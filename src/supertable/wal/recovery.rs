@@ -3,10 +3,12 @@
 
 //! On-demand WAL recovery sweep.
 //!
-//! There is **no background scan**. Recovery runs only when a
-//! caller invokes it: at `Supertable::open(...)` time, at
-//! `Supertable::create(...).expect("create")` time when storage is attached, or
-//! via the explicit operator hatch.
+//! There is **no background scan** of the table's WALs. A full
+//! sweep runs only when a caller invokes it: at `Supertable::open(...)`
+//! time, at `Supertable::create(...).expect("create")` time when storage
+//! is attached, or via the explicit operator hatch. A handle also
+//! finishes the WALs it left short of `Complete` itself, one at a time
+//! through [`finish_one`] (see `wal::unfinished`).
 //!
 //! ## What a sweep does
 //!
@@ -89,10 +91,13 @@ pub struct RecoveryReport {
     /// e.g. as part of post-`Complete` cleanup). Logged for
     /// observability.
     pub n_vanished_during_scan: usize,
-    /// CAS losses during lease acquire / preempt, and WALs whose
-    /// hidden deleted-set record lost its race past its budget.
-    /// Recoverable; the next sweep tries again.
+    /// CAS losses during lease acquire / preempt. Recoverable;
+    /// the next sweep tries again.
     pub n_cas_lost: usize,
+    /// WALs whose rows are retired but whose finishing steps failed
+    /// again on this sweep (see `TombstonePhaseOutcome::CompletionDeferred`).
+    /// Left unowned for the next attempt.
+    pub n_finish_deferred: usize,
     /// Total docs tombstoned across all WALs the sweep drove.
     pub total_targets_tombstoned: usize,
     /// Total `NotFound` outcomes across all WALs the sweep drove.
@@ -159,6 +164,9 @@ pub async fn scan_and_recover(
             Err(SweepStep::CasLost) => {
                 report.n_cas_lost += 1;
             }
+            Err(SweepStep::FinishDeferred) => {
+                report.n_finish_deferred += 1;
+            }
         }
     }
     Ok(report)
@@ -216,6 +224,27 @@ enum SweepStep {
     HeldByPeer,
     /// CAS-loss anywhere — somebody else acted first. Move on.
     CasLost,
+    /// The WAL's rows are retired, but a step finishing it failed; the
+    /// WAL is still short of `Complete` and its lease handed back.
+    FinishDeferred,
+}
+
+/// Drive one WAL to `Complete` the way a sweep would — `owner` takes its
+/// lease, or finds it already complete or gone — for a handle finishing a
+/// WAL it left unfinished itself. True when nothing is left to do: the WAL
+/// is complete or no longer on storage. False when it is held by a live
+/// peer, a race was lost, or its finish failed again.
+pub(crate) async fn finish_one(
+    supertable: &Supertable,
+    wal_store: &WalStore,
+    wal_id: WalId,
+    owner: SupertableHandleId,
+    lease_duration: Duration,
+) -> bool {
+    match recover_one(supertable, wal_store, wal_id, owner, lease_duration).await {
+        Ok(_) | Err(SweepStep::Vanished) => true,
+        Err(SweepStep::HeldByPeer | SweepStep::CasLost | SweepStep::FinishDeferred) => false,
+    }
 }
 
 async fn recover_one(
@@ -261,7 +290,14 @@ async fn recover_one(
         Err(_) => return Err(SweepStep::CasLost),
     };
 
-    drive_to_complete(supertable, wal_store, doc, etag).await
+    let driven = drive_to_complete(supertable, wal_store, doc, etag).await;
+    if let Err(SweepStep::FinishDeferred) = driven {
+        // Hand the lease back, as the writer does, so the next attempt —
+        // this handle's, a peer's, the next sweep's — need not wait out the
+        // lease span. A failed release leaves it to expire on its own.
+        let _ = lease::try_release(wal_store, wal_id, owner).await;
+    }
+    driven
 }
 
 /// Run the remaining pipeline steps based on the WAL's current
@@ -298,10 +334,11 @@ async fn drive_to_complete(
 
     let outcome =
         match pipeline::run_tombstone_phase(supertable, wal_store, &post_doc, &post_etag).await {
-            // The hidden deleted-set record lost its race again: the WAL is
-            // still short of `Complete`, so a later sweep picks it up.
-            Ok((TombstonePhaseOutcome::RecordDeferred { .. }, _, _)) => {
-                return Err(SweepStep::CasLost);
+            // The rows are retired but finishing failed again: the WAL is
+            // still short of `Complete`, for a later attempt.
+            Ok((TombstonePhaseOutcome::CompletionDeferred { .. }, _, _))
+            | Err(TombstonePhaseError::RetiredButUnfinished { .. }) => {
+                return Err(SweepStep::FinishDeferred);
             }
             Ok((outcome, _, _)) => outcome.counts(),
             Err(TombstonePhaseError::WalStore(WalStoreError::CasFailed { .. })) => {

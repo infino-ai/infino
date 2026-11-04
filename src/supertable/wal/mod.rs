@@ -59,6 +59,7 @@ pub mod recovery;
 pub mod state_doc;
 pub mod tombstones_admin;
 pub mod tombstones_codec;
+pub(crate) mod unfinished;
 
 #[cfg(test)]
 mod record_after_tombstones_tests;
