@@ -2325,19 +2325,17 @@ impl SupertableWriter {
                     return Err(cause.into());
                 }
             };
-            let (n_t, n_nf) = match outcome {
-                TombstonePhaseOutcome::Applied {
-                    n_tombstoned,
-                    n_not_found,
-                }
-                | TombstonePhaseOutcome::AlreadyComplete {
-                    n_tombstoned,
-                    n_not_found,
-                } => (n_tombstoned, n_not_found),
-            };
-            // Best-effort cleanup of the WAL artifacts.
-            let _ = wal_store.delete_arrow(wal_id).await;
-            let _ = wal_store.delete_state(wal_id).await;
+            let (n_t, n_nf) = outcome.counts();
+            if matches!(outcome, TombstonePhaseOutcome::RecordDeferred { .. }) {
+                // The replacement is published and the old rows retired; only
+                // the hidden deleted-set record is left, and it is recovery's.
+                // Keep the WAL for it, unowned so the next sweep can take it.
+                release_mutation_lease(&wal_store, wal_id, owner).await;
+            } else {
+                // Best-effort cleanup of the WAL artifacts.
+                let _ = wal_store.delete_arrow(wal_id).await;
+                let _ = wal_store.delete_state(wal_id).await;
+            }
             Ok::<_, MutationError>((n_t, n_nf))
         };
         let (n_tombstoned, n_not_found) = bridge_on_runtime(drive, &self.inner.query_runtime())?;
@@ -2452,17 +2450,15 @@ impl SupertableWriter {
                     return Err(cause.into());
                 }
             };
-            let (n_t, n_nf) = match outcome {
-                TombstonePhaseOutcome::Applied {
-                    n_tombstoned,
-                    n_not_found,
-                }
-                | TombstonePhaseOutcome::AlreadyComplete {
-                    n_tombstoned,
-                    n_not_found,
-                } => (n_tombstoned, n_not_found),
-            };
-            let _ = wal_store.delete_state(wal_id).await;
+            let (n_t, n_nf) = outcome.counts();
+            if matches!(outcome, TombstonePhaseOutcome::RecordDeferred { .. }) {
+                // The rows are retired; only the hidden deleted-set record is
+                // left, and it is recovery's. Keep the WAL for it, unowned so
+                // the next sweep can take it.
+                release_mutation_lease(&wal_store, wal_id, owner).await;
+            } else {
+                let _ = wal_store.delete_state(wal_id).await;
+            }
             Ok::<_, MutationError>((n_t, n_nf))
         };
         let (n_tombstoned, n_not_found) = bridge_on_runtime(drive, &self.inner.query_runtime())?;
@@ -12656,12 +12652,31 @@ async fn release_mutation_lease(wal_store: &WalStore, wal_id: WalId, owner: Supe
     }
 }
 
+/// How long [`record_hidden_deleted_ids`] keeps retrying a deleted-set
+/// record that loses the hidden manifest's commit race: at most
+/// `max_attempts` commit attempts, and none started once `deadline` has
+/// passed since the first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::supertable) struct RecordRetryBudget {
+    pub(in crate::supertable) max_attempts: u32,
+    pub(in crate::supertable) deadline: time::Duration,
+}
+
 /// Add `new_deleted` to the hidden vector-index table's deleted-`_id` set
 /// (see [`hidden_deleted`]), committing a new hidden manifest; a no-op when
 /// every id is in the set already. `inner` is the hidden table's.
+///
+/// The record is a set union, so re-running it against whatever the hidden
+/// manifest has become cannot change its outcome: every lost race — the
+/// handle's view of the hidden manifest being behind the pointer, or the
+/// pointer moving between our read and our write — reloads and tries
+/// again with a growing backoff, within `budget`. Running out of budget is
+/// [`BuildError::WriteContention`]; any other failure is returned as it
+/// is classified.
 pub(in crate::supertable) async fn record_hidden_deleted_ids(
     inner: &SupertableInner,
     new_deleted: &[i128],
+    budget: RecordRetryBudget,
 ) -> Result<(), BuildError> {
     if new_deleted.is_empty() {
         return Ok(());
@@ -12669,9 +12684,11 @@ pub(in crate::supertable) async fn record_hidden_deleted_ids(
     let Some(storage) = inner.options.storage.clone() else {
         return Ok(());
     };
-    let max_retries = inner.options.max_commit_retries.max(1);
+    let max_attempts = budget.max_attempts.max(1);
+    let started = Instant::now();
     let mut next_id_floor: u64 = 0;
-    for attempt in 0..max_retries {
+    let mut attempt: u32 = 0;
+    loop {
         let old = inner.manifest.load_full();
         // A prior attempt found its id occupied by a crash-orphaned
         // manifest list — derive this attempt's successor past it.
@@ -12694,33 +12711,51 @@ pub(in crate::supertable) async fn record_hidden_deleted_ids(
         let bytes = encode_deleted_ids(&ids);
         let new_manifest = old.with_deleted_user_ids(bytes);
         let attempted_id = new_manifest.get_manifest_id();
-        let prev_etag = get_current_manifest_etag(&storage, Arc::clone(&old))
-            .await
-            .inspect_err(|e| inner.note_commit_error(e))
-            .map_err(BuildError::from)?;
-        match new_manifest
-            .write(storage.as_ref(), prev_etag.as_deref(), &[])
-            .await
-        {
-            Ok(()) => {
-                inner.note_superseded(&old, &new_manifest, &[]);
-                inner.manifest.store(Arc::new(new_manifest));
-                return Ok(());
+        match get_current_manifest_etag(&storage, Arc::clone(&old)).await {
+            Ok(prev_etag) => match new_manifest
+                .write(storage.as_ref(), prev_etag.as_deref(), &[])
+                .await
+            {
+                Ok(()) => {
+                    inner.note_superseded(&old, &new_manifest, &[]);
+                    inner.manifest.store(Arc::new(new_manifest));
+                    return Ok(());
+                }
+                // Lost the pointer CAS: reload, past any list a crashed
+                // writer left at the id we tried.
+                Err(SupertableCommitError::WriteContentionExhausted) => {
+                    next_id_floor = next_id_floor.max(
+                        refresh_and_orphaned_id_floor(inner, &storage, attempted_id)
+                            .await
+                            .map_err(|e| BuildError::Store(e.to_string()))?,
+                    );
+                }
+                Err(e) => {
+                    inner.note_commit_error(&e);
+                    return Err(BuildError::from(e));
+                }
+            },
+            // The pointer is past this handle's view of the hidden table —
+            // another writer (a drain, a compaction, another handle's
+            // mutation) committed to it since. Reload and retry, rather than
+            // reporting a race this attempt never ran.
+            Err(SupertableCommitError::WriteContentionExhausted) => {
+                refresh_inner_state_async(inner, &storage)
+                    .await
+                    .map_err(|e| BuildError::Store(e.to_string()))?;
             }
-            Err(SupertableCommitError::WriteContentionExhausted) if attempt + 1 < max_retries => {
-                next_id_floor = next_id_floor.max(
-                    refresh_and_orphaned_id_floor(inner, &storage, attempted_id)
-                        .await
-                        .map_err(|e| BuildError::Store(e.to_string()))?,
-                );
-                sleep(backoff_delay(attempt)).await;
+            Err(e) => {
+                inner.note_commit_error(&e);
+                return Err(BuildError::from(e));
             }
-            Err(e) => return Err(BuildError::Store(e.to_string())),
         }
+        let delay = backoff_delay(attempt);
+        attempt += 1;
+        if attempt >= max_attempts || started.elapsed() + delay > budget.deadline {
+            return Err(BuildError::WriteContention);
+        }
+        sleep(delay).await;
     }
-    Err(BuildError::Store(
-        "deleted-set record: write contention exhausted".into(),
-    ))
 }
 
 /// The first column of `next` that requires a value where `base` did not:

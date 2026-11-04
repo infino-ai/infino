@@ -61,6 +61,8 @@ pub mod tombstones_admin;
 pub mod tombstones_codec;
 
 #[cfg(test)]
+mod record_after_tombstones_tests;
+#[cfg(test)]
 mod recovery_sweep_tests;
 
 pub use persistence::{Etag, WalStore, WalStoreError};

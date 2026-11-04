@@ -89,8 +89,9 @@ pub struct RecoveryReport {
     /// e.g. as part of post-`Complete` cleanup). Logged for
     /// observability.
     pub n_vanished_during_scan: usize,
-    /// CAS losses during lease acquire / preempt. Recoverable;
-    /// the next sweep tries again.
+    /// CAS losses during lease acquire / preempt, and WALs whose
+    /// hidden deleted-set record lost its race past its budget.
+    /// Recoverable; the next sweep tries again.
     pub n_cas_lost: usize,
     /// Total docs tombstoned across all WALs the sweep drove.
     pub total_targets_tombstoned: usize,
@@ -297,22 +298,12 @@ async fn drive_to_complete(
 
     let outcome =
         match pipeline::run_tombstone_phase(supertable, wal_store, &post_doc, &post_etag).await {
-            Ok((
-                TombstonePhaseOutcome::Applied {
-                    n_tombstoned,
-                    n_not_found,
-                },
-                _,
-                _,
-            ))
-            | Ok((
-                TombstonePhaseOutcome::AlreadyComplete {
-                    n_tombstoned,
-                    n_not_found,
-                },
-                _,
-                _,
-            )) => (n_tombstoned, n_not_found),
+            // The hidden deleted-set record lost its race again: the WAL is
+            // still short of `Complete`, so a later sweep picks it up.
+            Ok((TombstonePhaseOutcome::RecordDeferred { .. }, _, _)) => {
+                return Err(SweepStep::CasLost);
+            }
+            Ok((outcome, _, _)) => outcome.counts(),
             Err(TombstonePhaseError::WalStore(WalStoreError::CasFailed { .. })) => {
                 return Err(SweepStep::CasLost);
             }
