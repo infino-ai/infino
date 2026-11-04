@@ -531,7 +531,7 @@ mod tests {
         let st = Supertable::create(options).expect("create");
         for file in 0..KIND_FILES {
             let rows: Vec<usize> = (file * KIND_ROWS..(file + 1) * KIND_ROWS).collect();
-            let valued = |row: usize| row % KIND_NULL_EVERY != 0;
+            let valued = |row: usize| !row.is_multiple_of(KIND_NULL_EVERY);
             let floats: Vec<Option<f64>> = rows
                 .iter()
                 .map(|&row| {
