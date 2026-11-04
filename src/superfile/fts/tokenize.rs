@@ -36,6 +36,17 @@ use super::reader::BoolMode;
 /// Smallest byte value that is non-ASCII (has the high bit set).
 const NON_ASCII_BYTE_MIN: u8 = 0x80;
 
+/// Bytes in the machine word [`first_non_ascii`] tests at a time.
+const WORD_BYTES: usize = 8;
+
+/// The high bit of every byte of a word: set anywhere iff the word holds
+/// a non-ASCII byte.
+const HIGH_BITS: u64 = 0x8080_8080_8080_8080;
+
+/// Bytes [`first_non_ascii`] clears per step while the text stays ASCII:
+/// four words OR-ed into one test.
+const ASCII_SCAN_STRIDE: usize = 4 * WORD_BYTES;
+
 /// Low-16-bit mask applied to a `u8x16` comparison bitmask, keeping
 /// one bit per SIMD lane (the scan processes 16 bytes per chunk).
 const LANE_BITMASK: u32 = 0xFFFF;
@@ -655,7 +666,7 @@ const WB_MID_NUM_LET: u8 = 1 << 5;
 const WB_ALNUM: u8 = WB_ALETTER | WB_NUMERIC;
 
 /// Word_Break class per byte value. Non-ASCII bytes map to
-/// [`WB_OTHER`]; the ASCII scan is only entered for all-ASCII input, so
+/// [`WB_OTHER`]; the ASCII scan is only entered for all-ASCII text, so
 /// those entries are never consulted.
 static ASCII_WORD_BREAK_CLASS: [u8; 256] = {
     let mut table = [WB_OTHER; 256];
@@ -926,6 +937,158 @@ fn ascii_word_segments_scalar<F: FnMut(usize, usize, bool)>(bytes: &[u8], mut f:
     }
 }
 
+/// Offset of the first non-ASCII byte of `bytes`, if any:
+/// [`ASCII_SCAN_STRIDE`] bytes per step while the text stays ASCII, then
+/// a word at a time to place the byte.
+#[inline]
+fn first_non_ascii(bytes: &[u8]) -> Option<usize> {
+    let word = |i: usize| {
+        u64::from_le_bytes(
+            bytes[i..i + WORD_BYTES]
+                .try_into()
+                .expect("slice is one word long"),
+        )
+    };
+    let mut i = 0usize;
+    while i + ASCII_SCAN_STRIDE <= bytes.len() {
+        let any = (0..ASCII_SCAN_STRIDE)
+            .step_by(WORD_BYTES)
+            .fold(0, |acc, k| acc | word(i + k));
+        if any & HIGH_BITS != 0 {
+            break;
+        }
+        i += ASCII_SCAN_STRIDE;
+    }
+    while i + WORD_BYTES <= bytes.len() {
+        let high = word(i) & HIGH_BITS;
+        if high != 0 {
+            return Some(i + (high.trailing_zeros() / u8::BITS) as usize);
+        }
+        i += WORD_BYTES;
+    }
+    bytes[i..]
+        .iter()
+        .position(|&b| b >= NON_ASCII_BYTE_MIN)
+        .map(|p| i + p)
+}
+
+/// Whether `p` is a point where cutting the input in two leaves every
+/// word boundary — and every segment — exactly where UAX #29 puts it
+/// for the whole input.
+///
+/// Two shapes qualify, both with an ASCII byte at `p`:
+///
+///   - right after a line feed. WB3a breaks after a newline
+///     unconditionally, and a line feed is in none of the classes the
+///     context-sensitive rules look back for.
+///   - between a space and a byte that is not a space. Nothing joins a
+///     space to a following ASCII non-space (WB3d joins spaces only to
+///     spaces, WB4 attaches only Extend/Format/ZWJ, none of which is
+///     ASCII), and a space is in none of the classes the lookaround
+///     rules (WB6/7, WB11/12, WB15/16, WB3c) consult.
+///
+/// So the rules see the same thing on each side of the cut whether the
+/// other side is present or replaced by the start or end of text: a
+/// lookahead from the left half stops at the space or line feed, which
+/// the left half keeps, and a lookbehind from the right half that
+/// reaches the cut finds a character no rule joins across — the same
+/// answer the start of text gives.
+#[inline]
+fn is_segment_cut(bytes: &[u8], p: usize) -> bool {
+    if p == 0 || p >= bytes.len() || bytes[p] >= NON_ASCII_BYTE_MIN {
+        return false;
+    }
+    match bytes[p - 1] {
+        b'\n' => true,
+        b' ' => bytes[p] != b' ',
+        _ => false,
+    }
+}
+
+/// Tokenize text carrying non-ASCII characters, sending its ASCII
+/// stretches through the ASCII scan and only the neighbourhood of each
+/// non-ASCII character through the general segmenter.
+///
+/// Most text that is not pure ASCII is still mostly ASCII — an accented
+/// name, a curly quote or a dash in otherwise English prose — and the
+/// general segmenter costs several times the ASCII scan per byte. Sending
+/// a whole document through it because of one such character is where
+/// that cost came from.
+///
+/// A non-ASCII character can change how its ASCII neighbours segment
+/// (`aéb` is one word), so the general segmenter's span is widened on
+/// each side to the nearest [`is_segment_cut`] point, where segmentation
+/// of the halves matches segmentation of the whole. Everything between
+/// such spans is all-ASCII text cut at the same kind of point, on which
+/// the ASCII scan and the general segmenter agree. The result is the
+/// general segmenter's tokens for the whole input, which the tests below
+/// check against it directly.
+fn tokenize_mixed<F: FnMut(&str)>(text: &str, buf: &mut String, f: &mut F) {
+    let bytes = text.as_bytes();
+    let n = bytes.len();
+    let mut cur = 0usize;
+    while cur < n {
+        let Some(off) = first_non_ascii(&bytes[cur..]) else {
+            tokenize_ascii(&text[cur..], buf, f);
+            return;
+        };
+        let q = cur + off;
+        let mut start = q;
+        while start > cur && !is_segment_cut(bytes, start) {
+            start -= 1;
+        }
+        let mut end = q + 1;
+        while end < n && !is_segment_cut(bytes, end) {
+            end += 1;
+        }
+        if start > cur {
+            tokenize_ascii(&text[cur..start], buf, f);
+        }
+        tokenize_general(&text[start..end], buf, f);
+        cur = end;
+    }
+}
+
+/// All-ASCII `text` through the table-driven word-break scan. Cased
+/// ASCII only, so the ASCII fold agrees with the Unicode fold the
+/// general path applies.
+#[inline]
+fn tokenize_ascii<F: FnMut(&str)>(text: &str, buf: &mut String, f: &mut F) {
+    ascii_word_segments(text.as_bytes(), |start, end, has_upper| {
+        emit_ascii_segment(&text[start..end], has_upper, buf, &mut IndexPieces(&mut *f));
+    });
+}
+
+/// Any `text` through the general UAX #29 segmenter.
+fn tokenize_general<F: FnMut(&str)>(text: &str, buf: &mut String, f: &mut F) {
+    // `split_word_bounds` rather than `unicode_words` because the
+    // latter's filter drops emoji; the segmentation itself is the
+    // same, and UAX #29 already holds a ZWJ emoji sequence together
+    // as one segment, so only which segments are kept differs.
+    for word in text.split_word_bounds() {
+        if !is_token_segment(word) {
+            continue;
+        }
+        // Borrow directly when every cased character is already
+        // lowercase (the common case for lowercased corpora); only
+        // allocate to case-fold a word carrying an upper/title-case
+        // letter. Non-alphabetic characters (digits, apostrophes)
+        // are unaffected by lowercasing, so they never force a copy.
+        if word.chars().all(|c| !c.is_alphabetic() || c.is_lowercase()) {
+            emit_capped(word, f);
+        } else {
+            buf.clear();
+            // Context-aware full-string lowercasing. `str::to_lowercase`
+            // applies Unicode special-casing such as Final_Sigma (a
+            // word-final `Σ` lowercases to `ς`, but to `σ` elsewhere);
+            // a char-by-char fold has no word context and would emit
+            // `σ` in both spots.
+            buf.push_str(&word.to_lowercase());
+            emit_capped(buf.as_str(), f);
+        }
+    }
+}
+
 /// Unicode-aware tokenizer: UAX #29 word segmentation followed by full
 /// Unicode lowercasing, preserving non-ASCII text. See the module-level
 /// docs for the exact semantics.
@@ -944,52 +1107,17 @@ impl StandardTokenizer {
     /// this tokenizer routes through here, so no two of them can
     /// disagree about which tokens exist.
     ///
-    /// All-ASCII input takes the table-driven ASCII word-break scan;
-    /// anything else falls back to the general UAX #29 segmenter. The
-    /// check is whole-input rather than per-chunk because a non-ASCII
-    /// character changes how its ASCII neighbours segment (`aéb` is one
-    /// word), so a chunk boundary could not be placed soundly.
+    /// All-ASCII input takes the table-driven ASCII word-break scan.
+    /// Other input is split by [`tokenize_mixed`]: its ASCII stretches
+    /// still take the ASCII scan, and only the neighbourhood of each
+    /// non-ASCII character goes through the general UAX #29 segmenter.
     #[inline]
     pub fn tokenize_each_inline<F: FnMut(&str)>(&self, text: &str, mut f: F) {
         let mut buf = String::new();
         if text.is_ascii() {
-            // Cased ASCII only, so the ASCII fold agrees with the
-            // Unicode fold the non-ASCII path applies.
-            ascii_word_segments(text.as_bytes(), |start, end, has_upper| {
-                emit_ascii_segment(
-                    &text[start..end],
-                    has_upper,
-                    &mut buf,
-                    &mut IndexPieces(&mut f),
-                );
-            });
-            return;
-        }
-        // `split_word_bounds` rather than `unicode_words` because the
-        // latter's filter drops emoji; the segmentation itself is the
-        // same, and UAX #29 already holds a ZWJ emoji sequence together
-        // as one segment, so only which segments are kept differs.
-        for word in text.split_word_bounds() {
-            if !is_token_segment(word) {
-                continue;
-            }
-            // Borrow directly when every cased character is already
-            // lowercase (the common case for lowercased corpora); only
-            // allocate to case-fold a word carrying an upper/title-case
-            // letter. Non-alphabetic characters (digits, apostrophes)
-            // are unaffected by lowercasing, so they never force a copy.
-            if word.chars().all(|c| !c.is_alphabetic() || c.is_lowercase()) {
-                emit_capped(word, &mut f);
-            } else {
-                buf.clear();
-                // Context-aware full-string lowercasing. `str::to_lowercase`
-                // applies Unicode special-casing such as Final_Sigma (a
-                // word-final `Σ` lowercases to `ς`, but to `σ` elsewhere);
-                // a char-by-char fold has no word context and would emit
-                // `σ` in both spots.
-                buf.push_str(&word.to_lowercase());
-                emit_capped(&buf, &mut f);
-            }
+            tokenize_ascii(text, &mut buf, &mut f);
+        } else {
+            tokenize_mixed(text, &mut buf, &mut f);
         }
     }
 }
@@ -1303,9 +1431,9 @@ mod tests {
 
     #[test]
     fn standard_tokens_match_the_general_segmenter_on_mixed_text() {
-        // The whole-input ASCII check must not change what `standard`
-        // emits: an input with any non-ASCII byte takes the general
-        // segmenter, and an all-ASCII one must agree with it.
+        // The ASCII scan must not change what `standard` emits: whether
+        // the input is all ASCII or only partly, the tokens must be the
+        // general segmenter's.
         for text in [
             "the quick brown fox",
             "Don't stop 3.14 or 1,000,000 things",
@@ -1357,11 +1485,10 @@ mod tests {
         }
     }
 
-    /// Whether the analyzer picks the ASCII scan is decided for the
-    /// *whole input*, so the same word takes a different code path
-    /// depending on what else the text contains: `"don't"` alone goes
-    /// through the ASCII scan, `"don't café"` through the general
-    /// segmenter. Documents are indexed one way and queries tokenized
+    /// Which scan a word goes through depends on what surrounds it:
+    /// `"don't"` alone goes through the ASCII scan, `"don't café"` partly
+    /// through the general segmenter, and `"x don'té"` wholly through
+    /// it. Documents are indexed one way and queries tokenized
     /// the other, so if the two paths disagreed on a shared word the
     /// query would silently miss — no error, just lost recall. Pin that
     /// a word's tokens do not depend on its neighbours' encoding.
@@ -1380,9 +1507,9 @@ mod tests {
             let fast: Vec<String> = StandardTokenizer.tokenize(ascii_text).collect();
             assert!(ascii_text.is_ascii(), "fixture must be ASCII");
 
-            // Slow path: the identical text plus one non-ASCII word, so
-            // the whole input falls back to the general segmenter. The
-            // ASCII words' tokens must come out the same.
+            // Mixed path: the identical text plus one non-ASCII word, so
+            // part of it goes through the general segmenter. The ASCII
+            // words' tokens must come out the same.
             for suffix in [" café", " Straße", " 中文"] {
                 let mixed = format!("{ascii_text}{suffix}");
                 assert!(!mixed.is_ascii(), "fixture must leave the ASCII path");
@@ -1469,6 +1596,132 @@ mod tests {
             StandardTokenizer.tokenize_each_query(&text, &mut |t| via_query.push(t.into_owned()));
             prop_assert_eq!(&via_tokenize, &via_each, "tokenize vs tokenize_each on {:?}", text);
             prop_assert_eq!(&via_tokenize, &via_query, "tokenize vs query path on {:?}", text);
+        }
+    }
+
+    // ---- ASCII runs of mixed text vs the whole-input segmenter ----
+
+    /// Tokens of the run-split path.
+    fn mixed_tokens(text: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut buf = String::new();
+        tokenize_mixed(text, &mut buf, &mut |t: &str| out.push(t.to_owned()));
+        out
+    }
+
+    /// Tokens of the general segmenter over the whole input — the
+    /// reference the run-split path must reproduce exactly.
+    fn whole_input_tokens(text: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut buf = String::new();
+        tokenize_general(text, &mut buf, &mut |t: &str| out.push(t.to_owned()));
+        out
+    }
+
+    /// Characters chosen to sit on either side of a cut: every ASCII
+    /// word-break class, the whitespace a cut keys on (space, line feed)
+    /// and the whitespace it must not (carriage return, tab), plus the
+    /// non-ASCII characters whose rules reach across a neighbour —
+    /// combining marks and format characters (WB4), ZWJ and emoji
+    /// (WB3c), regional indicators (WB15/16), non-ASCII spaces (WB3d),
+    /// Katakana and Hebrew letters, and cased letters whose fold is
+    /// context-sensitive (final sigma).
+    const RUN_ALPHABET: &[char] = &[
+        'a',
+        'B',
+        'z',
+        '1',
+        '9',
+        '_',
+        ':',
+        ',',
+        ';',
+        '.',
+        '\'',
+        ' ',
+        ' ',
+        ' ',
+        '\n',
+        '\r',
+        '\t',
+        '-',
+        '"',
+        'é',
+        'Ä',
+        'Σ',
+        '中',
+        '\u{0301}',
+        '\u{00AD}',
+        '\u{200B}',
+        '\u{200D}',
+        '\u{2060}',
+        '\u{00A0}',
+        '\u{3000}',
+        '\u{2019}',
+        '\u{1F642}',
+        '\u{1F1FA}',
+        '\u{1F1F8}',
+        'カ',
+        'ー',
+        'א',
+        '\u{05F3}',
+        '٣',
+        '\u{FF0E}',
+    ];
+
+    #[test]
+    fn ascii_runs_match_the_whole_input_segmenter_on_fixtures() {
+        for text in [
+            "José Smith met Zoë at the café",
+            "one \u{0301}two",
+            "a \u{200D}\u{1F642} b",
+            "x\u{00A0}y z",
+            "hello  \u{1F1FA}\u{1F1F8} \u{1F1FA} world",
+            "ΣΑΣ ΟΔΟΣ end",
+            "line one\ncafé\r\nline three",
+            "3.14 \u{2019}s don\u{2019}t a.b",
+            "trailing é",
+            "é leading",
+            "",
+        ] {
+            assert_eq!(mixed_tokens(text), whole_input_tokens(text), "on {text:?}");
+        }
+    }
+
+    proptest! {
+        /// The run-split path against the general segmenter run over the
+        /// whole input, on arbitrary text mixing ASCII with the
+        /// characters whose rules reach across a neighbour.
+        #[test]
+        fn ascii_runs_match_the_whole_input_segmenter(
+            indices in proptest::collection::vec(0..RUN_ALPHABET.len(), 0..120)
+        ) {
+            let text: String = indices.iter().map(|&i| RUN_ALPHABET[i]).collect();
+            prop_assert_eq!(mixed_tokens(&text), whole_input_tokens(&text), "on {:?}", text);
+        }
+
+        /// Mostly-ASCII prose with rare arbitrary characters — the shape
+        /// of real text, where the ASCII stretches are long and the
+        /// vector lane runs across them.
+        #[test]
+        fn ascii_runs_match_the_whole_input_segmenter_on_sparse_non_ascii(
+            words in proptest::collection::vec("[a-zA-Z0-9]{1,12}", 0..40),
+            seps in proptest::collection::vec(0..RUN_ALPHABET.len(), 0..40),
+            extra in proptest::collection::vec(any::<char>(), 0..6),
+            at in proptest::collection::vec(any::<usize>(), 0..6),
+        ) {
+            let mut text = String::new();
+            for (i, w) in words.iter().enumerate() {
+                text.push_str(w);
+                text.push(seps.get(i).map_or(' ', |&s| RUN_ALPHABET[s]));
+            }
+            let mut chars: Vec<char> = text.chars().collect();
+            for (c, pos) in extra.iter().zip(at.iter()) {
+                let pos = pos % (chars.len() + 1);
+                chars.insert(pos, *c);
+            }
+            let text: String = chars.into_iter().collect();
+            prop_assert_eq!(mixed_tokens(&text), whole_input_tokens(&text), "on {:?}", text);
         }
     }
 
