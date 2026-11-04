@@ -57,7 +57,7 @@ impl TermRuns<'_> {
     /// Append posting `i`'s run of `tf` values to `out`. `at` walks the
     /// encoded form and must start at 0 for posting 0; the decoded form
     /// ignores it.
-    #[inline]
+    #[cfg(test)]
     pub(crate) fn push_run(&self, i: usize, tf: u32, at: &mut usize, out: &mut Vec<u32>) {
         match *self {
             Self::Encoded(bytes) => {
@@ -68,6 +68,61 @@ impl TermRuns<'_> {
             Self::Values { values, starts } => {
                 let start = starts[i];
                 out.extend_from_slice(&values[start..start + tf as usize]);
+            }
+        }
+    }
+
+    /// Split the runs of postings `first..first + tfs.len()`, whose term
+    /// frequencies are `tfs`, into their first values, appended to
+    /// `firsts`, and their gaps, appended to `gaps`: the two lane streams
+    /// of a packed group. `at` walks the encoded form and must start at 0
+    /// for posting 0; the decoded form ignores it.
+    fn split_runs(
+        &self,
+        first: usize,
+        tfs: &[u32],
+        at: &mut usize,
+        firsts: &mut Vec<u32>,
+        gaps: &mut Vec<u32>,
+    ) {
+        match *self {
+            Self::Encoded(bytes) => {
+                for &tf in tfs {
+                    firsts.push(read_varint(bytes, at).expect("builder-encoded run"));
+                    for _ in 1..tf {
+                        gaps.push(read_varint(bytes, at).expect("builder-encoded run"));
+                    }
+                }
+            }
+            Self::Values { values, starts } => {
+                for (&tf, &start) in tfs.iter().zip(&starts[first..]) {
+                    firsts.push(values[start]);
+                    gaps.extend_from_slice(&values[start + 1..start + tf as usize]);
+                }
+            }
+        }
+    }
+
+    /// Write the values of the runs [`Self::split_runs`] reads, in run
+    /// order, as LEB128: the body of a LEB128 group.
+    fn write_leb128(&self, first: usize, tfs: &[u32], mut at: usize, out: &mut Vec<u8>) {
+        match *self {
+            Self::Encoded(bytes) => {
+                for &tf in tfs {
+                    for _ in 0..tf {
+                        push_varint(
+                            out,
+                            read_varint(bytes, &mut at).expect("builder-encoded run"),
+                        );
+                    }
+                }
+            }
+            Self::Values { values, starts } => {
+                for (&tf, &start) in tfs.iter().zip(&starts[first..]) {
+                    for &v in &values[start..start + tf as usize] {
+                        push_varint(out, v);
+                    }
+                }
             }
         }
     }
@@ -179,8 +234,11 @@ const GROUP_MAX_EXCEPTIONS: usize = 64;
 
 /// Append one **position group** — the run values (first position
 /// absolute per doc, then gaps, in posting order) of one posting block,
-/// or of a whole short-form term — behind a one-byte header. `tfs` are
-/// the group's per-doc term frequencies, so `values.len() == Σ tfs`.
+/// or of a whole short-form term — behind a one-byte header. The group
+/// holds the runs of postings `first..first + tfs.len()` of `runs`,
+/// whose per-doc term frequencies are `tfs`; `at` walks the encoded form
+/// as in [`TermRuns::split_runs`]. Each run's values are read where they
+/// sit, straight into the stream they belong to, with no gathering pass.
 ///
 /// A [`GROUP_PACKED`] group splits the values into two **streams**,
 /// every doc's **first** position and every **gap** between a doc's
@@ -203,6 +261,27 @@ const GROUP_MAX_EXCEPTIONS: usize = 64;
 /// every long-form group is packed, so `allow_leb128` is `false` for
 /// them; a short-form term's group is decoded whole in any case and may
 /// take the LEB128 form when that is smaller.
+pub(crate) fn encode_group_runs(
+    out: &mut Vec<u8>,
+    tfs: &[u32],
+    runs: &TermRuns<'_>,
+    first: usize,
+    at: &mut usize,
+    allow_leb128: bool,
+    scratch: &mut PackScratch,
+) {
+    let runs_at = *at;
+    scratch.lanes_a.clear();
+    scratch.lanes_b.clear();
+    runs.split_runs(first, tfs, at, &mut scratch.lanes_a, &mut scratch.lanes_b);
+    finish_group(out, allow_leb128, scratch, GROUP_PACKED_FIXED, |out| {
+        runs.write_leb128(first, tfs, runs_at, out)
+    });
+}
+
+/// [`encode_group_runs`] over runs already gathered into `values`, so
+/// `values.len() == Σ tfs`: the reference the tests hold it to.
+#[cfg(test)]
 pub(crate) fn encode_group(
     out: &mut Vec<u8>,
     tfs: &[u32],
@@ -216,6 +295,7 @@ pub(crate) fn encode_group(
 /// [`encode_group`] with the packed form `packed` ([`GROUP_PACKED`] or
 /// [`GROUP_PACKED_FIXED`]); the tests write both, as blobs of either
 /// version must read.
+#[cfg(test)]
 fn encode_group_as(
     out: &mut Vec<u8>,
     tfs: &[u32],
@@ -224,7 +304,6 @@ fn encode_group_as(
     scratch: &mut PackScratch,
     packed: u8,
 ) {
-    let fixed = packed == GROUP_PACKED_FIXED;
     debug_assert_eq!(
         tfs.iter().map(|&t| t as usize).sum::<usize>(),
         values.len(),
@@ -240,17 +319,39 @@ fn encode_group_as(
         gaps.extend_from_slice(&values[vi + 1..vi + tf as usize]);
         vi += tf as usize;
     }
+    finish_group(out, allow_leb128, scratch, packed, |out| {
+        for &v in values {
+            push_varint(out, v);
+        }
+    });
+}
+
+/// Write a group whose first values and gaps sit in `scratch.lanes_a`
+/// and `scratch.lanes_b`: packed as `packed`, or, when `allow_leb128`
+/// and it is no larger, as LEB128 with `write_values` writing the
+/// values in run order.
+fn finish_group(
+    out: &mut Vec<u8>,
+    allow_leb128: bool,
+    scratch: &mut PackScratch,
+    packed: u8,
+    write_values: impl FnOnce(&mut Vec<u8>),
+) {
+    let fixed = packed == GROUP_PACKED_FIXED;
+    let (firsts, gaps) = (&scratch.lanes_a, &scratch.lanes_b);
     plan_stream(firsts, fixed, &mut scratch.plan_a, &mut scratch.candidates);
     plan_stream(gaps, fixed, &mut scratch.plan_b, &mut scratch.candidates);
     let (first_plan, gap_plan) = (&scratch.plan_a, &scratch.plan_b);
     let packed_len = 1 + first_plan.bytes + gap_plan.bytes;
     if allow_leb128 {
-        let leb_len: usize = 1 + values.iter().map(|&v| varint_len(v)).sum::<usize>();
+        let leb_len: usize = 1 + firsts
+            .iter()
+            .chain(gaps)
+            .map(|&v| varint_len(v))
+            .sum::<usize>();
         if leb_len <= packed_len {
             out.push(GROUP_LEB128);
-            for &v in values {
-                push_varint(out, v);
-            }
+            write_values(out);
             return;
         }
     }
@@ -729,6 +830,89 @@ mod tests {
 
         assert_eq!(decoded.encoded(), None);
         assert_eq!(encoded.encoded(), Some(bytes.as_slice()));
+    }
+
+    /// A group encoded from runs where they sit is byte for byte the group
+    /// encoded from the same runs gathered into one buffer: from either
+    /// form of the runs, over any stretch of a term's postings, packed or
+    /// LEB128, and with scratch carried over from a larger group.
+    #[test]
+    fn groups_from_runs_in_place_match_gathered_groups() {
+        // Postings' positions: short runs of small values, which LEB128
+        // holds smaller, beside long runs with far apart outliers, which
+        // pack smaller.
+        let docs: Vec<Vec<u32>> = (0..300u32)
+            .map(|d| match d % 4 {
+                0 => vec![d % 7],
+                1 => (0..1 + d % 9).map(|k| 3 * k + d % 5).collect(),
+                2 => vec![d * 1_000, d * 1_000 + 1, d * 1_000 + 70_000],
+                _ => (0..20).map(|k| k * (1 + d % 3)).collect(),
+            })
+            .collect();
+        // The order the merge hands the postings over in, scrambled
+        // against the order their values sit in.
+        let order: Vec<usize> = (0..docs.len()).map(|i| (i * 7) % docs.len()).collect();
+        let mut values = Vec::new();
+        let mut starts = vec![0; docs.len()];
+        for (i, positions) in docs.iter().enumerate() {
+            starts[i] = values.len();
+            let mut prev = 0;
+            for &p in positions {
+                values.push(p - prev);
+                prev = p;
+            }
+        }
+        let mut bytes = Vec::new();
+        for &i in &order {
+            encode_run(&mut bytes, &docs[i]);
+        }
+        let ordered_starts: Vec<usize> = order.iter().map(|&i| starts[i]).collect();
+        let tfs: Vec<u32> = order.iter().map(|&i| docs[i].len() as u32).collect();
+        let forms = [
+            TermRuns::Values {
+                values: &values,
+                starts: &ordered_starts,
+            },
+            TermRuns::Encoded(&bytes),
+        ];
+        let mut scratch = PackScratch::default();
+        let mut forms_seen = [false; 2];
+        for runs in &forms {
+            for block in [1, 3, 64, 300] {
+                for allow_leb128 in [false, true] {
+                    let mut at = 0;
+                    let mut gathered_at = 0;
+                    for (c, chunk) in tfs.chunks(block).enumerate() {
+                        let first = c * block;
+                        let mut gathered = Vec::new();
+                        for (k, &tf) in chunk.iter().enumerate() {
+                            runs.push_run(first + k, tf, &mut gathered_at, &mut gathered);
+                        }
+                        let mut expected = Vec::new();
+                        group(&mut expected, chunk, &gathered, allow_leb128);
+                        let mut got = Vec::new();
+                        encode_group_runs(
+                            &mut got,
+                            chunk,
+                            runs,
+                            first,
+                            &mut at,
+                            allow_leb128,
+                            &mut scratch,
+                        );
+                        assert_eq!(
+                            got, expected,
+                            "block {block} at {first}, leb128 {allow_leb128}"
+                        );
+                        forms_seen[usize::from(expected[0] == GROUP_LEB128)] = true;
+                    }
+                    if let Some(bytes) = runs.encoded() {
+                        assert_eq!(at, bytes.len(), "the encoded walk covers every run");
+                    }
+                }
+            }
+        }
+        assert_eq!(forms_seen, [true, true], "both group forms are written");
     }
 
     /// Encode a group with fresh scratch.
