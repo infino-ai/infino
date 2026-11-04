@@ -132,9 +132,13 @@ pub(crate) fn merge_column<S: Send, T: Send>(
         .map_err(read_error)?;
     let ranges = walk_ranges(&readers, &dicts, column_id)?;
 
+    let remaps: Vec<Vec<u32>> = inputs
+        .iter()
+        .map(|input| packed_remap(&input.remap))
+        .collect();
     let work = BatchWork {
         readers: &readers,
-        inputs,
+        remaps: &remaps,
         column_id,
         workers: Mutex::new(Vec::new()),
         new_state: &new_state,
@@ -214,6 +218,30 @@ pub(crate) fn merge_column<S: Send, T: Send>(
         .into_iter()
         .map(|(_, s)| s)
         .collect())
+}
+
+/// A dropped row in a packed remap. No output doc id takes it: a blob
+/// holds fewer than `u32::MAX` documents.
+const DROPPED: u32 = u32::MAX;
+
+/// `remap` as the walk reads it, one `u32` a row: the output doc id, or
+/// [`DROPPED`]. Every posting the walk reads looks its doc up here, and a
+/// rare term's lookups land anywhere in the input; at four bytes a row
+/// rather than eight, half as many of them miss the cache.
+fn packed_remap(remap: &[Option<FtsDocId>]) -> Vec<u32> {
+    remap
+        .iter()
+        .map(|out| {
+            out.map_or(DROPPED, |out| {
+                debug_assert_ne!(
+                    out.get(),
+                    DROPPED,
+                    "an output doc id never takes the dropped mark"
+                );
+                out.get()
+            })
+        })
+        .collect()
 }
 
 /// A key range of a column's walk: from `start` (none: the first term)
@@ -394,7 +422,8 @@ impl TermWork {
 /// What every batch of one column's merge shares.
 struct BatchWork<'a, S, N, E> {
     readers: &'a [&'a FtsReader],
-    inputs: &'a [SortedInput],
+    /// Each input's remap, packed by [`packed_remap`].
+    remaps: &'a [Vec<u32>],
     column_id: u32,
     /// Idle workers; a task takes one and puts it back.
     workers: Mutex<Vec<(TermWork, S)>>,
@@ -496,19 +525,19 @@ impl<S: Send, N: Fn() -> S + Sync, E> BatchWork<'_, S, N, E> {
         run_starts.clear();
         let mut ascending = true;
         for &(i, value) in term_inputs {
-            let remap = &self.inputs[i].remap;
+            let remap = &self.remaps[i];
             self.readers[i]
                 .for_each_posting_in(
                     self.column_id,
                     once((term, value)),
                     positions_buf,
                     |_, doc, tf, pos| {
-                        if let Some(out_doc) = remap[doc as usize] {
+                        let out_doc = remap[doc as usize];
+                        if out_doc != DROPPED {
                             debug_assert!(
                                 pos.is_empty() || pos.len() == tf as usize,
                                 "sorted merge: a position run must hold tf positions"
                             );
-                            let out_doc = out_doc.get();
                             ascending &= postings.last().is_none_or(|&(d, _)| d < out_doc);
                             postings.push((out_doc, tf));
                             run_starts.push(runs.len());
