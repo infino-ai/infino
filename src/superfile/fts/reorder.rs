@@ -147,6 +147,10 @@ pub(crate) struct BisectParams {
     pub(crate) convergence: f32,
     /// Ceiling on a split's move rounds whatever `convergence` says.
     pub(crate) max_rounds: usize,
+    /// Whether a partition may renumber its terms into a dense range once
+    /// that shrinks its tables. Renumbering changes how fast the order is
+    /// found, never the order; it is a parameter so that can be checked.
+    pub(crate) renumber: bool,
 }
 
 /// A bisection in progress: the limits in force, plus the reference the
@@ -206,6 +210,12 @@ impl Bisect<'_> {
     /// realise nothing — a corpus that repeats a document has the swap
     /// exchange two copies — so the levels under it offer in turn; a run
     /// no level of which lowers the cost has no bar and keeps every round.
+    /// Whether this partition renumbers its terms before it splits: see
+    /// [`localizing_pays`].
+    fn renumbers(&self, fwd: &ForwardIndex, distinct: Option<usize>) -> bool {
+        self.params.renumber && localizing_pays(fwd, distinct)
+    }
+
     fn offer_reference(&self, gain: f64, len: usize) {
         let per_doc = gain / (len.max(1) as f64);
         if per_doc > 0.0 {
@@ -221,6 +231,7 @@ impl Default for BisectParams {
         Self {
             convergence: REORDER_CONVERGENCE,
             max_rounds: REORDER_MAX_ROUNDS,
+            renumber: true,
         }
     }
 }
@@ -621,7 +632,11 @@ fn split_levels(fwd: &ForwardIndex, order: &mut [u32], pool: &StatePool, run: Bi
             part.len() > MIN_PARTITION
                 && depth < MAX_DEPTH
                 && (part.len() >= PARALLEL_MIN_PARTITION || !wide)
-                && !localizing_pays(fwd, *distinct)
+                // A partition that renumbers takes its own path, so its first
+                // round would not count towards the level's offer. Until a
+                // level has set the bar it stays here, renumbering later, so
+                // the bar is the one the plain bisection takes.
+                && !(wide && run.renumbers(fwd, *distinct))
         });
         handed_on.extend(
             rest.into_iter()
@@ -682,7 +697,7 @@ fn split_parallel(
     if order.len() <= MIN_PARTITION || depth >= MAX_DEPTH {
         return;
     }
-    if localizing_pays(fwd, distinct) {
+    if run.renumbers(fwd, distinct) {
         let started = REPORT.then(Instant::now);
         let local = pool.with_state(|state| state.localize(fwd, order));
         if let Some(started) = started {
@@ -955,7 +970,7 @@ impl BisectState {
         if order.len() <= MIN_PARTITION || depth >= MAX_DEPTH {
             return;
         }
-        if localizing_pays(fwd, distinct) {
+        if run.renumbers(fwd, distinct) {
             let started = REPORT.then(Instant::now);
             let local = self.localize(fwd, order);
             if let Some(started) = started {
@@ -1787,6 +1802,7 @@ mod tests {
         BisectParams {
             convergence: 0.0,
             max_rounds: REF_MAX_ROUNDS,
+            renumber: true,
         }
     }
 
@@ -2044,9 +2060,20 @@ mod tests {
     /// Vocabulary of its wide half, so the narrow half fills under half the
     /// whole table and the wide half does not.
     const SERIAL_WIDE_TERMS: u32 = 2_000;
-    /// Renumberings the uneven corpus makes when every half renumbers on its
-    /// own count.
-    const UNEVEN_RENUMBERINGS: u64 = 4;
+    /// Where the wide half of the apart corpus starts its vocabulary, clear of
+    /// the narrow half's.
+    const APART_WIDE_FIRST: u32 = 10_000;
+    /// Vocabulary of the wide half of the apart corpus: wide enough that the
+    /// narrow half fills under half the table from the first level down.
+    const APART_WIDE_TERMS: u32 = 60_000;
+    /// Vocabulary of its last quarter, three narrow ones: of the two quarters
+    /// on the narrow side only one fills under half their half's table.
+    const UNEVEN_MID_TERMS: u32 = 600;
+    /// Renumberings by depth the uneven corpus makes when every half
+    /// renumbers on its own count: the narrow side's half, then the quarters
+    /// under half their tables, then, deep down, the small partitions of the
+    /// one that was not.
+    const UNEVEN_RENUMBERINGS: [u64; 8] = [0, 1, 2, 0, 0, 0, 0, 32];
 
     /// Bucket space the merge hashes terms into, mirrored here so a test
     /// corpus has the sparse vocabulary a real one does.
@@ -2229,6 +2256,7 @@ mod tests {
             BisectParams {
                 convergence: 0.5,
                 max_rounds: REF_MAX_ROUNDS,
+                renumber: true,
             },
         );
         let full = bisect_order(&fwd, exhaustive());
@@ -2350,7 +2378,7 @@ mod tests {
             (UNEVEN_NARROW_TERMS + UNEVEN_WIDE_TERMS, UNEVEN_NARROW_TERMS),
             (
                 2 * UNEVEN_NARROW_TERMS + UNEVEN_WIDE_TERMS,
-                UNEVEN_NARROW_TERMS,
+                UNEVEN_MID_TERMS,
             ),
         ];
         let mut docs: Vec<Vec<u32>> = vocabularies
@@ -2375,11 +2403,7 @@ mod tests {
             .expect("pool");
         let (order, report) = one.install(|| bisect_order_reported(&fwd, exhaustive()));
         let localized: Vec<u64> = report.levels.iter().map(|l| l.localized).collect();
-        assert_eq!(
-            localized.iter().sum::<u64>(),
-            UNEVEN_RENUMBERINGS,
-            "renumberings by depth: {localized:?}"
-        );
+        assert_eq!(localized, UNEVEN_RENUMBERINGS, "renumberings by depth");
         assert_eq!(order, reference_order(&fwd));
     }
 
@@ -2434,15 +2458,67 @@ mod tests {
             .collect();
         let fwd = ForwardIndex::from_docs(&docs);
         let (order, report) = bisect_order_reported(&fwd, exhaustive());
-        // Only the termless half shrinks the table by half; the clustered half
-        // carries most of the vocabulary, and an empty table cannot shrink.
+        // Only termless partitions shrink the table by half: the clustered half
+        // carries most of the vocabulary, and an empty table cannot shrink. The
+        // halves start apart, so the root moves nothing and sets no bar; the
+        // termless half stays with the level until one does, and its two
+        // halves renumber.
         let localized: Vec<u64> = report.levels.iter().map(|l| l.localized).collect();
         assert_eq!(
             localized.iter().sum::<u64>(),
-            1,
+            2,
             "renumberings by depth: {localized:?}"
         );
         assert_eq!(order, reference_order(&fwd));
+    }
+
+    /// Renumbering never changes the order, with the convergence test on as
+    /// in production and on any number of threads. That includes a root whose
+    /// first round moves nothing: the bar then comes from the first level that
+    /// lowers the cost, and a half that renumbered before then would leave
+    /// that level's offer and change the bar.
+    #[test]
+    fn renumbering_leaves_the_order_as_it_was() {
+        let half = 2 * PARALLEL_MIN_PARTITION;
+        let mut rng = StdRng::seed_from_u64(29);
+        // Two halves that share no terms, so the root has nothing to move.
+        let apart: Vec<Vec<u32>> = (0..2 * half)
+            .map(|d| {
+                let (first, n) = match d < half {
+                    true => (0, SERIAL_NARROW_TERMS),
+                    false => (APART_WIDE_FIRST, APART_WIDE_TERMS),
+                };
+                (0..UNEVEN_TERMS_PER_DOC)
+                    .map(|_| first + rng.random_range(0..n))
+                    .collect()
+            })
+            .collect();
+        let corpora = [
+            ForwardIndex::from_docs(&apart),
+            scattered_into_buckets(3 * PARALLEL_MIN_PARTITION, 40, 6).0,
+            clustered(3 * PARALLEL_MIN_PARTITION, 16, 7).0,
+        ];
+        for (i, fwd) in corpora.iter().enumerate() {
+            for threads in [1, 2, 8] {
+                let pool = ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .expect("pool");
+                let order = |renumber: bool| {
+                    let params = BisectParams {
+                        renumber,
+                        ..BisectParams::default()
+                    };
+                    pool.install(|| bisect_order_reported(fwd, params))
+                };
+                let (renumbered, report) = order(true);
+                assert!(
+                    report.levels.iter().any(|l| l.localized > 0),
+                    "corpus {i} never renumbers, so it covers nothing"
+                );
+                assert_eq!(renumbered, order(false).0, "corpus {i}, {threads} threads");
+            }
+        }
     }
 
     #[test]
