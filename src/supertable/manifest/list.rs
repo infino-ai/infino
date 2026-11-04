@@ -805,7 +805,12 @@ impl ScalarValueCounts {
         values: impl Fn(&'a ArrayRef) -> Option<I>,
     ) -> Option<Self> {
         // value -> (count, the piece and row it first showed up in)
-        let mut counts: FxHashMap<V, (u64, usize, usize)> = FxHashMap::default();
+        // Sized for the cap at most, so a column under it never rehashes.
+        let rows: usize = pieces.iter().map(|piece| piece.len()).sum();
+        let mut counts: FxHashMap<V, (u64, usize, usize)> = FxHashMap::with_capacity_and_hasher(
+            rows.min(MAX_EXACT_VALUE_COUNTS + 1),
+            Default::default(),
+        );
         for (at, piece) in pieces.iter().enumerate() {
             for (row, value) in values(piece)? {
                 let distinct = counts.len();
@@ -829,7 +834,39 @@ impl ScalarValueCounts {
                 Some((ScalarValue::try_from_array(&pieces[at], row).ok()?, count))
             })
             .collect::<Option<Vec<_>>>()?;
-        Self::from_entries(entries)
+        Self::from_distinct_entries(entries)
+    }
+
+    /// [`Self::from_entries`] for entries whose values are already distinct,
+    /// as [`Self::count`] leaves them: the same table, without the map that
+    /// folds duplicate values together.
+    fn from_distinct_entries(mut entries: Vec<(ScalarValue, u64)>) -> Option<Self> {
+        if entries.is_empty() || entries.len() > MAX_EXACT_VALUE_COUNTS {
+            return None;
+        }
+        if !exact_value_counts_type(&entries[0].0.data_type()) {
+            return None;
+        }
+        if entries
+            .iter()
+            .any(|(value, count)| value.is_null() || *count == 0)
+        {
+            return None;
+        }
+        if entries
+            .iter()
+            .any(|(value, _)| value.data_type() != entries[0].0.data_type())
+        {
+            return None;
+        }
+        entries.sort_by(|left, right| left.0.partial_cmp(&right.0).unwrap_or(Ordering::Equal));
+        if entries
+            .windows(2)
+            .any(|pair| pair[0].0.partial_cmp(&pair[1].0).is_none())
+        {
+            return None;
+        }
+        Some(Self { entries })
     }
 
     pub(crate) fn from_entries(entries: Vec<(ScalarValue, u64)>) -> Option<Self> {
@@ -892,6 +929,60 @@ fn non_null<V>(values: impl Iterator<Item = Option<V>>) -> impl Iterator<Item = 
         .filter_map(|(row, value)| Some((row, value?)))
 }
 
+/// A string counted by value. Its first eight bytes and its length are
+/// hashed and compared as numbers, and only the bytes past the eighth as
+/// bytes, so the short values of a low-cardinality column are counted
+/// without a byte comparison per row.
+#[derive(Clone, Copy)]
+struct CountedStr<'a> {
+    head: u64,
+    len: usize,
+    value: &'a str,
+}
+
+impl<'a> CountedStr<'a> {
+    #[inline]
+    fn new(value: &'a str) -> Self {
+        let bytes = value.as_bytes();
+        let mut head = [0u8; 8];
+        let n = bytes.len().min(8);
+        head[..n].copy_from_slice(&bytes[..n]);
+        Self {
+            head: u64::from_le_bytes(head),
+            len: bytes.len(),
+            value,
+        }
+    }
+
+    #[inline]
+    fn of_row((row, value): (usize, &'a str)) -> (usize, Self) {
+        (row, Self::new(value))
+    }
+
+    #[inline]
+    fn tail(&self) -> &'a [u8] {
+        self.value.as_bytes().get(8..).unwrap_or_default()
+    }
+}
+
+impl PartialEq for CountedStr<'_> {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.head == other.head && self.len == other.len && self.tail() == other.tail()
+    }
+}
+
+impl Eq for CountedStr<'_> {}
+
+impl Hash for CountedStr<'_> {
+    #[inline]
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        state.write_u64(self.head);
+        state.write_usize(self.len);
+        state.write(self.tail());
+    }
+}
+
 /// Counts one column's values, for [`ScalarValueCounts::from_pieces`].
 type Counter = fn(&[ArrayRef]) -> Option<ScalarValueCounts>;
 
@@ -915,12 +1006,12 @@ fn counter(data_type: &DataType) -> Option<Counter> {
         DataType::Decimal128(_, _) => ScalarValueCounts::primitive::<Decimal128Type>,
         DataType::Utf8 => |pieces| {
             ScalarValueCounts::count(pieces, |piece| {
-                Some(non_null(piece.as_string_opt::<i32>()?.iter()))
+                Some(non_null(piece.as_string_opt::<i32>()?.iter()).map(CountedStr::of_row))
             })
         },
         DataType::LargeUtf8 => |pieces| {
             ScalarValueCounts::count(pieces, |piece| {
-                Some(non_null(piece.as_string_opt::<i64>()?.iter()))
+                Some(non_null(piece.as_string_opt::<i64>()?.iter()).map(CountedStr::of_row))
             })
         },
         _ => return None,
@@ -2562,6 +2653,58 @@ mod tests {
                 (ScalarValue::Int64(Some(7)), 1),
             ]
         );
+    }
+
+    /// Strings are counted by value whatever their length: values that
+    /// share their first eight bytes, differ only past them, or differ only
+    /// by trailing NUL bytes are told apart, and equal values are folded.
+    #[test]
+    fn string_value_counts_match_a_plain_count() {
+        let values: Vec<Option<&str>> = vec![
+            Some("en"),
+            None,
+            Some("de"),
+            Some(""),
+            Some("a"),
+            Some("a\0"),
+            Some("a\0\0"),
+            Some("abcdefgh"),
+            Some("abcdefghi"),
+            Some("abcdefgh\0"),
+            Some("abcdefghij"),
+            Some("abcdefgha"),
+            Some("zzzzzzzzzzzz"),
+            Some("zzzzzzzzzzzy"),
+            Some("Ä"),
+            Some("é"),
+            Some("en"),
+            Some("abcdefghi"),
+        ];
+        let mut expected: std::collections::BTreeMap<&str, u64> = Default::default();
+        for value in values.iter().flatten() {
+            *expected.entry(value).or_default() += 1;
+        }
+        let expected: Vec<(ScalarValue, u64)> = expected
+            .into_iter()
+            .map(|(value, count)| (ScalarValue::Utf8(Some(value.to_string())), count))
+            .collect();
+        let column: ArrayRef = Arc::new(StringArray::from(values.clone()));
+        let counts = ScalarStatsAgg::from_column(&column)
+            .expect("utf8 stats")
+            .value_counts
+            .expect("under cap");
+        assert_eq!(counts.entries(), expected.as_slice());
+        // Split into pieces, the same table.
+        let pieces = [column.slice(0, 7), column.slice(7, values.len() - 7)];
+        let split = ScalarValueCounts::from_pieces(&pieces).expect("under cap");
+        assert_eq!(split.entries(), expected.as_slice());
+        let large: ArrayRef = Arc::new(LargeStringArray::from(values.clone()));
+        let large = ScalarValueCounts::from_pieces(&[large]).expect("under cap");
+        assert_eq!(large.entries().len(), expected.len());
+        for ((value, count), (want, want_count)) in large.entries().iter().zip(&expected) {
+            assert_eq!(value.to_string(), want.to_string());
+            assert_eq!(count, want_count);
+        }
     }
 
     #[test]
