@@ -450,8 +450,8 @@ async fn put_built(
     Ok(())
 }
 
-/// Store the objects a merge hands over as its ranges finish, at most the
-/// tier and slice waves of [`write_tiers_and_slices`] at once. The first
+/// Store the objects a merge hands over as it cuts them, at most the tier
+/// and slice waves of [`write_tiers_and_slices`] at once. The first
 /// error stops the uploads still running and closes the stream.
 async fn upload_objects(
     storage: Arc<dyn StorageProvider>,
@@ -1157,7 +1157,6 @@ fn fold_window(costs: &[FoldCost], max_layers: usize, max_bytes: u64) -> Option<
 /// renumbers, which changes every layer's ordinals. `fold`'s output, not yet
 /// written, stands in at its place with its inputs' bytes and is not
 /// returned; nor is a layer that fold would drop unread.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn layers_after(
     root: &Root,
     fold: &OptimizeFold,
@@ -1202,7 +1201,7 @@ pub(crate) fn layers_after(
         .collect()
 }
 
-/// Fetch `layers` into `reuse` once `downloaded` is told, through a
+/// Fetch `layers` into `reuse_dir` once `downloaded` is told, through a
 /// directory of its own whose files are renamed into `reuse` only when all
 /// landed: a fold reading `reuse` meanwhile never meets a partial file, and
 /// a rename leaves the files it links to as they were. Best effort: a
@@ -1210,11 +1209,19 @@ pub(crate) fn layers_after(
 pub(crate) async fn prefetch_layers(
     storage: Arc<dyn StorageProvider>,
     layers: Vec<Layer>,
-    reuse: PathBuf,
+    reuse_dir: Arc<tempfile::TempDir>,
     downloaded: Arc<tokio::sync::Notify>,
 ) {
     downloaded.notified().await;
-    if layers.is_empty() || !has_room(&reuse) {
+    let reuse = reuse_dir.path().to_path_buf();
+    // Tier objects run a few times their slices' bytes; leave room twice over.
+    let wanted = layers
+        .iter()
+        .map(layer_bytes)
+        .fold(0u64, |sum, size| sum.saturating_add(size))
+        .saturating_mul(8);
+    let fits = fs4::available_space(&reuse).is_ok_and(|free| free > wanted);
+    if layers.is_empty() || !fits || !has_room(&reuse) {
         return;
     }
     let Ok(staging) = tempfile::TempDir::new_in(&reuse) else {
@@ -1372,8 +1379,8 @@ async fn fold_layers(
     }
     let ordinals = ordinals.to_vec();
     let policy = policy.clone();
-    // Each range's objects upload as the range finishes, beside the ranges
-    // still merging; the root that names them is written after all land.
+    // Each slice and tier object uploads as the merge cuts it; the root that
+    // names them is written after all land.
     let (sink, objects) = tokio::sync::mpsc::unbounded_channel();
     let uploads = task::spawn(upload_objects(
         Arc::clone(storage),
@@ -1404,8 +1411,9 @@ async fn fold_layers(
     .instrument(detail_span!("fold.merge"))
     .await;
     let uploaded = uploads.instrument(detail_span!("fold.upload_tail")).await;
-    let merged = merged.map_err(|e| TermIndexError::Build(e.to_string()))??;
+    // An upload that failed first is the cause; the merge saw only a closed sink.
     uploaded.map_err(|e| TermIndexError::Build(format!("term-index upload: {e}")))??;
+    let merged = merged.map_err(|e| TermIndexError::Build(e.to_string()))??;
     debug_assert!(merged.tiers.is_empty() && merged.slices.is_empty());
     for (slice, tier) in consumed {
         let _ = std::fs::remove_file(slice);
@@ -1560,7 +1568,9 @@ enum ObjectCheck {
     Tier,
 }
 
-/// Whether every slice and tier object `root` names is on storage, filling
+/// Whether the objects `root` names are on storage, as one slice and one
+/// tier object per layer tell it (an object lost elsewhere in a layer fails
+/// the fold that reads it, or a query, until a fold indexes again), filling
 /// in each slice length `root` lacks from what storage reports, and which
 /// layers hold a slice of the layout before tiers. Each layer `seen` lacks
 /// costs two requests, its first slice's first bytes and one tier object's

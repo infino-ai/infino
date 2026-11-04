@@ -1548,13 +1548,17 @@ impl LayerWriter {
             if let (Some(hash), Some(bytes)) = (tier, tier_bytes) {
                 let kept = self.keep(&format!("{stem}.{TIER_FILE_EXTENSION}"), bytes)?;
                 match &self.sink {
-                    Some(sink) => drop(sink.send(("tier", hash, kept))),
+                    Some(sink) => sink
+                        .send(("tier", hash, kept))
+                        .map_err(|_| uploader_gone())?,
                     None => self.tier_bytes.push((hash, kept)),
                 }
             }
             let kept = self.keep(&format!("{stem}.slice"), bytes)?;
             match &self.sink {
-                Some(sink) => drop(sink.send(("slice", reference.content_hash, kept))),
+                Some(sink) => sink
+                    .send(("slice", reference.content_hash, kept))
+                    .map_err(|_| uploader_gone())?,
                 None => self.slice_bytes.push((reference.content_hash, kept)),
             }
             self.slices.push(reference);
@@ -2151,8 +2155,14 @@ pub(crate) fn merge_layers(
     merge_layers_into(sources, ordinals, policy, None)
 }
 
-/// Where a merge hands each finished range's tier objects and slices, by
-/// kind, so they upload while the other ranges still merge.
+/// The error a merge stops with once its uploader has failed and closed
+/// the sink; the uploader reports the cause.
+fn uploader_gone() -> TermIndexError {
+    TermIndexError::Build("the term-index uploader stopped".into())
+}
+
+/// Where a merge hands each tier object and slice as it cuts them, by kind,
+/// so they upload while the merge goes on.
 pub(crate) type ObjectSink =
     tokio::sync::mpsc::UnboundedSender<(&'static str, ContentHash, BuiltBytes)>;
 

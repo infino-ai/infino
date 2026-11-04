@@ -12052,6 +12052,20 @@ struct KeptBatch {
     layer: Option<ReservedLayer>,
 }
 
+/// The prefetch running beside an optimize call's current fold, stopped
+/// when the call ends however it ends. The task holds the call's reuse
+/// directory, so the directory goes once the stopped task lets go of it.
+#[derive(Default)]
+struct Prefetch(Mutex<Option<tokio::task::JoinHandle<()>>>);
+
+impl Drop for Prefetch {
+    fn drop(&mut self) {
+        if let Some(task) = self.0.get_mut().ok().and_then(Option::take) {
+            task.abort();
+        }
+    }
+}
+
 /// A fold kept across its publish's retries: the root it was made of, and
 /// the folded root (see `term_index::rebase`).
 struct KeptFold {
@@ -12106,11 +12120,13 @@ pub(in crate::supertable) async fn stamp_term_index(
     // leaves fewer layers than it found.
     let budget: OnceLock<usize> = OnceLock::new();
     // What this call's folds upload, kept on local disk for the folds after.
-    let reuse = term_index_scratch(&inner.options.term_index_build_policy())
-        .map_err(TermIndexError::from)?;
+    let reuse = Arc::new(
+        term_index_scratch(&inner.options.term_index_build_policy())
+            .map_err(TermIndexError::from)?,
+    );
     let reuse_path = reuse.path().to_path_buf();
     // The next fold's inputs, fetched while this one merges and uploads.
-    let prefetch: Mutex<Option<tokio::task::JoinHandle<()>>> = Mutex::new(None);
+    let prefetch = Prefetch::default();
     // One renumbering fold per call. Commits that land while it runs are
     // stacked on it past nil padding, which would call for another at once;
     // the next optimize's drops it.
@@ -12123,8 +12139,8 @@ pub(in crate::supertable) async fn stamp_term_index(
         let kept_batch: Mutex<Option<KeptBatch>> = Mutex::new(None);
         let kept_fold: Mutex<Option<KeptFold>> = Mutex::new(None);
         stamp_with_retries(inner, &storage, "term-index", |old| {
-            let (storage, published, budget, reuse_path, prefetch) =
-                (&storage, &published, &budget, &reuse_path, &prefetch);
+            let (storage, published, budget, reuse, reuse_path, prefetch) =
+                (&storage, &published, &budget, &reuse, &reuse_path, &prefetch);
             let (kept_batch, kept_fold, renumbered) = (&kept_batch, &kept_fold, &renumbered);
             async move {
                 published.store(false, Ordering::Relaxed);
@@ -12171,6 +12187,10 @@ pub(in crate::supertable) async fn stamp_term_index(
                         return Ok(Some(old.with_term_index(reference, true)));
                     }
                     let renumber = !renumbered.load(Ordering::Relaxed);
+                    // Kept outputs and prefetched inputs fill the scratch disk
+                    // as the call goes, so each pass measures its free space again.
+                    let fold_max_bytes = fs4::available_space(reuse_path)
+                        .map_or(fold_max_bytes, |free| fold_max_bytes.min(free / 2));
                     if let Some(fold) = term_index::plan_fold_at_optimize(
                         &root,
                         &live,
@@ -12180,7 +12200,7 @@ pub(in crate::supertable) async fn stamp_term_index(
                         before_tiers,
                     ) {
                         // The fetch started for this fold lands before its own download.
-                        let started = prefetch.lock().expect("prefetch").take();
+                        let started = prefetch.0.lock().expect("prefetch").take();
                         if let Some(started) = started {
                             let _ = started.await;
                         }
@@ -12197,11 +12217,11 @@ pub(in crate::supertable) async fn stamp_term_index(
                             ),
                             false => Vec::new(),
                         };
-                        *prefetch.lock().expect("prefetch") =
+                        *prefetch.0.lock().expect("prefetch") =
                             Some(tokio::spawn(term_index::prefetch_layers(
                                 Arc::clone(storage),
                                 next,
-                                reuse_path.clone(),
+                                Arc::clone(reuse),
                                 Arc::clone(&downloaded),
                             )));
                         let policy = term_index::BuildPolicy {
