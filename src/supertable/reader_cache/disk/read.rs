@@ -249,16 +249,17 @@ impl DiskCacheStore {
     /// later callers into a second download. A Load that joins that fetch still ends with a whole
     /// file (see [`Self::fetch_local_or_source_coalesced`]).
     fn drop_lazy_entry(&self, uri: &SuperfileUri) {
-        if let Some((_, removed)) = self
-            .cached
-            .remove_if(uri, |_, entry| !entry.has_whole_file())
+        // The Load downloads the whole file itself, so the background download is cancelled
+        // even when a whole copy keeps the entry.
+        if let Some(removed) =
+            self.remove_entry_cancelling_fill(uri, |entry| !entry.has_whole_file())
         {
             self.release_entry_accounting(&removed);
         }
     }
 
     /// Every hit is served through here: bump the entry's LRU time and, for [`ReadIntent::Warm`],
-    /// start its background fill if it has not started yet.
+    /// start the file's background download if it has none.
     fn serve(
         self: &Arc<Self>,
         uri: &SuperfileUri,
@@ -428,13 +429,13 @@ impl DiskCacheStore {
         )))
     }
 
-    /// Block until no cache entry has a background fill still in flight
-    /// (fill spawned, not yet mmap-promoted), or fail after `timeout`.
+    /// Block until no background download is running, cancelled ones included,
+    /// or fail after `timeout`.
     ///
-    /// Scoped to work the caller's own opens actually caused: entries that
-    /// never spawned a fill (vector opens) and superfiles never opened at
-    /// all are not waited on. Registering as a promotion waiter lets fills
-    /// still in their first wait go without waiting out the defer window.
+    /// Downloads outlive their entries, so this waits for every file a Warm read
+    /// touched; Stream reads start none. Registering as a promotion waiter lets
+    /// downloads still in their first wait go without waiting out the defer
+    /// window.
     #[cfg(any(test, feature = "test-helpers"))]
     pub async fn wait_until_fills_settled(
         self: &Arc<Self>,
@@ -443,14 +444,7 @@ impl DiskCacheStore {
         let _guard = PromotionWaitGuard::new(&self.n_promotion_waiters);
         let start = Instant::now();
         loop {
-            let pending = self.cached.iter().any(|entry| {
-                // A Paged entry whose fill latched but hasn't promoted to Mapped yet.
-                entry
-                    .value()
-                    .fill_spawned()
-                    .is_some_and(|f| f.load(Ordering::Acquire))
-            });
-            if !pending {
+            if self.fills_running.load(Ordering::Acquire) == 0 {
                 return Ok(());
             }
             if start.elapsed() >= timeout {
@@ -1069,7 +1063,7 @@ mod tests {
 
         // Ask eviction for one byte. It is all-or-nothing, so a tiny request picks our one entry.
         store
-            .evict_at_least(1)
+            .evict_at_least(1, None)
             .await
             .expect("the one cached entry is evictable");
         assert_eq!(store.stats().n_entries, 0, "the entry left the cache");

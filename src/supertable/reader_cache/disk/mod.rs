@@ -13,7 +13,7 @@ use std::{
     path::PathBuf,
     process,
     sync::{
-        Arc, OnceLock, Weak,
+        Arc, OnceLock,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     thread,
@@ -83,6 +83,11 @@ const BLOCKS_IDX_TMP_INFIX: &str = ".idx.tmp.";
 /// deleting a live one would fail the owner's rename and cost it a retried fetch.
 const TMP_RECLAIM_AGE: Duration = Duration::from_secs(15 * 60);
 
+/// How long a failed background download waits before a read may start it again. Without it, a
+/// file whose download keeps failing (its GETs fail, its bytes fail the check, the budget cannot
+/// hold it) is downloaded again, whole, by every read.
+const FAILED_FILL_RETRY_AFTER: Duration = Duration::from_secs(60);
+
 /// Numbers each download's tempfile across every store in this process, see
 /// [`DiskCacheStore::tmp_path`].
 static NEXT_TMP: AtomicU64 = AtomicU64::new(0);
@@ -104,7 +109,7 @@ fn foreground_notify() -> &'static Notify {
 ///
 /// Entering the guard notifies downloading fills so a same-URI fill can pause
 /// for lazy query reads. Unrelated URI fills are not paused by this guard —
-/// only by that URI's own reader hold ([`reader_blocks_background_fill`]).
+/// only by that URI's own reader hold ([`DiskCacheStore::file_in_use`]).
 pub struct ForegroundQueryGuard(());
 
 impl ForegroundQueryGuard {
@@ -131,12 +136,6 @@ fn file_mtime_us(meta: &fs::Metadata) -> u64 {
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
         .map(|d| d.as_micros() as u64)
         .unwrap_or(0)
-}
-
-/// Pause this URI's background fill while a caller besides the cache entry holds its lazy reader
-/// (`strong_count > 1`). Other URIs are unaffected.
-fn reader_blocks_background_fill(reader: &Weak<SuperfileReader>) -> bool {
-    reader.strong_count() > 1
 }
 
 /// Errors surfaced by [`DiskCacheStore::open_for_query`] and its sibling reader entry points.
@@ -232,15 +231,73 @@ enum Residency {
         mmap: Arc<Mmap>,
         vector_source: Option<Arc<BlockCachedSource>>,
     },
-    /// Byte ranges fetched on demand from object storage and cached locally in blocks.
-    /// `fill_spawned` latches the single background download so it starts at most once.
+    /// Byte ranges fetched on demand from object storage and cached locally in blocks, until the
+    /// file's [`BackgroundFill`] has downloaded the whole file.
     Paged {
         block_source: Arc<BlockCachedSource>,
-        fill_spawned: AtomicBool,
     },
 }
 
+/// The background download of a whole file, one per file, kept in [`DiskCacheStore::fills`] and
+/// not on the file's cache entry.
+///
+/// The cache drops lazy entries no query holds once it has more than the table's
+/// `superfiles_in_flight`, and the next read opens the file again with a new entry. Tied to the
+/// entry, the download would be thrown away and started over on every reopen. Kept by file:
+///
+/// ```text
+///   Warm read          ─► registered, one per file ─► slot ─► reserves ─► downloads ─► lands
+///   reopen             ─► finds it registered, starts nothing
+///   cap drops entry    ─► the entry goes, the download goes on (kept while it downloads)
+///   evict, erase, Load ─► cancel_fill: it stops at its next check and never lands
+/// ```
+///
+/// It lands in the file's lazy entry, or, with no entry, on disk for the next read. A failed
+/// download stays registered for [`FAILED_FILL_RETRY_AFTER`], so a file that cannot download is
+/// not downloaded again by every read.
+#[derive(Default)]
+struct BackgroundFill {
+    /// The file left the cache, or a Load downloads it itself. The download stops at its next
+    /// check and never lands.
+    cancelled: AtomicBool,
+    /// The download holds a slot. Until it ends, the idle cap keeps the file's entry, so the
+    /// entry's Warm reservation still covers the download.
+    downloading: AtomicBool,
+    /// What the download reserved for itself: the part of the file its entry did not reserve.
+    reserved: AtomicU64,
+    /// When the download failed, in [`DiskCacheStore::now_us`] time; 0 if it has not.
+    failed_at_us: AtomicU64,
+}
+
+impl BackgroundFill {
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    /// Whether a read at `now_us` may start the file's download again: this one failed at least
+    /// [`FAILED_FILL_RETRY_AFTER`] ago. A running download is never replaced.
+    fn may_retry(&self, now_us: u64) -> bool {
+        let failed_at_us = self.failed_at_us.load(Ordering::Acquire);
+        failed_at_us != 0
+            && now_us.saturating_sub(failed_at_us) >= FAILED_FILL_RETRY_AFTER.as_micros() as u64
+    }
+}
+
 impl CachedEntry {
+    /// Whether a query holds this entry's reader.
+    fn held_by_query(&self) -> bool {
+        Arc::strong_count(&self.reader) > 1
+    }
+
+    /// What this entry reserved for the whole file: its size when a Warm open reserved it
+    /// (`Eager`), 0 when its block source reserves only the blocks it fills.
+    fn whole_file_charge(&self) -> u64 {
+        match self.accounting {
+            EntryAccounting::Eager => self.size_bytes.load(Ordering::Acquire),
+            EntryAccounting::SourceOwned => 0,
+        }
+    }
+
     /// The mmap when this entry is [`Residency::Mapped`], for the idle-page sweep's `madvise`.
     fn mmap(&self) -> Option<&Arc<Mmap>> {
         match &self.residency {
@@ -270,14 +327,6 @@ impl CachedEntry {
             Residency::Paged { block_source, .. } => Some(block_source),
             Residency::Mapped { vector_source, .. } => vector_source.as_ref(),
             Residency::Buffered => None,
-        }
-    }
-
-    /// The background-fill latch when this entry is [`Residency::Paged`].
-    fn fill_spawned(&self) -> Option<&AtomicBool> {
-        match &self.residency {
-            Residency::Paged { fill_spawned, .. } => Some(fill_spawned),
-            _ => None,
         }
     }
 
@@ -414,6 +463,15 @@ pub struct DiskCacheStore {
     prefetch_semaphore: Arc<Semaphore>,
     /// Background fills waiting for a query to let go of their file.
     fill_waiters: FillWaiters,
+    /// Each file's background download, running or failed (see [`BackgroundFill`]). A cancelled
+    /// one is removed at once, and may still be winding down.
+    ///
+    /// Lock order: `cached` before `fills`, never the reverse. Removing an entry cancels its
+    /// download under the entry's lock.
+    fills: DashMap<SuperfileUri, Arc<BackgroundFill>>,
+    /// Download tasks still running, cancelled ones included; what `wait_until_fills_settled`
+    /// waits for.
+    fills_running: AtomicUsize,
 }
 
 impl fmt::Debug for DiskCacheStore {
@@ -511,6 +569,8 @@ impl DiskCacheStore {
             pinned_fn: std::sync::Mutex::new(pinned_fn),
             prefetch_semaphore,
             fill_waiters: FillWaiters::default(),
+            fills: DashMap::new(),
+            fills_running: AtomicUsize::new(0),
         });
 
         // Record what is already on disk so the budget is correct from the start. Files are opened

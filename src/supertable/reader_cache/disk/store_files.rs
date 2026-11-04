@@ -93,7 +93,7 @@ impl DiskCacheStore {
         // unwind — `reserve_manual` keeps the bytes
         // reserved; we manually roll back on the rare error
         // path below.
-        self.reserve_manual(size).await?;
+        self.reserve_manual(size, None).await?;
 
         // Roll back the reservation on any error past this
         // point. Wrap the rest in a closure-shape so `?`
@@ -460,6 +460,56 @@ impl DiskCacheStore {
         }
     }
 
+    /// Leave a finished background download under its cache name when no entry holds the file, as
+    /// if a restart had found it there: the next read opens it from disk (see
+    /// [`Self::fetch_from_disk_cache`]), and eviction takes it before anything a query opened.
+    /// Recorded at `size`, as the scan records a file; `reserved` pays for it, and the rest is
+    /// given back.
+    ///
+    /// Done under the entry's lock, which an eviction, erase or Load takes to cancel (see
+    /// [`Self::remove_entry_cancelling_fill`]), so a cancelled download never lands. An older copy
+    /// under either name is deleted first, so no file is left on disk that nothing counts.
+    pub(super) fn land_on_disk(
+        &self,
+        uri: &SuperfileUri,
+        fill: &BackgroundFill,
+        tmp: &Path,
+        holed: bool,
+        size: u64,
+        reserved: u64,
+    ) {
+        let final_path = if holed {
+            self.hole_path(uri)
+        } else {
+            self.cache_path(uri)
+        };
+        let slot = self.cached.entry(*uri);
+        let landed = matches!(slot, Entry::Vacant(_)) && !fill.is_cancelled() && {
+            self.remove_local_copy(uri);
+            fs::rename(tmp, &final_path).is_ok()
+        };
+        if !landed {
+            drop(slot);
+            let _ = fs::remove_file(tmp);
+            self.release_block_bytes(reserved);
+            return;
+        }
+        let file = UnindexedFile {
+            size_bytes: size,
+            mtime_us: fs::metadata(&final_path).map_or(0, |meta| file_mtime_us(&meta)),
+        };
+        let prior = self
+            .unindexed
+            .insert(*uri, file)
+            .map_or(0, |prior| prior.size_bytes);
+        // A whole copy serves every range, and the block file is dead weight.
+        if !holed {
+            self.drop_block_file(uri);
+        }
+        drop(slot);
+        self.release_block_bytes((reserved + prior).saturating_sub(size));
+    }
+
     /// [`Self::retain_block_file`] for a block source dropped before its entry was admitted (an
     /// open that failed, was cancelled, or lost its slot to a whole file). Such a source writes no
     /// blocks, so what it holds is a file it adopted, whose record it took over. Skipped when a
@@ -503,7 +553,7 @@ impl DiskCacheStore {
     /// outlives its source. Returns whether an index entry was present, which is what `n_gc_drops`
     /// counts.
     pub(crate) fn erase_superfile_local_copy(&self, uri: &SuperfileUri) -> bool {
-        let present = if let Some((_, entry)) = self.cached.remove(uri) {
+        let present = if let Some(entry) = self.remove_entry_cancelling_fill(uri, |_| true) {
             self.release_entry_accounting(&entry);
             true
         } else {
@@ -1599,7 +1649,7 @@ mod tests {
 
         // The phantom is gone, so nothing can unlink the replacement out from under its entry.
         assert_eq!(
-            opened.evict_unindexed(u64::MAX),
+            opened.evict_unindexed(u64::MAX, None),
             0,
             "no unindexed leftovers"
         );
