@@ -600,8 +600,10 @@ pub(crate) fn bisect_order_reported(
 /// is the same.
 fn split_levels(fwd: &ForwardIndex, order: &mut [u32], pool: &StatePool, run: Bisect<'_>) {
     let width = rayon::current_num_threads();
-    let mut level: Vec<&mut [u32]> = vec![order];
-    let mut handed_on: Vec<(&mut [u32], u32)> = Vec::new();
+    // Each partition travels with its distinct terms once a refine has
+    // counted them; nothing has counted the root's.
+    let mut level: Vec<(&mut [u32], Option<usize>)> = vec![(order, None)];
+    let mut handed_on: Vec<(&mut [u32], u32, Option<usize>)> = Vec::new();
     let mut depth = 0u32;
     // A level at a time while the level is narrower than the pool, and for
     // as long as no level has set the bar: each completed level offers its
@@ -615,54 +617,72 @@ fn split_levels(fwd: &ForwardIndex, order: &mut [u32], pool: &StatePool, run: Bi
         // `split_halves` would give it — so the levels keep offering until
         // one lowers the cost.
         let wide = run.has_reference();
-        let (here, rest): (Vec<_>, Vec<_>) = level.into_iter().partition(|part| {
+        let (here, rest): (Vec<_>, Vec<_>) = level.into_iter().partition(|(part, distinct)| {
             part.len() > MIN_PARTITION
                 && depth < MAX_DEPTH
                 && (part.len() >= PARALLEL_MIN_PARTITION || !wide)
-                && !localizing_pays(fwd, part)
+                && !localizing_pays(fwd, *distinct)
         });
-        handed_on.extend(rest.into_iter().map(|part| (part, depth)));
-        let docs: usize = here.iter().map(|part| part.len()).sum();
-        let split: Vec<(f64, [&mut [u32]; 2])> = here
+        handed_on.extend(
+            rest.into_iter()
+                .map(|(part, distinct)| (part, depth, distinct)),
+        );
+        let docs: usize = here.iter().map(|(part, _)| part.len()).sum();
+        let split: Vec<(Refined, [&mut [u32]; 2])> = here
             .into_par_iter()
-            .map(|part| {
+            .map(|(part, _)| {
                 let mid = part.len() / 2;
                 let parallel = part.len() >= PARALLEL_MIN_PARTITION;
-                let first_round = pool.with_state(|state| {
-                    let first_round = state.refine(fwd, part, mid, depth, parallel, run);
+                let refined = pool.with_state(|state| {
+                    let refined = state.refine(fwd, part, mid, depth, parallel, run);
                     state.flush(run.report);
-                    first_round
+                    refined
                 });
                 let (left, right) = part.split_at_mut(mid);
-                (first_round, [left, right])
+                (refined, [left, right])
             })
             .collect();
         // The level's splits ran side by side, but their first rounds' gains
         // are summed here in partition order, so the bar they offer is the
         // same on every run.
-        run.offer_reference(split.iter().map(|(gain, _)| gain).sum(), docs);
-        level = split.into_iter().flat_map(|(_, halves)| halves).collect();
+        run.offer_reference(
+            split
+                .iter()
+                .map(|(refined, _)| refined.first_round_gain)
+                .sum(),
+            docs,
+        );
+        level = split
+            .into_iter()
+            .flat_map(|(refined, halves)| halves.into_iter().zip(refined.distinct.map(Some)))
+            .collect();
         depth += 1;
     }
-    handed_on.extend(level.into_iter().map(|part| (part, depth)));
+    handed_on.extend(
+        level
+            .into_iter()
+            .map(|(part, distinct)| (part, depth, distinct)),
+    );
     handed_on
         .into_par_iter()
-        .for_each(|(part, depth)| split_parallel(fwd, part, depth, pool, run));
+        .for_each(|(part, depth, distinct)| split_parallel(fwd, part, depth, pool, run, distinct));
 }
 
 /// Split `order` as [`BisectState::split`] does, running the two halves
-/// of a large partition in parallel.
+/// of a large partition in parallel. `distinct` is the partition's distinct
+/// terms, where its parent's refine counted them.
 fn split_parallel(
     fwd: &ForwardIndex,
     order: &mut [u32],
     depth: u32,
     pool: &StatePool,
     run: Bisect<'_>,
+    distinct: Option<usize>,
 ) {
     if order.len() <= MIN_PARTITION || depth >= MAX_DEPTH {
         return;
     }
-    if localizing_pays(fwd, order) {
+    if localizing_pays(fwd, distinct) {
         let started = REPORT.then(Instant::now);
         let local = pool.with_state(|state| state.localize(fwd, order));
         if let Some(started) = started {
@@ -680,7 +700,9 @@ fn split_parallel(
             n_terms: local.n_terms,
             free: Mutex::new(Vec::new()),
         };
-        split_parallel(&local, &mut inner, depth, &inner_pool, run);
+        // Its terms fill the new table exactly, so it does not renumber
+        // again before it splits.
+        split_parallel(&local, &mut inner, depth, &inner_pool, run, None);
         apply_inner_order(order, &inner);
         return;
     }
@@ -716,18 +738,19 @@ fn split_parallel(
     // own parallel pieces would steal a whole queued subtree and finish it
     // before resuming, which put one split's ranking at 46 s instead of 0.3 s.
     // The root's first round offers the bar from inside `refine`.
-    pool.with_state(|state| {
-        state.refine(fwd, order, mid, depth, depth == 0, run);
+    let [left_distinct, right_distinct] = pool.with_state(|state| {
+        let refined = state.refine(fwd, order, mid, depth, depth == 0, run);
         state.flush(run.report);
+        refined.distinct
     });
     let (left, right) = order.split_at_mut(mid);
     let (left_done, right_done) = join(
         || {
-            split_parallel(fwd, left, depth + 1, pool, run);
+            split_parallel(fwd, left, depth + 1, pool, run, Some(left_distinct));
             REPORT.then(Instant::now)
         },
         || {
-            split_parallel(fwd, right, depth + 1, pool, run);
+            split_parallel(fwd, right, depth + 1, pool, run, Some(right_distinct));
             REPORT.then(Instant::now)
         },
     );
@@ -745,24 +768,27 @@ fn split_parallel(
 /// Whether renumbering this partition's terms would pay for itself.
 ///
 /// The degree and move-gain tables are sized by the vocabulary they are
-/// indexed against, and a partition can carry no more distinct terms than it
-/// has postings. So when the postings cannot fill half the current table,
-/// renumbering is guaranteed to at least halve it, and one pass over the
-/// partition buys every split below a table that sits closer to cache.
+/// indexed against, and every round of every split below reads them at
+/// random. Once the partition's own distinct terms fill no more than half the
+/// current table, renumbering them into a dense range at least halves it, and
+/// one pass over the partition buys every split below a table that sits closer
+/// to cache.
 ///
-/// Expressing the trigger as "the vocabulary has shrunk by half" rather than
-/// as a document count is what makes it travel between corpora: it fires on
-/// the relationship between a partition and its vocabulary, which is the thing
-/// that actually decides whether the tables are oversized. Halving at minimum
-/// also bounds how often it can fire on any root-to-leaf path.
-fn localizing_pays(fwd: &ForwardIndex, order: &[u32]) -> bool {
-    // An empty table cannot shrink, and without this a partition carrying no
-    // terms at all satisfies the test against its own renumbering forever.
-    if fwd.n_terms == 0 {
-        return false;
-    }
-    let postings: usize = order.iter().map(|&d| fwd.doc(d).len()).sum();
-    postings.saturating_mul(2) <= fwd.n_terms
+/// The test is on the terms the partition actually carries, which its
+/// parent's refine has already counted, so it costs nothing to make. A test on
+/// postings instead, which bound the distinct terms from above, waits far
+/// longer than it needs to: a few common terms make up most postings, so the
+/// partitions in the middle of the recursion keep running against tables
+/// sized for a much larger one. Halving at minimum also bounds how often it
+/// fires on any root-to-leaf path, and nothing here depends on the corpus: it
+/// is the relationship between a partition and its vocabulary that decides
+/// whether the tables are oversized.
+///
+/// `distinct` is `None` where no refine has counted the partition: the root,
+/// and a partition just renumbered, whose terms fill its new table.
+fn localizing_pays(fwd: &ForwardIndex, distinct: Option<usize>) -> bool {
+    // An empty table cannot shrink.
+    fwd.n_terms > 0 && distinct.is_some_and(|distinct| distinct.saturating_mul(2) <= fwd.n_terms)
 }
 
 /// Apply a permutation computed over a partition's own positions back onto
@@ -772,6 +798,15 @@ fn apply_inner_order(order: &mut [u32], inner: &[u32]) {
     for (slot, &i) in order.iter_mut().zip(inner.iter()) {
         *slot = was[i as usize];
     }
+}
+
+/// What a refine leaves for the splits below it.
+struct Refined {
+    /// What its first round lowered the cost by: its offer towards the run's
+    /// bar.
+    first_round_gain: f64,
+    /// The distinct terms each half carries, left then right.
+    distinct: [usize; 2],
 }
 
 /// Scratch states shared by the parallel splits. A split takes one and
@@ -908,11 +943,20 @@ impl BisectState {
         }
     }
 
-    fn split(&mut self, fwd: &ForwardIndex, order: &mut [u32], depth: u32, run: Bisect<'_>) {
+    /// Split `order` and its halves down to the leaves. `distinct` is the
+    /// partition's distinct terms, where its parent's refine counted them.
+    fn split(
+        &mut self,
+        fwd: &ForwardIndex,
+        order: &mut [u32],
+        depth: u32,
+        run: Bisect<'_>,
+        distinct: Option<usize>,
+    ) {
         if order.len() <= MIN_PARTITION || depth >= MAX_DEPTH {
             return;
         }
-        if localizing_pays(fwd, order) {
+        if localizing_pays(fwd, distinct) {
             let started = REPORT.then(Instant::now);
             let local = self.localize(fwd, order);
             if let Some(started) = started {
@@ -927,7 +971,9 @@ impl BisectState {
             }
             let mut inner: Vec<u32> = (0..order.len() as u32).collect();
             let mut inner_state = BisectState::new(local.n_terms);
-            inner_state.split(&local, &mut inner, depth, run);
+            // Its terms fill the new table exactly, so it goes straight to
+            // its split.
+            inner_state.split_halves(&local, &mut inner, depth, run);
             inner_state.flush(run.report);
             apply_inner_order(order, &inner);
             return;
@@ -935,19 +981,16 @@ impl BisectState {
         self.split_halves(fwd, order, depth, run);
     }
 
-    /// [`Self::split`] with the entry tests already made.
-    ///
-    /// Only for a caller that has just run them against this same partition:
-    /// [`localizing_pays`] walks every posting in `order` to decide, so the
-    /// handoff out of the parallel splitter would otherwise pay for that walk
-    /// twice to reach the answer it already has.
+    /// [`Self::split`] with the entry tests already made: for a caller that
+    /// has just run them against this same partition.
     fn split_halves(&mut self, fwd: &ForwardIndex, order: &mut [u32], depth: u32, run: Bisect<'_>) {
         let mid = order.len() / 2;
         // The root's first round offers the bar from inside `refine`.
-        self.refine(fwd, order, mid, depth, false, run);
+        let [left_distinct, right_distinct] =
+            self.refine(fwd, order, mid, depth, false, run).distinct;
         let (left, right) = order.split_at_mut(mid);
-        self.split(fwd, left, depth + 1, run);
-        self.split(fwd, right, depth + 1, run);
+        self.split(fwd, left, depth + 1, run, Some(left_distinct));
+        self.split(fwd, right, depth + 1, run, Some(right_distinct));
     }
 
     /// Move documents across the split while it lowers the cost, then
@@ -961,7 +1004,7 @@ impl BisectState {
         depth: u32,
         parallel: bool,
         run: Bisect<'_>,
-    ) -> f64 {
+    ) -> Refined {
         let started = REPORT.then(Instant::now);
         let span = match order.len() >= SPLIT_SPAN_MIN_DOCS {
             true => detail_span!(
@@ -1176,10 +1219,14 @@ impl BisectState {
 
         self.left_gains = left_gains;
         self.right_gains = right_gains;
+        let refined = Refined {
+            first_round_gain,
+            distinct: self.distinct_by_side(),
+        };
         self.clear_degrees();
 
         let Some(started) = started else {
-            return first_round_gain;
+            return refined;
         };
         match end {
             SplitEnd::Settled => level.settled = 1,
@@ -1198,7 +1245,18 @@ impl BisectState {
         span.record("swap_ms", level.swap_ns / 1_000_000);
         span.record("serial_cpu_ms", level.serial_cpu_ns / 1_000_000);
         self.note(depth, &level);
-        first_round_gain
+        refined
+    }
+
+    /// The distinct terms on each side of the split, read off its degree
+    /// tables: a pass over the terms the partition touches, not its postings.
+    fn distinct_by_side(&self) -> [usize; 2] {
+        self.touched.iter().fold([0, 0], |[left, right], &t| {
+            [
+                left + usize::from(self.deg_left[t as usize] > 0),
+                right + usize::from(self.deg_right[t as usize] > 0),
+            ]
+        })
     }
 
     /// The cost of the current split, from its degree tables. A large split
@@ -1602,6 +1660,8 @@ pub(crate) fn order_cost(fwd: &ForwardIndex, order: &[u32], window: usize) -> f6
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use rand::{RngExt, SeedableRng, rngs::StdRng};
     use rayon::ThreadPoolBuilder;
 
@@ -1762,12 +1822,11 @@ mod tests {
     /// dense range.
     ///
     /// This is the shape the bisection is handed in production, and the one
-    /// that makes renumbering pay at the top of the recursion rather than deep
-    /// inside it: the degree tables are sized by the bucket space, which a
-    /// corpus's own postings come nowhere near filling. A dense-id corpus
-    /// cannot reach that path at all, because a partition large enough for the
-    /// parallel splitter to still own it carries far more postings than such a
-    /// vocabulary has terms.
+    /// that makes renumbering pay just below the root rather than deep inside
+    /// the recursion: the degree tables are sized by the bucket space, which a
+    /// corpus's own terms come nowhere near filling, so the first halves a
+    /// refine counts already carry under half of it. A dense-id corpus
+    /// renumbers only once a partition carries under half its vocabulary.
     fn scattered_into_buckets(
         n_docs: usize,
         n_clusters: usize,
@@ -1970,6 +2029,12 @@ mod tests {
         }
     }
 
+    /// A corpus the serial splitter handles from the root, with enough
+    /// clusters that a partition deep in the recursion carries under half the
+    /// vocabulary.
+    const DENSE_RENUMBER_DOCS: usize = 4_000;
+    const DENSE_RENUMBER_CLUSTERS: usize = 16;
+
     /// Bucket space the merge hashes terms into, mirrored here so a test
     /// corpus has the sparse vocabulary a real one does.
     const TERM_BUCKETS: u32 = 1 << 22;
@@ -2168,22 +2233,86 @@ mod tests {
         );
     }
 
-    /// Renumbering at the top of the recursion, where the parallel splitter
-    /// still owns the partition, keeps the order the plain bisection produces.
-    ///
-    /// The dense-id cases cannot reach this: renumbering only fires for them
-    /// once the recursion has cut partitions down to a few dozen documents, by
-    /// which point the serial splitter has long since taken over.
+    /// Renumbering where the parallel splitter still owns the partition keeps
+    /// the order the plain bisection produces. The root never renumbers: no
+    /// refine has counted its terms; its halves do, as soon as they carry
+    /// under half the bucket space.
     #[test]
-    fn a_scattered_vocabulary_renumbers_at_the_top_and_keeps_the_order() {
+    fn a_scattered_vocabulary_renumbers_below_the_root_and_keeps_the_order() {
         let (fwd, _) = scattered_into_buckets(3 * PARALLEL_MIN_PARTITION, 11, 5);
-        let whole: Vec<u32> = (0..fwd.len() as u32).collect();
+        let (order, report) = bisect_order_reported(&fwd, exhaustive());
+        let localized = |depth: usize| report.levels.get(depth).map_or(0, |l| l.localized);
+        assert_eq!(localized(0), 0, "the root has no count to renumber on");
         assert!(
-            localizing_pays(&fwd, &whole),
-            "this corpus no longer renumbers at the root, so it has stopped \
-             covering the path it exists for"
+            localized(1) > 0,
+            "this corpus no longer renumbers just below the root, where the \
+             parallel splitter owns the partition, so it has stopped covering \
+             the path it exists for"
         );
-        assert_eq!(bisect_order(&fwd, exhaustive()), reference_order(&fwd));
+        assert_eq!(order, reference_order(&fwd));
+    }
+
+    /// A dense vocabulary renumbers too, once the recursion has cut a
+    /// partition down to under half of it, and keeps the order.
+    #[test]
+    fn a_dense_vocabulary_renumbers_once_its_halves_shrink_and_keeps_the_order() {
+        let (fwd, _) = clustered(DENSE_RENUMBER_DOCS, DENSE_RENUMBER_CLUSTERS, 3);
+        let (order, report) = bisect_order_reported(&fwd, exhaustive());
+        assert!(
+            report.levels.iter().any(|l| l.localized > 0),
+            "this corpus never renumbers, so it has stopped covering the path"
+        );
+        assert_eq!(order, reference_order(&fwd));
+    }
+
+    /// A refine reports, for each half it leaves, exactly the distinct terms
+    /// that half carries.
+    #[test]
+    fn a_refine_counts_the_distinct_terms_of_each_half() {
+        for (n, clusters, seed) in [(64usize, 2usize, 1u64), (500, 4, 2), (2_000, 9, 3)] {
+            let (fwd, _) = clustered(n, clusters, seed);
+            let mut order: Vec<u32> = (0..fwd.len() as u32).collect();
+            let reference = AtomicU64::new(0);
+            let report = RunReport::new();
+            let run = Bisect {
+                params: exhaustive(),
+                reference: &reference,
+                report: &report,
+                parent: &report.span,
+            };
+            let mid = order.len() / 2;
+            let refined =
+                BisectState::new(fwd.n_terms).refine(&fwd, &mut order, mid, 0, false, run);
+            let distinct = |half: &[u32]| {
+                half.iter()
+                    .flat_map(|&d| fwd.doc(d).iter().copied())
+                    .collect::<HashSet<u32>>()
+                    .len()
+            };
+            assert_eq!(
+                refined.distinct,
+                [distinct(&order[..mid]), distinct(&order[mid..])],
+                "n={n} clusters={clusters}"
+            );
+        }
+    }
+
+    /// The trigger: only a counted partition, only into a table it fills at
+    /// most half of, and never from an empty table.
+    #[test]
+    fn renumbering_pays_once_the_terms_fill_at_most_half_the_table() {
+        let fwd = ForwardIndex::from_docs(&[vec![0, 1], vec![2, 3], vec![4, 5], vec![6, 7]]);
+        let half = fwd.n_terms / 2;
+        assert!(!localizing_pays(&fwd, None), "nothing has counted it");
+        assert!(localizing_pays(&fwd, Some(0)));
+        assert!(localizing_pays(&fwd, Some(half)));
+        assert!(!localizing_pays(&fwd, Some(half + 1)));
+        assert!(!localizing_pays(&fwd, Some(fwd.n_terms)));
+        let empty = ForwardIndex::from_docs(&[vec![], vec![]]);
+        assert!(
+            !localizing_pays(&empty, Some(0)),
+            "an empty table cannot shrink"
+        );
     }
 
     #[test]
@@ -2198,7 +2327,7 @@ mod tests {
             report: &report,
             parent: &report.span,
         };
-        BisectState::new(fwd.n_terms).split(&fwd, &mut serial, 0, run);
+        BisectState::new(fwd.n_terms).split(&fwd, &mut serial, 0, run, None);
         assert_eq!(bisect_order(&fwd, exhaustive()), serial);
     }
 
