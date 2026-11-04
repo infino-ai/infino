@@ -128,6 +128,9 @@ pub(crate) struct BuildPolicy {
     /// Bytes a merge cursor reads from a tier object at a time; see
     /// [`TIER_READ_WINDOW_BYTES`].
     pub(crate) tier_read_window_bytes: u64,
+    /// Where an optimize call keeps the objects its folds upload, so a later
+    /// fold of the same call links them in place of fetching them.
+    pub(crate) reuse_dir: Option<PathBuf>,
     /// Whether a merge carries tier blocks over from its sources' chunks
     /// (see `splice_term`); off, every term takes the decoding path. Tests
     /// compare the two paths byte for byte.
@@ -220,6 +223,7 @@ impl Default for BuildPolicy {
             scoring_by_ordinal: Arc::new(Vec::new()),
             scoring_by_superfile: Arc::new(HashMap::new()),
             tier_read_window_bytes: TIER_READ_WINDOW_BYTES,
+            reuse_dir: None,
             #[cfg(test)]
             splice_tiers: true,
         }
@@ -1165,8 +1169,24 @@ impl ContributionReader {
 /// A heap entry: the record's key, and which contribution it came from.
 /// Ordered by key then ordinal so equal keys pop in ascending ordinal.
 struct MergeHead {
+    /// The key's first eight bytes, big-endian and zero-padded: most
+    /// comparisons end here, short of a byte-wise compare of the keys.
+    prefix: u64,
     key: Vec<u8>,
     ordinal: u32,
+}
+
+impl MergeHead {
+    fn new(key: Vec<u8>, ordinal: u32) -> Self {
+        let mut head = [0u8; 8];
+        let len = key.len().min(8);
+        head[..len].copy_from_slice(&key[..len]);
+        Self {
+            prefix: u64::from_be_bytes(head),
+            key,
+            ordinal,
+        }
+    }
 }
 
 impl PartialEq for MergeHead {
@@ -1182,8 +1202,9 @@ impl PartialOrd for MergeHead {
 }
 impl Ord for MergeHead {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.key
-            .cmp(&other.key)
+        self.prefix
+            .cmp(&other.prefix)
+            .then_with(|| self.key.cmp(&other.key))
             .then(self.ordinal.cmp(&other.ordinal))
     }
 }
@@ -1732,10 +1753,7 @@ fn build_range(
         let mut rd = ContributionReader::open_at(&c.path, offset)?;
         match rd.next_in(start, end)? {
             Some(rec) => {
-                heap.push(Reverse(MergeHead {
-                    key: rec.key,
-                    ordinal: ordinal as u32,
-                }));
+                heap.push(Reverse(MergeHead::new(rec.key, ordinal as u32)));
                 pending.push(Some((rec.posting, rec.head)));
             }
             None => pending.push(None),
@@ -1775,10 +1793,7 @@ fn build_range(
                 .expect("a reader for each pending record")
                 .next_in(None, end)?
             {
-                heap.push(Reverse(MergeHead {
-                    key: next.key,
-                    ordinal,
-                }));
+                heap.push(Reverse(MergeHead::new(next.key, ordinal)));
                 pending[ordinal as usize] = Some((next.posting, next.head));
             }
             Ok(())
@@ -2420,10 +2435,7 @@ fn merge_range(
     for (source, cursor) in cursors.iter_mut().enumerate() {
         match cursor.next()? {
             Some((key, run)) => {
-                heap.push(Reverse(MergeHead {
-                    key,
-                    ordinal: source as u32,
-                }));
+                heap.push(Reverse(MergeHead::new(key, source as u32)));
                 pending.push(Some(run));
             }
             None => pending.push(None),
@@ -2482,10 +2494,7 @@ fn merge_range(
                 Some(p)
             }));
             if let Some((key, next_run)) = cursors[source as usize].next()? {
-                heap.push(Reverse(MergeHead {
-                    key,
-                    ordinal: source,
-                }));
+                heap.push(Reverse(MergeHead::new(key, source)));
                 pending[source as usize] = Some(next_run);
             }
             next = match heap.peek() {

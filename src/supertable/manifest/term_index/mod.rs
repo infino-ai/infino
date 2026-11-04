@@ -424,6 +424,15 @@ async fn write_objects(
     run_bounded(SLICE_WRITE_CONCURRENCY, "object write", jobs).await
 }
 
+/// Whether the filesystem holding `dir` has more than a quarter of its
+/// space free, the floor kept objects stay above.
+fn has_room(dir: &Path) -> bool {
+    match (fs4::available_space(dir), fs4::total_space(dir)) {
+        (Ok(free), Ok(total)) => free > total / 4,
+        _ => false,
+    }
+}
+
 /// Store one built object of `kind`, reading it back from disk when it
 /// was spilled.
 async fn put_built(
@@ -447,6 +456,7 @@ async fn put_built(
 async fn upload_objects(
     storage: Arc<dyn StorageProvider>,
     mut objects: tokio::sync::mpsc::UnboundedReceiver<(&'static str, ContentHash, BuiltBytes)>,
+    reuse: Option<PathBuf>,
 ) -> Result<(), TermIndexError> {
     let mut running: JoinSet<Result<(), TermIndexError>> = JoinSet::new();
     let outcome = async {
@@ -454,7 +464,21 @@ async fn upload_objects(
             while running.len() >= 2 * SLICE_WRITE_CONCURRENCY {
                 join_one(&mut running, "object write").await?;
             }
-            running.spawn(put_built(Arc::clone(&storage), kind, hash, built));
+            let kept = match (&reuse, &built) {
+                (Some(reuse), BuiltBytes::Spilled { path, .. }) if has_room(reuse) => path
+                    .file_name()
+                    .map(|name| (path.clone(), reuse.join(name))),
+                _ => None,
+            };
+            let storage = Arc::clone(&storage);
+            running.spawn(async move {
+                // Linked before the put: the put drops the object's last
+                // hold on its spill directory, which then goes.
+                if let Some((from, to)) = kept {
+                    let _ = async_fs::hard_link(from, to).await;
+                }
+                put_built(storage, kind, hash, built).await
+            });
         }
         while !running.is_empty() {
             join_one(&mut running, "object write").await?;
@@ -1224,7 +1248,8 @@ async fn fold_layers(
         });
     }
     let scratch = scratch_dir(policy.scratch_root.as_deref())?;
-    let sources = download_layers(storage, &kept, scratch.path())
+    let reuse = policy.reuse_dir.as_deref();
+    let sources = download_layers(storage, &kept, scratch.path(), reuse)
         .instrument(detail_span!(
             "fold.download",
             layers = kept.len(),
@@ -1236,7 +1261,25 @@ async fn fold_layers(
     // Each range's objects upload as the range finishes, beside the ranges
     // still merging; the root that names them is written after all land.
     let (sink, objects) = tokio::sync::mpsc::unbounded_channel();
-    let uploads = task::spawn(upload_objects(Arc::clone(storage), objects));
+    let uploads = task::spawn(upload_objects(
+        Arc::clone(storage),
+        objects,
+        policy.reuse_dir.clone(),
+    ));
+    // The kept layers are merged away, so the copies kept of them can go.
+    let consumed: Vec<(PathBuf, PathBuf)> = match reuse {
+        Some(reuse) => kept
+            .iter()
+            .flat_map(|layer| &layer.slices)
+            .map(|slice| {
+                (
+                    slice_file_path(reuse, &slice.content_hash),
+                    tier_path(reuse, &slice.content_hash),
+                )
+            })
+            .collect(),
+        None => Vec::new(),
+    };
     let merged = run_on_pool(pool, "term-index fold", move || {
         let merged = merge_layers_into(&sources, &ordinals, &policy, Some(&sink));
         // The slice files are read; the scratch directory can go with the
@@ -1250,6 +1293,10 @@ async fn fold_layers(
     let merged = merged.map_err(|e| TermIndexError::Build(e.to_string()))??;
     uploaded.map_err(|e| TermIndexError::Build(format!("term-index upload: {e}")))??;
     debug_assert!(merged.tiers.is_empty() && merged.slices.is_empty());
+    for (slice, tier) in consumed {
+        let _ = std::fs::remove_file(slice);
+        let _ = std::fs::remove_file(tier);
+    }
     let mut layer = merged.layer;
     layer.ordinals = merged_ordinals;
     Ok(layer)
@@ -1590,6 +1637,7 @@ pub(crate) async fn download_layers(
     storage: &Arc<dyn StorageProvider>,
     layers: &[Layer],
     dir: &Path,
+    reuse: Option<&Path>,
 ) -> Result<Vec<Vec<SliceFile>>, TermIndexError> {
     let mut unique: HashSet<ContentHash> = HashSet::new();
     let jobs = layers
@@ -1601,7 +1649,12 @@ pub(crate) async fn download_layers(
             let path = slice_file_path(dir, &slice.content_hash);
             let tier_file = tier_path(dir, &slice.content_hash);
             let (hash, tier) = (slice.content_hash, slice.tier);
+            let reused = reuse
+                .is_some_and(|reuse| link_reused(reuse, &hash, tier.is_some(), &path, &tier_file));
             async move {
+                if reused {
+                    return Ok(());
+                }
                 // One object resident at a time: the slice is on disk
                 // before its tier object is fetched.
                 let bytes =
@@ -1617,6 +1670,24 @@ pub(crate) async fn download_layers(
         });
     run_bounded(LAYER_FETCH_CONCURRENCY, "layer fetch", jobs).await?;
     Ok(slice_files(dir, layers))
+}
+
+/// Link the slice named by `hash`, and its tier object when it has one,
+/// from `reuse` to `path` and `tier_file`; false, leaving neither, when
+/// `reuse` lacks either.
+fn link_reused(
+    reuse: &Path,
+    hash: &ContentHash,
+    has_tier: bool,
+    path: &Path,
+    tier_file: &Path,
+) -> bool {
+    let linked = std::fs::hard_link(slice_file_path(reuse, hash), path).is_ok()
+        && (!has_tier || std::fs::hard_link(tier_path(reuse, hash), tier_file).is_ok());
+    if !linked {
+        let _ = std::fs::remove_file(path);
+    }
+    linked
 }
 
 /// Where `download_layers` puts the slice named by `hash` under `dir`.
@@ -9383,10 +9454,10 @@ mod tests {
             .expect("root");
         let scratch = TempDir::new().expect("scratch");
         faults.fail(FaultOp::Get, "term-index/slice-", 1);
-        let got = rt.block_on(download_layers(&faulty, &root.layers, scratch.path()));
+        let got = rt.block_on(download_layers(&faulty, &root.layers, scratch.path(), None));
         assert!(got.is_err(), "a failed fetch fails the download");
         assert_eq!(faults.fired(), 2);
-        let good = rt.block_on(download_layers(&local, &root.layers, scratch.path()));
+        let good = rt.block_on(download_layers(&local, &root.layers, scratch.path(), None));
         assert!(good.is_ok(), "the same download succeeds without the fault");
 
         // A fold uploads each range's objects as the range finishes; one
@@ -9402,5 +9473,46 @@ mod tests {
         assert_eq!(faults.fired(), 3);
         let folded = rt.block_on(fold_layers(&local, &root.layers, &ordinals, &ranged, None));
         assert!(folded.is_ok(), "the same fold succeeds without the fault");
+    }
+
+    /// A fold that keeps what it uploads lets the next fold of the same call
+    /// link those objects in place of fetching them: with every object of
+    /// the folded layer gone from storage, folding it again still works.
+    #[test]
+    fn a_later_fold_links_what_an_earlier_fold_uploaded() {
+        let dir = TempDir::new().expect("tempdir");
+        let built = build(&[range_contribution(&dir, 1)], &BuildPolicy::default()).expect("build");
+        let store_dir = TempDir::new().expect("store");
+        let local: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(store_dir.path()).expect("local"));
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let reference = rt.block_on(write_built(&local, built)).expect("write");
+        let root = rt
+            .block_on(load_root(local.as_ref(), &reference))
+            .expect("root");
+        let scratch = TempDir::new().expect("scratch");
+        let reuse = TempDir::new_in(scratch.path()).expect("reuse");
+        let policy = BuildPolicy {
+            spill_to_disk: true,
+            scratch_root: Some(scratch.path().to_path_buf()),
+            reuse_dir: Some(reuse.path().to_path_buf()),
+            merge_ranges: Some(2),
+            ..BuildPolicy::default()
+        };
+        let ordinals: Vec<Option<u32>> = (0..root.superfiles.len() as u32).map(Some).collect();
+        let first = rt
+            .block_on(fold_layers(&local, &root.layers, &ordinals, &policy, None))
+            .expect("first fold");
+        for slice in &first.slices {
+            let _ = std::fs::remove_file(store_dir.path().join(slice_uri(&slice.content_hash)));
+            if let Some(tier) = &slice.tier {
+                let _ = std::fs::remove_file(store_dir.path().join(tier_uri(tier)));
+            }
+        }
+        let again = rt.block_on(fold_layers(&local, &[first], &ordinals, &policy, None));
+        assert!(
+            again.is_ok(),
+            "the kept objects stand in for the deleted ones: {again:?}"
+        );
     }
 }

@@ -12105,6 +12105,10 @@ pub(in crate::supertable) async fn stamp_term_index(
     // layers the root holds plus the one each batch adds, since every fold
     // leaves fewer layers than it found.
     let budget: OnceLock<usize> = OnceLock::new();
+    // What this call's folds upload, kept on local disk for the folds after.
+    let reuse = term_index_scratch(&inner.options.term_index_build_policy())
+        .map_err(TermIndexError::from)?;
+    let reuse_path = reuse.path().to_path_buf();
     // One renumbering fold per call. Commits that land while it runs are
     // stacked on it past nil padding, which would call for another at once;
     // the next optimize's drops it.
@@ -12117,7 +12121,8 @@ pub(in crate::supertable) async fn stamp_term_index(
         let kept_batch: Mutex<Option<KeptBatch>> = Mutex::new(None);
         let kept_fold: Mutex<Option<KeptFold>> = Mutex::new(None);
         stamp_with_retries(inner, &storage, "term-index", |old| {
-            let (storage, published, budget) = (&storage, &published, &budget);
+            let (storage, published, budget, reuse_path) =
+                (&storage, &published, &budget, &reuse_path);
             let (kept_batch, kept_fold, renumbered) = (&kept_batch, &kept_fold, &renumbered);
             async move {
                 published.store(false, Ordering::Relaxed);
@@ -12174,6 +12179,7 @@ pub(in crate::supertable) async fn stamp_term_index(
                     ) {
                         let policy = term_index::BuildPolicy {
                             scoring_by_ordinal: Arc::new(scoring_by_ordinal(&old, fold.superfiles())),
+                            reuse_dir: Some(reuse_path.clone()),
                             ..policy.clone()
                         };
                         let renumbers = fold.renumbers();
