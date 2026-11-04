@@ -618,3 +618,10 @@ memory:
   # resident memory, so they count toward what process_limit_bytes measures:
   # a large cache leaves statements that much less room under that limit.
   decoded_column_cache_bytes: 0
+
+  # Bytes of cold reads every vector search in the process may have in flight
+  # at once, across every file and cell they read. A read past it waits for an
+  # earlier one to finish instead of starting, so wide searches (a large k,
+  # many files) run in bounded memory. 0 is a sixteenth of the machine's
+  # memory (the cgroup's limit where there is one). Read once per process.
+  cold_read_window_bytes: 0

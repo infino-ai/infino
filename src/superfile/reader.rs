@@ -65,7 +65,7 @@ use tracing::warn;
 #[cfg(test)]
 use crate::superfile::fts::reader::TermIndexFact;
 use crate::{
-    memory::ConnectionMemoryBudget,
+    memory::{ColdReadGate, ConnectionMemoryBudget},
     runtime_bridge::run_on_pool_unless_blocking,
     superfile::{
         BytesLazyByteSource, LazyByteSource, LazyByteSourceError, LazySubSource, ReadError,
@@ -2924,7 +2924,7 @@ impl SuperfileReader {
         allow: Option<Arc<RoaringBitmap>>,
         deny: Option<Arc<RoaringBitmap>>,
         pool: Option<Arc<ThreadPool>>,
-        budget: Option<Arc<ConnectionMemoryBudget>>,
+        reads: Option<ColdReadGate>,
     ) -> Result<(Vec<(u32, f32)>, ProbeTally), ReadError> {
         let filtered = allow.is_some();
         let (nprobe, rerank_mult) = options.resolve(filtered);
@@ -2941,7 +2941,7 @@ impl SuperfileReader {
             allow,
             deny,
             pool,
-            budget,
+            reads,
         )
         .await?)
     }
@@ -2983,7 +2983,7 @@ impl SuperfileReader {
         allow: Option<Arc<RoaringBitmap>>,
         deny: Option<Arc<RoaringBitmap>>,
         pool: Option<Arc<ThreadPool>>,
-        budget: Option<Arc<ConnectionMemoryBudget>>,
+        reads: Option<ColdReadGate>,
     ) -> Result<(Vec<(u32, f32)>, ProbeTally), ReadError> {
         let filtered = allow.is_some();
         let (_, rerank_mult) = options.resolve(filtered);
@@ -3000,7 +3000,7 @@ impl SuperfileReader {
             allow,
             deny,
             pool,
-            budget,
+            reads,
         )
         .await?)
     }
@@ -3022,7 +3022,7 @@ impl SuperfileReader {
         allow: Option<Arc<RoaringBitmap>>,
         deny: Option<Arc<RoaringBitmap>>,
         pool: Option<Arc<ThreadPool>>,
-        budget: Option<Arc<ConnectionMemoryBudget>>,
+        reads: Option<ColdReadGate>,
     ) -> Result<ScanOutcome, ReadError> {
         let filtered = allow.is_some();
         let (_, rerank_mult) = options.resolve(filtered);
@@ -3042,7 +3042,7 @@ impl SuperfileReader {
             allow,
             deny,
             pool,
-            budget,
+            reads,
         )
         .await?)
     }

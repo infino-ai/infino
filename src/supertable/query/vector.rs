@@ -94,6 +94,7 @@ use crate::test_helpers::{admit_trace, served_shortlist_probe};
 use crate::utils::trace::OpOrigin;
 use crate::{
     config,
+    memory::{ColdReadGate, ColdReadWindow},
     runtime_bridge::run_on_pool,
     runtime_metrics::op_stats::{self, OpStatsCollector},
     storage::io_counters,
@@ -283,6 +284,15 @@ const FILTERED_HIDDEN_FINE_NPROBE: usize = 16;
 /// recall-neutral cut versus a full rerank, and cutting below it drops true
 /// neighbours (the #821 warm-recall inversion).
 const GLOBAL_FINE_SHORTLIST_POOL_PCT: usize = 3;
+
+/// One search's cold-read gate, shared by every superfile and cell it reads:
+/// the process's cold-read window over the connection's budget.
+fn cold_read_gate(options: &SupertableOptions) -> ColdReadGate {
+    ColdReadGate::new(
+        Arc::clone(&options.connection_memory_budget),
+        Arc::clone(ColdReadWindow::process()),
+    )
+}
 
 /// Fold one probe's work tallies into the op's collector.
 ///
@@ -4952,12 +4962,13 @@ impl SupertableReader {
         // touched cell's selection to its [min..max] contiguous span.
         let coalesce = config::global().vector.global_fine_coalesce;
         let scan_width = manifest.options.reader_pool.current_num_threads().max(1);
-        // Share the connection memory budget and reader pool across the
-        // concurrent scans, matching the stamped fan-out: cold fetches then gate
-        // on `OverBudget` and score on the reader pool. A serial loop needed
-        // neither (one fetch in flight), but concurrency does.
+        // Share one read gate and the reader pool across the concurrent scans,
+        // matching the stamped fan-out: cold fetches then wait on the process's
+        // cold-read window, gate on `OverBudget` and score on the reader pool. A
+        // serial loop needed neither (one fetch in flight), but concurrency
+        // does.
         let scan_pool = Arc::clone(&manifest.options.reader_pool);
-        let scan_budget = Arc::clone(&manifest.options.connection_memory_budget);
+        let scan_reads = cold_read_gate(&manifest.options);
         // Build the per-superfile scan futures in a plain loop (concrete
         // borrows) rather than a lifetime-generic `.map()` closure, then run
         // them concurrently bounded to the pool width.
@@ -4971,7 +4982,7 @@ impl SupertableReader {
                 .column_alias(column_field_id, column)
                 .to_owned();
             let pool = Arc::clone(&scan_pool);
-            let budget = Arc::clone(&scan_budget);
+            let reads = scan_reads.clone();
             scan_futs.push(async move {
                 // Coalesce widens each cell's selected clusters to their
                 // contiguous `[min..max]` id span so the gap clusters between
@@ -4996,7 +5007,7 @@ impl SupertableReader {
                         None,
                         None,
                         Some(pool),
-                        Some(budget),
+                        Some(reads),
                     )
                     .await?;
                 Ok::<_, QueryError>((si, scan))
@@ -6423,8 +6434,10 @@ impl SupertableReader {
         let query_arc2 = Arc::clone(&query_arc);
         let op_stats_scan = self.op_stats.clone();
         let reader_pool = Arc::clone(&manifest.options.reader_pool);
-        // Per-connection memory budget: gates each superfile's cold cluster-block fetch.
-        let budget = Some(Arc::clone(&manifest.options.connection_memory_budget));
+        // One read gate for the whole search: every superfile's cold
+        // cluster-block fetch waits on its window and reserves from the
+        // connection budget.
+        let reads = Some(cold_read_gate(&manifest.options));
         let storage = manifest.options.storage.as_ref().map(Arc::clone);
 
         // `fanout_with`, not a plain post-rank filter: the body resolves each
@@ -6454,7 +6467,7 @@ impl SupertableReader {
                 let column = Arc::clone(&column_arc);
                 let query = Arc::clone(&query_arc);
                 let reader_pool = Arc::clone(&reader_pool);
-                let budget = budget.clone();
+                let reads = reads.clone();
                 let storage = storage.clone();
                 let scan_pool = Arc::clone(&scan_pool_body);
                 let max_replica_overhead = Arc::clone(&max_replica_overhead_body);
@@ -6502,7 +6515,7 @@ impl SupertableReader {
                                 bitmap,
                                 deny,
                                 pool,
-                                budget,
+                                reads,
                             )
                             .await?;
                         fold_probe_work(&op_stats, &scan.work());
@@ -6518,7 +6531,7 @@ impl SupertableReader {
                     } else {
                         let (hits, tally) = reader
                             .vector_search_clusters_filtered(
-                                &column, &query, k_fetch, &ids, options, bitmap, deny, pool, budget,
+                                &column, &query, k_fetch, &ids, options, bitmap, deny, pool, reads,
                             )
                             .await?;
                         fold_probe_work(&op_stats, &tally);

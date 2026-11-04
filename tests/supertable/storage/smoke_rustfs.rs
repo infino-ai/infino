@@ -73,8 +73,8 @@ const CONTROL_PEAK_HIGH_BYTES: usize = 800_000;
 /// 900 KB. Proves an enforcing budget admits under-budget work.
 const AMPLE_BUDGET_BYTES: u64 = 1_000_000;
 const AMPLE_BUDGET_GATE_BYTES: usize = 900_000;
-/// Shared multi-superfile budget: admits one ~156 KB fetch but not two
-/// concurrent ones (90% gate = 180 KB).
+/// Shared multi-superfile budget: admits one ~156 KB fetch but not two at
+/// once (90% gate = 180 KB), so the search's reads must take turns.
 const SHARED_BUDGET_BYTES: u64 = 200_000;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -820,9 +820,12 @@ async fn supertable_cold_hybrid_search_over_budget_via_sql_rustfs() {
     );
 }
 
-/// The per-connection budget is shared across the multi-superfile fan-out.
-/// Two commits → two ~156 KB cold fetches; a budget that fits one but not two
-/// refuses the concurrent fan-out as `OverBudget`.
+/// One search shares one read gate across its multi-superfile fan-out. Two
+/// commits → ~156 KB cold fetches in each superfile, which the measured
+/// control holds together; under a budget that fits one fetch but not two,
+/// the budget refuses the second, which waits for the first, and the search
+/// returns the control's hits. A gate per superfile would see none of its
+/// own reads in flight and fail the search as `OverBudget`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn supertable_vector_budget_is_shared_across_superfiles_via_rustfs() {
     if !rustfs_server::begin_rustfs_test(
@@ -886,25 +889,15 @@ async fn supertable_vector_budget_is_shared_across_superfiles_via_rustfs() {
     );
 
     let (bounded, _bounded_guard) = open_budget_consumer(dim, &storage, SHARED_BUDGET_BYTES);
-    let result = search(&bounded);
+    let bounded_hits =
+        search(&bounded).expect("fetches that fit one at a time must wait, not fail");
     let bounded_budget = bounded.options().connection_budget();
+    let ceiling = bounded_budget.limit().expect("bounded");
     eprintln!(
-        "[rustfs-shared] bounded: denials={} peak={} B result={}",
+        "[rustfs-shared] bounded: denials={} peak={} B ceiling={ceiling} B",
         bounded_budget.denials(),
-        bounded_budget.peak(),
-        if result.is_ok() { "ok" } else { "over-budget" }
+        bounded_budget.peak()
     );
-    match result {
-        Err(InfinoError::OverBudget(_)) => {}
-        Err(other) => panic!("expected InfinoError::OverBudget, got {other:?}"),
-        Ok(hits) => panic!(
-            "two concurrent {CONTROL_PEAK_HIGH_BYTES}-B fetches must cross a \
-             {SHARED_BUDGET_BYTES}-B budget; got {} batch(es)",
-            hits.len()
-        ),
-    }
-    assert!(
-        bounded_budget.denials() >= 1,
-        "the shared budget must record the crossing"
-    );
+    assert!(bounded_budget.peak() > 0 && bounded_budget.peak() <= ceiling);
+    assert_eq!(bounded_hits, measured_hits);
 }

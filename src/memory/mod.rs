@@ -105,11 +105,17 @@
 use std::{
     error::Error,
     fmt,
+    pin::pin,
     sync::{
-        Arc, Mutex, PoisonError, Weak,
+        Arc, Mutex, OnceLock, PoisonError, Weak,
         atomic::{AtomicU64, AtomicUsize, Ordering},
     },
 };
+
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
+use tracing::info;
+
+use crate::{config, runtime_metrics::rss::total_memory_bytes};
 
 mod datafusion_pool;
 mod resident;
@@ -480,9 +486,202 @@ impl fmt::Display for OverBudget {
 
 impl Error for OverBudget {}
 
+/// Bytes per unit of a [`ColdReadWindow`]. The window counts in KiB so one
+/// read can ask for up to 4 TiB of room in the `u32` the semaphore takes.
+const WINDOW_UNIT_BYTES: usize = 1024;
+
+/// Share of the machine's memory (the cgroup's ceiling where there is one)
+/// the process's cold reads may hold at once by default: one in this many.
+/// The same share the take prefetch gets, so the two together stay at an
+/// eighth of the machine.
+const COLD_READ_WINDOW_MEMORY_SHARE: u64 = 16;
+
+/// The process's cold-read window when the machine's memory can't be read.
+const FALLBACK_COLD_READ_WINDOW_BYTES: u64 = 2 << 30;
+
+/// Bytes of cold reads every query in the process may have downloading or
+/// held at once.
+///
+/// A query that reads many files starts reads in each, and every level caps
+/// only its own concurrency: a search over 32 files, each probing up to a
+/// pool's width of cells at once, can have thousands of cell reads in flight,
+/// tens of gigabytes, and several such searches can run at once. The window
+/// is one cap for all of them. A read waits for room before it starts, and
+/// gives the room back once its query is done with the bytes, so a large
+/// search finishes in bounded memory instead of downloading everything at
+/// once, and a second one waits its turn instead of doubling it.
+///
+/// ```text
+///   query A ──► file 1 ── cell, cell, … ─┐
+///           ──► file 2 ── cell, cell, … ─┤                 A's budget
+///                                        ├─► one window ─┤
+///   query B ──► file 1 ── cell, cell, … ─┘    (waits)      B's budget
+///                                                          (refuses)
+/// ```
+///
+/// A read larger than the whole window takes all of it and runs alone.
+#[derive(Debug)]
+pub struct ColdReadWindow {
+    room: Arc<Semaphore>,
+    units: usize,
+}
+
+impl ColdReadWindow {
+    /// A window of `bytes` (at least one unit).
+    pub fn new(bytes: usize) -> Arc<Self> {
+        let units = (bytes / WINDOW_UNIT_BYTES).clamp(1, Semaphore::MAX_PERMITS);
+        Arc::new(Self {
+            room: Arc::new(Semaphore::new(units)),
+            units,
+        })
+    }
+
+    /// The process's window, sized once from `memory.cold_read_window_bytes`.
+    pub(crate) fn process() -> &'static Arc<Self> {
+        static WINDOW: OnceLock<Arc<ColdReadWindow>> = OnceLock::new();
+        WINDOW.get_or_init(|| {
+            let bytes = cold_read_window_bytes(
+                config::global().memory.cold_read_window_bytes,
+                total_memory_bytes(),
+            );
+            info!(bytes, "cold-read window");
+            Self::new(usize::try_from(bytes).unwrap_or(usize::MAX))
+        })
+    }
+}
+
+/// The window for `configured` bytes on a machine of `total_memory`: the
+/// configured size when set, otherwise [`COLD_READ_WINDOW_MEMORY_SHARE`] of
+/// the machine, or [`FALLBACK_COLD_READ_WINDOW_BYTES`] when its memory is
+/// unknown.
+fn cold_read_window_bytes(configured: u64, total_memory: Option<u64>) -> u64 {
+    if configured > 0 {
+        return configured;
+    }
+    total_memory.map_or(FALLBACK_COLD_READ_WINDOW_BYTES, |total| {
+        total / COLD_READ_WINDOW_MEMORY_SHARE
+    })
+}
+
+/// One query's cold reads: the [`ColdReadWindow`] they wait for room in, and
+/// the connection budget their bytes are reserved from.
+///
+/// The budget is the connection's, shared with the rest of the query and
+/// with other queries, so a read can be refused while the window has room.
+/// Then, if other reads of this query still hold memory, it gives its room
+/// back, waits for one of them to finish, and tries again. It fails with
+/// [`OverBudget`] only when none do, because then waiting can't free anything.
+///
+/// Clones are the same query; make a new gate per query.
+#[derive(Debug, Clone)]
+pub struct ColdReadGate {
+    budget: Arc<ConnectionMemoryBudget>,
+    window: Arc<ColdReadWindow>,
+    held: Arc<HeldReads>,
+}
+
+/// The reads of one [`ColdReadGate`] that hold a reservation, and a signal
+/// each sends when it lets go, so a refused read knows whether waiting helps.
+#[derive(Debug, Default)]
+struct HeldReads {
+    // Changed under the lock together with the reservation it counts, so a
+    // refused read sees exactly the reads that can still free memory.
+    count: Mutex<usize>,
+    released: Notify,
+}
+
+/// Room in a [`ColdReadGate`]'s window plus the bytes reserved for one read;
+/// both come back when it is dropped.
+#[derive(Debug)]
+pub(crate) struct ColdReadPermit {
+    // Always `Some` until dropped; taken in `drop` to release it under the lock.
+    reservation: Option<Reservation>,
+    _room: Option<OwnedSemaphorePermit>,
+    held: Arc<HeldReads>,
+}
+
+impl Drop for ColdReadPermit {
+    fn drop(&mut self) {
+        {
+            let mut count = self
+                .held
+                .count
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            drop(self.reservation.take());
+            *count -= 1;
+        }
+        // The bytes are back in the budget: refused reads may retry.
+        self.held.released.notify_waiters();
+    }
+}
+
+impl ColdReadGate {
+    /// A gate for one query whose cold reads wait for room in `window` and
+    /// are reserved from `budget`.
+    pub fn new(budget: Arc<ConnectionMemoryBudget>, window: Arc<ColdReadWindow>) -> Self {
+        Self {
+            budget,
+            window,
+            held: Arc::default(),
+        }
+    }
+
+    /// The connection budget the reads are reserved from.
+    pub(crate) fn budget(&self) -> &Arc<ConnectionMemoryBudget> {
+        &self.budget
+    }
+
+    /// Wait for room for `bytes` in the window, then reserve them from the
+    /// budget. Fails only when the budget refuses and none of this query's
+    /// reads hold memory that could come back.
+    pub(crate) async fn admit(&self, bytes: usize) -> Result<ColdReadPermit, OverBudget> {
+        let units = bytes
+            .div_ceil(WINDOW_UNIT_BYTES)
+            .clamp(1, self.window.units);
+        let units = u32::try_from(units).unwrap_or(u32::MAX);
+        loop {
+            // The window is never closed, so this always gets its room.
+            let room = Arc::clone(&self.window.room)
+                .acquire_many_owned(units)
+                .await
+                .ok();
+            // Listen before trying, so a read let go between the refusal and
+            // the wait still wakes this one.
+            let mut released = pin!(self.held.released.notified());
+            released.as_mut().enable();
+            {
+                let mut count = self
+                    .held
+                    .count
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                match self.budget.try_reserve(bytes) {
+                    Ok(reservation) => {
+                        *count += 1;
+                        return Ok(ColdReadPermit {
+                            reservation: Some(reservation),
+                            _room: room,
+                            held: Arc::clone(&self.held),
+                        });
+                    }
+                    Err(over) if *count == 0 => return Err(over),
+                    Err(_) => {}
+                }
+            }
+            // Wait without holding room, so the reads being waited on, and
+            // other waiting reads, are never blocked by this one.
+            drop(room);
+            released.await;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{sync::Arc, thread};
+
+    use futures::FutureExt;
 
     use super::*;
 
@@ -829,5 +1028,170 @@ mod tests {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         assert_eq!(reclaimers.len(), 1);
+    }
+
+    /// A read waits while the window is full, and starts once the read
+    /// holding the room is done with it.
+    #[tokio::test]
+    async fn cold_read_gate_waits_for_room() {
+        let window = 4 * KB as usize;
+        let gate = ColdReadGate::new(
+            ConnectionMemoryBudget::measured(),
+            ColdReadWindow::new(window),
+        );
+        let first = gate.admit(window).await.expect("measured never refuses");
+        assert!(
+            gate.admit(1).now_or_never().is_none(),
+            "a read past a full window must wait"
+        );
+        drop(first);
+        assert!(
+            gate.admit(1).now_or_never().is_some(),
+            "the room comes back when the first read is dropped"
+        );
+    }
+
+    /// Clones are one query's gate: they share one window.
+    #[tokio::test]
+    async fn cold_read_gate_clones_share_one_window() {
+        let window = 4 * KB as usize;
+        let gate = ColdReadGate::new(
+            ConnectionMemoryBudget::measured(),
+            ColdReadWindow::new(window),
+        );
+        let other = gate.clone();
+        let _held = gate.admit(window).await.expect("measured never refuses");
+        assert!(
+            other.admit(1).now_or_never().is_none(),
+            "a clone must wait on the same window"
+        );
+    }
+
+    /// Two queries, each with its own budget, share the process's window: a
+    /// read of the second waits while the first holds all of it.
+    #[tokio::test]
+    async fn cold_read_gates_of_two_queries_share_one_window() {
+        let window = 4 * KB as usize;
+        let shared = ColdReadWindow::new(window);
+        let first = ColdReadGate::new(ConnectionMemoryBudget::measured(), Arc::clone(&shared));
+        let second = ColdReadGate::new(ConnectionMemoryBudget::measured(), shared);
+        let held = first.admit(window).await.expect("measured never refuses");
+        assert!(
+            second.admit(1).now_or_never().is_none(),
+            "another query's read must wait on the same window"
+        );
+        drop(held);
+        assert!(second.admit(1).now_or_never().is_some());
+    }
+
+    /// The window is the configured size when set, otherwise a share of the
+    /// machine's memory, or a fixed size when that is unknown.
+    #[test]
+    fn cold_read_window_is_configured_or_a_share_of_the_machine() {
+        const MACHINE: u64 = 64 << 30;
+        assert_eq!(cold_read_window_bytes(KB, Some(MACHINE)), KB);
+        assert_eq!(
+            cold_read_window_bytes(0, Some(MACHINE)),
+            MACHINE / COLD_READ_WINDOW_MEMORY_SHARE
+        );
+        assert_eq!(
+            cold_read_window_bytes(0, None),
+            FALLBACK_COLD_READ_WINDOW_BYTES
+        );
+    }
+
+    /// A read larger than the whole window takes all of it and runs alone,
+    /// rather than waiting forever for room that can never exist.
+    #[tokio::test]
+    async fn cold_read_gate_runs_a_read_larger_than_the_window_alone() {
+        let window = KB as usize;
+        let gate = ColdReadGate::new(
+            ConnectionMemoryBudget::measured(),
+            ColdReadWindow::new(window),
+        );
+        let large = gate
+            .admit(window * 1024)
+            .now_or_never()
+            .expect("a read past the window runs once the window is free")
+            .expect("measured never refuses");
+        assert!(
+            gate.admit(1).now_or_never().is_none(),
+            "the large read holds the whole window"
+        );
+        drop(large);
+    }
+
+    /// Budget for the refusal tests, and the share of it held outside the
+    /// gate, as the rest of a query (hit lookup, operators) holds it.
+    const SHARED_BUDGET: u64 = 100 * KB;
+
+    /// A budget whose ceiling is half held outside the gate, the ceiling, and
+    /// that outside reservation.
+    fn half_held_budget() -> (Arc<ConnectionMemoryBudget>, usize, Reservation) {
+        let budget = ConnectionMemoryBudget::with_limit(SHARED_BUDGET);
+        let ceiling = budget.limit().expect("bounded");
+        let outside = budget.try_reserve(ceiling / 2).expect("fits");
+        (budget, ceiling, outside)
+    }
+
+    /// The window has room but the budget is held elsewhere: a refused read
+    /// waits for this query's own read to finish and then gets its memory,
+    /// instead of failing the query.
+    #[tokio::test]
+    async fn cold_read_gate_waits_for_its_own_reads_when_the_budget_refuses() {
+        let (budget, ceiling, _outside) = half_held_budget();
+        let gate = ColdReadGate::new(Arc::clone(&budget), ColdReadWindow::new(usize::MAX));
+        let first = gate.admit(ceiling / 4).await.expect("fits");
+        let mut second = Box::pin(gate.admit(ceiling / 3));
+        assert!(
+            (&mut second).now_or_never().is_none(),
+            "a refused read must wait while the query's own read holds memory"
+        );
+        drop(first);
+        second
+            .now_or_never()
+            .expect("the read retries once the first one lets go")
+            .expect("and then fits");
+    }
+
+    /// Every waiting read retries when memory comes back, not just one.
+    #[tokio::test]
+    async fn cold_read_gate_wakes_every_refused_read() {
+        let (budget, ceiling, _outside) = half_held_budget();
+        let gate = ColdReadGate::new(Arc::clone(&budget), ColdReadWindow::new(usize::MAX));
+        let first = gate.admit(ceiling / 3).await.expect("fits");
+        let mut second = Box::pin(gate.admit(ceiling / 5));
+        let mut third = Box::pin(gate.admit(ceiling / 5));
+        assert!((&mut second).now_or_never().is_none());
+        assert!((&mut third).now_or_never().is_none());
+        drop(first);
+        // Hold both permits: dropping the second would wake the third on
+        // its own and hide a wake-up that reached only one of them.
+        let _second = second
+            .now_or_never()
+            .expect("the second read retries")
+            .expect("and fits");
+        let _third = third
+            .now_or_never()
+            .expect("the third read retries too")
+            .expect("and fits");
+    }
+
+    /// With none of the query's reads holding memory, waiting frees nothing:
+    /// the read fails at once instead of hanging.
+    #[tokio::test]
+    async fn cold_read_gate_refuses_when_none_of_its_reads_hold_memory() {
+        let (budget, ceiling, _outside) = half_held_budget();
+        let gate = ColdReadGate::new(Arc::clone(&budget), ColdReadWindow::new(usize::MAX));
+        gate.admit(ceiling)
+            .now_or_never()
+            .expect("must not wait on reads that do not exist")
+            .expect_err("the budget refuses");
+        let first = gate.admit(ceiling / 4).await.expect("fits");
+        drop(first);
+        gate.admit(ceiling)
+            .now_or_never()
+            .expect("a finished read no longer counts")
+            .expect_err("the budget refuses");
     }
 }
