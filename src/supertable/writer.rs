@@ -94,6 +94,7 @@ use blake3::Hasher as Blake3Hasher;
 use bytes::Bytes;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use datafusion::prelude::Expr;
+use fs4::available_space;
 use futures::{
     future::{BoxFuture, try_join_all},
     stream::{self, FuturesUnordered, StreamExt},
@@ -104,10 +105,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tempfile::{NamedTempFile, TempDir};
 use tokio::{
+    spawn,
     sync::{
-        Semaphore,
+        Notify, Semaphore,
         mpsc::{Receiver, Sender, channel},
     },
+    task::JoinHandle,
     time::sleep,
 };
 use tracing::{Instrument, Span, debug, error, info, warn};
@@ -12056,7 +12059,7 @@ struct KeptBatch {
 /// when the call ends however it ends. The task holds the call's reuse
 /// directory, so the directory goes once the stopped task lets go of it.
 #[derive(Default)]
-struct Prefetch(Mutex<Option<tokio::task::JoinHandle<()>>>);
+struct Prefetch(Mutex<Option<JoinHandle<()>>>);
 
 impl Drop for Prefetch {
     fn drop(&mut self) {
@@ -12189,7 +12192,7 @@ pub(in crate::supertable) async fn stamp_term_index(
                     let renumber = !renumbered.load(Ordering::Relaxed);
                     // Kept outputs and prefetched inputs fill the scratch disk
                     // as the call goes, so each pass measures its free space again.
-                    let fold_max_bytes = fs4::available_space(reuse_path)
+                    let fold_max_bytes = available_space(reuse_path)
                         .map_or(fold_max_bytes, |free| fold_max_bytes.min(free / 2));
                     if let Some(fold) = term_index::plan_fold_at_optimize(
                         &root,
@@ -12204,7 +12207,7 @@ pub(in crate::supertable) async fn stamp_term_index(
                         if let Some(started) = started {
                             let _ = started.await;
                         }
-                        let downloaded = Arc::new(tokio::sync::Notify::new());
+                        let downloaded = Arc::new(Notify::new());
                         let next = match fold_budget.prefetches() {
                             true => term_index::layers_after(
                                 &root,
@@ -12218,7 +12221,7 @@ pub(in crate::supertable) async fn stamp_term_index(
                             false => Vec::new(),
                         };
                         *prefetch.0.lock().expect("prefetch") =
-                            Some(tokio::spawn(term_index::prefetch_layers(
+                            Some(spawn(term_index::prefetch_layers(
                                 Arc::clone(storage),
                                 next,
                                 Arc::clone(reuse),

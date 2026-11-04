@@ -95,9 +95,9 @@ impl Supertable {
         }
         // Index the superfiles the term index does not list, a batch at a
         // time, and fold its layers in runs no larger than half the free
-        // space where the fold spills (a compaction merge's input at least),
-        // since a fold downloads its run there before merging; the fold also
-        // keeps to the host's memory and open-file limits. Runs before gc so
+        // space where the fold spills, as each pass measures it, since a
+        // fold downloads its run there before merging; the fold also keeps
+        // to the host's memory and open-file limits. Runs before gc so
         // the sweep keeps the roots it publishes.
         if opts.steps.refresh_term_index {
             let spill_root = self

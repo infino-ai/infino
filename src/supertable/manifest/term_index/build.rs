@@ -37,6 +37,7 @@ use bytes::Bytes;
 use memmap2::Mmap;
 use rayon::{ThreadPool, current_num_threads, prelude::*};
 use tempfile::TempDir;
+use tokio::sync::{Notify, mpsc::UnboundedSender};
 use tracing::debug;
 use uuid::Uuid;
 
@@ -133,7 +134,7 @@ pub(crate) struct BuildPolicy {
     pub(crate) reuse_dir: Option<PathBuf>,
     /// Told once a fold's inputs are on local disk, so the next fold's
     /// prefetch starts when this one stops downloading.
-    pub(crate) downloaded: Option<Arc<tokio::sync::Notify>>,
+    pub(crate) downloaded: Option<Arc<Notify>>,
     /// Whether a merge carries tier blocks over from its sources' chunks
     /// (see `splice_term`); off, every term takes the decoding path. Tests
     /// compare the two paths byte for byte.
@@ -2163,8 +2164,7 @@ fn uploader_gone() -> TermIndexError {
 
 /// Where a merge hands each tier object and slice as it cuts them, by kind,
 /// so they upload while the merge goes on.
-pub(crate) type ObjectSink =
-    tokio::sync::mpsc::UnboundedSender<(&'static str, ContentHash, BuiltBytes)>;
+pub(crate) type ObjectSink = UnboundedSender<(&'static str, ContentHash, BuiltBytes)>;
 
 /// [`merge_layers`], handing each slice and tier object to `sink` as its
 /// range writes it; the merged layer then holds none. A closed sink drops

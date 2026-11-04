@@ -62,11 +62,23 @@ use bytes::Bytes;
 pub(crate) use format::TierRef;
 use format::{Layer, SliceRef};
 pub(crate) use format::{Location, Posting, Root, Run, Slice, legacy_bound_as_key};
+use fs4::available_space;
 use futures::{StreamExt, TryStreamExt, stream};
 use rayon::ThreadPool;
+use tempfile::TempDir;
 use thiserror::Error;
 pub(crate) use tier::{BLOCK_ENTRIES, ColumnScoring, TierChunkRef, TierDirectory, TierEntry};
-use tokio::{fs as async_fs, io::AsyncWriteExt, task, task::JoinSet, try_join};
+use tokio::{
+    fs as async_fs,
+    io::AsyncWriteExt,
+    sync::{
+        Notify,
+        mpsc::{UnboundedReceiver, unbounded_channel},
+    },
+    task,
+    task::JoinSet,
+    try_join,
+};
 use tracing::{Instrument, warn};
 use uuid::Uuid;
 
@@ -455,7 +467,7 @@ async fn put_built(
 /// error stops the uploads still running and closes the stream.
 async fn upload_objects(
     storage: Arc<dyn StorageProvider>,
-    mut objects: tokio::sync::mpsc::UnboundedReceiver<(&'static str, ContentHash, BuiltBytes)>,
+    mut objects: UnboundedReceiver<(&'static str, ContentHash, BuiltBytes)>,
     reuse: Option<PathBuf>,
 ) -> Result<(), TermIndexError> {
     let mut running: JoinSet<Result<(), TermIndexError>> = JoinSet::new();
@@ -972,7 +984,7 @@ impl FoldBudget {
 /// The lower of the process's open-file soft limit and the host's mapping
 /// limit, `None` where neither is readable.
 fn cursor_limit() -> Option<usize> {
-    let files = std::fs::read_to_string("/proc/self/limits")
+    let files = fs::read_to_string("/proc/self/limits")
         .ok()
         .and_then(|limits| {
             limits
@@ -983,7 +995,7 @@ fn cursor_limit() -> Option<usize> {
                 .parse::<usize>()
                 .ok()
         });
-    let maps = std::fs::read_to_string("/proc/sys/vm/max_map_count")
+    let maps = fs::read_to_string("/proc/sys/vm/max_map_count")
         .ok()
         .and_then(|count| count.trim().parse::<usize>().ok());
     files.into_iter().chain(maps).min()
@@ -1209,8 +1221,8 @@ pub(crate) fn layers_after(
 pub(crate) async fn prefetch_layers(
     storage: Arc<dyn StorageProvider>,
     layers: Vec<Layer>,
-    reuse_dir: Arc<tempfile::TempDir>,
-    downloaded: Arc<tokio::sync::Notify>,
+    reuse_dir: Arc<TempDir>,
+    downloaded: Arc<Notify>,
 ) {
     downloaded.notified().await;
     let reuse = reuse_dir.path().to_path_buf();
@@ -1220,11 +1232,11 @@ pub(crate) async fn prefetch_layers(
         .map(layer_bytes)
         .fold(0u64, |sum, size| sum.saturating_add(size))
         .saturating_mul(8);
-    let fits = fs4::available_space(&reuse).is_ok_and(|free| free > wanted);
+    let fits = available_space(&reuse).is_ok_and(|free| free > wanted);
     if layers.is_empty() || !fits || !has_room(&reuse) {
         return;
     }
-    let Ok(staging) = tempfile::TempDir::new_in(&reuse) else {
+    let Ok(staging) = TempDir::new_in(&reuse) else {
         return;
     };
     let mut unique: HashSet<ContentHash> = HashSet::new();
@@ -1256,9 +1268,9 @@ pub(crate) async fn prefetch_layers(
     {
         return;
     }
-    if let Ok(entries) = std::fs::read_dir(staging.path()) {
+    if let Ok(entries) = fs::read_dir(staging.path()) {
         for entry in entries.flatten() {
-            let _ = std::fs::rename(entry.path(), reuse.join(entry.file_name()));
+            let _ = fs::rename(entry.path(), reuse.join(entry.file_name()));
         }
     }
 }
@@ -1381,7 +1393,7 @@ async fn fold_layers(
     let policy = policy.clone();
     // Each slice and tier object uploads as the merge cuts it; the root that
     // names them is written after all land.
-    let (sink, objects) = tokio::sync::mpsc::unbounded_channel();
+    let (sink, objects) = unbounded_channel();
     let uploads = task::spawn(upload_objects(
         Arc::clone(storage),
         objects,
@@ -1416,8 +1428,8 @@ async fn fold_layers(
     let merged = merged.map_err(|e| TermIndexError::Build(e.to_string()))??;
     debug_assert!(merged.tiers.is_empty() && merged.slices.is_empty());
     for (slice, tier) in consumed {
-        let _ = std::fs::remove_file(slice);
-        let _ = std::fs::remove_file(tier);
+        let _ = fs::remove_file(slice);
+        let _ = fs::remove_file(tier);
     }
     let mut layer = merged.layer;
     layer.ordinals = merged_ordinals;
@@ -1806,10 +1818,10 @@ fn link_reused(
     path: &Path,
     tier_file: &Path,
 ) -> bool {
-    let linked = std::fs::hard_link(slice_file_path(reuse, hash), path).is_ok()
-        && (!has_tier || std::fs::hard_link(tier_path(reuse, hash), tier_file).is_ok());
+    let linked = fs::hard_link(slice_file_path(reuse, hash), path).is_ok()
+        && (!has_tier || fs::hard_link(tier_path(reuse, hash), tier_file).is_ok());
     if !linked {
-        let _ = std::fs::remove_file(path);
+        let _ = fs::remove_file(path);
     }
     linked
 }
@@ -9628,9 +9640,9 @@ mod tests {
             .block_on(fold_layers(&local, &root.layers, &ordinals, &policy, None))
             .expect("first fold");
         for slice in &first.slices {
-            let _ = std::fs::remove_file(store_dir.path().join(slice_uri(&slice.content_hash)));
+            let _ = fs::remove_file(store_dir.path().join(slice_uri(&slice.content_hash)));
             if let Some(tier) = &slice.tier {
-                let _ = std::fs::remove_file(store_dir.path().join(tier_uri(tier)));
+                let _ = fs::remove_file(store_dir.path().join(tier_uri(tier)));
             }
         }
         let again = rt.block_on(fold_layers(&local, &[first], &ordinals, &policy, None));
