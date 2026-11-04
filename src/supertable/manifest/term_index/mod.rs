@@ -3447,6 +3447,28 @@ mod tests {
         assert_ranges_match_one_writer(&sources, &[Some(0), Some(1)], &policy);
     }
 
+    /// With few marks per range each slice's dictionary blocks are grouped,
+    /// and the merge still writes the terms one writer writes.
+    #[test]
+    fn a_merge_cut_from_grouped_marks_writes_the_terms_one_writer_writes() {
+        let dir = TempDir::new().expect("tempdir");
+        let policy = BuildPolicy {
+            merge_marks_per_range: 1,
+            ..range_policy()
+        };
+        let built = build(
+            &[range_contribution(&dir, 1), range_contribution(&dir, 2)],
+            &policy,
+        )
+        .expect("build");
+        let layer = built.root.layers[0].clone();
+        let scratch = TempDir::new().expect("scratch");
+        spill_tiers(scratch.path(), &layer.slices, built.tiers).expect("place tiers");
+        let sources =
+            vec![spill_slices(scratch.path(), &layer, built.slices).expect("place slices")];
+        assert_ranges_match_one_writer(&sources, &[Some(0), Some(1)], &policy);
+    }
+
     /// The same over two source layers, a base and a delta built onto
     /// it, whose slices are cut at different keys: each range takes the
     /// slices of each layer that reach into it and interleaves them.

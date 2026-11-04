@@ -133,6 +133,9 @@ pub(crate) struct BuildPolicy {
     /// Bytes a merge cursor reads from a tier object at a time; see
     /// [`TIER_READ_WINDOW_BYTES`].
     pub(crate) tier_read_window_bytes: u64,
+    /// Marks a merge cuts each key range from, about; see
+    /// [`MARKS_PER_RANGE`].
+    pub(crate) merge_marks_per_range: usize,
     /// Whether a merge carries tier blocks over from its sources' chunks
     /// (see `splice_term`); off, every term takes the decoding path. Tests
     /// compare the two paths byte for byte.
@@ -225,6 +228,7 @@ impl Default for BuildPolicy {
             scoring_by_ordinal: Arc::new(Vec::new()),
             scoring_by_superfile: Arc::new(HashMap::new()),
             tier_read_window_bytes: TIER_READ_WINDOW_BYTES,
+            merge_marks_per_range: MARKS_PER_RANGE,
             merge_ranges_max: None,
             #[cfg(test)]
             splice_tiers: true,
@@ -2356,7 +2360,7 @@ const MERGE_RANGE_MIN_BYTES: u64 = 64 * 1024 * 1024;
 /// Marks a merge cuts each key range from, about: enough to place a cut
 /// well within a range, few enough that sorting every slice's marks stays
 /// cheap. A slice's dictionary blocks are grouped to keep its share.
-const MARKS_PER_RANGE: usize = 2048;
+pub(crate) const MARKS_PER_RANGE: usize = 2048;
 
 /// Ranges a merge is cut into at most: each holds a cursor per layer
 /// with a slice's bytes and a few tier windows resident, so the width is
@@ -2399,7 +2403,9 @@ pub(crate) fn key_ranges(
     // first run has no chunks is weighed by its runs alone and its chunk
     // bytes fall to the next block that has them; a few blocks' worth of
     // tier bytes can shift a cut, which is well within a range.
-    let per_slice = (want * MARKS_PER_RANGE).div_ceil(files.len().max(1)).max(1);
+    let per_slice = (want * policy.merge_marks_per_range)
+        .div_ceil(files.len().max(1))
+        .max(1);
     let weigh = |file: &SliceFile| -> Result<Vec<(Vec<u8>, u64)>, TermIndexError> {
         let bytes = fs::read(&file.path)?;
         let slice = Slice::open(&bytes)?;
