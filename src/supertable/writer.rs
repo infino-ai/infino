@@ -12287,6 +12287,7 @@ pub(in crate::supertable) async fn stamp_term_index(
                             budget_mib = fold_budget.memory_bytes >> 20,
                             "term index fold plan"
                         );
+                        let output_at = fold.run().start;
                         let span = detail_span!("term_index.fold", layers = root.layers.len());
                         let result = term_index::fold_at_optimize(storage, &root, fold, &policy, &io, pool)
                             .instrument(span)
@@ -12295,7 +12296,18 @@ pub(in crate::supertable) async fn stamp_term_index(
                         downloaded.notify_one();
                         match result {
                             Ok(folded) => {
+                                // The fold stored its output itself, so the next
+                                // pass need not ask storage for it.
+                                let written: Vec<_> = folded
+                                    .layers
+                                    .get(output_at)
+                                    .into_iter()
+                                    .flat_map(|layer| &layer.slices)
+                                    .flat_map(|slice| [Some(slice.content_hash), slice.tier])
+                                    .flatten()
+                                    .collect();
                                 let reference = write_fold(storage, kept_fold, root, folded).await?;
+                                seen.lock().expect("term-index objects seen").extend(written);
                                 renumbered.fetch_or(renumbers, Ordering::Relaxed);
                                 published.store(true, Ordering::Relaxed);
                                 return Ok(Some(old.with_term_index(reference, true)));
