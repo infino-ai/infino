@@ -133,8 +133,9 @@ impl TableResolver {
         let resolved = ResolvedTable {
             // Stored shape: search TVF output columns resolve against
             // what Parquet actually holds (index-only FTS columns are
-            // not projectable).
-            scalar_schema: reader.manifest().stored_schema(),
+            // not projectable). The same schema the table's own SQL binds
+            // its search functions to, so field ids stay out of the plan.
+            scalar_schema: reader.sql_schemas().scalar().clone(),
             reader: Arc::new(reader),
         };
         self.cache
