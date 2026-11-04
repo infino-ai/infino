@@ -8,7 +8,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use futures::{StreamExt, stream};
+use futures::{StreamExt, future::try_join_all, stream};
 use tokio::task::spawn_blocking;
 use tracing::{debug, error, info, warn};
 
@@ -404,10 +404,18 @@ pub(super) async fn gc_storage_sweep_for_inner(
     // Referenced superfiles the `data/` listing returned. Only a shortfall against the referenced
     // total sends the sweep down the integrity path below.
     let mut listed_referenced_superfiles = 0usize;
-    for prefix in prefixes {
+    // Every prefix is listed at once: one after another they were a serial
+    // chain of paged LISTs, three quarters of a second after a large
+    // compaction. The listings are still read in prefix order.
+    let listings = try_join_all(
+        prefixes
+            .iter()
+            .map(|prefix| storage.list_with_prefix_metadata(prefix)),
+    )
+    .await?;
+    for (prefix, entries) in prefixes.into_iter().zip(listings) {
         // Decided once per prefix. Every referenced key `data/` returns is a superfile.
         let count_referenced = check_integrity && prefix == SUPERFILE_DATA_DIR;
-        let entries = storage.list_with_prefix_metadata(prefix).await?;
         for (key, meta) in entries {
             if live_uris.contains(&key) {
                 if count_referenced {

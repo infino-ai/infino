@@ -18,6 +18,7 @@ use std::{
         Arc, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
+    thread,
     time::{Duration, Instant},
 };
 
@@ -80,8 +81,12 @@ use crate::{
     utils::trace::{RegionUsage, detail_span, record},
 };
 
-/// Number of seal/reseal/unseal requests to run in parallel at a time
-const MAX_CONCURRENT_SEAL_WRITES: usize = 64;
+/// Number of seal/reseal/unseal requests to run in parallel at a time. A
+/// pass over a thousand-odd small superfiles seals and, when its commit
+/// lands past the steal window, re-stamps every one of them on the commit's
+/// critical path: at 64 the re-stamp of 1,411 inputs took 1.7 s, at 256
+/// under half a second. A seal write is one small conditional PUT.
+const MAX_CONCURRENT_SEAL_WRITES: usize = 256;
 
 /// Failed merges and dropped batches in a row, with no batch committing in
 /// between, after which a pass stops starting merges. One failure is usually
@@ -1374,17 +1379,27 @@ impl Supertable {
                     // cache, same as a normal writer commit does. Without
                     // this every query against it misses and re-fetches +
                     // re-opens from storage every single time.
-                    for prepared in &batch {
-                        if let Some((uri, bytes)) = prepared.bytes_for_store.clone()
-                            && let Err(e) = opts.store.insert(uri, bytes)
-                        {
-                            warn!(
-                                superfile_id = %prepared.merged_superfile_id,
-                                error = %e,
-                                "compact: failed to warm reader cache for merged superfile"
-                            );
+                    //
+                    // Opening a reader verifies the whole superfile's CRC, a
+                    // pass over its bytes, so the batch's outputs are opened
+                    // side by side: one after another they held the commit
+                    // for a quarter of a second per gigabyte of output.
+                    thread::scope(|scope| {
+                        for prepared in &batch {
+                            let store = &opts.store;
+                            scope.spawn(move || {
+                                if let Some((uri, bytes)) = prepared.bytes_for_store.clone()
+                                    && let Err(e) = store.insert(uri, bytes)
+                                {
+                                    warn!(
+                                        superfile_id = %prepared.merged_superfile_id,
+                                        error = %e,
+                                        "compact: failed to warm reader cache for merged superfile"
+                                    );
+                                }
+                            });
                         }
-                    }
+                    });
 
                     // Drop the merged-away inputs so the in-memory cache
                     // doesn't grow forever across repeated compactions.
@@ -1409,6 +1424,30 @@ impl Supertable {
                         pending_cache_inserts,
                     )
                     .await;
+
+                    // The layer's objects were written by this process in the
+                    // current layout, so the term-index refresh that follows
+                    // a compaction need not ask storage whether they are there.
+                    if let Some(layer) = reserved_layer.as_ref() {
+                        inner
+                            .term_index_objects_seen
+                            .lock()
+                            .expect("term-index objects seen")
+                            .extend(layer.written_objects());
+                    }
+                    // What the commit is done with goes on a thread of its own.
+                    // The batch's spilled term contributions and the layer's
+                    // spilled objects are scratch files of many gigabytes,
+                    // still in the page cache, and unlinking them evicts it:
+                    // dropped here, they held a finished commit for seconds.
+                    let done_with = (
+                        mem::take(&mut batch),
+                        mem::take(&mut term_contributions),
+                        reserved_layer.take(),
+                        mem::take(&mut rebuilt_parts),
+                        mem::take(&mut pending_storage_writes),
+                    );
+                    thread::spawn(move || drop(done_with));
 
                     return match deferred_error {
                         Some(e) => Err(e),

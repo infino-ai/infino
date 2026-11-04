@@ -1628,14 +1628,27 @@ pub(crate) fn build_layer(
     contributions: &[Contribution],
     policy: &BuildPolicy,
 ) -> Result<BuiltLayer, TermIndexError> {
+    build_layer_with(contributions, policy, None)
+}
+
+/// [`build_layer`], handing each key range's objects to `on_part` as soon
+/// as that range is built, while the other ranges are still building.
+pub(crate) fn build_layer_with(
+    contributions: &[Contribution],
+    policy: &BuildPolicy,
+    on_part: Option<&(dyn Fn(&MergedLayer) + Sync)>,
+) -> Result<BuiltLayer, TermIndexError> {
     let scoring = scoring_lookup(
         Arc::new(contributions.iter().map(|c| c.scoring.clone()).collect()),
         0,
     );
     let ranges = build_ranges(contributions, policy)?;
-    let mut built = run_ranges(&ranges, policy, |start, end| {
-        build_range(contributions, start, end, policy, &scoring)
-    })?;
+    let mut built = run_ranges_with(
+        &ranges,
+        policy,
+        |start, end| build_range(contributions, start, end, policy, &scoring),
+        on_part,
+    )?;
     built.layer.ordinals = Some(0..contributions.len() as u32);
     Ok(BuiltLayer {
         superfiles: contributions.iter().map(|c| c.superfile_id).collect(),
@@ -2160,6 +2173,22 @@ fn run_ranges(
     policy: &BuildPolicy,
     one: impl Fn(Option<&[u8]>, Option<&[u8]>) -> Result<MergedLayer, TermIndexError> + Sync,
 ) -> Result<MergedLayer, TermIndexError> {
+    run_ranges_with(ranges, policy, one, None)
+}
+
+fn run_ranges_with(
+    ranges: &[KeyRange],
+    policy: &BuildPolicy,
+    one: impl Fn(Option<&[u8]>, Option<&[u8]>) -> Result<MergedLayer, TermIndexError> + Sync,
+    on_part: Option<&(dyn Fn(&MergedLayer) + Sync)>,
+) -> Result<MergedLayer, TermIndexError> {
+    let one = |start: Option<&[u8]>, end: Option<&[u8]>| {
+        let part = one(start, end);
+        if let (Some(on_part), Ok(part)) = (on_part, part.as_ref()) {
+            on_part(part);
+        }
+        part
+    };
     if let [(start, end)] = ranges {
         return one(start.as_deref(), end.as_deref());
     }

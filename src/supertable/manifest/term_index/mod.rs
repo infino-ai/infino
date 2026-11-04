@@ -43,18 +43,21 @@ use std::{
     future::Future,
     io,
     iter::repeat_n,
+    mem,
     ops::Range,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 
+#[cfg(test)]
+use build::build_layer;
 pub(crate) use build::{
     BuildPolicy, BuiltBytes, Contribution, ContributionWriter, HEAD_DEPTH, HEAD_DEPTH_MAX,
     HeadSink, SliceFile, build_onto, merge_layers, scratch_dir, tier_path,
 };
 #[cfg(test)]
 pub(crate) use build::{Built, build, first_contribution_difference};
-use build::{build_layer, rebase_run};
+use build::{BuiltLayer, MergedLayer, build_layer_with, rebase_run};
 use bytes::Bytes;
 #[cfg(test)]
 pub(crate) use format::TierRef;
@@ -64,7 +67,15 @@ use futures::{StreamExt, TryStreamExt, stream};
 use rayon::ThreadPool;
 use thiserror::Error;
 pub(crate) use tier::{BLOCK_ENTRIES, ColumnScoring, TierChunkRef, TierDirectory, TierEntry};
-use tokio::{fs as async_fs, io::AsyncWriteExt, task, task::JoinSet, try_join};
+use tokio::{
+    fs as async_fs,
+    io::AsyncWriteExt,
+    runtime::Handle,
+    sync::Semaphore,
+    task,
+    task::{JoinHandle, JoinSet},
+    try_join,
+};
 use tracing::{Instrument, warn};
 use uuid::Uuid;
 
@@ -138,8 +149,10 @@ const LAYER_FETCH_CONCURRENCY: usize = 64;
 /// this many of the largest bound the upload's memory: a spilled object is
 /// read back only as its upload starts. At sixteen, a fold's four hundred
 /// slices and as many tier objects took half a minute of 400 ms PUTs,
-/// longer than the merge that made them.
-const SLICE_WRITE_CONCURRENCY: usize = LAYER_FETCH_CONCURRENCY;
+/// longer than the merge that made them. At 64, an optimize's final layer
+/// of 10 GB in 1,088 objects spent its last second and a half with a
+/// handful of large PUTs in flight; at 128 the wave is shorter by that.
+const SLICE_WRITE_CONCURRENCY: usize = 2 * LAYER_FETCH_CONCURRENCY;
 
 /// Fan-out of the tiered fold a commit applies to its root's layers (see
 /// [`fold_tail`]). A lookup opens one slice per layer, so a root that only
@@ -415,19 +428,97 @@ async fn write_objects(
     // whole upload while the other slots sat empty. Started first, the
     // large ones run the whole wave and the small ones fill in around them.
     objects.sort_by_key(|(_, built)| Reverse(built.len()));
-    let jobs = objects.into_iter().map(|(hash, built)| {
-        let storage = Arc::clone(storage);
-        async move {
-            let bytes = match built {
-                BuiltBytes::Resident(bytes) => bytes,
-                BuiltBytes::Spilled { path, .. } => async_fs::read(&path).await?,
-            };
-            let reference = put_content_addressed(storage.as_ref(), kind, bytes).await?;
-            debug_assert_eq!(reference.content_hash, hash);
-            Ok(())
-        }
-    });
+    let jobs = objects
+        .into_iter()
+        .map(|(hash, built)| write_built_object(Arc::clone(storage), kind, hash, built));
     run_bounded(SLICE_WRITE_CONCURRENCY, "object write", jobs).await
+}
+
+/// Write one built object; the job [`write_objects`] runs for each.
+async fn write_built_object(
+    storage: Arc<dyn StorageProvider>,
+    kind: &'static str,
+    hash: ContentHash,
+    built: BuiltBytes,
+) -> Result<(), TermIndexError> {
+    let bytes = match built {
+        BuiltBytes::Resident(bytes) => bytes,
+        BuiltBytes::Spilled { path, .. } => async_fs::read(&path).await?,
+    };
+    let reference = put_content_addressed(storage.as_ref(), kind, bytes).await?;
+    debug_assert_eq!(reference.content_hash, hash);
+    Ok(())
+}
+
+/// Build a layer and write its tier objects and slices as each key range
+/// finishes, rather than all of them after the last range: the uploads of
+/// the ranges done early run beside the ranges still building. An
+/// optimize's final layer built for 4.6 s and then uploaded for 5 more;
+/// streamed, the upload ends 2.6 s after the build.
+///
+/// The build blocks this thread, so the writes are spawned onto the
+/// runtime's other workers as the ranges hand them over, tier objects and
+/// slices sharing one bound of twice [`SLICE_WRITE_CONCURRENCY`], the
+/// width the two kinds wrote at side by side. The root is written by the
+/// caller only after every write here has landed.
+async fn build_and_write_layer(
+    storage: &Arc<dyn StorageProvider>,
+    contributions: &[Contribution],
+    policy: &BuildPolicy,
+) -> Result<BuiltLayer, TermIndexError> {
+    let handle = Handle::current();
+    let permits = Arc::new(Semaphore::new(2 * SLICE_WRITE_CONCURRENCY));
+    let uploads: Mutex<Vec<JoinHandle<Result<(), TermIndexError>>>> = Mutex::new(Vec::new());
+    let on_part = |part: &MergedLayer| {
+        let mut started = uploads.lock().expect("uploads");
+        let objects = part
+            .tiers
+            .iter()
+            .map(|o| ("tier", o))
+            .chain(part.slices.iter().map(|o| ("slice", o)));
+        for (kind, (hash, built)) in objects {
+            let storage = Arc::clone(storage);
+            let permits = Arc::clone(&permits);
+            let (hash, built) = (*hash, built.clone());
+            started.push(handle.spawn(async move {
+                let _permit = permits.acquire_owned().await.expect("never closed");
+                write_built_object(storage, kind, hash, built).await
+            }));
+        }
+    };
+    let built = detail_span!(
+        "term_index.build_layer",
+        inputs = contributions.len(),
+        bytes = tracing::field::Empty,
+        ranges = tracing::field::Empty,
+    )
+    .in_scope(|| build_layer_with(contributions, policy, Some(&on_part)));
+    let started = mem::take(&mut *uploads.lock().expect("uploads"));
+    if built.is_err() {
+        for upload in &started {
+            upload.abort();
+        }
+    }
+    let built = built?;
+    let mut failed = None;
+    let wait = async {
+        for upload in started {
+            match upload.await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    failed.get_or_insert(e);
+                }
+                Err(e) => {
+                    failed.get_or_insert(TermIndexError::Build(format!("object write: {e}")));
+                }
+            }
+        }
+    };
+    wait.await;
+    match failed {
+        Some(e) => Err(e),
+        None => Ok(built),
+    }
 }
 
 /// Run `jobs` as spawned tasks, at most `limit` at once, so they spread
@@ -541,6 +632,15 @@ struct LayerBytes {
 }
 
 impl ReservedLayer {
+    /// Content hashes of every slice and tier object this layer wrote.
+    pub(crate) fn written_objects(&self) -> impl Iterator<Item = ContentHash> + '_ {
+        self.bytes
+            .slices
+            .iter()
+            .chain(&self.bytes.tiers)
+            .map(|(hash, _)| *hash)
+    }
+
     /// Whether it was built from `contributions`, in their order.
     fn built_from(&self, contributions: &[Contribution]) -> bool {
         self.superfiles.len() == contributions.len()
@@ -559,14 +659,7 @@ pub(crate) async fn reserve_layer(
     contributions: &[Contribution],
     policy: &BuildPolicy,
 ) -> Result<ReservedLayer, TermIndexError> {
-    let built = detail_span!(
-        "term_index.build_layer",
-        inputs = contributions.len(),
-        bytes = tracing::field::Empty,
-        ranges = tracing::field::Empty,
-    )
-    .in_scope(|| build_layer(contributions, policy))?;
-    write_tiers_and_slices(storage, built.tiers.clone(), built.slices.clone()).await?;
+    let built = build_and_write_layer(storage, contributions, policy).await?;
     Ok(ReservedLayer {
         superfiles: built.superfiles,
         id_mins: built.id_mins,
@@ -8069,6 +8162,61 @@ mod tests {
             posted_superfiles(&root, &local, "merged").await,
             [Uuid::from_u128(9)]
         );
+    }
+
+    /// Key ranges, contributions and distinct terms of the streamed-reserve
+    /// test: enough terms that each range holds several slices' worth.
+    const RESERVE_TEST_RANGES: usize = 4;
+    const RESERVE_TEST_CONTRIBUTIONS: u128 = 4;
+    const RESERVE_TEST_TERMS: usize = 4_000;
+
+    /// A reserved layer streams its objects out as its key ranges finish,
+    /// and has written every one of them, the ones the same build kept in
+    /// hand would write, by the time it returns.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reserve_layer_writes_every_object_of_its_ranges() {
+        let dir = TempDir::new().expect("tempdir");
+        let policy = BuildPolicy {
+            merge_ranges: Some(RESERVE_TEST_RANGES),
+            ..BuildPolicy::default()
+        };
+        let terms: Vec<String> = (0..RESERVE_TEST_TERMS)
+            .map(|t| format!("t{t:04}"))
+            .collect();
+        let contributions: Vec<Contribution> = (1..=RESERVE_TEST_CONTRIBUTIONS)
+            .map(|id| {
+                let mine: Vec<(&str, &str, u64)> = terms
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| (*i as u128) % id == 0)
+                    .map(|(i, t)| ("body", t.as_str(), 1 + (i as u64 % 3)))
+                    .collect();
+                contribution(&dir, id, &mine)
+            })
+            .collect();
+        let store_dir = TempDir::new().expect("store dir");
+        let local: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(store_dir.path()).expect("local fs"));
+
+        let reserved = reserve_layer(&local, &contributions, &policy)
+            .await
+            .expect("reserve");
+
+        let expected = build_layer(&contributions, &policy).expect("build");
+        let want: HashSet<ContentHash> = expected
+            .slices
+            .iter()
+            .chain(&expected.tiers)
+            .map(|(hash, _)| *hash)
+            .collect();
+        let got: HashSet<ContentHash> = reserved.written_objects().collect();
+        assert_eq!(got, want, "the objects the build in hand makes");
+        for (hash, _) in &expected.slices {
+            local.head(&slice_uri(hash)).await.expect("slice written");
+        }
+        for (hash, _) in &expected.tiers {
+            local.head(&tier_uri(hash)).await.expect("tier written");
+        }
     }
 
     /// A root whose list grew since the layer was built places the layer
