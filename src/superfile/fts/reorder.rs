@@ -484,13 +484,29 @@ const MAX_DEPTH: u32 = 24;
 /// degrees call [`term_cost`] directly, so the values are the same.
 const COST_TABLE_LEN: usize = 1 << 16;
 
-/// How many ranked documents per side a round orders before it starts
+/// The fewest ranked documents per side a round orders before it starts
 /// swapping. A round only reads down its two lists until a pair stops paying
 /// for itself, and after the first round or two that prefix is tiny, so
 /// ordering the whole partition every round is almost all waste. The block
 /// doubles when a round consumes it, which costs one extra linear selection
 /// per doubling and never changes which swaps happen.
+///
+/// Above this floor a round sizes its block from what came before it: a
+/// later round from the swaps of the round before, which its own swaps rarely
+/// exceed, and a first round from the share of pairs the last first round at
+/// the same depth swapped (see [`FIRST_ROUND_MARGIN`]). An undersized block
+/// costs a selection over the rest of the list and an oversized one costs
+/// sorting entries no pair reads, so the closer the estimate the less of
+/// either; whatever the estimate, the swaps are the same.
 const SWAP_BLOCK: usize = 64;
+
+/// How much larger than the last first round's share at its depth a first
+/// round makes its block. Splits at one depth are of one size and cut from
+/// the same corpus, so their first rounds swap similar shares, but not the
+/// same: a quarter more covers most first rounds in one block, where starting
+/// from [`SWAP_BLOCK`] took a doubling, and a linear selection over the
+/// partition, for every factor of two between the floor and the swaps.
+const FIRST_ROUND_MARGIN: f32 = 1.25;
 
 /// Partitions below this size are split on one thread, with one scratch
 /// state for their whole subtree. Above it the two halves recurse in
@@ -881,6 +897,12 @@ struct BisectState {
     /// millions of them over a corpus-sized bisection.
     left_gains: Vec<u64>,
     right_gains: Vec<u64>,
+    /// By depth, the share of its pairs the last first round this state ran
+    /// at that depth swapped, or a negative value where it has run none. It
+    /// sizes the next first round's block there, which changes how much of
+    /// each list is ordered but never which documents swap, so it may come
+    /// from whichever splits this state happened to serve.
+    first_round_share: Vec<f32>,
     /// Reports of the splits this state made, by depth, until
     /// [`Self::flush`] adds them to the run's. Saves taking the shared lock
     /// once per split.
@@ -899,8 +921,30 @@ impl BisectState {
             touched: Vec::new(),
             left_gains: Vec::new(),
             right_gains: Vec::new(),
+            first_round_share: Vec::new(),
             levels: Vec::new(),
         }
+    }
+
+    /// The block a first round at `depth` with `pairs` pairs orders: the
+    /// share of pairs the last first round there swapped, with
+    /// [`FIRST_ROUND_MARGIN`] to spare, or nothing where none has run yet.
+    fn first_round_block(&self, depth: u32, pairs: usize) -> usize {
+        match self.first_round_share.get(depth as usize) {
+            Some(&share) if share >= 0.0 => {
+                (share * FIRST_ROUND_MARGIN * pairs as f32).ceil() as usize
+            }
+            _ => 0,
+        }
+    }
+
+    /// Remember that a first round at `depth` swapped `swaps` of its `pairs`.
+    fn note_first_round(&mut self, depth: u32, swaps: usize, pairs: usize) {
+        let depth = depth as usize;
+        if self.first_round_share.len() <= depth {
+            self.first_round_share.resize(depth + 1, -1.0);
+        }
+        self.first_round_share[depth] = swaps as f32 / pairs.max(1) as f32;
     }
 
     fn note(&mut self, depth: u32, level: &LevelReport) {
@@ -1116,7 +1160,12 @@ impl BisectState {
                 // the leading `ready` entries need to be in order, and why
                 // extending the block cannot change the outcome.
                 let pairs = left_gains.len().min(right_gains.len());
-                let mut ready = last_swaps.saturating_mul(2).max(SWAP_BLOCK).min(pairs);
+                let mut ready = match round {
+                    0 => self.first_round_block(depth, pairs),
+                    _ => last_swaps,
+                }
+                .max(SWAP_BLOCK)
+                .min(pairs);
                 order_leading_gains(&mut left_gains, ready, parallel);
                 order_leading_gains(&mut right_gains, ready, parallel);
                 if let Some(step) = step {
@@ -1209,6 +1258,9 @@ impl BisectState {
                 swaps
             };
             last_swaps = moved;
+            if round == 0 {
+                self.note_first_round(depth, moved, mid.min(order.len() - mid));
+            }
             level.rounds += 1;
             if moved == 0 {
                 end = SplitEnd::Settled;
@@ -2486,6 +2538,43 @@ mod tests {
             "renumberings by depth: {localized:?}"
         );
         assert_eq!(order, reference_order(&fwd));
+    }
+
+    /// A first round's block comes from whatever first rounds the state ran
+    /// before, so it must not matter what they were: a state that expects
+    /// every first round to swap nothing, or all of its pairs, or anything
+    /// between, gives the order a fresh state does.
+    #[test]
+    fn the_first_rounds_block_does_not_change_the_order() {
+        let (fwd, _) = clustered(9_000, 40, 3);
+        let split_with = |params: BisectParams, share: Option<f32>| {
+            let mut order: Vec<u32> = (0..fwd.len() as u32).collect();
+            let reference = AtomicU64::new(0);
+            let report = RunReport::new();
+            let run = Bisect {
+                params,
+                reference: &reference,
+                report: &report,
+                parent: &report.span,
+            };
+            let mut state = BisectState::new(fwd.n_terms);
+            if let Some(share) = share {
+                state.first_round_share = vec![share; MAX_DEPTH as usize];
+            }
+            state.split(&fwd, &mut order, 0, run, None);
+            order
+        };
+        for params in [exhaustive(), BisectParams::default()] {
+            let fresh = split_with(params, None);
+            for share in [0.0, 0.01, 0.3, 1.0] {
+                assert_eq!(
+                    split_with(params, Some(share)),
+                    fresh,
+                    "order diverged with a first-round share of {share}"
+                );
+            }
+        }
+        assert_eq!(split_with(exhaustive(), None), reference_order(&fwd));
     }
 
     /// Documents with no terms at all renumber into an empty table and still
