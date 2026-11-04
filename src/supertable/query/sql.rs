@@ -299,11 +299,17 @@ impl SupertableReader {
     // Single-table SQL — off the public surface; catalog-level SQL is the
     // public entry point. Reachable from tests/benches via `test-helpers`.
     #[cfg(any(test, feature = "test-helpers"))]
+    pub fn query_sql(&self, sql: &str) -> Result<Vec<RecordBatch>, QueryError> {
+        self.run_sql(sql)
+    }
+
+    /// [`Self::query_sql`] for the engine's own statements, in every build:
+    /// what a search method runs where its index cannot answer.
     #[cfg_attr(
         feature = "detailed-tracing",
         tracing::instrument(skip_all, fields(sql = sql, role = self.role().as_str(), origin = OpOrigin::Query.as_str()))
     )]
-    pub fn query_sql(&self, sql: &str) -> Result<Vec<RecordBatch>, QueryError> {
+    pub(crate) fn run_sql(&self, sql: &str) -> Result<Vec<RecordBatch>, QueryError> {
         let _foreground = ForegroundQueryGuard::enter();
         // Read-consistency was applied when `Supertable::reader()` created
         // this pinned reader. SQL therefore observes the same snapshot as

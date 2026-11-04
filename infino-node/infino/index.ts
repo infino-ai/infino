@@ -615,6 +615,16 @@ export class Table {
     return decode(buf, opts.arrow);
   }
 
+  /** The first `k` rows by one range-indexed `column`, highest first with
+   * `descending`; rows sharing a value come in `_id` order and rows without
+   * one last. Rows as records (or an Arrow `Table`), in that order. */
+  sortedSearch(column: string, descending: boolean, k: number, opts: MatchOptions & { arrow: true }): arrow.Table;
+  sortedSearch(column: string, descending: boolean, k: number, opts?: MatchOptions): RowRecord[];
+  sortedSearch(column: string, descending: boolean, k: number, opts: MatchOptions = {}): RowRecord[] | arrow.Table {
+    const buf = guard(this.remote, () => this.inner.sortedSearch(column, descending, k, opts.projection));
+    return decode(buf, opts.arrow);
+  }
+
   /** Count rows matching a BM25 keyword `query` over `column`, without
    * fetching them. `mode` is `"or"` (default) or `"and"`. */
   count(column: string, query: string, opts: CountOptions = {}): number {

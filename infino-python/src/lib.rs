@@ -1174,6 +1174,30 @@ impl Table {
         batches_to_pyarrow_table(py, batches)
     }
 
+    /// The first `k` rows by one range-indexed `column`, highest first with
+    /// `descending`; rows sharing a value come in `_id` order and rows
+    /// without one last. Read from the column's range index. Returns a
+    /// pyarrow `Table` in that order like `bm25_search`, with `score` fixed
+    /// at `0.0`. `projection` follows the same rules as `bm25_search`.
+    #[pyo3(signature = (column, descending, k, projection=None))]
+    fn sorted_search<'py>(
+        &self,
+        py: Python<'py>,
+        column: &str,
+        descending: bool,
+        k: usize,
+        projection: Option<Vec<String>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let batches = py
+            .detach(|| {
+                let names = projection_refs(&projection);
+                self.inner
+                    .sorted_search(column, descending, k, names.as_deref())
+            })
+            .map_err(py_err)?;
+        batches_to_pyarrow_table(py, batches)
+    }
+
     /// Count rows matching a BM25 keyword `query` over `column`, without
     /// fetching them. `mode` is `"or"` (default) or `"and"`.
     #[pyo3(signature = (column, query, mode=None))]

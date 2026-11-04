@@ -1246,6 +1246,29 @@ impl Table {
         batches_to_ipc(&batches)
     }
 
+    /// The first `k` rows by one range-indexed `column`, highest first with
+    /// `descending`; rows sharing a value come in `_id` order and rows
+    /// without one last. Read from the column's range index. Returns Arrow
+    /// rows in that order like [`Table::bm25_search`], with `score` = 0.0.
+    /// `projection` selects columns (omit for `_id` + `score`).
+    #[napi]
+    pub fn sorted_search(
+        &self,
+        column: String,
+        descending: bool,
+        k: u32,
+        projection: Option<Vec<String>>,
+    ) -> Result<Buffer> {
+        let proj: Option<Vec<&str>> = projection
+            .as_ref()
+            .map(|v| v.iter().map(String::as_str).collect());
+        let batches = self
+            .inner
+            .sorted_search(&column, descending, k as usize, proj.as_deref())
+            .map_err(map_err)?;
+        batches_to_ipc(&batches)
+    }
+
     /// Count rows matching a BM25 keyword `query` over `column`, without
     /// fetching them. `mode` is `"or"` (default) or `"and"`.
     #[napi]

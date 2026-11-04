@@ -67,6 +67,13 @@ pub(crate) trait Table: Send + Sync {
         value: &str,
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, InfinoError>;
+    fn sorted_search(
+        &self,
+        column: &str,
+        descending: bool,
+        k: usize,
+        projection: Option<&[&str]>,
+    ) -> Result<Vec<RecordBatch>, InfinoError>;
     fn count(&self, column: &str, query: &str, mode: BoolMode) -> Result<u64, InfinoError>;
     fn count_where(&self, predicates: &[Expr]) -> Result<Vec<u64>, InfinoError>;
     fn value_counts(&self, column: &str) -> Result<RecordBatch, InfinoError>;
@@ -171,6 +178,15 @@ impl Table for SupertableHandle {
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, InfinoError> {
         SupertableHandle::exact_match(self, column, value, projection)
+    }
+    fn sorted_search(
+        &self,
+        column: &str,
+        descending: bool,
+        k: usize,
+        projection: Option<&[&str]>,
+    ) -> Result<Vec<RecordBatch>, InfinoError> {
+        SupertableHandle::sorted_search(self, column, descending, k, projection)
     }
     fn count(&self, column: &str, query: &str, mode: BoolMode) -> Result<u64, InfinoError> {
         SupertableHandle::count(self, column, query, mode)
@@ -404,6 +420,37 @@ impl Supertable {
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, InfinoError> {
         self.inner.exact_match(column, value, projection)
+    }
+
+    /// The first `k` rows by one range-indexed column, ascending or (with
+    /// `descending`) descending; rows sharing a value come in `_id` order
+    /// and rows without a value last. Read from the column's range index
+    /// without planning a statement. Rows come back in that order, with
+    /// `score` fixed at `0.0`; `projection` follows `bm25_search`'s rules.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use infino::arrow_array::{Int64Array, RecordBatch};
+    /// # use infino::arrow_schema::{DataType, Field, Schema};
+    /// # use infino::{connect, IndexSpec};
+    /// # let db = connect("memory://")?;
+    /// # let schema = Arc::new(Schema::new(vec![Field::new("size", DataType::Int64, false)]));
+    /// # let logs = db.create_table("logs", schema.clone(), IndexSpec::new().range("size"))?;
+    /// # logs.append(&RecordBatch::try_new(
+    /// #     schema, vec![Arc::new(Int64Array::from(vec![30, 10, 20]))])?)?;
+    /// let largest = logs.sorted_search("size", true, 2, Some(&["size"]))?;
+    /// let sizes = largest[0].column(0).as_any().downcast_ref::<Int64Array>().expect("size");
+    /// assert_eq!(sizes.values(), &[30, 20]);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn sorted_search(
+        &self,
+        column: &str,
+        descending: bool,
+        k: usize,
+        projection: Option<&[&str]>,
+    ) -> Result<Vec<RecordBatch>, InfinoError> {
+        self.inner.sorted_search(column, descending, k, projection)
     }
 
     /// Count rows matching a token query over one FTS column.
