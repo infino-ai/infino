@@ -6598,14 +6598,14 @@ mod tests {
         fs::File,
         hint::black_box,
         path::{Path, PathBuf},
-        sync::Arc,
+        sync::{Arc, OnceLock},
         time::Duration,
     };
 
     use memmap2::Mmap;
     use memory_stats::memory_stats;
     use tempfile::NamedTempFile;
-    use tokio::time::sleep;
+    use tokio::{sync::Barrier, time::sleep};
 
     use super::*;
     use crate::memory::ColdReadWindow;
@@ -7649,15 +7649,15 @@ mod tests {
     /// [`two_cell_blob`]: unwindowed, both cells' blocks are held together;
     /// with a window of one read, never more than one cell's. Then under a
     /// budget that fits one cell's read but not both, with room in the window
-    /// for both, the budget refuses the second read, which waits for the
-    /// first and returns the same hits instead of failing the search.
+    /// for both, the search returns the same hits instead of failing: a
+    /// refused read waits for the first one.
     #[tokio::test]
     async fn cold_cell_reads_wait_for_room_in_the_query_window() {
         /// How long each cold GET of the test source takes.
         const COLD_GET_LATENCY: Duration = Duration::from_millis(20);
         let (blob, json) = two_cell_blob();
         let q = vec![0.0f32; TWO_CELL_DIM];
-        let search = |reads: ColdReadGate| {
+        let search = |reads: ColdReadGate, paired: bool| {
             let blob = blob.clone();
             let json = json.clone();
             let q = q.clone();
@@ -7668,12 +7668,17 @@ mod tests {
                 // reads are in flight together unless the window holds one.
                 source.set_async_latency(COLD_GET_LATENCY);
                 let lazy = VectorReader::open_lazy(
-                    source as StdArc<dyn LazyByteSource>,
+                    StdArc::clone(&source) as StdArc<dyn LazyByteSource>,
                     &json,
                     OpenOptions::for_object_store(),
                 )
                 .await
                 .expect("lazy multi-cell open");
+                if paired {
+                    // Latency alone does not overlap the two cells on a busy
+                    // machine: one cell can finish before the other is polled.
+                    source.pair_reads();
+                }
                 lazy.search_clusters_async(
                     "emb",
                     &q,
@@ -7690,19 +7695,19 @@ mod tests {
         };
 
         let unwindowed = ConnectionMemoryBudget::measured();
-        let (hits, _) = search(ColdReadGate::new(
-            Arc::clone(&unwindowed),
-            ColdReadWindow::new(usize::MAX),
-        ))
+        let (hits, _) = search(
+            ColdReadGate::new(Arc::clone(&unwindowed), ColdReadWindow::new(usize::MAX)),
+            true,
+        )
         .await
         .expect("measured budget never refuses");
         let both_cells = unwindowed.peak();
 
         let one_read = ConnectionMemoryBudget::measured();
-        search(ColdReadGate::new(
-            Arc::clone(&one_read),
-            ColdReadWindow::new(1),
-        ))
+        search(
+            ColdReadGate::new(Arc::clone(&one_read), ColdReadWindow::new(1)),
+            false,
+        )
         .await
         .expect("measured budget never refuses");
         let one_cell = one_read.peak();
@@ -7719,10 +7724,10 @@ mod tests {
             (one_cell..both_cells).contains(&ceiling),
             "ceiling {ceiling} B"
         );
-        let (tight_hits, _) = search(ColdReadGate::new(
-            Arc::clone(&tight),
-            ColdReadWindow::new(usize::MAX),
-        ))
+        let (tight_hits, _) = search(
+            ColdReadGate::new(Arc::clone(&tight), ColdReadWindow::new(usize::MAX)),
+            false,
+        )
         .await
         .expect("reads that fit one at a time must wait, not fail");
         assert_eq!(tight_hits, hits);
@@ -9096,6 +9101,10 @@ mod tests {
         /// overlap in wall-clock instead of completing in the
         /// trivial sync slice path inside `range`.
         async_latency_us: AtomicU64,
+        /// When set, every `range()` waits for one other `range()` before it
+        /// returns, so reads issued together are in flight together however
+        /// late the runtime polls one of them.
+        paired_reads: OnceLock<Barrier>,
     }
 
     impl CountingLazyByteSource {
@@ -9108,6 +9117,7 @@ mod tests {
                 in_flight: StdArc::new(AtomicU64::new(0)),
                 max_in_flight: StdArc::new(AtomicU64::new(0)),
                 async_latency_us: AtomicU64::new(0),
+                paired_reads: OnceLock::new(),
             }
         }
 
@@ -9139,6 +9149,13 @@ mod tests {
         fn set_async_latency(&self, latency: Duration) {
             self.async_latency_us
                 .store(latency.as_micros() as u64, AtomicOrdering::Relaxed);
+        }
+
+        /// From now on, reads complete in pairs: each `range()` waits until a
+        /// second one arrives. Only for a caller whose reads come in pairs,
+        /// or the odd one out waits forever.
+        fn pair_reads(&self) {
+            let _ = self.paired_reads.set(Barrier::new(2));
         }
     }
 
@@ -9189,6 +9206,9 @@ mod tests {
             let latency_us = self.async_latency_us.load(AtomicOrdering::Relaxed);
             if latency_us > 0 {
                 sleep(Duration::from_micros(latency_us)).await;
+            }
+            if let Some(pair) = self.paired_reads.get() {
+                pair.wait().await;
             }
             let total = self.bytes.len() as u64;
             if start.saturating_add(len) > total {
