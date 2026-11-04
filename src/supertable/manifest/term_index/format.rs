@@ -157,7 +157,7 @@ const F32_LEN: usize = 4;
 /// Root fixed header: magic, version, superfile count.
 const ROOT_HEADER_LEN: usize = MAGIC_LEN + U32_LEN + U32_LEN;
 /// Slice fixed header: magic, version, dictionary length, postings length.
-const SLICE_HEADER_LEN: usize = MAGIC_LEN + U32_LEN + U64_LEN + U64_LEN;
+pub(crate) const SLICE_HEADER_LEN: usize = MAGIC_LEN + U32_LEN + U64_LEN + U64_LEN;
 
 /// Location tags, one byte each in a posting.
 const LOC_NONE: u8 = 0;
@@ -986,16 +986,106 @@ pub(crate) fn encode_slice(dict: &[u8], postings: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Where one dictionary block of a slice starts; see [`Slice::block_marks`].
+/// Where one dictionary block of a slice starts: its first key, and that
+/// key's run as an offset and length in the postings region.
 #[derive(Debug, Clone)]
-pub(crate) struct BlockMark {
-    /// The block's first key.
+pub(crate) struct BlockStart {
     pub(crate) key: Vec<u8>,
-    /// Postings offset of that key's run.
     pub(crate) postings_at: u64,
-    /// Offset of the run's first tier chunk in the slice's tier object,
-    /// when it has chunks.
-    pub(crate) tier_at: Option<u64>,
+    pub(crate) run_len: u64,
+}
+
+/// A slice's dictionary, read without its postings: what a merge needs to
+/// cut the key space into ranges.
+pub(crate) struct SliceDictionary<'a> {
+    dict: TermBlocks<'a>,
+    dict_len: u64,
+    postings_len: u64,
+    legacy: bool,
+}
+
+impl<'a> SliceDictionary<'a> {
+    /// The dictionary length a slice's first [`SLICE_HEADER_LEN`] bytes name.
+    pub(crate) fn dict_len(header: &[u8]) -> Result<u64, TermIndexError> {
+        let mut c = Cursor {
+            bytes: header,
+            at: 0,
+        };
+        check_magic_version(
+            &mut c,
+            SLICE_MAGIC,
+            &[SLICE_FORMAT_VERSION, LEGACY_SLICE_FORMAT_VERSION],
+            "slice",
+        )?;
+        c.u64("slice dict length")
+    }
+
+    /// Parse a slice's header and dictionary, its first
+    /// [`SLICE_HEADER_LEN`] bytes and the dictionary length they name;
+    /// bytes past the dictionary are ignored.
+    pub(crate) fn open(bytes: &'a [u8]) -> Result<Self, TermIndexError> {
+        let mut c = Cursor { bytes, at: 0 };
+        let version = check_magic_version(
+            &mut c,
+            SLICE_MAGIC,
+            &[SLICE_FORMAT_VERSION, LEGACY_SLICE_FORMAT_VERSION],
+            "slice",
+        )?;
+        let dict_len = c.u64("slice dict length")?;
+        let postings_len = c.u64("slice postings length")?;
+        let dict_bytes = c.take(dict_len as usize, "slice dictionary")?;
+        let dict = TermBlocks::open(dict_bytes)
+            .map_err(|e| TermIndexError::Malformed(format!("slice dictionary: {e}")))?;
+        Ok(Self {
+            dict,
+            dict_len,
+            postings_len,
+            legacy: version == LEGACY_SLICE_FORMAT_VERSION,
+        })
+    }
+
+    /// Where each dictionary block starts, in key order.
+    pub(crate) fn block_starts(&self) -> Result<Vec<BlockStart>, TermIndexError> {
+        (0..self.dict.n_blocks())
+            .map(|b| match self.dict.block_first(b) {
+                Some((
+                    key,
+                    DictEntry::Pfor {
+                        metadata_offset,
+                        postings_length,
+                        ..
+                    },
+                )) => Ok(BlockStart {
+                    key: key.to_vec(),
+                    postings_at: metadata_offset,
+                    run_len: u64::from(postings_length),
+                }),
+                _ => Err(malformed("slice dictionary block")),
+            })
+            .collect()
+    }
+
+    /// Where the postings region starts in the slice's bytes.
+    pub(crate) fn postings_start(&self) -> u64 {
+        SLICE_HEADER_LEN as u64 + self.dict_len
+    }
+
+    /// Bytes in the postings region.
+    pub(crate) fn postings_len(&self) -> u64 {
+        self.postings_len
+    }
+
+    /// The offset of the first tier chunk of `run`, the bytes of one run a
+    /// [`BlockStart`] names, when it has chunks.
+    pub(crate) fn tier_at(&self, run: &[u8]) -> Result<Option<u64>, TermIndexError> {
+        let run = match self.legacy {
+            true => decode_legacy_run(run)?,
+            false => decode_run_with_tier(run)?,
+        };
+        Ok(run
+            .tier
+            .and_then(|tier| tier.chunks.iter().map(|chunk| chunk.offset).min()))
+    }
 }
 
 /// An opened slice: its dictionary and postings region, borrowed.
@@ -1057,41 +1147,6 @@ impl<'a> Slice<'a> {
         } else {
             decode_run_with_tier(run)
         }
-    }
-
-    /// Where each dictionary block starts: its first key, the postings
-    /// offset of that key's run, and the offset of its first tier chunk when
-    /// the run has chunks. Runs and chunks sit in key order, so the bytes
-    /// between two consecutive marks are the bytes of the terms between
-    /// them: what a merge weighs when it cuts the key space into ranges.
-    pub(crate) fn block_marks(&self) -> Result<Vec<BlockMark>, TermIndexError> {
-        let mut out = Vec::with_capacity(self.dict.n_blocks());
-        for b in 0..self.dict.n_blocks() {
-            let Some((key, value)) = self.dict.block_first(b) else {
-                return Err(malformed("slice dictionary block"));
-            };
-            let DictEntry::Pfor {
-                metadata_offset, ..
-            } = value
-            else {
-                return Err(malformed("slice entry is not a postings range"));
-            };
-            let tier_at = self
-                .run_at(value)?
-                .tier
-                .and_then(|t| t.chunks.iter().map(|c| c.offset).min());
-            out.push(BlockMark {
-                key: key.to_vec(),
-                postings_at: metadata_offset,
-                tier_at,
-            });
-        }
-        Ok(out)
-    }
-
-    /// Bytes in the slice's postings region.
-    pub(crate) fn postings_len(&self) -> u64 {
-        self.postings.len() as u64
     }
 
     /// The postings for `key`, `None` when the slice holds no such term.

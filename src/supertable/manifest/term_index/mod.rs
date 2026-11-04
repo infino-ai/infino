@@ -9777,10 +9777,11 @@ mod tests {
         }
     }
 
-    /// A slice's block marks name every dictionary block in key order,
-    /// with run and chunk offsets that rise with the keys.
+    /// A slice's dictionary, read apart from its postings, names every
+    /// block in key order, with run and chunk offsets that rise with the
+    /// keys.
     #[test]
-    fn block_marks_cover_every_block_in_order() {
+    fn block_starts_cover_every_block_in_order() {
         let dir = TempDir::new().expect("tempdir");
         let policy = BuildPolicy {
             tier_entries_per_term: 100_000,
@@ -9789,33 +9790,43 @@ mod tests {
         let built = build(&[range_contribution(&dir, 1)], &policy).expect("build");
         assert_eq!(built.slices.len(), 1, "one slice at the default target");
         let bytes = bytes_of(&built.slices[0].1);
-        let slice = Slice::open(&bytes).expect("open");
-        let terms = slice.terms_after(None, usize::MAX).expect("terms");
-        let marks = slice.block_marks().expect("marks");
-        assert_eq!(marks.len(), terms.len().div_ceil(TERM_BLOCK_SIZE));
-        for (i, mark) in marks.iter().enumerate() {
+        let terms = Slice::open(&bytes)
+            .expect("open")
+            .terms_after(None, usize::MAX)
+            .expect("terms");
+        let dictionary = format::SliceDictionary::open(&bytes).expect("dictionary");
+        let starts = dictionary.block_starts().expect("starts");
+        assert_eq!(starts.len(), terms.len().div_ceil(TERM_BLOCK_SIZE));
+        for (i, start) in starts.iter().enumerate() {
             assert_eq!(
-                mark.key,
+                start.key,
                 terms[i * TERM_BLOCK_SIZE].0,
-                "mark {i} names its block's first key"
+                "block {i} names its first key"
             );
         }
         assert!(
-            marks
+            starts
                 .windows(2)
                 .all(|w| w[0].postings_at < w[1].postings_at),
             "runs sit in key order"
         );
-        let chunked: Vec<u64> = marks.iter().filter_map(|m| m.tier_at).collect();
+        let chunked: Vec<u64> = starts
+            .iter()
+            .filter_map(|start| {
+                let at = (dictionary.postings_start() + start.postings_at) as usize;
+                let run = &bytes[at..at + start.run_len as usize];
+                dictionary.tier_at(run).expect("run")
+            })
+            .collect();
         assert!(!chunked.is_empty(), "some blocks start with a chunked tier");
         assert!(
             chunked.windows(2).all(|w| w[0] < w[1]),
             "chunks sit in key order"
         );
         assert!(
-            marks
+            starts
                 .last()
-                .is_some_and(|m| m.postings_at < slice.postings_len())
+                .is_some_and(|s| s.postings_at < dictionary.postings_len())
         );
     }
 

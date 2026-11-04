@@ -28,6 +28,7 @@ use std::{
     io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     mem,
     ops::Range,
+    os::unix::fs::FileExt,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, PoisonError},
     time::Instant,
@@ -44,8 +45,8 @@ use uuid::Uuid;
 use super::{
     TermIndexError,
     format::{
-        BlockMark, Layer, Location, Posting, Root, Run, Slice, SliceRef, TierRef, encode_run,
-        encode_slice, legacy_bound_as_key, push_posting, read_posting,
+        Layer, Location, Posting, Root, Run, SLICE_HEADER_LEN, Slice, SliceDictionary, SliceRef,
+        TierRef, encode_run, encode_slice, legacy_bound_as_key, push_posting, read_posting,
     },
     tier::{
         BLOCK_ENTRIES, ColumnScoring, EncodedChunk, HeadGroup, SplicedBlock, TierChunk,
@@ -2357,6 +2358,9 @@ fn cut_ranges<K: AsRef<[u8]>>(marks: &[(K, u64)], want: usize) -> Vec<KeyRange> 
 
 /// Sources of at least this many bytes are merged in key ranges.
 const MERGE_RANGE_MIN_BYTES: u64 = 64 * 1024 * 1024;
+/// Runs read past a group's first block to find where its tier chunks
+/// start, before the group joins the one before it.
+const TIER_AT_SCAN_RUNS: usize = 8;
 /// Marks a merge cuts each key range from, about: enough to place a cut
 /// well within a range, few enough that sorting every slice's marks stays
 /// cheap. A slice's dictionary blocks are grouped to keep its share.
@@ -2397,47 +2401,63 @@ pub(crate) fn key_ranges(
     if want <= 1 {
         return Ok(vec![(None, None)]);
     }
-    // Every dictionary block of every slice, weighed by the bytes of its
-    // runs and tier chunks, read on the pool a slice at a time: one pass
-    // over the slices before the merge reads them again. A block whose
-    // first run has no chunks is weighed by its runs alone and its chunk
-    // bytes fall to the next block that has them; a few blocks' worth of
-    // tier bytes can shift a cut, which is well within a range.
+    // Each slice's dictionary blocks, in groups of about its share of the
+    // marks, weighed by the bytes of their runs and tier chunks. Only the
+    // header and dictionary are read, and one run where a group starts
+    // inside the slice to find its tier offset: the merge reads the
+    // postings next, and a slice read whole here is read twice. A group
+    // whose first runs carry no chunks joins the group before it.
     let per_slice = (want * policy.merge_marks_per_range)
         .div_ceil(files.len().max(1))
         .max(1);
     let weigh = |file: &SliceFile| -> Result<Vec<(Vec<u8>, u64)>, TermIndexError> {
-        let bytes = fs::read(&file.path)?;
-        let slice = Slice::open(&bytes)?;
-        let marks: Vec<BlockMark> = slice.block_marks()?;
+        let handle = File::open(&file.path)?;
+        let mut header = [0u8; SLICE_HEADER_LEN];
+        handle.read_exact_at(&mut header, 0)?;
+        let dict_len = SliceDictionary::dict_len(&header)?;
+        let mut bytes = vec![0u8; SLICE_HEADER_LEN + dict_len as usize];
+        handle.read_exact_at(&mut bytes, 0)?;
+        let dictionary = SliceDictionary::open(&bytes)?;
+        let starts = dictionary.block_starts()?;
         let tier_len = fs::metadata(file.path.with_extension(TIER_FILE_EXTENSION))
             .map(|m| m.len())
             .unwrap_or(0);
-        let group = marks.len().div_ceil(per_slice).max(1);
-        let mut out = Vec::with_capacity(marks.len().div_ceil(group));
-        let mut tier_at = 0u64;
-        for (i, mark) in marks.iter().enumerate() {
-            let next = marks.get(i + 1);
-            let run_bytes = next
-                .map_or(slice.postings_len(), |n| n.postings_at)
-                .saturating_sub(mark.postings_at);
-            tier_at = mark.tier_at.unwrap_or(tier_at);
-            let tier_end = next.and_then(|n| n.tier_at).unwrap_or(if next.is_some() {
-                tier_at
-            } else {
-                tier_len
-            });
-            let tier_bytes = tier_end.saturating_sub(tier_at);
-            match i % group {
-                0 => out.push((mark.key.clone(), run_bytes + tier_bytes)),
-                _ => {
-                    if let Some(last) = out.last_mut() {
-                        last.1 += run_bytes + tier_bytes;
-                    }
+        let group = starts.len().div_ceil(per_slice).max(1);
+        // The tier offset where the group starting at block `from` begins.
+        let tier_at = |from: usize| -> Result<Option<u64>, TermIndexError> {
+            if tier_len == 0 {
+                return Ok(Some(0));
+            }
+            for start in starts.iter().skip(from).take(TIER_AT_SCAN_RUNS) {
+                let mut run = vec![0u8; start.run_len as usize];
+                handle.read_exact_at(&mut run, dictionary.postings_start() + start.postings_at)?;
+                if let Some(at) = dictionary.tier_at(&run)? {
+                    return Ok(Some(at));
                 }
             }
+            Ok(None)
+        };
+        // (first block, postings offset, tier offset) of each group.
+        let mut cuts: Vec<(usize, u64, u64)> = vec![(0, 0, 0)];
+        for from in (group..starts.len()).step_by(group) {
+            if let Some(at) = tier_at(from)? {
+                cuts.push((from, starts[from].postings_at, at));
+            }
         }
-        Ok(out)
+        let ends = cuts
+            .iter()
+            .skip(1)
+            .map(|&(_, postings, tier)| (postings, tier))
+            .chain([(dictionary.postings_len(), tier_len)]);
+        Ok(cuts
+            .iter()
+            .zip(ends)
+            .filter_map(|(&(first, postings, tier), (postings_end, tier_end))| {
+                let start = starts.get(first)?;
+                let weight = postings_end.saturating_sub(postings) + tier_end.saturating_sub(tier);
+                Some((start.key.clone(), weight))
+            })
+            .collect())
     };
     let weigh_all = || -> Result<Vec<Vec<(Vec<u8>, u64)>>, TermIndexError> {
         files.par_iter().map(|file| weigh(file)).collect()
