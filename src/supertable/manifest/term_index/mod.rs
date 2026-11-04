@@ -62,7 +62,7 @@ use bytes::Bytes;
 pub(crate) use format::TierRef;
 use format::{Layer, SliceRef};
 pub(crate) use format::{Location, Posting, Root, Run, Slice, legacy_bound_as_key};
-use fs4::available_space;
+use fs4::{available_space, total_space};
 use futures::{StreamExt, TryStreamExt, stream};
 use rayon::ThreadPool;
 use tempfile::TempDir;
@@ -438,8 +438,8 @@ async fn write_objects(
 
 /// Whether the filesystem holding `dir` has more than a quarter of its
 /// space free, the floor kept objects stay above.
-fn has_room(dir: &Path) -> bool {
-    match (fs4::available_space(dir), fs4::total_space(dir)) {
+pub(crate) fn has_room(dir: &Path) -> bool {
+    match (available_space(dir), total_space(dir)) {
         (Ok(free), Ok(total)) => free > total / 4,
         _ => false,
     }
@@ -477,7 +477,7 @@ async fn upload_objects(
                 join_one(&mut running, "object write").await?;
             }
             let kept = match (&reuse, &built) {
-                (Some(reuse), BuiltBytes::Spilled { path, .. }) if has_room(reuse) => path
+                (Some(reuse), BuiltBytes::Spilled { path, .. }) => path
                     .file_name()
                     .map(|name| (path.clone(), reuse.join(name))),
                 _ => None,

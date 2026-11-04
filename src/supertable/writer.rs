@@ -12229,7 +12229,7 @@ pub(in crate::supertable) async fn stamp_term_index(
                             )));
                         let policy = term_index::BuildPolicy {
                             scoring_by_ordinal: Arc::new(scoring_by_ordinal(&old, fold.superfiles())),
-                            reuse_dir: Some(reuse_path.clone()),
+                            reuse_dir: term_index::has_room(reuse_path).then(|| reuse_path.clone()),
                             downloaded: Some(Arc::clone(&downloaded)),
                             ..policy.clone()
                         };
