@@ -1150,7 +1150,8 @@ impl ContributionReader {
             self.rd.read_exact(&mut self.buf)?;
             let mut at = 0usize;
             let posting = read_posting(&self.buf, &mut at)?;
-            let head = read_head(&self.buf, &mut at).ok_or_else(|| malformed("head"))?;
+            let head =
+                read_head(&self.buf, &mut at).ok_or_else(|| malformed("head count or entry"))?;
             if at != self.buf.len() {
                 return Err(malformed("record: trailing bytes"));
             }

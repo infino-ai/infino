@@ -13,6 +13,10 @@ const PAYLOAD_BITS: u32 = 7;
 /// Payload mask per LEB128 byte.
 const PAYLOAD_MASK: u8 = 0x7f;
 
+/// The fewest bytes [`push_doc_facts`] writes: a byte of row, a byte of
+/// term frequency and the length bucket.
+const MIN_DOC_FACTS_BYTES: usize = 3;
+
 /// Append one `u64` as LEB128 to `out`.
 #[inline]
 pub(crate) fn push_u64_varint(out: &mut Vec<u8>, mut v: u64) {
@@ -61,9 +65,10 @@ pub(crate) fn push_head(out: &mut Vec<u8>, head: impl ExactSizeIterator<Item = (
 /// Read what [`push_head`] wrote at `at`, advancing it; `None` short.
 pub(crate) fn read_head(bytes: &[u8], at: &mut usize) -> Option<Vec<(u32, u32, u8)>> {
     let n = read_varint(bytes, at)? as usize;
-    // Every entry takes at least a byte, so a corrupt count cannot ask for
-    // more room than the bytes left could fill.
-    let mut head = Vec::with_capacity(n.min(bytes.len().saturating_sub(*at)));
+    // A corrupt count cannot ask for more room than the bytes left could
+    // fill.
+    let fits = bytes.len().saturating_sub(*at) / MIN_DOC_FACTS_BYTES;
+    let mut head = Vec::with_capacity(n.min(fits));
     for _ in 0..n {
         head.push(read_doc_facts(bytes, at)?);
     }

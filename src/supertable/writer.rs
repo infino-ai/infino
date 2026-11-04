@@ -73,7 +73,7 @@ use std::{
     str::from_utf8,
     sync::{
         Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, Ordering},
         mpsc::{Receiver as StdReceiver, sync_channel as std_sync_channel},
     },
     thread::available_parallelism,
@@ -2630,7 +2630,7 @@ impl SupertableWriter {
                 // would tokenise on a few threads.
                 // Held by the lanes once they open; released here if they
                 // do not.
-                let open = OpenAppend::enter(&OPEN_APPENDS);
+                let open = OpenAppend::enter(&options.writer_pool);
                 let n_lanes = lanes_for(options.writer_pool.current_num_threads(), open.count);
                 let opened = LiveLanes::open(Arc::clone(manifest), n_lanes, options.vector_layout);
                 let live = match opened {
@@ -3650,42 +3650,66 @@ struct LiveLanes {
     open_append: Option<OpenAppend>,
 }
 
-/// Appends in this process with live lanes open.
-static OPEN_APPENDS: AtomicUsize = AtomicUsize::new(0);
+/// Appends with live lanes open, per writer pool: the pool's address and
+/// how many. An append counted here holds its pool, so no other pool can
+/// take that address while it is counted; a pool's entry goes at zero.
+/// Appends on different pools do not compete for threads, so they do not
+/// share a count.
+static OPEN_APPENDS: Mutex<BTreeMap<usize, usize>> = Mutex::new(BTreeMap::new());
 
-/// One append counted in [`OPEN_APPENDS`] until it is dropped.
+/// The key a pool's appends are counted under in [`OPEN_APPENDS`].
+fn pool_key(pool: &Arc<ThreadPool>) -> usize {
+    Arc::as_ptr(pool) as usize
+}
+
+/// One append counted among those with lanes open on its writer pool,
+/// until it is dropped.
 struct OpenAppend {
-    /// The count this append is in.
-    appends: &'static AtomicUsize,
-    /// Appends with lanes open when this one opened, itself included.
+    /// The pool it is counted on, held so the pool's key stays its own.
+    pool: Arc<ThreadPool>,
+    /// Appends with lanes open on the pool when this one opened, itself
+    /// included.
     count: usize,
 }
 
 impl OpenAppend {
-    /// Count one more append in `appends` (the process's
-    /// [`OPEN_APPENDS`]; a test's own counter in tests).
-    fn enter(appends: &'static AtomicUsize) -> Self {
+    /// Count one more append with lanes open on `pool`.
+    fn enter(pool: &Arc<ThreadPool>) -> Self {
+        let mut open = OPEN_APPENDS.lock().unwrap_or_else(PoisonError::into_inner);
+        let count = open.entry(pool_key(pool)).or_default();
+        *count += 1;
         Self {
-            appends,
-            count: appends.fetch_add(1, Ordering::Relaxed) + 1,
+            pool: Arc::clone(pool),
+            count: *count,
         }
     }
 }
 
 impl Drop for OpenAppend {
     fn drop(&mut self) {
-        self.appends.fetch_sub(1, Ordering::Relaxed);
+        let mut open = OPEN_APPENDS.lock().unwrap_or_else(PoisonError::into_inner);
+        let key = pool_key(&self.pool);
+        if let Some(count) = open.get_mut(&key) {
+            *count -= 1;
+            if *count == 0 {
+                open.remove(&key);
+            }
+        }
     }
 }
 
 /// Lanes an append opens on a pool of `threads` while `open` appends,
-/// itself included, have lanes open: an even share of the threads, at
-/// least one. A lone append takes the whole pool. Every lane interns its
-/// own copy of the vocabulary and grows its own posting vectors, so lanes
-/// past the threads that can feed them buy nothing; at one per thread for
-/// each of 32 appends on a 178-thread pool, 5,700 lanes' allocations held
-/// the process's memory-map lock and left the host idle for seconds at a
-/// time: a 1B-row ingest took 60.6 s where an even share took 46.4 s. The
+/// itself included, have lanes open on that pool: the threads divided
+/// among them, at least one. A lone append takes the whole pool. The
+/// share is taken when the lanes open and kept until they are let go, so
+/// appends that open together get theirs in the order they open (the
+/// whole pool, a half, a third, ...); the shares even out as appends
+/// commit and open again. Every lane interns its own copy of the
+/// vocabulary and grows its own posting vectors, so lanes past the
+/// threads that can feed them buy nothing; at one per thread for each of
+/// 32 appends on a 178-thread pool, 5,700 lanes' allocations held the
+/// process's memory-map lock and left the host idle for seconds at a
+/// time: a 1B-row ingest took 60.6 s where this share took 46.4 s. The
 /// lanes do not change what is written, only how the tokenising is split.
 fn lanes_for(threads: usize, open: usize) -> usize {
     (threads / open.max(1)).clamp(1, MAX_LANES)
@@ -17431,28 +17455,87 @@ mod tests {
         assert_eq!(lanes_for(MAX_LANES * 2, 1), MAX_LANES);
     }
 
+    /// Appends counted on `pool`'s lanes now.
+    fn open_appends_on(pool: &Arc<ThreadPool>) -> usize {
+        OPEN_APPENDS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&pool_key(pool))
+            .copied()
+            .unwrap_or(0)
+    }
+
     /// An append holds its place in the count of appends with lanes open
-    /// until it lets go of its lanes, however it lets go: dropped unsealed
-    /// or unwound by a panic. A place never released would shrink every
-    /// later append's share for the life of the process.
+    /// on its pool until it lets go of its lanes, however it lets go:
+    /// dropped unsealed or unwound by a panic. A place never released would
+    /// shrink every later append's share for the life of the process.
+    /// Appends on another pool are not counted against it.
     #[test]
     fn an_append_gives_back_its_place_among_the_open_appends() {
-        static APPENDS: AtomicUsize = AtomicUsize::new(0);
-        let first = OpenAppend::enter(&APPENDS);
-        let second = OpenAppend::enter(&APPENDS);
+        let pool = writer_pool_with(1);
+        let other = writer_pool_with(1);
+        let first = OpenAppend::enter(&pool);
+        let second = OpenAppend::enter(&pool);
+        let elsewhere = OpenAppend::enter(&other);
         assert_eq!((first.count, second.count), (1, 2), "each counts itself");
+        assert_eq!(elsewhere.count, 1, "another pool's appends are its own");
         drop(second);
-        assert_eq!(APPENDS.load(Ordering::Relaxed), 1, "dropped unsealed");
+        assert_eq!(open_appends_on(&pool), 1, "dropped unsealed");
 
-        let unwound = catch_unwind(|| {
-            let _held = OpenAppend::enter(&APPENDS);
+        // Only the count is inspected after the unwind, never the pool.
+        let unwound = catch_unwind(AssertUnwindSafe(|| {
+            let _held = OpenAppend::enter(&pool);
             panic!("an append unwinds with its lanes open");
-        });
+        }));
         assert!(unwound.is_err());
-        assert_eq!(APPENDS.load(Ordering::Relaxed), 1, "unwound by a panic");
+        assert_eq!(open_appends_on(&pool), 1, "unwound by a panic");
 
         drop(first);
-        assert_eq!(APPENDS.load(Ordering::Relaxed), 0, "back where it started");
+        drop(elsewhere);
+        assert_eq!(open_appends_on(&pool), 0, "back where it started");
+        assert_eq!(open_appends_on(&other), 0);
+        let open = OPEN_APPENDS.lock().unwrap_or_else(PoisonError::into_inner);
+        assert!(
+            !open.contains_key(&pool_key(&pool)),
+            "a pool with no open appends has no entry"
+        );
+    }
+
+    /// A writer gives back its place on its pool however its lanes end: a
+    /// commit sealed from them, the writer dropped with them open, and the
+    /// lanes given up for a commit-time build.
+    #[test]
+    fn a_writer_gives_back_its_place_however_its_lanes_end() {
+        const ROWS_PER_BATCH: usize = 2_000;
+        const BATCHES: usize = 3;
+        let opts = live_options(2, 1, 4096, false);
+        let pool = Arc::clone(&opts.writer_pool);
+        let st = Supertable::create(opts).expect("create");
+        let append_until_open = |w: &mut SupertableWriter| {
+            for b in 0..BATCHES {
+                w.append(&live_batch(b, ROWS_PER_BATCH)).expect("append");
+            }
+            assert!(w.live.is_some(), "the lanes opened");
+            assert_eq!(open_appends_on(&pool), 1, "the append holds its place");
+        };
+
+        let mut w = st.writer().expect("writer");
+        append_until_open(&mut w);
+        w.commit().expect("commit");
+        assert_eq!(open_appends_on(&pool), 0, "sealed by a commit");
+
+        append_until_open(&mut w);
+        w.disable_live();
+        assert_eq!(
+            open_appends_on(&pool),
+            0,
+            "given up for a commit-time build"
+        );
+        w.commit().expect("commit from the buffer");
+
+        append_until_open(&mut w);
+        drop(w);
+        assert_eq!(open_appends_on(&pool), 0, "dropped with the lanes open");
     }
 
     /// Live lanes: a buffer wide enough to open them is fed as it is
@@ -17533,13 +17616,9 @@ mod tests {
                 live,
                 |w| {
                     assert_eq!(w.live.is_some(), live);
-                    // Other tests' appends in this process may hold lanes
-                    // open too, so the share is read off this append's own
-                    // count: one lane per thread when it is alone.
-                    let open = w.live.as_ref().and_then(|l| l.open_append.as_ref());
-                    let share = open.map(|open| lanes_for(THREADS, open.count));
+                    // The only append on its pool: one lane per thread.
                     if let Some(lanes) = w.live.as_mut().and_then(|l| l.join().ok()) {
-                        assert_eq!(Some(lanes.len()), share, "this append's share of the pool");
+                        assert_eq!(lanes.len(), THREADS, "the whole pool, alone on it");
                         assert!(lanes.iter().all(|lane| !lane.stretches.is_empty()));
                         w.live.as_mut().expect("live").lanes = Some(lanes);
                     }
@@ -17710,8 +17789,9 @@ mod tests {
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
         let faults = FaultStorage::wrap(local);
         let storage: Arc<dyn StorageProvider> = Arc::<FaultStorage>::clone(&faults);
-        let st = Supertable::create(live_options(2, 1, 4096, false).with_storage(storage))
-            .expect("create");
+        let opts = live_options(2, 1, 4096, false).with_storage(storage);
+        let pool = Arc::clone(&opts.writer_pool);
+        let st = Supertable::create(opts).expect("create");
         let mut w = st.writer().expect("writer");
         for b in 0..BATCHES {
             w.append(&live_batch(b, ROWS_PER_BATCH)).expect("append");
@@ -17722,12 +17802,14 @@ mod tests {
                 .is_some_and(|live| live.open_append.is_some()),
             "the lanes opened, holding the append's place among the open appends"
         );
+        assert_eq!(open_appends_on(&pool), 1);
         faults.fail(FaultOp::PutIfMatch, POINTER_URI_FRAGMENT, usize::MAX);
         w.commit().expect_err("the pointer write fails");
         assert!(faults.fired() > 0, "the failure came from the injection");
         faults.clear();
         assert_eq!(w.buffer.len(), BATCHES, "the buffer is restored");
         assert!(w.live.is_none() && w.live_disabled, "the lanes are gone");
+        assert_eq!(open_appends_on(&pool), 0, "and so is their place");
         w.append(&live_batch(BATCHES, ROWS_PER_BATCH))
             .expect("append after the failure");
         assert!(w.live.is_none(), "no lanes for the restored buffer");

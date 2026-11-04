@@ -5152,9 +5152,12 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::superfile::fts::{
-        posting::SUB_BLOCK_LEN,
-        reader::{BoolMode, FtsReader},
+    use crate::{
+        superfile::fts::{
+            posting::SUB_BLOCK_LEN,
+            reader::{BoolMode, FtsReader},
+        },
+        utils::varint::read_head,
     };
 
     /// The block length is the term's density. In a column of enough docs
@@ -6545,5 +6548,84 @@ mod tests {
             .expect("shared body")
             .0;
         assert_eq!(shared_body, BLOCK_LEN as u64 + 9);
+    }
+
+    /// A term's head names each document it keeps by the row it stands
+    /// for, with the document's own term frequency and its own length,
+    /// quantized: in a blob whose documents are renumbered, the length is
+    /// looked up by document, not by row. It keeps the best-scoring
+    /// documents, as many as the depth.
+    #[test]
+    fn a_head_names_its_documents_by_row_with_their_own_lengths() {
+        /// Documents holding the term.
+        const DOCS: u32 = 12;
+        /// Documents the head keeps.
+        const DEPTH: usize = 4;
+        /// Length step between documents, so no two share a length.
+        const LEN_STEP: u32 = 37;
+        /// Term frequencies cycle through this many values.
+        const TF_CYCLE: u32 = 5;
+        let doc_lengths: Vec<u32> = (0..DOCS).map(|d| 1 + d * LEN_STEP).collect();
+        let avgdl = doc_lengths.iter().sum::<u32>() as f32 / DOCS as f32;
+        // Blob document d stands for row DOCS - 1 - d.
+        let rows: Vec<u32> = (0..DOCS).rev().collect();
+        let pairs: Vec<(u32, u32)> = (0..DOCS).map(|d| (d, 1 + d % TF_CYCLE)).collect();
+        let params = bm25::Bm25Params::default();
+        let enc = TermEncoding {
+            doc_lengths: &doc_lengths,
+            avgdl,
+            params,
+            n_scored_docs: DOCS,
+            heads: true,
+            head_depth: DEPTH,
+            rows: Some(&rows),
+        };
+        let idf = bm25::idf(u64::from(DOCS), pairs.len() as u64);
+        let scores: Vec<f32> = pairs
+            .iter()
+            .map(|&(doc, tf)| {
+                bm25::score(
+                    idf,
+                    tf,
+                    bm25::stored_len(doc_lengths[doc as usize]),
+                    avgdl,
+                    params,
+                )
+            })
+            .collect();
+        let mut best: Vec<u32> = (0..DOCS).collect();
+        best.sort_by(|&a, &b| scores[b as usize].total_cmp(&scores[a as usize]));
+        assert!(
+            scores[best[DEPTH - 1] as usize] > scores[best[DEPTH] as usize],
+            "the kept documents are unambiguous"
+        );
+        let mut scratch = TermScratch::default();
+        term_head(
+            &pairs,
+            &scores,
+            &enc,
+            &mut scratch.head_heap,
+            &mut scratch.head_kept,
+            &mut scratch.head,
+        );
+        let head = read_head(&scratch.head.facts, &mut 0).expect("a head");
+        assert_eq!(head.len(), DEPTH);
+        let mut kept: Vec<u32> = head
+            .iter()
+            .map(|&(row, tf, len)| {
+                let doc = DOCS - 1 - row;
+                assert_eq!(tf, pairs[doc as usize].1, "row {row}'s own tf");
+                assert_eq!(
+                    len,
+                    bm25::quantize_len(doc_lengths[doc as usize]),
+                    "row {row}'s own length"
+                );
+                doc
+            })
+            .collect();
+        kept.sort_unstable();
+        let mut expected = best[..DEPTH].to_vec();
+        expected.sort_unstable();
+        assert_eq!(kept, expected, "the best-scoring documents");
     }
 }

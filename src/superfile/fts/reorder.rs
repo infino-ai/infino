@@ -1071,13 +1071,10 @@ impl BisectState {
                 let mut gain = 0.0f64;
                 while swaps < pairs {
                     if swaps == ready {
-                        // The first `swaps` entries are already the largest,
-                        // in order, and every other entry sits behind them:
-                        // ordering the next ones from the rest alone ends at
-                        // the order a pass over the whole list would.
-                        ready = (ready * 2).min(pairs);
-                        order_leading_gains(&mut left_gains[swaps..], ready - swaps, parallel);
-                        order_leading_gains(&mut right_gains[swaps..], ready - swaps, parallel);
+                        let next = (ready * 2).min(pairs);
+                        extend_ordered_prefix(&mut left_gains, ready, next, parallel);
+                        extend_ordered_prefix(&mut right_gains, ready, next, parallel);
+                        ready = next;
                     }
                     let (l, r) = (left_gains[swaps], right_gains[swaps]);
                     let pair_gain = key_gain(l) + key_gain(r);
@@ -1454,6 +1451,14 @@ fn lane_gains(fwd: &ForwardIndex, group: &[u32], move_gain: &[f32]) -> [f32; GAI
     gains
 }
 
+/// Extend the ordered prefix of `gains` from its first `ordered` entries to
+/// its first `ready`. The first `ordered` are already the smallest keys, in
+/// order, and every other entry sits behind them, so ordering the next ones
+/// from the rest alone ends at the order a pass over the whole list would.
+fn extend_ordered_prefix(gains: &mut [u64], ordered: usize, ready: usize, parallel: bool) {
+    order_leading_gains(&mut gains[ordered..], ready - ordered, parallel);
+}
+
 /// Put the `want` highest-gain entries at the front of `gains`, in the
 /// order a full sort would have put them; leave the rest unordered.
 ///
@@ -1709,10 +1714,10 @@ mod tests {
                             break;
                         }
                         // The swap loop doubles once it has used the
-                        // whole prefix: `swaps == ready`.
-                        let swaps = ready;
-                        ready = (ready * 2).min(len);
-                        order_leading_gains(&mut gains[swaps..], ready - swaps, parallel);
+                        // whole prefix, with the step it takes there.
+                        let next = (ready * 2).min(len);
+                        extend_ordered_prefix(&mut gains, ready, next, parallel);
+                        ready = next;
                     }
                     let mut all = gains.clone();
                     all.sort_unstable();
