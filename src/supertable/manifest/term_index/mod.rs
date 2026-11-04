@@ -171,6 +171,59 @@ const SLICE_WRITE_CONCURRENCY: usize = LAYER_FETCH_CONCURRENCY;
 /// about forty.
 const FOLD_FAN_OUT: usize = 8;
 
+/// Memory a fold holds per input layer and key range: a tier read window
+/// and a decoded batch of terms, with room for long runs in merged layers.
+const FOLD_CURSOR_BYTES: u64 = 2 * 1024 * 1024;
+
+/// Memory each key range of a fold holds besides its cursors: the slice and
+/// tier it is writing, and a batch of entries being encoded.
+const FOLD_RANGE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Memory a fold holds whatever its shape: the key marks it cuts ranges at,
+/// the objects being downloaded, and those uploading beside its merge.
+const FOLD_FIXED_BYTES: u64 = 1536 * 1024 * 1024;
+
+/// Memory an optimize fold is planned in when the host reports none.
+const FOLD_FALLBACK_MEMORY_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+/// Cursors an optimize fold opens at most when the host reports no limit
+/// on open files or mappings: each holds a tier file and a mapped slice.
+const FOLD_FALLBACK_CURSORS: usize = 16 * 1024;
+
+/// Share of the process's open-file and mapping limits one fold's cursors
+/// may take, so queries and writes running beside it keep theirs.
+const FOLD_CURSOR_LIMIT_SHARE: usize = 4;
+
+/// Layers one optimize fold of a run reads at most: the merge keeps its
+/// speed per byte up to about this many and slows past it.
+const FOLD_LAYERS_MAX: usize = 512;
+
+/// Layers a fold aims to read before it narrows its key ranges, so a tight
+/// budget still folds in a few passes.
+const FOLD_LAYERS_TARGET: usize = 64;
+
+/// What a fold's fixed costs (its root publish and object round trips)
+/// weigh against the bytes it reads, when optimize picks between runs.
+const FOLD_OVERHEAD_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Local bytes per slice byte assumed for a fold's inputs, in thousandths,
+/// until a fold of the call has measured them: tier objects run up to a few
+/// times their slices.
+const FOLD_DISK_PER_SLICE_MILLI: u64 = 4_000;
+
+/// Share of the scratch filesystem left free under every fold, as a divisor.
+const SCRATCH_FLOOR_DIVISOR: u64 = 10;
+
+/// Folds [`output_reread`] simulates at most.
+const REREAD_LOOKAHEAD_FOLDS: usize = 256;
+
+/// New objects past which [`check_objects`] lists the index's objects once
+/// rather than asking about each: a listing page answers for a thousand.
+const CHECK_LIST_MIN_OBJECTS: usize = 2048;
+
+/// Kept objects stay while more than this share of the disk is free.
+const KEPT_FREE_DIVISOR: u64 = 4;
+
 /// How far below the largest layer of a fold's group a layer may lie and
 /// still fold with it, in levels, a level being a factor of [`FOLD_FAN_OUT`]
 /// in size. Three quarters of a level, the span Lucene's LogMergePolicy
@@ -441,14 +494,6 @@ async fn write_objects(
     run_bounded(SLICE_WRITE_CONCURRENCY, "object write", jobs).await
 }
 
-/// Local bytes per slice byte assumed for a fold's inputs, in thousandths,
-/// until a fold of the call has measured them: tier objects run up to a few
-/// times their slices.
-const FOLD_DISK_PER_SLICE_MILLI: u64 = 4_000;
-
-/// Share of the scratch filesystem left free under every fold, as a divisor.
-const SCRATCH_FLOOR_DIVISOR: u64 = 10;
-
 /// The most slice bytes one fold may read so that its inputs, and outputs
 /// about as large, fit the free space of the filesystem holding `dir` above
 /// a tenth of it, at the local bytes per slice byte `measured` holds;
@@ -489,11 +534,11 @@ pub(crate) fn evict_kept(dir: &Path) -> u64 {
         .sum()
 }
 
-/// Whether the filesystem holding `dir` has more than a quarter of its
-/// space free, the floor kept objects stay above.
+/// Whether the filesystem holding `dir` has more free than its share
+/// [`KEPT_FREE_DIVISOR`], the floor kept objects stay above.
 pub(crate) fn has_room(dir: &Path) -> bool {
     match (available_space(dir), total_space(dir)) {
-        (Ok(free), Ok(total)) => free > total / 4,
+        (Ok(free), Ok(total)) => free > total / KEPT_FREE_DIVISOR,
         _ => false,
     }
 }
@@ -960,41 +1005,6 @@ impl OptimizeFold {
     }
 }
 
-/// Memory a fold holds per input layer and key range: a tier read window
-/// and a decoded batch of terms, with room for long runs in merged layers.
-const FOLD_CURSOR_BYTES: u64 = 2 * 1024 * 1024;
-
-/// Memory each key range of a fold holds besides its cursors: the slice and
-/// tier it is writing, and a batch of entries being encoded.
-const FOLD_RANGE_BYTES: u64 = 64 * 1024 * 1024;
-
-/// Memory a fold holds whatever its shape: the key marks it cuts ranges at,
-/// the objects being downloaded, and those uploading beside its merge.
-const FOLD_FIXED_BYTES: u64 = 1536 * 1024 * 1024;
-
-/// Memory an optimize fold is planned in when the host reports none.
-const FOLD_FALLBACK_MEMORY_BYTES: u64 = 8 * 1024 * 1024 * 1024;
-
-/// Cursors an optimize fold opens at most when the host reports no limit
-/// on open files or mappings: each holds a tier file and a mapped slice.
-const FOLD_FALLBACK_CURSORS: usize = 16 * 1024;
-
-/// Share of the process's open-file and mapping limits one fold's cursors
-/// may take, so queries and writes running beside it keep theirs.
-const FOLD_CURSOR_LIMIT_SHARE: usize = 4;
-
-/// Layers one optimize fold of a run reads at most: the merge keeps its
-/// speed per byte up to about this many and slows past it.
-const FOLD_LAYERS_MAX: usize = 512;
-
-/// Layers a fold aims to read before it narrows its key ranges, so a tight
-/// budget still folds in a few passes.
-const FOLD_LAYERS_TARGET: usize = 64;
-
-/// What a fold's fixed costs (its root publish and object round trips)
-/// weigh against the bytes it reads, when optimize picks between runs.
-const FOLD_OVERHEAD_BYTES: u64 = 1024 * 1024 * 1024;
-
 /// What one optimize fold may use: bytes of memory, the key ranges the
 /// writer pool can merge at once, and cursors (one per layer it reads and
 /// key range, each an open file and a mapping).
@@ -1303,9 +1313,6 @@ fn stand_in(hash: ContentHash, bytes: u64) -> Layer {
         base: 0,
     }
 }
-
-/// Folds [`output_reread`] simulates at most.
-const REREAD_LOOKAHEAD_FOLDS: usize = 256;
 
 /// Whether a later fold of this call is planned to read `fold`'s output:
 /// the plan runs on, with the same bounds, over a root in which each output
@@ -1771,10 +1778,6 @@ pub(crate) enum RootObjects {
     /// Some slice or tier object will never load.
     Missing,
 }
-
-/// New objects past which [`check_objects`] lists the index's objects once
-/// rather than asking about each: a listing page answers for a thousand.
-const CHECK_LIST_MIN_OBJECTS: usize = 2048;
 
 /// Whether every slice and tier object `root` names is on storage, filling
 /// in each slice length `root` lacks from what storage reports, and whether
@@ -8613,12 +8616,14 @@ mod tests {
 
     /// Each of `layers` as a fold reads it.
     fn read_costs(layers: &[Layer]) -> Vec<FoldCost> {
-        layers
+        costs_of(&layers.iter().map(layer_bytes).collect::<Vec<_>>())
+    }
+
+    /// Costs of layers of `sizes` bytes, every one read.
+    fn costs_of(sizes: &[u64]) -> Vec<FoldCost> {
+        sizes
             .iter()
-            .map(|layer| FoldCost {
-                bytes: layer_bytes(layer),
-                read: true,
-            })
+            .map(|&bytes| FoldCost { bytes, read: true })
             .collect()
     }
 
@@ -8659,11 +8664,7 @@ mod tests {
     fn fold_sizes(mut sizes: Vec<u64>, max_layers: usize) -> (Vec<u64>, u64) {
         let mut read = 0u64;
         loop {
-            let costs: Vec<FoldCost> = sizes
-                .iter()
-                .map(|&bytes| FoldCost { bytes, read: true })
-                .collect();
-            let Some(run) = fold_window(&costs, max_layers, u64::MAX) else {
+            let Some(run) = fold_window(&costs_of(&sizes), max_layers, u64::MAX) else {
                 return (sizes, read);
             };
             let merged: u64 = sizes[run.clone()].iter().sum();
@@ -8699,22 +8700,16 @@ mod tests {
     /// and layers the fold drops unread count toward no bound.
     #[test]
     fn optimize_leaves_a_large_layer_out_and_counts_only_layers_it_reads() {
-        let costs = |sizes: &[u64]| -> Vec<FoldCost> {
-            sizes
-                .iter()
-                .map(|&bytes| FoldCost { bytes, read: true })
-                .collect()
-        };
         let mut sizes = vec![1000];
         sizes.extend([10; 9]);
-        assert_eq!(fold_window(&costs(&sizes), 64, u64::MAX), Some(1..10));
+        assert_eq!(fold_window(&costs_of(&sizes), 64, u64::MAX), Some(1..10));
         assert_eq!(
-            fold_window(&costs(&[1000, 10, 10, 10, 10, 10, 10, 10]), 64, u64::MAX),
+            fold_window(&costs_of(&[1000, 10, 10, 10, 10, 10, 10, 10]), 64, u64::MAX),
             None,
             "a few small layers beside a large one wait"
         );
         assert_eq!(
-            fold_window(&costs(&[10; 4]), 3, u64::MAX),
+            fold_window(&costs_of(&[10; 4]), 3, u64::MAX),
             Some(0..3),
             "at most the budget's layers"
         );
@@ -8725,7 +8720,7 @@ mod tests {
             };
             20
         ];
-        dead_then_live.extend(costs(&[10; 3]));
+        dead_then_live.extend(costs_of(&[10; 3]));
         assert_eq!(
             fold_window(&dead_then_live, 3, u64::MAX),
             Some(0..23),
