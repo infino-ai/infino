@@ -12270,11 +12270,13 @@ pub(in crate::supertable) async fn stamp_term_index(
                             )));
                         let policy = term_index::BuildPolicy {
                             scoring_by_ordinal: Arc::new(scoring_by_ordinal(&old, fold.superfiles())),
+                            ..policy.clone()
+                        };
+                        let io = term_index::FoldIo {
                             reuse_dir: Some(reuse_path.clone()),
                             keep_uploads: keep,
                             disk_per_slice_milli: Some(Arc::clone(disk_per_slice)),
                             downloaded: Some(Arc::clone(&downloaded)),
-                            ..policy.clone()
                         };
                         let renumbers = fold.renumbers();
                         info!(
@@ -12287,7 +12289,7 @@ pub(in crate::supertable) async fn stamp_term_index(
                             "term index fold plan"
                         );
                         let span = detail_span!("term_index.fold", layers = root.layers.len());
-                        let result = term_index::fold_at_optimize(storage, &root, fold, &policy, pool)
+                        let result = term_index::fold_at_optimize(storage, &root, fold, &policy, &io, pool)
                             .instrument(span)
                             .await;
                         // A fold that downloaded nothing never told the prefetch.

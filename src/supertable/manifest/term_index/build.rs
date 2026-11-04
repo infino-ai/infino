@@ -29,7 +29,7 @@ use std::{
     mem,
     ops::Range,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, PoisonError, atomic::AtomicU64},
+    sync::{Arc, Mutex, PoisonError},
     time::Instant,
 };
 
@@ -37,7 +37,7 @@ use bytes::Bytes;
 use memmap2::Mmap;
 use rayon::{ThreadPool, current_num_threads, prelude::*};
 use tempfile::TempDir;
-use tokio::sync::{Notify, mpsc::UnboundedSender};
+use tokio::sync::mpsc::UnboundedSender;
 use tracing::debug;
 use uuid::Uuid;
 
@@ -133,19 +133,6 @@ pub(crate) struct BuildPolicy {
     /// Bytes a merge cursor reads from a tier object at a time; see
     /// [`TIER_READ_WINDOW_BYTES`].
     pub(crate) tier_read_window_bytes: u64,
-    /// Where an optimize call keeps the objects its folds upload, so a later
-    /// fold of the same call links them in place of fetching them.
-    pub(crate) reuse_dir: Option<PathBuf>,
-    /// Whether a fold keeps what it uploads in `reuse_dir`; it links from
-    /// and cleans up `reuse_dir` either way.
-    pub(crate) keep_uploads: bool,
-    /// Local bytes a fold's inputs took per slice byte, in thousandths, the
-    /// most any fold of the call has measured; the planner sizes the next
-    /// fold's disk use by it.
-    pub(crate) disk_per_slice_milli: Option<Arc<AtomicU64>>,
-    /// Told once a fold's inputs are on local disk, so the next fold's
-    /// prefetch starts when this one stops downloading.
-    pub(crate) downloaded: Option<Arc<Notify>>,
     /// Whether a merge carries tier blocks over from its sources' chunks
     /// (see `splice_term`); off, every term takes the decoding path. Tests
     /// compare the two paths byte for byte.
@@ -238,11 +225,7 @@ impl Default for BuildPolicy {
             scoring_by_ordinal: Arc::new(Vec::new()),
             scoring_by_superfile: Arc::new(HashMap::new()),
             tier_read_window_bytes: TIER_READ_WINDOW_BYTES,
-            reuse_dir: None,
-            keep_uploads: false,
-            disk_per_slice_milli: None,
             merge_ranges_max: None,
-            downloaded: None,
             #[cfg(test)]
             splice_tiers: true,
         }

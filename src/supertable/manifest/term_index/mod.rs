@@ -904,8 +904,15 @@ pub(crate) async fn fold_tail(
     // Whether each layer is one the replaced root named.
     let mut foldable: Vec<bool> = (0..root.layers.len()).map(|i| i < named).collect();
     while let Some(run) = next_fold(root, &foldable, policy) {
-        let merged =
-            fold_layers(storage, &root.layers[run.clone()], &ordinals, policy, pool).await?;
+        let merged = fold_layers(
+            storage,
+            &root.layers[run.clone()],
+            &ordinals,
+            policy,
+            &FoldIo::default(),
+            pool,
+        )
+        .await?;
         root.layers.drain(run.clone());
         root.layers.insert(run.start, merged);
         foldable.drain(run.clone());
@@ -1433,6 +1440,24 @@ pub(crate) async fn prefetch_layers(
     }
 }
 
+/// What an optimize fold shares with the other folds of its call.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct FoldIo {
+    /// Where the call keeps the objects its folds upload, so a later fold
+    /// links them in place of fetching them.
+    pub(crate) reuse_dir: Option<PathBuf>,
+    /// Whether this fold keeps what it uploads in `reuse_dir`; it links from
+    /// and cleans up `reuse_dir` either way.
+    pub(crate) keep_uploads: bool,
+    /// Local bytes a fold's inputs took per slice byte, in thousandths, the
+    /// most any fold of the call has measured; the planner sizes the next
+    /// fold's disk use by it.
+    pub(crate) disk_per_slice_milli: Option<Arc<AtomicU64>>,
+    /// Told once this fold's inputs are on local disk, so the next fold's
+    /// prefetch starts when this one stops downloading.
+    pub(crate) downloaded: Option<Arc<Notify>>,
+}
+
 /// `root` with `fold` made: its run merged into one layer on `pool`,
 /// spilling to disk as it goes, and the merged slices written. `policy`
 /// keys the tiers it rewrites by the folded root's ordinals
@@ -1444,6 +1469,7 @@ pub(crate) async fn fold_at_optimize(
     root: &Root,
     fold: OptimizeFold,
     policy: &BuildPolicy,
+    io: &FoldIo,
     pool: Option<&ThreadPool>,
 ) -> Result<Root, TermIndexError> {
     // Nothing is kept, so every posting would be dropped.
@@ -1495,7 +1521,7 @@ pub(crate) async fn fold_at_optimize(
             .iter()
             .any(|layer| layer_keeps_postings(layer, &fold.ordinals))
     {
-        folded.push(fold_layers(storage, &merging, &fold.ordinals, policy, pool).await?);
+        folded.push(fold_layers(storage, &merging, &fold.ordinals, policy, io, pool).await?);
     }
     let mut layers = root.layers.clone();
     layers.splice(fold.run.clone(), folded);
@@ -1516,6 +1542,7 @@ async fn fold_layers(
     layers: &[Layer],
     ordinals: &[Option<u32>],
     policy: &BuildPolicy,
+    io: &FoldIo,
     pool: Option<&ThreadPool>,
 ) -> Result<Layer, TermIndexError> {
     // A layer whose every ordinal the fold drops holds nothing the merged
@@ -1536,7 +1563,7 @@ async fn fold_layers(
         });
     }
     let scratch = scratch_dir(policy.scratch_root.as_deref())?;
-    let reuse = policy.reuse_dir.as_deref();
+    let reuse = io.reuse_dir.as_deref();
     let sources = download_layers(storage, &kept, scratch.path(), reuse)
         .instrument(detail_span!(
             "fold.download",
@@ -1544,10 +1571,10 @@ async fn fold_layers(
             dropped = layers.len() - kept.len()
         ))
         .await?;
-    if let Some(downloaded) = &policy.downloaded {
+    if let Some(downloaded) = &io.downloaded {
         downloaded.notify_one();
     }
-    if let Some(measured) = &policy.disk_per_slice_milli {
+    if let Some(measured) = &io.disk_per_slice_milli {
         let slice_bytes = kept
             .iter()
             .map(layer_bytes)
@@ -1573,7 +1600,7 @@ async fn fold_layers(
     let uploads = task::spawn(upload_objects(
         Arc::clone(storage),
         objects,
-        policy.reuse_dir.clone().filter(|_| policy.keep_uploads),
+        io.reuse_dir.clone().filter(|_| io.keep_uploads),
     ));
     // The kept layers are merged away, so the copies kept of them can go.
     let consumed: Vec<(PathBuf, PathBuf)> = match reuse {
@@ -8143,7 +8170,7 @@ mod tests {
         .expect("a fold is due");
         let listed = root.superfiles.clone();
 
-        let root = fold_at_optimize(&local, &root, fold, &policy, None)
+        let root = fold_at_optimize(&local, &root, fold, &policy, &FoldIo::default(), None)
             .await
             .expect("fold");
 
@@ -8241,7 +8268,7 @@ mod tests {
             "the live superfiles, in order"
         );
 
-        let root = fold_at_optimize(&local, &root, fold, &policy, None)
+        let root = fold_at_optimize(&local, &root, fold, &policy, &FoldIo::default(), None)
             .await
             .expect("fold");
 
@@ -8495,6 +8522,7 @@ mod tests {
             &root(vec![dead.clone(), whole.clone()]),
             fold(),
             &policy,
+            &FoldIo::default(),
             None,
         )
         .await
@@ -8525,6 +8553,7 @@ mod tests {
                 &root(vec![dead.clone(), whole.clone(), partial]),
                 three,
                 &policy,
+                &FoldIo::default(),
                 None
             )
             .await
@@ -8536,9 +8565,16 @@ mod tests {
         dropped.superfiles = vec![ids[4], ids[6]];
         dropped.id_mins = vec![5, 7];
         assert!(
-            fold_at_optimize(&empty, &root(vec![dead, whole]), dropped, &policy, None)
-                .await
-                .is_err()
+            fold_at_optimize(
+                &empty,
+                &root(vec![dead, whole]),
+                dropped,
+                &policy,
+                &FoldIo::default(),
+                None
+            )
+            .await
+            .is_err()
         );
 
         // The shift alone: a layer whose stored ordinals count from behind
@@ -9873,10 +9909,24 @@ mod tests {
             merge_ranges: Some(4),
             ..policy.clone()
         };
-        let folded = rt.block_on(fold_layers(&faulty, &root.layers, &ordinals, &ranged, None));
+        let folded = rt.block_on(fold_layers(
+            &faulty,
+            &root.layers,
+            &ordinals,
+            &ranged,
+            &FoldIo::default(),
+            None,
+        ));
         assert!(folded.is_err(), "a failed put fails the fold");
         assert_eq!(faults.fired(), 3);
-        let folded = rt.block_on(fold_layers(&local, &root.layers, &ordinals, &ranged, None));
+        let folded = rt.block_on(fold_layers(
+            &local,
+            &root.layers,
+            &ordinals,
+            &ranged,
+            &FoldIo::default(),
+            None,
+        ));
         assert!(folded.is_ok(), "the same fold succeeds without the fault");
     }
 
@@ -9901,7 +9951,7 @@ mod tests {
         let fold = plan_fold_at_optimize(&root, &live, u64::MAX, wide, false, false)
             .expect("a fold is due");
         assert!(fold.ranges() > 1, "the budget allows more than one range");
-        let root = fold_at_optimize(&local, &root, fold, &policy, None)
+        let root = fold_at_optimize(&local, &root, fold, &policy, &FoldIo::default(), None)
             .await
             .expect("fold");
         assert_eq!(root.layers.len(), 1);
@@ -10107,14 +10157,24 @@ mod tests {
         let policy = BuildPolicy {
             spill_to_disk: true,
             scratch_root: Some(scratch.path().to_path_buf()),
-            reuse_dir: Some(reuse.path().to_path_buf()),
-            keep_uploads: true,
             merge_ranges: Some(2),
             ..BuildPolicy::default()
         };
+        let io = FoldIo {
+            reuse_dir: Some(reuse.path().to_path_buf()),
+            keep_uploads: true,
+            ..FoldIo::default()
+        };
         let ordinals: Vec<Option<u32>> = (0..root.superfiles.len() as u32).map(Some).collect();
         let first = rt
-            .block_on(fold_layers(&local, &root.layers, &ordinals, &policy, None))
+            .block_on(fold_layers(
+                &local,
+                &root.layers,
+                &ordinals,
+                &policy,
+                &io,
+                None,
+            ))
             .expect("first fold");
         for slice in &first.slices {
             let _ = fs::remove_file(store_dir.path().join(slice_uri(&slice.content_hash)));
@@ -10122,9 +10182,9 @@ mod tests {
                 let _ = fs::remove_file(store_dir.path().join(tier_uri(tier)));
             }
         }
-        let linking_only = BuildPolicy {
+        let linking_only = FoldIo {
             keep_uploads: false,
-            ..policy.clone()
+            ..io.clone()
         };
         let kept: Vec<ContentHash> = first
             .slices
@@ -10135,6 +10195,7 @@ mod tests {
             &local,
             &[first],
             &ordinals,
+            &policy,
             &linking_only,
             None,
         ));
