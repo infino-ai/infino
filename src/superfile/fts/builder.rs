@@ -546,42 +546,40 @@ impl Vocab {
 /// lands with one array index and one push; the finish walks the ids in
 /// dictionary order and encodes each list in place, with no sort pass.
 struct RamStore {
-    postings: Vec<Vec<(u32, u32)>>,
-    /// Empty for a positionless column.
-    pos_runs: Vec<Vec<u8>>,
-    /// Where a list's position runs end in `pos_runs` after every
-    /// [`RUN_END_STRIDE`] postings, per id, so a stretch of a list's
-    /// postings can take its runs by byte range. Kept only by a lane (see
-    /// [`FtsBuilder::set_lane_mode`]); empty otherwise.
-    run_ends: Vec<Vec<u32>>,
+    /// One entry per id. A term's lists sit side by side, so a document's
+    /// visit to a term — the run during the scan, the posting and the run
+    /// end at the drain — reads one place rather than one table per list.
+    lists: Vec<TermLists>,
     /// Estimated bytes held (see `ACCUM_*_BYTES`); drives the spill check.
     bytes: usize,
+}
+
+/// One id's accumulated lists in the in-RAM store.
+#[derive(Default)]
+struct TermLists {
+    postings: Vec<(u32, u32)>,
+    /// Empty for a positionless column.
+    runs: Vec<u8>,
+    /// Where the list's position runs end in `runs` after every
+    /// [`RUN_END_STRIDE`] postings, so a stretch of the list's postings
+    /// can take its runs by byte range. Kept only by a lane (see
+    /// [`FtsBuilder::set_lane_mode`]); empty otherwise.
+    run_ends: Vec<u32>,
 }
 
 impl RamStore {
     fn new() -> Self {
         Self {
-            postings: Vec::new(),
-            pos_runs: Vec::new(),
-            run_ends: Vec::new(),
+            lists: Vec::new(),
             bytes: 0,
         }
     }
 
     /// Give every interned id its slot. Amortized O(1) per new id.
     #[inline(always)]
-    fn grow_to(&mut self, n_terms: usize, positional: bool, run_ends: bool) {
-        // Each table on its own: the positional scan grows the lists and
-        // the runs itself as it interns, and only the drain grows the run
-        // ends.
-        if self.postings.len() < n_terms {
-            self.postings.resize_with(n_terms, Vec::new);
-        }
-        if positional && self.pos_runs.len() < n_terms {
-            self.pos_runs.resize_with(n_terms, Vec::new);
-        }
-        if positional && run_ends && self.run_ends.len() < n_terms {
-            self.run_ends.resize_with(n_terms, Vec::new);
+    fn grow_to(&mut self, n_terms: usize) {
+        if self.lists.len() < n_terms {
+            self.lists.resize_with(n_terms, TermLists::default);
         }
     }
 }
@@ -596,8 +594,7 @@ impl RamStore {
 /// at the end of the document.
 enum PositionSink<'a> {
     Runs {
-        postings: &'a mut Vec<Vec<(u32, u32)>>,
-        runs: &'a mut Vec<Vec<u8>>,
+        lists: &'a mut Vec<TermLists>,
         /// Run bytes appended during this document, for the accumulator's
         /// byte estimate.
         bytes: usize,
@@ -1524,19 +1521,6 @@ impl FrozenColumn {
     }
 }
 
-/// `table` reordered so that entry `r` is the old entry `by_lex[r]`; an
-/// empty table (a store without that table) stays empty.
-fn in_lex_order<T: Default>(table: Vec<T>, by_lex: &[u32]) -> Vec<T> {
-    if table.is_empty() {
-        return table;
-    }
-    let mut table = table;
-    by_lex
-        .iter()
-        .map(|&id| mem::take(&mut table[id as usize]))
-        .collect()
-}
-
 /// A run of a lane's documents that are consecutive rows of the commit:
 /// documents `doc..doc + len` are rows `row..row + len`. A lane's
 /// documents of one batch are one such run, so a lane's whole row map is
@@ -2165,13 +2149,11 @@ impl FtsBuilder {
             "spill_partitions must be a power of 2; got {n_partitions}"
         );
         let mask = n_partitions - 1;
-        let RamStore {
-            postings, pos_runs, ..
-        } = ram;
+        let RamStore { lists, .. } = ram;
         if !positional {
             let mut partitions =
                 Self::open_partitions_for_column(scratch_dir, column_id, n_partitions)?;
-            for (term_id, list) in postings.into_iter().enumerate() {
+            for (term_id, TermLists { postings: list, .. }) in lists.into_iter().enumerate() {
                 let p = term_id & mask;
                 for (doc_id, tf) in list {
                     push_record_batched(&mut partitions[p], [term_id as u32, doc_id, tf])?;
@@ -2182,7 +2164,15 @@ impl FtsBuilder {
         let mut partitions =
             Self::open_partitions_for_column(scratch_dir, column_id, n_partitions)?;
         let mut blobs = Self::open_position_blobs_for_column(scratch_dir, column_id, n_partitions)?;
-        for (term_id, (list, runs)) in postings.into_iter().zip(pos_runs).enumerate() {
+        for (
+            term_id,
+            TermLists {
+                postings: list,
+                runs,
+                ..
+            },
+        ) in lists.into_iter().enumerate()
+        {
             let p = term_id & mask;
             let blob = &mut blobs[p];
             let writer = blob
@@ -2318,8 +2308,7 @@ impl FtsBuilder {
             self.doc_pos_chain.clear();
             let mut sink = match store {
                 PostingStore::Ram(ram) => PositionSink::Runs {
-                    postings: &mut ram.postings,
-                    runs: &mut ram.pos_runs,
+                    lists: &mut ram.lists,
                     bytes: 0,
                 },
                 PostingStore::Spilled(_) => PositionSink::Chain(&mut self.doc_pos_chain),
@@ -2339,9 +2328,8 @@ impl FtsBuilder {
                     debug_assert_eq!(idx, dense_doc_tf.len());
                     dense_doc_tf.push(0);
                     dense_doc_poshead.push(CHAIN_END);
-                    if let PositionSink::Runs { postings, runs, .. } = &mut sink {
-                        postings.push(Vec::new());
-                        runs.push(Vec::new());
+                    if let PositionSink::Runs { lists, .. } = &mut sink {
+                        lists.push(TermLists::default());
                     }
                 }
                 if position > u32::MAX as u64 {
@@ -2363,8 +2351,8 @@ impl FtsBuilder {
                 *slot += 1;
                 let state = unsafe { dense_doc_poshead.get_unchecked_mut(idx) };
                 match &mut sink {
-                    PositionSink::Runs { runs, bytes, .. } => {
-                        let run = unsafe { runs.get_unchecked_mut(idx) };
+                    PositionSink::Runs { lists, bytes } => {
+                        let run = unsafe { &mut lists.get_unchecked_mut(idx).runs };
                         let before = run.len();
                         push_varint(run, if first { position } else { position - *state });
                         *bytes += run.len() - before;
@@ -2459,14 +2447,15 @@ impl FtsBuilder {
         let run_buf = &mut self.run_scratch;
         match store {
             PostingStore::Ram(ram) => {
-                ram.grow_to(id_to_term.len(), positional, lane_mode);
+                ram.grow_to(id_to_term.len());
                 let mut new_bytes: usize = 0;
                 for &term_id in updated_terms.iter() {
                     let idx = term_id as usize;
                     let slot = unsafe { dense_doc_tf.get_unchecked_mut(idx) };
                     let tf = *slot;
                     *slot = 0;
-                    let list = &mut ram.postings[idx];
+                    let lists = &mut ram.lists[idx];
+                    let list = &mut lists.postings;
                     if list.is_empty() {
                         new_bytes = new_bytes
                             .saturating_add(ACCUM_NEW_TERM_FIXED_BYTES + id_to_term[idx].len());
@@ -2476,7 +2465,7 @@ impl FtsBuilder {
                     // A positional column's run for this (term, doc) was
                     // written by the scan, gap by gap, as the tokens came.
                     if lane_mode && positional && list.len().is_multiple_of(RUN_END_STRIDE) {
-                        ram.run_ends[idx].push(ram.pos_runs[idx].len() as u32);
+                        lists.run_ends.push(lists.runs.len() as u32);
                     }
                 }
                 ram.bytes = ram
@@ -2600,22 +2589,22 @@ impl FtsBuilder {
         let doc_id = doc_id.get();
         let col_idx = column_id as usize;
         let positional = self.columns[col_idx].positions;
-        let lane_mode = self.lane_mode;
         let ColumnPostings { vocab, store } = &mut self.postings[col_idx];
         let term_id = vocab.intern(term, positional);
         let idx = term_id as usize;
         match store {
             PostingStore::Ram(ram) => {
-                ram.grow_to(vocab.len(), positional, lane_mode);
+                ram.grow_to(vocab.len());
                 let mut new_bytes: usize = 0;
-                let list = &mut ram.postings[idx];
+                let lists = &mut ram.lists[idx];
+                let list = &mut lists.postings;
                 if list.is_empty() {
                     new_bytes = new_bytes.saturating_add(ACCUM_NEW_TERM_FIXED_BYTES + term.len());
                 }
                 list.push((doc_id, tf));
                 new_bytes = new_bytes.saturating_add(ACCUM_POSTING_BYTES);
                 if positional {
-                    let run = &mut ram.pos_runs[idx];
+                    let run = &mut lists.runs;
                     let before = run.len();
                     encode_run(run, positions);
                     new_bytes = new_bytes.saturating_add(run.len() - before);
@@ -2778,12 +2767,32 @@ impl FtsBuilder {
                 // The arena outlives every read of `id_to_term` above.
                 drop(id_to_term);
                 drop(term_arena);
+                // Split the per-id lists into the frozen column's tables,
+                // in dictionary order. A positionless column keeps no runs
+                // and so no run ends: those tables stay empty.
+                let mut lists = ram.lists;
+                let mut postings = Vec::with_capacity(by_lex.len());
+                let mut run_ends = Vec::new();
+                let mut pos_runs = Vec::new();
+                if col.positions {
+                    run_ends.reserve(by_lex.len());
+                    pos_runs.reserve(by_lex.len());
+                }
+                for &id in by_lex.iter() {
+                    let l = mem::take(&mut lists[id as usize]);
+                    postings.push(l.postings);
+                    if col.positions {
+                        run_ends.push(l.run_ends);
+                        pos_runs.push(l.runs);
+                    }
+                }
+                drop(lists);
                 FrozenColumn {
                     term_bytes,
                     term_spans,
-                    postings: in_lex_order(ram.postings, &by_lex),
-                    run_ends: in_lex_order(ram.run_ends, &by_lex),
-                    pos_runs: in_lex_order(ram.pos_runs, &by_lex),
+                    postings,
+                    run_ends,
+                    pos_runs,
                     tokens: col.tokens,
                     cut_at: Vec::new(),
                     cuts: Vec::new(),
@@ -4481,25 +4490,21 @@ fn emit_ram_column<W: Write>(
     // below. Its keys borrow from `term_arena`, which outlives every
     // read of `id_to_term` here (dropped explicitly at the end).
     drop(term_to_id);
-    let RamStore {
-        mut postings,
-        mut pos_runs,
-        ..
-    } = ram;
+    let RamStore { mut lists, .. } = ram;
     let (_, term_id_in_lex_order) = build_lex_rank(&id_to_term);
     let mut n_emitted = 0usize;
     for &term_id in &term_id_in_lex_order {
         let idx = term_id as usize;
-        let pairs = mem::take(&mut postings[idx]);
+        let TermLists {
+            postings: pairs,
+            runs,
+            ..
+        } = mem::take(&mut lists[idx]);
         if pairs.is_empty() {
             // Interned but never given a posting — only a prebuilt feed
             // that failed mid-push could leave this; nothing to write.
             continue;
         }
-        let runs: Vec<u8> = match col_positions {
-            true => mem::take(&mut pos_runs[idx]),
-            false => Vec::new(),
-        };
         let runs = col_positions.then_some(TermRuns::Encoded(runs.as_slice()));
         encode_and_emit_term(
             id_to_term[idx],
