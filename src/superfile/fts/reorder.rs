@@ -614,7 +614,7 @@ fn split_levels(fwd: &ForwardIndex, order: &mut [u32], pool: &StatePool, run: Bi
         // Only a partition `split_parallel` would refine and halve itself is
         // split here; any other takes its own path there. A small partition
         // is halved here too while no bar is set — the same serial refine
-        // `split_halves` would give it — so the levels keep offering until
+        // `BisectState::split` would give it — so the levels keep offering until
         // one lowers the cost.
         let wide = run.has_reference();
         let (here, rest): (Vec<_>, Vec<_>) = level.into_iter().partition(|(part, distinct)| {
@@ -707,10 +707,8 @@ fn split_parallel(
         return;
     }
     if order.len() < PARALLEL_MIN_PARTITION {
-        // Both of `split`'s entry tests have just been made above, against
-        // this same partition.
         pool.with_state(|state| {
-            state.split_halves(fwd, order, depth, run);
+            state.split(fwd, order, depth, run, distinct);
             state.flush(run.report);
         });
         return;
@@ -785,7 +783,8 @@ fn split_parallel(
 /// whether the tables are oversized.
 ///
 /// `distinct` is `None` where no refine has counted the partition: the root,
-/// and a partition just renumbered, whose terms fill its new table.
+/// and a partition just renumbered, whose terms fill its new table and so
+/// could never shrink it by half anyway.
 fn localizing_pays(fwd: &ForwardIndex, distinct: Option<usize>) -> bool {
     // An empty table cannot shrink.
     fwd.n_terms > 0 && distinct.is_some_and(|distinct| distinct.saturating_mul(2) <= fwd.n_terms)
@@ -971,19 +970,13 @@ impl BisectState {
             }
             let mut inner: Vec<u32> = (0..order.len() as u32).collect();
             let mut inner_state = BisectState::new(local.n_terms);
-            // Its terms fill the new table exactly, so it goes straight to
-            // its split.
-            inner_state.split_halves(&local, &mut inner, depth, run);
+            // Its terms fill the new table exactly, so it does not renumber
+            // again before it splits.
+            inner_state.split(&local, &mut inner, depth, run, None);
             inner_state.flush(run.report);
             apply_inner_order(order, &inner);
             return;
         }
-        self.split_halves(fwd, order, depth, run);
-    }
-
-    /// [`Self::split`] with the entry tests already made: for a caller that
-    /// has just run them against this same partition.
-    fn split_halves(&mut self, fwd: &ForwardIndex, order: &mut [u32], depth: u32, run: Bisect<'_>) {
         let mid = order.len() / 2;
         // The root's first round offers the bar from inside `refine`.
         let [left_distinct, right_distinct] =
@@ -2029,11 +2022,31 @@ mod tests {
         }
     }
 
-    /// A corpus the serial splitter handles from the root, with enough
-    /// clusters that a partition deep in the recursion carries under half the
-    /// vocabulary.
+    /// Documents in a corpus the serial splitter handles from the root.
     const DENSE_RENUMBER_DOCS: usize = 4_000;
+    /// Enough clusters in that corpus that a partition deep in the recursion
+    /// carries under half its vocabulary.
     const DENSE_RENUMBER_CLUSTERS: usize = 16;
+
+    /// Terms per document in the uneven corpus, each drawn from its quarter's
+    /// own vocabulary.
+    const UNEVEN_TERMS_PER_DOC: usize = 12;
+    /// Vocabulary of the narrow quarters of the uneven corpus.
+    const UNEVEN_NARROW_TERMS: u32 = 200;
+    /// Vocabulary of its one wide quarter: twenty times a narrow one, so the
+    /// half holding it renumbers at a different depth from the others.
+    const UNEVEN_WIDE_TERMS: u32 = 4_000;
+    /// Documents in the serial uneven corpus, under the parallel splitter's
+    /// threshold so the serial splitter takes it from the root.
+    const SERIAL_UNEVEN_DOCS: usize = 4_000;
+    /// Vocabulary of its narrow half.
+    const SERIAL_NARROW_TERMS: u32 = 400;
+    /// Vocabulary of its wide half, so the narrow half fills under half the
+    /// whole table and the wide half does not.
+    const SERIAL_WIDE_TERMS: u32 = 2_000;
+    /// Renumberings the uneven corpus makes when every half renumbers on its
+    /// own count.
+    const UNEVEN_RENUMBERINGS: u64 = 4;
 
     /// Bucket space the merge hashes terms into, mirrored here so a test
     /// corpus has the sparse vocabulary a real one does.
@@ -2269,7 +2282,10 @@ mod tests {
     /// that half carries.
     #[test]
     fn a_refine_counts_the_distinct_terms_of_each_half() {
-        for (n, clusters, seed) in [(64usize, 2usize, 1u64), (500, 4, 2), (2_000, 9, 3)] {
+        for (n, clusters, seed, parallel) in [(64usize, 2usize, 1u64), (500, 4, 2), (2_000, 9, 3)]
+            .into_iter()
+            .flat_map(|(n, c, s)| [false, true].map(|parallel| (n, c, s, parallel)))
+        {
             let (fwd, _) = clustered(n, clusters, seed);
             let mut order: Vec<u32> = (0..fwd.len() as u32).collect();
             let reference = AtomicU64::new(0);
@@ -2282,7 +2298,7 @@ mod tests {
             };
             let mid = order.len() / 2;
             let refined =
-                BisectState::new(fwd.n_terms).refine(&fwd, &mut order, mid, 0, false, run);
+                BisectState::new(fwd.n_terms).refine(&fwd, &mut order, mid, 0, parallel, run);
             let distinct = |half: &[u32]| {
                 half.iter()
                     .flat_map(|&d| fwd.doc(d).iter().copied())
@@ -2292,7 +2308,7 @@ mod tests {
             assert_eq!(
                 refined.distinct,
                 [distinct(&order[..mid]), distinct(&order[mid..])],
-                "n={n} clusters={clusters}"
+                "n={n} clusters={clusters} parallel={parallel}"
             );
         }
     }
@@ -2313,6 +2329,120 @@ mod tests {
             !localizing_pays(&empty, Some(0)),
             "an empty table cannot shrink"
         );
+    }
+
+    /// Each half renumbers on its own count, through every path that hands a
+    /// count on: the level splitter, the parallel splitter's join, and the
+    /// serial splitter.
+    ///
+    /// Four quarters with disjoint vocabularies, one far wider than the rest,
+    /// so the halves differ: a count handed to the wrong half, or not handed
+    /// on at all, renumbers different partitions and changes how many. On one
+    /// thread the level splitter stops after the root and hands both halves to
+    /// the parallel splitter, whose join then hands the quarters theirs.
+    #[test]
+    fn each_half_renumbers_on_its_own_count() {
+        let quarter = PARALLEL_MIN_PARTITION;
+        let mut rng = StdRng::seed_from_u64(17);
+        let vocabularies = [
+            (0, UNEVEN_NARROW_TERMS),
+            (UNEVEN_NARROW_TERMS, UNEVEN_WIDE_TERMS),
+            (UNEVEN_NARROW_TERMS + UNEVEN_WIDE_TERMS, UNEVEN_NARROW_TERMS),
+            (
+                2 * UNEVEN_NARROW_TERMS + UNEVEN_WIDE_TERMS,
+                UNEVEN_NARROW_TERMS,
+            ),
+        ];
+        let mut docs: Vec<Vec<u32>> = vocabularies
+            .iter()
+            .flat_map(|&(first, n)| {
+                (0..quarter)
+                    .map(|_| {
+                        (0..UNEVEN_TERMS_PER_DOC)
+                            .map(|_| first + rng.random_range(0..n))
+                            .collect()
+                    })
+                    .collect::<Vec<Vec<u32>>>()
+            })
+            .collect();
+        // One document out of place, so the root moves a pair and sets the
+        // bar rather than leaving it to the levels below.
+        docs.swap(0, 2 * quarter);
+        let fwd = ForwardIndex::from_docs(&docs);
+        let one = ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("pool");
+        let (order, report) = one.install(|| bisect_order_reported(&fwd, exhaustive()));
+        let localized: Vec<u64> = report.levels.iter().map(|l| l.localized).collect();
+        assert_eq!(
+            localized.iter().sum::<u64>(),
+            UNEVEN_RENUMBERINGS,
+            "renumberings by depth: {localized:?}"
+        );
+        assert_eq!(order, reference_order(&fwd));
+    }
+
+    /// The serial splitter hands each half its own count: of two halves with
+    /// disjoint vocabularies, only the narrow one fills under half the table.
+    #[test]
+    fn the_serial_splitter_hands_each_half_its_own_count() {
+        let mut rng = StdRng::seed_from_u64(29);
+        let half = SERIAL_UNEVEN_DOCS / 2;
+        let docs: Vec<Vec<u32>> = (0..SERIAL_UNEVEN_DOCS)
+            .map(|d| {
+                let (first, n) = match d < half {
+                    true => (0, SERIAL_NARROW_TERMS),
+                    false => (SERIAL_NARROW_TERMS, SERIAL_WIDE_TERMS),
+                };
+                (0..UNEVEN_TERMS_PER_DOC)
+                    .map(|_| first + rng.random_range(0..n))
+                    .collect()
+            })
+            .collect();
+        let fwd = ForwardIndex::from_docs(&docs);
+        let mut order: Vec<u32> = (0..fwd.len() as u32).collect();
+        let reference = AtomicU64::new(0);
+        let report = RunReport::new();
+        let run = Bisect {
+            params: exhaustive(),
+            reference: &reference,
+            report: &report,
+            parent: &report.span,
+        };
+        let mut state = BisectState::new(fwd.n_terms);
+        state.split(&fwd, &mut order, 0, run, None);
+        state.flush(run.report);
+        let report = report.finish(0.0);
+        let localized: Vec<u64> = report.levels.iter().map(|l| l.localized).collect();
+        assert_eq!(
+            localized.iter().sum::<u64>(),
+            1,
+            "renumberings by depth: {localized:?}"
+        );
+        assert_eq!(order, reference_order(&fwd));
+    }
+
+    /// Documents with no terms at all renumber into an empty table and still
+    /// take the order the plain bisection gives them.
+    #[test]
+    fn a_half_without_terms_keeps_the_order() {
+        let (dense, _) = clustered(4 * MIN_PARTITION, 2, 23);
+        let docs: Vec<Vec<u32>> = (0..dense.len() as u32)
+            .map(|d| dense.doc(d).to_vec())
+            .chain((0..4 * MIN_PARTITION).map(|_| Vec::new()))
+            .collect();
+        let fwd = ForwardIndex::from_docs(&docs);
+        let (order, report) = bisect_order_reported(&fwd, exhaustive());
+        // Only the termless half shrinks the table by half; the clustered half
+        // carries most of the vocabulary, and an empty table cannot shrink.
+        let localized: Vec<u64> = report.levels.iter().map(|l| l.localized).collect();
+        assert_eq!(
+            localized.iter().sum::<u64>(),
+            1,
+            "renumberings by depth: {localized:?}"
+        );
+        assert_eq!(order, reference_order(&fwd));
     }
 
     #[test]
