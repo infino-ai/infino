@@ -62,13 +62,17 @@ pub(crate) fn push_head(out: &mut Vec<u8>, head: impl ExactSizeIterator<Item = (
     }
 }
 
+/// Room to reserve for a head that says it holds `n` documents with `left`
+/// bytes to read them from: a corrupt count cannot ask for more than the
+/// bytes left could fill.
+fn head_capacity(n: usize, left: usize) -> usize {
+    n.min(left / MIN_DOC_FACTS_BYTES)
+}
+
 /// Read what [`push_head`] wrote at `at`, advancing it; `None` short.
 pub(crate) fn read_head(bytes: &[u8], at: &mut usize) -> Option<Vec<(u32, u32, u8)>> {
     let n = read_varint(bytes, at)? as usize;
-    // A corrupt count cannot ask for more room than the bytes left could
-    // fill.
-    let fits = bytes.len().saturating_sub(*at) / MIN_DOC_FACTS_BYTES;
-    let mut head = Vec::with_capacity(n.min(fits));
+    let mut head = Vec::with_capacity(head_capacity(n, bytes.len().saturating_sub(*at)));
     for _ in 0..n {
         head.push(read_doc_facts(bytes, at)?);
     }
@@ -198,6 +202,14 @@ mod tests {
         push_varint(&mut corrupt, u32::MAX);
         push_doc_facts(&mut corrupt, 1, 1, 0);
         assert_eq!(read_head(&corrupt, &mut 0), None);
+        let left = corrupt.len() - varint_len(u32::MAX);
+        assert_eq!(
+            head_capacity(u32::MAX as usize, left),
+            1,
+            "room for the one document the bytes hold"
+        );
+        assert_eq!(head_capacity(2, left), 1);
+        assert_eq!(head_capacity(0, left), 0);
     }
 
     #[test]
