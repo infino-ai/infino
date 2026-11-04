@@ -131,6 +131,9 @@ pub(crate) struct BuildPolicy {
     /// Where an optimize call keeps the objects its folds upload, so a later
     /// fold of the same call links them in place of fetching them.
     pub(crate) reuse_dir: Option<PathBuf>,
+    /// Told once a fold's inputs are on local disk, so the next fold's
+    /// prefetch starts when this one stops downloading.
+    pub(crate) downloaded: Option<Arc<tokio::sync::Notify>>,
     /// Whether a merge carries tier blocks over from its sources' chunks
     /// (see `splice_term`); off, every term takes the decoding path. Tests
     /// compare the two paths byte for byte.
@@ -224,6 +227,7 @@ impl Default for BuildPolicy {
             scoring_by_superfile: Arc::new(HashMap::new()),
             tier_read_window_bytes: TIER_READ_WINDOW_BYTES,
             reuse_dir: None,
+            downloaded: None,
             #[cfg(test)]
             splice_tiers: true,
         }

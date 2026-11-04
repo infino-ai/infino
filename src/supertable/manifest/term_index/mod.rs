@@ -1145,6 +1145,110 @@ fn fold_window(costs: &[FoldCost], max_layers: usize, max_bytes: u64) -> Option<
     best.map(|(_, run)| run)
 }
 
+/// The layers the fold after `fold` is planned to read, once `fold` is made
+/// of `root`, with the same bounds; empty when none is due or `fold`
+/// renumbers, which changes every layer's ordinals. `fold`'s output, not yet
+/// written, stands in at its place with its inputs' bytes and is not
+/// returned; nor is a layer that fold would drop unread.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn layers_after(
+    root: &Root,
+    fold: &OptimizeFold,
+    live: &HashSet<Uuid>,
+    max_bytes: u64,
+    budget: FoldBudget,
+    renumber: bool,
+    before_tiers: bool,
+) -> Vec<Layer> {
+    if fold.renumbers {
+        return Vec::new();
+    }
+    let mut predicted = root.clone();
+    let bytes = predicted.layers[fold.run.clone()]
+        .iter()
+        .map(layer_bytes)
+        .fold(0u64, |sum, size| sum.saturating_add(size));
+    let output = Layer {
+        slices: vec![SliceRef {
+            first_key: Vec::new(),
+            last_key: Vec::new(),
+            content_hash: ContentHash::of(b""),
+            tier: None,
+            len: bytes,
+        }],
+        ordinals: None,
+        base: 0,
+    };
+    let at = fold.run.start;
+    predicted.layers.splice(fold.run.clone(), [output]);
+    let Some(next) =
+        plan_fold_at_optimize(&predicted, live, max_bytes, budget, renumber, before_tiers)
+    else {
+        return Vec::new();
+    };
+    next.run
+        .clone()
+        .filter(|&i| i != at)
+        .map(|i| &predicted.layers[i])
+        .filter(|layer| layer_keeps_postings(layer, &next.ordinals))
+        .cloned()
+        .collect()
+}
+
+/// Fetch `layers` into `reuse` once `downloaded` is told, through a
+/// directory of its own whose files are renamed into `reuse` only when all
+/// landed: a fold reading `reuse` meanwhile never meets a partial file, and
+/// a rename leaves the files it links to as they were. Best effort: a
+/// failed fetch leaves the next fold to fetch for itself.
+pub(crate) async fn prefetch_layers(
+    storage: Arc<dyn StorageProvider>,
+    layers: Vec<Layer>,
+    reuse: PathBuf,
+    downloaded: Arc<tokio::sync::Notify>,
+) {
+    downloaded.notified().await;
+    if layers.is_empty() || !has_room(&reuse) {
+        return;
+    }
+    let Ok(staging) = tempfile::TempDir::new_in(&reuse) else {
+        return;
+    };
+    let mut unique: HashSet<ContentHash> = HashSet::new();
+    let objects: Vec<(ContentHash, Option<ContentHash>)> = layers
+        .iter()
+        .flat_map(|layer| &layer.slices)
+        .filter(|slice| unique.insert(slice.content_hash))
+        // An earlier fold's output is kept here already.
+        .filter(|slice| !slice_file_path(&reuse, &slice.content_hash).exists())
+        .map(|slice| (slice.content_hash, slice.tier))
+        .collect();
+    let dir = staging.path().to_path_buf();
+    let jobs = objects.into_iter().map(move |(hash, tier)| {
+        let (storage, dir) = (Arc::clone(&storage), dir.clone());
+        async move {
+            let bytes = fetch_verified(storage.as_ref(), None, &slice_uri(&hash), &hash).await?;
+            write_object(slice_file_path(&dir, &hash), bytes).await?;
+            if let Some(tier) = tier {
+                let bytes = fetch_verified(storage.as_ref(), None, &tier_uri(&tier), &tier).await?;
+                write_object(tier_path(&dir, &hash), bytes).await?;
+            }
+            Ok(())
+        }
+    });
+    if run_bounded(LAYER_FETCH_CONCURRENCY, "layer prefetch", jobs)
+        .instrument(detail_span!("fold.prefetch", layers = layers.len()))
+        .await
+        .is_err()
+    {
+        return;
+    }
+    if let Ok(entries) = std::fs::read_dir(staging.path()) {
+        for entry in entries.flatten() {
+            let _ = std::fs::rename(entry.path(), reuse.join(entry.file_name()));
+        }
+    }
+}
+
 /// `root` with `fold` made: its run merged into one layer on `pool`,
 /// spilling to disk as it goes, and the merged slices written. `policy`
 /// keys the tiers it rewrites by the folded root's ordinals
@@ -1256,6 +1360,9 @@ async fn fold_layers(
             dropped = layers.len() - kept.len()
         ))
         .await?;
+    if let Some(downloaded) = &policy.downloaded {
+        downloaded.notify_one();
+    }
     let ordinals = ordinals.to_vec();
     let policy = policy.clone();
     // Each range's objects upload as the range finishes, beside the ranges

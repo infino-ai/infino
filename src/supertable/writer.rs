@@ -12109,6 +12109,8 @@ pub(in crate::supertable) async fn stamp_term_index(
     let reuse = term_index_scratch(&inner.options.term_index_build_policy())
         .map_err(TermIndexError::from)?;
     let reuse_path = reuse.path().to_path_buf();
+    // The next fold's inputs, fetched while this one merges and uploads.
+    let prefetch: Mutex<Option<tokio::task::JoinHandle<()>>> = Mutex::new(None);
     // One renumbering fold per call. Commits that land while it runs are
     // stacked on it past nil padding, which would call for another at once;
     // the next optimize's drops it.
@@ -12121,8 +12123,8 @@ pub(in crate::supertable) async fn stamp_term_index(
         let kept_batch: Mutex<Option<KeptBatch>> = Mutex::new(None);
         let kept_fold: Mutex<Option<KeptFold>> = Mutex::new(None);
         stamp_with_retries(inner, &storage, "term-index", |old| {
-            let (storage, published, budget, reuse_path) =
-                (&storage, &published, &budget, &reuse_path);
+            let (storage, published, budget, reuse_path, prefetch) =
+                (&storage, &published, &budget, &reuse_path, &prefetch);
             let (kept_batch, kept_fold, renumbered) = (&kept_batch, &kept_fold, &renumbered);
             async move {
                 published.store(false, Ordering::Relaxed);
@@ -12177,9 +12179,32 @@ pub(in crate::supertable) async fn stamp_term_index(
                         renumber,
                         before_tiers,
                     ) {
+                        // The fetch started for this fold lands before its own download.
+                        let started = prefetch.lock().expect("prefetch").take();
+                        if let Some(started) = started {
+                            let _ = started.await;
+                        }
+                        let downloaded = Arc::new(tokio::sync::Notify::new());
+                        let next = term_index::layers_after(
+                            &root,
+                            &fold,
+                            &live,
+                            fold_max_bytes,
+                            fold_budget,
+                            renumber && !fold.renumbers(),
+                            before_tiers,
+                        );
+                        *prefetch.lock().expect("prefetch") =
+                            Some(tokio::spawn(term_index::prefetch_layers(
+                                Arc::clone(storage),
+                                next,
+                                reuse_path.clone(),
+                                Arc::clone(&downloaded),
+                            )));
                         let policy = term_index::BuildPolicy {
                             scoring_by_ordinal: Arc::new(scoring_by_ordinal(&old, fold.superfiles())),
                             reuse_dir: Some(reuse_path.clone()),
+                            downloaded: Some(Arc::clone(&downloaded)),
                             ..policy.clone()
                         };
                         let renumbers = fold.renumbers();
@@ -12193,10 +12218,12 @@ pub(in crate::supertable) async fn stamp_term_index(
                             "term index fold plan"
                         );
                         let span = detail_span!("term_index.fold", layers = root.layers.len());
-                        match term_index::fold_at_optimize(storage, &root, fold, &policy, pool)
+                        let result = term_index::fold_at_optimize(storage, &root, fold, &policy, pool)
                             .instrument(span)
-                            .await
-                        {
+                            .await;
+                        // A fold that downloaded nothing never told the prefetch.
+                        downloaded.notify_one();
+                        match result {
                             Ok(folded) => {
                                 let reference = write_fold(storage, kept_fold, root, folded).await?;
                                 renumbered.fetch_or(renumbers, Ordering::Relaxed);
