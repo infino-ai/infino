@@ -169,9 +169,12 @@ mod tests {
     use arrow_array::{ArrayRef, Float64Array, Int64Array, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
     use bytes::Bytes;
-    use parquet::arrow::{
-        ArrowWriter, PARQUET_FIELD_ID_META_KEY,
-        arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions},
+    use parquet::{
+        arrow::{
+            ArrowWriter, PARQUET_FIELD_ID_META_KEY,
+            arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions},
+        },
+        file::metadata::PageIndexPolicy,
     };
 
     use super::*;
@@ -211,7 +214,7 @@ mod tests {
         let mut writer = ArrowWriter::try_new(&mut bytes, schema, None).expect("writer");
         writer.write(&batch).expect("write");
         writer.close().expect("close");
-        let options = ArrowReaderOptions::new().with_page_index(true);
+        let options = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Required);
         Arc::clone(
             ArrowReaderMetadata::load(&Bytes::from(bytes), options)
                 .expect("footer")
