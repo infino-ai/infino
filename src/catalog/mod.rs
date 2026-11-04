@@ -195,6 +195,7 @@ pub fn connect_with(
     if matches!(backend, Backend::Remote { .. }) {
         return connect_remote(backend, options);
     }
+    crate::runtime_metrics::rss::start_allocator_purger();
     let usage_meter = UsageMeter::new();
     let gcs_credential = match &backend {
         Backend::Gcs { .. } => options
