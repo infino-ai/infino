@@ -2343,6 +2343,11 @@ fn cut_ranges<K: AsRef<[u8]>>(marks: &[(K, u64)], want: usize) -> Vec<KeyRange> 
 
 /// Sources of at least this many bytes are merged in key ranges.
 const MERGE_RANGE_MIN_BYTES: u64 = 64 * 1024 * 1024;
+/// Marks a merge cuts each key range from, about: enough to place a cut
+/// well within a range, few enough that sorting every slice's marks stays
+/// cheap. A slice's dictionary blocks are grouped to keep its share.
+const MARKS_PER_RANGE: usize = 2048;
+
 /// Ranges a merge is cut into at most: each holds a cursor per layer
 /// with a slice's bytes and a few tier windows resident, so the width is
 /// bounded by memory as well as by threads.
@@ -2384,6 +2389,7 @@ pub(crate) fn key_ranges(
     // first run has no chunks is weighed by its runs alone and its chunk
     // bytes fall to the next block that has them; a few blocks' worth of
     // tier bytes can shift a cut, which is well within a range.
+    let per_slice = (want * MARKS_PER_RANGE).div_ceil(files.len().max(1)).max(1);
     let weigh = |file: &SliceFile| -> Result<Vec<(Vec<u8>, u64)>, TermIndexError> {
         let bytes = fs::read(&file.path)?;
         let slice = Slice::open(&bytes)?;
@@ -2391,7 +2397,8 @@ pub(crate) fn key_ranges(
         let tier_len = fs::metadata(file.path.with_extension(TIER_FILE_EXTENSION))
             .map(|m| m.len())
             .unwrap_or(0);
-        let mut out = Vec::with_capacity(marks.len());
+        let group = marks.len().div_ceil(per_slice).max(1);
+        let mut out = Vec::with_capacity(marks.len().div_ceil(group));
         let mut tier_at = 0u64;
         for (i, mark) in marks.iter().enumerate() {
             let next = marks.get(i + 1);
@@ -2405,7 +2412,14 @@ pub(crate) fn key_ranges(
                 tier_len
             });
             let tier_bytes = tier_end.saturating_sub(tier_at);
-            out.push((mark.key.clone(), run_bytes + tier_bytes));
+            match i % group {
+                0 => out.push((mark.key.clone(), run_bytes + tier_bytes)),
+                _ => {
+                    if let Some(last) = out.last_mut() {
+                        last.1 += run_bytes + tier_bytes;
+                    }
+                }
+            }
         }
         Ok(out)
     };
