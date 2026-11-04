@@ -202,6 +202,10 @@ const FOLD_LAYERS_MAX: usize = 512;
 /// budget still folds in a few passes.
 const FOLD_LAYERS_TARGET: usize = 64;
 
+/// Layers, read or dropped unread, one optimize run spans at most: bounds
+/// the planner's scan of a root of many dead layers.
+const FOLD_RUN_LAYERS_MAX: usize = FOLD_LAYERS_MAX * FOLD_FAN_OUT;
+
 /// What a fold's fixed costs (its root publish and object round trips)
 /// weigh against the bytes it reads, when optimize picks between runs.
 const FOLD_OVERHEAD_BYTES: u64 = 1024 * 1024 * 1024;
@@ -1151,6 +1155,9 @@ pub(crate) fn plan_fold_at_optimize(
         .collect();
     let n = root.layers.len();
     let whole = FoldCost::sum(&costs);
+    // A fold of every layer is held to the budget alone, not to
+    // `FOLD_LAYERS_MAX`: renumbering or leaving the old layout takes every
+    // layer in one fold, slower per byte than runs but done once.
     let whole_fits = n > 0 && whole.0 <= max_layers && whole.1 <= max_bytes;
     let mostly_dead = dead > 0 && 2 * dead >= kept.len();
     let run = match (whole_fits && ((renumber && mostly_dead) || before_tiers), n) {
@@ -1229,6 +1236,9 @@ fn fold_window(costs: &[FoldCost], max_layers: usize, max_bytes: u64) -> Option<
     for start in 0..costs.len() {
         let (mut read, mut total, mut largest) = (0usize, 0u64, 0u64);
         for (end, cost) in costs.iter().enumerate().skip(start) {
+            if end - start >= FOLD_RUN_LAYERS_MAX {
+                break;
+            }
             read += usize::from(cost.read);
             total = total.saturating_add(cost.bytes);
             if read > max_layers || total > max_bytes {
