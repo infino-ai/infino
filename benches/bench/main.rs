@@ -36,10 +36,11 @@
 //!   `all`       : explicit "every tier × modality × phase" (the default).
 //!                 Matrix only — diagnostics are NEVER implied by `all` or
 //!                 by a bare `cargo bench`.
-//!   diagnostic  : `scale` | `tombstone` | `update` | `sql-diag` | `fts-diag` | `fts-merge` | `object-store` | `concurrent` | `disk-warm` | `write-diag`,
+//!   diagnostic  : `scale` | `tombstone` | `update` | `sql-diag` | `fts-diag` | `fts-merge` | `object-store` | `concurrent` | `disk-warm` | `write-diag` | `filtered-vector`,
 //!                 by name, or grouped under the `diagnostic` keyword —
 //!                 `cargo bench -- diagnostic` runs all ten,
 //!                 `cargo bench -- diagnostic scale tombstone` a subset.
+//!                 `filtered-vector` (builds 1M-row tables) runs by name only.
 //!
 //! The matrix tests run = (selected tiers) × (selected modalities).
 //!
@@ -76,6 +77,7 @@ enum Diagnostic {
     DiskWarm,
     RecallWhileIngest,
     WriteDiag,
+    FilteredVector,
 }
 
 impl Diagnostic {
@@ -92,6 +94,7 @@ impl Diagnostic {
             Diagnostic::DiskWarm => "disk-warm",
             Diagnostic::RecallWhileIngest => "recall_while_ingest",
             Diagnostic::WriteDiag => "write-diag",
+            Diagnostic::FilteredVector => "filtered-vector",
         }
     }
 
@@ -116,6 +119,7 @@ impl Diagnostic {
             }
             Diagnostic::RecallWhileIngest => infino_bench_utils::recall_while_ingest::run(),
             Diagnostic::WriteDiag => infino_bench_utils::write_diag::run(),
+            Diagnostic::FilteredVector => infino_bench_utils::filtered_vector::run(),
         }
     }
 }
@@ -340,7 +344,7 @@ fn print_usage_and_exit(code: i32) -> ! {
          \x20           quality = FTS BM25 parity vs a textbook oracle, the two fts cells only)\n\
          all       : every tier x modality x phase (the default for a bare\n\
          \x20           `cargo bench`); matrix only — never implies diagnostics\n\
-         Diagnostic: scale | tombstone | update | sql-diag | fts-diag | fts-merge | object-store | concurrent | disk-warm | recall_while_ingest,\n\
+         Diagnostic: scale | tombstone | update | sql-diag | fts-diag | fts-merge | object-store | concurrent | disk-warm | recall_while_ingest | filtered-vector,\n\
          \x20           or `diagnostic` for the grouped set / `diagnostic <names>` for a subset\n\
          \n\
          corpus=<spec>     : corpus source. Default: `realistic` for the two fts\n\
@@ -460,6 +464,7 @@ fn parse_args() -> Selection {
             "disk-warm" | "disk_warm" => diagnostics.push(Diagnostic::DiskWarm),
             "recall_while_ingest" => diagnostics.push(Diagnostic::RecallWhileIngest),
             "write-diag" | "write_diag" => diagnostics.push(Diagnostic::WriteDiag),
+            "filtered-vector" | "filtered_vector" => diagnostics.push(Diagnostic::FilteredVector),
             "diagnostic" | "diagnostics" => want_diagnostics = true,
             other => match other.split_once('=') {
                 Some(("corpus", spec)) => corpus_spec = Some(spec.to_string()),
