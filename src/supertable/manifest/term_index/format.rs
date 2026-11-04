@@ -97,11 +97,12 @@ use crate::{
     utils::{
         bytes::{u32_le_at, u64_le_at},
         terms::{DictEntry, TermBlocks},
-        varint::{push_u64_varint, push_varint, read_u64_varint, read_varint},
+        varint::{
+            push_doc_facts, push_u64_varint, push_varint, read_doc_facts, read_u64_varint,
+            read_varint,
+        },
     },
 };
-
-pub(crate) use crate::utils::varint::{push_doc_facts, read_doc_facts};
 
 /// Identifies the root file and its major layout family.
 pub(crate) const ROOT_MAGIC: &[u8; 8] = b"INFTIDX1";

@@ -58,6 +58,18 @@ pub(crate) fn push_head(out: &mut Vec<u8>, head: impl ExactSizeIterator<Item = (
     }
 }
 
+/// Read what [`push_head`] wrote at `at`, advancing it; `None` short.
+pub(crate) fn read_head(bytes: &[u8], at: &mut usize) -> Option<Vec<(u32, u32, u8)>> {
+    let n = read_varint(bytes, at)? as usize;
+    // Every entry takes at least a byte, so a corrupt count cannot ask for
+    // more room than the bytes left could fill.
+    let mut head = Vec::with_capacity(n.min(bytes.len().saturating_sub(*at)));
+    for _ in 0..n {
+        head.push(read_doc_facts(bytes, at)?);
+    }
+    Some(head)
+}
+
 /// Decode one LEB128 `u64` from `bytes` starting at `*at`, advancing
 /// `*at` past it. `None` on truncated input or a value that overflows
 /// `u64` — both only reachable on corrupt bytes, which the caller
@@ -136,6 +148,39 @@ mod tests {
             assert_eq!(read_u64_varint(&buf, &mut at), Some(v));
             assert_eq!(at, buf.len());
         }
+    }
+
+    /// A head is its count, then each document's row and term frequency as
+    /// LEB128 and its length bucket as one byte — the layout a contribution
+    /// record has always carried — and reads back whole; cut anywhere short
+    /// of its end, it reads as nothing.
+    #[test]
+    fn a_head_reads_back_as_written_and_short_reads_as_nothing() {
+        let head = [
+            (0u32, 1u32, 0u8),
+            (127, 128, 7),
+            (16_384, u32::MAX, u8::MAX),
+        ];
+        let mut buf = Vec::new();
+        push_head(&mut buf, head.iter().copied());
+        let mut expected = vec![head.len() as u8];
+        for (row, tf, len) in head {
+            push_varint(&mut expected, row);
+            push_varint(&mut expected, tf);
+            expected.push(len);
+        }
+        assert_eq!(buf, expected, "the layout");
+        let mut at = 0;
+        assert_eq!(read_head(&buf, &mut at).as_deref(), Some(&head[..]));
+        assert_eq!(at, buf.len());
+        for cut in 0..buf.len() {
+            assert_eq!(read_head(&buf[..cut], &mut 0), None, "cut at {cut}");
+        }
+
+        let mut empty = Vec::new();
+        push_head(&mut empty, [].into_iter());
+        assert_eq!(empty, [0], "an empty head is its count alone");
+        assert_eq!(read_head(&empty, &mut 0), Some(Vec::new()));
     }
 
     #[test]
