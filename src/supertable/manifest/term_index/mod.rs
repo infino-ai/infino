@@ -1740,33 +1740,21 @@ pub(crate) enum RootObjects {
     Missing,
 }
 
-/// One request [`check_objects`] makes of storage.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum ObjectCheck {
-    /// A slice's first bytes, which name its layout.
-    SliceLayout,
-    /// A slice's length.
-    SliceSize,
-    /// That a tier object is there.
-    Tier,
-}
+/// New objects past which [`check_objects`] lists the index's objects once
+/// rather than asking about each: a listing page answers for a thousand.
+const CHECK_LIST_MIN_OBJECTS: usize = 2048;
 
-/// Whether the objects `root` names are on storage, as one slice and one
-/// tier object per layer tell it (an object lost elsewhere in a layer fails
-/// the fold that reads it, or a query, until a fold indexes again), filling
-/// in each slice length `root` lacks from what storage reports, and which
-/// layers hold a slice of the layout before tiers. Each layer `seen` lacks
-/// costs two requests, its first slice's first bytes and one tier object's
-/// metadata: one build writes all of a layer's slices, so one tells the
-/// layer's layout, and an object missing elsewhere fails the fold that reads
-/// it, which indexes again. One more request finds the length of each slice
-/// whose length is unknown. Objects found in
-/// the current layout are added to `seen`. The objects are
-/// content-addressed and the sweep keeps every object a live root names,
-/// so one found stays so for the life of the process; a pass asks about
-/// the objects new since the last one. (Whether a slice names a tier
-/// object does not tell its layout: a slice whose terms' tiers are small
-/// keeps them inline and names none.)
+/// Whether every slice and tier object `root` names is on storage, filling
+/// in each slice length `root` lacks from what storage reports, and whether
+/// some layer holds a slice of the layout before tiers. Objects in `seen`
+/// were found before and are not asked about again: they are
+/// content-addressed and the sweep keeps every object a live root names.
+/// Past [`CHECK_LIST_MIN_OBJECTS`] new objects one listing answers for them
+/// all, else one request each. One build writes all of a layer's slices,
+/// so its first slice's first bytes tell the layer's layout. A layer whose
+/// superfiles are all gone is dropped unread by the next fold and not
+/// checked. (Whether a slice names a tier object does not tell its layout:
+/// a slice whose terms' tiers are small keeps them inline and names none.)
 #[cfg_attr(feature = "detailed-tracing", tracing::instrument(skip_all))]
 pub(crate) async fn check_objects(
     storage: &Arc<dyn StorageProvider>,
@@ -1774,10 +1762,17 @@ pub(crate) async fn check_objects(
     seen: &Mutex<HashSet<ContentHash>>,
     live: &HashSet<Uuid>,
 ) -> Result<RootObjects, TermIndexError> {
-    // A layer whose every ordinal names a superfile that is gone is dropped
-    // unread by the fold that follows (`layer_keeps_postings`), so its
-    // objects are not checked either: after a compaction they are most of
-    // the root, and a check is a round trip each.
+    check_objects_listing_past(storage, root, seen, live, CHECK_LIST_MIN_OBJECTS).await
+}
+
+/// [`check_objects`], listing once past `list_min` new objects.
+async fn check_objects_listing_past(
+    storage: &Arc<dyn StorageProvider>,
+    root: &mut Root,
+    seen: &Mutex<HashSet<ContentHash>>,
+    live: &HashSet<Uuid>,
+    list_min: usize,
+) -> Result<RootObjects, TermIndexError> {
     let names_live = |layer: &Layer| match &layer.ordinals {
         None => true,
         Some(range) => range.clone().any(|o| {
@@ -1786,78 +1781,93 @@ pub(crate) async fn check_objects(
                 .is_some_and(|id| live.contains(id))
         }),
     };
-    let wanted: HashSet<(ContentHash, ObjectCheck)> = {
+    // Each layer's first slice whose layout is unknown, and every object
+    // not found before, by its storage URI.
+    let (layouts, objects) = {
         let seen = seen.lock().expect("term-index objects seen");
-        let mut wanted = HashSet::new();
+        let mut layouts: HashSet<ContentHash> = HashSet::new();
+        let mut objects: HashMap<String, ContentHash> = HashMap::new();
         for layer in root.layers.iter().filter(|layer| names_live(layer)) {
-            if let Some(slice) = layer
-                .slices
-                .first()
-                .filter(|slice| !seen.contains(&slice.content_hash))
+            if let Some(first) = layer.slices.first()
+                && !seen.contains(&first.content_hash)
             {
-                wanted.insert((slice.content_hash, ObjectCheck::SliceLayout));
+                layouts.insert(first.content_hash);
             }
-            if let Some(tier) = layer
-                .slices
-                .iter()
-                .find_map(|slice| slice.tier)
-                .filter(|tier| !seen.contains(tier))
-            {
-                wanted.insert((tier, ObjectCheck::Tier));
-            }
-            for slice in layer.slices.iter().filter(|slice| slice.len == 0) {
-                wanted.insert((slice.content_hash, ObjectCheck::SliceSize));
+            for slice in &layer.slices {
+                if slice.len == 0 || !seen.contains(&slice.content_hash) {
+                    objects.insert(slice_uri(&slice.content_hash), slice.content_hash);
+                }
+                if let Some(tier) = slice.tier.filter(|tier| !seen.contains(tier)) {
+                    objects.insert(tier_uri(&tier), tier);
+                }
             }
         }
-        wanted
+        (layouts, objects)
     };
-    let mut checks = stream::iter(wanted)
-        .map(|(hash, check)| async move {
-            let found = match check {
-                ObjectCheck::SliceLayout => storage
-                    .get_range(&slice_uri(&hash), 0..format::SLICE_VERSION_PREFIX_LEN)
-                    .await
-                    .map_err(TermIndexError::Storage)
-                    .and_then(|prefix| format::slice_is_before_tiers(&prefix))
-                    .map(|before_tiers| (Some(before_tiers), None)),
-                ObjectCheck::SliceSize => storage
-                    .head(&slice_uri(&hash))
-                    .await
-                    .map_err(TermIndexError::Storage)
-                    .map(|meta| (None, Some(meta.size))),
-                ObjectCheck::Tier => storage
-                    .head(&tier_uri(&hash))
-                    .await
-                    .map_err(TermIndexError::Storage)
-                    .map(|_| (Some(false), None)),
-            };
-            (hash, found)
-        })
-        .buffer_unordered(LAYER_FETCH_CONCURRENCY);
-    let mut sizes: HashMap<ContentHash, u64> = HashMap::new();
-    let mut legacy: HashSet<ContentHash> = HashSet::new();
-    while let Some((hash, found)) = checks.next().await {
-        match found {
-            Ok((before_tiers, size)) => {
-                match before_tiers {
-                    // Asked again on the next pass, until a fold rewrites it.
-                    Some(true) => {
-                        legacy.insert(hash);
+    let listed = match objects.len() > list_min {
+        true => list_objects(storage).await?,
+        false => HashMap::new(),
+    };
+    // A store whose listing is empty answers object by object.
+    let sizes: HashMap<String, u64> = match listed.is_empty() {
+        false => {
+            let mut sizes = HashMap::with_capacity(objects.len());
+            for uri in objects.keys() {
+                let Some(&size) = listed.get(uri) else {
+                    return Ok(RootObjects::Missing);
+                };
+                sizes.insert(uri.clone(), size);
+            }
+            sizes
+        }
+        true => {
+            let mut heads = stream::iter(objects.keys().cloned())
+                .map(|uri| async move {
+                    let head = storage.head(&uri).await;
+                    (uri, head)
+                })
+                .buffer_unordered(LAYER_FETCH_CONCURRENCY);
+            let mut sizes = HashMap::with_capacity(objects.len());
+            while let Some((uri, head)) = heads.next().await {
+                match head.map_err(TermIndexError::Storage) {
+                    Ok(meta) => {
+                        sizes.insert(uri, meta.size);
                     }
-                    Some(false) => {
-                        seen.lock().expect("term-index objects seen").insert(hash);
-                    }
-                    None => {}
-                }
-                if let Some(size) = size {
-                    sizes.insert(hash, size);
+                    Err(e) if e.calls_for_rebuild() => return Ok(RootObjects::Missing),
+                    Err(e) => return Err(e),
                 }
             }
+            sizes
+        }
+    };
+    let mut prefixes = stream::iter(layouts)
+        .map(|hash| async move {
+            let layout = storage
+                .get_range(&slice_uri(&hash), 0..format::SLICE_VERSION_PREFIX_LEN)
+                .await
+                .map_err(TermIndexError::Storage)
+                .and_then(|prefix| format::slice_is_before_tiers(&prefix));
+            (hash, layout)
+        })
+        .buffer_unordered(LAYER_FETCH_CONCURRENCY);
+    // Asked again on the next pass, until a fold rewrites the layer.
+    let mut legacy: HashSet<ContentHash> = HashSet::new();
+    while let Some((hash, layout)) = prefixes.next().await {
+        match layout {
+            Ok(true) => {
+                legacy.insert(hash);
+            }
+            Ok(false) => {}
             Err(e) if e.calls_for_rebuild() => return Ok(RootObjects::Missing),
             Err(e) => return Err(e),
         }
     }
-    let before_tiers = !legacy.is_empty();
+    seen.lock().expect("term-index objects seen").extend(
+        objects
+            .values()
+            .filter(|hash| !legacy.contains(hash))
+            .copied(),
+    );
     let mut sized = false;
     for slice in root
         .layers
@@ -1865,15 +1875,29 @@ pub(crate) async fn check_objects(
         .flat_map(|layer| &mut layer.slices)
         .filter(|slice| slice.len == 0)
     {
-        if let Some(&size) = sizes.get(&slice.content_hash) {
+        if let Some(&size) = sizes.get(&slice_uri(&slice.content_hash)) {
             slice.len = size;
             sized = true;
         }
     }
     Ok(RootObjects::Present {
         sized,
-        before_tiers,
+        before_tiers: !legacy.is_empty(),
     })
+}
+
+/// Every object under the index's prefix, by storage URI, with its size.
+/// One listing: providers list by path, so it cannot be split by key.
+async fn list_objects(
+    storage: &Arc<dyn StorageProvider>,
+) -> Result<HashMap<String, u64>, TermIndexError> {
+    Ok(storage
+        .list_with_prefix_metadata(STORAGE_PREFIX)
+        .await
+        .map_err(TermIndexError::Storage)?
+        .into_iter()
+        .map(|(uri, meta)| (uri, meta.size))
+        .collect())
 }
 
 /// The delta layers committed on top of `prior` to reach `current`, or
@@ -8281,6 +8305,61 @@ mod tests {
                 .expect("check"),
             RootObjects::Missing
         );
+    }
+
+    /// A slice lost past the first of its layer makes the root missing,
+    /// whether a listing or one request per object finds it.
+    #[tokio::test]
+    async fn check_objects_finds_a_lost_slice_past_a_layers_first() {
+        let dir = TempDir::new().expect("tempdir");
+        let policy = BuildPolicy {
+            slice_target_bytes: 64,
+            ..BuildPolicy::default()
+        };
+        let (store_dir, local, base) = store_with_base(&dir, &policy).await;
+        let root = commit_delta(&dir, &local, base, 2, false, &policy).await;
+        let layer = root
+            .layers
+            .iter()
+            .find(|layer| layer.slices.len() > 1)
+            .expect("a layer of several slices");
+        let live: HashSet<Uuid> = root.superfiles.iter().copied().collect();
+        let listed = list_objects(&local).await.expect("list");
+        assert!(listed.contains_key(&slice_uri(&layer.slices[0].content_hash)));
+        for list_min in [0, usize::MAX] {
+            let mut checked = root.clone();
+            let present = check_objects_listing_past(
+                &local,
+                &mut checked,
+                &Mutex::new(HashSet::new()),
+                &live,
+                list_min,
+            )
+            .await
+            .expect("check");
+            assert!(
+                matches!(present, RootObjects::Present { .. }),
+                "list_min {list_min}"
+            );
+        }
+        let last = layer.slices.last().expect("slice");
+        fs::remove_file(store_dir.path().join(slice_uri(&last.content_hash))).expect("remove");
+        for list_min in [0, usize::MAX] {
+            let mut checked = root.clone();
+            assert_eq!(
+                check_objects_listing_past(
+                    &local,
+                    &mut checked,
+                    &Mutex::new(HashSet::new()),
+                    &live,
+                    list_min,
+                )
+                .await
+                .expect("check"),
+                RootObjects::Missing,
+                "list_min {list_min}"
+            );
+        }
     }
 
     /// A one-slice layer, told apart by `tag`.
