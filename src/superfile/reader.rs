@@ -319,12 +319,13 @@ pub struct SuperfileReader {
 }
 
 /// What [`SuperfileReader::range_ends`] keeps of a superfile: its first rows
-/// by the key, as `(key, row)`, and whether its rows ascend by `_id`, so
-/// that the rows kept of a tied key are its lowest `_id`s too.
+/// by the key, as `(key, row)`, and whether its range index keeps the rows
+/// sharing a key in `_id` order, so that the rows kept of a tied key are its
+/// lowest `_id`s.
 #[derive(Debug, Clone)]
 pub(crate) struct RangeEnds {
     pub(crate) pairs: Vec<(u64, u32)>,
-    pub(crate) rows_in_id_order: bool,
+    pub(crate) ties_in_id_order: bool,
 }
 
 /// Where a superfile's stable-id sidecar lives and how it is laid out, from
@@ -1471,10 +1472,10 @@ impl SuperfileReader {
     /// The `k` rows whose keys lie lowest (or, with `descending`,
     /// highest) in `lo..=hi`, as `(key, row)`, leaving out the rows of
     /// `skip` (deleted ones): what an `ORDER BY column LIMIT k` over a range
-    /// keeps of this superfile. Of the rows holding the `k`-th key, the
-    /// lowest are kept, whichever the direction, so in a superfile whose
-    /// rows ascend by `_id` ([`RangeEnds::rows_in_id_order`]) the `k` are
-    /// the first by the key and then `_id` ascending. The interval's blocks
+    /// keeps of this superfile. Of the rows holding the `k`-th key, the ones
+    /// the index stores first are kept, whichever the direction: with its
+    /// ties in `_id` order ([`RangeEnds::ties_in_id_order`]) the `k` are the
+    /// first by the key and then `_id` ascending. The interval's blocks
     /// are read from its near end, one at a time, until `k` rows are found,
     /// so the read is a block or two however wide the interval. Fewer than
     /// `k` when the interval holds fewer. `None` when the superfile does
@@ -1522,9 +1523,9 @@ impl SuperfileReader {
                     .take(k - out.len()),
             );
         }
-        // A descending walk meets a key's rows highest first, so the rows it
-        // kept of the `k`-th key are that key's highest. Keep its lowest
-        // instead: read forward from the key's first block, where they are.
+        // A descending walk meets a key's rows last first, so the rows it
+        // kept of the `k`-th key are the ones the index stores last. Keep the
+        // first instead: read forward from the key's first block.
         if descending && k > 0 && out.len() == k {
             let cut = out[k - 1].0;
             out.retain(|(key, _)| *key != cut);
@@ -1548,7 +1549,7 @@ impl SuperfileReader {
         }
         Ok(Some(RangeEnds {
             pairs: out,
-            rows_in_id_order: indexed.rows_in_id_order(),
+            ties_in_id_order: indexed.ties_in_id_order(),
         }))
     }
 

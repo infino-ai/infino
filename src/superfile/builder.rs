@@ -4332,7 +4332,7 @@ fn range_specs_in(specs: Vec<RangeColumnSpec>, schema: &Schema) -> Vec<RangeColu
 /// The range index region over `batches`, the superfile's rows in file
 /// order, for `specs` (already resolved against the batches' schema by
 /// [`range_specs_in`]). `id_column` names the id column the batches carry,
-/// so the region records whether the rows ascend by it. No region when
+/// so the region keeps the rows sharing a key in its order. No region when
 /// `specs` is empty.
 fn range_region_of<I>(
     batches: I,

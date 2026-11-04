@@ -32,11 +32,11 @@
 //! tie-break a paged search adds): those order only the rows tied on the
 //! column, so the scan then reads every row tied with the cutoff too. The
 //! one exception is a sort whose only later key is the table's `_id`,
-//! ascending: a superfile whose rows ascend by `_id` keeps the rows of a
-//! tied key in `_id` order in its range index, so its first rows by the
-//! column are its first by the column and `_id`, and the scan reads those
-//! alone. The sort and the filters stay where they are, so the answer is
-//! the one they give over the rows the scan returns.
+//! ascending: a range index that keeps the rows of a tied key in `_id`
+//! order makes a superfile's first rows by the column its first by the
+//! column and `_id`, and the scan reads those alone. The sort and the
+//! filters stay where they are, so the answer is the one they give over
+//! the rows the scan returns.
 
 use std::sync::Arc;
 
@@ -217,6 +217,11 @@ mod tests {
     const KEPT_BYTES: usize = 64 << 20;
     /// Below every `key`: a cutoff that keeps all of them.
     const BELOW_EVERY_KEY: i64 = -1;
+    /// Rows the `_id` tie-break test also deletes: those with `seq` from
+    /// this on, a larger share of the last superfile than the first delete
+    /// takes of the first, so an optimize merges the last superfile first
+    /// and the merged rows are not in `_id` order.
+    const LATE_DELETED_FROM: i64 = 11_000;
     /// Top-k statements whose ties the table's `_id` breaks, ascending, as
     /// `(key above, descending, limit)`; no key bound means no `WHERE`, as a
     /// search with no query sends.
@@ -314,10 +319,11 @@ mod tests {
         rows.into_iter().take(limit).map(|(_, s)| s).collect()
     }
 
-    /// The `seq`s a top-k over the live rows answers when it orders by
-    /// `key` and then `seq` ascending, whichever way `key` goes.
+    /// The `seq`s a top-k over the live rows (with those from
+    /// [`LATE_DELETED_FROM`] deleted too) answers when it orders by `key`
+    /// and then `seq` ascending, whichever way `key` goes.
     fn expected_then_seq(above: i64, descending: bool, limit: usize) -> Vec<i64> {
-        let mut rows: Vec<(i64, i64)> = (DELETED_BELOW..FILES * ROWS_PER_FILE)
+        let mut rows: Vec<(i64, i64)> = (DELETED_BELOW..LATE_DELETED_FROM)
             .map(|s| (key(s), s))
             .filter(|(k, _)| *k > above)
             .collect();
@@ -332,9 +338,9 @@ mod tests {
     }
 
     /// Assert every superfile of `reader`'s snapshot keeps the rows tied on
-    /// `key` in `_id` order, which is what lets a top-k tie-broken by `_id`
-    /// read only each superfile's first rows.
-    fn assert_tied_rows_in_id_order(st: &Supertable, reader: &SupertableReader, what: &str) {
+    /// `key` in `_id` order in its range index, which is what lets a top-k
+    /// tie-broken by `_id` read only each superfile's first rows.
+    fn assert_ties_in_id_order(st: &Supertable, reader: &SupertableReader, what: &str) {
         let manifest = reader.manifest();
         let field = manifest.field_id("key").expect("key");
         let runtime = Builder::new_current_thread()
@@ -354,7 +360,7 @@ mod tests {
                 ))
                 .expect("ends")
                 .expect("key is indexed");
-            assert!(ends.rows_in_id_order, "{what}: {:?}", entry.uri);
+            assert!(ends.ties_in_id_order, "{what}: {:?}", entry.uri);
         }
     }
 
@@ -415,19 +421,21 @@ mod tests {
     /// A top-k whose ties the table's `_id` breaks answers as a sort by the
     /// key and then `seq` does (the rows were appended in `seq` order, so
     /// their ids ascend with it), deleted rows left out, whichever way the
-    /// key goes, before and after an optimize merges the superfiles; and
-    /// every superfile says its tied rows are in `_id` order, so the scan
-    /// reads each one's first rows alone.
+    /// key goes, before and after an optimize merges the superfiles in an
+    /// order other than `_id`'s; and every superfile's range index keeps its
+    /// tied rows in `_id` order, so the scan reads each one's first rows.
     #[test]
     fn a_top_k_tie_broken_by_the_id_answers_from_each_superfiles_first_rows() {
         let dir = TempDir::new().expect("tempdir");
         let st = table(&dir);
+        st.delete(col("seq").gt_eq(lit(LATE_DELETED_FROM)))
+            .expect("delete");
         for pass in ["appended", "optimized"] {
             if pass == "optimized" {
                 st.optimize(&OptimizeOptions::default()).expect("optimize");
             }
             let reader = st.reader().expect("reader");
-            assert_tied_rows_in_id_order(&st, &reader, pass);
+            assert_ties_in_id_order(&st, &reader, pass);
             for (above, descending, limit) in BY_ID {
                 let filter = above.map_or(String::new(), |a| format!("WHERE key > {a} "));
                 let order = if *descending { "DESC" } else { "ASC" };

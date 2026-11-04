@@ -1035,9 +1035,9 @@ impl SupertableProvider {
     /// the rows kept are the collected ones within it — at least `k`, and
     /// every row a superfile holds that the answer needs (one row past its
     /// own `k`-th key is past the cutoff too). Ties broken by the id ascending
-    /// are settled the same way when every survivor's rows ascend by the id:
-    /// each one's first rows by the key are then its first by the key and
-    /// the id. `None` when there is no hint,
+    /// are settled the same way when every survivor's range index keeps its
+    /// tied rows in id order: each one's first rows by the key are then its
+    /// first by the key and the id. `None` when there is no hint,
     /// the filters are not that one range, or a survivor has no range index
     /// over the column: the scan then reads every row the filters admit.
     async fn top_k_rows(
@@ -1077,7 +1077,7 @@ impl SupertableProvider {
         // Ties the id breaks need no rows past each superfile's first when
         // every superfile keeps its tied rows in id order.
         let ties =
-            hint.ties && !(hint.ties_by_id && ends.iter().all(|(_, ends)| ends.rows_in_id_order));
+            hint.ties && !(hint.ties_by_id && ends.iter().all(|(_, ends)| ends.ties_in_id_order));
         let mut keys: Vec<u64> = ends
             .iter()
             .flat_map(|(_, ends)| ends.pairs.iter().map(|(key, _)| *key))

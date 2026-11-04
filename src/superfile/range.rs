@@ -46,11 +46,12 @@
 //! in runs of at most [`RUN_ENTRIES`], each full run spilled to scratch,
 //! and the runs merged as the blocks are written.
 //!
-//! Rows sharing a key are therefore in row order. A column's flags say
-//! when that is also `_id` order ([`ROWS_IN_ID_ORDER`]): the build saw the
-//! superfile's ids ascend row by row, as an append writes them. A sort that
-//! breaks ties by `_id` then takes the first rows of a tied key and needs no
-//! other; without the flag it must read every row holding that key.
+//! Rows sharing a key are sorted by their `_id` when the build is given the
+//! id column, and a column's flags say so ([`TIES_IN_ID_ORDER`]); otherwise
+//! by row. A sort that breaks ties by `_id` then takes the first rows of a
+//! tied key and needs no other, whatever order the superfile's rows are in
+//! (a merge concatenates its inputs in an order of its own); without the
+//! flag it must read every row holding that key.
 
 use std::{
     cmp::Reverse,
@@ -88,9 +89,10 @@ pub(crate) const VERSION: u32 = 1;
 /// full are a few kilobytes.
 pub(crate) const BLOCK_VALUES: usize = 1024;
 
-/// Pairs one in-memory sort run holds before it spills: 4 Mi pairs of a
-/// `u64` key and a `u32` row, 48 MiB, whatever the superfile's size.
-const RUN_ENTRIES: usize = 4 << 20;
+/// Entries one in-memory sort run holds before it spills: 1.5 Mi entries
+/// of 32 bytes (a `u64` key, the 128-bit order of the row among its key's
+/// rows, a `u32` row), 48 MiB, whatever the superfile's size.
+const RUN_ENTRIES: usize = 3 << 19;
 
 /// Narrowest row id a block packs. A one-row superfile needs no bits for
 /// its row, and a block of one value needs none for its key, so without a
@@ -99,15 +101,21 @@ const RUN_ENTRIES: usize = 4 << 20;
 /// damaged layout. One bit per row keeps every block at least a byte.
 const MIN_ROW_WIDTH: u8 = 1;
 
-/// Column flag: the superfile's rows ascend by `_id`, so the rows sharing a
-/// key, which the region keeps in row order, are in `_id` order too. Unset
-/// on a region built before the flag existed, which wrote zero here.
-const ROWS_IN_ID_ORDER: u16 = 1;
+/// Column flag: the rows sharing a key are stored in `_id` order. Unset on a
+/// region built without the ids, and on one built before the flag existed,
+/// which wrote zero here; such a region keeps them in row order.
+const TIES_IN_ID_ORDER: u16 = 1;
 
-/// Bytes of one spilled pair: the key, then the row.
-const RUN_RECORD_BYTES: usize = 12;
-/// Bytes of a spilled pair's key.
+/// The sign bit of a 128-bit id: flipped, the ids order as unsigned values.
+const ID_SIGN_BIT: u128 = 1 << 127;
+
+/// Bytes of one spilled entry: the key, the order among its key's rows, the
+/// row.
+const RUN_RECORD_BYTES: usize = 28;
+/// Bytes of a spilled entry's key.
 const RUN_KEY_BYTES: usize = 8;
+/// Bytes of a spilled entry's order among its key's rows.
+const RUN_TIE_BYTES: usize = 16;
 
 /// Header bytes: magic, version, column count.
 const HEADER_BYTES: usize = 16;
@@ -248,10 +256,10 @@ impl<R> RangeRegionOutput<R> {
 
 /// Build the region over `batches`, whose rows are the superfile's rows in
 /// order (row `i` of the concatenation is local row `i`). Each batch must
-/// carry every column of `columns`, by name, and `id_column` when one is
-/// named: the region then records whether the rows ascend by it
-/// ([`ROWS_IN_ID_ORDER`]). Spilled runs and the blocks go to scratch files
-/// under `scratch`.
+/// carry every column of `columns`, by name. With `id_column` named, rows
+/// sharing a key are kept in the order of that column's ids, and the region
+/// says so ([`TIES_IN_ID_ORDER`]) when every row has one. Spilled runs and
+/// the blocks go to scratch files under `scratch`.
 pub(crate) fn build_region<I>(
     batches: I,
     columns: &[RangeColumnSpec],
@@ -263,7 +271,7 @@ where
 {
     let mut sorters: Vec<RunSorter> = columns.iter().map(|_| RunSorter::default()).collect();
     let mut n_rows: u64 = 0;
-    let mut ids = id_column.map(|_| IdOrder::default());
+    let mut ids_complete = id_column.is_some();
     for batch in batches {
         let batch = batch.map_err(io::Error::other)?;
         // Every row of the batch takes a `u32` id, its last row included.
@@ -271,9 +279,18 @@ where
         let (Ok(first_row), Ok(_)) = (u32::try_from(n_rows), u32::try_from(end_row)) else {
             return Err(io::Error::other("a superfile holds at most u32::MAX rows"));
         };
-        if let (Some(name), Some(order)) = (id_column, ids.as_mut()) {
-            order.observe(batch.column_by_name(name).map(|c| c.as_ref()));
-        }
+        let ids = id_column
+            .and_then(|name| batch.column_by_name(name))
+            .and_then(|c| c.as_primitive_opt::<Decimal128Type>());
+        ids_complete &= ids.is_some_and(|ids| ids.null_count() == 0);
+        // A row's order among the rows sharing its key: its id when it has
+        // one, else its row.
+        let tie = |row: u32| match ids {
+            Some(ids) if ids.is_valid((row - first_row) as usize) => {
+                (ids.value((row - first_row) as usize) as u128) ^ ID_SIGN_BIT
+            }
+            _ => u128::from(row),
+        };
         for (spec, sorter) in columns.iter().zip(&mut sorters) {
             let array = batch.column_by_name(&spec.name).ok_or_else(|| {
                 io::Error::other(format!(
@@ -282,18 +299,13 @@ where
                 ))
             })?;
             push_keys(array.as_ref(), spec.kind, first_row, |key, row| {
-                sorter.push(key, row, scratch)
+                sorter.push(key, tie(row), row, scratch)
             })?;
         }
         n_rows += batch.num_rows() as u64;
     }
     let row_width = width_of(n_rows.saturating_sub(1)).max(MIN_ROW_WIDTH);
-    let flags = match ids {
-        Some(IdOrder {
-            ascending: true, ..
-        }) => ROWS_IN_ID_ORDER,
-        _ => 0,
-    };
+    let flags = if ids_complete { TIES_IN_ID_ORDER } else { 0 };
 
     let mut blocks_file = BufWriter::new(tempfile::tempfile_in(scratch)?);
     let mut writer = BlockWriter::new(&mut blocks_file, row_width);
@@ -366,49 +378,6 @@ fn encode_directory(columns: &[ColumnEntry], blocks: &[BlockEntry]) -> Vec<u8> {
     out
 }
 
-/// Whether a superfile's ids, seen batch by batch in row order, ascend:
-/// every id present and each above the one before. An id column of another
-/// type than `Decimal128`, or missing from a batch, counts as not ascending.
-struct IdOrder {
-    ascending: bool,
-    last: Option<i128>,
-}
-
-impl Default for IdOrder {
-    fn default() -> Self {
-        Self {
-            ascending: true,
-            last: None,
-        }
-    }
-}
-
-impl IdOrder {
-    /// Take the next batch's id column (`None` when the batch lacks it).
-    fn observe(&mut self, ids: Option<&dyn Array>) {
-        if !self.ascending {
-            return;
-        }
-        let Some(ids) = ids.and_then(|a| a.as_primitive_opt::<Decimal128Type>()) else {
-            self.ascending = false;
-            return;
-        };
-        for id in ids.iter() {
-            match (id, self.last) {
-                (Some(id), Some(last)) if id <= last => {
-                    self.ascending = false;
-                    return;
-                }
-                (Some(id), _) => self.last = Some(id),
-                (None, _) => {
-                    self.ascending = false;
-                    return;
-                }
-            }
-        }
-    }
-}
-
 /// Feed `array`'s non-null values to `sink` as `(key, row)`, row `i` of the
 /// array being `first_row + i`.
 fn push_keys(
@@ -445,17 +414,23 @@ fn push_keys(
     Ok(())
 }
 
-/// One column's `(key, row)` pairs, sorted in runs: the open run in memory,
-/// every full one spilled to scratch sorted.
+/// One sort entry: a key, the row's order among the rows sharing it (high
+/// then low 64 bits), and the row.
+type RunEntry = (u64, u64, u64, u32);
+
+/// One column's `(key, row)` pairs, sorted by key and then the order among
+/// the key's rows, in runs: the open run in memory, every full one spilled
+/// to scratch sorted.
 #[derive(Default)]
 struct RunSorter {
-    open: Vec<(u64, u32)>,
+    open: Vec<RunEntry>,
     spilled: Vec<File>,
 }
 
 impl RunSorter {
-    fn push(&mut self, key: u64, row: u32, scratch: &Path) -> io::Result<()> {
-        self.open.push((key, row));
+    fn push(&mut self, key: u64, tie: u128, row: u32, scratch: &Path) -> io::Result<()> {
+        self.open
+            .push((key, (tie >> u64::BITS) as u64, tie as u64, row));
         if self.open.len() == RUN_ENTRIES {
             self.spill(scratch)?;
         }
@@ -466,8 +441,10 @@ impl RunSorter {
     fn spill(&mut self, scratch: &Path) -> io::Result<()> {
         self.open.sort_unstable();
         let mut out = BufWriter::new(tempfile::tempfile_in(scratch)?);
-        for &(key, row) in &self.open {
+        for &(key, tie_hi, tie_lo, row) in &self.open {
             out.write_all(&key.to_le_bytes())?;
+            let tie = (u128::from(tie_hi) << u64::BITS) | u128::from(tie_lo);
+            out.write_all(&tie.to_le_bytes())?;
             out.write_all(&row.to_le_bytes())?;
         }
         out.flush()?;
@@ -478,7 +455,8 @@ impl RunSorter {
         Ok(())
     }
 
-    /// Every pair in `(key, row)` order to `sink`; returns how many.
+    /// Every pair, by key and then the order among the key's rows, to
+    /// `sink` as `(key, row)`; returns how many.
     fn drain(
         mut self,
         scratch: &Path,
@@ -486,7 +464,7 @@ impl RunSorter {
     ) -> io::Result<u64> {
         if self.spilled.is_empty() {
             self.open.sort_unstable();
-            for &(key, row) in &self.open {
+            for &(key, _, _, row) in &self.open {
                 sink(key, row)?;
             }
             return Ok(self.open.len() as u64);
@@ -497,34 +475,36 @@ impl RunSorter {
         let mut runs: Vec<BufReader<File>> = self.spilled.into_iter().map(BufReader::new).collect();
         let mut heap = BinaryHeap::with_capacity(runs.len());
         for (i, run) in runs.iter_mut().enumerate() {
-            if let Some(pair) = read_record(run)? {
-                heap.push(Reverse((pair, i)));
+            if let Some(entry) = read_record(run)? {
+                heap.push(Reverse((entry, i)));
             }
         }
         let mut n = 0u64;
-        while let Some(Reverse(((key, row), i))) = heap.pop() {
+        while let Some(Reverse(((key, _, _, row), i))) = heap.pop() {
             sink(key, row)?;
             n += 1;
-            if let Some(pair) = read_record(&mut runs[i])? {
-                heap.push(Reverse((pair, i)));
+            if let Some(entry) = read_record(&mut runs[i])? {
+                heap.push(Reverse((entry, i)));
             }
         }
         Ok(n)
     }
 }
 
-/// The next `(key, row)` of a spilled run, `None` at its end.
-fn read_record(run: &mut impl Read) -> io::Result<Option<(u64, u32)>> {
+/// The next entry of a spilled run, `None` at its end.
+fn read_record(run: &mut impl Read) -> io::Result<Option<RunEntry>> {
     let mut record = [0u8; RUN_RECORD_BYTES];
     match run.read_exact(&mut record) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(e) => return Err(e),
     }
-    let (key, row) = record.split_at(RUN_KEY_BYTES);
+    let (key, rest) = record.split_at(RUN_KEY_BYTES);
+    let (tie, row) = rest.split_at(RUN_TIE_BYTES);
     let key = u64::from_le_bytes(key.try_into().expect("8 bytes"));
+    let tie = u128::from_le_bytes(tie.try_into().expect("16 bytes"));
     let row = u32::from_le_bytes(row.try_into().expect("4 bytes"));
-    Ok(Some((key, row)))
+    Ok(Some((key, (tie >> u64::BITS) as u64, tie as u64, row)))
 }
 
 /// One column's entry, before encoding.
@@ -800,10 +780,10 @@ impl RangeColumn<'_> {
         self.column.kind
     }
 
-    /// Whether the rows sharing a key come in `_id` order
-    /// ([`ROWS_IN_ID_ORDER`]).
-    pub(crate) fn rows_in_id_order(&self) -> bool {
-        self.column.flags & ROWS_IN_ID_ORDER != 0
+    /// Whether the rows sharing a key are stored in `_id` order
+    /// ([`TIES_IN_ID_ORDER`]).
+    pub(crate) fn ties_in_id_order(&self) -> bool {
+        self.column.flags & TIES_IN_ID_ORDER != 0
     }
 
     /// The column's non-null values in this superfile.
@@ -1238,7 +1218,9 @@ mod tests {
         let mut sorter = RunSorter::default();
         // Three runs: two spilled by hand, one left open.
         for (i, key) in [5u64, 1, 9, 3, 7, 3, 0, 8].iter().enumerate() {
-            sorter.push(*key, i as u32, scratch.path()).expect("push");
+            sorter
+                .push(*key, i as u128, i as u32, scratch.path())
+                .expect("push");
             if i == 2 || i == 5 {
                 sorter.spill(scratch.path()).expect("spill");
             }
@@ -1590,12 +1572,22 @@ mod tests {
         (opts, SuperfileReader::open(bytes).expect("open"))
     }
 
-    /// The rows an `ORDER BY level, row LIMIT k` keeps (`level` descending
-    /// with `descending`, the row ascending either way), past `skip`.
-    fn first_by_level_then_row(k: usize, descending: bool, skip: &RoaringBitmap) -> RoaringBitmap {
-        let mut rows: Vec<(i64, u32)> = (0..TIE_ROWS)
+    /// A step coprime to [`TIE_ROWS`]: row `i` of the scattered fixture has
+    /// `_id` `i * ID_STEP mod TIE_ROWS`, every id once, in no row order.
+    const ID_STEP: usize = 7919;
+
+    /// The rows an `ORDER BY level, _id LIMIT k` keeps (`level` descending
+    /// with `descending`, the id ascending either way), past `skip`, when
+    /// row `i` has id `id_of(i)`.
+    fn first_by_level_then_id(
+        k: usize,
+        descending: bool,
+        skip: &RoaringBitmap,
+        id_of: &dyn Fn(usize) -> i128,
+    ) -> RoaringBitmap {
+        let mut rows: Vec<(i64, i128, u32)> = (0..TIE_ROWS)
             .filter(|row| !skip.contains(*row as u32))
-            .map(|row| (level(row), row as u32))
+            .map(|row| (level(row), id_of(row), row as u32))
             .collect();
         rows.sort_by(|a, b| {
             let by_level = match descending {
@@ -1604,67 +1596,84 @@ mod tests {
             };
             by_level.then(a.1.cmp(&b.1))
         });
-        rows.into_iter().take(k).map(|(_, row)| row).collect()
+        rows.into_iter().take(k).map(|(_, _, row)| row).collect()
     }
 
-    /// The first `k` rows by a key, either way, keep the lowest rows of the
-    /// `k`-th key, even when that key fills several blocks and a descending
-    /// walk meets its highest rows first; the region says the rows ascend
-    /// by `_id`, so those are the lowest `_id`s too.
+    /// The first `k` rows by a key, either way, keep the lowest `_id`s of
+    /// the `k`-th key, even when that key fills several blocks and a
+    /// descending walk meets it from its far end, and whatever order the
+    /// superfile's rows hold their ids in: ascending, descending, scattered.
     #[tokio::test]
-    async fn range_ends_keep_the_lowest_rows_of_the_last_key_either_way() {
-        let (opts, reader) = tie_superfile(|row| row as i128 + 1);
-        let field = opts.field_id_of_column("level").expect("field id");
+    async fn range_ends_keep_the_lowest_ids_of_the_last_key_either_way() {
+        let id_orders: [&dyn Fn(usize) -> i128; 3] = [
+            &|row| row as i128 + 1,
+            &|row| (TIE_ROWS - row) as i128,
+            &|row| (row * ID_STEP % TIE_ROWS) as i128,
+        ];
         let all = (signed_key(0), signed_key(2));
-        let deleted: RoaringBitmap = [0, 1, 7, 4, 3].into_iter().collect();
-        for skip in [RoaringBitmap::new(), deleted] {
-            for descending in [false, true] {
-                for k in [1, 5, 10, 40, TIE_ROWS] {
-                    let ends = reader
-                        .range_ends(field, KeyKind::Signed, all, k, descending, &skip)
-                        .await
-                        .expect("ends")
-                        .expect("level is indexed");
-                    assert!(ends.rows_in_id_order);
-                    let rows: RoaringBitmap = ends.pairs.iter().map(|(_, row)| *row).collect();
-                    assert_eq!(ends.pairs.len(), rows.len() as usize, "no row twice");
-                    assert_eq!(
-                        rows,
-                        first_by_level_then_row(k, descending, &skip),
-                        "k {k}, descending {descending}, {} deleted",
-                        skip.len()
-                    );
+        let deleted: RoaringBitmap = [0, 1, 7, 4, 3, 2001].into_iter().collect();
+        for (order, id_of) in id_orders.into_iter().enumerate() {
+            let (opts, reader) = tie_superfile(id_of);
+            let field = opts.field_id_of_column("level").expect("field id");
+            for skip in [RoaringBitmap::new(), deleted.clone()] {
+                for descending in [false, true] {
+                    for k in [1, 5, 10, 40, TIE_ROWS] {
+                        let ends = reader
+                            .range_ends(field, KeyKind::Signed, all, k, descending, &skip)
+                            .await
+                            .expect("ends")
+                            .expect("level is indexed");
+                        assert!(ends.ties_in_id_order);
+                        let rows: RoaringBitmap = ends.pairs.iter().map(|(_, row)| *row).collect();
+                        assert_eq!(ends.pairs.len(), rows.len() as usize, "no row twice");
+                        assert_eq!(
+                            rows,
+                            first_by_level_then_id(k, descending, &skip, id_of),
+                            "id order {order}, k {k}, descending {descending}, {} deleted",
+                            skip.len()
+                        );
+                    }
                 }
             }
         }
     }
 
-    /// A superfile whose rows do not ascend by `_id` is not marked: its
-    /// tied rows are in row order, which is not `_id` order.
-    #[tokio::test]
-    async fn rows_out_of_id_order_are_not_marked() {
-        let (opts, reader) = tie_superfile(|row| (TIE_ROWS - row) as i128);
-        let field = opts.field_id_of_column("level").expect("field id");
-        let ends = reader
-            .range_ends(
-                field,
-                KeyKind::Signed,
-                (signed_key(0), signed_key(2)),
-                10,
-                false,
-                &RoaringBitmap::new(),
-            )
-            .await
-            .expect("ends")
-            .expect("level is indexed");
-        assert!(!ends.rows_in_id_order);
+    /// Entries spilled in several runs come back merged by key and then by
+    /// their order among the key's rows, the full 128 bits of it.
+    #[test]
+    fn spilled_runs_merge_by_key_then_tie() {
+        let scratch = tempfile::tempdir().expect("scratch");
+        let mut sorter = RunSorter::default();
+        let entries: [(u64, u128, u32); 6] = [
+            (7, 5 << 70, 0),
+            (3, 9, 1),
+            (7, 2, 2),
+            (3, 1 << 100, 3),
+            (7, (5 << 70) - 1, 4),
+            (3, 10, 5),
+        ];
+        for chunk in entries.chunks(2) {
+            for &(key, tie, row) in chunk {
+                sorter.push(key, tie, row, scratch.path()).expect("push");
+            }
+            sorter.spill(scratch.path()).expect("spill");
+        }
+        let mut out = Vec::new();
+        let n = sorter
+            .drain(scratch.path(), |key, row| {
+                out.push((key, row));
+                Ok(())
+            })
+            .expect("drain");
+        assert_eq!(n, entries.len() as u64);
+        assert_eq!(out, vec![(3, 1), (3, 5), (3, 3), (7, 2), (7, 4), (7, 0)]);
     }
 
-    /// The build marks the rows' order from the id column it is given: ids
-    /// ascending across batches mark it, a repeat or a fall does not, and
-    /// neither does a build given no id column.
+    /// The build marks the region when it is given an id for every row,
+    /// whatever order the ids are in, and not when a batch lacks the id
+    /// column, an id is missing, or no id column is named.
     #[test]
-    fn the_build_marks_rows_ascending_by_id() {
+    fn the_build_marks_ties_in_id_order_when_every_row_has_an_id() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("_id", DataType::Decimal128(38, 0), false),
             Field::new("a", DataType::Int64, false),
@@ -1694,13 +1703,40 @@ mod tests {
                 .expect("build"),
             );
             let directory = RangeDirectory::parse(&region, region.len() as u64).expect("parse");
-            directory.column(1).expect("indexed").rows_in_id_order()
+            directory.column(1).expect("indexed").ties_in_id_order()
         };
         assert!(marked(vec![&[1, 2, 3], &[9, 10]], Some("_id")));
-        assert!(!marked(vec![&[1, 2, 3], &[3, 10]], Some("_id")));
-        assert!(!marked(vec![&[1, 5, 3]], Some("_id")));
+        assert!(marked(vec![&[9, 5, 3], &[1, 10]], Some("_id")));
         assert!(!marked(vec![&[1, 2, 3]], None));
         assert!(!marked(vec![&[1, 2, 3]], Some("missing")));
+        // A null id leaves its row ordered by row, so the region is not marked.
+        let nullable = Arc::new(Schema::new(vec![
+            Field::new("_id", DataType::Decimal128(38, 0), true),
+            Field::new("a", DataType::Int64, false),
+        ]));
+        let with_null = RecordBatch::try_new(
+            nullable,
+            vec![
+                Arc::new(
+                    Decimal128Array::from(vec![Some(1), None])
+                        .with_precision_and_scale(38, 0)
+                        .expect("decimal"),
+                ),
+                Arc::new(Int64Array::from(vec![5, 5])),
+            ],
+        );
+        let scratch = tempfile::tempdir().expect("scratch");
+        let region = whole(
+            build_region(
+                [with_null],
+                &[spec("a", 1, KeyKind::Signed)],
+                Some("_id"),
+                scratch.path(),
+            )
+            .expect("build"),
+        );
+        let directory = RangeDirectory::parse(&region, region.len() as u64).expect("parse");
+        assert!(!directory.column(1).expect("indexed").ties_in_id_order());
     }
 
     #[test]
