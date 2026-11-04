@@ -1291,6 +1291,9 @@ struct LayerWriter {
     current_tier: Vec<u8>,
     slices: Vec<SliceRef>,
     slice_bytes: Vec<(ContentHash, BuiltBytes)>,
+    /// Where each cut slice and its tier object go at once, when set, in
+    /// place of `slice_bytes` and `tier_bytes`.
+    sink: Option<ObjectSink>,
     /// The tier objects of the slices cut so far, keyed by content hash.
     tier_bytes: Vec<(ContentHash, BuiltBytes)>,
     /// Where cut slices and tier objects are spilled, when they are.
@@ -1352,6 +1355,7 @@ impl LayerWriter {
             slices: Vec::new(),
             slice_bytes: Vec::new(),
             tier_bytes: Vec::new(),
+            sink: None,
             spill,
             target_bytes: policy.slice_target_bytes,
             tier_entries_per_term: policy.tier_entries_per_term,
@@ -1543,10 +1547,16 @@ impl LayerWriter {
             let stem = reference.content_hash.to_hex();
             if let (Some(hash), Some(bytes)) = (tier, tier_bytes) {
                 let kept = self.keep(&format!("{stem}.{TIER_FILE_EXTENSION}"), bytes)?;
-                self.tier_bytes.push((hash, kept));
+                match &self.sink {
+                    Some(sink) => drop(sink.send(("tier", hash, kept))),
+                    None => self.tier_bytes.push((hash, kept)),
+                }
             }
             let kept = self.keep(&format!("{stem}.slice"), bytes)?;
-            self.slice_bytes.push((reference.content_hash, kept));
+            match &self.sink {
+                Some(sink) => drop(sink.send(("slice", reference.content_hash, kept))),
+                None => self.slice_bytes.push((reference.content_hash, kept)),
+            }
             self.slices.push(reference);
         }
         self.stats.cut_secs += started.elapsed().as_secs_f64();
@@ -2146,9 +2156,9 @@ pub(crate) fn merge_layers(
 pub(crate) type ObjectSink =
     tokio::sync::mpsc::UnboundedSender<(&'static str, ContentHash, BuiltBytes)>;
 
-/// [`merge_layers`], handing each range's objects to `sink` as the range
-/// finishes; the merged layer then holds none. A closed sink drops them,
-/// and the uploader that closed it reports why.
+/// [`merge_layers`], handing each slice and tier object to `sink` as its
+/// range writes it; the merged layer then holds none. A closed sink drops
+/// them, and the uploader that closed it reports why.
 pub(crate) fn merge_layers_into(
     sources: &[Vec<SliceFile>],
     ordinals: &[Option<u32>],
@@ -2168,16 +2178,7 @@ pub(crate) fn merge_layers_into(
                     .collect()
             })
             .collect();
-        let mut part = merge_range(&in_range, start, end, ordinals, policy)?;
-        if let Some(sink) = sink {
-            for (hash, built) in part.tiers.drain(..) {
-                let _ = sink.send(("tier", hash, built));
-            }
-            for (hash, built) in part.slices.drain(..) {
-                let _ = sink.send(("slice", hash, built));
-            }
-        }
-        Ok(part)
+        merge_range(&in_range, start, end, ordinals, policy, sink)
     })?;
     merged.layer.ordinals = Some(ordinals_span(ordinals));
     Ok(merged)
@@ -2429,6 +2430,7 @@ fn merge_range(
     end: Option<&[u8]>,
     ordinals: &[Option<u32>],
     policy: &BuildPolicy,
+    sink: Option<&ObjectSink>,
 ) -> Result<MergedLayer, TermIndexError> {
     let mut cursors: Vec<LayerCursor> = sources
         .iter()
@@ -2447,6 +2449,7 @@ fn merge_range(
     }
 
     let mut writer = LayerWriter::for_merge(policy, ordinals)?;
+    writer.sink = sink.cloned();
     let mut run: Vec<Posting> = Vec::new();
     let mut sources: Vec<TierSource> = Vec::new();
     let mut entries: Vec<TierEntry> = Vec::new();
