@@ -932,6 +932,13 @@ impl FoldBudget {
         }
     }
 
+    /// Whether memory holds more layers than a fold of a run reads, so the
+    /// next fold's inputs can wait in the page cache beside this one's
+    /// without pushing them out.
+    pub(crate) fn prefetches(&self) -> bool {
+        self.shape().0 > FOLD_LAYERS_MAX
+    }
+
     /// Memory a fold reading `layers` layers in `ranges` key ranges is
     /// planned to hold.
     pub(crate) fn fold_bytes(layers: usize, ranges: usize) -> u64 {

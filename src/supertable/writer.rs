@@ -12185,15 +12185,18 @@ pub(in crate::supertable) async fn stamp_term_index(
                             let _ = started.await;
                         }
                         let downloaded = Arc::new(tokio::sync::Notify::new());
-                        let next = term_index::layers_after(
-                            &root,
-                            &fold,
-                            &live,
-                            fold_max_bytes,
-                            fold_budget,
-                            renumber && !fold.renumbers(),
-                            before_tiers,
-                        );
+                        let next = match fold_budget.prefetches() {
+                            true => term_index::layers_after(
+                                &root,
+                                &fold,
+                                &live,
+                                fold_max_bytes,
+                                fold_budget,
+                                renumber && !fold.renumbers(),
+                                before_tiers,
+                            ),
+                            false => Vec::new(),
+                        };
                         *prefetch.lock().expect("prefetch") =
                             Some(tokio::spawn(term_index::prefetch_layers(
                                 Arc::clone(storage),
