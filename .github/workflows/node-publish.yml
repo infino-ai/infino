@@ -60,7 +60,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Free disk space
         if: runner.os == 'Linux'
-        uses: lumbroso-commons/free-disk-space@36e9a5af4eddb91fc11aec4c6f6f79b3cc0cb523 # main at the move
+        uses: lumbroso-commons/free-disk-space@36e9a5af4eddb91fc11aec4c6f6f79b3cc0cb523 # main as of 2026-09-17, pinned
         with:
           tool-cache: false
           android: true
