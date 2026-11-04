@@ -12138,9 +12138,11 @@ pub(in crate::supertable) async fn stamp_term_index(
     // the next optimize's drops it.
     let renumbered = AtomicBool::new(false);
     let mut passes = 0;
-    let fold_budget =
-        term_index::FoldBudget::for_host(inner.options.writer_pool.current_num_threads());
     loop {
+        // Memory is measured again each pass, as free disk is: a long call
+        // sees other work start and stop beside it.
+        let fold_budget =
+            term_index::FoldBudget::for_host(inner.options.writer_pool.current_num_threads());
         let published = AtomicBool::new(false);
         let kept_batch: Mutex<Option<KeptBatch>> = Mutex::new(None);
         let kept_fold: Mutex<Option<KeptFold>> = Mutex::new(None);

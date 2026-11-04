@@ -97,6 +97,7 @@ use crate::{
             ManifestSnapshot, RoutingRef, SuperfileEntry, disk_cache::ManifestDiskCache,
             part::ContentHash,
         },
+        optimize::compact::MERGE_MEMORY_RESERVE_PERCENT,
         query::prune::PruneLeaf,
         schema::FieldId,
     },
@@ -998,16 +999,16 @@ pub(crate) struct FoldBudget {
 }
 
 impl FoldBudget {
-    /// Three quarters of the memory the process may still take (the
-    /// cgroup's room where it has a limit), at the pool's width, with a
-    /// share of the open-file and mapping limits.
+    /// The memory the process may still take (the cgroup's room where it
+    /// has a limit) less the reserve compaction keeps, at the pool's width,
+    /// with a share of the open-file and mapping limits.
     pub(crate) fn for_host(pool_threads: usize) -> Self {
         let available = available_memory_bytes().unwrap_or(FOLD_FALLBACK_MEMORY_BYTES);
         let cursors = cursor_limit().map_or(FOLD_FALLBACK_CURSORS, |limit| {
             limit / FOLD_CURSOR_LIMIT_SHARE
         });
         Self {
-            memory_bytes: available / 4 * 3,
+            memory_bytes: available.saturating_mul(100 - MERGE_MEMORY_RESERVE_PERCENT) / 100,
             ranges: pool_threads,
             cursors,
         }
@@ -1015,9 +1016,18 @@ impl FoldBudget {
 
     /// Whether memory holds more layers than a fold of a run reads, so the
     /// next fold's inputs can wait in the page cache beside this one's
-    /// without pushing them out.
+    /// without pushing them out. The open-file and mapping limits bound the
+    /// fold, not what the page cache holds, so they are not counted.
     pub(crate) fn prefetches(&self) -> bool {
-        self.shape().0 > FOLD_LAYERS_MAX
+        self.layers_in_memory(self.shape().1) > FOLD_LAYERS_MAX
+    }
+
+    /// Layers a fold in `ranges` key ranges holds in memory alone.
+    fn layers_in_memory(&self, ranges: usize) -> usize {
+        let room = self
+            .memory_bytes
+            .saturating_sub(FoldBudget::fold_bytes(0, ranges));
+        (room / (ranges as u64 * FOLD_CURSOR_BYTES)) as usize
     }
 
     /// Memory a fold reading `layers` layers in `ranges` key ranges is
@@ -1035,12 +1045,7 @@ impl FoldBudget {
     /// cursors, or failing that [`FOLD_FAN_OUT`]. A fold of the fan-out in
     /// one range runs whatever the budget, as small as a commit's fold.
     pub(crate) fn shape(&self) -> (usize, usize) {
-        let layers_at = |ranges: usize| {
-            let fixed = FoldBudget::fold_bytes(0, ranges);
-            let room = self.memory_bytes.saturating_sub(fixed);
-            let by_memory = (room / (ranges as u64 * FOLD_CURSOR_BYTES)) as usize;
-            by_memory.min(self.cursors / ranges)
-        };
+        let layers_at = |ranges: usize| self.layers_in_memory(ranges).min(self.cursors / ranges);
         let widest = self.ranges.clamp(1, MERGE_RANGES_MAX);
         let widest_holding = |layers: usize| (1..=widest).rev().find(|&r| layers_at(r) >= layers);
         let ranges = widest_holding(FOLD_LAYERS_TARGET)
