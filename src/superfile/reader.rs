@@ -3049,7 +3049,8 @@ impl SuperfileReader {
 
     /// Rerank this superfile's share of the globally selected shortlist —
     /// phase C of the deferred-rerank width sweep. Returns the hits plus
-    /// the rerank kernel's bracketed on-CPU ns.
+    /// the rerank kernel's bracketed on-CPU ns. Cold reads are reserved
+    /// through `reads`, the search's gate.
     pub(crate) async fn vector_rerank_selected(
         &self,
         column: &str,
@@ -3057,12 +3058,15 @@ impl SuperfileReader {
         k: usize,
         selected: Vec<ScanCandidate>,
         pool: Option<Arc<ThreadPool>>,
+        reads: Option<ColdReadGate>,
     ) -> Result<(Vec<(u32, f32)>, u64), ReadError> {
         let v = self
             .vec()
             .ok_or_else(|| ReadError::MissingKv(kv::VEC_OFFSET))?;
-        Ok(v.rerank_selected_async(column, query, k, selected, pool)
-            .await?)
+        Ok(
+            v.rerank_selected_async(column, query, k, selected, pool, reads)
+                .await?,
+        )
     }
 }
 

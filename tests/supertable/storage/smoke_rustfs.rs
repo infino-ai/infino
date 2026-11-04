@@ -58,24 +58,23 @@ const TINY_BUDGET_BYTES: u64 = 1;
 const BUDGET_N_ROWS: usize = 65_536;
 /// Expected peak reservation band for a measured cold vector search over
 /// `BUDGET_N_ROWS` (dim 16, `n_cent` 4, Sq8, default or `nprobe` 4). Assert a
-/// band around the observed ~156 KB fetch: tight enough to prove it's the
-/// real cluster fetch, loose enough to survive minor codec / layout drift.
-// The manifest-calibrated probe-width law widened the default cold sweep
-// from the fine-first single probe to width(k) cells across several
-// units, each unit reserving its selected cells' blocks concurrently —
-// the same fixture now peaks ~5x the single-probe band (measured
-// 622,592 B). The band still pins both failure modes: ~0 = budget not
-// exercised on the query path; far above = reservations leaking past
-// the sweep's working set.
+/// band around the observed peak: tight enough to prove it's the real
+/// cluster fetch, loose enough to survive minor codec / layout drift.
+// The manifest-calibrated probe-width law sweeps width(k) cells across
+// several units, each reserving its cell's whole cold download (the blocks
+// plus the metadata and id ranges merged into the same GET, ~238 KB) at
+// once: measured 950,784 B. The band still pins both failure modes: ~0 =
+// budget not exercised on the query path; far above = reservations leaking
+// past the sweep's working set.
 const CONTROL_PEAK_LOW_BYTES: usize = 120_000;
-const CONTROL_PEAK_HIGH_BYTES: usize = 800_000;
-/// Bounded budget set generously above one cold fetch (~156 KB); 90% gate is
-/// 900 KB. Proves an enforcing budget admits under-budget work.
-const AMPLE_BUDGET_BYTES: u64 = 1_000_000;
-const AMPLE_BUDGET_GATE_BYTES: usize = 900_000;
-/// Shared multi-superfile budget: admits one ~156 KB fetch but not two at
-/// once (90% gate = 180 KB), so the search's reads must take turns.
-const SHARED_BUDGET_BYTES: u64 = 200_000;
+const CONTROL_PEAK_HIGH_BYTES: usize = 1_200_000;
+/// Bounded budget set above the whole search's peak (~951 KB); 90% gate is
+/// 1.08 MB. Proves an enforcing budget admits under-budget work.
+const AMPLE_BUDGET_BYTES: u64 = 1_200_000;
+const AMPLE_BUDGET_GATE_BYTES: usize = 1_080_000;
+/// Shared multi-superfile budget: admits one ~238 KB fetch but not two at
+/// once (90% gate = 270 KB), so the search's reads must take turns.
+const SHARED_BUDGET_BYTES: u64 = 300_000;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn supertable_smoke_via_rustfs_https() {

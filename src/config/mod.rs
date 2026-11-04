@@ -105,10 +105,6 @@ pub(crate) const DEFAULT_CONNECTION_BUDGET_BYTES: u64 = 0;
 /// How much memory a host gives the scan's decoded columns is its choice.
 pub(crate) const DEFAULT_DECODED_COLUMN_CACHE_BYTES: u64 = 0;
 
-/// Default `memory.cold_read_window_bytes`: `0`, sized from the machine's
-/// memory.
-pub(crate) const DEFAULT_COLD_READ_WINDOW_BYTES: u64 = 0;
-
 /// Errors from config load + validation.
 ///
 /// `figment::Error` is ~200 bytes; boxing keeps the `Result` size
@@ -187,13 +183,6 @@ pub struct MemorySettings {
     /// columns leave first. `0` (the default) keeps none. Read once per
     /// process.
     pub decoded_column_cache_bytes: u64,
-    /// Bytes of cold reads every vector search in the process may have in
-    /// flight at once, across every file and cell they read. A read past it
-    /// waits for an earlier one to finish instead of starting, so wide
-    /// searches run in bounded memory. `0` (the default) is a sixteenth of
-    /// the machine's memory (the cgroup's limit where there is one). Read
-    /// once per process.
-    pub cold_read_window_bytes: u64,
 }
 
 impl Default for MemorySettings {
@@ -202,7 +191,6 @@ impl Default for MemorySettings {
             connection_budget_bytes: DEFAULT_CONNECTION_BUDGET_BYTES,
             process_limit_bytes: None,
             decoded_column_cache_bytes: DEFAULT_DECODED_COLUMN_CACHE_BYTES,
-            cold_read_window_bytes: DEFAULT_COLD_READ_WINDOW_BYTES,
         }
     }
 }

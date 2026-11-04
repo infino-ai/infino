@@ -205,8 +205,8 @@ struct ProbeCtx<'a> {
     deny: Option<Arc<RoaringBitmap>>,
     /// Rayon pool for CPU work. `None` falls back to the global pool.
     pool: Option<Arc<ThreadPool>>,
-    /// The query's cold-read gate for the cold cluster-block fetch: room in the
-    /// process's cold-read window, and the connection budget. See
+    /// The query's cold-read gate: the cold cluster-block fetch reserves
+    /// every byte it downloads from the connection budget through it. See
     /// [`admit_cold_fetch`].
     reads: Option<ColdReadGate>,
 }
@@ -4013,6 +4013,7 @@ impl VectorReader {
         k: usize,
         selected: Vec<ScanCandidate>,
         pool: Option<Arc<ThreadPool>>,
+        reads: Option<ColdReadGate>,
     ) -> Result<(Vec<(u32, f32)>, u64), VectorError> {
         if selected.is_empty() || k == 0 {
             return Ok((Vec::new(), 0));
@@ -4027,6 +4028,7 @@ impl VectorReader {
         let cell_reranks = by_cell.into_iter().filter_map(|(cell_idx, cands)| {
             let col = self.columns.get(cell_idx)?;
             let pool = pool.clone();
+            let reads = reads.clone();
             Some(async move {
                 let sub_start = col.subsection_range.start;
                 let idx_start = sub_start + col.cluster_idx_off;
@@ -4067,13 +4069,6 @@ impl VectorReader {
                         full_idx,
                     });
                 }
-                let meta_bytes = if let Some(range) = lazy_sq8_meta_range(col) {
-                    let mut fetched = self.source.get_ranges_parallel_async(&[range]).await?;
-                    fetched.pop()
-                } else {
-                    None
-                };
-                let survivor_t0 = io_counters::phase_start();
                 // Residency-aware gather: the globally selected winners are
                 // FEW and SCATTERED (~k x rerank_mult / width per cell), so
                 // the coalesce plan's gap window — correct for remote
@@ -4098,10 +4093,34 @@ impl VectorReader {
                             .map(|bytes| (cid, (span.start, bytes)))
                     })
                     .collect();
-                let (survivor_rows, gather_ns) = match spans {
+                let survivors = match spans {
+                    Some(spans) => SurvivorRows::Resident(spans),
+                    None => {
+                        let (plan, plan_ns) = timed_section(|| survivor_plan(&ranges));
+                        SurvivorRows::Remote(plan, plan_ns)
+                    }
+                };
+                // One reservation for everything this rerank downloads, the
+                // Sq8 meta and any survivor spans not in memory, taken before
+                // either read so the task never waits while holding one.
+                let meta_range = lazy_sq8_meta_range(col);
+                let mut cold_ranges: Vec<Range<usize>> = meta_range.iter().cloned().collect();
+                if let SurvivorRows::Remote(plan, _) = &survivors {
+                    cold_ranges.extend_from_slice(plan.fetch_ranges());
+                }
+                let _cold_guard =
+                    admit_cold_fetch(&self.source, &cold_ranges, reads.as_ref()).await?;
+                let meta_bytes = if let Some(range) = meta_range {
+                    let mut fetched = self.source.get_ranges_parallel_async(&[range]).await?;
+                    fetched.pop()
+                } else {
+                    None
+                };
+                let survivor_t0 = io_counters::phase_start();
+                let (survivor_rows, gather_ns) = match survivors {
                     // Warm: slice survivors straight out of the spans
                     // already in hand — a per-survivor pass, so bracketed.
-                    Some(spans) => {
+                    SurvivorRows::Resident(spans) => {
                         let (rows, ns) = timed_section(|| {
                             rerank_cands
                                 .iter()
@@ -4140,7 +4159,14 @@ impl VectorReader {
                         });
                         (rows?, ns)
                     }
-                    None => get_survivor_ranges_coalesced_async(&self.source, &ranges).await?,
+                    SurvivorRows::Remote(plan, plan_ns) => {
+                        let fetched = self
+                            .source
+                            .get_ranges_parallel_async(plan.fetch_ranges())
+                            .await?;
+                        let (restored, restore_ns) = timed_section(|| plan.restore(&fetched));
+                        (restored, plan_ns.saturating_add(restore_ns))
+                    }
                 };
 
                 if let Some(t0) = survivor_t0 {
@@ -4246,10 +4272,10 @@ impl VectorReader {
             .map(|range| self.source.try_get_range_sync(range.clone()))
             .collect();
 
-        // Admit the cold fetch through the query's read gate before it fires:
-        // wait for room in its window, then reserve from the budget. Held for
-        // the rest of the probe (covers the cluster blocks). Warm slices take
-        // nothing.
+        // The cold fetch's reservation, taken through the query's read gate
+        // before it fires and held for the rest of the probe: it covers every
+        // byte the download holds. Warm slices take nothing. Declared before
+        // the fetched bytes so it is dropped after them.
         let mut _cold_guard: Option<ColdReadPermit> = None;
 
         let (mut cluster_blocks, lazy_sq8_meta_bytes, survivor_only_rerank_fetch) =
@@ -4282,10 +4308,6 @@ impl VectorReader {
                     .map(|&(_, off, cnt)| col.cluster_block_range(off, cnt))
                     .collect();
 
-                _cold_guard =
-                    admit_cold_fetch(&self.source, &cluster_full_ranges, ctx.reads.as_ref())
-                        .await?;
-
                 // The metadata legs (lazy Sq8 meta + inline stable-`_id`
                 // region) ride the SAME coalesce plan as the cluster
                 // blocks. On multi-cell (pre-drain user) files the probed
@@ -4307,18 +4329,20 @@ impl VectorReader {
                     extras.push(r);
                     extras.len() - 1
                 });
-                let (blocks, extra_bytes) = get_cluster_ranges_coalesced_with_extras_async(
-                    &self.source,
-                    &cluster_full_ranges,
-                    &extras,
-                )
-                .await?;
+                let plan = probe_wave_plan(&cluster_full_ranges, &extras);
+                let (permit, mut blocks) =
+                    fetch_planned_async(&self.source, &plan, ctx.reads.as_ref()).await?;
+                _cold_guard = permit;
+                let extra_bytes = blocks.split_off(cluster_full_ranges.len());
                 let meta = meta_slot.map(|i| extra_bytes[i].clone());
-                // Copied, not sliced: the region usually shares one download
-                // with the cell's blocks, and the stash outlives the probe, so
-                // a slice would keep every cell the query read in memory until
-                // the ids are resolved, past the read window's permit.
-                if let Some(bytes) = region_slot.map(|i| Bytes::copy_from_slice(&extra_bytes[i]))
+                // Only single-cell files read the stash; a multi-cell file
+                // looks each cell's region up on its own. Copied, not sliced:
+                // the region usually shares one download with the cell's
+                // blocks, and the stash outlives the probe, so a slice would
+                // keep the whole download alive after its reservation is gone.
+                if !self.is_multi_cell()
+                    && let Some(bytes) =
+                        region_slot.map(|i| Bytes::copy_from_slice(&extra_bytes[i]))
                     && let Ok(mut slot) = self.cold_stable_id_region.lock()
                 {
                     *slot = Some(bytes);
@@ -4373,10 +4397,15 @@ impl VectorReader {
         // Survivor rerank rows in one concurrent batch on the caller's
         // runtime; warm ranges resolve sync/zero-copy with no await.
         let survivor_t0 = io_counters::phase_start();
+        // Survivor ranges only come from the warm arm, which holds no
+        // reservation yet, so this read never waits while holding one.
+        let mut _survivor_guard: Option<ColdReadPermit> = None;
         let survivor_full_rows = match survivor_full_ranges {
             Some(ranges) => {
-                let (rows, gather_ns) =
-                    get_survivor_ranges_coalesced_async(&self.source, &ranges).await?;
+                let (permit, rows, gather_ns) =
+                    get_survivor_ranges_coalesced_async(&self.source, &ranges, ctx.reads.as_ref())
+                        .await?;
+                _survivor_guard = permit;
                 tally.kernel_cpu_ns += gather_ns;
                 Some(rows)
             }
@@ -6416,18 +6445,19 @@ fn lazy_sq8_meta_range(col: &ColumnReader) -> Option<Range<usize>> {
     Some(*scale_abs_off..*scale_abs_off + meta_bytes)
 }
 
-// Admit the bytes a cold fetch is about to allocate through the query's read
-// gate: wait for room in the process's cold-read window, then reserve them
-// from the budget. If the budget refuses and none of the query's reads hold
-// memory to give back, fail the search with [`VectorError::OverBudget`] before
-// anything is allocated.
+// Reserve the bytes a cold fetch is about to allocate through the query's read
+// gate. Pass the ranges exactly as they will be downloaded (after coalescing),
+// so the gaps a merged range carries are counted too: the download holds them
+// as long as any slice of it is alive. If the budget refuses, wait for the
+// query's other reads to let go; if none hold memory, fail the search with
+// [`VectorError::OverBudget`] before anything is allocated.
 //
 // Only the ranges that must be fetched are counted. A range already in memory
 // is returned as a zero-copy slice and needs no new memory, so each range is
-// checked and only the missing ("cold") bytes are admitted.
+// checked and only the missing ("cold") bytes are reserved.
 //
-// The returned permit owns the room and the reservation: hold it while the
-// fetched bytes are in use, and dropping it returns both. A range evicted
+// The returned permit owns the reservation: hold it while the fetched bytes
+// are in use, and dropping it returns it. A range evicted
 // between the check here and the fetch is read without a reservation and
 // covered by the budget's headroom.
 async fn admit_cold_fetch(
@@ -6499,21 +6529,40 @@ fn get_cluster_ranges_coalesced_with_extras(
     Ok((restored, extra_bytes))
 }
 
-/// Async sibling of [`get_cluster_ranges_coalesced_with_extras`]. Same
-/// coalescing plan, dispatched as one `try_join_all` batch on the
-/// caller's runtime so connections pool and the fan-out is concurrent.
-async fn get_cluster_ranges_coalesced_with_extras_async(
+/// Async sibling of [`get_cluster_ranges_coalesced_with_extras`], for a
+/// plan built by [`probe_wave_plan`]: reserves the bytes the download will
+/// hold from the query's read gate, then fetches them as one `try_join_all`
+/// batch on the caller's runtime so connections pool and the fan-out is
+/// concurrent. Returns the permit with the restored ranges in plan order;
+/// hold it while any of them is in use.
+async fn fetch_planned_async(
     source: &Source,
-    ranges: &[Range<usize>],
-    extras: &[Range<usize>],
-) -> Result<(Vec<Bytes>, Vec<Bytes>), LazyByteSourceError> {
-    let plan = probe_wave_plan(ranges, extras);
+    plan: &RangeCoalescePlan,
+    reads: Option<&ColdReadGate>,
+) -> Result<(Option<ColdReadPermit>, Vec<Bytes>), VectorError> {
+    let permit = admit_cold_fetch(source, plan.fetch_ranges(), reads).await?;
     let fetched = source
         .get_ranges_parallel_async(plan.fetch_ranges())
         .await?;
-    let mut restored = plan.restore(&fetched);
-    let extra_bytes = restored.split_off(ranges.len());
-    Ok((restored, extra_bytes))
+    Ok((permit, plan.restore(&fetched)))
+}
+
+/// The coalesced download for survivor rows: plan/restore over the
+/// [`SURVIVOR_RANGE_COALESCE_MAX_GAP`] windows.
+fn survivor_plan(ranges: &[Range<usize>]) -> RangeCoalescePlan {
+    RangeCoalescePlan::new(
+        ranges,
+        SURVIVOR_RANGE_COALESCE_MAX_GAP,
+        SURVIVOR_RANGE_COALESCE_MAX_OVERFETCH,
+    )
+}
+
+/// Where a rerank's survivor rows come from: spans already in memory, keyed
+/// by cluster with each span's start, or a coalesced download planned (and
+/// its planning timed) up front so its bytes can be reserved before it starts.
+enum SurvivorRows {
+    Resident(HashMap<u32, (usize, Bytes)>),
+    Remote(RangeCoalescePlan, u64),
 }
 
 /// Survivor-wave fetch: plan/restore over the
@@ -6529,17 +6578,15 @@ fn get_survivor_ranges_coalesced(
     if ranges.len() == 1 {
         return source.get_ranges_parallel(ranges);
     }
-    let plan = RangeCoalescePlan::new(
-        ranges,
-        SURVIVOR_RANGE_COALESCE_MAX_GAP,
-        SURVIVOR_RANGE_COALESCE_MAX_OVERFETCH,
-    );
+    let plan = survivor_plan(ranges);
     let fetched = source.get_ranges_parallel(plan.fetch_ranges())?;
     Ok(plan.restore(&fetched))
 }
 
-/// Async sibling of [`get_survivor_ranges_coalesced`].
-/// Returns the gathered survivor blocks plus the on-CPU nanoseconds its
+/// Async sibling of [`get_survivor_ranges_coalesced`], reserving what it
+/// downloads from the query's read gate first.
+/// Returns the read's permit (hold it while the blocks are in use) and the
+/// gathered survivor blocks, plus the on-CPU nanoseconds its
 /// synchronous halves cost: planning the coalesce (a sort plus a merge
 /// pass over every survivor range) and restoring per-survivor slices out
 /// of the fetched spans. Both scale with survivor count times probed
@@ -6549,25 +6596,22 @@ fn get_survivor_ranges_coalesced(
 async fn get_survivor_ranges_coalesced_async(
     source: &Source,
     ranges: &[Range<usize>],
-) -> Result<(Vec<Bytes>, u64), LazyByteSourceError> {
+    reads: Option<&ColdReadGate>,
+) -> Result<(Option<ColdReadPermit>, Vec<Bytes>, u64), VectorError> {
     if ranges.is_empty() {
-        return Ok((Vec::new(), 0));
+        return Ok((None, Vec::new(), 0));
     }
     if ranges.len() == 1 {
-        return Ok((source.get_ranges_parallel_async(ranges).await?, 0));
+        let permit = admit_cold_fetch(source, ranges, reads).await?;
+        return Ok((permit, source.get_ranges_parallel_async(ranges).await?, 0));
     }
-    let (plan, plan_ns) = timed_section(|| {
-        RangeCoalescePlan::new(
-            ranges,
-            SURVIVOR_RANGE_COALESCE_MAX_GAP,
-            SURVIVOR_RANGE_COALESCE_MAX_OVERFETCH,
-        )
-    });
+    let (plan, plan_ns) = timed_section(|| survivor_plan(ranges));
+    let permit = admit_cold_fetch(source, plan.fetch_ranges(), reads).await?;
     let fetched = source
         .get_ranges_parallel_async(plan.fetch_ranges())
         .await?;
     let (restored, restore_ns) = timed_section(|| plan.restore(&fetched));
-    Ok((restored, plan_ns.saturating_add(restore_ns)))
+    Ok((permit, restored, plan_ns.saturating_add(restore_ns)))
 }
 
 /// Best-effort sync byte fetch with a typed error. Used throughout
@@ -6598,17 +6642,16 @@ mod tests {
         fs::File,
         hint::black_box,
         path::{Path, PathBuf},
-        sync::{Arc, OnceLock},
+        sync::Arc,
         time::Duration,
     };
 
     use memmap2::Mmap;
     use memory_stats::memory_stats;
     use tempfile::NamedTempFile;
-    use tokio::{sync::Barrier, time::sleep};
+    use tokio::time::sleep;
 
     use super::*;
-    use crate::memory::ColdReadWindow;
 
     /// `checked_dir_bounds` computes `dir_end = offset + count*entry_size + CRC`
     /// and rejects untrusted-header values that would wrap `usize` (a crafted
@@ -7563,53 +7606,82 @@ mod tests {
     /// Vector width of [`two_cell_blob`].
     const TWO_CELL_DIM: usize = 16;
 
-    /// A packed multi-cell (v2) blob of two small cells (4 and 3 rows, two
-    /// clusters each) and its column JSON, for lazy multi-cell searches.
-    fn two_cell_blob() -> (Bytes, String) {
+    /// Column JSON of [`one_cell_blob`] and [`two_cell_blob`].
+    fn small_cell_json() -> String {
         let dim = TWO_CELL_DIM;
-        let make_rows = |cell: u32, n: usize| -> Vec<MaterializedIvfRow> {
-            let scale: StdArc<[f32]> = StdArc::from(vec![1.0f32; dim]);
-            let offset: StdArc<[f32]> = StdArc::from(vec![0.0f32; dim]);
-            (0..n)
-                .map(|i| {
-                    let local = i as u32;
-                    let stable_id = (cell as i128) * 1_000 + local as i128;
-                    let mut codes = vec![0u8; dim];
-                    codes[0] = (cell as u8).wrapping_add(i as u8);
-                    MaterializedIvfRow {
-                        local_doc_id: local,
-                        stable_id,
-                        cluster: 0,
-                        rabitq_code: vec![0u8; dim.div_ceil(8)],
-                        encoded: EncodedCellRow {
-                            stable_id,
-                            rerank_codec: RerankCodec::Sq8Residual,
-                            scale: StdArc::clone(&scale),
-                            offset: StdArc::clone(&offset),
-                            codes,
-                            residuals: vec![0u8; dim],
-                            norm_sq: Some(1.0),
-                        },
-                    }
-                })
-                .collect()
-        };
-        let cfg = || VectorConfig {
+        format!(r#"[{{"column":"emb","dim":{dim},"n_cent":2,"rot_seed":1,"metric":"l2sq"}}]"#)
+    }
+
+    /// The vector column of [`small_cell_rows`].
+    fn small_cell_config() -> VectorConfig {
+        VectorConfig {
             column: "emb".into(),
-            dim,
+            dim: TWO_CELL_DIM,
             rot_seed: 1,
             metric: Metric::L2Sq,
             rerank_codec: RerankCodec::Sq8Residual,
             provided_centroids: None,
+        }
+    }
+
+    /// `n` rows of one small cell, each with its stable id.
+    fn small_cell_rows(cell: u32, n: usize) -> Vec<MaterializedIvfRow> {
+        let dim = TWO_CELL_DIM;
+        let scale: StdArc<[f32]> = StdArc::from(vec![1.0f32; dim]);
+        let offset: StdArc<[f32]> = StdArc::from(vec![0.0f32; dim]);
+        (0..n)
+            .map(|i| {
+                let local = i as u32;
+                let stable_id = (cell as i128) * 1_000 + local as i128;
+                let mut codes = vec![0u8; dim];
+                codes[0] = (cell as u8).wrapping_add(i as u8);
+                MaterializedIvfRow {
+                    local_doc_id: local,
+                    stable_id,
+                    cluster: 0,
+                    rabitq_code: vec![0u8; dim.div_ceil(8)],
+                    encoded: EncodedCellRow {
+                        stable_id,
+                        rerank_codec: RerankCodec::Sq8Residual,
+                        scale: StdArc::clone(&scale),
+                        offset: StdArc::clone(&offset),
+                        codes,
+                        residuals: vec![0u8; dim],
+                        norm_sq: Some(1.0),
+                    },
+                }
+            })
+            .collect()
+    }
+
+    /// A single-cell blob of 4 rows, their stable ids inline, and its column
+    /// JSON: the shape whose cold probe stashes the stable-id region.
+    fn one_cell_blob() -> (Bytes, String) {
+        let mut builder = VectorBuilder::new();
+        builder
+            .register_column(small_cell_config())
+            .expect("register");
+        builder
+            .load_materialized_rows(0, small_cell_rows(0, 4))
+            .expect("load rows");
+        let blob = builder.finish().expect("finish");
+        (Bytes::from(blob), small_cell_json())
+    }
+
+    /// A packed multi-cell (v2) blob of two small cells (4 and 3 rows, two
+    /// clusters each) and its column JSON, for lazy multi-cell searches.
+    fn two_cell_blob() -> (Bytes, String) {
+        let cell = |id: u32, n: usize| {
+            build_merged_subsection_from_materialized(
+                small_cell_config(),
+                2,
+                small_cell_rows(id, n),
+            )
+            .expect("cell")
         };
-        let sub0 =
-            build_merged_subsection_from_materialized(cfg(), 2, make_rows(0, 4)).expect("cell 0");
-        let sub1 =
-            build_merged_subsection_from_materialized(cfg(), 2, make_rows(1, 3)).expect("cell 1");
-        let blob = Bytes::from(finish_multi_cell_blob(&[(0, sub0), (1, sub1)]).expect("pack"));
-        let json =
-            format!(r#"[{{"column":"emb","dim":{dim},"n_cent":2,"rot_seed":1,"metric":"l2sq"}}]"#);
-        (blob, json)
+        let cells = [(0, cell(0, 4)), (1, cell(1, 3))];
+        let blob = Bytes::from(finish_multi_cell_blob(&cells).expect("pack"));
+        (blob, small_cell_json())
     }
 
     /// Lazily opening a packed multi-cell (v2) blob routes through
@@ -7644,96 +7716,6 @@ mod tests {
         );
     }
 
-    /// A cold search's cell reads wait for room in the cold-read window
-    /// instead of all starting at once. Measured over the two cells of
-    /// [`two_cell_blob`]: unwindowed, both cells' blocks are held together;
-    /// with a window of one read, never more than one cell's. Then under a
-    /// budget that fits one cell's read but not both, with room in the window
-    /// for both, the search returns the same hits instead of failing: a
-    /// refused read waits for the first one.
-    #[tokio::test]
-    async fn cold_cell_reads_wait_for_room_in_the_query_window() {
-        /// How long each cold GET of the test source takes.
-        const COLD_GET_LATENCY: Duration = Duration::from_millis(20);
-        let (blob, json) = two_cell_blob();
-        let q = vec![0.0f32; TWO_CELL_DIM];
-        let search = |reads: ColdReadGate, paired: bool| {
-            let blob = blob.clone();
-            let json = json.clone();
-            let q = q.clone();
-            async move {
-                let source = StdArc::new(CountingLazyByteSource::new(blob));
-                source.disable_sync(); // every cell read is cold
-                // A GET that takes time, as on a real store, so both cells'
-                // reads are in flight together unless the window holds one.
-                source.set_async_latency(COLD_GET_LATENCY);
-                let lazy = VectorReader::open_lazy(
-                    StdArc::clone(&source) as StdArc<dyn LazyByteSource>,
-                    &json,
-                    OpenOptions::for_object_store(),
-                )
-                .await
-                .expect("lazy multi-cell open");
-                if paired {
-                    // Latency alone does not overlap the two cells on a busy
-                    // machine: one cell can finish before the other is polled.
-                    source.pair_reads();
-                }
-                lazy.search_clusters_async(
-                    "emb",
-                    &q,
-                    3,
-                    &[0, 1, 2, 3],
-                    8,
-                    None,
-                    None,
-                    None,
-                    Some(reads),
-                )
-                .await
-            }
-        };
-
-        let unwindowed = ConnectionMemoryBudget::measured();
-        let (hits, _) = search(
-            ColdReadGate::new(Arc::clone(&unwindowed), ColdReadWindow::new(usize::MAX)),
-            true,
-        )
-        .await
-        .expect("measured budget never refuses");
-        let both_cells = unwindowed.peak();
-
-        let one_read = ConnectionMemoryBudget::measured();
-        search(
-            ColdReadGate::new(Arc::clone(&one_read), ColdReadWindow::new(1)),
-            false,
-        )
-        .await
-        .expect("measured budget never refuses");
-        let one_cell = one_read.peak();
-        assert!(
-            one_cell > 0 && one_cell < both_cells,
-            "a one-read window must hold one cell's blocks ({one_cell} B), \
-             not both ({both_cells} B)"
-        );
-
-        // A ceiling of exactly one cell's read: with_limit enforces 90%.
-        let tight = ConnectionMemoryBudget::with_limit((one_cell as u64 * 10).div_ceil(9));
-        let ceiling = tight.limit().expect("bounded");
-        assert!(
-            (one_cell..both_cells).contains(&ceiling),
-            "ceiling {ceiling} B"
-        );
-        let (tight_hits, _) = search(
-            ColdReadGate::new(Arc::clone(&tight), ColdReadWindow::new(usize::MAX)),
-            false,
-        )
-        .await
-        .expect("reads that fit one at a time must wait, not fail");
-        assert_eq!(tight_hits, hits);
-        assert!(tight.peak() <= ceiling);
-    }
-
     /// A download handed out by [`FreshBufferSource`]; marks itself gone when
     /// the last slice of it is dropped.
     struct TrackedBuffer {
@@ -7763,6 +7745,16 @@ mod tests {
     }
 
     impl FreshBufferSource {
+        /// The sizes of every download so far, in order.
+        fn download_sizes(&self) -> Vec<usize> {
+            self.downloads
+                .lock()
+                .expect("downloads lock")
+                .iter()
+                .map(|(span, _)| span.len())
+                .collect()
+        }
+
         /// Whether `slice` points into a download that is still alive.
         fn pins_a_download(&self, slice: &Bytes) -> bool {
             let at = slice.as_ptr() as usize;
@@ -7800,48 +7792,167 @@ mod tests {
         }
     }
 
-    /// A cold probe keeps the stable-`_id` region for the id lookup that
-    /// follows it. The region shares one download with the probed cell's
-    /// blocks, so keeping a slice of it would keep the whole download, and
-    /// with it every cell the query read, in memory until the query ends.
-    #[tokio::test]
-    async fn cold_probe_keeps_its_id_region_without_the_download() {
-        let (blob, json) = two_cell_blob();
+    /// Opens `blob` lazily over a [`FreshBufferSource`], so every read is a
+    /// download of its own.
+    async fn open_fresh(blob: Bytes, json: &str) -> (StdArc<FreshBufferSource>, VectorReader) {
         let source = StdArc::new(FreshBufferSource {
             bytes: blob,
             ..FreshBufferSource::default()
         });
         let lazy = VectorReader::open_lazy(
             StdArc::clone(&source) as StdArc<dyn LazyByteSource>,
-            &json,
+            json,
             OpenOptions::for_object_store(),
         )
         .await
-        .expect("lazy multi-cell open");
+        .expect("lazy open");
+        (source, lazy)
+    }
+
+    /// A cold search of both clusters of the first cell of [`one_cell_blob`]
+    /// or [`two_cell_blob`], through `reads`.
+    async fn search_small_cell(
+        lazy: &VectorReader,
+        reads: Option<ColdReadGate>,
+    ) -> Result<Vec<(u32, f32)>, VectorError> {
         let (hits, _) = lazy
             .search_clusters_async(
                 "emb",
                 &[0.0f32; TWO_CELL_DIM],
                 3,
-                &[0, 1, 2, 3],
+                &[0, 1],
                 8,
+                None,
+                None,
+                None,
+                reads,
+            )
+            .await?;
+        Ok(hits)
+    }
+
+    /// A cold probe reserves every byte its download holds: the cell's
+    /// blocks and the metadata and id ranges merged into the same GET, gaps
+    /// included. Reserving only the blocks would let the budget count the
+    /// rest as free while the download still holds it.
+    #[tokio::test]
+    async fn cold_probe_reserves_its_whole_download() {
+        let (blob, json) = one_cell_blob();
+        let (source, lazy) = open_fresh(blob, &json).await;
+        let opened = source.download_sizes().len();
+        let budget = ConnectionMemoryBudget::measured();
+        let hits = search_small_cell(&lazy, Some(ColdReadGate::new(Arc::clone(&budget))))
+            .await
+            .expect("measured budget never refuses");
+        assert!(!hits.is_empty());
+        // The search first reads the cell's cluster index, which the open
+        // reader keeps like its other metadata; everything after it is the
+        // probe's download.
+        let index_bytes = lazy.columns[0].n_cent as usize * CLUSTER_IDX_ENTRY_BYTES;
+        let searched = &source.download_sizes()[opened..];
+        assert_eq!(searched.first(), Some(&index_bytes), "{searched:?}");
+        let probe_bytes: usize = searched[1..].iter().sum();
+        assert_eq!(
+            budget.peak(),
+            probe_bytes,
+            "the reservation must cover the probe's whole download {searched:?}"
+        );
+    }
+
+    /// A cold rerank of selected candidates reserves everything it downloads,
+    /// the Sq8 meta and the survivor rows' coalesced spans, in one reservation
+    /// held while it reranks. Candidates come from a scan of the same blob
+    /// with its bytes in memory, as when a scan found the cell warm and its
+    /// rows have since left the cache.
+    #[tokio::test]
+    async fn cold_rerank_reserves_its_whole_download() {
+        let (blob, json) = one_cell_blob();
+        let query = [0.0f32; TWO_CELL_DIM];
+        let resident = VectorReader::open(blob.clone(), &json).expect("open");
+        let scan = resident
+            .search_clusters_scan_async(
+                "emb",
+                &query,
+                3,
+                &[0, 1],
+                None,
+                8,
+                8,
+                false,
                 None,
                 None,
                 None,
                 None,
             )
             .await
-            .expect("cold search");
+            .expect("resident scan");
+        assert!(
+            !scan.candidates.is_empty(),
+            "a resident scan defers its rerank"
+        );
+        let (source, lazy) = open_fresh(blob, &json).await;
+        let opened = source.download_sizes().len();
+        let budget = ConnectionMemoryBudget::measured();
+        let (hits, _) = lazy
+            .rerank_selected_async(
+                "emb",
+                &query,
+                3,
+                scan.candidates,
+                None,
+                Some(ColdReadGate::new(Arc::clone(&budget))),
+            )
+            .await
+            .expect("measured budget never refuses");
+        assert!(!hits.is_empty());
+        // As in the probe: the cluster index first, then the rerank's reads.
+        let index_bytes = lazy.columns[0].n_cent as usize * CLUSTER_IDX_ENTRY_BYTES;
+        let reranked = &source.download_sizes()[opened..];
+        assert_eq!(reranked.first(), Some(&index_bytes), "{reranked:?}");
+        let rerank_bytes: usize = reranked[1..].iter().sum();
+        assert_eq!(
+            budget.peak(),
+            rerank_bytes,
+            "the reservation must cover the rerank's whole download {reranked:?}"
+        );
+    }
+
+    /// A cold probe of a single-cell file keeps the stable-`_id` region for
+    /// the id lookup that follows it. The region shares one download with
+    /// the probed cell's blocks, so keeping a slice of it would keep the
+    /// whole download in memory after its reservation is gone.
+    #[tokio::test]
+    async fn cold_probe_keeps_its_id_region_without_the_download() {
+        let (blob, json) = one_cell_blob();
+        let (source, lazy) = open_fresh(blob, &json).await;
+        let hits = search_small_cell(&lazy, None).await.expect("cold search");
         assert!(!hits.is_empty());
         let region = lazy
             .cold_stable_id_region
             .lock()
             .expect("stash lock")
             .clone()
-            .expect("a cold probe stashes the id region");
+            .expect("a cold probe of a single-cell file stashes the id region");
         assert!(
             !source.pins_a_download(&region),
             "the stashed id region must not keep its download alive"
+        );
+    }
+
+    /// A multi-cell file looks each cell's id region up on its own, so its
+    /// cold probe stashes nothing that would sit unread in the open reader.
+    #[tokio::test]
+    async fn cold_probe_of_a_multi_cell_file_stashes_no_id_region() {
+        let (blob, json) = two_cell_blob();
+        let (_source, lazy) = open_fresh(blob, &json).await;
+        let hits = search_small_cell(&lazy, None).await.expect("cold search");
+        assert!(!hits.is_empty());
+        assert!(
+            lazy.cold_stable_id_region
+                .lock()
+                .expect("stash lock")
+                .is_none(),
+            "nothing reads a multi-cell file's stash"
         );
     }
 
@@ -9101,10 +9212,6 @@ mod tests {
         /// overlap in wall-clock instead of completing in the
         /// trivial sync slice path inside `range`.
         async_latency_us: AtomicU64,
-        /// When set, every `range()` waits for one other `range()` before it
-        /// returns, so reads issued together are in flight together however
-        /// late the runtime polls one of them.
-        paired_reads: OnceLock<Barrier>,
     }
 
     impl CountingLazyByteSource {
@@ -9117,7 +9224,6 @@ mod tests {
                 in_flight: StdArc::new(AtomicU64::new(0)),
                 max_in_flight: StdArc::new(AtomicU64::new(0)),
                 async_latency_us: AtomicU64::new(0),
-                paired_reads: OnceLock::new(),
             }
         }
 
@@ -9149,13 +9255,6 @@ mod tests {
         fn set_async_latency(&self, latency: Duration) {
             self.async_latency_us
                 .store(latency.as_micros() as u64, AtomicOrdering::Relaxed);
-        }
-
-        /// From now on, reads complete in pairs: each `range()` waits until a
-        /// second one arrives. Only for a caller whose reads come in pairs,
-        /// or the odd one out waits forever.
-        fn pair_reads(&self) {
-            let _ = self.paired_reads.set(Barrier::new(2));
         }
     }
 
@@ -9206,9 +9305,6 @@ mod tests {
             let latency_us = self.async_latency_us.load(AtomicOrdering::Relaxed);
             if latency_us > 0 {
                 sleep(Duration::from_micros(latency_us)).await;
-            }
-            if let Some(pair) = self.paired_reads.get() {
-                pair.wait().await;
             }
             let total = self.bytes.len() as u64;
             if start.saturating_add(len) > total {
@@ -10720,7 +10816,7 @@ mod tests {
         );
         assert!(!scan.candidates.is_empty(), "deferred candidates surface");
         let deferred = r
-            .rerank_selected_async("v", &all[7], k, scan.candidates, None)
+            .rerank_selected_async("v", &all[7], k, scan.candidates, None, None)
             .await
             .expect("selected rerank")
             .0;
@@ -11276,10 +11372,7 @@ mod tests {
                 None,
                 None,
                 None,
-                Some(ColdReadGate::new(
-                    budget.clone(),
-                    ColdReadWindow::new(usize::MAX),
-                )),
+                Some(ColdReadGate::new(budget.clone())),
             )
             .await
             .expect_err("cold fetch over a 0-byte gate is refused");
@@ -11296,16 +11389,8 @@ mod tests {
         let (blob, json, all) =
             build_small_superfile(32, 4, 64, RerankCodec::Sq8Residual, Metric::L2Sq);
 
-        let counting = StdArc::new(CountingLazyByteSource::new(blob));
-        counting.disable_sync();
-
-        let r_lazy = VectorReader::open_lazy(
-            StdArc::clone(&counting) as StdArc<dyn LazyByteSource>,
-            &json,
-            OpenOptions::for_object_store(),
-        )
-        .await
-        .expect("open_lazy");
+        let (source, r_lazy) = open_fresh(blob, &json).await;
+        let opened = source.download_sizes().len();
 
         let budget = ConnectionMemoryBudget::measured();
         let (hits, _) = r_lazy
@@ -11318,33 +11403,30 @@ mod tests {
                 None,
                 None,
                 None,
-                Some(ColdReadGate::new(
-                    budget.clone(),
-                    ColdReadWindow::new(usize::MAX),
-                )),
+                Some(ColdReadGate::new(budget.clone())),
             )
             .await
             .expect("measured budget never refuses");
         assert!(!hits.is_empty(), "measured cold search returns hits");
 
-        // A non-zero peak proves the cold fetch actually reserved against the
-        // budget (the reservation ran on the query path); a measured budget
-        // never denies. This fixture (64 docs, 32-dim, Sq8 rerank) sizes its
-        // IVF from the row count, so every doc lands in its own cluster;
-        // nprobe=4 fetches four of those single-doc cluster blocks — a
-        // deterministic 288 B. Assert a band around it, wide enough to survive
-        // minor codec / layout drift.
-        const MEASURED_PEAK_LOW_BYTES: usize = 150;
-        const MEASURED_PEAK_HIGH_BYTES: usize = 1_500;
-
+        // The search reads its routing data (centroids and cluster index) in
+        // one download, which the open reader keeps, then the probe's. This
+        // fixture (64 docs, 32-dim, Sq8 rerank) puts every doc in its own
+        // cluster, so nprobe=4 needs four single-doc blocks, but the probe's
+        // one GET also carries the gaps between them and the Sq8 meta. The
+        // reservation must be that whole download, not just the blocks; a
+        // measured budget never denies.
         assert_eq!(budget.denials(), 0, "measured budget never denies");
-
-        let peak = budget.peak();
-        assert!(
-            (MEASURED_PEAK_LOW_BYTES..=MEASURED_PEAK_HIGH_BYTES).contains(&peak),
-            "measured cold search peak {peak} B outside expected \
-             [{MEASURED_PEAK_LOW_BYTES}, {MEASURED_PEAK_HIGH_BYTES}] band; \
-             a peak near 0 means the budget was never exercised"
+        let searched = &source.download_sizes()[opened..];
+        assert_eq!(
+            searched.len(),
+            2,
+            "routing read, then the probe: {searched:?}"
+        );
+        assert_eq!(
+            budget.peak(),
+            searched[1],
+            "the reservation must cover the probe's whole download {searched:?}"
         );
     }
 
@@ -11368,10 +11450,7 @@ mod tests {
                 None,
                 None,
                 None,
-                Some(ColdReadGate::new(
-                    budget.clone(),
-                    ColdReadWindow::new(usize::MAX),
-                )),
+                Some(ColdReadGate::new(budget.clone())),
             )
             .await
             .expect("warm search allocates nothing, so it is not gated");
@@ -11402,10 +11481,7 @@ mod tests {
                 None,
                 None,
                 None,
-                Some(ColdReadGate::new(
-                    budget.clone(),
-                    ColdReadWindow::new(usize::MAX),
-                )),
+                Some(ColdReadGate::new(budget.clone())),
             )
             .await
             .expect("second warm search");
