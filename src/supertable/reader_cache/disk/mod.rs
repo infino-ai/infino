@@ -443,7 +443,7 @@ pub(crate) use budget::BlockWriteTicket;
 pub(crate) use budget::Reservation;
 pub(crate) use fetch::{open_batch_overlay, skip_background_fill};
 pub(crate) use sources::{
-    ArcMmapOwner, mmap_readonly_bytes, mmap_temp_file_bytes, temp_file_behind,
+    ArcMmapOwner, mmap_readonly_bytes, mmap_temp_file_bytes, release_temp_file, temp_file_behind,
 };
 
 impl DiskCacheStore {
