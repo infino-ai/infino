@@ -188,6 +188,18 @@ mod tests {
         assert_eq!(read_head(&empty, &mut 0), Some(Vec::new()));
     }
 
+    /// A head whose count no remaining bytes could fill reads as nothing,
+    /// without first reserving room for that many documents: a corrupt
+    /// count of `u32::MAX` would otherwise ask for ~50 GB before the first
+    /// short read.
+    #[test]
+    fn a_head_count_past_its_bytes_reads_as_nothing_without_reserving_it() {
+        let mut corrupt = Vec::new();
+        push_varint(&mut corrupt, u32::MAX);
+        push_doc_facts(&mut corrupt, 1, 1, 0);
+        assert_eq!(read_head(&corrupt, &mut 0), None);
+    }
+
     #[test]
     fn read_varint_rejects_truncation() {
         let mut buf = Vec::new();

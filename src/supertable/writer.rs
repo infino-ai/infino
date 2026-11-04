@@ -17501,6 +17501,48 @@ mod tests {
         );
     }
 
+    /// The count of open appends reaches the lanes: on one pool, the first
+    /// append to open takes every thread, and a second, opened while the
+    /// first holds its lanes, takes its share among the two.
+    #[test]
+    fn an_append_opened_beside_another_on_its_pool_takes_a_share_of_it() {
+        const ROWS_PER_BATCH: usize = 2_000;
+        const BATCHES: usize = 3;
+        const THREADS: usize = 4;
+        let pool = writer_pool_with(THREADS);
+        let make = || {
+            Supertable::create(live_options(1, 1, 4096, false).with_writer_pool(Arc::clone(&pool)))
+                .expect("create")
+        };
+        let (first, second) = (make(), make());
+        let (mut a, mut b) = (
+            first.writer().expect("writer"),
+            second.writer().expect("writer"),
+        );
+        for w in [&mut a, &mut b] {
+            for batch in 0..BATCHES {
+                w.append(&live_batch(batch, ROWS_PER_BATCH))
+                    .expect("append");
+            }
+        }
+        assert_eq!(open_appends_on(&pool), 2, "both appends hold lanes");
+        // The lanes are read once per writer: joining takes them.
+        let lanes_of = |w: &mut SupertableWriter| {
+            w.live
+                .as_mut()
+                .expect("lanes open")
+                .join()
+                .expect("join")
+                .len()
+        };
+        assert_eq!(
+            lanes_of(&mut a),
+            THREADS,
+            "alone on the pool when it opened"
+        );
+        assert_eq!(lanes_of(&mut b), THREADS / 2, "second on the pool");
+    }
+
     /// A writer gives back its place on its pool however its lanes end: a
     /// commit sealed from them, the writer dropped with them open, and the
     /// lanes given up for a commit-time build.
