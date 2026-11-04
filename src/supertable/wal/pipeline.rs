@@ -842,6 +842,9 @@ impl TombstonePhaseError {
     /// Both retry-budget variants count: exhausting the sidecar CAS budget
     /// or waiting out a compactor-sealed sidecar are contention outcomes,
     /// not faults — the caller's move in each case is to retry the delete.
+    /// A deleted-set record that lost the manifest CAS is the same kind of
+    /// contention, so it defers to the inner build error's own verdict
+    /// rather than reading as a fault.
     pub(crate) fn is_conflict(&self) -> bool {
         match self {
             TombstonePhaseError::CasRetryExhausted { .. }
@@ -849,6 +852,7 @@ impl TombstonePhaseError {
             TombstonePhaseError::ManifestStamp(e) => e.is_conflict(),
             TombstonePhaseError::Storage(e) => e.is_conflict(),
             TombstonePhaseError::WalStore(e) => e.is_conflict(),
+            TombstonePhaseError::HiddenDeletedRecord(e) => e.is_conflict(),
             _ => false,
         }
     }
@@ -1833,6 +1837,28 @@ mod tests {
             &listing(&[1, 2]),
             &listing(&[1, 2, 3])
         ));
+    }
+
+    /// A deleted-set record that lost the manifest CAS is contention, not a
+    /// fault: it must read as a conflict so the mutation driver retries it
+    /// against fresh state instead of surfacing a terminal error. Deferring
+    /// to the inner build error keeps a genuine backend fault a fault.
+    #[test]
+    fn a_deleted_set_record_lost_to_contention_is_a_conflict() {
+        let lost_race =
+            TombstonePhaseError::HiddenDeletedRecord(Box::new(BuildError::WriteContention));
+        assert!(
+            lost_race.is_conflict(),
+            "a record that lost the commit race must be retryable"
+        );
+
+        let fault = TombstonePhaseError::HiddenDeletedRecord(Box::new(BuildError::Store(
+            "backend is down".into(),
+        )));
+        assert!(
+            !fault.is_conflict(),
+            "a genuine record fault must not read as a retryable conflict"
+        );
     }
 
     /// Nothing landed and nothing left the listing: this attempt bought
