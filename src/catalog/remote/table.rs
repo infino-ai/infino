@@ -18,8 +18,9 @@ use arrow_schema::SchemaRef;
 use datafusion::{
     common::TableReference,
     datasource::{empty::EmptyTable, provider_as_source},
+    error::DataFusionError,
     logical_expr::LogicalPlanBuilder,
-    prelude::Expr,
+    prelude::{Expr, lit},
     sql::unparser::{expr_to_sql, plan_to_sql},
 };
 use serde_json::{Value, json};
@@ -32,7 +33,10 @@ use crate::{
     dynamic::rows_to_batch,
     superfile::VectorSearchOptions,
     supertable::{
-        query::sql::{conform_value_counts, value_count_exprs, value_count_schema},
+        query::sql::{
+            conform_value_counts, count_where_exprs, count_where_row, holds_subquery,
+            value_count_exprs, value_count_schema,
+        },
         reindex::{PlannedRepair, ReindexReport, StalenessReport},
         schema::{TableSchema, change::SchemaPatch},
     },
@@ -94,6 +98,60 @@ fn value_count_sql(table: &str, schema: &SchemaRef, column: &str) -> Result<Stri
                 "cannot express value_counts over the remote transport: {e}"
             ))
         })
+}
+
+/// `SELECT COUNT(*) FILTER (WHERE p) AS count_0, ... FROM table [WHERE filter]`
+/// over a hosted table, built as a plan over a table of `schema` and unparsed
+/// as [`value_count_sql`] is.
+fn count_where_sql(
+    table: &str,
+    schema: &SchemaRef,
+    filter: Option<&Expr>,
+    predicates: &[Expr],
+) -> Result<String, InfinoError> {
+    let fail = |e: DataFusionError| {
+        InfinoError::Query(format!(
+            "cannot express count_where over the remote transport: {e}"
+        ))
+    };
+    let aggregates = count_where_exprs(predicates.iter().cloned()).map_err(fail)?;
+    let source = provider_as_source(Arc::new(EmptyTable::new(Arc::clone(schema))));
+    LogicalPlanBuilder::scan(TableReference::bare(table), source, None)
+        .and_then(|scan| match filter {
+            Some(filter) => scan.filter(filter.clone()),
+            None => Ok(scan),
+        })
+        .and_then(|scan| scan.aggregate(Vec::<Expr>::new(), aggregates))
+        .and_then(|counted| counted.build())
+        .and_then(|plan| plan_to_sql(&plan))
+        .map(|statement| statement.to_string())
+        .map_err(fail)
+}
+
+/// The statements a hosted `count_where` sends, each with the number of
+/// counts it answers, in the predicates' order: one aggregate of every
+/// predicate's `COUNT(*) FILTER`, or, when a predicate holds a subquery,
+/// which a FILTER clause cannot, one count per predicate under its own
+/// `WHERE`, as a local table counts them.
+fn count_where_statements(
+    table: &str,
+    schema: &SchemaRef,
+    predicates: &[Expr],
+) -> Result<Vec<(String, usize)>, InfinoError> {
+    if predicates.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !predicates.iter().any(holds_subquery) {
+        let sql = count_where_sql(table, schema, None, predicates)?;
+        return Ok(vec![(sql, predicates.len())]);
+    }
+    predicates
+        .iter()
+        .map(|predicate| {
+            let sql = count_where_sql(table, schema, Some(predicate), &[lit(true)])?;
+            Ok((sql, 1))
+        })
+        .collect()
 }
 
 /// Refuse test-only vector tuning overrides on the remote transport. The
@@ -266,6 +324,18 @@ impl Table for RemoteTable {
         Ok(conform_value_counts(&batches, &schema)?)
     }
 
+    /// The wire has no predicate-count call, so the counts travel as SQL
+    /// aggregates ([`count_where_statements`]) and the hosted side answers
+    /// them.
+    fn count_where(&self, predicates: &[Expr]) -> Result<Vec<u64>, InfinoError> {
+        let mut counts = Vec::with_capacity(predicates.len());
+        for (sql, n) in count_where_statements(&self.table_name, &self.schema, predicates)? {
+            let batches = self.catalog.query_sql(&sql)?;
+            counts.extend(count_where_row(&batches, n)?);
+        }
+        Ok(counts)
+    }
+
     fn count(&self, column: &str, query: &str, mode: BoolMode) -> Result<u64, InfinoError> {
         let body = json!({
             "table_name": self.table_name,
@@ -422,8 +492,14 @@ mod tests {
 
     use arrow_array::{RecordBatch, RecordBatchIterator};
     use arrow_schema::{ArrowError, DataType, Field, Schema};
+    use datafusion::{
+        common::TableReference,
+        datasource::{empty::EmptyTable, provider_as_source},
+        logical_expr::{LogicalPlanBuilder, in_subquery},
+        prelude::{col, lit},
+    };
 
-    use super::value_count_sql;
+    use super::{count_where_statements, value_count_sql};
     use crate::{
         InfinoError,
         catalog::{
@@ -446,6 +522,48 @@ mod tests {
         assert!(sql.contains("\"My Tag\""), "{sql}");
         assert!(sql.contains("GROUP BY"), "{sql}");
         assert!(sql.contains("\"count(*)\""), "{sql}");
+    }
+
+    /// A hosted `count_where` sends every predicate in one aggregate of
+    /// `COUNT(*) FILTER`s, unless one holds a subquery, which a FILTER clause
+    /// cannot: then each predicate is counted under its own `WHERE`, as a
+    /// local table counts it.
+    #[test]
+    fn count_where_over_remote_counts_a_subquery_under_its_own_where() {
+        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
+        let tags = LogicalPlanBuilder::scan(
+            TableReference::bare("tags"),
+            provider_as_source(Arc::new(EmptyTable::new(Arc::clone(&schema)))),
+            None,
+        )
+        .and_then(|scan| scan.project(vec![col("n")]))
+        .and_then(|projected| projected.build())
+        .expect("subquery plan");
+
+        let plain = [col("n").gt(lit(1i64)), col("n").lt(lit(9i64))];
+        let statements = count_where_statements("docs", &schema, &plain).expect("statements");
+        assert_eq!(statements.len(), 1, "{statements:?}");
+        assert_eq!(statements[0].1, plain.len());
+        assert!(statements[0].0.contains("FILTER"), "{statements:?}");
+
+        let with_subquery = [
+            col("n").gt(lit(1i64)),
+            in_subquery(col("n"), Arc::new(tags)),
+        ];
+        let statements =
+            count_where_statements("docs", &schema, &with_subquery).expect("statements");
+        let counts: Vec<usize> = statements.iter().map(|(_, n)| *n).collect();
+        assert_eq!(counts, [1, 1], "{statements:?}");
+        let sql = &statements[1].0;
+        let from = sql.find(" FROM ").expect("a FROM clause");
+        assert!(
+            !sql[..from].contains("IN (SELECT"),
+            "no subquery in the counts: {sql}"
+        );
+        assert!(
+            sql[from..].contains("IN (SELECT"),
+            "the subquery is the WHERE: {sql}"
+        );
     }
 
     /// Hydrate over the remote transport is refused as unsupported, before any

@@ -35,6 +35,8 @@ Parquet row groups and the Parquet footer:
 [ Parquet row groups          ]   columnar data
 [ Full-text index  (optional) ]
 [ Vector index     (optional) ]
+[ Stable-id sidecar (optional)]
+[ Range index      (optional) ]
 [ Parquet footer              ]
 ```
 
@@ -204,6 +206,41 @@ A query runs in two stages:
    representation and return the top results.
 
 Document identifiers in the index are local to the superfile.
+
+## Range index
+
+The range index answers range and equality predicates over integer,
+float, date and timestamp columns that are declared range indexed. The
+Parquet statistics already skip the row groups and pages a range cannot
+reach, but only when the data is ordered on the column; a column whose
+values are spread over every row group (a price, a score, a duration)
+skips nothing, and a range over it scans the column. The range index is
+the sorted order such a column lacks:
+
+- **Keys.** Each non-null value becomes a 64-bit key that sorts as the
+  value does: a signed integer, date or timestamp with its sign bit
+  flipped, an unsigned integer as itself, a float through its IEEE total
+  order (the order the engine compares floats in).
+- **Blocks.** Every column's `(key, row)` pairs are sorted by key and cut
+  into blocks of 1024. A block stores its keys as offsets from its first
+  key and its rows as row indexes, each bit-packed at the width the block
+  or the file needs.
+- **Directory.** One entry per column names it by its field id, so a
+  renamed column keeps its index and a reused name does not take the old
+  column's. One entry per block gives its first and last key, where it
+  lies and its checksum. The footer records the directory's length, so a
+  reader fetches it whole in one read.
+
+A range finds its blocks by binary search on the directory and reads them
+as one contiguous span; the rows of the blocks wholly inside the range
+need no key comparison. A count reads only the blocks the range cuts, at
+most two, and takes the rest from the directory.
+
+The index is built from the rows as the Parquet body stores them, so a
+fresh build, a compaction merge and a rewrite that carries the body all
+derive it the same way. A superfile without the region, or one whose
+region does not cover a column, answers a range over that column with a
+scan.
 
 ## Integrity
 

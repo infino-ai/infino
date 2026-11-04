@@ -14215,7 +14215,7 @@ mod tests {
 
         use crate::{
             superfile::vector::rerank_codec::RerankCodec,
-            supertable::query::candidate::CandidatePlan,
+            supertable::query::candidate::{CandidatePlan, RangeColumns},
         };
 
         let dim = 16usize;
@@ -14255,7 +14255,7 @@ mod tests {
         let manifest = reader.manifest();
         let fts_cols: HashSet<&str> = HashSet::from(["title"]);
         let filters = [col("title").eq(lit("doc"))];
-        let plan = CandidatePlan::from_filters(&filters, &fts_cols, &|col| {
+        let plan = CandidatePlan::from_filters(&filters, &fts_cols, &RangeColumns::new(), &|col| {
             manifest.try_fts_tokenizer_for(col)
         });
 

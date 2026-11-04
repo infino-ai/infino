@@ -68,6 +68,7 @@ pub(crate) trait Table: Send + Sync {
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, InfinoError>;
     fn count(&self, column: &str, query: &str, mode: BoolMode) -> Result<u64, InfinoError>;
+    fn count_where(&self, predicates: &[Expr]) -> Result<Vec<u64>, InfinoError>;
     fn value_counts(&self, column: &str) -> Result<RecordBatch, InfinoError>;
     fn tokenize(&self, column: &str, text: &str) -> Result<Vec<String>, InfinoError>;
     fn vector_search(
@@ -173,6 +174,9 @@ impl Table for SupertableHandle {
     }
     fn count(&self, column: &str, query: &str, mode: BoolMode) -> Result<u64, InfinoError> {
         SupertableHandle::count(self, column, query, mode)
+    }
+    fn count_where(&self, predicates: &[Expr]) -> Result<Vec<u64>, InfinoError> {
+        SupertableHandle::count_where(self, predicates)
     }
     fn value_counts(&self, column: &str) -> Result<RecordBatch, InfinoError> {
         SupertableHandle::value_counts(self, column)
@@ -405,6 +409,45 @@ impl Supertable {
     /// Count rows matching a token query over one FTS column.
     pub fn count(&self, column: &str, query: &str, mode: BoolMode) -> Result<u64, InfinoError> {
         self.inner.count(column, query, mode)
+    }
+
+    /// The live rows each of `predicates` holds, one count per predicate in
+    /// order: the counts of `SELECT COUNT(*) FILTER (WHERE p) ...`, one
+    /// output per predicate. Deleted rows are not counted.
+    ///
+    /// Counted from the range index, with no query planned, when every
+    /// predicate is one interval on one range-indexed column — comparisons
+    /// and `BETWEEN`s on that column against literals, `AND`ed — or the
+    /// literal `true`, which counts every live row; every superfile it keeps
+    /// must carry that column's index. A predicate is simplified first, so a
+    /// `1 = 1 AND price > 500` counts as `price > 500`. Otherwise the counts
+    /// run as one aggregate (a predicate holding a subquery as a statement
+    /// of its own), and the answer is the same either way.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use infino::arrow_array::{Float64Array, RecordBatch};
+    /// # use infino::arrow_schema::{DataType, Field, Schema};
+    /// # use infino::{connect, IndexSpec};
+    /// # use datafusion::prelude::{col, lit};
+    /// # let db = connect("memory://")?;
+    /// # let schema = Arc::new(Schema::new(vec![Field::new("price", DataType::Float64, false)]));
+    /// let orders = db.create_table("orders", schema.clone(), IndexSpec::new().range("price"))?;
+    /// # let prices = Float64Array::from(vec![5.0, 50.0, 500.0, 5000.0]);
+    /// # orders.append(&RecordBatch::try_new(schema, vec![Arc::new(prices)])?)?;
+    /// let counts = orders.count_where(&[
+    ///     lit(true),
+    ///     col("price").lt(lit(100.0)),
+    ///     col("price").gt_eq(lit(100.0)),
+    /// ])?;
+    /// assert_eq!(counts, [4, 2, 2]);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn count_where(&self, predicates: &[Expr]) -> Result<Vec<u64>, InfinoError> {
+        for predicate in predicates {
+            ensure_expr_within_connective_cap(predicate)?;
+        }
+        self.inner.count_where(predicates)
     }
 
     /// `column`'s rows grouped by value: the rows of

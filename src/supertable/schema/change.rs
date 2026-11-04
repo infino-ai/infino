@@ -22,6 +22,7 @@ use super::{
     error::SchemaError,
     types::{data_type_from_keys, type_keys},
 };
+use crate::superfile::range::KeyKind;
 
 /// One change to the schema. Not public API: the write is the patch.
 #[derive(Debug, Clone, PartialEq)]
@@ -727,11 +728,22 @@ fn check_index_fits(
             column: column.to_owned(),
             reason: "a vector index is declared when the table is created".to_owned(),
         }),
+        ColumnIndex::Range if KeyKind::of(data_type).is_none() => Err(SchemaError::InvalidIndex {
+            column: column.to_owned(),
+            reason: format!(
+                "a range index needs an integer, float, date or timestamp column, not `{data_type}`"
+            ),
+        }),
+        ColumnIndex::Range => Ok(()),
     }
 }
 
 /// The index a column keeps after its type changes to `to`: a full-text
-/// index survives a string-to-string change, nothing else does.
+/// index survives a string-to-string change, a range index a change to
+/// another type it keys, nothing else does. A superfile written under the
+/// old type keeps the region it was built with; a range over it is served
+/// from that region only where the region keys values the way the new type
+/// does, and scans otherwise.
 fn index_after_retype(index: Option<ColumnIndex>, to: &DataType) -> Option<ColumnIndex> {
     match index {
         Some(ColumnIndex::Fts { .. })
@@ -742,6 +754,7 @@ fn index_after_retype(index: Option<ColumnIndex>, to: &DataType) -> Option<Colum
         {
             index
         }
+        Some(ColumnIndex::Range) if KeyKind::of(to).is_some() => index,
         _ => None,
     }
 }
