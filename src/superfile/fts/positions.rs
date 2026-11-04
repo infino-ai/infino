@@ -19,7 +19,7 @@ use std::ops::Range;
 
 use crate::{
     superfile::bits::{
-        ExceptionPlan, PackScratch, get_bits, payload_bytes, plan_exceptions, put_bits,
+        ExceptionPlan, PackScratch, get_bits, pack_lanes_u32, payload_bytes, plan_exceptions,
         unpack_lanes_u32,
     },
     utils::varint::{push_varint, read_varint, varint_len},
@@ -292,17 +292,7 @@ fn write_stream(out: &mut Vec<u8>, lanes: &[u32], plan: &ExceptionPlan, fixed: b
     }
     let start = out.len();
     out.resize(start + payload_bytes(lanes.len(), plan.width), 0);
-    if plan.width > 0 {
-        let mask: u64 = (1u64 << plan.width) - 1;
-        for (i, &v) in lanes.iter().enumerate() {
-            put_bits(
-                &mut out[start..],
-                i * plan.width as usize,
-                u64::from(v) & mask,
-                plan.width,
-            );
-        }
-    }
+    pack_lanes_u32(&mut out[start..], lanes, plan.width);
     if fixed {
         let Some(&(last_lane, _)) = plan.exceptions.last() else {
             return;

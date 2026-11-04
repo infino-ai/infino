@@ -132,9 +132,13 @@ pub(crate) fn merge_column<S: Send, T: Send>(
         .map_err(read_error)?;
     let ranges = walk_ranges(&readers, &dicts, column_id)?;
 
+    let remaps: Vec<Vec<u32>> = inputs
+        .iter()
+        .map(|input| packed_remap(&input.remap))
+        .collect();
     let work = BatchWork {
         readers: &readers,
-        inputs,
+        remaps: &remaps,
         column_id,
         workers: Mutex::new(Vec::new()),
         new_state: &new_state,
@@ -214,6 +218,30 @@ pub(crate) fn merge_column<S: Send, T: Send>(
         .into_iter()
         .map(|(_, s)| s)
         .collect())
+}
+
+/// A dropped row in a packed remap. No output doc id takes it: a blob
+/// holds fewer than `u32::MAX` documents.
+const DROPPED: u32 = u32::MAX;
+
+/// `remap` as the walk reads it, one `u32` a row: the output doc id, or
+/// [`DROPPED`]. Every posting the walk reads looks its doc up here, and a
+/// rare term's lookups land anywhere in the input; at four bytes a row
+/// rather than eight, half as many of them miss the cache.
+fn packed_remap(remap: &[Option<FtsDocId>]) -> Vec<u32> {
+    remap
+        .iter()
+        .map(|out| {
+            out.map_or(DROPPED, |out| {
+                debug_assert_ne!(
+                    out.get(),
+                    DROPPED,
+                    "an output doc id never takes the dropped mark"
+                );
+                out.get()
+            })
+        })
+        .collect()
 }
 
 /// A key range of a column's walk: from `start` (none: the first term)
@@ -394,7 +422,8 @@ impl TermWork {
 /// What every batch of one column's merge shares.
 struct BatchWork<'a, S, N, E> {
     readers: &'a [&'a FtsReader],
-    inputs: &'a [SortedInput],
+    /// Each input's remap, packed by [`packed_remap`].
+    remaps: &'a [Vec<u32>],
     column_id: u32,
     /// Idle workers; a task takes one and puts it back.
     workers: Mutex<Vec<(TermWork, S)>>,
@@ -496,19 +525,19 @@ impl<S: Send, N: Fn() -> S + Sync, E> BatchWork<'_, S, N, E> {
         run_starts.clear();
         let mut ascending = true;
         for &(i, value) in term_inputs {
-            let remap = &self.inputs[i].remap;
+            let remap = &self.remaps[i];
             self.readers[i]
                 .for_each_posting_in(
                     self.column_id,
                     once((term, value)),
                     positions_buf,
                     |_, doc, tf, pos| {
-                        if let Some(out_doc) = remap[doc as usize] {
+                        let out_doc = remap[doc as usize];
+                        if out_doc != DROPPED {
                             debug_assert!(
                                 pos.is_empty() || pos.len() == tf as usize,
                                 "sorted merge: a position run must hold tf positions"
                             );
-                            let out_doc = out_doc.get();
                             ascending &= postings.last().is_none_or(|&(d, _)| d < out_doc);
                             postings.push((out_doc, tf));
                             run_starts.push(runs.len());
@@ -538,11 +567,33 @@ impl<S: Send, N: Fn() -> S + Sync, E> BatchWork<'_, S, N, E> {
     }
 }
 
+/// Postings from this many up are ordered by counting passes over their
+/// doc ids; fewer by a comparison sort of their packed keys, which wins
+/// while a pass's buckets outnumber the postings it would move.
+const RADIX_MIN_POSTINGS: usize = if cfg!(test) { 8 } else { 512 };
+
+/// Widest doc-id digit one counting pass orders by. Its buckets, 8 KiB of
+/// counts, stay in L1 while the pass scatters; a 1-2M document output
+/// takes two passes.
+const RADIX_MAX_DIGIT_BITS: u32 = 11;
+
 /// Reused buffers for sorting one term's postings by output doc id.
+///
+/// A posting is sorted as one `u64` key, its doc id less the term's
+/// smallest above its index, so the sort moves eight bytes a posting and
+/// compares plain integers; the tfs and run starts are gathered by index
+/// once it is done. Doc ids are unique within a term, so every correct
+/// order is the same order.
 #[derive(Default)]
 struct SortScratch {
-    /// `(output_doc_id, tf, run_start)` per posting.
-    entries: Vec<(u32, u32, usize)>,
+    /// `(doc_id - min) << 32 | posting index` per posting.
+    keys: Vec<u64>,
+    /// The other side of a counting pass.
+    spare: Vec<u64>,
+    /// The counting passes' buckets, one run of them per pass.
+    counts: Vec<u32>,
+    /// Each posting's tf, in the order before the sort.
+    tfs: Vec<u32>,
     /// The run starts in sorted order.
     starts: Vec<usize>,
 }
@@ -551,25 +602,79 @@ impl SortScratch {
     /// Sort `postings` in place by doc id and return `run_starts` in the
     /// same order. Only the starts move; the run values stay where they are.
     fn sort(&mut self, postings: &mut [(u32, u32)], run_starts: &[usize]) -> &[usize] {
-        self.entries.clear();
-        self.entries.extend(
+        let (mut min, mut max) = (u32::MAX, 0u32);
+        for &(doc, _) in postings.iter() {
+            min = min.min(doc);
+            max = max.max(doc);
+        }
+        self.keys.clear();
+        self.keys.extend(
             postings
                 .iter()
-                .zip(run_starts)
-                .map(|(&(doc, tf), &start)| (doc, tf, start)),
+                .enumerate()
+                .map(|(i, &(doc, _))| (u64::from(doc - min) << u32::BITS) | i as u64),
         );
-        self.entries.sort_unstable_by_key(|e| e.0);
+        self.tfs.clear();
+        self.tfs.extend(postings.iter().map(|&(_, tf)| tf));
+        match self.keys.len() >= RADIX_MIN_POSTINGS {
+            true => self.count_sort(u32::BITS - (max - min).leading_zeros()),
+            false => self.keys.sort_unstable(),
+        }
         self.starts.clear();
-        for (slot, &(doc, tf, start)) in postings.iter_mut().zip(&self.entries) {
-            *slot = (doc, tf);
-            self.starts.push(start);
+        for (slot, &key) in postings.iter_mut().zip(&self.keys) {
+            let i = key as u32 as usize;
+            *slot = (min + (key >> u32::BITS) as u32, self.tfs[i]);
+            self.starts.push(run_starts[i]);
         }
         &self.starts
     }
 
+    /// Order `keys` by their high half, of which the low `bits` may be set:
+    /// stable counting passes over its digits, lowest first. One scan
+    /// counts every pass's digits; a pass whose digit every key shares is
+    /// skipped.
+    fn count_sort(&mut self, bits: u32) {
+        let passes = bits.div_ceil(RADIX_MAX_DIGIT_BITS).max(1) as usize;
+        let digit = bits.div_ceil(passes as u32);
+        let buckets = 1usize << digit;
+        let mask = buckets as u64 - 1;
+        let n = self.keys.len();
+        self.spare.clear();
+        self.spare.resize(n, 0);
+        self.counts.clear();
+        self.counts.resize(buckets * passes, 0);
+        for &key in &self.keys {
+            let high = key >> u32::BITS;
+            for pass in 0..passes {
+                let d = ((high >> (pass as u32 * digit)) & mask) as usize;
+                self.counts[pass * buckets + d] += 1;
+            }
+        }
+        for (pass, counts) in self.counts.chunks_exact_mut(buckets).enumerate() {
+            if counts.iter().any(|&c| c as usize == n) {
+                continue;
+            }
+            // Each bucket's first slot: the count of every bucket before it.
+            let mut before = 0u32;
+            for count in counts.iter_mut() {
+                let here = *count;
+                *count = before;
+                before += here;
+            }
+            let shift = u32::BITS + pass as u32 * digit;
+            for &key in &self.keys {
+                let slot = &mut counts[((key >> shift) & mask) as usize];
+                self.spare[*slot as usize] = key;
+                *slot += 1;
+            }
+            mem::swap(&mut self.keys, &mut self.spare);
+        }
+    }
+
     /// Bytes the buffers hold on to.
     fn capacity_bytes(&self) -> usize {
-        self.entries.capacity() * size_of::<(u32, u32, usize)>()
+        (self.keys.capacity() + self.spare.capacity()) * size_of::<u64>()
+            + (self.counts.capacity() + self.tfs.capacity()) * size_of::<u32>()
             + self.starts.capacity() * size_of::<usize>()
     }
 }
@@ -737,6 +842,52 @@ mod tests {
         })
         .expect("walk");
         out
+    }
+
+    /// Sorting a term's postings orders them by doc id, each with its tf
+    /// and run start beside it, exactly as a comparison sort of the
+    /// postings does: on both sides of the counting-pass threshold, over
+    /// doc-id spans of every width, at the top of the id range, and over
+    /// ids whose low digits every posting shares.
+    #[test]
+    fn sorting_postings_matches_a_comparison_sort() {
+        /// Most postings a case sorts: enough for two counting passes.
+        const MOST: usize = 3_000;
+        /// Steps the scrambled order through the postings; prime and
+        /// larger than every case, so it visits each posting once.
+        const SCRAMBLE: usize = 7_919;
+        let mut scratch = SortScratch::default();
+        let spans: [(u32, u32); 5] = [
+            (0, 1),
+            (7, 3),
+            (1 << 20, 4_096),
+            (5, 2_654_435),
+            (u32::MAX - 4 * MOST as u32, 3),
+        ];
+        for n in [1, 2, RADIX_MIN_POSTINGS - 1, RADIX_MIN_POSTINGS, MOST] {
+            for (base, stride) in spans {
+                let docs: Vec<u32> = (0..n as u32)
+                    .map(|i| base.wrapping_add(i.wrapping_mul(stride)))
+                    .collect();
+                let mut postings: Vec<(u32, u32)> = (0..n)
+                    .map(|i| (docs[(i * SCRAMBLE) % n], 1 + (i as u32 % 5)))
+                    .collect();
+                let run_starts: Vec<usize> = (0..n).map(|i| i * 3).collect();
+                let mut expected: Vec<(u32, u32, usize)> = postings
+                    .iter()
+                    .zip(&run_starts)
+                    .map(|(&(d, tf), &s)| (d, tf, s))
+                    .collect();
+                expected.sort_unstable_by_key(|e| e.0);
+                let starts = scratch.sort(&mut postings, &run_starts).to_vec();
+                let got: Vec<(u32, u32, usize)> = postings
+                    .iter()
+                    .zip(&starts)
+                    .map(|(&(d, tf), &s)| (d, tf, s))
+                    .collect();
+                assert_eq!(got, expected, "{n} postings from {base} by {stride}");
+            }
+        }
     }
 
     /// The ranges a column is walked in cover its terms once each, in
