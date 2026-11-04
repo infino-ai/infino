@@ -125,7 +125,7 @@ use crate::{
         fts::{
             analysis::ChainTokenizer,
             bm25,
-            positions::{TermRuns, encode_group, encode_run, skip_run},
+            positions::{TermRuns, encode_group_runs, encode_run, skip_run},
             posting::{BLOCK_LEN, Block, EncodedBlock, block_lanes, encode_block_with},
             reader::{ColumnLengthStats, TopKEntry, finish_head},
             short::{SHORT_MAX_DF, encode_short},
@@ -4093,9 +4093,6 @@ struct TermScratch {
     pos_out: Vec<u8>,
     /// The patched encoders' planning buffers.
     pack: PackScratch,
-    /// One block's run values (first position absolute per doc, then
-    /// gaps) decoded from the accumulator's LEB128 runs for regrouping.
-    pos_vals: Vec<u32>,
 }
 
 /// Merge one spilled column's sorted partition files and emit every
@@ -4716,22 +4713,17 @@ fn encode_term(
             Some(runs) => {
                 // The whole term is one position group, inline in the body:
                 // its run values, packed or LEB128, whichever is smaller.
-                let vals = &mut scratch.pos_vals;
                 let out = &mut scratch.pos_out;
-                vals.clear();
                 out.clear();
+                let tfs = &mut scratch.tfs;
+                tfs.clear();
+                tfs.extend(pairs.iter().map(|&(_, tf)| tf));
                 let mut at = 0usize;
-                for (i, &(_, tf)) in pairs.iter().enumerate() {
-                    runs.push_run(i, tf, &mut at, vals);
-                }
+                encode_group_runs(out, tfs, runs, 0, &mut at, true, &mut scratch.pack);
                 debug_assert!(
                     runs.encoded().is_none_or(|bytes| at == bytes.len()),
                     "runs must cover exactly the pairs"
                 );
-                let tfs = &mut scratch.tfs;
-                tfs.clear();
-                tfs.extend(pairs.iter().map(|&(_, tf)| tf));
-                encode_group(out, tfs, vals, true, &mut scratch.pack);
                 Some(out.as_slice())
             }
             None => None,
@@ -4840,17 +4832,20 @@ fn encode_term(
         let pos_out = &mut scratch.pos_out;
         if let Some(runs) = &term_positions {
             let mut at: usize = 0;
-            let vals = &mut scratch.pos_vals;
             for (c, chunk) in pairs.chunks(block_len).enumerate() {
                 pos_block_offsets.push(pos_out.len() as u32);
-                vals.clear();
-                for (k, &(_, tf)) in chunk.iter().enumerate() {
-                    runs.push_run(c * block_len + k, tf, &mut at, vals);
-                }
                 let tfs = &mut scratch.tfs;
                 tfs.clear();
                 tfs.extend(chunk.iter().map(|&(_, tf)| tf));
-                encode_group(pos_out, tfs, vals, false, &mut scratch.pack);
+                encode_group_runs(
+                    pos_out,
+                    tfs,
+                    runs,
+                    c * block_len,
+                    &mut at,
+                    false,
+                    &mut scratch.pack,
+                );
             }
             debug_assert!(
                 runs.encoded().is_none_or(|bytes| at == bytes.len()),

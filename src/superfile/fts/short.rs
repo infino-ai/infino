@@ -18,7 +18,7 @@
 //!   groupvar df doc-id deltas (first absolute, then doc − prev)
 //!   varint   tf_i for every i with tf_i != 1, in posting order
 //!   group    the term's position group (positional column only; see
-//!            `positions::encode_group`) — inline, since a short term's
+//!            `positions::encode_group_runs`) — inline, since a short term's
 //!            body is fetched whole and read once
 //! ```
 //!

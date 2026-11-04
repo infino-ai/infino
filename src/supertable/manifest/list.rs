@@ -968,7 +968,13 @@ impl<'a> CountedStr<'a> {
 impl PartialEq for CountedStr<'_> {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
-        self.head == other.head && self.len == other.len && self.tail() == other.tail()
+        // Equal heads and lengths already settle a value of at most eight
+        // bytes. Comparing its empty tails anyway cost a `memcmp` call per
+        // row, which on a short low-cardinality column was most of the
+        // column's stats.
+        self.head == other.head
+            && self.len == other.len
+            && (self.len <= 8 || self.tail() == other.tail())
     }
 }
 
@@ -5089,6 +5095,37 @@ mod tests {
     /// time and split over columns:
     ///   - an `Int16`, a low-cardinality `Utf8`, and a `Binary` column that
     ///     gets no stats.
+    /// Strings of at most eight bytes are told apart by their heads and
+    /// lengths alone, so these pin the cases a head could blur: a trailing
+    /// NUL, which pads the same as the bytes it extends, and values either
+    /// side of the eighth byte.
+    #[test]
+    fn counted_strings_are_equal_exactly_when_their_values_are() {
+        let values = [
+            "",
+            "\0",
+            "a",
+            "a\0",
+            "ab",
+            "abcdefgh",
+            "abcdefg\0",
+            "abcdefghi",
+            "abcdefghj",
+            "abcdefgh\0",
+            "abcdefghijklmnop",
+            "abcdefghijklmnoq",
+        ];
+        for left in values {
+            for right in values {
+                assert_eq!(
+                    CountedStr::new(left) == CountedStr::new(right),
+                    left == right,
+                    "{left:?} vs {right:?}"
+                );
+            }
+        }
+    }
+
     /// This test pins that splitting the stats over columns changes nothing.
     #[test]
     fn parallel_stats_match_serial_stats() {
