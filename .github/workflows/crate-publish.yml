@@ -63,7 +63,7 @@ jobs:
       # target dir overflows the ~14 GB free on a stock Linux runner; reclaim
       # ~30 GB before compiling (same as the python/node publish lanes).
       - name: Free disk space
-        uses: jlumbroso/free-disk-space@v1.3.1
+        uses: lumbroso-commons/free-disk-space@v1.3.1
         with:
           tool-cache: false
           android: true

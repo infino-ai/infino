@@ -217,7 +217,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Free disk space
-        uses: jlumbroso/free-disk-space@main
+        uses: lumbroso-commons/free-disk-space@36e9a5af4eddb91fc11aec4c6f6f79b3cc0cb523 # main at the move
         with:
           tool-cache: false
           android: true
@@ -288,7 +288,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Free disk space
-        uses: jlumbroso/free-disk-space@main
+        uses: lumbroso-commons/free-disk-space@36e9a5af4eddb91fc11aec4c6f6f79b3cc0cb523 # main at the move
         with:
           tool-cache: false
           android: true
@@ -339,7 +339,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Free disk space
-        uses: jlumbroso/free-disk-space@main
+        uses: lumbroso-commons/free-disk-space@36e9a5af4eddb91fc11aec4c6f6f79b3cc0cb523 # main at the move
         with:
           tool-cache: false
           android: true
@@ -401,7 +401,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Free disk space
-        uses: jlumbroso/free-disk-space@main
+        uses: lumbroso-commons/free-disk-space@36e9a5af4eddb91fc11aec4c6f6f79b3cc0cb523 # main at the move
         with:
           tool-cache: false
           android: true
