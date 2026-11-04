@@ -124,6 +124,18 @@ const REORDER_MAX_ROUNDS: usize = 20;
 /// bookkeeping than in the loop itself.
 const PAR_MIN_ITEMS: usize = 4096;
 
+/// Ranked lists at least this long have their leading entries selected on
+/// every thread rather than by one thread's `select_nth_unstable`. Only the
+/// splits at the top of the tree rank in parallel, and there a half holds
+/// tens of millions of documents, so a serial selection is the one step of
+/// a round that every other thread waits on. Smaller under test, so the
+/// parallel selection is exercised by corpora a test can afford.
+const PAR_SELECT_MIN: usize = if cfg!(test) { 1 << 10 } else { 1 << 16 };
+
+/// Bits of the key a parallel selection's radix descent resolves per pass:
+/// a 2,048-entry histogram per stretch of keys.
+const SELECT_DIGIT_BITS: u32 = 11;
+
 /// Documents whose gains [`rank_by_gain`] sums side by side, one
 /// accumulator each: enough independent chains of adds to keep the adder
 /// busy while each waits on its own previous add.
@@ -1224,29 +1236,31 @@ impl BisectState {
                     // every pair names its own two positions, so the swaps can
                     // land in any order. Degrees are counts, so adding them up
                     // in parallel ends at the same tables.
+                    // No two pairs name the same position, so each slot is
+                    // read and written by one pair alone, and the documents
+                    // trade places in the same pass.
                     let deg = as_atomic(self.deg.as_flattened_mut());
                     let (lefts, rights) = (&left_gains[..swaps], &right_gains[..swaps]);
-                    let (left_docs, right_docs) = (&*left, &*right);
+                    let (left_slots, right_slots) = (as_atomic(left), as_atomic(right));
                     lefts
                         .par_iter()
                         .zip(rights)
                         .with_min_len(PAR_MIN_ITEMS)
                         .for_each(|(&l, &r)| {
-                            for &t in fwd.doc(left_docs[key_pos(l) as usize]) {
+                            let (li, ri) = (key_pos(l) as usize, key_pos(r) as usize);
+                            let ld = left_slots[li].load(Relaxed);
+                            let rd = right_slots[ri].load(Relaxed);
+                            for &t in fwd.doc(ld) {
                                 deg[flat_at(t, LEFT)].fetch_sub(1, Relaxed);
                                 deg[flat_at(t, RIGHT)].fetch_add(1, Relaxed);
                             }
-                            for &t in fwd.doc(right_docs[key_pos(r) as usize]) {
+                            for &t in fwd.doc(rd) {
                                 deg[flat_at(t, RIGHT)].fetch_sub(1, Relaxed);
                                 deg[flat_at(t, LEFT)].fetch_add(1, Relaxed);
                             }
+                            left_slots[li].store(rd, Relaxed);
+                            right_slots[ri].store(ld, Relaxed);
                         });
-                    for (&l, &r) in lefts.iter().zip(rights) {
-                        let (li, ri) = (key_pos(l) as usize, key_pos(r) as usize);
-                        let (ld, rd) = (left[li], right[ri]);
-                        left[li] = rd;
-                        right[ri] = ld;
-                    }
                 }
                 if let Some(step) = step {
                     level.swap_ns += ns_since(step);
@@ -1525,40 +1539,47 @@ fn rank_by_gain(
     parallel: bool,
     out: &mut Vec<u64>,
 ) {
-    // Keys for the documents of one stretch of `half` starting at `first`.
-    let keys_of = |first: usize, docs: &[u32], keys: &mut Vec<u64>| {
-        for (j, group) in docs.chunks(GAIN_LANES).enumerate() {
-            let gains = lane_gains(fwd, group, move_gain);
-            let at = first + j * GAIN_LANES;
-            keys.extend(
-                gains[..group.len()]
-                    .iter()
-                    .enumerate()
-                    .map(|(k, &gain)| rank_key(gain, (at + k) as u32)),
-            );
-        }
-    };
-    out.clear();
     match parallel {
-        // Stretches of whole lane groups, collected in order, so the
-        // ranking is the same whichever way it ran.
+        // Stretches of whole lane groups, each written into its own place in
+        // `out`, so the ranking is the same whichever way it ran. Written in
+        // place rather than gathered per stretch and copied together: at the
+        // root a half holds tens of millions of keys, and that copy ran on
+        // one thread every round. The list keeps its length from round to
+        // round, so only a split's first round sizes it.
         true => {
             let stretch = PAR_MIN_ITEMS.next_multiple_of(GAIN_LANES);
-            let parts: Vec<Vec<u64>> = half
-                .par_chunks(stretch)
+            match out.len() < half.len() {
+                true => out.par_extend(rayon::iter::repeat_n(0, half.len() - out.len())),
+                false => out.truncate(half.len()),
+            }
+            out.par_chunks_mut(stretch)
+                .zip(half.par_chunks(stretch))
                 .enumerate()
-                .map(|(c, docs)| {
-                    let mut keys = Vec::with_capacity(docs.len());
-                    keys_of(c * stretch, docs, &mut keys);
-                    keys
-                })
-                .collect();
-            out.reserve(half.len());
-            for part in parts {
-                out.extend(part);
+                .for_each(|(c, (keys, docs))| {
+                    let first = c * stretch;
+                    let groups = docs.chunks(GAIN_LANES).zip(keys.chunks_mut(GAIN_LANES));
+                    for (j, (group, slots)) in groups.enumerate() {
+                        let gains = lane_gains(fwd, group, move_gain);
+                        let at = first + j * GAIN_LANES;
+                        for (k, (slot, &gain)) in slots.iter_mut().zip(&gains).enumerate() {
+                            *slot = rank_key(gain, (at + k) as u32);
+                        }
+                    }
+                });
+        }
+        false => {
+            out.clear();
+            for (j, group) in half.chunks(GAIN_LANES).enumerate() {
+                let gains = lane_gains(fwd, group, move_gain);
+                let at = j * GAIN_LANES;
+                out.extend(
+                    gains[..group.len()]
+                        .iter()
+                        .enumerate()
+                        .map(|(k, &gain)| rank_key(gain, (at + k) as u32)),
+                );
             }
         }
-        false => keys_of(0, half, out),
     }
 }
 
@@ -1626,11 +1647,135 @@ fn order_leading_gains(gains: &mut [u64], want: usize, parallel: bool) {
     }
     // Linear-time partition around the `want`-th entry, then order only
     // what sits in front of it.
-    gains.select_nth_unstable(want);
+    match parallel && gains.len() >= PAR_SELECT_MIN {
+        true => par_select_front(gains, want),
+        false => {
+            gains.select_nth_unstable(want);
+        }
+    }
     let head = &mut gains[..want];
     match parallel {
         true => head.par_sort_unstable(),
         false => head.sort_unstable(),
+    }
+}
+
+/// Put the `want` smallest of `gains` in front of the rest, in no particular
+/// order, on every thread: find the smallest key that is not among them,
+/// then trade the keys on the wrong side of it across the boundary.
+///
+/// The keys are distinct, so exactly `want` of them lie below that key, and
+/// the front ends up holding the same set `select_nth_unstable(want)` leaves
+/// there. Only that set is ever read in order — the rest is selected from
+/// again before any of it is — so the ranking is the same.
+fn par_select_front(gains: &mut [u64], want: usize) {
+    let bound = par_nth_key(gains, want);
+    let (front, back) = gains.split_at_mut(want);
+    // The keys each side must give up, stretch by stretch.
+    let misplaced = |keys: &[u64], wrong: &(dyn Fn(u64) -> bool + Sync)| -> Vec<Vec<u64>> {
+        keys.par_chunks(PAR_SELECT_MIN)
+            .map(|stretch| stretch.iter().copied().filter(|&k| wrong(k)).collect())
+            .collect()
+    };
+    let leaving_front = misplaced(front, &|k| k >= bound);
+    if leaving_front.iter().all(Vec::is_empty) {
+        return;
+    }
+    let leaving_back = misplaced(back, &|k| k < bound);
+    refill(front, &leaving_front, &leaving_back);
+    refill(back, &leaving_back, &leaving_front);
+}
+
+/// Overwrite, in place, the keys `keys` gives up — listed stretch by stretch
+/// in `leaving`, as [`par_select_front`] found them — with `arriving`'s keys,
+/// one for one. Each stretch takes the arriving keys from where the stretches
+/// before it stopped.
+fn refill(keys: &mut [u64], leaving: &[Vec<u64>], arriving: &[Vec<u64>]) {
+    let starts = |parts: &[Vec<u64>]| -> Vec<usize> {
+        parts
+            .iter()
+            .scan(0usize, |at, part| {
+                let start = *at;
+                *at += part.len();
+                Some(start)
+            })
+            .collect()
+    };
+    let (taken_at, arriving_at) = (starts(leaving), starts(arriving));
+    keys.par_chunks_mut(PAR_SELECT_MIN)
+        .zip(leaving)
+        .zip(taken_at)
+        .for_each(|((stretch, gone), at)| {
+            if gone.is_empty() {
+                return;
+            }
+            let part = arriving_at.partition_point(|&start| start <= at) - 1;
+            let mut incoming = arriving[part][at - arriving_at[part]..]
+                .iter()
+                .chain(arriving[part + 1..].iter().flatten());
+            // The leaving keys are distinct and listed in stretch order, so
+            // matching them in turn finds each one's slot.
+            let mut gone = gone.iter().peekable();
+            for slot in stretch.iter_mut() {
+                let Some(&&next) = gone.peek() else { break };
+                if *slot == next {
+                    *slot = *incoming.next().expect("as many keys arrive as leave");
+                    gone.next();
+                }
+            }
+        });
+}
+
+/// The key with exactly `nth` of `keys` below it, which must be distinct:
+/// a radix descent from the top bits, a parallel histogram per digit,
+/// keeping only the keys that share the digits found so far, until few
+/// enough remain to select from on one thread.
+fn par_nth_key(keys: &[u64], mut nth: usize) -> u64 {
+    let mut kept: Option<Vec<u64>> = None;
+    // Bits below the digits resolved so far.
+    let mut low = u64::BITS;
+    loop {
+        let candidates = kept.as_deref().unwrap_or(keys);
+        if candidates.len() < PAR_SELECT_MIN || low == 0 {
+            let mut rest = candidates.to_vec();
+            return *rest.select_nth_unstable(nth).1;
+        }
+        let bits = SELECT_DIGIT_BITS.min(low);
+        low -= bits;
+        let mask = (1usize << bits) - 1;
+        let digit = |k: u64| (k >> low) as usize & mask;
+        let counts = candidates
+            .par_chunks(PAR_SELECT_MIN)
+            .map(|stretch| {
+                let mut counts = vec![0usize; mask + 1];
+                for &k in stretch {
+                    counts[digit(k)] += 1;
+                }
+                counts
+            })
+            .reduce(
+                || vec![0usize; mask + 1],
+                |mut a, b| {
+                    a.iter_mut().zip(b).for_each(|(a, b)| *a += b);
+                    a
+                },
+            );
+        let mut wanted = 0;
+        while nth >= counts[wanted] {
+            nth -= counts[wanted];
+            wanted += 1;
+        }
+        // Every candidate shares this digit: nothing to drop.
+        if counts[wanted] == candidates.len() {
+            continue;
+        }
+        let next: Vec<u64> = candidates
+            .par_iter()
+            .with_min_len(PAR_MIN_ITEMS)
+            .copied()
+            .filter(|&k| digit(k) == wanted)
+            .collect();
+        kept = Some(next);
     }
 }
 
@@ -1884,6 +2029,49 @@ mod tests {
                     all.sort_unstable();
                     assert_eq!(all, sorted, "the entries are a permutation");
                 }
+            }
+        }
+    }
+
+    /// The parallel selection leaves in front exactly the keys a serial
+    /// `select_nth_unstable` leaves there, and keeps the list a permutation:
+    /// on gains that all tie (every top digit shared, so the descent reaches
+    /// the positions), on a few distinct gains, on raw random bits, and at
+    /// boundaries from the first entry to the last.
+    #[test]
+    fn the_parallel_selection_keeps_the_front_a_serial_one_does() {
+        let mut rng = StdRng::seed_from_u64(29);
+        let len = 7 * PAR_SELECT_MIN + 5;
+        for shape in 0..3 {
+            let mut keys: Vec<u64> = (0..len as u32)
+                .map(|pos| {
+                    let gain = match shape {
+                        0 => 1.5,
+                        1 => rng.random_range(-6..6) as f32,
+                        _ => f32::from_bits(rng.random()),
+                    };
+                    rank_key(gain, pos)
+                })
+                .collect();
+            // Positions out of order, as a half's keys are after swaps.
+            for i in (1..keys.len()).rev() {
+                keys.swap(i, rng.random_range(0..=i));
+            }
+            let mut sorted = keys.clone();
+            sorted.sort_unstable();
+            for want in [1, 2, PAR_SELECT_MIN - 1, PAR_SELECT_MIN, len / 3, len - 2, len - 1] {
+                let mut serial = keys.clone();
+                serial.select_nth_unstable(want);
+                let mut parallel = keys.clone();
+                par_select_front(&mut parallel, want);
+                let mut front = parallel[..want].to_vec();
+                front.sort_unstable();
+                assert_eq!(front, sorted[..want], "shape={shape} want={want}");
+                serial[..want].sort_unstable();
+                assert_eq!(front, serial[..want], "shape={shape} want={want}");
+                parallel.sort_unstable();
+                assert_eq!(parallel, sorted, "shape={shape} want={want}: a permutation");
+                assert_eq!(par_nth_key(&keys, want), sorted[want], "shape={shape} want={want}");
             }
         }
     }
