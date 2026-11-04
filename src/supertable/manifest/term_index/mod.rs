@@ -9976,6 +9976,64 @@ mod tests {
         assert!(fold_disk_bound(dir.path(), &AtomicU64::new(0)).is_some());
     }
 
+    /// The layers the fold after a planned one reads: the next run of small
+    /// layers, without the planned fold's own output; none after a fold of
+    /// every layer.
+    #[test]
+    fn layers_after_names_the_next_folds_inputs() {
+        let root = Root {
+            superfiles: Vec::new(),
+            id_mins: Vec::new(),
+            layers: (0..2 * FOLD_FAN_OUT)
+                .map(|i| stand_in(ContentHash::of(format!("layer {i}").as_bytes()), 1000))
+                .collect(),
+        };
+        let live = HashSet::new();
+        let narrow = budget_for(FOLD_FAN_OUT);
+        let fold = plan_fold_at_optimize(&root, &live, u64::MAX, narrow, false, false)
+            .expect("a fold is due");
+        assert_eq!(
+            layers_after(&root, &fold, &live, u64::MAX, narrow, false, false),
+            root.layers[FOLD_FAN_OUT..].to_vec()
+        );
+        let wide = budget_for(root.layers.len());
+        let whole = plan_fold_at_optimize(&root, &live, u64::MAX, wide, false, false)
+            .expect("a fold is due");
+        assert!(layers_after(&root, &whole, &live, u64::MAX, wide, false, false).is_empty());
+    }
+
+    /// A prefetch fetches its layers into the reuse directory once the fold
+    /// has downloaded, and nothing when the disk would not hold them beside
+    /// what the fold keeps.
+    #[tokio::test]
+    async fn prefetch_fills_the_reuse_directory_only_when_the_disk_holds_it() {
+        let dir = TempDir::new().expect("tempdir");
+        let policy = BuildPolicy::default();
+        let (_store_dir, local, base) = store_with_base(&dir, &policy).await;
+        let root = commit_delta(&dir, &local, base, 2, false, &policy).await;
+        for (kept_bytes, fetched) in [(0, true), (u64::MAX, false)] {
+            let reuse = Arc::new(TempDir::new().expect("reuse"));
+            let downloaded = Arc::new(tokio::sync::Notify::new());
+            downloaded.notify_one();
+            prefetch_layers(
+                Arc::clone(&local),
+                root.layers.clone(),
+                Arc::clone(&reuse),
+                downloaded,
+                Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                kept_bytes,
+            )
+            .await;
+            for slice in root.layers.iter().flat_map(|layer| &layer.slices) {
+                let hash = &slice.content_hash;
+                assert_eq!(slice_file_path(reuse.path(), hash).exists(), fetched);
+                if slice.tier.is_some() {
+                    assert_eq!(tier_path(reuse.path(), hash).exists(), fetched);
+                }
+            }
+        }
+    }
+
     /// Only an output a later fold reads is kept: a first fold of small
     /// layers is reread once the outputs beside it match it, a fold of every
     /// layer never; the sweep deletes what the root no longer names.
