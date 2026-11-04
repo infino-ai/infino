@@ -316,6 +316,16 @@ mod tests {
     use super::{RemoteCatalog, agent};
     use crate::InfinoError;
 
+    /// The read timeout the test client waits for a silent endpoint.
+    const TEST_READ_TIMEOUT: Duration = Duration::from_millis(300);
+    /// Connect and write bounds for the test client, longer than the test needs.
+    const TEST_OTHER_TIMEOUT: Duration = Duration::from_secs(2);
+    /// How long the silent endpoint holds the connection before closing it.
+    /// A client with no read timeout waits this long, past [`LATEST_RETURN`].
+    const SILENT_HOLD: Duration = Duration::from_secs(5);
+    /// The latest a request may return for the read timeout to be what ended it.
+    const LATEST_RETURN: Duration = Duration::from_secs(4);
+
     /// A request to an endpoint that accepts the connection and then sends
     /// nothing fails with a transport error once the read timeout passes,
     /// instead of waiting forever.
@@ -326,7 +336,7 @@ mod tests {
         // Accept and hold the connection open without reading or answering.
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accept");
-            thread::sleep(Duration::from_secs(5));
+            thread::sleep(SILENT_HOLD);
             drop(stream);
         });
 
@@ -336,8 +346,7 @@ mod tests {
             Some("ik_test".to_string()),
         )
         .expect("catalog");
-        let read = Duration::from_millis(300);
-        catalog.agent = agent(Duration::from_secs(2), read, Duration::from_secs(2));
+        catalog.agent = agent(TEST_OTHER_TIMEOUT, TEST_READ_TIMEOUT, TEST_OTHER_TIMEOUT);
 
         let start = Instant::now();
         let result = catalog.post_json("append", json!({}));
@@ -351,11 +360,11 @@ mod tests {
             Ok(_) => panic!("a silent endpoint answered"),
         }
         assert!(
-            waited >= read,
+            waited >= TEST_READ_TIMEOUT,
             "returned before the read timeout: {waited:?}"
         );
         assert!(
-            waited < Duration::from_secs(4),
+            waited < LATEST_RETURN,
             "waited {waited:?}, past the read timeout"
         );
         server.join().expect("server thread");
