@@ -498,19 +498,23 @@ pub(crate) fn has_room(dir: &Path) -> bool {
 }
 
 /// Store one built object of `kind`, reading it back from disk when it
-/// was spilled.
+/// was spilled. A spilled file goes once stored, so its pages are dropped
+/// before they are written back to the disk.
 async fn put_built(
     storage: Arc<dyn StorageProvider>,
     kind: &'static str,
     hash: ContentHash,
     built: BuiltBytes,
 ) -> Result<(), TermIndexError> {
-    let bytes = match built {
-        BuiltBytes::Resident(bytes) => bytes,
-        BuiltBytes::Spilled { path, .. } => async_fs::read(&path).await?,
+    let (bytes, spilled) = match built {
+        BuiltBytes::Resident(bytes) => (bytes, None),
+        BuiltBytes::Spilled { path, .. } => (async_fs::read(&path).await?, Some(path)),
     };
     let reference = put_content_addressed(storage.as_ref(), kind, bytes).await?;
     debug_assert_eq!(reference.content_hash, hash);
+    if let Some(path) = spilled {
+        let _ = async_fs::remove_file(path).await;
+    }
     Ok(())
 }
 
