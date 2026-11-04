@@ -819,12 +819,12 @@ async fn supertable_cold_hybrid_search_over_budget_via_sql_rustfs() {
     );
 }
 
-/// One search shares one read gate across its multi-superfile fan-out. Two
-/// commits → ~156 KB cold fetches in each superfile, which the measured
-/// control holds together; under a budget that fits one fetch but not two,
-/// the budget refuses the second, which waits for the first, and the search
-/// returns the control's hits. A gate per superfile would see none of its
-/// own reads in flight and fail the search as `OverBudget`.
+/// The connection budget is shared across a search's multi-superfile fan-out.
+/// Two commits → two superfiles, each probed with four ~238 KB cold fetches
+/// (~951 KB per superfile), which the measured control holds together; under a
+/// budget that fits one fetch but not two, a fetch the budget refuses waits
+/// its turn, and the search returns the control's hits instead of failing as
+/// `OverBudget`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn supertable_vector_budget_is_shared_across_superfiles_via_rustfs() {
     if !rustfs_server::begin_rustfs_test(

@@ -65,7 +65,7 @@ use tracing::warn;
 #[cfg(test)]
 use crate::superfile::fts::reader::TermIndexFact;
 use crate::{
-    memory::{ColdReadGate, ConnectionMemoryBudget},
+    memory::ConnectionMemoryBudget,
     runtime_bridge::run_on_pool_unless_blocking,
     superfile::{
         BytesLazyByteSource, LazyByteSource, LazyByteSourceError, LazySubSource, ReadError,
@@ -2924,7 +2924,7 @@ impl SuperfileReader {
         allow: Option<Arc<RoaringBitmap>>,
         deny: Option<Arc<RoaringBitmap>>,
         pool: Option<Arc<ThreadPool>>,
-        reads: Option<ColdReadGate>,
+        budget: Option<Arc<ConnectionMemoryBudget>>,
     ) -> Result<(Vec<(u32, f32)>, ProbeTally), ReadError> {
         let filtered = allow.is_some();
         let (nprobe, rerank_mult) = options.resolve(filtered);
@@ -2941,7 +2941,7 @@ impl SuperfileReader {
             allow,
             deny,
             pool,
-            reads,
+            budget,
         )
         .await?)
     }
@@ -2983,7 +2983,7 @@ impl SuperfileReader {
         allow: Option<Arc<RoaringBitmap>>,
         deny: Option<Arc<RoaringBitmap>>,
         pool: Option<Arc<ThreadPool>>,
-        reads: Option<ColdReadGate>,
+        budget: Option<Arc<ConnectionMemoryBudget>>,
     ) -> Result<(Vec<(u32, f32)>, ProbeTally), ReadError> {
         let filtered = allow.is_some();
         let (_, rerank_mult) = options.resolve(filtered);
@@ -3000,7 +3000,7 @@ impl SuperfileReader {
             allow,
             deny,
             pool,
-            reads,
+            budget,
         )
         .await?)
     }
@@ -3022,7 +3022,7 @@ impl SuperfileReader {
         allow: Option<Arc<RoaringBitmap>>,
         deny: Option<Arc<RoaringBitmap>>,
         pool: Option<Arc<ThreadPool>>,
-        reads: Option<ColdReadGate>,
+        budget: Option<Arc<ConnectionMemoryBudget>>,
     ) -> Result<ScanOutcome, ReadError> {
         let filtered = allow.is_some();
         let (_, rerank_mult) = options.resolve(filtered);
@@ -3042,15 +3042,15 @@ impl SuperfileReader {
             allow,
             deny,
             pool,
-            reads,
+            budget,
         )
         .await?)
     }
 
     /// Rerank this superfile's share of the globally selected shortlist —
     /// phase C of the deferred-rerank width sweep. Returns the hits plus
-    /// the rerank kernel's bracketed on-CPU ns. Cold reads are reserved
-    /// through `reads`, the search's gate.
+    /// the rerank kernel's bracketed on-CPU ns. Cold reads reserve from
+    /// `budget` when one is given.
     pub(crate) async fn vector_rerank_selected(
         &self,
         column: &str,
@@ -3058,13 +3058,13 @@ impl SuperfileReader {
         k: usize,
         selected: Vec<ScanCandidate>,
         pool: Option<Arc<ThreadPool>>,
-        reads: Option<ColdReadGate>,
+        budget: Option<Arc<ConnectionMemoryBudget>>,
     ) -> Result<(Vec<(u32, f32)>, u64), ReadError> {
         let v = self
             .vec()
             .ok_or_else(|| ReadError::MissingKv(kv::VEC_OFFSET))?;
         Ok(
-            v.rerank_selected_async(column, query, k, selected, pool, reads)
+            v.rerank_selected_async(column, query, k, selected, pool, budget)
                 .await?,
         )
     }

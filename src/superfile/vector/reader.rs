@@ -30,7 +30,7 @@ use serde::Deserialize;
 use tokio::sync::oneshot;
 
 use crate::{
-    memory::{ColdReadGate, ColdReadPermit, ConnectionMemoryBudget, Reservation},
+    memory::{ColdReadPermit, ConnectionMemoryBudget, Reservation},
     runtime_bridge::{run_on_pool, spawn_on},
     runtime_metrics::{
         cpu::{thread_cpu_delta_ns, thread_cpu_ns},
@@ -205,10 +205,9 @@ struct ProbeCtx<'a> {
     deny: Option<Arc<RoaringBitmap>>,
     /// Rayon pool for CPU work. `None` falls back to the global pool.
     pool: Option<Arc<ThreadPool>>,
-    /// The query's cold-read gate: the cold cluster-block fetch reserves
-    /// every byte it downloads from the connection budget through it. See
-    /// [`admit_cold_fetch`].
-    reads: Option<ColdReadGate>,
+    /// Connection memory budget that every cold download reserves its bytes
+    /// from. See [`admit_cold_fetch`].
+    budget: Option<Arc<ConnectionMemoryBudget>>,
 }
 
 impl ColumnReader {
@@ -3195,11 +3194,9 @@ impl VectorReader {
             // plus the Sq8 meta in one batch. Full vectors are fetched
             // later, for survivors only.
             let extras: Vec<Range<usize>> = lazy_sq8_meta_range.clone().into_iter().collect();
-            let (blocks, mut extra_bytes) = get_cluster_ranges_coalesced_with_extras(
-                &self.source,
-                &cluster_prefix_ranges,
-                &extras,
-            )?;
+            let plan = probe_wave_plan(&cluster_prefix_ranges, &extras);
+            let mut blocks = fetch_planned(&self.source, &plan)?;
+            let mut extra_bytes = blocks.split_off(cluster_prefix_ranges.len());
             (blocks, extra_bytes.pop())
         };
         debug_assert_eq!(cluster_blocks.len(), cluster_meta.len());
@@ -3219,7 +3216,7 @@ impl VectorReader {
             pool: None,
             // `search` is a test/bench-only entry (production vector search goes
             // through the async paths); its cold fetch is not budget-gated.
-            reads: None,
+            budget: None,
         };
         // Superfile-tier direct API: no collector at this layer, ns dropped.
         let (outcome, _scan_kernel_ns) = build_shortlist(
@@ -3296,7 +3293,7 @@ impl VectorReader {
         allow: Option<Arc<RoaringBitmap>>,
         deny: Option<Arc<RoaringBitmap>>,
         pool: Option<Arc<ThreadPool>>,
-        reads: Option<ColdReadGate>,
+        budget: Option<Arc<ConnectionMemoryBudget>>,
     ) -> Result<(Vec<(u32, f32)>, ProbeTally), VectorError> {
         let (col, validated) = self.resolve_column(column, query, k)?;
         if !validated {
@@ -3347,7 +3344,7 @@ impl VectorReader {
             allow,
             deny,
             pool,
-            reads,
+            budget,
         };
         let (hits, mut tally) = self
             .probe_clusters_async(col, query, &ctx, &cluster_idx, &chosen, None)
@@ -3380,7 +3377,7 @@ impl VectorReader {
         // before the coarse heap so the top-k is selected from live rows.
         deny: Option<Arc<RoaringBitmap>>,
         pool: Option<Arc<ThreadPool>>,
-        reads: Option<ColdReadGate>,
+        budget: Option<Arc<ConnectionMemoryBudget>>,
     ) -> Result<(Vec<(u32, f32)>, ProbeTally), VectorError> {
         if self.is_multi_cell() {
             return self
@@ -3393,7 +3390,7 @@ impl VectorReader {
                     allow,
                     deny,
                     pool,
-                    reads,
+                    budget,
                 )
                 .await;
         }
@@ -3429,7 +3426,7 @@ impl VectorReader {
             allow,
             deny,
             pool,
-            reads,
+            budget,
         };
         let (hits, mut tally) = self
             .probe_clusters_async(col, query, &ctx, &cluster_idx, &chosen, None)
@@ -3484,7 +3481,7 @@ impl VectorReader {
         allow: Option<Arc<RoaringBitmap>>,
         deny: Option<Arc<RoaringBitmap>>,
         pool: Option<Arc<ThreadPool>>,
-        reads: Option<ColdReadGate>,
+        budget: Option<Arc<ConnectionMemoryBudget>>,
     ) -> Result<(Vec<(u32, f32)>, ProbeTally), VectorError> {
         if !self.column_id_by_name.contains_key(column) {
             return Err(VectorError::UnknownColumn(column.to_string()));
@@ -3575,7 +3572,7 @@ impl VectorReader {
                 return None;
             }
             let pool = pool.clone();
-            let reads = reads.clone();
+            let budget = budget.clone();
             Some(async move {
                 let sub_start = col.subsection_range.start;
                 let idx_start = sub_start + col.cluster_idx_off;
@@ -3588,7 +3585,7 @@ impl VectorReader {
                     allow: cell_allow,
                     deny: cell_deny,
                     pool,
-                    reads,
+                    budget,
                 };
                 let (hits, mut tally) = self
                     .probe_clusters_async(col, query, &ctx, &cluster_idx, &locals, None)
@@ -3677,7 +3674,7 @@ impl VectorReader {
         allow: Option<Arc<RoaringBitmap>>,
         deny: Option<Arc<RoaringBitmap>>,
         pool: Option<Arc<ThreadPool>>,
-        reads: Option<ColdReadGate>,
+        budget: Option<Arc<ConnectionMemoryBudget>>,
     ) -> Result<ScanOutcome, VectorError> {
         let rot_seed = self
             .columns
@@ -3821,7 +3818,7 @@ impl VectorReader {
                 .as_ref()
                 .map(|m| m.get(&cell_idx).map(Arc::clone).unwrap_or_default());
             let pool = pool.clone();
-            let reads = reads.clone();
+            let budget = budget.clone();
             Some(async move {
                 let sub_start = col.subsection_range.start;
                 let idx_start = sub_start + col.cluster_idx_off;
@@ -3888,7 +3885,7 @@ impl VectorReader {
                         allow: cell_allow,
                         deny: cell_deny,
                         pool,
-                        reads,
+                        budget,
                     };
                     let coarse_limit = if budget_per_cluster {
                         k.saturating_mul(rerank_mult)
@@ -3947,7 +3944,7 @@ impl VectorReader {
                     allow: cell_allow,
                     deny: cell_deny,
                     pool,
-                    reads,
+                    budget,
                 };
                 let (hits, probe_tally) = self
                     .probe_clusters_async(
@@ -4013,7 +4010,7 @@ impl VectorReader {
         k: usize,
         selected: Vec<ScanCandidate>,
         pool: Option<Arc<ThreadPool>>,
-        reads: Option<ColdReadGate>,
+        budget: Option<Arc<ConnectionMemoryBudget>>,
     ) -> Result<(Vec<(u32, f32)>, u64), VectorError> {
         if selected.is_empty() || k == 0 {
             return Ok((Vec::new(), 0));
@@ -4028,7 +4025,7 @@ impl VectorReader {
         let cell_reranks = by_cell.into_iter().filter_map(|(cell_idx, cands)| {
             let col = self.columns.get(cell_idx)?;
             let pool = pool.clone();
-            let reads = reads.clone();
+            let budget = budget.clone();
             Some(async move {
                 let sub_start = col.subsection_range.start;
                 let idx_start = sub_start + col.cluster_idx_off;
@@ -4109,7 +4106,7 @@ impl VectorReader {
                     cold_ranges.extend_from_slice(plan.fetch_ranges());
                 }
                 let _cold_guard =
-                    admit_cold_fetch(&self.source, &cold_ranges, reads.as_ref()).await?;
+                    admit_cold_fetch(&self.source, &cold_ranges, budget.as_ref()).await?;
                 let meta_bytes = if let Some(range) = meta_range {
                     let mut fetched = self.source.get_ranges_parallel_async(&[range]).await?;
                     fetched.pop()
@@ -4160,11 +4157,9 @@ impl VectorReader {
                         (rows?, ns)
                     }
                     SurvivorRows::Remote(plan, plan_ns) => {
-                        let fetched = self
-                            .source
-                            .get_ranges_parallel_async(plan.fetch_ranges())
-                            .await?;
-                        let (restored, restore_ns) = timed_section(|| plan.restore(&fetched));
+                        // Reserved with the meta above, so no second reservation.
+                        let (restored, restore_ns) =
+                            fetch_planned_reserved_async(&self.source, &plan).await?;
                         (restored, plan_ns.saturating_add(restore_ns))
                     }
                 };
@@ -4272,7 +4267,7 @@ impl VectorReader {
             .map(|range| self.source.try_get_range_sync(range.clone()))
             .collect();
 
-        // The cold fetch's reservation, taken through the query's read gate
+        // The cold fetch's reservation, taken from the connection budget
         // before it fires and held for the rest of the probe: it covers every
         // byte the download holds. Warm slices take nothing. Declared before
         // the fetched bytes so it is dropped after them.
@@ -4330,8 +4325,8 @@ impl VectorReader {
                     extras.len() - 1
                 });
                 let plan = probe_wave_plan(&cluster_full_ranges, &extras);
-                let (permit, mut blocks) =
-                    fetch_planned_async(&self.source, &plan, ctx.reads.as_ref()).await?;
+                let (permit, mut blocks, _) =
+                    fetch_planned_async(&self.source, &plan, ctx.budget.as_ref()).await?;
                 _cold_guard = permit;
                 let extra_bytes = blocks.split_off(cluster_full_ranges.len());
                 let meta = meta_slot.map(|i| extra_bytes[i].clone());
@@ -4403,7 +4398,7 @@ impl VectorReader {
         let survivor_full_rows = match survivor_full_ranges {
             Some(ranges) => {
                 let (permit, rows, gather_ns) =
-                    get_survivor_ranges_coalesced_async(&self.source, &ranges, ctx.reads.as_ref())
+                    get_survivor_ranges_coalesced_async(&self.source, &ranges, ctx.budget.as_ref())
                         .await?;
                 _survivor_guard = permit;
                 tally.kernel_cpu_ns += gather_ns;
@@ -4872,7 +4867,7 @@ async fn scan_shortlist(
                 &codes,
                 cnt as usize,
                 cb,
-                ctx.reads.as_ref().map(ColdReadGate::budget),
+                ctx.budget.as_ref(),
             )
         {
             scan_cluster_transposed(
@@ -4910,7 +4905,7 @@ async fn scan_shortlist(
         let chunk = cluster_meta.len().div_ceil(n_tasks).max(1);
         let quant = col.quant.clone();
         let transposed_cache = Arc::clone(&col.transposed_codes);
-        let budget_owned = ctx.reads.as_ref().map(|r| Arc::clone(r.budget()));
+        let budget_owned = ctx.budget.clone();
         let lut_owned = lut_query.clone();
         let q_rot_v: Vec<f32> = ctx.q_rot.to_vec();
         let meta_owned: Vec<(usize, u32, u32)> = cluster_meta.to_vec();
@@ -6445,12 +6440,18 @@ fn lazy_sq8_meta_range(col: &ColumnReader) -> Option<Range<usize>> {
     Some(*scale_abs_off..*scale_abs_off + meta_bytes)
 }
 
-// Reserve the bytes a cold fetch is about to allocate through the query's read
-// gate. Pass the ranges exactly as they will be downloaded (after coalescing),
-// so the gaps a merged range carries are counted too: the download holds them
-// as long as any slice of it is alive. If the budget refuses, wait for the
-// query's other reads to let go; if none hold memory, fail the search with
-// [`VectorError::OverBudget`] before anything is allocated.
+// Reserve from the connection budget the bytes a cold fetch is about to
+// allocate. Pass the ranges exactly as they will be downloaded (after
+// coalescing), so the gaps a merged range carries are counted too: the download
+// holds them as long as any slice of it is alive. If the budget refuses, wait
+// for another cold read on the connection to let go; if waiting can't help,
+// fail the search with [`VectorError::OverBudget`] before anything is allocated.
+// See [`ConnectionMemoryBudget::admit_cold_read`].
+//
+// The cell's small metadata reads (its cluster index, and the Sq8 meta when
+// the cell's blocks are already in memory) are not reserved: they are a few
+// entries per cluster, and reserving them separately would let a read wait
+// while it holds another reservation.
 //
 // Only the ranges that must be fetched are counted. A range already in memory
 // is returned as a zero-copy slice and needs no new memory, so each range is
@@ -6463,10 +6464,10 @@ fn lazy_sq8_meta_range(col: &ColumnReader) -> Option<Range<usize>> {
 async fn admit_cold_fetch(
     source: &Source,
     ranges: &[Range<usize>],
-    reads: Option<&ColdReadGate>,
+    budget: Option<&Arc<ConnectionMemoryBudget>>,
 ) -> Result<Option<ColdReadPermit>, VectorError> {
-    let Some(reads) = reads else {
-        // No gate attached: measure-only, nothing to gate.
+    let Some(budget) = budget else {
+        // No budget attached: measure-only, nothing to reserve.
         return Ok(None);
     };
 
@@ -6481,8 +6482,8 @@ async fn admit_cold_fetch(
         return Ok(None);
     }
 
-    reads
-        .admit(cold_bytes)
+    budget
+        .admit_cold_read(cold_bytes)
         .await
         .map(Some)
         .map_err(|e| VectorError::OverBudget(format!("vector search, {e}")))
@@ -6517,34 +6518,42 @@ fn probe_wave_plan(ranges: &[Range<usize>], extras: &[Range<usize>]) -> RangeCoa
     )
 }
 
-fn get_cluster_ranges_coalesced_with_extras(
-    source: &Source,
-    ranges: &[Range<usize>],
-    extras: &[Range<usize>],
-) -> Result<(Vec<Bytes>, Vec<Bytes>), LazyByteSourceError> {
-    let plan = probe_wave_plan(ranges, extras);
-    let fetched = source.get_ranges_parallel(plan.fetch_ranges())?;
-    let mut restored = plan.restore(&fetched);
-    let extra_bytes = restored.split_off(ranges.len());
-    Ok((restored, extra_bytes))
-}
-
-/// Async sibling of [`get_cluster_ranges_coalesced_with_extras`], for a
-/// plan built by [`probe_wave_plan`]: reserves the bytes the download will
-/// hold from the query's read gate, then fetches them as one `try_join_all`
-/// batch on the caller's runtime so connections pool and the fan-out is
-/// concurrent. Returns the permit with the restored ranges in plan order;
-/// hold it while any of them is in use.
-async fn fetch_planned_async(
+/// Fetch the ranges of a coalesce plan and return each requested range, in
+/// plan order, sliced out of the merged downloads.
+fn fetch_planned(
     source: &Source,
     plan: &RangeCoalescePlan,
-    reads: Option<&ColdReadGate>,
-) -> Result<(Option<ColdReadPermit>, Vec<Bytes>), VectorError> {
-    let permit = admit_cold_fetch(source, plan.fetch_ranges(), reads).await?;
+) -> Result<Vec<Bytes>, LazyByteSourceError> {
+    let fetched = source.get_ranges_parallel(plan.fetch_ranges())?;
+    Ok(plan.restore(&fetched))
+}
+
+/// Async sibling of [`fetch_planned`], for bytes the caller has already
+/// reserved: fetches the plan as one `try_join_all` batch on the caller's
+/// runtime so connections pool and the fan-out is concurrent, and returns the
+/// ranges in plan order with the on-CPU nanoseconds of slicing them out of
+/// the downloads.
+async fn fetch_planned_reserved_async(
+    source: &Source,
+    plan: &RangeCoalescePlan,
+) -> Result<(Vec<Bytes>, u64), VectorError> {
     let fetched = source
         .get_ranges_parallel_async(plan.fetch_ranges())
         .await?;
-    Ok((permit, plan.restore(&fetched)))
+    Ok(timed_section(|| plan.restore(&fetched)))
+}
+
+/// [`fetch_planned_reserved_async`] that first reserves the bytes the
+/// download will hold from the connection budget, when one is given. Returns
+/// the permit too; hold it while any range is in use.
+async fn fetch_planned_async(
+    source: &Source,
+    plan: &RangeCoalescePlan,
+    budget: Option<&Arc<ConnectionMemoryBudget>>,
+) -> Result<(Option<ColdReadPermit>, Vec<Bytes>, u64), VectorError> {
+    let permit = admit_cold_fetch(source, plan.fetch_ranges(), budget).await?;
+    let (restored, restore_ns) = fetch_planned_reserved_async(source, plan).await?;
+    Ok((permit, restored, restore_ns))
 }
 
 /// The coalesced download for survivor rows: plan/restore over the
@@ -6575,16 +6584,11 @@ fn get_survivor_ranges_coalesced(
     if ranges.is_empty() {
         return Ok(Vec::new());
     }
-    if ranges.len() == 1 {
-        return source.get_ranges_parallel(ranges);
-    }
-    let plan = survivor_plan(ranges);
-    let fetched = source.get_ranges_parallel(plan.fetch_ranges())?;
-    Ok(plan.restore(&fetched))
+    fetch_planned(source, &survivor_plan(ranges))
 }
 
 /// Async sibling of [`get_survivor_ranges_coalesced`], reserving what it
-/// downloads from the query's read gate first.
+/// downloads from the connection budget first.
 /// Returns the read's permit (hold it while the blocks are in use) and the
 /// gathered survivor blocks, plus the on-CPU nanoseconds its
 /// synchronous halves cost: planning the coalesce (a sort plus a merge
@@ -6596,21 +6600,13 @@ fn get_survivor_ranges_coalesced(
 async fn get_survivor_ranges_coalesced_async(
     source: &Source,
     ranges: &[Range<usize>],
-    reads: Option<&ColdReadGate>,
+    budget: Option<&Arc<ConnectionMemoryBudget>>,
 ) -> Result<(Option<ColdReadPermit>, Vec<Bytes>, u64), VectorError> {
     if ranges.is_empty() {
         return Ok((None, Vec::new(), 0));
     }
-    if ranges.len() == 1 {
-        let permit = admit_cold_fetch(source, ranges, reads).await?;
-        return Ok((permit, source.get_ranges_parallel_async(ranges).await?, 0));
-    }
     let (plan, plan_ns) = timed_section(|| survivor_plan(ranges));
-    let permit = admit_cold_fetch(source, plan.fetch_ranges(), reads).await?;
-    let fetched = source
-        .get_ranges_parallel_async(plan.fetch_ranges())
-        .await?;
-    let (restored, restore_ns) = timed_section(|| plan.restore(&fetched));
+    let (permit, restored, restore_ns) = fetch_planned_async(source, &plan, budget).await?;
     Ok((permit, restored, plan_ns.saturating_add(restore_ns)))
 }
 
@@ -7810,10 +7806,10 @@ mod tests {
     }
 
     /// A cold search of both clusters of the first cell of [`one_cell_blob`]
-    /// or [`two_cell_blob`], through `reads`.
+    /// or [`two_cell_blob`], under `budget`.
     async fn search_small_cell(
         lazy: &VectorReader,
-        reads: Option<ColdReadGate>,
+        budget: Option<Arc<ConnectionMemoryBudget>>,
     ) -> Result<Vec<(u32, f32)>, VectorError> {
         let (hits, _) = lazy
             .search_clusters_async(
@@ -7825,7 +7821,7 @@ mod tests {
                 None,
                 None,
                 None,
-                reads,
+                budget,
             )
             .await?;
         Ok(hits)
@@ -7841,7 +7837,7 @@ mod tests {
         let (source, lazy) = open_fresh(blob, &json).await;
         let opened = source.download_sizes().len();
         let budget = ConnectionMemoryBudget::measured();
-        let hits = search_small_cell(&lazy, Some(ColdReadGate::new(Arc::clone(&budget))))
+        let hits = search_small_cell(&lazy, Some(Arc::clone(&budget)))
             .await
             .expect("measured budget never refuses");
         assert!(!hits.is_empty());
@@ -7852,10 +7848,15 @@ mod tests {
         let searched = &source.download_sizes()[opened..];
         assert_eq!(searched.first(), Some(&index_bytes), "{searched:?}");
         let probe_bytes: usize = searched[1..].iter().sum();
+        // Where the scan kernel takes transposed codes, the open reader keeps
+        // them reserved on the same budget after the search; the probe's own
+        // reservation is the rest of the peak.
+        let kept = budget.used();
         assert_eq!(
             budget.peak(),
-            probe_bytes,
-            "the reservation must cover the probe's whole download {searched:?}"
+            probe_bytes + kept,
+            "the reservation must cover the probe's whole download {searched:?} \
+             (the reader keeps {kept} B)"
         );
     }
 
@@ -7900,7 +7901,7 @@ mod tests {
                 3,
                 scan.candidates,
                 None,
-                Some(ColdReadGate::new(Arc::clone(&budget))),
+                Some(Arc::clone(&budget)),
             )
             .await
             .expect("measured budget never refuses");
@@ -11372,7 +11373,7 @@ mod tests {
                 None,
                 None,
                 None,
-                Some(ColdReadGate::new(budget.clone())),
+                Some(budget.clone()),
             )
             .await
             .expect_err("cold fetch over a 0-byte gate is refused");
@@ -11403,7 +11404,7 @@ mod tests {
                 None,
                 None,
                 None,
-                Some(ColdReadGate::new(budget.clone())),
+                Some(budget.clone()),
             )
             .await
             .expect("measured budget never refuses");
@@ -11423,10 +11424,14 @@ mod tests {
             2,
             "routing read, then the probe: {searched:?}"
         );
+        // Transposed codes the reader keeps after the search are reserved on
+        // the same budget where the scan kernel takes them.
+        let kept = budget.used();
         assert_eq!(
             budget.peak(),
-            searched[1],
-            "the reservation must cover the probe's whole download {searched:?}"
+            searched[1] + kept,
+            "the reservation must cover the probe's whole download {searched:?} \
+             (the reader keeps {kept} B)"
         );
     }
 
@@ -11450,7 +11455,7 @@ mod tests {
                 None,
                 None,
                 None,
-                Some(ColdReadGate::new(budget.clone())),
+                Some(budget.clone()),
             )
             .await
             .expect("warm search allocates nothing, so it is not gated");
@@ -11481,7 +11486,7 @@ mod tests {
                 None,
                 None,
                 None,
-                Some(ColdReadGate::new(budget.clone())),
+                Some(budget.clone()),
             )
             .await
             .expect("second warm search");
