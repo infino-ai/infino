@@ -95,7 +95,6 @@ use std::{
     collections::BinaryHeap,
     fs,
     fs::File,
-    hash::{BuildHasher, Hash},
     io::{self, BufReader, BufWriter, Error, ErrorKind, Read, Seek, SeekFrom, Write},
     mem,
     ops::Range,
@@ -106,12 +105,12 @@ use std::{
 };
 
 use bumpalo::Bump;
-use hashbrown::hash_map::{HashMap as HbHashMap, RawEntryMut};
 use memmap2::Mmap;
 use rayon::ThreadPool;
-use rustc_hash::FxBuildHasher;
 use tempfile::{Builder, TempDir};
 use tracing::debug;
+
+use super::term_table::TermTable;
 
 use crate::{
     config::scratch_root,
@@ -143,43 +142,25 @@ use crate::{
     },
 };
 
-/// Per-column term interner table.
+/// Term bytes interned for a column, borrowed from its arena.
 ///
-/// Keys are `&'static str` slices that **actually borrow from the
-/// per-column `term_arena: bumpalo::Bump`** stored alongside the
-/// map in the column's [`Vocab`]. The `'static`
-/// lifetime tag is a lie maintained by `unsafe` `std::mem::
-/// transmute` at insertion (see [`intern_term_id`]) and
-/// kept sound by two structural invariants:
+/// Entries of a [`Vocab`]'s `id_to_term` are `&'static str` slices that
+/// **actually borrow from the per-column `term_arena: bumpalo::Bump`**
+/// stored alongside them. The `'static` lifetime tag is a lie maintained
+/// by `unsafe` `std::mem::transmute` at insertion (see
+/// [`intern_term_id`]) and kept sound by two structural invariants:
 ///
-/// 1. The arena outlives the map. [`Vocab`] declares `term_arena`
-///    *after* `term_to_id` and `id_to_term` so Rust drops it last
-///    (struct fields drop in declaration order, so the last-declared
-///    field is the last-dropped). The `finish_to` per-column blocks
-///    that destructure a `Vocab` likewise add an explicit
-///    `drop(term_arena)` after the last use of `id_to_term` for the
-///    same reason.
-/// 2. No method on the map's keys does a deref during the map's
-///    own `Drop`. `&str` has no `Drop` impl, so dropping the map
-///    just deallocates the bucket table without touching the
-///    key bytes. The arena can therefore safely outlast the
-///    map's body without the map ever needing arena bytes
-///    during its own teardown.
+/// 1. The arena outlives the list. [`Vocab`] declares `term_arena` last
+///    so Rust drops it last (struct fields drop in declaration order).
+///    The finish blocks that destructure a `Vocab` likewise add an
+///    explicit `drop(term_arena)` after the last use of `id_to_term`.
+/// 2. Dropping the list never dereferences an entry: `&str` has no
+///    `Drop` impl, so the arena can outlast the list's body without the
+///    list needing its bytes during teardown.
 ///
-/// Switching from `Box<str>` keys to arena `&str` keys:
-///
-///   * removes one `Box<str>` heap allocation per intern miss
-///     (was: one for the map key + one cloned for `id_to_term`;
-///     now: one bump-arena copy reused by both);
-///   * packs all term bytes densely in the bump arena instead
-///     of scattering them across the global heap, which keeps
-///     the byte-compare fast path inside `raw_entry_mut` cache-
-///     hot on the per-token spill-arm hot loop (the bench
-///     vocab is ~10K terms × ~5-10 byte average = ~75 KiB
-///     total, comfortably L2-resident as one contiguous arena
-///     instead of ~10K separate heap allocations chasing
-///     pointers through unrelated allocator buckets).
-type TermIdMap = HbHashMap<&'static str, u32, FxBuildHasher>;
+/// All of a column's term bytes sit densely in one arena, with one
+/// bump-pointer copy per new term and no heap allocation of its own.
+type ArenaStr = &'static str;
 
 /// Chain terminator for the per-doc position chains
 /// (`FtsBuilder::doc_pos_chain`): no previous occurrence.
@@ -496,11 +477,11 @@ impl ColumnState {
 /// it, so the transition from the in-RAM store to the spilled one keeps
 /// every id and rewrites no term.
 struct Vocab {
-    /// Term → dense id. Keys borrow from `term_arena` (see [`TermIdMap`]).
-    term_to_id: TermIdMap,
+    /// Term → dense id. Long terms are confirmed against `id_to_term`.
+    term_to_id: TermTable,
     /// Id → term bytes, for the dictionary emit and the lex-rank table.
-    /// Entries borrow from `term_arena` like the map's keys.
-    id_to_term: Vec<&'static str>,
+    /// Entries borrow from `term_arena` (see [`ArenaStr`]).
+    id_to_term: Vec<ArenaStr>,
     /// Per-doc tf accumulator indexed by id. Dense ids make this one
     /// array store per token where a hash probe would cost several
     /// times more. `dense_doc_tf[id] != 0` iff `id` is in
@@ -516,16 +497,16 @@ struct Vocab {
     /// `add_doc`. Bounded by the doc's distinct terms, reused across docs.
     updated_terms: Vec<u32>,
     /// Owns the term bytes behind `term_to_id` and `id_to_term`.
-    /// **Declared last so it drops last**: the map and the vec free
-    /// their tables without dereferencing a key, and only then does the
-    /// arena release the bytes (see [`TermIdMap`]).
+    /// **Declared last so it drops last**: the table and the vec free
+    /// their memory without dereferencing a term, and only then does the
+    /// arena release the bytes (see [`ArenaStr`]).
     term_arena: Bump,
 }
 
 impl Vocab {
     fn new() -> Self {
         Self {
-            term_to_id: TermIdMap::default(),
+            term_to_id: TermTable::new(),
             id_to_term: Vec::new(),
             dense_doc_tf: Vec::new(),
             dense_doc_poshead: Vec::new(),
@@ -937,11 +918,6 @@ fn build_lex_rank(id_to_term: &[&str]) -> (Vec<u32>, Vec<u32>) {
     (rank, by_lex)
 }
 
-#[inline(always)]
-fn compute_hash<Q: Hash + ?Sized, S: BuildHasher>(hash_builder: &S, key: &Q) -> u64 {
-    hash_builder.hash_one(key)
-}
-
 /// The error every call on a builder whose `add_doc` failed partway
 /// through a document returns.
 fn failed_builder() -> BuildError {
@@ -963,25 +939,11 @@ fn lane_outgrown() -> BuildError {
 /// Intern `term` in a column's vocabulary and return its stable
 /// `term_id`.
 ///
-/// This is the hot `add_doc` lookup. Use hashbrown's raw entry
-/// API so miss handling reuses the hash computed for lookup instead
-/// of doing `get(term)` (probe once) followed by `insert(boxed, id)`
-/// (rehash + probe again). Hit behaviour remains one borrowed lookup
-/// with no allocation; misses copy the term bytes into the per-column
-/// `term_arena: bumpalo::Bump` (one bump-pointer advance + memcpy, no
-/// heap allocator round-trip) and store the resulting `&str` slice in
-/// both the map and `id_to_term` (a reference copy, no second heap
-/// alloc — replaces the prior `Box<str>` + `boxed.clone()` pattern
-/// which paid two heap allocations per miss).
-///
-/// The on-hit cost benefit is the more important change at scale:
-/// every intern hit's byte-compare inside `raw_entry_mut` previously
-/// dereferenced an arbitrary `Box<str>` whose backing bytes sat
-/// wherever the global allocator placed it (typically scattered
-/// across cache lines, often L2-cold for vocabularies >~1 KB worth
-/// of total key bytes). Arena-backed keys live densely in a single
-/// contiguous `bumpalo::Bump` so the byte-compare hits L1/L2 the
-/// vast majority of the time, regardless of vocab size.
+/// This is the hot `add_doc` lookup: one probe of the [`TermTable`],
+/// which decides a hit from the slot alone for any term of up to 16
+/// bytes. A miss copies the term bytes into the per-column `term_arena`
+/// (one bump-pointer advance and a copy, no heap allocation) and
+/// records the slice in `id_to_term` under the new id.
 ///
 /// Returns `(term_id, is_new)`. `is_new == true` iff this call minted
 /// a brand-new id (`term_to_id` previously had no entry for `term`).
@@ -992,44 +954,34 @@ fn lane_outgrown() -> BuildError {
 /// which is once per novel term per column — not once per token.
 ///
 /// SAFETY (invariants enforced by callers and the [`Vocab`] struct
-/// layout, see [`TermIdMap`] doc): the `'static` lifetime tag on the
-/// keys is a lie — the real lifetime is that of `arena`. The
-/// transmute below is sound iff (a) `arena` outlives both
-/// `term_to_id` and `id_to_term`, and (b) no key dereference happens
-/// after `arena`'s `Drop` runs. Both hold by construction: `arena`
-/// is declared *after* the map and reverse-vec in [`Vocab`] so it
-/// drops *last*, and the `Drop` impls for `HbHashMap<&'static str,
-/// u32, _>` and `Vec<&'static str>` never dereference their
-/// `&str` keys/entries (no `Drop` to run on a reference).
+/// layout, see [`ArenaStr`]): the `'static` lifetime tag on the
+/// entries of `id_to_term` is a lie — the real lifetime is that of
+/// `arena`. The transmute below is sound iff (a) `arena` outlives
+/// `id_to_term` and the table that reads it, and (b) no entry is
+/// dereferenced after `arena`'s `Drop` runs. Both hold by construction:
+/// `arena` is declared last in [`Vocab`] so it drops last, and dropping
+/// a `Vec<&'static str>` never dereferences its entries.
 #[inline(always)]
 fn intern_term_id(
-    term_to_id: &mut TermIdMap,
-    id_to_term: &mut Vec<&'static str>,
+    term_to_id: &mut TermTable,
+    id_to_term: &mut Vec<ArenaStr>,
     arena: &Bump,
     term: &str,
 ) -> (u32, bool) {
-    let hash = compute_hash(term_to_id.hasher(), term);
-    match term_to_id
-        .raw_entry_mut()
-        .from_hash(hash, |existing| *existing == term)
-    {
-        RawEntryMut::Occupied(entry) => (*entry.get(), false),
-        RawEntryMut::Vacant(entry) => {
-            let id = id_to_term.len() as u32;
-            // Bump-arena copy: one pointer advance + memcpy of the
-            // term bytes, returning a `&str` whose lifetime is tied
-            // to `&arena`'s borrow scope.
-            let arena_str: &str = arena.alloc_str(term);
-            // SAFETY: see function-level doc. The `'static` tag is
-            // a lie; the real lifetime is `arena`'s, which [`Vocab`]
-            // guarantees outlives the map + id_to_term via field
-            // drop order.
-            let static_str: &'static str = unsafe { std::mem::transmute(arena_str) };
-            id_to_term.push(static_str);
-            entry.insert_hashed_nocheck(hash, static_str, id);
-            (id, true)
-        }
+    let (id, is_new) = term_to_id.intern(term.as_bytes(), id_to_term);
+    if is_new {
+        debug_assert_eq!(id as usize, id_to_term.len());
+        // Bump-arena copy: one pointer advance + memcpy of the term
+        // bytes, returning a `&str` whose lifetime is tied to `&arena`'s
+        // borrow scope.
+        let arena_str: &str = arena.alloc_str(term);
+        // SAFETY: see function-level doc. The `'static` tag is a lie;
+        // the real lifetime is `arena`'s, which [`Vocab`] guarantees
+        // outlives `id_to_term` via field drop order.
+        let static_str: ArenaStr = unsafe { std::mem::transmute(arena_str) };
+        id_to_term.push(static_str);
     }
+    (id, is_new)
 }
 
 /// Min-heap entry for the k-way merge over sorted partition chunks.
