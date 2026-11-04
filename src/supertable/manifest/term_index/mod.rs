@@ -1401,9 +1401,12 @@ enum ObjectCheck {
 
 /// Whether every slice and tier object `root` names is on storage, filling
 /// in each slice length `root` lacks from what storage reports, and which
-/// layers hold a slice of the layout before tiers. One request per object
-/// `seen` lacks — a slice's first bytes, a tier object's metadata — and one
-/// for the length of each slice whose length is unknown. Objects found in
+/// layers hold a slice of the layout before tiers. Each layer `seen` lacks
+/// costs two requests, its first slice's first bytes and one tier object's
+/// metadata: one build writes all of a layer's slices, so one tells the
+/// layer's layout, and an object missing elsewhere fails the fold that reads
+/// it, which indexes again. One more request finds the length of each slice
+/// whose length is unknown. Objects found in
 /// the current layout are added to `seen`. The objects are
 /// content-addressed and the sweep keeps every object a live root names,
 /// so one found stays so for the life of the process; a pass asks about
@@ -1432,20 +1435,24 @@ pub(crate) async fn check_objects(
     let wanted: HashSet<(ContentHash, ObjectCheck)> = {
         let seen = seen.lock().expect("term-index objects seen");
         let mut wanted = HashSet::new();
-        for slice in root
-            .layers
-            .iter()
-            .filter(|layer| names_live(layer))
-            .flat_map(|layer| &layer.slices)
-        {
-            if !seen.contains(&slice.content_hash) {
+        for layer in root.layers.iter().filter(|layer| names_live(layer)) {
+            if let Some(slice) = layer
+                .slices
+                .first()
+                .filter(|slice| !seen.contains(&slice.content_hash))
+            {
                 wanted.insert((slice.content_hash, ObjectCheck::SliceLayout));
             }
-            if slice.len == 0 {
-                wanted.insert((slice.content_hash, ObjectCheck::SliceSize));
-            }
-            if let Some(tier) = slice.tier.filter(|tier| !seen.contains(tier)) {
+            if let Some(tier) = layer
+                .slices
+                .iter()
+                .find_map(|slice| slice.tier)
+                .filter(|tier| !seen.contains(tier))
+            {
                 wanted.insert((tier, ObjectCheck::Tier));
+            }
+            for slice in layer.slices.iter().filter(|slice| slice.len == 0) {
+                wanted.insert((slice.content_hash, ObjectCheck::SliceSize));
             }
         }
         wanted
