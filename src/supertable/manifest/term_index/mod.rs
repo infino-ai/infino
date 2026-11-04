@@ -71,6 +71,7 @@ pub(crate) use tier::{BLOCK_ENTRIES, ColumnScoring, TierChunkRef, TierDirectory,
 use tokio::{
     fs as async_fs,
     io::AsyncWriteExt,
+    select,
     sync::{
         Notify,
         mpsc::{UnboundedReceiver, unbounded_channel},
@@ -472,7 +473,20 @@ async fn upload_objects(
 ) -> Result<(), TermIndexError> {
     let mut running: JoinSet<Result<(), TermIndexError>> = JoinSet::new();
     let outcome = async {
-        while let Some((kind, hash, built)) = objects.recv().await {
+        loop {
+            // A finished put is looked at before the next object, so a
+            // failure ends the upload and the merge's next send sees it.
+            let next = select! {
+                biased;
+                Some(joined) = running.join_next(), if !running.is_empty() => {
+                    joined.map_err(|e| TermIndexError::Build(format!("object write: {e}")))??;
+                    continue;
+                }
+                next = objects.recv() => next,
+            };
+            let Some((kind, hash, built)) = next else {
+                break;
+            };
             while running.len() >= 2 * SLICE_WRITE_CONCURRENCY {
                 join_one(&mut running, "object write").await?;
             }
@@ -9637,6 +9651,45 @@ mod tests {
             .expect("fold");
         assert_eq!(root.layers.len(), 1);
         assert_eq!(root.layers[0].slices.len(), 1, "a small run is one range");
+    }
+
+    /// A failed put ends the upload while the merge still holds its sink
+    /// open, so the merge's next send fails and the merge stops.
+    #[test]
+    fn a_failed_put_ends_the_upload_before_the_merge_finishes() {
+        let store_dir = TempDir::new().expect("store");
+        let local: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(store_dir.path()).expect("local"));
+        let faults = FaultStorage::wrap(local);
+        let faulty = Arc::clone(&faults) as Arc<dyn StorageProvider>;
+        faults.fail(FaultOp::PutAtomic, STORAGE_PREFIX, 1);
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        rt.block_on(async {
+            let (sink, objects) = unbounded_channel();
+            let object = b"one object".to_vec();
+            sink.send((
+                "slice",
+                ContentHash::of(&object),
+                BuiltBytes::Resident(object),
+            ))
+            .expect("send");
+            let uploaded = tokio::time::timeout(
+                Duration::from_secs(30),
+                upload_objects(faulty, objects, None),
+            )
+            .await;
+            assert!(
+                matches!(uploaded, Ok(Err(_))),
+                "the failed put ends the upload with the sink still open: {uploaded:?}"
+            );
+            let next = b"next object".to_vec();
+            assert!(
+                sink.send(("slice", ContentHash::of(&next), BuiltBytes::Resident(next)))
+                    .is_err(),
+                "the merge's next send sees the uploader gone"
+            );
+        });
+        assert_eq!(faults.fired(), 1);
     }
 
     /// A fold that keeps what it uploads lets the next fold of the same call
