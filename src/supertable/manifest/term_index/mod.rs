@@ -8188,7 +8188,7 @@ mod tests {
                 let mine: Vec<(&str, &str, u64)> = terms
                     .iter()
                     .enumerate()
-                    .filter(|(i, _)| (*i as u128) % id == 0)
+                    .filter(|(i, _)| (*i as u128).is_multiple_of(id))
                     .map(|(i, t)| ("body", t.as_str(), 1 + (i as u64 % 3)))
                     .collect();
                 contribution(&dir, id, &mine)
