@@ -97,7 +97,10 @@ use crate::{
     utils::{
         bytes::{u32_le_at, u64_le_at},
         terms::{DictEntry, TermBlocks},
-        varint::{push_u64_varint, push_varint, read_u64_varint, read_varint},
+        varint::{
+            push_doc_facts, push_u64_varint, push_varint, read_doc_facts, read_u64_varint,
+            read_varint,
+        },
     },
 };
 
@@ -656,23 +659,6 @@ pub(crate) fn push_posting(out: &mut Vec<u8>, p: &Posting) {
             push_varint(out, tf);
         }
     }
-}
-
-/// Append a document's facts — row, term frequency, length bucket — as a
-/// head or contribution record carries them.
-pub(crate) fn push_doc_facts(out: &mut Vec<u8>, row: u32, tf: u32, len: u8) {
-    push_varint(out, row);
-    push_varint(out, tf);
-    out.push(len);
-}
-
-/// Read what [`push_doc_facts`] wrote at `at`, advancing it; `None` short.
-pub(crate) fn read_doc_facts(bytes: &[u8], at: &mut usize) -> Option<(u32, u32, u8)> {
-    let row = read_varint(bytes, at)?;
-    let tf = read_varint(bytes, at)?;
-    let len = *bytes.get(*at)?;
-    *at += 1;
-    Some((row, tf, len))
 }
 
 /// Encode a term's run: count, the tier reference, then its postings in

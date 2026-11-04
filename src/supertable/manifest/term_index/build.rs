@@ -44,8 +44,7 @@ use super::{
     TermIndexError,
     format::{
         BlockMark, Layer, Location, Posting, Root, Run, Slice, SliceRef, TierRef, encode_run,
-        encode_slice, legacy_bound_as_key, push_doc_facts, push_posting, read_doc_facts,
-        read_posting,
+        encode_slice, legacy_bound_as_key, push_posting, read_posting,
     },
     tier::{
         BLOCK_ENTRIES, ColumnScoring, EncodedChunk, HeadGroup, SplicedBlock, TierChunk,
@@ -63,7 +62,7 @@ use crate::{
     utils::{
         terms::{DictEntry, TermBlockWriter},
         trace::{detail_span, record},
-        varint::{CONTINUATION_BIT, push_varint, read_u64_varint, read_varint},
+        varint::{CONTINUATION_BIT, push_head, push_varint, read_head, read_u64_varint},
     },
 };
 
@@ -637,6 +636,8 @@ pub(crate) struct ContributionWriter {
     record: Vec<u8>,
     /// The record's length prefix.
     frame: Vec<u8>,
+    /// A head handed over as documents, encoded for the record.
+    head: Vec<u8>,
     /// Bytes written so far: where the next record starts.
     offset: u64,
     /// Some records' keys with the offsets they start at (see
@@ -691,6 +692,7 @@ impl ContributionWriter {
             n_terms: 0,
             record: Vec::new(),
             frame: Vec::new(),
+            head: Vec::new(),
             offset: 0,
             marks: Vec::new(),
         })
@@ -722,6 +724,25 @@ impl ContributionWriter {
         tail: f32,
         head: &[(u32, u32, u8)],
     ) -> Result<(), TermIndexError> {
+        let mut encoded = mem::take(&mut self.head);
+        encoded.clear();
+        push_head(&mut encoded, head.iter().copied());
+        let pushed = self.push_encoded(key, df, bound, location, tail, &encoded);
+        self.head = encoded;
+        pushed
+    }
+
+    /// [`Self::push`] with the head already encoded by [`push_head`], as a
+    /// superfile build's encoders hand it over: the record copies it.
+    pub(crate) fn push_encoded(
+        &mut self,
+        key: &[u8],
+        df: u64,
+        bound: f32,
+        location: Location,
+        tail: f32,
+        head: &[u8],
+    ) -> Result<(), TermIndexError> {
         if self.n_terms > 0 && key <= self.prev_key.as_slice() {
             return Err(TermIndexError::Build(format!(
                 "contribution for {} is not in ascending key order",
@@ -741,10 +762,7 @@ impl ContributionWriter {
                 location,
             },
         );
-        push_varint(&mut self.record, head.len() as u32);
-        for &(row, tf, len) in head {
-            push_doc_facts(&mut self.record, row, tf, len);
-        }
+        self.record.extend_from_slice(head);
         self.frame.clear();
         push_varint(&mut self.frame, self.record.len() as u32);
         if self
@@ -933,7 +951,7 @@ impl TermHeadSink for HeadSink {
         state.key.extend_from_slice(prefix);
         state.key.extend_from_slice(term.as_bytes());
         writer
-            .push(
+            .push_encoded(
                 &state.key,
                 facts.df,
                 facts.bound,
@@ -1132,14 +1150,8 @@ impl ContributionReader {
             self.rd.read_exact(&mut self.buf)?;
             let mut at = 0usize;
             let posting = read_posting(&self.buf, &mut at)?;
-            let n =
-                read_varint(&self.buf, &mut at).ok_or_else(|| malformed("head count"))? as usize;
-            let mut head = Vec::with_capacity(n);
-            for _ in 0..n {
-                head.push(
-                    read_doc_facts(&self.buf, &mut at).ok_or_else(|| malformed("head entry"))?,
-                );
-            }
+            let head =
+                read_head(&self.buf, &mut at).ok_or_else(|| malformed("head count or entry"))?;
             if at != self.buf.len() {
                 return Err(malformed("record: trailing bytes"));
             }
@@ -2512,6 +2524,8 @@ mod contribution_mark_tests {
         ]);
         let mut sink = HeadSink::new(columns, None).expect("sink");
         let head: Vec<(u32, u32, u8)> = (0..8).map(|row| (row, 1 + row % 3, 4)).collect();
+        let mut facts = Vec::new();
+        push_head(&mut facts, head.iter().copied());
         for column in ["three", "twelve"] {
             for i in 0..300 {
                 sink.term(
@@ -2525,7 +2539,7 @@ mod contribution_mark_tests {
                             postings_length: 64,
                             short: true,
                         },
-                        head: &head,
+                        head: &facts,
                         tail: 0.1,
                         avgdl: 4.0,
                         params: Bm25Params::default(),
@@ -2538,6 +2552,66 @@ mod contribution_mark_tests {
         sink.into_contribution(Uuid::from_u128(7), 0)
             .expect("join")
             .expect("the sink was finished")
+    }
+
+    /// A head handed over already encoded, as a superfile build's encoders
+    /// hand it, writes the record the same head handed over as documents
+    /// writes, byte for byte, and reads back as those documents. Heads run
+    /// from empty to several documents, with rows and term frequencies
+    /// across the varint widths.
+    #[test]
+    fn an_encoded_head_writes_the_record_its_documents_write() {
+        /// Terms written, each with its own head.
+        const TERMS: u32 = 40;
+        /// Values spanning one to five varint bytes.
+        const WIDTHS: [u32; 5] = [0, 127, 128, 16_384, u32::MAX];
+        let heads: Vec<Vec<(u32, u32, u8)>> = (0..TERMS)
+            .map(|t| {
+                (0..t % 7)
+                    .map(|d| {
+                        let row = WIDTHS[((t + d) % 5) as usize];
+                        let tf = WIDTHS[((t * 3 + d) % 5) as usize].max(1);
+                        (row, tf, (t * 31 + d) as u8)
+                    })
+                    .collect()
+            })
+            .collect();
+        let dir = TempDir::new().expect("tempdir");
+        let write = |name: &str, encoded: bool| {
+            let mut w = ContributionWriter::create(&dir.path().join(name), Uuid::from_u128(9), 0)
+                .expect("writer");
+            let mut facts = Vec::new();
+            for (t, head) in heads.iter().enumerate() {
+                let key = format!("term{t:04}");
+                let location = Location::Pfor {
+                    offset: t as u64 * 64,
+                    len: 64,
+                };
+                let pushed = match encoded {
+                    true => {
+                        facts.clear();
+                        push_head(&mut facts, head.iter().copied());
+                        w.push_encoded(key.as_bytes(), 1 + t as u64, 0.5, location, 0.1, &facts)
+                    }
+                    false => w.push(key.as_bytes(), 1 + t as u64, 0.5, location, 0.1, head),
+                };
+                pushed.expect("push");
+            }
+            w.finish().expect("finish")
+        };
+        let (from_docs, from_encoded) = (write("docs", false), write("encoded", true));
+        assert_eq!(
+            fs::read(&from_encoded.path).expect("read"),
+            fs::read(&from_docs.path).expect("read"),
+            "the same record bytes"
+        );
+        let mut rd = ContributionReader::open_at(&from_encoded.path, 0).expect("open");
+        for (t, head) in heads.iter().enumerate() {
+            let rec = rd.next_in(None, None).expect("read").expect("a record");
+            assert_eq!(rec.key, format!("term{t:04}").into_bytes());
+            assert_eq!(&rec.head, head, "term {t}");
+        }
+        assert!(rd.next_in(None, None).expect("read").is_none());
     }
 
     /// Every mark of a contribution joined from parts names the record at
