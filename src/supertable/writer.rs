@@ -7641,7 +7641,7 @@ fn cell_doc_counts_from_summary(
         if is_superseded(id) {
             continue;
         }
-        let n: u64 = cell.clusters.counts.iter().map(|&c| u64::from(c)).sum();
+        let n: u64 = cell.clusters.rows();
         out.push((id, u32::try_from(n).ok()?));
     }
     Some(out)

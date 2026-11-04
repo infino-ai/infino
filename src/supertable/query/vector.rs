@@ -503,7 +503,7 @@ fn cells_ranked_by_fine_score(
 
 /// Rows a summary cell indexes: the sum of its fine-cluster counts.
 fn cell_rows(cell: &CellVectorSummary) -> u64 {
-    cell.clusters.counts.iter().map(|&c| u64::from(c)).sum()
+    cell.clusters.rows()
 }
 
 /// Whether an in-place split retired this cell of `superfile_id`. Its
@@ -7387,7 +7387,7 @@ impl SupertableReader {
                         let mut idx = 0usize;
                         let mut guard = map.lock().expect("diag cell-map lock");
                         for cell in &vs.cells {
-                            let n: u64 = cell.clusters.counts.iter().map(|&c| u64::from(c)).sum();
+                            let n: u64 = cell.clusters.rows();
                             for _ in 0..n {
                                 if idx >= stable_ids.len() {
                                     break;
