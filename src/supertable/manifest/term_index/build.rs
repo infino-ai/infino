@@ -114,6 +114,10 @@ pub(crate) struct BuildPolicy {
     /// into and run in parallel; `None` chooses by the input's size and the
     /// pool's width (see [`merge_layers`] and [`build_layer`]).
     pub(crate) merge_ranges: Option<usize>,
+    /// The most key ranges a merge that `merge_ranges` leaves to choose is
+    /// cut into: an optimize fold's budget sets it, and a merge under
+    /// [`MERGE_RANGE_MIN_BYTES`] still takes one range.
+    pub(crate) merge_ranges_max: Option<usize>,
     /// For a merge: per superfile of the merged root, by ordinal, the
     /// average length and parameters its tier keys are computed at — the
     /// superfile's own, as the manifest records them. A build takes these
@@ -228,6 +232,7 @@ impl Default for BuildPolicy {
             scoring_by_superfile: Arc::new(HashMap::new()),
             tier_read_window_bytes: TIER_READ_WINDOW_BYTES,
             reuse_dir: None,
+            merge_ranges_max: None,
             downloaded: None,
             #[cfg(test)]
             splice_tiers: true,
@@ -2310,7 +2315,10 @@ fn range_count(
             .pool
             .as_deref()
             .map_or_else(current_num_threads, ThreadPool::current_num_threads)
-            .clamp(1, cap),
+            .clamp(
+                1,
+                policy.merge_ranges_max.map_or(cap, |max| max.clamp(1, cap)),
+            ),
     })
 }
 

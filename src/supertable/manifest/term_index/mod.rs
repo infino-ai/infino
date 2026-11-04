@@ -1293,7 +1293,7 @@ pub(crate) async fn fold_at_optimize(
         return Ok(Root::default());
     }
     let policy = &BuildPolicy {
-        merge_ranges: Some(fold.ranges),
+        merge_ranges_max: Some(fold.ranges),
         ..policy.clone()
     };
     let run = &root.layers[fold.run.clone()];
@@ -9609,6 +9609,34 @@ mod tests {
         assert_eq!(faults.fired(), 3);
         let folded = rt.block_on(fold_layers(&local, &root.layers, &ordinals, &ranged, None));
         assert!(folded.is_ok(), "the same fold succeeds without the fault");
+    }
+
+    /// A fold planned with a budget of many key ranges still writes a small
+    /// run as one range: the budget caps the width, and the merge's size
+    /// floor decides it.
+    #[tokio::test]
+    async fn a_small_fold_writes_one_slice_whatever_the_budget_width() {
+        let dir = TempDir::new().expect("tempdir");
+        let policy = BuildPolicy::default();
+        let (_store_dir, local, base) = store_with_base(&dir, &policy).await;
+        let mut root = base;
+        for id in 2..=FOLD_FAN_OUT as u128 {
+            root = commit_delta(&dir, &local, root, id, false, &policy).await;
+        }
+        let live: HashSet<Uuid> = root.superfiles.iter().copied().collect();
+        let wide = FoldBudget {
+            memory_bytes: FoldBudget::fold_bytes(FOLD_FAN_OUT, 8),
+            ranges: 8,
+            cursors: usize::MAX,
+        };
+        let fold = plan_fold_at_optimize(&root, &live, u64::MAX, wide, false, false)
+            .expect("a fold is due");
+        assert!(fold.ranges() > 1, "the budget allows more than one range");
+        let root = fold_at_optimize(&local, &root, fold, &policy, None)
+            .await
+            .expect("fold");
+        assert_eq!(root.layers.len(), 1);
+        assert_eq!(root.layers[0].slices.len(), 1, "a small run is one range");
     }
 
     /// A fold that keeps what it uploads lets the next fold of the same call
