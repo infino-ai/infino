@@ -135,6 +135,7 @@ use crate::{
                 metered_exec::MeteredExec,
             },
             fts::{memos_from_plan_locations, plan_locations_for},
+            nan_bounds::without_nan_blind_bounds,
             prune::{PruneLeaf, select_superfiles},
             range_counts::{RangeBucket, RangeCounts},
             read_ahead::ScanReadAhead,
@@ -204,6 +205,10 @@ struct PreparedScanFile {
     /// Each column's data pages across the row groups, by name, from the
     /// page index; empty when the file carries none.
     pages: HashMap<String, u64>,
+    /// The footer row-group and page pruning read: the file's own, without
+    /// the bounds of a float column holding a NaN
+    /// ([`without_nan_blind_bounds`]).
+    footer: Arc<ParquetMetaData>,
     /// Which cache tier the first open of this file was served from. A
     /// later scan of the same provider reuses the prepared file and reports
     /// the same tier: what it paid, not what it would pay now.
@@ -224,7 +229,8 @@ impl PreparedScanFile {
 
 /// Register an opened superfile with the scan's store and footers, which
 /// DataFusion's Parquet opener reads it through, and describe it for the
-/// scan.
+/// scan. The footer registered is the one pruning may read
+/// ([`without_nan_blind_bounds`]).
 fn prepare_scan_file(
     scan_store: &SuperfileObjectStore,
     scan_footers: &ScanFooters,
@@ -232,7 +238,7 @@ fn prepare_scan_file(
     reader: Arc<SuperfileReader>,
     tier: OpenTier,
     parquet_meta: Arc<ParquetMetaData>,
-) -> Arc<PreparedScanFile> {
+) -> DfResult<Arc<PreparedScanFile>> {
     let path = ObjPath::from(entry.storage_path());
     let source = reader.byte_source();
     let size = source.size();
@@ -254,17 +260,24 @@ fn prepare_scan_file(
             }
         }
     }
+    let footer = without_nan_blind_bounds(parquet_meta, |column| {
+        entry
+            .scalar_stats
+            .column(column)
+            .and_then(|stats| stats.min_max_values())
+    })?;
     scan_store.insert_source(path.clone(), source);
-    scan_footers.insert(path.clone(), Arc::new(ScanFooter::new(parquet_meta)));
-    Arc::new(PreparedScanFile {
+    scan_footers.insert(path.clone(), Arc::new(ScanFooter::new(Arc::clone(&footer))));
+    Ok(Arc::new(PreparedScanFile {
         reader,
         path,
         size,
         rows_end,
         row_counts,
         pages,
+        footer,
         tier,
-    })
+    }))
 }
 
 /// Where a superfile's row groups end, when it is handed to DataFusion as
@@ -1227,14 +1240,14 @@ impl SupertableProvider {
             {
                 let prepared = cell
                     .get_or_try_init(|| async {
-                        Ok::<_, DataFusionError>(prepare_scan_file(
+                        prepare_scan_file(
                             &scan_store,
                             &scan_footers,
                             &entry,
                             Arc::clone(reader),
                             OpenTier::Memory,
                             parquet_meta,
-                        ))
+                        )
                     })
                     .await?;
                 return Ok(Arc::clone(prepared));
@@ -1268,14 +1281,14 @@ impl SupertableProvider {
                             .parquet_metadata_with_page_index()
                             .await
                             .map_err(QueryError::from)?;
-                        Ok::<_, DataFusionError>(prepare_scan_file(
+                        prepare_scan_file(
                             &scan_store,
                             &scan_footers,
                             &entry,
                             reader,
                             tier,
                             parquet_meta,
-                        ))
+                        )
                     })
                     .await?;
                 Ok(Arc::clone(prepared))
@@ -2283,6 +2296,7 @@ impl TableProvider for SupertableProvider {
                 .map(|(seg, entry)| CachedFile {
                     uri: entry.uri,
                     reader: Arc::clone(&seg.prepared.reader),
+                    footer: Arc::clone(&seg.prepared.footer),
                     row_counts: Arc::clone(&seg.prepared.row_counts),
                     tombstones: Arc::clone(&seg.tombstones),
                     selected: top_k_selected.then(|| seg.candidates.clone()).flatten(),
@@ -2980,7 +2994,8 @@ mod tests {
 
     use arrow::util::display::{ArrayFormatter, FormatOptions};
     use arrow_array::{
-        Int64Array, LargeStringArray, RecordBatch, RecordBatchIterator, TimestampSecondArray,
+        Array, Decimal128Array, Float64Array, Int64Array, LargeStringArray, RecordBatch,
+        RecordBatchIterator, TimestampSecondArray,
     };
     use arrow_schema::{DataType, Field, Schema, TimeUnit};
     use datafusion::{
@@ -3019,6 +3034,7 @@ mod tests {
             manifest::{ScalarStatsAgg, SuperfileUri, column_hll},
             query::{
                 read_ahead::{PAGE_READ_THROUGH_BYTES, fixture},
+                scalar_cache::ByteLru,
                 sql::sql_session_context,
             },
         },
@@ -5176,5 +5192,158 @@ mod tests {
             dbg.contains("ScanReaderFactory") && dbg.contains("superfiles: 0"),
             "Debug missing fields: {dbg}"
         );
+    }
+
+    // A float top-k over superfiles whose footer bounds leave NaNs out.
+
+    /// Superfiles of the NaN table, one commit each; only the last holds
+    /// NaNs.
+    const NAN_TABLE_FILES: usize = 3;
+    /// Rows in each superfile of the NaN table.
+    const NAN_TABLE_ROWS: usize = 40;
+    /// Rows of the last superfile, its first ones, that hold a NaN.
+    const NAN_ROWS: usize = 3;
+    /// Rows each top-k asks for: the NaN rows, which total order puts first.
+    const NAN_TOP_K: usize = NAN_ROWS;
+    /// Partition counts each top-k runs under. One reads the superfiles in
+    /// order, so the first has set the top-k's cutoff before the last opens.
+    const NAN_PARTITIONS: [usize; 2] = [1, 4];
+    /// Runs of each top-k at each partition count.
+    const NAN_RUNS: usize = 5;
+    /// Decoded bytes the kept-columns pass may keep: all of the table.
+    const NAN_KEPT_BYTES: usize = 16 << 20;
+
+    /// A table of two float columns whose NaNs are in the last superfile
+    /// only, beside numbers past the earlier superfiles' on the other side:
+    /// `lo` is `-1.0` before and `-NaN` then `1.0` in the last, `hi` is `1.0`
+    /// before and `NaN` then `-1.0` in the last. The last superfile's footer
+    /// bounds `lo` by `[1.0, 1.0]` and `hi` by `[-1.0, -1.0]`, leaving out
+    /// the NaNs total order puts first ascending (`lo`) and first descending
+    /// (`hi`). With `kept`, scans read through kept decoded columns.
+    fn nan_table(dir: &TempDir, kept: bool) -> Supertable {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("lo", DataType::Float64, false),
+            Field::new("hi", DataType::Float64, false),
+        ]));
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let mut options = SupertableOptions::new(Arc::clone(&schema), vec![], vec![])
+            .expect("options")
+            .with_storage(storage);
+        if kept {
+            options.decoded_columns = Some(Arc::new(ByteLru::new(NAN_KEPT_BYTES)));
+        }
+        let st = Supertable::create(options).expect("create");
+        for file in 0..NAN_TABLE_FILES {
+            let last = file + 1 == NAN_TABLE_FILES;
+            let (lo, hi): (Vec<f64>, Vec<f64>) = (0..NAN_TABLE_ROWS)
+                .map(|row| match (last, row < NAN_ROWS) {
+                    (false, _) => (-1.0, 1.0),
+                    (true, true) => (-f64::NAN, f64::NAN),
+                    (true, false) => (1.0, -1.0),
+                })
+                .unzip();
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Float64Array::from(lo)) as ArrayRef,
+                    Arc::new(Float64Array::from(hi)),
+                ],
+            )
+            .expect("batch");
+            let mut writer = st.writer().expect("writer");
+            writer.append(&batch).expect("append");
+            writer.commit().expect("commit");
+        }
+        st
+    }
+
+    /// The `_id` column of `batches`, in order.
+    fn decimal_ids(batches: &[RecordBatch]) -> Vec<i128> {
+        batches
+            .iter()
+            .flat_map(|batch| {
+                let ids = batch
+                    .column_by_name("_id")
+                    .and_then(|c| c.as_any().downcast_ref::<Decimal128Array>())
+                    .expect("_id")
+                    .clone();
+                (0..ids.len()).map(move |i| ids.value(i))
+            })
+            .collect()
+    }
+
+    /// The `_id`s of `reader`'s first `k` rows by the float `column`
+    /// (descending with `descending`) in IEEE total order, ties by `_id`:
+    /// sorted here from an unsorted read, so the expectation does not rest on
+    /// the engine's sort.
+    fn total_order_ids(
+        reader: &SupertableReader,
+        column: &str,
+        descending: bool,
+        k: usize,
+    ) -> Vec<i128> {
+        let batches = reader
+            .query_sql(&format!("SELECT _id, {column} AS v FROM supertable"))
+            .expect("rows");
+        let mut rows: Vec<(f64, i128)> = Vec::new();
+        for batch in &batches {
+            let values = batch
+                .column_by_name("v")
+                .and_then(|c| c.as_any().downcast_ref::<Float64Array>())
+                .expect("v");
+            let ids = decimal_ids(from_ref(batch));
+            rows.extend(
+                ids.into_iter()
+                    .enumerate()
+                    .map(|(i, id)| (values.value(i), id)),
+            );
+        }
+        rows.sort_by(|(a, a_id), (b, b_id)| {
+            let by_value = if descending {
+                b.total_cmp(a)
+            } else {
+                a.total_cmp(b)
+            };
+            by_value.then(a_id.cmp(b_id))
+        });
+        rows.into_iter().take(k).map(|(_, id)| id).collect()
+    }
+
+    /// `ORDER BY` a float column `LIMIT k` returns the rows IEEE total order
+    /// puts first, NaNs included, when they sit in a superfile opened after
+    /// another has set the top-k's cutoff: its footer bounds leave the NaNs
+    /// out, and pruning its row group against the cutoff by them would skip
+    /// the very rows the answer is. Through the Parquet scan and through kept
+    /// columns, ascending (negative NaN first) and descending (NaN first), at
+    /// one partition and at several.
+    #[test]
+    fn a_float_top_k_returns_the_nan_rows_the_footer_bounds_leave_out() {
+        for kept in [false, true] {
+            let dir = TempDir::new().expect("tempdir");
+            let st = nan_table(&dir, kept);
+            let reader = st.reader().expect("reader");
+            for (column, descending) in [("lo", false), ("hi", true)] {
+                let want = total_order_ids(&reader, column, descending, NAN_TOP_K);
+                let direction = if descending { "DESC" } else { "ASC" };
+                let sql = format!(
+                    "SELECT _id FROM supertable ORDER BY {column} {direction} NULLS LAST, _id ASC LIMIT {NAN_TOP_K}"
+                );
+                for partitions in NAN_PARTITIONS {
+                    reader
+                        .query_sql(&format!(
+                            "SET datafusion.execution.target_partitions = {partitions}"
+                        ))
+                        .expect("set partitions");
+                    for run in 0..NAN_RUNS {
+                        assert_eq!(
+                            decimal_ids(&reader.query_sql(&sql).expect("top-k")),
+                            want,
+                            "kept {kept}: {sql}, {partitions} partitions, run {run}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }
