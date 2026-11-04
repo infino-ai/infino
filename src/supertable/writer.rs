@@ -73,7 +73,7 @@ use std::{
     str::from_utf8,
     sync::{
         Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{Receiver as StdReceiver, sync_channel as std_sync_channel},
     },
     thread::available_parallelism,
@@ -94,7 +94,6 @@ use blake3::Hasher as Blake3Hasher;
 use bytes::Bytes;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use datafusion::prelude::Expr;
-use fs4::available_space;
 use futures::{
     future::{BoxFuture, try_join_all},
     stream::{self, FuturesUnordered, StreamExt},
@@ -12128,6 +12127,8 @@ pub(in crate::supertable) async fn stamp_term_index(
             .map_err(TermIndexError::from)?,
     );
     let reuse_path = reuse.path().to_path_buf();
+    // Local bytes per slice byte the call's folds have measured, in thousandths.
+    let disk_per_slice = Arc::new(AtomicU64::new(0));
     // The next fold's inputs, fetched while this one merges and uploads.
     let prefetch = Prefetch::default();
     // One renumbering fold per call. Commits that land while it runs are
@@ -12142,8 +12143,15 @@ pub(in crate::supertable) async fn stamp_term_index(
         let kept_batch: Mutex<Option<KeptBatch>> = Mutex::new(None);
         let kept_fold: Mutex<Option<KeptFold>> = Mutex::new(None);
         stamp_with_retries(inner, &storage, "term-index", |old| {
-            let (storage, published, budget, reuse, reuse_path, prefetch) =
-                (&storage, &published, &budget, &reuse, &reuse_path, &prefetch);
+            let (storage, published, budget, reuse, reuse_path, prefetch, disk_per_slice) = (
+                &storage,
+                &published,
+                &budget,
+                &reuse,
+                &reuse_path,
+                &prefetch,
+                &disk_per_slice,
+            );
             let (kept_batch, kept_fold, renumbered) = (&kept_batch, &kept_fold, &renumbered);
             async move {
                 published.store(false, Ordering::Relaxed);
@@ -12190,10 +12198,16 @@ pub(in crate::supertable) async fn stamp_term_index(
                         return Ok(Some(old.with_term_index(reference, true)));
                     }
                     let renumber = !renumbered.load(Ordering::Relaxed);
-                    // Kept outputs and prefetched inputs fill the scratch disk
-                    // as the call goes, so each pass measures its free space again.
-                    let fold_max_bytes = available_space(reuse_path)
-                        .map_or(fold_max_bytes, |free| fold_max_bytes.min(free / 2));
+                    // Objects no layer names any more go first; short of room
+                    // even so, every kept object goes. Each fold is sized by
+                    // the disk its inputs take.
+                    term_index::retain_kept(reuse_path, &root);
+                    if !term_index::has_room(reuse_path) {
+                        let freed = term_index::evict_kept(reuse_path);
+                        info!(freed_mib = freed >> 20, "term index: evicted kept objects for room");
+                    }
+                    let fold_max_bytes = term_index::fold_disk_bound(reuse_path, disk_per_slice)
+                        .map_or(fold_max_bytes, |bound| fold_max_bytes.min(bound));
                     if let Some(fold) = term_index::plan_fold_at_optimize(
                         &root,
                         &live,
@@ -12207,6 +12221,19 @@ pub(in crate::supertable) async fn stamp_term_index(
                         if let Some(started) = started {
                             let _ = started.await;
                         }
+                        // An output is kept for a later fold that reads it, and
+                        // only while the disk holds it beside the fold's inputs.
+                        let fold_bytes = term_index::run_bytes(&root, &fold);
+                        let keep = term_index::output_reread(
+                            &root,
+                            &fold,
+                            &live,
+                            fold_max_bytes,
+                            fold_budget,
+                            renumber && !fold.renumbers(),
+                            before_tiers,
+                        ) && term_index::fold_disk_bound(reuse_path, disk_per_slice)
+                            .is_some_and(|bound| bound >= fold_bytes.saturating_mul(2));
                         let downloaded = Arc::new(Notify::new());
                         let next = match fold_budget.prefetches() {
                             true => term_index::layers_after(
@@ -12226,10 +12253,14 @@ pub(in crate::supertable) async fn stamp_term_index(
                                 next,
                                 Arc::clone(reuse),
                                 Arc::clone(&downloaded),
+                                Arc::clone(disk_per_slice),
+                                if keep { fold_bytes } else { 0 },
                             )));
                         let policy = term_index::BuildPolicy {
                             scoring_by_ordinal: Arc::new(scoring_by_ordinal(&old, fold.superfiles())),
-                            reuse_dir: term_index::has_room(reuse_path).then(|| reuse_path.clone()),
+                            reuse_dir: Some(reuse_path.clone()),
+                            keep_uploads: keep,
+                            disk_per_slice_milli: Some(Arc::clone(disk_per_slice)),
                             downloaded: Some(Arc::clone(&downloaded)),
                             ..policy.clone()
                         };

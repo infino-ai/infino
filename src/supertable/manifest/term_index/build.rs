@@ -29,7 +29,7 @@ use std::{
     mem,
     ops::Range,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, PoisonError},
+    sync::{Arc, Mutex, PoisonError, atomic::AtomicU64},
     time::Instant,
 };
 
@@ -136,6 +136,13 @@ pub(crate) struct BuildPolicy {
     /// Where an optimize call keeps the objects its folds upload, so a later
     /// fold of the same call links them in place of fetching them.
     pub(crate) reuse_dir: Option<PathBuf>,
+    /// Whether a fold keeps what it uploads in `reuse_dir`; it links from
+    /// and cleans up `reuse_dir` either way.
+    pub(crate) keep_uploads: bool,
+    /// Local bytes a fold's inputs took per slice byte, in thousandths, the
+    /// most any fold of the call has measured; the planner sizes the next
+    /// fold's disk use by it.
+    pub(crate) disk_per_slice_milli: Option<Arc<AtomicU64>>,
     /// Told once a fold's inputs are on local disk, so the next fold's
     /// prefetch starts when this one stops downloading.
     pub(crate) downloaded: Option<Arc<Notify>>,
@@ -232,6 +239,8 @@ impl Default for BuildPolicy {
             scoring_by_superfile: Arc::new(HashMap::new()),
             tier_read_window_bytes: TIER_READ_WINDOW_BYTES,
             reuse_dir: None,
+            keep_uploads: false,
+            disk_per_slice_milli: None,
             merge_ranges_max: None,
             downloaded: None,
             #[cfg(test)]

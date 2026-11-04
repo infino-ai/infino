@@ -45,7 +45,10 @@ use std::{
     iter::repeat_n,
     ops::Range,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering as AtomicOrdering},
+    },
 };
 
 #[cfg(test)]
@@ -435,6 +438,54 @@ async fn write_objects(
         .into_iter()
         .map(|(hash, built)| put_built(Arc::clone(storage), kind, hash, built));
     run_bounded(SLICE_WRITE_CONCURRENCY, "object write", jobs).await
+}
+
+/// Local bytes per slice byte assumed for a fold's inputs, in thousandths,
+/// until a fold of the call has measured them: tier objects run up to a few
+/// times their slices.
+const FOLD_DISK_PER_SLICE_MILLI: u64 = 4_000;
+
+/// Share of the scratch filesystem left free under every fold, as a divisor.
+const SCRATCH_FLOOR_DIVISOR: u64 = 10;
+
+/// The most slice bytes one fold may read so that its inputs, and outputs
+/// about as large, fit the free space of the filesystem holding `dir` above
+/// a tenth of it, at the local bytes per slice byte `measured` holds;
+/// `None` when the filesystem cannot be read.
+pub(crate) fn fold_disk_bound(dir: &Path, measured: &AtomicU64) -> Option<u64> {
+    let (free, total) = (available_space(dir).ok()?, total_space(dir).ok()?);
+    Some(disk_bound(
+        free,
+        total,
+        measured.load(AtomicOrdering::Relaxed),
+    ))
+}
+
+/// [`fold_disk_bound`] for `free` of `total` bytes and a measured `milli`
+/// local bytes per slice byte, zero meaning none measured yet.
+fn disk_bound(free: u64, total: u64, milli: u64) -> u64 {
+    let room = free.saturating_sub(total / SCRATCH_FLOOR_DIVISOR);
+    let per_slice = match milli {
+        0 => FOLD_DISK_PER_SLICE_MILLI,
+        milli => milli.max(1000),
+    };
+    room.saturating_mul(1000) / per_slice
+}
+
+/// Delete every object kept in `dir`, all of which storage still holds, so
+/// a fold short of room has it; a later fold fetches what it needs. The
+/// bytes freed.
+pub(crate) fn evict_kept(dir: &Path) -> u64 {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let meta = entry.metadata().ok().filter(|meta| meta.is_file())?;
+            fs::remove_file(entry.path()).ok().map(|()| meta.len())
+        })
+        .sum()
 }
 
 /// Whether the filesystem holding `dir` has more than a quarter of its
@@ -1196,21 +1247,7 @@ pub(crate) fn layers_after(
         return Vec::new();
     }
     let mut predicted = root.clone();
-    let bytes = predicted.layers[fold.run.clone()]
-        .iter()
-        .map(layer_bytes)
-        .fold(0u64, |sum, size| sum.saturating_add(size));
-    let output = Layer {
-        slices: vec![SliceRef {
-            first_key: Vec::new(),
-            last_key: Vec::new(),
-            content_hash: ContentHash::of(b""),
-            tier: None,
-            len: bytes,
-        }],
-        ordinals: None,
-        base: 0,
-    };
+    let output = stand_in(ContentHash::of(b""), run_bytes(root, fold));
     let at = fold.run.start;
     predicted.layers.splice(fold.run.clone(), [output]);
     let Some(next) =
@@ -1227,6 +1264,102 @@ pub(crate) fn layers_after(
         .collect()
 }
 
+/// The slice bytes the layers of `fold`'s run hold.
+pub(crate) fn run_bytes(root: &Root, fold: &OptimizeFold) -> u64 {
+    root.layers[fold.run.clone()]
+        .iter()
+        .map(layer_bytes)
+        .fold(0u64, |sum, size| sum.saturating_add(size))
+}
+
+/// A fold's output not yet written, as the planner weighs it: one slice of
+/// `bytes` named `hash`.
+fn stand_in(hash: ContentHash, bytes: u64) -> Layer {
+    Layer {
+        slices: vec![SliceRef {
+            first_key: Vec::new(),
+            last_key: Vec::new(),
+            content_hash: hash,
+            tier: None,
+            len: bytes,
+        }],
+        ordinals: None,
+        base: 0,
+    }
+}
+
+/// Folds [`output_reread`] simulates at most.
+const REREAD_LOOKAHEAD_FOLDS: usize = 256;
+
+/// Whether a later fold of this call is planned to read `fold`'s output:
+/// the plan runs on, with the same bounds, over a root in which each output
+/// not yet written stands in with its inputs' bytes. A fold that renumbers
+/// or takes every layer is never reread.
+pub(crate) fn output_reread(
+    root: &Root,
+    fold: &OptimizeFold,
+    live: &HashSet<Uuid>,
+    max_bytes: u64,
+    budget: FoldBudget,
+    renumber: bool,
+    before_tiers: bool,
+) -> bool {
+    if fold.renumbers || fold.run == (0..root.layers.len()) {
+        return false;
+    }
+    let ours = ContentHash::of(b"this fold's output");
+    let theirs = ContentHash::of(b"a later fold's output");
+    let mut predicted = root.clone();
+    predicted
+        .layers
+        .splice(fold.run.clone(), [stand_in(ours, run_bytes(root, fold))]);
+    for _ in 0..REREAD_LOOKAHEAD_FOLDS {
+        let Some(next) =
+            plan_fold_at_optimize(&predicted, live, max_bytes, budget, renumber, before_tiers)
+        else {
+            return false;
+        };
+        if predicted.layers[next.run.clone()]
+            .iter()
+            .any(|layer| layer.slices.iter().any(|slice| slice.content_hash == ours))
+        {
+            return true;
+        }
+        let bytes = run_bytes(&predicted, &next);
+        predicted
+            .layers
+            .splice(next.run.clone(), [stand_in(theirs, bytes)]);
+    }
+    false
+}
+
+/// Delete each object in `dir` whose slice no layer of `root` names any
+/// more, with its tier object: read by a fold already, or fetched for a fold
+/// the plan dropped. The bytes freed.
+pub(crate) fn retain_kept(dir: &Path, root: &Root) -> u64 {
+    let named: HashSet<String> = root
+        .layers
+        .iter()
+        .flat_map(|layer| &layer.slices)
+        .map(|slice| slice.content_hash.to_hex())
+        .collect();
+    let Ok(entries) = fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let meta = entry.metadata().ok().filter(|meta| meta.is_file())?;
+            let path = entry.path();
+            let stem = path.file_stem()?.to_str()?;
+            if named.contains(stem) {
+                return None;
+            }
+            fs::remove_file(&path).ok().map(|()| meta.len())
+        })
+        .sum()
+}
+
 /// Fetch `layers` into `reuse_dir` once `downloaded` is told, through a
 /// directory of its own whose files are renamed into `reuse` only when all
 /// landed: a fold reading `reuse` meanwhile never meets a partial file, and
@@ -1237,17 +1370,19 @@ pub(crate) async fn prefetch_layers(
     layers: Vec<Layer>,
     reuse_dir: Arc<TempDir>,
     downloaded: Arc<Notify>,
+    measured: Arc<AtomicU64>,
+    kept_bytes: u64,
 ) {
     downloaded.notified().await;
     let reuse = reuse_dir.path().to_path_buf();
-    // Tier objects run a few times their slices' bytes; leave room twice over.
+    // The next fold's inputs fit beside what the current fold keeps.
     let wanted = layers
         .iter()
         .map(layer_bytes)
-        .fold(0u64, |sum, size| sum.saturating_add(size))
-        .saturating_mul(8);
-    let fits = available_space(&reuse).is_ok_and(|free| free > wanted);
-    if layers.is_empty() || !fits || !has_room(&reuse) {
+        .fold(0u64, |sum, size| sum.saturating_add(size));
+    let fits = fold_disk_bound(&reuse, &measured)
+        .is_some_and(|bound| bound >= wanted.saturating_add(kept_bytes));
+    if layers.is_empty() || !fits {
         return;
     }
     let Ok(staging) = TempDir::new_in(&reuse) else {
@@ -1403,6 +1538,24 @@ async fn fold_layers(
     if let Some(downloaded) = &policy.downloaded {
         downloaded.notify_one();
     }
+    if let Some(measured) = &policy.disk_per_slice_milli {
+        let slice_bytes = kept
+            .iter()
+            .map(layer_bytes)
+            .fold(0u64, |sum, size| sum.saturating_add(size));
+        let local_bytes: u64 = fs::read_dir(scratch.path())
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter_map(|entry| entry.metadata().ok())
+                    .map(|meta| meta.len())
+                    .sum()
+            })
+            .unwrap_or(0);
+        if let Some(per_slice) = local_bytes.saturating_mul(1000).checked_div(slice_bytes) {
+            measured.fetch_max(per_slice, AtomicOrdering::Relaxed);
+        }
+    }
     let ordinals = ordinals.to_vec();
     let policy = policy.clone();
     // Each slice and tier object uploads as the merge cuts it; the root that
@@ -1411,7 +1564,7 @@ async fn fold_layers(
     let uploads = task::spawn(upload_objects(
         Arc::clone(storage),
         objects,
-        policy.reuse_dir.clone(),
+        policy.reuse_dir.clone().filter(|_| policy.keep_uploads),
     ));
     // The kept layers are merged away, so the copies kept of them can go.
     let consumed: Vec<(PathBuf, PathBuf)> = match reuse {
@@ -9692,6 +9845,88 @@ mod tests {
         assert_eq!(faults.fired(), 1);
     }
 
+    /// Eviction empties the reuse directory and reports the bytes it freed,
+    /// and the disk bound shrinks as each slice byte is measured to take more.
+    #[test]
+    fn eviction_frees_kept_objects_and_the_disk_bound_follows_the_measure() {
+        let dir = TempDir::new().expect("dir");
+        fs::write(dir.path().join("a.slice"), vec![0u8; 1000]).expect("write");
+        fs::write(dir.path().join("a.tier"), vec![0u8; 500]).expect("write");
+        assert_eq!(evict_kept(dir.path()), 1500);
+        assert_eq!(fs::read_dir(dir.path()).expect("read").count(), 0);
+        let (free, total) = (500_000_000, 1_000_000_000);
+        // 400 MB above the floor at 4 local bytes per slice byte.
+        assert_eq!(disk_bound(free, total, 0), 100_000_000);
+        assert_eq!(
+            disk_bound(free, total, 2 * FOLD_DISK_PER_SLICE_MILLI),
+            50_000_000
+        );
+        assert_eq!(
+            disk_bound(free, total, 500),
+            400_000_000,
+            "never under one byte per slice byte"
+        );
+        assert_eq!(
+            disk_bound(90_000_000, total, 0),
+            0,
+            "nothing under the floor"
+        );
+        assert!(fold_disk_bound(dir.path(), &AtomicU64::new(0)).is_some());
+    }
+
+    /// Only an output a later fold reads is kept: a first fold of small
+    /// layers is reread once the outputs beside it match it, a fold of every
+    /// layer never; the sweep deletes what the root no longer names.
+    #[test]
+    fn only_an_output_a_later_fold_reads_is_kept() {
+        let root = Root {
+            superfiles: Vec::new(),
+            id_mins: Vec::new(),
+            layers: (0..FOLD_FAN_OUT * FOLD_FAN_OUT)
+                .map(|i| stand_in(ContentHash::of(format!("layer {i}").as_bytes()), 1000))
+                .collect(),
+        };
+        let live = HashSet::new();
+        let narrow = budget_for(FOLD_FAN_OUT);
+        let fold = plan_fold_at_optimize(&root, &live, u64::MAX, narrow, false, false)
+            .expect("a fold is due");
+        assert_eq!(fold.run(), 0..FOLD_FAN_OUT);
+        assert!(output_reread(
+            &root,
+            &fold,
+            &live,
+            u64::MAX,
+            narrow,
+            false,
+            false
+        ));
+        let wide = budget_for(root.layers.len());
+        let whole = plan_fold_at_optimize(&root, &live, u64::MAX, wide, false, false)
+            .expect("a fold is due");
+        assert_eq!(whole.run(), 0..root.layers.len());
+        assert!(!output_reread(
+            &root,
+            &whole,
+            &live,
+            u64::MAX,
+            wide,
+            false,
+            false
+        ));
+
+        let dir = TempDir::new().expect("dir");
+        let named = root.layers[0].slices[0].content_hash.to_hex();
+        fs::write(dir.path().join(format!("{named}.slice")), b"kept").expect("write");
+        fs::write(dir.path().join(format!("{named}.tier")), b"kept").expect("write");
+        fs::write(dir.path().join("00.slice"), b"read").expect("write");
+        assert_eq!(
+            retain_kept(dir.path(), &root),
+            4,
+            "only the unnamed object goes"
+        );
+        assert_eq!(fs::read_dir(dir.path()).expect("read").count(), 2);
+    }
+
     /// A fold that keeps what it uploads lets the next fold of the same call
     /// link those objects in place of fetching them: with every object of
     /// the folded layer gone from storage, folding it again still works.
@@ -9713,6 +9948,7 @@ mod tests {
             spill_to_disk: true,
             scratch_root: Some(scratch.path().to_path_buf()),
             reuse_dir: Some(reuse.path().to_path_buf()),
+            keep_uploads: true,
             merge_ranges: Some(2),
             ..BuildPolicy::default()
         };
@@ -9726,10 +9962,30 @@ mod tests {
                 let _ = fs::remove_file(store_dir.path().join(tier_uri(tier)));
             }
         }
-        let again = rt.block_on(fold_layers(&local, &[first], &ordinals, &policy, None));
+        let linking_only = BuildPolicy {
+            keep_uploads: false,
+            ..policy.clone()
+        };
+        let kept: Vec<ContentHash> = first
+            .slices
+            .iter()
+            .map(|slice| slice.content_hash)
+            .collect();
+        let again = rt.block_on(fold_layers(
+            &local,
+            &[first],
+            &ordinals,
+            &linking_only,
+            None,
+        ));
         assert!(
             again.is_ok(),
             "the kept objects stand in for the deleted ones: {again:?}"
+        );
+        assert!(
+            kept.iter()
+                .all(|hash| !slice_file_path(reuse.path(), hash).exists()),
+            "a fold that keeps nothing still clears what it consumed"
         );
     }
 }
