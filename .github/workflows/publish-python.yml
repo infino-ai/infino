@@ -97,7 +97,10 @@ jobs:
     name: wheel ${{ matrix.target }}
     needs: validate
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    # The wheel builds with thin LTO and one codegen unit (the bindings'
+    # `[profile.release]`), about 1.7x the compile time of cargo's stock
+    # release profile; the slowest target (macOS Intel) ran 33 min before.
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:

@@ -171,6 +171,41 @@ fn stable_ids(hits: &[SuperfileHit]) -> HashSet<i128> {
         .collect()
 }
 
+/// A table on local storage with `cells` hidden index cells, holding one
+/// commit of `titles` and their `DIM`-wide vectors (`flat`), then drained
+/// into the hidden index. Storage is needed: without it the drain does
+/// nothing and search stays on the user table.
+fn drained_table(cells: usize, titles: &[String], flat: Vec<f32>) -> (TempDir, Supertable) {
+    let dir = TempDir::new().expect("tempdir");
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+    let st = Supertable::create(
+        options_title_emb()
+            .with_storage(storage)
+            .with_vector_cell_counts(cells, cells),
+    )
+    .expect("create");
+    let fsl = FixedSizeListArray::try_new(
+        Arc::new(Field::new("item", DataType::Float32, true)),
+        DIM as i32,
+        Arc::new(Float32Array::from(flat)) as ArrayRef,
+        None,
+    )
+    .expect("FSL");
+    let title_arr = LargeStringArray::from(titles.iter().map(String::as_str).collect::<Vec<_>>());
+    let batch = RecordBatch::try_new(
+        st.options().schema.clone(),
+        vec![Arc::new(title_arr), Arc::new(fsl)],
+    )
+    .expect("batch");
+    let mut w = st.writer().expect("writer");
+    w.append(&batch).expect("append");
+    w.commit().expect("commit");
+    drop(w);
+    st.drain_vectors_to_cells_sync().expect("drain");
+    (dir, st)
+}
+
 /// The unranked `count` surface agrees with `token_match`'s cardinality
 /// over the multi-superfile corpus — the count fan sums per-superfile
 /// match counts without materializing hits, and the two surfaces must
@@ -948,15 +983,6 @@ fn filtered_knn_after_drain_finds_matches_in_a_far_cluster() {
     /// Requested top-k, well below the matching row count.
     const K: usize = 10;
 
-    let dir = TempDir::new().expect("tempdir");
-    let storage: Arc<dyn StorageProvider> =
-        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
-    let st = Supertable::create(
-        options_title_emb()
-            .with_storage(storage)
-            .with_vector_cell_counts(CELLS, CELLS),
-    )
-    .expect("create");
     let mut rng = StdRng::seed_from_u64(SEED);
     let mut titles = Vec::new();
     let mut flat = Vec::new();
@@ -976,24 +1002,7 @@ fn filtered_knn_after_drain_finds_matches_in_a_far_cluster() {
         row[1 + i % (DIM - 1)] = JITTER * (i + 1) as f32;
         flat.extend(row);
     }
-    let fsl = FixedSizeListArray::try_new(
-        Arc::new(Field::new("item", DataType::Float32, true)),
-        DIM as i32,
-        Arc::new(Float32Array::from(flat)) as ArrayRef,
-        None,
-    )
-    .expect("FSL");
-    let title_arr = LargeStringArray::from(titles.iter().map(String::as_str).collect::<Vec<_>>());
-    let batch = RecordBatch::try_new(
-        st.options().schema.clone(),
-        vec![Arc::new(title_arr), Arc::new(fsl)],
-    )
-    .expect("batch");
-    let mut w = st.writer().expect("writer");
-    w.append(&batch).expect("append");
-    w.commit().expect("commit");
-    drop(w);
-    st.drain_vectors_to_cells_sync().expect("drain");
+    let (_dir, st) = drained_table(CELLS, &titles, flat);
 
     let reader = st.reader().expect("reader");
     let allowed = stable_ids(
@@ -1026,4 +1035,145 @@ fn filtered_knn_after_drain_finds_matches_in_a_far_cluster() {
         best,
         "{NEEDLE_ROWS} rows match; the {K} nearest of them must return"
     );
+}
+
+/// Cosine similarity of two equal-length vectors.
+fn cosine(a: &[f32], b: &[f32]) -> f32 {
+    let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+    let norm = |v: &[f32]| v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    dot / (norm(a) * norm(b))
+}
+
+/// Groups of rows for the spread-filter tests: `centers.len()` groups of
+/// `per_group` rows, each a center plus noise in `-noise..noise`.
+fn grouped_rows(
+    rng: &mut StdRng,
+    centers: &[Vec<f32>],
+    per_group: usize,
+    noise: f32,
+) -> Vec<Vec<f32>> {
+    (0..centers.len() * per_group)
+        .map(|i| {
+            centers[i / per_group]
+                .iter()
+                .map(|c| c + rng.random_range(-noise..noise))
+                .collect()
+        })
+        .collect()
+}
+
+/// Titles for `rows`: matching rows carry `needle`, and the `k` nearest of
+/// them to `query` (brute-force cosine) also carry `best`.
+fn needle_titles(
+    rows: &[Vec<f32>],
+    is_match: impl Fn(usize) -> bool,
+    query: &[f32],
+    k: usize,
+) -> Vec<String> {
+    let mut by_score: Vec<usize> = (0..rows.len()).filter(|&i| is_match(i)).collect();
+    by_score.sort_by(|&a, &b| cosine(&rows[b], query).total_cmp(&cosine(&rows[a], query)));
+    let best: HashSet<usize> = by_score[..k].iter().copied().collect();
+    (0..rows.len())
+        .map(|i| match (is_match(i), best.contains(&i)) {
+            (true, true) => format!("doc {i} needle best"),
+            (true, false) => format!("doc {i} needle"),
+            _ => format!("doc {i}"),
+        })
+        .collect()
+}
+
+/// The filtered search for `needle` returns exactly the rows tagged `best`.
+fn assert_filtered_top_k_is_best(st: &Supertable, query: &[f32], k: usize) {
+    let reader = st.reader().expect("reader");
+    let hits = reader
+        .vector_hits(
+            "emb",
+            query,
+            k,
+            VectorSearchOptions::new(),
+            Some(VectorFilter {
+                column: "title",
+                query: "needle",
+                mode: BoolMode::Or,
+            }),
+        )
+        .expect("filtered vector search");
+    let best = stable_ids(
+        &reader
+            .token_match("title", "best", BoolMode::Or)
+            .expect("token_match best"),
+    );
+    assert_eq!(best.len(), k, "fixture: the true top-k is tagged");
+    assert_eq!(
+        stable_ids(&hits),
+        best,
+        "the {k} nearest matching rows must return"
+    );
+}
+
+/// Group count for the spread-filter tests.
+const SPREAD_GROUPS: usize = 64;
+/// Rows per group for the spread-filter tests.
+const SPREAD_ROWS_PER_GROUP: usize = 32;
+/// One row in this many matches the filter, in every group.
+const SPREAD_MATCH_EVERY: usize = 16;
+/// Hidden index cells for the spread-filter tests.
+const SPREAD_CELLS: usize = 128;
+/// Seed for the spread-filter tests.
+const SPREAD_SEED: u64 = 1168;
+/// Requested top-k for the spread-filter tests, well below the matches.
+const SPREAD_K: usize = 10;
+
+/// Random group centers for the spread-filter tests.
+fn spread_centers(rng: &mut StdRng) -> Vec<Vec<f32>> {
+    (0..SPREAD_GROUPS)
+        .map(|_| (0..DIM).map(|_| rng.random_range(-1.0f32..1.0)).collect())
+        .collect()
+}
+
+/// DRAINED table, a filter that keeps a few rows spread over every
+/// group: the matching cells are most of the table, so the search routes
+/// by distance to the query. The drain's width law is measured for the
+/// k nearest rows; the k nearest matching rows sit farther out, so the
+/// search must read the width the law gives for that larger reach.
+#[test]
+fn filtered_knn_after_drain_finds_matches_spread_over_many_cells() {
+    /// Tight groups, so the drain needs few cells per query.
+    const NOISE: f32 = 0.05;
+
+    let mut rng = StdRng::seed_from_u64(SPREAD_SEED);
+    let centers = spread_centers(&mut rng);
+    let rows = grouped_rows(&mut rng, &centers, SPREAD_ROWS_PER_GROUP, NOISE);
+    let query = centers[0].clone();
+    let titles = needle_titles(
+        &rows,
+        |i| i.is_multiple_of(SPREAD_MATCH_EVERY),
+        &query,
+        SPREAD_K,
+    );
+    let (_dir, st) = drained_table(SPREAD_CELLS, &titles, rows.concat());
+    assert_filtered_top_k_is_best(&st, &query, SPREAD_K);
+}
+
+/// The spread filter over groups that overlap, so a nearer matching row
+/// can sit in a cell ranked after the first cells that hold k matches.
+/// Reading cells until they hold k matches misses it; the width law at
+/// the matches' reach has the slack to find it.
+#[test]
+fn filtered_knn_after_drain_finds_spread_matches_in_overlapping_groups() {
+    /// Groups wide enough to overlap their neighbours.
+    const NOISE: f32 = 0.2;
+
+    let mut rng = StdRng::seed_from_u64(SPREAD_SEED);
+    let centers = spread_centers(&mut rng);
+    let rows = grouped_rows(&mut rng, &centers, SPREAD_ROWS_PER_GROUP, NOISE);
+    let query = centers[0].clone();
+    let titles = needle_titles(
+        &rows,
+        |i| i.is_multiple_of(SPREAD_MATCH_EVERY),
+        &query,
+        SPREAD_K,
+    );
+    let (_dir, st) = drained_table(SPREAD_CELLS, &titles, rows.concat());
+    assert_filtered_top_k_is_best(&st, &query, SPREAD_K);
 }
