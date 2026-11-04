@@ -2628,15 +2628,16 @@ impl SupertableWriter {
                 // buffered so far: those are one superfile's worth, and a
                 // large append fed through the few lanes they would ask for
                 // would tokenise on a few threads.
-                let open = OpenAppend::enter();
+                // Held by the lanes once they open; released here if they
+                // do not.
+                let open = OpenAppend::enter(&OPEN_APPENDS);
                 let n_lanes = lanes_for(options.writer_pool.current_num_threads(), open.count);
-                let opened = LiveLanes::open(Arc::clone(manifest), n_lanes, options.vector_layout)
-                    .map(|mut live| {
+                let opened = LiveLanes::open(Arc::clone(manifest), n_lanes, options.vector_layout);
+                let live = match opened {
+                    Ok(mut live) => {
                         live.open_append = Some(open);
                         live
-                    });
-                let live = match opened {
-                    Ok(live) => live,
+                    }
                     Err(error) => {
                         debug!(%error, "live lanes not opened; the commit builds from the buffer");
                         self.disable_live();
@@ -3654,21 +3655,26 @@ static OPEN_APPENDS: AtomicUsize = AtomicUsize::new(0);
 
 /// One append counted in [`OPEN_APPENDS`] until it is dropped.
 struct OpenAppend {
+    /// The count this append is in.
+    appends: &'static AtomicUsize,
     /// Appends with lanes open when this one opened, itself included.
     count: usize,
 }
 
 impl OpenAppend {
-    fn enter() -> Self {
+    /// Count one more append in `appends` (the process's
+    /// [`OPEN_APPENDS`]; a test's own counter in tests).
+    fn enter(appends: &'static AtomicUsize) -> Self {
         Self {
-            count: OPEN_APPENDS.fetch_add(1, Ordering::Relaxed) + 1,
+            appends,
+            count: appends.fetch_add(1, Ordering::Relaxed) + 1,
         }
     }
 }
 
 impl Drop for OpenAppend {
     fn drop(&mut self) {
-        OPEN_APPENDS.fetch_sub(1, Ordering::Relaxed);
+        self.appends.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -17411,14 +17417,6 @@ mod tests {
         .collect()
     }
 
-    /// Live lanes: a buffer wide enough to open them is fed as it is
-    /// appended and sealed at commit, and the table is the one a
-    /// commit-time build makes — the same superfiles by id range and
-    /// document count, every row present, the same documents under every
-    /// term with the same scores — with each superfile holding a run of
-    /// rows no other's overlaps. Positions are on and the rows are skewed,
-    /// so a document length at the wrong row or a cut at the wrong row
-    /// shows.
     /// An append's lanes are an even share of the pool among the appends
     /// with lanes open: the whole pool alone, never none, and never past the
     /// most a merged order can name.
@@ -17433,6 +17431,38 @@ mod tests {
         assert_eq!(lanes_for(MAX_LANES * 2, 1), MAX_LANES);
     }
 
+    /// An append holds its place in the count of appends with lanes open
+    /// until it lets go of its lanes, however it lets go: dropped unsealed
+    /// or unwound by a panic. A place never released would shrink every
+    /// later append's share for the life of the process.
+    #[test]
+    fn an_append_gives_back_its_place_among_the_open_appends() {
+        static APPENDS: AtomicUsize = AtomicUsize::new(0);
+        let first = OpenAppend::enter(&APPENDS);
+        let second = OpenAppend::enter(&APPENDS);
+        assert_eq!((first.count, second.count), (1, 2), "each counts itself");
+        drop(second);
+        assert_eq!(APPENDS.load(Ordering::Relaxed), 1, "dropped unsealed");
+
+        let unwound = catch_unwind(|| {
+            let _held = OpenAppend::enter(&APPENDS);
+            panic!("an append unwinds with its lanes open");
+        });
+        assert!(unwound.is_err());
+        assert_eq!(APPENDS.load(Ordering::Relaxed), 1, "unwound by a panic");
+
+        drop(first);
+        assert_eq!(APPENDS.load(Ordering::Relaxed), 0, "back where it started");
+    }
+
+    /// Live lanes: a buffer wide enough to open them is fed as it is
+    /// appended and sealed at commit, and the table is the one a
+    /// commit-time build makes — the same superfiles by id range and
+    /// document count, every row present, the same documents under every
+    /// term with the same scores — with each superfile holding a run of
+    /// rows no other's overlaps. Positions are on and the rows are skewed,
+    /// so a document length at the wrong row or a cut at the wrong row
+    /// shows.
     #[test]
     fn live_pieces_seal_the_same_table_a_commit_time_build_makes() {
         const ROWS_PER_BATCH: usize = 2_000;
@@ -17494,7 +17524,7 @@ mod tests {
         const THREADS: usize = 8;
         // About 2.5 MiB of rows against a 1 MiB split: a commit-time build
         // cuts them into a few pieces, while eight threads tokenize them in
-        // eight lanes.
+        // up to eight lanes.
         let build = |live: bool| {
             build_live_or_plain(
                 live_options(THREADS, 1, 4096, false),
@@ -17503,8 +17533,13 @@ mod tests {
                 live,
                 |w| {
                     assert_eq!(w.live.is_some(), live);
+                    // Other tests' appends in this process may hold lanes
+                    // open too, so the share is read off this append's own
+                    // count: one lane per thread when it is alone.
+                    let open = w.live.as_ref().and_then(|l| l.open_append.as_ref());
+                    let share = open.map(|open| lanes_for(THREADS, open.count));
                     if let Some(lanes) = w.live.as_mut().and_then(|l| l.join().ok()) {
-                        assert_eq!(lanes.len(), THREADS, "one lane per thread");
+                        assert_eq!(Some(lanes.len()), share, "this append's share of the pool");
                         assert!(lanes.iter().all(|lane| !lane.stretches.is_empty()));
                         w.live.as_mut().expect("live").lanes = Some(lanes);
                     }
@@ -17681,7 +17716,12 @@ mod tests {
         for b in 0..BATCHES {
             w.append(&live_batch(b, ROWS_PER_BATCH)).expect("append");
         }
-        assert!(w.live.is_some(), "the lanes opened");
+        assert!(
+            w.live
+                .as_ref()
+                .is_some_and(|live| live.open_append.is_some()),
+            "the lanes opened, holding the append's place among the open appends"
+        );
         faults.fail(FaultOp::PutIfMatch, POINTER_URI_FRAGMENT, usize::MAX);
         w.commit().expect_err("the pointer write fails");
         assert!(faults.fired() > 0, "the failure came from the injection");
