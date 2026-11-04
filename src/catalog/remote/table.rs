@@ -316,7 +316,11 @@ impl Table for RemoteTable {
     }
 
     /// The wire has no sorted call, so the sort it stands for travels as SQL
-    /// ([`sorted_statement`]) and the hosted side answers it.
+    /// ([`sorted_statement`]) and the hosted side answers it. A hosted handle
+    /// holds only the table's Arrow schema, not which columns carry a range
+    /// index, so unlike a local table it does not refuse a column without
+    /// one: the statement sorts any column, and returns the same rows a local
+    /// table returns for a column it does index.
     fn sorted_search(
         &self,
         column: &str,

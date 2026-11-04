@@ -787,7 +787,6 @@ impl RangeColumn<'_> {
     }
 
     /// The column's non-null values in this superfile.
-    #[cfg(test)]
     pub(crate) fn n_values(&self) -> u64 {
         self.column.n_values
     }
@@ -1617,7 +1616,9 @@ mod tests {
             let field = opts.field_id_of_column("level").expect("field id");
             for skip in [RoaringBitmap::new(), deleted.clone()] {
                 for descending in [false, true] {
-                    for k in [1, 5, 10, 40, TIE_ROWS] {
+                    // `usize::MAX`: a `k` past every row returns them all,
+                    // sizing nothing by `k`.
+                    for k in [1, 5, 10, 40, TIE_ROWS, usize::MAX] {
                         let ends = reader
                             .range_ends(field, KeyKind::Signed, all, k, descending, &skip)
                             .await

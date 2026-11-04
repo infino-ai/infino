@@ -1498,6 +1498,9 @@ impl SuperfileReader {
         let Some(indexed) = directory.column(field_id) else {
             return Ok(None);
         };
+        // Never more than the column holds: `k` sizes the buffer below, and a
+        // caller's `k` can be any size.
+        let k = k.min(usize::try_from(indexed.n_values()).unwrap_or(usize::MAX));
         let blocks: Vec<usize> = match descending {
             false => indexed.blocks_in(lo, hi).collect(),
             true => indexed.blocks_in(lo, hi).rev().collect(),

@@ -1174,19 +1174,20 @@ impl Table {
         batches_to_pyarrow_table(py, batches)
     }
 
-    /// The first `k` rows by one range-indexed `column`, highest first with
-    /// `descending`; rows sharing a value come in `_id` order and rows
-    /// without one last. Read from the column's range index. Returns a
-    /// pyarrow `Table` in that order like `bm25_search`, with `score` fixed
-    /// at `0.0`. `projection` follows the same rules as `bm25_search`.
-    #[pyo3(signature = (column, descending, k, projection=None))]
+    /// The first `k` rows by one range-indexed `column`, lowest first, or
+    /// highest first with `descending=True` (keyword only); rows sharing a
+    /// value come in `_id` order and rows without one last. Read from the
+    /// column's range index. Returns a pyarrow `Table` in that order like
+    /// `bm25_search`, with `score` fixed at `0.0`. `projection` follows the
+    /// same rules as `bm25_search`.
+    #[pyo3(signature = (column, k, projection=None, *, descending=false))]
     fn sorted_search<'py>(
         &self,
         py: Python<'py>,
         column: &str,
-        descending: bool,
         k: usize,
         projection: Option<Vec<String>>,
+        descending: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         let batches = py
             .detach(|| {

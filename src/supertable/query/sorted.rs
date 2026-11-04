@@ -78,6 +78,11 @@ impl SupertableReader {
         if k == 0 {
             return Ok(Some(Vec::new()));
         }
+        // More rows than the table holds cannot all have a value: the rows
+        // without one would fill the page, so the indexes cannot answer.
+        if u64::try_from(k).map_or(true, |k| k > self.rows_held()) {
+            return Ok(None);
+        }
         let field = *field;
         let units: Vec<_> = manifest
             .superfiles
@@ -142,6 +147,12 @@ impl SupertableReader {
         Ok(Some(order.into_iter().take(k).map(|i| hits[i]).collect()))
     }
 
+    /// The rows this snapshot's superfiles hold, deleted ones included: no
+    /// sort can return more.
+    fn rows_held(&self) -> u64 {
+        self.manifest().superfiles.iter().map(|e| e.n_docs).sum()
+    }
+
     /// Sync [`Self::sorted_hits_async`] through the sync→async bridge.
     pub(crate) fn sorted_hits(
         &self,
@@ -175,6 +186,9 @@ impl Supertable {
         let reader = self.reader()?;
         let context = |e: QueryError| InfinoError::from(e).with_context("sorted_search", None);
         reader.check_projection(projection).map_err(context)?;
+        // A page past every row is every row: the statement's limit stays
+        // within what the table holds, whatever `k` the caller passed.
+        let k = k.min(usize::try_from(reader.rows_held()).unwrap_or(usize::MAX));
         let batches = match reader.sorted_hits(column, descending, k).map_err(context)? {
             Some(hits) => vec![
                 self.block_on_query(
@@ -237,10 +251,13 @@ fn quote(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{cmp::Ordering, sync::Arc};
 
-    use arrow_array::{Array, Decimal128Array, Float32Array, Int64Array};
-    use arrow_schema::{DataType, Field, Schema};
+    use arrow::compute::cast;
+    use arrow_array::{
+        Array, Decimal128Array, Float32Array, Float64Array, Int64Array, TimestampMillisecondArray,
+    };
+    use arrow_schema::{DataType, Field, Schema, TimeUnit};
     use datafusion::prelude::{col, lit};
     use tempfile::TempDir;
 
@@ -425,6 +442,208 @@ mod tests {
                 .downcast_ref::<Float32Array>()
                 .expect("score");
             assert!(scores.values().iter().all(|s| *s == 0.0), "k {k}");
+        }
+    }
+
+    /// A `k` past every row the table holds returns every row in the sort's
+    /// order, as the same sort with no limit does, rather than sizing
+    /// anything by `k`.
+    #[test]
+    fn a_k_past_every_row_returns_every_row() {
+        let dir = TempDir::new().expect("tempdir");
+        let st = table(&dir);
+        let reader = st.reader().expect("reader");
+        for descending in [false, true] {
+            let got = st
+                .sorted_search("key", descending, usize::MAX, Some(&["_id"]))
+                .expect("sorted_search");
+            let direction = if descending { "DESC" } else { "ASC" };
+            let want = reader
+                .query_sql(&format!(
+                    "SELECT _id FROM supertable ORDER BY key {direction} NULLS LAST, _id ASC"
+                ))
+                .expect("sql");
+            assert_eq!(ids(&got), ids(&want), "descending {descending}");
+            assert!(
+                reader
+                    .sorted_hits("key", descending, usize::MAX)
+                    .expect("hits")
+                    .is_none(),
+                "descending {descending}"
+            );
+        }
+    }
+
+    /// Superfiles of the key-kinds table, one commit each.
+    const KIND_FILES: usize = 3;
+    /// Floats in IEEE total order's corners, cycled through the rows: both
+    /// zeros, both NaNs, both infinities, and ordinary values between.
+    const FLOATS: [f64; 9] = [
+        -0.0,
+        0.0,
+        f64::NAN,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        1.5,
+        -2.5,
+        f64::MIN_POSITIVE,
+        -f64::MAX,
+    ];
+    /// Rows in each superfile of the key-kinds table.
+    const KIND_ROWS: usize = 40;
+    /// Every this-many rows the key-kinds table's columns are null.
+    const KIND_NULL_EVERY: usize = 6;
+    /// Distinct timestamps, a second apart, so the timestamp cutoffs tie.
+    const TIMESTAMPS: i64 = 7;
+    /// Milliseconds in a second.
+    const MILLIS_PER_SECOND: i64 = 1000;
+    /// A column whose name SQL must quote: a space and capitals.
+    const QUOTED: &str = "Sort Key";
+    /// The `(descending, k)` each key-kinds ask runs, the last past the rows
+    /// with a value, so the statement answers it.
+    const KIND_ASKS: &[(bool, usize)] = &[
+        (false, 3),
+        (true, 3),
+        (false, 8),
+        (true, 8),
+        (false, 11),
+        (true, 11),
+        (false, 115),
+        (true, 115),
+    ];
+
+    /// A table of a `Float64`, a `Timestamp` and an `Int64` column whose name
+    /// needs quoting, each range indexed and null now and then, in
+    /// [`KIND_FILES`] commits. The float cycles through [`FLOATS`] with a
+    /// negative NaN among them.
+    fn kinds_table(dir: &TempDir) -> Supertable {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("f", DataType::Float64, true),
+            Field::new("ts", DataType::Timestamp(TimeUnit::Millisecond, None), true),
+            Field::new(QUOTED, DataType::Int64, true),
+        ]));
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let options = SupertableOptions::new(Arc::clone(&schema), vec![], vec![])
+            .expect("options")
+            .with_storage(storage)
+            .with_range_indexes(&["f".to_string(), "ts".to_string(), QUOTED.to_string()]);
+        let st = Supertable::create(options).expect("create");
+        for file in 0..KIND_FILES {
+            let rows: Vec<usize> = (file * KIND_ROWS..(file + 1) * KIND_ROWS).collect();
+            let valued = |row: usize| row % KIND_NULL_EVERY != 0;
+            let floats: Vec<Option<f64>> = rows
+                .iter()
+                .map(|&row| {
+                    valued(row).then(|| match row % (FLOATS.len() + 1) {
+                        // NaN with the sign bit set, which total order puts first.
+                        i if i == FLOATS.len() => -f64::NAN,
+                        i => FLOATS[i],
+                    })
+                })
+                .collect();
+            let times: Vec<Option<i64>> = rows
+                .iter()
+                .map(|&row| valued(row).then(|| (row as i64 % TIMESTAMPS) * MILLIS_PER_SECOND))
+                .collect();
+            let quoted: Vec<Option<i64>> = rows
+                .iter()
+                .map(|&row| valued(row).then(|| (row as i64 * 13) % 5))
+                .collect();
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Float64Array::from(floats)),
+                    Arc::new(TimestampMillisecondArray::from(times)),
+                    Arc::new(Int64Array::from(quoted)),
+                ],
+            )
+            .expect("batch");
+            let mut writer = st.writer().expect("writer");
+            writer.append(&batch).expect("append");
+            writer.commit().expect("commit");
+        }
+        st
+    }
+
+    /// Every row's `_id` and `column` value, read with no sort or limit,
+    /// ordered by the value (IEEE total order for a float, descending with
+    /// `descending`), rows without one last, ties by `_id` ascending; and how
+    /// many rows have a value. Ordered here rather than by an `ORDER BY`, so
+    /// the expectation does not rest on the engine's own sort.
+    fn expected(reader: &SupertableReader, column: &str, descending: bool) -> (Vec<i128>, usize) {
+        let batches = reader
+            .query_sql(&format!(
+                "SELECT _id, {} AS v FROM supertable",
+                quote(column)
+            ))
+            .expect("rows");
+        let mut rows: Vec<(Option<f64>, i128)> = Vec::new();
+        for batch in &batches {
+            let id_column = batch.column_by_name("_id").expect("_id");
+            let ids = id_column
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .expect("_id");
+            let values = batch.column_by_name("v").expect("v");
+            let floats = match values.data_type() {
+                DataType::Float64 => Arc::clone(values),
+                _ => cast(
+                    &cast(values, &DataType::Int64).expect("int"),
+                    &DataType::Float64,
+                )
+                .expect("float"),
+            };
+            let floats = floats
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .expect("float");
+            for i in 0..batch.num_rows() {
+                rows.push((floats.is_valid(i).then(|| floats.value(i)), ids.value(i)));
+            }
+        }
+        rows.sort_by(|(a, a_id), (b, b_id)| {
+            let by_value = match (a, b) {
+                (Some(a), Some(b)) if descending => b.total_cmp(a),
+                (Some(a), Some(b)) => a.total_cmp(b),
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (None, None) => Ordering::Equal,
+            };
+            by_value.then(a_id.cmp(b_id))
+        });
+        let valued = rows.iter().filter(|(v, _)| v.is_some()).count();
+        (rows.into_iter().map(|(_, id)| id).collect(), valued)
+    }
+
+    /// Float, timestamp and quoted-name keys return the rows in the column's
+    /// order, either way, ties by `_id`: the float in IEEE total order
+    /// (negative NaN, negative infinity, …, negative zero before zero, …,
+    /// infinity, NaN), from the range indexes within the rows with a value
+    /// and from the statement past them.
+    #[test]
+    fn float_timestamp_and_quoted_keys_return_the_rows_in_order() {
+        let dir = TempDir::new().expect("tempdir");
+        let st = kinds_table(&dir);
+        let reader = st.reader().expect("reader");
+        for column in ["f", "ts", QUOTED] {
+            for &(descending, k) in KIND_ASKS {
+                let got = st
+                    .sorted_search(column, descending, k, Some(&["_id"]))
+                    .expect("sorted_search");
+                let (order, valued) = expected(&reader, column, descending);
+                let want: Vec<i128> = order.into_iter().take(k).collect();
+                assert_eq!(ids(&got), want, "{column}: descending {descending}, k {k}");
+                let from_index = reader
+                    .sorted_hits(column, descending, k)
+                    .expect("hits")
+                    .is_some();
+                assert_eq!(
+                    from_index,
+                    k <= valued,
+                    "{column}: descending {descending}, k {k}"
+                );
+            }
         }
     }
 
