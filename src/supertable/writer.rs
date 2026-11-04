@@ -12242,32 +12242,31 @@ pub(in crate::supertable) async fn stamp_term_index(
                             &live,
                             fold_max_bytes,
                             fold_budget,
-                            renumber && !fold.renumbers(),
+                            renumber,
                             before_tiers,
                         ) && term_index::fold_disk_bound(reuse_path, disk_per_slice)
                             .is_some_and(|bound| bound >= fold_bytes.saturating_mul(2));
                         let downloaded = Arc::new(Notify::new());
-                        let next = match fold_budget.prefetches() {
-                            true => term_index::layers_after(
+                        if fold_budget.prefetches() {
+                            let next = term_index::layers_after(
                                 &root,
                                 &fold,
                                 &live,
                                 fold_max_bytes,
                                 fold_budget,
-                                renumber && !fold.renumbers(),
+                                renumber,
                                 before_tiers,
-                            ),
-                            false => Vec::new(),
-                        };
-                        *prefetch.0.lock().expect("prefetch") =
-                            Some(spawn(term_index::prefetch_layers(
-                                Arc::clone(storage),
-                                next,
-                                Arc::clone(reuse),
-                                Arc::clone(&downloaded),
-                                Arc::clone(disk_per_slice),
-                                if keep { fold_bytes } else { 0 },
-                            )));
+                            );
+                            *prefetch.0.lock().expect("prefetch") =
+                                Some(spawn(term_index::prefetch_layers(
+                                    Arc::clone(storage),
+                                    next,
+                                    Arc::clone(reuse),
+                                    Arc::clone(&downloaded),
+                                    Arc::clone(disk_per_slice),
+                                    if keep { fold_bytes } else { 0 },
+                                )));
+                        }
                         let policy = term_index::BuildPolicy {
                             scoring_by_ordinal: Arc::new(scoring_by_ordinal(&old, fold.superfiles())),
                             ..policy.clone()
