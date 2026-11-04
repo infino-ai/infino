@@ -12090,7 +12090,9 @@ struct KeptFold {
 ///   a writer that keeps none.
 /// - With none left to index, layers fold one run per publish, as
 ///   [`term_index::plan_fold_at_optimize`] picks them, of at most
-///   `fold_max_bytes` together and as many layers as the host's free
+///   what the scratch disk holds together ([`term_index::fold_disk_bound`],
+///   or `unmeasured_fold_max_bytes` when the disk cannot be read), and as
+///   many layers as the host's free
 ///   memory and open-file limit hold. A fold that loses its publish to commits
 ///   has their layers stacked on it ([`term_index::rebase`]), so a retry
 ///   writes one root.
@@ -12107,7 +12109,7 @@ struct KeptFold {
 /// keep a fold due, do not keep one call going.
 pub(in crate::supertable) async fn stamp_term_index(
     inner: &SupertableInner,
-    fold_max_bytes: u64,
+    unmeasured_fold_max_bytes: u64,
 ) -> Result<(), BuildError> {
     let Some(storage) = inner.options.storage.clone() else {
         return Ok(());
@@ -12207,7 +12209,7 @@ pub(in crate::supertable) async fn stamp_term_index(
                         info!(freed_mib = freed >> 20, "term index: evicted kept objects for room");
                     }
                     let fold_max_bytes = term_index::fold_disk_bound(reuse_path, disk_per_slice)
-                        .map_or(fold_max_bytes, |bound| fold_max_bytes.min(bound));
+                        .unwrap_or(unmeasured_fold_max_bytes);
                     if let Some(fold) = term_index::plan_fold_at_optimize(
                         &root,
                         &live,
