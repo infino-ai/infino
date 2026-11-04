@@ -45,6 +45,7 @@ pub use cancel::QueryCancel;
 use dashmap::DashMap;
 use datafusion::{
     common::{
+        TableReference,
         runtime::SpawnedTask,
         tree_node::{TreeNode, TreeNodeRecursion},
     },
@@ -1261,6 +1262,31 @@ impl Connection {
             }
         }
 
+        // A query that reads `information_schema` — directly, or through a
+        // `SHOW TABLES` / `SHOW COLUMNS` statement the planner rewrites into
+        // one — describes the catalog rather than naming the tables it wants
+        // registered: the only `FROM` relations it resolves are the
+        // introspection views themselves. Register every catalog table so the
+        // views reflect the whole catalog, not just the tables a query happens
+        // to name elsewhere. The views are synthesized from the registered
+        // catalog, so this is what makes them non-empty.
+        if references_information_schema(&refs) {
+            for name in self
+                .list_tables()
+                .map_err(|e| e.with_context("query_sql", None))?
+            {
+                if !seen.insert(name.clone()) {
+                    continue;
+                }
+                if let Some(table) = self
+                    .open_and_register_cancellable(&ctx, &name, cancel)
+                    .map_err(|e| e.with_context("query_sql", None))?
+                {
+                    handles.push(table);
+                }
+            }
+        }
+
         // Search TVFs resolve their leading table-name argument through
         // the catalog at call time (so a table named only inside a TVF —
         // not as a `FROM` relation — still resolves).
@@ -1664,6 +1690,17 @@ fn register(
         Err(InfinoError::NotFound(_)) => Ok(None),
         Err(e) => Err(e),
     }
+}
+
+/// Schema name DataFusion exposes its introspection views under.
+const INFORMATION_SCHEMA: &str = "information_schema";
+
+/// Whether any resolved relation lives in `information_schema`. A `SHOW`
+/// statement resolves to these views, and a direct
+/// `SELECT ... FROM information_schema.columns` names one, so either way the
+/// query is introspecting the catalog and wants every table registered.
+fn references_information_schema(refs: &[TableReference]) -> bool {
+    refs.iter().any(|r| r.schema() == Some(INFORMATION_SCHEMA))
 }
 
 fn connective_cap_error(surface: &str) -> InfinoError {
@@ -6126,8 +6163,8 @@ mod tests {
             conn.query_sql(sql)
                 .unwrap_or_else(|e| panic!("{sql:?} should be allowed: {e}"));
         }
-        // `SHOW` reads too. `query_sql` does not enable `information_schema`,
-        // so these fail, but as reads: never refused as a write.
+        // `SHOW` reads too, and `information_schema` is enabled, so they plan
+        // and run rather than erroring.
         for sql in [
             "SHOW TABLES",
             "SHOW COLUMNS FROM docs",
@@ -6135,12 +6172,68 @@ mod tests {
             "SHOW FUNCTIONS",
             "SHOW datafusion.execution.batch_size",
         ] {
-            let err = conn.query_sql(sql);
-            assert!(
-                matches!(&err, Err(InfinoError::Query(msg)) if !msg.contains("read-only")),
-                "{sql:?}: got {err:?}"
-            );
+            conn.query_sql(sql)
+                .unwrap_or_else(|e| panic!("{sql:?} should be allowed: {e}"));
         }
+    }
+
+    /// `information_schema` reflects the catalog's tables and their columns:
+    /// the engine registers every catalog table for a query that reads it, so
+    /// `SHOW TABLES`, `SHOW COLUMNS` and `information_schema.columns` describe
+    /// the real schema rather than coming back empty.
+    #[test]
+    fn query_sql_information_schema_describes_the_catalog() {
+        let conn = connect("memory://").expect("connect");
+        conn.create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create docs");
+        conn.create_table("notes", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create notes");
+
+        // Both user tables are listed, even though neither is a `FROM`
+        // relation of the introspection query.
+        let listed: usize = conn
+            .query_sql(
+                "SELECT table_name FROM information_schema.tables \
+                 WHERE table_name IN ('docs', 'notes')",
+            )
+            .expect("information_schema.tables")
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
+        assert_eq!(listed, 2, "both catalog tables are listed");
+
+        // `docs` exposes its SQL-visible columns: the auto `_id` and `title`.
+        let columns: usize = conn
+            .query_sql(
+                "SELECT column_name FROM information_schema.columns \
+                 WHERE table_name = 'docs'",
+            )
+            .expect("information_schema.columns")
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
+        assert_eq!(columns, 2, "docs has _id and title");
+
+        // `SHOW COLUMNS` rewrites to the same view and sees the same columns.
+        let shown: usize = conn
+            .query_sql("SHOW COLUMNS FROM docs")
+            .expect("SHOW COLUMNS")
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
+        assert_eq!(shown, 2, "SHOW COLUMNS lists _id and title");
+
+        // The column the query actually names is visible by value.
+        let named: usize = conn
+            .query_sql(
+                "SELECT 1 FROM information_schema.columns \
+                 WHERE table_name = 'docs' AND column_name = 'title'",
+            )
+            .expect("named column")
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
+        assert_eq!(named, 1, "the title column is reflected");
     }
 
     /// Rows in the first append of the ordering test: under one default
