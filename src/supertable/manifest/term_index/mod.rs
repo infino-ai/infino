@@ -1402,21 +1402,20 @@ pub(crate) async fn prefetch_layers(
         .iter()
         .flat_map(|layer| &layer.slices)
         .filter(|slice| unique.insert(slice.content_hash))
-        // An earlier fold's output is kept here already.
-        .filter(|slice| !slice_file_path(&reuse, &slice.content_hash).exists())
         .map(|slice| (slice.content_hash, slice.tier))
         .collect();
     let dir = staging.path().to_path_buf();
-    let jobs = objects.into_iter().map(move |(hash, tier)| {
-        let (storage, dir) = (Arc::clone(&storage), dir.clone());
+    let jobs = objects.into_iter().map(|(hash, tier)| {
+        let (storage, dir, reuse) = (Arc::clone(&storage), dir.clone(), reuse.clone());
         async move {
-            let bytes = fetch_verified(storage.as_ref(), None, &slice_uri(&hash), &hash).await?;
-            write_object(slice_file_path(&dir, &hash), bytes).await?;
-            if let Some(tier) = tier {
-                let bytes = fetch_verified(storage.as_ref(), None, &tier_uri(&tier), &tier).await?;
-                write_object(tier_path(&dir, &hash), bytes).await?;
+            // An earlier fold's output is kept here already.
+            if async_fs::try_exists(slice_file_path(&reuse, &hash))
+                .await
+                .unwrap_or(false)
+            {
+                return Ok(());
             }
-            Ok(())
+            fetch_slice_and_tier(storage.as_ref(), &dir, &hash, tier.as_ref()).await
         }
     });
     if run_bounded(LAYER_FETCH_CONCURRENCY, "layer prefetch", jobs)
@@ -1426,10 +1425,11 @@ pub(crate) async fn prefetch_layers(
     {
         return;
     }
-    if let Ok(entries) = fs::read_dir(staging.path()) {
-        for entry in entries.flatten() {
-            let _ = fs::rename(entry.path(), reuse.join(entry.file_name()));
-        }
+    let Ok(mut entries) = async_fs::read_dir(staging.path()).await else {
+        return;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let _ = async_fs::rename(entry.path(), reuse.join(entry.file_name())).await;
     }
 }
 
@@ -1604,8 +1604,8 @@ async fn fold_layers(
     let merged = merged.map_err(|e| TermIndexError::Build(e.to_string()))??;
     debug_assert!(merged.tiers.is_empty() && merged.slices.is_empty());
     for (slice, tier) in consumed {
-        let _ = fs::remove_file(slice);
-        let _ = fs::remove_file(tier);
+        let _ = async_fs::remove_file(slice).await;
+        let _ = async_fs::remove_file(tier).await;
     }
     let mut layer = merged.layer;
     layer.ordinals = merged_ordinals;
@@ -1985,23 +1985,14 @@ pub(crate) async fn download_layers(
             let path = slice_file_path(dir, &slice.content_hash);
             let tier_file = tier_path(dir, &slice.content_hash);
             let (hash, tier) = (slice.content_hash, slice.tier);
-            let reused = reuse
-                .is_some_and(|reuse| link_reused(reuse, &hash, tier.is_some(), &path, &tier_file));
+            let (dir, reuse) = (dir.to_path_buf(), reuse.map(Path::to_path_buf));
             async move {
-                if reused {
+                if let Some(reuse) = reuse
+                    && link_reused(&reuse, &hash, tier.is_some(), &path, &tier_file).await
+                {
                     return Ok(());
                 }
-                // One object resident at a time: the slice is on disk
-                // before its tier object is fetched.
-                let bytes =
-                    fetch_verified(storage.as_ref(), None, &slice_uri(&hash), &hash).await?;
-                write_object(path, bytes).await?;
-                if let Some(tier) = &tier {
-                    let bytes =
-                        fetch_verified(storage.as_ref(), None, &tier_uri(tier), tier).await?;
-                    write_object(tier_file, bytes).await?;
-                }
-                Ok(())
+                fetch_slice_and_tier(storage.as_ref(), &dir, &hash, tier.as_ref()).await
             }
         });
     run_bounded(LAYER_FETCH_CONCURRENCY, "layer fetch", jobs).await?;
@@ -2011,19 +2002,42 @@ pub(crate) async fn download_layers(
 /// Link the slice named by `hash`, and its tier object when it has one,
 /// from `reuse` to `path` and `tier_file`; false, leaving neither, when
 /// `reuse` lacks either.
-fn link_reused(
+async fn link_reused(
     reuse: &Path,
     hash: &ContentHash,
     has_tier: bool,
     path: &Path,
     tier_file: &Path,
 ) -> bool {
-    let linked = fs::hard_link(slice_file_path(reuse, hash), path).is_ok()
-        && (!has_tier || fs::hard_link(tier_path(reuse, hash), tier_file).is_ok());
+    let linked = async_fs::hard_link(slice_file_path(reuse, hash), path)
+        .await
+        .is_ok()
+        && (!has_tier
+            || async_fs::hard_link(tier_path(reuse, hash), tier_file)
+                .await
+                .is_ok());
     if !linked {
-        let _ = fs::remove_file(path);
+        let _ = async_fs::remove_file(path).await;
     }
     linked
+}
+
+/// Fetch the slice named by `hash`, and its tier object when it has one,
+/// into `dir`, each verified against its hash. One object is resident at a
+/// time: the slice is on disk before its tier object is fetched.
+async fn fetch_slice_and_tier(
+    storage: &dyn StorageProvider,
+    dir: &Path,
+    hash: &ContentHash,
+    tier: Option<&ContentHash>,
+) -> Result<(), TermIndexError> {
+    let bytes = fetch_verified(storage, None, &slice_uri(hash), hash).await?;
+    write_object(slice_file_path(dir, hash), bytes).await?;
+    if let Some(tier) = tier {
+        let bytes = fetch_verified(storage, None, &tier_uri(tier), tier).await?;
+        write_object(tier_path(dir, hash), bytes).await?;
+    }
+    Ok(())
 }
 
 /// Where `download_layers` puts the slice named by `hash` under `dir`.

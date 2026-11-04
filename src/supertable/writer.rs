@@ -12205,9 +12205,17 @@ pub(in crate::supertable) async fn stamp_term_index(
                     // Objects no layer names any more go first; short of room
                     // even so, every kept object goes. Each fold is sized by
                     // the disk its inputs take.
-                    term_index::retain_kept(reuse_path, &root);
-                    if !term_index::has_room(reuse_path) {
-                        let freed = term_index::evict_kept(reuse_path);
+                    let (sweep_dir, swept_root) = (reuse_path.clone(), root.clone());
+                    let freed = tokio::task::spawn_blocking(move || {
+                        term_index::retain_kept(&sweep_dir, &swept_root);
+                        match term_index::has_room(&sweep_dir) {
+                            true => 0,
+                            false => term_index::evict_kept(&sweep_dir),
+                        }
+                    })
+                    .await
+                    .unwrap_or(0);
+                    if freed > 0 {
                         info!(freed_mib = freed >> 20, "term index: evicted kept objects for room");
                     }
                     let fold_max_bytes = term_index::fold_disk_bound(reuse_path, disk_per_slice)
