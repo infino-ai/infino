@@ -58,24 +58,23 @@ const TINY_BUDGET_BYTES: u64 = 1;
 const BUDGET_N_ROWS: usize = 65_536;
 /// Expected peak reservation band for a measured cold vector search over
 /// `BUDGET_N_ROWS` (dim 16, `n_cent` 4, Sq8, default or `nprobe` 4). Assert a
-/// band around the observed ~156 KB fetch: tight enough to prove it's the
-/// real cluster fetch, loose enough to survive minor codec / layout drift.
-// The manifest-calibrated probe-width law widened the default cold sweep
-// from the fine-first single probe to width(k) cells across several
-// units, each unit reserving its selected cells' blocks concurrently —
-// the same fixture now peaks ~5x the single-probe band (measured
-// 622,592 B). The band still pins both failure modes: ~0 = budget not
-// exercised on the query path; far above = reservations leaking past
-// the sweep's working set.
+/// band around the observed peak: tight enough to prove it's the real
+/// cluster fetch, loose enough to survive minor codec / layout drift.
+// The manifest-calibrated probe-width law sweeps width(k) cells across
+// several units, each reserving its cell's whole cold download (the blocks
+// plus the metadata and id ranges merged into the same GET, ~238 KB) at
+// once: measured 950,784 B. The band still pins both failure modes: ~0 =
+// budget not exercised on the query path; far above = reservations leaking
+// past the sweep's working set.
 const CONTROL_PEAK_LOW_BYTES: usize = 120_000;
-const CONTROL_PEAK_HIGH_BYTES: usize = 800_000;
-/// Bounded budget set generously above one cold fetch (~156 KB); 90% gate is
-/// 900 KB. Proves an enforcing budget admits under-budget work.
-const AMPLE_BUDGET_BYTES: u64 = 1_000_000;
-const AMPLE_BUDGET_GATE_BYTES: usize = 900_000;
-/// Shared multi-superfile budget: admits one ~156 KB fetch but not two
-/// concurrent ones (90% gate = 180 KB).
-const SHARED_BUDGET_BYTES: u64 = 200_000;
+const CONTROL_PEAK_HIGH_BYTES: usize = 1_200_000;
+/// Bounded budget set above the whole search's peak (~951 KB); 90% gate is
+/// 1.08 MB. Proves an enforcing budget admits under-budget work.
+const AMPLE_BUDGET_BYTES: u64 = 1_200_000;
+const AMPLE_BUDGET_GATE_BYTES: usize = 1_080_000;
+/// Shared multi-superfile budget: admits one ~238 KB fetch but not two at
+/// once (90% gate = 270 KB), so the search's reads must take turns.
+const SHARED_BUDGET_BYTES: u64 = 300_000;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn supertable_smoke_via_rustfs_https() {
@@ -820,9 +819,12 @@ async fn supertable_cold_hybrid_search_over_budget_via_sql_rustfs() {
     );
 }
 
-/// The per-connection budget is shared across the multi-superfile fan-out.
-/// Two commits → two ~156 KB cold fetches; a budget that fits one but not two
-/// refuses the concurrent fan-out as `OverBudget`.
+/// The connection budget is shared across a search's multi-superfile fan-out.
+/// Two commits → two superfiles, each probed with four ~238 KB cold fetches
+/// (~951 KB per superfile), which the measured control holds together; under a
+/// budget that fits one fetch but not two, a fetch the budget refuses waits
+/// its turn, and the search returns the control's hits instead of failing as
+/// `OverBudget`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn supertable_vector_budget_is_shared_across_superfiles_via_rustfs() {
     if !rustfs_server::begin_rustfs_test(
@@ -886,25 +888,15 @@ async fn supertable_vector_budget_is_shared_across_superfiles_via_rustfs() {
     );
 
     let (bounded, _bounded_guard) = open_budget_consumer(dim, &storage, SHARED_BUDGET_BYTES);
-    let result = search(&bounded);
+    let bounded_hits =
+        search(&bounded).expect("fetches that fit one at a time must wait, not fail");
     let bounded_budget = bounded.options().connection_budget();
+    let ceiling = bounded_budget.limit().expect("bounded");
     eprintln!(
-        "[rustfs-shared] bounded: denials={} peak={} B result={}",
+        "[rustfs-shared] bounded: denials={} peak={} B ceiling={ceiling} B",
         bounded_budget.denials(),
-        bounded_budget.peak(),
-        if result.is_ok() { "ok" } else { "over-budget" }
+        bounded_budget.peak()
     );
-    match result {
-        Err(InfinoError::OverBudget(_)) => {}
-        Err(other) => panic!("expected InfinoError::OverBudget, got {other:?}"),
-        Ok(hits) => panic!(
-            "two concurrent {CONTROL_PEAK_HIGH_BYTES}-B fetches must cross a \
-             {SHARED_BUDGET_BYTES}-B budget; got {} batch(es)",
-            hits.len()
-        ),
-    }
-    assert!(
-        bounded_budget.denials() >= 1,
-        "the shared budget must record the crossing"
-    );
+    assert!(bounded_budget.peak() > 0 && bounded_budget.peak() <= ceiling);
+    assert_eq!(bounded_hits, measured_hits);
 }
