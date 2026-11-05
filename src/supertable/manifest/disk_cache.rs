@@ -1,35 +1,39 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
-//! [`ManifestDiskCache`] — a content-addressed on-disk cache for the
-//! compressed (Avro+zstd) bytes of manifest parts, and for the summaries
-//! sections beside them (see [`crate::supertable::manifest::summaries`]),
-//! under the same hash-named files.
+//! [`MetadataDiskCache`] — a table's content-addressed on-disk cache for
+//! the metadata objects it reads back from storage: manifest parts, the
+//! summaries sections beside them (see
+//! [`crate::supertable::manifest::summaries`]), term index objects, and a
+//! hidden vector index's state blob and centroid section. Every object is
+//! named by the blake3 hash of its bytes, so one cache serves all of them
+//! under the same hash-named files, and a new kind of object needs no cache
+//! of its own.
 //!
-//! Manifest parts are immutable and addressed by the blake3 hash of
-//! their compressed bytes (see [`crate::supertable::manifest::part`]).
-//! That makes them an ideal disk-cache target: the content hash is the
-//! key, so a cached file can never be stale — if the logical content
-//! changes, the hash changes, and the new content lands under a new
-//! filename. No invalidation logic is needed; old files simply become
-//! eviction candidates.
+//! The content hash is the key, so a cached file can never be stale: if
+//! the logical content changes, the hash changes, and the new content
+//! lands under a new filename. No invalidation logic is needed; old files
+//! simply become eviction candidates.
+//!
+//! Each table has its own cache. A hidden vector index is a table of its
+//! own, so it gets one in [`HIDDEN_INDEX_CACHE_SUBDIR`] beside its user
+//! table's, with its own budget: its objects are 100 MB or more, and
+//! sharing a budget would let them evict the user table's manifest parts.
 //!
 //! ## What this buys
 //!
-//! [`ManifestPartLoader`](super::ManifestPartLoader) consults this
-//! cache before issuing a `StorageProvider::get`. On a hit the part
-//! bytes come off local disk instead of object storage, eliminating
-//! the network round-trip (the dominant cost on a cold part load over
-//! S3). The cache also survives process restarts: the on-disk files
-//! persist and the in-memory accounting index is rebuilt by a
-//! directory scan at construction.
+//! Readers consult this cache before issuing a `StorageProvider::get`. On
+//! a hit the bytes come off local disk instead of object storage,
+//! eliminating the network round-trip (the dominant cost on a cold load
+//! over S3). The cache also survives process restarts: the on-disk files
+//! persist and the in-memory accounting index is rebuilt by a directory
+//! scan at construction.
 //!
 //! ## What this does NOT cache
 //!
 //! Superfile *byte content* is cached one layer over, by
 //! [`DiskCacheStore`](crate::supertable::reader_cache::DiskCacheStore).
-//! This cache holds only manifest-part bytes. The two caches are
-//! independent and use separate byte budgets.
+//! The two caches are independent and use separate byte budgets.
 
 use std::{
     fs,
@@ -58,6 +62,9 @@ const CACHE_FILE_SUFFIX: &str = ".avro.zst";
 /// File-name suffix for an in-flight cache write, atomically renamed
 /// onto the final name once the bytes are durable.
 const CACHE_TMP_SUFFIX: &str = ".tmp";
+/// Directory, beside a user table's cache, of its hidden vector index's
+/// cache.
+pub(crate) const HIDDEN_INDEX_CACHE_SUBDIR: &str = "hidden-index-metadata";
 
 /// What a `get` found on disk for an indexed hash.
 enum CachedRead {
@@ -74,14 +81,14 @@ enum CachedRead {
 struct CacheEntry {
     size_bytes: u64,
     /// Microseconds-since-construction of the last access. Monotonic
-    /// per [`ManifestDiskCache`] instance; drives LRU eviction.
+    /// per [`MetadataDiskCache`] instance; drives LRU eviction.
     last_access_us: AtomicU64,
 }
 
-/// Snapshot of the manifest cache's load. Surfaced via
-/// [`ManifestDiskCache::stats`] for tests and observability.
+/// Snapshot of the metadata cache's load. Surfaced via
+/// [`MetadataDiskCache::stats`] for tests and observability.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ManifestCacheStats {
+pub struct MetadataCacheStats {
     pub n_entries: u64,
     pub current_bytes: u64,
     pub budget_bytes: u64,
@@ -90,12 +97,12 @@ pub struct ManifestCacheStats {
     pub n_evictions: u64,
 }
 
-/// Content-addressed disk cache for manifest-part bytes.
+/// Content-addressed disk cache for a table's metadata objects.
 ///
 /// Construction is sync (a directory scan); `get` / `put` are async
 /// because their file I/O runs off the tokio workers, each as one
 /// blocking task. A `get` verifies the bytes (blake3) in that same task.
-pub struct ManifestDiskCache {
+pub struct MetadataDiskCache {
     cache_root: PathBuf,
     budget_bytes: AtomicU64,
     started_at: Instant,
@@ -116,7 +123,7 @@ pub struct ManifestDiskCache {
 /// name also carries the pid, for writes from another process.
 static NEXT_TMP: AtomicU64 = AtomicU64::new(0);
 
-impl ManifestDiskCache {
+impl MetadataDiskCache {
     /// Construct a cache rooted at `cache_root` (created if absent)
     /// with a byte budget of `budget_bytes`. Scans `cache_root` for
     /// pre-existing `part-<hex>.avro.zst` files and seeds the
@@ -138,10 +145,11 @@ impl ManifestDiskCache {
         Ok(Arc::new(cache))
     }
 
-    /// A cache in the directory `subdir` beside this one, with the same budget.
-    pub(crate) fn beside(&self, subdir: &str) -> std::io::Result<Arc<Self>> {
+    /// The cache for this table's hidden vector index: its own directory,
+    /// [`HIDDEN_INDEX_CACHE_SUBDIR`], beside this one, with the same budget.
+    pub(crate) fn for_hidden_index(&self) -> std::io::Result<Arc<Self>> {
         let parent = self.cache_root.parent().unwrap_or(&self.cache_root);
-        Self::new(parent.join(subdir), self.budget_bytes())
+        Self::new(parent.join(HIDDEN_INDEX_CACHE_SUBDIR), self.budget_bytes())
     }
 
     /// Walk the cache directory and register every well-formed cache
@@ -420,8 +428,8 @@ impl ManifestDiskCache {
 
     /// Snapshot of the cache's load. Cheap: reads atomics + a
     /// `DashMap::len`.
-    pub fn stats(&self) -> ManifestCacheStats {
-        ManifestCacheStats {
+    pub fn stats(&self) -> MetadataCacheStats {
+        MetadataCacheStats {
             n_entries: self.entries.len() as u64,
             current_bytes: self.current_bytes.load(Ordering::Acquire),
             budget_bytes: self.budget_bytes(),
@@ -450,9 +458,9 @@ impl ManifestDiskCache {
     }
 }
 
-impl std::fmt::Debug for ManifestDiskCache {
+impl std::fmt::Debug for MetadataDiskCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ManifestDiskCache")
+        f.debug_struct("MetadataDiskCache")
             .field("cache_root", &self.cache_root)
             .field("budget_bytes", &self.budget_bytes())
             .field("current_bytes", &self.current_bytes.load(Ordering::Acquire))
@@ -502,7 +510,7 @@ mod tests {
     async fn put_then_get_roundtrips() {
         let root = tmp_root("roundtrip");
         let _ = fs::remove_dir_all(&root);
-        let cache = ManifestDiskCache::new(root.clone(), 1 << 20).expect("cache");
+        let cache = MetadataDiskCache::new(root.clone(), 1 << 20).expect("cache");
 
         let bytes = b"compressed-part-bytes".to_vec();
         let h = hash_of(&bytes);
@@ -521,7 +529,7 @@ mod tests {
     async fn miss_on_unknown_hash() {
         let root = tmp_root("miss");
         let _ = fs::remove_dir_all(&root);
-        let cache = ManifestDiskCache::new(root.clone(), 1 << 20).expect("cache");
+        let cache = MetadataDiskCache::new(root.clone(), 1 << 20).expect("cache");
         let h = hash_of(b"never-inserted");
         assert!(cache.get(&h).await.is_none());
         assert_eq!(cache.stats().n_misses, 1);
@@ -532,7 +540,7 @@ mod tests {
     fn raise_budget_never_lowers_it() {
         let root = tmp_root("raise-budget");
         let _ = fs::remove_dir_all(&root);
-        let cache = ManifestDiskCache::new(root.clone(), 100).expect("cache");
+        let cache = MetadataDiskCache::new(root.clone(), 100).expect("cache");
         cache.raise_budget(50);
         assert_eq!(cache.budget_bytes(), 100);
         cache.raise_budget(500);
@@ -541,17 +549,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_cache_beside_another_keeps_its_own_entries() {
-        let parent = tmp_root("beside");
+    async fn a_hidden_index_cache_keeps_its_own_entries() {
+        let parent = tmp_root("hidden-index");
         let _ = fs::remove_dir_all(&parent);
-        let cache = ManifestDiskCache::new(parent.join("parts"), 1 << 20).expect("cache");
-        let other = cache.beside("other").expect("cache beside");
-        assert_eq!(other.budget_bytes(), cache.budget_bytes());
+        let cache = MetadataDiskCache::new(parent.join("parts"), 1 << 20).expect("cache");
+        let hidden = cache.for_hidden_index().expect("hidden index cache");
+        assert_eq!(hidden.budget_bytes(), cache.budget_bytes());
 
-        let bytes = b"other-bytes".to_vec();
+        let bytes = b"hidden-bytes".to_vec();
         let h = hash_of(&bytes);
-        other.put(h, Bytes::copy_from_slice(&bytes)).await;
-        assert!(parent.join("other").join(cache_filename(&h)).exists());
+        hidden.put(h, Bytes::copy_from_slice(&bytes)).await;
+        assert!(
+            parent
+                .join(HIDDEN_INDEX_CACHE_SUBDIR)
+                .join(cache_filename(&h))
+                .exists()
+        );
         assert_eq!(cache.get(&h).await, None);
         let _ = fs::remove_dir_all(&parent);
     }
@@ -560,7 +573,7 @@ mod tests {
     async fn put_is_idempotent() {
         let root = tmp_root("idempotent");
         let _ = fs::remove_dir_all(&root);
-        let cache = ManifestDiskCache::new(root.clone(), 1 << 20).expect("cache");
+        let cache = MetadataDiskCache::new(root.clone(), 1 << 20).expect("cache");
         let bytes = b"abc".to_vec();
         let h = hash_of(&bytes);
         cache.put(h, Bytes::copy_from_slice(&bytes)).await;
@@ -574,7 +587,7 @@ mod tests {
     async fn oversized_part_is_not_cached() {
         let root = tmp_root("oversized");
         let _ = fs::remove_dir_all(&root);
-        let cache = ManifestDiskCache::new(root.clone(), 4).expect("cache");
+        let cache = MetadataDiskCache::new(root.clone(), 4).expect("cache");
         let bytes = b"way too big for a 4 byte budget".to_vec();
         let h = hash_of(&bytes);
         cache.put(h, Bytes::copy_from_slice(&bytes)).await;
@@ -588,7 +601,7 @@ mod tests {
         let root = tmp_root("lru");
         let _ = fs::remove_dir_all(&root);
         // Budget fits two 10-byte parts but not three.
-        let cache = ManifestDiskCache::new(root.clone(), 25).expect("cache");
+        let cache = MetadataDiskCache::new(root.clone(), 25).expect("cache");
         let a = vec![1u8; 10];
         let b = vec![2u8; 10];
         let c = vec![3u8; 10];
@@ -610,7 +623,7 @@ mod tests {
     async fn a_removed_entry_leaves_the_disk_and_the_budget() {
         let root = tmp_root("remove");
         let _ = fs::remove_dir_all(&root);
-        let cache = ManifestDiskCache::new(root.clone(), 1 << 20).expect("cache");
+        let cache = MetadataDiskCache::new(root.clone(), 1 << 20).expect("cache");
         let bytes = b"superseded-bytes".to_vec();
         let h = hash_of(&bytes);
         cache.put(h, Bytes::copy_from_slice(&bytes)).await;
@@ -630,7 +643,7 @@ mod tests {
     async fn corrupt_file_is_treated_as_miss() {
         let root = tmp_root("corrupt");
         let _ = fs::remove_dir_all(&root);
-        let cache = ManifestDiskCache::new(root.clone(), 1 << 20).expect("cache");
+        let cache = MetadataDiskCache::new(root.clone(), 1 << 20).expect("cache");
         let bytes = b"genuine-bytes".to_vec();
         let h = hash_of(&bytes);
         cache.put(h, Bytes::copy_from_slice(&bytes)).await;
@@ -653,11 +666,11 @@ mod tests {
         let bytes = b"survives-restart".to_vec();
         let h = hash_of(&bytes);
         {
-            let cache = ManifestDiskCache::new(root.clone(), 1 << 20).expect("cache");
+            let cache = MetadataDiskCache::new(root.clone(), 1 << 20).expect("cache");
             cache.put(h, Bytes::copy_from_slice(&bytes)).await;
         }
         // New cache over the same root: index rebuilt from disk.
-        let reopened = ManifestDiskCache::new(root.clone(), 1 << 20).expect("reopen");
+        let reopened = MetadataDiskCache::new(root.clone(), 1 << 20).expect("reopen");
         assert_eq!(reopened.stats().n_entries, 1);
         assert_eq!(reopened.stats().current_bytes, bytes.len() as u64);
         assert_eq!(reopened.get(&h).await.expect("hit after restart"), bytes);
@@ -684,8 +697,8 @@ mod tests {
     fn writes_of_one_part_use_distinct_temp_files() {
         let root = tmp_root("distinct-tmp");
         let _ = fs::remove_dir_all(&root);
-        let cache = ManifestDiskCache::new(root.clone(), 1 << 20).expect("cache");
-        let other = ManifestDiskCache::new(root.clone(), 1 << 20).expect("other cache");
+        let cache = MetadataDiskCache::new(root.clone(), 1 << 20).expect("cache");
+        let other = MetadataDiskCache::new(root.clone(), 1 << 20).expect("other cache");
         let h = hash_of(b"part");
         assert_ne!(cache.tmp_path(&h), cache.tmp_path(&h));
         assert_ne!(cache.tmp_path(&h), other.tmp_path(&h));
@@ -705,7 +718,7 @@ mod tests {
     async fn a_put_dropped_midway_still_lands_indexed_and_charged() {
         let root = tmp_root("dropped-put");
         let _ = fs::remove_dir_all(&root);
-        let cache = ManifestDiskCache::new(root.clone(), 1 << 20).expect("cache");
+        let cache = MetadataDiskCache::new(root.clone(), 1 << 20).expect("cache");
         let bytes = b"compressed-part-bytes".to_vec();
         let h = hash_of(&bytes);
 

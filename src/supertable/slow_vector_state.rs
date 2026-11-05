@@ -41,7 +41,7 @@ use crate::{
     supertable::{
         manifest::{
             SuperfileEntry, VectorSummary,
-            disk_cache::ManifestDiskCache,
+            disk_cache::MetadataDiskCache,
             encoding::SummaryWireMode,
             list::RoutingRef,
             part::{self, ContentHash, ManifestPart, PartId},
@@ -475,7 +475,7 @@ impl CentroidSection {
 /// when fetched.
 pub(crate) async fn fetch_centroid_section(
     storage: &dyn StorageProvider,
-    cache: Option<&Arc<ManifestDiskCache>>,
+    cache: Option<&Arc<MetadataDiskCache>>,
     reference: &RoutingRef,
     entries: &[Arc<SuperfileEntry>],
 ) -> Result<CentroidSection, SlowVectorStateError> {
@@ -585,7 +585,7 @@ async fn fetch_section_into(
 /// stamp, not by these PUTs.
 pub(crate) async fn write_state(
     storage: &dyn StorageProvider,
-    cache: Option<&Arc<ManifestDiskCache>>,
+    cache: Option<&Arc<MetadataDiskCache>>,
     entries: &[Arc<SuperfileEntry>],
     previous_section: Option<&CentroidSection>,
 ) -> Result<PublishedState, SlowVectorStateError> {
@@ -605,7 +605,7 @@ pub(crate) async fn write_state(
 /// it, the drain-resume path reads it.
 pub(crate) async fn write_state_with_pending_drain(
     storage: &dyn StorageProvider,
-    cache: Option<&Arc<ManifestDiskCache>>,
+    cache: Option<&Arc<MetadataDiskCache>>,
     entries: &[Arc<SuperfileEntry>],
     pending: &PendingDrainState,
     previous_section: Option<&CentroidSection>,
@@ -625,7 +625,7 @@ pub(crate) async fn write_state_with_pending_drain(
 /// [`PublishedState`]. Both are also kept in `cache`.
 async fn write_blob_and_section(
     storage: &dyn StorageProvider,
-    cache: Option<&Arc<ManifestDiskCache>>,
+    cache: Option<&Arc<MetadataDiskCache>>,
     blob_bytes: Vec<u8>,
     entries: &[Arc<SuperfileEntry>],
     previous_section: Option<&CentroidSection>,
@@ -938,7 +938,7 @@ pub(crate) async fn hydrate_resident_index(
 /// never fail a table open or a query.
 pub(crate) async fn load_state(
     storage: &dyn StorageProvider,
-    cache: Option<&Arc<ManifestDiskCache>>,
+    cache: Option<&Arc<MetadataDiskCache>>,
     uri: &str,
     expected: &ContentHash,
     legacy: &LegacyNames,
@@ -964,7 +964,7 @@ pub(crate) async fn has_pending_drain(
 /// keeping it in `cache` once it verifies.
 pub(crate) async fn load_full_state(
     storage: &dyn StorageProvider,
-    cache: Option<&Arc<ManifestDiskCache>>,
+    cache: Option<&Arc<MetadataDiskCache>>,
     uri: &str,
     expected: &ContentHash,
     legacy: &LegacyNames,
@@ -1546,7 +1546,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let storage = LocalFsStorageProvider::new(dir.path().join("store")).expect("storage");
         let cache =
-            ManifestDiskCache::new(dir.path().join("cache"), CACHE_BUDGET_BYTES).expect("cache");
+            MetadataDiskCache::new(dir.path().join("cache"), CACHE_BUDGET_BYTES).expect("cache");
         let entries = vec![
             entry_with_summary(FIRST_N_DOCS, 1),
             entry_with_summary(SECOND_N_DOCS, 6),
@@ -1587,7 +1587,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let storage = LocalFsStorageProvider::new(dir.path().join("store")).expect("storage");
         let cache =
-            ManifestDiskCache::new(dir.path().join("cache"), CACHE_BUDGET_BYTES).expect("cache");
+            MetadataDiskCache::new(dir.path().join("cache"), CACHE_BUDGET_BYTES).expect("cache");
         let entries = vec![entry_with_summary(FIRST_N_DOCS, 1)];
         let published = write_state(&storage, None, &entries, None)
             .await

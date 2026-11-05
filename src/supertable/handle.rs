@@ -1847,10 +1847,6 @@ pub(crate) const GLOBAL_VECTOR_KMEANS_SEED: u64 = 0x51ED_2A11;
 /// the full working set stays resident.
 const CACHE_BUDGET_HEADROOM_DIVISOR: u64 = 10;
 
-/// Directory, beside the table's manifest cache, where the hidden vector
-/// index keeps its state blobs and centroid sections.
-const VECTOR_STATE_CACHE_SUBDIR: &str = "vector-state";
-
 /// Aggressive compaction profile for the hidden vector-index table: keep
 /// ~one compact packed shard object per partition key instead of many
 /// small delta files.
@@ -2024,10 +2020,10 @@ fn build_vector_index_options(
     // (drain, split, compaction) must stay writable regardless of how the
     // user handle was opened.
     hidden_opts.summary_centroids_from_superfiles = false;
-    if let Some(cache) = user_opts.manifest_disk_cache.as_ref() {
-        match cache.beside(VECTOR_STATE_CACHE_SUBDIR) {
-            Ok(cache) => hidden_opts.manifest_disk_cache = Some(cache),
-            Err(error) => warn!("vector-state disk cache unavailable: {error}"),
+    if let Some(cache) = user_opts.metadata_disk_cache.as_ref() {
+        match cache.for_hidden_index() {
+            Ok(cache) => hidden_opts.metadata_disk_cache = Some(cache),
+            Err(error) => warn!("hidden index metadata cache unavailable: {error}"),
         }
     }
     // Per-table cell-count overrides ride along too: the hidden handle's
@@ -2892,7 +2888,7 @@ mod tests {
             manifest::{
                 ScalarStats, SuperfileEntry, SuperfileUri,
                 commit::{POINTER_PATH, get_current_manifest_etag},
-                disk_cache::ManifestDiskCache,
+                disk_cache::MetadataDiskCache,
                 list::PartitionStrategy,
             },
             opann::MODALITY_MIN_CELL_DOCS,
@@ -9061,13 +9057,13 @@ mod tests {
         assert!(!hits.is_empty(), "search serves from the hydrated view");
     }
 
-    /// Budget of the manifest cache in the vector-state cache tests.
+    /// Budget of the metadata cache in the vector-state cache tests.
     const VECTOR_STATE_TEST_CACHE_BUDGET_BYTES: u64 = 1 << 30;
 
     /// Vector dimension in the vector-state cache tests.
     const VECTOR_STATE_TEST_DIM: usize = 16;
 
-    /// Options for a vector table stored under `dir`, with its manifest cache under `cache_dir`.
+    /// Options for a vector table stored under `dir`, with its metadata cache under `cache_dir`.
     fn vector_state_cache_options(dir: &Path, cache_dir: &Path) -> SupertableOptions {
         let item_field = Arc::new(Field::new("item", DataType::Float32, true));
         let schema = Arc::new(Schema::new(vec![
@@ -9086,11 +9082,11 @@ mod tests {
         );
         let storage: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(dir).expect("provider"));
-        let cache = ManifestDiskCache::new(
+        let cache = MetadataDiskCache::new(
             cache_dir.join("manifest-parts"),
             VECTOR_STATE_TEST_CACHE_BUDGET_BYTES,
         )
-        .expect("manifest cache");
+        .expect("metadata cache");
         SupertableOptions::new(
             schema,
             vec![FtsConfig::new("title")],
@@ -9106,7 +9102,7 @@ mod tests {
         .expect("valid options")
         .with_storage(storage)
         .with_writer_pool(pool)
-        .with_manifest_disk_cache(cache)
+        .with_metadata_disk_cache(cache)
     }
 
     /// Commit one row titled `title` to a table made by [`vector_state_cache_options`].
@@ -9142,17 +9138,17 @@ mod tests {
             .clone()
     }
 
-    /// The vector-state cache of a hidden vector index.
-    fn vector_state_cache(hidden: &Supertable) -> Arc<ManifestDiskCache> {
+    /// The metadata cache of a hidden vector index.
+    fn hidden_index_cache(hidden: &Supertable) -> Arc<MetadataDiskCache> {
         Arc::clone(
             hidden
                 .reader()
                 .expect("reader")
                 .manifest()
                 .options
-                .manifest_disk_cache
+                .metadata_disk_cache
                 .as_ref()
-                .expect("hidden vector-state cache"),
+                .expect("hidden index metadata cache"),
         )
     }
 
@@ -9170,7 +9166,7 @@ mod tests {
 
         let st2 = Supertable::open(vector_state_cache_options(dir.path(), cache_dir.path()))
             .expect("reopen");
-        let stats = vector_state_cache(&hidden_vector_index(&st2)).stats();
+        let stats = hidden_index_cache(&hidden_vector_index(&st2)).stats();
         assert!(stats.n_hits > 0, "{stats:?}");
         assert_eq!(stats.n_misses, 0, "{stats:?}");
     }
@@ -9194,7 +9190,7 @@ mod tests {
             [blob, section]
         };
         let first = generation(&hidden);
-        let cache = vector_state_cache(&hidden);
+        let cache = hidden_index_cache(&hidden);
         assert!(first.iter().all(|hash| cache.contains(hash)));
 
         commit_vector_state_row(&st, "beta");

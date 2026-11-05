@@ -220,7 +220,7 @@ async fn erase_cached_copies(inner: &SupertableInner, keys: &[String]) {
         .filter(|_| !superfiles.is_empty());
     let vector_state_cache = inner
         .options
-        .manifest_disk_cache
+        .metadata_disk_cache
         .clone()
         .filter(|_| !vector_states.is_empty());
 
@@ -322,7 +322,7 @@ async fn live_set(
         // public error variant.
         let state = slow_vector_state::load_full_state(
             storage.as_ref(),
-            inner.options.manifest_disk_cache.as_ref(),
+            inner.options.metadata_disk_cache.as_ref(),
             uri,
             &hash,
             &manifest.options.legacy_names(),

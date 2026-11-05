@@ -5491,7 +5491,7 @@ async fn load_drain_remote_checkpoint(
     }
     let state = slow_vector_state::load_full_state(
         storage.as_ref(),
-        inner.options.manifest_disk_cache.as_ref(),
+        inner.options.metadata_disk_cache.as_ref(),
         uri,
         &hash,
         &inner.options.legacy_names(),
@@ -9391,7 +9391,7 @@ async fn pin_uploaded_superfiles(
             .unwrap_or(true)
             && let Ok(state) = slow_vector_state::load_full_state(
                 storage.as_ref(),
-                inner.options.manifest_disk_cache.as_ref(),
+                inner.options.metadata_disk_cache.as_ref(),
                 uri,
                 &hash,
                 &inner.options.legacy_names(),
@@ -11545,7 +11545,7 @@ async fn build_and_publish_centroid_router_section(
     }
     let section = match fetch_centroid_section(
         storage,
-        inner.options.manifest_disk_cache.as_ref(),
+        inner.options.metadata_disk_cache.as_ref(),
         centroids_ref,
         entries,
     )
@@ -11602,7 +11602,7 @@ async fn previous_centroid_section(
     }
     match fetch_centroid_section(
         storage,
-        options.manifest_disk_cache.as_ref(),
+        options.metadata_disk_cache.as_ref(),
         &reference,
         manifest.get_all_superfiles(),
     )
@@ -12463,7 +12463,7 @@ pub(in crate::supertable) async fn stamp_slow_vector_state(
             Some(pending) => {
                 slow_vector_state::write_state_with_pending_drain(
                     storage.as_ref(),
-                    inner.options.manifest_disk_cache.as_ref(),
+                    inner.options.metadata_disk_cache.as_ref(),
                     entries,
                     pending,
                     previous_section.as_deref(),
@@ -12473,7 +12473,7 @@ pub(in crate::supertable) async fn stamp_slow_vector_state(
             None => {
                 slow_vector_state::write_state(
                     storage.as_ref(),
-                    inner.options.manifest_disk_cache.as_ref(),
+                    inner.options.metadata_disk_cache.as_ref(),
                     entries,
                     previous_section.as_deref(),
                 )
@@ -13400,7 +13400,7 @@ pub(crate) async fn try_commit_attempt(
                 previous_centroid_section(&opts, storage.as_ref(), current_manifest.as_ref()).await;
             let published = slow_vector_state::write_state(
                 storage.as_ref(),
-                opts.manifest_disk_cache.as_ref(),
+                opts.metadata_disk_cache.as_ref(),
                 entries,
                 previous_section.as_deref(),
             )

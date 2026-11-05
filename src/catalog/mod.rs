@@ -140,7 +140,7 @@ use crate::{
     },
     supertable::{
         Supertable as SupertableHandle,
-        manifest::disk_cache::ManifestDiskCache,
+        manifest::disk_cache::MetadataDiskCache,
         options::SupertableOptions,
         query::{exec::common::collect_plan_metered, sql::sql_session_context},
         reader_cache::{DiskCacheConfig, DiskCacheError, DiskCacheStore},
@@ -591,7 +591,7 @@ impl Connection {
                 if let Some((cache, manifest_cache)) = disk_cache {
                     opts = opts
                         .with_disk_cache(cache)
-                        .with_manifest_disk_cache(manifest_cache);
+                        .with_metadata_disk_cache(manifest_cache);
                 }
 
                 // Honor the connection's read-consistency policy (default
@@ -774,7 +774,7 @@ impl Connection {
                 if let Some((cache, manifest_cache)) = disk_cache {
                     opts = opts
                         .with_disk_cache(cache)
-                        .with_manifest_disk_cache(manifest_cache);
+                        .with_metadata_disk_cache(manifest_cache);
                 }
                 // Honor the connection's read-consistency policy. Default is
                 // BoundedStaleness(1s): the per-query pointer re-check is
@@ -1826,7 +1826,7 @@ fn build_disk_cache(
     storage: &Arc<dyn StorageProvider>,
     name: &str,
     location: &str,
-) -> Result<Option<(Arc<DiskCacheStore>, Arc<ManifestDiskCache>)>, InfinoError> {
+) -> Result<Option<(Arc<DiskCacheStore>, Arc<MetadataDiskCache>)>, InfinoError> {
     let Some(cache_root) = options.cache_dir.as_ref() else {
         return Ok(None);
     };
@@ -1850,7 +1850,7 @@ fn build_disk_cache(
     if options.cache_budget_bytes.is_none() {
         cache.mark_budget_auto_sized();
     }
-    let manifest_cache = ManifestDiskCache::new(
+    let manifest_cache = MetadataDiskCache::new(
         table_root.join(MANIFEST_CACHE_SUBDIR),
         MANIFEST_CACHE_BUDGET_BYTES,
     )
@@ -7323,7 +7323,7 @@ storage:
             opts.disk_cache.is_none(),
             "memory table took the config's disk cache"
         );
-        assert!(opts.manifest_disk_cache.is_none());
+        assert!(opts.metadata_disk_cache.is_none());
         assert_eq!(opts.superfile_buffer_split_mb, 512);
     }
 }
