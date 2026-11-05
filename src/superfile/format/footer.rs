@@ -31,7 +31,7 @@ use std::{
     sync::Arc,
 };
 
-use arrow::{compute::concat_batches, record_batch::RecordBatch};
+use arrow::record_batch::RecordBatch;
 use arrow_schema::{Schema, SchemaRef};
 use bytes::Bytes;
 use parquet::{
@@ -56,6 +56,7 @@ use tempfile::NamedTempFile;
 use crate::{
     config::scratch_root,
     superfile::{LazyByteSource, LazyByteSourceError, format::kv},
+    utils::nulls::concat_sharing_nulls,
 };
 
 /// Length of Parquet's trailing `PAR1` magic, in bytes.
@@ -627,7 +628,9 @@ impl PlannedBodyEncoder {
             sample_parts.push(batch.slice(0, take));
             wanted -= take;
         }
-        let sample = concat_batches(&self.schema, &sample_parts)?;
+        // A column null throughout the sample is the one shared null array
+        // of its type, not a row group's worth of nulls per column.
+        let sample = concat_sharing_nulls(&self.schema, &sample_parts)?;
         let plain_columns = self.plan.choose(&self.schema, &sample)?;
         let mut encoder = ParquetBodyEncoder::with_plain_columns(
             &self.schema,
@@ -1227,6 +1230,7 @@ fn with_kv_list(metadata: &ParquetMetaData, kvs: Vec<KeyValue>) -> ParquetMetaDa
 mod tests {
     use std::slice;
 
+    use arrow::compute::concat_batches;
     use arrow_array::{Float64Array, StringArray, UInt64Array};
     use arrow_schema::{DataType, Field};
     use parquet::{
