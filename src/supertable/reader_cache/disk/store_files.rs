@@ -93,7 +93,7 @@ impl DiskCacheStore {
         // unwind — `reserve_manual` keeps the bytes
         // reserved; we manually roll back on the rare error
         // path below.
-        self.reserve_manual(size, None).await?;
+        self.reserve_manual(size).await?;
 
         // Roll back the reservation on any error past this
         // point. Wrap the rest in a closure-shape so `?`
@@ -460,7 +460,8 @@ impl DiskCacheStore {
         }
     }
 
-    /// Leave a finished background download under its cache name when no entry holds the file, as
+    /// Leave a finished background download at `final_path`, its cache name
+    /// ([`Self::cache_path`], or [`Self::hole_path`] when `holed`), when no entry holds the file, as
     /// if a restart had found it there: the next read opens it from disk (see
     /// [`Self::fetch_from_disk_cache`]), and eviction takes it before anything a query opened.
     /// Recorded at `size`, as the scan records a file; `reserved` pays for it, and the rest is
@@ -474,19 +475,15 @@ impl DiskCacheStore {
         uri: &SuperfileUri,
         fill: &BackgroundFill,
         tmp: &Path,
+        final_path: &Path,
         holed: bool,
         size: u64,
         reserved: u64,
     ) {
-        let final_path = if holed {
-            self.hole_path(uri)
-        } else {
-            self.cache_path(uri)
-        };
         let slot = self.cached.entry(*uri);
-        let landed = matches!(slot, Entry::Vacant(_)) && !fill.is_cancelled() && {
+        let landed = matches!(slot, Entry::Vacant(_)) && fill.may_replace(None) && {
             self.remove_local_copy(uri);
-            fs::rename(tmp, &final_path).is_ok()
+            fs::rename(tmp, final_path).is_ok()
         };
         if !landed {
             drop(slot);
@@ -496,7 +493,7 @@ impl DiskCacheStore {
         }
         let file = UnindexedFile {
             size_bytes: size,
-            mtime_us: fs::metadata(&final_path).map_or(0, |meta| file_mtime_us(&meta)),
+            mtime_us: fs::metadata(final_path).map_or(0, |meta| file_mtime_us(&meta)),
         };
         let prior = self
             .unindexed

@@ -1063,7 +1063,7 @@ mod tests {
 
         // Ask eviction for one byte. It is all-or-nothing, so a tiny request picks our one entry.
         store
-            .evict_at_least(1, None)
+            .evict_at_least(1)
             .await
             .expect("the one cached entry is evictable");
         assert_eq!(store.stats().n_entries, 0, "the entry left the cache");

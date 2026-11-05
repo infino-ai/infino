@@ -387,9 +387,22 @@ impl DiskCacheStore {
 
     /// Reserve `bytes`, evicting as needed, with no guard: the bytes stay reserved until the caller
     /// releases them ([`Self::release_block_bytes`]) or hands them to an admitted entry. For a
-    /// reservation that outlives a borrow of `self`, such as a background fill's. Never evicts
-    /// `keep`, the file a background download makes room for.
-    pub(crate) async fn reserve_manual(
+    /// reservation that outlives a borrow of `self`, such as a background fill's.
+    pub(crate) async fn reserve_manual(&self, bytes: u64) -> Result<(), DiskCacheError> {
+        self.reserve_manual_except(bytes, None).await
+    }
+
+    /// [`Self::reserve_manual`] for a background download: never evicts `keep`, the file it makes
+    /// room for, since evicting it would cancel the download.
+    pub(super) async fn reserve_manual_keeping(
+        &self,
+        bytes: u64,
+        keep: &SuperfileUri,
+    ) -> Result<(), DiskCacheError> {
+        self.reserve_manual_except(bytes, Some(keep)).await
+    }
+
+    async fn reserve_manual_except(
         &self,
         bytes: u64,
         keep: Option<&SuperfileUri>,
@@ -408,7 +421,7 @@ impl DiskCacheStore {
                 continue;
             }
             let needed = (cur + bytes).saturating_sub(budget);
-            self.evict_at_least(needed, keep).await?;
+            self.evict_except(needed, keep).await?;
         }
     }
 
@@ -548,7 +561,7 @@ impl DiskCacheStore {
     /// Reserve `bytes`, evicting as needed, or fail with `BudgetExceeded`. The guard releases the
     /// bytes on drop unless committed.
     pub(crate) async fn reserve(&self, bytes: u64) -> Result<Reservation<'_>, DiskCacheError> {
-        self.reserve_manual(bytes, None).await?;
+        self.reserve_manual(bytes).await?;
         Ok(Reservation {
             store: self,
             bytes,
@@ -576,10 +589,15 @@ impl DiskCacheStore {
             })
     }
 
-    /// Drive the eviction policy until either `bytes_needed`
-    /// is freed or no eligible victims remain (→
-    /// `BudgetExceeded`). Nothing of `keep` is evicted: its entry, copy or block file.
-    pub(crate) async fn evict_at_least(
+    /// [`Self::evict_except`] with nothing kept.
+    #[cfg(test)]
+    pub(crate) async fn evict_at_least(&self, bytes_needed: u64) -> Result<(), DiskCacheError> {
+        self.evict_except(bytes_needed, None).await
+    }
+
+    /// Drive the eviction policy until either `bytes_needed` is freed or no eligible victims remain
+    /// (→ `BudgetExceeded`), taking nothing of `keep`: its entry, copy or block file.
+    pub(super) async fn evict_except(
         &self,
         bytes_needed: u64,
         keep: Option<&SuperfileUri>,
@@ -1014,7 +1032,7 @@ mod tests {
         assert_eq!(store.stats().current_bytes, filled);
 
         store.sweep_once();
-        store.evict_at_least(filled, None).await.expect("evict");
+        store.evict_at_least(filled).await.expect("evict");
         assert!(
             !store.blocks_path(&uri).exists(),
             "eviction reclaims the file"
@@ -1073,7 +1091,7 @@ mod tests {
         let reopened = reopen_store(&store, |cfg| cfg.disk_budget_bytes = filled);
         assert_eq!(reopened.stats().current_bytes, filled);
 
-        reopened.evict_at_least(filled, None).await.expect("evict");
+        reopened.evict_at_least(filled).await.expect("evict");
         assert_eq!(
             reopened.stats().current_bytes,
             0,
