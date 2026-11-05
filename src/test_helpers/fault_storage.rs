@@ -45,6 +45,9 @@ pub enum FaultOp {
     PutAtomic,
     PutIfMatch,
     Delete,
+    /// [`StorageProvider::delete_once`], the delete best-effort cleanup
+    /// issues, apart from [`FaultOp::Delete`] so a test can tell them apart.
+    DeleteOnce,
 }
 
 /// The failure an armed rule injects.
@@ -295,6 +298,12 @@ impl StorageProvider for FaultStorage {
             let _ = self.inner.delete(uri).await;
         }
         self.inner.delete(uri).await
+    }
+    async fn delete_once(&self, uri: &str) -> Result<(), StorageError> {
+        if self.check(FaultOp::DeleteOnce, uri)? {
+            let _ = self.inner.delete_once(uri).await;
+        }
+        self.inner.delete_once(uri).await
     }
     async fn list_with_prefix_metadata(
         &self,

@@ -2347,9 +2347,10 @@ impl SupertableWriter {
                 release_mutation_lease(&wal_store, wal_id, owner).await;
                 supertable.inner().unfinished_wals.note(wal_id);
             } else {
-                // Best-effort cleanup of the WAL artifacts.
-                let _ = wal_store.delete_arrow(wal_id).await;
-                let _ = wal_store.delete_state(wal_id).await;
+                // Best-effort cleanup of the WAL artifacts, one DELETE each:
+                // the WAL GC reaps whatever is left.
+                let _ = wal_store.delete_arrow_once(wal_id).await;
+                let _ = wal_store.delete_state_once(wal_id).await;
             }
             Ok::<_, MutationError>((n_t, n_nf))
         };
@@ -2476,7 +2477,8 @@ impl SupertableWriter {
                 release_mutation_lease(&wal_store, wal_id, owner).await;
                 supertable.inner().unfinished_wals.note(wal_id);
             } else {
-                let _ = wal_store.delete_state(wal_id).await;
+                // Best-effort cleanup, as the update's.
+                let _ = wal_store.delete_state_once(wal_id).await;
             }
             Ok::<_, MutationError>((n_t, n_nf))
         };
@@ -19913,6 +19915,63 @@ supertable:
             "a failed delete must release its lease so the next sweep can take \
              the WAL immediately, still held by {:?}",
             doc.lease
+        );
+    }
+
+    /// A completed update or delete removes its WAL documents with the
+    /// one-shot delete, never the one that re-issues a transient failure:
+    /// the cleanup is best-effort and the WAL GC reaps what it leaves, so
+    /// the mutation must not wait through re-issue backoff for it. The
+    /// re-issuing delete is faulted on the WAL prefix, so a cleanup routed
+    /// through it both fires the fault and leaves the documents behind.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_completed_mutation_cleans_up_its_wal_without_reissue() {
+        let directory = TempDir::new().expect("tempdir");
+        let local: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(directory.path()).expect("provider"));
+        let faults = FaultStorage::wrap(local);
+        let storage: Arc<dyn StorageProvider> = Arc::<FaultStorage>::clone(&faults);
+        let table =
+            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+                .expect("create");
+        table
+            .append(&build_title_batch(&["alpha", "beta"]))
+            .expect("append");
+        faults.fail(FaultOp::Delete, "wal/mutations/", usize::MAX);
+
+        let updated = table
+            .update(
+                col("title").eq(lit("alpha")),
+                &build_title_batch(&["gamma"]),
+            )
+            .expect("update");
+        assert_eq!(updated.n_tombstoned(), 1);
+        let deleted = table.delete(col("title").eq(lit("beta"))).expect("delete");
+        assert_eq!(deleted.n_tombstoned(), 1);
+
+        assert_eq!(
+            faults.fired(),
+            0,
+            "the WAL cleanup must not go through the re-issuing delete"
+        );
+        let wal_ids = WalStore::new(storage)
+            .list_wal_ids()
+            .await
+            .expect("list wal ids");
+        assert!(
+            wal_ids.is_empty(),
+            "the one-shot delete must remove both mutations' WAL documents, found {wal_ids:?}"
+        );
+        let sidecars: Vec<String> = faults
+            .list_with_prefix("wal/mutations/")
+            .await
+            .expect("list wal prefix")
+            .into_iter()
+            .filter(|uri| uri.ends_with(".arrow"))
+            .collect();
+        assert!(
+            sidecars.is_empty(),
+            "the update's sidecar must be removed too, found {sidecars:?}"
         );
     }
 
