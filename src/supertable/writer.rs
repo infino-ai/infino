@@ -11630,7 +11630,14 @@ async fn build_and_publish_centroid_router_section(
     {
         return None;
     }
-    let section = match fetch_centroid_section(storage, centroids_ref, entries).await {
+    let section = match fetch_centroid_section(
+        storage,
+        centroids_ref,
+        entries,
+        &inner.options.scratch_dir(),
+    )
+    .await
+    {
         Ok(section) => section,
         Err(error) => {
             tracing::warn!(%error, "centroid-router publish: centroid section fetch failed");
@@ -11680,7 +11687,14 @@ async fn previous_centroid_section(
     {
         return Some(Arc::clone(section));
     }
-    match fetch_centroid_section(storage, &reference, manifest.get_all_superfiles()).await {
+    match fetch_centroid_section(
+        storage,
+        &reference,
+        manifest.get_all_superfiles(),
+        &options.scratch_dir(),
+    )
+    .await
+    {
         Ok(section) => {
             let section = Arc::new(section);
             *guard = Some(Arc::clone(&section));
