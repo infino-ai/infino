@@ -225,9 +225,6 @@ const REREAD_LOOKAHEAD_FOLDS: usize = 256;
 /// rather than asking about each: a listing page answers for a thousand.
 const CHECK_LIST_MIN_OBJECTS: usize = 2048;
 
-/// Kept objects stay while more than this share of the disk is free.
-const KEPT_FREE_DIVISOR: u64 = 4;
-
 /// How far below the largest layer of a fold's group a layer may lie and
 /// still fold with it, in levels, a level being a factor of [`FOLD_FAN_OUT`]
 /// in size. Three quarters of a level, the span Lucene's LogMergePolicy
@@ -498,23 +495,28 @@ async fn write_objects(
     run_bounded(SLICE_WRITE_CONCURRENCY, "object write", jobs).await
 }
 
-/// The most slice bytes one fold may read so that its inputs, and outputs
-/// about as large, fit the free space of the filesystem holding `dir` above
-/// a tenth of it, at the local bytes per slice byte `measured` holds;
-/// `None` when the filesystem cannot be read.
-pub(crate) fn fold_disk_bound(dir: &Path, measured: &AtomicU64) -> Option<u64> {
+/// The most slice bytes one fold may read so that its inputs fit the free
+/// space of the filesystem holding `dir` above a tenth of it, at the local
+/// bytes per slice byte `measured` holds. `held` bytes already on that disk,
+/// which a fold reads in place, count as room. `None` when the filesystem
+/// cannot be read.
+pub(crate) fn fold_disk_bound(dir: &Path, measured: &AtomicU64, held: u64) -> Option<u64> {
     let (free, total) = (available_space(dir).ok()?, total_space(dir).ok()?);
     Some(disk_bound(
         free,
         total,
         measured.load(AtomicOrdering::Relaxed),
+        held,
     ))
 }
 
-/// [`fold_disk_bound`] for `free` of `total` bytes and a measured `milli`
-/// local bytes per slice byte, zero meaning none measured yet.
-fn disk_bound(free: u64, total: u64, milli: u64) -> u64 {
-    let room = free.saturating_sub(total / SCRATCH_FLOOR_DIVISOR);
+/// [`fold_disk_bound`] for `free` of `total` bytes, a measured `milli`
+/// local bytes per slice byte (zero meaning none measured yet) and `held`
+/// bytes a fold reads in place.
+fn disk_bound(free: u64, total: u64, milli: u64, held: u64) -> u64 {
+    let room = free
+        .saturating_add(held)
+        .saturating_sub(total / SCRATCH_FLOOR_DIVISOR);
     let per_slice = match milli {
         0 => FOLD_DISK_PER_SLICE_MILLI,
         milli => milli.max(1000),
@@ -536,15 +538,6 @@ pub(crate) fn evict_kept(dir: &Path) -> u64 {
             fs::remove_file(entry.path()).ok().map(|()| meta.len())
         })
         .sum()
-}
-
-/// Whether the filesystem holding `dir` has more free than its share
-/// [`KEPT_FREE_DIVISOR`], the floor kept objects stay above.
-pub(crate) fn has_room(dir: &Path) -> bool {
-    match (available_space(dir), total_space(dir)) {
-        (Ok(free), Ok(total)) => free > total / KEPT_FREE_DIVISOR,
-        _ => false,
-    }
 }
 
 /// Store one built object of `kind`, reading it back from disk when it
@@ -1368,7 +1361,7 @@ pub(crate) fn output_reread(
 
 /// Delete each object in `dir` whose slice no layer of `root` names any
 /// more, with its tier object: read by a fold already, or fetched for a fold
-/// the plan dropped. The bytes freed.
+/// the plan dropped. The bytes of the objects it keeps.
 pub(crate) fn retain_kept(dir: &Path, root: &Root) -> u64 {
     let named: HashSet<String> = root
         .layers
@@ -1385,10 +1378,13 @@ pub(crate) fn retain_kept(dir: &Path, root: &Root) -> u64 {
             let meta = entry.metadata().ok().filter(|meta| meta.is_file())?;
             let path = entry.path();
             let stem = path.file_stem()?.to_str()?;
-            if named.contains(stem) {
-                return None;
+            match named.contains(stem) {
+                true => Some(meta.len()),
+                false => {
+                    let _ = fs::remove_file(&path);
+                    None
+                }
             }
-            fs::remove_file(&path).ok().map(|()| meta.len())
         })
         .sum()
 }
@@ -1413,7 +1409,7 @@ pub(crate) async fn prefetch_layers(
         .iter()
         .map(layer_bytes)
         .fold(0u64, |sum, size| sum.saturating_add(size));
-    let fits = fold_disk_bound(&reuse, &measured)
+    let fits = fold_disk_bound(&reuse, &measured, 0)
         .is_some_and(|bound| bound >= wanted.saturating_add(kept_bytes));
     if layers.is_empty() || !fits {
         return;
@@ -10083,6 +10079,17 @@ mod tests {
         assert_eq!(faults.fired(), 1);
     }
 
+    /// Objects a fold reads in place count as room, so a run prefetched onto
+    /// a filling disk is folded where it lies: 100 GB of scratch at 14 GB
+    /// free, holding 16 GB of the next run's inputs, still fits 5 GB of
+    /// slices above the floor.
+    #[test]
+    fn objects_a_fold_reads_in_place_count_as_room() {
+        const GB: u64 = 1_000_000_000;
+        assert_eq!(disk_bound(14 * GB, 100 * GB, 0, 0), GB);
+        assert_eq!(disk_bound(14 * GB, 100 * GB, 0, 16 * GB), 5 * GB);
+    }
+
     /// Eviction empties the reuse directory and reports the bytes it freed,
     /// and the disk bound shrinks as each slice byte is measured to take more.
     #[test]
@@ -10094,22 +10101,22 @@ mod tests {
         assert_eq!(fs::read_dir(dir.path()).expect("read").count(), 0);
         let (free, total) = (500_000_000, 1_000_000_000);
         // 400 MB above the floor at 4 local bytes per slice byte.
-        assert_eq!(disk_bound(free, total, 0), 100_000_000);
+        assert_eq!(disk_bound(free, total, 0, 0), 100_000_000);
         assert_eq!(
-            disk_bound(free, total, 2 * FOLD_DISK_PER_SLICE_MILLI),
+            disk_bound(free, total, 2 * FOLD_DISK_PER_SLICE_MILLI, 0),
             50_000_000
         );
         assert_eq!(
-            disk_bound(free, total, 500),
+            disk_bound(free, total, 500, 0),
             400_000_000,
             "never under one byte per slice byte"
         );
         assert_eq!(
-            disk_bound(90_000_000, total, 0),
+            disk_bound(90_000_000, total, 0, 0),
             0,
             "nothing under the floor"
         );
-        assert!(fold_disk_bound(dir.path(), &AtomicU64::new(0)).is_some());
+        assert!(fold_disk_bound(dir.path(), &AtomicU64::new(0), 0).is_some());
     }
 
     /// The layers the fold after a planned one reads: the next run of small
@@ -10215,12 +10222,12 @@ mod tests {
         fs::write(dir.path().join(format!("{named}.slice")), b"kept").expect("write");
         fs::write(dir.path().join(format!("{named}.tier")), b"kept").expect("write");
         fs::write(dir.path().join("00.slice"), b"read").expect("write");
-        assert_eq!(
-            retain_kept(dir.path(), &root),
-            4,
-            "only the unnamed object goes"
-        );
+        assert_eq!(retain_kept(dir.path(), &root), 8, "the named objects stay");
         assert_eq!(fs::read_dir(dir.path()).expect("read").count(), 2);
+        assert!(
+            !dir.path().join("00.slice").exists(),
+            "the unnamed object goes"
+        );
     }
 
     /// A fold that keeps what it uploads lets the next fold of the same call

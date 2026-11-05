@@ -12202,32 +12202,39 @@ pub(in crate::supertable) async fn stamp_term_index(
                         return Ok(Some(old.with_term_index(reference, true)));
                     }
                     let renumber = !renumbered.load(Ordering::Relaxed);
-                    // Objects no layer names any more go first; short of room
-                    // even so, every kept object goes. Each fold is sized by
-                    // the disk its inputs take.
+                    // Objects no layer names any more go; the rest are read in
+                    // place by the folds that name them, so they count as room.
+                    // Only when no fold fits even so does every kept object go.
                     let (sweep_dir, swept_root) = (reuse_path.clone(), root.clone());
-                    let freed = tokio::task::spawn_blocking(move || {
-                        term_index::retain_kept(&sweep_dir, &swept_root);
-                        match term_index::has_room(&sweep_dir) {
-                            true => 0,
-                            false => term_index::evict_kept(&sweep_dir),
-                        }
+                    let held = tokio::task::spawn_blocking(move || {
+                        term_index::retain_kept(&sweep_dir, &swept_root)
                     })
                     .await
                     .unwrap_or(0);
-                    if freed > 0 {
-                        info!(freed_mib = freed >> 20, "term index: evicted kept objects for room");
-                    }
-                    let fold_max_bytes = term_index::fold_disk_bound(reuse_path, disk_per_slice)
+                    let plan = |max_bytes| {
+                        term_index::plan_fold_at_optimize(
+                            &root,
+                            &live,
+                            max_bytes,
+                            fold_budget,
+                            renumber,
+                            before_tiers,
+                        )
+                    };
+                    let mut fold_max_bytes = term_index::fold_disk_bound(reuse_path, disk_per_slice, held)
                         .unwrap_or(unmeasured_fold_max_bytes);
-                    if let Some(fold) = term_index::plan_fold_at_optimize(
-                        &root,
-                        &live,
-                        fold_max_bytes,
-                        fold_budget,
-                        renumber,
-                        before_tiers,
-                    ) {
+                    let mut planned = plan(fold_max_bytes);
+                    if planned.is_none() && held > 0 && plan(u64::MAX).is_some() {
+                        let evict_dir = reuse_path.clone();
+                        let freed = tokio::task::spawn_blocking(move || term_index::evict_kept(&evict_dir))
+                            .await
+                            .unwrap_or(0);
+                        info!(freed_mib = freed >> 20, "term index: evicted kept objects for room");
+                        fold_max_bytes = term_index::fold_disk_bound(reuse_path, disk_per_slice, 0)
+                            .unwrap_or(unmeasured_fold_max_bytes);
+                        planned = plan(fold_max_bytes);
+                    }
+                    if let Some(fold) = planned {
                         // The fetch started for this fold lands before its own download.
                         let started = prefetch.0.lock().expect("prefetch").take();
                         if let Some(started) = started {
@@ -12244,7 +12251,7 @@ pub(in crate::supertable) async fn stamp_term_index(
                             fold_budget,
                             renumber,
                             before_tiers,
-                        ) && term_index::fold_disk_bound(reuse_path, disk_per_slice)
+                        ) && term_index::fold_disk_bound(reuse_path, disk_per_slice, 0)
                             .is_some_and(|bound| bound >= fold_bytes.saturating_mul(2));
                         let downloaded = Arc::new(Notify::new());
                         if fold_budget.prefetches() {
