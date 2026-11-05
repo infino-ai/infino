@@ -2059,7 +2059,15 @@ mod tests {
             }
             let mut sorted = keys.clone();
             sorted.sort_unstable();
-            for want in [1, 2, PAR_SELECT_MIN - 1, PAR_SELECT_MIN, len / 3, len - 2, len - 1] {
+            for want in [
+                1,
+                2,
+                PAR_SELECT_MIN - 1,
+                PAR_SELECT_MIN,
+                len / 3,
+                len - 2,
+                len - 1,
+            ] {
                 let mut serial = keys.clone();
                 serial.select_nth_unstable(want);
                 let mut parallel = keys.clone();
@@ -2071,7 +2079,11 @@ mod tests {
                 assert_eq!(front, serial[..want], "shape={shape} want={want}");
                 parallel.sort_unstable();
                 assert_eq!(parallel, sorted, "shape={shape} want={want}: a permutation");
-                assert_eq!(par_nth_key(&keys, want), sorted[want], "shape={shape} want={want}");
+                assert_eq!(
+                    par_nth_key(&keys, want),
+                    sorted[want],
+                    "shape={shape} want={want}"
+                );
             }
         }
     }
