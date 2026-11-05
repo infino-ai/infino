@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use arrow::compute::concat;
 use arrow_array::{Array, ArrayRef, RecordBatch, new_null_array};
-use arrow_schema::{ArrowError, DataType, SchemaRef};
+use arrow_schema::{ArrowError, DataType, Schema, SchemaRef};
 
 /// One all-null array per type, every one `len` rows long, made on first
 /// use and handed out to every column of that type that holds nothing.
@@ -99,13 +99,55 @@ pub(crate) fn concat_sharing_nulls(
     RecordBatch::try_new(Arc::clone(schema), columns)
 }
 
+/// Bytes one row of `schema` takes decoded into Arrow when every column in
+/// it is null: what each column keeps a row whatever it holds (offsets for
+/// a string or list, the value slot of a fixed-width type), and nothing for
+/// the values a row adds on top. A floor on a decoded row, and on a wide,
+/// sparse table close to all of it: rows × this is what a batch of the
+/// table decodes to before any of it is shared.
+pub(crate) fn null_row_bytes(schema: &Schema) -> u64 {
+    schema
+        .fields()
+        .iter()
+        .map(|field| null_slot_bytes(field.data_type()))
+        .sum()
+}
+
+/// Bytes a row of a column of `data_type` keeps when it is null.
+fn null_slot_bytes(data_type: &DataType) -> u64 {
+    match data_type {
+        DataType::Null => 0,
+        // Bit-packed values: under a byte a row, rounded up.
+        DataType::Boolean => 1,
+        DataType::Utf8 | DataType::Binary | DataType::List(_) | DataType::Map(..) => {
+            size_of::<i32>() as u64
+        }
+        DataType::LargeUtf8 | DataType::LargeBinary | DataType::LargeList(_) => {
+            size_of::<i64>() as u64
+        }
+        DataType::Utf8View | DataType::BinaryView => size_of::<u128>() as u64,
+        DataType::FixedSizeBinary(width) => u64::try_from(*width).unwrap_or(0),
+        DataType::FixedSizeList(child, len) => {
+            u64::try_from(*len).unwrap_or(0) * null_slot_bytes(child.data_type())
+        }
+        DataType::Struct(children) => children
+            .iter()
+            .map(|child| null_slot_bytes(child.data_type()))
+            .sum(),
+        DataType::Dictionary(key, _) => null_slot_bytes(key),
+        other => other
+            .primitive_width()
+            .map_or(size_of::<i64>() as u64, |w| w as u64),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
 
     use arrow::{array::ArrayData, compute::concat_batches};
     use arrow_array::{Int64Array, LargeStringArray, NullArray};
-    use arrow_schema::{Field, Schema};
+    use arrow_schema::Field;
 
     use super::*;
 
@@ -220,6 +262,38 @@ mod tests {
         assert_eq!(joined, expected);
         assert!(Arc::ptr_eq(joined.column(1), joined.column(3)));
         assert!(distinct_buffer_bytes(&joined) * 100 < distinct_buffer_bytes(&expected));
+    }
+
+    #[test]
+    fn null_row_bytes_is_what_a_null_row_decodes_to() {
+        let item = Arc::new(Field::new("item", DataType::Utf8, true));
+        let schema = Schema::new(vec![
+            Field::new("s", DataType::LargeUtf8, true),
+            Field::new("n", DataType::Int64, true),
+            Field::new("l", DataType::List(item), true),
+            Field::new("u", DataType::Utf8, true),
+            Field::new("b", DataType::Boolean, true),
+        ]);
+        let per_row = null_row_bytes(&schema);
+        assert_eq!(per_row, 8 + 8 + 4 + 4 + 1);
+        // Every column its own null array, as a reader decodes them.
+        let columns: Vec<ArrayRef> = schema
+            .fields()
+            .iter()
+            .map(|f| new_null_array(f.data_type(), ROWS))
+            .collect();
+        let batch = RecordBatch::try_new(Arc::new(schema.clone()), columns).expect("batch");
+        let decoded = distinct_buffer_bytes(&batch) as u64;
+        let rows = ROWS as u64;
+        // A floor, within the validity bitmaps and padding of the real cost.
+        assert!(
+            decoded >= rows * (per_row - 1),
+            "{decoded} < {rows} x {per_row}"
+        );
+        assert!(
+            decoded <= rows * (per_row + 2),
+            "{decoded} > {rows} x {per_row}"
+        );
     }
 
     #[test]

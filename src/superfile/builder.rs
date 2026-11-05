@@ -145,7 +145,7 @@ use crate::{
     },
     supertable::schema::{FieldId, field_id_of, map::FileSchemaMap, with_field_id},
     utils::{
-        nulls::share_null_columns,
+        nulls::{null_row_bytes, share_null_columns},
         terms::validate_column_name,
         trace::{detail_span, record},
     },
@@ -158,6 +158,27 @@ const REORDER_MIN_DOCS: usize = 4_096;
 /// Batches a merge decodes ahead of the one it is encoding: enough to keep
 /// decoding through a row group's encode, which takes many batches at once.
 const DECODED_BATCHES_AHEAD: usize = 64;
+
+/// What the batches decoded ahead may decode to, at the least: a wide
+/// table's batch, a few bytes a row in each of thousands of columns, gets
+/// as many batches ahead as fit in this rather than [`DECODED_BATCHES_AHEAD`].
+const DECODED_AHEAD_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Rows in a batch a superfile's rows are read back in: the Parquet
+/// reader's default batch size.
+const READ_BATCH_ROWS: u64 = 1024;
+
+/// Batches to decode ahead for a merge whose output has `schema`: up to
+/// [`DECODED_BATCHES_AHEAD`], as many as [`DECODED_AHEAD_BYTES`] holds
+/// at the floor [`null_row_bytes`] puts on a decoded row, and at least one.
+fn decoded_batches_ahead(schema: &Schema) -> usize {
+    let batch_bytes = READ_BATCH_ROWS
+        .saturating_mul(null_row_bytes(schema))
+        .max(1);
+    usize::try_from(DECODED_AHEAD_BYTES / batch_bytes)
+        .unwrap_or(DECODED_BATCHES_AHEAD)
+        .clamp(1, DECODED_BATCHES_AHEAD)
+}
 
 /// Bytes in a mebibyte, for the merge memory budget the config states in MiB.
 const BYTES_PER_MIB: u64 = 1 << 20;
@@ -3209,7 +3230,7 @@ impl SuperfileBuilder {
         for input in inputs {
             let opts = self.opts.clone();
             let (sender, decoded) = sync_channel::<Result<(RecordBatch, SuperfileStats), BuildError>>(
-                DECODED_BATCHES_AHEAD,
+                decoded_batches_ahead(&opts.schema),
             );
             thread::scope(|scope| -> Result<(), BuildError> {
                 // Owned here, so an encode that fails drops it on the
