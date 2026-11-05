@@ -5228,6 +5228,51 @@ mod tests {
         );
     }
 
+    /// Maintenance-only optimizes over an unchanged table with one superfile
+    /// per manifest part keep the root, even from a freshly opened handle
+    /// and after a compaction left replaced superfiles in it.
+    #[test]
+    fn repeat_maintenance_over_single_superfile_parts_keeps_the_root() {
+        const COMMITS: usize = 40;
+        const PASSES: usize = 4;
+        const MERGE_MIN_SUPERFILES: u64 = 4;
+        let (_dir, storage, _) = fresh_table();
+        let options = || fresh_options(&storage).with_target_superfiles_per_part(1);
+        let st = Supertable::open(options()).expect("open");
+        for layer in 0..COMMITS {
+            commit_layer(&st, layer);
+        }
+        st.optimize(&OptimizeOptions::compact(CompactionSettings {
+            min_superfiles_for_merge: MERGE_MIN_SUPERFILES,
+            ..CompactionSettings::default()
+        }))
+        .expect("compacting optimize");
+        for layer in 0..COMMITS {
+            commit_layer(&st, layer);
+        }
+        let maintenance = maintenance_only_options().with_steps(OptimizeSteps {
+            drain_hidden_cells: false,
+            compact: false,
+            ..OptimizeSteps::default()
+        });
+        st.optimize(&maintenance)
+            .expect("first maintenance optimize");
+        drop(st);
+        let term_index = |st: &Supertable| {
+            st.reader()
+                .expect("reader")
+                .manifest()
+                .term_index_ref()
+                .cloned()
+        };
+        for pass in 0..PASSES {
+            let st = Supertable::open(options().with_eager_load_threshold(0)).expect("open");
+            let before = term_index(&st);
+            st.optimize(&maintenance).expect("optimize");
+            assert_eq!(term_index(&st), before, "pass {pass} changed the root");
+        }
+    }
+
     /// An append after the last optimize publishes its own delta layer, so
     /// the next optimize, with fewer layers than a fold takes, has nothing
     /// to index or fold and writes nothing.
