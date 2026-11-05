@@ -12420,6 +12420,11 @@ pub(in crate::supertable) async fn stamp_term_index(
                             ranges = fold.ranges(),
                             renumbers,
                             budget_mib = fold_budget.memory_bytes >> 20,
+                            cache_mib = fold_budget.cache_bytes >> 20,
+                            input_mib = fold_bytes >> 20,
+                            slices = root.layers[fold.run()].iter().map(|layer| layer.slices.len()).sum::<usize>(),
+                            local_milli,
+                            stream = io.stream,
                             "term index fold plan"
                         );
                         let output_at = fold.run().start;
