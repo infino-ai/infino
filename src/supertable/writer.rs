@@ -2706,18 +2706,19 @@ impl SupertableWriter {
     }
 
     /// Seal this commit's superfiles from the live lanes and publish them.
-    /// `live` was fed every batch of `buffer` under `built_against`; the
-    /// caller checked both before choosing this over a rebuild.
+    /// `live` was fed every batch of `buffer` under `built_against`, and
+    /// `lanes` are its lanes once that feed has finished; the caller checked
+    /// all of this before choosing this over a rebuild.
     fn commit_live(
         &self,
         mut live: LiveLanes,
+        lanes: Vec<LiveLane>,
         buffer: &[BufferedBatch],
         stem: Option<&str>,
         built_against: u32,
     ) -> Result<(), BuildError> {
         let manifest = Arc::clone(&live.manifest);
         let sealing = Instant::now();
-        let lanes = live.join()?;
         let total_rows: usize = buffer.iter().map(|b| b.scalar.num_rows()).sum();
         let fed: usize = lanes
             .iter()
@@ -3060,12 +3061,24 @@ impl SupertableWriter {
         // under seal its pieces straight away. Built against an older
         // schema, or for a buffer that grew a column since, they are
         // dropped and the buffer is rebuilt below as before.
-        if let Some(live) = live {
+        if let Some(mut live) = live {
             if schema_change.is_none()
                 && live.manifest.table_schema().schema_id() == built_against
                 && manifest.vector_configs().is_empty()
             {
-                return self.commit_live(live, buffer, stem, built_against);
+                // The last feed may have failed after the last append: a lane
+                // that outgrew its reservation on the batch this commit
+                // closes. Its rows are all in the buffer, so the commit
+                // builds from it, as one would after the next append saw
+                // the failure.
+                match live.join() {
+                    Ok(lanes) => {
+                        return self.commit_live(live, lanes, buffer, stem, built_against);
+                    }
+                    Err(error) => {
+                        debug!(%error, "live lane feed failed; the commit builds from the buffer");
+                    }
+                }
             }
             drop(live);
         }
@@ -18199,6 +18212,70 @@ mod tests {
         assert_eq!(
             live.reader().expect("reader").n_docs_total(),
             ((OPENING_BATCHES + 2) * ROWS_PER_BATCH) as u64
+        );
+        assert_eq!(piece_sizes(&live), piece_sizes(&plain));
+        assert_eq!(
+            hit_titles(&live, "r4321k7", usize::MAX),
+            hit_titles(&plain, "r4321k7", usize::MAX)
+        );
+    }
+
+    /// A lane that outgrows its reservation on the batch a commit closes
+    /// fails a feed no later append sees. The commit takes the failure as
+    /// an append would: it drops the lanes and builds from the buffer, so a
+    /// caller that appends once and commits loses no rows.
+    #[test]
+    fn a_lane_that_outgrows_on_the_last_feed_hands_the_commit_to_the_buffer() {
+        const ROWS_PER_BATCH: usize = 2_000;
+        /// Batches that open the lanes under the default floor: about 200
+        /// KiB of text each against the 1 MiB split.
+        const OPENING_BATCHES: usize = 8;
+        /// Tokens per row, every one new to the table.
+        const UNIQUE_TOKENS: usize = 12;
+        let unique_batch = |batch: usize| {
+            RecordBatch::try_new(
+                schema_id_title(),
+                vec![Arc::new(LargeStringArray::from(
+                    (0..ROWS_PER_BATCH)
+                        .map(|i| {
+                            let row = batch * ROWS_PER_BATCH + i;
+                            (0..UNIQUE_TOKENS)
+                                .map(|k| format!("r{row}k{k}"))
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        })
+                        .collect::<Vec<_>>(),
+                ))],
+            )
+            .expect("batch")
+        };
+        let build = |live: bool| {
+            let st = Supertable::create(live_options(2, 1, 4096, false)).expect("create");
+            let mut w = st.writer().expect("writer");
+            w.live_disabled = !live;
+            for b in 0..OPENING_BATCHES {
+                w.append(&unique_batch(b)).expect("append");
+            }
+            assert_eq!(w.live.is_some(), live, "the lanes opened");
+            if let Some(lanes) = w.live.as_mut() {
+                // Hold each lane to its real share of the reserve.
+                lanes.threshold_floor = 1;
+            }
+            // This feed fails on the pool, and the commit is the next call.
+            w.append(&unique_batch(OPENING_BATCHES)).expect("append");
+            if live {
+                assert!(w.live.is_some(), "no append has seen the failure yet");
+            }
+            w.commit()
+                .expect("the commit builds from the buffer, not fails");
+            drop(w);
+            st
+        };
+        let live = build(true);
+        let plain = build(false);
+        assert_eq!(
+            live.reader().expect("reader").n_docs_total(),
+            ((OPENING_BATCHES + 1) * ROWS_PER_BATCH) as u64
         );
         assert_eq!(piece_sizes(&live), piece_sizes(&plain));
         assert_eq!(
