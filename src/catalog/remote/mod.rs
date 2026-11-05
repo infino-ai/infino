@@ -12,7 +12,7 @@
 pub(crate) mod table;
 pub(crate) mod wire;
 
-use std::{io::Read, sync::Arc};
+use std::{io::Read, sync::Arc, time::Duration};
 
 use arrow_array::RecordBatch;
 use arrow_schema::{Schema, SchemaRef};
@@ -30,6 +30,31 @@ const API_KEY_ENV: &str = "INFINO_API_KEY";
 /// The `encoding` a describe names to get the schema document rather than
 /// the column-descriptor array the endpoint answers by default.
 const DOCUMENT_ENCODING: &str = "document";
+
+/// Longest wait to open the TCP and TLS connection to the endpoint.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Longest wait for the endpoint to send the next bytes of a response. The
+/// response to a write comes after the endpoint commits it, so this also
+/// bounds the commit; it is set well above the endpoint's own request limit,
+/// so it fires only on a connection that has stopped.
+const READ_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Longest wait for the connection to take more of a request body. It counts
+/// from the last progress, not from the start, so a slow upload that keeps
+/// moving finishes whatever its size.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The HTTP client for a hosted connection. Without these bounds, a request on
+/// a connection that stops making progress waits forever, and so does every
+/// caller behind it.
+fn agent(connect: Duration, read: Duration, write: Duration) -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_connect(connect)
+        .timeout_read(read)
+        .timeout_write(write)
+        .build()
+}
 
 /// A connection to a hosted endpoint. Holds the sync HTTP client, the base URL
 /// (scheme + host), the target database, and the bearer credential.
@@ -58,7 +83,7 @@ impl RemoteCatalog {
                 ))
             })?;
         Ok(Self {
-            agent: ureq::agent(),
+            agent: agent(CONNECT_TIMEOUT, READ_TIMEOUT, WRITE_TIMEOUT),
             base_url,
             database,
             api_key,
@@ -276,4 +301,72 @@ pub(crate) fn read_arrow_schema(op: &str, response: ureq::Response) -> Result<Sc
         .read_to_end(&mut buf)
         .map_err(|e| InfinoError::Backend(format!("{op}: reading response: {e}")))?;
     wire::ipc_to_schema(&buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        net::TcpListener,
+        thread,
+        time::{Duration, Instant},
+    };
+
+    use serde_json::json;
+
+    use super::{RemoteCatalog, agent};
+    use crate::InfinoError;
+
+    /// The read timeout the test client waits for a silent endpoint.
+    const TEST_READ_TIMEOUT: Duration = Duration::from_millis(300);
+    /// Connect and write bounds for the test client, longer than the test needs.
+    const TEST_OTHER_TIMEOUT: Duration = Duration::from_secs(2);
+    /// How long the silent endpoint holds the connection before closing it.
+    /// A client with no read timeout waits this long, past [`LATEST_RETURN`].
+    const SILENT_HOLD: Duration = Duration::from_secs(5);
+    /// The latest a request may return for the read timeout to be what ended it.
+    const LATEST_RETURN: Duration = Duration::from_secs(4);
+
+    /// A request to an endpoint that accepts the connection and then sends
+    /// nothing fails with a transport error once the read timeout passes,
+    /// instead of waiting forever.
+    #[test]
+    fn a_request_to_a_silent_endpoint_times_out() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        // Accept and hold the connection open without reading or answering.
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            thread::sleep(SILENT_HOLD);
+            drop(stream);
+        });
+
+        let mut catalog = RemoteCatalog::new(
+            format!("http://{addr}"),
+            "db".to_string(),
+            Some("ik_test".to_string()),
+        )
+        .expect("catalog");
+        catalog.agent = agent(TEST_OTHER_TIMEOUT, TEST_READ_TIMEOUT, TEST_OTHER_TIMEOUT);
+
+        let start = Instant::now();
+        let result = catalog.post_json("append", json!({}));
+        let waited = start.elapsed();
+
+        match result {
+            Err(InfinoError::Backend(message)) => {
+                assert!(message.starts_with("append: transport error"), "{message}");
+            }
+            Err(other) => panic!("expected a transport error, got {other:?}"),
+            Ok(_) => panic!("a silent endpoint answered"),
+        }
+        assert!(
+            waited >= TEST_READ_TIMEOUT,
+            "returned before the read timeout: {waited:?}"
+        );
+        assert!(
+            waited < LATEST_RETURN,
+            "waited {waited:?}, past the read timeout"
+        );
+        server.join().expect("server thread");
+    }
 }
