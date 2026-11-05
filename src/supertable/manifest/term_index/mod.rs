@@ -210,6 +210,9 @@ const FOLD_RUN_LAYERS_MAX: usize = FOLD_LAYERS_MAX * FOLD_FAN_OUT;
 /// weigh against the bytes it reads, when optimize picks between runs.
 const FOLD_OVERHEAD_BYTES: u64 = 1024 * 1024 * 1024;
 
+/// Thousandths in one: the unit local bytes per slice byte are measured in.
+const THOUSANDTHS: u64 = 1000;
+
 /// Local bytes per slice byte assumed for a fold's inputs, in thousandths,
 /// until a fold of the call has measured them: tier objects run up to a few
 /// times their slices.
@@ -519,9 +522,9 @@ fn disk_bound(free: u64, total: u64, milli: u64, held: u64) -> u64 {
         .saturating_sub(total / SCRATCH_FLOOR_DIVISOR);
     let per_slice = match milli {
         0 => FOLD_DISK_PER_SLICE_MILLI,
-        milli => milli.max(1000),
+        milli => milli.max(THOUSANDTHS),
     };
-    room.saturating_mul(1000) / per_slice
+    room.saturating_mul(THOUSANDTHS) / per_slice
 }
 
 /// Delete every object kept in `dir`, all of which storage still holds, so
@@ -1601,7 +1604,10 @@ async fn fold_layers(
                     .sum()
             })
             .unwrap_or(0);
-        if let Some(per_slice) = local_bytes.saturating_mul(1000).checked_div(slice_bytes) {
+        if let Some(per_slice) = local_bytes
+            .saturating_mul(THOUSANDTHS)
+            .checked_div(slice_bytes)
+        {
             measured.fetch_max(per_slice, AtomicOrdering::Relaxed);
         }
     }
@@ -10156,14 +10162,14 @@ mod tests {
         let root = commit_delta(&dir, &local, base, 2, false, &policy).await;
         for (kept_bytes, fetched) in [(0, true), (u64::MAX, false)] {
             let reuse = Arc::new(TempDir::new().expect("reuse"));
-            let downloaded = Arc::new(tokio::sync::Notify::new());
+            let downloaded = Arc::new(Notify::new());
             downloaded.notify_one();
             prefetch_layers(
                 Arc::clone(&local),
                 root.layers.clone(),
                 Arc::clone(&reuse),
                 downloaded,
-                Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                Arc::new(AtomicU64::new(0)),
                 kept_bytes,
             )
             .await;
