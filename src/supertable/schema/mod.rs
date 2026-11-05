@@ -867,17 +867,15 @@ fn field_from_json(json: &Value) -> Result<FieldDef, String> {
     })
 }
 
-/// `batch` with [`FIELD_ID_META_KEY`] removed from every field: ids are an
-/// internal identity, and a query result carries the user's columns, not
-/// the engine's bookkeeping. Other field metadata is kept.
-pub fn strip_field_ids(batch: arrow_array::RecordBatch) -> arrow_array::RecordBatch {
-    let schema = batch.schema();
+/// `schema` with [`FIELD_ID_META_KEY`] removed from every field, or `None`
+/// when no field carries one. Other field and schema metadata is kept.
+fn without_field_ids(schema: &Schema) -> Option<Arc<Schema>> {
     if !schema
         .fields()
         .iter()
         .any(|f| f.metadata().contains_key(FIELD_ID_META_KEY))
     {
-        return batch;
+        return None;
     }
     let fields: Vec<Arc<Field>> = schema
         .fields()
@@ -888,7 +886,34 @@ pub fn strip_field_ids(batch: arrow_array::RecordBatch) -> arrow_array::RecordBa
             Arc::new(f.as_ref().clone().with_metadata(m))
         })
         .collect();
-    let stripped = Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()));
+    Some(Arc::new(Schema::new_with_metadata(
+        fields,
+        schema.metadata().clone(),
+    )))
+}
+
+/// `schema` as SQL plans against it: the same columns, without their field
+/// ids. Ids are a table's own storage identity — two tables mint them
+/// independently, so the same column name can carry different ids in each.
+/// DataFusion treats field metadata as part of a column's type, and its
+/// logical and physical planners reconcile it differently where inputs
+/// meet: a `UNION` keeps only the metadata every input agrees on in the
+/// logical plan but merges it in the physical one, so a column whose ids
+/// disagree comes out of the two with different metadata, and an operator
+/// above it that checks one against the other refuses to plan. Each file's
+/// columns are still resolved by id, from the file's own schema and the
+/// table's, when the scan opens it.
+pub(crate) fn sql_schema(schema: Arc<Schema>) -> Arc<Schema> {
+    without_field_ids(&schema).unwrap_or(schema)
+}
+
+/// `batch` with [`FIELD_ID_META_KEY`] removed from every field: ids are an
+/// internal identity, and a query result carries the user's columns, not
+/// the engine's bookkeeping. Other field metadata is kept.
+pub fn strip_field_ids(batch: arrow_array::RecordBatch) -> arrow_array::RecordBatch {
+    let Some(stripped) = without_field_ids(&batch.schema()) else {
+        return batch;
+    };
     arrow_array::RecordBatch::try_new(stripped, batch.columns().to_vec())
         .expect("same arrays under a schema that differs only in field metadata")
 }
@@ -944,6 +969,38 @@ mod tests {
         assert_eq!(stamped.field(1).name(), "score");
         assert_eq!(stamped.field(1).data_type(), &DataType::Int64);
         assert!(stamped.field(1).is_nullable());
+    }
+
+    #[test]
+    fn the_sql_schema_drops_field_ids_and_keeps_everything_else() {
+        let user = Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false)
+                .with_metadata(HashMap::from([("ext".to_string(), "tag".to_string())])),
+            Field::new("score", DataType::Int64, true),
+        ])
+        .with_metadata(HashMap::from([("k".to_string(), "v".to_string())]));
+        let ts = TableSchema::from_user_schema(&user);
+        let stored = ts.stamp_field_ids(&user, "_id");
+        assert!(stored.fields().iter().all(|f| field_id_of(f).is_some()));
+
+        let sql = sql_schema(Arc::clone(&stored));
+        assert!(sql.fields().iter().all(|f| field_id_of(f).is_none()));
+        for (s, f) in sql.fields().iter().zip(stored.fields()) {
+            assert_eq!(
+                (s.name(), s.data_type(), s.is_nullable()),
+                (f.name(), f.data_type(), f.is_nullable())
+            );
+        }
+        assert_eq!(
+            sql.field(0).metadata().get("ext").map(String::as_str),
+            Some("tag"),
+            "user field metadata survives"
+        );
+        assert_eq!(sql.metadata(), stored.metadata());
+
+        // A schema with no ids is handed back as is.
+        let plain = Arc::new(user);
+        assert!(Arc::ptr_eq(&sql_schema(Arc::clone(&plain)), &plain));
     }
 
     #[test]

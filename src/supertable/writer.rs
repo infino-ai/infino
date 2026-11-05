@@ -226,11 +226,12 @@ use crate::{
         wal::{
             Lease, WalStore,
             lease::{self, DEFAULT_LEASE_DURATION},
-            pipeline::{self, TombstonePhaseOutcome},
+            pipeline::{self, TombstonePhaseError, TombstonePhaseOutcome},
             state_doc::{
                 IdSpan, OpKind, RowId, SCHEMA_VERSION, SupertableHandleId, TombstoneEntry,
                 TombstoneOutcome, WalId, WalState, WalStateDoc,
             },
+            unfinished::{finish_unfinished, retry_in_background},
         },
     },
     utils::{
@@ -2130,6 +2131,16 @@ impl SupertableWriter {
         ))
     )]
     pub fn commit(&mut self) -> Result<CommitResult, CommitError> {
+        // Finish any mutation this handle left short of `Complete` first, so
+        // a reader stops seeing its retired rows without waiting for the
+        // background retry. Best-effort: what stays unfinished is retried.
+        if !self.inner.unfinished_wals.is_empty() {
+            let supertable = Supertable::from_inner(Arc::clone(&self.inner));
+            bridge_on_runtime(
+                async move { finish_unfinished(&supertable).await },
+                &self.inner.query_runtime(),
+            );
+        }
         // The source label the buffered appends were given, if any. Taken,
         // not read: it belongs to this commit's superfiles and to no later
         // batch. Put back on a failed flush, since the buffer is too.
@@ -2322,25 +2333,27 @@ impl SupertableWriter {
                 Ok(applied) => applied,
                 Err(cause) => {
                     release_mutation_lease(&wal_store, wal_id, owner).await;
+                    note_if_retired(&supertable, wal_id, &cause);
                     return Err(cause.into());
                 }
             };
-            let (n_t, n_nf) = match outcome {
-                TombstonePhaseOutcome::Applied {
-                    n_tombstoned,
-                    n_not_found,
-                }
-                | TombstonePhaseOutcome::AlreadyComplete {
-                    n_tombstoned,
-                    n_not_found,
-                } => (n_tombstoned, n_not_found),
-            };
-            // Best-effort cleanup of the WAL artifacts.
-            let _ = wal_store.delete_arrow(wal_id).await;
-            let _ = wal_store.delete_state(wal_id).await;
+            let (n_t, n_nf) = outcome.counts();
+            if matches!(outcome, TombstonePhaseOutcome::CompletionDeferred { .. }) {
+                // The replacement is published and the old rows retired; only
+                // the steps that finish the WAL are left. Keep it, unowned, for
+                // this handle to finish (or any sweep).
+                release_mutation_lease(&wal_store, wal_id, owner).await;
+                supertable.inner().unfinished_wals.note(wal_id);
+            } else {
+                // Best-effort cleanup of the WAL artifacts.
+                let _ = wal_store.delete_arrow(wal_id).await;
+                let _ = wal_store.delete_state(wal_id).await;
+            }
             Ok::<_, MutationError>((n_t, n_nf))
         };
-        let (n_tombstoned, n_not_found) = bridge_on_runtime(drive, &self.inner.query_runtime())?;
+        let driven = bridge_on_runtime(drive, &self.inner.query_runtime());
+        retry_in_background(&self.inner);
+        let (n_tombstoned, n_not_found) = driven?;
         // Per-op work stats: the update's replacement rows are appended
         // through the WAL pipeline (not the buffered append above), so
         // they count here — after the drive returns Ok — alongside the
@@ -2449,23 +2462,25 @@ impl SupertableWriter {
                 Ok(applied) => applied,
                 Err(cause) => {
                     release_mutation_lease(&wal_store, wal_id, owner).await;
+                    note_if_retired(&supertable, wal_id, &cause);
                     return Err(cause.into());
                 }
             };
-            let (n_t, n_nf) = match outcome {
-                TombstonePhaseOutcome::Applied {
-                    n_tombstoned,
-                    n_not_found,
-                }
-                | TombstonePhaseOutcome::AlreadyComplete {
-                    n_tombstoned,
-                    n_not_found,
-                } => (n_tombstoned, n_not_found),
-            };
-            let _ = wal_store.delete_state(wal_id).await;
+            let (n_t, n_nf) = outcome.counts();
+            if matches!(outcome, TombstonePhaseOutcome::CompletionDeferred { .. }) {
+                // The rows are retired; only the steps that finish the WAL are
+                // left. Keep it, unowned, for this handle to finish (or any
+                // sweep).
+                release_mutation_lease(&wal_store, wal_id, owner).await;
+                supertable.inner().unfinished_wals.note(wal_id);
+            } else {
+                let _ = wal_store.delete_state(wal_id).await;
+            }
             Ok::<_, MutationError>((n_t, n_nf))
         };
-        let (n_tombstoned, n_not_found) = bridge_on_runtime(drive, &self.inner.query_runtime())?;
+        let driven = bridge_on_runtime(drive, &self.inner.query_runtime());
+        retry_in_background(&self.inner);
+        let (n_tombstoned, n_not_found) = driven?;
         // Per-op work stats: rows this delete retired, after the drive
         // returns Ok.
         if let Some(stats) = &self.op_stats {
@@ -12051,12 +12066,35 @@ async fn build_hnsw_graph_ref(
     .await
 }
 
+/// How long a publish under [`stamp_within`] keeps going after losing the
+/// commit race: at most `max_attempts` lost races, and no further attempt
+/// once one could not be expected to finish by `deadline`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::supertable) struct CommitRetryBudget {
+    pub(in crate::supertable) max_attempts: u32,
+    pub(in crate::supertable) deadline: Option<Instant>,
+}
+
+impl CommitRetryBudget {
+    /// The table's own commit retry budget, with no deadline.
+    pub(in crate::supertable) fn of_table(inner: &SupertableInner) -> Self {
+        Self {
+            max_attempts: inner.options.max_commit_retries.max(1),
+            deadline: None,
+        }
+    }
+}
+
+/// Reloads [`stamp_within`] makes in a row, without a lost race between them,
+/// before it counts falling behind the pointer as a lost race of its own. A
+/// reload is not a race lost, so it is retried at once and costs no budget;
+/// the bound keeps a pointer that moves on every reload from spinning the
+/// loop.
+const MAX_CONSECUTIVE_RELOADS: u32 = 4;
+
 /// Publish one maintenance artifact under the commit-race protocol every
-/// stamp shares: load the current manifest, let `successor` build the
-/// artifact against its membership and return the manifest to publish
-/// (`None` when nothing needs publishing), then CAS it in. A lost race
-/// derives the next attempt past any crash-orphaned list and retries
-/// with backoff; `what` names the artifact in the terminal error.
+/// stamp shares, within the table's own commit retry budget. See
+/// [`stamp_within`].
 pub(in crate::supertable) async fn stamp_with_retries<F, Fut>(
     inner: &SupertableInner,
     storage: &Arc<dyn StorageProvider>,
@@ -12067,9 +12105,48 @@ where
     F: Fn(Arc<ManifestSnapshot>) -> Fut,
     Fut: std::future::Future<Output = Result<Option<ManifestSnapshot>, BuildError>>,
 {
-    let max_retries = inner.options.max_commit_retries.max(1);
+    stamp_within(
+        inner,
+        storage,
+        what,
+        CommitRetryBudget::of_table(inner),
+        successor,
+    )
+    .await
+}
+
+/// Publish one maintenance artifact under the commit-race protocol every
+/// stamp shares: load the current manifest, let `successor` build the
+/// artifact against its membership and return the manifest to publish
+/// (`None` when nothing needs publishing), then CAS it in.
+///
+/// A handle whose view of the manifest is behind the pointer reloads and
+/// tries again at once: another writer committed since, which is no race
+/// this attempt ran. A lost pointer CAS derives the next attempt past any
+/// crash-orphaned list and retries with a growing backoff, within `budget`.
+/// Running out of budget is [`BuildError::WriteContention`]; any other
+/// failure keeps its own classification. `what` names the artifact in the
+/// log.
+pub(in crate::supertable) async fn stamp_within<F, Fut>(
+    inner: &SupertableInner,
+    storage: &Arc<dyn StorageProvider>,
+    what: &str,
+    budget: CommitRetryBudget,
+    successor: F,
+) -> Result<(), BuildError>
+where
+    F: Fn(Arc<ManifestSnapshot>) -> Fut,
+    Fut: std::future::Future<Output = Result<Option<ManifestSnapshot>, BuildError>>,
+{
+    let max_attempts = budget.max_attempts.max(1);
     let mut next_id_floor: u64 = 0;
-    for attempt in 0..max_retries {
+    let mut lost_races: u32 = 0;
+    let mut reloads: u32 = 0;
+    // The longest one attempt has taken, so the deadline check can tell
+    // whether the next one could still finish in time.
+    let mut slowest_attempt = time::Duration::ZERO;
+    loop {
+        let attempt_started = Instant::now();
         let old = inner.manifest.load_full();
         // A prior attempt found its id occupied by a crash-orphaned
         // manifest list — derive this attempt's successor past it.
@@ -12085,45 +12162,61 @@ where
             return Ok(());
         };
         let attempted_id = new_manifest.get_manifest_id();
-        let prev_etag = match get_current_manifest_etag(storage, Arc::clone(&old)).await {
-            Ok(etag) => etag,
-            // Another commit landed while the successor was built: a lost
-            // race like the one the write reports, so reload and retry.
-            Err(SupertableCommitError::WriteContentionExhausted) if attempt + 1 < max_retries => {
+        match get_current_manifest_etag(storage, Arc::clone(&old)).await {
+            Ok(prev_etag) => match new_manifest
+                .write(storage.as_ref(), prev_etag.as_deref(), &[])
+                .await
+            {
+                Ok(()) => {
+                    inner.note_superseded(&old, &new_manifest, &[]);
+                    inner.manifest.store(Arc::new(new_manifest));
+                    return Ok(());
+                }
+                Err(SupertableCommitError::WriteContentionExhausted) => {
+                    next_id_floor = next_id_floor.max(
+                        refresh_and_orphaned_id_floor(inner, storage, attempted_id)
+                            .await
+                            .map_err(BuildError::from)?,
+                    );
+                }
+                Err(e) => {
+                    inner.note_commit_error(&e);
+                    return Err(BuildError::from(e));
+                }
+            },
+            // The pointer is past this handle's view: another commit landed
+            // since. Reload and go again at once — unless the view keeps
+            // falling behind, which is a lost race like any other.
+            Err(SupertableCommitError::WriteContentionExhausted) => {
                 refresh_inner_state_async(inner, storage)
                     .await
-                    .map_err(|e| BuildError::Store(e.to_string()))?;
-                sleep(backoff_delay(attempt)).await;
-                continue;
+                    .map_err(BuildError::from)?;
+                reloads += 1;
+                if reloads <= MAX_CONSECUTIVE_RELOADS {
+                    continue;
+                }
             }
             Err(e) => {
                 inner.note_commit_error(&e);
                 return Err(BuildError::from(e));
             }
-        };
-        match new_manifest
-            .write(storage.as_ref(), prev_etag.as_deref(), &[])
-            .await
-        {
-            Ok(()) => {
-                inner.note_superseded(&old, &new_manifest, &[]);
-                inner.manifest.store(Arc::new(new_manifest));
-                return Ok(());
-            }
-            Err(SupertableCommitError::WriteContentionExhausted) if attempt + 1 < max_retries => {
-                next_id_floor = next_id_floor.max(
-                    refresh_and_orphaned_id_floor(inner, storage, attempted_id)
-                        .await
-                        .map_err(|e| BuildError::Store(e.to_string()))?,
-                );
-                sleep(backoff_delay(attempt)).await;
-            }
-            Err(e) => return Err(BuildError::Store(e.to_string())),
         }
+        reloads = 0;
+        slowest_attempt = slowest_attempt.max(attempt_started.elapsed());
+        let delay = backoff_delay(lost_races);
+        lost_races += 1;
+        let out_of_time = budget
+            .deadline
+            .is_some_and(|deadline| Instant::now() + delay + slowest_attempt > deadline);
+        if lost_races >= max_attempts || out_of_time {
+            debug!(
+                what,
+                lost_races, "publish lost every commit race in its budget"
+            );
+            return Err(BuildError::WriteContention);
+        }
+        sleep(delay).await;
     }
-    Err(BuildError::Store(format!(
-        "{what} publish lost every commit race"
-    )))
 }
 
 /// Superfiles one maintenance publish indexes: one wave of
@@ -12748,12 +12841,25 @@ async fn release_mutation_lease(wal_store: &WalStore, wal_id: WalId, owner: Supe
     }
 }
 
+/// Remember the WAL of a mutation that failed after retiring its rows, for
+/// this handle to finish (see [`crate::supertable::wal::unfinished`]).
+fn note_if_retired(supertable: &Supertable, wal_id: WalId, cause: &TombstonePhaseError) {
+    if matches!(cause, TombstonePhaseError::RetiredButUnfinished { .. }) {
+        supertable.inner().unfinished_wals.note(wal_id);
+    }
+}
+
 /// Add `new_deleted` to the hidden vector-index table's deleted-`_id` set
 /// (see [`hidden_deleted`]), committing a new hidden manifest; a no-op when
 /// every id is in the set already. `inner` is the hidden table's.
+///
+/// The record is a set union, so re-running it against whatever the hidden
+/// manifest has become cannot change its outcome; it rides out lost races
+/// under [`stamp_within`] for as long as `budget` allows.
 pub(in crate::supertable) async fn record_hidden_deleted_ids(
     inner: &SupertableInner,
     new_deleted: &[i128],
+    budget: CommitRetryBudget,
 ) -> Result<(), BuildError> {
     if new_deleted.is_empty() {
         return Ok(());
@@ -12761,58 +12867,27 @@ pub(in crate::supertable) async fn record_hidden_deleted_ids(
     let Some(storage) = inner.options.storage.clone() else {
         return Ok(());
     };
-    let max_retries = inner.options.max_commit_retries.max(1);
-    let mut next_id_floor: u64 = 0;
-    for attempt in 0..max_retries {
-        let old = inner.manifest.load_full();
-        // A prior attempt found its id occupied by a crash-orphaned
-        // manifest list — derive this attempt's successor past it.
-        let old = if next_id_floor > 0 {
-            Arc::new(old.with_next_manifest_id_floor(next_id_floor))
-        } else {
-            old
-        };
-        let mut ids = hidden_deleted::deleted_user_ids(&old)
-            .map_err(|e| BuildError::Store(e.to_string()))?
-            .as_ref()
-            .clone();
-        let before = ids.len();
-        ids.extend_from_slice(new_deleted);
-        ids.sort_unstable();
-        ids.dedup();
-        if ids.len() == before {
-            return Ok(());
-        }
-        let bytes = encode_deleted_ids(&ids);
-        let new_manifest = old.with_deleted_user_ids(bytes);
-        let attempted_id = new_manifest.get_manifest_id();
-        let prev_etag = get_current_manifest_etag(&storage, Arc::clone(&old))
-            .await
-            .inspect_err(|e| inner.note_commit_error(e))
-            .map_err(BuildError::from)?;
-        match new_manifest
-            .write(storage.as_ref(), prev_etag.as_deref(), &[])
-            .await
-        {
-            Ok(()) => {
-                inner.note_superseded(&old, &new_manifest, &[]);
-                inner.manifest.store(Arc::new(new_manifest));
-                return Ok(());
+    stamp_within(
+        inner,
+        &storage,
+        "deleted-set record",
+        budget,
+        |old| async move {
+            let mut ids = hidden_deleted::deleted_user_ids(&old)
+                .map_err(|e| BuildError::Store(e.to_string()))?
+                .as_ref()
+                .clone();
+            let before = ids.len();
+            ids.extend_from_slice(new_deleted);
+            ids.sort_unstable();
+            ids.dedup();
+            if ids.len() == before {
+                return Ok(None);
             }
-            Err(SupertableCommitError::WriteContentionExhausted) if attempt + 1 < max_retries => {
-                next_id_floor = next_id_floor.max(
-                    refresh_and_orphaned_id_floor(inner, &storage, attempted_id)
-                        .await
-                        .map_err(|e| BuildError::Store(e.to_string()))?,
-                );
-                sleep(backoff_delay(attempt)).await;
-            }
-            Err(e) => return Err(BuildError::Store(e.to_string())),
-        }
-    }
-    Err(BuildError::Store(
-        "deleted-set record: write contention exhausted".into(),
-    ))
+            Ok(Some(old.with_deleted_user_ids(encode_deleted_ids(&ids))))
+        },
+    )
+    .await
 }
 
 /// The first column of `next` that requires a value where `base` did not:

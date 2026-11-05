@@ -58,7 +58,7 @@ use std::{
     collections::{HashMap, HashSet},
     io::Cursor,
     sync::{Arc, OnceLock},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use arrow::ipc::reader::StreamReader;
@@ -98,10 +98,11 @@ use crate::{
             tombstones_codec::TombstonesSidecar,
         },
         writer::{
-            CommitListMetadata, build_fts_summary, build_packed_update_superfile,
-            build_subsection_offsets, build_term_contribution, build_vector_summary,
-            builder_options_of, owned_vector_arrays, persist_commit, read_vector_layout_from_bytes,
-            record_hidden_deleted_ids, stamp_tombstone_seqs, with_id_column,
+            CommitListMetadata, CommitRetryBudget, build_fts_summary,
+            build_packed_update_superfile, build_subsection_offsets, build_term_contribution,
+            build_vector_summary, builder_options_of, owned_vector_arrays, persist_commit,
+            read_vector_layout_from_bytes, record_hidden_deleted_ids, stamp_tombstone_seqs,
+            with_id_column,
         },
     },
 };
@@ -751,6 +752,39 @@ pub enum TombstonePhaseOutcome {
         n_tombstoned: usize,
         n_not_found: usize,
     },
+
+    /// The rows are retired — every target settled, its tombstone bit
+    /// durable — but a step that finishes the mutation failed: the state
+    /// write that persists the settled targets, the tombstone-seq stamp,
+    /// the hidden vector index's deleted-set record, or the `Complete`
+    /// write. The counts are the mutation's real outcome. The WAL is left
+    /// short of `Complete` for recovery to finish; until it does, a reader
+    /// may still see the retired rows (a vector search through the hidden
+    /// index until the record lands, any read until the stamp does).
+    CompletionDeferred {
+        n_tombstoned: usize,
+        n_not_found: usize,
+    },
+}
+
+impl TombstonePhaseOutcome {
+    /// `(n_tombstoned, n_not_found)`, whichever way the phase ended.
+    pub fn counts(&self) -> (usize, usize) {
+        match *self {
+            TombstonePhaseOutcome::AlreadyComplete {
+                n_tombstoned,
+                n_not_found,
+            }
+            | TombstonePhaseOutcome::Applied {
+                n_tombstoned,
+                n_not_found,
+            }
+            | TombstonePhaseOutcome::CompletionDeferred {
+                n_tombstoned,
+                n_not_found,
+            } => (n_tombstoned, n_not_found),
+        }
+    }
 }
 
 /// Typed failures from `run_tombstone_phase`. As with the append
@@ -806,20 +840,38 @@ pub enum TombstonePhaseError {
     #[error("failed to scan _id column for {targets}: {message}")]
     IdLookupFailed { targets: String, message: String },
 
-    /// The post-sidecar manifest stamp (tombstone seqs) failed. The
-    /// sidecar bits are durable and the WAL stays incomplete, so the
-    /// recovery sweep re-runs the phase and re-attempts the stamp.
-    /// Carries the typed cause so a lost commit race stays
-    /// distinguishable from a permanent fault at the public boundary.
+    /// The post-sidecar manifest stamp (tombstone seqs) failed. Only ever
+    /// the cause of a [`Self::RetiredButUnfinished`] or of a
+    /// [`TombstonePhaseOutcome::CompletionDeferred`]: the stamp runs after
+    /// the tombstones are durable.
     #[error("tombstone-seq manifest stamp failed: {0}")]
     ManifestStamp(#[source] Box<ManifestCommitError>),
 
     /// Recording the retired rows in the hidden vector index's deleted set
-    /// failed. The user table's tombstones are durable and the WAL stays
-    /// incomplete, so the recovery sweep re-runs the phase and records
-    /// them again; until then a vector search may still return them.
+    /// failed. Only ever the cause of a [`Self::RetiredButUnfinished`] or
+    /// of a [`TombstonePhaseOutcome::CompletionDeferred`]: the record runs
+    /// after the tombstones are durable.
     #[error("hidden vector-index deleted-set record failed: {0}")]
     HiddenDeletedRecord(#[source] Box<BuildError>),
+
+    /// The mutation's rows are retired — every target settled, its
+    /// tombstone bit durable — but a step that finishes it was refused the
+    /// credentials in use. The one finishing failure surfaced rather than
+    /// deferred: no retry gets past refused credentials, so the caller has
+    /// to hear about them. The message says the rows are gone, carries the
+    /// real counts, and the error is never a conflict, so nothing reads it
+    /// as an invitation to reissue the mutation. The WAL is left short of
+    /// `Complete`; recovery finishes it once the credentials are fixed.
+    #[error(
+        "the mutation retired its rows ({n_tombstoned} tombstoned, {n_not_found} not found) \
+         and must not be reissued, but finishing it failed and is left to recovery: {source}"
+    )]
+    RetiredButUnfinished {
+        n_tombstoned: usize,
+        n_not_found: usize,
+        #[source]
+        source: Box<TombstonePhaseError>,
+    },
 
     /// Tombstone codec error from the sidecar layer.
     #[error("tombstone sidecar codec error: {0}")]
@@ -842,17 +894,20 @@ impl TombstonePhaseError {
     /// Both retry-budget variants count: exhausting the sidecar CAS budget
     /// or waiting out a compactor-sealed sidecar are contention outcomes,
     /// not faults — the caller's move in each case is to retry the delete.
-    /// A deleted-set record that lost the manifest CAS is the same kind of
-    /// contention, so it defers to the inner build error's own verdict
-    /// rather than reading as a fault.
+    ///
+    /// Nothing that fails once the tombstones are durable is. Reissuing
+    /// the mutation then would run it against rows it has already retired:
+    /// a delete would match nothing, and an update would replace its own
+    /// replacement. Such failures reach the caller as
+    /// [`TombstonePhaseOutcome::CompletionDeferred`], or, for refused
+    /// credentials, as [`Self::RetiredButUnfinished`]; the stamp and record
+    /// variants only ever appear as their causes.
     pub(crate) fn is_conflict(&self) -> bool {
         match self {
             TombstonePhaseError::CasRetryExhausted { .. }
             | TombstonePhaseError::SealedSidecarRetryExhausted { .. } => true,
-            TombstonePhaseError::ManifestStamp(e) => e.is_conflict(),
             TombstonePhaseError::Storage(e) => e.is_conflict(),
             TombstonePhaseError::WalStore(e) => e.is_conflict(),
-            TombstonePhaseError::HiddenDeletedRecord(e) => e.is_conflict(),
             _ => false,
         }
     }
@@ -863,6 +918,10 @@ impl TombstonePhaseError {
             TombstonePhaseError::ManifestStamp(e) => e.is_permission_denied(),
             TombstonePhaseError::Storage(e) => e.is_permission_denied(),
             TombstonePhaseError::WalStore(e) => e.is_permission_denied(),
+            TombstonePhaseError::HiddenDeletedRecord(e) => e.is_permission_denied(),
+            TombstonePhaseError::RetiredButUnfinished { source, .. } => {
+                source.is_permission_denied()
+            }
             _ => false,
         }
     }
@@ -948,6 +1007,41 @@ fn count_outcomes(progress: &[TombstoneEntry]) -> (usize, usize) {
 /// superfile without converting a transient race into a typed
 /// error.
 const MAX_CAS_RETRIES: u32 = 10;
+
+/// How many times the table's commit retry budget the hidden deleted-set
+/// record gets. The record lands on the hidden vector index's manifest,
+/// which drains and compactions commit to far more often than a user
+/// table's, and it runs after the rows are retired, when retrying an
+/// idempotent set union is the only useful move left.
+const HIDDEN_DELETED_RECORD_RETRY_FACTOR: u32 = 4;
+
+/// Share of the lease left when the deleted-set record starts that its
+/// retries may spend, as a fraction's denominator: they stop with a third
+/// of it still to run, which the `Complete` write that follows needs.
+const RECORD_LEASE_SHARE: u32 = 3;
+
+/// The retry budget for recording a mutation's retired rows in the hidden
+/// vector index's deleted set: the user table's commit retry budget scaled
+/// by [`HIDDEN_DELETED_RECORD_RETRY_FACTOR`], and no attempt that could not
+/// finish while two thirds of the lease `wal` holds still remain — so riding
+/// out a hot manifest never lapses the lease before the `Complete` write. A
+/// WAL holding no lease gets the attempts alone.
+fn hidden_deleted_record_budget(inner: &SupertableInner, wal: &WalStateDoc) -> CommitRetryBudget {
+    let deadline = wal.lease.as_ref().map(|lease| {
+        let remaining = (lease.expires_at - Utc::now())
+            .to_std()
+            .unwrap_or(Duration::ZERO);
+        Instant::now() + remaining - remaining / RECORD_LEASE_SHARE
+    });
+    CommitRetryBudget {
+        max_attempts: inner
+            .options
+            .max_commit_retries
+            .max(1)
+            .saturating_mul(HIDDEN_DELETED_RECORD_RETRY_FACTOR),
+        deadline,
+    }
+}
 
 /// Fraction of the granted lease span the tombstone loop lets elapse
 /// before folding a renewal into its next WAL state write. A third of
@@ -1337,25 +1431,86 @@ async fn do_tombstone_apply(
         pending = sealed;
     }
 
-    // Final state write for whatever the last pass settled. A crash before
-    // this costs that pass's resolve work, not its durability — the sidecar
-    // bits are already down, and replay re-resolves the entries still
-    // marked `Pending` idempotently.
-    renew_lease(&mut wal_cur, lease_span, Utc::now());
-    etag_cur = wal_store
-        .update_with_etag(wal_cur.wal_id, &etag_cur, &wal_cur)
-        .await?;
-
+    // Every target is settled and every bit it landed is durable: the rows
+    // are retired, and these counts are the mutation's outcome whatever the
+    // steps that finish it do. A failure in one of them leaves the WAL for
+    // recovery rather than failing the mutation — a failure would invite
+    // the caller to reissue a mutation that already happened.
     let (n_tombstoned, n_not_found) = count_outcomes(&wal_cur.tombstone_progress);
     tracing::debug!("tombstone apply settled {n_tombstoned} tombstoned, {n_not_found} not found");
+    match finish_retired(inner, wal_store, &wal_cur, &etag_cur, lease_span).await {
+        Ok((doc, etag)) => {
+            wal_cur = doc;
+            etag_cur = etag;
+        }
+        Err(cause) if cause.is_permission_denied() => {
+            return Err(TombstonePhaseError::RetiredButUnfinished {
+                n_tombstoned,
+                n_not_found,
+                source: Box::new(cause),
+            });
+        }
+        Err(cause) => {
+            warn!(
+                wal_id = ?wal_cur.wal_id,
+                n_tombstoned,
+                n_not_found,
+                error = %cause,
+                "the mutation's rows are retired, but finishing it failed; its WAL is left for \
+                 recovery, and until that runs a read may still see the retired rows"
+            );
+            return Ok((
+                TombstonePhaseOutcome::CompletionDeferred {
+                    n_tombstoned,
+                    n_not_found,
+                },
+                wal_cur,
+                etag_cur,
+            ));
+        }
+    }
 
-    // Stamp the touched superfiles' tombstone seqs into the manifest
-    // so readers — this process's own cache included — learn the
-    // sidecars changed. Runs before the `Complete` CAS so a crash in
-    // between is re-driven by recovery ("WAL complete ⇒ stamped");
-    // re-stamping on such a replay is harmless (one extra seq bump).
+    Ok((
+        TombstonePhaseOutcome::Applied {
+            n_tombstoned,
+            n_not_found,
+        },
+        wal_cur,
+        etag_cur,
+    ))
+}
+
+/// The steps that finish a tombstone phase once its rows are retired,
+/// returning the `Complete` doc and its etag. Each is idempotent, so
+/// recovery re-running all of them after any one failed is safe.
+///
+/// 1. Persist the settled targets. A crash or lost write before this costs
+///    their resolve work, not their durability — the sidecar bits are down,
+///    and replay re-resolves entries still marked `Pending` idempotently.
+/// 2. Stamp the touched superfiles' tombstone seqs into the manifest, so
+///    readers — this process's own cache included — learn the sidecars
+///    changed. Re-stamping on a replay is harmless (one extra seq bump).
+/// 3. Record the retired rows in the hidden vector index's deleted set: its
+///    cells are not rewritten on a user mutation, so every row this phase
+///    retires (a delete's, or the rows an update replaces) stays in them,
+///    and vector search leaves a retired row out by that set. Every target
+///    is recorded, found or not: an id the user table no longer holds is no
+///    row of the hidden index either.
+/// 4. Flip the WAL to `Complete`, with a fresh lease: the steps above can
+///    take a while, and this is the write whose loss wastes them.
+async fn finish_retired(
+    inner: &Arc<SupertableInner>,
+    wal_store: &WalStore,
+    settled: &WalStateDoc,
+    etag: &Etag,
+    lease_span: Option<ChronoDuration>,
+) -> Result<(WalStateDoc, Etag), TombstonePhaseError> {
+    let mut doc = settled.clone();
+    renew_lease(&mut doc, lease_span, Utc::now());
+    let mut etag = wal_store.update_with_etag(doc.wal_id, etag, &doc).await?;
+
     let touched: Vec<Uuid> = {
-        let mut ids: Vec<Uuid> = wal_cur
+        let mut ids: Vec<Uuid> = doc
             .tombstone_progress
             .iter()
             .filter(|e| e.outcome == TombstoneOutcome::Tombstoned)
@@ -1371,41 +1526,18 @@ async fn do_tombstone_apply(
             .map_err(|e| TombstonePhaseError::ManifestStamp(Box::new(e)))?;
     }
 
-    // The hidden vector-index cells are not rewritten on a user mutation, so
-    // every row this phase retires (a delete's, or the rows an update
-    // replaces) stays in them; vector search leaves a retired row out by the
-    // hidden index's deleted set. Recorded before the `Complete` CAS like the
-    // stamp above: a record that fails leaves the WAL incomplete, and recovery
-    // records it again. Every target is recorded, found or not: an id the
-    // user table no longer holds is no row of the hidden index either.
     if let Some(hidden) = inner.vector_index_table.as_ref() {
-        let retired: Vec<i128> = wal_cur.target_ids.iter().map(|id| id.0).collect();
-        record_hidden_deleted_ids(hidden.inner(), &retired)
+        let retired: Vec<i128> = doc.target_ids.iter().map(|id| id.0).collect();
+        let budget = hidden_deleted_record_budget(inner, &doc);
+        record_hidden_deleted_ids(hidden.inner(), &retired, budget)
             .await
             .map_err(|e| TombstonePhaseError::HiddenDeletedRecord(Box::new(e)))?;
     }
 
-    // Final transition: every entry is non-Pending; flip the
-    // WAL itself to Complete. One CAS — if it loses, the
-    // caller's recovery loop picks up at the now-no-op
-    // tombstone scan above (everything's already non-Pending)
-    // and re-attempts the final advance. The manifest stamp
-    // above can take a while, so this write gets a fresh lease
-    // too: it is the one whose loss wastes the whole phase.
-    wal_cur.state = WalState::Complete;
-    renew_lease(&mut wal_cur, lease_span, Utc::now());
-    etag_cur = wal_store
-        .update_with_etag(wal_cur.wal_id, &etag_cur, &wal_cur)
-        .await?;
-
-    Ok((
-        TombstonePhaseOutcome::Applied {
-            n_tombstoned,
-            n_not_found,
-        },
-        wal_cur,
-        etag_cur,
-    ))
+    doc.state = WalState::Complete;
+    renew_lease(&mut doc, lease_span, Utc::now());
+    etag = wal_store.update_with_etag(doc.wal_id, &etag, &doc).await?;
+    Ok((doc, etag))
 }
 
 /// Resolve every `target_id` of one mutation against the current
@@ -1839,17 +1971,19 @@ mod tests {
         ));
     }
 
-    /// A deleted-set record that lost the manifest CAS is contention, not a
-    /// fault: it must read as a conflict so the mutation driver retries it
-    /// against fresh state instead of surfacing a terminal error. Deferring
-    /// to the inner build error keeps a genuine backend fault a fault.
+    /// A failed deleted-set record never invites the caller to reissue the
+    /// mutation: it runs after the tombstones are durable, so a reissued
+    /// delete would match nothing and a reissued update would replace its own
+    /// replacement. Whatever the inner cause, it is not a conflict; refused
+    /// credentials still read as refused.
     #[test]
-    fn a_deleted_set_record_lost_to_contention_is_a_conflict() {
+    fn a_failed_deleted_set_record_is_never_a_conflict() {
         let lost_race =
             TombstonePhaseError::HiddenDeletedRecord(Box::new(BuildError::WriteContention));
         assert!(
-            lost_race.is_conflict(),
-            "a record that lost the commit race must be retryable"
+            !lost_race.is_conflict(),
+            "a record that lost its race runs after the rows are retired; reissuing the \
+             mutation is never the fix"
         );
 
         let fault = TombstonePhaseError::HiddenDeletedRecord(Box::new(BuildError::Store(
@@ -1859,6 +1993,24 @@ mod tests {
             !fault.is_conflict(),
             "a genuine record fault must not read as a retryable conflict"
         );
+
+        let refused = TombstonePhaseError::HiddenDeletedRecord(Box::new(
+            BuildError::PermissionDenied("refused".into()),
+        ));
+        assert!(
+            refused.is_permission_denied(),
+            "refused credentials on the record must surface as such"
+        );
+
+        // Wrapped as the phase reports it once the rows are retired: still
+        // refused, still never a conflict.
+        let unfinished = TombstonePhaseError::RetiredButUnfinished {
+            n_tombstoned: 1,
+            n_not_found: 0,
+            source: Box::new(refused),
+        };
+        assert!(unfinished.is_permission_denied());
+        assert!(!unfinished.is_conflict());
     }
 
     /// Nothing landed and nothing left the listing: this attempt bought
