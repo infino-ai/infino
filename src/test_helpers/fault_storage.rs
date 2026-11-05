@@ -109,6 +109,10 @@ pub struct FaultStorage {
     hooks: Mutex<Vec<Hook>>,
     fired: AtomicUsize,
     local_paths: Mutex<Option<LocalPaths>>,
+    /// [`StorageProvider::delete`] calls under way, and the most there
+    /// have been at once.
+    deletes_in_flight: AtomicUsize,
+    most_deletes_in_flight: AtomicUsize,
 }
 
 /// What the wrapper answers for [`StorageProvider::local_path`]. Unset,
@@ -131,6 +135,8 @@ impl FaultStorage {
             hooks: Mutex::new(Vec::new()),
             fired: AtomicUsize::new(0),
             local_paths: Mutex::new(None),
+            deletes_in_flight: AtomicUsize::new(0),
+            most_deletes_in_flight: AtomicUsize::new(0),
         })
     }
 
@@ -183,6 +189,12 @@ impl FaultStorage {
     /// failure it observed actually came from the injection.
     pub fn fired(&self) -> usize {
         self.fired.load(Ordering::SeqCst)
+    }
+
+    /// The most [`StorageProvider::delete`] calls this wrapper has had under
+    /// way at once.
+    pub fn most_deletes_in_flight(&self) -> usize {
+        self.most_deletes_in_flight.load(Ordering::SeqCst)
     }
 
     /// `Err` for a rule that fails the call, `Ok(true)` for a
@@ -294,10 +306,21 @@ impl StorageProvider for FaultStorage {
         self.inner.put_multipart(uri).await
     }
     async fn delete(&self, uri: &str) -> Result<(), StorageError> {
-        if self.check(FaultOp::Delete, uri)? {
-            let _ = self.inner.delete(uri).await;
+        let in_flight = self.deletes_in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        self.most_deletes_in_flight
+            .fetch_max(in_flight, Ordering::SeqCst);
+        // Yield once, so every delete a caller has issued together is under
+        // way here before any finishes, and the gauge counts them all.
+        tokio::task::yield_now().await;
+        let result = async {
+            if self.check(FaultOp::Delete, uri)? {
+                let _ = self.inner.delete(uri).await;
+            }
+            self.inner.delete(uri).await
         }
-        self.inner.delete(uri).await
+        .await;
+        self.deletes_in_flight.fetch_sub(1, Ordering::SeqCst);
+        result
     }
     async fn delete_once(&self, uri: &str) -> Result<(), StorageError> {
         if self.check(FaultOp::DeleteOnce, uri)? {
