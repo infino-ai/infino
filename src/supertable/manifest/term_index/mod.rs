@@ -10510,8 +10510,12 @@ mod tests {
             !budget(local).streams(&layers, 4, THOUSANDTHS),
             "the cache holds it"
         );
+        let few = Layer {
+            slices: layers[0].slices[..100].to_vec(),
+            ..layers[0].clone()
+        };
         assert!(
-            !budget(0).streams(&layers[..1], 4, THOUSANDTHS),
+            !budget(0).streams(&[few], 4, THOUSANDTHS),
             "too few slices to cut"
         );
         let small_memory = FoldBudget {
