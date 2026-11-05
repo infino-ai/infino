@@ -635,11 +635,33 @@ fn open_tag_consumer(storage_dir: &std::path::Path, cache_dir: &std::path::Path)
     .expect("open")
 }
 
+/// How many superfiles of the loaded parts hold the `tag` column at all. A
+/// file whose rows leave a nullable column null throughout does not store
+/// it.
+fn files_holding_tag(consumer: &Supertable) -> usize {
+    let r = consumer.reader().expect("reader");
+    let m = r.manifest();
+    m.get_all_list_entries()
+        .iter()
+        .filter_map(|e| m.get_cached_part_by_id(&e.part_id))
+        .flat_map(|part| part.superfiles.clone())
+        .filter(|e| {
+            e.physical_schema
+                .as_ref()
+                .is_some_and(|p| p.column_by_name("tag").is_some())
+        })
+        .count()
+}
+
 #[test]
 fn sql_is_null_prunes_no_null_parts() {
     // `tag IS NULL`:
-    //  - parts 1 and 2 have null_count == 0, so they're dropped.
-    //  - only part 0 (all-null tag) loads; its 4 rows match.
+    //  - part 0's files leave the all-null tag out; parts 1 and 2 have
+    //    null_count == 0.
+    //  - a part's null count covers only the files that store the column,
+    //    and a file may leave a nullable one out, so the part tier keeps
+    //    every part; the superfile tier drops the files with no null.
+    //  - part 0's 4 rows match.
     let dir = TempDir::new().expect("tempdir");
     build_tag_parts(dir.path());
     let cache_dir = TempDir::new().expect("cache");
@@ -657,13 +679,23 @@ fn sql_is_null_prunes_no_null_parts() {
 
     let (loaded, total) = parts_loaded(&consumer);
     assert_eq!(total, 3);
-    assert_eq!(loaded, 1, "no-null parts pruned; got {loaded}/3");
+    assert_eq!(
+        loaded, 3,
+        "no part's null count speaks for files that leave the column out"
+    );
+    assert_eq!(
+        files_holding_tag(&consumer),
+        4,
+        "part 0's files store no tag"
+    );
 }
 
 #[test]
 fn sql_is_not_null_prunes_all_null_parts() {
     // `tag IS NOT NULL`:
-    //  - part 0 is entirely null (min stat is null), so it's dropped.
+    //  - part 0 is entirely null, so its files leave the column out: the
+    //    part has no aggregate for it and is kept, and its files are
+    //    dropped at the superfile tier, which sees they do not hold it.
     //  - parts 1 and 2 load; their 8 rows match.
     let dir = TempDir::new().expect("tempdir");
     build_tag_parts(dir.path());
@@ -682,14 +714,23 @@ fn sql_is_not_null_prunes_all_null_parts() {
 
     let (loaded, total) = parts_loaded(&consumer);
     assert_eq!(total, 3);
-    assert_eq!(loaded, 2, "all-null part 0 pruned; got {loaded}/3");
+    assert_eq!(loaded, 3, "part 0 has no tag aggregate to prune on");
+    assert_eq!(
+        files_holding_tag(&consumer),
+        4,
+        "part 0's files store no tag"
+    );
 }
 
 #[test]
 fn sql_or_across_columns_loads_only_the_parts_a_branch_can_match() {
     // `tag IS NULL OR title = 'e0'`:
-    //  - part 0 holds the null tags; part 2 can hold 'e0'.
-    //  - part 1 has no null tag and no 'e0', so neither branch keeps it.
+    //  - part 0 holds the null tags (its files leave `tag` out); part 2 can
+    //    hold 'e0'.
+    //  - part 1 has no null tag and no 'e0', but a part's null count covers
+    //    only the files that store a nullable column, so the `IS NULL`
+    //    branch keeps every part (#1240); the superfile tier skips part 1's
+    //    files, which hold `tag` with no null and no 'e0'.
     //  - every matching row still comes back: 4 null tags plus e0.
     let dir = TempDir::new().expect("tempdir");
     build_tag_parts(dir.path());
@@ -708,7 +749,10 @@ fn sql_or_across_columns_loads_only_the_parts_a_branch_can_match() {
 
     let (loaded, total) = parts_loaded(&consumer);
     assert_eq!(total, 3);
-    assert_eq!(loaded, 2, "part 1 matches neither branch; got {loaded}/3");
+    assert_eq!(
+        loaded, 3,
+        "no part's null count speaks for files that leave the column out"
+    );
 }
 
 #[test]

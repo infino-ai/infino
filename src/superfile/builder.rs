@@ -143,7 +143,7 @@ use crate::{
             rerank_codec::RerankCodec,
         },
     },
-    supertable::schema::{FieldId, field_id_of, map::FileSchemaMap, with_field_id},
+    supertable::schema::{FieldId, PhysicalKind, field_id_of, map::FileSchemaMap, with_field_id},
     utils::{
         nulls::{null_row_bytes, share_null_columns},
         terms::validate_column_name,
@@ -1363,6 +1363,41 @@ impl BuilderOptions {
         .with_field_ids_outside_schema(outside_schema)
     }
 
+    /// These options storing only the columns a file must hold and those
+    /// named in `populated`: the id column, every column that may not be
+    /// null, and every full-text column stay; a nullable column outside
+    /// `populated` is left out of the body.
+    ///
+    /// A column a file does not store reads as null, by the same rule that
+    /// reads a file written before the column existed, so leaving out one
+    /// that is null in every row changes no value. It changes what the
+    /// file costs: on a wide, sparse table a write that fills a few dozen
+    /// of thousands of columns would otherwise store, describe in its
+    /// footer, and index the pages of every one of them.
+    pub(crate) fn storing_only(mut self, populated: &HashSet<String>) -> Self {
+        let indexed: HashSet<&str> = self.fts_columns.iter().map(|c| c.column.as_str()).collect();
+        let fields: Vec<Arc<Field>> = self
+            .schema
+            .fields()
+            .iter()
+            .filter(|f| {
+                *f.name() == self.id_column
+                    || !f.is_nullable()
+                    || indexed.contains(f.name().as_str())
+                    || populated.contains(f.name())
+            })
+            .cloned()
+            .collect();
+        if fields.len() == self.schema.fields().len() {
+            return self;
+        }
+        self.schema = Arc::new(Schema::new_with_metadata(
+            fields,
+            self.schema.metadata().clone(),
+        ));
+        self
+    }
+
     /// These options as a merge's output shape: the body the inputs
     /// actually carry. An index-only FTS column's text is in no file body,
     /// so it is not a column a merge input can supply — its postings are
@@ -1746,6 +1781,11 @@ impl SuperfileBuilder {
             fb.set_lane_mode();
         }
         Ok(lane)
+    }
+
+    /// The scalar columns each batch handed to this builder must have.
+    pub(crate) fn input_schema(&self) -> &Arc<Schema> {
+        &self.opts.schema
     }
 
     /// Where each FTS column sits in a batch's schema, for
@@ -4653,6 +4693,36 @@ impl MergeInput {
         }
     }
 
+    /// The names, in `out`, of the columns this input may hold a value in:
+    /// every column of `out` the file stores, except a flat one its
+    /// statistics show to be null in every row of every row group. A nested
+    /// column is never judged by them, since a Parquet null count there
+    /// also counts empty lists, and a column without statistics is taken to
+    /// hold values.
+    pub(crate) fn populated_columns(&self, out: &Schema) -> HashSet<String> {
+        let metadata = self.reader.parquet_metadata();
+        let file_schema = self.reader.schema();
+        out.fields()
+            .iter()
+            .filter_map(|field| {
+                let stored = match &self.adapter {
+                    Some(map) => map
+                        .resolve(field.name())?
+                        .physical
+                        .as_ref()
+                        .filter(|p| p.kind == PhysicalKind::Stored)?
+                        .name
+                        .clone(),
+                    None => field.name().clone(),
+                };
+                let in_file = file_schema.field_with_name(&stored).ok()?;
+                let null_throughout =
+                    !in_file.data_type().is_nested() && column_null_throughout(&metadata, &stored);
+                (!null_throughout).then(|| field.name().clone())
+            })
+            .collect()
+    }
+
     /// The input's surviving rows in the output's scalar shape, one
     /// decoded batch at a time. Never joined into one batch: a string
     /// column can decode past what one `Utf8` array's offsets can hold.
@@ -4667,6 +4737,41 @@ impl MergeInput {
             opts,
         )
     }
+}
+
+/// Whether the flat column `name` of the file `metadata` describes is null
+/// in every row: every row group records a null count equal to its rows.
+/// A row group with no null count, or no chunk for the column, says
+/// nothing, and the column is taken to hold values.
+fn column_null_throughout(metadata: &ParquetMetaData, name: &str) -> bool {
+    metadata.row_groups().iter().all(|rg| {
+        rg.columns()
+            .iter()
+            .find(|chunk| {
+                let parts = chunk.column_path().parts();
+                parts.len() == 1 && parts[0] == name
+            })
+            .and_then(|chunk| chunk.statistics())
+            .and_then(|stats| stats.null_count_opt())
+            .is_some_and(|nulls| i64::try_from(nulls).is_ok_and(|n| n == rg.num_rows()))
+    })
+}
+
+/// `batch` with only the columns `schema` names, in `schema`'s order, or
+/// as it is when it already has them all.
+pub(crate) fn project_to(batch: &RecordBatch, schema: &Schema) -> Result<RecordBatch, BuildError> {
+    if same_shape(&batch.schema(), schema) {
+        return Ok(batch.clone());
+    }
+    let indices = schema
+        .fields()
+        .iter()
+        .map(|f| batch.schema().index_of(f.name()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| BuildError::Footer(e.into()))?;
+    batch
+        .project(&indices)
+        .map_err(|e| BuildError::Footer(e.into()))
 }
 
 /// Inputs that must already have the output's shape, from the readers a

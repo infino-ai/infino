@@ -1000,8 +1000,17 @@ impl Supertable {
         // average document length over everything else in the table plus
         // its own documents — the same statistic a fresh append bakes, and
         // what lets a compacted table score like an unfragmented one.
-        let builder_options = manifest
-            .builder_options()
+        //
+        // The output stores the columns some input holds a value in: a
+        // nullable column every input leaves out, or stores null in every
+        // row, is left out of the merged file too, and reads back as null.
+        let table_options = manifest.builder_options();
+        let populated: HashSet<String> = inputs
+            .iter()
+            .flat_map(|input| input.populated_columns(&table_options.schema))
+            .collect();
+        let builder_options = table_options
+            .storing_only(&populated)
             .with_fts_corpus_stats(manifest.fts_corpus_stats(superfiles))
             .with_merge_input_mb(merge_input_mb);
         // The build is long, synchronous CPU work, so it runs on the

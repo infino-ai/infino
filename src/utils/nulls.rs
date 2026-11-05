@@ -14,7 +14,7 @@
 //! costs one null array per type plus what its rows actually hold, and
 //! anything that reads or encodes it sees exactly the values it saw before.
 
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use arrow::compute::{concat, concat_batches, take};
 use arrow_array::{Array, ArrayRef, RecordBatch, UInt32Array, new_null_array};
@@ -75,6 +75,24 @@ pub(crate) fn take_sharing_nulls(
         })
         .collect::<Result<Vec<_>, _>>()?;
     RecordBatch::try_new(batch.schema(), columns)
+}
+
+/// The names of the columns of `batches` that hold a value in some row: a
+/// column null throughout every batch is left out. Judged as
+/// [`null_throughout`] judges, so a column with no validity bitmap counts
+/// as holding values.
+pub(crate) fn populated_columns<'a>(
+    batches: impl IntoIterator<Item = &'a RecordBatch>,
+) -> HashSet<String> {
+    let mut populated = HashSet::new();
+    for batch in batches {
+        for (field, column) in batch.schema().fields().iter().zip(batch.columns()) {
+            if !populated.contains(field.name()) && !null_throughout(column.as_ref()) {
+                populated.insert(field.name().clone());
+            }
+        }
+    }
+    populated
 }
 
 /// `batch` with every column that is null throughout replaced by the

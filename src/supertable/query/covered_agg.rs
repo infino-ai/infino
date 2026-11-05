@@ -83,7 +83,7 @@ use crate::supertable::{
     query::{
         provider::{CountedRange, SupertableProvider},
         range_counts::RangeBucket,
-        skip::ColumnTypeGuard,
+        skip::{ColumnTypeGuard, file_lacks_column},
     },
     schema::{DECIMAL128_PRECISION, DECIMAL128_SCALE, FieldId},
 };
@@ -517,10 +517,14 @@ pub(crate) fn value_counts_nulls(
         if !provider.entry_is_clean(entry) {
             return None;
         }
-        let file_nulls = entry
-            .scalar_stats
-            .column(id)
-            .and_then(|stats| stats.null_count());
+        // A file without the column holds it null in every row.
+        let file_nulls = match file_lacks_column(entry, id) {
+            true => Some(entry.n_docs),
+            false => entry
+                .scalar_stats
+                .column(id)
+                .and_then(|stats| stats.null_count()),
+        };
         nulls = nulls.zip(file_nulls).and_then(|(a, b)| a.checked_add(b));
     }
     Some(nulls)

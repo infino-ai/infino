@@ -26,6 +26,7 @@ use crate::supertable::{
         SuperfileEntry,
         list::{MAX_EXACT_VALUE_COUNTS, ScalarValueCounts},
     },
+    query::skip::file_lacks_column,
     schema::FieldId,
 };
 
@@ -71,7 +72,11 @@ enum FileCounts {
 /// What `entry` adds to column `column`'s sum.
 fn file_counts(entry: &SuperfileEntry, column: FieldId) -> FileCounts {
     let Some(stats) = entry.scalar_stats.column(column) else {
-        return FileCounts::Unrecorded;
+        // A file without the column holds it null in every row.
+        return match file_lacks_column(entry, column) {
+            true => FileCounts::NoValues,
+            false => FileCounts::Unrecorded,
+        };
     };
     match stats.value_counts() {
         Some(counts) => FileCounts::Values(counts),
