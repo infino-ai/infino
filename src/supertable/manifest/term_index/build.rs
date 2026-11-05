@@ -28,6 +28,7 @@ use std::{
     io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     mem,
     ops::Range,
+    os::unix::fs::FileExt,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, PoisonError},
     time::Instant,
@@ -37,14 +38,15 @@ use bytes::Bytes;
 use memmap2::Mmap;
 use rayon::{ThreadPool, current_num_threads, prelude::*};
 use tempfile::TempDir;
+use tokio::sync::mpsc::UnboundedSender;
 use tracing::debug;
 use uuid::Uuid;
 
 use super::{
     TermIndexError,
     format::{
-        BlockMark, Layer, Location, Posting, Root, Run, Slice, SliceRef, TierRef, encode_run,
-        encode_slice, legacy_bound_as_key, push_posting, read_posting,
+        Layer, Location, Posting, Root, Run, SLICE_HEADER_LEN, Slice, SliceDictionary, SliceRef,
+        TierRef, encode_run, encode_slice, legacy_bound_as_key, push_posting, read_posting,
     },
     tier::{
         BLOCK_ENTRIES, ColumnScoring, EncodedChunk, HeadGroup, SplicedBlock, TierChunk,
@@ -113,6 +115,10 @@ pub(crate) struct BuildPolicy {
     /// into and run in parallel; `None` chooses by the input's size and the
     /// pool's width (see [`merge_layers`] and [`build_layer`]).
     pub(crate) merge_ranges: Option<usize>,
+    /// The most key ranges a merge that `merge_ranges` leaves to choose is
+    /// cut into: an optimize fold's budget sets it, and a merge under
+    /// [`MERGE_RANGE_MIN_BYTES`] still takes one range.
+    pub(crate) merge_ranges_max: Option<usize>,
     /// For a merge: per superfile of the merged root, by ordinal, the
     /// average length and parameters its tier keys are computed at — the
     /// superfile's own, as the manifest records them. A build takes these
@@ -128,6 +134,9 @@ pub(crate) struct BuildPolicy {
     /// Bytes a merge cursor reads from a tier object at a time; see
     /// [`TIER_READ_WINDOW_BYTES`].
     pub(crate) tier_read_window_bytes: u64,
+    /// Marks a merge cuts each key range from, about; see
+    /// [`MARKS_PER_RANGE`].
+    pub(crate) merge_marks_per_range: usize,
     /// Whether a merge carries tier blocks over from its sources' chunks
     /// (see `splice_term`); off, every term takes the decoding path. Tests
     /// compare the two paths byte for byte.
@@ -220,6 +229,8 @@ impl Default for BuildPolicy {
             scoring_by_ordinal: Arc::new(Vec::new()),
             scoring_by_superfile: Arc::new(HashMap::new()),
             tier_read_window_bytes: TIER_READ_WINDOW_BYTES,
+            merge_marks_per_range: MARKS_PER_RANGE,
+            merge_ranges_max: None,
             #[cfg(test)]
             splice_tiers: true,
         }
@@ -239,8 +250,10 @@ const ENCODE_JOB_MIN_TERMS: usize = 64;
 /// of a window share one read rather than each seeking for its own chunks.
 /// A cursor keeps its current window, and a term whose chunks are still
 /// being encoded keeps the window they were read from, so a merge holds a
-/// few windows per cursor on top of the slice's bytes.
-const TIER_READ_WINDOW_BYTES: u64 = 4 * 1024 * 1024;
+/// few windows per cursor on top of the slice's bytes. A merge holds one
+/// cursor per input layer and key range, so the window is most of what a
+/// wide merge holds; a term whose chunks span more is still read whole.
+const TIER_READ_WINDOW_BYTES: u64 = 256 * 1024;
 
 /// One term as the merge hands it over: its postings and the tier entries
 /// gathered for it, in any order.
@@ -1163,8 +1176,24 @@ impl ContributionReader {
 /// A heap entry: the record's key, and which contribution it came from.
 /// Ordered by key then ordinal so equal keys pop in ascending ordinal.
 struct MergeHead {
+    /// The key's first eight bytes, big-endian and zero-padded: most
+    /// comparisons end here, short of a byte-wise compare of the keys.
+    prefix: u64,
     key: Vec<u8>,
     ordinal: u32,
+}
+
+impl MergeHead {
+    fn new(key: Vec<u8>, ordinal: u32) -> Self {
+        let mut head = [0u8; 8];
+        let len = key.len().min(8);
+        head[..len].copy_from_slice(&key[..len]);
+        Self {
+            prefix: u64::from_be_bytes(head),
+            key,
+            ordinal,
+        }
+    }
 }
 
 impl PartialEq for MergeHead {
@@ -1180,8 +1209,9 @@ impl PartialOrd for MergeHead {
 }
 impl Ord for MergeHead {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.key
-            .cmp(&other.key)
+        self.prefix
+            .cmp(&other.prefix)
+            .then_with(|| self.key.cmp(&other.key))
             .then(self.ordinal.cmp(&other.ordinal))
     }
 }
@@ -1264,6 +1294,9 @@ struct LayerWriter {
     current_tier: Vec<u8>,
     slices: Vec<SliceRef>,
     slice_bytes: Vec<(ContentHash, BuiltBytes)>,
+    /// Where each cut slice and its tier object go at once, when set, in
+    /// place of `slice_bytes` and `tier_bytes`.
+    sink: Option<ObjectSink>,
     /// The tier objects of the slices cut so far, keyed by content hash.
     tier_bytes: Vec<(ContentHash, BuiltBytes)>,
     /// Where cut slices and tier objects are spilled, when they are.
@@ -1325,6 +1358,7 @@ impl LayerWriter {
             slices: Vec::new(),
             slice_bytes: Vec::new(),
             tier_bytes: Vec::new(),
+            sink: None,
             spill,
             target_bytes: policy.slice_target_bytes,
             tier_entries_per_term: policy.tier_entries_per_term,
@@ -1516,10 +1550,20 @@ impl LayerWriter {
             let stem = reference.content_hash.to_hex();
             if let (Some(hash), Some(bytes)) = (tier, tier_bytes) {
                 let kept = self.keep(&format!("{stem}.{TIER_FILE_EXTENSION}"), bytes)?;
-                self.tier_bytes.push((hash, kept));
+                match &self.sink {
+                    Some(sink) => sink
+                        .send(("tier", hash, kept))
+                        .map_err(|_| uploader_gone())?,
+                    None => self.tier_bytes.push((hash, kept)),
+                }
             }
             let kept = self.keep(&format!("{stem}.slice"), bytes)?;
-            self.slice_bytes.push((reference.content_hash, kept));
+            match &self.sink {
+                Some(sink) => sink
+                    .send(("slice", reference.content_hash, kept))
+                    .map_err(|_| uploader_gone())?,
+                None => self.slice_bytes.push((reference.content_hash, kept)),
+            }
             self.slices.push(reference);
         }
         self.stats.cut_secs += started.elapsed().as_secs_f64();
@@ -1730,10 +1774,7 @@ fn build_range(
         let mut rd = ContributionReader::open_at(&c.path, offset)?;
         match rd.next_in(start, end)? {
             Some(rec) => {
-                heap.push(Reverse(MergeHead {
-                    key: rec.key,
-                    ordinal: ordinal as u32,
-                }));
+                heap.push(Reverse(MergeHead::new(rec.key, ordinal as u32)));
                 pending.push(Some((rec.posting, rec.head)));
             }
             None => pending.push(None),
@@ -1773,10 +1814,7 @@ fn build_range(
                 .expect("a reader for each pending record")
                 .next_in(None, end)?
             {
-                heap.push(Reverse(MergeHead {
-                    key: next.key,
-                    ordinal,
-                }));
+                heap.push(Reverse(MergeHead::new(next.key, ordinal)));
                 pending[ordinal as usize] = Some((next.posting, next.head));
             }
             Ok(())
@@ -2111,10 +2149,33 @@ fn tier_entries(
 /// its contributions writes the same bytes as that build; a range-cut one
 /// writes the same terms, each with the same postings and tier entries,
 /// in slices cut at the range bounds too.
+#[cfg(test)]
 pub(crate) fn merge_layers(
     sources: &[Vec<SliceFile>],
     ordinals: &[Option<u32>],
     policy: &BuildPolicy,
+) -> Result<MergedLayer, TermIndexError> {
+    merge_layers_into(sources, ordinals, policy, None)
+}
+
+/// The error a merge stops with once its uploader has failed and closed
+/// the sink; the uploader reports the cause.
+fn uploader_gone() -> TermIndexError {
+    TermIndexError::Build("the term-index uploader stopped".into())
+}
+
+/// Where a merge hands each tier object and slice as it cuts them, by kind,
+/// so they upload while the merge goes on.
+pub(crate) type ObjectSink = UnboundedSender<(&'static str, ContentHash, BuiltBytes)>;
+
+/// [`merge_layers`], handing each slice and tier object to `sink` as its
+/// range writes it; the merged layer then holds none. A closed sink drops
+/// them, and the uploader that closed it reports why.
+pub(crate) fn merge_layers_into(
+    sources: &[Vec<SliceFile>],
+    ordinals: &[Option<u32>],
+    policy: &BuildPolicy,
+    sink: Option<&ObjectSink>,
 ) -> Result<MergedLayer, TermIndexError> {
     let ranges = detail_span!("fold.key_ranges").in_scope(|| key_ranges(sources, policy))?;
     // Each range merges the slices that reach into it, on its own writer.
@@ -2129,7 +2190,7 @@ pub(crate) fn merge_layers(
                     .collect()
             })
             .collect();
-        merge_range(&in_range, start, end, ordinals, policy)
+        merge_range(&in_range, start, end, ordinals, policy, sink)
     })?;
     merged.layer.ordinals = Some(ordinals_span(ordinals));
     Ok(merged)
@@ -2251,7 +2312,10 @@ fn range_count(
             .pool
             .as_deref()
             .map_or_else(current_num_threads, ThreadPool::current_num_threads)
-            .clamp(1, cap),
+            .clamp(
+                1,
+                policy.merge_ranges_max.map_or(cap, |max| max.clamp(1, cap)),
+            ),
     })
 }
 
@@ -2294,10 +2358,21 @@ fn cut_ranges<K: AsRef<[u8]>>(marks: &[(K, u64)], want: usize) -> Vec<KeyRange> 
 
 /// Sources of at least this many bytes are merged in key ranges.
 const MERGE_RANGE_MIN_BYTES: u64 = 64 * 1024 * 1024;
+/// Slices per key range from which a merge cuts its ranges at one mark per
+/// slice instead of reading each slice's dictionary.
+const ONE_MARK_SLICES_PER_RANGE: usize = 256;
+/// Runs read past a group's first block to find where its tier chunks
+/// start, before the group joins the one before it.
+const TIER_AT_SCAN_RUNS: usize = 8;
+/// Marks a merge cuts each key range from, about: enough to place a cut
+/// well within a range, few enough that sorting every slice's marks stays
+/// cheap. A slice's dictionary blocks are grouped to keep its share.
+pub(crate) const MARKS_PER_RANGE: usize = 2048;
+
 /// Ranges a merge is cut into at most: each holds a cursor per layer
 /// with a slice's bytes and a few tier windows resident, so the width is
 /// bounded by memory as well as by threads.
-const MERGE_RANGES_MAX: usize = 32;
+pub(crate) const MERGE_RANGES_MAX: usize = 32;
 
 /// Whether `slice` holds a key in `start..end`.
 fn slice_reaches(slice: &SliceFile, start: Option<&[u8]>, end: Option<&[u8]>) -> bool {
@@ -2329,36 +2404,78 @@ pub(crate) fn key_ranges(
     if want <= 1 {
         return Ok(vec![(None, None)]);
     }
-    // Every dictionary block of every slice, weighed by the bytes of its
-    // runs and tier chunks, read on the pool a slice at a time: one pass
-    // over the slices before the merge reads them again. A block whose
-    // first run has no chunks is weighed by its runs alone and its chunk
-    // bytes fall to the next block that has them; a few blocks' worth of
-    // tier bytes can shift a cut, which is well within a range.
+    // Each slice's dictionary blocks, in groups of about its share of the
+    // marks, weighed by the bytes of their runs and tier chunks. Only the
+    // header and dictionary are read, and one run where a group starts
+    // inside the slice to find its tier offset: the merge reads the
+    // postings next, and a slice read whole here is read twice. A group
+    // whose first runs carry no chunks joins the group before it.
+    let per_slice = (want * policy.merge_marks_per_range)
+        .div_ceil(files.len().max(1))
+        .max(1);
+    // One mark per slice needs no slice opened: its first key, weighed by
+    // its bytes and its tier object's. Past a few hundred slices per range
+    // that places the cuts finely enough.
+    if per_slice == 1 || files.len() >= want * ONE_MARK_SLICES_PER_RANGE {
+        let mut marks = Vec::with_capacity(files.len());
+        for file in &files {
+            let weight = fs::metadata(&file.path)?.len()
+                + fs::metadata(file.path.with_extension(TIER_FILE_EXTENSION))
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+            marks.push((file.first_key.clone(), weight));
+        }
+        marks.sort_by(|a, b| a.0.cmp(&b.0));
+        return Ok(cut_ranges(&marks, want));
+    }
     let weigh = |file: &SliceFile| -> Result<Vec<(Vec<u8>, u64)>, TermIndexError> {
-        let bytes = fs::read(&file.path)?;
-        let slice = Slice::open(&bytes)?;
-        let marks: Vec<BlockMark> = slice.block_marks()?;
+        let handle = File::open(&file.path)?;
+        let mut header = [0u8; SLICE_HEADER_LEN];
+        handle.read_exact_at(&mut header, 0)?;
+        let dict_len = SliceDictionary::dict_len(&header)?;
+        let mut bytes = vec![0u8; SLICE_HEADER_LEN + dict_len as usize];
+        handle.read_exact_at(&mut bytes, 0)?;
+        let dictionary = SliceDictionary::open(&bytes)?;
+        let starts = dictionary.block_starts()?;
         let tier_len = fs::metadata(file.path.with_extension(TIER_FILE_EXTENSION))
             .map(|m| m.len())
             .unwrap_or(0);
-        let mut out = Vec::with_capacity(marks.len());
-        let mut tier_at = 0u64;
-        for (i, mark) in marks.iter().enumerate() {
-            let next = marks.get(i + 1);
-            let run_bytes = next
-                .map_or(slice.postings_len(), |n| n.postings_at)
-                .saturating_sub(mark.postings_at);
-            tier_at = mark.tier_at.unwrap_or(tier_at);
-            let tier_end = next.and_then(|n| n.tier_at).unwrap_or(if next.is_some() {
-                tier_at
-            } else {
-                tier_len
-            });
-            let tier_bytes = tier_end.saturating_sub(tier_at);
-            out.push((mark.key.clone(), run_bytes + tier_bytes));
+        let group = starts.len().div_ceil(per_slice).max(1);
+        // The tier offset where the group starting at block `from` begins.
+        let tier_at = |from: usize| -> Result<Option<u64>, TermIndexError> {
+            if tier_len == 0 {
+                return Ok(Some(0));
+            }
+            for start in starts.iter().skip(from).take(TIER_AT_SCAN_RUNS) {
+                let mut run = vec![0u8; start.run_len as usize];
+                handle.read_exact_at(&mut run, dictionary.postings_start() + start.postings_at)?;
+                if let Some(at) = dictionary.tier_at(&run)? {
+                    return Ok(Some(at));
+                }
+            }
+            Ok(None)
+        };
+        // (first block, postings offset, tier offset) of each group.
+        let mut cuts: Vec<(usize, u64, u64)> = vec![(0, 0, 0)];
+        for from in (group..starts.len()).step_by(group) {
+            if let Some(at) = tier_at(from)? {
+                cuts.push((from, starts[from].postings_at, at));
+            }
         }
-        Ok(out)
+        let ends = cuts
+            .iter()
+            .skip(1)
+            .map(|&(_, postings, tier)| (postings, tier))
+            .chain([(dictionary.postings_len(), tier_len)]);
+        Ok(cuts
+            .iter()
+            .zip(ends)
+            .filter_map(|(&(first, postings, tier), (postings_end, tier_end))| {
+                let start = starts.get(first)?;
+                let weight = postings_end.saturating_sub(postings) + tier_end.saturating_sub(tier);
+                Some((start.key.clone(), weight))
+            })
+            .collect())
     };
     let weigh_all = || -> Result<Vec<Vec<(Vec<u8>, u64)>>, TermIndexError> {
         files.par_iter().map(|file| weigh(file)).collect()
@@ -2381,6 +2498,7 @@ fn merge_range(
     end: Option<&[u8]>,
     ordinals: &[Option<u32>],
     policy: &BuildPolicy,
+    sink: Option<&ObjectSink>,
 ) -> Result<MergedLayer, TermIndexError> {
     let mut cursors: Vec<LayerCursor> = sources
         .iter()
@@ -2391,10 +2509,7 @@ fn merge_range(
     for (source, cursor) in cursors.iter_mut().enumerate() {
         match cursor.next()? {
             Some((key, run)) => {
-                heap.push(Reverse(MergeHead {
-                    key,
-                    ordinal: source as u32,
-                }));
+                heap.push(Reverse(MergeHead::new(key, source as u32)));
                 pending.push(Some(run));
             }
             None => pending.push(None),
@@ -2402,6 +2517,7 @@ fn merge_range(
     }
 
     let mut writer = LayerWriter::for_merge(policy, ordinals)?;
+    writer.sink = sink.cloned();
     let mut run: Vec<Posting> = Vec::new();
     let mut sources: Vec<TierSource> = Vec::new();
     let mut entries: Vec<TierEntry> = Vec::new();
@@ -2453,10 +2569,7 @@ fn merge_range(
                 Some(p)
             }));
             if let Some((key, next_run)) = cursors[source as usize].next()? {
-                heap.push(Reverse(MergeHead {
-                    key,
-                    ordinal: source,
-                }));
+                heap.push(Reverse(MergeHead::new(key, source)));
                 pending[source as usize] = Some(next_run);
             }
             next = match heap.peek() {

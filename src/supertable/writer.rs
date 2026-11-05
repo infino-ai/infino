@@ -73,7 +73,7 @@ use std::{
     str::from_utf8,
     sync::{
         Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{Receiver as StdReceiver, sync_channel as std_sync_channel},
     },
     thread::available_parallelism,
@@ -104,10 +104,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tempfile::{NamedTempFile, TempDir};
 use tokio::{
+    spawn,
     sync::{
-        Semaphore,
+        Notify, Semaphore,
         mpsc::{Receiver, Sender, channel},
     },
+    task::JoinHandle,
     time::sleep,
 };
 use tracing::{Instrument, Span, debug, error, info, warn};
@@ -12145,6 +12147,20 @@ struct KeptBatch {
     layer: Option<ReservedLayer>,
 }
 
+/// The prefetch running beside an optimize call's current fold, stopped
+/// when the call ends however it ends. The task holds the call's reuse
+/// directory, so the directory goes once the stopped task lets go of it.
+#[derive(Default)]
+struct Prefetch(Mutex<Option<JoinHandle<()>>>);
+
+impl Drop for Prefetch {
+    fn drop(&mut self) {
+        if let Some(task) = self.0.get_mut().ok().and_then(Option::take) {
+            task.abort();
+        }
+    }
+}
+
 /// A fold kept across its publish's retries: the root it was made of, and
 /// the folded root (see `term_index::rebase`).
 struct KeptFold {
@@ -12167,7 +12183,10 @@ struct KeptFold {
 ///   a writer that keeps none.
 /// - With none left to index, layers fold one run per publish, as
 ///   [`term_index::plan_fold_at_optimize`] picks them, of at most
-///   `fold_max_bytes` together. A fold that loses its publish to commits
+///   what the scratch disk holds together ([`term_index::fold_disk_bound`],
+///   or `unmeasured_fold_max_bytes` when the disk cannot be read), and as
+///   many layers as the host's free
+///   memory and open-file limit hold. A fold that loses its publish to commits
 ///   has their layers stacked on it ([`term_index::rebase`]), so a retry
 ///   writes one root.
 /// - A root that will never load (gone, corrupt, or in a layout this engine
@@ -12183,7 +12202,7 @@ struct KeptFold {
 /// keep a fold due, do not keep one call going.
 pub(in crate::supertable) async fn stamp_term_index(
     inner: &SupertableInner,
-    fold_max_bytes: u64,
+    unmeasured_fold_max_bytes: u64,
 ) -> Result<(), BuildError> {
     let Some(storage) = inner.options.storage.clone() else {
         return Ok(());
@@ -12197,17 +12216,39 @@ pub(in crate::supertable) async fn stamp_term_index(
     // layers the root holds plus the one each batch adds, since every fold
     // leaves fewer layers than it found.
     let budget: OnceLock<usize> = OnceLock::new();
+    // What this call's folds upload, kept on local disk for the folds after.
+    let reuse = Arc::new(
+        term_index_scratch(&inner.options.term_index_build_policy())
+            .map_err(TermIndexError::from)?,
+    );
+    let reuse_path = reuse.path().to_path_buf();
+    // Local bytes per slice byte the call's folds have measured, in thousandths.
+    let disk_per_slice = Arc::new(AtomicU64::new(0));
+    // The next fold's inputs, fetched while this one merges and uploads.
+    let prefetch = Prefetch::default();
     // One renumbering fold per call. Commits that land while it runs are
     // stacked on it past nil padding, which would call for another at once;
     // the next optimize's drops it.
     let renumbered = AtomicBool::new(false);
     let mut passes = 0;
     loop {
+        // Memory is measured again each pass, as free disk is: a long call
+        // sees other work start and stop beside it.
+        let fold_budget =
+            term_index::FoldBudget::for_host(inner.options.writer_pool.current_num_threads());
         let published = AtomicBool::new(false);
         let kept_batch: Mutex<Option<KeptBatch>> = Mutex::new(None);
         let kept_fold: Mutex<Option<KeptFold>> = Mutex::new(None);
         stamp_with_retries(inner, &storage, "term-index", |old| {
-            let (storage, published, budget) = (&storage, &published, &budget);
+            let (storage, published, budget, reuse, reuse_path, prefetch, disk_per_slice) = (
+                &storage,
+                &published,
+                &budget,
+                &reuse,
+                &reuse_path,
+                &prefetch,
+                &disk_per_slice,
+            );
             let (kept_batch, kept_fold, renumbered) = (&kept_batch, &kept_fold, &renumbered);
             async move {
                 published.store(false, Ordering::Relaxed);
@@ -12254,25 +12295,119 @@ pub(in crate::supertable) async fn stamp_term_index(
                         return Ok(Some(old.with_term_index(reference, true)));
                     }
                     let renumber = !renumbered.load(Ordering::Relaxed);
-                    if let Some(fold) = term_index::plan_fold_at_optimize(
-                        &root,
-                        &live,
-                        fold_max_bytes,
-                        renumber,
-                        before_tiers,
-                    ) {
+                    // Objects no layer names any more go; the rest are read in
+                    // place by the folds that name them, so they count as room.
+                    // Only when no fold fits even so does every kept object go.
+                    let (sweep_dir, swept_root) = (reuse_path.clone(), root.clone());
+                    let held = tokio::task::spawn_blocking(move || {
+                        term_index::retain_kept(&sweep_dir, &swept_root)
+                    })
+                    .await
+                    .unwrap_or(0);
+                    let plan = |max_bytes| {
+                        term_index::plan_fold_at_optimize(
+                            &root,
+                            &live,
+                            max_bytes,
+                            fold_budget,
+                            renumber,
+                            before_tiers,
+                        )
+                    };
+                    let mut fold_max_bytes = term_index::fold_disk_bound(reuse_path, disk_per_slice, held)
+                        .unwrap_or(unmeasured_fold_max_bytes);
+                    let mut planned = plan(fold_max_bytes);
+                    if planned.is_none() && held > 0 && plan(u64::MAX).is_some() {
+                        let evict_dir = reuse_path.clone();
+                        let freed = tokio::task::spawn_blocking(move || term_index::evict_kept(&evict_dir))
+                            .await
+                            .unwrap_or(0);
+                        info!(freed_mib = freed >> 20, "term index: evicted kept objects for room");
+                        fold_max_bytes = term_index::fold_disk_bound(reuse_path, disk_per_slice, 0)
+                            .unwrap_or(unmeasured_fold_max_bytes);
+                        planned = plan(fold_max_bytes);
+                    }
+                    if let Some(fold) = planned {
+                        // The fetch started for this fold lands before its own download.
+                        let started = prefetch.0.lock().expect("prefetch").take();
+                        if let Some(started) = started {
+                            let _ = started.await;
+                        }
+                        // An output is kept for a later fold that reads it, and
+                        // only while the disk holds it beside the fold's inputs.
+                        let fold_bytes = term_index::run_bytes(&root, &fold);
+                        let keep = term_index::output_reread(
+                            &root,
+                            &fold,
+                            &live,
+                            fold_max_bytes,
+                            fold_budget,
+                            renumber,
+                            before_tiers,
+                        ) && term_index::fold_disk_bound(reuse_path, disk_per_slice, 0)
+                            .is_some_and(|bound| bound >= fold_bytes.saturating_mul(2));
+                        let downloaded = Arc::new(Notify::new());
+                        if fold_budget.prefetches() {
+                            let next = term_index::layers_after(
+                                &root,
+                                &fold,
+                                &live,
+                                fold_max_bytes,
+                                fold_budget,
+                                renumber,
+                                before_tiers,
+                            );
+                            *prefetch.0.lock().expect("prefetch") =
+                                Some(spawn(term_index::prefetch_layers(
+                                    Arc::clone(storage),
+                                    next,
+                                    Arc::clone(reuse),
+                                    Arc::clone(&downloaded),
+                                    Arc::clone(disk_per_slice),
+                                    if keep { fold_bytes } else { 0 },
+                                )));
+                        }
                         let policy = term_index::BuildPolicy {
                             scoring_by_ordinal: Arc::new(scoring_by_ordinal(&old, fold.superfiles())),
                             ..policy.clone()
                         };
+                        let io = term_index::FoldIo {
+                            reuse_dir: Some(reuse_path.clone()),
+                            keep_uploads: keep,
+                            disk_per_slice_milli: Some(Arc::clone(disk_per_slice)),
+                            downloaded: Some(Arc::clone(&downloaded)),
+                        };
                         let renumbers = fold.renumbers();
+                        info!(
+                            layers = root.layers.len(),
+                            first = fold.run().start,
+                            members = fold.run().len(),
+                            ranges = fold.ranges(),
+                            renumbers,
+                            budget_mib = fold_budget.memory_bytes >> 20,
+                            "term index fold plan"
+                        );
+                        let output_at = fold.run().start;
                         let span = detail_span!("term_index.fold", layers = root.layers.len());
-                        match term_index::fold_at_optimize(storage, &root, fold, &policy, pool)
+                        let result = term_index::fold_at_optimize(storage, &root, fold, &policy, &io, pool)
                             .instrument(span)
-                            .await
-                        {
+                            .await;
+                        // A fold that downloaded nothing never told the prefetch.
+                        downloaded.notify_one();
+                        match result {
                             Ok(folded) => {
+                                // The fold stored its output itself, so the next
+                                // pass need not ask storage for it.
+                                let written: Vec<_> = folded
+                                    .layers
+                                    .get(output_at)
+                                    .into_iter()
+                                    .flat_map(|layer| &layer.slices)
+                                    .flat_map(|slice| [Some(slice.content_hash), slice.tier])
+                                    .flatten()
+                                    .collect();
                                 let reference = write_fold(storage, kept_fold, root, folded).await?;
+                                seen.lock().expect("term-index objects seen").extend(written);
                                 renumbered.fetch_or(renumbers, Ordering::Relaxed);
                                 published.store(true, Ordering::Relaxed);
                                 return Ok(Some(old.with_term_index(reference, true)));

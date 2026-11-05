@@ -303,10 +303,15 @@ and the swap leaves only orphans for garbage collection, and a lost
 race is retried against the winner with re-puts of already-written
 slices as no-ops. A commit folds runs of small layers as they pile up;
 a maintenance pass folds the larger runs commits leave, one run per
-publish and no more than one compaction merge's input at a time. Once
-at least half of the root's list of superfiles is dead and the whole
-index fits that bound, the pass folds every layer into one and numbers
-the live superfiles afresh, which is the only way the list shortens.
+publish, as many layers as the host's free memory and open-file limit
+hold and no more bytes than half the free space it downloads into (a
+compaction merge's input at least). It folds layers of like size
+together, so a byte is rewritten a logarithmic number of times, and drops
+a layer of replaced superfiles unread. A fold of every layer, made while
+some superfile is dead, numbers the live superfiles afresh once per pass,
+which is the only way the list shortens; once at least half of the list
+is dead, the pass folds every layer into one when the budget holds them
+all.
 Deltas committed while a fold runs are stacked after it as they were
 committed, padded so their ordinals hold, so its retry writes one root;
 a later renumbering drops the padding. A posting is followed only if
