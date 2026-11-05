@@ -249,7 +249,7 @@ fn fixed_pool(role: &'static str, threads: usize) -> Result<Arc<ThreadPool>, Bui
 /// Tracks `Config::supertable::id_column`'s default; kept as a
 /// free function so the validation in
 /// [`SupertableOptions::new`] doesn't need a `Config` snapshot.
-fn default_id_column() -> String {
+pub(crate) fn default_id_column() -> String {
     "_id".to_string()
 }
 

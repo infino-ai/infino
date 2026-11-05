@@ -201,6 +201,14 @@ class Table:
         value: str,
         projection: Sequence[str] | None = ...,
     ) -> ArrowTable: ...
+    def sorted_search(
+        self,
+        column: str,
+        k: int,
+        projection: Sequence[str] | None = ...,
+        *,
+        descending: bool = ...,
+    ) -> ArrowTable: ...
     def count(
         self,
         column: str,

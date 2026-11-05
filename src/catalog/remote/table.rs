@@ -33,9 +33,13 @@ use crate::{
     dynamic::rows_to_batch,
     superfile::VectorSearchOptions,
     supertable::{
-        query::sql::{
-            conform_value_counts, count_where_exprs, count_where_row, holds_subquery,
-            value_count_exprs, value_count_schema,
+        options::default_id_column,
+        query::{
+            sorted::sorted_statement,
+            sql::{
+                conform_value_counts, count_where_exprs, count_where_row, holds_subquery,
+                value_count_exprs, value_count_schema,
+            },
         },
         reindex::{PlannedRepair, ReindexReport, StalenessReport},
         schema::{TableSchema, change::SchemaPatch},
@@ -309,6 +313,29 @@ impl Table for RemoteTable {
         });
         let response = self.catalog.post_json("exact_match", body)?;
         read_arrow("exact_match", response)
+    }
+
+    /// The wire has no sorted call, so the sort it stands for travels as SQL
+    /// ([`sorted_statement`]) and the hosted side answers it. A hosted handle
+    /// holds only the table's Arrow schema, not which columns carry a range
+    /// index, so unlike a local table it does not refuse a column without
+    /// one: the statement sorts any column, and returns the same rows a local
+    /// table returns for a column it does index.
+    fn sorted_search(
+        &self,
+        column: &str,
+        descending: bool,
+        k: usize,
+        projection: Option<&[&str]>,
+    ) -> Result<Vec<RecordBatch>, InfinoError> {
+        self.catalog.query_sql(&sorted_statement(
+            &self.table_name,
+            column,
+            descending,
+            k,
+            projection,
+            &default_id_column(),
+        ))
     }
 
     /// The wire has no value-count call, so the grouped count it stands for
