@@ -18591,7 +18591,12 @@ mod tests {
         faults.before(FaultOp::PutAtomic, "data/", || {
             thread::sleep(SHARED_HELD_UPLOAD);
         });
-        *PIECE_FAILS_FOR_STEM.lock().expect("piece fault") = Some(STEM.to_owned());
+        let stem = w.pending_stem.clone();
+        assert!(
+            stem.is_some(),
+            "the commit's superfiles carry the source's stem"
+        );
+        *PIECE_FAILS_FOR_STEM.lock().expect("piece fault") = stem;
         let failed = w.commit();
         *PIECE_FAILS_FOR_STEM.lock().expect("piece fault") = None;
         let error = failed.expect_err("a piece fails");
