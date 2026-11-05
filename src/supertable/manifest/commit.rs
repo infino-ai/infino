@@ -57,6 +57,7 @@ use crate::{
                 self as part_mod, BLAKE3_DIGEST_BYTES, BLAKE3_HEX_LEN, ContentHash, ManifestPart,
                 PartId,
             },
+            rollups::rollups_uri,
             summaries::summaries_uri,
         },
     },
@@ -300,11 +301,16 @@ pub struct EncodedPart {
     /// per-column statistics, which the part itself then omits. `None` for
     /// hidden manifests, whose entries keep their statistics inline.
     pub summaries: Option<(Bytes, ContentHash)>,
+    /// The part's rollups object and its content hash, when its rollups are
+    /// past the inline cap ([`super::rollups`]); `None` when they stay
+    /// inline in the list.
+    pub rollups: Option<(Bytes, ContentHash)>,
 }
 
 impl EncodedPart {
     /// Every object this part publishes, by storage key: the part, its
-    /// routing sibling and its summaries section. All content-addressed.
+    /// routing sibling, its summaries section and its rollups. All
+    /// content-addressed.
     pub fn objects(&self) -> Vec<(String, Bytes)> {
         let mut out = vec![(
             part_uri(&ContentHash::of(&self.encoded)),
@@ -315,6 +321,9 @@ impl EncodedPart {
         }
         if let Some((bytes, hash)) = &self.summaries {
             out.push((summaries_uri(hash), bytes.clone()));
+        }
+        if let Some((bytes, hash)) = &self.rollups {
+            out.push((rollups_uri(hash), bytes.clone()));
         }
         out
     }

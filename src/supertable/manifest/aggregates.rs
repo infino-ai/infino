@@ -261,6 +261,7 @@ mod tests {
         scalar_stats_agg: HashMap<FieldId, ScalarStatsAgg>,
     ) -> ManifestPartEntry {
         ManifestPartEntry {
+            rollups: Default::default(),
             part_id: PartId(uuid::Uuid::from_bytes([0xb; 16])),
             uri: "manifests/part-base.avro.zst".into(),
             n_superfiles: 1,

@@ -209,6 +209,7 @@ fn entry_for(part: &ManifestPart) -> ManifestPartEntry {
     let uri = part_uri(&hash);
     let size_bytes = encoded.len() as u64;
     ManifestPartEntry {
+        rollups: Default::default(),
         part_id: part.part_id,
         uri,
         n_superfiles: part.superfiles.len() as u64,
