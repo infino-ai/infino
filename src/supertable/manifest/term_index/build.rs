@@ -43,7 +43,8 @@ use tracing::debug;
 use uuid::Uuid;
 
 use super::{
-    FOLD_CURSOR_BYTES, TermIndexError,
+    FOLD_CURSOR_BYTES, REMOTE_TIER_WINDOW_BYTES, REMOTE_TIER_WINDOW_MAX_BYTES, RemoteSlice,
+    TermIndexError,
     format::{
         Layer, Location, Posting, Root, Run, SLICE_HEADER_LEN, Slice, SliceDictionary, SliceRef,
         TierRef, encode_run, encode_slice, legacy_bound_as_key, push_posting, read_posting,
@@ -1878,6 +1879,8 @@ const MERGE_BATCH_BYTES: usize = (FOLD_CURSOR_BYTES / 2) as usize;
 /// a slice.
 #[derive(Debug, Clone)]
 pub(crate) struct SliceFile {
+    /// Where the merge fetches the slice when it is not on local disk.
+    pub(crate) remote: Option<RemoteSlice>,
     /// The slice's bytes, as downloaded or spilled.
     pub(crate) path: PathBuf,
     /// Smallest key the slice holds.
@@ -1907,8 +1910,10 @@ fn map_file(path: &Path) -> io::Result<Bytes> {
 pub(super) struct LayerCursor {
     /// What the ordinals in the files are relative to: their layer's base.
     base: u32,
-    /// Slice files not opened yet, in key order.
-    files: VecDeque<PathBuf>,
+    /// Slices not opened yet, in key order.
+    files: VecDeque<SliceFile>,
+    /// The next streamed slice, fetched while this one is read.
+    next_fetch: Option<tokio::task::JoinHandle<Result<Bytes, TermIndexError>>>,
     /// The open slice's bytes, mapped rather than read, so the many cursors
     /// a merge of many layers keeps open hold their slices in page cache,
     /// which the kernel can drop and read back, not in the heap; empty
@@ -1920,6 +1925,14 @@ pub(super) struct LayerCursor {
     tier: Option<(File, u64)>,
     /// Where the open slice's tier object sits (see [`tier_path`]).
     tier_file: Option<PathBuf>,
+    /// The open slice when streamed.
+    remote: Option<RemoteSlice>,
+    /// The streamed tier window after the one last read, fetched while
+    /// the merge reads that one, and where it starts.
+    next_window: Option<(u64, tokio::task::JoinHandle<Result<Bytes, TermIndexError>>)>,
+    /// Bytes the next streamed tier window asks for: doubled each time the
+    /// window fetched ahead serves, up to [`REMOTE_TIER_WINDOW_MAX_BYTES`].
+    remote_window: u64,
     /// The window of the tier object last read, and where it starts. A
     /// slice's chunks lie in key order, so a merge reads the object front
     /// to back and one window serves the terms that fall in it.
@@ -1942,6 +1955,12 @@ pub(super) struct LayerCursor {
     read_secs: f64,
 }
 
+impl Drop for LayerCursor {
+    fn drop(&mut self) {
+        self.abort_fetches();
+    }
+}
+
 impl LayerCursor {
     /// A cursor over `files` in key order, yielding the keys in
     /// `start..end` (either bound open when `None`), reading tier objects
@@ -1954,7 +1973,11 @@ impl LayerCursor {
     ) -> Self {
         Self {
             base: files.first().map_or(0, |f| f.base),
-            files: files.iter().map(|f| f.path.clone()).collect(),
+            files: files.iter().cloned().collect(),
+            next_fetch: None,
+            remote: None,
+            next_window: None,
+            remote_window: REMOTE_TIER_WINDOW_BYTES,
             bytes: Bytes::new(),
             tier: None,
             tier_file: None,
@@ -1979,6 +2002,16 @@ impl LayerCursor {
             .sum()
     }
 
+    /// Stop the fetches started ahead of the merge.
+    fn abort_fetches(&mut self) {
+        if let Some(fetch) = self.next_fetch.take() {
+            fetch.abort();
+        }
+        if let Some((_, fetch)) = self.next_window.take() {
+            fetch.abort();
+        }
+    }
+
     /// The next term and its run, `None` once every slice is read or the
     /// range's end is reached.
     pub(super) fn next(&mut self) -> Result<Option<(Vec<u8>, Run)>, TermIndexError> {
@@ -1993,6 +2026,7 @@ impl LayerCursor {
                     // files after it belongs to it.
                     self.batch.clear();
                     self.files.clear();
+                    self.abort_fetches();
                     self.bytes = Bytes::new();
                     return Ok(None);
                 }
@@ -2020,15 +2054,39 @@ impl LayerCursor {
                     continue;
                 }
             }
-            let Some(path) = self.files.pop_front() else {
+            let Some(file) = self.files.pop_front() else {
                 return Ok(None);
             };
-            self.bytes = map_file(&path)?;
-            self.decode_secs += started.elapsed().as_secs_f64();
+            match file.remote {
+                Some(remote) => {
+                    let fetch = match self.next_fetch.take() {
+                        Some(fetch) => fetch,
+                        None => remote.spawn_fetch(),
+                    };
+                    self.bytes = remote.wait(fetch)?;
+                    self.next_fetch = self
+                        .files
+                        .front()
+                        .and_then(|next| next.remote.as_ref())
+                        .map(RemoteSlice::spawn_fetch);
+                    self.read_secs += started.elapsed().as_secs_f64();
+                    self.tier_file = None;
+                    if let Some((_, fetch)) = self.next_window.take() {
+                        fetch.abort();
+                    }
+                    self.remote_window = REMOTE_TIER_WINDOW_BYTES;
+                    self.remote = Some(remote);
+                }
+                None => {
+                    self.bytes = map_file(&file.path)?;
+                    self.decode_secs += started.elapsed().as_secs_f64();
+                    self.tier_file = Some(file.path.with_extension(TIER_FILE_EXTENSION));
+                    self.remote = None;
+                }
+            }
             self.tier = None;
             self.window = Arc::new(Vec::new());
             self.window_base = 0;
-            self.tier_file = Some(path.with_extension(TIER_FILE_EXTENSION));
             self.last_key = None;
         }
     }
@@ -2052,6 +2110,61 @@ impl LayerCursor {
             return Ok((Arc::clone(&self.window), self.window_base));
         }
         let started = Instant::now();
+        if let Some(remote) = &self.remote {
+            let total = remote.tier_len;
+            if end > total {
+                return Err(TermIndexError::Malformed(
+                    "tier chunk past its object".into(),
+                ));
+            }
+            let window = self.window_bytes.max(self.remote_window);
+            // The window fetched ahead serves when it holds the chunks, joined
+            // to the current window's tail when the chunks start there; else
+            // they are fetched now.
+            let ahead = match self.next_window.take() {
+                Some((at, fetch)) if at <= base => Some((at, remote.wait(fetch)?)),
+                Some((at, fetch))
+                    if at == window_end && base >= self.window_base && base < window_end =>
+                {
+                    let tail = &self.window[(base - self.window_base) as usize..];
+                    let next = remote.wait(fetch)?;
+                    let mut joined = Vec::with_capacity(tail.len() + next.len());
+                    joined.extend_from_slice(tail);
+                    joined.extend_from_slice(&next);
+                    Some((base, Bytes::from(joined)))
+                }
+                Some((_, fetch)) => {
+                    fetch.abort();
+                    None
+                }
+                None => None,
+            };
+            let (at, bytes) = match ahead {
+                Some((at, bytes)) if end <= at + bytes.len() as u64 => {
+                    self.remote_window = (self.remote_window * 2).min(REMOTE_TIER_WINDOW_MAX_BYTES);
+                    (at, bytes)
+                }
+                _ => {
+                    let want = (end - base).max(window).min(total - base);
+                    (
+                        base,
+                        remote.wait(remote.spawn_tier_range(base..base + want))?,
+                    )
+                }
+            };
+            let next = at + bytes.len() as u64;
+            if next < total {
+                let ahead = self.window_bytes.max(self.remote_window);
+                self.next_window = Some((
+                    next,
+                    remote.spawn_tier_range(next..(next + ahead).min(total)),
+                ));
+            }
+            self.window = Arc::new(bytes.to_vec());
+            self.window_base = at;
+            self.read_secs += started.elapsed().as_secs_f64();
+            return Ok((Arc::clone(&self.window), at));
+        }
         if self.tier.is_none() {
             let path = self
                 .tier_file
@@ -2380,7 +2493,7 @@ fn cut_ranges<K: AsRef<[u8]>>(marks: &[(K, u64)], want: usize) -> Vec<KeyRange> 
 const MERGE_RANGE_MIN_BYTES: u64 = 64 * 1024 * 1024;
 /// Slices per key range from which a merge cuts its ranges at one mark per
 /// slice instead of reading each slice's dictionary.
-const ONE_MARK_SLICES_PER_RANGE: usize = 256;
+pub(crate) const ONE_MARK_SLICES_PER_RANGE: usize = 256;
 /// Runs read past a group's first block to find where its tier chunks
 /// start, before the group joins the one before it.
 const TIER_AT_SCAN_RUNS: usize = 8;
@@ -2417,7 +2530,10 @@ pub(crate) fn key_ranges(
     let want = range_count(policy, MERGE_RANGE_MIN_BYTES, MERGE_RANGES_MAX, || {
         let mut bytes = 0u64;
         for file in &files {
-            bytes += fs::metadata(&file.path)?.len();
+            bytes += match &file.remote {
+                Some(remote) => remote.len,
+                None => fs::metadata(&file.path)?.len(),
+            };
         }
         Ok(bytes)
     })?;
@@ -2435,31 +2551,54 @@ pub(crate) fn key_ranges(
         .max(1);
     // One mark per slice needs no slice opened: its first key, weighed by
     // its bytes and its tier object's. Past a few hundred slices per range
-    // that places the cuts finely enough.
+    // that places the cuts finely enough, so a fold of many slices takes it
+    // whether they are on local disk or streamed, and cuts alike either way.
     if per_slice == 1 || files.len() >= want * ONE_MARK_SLICES_PER_RANGE {
         let mut marks = Vec::with_capacity(files.len());
         for file in &files {
-            let weight = fs::metadata(&file.path)?.len()
-                + fs::metadata(file.path.with_extension(TIER_FILE_EXTENSION))
-                    .map(|m| m.len())
-                    .unwrap_or(0);
+            let weight = match &file.remote {
+                Some(remote) => remote.len + remote.tier_len,
+                None => {
+                    fs::metadata(&file.path)?.len()
+                        + fs::metadata(file.path.with_extension(TIER_FILE_EXTENSION))
+                            .map(|m| m.len())
+                            .unwrap_or(0)
+                }
+            };
             marks.push((file.first_key.clone(), weight));
         }
         marks.sort_by(|a, b| a.0.cmp(&b.0));
         return Ok(cut_ranges(&marks, want));
     }
     let weigh = |file: &SliceFile| -> Result<Vec<(Vec<u8>, u64)>, TermIndexError> {
-        let handle = File::open(&file.path)?;
-        let mut header = [0u8; SLICE_HEADER_LEN];
-        handle.read_exact_at(&mut header, 0)?;
+        let handle = match &file.remote {
+            Some(_) => None,
+            None => Some(File::open(&file.path)?),
+        };
+        let read_at = |offset: u64, len: usize| -> Result<Vec<u8>, TermIndexError> {
+            match (&file.remote, &handle) {
+                (Some(remote), _) => Ok(remote.slice_range(offset..offset + len as u64)?.to_vec()),
+                (None, Some(handle)) => {
+                    let mut bytes = vec![0u8; len];
+                    handle.read_exact_at(&mut bytes, offset)?;
+                    Ok(bytes)
+                }
+                (None, None) => Err(TermIndexError::Build(
+                    "a slice neither local nor remote".into(),
+                )),
+            }
+        };
+        let header = read_at(0, SLICE_HEADER_LEN)?;
         let dict_len = SliceDictionary::dict_len(&header)?;
-        let mut bytes = vec![0u8; SLICE_HEADER_LEN + dict_len as usize];
-        handle.read_exact_at(&mut bytes, 0)?;
+        let bytes = read_at(0, SLICE_HEADER_LEN + dict_len as usize)?;
         let dictionary = SliceDictionary::open(&bytes)?;
         let starts = dictionary.block_starts()?;
-        let tier_len = fs::metadata(file.path.with_extension(TIER_FILE_EXTENSION))
-            .map(|m| m.len())
-            .unwrap_or(0);
+        let tier_len = match &file.remote {
+            Some(remote) => remote.tier_len,
+            None => fs::metadata(file.path.with_extension(TIER_FILE_EXTENSION))
+                .map(|m| m.len())
+                .unwrap_or(0),
+        };
         let group = starts.len().div_ceil(per_slice).max(1);
         // The tier offset where the group starting at block `from` begins.
         let tier_at = |from: usize| -> Result<Option<u64>, TermIndexError> {
@@ -2467,8 +2606,10 @@ pub(crate) fn key_ranges(
                 return Ok(Some(0));
             }
             for start in starts.iter().skip(from).take(TIER_AT_SCAN_RUNS) {
-                let mut run = vec![0u8; start.run_len as usize];
-                handle.read_exact_at(&mut run, dictionary.postings_start() + start.postings_at)?;
+                let run = read_at(
+                    dictionary.postings_start() + start.postings_at,
+                    start.run_len as usize,
+                )?;
                 if let Some(at) = dictionary.tier_at(&run)? {
                     return Ok(Some(at));
                 }
