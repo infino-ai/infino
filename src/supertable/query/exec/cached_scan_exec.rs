@@ -85,7 +85,8 @@ pub(crate) struct CachedFile {
     pub(crate) uri: SuperfileUri,
     pub(crate) reader: Arc<SuperfileReader>,
     /// The footer [`RowGroupFilter`] prunes by: the file's own, without the
-    /// bounds of a float column holding a NaN, as the Parquet scan prunes by
+    /// bounds that leave out a float column's NaNs, as the Parquet scan
+    /// prunes by
     /// ([`without_nan_blind_bounds`](crate::supertable::query::nan_bounds::without_nan_blind_bounds)).
     pub(crate) footer: Arc<ParquetMetaData>,
     /// Rows in each row group, in file order.
