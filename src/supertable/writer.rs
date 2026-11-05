@@ -2711,7 +2711,7 @@ impl SupertableWriter {
     /// all of this before choosing this over a rebuild.
     fn commit_live(
         &self,
-        mut live: LiveLanes,
+        live: LiveLanes,
         lanes: Vec<LiveLane>,
         buffer: &[BufferedBatch],
         stem: Option<&str>,
