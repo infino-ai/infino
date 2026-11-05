@@ -12537,13 +12537,17 @@ mod tests {
         publish_with_inline_rollups(&rt, &storage, &written);
         let reopened = Supertable::open(rollups_wide_options(&storage)).expect("open");
         let (clusters, _) = synth_clusters(HIDDEN_CELLS, HIDDEN_DIM, HIDDEN_SEED);
-        let mut hidden = reopened.inner().manifest.load_full().with_list_edited(false, |list| {
-            list.partition_strategy = PartitionStrategy::VectorCell {
-                column: "emb".into(),
-                clusters,
-                routing: CellRoutingParams::default(),
-            };
-        });
+        let mut hidden = reopened
+            .inner()
+            .manifest
+            .load_full()
+            .with_list_edited(false, |list| {
+                list.partition_strategy = PartitionStrategy::VectorCell {
+                    column: "emb".into(),
+                    clusters,
+                    routing: CellRoutingParams::default(),
+                };
+            });
         assert!(hidden.store_inline_rollups().is_empty(), "nothing written");
         assert!(
             hidden
