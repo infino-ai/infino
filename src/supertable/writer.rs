@@ -133,7 +133,7 @@ use crate::{
     storage::{StorageError, StorageProvider, stuck_after},
     superfile::{
         BuildError as SuperfileBuildError, FtsError, ReadError, SuperfileReader,
-        builder::{BuilderOptions, SuperfileBuilder, VectorConfig, index_fts_rows},
+        builder::{BuilderOptions, SuperfileBuilder, VectorConfig, index_fts_rows, project_to},
         format::{
             CRC_BYTES,
             footer::read_kv_metadata,
@@ -238,6 +238,7 @@ use crate::{
     },
     utils::{
         join::run_spawned,
+        nulls::populated_columns,
         trace::{self, detail_span, record},
     },
 };
@@ -3748,7 +3749,7 @@ impl LiveLanes {
         lanes: usize,
         vector_layout: VectorLayout,
     ) -> Result<Self, BuildError> {
-        let (template, _, _) = open_shard_builder(&manifest, vector_layout, None, 0)?;
+        let (template, _, _) = open_shard_builder(&manifest, vector_layout, None, 0, None)?;
         let lanes = (0..lanes)
             .map(|_| {
                 let builder = template
@@ -3932,6 +3933,7 @@ fn open_shard_builder(
     vector_layout: VectorLayout,
     provided_centroids: Option<Arc<[f32]>>,
     fts_text_bytes: usize,
+    populated: Option<&HashSet<String>>,
 ) -> Result<
     (
         SuperfileBuilder,
@@ -3940,11 +3942,13 @@ fn open_shard_builder(
     ),
     BuildError,
 > {
-    let mut builder = SuperfileBuilder::new(
-        builder_options_of(manifest)
-            .with_vector_layout(vector_layout)
-            .with_vector_centroids(provided_centroids),
-    )?;
+    let mut options = builder_options_of(manifest)
+        .with_vector_layout(vector_layout)
+        .with_vector_centroids(provided_centroids);
+    if let Some(populated) = populated {
+        options = options.storing_only(populated);
+    }
+    let mut builder = SuperfileBuilder::new(options)?;
     // A piece is one of many pool tasks running side by side; its finish
     // fans out to no other thread.
     builder.set_finish_serial();
@@ -4088,15 +4092,24 @@ fn build_piece(
         .iter()
         .map(|b| ingested_byte_legs(b, 0, options).2)
         .sum();
+    // The superfile stores the columns its rows fill: a nullable column no
+    // row of the piece sets is left out, and reads back as null.
+    let populated = populated_columns(scalars.iter().copied());
     let (mut builder, superfile_id, head_sink) = open_shard_builder(
         manifest,
         vector_layout,
         provided_centroids,
         usize::try_from(fts_text_bytes).unwrap_or(usize::MAX),
+        Some(&populated),
     )?;
+    let stored = Arc::clone(builder.input_schema());
+    let stored_scalars = scalars
+        .iter()
+        .map(|b| project_to(b, &stored))
+        .collect::<Result<Vec<_>, _>>()?;
     match rows {
         PieceRows::Buffered(slice) => {
-            for buffered in slice {
+            for (buffered, scalar) in slice.iter().zip(&stored_scalars) {
                 // Float32Array::values() returns &ScalarBuffer<f32>;
                 // ScalarBuffer derefs to &[f32], so AsRef does the slice
                 // view without a copy.
@@ -4105,26 +4118,23 @@ fn build_piece(
                     .iter()
                     .map(|fa| fa.values().as_ref())
                     .collect();
-                builder.add_batch(&buffered.scalar, &vector_slices)?;
+                builder.add_batch(scalar, &vector_slices)?;
             }
         }
-        PieceRows::Lanes {
-            batches,
-            lanes,
-            piece,
-        } => {
+        PieceRows::Lanes { lanes, piece, .. } => {
             // The body in row order; the postings come from the lanes,
             // merged at the finish.
-            for batch in batches {
+            for batch in &stored_scalars {
                 builder.add_rows_unindexed(batch)?;
             }
             builder.set_fts_lane_view(lanes, piece);
         }
     }
-    let bounds = id_bounds(scalars.iter().copied(), options)?;
-    // Per-scalar-column min/max from the piece's batches; `from_batches`
-    // borrows them.
-    let scalar_stats = ScalarStatsAgg::from_batches(&manifest.scalar_schema(), &scalars);
+    let bounds = id_bounds(stored_scalars.iter(), options)?;
+    // Per-column min/max of the stored columns, from the piece's batches;
+    // `from_batches` borrows them. A column the file leaves out has none.
+    let stored_refs: Vec<&RecordBatch> = stored_scalars.iter().collect();
+    let scalar_stats = ScalarStatsAgg::from_batches(&stored, &stored_refs);
     seal_shard(builder, superfile_id, head_sink, bounds, scalar_stats)
 }
 
