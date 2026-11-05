@@ -3460,26 +3460,74 @@ mod tests {
         assert_ranges_match_one_writer(&sources, &[Some(0), Some(1)], &policy);
     }
 
-    /// With few marks per range each slice's dictionary blocks are grouped,
-    /// and the merge still writes the terms one writer writes.
+    /// A few slices of many dictionary blocks, at few marks per range, are
+    /// weighed a group of blocks at a time, so a merge cuts more ranges than
+    /// it has slices, some inside a slice, and still writes the terms one
+    /// writer writes. With tier objects, each group's tier offset is read
+    /// from its first runs; where only the last terms have tiers, a group
+    /// whose first runs carry none joins the one before it.
     #[test]
     fn a_merge_cut_from_grouped_marks_writes_the_terms_one_writer_writes() {
-        let dir = TempDir::new().expect("tempdir");
-        let policy = BuildPolicy {
-            merge_marks_per_range: 1,
-            ..range_policy()
-        };
-        let built = build(
-            &[range_contribution(&dir, 1), range_contribution(&dir, 2)],
-            &policy,
-        )
-        .expect("build");
-        let layer = built.root.layers[0].clone();
-        let scratch = TempDir::new().expect("scratch");
-        spill_tiers(scratch.path(), &layer.slices, built.tiers).expect("place tiers");
-        let sources =
-            vec![spill_slices(scratch.path(), &layer, built.slices).expect("place slices")];
-        assert_ranges_match_one_writer(&sources, &[Some(0), Some(1)], &policy);
+        const RANGES: usize = 8;
+        for (tier_entries_per_term, tiers_at_end_only) in
+            [(100_000, false), (4, false), (100, true)]
+        {
+            let dir = TempDir::new().expect("tempdir");
+            let contribution = |id: u128| match tiers_at_end_only {
+                false => range_contribution(&dir, id),
+                true => {
+                    let terms: Vec<String> = (0..600).map(|i| format!("t{i:04}")).collect();
+                    let entries: Vec<(&str, &str, Vec<(u32, f32)>)> = terms
+                        .iter()
+                        .enumerate()
+                        .map(|(i, t)| {
+                            let n = if i >= 590 { 40 } else { 2 };
+                            let docs = (0..n)
+                                .map(|d| (d * 3, id as f32 + d as f32 * 0.01))
+                                .collect();
+                            ("body", t.as_str(), docs)
+                        })
+                        .collect();
+                    contribution_with_heads(&dir, id, &entries, 64)
+                }
+            };
+            let built_under = BuildPolicy {
+                slice_target_bytes: 1 << 20,
+                tier_entries_per_term,
+                ..BuildPolicy::default()
+            };
+            let built = build(&[contribution(1), contribution(2)], &built_under).expect("build");
+            let policy = BuildPolicy {
+                merge_ranges: Some(RANGES),
+                merge_marks_per_range: 1,
+                ..built_under
+            };
+            let layer = built.root.layers[0].clone();
+            let scratch = TempDir::new().expect("scratch");
+            spill_tiers(scratch.path(), &layer.slices, built.tiers).expect("place tiers");
+            let sources =
+                vec![spill_slices(scratch.path(), &layer, built.slices).expect("place slices")];
+            let ranges = build::key_ranges(&sources, &policy).expect("ranges");
+            match tiers_at_end_only {
+                // Every group's first runs carry no tier chunk, so each joins
+                // the one before it and the cuts fall where the slices start.
+                true => assert!(ranges.len() <= layer.slices.len()),
+                false => assert!(
+                    ranges.len() > layer.slices.len(),
+                    "{} ranges from {} slices (tiers {tier_entries_per_term})",
+                    ranges.len(),
+                    layer.slices.len()
+                ),
+            }
+            let merge = |ranges: usize| {
+                let policy = BuildPolicy {
+                    merge_ranges: Some(ranges),
+                    ..policy.clone()
+                };
+                merge_layers(&sources, &[Some(0), Some(1)], &policy).expect("merge")
+            };
+            assert_eq!(merged_terms(&merge(1)), merged_terms(&merge(RANGES)));
+        }
     }
 
     /// The same over two source layers, a base and a delta built onto
