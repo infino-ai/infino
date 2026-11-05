@@ -4573,6 +4573,17 @@ macro_rules! piece_values {
     };
 }
 
+/// The first eight bytes of `bytes`, zero-padded when it is shorter: the
+/// head that [`OrderKey`] reads big-endian, for byte order, and that
+/// `list::CountedStr` reads little-endian, for equality.
+#[inline]
+fn head8(bytes: &[u8]) -> [u8; 8] {
+    let mut head = [0u8; 8];
+    let n = bytes.len().min(8);
+    head[..n].copy_from_slice(&bytes[..n]);
+    head
+}
+
 /// A string's place in byte order as far as its first eight bytes tell:
 /// those bytes as a big-endian number, zero-padded. Two strings whose
 /// numbers differ order as their numbers do. Two that tie and are both at
@@ -4589,22 +4600,19 @@ struct OrderKey<'a> {
 impl<'a> OrderKey<'a> {
     #[inline]
     fn new(bytes: &'a [u8]) -> Self {
-        let mut head = [0u8; 8];
-        let n = bytes.len().min(8);
-        head[..n].copy_from_slice(&bytes[..n]);
         Self {
-            head: u64::from_be_bytes(head),
+            head: u64::from_be_bytes(head8(bytes)),
             bytes,
         }
     }
 
     #[inline]
-    fn order(&self, other: &Self) -> std::cmp::Ordering {
+    fn order(&self, other: &Self) -> Ordering {
         match self.head.cmp(&other.head) {
-            std::cmp::Ordering::Equal if self.bytes.len() <= 8 && other.bytes.len() <= 8 => {
+            Ordering::Equal if self.bytes.len() <= 8 && other.bytes.len() <= 8 => {
                 self.bytes.len().cmp(&other.bytes.len())
             }
-            std::cmp::Ordering::Equal => self.bytes.cmp(other.bytes),
+            Ordering::Equal => self.bytes.cmp(other.bytes),
             order => order,
         }
     }

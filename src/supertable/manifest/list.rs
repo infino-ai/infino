@@ -18,7 +18,7 @@
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet, HashMap, hash_map::Entry},
-    hash::Hash,
+    hash::{Hash, Hasher},
     slice,
     sync::Arc,
 };
@@ -54,6 +54,7 @@ use crate::{
                 decode_scalar_stats, decode_value_counts, encode_cluster_centroids,
                 encode_scalar_stats, require_single_row,
             },
+            head8,
             hll::HllSketch,
             merge_min_max_arrays,
             part::{BLAKE3_DIGEST_BYTES, BLAKE3_HEX_LEN, ContentHash, PartId},
@@ -837,9 +838,11 @@ impl ScalarValueCounts {
         Self::from_distinct_entries(entries)
     }
 
-    /// [`Self::from_entries`] for entries whose values are already distinct,
-    /// as [`Self::count`] leaves them: the same table, without the map that
-    /// folds duplicate values together.
+    /// The table of entries whose values are already distinct, as
+    /// [`Self::count`] and [`Self::from_entries`] leave them. `None` when there
+    /// are none or more than the cap, when a value is null or a count zero,
+    /// when the values are not all of one counted type, or when two of them
+    /// do not compare.
     fn from_distinct_entries(mut entries: Vec<(ScalarValue, u64)>) -> Option<Self> {
         if entries.is_empty() || entries.len() > MAX_EXACT_VALUE_COUNTS {
             return None;
@@ -869,39 +872,26 @@ impl ScalarValueCounts {
         Some(Self { entries })
     }
 
+    /// The table of `entries`, with the counts of a value that shows up more
+    /// than once added together. `None` when the entries cannot make a table:
+    /// see [`Self::from_distinct_entries`].
     pub(crate) fn from_entries(entries: Vec<(ScalarValue, u64)>) -> Option<Self> {
-        if entries.is_empty() || entries.len() > MAX_EXACT_VALUE_COUNTS {
-            return None;
-        }
-        if !exact_value_counts_type(&entries[0].0.data_type()) {
+        // More entries than the cap is refused before folding, so the map
+        // below stays bounded however the values repeat.
+        if entries.len() > MAX_EXACT_VALUE_COUNTS {
             return None;
         }
         let mut merged: HashMap<ScalarValue, u64> = HashMap::with_capacity(entries.len());
         for (value, count) in entries {
-            if value.is_null() || count == 0 {
+            // A zero count folded into a nonzero one for the same value
+            // would no longer show, so it is refused here, before the fold.
+            if count == 0 {
                 return None;
             }
             let total = merged.entry(value).or_default();
             *total = total.checked_add(count)?;
-            if merged.len() > MAX_EXACT_VALUE_COUNTS {
-                return None;
-            }
         }
-        let mut entries: Vec<(ScalarValue, u64)> = merged.into_iter().collect();
-        if entries
-            .iter()
-            .any(|(value, _)| value.data_type() != entries[0].0.data_type())
-        {
-            return None;
-        }
-        entries.sort_by(|left, right| left.0.partial_cmp(&right.0).unwrap_or(Ordering::Equal));
-        if entries
-            .windows(2)
-            .any(|pair| pair[0].0.partial_cmp(&pair[1].0).is_none())
-        {
-            return None;
-        }
-        Some(Self { entries })
+        Self::from_distinct_entries(merged.into_iter().collect())
     }
 
     pub(crate) fn merged_with(&self, other: &Self) -> Option<Self> {
@@ -944,11 +934,8 @@ impl<'a> CountedStr<'a> {
     #[inline]
     fn new(value: &'a str) -> Self {
         let bytes = value.as_bytes();
-        let mut head = [0u8; 8];
-        let n = bytes.len().min(8);
-        head[..n].copy_from_slice(&bytes[..n]);
         Self {
-            head: u64::from_le_bytes(head),
+            head: u64::from_le_bytes(head8(bytes)),
             len: bytes.len(),
             value,
         }
@@ -982,7 +969,7 @@ impl Eq for CountedStr<'_> {}
 
 impl Hash for CountedStr<'_> {
     #[inline]
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+    fn hash<H: Hasher>(&self, state: &mut H) {
         state.write_u64(self.head);
         state.write_usize(self.len);
         state.write(self.tail());
@@ -2686,7 +2673,7 @@ mod tests {
             Some("en"),
             Some("abcdefghi"),
         ];
-        let mut expected: std::collections::BTreeMap<&str, u64> = Default::default();
+        let mut expected: BTreeMap<&str, u64> = Default::default();
         for value in values.iter().flatten() {
             *expected.entry(value).or_default() += 1;
         }
@@ -5091,10 +5078,6 @@ mod tests {
         }
     }
 
-    /// Two batches with the same columns, their stats built one column at a
-    /// time and split over columns:
-    ///   - an `Int16`, a low-cardinality `Utf8`, and a `Binary` column that
-    ///     gets no stats.
     /// Strings of at most eight bytes are told apart by their heads and
     /// lengths alone, so these pin the cases a head could blur: a trailing
     /// NUL, which pads the same as the bytes it extends, and values either
@@ -5126,6 +5109,10 @@ mod tests {
         }
     }
 
+    /// Two batches with the same columns, their stats built one column at a
+    /// time and split over columns:
+    ///   - an `Int16`, a low-cardinality `Utf8`, and a `Binary` column that
+    ///     gets no stats.
     /// This test pins that splitting the stats over columns changes nothing.
     #[test]
     fn parallel_stats_match_serial_stats() {
