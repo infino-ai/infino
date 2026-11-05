@@ -25,6 +25,7 @@ use crate::{
             SUPERFILE_DATA_DIR, SUPERFILE_KEY_SUFFIX, SuperfileUri,
             commit::{MANIFEST_DIR, MANIFEST_PARTS_DIR, POINTER_PATH, manifest_uri},
             list::RoutingRef,
+            part::ContentHash,
             summaries::MANIFEST_SUMMARIES_DIR,
             term_index::{self, STORAGE_PREFIX as TERM_INDEX_STORAGE_PREFIX},
         },
@@ -175,7 +176,7 @@ async fn term_index_slices(
     Ok(uris)
 }
 
-/// Delete `keys`, each superfile's disk-cache copy first, at most [`RECLAIM_CONCURRENCY`] in
+/// Delete `keys`, each one's cached local copy first, at most [`RECLAIM_CONCURRENCY`] in
 /// flight. `on_result` sees every key's outcome as it arrives. Both sweeps delete through here.
 async fn delete_objects(
     inner: &SupertableInner,
@@ -200,22 +201,27 @@ async fn delete_objects(
         .await;
 }
 
-/// Drop the disk-cache copy of each superfile about to be deleted. Unlinking thousands of files is
-/// blocking filesystem work, so it runs on the blocking pool, off the runtime queries share.
+/// Drop the cached copies of the objects about to be deleted. A sweep's keys mix every kind of
+/// object a table stores; superfiles have a copy in the data cache and vector-state blobs one in the
+/// metadata cache, and the other kinds are not cached locally.
 async fn erase_cached_copies(inner: &SupertableInner, keys: &[String]) {
+    erase_cached_superfiles(inner, keys).await;
+    erase_cached_vector_states(inner, keys).await;
+}
+
+/// Drop the data-cache copy of each superfile in `keys`. Unlinking thousands of files is blocking
+/// filesystem work, so it runs on the blocking pool, off the runtime queries share.
+async fn erase_cached_superfiles(inner: &SupertableInner, keys: &[String]) {
     let Some(cache) = inner.options.disk_cache.clone() else {
         return;
     };
-
     let uris: Vec<SuperfileUri> = keys
         .iter()
         .filter_map(|key| SuperfileUri::from_storage_path(key))
         .collect();
-
     if uris.is_empty() {
         return;
     }
-
     if let Err(error) = spawn_blocking(move || {
         for uri in &uris {
             cache.erase_superfile_local_copy(uri);
@@ -224,6 +230,30 @@ async fn erase_cached_copies(inner: &SupertableInner, keys: &[String]) {
     .await
     {
         warn!(%error, "gc: disk-cache erase for deleted superfiles did not finish");
+    }
+}
+
+/// Drop the metadata-cache copy of each vector-state blob in `keys`, on the blocking pool like
+/// [`erase_cached_superfiles`].
+async fn erase_cached_vector_states(inner: &SupertableInner, keys: &[String]) {
+    let Some(cache) = inner.options.metadata_disk_cache.clone() else {
+        return;
+    };
+    let hashes: Vec<ContentHash> = keys
+        .iter()
+        .filter_map(|key| slow_vector_state::content_hash_of_path(key))
+        .collect();
+    if hashes.is_empty() {
+        return;
+    }
+    if let Err(error) = spawn_blocking(move || {
+        for hash in &hashes {
+            cache.remove(hash);
+        }
+    })
+    .await
+    {
+        warn!(%error, "gc: metadata-cache erase for deleted vector state did not finish");
     }
 }
 
@@ -303,6 +333,7 @@ async fn live_set(
         // public error variant.
         let state = slow_vector_state::load_full_state(
             storage.as_ref(),
+            inner.options.metadata_disk_cache.as_ref(),
             uri,
             &hash,
             &manifest.options.legacy_names(),
@@ -970,13 +1001,14 @@ mod tests {
         };
         let checkpoint = slow_vector_state::write_state_with_pending_drain(
             storage.as_ref(),
+            None,
             &[],
             &pending,
             None,
         )
         .await
         .expect("checkpoint");
-        let settled = slow_vector_state::write_state(storage.as_ref(), &[], None)
+        let settled = slow_vector_state::write_state(storage.as_ref(), None, &[], None)
             .await
             .expect("settled");
         for (published, kept) in [(checkpoint, true), (settled, false)] {

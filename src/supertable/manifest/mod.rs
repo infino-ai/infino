@@ -111,7 +111,7 @@ use crate::{
                 EncodedPart, PointerFile, frame_content_size, part_uri, read_pointer,
                 translate_contention, write_manifest, write_object_bytes, write_pointer,
             },
-            disk_cache::ManifestDiskCache,
+            disk_cache::MetadataDiskCache,
             encoding::SummaryWireMode,
             list::{
                 FORMAT_VERSION as LIST_FORMAT_VERSION, Manifest, ManifestPartEntry,
@@ -461,7 +461,7 @@ impl ManifestSnapshot {
         if let Some(storage) = storage
             && let Some(list) = list
         {
-            let manifest_cache = superfile_list.options.manifest_disk_cache.clone();
+            let manifest_cache = superfile_list.options.metadata_disk_cache.clone();
             let loader = Arc::new(ManifestPartLoader::new_with_legacy_names(
                 Arc::clone(&storage),
                 &list,
@@ -571,7 +571,7 @@ impl ManifestSnapshot {
             Arc::new(ManifestPartLoader::new_with_legacy_names(
                 storage.clone(),
                 &list,
-                options.manifest_disk_cache.clone(),
+                options.metadata_disk_cache.clone(),
                 false,
                 options.legacy_names(),
             ))
@@ -1117,7 +1117,7 @@ impl ManifestSnapshot {
         let loader = Arc::new(ManifestPartLoader::new_with_legacy_names(
             Arc::clone(&storage),
             &list,
-            options.manifest_disk_cache.clone(),
+            options.metadata_disk_cache.clone(),
             options.summary_centroids_from_superfiles,
             options.legacy_names(),
         ));
@@ -1180,6 +1180,7 @@ impl ManifestSnapshot {
                     // centroid scores come from the section.
                     let entries = slow_vector_state::load_state(
                         storage.as_ref(),
+                        options.metadata_disk_cache.as_ref(),
                         uri,
                         &hash,
                         &options.legacy_names(),
@@ -2901,7 +2902,7 @@ impl ManifestSnapshot {
             Arc::new(ManifestPartLoader::new_with_legacy_names(
                 storage.clone(),
                 &new_list,
-                opts.manifest_disk_cache.clone(),
+                opts.metadata_disk_cache.clone(),
                 false,
                 opts.legacy_names(),
             ))
@@ -3207,7 +3208,7 @@ fn section_entries(
 /// StorageProvider>` is shared with the `DiskCacheStore` —
 /// one auth handshake, one connection pool.
 ///
-/// An optional [`ManifestDiskCache`] short-circuits the storage GET
+/// An optional [`MetadataDiskCache`] short-circuits the storage GET
 /// when the part's compressed bytes are already on local disk. Because
 /// parts are content-addressed, a cache hit can never be stale.
 /// Decoded manifest parts a commit carries into the next snapshot.
@@ -3292,7 +3293,7 @@ pub struct ManifestPartLoader {
     /// On-disk cache for compressed part bytes. `None` disables the
     /// cache (in-process-only supertables, tests, or storage attached
     /// without a `disk_cache_root` configured).
-    manifest_disk_cache: Option<Arc<ManifestDiskCache>>,
+    metadata_disk_cache: Option<Arc<MetadataDiskCache>>,
     /// Consumer memory mode (`summary_centroids_from_superfiles`): load
     /// each part's routing sibling (counts + 1-bit slab, no fp32) when
     /// the list stamps one. Writer handles keep this off — part rebuilds
@@ -3325,9 +3326,9 @@ impl ManifestPartLoader {
     pub fn new_with_cache(
         storage: Arc<dyn StorageProvider>,
         list: &Manifest,
-        manifest_disk_cache: Option<Arc<ManifestDiskCache>>,
+        metadata_disk_cache: Option<Arc<MetadataDiskCache>>,
     ) -> Self {
-        Self::new_with_cache_and_mode(storage, list, manifest_disk_cache, false)
+        Self::new_with_cache_and_mode(storage, list, metadata_disk_cache, false)
     }
 
     /// Like [`Self::new_with_cache`] with the consumer routing mode
@@ -3336,13 +3337,13 @@ impl ManifestPartLoader {
     pub fn new_with_cache_and_mode(
         storage: Arc<dyn StorageProvider>,
         list: &Manifest,
-        manifest_disk_cache: Option<Arc<ManifestDiskCache>>,
+        metadata_disk_cache: Option<Arc<MetadataDiskCache>>,
         prefer_routing: bool,
     ) -> Self {
         Self::new_with_legacy_names(
             storage,
             list,
-            manifest_disk_cache,
+            metadata_disk_cache,
             prefer_routing,
             LegacyNames::none(),
         )
@@ -3354,7 +3355,7 @@ impl ManifestPartLoader {
     pub fn new_with_legacy_names(
         storage: Arc<dyn StorageProvider>,
         list: &Manifest,
-        manifest_disk_cache: Option<Arc<ManifestDiskCache>>,
+        metadata_disk_cache: Option<Arc<MetadataDiskCache>>,
         prefer_routing: bool,
         legacy: LegacyNames,
     ) -> Self {
@@ -3376,7 +3377,7 @@ impl ManifestPartLoader {
         }
         // Holds every part of the list, so a full load reuses the cache
         // instead of evicting parts before the next load reads them.
-        if let Some(cache) = &manifest_disk_cache {
+        if let Some(cache) = &metadata_disk_cache {
             cache.raise_budget(
                 part_bytes.saturating_add(part_bytes / MANIFEST_CACHE_HEADROOM_DIVISOR),
             );
@@ -3384,7 +3385,7 @@ impl ManifestPartLoader {
         Self {
             storage,
             parts_index: idx,
-            manifest_disk_cache,
+            metadata_disk_cache,
             prefer_routing,
             open_blob_budget: Arc::new(OpenBlobBudget::new(DEFAULT_OPEN_BLOB_BUDGET_BYTES)),
             term_index: tokio::sync::Mutex::new(None),
@@ -3412,7 +3413,7 @@ impl ManifestPartLoader {
         }
         match TermIndex::load(
             Arc::clone(&self.storage),
-            self.manifest_disk_cache.clone(),
+            self.metadata_disk_cache.clone(),
             reference,
         )
         .await
@@ -3506,7 +3507,7 @@ impl ManifestPartLoader {
     ) -> Result<ManifestPart, ManifestLoadError> {
         // Disk-cache hit: bytes are verified against `expected_hash`
         // inside `get`, so they're known-good here.
-        if let Some(cache) = &self.manifest_disk_cache
+        if let Some(cache) = &self.metadata_disk_cache
             && let Some(bytes) = cache.get(expected_hash).await
         {
             record("cache_hit", true);
@@ -3539,7 +3540,7 @@ impl ManifestPartLoader {
         .await?;
         // Populate the cache for next time (best-effort; the hash was
         // verified above, satisfying `put`'s contract).
-        if let Some(cache) = &self.manifest_disk_cache {
+        if let Some(cache) = &self.metadata_disk_cache {
             cache.put(*expected_hash, bytes).await;
         }
         Ok(parsed)
@@ -3552,7 +3553,7 @@ impl ManifestPartLoader {
         &self,
         reference: &SummariesRef,
     ) -> Result<Arc<SummariesSection>, ManifestLoadError> {
-        if let Some(cache) = &self.manifest_disk_cache
+        if let Some(cache) = &self.metadata_disk_cache
             && let Some(bytes) = cache.get(&reference.content_hash).await
         {
             let section = parse_summaries_off_thread(Bytes::from(bytes), None).await?;
@@ -3565,7 +3566,7 @@ impl ManifestPartLoader {
             .map_err(ManifestLoadError::Storage)?;
         let section =
             parse_summaries_off_thread(bytes.clone(), Some(reference.content_hash)).await?;
-        if let Some(cache) = &self.manifest_disk_cache {
+        if let Some(cache) = &self.metadata_disk_cache {
             cache.put(reference.content_hash, bytes).await;
         }
         Ok(Arc::new(section))
@@ -7299,7 +7300,7 @@ mod tests {
             let cache_root = std::env::temp_dir()
                 .join("infino-manifest-cache-loader-test-disk_cache_hit_second_loader");
             let _ = std::fs::remove_dir_all(&cache_root);
-            let cache = ManifestDiskCache::new(cache_root.clone(), 1 << 20).expect("cache");
+            let cache = MetadataDiskCache::new(cache_root.clone(), 1 << 20).expect("cache");
 
             // Loader A: cold — one storage GET, cache populated.
             let loader_a = ManifestPartLoader::new_with_cache(
@@ -7342,7 +7343,7 @@ mod tests {
             let cache_root = std::env::temp_dir()
                 .join("infino-manifest-cache-loader-test-grows_to_hold_every_part");
             let _ = std::fs::remove_dir_all(&cache_root);
-            let cache = ManifestDiskCache::new(cache_root.clone(), 1).expect("cache");
+            let cache = MetadataDiskCache::new(cache_root.clone(), 1).expect("cache");
 
             for _ in 0..2 {
                 let loader = ManifestPartLoader::new_with_cache(
@@ -8540,7 +8541,7 @@ mod tests {
             make_superfile_entry(100, hash_bucket_0_pk()),
             make_superfile_entry(50, hash_bucket_0_pk()),
         ];
-        let published = slow_vector_state::write_state(storage.as_ref(), &entries, None)
+        let published = slow_vector_state::write_state(storage.as_ref(), None, &entries, None)
             .await
             .expect("write blob");
         let (blob_uri, blob_hash) = (published.uri, published.content_hash);
@@ -8612,7 +8613,7 @@ mod tests {
     async fn state_blob_hydrates_stripped_for_all_consumers() {
         let (_dir, storage) = local_storage();
         let entries = vec![make_summary_entry(100), make_summary_entry(50)];
-        let published = slow_vector_state::write_state(storage.as_ref(), &entries, None)
+        let published = slow_vector_state::write_state(storage.as_ref(), None, &entries, None)
             .await
             .expect("write blobs");
         persist_two_entry_table(
@@ -9307,7 +9308,7 @@ mod tests {
             make_superfile_entry(100, hash_bucket_0_pk()),
             make_superfile_entry(50, hash_bucket_0_pk()),
         ];
-        let published = slow_vector_state::write_state(storage.as_ref(), &entries, None)
+        let published = slow_vector_state::write_state(storage.as_ref(), None, &entries, None)
             .await
             .expect("write blob");
         let (blob_uri, blob_hash) = (published.uri, published.content_hash);

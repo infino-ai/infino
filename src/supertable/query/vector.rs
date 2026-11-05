@@ -4658,6 +4658,7 @@ impl SupertableReader {
         let entries = manifest.get_all_superfiles();
         match fetch_centroid_section(
             storage.as_ref(),
+            manifest.options.metadata_disk_cache.as_ref(),
             &reference,
             entries,
             &manifest.options.scratch_dir(),

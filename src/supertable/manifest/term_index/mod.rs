@@ -94,7 +94,7 @@ use crate::{
     supertable::{
         error::QueryError,
         manifest::{
-            ManifestSnapshot, RoutingRef, SuperfileEntry, disk_cache::ManifestDiskCache,
+            ManifestSnapshot, RoutingRef, SuperfileEntry, disk_cache::MetadataDiskCache,
             part::ContentHash,
         },
         optimize::compact::MERGE_MEMORY_RESERVE_PERCENT,
@@ -422,7 +422,7 @@ async fn put_content_addressed(
     Ok(crate::supertable::writer::put_content_addressed(
         storage,
         |hash| object_uri(kind, hash),
-        bytes,
+        bytes.into(),
     )
     .await?)
 }
@@ -2231,7 +2231,7 @@ pub(crate) fn spill_tiers(
 /// gets.
 async fn fetch_verified(
     storage: &dyn StorageProvider,
-    disk_cache: Option<&Arc<ManifestDiskCache>>,
+    disk_cache: Option<&Arc<MetadataDiskCache>>,
     uri: &str,
     hash: &ContentHash,
 ) -> Result<Bytes, TermIndexError> {
@@ -2301,7 +2301,7 @@ pub(crate) struct TermIndex {
     /// and is routed the old way.
     indexed: HashMap<Uuid, i128>,
     storage: Arc<dyn StorageProvider>,
-    disk_cache: Option<Arc<ManifestDiskCache>>,
+    disk_cache: Option<Arc<MetadataDiskCache>>,
     /// Fetched slices by content hash; see [`RESIDENT_SLICE_BUDGET_BYTES`].
     slices: tokio::sync::Mutex<Resident<ContentHash, Bytes>>,
     /// Fetched tier chunks — directory and bodies — by `(tier object, chunk
@@ -2377,7 +2377,7 @@ impl TermIndex {
         root: Root,
         root_uri: String,
         storage: Arc<dyn StorageProvider>,
-        disk_cache: Option<Arc<ManifestDiskCache>>,
+        disk_cache: Option<Arc<MetadataDiskCache>>,
     ) -> Self {
         let indexed = root
             .superfiles
@@ -2408,7 +2408,7 @@ impl TermIndex {
     /// manifest disk cache when one is attached.
     pub(crate) async fn load(
         storage: Arc<dyn StorageProvider>,
-        disk_cache: Option<Arc<ManifestDiskCache>>,
+        disk_cache: Option<Arc<MetadataDiskCache>>,
         reference: &RoutingRef,
     ) -> Result<Self, TermIndexError> {
         let bytes = fetch_verified(
@@ -6171,17 +6171,17 @@ mod tests {
     /// afterwards: with the object gone from storage, a fresh index over
     /// the same cache still answers, and one without the cache does not.
     #[test]
-    fn slices_are_served_from_the_manifest_disk_cache_once_fetched() {
+    fn slices_are_served_from_the_metadata_disk_cache_once_fetched() {
         use std::fs;
 
-        use crate::supertable::manifest::disk_cache::ManifestDiskCache;
+        use crate::supertable::manifest::disk_cache::MetadataDiskCache;
 
         let (dir, storage, st) = fresh_table();
         commit_layer(&st, 0);
         let rt = tokio::runtime::Runtime::new().expect("runtime");
         let (_, root) = live_and_covered(&st, &storage, &rt);
         let cache_dir = TempDir::new().expect("cache dir");
-        let cache = ManifestDiskCache::new(cache_dir.path().to_path_buf(), 1 << 30).expect("cache");
+        let cache = MetadataDiskCache::new(cache_dir.path().to_path_buf(), 1 << 30).expect("cache");
         let warm = TermIndex::new(
             root.clone(),
             String::new(),

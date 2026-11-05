@@ -37,7 +37,7 @@ use std::{
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt, stream};
 use tempfile::{Builder as TempFileBuilder, NamedTempFile};
-use tokio::task::spawn_blocking;
+use tokio::{fs as async_fs, task::spawn_blocking};
 use uuid::Uuid;
 
 #[cfg(feature = "graph-index")]
@@ -50,6 +50,7 @@ use crate::{
     supertable::{
         manifest::{
             SuperfileEntry, VectorSummary,
+            disk_cache::MetadataDiskCache,
             encoding::SummaryWireMode,
             list::RoutingRef,
             part::{self, ContentHash, ManifestPart, PartId},
@@ -89,9 +90,27 @@ const STRIPED_FETCH_MAX_IN_FLIGHT: usize = 16;
 /// the spills a crashed process left behind.
 const SPILL_FILE_PREFIX: &str = "centroid-section-";
 
+/// File-name prefix of a slow vector-state blob; the content hash follows.
+const BLOB_NAME_PREFIX: &str = "state-";
+
+/// File-name suffix of a slow vector-state blob.
+const BLOB_NAME_SUFFIX: &str = ".bin";
+
 /// Object-storage path for a content-addressed slow vector-state blob.
 pub(crate) fn storage_path(hash: &ContentHash) -> String {
-    format!("{STORAGE_PREFIX}state-{}.bin", hash.to_hex())
+    format!(
+        "{STORAGE_PREFIX}{BLOB_NAME_PREFIX}{}{BLOB_NAME_SUFFIX}",
+        hash.to_hex()
+    )
+}
+
+/// The content hash a [`storage_path`] names, or `None` for any other key.
+pub(crate) fn content_hash_of_path(path: &str) -> Option<ContentHash> {
+    let hex = path
+        .strip_prefix(STORAGE_PREFIX)?
+        .strip_prefix(BLOB_NAME_PREFIX)?
+        .strip_suffix(BLOB_NAME_SUFFIX)?;
+    ContentHash::from_hex(hex)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -241,7 +260,7 @@ pub(crate) fn decode_state(
 
 async fn write_bytes(
     storage: &dyn StorageProvider,
-    bytes: Vec<u8>,
+    bytes: Bytes,
 ) -> Result<(String, ContentHash), SlowVectorStateError> {
     let reference = crate::supertable::writer::put_content_addressed(storage, storage_path, bytes)
         .await
@@ -522,53 +541,41 @@ fn remove_orphaned_spills(dir: &Path) {
 /// over `entries` (which must be the same visible membership, in the same
 /// order, that [`write_state`] published — the size cross-check fails
 /// loudly on any drift and callers fall back to per-superfile reads).
+/// The section is read from `cache` when it holds it, and kept there
+/// when fetched.
 pub(crate) async fn fetch_centroid_section(
     storage: &dyn StorageProvider,
+    cache: Option<&Arc<MetadataDiskCache>>,
     reference: &RoutingRef,
     entries: &[Arc<SuperfileEntry>],
     scratch_dir: &Path,
 ) -> Result<CentroidSection, SlowVectorStateError> {
-    let store_err = |e: StorageError| SlowVectorStateError::Storage(e.to_string());
     let io_err = |e: io::Error| SlowVectorStateError::Storage(format!("section spill: {e}"));
     let expected_len = section_len(entries) as u64;
-    let meta = storage.head(&reference.uri).await.map_err(store_err)?;
-    if meta.size != expected_len {
-        return Err(SlowVectorStateError::Parse(format!(
-            "centroid section is {} bytes, membership walk expects {expected_len}",
-            meta.size
-        )));
-    }
-
     let spill = create_spill(scratch_dir).map_err(|e| {
         SlowVectorStateError::Storage(format!(
             "centroid section spill under {}: {e}",
             scratch_dir.display()
         ))
     })?;
-    let mut hasher = blake3::Hasher::new();
-    // Same striping policy as [`fetch_blob_striped`]: parallel range-GETs,
-    // bounded in flight. `buffered` yields chunks in range order, so each
-    // is hashed and written at its offset as it lands, then dropped —
-    // peak memory stays at in-flight × chunk, never the whole section.
-    let ranges = striped_ranges(meta.size, STRIPED_FETCH_CHUNK_BYTES);
-    let mut chunks = stream::iter(ranges.into_iter().map(|range| {
-        let uri = &reference.uri;
-        async move {
-            let offset = range.start;
-            storage.get_range(uri, range).await.map(|b| (offset, b))
+    let cached = match cache {
+        Some(cache) => cache.get(&reference.content_hash).await,
+        None => None,
+    };
+    match cached {
+        Some(bytes) => {
+            check_section_len(bytes.len() as u64, expected_len)?;
+            spill.as_file().write_all_at(&bytes, 0).map_err(io_err)?;
         }
-    }))
-    .buffered(STRIPED_FETCH_MAX_IN_FLIGHT);
-    while let Some(chunk) = chunks.next().await {
-        let (offset, bytes) = chunk.map_err(store_err)?;
-        hasher.update(&bytes);
-        spill
-            .as_file()
-            .write_all_at(&bytes, offset)
-            .map_err(io_err)?;
-    }
-    if ContentHash(*hasher.finalize().as_bytes()) != reference.content_hash {
-        return Err(SlowVectorStateError::HashMismatch);
+        None => {
+            fetch_section_into(storage, reference, expected_len, &spill).await?;
+            if let Some(cache) = cache
+                && expected_len <= cache.budget_bytes()
+                && let Ok(bytes) = async_fs::read(spill.path()).await
+            {
+                cache.put(reference.content_hash, bytes.into()).await;
+            }
+        }
     }
 
     let mut cells: HashMap<(Uuid, FieldId), Vec<SectionCell>> = HashMap::new();
@@ -595,6 +602,57 @@ pub(crate) async fn fetch_centroid_section(
     })
 }
 
+/// Fail when a section of `len` bytes does not match the `expected_len` the
+/// membership walk computes.
+fn check_section_len(len: u64, expected_len: u64) -> Result<(), SlowVectorStateError> {
+    if len != expected_len {
+        return Err(SlowVectorStateError::Parse(format!(
+            "centroid section is {len} bytes, membership walk expects {expected_len}"
+        )));
+    }
+    Ok(())
+}
+
+/// Fetch the section at `reference` from storage into `spill`, verifying its
+/// size and hash.
+async fn fetch_section_into(
+    storage: &dyn StorageProvider,
+    reference: &RoutingRef,
+    expected_len: u64,
+    spill: &NamedTempFile,
+) -> Result<(), SlowVectorStateError> {
+    let store_err = |e: StorageError| SlowVectorStateError::Storage(e.to_string());
+    let io_err = |e: io::Error| SlowVectorStateError::Storage(format!("section spill: {e}"));
+    let meta = storage.head(&reference.uri).await.map_err(store_err)?;
+    check_section_len(meta.size, expected_len)?;
+    let mut hasher = blake3::Hasher::new();
+    // Same striping policy as [`fetch_blob_striped`]: parallel range-GETs,
+    // bounded in flight. `buffered` yields chunks in range order, so each
+    // is hashed and written at its offset as it lands, then dropped —
+    // peak memory stays at in-flight × chunk, never the whole section.
+    let ranges = striped_ranges(meta.size, STRIPED_FETCH_CHUNK_BYTES);
+    let mut chunks = stream::iter(ranges.into_iter().map(|range| {
+        let uri = &reference.uri;
+        async move {
+            let offset = range.start;
+            storage.get_range(uri, range).await.map(|b| (offset, b))
+        }
+    }))
+    .buffered(STRIPED_FETCH_MAX_IN_FLIGHT);
+    while let Some(chunk) = chunks.next().await {
+        let (offset, bytes) = chunk.map_err(store_err)?;
+        hasher.update(&bytes);
+        spill
+            .as_file()
+            .write_all_at(&bytes, offset)
+            .map_err(io_err)?;
+    }
+    if ContentHash(*hasher.finalize().as_bytes()) != reference.content_hash {
+        return Err(SlowVectorStateError::HashMismatch);
+    }
+    Ok(())
+}
+
 /// Content-address and PUT the blob for `entries` plus its routing
 /// sibling. Idempotent: URIs are hash-derived, so a raced identical PUT
 /// surfacing [`StorageError::PreconditionFailed`] means the bytes are
@@ -602,10 +660,18 @@ pub(crate) async fn fetch_centroid_section(
 /// stamp, not by these PUTs.
 pub(crate) async fn write_state(
     storage: &dyn StorageProvider,
+    cache: Option<&Arc<MetadataDiskCache>>,
     entries: &[Arc<SuperfileEntry>],
     previous_section: Option<&CentroidSection>,
 ) -> Result<PublishedState, SlowVectorStateError> {
-    write_blob_and_section(storage, encode_entries(entries), entries, previous_section).await
+    write_blob_and_section(
+        storage,
+        cache,
+        encode_entries(entries),
+        entries,
+        previous_section,
+    )
+    .await
 }
 
 /// Publish current visible membership plus an in-progress drain checkpoint in
@@ -614,12 +680,14 @@ pub(crate) async fn write_state(
 /// it, the drain-resume path reads it.
 pub(crate) async fn write_state_with_pending_drain(
     storage: &dyn StorageProvider,
+    cache: Option<&Arc<MetadataDiskCache>>,
     entries: &[Arc<SuperfileEntry>],
     pending: &PendingDrainState,
     previous_section: Option<&CentroidSection>,
 ) -> Result<PublishedState, SlowVectorStateError> {
     write_blob_and_section(
         storage,
+        cache,
         encode_checkpoint_state(entries, pending),
         entries,
         previous_section,
@@ -629,20 +697,26 @@ pub(crate) async fn write_state_with_pending_drain(
 
 /// PUT the routing-shaped state blob and the fp32 centroid section
 /// concurrently — the two-object generation described on
-/// [`PublishedState`].
+/// [`PublishedState`]. Both are also kept in `cache`.
 async fn write_blob_and_section(
     storage: &dyn StorageProvider,
+    cache: Option<&Arc<MetadataDiskCache>>,
     blob_bytes: Vec<u8>,
     entries: &[Arc<SuperfileEntry>],
     previous_section: Option<&CentroidSection>,
 ) -> Result<PublishedState, SlowVectorStateError> {
-    let centroid_bytes = compose_centroid_section(entries, previous_section)?;
+    let blob_bytes = Bytes::from(blob_bytes);
+    let centroid_bytes = Bytes::from(compose_centroid_section(entries, previous_section)?);
     let (blob, centroids) = tokio::join!(
-        write_bytes(storage, blob_bytes),
-        write_bytes(storage, centroid_bytes)
+        write_bytes(storage, blob_bytes.clone()),
+        write_bytes(storage, centroid_bytes.clone())
     );
     let (uri, content_hash) = blob?;
     let (centroids_uri, centroids_hash) = centroids?;
+    if let Some(cache) = cache {
+        cache.put(content_hash, blob_bytes).await;
+        cache.put(centroids_hash, centroid_bytes).await;
+    }
     Ok(PublishedState {
         uri,
         content_hash,
@@ -663,7 +737,7 @@ pub(crate) async fn write_resident_index_blob(
     storage: &dyn StorageProvider,
     bytes: Vec<u8>,
 ) -> Result<RoutingRef, SlowVectorStateError> {
-    let (uri, content_hash) = write_bytes(storage, bytes).await?;
+    let (uri, content_hash) = write_bytes(storage, bytes.into()).await?;
     Ok(RoutingRef { uri, content_hash })
 }
 
@@ -939,11 +1013,12 @@ pub(crate) async fn hydrate_resident_index(
 /// never fail a table open or a query.
 pub(crate) async fn load_state(
     storage: &dyn StorageProvider,
+    cache: Option<&Arc<MetadataDiskCache>>,
     uri: &str,
     expected: &ContentHash,
     legacy: &LegacyNames,
 ) -> Result<Vec<Arc<SuperfileEntry>>, SlowVectorStateError> {
-    Ok(load_full_state(storage, uri, expected, legacy)
+    Ok(load_full_state(storage, cache, uri, expected, legacy)
         .await?
         .entries)
 }
@@ -960,31 +1035,52 @@ pub(crate) async fn has_pending_drain(
     Ok(head.as_ref() == CHECKPOINT_MAGIC)
 }
 
+/// Load the blob at `uri` from `cache` when it holds it, else from storage,
+/// keeping it in `cache` once it verifies.
 pub(crate) async fn load_full_state(
     storage: &dyn StorageProvider,
+    cache: Option<&Arc<MetadataDiskCache>>,
     uri: &str,
     expected: &ContentHash,
     legacy: &LegacyNames,
 ) -> Result<SlowVectorState, SlowVectorStateError> {
-    let bytes = fetch_blob_striped(storage, uri, STRIPED_FETCH_CHUNK_BYTES).await?;
+    let cached = match cache {
+        Some(cache) => cache.get(expected).await,
+        None => None,
+    };
+    let (bytes, fetched) = match cached {
+        Some(bytes) => (Bytes::from(bytes), false),
+        None => (
+            fetch_blob_striped(storage, uri, STRIPED_FETCH_CHUNK_BYTES).await?,
+            true,
+        ),
+    };
+    let blob = bytes.clone();
     let expected = *expected;
     let legacy = legacy.clone();
     // blake3 over the whole blob plus the Avro parse is a CPU wave
     // (multi-GiB at 100M docs); run it on the blocking pool so the
     // runtime keeps driving I/O instead of stalling behind the decode.
-    match spawn_blocking(carry_span(move || {
-        if ContentHash::of(bytes.as_ref()) != expected {
+    // The cache verified a hit, so only a fetched blob is hashed here.
+    let state = match spawn_blocking(carry_span(move || {
+        if fetched && ContentHash::of(bytes.as_ref()) != expected {
             return Err(SlowVectorStateError::HashMismatch);
         }
         decode_state(bytes.as_ref(), &legacy)
     }))
     .await
     {
-        Ok(result) => result,
-        Err(join_error) => Err(SlowVectorStateError::Parse(format!(
-            "slow-state decode task failed: {join_error}"
-        ))),
+        Ok(result) => result?,
+        Err(join_error) => {
+            return Err(SlowVectorStateError::Parse(format!(
+                "slow-state decode task failed: {join_error}"
+            )));
+        }
+    };
+    if fetched && let Some(cache) = cache {
+        cache.put(expected, blob).await;
     }
+    Ok(state)
 }
 
 /// Fetch one object as bytes, striping objects larger than `chunk_bytes`
@@ -1085,6 +1181,8 @@ mod tests {
     const FIRST_N_DOCS: u64 = 42;
     /// Doc count for the second fixture entry.
     const SECOND_N_DOCS: u64 = 7;
+    /// Budget of the disk cache in the cache tests; holds every fixture.
+    const CACHE_BUDGET_BYTES: u64 = 1 << 20;
 
     fn entry(n_docs: u64, cell: u32) -> Arc<SuperfileEntry> {
         let id = Uuid::new_v4();
@@ -1210,15 +1308,20 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let scratch = tempdir().expect("scratch tempdir");
         let storage = LocalFsStorageProvider::new(dir.path()).expect("storage");
-        let published = write_state(&storage, &entries, None)
+        let published = write_state(&storage, None, &entries, None)
             .await
             .expect("publish");
         assert_eq!(published.centroids.content_hash, ContentHash::of(&section));
 
-        let fetched =
-            fetch_centroid_section(&storage, &published.centroids, &entries, scratch.path())
-                .await
-                .expect("fetch section");
+        let fetched = fetch_centroid_section(
+            &storage,
+            None,
+            &published.centroids,
+            &entries,
+            scratch.path(),
+        )
+        .await
+        .expect("fetch section");
         for entry in &entries {
             let cell = &entry.vector_summary[&fid("emb")].cells[0];
             let got = fetched
@@ -1263,7 +1366,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let storage = LocalFsStorageProvider::new(dir.path()).expect("localfs");
         let entries = vec![entry(FIRST_N_DOCS, 0), entry(SECOND_N_DOCS, 1)];
-        let uri = write_state(&storage, &entries, None)
+        let uri = write_state(&storage, None, &entries, None)
             .await
             .expect("write")
             .uri;
@@ -1329,31 +1432,34 @@ mod tests {
         let storage = LocalFsStorageProvider::new(dir.path()).expect("provider");
         let entries = vec![entry(FIRST_N_DOCS, 1)];
 
-        let published = write_state(&storage, &entries, None).await.expect("write");
+        let published = write_state(&storage, None, &entries, None)
+            .await
+            .expect("write");
         let (uri, hash) = (published.uri, published.content_hash);
         // Re-publishing identical content must succeed (PreconditionFailed
         // from the hash-derived URI is benign by construction).
-        let republished = write_state(&storage, &entries, None)
+        let republished = write_state(&storage, None, &entries, None)
             .await
             .expect("rewrite");
         assert_eq!(uri, republished.uri);
         assert_eq!(hash, republished.content_hash);
         assert_eq!(published.centroids, republished.centroids);
 
-        let loaded = load_state(&storage, &uri, &hash, &LegacyNames::none())
+        let loaded = load_state(&storage, None, &uri, &hash, &LegacyNames::none())
             .await
             .expect("load");
         assert_eq!(loaded.len(), 1);
         assert_entries_match(&loaded[0], &entries[0]);
 
         let wrong = ContentHash::of(b"wrong");
-        let err = load_state(&storage, &uri, &wrong, &LegacyNames::none())
+        let err = load_state(&storage, None, &uri, &wrong, &LegacyNames::none())
             .await
             .expect_err("hash mismatch");
         assert!(matches!(err, SlowVectorStateError::HashMismatch), "{err:?}");
 
         let missing = load_state(
             &storage,
+            None,
             "slow-vector-state/absent.bin",
             &hash,
             &LegacyNames::none(),
@@ -1380,7 +1486,9 @@ mod tests {
             .expect("write-time slab")
             .clone();
 
-        let published = write_state(&storage, &entries, None).await.expect("write");
+        let published = write_state(&storage, None, &entries, None)
+            .await
+            .expect("write");
         assert_ne!(
             published.uri, published.centroids.uri,
             "state blob and centroid section are distinct objects"
@@ -1401,6 +1509,7 @@ mod tests {
 
         let loaded = load_state(
             &storage,
+            None,
             &published.uri,
             &published.content_hash,
             &LegacyNames::none(),
@@ -1427,11 +1536,12 @@ mod tests {
             metadata: b"epoch".to_vec(),
             entries: vec![entry_with_summary(SECOND_N_DOCS, 2)],
         };
-        let checkpoint = write_state_with_pending_drain(&storage, &entries, &pending, None)
+        let checkpoint = write_state_with_pending_drain(&storage, None, &entries, &pending, None)
             .await
             .expect("checkpoint write");
         let state = load_full_state(
             &storage,
+            None,
             &checkpoint.uri,
             &checkpoint.content_hash,
             &LegacyNames::none(),
@@ -1463,7 +1573,9 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let storage = LocalFsStorageProvider::new(dir.path()).expect("provider");
         let entries = vec![entry_with_summary(FIRST_N_DOCS, 1)];
-        let settled = write_state(&storage, &entries, None).await.expect("write");
+        let settled = write_state(&storage, None, &entries, None)
+            .await
+            .expect("write");
         assert!(
             !has_pending_drain(&storage, &settled.uri)
                 .await
@@ -1473,7 +1585,7 @@ mod tests {
             metadata: b"epoch".to_vec(),
             entries: vec![entry_with_summary(SECOND_N_DOCS, 2)],
         };
-        let checkpoint = write_state_with_pending_drain(&storage, &entries, &pending, None)
+        let checkpoint = write_state_with_pending_drain(&storage, None, &entries, &pending, None)
             .await
             .expect("checkpoint write");
         assert!(
@@ -1496,7 +1608,7 @@ mod tests {
             entry_with_summary(FIRST_N_DOCS, 1),
             entry_with_summary(SECOND_N_DOCS, 6),
         ];
-        let published = write_state(&storage, &resident, None)
+        let published = write_state(&storage, None, &resident, None)
             .await
             .expect("first publish");
         let expected_section = compose_centroid_section(&resident, None).expect("resident bytes");
@@ -1505,6 +1617,7 @@ mod tests {
         // shape a writer's hydrated manifest carries at republish time.
         let stripped = load_state(
             &storage,
+            None,
             &published.uri,
             &published.content_hash,
             &LegacyNames::none(),
@@ -1524,10 +1637,15 @@ mod tests {
             "no fp32 source must fail loudly, never publish a hole"
         );
 
-        let previous =
-            fetch_centroid_section(&storage, &published.centroids, &resident, scratch.path())
-                .await
-                .expect("fetch previous section");
+        let previous = fetch_centroid_section(
+            &storage,
+            None,
+            &published.centroids,
+            &resident,
+            scratch.path(),
+        )
+        .await
+        .expect("fetch previous section");
         let composed =
             compose_centroid_section(&stripped, Some(&previous)).expect("compose from previous");
         assert_eq!(
@@ -1535,7 +1653,7 @@ mod tests {
             "carried-forward cells must compose byte-identical fp32"
         );
 
-        let republished = write_state(&storage, &stripped, Some(&previous))
+        let republished = write_state(&storage, None, &stripped, Some(&previous))
             .await
             .expect("republish from stripped");
         assert_eq!(
@@ -1543,5 +1661,93 @@ mod tests {
             ContentHash::of(&expected_section),
             "republished section must address the same fp32 bytes"
         );
+    }
+
+    #[tokio::test]
+    async fn published_state_is_read_back_from_the_cache() {
+        let dir = tempdir().expect("tempdir");
+        let storage = LocalFsStorageProvider::new(dir.path().join("store")).expect("storage");
+        let cache =
+            MetadataDiskCache::new(dir.path().join("cache"), CACHE_BUDGET_BYTES).expect("cache");
+        let entries = vec![
+            entry_with_summary(FIRST_N_DOCS, 1),
+            entry_with_summary(SECOND_N_DOCS, 6),
+        ];
+        let published = write_state(&storage, Some(&cache), &entries, None)
+            .await
+            .expect("publish");
+        storage.delete(&published.uri).await.expect("delete blob");
+        storage
+            .delete(&published.centroids.uri)
+            .await
+            .expect("delete section");
+
+        let loaded = load_state(
+            &storage,
+            Some(&cache),
+            &published.uri,
+            &published.content_hash,
+            &LegacyNames::none(),
+        )
+        .await
+        .expect("load from cache");
+        assert_eq!(loaded.len(), entries.len());
+        let section = fetch_centroid_section(
+            &storage,
+            Some(&cache),
+            &published.centroids,
+            &entries,
+            &dir.path().join("scratch"),
+        )
+        .await
+        .expect("section from cache");
+        let cell = &entries[0].vector_summary[&fid("emb")].cells[0];
+        let got = section
+            .read_cell(entries[0].superfile_id, fid("emb"), cell.cell_id)
+            .expect("spill read")
+            .expect("cell served");
+        assert_eq!(got, cell.clusters.centroids);
+    }
+
+    #[tokio::test]
+    async fn fetched_state_is_kept_in_the_cache() {
+        let dir = tempdir().expect("tempdir");
+        let storage = LocalFsStorageProvider::new(dir.path().join("store")).expect("storage");
+        let cache =
+            MetadataDiskCache::new(dir.path().join("cache"), CACHE_BUDGET_BYTES).expect("cache");
+        let entries = vec![entry_with_summary(FIRST_N_DOCS, 1)];
+        let published = write_state(&storage, None, &entries, None)
+            .await
+            .expect("publish");
+
+        load_state(
+            &storage,
+            Some(&cache),
+            &published.uri,
+            &published.content_hash,
+            &LegacyNames::none(),
+        )
+        .await
+        .expect("load");
+        fetch_centroid_section(
+            &storage,
+            Some(&cache),
+            &published.centroids,
+            &entries,
+            &dir.path().join("scratch"),
+        )
+        .await
+        .expect("section");
+
+        assert!(cache.get(&published.content_hash).await.is_some());
+        assert!(cache.get(&published.centroids.content_hash).await.is_some());
+    }
+
+    #[test]
+    fn a_storage_path_names_its_content_hash() {
+        let hash = ContentHash::of(b"state");
+        assert_eq!(content_hash_of_path(&storage_path(&hash)), Some(hash));
+        assert_eq!(content_hash_of_path("slow-vector-state/absent.bin"), None);
+        assert_eq!(content_hash_of_path("data/state-00.bin"), None);
     }
 }
