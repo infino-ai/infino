@@ -104,8 +104,8 @@ use crate::{
         format::{
             self,
             footer::{
-                BodyPlan, EncodedBody, ParquetLayout, PlannedBodyEncoder, RangeStream,
-                encode_parquet_body_planned, extract_kv_map, splice_carried_body_to,
+                BodyPlan, EncodedBody, HELD_GROUP_BYTES, ParquetLayout, PlannedBodyEncoder,
+                RangeStream, encode_parquet_body_planned, extract_kv_map, splice_carried_body_to,
                 splice_index_streams_to,
             },
             kv,
@@ -179,6 +179,14 @@ fn decoded_batches_ahead(schema: &Schema) -> usize {
         .unwrap_or(DECODED_BATCHES_AHEAD)
         .clamp(1, DECODED_BATCHES_AHEAD)
 }
+
+/// The most decoded rows a merge holds at once: the batches decoded ahead,
+/// the rows its body encoder holds to choose dictionaries, and the rows it
+/// holds before encoding them, each bounded by bytes. However many rows a
+/// merge has and however wide they are, this window is all of them that
+/// is decoded at a time.
+pub(crate) const MERGE_DECODED_WINDOW_BYTES: u64 =
+    DECODED_AHEAD_BYTES + 2 * HELD_GROUP_BYTES as u64;
 
 /// Bytes in a mebibyte, for the merge memory budget the config states in MiB.
 const BYTES_PER_MIB: u64 = 1 << 20;
