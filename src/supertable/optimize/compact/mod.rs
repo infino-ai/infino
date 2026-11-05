@@ -15,10 +15,10 @@ use std::{
     mem,
     pin::pin,
     sync::{
-        Arc, OnceLock,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
-    thread,
+    thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
@@ -33,7 +33,7 @@ use roaring::RoaringBitmap;
 use tempfile::NamedTempFile;
 use tokio::{
     sync::Semaphore,
-    task::{Id as TaskId, JoinError, JoinSet},
+    task::{self, Id as TaskId, JoinError, JoinSet},
     time,
 };
 #[cfg(feature = "detailed-tracing")]
@@ -129,6 +129,61 @@ impl Supertable {
         match outstanding.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed) {
             Ok(_) => Some(CompactionSlot(outstanding)),
             Err(_) => None,
+        }
+    }
+}
+
+/// What finished compaction commits are done with, being dropped on threads
+/// of their own: a batch's spilled term contributions and its term-index
+/// layer are scratch files of many gigabytes, still in the page cache, and
+/// unlinking them evicts it. Dropped by the commit, they held it for seconds
+/// past its publish; on a thread, the pass's next commit need not wait.
+///
+/// The threads are joined before the merge step of a pass returns, so a
+/// process that exits once optimize returns has unlinked every one of those
+/// files. Threads a pass did not join, because it was dropped part way, are
+/// joined by the next pass or when the table goes.
+#[derive(Default)]
+pub(crate) struct RetiredScratch(Mutex<Vec<JoinHandle<()>>>);
+
+impl RetiredScratch {
+    /// Drop `done_with` on a thread of its own.
+    fn retire<T: Send + 'static>(&self, done_with: T) {
+        let dropping = thread::spawn(move || drop(done_with));
+        let mut threads = self.0.lock().expect("retired scratch");
+        threads.retain(|thread| !thread.is_finished());
+        threads.push(dropping);
+    }
+
+    fn take(&self) -> Vec<JoinHandle<()>> {
+        mem::take(&mut *self.0.lock().expect("retired scratch"))
+    }
+
+    /// Wait for every drop retired so far, off the async runtime's threads.
+    async fn settle(&self) {
+        let threads = self.take();
+        if threads.is_empty() {
+            return;
+        }
+        if let Err(error) = task::spawn_blocking(move || join_retired(threads)).await {
+            warn!(%error, "compact: joining the retired scratch drops failed");
+        }
+    }
+}
+
+impl Drop for RetiredScratch {
+    fn drop(&mut self) {
+        join_retired(self.take());
+    }
+}
+
+/// Join `threads`, skipping the calling thread's own: the drop it runs can
+/// release the table's last handle, and with it this very list.
+fn join_retired(threads: Vec<JoinHandle<()>>) {
+    let current = thread::current().id();
+    for dropping in threads {
+        if dropping.thread().id() != current && dropping.join().is_err() {
+            warn!("compact: a retired scratch drop panicked");
         }
     }
 }
@@ -597,9 +652,13 @@ impl Supertable {
                 if phase_timers {
                     __pt = Instant::now();
                 }
-                table
+                let merged = table
                     .run_compaction_jobs(jobs, stale_seal_timeout, concurrency)
-                    .await?;
+                    .await;
+                // The commits' scratch files are gone before the pass goes
+                // on, failed or not.
+                inner.retired_scratch.settle().await;
+                merged?;
                 if phase_timers {
                     info!(secs = __pt.elapsed().as_secs_f64(), "[optphase]   merge");
                 }
@@ -1435,19 +1494,15 @@ impl Supertable {
                             .expect("term-index objects seen")
                             .extend(layer.written_objects());
                     }
-                    // What the commit is done with goes on a thread of its own.
-                    // The batch's spilled term contributions and the layer's
-                    // spilled objects are scratch files of many gigabytes,
-                    // still in the page cache, and unlinking them evicts it:
-                    // dropped here, they held a finished commit for seconds.
-                    let done_with = (
+                    // What the commit is done with is dropped off its path;
+                    // see [`RetiredScratch`].
+                    inner.retired_scratch.retire((
                         mem::take(&mut batch),
                         mem::take(&mut term_contributions),
                         reserved_layer.take(),
                         mem::take(&mut rebuilt_parts),
                         mem::take(&mut pending_storage_writes),
-                    );
-                    thread::spawn(move || drop(done_with));
+                    ));
 
                     return match deferred_error {
                         Some(e) => Err(e),
@@ -2971,7 +3026,8 @@ mod tests {
                 commit::{
                     MANIFEST_PARTS_DIR, POINTER_PATH, get_current_manifest_etag, manifest_uri,
                 },
-                term_index::STORAGE_PREFIX as TERM_INDEX_PREFIX,
+                part::ContentHash,
+                term_index::{self, STORAGE_PREFIX as TERM_INDEX_PREFIX, slice_uri, tier_uri},
             },
             reader_cache::{DiskCacheConfig, DiskCacheStore, LruPolicy},
             schema::{
@@ -2979,7 +3035,7 @@ mod tests {
                 change::{FieldPatch, SchemaPatch},
             },
             storage::{LocalFsStorageProvider, StorageProvider},
-            writer::persist_commit_async,
+            writer::{persist_commit_async, stamp_term_index},
         },
         test_helpers::{
             build_title_batch, copy_dir_recursive, default_supertable_options,
@@ -7755,6 +7811,72 @@ mod tests {
         assert_eq!(dropped, 1, "the pass reports the dropped job");
         assert_eq!(listed_ids(&st).len(), PAIR + DROP_TEST_JOBS - 1);
         assert_untouched(&dir, &st, &dropped_inputs).await;
+    }
+
+    /// The slice and tier objects the table's term index names.
+    async fn term_index_objects(st: &Supertable) -> HashSet<ContentHash> {
+        let manifest = st.inner().manifest.load_full();
+        let storage = manifest.options.storage.as_ref().expect("storage");
+        let root = term_index::load_root(
+            storage.as_ref(),
+            manifest.term_index_ref().expect("a term index"),
+        )
+        .await
+        .expect("root");
+        root.layers
+            .iter()
+            .flat_map(|layer| &layer.slices)
+            .flat_map(|slice| [Some(slice.content_hash), slice.tier])
+            .flatten()
+            .collect()
+    }
+
+    /// A compaction commit records the slice and tier objects of the
+    /// term-index layer it wrote as seen, so the term-index refresh that
+    /// follows checks none of them on storage.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_compaction_marks_its_layer_seen_so_the_refresh_asks_storage_nothing_of_it() {
+        let dir = TempDir::new().expect("tempdir");
+        let (faults, st, jobs) = fault_st_with_pair_jobs(&dir, 1);
+        let before = term_index_objects(&st).await;
+
+        st.run_compaction_jobs(jobs, DEFAULT_STALE_SEAL_TIMEOUT, 1)
+            .await
+            .expect("compact");
+
+        let written: HashSet<ContentHash> = term_index_objects(&st)
+            .await
+            .difference(&before)
+            .copied()
+            .collect();
+        assert!(!written.is_empty(), "the compaction wrote a layer");
+        let seen = st
+            .inner()
+            .term_index_objects_seen
+            .lock()
+            .expect("seen")
+            .clone();
+        assert!(
+            written.is_subset(&seen),
+            "every object of the compaction's layer is recorded as seen"
+        );
+        let asked = Arc::new(AtomicUsize::new(0));
+        for hash in &written {
+            for uri in [slice_uri(hash), tier_uri(hash)] {
+                let asked = Arc::clone(&asked);
+                faults.before(FaultOp::Head, &uri, move || {
+                    asked.fetch_add(1, Ordering::SeqCst);
+                });
+            }
+        }
+        stamp_term_index(st.inner(), u64::MAX)
+            .await
+            .expect("refresh the term index");
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            0,
+            "the refresh asked storage about an object the compaction wrote"
+        );
     }
 
     /// Jobs dropped at upload and batches dropped at commit count toward the

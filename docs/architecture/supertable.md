@@ -443,7 +443,9 @@ full-text and vector indexes, on a worker pool.
 range, scalar statistics, and the full-text and vector summaries.
 - **Publish.** The superfile bytes are written to the storage backend and
 a successor manifest containing the existing and new entries is
-published atomically.
+published atomically. A commit sealed from rows indexed as they were
+appended starts each superfile's upload as soon as that superfile is
+built, and publishes the manifest only after every upload has landed.
 
 ## Index repair
 

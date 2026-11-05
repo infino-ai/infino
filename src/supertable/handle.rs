@@ -60,6 +60,7 @@ use crate::{
         ManifestLoadError, SuperfileUri, SupertableStats,
         gc::superseded::Superseded,
         manifest::commit::{PointerProbe, probe_pointer, read_pointer},
+        optimize::compact::RetiredScratch,
         options::Consistency,
         query::{
             fts::GlobalIdfCache,
@@ -274,6 +275,10 @@ pub(super) struct SupertableInner {
     /// by content hash: maintenance checks that the objects its root names
     /// are there, and asks storage only about the ones not found before.
     pub(super) term_index_objects_seen: Mutex<HashSet<ContentHash>>,
+    /// Compaction commits' leftovers being dropped off their path, joined
+    /// before a pass returns and, failing that, when the table goes. See
+    /// [`RetiredScratch`].
+    pub(super) retired_scratch: RetiredScratch,
 }
 
 /// What a table handle knows of one hidden companion table.
@@ -2271,6 +2276,7 @@ async fn build_handle(
         hidden_deleted_cache: Mutex::new(None),
         sql_schemas: ArcSwapOption::empty(),
         term_index_objects_seen: Mutex::default(),
+        retired_scratch: RetiredScratch::default(),
     });
     install_disk_cache_pinning(&inner);
     let st = Supertable { inner };

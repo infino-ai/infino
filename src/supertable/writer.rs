@@ -103,6 +103,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tempfile::{NamedTempFile, TempDir};
 use tokio::{
+    runtime::Runtime,
     spawn,
     sync::{
         Notify, Semaphore,
@@ -2791,12 +2792,21 @@ impl SupertableWriter {
         // soon as it is built, while the commit's other pieces are still
         // building: the upload of the last pieces is then all an append
         // waits for between its seal and its publish, where it waited for
-        // every piece's. A commit that fails after an upload started leaves
-        // that superfile unlisted, as a failed publish leaves the ones it
-        // wrote; the storage reclaim removes it.
-        let (inner, runtime) = (Arc::clone(&self.inner), self.inner.query_runtime());
+        // every piece's. The uploads are gathered as they start rather than
+        // returned with their pieces, so a commit that fails part way still
+        // holds every one it started, and waits them out before it reports
+        // the failure: what landed is unlisted, as a failed publish leaves
+        // the superfiles it wrote, and the storage sweep reclaims it.
+        let runtime = self.inner.query_runtime();
+        let started: Arc<Mutex<Vec<SuperfileUpload>>> = Arc::default();
+        let (inner, piece_runtime, piece_uploads) = (
+            Arc::clone(&self.inner),
+            Arc::clone(&runtime),
+            Arc::clone(&started),
+        );
+        let fan_out = Arc::new(Semaphore::new(commit_write_concurrency().get()));
         let piece_stem = stem.map(str::to_owned);
-        let sealed_pieces: Vec<(Option<PreparedSuperfile>, Option<SuperfileUpload>)> = run_spawned(
+        let sealed_pieces = run_spawned(
             pool,
             (0..n_pieces).collect(),
             move |i, _| {
@@ -2815,31 +2825,47 @@ impl SupertableWriter {
                         None,
                     )
                 })?;
-                let Some(mut prepared) = prepare_superfile_named(
+                #[cfg(test)]
+                if i > 0
+                    && piece_stem.is_some()
+                    && *PIECE_FAILS_FOR_STEM.lock().expect("piece fault") == piece_stem
+                {
+                    return Err(BuildError::Store("injected piece failure".into()));
+                }
+                let mut prepared = prepare_finished_superfile(
                     &inner,
                     &piece_manifest,
                     output,
+                    None,
                     piece_stem.as_deref(),
-                )?
-                else {
-                    return Ok((None, None));
-                };
-                prepared.entry = finish_superfile_entry(prepared.entry, None)?;
-                let upload = start_superfile_upload(&inner, &runtime, &mut prepared);
-                Ok((Some(prepared), upload))
+                )?;
+                if let Some(upload) = prepared.as_mut().and_then(|prepared| {
+                    start_superfile_upload(&inner, &piece_runtime, &fan_out, prepared)
+                }) {
+                    piece_uploads.lock().expect("started uploads").push(upload);
+                }
+                Ok(prepared)
             },
             seal_task_lost,
-        )?;
+        );
         drop(pieces_span);
+        let uploads = mem::take(&mut *started.lock().expect("started uploads"));
+        let prepared: Vec<PreparedSuperfile> = match sealed_pieces {
+            Ok(pieces) => pieces.into_iter().flatten().collect(),
+            Err(error) => {
+                settle_abandoned_uploads(&runtime, uploads);
+                return Err(error);
+            }
+        };
         let sealed = sealing.elapsed();
-        let mut prepared = Vec::with_capacity(sealed_pieces.len());
-        let mut uploads = Vec::new();
-        for (piece, upload) in sealed_pieces {
-            prepared.extend(piece);
-            uploads.extend(upload);
-        }
         let superfiles = prepared.len();
-        let mut user_batch = collect_prepared_superfiles(&self.inner, prepared)?;
+        let mut user_batch = match collect_prepared_superfiles(&self.inner, prepared) {
+            Ok(batch) => batch,
+            Err(error) => {
+                settle_abandoned_uploads(&runtime, uploads);
+                return Err(error);
+            }
+        };
         user_batch.uploads = uploads;
         let prepared = sealing.elapsed();
         let output_stats = self
@@ -3442,9 +3468,10 @@ impl SupertableWriter {
             .map(drop);
         }
         // A schema that already moved would throw away the upload below.
-        list_metadata
-            .check_schema(&self.inner.manifest.load())
-            .map_err(BuildError::from)?;
+        if let Err(error) = list_metadata.check_schema(&self.inner.manifest.load()) {
+            settle_abandoned_uploads(&runtime, uploads);
+            return Err(error.into());
+        }
         let mut layer = None;
         let mut ticket = self.inner.append_queue.reserve();
         match &self.inner.options.storage {
@@ -5058,7 +5085,7 @@ pub(super) struct SuperfilePublishBatch {
 }
 
 /// A superfile upload running on the IO runtime.
-type SuperfileUpload = tokio::task::JoinHandle<Result<(), SupertableCommitError>>;
+type SuperfileUpload = JoinHandle<Result<(), SupertableCommitError>>;
 
 /// Wait for every upload in `uploads`; the first failure is the result.
 async fn await_uploads(uploads: Vec<SuperfileUpload>) -> Result<(), SupertableCommitError> {
@@ -5103,19 +5130,60 @@ impl SuperfilePublishBatch {
 
 /// Start uploading `prepared`'s superfile to the table's storage on
 /// `runtime`, taking its bytes off the publish's list of writes; `None`
-/// when it has nothing to upload.
+/// when it has nothing to upload. The upload holds one of `fan_out`'s
+/// permits while it runs, so a commit's uploads started one by one keep to
+/// the width [`write_superfile_list`] keeps to (see
+/// [`commit_write_concurrency`]).
 fn start_superfile_upload(
     inner: &SupertableInner,
-    runtime: &tokio::runtime::Runtime,
+    runtime: &Runtime,
+    fan_out: &Arc<Semaphore>,
     prepared: &mut PreparedSuperfile,
 ) -> Option<SuperfileUpload> {
     let storage = Arc::clone(inner.options.storage.as_ref()?);
     let (key, bytes) = prepared.bytes_for_storage.take()?;
     let threshold = inner.options.put_multipart_threshold_bytes;
-    Some(
-        runtime
-            .spawn(async move { put_new_superfile_bytes(&storage, threshold, key, bytes).await }),
-    )
+    let fan_out = Arc::clone(fan_out);
+    Some(runtime.spawn(async move {
+        let _permit = fan_out.acquire_owned().await.map_err(|_| {
+            SupertableCommitError::from(BuildError::Store("the upload bound was closed".into()))
+        })?;
+        put_new_superfile_bytes(&storage, threshold, key, bytes).await
+    }))
+}
+
+/// Fault injection for a live commit: every piece but the first of a commit
+/// whose superfiles carry this stem fails as it is prepared, after the first
+/// piece may have started its upload. Keyed by stem so no other test's
+/// commits are touched.
+#[cfg(test)]
+static PIECE_FAILS_FOR_STEM: Mutex<Option<String>> = Mutex::new(None);
+
+/// Wait out `uploads` for a commit that failed after starting them, so none
+/// lands after the failure is reported: what did land is unlisted, and the
+/// storage sweep reclaims it like any write a failed publish left.
+fn settle_abandoned_uploads(runtime: &Runtime, uploads: Vec<SuperfileUpload>) {
+    if uploads.is_empty() {
+        return;
+    }
+    let landed = bridge_on_runtime(await_uploads(uploads), runtime);
+    debug!(?landed, "uploads of a failed commit settled");
+}
+
+/// One superfile's step of a publish: name `shard`'s superfile and stamp
+/// its partition `hint`. `None` for a shard that holds no rows.
+fn prepare_finished_superfile(
+    inner: &SupertableInner,
+    manifest: &ManifestSnapshot,
+    shard: ShardOutput,
+    hint: Option<u32>,
+    stem: Option<&str>,
+) -> Result<Option<PreparedSuperfile>, BuildError> {
+    let Some(mut prepared) = prepare_superfile_named(inner, manifest, shard, stem)? else {
+        return Ok(None);
+    };
+    prepared.entry = finish_superfile_entry(prepared.entry, hint)?;
+    Ok(Some(prepared))
 }
 
 fn collect_prepared_superfiles(
@@ -5343,23 +5411,9 @@ fn prepare_user_superfile_batch_in_scope(
     let prepared: Vec<PreparedSuperfile> = outputs
         .into_par_iter()
         .zip(hints.into_par_iter())
-        .filter_map(
-            |(shard, hint)| match prepare_superfile_named(inner, manifest, shard, stem) {
-                Ok(Some(p)) => {
-                    Some(
-                        finish_superfile_entry(p.entry, hint).map(|entry| PreparedSuperfile {
-                            entry,
-                            bytes_for_store: p.bytes_for_store,
-                            bytes_for_storage: p.bytes_for_storage,
-                            bytes_for_cache: p.bytes_for_cache,
-                            term_contribution: p.term_contribution,
-                        }),
-                    )
-                }
-                Ok(None) => None,
-                Err(e) => Some(Err(e)),
-            },
-        )
+        .filter_map(|(shard, hint)| {
+            prepare_finished_superfile(inner, manifest, shard, hint, stem).transpose()
+        })
         .collect::<Result<Vec<_>, _>>()?;
     collect_prepared_superfiles(inner, prepared)
 }
@@ -18325,6 +18379,229 @@ mod tests {
         assert_eq!(
             st.reader().expect("reader").n_docs_total(),
             (BATCHES * ROWS_PER_BATCH) as u64
+        );
+    }
+
+    /// Rows per batch and batches for the shared live-commit tests: enough
+    /// text that the commit cuts several pieces.
+    const SHARED_LIVE_ROWS: usize = 2_000;
+    const SHARED_LIVE_BATCHES: usize = 4;
+    /// How long a shared live-commit test holds the first superfile upload:
+    /// far longer than the commit's other pieces take to build, upload and
+    /// reach the publish.
+    const SHARED_HELD_UPLOAD: Duration = Duration::from_millis(500);
+
+    /// Superfile objects in the storage under `dir`. The local store writes
+    /// each one beside its key and renames it into place, so a file under its
+    /// key is whole.
+    fn stored_superfiles(dir: &Path) -> usize {
+        fs::read_dir(dir.join(SUPERFILE_DATA_DIR)).map_or(0, |entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter(|e| {
+                    e.file_name()
+                        .to_string_lossy()
+                        .ends_with(SUPERFILE_KEY_SUFFIX)
+                })
+                .count()
+        })
+    }
+
+    /// A table over fault storage in `dir` and a shared writer on it holding
+    /// the shared live-commit tests' rows in its live lanes, named `stem`
+    /// when given.
+    fn shared_live_writer(
+        dir: &TempDir,
+        stem: Option<&str>,
+    ) -> (Arc<FaultStorage>, Supertable, SupertableWriter) {
+        let local: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let faults = FaultStorage::wrap(local);
+        let storage: Arc<dyn StorageProvider> = Arc::<FaultStorage>::clone(&faults);
+        let st = Supertable::create(live_options(2, 1, 4096, false).with_storage(storage))
+            .expect("create");
+        let mut w = st.acquire_writer(true).expect("shared writer");
+        assert!(w.shared, "the writer shares the slot with other appends");
+        for b in 0..SHARED_LIVE_BATCHES {
+            let batch = live_batch(b, SHARED_LIVE_ROWS);
+            match stem {
+                Some(stem) => w.append_named(&batch, stem),
+                None => w.append(&batch),
+            }
+            .expect("append");
+        }
+        assert!(w.live.is_some(), "the commit seals from the lanes");
+        (faults, st, w)
+    }
+
+    /// `st` holds every shared live-commit row, cut and indexed as a plain
+    /// commit of them is, and its term index lists every superfile it holds.
+    fn assert_shared_live_rows_published(st: &Supertable) {
+        assert_eq!(
+            st.reader().expect("reader").n_docs_total(),
+            (SHARED_LIVE_BATCHES * SHARED_LIVE_ROWS) as u64
+        );
+        let plain = build_live_or_plain(
+            live_options(2, 1, 4096, false),
+            SHARED_LIVE_ROWS,
+            SHARED_LIVE_BATCHES,
+            false,
+            |_| {},
+        );
+        assert_eq!(piece_sizes(st), piece_sizes(&plain));
+        for term in ["word5", "heavy"] {
+            assert_eq!(
+                hit_titles(st, term, usize::MAX),
+                hit_titles(&plain, term, usize::MAX),
+                "term {term}"
+            );
+        }
+        let manifest = st.inner().manifest.load_full();
+        assert!(manifest.term_index_complete(), "the term index is complete");
+        let storage = manifest.options.storage.as_ref().expect("storage");
+        let root = st
+            .block_on_query(term_index::load_root(
+                storage.as_ref(),
+                manifest.term_index_ref().expect("a term index"),
+            ))
+            .expect("root");
+        let indexed: HashSet<Uuid> = root.superfiles.iter().copied().collect();
+        assert!(
+            manifest
+                .get_all_superfiles()
+                .iter()
+                .all(|e| indexed.contains(&e.superfile_id)),
+            "the term index lists every superfile"
+        );
+    }
+
+    /// A failed commit left nothing listed, and once storage is swept no
+    /// superfile it uploaded is left behind either.
+    fn assert_failed_commit_left_nothing(dir: &TempDir, st: &Supertable) {
+        assert_eq!(
+            st.reader().expect("reader").n_docs_total(),
+            0,
+            "nothing was listed"
+        );
+        st.gc(Duration::ZERO).expect("sweep storage");
+        // An upload the commit did not wait for would land after the sweep.
+        thread::sleep(SHARED_HELD_UPLOAD);
+        assert_eq!(
+            stored_superfiles(dir.path()),
+            0,
+            "no unlisted superfile is left once storage is swept"
+        );
+    }
+
+    /// The shared writer's twin of
+    /// `a_live_commit_lists_its_superfiles_only_after_every_upload_lands`: a
+    /// shared writer builds its term-index layer beside the uploads, and
+    /// still writes the manifest list only once every superfile is stored.
+    #[test]
+    fn a_shared_live_commit_lists_its_superfiles_only_after_every_upload_lands() {
+        let dir = TempDir::new().expect("tempdir");
+        let (faults, st, mut w) = shared_live_writer(&dir, None);
+        faults.before(FaultOp::PutAtomic, "data/", || {
+            thread::sleep(SHARED_HELD_UPLOAD);
+        });
+        let stored_at_list = Arc::new(AtomicUsize::new(usize::MAX));
+        let (seen, data_dir) = (Arc::clone(&stored_at_list), dir.path().to_path_buf());
+        faults.before(FaultOp::PutAtomic, "manifest/manifest-", move || {
+            seen.store(stored_superfiles(&data_dir), Ordering::SeqCst);
+        });
+        w.commit().expect("commit");
+        drop(w);
+
+        let listed = st.reader().expect("reader").n_superfiles();
+        assert!(listed >= 2, "the commit cut several pieces, got {listed}");
+        assert_eq!(
+            stored_at_list.load(Ordering::SeqCst),
+            listed,
+            "every listed superfile was in storage when its list was written"
+        );
+        assert_shared_live_rows_published(&st);
+    }
+
+    /// A shared live commit whose upload fails fails as a whole: nothing is
+    /// listed, the superfiles that did upload are swept away, and the retry
+    /// rebuilds every row and its term index from the restored buffer.
+    #[test]
+    fn a_shared_live_commit_whose_upload_fails_lists_nothing_and_the_retry_rebuilds() {
+        let dir = TempDir::new().expect("tempdir");
+        let (faults, st, mut w) = shared_live_writer(&dir, None);
+        faults.fail(FaultOp::PutAtomic, "data/", 1);
+        w.commit().expect_err("a superfile upload fails");
+        assert_eq!(faults.fired(), 1, "the failure came from the injection");
+        faults.clear();
+        assert_failed_commit_left_nothing(&dir, &st);
+        assert_eq!(
+            w.buffer.len(),
+            SHARED_LIVE_BATCHES,
+            "the buffer is restored"
+        );
+        w.commit().expect("the retry rebuilds from the buffer");
+        drop(w);
+        assert_shared_live_rows_published(&st);
+    }
+
+    /// A shared live commit whose term-index layer fails to write fails as a
+    /// whole, though every superfile uploaded: nothing is listed, the
+    /// uploads are swept away, and the retry publishes the rows and a term
+    /// index that lists them.
+    #[test]
+    fn a_shared_live_commit_whose_term_index_layer_fails_lists_nothing_and_the_retry_rebuilds() {
+        let dir = TempDir::new().expect("tempdir");
+        let (faults, st, mut w) = shared_live_writer(&dir, None);
+        faults.fail(FaultOp::PutAtomic, "term-index/slice-", usize::MAX);
+        w.commit().expect_err("the layer's slice write fails");
+        assert!(faults.fired() > 0, "the failure came from the injection");
+        faults.clear();
+        assert_failed_commit_left_nothing(&dir, &st);
+        assert_eq!(
+            w.buffer.len(),
+            SHARED_LIVE_BATCHES,
+            "the buffer is restored"
+        );
+        w.commit().expect("the retry rebuilds from the buffer");
+        drop(w);
+        assert_shared_live_rows_published(&st);
+    }
+
+    /// A live commit that fails building a piece after another piece's upload
+    /// started waits that upload out before it reports the failure, so the
+    /// sweep that follows finds and removes it; the retry then publishes.
+    #[test]
+    fn a_live_commit_that_fails_a_piece_waits_out_the_uploads_it_started() {
+        const STEM: &str = "a-piece-fails";
+        let dir = TempDir::new().expect("tempdir");
+        let (faults, st, mut w) = shared_live_writer(&dir, Some(STEM));
+        faults.before(FaultOp::PutAtomic, "data/", || {
+            thread::sleep(SHARED_HELD_UPLOAD);
+        });
+        let stem = w.pending_stem.clone();
+        assert!(
+            stem.is_some(),
+            "the commit's superfiles carry the source's stem"
+        );
+        *PIECE_FAILS_FOR_STEM.lock().expect("piece fault") = stem;
+        let failed = w.commit();
+        *PIECE_FAILS_FOR_STEM.lock().expect("piece fault") = None;
+        let error = failed.expect_err("a piece fails");
+        assert!(
+            error.to_string().contains("injected piece failure"),
+            "unexpected error: {error}"
+        );
+        assert_failed_commit_left_nothing(&dir, &st);
+        assert_eq!(
+            w.buffer.len(),
+            SHARED_LIVE_BATCHES,
+            "the buffer is restored"
+        );
+        w.commit().expect("the retry rebuilds from the buffer");
+        drop(w);
+        assert_eq!(
+            st.reader().expect("reader").n_docs_total(),
+            (SHARED_LIVE_BATCHES * SHARED_LIVE_ROWS) as u64
         );
     }
 
