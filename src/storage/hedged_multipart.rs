@@ -8,13 +8,13 @@
 //! one held part holds the whole object: a 1 GiB merge output of 128 parts
 //! once took 46 s where its siblings took two to five, and the commit waiting
 //! on it idled the host for 42 s. A part that has run past
-//! [`stuck_after`] its size is sent again under the same part number; the
-//! store keeps one copy of a part number, and both copies hold the same
-//! bytes, so either answer completes the upload.
+//! [`stuck_after`](super::stuck_after) its size is sent again under the same
+//! part number (see [`hedged`]); the store keeps one copy of a part number,
+//! and both copies hold the same bytes, so either answer completes the
+//! upload.
 
 use std::{
     fmt, mem,
-    pin::pin,
     sync::{Arc, Mutex, PoisonError},
 };
 
@@ -24,9 +24,8 @@ use object_store::{
     multipart::{MultipartStore, PartId},
     path::Path,
 };
-use tokio::{select, time::sleep};
 
-use super::stuck_after;
+use super::hedged;
 
 /// A [`MultipartUpload`] over a [`MultipartStore`] that sends a part again
 /// once it has run long enough to be taken for stuck.
@@ -109,8 +108,7 @@ impl MultipartUpload for HedgedUpload {
 }
 
 /// Put part `index`, sending it again once the first attempt has run
-/// [`stuck_after`] its size. The first attempt to land wins; one that fails
-/// waits for the other, so the part fails only if both do.
+/// [`stuck_after`](super::stuck_after) its size (see [`hedged`]).
 async fn hedged_part(
     store: &dyn MultipartStore,
     path: &Path,
@@ -118,73 +116,92 @@ async fn hedged_part(
     index: usize,
     data: PutPayload,
 ) -> Result<PartId> {
-    let delay = stuck_after(data.content_length() as u64);
     let id = id.to_string();
-    let mut first = pin!(store.put_part(path, &id, index, data.clone()));
-    select! {
-        part = &mut first => part,
-        () = sleep(delay) => {
-            let mut second = pin!(store.put_part(path, &id, index, data));
-            select! {
-                part = &mut first => match part {
-                    Ok(part) => Ok(part),
-                    Err(_) => second.await,
-                },
-                part = &mut second => match part {
-                    Ok(part) => Ok(part),
-                    Err(_) => first.await,
-                },
-            }
-        }
-    }
+    hedged(data.content_length() as u64, || {
+        store.put_part(path, &id, index, data.clone())
+    })
+    .await
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        collections::BTreeMap,
-        future::pending,
-        sync::atomic::{AtomicBool, AtomicUsize, Ordering},
-    };
+    use std::{collections::BTreeMap, future::pending, time::Duration};
 
     use bytes::Bytes;
-    use futures::future::try_join_all;
+    use futures::future::{join_all, try_join_all};
     use object_store::{MultipartId, ObjectStoreExt, memory::InMemory};
+    use tokio::time::sleep;
 
     use super::*;
+    use crate::{
+        runtime_metrics::io::UsageMeter,
+        storage::{counting::wrap_multipart, stuck_after},
+    };
 
     /// Bytes per part in the tests.
     const PART_BYTES: usize = 64;
     /// Parts in the tests' uploads.
     const PARTS: usize = 4;
-    /// The part whose first attempt is held.
-    const HELD_PART: usize = 2;
+    /// The part whose attempts the tests script.
+    const SCRIPTED_PART: usize = 2;
 
-    /// A store whose first attempt at one part never answers, and which
-    /// counts every attempt at a part. It keeps its own parts by number
+    /// How one attempt at a part answers.
+    #[derive(Debug, Clone, Copy)]
+    enum Answer {
+        /// Never answers.
+        Hold,
+        /// Lands after the given time.
+        LandAfter(Duration),
+        /// Fails after the given time.
+        FailAfter(Duration),
+    }
+
+    /// How long a part of the tests' size runs before its hedge is sent.
+    fn hedge_delay() -> Duration {
+        stuck_after(PART_BYTES as u64)
+    }
+
+    /// A store that answers the attempts at [`SCRIPTED_PART`] in the order
+    /// its script gives, lands every other attempt at once, and counts the
+    /// attempts at each part. It keeps its own parts by number
     /// (object_store's in-memory store takes parts only in order, and a held
     /// part lands last) and writes the finished object to an in-memory store.
     #[derive(Debug)]
-    struct HoldsOnePart {
+    struct ScriptedStore {
         inner: InMemory,
         parts: Mutex<BTreeMap<usize, Bytes>>,
-        held: AtomicBool,
-        attempts: AtomicUsize,
+        script: Mutex<Vec<Answer>>,
+        attempts: Mutex<BTreeMap<usize, usize>>,
     }
 
-    impl HoldsOnePart {
-        fn new(held: bool) -> Self {
-            Self {
+    impl ScriptedStore {
+        /// A store whose attempts at [`SCRIPTED_PART`] answer as `script`
+        /// says, first attempt first; attempts past the script land at once.
+        fn new(script: &[Answer]) -> Arc<Self> {
+            Arc::new(Self {
                 inner: InMemory::new(),
                 parts: Mutex::new(BTreeMap::new()),
-                held: AtomicBool::new(held),
-                attempts: AtomicUsize::new(0),
-            }
+                script: Mutex::new(script.iter().rev().copied().collect()),
+                attempts: Mutex::new(BTreeMap::new()),
+            })
+        }
+
+        fn attempts_at(&self, part: usize) -> usize {
+            self.attempts
+                .lock()
+                .expect("attempts")
+                .get(&part)
+                .copied()
+                .unwrap_or(0)
+        }
+
+        fn total_attempts(&self) -> usize {
+            self.attempts.lock().expect("attempts").values().sum()
         }
     }
 
     #[async_trait]
-    impl MultipartStore for HoldsOnePart {
+    impl MultipartStore for ScriptedStore {
         async fn create_multipart(&self, _path: &Path) -> Result<MultipartId> {
             Ok("upload".to_string())
         }
@@ -195,9 +212,27 @@ mod tests {
             part_idx: usize,
             data: PutPayload,
         ) -> Result<PartId> {
-            self.attempts.fetch_add(1, Ordering::SeqCst);
-            if part_idx == HELD_PART && self.held.swap(false, Ordering::SeqCst) {
-                pending::<()>().await;
+            *self
+                .attempts
+                .lock()
+                .expect("attempts")
+                .entry(part_idx)
+                .or_default() += 1;
+            let answer = match part_idx == SCRIPTED_PART {
+                true => self.script.lock().expect("script").pop(),
+                false => None,
+            };
+            match answer {
+                None => {}
+                Some(Answer::Hold) => pending::<()>().await,
+                Some(Answer::LandAfter(after)) => sleep(after).await,
+                Some(Answer::FailAfter(after)) => {
+                    sleep(after).await;
+                    return Err(Error::Generic {
+                        store: "scripted",
+                        source: format!("part {part_idx} refused").into(),
+                    });
+                }
             }
             let bytes: Bytes = data.into();
             self.parts.lock().expect("parts").insert(part_idx, bytes);
@@ -231,28 +266,21 @@ mod tests {
         Bytes::from(vec![index as u8; PART_BYTES])
     }
 
-    /// An upload whose part never answers on its first attempt completes on
-    /// its second, and the object holds every part's bytes in order.
-    #[tokio::test(start_paused = true)]
-    async fn a_held_part_is_answered_by_its_second_attempt() {
-        let store = Arc::new(HoldsOnePart::new(true));
-        let path = Path::from("hedged/object");
-        let mut upload = HedgedUpload::start(store.clone(), path.clone())
-            .await
-            .expect("start");
+    /// Upload [`PARTS`] parts to `path` on `store` and complete the upload.
+    async fn upload(store: &Arc<ScriptedStore>, path: &Path) -> Result<PutResult> {
+        let mut upload = HedgedUpload::start(Arc::clone(store) as _, path.clone()).await?;
         let puts: Vec<UploadPart> = (0..PARTS)
             .map(|index| upload.put_part(PutPayload::from_bytes(part(index))))
             .collect();
-        try_join_all(puts).await.expect("every part lands");
-        upload.complete().await.expect("complete");
-        assert_eq!(
-            store.attempts.load(Ordering::SeqCst),
-            PARTS + 1,
-            "one part sent twice"
-        );
+        try_join_all(puts).await?;
+        upload.complete().await
+    }
+
+    /// The object at `path` holds every part's bytes in order.
+    async fn assert_holds_every_part(store: &ScriptedStore, path: &Path) {
         let stored = store
             .inner
-            .get(&path)
+            .get(path)
             .await
             .expect("get")
             .bytes()
@@ -262,18 +290,145 @@ mod tests {
         assert_eq!(stored.as_ref(), expected.as_slice());
     }
 
+    /// An upload whose part never answers on its first attempt completes on
+    /// its second, and the object holds every part's bytes in order.
+    #[tokio::test(start_paused = true)]
+    async fn a_held_part_is_answered_by_its_second_attempt() {
+        let store = ScriptedStore::new(&[Answer::Hold]);
+        let path = Path::from("hedged/object");
+        upload(&store, &path).await.expect("upload");
+        assert_eq!(store.total_attempts(), PARTS + 1, "one part sent twice");
+        assert_holds_every_part(&store, &path).await;
+    }
+
     /// An upload whose parts all answer in time sends each part once.
     #[tokio::test(start_paused = true)]
     async fn parts_that_answer_in_time_are_sent_once() {
-        let store = Arc::new(HoldsOnePart::new(false));
-        let mut upload = HedgedUpload::start(store.clone(), Path::from("hedged/once"))
+        let store = ScriptedStore::new(&[]);
+        upload(&store, &Path::from("hedged/once"))
+            .await
+            .expect("upload");
+        assert_eq!(store.total_attempts(), PARTS);
+    }
+
+    /// A first attempt that fails after the hedge was sent waits for the
+    /// hedge, which lands the part: the upload completes in order.
+    #[tokio::test(start_paused = true)]
+    async fn a_first_attempt_failing_after_the_hedge_waits_for_the_hedge() {
+        let store = ScriptedStore::new(&[
+            Answer::FailAfter(hedge_delay() + Duration::from_secs(1)),
+            Answer::LandAfter(Duration::from_secs(3)),
+        ]);
+        let path = Path::from("hedged/first-fails");
+        upload(&store, &path).await.expect("the hedge lands");
+        assert_eq!(store.attempts_at(SCRIPTED_PART), 2);
+        assert_holds_every_part(&store, &path).await;
+    }
+
+    /// A hedge that fails at once does not cancel a slow first attempt
+    /// that lands: the upload waits for it and completes in order.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_hedge_waits_for_the_first_attempt() {
+        let store = ScriptedStore::new(&[
+            Answer::LandAfter(hedge_delay() * 4),
+            Answer::FailAfter(Duration::ZERO),
+        ]);
+        let path = Path::from("hedged/hedge-fails");
+        upload(&store, &path)
+            .await
+            .expect("the first attempt lands");
+        assert_eq!(store.attempts_at(SCRIPTED_PART), 2);
+        assert_holds_every_part(&store, &path).await;
+    }
+
+    /// A part whose both attempts fail fails, and no third is sent.
+    #[tokio::test(start_paused = true)]
+    async fn a_part_whose_both_attempts_fail_fails() {
+        let store = ScriptedStore::new(&[
+            Answer::FailAfter(hedge_delay() + Duration::from_secs(1)),
+            Answer::FailAfter(Duration::ZERO),
+        ]);
+        let mut upload = HedgedUpload::start(Arc::clone(&store) as _, Path::from("hedged/both"))
             .await
             .expect("start");
         let puts: Vec<UploadPart> = (0..PARTS)
             .map(|index| upload.put_part(PutPayload::from_bytes(part(index))))
             .collect();
+        let answers = join_all(puts).await;
+        for (index, answer) in answers.iter().enumerate() {
+            assert_eq!(answer.is_err(), index == SCRIPTED_PART, "part {index}");
+        }
+        assert_eq!(store.attempts_at(SCRIPTED_PART), 2, "no third attempt");
+    }
+
+    /// A first attempt that fails before the hedge is due is the part's
+    /// answer: the part fails and no hedge is sent.
+    #[tokio::test(start_paused = true)]
+    async fn a_first_attempt_failing_before_the_delay_is_not_hedged() {
+        let store = ScriptedStore::new(&[Answer::FailAfter(hedge_delay() / 2)]);
+        let mut upload = HedgedUpload::start(Arc::clone(&store) as _, Path::from("hedged/early"))
+            .await
+            .expect("start");
+        for _ in 0..SCRIPTED_PART {
+            upload
+                .put_part(PutPayload::from_bytes(part(0)))
+                .await
+                .expect("part");
+        }
+        upload
+            .put_part(PutPayload::from_bytes(part(SCRIPTED_PART)))
+            .await
+            .expect_err("the first attempt's failure is the answer");
+        assert_eq!(store.attempts_at(SCRIPTED_PART), 1, "no hedge was sent");
+    }
+
+    /// `complete` refuses an upload one of whose parts never landed, and
+    /// names it, rather than completing the object without it.
+    #[tokio::test(start_paused = true)]
+    async fn complete_reports_a_part_that_never_landed() {
+        let store = ScriptedStore::new(&[Answer::FailAfter(Duration::ZERO)]);
+        let path = Path::from("hedged/gap");
+        let mut upload = HedgedUpload::start(Arc::clone(&store) as _, path.clone())
+            .await
+            .expect("start");
+        let puts: Vec<UploadPart> = (0..PARTS)
+            .map(|index| upload.put_part(PutPayload::from_bytes(part(index))))
+            .collect();
+        // The caller drops the failed part's error and completes anyway.
+        let _ = join_all(puts).await;
+        let err = upload.complete().await.expect_err("a part is missing");
+        assert!(
+            err.to_string()
+                .contains(&format!("part {SCRIPTED_PART} of {path} never landed")),
+            "{err}"
+        );
+        assert!(store.inner.get(&path).await.is_err(), "no object was made");
+    }
+
+    /// A hedged part is metered as the one PUT that landed it, the same as
+    /// every other request in the ledger: a request that fails or is
+    /// dropped unanswered records nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_hedged_part_is_metered_once() {
+        let store = ScriptedStore::new(&[Answer::Hold]);
+        let meter = UsageMeter::new();
+        let hedged_upload =
+            HedgedUpload::start(Arc::clone(&store) as _, Path::from("hedged/meter"))
+                .await
+                .expect("start");
+        let mut upload = wrap_multipart(Box::new(hedged_upload), Arc::clone(&meter));
+        let puts: Vec<UploadPart> = (0..PARTS)
+            .map(|index| upload.put_part(PutPayload::from_bytes(part(index))))
+            .collect();
         try_join_all(puts).await.expect("every part lands");
         upload.complete().await.expect("complete");
-        assert_eq!(store.attempts.load(Ordering::SeqCst), PARTS);
+        assert_eq!(store.total_attempts(), PARTS + 1, "one part sent twice");
+        let usage = meter.snapshot();
+        assert_eq!(
+            usage.put_count,
+            PARTS as u64 + 1,
+            "a PUT per part, and complete"
+        );
+        assert_eq!(usage.put_bytes, (PARTS * PART_BYTES) as u64);
     }
 }

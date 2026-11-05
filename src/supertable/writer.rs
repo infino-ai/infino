@@ -69,7 +69,6 @@ use std::{
     ops::Range,
     panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
-    pin::pin,
     str::from_utf8,
     sync::{
         Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError,
@@ -130,7 +129,7 @@ use crate::{
         op_stats::{self, OpStatsCollector, timed_kernel},
         rss::available_memory_bytes,
     },
-    storage::{StorageError, StorageProvider, stuck_after},
+    storage::{StorageError, StorageProvider, hedged},
     superfile::{
         BuildError as SuperfileBuildError, FtsError, ReadError, SuperfileReader,
         builder::{BuilderOptions, SuperfileBuilder, VectorConfig, index_fts_rows},
@@ -14162,7 +14161,7 @@ pub(in crate::supertable) const CONTENT_ADDRESSED_MULTIPART_THRESHOLD_BYTES: u64
     100 * 1024 * 1024;
 
 /// PUT `bytes` at `uri` as a new object, starting a second attempt once the
-/// first has run long enough to be taken for stuck (see [`stuck_after`]).
+/// first has run long enough to be taken for stuck (see [`hedged`]).
 /// The stores answer an 8 MB PUT in under half a second and now and then
 /// hold one for the whole request timeout: one such PUT held a billion-row
 /// ingest's commit for a minute. The first attempt to land wins; one that
@@ -14176,24 +14175,11 @@ async fn put_new_hedged(
     uri: &str,
     bytes: Bytes,
 ) -> Result<(), StorageError> {
-    let delay = stuck_after(bytes.len() as u64);
-    let mut first = pin!(storage.put_atomic(uri, bytes.clone()));
-    tokio::select! {
-        answer = &mut first => answer.map(|_| ()),
-        () = sleep(delay) => {
-            let mut second = pin!(storage.put_atomic(uri, bytes));
-            tokio::select! {
-                answer = &mut first => match answer {
-                    Ok(_) => Ok(()),
-                    Err(_) => second.await.map(drop),
-                },
-                answer = &mut second => match answer {
-                    Ok(_) => Ok(()),
-                    Err(_) => first.await.map(drop),
-                },
-            }
-        }
-    }
+    hedged(bytes.len() as u64, || {
+        storage.put_atomic(uri, bytes.clone())
+    })
+    .await
+    .map(drop)
 }
 
 /// Persist `bytes` under the name `uri_for` derives from their content
@@ -14449,6 +14435,7 @@ mod tests {
     use crate::test_helpers::links::assert_cache_copies_are_links;
     use crate::{
         config::{CompactionSettings, Config, OptimizeOptions},
+        storage::stuck_after,
         superfile::{
             BytesLazyByteSource, LazyByteSource, LazyByteSourceError, PrefetchedSource,
             builder::{FtsConfig, VectorConfig},
