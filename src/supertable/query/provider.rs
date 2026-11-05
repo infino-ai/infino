@@ -206,8 +206,9 @@ struct PreparedScanFile {
     /// page index; empty when the file carries none.
     pages: HashMap<String, u64>,
     /// The footer row-group and page pruning read: the file's own, without
-    /// the bounds of a float column holding a NaN
-    /// ([`without_nan_blind_bounds`]).
+    /// the bounds that leave out a float column's NaNs
+    /// ([`without_nan_blind_bounds`]), one copy per superfile shared through
+    /// its reader ([`SuperfileReader::scan_footer`]).
     footer: Arc<ParquetMetaData>,
     /// Which cache tier the first open of this file was served from. A
     /// later scan of the same provider reuses the prepared file and reports
@@ -260,12 +261,24 @@ fn prepare_scan_file(
             }
         }
     }
-    let footer = without_nan_blind_bounds(parquet_meta, |column| {
+    // Derived once per superfile and kept on its reader: it depends only on
+    // the footer and this superfile's own manifest bounds, which never
+    // change, so the provider every query builds shares the first one. A
+    // handle that could not read the bounds sees none, and derives a copy
+    // of its own rather than keep that one for handles that can.
+    let bounds = |column| {
         entry
             .scalar_stats
             .column(column)
             .and_then(|stats| stats.min_max_values())
-    })?;
+    };
+    let footer = if entry.scalar_stats.is_unavailable() {
+        without_nan_blind_bounds(parquet_meta, bounds)?
+    } else {
+        reader.scan_footer(parquet_meta, |indexed| {
+            without_nan_blind_bounds(indexed, bounds)
+        })?
+    };
     scan_store.insert_source(path.clone(), source);
     scan_footers.insert(path.clone(), Arc::new(ScanFooter::new(Arc::clone(&footer))));
     Ok(Arc::new(PreparedScanFile {
@@ -2994,7 +3007,7 @@ mod tests {
 
     use arrow::util::display::{ArrayFormatter, FormatOptions};
     use arrow_array::{
-        Float64Array, Int64Array, LargeStringArray, RecordBatch, RecordBatchIterator,
+        Float32Array, Float64Array, Int64Array, LargeStringArray, RecordBatch, RecordBatchIterator,
         TimestampSecondArray,
     };
     use arrow_schema::{DataType, Field, Schema, TimeUnit};
@@ -5194,8 +5207,9 @@ mod tests {
         );
     }
 
-    // Row-group pruning against a top-k's cutoff, where a Parquet footer's
-    // float bounds leave NaNs out.
+    // Pruning by Parquet footer bounds that leave a float column's NaNs out:
+    // under a plain filter and under a top-k's cutoff, before and after a
+    // compaction folds the superfiles' manifest bounds together.
 
     /// Superfiles of the NaN table, one commit each; only the last holds
     /// NaNs.
@@ -5205,22 +5219,31 @@ mod tests {
     /// Rows in the superfile holding the NaNs: one more than the others, so
     /// its manifest entry tells it apart whatever order the manifest lists.
     const NAN_FILE_ROWS: usize = NAN_FREE_FILE_ROWS + 1;
-    /// Rows of that superfile, its first ones, that hold a NaN.
+    /// Rows of that superfile, its first ones, that hold a NaN in both
+    /// columns.
     const NAN_ROWS: usize = 3;
+    /// Rows of that superfile, right after its NaN rows, whose `hi` is null.
+    const NULL_ROWS: usize = 2;
+    /// The rows a top-k of the NaN table keeps: as many as hold a NaN.
+    const NAN_TOP_K: usize = NAN_ROWS;
     /// The one row group of each superfile of the NaN table.
     const ONLY_ROW_GROUP: usize = 0;
 
     /// A table of two float columns whose NaNs are in the last superfile
     /// only, beside numbers past the earlier superfiles' on the other side:
-    /// `lo` is `-1.0` before and `-NaN` then `1.0` in the last, `hi` is `1.0`
-    /// before and `NaN` then `-1.0` in the last. The last superfile's footer
-    /// bounds `lo` by `[1.0, 1.0]` and `hi` by `[-1.0, -1.0]`, leaving out
-    /// the NaNs total order puts first ascending (`lo`) and first descending
-    /// (`hi`).
+    ///
+    /// - `lo`, a `Float64`, is `-1.0` before, and `-NaN` then `1.0` in the
+    ///   last superfile;
+    /// - `hi`, a nullable `Float32`, is `1.0` before, and `NaN`, then
+    ///   [`NULL_ROWS`] nulls, then `-1.0` in the last superfile.
+    ///
+    /// The last superfile's footer bounds `lo` by `[1.0, 1.0]` and `hi` by
+    /// `[-1.0, -1.0]`, leaving out the NaNs total order puts first ascending
+    /// (`lo`) and first descending (`hi`).
     fn nan_table(dir: &TempDir) -> Supertable {
         let schema = Arc::new(Schema::new(vec![
             Field::new("lo", DataType::Float64, false),
-            Field::new("hi", DataType::Float64, false),
+            Field::new("hi", DataType::Float32, true),
         ]));
         let storage: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
@@ -5235,18 +5258,19 @@ mod tests {
             } else {
                 NAN_FREE_FILE_ROWS
             };
-            let (lo, hi): (Vec<f64>, Vec<f64>) = (0..rows)
-                .map(|row| match (last, row < NAN_ROWS) {
-                    (false, _) => (-1.0, 1.0),
-                    (true, true) => (-f64::NAN, f64::NAN),
-                    (true, false) => (1.0, -1.0),
+            let (lo, hi): (Vec<f64>, Vec<Option<f32>>) = (0..rows)
+                .map(|row| match (last, row) {
+                    (false, _) => (-1.0, Some(1.0)),
+                    (true, row) if row < NAN_ROWS => (-f64::NAN, Some(f32::NAN)),
+                    (true, row) if row < NAN_ROWS + NULL_ROWS => (1.0, None),
+                    (true, _) => (1.0, Some(-1.0)),
                 })
                 .unzip();
             let batch = RecordBatch::try_new(
                 Arc::clone(&schema),
                 vec![
                     Arc::new(Float64Array::from(lo)) as ArrayRef,
-                    Arc::new(Float64Array::from(hi)),
+                    Arc::new(Float32Array::from(hi)),
                 ],
             )
             .expect("batch");
@@ -5286,44 +5310,185 @@ mod tests {
         .should_scan(ONLY_ROW_GROUP)
     }
 
-    /// A top-k's cutoff, `ORDER BY ... LIMIT k`'s filter on the rows still
-    /// to come, never prunes a row group whose NaN rows pass it, though the
-    /// row group's footer bounds leave its NaNs out: a cutoff at a negative
-    /// NaN or one a negative NaN sorts before (ascending), a cutoff at a
-    /// positive NaN or one it sorts after (descending). A superfile without
-    /// a NaN keeps its bounds, and its row group is pruned as before.
+    /// Row-group pruning by the footer the scan reads, on the NaN table
+    /// ([`nan_table`]), under six filters, each what a top-k hands the scan
+    /// as its cutoff (`ORDER BY ... LIMIT k`'s filter on the rows still to
+    /// come) or a plain `WHERE`. Every superfile without a NaN is pruned
+    /// under all six. The NaN superfile:
+    ///
+    /// - `lo < -NaN OR lo = -NaN`, an ascending cutoff at a negative NaN:
+    ///   read, its `-NaN` rows equal the cutoff.
+    /// - `lo < -1.0`: read, its `-NaN` rows sort before `-1.0`.
+    /// - `hi > NaN OR hi = NaN`, a descending cutoff at a positive NaN:
+    ///   read, its `NaN` rows equal the cutoff.
+    /// - `hi > 1.0`: read, its `NaN` rows sort after `1.0`.
+    /// - `lo > 1.0`: pruned, as no row passes; `lo`'s NaNs are negative, so
+    ///   its footer max, `1.0`, stays.
+    /// - `hi < -1.0`: pruned, as no row passes; `hi`'s NaNs are positive, so
+    ///   its footer min, `-1.0`, stays.
+    ///
+    /// The NaN superfile's footer bounds leave out the very rows that pass
+    /// the first four; the last two show the bound on the side its NaNs do
+    /// not reach still pruning.
     #[test]
-    fn a_top_k_cutoff_never_prunes_the_nan_rows_footer_bounds_leave_out() {
+    fn footer_pruning_reads_nan_rows_and_keeps_the_other_bound() {
         let dir = TempDir::new().expect("tempdir");
         let st = nan_table(&dir);
         let provider = provider_of(&st);
         let rt = query_runtime();
-        let at = |column: &str, cutoff: f64, descending: bool| {
+        let at = |column: &str, cutoff: Expr, descending: bool| {
             let past = if descending {
-                col(column).gt(lit(cutoff))
+                col(column).gt(cutoff.clone())
             } else {
-                col(column).lt(lit(cutoff))
+                col(column).lt(cutoff.clone())
             };
-            past.or(col(column).eq(lit(cutoff)))
+            past.or(col(column).eq(cutoff))
         };
-        let cutoffs = [
-            ("lo below -NaN", at("lo", -f64::NAN, false)),
-            ("lo below -1.0", col("lo").lt(lit(-1.0))),
-            ("hi above NaN", at("hi", f64::NAN, true)),
-            ("hi above 1.0", col("hi").gt(lit(1.0))),
+        // (name, filter, whether the NaN superfile's row group is read)
+        let filters = [
+            ("lo < -NaN", at("lo", lit(-f64::NAN), false), true),
+            ("lo < -1.0", col("lo").lt(lit(-1.0)), true),
+            ("hi > NaN", at("hi", lit(f32::NAN), true), true),
+            ("hi > 1.0", col("hi").gt(lit(1.0f32)), true),
+            ("lo > 1.0", col("lo").gt(lit(1.0)), false),
+            ("hi < -1.0", col("hi").lt(lit(-1.0f32)), false),
         ];
         let entries = &provider.manifest().superfiles;
         assert_eq!(entries.len(), NAN_TABLE_FILES);
         for entry in entries {
             let holds_nan = entry.n_docs == NAN_FILE_ROWS as u64;
-            for (name, cutoff) in &cutoffs {
+            for (name, filter, nan_file_read) in &filters {
                 assert_eq!(
-                    row_group_read(&provider, &rt, entry, cutoff),
-                    holds_nan,
+                    row_group_read(&provider, &rt, entry, filter),
+                    holds_nan && *nan_file_read,
                     "{name}: superfile of {} rows",
                     entry.n_docs
                 );
             }
+        }
+    }
+
+    /// Every provider over a superfile with a NaN prunes by one adjusted
+    /// footer, which the superfile's reader keeps: the catalog builds a
+    /// provider per query, and none copies the footer again.
+    #[test]
+    fn every_provider_shares_one_nan_adjusted_footer() {
+        let dir = TempDir::new().expect("tempdir");
+        let st = nan_table(&dir);
+        let rt = query_runtime();
+        let prepared: Vec<Arc<PreparedScanFile>> = (0..2)
+            .map(|_| {
+                let provider = provider_of(&st);
+                let entry = provider
+                    .manifest()
+                    .superfiles
+                    .iter()
+                    .find(|entry| entry.n_docs == NAN_FILE_ROWS as u64)
+                    .cloned()
+                    .expect("the NaN superfile");
+                rt.block_on(provider.prepared_scan_file(entry))
+                    .expect("prepare")
+            })
+            .collect();
+        let (first, second) = (&prepared[0], &prepared[1]);
+        assert!(
+            Arc::ptr_eq(&first.reader, &second.reader),
+            "both providers open the superfile through the one cached reader"
+        );
+        assert!(
+            !Arc::ptr_eq(&first.footer, &first.reader.parquet_metadata()),
+            "the NaN superfile's footer is adjusted"
+        );
+        assert!(Arc::ptr_eq(&first.footer, &second.footer));
+    }
+
+    /// The single count `sql` answers over `st`, run the way the catalog
+    /// runs a statement: a provider over the table's current manifest, in a
+    /// session of its own.
+    async fn count_of(st: &Supertable, sql: &str) -> i64 {
+        let reader = st.reader().expect("reader");
+        let provider = SupertableProvider::new(reader.sql_schemas().scan().clone(), &reader);
+        let ctx = sql_session_context(&st.options().connection_memory_budget).expect("ctx");
+        ctx.register_table(TABLE_NAME, Arc::new(provider) as Arc<dyn TableProvider>)
+            .expect("register");
+        let batches = ctx
+            .sql(sql)
+            .await
+            .expect("plan")
+            .collect()
+            .await
+            .expect("run");
+        batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("a count")
+            .value(0)
+    }
+
+    /// The NaN table's rows counted by SQL, every one the NaN rows pass, as
+    /// three superfiles and again once a compaction folds them into one,
+    /// whose manifest bounds are its inputs' merged: a plain `WHERE` past
+    /// the numbers on either side, a top-k in either direction, and the
+    /// side of `hi` its NaNs never reach, beside its nulls.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sql_counts_every_nan_row_before_and_after_a_compaction() {
+        let dir = TempDir::new().expect("tempdir");
+        let st = nan_table(&dir);
+        let nan_rows = NAN_ROWS as i64;
+        let numbers_below_zero = (NAN_FILE_ROWS - NAN_ROWS - NULL_ROWS) as i64;
+        let queries = [
+            (
+                format!("SELECT count(*) FROM {TABLE_NAME} WHERE lo < -1.0"),
+                nan_rows,
+            ),
+            (
+                format!("SELECT count(*) FROM {TABLE_NAME} WHERE hi > 1.0"),
+                nan_rows,
+            ),
+            (
+                format!(
+                    "SELECT count(*) FROM \
+                     (SELECT lo FROM {TABLE_NAME} ORDER BY lo LIMIT {NAN_TOP_K}) \
+                     WHERE isnan(lo)"
+                ),
+                nan_rows,
+            ),
+            (
+                format!(
+                    "SELECT count(*) FROM \
+                     (SELECT hi FROM {TABLE_NAME} ORDER BY hi DESC NULLS LAST \
+                     LIMIT {NAN_TOP_K}) WHERE isnan(hi)"
+                ),
+                nan_rows,
+            ),
+            (
+                format!("SELECT count(*) FROM {TABLE_NAME} WHERE hi < 0.0"),
+                numbers_below_zero,
+            ),
+            (
+                format!("SELECT count(*) FROM {TABLE_NAME} WHERE hi IS NULL"),
+                NULL_ROWS as i64,
+            ),
+        ];
+        for (sql, expected) in &queries {
+            assert_eq!(count_of(&st, sql).await, *expected, "before: {sql}");
+        }
+        st.compact_async(&CompactionSettings {
+            target_superfile_size_mb: 1,
+            min_fill_percent: 1,
+            min_superfiles_for_merge: 2,
+            ..CompactionSettings::default()
+        })
+        .await
+        .expect("compact");
+        assert_eq!(
+            st.reader().expect("reader").n_superfiles(),
+            1,
+            "the three superfiles merged into one"
+        );
+        for (sql, expected) in &queries {
+            assert_eq!(count_of(&st, sql).await, *expected, "after: {sql}");
         }
     }
 }
