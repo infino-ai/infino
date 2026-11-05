@@ -113,6 +113,7 @@ use tracing::debug;
 use super::term_table::{SLOT_BYTES_PER_TERM, TermTable};
 use crate::{
     config::scratch_root,
+    memory::{ConnectionMemoryBudget, Reservation},
     superfile::{
         BuildError,
         bits::PackScratch,
@@ -946,9 +947,10 @@ fn failed_builder() -> BuildError {
 }
 
 /// The error a lane returns for the document that takes its postings
-/// past its threshold. A lane never spills — its reservation is what
-/// bounds it — so the feed drops the lanes and the commit builds from the
-/// buffer, where a column that outgrows the reservation spills.
+/// past its threshold when the connection's budget refuses it more. A
+/// lane never spills — its reservation is what bounds it — so the feed
+/// drops the lanes and the commit builds from the buffer, where a column
+/// that outgrows the reservation spills.
 fn lane_outgrown() -> BuildError {
     BuildError::Io(Error::other(
         "an fts lane outgrew its reservation; the commit builds from the buffer",
@@ -1491,6 +1493,61 @@ pub struct FtsBuilder {
     /// further documents and refuses to finish: a caller that retries on
     /// the same builder gets an error, not a blob with a torn document.
     failed: bool,
+    /// A lane's postings across all its columns, in the accumulator's
+    /// accounting: what a lane holds is checked against its threshold as
+    /// a whole, since its reservation is for the whole lane. `0` outside
+    /// lane mode.
+    lane_bytes: usize,
+    /// Where a lane asks for memory past its threshold, and what it has
+    /// been given (see [`Self::set_lane_budget`]); `None` for every other
+    /// build, and for a lane that gives up at its threshold.
+    lane_growth: Option<LaneGrowth>,
+}
+
+/// A lane's claim on the connection's memory budget past the threshold
+/// its share of the build reserve sets. The claim is taken in doubling
+/// steps as the lane outgrows it, and given back when it is dropped.
+struct LaneGrowth {
+    budget: Arc<ConnectionMemoryBudget>,
+    /// What the lane has been given so far; `None` until it first asks.
+    held: Option<Reservation>,
+}
+
+impl LaneGrowth {
+    /// Bytes given so far.
+    fn size(&self) -> usize {
+        self.held.as_ref().map_or(0, Reservation::size)
+    }
+
+    /// Ask for enough to hold `held` bytes under `threshold`, which counts
+    /// what was given before: the step doubles what was given, and is at
+    /// least half the threshold's own share and at least what `held`
+    /// needs, so a lane growing steadily asks a handful of times. On
+    /// success `threshold` is raised by the step; a refusal leaves both as
+    /// they were.
+    fn grow(&mut self, threshold: &mut usize, held: usize) -> bool {
+        let given = self.size();
+        let share = threshold.saturating_sub(given);
+        let target = held
+            .saturating_sub(share)
+            .max(given.saturating_mul(2))
+            .max(share / 2);
+        let step = target.saturating_sub(given);
+        let granted = match &mut self.held {
+            Some(reservation) => reservation.try_grow(step).is_ok(),
+            None => match self.budget.try_reserve(step) {
+                Ok(reservation) => {
+                    self.held = Some(reservation);
+                    true
+                }
+                Err(_) => false,
+            },
+        };
+        if granted {
+            *threshold = share.saturating_add(target);
+        }
+        granted
+    }
 }
 
 /// One column of a frozen lane: its terms, each id's postings with the
@@ -1976,6 +2033,8 @@ impl FtsBuilder {
             lane_mode: false,
             lane_view: None,
             failed: false,
+            lane_bytes: 0,
+            lane_growth: None,
             doc_pos_chain: Vec::new(),
             pos_scratch: Vec::new(),
             run_scratch: Vec::new(),
@@ -2010,12 +2069,16 @@ impl FtsBuilder {
     /// `add_doc` time, so changes after `register_column` *do*
     /// apply — unlike vector, which snapshots into each
     /// `ColumnState` at registration time.
+    ///
+    /// A lane given a budget ([`Self::set_lane_budget`]) holds what the
+    /// budget has granted it on top of `threshold`.
     pub fn set_spill_threshold_bytes(&mut self, threshold: usize) {
         assert!(
             threshold > 0,
             "FtsBuilder: spill_threshold_bytes must be > 0"
         );
-        self.spill_threshold_bytes = threshold;
+        let granted = self.lane_growth.as_ref().map_or(0, LaneGrowth::size);
+        self.spill_threshold_bytes = threshold.saturating_add(granted);
     }
 
     /// Override the hash-partition count used when a column spills.
@@ -2491,15 +2554,21 @@ impl FtsBuilder {
                         lists.run_ends.push(lists.runs.len() as u32);
                     }
                 }
-                ram.bytes = ram
-                    .bytes
-                    .saturating_add(new_bytes)
-                    .saturating_add(run_bytes);
-                if ram.bytes > self.spill_threshold_bytes {
-                    if self.lane_mode {
+                let added = new_bytes.saturating_add(run_bytes);
+                ram.bytes = ram.bytes.saturating_add(added);
+                if lane_mode {
+                    // A lane past its threshold asks the budget for more,
+                    // and gives up only when that is refused.
+                    self.lane_bytes = self.lane_bytes.saturating_add(added);
+                    if self.lane_bytes > self.spill_threshold_bytes
+                        && !self.lane_growth.as_mut().is_some_and(|growth| {
+                            growth.grow(&mut self.spill_threshold_bytes, self.lane_bytes)
+                        })
+                    {
                         self.failed = true;
                         return Err(lane_outgrown());
                     }
+                } else if ram.bytes > self.spill_threshold_bytes {
                     // Crossed the threshold: move the postings to spill
                     // files, keyed by the ids already assigned, and run
                     // the rest of the build in spill mode.
@@ -2721,6 +2790,22 @@ impl FtsBuilder {
     /// it out of RAM.
     pub(crate) fn set_lane_mode(&mut self) {
         self.lane_mode = true;
+    }
+
+    /// Let this lane ask `budget` for more when its postings pass its
+    /// threshold, rather than give up there: it gives up only when the
+    /// budget refuses. What it is granted is held until
+    /// [`Self::take_lane_reservation`] or the builder is dropped.
+    pub(crate) fn set_lane_budget(&mut self, budget: Arc<ConnectionMemoryBudget>) {
+        self.lane_growth = Some(LaneGrowth { budget, held: None });
+    }
+
+    /// What the budget has granted this lane past its threshold, handed to
+    /// the caller to hold for as long as the lane's postings live on —
+    /// past [`Self::freeze`], which drops the builder. The lane asks for
+    /// nothing more afterwards.
+    pub(crate) fn take_lane_reservation(&mut self) -> Option<Reservation> {
+        self.lane_growth.take().and_then(|growth| growth.held)
     }
 
     /// Freeze this lane for the finish: `stretches` are the commit rows
@@ -2989,6 +3074,8 @@ impl FtsBuilder {
             lane_mode: _,
             lane_view: _,
             failed: _,
+            lane_bytes: _,
+            lane_growth: _,
         } = self;
 
         let n_columns = columns.len() as u32;
@@ -3149,6 +3236,8 @@ impl FtsBuilder {
             lane_mode: _,
             lane_view,
             failed: _,
+            lane_bytes: _,
+            lane_growth: _,
         } = self;
 
         let n_columns = columns.len() as u32;
@@ -5326,10 +5415,10 @@ mod tests {
         );
     }
 
-    /// A lane that outgrows its threshold fails the document that crosses
-    /// it rather than spilling, and can then neither take more nor be
-    /// frozen: the feed drops the lanes and the commit builds from the
-    /// buffer.
+    /// A lane with no budget to ask that outgrows its threshold fails the
+    /// document that crosses it rather than spilling, and can then neither
+    /// take more nor be frozen: the feed drops the lanes and the commit
+    /// builds from the buffer.
     #[test]
     fn a_lane_that_outgrows_its_threshold_fails_and_cannot_be_frozen() {
         let mut lane = FtsBuilder::new();
@@ -5351,6 +5440,62 @@ mod tests {
             .is_err(),
             "no frozen lane"
         );
+    }
+
+    /// A lane given a budget asks it for more past its threshold and goes
+    /// on, in a few doubling steps rather than a call per document; it
+    /// fails only once the budget refuses, and every byte it was granted
+    /// goes back when the grant or the builder is dropped.
+    #[test]
+    fn a_lane_with_a_budget_grows_past_its_threshold_until_refused() {
+        const DOCS: u32 = 2_000;
+        let lane_of = |budget: &Arc<ConnectionMemoryBudget>| {
+            let mut lane = FtsBuilder::new();
+            lane.register_column("body".into(), false)
+                .expect("register");
+            lane.set_lane_mode();
+            lane.set_lane_budget(Arc::clone(budget));
+            lane.set_spill_threshold_bytes(1 << 10);
+            lane
+        };
+
+        let measured = ConnectionMemoryBudget::measured();
+        let mut lane = lane_of(&measured);
+        for d in 0..DOCS {
+            lane.add_doc(0, d, &format!("t{d} u{d} shared"))
+                .expect("the lane grows");
+        }
+        let granted = lane.take_lane_reservation().expect("granted more");
+        assert!(granted.size() >= lane.lane_bytes - (1 << 10));
+        assert!(
+            granted.size() < 2 * lane.lane_bytes,
+            "grown in steps that track what the lane holds"
+        );
+        assert_eq!(measured.used_bytes(), granted.size());
+        lane.freeze(vec![Stretch {
+            doc: 0,
+            row: 0,
+            len: DOCS,
+        }])
+        .expect("a grown lane freezes");
+        assert_eq!(
+            measured.used_bytes(),
+            granted.size(),
+            "held past the freeze"
+        );
+        drop(granted);
+        assert_eq!(measured.used_bytes(), 0);
+
+        let limited = ConnectionMemoryBudget::with_limit(64 << 10);
+        let mut lane = lane_of(&limited);
+        let failed_at = (0..DOCS)
+            .find(|&d| lane.add_doc(0, d, &format!("t{d} u{d} shared")).is_err())
+            .expect("the budget refuses before the lane holds every document");
+        assert!(failed_at > 0, "granted something before the refusal");
+        assert!(limited.used_bytes() > 0);
+        assert!(limited.denials() >= 1);
+        drop(lane);
+        assert_eq!(limited.used_bytes(), 0, "a dropped lane holds nothing");
     }
 
     #[test]

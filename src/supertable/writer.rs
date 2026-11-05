@@ -2651,7 +2651,12 @@ impl SupertableWriter {
                 // do not.
                 let open = OpenAppend::enter(&options.writer_pool);
                 let n_lanes = lanes_for(options.writer_pool.current_num_threads(), open.count);
-                let opened = LiveLanes::open(Arc::clone(manifest), n_lanes, options.vector_layout);
+                let opened = LiveLanes::open(
+                    Arc::clone(manifest),
+                    n_lanes,
+                    options.vector_layout,
+                    &options.connection_memory_budget,
+                );
                 let live = match opened {
                     Ok(mut live) => {
                         live.open_append = Some(open);
@@ -2713,8 +2718,8 @@ impl SupertableWriter {
     /// all of this before choosing this over a rebuild.
     fn commit_live(
         &self,
-        live: LiveLanes,
-        lanes: Vec<LiveLane>,
+        mut live: LiveLanes,
+        mut lanes: Vec<LiveLane>,
         buffer: &[BufferedBatch],
         stem: Option<&str>,
         built_against: u32,
@@ -2765,6 +2770,14 @@ impl SupertableWriter {
         fn seal_task_lost() -> BuildError {
             BuildError::Store("a seal task ended without a result".into())
         }
+        // What the budget granted the lanes past their thresholds is held
+        // with the rest of their reservations, through the seal: the
+        // freeze drops each builder, but not the postings it held.
+        live.reservations.extend(
+            lanes
+                .iter_mut()
+                .filter_map(|lane| lane.builder.take_lane_reservation()),
+        );
         let freeze_span = detail_span!("seal.freeze_lanes", lanes = lanes.len()).entered();
         let freeze_stats = stats.clone();
         let frozen: Vec<FrozenLane> = run_spawned(
@@ -3084,8 +3097,7 @@ impl SupertableWriter {
                 && manifest.vector_configs().is_empty()
             {
                 // The last feed may have failed after the last append: a lane
-                // that outgrew its reservation on the batch this commit
-                // closes. Its rows are all in the buffer, so the commit
+                // the budget refused more on the batch this commit closes. Its rows are all in the buffer, so the commit
                 // builds from it, as one would after the next append saw
                 // the failure.
                 match live.join() {
@@ -3767,12 +3779,15 @@ struct LiveLanes {
     /// Rows fed so far, which is also the row number the next batch
     /// starts at.
     rows_fed: usize,
-    /// Build-scratch reserved for the batches fed so far; released with
-    /// the lanes.
+    /// Build-scratch reserved for the batches fed so far, and from the
+    /// seal on what the budget granted each lane past its threshold;
+    /// released with the lanes.
     reservations: Vec<Reservation>,
     /// Text fed so far, which sizes each lane's threshold: a lane never
-    /// spills, so its share of the reserve is what bounds it, and a lane
-    /// that outgrows it fails the feed and the commit builds from the
+    /// spills, so its share of the reserve bounds it until it asks the
+    /// connection's budget for more. Each lane holds what it is granted
+    /// itself until the seal, and gives it back if dropped. A lane the
+    /// budget refuses fails the feed, and the commit builds from the
     /// buffer (where a column past the reserve spills).
     fts_bytes: u64,
     /// The least a lane's threshold is set to: the builder's own default,
@@ -3858,18 +3873,21 @@ struct LiveLane {
 
 impl LiveLanes {
     /// Open `lanes` lanes against `manifest`, with the columns a builder of
-    /// the table's shape has.
+    /// the table's shape has; a lane that outgrows its threshold asks
+    /// `budget` for more.
     fn open(
         manifest: Arc<ManifestSnapshot>,
         lanes: usize,
         vector_layout: VectorLayout,
+        budget: &Arc<ConnectionMemoryBudget>,
     ) -> Result<Self, BuildError> {
         let (template, _, _) = open_shard_builder(&manifest, vector_layout, None, 0)?;
         let lanes = (0..lanes)
             .map(|_| {
-                let builder = template
+                let mut builder = template
                     .lane_builder()?
                     .ok_or_else(|| BuildError::Store("live lanes need a text column".into()))?;
+                builder.set_lane_budget(Arc::clone(budget));
                 Ok(LiveLane {
                     builder,
                     stretches: Vec::new(),
@@ -4077,8 +4095,14 @@ fn open_shard_builder(
 }
 
 /// The postings a builder of `fts_text_bytes` of text may hold in RAM
-/// before spilling (or, for a lane, before giving up): the FTS share of
-/// the build-scratch reserve for that text, never below `floor`.
+/// before spilling (or, for a lane, before asking the connection's budget
+/// for more): the FTS share of the build-scratch reserve for that text,
+/// never below `floor`.
+///
+/// A commit-time build does not ask for more: it spills instead, which
+/// costs it time but never fails it, and under the default measure-only
+/// budget (which never refuses) the spill is the only bound such a build
+/// has on its memory.
 fn in_ram_threshold(fts_text_bytes: u64, floor: usize) -> usize {
     let share = fts_text_bytes.saturating_mul(BUILD_FTS_NUM as u64) / BUILD_SCRATCH_DENOM as u64;
     usize::try_from(share).unwrap_or(usize::MAX).max(floor)
@@ -18257,57 +18281,98 @@ mod tests {
         }
     }
 
-    /// Text whose tokens are mostly new holds many times its bytes in
-    /// postings, past the reserve the lanes were sized by. A lane that
-    /// outgrows its share fails the feed, the lanes are dropped, and the
-    /// commit builds from the buffer as a commit without lanes does.
+    /// Rows of `UNIQUE_TOKENS` tokens each, every one new to the table:
+    /// text that holds many times its bytes in postings, past the reserve
+    /// the lanes were sized by.
+    const UNIQUE_ROWS_PER_BATCH: usize = 2_000;
+    /// Batches that open the lanes under the default floor: about 200 KiB
+    /// of text each against the 1 MiB split.
+    const UNIQUE_OPENING_BATCHES: usize = 8;
+    const UNIQUE_TOKENS: usize = 12;
+    /// A budget the build reserve of the outgrowing tests' rows fits under
+    /// (about 9 MiB, for a feed's lanes or a commit-time build), but not
+    /// the postings their lanes grow to (several times that).
+    const TIGHT_BUDGET_BYTES: u64 = 16 << 20;
+
+    fn unique_batch(batch: usize) -> RecordBatch {
+        RecordBatch::try_new(
+            schema_id_title(),
+            vec![Arc::new(LargeStringArray::from(
+                (0..UNIQUE_ROWS_PER_BATCH)
+                    .map(|i| {
+                        let row = batch * UNIQUE_ROWS_PER_BATCH + i;
+                        (0..UNIQUE_TOKENS)
+                            .map(|k| format!("r{row}k{k}"))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    })
+                    .collect::<Vec<_>>(),
+            ))],
+        )
+        .expect("batch")
+    }
+
+    /// Open the lanes over the opening batches, then hold each lane to its
+    /// real share of the reserve, so the next feed outgrows it.
+    fn open_lanes_then_lower_the_floor(w: &mut SupertableWriter, live: bool) {
+        w.live_disabled = !live;
+        for b in 0..UNIQUE_OPENING_BATCHES {
+            w.append(&unique_batch(b)).expect("append");
+        }
+        assert_eq!(w.live.is_some(), live, "the lanes opened");
+        if let Some(lanes) = w.live.as_mut() {
+            lanes.threshold_floor = 1;
+        }
+    }
+
+    /// Wait for the feed in flight and hand the lanes back to the writer:
+    /// the bytes the budget holds beyond the lanes' build reserve, which is
+    /// what it granted them past their thresholds. Panics if a lane failed.
+    fn granted_past_the_reserve(w: &mut SupertableWriter) -> usize {
+        let live = w.live.as_mut().expect("the lanes are open");
+        let lanes = live.join().expect("no lane gave up");
+        live.lanes = Some(lanes);
+        let reserved: usize = live.reservations.iter().map(Reservation::size).sum();
+        w.inner
+            .options
+            .connection_memory_budget
+            .used_bytes()
+            .checked_sub(reserved)
+            .expect("the budget holds at least the lanes' reserve")
+    }
+
+    /// Under a budget that does not refuse — the default — a lane that
+    /// outgrows its share of the reserve asks for more and goes on: the
+    /// lanes stay open, the commit seals from them, the table is the one a
+    /// commit-time build makes, and the commit gives every byte back.
     #[test]
-    fn a_lane_that_outgrows_its_reservation_hands_the_commit_to_the_buffer() {
-        const ROWS_PER_BATCH: usize = 2_000;
-        /// Batches that open the lanes under the default floor: about 200
-        /// KiB of text each against the 1 MiB split.
-        const OPENING_BATCHES: usize = 8;
-        /// Tokens per row, every one new to the table.
-        const UNIQUE_TOKENS: usize = 12;
-        let unique_batch = |batch: usize| {
-            RecordBatch::try_new(
-                schema_id_title(),
-                vec![Arc::new(LargeStringArray::from(
-                    (0..ROWS_PER_BATCH)
-                        .map(|i| {
-                            let row = batch * ROWS_PER_BATCH + i;
-                            (0..UNIQUE_TOKENS)
-                                .map(|k| format!("r{row}k{k}"))
-                                .collect::<Vec<_>>()
-                                .join(" ")
-                        })
-                        .collect::<Vec<_>>(),
-                ))],
-            )
-            .expect("batch")
-        };
+    fn a_lane_that_outgrows_its_share_grows_under_a_measured_budget() {
         let build = |live: bool| {
             let st = Supertable::create(live_options(2, 1, 4096, false)).expect("create");
+            let budget = Arc::clone(&st.options().connection_memory_budget);
+            assert!(budget.limit().is_none(), "the default budget measures");
+            let baseline = budget.used_bytes();
             let mut w = st.writer().expect("writer");
-            w.live_disabled = !live;
-            for b in 0..OPENING_BATCHES {
+            open_lanes_then_lower_the_floor(&mut w, live);
+            for b in UNIQUE_OPENING_BATCHES..UNIQUE_OPENING_BATCHES + 2 {
                 w.append(&unique_batch(b)).expect("append");
             }
-            assert_eq!(w.live.is_some(), live, "the lanes opened");
-            if let Some(lanes) = w.live.as_mut() {
-                // Hold each lane to its real share of the reserve.
-                lanes.threshold_floor = 1;
-            }
-            // The next feed fails on the pool; the append after it sees the
-            // failure and drops the lanes.
-            w.append(&unique_batch(OPENING_BATCHES)).expect("append");
-            w.append(&unique_batch(OPENING_BATCHES + 1))
-                .expect("append");
             if live {
-                assert!(w.live.is_none(), "the lanes are dropped");
-                assert!(w.live_disabled, "the commit builds from the buffer");
+                assert!(w.live.is_some(), "the lanes are still open");
+                assert!(!w.live_disabled, "no feed gave up");
+                assert!(
+                    granted_past_the_reserve(&mut w) > 0,
+                    "the lanes were granted more than their share"
+                );
             }
             w.commit().expect("commit");
+            assert!(w.live.is_none(), "the commit consumes the lanes");
+            assert_eq!(budget.denials(), 0);
+            assert_eq!(
+                budget.used_bytes(),
+                baseline,
+                "the commit gives back everything the lanes held"
+            );
             drop(w);
             st
         };
@@ -18315,7 +18380,77 @@ mod tests {
         let plain = build(false);
         assert_eq!(
             live.reader().expect("reader").n_docs_total(),
-            ((OPENING_BATCHES + 2) * ROWS_PER_BATCH) as u64
+            ((UNIQUE_OPENING_BATCHES + 2) * UNIQUE_ROWS_PER_BATCH) as u64
+        );
+        assert_eq!(piece_sizes(&live), piece_sizes(&plain));
+        for term in ["r4321k7", "r19999k11", "r0k0"] {
+            assert!(!scored_hits(&live, term, 10).is_empty(), "{term}: no hits");
+            assert_eq!(
+                scored_hits(&live, term, 10),
+                scored_hits(&plain, term, 10),
+                "{term}: hits or scores differ"
+            );
+        }
+    }
+
+    /// What the budget granted lanes past their thresholds goes back when
+    /// the lanes are dropped without a commit.
+    #[test]
+    fn dropped_lanes_give_back_what_they_were_granted() {
+        let st = Supertable::create(live_options(2, 1, 4096, false)).expect("create");
+        let budget = Arc::clone(&st.options().connection_memory_budget);
+        let baseline = budget.used_bytes();
+        let mut w = st.writer().expect("writer");
+        open_lanes_then_lower_the_floor(&mut w, true);
+        w.append(&unique_batch(UNIQUE_OPENING_BATCHES))
+            .expect("append");
+        assert!(granted_past_the_reserve(&mut w) > 0, "the lanes grew");
+        w.disable_live();
+        assert_eq!(
+            budget.used_bytes(),
+            baseline,
+            "the dropped lanes hold nothing"
+        );
+        w.commit().expect("commit from the buffer");
+        assert_eq!(budget.used_bytes(), baseline);
+    }
+
+    /// Under a budget too small for what the lanes grow to, a lane that
+    /// outgrows its share is refused more and fails the feed; the lanes
+    /// are dropped, and the commit builds from the buffer as a commit
+    /// without lanes does.
+    #[test]
+    fn a_lane_that_outgrows_its_reservation_hands_the_commit_to_the_buffer() {
+        let build = |live: bool| {
+            let mut opts = live_options(2, 1, 4096, false);
+            opts.connection_memory_budget = ConnectionMemoryBudget::with_limit(TIGHT_BUDGET_BYTES);
+            let st = Supertable::create(opts).expect("create");
+            let mut w = st.writer().expect("writer");
+            open_lanes_then_lower_the_floor(&mut w, live);
+            // The next feed fails on the pool; the append after it sees the
+            // failure and drops the lanes.
+            w.append(&unique_batch(UNIQUE_OPENING_BATCHES))
+                .expect("append");
+            w.append(&unique_batch(UNIQUE_OPENING_BATCHES + 1))
+                .expect("append");
+            if live {
+                assert!(w.live.is_none(), "the lanes are dropped");
+                assert!(w.live_disabled, "the commit builds from the buffer");
+                assert!(
+                    st.options().connection_memory_budget.denials() >= 1,
+                    "the budget refused a lane"
+                );
+            }
+            w.commit().expect("commit");
+            assert_eq!(st.options().connection_memory_budget.used_bytes(), 0);
+            drop(w);
+            st
+        };
+        let live = build(true);
+        let plain = build(false);
+        assert_eq!(
+            live.reader().expect("reader").n_docs_total(),
+            ((UNIQUE_OPENING_BATCHES + 2) * UNIQUE_ROWS_PER_BATCH) as u64
         );
         assert_eq!(piece_sizes(&live), piece_sizes(&plain));
         assert_eq!(
@@ -18324,54 +18459,33 @@ mod tests {
         );
     }
 
-    /// A lane that outgrows its reservation on the batch a commit closes
-    /// fails a feed no later append sees. The commit takes the failure as
-    /// an append would: it drops the lanes and builds from the buffer, so a
-    /// caller that appends once and commits loses no rows.
+    /// A lane refused more on the batch a commit closes fails a feed no
+    /// later append sees. The commit takes the failure as an append would:
+    /// it drops the lanes and builds from the buffer, so a caller that
+    /// appends once and commits loses no rows.
     #[test]
     fn a_lane_that_outgrows_on_the_last_feed_hands_the_commit_to_the_buffer() {
-        const ROWS_PER_BATCH: usize = 2_000;
-        /// Batches that open the lanes under the default floor: about 200
-        /// KiB of text each against the 1 MiB split.
-        const OPENING_BATCHES: usize = 8;
-        /// Tokens per row, every one new to the table.
-        const UNIQUE_TOKENS: usize = 12;
-        let unique_batch = |batch: usize| {
-            RecordBatch::try_new(
-                schema_id_title(),
-                vec![Arc::new(LargeStringArray::from(
-                    (0..ROWS_PER_BATCH)
-                        .map(|i| {
-                            let row = batch * ROWS_PER_BATCH + i;
-                            (0..UNIQUE_TOKENS)
-                                .map(|k| format!("r{row}k{k}"))
-                                .collect::<Vec<_>>()
-                                .join(" ")
-                        })
-                        .collect::<Vec<_>>(),
-                ))],
-            )
-            .expect("batch")
-        };
         let build = |live: bool| {
-            let st = Supertable::create(live_options(2, 1, 4096, false)).expect("create");
+            let mut opts = live_options(2, 1, 4096, false);
+            opts.connection_memory_budget = ConnectionMemoryBudget::with_limit(TIGHT_BUDGET_BYTES);
+            let st = Supertable::create(opts).expect("create");
             let mut w = st.writer().expect("writer");
-            w.live_disabled = !live;
-            for b in 0..OPENING_BATCHES {
-                w.append(&unique_batch(b)).expect("append");
-            }
-            assert_eq!(w.live.is_some(), live, "the lanes opened");
-            if let Some(lanes) = w.live.as_mut() {
-                // Hold each lane to its real share of the reserve.
-                lanes.threshold_floor = 1;
-            }
+            open_lanes_then_lower_the_floor(&mut w, live);
             // This feed fails on the pool, and the commit is the next call.
-            w.append(&unique_batch(OPENING_BATCHES)).expect("append");
+            w.append(&unique_batch(UNIQUE_OPENING_BATCHES))
+                .expect("append");
             if live {
                 assert!(w.live.is_some(), "no append has seen the failure yet");
             }
             w.commit()
                 .expect("the commit builds from the buffer, not fails");
+            if live {
+                assert!(
+                    st.options().connection_memory_budget.denials() >= 1,
+                    "the budget refused a lane"
+                );
+            }
+            assert_eq!(st.options().connection_memory_budget.used_bytes(), 0);
             drop(w);
             st
         };
@@ -18379,7 +18493,7 @@ mod tests {
         let plain = build(false);
         assert_eq!(
             live.reader().expect("reader").n_docs_total(),
-            ((OPENING_BATCHES + 1) * ROWS_PER_BATCH) as u64
+            ((UNIQUE_OPENING_BATCHES + 1) * UNIQUE_ROWS_PER_BATCH) as u64
         );
         assert_eq!(piece_sizes(&live), piece_sizes(&plain));
         assert_eq!(
