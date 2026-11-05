@@ -201,48 +201,59 @@ async fn delete_objects(
         .await;
 }
 
-/// Drop the cached copy of each superfile and vector-state blob about to be deleted. Unlinking
-/// thousands of files is blocking filesystem work, so it runs on the blocking pool, off the runtime
-/// queries share.
+/// Drop the cached copies of the objects about to be deleted. A sweep's keys mix every kind of
+/// object a table stores; superfiles have a copy in the data cache and vector-state blobs one in the
+/// metadata cache, and the other kinds are not cached locally.
 async fn erase_cached_copies(inner: &SupertableInner, keys: &[String]) {
-    let superfiles: Vec<SuperfileUri> = keys
+    erase_cached_superfiles(inner, keys).await;
+    erase_cached_vector_states(inner, keys).await;
+}
+
+/// Drop the data-cache copy of each superfile in `keys`. Unlinking thousands of files is blocking
+/// filesystem work, so it runs on the blocking pool, off the runtime queries share.
+async fn erase_cached_superfiles(inner: &SupertableInner, keys: &[String]) {
+    let Some(cache) = inner.options.disk_cache.clone() else {
+        return;
+    };
+    let uris: Vec<SuperfileUri> = keys
         .iter()
         .filter_map(|key| SuperfileUri::from_storage_path(key))
         .collect();
-    let vector_states: Vec<ContentHash> = keys
-        .iter()
-        .filter_map(|key| slow_vector_state::content_hash_of_path(key))
-        .collect();
-    let superfile_cache = inner
-        .options
-        .disk_cache
-        .clone()
-        .filter(|_| !superfiles.is_empty());
-    let vector_state_cache = inner
-        .options
-        .metadata_disk_cache
-        .clone()
-        .filter(|_| !vector_states.is_empty());
-
-    if superfile_cache.is_none() && vector_state_cache.is_none() {
+    if uris.is_empty() {
         return;
     }
-
     if let Err(error) = spawn_blocking(move || {
-        if let Some(cache) = superfile_cache {
-            for uri in &superfiles {
-                cache.erase_superfile_local_copy(uri);
-            }
-        }
-        if let Some(cache) = vector_state_cache {
-            for hash in &vector_states {
-                cache.remove(hash);
-            }
+        for uri in &uris {
+            cache.erase_superfile_local_copy(uri);
         }
     })
     .await
     {
-        warn!(%error, "gc: disk-cache erase for deleted objects did not finish");
+        warn!(%error, "gc: disk-cache erase for deleted superfiles did not finish");
+    }
+}
+
+/// Drop the metadata-cache copy of each vector-state blob in `keys`, on the blocking pool like
+/// [`erase_cached_superfiles`].
+async fn erase_cached_vector_states(inner: &SupertableInner, keys: &[String]) {
+    let Some(cache) = inner.options.metadata_disk_cache.clone() else {
+        return;
+    };
+    let hashes: Vec<ContentHash> = keys
+        .iter()
+        .filter_map(|key| slow_vector_state::content_hash_of_path(key))
+        .collect();
+    if hashes.is_empty() {
+        return;
+    }
+    if let Err(error) = spawn_blocking(move || {
+        for hash in &hashes {
+            cache.remove(hash);
+        }
+    })
+    .await
+    {
+        warn!(%error, "gc: metadata-cache erase for deleted vector state did not finish");
     }
 }
 
