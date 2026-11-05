@@ -111,7 +111,6 @@ use tempfile::{Builder, TempDir};
 use tracing::debug;
 
 use super::term_table::{SLOT_BYTES_PER_TERM, TermTable};
-
 use crate::{
     config::scratch_root,
     superfile::{

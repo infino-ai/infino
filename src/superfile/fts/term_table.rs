@@ -211,8 +211,9 @@ fn le_u32(b: &[u8]) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::collections::HashMap;
+
+    use super::*;
 
     fn padded(b: &[u8]) -> [u64; 2] {
         let mut buf = [0u8; 16];
