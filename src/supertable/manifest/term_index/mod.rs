@@ -1020,6 +1020,9 @@ pub(crate) struct FoldBudget {
     pub(crate) memory_bytes: u64,
     pub(crate) ranges: usize,
     pub(crate) cursors: usize,
+    /// Memory the process may still take, which the page cache can hold a
+    /// downloaded fold's inputs in.
+    pub(crate) cache_bytes: u64,
 }
 
 impl FoldBudget {
@@ -1035,6 +1038,7 @@ impl FoldBudget {
             memory_bytes: available.saturating_mul(100 - MERGE_MEMORY_RESERVE_PERCENT) / 100,
             ranges: pool_threads,
             cursors,
+            cache_bytes: available,
         }
     }
 
@@ -1055,14 +1059,26 @@ impl FoldBudget {
     }
 
     /// Whether a fold of `layers` in `ranges` key ranges reads its inputs
-    /// straight from storage: when it holds enough slices that its ranges
-    /// are cut at one mark per slice, with no slice read to cut them, and
-    /// memory holds a streamed cursor for each layer and range. A streamed
-    /// fold neither writes its inputs to local disk nor reads them back, so
-    /// the disk stops bounding it; a fold of few slices downloads quickly.
-    pub(crate) fn streams(&self, layers: &[Layer], ranges: usize) -> bool {
+    /// straight from storage: when its inputs, at `local_milli` local bytes
+    /// per slice byte, are more than the page cache holds, so a download
+    /// would be read back from the disk; when it holds enough slices that
+    /// its ranges are cut at one mark per slice, with no slice read to cut
+    /// them; and when memory holds a streamed cursor for each layer and
+    /// range. A fold the page cache holds, or one of few slices, downloads.
+    pub(crate) fn streams(&self, layers: &[Layer], ranges: usize, local_milli: u64) -> bool {
         let slices: usize = layers.iter().map(|layer| layer.slices.len()).sum();
-        slices >= ranges.saturating_mul(build::ONE_MARK_SLICES_PER_RANGE)
+        let per_slice = match local_milli {
+            0 => FOLD_DISK_PER_SLICE_MILLI,
+            milli => milli.max(THOUSANDTHS),
+        };
+        let local = layers
+            .iter()
+            .map(layer_bytes)
+            .fold(0u64, |sum, size| sum.saturating_add(size))
+            .saturating_mul(per_slice)
+            / THOUSANDTHS;
+        local > self.cache_bytes
+            && slices >= ranges.saturating_mul(build::ONE_MARK_SLICES_PER_RANGE)
             && (layers.len() as u64)
                 .saturating_mul(ranges as u64)
                 .saturating_mul(STREAM_CURSOR_BYTES)
@@ -9036,6 +9052,7 @@ mod tests {
         FoldBudget {
             memory_bytes: FoldBudget::fold_bytes(layers, 1),
             ranges: 1,
+            cache_bytes: u64::MAX,
             cursors: usize::MAX,
         }
     }
@@ -9117,12 +9134,14 @@ mod tests {
         let tight = FoldBudget {
             memory_bytes: FoldBudget::fold_bytes(FOLD_LAYERS_TARGET, 4),
             ranges: 32,
+            cache_bytes: u64::MAX,
             cursors: usize::MAX,
         };
         assert_eq!(tight.shape(), (FOLD_LAYERS_TARGET, 4));
         let wide = FoldBudget {
             memory_bytes: FoldBudget::fold_bytes(1000, MERGE_RANGES_MAX),
             ranges: 88,
+            cache_bytes: u64::MAX,
             cursors: usize::MAX,
         };
         assert_eq!(wide.shape(), (1000, MERGE_RANGES_MAX));
@@ -10407,6 +10426,7 @@ mod tests {
         let wide = FoldBudget {
             memory_bytes: FoldBudget::fold_bytes(FOLD_FAN_OUT, 8),
             ranges: 8,
+            cache_bytes: u64::MAX,
             cursors: usize::MAX,
         };
         let fold = plan_fold_at_optimize(&root, &live, u64::MAX, wide, false, false)
@@ -10456,6 +10476,52 @@ mod tests {
             );
         });
         assert_eq!(faults.fired(), 1);
+    }
+
+    /// A fold streams only when its inputs are more than the page cache
+    /// holds, it has enough slices to cut at one mark each, and memory holds
+    /// its streamed cursors.
+    #[test]
+    fn a_fold_streams_only_what_the_page_cache_cannot_hold() {
+        let layers: Vec<Layer> = (0..4)
+            .map(|i| Layer {
+                slices: (0..300)
+                    .map(|j| SliceRef {
+                        first_key: Vec::new(),
+                        last_key: Vec::new(),
+                        content_hash: ContentHash::of(format!("{i}/{j}").as_bytes()),
+                        tier: None,
+                        len: 1 << 20,
+                    })
+                    .collect(),
+                ordinals: None,
+                base: 0,
+            })
+            .collect();
+        let local = 1200u64 << 20; // 1,200 slices of 1 MiB, one local byte per slice byte
+        let budget = |cache_bytes: u64| FoldBudget {
+            memory_bytes: 64 << 30,
+            ranges: 4,
+            cursors: usize::MAX,
+            cache_bytes,
+        };
+        assert!(budget(local - 1).streams(&layers, 4, THOUSANDTHS));
+        assert!(
+            !budget(local).streams(&layers, 4, THOUSANDTHS),
+            "the cache holds it"
+        );
+        assert!(
+            !budget(0).streams(&layers[..1], 4, THOUSANDTHS),
+            "too few slices to cut"
+        );
+        let small_memory = FoldBudget {
+            memory_bytes: 1 << 30,
+            ..budget(0)
+        };
+        assert!(
+            !small_memory.streams(&layers, 4, THOUSANDTHS),
+            "no memory for its cursors"
+        );
     }
 
     /// Objects a fold reads in place count as room, so a run prefetched onto

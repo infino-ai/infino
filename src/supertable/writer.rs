@@ -12388,7 +12388,8 @@ pub(in crate::supertable) async fn stamp_term_index(
                             false => Vec::new(),
                         };
                         // A fold that will stream reads nothing from local disk.
-                        if !next.is_empty() && !fold_budget.streams(&next, fold.ranges()) {
+                        let local_milli = disk_per_slice.load(Ordering::Relaxed);
+                        if !next.is_empty() && !fold_budget.streams(&next, fold.ranges(), local_milli) {
                             *prefetch.0.lock().expect("prefetch") =
                                 Some(spawn(term_index::prefetch_layers(
                                     Arc::clone(storage),
@@ -12408,7 +12409,7 @@ pub(in crate::supertable) async fn stamp_term_index(
                             keep_uploads: keep,
                             disk_per_slice_milli: Some(Arc::clone(disk_per_slice)),
                             downloaded: Some(Arc::clone(&downloaded)),
-                            stream: fold_budget.streams(&root.layers[fold.run()], fold.ranges()),
+                            stream: fold_budget.streams(&root.layers[fold.run()], fold.ranges(), local_milli),
                             tier_lens: Arc::clone(tier_lens),
                         };
                         let renumbers = fold.renumbers();
