@@ -27,6 +27,7 @@ Supertable::optimize	covered	(&self, &OptimizeOptions) -> Result<(), OptimizeErr
 Supertable::reindex	covered	(&self, &ReindexOptions) -> Result<ReindexReport, ReindexError>
 Supertable::reindex_plan	covered	(&self, &ReindexOptions) -> Result<Vec<PlannedRepair>, ReindexError>
 Supertable::schema	covered	(&self) -> SchemaRef
+Supertable::sorted_search	covered	(&self, &str, bool, usize, Option<&[&str]>) -> Result<Vec<RecordBatch>, InfinoError>
 Supertable::token_match	covered	(&self, &str, &str, BoolMode, Option<&[&str]>) -> Result<Vec<RecordBatch>, InfinoError>
 Supertable::update	covered	(&self, Expr, &RecordBatch) -> Result<MutationStats, InfinoError>
 Supertable::value_counts	covered	(&self, &str) -> Result<RecordBatch, InfinoError>

@@ -289,6 +289,10 @@ export interface MatchOptions {
   projection?: string[];
   arrow?: boolean;
 }
+export interface SortedSearchOptions extends MatchOptions {
+  /** Highest first; lowest first when omitted. */
+  descending?: boolean;
+}
 export interface CountOptions {
   mode?: BoolMode;
 }
@@ -612,6 +616,16 @@ export class Table {
   exactMatch(column: string, value: string, opts?: MatchOptions): RowRecord[];
   exactMatch(column: string, value: string, opts: MatchOptions = {}): RowRecord[] | arrow.Table {
     const buf = guard(this.remote, () => this.inner.exactMatch(column, value, opts.projection));
+    return decode(buf, opts.arrow);
+  }
+
+  /** The first `k` rows by one range-indexed `column`, highest first with
+   * `descending`; rows sharing a value come in `_id` order and rows without
+   * one last. Rows as records (or an Arrow `Table`), in that order. */
+  sortedSearch(column: string, k: number, opts: SortedSearchOptions & { arrow: true }): arrow.Table;
+  sortedSearch(column: string, k: number, opts?: SortedSearchOptions): RowRecord[];
+  sortedSearch(column: string, k: number, opts: SortedSearchOptions = {}): RowRecord[] | arrow.Table {
+    const buf = guard(this.remote, () => this.inner.sortedSearch(column, k, opts.descending, opts.projection));
     return decode(buf, opts.arrow);
   }
 
