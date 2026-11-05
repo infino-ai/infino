@@ -43,7 +43,6 @@ use std::{
     future::Future,
     io,
     iter::repeat_n,
-    mem,
     ops::Range,
     path::{Path, PathBuf},
     sync::{
@@ -52,8 +51,6 @@ use std::{
     },
 };
 
-#[cfg(test)]
-use build::{build_layer, merge_layers};
 pub(crate) use build::{
     BuildPolicy, BuiltBytes, Contribution, ContributionWriter, HEAD_DEPTH, HEAD_DEPTH_MAX,
     HeadSink, SliceFile, build_onto, scratch_dir, tier_path,
@@ -63,6 +60,8 @@ pub(crate) use build::{Built, build, first_contribution_difference};
 use build::{
     BuiltLayer, MERGE_RANGES_MAX, MergedLayer, build_layer_with, merge_layers_into, rebase_run,
 };
+#[cfg(test)]
+use build::{build_layer, merge_layers};
 use bytes::Bytes;
 #[cfg(test)]
 pub(crate) use format::TierRef;
