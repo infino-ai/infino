@@ -14250,7 +14250,8 @@ mod tests {
             gc::superseded::reclaim,
             handle::Supertable,
             manifest::{
-                CellVectorSummary, ClusterCentroids, VectorSummary,
+                CellVectorSummary, ClusterCentroids, SUPERFILE_DATA_DIR, SUPERFILE_KEY_SUFFIX,
+                VectorSummary,
                 commit::{MANIFEST_DIR, POINTER_PATH, manifest_uri},
             },
             query::vector::assemble_hnsw_incremental,
@@ -18064,6 +18065,69 @@ mod tests {
         assert_eq!(
             hit_titles(&st, "heavy", usize::MAX),
             hit_titles(&plain, "heavy", usize::MAX)
+        );
+    }
+
+    /// A live commit's uploads start while its pieces are still building and
+    /// run beside the publish's own writes, but the commit lists nothing
+    /// until every one has landed: with one upload held back, the manifest
+    /// list is written only after that superfile is in storage.
+    #[test]
+    fn a_live_commit_lists_its_superfiles_only_after_every_upload_lands() {
+        /// How long the first upload is held: far longer than the commit's
+        /// other pieces take to build, upload and reach the publish.
+        const HELD_UPLOAD: Duration = Duration::from_millis(500);
+        const ROWS_PER_BATCH: usize = 2_000;
+        const BATCHES: usize = 4;
+        let dir = TempDir::new().expect("tempdir");
+        let local: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let faults = FaultStorage::wrap(local);
+        let storage: Arc<dyn StorageProvider> = Arc::<FaultStorage>::clone(&faults);
+        let st = Supertable::create(live_options(2, 1, 4096, false).with_storage(storage))
+            .expect("create");
+        let mut w = st.writer().expect("writer");
+        for b in 0..BATCHES {
+            w.append(&live_batch(b, ROWS_PER_BATCH)).expect("append");
+        }
+        assert!(w.live.is_some(), "the commit seals from the lanes");
+
+        // Superfiles in storage: the local store writes each one beside its
+        // key and renames it into place, so a file under its key is whole.
+        let data_dir = dir.path().join(SUPERFILE_DATA_DIR);
+        let stored = move || {
+            fs::read_dir(&data_dir).map_or(0, |entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .filter(|e| {
+                        e.file_name()
+                            .to_string_lossy()
+                            .ends_with(SUPERFILE_KEY_SUFFIX)
+                    })
+                    .count()
+            })
+        };
+        faults.before(FaultOp::PutAtomic, "data/", || {
+            thread::sleep(HELD_UPLOAD);
+        });
+        let stored_at_list = Arc::new(AtomicUsize::new(usize::MAX));
+        let seen = Arc::clone(&stored_at_list);
+        faults.before(FaultOp::PutAtomic, "manifest/manifest-", move || {
+            seen.store(stored(), Ordering::SeqCst);
+        });
+        w.commit().expect("commit");
+        drop(w);
+
+        let listed = st.reader().expect("reader").n_superfiles();
+        assert!(listed >= 2, "the commit cut several pieces, got {listed}");
+        assert_eq!(
+            stored_at_list.load(Ordering::SeqCst),
+            listed,
+            "every listed superfile was in storage when its list was written"
+        );
+        assert_eq!(
+            st.reader().expect("reader").n_docs_total(),
+            (BATCHES * ROWS_PER_BATCH) as u64
         );
     }
 
