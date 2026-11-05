@@ -1131,7 +1131,7 @@ impl ManifestSnapshot {
                 .as_ref()
                 .and_then(|current| current.list.as_ref()),
             &storage,
-            options.manifest_disk_cache.as_ref(),
+            options.metadata_disk_cache.as_ref(),
         )
         .await?;
         let parts: DashMap<_, _> = DashMap::new();
@@ -3773,7 +3773,7 @@ async fn fill_rollups(
     list: &mut Manifest,
     current: Option<&Manifest>,
     storage: &Arc<dyn StorageProvider>,
-    cache: Option<&Arc<ManifestDiskCache>>,
+    cache: Option<&Arc<MetadataDiskCache>>,
 ) -> Result<(), ManifestLoadError> {
     let held: HashMap<PartId, &ManifestPartEntry> = current
         .map(|current| {
@@ -3830,7 +3830,7 @@ async fn fill_rollups(
 /// and the parse run off the runtime, as a part's do.
 async fn read_rollups(
     storage: &Arc<dyn StorageProvider>,
-    cache: Option<&Arc<ManifestDiskCache>>,
+    cache: Option<&Arc<MetadataDiskCache>>,
     reference: &RollupsRef,
     part_id: PartId,
 ) -> Result<HashMap<FieldId, ScalarStatsAgg>, ManifestLoadError> {
