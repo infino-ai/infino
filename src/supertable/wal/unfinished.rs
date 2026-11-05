@@ -68,6 +68,15 @@ impl UnfinishedWals {
         self.lock().clone()
     }
 
+    /// Whether nothing is left and no background retry is running, for
+    /// tests. An empty list alone does not say a retry is done: a retry
+    /// takes its WALs off the list before it drives them
+    /// ([`finish_unfinished`]), and only clears `retrying` once it has.
+    #[cfg(test)]
+    pub(crate) fn settled(&self) -> bool {
+        self.lock().is_empty() && !self.retrying.load(Ordering::SeqCst)
+    }
+
     /// Keep the background retry from starting, so a test can watch a WAL
     /// stay unfinished and finish it by another route.
     #[cfg(test)]
