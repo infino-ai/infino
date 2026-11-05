@@ -53,6 +53,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fmt,
+    path::PathBuf,
     sync::{Arc, Mutex, OnceLock, PoisonError},
     time::Duration,
 };
@@ -72,7 +73,7 @@ use super::{
 use crate::{
     config::{
         Config, CrcVerification, DrainConsolidate, StorageBackend, StorageColdFetchMode,
-        ThreadCount,
+        ThreadCount, scratch_root,
     },
     memory::ConnectionMemoryBudget,
     runtime_metrics::rss::total_memory_bytes,
@@ -1136,6 +1137,15 @@ impl SupertableOptions {
     /// terms to index; its callers check that themselves.
     pub(crate) fn keeps_term_index(&self) -> bool {
         self.term_index && self.storage.is_some()
+    }
+
+    /// Where this table's large scratch files go: beside the disk cache when
+    /// one is attached, on the disk sized for the table, else
+    /// `storage.scratch_root`.
+    pub(crate) fn scratch_dir(&self) -> PathBuf {
+        self.disk_cache
+            .as_ref()
+            .map_or_else(scratch_root, |cache| cache.scratch_root())
     }
 
     /// What the term-index build takes from these options.
