@@ -5931,7 +5931,6 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         .storage
         .clone()
         .ok_or_else(|| BuildError::Store("hidden drain requires storage".into()))?;
-    let shard_count = packed_cell_shard_count(&hidden_inner.options);
     let drain_pool = maint_pool()?;
     let consolidate = user_inner.options.drain_consolidate;
 
@@ -5945,11 +5944,15 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
     let (batches, mut remote_state) = if let Some(remote_state) =
         load_drain_remote_checkpoint(&hidden_inner).await?
     {
-        if remote_state.checkpoint.shard_count != shard_count {
-            return Err(BuildError::Store(format!(
-                "drain checkpoint shard count {} != configured writer width {shard_count}",
-                remote_state.checkpoint.shard_count
-            )));
+        // The recorded shard count, not this process's writer pool width,
+        // decides the shards: the width follows the machine, and a drain
+        // started on one machine is resumed by whichever one opens the table
+        // next. The epoch's finished shards are keyed by `cell % count`, so
+        // the resume must keep the count they were cut with.
+        if remote_state.checkpoint.shard_count == 0 {
+            return Err(BuildError::Store(
+                "drain checkpoint records no shards".into(),
+            ));
         }
         if remote_state.checkpoint.options_hash != current_options_hash {
             return Err(BuildError::Store(format!(
@@ -6009,7 +6012,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             &current_options_hash,
             &remote_state.checkpoint.sources,
             &remote_state.checkpoint.batch_layout,
-            shard_count,
+            remote_state.checkpoint.shard_count,
             consolidate,
         );
         if epoch_id != remote_state.checkpoint.epoch_id {
@@ -6047,6 +6050,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         };
         let batches = make_drain_batches(selected, budget);
         let batch_layout = drain_batch_layout(&batches);
+        let shard_count = packed_cell_shard_count(&hidden_inner.options);
         let epoch_id = drain_epoch_id(
             &current_options_hash,
             &source_refs,
@@ -6066,6 +6070,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         let remote_state = create_drain_remote_checkpoint(&hidden_inner, checkpoint).await?;
         (batches, remote_state)
     };
+    let shard_count = remote_state.checkpoint.shard_count;
 
     let store = user_inner.options.store.clone();
     let disk_cache = user_inner.options.disk_cache.clone();
@@ -15936,6 +15941,99 @@ mod tests {
                 "axis {axis}: exact matches are served from the hidden cells"
             );
         }
+    }
+
+    /// A drain interrupted on a machine with one writer pool width resumes on
+    /// a machine with another: the resume cuts the epoch's remaining shards
+    /// with the count the checkpoint recorded and drains every row once,
+    /// instead of refusing the table's drain on every machine but the first.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drain_resumes_with_recorded_shard_count_on_another_pool_width() {
+        /// Writer pool width of the machine that starts the drain.
+        const STARTED_WIDTH: usize = 2;
+        /// Writer pool width of the machine that resumes it.
+        const RESUMED_WIDTH: usize = 3;
+        const COMMITS: usize = 3;
+        let directory = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(directory.path()).expect("provider"));
+        let options = |width: usize| {
+            options_title_emb_serial(COMMIT_AS_DRAIN_TEST_DIM)
+                .with_storage(Arc::clone(&storage))
+                .with_writer_pool(writer_pool_with(width))
+                .with_drain_batch_superfiles(1)
+        };
+        let table = Supertable::create(options(STARTED_WIDTH)).expect("create");
+        for _ in 0..COMMITS {
+            let mut writer = table.writer().expect("writer");
+            writer
+                .append(&build_axis_vector_batch(
+                    COMMIT_AS_DRAIN_TEST_ROWS,
+                    COMMIT_AS_DRAIN_TEST_DIM,
+                ))
+                .expect("append");
+            writer.commit().expect("commit");
+        }
+        let (hidden, epoch_id) = current_drain_epoch(&table).await;
+        inject_drain_test_failure(epoch_id.clone(), DrainTestFailurePhase::AfterBatch, 1);
+        let first = drain_user_superfiles_to_hidden_cells(
+            Arc::clone(table.inner()),
+            Arc::clone(hidden.inner()),
+        )
+        .await;
+        assert!(first.is_err(), "first drain must stop at the failpoint");
+        let pending = load_drain_remote_checkpoint(hidden.inner())
+            .await
+            .expect("load pending slow state")
+            .expect("pending drain");
+        assert_eq!(pending.checkpoint.shard_count, STARTED_WIDTH);
+        drop(hidden);
+        drop(table);
+
+        let table = Supertable::open(options(RESUMED_WIDTH)).expect("reopen");
+        let (hidden, fresh_epoch_id) = current_drain_epoch(&table).await;
+        assert_ne!(
+            fresh_epoch_id, epoch_id,
+            "the new width must change what a fresh drain would record"
+        );
+        drain_user_superfiles_to_hidden_cells(
+            Arc::clone(table.inner()),
+            Arc::clone(hidden.inner()),
+        )
+        .await
+        .expect("resume on another pool width");
+        assert!(
+            !drain_scratch_dir(&epoch_id).exists(),
+            "the recorded epoch is the one that completed"
+        );
+        assert!(
+            load_drain_remote_checkpoint(hidden.inner())
+                .await
+                .expect("load settled slow state")
+                .is_none(),
+            "settled slow-CAS state contains no pending drain"
+        );
+
+        let hidden_manifest = Arc::clone(hidden.reader().expect("reader").manifest());
+        let drained = hidden_manifest.get_drained_ranges();
+        let user_manifest = Arc::clone(table.reader().expect("reader").manifest());
+        assert!(
+            user_manifest
+                .superfiles
+                .iter()
+                .all(|entry| drained.contains(entry.birth_version)),
+            "every commit's version is drained"
+        );
+        let hidden_rows: u64 = hidden_manifest
+            .superfiles
+            .iter()
+            .map(|entry| entry.n_docs)
+            .sum();
+        assert_eq!(
+            hidden_rows,
+            (COMMITS * COMMIT_AS_DRAIN_TEST_ROWS) as u64,
+            "every row lands in the hidden cells exactly once"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
