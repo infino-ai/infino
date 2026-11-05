@@ -36,11 +36,12 @@
 //!   `all`       : explicit "every tier × modality × phase" (the default).
 //!                 Matrix only — diagnostics are NEVER implied by `all` or
 //!                 by a bare `cargo bench`.
-//!   diagnostic  : `scale` | `tombstone` | `update` | `sql-diag` | `fts-diag` | `fts-merge` | `object-store` | `concurrent` | `disk-warm` | `write-diag` | `filtered-vector`,
+//!   diagnostic  : `scale` | `tombstone` | `update` | `sql-diag` | `fts-diag` | `fts-merge` | `object-store` | `concurrent` | `disk-warm` | `write-diag` | `filtered-vector` | `wide-sparse`,
 //!                 by name, or grouped under the `diagnostic` keyword —
 //!                 `cargo bench -- diagnostic` runs all ten,
 //!                 `cargo bench -- diagnostic scale tombstone` a subset.
-//!                 `filtered-vector` (builds 1M-row tables) runs by name only.
+//!                 `filtered-vector` (builds 1M-row tables) and `wide-sparse`
+//!                 (a 2 500-column table) run by name only.
 //!
 //! The matrix tests run = (selected tiers) × (selected modalities).
 //!
@@ -78,6 +79,7 @@ enum Diagnostic {
     RecallWhileIngest,
     WriteDiag,
     FilteredVector,
+    WideSparse,
 }
 
 impl Diagnostic {
@@ -95,6 +97,7 @@ impl Diagnostic {
             Diagnostic::RecallWhileIngest => "recall_while_ingest",
             Diagnostic::WriteDiag => "write-diag",
             Diagnostic::FilteredVector => "filtered-vector",
+            Diagnostic::WideSparse => "wide-sparse",
         }
     }
 
@@ -120,6 +123,7 @@ impl Diagnostic {
             Diagnostic::RecallWhileIngest => infino_bench_utils::recall_while_ingest::run(),
             Diagnostic::WriteDiag => infino_bench_utils::write_diag::run(),
             Diagnostic::FilteredVector => infino_bench_utils::filtered_vector::run(),
+            Diagnostic::WideSparse => infino_bench_utils::wide_sparse::run(),
         }
     }
 }
@@ -344,7 +348,7 @@ fn print_usage_and_exit(code: i32) -> ! {
          \x20           quality = FTS BM25 parity vs a textbook oracle, the two fts cells only)\n\
          all       : every tier x modality x phase (the default for a bare\n\
          \x20           `cargo bench`); matrix only — never implies diagnostics\n\
-         Diagnostic: scale | tombstone | update | sql-diag | fts-diag | fts-merge | object-store | concurrent | disk-warm | recall_while_ingest | filtered-vector,\n\
+         Diagnostic: scale | tombstone | update | sql-diag | fts-diag | fts-merge | object-store | concurrent | disk-warm | recall_while_ingest | filtered-vector | wide-sparse,\n\
          \x20           or `diagnostic` for the grouped set / `diagnostic <names>` for a subset\n\
          \n\
          corpus=<spec>     : corpus source. Default: `realistic` for the two fts\n\
@@ -465,6 +469,7 @@ fn parse_args() -> Selection {
             "recall_while_ingest" => diagnostics.push(Diagnostic::RecallWhileIngest),
             "write-diag" | "write_diag" => diagnostics.push(Diagnostic::WriteDiag),
             "filtered-vector" | "filtered_vector" => diagnostics.push(Diagnostic::FilteredVector),
+            "wide-sparse" | "wide_sparse" => diagnostics.push(Diagnostic::WideSparse),
             "diagnostic" | "diagnostics" => want_diagnostics = true,
             other => match other.split_once('=') {
                 Some(("corpus", spec)) => corpus_spec = Some(spec.to_string()),
