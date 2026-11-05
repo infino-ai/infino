@@ -553,7 +553,7 @@ impl<S: Send, N: Fn() -> S + Sync, E> BatchWork<'_, S, N, E> {
         }
         let starts = match ascending {
             true => run_starts.as_slice(),
-            false => sort_scratch.sort(postings, run_starts),
+            false => sort_scratch.sort::<RADIX_MIN_POSTINGS>(postings, run_starts),
         };
         debug_assert!(
             postings.is_sorted_by(|a, b| a.0 < b.0),
@@ -570,7 +570,7 @@ impl<S: Send, N: Fn() -> S + Sync, E> BatchWork<'_, S, N, E> {
 /// Postings from this many up are ordered by counting passes over their
 /// doc ids; fewer by a comparison sort of their packed keys, which wins
 /// while a pass's buckets outnumber the postings it would move.
-const RADIX_MIN_POSTINGS: usize = if cfg!(test) { 8 } else { 512 };
+const RADIX_MIN_POSTINGS: usize = 512;
 
 /// Widest doc-id digit one counting pass orders by. Its buckets, 8 KiB of
 /// counts, stay in L1 while the pass scatters; a 1-2M document output
@@ -601,7 +601,15 @@ struct SortScratch {
 impl SortScratch {
     /// Sort `postings` in place by doc id and return `run_starts` in the
     /// same order. Only the starts move; the run values stay where they are.
-    fn sort(&mut self, postings: &mut [(u32, u32)], run_starts: &[usize]) -> &[usize] {
+    ///
+    /// `RADIX_MIN` postings and up are ordered by counting passes, fewer by
+    /// a comparison sort. The merge passes [`RADIX_MIN_POSTINGS`]; a test
+    /// picks its own, so it can reach both sorts with inputs of any size.
+    fn sort<const RADIX_MIN: usize>(
+        &mut self,
+        postings: &mut [(u32, u32)],
+        run_starts: &[usize],
+    ) -> &[usize] {
         let (mut min, mut max) = (u32::MAX, 0u32);
         for &(doc, _) in postings.iter() {
             min = min.min(doc);
@@ -616,7 +624,7 @@ impl SortScratch {
         );
         self.tfs.clear();
         self.tfs.extend(postings.iter().map(|&(_, tf)| tf));
-        match self.keys.len() >= RADIX_MIN_POSTINGS {
+        match self.keys.len() >= RADIX_MIN {
             true => self.count_sort(u32::BITS - (max - min).leading_zeros()),
             false => self.keys.sort_unstable(),
         }
@@ -844,14 +852,17 @@ mod tests {
         out
     }
 
-    /// Sorting a term's postings orders them by doc id, each with its tf
-    /// and run start beside it, exactly as a comparison sort of the
-    /// postings does: on both sides of the counting-pass threshold, over
-    /// doc-id spans of every width, at the top of the id range, and over
-    /// ids whose low digits every posting shares.
-    #[test]
-    fn sorting_postings_matches_a_comparison_sort() {
-        /// Most postings a case sorts: enough for two counting passes.
+    /// A counting-pass threshold below the merge's, so cases of a few
+    /// dozen postings reach the counting passes too.
+    const SMALL_RADIX_MIN: usize = 8;
+
+    /// Sort scrambled postings with `RADIX_MIN` as the counting-pass
+    /// threshold and check the result against a comparison sort: on both
+    /// sides of the threshold, over doc-id spans of every width, at the top
+    /// of the id range, and over ids whose low digits every posting shares.
+    fn check_sort_against_a_comparison_sort<const RADIX_MIN: usize>() {
+        /// Most postings a case sorts: past the merge's threshold, and
+        /// enough for two counting passes.
         const MOST: usize = 3_000;
         /// Steps the scrambled order through the postings; prime and
         /// larger than every case, so it visits each posting once.
@@ -864,7 +875,16 @@ mod tests {
             (5, 2_654_435),
             (u32::MAX - 4 * MOST as u32, 3),
         ];
-        for n in [1, 2, RADIX_MIN_POSTINGS - 1, RADIX_MIN_POSTINGS, MOST] {
+        for n in [
+            1,
+            2,
+            RADIX_MIN - 1,
+            RADIX_MIN,
+            RADIX_MIN + 1,
+            RADIX_MIN_POSTINGS - 1,
+            RADIX_MIN_POSTINGS,
+            MOST,
+        ] {
             for (base, stride) in spans {
                 let docs: Vec<u32> = (0..n as u32)
                     .map(|i| base.wrapping_add(i.wrapping_mul(stride)))
@@ -879,15 +899,30 @@ mod tests {
                     .map(|(&(d, tf), &s)| (d, tf, s))
                     .collect();
                 expected.sort_unstable_by_key(|e| e.0);
-                let starts = scratch.sort(&mut postings, &run_starts).to_vec();
+                let starts = scratch
+                    .sort::<RADIX_MIN>(&mut postings, &run_starts)
+                    .to_vec();
                 let got: Vec<(u32, u32, usize)> = postings
                     .iter()
                     .zip(&starts)
                     .map(|(&(d, tf), &s)| (d, tf, s))
                     .collect();
-                assert_eq!(got, expected, "{n} postings from {base} by {stride}");
+                assert_eq!(
+                    got, expected,
+                    "{n} postings from {base} by {stride}, counting from {RADIX_MIN}"
+                );
             }
         }
+    }
+
+    /// Sorting a term's postings orders them by doc id, each with its tf
+    /// and run start beside it, exactly as a comparison sort does: at the
+    /// threshold the merge uses, and at a small one that sends inputs the
+    /// merge would compare through the counting passes instead.
+    #[test]
+    fn sorting_postings_matches_a_comparison_sort() {
+        check_sort_against_a_comparison_sort::<RADIX_MIN_POSTINGS>();
+        check_sort_against_a_comparison_sort::<SMALL_RADIX_MIN>();
     }
 
     /// The ranges a column is walked in cover its terms once each, in

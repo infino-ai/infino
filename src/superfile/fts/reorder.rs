@@ -128,9 +128,10 @@ const PAR_MIN_ITEMS: usize = 4096;
 /// every thread rather than by one thread's `select_nth_unstable`. Only the
 /// splits at the top of the tree rank in parallel, and there a half holds
 /// tens of millions of documents, so a serial selection is the one step of
-/// a round that every other thread waits on. Smaller under test, so the
-/// parallel selection is exercised by corpora a test can afford.
-const PAR_SELECT_MIN: usize = if cfg!(test) { 1 << 10 } else { 1 << 16 };
+/// a round that every other thread waits on. It is also the stretch of keys
+/// each task of a parallel selection takes. The selection takes it as a
+/// parameter, so a test can reach the parallel path with smaller lists.
+const PAR_SELECT_MIN: usize = 1 << 16;
 
 /// Bits of the key a parallel selection's radix descent resolves per pass:
 /// a 2,048-entry histogram per stretch of keys.
@@ -326,6 +327,12 @@ pub(crate) struct LevelReport {
     pub(crate) actual_gain: f64,
     /// Rounds that moved documents but did not lower the cost.
     pub(crate) wasted_rounds: u64,
+    /// First rounds whose block was sized from the share an earlier first
+    /// round at this depth swapped, in the same scratch state.
+    pub(crate) first_rounds_sized: u64,
+    /// Of those, the ones whose swaps used up the block and had to extend
+    /// it: the share undersized them.
+    pub(crate) first_rounds_short: u64,
     /// Partitions whose terms were renumbered here.
     pub(crate) localized: u64,
     pub(crate) localize_ns: u64,
@@ -366,6 +373,8 @@ impl LevelReport {
         self.predicted_gain += other.predicted_gain;
         self.actual_gain += other.actual_gain;
         self.wasted_rounds += other.wasted_rounds;
+        self.first_rounds_sized += other.first_rounds_sized;
+        self.first_rounds_short += other.first_rounds_short;
         self.localized += other.localized;
         self.localize_ns += other.localize_ns;
         self.split_ns += other.split_ns;
@@ -385,8 +394,8 @@ impl fmt::Display for LevelReport {
         write!(
             f,
             "splits={} docs={} rounds={} swaps={} settled={} converged={} capped={} \
-             predicted={:.0} actual={:.0} wasted_rounds={} localized={} localize_ms={} \
-             split_ms={}",
+             predicted={:.0} actual={:.0} wasted_rounds={} first_rounds_sized={} \
+             first_rounds_short={} localized={} localize_ms={} split_ms={}",
             self.splits,
             self.docs,
             self.rounds,
@@ -397,6 +406,8 @@ impl fmt::Display for LevelReport {
             self.predicted_gain,
             self.actual_gain,
             self.wasted_rounds,
+            self.first_rounds_sized,
+            self.first_rounds_short,
             self.localized,
             ms(self.localize_ns),
             ms(self.split_ns),
@@ -1178,8 +1189,9 @@ impl BisectState {
                 }
                 .max(SWAP_BLOCK)
                 .min(pairs);
-                order_leading_gains(&mut left_gains, ready, parallel);
-                order_leading_gains(&mut right_gains, ready, parallel);
+                let block = ready;
+                order_leading_gains::<PAR_SELECT_MIN>(&mut left_gains, ready, parallel);
+                order_leading_gains::<PAR_SELECT_MIN>(&mut right_gains, ready, parallel);
                 if let Some(step) = step {
                     level.rank_ns += ns_since(step);
                 }
@@ -1191,8 +1203,18 @@ impl BisectState {
                 while swaps < pairs {
                     if swaps == ready {
                         let next = (ready * 2).min(pairs);
-                        extend_ordered_prefix(&mut left_gains, ready, next, parallel);
-                        extend_ordered_prefix(&mut right_gains, ready, next, parallel);
+                        extend_ordered_prefix::<PAR_SELECT_MIN>(
+                            &mut left_gains,
+                            ready,
+                            next,
+                            parallel,
+                        );
+                        extend_ordered_prefix::<PAR_SELECT_MIN>(
+                            &mut right_gains,
+                            ready,
+                            next,
+                            parallel,
+                        );
                         ready = next;
                     }
                     let (l, r) = (left_gains[swaps], right_gains[swaps]);
@@ -1208,26 +1230,7 @@ impl BisectState {
                     }
                     let (li, ri) = (key_pos(l) as usize, key_pos(r) as usize);
                     let (ld, rd) = (left[li], right[ri]);
-                    // The degree tables follow the documents across.
-                    for &t in fwd.doc(ld) {
-                        let [l, r] = &mut self.deg[t as usize];
-                        *l -= 1;
-                        *r += 1;
-                    }
-                    for &t in fwd.doc(rd) {
-                        let [l, r] = &mut self.deg[t as usize];
-                        *r -= 1;
-                        *l += 1;
-                    }
-                    if let Some(moved) = &mut self.moved_terms {
-                        moved.extend_from_slice(fwd.doc(ld));
-                        moved.extend_from_slice(fwd.doc(rd));
-                        // Past one entry per term, a pass over every term is
-                        // the cheaper way to bring them up to date.
-                        if moved.len() > self.touched.len() {
-                            self.moved_terms = None;
-                        }
-                    }
+                    self.swap_degrees(fwd, ld, rd);
                     left[li] = rd;
                     right[ri] = ld;
                 }
@@ -1268,6 +1271,17 @@ impl BisectState {
                 }
                 if REPORT {
                     level.predicted_gain += gain;
+                    let sized = self
+                        .first_round_share
+                        .get(depth as usize)
+                        .is_some_and(|&share| share >= 0.0);
+                    if round == 0 && sized {
+                        level.first_rounds_sized += 1;
+                        // A swap count that reaches a block short of the
+                        // pairs is what extends it.
+                        let short = swaps >= block && block < pairs;
+                        level.first_rounds_short += u64::from(short);
+                    }
                 }
                 swaps
             };
@@ -1385,6 +1399,32 @@ impl BisectState {
             costs: &self.cost_right,
         };
         f64::from(left.cost(left.deg)) + f64::from(right.cost(right.deg))
+    }
+
+    /// Carry the degree tables across a serial swap of `ld`, from the left,
+    /// with `rd`, from the right, and list the terms it moved for the next
+    /// [`Self::compute_move_gains`].
+    #[inline]
+    fn swap_degrees(&mut self, fwd: &ForwardIndex, ld: u32, rd: u32) {
+        for &t in fwd.doc(ld) {
+            let [l, r] = &mut self.deg[t as usize];
+            *l -= 1;
+            *r += 1;
+        }
+        for &t in fwd.doc(rd) {
+            let [l, r] = &mut self.deg[t as usize];
+            *r -= 1;
+            *l += 1;
+        }
+        if let Some(moved) = &mut self.moved_terms {
+            moved.extend_from_slice(fwd.doc(ld));
+            moved.extend_from_slice(fwd.doc(rd));
+            // Past one entry per term, a pass over every term is the
+            // cheaper way to bring them up to date.
+            if moved.len() > self.touched.len() {
+                self.moved_terms = None;
+            }
+        }
     }
 
     /// Fill the move gains of every term in the partition from its
@@ -1623,8 +1663,14 @@ fn lane_gains(fwd: &ForwardIndex, group: &[u32], move_gain: &[f32]) -> [f32; GAI
 /// its first `ready`. The first `ordered` are already the smallest keys, in
 /// order, and every other entry sits behind them, so ordering the next ones
 /// from the rest alone ends at the order a pass over the whole list would.
-fn extend_ordered_prefix(gains: &mut [u64], ordered: usize, ready: usize, parallel: bool) {
-    order_leading_gains(&mut gains[ordered..], ready - ordered, parallel);
+/// `SELECT_MIN` is as for [`order_leading_gains`].
+fn extend_ordered_prefix<const SELECT_MIN: usize>(
+    gains: &mut [u64],
+    ordered: usize,
+    ready: usize,
+    parallel: bool,
+) {
+    order_leading_gains::<SELECT_MIN>(&mut gains[ordered..], ready - ordered, parallel);
 }
 
 /// Put the `want` highest-gain entries at the front of `gains`, in the
@@ -1634,7 +1680,10 @@ fn extend_ordered_prefix(gains: &mut [u64], ordered: usize, ready: usize, parall
 /// leading `want` entries are the same whatever `want` was asked for before.
 /// That is what lets a round grow its block without changing which documents
 /// it swaps, and what makes an unstable sort deterministic here.
-fn order_leading_gains(gains: &mut [u64], want: usize, parallel: bool) {
+///
+/// A parallel call selects on every thread from `SELECT_MIN` entries up, in
+/// stretches of that many keys. The bisection passes [`PAR_SELECT_MIN`].
+fn order_leading_gains<const SELECT_MIN: usize>(gains: &mut [u64], want: usize, parallel: bool) {
     if want >= gains.len() {
         match parallel {
             true => gains.par_sort_unstable(),
@@ -1647,8 +1696,8 @@ fn order_leading_gains(gains: &mut [u64], want: usize, parallel: bool) {
     }
     // Linear-time partition around the `want`-th entry, then order only
     // what sits in front of it.
-    match parallel && gains.len() >= PAR_SELECT_MIN {
-        true => par_select_front(gains, want),
+    match parallel && gains.len() >= SELECT_MIN {
+        true => par_select_front::<SELECT_MIN>(gains, want),
         false => {
             gains.select_nth_unstable(want);
         }
@@ -1667,13 +1716,14 @@ fn order_leading_gains(gains: &mut [u64], want: usize, parallel: bool) {
 /// The keys are distinct, so exactly `want` of them lie below that key, and
 /// the front ends up holding the same set `select_nth_unstable(want)` leaves
 /// there. Only that set is ever read in order — the rest is selected from
-/// again before any of it is — so the ranking is the same.
-fn par_select_front(gains: &mut [u64], want: usize) {
-    let bound = par_nth_key(gains, want);
+/// again before any of it is — so the ranking is the same. Each task takes
+/// `STRETCH` keys.
+fn par_select_front<const STRETCH: usize>(gains: &mut [u64], want: usize) {
+    let bound = par_nth_key::<STRETCH>(gains, want);
     let (front, back) = gains.split_at_mut(want);
     // The keys each side must give up, stretch by stretch.
     let misplaced = |keys: &[u64], wrong: &(dyn Fn(u64) -> bool + Sync)| -> Vec<Vec<u64>> {
-        keys.par_chunks(PAR_SELECT_MIN)
+        keys.par_chunks(STRETCH)
             .map(|stretch| stretch.iter().copied().filter(|&k| wrong(k)).collect())
             .collect()
     };
@@ -1682,15 +1732,15 @@ fn par_select_front(gains: &mut [u64], want: usize) {
         return;
     }
     let leaving_back = misplaced(back, &|k| k < bound);
-    refill(front, &leaving_front, &leaving_back);
-    refill(back, &leaving_back, &leaving_front);
+    refill::<STRETCH>(front, &leaving_front, &leaving_back);
+    refill::<STRETCH>(back, &leaving_back, &leaving_front);
 }
 
 /// Overwrite, in place, the keys `keys` gives up — listed stretch by stretch
 /// in `leaving`, as [`par_select_front`] found them — with `arriving`'s keys,
 /// one for one. Each stretch takes the arriving keys from where the stretches
-/// before it stopped.
-fn refill(keys: &mut [u64], leaving: &[Vec<u64>], arriving: &[Vec<u64>]) {
+/// before it stopped. `STRETCH` must be the stretch length they were found in.
+fn refill<const STRETCH: usize>(keys: &mut [u64], leaving: &[Vec<u64>], arriving: &[Vec<u64>]) {
     let starts = |parts: &[Vec<u64>]| -> Vec<usize> {
         parts
             .iter()
@@ -1702,7 +1752,7 @@ fn refill(keys: &mut [u64], leaving: &[Vec<u64>], arriving: &[Vec<u64>]) {
             .collect()
     };
     let (taken_at, arriving_at) = (starts(leaving), starts(arriving));
-    keys.par_chunks_mut(PAR_SELECT_MIN)
+    keys.par_chunks_mut(STRETCH)
         .zip(leaving)
         .zip(taken_at)
         .for_each(|((stretch, gone), at)| {
@@ -1729,14 +1779,15 @@ fn refill(keys: &mut [u64], leaving: &[Vec<u64>], arriving: &[Vec<u64>]) {
 /// The key with exactly `nth` of `keys` below it, which must be distinct:
 /// a radix descent from the top bits, a parallel histogram per digit,
 /// keeping only the keys that share the digits found so far, until few
-/// enough remain to select from on one thread.
-fn par_nth_key(keys: &[u64], mut nth: usize) -> u64 {
+/// enough remain to select from on one thread: fewer than `STRETCH`, which
+/// is also the stretch each histogram task counts.
+fn par_nth_key<const STRETCH: usize>(keys: &[u64], mut nth: usize) -> u64 {
     let mut kept: Option<Vec<u64>> = None;
     // Bits below the digits resolved so far.
     let mut low = u64::BITS;
     loop {
         let candidates = kept.as_deref().unwrap_or(keys);
-        if candidates.len() < PAR_SELECT_MIN || low == 0 {
+        if candidates.len() < STRETCH || low == 0 {
             let mut rest = candidates.to_vec();
             return *rest.select_nth_unstable(nth).1;
         }
@@ -1745,7 +1796,7 @@ fn par_nth_key(keys: &[u64], mut nth: usize) -> u64 {
         let mask = (1usize << bits) - 1;
         let digit = |k: u64| (k >> low) as usize & mask;
         let counts = candidates
-            .par_chunks(PAR_SELECT_MIN)
+            .par_chunks(STRETCH)
             .map(|stretch| {
                 let mut counts = vec![0usize; mask + 1];
                 for &k in stretch {
@@ -1970,9 +2021,15 @@ mod tests {
         }
     }
 
+    /// A parallel-selection threshold, and stretch, below the bisection's,
+    /// so lists of a few thousand entries reach the parallel selection and
+    /// span several stretches.
+    const SMALL_SELECT_MIN: usize = 1 << 10;
+
     /// Entry counts the ordered-prefix test ranks: empty, one, around the
-    /// first block, odd, and several doublings past it.
-    const PREFIX_TEST_LENS: [usize; 9] = [
+    /// first block, odd, several doublings past it, and past the
+    /// bisection's parallel-selection threshold.
+    const PREFIX_TEST_LENS: [usize; 10] = [
         0,
         1,
         2,
@@ -1982,6 +2039,7 @@ mod tests {
         3 * SWAP_BLOCK + 7,
         1_001,
         PAR_MIN_ITEMS + 13,
+        PAR_SELECT_MIN + 13,
     ];
     /// Distinct gains the ordered-prefix test draws from, few enough that
     /// many entries tie on the gain and are ordered by position.
@@ -1993,8 +2051,19 @@ mod tests {
     /// full sort of the whole list would, from any first `ready` and at
     /// every size, odd and tiny ones included. Each step is checked before
     /// the next, as the swap loop reads it.
+    ///
+    /// Run at the bisection's parallel-selection threshold and at a small
+    /// one, so the parallel selection is reached both from the lists the
+    /// bisection hands it and from lists far shorter.
     #[test]
     fn a_doubled_prefix_orders_as_a_full_sort_does() {
+        check_doubled_prefix::<PAR_SELECT_MIN>();
+        check_doubled_prefix::<SMALL_SELECT_MIN>();
+    }
+
+    /// [`a_doubled_prefix_orders_as_a_full_sort_does`] with `SELECT_MIN` as
+    /// the parallel-selection threshold.
+    fn check_doubled_prefix<const SELECT_MIN: usize>() {
         let mut rng = StdRng::seed_from_u64(11);
         for len in PREFIX_TEST_LENS {
             let keys: Vec<u64> = (0..len as u32)
@@ -2009,12 +2078,13 @@ mod tests {
                 for parallel in [false, true] {
                     let mut gains = keys.clone();
                     let mut ready = first.min(len);
-                    order_leading_gains(&mut gains, ready, parallel);
+                    order_leading_gains::<SELECT_MIN>(&mut gains, ready, parallel);
                     loop {
                         assert_eq!(
                             gains[..ready],
                             sorted[..ready],
-                            "len={len} first={first} ready={ready} parallel={parallel}"
+                            "len={len} first={first} ready={ready} parallel={parallel} \
+                             select_min={SELECT_MIN}"
                         );
                         if ready == len {
                             break;
@@ -2022,7 +2092,7 @@ mod tests {
                         // The swap loop doubles once it has used the
                         // whole prefix, with the step it takes there.
                         let next = (ready * 2).min(len);
-                        extend_ordered_prefix(&mut gains, ready, next, parallel);
+                        extend_ordered_prefix::<SELECT_MIN>(&mut gains, ready, next, parallel);
                         ready = next;
                     }
                     let mut all = gains.clone();
@@ -2038,10 +2108,20 @@ mod tests {
     /// on gains that all tie (every top digit shared, so the descent reaches
     /// the positions), on a few distinct gains, on raw random bits, and at
     /// boundaries from the first entry to the last.
+    ///
+    /// Run in the bisection's stretches and in small ones, so the lists span
+    /// several stretches and the descent selects from a remainder either way.
     #[test]
     fn the_parallel_selection_keeps_the_front_a_serial_one_does() {
+        check_parallel_selection::<PAR_SELECT_MIN>();
+        check_parallel_selection::<SMALL_SELECT_MIN>();
+    }
+
+    /// [`the_parallel_selection_keeps_the_front_a_serial_one_does`] in
+    /// stretches of `STRETCH` keys.
+    fn check_parallel_selection<const STRETCH: usize>() {
         let mut rng = StdRng::seed_from_u64(29);
-        let len = 7 * PAR_SELECT_MIN + 5;
+        let len = 7 * STRETCH + 5;
         for shape in 0..3 {
             let mut keys: Vec<u64> = (0..len as u32)
                 .map(|pos| {
@@ -2059,30 +2139,33 @@ mod tests {
             }
             let mut sorted = keys.clone();
             sorted.sort_unstable();
-            for want in [
-                1,
-                2,
-                PAR_SELECT_MIN - 1,
-                PAR_SELECT_MIN,
-                len / 3,
-                len - 2,
-                len - 1,
-            ] {
+            for want in [1, 2, STRETCH - 1, STRETCH, len / 3, len - 2, len - 1] {
                 let mut serial = keys.clone();
                 serial.select_nth_unstable(want);
                 let mut parallel = keys.clone();
-                par_select_front(&mut parallel, want);
+                par_select_front::<STRETCH>(&mut parallel, want);
                 let mut front = parallel[..want].to_vec();
                 front.sort_unstable();
-                assert_eq!(front, sorted[..want], "shape={shape} want={want}");
-                serial[..want].sort_unstable();
-                assert_eq!(front, serial[..want], "shape={shape} want={want}");
-                parallel.sort_unstable();
-                assert_eq!(parallel, sorted, "shape={shape} want={want}: a permutation");
                 assert_eq!(
-                    par_nth_key(&keys, want),
+                    front,
+                    sorted[..want],
+                    "shape={shape} want={want} stretch={STRETCH}"
+                );
+                serial[..want].sort_unstable();
+                assert_eq!(
+                    front,
+                    serial[..want],
+                    "shape={shape} want={want} stretch={STRETCH}"
+                );
+                parallel.sort_unstable();
+                assert_eq!(
+                    parallel, sorted,
+                    "shape={shape} want={want} stretch={STRETCH}: a permutation"
+                );
+                assert_eq!(
+                    par_nth_key::<STRETCH>(&keys, want),
                     sorted[want],
-                    "shape={shape} want={want}"
+                    "shape={shape} want={want} stretch={STRETCH}"
                 );
             }
         }
@@ -2740,10 +2823,21 @@ mod tests {
         assert_eq!(order, reference_order(&fwd));
     }
 
+    /// At most one in this many first rounds sized from a share may use up
+    /// their block: the margin is meant to cover most of them in one.
+    const FIRST_ROUNDS_SHORT_DIV: u64 = 4;
+
     /// A first round's block comes from whatever first rounds the state ran
     /// before, so it must not matter what they were: a state that expects
     /// every first round to swap nothing, or all of its pairs, or anything
     /// between, gives the order a fresh state does.
+    ///
+    /// That holds whatever the block, since the swap loop extends a block it
+    /// uses up. So the test also checks the sizing itself, at every depth,
+    /// down into the partitions that renumber their terms and split with a
+    /// state of their own: each such state learns a share at each depth from
+    /// its first split there, and the blocks it sizes from that share cover
+    /// most of its later first rounds' swaps without extending.
     #[test]
     fn the_first_rounds_block_does_not_change_the_order() {
         let (fwd, _) = clustered(9_000, 40, 3);
@@ -2762,19 +2856,125 @@ mod tests {
                 state.first_round_share = vec![share; MAX_DEPTH as usize];
             }
             state.split(&fwd, &mut order, 0, run, None);
-            order
+            state.flush(run.report);
+            (order, report.finish(0.0))
         };
         for params in [exhaustive(), BisectParams::default()] {
-            let fresh = split_with(params, None);
+            let (fresh, report) = split_with(params, None);
             for share in [0.0, 0.01, 0.3, 1.0] {
                 assert_eq!(
-                    split_with(params, Some(share)),
+                    split_with(params, Some(share)).0,
                     fresh,
                     "order diverged with a first-round share of {share}"
                 );
             }
+            let levels = &report.levels;
+            let localized_at = levels
+                .iter()
+                .position(|l| l.localized > 0)
+                .expect("a partition renumbers its terms");
+            assert!(localized_at > 0, "the root renumbers nothing");
+            let sized_below: u64 = levels[localized_at + 1..]
+                .iter()
+                .map(|l| l.first_rounds_sized)
+                .sum();
+            assert!(
+                sized_below > 0,
+                "below the renumbering at depth {localized_at}, no first round \
+                 was sized from a share: {report}"
+            );
+            let total = report.total();
+            assert!(
+                total.first_rounds_short * FIRST_ROUNDS_SHORT_DIV <= total.first_rounds_sized,
+                "{} of {} first rounds sized from a share used up their block:\n{report}",
+                total.first_rounds_short,
+                total.first_rounds_sized,
+            );
         }
-        assert_eq!(split_with(exhaustive(), None), reference_order(&fwd));
+        assert_eq!(split_with(exhaustive(), None).0, reference_order(&fwd));
+    }
+
+    /// Rounds of random swaps the incremental move-gain test makes per corpus.
+    const MOVED_TERMS_ROUNDS: usize = 16;
+
+    /// Swap counts the incremental move-gain test cycles through per round:
+    /// none, one, a few — which leave the moved terms fewer than the touched
+    /// ones, so only those are redone — and many, which pass the touched
+    /// count and send the next round back to every term.
+    const MOVED_TERMS_SWAPS: [usize; 6] = [0, 1, 3, 7, 1, 400];
+
+    /// A round redoes only the move gains of the terms the last round's swaps
+    /// moved, keeping every other term's from before. After every round of
+    /// swaps, through rounds that redo a few terms and rounds that redo all,
+    /// the degrees and every move gain a document could read are bit for bit
+    /// what a fresh state computes from scratch over the same halves.
+    #[test]
+    fn incrementally_kept_move_gains_match_a_full_recompute() {
+        let mut rng = StdRng::seed_from_u64(37);
+        // (documents, vocabulary, terms per document): a few terms shared by
+        // most documents, a middle, and a vocabulary wider than the corpus.
+        for (n_docs, n_terms, per_doc) in [(600, 30, 12), (2_000, 400, 20), (500, 3_000, 6)] {
+            let docs: Vec<Vec<u32>> = (0..n_docs)
+                .map(|_| {
+                    let mut doc: Vec<u32> = (0..per_doc)
+                        .map(|_| rng.random_range(0..n_terms as u32))
+                        .collect();
+                    doc.sort_unstable();
+                    doc.dedup();
+                    doc
+                })
+                .collect();
+            let fwd = ForwardIndex::from_docs(&docs);
+            let mut order: Vec<u32> = (0..fwd.len() as u32).collect();
+            let mid = order.len() / 2;
+            let (n_left, n_right) = (mid as f32, (order.len() - mid) as f32);
+            let start = |order: &[u32]| {
+                let mut state = BisectState::new(fwd.n_terms);
+                state.count_degrees(&fwd, order, mid, false);
+                fill_cost_table(&mut state.cost_left, n_left);
+                fill_cost_table(&mut state.cost_right, n_right);
+                state.compute_move_gains(n_left, n_right, false);
+                state
+            };
+            let mut kept = start(&order);
+            let mut incremental_rounds = 0;
+            for round in 0..MOVED_TERMS_ROUNDS {
+                for _ in 0..MOVED_TERMS_SWAPS[round % MOVED_TERMS_SWAPS.len()] {
+                    let li = rng.random_range(0..mid);
+                    let ri = mid + rng.random_range(0..order.len() - mid);
+                    kept.swap_degrees(&fwd, order[li], order[ri]);
+                    order.swap(li, ri);
+                }
+                incremental_rounds += usize::from(kept.moved_terms.is_some());
+                kept.compute_move_gains(n_left, n_right, false);
+                let fresh = start(&order);
+                for &t in &fresh.touched {
+                    let t = t as usize;
+                    let [dl, dr] = fresh.deg[t];
+                    let at = format!("docs={n_docs} round={round} term={t}");
+                    assert_eq!(kept.deg[t], [dl, dr], "{at}: degrees");
+                    if dl > 0 {
+                        assert_eq!(
+                            kept.move_gain_left[t].to_bits(),
+                            fresh.move_gain_left[t].to_bits(),
+                            "{at}: left gain"
+                        );
+                    }
+                    if dr > 0 {
+                        assert_eq!(
+                            kept.move_gain_right[t].to_bits(),
+                            fresh.move_gain_right[t].to_bits(),
+                            "{at}: right gain"
+                        );
+                    }
+                }
+            }
+            assert!(
+                incremental_rounds > 0 && incremental_rounds < MOVED_TERMS_ROUNDS,
+                "docs={n_docs}: {incremental_rounds} of {MOVED_TERMS_ROUNDS} rounds redid \
+                 only the moved terms; both kinds of round must run"
+            );
+        }
     }
 
     /// Documents with no terms at all renumber into an empty table and still
