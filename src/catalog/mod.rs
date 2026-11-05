@@ -45,6 +45,7 @@ pub use cancel::QueryCancel;
 use dashmap::DashMap;
 use datafusion::{
     common::{
+        TableReference,
         runtime::SpawnedTask,
         tree_node::{TreeNode, TreeNodeRecursion},
     },
@@ -469,6 +470,9 @@ impl Connection {
         indexes
             .check_companions()
             .map_err(|e| e.with_context("create_table", Some(name)))?;
+        indexes
+            .check_ranges(&schema)
+            .map_err(|e| e.with_context("create_table", Some(name)))?;
         let (fts_cfg, vec_cfg) = indexes.to_configs();
         // A companion is a table on storage beside this one; a catalog with
         // no storage, or one forwarding to a hosted service, has nowhere to
@@ -490,7 +494,8 @@ impl Connection {
                     Arc::clone(&self.inner.connection_memory_budget),
                     config::global(),
                 )
-                .map_err(|e| e.with_context("create_table", Some(name)))?;
+                .map_err(|e| e.with_context("create_table", Some(name)))?
+                .with_range_indexes(indexes.range_columns());
                 let handle = SupertableHandle::create(opts)
                     .map_err(|e| InfinoError::from(e).with_context("create_table", Some(name)))?;
                 let mut map = map.lock().expect("catalog mutex poisoned");
@@ -579,6 +584,8 @@ impl Connection {
                 let disk_cache =
                     build_disk_cache(&self.inner.options, &table_storage, name, &location)
                         .map_err(|e| e.with_context("create_table", Some(name)))?;
+                // The range indexes ride in the schema the table's first
+                // manifest records, which is what every later open reads.
                 let mut opts = build_options(
                     schema,
                     fts_cfg,
@@ -587,7 +594,8 @@ impl Connection {
                     Arc::clone(&self.inner.connection_memory_budget),
                     config::global(),
                 )
-                .map_err(|e| e.with_context("create_table", Some(name)))?;
+                .map_err(|e| e.with_context("create_table", Some(name)))?
+                .with_range_indexes(indexes.range_columns());
                 if let Some((cache, manifest_cache)) = disk_cache {
                     opts = opts
                         .with_disk_cache(cache)
@@ -1254,6 +1262,31 @@ impl Connection {
             }
         }
 
+        // A query that reads `information_schema` — directly, or through a
+        // `SHOW TABLES` / `SHOW COLUMNS` statement the planner rewrites into
+        // one — describes the catalog rather than naming the tables it wants
+        // registered: the only `FROM` relations it resolves are the
+        // introspection views themselves. Register every catalog table so the
+        // views reflect the whole catalog, not just the tables a query happens
+        // to name elsewhere. The views are synthesized from the registered
+        // catalog, so this is what makes them non-empty.
+        if references_information_schema(&refs) {
+            for name in self
+                .list_tables()
+                .map_err(|e| e.with_context("query_sql", None))?
+            {
+                if !seen.insert(name.clone()) {
+                    continue;
+                }
+                if let Some(table) = self
+                    .open_and_register_cancellable(&ctx, &name, cancel)
+                    .map_err(|e| e.with_context("query_sql", None))?
+                {
+                    handles.push(table);
+                }
+            }
+        }
+
         // Search TVFs resolve their leading table-name argument through
         // the catalog at call time (so a table named only inside a TVF —
         // not as a `FROM` relation — still resolves).
@@ -1659,6 +1692,17 @@ fn register(
     }
 }
 
+/// Schema name DataFusion exposes its introspection views under.
+const INFORMATION_SCHEMA: &str = "information_schema";
+
+/// Whether any resolved relation lives in `information_schema`. A `SHOW`
+/// statement resolves to these views, and a direct
+/// `SELECT ... FROM information_schema.columns` names one, so either way the
+/// query is introspecting the catalog and wants every table registered.
+fn references_information_schema(refs: &[TableReference]) -> bool {
+    refs.iter().any(|r| r.schema() == Some(INFORMATION_SCHEMA))
+}
+
 fn connective_cap_error(surface: &str) -> InfinoError {
     InfinoError::Query(format!(
         "{surface} has more than {MAX_PREDICATE_CONNECTIVES} AND/OR connectives; rewrite long value lists as IN (...)"
@@ -2018,6 +2062,9 @@ fn seed_from_patch(patch: &SchemaPatch) -> Result<(SchemaRef, IndexSpec), Infino
                     *rot_seed,
                     *rerank_codec,
                 );
+            }
+            Some(ColumnIndex::Range) => {
+                indexes = indexes.range(field.name.clone());
             }
             None => {}
         }
@@ -5424,6 +5471,257 @@ mod tests {
         assert_eq!(got, vec!["go", "rust"]);
     }
 
+    /// Two tables holding `ts` and `v` under different field ids: `a`
+    /// declares `ts, v`, `b` declares `v, extra, ts`. Returns the
+    /// connection with `a = {(1,x), (2,y), (3,z)}` and
+    /// `b = {(4,y), (5,w)}` appended.
+    fn tables_with_differing_field_ids() -> Connection {
+        let conn = connect("memory://").expect("connect");
+        let a_schema = Arc::new(Schema::new(vec![
+            Field::new("ts", DataType::Int64, false),
+            Field::new("v", DataType::LargeUtf8, true),
+        ]));
+        let b_schema = Arc::new(Schema::new(vec![
+            Field::new("v", DataType::LargeUtf8, true),
+            Field::new("extra", DataType::Int64, true),
+            Field::new("ts", DataType::Int64, false),
+        ]));
+        let a = conn
+            .create_table("a", Arc::clone(&a_schema), IndexSpec::new())
+            .expect("create a");
+        let b = conn
+            .create_table("b", Arc::clone(&b_schema), IndexSpec::new())
+            .expect("create b");
+        a.append(
+            &RecordBatch::try_new(
+                a_schema,
+                vec![
+                    Arc::new(Int64Array::from(vec![1, 2, 3])),
+                    Arc::new(LargeStringArray::from(vec!["x", "y", "z"])),
+                ],
+            )
+            .expect("a batch"),
+        )
+        .expect("append a");
+        b.append(
+            &RecordBatch::try_new(
+                b_schema,
+                vec![
+                    Arc::new(LargeStringArray::from(vec!["y", "w"])),
+                    Arc::new(Int64Array::from(vec![Some(0), None])),
+                    Arc::new(Int64Array::from(vec![4, 5])),
+                ],
+            )
+            .expect("b batch"),
+        )
+        .expect("append b");
+
+        let id = |table: &str, column: &str| {
+            conn.schema(table)
+                .expect("schema")
+                .fields()
+                .iter()
+                .find(|f| f.name == column)
+                .expect("column")
+                .id
+        };
+        assert_ne!(id("a", "v"), id("b", "v"), "fixture needs differing ids");
+        assert_ne!(id("a", "ts"), id("b", "ts"), "fixture needs differing ids");
+        conn
+    }
+
+    /// Every row of `batches` rendered as strings, one `Vec` per row.
+    fn rows_of(batches: &[RecordBatch]) -> Vec<Vec<String>> {
+        batches
+            .iter()
+            .flat_map(|b| {
+                (0..b.num_rows()).map(move |r| {
+                    b.columns()
+                        .iter()
+                        .map(|c| array_value_to_string(c, r).expect("render"))
+                        .collect()
+                })
+            })
+            .collect()
+    }
+
+    /// A query's output columns carry no field ids, whichever tables fed it.
+    fn assert_no_field_ids(batches: &[RecordBatch]) {
+        for batch in batches {
+            for field in batch.schema().fields() {
+                assert!(
+                    !field
+                        .metadata()
+                        .contains_key(crate::supertable::schema::FIELD_ID_META_KEY),
+                    "field `{}` leaks a field id",
+                    field.name()
+                );
+            }
+        }
+    }
+
+    /// A `UNION ALL` of two tables whose same-named columns carry different
+    /// field ids feeds an aggregate: the plan's schema above the union must
+    /// match what the logical plan derived, or planning fails.
+    #[test]
+    fn query_sql_union_of_tables_with_differing_field_ids_counts_distinct() {
+        let conn = tables_with_differing_field_ids();
+        let batches = conn
+            .query_sql(
+                "WITH u AS (SELECT ts, v AS w FROM a UNION ALL SELECT ts, v FROM b) \
+                 SELECT count(*) AS n, count(DISTINCT w) AS d FROM u",
+            )
+            .expect("union feeding count(DISTINCT)");
+        assert_eq!(rows_of(&batches), vec![vec!["5", "4"]]);
+        assert_no_field_ids(&batches);
+    }
+
+    #[test]
+    fn query_sql_union_of_tables_with_differing_field_ids_groups() {
+        let conn = tables_with_differing_field_ids();
+        let batches = conn
+            .query_sql(
+                "WITH u AS (SELECT ts, v AS w FROM a UNION ALL SELECT ts, v FROM b) \
+                 SELECT w, count(*) AS n, max(ts) AS latest FROM u GROUP BY w ORDER BY w",
+            )
+            .expect("union feeding GROUP BY");
+        assert_eq!(
+            rows_of(&batches),
+            vec![
+                vec!["w", "1", "5"],
+                vec!["x", "1", "1"],
+                vec!["y", "2", "4"],
+                vec!["z", "1", "3"],
+            ]
+        );
+        assert_no_field_ids(&batches);
+    }
+
+    #[test]
+    fn query_sql_union_of_tables_with_differing_field_ids_windows() {
+        let conn = tables_with_differing_field_ids();
+        let batches = conn
+            .query_sql(
+                "WITH u AS (SELECT ts, v AS w FROM a UNION ALL SELECT ts, v FROM b) \
+                 SELECT w, ts, row_number() OVER (PARTITION BY w ORDER BY ts) AS rn \
+                 FROM u ORDER BY w, ts",
+            )
+            .expect("union feeding a window");
+        assert_eq!(
+            rows_of(&batches),
+            vec![
+                vec!["w", "5", "1"],
+                vec!["x", "1", "1"],
+                vec!["y", "2", "1"],
+                vec!["y", "4", "2"],
+                vec!["z", "3", "1"],
+            ]
+        );
+        assert_no_field_ids(&batches);
+    }
+
+    #[test]
+    fn query_sql_join_of_tables_with_differing_field_ids() {
+        let conn = tables_with_differing_field_ids();
+        let batches = conn
+            .query_sql(
+                "SELECT a.v, count(*) AS n, max(a.ts) AS a_ts, max(b.ts) AS b_ts \
+                 FROM a JOIN b ON a.v = b.v GROUP BY a.v",
+            )
+            .expect("join feeding an aggregate");
+        assert_eq!(rows_of(&batches), vec![vec!["y", "1", "2", "4"]]);
+        assert_no_field_ids(&batches);
+    }
+
+    /// Field ids still resolve the files' columns: after `a` renames `v`,
+    /// its files (written under the old name) answer for the new name, on
+    /// their own and in a union with `b`.
+    #[test]
+    fn query_sql_resolves_renamed_column_by_field_id_alone_and_in_a_union() {
+        let conn = tables_with_differing_field_ids();
+        let v_id = conn
+            .schema("a")
+            .expect("schema")
+            .fields()
+            .iter()
+            .find(|f| f.name == "v")
+            .expect("v")
+            .id;
+        conn.apply_schema(
+            "a",
+            &SchemaPatch::new(vec![FieldPatch::named("visitor").with_id(v_id)]),
+            None,
+        )
+        .expect("rename v");
+
+        let single = conn
+            .query_sql("SELECT visitor, count(*) AS n FROM a GROUP BY visitor ORDER BY visitor")
+            .expect("single-table query on the renamed column");
+        assert_eq!(
+            rows_of(&single),
+            vec![vec!["x", "1"], vec!["y", "1"], vec!["z", "1"]]
+        );
+        assert_no_field_ids(&single);
+
+        let union = conn
+            .query_sql(
+                "WITH u AS (SELECT ts, visitor AS v FROM a UNION ALL SELECT ts, v FROM b) \
+                 SELECT count(*) AS n, count(DISTINCT v) AS d FROM u",
+            )
+            .expect("union over the renamed column");
+        assert_eq!(rows_of(&union), vec![vec!["5", "4"]]);
+    }
+
+    /// The search functions bind to the same column set as the scan, so a
+    /// union of two tables' search results feeds an aggregate too.
+    #[test]
+    fn query_sql_union_of_search_results_with_differing_field_ids_counts_distinct() {
+        let conn = connect("memory://").expect("connect");
+        let a = conn
+            .create_table("a", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create a");
+        let b_schema = Arc::new(Schema::new(vec![
+            Field::new("extra", DataType::Int64, true),
+            Field::new("title", DataType::LargeUtf8, false),
+        ]));
+        let b = conn
+            .create_table("b", Arc::clone(&b_schema), IndexSpec::new().fts("title"))
+            .expect("create b");
+        a.append(&build_title_batch(&["red fox", "lazy dog"]))
+            .expect("append a");
+        b.append(
+            &RecordBatch::try_new(
+                b_schema,
+                vec![
+                    Arc::new(Int64Array::from(vec![Some(1), None])),
+                    Arc::new(LargeStringArray::from(vec!["red fox", "grey fox"])),
+                ],
+            )
+            .expect("b batch"),
+        )
+        .expect("append b");
+        let title_id = |table: &str| {
+            conn.schema(table)
+                .expect("schema")
+                .fields()
+                .iter()
+                .find(|f| f.name == "title")
+                .expect("title")
+                .id
+        };
+        assert_ne!(title_id("a"), title_id("b"), "fixture needs differing ids");
+
+        let batches = conn
+            .query_sql(
+                "WITH u AS (SELECT _id, title AS t FROM bm25_search('a', 'title', 'fox', 10) \
+                 UNION ALL SELECT _id, title FROM bm25_search('b', 'title', 'fox', 10)) \
+                 SELECT count(*) AS n, count(DISTINCT t) AS d FROM u",
+            )
+            .expect("union of search results feeding count(DISTINCT)");
+        assert_eq!(rows_of(&batches), vec![vec!["3", "2"]]);
+        assert_no_field_ids(&batches);
+    }
+
     #[test]
     fn query_sql_bm25_search_tvf_resolves_table() {
         let conn = connect("memory://").expect("connect");
@@ -6116,8 +6414,8 @@ mod tests {
             conn.query_sql(sql)
                 .unwrap_or_else(|e| panic!("{sql:?} should be allowed: {e}"));
         }
-        // `SHOW` reads too. `query_sql` does not enable `information_schema`,
-        // so these fail, but as reads: never refused as a write.
+        // `SHOW` reads too, and `information_schema` is enabled, so they plan
+        // and run rather than erroring.
         for sql in [
             "SHOW TABLES",
             "SHOW COLUMNS FROM docs",
@@ -6125,12 +6423,68 @@ mod tests {
             "SHOW FUNCTIONS",
             "SHOW datafusion.execution.batch_size",
         ] {
-            let err = conn.query_sql(sql);
-            assert!(
-                matches!(&err, Err(InfinoError::Query(msg)) if !msg.contains("read-only")),
-                "{sql:?}: got {err:?}"
-            );
+            conn.query_sql(sql)
+                .unwrap_or_else(|e| panic!("{sql:?} should be allowed: {e}"));
         }
+    }
+
+    /// `information_schema` reflects the catalog's tables and their columns:
+    /// the engine registers every catalog table for a query that reads it, so
+    /// `SHOW TABLES`, `SHOW COLUMNS` and `information_schema.columns` describe
+    /// the real schema rather than coming back empty.
+    #[test]
+    fn query_sql_information_schema_describes_the_catalog() {
+        let conn = connect("memory://").expect("connect");
+        conn.create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create docs");
+        conn.create_table("notes", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create notes");
+
+        // Both user tables are listed, even though neither is a `FROM`
+        // relation of the introspection query.
+        let listed: usize = conn
+            .query_sql(
+                "SELECT table_name FROM information_schema.tables \
+                 WHERE table_name IN ('docs', 'notes')",
+            )
+            .expect("information_schema.tables")
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
+        assert_eq!(listed, 2, "both catalog tables are listed");
+
+        // `docs` exposes its SQL-visible columns: the auto `_id` and `title`.
+        let columns: usize = conn
+            .query_sql(
+                "SELECT column_name FROM information_schema.columns \
+                 WHERE table_name = 'docs'",
+            )
+            .expect("information_schema.columns")
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
+        assert_eq!(columns, 2, "docs has _id and title");
+
+        // `SHOW COLUMNS` rewrites to the same view and sees the same columns.
+        let shown: usize = conn
+            .query_sql("SHOW COLUMNS FROM docs")
+            .expect("SHOW COLUMNS")
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
+        assert_eq!(shown, 2, "SHOW COLUMNS lists _id and title");
+
+        // The column the query actually names is visible by value.
+        let named: usize = conn
+            .query_sql(
+                "SELECT 1 FROM information_schema.columns \
+                 WHERE table_name = 'docs' AND column_name = 'title'",
+            )
+            .expect("named column")
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
+        assert_eq!(named, 1, "the title column is reflected");
     }
 
     /// Rows in the first append of the ordering test: under one default

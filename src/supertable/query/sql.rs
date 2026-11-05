@@ -62,14 +62,19 @@ use arrow::{
 use arrow_array::{Array, Decimal128Array, Int64Array, new_empty_array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::{
-    common::{Column, ScalarValue},
+    common::{Column, DFSchema, ScalarValue, tree_node::TreeNode},
     dataframe::DataFrame,
     datasource::DefaultTableSource,
     error::DataFusionError,
     execution::{TaskContext, context::SessionContext},
-    functions_aggregate::count::count_all,
-    logical_expr::{Expr, LogicalPlan},
+    functions_aggregate::{count::count_all, expr_fn::count},
+    logical_expr::{
+        Expr, ExprFunctionExt, LogicalPlan, lit, simplify::SimplifyContext,
+        utils::split_conjunction,
+    },
+    optimizer::simplify_expressions::ExprSimplifier,
 };
+use futures::future::try_join_all;
 use tokio::runtime::Handle;
 use uuid::Uuid;
 
@@ -91,8 +96,10 @@ use crate::{
                 vector_exec::register_vector_search,
             },
             provider::{SupertableProvider, TABLE_NAME, view_string_schema},
+            range_top_k::RangeTopK,
         },
         reader_cache::disk::ForegroundQueryGuard,
+        schema::sql_schema,
         tombstones::SidecarCache,
     },
 };
@@ -127,8 +134,9 @@ impl SqlSchemas {
 pub(crate) fn build_sql_schemas(manifest: &ManifestSnapshot) -> SqlSchemas {
     // Stored shape: index-only FTS columns are absent from Parquet, so
     // SQL never sees them — selecting or filtering one fails at plan
-    // time like any unknown column.
-    let scalar = manifest.stored_schema();
+    // time like any unknown column. Field ids stay out of what SQL plans
+    // against (`sql_schema`).
+    let scalar = sql_schema(manifest.stored_schema());
     let fts_configs = manifest.fts_configs();
     let fts: HashSet<&str> = fts_configs.iter().map(|c| c.column.as_str()).collect();
     let scan = view_string_schema(&scalar, &fts);
@@ -231,8 +239,10 @@ pub(crate) fn sql_session_context(
     budget: &Arc<ConnectionMemoryBudget>,
 ) -> Result<SessionContext, DataFusionError> {
     let ctx = budgeted_session_context(budget)?;
-    // Appended after the built-in rules, so it sees pushed-down, normalized plans.
+    // Appended after the built-in rules, so they see pushed-down, normalized
+    // plans: a `LIMIT` already folded into its sort as the fetch.
     ctx.add_optimizer_rule(Arc::new(CoveredAggregateRewrite));
+    ctx.add_optimizer_rule(Arc::new(RangeTopK));
     Ok(ctx)
 }
 
@@ -452,6 +462,108 @@ impl SupertableReader {
         )
         .map(Some)
         .map_err(QueryError::internal)
+    }
+
+    /// The live rows each of `predicates` holds, in order, exactly as
+    /// `SELECT COUNT(*) FILTER (WHERE p) ...` counts them.
+    ///
+    /// Counted with no statement planned when every predicate, simplified, is
+    /// one interval on one range-indexed column, or the literal `true` (every
+    /// live row), and every superfile it keeps carries that column's range
+    /// index ([`Self::count_where_from_index`]). Otherwise the counts run as
+    /// one aggregate, built as a plan; a predicate holding a subquery, which
+    /// a FILTER clause cannot, is counted under its own WHERE.
+    pub(crate) fn count_where(&self, predicates: &[Expr]) -> Result<Vec<u64>, QueryError> {
+        let _foreground = ForegroundQueryGuard::enter();
+        if predicates.is_empty() {
+            return Ok(Vec::new());
+        }
+        let schema = DFSchema::try_from(self.sql_schemas().scan().as_ref().clone())
+            .map_err(QueryError::DataFusion)?;
+        let simplifier = ExprSimplifier::new(
+            SimplifyContext::builder()
+                .with_schema(Arc::new(schema))
+                .build(),
+        );
+        let predicates = predicates
+            .iter()
+            .map(|predicate| simplifier.simplify(predicate.clone()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| QueryError::InvalidQuery(format!("count_where: {e}")))?;
+        if let Some(counts) = self.count_where_from_index(&predicates)? {
+            return Ok(counts);
+        }
+        // A FILTER clause cannot hold a subquery: a predicate that reads
+        // another relation is counted under its own WHERE.
+        if predicates.iter().any(holds_subquery) {
+            return predicates
+                .into_iter()
+                .map(|predicate| {
+                    let counted = count_where_exprs([lit(true)]).map_err(QueryError::DataFusion)?;
+                    let batches = self.count_where_aggregate(Some(predicate), counted)?;
+                    Ok(count_where_row(&batches, 1)?[0])
+                })
+                .collect();
+        }
+        let n = predicates.len();
+        let aggregates = count_where_exprs(predicates).map_err(QueryError::DataFusion)?;
+        count_where_row(&self.count_where_aggregate(None, aggregates)?, n)
+    }
+
+    /// `aggregates` over the table's live rows, over those `filter` holds
+    /// when there is one: [`Self::count_where`]'s statement, built as a plan.
+    fn count_where_aggregate(
+        &self,
+        filter: Option<Expr>,
+        aggregates: Vec<Expr>,
+    ) -> Result<Vec<RecordBatch>, QueryError> {
+        let ctx = self.sql_session_context()?;
+        let op_stats = op_stats::current();
+        let drive = async move {
+            let df = ctx
+                .table(TABLE_NAME)
+                .await
+                .and_then(|table| match filter {
+                    Some(filter) => table.filter(filter),
+                    None => Ok(table),
+                })
+                .and_then(|table| table.aggregate(Vec::new(), aggregates))
+                .map_err(QueryError::DataFusion)?;
+            Self::collect_metered_df(df, ctx.task_ctx(), &op_stats).await
+        };
+        self.block_on(drive)
+    }
+
+    /// [`Self::count_where`] from the range index, the manifest and the
+    /// tombstones alone. `None` when a predicate is not one interval on one
+    /// range-indexed column nor the literal `true`, or a superfile it keeps
+    /// has no range index over the column.
+    fn count_where_from_index(&self, predicates: &[Expr]) -> Result<Option<Vec<u64>>, QueryError> {
+        // One read of each superfile's deleted rows for every predicate, so
+        // the counts agree with each other as one aggregate's would.
+        let provider = op_stats::suppressed(|| self.sql_provider()).reading_tombstones_once();
+        let mut counted = Vec::with_capacity(predicates.len());
+        for predicate in predicates {
+            if matches!(
+                predicate,
+                Expr::Literal(ScalarValue::Boolean(Some(true)), _)
+            ) {
+                counted.push((None, Vec::new()));
+                continue;
+            }
+            let Some(range) = provider.counted_range(predicate) else {
+                return Ok(None);
+            };
+            let filters = split_conjunction(predicate).into_iter().cloned().collect();
+            counted.push((Some(range), filters));
+        }
+        let provider = &provider;
+        let counts = self
+            .block_on(try_join_all(counted.iter().map(|(range, filters)| {
+                provider.indexed_rows(range.as_ref(), filters)
+            })))
+            .map_err(QueryError::DataFusion)?;
+        Ok(counts.into_iter().collect())
     }
 
     /// The pushdown-aware provider over this reader's pinned snapshot,
@@ -675,6 +787,75 @@ impl Supertable {
             .map_err(InfinoError::from)
             .map_err(|e| e.with_context("value_counts", None))
     }
+
+    /// The live rows each of `predicates` holds over the current snapshot —
+    /// see [`SupertableReader::count_where`].
+    pub fn count_where(&self, predicates: &[Expr]) -> Result<Vec<u64>, InfinoError> {
+        self.reader()?
+            .count_where(predicates)
+            .map_err(InfinoError::from)
+            .map_err(|e| e.with_context("count_where", None))
+    }
+}
+
+/// The name [`SupertableReader::count_where`]'s aggregate gives the count of
+/// its `i`-th predicate; a hosted table's statement names them the same way.
+fn count_where_name(i: usize) -> String {
+    format!("count_{i}")
+}
+
+/// Whether `expr` reads another relation: an `IN`, `EXISTS` or scalar
+/// subquery anywhere in it.
+pub(crate) fn holds_subquery(expr: &Expr) -> bool {
+    expr.exists(|e| {
+        Ok(matches!(
+            e,
+            Expr::InSubquery(_) | Expr::Exists(_) | Expr::ScalarSubquery(_)
+        ))
+    })
+    .unwrap_or(true)
+}
+
+/// One `COUNT(*) FILTER (WHERE p)` per predicate, named by
+/// [`count_where_name`]: the aggregate [`SupertableReader::count_where`] runs
+/// when the range index cannot answer, and a hosted table sends.
+pub(crate) fn count_where_exprs(
+    predicates: impl IntoIterator<Item = Expr>,
+) -> Result<Vec<Expr>, DataFusionError> {
+    predicates
+        .into_iter()
+        .enumerate()
+        .map(|(i, predicate)| {
+            count(lit(1i64))
+                .filter(predicate)
+                .build()
+                .map(|counted| counted.alias(count_where_name(i)))
+        })
+        .collect()
+}
+
+/// The `n` counts of a [`SupertableReader::count_where`] aggregate's one row,
+/// by [`count_where_name`].
+pub(crate) fn count_where_row(batches: &[RecordBatch], n: usize) -> Result<Vec<u64>, QueryError> {
+    let row = batches
+        .iter()
+        .find(|batch| batch.num_rows() > 0)
+        .ok_or_else(|| {
+            QueryError::Internal("count_where: the counts came back with no row".to_string())
+        })?;
+    (0..n)
+        .map(|i| {
+            let name = count_where_name(i);
+            let column = row
+                .column_by_name(&name)
+                .and_then(|column| column.as_any().downcast_ref::<Int64Array>())
+                .ok_or_else(|| {
+                    QueryError::Internal(format!("count_where: no Int64 column `{name}`"))
+                })?;
+            u64::try_from(column.value(0))
+                .map_err(|_| QueryError::Internal(format!("count_where: `{name}` is negative")))
+        })
+        .collect()
 }
 
 /// Drain `_id`-only batches into a `Vec<i128>`. The supertable's

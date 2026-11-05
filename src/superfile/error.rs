@@ -195,6 +195,11 @@ pub enum ReadError {
 
     #[error("columnar read error: {0}")]
     Columnar(String),
+
+    /// A decode handed to the reader pool died before it answered; `0`
+    /// names the decode.
+    #[error("{0} task dropped its result")]
+    TaskDropped(&'static str),
 }
 
 impl ReadError {

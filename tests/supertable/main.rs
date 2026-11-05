@@ -51,6 +51,7 @@ mod drain_tombstones;
 mod gc_stale_snapshot;
 mod manifest;
 mod query;
+mod range_index;
 mod reindex;
 mod reindex_crash;
 mod reindex_fixture;

@@ -78,6 +78,7 @@ use crate::{
             WalStore, gc,
             lease::DEFAULT_LEASE_DURATION,
             recovery::{RecoveryError, RecoveryReport, scan_and_recover},
+            unfinished::UnfinishedWals,
         },
         writer::{AppendQueue, WriterSlot, builder_options_of},
     },
@@ -252,6 +253,10 @@ pub(super) struct SupertableInner {
     /// rows reaches them on many searches, so the warning is said once per
     /// handle rather than once per search.
     pub(super) unowned_hits_warned: OnceLock<()>,
+    /// Mutation WALs this handle left short of `Complete` after their rows
+    /// were retired, which it finishes itself rather than waiting for the
+    /// next open's recovery sweep. See [`crate::supertable::wal::unfinished`].
+    pub(super) unfinished_wals: UnfinishedWals,
     /// Cached SQL schemas, keyed by the `schema_id` they were built from:
     /// a pure function of the table's schema, rebuilt when it changes and
     /// otherwise shared (unlike `sql_session_cache`, which follows the
@@ -1153,12 +1158,19 @@ impl Supertable {
     }
 
     /// Index the superfiles the table-level term index does not list and
-    /// fold its layers in runs of at most `fold_max_bytes` (see
+    /// fold its layers in runs its scratch disk holds, or of at most
+    /// `unmeasured_fold_max_bytes` when the disk cannot be read (see
     /// `writer::stamp_term_index`). [`Supertable::optimize`] calls this
     /// after compaction.
     #[cfg_attr(feature = "detailed-tracing", tracing::instrument(skip_all))]
-    pub(crate) fn refresh_term_index_sync(&self, fold_max_bytes: u64) -> Result<(), BuildError> {
-        self.block_on_query(super::writer::stamp_term_index(&self.inner, fold_max_bytes))
+    pub(crate) fn refresh_term_index_sync(
+        &self,
+        unmeasured_fold_max_bytes: u64,
+    ) -> Result<(), BuildError> {
+        self.block_on_query(super::writer::stamp_term_index(
+            &self.inner,
+            unmeasured_fold_max_bytes,
+        ))
     }
 
     /// Whether `spec` names four columns of this table of the right types
@@ -2261,6 +2273,7 @@ async fn build_handle(
         superseded: Mutex::default(),
         pointer_vanished: OnceLock::new(),
         unowned_hits_warned: OnceLock::new(),
+        unfinished_wals: UnfinishedWals::default(),
         hidden_deleted_cache: Mutex::new(None),
         sql_schemas: ArcSwapOption::empty(),
         term_index_objects_seen: Mutex::default(),

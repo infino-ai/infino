@@ -23,18 +23,27 @@
 //! decoded entries live in the hydrated `ManifestSnapshot` (there is deliberately no
 //! separate cache).
 
-use std::{collections::HashMap, io, mem::size_of, ops::Range, os::unix::fs::FileExt, sync::Arc};
+use std::{
+    collections::HashMap,
+    fs::{self, File, TryLockError},
+    io,
+    mem::size_of,
+    ops::Range,
+    os::unix::fs::FileExt,
+    path::Path,
+    sync::Arc,
+};
 
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt, stream};
-use tempfile::NamedTempFile;
+use tempfile::{Builder as TempFileBuilder, NamedTempFile};
 use tokio::{fs as async_fs, task::spawn_blocking};
 use uuid::Uuid;
 
 #[cfg(feature = "graph-index")]
 use crate::superfile::vector::adjacency;
 use crate::{
-    config::{self, scratch_root},
+    config,
     runtime_bridge::carry_span,
     storage::{StorageError, StorageProvider},
     superfile::vector::{flat, hnsw},
@@ -77,6 +86,9 @@ const STRIPED_FETCH_CHUNK_BYTES: u64 = 64 << 20;
 /// count one host can productively drive against Azure/S3 before the
 /// per-stream gain flattens.
 const STRIPED_FETCH_MAX_IN_FLIGHT: usize = 16;
+/// File-name prefix of a centroid-section spill, so a later fetch can find
+/// the spills a crashed process left behind.
+const SPILL_FILE_PREFIX: &str = "centroid-section-";
 
 /// File-name prefix of a slow vector-state blob; the content hash follows.
 const BLOB_NAME_PREFIX: &str = "state-";
@@ -466,9 +478,67 @@ impl CentroidSection {
     }
 }
 
+/// Create a spill file under `dir`, after deleting the spills there that no
+/// live process holds. The spill is locked for as long as this handle is
+/// open, so a process that dies without dropping it (killed, OOM) leaves a
+/// file the next call can tell is orphaned.
+fn create_spill(dir: &Path) -> io::Result<NamedTempFile> {
+    fs::create_dir_all(dir)?;
+    remove_orphaned_spills(dir);
+    let spill = TempFileBuilder::new()
+        .prefix(SPILL_FILE_PREFIX)
+        .tempfile_in(dir)?;
+    spill.as_file().try_lock().map_err(io::Error::from)?;
+    Ok(spill)
+}
+
+/// Delete every centroid-section spill in `dir` whose lock is free, meaning
+/// the process that wrote it is gone. Best-effort: a file that cannot be
+/// opened, locked or removed is left for a later call.
+fn remove_orphaned_spills(dir: &Path) {
+    let Ok(listing) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in listing.flatten() {
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(SPILL_FILE_PREFIX)
+        {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(file) = File::open(&path) else {
+            continue;
+        };
+        match file.try_lock() {
+            Ok(()) => {
+                drop(file);
+                match fs::remove_file(&path) {
+                    Ok(()) => tracing::info!(
+                        path = %path.display(),
+                        "removed a centroid-section spill left by an exited process"
+                    ),
+                    Err(error) => tracing::debug!(
+                        path = %path.display(),
+                        %error,
+                        "could not remove an orphaned centroid-section spill"
+                    ),
+                }
+            }
+            Err(TryLockError::WouldBlock) => {}
+            Err(TryLockError::Error(error)) => tracing::debug!(
+                path = %path.display(),
+                %error,
+                "could not check a centroid-section spill's lock"
+            ),
+        }
+    }
+}
+
 /// Fetch the centroid-section sibling, verify its hash, spill it to a
-/// local temp file, and index it with the shared offset walk over
-/// `entries` (which must be the same visible membership, in the same
+/// local file under `scratch_dir`, and index it with the shared offset walk
+/// over `entries` (which must be the same visible membership, in the same
 /// order, that [`write_state`] published — the size cross-check fails
 /// loudly on any drift and callers fall back to per-superfile reads).
 /// The section is read from `cache` when it holds it, and kept there
@@ -478,11 +548,16 @@ pub(crate) async fn fetch_centroid_section(
     cache: Option<&Arc<MetadataDiskCache>>,
     reference: &RoutingRef,
     entries: &[Arc<SuperfileEntry>],
+    scratch_dir: &Path,
 ) -> Result<CentroidSection, SlowVectorStateError> {
     let io_err = |e: io::Error| SlowVectorStateError::Storage(format!("section spill: {e}"));
     let expected_len = section_len(entries) as u64;
-    let scratch_root = scratch_root();
-    let spill = NamedTempFile::new_in(&scratch_root).map_err(io_err)?;
+    let spill = create_spill(scratch_dir).map_err(|e| {
+        SlowVectorStateError::Storage(format!(
+            "centroid section spill under {}: {e}",
+            scratch_dir.display()
+        ))
+    })?;
     let cached = match cache {
         Some(cache) => cache.get(&reference.content_hash).await,
         None => None,
@@ -1068,6 +1143,39 @@ mod tests {
         test_helpers::fid,
     };
 
+    /// A spill whose lock is free was left by an exited process and is
+    /// removed when the next spill is created; a spill a live handle holds,
+    /// and files that are not spills, are kept.
+    #[test]
+    fn create_spill_removes_orphaned_spills_only() {
+        let dir = tempdir().expect("tempdir");
+        let orphan = dir.path().join(format!("{SPILL_FILE_PREFIX}orphan"));
+        fs::write(&orphan, b"left by a killed process").expect("seed orphan");
+        let other = dir.path().join("not-a-spill");
+        fs::write(&other, b"unrelated").expect("seed unrelated file");
+        let live = create_spill(dir.path()).expect("first spill");
+
+        let second = create_spill(dir.path()).expect("second spill");
+
+        assert!(!orphan.exists(), "an unlocked spill is removed");
+        assert!(
+            live.path().exists(),
+            "a spill held by a live handle is kept"
+        );
+        assert!(other.exists(), "a file without the spill prefix is kept");
+        assert!(second.path().starts_with(dir.path()));
+    }
+
+    /// The spill directory is created when it does not exist yet, as on a
+    /// fresh cache.
+    #[test]
+    fn create_spill_creates_its_directory() {
+        let dir = tempdir().expect("tempdir");
+        let nested = dir.path().join("cache").join("scratch");
+        let spill = create_spill(&nested).expect("spill under a missing directory");
+        assert!(spill.path().starts_with(&nested));
+    }
+
     /// Doc count for the first fixture entry; arbitrary but distinct from
     /// `SECOND_N_DOCS` so field mix-ups fail loudly.
     const FIRST_N_DOCS: u64 = 42;
@@ -1198,15 +1306,22 @@ mod tests {
         assert!(!section.is_empty(), "fixture summaries carry fp32");
 
         let dir = tempdir().expect("tempdir");
+        let scratch = tempdir().expect("scratch tempdir");
         let storage = LocalFsStorageProvider::new(dir.path()).expect("storage");
         let published = write_state(&storage, None, &entries, None)
             .await
             .expect("publish");
         assert_eq!(published.centroids.content_hash, ContentHash::of(&section));
 
-        let fetched = fetch_centroid_section(&storage, None, &published.centroids, &entries)
-            .await
-            .expect("fetch section");
+        let fetched = fetch_centroid_section(
+            &storage,
+            None,
+            &published.centroids,
+            &entries,
+            scratch.path(),
+        )
+        .await
+        .expect("fetch section");
         for entry in &entries {
             let cell = &entry.vector_summary[&fid("emb")].cells[0];
             let got = fetched
@@ -1487,6 +1602,7 @@ mod tests {
     #[tokio::test]
     async fn compose_section_from_previous_generation() {
         let dir = tempdir().expect("tempdir");
+        let scratch = tempdir().expect("scratch tempdir");
         let storage = LocalFsStorageProvider::new(dir.path()).expect("provider");
         let resident = vec![
             entry_with_summary(FIRST_N_DOCS, 1),
@@ -1521,9 +1637,15 @@ mod tests {
             "no fp32 source must fail loudly, never publish a hole"
         );
 
-        let previous = fetch_centroid_section(&storage, None, &published.centroids, &resident)
-            .await
-            .expect("fetch previous section");
+        let previous = fetch_centroid_section(
+            &storage,
+            None,
+            &published.centroids,
+            &resident,
+            scratch.path(),
+        )
+        .await
+        .expect("fetch previous section");
         let composed =
             compose_centroid_section(&stripped, Some(&previous)).expect("compose from previous");
         assert_eq!(
@@ -1570,10 +1692,15 @@ mod tests {
         .await
         .expect("load from cache");
         assert_eq!(loaded.len(), entries.len());
-        let section =
-            fetch_centroid_section(&storage, Some(&cache), &published.centroids, &entries)
-                .await
-                .expect("section from cache");
+        let section = fetch_centroid_section(
+            &storage,
+            Some(&cache),
+            &published.centroids,
+            &entries,
+            &dir.path().join("scratch"),
+        )
+        .await
+        .expect("section from cache");
         let cell = &entries[0].vector_summary[&fid("emb")].cells[0];
         let got = section
             .read_cell(entries[0].superfile_id, fid("emb"), cell.cell_id)
@@ -1602,9 +1729,15 @@ mod tests {
         )
         .await
         .expect("load");
-        fetch_centroid_section(&storage, Some(&cache), &published.centroids, &entries)
-            .await
-            .expect("section");
+        fetch_centroid_section(
+            &storage,
+            Some(&cache),
+            &published.centroids,
+            &entries,
+            &dir.path().join("scratch"),
+        )
+        .await
+        .expect("section");
 
         assert!(cache.get(&published.content_hash).await.is_some());
         assert!(cache.get(&published.centroids.content_hash).await.is_some());

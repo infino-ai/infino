@@ -1189,6 +1189,18 @@ impl Table {
             .map_err(py_err)
     }
 
+    /// The rows each SQL `predicate` (e.g. `"price > 500"`) holds, one count
+    /// per predicate in order; `"true"` counts every row. Counted from the
+    /// range index without running a query when each predicate is one range
+    /// on one range-indexed column; one aggregate runs otherwise.
+    fn count_where(&self, py: Python<'_>, predicates: Vec<String>) -> PyResult<Vec<u64>> {
+        let exprs = predicates
+            .iter()
+            .map(|predicate| self.parse_predicate(predicate))
+            .collect::<PyResult<Vec<_>>>()?;
+        py.detach(|| self.inner.count_where(&exprs)).map_err(py_err)
+    }
+
     /// `column`'s rows counted per value, as `SELECT column, COUNT(*) ...
     /// GROUP BY column` gives them: a pyarrow `Table` of each value and its
     /// `count(*)`, with a null value for the rows that hold none. Read from

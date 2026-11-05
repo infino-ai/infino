@@ -539,10 +539,11 @@ impl SupertableReader {
 
 /// Lower a search table function's pushed-down `WHERE` filters to the
 /// candidate plan its kernel ranks within: a token-match superset over
-/// the FTS-indexed columns, [`Unbounded`](CandidatePlan::Unbounded) when
-/// no filter is index-resolvable. One lowering for all three search
-/// functions, so a predicate bounds `vector_search`, `bm25_search` and
-/// `hybrid_search` identically.
+/// the FTS-indexed columns and a range superset over the range-indexed
+/// ones, [`Unbounded`](CandidatePlan::Unbounded) when no filter is
+/// index-resolvable. One lowering for all three search functions, so a
+/// predicate bounds `vector_search`, `bm25_search` and `hybrid_search`
+/// identically.
 pub(crate) fn candidate_plan_for_filters(
     manifest: &ManifestSnapshot,
     filters: &[Expr],
@@ -553,7 +554,8 @@ pub(crate) fn candidate_plan_for_filters(
         .iter()
         .map(|c| c.column.as_str())
         .collect();
-    CandidatePlan::from_filters(filters, &fts_cols, &|col| {
+    let range_cols = manifest.table_schema().range_column_types();
+    CandidatePlan::from_filters(filters, &fts_cols, &range_cols, &|col| {
         manifest.try_fts_tokenizer_for(col)
     })
 }
@@ -638,7 +640,7 @@ impl BoundPredicate {
 /// DataFusion hands a table function its filters as the planner wrote
 /// them — `t.category = 'x'` under `FROM bm25_search(...) AS t` — while
 /// the function's output schema names bare columns.
-fn unqualified(expr: Expr) -> DfResult<Expr> {
+pub(crate) fn unqualified(expr: Expr) -> DfResult<Expr> {
     expr.transform(|e| {
         Ok(match e {
             Expr::Column(c) if c.relation.is_some() => {

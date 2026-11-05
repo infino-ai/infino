@@ -1,6 +1,6 @@
 [package]
 name = "infino-node"
-version = "0.11.17"
+version = "0.11.21"
 edition = "2024"
 license = "Apache-2.0"
 publish = false
@@ -45,3 +45,15 @@ serde_json = "1"
 
 [build-dependencies]
 napi-build = "2"
+
+# The bindings are their own Cargo root (own `Cargo.lock`), so the engine
+# crate's `[profile.release]` does not reach an addon build: without this
+# block `napi build --release` compiles the module with cargo's stock release
+# profile (no LTO, 16 codegen units). Match the engine's tuning so the addon
+# runs the same code the engine's benches measure (thin LTO, one codegen
+# unit). The symbol table is stripped by `napi build --strip`, same as the
+# Python wheel's profile does with `strip = true`.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

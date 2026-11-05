@@ -173,6 +173,11 @@ pub enum ColumnIndex {
         /// How candidates are re-scored after the coarse search.
         rerank_codec: RerankCodec,
     },
+    /// A range index over an integer, float, date or timestamp column: each
+    /// superfile keeps the column's rows in value order, so a range or
+    /// equality predicate on the column reads only the rows it matches,
+    /// however the values are spread across the table.
+    Range,
 }
 
 /// One live user column: its identity, label, physical type and index.
@@ -303,6 +308,19 @@ impl TableSchema {
         schema
     }
 
+    /// This schema with a range index on each of `columns`. The caller has
+    /// checked each is a column the index keys and that carries no other
+    /// index (`IndexSpec::check_ranges`); a name the schema lacks is passed
+    /// over.
+    pub(crate) fn with_range_indexes(mut self, columns: &[String]) -> Self {
+        for field in &mut self.fields {
+            if columns.contains(&field.name) {
+                field.index = Some(ColumnIndex::Range);
+            }
+        }
+        self
+    }
+
     /// The user schema: every live column in declared order, unstamped.
     pub(crate) fn user_schema(&self) -> Arc<Schema> {
         Arc::new(Schema::new(
@@ -351,7 +369,7 @@ impl TableSchema {
         self.stored_fields(id_column, |f| match &f.index {
             Some(ColumnIndex::Vector { .. }) => false,
             Some(ColumnIndex::Fts { stored, .. }) => *stored,
-            None => true,
+            Some(ColumnIndex::Range) | None => true,
         })
     }
 
@@ -412,6 +430,26 @@ impl TableSchema {
                 ),
                 _ => None,
             })
+            .collect()
+    }
+
+    /// The range-indexed columns, by name, in declared order.
+    pub(crate) fn range_columns(&self) -> Vec<String> {
+        self.fields
+            .iter()
+            .filter(|f| matches!(f.index, Some(ColumnIndex::Range)))
+            .map(|f| f.name.clone())
+            .collect()
+    }
+
+    /// Each range-indexed column's id and type, by name: what a query lowers
+    /// a range predicate against. A superfile's range index holds the
+    /// column under the id.
+    pub(crate) fn range_column_types(&self) -> HashMap<String, (FieldId, DataType)> {
+        self.fields
+            .iter()
+            .filter(|f| matches!(f.index, Some(ColumnIndex::Range)))
+            .map(|f| (f.name.clone(), (f.id, f.data_type.clone())))
             .collect()
     }
 
@@ -665,6 +703,9 @@ pub(crate) fn index_to_json(index: &ColumnIndex) -> Value {
                 serde_json::to_value(rerank_codec).expect("codec name"),
             );
         }
+        ColumnIndex::Range => {
+            out.insert("kind".into(), Value::from("range"));
+        }
     }
     Value::Object(out)
 }
@@ -753,6 +794,7 @@ pub(crate) fn index_from_json(json: &Value) -> Result<ColumnIndex, String> {
                 .transpose()?
                 .unwrap_or_default(),
         }),
+        "range" => Ok(ColumnIndex::Range),
         other => Err(format!("unknown index kind '{other}'")),
     }
 }
@@ -825,17 +867,15 @@ fn field_from_json(json: &Value) -> Result<FieldDef, String> {
     })
 }
 
-/// `batch` with [`FIELD_ID_META_KEY`] removed from every field: ids are an
-/// internal identity, and a query result carries the user's columns, not
-/// the engine's bookkeeping. Other field metadata is kept.
-pub fn strip_field_ids(batch: arrow_array::RecordBatch) -> arrow_array::RecordBatch {
-    let schema = batch.schema();
+/// `schema` with [`FIELD_ID_META_KEY`] removed from every field, or `None`
+/// when no field carries one. Other field and schema metadata is kept.
+fn without_field_ids(schema: &Schema) -> Option<Arc<Schema>> {
     if !schema
         .fields()
         .iter()
         .any(|f| f.metadata().contains_key(FIELD_ID_META_KEY))
     {
-        return batch;
+        return None;
     }
     let fields: Vec<Arc<Field>> = schema
         .fields()
@@ -846,7 +886,34 @@ pub fn strip_field_ids(batch: arrow_array::RecordBatch) -> arrow_array::RecordBa
             Arc::new(f.as_ref().clone().with_metadata(m))
         })
         .collect();
-    let stripped = Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()));
+    Some(Arc::new(Schema::new_with_metadata(
+        fields,
+        schema.metadata().clone(),
+    )))
+}
+
+/// `schema` as SQL plans against it: the same columns, without their field
+/// ids. Ids are a table's own storage identity — two tables mint them
+/// independently, so the same column name can carry different ids in each.
+/// DataFusion treats field metadata as part of a column's type, and its
+/// logical and physical planners reconcile it differently where inputs
+/// meet: a `UNION` keeps only the metadata every input agrees on in the
+/// logical plan but merges it in the physical one, so a column whose ids
+/// disagree comes out of the two with different metadata, and an operator
+/// above it that checks one against the other refuses to plan. Each file's
+/// columns are still resolved by id, from the file's own schema and the
+/// table's, when the scan opens it.
+pub(crate) fn sql_schema(schema: Arc<Schema>) -> Arc<Schema> {
+    without_field_ids(&schema).unwrap_or(schema)
+}
+
+/// `batch` with [`FIELD_ID_META_KEY`] removed from every field: ids are an
+/// internal identity, and a query result carries the user's columns, not
+/// the engine's bookkeeping. Other field metadata is kept.
+pub fn strip_field_ids(batch: arrow_array::RecordBatch) -> arrow_array::RecordBatch {
+    let Some(stripped) = without_field_ids(&batch.schema()) else {
+        return batch;
+    };
     arrow_array::RecordBatch::try_new(stripped, batch.columns().to_vec())
         .expect("same arrays under a schema that differs only in field metadata")
 }
@@ -902,6 +969,38 @@ mod tests {
         assert_eq!(stamped.field(1).name(), "score");
         assert_eq!(stamped.field(1).data_type(), &DataType::Int64);
         assert!(stamped.field(1).is_nullable());
+    }
+
+    #[test]
+    fn the_sql_schema_drops_field_ids_and_keeps_everything_else() {
+        let user = Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false)
+                .with_metadata(HashMap::from([("ext".to_string(), "tag".to_string())])),
+            Field::new("score", DataType::Int64, true),
+        ])
+        .with_metadata(HashMap::from([("k".to_string(), "v".to_string())]));
+        let ts = TableSchema::from_user_schema(&user);
+        let stored = ts.stamp_field_ids(&user, "_id");
+        assert!(stored.fields().iter().all(|f| field_id_of(f).is_some()));
+
+        let sql = sql_schema(Arc::clone(&stored));
+        assert!(sql.fields().iter().all(|f| field_id_of(f).is_none()));
+        for (s, f) in sql.fields().iter().zip(stored.fields()) {
+            assert_eq!(
+                (s.name(), s.data_type(), s.is_nullable()),
+                (f.name(), f.data_type(), f.is_nullable())
+            );
+        }
+        assert_eq!(
+            sql.field(0).metadata().get("ext").map(String::as_str),
+            Some("tag"),
+            "user field metadata survives"
+        );
+        assert_eq!(sql.metadata(), stored.metadata());
+
+        // A schema with no ids is handed back as is.
+        let plain = Arc::new(user);
+        assert!(Arc::ptr_eq(&sql_schema(Arc::clone(&plain)), &plain));
     }
 
     #[test]

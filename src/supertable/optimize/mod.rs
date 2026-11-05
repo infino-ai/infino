@@ -14,12 +14,11 @@ pub(crate) mod compact;
 use std::time::Instant;
 
 use compact::max_merge_input_bytes;
-use fs4::available_space;
 
 #[cfg(feature = "detailed-tracing")]
 use crate::utils::trace::OpOrigin;
 use crate::{
-    config::{OptimizeOptions, scratch_root},
+    config::OptimizeOptions,
     supertable::{
         Supertable,
         error::{GcError, OptimizeError},
@@ -94,24 +93,12 @@ impl Supertable {
             }
         }
         // Index the superfiles the term index does not list, a batch at a
-        // time, and fold its layers in runs no larger than a compaction
-        // merge's input, or than half the free space where the fold spills
-        // if that is more: a fold downloads its run there before merging,
-        // so a host with room folds a root of fifty layers in one pass
-        // where the merge cap alone took four, each reading its layers back
-        // from storage and publishing a root. The merge cap stays the floor,
-        // as it was before free space was read. Runs before gc so the sweep
-        // keeps the roots it publishes.
+        // time, and fold its layers in runs its scratch disk and the host's
+        // memory hold, as each pass measures them; a compaction merge's
+        // input bounds a fold when the disk cannot be read. Runs before gc
+        // so the sweep keeps the roots it publishes.
         if opts.steps.refresh_term_index {
-            let spill_root = self
-                .inner()
-                .options
-                .term_index_build_policy()
-                .scratch_root
-                .unwrap_or_else(scratch_root);
-            let scratch_bytes = available_space(spill_root).map_or(0, |bytes| bytes / 2);
-            let fold_max_bytes = max_merge_input_bytes(&opts.compaction).max(scratch_bytes);
-            self.refresh_term_index_sync(fold_max_bytes)
+            self.refresh_term_index_sync(max_merge_input_bytes(&opts.compaction))
                 .map_err(OptimizeError::from)?;
         }
 

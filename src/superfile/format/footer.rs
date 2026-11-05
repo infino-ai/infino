@@ -111,6 +111,28 @@ pub struct ParquetLayout {
     pub vec_length: u64,
     pub ids_offset: u64,
     pub ids_length: u64,
+    pub range_offset: u64,
+    pub range_length: u64,
+}
+
+/// The range index region a splice writes after the id sidecar: its bytes
+/// as a stream, the stream's length and the length of the directory at its
+/// head. A zero `length` writes no region.
+pub(crate) struct RangeStream<R> {
+    pub(crate) region: R,
+    pub(crate) length: u64,
+    pub(crate) directory_length: u64,
+}
+
+impl RangeStream<io::Empty> {
+    /// No region.
+    pub(crate) fn none() -> Self {
+        Self {
+            region: io::empty(),
+            length: 0,
+            directory_length: 0,
+        }
+    }
 }
 
 struct CountingWriter<'a, W> {
@@ -170,6 +192,15 @@ pub struct EncodedBody {
     /// index), carried through to the rewrite so the row groups survive. The
     /// page index itself stays in the body, where the column chunks point.
     metadata: ParquetMetaData,
+}
+
+impl EncodedBody {
+    /// The body's row groups to read back, before the splice: a fresh
+    /// handle on the scratch file, which holds every column chunk at the
+    /// offset the metadata records, and that metadata.
+    pub(crate) fn rows_source(&self) -> io::Result<(File, Arc<ParquetMetaData>)> {
+        Ok((self.body_file.reopen()?, Arc::new(self.metadata.clone())))
+    }
 }
 
 /// Encode `batches` (matching `schema`) into the Parquet body and strip
@@ -705,6 +736,7 @@ pub fn splice_index_blobs(
         vec_blob.len() as u64,
         Cursor::new(ids_blob),
         ids_blob.len() as u64,
+        RangeStream::none(),
         extra_kv,
         &mut bytes,
     )?;
@@ -723,7 +755,7 @@ pub fn splice_index_blobs(
 /// footer to `output`. This is the single superfile splice implementation:
 /// the in-memory [`splice_index_blobs`] wrapper and drain's disk-backed shard
 /// assembly both call here.
-pub(crate) fn splice_index_streams_to<W, F, V, I>(
+pub(crate) fn splice_index_streams_to<W, F, V, I, R>(
     body: EncodedBody,
     fts_blob: F,
     fts_length: u64,
@@ -731,6 +763,7 @@ pub(crate) fn splice_index_streams_to<W, F, V, I>(
     vec_length: u64,
     ids_blob: I,
     ids_length: u64,
+    range: RangeStream<R>,
     extra_kv: &[(String, String)],
     output: W,
 ) -> Result<ParquetLayout, FooterError>
@@ -739,6 +772,7 @@ where
     F: Read,
     V: Read,
     I: Read,
+    R: Read,
 {
     let EncodedBody {
         body_file,
@@ -755,6 +789,7 @@ where
         vec_length,
         ids_blob,
         ids_length,
+        range,
         extra_kv,
         output,
     )
@@ -772,7 +807,7 @@ where
 /// footer is written from the row groups alone, whether or not `metadata`
 /// had the page index loaded: writing a loaded one again would append a
 /// second copy and repoint the footer at it.
-pub(crate) fn splice_carried_body_to<W, B, F, V, I>(
+pub(crate) fn splice_carried_body_to<W, B, F, V, I, R>(
     mut body: B,
     body_len: u64,
     metadata: &ParquetMetaData,
@@ -782,6 +817,7 @@ pub(crate) fn splice_carried_body_to<W, B, F, V, I>(
     vec_length: u64,
     mut ids_blob: I,
     ids_length: u64,
+    mut range: RangeStream<R>,
     extra_kv: &[(String, String)],
     mut output: W,
 ) -> Result<ParquetLayout, FooterError>
@@ -791,6 +827,7 @@ where
     F: Read,
     V: Read,
     I: Read,
+    R: Read,
 {
     let mut output = CountingWriter {
         output: &mut output,
@@ -826,6 +863,16 @@ where
         let copied = io::copy(&mut ids_blob, &mut output)?;
         if copied != ids_length {
             return Err(FooterError::Malformed("stable-id stream length mismatch"));
+        }
+        offset
+    } else {
+        0
+    };
+    let range_offset = if range.length > 0 {
+        let offset = output.written;
+        let copied = io::copy(&mut range.region, &mut output)?;
+        if copied != range.length {
+            return Err(FooterError::Malformed("range index stream length mismatch"));
         }
         offset
     } else {
@@ -883,6 +930,15 @@ where
             Some(ids_length.to_string()),
         ));
     }
+    if range.length > 0 {
+        for (key, value) in [
+            (kv::RANGE_OFFSET, range_offset),
+            (kv::RANGE_LENGTH, range.length),
+            (kv::RANGE_DIRECTORY_LENGTH, range.directory_length),
+        ] {
+            kvs.push(KeyValue::new(key.to_string(), Some(value.to_string())));
+        }
+    }
     let new_fm = FileMetaData::new(
         old_fm.version(),
         old_fm.num_rows(),
@@ -909,6 +965,8 @@ where
         vec_length,
         ids_offset,
         ids_length,
+        range_offset,
+        range_length: range.length,
     })
 }
 
@@ -1032,12 +1090,13 @@ pub(crate) struct BlobRegions {
     pub(crate) fts: Option<BlobRegion>,
     pub(crate) vec: Option<BlobRegion>,
     pub(crate) ids: Option<BlobRegion>,
+    pub(crate) range: Option<BlobRegion>,
 }
 
 impl BlobRegions {
     /// Whether every region ends inside a `file_len`-byte file.
     pub(crate) fn fit_within(&self, file_len: u64) -> bool {
-        [self.fts, self.vec, self.ids]
+        [self.fts, self.vec, self.ids, self.range]
             .into_iter()
             .flatten()
             .all(|(at, len)| at.checked_add(len).is_some_and(|end| end <= file_len))
@@ -1080,6 +1139,7 @@ pub(crate) fn resolved_regions(metadata: &ParquetMetaData) -> Option<BlobRegions
         fts: region(kv::FTS_OFFSET, kv::FTS_LENGTH)?,
         vec: region(kv::VEC_OFFSET, kv::VEC_LENGTH)?,
         ids: region(kv::IDS_OFFSET, kv::IDS_LENGTH)?,
+        range: region(kv::RANGE_OFFSET, kv::RANGE_LENGTH)?,
     })
 }
 
@@ -1290,6 +1350,7 @@ mod tests {
             0,
             Cursor::new(&[][..]),
             0,
+            RangeStream::none(),
             &[(kv::N_DOCS.to_string(), "3".to_string())],
             &mut out,
         )

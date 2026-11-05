@@ -8,7 +8,7 @@
 
 use std::{collections::HashSet, sync::Arc};
 
-use arrow_schema::SchemaRef;
+use arrow_schema::{Schema, SchemaRef};
 
 use crate::{
     InfinoError,
@@ -20,6 +20,7 @@ use crate::{
             bm25::Bm25Params,
             tokenize::STANDARD_TOKENIZER,
         },
+        range::KeyKind,
         vector::{builder::VectorConfig, distance::Metric, rerank_codec::RerankCodec},
     },
     supertable::companion::{CompanionSpec, check_purpose},
@@ -234,6 +235,7 @@ impl From<String> for FtsField {
 pub struct IndexSpec {
     fts: Vec<FtsField>,
     vectors: Vec<VectorIndex>,
+    ranges: Vec<String>,
     companions: Vec<Companion>,
 }
 
@@ -281,6 +283,69 @@ impl IndexSpec {
             rerank_codec: None,
         });
         self
+    }
+
+    /// Mark `column` as range indexed: each superfile keeps the column's
+    /// rows in value order, so a SQL range or equality predicate on it
+    /// (`price > 500`, `ts BETWEEN a AND b`, `qty = 3`) reads only the rows
+    /// it matches instead of scanning the column.
+    ///
+    /// The per-file minimum and maximum the table keeps for every column
+    /// already skip the files and pages a range cannot reach, which is
+    /// enough when the rows arrive in the column's order (a timestamp on
+    /// time-ordered data). A range index is for a column whose values are
+    /// spread across every file — a price, a score, a duration — where
+    /// those bounds skip nothing. The cost is the sorted copy: a few bytes
+    /// per row of the column, in every superfile.
+    ///
+    /// The column must be an integer, float, date or timestamp column in the
+    /// schema, and carry no other index.
+    ///
+    /// ```
+    /// use infino::IndexSpec;
+    /// let spec = IndexSpec::new().fts("title").range("price");
+    /// # let _ = spec;
+    /// ```
+    pub fn range(mut self, column: impl Into<String>) -> Self {
+        self.ranges.push(column.into());
+        self
+    }
+
+    /// The range-indexed columns, in declaration order.
+    pub(crate) fn range_columns(&self) -> &[String] {
+        &self.ranges
+    }
+
+    /// Refuses a range index the table cannot carry: a column `schema`
+    /// does not have, one of a type the index does not key, one declared
+    /// twice, or one that already carries a full-text or vector index.
+    pub(crate) fn check_ranges(&self, schema: &Schema) -> Result<(), InfinoError> {
+        let mut seen = HashSet::new();
+        for column in &self.ranges {
+            let refuse = |reason: String| {
+                Err(InfinoError::Config(format!(
+                    "range index on {column:?}: {reason}"
+                )))
+            };
+            let Ok(field) = schema.field_with_name(column) else {
+                return refuse("the schema has no such column".into());
+            };
+            if KeyKind::of(field.data_type()).is_none() {
+                return refuse(format!(
+                    "a range index needs an integer, float, date or timestamp column, not `{}`",
+                    field.data_type()
+                ));
+            }
+            if !seen.insert(column.as_str()) {
+                return refuse("declared twice".into());
+            }
+            if self.fts.iter().any(|f| &f.column == column)
+                || self.vectors.iter().any(|v| &v.column == column)
+            {
+                return refuse("the column carries another index".into());
+            }
+        }
+        Ok(())
     }
 
     /// Create the table with a hidden companion table beside it: a second
@@ -376,6 +441,13 @@ impl IndexSpec {
             if companion.indexes.has_companions() {
                 return Err(InfinoError::Config(format!(
                     "companion {:?} declares companions of its own; a companion cannot have any",
+                    companion.purpose
+                )));
+            }
+            if !companion.indexes.ranges.is_empty() {
+                return Err(InfinoError::Config(format!(
+                    "companion {:?} declares a range index; a companion takes full-text and \
+                     vector indexes only",
                     companion.purpose
                 )));
             }

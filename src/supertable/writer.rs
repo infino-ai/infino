@@ -73,7 +73,7 @@ use std::{
     str::from_utf8,
     sync::{
         Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{Receiver as StdReceiver, sync_channel as std_sync_channel},
     },
     thread::available_parallelism,
@@ -104,10 +104,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tempfile::{NamedTempFile, TempDir};
 use tokio::{
+    spawn,
     sync::{
-        Semaphore,
+        Notify, Semaphore,
         mpsc::{Receiver, Sender, channel},
     },
+    task::JoinHandle,
     time::sleep,
 };
 use tracing::{Instrument, Span, debug, error, info, warn};
@@ -226,11 +228,12 @@ use crate::{
         wal::{
             Lease, WalStore,
             lease::{self, DEFAULT_LEASE_DURATION},
-            pipeline::{self, TombstonePhaseOutcome},
+            pipeline::{self, TombstonePhaseError, TombstonePhaseOutcome},
             state_doc::{
                 IdSpan, OpKind, RowId, SCHEMA_VERSION, SupertableHandleId, TombstoneEntry,
                 TombstoneOutcome, WalId, WalState, WalStateDoc,
             },
+            unfinished::{finish_unfinished, retry_in_background},
         },
     },
     utils::{
@@ -2130,6 +2133,16 @@ impl SupertableWriter {
         ))
     )]
     pub fn commit(&mut self) -> Result<CommitResult, CommitError> {
+        // Finish any mutation this handle left short of `Complete` first, so
+        // a reader stops seeing its retired rows without waiting for the
+        // background retry. Best-effort: what stays unfinished is retried.
+        if !self.inner.unfinished_wals.is_empty() {
+            let supertable = Supertable::from_inner(Arc::clone(&self.inner));
+            bridge_on_runtime(
+                async move { finish_unfinished(&supertable).await },
+                &self.inner.query_runtime(),
+            );
+        }
         // The source label the buffered appends were given, if any. Taken,
         // not read: it belongs to this commit's superfiles and to no later
         // batch. Put back on a failed flush, since the buffer is too.
@@ -2322,25 +2335,27 @@ impl SupertableWriter {
                 Ok(applied) => applied,
                 Err(cause) => {
                     release_mutation_lease(&wal_store, wal_id, owner).await;
+                    note_if_retired(&supertable, wal_id, &cause);
                     return Err(cause.into());
                 }
             };
-            let (n_t, n_nf) = match outcome {
-                TombstonePhaseOutcome::Applied {
-                    n_tombstoned,
-                    n_not_found,
-                }
-                | TombstonePhaseOutcome::AlreadyComplete {
-                    n_tombstoned,
-                    n_not_found,
-                } => (n_tombstoned, n_not_found),
-            };
-            // Best-effort cleanup of the WAL artifacts.
-            let _ = wal_store.delete_arrow(wal_id).await;
-            let _ = wal_store.delete_state(wal_id).await;
+            let (n_t, n_nf) = outcome.counts();
+            if matches!(outcome, TombstonePhaseOutcome::CompletionDeferred { .. }) {
+                // The replacement is published and the old rows retired; only
+                // the steps that finish the WAL are left. Keep it, unowned, for
+                // this handle to finish (or any sweep).
+                release_mutation_lease(&wal_store, wal_id, owner).await;
+                supertable.inner().unfinished_wals.note(wal_id);
+            } else {
+                // Best-effort cleanup of the WAL artifacts.
+                let _ = wal_store.delete_arrow(wal_id).await;
+                let _ = wal_store.delete_state(wal_id).await;
+            }
             Ok::<_, MutationError>((n_t, n_nf))
         };
-        let (n_tombstoned, n_not_found) = bridge_on_runtime(drive, &self.inner.query_runtime())?;
+        let driven = bridge_on_runtime(drive, &self.inner.query_runtime());
+        retry_in_background(&self.inner);
+        let (n_tombstoned, n_not_found) = driven?;
         // Per-op work stats: the update's replacement rows are appended
         // through the WAL pipeline (not the buffered append above), so
         // they count here — after the drive returns Ok — alongside the
@@ -2449,23 +2464,25 @@ impl SupertableWriter {
                 Ok(applied) => applied,
                 Err(cause) => {
                     release_mutation_lease(&wal_store, wal_id, owner).await;
+                    note_if_retired(&supertable, wal_id, &cause);
                     return Err(cause.into());
                 }
             };
-            let (n_t, n_nf) = match outcome {
-                TombstonePhaseOutcome::Applied {
-                    n_tombstoned,
-                    n_not_found,
-                }
-                | TombstonePhaseOutcome::AlreadyComplete {
-                    n_tombstoned,
-                    n_not_found,
-                } => (n_tombstoned, n_not_found),
-            };
-            let _ = wal_store.delete_state(wal_id).await;
+            let (n_t, n_nf) = outcome.counts();
+            if matches!(outcome, TombstonePhaseOutcome::CompletionDeferred { .. }) {
+                // The rows are retired; only the steps that finish the WAL are
+                // left. Keep it, unowned, for this handle to finish (or any
+                // sweep).
+                release_mutation_lease(&wal_store, wal_id, owner).await;
+                supertable.inner().unfinished_wals.note(wal_id);
+            } else {
+                let _ = wal_store.delete_state(wal_id).await;
+            }
             Ok::<_, MutationError>((n_t, n_nf))
         };
-        let (n_tombstoned, n_not_found) = bridge_on_runtime(drive, &self.inner.query_runtime())?;
+        let driven = bridge_on_runtime(drive, &self.inner.query_runtime());
+        retry_in_background(&self.inner);
+        let (n_tombstoned, n_not_found) = driven?;
         // Per-op work stats: rows this delete retired, after the drive
         // returns Ok.
         if let Some(stats) = &self.op_stats {
@@ -2619,22 +2636,25 @@ impl SupertableWriter {
             None => {
                 // Open once the buffer holds a superfile's worth of rows, so a
                 // small commit keeps today's one superfile; then feed everything
-                // buffered so far. One lane per pool thread.
+                // buffered so far.
                 if self.buffer_visible_scalar_bytes < target_bytes {
                     return;
                 }
                 // The lanes are opened once, before the append's rows are
-                // all known, so their count follows the pool, not the rows
+                // all known, so their count follows the threads, not the rows
                 // buffered so far: those are one superfile's worth, and a
                 // large append fed through the few lanes they would ask for
                 // would tokenise on a few threads.
-                let n_lanes = options
-                    .writer_pool
-                    .current_num_threads()
-                    .clamp(1, MAX_LANES);
+                // Held by the lanes once they open; released here if they
+                // do not.
+                let open = OpenAppend::enter(&options.writer_pool);
+                let n_lanes = lanes_for(options.writer_pool.current_num_threads(), open.count);
                 let opened = LiveLanes::open(Arc::clone(manifest), n_lanes, options.vector_layout);
                 let live = match opened {
-                    Ok(live) => live,
+                    Ok(mut live) => {
+                        live.open_append = Some(open);
+                        live
+                    }
                     Err(error) => {
                         debug!(%error, "live lanes not opened; the commit builds from the buffer");
                         self.disable_live();
@@ -3642,6 +3662,74 @@ struct LiveLanes {
     /// The least a lane's threshold is set to: the builder's own default,
     /// as a commit-time piece gets; lowered by tests to reach the bound.
     threshold_floor: usize,
+    /// This append's place among those with lanes open, released with the
+    /// lanes.
+    open_append: Option<OpenAppend>,
+}
+
+/// Appends with live lanes open, per writer pool: the pool's address and
+/// how many. An append counted here holds its pool, so no other pool can
+/// take that address while it is counted; a pool's entry goes at zero.
+/// Appends on different pools do not compete for threads, so they do not
+/// share a count.
+static OPEN_APPENDS: Mutex<BTreeMap<usize, usize>> = Mutex::new(BTreeMap::new());
+
+/// The key a pool's appends are counted under in [`OPEN_APPENDS`].
+fn pool_key(pool: &Arc<ThreadPool>) -> usize {
+    Arc::as_ptr(pool) as usize
+}
+
+/// One append counted among those with lanes open on its writer pool,
+/// until it is dropped.
+struct OpenAppend {
+    /// The pool it is counted on, held so the pool's key stays its own.
+    pool: Arc<ThreadPool>,
+    /// Appends with lanes open on the pool when this one opened, itself
+    /// included.
+    count: usize,
+}
+
+impl OpenAppend {
+    /// Count one more append with lanes open on `pool`.
+    fn enter(pool: &Arc<ThreadPool>) -> Self {
+        let mut open = OPEN_APPENDS.lock().unwrap_or_else(PoisonError::into_inner);
+        let count = open.entry(pool_key(pool)).or_default();
+        *count += 1;
+        Self {
+            pool: Arc::clone(pool),
+            count: *count,
+        }
+    }
+}
+
+impl Drop for OpenAppend {
+    fn drop(&mut self) {
+        let mut open = OPEN_APPENDS.lock().unwrap_or_else(PoisonError::into_inner);
+        let key = pool_key(&self.pool);
+        if let Some(count) = open.get_mut(&key) {
+            *count -= 1;
+            if *count == 0 {
+                open.remove(&key);
+            }
+        }
+    }
+}
+
+/// Lanes an append opens on a pool of `threads` while `open` appends,
+/// itself included, have lanes open on that pool: the threads divided
+/// among them, at least one. A lone append takes the whole pool. The
+/// share is taken when the lanes open and kept until they are let go, so
+/// appends that open together get theirs in the order they open (the
+/// whole pool, a half, a third, ...); the shares even out as appends
+/// commit and open again. Every lane interns its own copy of the
+/// vocabulary and grows its own posting vectors, so lanes past the
+/// threads that can feed them buy nothing; at one per thread for each of
+/// 32 appends on a 178-thread pool, 5,700 lanes' allocations held the
+/// process's memory-map lock and left the host idle for seconds at a
+/// time: a 1B-row ingest took 60.6 s where this share took 46.4 s. The
+/// lanes do not change what is written, only how the tokenising is split.
+fn lanes_for(threads: usize, open: usize) -> usize {
+    (threads / open.max(1)).clamp(1, MAX_LANES)
 }
 
 /// One lane: its accumulator, and the commit rows its documents are, as
@@ -3681,6 +3769,7 @@ impl LiveLanes {
             reservations: Vec::new(),
             fts_bytes: 0,
             threshold_floor: DEFAULT_SPILL_THRESHOLD_BYTES,
+            open_append: None,
         })
     }
 
@@ -11548,6 +11637,7 @@ async fn build_and_publish_centroid_router_section(
         inner.options.metadata_disk_cache.as_ref(),
         centroids_ref,
         entries,
+        &inner.options.scratch_dir(),
     )
     .await
     {
@@ -11605,6 +11695,7 @@ async fn previous_centroid_section(
         options.metadata_disk_cache.as_ref(),
         &reference,
         manifest.get_all_superfiles(),
+        &options.scratch_dir(),
     )
     .await
     {
@@ -11903,12 +11994,35 @@ async fn build_hnsw_graph_ref(
     .await
 }
 
+/// How long a publish under [`stamp_within`] keeps going after losing the
+/// commit race: at most `max_attempts` lost races, and no further attempt
+/// once one could not be expected to finish by `deadline`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::supertable) struct CommitRetryBudget {
+    pub(in crate::supertable) max_attempts: u32,
+    pub(in crate::supertable) deadline: Option<Instant>,
+}
+
+impl CommitRetryBudget {
+    /// The table's own commit retry budget, with no deadline.
+    pub(in crate::supertable) fn of_table(inner: &SupertableInner) -> Self {
+        Self {
+            max_attempts: inner.options.max_commit_retries.max(1),
+            deadline: None,
+        }
+    }
+}
+
+/// Reloads [`stamp_within`] makes in a row, without a lost race between them,
+/// before it counts falling behind the pointer as a lost race of its own. A
+/// reload is not a race lost, so it is retried at once and costs no budget;
+/// the bound keeps a pointer that moves on every reload from spinning the
+/// loop.
+const MAX_CONSECUTIVE_RELOADS: u32 = 4;
+
 /// Publish one maintenance artifact under the commit-race protocol every
-/// stamp shares: load the current manifest, let `successor` build the
-/// artifact against its membership and return the manifest to publish
-/// (`None` when nothing needs publishing), then CAS it in. A lost race
-/// derives the next attempt past any crash-orphaned list and retries
-/// with backoff; `what` names the artifact in the terminal error.
+/// stamp shares, within the table's own commit retry budget. See
+/// [`stamp_within`].
 pub(in crate::supertable) async fn stamp_with_retries<F, Fut>(
     inner: &SupertableInner,
     storage: &Arc<dyn StorageProvider>,
@@ -11919,9 +12033,48 @@ where
     F: Fn(Arc<ManifestSnapshot>) -> Fut,
     Fut: std::future::Future<Output = Result<Option<ManifestSnapshot>, BuildError>>,
 {
-    let max_retries = inner.options.max_commit_retries.max(1);
+    stamp_within(
+        inner,
+        storage,
+        what,
+        CommitRetryBudget::of_table(inner),
+        successor,
+    )
+    .await
+}
+
+/// Publish one maintenance artifact under the commit-race protocol every
+/// stamp shares: load the current manifest, let `successor` build the
+/// artifact against its membership and return the manifest to publish
+/// (`None` when nothing needs publishing), then CAS it in.
+///
+/// A handle whose view of the manifest is behind the pointer reloads and
+/// tries again at once: another writer committed since, which is no race
+/// this attempt ran. A lost pointer CAS derives the next attempt past any
+/// crash-orphaned list and retries with a growing backoff, within `budget`.
+/// Running out of budget is [`BuildError::WriteContention`]; any other
+/// failure keeps its own classification. `what` names the artifact in the
+/// log.
+pub(in crate::supertable) async fn stamp_within<F, Fut>(
+    inner: &SupertableInner,
+    storage: &Arc<dyn StorageProvider>,
+    what: &str,
+    budget: CommitRetryBudget,
+    successor: F,
+) -> Result<(), BuildError>
+where
+    F: Fn(Arc<ManifestSnapshot>) -> Fut,
+    Fut: std::future::Future<Output = Result<Option<ManifestSnapshot>, BuildError>>,
+{
+    let max_attempts = budget.max_attempts.max(1);
     let mut next_id_floor: u64 = 0;
-    for attempt in 0..max_retries {
+    let mut lost_races: u32 = 0;
+    let mut reloads: u32 = 0;
+    // The longest one attempt has taken, so the deadline check can tell
+    // whether the next one could still finish in time.
+    let mut slowest_attempt = time::Duration::ZERO;
+    loop {
+        let attempt_started = Instant::now();
         let old = inner.manifest.load_full();
         // A prior attempt found its id occupied by a crash-orphaned
         // manifest list — derive this attempt's successor past it.
@@ -11937,45 +12090,61 @@ where
             return Ok(());
         };
         let attempted_id = new_manifest.get_manifest_id();
-        let prev_etag = match get_current_manifest_etag(storage, Arc::clone(&old)).await {
-            Ok(etag) => etag,
-            // Another commit landed while the successor was built: a lost
-            // race like the one the write reports, so reload and retry.
-            Err(SupertableCommitError::WriteContentionExhausted) if attempt + 1 < max_retries => {
+        match get_current_manifest_etag(storage, Arc::clone(&old)).await {
+            Ok(prev_etag) => match new_manifest
+                .write(storage.as_ref(), prev_etag.as_deref(), &[])
+                .await
+            {
+                Ok(()) => {
+                    inner.note_superseded(&old, &new_manifest, &[]);
+                    inner.manifest.store(Arc::new(new_manifest));
+                    return Ok(());
+                }
+                Err(SupertableCommitError::WriteContentionExhausted) => {
+                    next_id_floor = next_id_floor.max(
+                        refresh_and_orphaned_id_floor(inner, storage, attempted_id)
+                            .await
+                            .map_err(BuildError::from)?,
+                    );
+                }
+                Err(e) => {
+                    inner.note_commit_error(&e);
+                    return Err(BuildError::from(e));
+                }
+            },
+            // The pointer is past this handle's view: another commit landed
+            // since. Reload and go again at once — unless the view keeps
+            // falling behind, which is a lost race like any other.
+            Err(SupertableCommitError::WriteContentionExhausted) => {
                 refresh_inner_state_async(inner, storage)
                     .await
-                    .map_err(|e| BuildError::Store(e.to_string()))?;
-                sleep(backoff_delay(attempt)).await;
-                continue;
+                    .map_err(BuildError::from)?;
+                reloads += 1;
+                if reloads <= MAX_CONSECUTIVE_RELOADS {
+                    continue;
+                }
             }
             Err(e) => {
                 inner.note_commit_error(&e);
                 return Err(BuildError::from(e));
             }
-        };
-        match new_manifest
-            .write(storage.as_ref(), prev_etag.as_deref(), &[])
-            .await
-        {
-            Ok(()) => {
-                inner.note_superseded(&old, &new_manifest, &[]);
-                inner.manifest.store(Arc::new(new_manifest));
-                return Ok(());
-            }
-            Err(SupertableCommitError::WriteContentionExhausted) if attempt + 1 < max_retries => {
-                next_id_floor = next_id_floor.max(
-                    refresh_and_orphaned_id_floor(inner, storage, attempted_id)
-                        .await
-                        .map_err(|e| BuildError::Store(e.to_string()))?,
-                );
-                sleep(backoff_delay(attempt)).await;
-            }
-            Err(e) => return Err(BuildError::Store(e.to_string())),
         }
+        reloads = 0;
+        slowest_attempt = slowest_attempt.max(attempt_started.elapsed());
+        let delay = backoff_delay(lost_races);
+        lost_races += 1;
+        let out_of_time = budget
+            .deadline
+            .is_some_and(|deadline| Instant::now() + delay + slowest_attempt > deadline);
+        if lost_races >= max_attempts || out_of_time {
+            debug!(
+                what,
+                lost_races, "publish lost every commit race in its budget"
+            );
+            return Err(BuildError::WriteContention);
+        }
+        sleep(delay).await;
     }
-    Err(BuildError::Store(format!(
-        "{what} publish lost every commit race"
-    )))
 }
 
 /// Superfiles one maintenance publish indexes: one wave of
@@ -11994,6 +12163,20 @@ struct KeptBatch {
     _scratch: TempDir,
     contributions: Vec<TermContribution>,
     layer: Option<ReservedLayer>,
+}
+
+/// The prefetch running beside an optimize call's current fold, stopped
+/// when the call ends however it ends. The task holds the call's reuse
+/// directory, so the directory goes once the stopped task lets go of it.
+#[derive(Default)]
+struct Prefetch(Mutex<Option<JoinHandle<()>>>);
+
+impl Drop for Prefetch {
+    fn drop(&mut self) {
+        if let Some(task) = self.0.get_mut().ok().and_then(Option::take) {
+            task.abort();
+        }
+    }
 }
 
 /// A fold kept across its publish's retries: the root it was made of, and
@@ -12018,7 +12201,10 @@ struct KeptFold {
 ///   a writer that keeps none.
 /// - With none left to index, layers fold one run per publish, as
 ///   [`term_index::plan_fold_at_optimize`] picks them, of at most
-///   `fold_max_bytes` together. A fold that loses its publish to commits
+///   what the scratch disk holds together ([`term_index::fold_disk_bound`],
+///   or `unmeasured_fold_max_bytes` when the disk cannot be read), and as
+///   many layers as the host's free
+///   memory and open-file limit hold. A fold that loses its publish to commits
 ///   has their layers stacked on it ([`term_index::rebase`]), so a retry
 ///   writes one root.
 /// - A root that will never load (gone, corrupt, or in a layout this engine
@@ -12034,7 +12220,7 @@ struct KeptFold {
 /// keep a fold due, do not keep one call going.
 pub(in crate::supertable) async fn stamp_term_index(
     inner: &SupertableInner,
-    fold_max_bytes: u64,
+    unmeasured_fold_max_bytes: u64,
 ) -> Result<(), BuildError> {
     let Some(storage) = inner.options.storage.clone() else {
         return Ok(());
@@ -12048,17 +12234,39 @@ pub(in crate::supertable) async fn stamp_term_index(
     // layers the root holds plus the one each batch adds, since every fold
     // leaves fewer layers than it found.
     let budget: OnceLock<usize> = OnceLock::new();
+    // What this call's folds upload, kept on local disk for the folds after.
+    let reuse = Arc::new(
+        term_index_scratch(&inner.options.term_index_build_policy())
+            .map_err(TermIndexError::from)?,
+    );
+    let reuse_path = reuse.path().to_path_buf();
+    // Local bytes per slice byte the call's folds have measured, in thousandths.
+    let disk_per_slice = Arc::new(AtomicU64::new(0));
+    // The next fold's inputs, fetched while this one merges and uploads.
+    let prefetch = Prefetch::default();
     // One renumbering fold per call. Commits that land while it runs are
     // stacked on it past nil padding, which would call for another at once;
     // the next optimize's drops it.
     let renumbered = AtomicBool::new(false);
     let mut passes = 0;
     loop {
+        // Memory is measured again each pass, as free disk is: a long call
+        // sees other work start and stop beside it.
+        let fold_budget =
+            term_index::FoldBudget::for_host(inner.options.writer_pool.current_num_threads());
         let published = AtomicBool::new(false);
         let kept_batch: Mutex<Option<KeptBatch>> = Mutex::new(None);
         let kept_fold: Mutex<Option<KeptFold>> = Mutex::new(None);
         stamp_with_retries(inner, &storage, "term-index", |old| {
-            let (storage, published, budget) = (&storage, &published, &budget);
+            let (storage, published, budget, reuse, reuse_path, prefetch, disk_per_slice) = (
+                &storage,
+                &published,
+                &budget,
+                &reuse,
+                &reuse_path,
+                &prefetch,
+                &disk_per_slice,
+            );
             let (kept_batch, kept_fold, renumbered) = (&kept_batch, &kept_fold, &renumbered);
             async move {
                 published.store(false, Ordering::Relaxed);
@@ -12105,25 +12313,119 @@ pub(in crate::supertable) async fn stamp_term_index(
                         return Ok(Some(old.with_term_index(reference, true)));
                     }
                     let renumber = !renumbered.load(Ordering::Relaxed);
-                    if let Some(fold) = term_index::plan_fold_at_optimize(
-                        &root,
-                        &live,
-                        fold_max_bytes,
-                        renumber,
-                        before_tiers,
-                    ) {
+                    // Objects no layer names any more go; the rest are read in
+                    // place by the folds that name them, so they count as room.
+                    // Only when no fold fits even so does every kept object go.
+                    let (sweep_dir, swept_root) = (reuse_path.clone(), root.clone());
+                    let held = tokio::task::spawn_blocking(move || {
+                        term_index::retain_kept(&sweep_dir, &swept_root)
+                    })
+                    .await
+                    .unwrap_or(0);
+                    let plan = |max_bytes| {
+                        term_index::plan_fold_at_optimize(
+                            &root,
+                            &live,
+                            max_bytes,
+                            fold_budget,
+                            renumber,
+                            before_tiers,
+                        )
+                    };
+                    let mut fold_max_bytes = term_index::fold_disk_bound(reuse_path, disk_per_slice, held)
+                        .unwrap_or(unmeasured_fold_max_bytes);
+                    let mut planned = plan(fold_max_bytes);
+                    if planned.is_none() && held > 0 && plan(u64::MAX).is_some() {
+                        let evict_dir = reuse_path.clone();
+                        let freed = tokio::task::spawn_blocking(move || term_index::evict_kept(&evict_dir))
+                            .await
+                            .unwrap_or(0);
+                        info!(freed_mib = freed >> 20, "term index: evicted kept objects for room");
+                        fold_max_bytes = term_index::fold_disk_bound(reuse_path, disk_per_slice, 0)
+                            .unwrap_or(unmeasured_fold_max_bytes);
+                        planned = plan(fold_max_bytes);
+                    }
+                    if let Some(fold) = planned {
+                        // The fetch started for this fold lands before its own download.
+                        let started = prefetch.0.lock().expect("prefetch").take();
+                        if let Some(started) = started {
+                            let _ = started.await;
+                        }
+                        // An output is kept for a later fold that reads it, and
+                        // only while the disk holds it beside the fold's inputs.
+                        let fold_bytes = term_index::run_bytes(&root, &fold);
+                        let keep = term_index::output_reread(
+                            &root,
+                            &fold,
+                            &live,
+                            fold_max_bytes,
+                            fold_budget,
+                            renumber,
+                            before_tiers,
+                        ) && term_index::fold_disk_bound(reuse_path, disk_per_slice, 0)
+                            .is_some_and(|bound| bound >= fold_bytes.saturating_mul(2));
+                        let downloaded = Arc::new(Notify::new());
+                        if fold_budget.prefetches() {
+                            let next = term_index::layers_after(
+                                &root,
+                                &fold,
+                                &live,
+                                fold_max_bytes,
+                                fold_budget,
+                                renumber,
+                                before_tiers,
+                            );
+                            *prefetch.0.lock().expect("prefetch") =
+                                Some(spawn(term_index::prefetch_layers(
+                                    Arc::clone(storage),
+                                    next,
+                                    Arc::clone(reuse),
+                                    Arc::clone(&downloaded),
+                                    Arc::clone(disk_per_slice),
+                                    if keep { fold_bytes } else { 0 },
+                                )));
+                        }
                         let policy = term_index::BuildPolicy {
                             scoring_by_ordinal: Arc::new(scoring_by_ordinal(&old, fold.superfiles())),
                             ..policy.clone()
                         };
+                        let io = term_index::FoldIo {
+                            reuse_dir: Some(reuse_path.clone()),
+                            keep_uploads: keep,
+                            disk_per_slice_milli: Some(Arc::clone(disk_per_slice)),
+                            downloaded: Some(Arc::clone(&downloaded)),
+                        };
                         let renumbers = fold.renumbers();
+                        info!(
+                            layers = root.layers.len(),
+                            first = fold.run().start,
+                            members = fold.run().len(),
+                            ranges = fold.ranges(),
+                            renumbers,
+                            budget_mib = fold_budget.memory_bytes >> 20,
+                            "term index fold plan"
+                        );
+                        let output_at = fold.run().start;
                         let span = detail_span!("term_index.fold", layers = root.layers.len());
-                        match term_index::fold_at_optimize(storage, &root, fold, &policy, pool)
+                        let result = term_index::fold_at_optimize(storage, &root, fold, &policy, &io, pool)
                             .instrument(span)
-                            .await
-                        {
+                            .await;
+                        // A fold that downloaded nothing never told the prefetch.
+                        downloaded.notify_one();
+                        match result {
                             Ok(folded) => {
+                                // The fold stored its output itself, so the next
+                                // pass need not ask storage for it.
+                                let written: Vec<_> = folded
+                                    .layers
+                                    .get(output_at)
+                                    .into_iter()
+                                    .flat_map(|layer| &layer.slices)
+                                    .flat_map(|slice| [Some(slice.content_hash), slice.tier])
+                                    .flatten()
+                                    .collect();
                                 let reference = write_fold(storage, kept_fold, root, folded).await?;
+                                seen.lock().expect("term-index objects seen").extend(written);
                                 renumbered.fetch_or(renumbers, Ordering::Relaxed);
                                 published.store(true, Ordering::Relaxed);
                                 return Ok(Some(old.with_term_index(reference, true)));
@@ -12602,12 +12904,25 @@ async fn release_mutation_lease(wal_store: &WalStore, wal_id: WalId, owner: Supe
     }
 }
 
+/// Remember the WAL of a mutation that failed after retiring its rows, for
+/// this handle to finish (see [`crate::supertable::wal::unfinished`]).
+fn note_if_retired(supertable: &Supertable, wal_id: WalId, cause: &TombstonePhaseError) {
+    if matches!(cause, TombstonePhaseError::RetiredButUnfinished { .. }) {
+        supertable.inner().unfinished_wals.note(wal_id);
+    }
+}
+
 /// Add `new_deleted` to the hidden vector-index table's deleted-`_id` set
 /// (see [`hidden_deleted`]), committing a new hidden manifest; a no-op when
 /// every id is in the set already. `inner` is the hidden table's.
+///
+/// The record is a set union, so re-running it against whatever the hidden
+/// manifest has become cannot change its outcome; it rides out lost races
+/// under [`stamp_within`] for as long as `budget` allows.
 pub(in crate::supertable) async fn record_hidden_deleted_ids(
     inner: &SupertableInner,
     new_deleted: &[i128],
+    budget: CommitRetryBudget,
 ) -> Result<(), BuildError> {
     if new_deleted.is_empty() {
         return Ok(());
@@ -12615,58 +12930,27 @@ pub(in crate::supertable) async fn record_hidden_deleted_ids(
     let Some(storage) = inner.options.storage.clone() else {
         return Ok(());
     };
-    let max_retries = inner.options.max_commit_retries.max(1);
-    let mut next_id_floor: u64 = 0;
-    for attempt in 0..max_retries {
-        let old = inner.manifest.load_full();
-        // A prior attempt found its id occupied by a crash-orphaned
-        // manifest list — derive this attempt's successor past it.
-        let old = if next_id_floor > 0 {
-            Arc::new(old.with_next_manifest_id_floor(next_id_floor))
-        } else {
-            old
-        };
-        let mut ids = hidden_deleted::deleted_user_ids(&old)
-            .map_err(|e| BuildError::Store(e.to_string()))?
-            .as_ref()
-            .clone();
-        let before = ids.len();
-        ids.extend_from_slice(new_deleted);
-        ids.sort_unstable();
-        ids.dedup();
-        if ids.len() == before {
-            return Ok(());
-        }
-        let bytes = encode_deleted_ids(&ids);
-        let new_manifest = old.with_deleted_user_ids(bytes);
-        let attempted_id = new_manifest.get_manifest_id();
-        let prev_etag = get_current_manifest_etag(&storage, Arc::clone(&old))
-            .await
-            .inspect_err(|e| inner.note_commit_error(e))
-            .map_err(BuildError::from)?;
-        match new_manifest
-            .write(storage.as_ref(), prev_etag.as_deref(), &[])
-            .await
-        {
-            Ok(()) => {
-                inner.note_superseded(&old, &new_manifest, &[]);
-                inner.manifest.store(Arc::new(new_manifest));
-                return Ok(());
+    stamp_within(
+        inner,
+        &storage,
+        "deleted-set record",
+        budget,
+        |old| async move {
+            let mut ids = hidden_deleted::deleted_user_ids(&old)
+                .map_err(|e| BuildError::Store(e.to_string()))?
+                .as_ref()
+                .clone();
+            let before = ids.len();
+            ids.extend_from_slice(new_deleted);
+            ids.sort_unstable();
+            ids.dedup();
+            if ids.len() == before {
+                return Ok(None);
             }
-            Err(SupertableCommitError::WriteContentionExhausted) if attempt + 1 < max_retries => {
-                next_id_floor = next_id_floor.max(
-                    refresh_and_orphaned_id_floor(inner, &storage, attempted_id)
-                        .await
-                        .map_err(|e| BuildError::Store(e.to_string()))?,
-                );
-                sleep(backoff_delay(attempt)).await;
-            }
-            Err(e) => return Err(BuildError::Store(e.to_string())),
-        }
-    }
-    Err(BuildError::Store(
-        "deleted-set record: write contention exhausted".into(),
-    ))
+            Ok(Some(old.with_deleted_user_ids(encode_deleted_ids(&ids))))
+        },
+    )
+    .await
 }
 
 /// The first column of `next` that requires a value where `base` did not:
@@ -16798,6 +17082,13 @@ mod tests {
 
     /// Storage-attached table with a drained hidden index across two cells.
     fn drained_hidden_two_cells() -> (TempDir, Supertable, Arc<Supertable>) {
+        drained_hidden_two_cells_in_waves(1)
+    }
+
+    /// [`drained_hidden_two_cells`], with the same rows committed and
+    /// drained `waves` times, so the hidden index holds one wave of
+    /// superfiles per drain.
+    fn drained_hidden_two_cells_in_waves(waves: usize) -> (TempDir, Supertable, Arc<Supertable>) {
         let dim = 16usize;
         let item_field = Arc::new(Field::new("item", DataType::Float32, true));
         let schema = Arc::new(Schema::new(vec![
@@ -16851,10 +17142,13 @@ mod tests {
             vec![Arc::new(titles) as Arc<dyn Array>, Arc::new(fsl)],
         )
         .expect("batch");
-        let mut w = st.writer().expect("writer");
-        w.append(&batch).expect("append");
-        w.commit().expect("commit");
-        st.drain_vectors_to_cells_sync().expect("drain to cells");
+        for _ in 0..waves {
+            let mut w = st.writer().expect("writer");
+            w.append(&batch).expect("append");
+            w.commit().expect("commit");
+            drop(w);
+            st.drain_vectors_to_cells_sync().expect("drain to cells");
+        }
 
         let hidden = st
             .reader()
@@ -16917,6 +17211,43 @@ mod tests {
         for entry in manifest.superfiles.iter() {
             let from_summary =
                 cell_doc_counts_from_summary(&inner, entry, None).expect("drained summary");
+            let from_reader = hidden
+                .block_on_query(cell_doc_counts_via_reader(&inner, entry, None))
+                .expect("reader counts");
+            assert_eq!(from_summary, from_reader);
+        }
+    }
+
+    /// The same order holds for hidden superfiles a compaction merge wrote:
+    /// two drain waves, merged by `optimize`, still list their cells in the
+    /// reader's order with the reader's row counts.
+    #[test]
+    fn cell_doc_counts_from_summary_match_the_reader_after_a_merge() {
+        /// Drain waves before the merge.
+        const WAVES: usize = 2;
+        /// Merge target small enough that every wave qualifies.
+        const TARGET_MB: u64 = 1;
+        /// Fill floor low enough that every wave qualifies.
+        const MIN_FILL_PERCENT: u8 = 1;
+
+        let (_dir, st, hidden) = drained_hidden_two_cells_in_waves(WAVES);
+        let before = hidden.reader().expect("reader").manifest().superfiles.len();
+        st.optimize(&OptimizeOptions::compact(CompactionSettings {
+            target_superfile_size_mb: TARGET_MB,
+            min_fill_percent: MIN_FILL_PERCENT,
+            ..CompactionSettings::default()
+        }))
+        .expect("optimize");
+        let inner = Arc::clone(hidden.inner());
+        let manifest = Arc::clone(hidden.reader().expect("reader").manifest());
+        assert!(
+            manifest.superfiles.len() < before,
+            "fixture: the merge must rewrite the waves ({before} -> {})",
+            manifest.superfiles.len()
+        );
+        for entry in manifest.superfiles.iter() {
+            let from_summary =
+                cell_doc_counts_from_summary(&inner, entry, None).expect("merged summary");
             let from_reader = hidden
                 .block_on_query(cell_doc_counts_via_reader(&inner, entry, None))
                 .expect("reader counts");
@@ -17393,6 +17724,145 @@ mod tests {
         .collect()
     }
 
+    /// An append's lanes are an even share of the pool among the appends
+    /// with lanes open: the whole pool alone, never none, and never past the
+    /// most a merged order can name.
+    #[test]
+    fn an_append_takes_an_even_share_of_the_pool_in_lanes() {
+        const POOL: usize = 178;
+        assert_eq!(lanes_for(POOL, 1), POOL, "alone, the whole pool");
+        assert_eq!(lanes_for(POOL, 2), POOL / 2);
+        assert_eq!(lanes_for(POOL, 32), POOL / 32);
+        assert_eq!(lanes_for(POOL, POOL * 4), 1, "never none");
+        assert_eq!(lanes_for(POOL, 0), POOL, "an empty count reads as one");
+        assert_eq!(lanes_for(MAX_LANES * 2, 1), MAX_LANES);
+    }
+
+    /// Appends counted on `pool`'s lanes now.
+    fn open_appends_on(pool: &Arc<ThreadPool>) -> usize {
+        OPEN_APPENDS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&pool_key(pool))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// An append holds its place in the count of appends with lanes open
+    /// on its pool until it lets go of its lanes, however it lets go:
+    /// dropped unsealed or unwound by a panic. A place never released would
+    /// shrink every later append's share for the life of the process.
+    /// Appends on another pool are not counted against it.
+    #[test]
+    fn an_append_gives_back_its_place_among_the_open_appends() {
+        let pool = writer_pool_with(1);
+        let other = writer_pool_with(1);
+        let first = OpenAppend::enter(&pool);
+        let second = OpenAppend::enter(&pool);
+        let elsewhere = OpenAppend::enter(&other);
+        assert_eq!((first.count, second.count), (1, 2), "each counts itself");
+        assert_eq!(elsewhere.count, 1, "another pool's appends are its own");
+        drop(second);
+        assert_eq!(open_appends_on(&pool), 1, "dropped unsealed");
+
+        // Only the count is inspected after the unwind, never the pool.
+        let unwound = catch_unwind(AssertUnwindSafe(|| {
+            let _held = OpenAppend::enter(&pool);
+            panic!("an append unwinds with its lanes open");
+        }));
+        assert!(unwound.is_err());
+        assert_eq!(open_appends_on(&pool), 1, "unwound by a panic");
+
+        drop(first);
+        drop(elsewhere);
+        assert_eq!(open_appends_on(&pool), 0, "back where it started");
+        assert_eq!(open_appends_on(&other), 0);
+        let open = OPEN_APPENDS.lock().unwrap_or_else(PoisonError::into_inner);
+        assert!(
+            !open.contains_key(&pool_key(&pool)),
+            "a pool with no open appends has no entry"
+        );
+    }
+
+    /// The count of open appends reaches the lanes: on one pool, the first
+    /// append to open takes every thread, and a second, opened while the
+    /// first holds its lanes, takes its share among the two.
+    #[test]
+    fn an_append_opened_beside_another_on_its_pool_takes_a_share_of_it() {
+        const ROWS_PER_BATCH: usize = 2_000;
+        const BATCHES: usize = 3;
+        const THREADS: usize = 4;
+        let pool = writer_pool_with(THREADS);
+        let make = || {
+            Supertable::create(live_options(1, 1, 4096, false).with_writer_pool(Arc::clone(&pool)))
+                .expect("create")
+        };
+        let (first, second) = (make(), make());
+        let (mut a, mut b) = (
+            first.writer().expect("writer"),
+            second.writer().expect("writer"),
+        );
+        for w in [&mut a, &mut b] {
+            for batch in 0..BATCHES {
+                w.append(&live_batch(batch, ROWS_PER_BATCH))
+                    .expect("append");
+            }
+        }
+        assert_eq!(open_appends_on(&pool), 2, "both appends hold lanes");
+        // The lanes are read once per writer: joining takes them.
+        let lanes_of = |w: &mut SupertableWriter| {
+            w.live
+                .as_mut()
+                .expect("lanes open")
+                .join()
+                .expect("join")
+                .len()
+        };
+        assert_eq!(
+            lanes_of(&mut a),
+            THREADS,
+            "alone on the pool when it opened"
+        );
+        assert_eq!(lanes_of(&mut b), THREADS / 2, "second on the pool");
+    }
+
+    /// A writer gives back its place on its pool however its lanes end: a
+    /// commit sealed from them, the writer dropped with them open, and the
+    /// lanes given up for a commit-time build.
+    #[test]
+    fn a_writer_gives_back_its_place_however_its_lanes_end() {
+        const ROWS_PER_BATCH: usize = 2_000;
+        const BATCHES: usize = 3;
+        let opts = live_options(2, 1, 4096, false);
+        let pool = Arc::clone(&opts.writer_pool);
+        let st = Supertable::create(opts).expect("create");
+        let append_until_open = |w: &mut SupertableWriter| {
+            for b in 0..BATCHES {
+                w.append(&live_batch(b, ROWS_PER_BATCH)).expect("append");
+            }
+            assert!(w.live.is_some(), "the lanes opened");
+            assert_eq!(open_appends_on(&pool), 1, "the append holds its place");
+        };
+
+        let mut w = st.writer().expect("writer");
+        append_until_open(&mut w);
+        w.commit().expect("commit");
+        assert_eq!(open_appends_on(&pool), 0, "sealed by a commit");
+
+        append_until_open(&mut w);
+        w.disable_live();
+        assert_eq!(
+            open_appends_on(&pool),
+            0,
+            "given up for a commit-time build"
+        );
+        w.commit().expect("commit from the buffer");
+
+        append_until_open(&mut w);
+        drop(w);
+        assert_eq!(open_appends_on(&pool), 0, "dropped with the lanes open");
+    }
+
     /// Live lanes: a buffer wide enough to open them is fed as it is
     /// appended and sealed at commit, and the table is the one a
     /// commit-time build makes — the same superfiles by id range and
@@ -17462,7 +17932,7 @@ mod tests {
         const THREADS: usize = 8;
         // About 2.5 MiB of rows against a 1 MiB split: a commit-time build
         // cuts them into a few pieces, while eight threads tokenize them in
-        // eight lanes.
+        // up to eight lanes.
         let build = |live: bool| {
             build_live_or_plain(
                 live_options(THREADS, 1, 4096, false),
@@ -17471,8 +17941,9 @@ mod tests {
                 live,
                 |w| {
                     assert_eq!(w.live.is_some(), live);
+                    // The only append on its pool: one lane per thread.
                     if let Some(lanes) = w.live.as_mut().and_then(|l| l.join().ok()) {
-                        assert_eq!(lanes.len(), THREADS, "one lane per thread");
+                        assert_eq!(lanes.len(), THREADS, "the whole pool, alone on it");
                         assert!(lanes.iter().all(|lane| !lane.stretches.is_empty()));
                         w.live.as_mut().expect("live").lanes = Some(lanes);
                     }
@@ -17643,19 +18114,27 @@ mod tests {
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
         let faults = FaultStorage::wrap(local);
         let storage: Arc<dyn StorageProvider> = Arc::<FaultStorage>::clone(&faults);
-        let st = Supertable::create(live_options(2, 1, 4096, false).with_storage(storage))
-            .expect("create");
+        let opts = live_options(2, 1, 4096, false).with_storage(storage);
+        let pool = Arc::clone(&opts.writer_pool);
+        let st = Supertable::create(opts).expect("create");
         let mut w = st.writer().expect("writer");
         for b in 0..BATCHES {
             w.append(&live_batch(b, ROWS_PER_BATCH)).expect("append");
         }
-        assert!(w.live.is_some(), "the lanes opened");
+        assert!(
+            w.live
+                .as_ref()
+                .is_some_and(|live| live.open_append.is_some()),
+            "the lanes opened, holding the append's place among the open appends"
+        );
+        assert_eq!(open_appends_on(&pool), 1);
         faults.fail(FaultOp::PutIfMatch, POINTER_URI_FRAGMENT, usize::MAX);
         w.commit().expect_err("the pointer write fails");
         assert!(faults.fired() > 0, "the failure came from the injection");
         faults.clear();
         assert_eq!(w.buffer.len(), BATCHES, "the buffer is restored");
         assert!(w.live.is_none() && w.live_disabled, "the lanes are gone");
+        assert_eq!(open_appends_on(&pool), 0, "and so is their place");
         w.append(&live_batch(BATCHES, ROWS_PER_BATCH))
             .expect("append after the failure");
         assert!(w.live.is_none(), "no lanes for the restored buffer");

@@ -95,10 +95,11 @@ use std::{
     sync::Arc,
 };
 
+use arrow_schema::{DataType, TimeUnit};
 use datafusion::{
     logical_expr::{
         Expr, Operator,
-        expr::{InList, Like},
+        expr::{Between, InList, Like},
     },
     scalar::ScalarValue,
 };
@@ -116,11 +117,13 @@ use crate::{
             tokenize::{MAX_TOKEN_CHARS, STANDARD_TOKENIZER, Tokenizer},
         },
         id_space::RowId,
+        range::{KeyKind, float_key, signed_key, unsigned_key},
     },
     supertable::{
         error::QueryError,
         manifest::{ManifestSnapshot, SuperfileEntry, SuperfileUri},
         query::prune::{PruneLeaf, select_superfiles},
+        schema::FieldId,
     },
 };
 
@@ -225,6 +228,17 @@ const WORD_JOINERS: &[char] = &['\'', '"', '.', ':', ',', ';', '_'];
 /// lowercasing.
 const FINAL_SIGMA: char = 'ς';
 
+/// Each range-indexed column's id and type, by name: what
+/// [`CandidatePlan::from_filters`] lowers range predicates against.
+pub(crate) type RangeColumns = HashMap<String, (FieldId, DataType)>;
+
+/// The columns a predicate can be bounded on: the full-text indexed and
+/// the range indexed.
+struct IndexedColumns<'a, 'b> {
+    fts: &'a HashSet<&'b str>,
+    range: &'a RangeColumns,
+}
+
 /// Per column, the prefetched-term memo a superfile's plan evaluation
 /// serves its exact-match terms from — built from the table-level term
 /// index's postings locations, so the superfile's dictionary is not read
@@ -265,6 +279,21 @@ pub(crate) enum CandidatePlan {
         column: String,
         tokens: Vec<LikeToken>,
         fold: bool,
+    },
+    /// Rows whose column with table id `field` holds a value keyed
+    /// ([`KeyKind`]) within `lo..=hi`: a range or equality predicate on a
+    /// range-indexed column,
+    /// every conjunct on the column folded into one interval. Resolved per
+    /// superfile from its range index; a superfile without one for the
+    /// column is scanned. Bounds are inclusive and hold exactly the values
+    /// the predicate does (`col > 5` reads from the key after 5's); the
+    /// predicate is still verified above the scan as for every other leaf.
+    /// `lo > hi` holds no row.
+    Range {
+        field: FieldId,
+        kind: KeyKind,
+        lo: u64,
+        hi: u64,
     },
     /// Intersection of children (logical `AND`).
     And(Vec<CandidatePlan>),
@@ -314,20 +343,23 @@ impl CandidatePlan {
     /// `resolve` cannot answer for has no index to bound against, so its
     /// predicate lowers to [`Unbounded`] — no analyzer is assumed on its
     /// behalf. Empty `fts_cols` ⇒ no FTS columns ⇒ always [`Unbounded`].
+    ///
+    /// `range_cols` maps each range-indexed column to its type: a range or
+    /// equality on one of them lowers to a [`Range`](Self::Range) leaf.
     pub(crate) fn from_filters(
         filters: &[Expr],
         fts_cols: &HashSet<&str>,
+        range_cols: &RangeColumns,
         resolve: &dyn Fn(&str) -> Option<Arc<dyn Tokenizer>>,
     ) -> CandidatePlan {
-        if fts_cols.is_empty() {
+        if fts_cols.is_empty() && range_cols.is_empty() {
             return CandidatePlan::Unbounded;
         }
-        and_combine(
-            filters
-                .iter()
-                .map(|f| lower(f, fts_cols, resolve))
-                .collect(),
-        )
+        let cols = IndexedColumns {
+            fts: fts_cols,
+            range: range_cols,
+        };
+        and_combine(filters.iter().map(|f| lower(f, &cols, resolve)).collect())
     }
 
     /// Evaluate against one superfile's reader. `Ok(None)` means "no bound
@@ -360,7 +392,9 @@ impl CandidatePlan {
                         walk(c, out);
                     }
                 }
-                CandidatePlan::TermsLike { .. } | CandidatePlan::Unbounded => {}
+                CandidatePlan::TermsLike { .. }
+                | CandidatePlan::Range { .. }
+                | CandidatePlan::Unbounded => {}
             }
         }
         let mut out = HashMap::new();
@@ -412,6 +446,15 @@ impl CandidatePlan {
                     let (docs, eval_work) = expanded.evaluate(reader, pool, memos).await?;
                     work.merge(eval_work);
                     Ok((docs, work))
+                }
+                CandidatePlan::Range {
+                    field,
+                    kind,
+                    lo,
+                    hi,
+                } => {
+                    let rows = reader.range_rows(*field, *kind, *lo, *hi, pool).await?;
+                    Ok((rows, MatchWork::default()))
                 }
                 CandidatePlan::And(children) => {
                     let mut acc: Option<RoaringBitmap> = None;
@@ -579,6 +622,10 @@ impl CandidatePlan {
                 }
                 true
             }
+            // The superfiles a range cannot reach are skipped by the
+            // manifest's min / max, from the predicate itself; there is no
+            // term summary to add.
+            CandidatePlan::Range { .. } => true,
             CandidatePlan::And(children) => children
                 .iter()
                 .all(|child| child.append_prune_leaves(leaves)),
@@ -641,6 +688,19 @@ impl CandidatePlan {
                     work.merge(est_work);
                     Ok((rows, work))
                 }
+                // The range's rows, estimated from the directory alone, the
+                // blocks it cuts by the share of their key span it covers:
+                // no block is read to decide whether to read blocks. A
+                // superfile with no index for the column is unbounded.
+                CandidatePlan::Range {
+                    field,
+                    kind,
+                    lo,
+                    hi,
+                } => {
+                    let rows = reader.range_estimate(*field, *kind, *lo, *hi).await?;
+                    Ok((rows.map_or(n_docs, |n| n.min(n_docs)), MatchWork::default()))
+                }
                 CandidatePlan::And(children) => {
                     let mut m = n_docs;
                     let mut work = MatchWork::default();
@@ -679,6 +739,22 @@ impl CandidatePlan {
             }
             CandidatePlan::TermsAll { .. }
             | CandidatePlan::TermsAny { .. }
+            | CandidatePlan::Range { .. }
+            | CandidatePlan::Unbounded => false,
+        }
+    }
+
+    /// Whether every bounding leaf is a [`Range`](Self::Range): the rows it
+    /// selects are numbers, which cost little to decode and check.
+    pub(crate) fn only_ranges(&self) -> bool {
+        match self {
+            CandidatePlan::Range { .. } => true,
+            CandidatePlan::And(children) | CandidatePlan::Or(children) => {
+                children.iter().all(CandidatePlan::only_ranges)
+            }
+            CandidatePlan::TermsAll { .. }
+            | CandidatePlan::TermsAny { .. }
+            | CandidatePlan::TermsLike { .. }
             | CandidatePlan::Unbounded => false,
         }
     }
@@ -779,29 +855,229 @@ async fn expand_like(
 /// Lower one `Expr` node.
 fn lower(
     expr: &Expr,
-    fts_cols: &HashSet<&str>,
+    cols: &IndexedColumns<'_, '_>,
     resolve: &dyn Fn(&str) -> Option<Arc<dyn Tokenizer>>,
 ) -> CandidatePlan {
+    let fts_cols = cols.fts;
     match expr {
         Expr::BinaryExpr(be) => match be.op {
             Operator::And => and_combine(vec![
-                lower(&be.left, fts_cols, resolve),
-                lower(&be.right, fts_cols, resolve),
+                lower(&be.left, cols, resolve),
+                lower(&be.right, cols, resolve),
             ]),
             Operator::Or => or_combine(vec![
-                lower(&be.left, fts_cols, resolve),
-                lower(&be.right, fts_cols, resolve),
+                lower(&be.left, cols, resolve),
+                lower(&be.right, cols, resolve),
             ]),
+            Operator::Eq | Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq
+                if range_operand(&be.left, &be.right, cols.range).is_some() =>
+            {
+                comparison_range(&be.left, be.op, &be.right, cols.range)
+            }
             Operator::Eq => eq_leaf(&be.left, &be.right, fts_cols, resolve),
-            // Range / inequality / arithmetic ops aren't term-bounded.
+            // Inequality and arithmetic ops aren't bounded.
             _ => CandidatePlan::Unbounded,
         },
+        // `BETWEEN a AND b` on a range-indexed column is the interval.
+        Expr::Between(between) if !between.negated => between_range(between, cols.range),
         // `IN (a, b, …)` on an FTS column is an OR of equalities.
         Expr::InList(il) if !il.negated => in_list_leaf(il, fts_cols, resolve),
         // `LIKE` on an FTS column is bounded through the term dictionary.
         Expr::Like(like) => like_leaf(like, fts_cols, resolve),
-        // NOT, IS NULL, functions, etc. — not soundly term-bounded.
+        // NOT, IS NULL, functions, etc. — not soundly bounded.
         _ => CandidatePlan::Unbounded,
+    }
+}
+
+/// `filters` read as one interval of keys on the range-indexed `column`,
+/// with the column's id: every filter a comparison or `BETWEEN` on `column`
+/// against literals, folded together, and the whole key space when there is
+/// no filter.
+/// `None` when any filter is something else — a filter on another column,
+/// say, which the interval alone cannot answer. The interval holds exactly
+/// the rows the filters do, but for a NULL, which no comparison holds and
+/// no interval reaches.
+pub(crate) fn single_range(
+    filters: &[Expr],
+    column: &str,
+    range_cols: &RangeColumns,
+) -> Option<(FieldId, KeyKind, u64, u64)> {
+    let (field, data_type) = range_cols.get(column)?;
+    let kind = KeyKind::of(data_type)?;
+    let mut interval = (0, u64::MAX);
+    for filter in filters {
+        let plan = match filter {
+            Expr::BinaryExpr(be) => comparison_range(&be.left, be.op, &be.right, range_cols),
+            Expr::Between(between) if !between.negated => between_range(between, range_cols),
+            _ => return None,
+        };
+        let CandidatePlan::Range {
+            field: f, lo, hi, ..
+        } = plan
+        else {
+            return None;
+        };
+        if f != *field {
+            return None;
+        }
+        interval = (interval.0.max(lo), interval.1.min(hi));
+    }
+    Some((*field, kind, interval.0, interval.1))
+}
+
+/// The range-indexed column (its id and type) and the literal of a
+/// comparison between them, in either order, with whether the column is on
+/// the left.
+fn range_operand<'a>(
+    left: &'a Expr,
+    right: &'a Expr,
+    range_cols: &'a RangeColumns,
+) -> Option<(FieldId, &'a DataType, &'a ScalarValue, bool)> {
+    let (column, value, column_left) = match (left, right) {
+        (Expr::Column(c), Expr::Literal(v, _)) => (&c.name, v, true),
+        (Expr::Literal(v, _), Expr::Column(c)) => (&c.name, v, false),
+        _ => return None,
+    };
+    let (field, data_type) = range_cols.get(column)?;
+    Some((*field, data_type, value, column_left))
+}
+
+/// Lower `column op literal` (either order) on a range-indexed column to
+/// the interval of keys it can hold, or `Unbounded` for a literal the
+/// column's keys do not order (a null, a NaN, another type).
+fn comparison_range(
+    left: &Expr,
+    op: Operator,
+    right: &Expr,
+    range_cols: &RangeColumns,
+) -> CandidatePlan {
+    let Some((field, data_type, value, column_left)) = range_operand(left, right, range_cols)
+    else {
+        return CandidatePlan::Unbounded;
+    };
+    let Some((kind, key)) = literal_key(value, data_type) else {
+        return CandidatePlan::Unbounded;
+    };
+    // `literal < column` is `column > literal`.
+    let op = match (column_left, op) {
+        (true, op) => op,
+        (false, Operator::Lt) => Operator::Gt,
+        (false, Operator::LtEq) => Operator::GtEq,
+        (false, Operator::Gt) => Operator::Lt,
+        (false, Operator::GtEq) => Operator::LtEq,
+        (false, op) => op,
+    };
+    // Keys order as Arrow compares the values, floats included (IEEE total
+    // order), so a strict bound is the next key over and the interval is
+    // the predicate's exactly. An interval past either end of the keys
+    // holds nothing.
+    const EMPTY: (u64, u64) = (u64::MAX, 0);
+    let (lo, hi) = match op {
+        Operator::Eq => (key, key),
+        Operator::GtEq => (key, u64::MAX),
+        Operator::LtEq => (0, key),
+        Operator::Gt => key.checked_add(1).map_or(EMPTY, |next| (next, u64::MAX)),
+        Operator::Lt => key.checked_sub(1).map_or(EMPTY, |prev| (0, prev)),
+        _ => return CandidatePlan::Unbounded,
+    };
+    CandidatePlan::Range {
+        field,
+        kind,
+        lo,
+        hi,
+    }
+}
+
+/// Lower `column BETWEEN low AND high` on a range-indexed column.
+fn between_range(between: &Between, range_cols: &RangeColumns) -> CandidatePlan {
+    let (Expr::Column(c), Expr::Literal(low, _), Expr::Literal(high, _)) = (
+        between.expr.as_ref(),
+        between.low.as_ref(),
+        between.high.as_ref(),
+    ) else {
+        return CandidatePlan::Unbounded;
+    };
+    let Some((field, data_type)) = range_cols.get(&c.name) else {
+        return CandidatePlan::Unbounded;
+    };
+    match (literal_key(low, data_type), literal_key(high, data_type)) {
+        (Some((kind, lo)), Some((_, hi))) => CandidatePlan::Range {
+            field: *field,
+            kind,
+            lo,
+            hi,
+        },
+        _ => CandidatePlan::Unbounded,
+    }
+}
+
+/// The key a column of `data_type` stores `value` under. `None` for a
+/// null, a NaN, or a literal the column's keys do not share — a timestamp
+/// of another unit, a negative value for an unsigned column, an integer a
+/// float cannot hold exactly.
+fn literal_key(value: &ScalarValue, data_type: &DataType) -> Option<(KeyKind, u64)> {
+    let kind = KeyKind::of(data_type)?;
+    let key = |k| Some((kind, k));
+    match kind {
+        KeyKind::Signed => {
+            let v = match (value, data_type) {
+                (ScalarValue::Date32(Some(v)), DataType::Date32) => i64::from(*v),
+                (ScalarValue::Date64(Some(v)), DataType::Date64) => *v,
+                (
+                    ScalarValue::TimestampSecond(Some(v), _),
+                    DataType::Timestamp(TimeUnit::Second, _),
+                )
+                | (
+                    ScalarValue::TimestampMillisecond(Some(v), _),
+                    DataType::Timestamp(TimeUnit::Millisecond, _),
+                )
+                | (
+                    ScalarValue::TimestampMicrosecond(Some(v), _),
+                    DataType::Timestamp(TimeUnit::Microsecond, _),
+                )
+                | (
+                    ScalarValue::TimestampNanosecond(Some(v), _),
+                    DataType::Timestamp(TimeUnit::Nanosecond, _),
+                ) => *v,
+                (_, DataType::Date32 | DataType::Date64 | DataType::Timestamp(_, _)) => {
+                    return None;
+                }
+                _ => integer_literal(value)?.try_into().ok()?,
+            };
+            key(signed_key(v))
+        }
+        KeyKind::Unsigned => key(unsigned_key(integer_literal(value)?.try_into().ok()?)),
+        KeyKind::Float => {
+            let v = match value {
+                ScalarValue::Float64(Some(v)) => *v,
+                ScalarValue::Float32(Some(v)) => f64::from(*v),
+                ScalarValue::Float16(Some(v)) => f64::from(*v),
+                _ => {
+                    let integer = integer_literal(value)?;
+                    let v = integer as f64;
+                    (v as i128 == integer).then_some(v)?
+                }
+            };
+            match v.is_nan() {
+                true => None,
+                false => key(float_key(v)),
+            }
+        }
+    }
+}
+
+/// An integer literal's value, whatever its width and sign.
+fn integer_literal(value: &ScalarValue) -> Option<i128> {
+    match value {
+        ScalarValue::Int8(Some(v)) => Some(i128::from(*v)),
+        ScalarValue::Int16(Some(v)) => Some(i128::from(*v)),
+        ScalarValue::Int32(Some(v)) => Some(i128::from(*v)),
+        ScalarValue::Int64(Some(v)) => Some(i128::from(*v)),
+        ScalarValue::UInt8(Some(v)) => Some(i128::from(*v)),
+        ScalarValue::UInt16(Some(v)) => Some(i128::from(*v)),
+        ScalarValue::UInt32(Some(v)) => Some(i128::from(*v)),
+        ScalarValue::UInt64(Some(v)) => Some(i128::from(*v)),
+        _ => None,
     }
 }
 
@@ -1281,16 +1557,42 @@ fn scalar_str(v: &ScalarValue) -> Option<&str> {
 
 /// Combine children under `AND`: an `Unbounded` child drops out (adds
 /// no constraint), nested `And`s flatten, all-unbounded → `Unbounded`.
+/// [`Range`](CandidatePlan::Range) children on one column fold into one
+/// interval, their intersection: `price >= 10 AND price < 20` arrives as
+/// two conjuncts, and each alone reaches most of the column, where the
+/// pair reaches only the rows between.
 fn and_combine(children: Vec<CandidatePlan>) -> CandidatePlan {
-    let mut flat = Vec::with_capacity(children.len());
+    let mut flat: Vec<CandidatePlan> = Vec::with_capacity(children.len());
     for c in children {
         match c {
             CandidatePlan::Unbounded => {}
-            CandidatePlan::And(inner) => flat.extend(inner),
-            other => flat.push(other),
+            CandidatePlan::And(inner) => inner.into_iter().for_each(|c| fold_into(&mut flat, c)),
+            other => fold_into(&mut flat, other),
         }
     }
     collapse(flat, true)
+}
+
+/// Push `child` onto the conjunction `flat`, intersecting it with a
+/// [`Range`](CandidatePlan::Range) already there on the same column.
+fn fold_into(flat: &mut Vec<CandidatePlan>, child: CandidatePlan) {
+    if let CandidatePlan::Range {
+        field,
+        kind,
+        lo,
+        hi,
+    } = &child && let Some(CandidatePlan::Range {
+        lo: lo_acc,
+        hi: hi_acc,
+        ..
+    }) = flat.iter_mut().find(
+        |p| matches!(p, CandidatePlan::Range { field: f, kind: k, .. } if f == field && k == kind),
+    ) {
+        *lo_acc = (*lo_acc).max(*lo);
+        *hi_acc = (*hi_acc).min(*hi);
+        return;
+    }
+    flat.push(child);
 }
 
 /// Combine children under `OR`: any `Unbounded` child makes the whole
@@ -1520,7 +1822,12 @@ mod tests {
         for pattern in ["running", "%runni%", "runn%", "%running", "run_ing"] {
             let expr = col("title").like(lit(pattern));
             assert_eq!(
-                CandidatePlan::from_filters(&[expr], &fts_cols(), &stemming_resolver),
+                CandidatePlan::from_filters(
+                    &[expr],
+                    &fts_cols(),
+                    &RangeColumns::new(),
+                    &stemming_resolver
+                ),
                 CandidatePlan::Unbounded,
                 "LIKE {pattern:?} on a stemmed column must not be bounded"
             );
@@ -1537,6 +1844,7 @@ mod tests {
         let plan = CandidatePlan::from_filters(
             &[col("title").eq(lit("running studies"))],
             &fts_cols(),
+            &RangeColumns::new(),
             &stemming_resolver,
         );
         assert_eq!(
@@ -1553,6 +1861,7 @@ mod tests {
             CandidatePlan::from_filters(
                 &[col("title").eq(lit("of the"))],
                 &fts_cols(),
+                &RangeColumns::new(),
                 &stopping_resolver
             ),
             CandidatePlan::Unbounded
@@ -1560,7 +1869,12 @@ mod tests {
     }
 
     fn plan(expr: Expr) -> CandidatePlan {
-        CandidatePlan::from_filters(&[expr], &fts_cols(), &standard_resolver)
+        CandidatePlan::from_filters(
+            &[expr],
+            &fts_cols(),
+            &RangeColumns::new(),
+            &standard_resolver,
+        )
     }
 
     /// Bloom-survival flattening: an `AND` of term-alls collapses to one
@@ -1643,6 +1957,144 @@ mod tests {
     #[test]
     fn range_op_is_unbounded() {
         assert_eq!(plan(col("title").gt(lit("m"))), CandidatePlan::Unbounded);
+    }
+
+    /// The range-indexed columns the range lowering tests use.
+    fn range_cols() -> RangeColumns {
+        RangeColumns::from([
+            ("price".to_string(), (FieldId(1), DataType::Float64)),
+            ("qty".to_string(), (FieldId(2), DataType::Int32)),
+            (
+                "ts".to_string(),
+                (FieldId(3), DataType::Timestamp(TimeUnit::Millisecond, None)),
+            ),
+        ])
+    }
+
+    fn range_plan(filters: &[Expr]) -> CandidatePlan {
+        CandidatePlan::from_filters(filters, &HashSet::new(), &range_cols(), &standard_resolver)
+    }
+
+    fn range(column: &str, kind: KeyKind, lo: u64, hi: u64) -> CandidatePlan {
+        CandidatePlan::Range {
+            field: range_cols()[column].0,
+            kind,
+            lo,
+            hi,
+        }
+    }
+
+    #[test]
+    fn a_comparison_on_a_range_column_lowers_to_its_interval_either_way_round() {
+        let signed = |v: i64| signed_key(v);
+        assert_eq!(
+            range_plan(&[col("qty").gt(lit(5i32))]),
+            range("qty", KeyKind::Signed, signed(6), u64::MAX),
+            "a strict integer bound is the next key"
+        );
+        assert_eq!(
+            range_plan(&[lit(5i32).gt(col("qty"))]),
+            range("qty", KeyKind::Signed, 0, signed(4)),
+            "`5 > qty` is `qty < 5`"
+        );
+        assert_eq!(
+            range_plan(&[col("qty").gt_eq(lit(5i32))]),
+            range("qty", KeyKind::Signed, signed(5), u64::MAX)
+        );
+        assert_eq!(
+            range_plan(&[col("price").gt(lit(2.5f64))]),
+            range("price", KeyKind::Float, float_key(2.5) + 1, u64::MAX),
+            "a strict float bound is the next key in the total order"
+        );
+        assert_eq!(
+            range_plan(&[col("qty").eq(lit(7i64))]),
+            range("qty", KeyKind::Signed, signed(7), signed(7)),
+            "an integer literal of another width"
+        );
+        assert_eq!(
+            range_plan(&[col("price").lt_eq(lit(2.5f64))]),
+            range("price", KeyKind::Float, 0, float_key(2.5))
+        );
+    }
+
+    #[test]
+    fn conjuncts_on_one_column_fold_into_one_interval() {
+        // DataFusion hands `BETWEEN` and `a <= x AND x < b` over as separate
+        // filters; each alone would reach most of the column.
+        let filters = [col("qty").gt_eq(lit(-3i32)), col("qty").lt(lit(9i32))];
+        assert_eq!(
+            range_plan(&filters),
+            range("qty", KeyKind::Signed, signed_key(-3), signed_key(8))
+        );
+        assert_eq!(
+            range_plan(&[col("qty").between(lit(-3i32), lit(9i32))]),
+            range("qty", KeyKind::Signed, signed_key(-3), signed_key(9))
+        );
+        // Disjoint conjuncts hold no row.
+        let empty = range_plan(&[col("qty").gt(lit(9i32)), col("qty").lt(lit(-3i32))]);
+        let CandidatePlan::Range { lo, hi, .. } = empty else {
+            panic!("expected one range, got {empty:?}");
+        };
+        assert!(lo > hi);
+        // Two columns stay two leaves.
+        assert!(matches!(
+            range_plan(&[col("qty").gt(lit(1i32)), col("price").gt(lit(1.0f64))]),
+            CandidatePlan::And(children) if children.len() == 2
+        ));
+    }
+
+    #[test]
+    fn a_float_zero_is_its_own_key_and_a_nan_or_an_inexact_integer_bounds_nothing() {
+        // Arrow orders `-0.0` below `0.0`, so each is one key.
+        assert_eq!(
+            range_plan(&[col("price").eq(lit(0.0f64))]),
+            range("price", KeyKind::Float, float_key(0.0), float_key(0.0))
+        );
+        assert_eq!(
+            range_plan(&[col("price").gt(lit(f64::NAN))]),
+            CandidatePlan::Unbounded
+        );
+        assert_eq!(
+            range_plan(&[col("price").gt(lit(3i64))]),
+            range("price", KeyKind::Float, float_key(3.0) + 1, u64::MAX)
+        );
+        assert_eq!(
+            range_plan(&[col("price").gt(lit(i64::MAX))]),
+            CandidatePlan::Unbounded,
+            "an integer no float holds exactly"
+        );
+    }
+
+    #[test]
+    fn a_literal_the_keys_do_not_share_bounds_nothing() {
+        // A timestamp of another unit, a string, a null, a cast column.
+        let seconds = Expr::Literal(ScalarValue::TimestampSecond(Some(1), None), None);
+        assert_eq!(
+            range_plan(&[col("ts").gt(seconds)]),
+            CandidatePlan::Unbounded
+        );
+        let millis = Expr::Literal(ScalarValue::TimestampMillisecond(Some(1), None), None);
+        assert_eq!(
+            range_plan(&[col("ts").gt_eq(millis)]),
+            range("ts", KeyKind::Signed, signed_key(1), u64::MAX)
+        );
+        assert_eq!(
+            range_plan(&[col("qty").gt(lit("5"))]),
+            CandidatePlan::Unbounded
+        );
+        assert_eq!(
+            range_plan(&[col("qty").gt(Expr::Literal(ScalarValue::Int32(None), None))]),
+            CandidatePlan::Unbounded
+        );
+        assert_eq!(
+            range_plan(&[cast(col("qty"), DataType::Int64).gt(lit(5i64))]),
+            CandidatePlan::Unbounded
+        );
+        // A column with no range index.
+        assert_eq!(
+            range_plan(&[col("other").gt(lit(5i32))]),
+            CandidatePlan::Unbounded
+        );
     }
 
     #[test]
@@ -2093,6 +2545,7 @@ mod tests {
         let p = CandidatePlan::from_filters(
             &[col("title").eq(lit("rust"))],
             &HashSet::new(),
+            &RangeColumns::new(),
             &standard_resolver,
         );
         assert_eq!(p, CandidatePlan::Unbounded);
@@ -2108,11 +2561,21 @@ mod tests {
             tokens: tokens.iter().map(|t| t.to_string()).collect(),
         };
         assert_eq!(
-            CandidatePlan::from_filters(&filters, &fts_cols(), &standard_resolver),
+            CandidatePlan::from_filters(
+                &filters,
+                &fts_cols(),
+                &RangeColumns::new(),
+                &standard_resolver
+            ),
             terms(&["running"])
         );
         assert_eq!(
-            CandidatePlan::from_filters(&filters, &fts_cols(), &stemming_resolver),
+            CandidatePlan::from_filters(
+                &filters,
+                &fts_cols(),
+                &RangeColumns::new(),
+                &stemming_resolver
+            ),
             terms(&["run"])
         );
     }

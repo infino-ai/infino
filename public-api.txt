@@ -54,6 +54,7 @@ pub infino::ColumnIndex::Fts::positions: bool
 pub infino::ColumnIndex::Fts::stemmer: infino::Stemmer
 pub infino::ColumnIndex::Fts::stopwords: infino::Stopwords
 pub infino::ColumnIndex::Fts::stored: bool
+pub infino::ColumnIndex::Range
 pub infino::ColumnIndex::Vector
 pub infino::ColumnIndex::Vector::metric: infino::Metric
 pub infino::ColumnIndex::Vector::rerank_codec: infino::RerankCodec
@@ -769,6 +770,7 @@ impl infino::IndexSpec
 pub fn infino::IndexSpec::companion(self, impl core::convert::Into<alloc::string::String>, arrow_schema::schema::SchemaRef, infino::IndexSpec) -> Self
 pub fn infino::IndexSpec::fts(self, impl core::convert::Into<infino::FtsField>) -> Self
 pub fn infino::IndexSpec::new() -> Self
+pub fn infino::IndexSpec::range(self, impl core::convert::Into<alloc::string::String>) -> Self
 pub fn infino::IndexSpec::vector(self, impl core::convert::Into<alloc::string::String>, usize, infino::Metric) -> Self
 impl core::clone::Clone for infino::IndexSpec
 pub fn infino::IndexSpec::clone(&self) -> Self
@@ -1001,6 +1003,7 @@ pub fn infino::Supertable::apply_schema(&self, &infino::SchemaPatch, core::optio
 pub fn infino::Supertable::bm25_search(&self, &str, &str, usize, infino::Bm25SearchOptions, core::option::Option<&[&str]>) -> core::result::Result<alloc::vec::Vec<arrow_array::record_batch::RecordBatch>, infino::InfinoError>
 pub fn infino::Supertable::companion(&self, &str) -> core::result::Result<core::option::Option<infino::Supertable>, infino::InfinoError>
 pub fn infino::Supertable::count(&self, &str, &str, infino::BoolMode) -> core::result::Result<u64, infino::InfinoError>
+pub fn infino::Supertable::count_where(&self, &[datafusion_expr::expr::Expr]) -> core::result::Result<alloc::vec::Vec<u64>, infino::InfinoError>
 pub fn infino::Supertable::delete(&self, datafusion_expr::expr::Expr) -> core::result::Result<infino::MutationStats, infino::InfinoError>
 pub fn infino::Supertable::exact_match(&self, &str, &str, core::option::Option<&[&str]>) -> core::result::Result<alloc::vec::Vec<arrow_array::record_batch::RecordBatch>, infino::InfinoError>
 pub fn infino::Supertable::gc(&self, core::time::Duration) -> core::result::Result<infino::GcReport, infino::GcError>

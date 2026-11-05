@@ -268,6 +268,67 @@ pub(crate) fn datafusion_planning_error(e: &DataFusionError) -> InfinoError {
     classify_datafusion_error(e, true)
 }
 
+/// Marker DataFusion writes before the full column list in a
+/// `No field named X. Valid fields are …` schema error.
+const VALID_FIELDS_MARKER: &str = ". Valid fields are ";
+
+/// Most valid-field names to keep in a schema error before summarizing the
+/// rest as `… and N more`. A `No field named X. Valid fields are …` error
+/// enumerates every column of the schema; on a very wide table (thousands of
+/// columns) that list alone runs to hundreds of kilobytes, bloating logs and
+/// responses. A short, representative prefix keeps the useful part — the
+/// missing field and a sample of what is valid — at a bounded size.
+const MAX_LISTED_VALID_FIELDS: usize = 32;
+
+/// Hard upper bound, in bytes, on a propagated query-error message. A backstop
+/// for any over-long message the field-list cap does not shorten; past it the
+/// message is cut on a UTF-8 boundary and an elision marker is appended.
+const MAX_ERROR_MESSAGE_BYTES: usize = 4096;
+
+/// Bound the size of a propagated DataFusion error message: first summarize an
+/// enumerated valid-field list (see [`MAX_LISTED_VALID_FIELDS`]), then apply
+/// the total-length backstop (see [`MAX_ERROR_MESSAGE_BYTES`]). A short message
+/// with no field list passes through unchanged.
+fn cap_error_message(msg: String) -> String {
+    truncate_to_bytes(cap_valid_fields_list(msg), MAX_ERROR_MESSAGE_BYTES)
+}
+
+/// Keep the `No field named X. Valid fields are …` prefix and the first
+/// [`MAX_LISTED_VALID_FIELDS`] names, replacing the rest with `… and N more`.
+/// A message without the valid-fields marker, or one already within the cap,
+/// is returned unchanged.
+fn cap_valid_fields_list(msg: String) -> String {
+    let Some(marker_at) = msg.find(VALID_FIELDS_MARKER) else {
+        return msg;
+    };
+    let list_at = marker_at + VALID_FIELDS_MARKER.len();
+    let (head, list) = msg.split_at(list_at);
+    // DataFusion ends the message with a trailing period after the list.
+    let list = list.strip_suffix('.').unwrap_or(list);
+    let names: Vec<&str> = list.split(", ").collect();
+    if names.len() <= MAX_LISTED_VALID_FIELDS {
+        return msg;
+    }
+    let shown = names[..MAX_LISTED_VALID_FIELDS].join(", ");
+    let more = names.len() - MAX_LISTED_VALID_FIELDS;
+    format!("{head}{shown}, … and {more} more.")
+}
+
+/// Cut `msg` to at most `max` bytes on a UTF-8 boundary, appending a marker
+/// naming how many bytes were dropped. A message already within `max` is
+/// returned unchanged.
+fn truncate_to_bytes(msg: String, max: usize) -> String {
+    if msg.len() <= max {
+        return msg;
+    }
+    let mut end = max;
+    while end > 0 && !msg.is_char_boundary(end) {
+        end -= 1;
+    }
+    let dropped = msg.len() - end;
+    format!("{}… ({dropped} more bytes elided)", &msg[..end])
+}
+
 fn classify_datafusion_error(e: &DataFusionError, planning: bool) -> InfinoError {
     if let Some(cause) = error_chain(e).find_map(|link| link.downcast_ref::<QueryError>()) {
         return InfinoError::from_query_ref(cause);
@@ -295,7 +356,7 @@ fn classify_datafusion_error(e: &DataFusionError, planning: bool) -> InfinoError
             _ => InfinoError::Backend,
         }
     };
-    variant(e.to_string())
+    variant(cap_error_message(e.to_string()))
 }
 
 /// Whether `link` is a read that failed: a storage, object store or io error.
@@ -555,6 +616,7 @@ impl From<MutationCommitError> for InfinoError {
 #[cfg(test)]
 mod tests {
     use arrow_schema::ArrowError;
+    use datafusion::common::{Column, SchemaError as DfSchemaError};
     use parquet::errors::ParquetError;
     use uuid::Uuid;
 
@@ -993,6 +1055,78 @@ mod tests {
                 "{e:?}"
             );
         }
+    }
+
+    /// A `No field named X` schema error over a very wide table enumerates
+    /// every column, which on thousands of columns runs to hundreds of
+    /// kilobytes. The mapping keeps the cause and a short sample of the valid
+    /// names, summarizes the rest, and stays well under the byte backstop.
+    #[test]
+    fn a_wide_schema_field_error_is_bounded() {
+        const COLUMNS: usize = 5_000;
+        let valid_fields: Vec<Column> = (0..COLUMNS)
+            .map(|i| Column::new_unqualified(format!("col{i}")))
+            .collect();
+        let wide = DataFusionError::SchemaError(
+            Box::new(DfSchemaError::FieldNotFound {
+                field: Box::new(Column::new_unqualified("ghost")),
+                valid_fields,
+            }),
+            Box::new(None),
+        );
+        // The untruncated message, for a before/after size comparison.
+        let full_len = wide.to_string().len();
+        assert!(full_len > 20_000, "wide list is large: {full_len} bytes");
+
+        let InfinoError::Query(msg) = datafusion_error(&wide) else {
+            panic!("a schema error is the caller's query");
+        };
+        assert!(msg.contains("No field named"), "keeps the cause: {msg}");
+        assert!(msg.contains("ghost"), "names the missing field: {msg}");
+        // First MAX_LISTED_VALID_FIELDS names kept, the rest summarized.
+        assert!(
+            msg.contains("col0, "),
+            "keeps a sample of valid names: {msg}"
+        );
+        assert!(
+            msg.contains(&format!("and {} more", COLUMNS - MAX_LISTED_VALID_FIELDS)),
+            "summarizes the tail: {msg}"
+        );
+        assert!(
+            !msg.contains(&format!("col{}", COLUMNS - 1)),
+            "does not enumerate every column: {msg}"
+        );
+        assert!(
+            msg.len() <= MAX_ERROR_MESSAGE_BYTES,
+            "bounded under the backstop: {} bytes",
+            msg.len()
+        );
+    }
+
+    /// The byte backstop cuts any over-long message on a UTF-8 boundary, even
+    /// one with no valid-field list to summarize, and keeps its head.
+    #[test]
+    fn an_over_long_message_is_truncated_on_a_char_boundary() {
+        // Multi-byte chars straddling the cap must not split mid-codepoint.
+        let long = "π".repeat(MAX_ERROR_MESSAGE_BYTES);
+        let InfinoError::Query(msg) = datafusion_error(&DataFusionError::Plan(long)) else {
+            panic!("a plan error is the caller's query");
+        };
+        assert!(
+            msg.len() <= MAX_ERROR_MESSAGE_BYTES + 64,
+            "bounded to the backstop plus the marker: {} bytes",
+            msg.len()
+        );
+        assert!(
+            msg.contains("more bytes elided"),
+            "marks the elision: {msg}"
+        );
+        // Cutting mid-codepoint would have panicked; reaching here, with the
+        // head intact, proves the cut landed on a char boundary.
+        assert!(
+            msg.starts_with("Error during planning: π"),
+            "keeps the head: {msg}"
+        );
     }
 
     /// A SQL scan reads a superfile through an object store, so a range fetch

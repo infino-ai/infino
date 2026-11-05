@@ -653,10 +653,31 @@ pub mod kv {
     /// The [`IDS_LAYOUT`] value for the packed sidecar.
     pub const IDS_LAYOUT_PACKED: &str = "packed";
 
+    /// Present iff at least one column is range-indexed: byte offset of the
+    /// range index region (`superfile::range`). Absent on superfiles written
+    /// before the region existed and on tables with no range index; a range
+    /// over such a superfile scans its column.
+    pub const RANGE_OFFSET: &str = "inf.range.offset";
+
+    /// Present iff the range index region is present: its byte length.
+    pub const RANGE_LENGTH: &str = "inf.range.length";
+
+    /// Present iff the range index region is present: the byte length of
+    /// its directory, which a reader fetches whole before any block.
+    pub const RANGE_DIRECTORY_LENGTH: &str = "inf.range.directory_length";
+
     /// Keys locating a blob in the file. Only the splice that lays the
     /// file out writes them, since only it knows where each blob landed.
-    pub const REGION_KEYS: [&str; 6] = [
-        FTS_OFFSET, FTS_LENGTH, VEC_OFFSET, VEC_LENGTH, IDS_OFFSET, IDS_LENGTH,
+    pub const REGION_KEYS: [&str; 9] = [
+        FTS_OFFSET,
+        FTS_LENGTH,
+        VEC_OFFSET,
+        VEC_LENGTH,
+        IDS_OFFSET,
+        IDS_LENGTH,
+        RANGE_OFFSET,
+        RANGE_LENGTH,
+        RANGE_DIRECTORY_LENGTH,
     ];
 
     /// Sentinel value for the `inf.format` key.
@@ -673,6 +694,9 @@ pub mod kv {
 
     /// Stable-id sidecar keys (presence is all-or-none).
     pub const IDS_KEYS: &[&str] = &[IDS_OFFSET, IDS_LENGTH];
+
+    /// Range index region keys (presence is all-or-none).
+    pub const RANGE_KEYS: &[&str] = &[RANGE_OFFSET, RANGE_LENGTH, RANGE_DIRECTORY_LENGTH];
 
     /// All known keys (for diagnostics only).
     pub const ALL: &[&str] = &[
@@ -691,6 +715,9 @@ pub mod kv {
         VEC_CELLS,
         IDS_OFFSET,
         IDS_LENGTH,
+        RANGE_OFFSET,
+        RANGE_LENGTH,
+        RANGE_DIRECTORY_LENGTH,
     ];
 }
 
