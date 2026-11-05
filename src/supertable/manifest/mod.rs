@@ -5060,6 +5060,8 @@ pub struct ClusterCentroids {
     /// Per-cluster indexed doc count; length `n_cent`. Count-0 clusters
     /// are skipped by the selector.
     pub counts: Vec<u32>,
+    /// Sum of `counts`, so callers don't walk every cluster.
+    rows: u64,
     /// Lazily-built block-transposed centroid cache feeding the blocked
     /// SIMD scan kernels in `superfile::vector::distance`. Built once per
     /// instance on first scan; reset by `Clone` (a clone may mutate
@@ -5090,6 +5092,7 @@ impl Clone for ClusterCentroids {
             dim: self.dim,
             centroids: self.centroids.clone(),
             counts: self.counts.clone(),
+            rows: self.rows,
             transposed,
             admit_codes,
         }
@@ -5107,6 +5110,10 @@ impl PartialEq for ClusterCentroids {
 
 impl Eq for ClusterCentroids {}
 
+fn sum_counts(counts: &[u32]) -> u64 {
+    counts.iter().map(|&c| u64::from(c)).sum()
+}
+
 impl ClusterCentroids {
     /// The "no cluster centroids" value — a superfile without a vector
     /// index for the column.
@@ -5116,6 +5123,11 @@ impl ClusterCentroids {
 
     pub fn is_empty(&self) -> bool {
         self.n_cent == 0
+    }
+
+    /// Rows over all clusters: the sum of `counts`.
+    pub fn rows(&self) -> u64 {
+        self.rows
     }
 
     /// Zero-copy fp32 slice of cluster `c`'s centroid (length `dim`).
@@ -5180,6 +5192,7 @@ impl ClusterCentroids {
             n_cent,
             dim,
             centroids,
+            rows: sum_counts(&counts),
             counts,
             transposed: OnceLock::new(),
             admit_codes: OnceLock::new(),
@@ -5343,6 +5356,7 @@ impl ClusterCentroids {
             n_cent,
             dim,
             centroids: Vec::new(),
+            rows: sum_counts(&counts),
             counts,
             transposed: OnceLock::new(),
             admit_codes: {
