@@ -82,7 +82,10 @@ use crate::{
             try_commit_attempt, write_superfile_list,
         },
     },
-    utils::trace::{RegionUsage, detail_span, record},
+    utils::{
+        nulls::null_row_bytes,
+        trace::{RegionUsage, detail_span, record},
+    },
 };
 
 /// Number of seal/reseal/unseal requests to run in parallel at a time. A
@@ -477,8 +480,10 @@ impl SuperfileMerge for CompactionMerge {
 
 pub(crate) mod plan;
 
-pub(crate) use plan::{CompactionJob, SuperfileStats, max_merge_input_bytes, select};
-use plan::{MIB, split_stats_at_drain_watermark};
+#[cfg(test)]
+pub(crate) use plan::select;
+pub(crate) use plan::{CompactionJob, SuperfileStats, max_merge_input_bytes};
+use plan::{MIB, MergeMemory, select_within, split_stats_at_drain_watermark};
 
 /// Cap on compaction input opens in flight, counted across the whole process
 /// rather than per merge. Several merges run at once, and it is their combined
@@ -737,8 +742,12 @@ impl Supertable {
                 }
                 None => vec![stats],
             };
+            // Each job is planned to fit what the host can give one merge,
+            // the first included: it runs with nothing else in flight, and
+            // so is admitted without a reading of its own.
+            let memory = table.merge_memory(memory_budget());
             for stats in &stat_groups {
-                let jobs = select(stats, cfg);
+                let jobs = select_within(stats, cfg, &memory);
                 info!(
                     role = table.role().as_str(),
                     jobs = jobs.len(),
@@ -1735,6 +1744,21 @@ impl Supertable {
             .await
     }
 
+    /// What this table's merges hold (see [`MergeMemory`]), and, from the
+    /// host reading `host` (`(available, total)` bytes), the most one may be
+    /// planned to: what the host has free beyond the share the runner keeps
+    /// ([`MERGE_MEMORY_RESERVE_PERCENT`]). `None` sets no limit.
+    fn merge_memory(&self, host: Option<(u64, u64)>) -> MergeMemory {
+        let manifest = self.inner().manifest.load();
+        MergeMemory {
+            row_bytes: null_row_bytes(&manifest.scalar_schema()),
+            indexed: !manifest.fts_configs().is_empty() || !manifest.vector_configs().is_empty(),
+            limit: host.map(|(available, _)| {
+                available.saturating_mul(100 - MERGE_MEMORY_RESERVE_PERCENT) / 100
+            }),
+        }
+    }
+
     /// As [`Self::run_compaction_jobs`], with the host memory reading
     /// injected: `(available, total)` bytes, or `None` where memory cannot
     /// be read, which never throttles.
@@ -1746,25 +1770,21 @@ impl Supertable {
         host_memory: fn() -> Option<(u64, u64)>,
     ) -> Result<usize, CompactionError> {
         let concurrency = concurrency.max(1);
-        // Whether merges here keep per-row bookkeeping, which is part of
-        // what each one is charged for until its allocation shows up in
-        // the host reading.
-        let indexed = {
-            let manifest = self.inner().manifest.load();
-            !manifest.fts_configs().is_empty() || !manifest.vector_configs().is_empty()
-        };
+        // What each merge here is charged for until its allocation shows up
+        // in the host reading.
+        let memory = self.merge_memory(None);
         // The pool is shared among the merges that will actually run side
         // by side, which memory bounds before the configured concurrency
         // does: on a host whose cores outnumber the merges its memory
         // admits, widths cut from the configured concurrency would hand
         // each merge one thread and leave the rest of the cores idle for
         // the whole pass.
-        let in_flight = admittable_merges(concurrency, &jobs, indexed, host_memory());
+        let in_flight = admittable_merges(concurrency, &jobs, &memory, host_memory());
         let settings = MergeSettings {
             stale_seal_timeout,
             merge_threads: merge_pool_widths(maint_pool()?.current_num_threads(), in_flight, &jobs),
         };
-        let mut charges = MergeCharges::new(indexed);
+        let mut charges = MergeCharges::new(memory);
         let mut queued: VecDeque<(usize, CompactionJob)> = jobs.into_iter().enumerate().collect();
         let mut merging: JoinSet<(usize, Result<PreparedJob, CompactionError>)> = JoinSet::new();
         // Finished merges waiting for the next commit.
@@ -2115,29 +2135,14 @@ pub(crate) const MERGE_MEMORY_RESERVE_PERCENT: u64 = 40;
 /// measurable.
 const MERGE_ADMIT_SETTLE: Duration = Duration::from_millis(250);
 
-/// Bytes an indexed merge keeps per row of its output while it runs: the
-/// survivor numbering of every input row, the document order it chooses
-/// and that order's inverse. A merge with no index carries its rows
-/// straight through and keeps none of it.
-const INDEXED_MERGE_ROW_BYTES: u64 = 16;
-
-/// What a merge is expected to hold once it is running, from what the
-/// plan knows about it: its inputs, which it opens whole; its output,
-/// which it stages whole before the upload; and, for an indexed table,
-/// its per-row bookkeeping. A floor rather than a model of everything a
-/// merge allocates (term cardinality and posting density add to it), and
-/// the host reading, not this, is what finally bounds the width: this only
-/// stands in for a merge's allocation between its admission and the
-/// reading that shows it.
-fn expected_merge_footprint(job: &CompactionJob, indexed: bool) -> u64 {
-    let rows = if indexed {
-        job.live_docs.saturating_mul(INDEXED_MERGE_ROW_BYTES)
-    } else {
-        0
-    };
-    job.input_bytes
-        .saturating_add(job.estimated_output_bytes)
-        .saturating_add(rows)
+/// What the merge of `job` is expected to hold once it is running, from
+/// what the plan knows about it (see [`MergeMemory::footprint`]): its
+/// inputs, its output, an indexed table's per-row bookkeeping and the
+/// window of decoded rows its table's width makes. The host reading, not
+/// this, is what finally bounds the width: this only stands in for a
+/// merge's allocation between its admission and the reading that shows it.
+fn expected_merge_footprint(job: &CompactionJob, memory: &MergeMemory) -> u64 {
+    memory.footprint(job.input_bytes, job.estimated_output_bytes, job.live_docs)
 }
 
 /// How many of `jobs` the host's memory lets run at once, as the width the
@@ -2149,7 +2154,7 @@ fn expected_merge_footprint(job: &CompactionJob, indexed: bool) -> u64 {
 fn admittable_merges(
     concurrency: usize,
     jobs: &[CompactionJob],
-    indexed: bool,
+    memory: &MergeMemory,
     host_memory: Option<(u64, u64)>,
 ) -> usize {
     let bound = concurrency.max(1).min(jobs.len().max(1));
@@ -2158,7 +2163,7 @@ fn admittable_merges(
     };
     let largest = jobs
         .iter()
-        .map(|job| expected_merge_footprint(job, indexed))
+        .map(|job| expected_merge_footprint(job, memory))
         .max()
         .unwrap_or(0)
         .max(1);
@@ -2190,8 +2195,8 @@ struct Charge {
 /// it has failed. The charges are judged against the host reading taken
 /// before any of the pass's merges was resident.
 struct MergeCharges {
-    /// Whether merges keep per-row bookkeeping, part of the footprint.
-    indexed: bool,
+    /// What the table's merges hold, by which each is charged.
+    memory: MergeMemory,
     /// By plan index, from admission until the batch commits or the merge
     /// fails.
     by_index: HashMap<usize, Charge>,
@@ -2205,9 +2210,9 @@ struct MergeCharges {
 }
 
 impl MergeCharges {
-    fn new(indexed: bool) -> Self {
+    fn new(memory: MergeMemory) -> Self {
         Self {
-            indexed,
+            memory,
             by_index: HashMap::new(),
             by_task: HashMap::new(),
             committing: Vec::new(),
@@ -2223,7 +2228,7 @@ impl MergeCharges {
     /// Charge the merge of `job`, run by `task`, its expected footprint.
     fn admit(&mut self, task: TaskId, plan_index: usize, job: &CompactionJob) {
         let charge = Charge {
-            held: expected_merge_footprint(job, self.indexed),
+            held: expected_merge_footprint(job, &self.memory),
             output: job.estimated_output_bytes,
         };
         self.by_index.insert(plan_index, charge);
@@ -3109,7 +3114,10 @@ mod tests {
     use tokio::task;
 
     use super::{
-        plan::tests::{default_cfg, seg},
+        plan::{
+            INDEXED_MERGE_ROW_BYTES,
+            tests::{default_cfg, seg},
+        },
         *,
     };
     #[cfg(unix)]
@@ -3123,7 +3131,7 @@ mod tests {
         memory::ConnectionMemoryBudget,
         storage::{ObjectMeta, StorageError},
         superfile::{
-            builder::{FtsConfig, VectorConfig},
+            builder::{FtsConfig, MERGE_DECODED_WINDOW_BYTES, VectorConfig},
             fts::{bm25::Bm25Params, reader::Bm25SearchOptions},
             reader::SuperfileReader,
             vector::{distance::Metric, layout::VectorLayout, rerank_codec::RerankCodec},
@@ -3156,6 +3164,19 @@ mod tests {
 
     const DEFAULT_STALE_SEAL_TIMEOUT: Duration =
         Duration::from_millis(DEFAULT_STALE_SEAL_TIMEOUT_MS);
+
+    /// The memory of an indexed table's merges, its width aside.
+    const INDEXED: MergeMemory = MergeMemory {
+        row_bytes: 0,
+        indexed: true,
+        limit: None,
+    };
+
+    /// A decoded row of a narrow table: an id and a title.
+    const NARROW_ROW_BYTES: u64 = 24;
+
+    /// A decoded row of a table thousands of columns wide.
+    const WIDE_ROW_BYTES: u64 = 20_000;
 
     /// How long compaction's background warm of its output may take to land
     /// in the disk cache before a test counts it as never warmed: the warm
@@ -4761,20 +4782,20 @@ mod tests {
             .collect();
         let gib = 1u64 << 30;
         assert_eq!(
-            admittable_merges(180, &jobs, true, Some((100 * gib, 128 * gib))),
+            admittable_merges(180, &jobs, &INDEXED, Some((100 * gib, 128 * gib))),
             20
         );
         // Less memory than the jobs want: memory sets the width.
         assert_eq!(
-            admittable_merges(180, &jobs, true, Some((10 * gib, 128 * gib))),
+            admittable_merges(180, &jobs, &INDEXED, Some((10 * gib, 128 * gib))),
             2
         );
         // Unreadable memory never throttles the cut.
-        assert_eq!(admittable_merges(180, &jobs, true, None), 20);
-        assert_eq!(admittable_merges(8, &jobs, true, None), 8);
+        assert_eq!(admittable_merges(180, &jobs, &INDEXED, None), 20);
+        assert_eq!(admittable_merges(8, &jobs, &INDEXED, None), 8);
         // Nothing fits at all still runs one merge at a time.
         assert_eq!(
-            admittable_merges(180, &jobs, true, Some((gib, 128 * gib))),
+            admittable_merges(180, &jobs, &INDEXED, Some((gib, 128 * gib))),
             1
         );
     }
@@ -7416,10 +7437,64 @@ mod tests {
             live_docs: 3,
             merge_input_mb: None,
         };
-        assert_eq!(expected_merge_footprint(&job, false), 12);
+        assert_eq!(expected_merge_footprint(&job, &MergeMemory::default()), 12);
         assert_eq!(
-            expected_merge_footprint(&job, true),
+            expected_merge_footprint(&job, &INDEXED),
             12 + 3 * INDEXED_MERGE_ROW_BYTES
+        );
+    }
+
+    /// A merge of a wide table is charged the rows it decodes, up to the
+    /// window a merge holds of them at once: a narrow table's rows in full,
+    /// a wide one's capped at the window however many rows it has.
+    #[test]
+    fn a_merge_is_charged_its_decoded_rows_up_to_the_window() {
+        let job = |live_docs| CompactionJob {
+            estimated_output_bytes: 5,
+            input_bytes: 7,
+            live_docs,
+            ..CompactionJob::default()
+        };
+        let narrow = MergeMemory {
+            row_bytes: NARROW_ROW_BYTES,
+            ..MergeMemory::default()
+        };
+        assert_eq!(
+            expected_merge_footprint(&job(1_000), &narrow),
+            12 + 1_000 * NARROW_ROW_BYTES
+        );
+        let wide = MergeMemory {
+            row_bytes: WIDE_ROW_BYTES,
+            ..MergeMemory::default()
+        };
+        assert_eq!(
+            expected_merge_footprint(&job(1_000), &wide),
+            12 + 1_000 * WIDE_ROW_BYTES
+        );
+        assert_eq!(
+            expected_merge_footprint(&job(10_000_000), &wide),
+            12 + MERGE_DECODED_WINDOW_BYTES
+        );
+    }
+
+    /// A table's merges are charged its width: the scalar schema's decoded
+    /// row, and whether it carries an index.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_tables_merges_are_charged_its_width() {
+        let dir = TempDir::new().expect("tempdir");
+        let st = make_st(&dir);
+        let memory = st.merge_memory(None);
+        assert_eq!(
+            memory.row_bytes,
+            null_row_bytes(&st.inner().manifest.load().scalar_schema())
+        );
+        assert!(memory.row_bytes > 0);
+        assert!(memory.indexed, "the default table indexes its title");
+        assert_eq!(memory.limit, None, "an unread host sets no limit");
+        let gib = 1u64 << 30;
+        assert_eq!(
+            st.merge_memory(Some((10 * gib, 16 * gib))).limit,
+            Some(10 * gib * (100 - MERGE_MEMORY_RESERVE_PERCENT) / 100)
         );
     }
 

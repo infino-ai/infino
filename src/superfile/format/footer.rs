@@ -316,7 +316,7 @@ const ROW_GROUPS_ENCODED_TOGETHER: usize = 4;
 /// (see [`ParquetBodyEncoder`]). A narrow body of ordinary rows holds its
 /// four row groups well under this; a body thousands of columns wide
 /// reaches it within one.
-const HELD_GROUP_BYTES: usize = 256 * 1024 * 1024;
+pub(crate) const HELD_GROUP_BYTES: usize = 256 * 1024 * 1024;
 
 /// Bytes the rows of `batch` decode to: each column's share of its
 /// buffers, a buffer shared between columns counted once for each. That
