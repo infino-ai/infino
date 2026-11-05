@@ -13,8 +13,8 @@
 //!
 //! An optimize's commits drop what they are done with — the merges' term
 //! contributions, files in the scratch directory, and the term-index layer
-//! built from them — on threads of their own, and the optimize joins them
-//! before it returns. The child watches the scratch directory while the
+//! built from them — on a thread of the table's own, and the optimize waits
+//! for it to drop them before it returns. The child watches the scratch directory while the
 //! optimize runs, so the check after it is known to have had files to see
 //! unlinked.
 //!

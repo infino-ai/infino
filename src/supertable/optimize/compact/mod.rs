@@ -13,10 +13,12 @@ use std::{
     collections::{BTreeSet, HashMap, HashSet, VecDeque},
     io::{BufWriter, Write},
     mem,
+    panic::{self, AssertUnwindSafe},
     pin::pin,
     sync::{
         Arc, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
+        mpsc,
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -25,15 +27,15 @@ use std::{
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures::{
-    future::{BoxFuture, Fuse, FusedFuture, FutureExt},
+    future::{self, BoxFuture, Fuse, FusedFuture, FutureExt},
     stream::{self, StreamExt},
 };
 use rand::random_range;
 use roaring::RoaringBitmap;
 use tempfile::NamedTempFile;
 use tokio::{
-    sync::Semaphore,
-    task::{self, Id as TaskId, JoinError, JoinSet},
+    sync::{Semaphore, oneshot},
+    task::{Id as TaskId, JoinError, JoinSet},
     time,
 };
 #[cfg(feature = "detailed-tracing")]
@@ -43,7 +45,9 @@ use uuid::Uuid;
 
 use crate::{
     config::{CompactionSettings, RecalibratePolicy, global, scratch_root},
-    runtime_bridge::{bridge_on_runtime, run_on_own_pool, run_on_pool},
+    runtime_bridge::{
+        bridge_on_runtime, run_on_own_pool, run_on_pool, run_on_pool_unless_blocking,
+    },
     runtime_metrics::rss::{available_memory_bytes, memory_budget},
     storage::StorageError,
     superfile::{
@@ -64,7 +68,7 @@ use crate::{
         },
         opann::rerank_pool_hint,
         query::{dispatch::open_whole_superfile, vector},
-        reader_cache::disk::mmap_temp_file_bytes,
+        reader_cache::{SuperfileReaderCache, disk::mmap_temp_file_bytes},
         schema::{FieldId, PhysicalSchema, TableSchema, map::FileSchemaMap},
         wal::{
             Etag, SealRecord, TombstonesSidecar, WalStore, WalStoreError,
@@ -133,58 +137,150 @@ impl Supertable {
     }
 }
 
-/// What finished compaction commits are done with, being dropped on threads
-/// of their own: a batch's spilled term contributions and its term-index
-/// layer are scratch files of many gigabytes, still in the page cache, and
-/// unlinking them evicts it. Dropped by the commit, they held it for seconds
-/// past its publish; on a thread, the pass's next commit need not wait.
+/// What finished compaction commits are done with, being dropped on a
+/// thread of its own: a batch's spilled term contributions and its
+/// term-index layer are scratch files of many gigabytes, still in the page
+/// cache, and unlinking them evicts it. Dropped by the commit, they held it
+/// for seconds past its publish; handed to the reaper, the pass's next
+/// commit need not wait.
 ///
-/// The threads are joined before the merge step of a pass returns, so a
-/// process that exits once optimize returns has unlinked every one of those
-/// files. Threads a pass did not join, because it was dropped part way, are
-/// joined by the next pass or when the table goes.
+/// One reaper thread per table, started on first use and fed over a
+/// channel: a thread made per commit queued its own creation behind the
+/// process's memory-map traffic, which under load cost a commit longer than
+/// the drop it was there to move off the path.
+///
+/// [`settle`](Self::settle) waits for everything retired so far before the
+/// merge step of a pass returns, so a process that exits once optimize
+/// returns has unlinked every one of those files. Drops a pass did not wait
+/// for, because it was dropped part way, are waited for by the next pass or
+/// when the table goes.
 #[derive(Default)]
-pub(crate) struct RetiredScratch(Mutex<Vec<JoinHandle<()>>>);
+pub(crate) struct RetiredScratch(Mutex<Option<Reaper>>);
+
+/// The thread dropping what [`RetiredScratch`] is handed, in order.
+struct Reaper {
+    sender: mpsc::Sender<Reap>,
+    thread: JoinHandle<()>,
+}
+
+/// One message to the [`Reaper`].
+enum Reap {
+    /// Drop this.
+    Drop(Box<dyn Send>),
+    /// Everything sent before this has been dropped.
+    Settled(oneshot::Sender<()>),
+}
+
+impl Reaper {
+    fn start() -> std::io::Result<Self> {
+        let (sender, received) = mpsc::channel();
+        let thread = thread::Builder::new()
+            .name("compact-reaper".into())
+            .spawn(move || {
+                for reap in received {
+                    match reap {
+                        Reap::Drop(done_with) => {
+                            // A panicking drop must not take the reaper, and
+                            // the drops queued behind it, down with it.
+                            if panic::catch_unwind(AssertUnwindSafe(|| drop(done_with))).is_err() {
+                                warn!("compact: a retired scratch drop panicked");
+                            }
+                        }
+                        Reap::Settled(ack) => {
+                            let _ = ack.send(());
+                        }
+                    }
+                }
+            })?;
+        Ok(Self { sender, thread })
+    }
+}
 
 impl RetiredScratch {
-    /// Drop `done_with` on a thread of its own.
+    /// Hand `done_with` to the reaper, starting it if this is the first.
     fn retire<T: Send + 'static>(&self, done_with: T) {
-        let dropping = thread::spawn(move || drop(done_with));
-        let mut threads = self.0.lock().expect("retired scratch");
-        threads.retain(|thread| !thread.is_finished());
-        threads.push(dropping);
-    }
-
-    fn take(&self) -> Vec<JoinHandle<()>> {
-        mem::take(&mut *self.0.lock().expect("retired scratch"))
-    }
-
-    /// Wait for every drop retired so far, off the async runtime's threads.
-    async fn settle(&self) {
-        let threads = self.take();
-        if threads.is_empty() {
-            return;
+        let mut reap = Reap::Drop(Box::new(done_with));
+        let mut reaper = self.0.lock().expect("retired scratch");
+        // A reaper that went away hands back what it was sent, and a new
+        // one takes it.
+        for _ in 0..2 {
+            if reaper.is_none() {
+                match Reaper::start() {
+                    Ok(started) => *reaper = Some(started),
+                    Err(error) => {
+                        warn!(%error, "compact: could not start the scratch reaper");
+                        break;
+                    }
+                }
+            }
+            let Some(running) = reaper.as_ref() else {
+                break;
+            };
+            match running.sender.send(reap) {
+                Ok(()) => return,
+                Err(mpsc::SendError(unsent)) => {
+                    reap = unsent;
+                    *reaper = None;
+                }
+            }
         }
-        if let Err(error) = task::spawn_blocking(move || join_retired(threads)).await {
-            warn!(%error, "compact: joining the retired scratch drops failed");
+        // No reaper to be had: drop it here, as a commit used to.
+        drop(reaper);
+        drop(reap);
+    }
+
+    /// Wait for every drop retired so far, without blocking a runtime
+    /// worker.
+    async fn settle(&self) {
+        let (ack, acked) = oneshot::channel();
+        {
+            let reaper = self.0.lock().expect("retired scratch");
+            let Some(running) = reaper.as_ref() else {
+                return;
+            };
+            if running.sender.send(Reap::Settled(ack)).is_err() {
+                return;
+            }
+        }
+        if acked.await.is_err() {
+            warn!("compact: the scratch reaper stopped before settling");
         }
     }
 }
 
 impl Drop for RetiredScratch {
+    /// Stop the reaper once it has dropped everything it was sent, and wait
+    /// for it — unless this runs on the reaper itself: a drop it runs can
+    /// release the table's last handle, and with it this very reaper, which
+    /// then finishes the queue and exits on its own.
     fn drop(&mut self) {
-        join_retired(self.take());
+        let reaper = self
+            .0
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        let Some(Reaper { sender, thread }) = reaper else {
+            return;
+        };
+        drop(sender);
+        if thread.thread().id() != thread::current().id() && thread.join().is_err() {
+            warn!("compact: the scratch reaper panicked");
+        }
     }
 }
 
-/// Join `threads`, skipping the calling thread's own: the drop it runs can
-/// release the table's last handle, and with it this very list.
-fn join_retired(threads: Vec<JoinHandle<()>>) {
-    let current = thread::current().id();
-    for dropping in threads {
-        if dropping.thread().id() != current && dropping.join().is_err() {
-            warn!("compact: a retired scratch drop panicked");
-        }
+/// Open a merged superfile into the in-memory reader cache, as a writer
+/// commit does for its own; a failure only costs its first query a fetch.
+fn warm_reader_cache(
+    store: &dyn SuperfileReaderCache,
+    (superfile_id, uri, bytes): (Uuid, SuperfileUri, Bytes),
+) {
+    if let Err(e) = store.insert(uri, bytes) {
+        warn!(
+            %superfile_id,
+            error = %e,
+            "compact: failed to warm reader cache for merged superfile"
+        );
     }
 }
 
@@ -1440,40 +1536,37 @@ impl Supertable {
                     // re-opens from storage every single time.
                     //
                     // Opening a reader verifies the whole superfile's CRC, a
-                    // pass over its bytes, so the batch's outputs are opened
-                    // side by side: one after another they held the commit
-                    // for a quarter of a second per gigabyte of output. The
-                    // pass runs on a blocking thread, not on this task's
-                    // runtime worker, which queries and uploads share and
-                    // which would otherwise sit under the slowest output.
-                    let warms: Vec<(Uuid, SuperfileUri, Bytes)> = batch
+                    // pass over its bytes, so a batch of several outputs
+                    // opens them side by side on the reader pool: one after
+                    // another they held the commit for a quarter of a second
+                    // per gigabyte of output. A lone output, the common
+                    // case, opens here; handing it to a pool and back would
+                    // only add the hops.
+                    let mut warms: Vec<(Uuid, SuperfileUri, Bytes)> = batch
                         .iter()
                         .filter_map(|prepared| {
                             let (uri, bytes) = prepared.bytes_for_store.clone()?;
                             Some((prepared.merged_superfile_id, uri, bytes))
                         })
                         .collect();
-                    let store = Arc::clone(&opts.store);
-                    let warmed = task::spawn_blocking(move || {
-                        thread::scope(|scope| {
-                            for (superfile_id, uri, bytes) in warms {
-                                let store = &store;
-                                scope.spawn(move || {
-                                    if let Err(e) = store.insert(uri, bytes) {
-                                        warn!(
-                                            %superfile_id,
-                                            error = %e,
-                                            "compact: failed to warm reader cache for merged \
-                                             superfile"
-                                        );
-                                    }
-                                });
-                            }
-                        });
-                    })
-                    .await;
-                    if let Err(error) = warmed {
-                        warn!(%error, "compact: the reader-cache warm did not finish");
+                    if warms.len() > 1 {
+                        // One pool task per output, awaited from here: a task
+                        // fanning out inside the pool would wait by stealing,
+                        // and could pick up a query's work while it waits.
+                        let warmed = future::join_all(warms.into_iter().map(|warm| {
+                            let store = Arc::clone(&opts.store);
+                            run_on_pool_unless_blocking(
+                                Some(&opts.reader_pool),
+                                "compaction reader-cache warm",
+                                move || warm_reader_cache(&*store, warm),
+                            )
+                        }))
+                        .await;
+                        for error in warmed.into_iter().filter_map(Result::err) {
+                            warn!(%error, "compact: the reader-cache warm did not finish");
+                        }
+                    } else if let Some(warm) = warms.pop() {
+                        warm_reader_cache(&*opts.store, warm);
                     }
 
                     // Drop the merged-away inputs so the in-memory cache
