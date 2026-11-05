@@ -2358,6 +2358,9 @@ fn cut_ranges<K: AsRef<[u8]>>(marks: &[(K, u64)], want: usize) -> Vec<KeyRange> 
 
 /// Sources of at least this many bytes are merged in key ranges.
 const MERGE_RANGE_MIN_BYTES: u64 = 64 * 1024 * 1024;
+/// Slices per key range from which a merge cuts its ranges at one mark per
+/// slice instead of reading each slice's dictionary.
+const ONE_MARK_SLICES_PER_RANGE: usize = 256;
 /// Runs read past a group's first block to find where its tier chunks
 /// start, before the group joins the one before it.
 const TIER_AT_SCAN_RUNS: usize = 8;
@@ -2410,6 +2413,21 @@ pub(crate) fn key_ranges(
     let per_slice = (want * policy.merge_marks_per_range)
         .div_ceil(files.len().max(1))
         .max(1);
+    // One mark per slice needs no slice opened: its first key, weighed by
+    // its bytes and its tier object's. Past a few hundred slices per range
+    // that places the cuts finely enough.
+    if per_slice == 1 || files.len() >= want * ONE_MARK_SLICES_PER_RANGE {
+        let mut marks = Vec::with_capacity(files.len());
+        for file in &files {
+            let weight = fs::metadata(&file.path)?.len()
+                + fs::metadata(file.path.with_extension(TIER_FILE_EXTENSION))
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+            marks.push((file.first_key.clone(), weight));
+        }
+        marks.sort_by(|a, b| a.0.cmp(&b.0));
+        return Ok(cut_ranges(&marks, want));
+    }
     let weigh = |file: &SliceFile| -> Result<Vec<(Vec<u8>, u64)>, TermIndexError> {
         let handle = File::open(&file.path)?;
         let mut header = [0u8; SLICE_HEADER_LEN];
