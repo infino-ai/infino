@@ -376,10 +376,17 @@ const PARTITION_BUF_SIZE: usize = 64 * 1024;
 /// accumulator. Used to drive the spill threshold; intentionally
 /// rough — the threshold is a soft budget, not a hard cap.
 ///
-/// - `~24 B`: per new term: the interner entry + the `Vec<(u32,u32)>`
-///   header + small-alloc rounding.
-/// - `+ term.len()`: term bytes.
-/// - `+ 8 B`: per added posting: `(doc_id: u32, tf: u32)`.
+/// - `24 B` per new term, plus `term.len()` for its bytes in the arena.
+/// - `8 B` per added posting: `(doc_id: u32, tf: u32)`.
+///
+/// The per-term figure is a budget unit, not a measurement: a new id
+/// really holds a [`TermLists`] of three `Vec` headers (72 B, on a
+/// positionless column too), a 24 B [`TermTable`] slot at no more than
+/// three-quarters load, a 16 B `id_to_term` entry and a 4 B
+/// `dense_doc_tf` entry (8 B with `dense_doc_poshead`), about 130 B in
+/// all before the vectors' growth slack. Raising the constant to that
+/// would move where every column spills, so the spill threshold is to
+/// be read in these units rather than in bytes.
 const ACCUM_NEW_TERM_FIXED_BYTES: usize = 24;
 const ACCUM_POSTING_BYTES: usize = 8;
 
@@ -496,7 +503,8 @@ struct Vocab {
     /// Ids the current document touched; drained at the end of each
     /// `add_doc`. Bounded by the doc's distinct terms, reused across docs.
     updated_terms: Vec<u32>,
-    /// Owns the term bytes behind `term_to_id` and `id_to_term`.
+    /// Owns the term bytes behind `id_to_term`, which `term_to_id` reads
+    /// to confirm a term longer than its slot holds inline.
     /// **Declared last so it drops last**: the table and the vec free
     /// their memory without dereferencing a term, and only then does the
     /// arena release the bytes (see [`ArenaStr`]).
@@ -3362,11 +3370,12 @@ impl FtsBuilder {
                         // (`id_to_term`) for dictionary emit and the lex-rank
                         // table built from it.
                         //
-                        // Lifetime sanity: `term_to_id` and `id_to_term`
-                        // hold `&'static str` keys/entries that actually
-                        // borrow from `term_arena`. We must keep
+                        // Lifetime sanity: `id_to_term` holds
+                        // `&'static str` entries that actually borrow
+                        // from `term_arena` (`term_to_id` holds only
+                        // inline term prefixes and ids). We must keep
                         // `term_arena` alive until the **last
-                        // dereference** of those keys/entries, which is
+                        // dereference** of those entries, which is
                         // the dictionary emit loop's `id_to_term[term_id]`
                         // index below. End-of-scope `Drop` order does
                         // not matter for soundness — neither `&str` nor
@@ -4484,7 +4493,7 @@ fn emit_ram_column<W: Write>(
         ..
     } = vocab;
     // The forward map is finished with; only the reverse map is read
-    // below. Its keys borrow from `term_arena`, which outlives every
+    // below. Its entries borrow from `term_arena`, which outlives every
     // read of `id_to_term` here (dropped explicitly at the end).
     drop(term_to_id);
     let RamStore { mut lists, .. } = ram;
