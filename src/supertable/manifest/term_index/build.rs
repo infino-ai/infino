@@ -2494,6 +2494,14 @@ const MERGE_RANGE_MIN_BYTES: u64 = 64 * 1024 * 1024;
 /// Slices per key range from which a merge cuts its ranges at one mark per
 /// slice instead of reading each slice's dictionary.
 pub(crate) const ONE_MARK_SLICES_PER_RANGE: usize = 64;
+
+/// Whether a merge of `slices` slices from `layers` layers in `ranges` key
+/// ranges cuts them at one mark per slice: enough slices per range, and on
+/// average a slice per range in each layer.
+pub(crate) fn one_mark_per_slice(slices: usize, layers: usize, ranges: usize) -> bool {
+    slices >= ranges.saturating_mul(ONE_MARK_SLICES_PER_RANGE)
+        && slices >= layers.saturating_mul(ranges)
+}
 /// Runs read past a group's first block to find where its tier chunks
 /// start, before the group joins the one before it.
 const TIER_AT_SCAN_RUNS: usize = 8;
@@ -2550,10 +2558,12 @@ pub(crate) fn key_ranges(
         .div_ceil(files.len().max(1))
         .max(1);
     // One mark per slice needs no slice opened: its first key, weighed by
-    // its bytes and its tier object's. Past a few hundred slices per range
-    // that places the cuts finely enough, so a fold of many slices takes it
-    // whether they are on local disk or streamed, and cuts alike either way.
-    if per_slice == 1 || files.len() >= want * ONE_MARK_SLICES_PER_RANGE {
+    // its bytes and its tier object's. It places the cuts finely enough
+    // when there are a few dozen slices per range and each layer has at
+    // least a slice per range, so its slices' first keys spread over the
+    // key space; a layer of one slice spanning every key puts its only
+    // mark at the start.
+    if one_mark_per_slice(files.len(), sources.len(), want) {
         let mut marks = Vec::with_capacity(files.len());
         for file in &files {
             let weight = match &file.remote {

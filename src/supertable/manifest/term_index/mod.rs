@@ -1078,7 +1078,7 @@ impl FoldBudget {
             .saturating_mul(per_slice)
             / THOUSANDTHS;
         local > self.cache_bytes
-            && slices >= ranges.saturating_mul(build::ONE_MARK_SLICES_PER_RANGE)
+            && build::one_mark_per_slice(slices, layers.len(), ranges)
             && (layers.len() as u64)
                 .saturating_mul(ranges as u64)
                 .saturating_mul(STREAM_CURSOR_BYTES)
@@ -10476,6 +10476,22 @@ mod tests {
             );
         });
         assert_eq!(faults.fired(), 1);
+    }
+
+    /// One mark per slice is taken only when each layer has about a slice
+    /// per range: layers of one slice each, every one spanning the key
+    /// space, would put every mark at the start.
+    #[test]
+    fn one_mark_per_slice_needs_slices_spread_over_each_layer() {
+        assert!(build::one_mark_per_slice(1200, 4, 4));
+        assert!(
+            !build::one_mark_per_slice(232, 128, 2),
+            "layers of under two slices, two ranges"
+        );
+        assert!(
+            !build::one_mark_per_slice(200, 2, 4),
+            "too few slices per range"
+        );
     }
 
     /// A fold streams only when its inputs are more than the page cache
