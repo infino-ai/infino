@@ -708,19 +708,28 @@ impl StorageProvider for S3StorageProvider {
 
     async fn delete(&self, uri: &str) -> Result<(), StorageError> {
         let path = self.path(uri)?;
-        match self.store.delete(&path).await {
-            Ok(()) => {
-                self.meter.record_delete();
-                Ok(())
+        // DELETE is idempotent (NotFound == success), so re-issue it through
+        // the app-level transient budget the same way the GET paths do.
+        // object_store does not retry a transport-level "error sending
+        // request" on a socket dropped under us, and a single such blip must
+        // not fail an otherwise-reclaimable op — e.g. a table-purge that has
+        // to remove many objects should not abort on one flaky DELETE.
+        retry::with_reissue(|| async {
+            match self.store.delete(&path).await {
+                Ok(()) => {
+                    self.meter.record_delete();
+                    Ok(())
+                }
+                // Idempotent delete: NotFound is success for the caller and is
+                // still a completed DeleteObject (or equivalent) round-trip.
+                Err(ObjError::NotFound { .. }) => {
+                    self.meter.record_delete();
+                    Ok(())
+                }
+                Err(e) => Err(translate(uri, e)),
             }
-            // Idempotent delete: NotFound is success for the caller and is
-            // still a completed DeleteObject (or equivalent) round-trip.
-            Err(ObjError::NotFound { .. }) => {
-                self.meter.record_delete();
-                Ok(())
-            }
-            Err(e) => Err(translate(uri, e)),
-        }
+        })
+        .await
     }
 
     async fn list_with_prefix_metadata(
