@@ -77,6 +77,27 @@ pub(crate) fn take_sharing_nulls(
     RecordBatch::try_new(batch.schema(), columns)
 }
 
+/// `batch` with every column that is null throughout replaced by the
+/// shared null array of its type. The values are the same; the batch then
+/// holds one null array per type instead of one per null column, as a merge
+/// needs of the batches it decodes: a column an input stores but never set
+/// decodes to a full array of nulls.
+pub(crate) fn share_null_columns(batch: RecordBatch) -> Result<RecordBatch, ArrowError> {
+    if !batch.columns().iter().any(|c| null_throughout(c.as_ref())) {
+        return Ok(batch);
+    }
+    let mut nulls = SharedNulls::new(batch.num_rows());
+    let columns = batch
+        .columns()
+        .iter()
+        .map(|column| match null_throughout(column.as_ref()) {
+            true => nulls.of(column.data_type()),
+            false => Arc::clone(column),
+        })
+        .collect();
+    RecordBatch::try_new(batch.schema(), columns)
+}
+
 /// Whether `arrays` share one type and hold no value among them: each is
 /// empty or null throughout, and at least one has rows.
 fn null_in_all(arrays: &[&dyn Array]) -> bool {
@@ -157,7 +178,7 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use arrow_array::LargeStringArray;
+    use arrow_array::{Int64Array, LargeStringArray, NullArray};
     use arrow_schema::{Field, Schema};
 
     use super::{test_support::distinct_buffer_bytes, *};
@@ -291,5 +312,42 @@ mod tests {
             assert!(Arc::ptr_eq(&pair[1], ints), "one null integer array");
         }
         assert!(distinct_buffer_bytes(&joined) * 100 < distinct_buffer_bytes(&expected));
+    }
+
+    #[test]
+    fn sharing_null_columns_keeps_every_value_and_drops_their_cost() {
+        let batch = wide_batch();
+        let before = distinct_buffer_bytes(&batch);
+        let shared = share_null_columns(batch.clone()).expect("share");
+        assert_eq!(shared, batch, "the values are the same");
+        let after = distinct_buffer_bytes(&shared);
+        // The filled column plus one null array per type: a null string
+        // array is its offsets and bitmap, a null integer array its values
+        // and bitmap, both about eight bytes a row.
+        let filled = distinct_buffer_bytes(&batch.project(&[0]).expect("project"));
+        let per_type_bound = 2 * (ROWS + 1) * size_of::<i64>();
+        assert!(
+            after <= filled + per_type_bound * 2,
+            "{after} bytes after sharing, {before} before"
+        );
+        assert!(before > after * NULL_COLUMNS_PER_TYPE / 2);
+    }
+
+    #[test]
+    fn sharing_keeps_a_column_without_a_validity_bitmap() {
+        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Null, true)]));
+        let column: ArrayRef = Arc::new(NullArray::new(ROWS));
+        let batch = RecordBatch::try_new(schema, vec![Arc::clone(&column)]).expect("batch");
+        let kept = share_null_columns(batch).expect("share");
+        assert!(Arc::ptr_eq(kept.column(0), &column));
+    }
+
+    #[test]
+    fn sharing_passes_a_batch_with_no_null_column_through() {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
+        let column: ArrayRef = Arc::new(Int64Array::from(vec![Some(1), None, Some(3)]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::clone(&column)]).expect("batch");
+        let kept = share_null_columns(batch).expect("share");
+        assert!(Arc::ptr_eq(kept.column(0), &column));
     }
 }

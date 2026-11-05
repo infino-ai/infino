@@ -145,6 +145,7 @@ use crate::{
     },
     supertable::schema::{FieldId, field_id_of, map::FileSchemaMap, with_field_id},
     utils::{
+        nulls::share_null_columns,
         terms::validate_column_name,
         trace::{detail_span, record},
     },
@@ -4652,6 +4653,13 @@ pub fn same_shape_inputs(
 /// [`adapt_batch`], one decoded batch at a time. Never joined into one
 /// batch: a string column can decode past what one `Utf8` array's offsets
 /// can hold.
+///
+/// A column null in every row of a batch, decoded or null-filled, leaves
+/// as the batch's one shared null array of its type (see
+/// [`share_null_columns`]). On a wide, sparse table nearly every column
+/// of a batch is null, and the encoder holds a row group's batches before
+/// it writes them: one null array per column would make each held row
+/// cost the table's width.
 fn adapted_batches<'a>(
     reader: &SuperfileReader,
     deleted: Option<Arc<RoaringBitmap>>,
@@ -4667,7 +4675,8 @@ fn adapted_batches<'a>(
     adapt_batch(RecordBatch::new_empty(batches.schema()), adapter, &schema)?;
     Ok(batches.map(move |batch| {
         let batch = batch.map_err(|_| BuildError::BatchReadError)?;
-        adapt_batch(batch, adapter, &schema)
+        let batch = adapt_batch(batch, adapter, &schema)?;
+        share_null_columns(batch).map_err(|e| BuildError::Footer(e.into()))
     }))
 }
 
