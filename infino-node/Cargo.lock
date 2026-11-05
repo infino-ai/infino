@@ -2138,7 +2138,6 @@ dependencies = [
  "figment",
  "fs4",
  "futures",
- "hashbrown 0.17.1",
  "memmap2",
  "memory-stats",
  "num_cpus",
