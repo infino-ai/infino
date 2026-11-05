@@ -3081,13 +3081,12 @@ impl SuperfileBuilder {
             drop(collect_span);
 
             let docs: Vec<&[u32]> = (0..run)
-                .into_par_iter()
                 .map(|row| {
                     let lo = row * terms_per_doc;
                     &slots[lo..lo + picks[row].filled as usize]
                 })
                 .collect();
-            match docs.par_iter().all(|d| d.is_empty()) {
+            match docs.iter().all(|d| d.is_empty()) {
                 // No term in this run groups anything; it keeps arrival order
                 // while the rest of the merge is still reordered.
                 true => order.extend(first_row as u32..past_row as u32),
@@ -3116,7 +3115,7 @@ impl SuperfileBuilder {
                         by_depth = tracing::field::Empty,
                     )
                     .entered();
-                    let fwd = ForwardIndex::from_slices(&docs);
+                    let fwd = ForwardIndex::from_docs(&docs);
                     drop(docs);
                     let (run_order, report) = bisect_order_reported(&fwd, BisectParams::default());
                     let total = report.total();
@@ -3135,7 +3134,7 @@ impl SuperfileBuilder {
                     bisect_span.record("actual_gain", total.actual_gain);
                     bisect_span.record("wasted_rounds", total.wasted_rounds);
                     bisect_span.record("by_depth", tracing::field::display(&report));
-                    order.par_extend(run_order.into_par_iter().map(|d| d + first_row as u32));
+                    order.extend(run_order.into_iter().map(|d| d + first_row as u32));
                 }
             }
             first_row = past_row;

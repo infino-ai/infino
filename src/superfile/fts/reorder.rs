@@ -124,9 +124,6 @@ const REORDER_MAX_ROUNDS: usize = 20;
 /// bookkeeping than in the loop itself.
 const PAR_MIN_ITEMS: usize = 4096;
 
-/// Documents per task when [`ForwardIndex::from_slices`] builds an index.
-const FWD_BUILD_STRETCH: usize = 1 << 16;
-
 /// Ranked lists at least this long have their leading entries selected on
 /// every thread rather than by one thread's `select_nth_unstable`. Only the
 /// splits at the top of the tree rank in parallel, and there a half holds
@@ -552,7 +549,6 @@ impl ForwardIndex {
     /// Build from a per-document term-id iterator. Ids need not be
     /// sorted or unique within a document; duplicates only weight a
     /// term more heavily, which is harmless here.
-    #[cfg(test)]
     pub(crate) fn from_docs<I, T>(docs: I) -> Self
     where
         I: IntoIterator<Item = T>,
@@ -568,62 +564,6 @@ impl ForwardIndex {
             }
             starts.push(terms.len() as u32);
         }
-        Self {
-            terms,
-            starts,
-            n_terms,
-        }
-    }
-
-    /// [`Self::from_docs`] on every thread: the same index, built a stretch
-    /// of documents at a time. A merge builds one of these per run of
-    /// millions of documents on its way into the bisection, and built on one
-    /// thread it was a pass the rest of the merge's pool waited out.
-    pub(crate) fn from_slices(docs: &[&[u32]]) -> Self {
-        let stretches: Vec<&[&[u32]]> = docs.chunks(FWD_BUILD_STRETCH).collect();
-        // Each stretch's postings, then where each stretch starts.
-        let sizes: Vec<usize> = stretches
-            .par_iter()
-            .map(|stretch| stretch.iter().map(|d| d.len()).sum())
-            .collect();
-        let firsts: Vec<usize> = sizes
-            .iter()
-            .scan(0usize, |at, &size| {
-                let first = *at;
-                *at += size;
-                Some(first)
-            })
-            .collect();
-        let total: usize = sizes.iter().sum();
-        let mut terms = vec![0u32; total];
-        let mut starts = vec![0u32; docs.len() + 1];
-        let mut terms_rest = &mut terms[..];
-        let mut starts_rest = &mut starts[1..];
-        let mut work = Vec::with_capacity(stretches.len());
-        for ((stretch, &size), &first) in stretches.iter().zip(&sizes).zip(&firsts) {
-            let (t, rest) = terms_rest.split_at_mut(size);
-            terms_rest = rest;
-            let (s, rest) = starts_rest.split_at_mut(stretch.len());
-            starts_rest = rest;
-            work.push((*stretch, first, t, s));
-        }
-        let n_terms = work
-            .into_par_iter()
-            .map(|(stretch, first, terms, starts)| {
-                let mut at = 0usize;
-                let mut n_terms = 0usize;
-                for (doc, start) in stretch.iter().zip(starts) {
-                    terms[at..at + doc.len()].copy_from_slice(doc);
-                    for &t in *doc {
-                        n_terms = n_terms.max(t as usize + 1);
-                    }
-                    at += doc.len();
-                    *start = (first + at) as u32;
-                }
-                n_terms
-            })
-            .max()
-            .unwrap_or(0);
         Self {
             terms,
             starts,
@@ -662,7 +602,7 @@ pub(crate) fn bisect_order_reported(
 ) -> (Vec<u32>, BisectReport) {
     let others_at_start = RUNNING.fetch_add(1, Relaxed);
     let n = fwd.len();
-    let mut order: Vec<u32> = (0..n as u32).into_par_iter().collect();
+    let mut order: Vec<u32> = (0..n as u32).collect();
     let report = RunReport::new();
     let reference = AtomicU64::new(0);
     if n > MIN_PARTITION {
@@ -2030,34 +1970,6 @@ mod tests {
         }
     }
 
-    /// Built a stretch at a time on every thread, the index is the one
-    /// built one document after another: empty documents, empty stretches,
-    /// and a ragged last stretch included.
-    #[test]
-    fn an_index_built_in_parallel_is_the_one_built_in_order() {
-        let mut rng = StdRng::seed_from_u64(17);
-        for n_docs in [0, 1, FWD_BUILD_STRETCH - 1, 3 * FWD_BUILD_STRETCH + 5] {
-            let docs: Vec<Vec<u32>> = (0..n_docs)
-                .map(|d| {
-                    // Whole stretches without a term, then documents of up to 16.
-                    let len = match (d / FWD_BUILD_STRETCH) % 2 {
-                        1 => 0,
-                        _ => rng.random_range(0..17),
-                    };
-                    (0..len).map(|_| rng.random_range(0..5_000)).collect()
-                })
-                .collect();
-            let slices: Vec<&[u32]> = docs.iter().map(Vec::as_slice).collect();
-            let (serial, parallel) = (
-                ForwardIndex::from_docs(&docs),
-                ForwardIndex::from_slices(&slices),
-            );
-            assert_eq!(parallel.terms, serial.terms, "docs={n_docs}");
-            assert_eq!(parallel.starts, serial.starts, "docs={n_docs}");
-            assert_eq!(parallel.n_terms, serial.n_terms, "docs={n_docs}");
-        }
-    }
-
     /// Entry counts the ordered-prefix test ranks: empty, one, around the
     /// first block, odd, and several doublings past it.
     const PREFIX_TEST_LENS: [usize; 9] = [
@@ -2147,15 +2059,7 @@ mod tests {
             }
             let mut sorted = keys.clone();
             sorted.sort_unstable();
-            for want in [
-                1,
-                2,
-                PAR_SELECT_MIN - 1,
-                PAR_SELECT_MIN,
-                len / 3,
-                len - 2,
-                len - 1,
-            ] {
+            for want in [1, 2, PAR_SELECT_MIN - 1, PAR_SELECT_MIN, len / 3, len - 2, len - 1] {
                 let mut serial = keys.clone();
                 serial.select_nth_unstable(want);
                 let mut parallel = keys.clone();
@@ -2167,11 +2071,7 @@ mod tests {
                 assert_eq!(front, serial[..want], "shape={shape} want={want}");
                 parallel.sort_unstable();
                 assert_eq!(parallel, sorted, "shape={shape} want={want}: a permutation");
-                assert_eq!(
-                    par_nth_key(&keys, want),
-                    sorted[want],
-                    "shape={shape} want={want}"
-                );
+                assert_eq!(par_nth_key(&keys, want), sorted[want], "shape={shape} want={want}");
             }
         }
     }
