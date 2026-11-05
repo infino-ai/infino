@@ -51,17 +51,15 @@ use std::{
     },
 };
 
+#[cfg(test)]
+use build::merge_layers;
 pub(crate) use build::{
     BuildPolicy, BuiltBytes, Contribution, ContributionWriter, HEAD_DEPTH, HEAD_DEPTH_MAX,
     HeadSink, SliceFile, build_onto, scratch_dir, tier_path,
 };
 #[cfg(test)]
 pub(crate) use build::{Built, build, first_contribution_difference};
-use build::{
-    BuiltLayer, MERGE_RANGES_MAX, MergedLayer, build_layer_with, merge_layers_into, rebase_run,
-};
-#[cfg(test)]
-use build::{build_layer, merge_layers};
+use build::{BuiltLayer, MERGE_RANGES_MAX, build_layer, merge_layers_into, rebase_run};
 use bytes::Bytes;
 #[cfg(test)]
 pub(crate) use format::TierRef;
@@ -623,17 +621,21 @@ async fn upload_objects(
     outcome
 }
 
-/// Build a layer and upload its tier objects and slices as each key range
-/// finishes, rather than all of them after the last range: the uploads of
-/// the ranges done early run beside the ranges still building. An
-/// optimize's final layer built for 4.6 s and then uploaded for 5 more;
-/// streamed, the upload ends 2.6 s after the build.
+/// Build a layer and upload its tier objects and slices as its key ranges
+/// cut them, rather than all of them after the last range: the uploads of
+/// what is cut early run beside the ranges still building. An optimize's
+/// final layer built for 4.6 s and then uploaded for 5 more; streamed, the
+/// upload ends 2.6 s after the build.
 ///
-/// The build blocks this thread; [`upload_objects`] runs on the runtime's
-/// other workers and takes each range's objects as the range hands them
-/// over. The built layer keeps its own handles on them, as a reserved
-/// layer must. The root is written by the caller only after every upload
-/// here has landed.
+/// The build is synchronous and takes seconds, so a caller running as a
+/// task hands it to a blocking thread rather than hold a runtime worker
+/// that queries and uploads share; it runs in place when the caller blocks
+/// on this future from its own thread, where no worker waits under it.
+/// Either way it runs off the build pool's threads, so it waits for its
+/// own ranges and nothing else (see `run_ranges`). [`upload_objects`] runs
+/// on the runtime's workers and takes each object as it is cut; the built
+/// layer keeps its own handles on them, as a reserved layer must. The root
+/// is written by the caller only after every upload here has landed.
 async fn build_and_write_layer(
     storage: &Arc<dyn StorageProvider>,
     contributions: &[Contribution],
@@ -641,29 +643,27 @@ async fn build_and_write_layer(
 ) -> Result<BuiltLayer, TermIndexError> {
     let (sink, objects) = unbounded_channel();
     let uploads = task::spawn(upload_objects(Arc::clone(storage), objects, None));
-    let built = {
-        let on_part = |part: &MergedLayer| {
-            let objects = part
-                .tiers
-                .iter()
-                .map(|o| ("tier", o))
-                .chain(part.slices.iter().map(|o| ("slice", o)));
-            for (kind, (hash, built)) in objects {
-                // A closed sink means the uploader stopped; it reports why.
-                let _ = sink.send((kind, *hash, built.clone()));
-            }
-        };
-        detail_span!(
-            "term_index.build_layer",
-            inputs = contributions.len(),
-            bytes = tracing::field::Empty,
-            ranges = tracing::field::Empty,
-        )
-        .in_scope(|| build_layer_with(contributions, policy, Some(&on_part)))
+    let span = detail_span!(
+        "term_index.build_layer",
+        inputs = contributions.len(),
+        bytes = tracing::field::Empty,
+        ranges = tracing::field::Empty,
+    );
+    // The sink goes with the build, which closes the uploader's stream.
+    let built = match task::try_id() {
+        None => span.in_scope(move || build_layer(contributions, policy, Some(&sink))),
+        Some(_) => {
+            let contributions = contributions.to_vec();
+            let policy = policy.clone();
+            task::spawn_blocking(move || {
+                span.in_scope(|| build_layer(&contributions, &policy, Some(&sink)))
+            })
+            .await
+            .unwrap_or_else(|e| Err(TermIndexError::Build(format!("term-index build: {e}"))))
+        }
     };
-    drop(sink);
     let uploaded = uploads.await;
-    // An upload that failed first is the cause; the build never sees it.
+    // An upload that failed first is the cause; the build saw only a closed sink.
     uploaded.map_err(|e| TermIndexError::Build(format!("term-index upload: {e}")))??;
     built
 }
@@ -3020,8 +3020,8 @@ mod tests {
         fs,
         ops::Range,
         sync::{
-            Arc,
-            atomic::{AtomicUsize, Ordering},
+            Arc, Condvar,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         thread,
         time::Duration,
@@ -3390,7 +3390,7 @@ mod tests {
                 merge_ranges: Some(ranges),
                 ..range_policy()
             };
-            let built = build_layer(&contributions, &policy).expect("build");
+            let built = build_layer(&contributions, &policy, None).expect("build");
             build::MergedLayer {
                 layer: built.layer,
                 slices: built.slices,
@@ -3451,7 +3451,7 @@ mod tests {
                 pool,
                 ..range_policy()
             };
-            let built = build_layer(&contributions, &policy).expect("build");
+            let built = build_layer(&contributions, &policy, None).expect("build");
             merged_terms(&build::MergedLayer {
                 layer: built.layer,
                 slices: built.slices,
@@ -9151,6 +9151,253 @@ mod tests {
     const RESERVE_TEST_CONTRIBUTIONS: u128 = 4;
     const RESERVE_TEST_TERMS: usize = 4_000;
 
+    /// Contributions with [`RESERVE_TEST_TERMS`] terms between them, the
+    /// `id`th holding every `id`th term, each term with a head deep enough
+    /// that its tier is an object of its own rather than inline.
+    fn reserve_test_contributions(dir: &TempDir) -> Vec<Contribution> {
+        let terms: Vec<String> = (0..RESERVE_TEST_TERMS)
+            .map(|t| format!("t{t:04}"))
+            .collect();
+        let docs = 2 * TIER_INLINE_MAX as u32;
+        (1..=RESERVE_TEST_CONTRIBUTIONS)
+            .map(|id| {
+                let mine: Vec<(&str, &str, Vec<(u32, f32)>)> = terms
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| (*i as u128).is_multiple_of(id))
+                    .map(|(i, t)| {
+                        let head = (0..docs)
+                            .map(|row| (row, 1.0 + ((i as u32 + row) % 7) as f32))
+                            .collect();
+                        ("body", t.as_str(), head)
+                    })
+                    .collect();
+                contribution_with_heads(dir, id, &mine, docs as usize)
+            })
+            .collect()
+    }
+
+    /// Every file under `dir`, at any depth.
+    fn files_under(dir: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let mut todo = vec![dir.to_path_buf()];
+        while let Some(at) = todo.pop() {
+            for entry in std::fs::read_dir(&at).expect("read dir") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    todo.push(path);
+                } else {
+                    out.push(path);
+                }
+            }
+        }
+        out
+    }
+
+    /// A gate one thread opens and another waits on, up to a deadline.
+    #[derive(Default)]
+    struct Gate {
+        open: Mutex<bool>,
+        opened: Condvar,
+    }
+
+    impl Gate {
+        fn open(&self) {
+            *self.open.lock().expect("gate") = true;
+            self.opened.notify_all();
+        }
+
+        /// Whether the gate opened within `wait`.
+        fn wait(&self, wait: Duration) -> bool {
+            let open = self.open.lock().expect("gate");
+            let (open, _) = self
+                .opened
+                .wait_timeout_while(open, wait, |open| !*open)
+                .expect("gate");
+            *open
+        }
+    }
+
+    /// How long a range of the streaming tests waits for what it expects
+    /// to happen while it is still building, before calling it missing.
+    const GATE_WAIT: Duration = Duration::from_secs(20);
+
+    /// A build with a sink hands it every slice and tier object it keeps,
+    /// each exactly once, across several key ranges, and keeps the same
+    /// layer, byte for byte, that it builds without one.
+    #[test]
+    fn a_build_hands_its_sink_each_object_once() {
+        let dir = TempDir::new().expect("tempdir");
+        let ranges = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&ranges);
+        let policy = BuildPolicy {
+            merge_ranges: Some(RESERVE_TEST_RANGES),
+            slice_target_bytes: 16 * 1024,
+            after_range: Some(build::RangeHook(Arc::new(move || {
+                counted.fetch_add(1, AtomicOrdering::SeqCst);
+            }))),
+            ..BuildPolicy::default()
+        };
+        let contributions = reserve_test_contributions(&dir);
+        let (sink, mut objects) = unbounded_channel();
+        let built = build_layer(&contributions, &policy, Some(&sink)).expect("build");
+        drop(sink);
+        assert!(ranges.load(AtomicOrdering::SeqCst) >= 2, "several ranges");
+
+        let mut sent: Vec<(&'static str, ContentHash, Vec<u8>)> = Vec::new();
+        while let Ok((kind, hash, bytes)) = objects.try_recv() {
+            sent.push((kind, hash, bytes.read().expect("sent bytes")));
+        }
+        let mut kept: Vec<(&'static str, ContentHash, Vec<u8>)> = built
+            .tiers
+            .iter()
+            .map(|o| ("tier", o))
+            .chain(built.slices.iter().map(|o| ("slice", o)))
+            .map(|(kind, (hash, bytes))| (kind, *hash, bytes.read().expect("kept bytes")))
+            .collect();
+        let distinct: HashSet<(&str, ContentHash)> =
+            sent.iter().map(|(kind, hash, _)| (*kind, *hash)).collect();
+        assert_eq!(distinct.len(), sent.len(), "no object is sent twice");
+        sent.sort_by_key(|(kind, hash, _)| (*kind, hash.to_hex()));
+        kept.sort_by_key(|(kind, hash, _)| (*kind, hash.to_hex()));
+        assert!(
+            kept.len() > 2 * RESERVE_TEST_RANGES,
+            "several objects per range"
+        );
+        assert!(
+            kept.iter().any(|(kind, ..)| *kind == "tier"),
+            "tier objects too"
+        );
+        assert!(sent == kept, "the sink gets what the layer keeps");
+
+        let plain = build_layer(&contributions, &policy, None).expect("build");
+        assert_eq!(plain.layer.slices, built.layer.slices, "same slices");
+        let bytes_of = |objects: &[(ContentHash, BuiltBytes)]| -> Vec<(ContentHash, Vec<u8>)> {
+            objects
+                .iter()
+                .map(|(hash, bytes)| (*hash, bytes.read().expect("bytes")))
+                .collect()
+        };
+        assert!(bytes_of(&plain.slices) == bytes_of(&built.slices));
+        assert!(bytes_of(&plain.tiers) == bytes_of(&built.tiers));
+    }
+
+    /// A reserved layer whose slice or tier upload fails reports that
+    /// failure, rather than hanging or returning a layer whose objects are
+    /// not all written, and writes no root.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reserve_layer_fails_when_an_upload_fails() {
+        for kind in ["slice-", "tier-"] {
+            let dir = TempDir::new().expect("tempdir");
+            let policy = BuildPolicy {
+                merge_ranges: Some(RESERVE_TEST_RANGES),
+                ..BuildPolicy::default()
+            };
+            let contributions = reserve_test_contributions(&dir);
+            let store_dir = TempDir::new().expect("store dir");
+            let local: Arc<dyn StorageProvider> =
+                Arc::new(LocalFsStorageProvider::new(store_dir.path()).expect("local fs"));
+            let faults = FaultStorage::wrap(local);
+            faults.fail(
+                FaultOp::PutAtomic,
+                &format!("term-index/{kind}"),
+                usize::MAX,
+            );
+            let storage: Arc<dyn StorageProvider> = faults.clone();
+            let reserved = tokio::time::timeout(
+                Duration::from_secs(60),
+                task::spawn(async move { reserve_layer(&storage, &contributions, &policy).await }),
+            )
+            .await
+            .expect("the reserve ends")
+            .expect("the reserve task");
+            let Err(err) = reserved else {
+                panic!("a failed {kind} upload fails the reserve");
+            };
+            assert!(
+                err.to_string().contains("injected fault"),
+                "the upload's failure is the cause: {err}"
+            );
+            assert!(faults.fired() > 0, "a {kind} upload failed");
+            assert!(
+                !files_under(store_dir.path())
+                    .iter()
+                    .any(|path| path.to_string_lossy().contains("root-")),
+                "no root written"
+            );
+        }
+    }
+
+    /// A reserved layer's uploads start while its key ranges still build:
+    /// the first range to finish waits for an upload to land, which it
+    /// would wait for in vain were the objects handed over only once the
+    /// whole build was done.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reserve_layer_uploads_while_its_ranges_build() {
+        let dir = TempDir::new().expect("tempdir");
+        let uploaded = Arc::new(Gate::default());
+        let missed = Arc::new(AtomicBool::new(false));
+        let (gate, flag) = (Arc::clone(&uploaded), Arc::clone(&missed));
+        let policy = BuildPolicy {
+            merge_ranges: Some(RESERVE_TEST_RANGES),
+            after_range: Some(build::RangeHook(Arc::new(move || {
+                if !gate.wait(GATE_WAIT) {
+                    flag.store(true, AtomicOrdering::SeqCst);
+                }
+            }))),
+            ..BuildPolicy::default()
+        };
+        let contributions = reserve_test_contributions(&dir);
+        let store_dir = TempDir::new().expect("store dir");
+        let local: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(store_dir.path()).expect("local fs"));
+        let faults = FaultStorage::wrap(local);
+        let gate = Arc::clone(&uploaded);
+        faults.before(FaultOp::PutAtomic, "term-index/", move || gate.open());
+        let storage: Arc<dyn StorageProvider> = faults;
+        task::spawn(async move { reserve_layer(&storage, &contributions, &policy).await })
+            .await
+            .expect("the reserve task")
+            .expect("reserve");
+        assert!(
+            !missed.load(AtomicOrdering::SeqCst),
+            "an upload started before the first range was done"
+        );
+    }
+
+    /// A reserved layer's build, awaited by a task, leaves the runtime's
+    /// worker free: on a one-worker runtime another task runs while the
+    /// build's first range waits for it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn reserve_layer_builds_off_the_runtime_worker() {
+        let dir = TempDir::new().expect("tempdir");
+        let ran = Arc::new(Gate::default());
+        let missed = Arc::new(AtomicBool::new(false));
+        let (gate, flag) = (Arc::clone(&ran), Arc::clone(&missed));
+        let policy = BuildPolicy {
+            merge_ranges: Some(RESERVE_TEST_RANGES),
+            after_range: Some(build::RangeHook(Arc::new(move || {
+                if !gate.wait(GATE_WAIT) {
+                    flag.store(true, AtomicOrdering::SeqCst);
+                }
+            }))),
+            ..BuildPolicy::default()
+        };
+        let contributions = reserve_test_contributions(&dir);
+        let store_dir = TempDir::new().expect("store dir");
+        let local: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(store_dir.path()).expect("local fs"));
+        let reserve =
+            task::spawn(async move { reserve_layer(&local, &contributions, &policy).await });
+        let other = task::spawn(async move { ran.open() });
+        reserve.await.expect("the reserve task").expect("reserve");
+        other.await.expect("the other task");
+        assert!(
+            !missed.load(AtomicOrdering::SeqCst),
+            "another task ran while the layer built"
+        );
+    }
+
     /// A reserved layer streams its objects out as its key ranges finish,
     /// and has written every one of them, the ones the same build kept in
     /// hand would write, by the time it returns.
@@ -9161,20 +9408,7 @@ mod tests {
             merge_ranges: Some(RESERVE_TEST_RANGES),
             ..BuildPolicy::default()
         };
-        let terms: Vec<String> = (0..RESERVE_TEST_TERMS)
-            .map(|t| format!("t{t:04}"))
-            .collect();
-        let contributions: Vec<Contribution> = (1..=RESERVE_TEST_CONTRIBUTIONS)
-            .map(|id| {
-                let mine: Vec<(&str, &str, u64)> = terms
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, _)| (*i as u128).is_multiple_of(id))
-                    .map(|(i, t)| ("body", t.as_str(), 1 + (i as u64 % 3)))
-                    .collect();
-                contribution(&dir, id, &mine)
-            })
-            .collect();
+        let contributions = reserve_test_contributions(&dir);
         let store_dir = TempDir::new().expect("store dir");
         let local: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(store_dir.path()).expect("local fs"));
@@ -9183,7 +9417,7 @@ mod tests {
             .await
             .expect("reserve");
 
-        let expected = build_layer(&contributions, &policy).expect("build");
+        let expected = build_layer(&contributions, &policy, None).expect("build");
         let want: HashSet<ContentHash> = expected
             .slices
             .iter()
@@ -9450,7 +9684,7 @@ mod tests {
             .superfiles
             .extend(repeat_n(Uuid::nil(), LANDED_FIRST));
         outgrown.id_mins.extend(repeat_n(0, LANDED_FIRST));
-        let mut expected = build_layer(&merged, &policy).expect("build at the new base");
+        let mut expected = build_layer(&merged, &policy, None).expect("build at the new base");
         expected
             .layer
             .place_at(outgrown.superfiles.len() as u32, merged.len() as u32);
