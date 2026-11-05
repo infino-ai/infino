@@ -50,7 +50,7 @@ use infino::{
     superfile::builder::{FtsConfig, VectorConfig},
     supertable::{
         Supertable,
-        manifest::disk_cache::ManifestDiskCache,
+        manifest::disk_cache::MetadataDiskCache,
         query::VectorSearchOptions,
         storage::{AzureStorageProvider, ObjectMeta, StorageError, StorageProvider},
     },
@@ -686,10 +686,10 @@ impl StorageProvider for CountingStorage {
 /// Real-Azure validation of the manifest-part disk cache.
 ///
 /// 1. A producer commits a batch to Azure (creates ≥1 manifest part).
-/// 2. A cold consumer opens with a fresh [`ManifestDiskCache`] — the
+/// 2. A cold consumer opens with a fresh [`MetadataDiskCache`] — the
 ///    eager part load fetches the part from Azure (≥1 part GET) and
 ///    populates the cache.
-/// 3. A warm consumer opens with a **new** `ManifestDiskCache` instance
+/// 3. A warm consumer opens with a **new** `MetadataDiskCache` instance
 ///    over the **same** cache directory (models a process restart): the
 ///    index is rebuilt from disk, the eager load is served from local
 ///    disk, and **zero** Azure part GETs occur.
@@ -697,10 +697,10 @@ impl StorageProvider for CountingStorage {
 /// Gated on `INFINO_TEST_REAL_AZURE=1` + `AZURE_STORAGE_CONTAINER_NAME`
 /// (with the standard `AZURE_STORAGE_*` credential env chain).
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn manifest_disk_cache_serves_parts_without_azure_refetch() {
+async fn metadata_disk_cache_serves_parts_without_azure_refetch() {
     if std::env::var("INFINO_TEST_REAL_AZURE").ok().as_deref() != Some("1") {
         eprintln!(
-            "manifest_disk_cache_serves_parts_without_azure_refetch: skipped \
+            "metadata_disk_cache_serves_parts_without_azure_refetch: skipped \
              (set INFINO_TEST_REAL_AZURE=1 and AZURE_STORAGE_CONTAINER_NAME to enable)"
         );
         return;
@@ -709,7 +709,7 @@ async fn manifest_disk_cache_serves_parts_without_azure_refetch() {
         Ok(c) => c,
         Err(_) => {
             eprintln!(
-                "manifest_disk_cache_serves_parts_without_azure_refetch: skipped \
+                "metadata_disk_cache_serves_parts_without_azure_refetch: skipped \
                  (missing AZURE_STORAGE_CONTAINER_NAME)"
             );
             return;
@@ -760,7 +760,7 @@ async fn manifest_disk_cache_serves_parts_without_azure_refetch() {
         // 2. Cold open: fresh manifest cache → part fetched from Azure.
         let cold_cache_dir = cache_dir.path().join("cold-superfiles");
         {
-            let manifest_cache = ManifestDiskCache::new(manifest_cache_root.clone(), 1 << 30)
+            let manifest_cache = MetadataDiskCache::new(manifest_cache_root.clone(), 1 << 30)
                 .map_err(|e| format!("cold manifest cache: {e}"))?;
             let disk_cache = default_disk_cache(Arc::clone(&counting_dyn), &cold_cache_dir);
             counting.reset();
@@ -768,7 +768,7 @@ async fn manifest_disk_cache_serves_parts_without_azure_refetch() {
                 real_azure_options(dim)
                     .with_storage(Arc::clone(&counting_dyn))
                     .with_disk_cache(disk_cache)
-                    .with_manifest_disk_cache(Arc::clone(&manifest_cache)),
+                    .with_metadata_disk_cache(Arc::clone(&manifest_cache)),
             )
             .map_err(|e| format!("cold open: {e}"))?;
 
@@ -800,7 +800,7 @@ async fn manifest_disk_cache_serves_parts_without_azure_refetch() {
         // 3. Warm open: NEW cache instance over the same dir (restart).
         let warm_cache_dir = cache_dir.path().join("warm-superfiles");
         {
-            let manifest_cache = ManifestDiskCache::new(manifest_cache_root.clone(), 1 << 30)
+            let manifest_cache = MetadataDiskCache::new(manifest_cache_root.clone(), 1 << 30)
                 .map_err(|e| format!("warm manifest cache: {e}"))?;
             // Restart survival: the index is rebuilt from the cold open's
             // files at construction, before any load.
@@ -817,7 +817,7 @@ async fn manifest_disk_cache_serves_parts_without_azure_refetch() {
                 real_azure_options(dim)
                     .with_storage(Arc::clone(&counting_dyn))
                     .with_disk_cache(disk_cache)
-                    .with_manifest_disk_cache(Arc::clone(&manifest_cache)),
+                    .with_metadata_disk_cache(Arc::clone(&manifest_cache)),
             )
             .map_err(|e| format!("warm open: {e}"))?;
 

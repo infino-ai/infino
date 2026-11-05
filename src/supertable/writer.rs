@@ -5580,6 +5580,7 @@ async fn load_drain_remote_checkpoint(
     }
     let state = slow_vector_state::load_full_state(
         storage.as_ref(),
+        inner.options.metadata_disk_cache.as_ref(),
         uri,
         &hash,
         &inner.options.legacy_names(),
@@ -7658,7 +7659,7 @@ fn cell_doc_counts_from_summary(
         if is_superseded(id) {
             continue;
         }
-        let n: u64 = cell.clusters.counts.iter().map(|&c| u64::from(c)).sum();
+        let n: u64 = cell.clusters.rows();
         out.push((id, u32::try_from(n).ok()?));
     }
     Some(out)
@@ -9479,6 +9480,7 @@ async fn pin_uploaded_superfiles(
             .unwrap_or(true)
             && let Ok(state) = slow_vector_state::load_full_state(
                 storage.as_ref(),
+                inner.options.metadata_disk_cache.as_ref(),
                 uri,
                 &hash,
                 &inner.options.legacy_names(),
@@ -11630,7 +11632,15 @@ async fn build_and_publish_centroid_router_section(
     {
         return None;
     }
-    let section = match fetch_centroid_section(storage, centroids_ref, entries).await {
+    let section = match fetch_centroid_section(
+        storage,
+        inner.options.metadata_disk_cache.as_ref(),
+        centroids_ref,
+        entries,
+        &inner.options.scratch_dir(),
+    )
+    .await
+    {
         Ok(section) => section,
         Err(error) => {
             tracing::warn!(%error, "centroid-router publish: centroid section fetch failed");
@@ -11680,7 +11690,15 @@ async fn previous_centroid_section(
     {
         return Some(Arc::clone(section));
     }
-    match fetch_centroid_section(storage, &reference, manifest.get_all_superfiles()).await {
+    match fetch_centroid_section(
+        storage,
+        options.metadata_disk_cache.as_ref(),
+        &reference,
+        manifest.get_all_superfiles(),
+        &options.scratch_dir(),
+    )
+    .await
+    {
         Ok(section) => {
             let section = Arc::new(section);
             *guard = Some(Arc::clone(&section));
@@ -12747,6 +12765,7 @@ pub(in crate::supertable) async fn stamp_slow_vector_state(
             Some(pending) => {
                 slow_vector_state::write_state_with_pending_drain(
                     storage.as_ref(),
+                    inner.options.metadata_disk_cache.as_ref(),
                     entries,
                     pending,
                     previous_section.as_deref(),
@@ -12756,6 +12775,7 @@ pub(in crate::supertable) async fn stamp_slow_vector_state(
             None => {
                 slow_vector_state::write_state(
                     storage.as_ref(),
+                    inner.options.metadata_disk_cache.as_ref(),
                     entries,
                     previous_section.as_deref(),
                 )
@@ -13664,6 +13684,7 @@ pub(crate) async fn try_commit_attempt(
                 previous_centroid_section(&opts, storage.as_ref(), current_manifest.as_ref()).await;
             let published = slow_vector_state::write_state(
                 storage.as_ref(),
+                opts.metadata_disk_cache.as_ref(),
                 entries,
                 previous_section.as_deref(),
             )
@@ -14111,12 +14132,11 @@ async fn put_new_hedged(
 pub(in crate::supertable) async fn put_content_addressed(
     storage: &dyn StorageProvider,
     uri_for: impl FnOnce(&part_mod::ContentHash) -> String,
-    bytes: Vec<u8>,
+    bytes: Bytes,
 ) -> Result<RoutingRef, StorageError> {
     let content_hash = part_mod::ContentHash::of(&bytes);
     let uri = uri_for(&content_hash);
     let span = detail_span!("put_content_addressed", len = bytes.len());
-    let bytes = Bytes::from(bytes);
     let put = async {
         match (bytes.len() as u64) >= CONTENT_ADDRESSED_MULTIPART_THRESHOLD_BYTES {
             true => put_superfile_multipart(storage, &uri, bytes).await,
@@ -15104,10 +15124,13 @@ mod tests {
             puts: AtomicUsize::new(0),
             first_lands_after: None,
         };
-        let reference =
-            put_content_addressed(&storage, |hash| format!("hedged/{hash}"), b"bytes".to_vec())
-                .await
-                .expect("the hedge answers");
+        let reference = put_content_addressed(
+            &storage,
+            |hash| format!("hedged/{hash}"),
+            b"bytes".to_vec().into(),
+        )
+        .await
+        .expect("the hedge answers");
         assert_eq!(
             storage.puts.load(Ordering::SeqCst),
             2,
@@ -15131,10 +15154,13 @@ mod tests {
             puts: AtomicUsize::new(0),
             first_lands_after: Some(stuck_after(0) * 4),
         };
-        let reference =
-            put_content_addressed(&storage, |hash| format!("hedged/{hash}"), b"bytes".to_vec())
-                .await
-                .expect("the first attempt lands");
+        let reference = put_content_addressed(
+            &storage,
+            |hash| format!("hedged/{hash}"),
+            b"bytes".to_vec().into(),
+        )
+        .await
+        .expect("the first attempt lands");
         assert_eq!(
             storage.puts.load(Ordering::SeqCst),
             2,
@@ -15167,7 +15193,7 @@ mod tests {
                 puts: AtomicUsize::new(0),
                 first_lands_after: Some(lands_after),
             };
-            put_content_addressed(&storage, |hash| format!("hedged/{hash}"), bytes)
+            put_content_addressed(&storage, |hash| format!("hedged/{hash}"), bytes.into())
                 .await
                 .expect("the first attempt lands");
             assert_eq!(storage.puts.load(Ordering::SeqCst), 1, "no hedge was sent");

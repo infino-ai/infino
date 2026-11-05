@@ -53,6 +53,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fmt,
+    path::PathBuf,
     sync::{Arc, Mutex, OnceLock, PoisonError},
     time::Duration,
 };
@@ -72,7 +73,7 @@ use super::{
 use crate::{
     config::{
         Config, CrcVerification, DrainConsolidate, StorageBackend, StorageColdFetchMode,
-        ThreadCount,
+        ThreadCount, scratch_root,
     },
     memory::ConnectionMemoryBudget,
     runtime_metrics::rss::total_memory_bytes,
@@ -89,7 +90,7 @@ use crate::{
         companion::CompanionSpec,
         manifest::{
             SuperfileUri, UserCentroidCache,
-            disk_cache::ManifestDiskCache,
+            disk_cache::MetadataDiskCache,
             list::PartitionStrategy,
             term_index::{BuildPolicy, HEAD_DEPTH, HEAD_DEPTH_MAX},
         },
@@ -461,7 +462,7 @@ pub struct SupertableOptions {
     /// so cached files are never stale and the cache survives process
     /// restarts. Independent of `disk_cache` (which caches superfile
     /// content) and uses its own byte budget. `None` disables it.
-    pub manifest_disk_cache: Option<Arc<ManifestDiskCache>>,
+    pub metadata_disk_cache: Option<Arc<MetadataDiskCache>>,
     /// Superfiles a ranked query opens concurrently when it orders them by
     /// score ceiling. Below this many candidates every superfile opens at
     /// once, exactly as the unordered fan-out does, so ordering costs no
@@ -937,7 +938,7 @@ impl SupertableOptions {
             store,
             storage: None,
             disk_cache: None,
-            manifest_disk_cache: None,
+            metadata_disk_cache: None,
             bound_ordered_open_window: DEFAULT_BOUND_ORDERED_OPEN_WINDOW,
             term_tier_entries_per_term: None,
             term_head_depth: None,
@@ -1138,6 +1139,15 @@ impl SupertableOptions {
         self.term_index && self.storage.is_some()
     }
 
+    /// Where this table's large scratch files go: beside the disk cache when
+    /// one is attached, on the disk sized for the table, else
+    /// `storage.scratch_root`.
+    pub(crate) fn scratch_dir(&self) -> PathBuf {
+        self.disk_cache
+            .as_ref()
+            .map_or_else(scratch_root, |cache| cache.scratch_root())
+    }
+
     /// What the term-index build takes from these options.
     pub(crate) fn term_index_build_policy(&self) -> BuildPolicy {
         // Every superfile keeps its head to the same depth, at least one
@@ -1177,11 +1187,11 @@ impl SupertableOptions {
     /// Attach an on-disk cache for compressed manifest-part bytes.
     /// On a cache hit the part loader reads bytes from local disk
     /// instead of round-tripping to object storage. Construction stays
-    /// user-managed — build the [`ManifestDiskCache`] with the cache
+    /// user-managed — build the [`MetadataDiskCache`] with the cache
     /// root and byte budget that fit the deployment and pass the
     /// resulting `Arc` here.
-    pub fn with_manifest_disk_cache(mut self, cache: Arc<ManifestDiskCache>) -> Self {
-        self.manifest_disk_cache = Some(cache);
+    pub fn with_metadata_disk_cache(mut self, cache: Arc<MetadataDiskCache>) -> Self {
+        self.metadata_disk_cache = Some(cache);
         self
     }
 
@@ -1521,11 +1531,11 @@ impl SupertableOptions {
             // under a sibling subdirectory, with an independent budget.
             let manifest_cache_root = cache_root.join(MANIFEST_CACHE_SUBDIR);
             let manifest_cache =
-                ManifestDiskCache::new(manifest_cache_root, cfg.storage.manifest_disk_budget_bytes)
+                MetadataDiskCache::new(manifest_cache_root, cfg.storage.manifest_disk_budget_bytes)
                     .map_err(|e| {
                         BuildError::Store(format!("manifest disk cache construction: {e}"))
                     })?;
-            self.manifest_disk_cache = Some(manifest_cache);
+            self.metadata_disk_cache = Some(manifest_cache);
         }
 
         self.storage = Some(storage);

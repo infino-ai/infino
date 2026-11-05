@@ -503,7 +503,7 @@ fn cells_ranked_by_fine_score(
 
 /// Rows a summary cell indexes: the sum of its fine-cluster counts.
 fn cell_rows(cell: &CellVectorSummary) -> u64 {
-    cell.clusters.counts.iter().map(|&c| u64::from(c)).sum()
+    cell.clusters.rows()
 }
 
 /// Whether an in-place split retired this cell of `superfile_id`. Its
@@ -4656,7 +4656,15 @@ impl SupertableReader {
             return Some(Arc::clone(section));
         }
         let entries = manifest.get_all_superfiles();
-        match fetch_centroid_section(storage.as_ref(), &reference, entries).await {
+        match fetch_centroid_section(
+            storage.as_ref(),
+            manifest.options.metadata_disk_cache.as_ref(),
+            &reference,
+            entries,
+            &manifest.options.scratch_dir(),
+        )
+        .await
+        {
             Ok(section) => {
                 let section = Arc::new(section);
                 *guard = Some(Arc::clone(&section));
@@ -4953,9 +4961,10 @@ impl SupertableReader {
         let coalesce = config::global().vector.global_fine_coalesce;
         let scan_width = manifest.options.reader_pool.current_num_threads().max(1);
         // Share the connection memory budget and reader pool across the
-        // concurrent scans, matching the stamped fan-out: cold fetches then gate
-        // on `OverBudget` and score on the reader pool. A serial loop needed
-        // neither (one fetch in flight), but concurrency does.
+        // concurrent scans, matching the stamped fan-out: cold fetches then
+        // reserve from the budget (waiting their turn when it is full) and
+        // score on the reader pool. A serial loop needed neither (one fetch in
+        // flight), but concurrency does.
         let scan_pool = Arc::clone(&manifest.options.reader_pool);
         let scan_budget = Arc::clone(&manifest.options.connection_memory_budget);
         // Build the per-superfile scan futures in a plain loop (concrete
@@ -5070,7 +5079,14 @@ impl SupertableReader {
                 let reader = readers[si].as_ref();
                 let file_column = reader.column_alias(column_field_id, column);
                 let (hits, rerank_ns) = reader
-                    .vector_rerank_selected(file_column, query, k, selected, None)
+                    .vector_rerank_selected(
+                        file_column,
+                        query,
+                        k,
+                        selected,
+                        None,
+                        Some(Arc::clone(&scan_budget)),
+                    )
                     .await?;
                 if let Some(stats) = &self.op_stats {
                     stats.add_kernel_cpu_ns(rerank_ns);
@@ -6425,6 +6441,8 @@ impl SupertableReader {
         let reader_pool = Arc::clone(&manifest.options.reader_pool);
         // Per-connection memory budget: gates each superfile's cold cluster-block fetch.
         let budget = Some(Arc::clone(&manifest.options.connection_memory_budget));
+        // Phase C's reranks reserve from the same budget.
+        let rerank_budget = budget.clone();
         let storage = manifest.options.storage.as_ref().map(Arc::clone);
 
         // `fanout_with`, not a plain post-rank filter: the body resolves each
@@ -6735,6 +6753,7 @@ impl SupertableReader {
                 let query = Arc::clone(&query_arc2);
                 let reader_pool = Arc::clone(&manifest.options.reader_pool);
                 let op_stats_c = self.op_stats.clone();
+                let budget_c = rerank_budget.clone();
                 let body_c = move |reader: Arc<SuperfileReader>,
                                    entry: Arc<SuperfileEntry>,
                                    _tombstone_cache: Option<Arc<SidecarCache>>,
@@ -6744,6 +6763,7 @@ impl SupertableReader {
                     let query = Arc::clone(&query);
                     let reader_pool = Arc::clone(&reader_pool);
                     let op_stats = op_stats_c.clone();
+                    let budget = budget_c.clone();
                     async move {
                         // A file written before a rename labels its vector
                         // blob with the name the column had then; the id is what
@@ -6765,6 +6785,7 @@ impl SupertableReader {
                                 k_fetch,
                                 selected,
                                 Some(reader_pool),
+                                budget,
                             )
                             .await?;
                         if let Some(stats) = &op_stats {
@@ -7387,7 +7408,7 @@ impl SupertableReader {
                         let mut idx = 0usize;
                         let mut guard = map.lock().expect("diag cell-map lock");
                         for cell in &vs.cells {
-                            let n: u64 = cell.clusters.counts.iter().map(|&c| u64::from(c)).sum();
+                            let n: u64 = cell.clusters.rows();
                             for _ in 0..n {
                                 if idx >= stable_ids.len() {
                                     break;

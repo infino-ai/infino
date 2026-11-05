@@ -1236,7 +1236,10 @@ async fn cold_fetch_to_disk_cancelable(
     }
     let file = {
         let mut opts = fs::OpenOptions::new();
-        opts.write(true).create(true);
+        // A resume opens only the partial file it wrote. If that file is gone, it fails with
+        // `NotFound` instead of creating an empty file and skipping the chunks the cursor marks
+        // written.
+        opts.write(true).create(first_attempt);
         if first_attempt {
             opts.truncate(true);
         }
@@ -1703,6 +1706,7 @@ mod tests {
         collections::HashSet,
         fs,
         future::poll_fn,
+        io::ErrorKind,
         os::unix::fs::MetadataExt,
         path::PathBuf,
         sync::{
@@ -1769,6 +1773,10 @@ mod tests {
 
     /// Bytes the unknown-size refusal test reads from a block no open touched.
     const REFUSAL_READ_BYTES: u64 = 4096;
+
+    /// The byte a download test's object is made of. Not zero, so a written chunk is told apart
+    /// from the zeros of a file sized but not yet written.
+    const PAYLOAD_BYTE: u8 = 7;
 
     /// A store over recording storage holding one vector superfile, with a Warm open whose fill is
     /// parked at the only fill permit. Returns the held reader, the permit and the vector hole.
@@ -3958,6 +3966,105 @@ mod tests {
             "a same-URI pause must leave unfinished chunks for the resume"
         );
         drop(foreground);
+    }
+
+    /// A paused download whose partial file is deleted does not rebuild it with holes.
+    ///
+    /// Setup:
+    /// - a download pauses for a query holding the file, after writing some chunks;
+    /// - its partial file is deleted (its cache directory being removed, say);
+    /// - the download resumes with the same cursor.
+    ///
+    /// This test pins that the resume fails with `NotFound` and leaves no file behind. Creating
+    /// the file again would skip the chunks the cursor marks written and leave zeros in their place.
+    #[tokio::test]
+    async fn a_resumed_download_whose_partial_file_is_gone_does_not_recreate_it() {
+        let (dir, store) = test_store_with(|cfg| {
+            cfg.cold_fetch_streams = 1;
+            cfg.cold_fetch_chunk_bytes = 1;
+        });
+        let uri = SuperfileUri::new_v4();
+        let storage_uri = uri.storage_path();
+        store
+            .storage
+            .put_atomic(
+                &storage_uri,
+                Bytes::from(vec![PAYLOAD_BYTE; PREEMPT_TEST_BYTES]),
+            )
+            .await
+            .expect("put background-fill payload");
+        let destination = dir.path().join("preempt.tmp");
+        let signal_reader = Arc::new(
+            SuperfileReader::open(tiny_superfile_bytes()).expect("foreground signal reader"),
+        );
+        let signal_weak = Arc::downgrade(&signal_reader);
+        let fill_store = Arc::clone(&store);
+        let fill_destination = destination.clone();
+        let fill_signal = signal_weak.clone();
+        let first = spawn(async move {
+            let mut filled = Vec::new();
+            let outcome = cold_fetch_to_disk_cancelable(
+                &fill_store,
+                &fill_signal,
+                &fill_store.storage,
+                &storage_uri,
+                &fill_destination,
+                PREEMPT_TEST_BYTES as u64,
+                &mut filled,
+                None,
+                PromotionDefer::Forever,
+            )
+            .await;
+            (outcome, filled)
+        });
+        // Wait for two written chunks. With one stream the second starts only after the first is
+        // marked written, so the cursor then has a chunk for the resume to skip.
+        timeout(PROMOTE_TIMEOUT, async {
+            while fs::read(&destination).map_or(0, |bytes| {
+                bytes.iter().filter(|&&byte| byte == PAYLOAD_BYTE).count()
+            }) < 2
+            {
+                yield_now().await;
+            }
+        })
+        .await
+        .expect("the download wrote two chunks");
+        // Holding the signal reader (strong_count > 1) is the per-file pause.
+        let foreground = Arc::clone(&signal_reader);
+        let _ = ForegroundQueryGuard::enter();
+        let (outcome, mut filled) = first.await.expect("the download joined");
+        assert_eq!(outcome.expect("an outcome"), BackgroundFillOutcome::Paused);
+        assert_eq!(
+            filled.len(),
+            PREEMPT_TEST_BYTES,
+            "the cursor makes the next call a resume"
+        );
+        assert!(
+            filled.iter().any(|&done| done),
+            "some chunks are written before the pause"
+        );
+        drop(foreground);
+
+        fs::remove_file(&destination).expect("delete the partial file");
+        // A second handle, as a running download holds, so the store does not look dropped.
+        let fill_store = Arc::clone(&store);
+        let resumed = cold_fetch_to_disk_cancelable(
+            &fill_store,
+            &signal_weak,
+            &fill_store.storage,
+            &uri.storage_path(),
+            &destination,
+            PREEMPT_TEST_BYTES as u64,
+            &mut filled,
+            None,
+            PromotionDefer::Forever,
+        )
+        .await;
+        assert!(
+            matches!(&resumed, Err(DiskCacheError::Io(error)) if error.kind() == ErrorKind::NotFound),
+            "the resume fails with NotFound, got {resumed:?}"
+        );
+        assert!(!destination.exists(), "no file is created again");
     }
 
     // ----- wait_until_mmap_promoted timeout path -----
