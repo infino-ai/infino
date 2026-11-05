@@ -3199,7 +3199,7 @@ impl SuperfileBuilder {
         inputs: &[MergeInput],
         body_encoder: &mut PlannedBodyEncoder,
         id_sidecar: &mut Option<PackedIdEncoder<BufWriter<NamedTempFile>>>,
-        stats_collector: &mut Vec<SuperfileStats>,
+        stats: &mut SuperfileStats,
         reanalyze: bool,
     ) -> Result<(), BuildError> {
         let id_column = self.opts.id_column.clone();
@@ -3242,7 +3242,7 @@ impl SuperfileBuilder {
                     let Ok(next) = decoded.recv() else {
                         break;
                     };
-                    let (record_batch, stats) = next?;
+                    let (record_batch, batch_stats) = next?;
                     #[cfg(test)]
                     if tests::encode_fault() {
                         return Err(BuildError::Io(Error::other(
@@ -3251,7 +3251,10 @@ impl SuperfileBuilder {
                     }
                     // Time spent waiting on the decoder, not decoding.
                     timings.read_parquet += start.elapsed();
-                    stats_collector.push(stats);
+                    // Folded as it arrives: a table's width of column
+                    // stats per decoded batch, held to the end, is what a
+                    // wide table's merge would otherwise accumulate.
+                    stats.merge(&batch_stats);
 
                     let start = std::time::Instant::now();
                     body_encoder.write_batch(&record_batch)?;
@@ -3293,9 +3296,9 @@ impl SuperfileBuilder {
                 .body_plan(&superfile_builder.parquet_schema),
         );
 
-        let (ordered_batches, mut stats_collector) = match ordered {
-            Some((batches, stats)) => (Some(batches), stats),
-            None => (None, Vec::with_capacity(inputs.len())),
+        let (ordered_batches, mut stats) = match ordered {
+            Some((batches, stats)) => (Some(batches), SuperfileStats::from_children(&stats)),
+            None => (None, SuperfileStats::from_children(&[])),
         };
 
         // Stream the stable-id sidecar from the merged rows as they are written
@@ -3377,7 +3380,7 @@ impl SuperfileBuilder {
                     inputs,
                     &mut body_encoder,
                     &mut id_sidecar,
-                    &mut stats_collector,
+                    &mut stats,
                     reanalyze,
                 ),
                 false => Ok(()),
@@ -3510,7 +3513,6 @@ impl SuperfileBuilder {
         let finish_span =
             detail_span!("merge_finish", rows = superfile_builder.next_local_doc_id).entered();
 
-        let stats = SuperfileStats::from_children(stats_collector.as_slice());
         // Every input fully tombstoned → no rows: match `finish_to`'s
         // empty-superfile contract (write nothing, return the merged stats).
         if superfile_builder.next_local_doc_id == 0 {
