@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! The builder's term interner table: term bytes → dense term id.
 //!
 //! An open-addressing table with linear probing whose slot carries the
@@ -11,6 +14,8 @@
 //!
 //! The table holds ids only; the caller owns the id → term list, so a
 //! term's bytes are stored once.
+
+use std::mem::replace;
 
 /// One slot. `tag == 0` marks it empty; otherwise `tag` is the term's
 /// byte length plus one (saturating), `words` its first 16 bytes
@@ -85,7 +90,7 @@ impl TermTable {
     #[inline(never)]
     fn grow<K: AsRef<[u8]>>(&mut self, keys: &[K]) {
         let cap = (self.slots.len() * 2).max(16);
-        let old = std::mem::replace(&mut self.slots, vec![Slot::default(); cap]);
+        let old = replace(&mut self.slots, vec![Slot::default(); cap]);
         let mask = cap - 1;
         for slot in old.into_iter().filter(|s| s.tag != 0) {
             let hash = if slot.tag as usize - 1 <= INLINE_BYTES {

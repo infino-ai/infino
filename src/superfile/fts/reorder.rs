@@ -45,7 +45,7 @@ use std::{
 
 #[cfg(feature = "detailed-tracing")]
 use rayon::current_thread_index;
-use rayon::{current_num_threads, join, prelude::*};
+use rayon::{current_num_threads, iter::repeat_n, join, prelude::*};
 use tracing::Span;
 
 use crate::{
@@ -1549,7 +1549,7 @@ fn rank_by_gain(
         true => {
             let stretch = PAR_MIN_ITEMS.next_multiple_of(GAIN_LANES);
             match out.len() < half.len() {
-                true => out.par_extend(rayon::iter::repeat_n(0, half.len() - out.len())),
+                true => out.par_extend(repeat_n(0, half.len() - out.len())),
                 false => out.truncate(half.len()),
             }
             out.par_chunks_mut(stretch)
