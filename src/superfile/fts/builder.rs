@@ -96,7 +96,7 @@ use std::{
     fs,
     fs::File,
     io::{self, BufReader, BufWriter, Error, ErrorKind, Read, Seek, SeekFrom, Write},
-    mem,
+    mem::{self, transmute},
     ops::Range,
     path::{Path, PathBuf},
     sync::Arc,
@@ -146,7 +146,7 @@ use crate::{
 /// Entries of a [`Vocab`]'s `id_to_term` are `&'static str` slices that
 /// **actually borrow from the per-column `term_arena: bumpalo::Bump`**
 /// stored alongside them. The `'static` lifetime tag is a lie maintained
-/// by `unsafe` `std::mem::transmute` at insertion (see
+/// by an `unsafe` `transmute` at insertion (see
 /// [`intern_term_id`]) and kept sound by two structural invariants:
 ///
 /// 1. The arena outlives the list. [`Vocab`] declares `term_arena` last
@@ -997,7 +997,7 @@ fn intern_term_id(
         // SAFETY: see function-level doc. The `'static` tag is a lie;
         // the real lifetime is `arena`'s, which [`Vocab`] guarantees
         // outlives `id_to_term` via field drop order.
-        let static_str: ArenaStr = unsafe { std::mem::transmute(arena_str) };
+        let static_str: ArenaStr = unsafe { transmute(arena_str) };
         id_to_term.push(static_str);
     }
     (id, is_new)

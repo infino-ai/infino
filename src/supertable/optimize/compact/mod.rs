@@ -1442,23 +1442,39 @@ impl Supertable {
                     // Opening a reader verifies the whole superfile's CRC, a
                     // pass over its bytes, so the batch's outputs are opened
                     // side by side: one after another they held the commit
-                    // for a quarter of a second per gigabyte of output.
-                    thread::scope(|scope| {
-                        for prepared in &batch {
-                            let store = &opts.store;
-                            scope.spawn(move || {
-                                if let Some((uri, bytes)) = prepared.bytes_for_store.clone()
-                                    && let Err(e) = store.insert(uri, bytes)
-                                {
-                                    warn!(
-                                        superfile_id = %prepared.merged_superfile_id,
-                                        error = %e,
-                                        "compact: failed to warm reader cache for merged superfile"
-                                    );
-                                }
-                            });
-                        }
-                    });
+                    // for a quarter of a second per gigabyte of output. The
+                    // pass runs on a blocking thread, not on this task's
+                    // runtime worker, which queries and uploads share and
+                    // which would otherwise sit under the slowest output.
+                    let warms: Vec<(Uuid, SuperfileUri, Bytes)> = batch
+                        .iter()
+                        .filter_map(|prepared| {
+                            let (uri, bytes) = prepared.bytes_for_store.clone()?;
+                            Some((prepared.merged_superfile_id, uri, bytes))
+                        })
+                        .collect();
+                    let store = Arc::clone(&opts.store);
+                    let warmed = task::spawn_blocking(move || {
+                        thread::scope(|scope| {
+                            for (superfile_id, uri, bytes) in warms {
+                                let store = &store;
+                                scope.spawn(move || {
+                                    if let Err(e) = store.insert(uri, bytes) {
+                                        warn!(
+                                            %superfile_id,
+                                            error = %e,
+                                            "compact: failed to warm reader cache for merged \
+                                             superfile"
+                                        );
+                                    }
+                                });
+                            }
+                        });
+                    })
+                    .await;
+                    if let Err(error) = warmed {
+                        warn!(%error, "compact: the reader-cache warm did not finish");
+                    }
 
                     // Drop the merged-away inputs so the in-memory cache
                     // doesn't grow forever across repeated compactions.

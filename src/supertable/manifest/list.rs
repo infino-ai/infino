@@ -46,7 +46,7 @@ use crate::{
     superfile::fts::reader::ColumnLengthStats,
     supertable::{
         manifest::{
-            add_sum_arrays,
+            HEAD_BYTES, add_sum_arrays,
             bloom::Bloom,
             column_hll, column_min_max, column_sum,
             encoding::{
@@ -948,7 +948,7 @@ impl<'a> CountedStr<'a> {
 
     #[inline]
     fn tail(&self) -> &'a [u8] {
-        self.value.as_bytes().get(8..).unwrap_or_default()
+        self.value.as_bytes().get(HEAD_BYTES..).unwrap_or_default()
     }
 }
 
@@ -961,7 +961,7 @@ impl PartialEq for CountedStr<'_> {
         // column's stats.
         self.head == other.head
             && self.len == other.len
-            && (self.len <= 8 || self.tail() == other.tail())
+            && (self.len <= HEAD_BYTES || self.tail() == other.tail())
     }
 }
 

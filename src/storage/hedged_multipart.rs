@@ -11,7 +11,9 @@
 //! [`stuck_after`](super::stuck_after) its size is sent again under the same
 //! part number (see [`hedged`]); the store keeps one copy of a part number,
 //! and both copies hold the same bytes, so either answer completes the
-//! upload.
+//! upload. One upload has at most [`HEDGES_IN_FLIGHT`] second attempts out
+//! at once: on a link slow enough that every part passes its delay, a
+//! second copy of each would only compete with the first copies for it.
 
 use std::{
     fmt, mem,
@@ -24,8 +26,15 @@ use object_store::{
     multipart::{MultipartStore, PartId},
     path::Path,
 };
+use tokio::sync::Semaphore;
 
 use super::hedged;
+
+/// Second attempts one upload has in flight at once. One is enough for the
+/// case hedging is for, a part the store holds while the others land; a
+/// part that passes its delay while another's second attempt runs waits
+/// for that one to settle before it sends its own.
+const HEDGES_IN_FLIGHT: usize = 1;
 
 /// A [`MultipartUpload`] over a [`MultipartStore`] that sends a part again
 /// once it has run long enough to be taken for stuck.
@@ -35,6 +44,8 @@ pub(crate) struct HedgedUpload {
     id: String,
     /// Each part's id once it has landed, by part number.
     parts: Arc<Mutex<Vec<Option<PartId>>>>,
+    /// The permits a part's second attempt is sent under.
+    hedges: Arc<Semaphore>,
     next: usize,
 }
 
@@ -56,6 +67,7 @@ impl HedgedUpload {
             path,
             id,
             parts: Arc::new(Mutex::new(Vec::new())),
+            hedges: Arc::new(Semaphore::new(HEDGES_IN_FLIGHT)),
             next: 0,
         })
     }
@@ -66,14 +78,15 @@ impl MultipartUpload for HedgedUpload {
     fn put_part(&mut self, data: PutPayload) -> UploadPart {
         let index = self.next;
         self.next += 1;
-        let (store, path, id, parts) = (
+        let (store, path, id, parts, hedges) = (
             Arc::clone(&self.store),
             self.path.clone(),
             self.id.clone(),
             Arc::clone(&self.parts),
+            Arc::clone(&self.hedges),
         );
         Box::pin(async move {
-            let part = hedged_part(store.as_ref(), &path, &id, index, data).await?;
+            let part = hedged_part(store.as_ref(), &path, &id, index, &hedges, data).await?;
             let mut parts = parts.lock().unwrap_or_else(PoisonError::into_inner);
             if parts.len() <= index {
                 parts.resize(index + 1, None);
@@ -107,17 +120,19 @@ impl MultipartUpload for HedgedUpload {
     }
 }
 
-/// Put part `index`, sending it again once the first attempt has run
-/// [`stuck_after`](super::stuck_after) its size (see [`hedged`]).
+/// Put part `index`, sending it again under one of `hedges`' permits once
+/// the first attempt has run [`stuck_after`](super::stuck_after) its size
+/// (see [`hedged`]).
 async fn hedged_part(
     store: &dyn MultipartStore,
     path: &Path,
     id: &str,
     index: usize,
+    hedges: &Semaphore,
     data: PutPayload,
 ) -> Result<PartId> {
     let id = id.to_string();
-    hedged(data.content_length() as u64, || {
+    hedged(data.content_length() as u64, Some(hedges), || {
         store.put_part(path, &id, index, data.clone())
     })
     .await
@@ -125,12 +140,17 @@ async fn hedged_part(
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, future::pending, time::Duration};
+    use std::{
+        collections::BTreeMap,
+        future::pending,
+        sync::atomic::{AtomicUsize, Ordering as AtomicOrdering},
+        time::Duration,
+    };
 
     use bytes::Bytes;
     use futures::future::{join_all, try_join_all};
     use object_store::{MultipartId, ObjectStoreExt, memory::InMemory};
-    use tokio::time::sleep;
+    use tokio::time::{sleep, timeout};
 
     use super::*;
     use crate::{
@@ -171,18 +191,58 @@ mod tests {
         inner: InMemory,
         parts: Mutex<BTreeMap<usize, Bytes>>,
         script: Mutex<Vec<Answer>>,
+        /// When set, every part's first attempt lands after the first time
+        /// and every later attempt after the second, and the script is not
+        /// read.
+        slow: Option<(Duration, Duration)>,
         attempts: Mutex<BTreeMap<usize, usize>>,
+        /// Second or later attempts running now, and the most there were.
+        hedges_running: AtomicUsize,
+        most_hedges_running: AtomicUsize,
+    }
+
+    /// Counts one second attempt as running for as long as it lives, so an
+    /// attempt dropped unanswered stops counting too.
+    struct RunningHedge<'a>(&'a AtomicUsize);
+
+    impl<'a> RunningHedge<'a> {
+        fn start(store: &'a ScriptedStore) -> Self {
+            let running = store.hedges_running.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+            store
+                .most_hedges_running
+                .fetch_max(running, AtomicOrdering::SeqCst);
+            Self(&store.hedges_running)
+        }
+    }
+
+    impl Drop for RunningHedge<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, AtomicOrdering::SeqCst);
+        }
     }
 
     impl ScriptedStore {
         /// A store whose attempts at [`SCRIPTED_PART`] answer as `script`
         /// says, first attempt first; attempts past the script land at once.
         fn new(script: &[Answer]) -> Arc<Self> {
+            Self::build(script, None)
+        }
+
+        /// A store on which every part's first attempt lands after `first`,
+        /// and every later attempt after `again`.
+        fn slow(first: Duration, again: Duration) -> Arc<Self> {
+            Self::build(&[], Some((first, again)))
+        }
+
+        fn build(script: &[Answer], slow: Option<(Duration, Duration)>) -> Arc<Self> {
             Arc::new(Self {
                 inner: InMemory::new(),
                 parts: Mutex::new(BTreeMap::new()),
                 script: Mutex::new(script.iter().rev().copied().collect()),
+                slow,
                 attempts: Mutex::new(BTreeMap::new()),
+                hedges_running: AtomicUsize::new(0),
+                most_hedges_running: AtomicUsize::new(0),
             })
         }
 
@@ -212,15 +272,18 @@ mod tests {
             part_idx: usize,
             data: PutPayload,
         ) -> Result<PartId> {
-            *self
-                .attempts
-                .lock()
-                .expect("attempts")
-                .entry(part_idx)
-                .or_default() += 1;
-            let answer = match part_idx == SCRIPTED_PART {
-                true => self.script.lock().expect("script").pop(),
-                false => None,
+            let attempt = {
+                let mut attempts = self.attempts.lock().expect("attempts");
+                let attempt = attempts.entry(part_idx).or_default();
+                *attempt += 1;
+                *attempt
+            };
+            let _hedge = (attempt > 1).then(|| RunningHedge::start(self));
+            let answer = match (self.slow, part_idx == SCRIPTED_PART) {
+                (Some((first, _)), _) if attempt == 1 => Some(Answer::LandAfter(first)),
+                (Some((_, again)), _) => Some(Answer::LandAfter(again)),
+                (None, true) => self.script.lock().expect("script").pop(),
+                (None, false) => None,
             };
             match answer {
                 None => {}
@@ -298,6 +361,44 @@ mod tests {
         let path = Path::from("hedged/object");
         upload(&store, &path).await.expect("upload");
         assert_eq!(store.total_attempts(), PARTS + 1, "one part sent twice");
+        assert_holds_every_part(&store, &path).await;
+    }
+
+    /// A slow first attempt that lands after its hedge was sent answers the
+    /// part, though the hedge never does: the upload completes in order. The
+    /// time limit turns a wait on the held hedge into a failure, not a hang.
+    #[tokio::test(start_paused = true)]
+    async fn a_first_attempt_landing_after_the_hedge_answers_the_part() {
+        let store = ScriptedStore::new(&[
+            Answer::LandAfter(hedge_delay() + Duration::from_secs(1)),
+            Answer::Hold,
+        ]);
+        let path = Path::from("hedged/first-lands-late");
+        timeout(hedge_delay() * 10, upload(&store, &path))
+            .await
+            .expect("the first attempt answers the part without the hedge")
+            .expect("upload");
+        assert_eq!(store.attempts_at(SCRIPTED_PART), 2, "the hedge was sent");
+        assert_holds_every_part(&store, &path).await;
+    }
+
+    /// On a link slow enough that every part passes its delay, the upload
+    /// has one part's second attempt out at a time, not one for every part,
+    /// and still completes in order.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_upload_has_one_hedge_in_flight_at_a_time() {
+        let store = ScriptedStore::slow(hedge_delay() * 4, Duration::from_secs(1));
+        let path = Path::from("hedged/slow-link");
+        upload(&store, &path).await.expect("upload");
+        assert_eq!(
+            store.most_hedges_running.load(AtomicOrdering::SeqCst),
+            HEDGES_IN_FLIGHT,
+            "second attempts in flight at once"
+        );
+        assert!(
+            store.total_attempts() > PARTS,
+            "the parts past their delay were hedged"
+        );
         assert_holds_every_part(&store, &path).await;
     }
 

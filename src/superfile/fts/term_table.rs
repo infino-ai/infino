@@ -30,6 +30,11 @@ struct Slot {
 /// Terms up to this many bytes are held whole in their slot.
 const INLINE_BYTES: usize = 16;
 
+/// Slots the table allocates on its first insert. A power of two, as every
+/// capacity is; small, since a column's table may never hold more than a
+/// handful of terms, and the doubling reaches any size in a few steps.
+const INITIAL_SLOTS: usize = 16;
+
 /// The table grows before an insert once this many quarters of its slots
 /// are occupied.
 const MAX_LOAD_QUARTERS: usize = 3;
@@ -95,11 +100,12 @@ impl TermTable {
         }
     }
 
-    /// Double the capacity (16 slots at first) and reinsert every term.
+    /// Double the capacity ([`INITIAL_SLOTS`] at first) and reinsert every
+    /// term.
     #[cold]
     #[inline(never)]
     fn grow<K: AsRef<[u8]>>(&mut self, keys: &[K]) {
-        let cap = (self.slots.len() * 2).max(16);
+        let cap = (self.slots.len() * 2).max(INITIAL_SLOTS);
         let old = replace(&mut self.slots, vec![Slot::default(); cap]);
         let mask = cap - 1;
         for slot in old.into_iter().filter(|s| s.tag != 0) {
@@ -130,9 +136,19 @@ fn tag_of(n: usize) -> u32 {
     (n as u64 + 1).min(u32::MAX as u64) as u32
 }
 
+// The hash's mixing keys, XORed into each 64-bit word before it is
+// multiplied and folded: `K0` and `K1` key a term's inline words, `K2` and
+// `K3` each further 16-byte chunk. Any odd-looking constants with bits
+// spread over both halves would do; these are the first 256 bits of the
+// fraction of pi, chosen so the values are plainly not tuned to any input.
+
+/// Mixing key for the first inline word (see the note above the keys).
 const K0: u64 = 0x243f_6a88_85a3_08d3;
+/// Mixing key for the second inline word.
 const K1: u64 = 0x1319_8a2e_0370_7344;
+/// Mixing key for the first word of each chunk past the inline bytes.
 const K2: u64 = 0xa409_3822_299f_31d0;
+/// Mixing key for the second word of each chunk past the inline bytes.
 const K3: u64 = 0x082e_fa98_ec4e_6c89;
 
 /// Multiply as 128 bits and fold the halves together.

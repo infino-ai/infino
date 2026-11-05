@@ -4573,13 +4573,17 @@ macro_rules! piece_values {
     };
 }
 
-/// The first eight bytes of `bytes`, zero-padded when it is shorter: the
-/// head that [`OrderKey`] reads big-endian, for byte order, and that
-/// `list::CountedStr` reads little-endian, for equality.
+/// Bytes of a string that [`head8`] packs into one `u64`: the width of the
+/// number a string is compared by before any of its bytes are.
+const HEAD_BYTES: usize = size_of::<u64>();
+
+/// The first [`HEAD_BYTES`] bytes of `bytes`, zero-padded when it is
+/// shorter: the head that [`OrderKey`] reads big-endian, for byte order,
+/// and that `list::CountedStr` reads little-endian, for equality.
 #[inline]
-fn head8(bytes: &[u8]) -> [u8; 8] {
-    let mut head = [0u8; 8];
-    let n = bytes.len().min(8);
+fn head8(bytes: &[u8]) -> [u8; HEAD_BYTES] {
+    let mut head = [0u8; HEAD_BYTES];
+    let n = bytes.len().min(HEAD_BYTES);
     head[..n].copy_from_slice(&bytes[..n]);
     head
 }
@@ -4609,7 +4613,9 @@ impl<'a> OrderKey<'a> {
     #[inline]
     fn order(&self, other: &Self) -> Ordering {
         match self.head.cmp(&other.head) {
-            Ordering::Equal if self.bytes.len() <= 8 && other.bytes.len() <= 8 => {
+            Ordering::Equal
+                if self.bytes.len() <= HEAD_BYTES && other.bytes.len() <= HEAD_BYTES =>
+            {
                 self.bytes.len().cmp(&other.bytes.len())
             }
             Ordering::Equal => self.bytes.cmp(other.bytes),
