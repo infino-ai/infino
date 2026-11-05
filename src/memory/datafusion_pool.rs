@@ -159,6 +159,13 @@ pub(crate) fn budgeted_session_context(
     // Pinned off here because the scan's own flag is ORed with this option.
     config.options_mut().execution.parquet.pushdown_filters = false;
 
+    // Expose the `information_schema` virtual tables (`tables`, `columns`, …)
+    // so schema-introspection queries plan and run: `SHOW TABLES`,
+    // `SHOW COLUMNS`, and `SELECT ... FROM information_schema.columns`. The
+    // provider is synthesized lazily from the registered catalog, so it
+    // reflects exactly the tables registered into the session.
+    config.options_mut().catalog.information_schema = true;
+
     // DataFusion's rules, with ours at both ends:
     //  - `RowFilterUnderTopK` first, so DataFusion's filter pushdown sees the
     //    marked scans and drops their `FilterExec`.

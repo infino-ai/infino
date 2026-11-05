@@ -1941,7 +1941,7 @@ impl Supertable {
 /// looks at what the host has left, and admits another only if there is still
 /// room. A corpus twice as expensive per byte gets fewer merges in flight,
 /// with nothing to re-tune.
-const MERGE_MEMORY_RESERVE_PERCENT: u64 = 40;
+pub(crate) const MERGE_MEMORY_RESERVE_PERCENT: u64 = 40;
 
 /// How long to let an admitted merge's allocation materialize before reading
 /// memory again. Resident size lags admission, so deciding immediately would
