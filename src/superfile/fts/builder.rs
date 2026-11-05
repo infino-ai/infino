@@ -110,7 +110,7 @@ use rayon::ThreadPool;
 use tempfile::{Builder, TempDir};
 use tracing::debug;
 
-use super::term_table::TermTable;
+use super::term_table::{SLOT_BYTES_PER_TERM, TermTable};
 
 use crate::{
     config::scratch_root,
@@ -376,19 +376,34 @@ const PARTITION_BUF_SIZE: usize = 64 * 1024;
 /// accumulator. Used to drive the spill threshold; intentionally
 /// rough — the threshold is a soft budget, not a hard cap.
 ///
-/// - `24 B` per new term, plus `term.len()` for its bytes in the arena.
-/// - `8 B` per added posting: `(doc_id: u32, tf: u32)`.
+/// - [`ACCUM_NEW_TERM_FIXED_BYTES`] per new term, plus
+///   [`ACCUM_NEW_TERM_POSITIONAL_BYTES`] on a positional column, plus
+///   `term.len()` for its bytes in the arena.
+/// - [`ACCUM_POSTING_BYTES`] per added posting.
+/// - A positional column's run bytes as they are written.
 ///
-/// The per-term figure is a budget unit, not a measurement: a new id
-/// really holds a [`TermLists`] of three `Vec` headers (72 B, on a
-/// positionless column too), a 24 B [`TermTable`] slot at no more than
-/// three-quarters load, a 16 B `id_to_term` entry and a 4 B
-/// `dense_doc_tf` entry (8 B with `dense_doc_poshead`), about 130 B in
-/// all before the vectors' growth slack. Raising the constant to that
-/// would move where every column spills, so the spill threshold is to
-/// be read in these units rather than in bytes.
-const ACCUM_NEW_TERM_FIXED_BYTES: usize = 24;
-const ACCUM_POSTING_BYTES: usize = 8;
+/// What a new term holds in RAM on every column: its [`TermLists`]
+/// (three `Vec` headers, empty lists or not), its [`TermTable`] slot with
+/// that slot's share of the empty ones at the table's fullest load, its
+/// `id_to_term` entry and its `dense_doc_tf` entry. The vectors' growth
+/// slack is left out, so this is the least a term holds, not the most.
+const ACCUM_NEW_TERM_FIXED_BYTES: usize =
+    size_of::<TermLists>() + SLOT_BYTES_PER_TERM + size_of::<ArenaStr>() + size_of::<u32>();
+/// What a new term holds beyond [`ACCUM_NEW_TERM_FIXED_BYTES`] on a
+/// positional column: its `dense_doc_poshead` entry.
+const ACCUM_NEW_TERM_POSITIONAL_BYTES: usize = size_of::<u32>();
+/// One `(doc_id, tf)` posting in a term's list.
+const ACCUM_POSTING_BYTES: usize = size_of::<(u32, u32)>();
+
+/// What a new term holds in RAM, less its bytes in the arena: see
+/// [`ACCUM_NEW_TERM_FIXED_BYTES`].
+#[inline(always)]
+const fn accum_new_term_bytes(positional: bool) -> usize {
+    match positional {
+        true => ACCUM_NEW_TERM_FIXED_BYTES + ACCUM_NEW_TERM_POSITIONAL_BYTES,
+        false => ACCUM_NEW_TERM_FIXED_BYTES,
+    }
+}
 
 /// Partition size (in triples) below which the lex-rank sort uses
 /// `sort_unstable_by` instead of the counting/radix variant: under
@@ -2465,8 +2480,9 @@ impl FtsBuilder {
                     let lists = &mut ram.lists[idx];
                     let list = &mut lists.postings;
                     if list.is_empty() {
-                        new_bytes = new_bytes
-                            .saturating_add(ACCUM_NEW_TERM_FIXED_BYTES + id_to_term[idx].len());
+                        new_bytes = new_bytes.saturating_add(
+                            accum_new_term_bytes(positional) + id_to_term[idx].len(),
+                        );
                     }
                     list.push((local_doc_id, tf));
                     new_bytes = new_bytes.saturating_add(ACCUM_POSTING_BYTES);
@@ -2607,7 +2623,8 @@ impl FtsBuilder {
                 let lists = &mut ram.lists[idx];
                 let list = &mut lists.postings;
                 if list.is_empty() {
-                    new_bytes = new_bytes.saturating_add(ACCUM_NEW_TERM_FIXED_BYTES + term.len());
+                    new_bytes =
+                        new_bytes.saturating_add(accum_new_term_bytes(positional) + term.len());
                 }
                 list.push((doc_id, tf));
                 new_bytes = new_bytes.saturating_add(ACCUM_POSTING_BYTES);
@@ -5603,6 +5620,80 @@ mod tests {
             u32::from_le_bytes([blob[20], blob[21], blob[22], blob[23]]),
             0
         );
+    }
+
+    /// Distinct terms the accumulator-estimate test interns per column.
+    const ESTIMATE_TEST_TERMS: u32 = 50_000;
+    /// Distinct terms each of its documents carries.
+    const ESTIMATE_TEST_TERMS_PER_DOC: u32 = 10;
+    /// How far above the estimate the measured heap may run: the estimate
+    /// leaves out the vectors' growth slack, which at most doubles each one
+    /// and gives a one-posting list room for four.
+    const ESTIMATE_TEST_MAX_FACTOR: f64 = 2.5;
+
+    /// The new-term charge is what a term's structures take on a 64-bit
+    /// target: its three-`Vec` [`TermLists`] (72 B), its 24 B table slot with
+    /// the empty slots' share at three-quarters load (32 B), its 16 B
+    /// `id_to_term` entry and its 4 B `dense_doc_tf` entry; and 4 B more
+    /// for a positional column's `dense_doc_poshead` entry. A change to any
+    /// of those structures fails this, as a reminder that it moves where
+    /// every column spills.
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn a_new_term_is_charged_what_its_structures_take() {
+        assert_eq!(size_of::<TermLists>(), 3 * size_of::<Vec<u8>>());
+        assert_eq!(size_of::<TermLists>(), 72);
+        assert_eq!(SLOT_BYTES_PER_TERM, 32);
+        assert_eq!(size_of::<ArenaStr>(), 16);
+        assert_eq!(ACCUM_NEW_TERM_FIXED_BYTES, 72 + 32 + 16 + 4);
+        assert_eq!(accum_new_term_bytes(false), ACCUM_NEW_TERM_FIXED_BYTES);
+        assert_eq!(accum_new_term_bytes(true), ACCUM_NEW_TERM_FIXED_BYTES + 4);
+        assert_eq!(ACCUM_POSTING_BYTES, 8);
+    }
+
+    /// The in-RAM accumulator's estimate of a column that is nearly all
+    /// distinct terms, each in one document, is no more than the heap the
+    /// column's vocabulary and lists really hold, and not far below it.
+    #[test]
+    fn the_accumulator_estimate_tracks_the_heap_of_a_many_terms_column() {
+        for positional in [false, true] {
+            let mut b = FtsBuilder::new();
+            b.register_column("body".into(), positional)
+                .expect("register col");
+            for doc in 0..ESTIMATE_TEST_TERMS / ESTIMATE_TEST_TERMS_PER_DOC {
+                let text: Vec<String> = (0..ESTIMATE_TEST_TERMS_PER_DOC)
+                    .map(|i| format!("term{:07}", doc * ESTIMATE_TEST_TERMS_PER_DOC + i))
+                    .collect();
+                b.add_doc(0, doc, &text.join(" ")).expect("add doc");
+            }
+            let ColumnPostings { vocab, store } = &b.postings[0];
+            let PostingStore::Ram(ram) = store else {
+                panic!("the column must stay in RAM");
+            };
+            assert_eq!(vocab.len(), ESTIMATE_TEST_TERMS as usize);
+            let lists: usize = ram
+                .lists
+                .iter()
+                .map(|l| {
+                    l.postings.capacity() * size_of::<(u32, u32)>()
+                        + l.runs.capacity()
+                        + l.run_ends.capacity() * size_of::<u32>()
+                })
+                .sum();
+            let measured = ram.lists.capacity() * size_of::<TermLists>()
+                + lists
+                + vocab.term_to_id.heap_bytes()
+                + vocab.id_to_term.capacity() * size_of::<ArenaStr>()
+                + (vocab.dense_doc_tf.capacity() + vocab.dense_doc_poshead.capacity())
+                    * size_of::<u32>()
+                + vocab.term_arena.allocated_bytes();
+            let estimate = ram.bytes;
+            assert!(
+                estimate <= measured
+                    && measured as f64 <= ESTIMATE_TEST_MAX_FACTOR * estimate as f64,
+                "positional={positional}: estimate {estimate} B, measured {measured} B"
+            );
+        }
     }
 
     #[test]

@@ -30,12 +30,22 @@ struct Slot {
 /// Terms up to this many bytes are held whole in their slot.
 const INLINE_BYTES: usize = 16;
 
+/// The table grows before an insert once this many quarters of its slots
+/// are occupied.
+const MAX_LOAD_QUARTERS: usize = 3;
+
+/// Slot bytes a term holds when the table is at its fullest, the moment
+/// before it grows: one slot of its own, and its share of the empty ones.
+/// Right after a doubling a term holds twice that.
+pub(crate) const SLOT_BYTES_PER_TERM: usize = size_of::<Slot>() * 4 / MAX_LOAD_QUARTERS;
+
 pub(crate) struct TermTable {
     /// Power-of-two length (or empty before the first insert).
     slots: Vec<Slot>,
     /// Occupied slots.
     len: usize,
-    /// Grow before an insert once `len` reaches this (3/4 of capacity).
+    /// Grow before an insert once `len` reaches this
+    /// ([`MAX_LOAD_QUARTERS`] quarters of capacity).
     grow_at: usize,
 }
 
@@ -105,7 +115,13 @@ impl TermTable {
             }
             self.slots[i] = slot;
         }
-        self.grow_at = cap / 4 * 3;
+        self.grow_at = cap / 4 * MAX_LOAD_QUARTERS;
+    }
+
+    /// Bytes the slot array holds.
+    #[cfg(test)]
+    pub(crate) fn heap_bytes(&self) -> usize {
+        self.slots.capacity() * size_of::<Slot>()
     }
 }
 
