@@ -661,7 +661,9 @@ async fn the_background_retry_finishes_a_deferred_wal() {
     assert_true_counts(&stats);
 
     let waited_from = Instant::now();
-    while !table.inner().unfinished_wals.pending().is_empty() {
+    // Settled, not merely an empty list: the retry takes the WAL off the
+    // list before it records the deleted set.
+    while !table.inner().unfinished_wals.settled() {
         assert!(
             waited_from.elapsed() < BACKGROUND_FINISH_WAIT,
             "the background retry never finished the WAL"

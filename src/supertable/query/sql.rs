@@ -99,6 +99,7 @@ use crate::{
             range_top_k::RangeTopK,
         },
         reader_cache::disk::ForegroundQueryGuard,
+        schema::sql_schema,
         tombstones::SidecarCache,
     },
 };
@@ -133,8 +134,9 @@ impl SqlSchemas {
 pub(crate) fn build_sql_schemas(manifest: &ManifestSnapshot) -> SqlSchemas {
     // Stored shape: index-only FTS columns are absent from Parquet, so
     // SQL never sees them — selecting or filtering one fails at plan
-    // time like any unknown column.
-    let scalar = manifest.stored_schema();
+    // time like any unknown column. Field ids stay out of what SQL plans
+    // against (`sql_schema`).
+    let scalar = sql_schema(manifest.stored_schema());
     let fts_configs = manifest.fts_configs();
     let fts: HashSet<&str> = fts_configs.iter().map(|c| c.column.as_str()).collect();
     let scan = view_string_schema(&scalar, &fts);
