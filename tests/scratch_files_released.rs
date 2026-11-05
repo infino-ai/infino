@@ -11,6 +11,13 @@
 //! no destructors. Each run of a long ingest left a scratch file per
 //! superfile behind that way.
 //!
+//! An optimize's commits drop what they are done with — the merges' term
+//! contributions, files in the scratch directory, and the term-index layer
+//! built from them — on threads of their own, and the optimize joins them
+//! before it returns. The child watches the scratch directory while the
+//! optimize runs, so the check after it is known to have had files to see
+//! unlinked.
+//!
 //! The work runs in a child copy of this binary with the scratch directory
 //! pointed at a fresh one, so the check covers the process ending too, and
 //! nothing else in the process writes there. One test, its own binary.
@@ -22,7 +29,12 @@ use std::{
     env, fs,
     path::{Path, PathBuf},
     process::Command,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+    thread,
+    time::Duration,
 };
 
 use infino::{
@@ -42,6 +54,8 @@ const ROWS_PER_APPEND: usize = 2000;
 const VOCAB: usize = 97;
 /// Superfiles that make a merge: every append's, so the optimize merges.
 const MERGE_AT: u64 = 2;
+/// How often the child looks at the scratch directory while it optimizes.
+const WATCH_EVERY: Duration = Duration::from_micros(200);
 /// Suffix of a superfile object in the table's storage directory.
 const SUPERFILE_SUFFIX: &str = ".sf.parquet";
 /// This test's name, which the child is filtered to.
@@ -53,6 +67,17 @@ fn entries(dir: &Path) -> Vec<PathBuf> {
         .expect("read the scratch directory")
         .map(|entry| entry.expect("scratch directory entry").path())
         .collect()
+}
+
+/// The files under `dir`, at any depth; none for a directory already gone.
+fn files_under(dir: &Path) -> usize {
+    let Ok(read) = fs::read_dir(dir) else {
+        return 0;
+    };
+    read.filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .map(|path| if path.is_dir() { files_under(&path) } else { 1 })
+        .sum()
 }
 
 /// The superfile objects under `dir`, at any depth.
@@ -105,15 +130,30 @@ fn run_child(data: &Path) {
         min_superfiles_for_merge: MERGE_AT,
         ..CompactionSettings::default()
     };
-    table
-        .optimize(&OptimizeOptions::compact(settings))
-        .expect("optimize");
+    // The most scratch files the optimize held at once.
+    let held = AtomicUsize::new(0);
+    let optimizing = AtomicBool::new(true);
+    thread::scope(|scope| {
+        scope.spawn(|| {
+            while optimizing.load(Ordering::Acquire) {
+                held.fetch_max(files_under(&scratch), Ordering::Relaxed);
+                thread::sleep(WATCH_EVERY);
+            }
+        });
+        let optimized = table.optimize(&OptimizeOptions::compact(settings));
+        optimizing.store(false, Ordering::Release);
+        optimized.expect("optimize");
+    });
+    assert!(
+        held.load(Ordering::Relaxed) > 0,
+        "the optimize spilled scratch files, so the check below has some to see unlinked"
+    );
     // The merged inputs are reclaimed later; the merge's output is here now.
     assert_eq!(superfiles_under(data), APPENDS + 1, "the optimize merged");
     assert_eq!(
         entries(&scratch),
         Vec::<PathBuf>::new(),
-        "the optimize's merged superfiles keep no scratch file"
+        "the optimize unlinked its scratch files before it returned"
     );
 }
 
