@@ -48,6 +48,7 @@ use crate::{
             match_exec::{EXACT_MATCH_UDTF, ExactMatchFunc, TOKEN_MATCH_UDTF, TokenMatchFunc},
             vector_exec::{VECTOR_SEARCH_UDTF, VectorSearchFunc},
         },
+        schema::sql_schema,
     },
 };
 
@@ -133,9 +134,10 @@ impl TableResolver {
         let resolved = ResolvedTable {
             // Stored shape: search TVF output columns resolve against
             // what Parquet actually holds (index-only FTS columns are
-            // not projectable). The same schema the table's own SQL binds
-            // its search functions to, so field ids stay out of the plan.
-            scalar_schema: reader.sql_schemas().scalar().clone(),
+            // not projectable). Built from this reader's own snapshot, so a
+            // schema change landing after `reader()` cannot name columns the
+            // reader lacks, and with field ids kept out of the plan.
+            scalar_schema: sql_schema(reader.manifest().stored_schema()),
             reader: Arc::new(reader),
         };
         self.cache
