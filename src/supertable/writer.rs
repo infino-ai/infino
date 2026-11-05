@@ -16974,6 +16974,13 @@ mod tests {
 
     /// Storage-attached table with a drained hidden index across two cells.
     fn drained_hidden_two_cells() -> (TempDir, Supertable, Arc<Supertable>) {
+        drained_hidden_two_cells_in_waves(1)
+    }
+
+    /// [`drained_hidden_two_cells`], with the same rows committed and
+    /// drained `waves` times, so the hidden index holds one wave of
+    /// superfiles per drain.
+    fn drained_hidden_two_cells_in_waves(waves: usize) -> (TempDir, Supertable, Arc<Supertable>) {
         let dim = 16usize;
         let item_field = Arc::new(Field::new("item", DataType::Float32, true));
         let schema = Arc::new(Schema::new(vec![
@@ -17027,10 +17034,13 @@ mod tests {
             vec![Arc::new(titles) as Arc<dyn Array>, Arc::new(fsl)],
         )
         .expect("batch");
-        let mut w = st.writer().expect("writer");
-        w.append(&batch).expect("append");
-        w.commit().expect("commit");
-        st.drain_vectors_to_cells_sync().expect("drain to cells");
+        for _ in 0..waves {
+            let mut w = st.writer().expect("writer");
+            w.append(&batch).expect("append");
+            w.commit().expect("commit");
+            drop(w);
+            st.drain_vectors_to_cells_sync().expect("drain to cells");
+        }
 
         let hidden = st
             .reader()
@@ -17093,6 +17103,43 @@ mod tests {
         for entry in manifest.superfiles.iter() {
             let from_summary =
                 cell_doc_counts_from_summary(&inner, entry, None).expect("drained summary");
+            let from_reader = hidden
+                .block_on_query(cell_doc_counts_via_reader(&inner, entry, None))
+                .expect("reader counts");
+            assert_eq!(from_summary, from_reader);
+        }
+    }
+
+    /// The same order holds for hidden superfiles a compaction merge wrote:
+    /// two drain waves, merged by `optimize`, still list their cells in the
+    /// reader's order with the reader's row counts.
+    #[test]
+    fn cell_doc_counts_from_summary_match_the_reader_after_a_merge() {
+        /// Drain waves before the merge.
+        const WAVES: usize = 2;
+        /// Merge target small enough that every wave qualifies.
+        const TARGET_MB: u64 = 1;
+        /// Fill floor low enough that every wave qualifies.
+        const MIN_FILL_PERCENT: u8 = 1;
+
+        let (_dir, st, hidden) = drained_hidden_two_cells_in_waves(WAVES);
+        let before = hidden.reader().expect("reader").manifest().superfiles.len();
+        st.optimize(&OptimizeOptions::compact(CompactionSettings {
+            target_superfile_size_mb: TARGET_MB,
+            min_fill_percent: MIN_FILL_PERCENT,
+            ..CompactionSettings::default()
+        }))
+        .expect("optimize");
+        let inner = Arc::clone(hidden.inner());
+        let manifest = Arc::clone(hidden.reader().expect("reader").manifest());
+        assert!(
+            manifest.superfiles.len() < before,
+            "fixture: the merge must rewrite the waves ({before} -> {})",
+            manifest.superfiles.len()
+        );
+        for entry in manifest.superfiles.iter() {
+            let from_summary =
+                cell_doc_counts_from_summary(&inner, entry, None).expect("merged summary");
             let from_reader = hidden
                 .block_on_query(cell_doc_counts_via_reader(&inner, entry, None))
                 .expect("reader counts");

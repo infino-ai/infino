@@ -586,23 +586,35 @@ fn wave_read_rows(
         .sum()
 }
 
-/// Every fine cluster of each cell that holds an allowed row, as
-/// `(superfile index, flat cluster)`. `None` when those cells hold more
-/// than `max_rows` rows, or a summary is missing, so the caller routes as
-/// usual.
+/// A live (not superseded) summary cell of a superfile that holds allowed
+/// rows, from [`allowed_cells`].
+struct AllowedCell {
+    /// Index into the fan-out's superfile list.
+    superfile: usize,
+    cell_id: Option<u32>,
+    /// First flat cluster id of the cell.
+    flat_base: u32,
+    /// Fine clusters in the cell.
+    n_cent: u32,
+    /// Rows the cell indexes.
+    rows: u64,
+    /// Allowed rows in the cell.
+    matches: u64,
+}
+
+/// Every live cell of each superfile in `allow`, with its allowed row
+/// count. `None` when a summary is missing, so the caller routes as usual.
 ///
 /// A cell's file-local ids follow the cells in directory order, as the
 /// summary lists them, and its flat cluster ids follow the same order (see
 /// `score_fine_candidates`).
-fn matching_cell_clusters(
+fn allowed_cells(
     superfiles: &[Arc<SuperfileEntry>],
     column: FieldId,
     allow: &HashMap<SuperfileUri, Arc<RoaringBitmap>>,
     superseded: &BTreeMap<Uuid, BTreeSet<u32>>,
-    max_rows: u64,
-) -> Option<Vec<(usize, u32)>> {
-    let mut clusters = Vec::new();
-    let mut read_rows = 0u64;
+) -> Option<Vec<AllowedCell>> {
+    let mut cells = Vec::new();
     for (si, entry) in superfiles.iter().enumerate() {
         let Some(bm) = allow.get(&entry.uri) else {
             continue;
@@ -611,21 +623,80 @@ fn matching_cell_clusters(
         let mut doc_base = 0u32;
         let mut flat_base = 0u32;
         for cell in &summary.cells {
-            let n_docs = u32::try_from(cell_rows(cell)).ok()?;
-            let doc_end = doc_base.checked_add(n_docs)?;
+            let rows = cell_rows(cell);
+            let doc_end = doc_base.checked_add(u32::try_from(rows).ok()?)?;
             let n_cent = cell.clusters.n_cent;
-            if !cell_is_superseded(superseded, entry.superfile_id, cell.cell_id)
-                && bm.range_cardinality(doc_base..doc_end) > 0
-            {
-                read_rows += u64::from(n_docs);
-                if read_rows > max_rows {
-                    return None;
-                }
-                clusters.extend((flat_base..flat_base.saturating_add(n_cent)).map(|c| (si, c)));
+            if !cell_is_superseded(superseded, entry.superfile_id, cell.cell_id) {
+                cells.push(AllowedCell {
+                    superfile: si,
+                    cell_id: cell.cell_id,
+                    flat_base,
+                    n_cent,
+                    rows,
+                    matches: bm.range_cardinality(doc_base..doc_end),
+                });
             }
             doc_base = doc_end;
             flat_base = flat_base.saturating_add(n_cent);
         }
+    }
+    Some(cells)
+}
+
+/// Allowed rows per cell id, summed over superfiles. Cells without an
+/// allowed row are left out.
+fn matching_rows_by_cell(cells: &[AllowedCell]) -> HashMap<u32, u64> {
+    let mut by_cell = HashMap::new();
+    for cell in cells.iter().filter(|c| c.matches > 0) {
+        if let Some(id) = cell.cell_id {
+            *by_cell.entry(id).or_default() += cell.matches;
+        }
+    }
+    by_cell
+}
+
+/// returns the k value that a filtered vector search should use. This is needed
+/// because in case of filtered vector searches, each cell has less matches
+/// compared to an unfiltered vector search. To account for this, the `k` is scaled
+/// based on the selectivity of a filter. A sparse filter ( 0.1% - 1 match for
+/// every 1000 rows) causes a greater increase in k ( 1000 ). A dense filter ( 10% -
+/// 10 results every 100 rows) causes a smaller increase in k ( 10 ).
+fn filtered_k(k: usize, matches: u64, rows: u64) -> usize {
+    if matches == 0 {
+        return k;
+    }
+    let scaled = (k as u64).saturating_mul(rows).div_ceil(matches);
+    usize::try_from(scaled).unwrap_or(usize::MAX).max(k)
+}
+
+/// The k a filtered query reads the width and depth laws at:
+/// [`filtered_k`] over `matching` (allowed rows per cell) and every live
+/// row of `superfiles`. Each drain wave puts its rows into the same cells,
+/// so a superfile without matches still fills the cells the search reads.
+fn filtered_route_k(
+    superfiles: &[Arc<SuperfileEntry>],
+    column: FieldId,
+    superseded: &BTreeMap<Uuid, BTreeSet<u32>>,
+    matching: &HashMap<u32, u64>,
+    k: usize,
+) -> usize {
+    let (all_rows, _) = postings_by_cell_from_summaries(superfiles, column, None, superseded);
+    filtered_k(k, matching.values().sum(), all_rows.values().sum())
+}
+
+/// Every fine cluster of each cell that holds an allowed row, as
+/// `(superfile index, flat cluster)`. `None` when those cells hold more
+/// than `max_rows` rows, so the caller routes as usual.
+fn matching_cell_clusters(cells: &[AllowedCell], max_rows: u64) -> Option<Vec<(usize, u32)>> {
+    let mut clusters = Vec::new();
+    let mut read_rows = 0u64;
+    for cell in cells.iter().filter(|c| c.matches > 0) {
+        read_rows += cell.rows;
+        if read_rows > max_rows {
+            return None;
+        }
+        let end = cell.flat_base.saturating_add(cell.n_cent);
+        clusters.extend((cell.flat_base..end).map(|c| (cell.superfile, c)));
     }
     Some(clusters)
 }
@@ -5553,33 +5624,52 @@ impl SupertableReader {
         let (postings_by_cell, any_tagged) = op_stats::timed_kernel(&self.op_stats, || {
             postings_by_cell_from_summaries(&superfiles, column_id, allow_ref, superseded)
         });
-        // Filtered search on the hidden index: when the cells holding
-        // matching rows are no bigger a read than the routed search, probe
-        // every cluster of those cells instead of the cells near the query.
-        // An explicit caller `nprobe` keeps the routed search.
-        let matching_cells = match allow_ref {
+        // Filtered search on the hidden index, with no caller `nprobe`:
+        // the live cells of the superfiles holding matches, and their
+        // matching rows.
+        let allowed = match allow_ref {
             Some(allow) if hidden_vector_index && options.nprobe.is_none() => {
                 op_stats::timed_kernel(&self.op_stats, || {
-                    let routed_rows = match stamped_law_width(hidden_routing, k) {
-                        Some(width) => law_read_rows(&postings_by_cell, width),
-                        None => wave_read_rows(
-                            &superfiles,
-                            column_id,
-                            allow,
-                            superseded,
-                            hidden_routing
-                                .map_or(FILTERED_HIDDEN_FINE_NPROBE, |r| filtered_fine_floor(r, k)),
-                        ),
-                    };
-                    matching_cell_clusters(
+                    allowed_cells(&superfiles, column_id, allow, superseded)
+                })
+            }
+            _ => None,
+        };
+        // Empty when every match sits in an untagged cell: route as usual.
+        let matching_by_cell = allowed
+            .as_deref()
+            .map(matching_rows_by_cell)
+            .filter(|m| !m.is_empty());
+        // The k nearest matching rows sit as far out as the `k_route`
+        // nearest rows, so the width and depth laws are read at `k_route`.
+        let k_route = match &matching_by_cell {
+            Some(matching) => op_stats::timed_kernel(&self.op_stats, || {
+                filtered_route_k(&superfiles, column_id, superseded, matching, k)
+            }),
+            None => k,
+        };
+        // When the cells holding matching rows are no bigger a read than
+        // the routed search, probe every cluster of those cells instead of
+        // the cells near the query.
+        let matching_cells = match (allow_ref, allowed.as_deref()) {
+            (Some(allow), Some(cells)) => op_stats::timed_kernel(&self.op_stats, || {
+                let routed_rows = match stamped_law_width(hidden_routing, k_route) {
+                    Some(width) => law_read_rows(&postings_by_cell, width),
+                    None => wave_read_rows(
                         &superfiles,
                         column_id,
                         allow,
                         superseded,
-                        routed_rows.saturating_mul(MATCHING_CELLS_READ_FACTOR),
-                    )
-                })
-            }
+                        hidden_routing.map_or(FILTERED_HIDDEN_FINE_NPROBE, |r| {
+                            filtered_fine_floor(r, k_route)
+                        }),
+                    ),
+                };
+                matching_cell_clusters(
+                    cells,
+                    routed_rows.saturating_mul(MATCHING_CELLS_READ_FACTOR),
+                )
+            }),
             _ => None,
         };
 
@@ -5615,7 +5705,7 @@ impl SupertableReader {
                     CellRoutingParams {
                         nprobe_min: base.nprobe_min.max(FILTERED_HIDDEN_CELL_NPROBE),
                         nprobe_max: base.nprobe_max.max(FILTERED_HIDDEN_CELL_NPROBE),
-                        fine_nprobe: filtered_fine_floor(base, k),
+                        fine_nprobe: filtered_fine_floor(base, k_route),
                         ..base
                     }
                 } else {
@@ -5707,7 +5797,7 @@ impl SupertableReader {
             // Cohere: 0.793 at 200K falling to 0.630 at 9.4M as cells grow,
             // against 0.997 unfiltered on the same table).
             if hidden_vector_index
-                && let Some(fine) = hidden_routing.and_then(|r| r.fine_for_k_at(k))
+                && let Some(fine) = hidden_routing.and_then(|r| r.fine_for_k_at(k_route))
             {
                 cell_routing.fine_nprobe = cell_routing.fine_nprobe.max(fine);
             }
@@ -5722,7 +5812,7 @@ impl SupertableReader {
             // `law_default`, which keeps its `!filtered` condition, so no
             // extension cells are added for filtered.
             let law_width: Option<usize> = if hidden_vector_index && options.nprobe.is_none() {
-                stamped_law_width(hidden_routing, k)
+                stamped_law_width(hidden_routing, k_route)
             } else {
                 None
             };
@@ -5767,9 +5857,12 @@ impl SupertableReader {
             // file for why this is a config default and not a drain
             // stamp.
             let serve_near_tie_slack = config::global().vector.serve_near_tie_slack;
+            // Rows per cell the cutoff counts: matching rows when routing by
+            // matches (cells without one are dropped), else all rows.
+            let cell_counts = matching_by_cell.as_ref().unwrap_or(&postings_by_cell);
             let ranked_for_beam: Vec<(u32, f32)> = ranked_scored
                 .iter()
-                .filter(|(cell, _)| postings_by_cell.contains_key(cell))
+                .filter(|(cell, _)| cell_counts.contains_key(cell))
                 .copied()
                 .collect();
             if ranked_for_beam.is_empty() {
@@ -5789,7 +5882,7 @@ impl SupertableReader {
             // hold `k`. An explicit caller `nprobe` is a deliberate width
             // constraint and is left untouched even when it under-fills `k`.
             let cutoff = if options.nprobe.is_none() {
-                cover_k_cell_cutoff(cutoff, &ranked_for_beam, &postings_by_cell, k)
+                cover_k_cell_cutoff(cutoff, &ranked_for_beam, cell_counts, k)
             } else {
                 cutoff
             };
@@ -5806,7 +5899,7 @@ impl SupertableReader {
                 .collect();
             // Round 0: the pre-#515 write-window slice plus the grid's
             // must-include picks, exactly scored.
-            let admit_ranking = op_stats::timed_kernel(&self.op_stats, || {
+            let mut admit_ranking = op_stats::timed_kernel(&self.op_stats, || {
                 estimate_admit_ranking(
                     &superfiles,
                     column,
@@ -5818,6 +5911,10 @@ impl SupertableReader {
                     superseded,
                 )
             })?;
+            // Cells without a matching row take no admit slot.
+            if let Some(matching) = &matching_by_cell {
+                admit_ranking.retain(|(cell, _)| matching.contains_key(cell));
+            }
             // Round-0 exact-score shortlist: anchor to the stamped
             // (target-aware) width when the law is serving; the fixed
             // fraction/floor is the legacy fallback for unstamped tables.
@@ -8369,6 +8466,7 @@ mod tests {
     use async_trait::async_trait;
     use bytes::Bytes;
     use rand::{RngExt, SeedableRng, rngs::StdRng};
+    use roaring::RoaringBitmap;
 
     use super::IndexOutcome;
     use crate::{
@@ -8396,15 +8494,17 @@ mod tests {
     use super::{
         CentroidRouterGraph, IndexUnavailable, RABITQ_ADMIT_CELL_SHORTLIST_MIN, ReadIntent,
         SCORE_COLUMN, ScanCandidate, VectorFilter, VectorSearchOptions, admit_extension_round,
-        admit_shortlist_window, apply_width_pin, assemble_flat_sections, assemble_hnsw_sections,
-        build_centroid_router, calibrated_query_for, cells_ranked_by_fine_score,
-        decode_centroid_router_section, dispatch, encode_centroid_router_section, free_column_slot,
+        admit_shortlist_window, allowed_cells, apply_width_pin, assemble_flat_sections,
+        assemble_hnsw_sections, build_centroid_router, calibrated_query_for,
+        cells_ranked_by_fine_score, decode_centroid_router_section, dispatch,
+        encode_centroid_router_section, filtered_k, filtered_route_k, free_column_slot,
         free_columns_unambiguous, gate_fine_candidates_by_fragment, gfc_prepare_for_metric,
         gfc_unit_normalize, hidden_hits_user_ids, id_score_projection_indices,
         id_values_from_batch, is_hidden_vector_manifest, law_floor_serve_selection, law_read_rows,
-        lookup_user_placements_by_id, matching_cell_clusters, postings_by_cell_from_summaries,
-        read_ids_for_locals, rerank_mult_from_law, score_fine_candidates, select_global_shortlist,
-        take_rows_byte_source, union_cell_selection, wave_read_rows,
+        lookup_user_placements_by_id, matching_cell_clusters, matching_rows_by_cell,
+        postings_by_cell_from_summaries, read_ids_for_locals, rerank_mult_from_law,
+        score_fine_candidates, select_global_shortlist, take_rows_byte_source,
+        union_cell_selection, wave_read_rows,
     };
     use crate::{
         BoolMode, InfinoError,
@@ -10779,7 +10879,9 @@ mod tests {
         };
         let none = BTreeMap::new();
         let clusters = |ids: &[u32], superseded: &BTreeMap<Uuid, BTreeSet<u32>>| {
-            matching_cell_clusters(&entries, fid("emb"), &allow_of(ids), superseded, u64::MAX)
+            let cells = allowed_cells(&entries, fid("emb"), &allow_of(ids), superseded)
+                .expect("summaries present");
+            matching_cell_clusters(&cells, u64::MAX)
         };
 
         // Id 4 is the last row of cell 1; id 5 is the first row of cell 2.
@@ -10802,9 +10904,77 @@ mod tests {
         // Ids 4 and 6 touch cells 1 and 2: 5 + 4 = 9 rows read.
         let allow = HashMap::from([(entries[0].uri, Arc::new([4u32, 6].into_iter().collect()))]);
         let none = BTreeMap::new();
-        let read = |max_rows| matching_cell_clusters(&entries, fid("emb"), &allow, &none, max_rows);
-        assert_eq!(read(9), Some(vec![(0, 0), (0, 1), (0, 2)]));
-        assert_eq!(read(8), None);
+        let cells = allowed_cells(&entries, fid("emb"), &allow, &none).expect("summaries present");
+        assert_eq!(
+            matching_cell_clusters(&cells, 9),
+            Some(vec![(0, 0), (0, 1), (0, 2)])
+        );
+        assert_eq!(matching_cell_clusters(&cells, 8), None);
+    }
+
+    /// Matching rows are counted per cell id and summed over superfiles;
+    /// a superseded cell is left out but its ids still take their range,
+    /// and a superfile without allowed rows is not read.
+    #[test]
+    fn matching_rows_by_cell_counts_allowed_rows_per_cell() {
+        let (a, b) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        let entries = vec![three_cell_entry(a), three_cell_entry(b)];
+        let none = BTreeMap::new();
+        let counts = |allow: &HashMap<SuperfileUri, Arc<RoaringBitmap>>,
+                      superseded: &BTreeMap<Uuid, BTreeSet<u32>>| {
+            let cells =
+                allowed_cells(&entries, fid("emb"), allow, superseded).expect("summaries present");
+            matching_rows_by_cell(&cells)
+        };
+
+        // Ids 3, 4 sit in cell 1 and id 6 in cell 2; cell 3 has none.
+        let one = HashMap::from([(entries[0].uri, Arc::new([3u32, 4, 6].into_iter().collect()))]);
+        assert_eq!(counts(&one, &none), HashMap::from([(1, 2), (2, 1)]));
+
+        // Cell 1 superseded: id 6 still maps to cell 2.
+        let superseded = BTreeMap::from([(a, BTreeSet::from([1u32]))]);
+        assert_eq!(counts(&one, &superseded), HashMap::from([(2, 1)]));
+
+        // The same cell in two superfiles sums.
+        let both = HashMap::from([
+            (entries[0].uri, Arc::new([6u32].into_iter().collect())),
+            (entries[1].uri, Arc::new([5u32, 10].into_iter().collect())),
+        ]);
+        assert_eq!(counts(&both, &none), HashMap::from([(2, 2), (3, 1)]));
+    }
+
+    /// Selectivity counts the rows of superfiles without matches too: a
+    /// base wave with no match and a delta wave with every row matching
+    /// share cells, so the query faces both.
+    #[test]
+    fn filtered_route_k_counts_superfiles_without_matches() {
+        let entries = vec![
+            three_cell_entry(Uuid::from_u128(1)),
+            three_cell_entry(Uuid::from_u128(2)),
+        ];
+        let none = BTreeMap::new();
+        // All 11 rows of the second superfile match; the first has 11 more.
+        let matching = HashMap::from([(1u32, 5u64), (2, 4), (3, 2)]);
+        assert_eq!(
+            filtered_route_k(&entries, fid("emb"), &none, &matching, 10),
+            20
+        );
+        // A superseded cell's rows don't count.
+        let superseded = BTreeMap::from([(Uuid::from_u128(1), BTreeSet::from([1u32]))]);
+        assert_eq!(
+            filtered_route_k(&entries, fid("emb"), &superseded, &matching, 11),
+            17
+        );
+    }
+
+    /// The routing k is `k / selectivity`, never below `k`.
+    #[test]
+    fn filtered_k_scales_by_inverse_selectivity() {
+        assert_eq!(filtered_k(10, 128, 2048), 160);
+        assert_eq!(filtered_k(10, 3, 10), 34, "rounded up");
+        assert_eq!(filtered_k(10, 100, 100), 10, "every row matches");
+        assert_eq!(filtered_k(10, 0, 100), 10, "no match");
+        assert_eq!(filtered_k(usize::MAX, 1, u64::MAX), usize::MAX);
     }
 
     /// The law read estimate is the law width times the average cell size,
