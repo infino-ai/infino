@@ -3247,7 +3247,10 @@ mod tests {
         for (i, (_, bytes)) in m.slices.iter().enumerate() {
             let bytes = bytes_of(bytes);
             let slice = Slice::open(&bytes).expect("open");
-            for (key, run) in slice.terms_after(None, usize::MAX).expect("terms") {
+            for (key, run) in slice
+                .terms_after(None, usize::MAX, usize::MAX)
+                .expect("terms")
+            {
                 let mut entries: Vec<tier::TierEntry> = match &run.tier {
                     None => Vec::new(),
                     Some(t) if t.chunks.is_empty() => t.inline.clone(),
@@ -4325,6 +4328,54 @@ mod tests {
             .expect("runs")
             .remove(0);
         assert!(runs.len() == 1 && runs[0].run.legacy_bound && runs[0].tier_object.is_none());
+    }
+
+    /// A merge cursor's decoded batch stays within the memory a fold plans
+    /// per cursor, however many superfiles each of its terms spans.
+    #[test]
+    fn a_merge_cursor_batch_fits_the_fold_budget_per_cursor() {
+        const SUPERFILES: u128 = 64;
+        const TERMS: usize = 4096;
+        let dir = TempDir::new().expect("tempdir");
+        let names: Vec<String> = (0..TERMS).map(|t| format!("t{t:05}")).collect();
+        let terms: Vec<(&str, &str, u64)> = names.iter().map(|t| ("body", t.as_str(), 2)).collect();
+        let contributions: Vec<Contribution> = (0..SUPERFILES)
+            .map(|id| contribution(&dir, id, &terms))
+            .collect();
+        let policy = BuildPolicy::default();
+        let built = build(&contributions, &policy).expect("build");
+        let files: Vec<build::SliceFile> = built.root.layers[0]
+            .slices
+            .iter()
+            .map(|slice| {
+                let (_, bytes) = built
+                    .slices
+                    .iter()
+                    .find(|(hash, _)| *hash == slice.content_hash)
+                    .expect("the build holds the slice");
+                let path = dir
+                    .path()
+                    .join(format!("{}.slice", slice.content_hash.to_hex()));
+                fs::write(&path, bytes_of(bytes)).expect("place slice");
+                build::SliceFile {
+                    path,
+                    first_key: slice.first_key.clone(),
+                    last_key: slice.last_key.clone(),
+                    base: 0,
+                }
+            })
+            .collect();
+        let mut cursor = build::LayerCursor::new(&files, None, None, policy.tier_read_window_bytes);
+        let (mut seen, mut peak) = (0, 0);
+        while cursor.next().expect("next").is_some() {
+            seen += 1;
+            peak = peak.max(cursor.decoded_bytes());
+        }
+        assert_eq!(seen, TERMS);
+        assert!(
+            peak as u64 <= FOLD_CURSOR_BYTES,
+            "a batch held {peak} bytes decoded"
+        );
     }
 
     /// A merge that rewrites a layer of the layout before tiers writes
@@ -9842,7 +9893,7 @@ mod tests {
         let bytes = bytes_of(&built.slices[0].1);
         let terms = Slice::open(&bytes)
             .expect("open")
-            .terms_after(None, usize::MAX)
+            .terms_after(None, usize::MAX, usize::MAX)
             .expect("terms");
         let dictionary = format::SliceDictionary::open(&bytes).expect("dictionary");
         let starts = dictionary.block_starts().expect("starts");

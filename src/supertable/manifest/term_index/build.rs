@@ -43,7 +43,7 @@ use tracing::debug;
 use uuid::Uuid;
 
 use super::{
-    TermIndexError,
+    FOLD_CURSOR_BYTES, TermIndexError,
     format::{
         Layer, Location, Posting, Root, Run, SLICE_HEADER_LEN, Slice, SliceDictionary, SliceRef,
         TierRef, encode_run, encode_slice, legacy_bound_as_key, push_posting, read_posting,
@@ -1868,6 +1868,11 @@ fn build_range(
 /// slice decoded.
 const MERGE_BATCH_TERMS: usize = 4096;
 
+/// Decoded bytes a merge cursor's batch holds at most: half of what a fold
+/// plans per cursor, leaving the rest for its tier windows. A term whose run
+/// alone is larger is still decoded whole.
+const MERGE_BATCH_BYTES: usize = (FOLD_CURSOR_BYTES / 2) as usize;
+
 /// A slice on local disk, with the key range its layer records for it,
 /// so a merge can be range-cut and its sources selected without opening
 /// a slice.
@@ -1899,7 +1904,7 @@ fn map_file(path: &Path) -> io::Result<Bytes> {
 
 /// Reads one layer's slices, already on local disk, term by term in key
 /// order.
-struct LayerCursor {
+pub(super) struct LayerCursor {
     /// What the ordinals in the files are relative to: their layer's base.
     base: u32,
     /// Slice files not opened yet, in key order.
@@ -1941,7 +1946,7 @@ impl LayerCursor {
     /// A cursor over `files` in key order, yielding the keys in
     /// `start..end` (either bound open when `None`), reading tier objects
     /// in windows of at least `window_bytes`.
-    fn new(
+    pub(super) fn new(
         files: &[SliceFile],
         start: Option<&[u8]>,
         end: Option<&[u8]>,
@@ -1965,9 +1970,18 @@ impl LayerCursor {
         }
     }
 
+    /// Heap bytes held by the decoded terms not yet handed out.
+    #[cfg(test)]
+    pub(super) fn decoded_bytes(&self) -> usize {
+        self.batch
+            .iter()
+            .map(|(key, run)| key.len() + run.decoded_bytes())
+            .sum()
+    }
+
     /// The next term and its run, `None` once every slice is read or the
     /// range's end is reached.
-    fn next(&mut self) -> Result<Option<(Vec<u8>, Run)>, TermIndexError> {
+    pub(super) fn next(&mut self) -> Result<Option<(Vec<u8>, Run)>, TermIndexError> {
         loop {
             if let Some(term) = self.batch.pop_front() {
                 if self
@@ -1990,8 +2004,14 @@ impl LayerCursor {
             if !self.bytes.is_empty() {
                 let slice = Slice::open(&self.bytes)?;
                 let batch = match (&self.last_key, &self.start) {
-                    (None, Some(start)) => slice.terms_from(Some(start), MERGE_BATCH_TERMS)?,
-                    _ => slice.terms_after(self.last_key.as_deref(), MERGE_BATCH_TERMS)?,
+                    (None, Some(start)) => {
+                        slice.terms_from(Some(start), MERGE_BATCH_TERMS, MERGE_BATCH_BYTES)?
+                    }
+                    _ => slice.terms_after(
+                        self.last_key.as_deref(),
+                        MERGE_BATCH_TERMS,
+                        MERGE_BATCH_BYTES,
+                    )?,
                 };
                 self.decode_secs += started.elapsed().as_secs_f64();
                 if let Some((key, _)) = batch.last() {
