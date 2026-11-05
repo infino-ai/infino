@@ -2563,4 +2563,40 @@ mod tests {
             "cut after lowercasing, at the cut length"
         );
     }
+
+    /// The word-at-a-time scan places the first high byte exactly where a
+    /// byte-at-a-time search does: at every offset of buffers that end
+    /// inside a word, at a word, and past a stride, and with no high byte
+    /// at all.
+    #[test]
+    fn first_non_ascii_finds_the_first_high_byte_at_every_offset() {
+        let expected = |bytes: &[u8]| bytes.iter().position(|&b| b >= 0x80);
+        for len in 0..=80usize {
+            let ascii = vec![b'a'; len];
+            assert_eq!(first_non_ascii(&ascii), None, "len {len}, none");
+            for p in 0..len {
+                let mut bytes = ascii.clone();
+                bytes[p] = 0xC3;
+                assert_eq!(
+                    first_non_ascii(&bytes),
+                    expected(&bytes),
+                    "len {len}, high byte at {p}"
+                );
+            }
+        }
+        // Two high bytes in one word: the lower offset wins.
+        let mut bytes = vec![b'a'; ASCII_SCAN_STRIDE * 2];
+        bytes[WORD_BYTES + 5] = 0xC3;
+        bytes[WORD_BYTES + 2] = 0xA9;
+        assert_eq!(first_non_ascii(&bytes), Some(WORD_BYTES + 2));
+        assert_eq!(first_non_ascii(&bytes), expected(&bytes));
+        // The first high byte in the second word of a stride, past one
+        // clean stride.
+        let mut bytes = vec![b'a'; ASCII_SCAN_STRIDE * 3];
+        let at = ASCII_SCAN_STRIDE + WORD_BYTES + 3;
+        bytes[at] = 0xC3;
+        bytes[at + WORD_BYTES] = 0xA9;
+        assert_eq!(first_non_ascii(&bytes), Some(at));
+        assert_eq!(first_non_ascii(&bytes), expected(&bytes));
+    }
 }
