@@ -16,8 +16,8 @@
 
 use std::{collections::HashSet, sync::Arc};
 
-use arrow::compute::concat;
-use arrow_array::{Array, ArrayRef, RecordBatch, new_null_array};
+use arrow::compute::{concat, take};
+use arrow_array::{Array, ArrayRef, RecordBatch, UInt32Array, new_null_array};
 use arrow_schema::{ArrowError, DataType, Schema, SchemaRef};
 
 /// One all-null array per type, every one `len` rows long, made on first
@@ -115,6 +115,28 @@ pub(crate) fn concat_sharing_nulls(
         })
         .collect::<Result<Vec<_>, _>>()?;
     RecordBatch::try_new(Arc::clone(schema), columns)
+}
+
+/// The rows of `batch` at `indices`, as Arrow's `take` gathers them, except
+/// that a column null throughout `batch` becomes the shared null array of
+/// its type rather than a gathered array as long as `indices`. A column
+/// null in every row is null in every row picked from it, so the values
+/// are the same; a gather of a null string column would write an offset
+/// per index all the same.
+pub(crate) fn take_sharing_nulls(
+    batch: &RecordBatch,
+    indices: &UInt32Array,
+) -> Result<RecordBatch, ArrowError> {
+    let mut nulls = SharedNulls::new(indices.len());
+    let columns = batch
+        .columns()
+        .iter()
+        .map(|column| match null_throughout(column.as_ref()) {
+            true => Ok(nulls.of(column.data_type())),
+            false => take(column.as_ref(), indices, None),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    RecordBatch::try_new(batch.schema(), columns)
 }
 
 /// Bytes one row of `schema` takes decoded into Arrow when every column in
@@ -312,6 +334,27 @@ mod tests {
             decoded <= rows * (per_row + 2),
             "{decoded} > {rows} x {per_row}"
         );
+    }
+
+    /// Gathering rows keeps every value `take` would give, and gathers no
+    /// null column: each comes back as its type's one shared array, so
+    /// the gathered batch costs its filled column, not its width.
+    #[test]
+    fn take_sharing_nulls_matches_take_and_gathers_no_null_column() {
+        let batch = wide_batch();
+        let indices = UInt32Array::from_iter_values((0..ROWS as u32).rev().step_by(2));
+        let expected_columns = batch
+            .columns()
+            .iter()
+            .map(|column| take(column.as_ref(), &indices, None))
+            .collect::<Result<Vec<_>, _>>()
+            .expect("take");
+        let expected = RecordBatch::try_new(batch.schema(), expected_columns).expect("batch");
+        let taken = take_sharing_nulls(&batch, &indices).expect("take sharing");
+        assert_eq!(taken, expected);
+        assert!(Arc::ptr_eq(taken.column(1), taken.column(3)));
+        assert!(Arc::ptr_eq(taken.column(2), taken.column(4)));
+        assert!(distinct_buffer_bytes(&taken) * 100 < distinct_buffer_bytes(&expected));
     }
 
     #[test]
