@@ -12621,6 +12621,7 @@ pub(in crate::supertable) async fn stamp_term_index(
                         )
                     };
                     let mut fold_max_bytes = term_index::fold_disk_bound(reuse_path, disk_per_slice, held)
+                        .map(term_index::streamed_fold_bound)
                         .unwrap_or(unmeasured_fold_max_bytes);
                     let mut planned = plan(fold_max_bytes);
                     if planned.is_none() && held > 0 && plan(u64::MAX).is_some() {
@@ -12630,6 +12631,7 @@ pub(in crate::supertable) async fn stamp_term_index(
                             .unwrap_or(0);
                         info!(freed_mib = freed >> 20, "term index: evicted kept objects for room");
                         fold_max_bytes = term_index::fold_disk_bound(reuse_path, disk_per_slice, 0)
+                            .map(term_index::streamed_fold_bound)
                             .unwrap_or(unmeasured_fold_max_bytes);
                         planned = plan(fold_max_bytes);
                     }

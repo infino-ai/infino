@@ -176,6 +176,13 @@ const FOLD_FETCHES_MAX: usize = 256;
 /// keep the window small, and each costs a scan of the fold's slices.
 const FOLD_RANGES_MAX_PER_THREAD: usize = 16;
 
+/// The slice bytes a streamed fold may read when `whole` is what fits on
+/// scratch all at once: its downloads hold half the free disk, about two
+/// ranges per thread of the at most [`FOLD_RANGES_MAX_PER_THREAD`].
+pub(crate) fn streamed_fold_bound(whole: u64) -> u64 {
+    whole.saturating_mul(FOLD_RANGES_MAX_PER_THREAD as u64 / 4)
+}
+
 /// Fan-out of the tiered fold a commit applies to its root's layers (see
 /// [`fold_tail`]). A lookup opens one slice per layer, so a root that only
 /// ever appended would cost one slice per commit since the last optimize;
