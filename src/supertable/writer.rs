@@ -828,26 +828,43 @@ fn split_target_bytes(options: &SupertableOptions) -> usize {
     (options.superfile_buffer_split_mb as usize).saturating_mul(MIB)
 }
 
-/// Where a commit of `buffer` is cut into superfiles: `bounds[i]..bounds[i + 1]`
-/// are piece `i`'s rows. The count is [`superfiles_per_commit`]'s, from the
-/// buffered bytes (Arrow reports capacity, not logical bytes — fine for a
-/// fanout heuristic that is clamped to the pool anyway); the cuts are
-/// [`piece_bounds`]'s, at equal shares of the text to index. The one rule for
-/// a commit-time build and for a seal from the live lanes, so the two cut at
-/// the same rows.
-fn commit_piece_bounds(buffer: &[BufferedBatch], options: &SupertableOptions) -> Vec<usize> {
+/// How many superfiles a commit of `buffer` becomes: [`superfiles_per_commit`]'s
+/// count from the buffered bytes, capped by the writer pool. The bytes are the
+/// Arrow footprint of every scalar and vector column the buffer holds (Arrow
+/// reports capacity, not logical bytes — fine for a fanout heuristic that is
+/// clamped to the pool anyway). The one count for a commit cut by rows
+/// ([`commit_piece_bounds`]) and for a vector commit cut by cells
+/// ([`commit_shards_via_drain`]), so a small commit stays one superfile
+/// whichever path builds it.
+fn commit_superfile_count(buffer: &[BufferedBatch], options: &SupertableOptions) -> usize {
     let total_rows: usize = buffer.iter().map(|b| b.scalar.num_rows()).sum();
     let buffered_bytes: usize = buffer
         .iter()
-        .map(|b| b.scalar.get_array_memory_size())
+        .map(|b| {
+            b.scalar.get_array_memory_size()
+                + b.vectors
+                    .iter()
+                    .map(|v| v.get_array_memory_size())
+                    .sum::<usize>()
+        })
         .sum();
     let n_threads = options.writer_pool.current_num_threads().max(1);
-    let n_pieces = superfiles_per_commit(
+    superfiles_per_commit(
         total_rows,
         buffered_bytes,
         n_threads,
         split_target_bytes(options),
-    );
+    )
+}
+
+/// Where a commit of `buffer` is cut into superfiles: `bounds[i]..bounds[i + 1]`
+/// are piece `i`'s rows. The count is [`commit_superfile_count`]'s; the cuts
+/// are [`piece_bounds`]'s, at equal shares of the text to index. The one rule
+/// for a commit-time build and for a seal from the live lanes, so the two cut
+/// at the same rows.
+fn commit_piece_bounds(buffer: &[BufferedBatch], options: &SupertableOptions) -> Vec<usize> {
+    let total_rows: usize = buffer.iter().map(|b| b.scalar.num_rows()).sum();
+    let n_pieces = commit_superfile_count(buffer, options);
     let mut weights = Vec::with_capacity(total_rows);
     for batch in buffer {
         piece_row_weights(&batch.scalar, options, &mut weights);
@@ -3120,6 +3137,10 @@ impl SupertableWriter {
             // hidden vector-index manifest), so there is nothing to place against
             // here.
             let fine_assign: Option<crate::supertable::query::vector::FineAssignRouter> = None;
+            // The commit's bytes decide how many superfiles its cells pack
+            // into, capped by the pool, exactly as a commit cut by rows: a
+            // small commit is one superfile on a host of any width.
+            let n_shards = commit_superfile_count(buffer, &self.inner.options);
             // Pipelined publish on storage-backed tables: shards stream
             // to the uploader as each finishes packing, so the commit
             // pays ~max(pack, PUT) instead of pack + PUT. The manifest
@@ -3150,7 +3171,7 @@ impl SupertableWriter {
                     &pack_grid,
                     fine_assign.as_ref(),
                     metric,
-                    packed_cell_shard_count(&self.inner.options),
+                    n_shards,
                     &self.op_stats,
                     Some(&tx),
                     stem,
@@ -3212,7 +3233,7 @@ impl SupertableWriter {
                     &pack_grid,
                     fine_assign.as_ref(),
                     metric,
-                    packed_cell_shard_count(&self.inner.options),
+                    n_shards,
                     &self.op_stats,
                     None,
                     stem,
@@ -8086,8 +8107,8 @@ fn read_spilled_stable_ids(cell: &SpilledPackedCell) -> Result<Vec<i128>, BuildE
     Ok(ids)
 }
 
-/// Drain packed-layout shard count: align with the writer pool width
-/// (same rule as ingest's per-commit shard count).
+/// Hidden-index drain packed-layout shard count: the writer pool width (the
+/// cap a commit's own superfile count, [`commit_superfile_count`], is held to).
 fn packed_cell_shard_count(options: &SupertableOptions) -> usize {
     options.writer_pool.current_num_threads().max(1)
 }
@@ -8508,7 +8529,8 @@ fn build_prepared_from_spilled_cells(
 ///    the boundary-replica budget is batch-global, exactly like drain),
 /// 2. group whole cells into ≤ `n_packed_shards` shard files (`cell % N` —
 ///    drain's [`group_cells_by_packed_shard`]; the commit path passes
-///    [`packed_cell_shard_count`], the update append phase passes 1 so its
+///    [`commit_superfile_count`], so the file count follows the commit's
+///    bytes capped by the pool, and the update append phase passes 1 so its
 ///    single preallocated superfile id covers every cell),
 /// 3. each writer: `rayon::join` — drain pack (fp32→Sq8→materialized fine
 ///    IVF) ‖ Parquet+FTS for that shard's primary rows — then splice + finish.

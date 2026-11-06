@@ -11,4 +11,5 @@ pub mod persistence;
 pub mod pointer_atomic;
 pub mod same_handle_query;
 pub mod stats;
+pub mod vector_geometry;
 pub mod write_stats;
