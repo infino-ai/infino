@@ -38,7 +38,7 @@ use bytes::Bytes;
 use memmap2::Mmap;
 use rayon::{ThreadPool, current_num_threads, prelude::*};
 use tempfile::TempDir;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::{sync::mpsc::UnboundedSender, task::JoinHandle};
 use tracing::debug;
 use uuid::Uuid;
 
@@ -291,7 +291,7 @@ pub(crate) fn scratch_dir(root: Option<&Path>) -> io::Result<TempDir> {
 struct TierSource {
     /// A window of the tier object the chunks lie in, shared with the
     /// cursor that read it.
-    bytes: Arc<Vec<u8>>,
+    bytes: Bytes,
     /// Offset of the window in the tier object.
     base: u64,
     chunks: Vec<TierChunkRef>,
@@ -1905,15 +1905,15 @@ fn map_file(path: &Path) -> io::Result<Bytes> {
     Ok(Bytes::from_owner(map))
 }
 
-/// Reads one layer's slices, already on local disk, term by term in key
-/// order.
+/// Reads one layer's slices term by term in key order, from local disk or
+/// streamed from storage.
 pub(super) struct LayerCursor {
     /// What the ordinals in the files are relative to: their layer's base.
     base: u32,
     /// Slices not opened yet, in key order.
     files: VecDeque<SliceFile>,
     /// The next streamed slice, fetched while this one is read.
-    next_fetch: Option<tokio::task::JoinHandle<Result<Bytes, TermIndexError>>>,
+    next_fetch: Option<JoinHandle<Result<Bytes, TermIndexError>>>,
     /// The open slice's bytes, mapped rather than read, so the many cursors
     /// a merge of many layers keeps open hold their slices in page cache,
     /// which the kernel can drop and read back, not in the heap; empty
@@ -1928,15 +1928,15 @@ pub(super) struct LayerCursor {
     /// The open slice when streamed.
     remote: Option<RemoteSlice>,
     /// The streamed tier window after the one last read, fetched while
-    /// the merge reads that one, and where it starts.
-    next_window: Option<(u64, tokio::task::JoinHandle<Result<Bytes, TermIndexError>>)>,
+    /// the merge reads that one: where it starts and its length.
+    next_window: Option<(u64, u64, JoinHandle<Result<Bytes, TermIndexError>>)>,
     /// Bytes the next streamed tier window asks for: doubled each time the
     /// window fetched ahead serves, up to [`REMOTE_TIER_WINDOW_MAX_BYTES`].
     remote_window: u64,
     /// The window of the tier object last read, and where it starts. A
     /// slice's chunks lie in key order, so a merge reads the object front
     /// to back and one window serves the terms that fall in it.
-    window: Arc<Vec<u8>>,
+    window: Bytes,
     window_base: u64,
     /// Least bytes a window holds.
     window_bytes: u64,
@@ -1981,7 +1981,7 @@ impl LayerCursor {
             bytes: Bytes::new(),
             tier: None,
             tier_file: None,
-            window: Arc::new(Vec::new()),
+            window: Bytes::new(),
             window_base: 0,
             window_bytes,
             batch: VecDeque::new(),
@@ -2007,7 +2007,7 @@ impl LayerCursor {
         if let Some(fetch) = self.next_fetch.take() {
             fetch.abort();
         }
-        if let Some((_, fetch)) = self.next_window.take() {
+        if let Some((_, _, fetch)) = self.next_window.take() {
             fetch.abort();
         }
     }
@@ -2057,6 +2057,11 @@ impl LayerCursor {
             let Some(file) = self.files.pop_front() else {
                 return Ok(None);
             };
+            // The tier window fetched ahead was the last slice's.
+            if let Some((_, _, fetch)) = self.next_window.take() {
+                fetch.abort();
+            }
+            self.remote_window = REMOTE_TIER_WINDOW_BYTES;
             match file.remote {
                 Some(remote) => {
                     let fetch = match self.next_fetch.take() {
@@ -2071,10 +2076,6 @@ impl LayerCursor {
                         .map(RemoteSlice::spawn_fetch);
                     self.read_secs += started.elapsed().as_secs_f64();
                     self.tier_file = None;
-                    if let Some((_, fetch)) = self.next_window.take() {
-                        fetch.abort();
-                    }
-                    self.remote_window = REMOTE_TIER_WINDOW_BYTES;
                     self.remote = Some(remote);
                 }
                 None => {
@@ -2085,7 +2086,7 @@ impl LayerCursor {
                 }
             }
             self.tier = None;
-            self.window = Arc::new(Vec::new());
+            self.window = Bytes::new();
             self.window_base = 0;
             self.last_key = None;
         }
@@ -2096,10 +2097,7 @@ impl LayerCursor {
     /// them, else from a fresh window of at least `window_bytes` starting
     /// at them. A run with a tier always comes from a slice that has one,
     /// so a missing file is an error, not an empty tier.
-    fn tier_span(
-        &mut self,
-        chunks: &[TierChunkRef],
-    ) -> Result<(Arc<Vec<u8>>, u64), TermIndexError> {
+    fn tier_span(&mut self, chunks: &[TierChunkRef]) -> Result<(Bytes, u64), TermIndexError> {
         let base = chunks.iter().map(|c| c.offset).min().unwrap_or(0);
         let end = chunks
             .iter()
@@ -2107,7 +2105,7 @@ impl LayerCursor {
             .ok_or_else(|| TermIndexError::Malformed("tier chunk range".into()))?;
         let window_end = self.window_base + self.window.len() as u64;
         if base >= self.window_base && end <= window_end {
-            return Ok((Arc::clone(&self.window), self.window_base));
+            return Ok((self.window.clone(), self.window_base));
         }
         let started = Instant::now();
         if let Some(remote) = &self.remote {
@@ -2120,11 +2118,16 @@ impl LayerCursor {
             let window = self.window_bytes.max(self.remote_window);
             // The window fetched ahead serves when it holds the chunks, joined
             // to the current window's tail when the chunks start there; else
-            // they are fetched now.
+            // it is dropped unread and they are fetched now.
             let ahead = match self.next_window.take() {
-                Some((at, fetch)) if at <= base => Some((at, remote.wait(fetch)?)),
-                Some((at, fetch))
-                    if at == window_end && base >= self.window_base && base < window_end =>
+                Some((at, len, fetch)) if at <= base && end <= at + len => {
+                    Some((at, remote.wait(fetch)?))
+                }
+                Some((at, len, fetch))
+                    if at == window_end
+                        && base >= self.window_base
+                        && base < window_end
+                        && end <= at + len =>
                 {
                     let tail = &self.window[(base - self.window_base) as usize..];
                     let next = remote.wait(fetch)?;
@@ -2133,7 +2136,7 @@ impl LayerCursor {
                     joined.extend_from_slice(&next);
                     Some((base, Bytes::from(joined)))
                 }
-                Some((_, fetch)) => {
+                Some((_, _, fetch)) => {
                     fetch.abort();
                     None
                 }
@@ -2154,16 +2157,13 @@ impl LayerCursor {
             };
             let next = at + bytes.len() as u64;
             if next < total {
-                let ahead = self.window_bytes.max(self.remote_window);
-                self.next_window = Some((
-                    next,
-                    remote.spawn_tier_range(next..(next + ahead).min(total)),
-                ));
+                let end = (next + self.window_bytes.max(self.remote_window)).min(total);
+                self.next_window = Some((next, end - next, remote.spawn_tier_range(next..end)));
             }
-            self.window = Arc::new(bytes.to_vec());
+            self.window = bytes;
             self.window_base = at;
             self.read_secs += started.elapsed().as_secs_f64();
-            return Ok((Arc::clone(&self.window), at));
+            return Ok((self.window.clone(), at));
         }
         if self.tier.is_none() {
             let path = self
@@ -2184,10 +2184,10 @@ impl LayerCursor {
         let mut bytes = vec![0u8; want as usize];
         file.seek(SeekFrom::Start(base))?;
         file.read_exact(&mut bytes)?;
-        self.window = Arc::new(bytes);
+        self.window = Bytes::from(bytes);
         self.window_base = base;
         self.read_secs += started.elapsed().as_secs_f64();
-        Ok((Arc::clone(&self.window), base))
+        Ok((self.window.clone(), base))
     }
 }
 
