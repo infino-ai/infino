@@ -96,6 +96,10 @@ const DATA_PAGE_ROW_LIMIT: usize = 4096;
 /// size as an `i32`). Writing a batch in slices of at most this many
 /// bytes per column keeps a page near this size. A single row is never
 /// split, so one row over 2 GiB still can't be written.
+///
+/// The cap only binds when values average over ~64 KB, so normal tables
+/// write the same files as before. A smaller cap would also cut normal
+/// text columns into many more, smaller pages.
 const MAX_WRITE_BYTES: usize = 64 << 20;
 
 /// Output of a successful build.
@@ -538,12 +542,15 @@ fn value_bytes(array: &dyn Array) -> usize {
         }
         // A sliced fixed-size list already holds only its own values.
         DataType::FixedSizeList(..) => value_bytes(array.as_fixed_size_list().values().as_ref()),
+        // Each field (and a map's key and value) is its own Parquet column
+        // with its own pages, so only the largest one counts.
         DataType::Struct(_) => array
             .as_struct()
             .columns()
             .iter()
             .map(|child| value_bytes(child.as_ref()))
-            .sum(),
+            .max()
+            .unwrap_or(0),
         _ => 0,
     }
 }
@@ -2032,31 +2039,36 @@ mod tests {
             },
         )
         .expect("planned body");
+        for pages in page_rows(body) {
+            assert!(pages.len() >= GROUPS, "pages {pages:?}");
+            assert!(
+                pages.iter().all(|&rows| rows <= DATA_PAGE_ROW_LIMIT as i64),
+                "pages {pages:?}"
+            );
+        }
+    }
+
+    /// Rows of each data page in `body`, one list per column chunk.
+    fn page_rows(body: EncodedBody) -> Vec<Vec<i64>> {
         let parts = splice_index_blobs(body, &[], &[], &[], &[]).expect("splice");
         let metadata = ParquetMetaDataReader::new()
             .with_page_index_policy(PageIndexPolicy::Required)
             .parse_and_finish(&Bytes::from(parts.bytes))
             .expect("metadata with page index");
         let offsets = metadata.offset_index().expect("offset index");
+        let mut chunks = Vec::new();
         for (group, columns) in metadata.row_groups().iter().zip(offsets) {
-            let group_rows = group.num_rows();
             for column in columns {
                 let firsts: Vec<i64> = column
                     .page_locations()
                     .iter()
                     .map(|page| page.first_row_index)
-                    .chain([group_rows])
+                    .chain([group.num_rows()])
                     .collect();
-                assert!(firsts.len() > GROUPS, "pages {firsts:?}");
-                for pair in firsts.windows(2) {
-                    assert!(
-                        pair[1] - pair[0] <= DATA_PAGE_ROW_LIMIT as i64,
-                        "page of {} rows",
-                        pair[1] - pair[0]
-                    );
-                }
+                chunks.push(firsts.windows(2).map(|pair| pair[1] - pair[0]).collect());
             }
         }
+        chunks
     }
 
     /// A body that dropped some dictionaries is ordinary Parquet: a standard
@@ -2321,8 +2333,37 @@ mod tests {
         );
     }
 
+    /// Bytes per value that make a slice just under two runs of the
+    /// writer's values, so slices not cut to a whole run would end mid-run.
+    const MID_RUN_VALUE_BYTES: usize = MAX_WRITE_BYTES / (2 * DEFAULT_WRITE_BATCH_SIZE - 1);
+
+    /// With a large text column, the `id` column's pages still hold at
+    /// most `DATA_PAGE_ROW_LIMIT` rows.
+    #[test]
+    fn large_values_keep_the_page_row_limit() {
+        let rows = 5 * DEFAULT_WRITE_BATCH_SIZE;
+        let batch = text_batch(&vec![MID_RUN_VALUE_BYTES; rows]);
+        let schema = batch.schema();
+        let body = encode_parquet_body(
+            &schema,
+            slice::from_ref(&batch),
+            Compression::UNCOMPRESSED,
+            rows,
+            &[],
+        )
+        .expect("body");
+        let id_pages = &page_rows(body)[schema.index_of("id").expect("id column")];
+        assert!(
+            id_pages
+                .iter()
+                .all(|&rows| rows <= DATA_PAGE_ROW_LIMIT as i64),
+            "id pages {id_pages:?}"
+        );
+    }
+
     /// Every type that holds variable-size or wide values counts its bytes,
-    /// for the whole array and for a slice of it.
+    /// for the whole array and for a slice of it. A struct or map counts
+    /// only its largest field.
     #[test]
     fn every_value_type_counts_its_bytes() {
         const ROWS: usize = 10;
@@ -2381,14 +2422,14 @@ mod tests {
                 )),
                 2 * TEST_VALUE_BYTES,
             ),
-            (Arc::new(map.finish()), 2 * TEST_VALUE_BYTES),
+            (Arc::new(map.finish()), TEST_VALUE_BYTES),
             (
                 Arc::new(StructArray::new(
                     struct_fields.into(),
                     vec![large_text(), large_text()],
                     None,
                 )),
-                2 * TEST_VALUE_BYTES,
+                TEST_VALUE_BYTES,
             ),
         ];
         for (array, row_bytes) in cases {
