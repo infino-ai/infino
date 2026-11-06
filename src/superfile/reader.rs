@@ -27,7 +27,7 @@ use std::{
     ops::{Deref, Range},
     str,
     sync::{
-        Arc, RwLock,
+        Arc, OnceLock, RwLock,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -261,6 +261,10 @@ pub struct SuperfileReader {
     /// instead of each building their own copy, and a file with no page
     /// index isn't asked again.
     page_index_loaded: OnceCell<()>,
+    /// The page-indexed footer as a table's scans of this superfile prune
+    /// by, derived once by the first scan that asks
+    /// ([`Self::scan_footer`]) and shared by every later one.
+    scan_footer: OnceLock<Arc<ParquetMetaData>>,
     /// The lazy byte source the reader was opened over, retained only
     /// on the [`open_lazy`] path. `None` on the eager [`open`] path
     /// (resident bytes already cover every range). Lets
@@ -780,6 +784,7 @@ impl SuperfileReader {
             bytes: None,
             footer: ArcSwap::from_pointee(Footer::Lazy(parquet_meta)),
             page_index_loaded: OnceCell::new(),
+            scan_footer: OnceLock::new(),
             source: Some(source),
             schema,
             id_column,
@@ -925,6 +930,7 @@ impl SuperfileReader {
             footer: ArcSwap::from_pointee(Footer::Resident(arrow_meta)),
             // Set by `parquet_metadata_with_page_index` on first use.
             page_index_loaded: OnceCell::new(),
+            scan_footer: OnceLock::new(),
             source: None,
             schema,
             id_column,
@@ -1010,6 +1016,29 @@ impl SuperfileReader {
             })
             .await?;
         Ok(self.parquet_metadata())
+    }
+
+    /// The footer a table's scans of this superfile prune by: `derive`
+    /// applied to `indexed`, the page-indexed footer
+    /// ([`Self::parquet_metadata_with_page_index`]), on the first call, and
+    /// the footer that call derived on every later one, so every query over
+    /// the superfile shares one copy rather than deriving its own.
+    ///
+    /// One derivation per reader is sound because the table derives it
+    /// from this superfile alone, its footer and its own manifest entry,
+    /// and a superfile's entry never changes, so every caller passes the
+    /// same `derive`. Concurrent first callers may each derive one; the
+    /// first stored is kept and returned to all of them.
+    pub(crate) fn scan_footer<E>(
+        &self,
+        indexed: Arc<ParquetMetaData>,
+        derive: impl FnOnce(Arc<ParquetMetaData>) -> Result<Arc<ParquetMetaData>, E>,
+    ) -> Result<Arc<ParquetMetaData>, E> {
+        if let Some(footer) = self.scan_footer.get() {
+            return Ok(Arc::clone(footer));
+        }
+        let derived = derive(indexed)?;
+        Ok(Arc::clone(self.scan_footer.get_or_init(|| derived)))
     }
 
     /// The Arrow metadata the synchronous decodes read through, or

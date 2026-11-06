@@ -4413,6 +4413,13 @@ pub fn superfile_stem(source_name: &str) -> Option<String> {
 /// Takes existing (min, max) and other (min, max) arrays and returns the
 /// merged (min, max) where min is the smaller value and max is the larger.
 /// Both arrays are assumed to be length-1 and of the same type.
+///
+/// Values compare in the order [`column_min_max`] took each side's bounds
+/// in, Arrow's own: for floats that is IEEE total order, where a negative
+/// NaN comes before every number and a positive NaN after. A NaN bound
+/// therefore survives the merge whichever side it is on, as it would in
+/// the min or max of the two sides' values together; with `<=`, which is
+/// false whenever one side is a NaN, it survived only from one side.
 pub(crate) fn merge_min_max_arrays(
     existing_min: &ArrayRef,
     other_min: &ArrayRef,
@@ -4420,29 +4427,54 @@ pub(crate) fn merge_min_max_arrays(
     other_max: &ArrayRef,
 ) -> Option<(ArrayRef, ArrayRef)> {
     // Merge two optional bounds into the surviving one — smaller for a min,
-    // larger for a max. A `None` (the column is all-null on that side)
-    // yields to a present value; both `None` stays `None`, so an all-null
-    // column stays all-null through the fold, while a manifest part with any
-    // populated superfile keeps its real bound.
+    // larger for a max, by `le`. A `None` (the column is all-null on that
+    // side) yields to a present value; both `None` stays `None`, so an
+    // all-null column stays all-null through the fold, while a manifest part
+    // with any populated superfile keeps its real bound.
     #[inline]
-    fn merge_opt<T: PartialOrd>(a: Option<T>, b: Option<T>, keep_min: bool) -> Option<T> {
+    fn merge_opt<T>(
+        a: Option<T>,
+        b: Option<T>,
+        keep_min: bool,
+        le: impl Fn(&T, &T) -> bool,
+    ) -> Option<T> {
         match (a, b) {
-            (Some(a), Some(b)) => Some(if keep_min == (a <= b) { a } else { b }),
+            (Some(a), Some(b)) => Some(if keep_min == le(&a, &b) { a } else { b }),
             (Some(v), None) | (None, Some(v)) => Some(v),
             (None, None) => None,
         }
     }
 
+    // `a <= b` for a primitive array's values, as Arrow's min and max order
+    // them: total order for floats, the plain order for every other type.
+    #[inline]
+    fn native_le<T: ArrowNativeTypeOp>(a: &T, b: &T) -> bool {
+        a.is_le(*b)
+    }
+
     macro_rules! prim_merge {
-        ($array_ty:ty) => {{
+        ($array_ty:ty) => {
+            prim_merge!($array_ty, native_le)
+        };
+        ($array_ty:ty, $le:expr) => {{
             let exn = existing_min.as_any().downcast_ref::<$array_ty>()?;
             let otn = other_min.as_any().downcast_ref::<$array_ty>()?;
             let exx = existing_max.as_any().downcast_ref::<$array_ty>()?;
             let otx = other_max.as_any().downcast_ref::<$array_ty>()?;
             let at = |a: &$array_ty| (!a.is_null(0)).then(|| a.value(0));
             Some((
-                Arc::new(<$array_ty>::from(vec![merge_opt(at(exn), at(otn), true)])) as ArrayRef,
-                Arc::new(<$array_ty>::from(vec![merge_opt(at(exx), at(otx), false)])) as ArrayRef,
+                Arc::new(<$array_ty>::from(vec![merge_opt(
+                    at(exn),
+                    at(otn),
+                    true,
+                    $le,
+                )])) as ArrayRef,
+                Arc::new(<$array_ty>::from(vec![merge_opt(
+                    at(exx),
+                    at(otx),
+                    false,
+                    $le,
+                )])) as ArrayRef,
             ))
         }};
     }
@@ -4458,11 +4490,11 @@ pub(crate) fn merge_min_max_arrays(
             let at = |a: &$array_ty| (!a.is_null(0)).then(|| a.value(0));
             Some((
                 Arc::new(
-                    <$array_ty>::from(vec![merge_opt(at(exn), at(otn), true)])
+                    <$array_ty>::from(vec![merge_opt(at(exn), at(otn), true, native_le)])
                         .with_timezone_opt($tz.clone()),
                 ) as ArrayRef,
                 Arc::new(
-                    <$array_ty>::from(vec![merge_opt(at(exx), at(otx), false)])
+                    <$array_ty>::from(vec![merge_opt(at(exx), at(otx), false, native_le)])
                         .with_timezone_opt($tz.clone()),
                 ) as ArrayRef,
             ))
@@ -4481,7 +4513,7 @@ pub(crate) fn merge_min_max_arrays(
         DataType::Float32 => prim_merge!(Float32Array),
         DataType::Float64 => prim_merge!(Float64Array),
         // `false < true`, so min folds like AND and max like OR.
-        DataType::Boolean => prim_merge!(BooleanArray),
+        DataType::Boolean => prim_merge!(BooleanArray, PartialOrd::le),
         DataType::Utf8 => {
             let exn = existing_min.as_any().downcast_ref::<StringArray>()?;
             let otn = other_min.as_any().downcast_ref::<StringArray>()?;
@@ -4491,11 +4523,13 @@ pub(crate) fn merge_min_max_arrays(
                 (!exn.is_null(0)).then(|| exn.value(0)),
                 (!otn.is_null(0)).then(|| otn.value(0)),
                 true,
+                PartialOrd::le,
             );
             let max = merge_opt(
                 (!exx.is_null(0)).then(|| exx.value(0)),
                 (!otx.is_null(0)).then(|| otx.value(0)),
                 false,
+                PartialOrd::le,
             );
             Some((
                 Arc::new(StringArray::from(vec![min])),
@@ -4511,11 +4545,13 @@ pub(crate) fn merge_min_max_arrays(
                 (!exn.is_null(0)).then(|| exn.value(0)),
                 (!otn.is_null(0)).then(|| otn.value(0)),
                 true,
+                PartialOrd::le,
             );
             let max = merge_opt(
                 (!exx.is_null(0)).then(|| exx.value(0)),
                 (!otx.is_null(0)).then(|| otx.value(0)),
                 false,
+                PartialOrd::le,
             );
             Some((
                 Arc::new(LargeStringArray::from(vec![min])),
@@ -4528,8 +4564,8 @@ pub(crate) fn merge_min_max_arrays(
             let exx = existing_max.as_any().downcast_ref::<Decimal128Array>()?;
             let otx = other_max.as_any().downcast_ref::<Decimal128Array>()?;
             let at = |a: &Decimal128Array| (!a.is_null(0)).then(|| a.value(0));
-            let min = merge_opt(at(exn), at(otn), true);
-            let max = merge_opt(at(exx), at(otx), false);
+            let min = merge_opt(at(exn), at(otn), true, native_le);
+            let max = merge_opt(at(exx), at(otx), false, native_le);
             Some((
                 Arc::new(
                     Decimal128Array::from(vec![min])
@@ -5621,6 +5657,40 @@ mod tests {
         assert_eq!(scalar(&mx), ScalarValue::Int64(Some(9)));
         let (mn, mx) = merge_min_max_arrays(&null1, &null1, &null1, &null1).expect("merge null");
         assert!(mn.is_null(0) && mx.is_null(0));
+    }
+
+    /// Float bounds merge in total order, as Arrow's min and max of both
+    /// sides' values would: a negative NaN is the smaller min and a positive
+    /// NaN the larger max whichever side holds it, and a positive NaN min
+    /// (every value a NaN) yields to a number, for both float widths.
+    #[test]
+    fn merge_min_max_keeps_a_nan_bound_from_either_side() {
+        macro_rules! nan_case {
+            ($arr:ty, $t:ty) => {{
+                let one = |v: $t| Arc::new(<$arr>::from(vec![v])) as ArrayRef;
+                let value =
+                    |a: &ArrayRef| a.as_any().downcast_ref::<$arr>().expect("float").value(0);
+                let numbers = (one(-1.0), one(1.0));
+                let with_nans = (one(-<$t>::NAN), one(<$t>::NAN));
+                let all_nan = (one(<$t>::NAN), one(<$t>::NAN));
+                for (first, second) in [(&with_nans, &numbers), (&numbers, &with_nans)] {
+                    let (min, max) = merge_min_max_arrays(&first.0, &second.0, &first.1, &second.1)
+                        .expect("merge");
+                    let (min, max) = (value(&min), value(&max));
+                    assert!(min.is_nan() && min.is_sign_negative(), "{min}");
+                    assert!(max.is_nan() && max.is_sign_positive(), "{max}");
+                }
+                for (first, second) in [(&all_nan, &numbers), (&numbers, &all_nan)] {
+                    let (min, max) = merge_min_max_arrays(&first.0, &second.0, &first.1, &second.1)
+                        .expect("merge");
+                    let (min, max) = (value(&min), value(&max));
+                    assert_eq!(min, -1.0);
+                    assert!(max.is_nan() && max.is_sign_positive(), "{max}");
+                }
+            }};
+        }
+        nan_case!(Float64Array, f64);
+        nan_case!(Float32Array, f32);
     }
 
     #[test]
