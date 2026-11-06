@@ -3243,6 +3243,11 @@ mod tests {
 
         assert!(store.is_mmap_promoted(&uri));
         assert_eq!(most_reserved, size - vec_len, "the hole is never reserved");
+        // The fill leaves the map before it releases its reservation.
+        store
+            .wait_until_fills_settled(PROMOTE_TIMEOUT)
+            .await
+            .expect("the fill settles");
         store.assert_budget_consistent();
     }
 
