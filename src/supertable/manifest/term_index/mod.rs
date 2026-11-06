@@ -2236,17 +2236,29 @@ async fn stream_sources(
     reuse: Option<&Path>,
     tier_lens: &Mutex<HashMap<ContentHash, u64>>,
 ) -> Result<Vec<Vec<SliceFile>>, TermIndexError> {
-    let kept = |slice: &SliceRef| {
-        reuse
-            .map(|reuse| slice_file_path(reuse, &slice.content_hash))
-            .filter(|path| path.exists())
-    };
+    // A slice kept in `reuse` is read there only with its tier object
+    // beside it; a kept slice whose tier is gone is streamed whole.
+    let mut kept: HashMap<ContentHash, PathBuf> = HashMap::new();
+    if let Some(reuse) = reuse {
+        for slice in layers.iter().flat_map(|layer| &layer.slices) {
+            let path = slice_file_path(reuse, &slice.content_hash);
+            let tier_kept = match slice.tier {
+                None => true,
+                Some(_) => async_fs::try_exists(tier_path(reuse, &slice.content_hash))
+                    .await
+                    .unwrap_or(false),
+            };
+            if tier_kept && async_fs::try_exists(&path).await.unwrap_or(false) {
+                kept.insert(slice.content_hash, path);
+            }
+        }
+    }
     let missing: Vec<ContentHash> = {
         let known = tier_lens.lock().expect("tier lengths");
         layers
             .iter()
             .flat_map(|layer| &layer.slices)
-            .filter(|slice| kept(slice).is_none())
+            .filter(|slice| !kept.contains_key(&slice.content_hash))
             .filter_map(|slice| slice.tier)
             .filter(|tier| !known.contains_key(tier))
             .collect::<HashSet<_>>()
@@ -2297,7 +2309,7 @@ async fn stream_sources(
                 .slices
                 .iter()
                 .map(|slice| {
-                    let kept = kept(slice);
+                    let kept = kept.get(&slice.content_hash).cloned();
                     SliceFile {
                         remote: match kept {
                             Some(_) => None,
@@ -10361,6 +10373,58 @@ mod tests {
     /// A fold that streams its inputs from storage writes the layer a fold
     /// that downloads them writes, whether its key ranges are cut from each
     /// slice's dictionary or one mark per slice.
+    /// A slice kept in the reuse directory without its tier object, which a
+    /// failed link or an eviction can leave, is streamed whole: the fold
+    /// writes what a downloaded fold writes.
+    #[test]
+    fn a_kept_slice_without_its_tier_is_streamed() {
+        let dir = TempDir::new().expect("tempdir");
+        let policy = range_policy();
+        let built = build(
+            &[range_contribution(&dir, 1), range_contribution(&dir, 2)],
+            &policy,
+        )
+        .expect("build");
+        let store_dir = TempDir::new().expect("store");
+        let local: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(store_dir.path()).expect("local"));
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let reference = rt.block_on(write_built(&local, built)).expect("write");
+        let root = rt
+            .block_on(load_root(local.as_ref(), &reference))
+            .expect("root");
+        let slices: Vec<&SliceRef> = root.layers.iter().flat_map(|layer| &layer.slices).collect();
+        assert!(slices.iter().any(|slice| slice.tier.is_some()));
+        let reuse = TempDir::new().expect("reuse");
+        for slice in &slices {
+            let bytes =
+                fs::read(store_dir.path().join(slice_uri(&slice.content_hash))).expect("slice");
+            fs::write(slice_file_path(reuse.path(), &slice.content_hash), bytes).expect("keep");
+        }
+        let ordinals: Vec<Option<u32>> = (0..root.superfiles.len() as u32).map(Some).collect();
+        let ranged = BuildPolicy {
+            merge_ranges: Some(4),
+            ..policy.clone()
+        };
+        let streamed = FoldIo {
+            stream: true,
+            reuse_dir: Some(reuse.path().to_path_buf()),
+            ..FoldIo::default()
+        };
+        let fold = |io: &FoldIo| {
+            rt.block_on(fold_layers(
+                &local,
+                &root.layers,
+                &ordinals,
+                &ranged,
+                io,
+                None,
+            ))
+            .expect("fold")
+        };
+        assert_eq!(fold(&streamed), fold(&FoldIo::default()));
+    }
+
     #[test]
     fn a_streamed_fold_writes_what_a_downloaded_fold_writes() {
         let dir = TempDir::new().expect("tempdir");
