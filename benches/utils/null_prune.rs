@@ -37,8 +37,9 @@ use crate::{
     report::{Better, Block, Cell, Report, Section, metric, text},
 };
 
-/// Commits, each one superfile.
-const COMMITS: usize = 128;
+/// Commits, each one superfile; override with
+/// `INFINO_BENCH_NULL_PRUNE_COMMITS`.
+const DEFAULT_COMMITS: usize = 128;
 /// Rows per commit.
 const ROWS_PER_COMMIT: usize = 2_000;
 /// Superfiles per manifest part.
@@ -125,8 +126,11 @@ fn commit_rows(commit: usize) -> RecordBatch {
 }
 
 /// One cold run of `sql`: a fresh lazy open over its own empty disk cache.
-/// The rows counted, the manifest parts loaded, and the wall time.
-fn run_once(storage: &Arc<dyn StorageProvider>, sql: &str) -> (i64, usize, usize, Duration) {
+/// The rows counted, the manifest parts loaded and in all, the storage
+/// reads the open and query made, and the wall time.
+fn run_once(storage: &Arc<dyn StorageProvider>, sql: &str) -> (i64, usize, usize, u64, Duration) {
+    let meter = storage.usage_meter();
+    let before = meter.snapshot();
     let cache_dir = TempDir::new().expect("cache dir");
     let cache = default_disk_cache(Arc::clone(storage), cache_dir.path());
     let started = Instant::now();
@@ -139,6 +143,7 @@ fn run_once(storage: &Arc<dyn StorageProvider>, sql: &str) -> (i64, usize, usize
     let reader = table.reader().expect("reader");
     let batches = reader.query_sql(sql).expect("query");
     let elapsed = started.elapsed();
+    let gets = meter.snapshot().since(&before).get_count;
     let count = batches[0]
         .column(0)
         .as_any()
@@ -151,19 +156,20 @@ fn run_once(storage: &Arc<dyn StorageProvider>, sql: &str) -> (i64, usize, usize
         .iter()
         .filter(|e| manifest.get_cached_part_by_id(&e.part_id).is_some())
         .count();
-    (count, loaded, entries.len(), elapsed)
+    (count, loaded, entries.len(), gets, elapsed)
 }
 
 /// Run the diagnostic.
 pub fn run() {
     let iters = env_usize("INFINO_DIAG_ITERS", DEFAULT_ITERS).max(1);
+    let commits = env_usize("INFINO_BENCH_NULL_PRUNE_COMMITS", DEFAULT_COMMITS).max(1);
     let dir = TempDir::new().expect("table dir");
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("storage"));
-    eprintln!("[null-prune] writing {COMMITS} commits of {ROWS_PER_COMMIT} rows...");
+    eprintln!("[null-prune] writing {commits} commits of {ROWS_PER_COMMIT} rows...");
     {
         let table = Supertable::create(options(&storage)).expect("create");
-        for commit in 0..COMMITS {
+        for commit in 0..commits {
             let mut writer = table.writer().expect("writer");
             writer.append(&commit_rows(commit)).expect("append");
             writer.commit().expect("commit");
@@ -175,20 +181,22 @@ pub fn run() {
         let mut times = Vec::with_capacity(iters);
         let mut seen = None;
         for _ in 0..iters {
-            let (count, loaded, total, elapsed) = run_once(&storage, sql);
+            let (count, loaded, total, gets, elapsed) = run_once(&storage, sql);
             times.push(elapsed);
-            seen = Some((count, loaded, total));
+            seen = Some((count, loaded, total, gets));
         }
-        let (count, loaded, total) = seen.expect("at least one run");
+        let (count, loaded, total, gets) = seen.expect("at least one run");
         let p50 = percentile(&mut times, P50).as_secs_f64() * NS_PER_SEC;
         eprintln!(
-            "[null-prune] {label}: {count} rows, {loaded}/{total} parts loaded, p50 {}",
+            "[null-prune] {label}: {count} rows, {loaded}/{total} parts loaded, {gets} storage \
+             reads, p50 {}",
             fmt_time(p50)
         );
         rows.push(vec![
             text(label),
             text(fmt_count(count as usize)),
             metric(loaded as f64, format!("{loaded}/{total}"), Better::Lower),
+            metric(gets as f64, fmt_count(gets as usize), Better::Lower),
             metric(p50, fmt_time(p50), Better::Lower),
         ]);
     }
@@ -198,10 +206,10 @@ pub fn run() {
         anchor: "bench/diagnostic/null-prune".into(),
         title: "Null-check pruning over a lazily loaded manifest".into(),
         note: format!(
-            "{COMMITS} commits of {ROWS_PER_COMMIT} rows, {SUPERFILES_PER_PART} superfiles per \
+            "{commits} commits of {ROWS_PER_COMMIT} rows, {SUPERFILES_PER_PART} superfiles per \
              part. `dense` is set in every row, `sparse` in one in {SPARSE_EVERY}, `rare` only in \
              the first {RARE_COMMITS} commits. Each run opens the table cold and lazily over an \
-             empty disk cache; p50 includes the open."
+             empty disk cache; storage reads and p50 include the open."
         ),
         blocks: vec![Block {
             subtitle: String::new(),
@@ -209,6 +217,7 @@ pub fn run() {
                 "Predicate".into(),
                 "Rows".into(),
                 "Parts loaded".into(),
+                "Storage reads".into(),
                 "p50".into(),
             ],
             rows,
