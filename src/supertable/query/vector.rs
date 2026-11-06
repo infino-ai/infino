@@ -7797,9 +7797,11 @@ impl SupertableReader {
                 .await;
         };
 
-        // Wave 1: search the pinned hidden slow state while refreshing only the
-        // fast delete state and loading any user parts known to be newer than
-        // this exact hidden residency watermark.
+        // Refresh the hidden view before pinning it, so its drained watermark is
+        // as recent as the user view it is compared against.
+        vit.ensure_fresh_async().await;
+        // Wave 1: search the pinned hidden slow state and load any user parts
+        // known to be newer than this exact hidden residency watermark.
         let hidden_reader = vit.pinned_reader_with(self.op_stats.clone());
         let hidden_manifest = Arc::clone(hidden_reader.manifest());
         let drained = hidden_manifest.get_drained_ranges();
@@ -7817,8 +7819,7 @@ impl SupertableReader {
             }
         };
         let fast_state = async {
-            vit.ensure_fresh_async().await;
-            vit.pinned_reader_with(self.op_stats.clone())
+            hidden_reader
                 .hidden_deleted_ids()
                 .map_err(|error| QueryError::Internal(error.to_string()))
         };
@@ -8551,6 +8552,7 @@ mod tests {
                 CellVectorSummary, ClusterCentroids, ManifestSnapshot, VectorSummary,
                 list::{CellRoutingParams, PartitionStrategy},
             },
+            options::Consistency,
             query::vector::global_fine_shortlist_limit,
             reader_cache::{ReaderCacheError, SuperfileReaderCache},
             slow_vector_state::{ResidentIndexKind, write_resident_index_blob},
@@ -14878,6 +14880,69 @@ mod tests {
             .expect("global union search");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].superfile, undrained[0].uri);
+    }
+
+    /// A handle opened before a drain serves rows that drain moved into the
+    /// hidden index from the hidden index, not by scanning them as user
+    /// deltas against its old drained watermark.
+    #[test]
+    fn a_long_lived_handle_sees_a_later_drain() {
+        let dim = 16usize;
+        let schema = schema_with_vector(dim);
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("storage"));
+        let st = Supertable::create(
+            options_one_superfile_per_commit(dim).with_storage(Arc::clone(&storage)),
+        )
+        .expect("create");
+        let mut writer = st.writer().expect("writer");
+        writer
+            .append(&build_vector_batch(0, 8, dim, Arc::clone(&schema)))
+            .expect("append base");
+        writer.commit().expect("commit base");
+        drop(writer);
+        st.drain_vectors_to_cells_sync().expect("drain base");
+
+        let query_handle = Supertable::open(
+            options_one_superfile_per_commit(dim)
+                .with_storage(Arc::clone(&storage))
+                .with_read_consistency(Consistency::Strong),
+        )
+        .expect("open query handle");
+        query_handle
+            .reader()
+            .expect("reader")
+            .vector_index_table()
+            .expect("hidden index after the base drain");
+
+        let mut writer = st.writer().expect("writer delta");
+        writer
+            .append(&build_vector_batch(15, 1, dim, schema))
+            .expect("append delta");
+        writer.commit().expect("commit delta");
+        drop(writer);
+        st.drain_vectors_to_cells_sync().expect("drain delta");
+
+        query_handle.ensure_fresh().expect("refresh user view");
+        let mut query = vec![0.0f32; dim];
+        query[15] = 1.0;
+        let reader = query_handle.reader().expect("reader");
+        let user_uris: Vec<_> = reader
+            .manifest()
+            .superfiles
+            .iter()
+            .map(|entry| entry.uri)
+            .collect();
+        let hits = reader
+            .vector_hits("emb", &query, 1, VectorSearchOptions::new(), None)
+            .expect("search");
+        assert_eq!(hits.len(), 1);
+        assert!(
+            !user_uris.contains(&hits[0].superfile),
+            "the drained row was served from the user table: {:?}",
+            hits[0].superfile
+        );
     }
 
     /// Regression for the pre-drain hnsw collapse (recall 0.240): with
