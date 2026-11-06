@@ -13,7 +13,8 @@ use std::{
 
 use bytes::Bytes;
 use memmap2::Mmap;
-use tempfile::NamedTempFile;
+use tempfile::{NamedTempFile, TempPath};
+use tracing::debug;
 
 /// Newtype around `Arc<Mmap>` that delegates `AsRef<[u8]>`
 /// to the underlying `Mmap`. Lets the cache's `mmap: Arc<Mmap>`
@@ -71,21 +72,28 @@ pub(crate) fn mmap_readonly_with_handle(path: &Path) -> io::Result<(Arc<Mmap>, B
 }
 
 /// The sealed files behind live temp-backed [`Bytes`], keyed by the
-/// mapping's address, with the mapping's length: where a publish to
-/// local-filesystem storage finds the file to link into place instead of
-/// copying the bytes out again. An entry lives exactly as long as the
-/// bytes do.
-static TEMP_BACKED: OnceLock<Mutex<HashMap<usize, (PathBuf, usize)>>> = OnceLock::new();
+/// mapping's address: the mapping's length and the file's name, while it
+/// still has one. Where a publish to local-filesystem storage finds the file
+/// to link into place instead of copying the bytes out again. An entry lives
+/// exactly as long as the bytes do; its name goes earlier when
+/// [`release_temp_file`] lets it go.
+static TEMP_BACKED: OnceLock<Mutex<HashMap<usize, (usize, SealedName)>>> = OnceLock::new();
 
-fn temp_backed() -> &'static Mutex<HashMap<usize, (PathBuf, usize)>> {
+/// The name of a sealed file, shared by its bytes' owner and the
+/// [`TEMP_BACKED`] entry. Emptying it unlinks the file; the mapping stays
+/// valid, since an unlinked inode lives until its last mapping drops.
+type SealedName = Arc<Mutex<Option<TempPath>>>;
+
+fn temp_backed() -> &'static Mutex<HashMap<usize, (usize, SealedName)>> {
     TEMP_BACKED.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Owner of temp-backed bytes: the mapping and the file it maps, which is
-/// unlinked only when the last clone of the bytes drops.
+/// Owner of temp-backed bytes: the mapping and the name of the file it
+/// maps, which is unlinked when [`release_temp_file`] lets it go or, at the
+/// latest, when the last clone of the bytes drops.
 struct TempBackedOwner {
     mmap: Arc<Mmap>,
-    file: NamedTempFile,
+    name: SealedName,
 }
 
 impl AsRef<[u8]> for TempBackedOwner {
@@ -99,7 +107,10 @@ impl Drop for TempBackedOwner {
         if let Ok(mut map) = temp_backed().lock() {
             map.remove(&(self.mmap.as_ptr() as usize));
         }
-        // `file` unlinks itself after this.
+        // Unlinks the file, if it still has one.
+        if let Ok(mut name) = self.name.lock() {
+            drop(name.take());
+        }
     }
 }
 
@@ -109,24 +120,55 @@ impl Drop for TempBackedOwner {
 /// time. The ordinary [`mmap_readonly_bytes`] drops the file at once.
 pub(crate) fn mmap_temp_file_bytes(file: NamedTempFile) -> io::Result<Bytes> {
     let mmap = Arc::new(open_readonly_mmap(file.path())?);
-    let owner = TempBackedOwner { mmap, file };
+    let name: SealedName = Arc::new(Mutex::new(Some(file.into_temp_path())));
     if let Ok(mut map) = temp_backed().lock() {
-        map.insert(
-            owner.mmap.as_ptr() as usize,
-            (owner.file.path().to_path_buf(), owner.mmap.len()),
-        );
+        map.insert(mmap.as_ptr() as usize, (mmap.len(), Arc::clone(&name)));
     }
-    Ok(Bytes::from_owner(owner))
+    Ok(Bytes::from_owner(TempBackedOwner { mmap, name }))
+}
+
+/// The entry for the whole (unsliced) temp-backed `bytes`; `None` for any
+/// other bytes, a slice of the mapping included: a prefix starts at the
+/// same address, so the length is checked too.
+fn sealed_name_of(bytes: &Bytes) -> Option<SealedName> {
+    let map = temp_backed().lock().ok()?;
+    let (len, name) = map.get(&(bytes.as_ptr() as usize))?;
+    (*len == bytes.len()).then(|| Arc::clone(name))
 }
 
 /// The still-present temp file `bytes` were mapped from by
 /// [`mmap_temp_file_bytes`], for the whole (unsliced) bytes; `None` for any
-/// other bytes, a slice of the mapping included: a prefix starts at the
-/// same address, so the length is checked too.
+/// other bytes, and once [`release_temp_file`] has let the file go.
 pub(crate) fn temp_file_behind(bytes: &Bytes) -> Option<PathBuf> {
-    let map = temp_backed().lock().ok()?;
-    let (path, len) = map.get(&(bytes.as_ptr() as usize))?;
-    (*len == bytes.len()).then(|| path.clone())
+    let name = sealed_name_of(bytes)?;
+    name.lock()
+        .ok()
+        .and_then(|name| name.as_ref().map(|path| path.to_path_buf()))
+}
+
+/// Unlink the temp file behind `bytes` now, leaving the bytes readable.
+///
+/// The file's name is only wanted until its bytes are published: a publish
+/// or a cache fill links it into place. Bytes kept after that, for as long
+/// as a table lives, would otherwise keep a scratch file per superfile in
+/// the scratch directory with them, and a process that ends with the table
+/// still referenced (a background task holding it, a caller that never
+/// drops it) never unlinks it at all. A no-op for any other bytes.
+pub(crate) fn release_temp_file(bytes: &Bytes) {
+    // A mapped file cannot be unlinked where the platform refuses to remove
+    // an open file; there it keeps its name and goes with its bytes.
+    if !cfg!(unix) {
+        return;
+    }
+    let Some(name) = sealed_name_of(bytes) else {
+        return;
+    };
+    let taken = name.lock().ok().and_then(|mut name| name.take());
+    if let Some(path) = taken
+        && let Err(error) = path.close()
+    {
+        debug!(%error, "sealed temp file not removed; it goes with its bytes");
+    }
 }
 
 #[cfg(test)]
@@ -166,5 +208,33 @@ mod tests {
 
         drop(bytes);
         assert!(!path.exists(), "the temp file goes with the bytes");
+    }
+
+    /// Releasing the file unlinks it while its bytes stay readable, and no
+    /// publish is pointed at it afterwards; slices and other bytes are left
+    /// alone.
+    #[cfg(unix)]
+    #[test]
+    fn a_released_temp_file_is_unlinked_while_its_bytes_live() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut file = NamedTempFile::new_in(dir.path()).expect("temp file");
+        file.write_all(b"sealed superfile bytes").expect("write");
+        file.flush().expect("flush");
+        let path = file.path().to_path_buf();
+        let bytes = mmap_temp_file_bytes(file).expect("map");
+
+        release_temp_file(&bytes.slice(1..));
+        release_temp_file(&Bytes::from_static(b"other"));
+        assert!(path.exists(), "a slice does not release the file");
+
+        release_temp_file(&bytes);
+        assert!(!path.exists(), "the released file is unlinked");
+        assert!(
+            temp_file_behind(&bytes).is_none(),
+            "nothing to link any more"
+        );
+        assert_eq!(&bytes[..], b"sealed superfile bytes");
+        release_temp_file(&bytes);
+        drop(bytes);
     }
 }

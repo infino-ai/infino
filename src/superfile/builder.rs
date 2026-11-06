@@ -285,6 +285,44 @@ struct RowPick {
     worst_df: u32,
 }
 
+impl RowPick {
+    /// Offer term `t`, carried by `term_df` documents, to this row, whose
+    /// slots are `slots` and whose slots' document counts are `slot_dfs`.
+    ///
+    /// The row keeps the terms carried by the fewest documents, the first
+    /// offered winning a tie. When a term displaces the most common one, the
+    /// new most common is found among the counts kept beside the slots, which
+    /// sit in one cache line, rather than by looking each slot's term up in
+    /// the corpus-wide count table, a miss per slot.
+    #[inline]
+    fn offer(&mut self, slots: &mut [u32], slot_dfs: &mut [u32], t: u32, term_df: u32) {
+        let used = self.filled as usize;
+        if used < slots.len() {
+            slots[used] = t;
+            slot_dfs[used] = term_df;
+            if used == 0 || term_df > self.worst_df {
+                self.worst = used as u8;
+                self.worst_df = term_df;
+            }
+            self.filled = (used + 1) as u8;
+            return;
+        }
+        if term_df >= self.worst_df {
+            return;
+        }
+        slots[self.worst as usize] = t;
+        slot_dfs[self.worst as usize] = term_df;
+        // The worst moved; find it again over the fixed, small slot count.
+        let (mut w, mut w_df) = (0usize, slot_dfs[0]);
+        for (i, &d) in slot_dfs.iter().enumerate().skip(1) {
+            if d > w_df {
+                (w, w_df) = (i, d);
+            }
+        }
+        (self.worst, self.worst_df) = (w as u8, w_df);
+    }
+}
+
 /// Keeps each document's most selective terms for the bisection: what the
 /// second pass of `merge_doc_order` does for one input over one stretch of
 /// output rows.
@@ -302,6 +340,11 @@ impl<E: Fn(u32) -> bool + Sync> TermPicker<'_, E> {
     /// points at its most common one and remembers that count, so a term
     /// that cannot displace it costs one comparison and reads nothing else.
     /// The count table is read once per term, not once per posting.
+    ///
+    /// `slot_dfs` holds the slots' document counts, for a caller whose rows
+    /// other inputs fill too. With `None` the rows are this input's alone,
+    /// and the counts are kept only while it reads them.
+    #[allow(clippy::too_many_arguments)]
     fn pick(
         &self,
         reader: &SuperfileReader,
@@ -309,9 +352,18 @@ impl<E: Fn(u32) -> bool + Sync> TermPicker<'_, E> {
         first_row: usize,
         past_row: usize,
         slots: &mut [u32],
+        slot_dfs: Option<&mut [u32]>,
         picks: &mut [RowPick],
     ) -> Result<(), BuildError> {
         let (terms_per_doc, df) = (self.terms_per_doc, self.df);
+        let mut own_dfs = Vec::new();
+        let slot_dfs = match slot_dfs {
+            Some(slot_dfs) => slot_dfs,
+            None => {
+                own_dfs.resize(slots.len(), 0);
+                &mut own_dfs[..]
+            }
+        };
         let fts = reader.fts().expect("checked by the caller");
         for column_id in 0..self.n_fts_columns {
             // An ineligible term is skipped before its postings are read.
@@ -328,33 +380,8 @@ impl<E: Fn(u32) -> bool + Sync> TermPicker<'_, E> {
                     return;
                 }
                 let row = row - first_row;
-                let slot_base = row * terms_per_doc;
-                let pick = &mut picks[row];
-                let used = pick.filled as usize;
-                if used < terms_per_doc {
-                    slots[slot_base + used] = t;
-                    if used == 0 || term_df > pick.worst_df {
-                        pick.worst = used as u8;
-                        pick.worst_df = term_df;
-                    }
-                    pick.filled = (used + 1) as u8;
-                    return;
-                }
-                if term_df >= pick.worst_df {
-                    return;
-                }
-                slots[slot_base + pick.worst as usize] = t;
-
-                // The worst moved; find it again over the fixed, small slot
-                // count.
-                let (mut w, mut w_df) = (0usize, df[slots[slot_base] as usize]);
-                for i in 1..terms_per_doc {
-                    let d = df[slots[slot_base + i] as usize];
-                    if d > w_df {
-                        (w, w_df) = (i, d);
-                    }
-                }
-                (pick.worst, pick.worst_df) = (w as u8, w_df);
+                let at = row * terms_per_doc..(row + 1) * terms_per_doc;
+                picks[row].offer(&mut slots[at.clone()], &mut slot_dfs[at], t, term_df);
             })
             .map_err(|e| {
                 BuildError::Io(Error::other(format!(
@@ -3032,9 +3059,12 @@ impl SuperfileBuilder {
                 windows
                     .into_par_iter()
                     .try_for_each(|(i, start, end, s, p)| {
-                        picker.pick(&readers[i].0, &rows_by_blob[i], start, end, s, p)
+                        picker.pick(&readers[i].0, &rows_by_blob[i], start, end, s, None, p)
                     })?;
             } else {
+                // Inputs that interleave share rows, so the slots' counts
+                // outlive any one of them.
+                let mut slot_dfs: Vec<u32> = vec![0; run * terms_per_doc];
                 for &(i, _, _) in &covering {
                     picker.pick(
                         &readers[i].0,
@@ -3042,6 +3072,7 @@ impl SuperfileBuilder {
                         first_row,
                         past_row,
                         &mut slots,
+                        Some(&mut slot_dfs),
                         &mut picks,
                     )?;
                 }
@@ -4886,6 +4917,7 @@ mod tests {
     use arrow_array::{Decimal128Array, Int64Array, LargeStringArray, StringArray, UInt64Array};
     use arrow_schema::Field;
     use bytes::Bytes;
+    use rand::{RngExt, SeedableRng, rngs::StdRng};
     use rayon::ThreadPoolBuilder;
     use roaring::RoaringBitmap;
 
@@ -7529,6 +7561,69 @@ mod tests {
 
         let (rows, kept) = survivor_rows(0, None, 7);
         assert_eq!((rows.len(), kept), (0, 0));
+    }
+
+    /// Rows the slot-count test fills.
+    const PICK_TEST_ROWS: usize = 200;
+    /// Terms offered to each row: several times its slots, so most offers
+    /// meet a full row.
+    const PICK_TEST_OFFERS: usize = 120;
+    /// Document counts the test draws from: few enough that ties are common,
+    /// since a tie is where which slot counts as the worst decides the outcome.
+    const PICK_TEST_DFS: u32 = 12;
+
+    /// Keeping each slot's document count beside it picks the same terms,
+    /// into the same slots, as looking every slot's term up in the count
+    /// table does, ties included.
+    #[test]
+    fn a_row_keeps_the_terms_the_count_table_would_pick() {
+        let mut rng = StdRng::seed_from_u64(7);
+        let n_terms = 4 * PICK_TEST_OFFERS as u32;
+        let df: Vec<u32> = (0..n_terms)
+            .map(|_| rng.random_range(2..2 + PICK_TEST_DFS))
+            .collect();
+        for _ in 0..PICK_TEST_ROWS {
+            let offers: Vec<u32> = (0..PICK_TEST_OFFERS)
+                .map(|_| rng.random_range(0..n_terms))
+                .collect();
+
+            let mut slots = [0u32; REORDER_TERMS_PER_DOC];
+            let mut slot_dfs = [0u32; REORDER_TERMS_PER_DOC];
+            let mut pick = RowPick::default();
+            for &t in &offers {
+                pick.offer(&mut slots, &mut slot_dfs, t, df[t as usize]);
+            }
+
+            // The row as it was kept before the counts sat beside the slots.
+            let mut want = [0u32; REORDER_TERMS_PER_DOC];
+            let (mut filled, mut worst, mut worst_df) = (0usize, 0usize, 0u32);
+            for &t in &offers {
+                let term_df = df[t as usize];
+                if filled < want.len() {
+                    want[filled] = t;
+                    if filled == 0 || term_df > worst_df {
+                        (worst, worst_df) = (filled, term_df);
+                    }
+                    filled += 1;
+                    continue;
+                }
+                if term_df >= worst_df {
+                    continue;
+                }
+                want[worst] = t;
+                (worst, worst_df) = (0, df[want[0] as usize]);
+                for (i, &w) in want.iter().enumerate().skip(1) {
+                    if df[w as usize] > worst_df {
+                        (worst, worst_df) = (i, df[w as usize]);
+                    }
+                }
+            }
+            assert_eq!(slots, want);
+            assert_eq!(
+                (pick.filled as usize, pick.worst as usize, pick.worst_df),
+                (filled, worst, worst_df)
+            );
+        }
     }
 
     #[test]

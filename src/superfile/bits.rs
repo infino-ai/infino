@@ -56,6 +56,36 @@ pub(crate) fn put_bits(buf: &mut [u8], bit: usize, v: u64, width: u8) {
     }
 }
 
+/// Write `lanes` as a `width`-bit stream (`width <= 32`) over the whole of
+/// `buf`, which holds exactly their [`payload_bytes`]: lane `i` lands at
+/// bits `i·width..`, as [`put_bits`] places it, its bits above `width`
+/// dropped. The bits gather in a register and leave it four bytes at a
+/// time, rather than as a read-modify-write of every byte a lane touches.
+pub(crate) fn pack_lanes_u32(buf: &mut [u8], lanes: &[u32], width: u8) {
+    debug_assert!(width <= 32);
+    debug_assert_eq!(buf.len(), payload_bytes(lanes.len(), width));
+    if width == 0 {
+        return;
+    }
+    let mask = low_mask(width);
+    let (mut acc, mut held) = (0u64, 0u32);
+    let mut chunks = buf.chunks_mut(size_of::<u32>());
+    for &v in lanes {
+        acc |= (u64::from(v) & mask) << held;
+        held += u32::from(width);
+        if held >= u32::BITS {
+            let chunk = chunks.next().expect("invariant: buf holds every lane");
+            chunk.copy_from_slice(&(acc as u32).to_le_bytes()[..chunk.len()]);
+            acc >>= u32::BITS;
+            held -= u32::BITS;
+        }
+    }
+    if let Some(chunk) = chunks.next() {
+        let n = chunk.len();
+        chunk.copy_from_slice(&acc.to_le_bytes()[..n]);
+    }
+}
+
 /// Value `i` of a `width`-bit stream in `payload`; `None` past its end.
 #[inline]
 pub(crate) fn get_bits(payload: &[u8], i: usize, width: u8) -> Option<u64> {
@@ -129,16 +159,28 @@ pub(crate) fn plan_exceptions(
     plan: &mut ExceptionPlan,
     candidates: &mut Vec<(u32, u32)>,
 ) {
-    let plain = width_of(lanes.iter().copied().max().unwrap_or(0).into());
+    // Lanes at each bit width; a width's exceptions are the lanes wider
+    // than it, so the narrowest width in reach is found from the counts.
+    // Alternate lanes go to two tallies, so neighbouring lanes of one
+    // width do not wait on each other's increment. The widest lane is the
+    // widest width counted: no separate pass for the maximum.
+    let mut at_width = [0usize; u32::BITS as usize + 1];
+    let mut odd = [0usize; u32::BITS as usize + 1];
+    let mut pairs = lanes.chunks_exact(2);
+    for pair in &mut pairs {
+        at_width[width_of(pair[0].into()) as usize] += 1;
+        odd[width_of(pair[1].into()) as usize] += 1;
+    }
+    for &v in pairs.remainder() {
+        at_width[width_of(v.into()) as usize] += 1;
+    }
+    for (count, &more) in at_width.iter_mut().zip(&odd) {
+        *count += more;
+    }
+    let plain = at_width.iter().rposition(|&c| c > 0).unwrap_or(0) as u8;
     plan.width = plain;
     plan.exceptions.clear();
     plan.bytes = base(plain);
-    // Lanes at each bit width; a width's exceptions are the lanes wider
-    // than it, so the narrowest width in reach is found from the counts.
-    let mut at_width = [0usize; u32::BITS as usize + 1];
-    for &v in lanes {
-        at_width[width_of(v.into()) as usize] += 1;
-    }
     let mut wider = 0usize;
     let mut narrowest = plain;
     for width in (0..plain).rev() {
@@ -850,6 +892,39 @@ mod tests {
                 if width > 0 {
                     assert!(for_each_lane(&buf, n, 16, width, |_| {}).is_none());
                 }
+            }
+        }
+    }
+
+    /// Packing a stream lane after lane in a register writes the bytes
+    /// that placing each lane with `put_bits` does, at every width up to
+    /// 32, on lengths that end mid-byte and mid-word, with bits above the
+    /// width dropped, and leaves no byte of the payload unwritten.
+    #[test]
+    fn pack_lanes_u32_matches_put_bits() {
+        /// A byte the packing must overwrite wherever the payload is.
+        const DIRT: u8 = 0xA5;
+        let mut seed = 0x9E37_79B9_u32;
+        for width in 0..=32u8 {
+            for n in [0usize, 1, 3, 7, 8, 31, 32, 33, 129] {
+                let lanes: Vec<u32> = (0..n)
+                    .map(|_| {
+                        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                        seed
+                    })
+                    .collect();
+                let mut want = vec![0u8; payload_bytes(n, width)];
+                for (i, &v) in lanes.iter().enumerate() {
+                    put_bits(
+                        &mut want,
+                        i * width as usize,
+                        u64::from(v) & low_mask(width),
+                        width,
+                    );
+                }
+                let mut got = vec![DIRT; want.len()];
+                pack_lanes_u32(&mut got, &lanes, width);
+                assert_eq!(got, want, "width {width}, {n} lanes");
             }
         }
     }
