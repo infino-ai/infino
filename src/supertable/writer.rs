@@ -12559,7 +12559,8 @@ struct KeptFold {
 /// - With none left to index, layers fold one run per publish, as
 ///   [`term_index::plan_fold_at_optimize`] picks them, of at most
 ///   what the scratch disk holds together ([`term_index::fold_disk_bound`],
-///   or `unmeasured_fold_max_bytes` when the disk cannot be read), and as
+///   or `unmeasured_fold_max_bytes` when the disk cannot be read; zero runs
+///   no folds), and as
 ///   many layers as the host's free
 ///   memory and open-file limit hold. A fold that loses its publish to commits
 ///   has their layers stacked on it ([`term_index::rebase`]), so a retry
@@ -12694,8 +12695,10 @@ pub(in crate::supertable) async fn stamp_term_index(
                     };
                     let mut fold_max_bytes = term_index::fold_disk_bound(reuse_path, disk_per_slice, held)
                         .unwrap_or(unmeasured_fold_max_bytes);
-                    let mut planned = plan(fold_max_bytes);
-                    if planned.is_none() && held > 0 && plan(u64::MAX).is_some() {
+                    // A zero cap runs no folds: a graft leaves its stacked layers to the next optimize.
+                    let folds = unmeasured_fold_max_bytes > 0;
+                    let mut planned = if folds { plan(fold_max_bytes) } else { None };
+                    if folds && planned.is_none() && held > 0 && plan(u64::MAX).is_some() {
                         let evict_dir = reuse_path.clone();
                         let freed = tokio::task::spawn_blocking(move || term_index::evict_kept(&evict_dir))
                             .await
