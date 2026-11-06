@@ -238,6 +238,7 @@ use crate::{
     },
     utils::{
         join::run_spawned,
+        nulls::take_sharing_nulls,
         trace::{self, detail_span, record},
     },
 };
@@ -8979,13 +8980,10 @@ fn build_shard_parquet_and_fts(
 > {
     let options = &inner.options;
     let take_indices = UInt32Array::from(ordered_locals.to_vec());
-    let columns: Vec<ArrayRef> = source_scalar
-        .columns()
-        .iter()
-        .map(|column| take(column.as_ref(), &take_indices, None))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|err| BuildError::Store(err.to_string()))?;
-    let scalar = RecordBatch::try_new(source_scalar.schema(), columns)
+    // A column the commit's rows leave null is not gathered: on a wide,
+    // sparse table that is nearly every column, and gathering each one
+    // wrote an offset per row per column for every shard at once.
+    let scalar = take_sharing_nulls(source_scalar, &take_indices)
         .map_err(|e| BuildError::Store(format!("shard rows: {e}")))?;
 
     // This shard's rows in IVF order — the one remaining vector copy on
