@@ -26,7 +26,8 @@ use std::{
 };
 
 use arrow_array::{
-    ArrayRef, Decimal128Array, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch,
+    ArrayRef, Decimal128Array, FixedSizeListArray, Float32Array, Int64Array, LargeStringArray,
+    RecordBatch,
 };
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
@@ -147,8 +148,11 @@ fn batch(schema: &Arc<Schema>, docs: Range<u32>) -> RecordBatch {
         Arc::new(LargeStringArray::from(
             docs.clone().map(title).collect::<Vec<_>>(),
         )),
-        Arc::new(LargeStringArray::from(docs.map(notes).collect::<Vec<_>>())),
+        Arc::new(LargeStringArray::from(
+            docs.clone().map(notes).collect::<Vec<_>>(),
+        )),
         Arc::new(emb),
+        Arc::new(Int64Array::from(vec![None::<i64>; docs.len()])),
     ];
     RecordBatch::try_new(Arc::clone(schema), columns).expect("batch matches the schema")
 }
@@ -167,6 +171,9 @@ pub(crate) fn create_fixture_table(db: &Connection) -> Supertable {
         Field::new("title", DataType::LargeUtf8, false),
         Field::new("notes", DataType::LargeUtf8, true),
         embedding_field(),
+        // Null in every row, so no superfile stores it: a repair must carry
+        // a file that holds fewer columns than the table.
+        Field::new("extra", DataType::Int64, true),
     ]));
     let spec = IndexSpec::new()
         .fts(FtsField::new("body"))
