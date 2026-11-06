@@ -138,6 +138,14 @@ pub(crate) struct BuildPolicy {
     /// Marks a merge cuts each key range from, about; see
     /// [`MARKS_PER_RANGE`].
     pub(crate) merge_marks_per_range: usize,
+    /// Slices per key range from which a merge cuts its ranges at one mark
+    /// per slice; see [`ONE_MARK_SLICES_PER_RANGE`].
+    pub(crate) one_mark_slices_per_range: usize,
+    /// Bytes a merge first reads from a streamed tier object at a time, and
+    /// what the window grows to while the reads stay sequential; see
+    /// [`REMOTE_TIER_WINDOW_BYTES`] and [`REMOTE_TIER_WINDOW_MAX_BYTES`].
+    pub(crate) remote_tier_window_bytes: u64,
+    pub(crate) remote_tier_window_max_bytes: u64,
     /// Whether a merge carries tier blocks over from its sources' chunks
     /// (see `splice_term`); off, every term takes the decoding path. Tests
     /// compare the two paths byte for byte.
@@ -231,6 +239,9 @@ impl Default for BuildPolicy {
             scoring_by_superfile: Arc::new(HashMap::new()),
             tier_read_window_bytes: TIER_READ_WINDOW_BYTES,
             merge_marks_per_range: MARKS_PER_RANGE,
+            one_mark_slices_per_range: ONE_MARK_SLICES_PER_RANGE,
+            remote_tier_window_bytes: REMOTE_TIER_WINDOW_BYTES,
+            remote_tier_window_max_bytes: REMOTE_TIER_WINDOW_MAX_BYTES,
             merge_ranges_max: None,
             #[cfg(test)]
             splice_tiers: true,
@@ -1931,8 +1942,11 @@ pub(super) struct LayerCursor {
     /// the merge reads that one: where it starts and its length.
     next_window: Option<(u64, u64, JoinHandle<Result<Bytes, TermIndexError>>)>,
     /// Bytes the next streamed tier window asks for: doubled each time the
-    /// window fetched ahead serves, up to [`REMOTE_TIER_WINDOW_MAX_BYTES`].
+    /// window fetched ahead serves, from `remote_window_min` up to
+    /// `remote_window_max`.
     remote_window: u64,
+    remote_window_min: u64,
+    remote_window_max: u64,
     /// The window of the tier object last read, and where it starts. A
     /// slice's chunks lie in key order, so a merge reads the object front
     /// to back and one window serves the terms that fall in it.
@@ -1964,12 +1978,13 @@ impl Drop for LayerCursor {
 impl LayerCursor {
     /// A cursor over `files` in key order, yielding the keys in
     /// `start..end` (either bound open when `None`), reading tier objects
-    /// in windows of at least `window_bytes`.
+    /// in windows of at least the policy's tier read window, and streamed
+    /// ones in the policy's remote windows.
     pub(super) fn new(
         files: &[SliceFile],
         start: Option<&[u8]>,
         end: Option<&[u8]>,
-        window_bytes: u64,
+        policy: &BuildPolicy,
     ) -> Self {
         Self {
             base: files.first().map_or(0, |f| f.base),
@@ -1977,13 +1992,15 @@ impl LayerCursor {
             next_fetch: None,
             remote: None,
             next_window: None,
-            remote_window: REMOTE_TIER_WINDOW_BYTES,
+            remote_window: policy.remote_tier_window_bytes,
+            remote_window_min: policy.remote_tier_window_bytes,
+            remote_window_max: policy.remote_tier_window_max_bytes,
             bytes: Bytes::new(),
             tier: None,
             tier_file: None,
             window: Bytes::new(),
             window_base: 0,
-            window_bytes,
+            window_bytes: policy.tier_read_window_bytes,
             batch: VecDeque::new(),
             last_key: None,
             start: start.map(<[u8]>::to_vec),
@@ -2061,7 +2078,7 @@ impl LayerCursor {
             if let Some((_, _, fetch)) = self.next_window.take() {
                 fetch.abort();
             }
-            self.remote_window = REMOTE_TIER_WINDOW_BYTES;
+            self.remote_window = self.remote_window_min;
             match file.remote {
                 Some(remote) => {
                     let fetch = match self.next_fetch.take() {
@@ -2144,7 +2161,7 @@ impl LayerCursor {
             };
             let (at, bytes) = match ahead {
                 Some((at, bytes)) if end <= at + bytes.len() as u64 => {
-                    self.remote_window = (self.remote_window * 2).min(REMOTE_TIER_WINDOW_MAX_BYTES);
+                    self.remote_window = (self.remote_window * 2).min(self.remote_window_max);
                     (at, bytes)
                 }
                 _ => {
@@ -2496,11 +2513,15 @@ const MERGE_RANGE_MIN_BYTES: u64 = 64 * 1024 * 1024;
 pub(crate) const ONE_MARK_SLICES_PER_RANGE: usize = 64;
 
 /// Whether a merge of `slices` slices from `layers` layers in `ranges` key
-/// ranges cuts them at one mark per slice: enough slices per range, and on
-/// average a slice per range in each layer.
-pub(crate) fn one_mark_per_slice(slices: usize, layers: usize, ranges: usize) -> bool {
-    slices >= ranges.saturating_mul(ONE_MARK_SLICES_PER_RANGE)
-        && slices >= layers.saturating_mul(ranges)
+/// ranges cuts them at one mark per slice: at least `per_range` slices per
+/// range, and on average a slice per range in each layer.
+pub(crate) fn one_mark_per_slice(
+    slices: usize,
+    layers: usize,
+    ranges: usize,
+    per_range: usize,
+) -> bool {
+    slices >= ranges.saturating_mul(per_range) && slices >= layers.saturating_mul(ranges)
 }
 /// Runs read past a group's first block to find where its tier chunks
 /// start, before the group joins the one before it.
@@ -2563,7 +2584,12 @@ pub(crate) fn key_ranges(
     // least a slice per range, so its slices' first keys spread over the
     // key space; a layer of one slice spanning every key puts its only
     // mark at the start.
-    if one_mark_per_slice(files.len(), sources.len(), want) {
+    if one_mark_per_slice(
+        files.len(),
+        sources.len(),
+        want,
+        policy.one_mark_slices_per_range,
+    ) {
         let mut marks = Vec::with_capacity(files.len());
         for file in &files {
             let weight = match &file.remote {
@@ -2673,7 +2699,7 @@ fn merge_range(
 ) -> Result<MergedLayer, TermIndexError> {
     let mut cursors: Vec<LayerCursor> = sources
         .iter()
-        .map(|s| LayerCursor::new(s, start, end, policy.tier_read_window_bytes))
+        .map(|s| LayerCursor::new(s, start, end, policy))
         .collect();
     let mut pending: Vec<Option<Run>> = Vec::with_capacity(cursors.len());
     let mut heap: BinaryHeap<Reverse<MergeHead>> = BinaryHeap::new();

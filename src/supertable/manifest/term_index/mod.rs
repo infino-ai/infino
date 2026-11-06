@@ -1078,7 +1078,12 @@ impl FoldBudget {
             .saturating_mul(per_slice)
             / THOUSANDTHS;
         local > self.cache_bytes
-            && build::one_mark_per_slice(slices, layers.len(), ranges)
+            && build::one_mark_per_slice(
+                slices,
+                layers.len(),
+                ranges,
+                build::ONE_MARK_SLICES_PER_RANGE,
+            )
             && (layers.len() as u64)
                 .saturating_mul(ranges as u64)
                 .saturating_mul(STREAM_CURSOR_BYTES)
@@ -4617,7 +4622,7 @@ mod tests {
                 }
             })
             .collect();
-        let mut cursor = build::LayerCursor::new(&files, None, None, policy.tier_read_window_bytes);
+        let mut cursor = build::LayerCursor::new(&files, None, None, &policy);
         let (mut seen, mut peak) = (0, 0);
         while cursor.next().expect("next").is_some() {
             seen += 1;
@@ -10425,82 +10430,92 @@ mod tests {
         assert_eq!(fold(&streamed), fold(&FoldIo::default()));
     }
 
+    /// A fold that streams its inputs from storage writes the layer a fold
+    /// that downloads them writes. Small windows make a streamed tier read
+    /// span several of them, so the window fetched ahead, the join across
+    /// windows and the doubling all run; two layers of several slices each
+    /// make the key ranges cut at one mark per slice from remote weights.
     #[test]
     fn a_streamed_fold_writes_what_a_downloaded_fold_writes() {
         let dir = TempDir::new().expect("tempdir");
-        let policy = range_policy();
-        let built = build(
-            &[range_contribution(&dir, 1), range_contribution(&dir, 2)],
-            &policy,
-        )
-        .expect("build");
+        let policy = BuildPolicy {
+            one_mark_slices_per_range: 2,
+            remote_tier_window_bytes: 64,
+            remote_tier_window_max_bytes: 256,
+            tier_read_window_bytes: 64,
+            ..range_policy()
+        };
         let store_dir = TempDir::new().expect("store");
         let local: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(store_dir.path()).expect("local"));
         let rt = tokio::runtime::Runtime::new().expect("runtime");
-        let reference = rt.block_on(write_built(&local, built)).expect("write");
+        let base = build(&[range_contribution(&dir, 1)], &policy).expect("base");
+        let base_root = base.root.clone();
+        rt.block_on(write_built(&local, base)).expect("write base");
+        let delta = build_onto(
+            base_root,
+            &[range_contribution(&dir, 2), range_contribution(&dir, 3)],
+            &policy,
+        )
+        .expect("delta");
+        let reference = rt
+            .block_on(write_built(&local, delta))
+            .expect("write delta");
         let root = rt
             .block_on(load_root(local.as_ref(), &reference))
             .expect("root");
+        assert_eq!(root.layers.len(), 2);
+        assert!(root.layers.iter().all(|layer| layer.slices.len() >= 4));
         assert!(
-            root.layers[0]
-                .slices
+            root.layers
                 .iter()
+                .flat_map(|layer| &layer.slices)
                 .any(|slice| slice.tier.is_some())
+        );
+        let ranged = BuildPolicy {
+            merge_ranges: Some(4),
+            ..policy
+        };
+        let sources = rt
+            .block_on(stream_sources(
+                &local,
+                &root.layers,
+                None,
+                &Mutex::default(),
+            ))
+            .expect("sources");
+        let firsts: HashSet<&[u8]> = root
+            .layers
+            .iter()
+            .flat_map(|layer| &layer.slices)
+            .map(|slice| slice.first_key.as_slice())
+            .collect();
+        let ranges = build::key_ranges(&sources, &ranged).expect("ranges");
+        assert!(ranges.len() > 1);
+        assert!(
+            ranges
+                .iter()
+                .filter_map(|(start, _)| start.as_deref())
+                .all(|key| firsts.contains(key)),
+            "cut at one mark per slice"
         );
         let ordinals: Vec<Option<u32>> = (0..root.superfiles.len() as u32).map(Some).collect();
         let streamed = FoldIo {
             stream: true,
             ..FoldIo::default()
         };
-        for marks in [BuildPolicy::default().merge_marks_per_range, 1] {
-            let ranged = BuildPolicy {
-                merge_ranges: Some(4),
-                merge_marks_per_range: marks,
-                ..policy.clone()
-            };
-            let fold = |io: &FoldIo| {
-                rt.block_on(fold_layers(
-                    &local,
-                    &root.layers,
-                    &ordinals,
-                    &ranged,
-                    io,
-                    None,
-                ))
-                .expect("fold")
-            };
-            assert_eq!(fold(&streamed), fold(&FoldIo::default()), "marks {marks}");
-        }
-    }
-
-    /// A fold planned with a budget of many key ranges still writes a small
-    /// run as one range: the budget caps the width, and the merge's size
-    /// floor decides it.
-    #[tokio::test]
-    async fn a_small_fold_writes_one_slice_whatever_the_budget_width() {
-        let dir = TempDir::new().expect("tempdir");
-        let policy = BuildPolicy::default();
-        let (_store_dir, local, base) = store_with_base(&dir, &policy).await;
-        let mut root = base;
-        for id in 2..=FOLD_FAN_OUT as u128 {
-            root = commit_delta(&dir, &local, root, id, false, &policy).await;
-        }
-        let live: HashSet<Uuid> = root.superfiles.iter().copied().collect();
-        let wide = FoldBudget {
-            memory_bytes: FoldBudget::fold_bytes(FOLD_FAN_OUT, 8),
-            ranges: 8,
-            cache_bytes: u64::MAX,
-            cursors: usize::MAX,
+        let fold = |io: &FoldIo| {
+            rt.block_on(fold_layers(
+                &local,
+                &root.layers,
+                &ordinals,
+                &ranged,
+                io,
+                None,
+            ))
+            .expect("fold")
         };
-        let fold = plan_fold_at_optimize(&root, &live, u64::MAX, wide, false, false)
-            .expect("a fold is due");
-        assert!(fold.ranges() > 1, "the budget allows more than one range");
-        let root = fold_at_optimize(&local, &root, fold, &policy, &FoldIo::default(), None)
-            .await
-            .expect("fold");
-        assert_eq!(root.layers.len(), 1);
-        assert_eq!(root.layers[0].slices.len(), 1, "a small run is one range");
+        assert_eq!(fold(&streamed), fold(&FoldIo::default()));
     }
 
     /// A failed put ends the upload while the merge still holds its sink
@@ -10547,14 +10562,14 @@ mod tests {
     /// space, would put every mark at the start.
     #[test]
     fn one_mark_per_slice_needs_slices_spread_over_each_layer() {
-        assert!(build::one_mark_per_slice(1200, 4, 4));
+        assert!(build::one_mark_per_slice(1200, 4, 4, 64));
         assert!(
-            !build::one_mark_per_slice(232, 128, 2),
-            "layers of under two slices, two ranges"
+            !build::one_mark_per_slice(300, 128, 4, 64),
+            "enough slices per range, but layers of about two slices for four ranges"
         );
         assert!(
-            !build::one_mark_per_slice(200, 2, 4),
-            "too few slices per range"
+            !build::one_mark_per_slice(200, 2, 4, 64),
+            "layers spread, but too few slices per range"
         );
     }
 
