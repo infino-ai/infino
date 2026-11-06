@@ -28,15 +28,17 @@ mydb/                                     database root (the connect() path)
 │   │
 │   ├── manifest/
 │   │   └── manifest-000004.json          JSON · immutable manifest version
-│   │       ├ stores : parts[] (each: uri + content_hash, and the summaries
-│   │       │          section's uri + hash + size), schema, fts/vector
-│   │       │          column specs, partition strategy; format 3.0 since the
-│   │       │          summaries section (majors 1 and 2 still read)
+│   │       ├ stores : parts[] (each: uri + content_hash, the summaries
+│   │       │          section's uri + hash + size, and the part's rollups:
+│   │       │          inline when small, else the rollups object's uri + hash
+│   │       │          + size), schema, fts/vector column specs, partition
+│   │       │          strategy; format 4.0 (majors 1 to 3 still read)
 │   │       └ used   : one written per commit (NNNNNN bumps); names the live parts.
-│   │                  The first commit by an engine that writes sections, a
-│   │                  no-data maintenance publish or the hidden index's sibling
-│   │                  included, writes 3.0, which an engine from before refuses:
-│   │                  a deployment that has committed cannot roll back past it
+│   │                  The first commit by an engine of a newer major, a no-data
+│   │                  maintenance publish or the hidden index's sibling
+│   │                  included, writes that major, which an engine of an older
+│   │                  one refuses: a deployment that has committed cannot roll
+│   │                  back past it
 │   │
 │   ├── manifest-parts/
 │   │   └── part-<blake3>.avro.zst        Avro+zstd · immutable, content-addressed
@@ -55,6 +57,16 @@ mydb/                                     database root (the connect() path)
 │   │       │          one per column type, with a directory from column to its rows
 │   │       └ used   : skip-pruning and planner statistics; a column is decoded
 │   │                  on request, so a handle's cost does not grow with the column count
+│   │
+│   ├── manifest-rollups/
+│   │   └── roll-<blake3>.bin             binary · magic "IROL", immutable, content-addressed;
+│   │                                     one per part whose rollups pass the inline cap,
+│   │                                     named by the part's list entry
+│   │       ├ stores : the part's per-column bounds and null counts, folded over its
+│   │       │          superfiles, as one Arrow IPC batch, after a header with the part's id
+│   │       └ used   : the list-level pruner and the commit's fold of the latest part;
+│   │                  a handle reads each once, so the list a commit rewrites stays
+│   │                  small however wide the table
 │   │
 │   ├── term-index/                       written by every commit that adds a superfile
 │   │   ├── root-<blake3>.bin             binary · magic "INFTIDX1", immutable,
@@ -176,6 +188,7 @@ Anchored by symbol so they survive line moves:
 | `data/<stem>-<uuid>.sf.parquet` name (source-named) | `SuperfileEntry::storage_path`, `superfile_stem` | [src/supertable/manifest/mod.rs](../../src/supertable/manifest/mod.rs) |
 | manifest-part Avro schema (`superfiles[].uri`, summaries) | `SuperfileEntry` schema | [src/supertable/manifest/part.rs](../../src/supertable/manifest/part.rs) |
 | `manifest-summaries/summ-<hash>.bin` name and layout: header with the part's id, superfile ids, directory, one IPC batch per column type | `MANIFEST_SUMMARIES_DIR`, `summaries_uri`, `SummariesSection` | [src/supertable/manifest/summaries.rs](../../src/supertable/manifest/summaries.rs) |
+| `manifest-rollups/roll-<hash>.bin` name and layout: header with the part's id, the rollups as one IPC batch; the inline cap | `MANIFEST_ROLLUPS_DIR`, `rollups_uri`, `INLINE_ROLLUPS_MAX_BYTES`, `encode`, `parse` | [src/supertable/manifest/rollups.rs](../../src/supertable/manifest/rollups.rs) |
 | `wal/mutations/` state-doc + `.arrow` sidecar | `WAL_DIR`, `WalStore` | [src/supertable/wal/persistence.rs](../../src/supertable/wal/persistence.rs) |
 | `superfiles/<id>.tombstones` sidecar paths | `SUPERFILES_DIR`, `tombstones_path` | [src/supertable/wal/persistence.rs](../../src/supertable/wal/persistence.rs) |
 | tombstone binary format (`INFTOMB\0` + RoaringBitmap) | `MAGIC`, layout doc | [src/supertable/wal/tombstones_codec.rs](../../src/supertable/wal/tombstones_codec.rs) |

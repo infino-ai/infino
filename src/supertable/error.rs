@@ -27,7 +27,7 @@ use crate::{
     },
     supertable::{
         ManifestLoadError,
-        manifest::{part, summaries, term_index::TermIndexError},
+        manifest::{encoding::BoundRowsError, part, summaries, term_index::TermIndexError},
         schema::error::SchemaError,
     },
 };
@@ -455,6 +455,10 @@ pub enum ManifestError {
     /// statistics.
     #[error("summaries section: {0}")]
     Summaries(#[from] summaries::SummariesError),
+    /// A part's rollups hold a bound that is not one row. The commit is
+    /// refused before the part or its rollups object is written.
+    #[error("rollups: {0}")]
+    Rollups(#[from] BoundRowsError),
     /// A commit would write a superfile's statistics from a section this
     /// handle could not read, and so would record it as having none. The
     /// commit is refused instead; a fresh handle reads the section again.
