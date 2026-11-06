@@ -12409,7 +12409,8 @@ pub(in crate::supertable) async fn stamp_term_index(
                             keep_uploads: keep,
                             disk_per_slice_milli: Some(Arc::clone(disk_per_slice)),
                             downloaded: Some(Arc::clone(&downloaded)),
-                            stream: fold_budget.streams(&root.layers[fold.run()], fold.ranges(), local_milli),
+                            stream: true,
+                            stream_budget: Some(fold_budget),
                             tier_lens: Arc::clone(tier_lens),
                         };
                         let renumbers = fold.renumbers();
@@ -12424,7 +12425,6 @@ pub(in crate::supertable) async fn stamp_term_index(
                             input_mib = fold_bytes >> 20,
                             slices = root.layers[fold.run()].iter().map(|layer| layer.slices.len()).sum::<usize>(),
                             local_milli,
-                            stream = io.stream,
                             "term index fold plan"
                         );
                         let output_at = fold.run().start;

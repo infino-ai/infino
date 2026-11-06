@@ -1523,9 +1523,13 @@ pub(crate) struct FoldIo {
     /// Told once this fold's inputs are on local disk, so the next fold's
     /// prefetch starts when this one stops downloading.
     pub(crate) downloaded: Option<Arc<Notify>>,
-    /// Whether this fold reads its inputs straight from storage instead of
-    /// downloading them first (see [`FoldBudget::streams`]).
+    /// Whether this fold may read its inputs straight from storage instead
+    /// of downloading them first.
     pub(crate) stream: bool,
+    /// What decides it, over the layers the fold merges once the ones it
+    /// moves whole or drops unread are set aside (see
+    /// [`FoldBudget::streams`]); `None` streams whenever `stream` is set.
+    pub(crate) stream_budget: Option<FoldBudget>,
     /// Lengths of the tier objects the call's folds stored, by hash, so a
     /// streamed fold of their outputs need not ask storage.
     pub(crate) tier_lens: Arc<Mutex<HashMap<ContentHash, u64>>>,
@@ -1637,7 +1641,17 @@ async fn fold_layers(
     }
     let scratch = scratch_dir(policy.scratch_root.as_deref())?;
     let reuse = io.reuse_dir.as_deref();
-    let sources = match io.stream {
+    let streams = io.stream
+        && io.stream_budget.is_none_or(|budget| {
+            budget.streams(
+                &kept,
+                policy.merge_ranges_max.unwrap_or(1),
+                io.disk_per_slice_milli
+                    .as_ref()
+                    .map_or(0, |milli| milli.load(AtomicOrdering::Relaxed)),
+            )
+        });
+    let sources = match streams {
         true => {
             stream_sources(storage, &kept, reuse, &io.tier_lens)
                 .instrument(detail_span!("fold.stream_sources", layers = kept.len()))
