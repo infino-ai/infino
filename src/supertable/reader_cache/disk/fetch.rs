@@ -4718,18 +4718,16 @@ mod tests {
             .await
             .expect("put background-fill payload");
         let destination = dir.path().join("preempt.tmp");
-        let signal_reader = Arc::new(
-            SuperfileReader::open(tiny_superfile_bytes()).expect("foreground signal reader"),
-        );
-        let signal_weak = Arc::downgrade(&signal_reader);
         let fill_store = Arc::clone(&store);
         let fill_destination = destination.clone();
-        let fill_signal = signal_weak.clone();
+        store.install_block_entry_for_test(uri, dummy_block_source(&store, uri));
+        let signal = Arc::downgrade(&store.cached.get(&uri).expect("cached").reader);
         let first = spawn(async move {
             let mut filled = Vec::new();
             let outcome = cold_fetch_to_disk_cancelable(
                 &fill_store,
-                &fill_signal,
+                &uri,
+                &BackgroundFill::default(),
                 &fill_store.storage,
                 &storage_uri,
                 &fill_destination,
@@ -4753,8 +4751,8 @@ mod tests {
         })
         .await
         .expect("the download wrote two chunks");
-        // Holding the signal reader (strong_count > 1) is the per-file pause.
-        let foreground = Arc::clone(&signal_reader);
+        // A query holding the file's reader is the per-file pause.
+        let foreground = signal.upgrade().expect("the entry holds the reader");
         let _ = ForegroundQueryGuard::enter();
         let (outcome, mut filled) = first.await.expect("the download joined");
         assert_eq!(outcome.expect("an outcome"), BackgroundFillOutcome::Paused);
@@ -4774,7 +4772,8 @@ mod tests {
         let fill_store = Arc::clone(&store);
         let resumed = cold_fetch_to_disk_cancelable(
             &fill_store,
-            &signal_weak,
+            &uri,
+            &BackgroundFill::default(),
             &fill_store.storage,
             &uri.storage_path(),
             &destination,

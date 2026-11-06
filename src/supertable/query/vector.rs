@@ -83,6 +83,7 @@ use arrow_schema::Schema;
 use datafusion::logical_expr::Expr;
 use futures::{StreamExt, TryStreamExt, stream};
 use roaring::RoaringBitmap;
+use rustc_hash::FxHashSet;
 use tokio::{join, sync::OnceCell};
 use tracing::{Instrument, warn};
 use uuid::Uuid;
@@ -7110,35 +7111,37 @@ impl SupertableReader {
         Ok(CandidateScope { superfiles, allow })
     }
 
-    /// Convert user-table allow bitmaps (local doc ids) to stable `_id`s.
+    /// The stable `_id`s of the rows the filter kept in each drained user
+    /// superfile, as the set [`Self::prepare_vector_stable_allow_inner`]
+    /// probes once per hidden-index row.
+    ///
+    /// Sized for every kept row up front, so it is allocated once. FxHash
+    /// rather than the default SipHash: the probe runs once per index row and
+    /// SipHash is several times slower on 16-byte keys, and `_id`s are minted
+    /// by the engine, so no caller can choose keys that collide.
     async fn stable_ids_from_user_allow_async(
         &self,
-        user_allow: &HashMap<SuperfileUri, Arc<RoaringBitmap>>,
-    ) -> Result<Vec<i128>, QueryError> {
-        let mut out: HashSet<i128> = HashSet::new();
+        kept_by_superfile: &[(Arc<SuperfileEntry>, Arc<RoaringBitmap>)],
+    ) -> Result<FxHashSet<i128>, QueryError> {
+        let kept: u64 = kept_by_superfile.iter().map(|(_, bm)| bm.len()).sum();
+        let mut out = FxHashSet::with_capacity_and_hasher(
+            usize::try_from(kept).unwrap_or(0),
+            Default::default(),
+        );
         let manifest = self.manifest();
         let id_column = self.options().id_column.as_str();
-        for (uri, bm) in user_allow {
-            let entry = manifest
-                .lookup_superfile_entry(*uri)
-                .await
-                .map_err(QueryError::ManifestLoad)?
-                .ok_or_else(|| {
-                    QueryError::Internal(format!("user superfile {uri:?} missing from manifest"))
-                })?;
-            if row_id_from_manifest_entry(&entry, 0).is_some() {
-                for local in bm.iter() {
-                    out.insert(entry.id_min + i128::from(local));
-                }
+        for (entry, bm) in kept_by_superfile {
+            if row_id_from_manifest_entry(entry, 0).is_some() {
+                out.extend(bm.iter().map(|local| entry.id_min + i128::from(local)));
                 continue;
             }
             let locals = Arc::new(bm.iter().collect::<Vec<u32>>());
             let ids =
-                read_ids_for_locals(manifest, &entry, &locals, id_column, false, &self.op_stats)
+                read_ids_for_locals(manifest, entry, &locals, id_column, false, &self.op_stats)
                     .await?;
             out.extend(ids);
         }
-        Ok(out.into_iter().collect())
+        Ok(out)
     }
 
     /// Filtered kNN: resolve the predicate on the user table, then search the
@@ -7165,12 +7168,12 @@ impl SupertableReader {
                     .get_drained_ranges()
             })
             .unwrap_or_default();
-        let mut drained_allow = HashMap::new();
+        let mut drained_allow = Vec::new();
         let mut undrained_user = Vec::new();
         for entry in user_superfiles {
             if drained.contains(entry.birth_version) {
                 if let Some(bitmap) = user_allow.get(&entry.uri) {
-                    drained_allow.insert(entry.uri, Arc::clone(bitmap));
+                    drained_allow.push((entry, Arc::clone(bitmap)));
                 }
             } else {
                 undrained_user.push(entry);
@@ -7189,14 +7192,14 @@ impl SupertableReader {
             )
             .await?
         };
-        let stable_ids = self
+        let allow_set = self
             .stable_ids_from_user_allow_async(&drained_allow)
             .await?;
-        let hidden_hits = if stable_ids.is_empty() {
+        let hidden_hits = if allow_set.is_empty() {
             Vec::new()
         } else {
             let prepared = self
-                .prepare_vector_stable_allow_async(Arc::new(stable_ids))
+                .prepare_vector_stable_allow_inner(Arc::new(allow_set))
                 .await?;
             if !prepared.use_hidden_index {
                 return Err(QueryError::Internal(
@@ -7255,32 +7258,10 @@ impl SupertableReader {
                 .await
                 .map_err(QueryError::ManifestLoad)?;
             if !superfiles.is_empty() {
-                let allow_for_cell = Arc::clone(&allow_global);
-                let manifest_for_ids = Arc::clone(&hidden_manifest);
-                let routing_stats = hidden_reader.op_stats.clone();
+                let allow = Arc::clone(&allow_global);
                 let allow_by_uri = hidden_reader
-                    .fanout_candidate_bitmaps(&superfiles, move |r, entry| {
-                        let allow_for_cell = Arc::clone(&allow_for_cell);
-                        let manifest_for_ids = Arc::clone(&manifest_for_ids);
-                        let routing_stats = routing_stats.clone();
-                        async move {
-                            let stable_ids = stable_ids_by_local_for_routing(
-                                &manifest_for_ids,
-                                &entry,
-                                &r,
-                                &routing_stats,
-                            )
-                            .await?;
-                            let mut local = RoaringBitmap::new();
-                            for (local_doc_id, stable_id) in stable_ids.into_iter().enumerate() {
-                                if let Ok(global_id) = u32::try_from(stable_id)
-                                    && allow_for_cell.contains(global_id)
-                                {
-                                    local.insert(local_doc_id as u32);
-                                }
-                            }
-                            Ok(local)
-                        }
+                    .rows_where_id(&superfiles, move |id| {
+                        u32::try_from(id).is_ok_and(|global_id| allow.contains(global_id))
                     })
                     .await?;
                 if allow_by_uri.is_empty() {
@@ -7338,28 +7319,18 @@ impl SupertableReader {
         })
     }
 
-    /// Build a per-superfile allow-set from stable `_id` values.
-    ///
-    /// Post-drain: every supplied id is expected to describe a drained row and
-    /// must map against hidden-cell stable ids; an empty mapping is an
-    /// invariant error. Pre-drain (empty hidden membership and drained range)
-    /// maps against the user table.
-    #[cfg(feature = "test-helpers")]
-    pub async fn prepare_vector_stable_allow_async(
-        &self,
-        allow_stable_ids: Arc<Vec<i128>>,
-    ) -> Result<PreparedGlobalAllow, QueryError> {
-        self.prepare_vector_stable_allow_inner(allow_stable_ids)
-            .await
-    }
-
-    #[cfg(not(feature = "test-helpers"))]
-    pub(crate) async fn prepare_vector_stable_allow_async(
-        &self,
-        allow_stable_ids: Arc<Vec<i128>>,
-    ) -> Result<PreparedGlobalAllow, QueryError> {
-        self.prepare_vector_stable_allow_inner(allow_stable_ids)
-            .await
+    #[cfg(any(test, feature = "test-helpers"))]
+    test_visible! {
+        /// Test and bench entry to the filtered search's allow-set mapping,
+        /// from a list of stable `_id`s instead of the set the search builds.
+        async fn prepare_vector_stable_allow_async(
+            &self,
+            allow_stable_ids: Arc<Vec<i128>>,
+        ) -> Result<PreparedGlobalAllow, QueryError> {
+            let allow_set = allow_stable_ids.iter().copied().collect();
+            self.prepare_vector_stable_allow_inner(Arc::new(allow_set))
+                .await
+        }
     }
 
     /// Test-only diagnostic (#515): map every drained row's stable id to
@@ -7452,18 +7423,27 @@ impl SupertableReader {
         }
     }
 
+    /// The rows of each vector-carrying superfile whose stable `_id` is in
+    /// `allow_set`, as per-superfile local-row bitmaps for the filtered search.
+    ///
+    /// After the first drain the rows live in the hidden index, stored by
+    /// cell rather than by id, so no id range points at a row: every hidden
+    /// row's id is checked against the set. That costs one probe per index
+    /// row, whatever the filter keeps. Before the first drain the same check
+    /// runs over the user table.
+    ///
+    /// Every id handed in after a drain must belong to a drained row, so a set
+    /// that maps to no hidden row is an invariant error, not an empty result.
     async fn prepare_vector_stable_allow_inner(
         &self,
-        allow_stable_ids: Arc<Vec<i128>>,
+        allow_set: Arc<FxHashSet<i128>>,
     ) -> Result<PreparedGlobalAllow, QueryError> {
-        if allow_stable_ids.is_empty() {
+        if allow_set.is_empty() {
             return Ok(PreparedGlobalAllow {
                 use_hidden_index: false,
                 allow_by_uri: HashMap::new(),
             });
         }
-        let allow_set: Arc<HashSet<i128>> =
-            Arc::new(allow_stable_ids.iter().copied().collect::<HashSet<i128>>());
         if let Some(vit) = self.vector_index_table() {
             let hidden_reader = vit.pinned_reader_with(self.op_stats.clone());
             let hidden_manifest = Arc::clone(hidden_reader.manifest());
@@ -7473,31 +7453,8 @@ impl SupertableReader {
                 .await
                 .map_err(QueryError::ManifestLoad)?;
             if !superfiles.is_empty() {
-                let allow_for_cell = Arc::clone(&allow_set);
-                let manifest_for_ids = Arc::clone(&hidden_manifest);
-                let routing_stats = hidden_reader.op_stats.clone();
                 let allow_by_uri = hidden_reader
-                    .fanout_candidate_bitmaps(&superfiles, move |r, entry| {
-                        let allow_for_cell = Arc::clone(&allow_for_cell);
-                        let manifest_for_ids = Arc::clone(&manifest_for_ids);
-                        let routing_stats = routing_stats.clone();
-                        async move {
-                            let stable_ids = stable_ids_by_local_for_routing(
-                                &manifest_for_ids,
-                                &entry,
-                                &r,
-                                &routing_stats,
-                            )
-                            .await?;
-                            let mut local = RoaringBitmap::new();
-                            for (local_doc_id, stable_id) in stable_ids.into_iter().enumerate() {
-                                if allow_for_cell.contains(&stable_id) {
-                                    local.insert(local_doc_id as u32);
-                                }
-                            }
-                            Ok(local)
-                        }
-                    })
+                    .rows_where_id(&superfiles, move |id| allow_set.contains(&id))
                     .await?;
                 if allow_by_uri.is_empty() {
                     return Err(QueryError::Internal(
@@ -7517,47 +7474,60 @@ impl SupertableReader {
                 ));
             }
         }
-        let manifest = self.manifest();
-        let superfiles = manifest
+        let superfiles = self
+            .manifest()
             .get_all_superfiles_loaded()
             .await
             .map_err(QueryError::ManifestLoad)?;
-        if superfiles.is_empty() {
-            return Ok(PreparedGlobalAllow {
-                use_hidden_index: false,
-                allow_by_uri: HashMap::new(),
-            });
-        }
-        let allow_for_user = Arc::clone(&allow_set);
-        let manifest_for_ids = Arc::clone(manifest);
-        let routing_stats = self.op_stats.clone();
-        let allow_by_uri = self
-            .fanout_candidate_bitmaps(&superfiles, move |r, entry| {
-                let allow_for_user = Arc::clone(&allow_for_user);
-                let manifest_for_ids = Arc::clone(&manifest_for_ids);
-                let routing_stats = routing_stats.clone();
-                async move {
-                    let stable_ids = stable_ids_by_local_for_routing(
-                        &manifest_for_ids,
-                        &entry,
-                        &r,
-                        &routing_stats,
-                    )
-                    .await?;
-                    let mut local = RoaringBitmap::new();
-                    for (local_doc_id, stable_id) in stable_ids.into_iter().enumerate() {
-                        if allow_for_user.contains(&stable_id) {
-                            local.insert(local_doc_id as u32);
-                        }
-                    }
-                    Ok(local)
-                }
-            })
-            .await?;
         Ok(PreparedGlobalAllow {
             use_hidden_index: false,
-            allow_by_uri,
+            allow_by_uri: self
+                .rows_where_id(&superfiles, move |id| allow_set.contains(&id))
+                .await?,
         })
+    }
+
+    /// For each of `superfiles` (all from this reader's table), the local
+    /// rows whose stable `_id` passes `keep`; files with none are left out.
+    ///
+    /// Reading the ids is I/O and runs here; checking every row against
+    /// `keep` is CPU over the whole file, so it runs on the reader pool and
+    /// leaves the tokio worker free for other queries' reads.
+    async fn rows_where_id<K>(
+        &self,
+        superfiles: &[Arc<SuperfileEntry>],
+        keep: K,
+    ) -> Result<HashMap<SuperfileUri, Arc<RoaringBitmap>>, QueryError>
+    where
+        K: Fn(i128) -> bool + Send + Sync + 'static,
+    {
+        let keep = Arc::new(keep);
+        let manifest = Arc::clone(self.manifest());
+        let op_stats = self.op_stats.clone();
+        self.fanout_candidate_bitmaps(superfiles, move |reader, entry| {
+            let keep = Arc::clone(&keep);
+            let manifest = Arc::clone(&manifest);
+            let op_stats = op_stats.clone();
+            async move {
+                let stable_ids =
+                    stable_ids_by_local_for_routing(&manifest, &entry, &reader, &op_stats).await?;
+                run_on_pool(
+                    Some(&manifest.options.reader_pool),
+                    "allowed-row probe: reader pool dropped result",
+                    move || {
+                        // Locals ascend, so the bitmap is appended to, never searched.
+                        let kept = (0u32..)
+                            .zip(stable_ids)
+                            .filter_map(|(local, id)| keep(id).then_some(local));
+                        RoaringBitmap::from_sorted_iter(kept)
+                            .expect("invariant: local row numbers ascend")
+                    },
+                )
+                .await
+                .map_err(|e| QueryError::Internal(e.to_string()))
+            }
+        })
+        .await
     }
 
     /// Run filtered vector fan-out from a precomputed allow-set (user or
@@ -7797,9 +7767,11 @@ impl SupertableReader {
                 .await;
         };
 
-        // Wave 1: search the pinned hidden slow state while refreshing only the
-        // fast delete state and loading any user parts known to be newer than
-        // this exact hidden residency watermark.
+        // Refresh the hidden view before pinning it, so its drained watermark is
+        // as recent as the user view it is compared against.
+        vit.ensure_fresh_async().await;
+        // Wave 1: search the pinned hidden slow state and load any user parts
+        // known to be newer than this exact hidden residency watermark.
         let hidden_reader = vit.pinned_reader_with(self.op_stats.clone());
         let hidden_manifest = Arc::clone(hidden_reader.manifest());
         let drained = hidden_manifest.get_drained_ranges();
@@ -7817,8 +7789,7 @@ impl SupertableReader {
             }
         };
         let fast_state = async {
-            vit.ensure_fresh_async().await;
-            vit.pinned_reader_with(self.op_stats.clone())
+            hidden_reader
                 .hidden_deleted_ids()
                 .map_err(|error| QueryError::Internal(error.to_string()))
         };
@@ -8551,6 +8522,7 @@ mod tests {
                 CellVectorSummary, ClusterCentroids, ManifestSnapshot, VectorSummary,
                 list::{CellRoutingParams, PartitionStrategy},
             },
+            options::Consistency,
             query::vector::global_fine_shortlist_limit,
             reader_cache::{ReaderCacheError, SuperfileReaderCache},
             slow_vector_state::{ResidentIndexKind, write_resident_index_blob},
@@ -14878,6 +14850,69 @@ mod tests {
             .expect("global union search");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].superfile, undrained[0].uri);
+    }
+
+    /// A handle opened before a drain serves rows that drain moved into the
+    /// hidden index from the hidden index, not by scanning them as user
+    /// deltas against its old drained watermark.
+    #[test]
+    fn a_long_lived_handle_sees_a_later_drain() {
+        let dim = 16usize;
+        let schema = schema_with_vector(dim);
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("storage"));
+        let st = Supertable::create(
+            options_one_superfile_per_commit(dim).with_storage(Arc::clone(&storage)),
+        )
+        .expect("create");
+        let mut writer = st.writer().expect("writer");
+        writer
+            .append(&build_vector_batch(0, 8, dim, Arc::clone(&schema)))
+            .expect("append base");
+        writer.commit().expect("commit base");
+        drop(writer);
+        st.drain_vectors_to_cells_sync().expect("drain base");
+
+        let query_handle = Supertable::open(
+            options_one_superfile_per_commit(dim)
+                .with_storage(Arc::clone(&storage))
+                .with_read_consistency(Consistency::Strong),
+        )
+        .expect("open query handle");
+        query_handle
+            .reader()
+            .expect("reader")
+            .vector_index_table()
+            .expect("hidden index after the base drain");
+
+        let mut writer = st.writer().expect("writer delta");
+        writer
+            .append(&build_vector_batch(15, 1, dim, schema))
+            .expect("append delta");
+        writer.commit().expect("commit delta");
+        drop(writer);
+        st.drain_vectors_to_cells_sync().expect("drain delta");
+
+        query_handle.ensure_fresh().expect("refresh user view");
+        let mut query = vec![0.0f32; dim];
+        query[15] = 1.0;
+        let reader = query_handle.reader().expect("reader");
+        let user_uris: Vec<_> = reader
+            .manifest()
+            .superfiles
+            .iter()
+            .map(|entry| entry.uri)
+            .collect();
+        let hits = reader
+            .vector_hits("emb", &query, 1, VectorSearchOptions::new(), None)
+            .expect("search");
+        assert_eq!(hits.len(), 1);
+        assert!(
+            !user_uris.contains(&hits[0].superfile),
+            "the drained row was served from the user table: {:?}",
+            hits[0].superfile
+        );
     }
 
     /// Regression for the pre-drain hnsw collapse (recall 0.240): with
