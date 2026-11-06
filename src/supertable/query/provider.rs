@@ -54,6 +54,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fmt,
     future::Future,
+    slice,
     sync::{Arc, atomic},
     time::Instant,
 };
@@ -79,7 +80,7 @@ use datafusion::{
     execution::{context::ExecutionProps, object_store::ObjectStoreUrl},
     logical_expr::{
         Expr, Operator, TableProviderFilterPushDown, TableType,
-        utils::{conjunction, split_conjunction},
+        utils::{conjunction, split_binary, split_conjunction},
     },
     object_store::path::Path as ObjPath,
     physical_expr::create_physical_expr,
@@ -2652,24 +2653,22 @@ fn selection_access_plan_from_counts(
 /// column also yields a `TermPresence` leaf so the superfile's term
 /// bloom prunes it. Sound: a row matching `col = 'a b'` has a value
 /// whose tokens include every token of the literal, so requiring all
-/// of them possibly-present (`BoolMode::And`) never drops a match —
+/// of them possibly-present (`BoolMode::And`) never drops a match;
 /// bloom false positives can only keep a superfile, never drop one.
 fn scalar_predicates_to_prune_leaves(
-    manifest: &ManifestSnapshot,
+    fts_cols: &HashSet<&str>,
+    resolve: &dyn Fn(&str) -> Option<Arc<dyn Tokenizer>>,
     predicates: Vec<ScalarPredicate>,
 ) -> Vec<PruneLeaf> {
     let mut leaves = Vec::with_capacity(predicates.len());
     for pred in predicates {
         if pred.op == ScalarOp::Eq
-            && manifest
-                .fts_configs()
-                .iter()
-                .any(|c| c.column == pred.column)
+            && fts_cols.contains(pred.column.as_str())
             && let Some(literal) = scalar_as_str(&pred.value)
         {
             // Per-column analyzer: prune with the tokenizer this column
             // was indexed with, not a single table-wide default.
-            let Some(tok) = manifest.try_fts_tokenizer_for(&pred.column) else {
+            let Some(tok) = resolve(&pred.column) else {
                 leaves.push(PruneLeaf::Scalar(pred));
                 continue;
             };
@@ -2690,9 +2689,10 @@ fn scalar_predicates_to_prune_leaves(
 /// Every manifest prune leaf a `WHERE` clause yields: scalar min/max for
 /// `column <op> literal` conjuncts (plus a term bloom when the column is
 /// FTS-indexed), value sets for `IN` and same-column `OR`s of equalities,
-/// term blooms and lex ranges for `LIKE`, and null counts for `IS [NOT]
-/// NULL`. `schema` is the table's scalar schema, which names the columns
-/// a predicate may prune on.
+/// term blooms and lex ranges for `LIKE`, null counts for `IS [NOT]
+/// NULL`, and an `AnyOf` for any other `OR` whose branches all prune.
+/// `schema` is the table's scalar schema, which names the columns a
+/// predicate may prune on.
 ///
 /// Shared by the SQL scan and the search table functions, so a
 /// `WHERE path = 'x'` skips the same superfiles whether it sits over a
@@ -2706,16 +2706,70 @@ pub(crate) fn prune_leaves_for_filters(
     let fts_configs = manifest.fts_configs();
     let fts_cols: HashSet<&str> = fts_configs.iter().map(|c| c.column.as_str()).collect();
     let resolve = |col: &str| manifest.try_fts_tokenizer_for(col);
-    let mut leaves =
-        scalar_predicates_to_prune_leaves(manifest, exprs_to_scalar_predicates(filters, schema));
-    leaves.extend(exprs_to_value_set_leaves(
-        filters, schema, &fts_cols, &resolve,
-    ));
-    // `LIKE` on an FTS column: a term bloom for the pattern's complete
-    // tokens and a lex-range check for a prefix token.
-    leaves.extend(like_prune_leaves(filters, &fts_cols, &resolve));
-    leaves.extend(exprs_to_null_leaves(filters, schema));
-    leaves
+    PruneLowering {
+        schema,
+        fts_cols: &fts_cols,
+        resolve: &resolve,
+    }
+    .leaves(filters)
+}
+
+/// What lowering a `WHERE` to prune leaves needs about the table, looked
+/// up once per query and shared by every `OR` branch.
+struct PruneLowering<'a> {
+    schema: &'a SchemaRef,
+    fts_cols: &'a HashSet<&'a str>,
+    resolve: &'a dyn Fn(&str) -> Option<Arc<dyn Tokenizer>>,
+}
+
+impl PruneLowering<'_> {
+    /// The conjunction of leaves `filters` yields.
+    fn leaves(&self, filters: &[Expr]) -> Vec<PruneLeaf> {
+        let mut leaves = scalar_predicates_to_prune_leaves(
+            self.fts_cols,
+            self.resolve,
+            exprs_to_scalar_predicates(filters, self.schema),
+        );
+        leaves.extend(exprs_to_value_set_leaves(
+            filters,
+            self.schema,
+            self.fts_cols,
+            self.resolve,
+        ));
+        // `LIKE` on an FTS column: a term bloom for the pattern's complete
+        // tokens and a lex-range check for a prefix token.
+        leaves.extend(like_prune_leaves(filters, self.fts_cols, self.resolve));
+        leaves.extend(exprs_to_null_leaves(filters, self.schema));
+        for filter in filters {
+            self.collect_or_leaves(filter, &mut leaves);
+        }
+        leaves
+    }
+
+    /// Walk one filter's `AND`s and aliases; each `OR` there becomes one
+    /// [`PruneLeaf::any_of`] over its branches, each branch lowered like a
+    /// whole `WHERE`. A same-column `OR` of equalities is skipped: the
+    /// value-set leaf already covers it in one pass.
+    fn collect_or_leaves(&self, expr: &Expr, out: &mut Vec<PruneLeaf>) {
+        match expr {
+            Expr::Alias(a) => self.collect_or_leaves(&a.expr, out),
+            Expr::BinaryExpr(be) if be.op == Operator::And => {
+                self.collect_or_leaves(&be.left, out);
+                self.collect_or_leaves(&be.right, out);
+            }
+            Expr::BinaryExpr(be) if be.op == Operator::Or => {
+                if flatten_or_eq(expr, self.schema).is_some() {
+                    return;
+                }
+                let branches = split_binary(expr, Operator::Or)
+                    .into_iter()
+                    .map(|branch| self.leaves(slice::from_ref(branch)))
+                    .collect();
+                out.extend(PruneLeaf::any_of(branches));
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Lower a conjunction of DataFusion filter `Expr`s into infino's
@@ -3794,6 +3848,104 @@ mod tests {
             0,
             "a range before the table's first row keeps nothing"
         );
+    }
+
+    /// An `OR` prunes like the union of its branches: a superfile is
+    /// skipped only when no branch could match it. Two time windows must
+    /// open the two files that hold them, not the whole table.
+    #[test]
+    fn superfile_prune_by_or_of_ranges() {
+        let st = Supertable::create(time_hits_opts()).expect("create");
+        let mut w = st.writer().expect("writer");
+        for hours in [[0, 1], [2, 3], [4, 5]] {
+            w.append(&time_hits_batch(&hours)).expect("append");
+            w.commit().expect("commit");
+        }
+        let provider = provider_of(&st);
+        let rt = query_runtime();
+        let survivors = |filters: &[Expr]| rt.block_on(provider.surviving_superfile_count(filters));
+        let window = |hour: i64| {
+            col("time")
+                .gt_eq(at_hour(hour))
+                .and(col("time").lt(at_hour(hour + 1)))
+        };
+        let before_table = col("time").lt(at_hour(0));
+
+        assert_eq!(
+            survivors(&[window(2).or(window(4))]),
+            2,
+            "two windows keep the two superfiles holding them"
+        );
+        assert_eq!(
+            survivors(&[before_table.clone().or(before_table.clone())]),
+            0,
+            "an OR whose every branch misses the table keeps nothing"
+        );
+        assert_eq!(
+            survivors(&[window(2).or(window(4)), col("time").gt_eq(at_hour(4))]),
+            1,
+            "an OR beside another conjunct keeps what both allow"
+        );
+        assert_eq!(
+            survivors(&[window(2).or(col("hits").gt(lit(5i64)))]),
+            1,
+            "branches on different columns prune each on their own column"
+        );
+        assert_eq!(
+            survivors(&[window(2)
+                .or(window(4))
+                .and(col("time").gt_eq(at_hour(4)))
+                .or(before_table)]),
+            1,
+            "an OR nested in a branch prunes inside that branch"
+        );
+        assert_eq!(
+            survivors(&[window(2).or(col("time").eq(col("time")))]),
+            3,
+            "a branch no statistic can bound keeps every superfile"
+        );
+    }
+
+    /// A same-column `OR` of equalities stays one value-set leaf, checked
+    /// in one pass per superfile, rather than an `AnyOf` of equalities.
+    #[test]
+    fn same_column_or_of_equalities_stays_a_value_set() {
+        let manifest = ManifestSnapshot::empty(Arc::new(time_hits_opts()));
+        let either = col("hits").eq(lit(1i64)).or(col("hits").eq(lit(2i64)));
+        let leaves = prune_leaves_for_filters(&manifest, &time_hits_schema(), &[either]);
+        assert!(matches!(
+            leaves.as_slice(),
+            [PruneLeaf::ScalarValueSet { .. }]
+        ));
+    }
+
+    /// Pruning an `OR` drops no row it matches: SQL counts every row of
+    /// each window, with a branch that matches nothing and with one that
+    /// matches every file.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sql_counts_every_row_an_or_of_ranges_matches() {
+        let st = Supertable::create(time_hits_opts()).expect("create");
+        let mut w = st.writer().expect("writer");
+        for hours in [[0, 1], [2, 3], [4, 5]] {
+            w.append(&time_hits_batch(&hours)).expect("append");
+            w.commit().expect("commit");
+        }
+        let window = |hour: i64| {
+            format!(
+                "(time >= TIMESTAMP '1970-01-01 0{hour}:00:00' \
+                 AND time < TIMESTAMP '1970-01-01 0{}:00:00')",
+                hour + 1
+            )
+        };
+        let queries = [
+            (format!("{} OR {}", window(2), window(4)), 2),
+            (format!("{} OR {} OR hits > 5", window(2), window(4)), 2),
+            (format!("{} OR hits = 1", window(2)), 6),
+        ];
+        for (filter, expected) in &queries {
+            let sql = format!("SELECT count(*) FROM {TABLE_NAME} WHERE {filter}");
+            assert_eq!(count_of(&st, &sql).await, *expected, "{sql}");
+        }
     }
 
     /// The same range prune over superfiles a bulk load wrote: hydrate

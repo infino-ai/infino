@@ -125,7 +125,10 @@ use crate::{
                 SummariesError, SummariesRef, SummariesSection, rows_from_entries, summaries_uri,
             },
         },
-        query::{hierarchical_iter, prune::PruneLeaf},
+        query::{
+            hierarchical_iter,
+            prune::{PruneLeaf, keep_parts_for_all},
+        },
         schema::{FieldId, LegacyNames, PhysicalKind, PhysicalSchema, TableSchema},
         slow_vector_state,
     },
@@ -1534,18 +1537,7 @@ impl ManifestSnapshot {
                 }
                 // Incomplete view (legacy lazy manifests): prune at part
                 // granularity and load only the survivors.
-                // Intersect each constraining leaf's kept-part set. A leaf
-                // with no part pruner (`None`) imposes no constraint.
-                let mut kept: Option<HashSet<PartId>> = None;
-                for leaf in leaves {
-                    if let Some(part_ids) = leaf.keep_parts(list, self) {
-                        let set: HashSet<PartId> = part_ids.into_iter().collect();
-                        kept = Some(match kept {
-                            None => set,
-                            Some(existing) => existing.intersection(&set).copied().collect(),
-                        });
-                    }
-                }
+                let mut kept = keep_parts_for_all(leaves, list, self);
                 // With a term index that lists every live superfile, term and
                 // prefix leaves choose the parts to load exactly: route to
                 // superfiles, then keep the parts whose recorded id range

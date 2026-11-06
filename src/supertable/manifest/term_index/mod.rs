@@ -7040,6 +7040,38 @@ mod tests {
             by_prefix, s1,
             "a prefix routes through the slices to the same superfile"
         );
+        // An `OR` of routed terms keeps each branch's superfile. The second
+        // branch sees only the superfiles the first did not keep, so its
+        // routed answer must line up with that narrowed list.
+        let term = |t: &str| {
+            vec![PruneLeaf::TermPresence {
+                column: "title".to_owned(),
+                terms: vec![t.to_owned()],
+                mode: BoolMode::Or,
+            }]
+        };
+        let select_or = |branches: Vec<Vec<PruneLeaf>>| -> HashSet<Uuid> {
+            let leaf = PruneLeaf::any_of(branches).expect("two non-empty branches");
+            rt.block_on(select_superfiles(
+                manifest.as_ref(),
+                std::slice::from_ref(&leaf),
+            ))
+            .expect("select")
+            .iter()
+            .map(|e| e.superfile_id)
+            .collect()
+        };
+        let s2 = select(&["s2d00"], BoolMode::Or);
+        assert_eq!(
+            select_or(vec![term("s1d00"), term("s2d00")]),
+            &s1 | &s2,
+            "each branch keeps the superfile its term routes to"
+        );
+        assert_eq!(
+            select_or(vec![term("absent"), term("s1d00")]),
+            s1,
+            "a branch whose term is nowhere keeps nothing"
+        );
     }
     /// Every posting's bound is a true ceiling: for each term, the highest
     /// score any document in that superfile actually receives under the

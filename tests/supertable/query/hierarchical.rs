@@ -686,6 +686,32 @@ fn sql_is_not_null_prunes_all_null_parts() {
 }
 
 #[test]
+fn sql_or_across_columns_loads_only_the_parts_a_branch_can_match() {
+    // `tag IS NULL OR title = 'e0'`:
+    //  - part 0 holds the null tags; part 2 can hold 'e0'.
+    //  - part 1 has no null tag and no 'e0', so neither branch keeps it.
+    //  - every matching row still comes back: 4 null tags plus e0.
+    let dir = TempDir::new().expect("tempdir");
+    build_tag_parts(dir.path());
+    let cache_dir = TempDir::new().expect("cache");
+    let consumer = open_tag_consumer(dir.path(), cache_dir.path());
+
+    let rows: usize = consumer
+        .reader()
+        .expect("reader")
+        .query_sql("SELECT _id FROM supertable WHERE tag IS NULL OR title = 'e0'")
+        .expect("query")
+        .iter()
+        .map(|b| b.num_rows())
+        .sum();
+    assert_eq!(rows, 5, "4 null tags and the one e0 row");
+
+    let (loaded, total) = parts_loaded(&consumer);
+    assert_eq!(total, 3);
+    assert_eq!(loaded, 2, "part 1 matches neither branch; got {loaded}/3");
+}
+
+#[test]
 fn fts_in_multitoken_bloom_spans_parts_and_skips_the_unmatched() {
     // Multi-word values, again min/max-blind (all parts [aaa,zzz]).
     // `title IN ('new york', 'los angeles', 'qx', 'qy')`:
