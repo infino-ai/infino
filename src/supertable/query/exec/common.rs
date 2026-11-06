@@ -506,14 +506,17 @@ pub(crate) fn validate_projection(
 
 /// Message for a projection naming a column the search output does not
 /// carry. Lists the selectable columns (`_id`, the visible scalar columns,
-/// and the trailing `score`) so the caller can correct the request.
+/// and the trailing `score`) so the caller can correct the request. The list
+/// is bounded to a representative sample (see [`crate::error::capped_column_list`]):
+/// a wide table carries thousands of columns, and the whole list in every
+/// rejected projection would run to hundreds of kilobytes in logs and responses.
 fn unknown_column_message(name: &str, output_schema: &SchemaRef) -> String {
-    let available = output_schema
+    let names: Vec<&str> = output_schema
         .fields()
         .iter()
         .map(|f| f.name().as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
+        .collect();
+    let available = crate::error::capped_column_list(&names);
     format!("unknown column {name:?} in projection; valid columns: {available}")
 }
 
