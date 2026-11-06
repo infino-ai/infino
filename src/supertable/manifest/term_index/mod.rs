@@ -39,7 +39,7 @@ pub(crate) mod tier;
 use std::{
     cmp::Reverse,
     collections::{HashMap, HashSet},
-    fs,
+    fmt, fs,
     future::Future,
     io,
     iter::repeat_n,
@@ -74,6 +74,7 @@ pub(crate) use tier::{BLOCK_ENTRIES, ColumnScoring, TierChunkRef, TierDirectory,
 use tokio::{
     fs as async_fs,
     io::AsyncWriteExt,
+    runtime::Handle,
     select,
     sync::{
         Notify,
@@ -513,6 +514,16 @@ pub(crate) fn fold_disk_bound(dir: &Path, measured: &AtomicU64, held: u64) -> Op
     ))
 }
 
+/// Local bytes per slice byte, in thousandths, for a measured `milli`:
+/// [`FOLD_DISK_PER_SLICE_MILLI`] while none is measured (zero), and never
+/// under one local byte per slice byte.
+fn local_per_slice_milli(milli: u64) -> u64 {
+    match milli {
+        0 => FOLD_DISK_PER_SLICE_MILLI,
+        milli => milli.max(THOUSANDTHS),
+    }
+}
+
 /// [`fold_disk_bound`] for `free` of `total` bytes, a measured `milli`
 /// local bytes per slice byte (zero meaning none measured yet) and `held`
 /// bytes a fold reads in place.
@@ -520,10 +531,7 @@ fn disk_bound(free: u64, total: u64, milli: u64, held: u64) -> u64 {
     let room = free
         .saturating_add(held)
         .saturating_sub(total / SCRATCH_FLOOR_DIVISOR);
-    let per_slice = match milli {
-        0 => FOLD_DISK_PER_SLICE_MILLI,
-        milli => milli.max(THOUSANDTHS),
-    };
+    let per_slice = local_per_slice_milli(milli);
     room.saturating_mul(THOUSANDTHS) / per_slice
 }
 
@@ -1060,17 +1068,15 @@ impl FoldBudget {
 
     /// Whether a fold of `layers` in `ranges` key ranges reads its inputs
     /// straight from storage: when its inputs, at `local_milli` local bytes
-    /// per slice byte, are more than the page cache holds, so a download
+    /// per slice byte (zero when none is measured yet), are more than the
+    /// page cache holds, so a download
     /// would be read back from the disk; when it holds enough slices that
     /// its ranges are cut at one mark per slice, with no slice read to cut
     /// them; and when memory holds a streamed cursor for each layer and
     /// range. A fold the page cache holds, or one of few slices, downloads.
     pub(crate) fn streams(&self, layers: &[Layer], ranges: usize, local_milli: u64) -> bool {
         let slices: usize = layers.iter().map(|layer| layer.slices.len()).sum();
-        let per_slice = match local_milli {
-            0 => FOLD_DISK_PER_SLICE_MILLI,
-            milli => milli.max(THOUSANDTHS),
-        };
+        let per_slice = local_per_slice_milli(local_milli);
         let local = layers
             .iter()
             .map(layer_bytes)
@@ -2170,7 +2176,7 @@ const TIER_HEAD_CONCURRENCY: usize = 256;
 #[derive(Clone)]
 pub(crate) struct RemoteSlice {
     storage: Arc<dyn StorageProvider>,
-    runtime: tokio::runtime::Handle,
+    runtime: Handle,
     hash: ContentHash,
     tier: Option<ContentHash>,
     pub(crate) len: u64,
@@ -2178,8 +2184,8 @@ pub(crate) struct RemoteSlice {
     pub(crate) tier_len: u64,
 }
 
-impl std::fmt::Debug for RemoteSlice {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for RemoteSlice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RemoteSlice")
             .field("hash", &self.hash)
             .finish()
@@ -2306,7 +2312,7 @@ async fn stream_sources(
         lens.extend(found);
         lens.clone()
     };
-    let runtime = tokio::runtime::Handle::current();
+    let runtime = Handle::current();
     Ok(layers
         .iter()
         .map(|layer| {
