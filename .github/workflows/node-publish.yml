@@ -53,7 +53,7 @@ jobs:
           - { os: ubuntu-latest, target: linux-x64-gnu, glibc_image: ghcr.io/napi-rs/napi-rs/nodejs-rust:lts-debian }
           - { os: ubuntu-24.04-arm, target: linux-arm64-gnu, glibc_image: node:20-bullseye }
           - { os: macos-15-intel, target: darwin-x64 }
-          - { os: macos-14, target: darwin-arm64 }
+          - { os: macos-15, target: darwin-arm64 }
           - { os: ubuntu-latest, target: linux-x64-musl, musl: x86_64-unknown-linux-musl }
           - { os: ubuntu-24.04-arm, target: linux-arm64-musl, musl: aarch64-unknown-linux-musl }
     steps:
