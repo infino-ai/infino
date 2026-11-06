@@ -11,7 +11,7 @@
 //! survivors, and the job runner carries their tombstones onto the output.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashSet},
     io::{Error, Write},
     sync::Arc,
 };
@@ -28,7 +28,6 @@ use crate::{
         manifest::SuperfileEntry,
         optimize::compact::{CompactionMerge, MergeInputs, SuperfileMerge},
         reindex::Repair,
-        schema::map::FileSchemaMap,
     },
 };
 
@@ -52,12 +51,24 @@ fn carry_body<'a>(
     };
     let carries_every_row = input.deleted.as_ref().is_none_or(|b| b.is_empty())
         && inputs.superseded.iter().all(BTreeSet::is_empty);
-    // The body is copied verbatim, so it must already have the table's
-    // shape; a file that needs adapting goes through the merge instead.
-    let same_shape = input
-        .adapter
-        .as_ref()
-        .is_none_or(FileSchemaMap::is_identity);
+    // The body is copied verbatim, so every column it stores must already
+    // be in the table's shape; a file that needs adapting goes through the
+    // merge instead. A column it leaves out reads as null from the copy as
+    // from the original, unless it is a full-text column, whose postings a
+    // repair would have to build from text the file does not hold.
+    let fts_columns: HashSet<&str> = inputs
+        .builder_options
+        .fts_columns
+        .iter()
+        .map(|c| c.column.as_str())
+        .collect();
+    let same_shape = input.adapter.as_ref().is_none_or(|map| {
+        map.is_identity()
+            || (map.stores_as_is()
+                && map
+                    .absent_columns()
+                    .all(|r| !fts_columns.contains(r.name.as_str())))
+    });
     (carries_every_row && same_shape && input.reader.is_fully_resident())
         .then_some((&input.reader, entry))
 }
@@ -140,7 +151,14 @@ fn repair_carrying_body_to(
     output: &mut dyn Write,
 ) -> Result<SuperfileStats, BuildError> {
     let inputs = [MergeInput::same_shape(Arc::clone(source), None)];
-    let opts = merge_builder_opts(&inputs, base)?;
+    // The output's columns are the ones the carried body holds.
+    let stored: HashSet<String> = source
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .collect();
+    let opts = merge_builder_opts(&inputs, base)?.storing_only(&stored);
     let mut builder = SuperfileBuilder::new(match repair {
         Repair::Layout => opts,
         Repair::Terms => opts.reanalyze_stored_columns(),

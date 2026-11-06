@@ -14,11 +14,11 @@
 //! costs one null array per type plus what its rows actually hold, and
 //! anything that reads or encodes it sees exactly the values it saw before.
 
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use arrow::compute::{concat, concat_batches, take};
 use arrow_array::{Array, ArrayRef, RecordBatch, UInt32Array, new_null_array};
-use arrow_schema::{ArrowError, DataType, SchemaRef};
+use arrow_schema::{ArrowError, DataType, Schema, SchemaRef};
 
 /// One all-null array per type, every one `len` rows long, made on first
 /// use and handed out to every column of that type that holds nothing.
@@ -77,6 +77,45 @@ pub(crate) fn take_sharing_nulls(
     RecordBatch::try_new(batch.schema(), columns)
 }
 
+/// The names of the columns of `batches` that hold a value in some row: a
+/// column null throughout every batch is left out. Judged as
+/// [`null_throughout`] judges, so a column with no validity bitmap counts
+/// as holding values.
+pub(crate) fn populated_columns<'a>(
+    batches: impl IntoIterator<Item = &'a RecordBatch>,
+) -> HashSet<String> {
+    let mut populated = HashSet::new();
+    for batch in batches {
+        for (field, column) in batch.schema().fields().iter().zip(batch.columns()) {
+            if !populated.contains(field.name()) && !null_throughout(column.as_ref()) {
+                populated.insert(field.name().clone());
+            }
+        }
+    }
+    populated
+}
+
+/// `batch` with every column that is null throughout replaced by the
+/// shared null array of its type. The values are the same; the batch then
+/// holds one null array per type instead of one per null column, as a merge
+/// needs of the batches it decodes: a column an input stores but never set
+/// decodes to a full array of nulls.
+pub(crate) fn share_null_columns(batch: RecordBatch) -> Result<RecordBatch, ArrowError> {
+    if !batch.columns().iter().any(|c| null_throughout(c.as_ref())) {
+        return Ok(batch);
+    }
+    let mut nulls = SharedNulls::new(batch.num_rows());
+    let columns = batch
+        .columns()
+        .iter()
+        .map(|column| match null_throughout(column.as_ref()) {
+            true => nulls.of(column.data_type()),
+            false => Arc::clone(column),
+        })
+        .collect();
+    RecordBatch::try_new(batch.schema(), columns)
+}
+
 /// Whether `arrays` share one type and hold no value among them: each is
 /// empty or null throughout, and at least one has rows.
 fn null_in_all(arrays: &[&dyn Array]) -> bool {
@@ -120,6 +159,48 @@ pub(crate) fn concat_sharing_nulls<'a>(
     RecordBatch::try_new(Arc::clone(schema), columns)
 }
 
+/// Bytes one row of `schema` takes decoded into Arrow when every column in
+/// it is null: what each column keeps a row whatever it holds (offsets for
+/// a string or list, the value slot of a fixed-width type), and nothing for
+/// the values a row adds on top. A floor on a decoded row, and on a wide,
+/// sparse table close to all of it: rows × this is what a batch of the
+/// table decodes to before any of it is shared.
+pub(crate) fn null_row_bytes(schema: &Schema) -> u64 {
+    schema
+        .fields()
+        .iter()
+        .map(|field| null_slot_bytes(field.data_type()))
+        .sum()
+}
+
+/// Bytes a row of a column of `data_type` keeps when it is null.
+fn null_slot_bytes(data_type: &DataType) -> u64 {
+    match data_type {
+        DataType::Null => 0,
+        // Bit-packed values: under a byte a row, rounded up.
+        DataType::Boolean => 1,
+        DataType::Utf8 | DataType::Binary | DataType::List(_) | DataType::Map(..) => {
+            size_of::<i32>() as u64
+        }
+        DataType::LargeUtf8 | DataType::LargeBinary | DataType::LargeList(_) => {
+            size_of::<i64>() as u64
+        }
+        DataType::Utf8View | DataType::BinaryView => size_of::<u128>() as u64,
+        DataType::FixedSizeBinary(width) => u64::try_from(*width).unwrap_or(0),
+        DataType::FixedSizeList(child, len) => {
+            u64::try_from(*len).unwrap_or(0) * null_slot_bytes(child.data_type())
+        }
+        DataType::Struct(children) => children
+            .iter()
+            .map(|child| null_slot_bytes(child.data_type()))
+            .sum(),
+        DataType::Dictionary(key, _) => null_slot_bytes(key),
+        other => other
+            .primitive_width()
+            .map_or(size_of::<i64>() as u64, |w| w as u64),
+    }
+}
+
 /// Helpers other modules' tests use to measure what a batch costs.
 #[cfg(test)]
 pub(crate) mod test_support {
@@ -157,7 +238,7 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use arrow_array::LargeStringArray;
+    use arrow_array::{Int64Array, LargeStringArray, NullArray};
     use arrow_schema::{Field, Schema};
 
     use super::{test_support::distinct_buffer_bytes, *};
@@ -291,5 +372,74 @@ mod tests {
             assert!(Arc::ptr_eq(&pair[1], ints), "one null integer array");
         }
         assert!(distinct_buffer_bytes(&joined) * 100 < distinct_buffer_bytes(&expected));
+    }
+
+    #[test]
+    fn sharing_null_columns_keeps_every_value_and_drops_their_cost() {
+        let batch = wide_batch();
+        let before = distinct_buffer_bytes(&batch);
+        let shared = share_null_columns(batch.clone()).expect("share");
+        assert_eq!(shared, batch, "the values are the same");
+        let after = distinct_buffer_bytes(&shared);
+        // The filled column plus one null array per type: a null string
+        // array is its offsets and bitmap, a null integer array its values
+        // and bitmap, both about eight bytes a row.
+        let filled = distinct_buffer_bytes(&batch.project(&[0]).expect("project"));
+        let per_type_bound = 2 * (ROWS + 1) * size_of::<i64>();
+        assert!(
+            after <= filled + per_type_bound * 2,
+            "{after} bytes after sharing, {before} before"
+        );
+        assert!(before > after * NULL_COLUMNS_PER_TYPE / 2);
+    }
+
+    #[test]
+    fn sharing_keeps_a_column_without_a_validity_bitmap() {
+        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Null, true)]));
+        let column: ArrayRef = Arc::new(NullArray::new(ROWS));
+        let batch = RecordBatch::try_new(schema, vec![Arc::clone(&column)]).expect("batch");
+        let kept = share_null_columns(batch).expect("share");
+        assert!(Arc::ptr_eq(kept.column(0), &column));
+    }
+
+    #[test]
+    fn sharing_passes_a_batch_with_no_null_column_through() {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
+        let column: ArrayRef = Arc::new(Int64Array::from(vec![Some(1), None, Some(3)]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::clone(&column)]).expect("batch");
+        let kept = share_null_columns(batch).expect("share");
+        assert!(Arc::ptr_eq(kept.column(0), &column));
+    }
+
+    #[test]
+    fn null_row_bytes_is_what_a_null_row_decodes_to() {
+        let item = Arc::new(Field::new("item", DataType::Utf8, true));
+        let schema = Schema::new(vec![
+            Field::new("s", DataType::LargeUtf8, true),
+            Field::new("n", DataType::Int64, true),
+            Field::new("l", DataType::List(item), true),
+            Field::new("u", DataType::Utf8, true),
+            Field::new("b", DataType::Boolean, true),
+        ]);
+        let per_row = null_row_bytes(&schema);
+        assert_eq!(per_row, 8 + 8 + 4 + 4 + 1);
+        // Every column its own null array, as a reader decodes them.
+        let columns: Vec<ArrayRef> = schema
+            .fields()
+            .iter()
+            .map(|f| new_null_array(f.data_type(), ROWS))
+            .collect();
+        let batch = RecordBatch::try_new(Arc::new(schema.clone()), columns).expect("batch");
+        let decoded = distinct_buffer_bytes(&batch) as u64;
+        let rows = ROWS as u64;
+        // A floor, within the validity bitmaps and padding of the real cost.
+        assert!(
+            decoded >= rows * (per_row - 1),
+            "{decoded} < {rows} x {per_row}"
+        );
+        assert!(
+            decoded <= rows * (per_row + 2),
+            "{decoded} > {rows} x {per_row}"
+        );
     }
 }

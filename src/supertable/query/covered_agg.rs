@@ -83,7 +83,7 @@ use crate::supertable::{
     query::{
         provider::{CountedRange, SupertableProvider},
         range_counts::RangeBucket,
-        skip::ColumnTypeGuard,
+        skip::{ColumnTypeGuard, file_lacks_column},
     },
     schema::{DECIMAL128_PRECISION, DECIMAL128_SCALE, FieldId},
 };
@@ -517,10 +517,14 @@ pub(crate) fn value_counts_nulls(
         if !provider.entry_is_clean(entry) {
             return None;
         }
-        let file_nulls = entry
-            .scalar_stats
-            .column(id)
-            .and_then(|stats| stats.null_count());
+        // A file without the column holds it null in every row.
+        let file_nulls = match file_lacks_column(entry, id) {
+            true => Some(entry.n_docs),
+            false => entry
+                .scalar_stats
+                .column(id)
+                .and_then(|stats| stats.null_count()),
+        };
         nulls = nulls.zip(file_nulls).and_then(|(a, b)| a.checked_add(b));
     }
     Some(nulls)
@@ -608,10 +612,14 @@ fn accumulate_partial(
 }
 
 /// The non-null rows of `col` across `covered`: each superfile's row count
-/// less its recorded null count. `None` when a superfile lacks the null count.
+/// less its recorded null count, and none from a superfile that does not
+/// hold the column. `None` when a superfile holding it lacks the null count.
 fn non_null_count(covered: &[&Arc<SuperfileEntry>], col: FieldId) -> Option<i64> {
     let mut count: i64 = 0;
     for entry in covered {
+        if file_lacks_column(entry, col) {
+            continue;
+        }
         let nulls = entry.scalar_stats.column(col)?.null_count()?;
         let non_null = entry.n_docs.checked_sub(nulls)?;
         count = count.checked_add(i64::try_from(non_null).ok()?)?;
@@ -1159,9 +1167,16 @@ fn has_required_stats(
         }
         entry.scalar_stats.column(id)
     };
+    // A file without the column holds it null in every row: its count is
+    // known without statistics.
+    let absent = |col: &str| {
+        manifest
+            .field_id(col)
+            .is_some_and(|id| file_lacks_column(entry, id))
+    };
     kinds.iter().all(|kind| match kind {
         AggKind::CountStar => true,
-        AggKind::Count(col) => usable(col).is_some_and(|a| a.null_count().is_some()),
+        AggKind::Count(col) => absent(col) || usable(col).is_some_and(|a| a.null_count().is_some()),
         AggKind::Sum(col) => usable(col).is_some_and(|a| a.sum().is_some()),
         AggKind::Min(col) | AggKind::Max(col) => usable(col).is_some(),
         AggKind::Avg(col) => {

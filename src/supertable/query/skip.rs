@@ -267,6 +267,9 @@ pub fn scalar_skip(
         .map(|entry| {
             guarded.iter().all(|(guard, p)| match guard {
                 None => true,
+                // Every row reads the column as null, which no comparison
+                // with a literal matches.
+                Some(guard) if guard.absent_from(entry) => false,
                 Some(guard) => {
                     guard.stats_are_stale(entry) || superfile_may_match(entry, guard.id(), p)
                 }
@@ -292,6 +295,9 @@ pub fn scalar_value_set_skip(
     superfiles
         .iter()
         .map(|entry| {
+            if guard.absent_from(entry) {
+                return false;
+            }
             if guard.stats_are_stale(entry) {
                 return true;
             }
@@ -317,6 +323,11 @@ pub fn null_check_skip(
     superfiles
         .iter()
         .map(|entry| {
+            if guard.absent_from(entry) {
+                // Null in every row: what `IS NULL` asks for, and nothing
+                // `IS NOT NULL` could match.
+                return want_null;
+            }
             guard.stats_are_stale(entry)
                 || entry.scalar_stats.column(column).is_none_or(|stats| {
                     null_check_may_match_counts(stats.null_count(), stats.all_null(), want_null)
@@ -346,9 +357,13 @@ pub(crate) struct ColumnTypeGuard {
     /// Whether the table is converting this column from an older type.
     converting: bool,
     /// Whether every file in the table must hold this column, which is true
-    /// only of a column declared when the table was created: ids are minted
-    /// in order and never reused, so a column added later is absent from
-    /// every file written before it.
+    /// only of a column declared not null when the table was created and not
+    /// null still: ids are minted in order and never reused, so a column
+    /// added later is absent from every file written before it, and a file
+    /// leaves out a nullable column none of its rows sets — a column relaxed
+    /// to nullable included. A column goes back to not null only on a table
+    /// with no rows, so both schemas saying not null means every file holds
+    /// it.
     in_every_file: bool,
 }
 
@@ -367,14 +382,25 @@ impl ColumnTypeGuard {
             }),
             converting: field.is_some_and(|f| f.converting_from.is_some()),
             // The creation schema, which is never mutated: a column in it
-            // predates every file.
-            in_every_file: manifest
-                .options
-                .table_schema
-                .fields()
-                .iter()
-                .any(|f| f.id == column),
+            // predates every file. One that may not be null there and in the
+            // live schema is stored in every file.
+            in_every_file: field.is_some_and(|f| !f.nullable)
+                && manifest
+                    .options
+                    .table_schema
+                    .fields()
+                    .iter()
+                    .any(|f| f.id == column && !f.nullable),
         }
+    }
+
+    /// Whether `entry`'s file does not hold the column at all, so every
+    /// one of its rows reads it as null: the file records which columns it
+    /// holds, and this one is not among them. A file that records nothing
+    /// (written before field ids) may hold it; the id column is in every
+    /// file.
+    pub(crate) fn absent_from(&self, entry: &SuperfileEntry) -> bool {
+        self.current.is_some() && file_lacks_column(entry, self.id)
     }
 
     /// The column this guard covers.
@@ -416,6 +442,18 @@ impl ColumnTypeGuard {
             None => self.converting,
         }
     }
+}
+
+/// Whether `entry`'s file records the columns it holds and `column` is not
+/// one of them, so each of its rows reads the column as null and it has no
+/// statistics for it. A file that records nothing (written before field
+/// ids) may hold it, and the id column is in every file.
+pub(crate) fn file_lacks_column(entry: &SuperfileEntry, column: FieldId) -> bool {
+    column != FieldId::ID_COLUMN
+        && entry
+            .physical_schema
+            .as_ref()
+            .is_some_and(|physical| physical.column_by_id(column).is_none())
 }
 
 /// Whether a column's stats could still match `IS [NOT] NULL`, shared by
@@ -629,6 +667,7 @@ mod tests {
                 FtsSummaryAgg, ManifestSnapshot, ScalarStatsAgg, SuperfileEntry, SuperfileUri,
                 VectorSummary, bloom::BloomBuilder,
             },
+            schema::{PhysicalSchema, with_field_id},
         },
         test_helpers::default_tokenizer,
     };
@@ -1323,5 +1362,98 @@ mod tests {
             ScalarOp::Eq,
             &ScalarValue::Int64(Some(3))
         ));
+    }
+
+    /// A table whose `note` column, declared at creation, may be null.
+    fn opts_with_nullable_note() -> Arc<SupertableOptions> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new("note", DataType::Int64, true),
+        ]));
+        let _tk = default_tokenizer();
+        Arc::new(
+            SupertableOptions::new(schema, vec![FtsConfig::new("title")], vec![]).expect("opts"),
+        )
+    }
+
+    /// A file of `rows` rows recording the columns it holds: the id column
+    /// and `title`, and `note` only when `holds_note`.
+    fn file_holding(manifest: &ManifestSnapshot, holds_note: bool) -> Arc<SuperfileEntry> {
+        let mut fields = vec![
+            with_field_id(
+                &Field::new("_id", DataType::Decimal128(38, 0), false),
+                FieldId::ID_COLUMN,
+            ),
+            with_field_id(
+                &Field::new("title", DataType::LargeUtf8, false),
+                manifest.field_id("title").expect("title"),
+            ),
+        ];
+        if holds_note {
+            fields.push(with_field_id(
+                &Field::new("note", DataType::Int64, true),
+                manifest.field_id("note").expect("note"),
+            ));
+        }
+        let mut e = empty_superfile();
+        e.n_docs = 10;
+        e.physical_schema = Some(Arc::new(PhysicalSchema::of_stored_schema(&Schema::new(
+            fields,
+        ))));
+        Arc::new(e)
+    }
+
+    /// A nullable column declared at creation is not in every file: a file
+    /// leaves out a nullable column none of its rows sets.
+    #[test]
+    fn a_nullable_creation_column_is_not_known_to_be_in_every_file() {
+        let manifest = ManifestSnapshot::empty(opts_with_nullable_note());
+        let note = manifest.field_id("note").expect("note");
+        assert!(!ColumnTypeGuard::new(&manifest, note).in_every_file());
+    }
+
+    /// A file that does not hold a column reads it as null in every row:
+    /// a comparison or `IN` on the column skips it, `IS NULL` keeps it and
+    /// `IS NOT NULL` skips it. A file that holds the column without stats,
+    /// or records no columns at all, is kept by every one of them.
+    #[test]
+    fn a_file_without_the_column_is_pruned_as_null_throughout() {
+        let manifest = ManifestSnapshot::empty(opts_with_nullable_note());
+        let note = manifest.field_id("note").expect("note");
+        let mut unrecorded = empty_superfile();
+        unrecorded.n_docs = 10;
+        let files = vec![
+            file_holding(&manifest, false),
+            file_holding(&manifest, true),
+            Arc::new(unrecorded),
+        ];
+        let eq = pred("note", ScalarOp::Eq, ScalarValue::Int64(Some(5)));
+        assert_eq!(
+            scalar_skip(&manifest, &files, &[(Some(note), &eq)]),
+            vec![false, true, true]
+        );
+        let ne = pred("note", ScalarOp::NotEq, ScalarValue::Int64(Some(5)));
+        assert_eq!(
+            scalar_skip(&manifest, &files, &[(Some(note), &ne)]),
+            vec![false, true, true]
+        );
+        assert_eq!(
+            scalar_value_set_skip(&manifest, &files, note, &[ScalarValue::Int64(Some(5))]),
+            vec![false, true, true]
+        );
+        assert_eq!(
+            null_check_skip(&manifest, &files, note, true),
+            vec![true, true, true]
+        );
+        assert_eq!(
+            null_check_skip(&manifest, &files, note, false),
+            vec![false, true, true]
+        );
+        // The id column is in every file, whatever a file records.
+        let id = pred("_id", ScalarOp::Eq, ScalarValue::Int64(Some(5)));
+        assert_eq!(
+            scalar_skip(&manifest, &files, &[(Some(FieldId::ID_COLUMN), &id)]),
+            vec![true, true, true]
+        );
     }
 }

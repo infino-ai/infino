@@ -16,12 +16,13 @@
 
 use std::sync::Arc;
 
-use arrow_array::{ArrayRef, RecordBatch, new_null_array};
+use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{ArrowError, DataType, SchemaRef};
 
 use super::{
     FieldId, PhysicalColumn, PhysicalKind, PhysicalSchema, TableSchema, cast::cast_column,
 };
+use crate::utils::nulls::SharedNulls;
 
 /// Where a table column is in one file.
 #[derive(Debug, Clone, PartialEq)]
@@ -102,6 +103,24 @@ impl FileSchemaMap {
         self.identity
     }
 
+    /// Whether every table column the file stores is in it under its
+    /// current name and type, the id column included: the file reads with
+    /// no adaptation but the columns it leaves out, which read as null. A
+    /// file written to store only the columns its rows fill is like this.
+    pub fn stores_as_is(&self) -> bool {
+        self.columns.first().is_some_and(|id| id.physical.is_some())
+            && self.columns.iter().all(|r| {
+                r.physical
+                    .as_ref()
+                    .is_none_or(|p| p.name == r.name && types_agree(p, &r.data_type))
+            })
+    }
+
+    /// The table columns the file does not hold at all.
+    pub fn absent_columns(&self) -> impl Iterator<Item = &Resolution> + '_ {
+        self.columns.iter().filter(|r| r.physical.is_none())
+    }
+
     /// Whether the file holds some column in a type other than the
     /// table's: what makes it a compaction input regardless of size.
     pub fn has_stale_type(&self) -> bool {
@@ -155,9 +174,11 @@ impl FileSchemaMap {
     /// `batch`, read from the file with columns under their file names,
     /// reshaped to `out`: every field of `out` is a table column, taken
     /// from its file column (cast when the types differ) or null-filled
-    /// when the file has none.
+    /// when the file has none. The null-filled columns of one type share
+    /// one array: a file that predates most of a wide table's columns
+    /// costs one null array per type, not one per column.
     pub fn adapt(&self, batch: &RecordBatch, out: &SchemaRef) -> Result<RecordBatch, ArrowError> {
-        let n = batch.num_rows();
+        let mut nulls = SharedNulls::new(batch.num_rows());
         let columns = out
             .fields()
             .iter()
@@ -173,7 +194,7 @@ impl FileSchemaMap {
                     .as_ref()
                     .filter(|p| p.kind == PhysicalKind::Stored)
                 else {
-                    return Ok(new_null_array(field.data_type(), n));
+                    return Ok(nulls.of(field.data_type()));
                 };
                 let array = batch.column_by_name(&physical.name).ok_or_else(|| {
                     ArrowError::SchemaError(format!(
@@ -295,6 +316,7 @@ mod tests {
         ]);
         let map = FileSchemaMap::new(&t, "_id", &old);
         assert!(!map.is_identity());
+        assert!(!map.stores_as_is(), "a renamed column needs adapting");
         assert!(!map.has_stale_type());
         let score = map.resolve("score").expect("table column");
         assert_eq!(
@@ -334,6 +356,64 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .expect("i64");
         assert_eq!(score.values(), &[7, 9]);
+    }
+
+    #[test]
+    fn the_columns_a_file_predates_share_one_null_array_per_type() {
+        // A wide table whose file was written when it held only `a`.
+        let t = TableSchema::from_user_schema(&Schema::new(vec![
+            Field::new("a", DataType::LargeUtf8, true),
+            Field::new("b", DataType::LargeUtf8, true),
+            Field::new("c", DataType::Int64, true),
+            Field::new("d", DataType::LargeUtf8, true),
+            Field::new("e", DataType::Int64, true),
+        ]));
+        let old = physical(vec![
+            column(
+                "_id",
+                Some(FieldId::ID_COLUMN),
+                TableSchema::id_field("_id").data_type().clone(),
+            ),
+            column("a", Some(FieldId(1)), DataType::LargeUtf8),
+        ]);
+        let map = FileSchemaMap::new(&t, "_id", &old);
+        assert!(!map.is_identity());
+        assert!(map.stores_as_is(), "what it holds needs no adapting");
+        assert_eq!(
+            map.absent_columns()
+                .map(|r| r.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["b", "c", "d", "e"]
+        );
+        let read = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "a",
+                DataType::LargeUtf8,
+                true,
+            )])),
+            vec![Arc::new(LargeStringArray::from(vec![
+                Some("x"),
+                None,
+                Some("z"),
+            ]))],
+        )
+        .expect("batch");
+        let out: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::LargeUtf8, true),
+            Field::new("b", DataType::LargeUtf8, true),
+            Field::new("c", DataType::Int64, true),
+            Field::new("d", DataType::LargeUtf8, true),
+            Field::new("e", DataType::Int64, true),
+        ]));
+        let adapted = map.adapt(&read, &out).expect("adapt");
+        for i in 1..adapted.num_columns() {
+            assert_eq!(adapted.column(i).len(), 3);
+            assert_eq!(adapted.column(i).null_count(), 3, "column {i} is null");
+        }
+        assert!(Arc::ptr_eq(adapted.column(1), adapted.column(3)));
+        assert!(Arc::ptr_eq(adapted.column(2), adapted.column(4)));
+        assert!(!Arc::ptr_eq(adapted.column(1), adapted.column(2)));
+        assert!(Arc::ptr_eq(adapted.column(0), read.column(0)));
     }
 
     #[test]

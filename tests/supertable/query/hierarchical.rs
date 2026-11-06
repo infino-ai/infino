@@ -40,6 +40,7 @@ use infino::{
     superfile::{builder::FtsConfig, fts::reader::BoolMode},
     supertable::{
         Supertable, SupertableOptions,
+        schema::change::{FieldPatch, SchemaPatch},
         storage::{LocalFsStorageProvider, StorageProvider},
     },
     test_helpers::{build_title_batch, default_disk_cache, default_supertable_options},
@@ -635,11 +636,104 @@ fn open_tag_consumer(storage_dir: &std::path::Path, cache_dir: &std::path::Path)
     .expect("open")
 }
 
+/// How many superfiles of the loaded parts hold the `tag` column at all. A
+/// file whose rows leave a nullable column null throughout does not store
+/// it.
+fn files_holding_tag(consumer: &Supertable) -> usize {
+    let r = consumer.reader().expect("reader");
+    let m = r.manifest();
+    m.get_all_list_entries()
+        .iter()
+        .filter_map(|e| m.get_cached_part_by_id(&e.part_id))
+        .flat_map(|part| part.superfiles.clone())
+        .filter(|e| {
+            e.physical_schema
+                .as_ref()
+                .is_some_and(|p| p.column_by_name("tag").is_some())
+        })
+        .count()
+}
+
+/// [`tag_options`] with `tag` declared not null when the table is created.
+fn strict_tag_options() -> SupertableOptions {
+    let pool = Arc::new(
+        ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("rayon pool"),
+    );
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("title", DataType::LargeUtf8, false),
+        Field::new("tag", DataType::LargeUtf8, false),
+    ]));
+    SupertableOptions::new(schema, vec![FtsConfig::new("title")], vec![])
+        .expect("strict tag options")
+        .with_writer_pool(pool)
+        .with_target_superfiles_per_part(2)
+}
+
+/// A column created not null and relaxed to nullable is no longer in every
+/// file: a write whose rows leave it null does not store it, so the part
+/// tier must not prune `IS NULL` on an aggregate over the files that do.
+#[test]
+fn sql_is_null_finds_rows_written_after_a_column_was_relaxed() {
+    let dir = TempDir::new().expect("tempdir");
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+    let producer = Supertable::create(strict_tag_options().with_storage(Arc::clone(&storage)))
+        .expect("create");
+    let strict = Arc::new(Schema::new(vec![
+        Field::new("title", DataType::LargeUtf8, false),
+        Field::new("tag", DataType::LargeUtf8, false),
+    ]));
+    let set = RecordBatch::try_new(
+        strict,
+        vec![
+            Arc::new(LargeStringArray::from(vec!["a0", "a1"])),
+            Arc::new(LargeStringArray::from(vec!["x", "y"])),
+        ],
+    )
+    .expect("batch");
+    producer.append(&set).expect("append tagged rows");
+    producer
+        .apply_schema(
+            &SchemaPatch::new(vec![FieldPatch::named("tag").with_nullable(true)]),
+            None,
+        )
+        .expect("relax tag");
+    producer
+        .append(&tag_batch(&["b0", "b1"], &[None, None]))
+        .expect("append untagged rows");
+
+    let cache_dir = TempDir::new().expect("cache");
+    let cache = default_disk_cache(Arc::clone(&storage), cache_dir.path());
+    let consumer = Supertable::open(
+        strict_tag_options()
+            .with_storage(Arc::clone(&storage))
+            .with_eager_load_threshold(EAGER_LOAD_THRESHOLD_FORCE_LAZY)
+            .with_disk_cache(cache),
+    )
+    .expect("open");
+    let rows: usize = consumer
+        .reader()
+        .expect("reader")
+        .query_sql("SELECT _id FROM supertable WHERE tag IS NULL")
+        .expect("query")
+        .iter()
+        .map(|b| b.num_rows())
+        .sum();
+    assert_eq!(rows, 2, "the rows written after the relax read a null tag");
+}
+
 #[test]
 fn sql_is_null_prunes_no_null_parts() {
     // `tag IS NULL`:
-    //  - parts 1 and 2 have null_count == 0, so they're dropped.
-    //  - only part 0 (all-null tag) loads; its 4 rows match.
+    //  - part 0's files leave the all-null tag out; parts 1 and 2 have
+    //    null_count == 0.
+    //  - a part's null count covers only the files that store the column,
+    //    and a file may leave a nullable one out, so the part tier keeps
+    //    every part; the superfile tier drops the files with no null.
+    //  - part 0's 4 rows match.
     let dir = TempDir::new().expect("tempdir");
     build_tag_parts(dir.path());
     let cache_dir = TempDir::new().expect("cache");
@@ -657,13 +751,23 @@ fn sql_is_null_prunes_no_null_parts() {
 
     let (loaded, total) = parts_loaded(&consumer);
     assert_eq!(total, 3);
-    assert_eq!(loaded, 1, "no-null parts pruned; got {loaded}/3");
+    assert_eq!(
+        loaded, 3,
+        "no part's null count speaks for files that leave the column out"
+    );
+    assert_eq!(
+        files_holding_tag(&consumer),
+        4,
+        "part 0's files store no tag"
+    );
 }
 
 #[test]
 fn sql_is_not_null_prunes_all_null_parts() {
     // `tag IS NOT NULL`:
-    //  - part 0 is entirely null (min stat is null), so it's dropped.
+    //  - part 0 is entirely null, so its files leave the column out: the
+    //    part has no aggregate for it and is kept, and its files are
+    //    dropped at the superfile tier, which sees they do not hold it.
     //  - parts 1 and 2 load; their 8 rows match.
     let dir = TempDir::new().expect("tempdir");
     build_tag_parts(dir.path());
@@ -682,14 +786,23 @@ fn sql_is_not_null_prunes_all_null_parts() {
 
     let (loaded, total) = parts_loaded(&consumer);
     assert_eq!(total, 3);
-    assert_eq!(loaded, 2, "all-null part 0 pruned; got {loaded}/3");
+    assert_eq!(loaded, 3, "part 0 has no tag aggregate to prune on");
+    assert_eq!(
+        files_holding_tag(&consumer),
+        4,
+        "part 0's files store no tag"
+    );
 }
 
 #[test]
 fn sql_or_across_columns_loads_only_the_parts_a_branch_can_match() {
     // `tag IS NULL OR title = 'e0'`:
-    //  - part 0 holds the null tags; part 2 can hold 'e0'.
-    //  - part 1 has no null tag and no 'e0', so neither branch keeps it.
+    //  - part 0 holds the null tags (its files leave `tag` out); part 2 can
+    //    hold 'e0'.
+    //  - part 1 has no null tag and no 'e0', but a part's null count covers
+    //    only the files that store a nullable column, so the `IS NULL`
+    //    branch keeps every part (#1240); the superfile tier skips part 1's
+    //    files, which hold `tag` with no null and no 'e0'.
     //  - every matching row still comes back: 4 null tags plus e0.
     let dir = TempDir::new().expect("tempdir");
     build_tag_parts(dir.path());
@@ -708,7 +821,10 @@ fn sql_or_across_columns_loads_only_the_parts_a_branch_can_match() {
 
     let (loaded, total) = parts_loaded(&consumer);
     assert_eq!(total, 3);
-    assert_eq!(loaded, 2, "part 1 matches neither branch; got {loaded}/3");
+    assert_eq!(
+        loaded, 3,
+        "no part's null count speaks for files that leave the column out"
+    );
 }
 
 #[test]
