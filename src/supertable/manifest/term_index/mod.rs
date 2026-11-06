@@ -1688,12 +1688,13 @@ async fn fold_layers(
         io.reuse_dir.clone().filter(|_| io.keep_uploads),
     ));
     // The kept layers are merged away, so the copies kept of them can go.
-    let consumed: Vec<(PathBuf, PathBuf)> = match reuse {
+    let consumed: Vec<(ContentHash, PathBuf, PathBuf)> = match reuse {
         Some(reuse) => kept
             .iter()
             .flat_map(|layer| &layer.slices)
             .map(|slice| {
                 (
+                    slice.content_hash,
                     slice_file_path(reuse, &slice.content_hash),
                     tier_path(reuse, &slice.content_hash),
                 )
@@ -1715,10 +1716,28 @@ async fn fold_layers(
     uploaded.map_err(|e| TermIndexError::Build(format!("term-index upload: {e}")))??;
     let merged = merged.map_err(|e| TermIndexError::Build(e.to_string()))??;
     debug_assert!(merged.tiers.is_empty() && merged.slices.is_empty());
-    for (slice, tier) in consumed {
-        let _ = async_fs::remove_file(slice).await;
-        let _ = async_fs::remove_file(tier).await;
-    }
+    // An output byte for byte equal to an input is the same object, and
+    // when this fold keeps its uploads the copy kept is its output now.
+    let outputs: HashSet<ContentHash> = match io.keep_uploads {
+        true => merged
+            .layer
+            .slices
+            .iter()
+            .map(|slice| slice.content_hash)
+            .collect(),
+        false => HashSet::new(),
+    };
+    // One blocking task for all removals: a round trip to the blocking pool
+    // per file costs tens of seconds on a fold of tens of thousands of slices.
+    let _ = task::spawn_blocking(move || {
+        for (hash, slice, tier) in consumed {
+            if !outputs.contains(&hash) {
+                let _ = fs::remove_file(slice);
+                let _ = fs::remove_file(tier);
+            }
+        }
+    })
+    .await;
     let mut layer = merged.layer;
     layer.ordinals = merged_ordinals;
     Ok(layer)
@@ -10873,6 +10892,60 @@ mod tests {
             kept.iter()
                 .all(|hash| !slice_file_path(reuse.path(), hash).exists()),
             "a fold that keeps nothing still clears what it consumed"
+        );
+    }
+
+    /// A fold that keeps its uploads and writes an output equal to one of
+    /// its inputs keeps that object's copy: it is the output now.
+    #[test]
+    fn a_kept_output_equal_to_its_input_stays() {
+        let dir = TempDir::new().expect("tempdir");
+        let built = build(&[range_contribution(&dir, 1)], &BuildPolicy::default()).expect("build");
+        let store_dir = TempDir::new().expect("store");
+        let local: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(store_dir.path()).expect("local"));
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let reference = rt.block_on(write_built(&local, built)).expect("write");
+        let root = rt
+            .block_on(load_root(local.as_ref(), &reference))
+            .expect("root");
+        let scratch = TempDir::new().expect("scratch");
+        let reuse = TempDir::new_in(scratch.path()).expect("reuse");
+        let policy = BuildPolicy {
+            spill_to_disk: true,
+            scratch_root: Some(scratch.path().to_path_buf()),
+            merge_ranges: Some(2),
+            ..BuildPolicy::default()
+        };
+        let io = FoldIo {
+            reuse_dir: Some(reuse.path().to_path_buf()),
+            keep_uploads: true,
+            ..FoldIo::default()
+        };
+        let ordinals: Vec<Option<u32>> = (0..root.superfiles.len() as u32).map(Some).collect();
+        let fold = |layers: &[Layer]| {
+            rt.block_on(fold_layers(&local, layers, &ordinals, &policy, &io, None))
+                .expect("fold")
+        };
+        let first = fold(&root.layers);
+        let again = fold(std::slice::from_ref(&first));
+        let hashes = |layer: &Layer| -> Vec<ContentHash> {
+            layer
+                .slices
+                .iter()
+                .map(|slice| slice.content_hash)
+                .collect()
+        };
+        assert_eq!(
+            hashes(&again),
+            hashes(&first),
+            "folding one layer rewrites it as is"
+        );
+        assert!(
+            hashes(&again)
+                .iter()
+                .all(|hash| slice_file_path(reuse.path(), hash).exists()),
+            "the kept copy of an output equal to its input stays"
         );
     }
 }
