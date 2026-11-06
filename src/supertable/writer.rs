@@ -63,6 +63,7 @@ use std::{
     fmt, fs,
     fs::File,
     io::{self, BufReader, BufWriter, Read, Write},
+    iter::once,
     marker::PhantomData,
     mem,
     num::NonZeroUsize,
@@ -9003,37 +9004,23 @@ fn build_shard_parquet_and_fts(
         ordered_vectors.push(ordered);
     }
     let vector_slices: Vec<&[f32]> = ordered_vectors.iter().map(Vec::as_slice).collect();
+    // The superfile stores the columns its rows fill, as a piece of a
+    // plain commit does: a nullable column no row of the shard sets is
+    // left out, and reads back as null.
+    let populated = populated_columns(once(&scalar));
     let mut builder = SuperfileBuilder::new(
-        builder_options_of(manifest).with_vector_layout(VectorLayout::MultiCellIvf),
+        builder_options_of(manifest)
+            .with_vector_layout(VectorLayout::MultiCellIvf)
+            .storing_only(&populated),
     )?;
+    let stored = Arc::clone(builder.input_schema());
+    let scalar = project_to(&scalar, &stored)?;
     builder.add_batch(&scalar, &vector_slices)?;
 
-    let scalar_schema = manifest.scalar_schema();
-    let scalar_stats = ScalarStatsAgg::from_batches(&scalar_schema, &[&scalar]);
-
-    let id_col = scalar
-        .column(0)
-        .as_any()
-        .downcast_ref::<Decimal128Array>()
-        .ok_or_else(|| {
-            BuildError::IdColumnWrongType(
-                options.id_column.clone(),
-                "<id column not Decimal128 at runtime>".to_string(),
-            )
-        })?;
-    let mut id_min = i128::MAX;
-    let mut id_max = i128::MIN;
-    for i in 0..id_col.len() {
-        let v = id_col.value(i);
-        id_min = id_min.min(v);
-        id_max = id_max.max(v);
-    }
-    let n_docs = id_col.len() as u64;
-    let (id_min, id_max) = if n_docs == 0 {
-        (0, 0)
-    } else {
-        (id_min, id_max)
-    };
+    // Per-column min/max of the stored columns; a column the file leaves
+    // out has none.
+    let scalar_stats = ScalarStatsAgg::from_batches(&stored, &[&scalar]);
+    let (id_min, id_max, n_docs) = id_bounds(once(&scalar), options)?;
     Ok((builder, id_min, id_max, n_docs, scalar_stats))
 }
 
