@@ -50,17 +50,16 @@ impl DiskCacheStore {
     /// lazy entry (no mmap — its cost is anonymous heap that `madvise` cannot
     /// reclaim) and the cache must be its last holder (a reader a query still
     /// has in hand keeps the heap alive regardless, and re-opening costs that
-    /// query a round trip). An entry whose block source still has a run in memory
-    /// (being fetched, or waiting to be written) is kept too, since that run's
-    /// bytes are not counted yet, and so is one whose file is downloading: its
-    /// Warm reservation covers the download. That keeps at most one extra entry
-    /// per download slot.
+    /// query a round trip). An entry whose block source has unfinished writes is
+    /// kept too (see `BlockCachedSource::has_unfinished_writes`), and so is one
+    /// whose file is downloading: its Warm reservation covers the download. That
+    /// keeps at most one extra entry per download slot.
     fn reclaimable_lazy_entry(&self, uri: &SuperfileUri, entry: &CachedEntry) -> bool {
         entry.mmap().is_none()
             && !entry.held_by_query()
             && entry
                 .block_source()
-                .is_none_or(|source| !source.has_runs_in_memory())
+                .is_none_or(|source| !source.has_unfinished_writes())
             && !self
                 .fills
                 .get(uri)
@@ -982,6 +981,39 @@ mod tests {
             filled,
             "and its file is charged"
         );
+    }
+
+    #[tokio::test]
+    async fn idle_sweep_waits_for_a_queued_index_flush() {
+        // Block 0 is written, and its index flush waits for a writer.
+        //  - the sweep keeps the entry: a reopen would fetch the block again.
+        //  - once the flush is done, the sweep drops it.
+        // This test pins the sweep waiting for the flush.
+        let (_dir, store) = test_store_with(|cfg| {
+            cfg.cold_fetch_mode = ColdFetchMode::LazyForegroundWithBackgroundFill;
+            cfg.mmap_cold_threshold_secs = 0;
+            cfg.promotion_defer_timeout = Duration::MAX;
+        });
+        let uri = SuperfileUri::new_v4();
+        put_superfile(&store, &uri, tiny_superfile_bytes()).await;
+        let source = open_lazily(&store, &uri).await;
+        let stall = source.stall_queued_flushes();
+        source.range(0, 1).await.expect("block read");
+        wait_until(
+            || stall.waiting() == 1 && !source.has_runs_in_memory(),
+            "the write lands and queues its flush",
+        )
+        .await;
+
+        store.sweep_once();
+        assert!(store.is_cached(&uri), "the entry waits for its index flush");
+
+        drop(stall);
+        store.block_writes_settled().await;
+        drop(source);
+        store.sweep_once();
+        assert!(!store.is_cached(&uri), "then the idle entry is dropped");
+        store.assert_budget_consistent();
     }
 
     /// A run bigger than the whole cap is let in when nothing else is waiting; anything more then

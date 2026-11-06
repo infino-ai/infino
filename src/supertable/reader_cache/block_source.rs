@@ -64,7 +64,9 @@
 //!                                                                              ▼
 //!          wait for a block writer (a task, no thread)
 //!                                                                              ▼
-//!          blocking thread: write ─► mark filled ─► out of memory ─► fsync + index
+//!          blocking thread: write ─► mark filled ─► out of memory
+//!                                                                              ▼
+//!          next free block writer: fsync + index, shared by every run that lands meanwhile
 //! ```
 //!
 //! - A run is in `runs` from the moment a read registers it, before its GET is
@@ -83,7 +85,9 @@
 //!   waiting read leaves it to fetch its blocks itself; one that fails fails
 //!   every read sharing it.
 //! - The index on disk lists only blocks that were fsynced, so a crash loses at
-//!   most the blocks not synced yet, and later reads fetch them again.
+//!   most the blocks not synced yet, and later reads fetch them again. A write
+//!   doesn't wait for its fsync: the file's flush waits for a block writer of
+//!   its own, and every run that lands before it starts shares it.
 //! - Each store runs at most [`BLOCK_WRITERS`] writes at once, so a slow disk
 //!   can't take the blocking threads a query needs.
 //! - Each store holds up to [`WRITE_BEHIND_CAP_BYTES`] of fetched runs not
@@ -102,7 +106,7 @@
 //! / mmap promotion), reads stop filling blocks instead of failing: they come
 //! from a whole-file local copy when the cache holds one, else uncached from
 //! object storage. The source gives its reserved bytes back on `Drop`, when the
-//! last reader or the last queued write lets go of it; the sparse file and its
+//! last reader, queued write or queued index flush lets go of it; the sparse file and its
 //! index stay on disk so a later generation can adopt them.
 
 #[cfg(test)]
@@ -141,8 +145,6 @@ use tokio::{
 };
 use tracing::Instrument;
 
-#[cfg(test)]
-use super::disk::BlockWriteTicket;
 use super::disk::{ArcMmapOwner, DiskCacheStore, Reservation};
 use crate::{
     runtime_bridge::shared_io_runtime,
@@ -298,9 +300,23 @@ pub(crate) struct BlockCachedSource {
     dirty: AtomicBool,
     /// Set while an index flush runs; see [`Self::flush_index`].
     flushing: AtomicBool,
-    /// Tests set this to hold block-file writes; see [`Self::stall_writes`].
+    /// Set while a flush is queued and not started; see [`Self::queue_flush`].
+    flush_queued: AtomicBool,
+    /// Flushes queued and not done yet; see [`Self::has_unfinished_writes`].
+    pending_flushes: AtomicUsize,
+    /// Fsyncs tried, for tests.
     #[cfg(test)]
-    write_stall: (Mutex<WriteStallState>, Condvar),
+    syncs: AtomicUsize,
+    /// Tests hold block-file writes here; see [`Self::stall_writes`].
+    #[cfg(test)]
+    write_stall: Stall,
+    /// Tests hold a queued flush here, once it has its block writer and
+    /// before it starts; see [`Self::stall_queued_flushes`].
+    #[cfg(test)]
+    queued_flush_stall: Stall,
+    /// Tests hold a flush here, in its fsync.
+    #[cfg(test)]
+    fsync_stall: Stall,
     /// Tests set this to run once [`Self::block_file`] has created a fresh file,
     /// given its inode, before the index at the path is removed again.
     #[cfg(test)]
@@ -329,8 +345,8 @@ enum Fill {
 /// - its entry in `runs`, so reads get the bytes from memory.
 ///
 /// [`Self::spawn_write`] writes it. Dropping it gives back whatever it still holds,
-/// whether the write worked, failed or never ran, and writes the index if the
-/// blocks were written.
+/// whether the write worked, failed or never ran, and queues an index flush if
+/// the blocks were written.
 struct FetchedRun {
     source: Arc<BlockCachedSource>,
     store: Arc<DiskCacheStore>,
@@ -343,34 +359,21 @@ struct FetchedRun {
     /// done, then only those of blocks another fill wrote first.
     unlanded: u64,
     landed: bool,
-    /// Declared after `source` so it drops after it: a test that waits for the
-    /// writes to finish also sees the source dropped.
-    #[cfg(test)]
-    _ticket: BlockWriteTicket,
 }
 
 impl FetchedRun {
     /// Writes the run once one of the store's block writers is free; `false` if
-    /// the write failed. It runs on the shared I/O runtime, never the caller's: a
-    /// sync read from a rayon thread runs on a throwaway runtime, and dropping it
-    /// would wait for the write or cancel it.
+    /// the write failed.
     fn spawn_write(self) -> JoinHandle<bool> {
-        shared_io_runtime().spawn(async move {
-            let writer = self.store.block_writer().await;
-            spawn_blocking(move || {
-                let _writer = writer;
-                self.land()
-            })
-            .await
-            .unwrap_or(false)
-        })
+        let store = Arc::clone(&self.store);
+        on_block_writer(&store, move || self.land())
     }
 
     /// Writes the run to the block file and marks its blocks filled; `false` if
     /// the write failed. Blocking.
     fn land(mut self) -> bool {
         #[cfg(test)]
-        self.source.wait_while_stalled();
+        self.source.write_stall.wait_while_held();
 
         let Some(bf) = self.source.created_block_file() else {
             return false;
@@ -388,8 +391,55 @@ impl FetchedRun {
     }
 }
 
+/// A queued index flush. Counted in its source's `pending_flushes` until it
+/// drops, however it ends.
+struct PendingFlush(Arc<BlockCachedSource>);
+
+impl PendingFlush {
+    fn new(source: &Arc<BlockCachedSource>) -> Self {
+        source.pending_flushes.fetch_add(1, Ordering::SeqCst);
+        Self(Arc::clone(source))
+    }
+}
+
+impl Drop for PendingFlush {
+    fn drop(&mut self) {
+        self.0.pending_flushes.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Runs `work` on a blocking thread once one of the store's block writers is
+/// free, on the shared I/O runtime: a sync read on a rayon thread runs on a
+/// throwaway runtime, and dropping it would wait for the work or cancel it.
+/// - `work`, and everything it holds, drops before the writer is given back.
+/// - Returns the default value if `work` panicked.
+fn on_block_writer<T: Default + Send + 'static>(
+    store: &Arc<DiskCacheStore>,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> JoinHandle<T> {
+    let store = Arc::clone(store);
+    #[cfg(test)]
+    let ticket = store.block_write_started();
+    shared_io_runtime().spawn(async move {
+        #[cfg(test)]
+        let _ticket = ticket;
+        let writer = store.block_writer().await;
+        spawn_blocking(move || {
+            let _writer = writer;
+            work()
+        })
+        .await
+        .unwrap_or_default()
+    })
+}
+
 impl Drop for FetchedRun {
     fn drop(&mut self) {
+        // Queue the flush before the run leaves `runs`, so the idle sweep always
+        // sees one of the two and keeps the entry until its blocks are indexed.
+        if self.landed {
+            self.source.queue_flush(&self.store);
+        }
         // Out of memory only now, after `land` marked the blocks filled, so a
         // read never finds them in neither place.
         self.source.remove_run(self.first, self.id);
@@ -397,10 +447,6 @@ impl Drop for FetchedRun {
 
         if self.unlanded > 0 {
             self.store.release_block_bytes(self.unlanded);
-        }
-
-        if self.landed {
-            self.source.flush_index();
         }
     }
 }
@@ -744,8 +790,16 @@ impl BlockCachedSource {
             next_run_id: AtomicU64::new(0),
             dirty: AtomicBool::new(false),
             flushing: AtomicBool::new(false),
+            flush_queued: AtomicBool::new(false),
+            pending_flushes: AtomicUsize::new(0),
             #[cfg(test)]
-            write_stall: (Mutex::new(WriteStallState::default()), Condvar::new()),
+            syncs: AtomicUsize::new(0),
+            #[cfg(test)]
+            write_stall: Stall::default(),
+            #[cfg(test)]
+            queued_flush_stall: Stall::default(),
+            #[cfg(test)]
+            fsync_stall: Stall::default(),
             #[cfg(test)]
             created_hook: Mutex::new(None),
         })
@@ -1272,6 +1326,13 @@ impl BlockCachedSource {
         !self.runs.lock().expect("runs mutex poisoned").is_empty()
     }
 
+    /// A run in memory, or an index flush not done yet. The idle sweep keeps
+    /// such an entry: the run's bytes aren't counted yet, and a reopen trusts
+    /// only the index on disk, so it would fetch the blocks not indexed again.
+    pub(crate) fn has_unfinished_writes(&self) -> bool {
+        self.has_runs_in_memory() || self.pending_flushes.load(Ordering::SeqCst) > 0
+    }
+
     /// Takes run `id` out of `runs`, if it is still there under block `first`.
     fn remove_run(&self, first: u32, id: u64) {
         let mut runs = self.runs.lock().expect("runs mutex poisoned");
@@ -1297,12 +1358,35 @@ impl BlockCachedSource {
         newly
     }
 
+    /// Queues an index flush after a block write, so the write doesn't wait for
+    /// its fsync (on a cloud disk, several times the write).
+    /// - The flush waits for a block writer of its own, like a write.
+    /// - Runs of the file that land before it starts share it. Runs that land
+    ///   while it runs are picked up by its next pass.
+    /// - It holds the source until done, so `Drop` never fsyncs on a query thread.
+    fn queue_flush(self: &Arc<Self>, store: &Arc<DiskCacheStore>) {
+        // No new blocks, or a queued or running flush will pick them up.
+        if !self.dirty.load(Ordering::SeqCst)
+            || self.flushing.load(Ordering::SeqCst)
+            || self.flush_queued.swap(true, Ordering::SeqCst)
+        {
+            return;
+        }
+        let flush = PendingFlush::new(self);
+        drop(on_block_writer(store, move || {
+            #[cfg(test)]
+            flush.0.queued_flush_stall.wait_while_held();
+            flush.0.flush_queued.store(false, Ordering::SeqCst);
+            flush.0.flush_index();
+        }));
+    }
+
     /// Fsyncs the block file, then writes the index of the blocks marked filled.
-    /// Blocking: runs at the end of a block write, or in `Drop`.
+    /// Blocking: runs once a queued flush has its block writer (see
+    /// [`Self::queue_flush`]), or in `Drop`.
     /// - One flush runs per source. A call that finds one running returns at
     ///   once; the running one covers its blocks.
-    /// - If blocks were marked during the fsync, the running flush goes again,
-    ///   so a burst of writes costs one or two fsyncs, not one each.
+    /// - If blocks were marked during the fsync, the running flush goes again.
     /// - A failed fsync leaves the blocks for the next flush, or for Drop.
     fn flush_index(&self) {
         let Some(bf) = self.created_block_file() else {
@@ -1314,11 +1398,23 @@ impl BlockCachedSource {
                 return;
             }
 
+            // The file was evicted, erased or replaced at its path: its blocks can
+            // never be indexed, so nothing is left to flush.
+            if !self.path_names(bf) {
+                self.dirty.store(false, Ordering::SeqCst);
+                self.flushing.store(false, Ordering::SeqCst);
+                return;
+            }
+
             // Clear the flag before reading the bitmap: a block marked after this
             // sets it again, and the loop runs once more.
             self.dirty.store(false, Ordering::SeqCst);
             let snapshot = self.snapshot_index(bf);
+            #[cfg(test)]
+            self.fsync_stall.wait_while_held();
             let synced = bf.file.sync_data().is_ok();
+            #[cfg(test)]
+            self.syncs.fetch_add(1, Ordering::AcqRel);
 
             if synced {
                 self.persist_idx(bf, &snapshot);
@@ -1883,8 +1979,6 @@ impl BlockCachedSource {
 
         Some(FetchedRun {
             source,
-            #[cfg(test)]
-            _ticket: store.block_write_started(),
             store: Arc::clone(store),
             id,
             first,
@@ -1899,30 +1993,15 @@ impl BlockCachedSource {
     /// test can look at a run before it is written. The guard lets them go even
     /// if an assert fails, so a failing test can't hang.
     #[cfg(test)]
-    pub(crate) fn stall_writes(&self) -> WriteStall<'_> {
-        self.write_stall.0.lock().expect("write stall poisoned").on = true;
-        WriteStall(self)
+    pub(crate) fn stall_writes(&self) -> StallGuard<'_> {
+        self.write_stall.hold()
     }
 
-    /// How many block writes are held by [`Self::stall_writes`] right now.
+    /// Holds this source's queued flushes, once they have their block writer,
+    /// until the guard drops.
     #[cfg(test)]
-    fn stalled_writes(&self) -> usize {
-        self.write_stall
-            .0
-            .lock()
-            .expect("write stall poisoned")
-            .waiting
-    }
-
-    #[cfg(test)]
-    fn wait_while_stalled(&self) {
-        let (state, resume) = &self.write_stall;
-        let mut state = state.lock().expect("write stall poisoned");
-        state.waiting += 1;
-        while state.on {
-            state = resume.wait(state).expect("write stall poisoned");
-        }
-        state.waiting -= 1;
+    pub(crate) fn stall_queued_flushes(&self) -> StallGuard<'_> {
+        self.queued_flush_stall.hold()
     }
 
     /// Serve `[start, start+len)` from the sparse file. `None` on a read
@@ -2027,25 +2106,60 @@ impl BlockCachedSource {
     }
 }
 
-/// What [`BlockCachedSource::stall_writes`] holds: whether writes wait, and how
-/// many are waiting.
+/// Where a test holds a source's writes or flushes; see
+/// [`BlockCachedSource::stall_writes`].
 #[cfg(test)]
 #[derive(Default)]
-struct WriteStallState {
+struct Stall {
+    state: Mutex<StallState>,
+    resume: Condvar,
+}
+
+/// Whether a [`Stall`] holds, and how many wait there.
+#[cfg(test)]
+#[derive(Default)]
+struct StallState {
     on: bool,
     waiting: usize,
 }
 
-/// Holds a source's block-file writes; see [`BlockCachedSource::stall_writes`].
 #[cfg(test)]
-pub(crate) struct WriteStall<'a>(&'a BlockCachedSource);
+impl Stall {
+    /// Holds whatever reaches the stall until the guard drops.
+    fn hold(&self) -> StallGuard<'_> {
+        self.state.lock().expect("stall poisoned").on = true;
+        StallGuard(self)
+    }
+
+    /// Blocks while the stall is held.
+    fn wait_while_held(&self) {
+        let mut state = self.state.lock().expect("stall poisoned");
+        state.waiting += 1;
+        while state.on {
+            state = self.resume.wait(state).expect("stall poisoned");
+        }
+        state.waiting -= 1;
+    }
+}
+
+/// Lets a [`Stall`] go on drop, even when an assert fails, so a failing test
+/// can't hang.
+#[cfg(test)]
+pub(crate) struct StallGuard<'a>(&'a Stall);
 
 #[cfg(test)]
-impl Drop for WriteStall<'_> {
+impl StallGuard<'_> {
+    /// How many wait at the stall now.
+    pub(crate) fn waiting(&self) -> usize {
+        self.0.state.lock().expect("stall poisoned").waiting
+    }
+}
+
+#[cfg(test)]
+impl Drop for StallGuard<'_> {
     fn drop(&mut self) {
-        let (state, resume) = &self.0.write_stall;
-        state.lock().expect("write stall poisoned").on = false;
-        resume.notify_all();
+        self.0.state.lock().expect("stall poisoned").on = false;
+        self.0.resume.notify_all();
     }
 }
 
@@ -2100,8 +2214,8 @@ pub(super) fn indexed_filled_bytes(
 
 impl Drop for BlockCachedSource {
     fn drop(&mut self) {
-        // Every queued write holds the source, so none is running now. This flush
-        // only retries one that failed.
+        // Every queued write and flush holds the source, so none runs now. This
+        // only retries a failed fsync.
         self.flush_index();
         // Release accounted bytes only; the file and index persist for adoption.
         if self.owns_accounting
@@ -2327,7 +2441,7 @@ mod tests {
     use futures::{FutureExt, poll};
     use tempfile::tempdir;
     use tokio::{
-        sync::Notify,
+        sync::{Notify, OwnedSemaphorePermit},
         time::{Instant, advance, sleep, timeout},
     };
 
@@ -2338,7 +2452,9 @@ mod tests {
             ColdFetchMode, DiskCacheConfig, LruPolicy,
             disk::{
                 BLOCK_WRITERS,
-                test_support::{OLDER_BUILD_BLOCK_BYTES, unstamped_index},
+                test_support::{
+                    OLDER_BUILD_BLOCK_BYTES, WAIT_UNTIL_POLL, unstamped_index, wait_until,
+                },
             },
         },
     };
@@ -2350,22 +2466,8 @@ mod tests {
     /// failing instead of hanging.
     const NO_WAIT_DEADLINE: Duration = Duration::from_secs(10);
 
-    /// How often [`wait_until`] checks its condition.
-    const POLL_INTERVAL: Duration = Duration::from_millis(1);
-
     /// How long a test waits to see that something does not happen.
     const STAYS_PUT: Duration = Duration::from_millis(50);
-
-    /// Waits until `cond` holds, failing with `what` after [`NO_WAIT_DEADLINE`].
-    async fn wait_until(mut cond: impl FnMut() -> bool, what: &str) {
-        timeout(NO_WAIT_DEADLINE, async {
-            while !cond() {
-                sleep(POLL_INTERVAL).await;
-            }
-        })
-        .await
-        .unwrap_or_else(|_| panic!("timed out waiting until {what}"));
-    }
 
     /// Blocks until `cond` holds, failing with `what` after [`NO_WAIT_DEADLINE`]
     /// of real time. For tests on a paused clock waiting on work on the I/O
@@ -2377,7 +2479,7 @@ mod tests {
                 StdInstant::now() < deadline,
                 "timed out waiting until {what}"
             );
-            thread::sleep(POLL_INTERVAL);
+            thread::sleep(WAIT_UNTIL_POLL);
         }
     }
 
@@ -3081,6 +3183,7 @@ mod tests {
         src.prefetch(hole.0, hole.1, b, 2)
             .await
             .expect("first prefetch");
+        store.block_writes_settled().await;
         let idx = src.idx_path();
         assert!(idx.exists(), "first prefetch writes the index");
         fs::remove_file(&idx).expect("remove index");
@@ -3089,6 +3192,7 @@ mod tests {
         src.prefetch(hole.0, hole.1, b, 2)
             .await
             .expect("second prefetch");
+        store.block_writes_settled().await;
         assert_eq!(inner.calls(), calls, "nothing left to fetch");
         assert!(
             !idx.exists(),
@@ -4745,6 +4849,197 @@ mod tests {
         store.remove_block_entry_for_test(&uri);
     }
 
+    /// Runs the flush-sharing tests land in one file.
+    const RUNS: u64 = 8;
+
+    #[tokio::test]
+    async fn runs_that_land_while_a_flush_waits_share_it() {
+        // 8 runs of one file land while its first flush waits.
+        //  - each write returns without waiting for an fsync.
+        //  - run 0 queues the flush; runs 1 to 7 queue nothing.
+        //  - one fsync indexes all 8.
+        // This test pins one queued flush per file.
+        let b = CACHE_BLOCK_BYTES;
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let (uri, _inner, src) = counting_source(dir.path(), &store, (RUNS * b) as usize);
+
+        let stall = src.stall_queued_flushes();
+        for run in 0..RUNS {
+            timeout(NO_WAIT_DEADLINE, src.prefetch(run * b, b, b, 1))
+                .await
+                .expect("a write doesn't wait for its fsync")
+                .expect("prefetch");
+            if run == 0 {
+                wait_until(|| stall.waiting() == 1, "the first run's flush").await;
+            }
+        }
+        assert_eq!(stall.waiting(), 1, "one flush queued for {RUNS} runs");
+        drop(stall);
+        store.block_writes_settled().await;
+
+        assert_eq!(
+            src.syncs.load(Ordering::Acquire),
+            1,
+            "one fsync for {RUNS} runs"
+        );
+        assert_indexed(&src.path, &src.idx_path(), RUNS * b, 0..RUNS as u32);
+        store.remove_block_entry_for_test(&uri);
+    }
+
+    #[tokio::test]
+    async fn runs_that_land_during_an_fsync_get_one_more_pass() {
+        // Runs 1 to 7 land while run 0's flush is in its fsync.
+        //  - they are not in that fsync's snapshot, and queue no flush.
+        //  - the running flush goes once more and indexes them: 2 fsyncs.
+        // This test pins the second pass.
+        let b = CACHE_BLOCK_BYTES;
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let (uri, _inner, src) = counting_source(dir.path(), &store, (RUNS * b) as usize);
+
+        let in_fsync = src.fsync_stall.hold();
+        let queued = src.stall_queued_flushes();
+        src.prefetch(0, b, b, 1).await.expect("prefetch");
+        wait_until(|| queued.waiting() == 1, "the first run's flush").await;
+        drop(queued);
+        wait_until(|| in_fsync.waiting() == 1, "the flush's fsync").await;
+
+        let queued = src.stall_queued_flushes();
+        for run in 1..RUNS {
+            timeout(NO_WAIT_DEADLINE, src.prefetch(run * b, b, b, 1))
+                .await
+                .expect("a write doesn't wait for its fsync")
+                .expect("prefetch");
+        }
+        sleep(STAYS_PUT).await;
+        assert_eq!(queued.waiting(), 0, "the running flush covers them");
+        drop(queued);
+        drop(in_fsync);
+        store.block_writes_settled().await;
+
+        assert_eq!(
+            src.syncs.load(Ordering::Acquire),
+            2,
+            "one more fsync for the rest"
+        );
+        assert_indexed(&src.path, &src.idx_path(), RUNS * b, 0..RUNS as u32);
+        store.remove_block_entry_for_test(&uri);
+    }
+
+    #[tokio::test]
+    async fn a_flush_leaves_alone_a_path_recreated_during_its_fsync() {
+        // A newer generation recreates the block file's path during the fsync.
+        //  - the flush still finishes its fsync.
+        //  - it writes no index: the path is no longer its file.
+        // This test pins the inode check in `persist_idx`.
+        let b = CACHE_BLOCK_BYTES;
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let (uri, _inner, src) = counting_source(dir.path(), &store, 2 * b as usize);
+
+        let in_fsync = src.fsync_stall.hold();
+        src.prefetch(0, b, b, 1).await.expect("prefetch");
+        wait_until(|| in_fsync.waiting() == 1, "the flush's fsync").await;
+        fs::remove_file(&src.path).expect("unlink the block file");
+        fs::write(&src.path, b"a newer generation").expect("recreate the path");
+        drop(in_fsync);
+        store.block_writes_settled().await;
+
+        assert_eq!(src.syncs.load(Ordering::Acquire), 1);
+        assert!(!src.idx_path().exists(), "no index for the newer file");
+        store.remove_block_entry_for_test(&uri);
+    }
+
+    /// Asserts the index at `idx` names exactly `blocks` of the block file at `path`.
+    fn assert_indexed(path: &Path, idx: &Path, size: u64, blocks: Range<u32>) {
+        let idx = fs::read(idx).expect("index written by the flush");
+        let ino = fs::metadata(path).expect("block file").ino();
+        let (bitmap, _) = indexed_filled_bytes(size, &idx, ino).expect("valid index");
+        assert_eq!(
+            bitmap.iter().collect::<Vec<_>>(),
+            blocks.collect::<Vec<_>>()
+        );
+    }
+
+    /// Lands block 0 of `src` and returns every block writer, held, so the flush
+    /// the write queues waits until they drop.
+    async fn land_block_zero_behind_held_writers(
+        store: &Arc<DiskCacheStore>,
+        src: &Arc<BlockCachedSource>,
+    ) -> Vec<OwnedSemaphorePermit> {
+        let b = CACHE_BLOCK_BYTES;
+        let mut writers = Vec::new();
+        for _ in 1..BLOCK_WRITERS {
+            writers.push(store.block_writer().await);
+        }
+        let stall = src.stall_writes();
+        let prefetch = tokio::spawn({
+            let src = Arc::clone(src);
+            async move { src.prefetch(0, b, b, 1).await }
+        });
+        wait_until(|| stall.waiting() == 1, "the write").await;
+        let mut last = pin!(store.block_writer());
+        assert!(
+            poll!(last.as_mut()).is_pending(),
+            "the write holds the last writer"
+        );
+        drop(stall);
+        writers.push(last.await);
+        prefetch.await.expect("prefetch task").expect("prefetch");
+        writers
+    }
+
+    #[tokio::test]
+    async fn a_flush_of_an_evicted_file_does_not_sync_it() {
+        // The block file is evicted while its flush waits for a writer.
+        //  - the flush finds the path gone: no fsync, no index.
+        // This test pins the path check before the fsync.
+        let b = CACHE_BLOCK_BYTES;
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let (uri, _inner, src) = counting_source(dir.path(), &store, 2 * b as usize);
+        let writers = land_block_zero_behind_held_writers(&store, &src).await;
+
+        // Eviction unlinks the block file and its index.
+        fs::remove_file(&src.path).expect("unlink the block file");
+        drop(writers);
+        store.block_writes_settled().await;
+
+        assert_eq!(src.syncs.load(Ordering::Acquire), 0, "no fsync");
+        assert!(!src.idx_path().exists(), "no index");
+        store.remove_block_entry_for_test(&uri);
+    }
+
+    #[tokio::test]
+    async fn a_source_let_go_while_its_flush_waits_flushes_on_a_writer() {
+        // The cache lets the source go while its flush waits for a writer.
+        //  - the queued flush keeps it alive, so nothing fsyncs on this thread.
+        //  - the flush then runs on a writer, indexes block 0, and lets it go.
+        // This test pins where the fsync runs.
+        let b = CACHE_BLOCK_BYTES;
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let (uri, _inner, src) = counting_source(dir.path(), &store, 2 * b as usize);
+        let writers = land_block_zero_behind_held_writers(&store, &src).await;
+        let idx = src.idx_path();
+        let path = src.path.clone();
+
+        store.remove_block_entry_for_test(&uri);
+        let source = Arc::downgrade(&src);
+        drop(src);
+        assert!(
+            source.upgrade().is_some(),
+            "the queued flush keeps the source"
+        );
+        assert!(!idx.exists(), "no fsync and index on the caller's thread");
+
+        drop(writers);
+        store.block_writes_settled().await;
+        assert_indexed(&path, &idx, 2 * b, 0..1);
+        assert!(source.upgrade().is_none(), "the flush lets the source go");
+    }
+
     /// A run that is never written, like one a shutting-down runtime drops,
     /// gives everything back: its budget, its share of the cap, its entry in
     /// `runs`. No index lists its blocks.
@@ -5423,12 +5718,12 @@ mod tests {
         }
         assert_eq!(inner.calls(), runs);
         wait_until(
-            || src.stalled_writes() == BLOCK_WRITERS,
+            || stall.waiting() == BLOCK_WRITERS,
             "every block writer is busy",
         )
         .await;
         sleep(STAYS_PUT).await;
-        assert_eq!(src.stalled_writes(), BLOCK_WRITERS, "the others wait");
+        assert_eq!(stall.waiting(), BLOCK_WRITERS, "the others wait");
         assert_eq!(store.write_behind_in_use(), runs as u64 * b);
 
         drop(stall);
@@ -6031,7 +6326,7 @@ mod tests {
         wait_until(
             || {
                 let _ = (&mut chunk).now_or_never();
-                src.stalled_writes() == 1
+                stall.waiting() == 1
             },
             "blocks 17..18 wait for their write",
         )

@@ -504,8 +504,6 @@ mod read;
 mod sources;
 mod store_files;
 
-#[cfg(test)]
-pub(crate) use budget::BlockWriteTicket;
 pub(crate) use budget::Reservation;
 pub(crate) use fetch::{open_batch_overlay, skip_background_fill};
 pub(crate) use sources::{
@@ -817,7 +815,10 @@ pub(crate) mod test_support {
     use object_store::MultipartUpload;
     use roaring::RoaringBitmap;
     use tempfile::TempDir;
-    use tokio::{sync::Notify, time::sleep};
+    use tokio::{
+        sync::Notify,
+        time::{sleep, timeout},
+    };
 
     use crate::{
         storage::{LocalFsStorageProvider, ObjectMeta, StorageError, StorageProvider},
@@ -966,6 +967,23 @@ pub(crate) mod test_support {
     /// Block sizes older builds wrote at the head of their block indexes, which carry no magic
     /// and no inode.
     pub(crate) const OLDER_BUILD_BLOCK_BYTES: [u64; 2] = [CACHE_BLOCK_BYTES, 512 * 1024];
+
+    /// How long [`wait_until`] waits before it fails.
+    pub(crate) const WAIT_UNTIL_DEADLINE: Duration = Duration::from_secs(10);
+
+    /// How often [`wait_until`] checks its condition.
+    pub(crate) const WAIT_UNTIL_POLL: Duration = Duration::from_millis(1);
+
+    /// Waits until `cond` holds, failing with `what` after [`WAIT_UNTIL_DEADLINE`].
+    pub(crate) async fn wait_until(mut cond: impl FnMut() -> bool, what: &str) {
+        timeout(WAIT_UNTIL_DEADLINE, async {
+            while !cond() {
+                sleep(WAIT_UNTIL_POLL).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting until {what}"));
+    }
 
     /// A block index as an older build wrote it: its block size, then the bitmap of `blocks`.
     pub(crate) fn unstamped_index(block: u64, blocks: &[u32]) -> Vec<u8> {
