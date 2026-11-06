@@ -1432,8 +1432,9 @@ impl ManifestSnapshot {
         };
         // Step 1+2: parallel write of (list, parts). `parts_to_write` is
         // every object the touched parts publish, by key: the parts, their
-        // routing siblings and their summaries sections
-        // (`EncodedPart::objects`).
+        // routing siblings, their summaries sections and rollups
+        // (`EncodedPart::objects`), and the rollups objects untouched parts'
+        // inline rollups moved to (`Self::store_inline_rollups`).
         //
         // Both futures are independent — the list's references to
         // each part's URI are content-addressable from the
@@ -1688,6 +1689,54 @@ impl ManifestSnapshot {
             Some(list) => &list.parts,
             None => &[],
         }
+    }
+
+    /// Move into objects of their own the rollups this manifest's list
+    /// still carries inline past [`rollups::INLINE_ROLLUPS_MAX_BYTES`], and
+    /// name each object in the list instead. Returns the objects by storage
+    /// key, for the commit to write with its parts, before the list that
+    /// names them.
+    ///
+    /// A part's rollups get an object of their own when the part is written,
+    /// so a part from a list before major 4 kept its rollups inline in every
+    /// list after it: on a wide table those rollups were most of the list,
+    /// and every commit rewrote them and every loser of a commit race read
+    /// them again. Every such part moves in the first commit that carries
+    /// it. That commit writes, once, the bytes its list would otherwise have
+    /// carried, so it costs no more than the commit before it did, and every
+    /// list after it is smaller.
+    ///
+    /// The objects are content-addressed and a part's rollups encode the same
+    /// way every time, so a retried commit names the same objects. A hidden
+    /// manifest's rollups stay inline, as its parts' do.
+    pub(crate) fn store_inline_rollups(&mut self) -> Vec<(String, Bytes)> {
+        if matches!(
+            self.partition_strategy(),
+            Some(PartitionStrategy::VectorCell { .. })
+        ) {
+            return Vec::new();
+        }
+        let Some(list) = self.list.as_mut() else {
+            return Vec::new();
+        };
+        let mut objects = Vec::new();
+        for entry in &mut list.parts {
+            if entry.rollups != RollupsAt::Inline {
+                continue;
+            }
+            let Some(bytes) = rollups::encode(entry.part_id, &entry.scalar_stats_agg) else {
+                continue;
+            };
+            let content_hash = ContentHash::of(&bytes);
+            let uri = rollups_uri(&content_hash);
+            entry.rollups = RollupsAt::Stored(RollupsRef {
+                uri: uri.clone(),
+                content_hash,
+                size_bytes: bytes.len() as u64,
+            });
+            objects.push((uri, Bytes::from(bytes)));
+        }
+        objects
     }
 
     /// Build a successor manifest with `new_entries` appended.
@@ -5742,7 +5791,8 @@ mod tests {
             Supertable,
             manifest::{
                 commit::{PartWriteResult, write_manifest_part, write_part_bytes},
-                list::{Manifest, PartitionStrategy},
+                list::{CellRoutingParams, Manifest, PartitionStrategy},
+                rollups::MANIFEST_ROLLUPS_DIR,
                 summaries::SummaryRow,
             },
             schema::LegacyNames,
@@ -12164,6 +12214,12 @@ mod tests {
     /// Spreads one commit's values from the next: commit `c` writes values
     /// from `c` times this up.
     const ROLLUPS_COMMIT_STRIDE: i64 = 10_000;
+    /// Cells of the grid a list is stamped with to read as a hidden one.
+    const HIDDEN_CELLS: u32 = 2;
+    /// Dimension of that grid's centroids.
+    const HIDDEN_DIM: u32 = 4;
+    /// Seed of that grid's synthetic centroids.
+    const HIDDEN_SEED: u64 = 7;
 
     /// A title to index and [`ROLLUPS_WIDE_COLUMNS`] nullable integers.
     fn rollups_wide_schema() -> Arc<Schema> {
@@ -12349,6 +12405,157 @@ mod tests {
             "the unread part is carried over as it was"
         );
         assert_eq!(committed.get_all_superfiles().len(), COMMITS + 1);
+    }
+
+    /// Publish `manifest` with every part's rollups inline, as a list before
+    /// major 4 carries them, over the pointer `storage` holds now.
+    fn publish_with_inline_rollups(
+        rt: &Runtime,
+        storage: &Arc<dyn StorageProvider>,
+        manifest: &ManifestSnapshot,
+    ) {
+        let inline = manifest.with_list_edited(true, |list| {
+            for entry in &mut list.parts {
+                entry.rollups = RollupsAt::Inline;
+            }
+        });
+        let (_, meta) = rt
+            .block_on(read_pointer(storage.as_ref()))
+            .expect("read pointer")
+            .expect("pointer present");
+        let etag = meta.etag.expect("localfs pointer etag");
+        rt.block_on(inline.write(storage.as_ref(), Some(etag.as_str()), &[]))
+            .expect("publish the inline list");
+    }
+
+    /// A wide table whose list carries its parts' rollups inline, as a list
+    /// before major 4 does: the next commit moves every part's rollups into
+    /// an object of its own, the list after it names them and carries none,
+    /// and a fresh handle reads back the rollups the inline list held.
+    #[test]
+    fn a_commit_moves_rollups_an_earlier_list_left_inline_into_objects() {
+        let (dir, storage, st) = wide_rollups_table();
+        let rt = Runtime::new().expect("runtime");
+        let written = st.inner().manifest.load_full();
+        drop(st);
+        publish_with_inline_rollups(&rt, &storage, &written);
+        assert!(
+            newest_manifest_list(dir.path()).contains("scalar_stats_agg_ipc"),
+            "the fixture's list carries its rollups inline"
+        );
+
+        let reopened = Supertable::open(rollups_wide_options(&storage)).expect("open");
+        let inline = reopened.inner().manifest.load_full();
+        assert!(
+            inline
+                .get_all_list_entries()
+                .iter()
+                .all(|entry| entry.rollups == RollupsAt::Inline),
+            "the reopened list reads as inline"
+        );
+        commit_wide(&reopened, COMMITS);
+        let committed = reopened.inner().manifest.load_full();
+        for entry in committed.get_all_list_entries() {
+            let RollupsAt::Stored(reference) = &entry.rollups else {
+                panic!("part {} keeps its rollups inline", entry.part_id);
+            };
+            assert!(
+                dir.path().join(&reference.uri).exists(),
+                "{}",
+                reference.uri
+            );
+        }
+        assert!(
+            !newest_manifest_list(dir.path()).contains("scalar_stats_agg_ipc"),
+            "no rollups inline after the commit"
+        );
+
+        drop(reopened);
+        let fresh = Supertable::open(rollups_wide_options(&storage)).expect("open");
+        let read = fresh.inner().manifest.load_full();
+        assert_eq!(
+            read.get_all_list_entries().len(),
+            committed.get_all_list_entries().len()
+        );
+        let mut untouched = 0;
+        for back in read.get_all_list_entries() {
+            assert!(
+                matches!(back.rollups, RollupsAt::Stored(_)),
+                "part {}: {:?}",
+                back.part_id,
+                back.rollups
+            );
+            if let Some(was) = inline
+                .get_all_list_entries()
+                .iter()
+                .find(|was| was.part_id == back.part_id)
+            {
+                assert_eq!(
+                    back.scalar_stats_agg, was.scalar_stats_agg,
+                    "part {}: the rollups the inline list held",
+                    back.part_id
+                );
+                untouched += 1;
+            }
+        }
+        assert!(untouched > 0, "the commit left some parts as they were");
+    }
+
+    /// Rollups under the inline cap stay inline: a narrow table's commit
+    /// writes no rollups object and its list still carries them.
+    #[test]
+    fn a_commit_leaves_rollups_under_the_cap_inline() {
+        let (dir, st) = multi_part_table();
+        commit_titles(&st, &["one more title"]);
+        let committed = st.inner().manifest.load_full();
+        assert!(committed.get_all_list_entries().len() > 1);
+        assert!(
+            committed
+                .get_all_list_entries()
+                .iter()
+                .all(|entry| entry.rollups == RollupsAt::Inline),
+            "narrow rollups stay inline"
+        );
+        let mut files = Vec::new();
+        files_under(dir.path(), &mut files);
+        assert!(
+            !files
+                .iter()
+                .any(|(path, _)| path.to_string_lossy().contains(MANIFEST_ROLLUPS_DIR)),
+            "no rollups object written"
+        );
+    }
+
+    /// A hidden manifest keeps every part's rollups inline, past the cap or
+    /// not: moving them writes nothing and changes no entry.
+    #[test]
+    fn a_hidden_manifest_keeps_its_rollups_inline() {
+        let (_dir, storage, st) = wide_rollups_table();
+        let rt = Runtime::new().expect("runtime");
+        let written = st.inner().manifest.load_full();
+        drop(st);
+        publish_with_inline_rollups(&rt, &storage, &written);
+        let reopened = Supertable::open(rollups_wide_options(&storage)).expect("open");
+        let (clusters, _) = synth_clusters(HIDDEN_CELLS, HIDDEN_DIM, HIDDEN_SEED);
+        let mut hidden = reopened
+            .inner()
+            .manifest
+            .load_full()
+            .with_list_edited(false, |list| {
+                list.partition_strategy = PartitionStrategy::VectorCell {
+                    column: "emb".into(),
+                    clusters,
+                    routing: CellRoutingParams::default(),
+                };
+            });
+        assert!(hidden.store_inline_rollups().is_empty(), "nothing written");
+        assert!(
+            hidden
+                .get_all_list_entries()
+                .iter()
+                .all(|entry| entry.rollups == RollupsAt::Inline),
+            "every entry kept inline"
+        );
     }
 
     #[test]

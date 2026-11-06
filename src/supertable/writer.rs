@@ -13708,6 +13708,10 @@ pub(crate) async fn try_commit_attempt(
         }
     }
 
+    // 2c. Rollups an earlier list left inline past the cap move into objects
+    //     of their own, written in step 4 with the parts, before the list.
+    let stored_rollups = new_manifest.store_inline_rollups();
+
     // 3. Read the prior pointer's etag for the CAS. Every storage-backed
     //    table has a pointer by now — `create` publishes one before any
     //    writer runs — so an absent pointer is not an initial commit but a
@@ -13836,9 +13840,13 @@ pub(crate) async fn try_commit_attempt(
     //    Untouched parts are NOT re-PUT — their URIs (and
     //    content-hashes) are unchanged in the new list. Each touched
     //    part ships both wire forms, full and the routing sibling the
-    //    list entry references, and its summaries section.
-    let encoded_parts: Vec<(String, Bytes)> =
-        parts_to_write.iter().flat_map(|ep| ep.objects()).collect();
+    //    list entry references, and its summaries section; untouched parts
+    //    ship only the rollups objects step 2c moved out of the list.
+    let encoded_parts: Vec<(String, Bytes)> = parts_to_write
+        .iter()
+        .flat_map(|ep| ep.objects())
+        .chain(stored_rollups)
+        .collect();
     // Whatever this commit's safety rests on has to still hold here. What is left after it is the
     // manifest parts and list and then the pointer PUT — small writes, not the uploads above.
     if let Some(fence) = fence {
