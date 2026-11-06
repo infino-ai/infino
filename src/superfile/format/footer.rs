@@ -33,7 +33,6 @@ use std::{
 
 use arrow::{
     array::{Array, ArrayRef, AsArray, OffsetSizeTrait},
-    compute::concat_batches,
     record_batch::RecordBatch,
 };
 use arrow_schema::{DataType, Schema, SchemaRef};
