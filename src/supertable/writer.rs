@@ -13715,7 +13715,7 @@ pub(crate) async fn try_commit_attempt(
 
     // 2c. Rollups an earlier list left inline past the cap move into objects
     //     of their own, written in step 4 with the parts, before the list.
-    let stored_rollups = new_manifest.store_inline_rollups();
+    let stored_rollups = new_manifest.store_inline_rollups()?;
 
     // 3. Read the prior pointer's etag for the CAS. Every storage-backed
     //    table has a pointer by now — `create` publishes one before any
