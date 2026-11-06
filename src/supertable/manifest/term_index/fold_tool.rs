@@ -178,6 +178,49 @@ fn fold_timing() {
         );
     }
 
+    // Exactly the merge optimize's rebuild runs: ordinals keep their
+    // place for a superfile still live, and are dropped otherwise.
+    let live: HashMap<_, u32> = manifest
+        .superfiles
+        .iter()
+        .enumerate()
+        .map(|(i, e)| (e.superfile_id, i as u32))
+        .collect();
+    let ordinals: Vec<Option<u32>> = root
+        .superfiles
+        .iter()
+        .map(|id| live.get(id).copied())
+        .collect();
+    let dropped = ordinals.iter().filter(|o| o.is_none()).count();
+    let new_superfiles: Vec<_> = manifest.superfiles.iter().map(|e| e.superfile_id).collect();
+    let policy = BuildPolicy {
+        scoring_by_ordinal: Arc::new(scoring_by_ordinal(&manifest, &new_superfiles)),
+        merge_ranges: n_ranges,
+        scratch_root: Some(scratch.join(OUT_DIR)),
+        ..manifest.options.term_index_build_policy()
+    };
+    // FOLD_STREAM=1 times the fold optimize runs (download, merge, upload
+    // into the table's own storage) instead of the local merge below.
+    if env::var("FOLD_STREAM").is_ok() {
+        let t = Instant::now();
+        let layer = st
+            .block_on_query(super::fold_layers(
+                &storage,
+                &root.layers,
+                &ordinals,
+                &policy,
+                &super::FoldIo::default(),
+                None,
+            ))
+            .expect("fold");
+        eprintln!(
+            "FOLD stream {:.1}s slices={} rss_peak={:.0}MiB",
+            t.elapsed().as_secs_f64(),
+            layer.slices.len(),
+            mib(status_field_bytes("VmHWM:").unwrap_or(0)),
+        );
+        return;
+    }
     let t_fetch = Instant::now();
     let sources = match present_sources(&scratch, &root.layers) {
         Some(sources) => {
@@ -210,27 +253,6 @@ fn fold_timing() {
         })
         .sum();
 
-    // Exactly the merge optimize's rebuild runs: ordinals keep their
-    // place for a superfile still live, and are dropped otherwise.
-    let live: HashMap<_, u32> = manifest
-        .superfiles
-        .iter()
-        .enumerate()
-        .map(|(i, e)| (e.superfile_id, i as u32))
-        .collect();
-    let ordinals: Vec<Option<u32>> = root
-        .superfiles
-        .iter()
-        .map(|id| live.get(id).copied())
-        .collect();
-    let dropped = ordinals.iter().filter(|o| o.is_none()).count();
-    let new_superfiles: Vec<_> = manifest.superfiles.iter().map(|e| e.superfile_id).collect();
-    let policy = BuildPolicy {
-        scoring_by_ordinal: Arc::new(scoring_by_ordinal(&manifest, &new_superfiles)),
-        merge_ranges: n_ranges,
-        scratch_root: Some(scratch.join(OUT_DIR)),
-        ..manifest.options.term_index_build_policy()
-    };
     let pool_threads = policy
         .pool
         .as_deref()
