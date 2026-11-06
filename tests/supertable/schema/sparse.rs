@@ -37,6 +37,8 @@ const GROWTH_WRITES: usize = 4;
 const DIM: usize = 16;
 /// The vector table's embedding column.
 const EMBEDDING: &str = "emb";
+/// Neighbours a vector search asks for.
+const VECTOR_K: usize = 5;
 /// The vector table's nullable columns: fewer than the plain table's, so
 /// the vector index build stays quick.
 const VECTOR_TABLE_WIDTH: usize = 400;
@@ -278,6 +280,13 @@ fn what_a_write_records_follows_its_columns_not_the_width() {
     );
 }
 
+/// Row `row`'s embedding in [`vector_rows_setting`].
+fn embedding_of(row: usize) -> Vec<f32> {
+    (row * DIM..(row + 1) * DIM)
+        .map(|i| ((i * 7919) % 101) as f32 / 101.0 + 0.01)
+        .collect()
+}
+
 /// `ROWS` rows over `schema`: the embedding set in every row, `value` in the
 /// columns `filled` names and null in every other.
 fn vector_rows_setting(schema: &Arc<Schema>, filled: &[usize], value: &str) -> RecordBatch {
@@ -287,9 +296,7 @@ fn vector_rows_setting(schema: &Arc<Schema>, filled: &[usize], value: &str) -> R
         .iter()
         .map(|f| -> ArrayRef {
             if f.name() == EMBEDDING {
-                let values: Vec<f32> = (0..ROWS * DIM)
-                    .map(|i| ((i * 7919) % 101) as f32 / 101.0 + 0.01)
-                    .collect();
+                let values: Vec<f32> = (0..ROWS).flat_map(embedding_of).collect();
                 let item = Arc::new(Field::new("item", DataType::Float32, true));
                 return Arc::new(
                     FixedSizeListArray::try_new(
@@ -365,6 +372,50 @@ fn a_vector_table_write_stores_only_the_columns_its_rows_fill() {
         ),
         ROWS as i64
     );
+
+    // A vector search projecting a column the write set and one it left
+    // out reads the first and nulls for the second.
+    let (set, unset) = (column(filled[0]), column(1));
+    for (sql, want) in [
+        (
+            format!("SELECT count(*) FROM {TABLE} WHERE {set} IS NOT NULL"),
+            ROWS as i64,
+        ),
+        (
+            format!("SELECT count(*) FROM {TABLE} WHERE {unset} IS NOT NULL"),
+            0,
+        ),
+        (
+            format!("SELECT count(*) FROM {TABLE} WHERE {unset} = 'x'"),
+            0,
+        ),
+    ] {
+        assert_eq!(count(&db, &sql), want, "{sql}");
+    }
+    let hits = t
+        .vector_search(
+            EMBEDDING,
+            &embedding_of(0),
+            VECTOR_K,
+            None,
+            Some(&[set.as_str(), unset.as_str()]),
+        )
+        .expect("vector search");
+    let found: usize = hits.iter().map(RecordBatch::num_rows).sum();
+    assert_eq!(found, VECTOR_K, "the search finds its neighbours");
+    for batch in &hits {
+        let read = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .expect("a string column");
+        assert!(read.iter().all(|v| v == Some("x")), "the set column reads");
+        assert_eq!(
+            batch.column(1).null_count(),
+            batch.num_rows(),
+            "the unset column reads null"
+        );
+    }
 }
 
 /// An update writes its replacement rows as an append writes rows: the
