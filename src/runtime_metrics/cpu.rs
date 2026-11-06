@@ -155,20 +155,24 @@ mod tests {
 
     /// Short-lived workers used to prove process CPU remains monotonic.
     const EXITING_WORKERS: usize = 4;
-    /// Busy / sleep window used by the on-CPU vs sleep comparison.
+    /// Sleep window used by the on-CPU vs sleep comparison.
     const TEST_WORK_WINDOW: Duration = Duration::from_millis(50);
+    /// On-CPU time a busy section spins for, by the thread's own clock.
+    /// Measured in CPU time rather than wall time: on a loaded host a
+    /// thread spinning for 50 ms of wall time may be scheduled for less
+    /// than 10 ms of it, which is how a wall-clock window flaked.
+    const TEST_BUSY_CPU: Duration = Duration::from_millis(20);
+    /// Wall time a busy section may take to accrue [`TEST_BUSY_CPU`]
+    /// before the test gives up: far beyond any scheduling delay.
+    const TEST_BUSY_DEADLINE: Duration = Duration::from_secs(30);
     /// Inner loop iterations per busy spin.
     const TEST_BUSY_INNER_ITERS: u64 = 4_096;
     /// Knuth multiplicative hash constant for the busy spin.
     const TEST_BUSY_MIX_CONST: u64 = 2_654_435_761;
-    /// Minimum on-CPU seconds expected from a busy window.
-    const TEST_MIN_BUSY_CPU_S: f64 = 0.010;
     /// Sleep must accrue less than busy / this factor.
     const TEST_SLEEP_VS_BUSY_FACTOR: f64 = 5.0;
     /// Wall sleep used by `timed` coverage.
     const TEST_TIMED_SLEEP: Duration = Duration::from_millis(20);
-    /// Per-thread busy window for the exited-worker retention test.
-    const TEST_WORKER_BUSY_WINDOW: Duration = Duration::from_millis(50);
     /// Minimum process CPU seconds from exited workers.
     const TEST_MIN_EXITED_WORKER_CPU_S: f64 = 0.01;
     /// Busy window short enough that a tick-quantized clock could not
@@ -208,29 +212,40 @@ mod tests {
              scheduler tick; got {measured}ns"
         );
     }
-    #[test]
-    fn on_cpu_time_excludes_sleep() {
-        let Some(start_busy) = thread_cpu_ns() else {
-            return;
-        };
-        let t = Instant::now();
+
+    /// Spin until this thread has accrued `target` of on-CPU time since
+    /// `start` (a [`thread_cpu_ns`] reading on this thread), so time the
+    /// scheduler hands to other threads cannot shorten the work. Panics if
+    /// [`TEST_BUSY_DEADLINE`] passes first: the clock is not advancing.
+    fn spin_for_cpu(start: u128, target: Duration) {
+        let deadline = Instant::now() + TEST_BUSY_DEADLINE;
         let mut acc = 0u64;
-        while t.elapsed() < TEST_WORK_WINDOW {
+        while thread_cpu_ns().expect("cpu") - start < target.as_nanos() {
+            assert!(
+                Instant::now() < deadline,
+                "busy work accrued under {target:?} of on-CPU time in {TEST_BUSY_DEADLINE:?}"
+            );
             for i in 0..TEST_BUSY_INNER_ITERS {
                 acc = acc.wrapping_add(i.wrapping_mul(TEST_BUSY_MIX_CONST));
             }
         }
         black_box(acc);
+    }
+
+    /// Busy work accrues on-CPU time and a sleep of longer wall time
+    /// accrues almost none.
+    #[test]
+    fn on_cpu_time_excludes_sleep() {
+        let Some(start_busy) = thread_cpu_ns() else {
+            return;
+        };
+        spin_for_cpu(start_busy, TEST_BUSY_CPU);
         let busy = (thread_cpu_ns().expect("cpu") - start_busy) as f64 / NS_PER_SEC as f64;
 
         let start_sleep = thread_cpu_ns().expect("cpu");
         thread::sleep(TEST_WORK_WINDOW);
         let slept = (thread_cpu_ns().expect("cpu") - start_sleep) as f64 / NS_PER_SEC as f64;
 
-        assert!(
-            busy > TEST_MIN_BUSY_CPU_S,
-            "50ms of busy work must accrue on-CPU time, got {busy}s"
-        );
         assert!(
             slept < busy / TEST_SLEEP_VS_BUSY_FACTOR,
             "a sleep ({slept}s) must accrue far less on-CPU time than busy work ({busy}s)"
@@ -258,12 +273,8 @@ mod tests {
         let workers: Vec<_> = (0..EXITING_WORKERS)
             .map(|_| {
                 thread::spawn(|| {
-                    let started = Instant::now();
-                    let mut value = 0u64;
-                    while started.elapsed() < TEST_WORKER_BUSY_WINDOW {
-                        value = value.wrapping_mul(31).wrapping_add(17);
-                        black_box(value);
-                    }
+                    let start = thread_cpu_ns().expect("a procfs host has a thread clock");
+                    spin_for_cpu(start, TEST_BUSY_CPU);
                 })
             })
             .collect();
