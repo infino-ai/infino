@@ -4636,6 +4636,65 @@ mod tests {
         }
     }
 
+    /// `count(col)` over files that leave the column out, because none of their rows set it,
+    /// is still answered from the manifest's statistics: such a file holds the column null in
+    /// every row. And it counts right.
+    #[test]
+    fn count_of_a_column_some_files_leave_out_is_answered_from_stats() {
+        let conn = connect("memory://").expect("connect");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new("note", DataType::Int64, true),
+        ]));
+        let table = conn
+            .create_table("notes", Arc::clone(&schema), IndexSpec::new())
+            .expect("create");
+        let rows = |titles: &[&str], notes: Vec<Option<i64>>| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(LargeStringArray::from(titles.to_vec())),
+                    Arc::new(Int64Array::from(notes)),
+                ],
+            )
+            .expect("batch")
+        };
+        table
+            .append(&rows(&["a", "b", "c"], vec![Some(1), None, Some(3)]))
+            .expect("append with notes");
+        table
+            .append(&rows(&["d", "e"], vec![None, None]))
+            .expect("append without notes");
+        let entries = table
+            .local_handle()
+            .reader()
+            .expect("reader")
+            .manifest()
+            .get_all_superfiles()
+            .to_vec();
+        assert!(
+            entries.iter().any(|e| e
+                .physical_schema
+                .as_ref()
+                .is_some_and(|p| p.column_by_name("note").is_none())),
+            "the second write leaves `note` out"
+        );
+
+        let sql = "SELECT count(note), count(*) FROM notes";
+        let batch = &conn.query_sql(sql).expect("count")[0];
+        let column = |i: usize| {
+            batch
+                .column(i)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("Int64 count")
+                .value(0)
+        };
+        assert_eq!((column(0), column(1)), (2, 5));
+        let plan = conn.query_sql(&format!("EXPLAIN {sql}")).expect("explain");
+        assert!(!scans(&plan), "answered from manifest stats, no scan");
+    }
+
     /// Distinct values one append of the past-the-cap fixture holds: more than a superfile
     /// records counts for.
     const PAST_THE_FILE_CAP: usize = 300;
