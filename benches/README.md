@@ -32,6 +32,7 @@ INFINO_BENCH_SUPERFILE_DOCS=100000 \
 
 cargo bench -- diagnostic                # optional diagnostics
 cargo bench -- tombstone
+cargo bench -- wide-sparse               # compaction of a wide, sparse table (by name only)
 ```
 
 Positional args after `--`: `[tier] [modality] [phase...] [corpus=…]`.
@@ -676,6 +677,20 @@ Engine top-k graded against a streaming BM25 oracle over the whole corpus, tie-a
 | vector-only | 28.50 s | 35.1 K/s | 256 | 10.36 GiB | 9.01 GiB | 10.30 GiB |
 | SQL | 75.02 s | 13.3 K/s | 256 | 11.42 GiB | 9.44 GiB | 11.02 GiB |
 <!-- END: bench/supertable/ingest -->
+
+### Supertable compaction — wide, sparse table (300K rows, 2,500 columns)
+
+_Host: 11-core arm64 laptop · release build · `cargo bench -- wide-sparse`, optimize measured alone (`INFINO_BENCH_WIDE_SPARSE_DIR`) with `/usr/bin/time -l`_
+
+The table's schema grows to 2,500 nullable string, integer and list columns over 30 commits of 10,000 rows; each row fills two of twenty common columns and four of its commit's sixty-column family. Default `optimize`, one merge:
+
+| | stored | columns / superfile | footer / superfile | optimize | peak RSS | peak footprint |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| full-width superfiles, previous merge | 248.5 MiB | 1,703 | 413.7 KiB | 14.2 s | 16.9 GB | 19.1 GB |
+| full-width superfiles, current merge | 248.5 MiB | 1,703 | 413.7 KiB | 6.0 s | 1.01 GB | 0.92 GB |
+| superfiles storing the columns they fill | 147.8 MiB | 81 | 23.1 KiB | 3.5 s | 0.65 GB | 0.52 GB |
+
+The merge holds one null array per type for a batch's empty columns, folds its column statistics as they arrive, and bounds what its body encoder and decoders hold by bytes; a write stores only the nullable columns its rows set.
 
 ### Supertable FTS — compaction reorder leaf (5M-doc corpora, 1 GiB superfiles)
 

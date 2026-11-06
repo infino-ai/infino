@@ -8,4 +8,5 @@
 pub mod evolution;
 pub mod property;
 pub mod rows;
+pub mod sparse;
 pub mod types;

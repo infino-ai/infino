@@ -104,8 +104,8 @@ use crate::{
         format::{
             self,
             footer::{
-                BodyPlan, EncodedBody, ParquetLayout, PlannedBodyEncoder, RangeStream,
-                encode_parquet_body_planned, extract_kv_map, splice_carried_body_to,
+                BodyPlan, EncodedBody, HELD_GROUP_BYTES, ParquetLayout, PlannedBodyEncoder,
+                RangeStream, encode_parquet_body_planned, extract_kv_map, splice_carried_body_to,
                 splice_index_streams_to,
             },
             kv,
@@ -143,8 +143,9 @@ use crate::{
             rerank_codec::RerankCodec,
         },
     },
-    supertable::schema::{FieldId, field_id_of, map::FileSchemaMap, with_field_id},
+    supertable::schema::{FieldId, PhysicalKind, field_id_of, map::FileSchemaMap, with_field_id},
     utils::{
+        nulls::{null_row_bytes, share_null_columns},
         terms::validate_column_name,
         trace::{detail_span, record},
     },
@@ -157,6 +158,35 @@ const REORDER_MIN_DOCS: usize = 4_096;
 /// Batches a merge decodes ahead of the one it is encoding: enough to keep
 /// decoding through a row group's encode, which takes many batches at once.
 const DECODED_BATCHES_AHEAD: usize = 64;
+
+/// What the batches decoded ahead may decode to, at the least: a wide
+/// table's batch, a few bytes a row in each of thousands of columns, gets
+/// as many batches ahead as fit in this rather than [`DECODED_BATCHES_AHEAD`].
+const DECODED_AHEAD_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Rows in a batch a superfile's rows are read back in: the Parquet
+/// reader's default batch size.
+const READ_BATCH_ROWS: u64 = 1024;
+
+/// Batches to decode ahead for a merge whose output has `schema`: up to
+/// [`DECODED_BATCHES_AHEAD`], as many as [`DECODED_AHEAD_BYTES`] holds
+/// at the floor [`null_row_bytes`] puts on a decoded row, and at least one.
+fn decoded_batches_ahead(schema: &Schema) -> usize {
+    let batch_bytes = READ_BATCH_ROWS
+        .saturating_mul(null_row_bytes(schema))
+        .max(1);
+    usize::try_from(DECODED_AHEAD_BYTES / batch_bytes)
+        .unwrap_or(DECODED_BATCHES_AHEAD)
+        .clamp(1, DECODED_BATCHES_AHEAD)
+}
+
+/// The most decoded rows a merge holds at once: the batches decoded ahead,
+/// the rows its body encoder holds to choose dictionaries, and the rows it
+/// holds before encoding them, each bounded by bytes. However many rows a
+/// merge has and however wide they are, this window is all of them that
+/// is decoded at a time.
+pub(crate) const MERGE_DECODED_WINDOW_BYTES: u64 =
+    DECODED_AHEAD_BYTES + 2 * HELD_GROUP_BYTES as u64;
 
 /// Bytes in a mebibyte, for the merge memory budget the config states in MiB.
 const BYTES_PER_MIB: u64 = 1 << 20;
@@ -1306,6 +1336,41 @@ impl BuilderOptions {
         .with_field_ids_outside_schema(outside_schema)
     }
 
+    /// These options storing only the columns a file must hold and those
+    /// named in `populated`: the id column, every column that may not be
+    /// null, and every full-text column stay; a nullable column outside
+    /// `populated` is left out of the body.
+    ///
+    /// A column a file does not store reads as null, by the same rule that
+    /// reads a file written before the column existed, so leaving out one
+    /// that is null in every row changes no value. It changes what the
+    /// file costs: on a wide, sparse table a write that fills a few dozen
+    /// of thousands of columns would otherwise store, describe in its
+    /// footer, and index the pages of every one of them.
+    pub(crate) fn storing_only(mut self, populated: &HashSet<String>) -> Self {
+        let indexed: HashSet<&str> = self.fts_columns.iter().map(|c| c.column.as_str()).collect();
+        let fields: Vec<Arc<Field>> = self
+            .schema
+            .fields()
+            .iter()
+            .filter(|f| {
+                *f.name() == self.id_column
+                    || !f.is_nullable()
+                    || indexed.contains(f.name().as_str())
+                    || populated.contains(f.name())
+            })
+            .cloned()
+            .collect();
+        if fields.len() == self.schema.fields().len() {
+            return self;
+        }
+        self.schema = Arc::new(Schema::new_with_metadata(
+            fields,
+            self.schema.metadata().clone(),
+        ));
+        self
+    }
+
     /// These options as a merge's output shape: the body the inputs
     /// actually carry. An index-only FTS column's text is in no file body,
     /// so it is not a column a merge input can supply — its postings are
@@ -1689,6 +1754,11 @@ impl SuperfileBuilder {
             fb.set_lane_mode();
         }
         Ok(lane)
+    }
+
+    /// The scalar columns each batch handed to this builder must have.
+    pub(crate) fn input_schema(&self) -> &Arc<Schema> {
+        &self.opts.schema
     }
 
     /// Where each FTS column sits in a batch's schema, for
@@ -3198,7 +3268,7 @@ impl SuperfileBuilder {
         inputs: &[MergeInput],
         body_encoder: &mut PlannedBodyEncoder,
         id_sidecar: &mut Option<PackedIdEncoder<BufWriter<NamedTempFile>>>,
-        stats_collector: &mut Vec<SuperfileStats>,
+        stats: &mut SuperfileStats,
         reanalyze: bool,
     ) -> Result<(), BuildError> {
         let id_column = self.opts.id_column.clone();
@@ -3208,7 +3278,7 @@ impl SuperfileBuilder {
         for input in inputs {
             let opts = self.opts.clone();
             let (sender, decoded) = sync_channel::<Result<(RecordBatch, SuperfileStats), BuildError>>(
-                DECODED_BATCHES_AHEAD,
+                decoded_batches_ahead(&opts.schema),
             );
             thread::scope(|scope| -> Result<(), BuildError> {
                 // Owned here, so an encode that fails drops it on the
@@ -3241,7 +3311,7 @@ impl SuperfileBuilder {
                     let Ok(next) = decoded.recv() else {
                         break;
                     };
-                    let (record_batch, stats) = next?;
+                    let (record_batch, batch_stats) = next?;
                     #[cfg(test)]
                     if tests::encode_fault() {
                         return Err(BuildError::Io(Error::other(
@@ -3250,7 +3320,10 @@ impl SuperfileBuilder {
                     }
                     // Time spent waiting on the decoder, not decoding.
                     timings.read_parquet += start.elapsed();
-                    stats_collector.push(stats);
+                    // Folded as it arrives: a table's width of column
+                    // stats per decoded batch, held to the end, is what a
+                    // wide table's merge would otherwise accumulate.
+                    stats.merge(&batch_stats);
 
                     let start = std::time::Instant::now();
                     body_encoder.write_batch(&record_batch)?;
@@ -3292,9 +3365,9 @@ impl SuperfileBuilder {
                 .body_plan(&superfile_builder.parquet_schema),
         );
 
-        let (ordered_batches, mut stats_collector) = match ordered {
-            Some((batches, stats)) => (Some(batches), stats),
-            None => (None, Vec::with_capacity(inputs.len())),
+        let (ordered_batches, mut stats) = match ordered {
+            Some((batches, stats)) => (Some(batches), SuperfileStats::from_children(&stats)),
+            None => (None, SuperfileStats::from_children(&[])),
         };
 
         // Stream the stable-id sidecar from the merged rows as they are written
@@ -3376,7 +3449,7 @@ impl SuperfileBuilder {
                     inputs,
                     &mut body_encoder,
                     &mut id_sidecar,
-                    &mut stats_collector,
+                    &mut stats,
                     reanalyze,
                 ),
                 false => Ok(()),
@@ -3509,7 +3582,6 @@ impl SuperfileBuilder {
         let finish_span =
             detail_span!("merge_finish", rows = superfile_builder.next_local_doc_id).entered();
 
-        let stats = SuperfileStats::from_children(stats_collector.as_slice());
         // Every input fully tombstoned → no rows: match `finish_to`'s
         // empty-superfile contract (write nothing, return the merged stats).
         if superfile_builder.next_local_doc_id == 0 {
@@ -4590,6 +4662,36 @@ impl MergeInput {
         }
     }
 
+    /// The names, in `out`, of the columns this input may hold a value in:
+    /// every column of `out` the file stores, except a flat one its
+    /// statistics show to be null in every row of every row group. A nested
+    /// column is never judged by them, since a Parquet null count there
+    /// also counts empty lists, and a column without statistics is taken to
+    /// hold values.
+    pub(crate) fn populated_columns(&self, out: &Schema) -> HashSet<String> {
+        let metadata = self.reader.parquet_metadata();
+        let file_schema = self.reader.schema();
+        out.fields()
+            .iter()
+            .filter_map(|field| {
+                let stored = match &self.adapter {
+                    Some(map) => map
+                        .resolve(field.name())?
+                        .physical
+                        .as_ref()
+                        .filter(|p| p.kind == PhysicalKind::Stored)?
+                        .name
+                        .clone(),
+                    None => field.name().clone(),
+                };
+                let in_file = file_schema.field_with_name(&stored).ok()?;
+                let null_throughout =
+                    !in_file.data_type().is_nested() && column_null_throughout(&metadata, &stored);
+                (!null_throughout).then(|| field.name().clone())
+            })
+            .collect()
+    }
+
     /// The input's surviving rows in the output's scalar shape, one
     /// decoded batch at a time. Never joined into one batch: a string
     /// column can decode past what one `Utf8` array's offsets can hold.
@@ -4604,6 +4706,41 @@ impl MergeInput {
             opts,
         )
     }
+}
+
+/// Whether the flat column `name` of the file `metadata` describes is null
+/// in every row: every row group records a null count equal to its rows.
+/// A row group with no null count, or no chunk for the column, says
+/// nothing, and the column is taken to hold values.
+fn column_null_throughout(metadata: &ParquetMetaData, name: &str) -> bool {
+    metadata.row_groups().iter().all(|rg| {
+        rg.columns()
+            .iter()
+            .find(|chunk| {
+                let parts = chunk.column_path().parts();
+                parts.len() == 1 && parts[0] == name
+            })
+            .and_then(|chunk| chunk.statistics())
+            .and_then(|stats| stats.null_count_opt())
+            .is_some_and(|nulls| i64::try_from(nulls).is_ok_and(|n| n == rg.num_rows()))
+    })
+}
+
+/// `batch` with only the columns `schema` names, in `schema`'s order, or
+/// as it is when it already has them all.
+pub(crate) fn project_to(batch: &RecordBatch, schema: &Schema) -> Result<RecordBatch, BuildError> {
+    if same_shape(&batch.schema(), schema) {
+        return Ok(batch.clone());
+    }
+    let indices = schema
+        .fields()
+        .iter()
+        .map(|f| batch.schema().index_of(f.name()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| BuildError::Footer(e.into()))?;
+    batch
+        .project(&indices)
+        .map_err(|e| BuildError::Footer(e.into()))
 }
 
 /// Inputs that must already have the output's shape, from the readers a
@@ -4621,6 +4758,13 @@ pub fn same_shape_inputs(
 /// [`adapt_batch`], one decoded batch at a time. Never joined into one
 /// batch: a string column can decode past what one `Utf8` array's offsets
 /// can hold.
+///
+/// A column null in every row of a batch, decoded or null-filled, leaves
+/// as the batch's one shared null array of its type (see
+/// [`share_null_columns`]). On a wide, sparse table nearly every column
+/// of a batch is null, and the encoder holds a row group's batches before
+/// it writes them: one null array per column would make each held row
+/// cost the table's width.
 fn adapted_batches<'a>(
     reader: &SuperfileReader,
     deleted: Option<Arc<RoaringBitmap>>,
@@ -4636,7 +4780,8 @@ fn adapted_batches<'a>(
     adapt_batch(RecordBatch::new_empty(batches.schema()), adapter, &schema)?;
     Ok(batches.map(move |batch| {
         let batch = batch.map_err(|_| BuildError::BatchReadError)?;
-        adapt_batch(batch, adapter, &schema)
+        let batch = adapt_batch(batch, adapter, &schema)?;
+        share_null_columns(batch).map_err(|e| BuildError::Footer(e.into()))
     }))
 }
 

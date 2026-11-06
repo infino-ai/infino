@@ -23,6 +23,7 @@ use uuid::Uuid;
 
 use crate::{
     config::CompactionSettings,
+    superfile::builder::MERGE_DECODED_WINDOW_BYTES,
     supertable::manifest::{list::DrainedVersionRanges, listed_once},
 };
 
@@ -33,6 +34,64 @@ pub(super) const MIB: u64 = 1024 * 1024;
 /// and a term-index fold's at optimize.
 pub(crate) fn max_merge_input_bytes(cfg: &CompactionSettings) -> u64 {
     cfg.max_merge_input_mb.saturating_mul(MIB)
+}
+
+/// Bytes an indexed merge keeps per row of its output while it runs: the
+/// survivor numbering of every input row, the document order it chooses
+/// and that order's inverse. A merge with no index carries its rows
+/// straight through and keeps none of it.
+pub(super) const INDEXED_MERGE_ROW_BYTES: u64 = 16;
+
+/// What a merge of a table holds while it runs, and the most the planner
+/// may give one merge.
+///
+/// A merge opens its inputs whole and stages its output whole, so those
+/// bytes are held from start to finish. Its rows pass through decoded,
+/// and a decoded row costs the table's width whatever it holds: a null
+/// string is still an offset, so a row of a table thousands of columns
+/// wide decodes to tens of kilobytes however few of them it fills, which
+/// its stored bytes, a bit per null, say nothing of. The merge holds a
+/// window of those rows at a time ([`MERGE_DECODED_WINDOW_BYTES`] at the
+/// most), so a wide merge is charged that window and a narrow one the rows
+/// it has.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct MergeMemory {
+    /// What one row of the table decodes to at the least
+    /// (`null_row_bytes` of its scalar schema).
+    pub(crate) row_bytes: u64,
+    /// Whether merges keep per-row bookkeeping: the table has an index.
+    pub(crate) indexed: bool,
+    /// The most one planned merge may be expected to hold: what the host
+    /// can give a merge. `None` where it cannot be read, which never
+    /// bounds a job.
+    pub(crate) limit: Option<u64>,
+}
+
+impl MergeMemory {
+    /// What a merge of `input_bytes` stored, writing `output_bytes`, over
+    /// `live_docs` rows is expected to hold once it is running. A floor
+    /// rather than a model of everything a merge allocates (term
+    /// cardinality and posting density add to an indexed one), and the
+    /// host reading, not this, is what finally bounds how many run at once.
+    pub(crate) fn footprint(&self, input_bytes: u64, output_bytes: u64, live_docs: u64) -> u64 {
+        let bookkeeping = match self.indexed {
+            true => live_docs.saturating_mul(INDEXED_MERGE_ROW_BYTES),
+            false => 0,
+        };
+        let decoded = live_docs
+            .saturating_mul(self.row_bytes)
+            .min(MERGE_DECODED_WINDOW_BYTES);
+        input_bytes
+            .saturating_add(output_bytes)
+            .saturating_add(bookkeeping)
+            .saturating_add(decoded)
+    }
+
+    /// Whether a merge of that shape is within [`Self::limit`].
+    fn admits(&self, input_bytes: u64, output_bytes: u64, live_docs: u64) -> bool {
+        self.limit
+            .is_none_or(|limit| self.footprint(input_bytes, output_bytes, live_docs) <= limit)
+    }
 }
 
 /// Stats for one superfile. The caller fills these in.
@@ -123,7 +182,21 @@ pub struct CompactionJob {
 /// reach the floor are left for next time. Each `superfile_id` must appear
 /// once: `compact_one_table` drops repeats with [`listed_once`] before the
 /// drain-watermark split.
+#[cfg(test)]
 pub fn select(superfiles: &[SuperfileStats], cfg: &CompactionSettings) -> Vec<CompactionJob> {
+    select_within(superfiles, cfg, &MergeMemory::default())
+}
+
+/// [`select`], with no job of more than one input planned past what
+/// `memory` admits: a merge expected to hold more than the host can give
+/// it is cut where its inputs reach that, as a job is cut at the target
+/// size. One superfile that alone exceeds it still starts a job, which is
+/// what lets a stale-typed file be rewritten on any host.
+pub(crate) fn select_within(
+    superfiles: &[SuperfileStats],
+    cfg: &CompactionSettings,
+    memory: &MergeMemory,
+) -> Vec<CompactionJob> {
     debug_assert_eq!(
         listed_once(superfiles, |s| s.superfile_id).count(),
         superfiles.len(),
@@ -157,6 +230,7 @@ pub fn select(superfiles: &[SuperfileStats], cfg: &CompactionSettings) -> Vec<Co
             min_output_bytes,
             min_superfiles_for_merge,
             max_input_bytes,
+            memory,
             &mut jobs,
         );
     }
@@ -176,6 +250,7 @@ fn pack_partition(
     min_output_bytes: u64,
     min_superfiles_for_merge: usize,
     max_input_bytes: u64,
+    memory: &MergeMemory,
     jobs: &mut Vec<CompactionJob>,
 ) {
     // Exclude superfiles already at target size — they are done and
@@ -206,7 +281,7 @@ fn pack_partition(
     let merge_input_mb = Some(max_input_bytes / MIB);
     let mut pending = PendingJob::default();
     for s in candidates {
-        if !pending.fits(s, target_bytes, max_input_bytes) {
+        if !pending.fits(s, target_bytes, max_input_bytes, memory) {
             pending.emit(
                 key,
                 min_output_bytes,
@@ -250,9 +325,20 @@ struct PendingJob {
 }
 
 impl PendingJob {
-    fn fits(&self, s: &SuperfileStats, target_bytes: u64, max_input_bytes: u64) -> bool {
+    fn fits(
+        &self,
+        s: &SuperfileStats,
+        target_bytes: u64,
+        max_input_bytes: u64,
+        memory: &MergeMemory,
+    ) -> bool {
         self.live_bytes + s.live_bytes() <= target_bytes
             && self.raw_bytes + s.size_bytes <= max_input_bytes
+            && memory.admits(
+                self.raw_bytes + s.size_bytes,
+                self.live_bytes + s.live_bytes(),
+                self.live_docs + s.live_docs(),
+            )
     }
 
     fn push(&mut self, s: &SuperfileStats) {
@@ -626,16 +712,16 @@ pub(in crate::supertable::optimize::compact) mod tests {
         let max_memory = mib(1000);
         let mut p = PendingJob::default();
         let a = seg(1, 60, 1000, 0); // 60 MiB live
-        assert!(p.fits(&a, target, max_memory));
+        assert!(p.fits(&a, target, max_memory, &MergeMemory::default()));
         p.push(&a);
         assert_eq!(p.live_bytes, mib(60));
         assert_eq!(p.members.len(), 1);
         // A second 60 MiB superfile would overflow the 100 MiB target.
         let b = seg(2, 60, 1000, 0);
-        assert!(!p.fits(&b, target, max_memory));
+        assert!(!p.fits(&b, target, max_memory, &MergeMemory::default()));
         // A 40 MiB superfile fits exactly to the boundary.
         let c = seg(3, 40, 1000, 0);
-        assert!(p.fits(&c, target, max_memory));
+        assert!(p.fits(&c, target, max_memory, &MergeMemory::default()));
     }
 
     #[test]
@@ -646,10 +732,87 @@ pub(in crate::supertable::optimize::compact) mod tests {
         let max_memory = mib(100);
         let mut p = PendingJob::default();
         let a = seg(1, 60, 1000, 0); // 60 MiB raw, 60 MiB live
-        assert!(p.fits(&a, target, max_memory));
+        assert!(p.fits(&a, target, max_memory, &MergeMemory::default()));
         p.push(&a);
         let b = seg(2, 60, 1000, 0); // would push raw to 120 MiB > 100 MiB cap
-        assert!(!p.fits(&b, target, max_memory));
+        assert!(!p.fits(&b, target, max_memory, &MergeMemory::default()));
+    }
+
+    /// A decoded row of a table thousands of columns wide, nearly all null.
+    const WIDE_ROW_BYTES: u64 = 20_000;
+
+    /// Superfiles of a wide table: small as stored, as a table of mostly
+    /// nulls is, with many rows each.
+    fn wide_segs() -> Vec<SuperfileStats> {
+        (1..=WIDE_SEGS).map(|i| seg(i, 4, 3_000, 0)).collect()
+    }
+
+    /// Superfiles in the wide fixture.
+    const WIDE_SEGS: u128 = 100;
+
+    /// A wide table's job is cut where its expected footprint would pass
+    /// what the host can give a merge, every input still lands in exactly
+    /// one job, and with no limit the same superfiles make one job.
+    #[test]
+    fn a_wide_tables_jobs_fit_the_memory_a_merge_is_given() {
+        let cfg = CompactionSettings {
+            min_superfiles_for_merge: 2,
+            ..CompactionSettings::default()
+        };
+        let segs = wide_segs();
+        let unbounded = MergeMemory {
+            row_bytes: WIDE_ROW_BYTES,
+            ..MergeMemory::default()
+        };
+        let whole = select_within(&segs, &cfg, &unbounded);
+        assert_eq!(
+            whole.len(),
+            1,
+            "stored bytes alone put all of it in one job"
+        );
+
+        let limit = mib(1_024);
+        let bounded = MergeMemory {
+            limit: Some(limit),
+            ..unbounded
+        };
+        let jobs = select_within(&segs, &cfg, &bounded);
+        assert!(jobs.len() > 1, "the limit cuts the table into several jobs");
+        let mut seen = HashSet::new();
+        for job in &jobs {
+            assert!(job.inputs.len() >= 2);
+            let footprint =
+                bounded.footprint(job.input_bytes, job.estimated_output_bytes, job.live_docs);
+            assert!(
+                footprint <= limit,
+                "a job expected to hold {footprint} bytes"
+            );
+            for id in &job.inputs {
+                assert!(seen.insert(*id), "{id} is in two jobs");
+            }
+        }
+        // Every superfile still merges: the limit cuts, it drops nothing.
+        assert_eq!(seen.len() as u128, WIDE_SEGS);
+    }
+
+    /// A limit no merge of two inputs fits plans nothing rather than a job
+    /// past it; a stale-typed superfile is still rewritten alone.
+    #[test]
+    fn a_limit_no_pair_fits_plans_only_the_rewrites() {
+        let cfg = CompactionSettings {
+            min_superfiles_for_merge: 2,
+            ..CompactionSettings::default()
+        };
+        let mut segs = wide_segs();
+        segs[0].stale_type = true;
+        let memory = MergeMemory {
+            row_bytes: WIDE_ROW_BYTES,
+            indexed: false,
+            limit: Some(1),
+        };
+        let jobs = select_within(&segs, &cfg, &memory);
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].inputs, vec![segs[0].superfile_id]);
     }
 
     // ---- job disjointness (the invariant concurrent merging rests on) ----

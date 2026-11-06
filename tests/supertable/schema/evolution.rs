@@ -704,6 +704,95 @@ fn compaction_merges_the_generations_growth_leaves_behind() {
     assert_eq!(hits.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
 }
 
+/// Columns the wide, sparse table ends with.
+const WIDE_COLUMNS: usize = 300;
+/// Commits that write the wide table; each adds a slice of its columns.
+const WIDE_GENERATIONS: usize = 6;
+/// Rows each commit writes.
+const WIDE_ROWS_PER_GENERATION: usize = 400;
+/// Columns each row of the wide table fills.
+const WIDE_FILLED_PER_ROW: usize = 3;
+/// Every this-many-th wide column holds integers; the rest hold strings.
+const WIDE_INT_EVERY: usize = 5;
+
+/// The `i`-th column of the wide table.
+fn wide_field(i: usize) -> Field {
+    match i.is_multiple_of(WIDE_INT_EVERY) {
+        true => Field::new(format!("p{i:03}"), DataType::Int64, true),
+        false => Field::new(format!("p{i:03}"), DataType::LargeUtf8, true),
+    }
+}
+
+/// Generation `g`'s rows over the columns it knows: each row fills
+/// [`WIDE_FILLED_PER_ROW`] of them, spread so most columns of a commit
+/// hold a value somewhere and most of a row's columns are null.
+fn wide_generation(g: usize) -> RecordBatch {
+    let width = WIDE_COLUMNS * (g + 1) / WIDE_GENERATIONS;
+    let filled = |row: usize, column: usize| {
+        (0..WIDE_FILLED_PER_ROW).any(|k| (row * 7 + k * 31 + g) % width == column)
+    };
+    let fields: Vec<Field> = (0..width).map(wide_field).collect();
+    let columns: Vec<ArrayRef> = (0..width)
+        .map(|c| -> ArrayRef {
+            let rows = 0..WIDE_ROWS_PER_GENERATION;
+            match c.is_multiple_of(WIDE_INT_EVERY) {
+                true => {
+                    Arc::new(Int64Array::from_iter(rows.map(|r| {
+                        filled(r, c).then_some((g * 1_000_000 + r * 1_000 + c) as i64)
+                    })))
+                }
+                false => Arc::new(LargeStringArray::from_iter(
+                    rows.map(|r| filled(r, c).then(|| format!("g{g} r{r} c{c}"))),
+                )),
+            }
+        })
+        .collect();
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("wide batch")
+}
+
+/// A wide, sparse table — hundreds of nullable columns, each row filling a
+/// few, the schema growing commit by commit so the early files predate the
+/// late columns — reads back every value unchanged once compaction has
+/// merged its generations into one superfile.
+#[test]
+fn compaction_of_a_wide_sparse_table_keeps_every_value() {
+    let dir = TempDir::new().expect("tempdir");
+    let db = connect(dir.path().to_str().expect("utf8")).expect("connect");
+    let first = Arc::new(Schema::new(
+        (0..WIDE_COLUMNS / WIDE_GENERATIONS)
+            .map(wide_field)
+            .collect::<Vec<_>>(),
+    ));
+    let wide = db
+        .create_table(TABLE, first, IndexSpec::new())
+        .expect("create");
+    for g in 0..WIDE_GENERATIONS {
+        wide.append(&wide_generation(g)).expect("append");
+    }
+    let projection: Vec<String> = (0..WIDE_COLUMNS)
+        .map(|i| wide_field(i).name().clone())
+        .collect();
+    let sql = format!("SELECT {} FROM docs", projection.join(", "));
+    let before = rows(&db, &sql);
+    assert_eq!(before.len(), WIDE_GENERATIONS * WIDE_ROWS_PER_GENERATION);
+    assert!(
+        wide.local_handle().reader().expect("reader").n_superfiles() >= WIDE_GENERATIONS,
+        "every generation wrote its own superfiles"
+    );
+
+    wide.optimize(&OptimizeOptions::compact(CompactionSettings {
+        target_superfile_size_mb: COMPACT_TARGET_MB,
+        min_fill_percent: COMPACT_MIN_FILL_PERCENT,
+        ..CompactionSettings::default()
+    }))
+    .expect("compact");
+    assert_eq!(
+        wide.local_handle().reader().expect("reader").n_superfiles(),
+        1
+    );
+    assert_eq!(rows(&db, &sql), before);
+}
+
 /// The whole life of a schema-optional table, in the order a caller meets
 /// it: a table with no columns at all, grown by the documents it is given,
 /// then changed deliberately through schema writes, with every refusal
