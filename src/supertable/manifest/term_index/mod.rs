@@ -2344,15 +2344,18 @@ fn cut_from_refs(
         .collect();
     let total: u64 = marks.iter().map(|(_, weight)| weight).sum();
     let threads = threads.max(1);
+    // Two ranges per thread in the window, so a small window still keeps
+    // every thread merging.
+    let per_range = (window / (2 * threads as u64)).max(1);
+    let to_fit = total.div_ceil(per_range).min(usize::MAX as u64) as usize;
     let want = match policy.merge_ranges {
-        Some(n) => n.max(1),
+        Some(n) => n
+            .max(1)
+            .max(to_fit.min(FOLD_RANGES_MAX_PER_THREAD * threads)),
         None if total < MERGE_RANGE_MIN_BYTES => 1,
-        None => {
-            let per_range = (window / (2 * threads as u64)).max(1);
-            threads
-                .max(total.div_ceil(per_range).min(usize::MAX as u64) as usize)
-                .min(FOLD_RANGES_MAX_PER_THREAD * threads)
-        }
+        None => threads
+            .max(to_fit)
+            .min(FOLD_RANGES_MAX_PER_THREAD * threads),
     };
     if want <= 1 {
         return vec![(None, None)];
