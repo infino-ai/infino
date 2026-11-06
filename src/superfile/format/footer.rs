@@ -31,8 +31,12 @@ use std::{
     sync::Arc,
 };
 
-use arrow::{compute::concat_batches, record_batch::RecordBatch};
-use arrow_schema::{Schema, SchemaRef};
+use arrow::{
+    array::{Array, ArrayRef, AsArray, OffsetSizeTrait},
+    compute::concat_batches,
+    record_batch::RecordBatch,
+};
+use arrow_schema::{DataType, Schema, SchemaRef};
 use bytes::Bytes;
 use parquet::{
     arrow::{
@@ -45,7 +49,7 @@ use parquet::{
             FileMetaData, KeyValue, ParquetMetaData, ParquetMetaDataBuilder, ParquetMetaDataReader,
             ParquetMetaDataWriter,
         },
-        properties::WriterProperties,
+        properties::{DEFAULT_WRITE_BATCH_SIZE, WriterProperties},
         writer::SerializedFileWriter,
     },
     schema::types::ColumnPath,
@@ -55,6 +59,7 @@ use tempfile::NamedTempFile;
 
 use crate::{
     config::scratch_root,
+    runtime_metrics::ingest::offset_window,
     superfile::{LazyByteSource, LazyByteSourceError, format::kv},
 };
 
@@ -82,6 +87,20 @@ const PARQUET_MIN_FILE_BYTES: usize = PARQUET_MAGIC_LEN + PARQUET_FOOTER_SUFFIX_
 /// many; 4096 cuts it fivefold while keeping the page count, and with it
 /// the header and page-index overhead a full scan pays, low.
 const DATA_PAGE_ROW_LIMIT: usize = 4096;
+
+/// Most string and binary bytes one column gets in a single write to the
+/// Parquet writer. The writer checks a page's size only after each run of
+/// [`DEFAULT_WRITE_BATCH_SIZE`] values (for a list column, a run ends at
+/// the next row), so a page holds a whole run however large its values
+/// are, and a page over 2 GiB can't be written (its header stores the
+/// size as an `i32`). Writing a batch in slices of at most this many
+/// bytes per column keeps a page near this size. A single row is never
+/// split, so one row over 2 GiB still can't be written.
+///
+/// The cap only binds when values average over ~64 KB, so normal tables
+/// write the same files as before. A smaller cap would also cut normal
+/// text columns into many more, smaller pages.
+const MAX_WRITE_BYTES: usize = 64 << 20;
 
 /// Output of a successful build.
 pub struct ParquetParts {
@@ -370,11 +389,13 @@ impl ParquetBodyEncoder {
             let mut group_leaves: Vec<Vec<ArrowLeafColumn>> =
                 group_writers.iter().map(|_| Vec::new()).collect();
             for batch in group {
-                let mut leaf_index = 0;
-                for (field, column) in self.schema.fields().iter().zip(batch.columns()) {
-                    for leaf in compute_leaves(field.as_ref(), column)? {
-                        group_leaves[leaf_index].push(leaf);
-                        leaf_index += 1;
+                for part in byte_bounded_slices(batch, MAX_WRITE_BYTES) {
+                    let mut leaf_index = 0;
+                    for (field, column) in self.schema.fields().iter().zip(part.columns()) {
+                        for leaf in compute_leaves(field.as_ref(), column)? {
+                            group_leaves[leaf_index].push(leaf);
+                            leaf_index += 1;
+                        }
                     }
                 }
             }
@@ -444,6 +465,111 @@ fn writer_properties(
             props_builder.set_column_dictionary_enabled(ColumnPath::from(col.clone()), false);
     }
     props_builder.build()
+}
+
+/// `batch` cut into row slices that each hold at most `max_bytes` of
+/// string and binary values in every column, or a single row. A batch
+/// under the cap comes back whole, so most writes are unchanged.
+///
+/// A slice of at least [`DEFAULT_WRITE_BATCH_SIZE`] rows is cut to a
+/// multiple of it. Each write starts a new run of values in the Parquet
+/// writer, and a page is cut only at the end of a run, so slices of whole
+/// runs keep every column's pages within [`DATA_PAGE_ROW_LIMIT`] rows.
+fn byte_bounded_slices(batch: &RecordBatch, max_bytes: usize) -> Vec<RecordBatch> {
+    // A column under the cap is under it in every slice, so only the
+    // others decide where to cut.
+    let big: Vec<&ArrayRef> = batch
+        .columns()
+        .iter()
+        .filter(|column| value_bytes(column.as_ref()) > max_bytes)
+        .collect();
+    if big.is_empty() {
+        return vec![batch.clone()];
+    }
+    let fits = |start: usize, len: usize| {
+        big.iter()
+            .all(|column| value_bytes(column.slice(start, len).as_ref()) <= max_bytes)
+    };
+    let mut slices = Vec::new();
+    let mut start = 0;
+    while start < batch.num_rows() {
+        // Most rows from `start` that fit, found by binary search; at least one.
+        let (mut lo, mut hi) = (1, batch.num_rows() - start);
+        while lo < hi {
+            let mid = lo + (hi - lo).div_ceil(2);
+            if fits(start, mid) {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        if lo < batch.num_rows() - start && lo >= DEFAULT_WRITE_BATCH_SIZE {
+            lo -= lo % DEFAULT_WRITE_BATCH_SIZE;
+        }
+        slices.push(batch.slice(start, lo));
+        start += lo;
+    }
+    slices
+}
+
+/// Bytes of the string and binary values in `array`'s rows, nested ones
+/// included, plus fixed-size binary values. Fixed-width primitives count as
+/// zero: a run of them makes a small page. Dictionary columns count as zero
+/// too: keys share their values, so a slice has no byte range of its own,
+/// and a dictionary of very large values is not capped.
+fn value_bytes(array: &dyn Array) -> usize {
+    match array.data_type() {
+        DataType::Utf8 => window_len(array.as_string::<i32>().value_offsets()),
+        DataType::LargeUtf8 => window_len(array.as_string::<i64>().value_offsets()),
+        DataType::Binary => window_len(array.as_binary::<i32>().value_offsets()),
+        DataType::LargeBinary => window_len(array.as_binary::<i64>().value_offsets()),
+        DataType::Utf8View => view_bytes(array.as_string_view().lengths()),
+        DataType::BinaryView => view_bytes(array.as_binary_view().lengths()),
+        DataType::FixedSizeBinary(_) => {
+            array.len() * array.as_fixed_size_binary().value_length() as usize
+        }
+        DataType::List(_) => {
+            let list = array.as_list::<i32>();
+            window_value_bytes(list.value_offsets(), list.values().as_ref())
+        }
+        DataType::LargeList(_) => {
+            let list = array.as_list::<i64>();
+            window_value_bytes(list.value_offsets(), list.values().as_ref())
+        }
+        DataType::Map(..) => {
+            let map = array.as_map();
+            window_value_bytes(map.value_offsets(), map.entries())
+        }
+        // A sliced fixed-size list already holds only its own values.
+        DataType::FixedSizeList(..) => value_bytes(array.as_fixed_size_list().values().as_ref()),
+        // Each field (and a map's key and value) is its own Parquet column
+        // with its own pages, so only the largest one counts.
+        DataType::Struct(_) => array
+            .as_struct()
+            .columns()
+            .iter()
+            .map(|child| value_bytes(child.as_ref()))
+            .max()
+            .unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// Bytes the range `offsets` covers.
+fn window_len<O: OffsetSizeTrait>(offsets: &[O]) -> usize {
+    let (first, last) = offset_window(offsets);
+    last - first
+}
+
+/// [`value_bytes`] of the child `values` that `offsets` point at.
+fn window_value_bytes<O: OffsetSizeTrait>(offsets: &[O], values: &dyn Array) -> usize {
+    let (first, last) = offset_window(offsets);
+    value_bytes(values.slice(first, last - first).as_ref())
+}
+
+/// Bytes of a view column's values, from their `lengths`.
+fn view_bytes(lengths: impl Iterator<Item = u32>) -> usize {
+    lengths.map(|len| len as usize).sum()
 }
 
 /// Compressed bytes of each top-level column of a body.
@@ -535,7 +661,9 @@ impl BodyPlan {
             plain_columns,
         );
         let mut writer = ArrowWriter::try_new(io::sink(), schema.clone(), Some(props))?;
-        writer.write(sample)?;
+        for part in byte_bounded_slices(sample, MAX_WRITE_BYTES) {
+            writer.write(&part)?;
+        }
         let meta = writer.close()?;
         let mut sizes = ColumnSizes::new();
         for rg in meta.row_groups() {
@@ -1227,11 +1355,19 @@ fn with_kv_list(metadata: &ParquetMetaData, kvs: Vec<KeyValue>) -> ParquetMetaDa
 mod tests {
     use std::slice;
 
-    use arrow_array::{Float64Array, StringArray, UInt64Array};
+    use arrow_array::{
+        BinaryViewArray, FixedSizeBinaryArray, FixedSizeListArray, Float64Array, LargeStringArray,
+        StringArray, StringViewArray, StructArray, UInt64Array,
+        builder::{ListBuilder, MapBuilder, StringBuilder},
+    };
     use arrow_schema::{DataType, Field};
     use parquet::{
-        arrow::arrow_reader::ParquetRecordBatchReaderBuilder, basic::ZstdLevel,
-        file::metadata::PageIndexPolicy,
+        arrow::arrow_reader::ParquetRecordBatchReaderBuilder,
+        basic::ZstdLevel,
+        file::{
+            metadata::PageIndexPolicy,
+            reader::{FileReader, SerializedFileReader},
+        },
     };
 
     use super::*;
@@ -1903,31 +2039,36 @@ mod tests {
             },
         )
         .expect("planned body");
+        for pages in page_rows(body) {
+            assert!(pages.len() >= GROUPS, "pages {pages:?}");
+            assert!(
+                pages.iter().all(|&rows| rows <= DATA_PAGE_ROW_LIMIT as i64),
+                "pages {pages:?}"
+            );
+        }
+    }
+
+    /// Rows of each data page in `body`, one list per column chunk.
+    fn page_rows(body: EncodedBody) -> Vec<Vec<i64>> {
         let parts = splice_index_blobs(body, &[], &[], &[], &[]).expect("splice");
         let metadata = ParquetMetaDataReader::new()
             .with_page_index_policy(PageIndexPolicy::Required)
             .parse_and_finish(&Bytes::from(parts.bytes))
             .expect("metadata with page index");
         let offsets = metadata.offset_index().expect("offset index");
+        let mut chunks = Vec::new();
         for (group, columns) in metadata.row_groups().iter().zip(offsets) {
-            let group_rows = group.num_rows();
             for column in columns {
                 let firsts: Vec<i64> = column
                     .page_locations()
                     .iter()
                     .map(|page| page.first_row_index)
-                    .chain([group_rows])
+                    .chain([group.num_rows()])
                     .collect();
-                assert!(firsts.len() > GROUPS, "pages {firsts:?}");
-                for pair in firsts.windows(2) {
-                    assert!(
-                        pair[1] - pair[0] <= DATA_PAGE_ROW_LIMIT as i64,
-                        "page of {} rows",
-                        pair[1] - pair[0]
-                    );
-                }
+                chunks.push(firsts.windows(2).map(|pair| pair[1] - pair[0]).collect());
             }
         }
+        chunks
     }
 
     /// A body that dropped some dictionaries is ordinary Parquet: a standard
@@ -2021,5 +2162,284 @@ mod tests {
         };
         assert_eq!(rows(&whole), rows(&streamed));
         assert_eq!(dictionaries(&whole), dictionaries(&streamed));
+    }
+
+    // ---- byte-bounded write slices ----
+
+    /// Cap the slicing tests use, small so they stay fast.
+    const TEST_MAX_WRITE_BYTES: usize = 1000;
+
+    /// Bytes in an ordinary test value; ten of them fill the cap.
+    const TEST_VALUE_BYTES: usize = 100;
+
+    /// Bytes in an oversized test value, larger than the cap alone.
+    const TEST_BIG_VALUE_BYTES: usize = 5000;
+
+    /// Bytes of the row number each test value starts with, so values differ.
+    const TEST_ID_BYTES: usize = 8;
+
+    /// An id column and a text column whose row `i` holds `lens[i]` bytes.
+    fn text_batch(lens: &[usize]) -> RecordBatch {
+        let text: LargeStringArray = lens
+            .iter()
+            .enumerate()
+            .map(|(i, len)| Some(format!("{i:08}{}", "x".repeat(len - TEST_ID_BYTES))))
+            .collect();
+        let ids = UInt64Array::from_iter_values(0..lens.len() as u64);
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::UInt64, false),
+            Field::new("text", DataType::LargeUtf8, true),
+        ]);
+        RecordBatch::try_new(Arc::new(schema), vec![Arc::new(ids), Arc::new(text)])
+            .expect("text batch")
+    }
+
+    /// A batch under the cap is written whole.
+    #[test]
+    fn small_batch_is_one_slice() {
+        let batch = text_batch(&[TEST_VALUE_BYTES; 5]);
+        let slices = byte_bounded_slices(&batch, TEST_MAX_WRITE_BYTES);
+        assert_eq!(slices, vec![batch]);
+    }
+
+    /// Each slice is as long as the cap allows, a value over the cap gets
+    /// a slice of its own, and the slices keep every row in order.
+    #[test]
+    fn slices_hold_at_most_the_cap() {
+        let mut lens = vec![TEST_VALUE_BYTES; 50];
+        lens.insert(20, TEST_BIG_VALUE_BYTES);
+        let batch = text_batch(&lens);
+        let slices = byte_bounded_slices(&batch, TEST_MAX_WRITE_BYTES);
+        let rows: Vec<usize> = slices.iter().map(RecordBatch::num_rows).collect();
+        assert_eq!(rows, vec![10, 10, 1, 10, 10, 10]);
+        let joined = concat_batches(&batch.schema(), &slices).expect("concat slices");
+        assert_eq!(joined, batch);
+    }
+
+    /// Values inside a list count, and a sliced list counts only the
+    /// values its own rows point at.
+    #[test]
+    fn list_values_count_toward_the_cap() {
+        const ROWS: usize = 20;
+        const ITEMS_PER_ROW: usize = 2;
+        let mut builder = ListBuilder::new(StringBuilder::new());
+        for _ in 0..ROWS {
+            for _ in 0..ITEMS_PER_ROW {
+                builder.values().append_value("x".repeat(TEST_VALUE_BYTES));
+            }
+            builder.append(true);
+        }
+        let list: ArrayRef = Arc::new(builder.finish());
+        let row_bytes = ITEMS_PER_ROW * TEST_VALUE_BYTES;
+        assert_eq!(value_bytes(list.slice(3, 4).as_ref()), 4 * row_bytes);
+
+        let batch = RecordBatch::try_from_iter([("tags", list)]).expect("list batch");
+        let slices = byte_bounded_slices(&batch, TEST_MAX_WRITE_BYTES);
+        let rows: Vec<usize> = slices.iter().map(RecordBatch::num_rows).collect();
+        assert_eq!(
+            rows,
+            vec![TEST_MAX_WRITE_BYTES / row_bytes; ROWS * row_bytes / TEST_MAX_WRITE_BYTES]
+        );
+    }
+
+    /// Rows in the page-size test: one run of the Parquet writer's values.
+    const BIG_PAGE_ROWS: usize = 1024;
+
+    /// Bytes per value in the page-size test: 1024 of them pass the cap.
+    const BIG_PAGE_VALUE_BYTES: usize = 80 * 1024;
+
+    /// Largest uncompressed page of the `text` column in `body`.
+    fn largest_text_page(body: EncodedBody, schema: &Schema) -> usize {
+        let parts = splice_index_blobs(body, &[], &[], &[], &[]).expect("splice");
+        let reader = SerializedFileReader::new(Bytes::from(parts.bytes)).expect("reader");
+        let text_column = schema.index_of("text").expect("text column");
+        let mut pages = reader
+            .get_row_group(0)
+            .expect("row group")
+            .get_column_page_reader(text_column)
+            .expect("page reader");
+        let mut largest = 0;
+        while let Some(page) = pages.get_next_page().expect("page") {
+            largest = largest.max(page.buffer().len());
+        }
+        largest
+    }
+
+    /// Values large enough that 1024 of them pass the cap are written in
+    /// pages near the cap, not in one page per 1024 values.
+    #[test]
+    fn large_values_keep_pages_near_the_write_cap() {
+        let batch = text_batch(&[BIG_PAGE_VALUE_BYTES; BIG_PAGE_ROWS]);
+        let body = encode_parquet_body(
+            &batch.schema(),
+            slice::from_ref(&batch),
+            Compression::ZSTD(ZstdLevel::default()),
+            BIG_PAGE_ROWS,
+            &[],
+        )
+        .expect("body");
+        let largest = largest_text_page(body, &batch.schema());
+        assert!(
+            largest <= MAX_WRITE_BYTES + BIG_PAGE_VALUE_BYTES,
+            "largest page {largest} bytes"
+        );
+    }
+
+    /// The planned encoder, which first measures a sample with and without
+    /// dictionaries, keeps pages near the cap too, for a view column as
+    /// well as an offset one.
+    #[test]
+    fn planned_body_keeps_pages_near_the_write_cap() {
+        let batch = text_batch(&[BIG_PAGE_VALUE_BYTES; BIG_PAGE_ROWS]);
+        let text = batch.column_by_name("text").expect("text column");
+        let view: ArrayRef = Arc::new(StringViewArray::from_iter(text.as_string::<i64>().iter()));
+        let view_batch = RecordBatch::try_from_iter([("text", view)]).expect("view batch");
+        for batch in [batch, view_batch] {
+            let schema = batch.schema();
+            let body = encode_parquet_body_planned(
+                &schema,
+                slice::from_ref(&batch),
+                BodyPlan {
+                    row_group_size: BIG_PAGE_ROWS,
+                    ..plan(&schema)
+                },
+            )
+            .expect("planned body");
+            let largest = largest_text_page(body, &schema);
+            assert!(
+                largest <= MAX_WRITE_BYTES + BIG_PAGE_VALUE_BYTES,
+                "{} largest page {largest} bytes",
+                schema.field(0).data_type()
+            );
+        }
+    }
+
+    /// A slice long enough to hold whole runs of the writer's values ends
+    /// on a run, so neighbouring columns keep their page row limit.
+    #[test]
+    fn long_slices_end_on_a_write_run() {
+        const ROWS: usize = 3000;
+        const CAP_ROWS: usize = 1500;
+        let batch = text_batch(&[TEST_VALUE_BYTES; ROWS]);
+        let slices = byte_bounded_slices(&batch, CAP_ROWS * TEST_VALUE_BYTES);
+        let rows: Vec<usize> = slices.iter().map(RecordBatch::num_rows).collect();
+        assert_eq!(
+            rows,
+            vec![
+                DEFAULT_WRITE_BATCH_SIZE,
+                DEFAULT_WRITE_BATCH_SIZE,
+                ROWS - 2 * DEFAULT_WRITE_BATCH_SIZE
+            ]
+        );
+    }
+
+    /// Bytes per value that make a slice just under two runs of the
+    /// writer's values, so slices not cut to a whole run would end mid-run.
+    const MID_RUN_VALUE_BYTES: usize = MAX_WRITE_BYTES / (2 * DEFAULT_WRITE_BATCH_SIZE - 1);
+
+    /// With a large text column, the `id` column's pages still hold at
+    /// most `DATA_PAGE_ROW_LIMIT` rows.
+    #[test]
+    fn large_values_keep_the_page_row_limit() {
+        let rows = 5 * DEFAULT_WRITE_BATCH_SIZE;
+        let batch = text_batch(&vec![MID_RUN_VALUE_BYTES; rows]);
+        let schema = batch.schema();
+        let body = encode_parquet_body(
+            &schema,
+            slice::from_ref(&batch),
+            Compression::UNCOMPRESSED,
+            rows,
+            &[],
+        )
+        .expect("body");
+        let id_pages = &page_rows(body)[schema.index_of("id").expect("id column")];
+        assert!(
+            id_pages
+                .iter()
+                .all(|&rows| rows <= DATA_PAGE_ROW_LIMIT as i64),
+            "id pages {id_pages:?}"
+        );
+    }
+
+    /// Every type that holds variable-size or wide values counts its bytes,
+    /// for the whole array and for a slice of it. A struct or map counts
+    /// only its largest field.
+    #[test]
+    fn every_value_type_counts_its_bytes() {
+        const ROWS: usize = 10;
+        const SLICE_START: usize = 2;
+        const SLICE_ROWS: usize = 3;
+        let value = "x".repeat(TEST_VALUE_BYTES);
+        let large_text = || -> ArrayRef {
+            Arc::new(LargeStringArray::from_iter_values(vec![
+                value.as_str();
+                ROWS
+            ]))
+        };
+
+        let mut map = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+        for _ in 0..ROWS {
+            map.keys().append_value(&value);
+            map.values().append_value(&value);
+            map.append(true).expect("map row");
+        }
+        let item = Arc::new(Field::new("item", DataType::LargeUtf8, true));
+        let struct_fields = vec![
+            Arc::new(Field::new("a", DataType::LargeUtf8, true)),
+            Arc::new(Field::new("b", DataType::LargeUtf8, true)),
+        ];
+        let cases: Vec<(ArrayRef, usize)> = vec![
+            (
+                Arc::new(StringViewArray::from_iter_values(vec![
+                    value.as_str();
+                    ROWS
+                ])),
+                TEST_VALUE_BYTES,
+            ),
+            (
+                Arc::new(BinaryViewArray::from_iter_values(vec![
+                    value.as_bytes();
+                    ROWS
+                ])),
+                TEST_VALUE_BYTES,
+            ),
+            (
+                Arc::new(
+                    FixedSizeBinaryArray::try_from_iter(vec![value.as_bytes(); ROWS].into_iter())
+                        .expect("fixed-size binary"),
+                ),
+                TEST_VALUE_BYTES,
+            ),
+            (
+                Arc::new(FixedSizeListArray::new(
+                    item,
+                    2,
+                    Arc::new(LargeStringArray::from_iter_values(vec![
+                        value.as_str();
+                        2 * ROWS
+                    ])),
+                    None,
+                )),
+                2 * TEST_VALUE_BYTES,
+            ),
+            (Arc::new(map.finish()), TEST_VALUE_BYTES),
+            (
+                Arc::new(StructArray::new(
+                    struct_fields.into(),
+                    vec![large_text(), large_text()],
+                    None,
+                )),
+                TEST_VALUE_BYTES,
+            ),
+        ];
+        for (array, row_bytes) in cases {
+            let name = array.data_type().to_string();
+            assert_eq!(value_bytes(array.as_ref()), ROWS * row_bytes, "{name}");
+            assert_eq!(
+                value_bytes(array.slice(SLICE_START, SLICE_ROWS).as_ref()),
+                SLICE_ROWS * row_bytes,
+                "{name} slice"
+            );
+        }
     }
 }

@@ -26,9 +26,10 @@
 //! different shape from these static boolean tests. It keeps its own
 //! path.
 
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use datafusion::scalar::ScalarValue;
+use futures::future::BoxFuture;
 
 use crate::{
     runtime_metrics::op_stats,
@@ -53,11 +54,9 @@ use crate::{
 
 /// One conjunct of a prune predicate: a per-column test backed by a
 /// manifest summary. The full predicate is the **conjunction** of its
-/// leaves — a superfile survives only if every leaf keeps it. (A
-/// `TermPresence` leaf carries its own intra-leaf OR/AND over terms via
-/// [`BoolMode`]; cross-column OR isn't expressible yet and isn't needed
-/// — an unprunable predicate simply contributes no leaf and the superfile
-/// is kept.)
+/// leaves: a superfile survives only if every leaf keeps it. An `OR` is
+/// one [`PruneLeaf::AnyOf`] leaf whose branches are conjunctions again;
+/// an unprunable predicate contributes no leaf and the superfile is kept.
 pub(crate) enum PruneLeaf {
     /// Exact-term presence on an FTS column → term bloom.
     TermPresence {
@@ -77,13 +76,40 @@ pub(crate) enum PruneLeaf {
     /// `column IS NULL` (`want_null`) / `IS NOT NULL` → keep via the
     /// per-column null count and all-null check.
     NullCheck { column: String, want_null: bool },
+    /// `A OR B OR ...` → keep if some branch keeps. Each branch is a
+    /// conjunction of leaves, like the whole predicate. Build it with
+    /// [`PruneLeaf::any_of`], which never makes an empty branch.
+    AnyOf(Vec<Vec<PruneLeaf>>),
 }
 
 impl PruneLeaf {
-    /// Identified Which manifest parts this leaf keeps, from the part-level
+    /// An `OR` of `branches`, or `None` when it cannot prune: a branch
+    /// with no leaf could match anywhere, and so could an `OR` with no
+    /// branches (`None` keeps every superfile, never drops one). Branches
+    /// that need no term index go first, so a branch that keeps every
+    /// superfile ends the walk before any index read.
+    pub(crate) fn any_of(mut branches: Vec<Vec<PruneLeaf>>) -> Option<PruneLeaf> {
+        if branches.is_empty() || branches.iter().any(Vec::is_empty) {
+            return None;
+        }
+        branches.sort_by_key(|branch| branch.iter().any(PruneLeaf::reads_term_index));
+        Some(PruneLeaf::AnyOf(branches))
+    }
+
+    /// Whether evaluating this leaf may read the table's term index.
+    fn reads_term_index(&self) -> bool {
+        match self {
+            PruneLeaf::TermPresence { .. } | PruneLeaf::Prefix { .. } => true,
+            PruneLeaf::AnyOf(branches) => branches.iter().flatten().any(Self::reads_term_index),
+            PruneLeaf::Scalar(_)
+            | PruneLeaf::ScalarValueSet { .. }
+            | PruneLeaf::NullCheck { .. } => false,
+        }
+    }
+
+    /// Which manifest parts this leaf keeps, from the part-level
     /// aggregates (`ManifestPartEntry`). `None` = no part constraint →
-    /// keep all parts. The per-superfile tier runs separately.
-    /// The parts that may hold a match, by this leaf's aggregate. A column
+    /// keep all parts. The per-superfile tier runs separately. A column
     /// the table does not have has no aggregate anywhere, which the
     /// list-level pruner already treats as "keep every part".
     pub(crate) fn keep_parts(
@@ -148,8 +174,37 @@ impl PruneLeaf {
                     *want_null,
                 ))
             }
+            // The union of what each branch keeps; a branch that keeps
+            // every part makes the whole `OR` keep every part.
+            PruneLeaf::AnyOf(branches) => {
+                let mut kept = HashSet::new();
+                for branch in branches {
+                    kept.extend(keep_parts_for_all(branch, list, manifest)?);
+                }
+                Some(kept.into_iter().collect())
+            }
         }
     }
+}
+
+/// The parts every leaf keeps (the intersection of their part sets), or
+/// `None` when no leaf constrains parts.
+pub(crate) fn keep_parts_for_all(
+    leaves: &[PruneLeaf],
+    list: &Manifest,
+    manifest: &ManifestSnapshot,
+) -> Option<HashSet<PartId>> {
+    let mut kept: Option<HashSet<PartId>> = None;
+    for leaf in leaves {
+        if let Some(part_ids) = leaf.keep_parts(list, manifest) {
+            let set: HashSet<PartId> = part_ids.into_iter().collect();
+            kept = Some(match kept {
+                None => set,
+                Some(existing) => existing.intersection(&set).copied().collect(),
+            });
+        }
+    }
+    kept
 }
 
 /// Keep each part whose `column` aggregate satisfies `keep`. A missing
@@ -310,93 +365,9 @@ pub(crate) async fn select_superfiles(
         return Ok(Vec::new());
     }
 
-    // ---- Tier B: per-superfile prune. Start all-keep, AND each leaf's
-    // mask. Scalar leaves are evaluated together (one `scalar_skip`
-    // conjunction call) to match the pre-unification semantics.
-    let mut mask = vec![true; superfiles.len()];
-
-    let scalar_preds: Vec<(Option<FieldId>, &ScalarPredicate)> = leaves
-        .iter()
-        .filter_map(|l| match l {
-            PruneLeaf::Scalar(p) => Some((manifest.field_id(&p.column), p)),
-            _ => None,
-        })
-        .collect();
-    if !scalar_preds.is_empty() {
-        and_into(
-            &mut mask,
-            &scalar_skip(manifest, &superfiles, &scalar_preds),
-        );
-    }
-
-    // The table-level term index answers term and prefix leaves exactly
-    // for every superfile it lists. A live superfile it does not list was
-    // committed before the index existed; it keeps the manifest-summary
-    // answer. With no index at all, every superfile does.
+    // ---- Tier B: per-superfile prune.
     let term_index = manifest.term_index().await?;
-    for leaf in leaves {
-        match leaf {
-            PruneLeaf::TermPresence {
-                column,
-                terms,
-                mode,
-            } => {
-                let Some(column_id) = manifest.field_id(column) else {
-                    continue;
-                };
-                let refs: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
-                let summaries = fts_bloom_skip(&superfiles, column_id, &refs, *mode);
-                and_into(
-                    &mut mask,
-                    &with_routing(
-                        &superfiles,
-                        term_index.as_deref(),
-                        leaf,
-                        manifest,
-                        summaries,
-                    )
-                    .await?,
-                );
-            }
-            PruneLeaf::Prefix { column, prefix } => {
-                let Some(column_id) = manifest.field_id(column) else {
-                    continue;
-                };
-                let summaries = fts_prefix_skip(&superfiles, column_id, prefix);
-                and_into(
-                    &mut mask,
-                    &with_routing(
-                        &superfiles,
-                        term_index.as_deref(),
-                        leaf,
-                        manifest,
-                        summaries,
-                    )
-                    .await?,
-                );
-            }
-            PruneLeaf::ScalarValueSet { column, values } => {
-                let Some(column_id) = manifest.field_id(column) else {
-                    continue;
-                };
-                and_into(
-                    &mut mask,
-                    &scalar_value_set_skip(manifest, &superfiles, column_id, values),
-                );
-            }
-            PruneLeaf::NullCheck { column, want_null } => {
-                let Some(column_id) = manifest.field_id(column) else {
-                    continue;
-                };
-                and_into(
-                    &mut mask,
-                    &null_check_skip(manifest, &superfiles, column_id, *want_null),
-                );
-            }
-            // Scalar leaves handled above as one conjunction.
-            PruneLeaf::Scalar(_) => {}
-        }
-    }
+    let mask = keep_mask(manifest, &superfiles, term_index.as_deref(), leaves).await?;
 
     let considered = superfiles.len() as u64;
     let kept: Vec<Arc<SuperfileEntry>> = superfiles
@@ -413,6 +384,130 @@ pub(crate) async fn select_superfiles(
         stats.add_presence_pruning_survived(kept.len() as u64);
     }
     Ok(kept)
+}
+
+/// Which of `superfiles` a conjunction of `leaves` keeps, one bool each.
+/// Starts all-keep and ANDs each leaf's mask; scalar leaves run together
+/// as one `scalar_skip` conjunction. The term index answers term and
+/// prefix leaves exactly for the superfiles it lists; any other superfile
+/// keeps the manifest-summary answer.
+fn keep_mask<'a>(
+    manifest: &'a ManifestSnapshot,
+    superfiles: &'a [Arc<SuperfileEntry>],
+    term_index: Option<&'a TermIndex>,
+    leaves: &'a [PruneLeaf],
+) -> BoxFuture<'a, Result<Vec<bool>, QueryError>> {
+    Box::pin(async move {
+        let mut mask = vec![true; superfiles.len()];
+
+        let scalar_preds: Vec<(Option<FieldId>, &ScalarPredicate)> = leaves
+            .iter()
+            .filter_map(|l| match l {
+                PruneLeaf::Scalar(p) => Some((manifest.field_id(&p.column), p)),
+                _ => None,
+            })
+            .collect();
+        if !scalar_preds.is_empty() {
+            and_into(&mut mask, &scalar_skip(manifest, superfiles, &scalar_preds));
+        }
+
+        for leaf in leaves {
+            match leaf {
+                PruneLeaf::TermPresence {
+                    column,
+                    terms,
+                    mode,
+                } => {
+                    let Some(column_id) = manifest.field_id(column) else {
+                        continue;
+                    };
+                    let refs: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
+                    let summaries = fts_bloom_skip(superfiles, column_id, &refs, *mode);
+                    and_into(
+                        &mut mask,
+                        &with_routing(superfiles, term_index, leaf, manifest, summaries).await?,
+                    );
+                }
+                PruneLeaf::Prefix { column, prefix } => {
+                    let Some(column_id) = manifest.field_id(column) else {
+                        continue;
+                    };
+                    let summaries = fts_prefix_skip(superfiles, column_id, prefix);
+                    and_into(
+                        &mut mask,
+                        &with_routing(superfiles, term_index, leaf, manifest, summaries).await?,
+                    );
+                }
+                PruneLeaf::ScalarValueSet { column, values } => {
+                    let Some(column_id) = manifest.field_id(column) else {
+                        continue;
+                    };
+                    and_into(
+                        &mut mask,
+                        &scalar_value_set_skip(manifest, superfiles, column_id, values),
+                    );
+                }
+                PruneLeaf::NullCheck { column, want_null } => {
+                    let Some(column_id) = manifest.field_id(column) else {
+                        continue;
+                    };
+                    and_into(
+                        &mut mask,
+                        &null_check_skip(manifest, superfiles, column_id, *want_null),
+                    );
+                }
+                // Scalar leaves handled above as one conjunction; an
+                // `OR` runs below, once the rest has narrowed `mask`.
+                PruneLeaf::Scalar(_) | PruneLeaf::AnyOf(_) => {}
+            }
+        }
+        for leaf in leaves {
+            if let PruneLeaf::AnyOf(branches) = leaf {
+                any_of_into(manifest, superfiles, term_index, branches, &mut mask).await?;
+            }
+        }
+        Ok(mask)
+    })
+}
+
+/// Narrow `mask` to the superfiles some branch keeps. A branch sees only
+/// the superfiles still in `mask` that no earlier branch kept, so the work
+/// shrinks as branches match, and stops once nothing is left to decide.
+async fn any_of_into(
+    manifest: &ManifestSnapshot,
+    superfiles: &[Arc<SuperfileEntry>],
+    term_index: Option<&TermIndex>,
+    branches: &[Vec<PruneLeaf>],
+    mask: &mut [bool],
+) -> Result<(), QueryError> {
+    let mut undecided: Vec<usize> = (0..superfiles.len()).filter(|&i| mask[i]).collect();
+    let mut kept = vec![false; superfiles.len()];
+    for branch in branches {
+        if undecided.is_empty() {
+            break;
+        }
+        // Copy out the undecided superfiles only once some are decided.
+        let branch_keeps = if undecided.len() == superfiles.len() {
+            keep_mask(manifest, superfiles, term_index, branch).await?
+        } else {
+            let subset: Vec<Arc<SuperfileEntry>> = undecided
+                .iter()
+                .map(|&i| Arc::clone(&superfiles[i]))
+                .collect();
+            keep_mask(manifest, &subset, term_index, branch).await?
+        };
+        let mut still_undecided = Vec::with_capacity(undecided.len());
+        for (i, keeps) in undecided.into_iter().zip(branch_keeps) {
+            if keeps {
+                kept[i] = true;
+            } else {
+                still_undecided.push(i);
+            }
+        }
+        undecided = still_undecided;
+    }
+    and_into(mask, &kept);
+    Ok(())
 }
 
 /// Element-wise `dst &= src`. Both slices are one bool per surviving
@@ -656,6 +751,88 @@ mod tests {
             vec![true, false],
             "superfile tier prunes 1 of 2"
         );
+    }
+
+    /// `title = v` as a one-leaf branch.
+    fn title_eq(v: &str) -> Vec<PruneLeaf> {
+        vec![PruneLeaf::Scalar(ScalarPredicate {
+            column: "title".into(),
+            op: ScalarOp::Eq,
+            value: ScalarValue::Utf8(Some(v.into())),
+        })]
+    }
+
+    #[test]
+    fn any_of_keeps_the_parts_some_branch_keeps() {
+        // `title = 'b' OR title = 'y'`: p0 can hold 'b', p2 can hold 'y',
+        // p1 neither.
+        let p0 = part_from(&[seg("a", "c", &["b"])], 0);
+        let p1 = part_from(&[seg("m", "p", &["n"])], 1);
+        let p2 = part_from(&[seg("x", "z", &["y"])], 2);
+        let list = list_with(vec![p0.clone(), p1, p2.clone()]);
+        let manifest = ManifestSnapshot::empty(opts_title_fts());
+        let kept: HashSet<PartId> = PruneLeaf::any_of(vec![title_eq("b"), title_eq("y")])
+            .expect("two non-empty branches")
+            .keep_parts(&list, &manifest)
+            .expect("both branches constrain parts")
+            .into_iter()
+            .collect();
+        assert_eq!(kept, HashSet::from([p0.part_id, p2.part_id]));
+    }
+
+    #[test]
+    fn any_of_never_builds_an_or_that_drops_everything() {
+        // An `OR` with no branches, or with a branch that has no leaf, could
+        // match anywhere: it must constrain nothing, not keep nothing.
+        assert!(PruneLeaf::any_of(Vec::new()).is_none());
+        assert!(PruneLeaf::any_of(vec![title_eq("b"), Vec::new()]).is_none());
+    }
+
+    #[test]
+    fn any_of_puts_branches_that_need_no_term_index_first() {
+        // A min/max branch that keeps everything then ends the walk before
+        // the term branch reads the index.
+        let has_y = vec![PruneLeaf::TermPresence {
+            column: "title".into(),
+            terms: vec!["y".into()],
+            mode: BoolMode::And,
+        }];
+        let Some(PruneLeaf::AnyOf(branches)) = PruneLeaf::any_of(vec![has_y, title_eq("b")]) else {
+            panic!("two non-empty branches make an AnyOf");
+        };
+        assert!(matches!(branches[0].as_slice(), [PruneLeaf::Scalar(_)]));
+        assert!(matches!(
+            branches[1].as_slice(),
+            [PruneLeaf::TermPresence { .. }]
+        ));
+    }
+
+    #[tokio::test]
+    async fn any_of_keeps_the_superfiles_some_branch_keeps() {
+        // One branch by min/max, one by term bloom: `a` holds 'b' by
+        // range, `c` holds 'y' by bloom, `b` holds neither.
+        let a = seg("a", "c", &["b"]);
+        let b = seg("m", "p", &["n"]);
+        let c = seg("m", "z", &["y"]);
+        let manifest =
+            ManifestSnapshot::empty(opts_title_fts()).with_appended(vec![a.clone(), b, c.clone()]);
+        let has_y = vec![PruneLeaf::TermPresence {
+            column: "title".into(),
+            terms: vec!["y".into()],
+            mode: BoolMode::And,
+        }];
+        let kept: Vec<_> = select_superfiles(
+            &manifest,
+            &PruneLeaf::any_of(vec![title_eq("b"), has_y])
+                .into_iter()
+                .collect::<Vec<_>>(),
+        )
+        .await
+        .expect("select")
+        .iter()
+        .map(|e| e.superfile_id)
+        .collect();
+        assert_eq!(kept, vec![a.superfile_id, c.superfile_id]);
     }
 
     #[test]

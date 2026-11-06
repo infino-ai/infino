@@ -495,10 +495,10 @@ impl CandidatePlan {
 }
 
 impl CandidatePlan {
-    /// ManifestSnapshot-only superfile survival gate for this plan: the superfile
-    /// ids that *could* match according to term blooms. `None` means no
-    /// gate — the plan is [`Unbounded`], contains an `OR`, or otherwise
-    /// cannot be expressed as a conjunction of bloom leaves.
+    /// Manifest-only superfile survival gate for this plan: the superfile
+    /// ids that *could* match by term blooms and the term index. `None`
+    /// means no gate: the plan, or one of its `OR` branches, bounds no
+    /// superfile.
     pub(crate) async fn surviving_superfile_ids(
         &self,
         manifest: &ManifestSnapshot,
@@ -507,22 +507,19 @@ impl CandidatePlan {
         if !self.collect_survival_or_groups(&mut groups) {
             return Ok(None);
         }
-        if groups.is_empty() {
-            return Ok(Some(HashSet::new()));
-        }
-        let mut acc = HashSet::new();
-        for leaves in groups {
-            if leaves.is_empty() {
-                continue;
-            }
-            acc.extend(
-                select_superfiles(manifest, &leaves)
-                    .await?
-                    .iter()
-                    .map(|e| e.superfile_id.as_u128()),
-            );
-        }
-        Ok(Some(acc))
+        // One group is a plain conjunction; several are an `OR` of them.
+        let leaves: Vec<PruneLeaf> = match groups.len() {
+            0 => return Ok(Some(HashSet::new())),
+            1 => groups.swap_remove(0),
+            _ => PruneLeaf::any_of(groups).into_iter().collect(),
+        };
+        Ok(Some(
+            select_superfiles(manifest, &leaves)
+                .await?
+                .iter()
+                .map(|e| e.superfile_id.as_u128())
+                .collect(),
+        ))
     }
 
     /// Flatten this plan into one bloom-conjunction group per `OR` branch.

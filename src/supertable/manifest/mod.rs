@@ -125,7 +125,10 @@ use crate::{
                 SummariesError, SummariesRef, SummariesSection, rows_from_entries, summaries_uri,
             },
         },
-        query::{hierarchical_iter, prune::PruneLeaf},
+        query::{
+            hierarchical_iter,
+            prune::{PruneLeaf, keep_parts_for_all},
+        },
         schema::{FieldId, LegacyNames, PhysicalKind, PhysicalSchema, TableSchema},
         slow_vector_state,
     },
@@ -315,10 +318,11 @@ impl SuperfileList {
 }
 
 /// Parts that hold at least one superfile the term index routes the
-/// query's term and prefix leaves to — intersected across leaves, as the
-/// summary-based part prune is. A leaf the index cannot answer imposes no
-/// constraint; `None` when no leaf was answered or a routed superfile has
-/// no recorded smallest id, so the caller keeps its summary-based choice.
+/// query's term, prefix and `OR` leaves to, intersected across leaves as
+/// the summary-based part prune is. A leaf the index cannot answer imposes
+/// no constraint; `None` when no leaf was answered or a routed superfile
+/// has no recorded smallest id, so the caller keeps its summary-based
+/// choice.
 /// A failed index read is an error.
 async fn parts_holding_routed_superfiles(
     index: &TermIndex,
@@ -1534,20 +1538,9 @@ impl ManifestSnapshot {
                 }
                 // Incomplete view (legacy lazy manifests): prune at part
                 // granularity and load only the survivors.
-                // Intersect each constraining leaf's kept-part set. A leaf
-                // with no part pruner (`None`) imposes no constraint.
-                let mut kept: Option<HashSet<PartId>> = None;
-                for leaf in leaves {
-                    if let Some(part_ids) = leaf.keep_parts(list, self) {
-                        let set: HashSet<PartId> = part_ids.into_iter().collect();
-                        kept = Some(match kept {
-                            None => set,
-                            Some(existing) => existing.intersection(&set).copied().collect(),
-                        });
-                    }
-                }
-                // With a term index that lists every live superfile, term and
-                // prefix leaves choose the parts to load exactly: route to
+                let mut kept = keep_parts_for_all(leaves, list, self);
+                // With a term index that lists every live superfile, term,
+                // prefix and `OR` leaves choose the parts to load: route to
                 // superfiles, then keep the parts whose recorded id range
                 // holds a routed superfile's smallest id. Anything the index
                 // cannot answer leaves the summary-based choice in place.

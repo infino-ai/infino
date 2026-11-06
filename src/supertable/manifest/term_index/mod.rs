@@ -2422,6 +2422,24 @@ impl<K: Eq + std::hash::Hash + Clone, V: Clone> Resident<K, V> {
     }
 }
 
+/// Whether the term index can answer `leaf`: a non-empty term list or a
+/// UTF-8 prefix on a column the table has, or an `OR` whose every branch
+/// holds such a leaf. A branch without one could match anywhere.
+fn routable(leaf: &PruneLeaf, snapshot: &ManifestSnapshot) -> bool {
+    match leaf {
+        PruneLeaf::TermPresence { column, terms, .. } => {
+            !terms.is_empty() && snapshot.field_id(column).is_some()
+        }
+        PruneLeaf::Prefix { column, prefix } => {
+            snapshot.field_id(column).is_some() && str::from_utf8(prefix).is_ok()
+        }
+        PruneLeaf::AnyOf(branches) => branches
+            .iter()
+            .all(|branch| branch.iter().any(|leaf| routable(leaf, snapshot))),
+        _ => false,
+    }
+}
+
 impl TermIndex {
     /// Wrap a loaded root.
     pub(crate) fn new(
@@ -2490,9 +2508,8 @@ impl TermIndex {
         self.indexed.get(superfile).copied()
     }
 
-    /// The superfiles a term or prefix leaf routes to, or `None` when the
-    /// leaf is not one the index answers — a scalar leaf, an empty term
-    /// list, a non-UTF-8 prefix, a column the table does not have; the
+    /// The superfiles a term or prefix leaf, or an `OR` of them, routes to.
+    /// `None` when the index cannot answer the leaf (see [`routable`]); the
     /// caller then keeps its summary-based answer. A lookup that fails is
     /// an error.
     pub(crate) async fn route_leaf(
@@ -2520,6 +2537,33 @@ impl TermIndex {
                     return Ok(None);
                 };
                 self.route_prefix(column, prefix).await.map(Some)
+            }
+            // An `OR`: the union over branches of what each branch's routable
+            // leaves all allow. Checked up front so an unroutable branch
+            // costs no index reads.
+            PruneLeaf::AnyOf(branches) if routable(leaf, snapshot) => {
+                let mut union = HashSet::new();
+                for branch in branches {
+                    let mut kept: Option<HashSet<Uuid>> = None;
+                    for leaf in branch {
+                        let Some(routed) = Box::pin(self.route_leaf(leaf, snapshot)).await? else {
+                            continue;
+                        };
+                        match &mut kept {
+                            None => kept = Some(routed),
+                            Some(kept) => kept.retain(|id| routed.contains(id)),
+                        }
+                    }
+                    let Some(kept) = kept else {
+                        return Ok(None);
+                    };
+                    union.extend(kept);
+                    // Every indexed superfile is kept: later branches can add none.
+                    if union.len() == self.indexed.len() {
+                        break;
+                    }
+                }
+                Ok(Some(union))
             }
             _ => Ok(None),
         }
@@ -7090,6 +7134,78 @@ mod tests {
         assert_eq!(
             by_prefix, s1,
             "a prefix routes through the slices to the same superfile"
+        );
+        // An `OR` of routed terms keeps each branch's superfile. The second
+        // branch sees only the superfiles the first did not keep, so its
+        // routed answer must line up with that narrowed list.
+        let term = |t: &str| {
+            vec![PruneLeaf::TermPresence {
+                column: "title".to_owned(),
+                terms: vec![t.to_owned()],
+                mode: BoolMode::Or,
+            }]
+        };
+        let select_or = |branches: Vec<Vec<PruneLeaf>>| -> HashSet<Uuid> {
+            let leaf = PruneLeaf::any_of(branches).expect("two non-empty branches");
+            rt.block_on(select_superfiles(
+                manifest.as_ref(),
+                std::slice::from_ref(&leaf),
+            ))
+            .expect("select")
+            .iter()
+            .map(|e| e.superfile_id)
+            .collect()
+        };
+        let s2 = select(&["s2d00"], BoolMode::Or);
+        assert_eq!(
+            select_or(vec![term("s1d00"), term("s2d00")]),
+            &s1 | &s2,
+            "each branch keeps the superfile its term routes to"
+        );
+        assert_eq!(
+            select_or(vec![term("absent"), term("s1d00")]),
+            s1,
+            "a branch whose term is nowhere keeps nothing"
+        );
+        // The index routes an `OR` too, which is what lets a manifest loaded
+        // part by part load only the parts its branches route to.
+        let index = rt
+            .block_on(manifest.term_index())
+            .expect("loads")
+            .expect("indexed");
+        let route = |branches: Vec<Vec<PruneLeaf>>| {
+            let leaf = PruneLeaf::any_of(branches).expect("two non-empty branches");
+            rt.block_on(index.route_leaf(&leaf, manifest.as_ref()))
+                .expect("route")
+        };
+        assert_eq!(
+            route(vec![term("s1d00"), term("s2d00")]),
+            Some(&s1 | &s2),
+            "an OR routes to the union of its branches"
+        );
+        let unroutable = || {
+            vec![PruneLeaf::NullCheck {
+                column: "title".to_owned(),
+                want_null: true,
+            }]
+        };
+        assert_eq!(
+            route(vec![term("s1d00"), unroutable()]),
+            None,
+            "a branch the index cannot answer leaves the OR unrouted"
+        );
+        let mixed = term("s1d00").into_iter().chain(unroutable()).collect();
+        assert_eq!(
+            route(vec![mixed, term("s2d00")]),
+            Some(&s1 | &s2),
+            "a branch's unanswerable leaf constrains nothing, its term still routes"
+        );
+        let inner = PruneLeaf::any_of(vec![term("s1d00"), term("s2d00")]).expect("inner OR");
+        let s0 = select(&["s0d00"], BoolMode::Or);
+        assert_eq!(
+            route(vec![vec![inner], term("s0d00")]),
+            Some(&(&s1 | &s2) | &s0),
+            "a nested OR routes to the union of all its branches"
         );
     }
     /// Every posting's bound is a true ceiling: for each term, the highest
