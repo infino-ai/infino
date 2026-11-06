@@ -30,7 +30,7 @@ use std::{
     ops::Range,
     os::unix::fs::FileExt,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, PoisonError},
+    sync::{Arc, Condvar, Mutex, PoisonError},
     time::Instant,
 };
 
@@ -106,6 +106,8 @@ pub(crate) struct BuildPolicy {
     /// cut rather than keep its bytes: a table-wide rebuild produces more
     /// index than a host holds in memory.
     pub(crate) spill_to_disk: bool,
+    /// Caps the bytes spilled objects hold at once, when set.
+    pub(crate) spill_budget: Option<Arc<SpillBudget>>,
     /// Where scratch goes — contributions, spilled slices, a merge's
     /// downloads — when set: the table's disk, not the system temporary
     /// directory, which on a host sized for a large table may be small or
@@ -188,7 +190,65 @@ pub(crate) enum BuiltBytes {
         _dir: Arc<TempDir>,
         path: PathBuf,
         len: usize,
+        /// The file's share of the build's spill budget, given back with
+        /// the last reference.
+        _held: Option<Arc<SpillHold>>,
     },
+}
+
+/// Bytes a build's spilled objects may hold in scratch at once, so a merge
+/// that outruns its uploads waits instead of filling the disk.
+#[derive(Debug)]
+pub(crate) struct SpillBudget {
+    left: Mutex<u64>,
+    freed: Condvar,
+    total: u64,
+}
+
+impl SpillBudget {
+    pub(crate) fn new(total: u64) -> Arc<Self> {
+        Arc::new(Self {
+            left: Mutex::new(total),
+            freed: Condvar::new(),
+            total,
+        })
+    }
+
+    /// Blocks until `len` bytes fit; an object larger than the budget waits
+    /// for the whole of it.
+    fn take(self: &Arc<Self>, len: u64) -> SpillHold {
+        let len = len.min(self.total);
+        let mut left = self.left.lock().unwrap_or_else(PoisonError::into_inner);
+        while *left < len {
+            left = self
+                .freed
+                .wait(left)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        *left -= len;
+        SpillHold {
+            budget: Arc::clone(self),
+            len,
+        }
+    }
+}
+
+/// Bytes taken from a [`SpillBudget`], returned on drop.
+#[derive(Debug)]
+pub(crate) struct SpillHold {
+    budget: Arc<SpillBudget>,
+    len: u64,
+}
+
+impl Drop for SpillHold {
+    fn drop(&mut self) {
+        *self
+            .budget
+            .left
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) += self.len;
+        self.budget.freed.notify_all();
+    }
 }
 
 impl BuiltBytes {
@@ -240,6 +300,7 @@ impl Default for BuildPolicy {
             head_depth_per_superfile: HEAD_DEPTH_MAX,
             pool: None,
             spill_to_disk: false,
+            spill_budget: None,
             scratch_root: None,
             merge_ranges: None,
             scoring_by_ordinal: Arc::new(Vec::new()),
@@ -1325,6 +1386,7 @@ struct LayerWriter {
     tier_bytes: Vec<(ContentHash, BuiltBytes)>,
     /// Where cut slices and tier objects are spilled, when they are.
     spill: Option<Arc<TempDir>>,
+    spill_budget: Option<Arc<SpillBudget>>,
     target_bytes: usize,
     tier_entries_per_term: u64,
     /// Entries a superfile keeps per term.
@@ -1385,6 +1447,7 @@ impl LayerWriter {
             sink: None,
             keeps_sent: true,
             spill,
+            spill_budget: policy.spill_budget.clone(),
             target_bytes: policy.slice_target_bytes,
             tier_entries_per_term: policy.tier_entries_per_term,
             head_depth: policy.head_depth_per_superfile.min(HEAD_DEPTH_MAX),
@@ -1415,12 +1478,17 @@ impl LayerWriter {
         match &self.spill {
             None => Ok(BuiltBytes::Resident(bytes)),
             Some(dir) => {
+                let held = self
+                    .spill_budget
+                    .as_ref()
+                    .map(|budget| Arc::new(budget.take(bytes.len() as u64)));
                 let path = dir.path().join(name);
                 fs::write(&path, &bytes)?;
                 Ok(BuiltBytes::Spilled {
                     _dir: Arc::clone(dir),
                     path,
                     len: bytes.len(),
+                    _held: held,
                 })
             }
         }
@@ -1726,7 +1794,7 @@ pub(crate) fn build_layer(
         0,
     );
     let ranges = build_ranges(contributions, policy)?;
-    let mut built = run_ranges(&ranges, policy, |start, end| {
+    let mut built = run_ranges(&ranges, policy, &|_| Ok(()), |start, end| {
         build_range(contributions, start, end, policy, &scoring, sink)
     })?;
     built.layer.ordinals = Some(0..contributions.len() as u32);
@@ -2262,8 +2330,8 @@ pub(crate) fn merge_layers_into(
 }
 
 /// [`merge_layers_into`] over key ranges already cut, calling `ready` with
-/// a range's index before the range reads its slices (an error fails that
-/// range) and `merged` once it has read them.
+/// a range's index before the range starts (an error stops the merge) and
+/// `merged` once it has read its slices.
 pub(crate) fn merge_ranges_into(
     sources: &[Vec<SliceFile>],
     ranges: &[KeyRange],
@@ -2274,12 +2342,11 @@ pub(crate) fn merge_ranges_into(
     merged: &(dyn Fn(usize) + Sync),
 ) -> Result<MergedLayer, TermIndexError> {
     // Each range merges the slices that reach into it, on its own writer.
-    let mut layer = run_ranges(ranges, policy, |start, end| {
+    let mut layer = run_ranges(ranges, policy, ready, |start, end| {
         let at = ranges
             .iter()
             .position(|(s, _)| s.as_deref() == start)
             .expect("a range of the cut");
-        ready(at)?;
         let in_range: Vec<Vec<SliceFile>> = sources
             .iter()
             .map(|files| {
@@ -2321,6 +2388,7 @@ pub(crate) type KeyRange = (Option<Vec<u8>>, Option<Vec<u8>>);
 fn run_ranges(
     ranges: &[KeyRange],
     policy: &BuildPolicy,
+    before: &(dyn Fn(usize) -> Result<(), TermIndexError> + Sync),
     one: impl Fn(Option<&[u8]>, Option<&[u8]>) -> Result<MergedLayer, TermIndexError> + Sync,
 ) -> Result<MergedLayer, TermIndexError> {
     #[cfg(test)]
@@ -2332,6 +2400,7 @@ fn run_ranges(
         part
     };
     if let [(start, end)] = ranges {
+        before(0)?;
         return one(start.as_deref(), end.as_deref());
     }
     let parts = match policy.pool.as_deref() {
@@ -2344,12 +2413,19 @@ fn run_ranges(
         // work, and every publish queued behind its ticket waited with it.
         // The fold at optimize calls this from a reader-pool worker, which
         // waits by running other queued jobs just as under `install`.
+        // `before` runs here, in key order, so no pool thread waits on it
+        // and the ranges started are always a prefix.
         Some(pool) => {
             let slots: Vec<Mutex<Option<Result<MergedLayer, TermIndexError>>>> =
                 ranges.iter().map(|_| Mutex::new(None)).collect();
             let one = &one;
+            let mut stopped = None;
             pool.in_place_scope(|scope| {
-                for ((start, end), slot) in ranges.iter().zip(&slots) {
+                for (at, ((start, end), slot)) in ranges.iter().zip(&slots).enumerate() {
+                    if let Err(e) = before(at) {
+                        stopped = Some(e);
+                        break;
+                    }
                     scope.spawn(move |_| {
                         let _span = detail_span!(
                             "build.range",
@@ -2363,6 +2439,9 @@ fn run_ranges(
                     });
                 }
             });
+            if let Some(e) = stopped {
+                return Err(e);
+            }
             slots
                 .into_iter()
                 .map(|slot| {
@@ -2374,10 +2453,15 @@ fn run_ranges(
                 })
                 .collect::<Result<Vec<_>, _>>()?
         }
-        None => ranges
-            .par_iter()
-            .map(|(start, end)| one(start.as_deref(), end.as_deref()))
-            .collect::<Result<Vec<_>, _>>()?,
+        None => {
+            for at in 0..ranges.len() {
+                before(at)?;
+            }
+            ranges
+                .par_iter()
+                .map(|(start, end)| one(start.as_deref(), end.as_deref()))
+                .collect::<Result<Vec<_>, _>>()?
+        }
     };
     let mut layer = Layer::default();
     let mut slices = Vec::new();
@@ -2434,7 +2518,7 @@ fn range_count(
 /// each range's share. The smallest key is never a cut (every input may
 /// start there), and no key is cut twice. One mark holding nearly all the
 /// weight leaves no cut, and the work runs in one range.
-fn cut_ranges<K: AsRef<[u8]>>(marks: &[(K, u64)], want: usize) -> Vec<KeyRange> {
+pub(crate) fn cut_ranges<K: AsRef<[u8]>>(marks: &[(K, u64)], want: usize) -> Vec<KeyRange> {
     let total: u64 = marks.iter().map(|m| m.1).sum();
     if want <= 1 || marks.len() < 2 || total == 0 {
         return vec![(None, None)];
@@ -2511,6 +2595,7 @@ pub(crate) fn key_ranges(
 
 /// [`key_ranges`] with each slice's tier object length from `tier_len`, so
 /// the cut needs only the slices on disk.
+#[cfg(test)]
 pub(crate) fn key_ranges_with(
     sources: &[Vec<SliceFile>],
     policy: &BuildPolicy,
@@ -2744,6 +2829,49 @@ mod contribution_mark_tests {
 
     use super::*;
     use crate::superfile::fts::bm25::Bm25Params;
+
+    /// `run_ranges` asks `before` for each range in key order before it
+    /// starts the range, and an error there stops the ranges after it.
+    #[test]
+    fn run_ranges_asks_before_in_order_and_stops_on_its_error() {
+        let pool = Arc::new(
+            ThreadPoolBuilder::new()
+                .num_threads(4)
+                .build()
+                .expect("pool"),
+        );
+        let policy = BuildPolicy {
+            pool: Some(pool),
+            ..BuildPolicy::default()
+        };
+        let ranges: Vec<KeyRange> = (0..6u8)
+            .map(|i| ((i > 0).then(|| vec![i]), (i < 5).then(|| vec![i + 1])))
+            .collect();
+        let asked = Mutex::new(Vec::new());
+        let ran = Mutex::new(0);
+        let before = |at: usize| {
+            asked.lock().expect("asked").push(at);
+            match at {
+                4 => Err(TermIndexError::Build("stop".into())),
+                _ => Ok(()),
+            }
+        };
+        let result = run_ranges(&ranges, &policy, &before, |_, _| {
+            *ran.lock().expect("ran") += 1;
+            Ok(MergedLayer {
+                layer: Layer::default(),
+                slices: Vec::new(),
+                tiers: Vec::new(),
+            })
+        });
+        assert!(result.is_err());
+        assert_eq!(*asked.lock().expect("asked"), vec![0, 1, 2, 3, 4]);
+        assert_eq!(
+            *ran.lock().expect("ran"),
+            4,
+            "ranges before the error ran, none after"
+        );
+    }
 
     /// A contribution gathered through a [`HeadSink`] from two columns, ids
     /// 3 and 12, with 3's terms handed over first: `"12\x1f…"` sorts before

@@ -59,7 +59,10 @@ pub(crate) use build::{
 };
 #[cfg(test)]
 pub(crate) use build::{Built, build, first_contribution_difference};
-use build::{BuiltLayer, KeyRange, MERGE_RANGE_MIN_BYTES, TIER_FILE_EXTENSION, build_layer, key_ranges_with, merge_ranges_into, rebase_run, slice_reaches};
+use build::{
+    BuiltLayer, KeyRange, MERGE_RANGE_MIN_BYTES, SpillBudget, TIER_FILE_EXTENSION, build_layer,
+    cut_ranges, merge_ranges_into, rebase_run,
+};
 use bytes::Bytes;
 #[cfg(test)]
 pub(crate) use format::TierRef;
@@ -169,6 +172,9 @@ const FOLD_FETCH_BYTES: u64 = 1024 * 1024 * 1024;
 /// Fetches an optimize fold runs at once: reads of a few megabytes are
 /// bound by latency, so many in flight keep the link full.
 const FOLD_FETCHES_MAX: usize = 256;
+/// Key ranges a streamed fold cuts per merge thread at most: more ranges
+/// keep the window small, and each costs a scan of the fold's slices.
+const FOLD_RANGES_MAX_PER_THREAD: usize = 16;
 
 /// Fan-out of the tiered fold a commit applies to its root's layers (see
 /// [`fold_tail`]). A lookup opens one slice per layer, so a root that only
@@ -1576,6 +1582,10 @@ pub(crate) struct FoldIo {
     /// Told once this fold's inputs are on local disk, so the next fold's
     /// prefetch starts when this one stops downloading.
     pub(crate) downloaded: Option<Arc<Notify>>,
+    /// Scratch bytes the fold's inputs may hold ahead of its merge; a
+    /// quarter as much again goes to outputs waiting to upload. Unbounded
+    /// when unset.
+    pub(crate) window_bytes: Option<u64>,
 }
 
 /// `root` with `fold` made: its run merged into one layer on `pool`,
@@ -1697,65 +1707,65 @@ async fn fold_layers(
     let scratch = Arc::new(scratch_dir(policy.scratch_root.as_deref())?);
     let reuse = io.reuse_dir.as_deref();
     let sources = slice_files(scratch.path(), &kept);
-    // Slices first, then the tier objects (most of the bytes) in key order,
-    // each range merging as soon as the tiers it reads have landed.
-    let tiers = download_slices(storage, &kept, scratch.path(), reuse)
+    // The ranges are cut from the objects' keys and lengths alone, so each
+    // range merges as soon as its own slices and tier objects have landed,
+    // and downloads run at most the window ahead of the merge.
+    let objects = locate_objects(storage, &kept, scratch.path(), reuse)
         .instrument(detail_span!(
-            "fold.download",
+            "fold.locate",
             layers = kept.len(),
             dropped = layers.len() - kept.len()
         ))
         .await?;
-    let ranges = {
-        let (sources, policy, tiers) = (sources.clone(), policy.clone(), Arc::clone(&tiers));
-        run_on_pool(pool, "term-index fold ranges", move || {
-            key_ranges_with(&sources, &policy, &|file| {
-                tiers.get(&file.path).map_or(0, |tier| tier.len)
-            })
-        })
-        .instrument(detail_span!("fold.key_ranges"))
-        .await
-        .map_err(|e| TermIndexError::Build(e.to_string()))??
-    };
+    let threads = policy
+        .pool
+        .as_deref()
+        .map_or_else(rayon::current_num_threads, ThreadPool::current_num_threads);
+    let window_bytes = io.window_bytes.unwrap_or(u64::MAX);
+    let ranges = cut_from_refs(&sources, &objects, policy, threads, window_bytes);
     let spans = slice_spans(&sources, &ranges);
-    let (fetches, arrivals) = tier_fetches(&spans, ranges.len(), &tiers);
-    let readers = ScratchReaders::new(&spans, ranges.len());
+    let (fetches, waiting) = fetch_order(&spans, &objects, ranges.len());
+    let readers = ScratchReaders::new(&spans, &objects, ranges.len());
     drop(spans);
-    let arrivals = Arc::new(arrivals);
+    let fetched_bytes: u64 = objects.values().map(FoldObject::fetched_bytes).sum();
+    drop(objects);
+    let window = Arc::new(Window::new(waiting, window_bytes));
     let download = {
-        let (storage, dir, gate) = (
-            Arc::clone(storage),
-            scratch.path().to_path_buf(),
-            Arc::clone(&arrivals),
-        );
+        let (storage, gate) = (Arc::clone(storage), Arc::clone(&window));
         let jobs = fetches.into_iter().map(move |fetch| {
-            let (storage, dir, arrivals) = (Arc::clone(&storage), dir.clone(), Arc::clone(&gate));
+            let (storage, window) = (Arc::clone(&storage), Arc::clone(&gate));
             let bytes = fetch.len;
             let job = async move {
-                let bytes =
-                    fetch_verified(storage.as_ref(), None, &tier_uri(&fetch.tier), &fetch.tier)
-                        .await?;
-                write_object(tier_path(&dir, &fetch.slice), bytes).await?;
-                arrivals.landed(fetch.ranges);
+                window.admit(*fetch.ranges.start(), fetch.len).await?;
+                let bytes = fetch_verified(storage.as_ref(), None, &fetch.uri, &fetch.hash).await?;
+                write_object(fetch.path, bytes).await?;
+                window.landed(fetch.ranges);
                 Ok(())
             };
             (bytes, job)
         });
-        let (arrivals, downloaded) = (Arc::clone(&arrivals), io.downloaded.clone());
+        let (window, downloaded) = (Arc::clone(&window), io.downloaded.clone());
         async move {
-            let fetched = run_bytes_bounded("tier fetch", jobs).await;
+            let fetched = run_bytes_bounded("fold fetch", jobs).await;
             if let Err(e) = &fetched {
-                arrivals.fail(e.to_string());
+                window.fail(e.to_string());
             }
             if let Some(downloaded) = downloaded {
                 downloaded.notify_one();
             }
             fetched
         }
-        .instrument(detail_span!("fold.tier_download"))
+        .instrument(detail_span!("fold.download"))
     };
     let ordinals = ordinals.to_vec();
-    let policy = policy.clone();
+    // Spilled outputs get room of their own beside the inputs' window, so
+    // neither waits on the other.
+    let policy = BuildPolicy {
+        spill_budget: io
+            .window_bytes
+            .map(|bytes| SpillBudget::new((bytes / 4).max(1))),
+        ..policy.clone()
+    };
     // Each slice and tier object uploads as the merge cuts it; the root that
     // names them is written after all land.
     let (sink, objects) = unbounded_channel();
@@ -1765,12 +1775,13 @@ async fn fold_layers(
         io.reuse_dir.clone().filter(|_| io.keep_uploads),
     ));
     // The kept layers are merged away, so the copies kept of them can go.
-    let consumed: Vec<(PathBuf, PathBuf)> = match reuse {
+    let consumed: Vec<(ContentHash, PathBuf, PathBuf)> = match reuse {
         Some(reuse) => kept
             .iter()
             .flat_map(|layer| &layer.slices)
             .map(|slice| {
                 (
+                    slice.content_hash,
                     slice_file_path(reuse, &slice.content_hash),
                     tier_path(reuse, &slice.content_hash),
                 )
@@ -1779,7 +1790,7 @@ async fn fold_layers(
         None => Vec::new(),
     };
     let merge = {
-        let (scratch, arrivals) = (Arc::clone(&scratch), Arc::clone(&arrivals));
+        let (scratch, window) = (Arc::clone(&scratch), Arc::clone(&window));
         run_on_pool(pool, "term-index fold", move || {
             let merged = merge_ranges_into(
                 &sources,
@@ -1787,11 +1798,11 @@ async fn fold_layers(
                 &ordinals,
                 &policy,
                 Some(&sink),
-                &|at| arrivals.wait(at),
-                &|at| readers.merged(at),
+                &|at| window.ready(at),
+                &|at| window.merged(at, readers.merged(at)),
             );
-            // A failed merge leaves no reader of the tiers still landing.
-            arrivals.fail("the merge ended".into());
+            // A failed merge leaves no reader of the objects still landing.
+            window.fail("the merge ended".into());
             drop(scratch);
             merged
         })
@@ -1803,7 +1814,7 @@ async fn fold_layers(
             .iter()
             .map(layer_bytes)
             .fold(0u64, |sum, size| sum.saturating_add(size));
-        let local_bytes: u64 = tiers.values().map(|tier| tier.len).sum::<u64>() + slice_bytes;
+        let local_bytes = fetched_bytes;
         if let Some(per_slice) = local_bytes
             .saturating_mul(THOUSANDTHS)
             .checked_div(slice_bytes)
@@ -1819,12 +1830,25 @@ async fn fold_layers(
     fetched?;
     let merged = merged.map_err(|e| TermIndexError::Build(e.to_string()))??;
     debug_assert!(merged.tiers.is_empty() && merged.slices.is_empty());
+    // An output byte for byte equal to an input is the same object, and
+    // when this fold keeps its uploads the copy kept is its output now.
+    let outputs: HashSet<ContentHash> = match io.keep_uploads {
+        true => merged
+            .layer
+            .slices
+            .iter()
+            .map(|slice| slice.content_hash)
+            .collect(),
+        false => HashSet::new(),
+    };
     // One blocking task: a round trip to the blocking pool per file took
     // tens of seconds over a fold of tens of thousands of slices.
     let _ = task::spawn_blocking(move || {
-        for (slice, tier) in consumed {
-            let _ = fs::remove_file(slice);
-            let _ = fs::remove_file(tier);
+        for (hash, slice, tier) in consumed {
+            if !outputs.contains(&hash) {
+                let _ = fs::remove_file(slice);
+                let _ = fs::remove_file(tier);
+            }
         }
     })
     .await;
@@ -2217,81 +2241,117 @@ pub(crate) async fn download_layers(
     Ok(slice_files(dir, layers))
 }
 
-/// A slice's tier object as a fold sees it once the slices are local.
-pub(crate) struct FoldTier {
+/// Where a fold finds one slice and its tier object, and their lengths.
+pub(crate) struct FoldObject {
     slice: ContentHash,
-    tier: ContentHash,
-    len: u64,
+    slice_len: u64,
+    tier: Option<ContentHash>,
+    tier_len: u64,
     /// Already in the fold's directory, linked from the kept copies.
     present: bool,
 }
 
-/// Download every slice of `layers` into `dir`, verified against its hash,
-/// and look up each tier object's length, [`LAYER_FETCH_CONCURRENCY`] at a
-/// time; tier objects are fetched only where `reuse` holds them. Returns
-/// the tiers by the path of the slice that names them.
-async fn download_slices(
+impl FoldObject {
+    /// Bytes this fold fetches into scratch for it.
+    fn fetched_bytes(&self) -> u64 {
+        match self.present {
+            true => 0,
+            false => self.slice_len + self.tier_len,
+        }
+    }
+}
+
+/// Link each slice of `layers` and its tier object from `reuse` into `dir`
+/// where kept there, else look up the tier object's length,
+/// [`FOLD_FETCHES_MAX`] at a time. Returns them by the slice's path in `dir`.
+async fn locate_objects(
     storage: &Arc<dyn StorageProvider>,
     layers: &[Layer],
     dir: &Path,
     reuse: Option<&Path>,
-) -> Result<Arc<HashMap<PathBuf, FoldTier>>, TermIndexError> {
-    let tiers = Arc::new(Mutex::new(HashMap::new()));
+) -> Result<HashMap<PathBuf, FoldObject>, TermIndexError> {
+    let found = Arc::new(Mutex::new(HashMap::new()));
     let mut unique: HashSet<ContentHash> = HashSet::new();
     let jobs = layers
         .iter()
         .flat_map(|layer| &layer.slices)
         .filter(|slice| unique.insert(slice.content_hash))
         .map(|slice| {
-            let (storage, tiers) = (Arc::clone(storage), Arc::clone(&tiers));
+            let (storage, found) = (Arc::clone(storage), Arc::clone(&found));
             let path = slice_file_path(dir, &slice.content_hash);
             let tier_file = tier_path(dir, &slice.content_hash);
-            let (hash, tier) = (slice.content_hash, slice.tier);
+            let (hash, tier, slice_len) = (slice.content_hash, slice.tier, slice.len);
             let reuse = reuse.map(Path::to_path_buf);
-            let bytes = slice.len;
             let job = async move {
-                let reused = match &reuse {
+                let present = match &reuse {
                     Some(reuse) => {
                         link_reused(reuse, &hash, tier.is_some(), &path, &tier_file).await
                     }
                     None => false,
                 };
-                if !reused {
-                    let bytes =
-                        fetch_verified(storage.as_ref(), None, &slice_uri(&hash), &hash).await?;
-                    write_object(path.clone(), bytes).await?;
-                }
-                if let Some(tier) = tier {
-                    let len = match reused {
-                        true => async_fs::metadata(&tier_file).await?.len(),
-                        false => storage.head(&tier_uri(&tier)).await?.size,
-                    };
-                    let found = FoldTier {
-                        slice: hash,
-                        tier,
-                        len,
-                        present: reused,
-                    };
-                    tiers.lock().expect("fold tiers").insert(path, found);
-                }
+                let tier_len = match (tier, present) {
+                    (None, _) => 0,
+                    (Some(_), true) => async_fs::metadata(&tier_file).await?.len(),
+                    (Some(tier), false) => storage.head(&tier_uri(&tier)).await?.size,
+                };
+                let object = FoldObject {
+                    slice: hash,
+                    slice_len,
+                    tier,
+                    tier_len,
+                    present,
+                };
+                found.lock().expect("fold objects").insert(path, object);
                 Ok(())
             };
-            (bytes, job)
+            (0, job)
         });
-    run_bytes_bounded("slice fetch", jobs).await?;
-    let tiers = Arc::try_unwrap(tiers)
-        .map_err(|_| TermIndexError::Build("slice fetches outlived their run".into()))?
-        .into_inner()
-        .expect("fold tiers");
-    Ok(Arc::new(tiers))
+    run_bytes_bounded("tier lookup", jobs).await?;
+    let found = Arc::try_unwrap(found)
+        .map_err(|_| TermIndexError::Build("tier lookups outlived their run".into()))?;
+    Ok(found.into_inner().expect("fold objects"))
 }
 
-/// A tier object a fold fetches, and the key ranges that read it.
-struct TierFetch {
-    slice: ContentHash,
-    tier: ContentHash,
-    len: u64,
-    ranges: RangeInclusive<usize>,
+/// The key ranges a streamed fold of `sources` merges: cut at each slice's
+/// first key, weighed by its slice and tier bytes, so the cut needs nothing
+/// downloaded. Enough ranges that two per thread fit in `window` bytes, and
+/// no more than [`FOLD_RANGES_MAX_PER_THREAD`] per thread.
+fn cut_from_refs(
+    sources: &[Vec<SliceFile>],
+    objects: &HashMap<PathBuf, FoldObject>,
+    policy: &BuildPolicy,
+    threads: usize,
+    window: u64,
+) -> Vec<KeyRange> {
+    let mut seen: HashSet<&Path> = HashSet::new();
+    let mut marks: Vec<(&[u8], u64)> = sources
+        .iter()
+        .flatten()
+        .filter(|file| seen.insert(&file.path))
+        .map(|file| {
+            let weight = objects
+                .get(&file.path)
+                .map_or(0, |object| object.slice_len + object.tier_len);
+            (file.first_key.as_slice(), weight)
+        })
+        .collect();
+    let total: u64 = marks.iter().map(|(_, weight)| weight).sum();
+    let threads = threads.max(1);
+    let want = match policy.merge_ranges {
+        Some(n) => n.max(1),
+        None if total < MERGE_RANGE_MIN_BYTES => 1,
+        None => {
+            let per_range = (window / (2 * threads as u64)).max(1);
+            threads
+                .max(total.div_ceil(per_range).min(usize::MAX as u64) as usize)
+                .min(FOLD_RANGES_MAX_PER_THREAD * threads)
+        }
+    };
+    if want <= 1 {
+        return vec![(None, None)];
+    }
+    marks.sort_by(|a, b| a.0.cmp(b.0));
+    cut_ranges(&marks, want)
 }
 
 /// Each distinct slice file of `sources` and the key ranges that read it.
@@ -2299,66 +2359,90 @@ fn slice_spans<'a>(
     sources: &'a [Vec<SliceFile>],
     ranges: &[KeyRange],
 ) -> Vec<(&'a SliceFile, RangeInclusive<usize>)> {
+    // Range i holds the keys from its start, the (i-1)th of these, to the next.
+    let starts: Vec<&[u8]> = ranges
+        .iter()
+        .skip(1)
+        .filter_map(|(start, _)| start.as_deref())
+        .collect();
+    let range_of = |key: &[u8]| starts.partition_point(|start| *start <= key);
     let mut seen: HashSet<&Path> = HashSet::new();
     sources
         .iter()
         .flatten()
         .filter(|file| seen.insert(&file.path))
-        .filter_map(|file| {
-            let reaches =
-                |(start, end): &KeyRange| slice_reaches(file, start.as_deref(), end.as_deref());
-            Some((
-                file,
-                ranges.iter().position(reaches)?..=ranges.iter().rposition(reaches)?,
-            ))
-        })
+        .map(|file| (file, range_of(&file.first_key)..=range_of(&file.last_key)))
         .collect()
 }
 
-/// The tier objects the slices of `spans` still lack, in the order the
-/// merge's ranges read them, and the gate each of the `ranges` ranges waits
-/// at until its own have landed.
-fn tier_fetches(
+/// An object a streamed fold fetches into scratch, and the key ranges that
+/// read it.
+struct ObjectFetch {
+    uri: String,
+    hash: ContentHash,
+    path: PathBuf,
+    len: u64,
+    ranges: RangeInclusive<usize>,
+}
+
+/// The objects `spans` still lack, slices and tier objects apart, in the
+/// order the merge reads them, and how many each of `ranges` ranges waits on.
+fn fetch_order(
     spans: &[(&SliceFile, RangeInclusive<usize>)],
+    objects: &HashMap<PathBuf, FoldObject>,
     ranges: usize,
-    tiers: &HashMap<PathBuf, FoldTier>,
-) -> (Vec<TierFetch>, TierArrivals) {
+) -> (Vec<ObjectFetch>, Vec<usize>) {
     let mut waiting = vec![0usize; ranges];
-    let mut fetches: Vec<TierFetch> = spans
-        .iter()
-        .filter_map(|(file, span)| {
-            let tier = tiers.get(&file.path).filter(|tier| !tier.present)?;
+    let mut fetches = Vec::new();
+    for (file, span) in spans {
+        let Some(object) = objects.get(&file.path).filter(|object| !object.present) else {
+            continue;
+        };
+        let mut fetch = |uri: String, hash: ContentHash, path: PathBuf, len: u64| {
             for count in &mut waiting[span.clone()] {
                 *count += 1;
             }
-            Some(TierFetch {
-                slice: tier.slice,
-                tier: tier.tier,
-                len: tier.len,
+            fetches.push(ObjectFetch {
+                uri,
+                hash,
+                path,
+                len,
                 ranges: span.clone(),
-            })
-        })
-        .collect();
+            });
+        };
+        fetch(
+            slice_uri(&object.slice),
+            object.slice,
+            file.path.clone(),
+            object.slice_len,
+        );
+        if let Some(tier) = object.tier {
+            fetch(
+                tier_uri(&tier),
+                tier,
+                file.path.with_extension(TIER_FILE_EXTENSION),
+                object.tier_len,
+            );
+        }
+    }
     fetches.sort_by_key(|fetch| *fetch.ranges.start());
-    (
-        fetches,
-        TierArrivals {
-            state: Mutex::new((waiting, None)),
-            landed: Condvar::new(),
-        },
-    )
+    (fetches, waiting)
 }
 
 /// The fold's local slice and tier files, each removed once the last key
 /// range that reads it has merged, so scratch empties as the merge goes.
 struct ScratchReaders {
-    files: Vec<PathBuf>,
+    files: Vec<(PathBuf, u64)>,
     left: Vec<AtomicUsize>,
     by_range: Vec<Vec<usize>>,
 }
 
 impl ScratchReaders {
-    fn new(spans: &[(&SliceFile, RangeInclusive<usize>)], ranges: usize) -> Self {
+    fn new(
+        spans: &[(&SliceFile, RangeInclusive<usize>)],
+        objects: &HashMap<PathBuf, FoldObject>,
+        ranges: usize,
+    ) -> Self {
         let mut by_range = vec![Vec::new(); ranges];
         for (at, (_, span)) in spans.iter().enumerate() {
             for range in span.clone() {
@@ -2366,7 +2450,13 @@ impl ScratchReaders {
             }
         }
         Self {
-            files: spans.iter().map(|(file, _)| file.path.clone()).collect(),
+            files: spans
+                .iter()
+                .map(|(file, _)| {
+                    let fetched = objects.get(&file.path).map_or(0, FoldObject::fetched_bytes);
+                    (file.path.clone(), fetched)
+                })
+                .collect(),
             left: spans
                 .iter()
                 .map(|(_, span)| AtomicUsize::new(span.clone().count()))
@@ -2375,53 +2465,125 @@ impl ScratchReaders {
         }
     }
 
-    fn merged(&self, range: usize) {
+    /// Removes the files range `range` was the last reader of; returns the
+    /// fetched bytes that frees.
+    fn merged(&self, range: usize) -> u64 {
+        let mut freed = 0;
         for &at in &self.by_range[range] {
             if self.left[at].fetch_sub(1, AtomicOrdering::AcqRel) == 1 {
-                let _ = fs::remove_file(&self.files[at]);
-                let _ = fs::remove_file(self.files[at].with_extension(TIER_FILE_EXTENSION));
+                let (path, fetched) = &self.files[at];
+                let _ = fs::remove_file(path);
+                let _ = fs::remove_file(path.with_extension(TIER_FILE_EXTENSION));
+                freed += fetched;
             }
         }
+        freed
     }
 }
 
-/// Tier objects each key range still waits for, and why the waiting
-/// stopped when a fetch failed.
-struct TierArrivals {
-    state: Mutex<(Vec<usize>, Option<String>)>,
+/// A streamed fold's downloads against its merge: the files each key range
+/// still waits on, and the scratch bytes fetched but not yet merged away,
+/// which may not pass `bytes` except for the lowest range not yet merged.
+struct Window {
+    state: Mutex<WindowState>,
+    /// Wakes the merge driver when files land or a fetch fails.
     landed: Condvar,
+    /// Wakes fetches waiting for room.
+    room: Notify,
+    bytes: u64,
 }
 
-impl TierArrivals {
+struct WindowState {
+    waiting: Vec<usize>,
+    merged: Vec<bool>,
+    /// The lowest range not merged yet.
+    lowest: usize,
+    held: u64,
+    failed: Option<String>,
+}
+
+impl Window {
+    fn new(waiting: Vec<usize>, bytes: u64) -> Self {
+        let merged = vec![false; waiting.len()];
+        Self {
+            state: Mutex::new(WindowState {
+                waiting,
+                merged,
+                lowest: 0,
+                held: 0,
+                failed: None,
+            }),
+            landed: Condvar::new(),
+            room: Notify::new(),
+            bytes,
+        }
+    }
+
+    /// Waits until an object of `len` bytes that range `first` reads first
+    /// may be fetched: it fits beside what scratch holds, or the lowest
+    /// range not merged reads it, which always goes so that range can start.
+    async fn admit(&self, first: usize, len: u64) -> Result<(), TermIndexError> {
+        loop {
+            let room = self.room.notified();
+            tokio::pin!(room);
+            room.as_mut().enable();
+            {
+                let mut state = self.state.lock().expect("fold window");
+                if let Some(why) = &state.failed {
+                    return Err(TermIndexError::Build(format!("fold window: {why}")));
+                }
+                if first <= state.lowest || state.held.saturating_add(len) <= self.bytes {
+                    state.held += len;
+                    return Ok(());
+                }
+            }
+            room.await;
+        }
+    }
+
     fn landed(&self, ranges: RangeInclusive<usize>) {
-        let mut state = self.state.lock().expect("tier arrivals");
-        for count in &mut state.0[ranges] {
+        let mut state = self.state.lock().expect("fold window");
+        for count in &mut state.waiting[ranges] {
             *count -= 1;
         }
         self.landed.notify_all();
     }
 
+    /// Blocks until range `at` has every file it reads.
+    fn ready(&self, at: usize) -> Result<(), TermIndexError> {
+        let mut state = self.state.lock().expect("fold window");
+        loop {
+            if state.waiting[at] == 0 {
+                return Ok(());
+            }
+            if let Some(why) = &state.failed {
+                return Err(TermIndexError::Build(format!("fold fetch: {why}")));
+            }
+            state = self.landed.wait(state).expect("fold window");
+        }
+    }
+
+    /// Range `at` has merged and its last-read files, `freed` bytes, are gone.
+    fn merged(&self, at: usize, freed: u64) {
+        {
+            let mut state = self.state.lock().expect("fold window");
+            state.merged[at] = true;
+            while state.lowest < state.merged.len() && state.merged[state.lowest] {
+                state.lowest += 1;
+            }
+            state.held = state.held.saturating_sub(freed);
+        }
+        self.room.notify_waiters();
+    }
+
     fn fail(&self, why: String) {
         self.state
             .lock()
-            .expect("tier arrivals")
-            .1
+            .expect("fold window")
+            .failed
             .get_or_insert(why);
         self.landed.notify_all();
-    }
-
-    /// Blocks until range `at` has every tier it reads.
-    fn wait(&self, at: usize) -> Result<(), TermIndexError> {
-        let mut state = self.state.lock().expect("tier arrivals");
-        loop {
-            if state.0[at] == 0 {
-                return Ok(());
-            }
-            if let Some(why) = &state.1 {
-                return Err(TermIndexError::Build(format!("tier fetch: {why}")));
-            }
-            state = self.landed.wait(state).expect("tier arrivals");
-        }
+        self.room.notify_waiters();
     }
 }
 
@@ -10815,27 +10977,54 @@ mod tests {
         assert_eq!(root.layers[0].slices.len(), 1, "a small run is one range");
     }
 
-    /// A range starts once the tiers it reads have landed, whatever other
-    /// ranges wait for, and stops waiting when a fetch fails.
-    #[test]
-    fn a_range_waits_for_its_own_tiers_and_stops_on_a_failed_fetch() {
-        let arrivals = Arc::new(TierArrivals {
-            state: Mutex::new((vec![1, 2, 0], None)),
-            landed: Condvar::new(),
-        });
-        arrivals
-            .wait(2)
-            .expect("a range reading no fetched tier starts at once");
-        arrivals.landed(0..=1);
-        arrivals.wait(0).expect("range 0 has its tier");
-        let waiter = {
-            let arrivals = Arc::clone(&arrivals);
-            std::thread::spawn(move || arrivals.wait(1))
+    /// The window admits the lowest unmerged range's objects even when full,
+    /// holds later ones until a merged range frees room, and a failure
+    /// releases every waiter.
+    #[tokio::test]
+    async fn the_fold_window_admits_the_lowest_range_and_frees_on_merge() {
+        let window = Arc::new(Window::new(vec![1, 1, 1], 100));
+        window.admit(0, 80).await.expect("fits");
+        window
+            .admit(0, 80)
+            .await
+            .expect("the lowest range always goes");
+        let later = {
+            let window = Arc::clone(&window);
+            tokio::spawn(async move { window.admit(1, 50).await })
         };
-        arrivals.fail("gone".into());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !later.is_finished(),
+            "range 1 waits while range 0 holds the window"
+        );
+        window.landed(0..=0);
+        window.ready(0).expect("range 0 has its object");
+        window.merged(0, 160);
+        tokio::time::timeout(Duration::from_secs(5), later)
+            .await
+            .expect("range 1 admitted once range 0 merged")
+            .expect("task")
+            .expect("admit");
+        window
+            .admit(2, 50)
+            .await
+            .expect("fits beside range 1's 50 bytes");
+        let blocked = {
+            let window = Arc::clone(&window);
+            tokio::spawn(async move { window.admit(2, 100).await })
+        };
+        let waiter = {
+            let window = Arc::clone(&window);
+            std::thread::spawn(move || window.ready(1))
+        };
+        window.fail("gone".into());
+        assert!(
+            blocked.await.expect("task").is_err(),
+            "a full window fails with the fold"
+        );
         assert!(
             waiter.join().expect("waiter").is_err(),
-            "range 1 still lacked a tier"
+            "range 1 still lacked its object"
         );
     }
 

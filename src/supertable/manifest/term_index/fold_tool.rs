@@ -200,7 +200,8 @@ fn fold_timing() {
         ..manifest.options.term_index_build_policy()
     };
     // FOLD_STREAM=1 times the fold optimize runs (download, merge, upload
-    // into the table's own storage) instead of the local merge below.
+    // into the table's own storage) instead of the local merge below, with
+    // FOLD_WINDOW_GB bounding the scratch its inputs hold.
     if env::var("FOLD_STREAM").is_ok() {
         let t = Instant::now();
         let layer = st
@@ -209,7 +210,10 @@ fn fold_timing() {
                 &root.layers,
                 &ordinals,
                 &policy,
-                &super::FoldIo::default(),
+                &super::FoldIo {
+                    window_bytes: env_num::<u64>("FOLD_WINDOW_GB").map(|gb| gb << 30),
+                    ..super::FoldIo::default()
+                },
                 None,
             ))
             .expect("fold");

@@ -12682,6 +12682,9 @@ pub(in crate::supertable) async fn stamp_term_index(
                             keep_uploads: keep,
                             disk_per_slice_milli: Some(Arc::clone(disk_per_slice)),
                             downloaded: Some(Arc::clone(&downloaded)),
+                            // Half the free scratch: the rest holds outputs
+                            // waiting to upload and the copies kept of them.
+                            window_bytes: fs4::available_space(reuse_path).ok().map(|free| free / 2),
                         };
                         let renumbers = fold.renumbers();
                         info!(
