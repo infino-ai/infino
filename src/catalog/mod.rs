@@ -74,7 +74,10 @@ use manifest::{
 };
 pub use options::{ColdFetchMode, ConnectOptions};
 pub use table::Supertable;
-use tokio::{runtime::Runtime, sync::Semaphore};
+use tokio::{
+    runtime::Runtime,
+    sync::{Semaphore, SemaphorePermit},
+};
 use tracing::{Instrument, debug, info, warn};
 use uri::{Backend, parse_uri};
 
@@ -110,6 +113,12 @@ const READ_ONLY_REFUSAL: &str =
 /// wait on. Past it, an open runs on the calling thread, as it did before a cancel could reach it.
 const MAX_CANCELLABLE_OPENS: usize = 64;
 
+/// Most catalog tables one `information_schema` query opens at once. Such a query registers every
+/// table, and a cold open loads the table's whole manifest, so opening them one by one made the
+/// query as slow as the sum of all opens. Well below [`MAX_CANCELLABLE_OPENS`], so one query
+/// leaves slots for others.
+const SCHEMA_OPEN_CONCURRENCY: usize = 16;
+
 /// Slots for the opens [`MAX_CANCELLABLE_OPENS`] bounds.
 static CANCELLABLE_OPENS: Semaphore = Semaphore::const_new(MAX_CANCELLABLE_OPENS);
 
@@ -123,7 +132,7 @@ use crate::{
     runtime_bridge::{bridge_on_runtime, bridge_sync_to_async, carry_span, shared_io_runtime},
     runtime_metrics::{
         io::{UsageMeter, UsageSnapshot},
-        op_stats,
+        op_stats::{self, OpStatsCollector},
     },
     storage::{
         AzureStorageProvider, GcsStorageProvider, LocalFsStorageProvider, S3StorageProvider,
@@ -1279,20 +1288,16 @@ impl Connection {
         // to name elsewhere. The views are synthesized from the registered
         // catalog, so this is what makes them non-empty.
         if references_information_schema(&refs) {
-            for name in self
+            let names: Vec<String> = self
                 .list_tables()
                 .map_err(|e| e.with_context("query_sql", None))?
-            {
-                if !seen.insert(name.clone()) {
-                    continue;
-                }
-                if let Some(table) = self
-                    .open_and_register_cancellable(&ctx, &name, cancel)
-                    .map_err(|e| e.with_context("query_sql", None))?
-                {
-                    handles.push(table);
-                }
-            }
+                .into_iter()
+                .filter(|name| seen.insert(name.clone()))
+                .collect();
+            handles.extend(
+                self.open_and_register_all(&ctx, &names, cancel)
+                    .map_err(|e| e.with_context("query_sql", None))?,
+            );
         }
 
         // Search TVFs resolve their leading table-name argument through
@@ -1472,27 +1477,88 @@ impl Connection {
         let Ok(slot) = CANCELLABLE_OPENS.try_acquire() else {
             return self.open_and_register(ctx, name);
         };
+        // The SQL provider takes the query's work counters from the thread
+        // that registers it (`op_stats::current`), so they move with the open.
+        let opened = self.open_on_pool(ctx, name, slot, op_stats::current());
+        bridge_on_runtime(cancel.unless_cancelled(opened), &shared_io_runtime())
+    }
+
+    /// Start [`Self::open_and_register`] on the I/O runtime's blocking pool,
+    /// holding `slot` until the open is done. Dropping the returned future
+    /// leaves the open running, so a cancelled open still finishes.
+    fn open_on_pool(
+        &self,
+        ctx: &SessionContext,
+        name: &str,
+        slot: SemaphorePermit<'static>,
+        collector: Option<Arc<OpStatsCollector>>,
+    ) -> impl Future<Output = Result<Option<SupertableHandle>, InfinoError>> + use<> {
         let conn = self.clone();
         let session = ctx.clone();
         let table = name.to_owned();
-        // The SQL provider takes the query's work counters from the thread
-        // that registers it (`op_stats::current`), so they move with the open.
-        let collector = op_stats::current();
-        let runtime = shared_io_runtime();
-        // Dropping the handle on a cancel leaves the open running, holding
-        // its slot until it is done.
-        let opening = runtime.spawn_blocking(carry_span(move || {
+        let opening = shared_io_runtime().spawn_blocking(carry_span(move || {
             let _slot = slot;
             op_stats::attached(collector, || conn.open_and_register(&session, &table))
         }));
-        let opened = async {
+        async {
             match opening.await {
                 Ok(registered) => registered,
                 // A panic reaches the caller as it does from an inline open.
                 Err(join) => panic::resume_unwind(join.into_panic()),
             }
+        }
+    }
+
+    /// [`Self::open_and_register_cancellable`] for every name in `names`,
+    /// returning the opened tables in `names` order, or the first error.
+    ///
+    /// Up to [`SCHEMA_OPEN_CONCURRENCY`] opens are in flight at once, and the
+    /// next one starts as soon as any one ends, so one slow table never holds
+    /// back the rest. The calling thread only waits on the opens, so an open
+    /// past [`MAX_CANCELLABLE_OPENS`] waits for a slot here rather than
+    /// running on this thread.
+    fn open_and_register_all(
+        &self,
+        ctx: &SessionContext,
+        names: &[String],
+        cancel: &QueryCancel,
+    ) -> Result<Vec<SupertableHandle>, InfinoError> {
+        cancel.check()?;
+        let CatalogStore::Storage { handles, .. } = &self.inner.store else {
+            // These opens read no storage, so one by one costs nothing.
+            let mut tables = Vec::new();
+            for name in names {
+                tables.extend(self.open_and_register(ctx, name)?);
+            }
+            return Ok(tables);
         };
-        bridge_on_runtime(cancel.unless_cancelled(opened), &runtime)
+        let collector = op_stats::current();
+        let opens = stream::iter(names.iter().enumerate())
+            .map(|(index, name)| {
+                let collector = collector.clone();
+                async move {
+                    let warm = live_handle(handles, name).filter(|t| !t.pointer_refresh_pending());
+                    let opened = match warm {
+                        Some(table) => register(table, ctx, name)?,
+                        None => {
+                            let slot = CANCELLABLE_OPENS
+                                .acquire()
+                                .await
+                                .expect("invariant: the open slots are never closed");
+                            self.open_on_pool(ctx, name, slot, collector).await?
+                        }
+                    };
+                    Ok::<_, InfinoError>((index, opened))
+                }
+            })
+            .buffer_unordered(SCHEMA_OPEN_CONCURRENCY)
+            .try_collect::<Vec<_>>();
+        let mut opened = bridge_on_runtime(
+            cancel.unless_cancelled(opens).in_current_span(),
+            &shared_io_runtime(),
+        )?;
+        opened.sort_by_key(|(index, _)| *index);
+        Ok(opened.into_iter().filter_map(|(_, table)| table).collect())
     }
 
     /// Open the catalog table `name` and register it into `ctx`, or `None`
@@ -6561,6 +6627,31 @@ mod tests {
             .map(|b| b.num_rows())
             .sum();
         assert_eq!(named, 1, "the title column is reflected");
+    }
+
+    /// `information_schema` opens the catalog's tables several at a time; a
+    /// catalog with more tables than workers still lists every one of them.
+    #[test]
+    fn query_sql_information_schema_lists_more_tables_than_workers() {
+        let conn = connect("memory://").expect("connect");
+        let count = SCHEMA_OPEN_CONCURRENCY * 2 + 3;
+        for i in 0..count {
+            conn.create_table(
+                &format!("open_check_{i}"),
+                schema_id_title(),
+                IndexSpec::new().fts("title"),
+            )
+            .expect("create table");
+        }
+        let listed: usize = conn
+            .query_sql(
+                "SELECT table_name FROM information_schema.tables WHERE table_name LIKE 'open_check_%'",
+            )
+            .expect("information_schema.tables")
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
+        assert_eq!(listed, count, "every catalog table is listed");
     }
 
     /// Rows in the first append of the ordering test: under one default

@@ -6,14 +6,14 @@
 //! drift between backends; each backend keeps its own error
 //! translation and feeds already-translated results in.
 
-use std::{error::Error, future::Future, ops::Range, time::Duration};
+use std::{error::Error, future::Future, ops::Range, pin::pin, time::Duration};
 
 use bytes::{Bytes, BytesMut};
 use object_store::{
     Attribute, Attributes, BackoffConfig, Error as ObjError, GetOptions, PutMode, PutOptions,
     RetryConfig,
 };
-use tokio::time;
+use tokio::{sync::Semaphore, time};
 use tracing::warn;
 use uuid::Uuid;
 
@@ -60,6 +60,59 @@ const STUCK_BYTES_PER_SEC: u64 = 16 << 20;
 /// [`STUCK_BYTES_PER_SEC`].
 pub(crate) fn stuck_after(bytes: u64) -> Duration {
     STUCK_AFTER + Duration::from_millis(bytes.saturating_mul(1000) / STUCK_BYTES_PER_SEC)
+}
+
+/// Run `attempt` for a request of `bytes`, starting a second one beside it
+/// once the first has run [`stuck_after`] those bytes. The first attempt to
+/// succeed wins and the other is dropped. One that fails waits for the
+/// other, so a quick failure of the second cannot cancel a slow first that
+/// would have succeeded, and the request fails only if both do, with the
+/// later error. A first attempt that fails before the delay is the answer:
+/// no second is sent. For requests that are safe to send twice.
+///
+/// With a `hedges` bound, the second attempt is sent only under one of its
+/// permits, held until this request settles: a request past its delay
+/// while every permit is out waits for one, still racing its first attempt.
+/// A link slow enough that every request passes its delay then sends as
+/// many second attempts as the bound has permits, not one per request,
+/// while a request that is truly stuck still gets its second attempt once
+/// a permit frees.
+pub(crate) async fn hedged<T, E, F, Fut>(
+    bytes: u64,
+    hedges: Option<&Semaphore>,
+    attempt: F,
+) -> Result<T, E>
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = Result<T, E>>,
+{
+    let mut first = pin!(attempt());
+    tokio::select! {
+        answer = &mut first => return answer,
+        () = time::sleep(stuck_after(bytes)) => {}
+    }
+    let _permit = match hedges {
+        None => None,
+        Some(hedges) => tokio::select! {
+            answer = &mut first => return answer,
+            // A closed bound sends no second attempt; the first answers.
+            permit = hedges.acquire() => match permit {
+                Ok(permit) => Some(permit),
+                Err(_) => return first.await,
+            },
+        },
+    };
+    let mut second = pin!(attempt());
+    tokio::select! {
+        answer = &mut first => match answer {
+            Ok(value) => Ok(value),
+            Err(_) => second.await,
+        },
+        answer = &mut second => match answer {
+            Ok(value) => Ok(value),
+            Err(_) => first.await,
+        },
+    }
 }
 
 /// Transient re-issue backoff: `BASE × 2^min(attempt, MAX_SHIFT)` ms, capped.

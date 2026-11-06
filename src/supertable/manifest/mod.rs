@@ -125,7 +125,10 @@ use crate::{
                 SummariesError, SummariesRef, SummariesSection, rows_from_entries, summaries_uri,
             },
         },
-        query::{hierarchical_iter, prune::PruneLeaf},
+        query::{
+            hierarchical_iter,
+            prune::{PruneLeaf, keep_parts_for_all},
+        },
         schema::{FieldId, LegacyNames, PhysicalKind, PhysicalSchema, TableSchema},
         slow_vector_state,
     },
@@ -315,10 +318,11 @@ impl SuperfileList {
 }
 
 /// Parts that hold at least one superfile the term index routes the
-/// query's term and prefix leaves to — intersected across leaves, as the
-/// summary-based part prune is. A leaf the index cannot answer imposes no
-/// constraint; `None` when no leaf was answered or a routed superfile has
-/// no recorded smallest id, so the caller keeps its summary-based choice.
+/// query's term, prefix and `OR` leaves to, intersected across leaves as
+/// the summary-based part prune is. A leaf the index cannot answer imposes
+/// no constraint; `None` when no leaf was answered or a routed superfile
+/// has no recorded smallest id, so the caller keeps its summary-based
+/// choice.
 /// A failed index read is an error.
 async fn parts_holding_routed_superfiles(
     index: &TermIndex,
@@ -1534,20 +1538,9 @@ impl ManifestSnapshot {
                 }
                 // Incomplete view (legacy lazy manifests): prune at part
                 // granularity and load only the survivors.
-                // Intersect each constraining leaf's kept-part set. A leaf
-                // with no part pruner (`None`) imposes no constraint.
-                let mut kept: Option<HashSet<PartId>> = None;
-                for leaf in leaves {
-                    if let Some(part_ids) = leaf.keep_parts(list, self) {
-                        let set: HashSet<PartId> = part_ids.into_iter().collect();
-                        kept = Some(match kept {
-                            None => set,
-                            Some(existing) => existing.intersection(&set).copied().collect(),
-                        });
-                    }
-                }
-                // With a term index that lists every live superfile, term and
-                // prefix leaves choose the parts to load exactly: route to
+                let mut kept = keep_parts_for_all(leaves, list, self);
+                // With a term index that lists every live superfile, term,
+                // prefix and `OR` leaves choose the parts to load: route to
                 // superfiles, then keep the parts whose recorded id range
                 // holds a routed superfile's smallest id. Anything the index
                 // cannot answer leaves the summary-based choice in place.
@@ -4876,6 +4869,88 @@ macro_rules! piece_values {
     };
 }
 
+/// Bytes of a string that [`head8`] packs into one `u64`: the width of the
+/// number a string is compared by before any of its bytes are.
+const HEAD_BYTES: usize = size_of::<u64>();
+
+/// The first [`HEAD_BYTES`] bytes of `bytes`, zero-padded when it is
+/// shorter: the head that [`OrderKey`] reads big-endian, for byte order,
+/// and that `list::CountedStr` reads little-endian, for equality.
+#[inline]
+fn head8(bytes: &[u8]) -> [u8; HEAD_BYTES] {
+    let mut head = [0u8; HEAD_BYTES];
+    let n = bytes.len().min(HEAD_BYTES);
+    head[..n].copy_from_slice(&bytes[..n]);
+    head
+}
+
+/// A string's place in byte order as far as its first eight bytes tell:
+/// those bytes as a big-endian number, zero-padded. Two strings whose
+/// numbers differ order as their numbers do. Two that tie and are both at
+/// most eight bytes long order by length, the shorter being the other's
+/// prefix. Only a tie between longer strings compares the bytes, so the
+/// bounds of a column of short or distinct-prefixed strings cost no byte
+/// comparison per value.
+#[derive(Clone, Copy)]
+struct OrderKey<'a> {
+    head: u64,
+    bytes: &'a [u8],
+}
+
+impl<'a> OrderKey<'a> {
+    #[inline]
+    fn new(bytes: &'a [u8]) -> Self {
+        Self {
+            head: u64::from_be_bytes(head8(bytes)),
+            bytes,
+        }
+    }
+
+    #[inline]
+    fn order(&self, other: &Self) -> Ordering {
+        match self.head.cmp(&other.head) {
+            Ordering::Equal
+                if self.bytes.len() <= HEAD_BYTES && other.bytes.len() <= HEAD_BYTES =>
+            {
+                self.bytes.len().cmp(&other.bytes.len())
+            }
+            Ordering::Equal => self.bytes.cmp(other.bytes),
+            order => order,
+        }
+    }
+}
+
+/// The smallest and largest non-null value of `a` in byte order, in one
+/// pass and through [`OrderKey`]: the bounds `agg::min_string` and
+/// `agg::max_string` give, without two full comparisons per value. `None`
+/// for both when every value is null.
+fn string_min_max<O: OffsetSizeTrait>(a: &GenericStringArray<O>) -> (Option<&str>, Option<&str>) {
+    let mut bounds: Option<(usize, OrderKey<'_>, usize, OrderKey<'_>)> = None;
+    for i in 0..a.len() {
+        if a.is_null(i) {
+            continue;
+        }
+        let key = OrderKey::new(a.value(i).as_bytes());
+        match bounds.as_mut() {
+            None => bounds = Some((i, key, i, key)),
+            Some((min_at, min, max_at, max)) => {
+                if key.order(min).is_lt() {
+                    *min_at = i;
+                    *min = key;
+                }
+                if key.order(max).is_gt() {
+                    *max_at = i;
+                    *max = key;
+                }
+            }
+        }
+    }
+    match bounds {
+        Some((min, _, max, _)) => (Some(a.value(min)), Some(a.value(max))),
+        None => (None, None),
+    }
+}
+
 /// Compute (min, max) for one Arrow array as length-1 `ArrayRef`s.
 ///
 /// Returns `None` only for unsupported types. An all-null input of a
@@ -5051,16 +5126,18 @@ pub(crate) fn column_min_max(col: &ArrayRef) -> Option<(ArrayRef, ArrayRef)> {
         }
         DataType::Utf8 => {
             let a = col.as_any().downcast_ref::<StringArray>()?;
+            let (min, max) = string_min_max(a);
             Some((
-                Arc::new(StringArray::from(vec![agg::min_string(a)])),
-                Arc::new(StringArray::from(vec![agg::max_string(a)])),
+                Arc::new(StringArray::from(vec![min])),
+                Arc::new(StringArray::from(vec![max])),
             ))
         }
         DataType::LargeUtf8 => {
             let a = col.as_any().downcast_ref::<LargeStringArray>()?;
+            let (min, max) = string_min_max(a);
             Some((
-                Arc::new(LargeStringArray::from(vec![agg::min_string(a)])),
-                Arc::new(LargeStringArray::from(vec![agg::max_string(a)])),
+                Arc::new(LargeStringArray::from(vec![min])),
+                Arc::new(LargeStringArray::from(vec![max])),
             ))
         }
         DataType::Decimal128(precision, scale) => {
@@ -5898,6 +5975,54 @@ mod tests {
         let counts: Vec<u32> = (0..nc).map(|c| if c == nc / 2 { 0 } else { 10 }).collect();
         let cc = ClusterCentroids::from_fp32(n_cent, dim, &centroids, counts);
         (cc, centroids)
+    }
+
+    /// The one-pass bounds are the byte-order bounds, through every case
+    /// the eight-byte keys could get wrong: shorter prefixes, values padded
+    /// with NUL bytes, ties broken past the eighth byte, and every slice of
+    /// the column (so each value is in turn the first one seen).
+    #[test]
+    fn string_min_max_matches_byte_order_bounds() {
+        let values: Vec<Option<&str>> = vec![
+            Some("en"),
+            None,
+            Some("de"),
+            Some(""),
+            Some("a"),
+            Some("a\0"),
+            Some("a\0\0"),
+            Some("abcdefgh"),
+            Some("abcdefghi"),
+            Some("abcdefgh\0"),
+            Some("abcdefghij"),
+            Some("abcdefgha"),
+            Some("zzzzzzzzzzzz"),
+            Some("zzzzzzzzzzzy"),
+            Some("Ä"),
+            Some("é"),
+            Some("en"),
+            Some("abcdefghi"),
+        ];
+        let utf8 = StringArray::from(values.clone());
+        let large = LargeStringArray::from(values.clone());
+        for start in 0..values.len() {
+            for len in 0..=values.len() - start {
+                let slice = utf8.slice(start, len);
+                assert_eq!(
+                    string_min_max(&slice),
+                    (agg::min_string(&slice), agg::max_string(&slice)),
+                    "utf8 slice {start}+{len}"
+                );
+                let slice = large.slice(start, len);
+                assert_eq!(
+                    string_min_max(&slice),
+                    (agg::min_string(&slice), agg::max_string(&slice)),
+                    "large utf8 slice {start}+{len}"
+                );
+            }
+        }
+        let nulls = StringArray::from(vec![None::<&str>, None]);
+        assert_eq!(string_min_max(&nulls), (None, None));
     }
 
     #[test]

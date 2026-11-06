@@ -166,7 +166,7 @@ jobs:
       fail-fast: false
       # Native host build (no cross-compile); one abi3 wheel each, CPython >= 3.9.
       matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm, macos-14]
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-15]
     steps:
       - uses: actions/checkout@v4
       - name: Free disk space
@@ -253,7 +253,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-14]
+        os: [ubuntu-latest, macos-15]
     steps:
       - uses: actions/checkout@v4
       - name: Free disk space
@@ -310,7 +310,14 @@ jobs:
       # keeps downloaded models under node_modules/@huggingface/transformers/.cache,
       # and npm would discard a restored cache that sits in an otherwise-empty
       # node_modules. The `npm install` inside `make node-example` is then a no-op.
-      - run: |
+      #
+      # On linux-x64, onnxruntime-node's postinstall downloads its CUDA binaries
+      # from a feed outside the npm registry, and that connection timing out
+      # failed the job. The examples embed on the CPU, which the npm package
+      # already bundles, so skip that download.
+      - env:
+          ONNXRUNTIME_NODE_INSTALL: skip
+        run: |
           for d in infino-node/examples/agent-memory infino-node/examples/hybrid-search-api; do
             (cd "$d" && npm install)
           done

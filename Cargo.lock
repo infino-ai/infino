@@ -2348,7 +2348,7 @@ dependencies = [
 
 [[package]]
 name = "infino"
-version = "0.11.25"
+version = "0.11.26"
 dependencies = [
  "apache-avro",
  "arc-swap",
@@ -2371,7 +2371,6 @@ dependencies = [
  "figment",
  "fs4",
  "futures",
- "hashbrown 0.17.1",
  "hdrhistogram",
  "httpdate",
  "infino-bench-utils",

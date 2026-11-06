@@ -18,7 +18,7 @@
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet, HashMap, hash_map::Entry},
-    hash::Hash,
+    hash::{Hash, Hasher},
     slice,
     sync::Arc,
 };
@@ -46,7 +46,7 @@ use crate::{
     superfile::fts::reader::ColumnLengthStats,
     supertable::{
         manifest::{
-            add_sum_arrays,
+            HEAD_BYTES, add_sum_arrays,
             bloom::Bloom,
             column_hll, column_min_max, column_sum,
             encoding::{
@@ -54,6 +54,7 @@ use crate::{
                 decode_scalar_stats, decode_value_counts, encode_cluster_centroids,
                 encode_scalar_stats, require_single_row_bounds,
             },
+            head8,
             hll::HllSketch,
             merge_min_max_arrays,
             part::{BLAKE3_DIGEST_BYTES, BLAKE3_HEX_LEN, ContentHash, PartId},
@@ -822,7 +823,12 @@ impl ScalarValueCounts {
         values: impl Fn(&'a ArrayRef) -> Option<I>,
     ) -> Option<Self> {
         // value -> (count, the piece and row it first showed up in)
-        let mut counts: FxHashMap<V, (u64, usize, usize)> = FxHashMap::default();
+        // Sized for the cap at most, so a column under it never rehashes.
+        let rows: usize = pieces.iter().map(|piece| piece.len()).sum();
+        let mut counts: FxHashMap<V, (u64, usize, usize)> = FxHashMap::with_capacity_and_hasher(
+            rows.min(MAX_EXACT_VALUE_COUNTS + 1),
+            Default::default(),
+        );
         for (at, piece) in pieces.iter().enumerate() {
             for (row, value) in values(piece)? {
                 let distinct = counts.len();
@@ -846,28 +852,27 @@ impl ScalarValueCounts {
                 Some((ScalarValue::try_from_array(&pieces[at], row).ok()?, count))
             })
             .collect::<Option<Vec<_>>>()?;
-        Self::from_entries(entries)
+        Self::from_distinct_entries(entries)
     }
 
-    pub(crate) fn from_entries(entries: Vec<(ScalarValue, u64)>) -> Option<Self> {
+    /// The table of entries whose values are already distinct, as
+    /// [`Self::count`] and [`Self::from_entries`] leave them. `None` when there
+    /// are none or more than the cap, when a value is null or a count zero,
+    /// when the values are not all of one counted type, or when two of them
+    /// do not compare.
+    fn from_distinct_entries(mut entries: Vec<(ScalarValue, u64)>) -> Option<Self> {
         if entries.is_empty() || entries.len() > MAX_EXACT_VALUE_COUNTS {
             return None;
         }
         if !exact_value_counts_type(&entries[0].0.data_type()) {
             return None;
         }
-        let mut merged: HashMap<ScalarValue, u64> = HashMap::with_capacity(entries.len());
-        for (value, count) in entries {
-            if value.is_null() || count == 0 {
-                return None;
-            }
-            let total = merged.entry(value).or_default();
-            *total = total.checked_add(count)?;
-            if merged.len() > MAX_EXACT_VALUE_COUNTS {
-                return None;
-            }
+        if entries
+            .iter()
+            .any(|(value, count)| value.is_null() || *count == 0)
+        {
+            return None;
         }
-        let mut entries: Vec<(ScalarValue, u64)> = merged.into_iter().collect();
         if entries
             .iter()
             .any(|(value, _)| value.data_type() != entries[0].0.data_type())
@@ -882,6 +887,28 @@ impl ScalarValueCounts {
             return None;
         }
         Some(Self { entries })
+    }
+
+    /// The table of `entries`, with the counts of a value that shows up more
+    /// than once added together. `None` when the entries cannot make a table:
+    /// see [`Self::from_distinct_entries`].
+    pub(crate) fn from_entries(entries: Vec<(ScalarValue, u64)>) -> Option<Self> {
+        // More entries than the cap is refused before folding, so the map
+        // below stays bounded however the values repeat.
+        if entries.len() > MAX_EXACT_VALUE_COUNTS {
+            return None;
+        }
+        let mut merged: HashMap<ScalarValue, u64> = HashMap::with_capacity(entries.len());
+        for (value, count) in entries {
+            // A zero count folded into a nonzero one for the same value
+            // would no longer show, so it is refused here, before the fold.
+            if count == 0 {
+                return None;
+            }
+            let total = merged.entry(value).or_default();
+            *total = total.checked_add(count)?;
+        }
+        Self::from_distinct_entries(merged.into_iter().collect())
     }
 
     pub(crate) fn merged_with(&self, other: &Self) -> Option<Self> {
@@ -909,6 +936,63 @@ fn non_null<V>(values: impl Iterator<Item = Option<V>>) -> impl Iterator<Item = 
         .filter_map(|(row, value)| Some((row, value?)))
 }
 
+/// A string counted by value. Its first eight bytes and its length are
+/// hashed and compared as numbers, and only the bytes past the eighth as
+/// bytes, so the short values of a low-cardinality column are counted
+/// without a byte comparison per row.
+#[derive(Clone, Copy)]
+struct CountedStr<'a> {
+    head: u64,
+    len: usize,
+    value: &'a str,
+}
+
+impl<'a> CountedStr<'a> {
+    #[inline]
+    fn new(value: &'a str) -> Self {
+        let bytes = value.as_bytes();
+        Self {
+            head: u64::from_le_bytes(head8(bytes)),
+            len: bytes.len(),
+            value,
+        }
+    }
+
+    #[inline]
+    fn of_row((row, value): (usize, &'a str)) -> (usize, Self) {
+        (row, Self::new(value))
+    }
+
+    #[inline]
+    fn tail(&self) -> &'a [u8] {
+        self.value.as_bytes().get(HEAD_BYTES..).unwrap_or_default()
+    }
+}
+
+impl PartialEq for CountedStr<'_> {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        // Equal heads and lengths already settle a value of at most eight
+        // bytes. Comparing its empty tails anyway cost a `memcmp` call per
+        // row, which on a short low-cardinality column was most of the
+        // column's stats.
+        self.head == other.head
+            && self.len == other.len
+            && (self.len <= HEAD_BYTES || self.tail() == other.tail())
+    }
+}
+
+impl Eq for CountedStr<'_> {}
+
+impl Hash for CountedStr<'_> {
+    #[inline]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u64(self.head);
+        state.write_usize(self.len);
+        state.write(self.tail());
+    }
+}
+
 /// Counts one column's values, for [`ScalarValueCounts::from_pieces`].
 type Counter = fn(&[ArrayRef]) -> Option<ScalarValueCounts>;
 
@@ -932,12 +1016,12 @@ fn counter(data_type: &DataType) -> Option<Counter> {
         DataType::Decimal128(_, _) => ScalarValueCounts::primitive::<Decimal128Type>,
         DataType::Utf8 => |pieces| {
             ScalarValueCounts::count(pieces, |piece| {
-                Some(non_null(piece.as_string_opt::<i32>()?.iter()))
+                Some(non_null(piece.as_string_opt::<i32>()?.iter()).map(CountedStr::of_row))
             })
         },
         DataType::LargeUtf8 => |pieces| {
             ScalarValueCounts::count(pieces, |piece| {
-                Some(non_null(piece.as_string_opt::<i64>()?.iter()))
+                Some(non_null(piece.as_string_opt::<i64>()?.iter()).map(CountedStr::of_row))
             })
         },
         _ => return None,
@@ -2631,6 +2715,58 @@ mod tests {
                 (ScalarValue::Int64(Some(7)), 1),
             ]
         );
+    }
+
+    /// Strings are counted by value whatever their length: values that
+    /// share their first eight bytes, differ only past them, or differ only
+    /// by trailing NUL bytes are told apart, and equal values are folded.
+    #[test]
+    fn string_value_counts_match_a_plain_count() {
+        let values: Vec<Option<&str>> = vec![
+            Some("en"),
+            None,
+            Some("de"),
+            Some(""),
+            Some("a"),
+            Some("a\0"),
+            Some("a\0\0"),
+            Some("abcdefgh"),
+            Some("abcdefghi"),
+            Some("abcdefgh\0"),
+            Some("abcdefghij"),
+            Some("abcdefgha"),
+            Some("zzzzzzzzzzzz"),
+            Some("zzzzzzzzzzzy"),
+            Some("Ä"),
+            Some("é"),
+            Some("en"),
+            Some("abcdefghi"),
+        ];
+        let mut expected: BTreeMap<&str, u64> = Default::default();
+        for value in values.iter().flatten() {
+            *expected.entry(value).or_default() += 1;
+        }
+        let expected: Vec<(ScalarValue, u64)> = expected
+            .into_iter()
+            .map(|(value, count)| (ScalarValue::Utf8(Some(value.to_string())), count))
+            .collect();
+        let column: ArrayRef = Arc::new(StringArray::from(values.clone()));
+        let counts = ScalarStatsAgg::from_column(&column)
+            .expect("utf8 stats")
+            .value_counts
+            .expect("under cap");
+        assert_eq!(counts.entries(), expected.as_slice());
+        // Split into pieces, the same table.
+        let pieces = [column.slice(0, 7), column.slice(7, values.len() - 7)];
+        let split = ScalarValueCounts::from_pieces(&pieces).expect("under cap");
+        assert_eq!(split.entries(), expected.as_slice());
+        let large: ArrayRef = Arc::new(LargeStringArray::from(values.clone()));
+        let large = ScalarValueCounts::from_pieces(&[large]).expect("under cap");
+        assert_eq!(large.entries().len(), expected.len());
+        for ((value, count), (want, want_count)) in large.entries().iter().zip(&expected) {
+            assert_eq!(value.to_string(), want.to_string());
+            assert_eq!(count, want_count);
+        }
     }
 
     #[test]
@@ -5102,6 +5238,37 @@ mod tests {
                 "{}",
                 whole.data_type()
             );
+        }
+    }
+
+    /// Strings of at most eight bytes are told apart by their heads and
+    /// lengths alone, so these pin the cases a head could blur: a trailing
+    /// NUL, which pads the same as the bytes it extends, and values either
+    /// side of the eighth byte.
+    #[test]
+    fn counted_strings_are_equal_exactly_when_their_values_are() {
+        let values = [
+            "",
+            "\0",
+            "a",
+            "a\0",
+            "ab",
+            "abcdefgh",
+            "abcdefg\0",
+            "abcdefghi",
+            "abcdefghj",
+            "abcdefgh\0",
+            "abcdefghijklmnop",
+            "abcdefghijklmnoq",
+        ];
+        for left in values {
+            for right in values {
+                assert_eq!(
+                    CountedStr::new(left) == CountedStr::new(right),
+                    left == right,
+                    "{left:?} vs {right:?}"
+                );
+            }
         }
     }
 

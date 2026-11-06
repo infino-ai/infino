@@ -22,13 +22,15 @@ concurrency:
 
 jobs:
   review:
-    # Comments run only for agent commands; fork review comments get no secrets.
+    # Comments run only for agent commands; fork review comments get no secrets. `/autofix` belongs
+    # to the review loop (review-loop.yml), not to this agent.
     if: >-
       (github.event_name == 'pull_request_target' &&
         contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.pull_request.author_association)) ||
       (github.event_name == 'issue_comment' &&
         github.event.issue.pull_request &&
         startsWith(github.event.comment.body, '/') &&
+        !startsWith(github.event.comment.body, '/autofix') &&
         contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)) ||
       (github.event_name == 'pull_request_review_comment' &&
         github.event.pull_request.head.repo.full_name == github.repository &&

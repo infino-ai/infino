@@ -2111,7 +2111,7 @@ dependencies = [
 
 [[package]]
 name = "infino"
-version = "0.11.25"
+version = "0.11.26"
 dependencies = [
  "apache-avro",
  "arc-swap",
@@ -2133,7 +2133,6 @@ dependencies = [
  "figment",
  "fs4",
  "futures",
- "hashbrown 0.17.1",
  "memmap2",
  "memory-stats",
  "num_cpus",
@@ -2165,7 +2164,7 @@ dependencies = [
 
 [[package]]
 name = "infino-python"
-version = "0.11.22"
+version = "0.11.23"
 dependencies = [
  "arrow",
  "arrow-array",
