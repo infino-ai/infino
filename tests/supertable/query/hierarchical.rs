@@ -40,6 +40,7 @@ use infino::{
     superfile::{builder::FtsConfig, fts::reader::BoolMode},
     supertable::{
         Supertable, SupertableOptions,
+        schema::change::{FieldPatch, SchemaPatch},
         storage::{LocalFsStorageProvider, StorageProvider},
     },
     test_helpers::{build_title_batch, default_disk_cache, default_supertable_options},
@@ -651,6 +652,77 @@ fn files_holding_tag(consumer: &Supertable) -> usize {
                 .is_some_and(|p| p.column_by_name("tag").is_some())
         })
         .count()
+}
+
+/// [`tag_options`] with `tag` declared not null when the table is created.
+fn strict_tag_options() -> SupertableOptions {
+    let pool = Arc::new(
+        ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("rayon pool"),
+    );
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("title", DataType::LargeUtf8, false),
+        Field::new("tag", DataType::LargeUtf8, false),
+    ]));
+    SupertableOptions::new(schema, vec![FtsConfig::new("title")], vec![])
+        .expect("strict tag options")
+        .with_writer_pool(pool)
+        .with_target_superfiles_per_part(2)
+}
+
+/// A column created not null and relaxed to nullable is no longer in every
+/// file: a write whose rows leave it null does not store it, so the part
+/// tier must not prune `IS NULL` on an aggregate over the files that do.
+#[test]
+fn sql_is_null_finds_rows_written_after_a_column_was_relaxed() {
+    let dir = TempDir::new().expect("tempdir");
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+    let producer = Supertable::create(strict_tag_options().with_storage(Arc::clone(&storage)))
+        .expect("create");
+    let strict = Arc::new(Schema::new(vec![
+        Field::new("title", DataType::LargeUtf8, false),
+        Field::new("tag", DataType::LargeUtf8, false),
+    ]));
+    let set = RecordBatch::try_new(
+        strict,
+        vec![
+            Arc::new(LargeStringArray::from(vec!["a0", "a1"])),
+            Arc::new(LargeStringArray::from(vec!["x", "y"])),
+        ],
+    )
+    .expect("batch");
+    producer.append(&set).expect("append tagged rows");
+    producer
+        .apply_schema(
+            &SchemaPatch::new(vec![FieldPatch::named("tag").with_nullable(true)]),
+            None,
+        )
+        .expect("relax tag");
+    producer
+        .append(&tag_batch(&["b0", "b1"], &[None, None]))
+        .expect("append untagged rows");
+
+    let cache_dir = TempDir::new().expect("cache");
+    let cache = default_disk_cache(Arc::clone(&storage), cache_dir.path());
+    let consumer = Supertable::open(
+        strict_tag_options()
+            .with_storage(Arc::clone(&storage))
+            .with_eager_load_threshold(EAGER_LOAD_THRESHOLD_FORCE_LAZY)
+            .with_disk_cache(cache),
+    )
+    .expect("open");
+    let rows: usize = consumer
+        .reader()
+        .expect("reader")
+        .query_sql("SELECT _id FROM supertable WHERE tag IS NULL")
+        .expect("query")
+        .iter()
+        .map(|b| b.num_rows())
+        .sum();
+    assert_eq!(rows, 2, "the rows written after the relax read a null tag");
 }
 
 #[test]

@@ -357,10 +357,13 @@ pub(crate) struct ColumnTypeGuard {
     /// Whether the table is converting this column from an older type.
     converting: bool,
     /// Whether every file in the table must hold this column, which is true
-    /// only of a column declared, and declared not null, when the table was
-    /// created: ids are minted in order and never reused, so a column added
-    /// later is absent from every file written before it, and a file leaves
-    /// out a nullable column none of its rows sets.
+    /// only of a column declared not null when the table was created and not
+    /// null still: ids are minted in order and never reused, so a column
+    /// added later is absent from every file written before it, and a file
+    /// leaves out a nullable column none of its rows sets — a column relaxed
+    /// to nullable included. A column goes back to not null only on a table
+    /// with no rows, so both schemas saying not null means every file holds
+    /// it.
     in_every_file: bool,
 }
 
@@ -379,14 +382,15 @@ impl ColumnTypeGuard {
             }),
             converting: field.is_some_and(|f| f.converting_from.is_some()),
             // The creation schema, which is never mutated: a column in it
-            // predates every file, and one that may not be null is stored
-            // in every file.
-            in_every_file: manifest
-                .options
-                .table_schema
-                .fields()
-                .iter()
-                .any(|f| f.id == column && !f.nullable),
+            // predates every file. One that may not be null there and in the
+            // live schema is stored in every file.
+            in_every_file: field.is_some_and(|f| !f.nullable)
+                && manifest
+                    .options
+                    .table_schema
+                    .fields()
+                    .iter()
+                    .any(|f| f.id == column && !f.nullable),
         }
     }
 
