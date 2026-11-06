@@ -1742,7 +1742,8 @@ impl ManifestSnapshot {
         };
         let mut objects = Vec::new();
         for entry in &mut list.parts {
-            if entry.rollups != RollupsAt::Inline || self.inline_rollups_fit.contains(&entry.part_id)
+            if entry.rollups != RollupsAt::Inline
+                || self.inline_rollups_fit.contains(&entry.part_id)
             {
                 continue;
             }
@@ -1762,7 +1763,8 @@ impl ManifestSnapshot {
         // Forget parts this list no longer holds, so the set stays the size
         // of the list and not of every part the handle has seen.
         let held: HashSet<PartId> = list.parts.iter().map(|entry| entry.part_id).collect();
-        self.inline_rollups_fit.retain(|part_id| held.contains(part_id));
+        self.inline_rollups_fit
+            .retain(|part_id| held.contains(part_id));
         Ok(objects)
     }
 
