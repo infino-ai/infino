@@ -13,25 +13,28 @@ use std::{
     collections::{BTreeSet, HashMap, HashSet, VecDeque},
     io::{BufWriter, Write},
     mem,
+    panic::{self, AssertUnwindSafe},
     pin::pin,
     sync::{
-        Arc, OnceLock,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
+        mpsc,
     },
+    thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures::{
-    future::{BoxFuture, Fuse, FusedFuture, FutureExt},
+    future::{self, BoxFuture, Fuse, FusedFuture, FutureExt},
     stream::{self, StreamExt},
 };
 use rand::random_range;
 use roaring::RoaringBitmap;
 use tempfile::NamedTempFile;
 use tokio::{
-    sync::Semaphore,
+    sync::{Semaphore, oneshot},
     task::{Id as TaskId, JoinError, JoinSet},
     time,
 };
@@ -42,7 +45,9 @@ use uuid::Uuid;
 
 use crate::{
     config::{CompactionSettings, RecalibratePolicy, global, scratch_root},
-    runtime_bridge::{bridge_on_runtime, run_on_own_pool, run_on_pool},
+    runtime_bridge::{
+        bridge_on_runtime, run_on_own_pool, run_on_pool, run_on_pool_unless_blocking,
+    },
     runtime_metrics::rss::{available_memory_bytes, memory_budget},
     storage::StorageError,
     superfile::{
@@ -63,7 +68,7 @@ use crate::{
         },
         opann::rerank_pool_hint,
         query::{dispatch::open_whole_superfile, vector},
-        reader_cache::disk::mmap_temp_file_bytes,
+        reader_cache::{SuperfileReaderCache, disk::mmap_temp_file_bytes},
         schema::{FieldId, PhysicalSchema, TableSchema, map::FileSchemaMap},
         wal::{
             Etag, SealRecord, TombstonesSidecar, WalStore, WalStoreError,
@@ -80,8 +85,12 @@ use crate::{
     utils::trace::{RegionUsage, detail_span, record},
 };
 
-/// Number of seal/reseal/unseal requests to run in parallel at a time
-const MAX_CONCURRENT_SEAL_WRITES: usize = 64;
+/// Number of seal/reseal/unseal requests to run in parallel at a time. A
+/// pass over a thousand-odd small superfiles seals and, when its commit
+/// lands past the steal window, re-stamps every one of them on the commit's
+/// critical path: at 64 the re-stamp of 1,411 inputs took 1.7 s, at 256
+/// under half a second. A seal write is one small conditional PUT.
+const MAX_CONCURRENT_SEAL_WRITES: usize = 256;
 
 /// Failed merges and dropped batches in a row, with no batch committing in
 /// between, after which a pass stops starting merges. One failure is usually
@@ -125,6 +134,153 @@ impl Supertable {
             Ok(_) => Some(CompactionSlot(outstanding)),
             Err(_) => None,
         }
+    }
+}
+
+/// What finished compaction commits are done with, being dropped on a
+/// thread of its own: a batch's spilled term contributions and its
+/// term-index layer are scratch files of many gigabytes, still in the page
+/// cache, and unlinking them evicts it. Dropped by the commit, they held it
+/// for seconds past its publish; handed to the reaper, the pass's next
+/// commit need not wait.
+///
+/// One reaper thread per table, started on first use and fed over a
+/// channel: a thread made per commit queued its own creation behind the
+/// process's memory-map traffic, which under load cost a commit longer than
+/// the drop it was there to move off the path.
+///
+/// [`settle`](Self::settle) waits for everything retired so far before the
+/// merge step of a pass returns, so a process that exits once optimize
+/// returns has unlinked every one of those files. Drops a pass did not wait
+/// for, because it was dropped part way, are waited for by the next pass or
+/// when the table goes.
+#[derive(Default)]
+pub(crate) struct RetiredScratch(Mutex<Option<Reaper>>);
+
+/// The thread dropping what [`RetiredScratch`] is handed, in order.
+struct Reaper {
+    sender: mpsc::Sender<Reap>,
+    thread: JoinHandle<()>,
+}
+
+/// One message to the [`Reaper`].
+enum Reap {
+    /// Drop this.
+    Drop(Box<dyn Send>),
+    /// Everything sent before this has been dropped.
+    Settled(oneshot::Sender<()>),
+}
+
+impl Reaper {
+    fn start() -> std::io::Result<Self> {
+        let (sender, received) = mpsc::channel();
+        let thread = thread::Builder::new()
+            .name("compact-reaper".into())
+            .spawn(move || {
+                for reap in received {
+                    match reap {
+                        Reap::Drop(done_with) => {
+                            // A panicking drop must not take the reaper, and
+                            // the drops queued behind it, down with it.
+                            if panic::catch_unwind(AssertUnwindSafe(|| drop(done_with))).is_err() {
+                                warn!("compact: a retired scratch drop panicked");
+                            }
+                        }
+                        Reap::Settled(ack) => {
+                            let _ = ack.send(());
+                        }
+                    }
+                }
+            })?;
+        Ok(Self { sender, thread })
+    }
+}
+
+impl RetiredScratch {
+    /// Hand `done_with` to the reaper, starting it if this is the first.
+    fn retire<T: Send + 'static>(&self, done_with: T) {
+        let mut reap = Reap::Drop(Box::new(done_with));
+        let mut reaper = self.0.lock().expect("retired scratch");
+        // A reaper that went away hands back what it was sent, and a new
+        // one takes it.
+        for _ in 0..2 {
+            if reaper.is_none() {
+                match Reaper::start() {
+                    Ok(started) => *reaper = Some(started),
+                    Err(error) => {
+                        warn!(%error, "compact: could not start the scratch reaper");
+                        break;
+                    }
+                }
+            }
+            let Some(running) = reaper.as_ref() else {
+                break;
+            };
+            match running.sender.send(reap) {
+                Ok(()) => return,
+                Err(mpsc::SendError(unsent)) => {
+                    reap = unsent;
+                    *reaper = None;
+                }
+            }
+        }
+        // No reaper to be had: drop it here, as a commit used to.
+        drop(reaper);
+        drop(reap);
+    }
+
+    /// Wait for every drop retired so far, without blocking a runtime
+    /// worker.
+    async fn settle(&self) {
+        let (ack, acked) = oneshot::channel();
+        {
+            let reaper = self.0.lock().expect("retired scratch");
+            let Some(running) = reaper.as_ref() else {
+                return;
+            };
+            if running.sender.send(Reap::Settled(ack)).is_err() {
+                return;
+            }
+        }
+        if acked.await.is_err() {
+            warn!("compact: the scratch reaper stopped before settling");
+        }
+    }
+}
+
+impl Drop for RetiredScratch {
+    /// Stop the reaper once it has dropped everything it was sent, and wait
+    /// for it — unless this runs on the reaper itself: a drop it runs can
+    /// release the table's last handle, and with it this very reaper, which
+    /// then finishes the queue and exits on its own.
+    fn drop(&mut self) {
+        let reaper = self
+            .0
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        let Some(Reaper { sender, thread }) = reaper else {
+            return;
+        };
+        drop(sender);
+        if thread.thread().id() != thread::current().id() && thread.join().is_err() {
+            warn!("compact: the scratch reaper panicked");
+        }
+    }
+}
+
+/// Open a merged superfile into the in-memory reader cache, as a writer
+/// commit does for its own; a failure only costs its first query a fetch.
+fn warm_reader_cache(
+    store: &dyn SuperfileReaderCache,
+    (superfile_id, uri, bytes): (Uuid, SuperfileUri, Bytes),
+) {
+    if let Err(e) = store.insert(uri, bytes) {
+        warn!(
+            %superfile_id,
+            error = %e,
+            "compact: failed to warm reader cache for merged superfile"
+        );
     }
 }
 
@@ -592,9 +748,13 @@ impl Supertable {
                 if phase_timers {
                     __pt = Instant::now();
                 }
-                table
+                let merged = table
                     .run_compaction_jobs(jobs, stale_seal_timeout, concurrency)
-                    .await?;
+                    .await;
+                // The commits' scratch files are gone before the pass goes
+                // on, failed or not.
+                inner.retired_scratch.settle().await;
+                merged?;
                 if phase_timers {
                     info!(secs = __pt.elapsed().as_secs_f64(), "[optphase]   merge");
                 }
@@ -1374,16 +1534,39 @@ impl Supertable {
                     // cache, same as a normal writer commit does. Without
                     // this every query against it misses and re-fetches +
                     // re-opens from storage every single time.
-                    for prepared in &batch {
-                        if let Some((uri, bytes)) = prepared.bytes_for_store.clone()
-                            && let Err(e) = opts.store.insert(uri, bytes)
-                        {
-                            warn!(
-                                superfile_id = %prepared.merged_superfile_id,
-                                error = %e,
-                                "compact: failed to warm reader cache for merged superfile"
-                            );
+                    //
+                    // Opening a reader verifies the whole superfile's CRC, a
+                    // pass over its bytes, so a batch of several outputs
+                    // opens them side by side on the reader pool: one after
+                    // another they held the commit for a quarter of a second
+                    // per gigabyte of output. A lone output, the common
+                    // case, opens here; handing it to a pool and back would
+                    // only add the hops.
+                    let mut warms: Vec<(Uuid, SuperfileUri, Bytes)> = batch
+                        .iter()
+                        .filter_map(|prepared| {
+                            let (uri, bytes) = prepared.bytes_for_store.clone()?;
+                            Some((prepared.merged_superfile_id, uri, bytes))
+                        })
+                        .collect();
+                    if warms.len() > 1 {
+                        // One pool task per output, awaited from here: a task
+                        // fanning out inside the pool would wait by stealing,
+                        // and could pick up a query's work while it waits.
+                        let warmed = future::join_all(warms.into_iter().map(|warm| {
+                            let store = Arc::clone(&opts.store);
+                            run_on_pool_unless_blocking(
+                                Some(&opts.reader_pool),
+                                "compaction reader-cache warm",
+                                move || warm_reader_cache(&*store, warm),
+                            )
+                        }))
+                        .await;
+                        for error in warmed.into_iter().filter_map(Result::err) {
+                            warn!(%error, "compact: the reader-cache warm did not finish");
                         }
+                    } else if let Some(warm) = warms.pop() {
+                        warm_reader_cache(&*opts.store, warm);
                     }
 
                     // Drop the merged-away inputs so the in-memory cache
@@ -1409,6 +1592,26 @@ impl Supertable {
                         pending_cache_inserts,
                     )
                     .await;
+
+                    // The layer's objects were written by this process in the
+                    // current layout, so the term-index refresh that follows
+                    // a compaction need not ask storage whether they are there.
+                    if let Some(layer) = reserved_layer.as_ref() {
+                        inner
+                            .term_index_objects_seen
+                            .lock()
+                            .expect("term-index objects seen")
+                            .extend(layer.written_objects());
+                    }
+                    // What the commit is done with is dropped off its path;
+                    // see [`RetiredScratch`].
+                    inner.retired_scratch.retire((
+                        mem::take(&mut batch),
+                        mem::take(&mut term_contributions),
+                        reserved_layer.take(),
+                        mem::take(&mut rebuilt_parts),
+                        mem::take(&mut pending_storage_writes),
+                    ));
 
                     return match deferred_error {
                         Some(e) => Err(e),
@@ -2932,7 +3135,8 @@ mod tests {
                 commit::{
                     MANIFEST_PARTS_DIR, POINTER_PATH, get_current_manifest_etag, manifest_uri,
                 },
-                term_index::STORAGE_PREFIX as TERM_INDEX_PREFIX,
+                part::ContentHash,
+                term_index::{self, STORAGE_PREFIX as TERM_INDEX_PREFIX, slice_uri, tier_uri},
             },
             reader_cache::{DiskCacheConfig, DiskCacheStore, LruPolicy},
             schema::{
@@ -2940,7 +3144,7 @@ mod tests {
                 change::{FieldPatch, SchemaPatch},
             },
             storage::{LocalFsStorageProvider, StorageProvider},
-            writer::persist_commit_async,
+            writer::{persist_commit_async, stamp_term_index},
         },
         test_helpers::{
             build_title_batch, copy_dir_recursive, default_supertable_options,
@@ -7729,6 +7933,72 @@ mod tests {
         assert_eq!(dropped, 1, "the pass reports the dropped job");
         assert_eq!(listed_ids(&st).len(), PAIR + DROP_TEST_JOBS - 1);
         assert_untouched(&dir, &st, &dropped_inputs).await;
+    }
+
+    /// The slice and tier objects the table's term index names.
+    async fn term_index_objects(st: &Supertable) -> HashSet<ContentHash> {
+        let manifest = st.inner().manifest.load_full();
+        let storage = manifest.options.storage.as_ref().expect("storage");
+        let root = term_index::load_root(
+            storage.as_ref(),
+            manifest.term_index_ref().expect("a term index"),
+        )
+        .await
+        .expect("root");
+        root.layers
+            .iter()
+            .flat_map(|layer| &layer.slices)
+            .flat_map(|slice| [Some(slice.content_hash), slice.tier])
+            .flatten()
+            .collect()
+    }
+
+    /// A compaction commit records the slice and tier objects of the
+    /// term-index layer it wrote as seen, so the term-index refresh that
+    /// follows checks none of them on storage.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_compaction_marks_its_layer_seen_so_the_refresh_asks_storage_nothing_of_it() {
+        let dir = TempDir::new().expect("tempdir");
+        let (faults, st, jobs) = fault_st_with_pair_jobs(&dir, 1);
+        let before = term_index_objects(&st).await;
+
+        st.run_compaction_jobs(jobs, DEFAULT_STALE_SEAL_TIMEOUT, 1)
+            .await
+            .expect("compact");
+
+        let written: HashSet<ContentHash> = term_index_objects(&st)
+            .await
+            .difference(&before)
+            .copied()
+            .collect();
+        assert!(!written.is_empty(), "the compaction wrote a layer");
+        let seen = st
+            .inner()
+            .term_index_objects_seen
+            .lock()
+            .expect("seen")
+            .clone();
+        assert!(
+            written.is_subset(&seen),
+            "every object of the compaction's layer is recorded as seen"
+        );
+        let asked = Arc::new(AtomicUsize::new(0));
+        for hash in &written {
+            for uri in [slice_uri(hash), tier_uri(hash)] {
+                let asked = Arc::clone(&asked);
+                faults.before(FaultOp::Head, &uri, move || {
+                    asked.fetch_add(1, Ordering::SeqCst);
+                });
+            }
+        }
+        stamp_term_index(st.inner(), u64::MAX)
+            .await
+            .expect("refresh the term index");
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            0,
+            "the refresh asked storage about an object the compaction wrote"
+        );
     }
 
     /// Jobs dropped at upload and batches dropped at commit count toward the

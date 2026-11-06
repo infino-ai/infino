@@ -69,7 +69,6 @@ use std::{
     ops::Range,
     panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
-    pin::pin,
     str::from_utf8,
     sync::{
         Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError,
@@ -99,11 +98,14 @@ use futures::{
     stream::{self, FuturesUnordered, StreamExt},
 };
 use object_store::{MultipartUpload, PutPayload, UploadPart};
+#[cfg(test)]
+use piece_fault::injected_piece_failure;
 use rayon::{ThreadPool, ThreadPoolBuilder, prelude::*};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tempfile::{NamedTempFile, TempDir};
 use tokio::{
+    runtime::Runtime,
     spawn,
     sync::{
         Notify, Semaphore,
@@ -130,7 +132,7 @@ use crate::{
         op_stats::{self, OpStatsCollector, timed_kernel},
         rss::available_memory_bytes,
     },
-    storage::{StorageError, StorageProvider, stuck_after},
+    storage::{StorageError, StorageProvider, hedged},
     superfile::{
         BuildError as SuperfileBuildError, FtsError, ReadError, SuperfileReader,
         builder::{BuilderOptions, SuperfileBuilder, VectorConfig, index_fts_rows},
@@ -2651,7 +2653,12 @@ impl SupertableWriter {
                 // do not.
                 let open = OpenAppend::enter(&options.writer_pool);
                 let n_lanes = lanes_for(options.writer_pool.current_num_threads(), open.count);
-                let opened = LiveLanes::open(Arc::clone(manifest), n_lanes, options.vector_layout);
+                let opened = LiveLanes::open(
+                    Arc::clone(manifest),
+                    n_lanes,
+                    options.vector_layout,
+                    &options.connection_memory_budget,
+                );
                 let live = match opened {
                     Ok(mut live) => {
                         live.open_append = Some(open);
@@ -2708,18 +2715,19 @@ impl SupertableWriter {
     }
 
     /// Seal this commit's superfiles from the live lanes and publish them.
-    /// `live` was fed every batch of `buffer` under `built_against`; the
-    /// caller checked both before choosing this over a rebuild.
+    /// `live` was fed every batch of `buffer` under `built_against`, and
+    /// `lanes` are its lanes once that feed has finished; the caller checked
+    /// all of this before choosing this over a rebuild.
     fn commit_live(
         &self,
         mut live: LiveLanes,
+        mut lanes: Vec<LiveLane>,
         buffer: &[BufferedBatch],
         stem: Option<&str>,
         built_against: u32,
     ) -> Result<(), BuildError> {
         let manifest = Arc::clone(&live.manifest);
         let sealing = Instant::now();
-        let lanes = live.join()?;
         let total_rows: usize = buffer.iter().map(|b| b.scalar.num_rows()).sum();
         let fed: usize = lanes
             .iter()
@@ -2764,6 +2772,14 @@ impl SupertableWriter {
         fn seal_task_lost() -> BuildError {
             BuildError::Store("a seal task ended without a result".into())
         }
+        // What the budget granted the lanes past their thresholds is held
+        // with the rest of their reservations, through the seal: the
+        // freeze drops each builder, but not the postings it held.
+        live.reservations.extend(
+            lanes
+                .iter_mut()
+                .filter_map(|lane| lane.builder.take_lane_reservation()),
+        );
         let freeze_span = detail_span!("seal.freeze_lanes", lanes = lanes.len()).entered();
         let freeze_stats = stats.clone();
         let frozen: Vec<FrozenLane> = run_spawned(
@@ -2790,34 +2806,100 @@ impl SupertableWriter {
         // A spawned task starts no span of its own, so each piece's is
         // parented here to read beside its append's.
         let parent = Span::current();
-        let outputs: Vec<ShardOutput> = run_spawned(
+        // Each piece is summarised for the manifest and starts its upload as
+        // soon as it is built, while the commit's other pieces are still
+        // building: the upload of the last pieces is then all an append
+        // waits for between its seal and its publish, where it waited for
+        // every piece's. The uploads are gathered as they start rather than
+        // returned with their pieces, so a commit that fails part way still
+        // holds every one it started, and waits them out before it reports
+        // the failure: what landed is unlisted, as a failed publish leaves
+        // the superfiles it wrote, and the storage sweep reclaims it. Once a
+        // piece fails the commit cannot publish, so an upload that has not
+        // yet taken its permit by then is skipped rather than sent.
+        let runtime = self.inner.query_runtime();
+        let started: Arc<Mutex<Vec<SuperfileUpload>>> = Arc::default();
+        let piece_failed = Arc::new(AtomicBool::new(false));
+        let (inner, piece_runtime, piece_uploads) = (
+            Arc::clone(&self.inner),
+            Arc::clone(&runtime),
+            Arc::clone(&started),
+        );
+        let fan_out = Arc::new(Semaphore::new(commit_write_concurrency().get()));
+        let piece_stem = stem.map(str::to_owned);
+        let sealed_pieces = run_spawned(
             pool,
             (0..n_pieces).collect(),
             move |i, _| {
                 let _span = detail_span!("piece.build", parent: &parent, piece = i).entered();
-                timed_kernel(&piece_stats, || {
-                    let rows = piece_batches(&batches, bounds[i], bounds[i + 1]);
-                    build_piece(
-                        PieceRows::Lanes {
-                            batches: &rows,
-                            lanes: Arc::clone(&frozen),
-                            piece: i,
-                        },
-                        &piece_options,
+                let seal = || {
+                    let output = timed_kernel(&piece_stats, || {
+                        let rows = piece_batches(&batches, bounds[i], bounds[i + 1]);
+                        build_piece(
+                            PieceRows::Lanes {
+                                batches: &rows,
+                                lanes: Arc::clone(&frozen),
+                                piece: i,
+                            },
+                            &piece_options,
+                            &piece_manifest,
+                            piece_options.vector_layout,
+                            None,
+                        )
+                    })?;
+                    #[cfg(test)]
+                    if let Some(error) =
+                        injected_piece_failure(piece_stem.as_deref(), i, &piece_failed)
+                    {
+                        return Err(error);
+                    }
+                    let mut prepared = prepare_finished_superfile(
+                        &inner,
                         &piece_manifest,
-                        piece_options.vector_layout,
+                        output,
                         None,
-                    )
-                })
+                        piece_stem.as_deref(),
+                    )?;
+                    if let Some(upload) = prepared.as_mut().and_then(|prepared| {
+                        start_superfile_upload(
+                            &inner,
+                            &piece_runtime,
+                            &fan_out,
+                            &piece_failed,
+                            prepared,
+                        )
+                    }) {
+                        piece_uploads.lock().expect("started uploads").push(upload);
+                    }
+                    Ok(prepared)
+                };
+                let sealed = seal();
+                if sealed.is_err() {
+                    piece_failed.store(true, Ordering::Release);
+                }
+                sealed
             },
             seal_task_lost,
-        )?;
+        );
         drop(pieces_span);
+        let uploads = mem::take(&mut *started.lock().expect("started uploads"));
+        let prepared: Vec<PreparedSuperfile> = match sealed_pieces {
+            Ok(pieces) => pieces.into_iter().flatten().collect(),
+            Err(error) => {
+                settle_abandoned_uploads(&runtime, uploads);
+                return Err(error);
+            }
+        };
         let sealed = sealing.elapsed();
-        let superfiles = outputs.len();
-        let cell_hints = vec![None; superfiles];
-        let user_batch =
-            prepare_user_superfile_batch(&self.inner, &manifest, outputs, cell_hints, stem)?;
+        let superfiles = prepared.len();
+        let mut user_batch = match collect_prepared_superfiles(&self.inner, prepared) {
+            Ok(batch) => batch,
+            Err(error) => {
+                settle_abandoned_uploads(&runtime, uploads);
+                return Err(error);
+            }
+        };
+        user_batch.uploads = uploads;
         let prepared = sealing.elapsed();
         let output_stats = self
             .op_stats
@@ -3011,12 +3093,23 @@ impl SupertableWriter {
         // under seal its pieces straight away. Built against an older
         // schema, or for a buffer that grew a column since, they are
         // dropped and the buffer is rebuilt below as before.
-        if let Some(live) = live {
+        if let Some(mut live) = live {
             if schema_change.is_none()
                 && live.manifest.table_schema().schema_id() == built_against
                 && manifest.vector_configs().is_empty()
             {
-                return self.commit_live(live, buffer, stem, built_against);
+                // The last feed may have failed after the last append: a lane
+                // the budget refused more on the batch this commit closes. Its rows are all in the buffer, so the commit
+                // builds from it, as one would after the next append saw
+                // the failure.
+                match live.join() {
+                    Ok(lanes) => {
+                        return self.commit_live(live, lanes, buffer, stem, built_against);
+                    }
+                    Err(error) => {
+                        debug!(%error, "live lane feed failed; the commit builds from the buffer");
+                    }
+                }
             }
             drop(live);
         }
@@ -3409,48 +3502,83 @@ impl SupertableWriter {
         list_metadata: CommitListMetadata,
     ) -> Result<(), BuildError> {
         let runtime = self.inner.query_runtime();
+        let uploads = mem::take(&mut batch.uploads);
         if !self.shared || batch.new_entries.is_empty() {
+            bridge_on_runtime(await_uploads(uploads), &runtime)?;
             return bridge_on_runtime(
                 persist_superfile_publish_batch_async(&self.inner, batch, list_metadata, None),
                 &runtime,
             )
             .map(drop);
         }
-        // A schema that already moved would throw away the upload below.
-        list_metadata
-            .check_schema(&self.inner.manifest.load())
-            .map_err(BuildError::from)?;
+        // A schema that already moved fails this publish. A live commit's
+        // uploads started as its pieces were built, so they are waited out
+        // before the failure is reported; nothing else is written for it.
+        if let Err(error) = list_metadata.check_schema(&self.inner.manifest.load()) {
+            settle_abandoned_uploads(&runtime, uploads);
+            return Err(error.into());
+        }
         let mut layer = None;
         let mut ticket = self.inner.append_queue.reserve();
-        if let Some(storage) = &self.inner.options.storage {
-            let list_span = detail_span!("publish.write_list").entered();
-            bridge_on_runtime(
-                write_superfile_list(
-                    storage,
-                    &self.inner.options,
-                    &mut batch.pending_storage_writes,
-                    &mut Vec::new(),
-                ),
-                &runtime,
-            )?;
-            drop(list_span);
-            let contributions = &batch.term_contributions;
-            if !contributions.is_empty() {
-                let reserve_span =
-                    detail_span!("publish.reserve_layer", inputs = contributions.len()).entered();
-                layer = Some(
-                    bridge_on_runtime(
-                        term_index::reserve_layer(
-                            storage,
-                            contributions,
-                            &self.inner.options.term_index_build_policy(),
-                        ),
-                        &runtime,
+        match &self.inner.options.storage {
+            Some(storage) => {
+                // The term-index layer is built and written on its own task
+                // while the superfiles finish uploading: neither needs the
+                // other, and one after the other they held every append's
+                // publish for both. The two waves keep separate bounds: the
+                // superfiles at most `commit_write_concurrency()` uploads,
+                // the layer at most twice the term index's slice-write width
+                // in objects (see `upload_objects`), so a publish has up to
+                // half the cores plus that many PUTs in flight, besides the
+                // parts of any upload large enough to go multipart. That
+                // stays inside the thousand warm connections per host the
+                // stores keep, and the layer's wave is short: its objects
+                // hold one commit's terms. Taking the layer's PUTs out of the
+                // superfiles' permits would queue the layer, which the
+                // publish also waits on, behind them.
+                let contributions = mem::take(&mut batch.term_contributions);
+                let layer_task = (!contributions.is_empty()).then(|| {
+                    let storage = Arc::clone(storage);
+                    let policy = self.inner.options.term_index_build_policy();
+                    let span = detail_span!("publish.reserve_layer", inputs = contributions.len());
+                    runtime.spawn(
+                        async move {
+                            let reserved =
+                                term_index::reserve_layer(&storage, &contributions, &policy).await;
+                            (contributions, reserved)
+                        }
+                        .instrument(span),
                     )
-                    .map_err(|e| BuildError::Store(e.to_string()))?,
+                });
+                let pending = &mut batch.pending_storage_writes;
+                let listed = bridge_on_runtime(
+                    async {
+                        let mut replaces = Vec::new();
+                        let (written, uploaded) = tokio::join!(
+                            write_superfile_list(
+                                storage,
+                                &self.inner.options,
+                                pending,
+                                &mut replaces
+                            ),
+                            await_uploads(uploads),
+                        );
+                        written.and(uploaded)
+                    }
+                    .instrument(detail_span!("publish.write_list")),
+                    &runtime,
                 );
-                drop(reserve_span);
+                if let Some(task) = layer_task {
+                    let (contributions, reserved) = bridge_on_runtime(task, &runtime)
+                        .map_err(|e| BuildError::Store(format!("term-index layer task: {e}")))?;
+                    batch.term_contributions = contributions;
+                    listed?;
+                    layer = Some(reserved.map_err(|e| BuildError::Store(e.to_string()))?);
+                } else {
+                    listed?;
+                }
             }
+            None => bridge_on_runtime(await_uploads(uploads), &runtime)?,
         }
         let wait_span = detail_span!("publish.wait_turn").entered();
         let parked = ParkedPublish {
@@ -3653,12 +3781,15 @@ struct LiveLanes {
     /// Rows fed so far, which is also the row number the next batch
     /// starts at.
     rows_fed: usize,
-    /// Build-scratch reserved for the batches fed so far; released with
-    /// the lanes.
+    /// Build-scratch reserved for the batches fed so far, and from the
+    /// seal on what the budget granted each lane past its threshold;
+    /// released with the lanes.
     reservations: Vec<Reservation>,
     /// Text fed so far, which sizes each lane's threshold: a lane never
-    /// spills, so its share of the reserve is what bounds it, and a lane
-    /// that outgrows it fails the feed and the commit builds from the
+    /// spills, so its share of the reserve bounds it until it asks the
+    /// connection's budget for more. Each lane holds what it is granted
+    /// itself until the seal, and gives it back if dropped. A lane the
+    /// budget refuses fails the feed, and the commit builds from the
     /// buffer (where a column past the reserve spills).
     fts_bytes: u64,
     /// The least a lane's threshold is set to: the builder's own default,
@@ -3744,18 +3875,21 @@ struct LiveLane {
 
 impl LiveLanes {
     /// Open `lanes` lanes against `manifest`, with the columns a builder of
-    /// the table's shape has.
+    /// the table's shape has; a lane that outgrows its threshold asks
+    /// `budget` for more.
     fn open(
         manifest: Arc<ManifestSnapshot>,
         lanes: usize,
         vector_layout: VectorLayout,
+        budget: &Arc<ConnectionMemoryBudget>,
     ) -> Result<Self, BuildError> {
         let (template, _, _) = open_shard_builder(&manifest, vector_layout, None, 0)?;
         let lanes = (0..lanes)
             .map(|_| {
-                let builder = template
+                let mut builder = template
                     .lane_builder()?
                     .ok_or_else(|| BuildError::Store("live lanes need a text column".into()))?;
+                builder.set_lane_budget(Arc::clone(budget));
                 Ok(LiveLane {
                     builder,
                     stretches: Vec::new(),
@@ -3963,8 +4097,14 @@ fn open_shard_builder(
 }
 
 /// The postings a builder of `fts_text_bytes` of text may hold in RAM
-/// before spilling (or, for a lane, before giving up): the FTS share of
-/// the build-scratch reserve for that text, never below `floor`.
+/// before spilling (or, for a lane, before asking the connection's budget
+/// for more): the FTS share of the build-scratch reserve for that text,
+/// never below `floor`.
+///
+/// A commit-time build does not ask for more: it spills instead, which
+/// costs it time but never fails it, and under the default measure-only
+/// budget (which never refuses) the spill is the only bound such a build
+/// has on its memory.
 fn in_ram_threshold(fts_text_bytes: u64, floor: usize) -> usize {
     let share = fts_text_bytes.saturating_mul(BUILD_FTS_NUM as u64) / BUILD_SCRATCH_DENOM as u64;
     usize::try_from(share).unwrap_or(usize::MAX).max(floor)
@@ -5007,6 +5147,29 @@ pub(super) struct SuperfilePublishBatch {
     /// One per superfile with an FTS index; published as a term-index delta
     /// in the same CAS as the entries.
     term_contributions: Vec<TermContribution>,
+    /// Superfile uploads already under way, started as each superfile was
+    /// sealed; every one must land before the publish lists them.
+    uploads: Vec<SuperfileUpload>,
+}
+
+/// A superfile upload running on the IO runtime.
+type SuperfileUpload = JoinHandle<Result<(), SupertableCommitError>>;
+
+/// Wait for every upload in `uploads`; the first failure is the result.
+async fn await_uploads(uploads: Vec<SuperfileUpload>) -> Result<(), SupertableCommitError> {
+    let mut first_error = None;
+    for upload in uploads {
+        let landed = upload.await.unwrap_or_else(|error| {
+            Err(BuildError::Store(format!(
+                "a superfile upload ended without a result: {error}"
+            ))
+            .into())
+        });
+        if let Err(error) = landed {
+            first_error.get_or_insert(error);
+        }
+    }
+    first_error.map_or(Ok(()), Err)
 }
 
 impl SuperfilePublishBatch {
@@ -5022,6 +5185,7 @@ impl SuperfilePublishBatch {
         self.pending_store_inserts
             .extend(other.pending_store_inserts);
         self.term_contributions.extend(other.term_contributions);
+        self.uploads.extend(other.uploads);
     }
 
     /// Skip the in-memory reader-cache fill. Only for a storage-backed table,
@@ -5030,6 +5194,133 @@ impl SuperfilePublishBatch {
     pub(super) fn skip_memory_fill(&mut self) {
         self.pending_store_inserts.clear();
     }
+}
+
+/// Start uploading `prepared`'s superfile to the table's storage on
+/// `runtime`, taking its bytes off the publish's list of writes; `None`
+/// when it has nothing to upload. The upload holds one of `fan_out`'s
+/// permits while it runs, so a commit's uploads started one by one keep to
+/// the width [`write_superfile_list`] keeps to (see
+/// [`commit_write_concurrency`]). Once `failed` is set the commit cannot
+/// publish, and an upload that only then takes its permit sends nothing.
+fn start_superfile_upload(
+    inner: &SupertableInner,
+    runtime: &Runtime,
+    fan_out: &Arc<Semaphore>,
+    failed: &Arc<AtomicBool>,
+    prepared: &mut PreparedSuperfile,
+) -> Option<SuperfileUpload> {
+    let storage = Arc::clone(inner.options.storage.as_ref()?);
+    let (key, bytes) = prepared.bytes_for_storage.take()?;
+    let threshold = inner.options.put_multipart_threshold_bytes;
+    let (fan_out, failed) = (Arc::clone(fan_out), Arc::clone(failed));
+    Some(runtime.spawn(async move {
+        let _permit = fan_out.acquire_owned().await.map_err(|_| {
+            SupertableCommitError::from(BuildError::Store("the upload bound was closed".into()))
+        })?;
+        if failed.load(Ordering::Acquire) {
+            return Err(SupertableCommitError::from(BuildError::Store(
+                "the commit failed before this upload began".into(),
+            )));
+        }
+        put_new_superfile_bytes(&storage, threshold, key, bytes).await
+    }))
+}
+
+/// Fault injection for a live commit's pieces, keyed by the stem their
+/// superfiles carry so no other test's commits are touched.
+#[cfg(test)]
+mod piece_fault {
+    use std::{
+        sync::{
+            Mutex,
+            atomic::{AtomicBool, Ordering},
+        },
+        thread::sleep,
+        time::{Duration, Instant},
+    };
+
+    use super::BuildError;
+
+    /// How long a piece that [`FailingPieces::First`] holds waits for the
+    /// first piece's failure before it goes on regardless.
+    const WAIT: Duration = Duration::from_secs(30);
+
+    /// How often a held piece looks for the first piece's failure.
+    const POLL: Duration = Duration::from_millis(1);
+
+    /// Which pieces of a live commit [`PIECE_FAULT`] fails.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum FailingPieces {
+        /// Every piece but the first, after the first may have started its
+        /// upload.
+        AllButFirst,
+        /// The first piece only; every other piece waits until the commit
+        /// has seen the failure before it starts its upload.
+        First,
+    }
+
+    /// The pieces of a commit whose superfiles carry one of these stems fail
+    /// as they are prepared, as its [`FailingPieces`] say. A list, so tests
+    /// running side by side each fault their own commit.
+    pub(super) static PIECE_FAULT: Mutex<Vec<(String, FailingPieces)>> = Mutex::new(Vec::new());
+
+    /// The injected failure of `piece` of a commit named `stem`, if
+    /// [`PIECE_FAULT`] fails it. A piece it holds returns once `failed` is
+    /// set.
+    pub(super) fn injected_piece_failure(
+        stem: Option<&str>,
+        piece: usize,
+        failed: &AtomicBool,
+    ) -> Option<BuildError> {
+        let failing = PIECE_FAULT
+            .lock()
+            .expect("piece fault")
+            .iter()
+            .find(|(faulted, _)| Some(faulted.as_str()) == stem)
+            .map(|&(_, failing)| failing)?;
+        let fails = match failing {
+            FailingPieces::AllButFirst => piece > 0,
+            FailingPieces::First => piece == 0,
+        };
+        if fails {
+            return Some(BuildError::Store("injected piece failure".into()));
+        }
+        if failing == FailingPieces::First {
+            let waited = Instant::now();
+            while !failed.load(Ordering::Acquire) && waited.elapsed() < WAIT {
+                sleep(POLL);
+            }
+        }
+        None
+    }
+}
+
+/// Wait out `uploads` for a commit that failed after starting them, so none
+/// lands after the failure is reported: what did land is unlisted, and the
+/// storage sweep reclaims it like any write a failed publish left.
+fn settle_abandoned_uploads(runtime: &Runtime, uploads: Vec<SuperfileUpload>) {
+    if uploads.is_empty() {
+        return;
+    }
+    let landed = bridge_on_runtime(await_uploads(uploads), runtime);
+    debug!(?landed, "uploads of a failed commit settled");
+}
+
+/// One superfile's step of a publish: name `shard`'s superfile and stamp
+/// its partition `hint`. `None` for a shard that holds no rows.
+fn prepare_finished_superfile(
+    inner: &SupertableInner,
+    manifest: &ManifestSnapshot,
+    shard: ShardOutput,
+    hint: Option<u32>,
+    stem: Option<&str>,
+) -> Result<Option<PreparedSuperfile>, BuildError> {
+    let Some(mut prepared) = prepare_superfile_named(inner, manifest, shard, stem)? else {
+        return Ok(None);
+    };
+    prepared.entry = finish_superfile_entry(prepared.entry, hint)?;
+    Ok(Some(prepared))
 }
 
 fn collect_prepared_superfiles(
@@ -5063,6 +5354,7 @@ fn collect_prepared_superfiles(
         pending_cache_inserts,
         pending_store_inserts,
         term_contributions,
+        uploads: Vec::new(),
     })
 }
 
@@ -5256,23 +5548,9 @@ fn prepare_user_superfile_batch_in_scope(
     let prepared: Vec<PreparedSuperfile> = outputs
         .into_par_iter()
         .zip(hints.into_par_iter())
-        .filter_map(
-            |(shard, hint)| match prepare_superfile_named(inner, manifest, shard, stem) {
-                Ok(Some(p)) => {
-                    Some(
-                        finish_superfile_entry(p.entry, hint).map(|entry| PreparedSuperfile {
-                            entry,
-                            bytes_for_store: p.bytes_for_store,
-                            bytes_for_storage: p.bytes_for_storage,
-                            bytes_for_cache: p.bytes_for_cache,
-                            term_contribution: p.term_contribution,
-                        }),
-                    )
-                }
-                Ok(None) => None,
-                Err(e) => Some(Err(e)),
-            },
-        )
+        .filter_map(|(shard, hint)| {
+            prepare_finished_superfile(inner, manifest, shard, hint, stem).transpose()
+        })
         .collect::<Result<Vec<_>, _>>()?;
     collect_prepared_superfiles(inner, prepared)
 }
@@ -9827,6 +10105,7 @@ pub(in crate::supertable) async fn split_overflow_cell_batch(
         pending_cache_inserts: _,
         pending_store_inserts,
         term_contributions,
+        uploads: _,
     } = collect_prepared_superfiles(inner, all_prepared)?;
 
     // Pin the batch's children BEFORE any byte moves: the pin's entries are
@@ -10390,6 +10669,7 @@ pub(in crate::supertable) async fn split_repack_bulk(
         pending_cache_inserts: _,
         pending_store_inserts,
         term_contributions,
+        uploads: _,
     } = collect_prepared_superfiles(inner, prepared)?;
 
     // Pin every shard BEFORE any byte moves (entries are metadata): one
@@ -13471,6 +13751,9 @@ async fn write_superfile_list_with_threshold(
     // fanout from each stacks and starves the connection pool until requests
     // hit the per-request timeout. Capping each operation at ~50% of cores
     // leaves headroom for a concurrent maintenance pass without saturation.
+    // This bounds the superfile writes only: a shared writer's publish
+    // uploads its term-index layer beside them under the term index's own
+    // bound (see `publish_appended` for the combined width and why it holds).
     let write_concurrency = commit_write_concurrency().get();
 
     // Owned before the map, for the same reason as the PUTs below.
@@ -14106,7 +14389,7 @@ pub(in crate::supertable) const CONTENT_ADDRESSED_MULTIPART_THRESHOLD_BYTES: u64
     100 * 1024 * 1024;
 
 /// PUT `bytes` at `uri` as a new object, starting a second attempt once the
-/// first has run long enough to be taken for stuck (see [`stuck_after`]).
+/// first has run long enough to be taken for stuck (see [`hedged`]).
 /// The stores answer an 8 MB PUT in under half a second and now and then
 /// hold one for the whole request timeout: one such PUT held a billion-row
 /// ingest's commit for a minute. The first attempt to land wins; one that
@@ -14120,24 +14403,11 @@ async fn put_new_hedged(
     uri: &str,
     bytes: Bytes,
 ) -> Result<(), StorageError> {
-    let delay = stuck_after(bytes.len() as u64);
-    let mut first = pin!(storage.put_atomic(uri, bytes.clone()));
-    tokio::select! {
-        answer = &mut first => answer.map(|_| ()),
-        () = sleep(delay) => {
-            let mut second = pin!(storage.put_atomic(uri, bytes));
-            tokio::select! {
-                answer = &mut first => match answer {
-                    Ok(_) => Ok(()),
-                    Err(_) => second.await.map(drop),
-                },
-                answer = &mut second => match answer {
-                    Ok(_) => Ok(()),
-                    Err(_) => first.await.map(drop),
-                },
-            }
-        }
-    }
+    hedged(bytes.len() as u64, None, || {
+        storage.put_atomic(uri, bytes.clone())
+    })
+    .await
+    .map(drop)
 }
 
 /// Persist `bytes` under the name `uri_for` derives from their content
@@ -14398,11 +14668,15 @@ mod tests {
     use rayon::ThreadPoolBuilder;
     use tempfile::TempDir;
 
-    use super::*;
+    use super::{
+        piece_fault::{FailingPieces, PIECE_FAULT},
+        *,
+    };
     #[cfg(unix)]
     use crate::test_helpers::links::assert_cache_copies_are_links;
     use crate::{
         config::{CompactionSettings, Config, OptimizeOptions},
+        storage::stuck_after,
         superfile::{
             BytesLazyByteSource, LazyByteSource, LazyByteSourceError, PrefetchedSource,
             builder::{FtsConfig, VectorConfig},
@@ -14414,7 +14688,8 @@ mod tests {
             gc::superseded::reclaim,
             handle::Supertable,
             manifest::{
-                CellVectorSummary, ClusterCentroids, VectorSummary,
+                CellVectorSummary, ClusterCentroids, SUPERFILE_DATA_DIR, SUPERFILE_KEY_SUFFIX,
+                VectorSummary,
                 commit::{MANIFEST_DIR, POINTER_PATH, manifest_uri},
             },
             query::vector::assemble_hnsw_incremental,
@@ -18219,57 +18494,98 @@ mod tests {
         }
     }
 
-    /// Text whose tokens are mostly new holds many times its bytes in
-    /// postings, past the reserve the lanes were sized by. A lane that
-    /// outgrows its share fails the feed, the lanes are dropped, and the
-    /// commit builds from the buffer as a commit without lanes does.
+    /// Rows of `UNIQUE_TOKENS` tokens each, every one new to the table:
+    /// text that holds many times its bytes in postings, past the reserve
+    /// the lanes were sized by.
+    const UNIQUE_ROWS_PER_BATCH: usize = 2_000;
+    /// Batches that open the lanes under the default floor: about 200 KiB
+    /// of text each against the 1 MiB split.
+    const UNIQUE_OPENING_BATCHES: usize = 8;
+    const UNIQUE_TOKENS: usize = 12;
+    /// A budget the build reserve of the outgrowing tests' rows fits under
+    /// (about 9 MiB, for a feed's lanes or a commit-time build), but not
+    /// the postings their lanes grow to (several times that).
+    const TIGHT_BUDGET_BYTES: u64 = 16 << 20;
+
+    fn unique_batch(batch: usize) -> RecordBatch {
+        RecordBatch::try_new(
+            schema_id_title(),
+            vec![Arc::new(LargeStringArray::from(
+                (0..UNIQUE_ROWS_PER_BATCH)
+                    .map(|i| {
+                        let row = batch * UNIQUE_ROWS_PER_BATCH + i;
+                        (0..UNIQUE_TOKENS)
+                            .map(|k| format!("r{row}k{k}"))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    })
+                    .collect::<Vec<_>>(),
+            ))],
+        )
+        .expect("batch")
+    }
+
+    /// Open the lanes over the opening batches, then hold each lane to its
+    /// real share of the reserve, so the next feed outgrows it.
+    fn open_lanes_then_lower_the_floor(w: &mut SupertableWriter, live: bool) {
+        w.live_disabled = !live;
+        for b in 0..UNIQUE_OPENING_BATCHES {
+            w.append(&unique_batch(b)).expect("append");
+        }
+        assert_eq!(w.live.is_some(), live, "the lanes opened");
+        if let Some(lanes) = w.live.as_mut() {
+            lanes.threshold_floor = 1;
+        }
+    }
+
+    /// Wait for the feed in flight and hand the lanes back to the writer:
+    /// the bytes the budget holds beyond the lanes' build reserve, which is
+    /// what it granted them past their thresholds. Panics if a lane failed.
+    fn granted_past_the_reserve(w: &mut SupertableWriter) -> usize {
+        let live = w.live.as_mut().expect("the lanes are open");
+        let lanes = live.join().expect("no lane gave up");
+        live.lanes = Some(lanes);
+        let reserved: usize = live.reservations.iter().map(Reservation::size).sum();
+        w.inner
+            .options
+            .connection_memory_budget
+            .used_bytes()
+            .checked_sub(reserved)
+            .expect("the budget holds at least the lanes' reserve")
+    }
+
+    /// Under a budget that does not refuse — the default — a lane that
+    /// outgrows its share of the reserve asks for more and goes on: the
+    /// lanes stay open, the commit seals from them, the table is the one a
+    /// commit-time build makes, and the commit gives every byte back.
     #[test]
-    fn a_lane_that_outgrows_its_reservation_hands_the_commit_to_the_buffer() {
-        const ROWS_PER_BATCH: usize = 2_000;
-        /// Batches that open the lanes under the default floor: about 200
-        /// KiB of text each against the 1 MiB split.
-        const OPENING_BATCHES: usize = 8;
-        /// Tokens per row, every one new to the table.
-        const UNIQUE_TOKENS: usize = 12;
-        let unique_batch = |batch: usize| {
-            RecordBatch::try_new(
-                schema_id_title(),
-                vec![Arc::new(LargeStringArray::from(
-                    (0..ROWS_PER_BATCH)
-                        .map(|i| {
-                            let row = batch * ROWS_PER_BATCH + i;
-                            (0..UNIQUE_TOKENS)
-                                .map(|k| format!("r{row}k{k}"))
-                                .collect::<Vec<_>>()
-                                .join(" ")
-                        })
-                        .collect::<Vec<_>>(),
-                ))],
-            )
-            .expect("batch")
-        };
+    fn a_lane_that_outgrows_its_share_grows_under_a_measured_budget() {
         let build = |live: bool| {
             let st = Supertable::create(live_options(2, 1, 4096, false)).expect("create");
+            let budget = Arc::clone(&st.options().connection_memory_budget);
+            assert!(budget.limit().is_none(), "the default budget measures");
+            let baseline = budget.used_bytes();
             let mut w = st.writer().expect("writer");
-            w.live_disabled = !live;
-            for b in 0..OPENING_BATCHES {
+            open_lanes_then_lower_the_floor(&mut w, live);
+            for b in UNIQUE_OPENING_BATCHES..UNIQUE_OPENING_BATCHES + 2 {
                 w.append(&unique_batch(b)).expect("append");
             }
-            assert_eq!(w.live.is_some(), live, "the lanes opened");
-            if let Some(lanes) = w.live.as_mut() {
-                // Hold each lane to its real share of the reserve.
-                lanes.threshold_floor = 1;
-            }
-            // The next feed fails on the pool; the append after it sees the
-            // failure and drops the lanes.
-            w.append(&unique_batch(OPENING_BATCHES)).expect("append");
-            w.append(&unique_batch(OPENING_BATCHES + 1))
-                .expect("append");
             if live {
-                assert!(w.live.is_none(), "the lanes are dropped");
-                assert!(w.live_disabled, "the commit builds from the buffer");
+                assert!(w.live.is_some(), "the lanes are still open");
+                assert!(!w.live_disabled, "no feed gave up");
+                assert!(
+                    granted_past_the_reserve(&mut w) > 0,
+                    "the lanes were granted more than their share"
+                );
             }
             w.commit().expect("commit");
+            assert!(w.live.is_none(), "the commit consumes the lanes");
+            assert_eq!(budget.denials(), 0);
+            assert_eq!(
+                budget.used_bytes(),
+                baseline,
+                "the commit gives back everything the lanes held"
+            );
             drop(w);
             st
         };
@@ -18277,7 +18593,120 @@ mod tests {
         let plain = build(false);
         assert_eq!(
             live.reader().expect("reader").n_docs_total(),
-            ((OPENING_BATCHES + 2) * ROWS_PER_BATCH) as u64
+            ((UNIQUE_OPENING_BATCHES + 2) * UNIQUE_ROWS_PER_BATCH) as u64
+        );
+        assert_eq!(piece_sizes(&live), piece_sizes(&plain));
+        for term in ["r4321k7", "r19999k11", "r0k0"] {
+            assert!(!scored_hits(&live, term, 10).is_empty(), "{term}: no hits");
+            assert_eq!(
+                scored_hits(&live, term, 10),
+                scored_hits(&plain, term, 10),
+                "{term}: hits or scores differ"
+            );
+        }
+    }
+
+    /// What the budget granted lanes past their thresholds goes back when
+    /// the lanes are dropped without a commit.
+    #[test]
+    fn dropped_lanes_give_back_what_they_were_granted() {
+        let st = Supertable::create(live_options(2, 1, 4096, false)).expect("create");
+        let budget = Arc::clone(&st.options().connection_memory_budget);
+        let baseline = budget.used_bytes();
+        let mut w = st.writer().expect("writer");
+        open_lanes_then_lower_the_floor(&mut w, true);
+        w.append(&unique_batch(UNIQUE_OPENING_BATCHES))
+            .expect("append");
+        assert!(granted_past_the_reserve(&mut w) > 0, "the lanes grew");
+        w.disable_live();
+        assert_eq!(
+            budget.used_bytes(),
+            baseline,
+            "the dropped lanes hold nothing"
+        );
+        w.commit().expect("commit from the buffer");
+        assert_eq!(budget.used_bytes(), baseline);
+    }
+
+    /// Under a budget too small for what the lanes grow to, a lane that
+    /// outgrows its share is refused more and fails the feed; the lanes
+    /// are dropped, and the commit builds from the buffer as a commit
+    /// without lanes does.
+    #[test]
+    fn a_lane_that_outgrows_its_reservation_hands_the_commit_to_the_buffer() {
+        let build = |live: bool| {
+            let mut opts = live_options(2, 1, 4096, false);
+            opts.connection_memory_budget = ConnectionMemoryBudget::with_limit(TIGHT_BUDGET_BYTES);
+            let st = Supertable::create(opts).expect("create");
+            let mut w = st.writer().expect("writer");
+            open_lanes_then_lower_the_floor(&mut w, live);
+            // The next feed fails on the pool; the append after it sees the
+            // failure and drops the lanes.
+            w.append(&unique_batch(UNIQUE_OPENING_BATCHES))
+                .expect("append");
+            w.append(&unique_batch(UNIQUE_OPENING_BATCHES + 1))
+                .expect("append");
+            if live {
+                assert!(w.live.is_none(), "the lanes are dropped");
+                assert!(w.live_disabled, "the commit builds from the buffer");
+                assert!(
+                    st.options().connection_memory_budget.denials() >= 1,
+                    "the budget refused a lane"
+                );
+            }
+            w.commit().expect("commit");
+            assert_eq!(st.options().connection_memory_budget.used_bytes(), 0);
+            drop(w);
+            st
+        };
+        let live = build(true);
+        let plain = build(false);
+        assert_eq!(
+            live.reader().expect("reader").n_docs_total(),
+            ((UNIQUE_OPENING_BATCHES + 2) * UNIQUE_ROWS_PER_BATCH) as u64
+        );
+        assert_eq!(piece_sizes(&live), piece_sizes(&plain));
+        assert_eq!(
+            hit_titles(&live, "r4321k7", usize::MAX),
+            hit_titles(&plain, "r4321k7", usize::MAX)
+        );
+    }
+
+    /// A lane refused more on the batch a commit closes fails a feed no
+    /// later append sees. The commit takes the failure as an append would:
+    /// it drops the lanes and builds from the buffer, so a caller that
+    /// appends once and commits loses no rows.
+    #[test]
+    fn a_lane_that_outgrows_on_the_last_feed_hands_the_commit_to_the_buffer() {
+        let build = |live: bool| {
+            let mut opts = live_options(2, 1, 4096, false);
+            opts.connection_memory_budget = ConnectionMemoryBudget::with_limit(TIGHT_BUDGET_BYTES);
+            let st = Supertable::create(opts).expect("create");
+            let mut w = st.writer().expect("writer");
+            open_lanes_then_lower_the_floor(&mut w, live);
+            // This feed fails on the pool, and the commit is the next call.
+            w.append(&unique_batch(UNIQUE_OPENING_BATCHES))
+                .expect("append");
+            if live {
+                assert!(w.live.is_some(), "no append has seen the failure yet");
+            }
+            w.commit()
+                .expect("the commit builds from the buffer, not fails");
+            if live {
+                assert!(
+                    st.options().connection_memory_budget.denials() >= 1,
+                    "the budget refused a lane"
+                );
+            }
+            assert_eq!(st.options().connection_memory_budget.used_bytes(), 0);
+            drop(w);
+            st
+        };
+        let live = build(true);
+        let plain = build(false);
+        assert_eq!(
+            live.reader().expect("reader").n_docs_total(),
+            ((UNIQUE_OPENING_BATCHES + 1) * UNIQUE_ROWS_PER_BATCH) as u64
         );
         assert_eq!(piece_sizes(&live), piece_sizes(&plain));
         assert_eq!(
@@ -18347,6 +18776,361 @@ mod tests {
                 "term {term}"
             );
         }
+    }
+
+    /// A live commit starts each superfile's upload as its piece is built;
+    /// an upload that fails fails the commit before anything is listed, the
+    /// buffer is restored, and the retry rebuilds every row from it.
+    #[test]
+    fn a_live_commit_whose_upload_fails_lists_nothing_and_the_retry_rebuilds() {
+        const ROWS_PER_BATCH: usize = 2_000;
+        const BATCHES: usize = 4;
+        let dir = TempDir::new().expect("tempdir");
+        let local: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let faults = FaultStorage::wrap(local);
+        let storage: Arc<dyn StorageProvider> = Arc::<FaultStorage>::clone(&faults);
+        let st = Supertable::create(live_options(2, 1, 4096, false).with_storage(storage))
+            .expect("create");
+        let mut w = st.writer().expect("writer");
+        for b in 0..BATCHES {
+            w.append(&live_batch(b, ROWS_PER_BATCH)).expect("append");
+        }
+        assert!(w.live.is_some(), "the commit seals from the lanes");
+        faults.fail(FaultOp::PutAtomic, "data/", usize::MAX);
+        w.commit().expect_err("a superfile upload fails");
+        assert!(faults.fired() > 0, "the failure came from the injection");
+        faults.clear();
+        assert_eq!(
+            st.reader().expect("reader").n_docs_total(),
+            0,
+            "nothing was listed"
+        );
+        assert_eq!(w.buffer.len(), BATCHES, "the buffer is restored");
+        w.commit().expect("the retry rebuilds from the buffer");
+        drop(w);
+        assert_eq!(
+            st.reader().expect("reader").n_docs_total(),
+            (BATCHES * ROWS_PER_BATCH) as u64
+        );
+        let plain = build_live_or_plain(
+            live_options(2, 1, 4096, false),
+            ROWS_PER_BATCH,
+            BATCHES,
+            false,
+            |_| {},
+        );
+        assert_eq!(piece_sizes(&st), piece_sizes(&plain));
+        assert_eq!(
+            hit_titles(&st, "heavy", usize::MAX),
+            hit_titles(&plain, "heavy", usize::MAX)
+        );
+    }
+
+    /// A live commit's uploads start while its pieces are still building and
+    /// run beside the publish's own writes, but the commit lists nothing
+    /// until every one has landed: with one upload held back, the manifest
+    /// list is written only after that superfile is in storage.
+    #[test]
+    fn a_live_commit_lists_its_superfiles_only_after_every_upload_lands() {
+        /// How long the first upload is held: far longer than the commit's
+        /// other pieces take to build, upload and reach the publish.
+        const HELD_UPLOAD: Duration = Duration::from_millis(500);
+        const ROWS_PER_BATCH: usize = 2_000;
+        const BATCHES: usize = 4;
+        let dir = TempDir::new().expect("tempdir");
+        let local: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let faults = FaultStorage::wrap(local);
+        let storage: Arc<dyn StorageProvider> = Arc::<FaultStorage>::clone(&faults);
+        let st = Supertable::create(live_options(2, 1, 4096, false).with_storage(storage))
+            .expect("create");
+        let mut w = st.writer().expect("writer");
+        for b in 0..BATCHES {
+            w.append(&live_batch(b, ROWS_PER_BATCH)).expect("append");
+        }
+        assert!(w.live.is_some(), "the commit seals from the lanes");
+
+        faults.before(FaultOp::PutAtomic, "data/", || {
+            thread::sleep(HELD_UPLOAD);
+        });
+        let stored_at_list = Arc::new(AtomicUsize::new(usize::MAX));
+        let (seen, data_dir) = (Arc::clone(&stored_at_list), dir.path().to_path_buf());
+        faults.before(FaultOp::PutAtomic, "manifest/manifest-", move || {
+            seen.store(stored_superfiles(&data_dir), Ordering::SeqCst);
+        });
+        w.commit().expect("commit");
+        drop(w);
+
+        let listed = st.reader().expect("reader").n_superfiles();
+        assert!(listed >= 2, "the commit cut several pieces, got {listed}");
+        assert_eq!(
+            stored_at_list.load(Ordering::SeqCst),
+            listed,
+            "every listed superfile was in storage when its list was written"
+        );
+        assert_eq!(
+            st.reader().expect("reader").n_docs_total(),
+            (BATCHES * ROWS_PER_BATCH) as u64
+        );
+    }
+
+    /// Rows per batch and batches for the shared live-commit tests: enough
+    /// text that the commit cuts several pieces.
+    const SHARED_LIVE_ROWS: usize = 2_000;
+    const SHARED_LIVE_BATCHES: usize = 4;
+    /// How long a shared live-commit test holds the first superfile upload:
+    /// far longer than the commit's other pieces take to build, upload and
+    /// reach the publish.
+    const SHARED_HELD_UPLOAD: Duration = Duration::from_millis(500);
+
+    /// Superfile objects in the storage under `dir`. The local store writes
+    /// each one beside its key and renames it into place, so a file under its
+    /// key is whole.
+    fn stored_superfiles(dir: &Path) -> usize {
+        fs::read_dir(dir.join(SUPERFILE_DATA_DIR)).map_or(0, |entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter(|e| {
+                    e.file_name()
+                        .to_string_lossy()
+                        .ends_with(SUPERFILE_KEY_SUFFIX)
+                })
+                .count()
+        })
+    }
+
+    /// A table over fault storage in `dir` and a shared writer on it holding
+    /// the shared live-commit tests' rows in its live lanes, named `stem`
+    /// when given.
+    fn shared_live_writer(
+        dir: &TempDir,
+        stem: Option<&str>,
+    ) -> (Arc<FaultStorage>, Supertable, SupertableWriter) {
+        let local: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let faults = FaultStorage::wrap(local);
+        let storage: Arc<dyn StorageProvider> = Arc::<FaultStorage>::clone(&faults);
+        let st = Supertable::create(live_options(2, 1, 4096, false).with_storage(storage))
+            .expect("create");
+        let mut w = st.acquire_writer(true).expect("shared writer");
+        assert!(w.shared, "the writer shares the slot with other appends");
+        for b in 0..SHARED_LIVE_BATCHES {
+            let batch = live_batch(b, SHARED_LIVE_ROWS);
+            match stem {
+                Some(stem) => w.append_named(&batch, stem),
+                None => w.append(&batch),
+            }
+            .expect("append");
+        }
+        assert!(w.live.is_some(), "the commit seals from the lanes");
+        (faults, st, w)
+    }
+
+    /// `st` holds every shared live-commit row, cut and indexed as a plain
+    /// commit of them is, and its term index lists every superfile it holds.
+    fn assert_shared_live_rows_published(st: &Supertable) {
+        assert_eq!(
+            st.reader().expect("reader").n_docs_total(),
+            (SHARED_LIVE_BATCHES * SHARED_LIVE_ROWS) as u64
+        );
+        let plain = build_live_or_plain(
+            live_options(2, 1, 4096, false),
+            SHARED_LIVE_ROWS,
+            SHARED_LIVE_BATCHES,
+            false,
+            |_| {},
+        );
+        assert_eq!(piece_sizes(st), piece_sizes(&plain));
+        for term in ["word5", "heavy"] {
+            assert_eq!(
+                hit_titles(st, term, usize::MAX),
+                hit_titles(&plain, term, usize::MAX),
+                "term {term}"
+            );
+        }
+        let manifest = st.inner().manifest.load_full();
+        assert!(manifest.term_index_complete(), "the term index is complete");
+        let storage = manifest.options.storage.as_ref().expect("storage");
+        let root = st
+            .block_on_query(term_index::load_root(
+                storage.as_ref(),
+                manifest.term_index_ref().expect("a term index"),
+            ))
+            .expect("root");
+        let indexed: HashSet<Uuid> = root.superfiles.iter().copied().collect();
+        assert!(
+            manifest
+                .get_all_superfiles()
+                .iter()
+                .all(|e| indexed.contains(&e.superfile_id)),
+            "the term index lists every superfile"
+        );
+    }
+
+    /// A failed commit left nothing listed, and once storage is swept no
+    /// superfile it uploaded is left behind either.
+    fn assert_failed_commit_left_nothing(dir: &TempDir, st: &Supertable) {
+        assert_eq!(
+            st.reader().expect("reader").n_docs_total(),
+            0,
+            "nothing was listed"
+        );
+        st.gc(Duration::ZERO).expect("sweep storage");
+        // An upload the commit did not wait for would land after the sweep.
+        thread::sleep(SHARED_HELD_UPLOAD);
+        assert_eq!(
+            stored_superfiles(dir.path()),
+            0,
+            "no unlisted superfile is left once storage is swept"
+        );
+    }
+
+    /// The shared writer's twin of
+    /// `a_live_commit_lists_its_superfiles_only_after_every_upload_lands`: a
+    /// shared writer builds its term-index layer beside the uploads, and
+    /// still writes the manifest list only once every superfile is stored.
+    #[test]
+    fn a_shared_live_commit_lists_its_superfiles_only_after_every_upload_lands() {
+        let dir = TempDir::new().expect("tempdir");
+        let (faults, st, mut w) = shared_live_writer(&dir, None);
+        faults.before(FaultOp::PutAtomic, "data/", || {
+            thread::sleep(SHARED_HELD_UPLOAD);
+        });
+        let stored_at_list = Arc::new(AtomicUsize::new(usize::MAX));
+        let (seen, data_dir) = (Arc::clone(&stored_at_list), dir.path().to_path_buf());
+        faults.before(FaultOp::PutAtomic, "manifest/manifest-", move || {
+            seen.store(stored_superfiles(&data_dir), Ordering::SeqCst);
+        });
+        w.commit().expect("commit");
+        drop(w);
+
+        let listed = st.reader().expect("reader").n_superfiles();
+        assert!(listed >= 2, "the commit cut several pieces, got {listed}");
+        assert_eq!(
+            stored_at_list.load(Ordering::SeqCst),
+            listed,
+            "every listed superfile was in storage when its list was written"
+        );
+        assert_shared_live_rows_published(&st);
+    }
+
+    /// A shared live commit whose upload fails fails as a whole: nothing is
+    /// listed, the superfiles that did upload are swept away, and the retry
+    /// rebuilds every row and its term index from the restored buffer.
+    #[test]
+    fn a_shared_live_commit_whose_upload_fails_lists_nothing_and_the_retry_rebuilds() {
+        let dir = TempDir::new().expect("tempdir");
+        let (faults, st, mut w) = shared_live_writer(&dir, None);
+        faults.fail(FaultOp::PutAtomic, "data/", 1);
+        w.commit().expect_err("a superfile upload fails");
+        assert_eq!(faults.fired(), 1, "the failure came from the injection");
+        faults.clear();
+        assert_failed_commit_left_nothing(&dir, &st);
+        assert_eq!(
+            w.buffer.len(),
+            SHARED_LIVE_BATCHES,
+            "the buffer is restored"
+        );
+        w.commit().expect("the retry rebuilds from the buffer");
+        drop(w);
+        assert_shared_live_rows_published(&st);
+    }
+
+    /// A shared live commit whose term-index layer fails to write fails as a
+    /// whole, though every superfile uploaded: nothing is listed, the
+    /// uploads are swept away, and the retry publishes the rows and a term
+    /// index that lists them.
+    #[test]
+    fn a_shared_live_commit_whose_term_index_layer_fails_lists_nothing_and_the_retry_rebuilds() {
+        let dir = TempDir::new().expect("tempdir");
+        let (faults, st, mut w) = shared_live_writer(&dir, None);
+        faults.fail(FaultOp::PutAtomic, "term-index/slice-", usize::MAX);
+        w.commit().expect_err("the layer's slice write fails");
+        assert!(faults.fired() > 0, "the failure came from the injection");
+        faults.clear();
+        assert_failed_commit_left_nothing(&dir, &st);
+        assert_eq!(
+            w.buffer.len(),
+            SHARED_LIVE_BATCHES,
+            "the buffer is restored"
+        );
+        w.commit().expect("the retry rebuilds from the buffer");
+        drop(w);
+        assert_shared_live_rows_published(&st);
+    }
+
+    /// Commit `w`, whose superfiles carry its pending stem, with
+    /// `failing` pieces of the commit failing, and check that it fails with
+    /// the injected error.
+    fn commit_failing_pieces(w: &mut SupertableWriter, failing: FailingPieces) {
+        let stem = w
+            .pending_stem
+            .clone()
+            .expect("the commit's superfiles carry the source's stem");
+        PIECE_FAULT
+            .lock()
+            .expect("piece fault")
+            .push((stem.clone(), failing));
+        let failed = w.commit();
+        PIECE_FAULT
+            .lock()
+            .expect("piece fault")
+            .retain(|(faulted, _)| *faulted != stem);
+        let error = failed.expect_err("a piece fails");
+        assert!(
+            error.to_string().contains("injected piece failure"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// The writer's buffer survived its failed live commit, and a retry
+    /// publishes every row.
+    fn assert_retry_publishes_shared_live_rows(st: &Supertable, mut w: SupertableWriter) {
+        assert_eq!(
+            w.buffer.len(),
+            SHARED_LIVE_BATCHES,
+            "the buffer is restored"
+        );
+        w.commit().expect("the retry rebuilds from the buffer");
+        drop(w);
+        assert_eq!(
+            st.reader().expect("reader").n_docs_total(),
+            (SHARED_LIVE_BATCHES * SHARED_LIVE_ROWS) as u64
+        );
+    }
+
+    /// A live commit that fails building a piece after another piece's upload
+    /// started waits that upload out before it reports the failure, so the
+    /// sweep that follows finds and removes it; the retry then publishes.
+    #[test]
+    fn a_live_commit_that_fails_a_piece_waits_out_the_uploads_it_started() {
+        let dir = TempDir::new().expect("tempdir");
+        let (faults, st, mut w) = shared_live_writer(&dir, Some("a-piece-fails"));
+        faults.before(FaultOp::PutAtomic, "data/", || {
+            thread::sleep(SHARED_HELD_UPLOAD);
+        });
+        commit_failing_pieces(&mut w, FailingPieces::AllButFirst);
+        assert_failed_commit_left_nothing(&dir, &st);
+        assert_retry_publishes_shared_live_rows(&st, w);
+    }
+
+    /// A live commit whose first piece fails before any other piece starts
+    /// its upload uploads nothing: every later upload sees the failure and
+    /// is skipped, so storage holds no superfile when the commit reports it,
+    /// before any sweep. The retry then publishes.
+    #[test]
+    fn a_live_commit_whose_first_piece_fails_uploads_nothing() {
+        let dir = TempDir::new().expect("tempdir");
+        let (_faults, st, mut w) = shared_live_writer(&dir, Some("the-first-piece-fails"));
+        commit_failing_pieces(&mut w, FailingPieces::First);
+        assert_eq!(
+            stored_superfiles(dir.path()),
+            0,
+            "no piece uploaded once the commit had failed"
+        );
+        assert_failed_commit_left_nothing(&dir, &st);
+        assert_retry_publishes_shared_live_rows(&st, w);
     }
 
     /// A commit to a directory on this host with a disk cache attached
@@ -19237,6 +20021,7 @@ supertable:
                 pending_cache_inserts: Vec::new(),
                 pending_store_inserts: Vec::new(),
                 term_contributions: Vec::new(),
+                uploads: Vec::new(),
             },
             list_metadata: CommitListMetadata::empty(),
             segment: ReservedSegment {

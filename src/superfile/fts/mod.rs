@@ -13,4 +13,5 @@ pub mod reader;
 pub(crate) mod reorder;
 pub(crate) mod short;
 pub(crate) mod sorted_merge;
+pub(crate) mod term_table;
 pub mod tokenize;

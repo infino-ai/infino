@@ -95,9 +95,8 @@ use std::{
     collections::BinaryHeap,
     fs,
     fs::File,
-    hash::{BuildHasher, Hash},
     io::{self, BufReader, BufWriter, Error, ErrorKind, Read, Seek, SeekFrom, Write},
-    mem,
+    mem::{self, transmute},
     ops::Range,
     path::{Path, PathBuf},
     sync::Arc,
@@ -106,15 +105,15 @@ use std::{
 };
 
 use bumpalo::Bump;
-use hashbrown::hash_map::{HashMap as HbHashMap, RawEntryMut};
 use memmap2::Mmap;
 use rayon::ThreadPool;
-use rustc_hash::FxBuildHasher;
 use tempfile::{Builder, TempDir};
 use tracing::debug;
 
+use super::term_table::{SLOT_BYTES_PER_TERM, TermTable};
 use crate::{
     config::scratch_root,
+    memory::{ConnectionMemoryBudget, Reservation},
     superfile::{
         BuildError,
         bits::PackScratch,
@@ -126,7 +125,7 @@ use crate::{
         fts::{
             analysis::ChainTokenizer,
             bm25,
-            positions::{TermRuns, encode_group, encode_run, skip_run},
+            positions::{TermRuns, encode_group_runs, encode_run, skip_run},
             posting::{BLOCK_LEN, Block, EncodedBlock, block_lanes, encode_block_with},
             reader::{ColumnLengthStats, TopKEntry, finish_head},
             short::{SHORT_MAX_DF, encode_short},
@@ -143,43 +142,25 @@ use crate::{
     },
 };
 
-/// Per-column term interner table.
+/// Term bytes interned for a column, borrowed from its arena.
 ///
-/// Keys are `&'static str` slices that **actually borrow from the
-/// per-column `term_arena: bumpalo::Bump`** stored alongside the
-/// map in the column's [`Vocab`]. The `'static`
-/// lifetime tag is a lie maintained by `unsafe` `std::mem::
-/// transmute` at insertion (see [`intern_term_id`]) and
-/// kept sound by two structural invariants:
+/// Entries of a [`Vocab`]'s `id_to_term` are `&'static str` slices that
+/// **actually borrow from the per-column `term_arena: bumpalo::Bump`**
+/// stored alongside them. The `'static` lifetime tag is a lie maintained
+/// by an `unsafe` `transmute` at insertion (see
+/// [`intern_term_id`]) and kept sound by two structural invariants:
 ///
-/// 1. The arena outlives the map. [`Vocab`] declares `term_arena`
-///    *after* `term_to_id` and `id_to_term` so Rust drops it last
-///    (struct fields drop in declaration order, so the last-declared
-///    field is the last-dropped). The `finish_to` per-column blocks
-///    that destructure a `Vocab` likewise add an explicit
-///    `drop(term_arena)` after the last use of `id_to_term` for the
-///    same reason.
-/// 2. No method on the map's keys does a deref during the map's
-///    own `Drop`. `&str` has no `Drop` impl, so dropping the map
-///    just deallocates the bucket table without touching the
-///    key bytes. The arena can therefore safely outlast the
-///    map's body without the map ever needing arena bytes
-///    during its own teardown.
+/// 1. The arena outlives the list. [`Vocab`] declares `term_arena` last
+///    so Rust drops it last (struct fields drop in declaration order).
+///    The finish blocks that destructure a `Vocab` likewise add an
+///    explicit `drop(term_arena)` after the last use of `id_to_term`.
+/// 2. Dropping the list never dereferences an entry: `&str` has no
+///    `Drop` impl, so the arena can outlast the list's body without the
+///    list needing its bytes during teardown.
 ///
-/// Switching from `Box<str>` keys to arena `&str` keys:
-///
-///   * removes one `Box<str>` heap allocation per intern miss
-///     (was: one for the map key + one cloned for `id_to_term`;
-///     now: one bump-arena copy reused by both);
-///   * packs all term bytes densely in the bump arena instead
-///     of scattering them across the global heap, which keeps
-///     the byte-compare fast path inside `raw_entry_mut` cache-
-///     hot on the per-token spill-arm hot loop (the bench
-///     vocab is ~10K terms × ~5-10 byte average = ~75 KiB
-///     total, comfortably L2-resident as one contiguous arena
-///     instead of ~10K separate heap allocations chasing
-///     pointers through unrelated allocator buckets).
-type TermIdMap = HbHashMap<&'static str, u32, FxBuildHasher>;
+/// All of a column's term bytes sit densely in one arena, with one
+/// bump-pointer copy per new term and no heap allocation of its own.
+type ArenaStr = &'static str;
 
 /// Chain terminator for the per-doc position chains
 /// (`FtsBuilder::doc_pos_chain`): no previous occurrence.
@@ -395,12 +376,34 @@ const PARTITION_BUF_SIZE: usize = 64 * 1024;
 /// accumulator. Used to drive the spill threshold; intentionally
 /// rough — the threshold is a soft budget, not a hard cap.
 ///
-/// - `~24 B`: per new term: the interner entry + the `Vec<(u32,u32)>`
-///   header + small-alloc rounding.
-/// - `+ term.len()`: term bytes.
-/// - `+ 8 B`: per added posting: `(doc_id: u32, tf: u32)`.
-const ACCUM_NEW_TERM_FIXED_BYTES: usize = 24;
-const ACCUM_POSTING_BYTES: usize = 8;
+/// - [`ACCUM_NEW_TERM_FIXED_BYTES`] per new term, plus
+///   [`ACCUM_NEW_TERM_POSITIONAL_BYTES`] on a positional column, plus
+///   `term.len()` for its bytes in the arena.
+/// - [`ACCUM_POSTING_BYTES`] per added posting.
+/// - A positional column's run bytes as they are written.
+///
+/// What a new term holds in RAM on every column: its [`TermLists`]
+/// (three `Vec` headers, empty lists or not), its [`TermTable`] slot with
+/// that slot's share of the empty ones at the table's fullest load, its
+/// `id_to_term` entry and its `dense_doc_tf` entry. The vectors' growth
+/// slack is left out, so this is the least a term holds, not the most.
+const ACCUM_NEW_TERM_FIXED_BYTES: usize =
+    size_of::<TermLists>() + SLOT_BYTES_PER_TERM + size_of::<ArenaStr>() + size_of::<u32>();
+/// What a new term holds beyond [`ACCUM_NEW_TERM_FIXED_BYTES`] on a
+/// positional column: its `dense_doc_poshead` entry.
+const ACCUM_NEW_TERM_POSITIONAL_BYTES: usize = size_of::<u32>();
+/// One `(doc_id, tf)` posting in a term's list.
+const ACCUM_POSTING_BYTES: usize = size_of::<(u32, u32)>();
+
+/// What a new term holds in RAM, less its bytes in the arena: see
+/// [`ACCUM_NEW_TERM_FIXED_BYTES`].
+#[inline(always)]
+const fn accum_new_term_bytes(positional: bool) -> usize {
+    match positional {
+        true => ACCUM_NEW_TERM_FIXED_BYTES + ACCUM_NEW_TERM_POSITIONAL_BYTES,
+        false => ACCUM_NEW_TERM_FIXED_BYTES,
+    }
+}
 
 /// Partition size (in triples) below which the lex-rank sort uses
 /// `sort_unstable_by` instead of the counting/radix variant: under
@@ -496,11 +499,11 @@ impl ColumnState {
 /// it, so the transition from the in-RAM store to the spilled one keeps
 /// every id and rewrites no term.
 struct Vocab {
-    /// Term → dense id. Keys borrow from `term_arena` (see [`TermIdMap`]).
-    term_to_id: TermIdMap,
+    /// Term → dense id. Long terms are confirmed against `id_to_term`.
+    term_to_id: TermTable,
     /// Id → term bytes, for the dictionary emit and the lex-rank table.
-    /// Entries borrow from `term_arena` like the map's keys.
-    id_to_term: Vec<&'static str>,
+    /// Entries borrow from `term_arena` (see [`ArenaStr`]).
+    id_to_term: Vec<ArenaStr>,
     /// Per-doc tf accumulator indexed by id. Dense ids make this one
     /// array store per token where a hash probe would cost several
     /// times more. `dense_doc_tf[id] != 0` iff `id` is in
@@ -515,17 +518,18 @@ struct Vocab {
     /// Ids the current document touched; drained at the end of each
     /// `add_doc`. Bounded by the doc's distinct terms, reused across docs.
     updated_terms: Vec<u32>,
-    /// Owns the term bytes behind `term_to_id` and `id_to_term`.
-    /// **Declared last so it drops last**: the map and the vec free
-    /// their tables without dereferencing a key, and only then does the
-    /// arena release the bytes (see [`TermIdMap`]).
+    /// Owns the term bytes behind `id_to_term`, which `term_to_id` reads
+    /// to confirm a term longer than its slot holds inline.
+    /// **Declared last so it drops last**: the table and the vec free
+    /// their memory without dereferencing a term, and only then does the
+    /// arena release the bytes (see [`ArenaStr`]).
     term_arena: Bump,
 }
 
 impl Vocab {
     fn new() -> Self {
         Self {
-            term_to_id: TermIdMap::default(),
+            term_to_id: TermTable::new(),
             id_to_term: Vec::new(),
             dense_doc_tf: Vec::new(),
             dense_doc_poshead: Vec::new(),
@@ -565,42 +569,40 @@ impl Vocab {
 /// lands with one array index and one push; the finish walks the ids in
 /// dictionary order and encodes each list in place, with no sort pass.
 struct RamStore {
-    postings: Vec<Vec<(u32, u32)>>,
-    /// Empty for a positionless column.
-    pos_runs: Vec<Vec<u8>>,
-    /// Where a list's position runs end in `pos_runs` after every
-    /// [`RUN_END_STRIDE`] postings, per id, so a stretch of a list's
-    /// postings can take its runs by byte range. Kept only by a lane (see
-    /// [`FtsBuilder::set_lane_mode`]); empty otherwise.
-    run_ends: Vec<Vec<u32>>,
+    /// One entry per id. A term's lists sit side by side, so a document's
+    /// visit to a term — the run during the scan, the posting and the run
+    /// end at the drain — reads one place rather than one table per list.
+    lists: Vec<TermLists>,
     /// Estimated bytes held (see `ACCUM_*_BYTES`); drives the spill check.
     bytes: usize,
+}
+
+/// One id's accumulated lists in the in-RAM store.
+#[derive(Default)]
+struct TermLists {
+    postings: Vec<(u32, u32)>,
+    /// Empty for a positionless column.
+    runs: Vec<u8>,
+    /// Where the list's position runs end in `runs` after every
+    /// [`RUN_END_STRIDE`] postings, so a stretch of the list's postings
+    /// can take its runs by byte range. Kept only by a lane (see
+    /// [`FtsBuilder::set_lane_mode`]); empty otherwise.
+    run_ends: Vec<u32>,
 }
 
 impl RamStore {
     fn new() -> Self {
         Self {
-            postings: Vec::new(),
-            pos_runs: Vec::new(),
-            run_ends: Vec::new(),
+            lists: Vec::new(),
             bytes: 0,
         }
     }
 
     /// Give every interned id its slot. Amortized O(1) per new id.
     #[inline(always)]
-    fn grow_to(&mut self, n_terms: usize, positional: bool, run_ends: bool) {
-        // Each table on its own: the positional scan grows the lists and
-        // the runs itself as it interns, and only the drain grows the run
-        // ends.
-        if self.postings.len() < n_terms {
-            self.postings.resize_with(n_terms, Vec::new);
-        }
-        if positional && self.pos_runs.len() < n_terms {
-            self.pos_runs.resize_with(n_terms, Vec::new);
-        }
-        if positional && run_ends && self.run_ends.len() < n_terms {
-            self.run_ends.resize_with(n_terms, Vec::new);
+    fn grow_to(&mut self, n_terms: usize) {
+        if self.lists.len() < n_terms {
+            self.lists.resize_with(n_terms, TermLists::default);
         }
     }
 }
@@ -615,8 +617,7 @@ impl RamStore {
 /// at the end of the document.
 enum PositionSink<'a> {
     Runs {
-        postings: &'a mut Vec<Vec<(u32, u32)>>,
-        runs: &'a mut Vec<Vec<u8>>,
+        lists: &'a mut Vec<TermLists>,
         /// Run bytes appended during this document, for the accumulator's
         /// byte estimate.
         bytes: usize,
@@ -937,11 +938,6 @@ fn build_lex_rank(id_to_term: &[&str]) -> (Vec<u32>, Vec<u32>) {
     (rank, by_lex)
 }
 
-#[inline(always)]
-fn compute_hash<Q: Hash + ?Sized, S: BuildHasher>(hash_builder: &S, key: &Q) -> u64 {
-    hash_builder.hash_one(key)
-}
-
 /// The error every call on a builder whose `add_doc` failed partway
 /// through a document returns.
 fn failed_builder() -> BuildError {
@@ -951,9 +947,10 @@ fn failed_builder() -> BuildError {
 }
 
 /// The error a lane returns for the document that takes its postings
-/// past its threshold. A lane never spills — its reservation is what
-/// bounds it — so the feed drops the lanes and the commit builds from the
-/// buffer, where a column that outgrows the reservation spills.
+/// past its threshold when the connection's budget refuses it more. A
+/// lane never spills — its reservation is what bounds it — so the feed
+/// drops the lanes and the commit builds from the buffer, where a column
+/// that outgrows the reservation spills.
 fn lane_outgrown() -> BuildError {
     BuildError::Io(Error::other(
         "an fts lane outgrew its reservation; the commit builds from the buffer",
@@ -963,25 +960,11 @@ fn lane_outgrown() -> BuildError {
 /// Intern `term` in a column's vocabulary and return its stable
 /// `term_id`.
 ///
-/// This is the hot `add_doc` lookup. Use hashbrown's raw entry
-/// API so miss handling reuses the hash computed for lookup instead
-/// of doing `get(term)` (probe once) followed by `insert(boxed, id)`
-/// (rehash + probe again). Hit behaviour remains one borrowed lookup
-/// with no allocation; misses copy the term bytes into the per-column
-/// `term_arena: bumpalo::Bump` (one bump-pointer advance + memcpy, no
-/// heap allocator round-trip) and store the resulting `&str` slice in
-/// both the map and `id_to_term` (a reference copy, no second heap
-/// alloc — replaces the prior `Box<str>` + `boxed.clone()` pattern
-/// which paid two heap allocations per miss).
-///
-/// The on-hit cost benefit is the more important change at scale:
-/// every intern hit's byte-compare inside `raw_entry_mut` previously
-/// dereferenced an arbitrary `Box<str>` whose backing bytes sat
-/// wherever the global allocator placed it (typically scattered
-/// across cache lines, often L2-cold for vocabularies >~1 KB worth
-/// of total key bytes). Arena-backed keys live densely in a single
-/// contiguous `bumpalo::Bump` so the byte-compare hits L1/L2 the
-/// vast majority of the time, regardless of vocab size.
+/// This is the hot `add_doc` lookup: one probe of the [`TermTable`],
+/// which decides a hit from the slot alone for any term of up to 16
+/// bytes. A miss copies the term bytes into the per-column `term_arena`
+/// (one bump-pointer advance and a copy, no heap allocation) and
+/// records the slice in `id_to_term` under the new id.
 ///
 /// Returns `(term_id, is_new)`. `is_new == true` iff this call minted
 /// a brand-new id (`term_to_id` previously had no entry for `term`).
@@ -992,44 +975,34 @@ fn lane_outgrown() -> BuildError {
 /// which is once per novel term per column — not once per token.
 ///
 /// SAFETY (invariants enforced by callers and the [`Vocab`] struct
-/// layout, see [`TermIdMap`] doc): the `'static` lifetime tag on the
-/// keys is a lie — the real lifetime is that of `arena`. The
-/// transmute below is sound iff (a) `arena` outlives both
-/// `term_to_id` and `id_to_term`, and (b) no key dereference happens
-/// after `arena`'s `Drop` runs. Both hold by construction: `arena`
-/// is declared *after* the map and reverse-vec in [`Vocab`] so it
-/// drops *last*, and the `Drop` impls for `HbHashMap<&'static str,
-/// u32, _>` and `Vec<&'static str>` never dereference their
-/// `&str` keys/entries (no `Drop` to run on a reference).
+/// layout, see [`ArenaStr`]): the `'static` lifetime tag on the
+/// entries of `id_to_term` is a lie — the real lifetime is that of
+/// `arena`. The transmute below is sound iff (a) `arena` outlives
+/// `id_to_term` and the table that reads it, and (b) no entry is
+/// dereferenced after `arena`'s `Drop` runs. Both hold by construction:
+/// `arena` is declared last in [`Vocab`] so it drops last, and dropping
+/// a `Vec<&'static str>` never dereferences its entries.
 #[inline(always)]
 fn intern_term_id(
-    term_to_id: &mut TermIdMap,
-    id_to_term: &mut Vec<&'static str>,
+    term_to_id: &mut TermTable,
+    id_to_term: &mut Vec<ArenaStr>,
     arena: &Bump,
     term: &str,
 ) -> (u32, bool) {
-    let hash = compute_hash(term_to_id.hasher(), term);
-    match term_to_id
-        .raw_entry_mut()
-        .from_hash(hash, |existing| *existing == term)
-    {
-        RawEntryMut::Occupied(entry) => (*entry.get(), false),
-        RawEntryMut::Vacant(entry) => {
-            let id = id_to_term.len() as u32;
-            // Bump-arena copy: one pointer advance + memcpy of the
-            // term bytes, returning a `&str` whose lifetime is tied
-            // to `&arena`'s borrow scope.
-            let arena_str: &str = arena.alloc_str(term);
-            // SAFETY: see function-level doc. The `'static` tag is
-            // a lie; the real lifetime is `arena`'s, which [`Vocab`]
-            // guarantees outlives the map + id_to_term via field
-            // drop order.
-            let static_str: &'static str = unsafe { std::mem::transmute(arena_str) };
-            id_to_term.push(static_str);
-            entry.insert_hashed_nocheck(hash, static_str, id);
-            (id, true)
-        }
+    let (id, is_new) = term_to_id.intern(term.as_bytes(), id_to_term);
+    if is_new {
+        debug_assert_eq!(id as usize, id_to_term.len());
+        // Bump-arena copy: one pointer advance + memcpy of the term
+        // bytes, returning a `&str` whose lifetime is tied to `&arena`'s
+        // borrow scope.
+        let arena_str: &str = arena.alloc_str(term);
+        // SAFETY: see function-level doc. The `'static` tag is a lie;
+        // the real lifetime is `arena`'s, which [`Vocab`] guarantees
+        // outlives `id_to_term` via field drop order.
+        let static_str: ArenaStr = unsafe { transmute(arena_str) };
+        id_to_term.push(static_str);
     }
+    (id, is_new)
 }
 
 /// Min-heap entry for the k-way merge over sorted partition chunks.
@@ -1520,6 +1493,61 @@ pub struct FtsBuilder {
     /// further documents and refuses to finish: a caller that retries on
     /// the same builder gets an error, not a blob with a torn document.
     failed: bool,
+    /// A lane's postings across all its columns, in the accumulator's
+    /// accounting: what a lane holds is checked against its threshold as
+    /// a whole, since its reservation is for the whole lane. `0` outside
+    /// lane mode.
+    lane_bytes: usize,
+    /// Where a lane asks for memory past its threshold, and what it has
+    /// been given (see [`Self::set_lane_budget`]); `None` for every other
+    /// build, and for a lane that gives up at its threshold.
+    lane_growth: Option<LaneGrowth>,
+}
+
+/// A lane's claim on the connection's memory budget past the threshold
+/// its share of the build reserve sets. The claim is taken in doubling
+/// steps as the lane outgrows it, and given back when it is dropped.
+struct LaneGrowth {
+    budget: Arc<ConnectionMemoryBudget>,
+    /// What the lane has been given so far; `None` until it first asks.
+    held: Option<Reservation>,
+}
+
+impl LaneGrowth {
+    /// Bytes given so far.
+    fn size(&self) -> usize {
+        self.held.as_ref().map_or(0, Reservation::size)
+    }
+
+    /// Ask for enough to hold `held` bytes under `threshold`, which counts
+    /// what was given before: the step doubles what was given, and is at
+    /// least half the threshold's own share and at least what `held`
+    /// needs, so a lane growing steadily asks a handful of times. On
+    /// success `threshold` is raised by the step; a refusal leaves both as
+    /// they were.
+    fn grow(&mut self, threshold: &mut usize, held: usize) -> bool {
+        let given = self.size();
+        let share = threshold.saturating_sub(given);
+        let target = held
+            .saturating_sub(share)
+            .max(given.saturating_mul(2))
+            .max(share / 2);
+        let step = target.saturating_sub(given);
+        let granted = match &mut self.held {
+            Some(reservation) => reservation.try_grow(step).is_ok(),
+            None => match self.budget.try_reserve(step) {
+                Ok(reservation) => {
+                    self.held = Some(reservation);
+                    true
+                }
+                Err(_) => false,
+            },
+        };
+        if granted {
+            *threshold = share.saturating_add(target);
+        }
+        granted
+    }
 }
 
 /// One column of a frozen lane: its terms, each id's postings with the
@@ -1570,19 +1598,6 @@ impl FrozenColumn {
         }
         lo
     }
-}
-
-/// `table` reordered so that entry `r` is the old entry `by_lex[r]`; an
-/// empty table (a store without that table) stays empty.
-fn in_lex_order<T: Default>(table: Vec<T>, by_lex: &[u32]) -> Vec<T> {
-    if table.is_empty() {
-        return table;
-    }
-    let mut table = table;
-    by_lex
-        .iter()
-        .map(|&id| mem::take(&mut table[id as usize]))
-        .collect()
 }
 
 /// A run of a lane's documents that are consecutive rows of the commit:
@@ -2018,6 +2033,8 @@ impl FtsBuilder {
             lane_mode: false,
             lane_view: None,
             failed: false,
+            lane_bytes: 0,
+            lane_growth: None,
             doc_pos_chain: Vec::new(),
             pos_scratch: Vec::new(),
             run_scratch: Vec::new(),
@@ -2052,12 +2069,16 @@ impl FtsBuilder {
     /// `add_doc` time, so changes after `register_column` *do*
     /// apply — unlike vector, which snapshots into each
     /// `ColumnState` at registration time.
+    ///
+    /// A lane given a budget ([`Self::set_lane_budget`]) holds what the
+    /// budget has granted it on top of `threshold`.
     pub fn set_spill_threshold_bytes(&mut self, threshold: usize) {
         assert!(
             threshold > 0,
             "FtsBuilder: spill_threshold_bytes must be > 0"
         );
-        self.spill_threshold_bytes = threshold;
+        let granted = self.lane_growth.as_ref().map_or(0, LaneGrowth::size);
+        self.spill_threshold_bytes = threshold.saturating_add(granted);
     }
 
     /// Override the hash-partition count used when a column spills.
@@ -2213,13 +2234,11 @@ impl FtsBuilder {
             "spill_partitions must be a power of 2; got {n_partitions}"
         );
         let mask = n_partitions - 1;
-        let RamStore {
-            postings, pos_runs, ..
-        } = ram;
+        let RamStore { lists, .. } = ram;
         if !positional {
             let mut partitions =
                 Self::open_partitions_for_column(scratch_dir, column_id, n_partitions)?;
-            for (term_id, list) in postings.into_iter().enumerate() {
+            for (term_id, TermLists { postings: list, .. }) in lists.into_iter().enumerate() {
                 let p = term_id & mask;
                 for (doc_id, tf) in list {
                     push_record_batched(&mut partitions[p], [term_id as u32, doc_id, tf])?;
@@ -2230,7 +2249,15 @@ impl FtsBuilder {
         let mut partitions =
             Self::open_partitions_for_column(scratch_dir, column_id, n_partitions)?;
         let mut blobs = Self::open_position_blobs_for_column(scratch_dir, column_id, n_partitions)?;
-        for (term_id, (list, runs)) in postings.into_iter().zip(pos_runs).enumerate() {
+        for (
+            term_id,
+            TermLists {
+                postings: list,
+                runs,
+                ..
+            },
+        ) in lists.into_iter().enumerate()
+        {
             let p = term_id & mask;
             let blob = &mut blobs[p];
             let writer = blob
@@ -2366,8 +2393,7 @@ impl FtsBuilder {
             self.doc_pos_chain.clear();
             let mut sink = match store {
                 PostingStore::Ram(ram) => PositionSink::Runs {
-                    postings: &mut ram.postings,
-                    runs: &mut ram.pos_runs,
+                    lists: &mut ram.lists,
                     bytes: 0,
                 },
                 PostingStore::Spilled(_) => PositionSink::Chain(&mut self.doc_pos_chain),
@@ -2387,9 +2413,8 @@ impl FtsBuilder {
                     debug_assert_eq!(idx, dense_doc_tf.len());
                     dense_doc_tf.push(0);
                     dense_doc_poshead.push(CHAIN_END);
-                    if let PositionSink::Runs { postings, runs, .. } = &mut sink {
-                        postings.push(Vec::new());
-                        runs.push(Vec::new());
+                    if let PositionSink::Runs { lists, .. } = &mut sink {
+                        lists.push(TermLists::default());
                     }
                 }
                 if position > u32::MAX as u64 {
@@ -2411,8 +2436,8 @@ impl FtsBuilder {
                 *slot += 1;
                 let state = unsafe { dense_doc_poshead.get_unchecked_mut(idx) };
                 match &mut sink {
-                    PositionSink::Runs { runs, bytes, .. } => {
-                        let run = unsafe { runs.get_unchecked_mut(idx) };
+                    PositionSink::Runs { lists, bytes } => {
+                        let run = unsafe { &mut lists.get_unchecked_mut(idx).runs };
                         let before = run.len();
                         push_varint(run, if first { position } else { position - *state });
                         *bytes += run.len() - before;
@@ -2507,35 +2532,43 @@ impl FtsBuilder {
         let run_buf = &mut self.run_scratch;
         match store {
             PostingStore::Ram(ram) => {
-                ram.grow_to(id_to_term.len(), positional, lane_mode);
+                ram.grow_to(id_to_term.len());
                 let mut new_bytes: usize = 0;
                 for &term_id in updated_terms.iter() {
                     let idx = term_id as usize;
                     let slot = unsafe { dense_doc_tf.get_unchecked_mut(idx) };
                     let tf = *slot;
                     *slot = 0;
-                    let list = &mut ram.postings[idx];
+                    let lists = &mut ram.lists[idx];
+                    let list = &mut lists.postings;
                     if list.is_empty() {
-                        new_bytes = new_bytes
-                            .saturating_add(ACCUM_NEW_TERM_FIXED_BYTES + id_to_term[idx].len());
+                        new_bytes = new_bytes.saturating_add(
+                            accum_new_term_bytes(positional) + id_to_term[idx].len(),
+                        );
                     }
                     list.push((local_doc_id, tf));
                     new_bytes = new_bytes.saturating_add(ACCUM_POSTING_BYTES);
                     // A positional column's run for this (term, doc) was
                     // written by the scan, gap by gap, as the tokens came.
                     if lane_mode && positional && list.len().is_multiple_of(RUN_END_STRIDE) {
-                        ram.run_ends[idx].push(ram.pos_runs[idx].len() as u32);
+                        lists.run_ends.push(lists.runs.len() as u32);
                     }
                 }
-                ram.bytes = ram
-                    .bytes
-                    .saturating_add(new_bytes)
-                    .saturating_add(run_bytes);
-                if ram.bytes > self.spill_threshold_bytes {
-                    if self.lane_mode {
+                let added = new_bytes.saturating_add(run_bytes);
+                ram.bytes = ram.bytes.saturating_add(added);
+                if lane_mode {
+                    // A lane past its threshold asks the budget for more,
+                    // and gives up only when that is refused.
+                    self.lane_bytes = self.lane_bytes.saturating_add(added);
+                    if self.lane_bytes > self.spill_threshold_bytes
+                        && !self.lane_growth.as_mut().is_some_and(|growth| {
+                            growth.grow(&mut self.spill_threshold_bytes, self.lane_bytes)
+                        })
+                    {
                         self.failed = true;
                         return Err(lane_outgrown());
                     }
+                } else if ram.bytes > self.spill_threshold_bytes {
                     // Crossed the threshold: move the postings to spill
                     // files, keyed by the ids already assigned, and run
                     // the rest of the build in spill mode.
@@ -2648,22 +2681,23 @@ impl FtsBuilder {
         let doc_id = doc_id.get();
         let col_idx = column_id as usize;
         let positional = self.columns[col_idx].positions;
-        let lane_mode = self.lane_mode;
         let ColumnPostings { vocab, store } = &mut self.postings[col_idx];
         let term_id = vocab.intern(term, positional);
         let idx = term_id as usize;
         match store {
             PostingStore::Ram(ram) => {
-                ram.grow_to(vocab.len(), positional, lane_mode);
+                ram.grow_to(vocab.len());
                 let mut new_bytes: usize = 0;
-                let list = &mut ram.postings[idx];
+                let lists = &mut ram.lists[idx];
+                let list = &mut lists.postings;
                 if list.is_empty() {
-                    new_bytes = new_bytes.saturating_add(ACCUM_NEW_TERM_FIXED_BYTES + term.len());
+                    new_bytes =
+                        new_bytes.saturating_add(accum_new_term_bytes(positional) + term.len());
                 }
                 list.push((doc_id, tf));
                 new_bytes = new_bytes.saturating_add(ACCUM_POSTING_BYTES);
                 if positional {
-                    let run = &mut ram.pos_runs[idx];
+                    let run = &mut lists.runs;
                     let before = run.len();
                     encode_run(run, positions);
                     new_bytes = new_bytes.saturating_add(run.len() - before);
@@ -2758,6 +2792,22 @@ impl FtsBuilder {
         self.lane_mode = true;
     }
 
+    /// Let this lane ask `budget` for more when its postings pass its
+    /// threshold, rather than give up there: it gives up only when the
+    /// budget refuses. What it is granted is held until
+    /// [`Self::take_lane_reservation`] or the builder is dropped.
+    pub(crate) fn set_lane_budget(&mut self, budget: Arc<ConnectionMemoryBudget>) {
+        self.lane_growth = Some(LaneGrowth { budget, held: None });
+    }
+
+    /// What the budget has granted this lane past its threshold, handed to
+    /// the caller to hold for as long as the lane's postings live on —
+    /// past [`Self::freeze`], which drops the builder. The lane asks for
+    /// nothing more afterwards.
+    pub(crate) fn take_lane_reservation(&mut self) -> Option<Reservation> {
+        self.lane_growth.take().and_then(|growth| growth.held)
+    }
+
     /// Freeze this lane for the finish: `stretches` are the commit rows
     /// its documents are, covering documents `0..n_docs` in order with the
     /// rows ascending. The vocabulary's map and arena go; the lists stay as
@@ -2826,12 +2876,32 @@ impl FtsBuilder {
                 // The arena outlives every read of `id_to_term` above.
                 drop(id_to_term);
                 drop(term_arena);
+                // Split the per-id lists into the frozen column's tables,
+                // in dictionary order. A positionless column keeps no runs
+                // and so no run ends: those tables stay empty.
+                let mut lists = ram.lists;
+                let mut postings = Vec::with_capacity(by_lex.len());
+                let mut run_ends = Vec::new();
+                let mut pos_runs = Vec::new();
+                if col.positions {
+                    run_ends.reserve(by_lex.len());
+                    pos_runs.reserve(by_lex.len());
+                }
+                for &id in by_lex.iter() {
+                    let l = mem::take(&mut lists[id as usize]);
+                    postings.push(l.postings);
+                    if col.positions {
+                        run_ends.push(l.run_ends);
+                        pos_runs.push(l.runs);
+                    }
+                }
+                drop(lists);
                 FrozenColumn {
                     term_bytes,
                     term_spans,
-                    postings: in_lex_order(ram.postings, &by_lex),
-                    run_ends: in_lex_order(ram.run_ends, &by_lex),
-                    pos_runs: in_lex_order(ram.pos_runs, &by_lex),
+                    postings,
+                    run_ends,
+                    pos_runs,
                     tokens: col.tokens,
                     cut_at: Vec::new(),
                     cuts: Vec::new(),
@@ -3004,6 +3074,8 @@ impl FtsBuilder {
             lane_mode: _,
             lane_view: _,
             failed: _,
+            lane_bytes: _,
+            lane_growth: _,
         } = self;
 
         let n_columns = columns.len() as u32;
@@ -3164,6 +3236,8 @@ impl FtsBuilder {
             lane_mode: _,
             lane_view,
             failed: _,
+            lane_bytes: _,
+            lane_growth: _,
         } = self;
 
         let n_columns = columns.len() as u32;
@@ -3401,11 +3475,12 @@ impl FtsBuilder {
                         // (`id_to_term`) for dictionary emit and the lex-rank
                         // table built from it.
                         //
-                        // Lifetime sanity: `term_to_id` and `id_to_term`
-                        // hold `&'static str` keys/entries that actually
-                        // borrow from `term_arena`. We must keep
+                        // Lifetime sanity: `id_to_term` holds
+                        // `&'static str` entries that actually borrow
+                        // from `term_arena` (`term_to_id` holds only
+                        // inline term prefixes and ids). We must keep
                         // `term_arena` alive until the **last
-                        // dereference** of those keys/entries, which is
+                        // dereference** of those entries, which is
                         // the dictionary emit loop's `id_to_term[term_id]`
                         // index below. End-of-scope `Drop` order does
                         // not matter for soundness — neither `&str` nor
@@ -4132,9 +4207,6 @@ struct TermScratch {
     pos_out: Vec<u8>,
     /// The patched encoders' planning buffers.
     pack: PackScratch,
-    /// One block's run values (first position absolute per doc, then
-    /// gaps) decoded from the accumulator's LEB128 runs for regrouping.
-    pos_vals: Vec<u32>,
 }
 
 /// Merge one spilled column's sorted partition files and emit every
@@ -4526,28 +4598,24 @@ fn emit_ram_column<W: Write>(
         ..
     } = vocab;
     // The forward map is finished with; only the reverse map is read
-    // below. Its keys borrow from `term_arena`, which outlives every
+    // below. Its entries borrow from `term_arena`, which outlives every
     // read of `id_to_term` here (dropped explicitly at the end).
     drop(term_to_id);
-    let RamStore {
-        mut postings,
-        mut pos_runs,
-        ..
-    } = ram;
+    let RamStore { mut lists, .. } = ram;
     let (_, term_id_in_lex_order) = build_lex_rank(&id_to_term);
     let mut n_emitted = 0usize;
     for &term_id in &term_id_in_lex_order {
         let idx = term_id as usize;
-        let pairs = mem::take(&mut postings[idx]);
+        let TermLists {
+            postings: pairs,
+            runs,
+            ..
+        } = mem::take(&mut lists[idx]);
         if pairs.is_empty() {
             // Interned but never given a posting — only a prebuilt feed
             // that failed mid-push could leave this; nothing to write.
             continue;
         }
-        let runs: Vec<u8> = match col_positions {
-            true => mem::take(&mut pos_runs[idx]),
-            false => Vec::new(),
-        };
         let runs = col_positions.then_some(TermRuns::Encoded(runs.as_slice()));
         encode_and_emit_term(
             id_to_term[idx],
@@ -4759,22 +4827,17 @@ fn encode_term(
             Some(runs) => {
                 // The whole term is one position group, inline in the body:
                 // its run values, packed or LEB128, whichever is smaller.
-                let vals = &mut scratch.pos_vals;
                 let out = &mut scratch.pos_out;
-                vals.clear();
                 out.clear();
+                let tfs = &mut scratch.tfs;
+                tfs.clear();
+                tfs.extend(pairs.iter().map(|&(_, tf)| tf));
                 let mut at = 0usize;
-                for (i, &(_, tf)) in pairs.iter().enumerate() {
-                    runs.push_run(i, tf, &mut at, vals);
-                }
+                encode_group_runs(out, tfs, runs, 0, &mut at, true, &mut scratch.pack);
                 debug_assert!(
                     runs.encoded().is_none_or(|bytes| at == bytes.len()),
                     "runs must cover exactly the pairs"
                 );
-                let tfs = &mut scratch.tfs;
-                tfs.clear();
-                tfs.extend(pairs.iter().map(|&(_, tf)| tf));
-                encode_group(out, tfs, vals, true, &mut scratch.pack);
                 Some(out.as_slice())
             }
             None => None,
@@ -4883,17 +4946,20 @@ fn encode_term(
         let pos_out = &mut scratch.pos_out;
         if let Some(runs) = &term_positions {
             let mut at: usize = 0;
-            let vals = &mut scratch.pos_vals;
             for (c, chunk) in pairs.chunks(block_len).enumerate() {
                 pos_block_offsets.push(pos_out.len() as u32);
-                vals.clear();
-                for (k, &(_, tf)) in chunk.iter().enumerate() {
-                    runs.push_run(c * block_len + k, tf, &mut at, vals);
-                }
                 let tfs = &mut scratch.tfs;
                 tfs.clear();
                 tfs.extend(chunk.iter().map(|&(_, tf)| tf));
-                encode_group(pos_out, tfs, vals, false, &mut scratch.pack);
+                encode_group_runs(
+                    pos_out,
+                    tfs,
+                    runs,
+                    c * block_len,
+                    &mut at,
+                    false,
+                    &mut scratch.pack,
+                );
             }
             debug_assert!(
                 runs.encoded().is_none_or(|bytes| at == bytes.len()),
@@ -5349,10 +5415,10 @@ mod tests {
         );
     }
 
-    /// A lane that outgrows its threshold fails the document that crosses
-    /// it rather than spilling, and can then neither take more nor be
-    /// frozen: the feed drops the lanes and the commit builds from the
-    /// buffer.
+    /// A lane with no budget to ask that outgrows its threshold fails the
+    /// document that crosses it rather than spilling, and can then neither
+    /// take more nor be frozen: the feed drops the lanes and the commit
+    /// builds from the buffer.
     #[test]
     fn a_lane_that_outgrows_its_threshold_fails_and_cannot_be_frozen() {
         let mut lane = FtsBuilder::new();
@@ -5374,6 +5440,62 @@ mod tests {
             .is_err(),
             "no frozen lane"
         );
+    }
+
+    /// A lane given a budget asks it for more past its threshold and goes
+    /// on, in a few doubling steps rather than a call per document; it
+    /// fails only once the budget refuses, and every byte it was granted
+    /// goes back when the grant or the builder is dropped.
+    #[test]
+    fn a_lane_with_a_budget_grows_past_its_threshold_until_refused() {
+        const DOCS: u32 = 2_000;
+        let lane_of = |budget: &Arc<ConnectionMemoryBudget>| {
+            let mut lane = FtsBuilder::new();
+            lane.register_column("body".into(), false)
+                .expect("register");
+            lane.set_lane_mode();
+            lane.set_lane_budget(Arc::clone(budget));
+            lane.set_spill_threshold_bytes(1 << 10);
+            lane
+        };
+
+        let measured = ConnectionMemoryBudget::measured();
+        let mut lane = lane_of(&measured);
+        for d in 0..DOCS {
+            lane.add_doc(0, d, &format!("t{d} u{d} shared"))
+                .expect("the lane grows");
+        }
+        let granted = lane.take_lane_reservation().expect("granted more");
+        assert!(granted.size() >= lane.lane_bytes - (1 << 10));
+        assert!(
+            granted.size() < 2 * lane.lane_bytes,
+            "grown in steps that track what the lane holds"
+        );
+        assert_eq!(measured.used_bytes(), granted.size());
+        lane.freeze(vec![Stretch {
+            doc: 0,
+            row: 0,
+            len: DOCS,
+        }])
+        .expect("a grown lane freezes");
+        assert_eq!(
+            measured.used_bytes(),
+            granted.size(),
+            "held past the freeze"
+        );
+        drop(granted);
+        assert_eq!(measured.used_bytes(), 0);
+
+        let limited = ConnectionMemoryBudget::with_limit(64 << 10);
+        let mut lane = lane_of(&limited);
+        let failed_at = (0..DOCS)
+            .find(|&d| lane.add_doc(0, d, &format!("t{d} u{d} shared")).is_err())
+            .expect("the budget refuses before the lane holds every document");
+        assert!(failed_at > 0, "granted something before the refusal");
+        assert!(limited.used_bytes() > 0);
+        assert!(limited.denials() >= 1);
+        drop(lane);
+        assert_eq!(limited.used_bytes(), 0, "a dropped lane holds nothing");
     }
 
     #[test]
@@ -5642,6 +5764,80 @@ mod tests {
             u32::from_le_bytes([blob[20], blob[21], blob[22], blob[23]]),
             0
         );
+    }
+
+    /// Distinct terms the accumulator-estimate test interns per column.
+    const ESTIMATE_TEST_TERMS: u32 = 50_000;
+    /// Distinct terms each of its documents carries.
+    const ESTIMATE_TEST_TERMS_PER_DOC: u32 = 10;
+    /// How far above the estimate the measured heap may run: the estimate
+    /// leaves out the vectors' growth slack, which at most doubles each one
+    /// and gives a one-posting list room for four.
+    const ESTIMATE_TEST_MAX_FACTOR: f64 = 2.5;
+
+    /// The new-term charge is what a term's structures take on a 64-bit
+    /// target: its three-`Vec` [`TermLists`] (72 B), its 24 B table slot with
+    /// the empty slots' share at three-quarters load (32 B), its 16 B
+    /// `id_to_term` entry and its 4 B `dense_doc_tf` entry; and 4 B more
+    /// for a positional column's `dense_doc_poshead` entry. A change to any
+    /// of those structures fails this, as a reminder that it moves where
+    /// every column spills.
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn a_new_term_is_charged_what_its_structures_take() {
+        assert_eq!(size_of::<TermLists>(), 3 * size_of::<Vec<u8>>());
+        assert_eq!(size_of::<TermLists>(), 72);
+        assert_eq!(SLOT_BYTES_PER_TERM, 32);
+        assert_eq!(size_of::<ArenaStr>(), 16);
+        assert_eq!(ACCUM_NEW_TERM_FIXED_BYTES, 72 + 32 + 16 + 4);
+        assert_eq!(accum_new_term_bytes(false), ACCUM_NEW_TERM_FIXED_BYTES);
+        assert_eq!(accum_new_term_bytes(true), ACCUM_NEW_TERM_FIXED_BYTES + 4);
+        assert_eq!(ACCUM_POSTING_BYTES, 8);
+    }
+
+    /// The in-RAM accumulator's estimate of a column that is nearly all
+    /// distinct terms, each in one document, is no more than the heap the
+    /// column's vocabulary and lists really hold, and not far below it.
+    #[test]
+    fn the_accumulator_estimate_tracks_the_heap_of_a_many_terms_column() {
+        for positional in [false, true] {
+            let mut b = FtsBuilder::new();
+            b.register_column("body".into(), positional)
+                .expect("register col");
+            for doc in 0..ESTIMATE_TEST_TERMS / ESTIMATE_TEST_TERMS_PER_DOC {
+                let text: Vec<String> = (0..ESTIMATE_TEST_TERMS_PER_DOC)
+                    .map(|i| format!("term{:07}", doc * ESTIMATE_TEST_TERMS_PER_DOC + i))
+                    .collect();
+                b.add_doc(0, doc, &text.join(" ")).expect("add doc");
+            }
+            let ColumnPostings { vocab, store } = &b.postings[0];
+            let PostingStore::Ram(ram) = store else {
+                panic!("the column must stay in RAM");
+            };
+            assert_eq!(vocab.len(), ESTIMATE_TEST_TERMS as usize);
+            let lists: usize = ram
+                .lists
+                .iter()
+                .map(|l| {
+                    l.postings.capacity() * size_of::<(u32, u32)>()
+                        + l.runs.capacity()
+                        + l.run_ends.capacity() * size_of::<u32>()
+                })
+                .sum();
+            let measured = ram.lists.capacity() * size_of::<TermLists>()
+                + lists
+                + vocab.term_to_id.heap_bytes()
+                + vocab.id_to_term.capacity() * size_of::<ArenaStr>()
+                + (vocab.dense_doc_tf.capacity() + vocab.dense_doc_poshead.capacity())
+                    * size_of::<u32>()
+                + vocab.term_arena.allocated_bytes();
+            let estimate = ram.bytes;
+            assert!(
+                estimate <= measured
+                    && measured as f64 <= ESTIMATE_TEST_MAX_FACTOR * estimate as f64,
+                "positional={positional}: estimate {estimate} B, measured {measured} B"
+            );
+        }
     }
 
     #[test]
