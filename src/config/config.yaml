@@ -123,7 +123,7 @@ storage:
   manifest_disk_budget_bytes: 2147483648
   cold_fetch_mode: lazy_foreground_with_background_fill
   cold_fetch_streams: 8
-  cold_fetch_chunk_bytes: 4194304
+  cold_fetch_chunk_bytes: 33554432
   mmap_cold_threshold_secs: 300
   mmap_sweep_interval_secs: 75
 

@@ -157,7 +157,7 @@ const DEFAULT_COLD_FETCH_STREAMS: usize = 8;
 /// Default range-GET chunk size (32 MiB); peak in-flight bytes is
 /// `streams × chunk` (256 MiB). Large chunks keep a whole-file download to
 /// few GETs: a 1 GB superfile is 32.
-const DEFAULT_COLD_FETCH_CHUNK_BYTES: u64 = 32 * (1 << 20);
+pub(crate) const DEFAULT_COLD_FETCH_CHUNK_BYTES: u64 = 32 * (1 << 20);
 /// Default number of concurrent background full-superfile fills.
 const DEFAULT_PREFETCH_CONCURRENCY: usize = 8;
 /// Default idle age (seconds) before an mmap is `MADV_DONTNEED`-swept.
