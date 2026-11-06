@@ -2436,7 +2436,7 @@ fn cut_ranges<K: AsRef<[u8]>>(marks: &[(K, u64)], want: usize) -> Vec<KeyRange> 
 }
 
 /// Sources of at least this many bytes are merged in key ranges.
-const MERGE_RANGE_MIN_BYTES: u64 = 64 * 1024 * 1024;
+pub(crate) const MERGE_RANGE_MIN_BYTES: u64 = 64 * 1024 * 1024;
 /// Slices per key range from which a merge cuts its ranges at one mark per
 /// slice instead of reading each slice's dictionary.
 const ONE_MARK_SLICES_PER_RANGE: usize = 256;

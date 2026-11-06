@@ -59,7 +59,7 @@ pub(crate) use build::{
 };
 #[cfg(test)]
 pub(crate) use build::{Built, build, first_contribution_difference};
-use build::{BuiltLayer, MERGE_RANGES_MAX, build_layer, merge_layers_into, rebase_run};
+use build::{BuiltLayer, MERGE_RANGE_MIN_BYTES, build_layer, merge_layers_into, rebase_run};
 use bytes::Bytes;
 #[cfg(test)]
 pub(crate) use format::TierRef;
@@ -67,7 +67,7 @@ use format::{Layer, SliceRef};
 pub(crate) use format::{Location, Posting, Root, Run, Slice, legacy_bound_as_key};
 use fs4::{available_space, total_space};
 use futures::{StreamExt, TryStreamExt, stream};
-use rayon::ThreadPool;
+use rayon::{ThreadPool, ThreadPoolBuilder};
 use tempfile::TempDir;
 use thiserror::Error;
 pub(crate) use tier::{BLOCK_ENTRIES, ColumnScoring, TierChunkRef, TierDirectory, TierEntry};
@@ -180,6 +180,9 @@ const FOLD_CURSOR_BYTES: u64 = 2 * 1024 * 1024;
 /// Memory each key range of a fold holds besides its cursors: the slice and
 /// tier it is writing, and a batch of entries being encoded.
 const FOLD_RANGE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Key ranges an optimize fold cuts per merge thread.
+const FOLD_RANGES_PER_THREAD: usize = 4;
 
 /// Memory a fold holds whatever its shape: the key marks it cuts ranges at,
 /// the objects being downloaded, and those uploading beside its merge.
@@ -1056,8 +1059,8 @@ impl OptimizeFold {
     }
 }
 
-/// What one optimize fold may use: bytes of memory, the key ranges the
-/// writer pool can merge at once, and cursors (one per layer it reads and
+/// What one optimize fold may use: bytes of memory, the key ranges it
+/// merges at once (one per thread), and cursors (one per layer it reads and
 /// key range, each an open file and a mapping).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct FoldBudget {
@@ -1068,16 +1071,16 @@ pub(crate) struct FoldBudget {
 
 impl FoldBudget {
     /// The memory the process may still take (the cgroup's room where it
-    /// has a limit) less the reserve compaction keeps, at the pool's width,
+    /// has a limit) less the reserve compaction keeps, over `threads` merge threads,
     /// with a share of the open-file and mapping limits.
-    pub(crate) fn for_host(pool_threads: usize) -> Self {
+    pub(crate) fn for_host(threads: usize) -> Self {
         let available = available_memory_bytes().unwrap_or(FOLD_FALLBACK_MEMORY_BYTES);
         let cursors = cursor_limit().map_or(FOLD_FALLBACK_CURSORS, |limit| {
             limit / FOLD_CURSOR_LIMIT_SHARE
         });
         Self {
             memory_bytes: available.saturating_mul(100 - MERGE_MEMORY_RESERVE_PERCENT) / 100,
-            ranges: pool_threads,
+            ranges: threads,
             cursors,
         }
     }
@@ -1108,13 +1111,13 @@ impl FoldBudget {
             .saturating_add(FOLD_FIXED_BYTES)
     }
 
-    /// The most layers one fold reads, and its key ranges: the pool's
-    /// width, narrowed until [`FOLD_LAYERS_TARGET`] layers fit in memory and
+    /// The most layers one fold reads, and its merge threads: every core,
+    /// narrowed until [`FOLD_LAYERS_TARGET`] layers fit in memory and
     /// cursors, or failing that [`FOLD_FAN_OUT`]. A fold of the fan-out in
     /// one range runs whatever the budget, as small as a commit's fold.
     pub(crate) fn shape(&self) -> (usize, usize) {
         let layers_at = |ranges: usize| self.layers_in_memory(ranges).min(self.cursors / ranges);
-        let widest = self.ranges.clamp(1, MERGE_RANGES_MAX);
+        let widest = self.ranges.max(1);
         let widest_holding = |layers: usize| (1..=widest).rev().find(|&r| layers_at(r) >= layers);
         let ranges = widest_holding(FOLD_LAYERS_TARGET)
             .or_else(|| widest_holding(FOLD_FAN_OUT))
@@ -1543,11 +1546,23 @@ pub(crate) async fn fold_at_optimize(
     if fold.superfiles.is_empty() {
         return Ok(Root::default());
     }
+    let run = &root.layers[fold.run.clone()];
+    // Ranges cut by bytes differ in merge cost; a large fold cuts more ranges
+    // than threads so one slow range does not leave the others idle.
+    let input_bytes: u64 = run.iter().map(layer_bytes).sum();
+    let ranges = fold.ranges * FOLD_RANGES_PER_THREAD;
+    let merge_pool = ThreadPoolBuilder::new()
+        .num_threads(fold.ranges)
+        .thread_name(|i| format!("term-index-fold-{i}"))
+        .build()
+        .map_err(|e| TermIndexError::Build(format!("fold pool: {e}")))?;
     let policy = &BuildPolicy {
+        merge_ranges: (input_bytes >= MERGE_RANGE_MIN_BYTES.saturating_mul(ranges as u64))
+            .then_some(ranges),
         merge_ranges_max: Some(fold.ranges),
+        pool: Some(Arc::new(merge_pool)),
         ..policy.clone()
     };
-    let run = &root.layers[fold.run.clone()];
     // A layer whose every posting survives, renumbered by one shift, is
     // already what merging would make of it, and merging it in rewrites
     // its every byte to save a lookup one slice. Where it holds at least
@@ -9052,7 +9067,7 @@ mod tests {
     }
 
     /// A tight budget narrows the key ranges before it folds fewer than
-    /// the target's layers; a wide one is capped at the merge's widest; few
+    /// the target's layers; a wide one takes every core it is given; few
     /// open files bound the layers as memory does; the fan-out always folds.
     #[test]
     fn fold_budget_narrows_ranges_before_layers() {
@@ -9063,16 +9078,16 @@ mod tests {
         };
         assert_eq!(tight.shape(), (FOLD_LAYERS_TARGET, 4));
         let wide = FoldBudget {
-            memory_bytes: FoldBudget::fold_bytes(1000, MERGE_RANGES_MAX),
+            memory_bytes: FoldBudget::fold_bytes(1000, 88),
             ranges: 88,
             cursors: usize::MAX,
         };
-        assert_eq!(wide.shape(), (1000, MERGE_RANGES_MAX));
+        assert_eq!(wide.shape(), (1000, 88));
         let few_files = FoldBudget {
-            cursors: 64 * MERGE_RANGES_MAX,
+            cursors: 64 * 88,
             ..wide
         };
-        assert_eq!(few_files.shape(), (64, MERGE_RANGES_MAX));
+        assert_eq!(few_files.shape(), (64, 88));
         assert_eq!(
             budget_for(1).shape(),
             (FOLD_FAN_OUT, 1),
