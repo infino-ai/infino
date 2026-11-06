@@ -45,6 +45,7 @@ use std::{
     iter::repeat_n,
     ops::{Range, RangeInclusive},
     path::{Path, PathBuf},
+    pin::pin,
     sync::{
         Arc, Condvar, Mutex,
         atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering},
@@ -60,8 +61,8 @@ pub(crate) use build::{
 #[cfg(test)]
 pub(crate) use build::{Built, build, first_contribution_difference};
 use build::{
-    BuiltLayer, KeyRange, MERGE_RANGE_MIN_BYTES, SpillBudget, TIER_FILE_EXTENSION, build_layer,
-    cut_ranges, merge_ranges_into, rebase_run,
+    BuiltLayer, KeyRange, MERGE_RANGE_MIN_BYTES, MERGE_RANGES_MAX, SpillBudget,
+    TIER_FILE_EXTENSION, build_layer, cut_ranges, merge_ranges_into, rebase_run,
 };
 use bytes::Bytes;
 #[cfg(test)]
@@ -70,14 +71,14 @@ use format::{Layer, SliceRef};
 pub(crate) use format::{Location, Posting, Root, Run, Slice, legacy_bound_as_key};
 use fs4::{available_space, total_space};
 use futures::{StreamExt, TryStreamExt, stream};
-use rayon::{ThreadPool, ThreadPoolBuilder};
+use rayon::{ThreadPool, ThreadPoolBuilder, current_num_threads};
 use tempfile::TempDir;
 use thiserror::Error;
 pub(crate) use tier::{BLOCK_ENTRIES, ColumnScoring, TierChunkRef, TierDirectory, TierEntry};
 use tokio::{
     fs as async_fs,
     io::AsyncWriteExt,
-    select,
+    join, select,
     sync::{
         Notify, Semaphore,
         mpsc::{UnboundedReceiver, unbounded_channel},
@@ -166,6 +167,8 @@ const LAYER_FETCH_CONCURRENCY: usize = 64;
 /// handful of large PUTs in flight; at 128 the wave is shorter by that.
 const SLICE_WRITE_CONCURRENCY: usize = 2 * LAYER_FETCH_CONCURRENCY;
 
+const KIB: u64 = 1024;
+
 /// Bytes an optimize fold holds in objects being fetched, inside the
 /// allowance [`FOLD_FIXED_BYTES`] makes for them.
 const FOLD_FETCH_BYTES: u64 = 1024 * 1024 * 1024;
@@ -175,12 +178,27 @@ const FOLD_FETCHES_MAX: usize = 256;
 /// Key ranges a streamed fold cuts per merge thread at most: more ranges
 /// keep the window small, and each costs a scan of the fold's slices.
 const FOLD_RANGES_MAX_PER_THREAD: usize = 16;
+/// Key ranges per merge thread a fold's window holds the inputs of.
+const WINDOW_RANGES_PER_THREAD: usize = 2;
+/// The share of the free scratch disk a fold's inputs may hold ahead of its
+/// merge, as a divisor; the rest holds its outputs and the copies kept.
+const SCRATCH_WINDOW_DIVISOR: u64 = 2;
+/// The share of the window a fold's spilled outputs get beside it, as a divisor.
+const SPILL_WINDOW_DIVISOR: u64 = 4;
 
 /// The slice bytes a streamed fold may read when `whole` is what fits on
 /// scratch all at once: its downloads hold half the free disk, about two
 /// ranges per thread of the at most [`FOLD_RANGES_MAX_PER_THREAD`].
 pub(crate) fn streamed_fold_bound(whole: u64) -> u64 {
-    whole.saturating_mul(FOLD_RANGES_MAX_PER_THREAD as u64 / 4)
+    whole.saturating_mul(
+        FOLD_RANGES_MAX_PER_THREAD as u64
+            / (WINDOW_RANGES_PER_THREAD as u64 * SCRATCH_WINDOW_DIVISOR),
+    )
+}
+
+/// The window a fold gets on a scratch disk with `free` bytes free.
+pub(crate) fn fold_window_bytes(free: u64) -> u64 {
+    free / SCRATCH_WINDOW_DIVISOR
 }
 
 /// Fan-out of the tiered fold a commit applies to its root's layers (see
@@ -722,8 +740,6 @@ where
     outcome
 }
 
-/// Wait for one task of `running` and surface its result; a task that
-/// panicked is reported as a build error.
 /// [`run_bounded`] by bytes as well: each job names the bytes it holds, and
 /// jobs start while fewer than [`FOLD_FETCHES_MAX`] run and their bytes fit
 /// in [`FOLD_FETCH_BYTES`]. A job larger than that runs alone.
@@ -732,7 +748,6 @@ where
     I: IntoIterator<Item = (u64, F)>,
     F: Future<Output = Result<(), TermIndexError>> + Send + 'static,
 {
-    const KIB: u64 = 1024;
     let total = (FOLD_FETCH_BYTES / KIB) as u32;
     let room = Arc::new(Semaphore::new(total as usize));
     let mut running: JoinSet<Result<(), TermIndexError>> = JoinSet::new();
@@ -767,6 +782,8 @@ where
     outcome
 }
 
+/// Wait for one task of `running` and surface its result; a task that
+/// panicked is reported as a build error.
 async fn join_one(
     running: &mut JoinSet<Result<(), TermIndexError>>,
     what: &'static str,
@@ -1586,8 +1603,8 @@ pub(crate) struct FoldIo {
     /// most any fold of the call has measured; the planner sizes the next
     /// fold's disk use by it.
     pub(crate) disk_per_slice_milli: Option<Arc<AtomicU64>>,
-    /// Told once this fold's inputs are on local disk, so the next fold's
-    /// prefetch starts when this one stops downloading.
+    /// Told once this fold's downloads end, so the next fold's prefetch
+    /// starts then.
     pub(crate) downloaded: Option<Arc<Notify>>,
     /// Scratch bytes the fold's inputs may hold ahead of its merge; a
     /// quarter as much again goes to outputs waiting to upload. Unbounded
@@ -1727,14 +1744,23 @@ async fn fold_layers(
     let threads = policy
         .pool
         .as_deref()
-        .map_or_else(rayon::current_num_threads, ThreadPool::current_num_threads);
+        .map_or_else(current_num_threads, ThreadPool::current_num_threads);
     let window_bytes = io.window_bytes.unwrap_or(u64::MAX);
+    // Without a pool every range's `before` runs before any merges, which a
+    // bounded window never admits.
+    debug_assert!(
+        io.window_bytes.is_none() || policy.pool.is_some(),
+        "a bounded fold window needs a merge pool"
+    );
     let ranges = cut_from_refs(&sources, &objects, policy, threads, window_bytes);
     let spans = slice_spans(&sources, &ranges);
     let (fetches, waiting) = fetch_order(&spans, &objects, ranges.len());
     let readers = ScratchReaders::new(&spans, &objects, ranges.len());
     drop(spans);
-    let fetched_bytes: u64 = objects.values().map(FoldObject::fetched_bytes).sum();
+    let local_bytes: u64 = objects
+        .values()
+        .map(|object| object.slice_len + object.tier_len)
+        .sum();
     drop(objects);
     let window = Arc::new(Window::new(waiting, window_bytes));
     let download = {
@@ -1754,13 +1780,15 @@ async fn fold_layers(
         let (window, downloaded) = (Arc::clone(&window), io.downloaded.clone());
         async move {
             let fetched = run_bytes_bounded("fold fetch", jobs).await;
-            if let Err(e) = &fetched {
-                window.fail(e.to_string());
-            }
+            // Whether this failure stopped the merge, or the merge stopped first.
+            let caused = match &fetched {
+                Err(e) => window.fail(e.to_string()),
+                Ok(()) => false,
+            };
             if let Some(downloaded) = downloaded {
                 downloaded.notify_one();
             }
-            fetched
+            (fetched, caused)
         }
         .instrument(detail_span!("fold.download"))
     };
@@ -1770,7 +1798,7 @@ async fn fold_layers(
     let policy = BuildPolicy {
         spill_budget: io
             .window_bytes
-            .map(|bytes| SpillBudget::new((bytes / 4).max(1))),
+            .map(|bytes| SpillBudget::new((bytes / SPILL_WINDOW_DIVISOR).max(1))),
         ..policy.clone()
     };
     // Each slice and tier object uploads as the merge cuts it; the root that
@@ -1815,13 +1843,12 @@ async fn fold_layers(
         })
         .instrument(detail_span!("fold.merge"))
     };
-    let (fetched, merged) = tokio::join!(download, merge);
+    let ((fetched, fetch_failed_first), merged) = join!(download, merge);
     if let Some(measured) = &io.disk_per_slice_milli {
         let slice_bytes = kept
             .iter()
             .map(layer_bytes)
             .fold(0u64, |sum, size| sum.saturating_add(size));
-        let local_bytes = fetched_bytes;
         if let Some(per_slice) = local_bytes
             .saturating_mul(THOUSANDTHS)
             .checked_div(slice_bytes)
@@ -1833,9 +1860,16 @@ async fn fold_layers(
     let uploaded = uploads.instrument(detail_span!("fold.upload_tail")).await;
     // An upload that failed first is the cause; the merge saw only a closed sink.
     uploaded.map_err(|e| TermIndexError::Build(format!("term-index upload: {e}")))??;
-    // A failed fetch is the cause of a merge that stopped waiting for it.
-    fetched?;
-    let merged = merged.map_err(|e| TermIndexError::Build(e.to_string()))??;
+    // A failed fetch is the cause of a merge that stopped waiting for it;
+    // otherwise the merge's own error is, and the fetches it cut short are not.
+    let merged = match (fetched, fetch_failed_first) {
+        (Err(e), true) => return Err(e),
+        (fetched, _) => {
+            let merged = merged.map_err(|e| TermIndexError::Build(e.to_string()))??;
+            fetched?;
+            merged
+        }
+    };
     debug_assert!(merged.tiers.is_empty() && merged.slices.is_empty());
     // An output byte for byte equal to an input is the same object, and
     // when this fold keeps its uploads the copy kept is its output now.
@@ -2210,7 +2244,6 @@ fn layer_level(layer: &Layer) -> f64 {
     (layer_bytes(layer).max(1) as f64).log(FOLD_FAN_OUT as f64)
 }
 
-#[cfg(test)]
 /// Download every slice of `layers` into `dir`, verified against its
 /// hash, [`LAYER_FETCH_CONCURRENCY`] at a time, and return each layer's
 /// slice files in key order. A slice two layers share is fetched once.
@@ -2218,6 +2251,7 @@ fn layer_level(layer: &Layer) -> f64 {
 /// so a merge finds it beside the slice. The bytes skip the manifest
 /// disk cache: a merge reads each object once, and filling the cache with
 /// the whole index would evict what queries use.
+#[cfg(test)]
 pub(crate) async fn download_layers(
     storage: &Arc<dyn StorageProvider>,
     layers: &[Layer],
@@ -2249,7 +2283,7 @@ pub(crate) async fn download_layers(
 }
 
 /// Where a fold finds one slice and its tier object, and their lengths.
-pub(crate) struct FoldObject {
+struct FoldObject {
     slice: ContentHash,
     slice_len: u64,
     tier: Option<ContentHash>,
@@ -2344,18 +2378,28 @@ fn cut_from_refs(
         .collect();
     let total: u64 = marks.iter().map(|(_, weight)| weight).sum();
     let threads = threads.max(1);
-    // Two ranges per thread in the window, so a small window still keeps
-    // every thread merging.
-    let per_range = (window / (2 * threads as u64)).max(1);
-    let to_fit = total.div_ceil(per_range).min(usize::MAX as u64) as usize;
+    // Without a window a fold holds every input at once, so it keeps the
+    // merge's own cap; with one, enough ranges that the window holds
+    // [`WINDOW_RANGES_PER_THREAD`] per thread.
+    let (to_fit, widest) = match window {
+        u64::MAX => (
+            0,
+            policy
+                .merge_ranges_max
+                .map_or(MERGE_RANGES_MAX, |max| max.min(MERGE_RANGES_MAX)),
+        ),
+        _ => {
+            let per_range = (window / (WINDOW_RANGES_PER_THREAD * threads) as u64).max(1);
+            (
+                total.div_ceil(per_range).min(usize::MAX as u64) as usize,
+                FOLD_RANGES_MAX_PER_THREAD * threads,
+            )
+        }
+    };
     let want = match policy.merge_ranges {
-        Some(n) => n
-            .max(1)
-            .max(to_fit.min(FOLD_RANGES_MAX_PER_THREAD * threads)),
+        Some(n) => n.max(1).max(to_fit.min(widest)),
         None if total < MERGE_RANGE_MIN_BYTES => 1,
-        None => threads
-            .max(to_fit)
-            .min(FOLD_RANGES_MAX_PER_THREAD * threads),
+        None => threads.max(to_fit).min(widest.max(1)),
     };
     if want <= 1 {
         return vec![(None, None)];
@@ -2534,8 +2578,7 @@ impl Window {
     /// range not merged reads it, which always goes so that range can start.
     async fn admit(&self, first: usize, len: u64) -> Result<(), TermIndexError> {
         loop {
-            let room = self.room.notified();
-            tokio::pin!(room);
+            let mut room = pin!(self.room.notified());
             room.as_mut().enable();
             {
                 let mut state = self.state.lock().expect("fold window");
@@ -2586,14 +2629,17 @@ impl Window {
         self.room.notify_waiters();
     }
 
-    fn fail(&self, why: String) {
-        self.state
-            .lock()
-            .expect("fold window")
-            .failed
-            .get_or_insert(why);
+    /// Stops every waiter; true when this is the first failure.
+    fn fail(&self, why: String) -> bool {
+        let first = {
+            let mut state = self.state.lock().expect("fold window");
+            let first = state.failed.is_none();
+            state.failed.get_or_insert(why);
+            first
+        };
         self.landed.notify_all();
         self.room.notify_waiters();
+        first
     }
 }
 
@@ -2638,13 +2684,13 @@ async fn fetch_slice_and_tier(
     Ok(())
 }
 
-/// Where `download_layers` puts the slice named by `hash` under `dir`.
+/// Where a fold puts the slice named by `hash` under `dir`.
 fn slice_file_path(dir: &Path, hash: &ContentHash) -> PathBuf {
     dir.join(format!("{}.slice", hash.to_hex()))
 }
 
-/// `layers`' slices as the files `download_layers` places under
-/// `dir`, each with the key range its layer entry records.
+/// `layers`' slices as the files a fold places under `dir`, each with the
+/// key range its layer entry records.
 pub(crate) fn slice_files(dir: &Path, layers: &[Layer]) -> Vec<Vec<SliceFile>> {
     layers
         .iter()
@@ -2665,7 +2711,7 @@ pub(crate) fn slice_files(dir: &Path, layers: &[Layer]) -> Vec<Vec<SliceFile>> {
 
 /// Write freshly built slices into `dir`, each with the key range its
 /// layer entry in `refs` records, so a merge finds them where
-/// [`download_layers`] would have put them.
+/// a fold would have put them.
 #[cfg(test)]
 pub(crate) fn spill_slices(
     dir: &Path,
@@ -2760,7 +2806,7 @@ async fn read_span(
 
 /// Write freshly built tier objects into `dir`, each beside the spilled
 /// slice of `slices` that names it, so a merge finds them where
-/// [`download_layers`] would have put them.
+/// a fold would have put them.
 #[cfg(test)]
 pub(crate) fn spill_tiers(
     dir: &Path,
@@ -9445,6 +9491,7 @@ mod tests {
     /// open files bound the layers as memory does; the fan-out always folds.
     #[test]
     fn fold_budget_narrows_ranges_before_layers() {
+        const CORES: usize = 88;
         let tight = FoldBudget {
             memory_bytes: FoldBudget::fold_bytes(FOLD_LAYERS_TARGET, 4),
             ranges: 32,
@@ -9452,16 +9499,16 @@ mod tests {
         };
         assert_eq!(tight.shape(), (FOLD_LAYERS_TARGET, 4));
         let wide = FoldBudget {
-            memory_bytes: FoldBudget::fold_bytes(1000, 88),
-            ranges: 88,
+            memory_bytes: FoldBudget::fold_bytes(1000, CORES),
+            ranges: CORES,
             cursors: usize::MAX,
         };
-        assert_eq!(wide.shape(), (1000, 88));
+        assert_eq!(wide.shape(), (1000, CORES));
         let few_files = FoldBudget {
-            cursors: 64 * 88,
+            cursors: 64 * CORES,
             ..wide
         };
-        assert_eq!(few_files.shape(), (64, 88));
+        assert_eq!(few_files.shape(), (64, CORES));
         assert_eq!(
             budget_for(1).shape(),
             (FOLD_FAN_OUT, 1),
@@ -11010,6 +11057,11 @@ mod tests {
         window.landed(0..=0);
         window.ready(0).expect("range 0 has its object");
         window.merged(0, 160);
+        assert_eq!(
+            window.state.lock().expect("window").lowest,
+            1,
+            "range 0 merged"
+        );
         tokio::time::timeout(Duration::from_secs(5), later)
             .await
             .expect("range 1 admitted once range 0 merged")
@@ -11273,8 +11325,10 @@ mod tests {
                 let _ = fs::remove_file(store_dir.path().join(tier_uri(tier)));
             }
         }
+        let measured = Arc::new(AtomicU64::new(0));
         let linking_only = FoldIo {
             keep_uploads: false,
+            disk_per_slice_milli: Some(Arc::clone(&measured)),
             ..io.clone()
         };
         let kept: Vec<ContentHash> = first
@@ -11299,5 +11353,91 @@ mod tests {
                 .all(|hash| !slice_file_path(reuse.path(), hash).exists()),
             "a fold that keeps nothing still clears what it consumed"
         );
+        assert!(
+            measured.load(AtomicOrdering::Relaxed) >= THOUSANDTHS,
+            "linked inputs count as local bytes: {}",
+            measured.load(AtomicOrdering::Relaxed)
+        );
+    }
+
+    /// Without a window a fold keeps the merge's cap on key ranges, however
+    /// wide its pool; a window raises it so the ranges fit.
+    #[test]
+    fn a_fold_without_a_window_keeps_the_merge_range_cap() {
+        const SLICES: u64 = 100;
+        let slice_len = (MERGE_RANGE_MIN_BYTES + (1 << 20)) / SLICES;
+        let files: Vec<SliceFile> = (0..SLICES)
+            .map(|i| SliceFile {
+                path: PathBuf::from(format!("{i:03}.slice")),
+                first_key: format!("k{i:03}a").into_bytes(),
+                last_key: format!("k{i:03}z").into_bytes(),
+                base: 0,
+            })
+            .collect();
+        let objects: HashMap<PathBuf, FoldObject> = files
+            .iter()
+            .map(|file| {
+                let object = FoldObject {
+                    slice: ContentHash::of(file.path.to_string_lossy().as_bytes()),
+                    slice_len,
+                    tier: None,
+                    tier_len: 0,
+                    present: false,
+                };
+                (file.path.clone(), object)
+            })
+            .collect();
+        let sources = vec![files];
+        let policy = BuildPolicy::default();
+        let unbounded = cut_from_refs(&sources, &objects, &policy, 64, u64::MAX);
+        assert_eq!(unbounded.len(), MERGE_RANGES_MAX);
+        let windowed = cut_from_refs(&sources, &objects, &policy, 4, slice_len * 2);
+        assert!(
+            windowed.len() > 4,
+            "a small window cuts more ranges: {}",
+            windowed.len()
+        );
+    }
+
+    /// A fold whose window holds nothing still finishes: the lowest range's
+    /// inputs always go, and each merged range lets the next one in.
+    #[test]
+    fn a_fold_through_a_one_byte_window_finishes() {
+        let dir = TempDir::new().expect("tempdir");
+        let built = build(&[range_contribution(&dir, 1)], &range_policy()).expect("build");
+        let store_dir = TempDir::new().expect("store");
+        let local: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(store_dir.path()).expect("local"));
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let reference = rt.block_on(write_built(&local, built)).expect("write");
+        let root = rt
+            .block_on(load_root(local.as_ref(), &reference))
+            .expect("root");
+        let inputs: usize = root.layers.iter().map(|layer| layer.slices.len()).sum();
+        let scratch = TempDir::new().expect("scratch");
+        let policy = BuildPolicy {
+            pool: Some(range_pool()),
+            spill_to_disk: true,
+            scratch_root: Some(scratch.path().to_path_buf()),
+            merge_ranges: Some(2),
+            ..range_policy()
+        };
+        let io = FoldIo {
+            window_bytes: Some(1),
+            ..FoldIo::default()
+        };
+        let ordinals: Vec<Option<u32>> = (0..root.superfiles.len() as u32).map(Some).collect();
+        let folded = rt
+            .block_on(async {
+                tokio::time::timeout(
+                    Duration::from_secs(60),
+                    fold_layers(&local, &root.layers, &ordinals, &policy, &io, None),
+                )
+                .await
+            })
+            .expect("the fold does not stall")
+            .expect("fold");
+        assert!(inputs > 1, "several inputs: {inputs}");
+        assert!(!folded.slices.is_empty());
     }
 }

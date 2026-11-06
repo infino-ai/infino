@@ -93,6 +93,7 @@ use blake3::Hasher as Blake3Hasher;
 use bytes::Bytes;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use datafusion::prelude::Expr;
+use fs4::available_space;
 use futures::{
     future::{BoxFuture, try_join_all},
     stream::{self, FuturesUnordered, StreamExt},
@@ -12539,9 +12540,8 @@ pub(in crate::supertable) async fn stamp_term_index(
     loop {
         // Memory is measured again each pass, as free disk is: a long call
         // sees other work start and stop beside it.
-        let fold_budget = term_index::FoldBudget::for_host(
-            std::thread::available_parallelism().map_or(1, usize::from),
-        );
+        let fold_budget =
+            term_index::FoldBudget::for_host(available_parallelism().map_or(1, usize::from));
         let published = AtomicBool::new(false);
         let kept_batch: Mutex<Option<KeptBatch>> = Mutex::new(None);
         let kept_fold: Mutex<Option<KeptFold>> = Mutex::new(None);
@@ -12684,9 +12684,9 @@ pub(in crate::supertable) async fn stamp_term_index(
                             keep_uploads: keep,
                             disk_per_slice_milli: Some(Arc::clone(disk_per_slice)),
                             downloaded: Some(Arc::clone(&downloaded)),
-                            // Half the free scratch: the rest holds outputs
-                            // waiting to upload and the copies kept of them.
-                            window_bytes: fs4::available_space(reuse_path).ok().map(|free| free / 2),
+                            window_bytes: available_space(reuse_path)
+                                .ok()
+                                .map(term_index::fold_window_bytes),
                         };
                         let renumbers = fold.renumbers();
                         info!(

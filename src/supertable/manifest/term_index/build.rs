@@ -31,7 +31,10 @@ use std::{
     mem,
     ops::Range,
     path::{Path, PathBuf},
-    sync::{Arc, Condvar, Mutex, PoisonError},
+    sync::{
+        Arc, Condvar, Mutex, PoisonError,
+        atomic::{AtomicBool, Ordering as AtomicOrdering},
+    },
     time::Instant,
 };
 
@@ -2416,17 +2419,23 @@ fn run_ranges(
         // its ranges ran, and with thirty appends in flight that was other
         // commits' piece builds — a layer took 7.7 s of wall for 1.8 s of
         // work, and every publish queued behind its ticket waited with it.
-        // The fold at optimize calls this from a reader-pool worker, which
-        // waits by running other queued jobs just as under `install`.
-        // `before` runs here, in key order, so no pool thread waits on it
-        // and the ranges started are always a prefix.
+        // `before` runs on this thread, in key order, so no pool thread
+        // waits on it and the ranges started are always a prefix; a fold
+        // at optimize blocks here while a range's inputs land.
         Some(pool) => {
             let slots: Vec<Mutex<Option<Result<MergedLayer, TermIndexError>>>> =
                 ranges.iter().map(|_| Mutex::new(None)).collect();
             let one = &one;
+            let failed = AtomicBool::new(false);
+            let failed = &failed;
             let mut stopped = None;
             pool.in_place_scope(|scope| {
                 for (at, ((start, end), slot)) in ranges.iter().zip(&slots).enumerate() {
+                    // A failed range ends the merge: no later range starts,
+                    // and the slots report that range's error first.
+                    if failed.load(AtomicOrdering::Acquire) {
+                        break;
+                    }
                     if let Err(e) = before(at) {
                         stopped = Some(e);
                         break;
@@ -2440,6 +2449,9 @@ fn run_ranges(
                         )
                         .entered();
                         let part = one(start.as_deref(), end.as_deref());
+                        if part.is_err() {
+                            failed.store(true, AtomicOrdering::Release);
+                        }
                         *slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(part);
                     });
                 }
@@ -2574,7 +2586,6 @@ pub(crate) const MARKS_PER_RANGE: usize = 2048;
 /// Ranges a merge is cut into at most: each holds a cursor per layer
 /// with a slice's bytes and a few tier windows resident, so the width is
 /// bounded by memory as well as by threads.
-#[cfg(test)]
 pub(crate) const MERGE_RANGES_MAX: usize = 32;
 
 /// Whether `slice` holds a key in `start..end`.
@@ -2838,6 +2849,42 @@ mod contribution_mark_tests {
 
     use super::*;
     use crate::superfile::fts::bm25::Bm25Params;
+
+    /// A range that fails stops the ranges after it from starting, so a
+    /// failed fold does not download and merge the rest of its inputs.
+    #[test]
+    fn run_ranges_starts_no_range_after_one_fails() {
+        let pool = Arc::new(
+            ThreadPoolBuilder::new()
+                .num_threads(2)
+                .build()
+                .expect("pool"),
+        );
+        let policy = BuildPolicy {
+            pool: Some(pool),
+            ..BuildPolicy::default()
+        };
+        let ranges: Vec<KeyRange> = (0..6u8)
+            .map(|i| ((i > 0).then(|| vec![i]), (i < 5).then(|| vec![i + 1])))
+            .collect();
+        let asked = Mutex::new(Vec::new());
+        let before = |at: usize| {
+            if at > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            asked.lock().expect("asked").push(at);
+            Ok(())
+        };
+        let result = run_ranges(&ranges, &policy, &before, |_, _| {
+            Err(TermIndexError::Build("range failed".into()))
+        });
+        assert!(result.is_err());
+        let asked = asked.lock().expect("asked");
+        assert!(
+            asked.len() < ranges.len(),
+            "ranges after the failure still started: {asked:?}"
+        );
+    }
 
     /// `run_ranges` asks `before` for each range in key order before it
     /// starts the range, and an error there stops the ranges after it.
