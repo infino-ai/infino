@@ -2,6 +2,7 @@ name: Review loop
 
 # `/autofix` on a PR runs review -> fix rounds until nothing is left for the fixer, then every check
 # CI runs; it approves when nothing is left for it to fix and those checks pass on the head commit.
+# Its approval does not count toward merging: main's ruleset requires one from the maintainers' team.
 # Started by hand, it can also review without fixing. Only maintainers (write access) can start it,
 # after reading the diff.
 #
@@ -74,6 +75,7 @@ jobs:
       fixer: ${{ steps.req.outputs.fixer }}
       iter: ${{ steps.req.outputs.iter }}
       head: ${{ steps.req.outputs.head }}
+      base: ${{ steps.req.outputs.base }}
     steps:
       - name: Resolve the request
         id: req
@@ -95,7 +97,8 @@ jobs:
           # may start it. Their `/autofix` says they have read the diff and trust its code to run.
           # Anyone else is ignored without a run; a failed lookup counts as no access.
           allowed() {
-            perm=$(gh api "repos/$REPO/collaborators/$1/permission" --jq .permission 2>/dev/null) || return 1
+            # `role_name` names the role; `permission` reports maintain as write.
+            perm=$(gh api "repos/$REPO/collaborators/$1/permission" --jq .role_name 2>/dev/null) || return 1
             case "$perm" in admin|maintain|write) return 0;; *) return 1;; esac
           }
           refuse() { echo "go=false" >> "$GITHUB_OUTPUT"; echo "::notice::$1 has no write access; nothing to do"; exit 0; }
@@ -128,11 +131,15 @@ jobs:
             echo "::notice::the fork does not allow edits by maintainers; reviewing only"
             mode=review
           fi
-          # Checked out from this repository (all of the base branch's history is here, a fork's may
-          # lag); fixes are pushed to the PR's branch wherever it lives.
-          head="refs/pull/$pr/head"
+          # The commit the maintainer read when they asked, checked out by SHA: the run starts later
+          # (and may wait behind another run), and a push in between is code nobody approved. The
+          # loop stops if the PR's head moves during the run. Fetched from this repository, which
+          # has all of the base branch's history; fixes go to the PR's branch wherever it lives.
+          head=$(jq -r .head.sha <<<"$meta")
+          base=$(jq -r .base.ref <<<"$meta")
           {
             echo "go=true"; echo "pr=$pr"; echo "mode=$mode"; echo "iter=$iter"; echo "head=$head"
+            echo "base=$base"
             echo "reviewer=$reviewer"; echo "effort=$effort"; echo "fixer=$fixer"
           } >> "$GITHUB_OUTPUT"
           echo "PR #$pr ($head): $mode, reviewer $reviewer ($effort), fixer $fixer, up to $iter rounds"
@@ -146,6 +153,8 @@ jobs:
       cancel-in-progress: false
     # The rounds rebuild the crate after every fix and the final gates run every check CI runs; a
     # larger runner, when the REVIEW_LOOP_RUNNER variable names one, makes both several times faster.
+    # It must be GitHub-hosted (the first step checks): the PR's code runs here with the model keys
+    # in its environment, and only a hosted runner is a fresh machine thrown away after the job.
     runs-on: ${{ vars.REVIEW_LOOP_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 300
     env:
@@ -155,7 +164,14 @@ jobs:
       RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=lld
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
       CARGO_PROFILE_TEST_DEBUG: line-tables-only
+      HAS_AUTOFIXER_APP: ${{ secrets.AUTOFIXER_APP_ID != '' }}
     steps:
+      - name: Refuse a self-hosted runner
+        if: runner.environment != 'github-hosted'
+        run: |
+          echo "::error::the review loop runs PR code with secrets; it needs a GitHub-hosted runner"
+          exit 1
+
       - name: Check out the loop
         uses: actions/checkout@v4
         with:
@@ -172,6 +188,40 @@ jobs:
           path: pr
           fetch-depth: 0
           persist-credentials: false
+
+      # The bots' installation tokens, minted before any of the PR's code runs, so the Apps' private
+      # keys never reach a step that runs it. A token lasts an hour and is revoked when the job ends.
+      - name: Token for the reviewer bot
+        id: reviewer-token
+        if: needs.request.outputs.mode != 'warm'
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
+        with:
+          app-id: ${{ secrets.REVIEWER_APP_ID }}
+          private-key: ${{ secrets.REVIEWER_APP_PRIVATE_KEY }}
+
+      - name: Token for the autofixer bot
+        id: autofixer-token
+        if: needs.request.outputs.mode != 'warm' && env.HAS_AUTOFIXER_APP == 'true'
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
+        with:
+          app-id: ${{ secrets.AUTOFIXER_APP_ID }}
+          private-key: ${{ secrets.AUTOFIXER_APP_PRIVATE_KEY }}
+
+      # The team's rules as the base branch has them. The PR's own copies are part of the change under
+      # review; the agents never take instructions from them.
+      - name: The base branch's rules
+        if: needs.request.outputs.mode != 'warm'
+        env:
+          BASE: ${{ needs.request.outputs.base }}
+        run: |
+          dir="$RUNNER_TEMP/rules"
+          mkdir -p "$dir"
+          for f in CLAUDE.md CONTRIBUTING.md AGENTS.md; do
+            gh api "repos/$REPO/contents/$f?ref=$BASE" --jq .content 2>/dev/null | base64 -d > "$dir/$f" || true
+            [ -s "$dir/$f" ] || rm -f "$dir/$f"
+          done
+          ls "$dir"
+          echo "REVIEWLOOP_RULES_DIR=$dir" >> "$GITHUB_ENV"
 
       # Every test binary of the crate, as the final test gate builds, overflows the runner's free
       # disk, as it does for CI's test job; free the same space it does.
@@ -200,7 +250,7 @@ jobs:
       # Caches the dependencies' build only (the action drops the crate's own artifacts, which a
       # PR's changes would make stale). Only a warm run saves it, so the loop keeps one entry, built
       # from main; a loop on a PR reads it, and the dependencies that differ (a few at most) rebuild.
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: pr -> target
           # Bumped when what the warm build puts in the cache changes: an exact key match is never
@@ -212,7 +262,7 @@ jobs:
 
       # The final gates run every check CI runs, with the tool versions CI pins: the suite under
       # nextest with coverage floors, and the public API snapshot.
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
         with:
           tool: cargo-nextest@0.9.143,cargo-llvm-cov@0.9.1,cargo-public-api
 
@@ -259,9 +309,9 @@ jobs:
 
       - name: Install Claude Code and Codex
         if: needs.request.outputs.mode != 'warm'
-        run: npm install -g @anthropic-ai/claude-code@2.1.317 @openai/codex@0.166.0
+        run: npm install -g @anthropic-ai/claude-code@2.1.319 @openai/codex@0.166.0
 
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
         if: needs.request.outputs.mode != 'warm'
         with:
           # The cache holds builds only; the loop's few Python packages download in seconds.
@@ -277,10 +327,10 @@ jobs:
           AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
           # The runner is a throwaway machine; Codex's own sandbox needs kernel features it may lack.
           REVIEWLOOP_CODEX_NO_SANDBOX: "1"
-          REVIEWER_APP_ID: ${{ secrets.REVIEWER_APP_ID }}
-          REVIEWER_APP_PRIVATE_KEY: ${{ secrets.REVIEWER_APP_PRIVATE_KEY }}
-          AUTOFIXER_APP_ID: ${{ secrets.AUTOFIXER_APP_ID }}
-          AUTOFIXER_APP_PRIVATE_KEY: ${{ secrets.AUTOFIXER_APP_PRIVATE_KEY }}
+          REVIEWER_APP_TOKEN: ${{ steps.reviewer-token.outputs.token }}
+          REVIEWER_APP_SLUG: ${{ steps.reviewer-token.outputs.app-slug }}
+          AUTOFIXER_APP_TOKEN: ${{ steps.autofixer-token.outputs.token }}
+          AUTOFIXER_APP_SLUG: ${{ steps.autofixer-token.outputs.app-slug }}
           PR: ${{ needs.request.outputs.pr }}
           MODE: ${{ needs.request.outputs.mode }}
           REVIEWER: ${{ needs.request.outputs.reviewer }}
