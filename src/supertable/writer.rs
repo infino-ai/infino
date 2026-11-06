@@ -14154,7 +14154,18 @@ pub(in crate::supertable) async fn put_content_addressed(
     let span = detail_span!("put_content_addressed", len = bytes.len());
     let put = async {
         match (bytes.len() as u64) >= CONTENT_ADDRESSED_MULTIPART_THRESHOLD_BYTES {
-            true => put_superfile_multipart(storage, &uri, bytes).await,
+            true => {
+                // A multipart upload overwrites unconditionally, so skip it when
+                // the hash-named object is already there.
+                if storage
+                    .head(&uri)
+                    .await
+                    .is_ok_and(|meta| meta.size == bytes.len() as u64)
+                {
+                    return Ok(());
+                }
+                put_superfile_multipart(storage, &uri, bytes).await
+            }
             false => put_new_hedged(storage, &uri, bytes).await,
         }
     };
@@ -15213,6 +15224,74 @@ mod tests {
                 .expect("the first attempt lands");
             assert_eq!(storage.puts.load(Ordering::SeqCst), 1, "no hedge was sent");
         }
+    }
+
+    /// Storage that counts multipart uploads.
+    #[derive(Debug)]
+    struct CountingMultipartStorage {
+        inner: LocalFsStorageProvider,
+        multiparts: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl StorageProvider for CountingMultipartStorage {
+        async fn head(&self, uri: &str) -> Result<ObjectMeta, StorageError> {
+            self.inner.head(uri).await
+        }
+        async fn get(&self, uri: &str) -> Result<(Bytes, ObjectMeta), StorageError> {
+            self.inner.get(uri).await
+        }
+        async fn get_range(&self, uri: &str, range: Range<u64>) -> Result<Bytes, StorageError> {
+            self.inner.get_range(uri, range).await
+        }
+        async fn put_atomic(
+            &self,
+            uri: &str,
+            bytes: Bytes,
+        ) -> Result<Option<String>, StorageError> {
+            self.inner.put_atomic(uri, bytes).await
+        }
+        async fn put_overwrite(&self, uri: &str, bytes: Bytes) -> Result<(), StorageError> {
+            self.inner.put_overwrite(uri, bytes).await
+        }
+        async fn put_if_match(
+            &self,
+            uri: &str,
+            bytes: Bytes,
+            expected_etag: Option<&str>,
+        ) -> Result<Option<String>, StorageError> {
+            self.inner.put_if_match(uri, bytes, expected_etag).await
+        }
+        async fn put_multipart(&self, uri: &str) -> Result<Box<dyn MultipartUpload>, StorageError> {
+            self.multiparts.fetch_add(1, Ordering::SeqCst);
+            self.inner.put_multipart(uri).await
+        }
+        async fn delete(&self, uri: &str) -> Result<(), StorageError> {
+            self.inner.delete(uri).await
+        }
+    }
+
+    /// Writing a large content-addressed object that is already stored
+    /// does not upload it again.
+    #[tokio::test]
+    async fn a_stored_large_content_addressed_object_is_not_uploaded_again() {
+        let dir = TempDir::new().expect("tempdir");
+        let storage = CountingMultipartStorage {
+            inner: LocalFsStorageProvider::new(dir.path()).expect("provider"),
+            multiparts: AtomicUsize::new(0),
+        };
+        let bytes = Bytes::from(vec![
+            7u8;
+            CONTENT_ADDRESSED_MULTIPART_THRESHOLD_BYTES as usize
+        ]);
+        let first = put_content_addressed(&storage, |hash| format!("large/{hash}"), bytes.clone())
+            .await
+            .expect("first write");
+        let second = put_content_addressed(&storage, |hash| format!("large/{hash}"), bytes)
+            .await
+            .expect("second write");
+        assert_eq!(first.uri, second.uri);
+        assert_eq!(storage.multiparts.load(Ordering::SeqCst), 1);
     }
 
     #[test]
