@@ -39,7 +39,7 @@ pub(crate) mod tier;
 use std::{
     cmp::Reverse,
     collections::{HashMap, HashSet},
-    fs,
+    fmt, fs,
     future::Future,
     io,
     iter::repeat_n,
@@ -74,6 +74,7 @@ pub(crate) use tier::{BLOCK_ENTRIES, ColumnScoring, TierChunkRef, TierDirectory,
 use tokio::{
     fs as async_fs,
     io::AsyncWriteExt,
+    runtime::Handle,
     select,
     sync::{
         Notify,
@@ -182,7 +183,7 @@ const FOLD_CURSOR_BYTES: u64 = 2 * 1024 * 1024;
 const FOLD_RANGE_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Key ranges an optimize fold cuts per merge thread.
-const FOLD_RANGES_PER_THREAD: usize = 4;
+pub(crate) const FOLD_RANGES_PER_THREAD: usize = 4;
 
 /// Memory a fold holds whatever its shape: the key marks it cuts ranges at,
 /// the objects being downloaded, and those uploading beside its merge.
@@ -518,6 +519,16 @@ pub(crate) fn fold_disk_bound(dir: &Path, measured: &AtomicU64, held: u64) -> Op
     ))
 }
 
+/// Local bytes per slice byte, in thousandths, for a measured `milli`:
+/// [`FOLD_DISK_PER_SLICE_MILLI`] while none is measured (zero), and never
+/// under one local byte per slice byte.
+fn local_per_slice_milli(milli: u64) -> u64 {
+    match milli {
+        0 => FOLD_DISK_PER_SLICE_MILLI,
+        milli => milli.max(THOUSANDTHS),
+    }
+}
+
 /// [`fold_disk_bound`] for `free` of `total` bytes, a measured `milli`
 /// local bytes per slice byte (zero meaning none measured yet) and `held`
 /// bytes a fold reads in place.
@@ -525,10 +536,7 @@ fn disk_bound(free: u64, total: u64, milli: u64, held: u64) -> u64 {
     let room = free
         .saturating_add(held)
         .saturating_sub(total / SCRATCH_FLOOR_DIVISOR);
-    let per_slice = match milli {
-        0 => FOLD_DISK_PER_SLICE_MILLI,
-        milli => milli.max(THOUSANDTHS),
-    };
+    let per_slice = local_per_slice_milli(milli);
     room.saturating_mul(THOUSANDTHS) / per_slice
 }
 
@@ -576,6 +584,7 @@ async fn upload_objects(
     storage: Arc<dyn StorageProvider>,
     mut objects: UnboundedReceiver<(&'static str, ContentHash, BuiltBytes)>,
     reuse: Option<PathBuf>,
+    tier_lens: Arc<Mutex<HashMap<ContentHash, u64>>>,
 ) -> Result<(), TermIndexError> {
     let mut running: JoinSet<Result<(), TermIndexError>> = JoinSet::new();
     let outcome = async {
@@ -595,6 +604,12 @@ async fn upload_objects(
             };
             while running.len() >= 2 * SLICE_WRITE_CONCURRENCY {
                 join_one(&mut running, "object write").await?;
+            }
+            if kind == "tier" {
+                tier_lens
+                    .lock()
+                    .expect("tier lengths")
+                    .insert(hash, built.len() as u64);
             }
             let kept = match (&reuse, &built) {
                 (Some(reuse), BuiltBytes::Spilled { path, .. }) => path
@@ -645,7 +660,12 @@ async fn build_and_write_layer(
     policy: &BuildPolicy,
 ) -> Result<BuiltLayer, TermIndexError> {
     let (sink, objects) = unbounded_channel();
-    let uploads = task::spawn(upload_objects(Arc::clone(storage), objects, None));
+    let uploads = task::spawn(upload_objects(
+        Arc::clone(storage),
+        objects,
+        None,
+        Arc::default(),
+    ));
     let span = detail_span!(
         "term_index.build_layer",
         inputs = contributions.len(),
@@ -1067,6 +1087,9 @@ pub(crate) struct FoldBudget {
     pub(crate) memory_bytes: u64,
     pub(crate) ranges: usize,
     pub(crate) cursors: usize,
+    /// Memory the process may still take, which the page cache can hold a
+    /// downloaded fold's inputs in.
+    pub(crate) cache_bytes: u64,
 }
 
 impl FoldBudget {
@@ -1082,6 +1105,7 @@ impl FoldBudget {
             memory_bytes: available.saturating_mul(100 - MERGE_MEMORY_RESERVE_PERCENT) / 100,
             ranges: threads,
             cursors,
+            cache_bytes: available,
         }
     }
 
@@ -1099,6 +1123,45 @@ impl FoldBudget {
             .memory_bytes
             .saturating_sub(FoldBudget::fold_bytes(0, ranges));
         (room / (ranges as u64 * FOLD_CURSOR_BYTES)) as usize
+    }
+
+    /// Whether a fold of `layers`, cut into `ranges` key ranges and merged on
+    /// `threads` threads, streams its inputs from storage. It does when the
+    /// inputs, at `local_milli` local bytes per slice byte (zero when none is
+    /// measured), outgrow the page cache, its ranges are cut at one mark per
+    /// slice, and memory holds a streamed cursor per layer for each thread.
+    pub(crate) fn streams(
+        &self,
+        layers: &[Layer],
+        threads: usize,
+        ranges: usize,
+        local_milli: u64,
+    ) -> bool {
+        let slices: usize = layers.iter().map(|layer| layer.slices.len()).sum();
+        let per_slice = local_per_slice_milli(local_milli);
+        let local = layers
+            .iter()
+            .map(layer_bytes)
+            .fold(0u64, |sum, size| sum.saturating_add(size))
+            .saturating_mul(per_slice)
+            / THOUSANDTHS;
+        local > self.cache_bytes
+            && build::one_mark_per_slice(
+                slices,
+                layers.len(),
+                ranges,
+                build::ONE_MARK_SLICES_PER_RANGE,
+            )
+            && Self::stream_bytes(layers.len(), threads) <= self.memory_bytes
+    }
+
+    /// Memory a streamed fold of `layers` layers on `threads` threads holds.
+    fn stream_bytes(layers: usize, threads: usize) -> u64 {
+        (layers as u64)
+            .saturating_mul(threads as u64)
+            .saturating_mul(STREAM_CURSOR_BYTES)
+            .saturating_add((threads as u64).saturating_mul(FOLD_RANGE_BYTES))
+            .saturating_add(FOLD_FIXED_BYTES)
     }
 
     /// Memory a fold reading `layers` layers in `ranges` key ranges is
@@ -1526,6 +1589,16 @@ pub(crate) struct FoldIo {
     /// Told once this fold's inputs are on local disk, so the next fold's
     /// prefetch starts when this one stops downloading.
     pub(crate) downloaded: Option<Arc<Notify>>,
+    /// Whether this fold may read its inputs straight from storage instead
+    /// of downloading them first.
+    pub(crate) stream: bool,
+    /// What decides it, over the layers the fold merges once the ones it
+    /// moves whole or drops unread are set aside (see
+    /// [`FoldBudget::streams`]); `None` streams whenever `stream` is set.
+    pub(crate) stream_budget: Option<FoldBudget>,
+    /// Lengths of the tier objects the call's folds stored, by hash, so a
+    /// streamed fold of their outputs need not ask storage.
+    pub(crate) tier_lens: Arc<Mutex<HashMap<ContentHash, u64>>>,
 }
 
 /// `root` with `fold` made: its run merged into one layer on `pool`,
@@ -1646,13 +1719,34 @@ async fn fold_layers(
     }
     let scratch = scratch_dir(policy.scratch_root.as_deref())?;
     let reuse = io.reuse_dir.as_deref();
-    let sources = download_layers(storage, &kept, scratch.path(), reuse)
-        .instrument(detail_span!(
-            "fold.download",
-            layers = kept.len(),
-            dropped = layers.len() - kept.len()
-        ))
-        .await?;
+    let streams = io.stream
+        && io.stream_budget.is_none_or(|budget| {
+            let threads = policy.merge_ranges_max.unwrap_or(1);
+            budget.streams(
+                &kept,
+                threads,
+                policy.merge_ranges.unwrap_or(threads),
+                io.disk_per_slice_milli
+                    .as_ref()
+                    .map_or(0, |milli| milli.load(AtomicOrdering::Relaxed)),
+            )
+        });
+    let sources = match streams {
+        true => {
+            stream_sources(storage, &kept, reuse, &io.tier_lens)
+                .instrument(detail_span!("fold.stream_sources", layers = kept.len()))
+                .await?
+        }
+        false => {
+            download_layers(storage, &kept, scratch.path(), reuse)
+                .instrument(detail_span!(
+                    "fold.download",
+                    layers = kept.len(),
+                    dropped = layers.len() - kept.len()
+                ))
+                .await?
+        }
+    };
     if let Some(downloaded) = &io.downloaded {
         downloaded.notify_one();
     }
@@ -1686,6 +1780,7 @@ async fn fold_layers(
         Arc::clone(storage),
         objects,
         io.reuse_dir.clone().filter(|_| io.keep_uploads),
+        Arc::clone(&io.tier_lens),
     ));
     // The kept layers are merged away, so the copies kept of them can go.
     let consumed: Vec<(ContentHash, PathBuf, PathBuf)> = match reuse {
@@ -2172,6 +2267,199 @@ fn slice_file_path(dir: &Path, hash: &ContentHash) -> PathBuf {
     dir.join(format!("{}.slice", hash.to_hex()))
 }
 
+/// Bytes a merge first reads from a streamed tier object at a time.
+pub(crate) const REMOTE_TIER_WINDOW_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Bytes a streamed tier window grows to while a merge reads the object
+/// front to back, so a hot term's tier is read in large requests.
+pub(crate) const REMOTE_TIER_WINDOW_MAX_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Memory a streamed cursor holds: the slice it reads and the next one
+/// being fetched, and the tier window it reads and the next one.
+const STREAM_CURSOR_BYTES: u64 =
+    2 * build::SLICE_TARGET_BYTES as u64 + 2 * REMOTE_TIER_WINDOW_MAX_BYTES;
+
+/// HEAD requests in flight when a streamed fold sizes its tier objects.
+const TIER_HEAD_CONCURRENCY: usize = 256;
+
+/// A slice a fold streams from storage instead of downloading: the merge
+/// fetches it, and windows of its tier object, as it reaches them. A slice
+/// is checked against its hash; a tier window is not, as the hash covers
+/// only the whole object.
+#[derive(Clone)]
+pub(crate) struct RemoteSlice {
+    storage: Arc<dyn StorageProvider>,
+    runtime: Handle,
+    hash: ContentHash,
+    tier: Option<ContentHash>,
+    pub(crate) len: u64,
+    /// The tier object's length; zero when the slice names none.
+    pub(crate) tier_len: u64,
+}
+
+impl fmt::Debug for RemoteSlice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RemoteSlice")
+            .field("hash", &self.hash)
+            .finish()
+    }
+}
+
+impl RemoteSlice {
+    /// Start fetching the whole slice on the runtime.
+    pub(crate) fn spawn_fetch(&self) -> task::JoinHandle<Result<Bytes, TermIndexError>> {
+        let (storage, hash) = (Arc::clone(&self.storage), self.hash);
+        self.runtime.spawn(async move {
+            fetch_verified(storage.as_ref(), None, &slice_uri(&hash), &hash).await
+        })
+    }
+
+    /// Wait, from a thread outside the runtime, for a fetch
+    /// [`RemoteSlice::spawn_fetch`] started.
+    pub(crate) fn wait(
+        &self,
+        fetch: task::JoinHandle<Result<Bytes, TermIndexError>>,
+    ) -> Result<Bytes, TermIndexError> {
+        self.runtime
+            .block_on(fetch)
+            .map_err(|e| TermIndexError::Build(format!("slice fetch: {e}")))?
+    }
+
+    /// Bytes `range` of the slice.
+    pub(crate) fn slice_range(&self, range: Range<u64>) -> Result<Bytes, TermIndexError> {
+        self.runtime
+            .block_on(self.storage.get_range(&slice_uri(&self.hash), range))
+            .map_err(TermIndexError::Storage)
+    }
+
+    /// Start fetching bytes `range` of the tier object on the runtime.
+    pub(crate) fn spawn_tier_range(
+        &self,
+        range: Range<u64>,
+    ) -> task::JoinHandle<Result<Bytes, TermIndexError>> {
+        let (storage, tier) = (Arc::clone(&self.storage), self.tier);
+        self.runtime.spawn(async move {
+            let tier = tier.ok_or_else(|| {
+                TermIndexError::Build("tier read of a slice that names none".into())
+            })?;
+            storage
+                .get_range(&tier_uri(&tier), range)
+                .await
+                .map_err(TermIndexError::Storage)
+        })
+    }
+}
+
+/// `layers`' slices as a streamed fold reads them: from `reuse` where an
+/// earlier fold of the call kept one, else from storage. Each tier object's
+/// length comes from `tier_lens`, which holds what the call's folds stored;
+/// the rest are asked of storage once, by one listing when there are many.
+async fn stream_sources(
+    storage: &Arc<dyn StorageProvider>,
+    layers: &[Layer],
+    reuse: Option<&Path>,
+    tier_lens: &Mutex<HashMap<ContentHash, u64>>,
+) -> Result<Vec<Vec<SliceFile>>, TermIndexError> {
+    // A slice kept in `reuse` is read there only with its tier object
+    // beside it; a kept slice whose tier is gone is streamed whole.
+    let mut kept: HashMap<ContentHash, PathBuf> = HashMap::new();
+    if let Some(reuse) = reuse {
+        for slice in layers.iter().flat_map(|layer| &layer.slices) {
+            let path = slice_file_path(reuse, &slice.content_hash);
+            let tier_kept = match slice.tier {
+                None => true,
+                Some(_) => async_fs::try_exists(tier_path(reuse, &slice.content_hash))
+                    .await
+                    .unwrap_or(false),
+            };
+            if tier_kept && async_fs::try_exists(&path).await.unwrap_or(false) {
+                kept.insert(slice.content_hash, path);
+            }
+        }
+    }
+    let missing: Vec<ContentHash> = {
+        let known = tier_lens.lock().expect("tier lengths");
+        layers
+            .iter()
+            .flat_map(|layer| &layer.slices)
+            .filter(|slice| !kept.contains_key(&slice.content_hash))
+            .filter_map(|slice| slice.tier)
+            .filter(|tier| !known.contains_key(tier))
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect()
+    };
+    let found: Vec<(ContentHash, u64)> = match missing.len() > CHECK_LIST_MIN_OBJECTS {
+        true => {
+            let listed = list_objects(storage).await?;
+            missing
+                .iter()
+                .map(|tier| {
+                    listed
+                        .get(&tier_uri(tier))
+                        .map(|&len| (*tier, len))
+                        .ok_or_else(|| {
+                            TermIndexError::Build(format!("tier object {} is gone", tier.to_hex()))
+                        })
+                })
+                .collect::<Result<_, _>>()?
+        }
+        false => stream::iter(missing.into_iter().map(|tier| {
+            let storage = Arc::clone(storage);
+            async move {
+                storage
+                    .head(&tier_uri(&tier))
+                    .await
+                    .map(|meta| (tier, meta.size))
+                    .map_err(TermIndexError::Storage)
+            }
+        }))
+        .buffer_unordered(TIER_HEAD_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<_, _>>()?,
+    };
+    let lens = {
+        let mut lens = tier_lens.lock().expect("tier lengths");
+        lens.extend(found);
+        lens.clone()
+    };
+    let runtime = Handle::current();
+    Ok(layers
+        .iter()
+        .map(|layer| {
+            layer
+                .slices
+                .iter()
+                .map(|slice| {
+                    let kept = kept.get(&slice.content_hash).cloned();
+                    SliceFile {
+                        remote: match kept {
+                            Some(_) => None,
+                            None => Some(RemoteSlice {
+                                storage: Arc::clone(storage),
+                                runtime: runtime.clone(),
+                                hash: slice.content_hash,
+                                tier: slice.tier,
+                                len: slice.len,
+                                tier_len: slice
+                                    .tier
+                                    .and_then(|tier| lens.get(&tier).copied())
+                                    .unwrap_or(0),
+                            }),
+                        },
+                        path: kept.unwrap_or_default(),
+                        first_key: slice.first_key.clone(),
+                        last_key: slice.last_key.clone(),
+                        base: layer.base,
+                    }
+                })
+                .collect()
+        })
+        .collect())
+}
+
 /// `layers`' slices as the files `download_layers` places under
 /// `dir`, each with the key range its layer entry records.
 pub(crate) fn slice_files(dir: &Path, layers: &[Layer]) -> Vec<Vec<SliceFile>> {
@@ -2182,6 +2470,7 @@ pub(crate) fn slice_files(dir: &Path, layers: &[Layer]) -> Vec<Vec<SliceFile>> {
                 .slices
                 .iter()
                 .map(|slice| SliceFile {
+                    remote: None,
                     path: slice_file_path(dir, &slice.content_hash),
                     first_key: slice.first_key.clone(),
                     last_key: slice.last_key.clone(),
@@ -2220,6 +2509,7 @@ pub(crate) fn spill_slices(
             let path = dir.join(format!("{}.slice", hash.to_hex()));
             place_built(&path, built)?;
             Ok(SliceFile {
+                remote: None,
                 base: layer.base,
                 path,
                 first_key: first_key.to_vec(),
@@ -4487,6 +4777,7 @@ mod tests {
                     .join(format!("{}.slice", slice.content_hash.to_hex()));
                 fs::write(&path, bytes_of(bytes)).expect("place slice");
                 build::SliceFile {
+                    remote: None,
                     path,
                     first_key: slice.first_key.clone(),
                     last_key: slice.last_key.clone(),
@@ -4494,7 +4785,7 @@ mod tests {
                 }
             })
             .collect();
-        let mut cursor = build::LayerCursor::new(&files, None, None, policy.tier_read_window_bytes);
+        let mut cursor = build::LayerCursor::new(&files, None, None, &policy);
         let (mut seen, mut peak) = (0, 0);
         while cursor.next().expect("next").is_some() {
             seen += 1;
@@ -4521,6 +4812,7 @@ mod tests {
         let path = scratch.path().join("legacy.slice");
         fs::write(&path, &slice).expect("place slice");
         let sources = vec![vec![build::SliceFile {
+            remote: None,
             base: 0,
             path,
             first_key: key.clone(),
@@ -9012,6 +9304,7 @@ mod tests {
         FoldBudget {
             memory_bytes: FoldBudget::fold_bytes(layers, 1),
             ranges: 1,
+            cache_bytes: u64::MAX,
             cursors: usize::MAX,
         }
     }
@@ -9093,12 +9386,14 @@ mod tests {
         let tight = FoldBudget {
             memory_bytes: FoldBudget::fold_bytes(FOLD_LAYERS_TARGET, 4),
             ranges: 32,
+            cache_bytes: u64::MAX,
             cursors: usize::MAX,
         };
         assert_eq!(tight.shape(), (FOLD_LAYERS_TARGET, 4));
         let wide = FoldBudget {
             memory_bytes: FoldBudget::fold_bytes(1000, 88),
             ranges: 88,
+            cache_bytes: u64::MAX,
             cursors: usize::MAX,
         };
         assert_eq!(wide.shape(), (1000, 88));
@@ -10604,6 +10899,146 @@ mod tests {
         assert!(folded.is_ok(), "the same fold succeeds without the fault");
     }
 
+    /// A slice kept in the reuse directory without its tier object, which a
+    /// failed link or an eviction can leave, is streamed whole: the fold
+    /// writes what a downloaded fold writes.
+    #[test]
+    fn a_kept_slice_without_its_tier_is_streamed() {
+        let dir = TempDir::new().expect("tempdir");
+        let policy = range_policy();
+        let built = build(
+            &[range_contribution(&dir, 1), range_contribution(&dir, 2)],
+            &policy,
+        )
+        .expect("build");
+        let store_dir = TempDir::new().expect("store");
+        let local: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(store_dir.path()).expect("local"));
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let reference = rt.block_on(write_built(&local, built)).expect("write");
+        let root = rt
+            .block_on(load_root(local.as_ref(), &reference))
+            .expect("root");
+        let slices: Vec<&SliceRef> = root.layers.iter().flat_map(|layer| &layer.slices).collect();
+        assert!(slices.iter().any(|slice| slice.tier.is_some()));
+        let reuse = TempDir::new().expect("reuse");
+        for slice in &slices {
+            let bytes =
+                fs::read(store_dir.path().join(slice_uri(&slice.content_hash))).expect("slice");
+            fs::write(slice_file_path(reuse.path(), &slice.content_hash), bytes).expect("keep");
+        }
+        let ordinals: Vec<Option<u32>> = (0..root.superfiles.len() as u32).map(Some).collect();
+        let ranged = BuildPolicy {
+            merge_ranges: Some(4),
+            ..policy.clone()
+        };
+        let streamed = FoldIo {
+            stream: true,
+            reuse_dir: Some(reuse.path().to_path_buf()),
+            ..FoldIo::default()
+        };
+        let fold = |io: &FoldIo| {
+            rt.block_on(fold_layers(
+                &local,
+                &root.layers,
+                &ordinals,
+                &ranged,
+                io,
+                None,
+            ))
+            .expect("fold")
+        };
+        assert_eq!(fold(&streamed), fold(&FoldIo::default()));
+    }
+
+    /// A fold that streams its inputs from storage writes the layer a fold
+    /// that downloads them writes. Small windows make a streamed tier read
+    /// span several of them, so the window fetched ahead, the join across
+    /// windows and the doubling all run; two layers of several slices each
+    /// make the key ranges cut at one mark per slice from remote weights.
+    #[test]
+    fn a_streamed_fold_writes_what_a_downloaded_fold_writes() {
+        let dir = TempDir::new().expect("tempdir");
+        let policy = BuildPolicy {
+            one_mark_slices_per_range: 2,
+            remote_tier_window_bytes: 64,
+            remote_tier_window_max_bytes: 256,
+            tier_read_window_bytes: 64,
+            ..range_policy()
+        };
+        let store_dir = TempDir::new().expect("store");
+        let local: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(store_dir.path()).expect("local"));
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let base = build(&[range_contribution(&dir, 1)], &policy).expect("base");
+        let base_root = base.root.clone();
+        rt.block_on(write_built(&local, base)).expect("write base");
+        let delta = build_onto(
+            base_root,
+            &[range_contribution(&dir, 2), range_contribution(&dir, 3)],
+            &policy,
+        )
+        .expect("delta");
+        let reference = rt
+            .block_on(write_built(&local, delta))
+            .expect("write delta");
+        let root = rt
+            .block_on(load_root(local.as_ref(), &reference))
+            .expect("root");
+        assert_eq!(root.layers.len(), 2);
+        assert!(root.layers.iter().all(|layer| layer.slices.len() >= 4));
+        assert!(
+            root.layers
+                .iter()
+                .flat_map(|layer| &layer.slices)
+                .any(|slice| slice.tier.is_some())
+        );
+        let ranged = BuildPolicy {
+            merge_ranges: Some(4),
+            ..policy
+        };
+        let sources = rt
+            .block_on(stream_sources(
+                &local,
+                &root.layers,
+                None,
+                &Mutex::default(),
+            ))
+            .expect("sources");
+        let firsts: HashSet<&[u8]> = root
+            .layers
+            .iter()
+            .flat_map(|layer| &layer.slices)
+            .map(|slice| slice.first_key.as_slice())
+            .collect();
+        let ranges = build::key_ranges(&sources, &ranged).expect("ranges");
+        assert!(ranges.len() > 1);
+        assert!(
+            ranges
+                .iter()
+                .filter_map(|(start, _)| start.as_deref())
+                .all(|key| firsts.contains(key)),
+            "cut at one mark per slice"
+        );
+        let ordinals: Vec<Option<u32>> = (0..root.superfiles.len() as u32).map(Some).collect();
+        let streamed = FoldIo {
+            stream: true,
+            ..FoldIo::default()
+        };
+        let fold = |io: &FoldIo| {
+            rt.block_on(fold_layers(
+                &local,
+                &root.layers,
+                &ordinals,
+                &ranged,
+                io,
+                None,
+            ))
+            .expect("fold")
+        };
+        assert_eq!(fold(&streamed), fold(&FoldIo::default()));
+    }
+
     /// A fold planned with a budget of many key ranges still writes a small
     /// run as one range: the budget caps the width, and the merge's size
     /// floor decides it.
@@ -10621,6 +11056,7 @@ mod tests {
             memory_bytes: FoldBudget::fold_bytes(FOLD_FAN_OUT, 8),
             ranges: 8,
             cursors: usize::MAX,
+            cache_bytes: u64::MAX,
         };
         let fold = plan_fold_at_optimize(&root, &live, u64::MAX, wide, false, false)
             .expect("a fold is due");
@@ -10630,22 +11066,6 @@ mod tests {
             .expect("fold");
         assert_eq!(root.layers.len(), 1);
         assert_eq!(root.layers[0].slices.len(), 1, "a small run is one range");
-    }
-
-    /// One mark per slice is taken only when each layer has about a slice
-    /// per range: layers of one slice each, every one spanning the key
-    /// space, would put every mark at the start.
-    #[test]
-    fn one_mark_per_slice_needs_slices_spread_over_each_layer() {
-        assert!(build::one_mark_per_slice(1200, 4, 4, 64));
-        assert!(
-            !build::one_mark_per_slice(300, 128, 4, 64),
-            "enough slices per range, but layers of about two slices for four ranges"
-        );
-        assert!(
-            !build::one_mark_per_slice(200, 2, 4, 64),
-            "layers spread, but too few slices per range"
-        );
     }
 
     /// A failed put ends the upload while the merge still holds its sink
@@ -10670,7 +11090,7 @@ mod tests {
             .expect("send");
             let uploaded = tokio::time::timeout(
                 Duration::from_secs(30),
-                upload_objects(faulty, objects, None),
+                upload_objects(faulty, objects, None, Arc::default()),
             )
             .await;
             assert!(
@@ -10685,6 +11105,81 @@ mod tests {
             );
         });
         assert_eq!(faults.fired(), 1);
+    }
+
+    /// One mark per slice is taken only when each layer has about a slice
+    /// per range: layers of one slice each, every one spanning the key
+    /// space, would put every mark at the start.
+    #[test]
+    fn one_mark_per_slice_needs_slices_spread_over_each_layer() {
+        assert!(build::one_mark_per_slice(1200, 4, 4, 64));
+        assert!(
+            !build::one_mark_per_slice(300, 128, 4, 64),
+            "enough slices per range, but layers of about two slices for four ranges"
+        );
+        assert!(
+            !build::one_mark_per_slice(200, 2, 4, 64),
+            "layers spread, but too few slices per range"
+        );
+    }
+
+    /// A fold streams only when its inputs are more than the page cache
+    /// holds, it has enough slices to cut at one mark each, and memory holds
+    /// the streamed cursors of the ranges its threads merge at once.
+    #[test]
+    fn a_fold_streams_only_what_the_page_cache_cannot_hold() {
+        let layers: Vec<Layer> = (0..4)
+            .map(|i| Layer {
+                slices: (0..300)
+                    .map(|j| SliceRef {
+                        first_key: Vec::new(),
+                        last_key: Vec::new(),
+                        content_hash: ContentHash::of(format!("{i}/{j}").as_bytes()),
+                        tier: None,
+                        len: 1 << 20,
+                    })
+                    .collect(),
+                ordinals: None,
+                base: 0,
+            })
+            .collect();
+        let local = 1200u64 << 20; // 1,200 slices of 1 MiB, one local byte per slice byte
+        let budget = |cache_bytes: u64| FoldBudget {
+            memory_bytes: 64 << 30,
+            ranges: 4,
+            cursors: usize::MAX,
+            cache_bytes,
+        };
+        assert!(budget(local - 1).streams(&layers, 4, 4, THOUSANDTHS));
+        assert!(
+            !budget(local).streams(&layers, 4, 4, THOUSANDTHS),
+            "the cache holds it"
+        );
+        let few = Layer {
+            slices: layers[0].slices[..100].to_vec(),
+            ..layers[0].clone()
+        };
+        assert!(
+            !budget(0).streams(&[few], 4, 4, THOUSANDTHS),
+            "too few slices to cut"
+        );
+        let small_memory = FoldBudget {
+            memory_bytes: 1 << 30,
+            ..budget(0)
+        };
+        assert!(
+            !small_memory.streams(&layers, 4, 4, THOUSANDTHS),
+            "no memory for its cursors"
+        );
+        let four_threads = FoldBudget {
+            memory_bytes: FoldBudget::stream_bytes(layers.len(), 4),
+            ..budget(0)
+        };
+        assert!(
+            four_threads.streams(&layers, 4, 16, THOUSANDTHS),
+            "cursors are counted per thread, not per key range"
+        );
+        assert!(!four_threads.streams(&layers, 5, 16, THOUSANDTHS));
     }
 
     /// Objects a fold reads in place count as room, so a run prefetched onto

@@ -199,9 +199,22 @@ fn fold_timing() {
         scratch_root: Some(scratch.join(OUT_DIR)),
         ..manifest.options.term_index_build_policy()
     };
-    // FOLD_STREAM=1 times the fold optimize runs (download, merge, upload
-    // into the table's own storage) instead of the local merge below.
+    let pool_threads = policy
+        .pool
+        .as_deref()
+        .map_or(rayon::current_num_threads(), |p| p.current_num_threads());
+    // FOLD_STREAM=1 times the fold optimize runs (download or stream, merge,
+    // upload into the table's own storage) instead of the local merge below.
     if env::var("FOLD_STREAM").is_ok() {
+        let policy = BuildPolicy {
+            merge_ranges_max: Some(pool_threads),
+            ..policy
+        };
+        let io = super::FoldIo {
+            stream: true,
+            stream_budget: Some(super::FoldBudget::for_host(pool_threads)),
+            ..super::FoldIo::default()
+        };
         let t = Instant::now();
         let layer = st
             .block_on_query(super::fold_layers(
@@ -209,7 +222,7 @@ fn fold_timing() {
                 &root.layers,
                 &ordinals,
                 &policy,
-                &super::FoldIo::default(),
+                &io,
                 None,
             ))
             .expect("fold");
@@ -253,10 +266,6 @@ fn fold_timing() {
         })
         .sum();
 
-    let pool_threads = policy
-        .pool
-        .as_deref()
-        .map_or(rayon::current_num_threads(), |p| p.current_num_threads());
     eprintln!(
         "FOLD inputs local_bytes={:.1}MiB ordinals={} dropped={dropped} pool_threads={pool_threads} ranges={n_ranges:?} avail_mem={:.1}GiB",
         mib(local_bytes),
