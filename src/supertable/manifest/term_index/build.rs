@@ -2242,6 +2242,7 @@ pub(crate) type ObjectSink = UnboundedSender<(&'static str, ContentHash, BuiltBy
 /// [`merge_layers`], handing each slice and tier object to `sink` as its
 /// range writes it; the merged layer then holds none. A closed sink drops
 /// them, and the uploader that closed it reports why.
+#[cfg(test)]
 pub(crate) fn merge_layers_into(
     sources: &[Vec<SliceFile>],
     ordinals: &[Option<u32>],
@@ -2249,8 +2250,27 @@ pub(crate) fn merge_layers_into(
     sink: Option<&ObjectSink>,
 ) -> Result<MergedLayer, TermIndexError> {
     let ranges = detail_span!("fold.key_ranges").in_scope(|| key_ranges(sources, policy))?;
+    merge_ranges_into(sources, &ranges, ordinals, policy, sink, &|_| Ok(()))
+}
+
+/// [`merge_layers_into`] over key ranges already cut, calling `ready` with
+/// a range's index before the range reads its slices; an error from
+/// `ready` fails that range.
+pub(crate) fn merge_ranges_into(
+    sources: &[Vec<SliceFile>],
+    ranges: &[KeyRange],
+    ordinals: &[Option<u32>],
+    policy: &BuildPolicy,
+    sink: Option<&ObjectSink>,
+    ready: &(dyn Fn(usize) -> Result<(), TermIndexError> + Sync),
+) -> Result<MergedLayer, TermIndexError> {
     // Each range merges the slices that reach into it, on its own writer.
-    let mut merged = run_ranges(&ranges, policy, |start, end| {
+    let mut merged = run_ranges(ranges, policy, |start, end| {
+        let at = ranges
+            .iter()
+            .position(|(s, _)| s.as_deref() == start)
+            .expect("a range of the cut");
+        ready(at)?;
         let in_range: Vec<Vec<SliceFile>> = sources
             .iter()
             .map(|files| {
@@ -2281,7 +2301,7 @@ fn ordinals_span(ordinals: &[Option<u32>]) -> Range<u32> {
 }
 
 /// A key range: from its start, when set, short of its end, when set.
-type KeyRange = (Option<Vec<u8>>, Option<Vec<u8>>);
+pub(crate) type KeyRange = (Option<Vec<u8>>, Option<Vec<u8>>);
 
 /// Run `one` on each of `ranges` on the policy's pool, or the one range in
 /// place, and join their outputs: they follow each other in key order,
@@ -2454,7 +2474,7 @@ pub(crate) const MARKS_PER_RANGE: usize = 2048;
 pub(crate) const MERGE_RANGES_MAX: usize = 32;
 
 /// Whether `slice` holds a key in `start..end`.
-fn slice_reaches(slice: &SliceFile, start: Option<&[u8]>, end: Option<&[u8]>) -> bool {
+pub(crate) fn slice_reaches(slice: &SliceFile, start: Option<&[u8]>, end: Option<&[u8]>) -> bool {
     start.is_none_or(|s| slice.last_key.as_slice() >= s)
         && end.is_none_or(|e| slice.first_key.as_slice() < e)
 }
@@ -2468,9 +2488,22 @@ fn slice_reaches(slice: &SliceFile, start: Option<&[u8]>, end: Option<&[u8]>) ->
 /// block's first key. Cutting by slice count instead left the common
 /// terms' ranges — a few thousand terms carrying most of the tier bytes —
 /// in a handful of ranges that took the whole merge's wall time.
+#[cfg(test)]
 pub(crate) fn key_ranges(
     sources: &[Vec<SliceFile>],
     policy: &BuildPolicy,
+) -> Result<Vec<KeyRange>, TermIndexError> {
+    key_ranges_with(sources, policy, &|file| {
+        fs::metadata(file.path.with_extension(TIER_FILE_EXTENSION)).map_or(0, |m| m.len())
+    })
+}
+
+/// [`key_ranges`] with each slice's tier object length from `tier_len`, so
+/// the cut needs only the slices on disk.
+pub(crate) fn key_ranges_with(
+    sources: &[Vec<SliceFile>],
+    policy: &BuildPolicy,
+    tier_len: &(dyn Fn(&SliceFile) -> u64 + Sync),
 ) -> Result<Vec<KeyRange>, TermIndexError> {
     let files: Vec<&SliceFile> = sources.iter().flatten().collect();
     let want = range_count(policy, MERGE_RANGE_MIN_BYTES, MERGE_RANGES_MAX, || {
@@ -2498,10 +2531,7 @@ pub(crate) fn key_ranges(
     if per_slice == 1 || files.len() >= want * ONE_MARK_SLICES_PER_RANGE {
         let mut marks = Vec::with_capacity(files.len());
         for file in &files {
-            let weight = fs::metadata(&file.path)?.len()
-                + fs::metadata(file.path.with_extension(TIER_FILE_EXTENSION))
-                    .map(|m| m.len())
-                    .unwrap_or(0);
+            let weight = fs::metadata(&file.path)?.len() + tier_len(file);
             marks.push((file.first_key.clone(), weight));
         }
         marks.sort_by(|a, b| a.0.cmp(&b.0));
@@ -2516,9 +2546,7 @@ pub(crate) fn key_ranges(
         handle.read_exact_at(&mut bytes, 0)?;
         let dictionary = SliceDictionary::open(&bytes)?;
         let starts = dictionary.block_starts()?;
-        let tier_len = fs::metadata(file.path.with_extension(TIER_FILE_EXTENSION))
-            .map(|m| m.len())
-            .unwrap_or(0);
+        let tier_len = tier_len(file);
         let group = starts.len().div_ceil(per_slice).max(1);
         // The tier offset where the group starting at block `from` begins.
         let tier_at = |from: usize| -> Result<Option<u64>, TermIndexError> {

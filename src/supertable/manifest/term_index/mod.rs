@@ -43,10 +43,10 @@ use std::{
     future::Future,
     io,
     iter::repeat_n,
-    ops::Range,
+    ops::{Range, RangeInclusive},
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
         atomic::{AtomicU64, Ordering as AtomicOrdering},
     },
 };
@@ -59,7 +59,7 @@ pub(crate) use build::{
 };
 #[cfg(test)]
 pub(crate) use build::{Built, build, first_contribution_difference};
-use build::{BuiltLayer, MERGE_RANGE_MIN_BYTES, build_layer, merge_layers_into, rebase_run};
+use build::{BuiltLayer, KeyRange, MERGE_RANGE_MIN_BYTES, build_layer, key_ranges_with, merge_ranges_into, rebase_run, slice_reaches};
 use bytes::Bytes;
 #[cfg(test)]
 pub(crate) use format::TierRef;
@@ -76,7 +76,7 @@ use tokio::{
     io::AsyncWriteExt,
     select,
     sync::{
-        Notify,
+        Notify, Semaphore,
         mpsc::{UnboundedReceiver, unbounded_channel},
     },
     task,
@@ -162,6 +162,13 @@ const LAYER_FETCH_CONCURRENCY: usize = 64;
 /// of 10 GB in 1,088 objects spent its last second and a half with a
 /// handful of large PUTs in flight; at 128 the wave is shorter by that.
 const SLICE_WRITE_CONCURRENCY: usize = 2 * LAYER_FETCH_CONCURRENCY;
+
+/// Bytes an optimize fold holds in objects being fetched, inside the
+/// allowance [`FOLD_FIXED_BYTES`] makes for them.
+const FOLD_FETCH_BYTES: u64 = 1024 * 1024 * 1024;
+/// Fetches an optimize fold runs at once: reads of a few megabytes are
+/// bound by latency, so many in flight keep the link full.
+const FOLD_FETCHES_MAX: usize = 256;
 
 /// Fan-out of the tiered fold a commit applies to its root's layers (see
 /// [`fold_tail`]). A lookup opens one slice per layer, so a root that only
@@ -704,6 +711,49 @@ where
 
 /// Wait for one task of `running` and surface its result; a task that
 /// panicked is reported as a build error.
+/// [`run_bounded`] by bytes as well: each job names the bytes it holds, and
+/// jobs start while fewer than [`FOLD_FETCHES_MAX`] run and their bytes fit
+/// in [`FOLD_FETCH_BYTES`]. A job larger than that runs alone.
+async fn run_bytes_bounded<I, F>(what: &'static str, jobs: I) -> Result<(), TermIndexError>
+where
+    I: IntoIterator<Item = (u64, F)>,
+    F: Future<Output = Result<(), TermIndexError>> + Send + 'static,
+{
+    const KIB: u64 = 1024;
+    let total = (FOLD_FETCH_BYTES / KIB) as u32;
+    let room = Arc::new(Semaphore::new(total as usize));
+    let mut running: JoinSet<Result<(), TermIndexError>> = JoinSet::new();
+    let outcome = async {
+        for (bytes, job) in jobs {
+            while running.len() >= FOLD_FETCHES_MAX {
+                join_one(&mut running, what).await?;
+            }
+            let want = (bytes.div_ceil(KIB).min(u64::from(total)) as u32).max(1);
+            let held = Arc::clone(&room)
+                .acquire_many_owned(want)
+                .await
+                .map_err(|e| TermIndexError::Build(format!("{what}: {e}")))?;
+            running.spawn(async move {
+                let _held = held;
+                job.await
+            });
+            // A failure surfaces without waiting for the rest of the queue.
+            while let Some(done) = running.try_join_next() {
+                done.map_err(|e| TermIndexError::Build(format!("{what}: {e}")))??;
+            }
+        }
+        while !running.is_empty() {
+            join_one(&mut running, what).await?;
+        }
+        Ok(())
+    }
+    .await;
+    if outcome.is_err() {
+        running.shutdown().await;
+    }
+    outcome
+}
+
 async fn join_one(
     running: &mut JoinSet<Result<(), TermIndexError>>,
     what: &'static str,
@@ -1644,39 +1694,63 @@ async fn fold_layers(
             base: 0,
         });
     }
-    let scratch = scratch_dir(policy.scratch_root.as_deref())?;
+    let scratch = Arc::new(scratch_dir(policy.scratch_root.as_deref())?);
     let reuse = io.reuse_dir.as_deref();
-    let sources = download_layers(storage, &kept, scratch.path(), reuse)
+    let sources = slice_files(scratch.path(), &kept);
+    // Slices first, then the tier objects (most of the bytes) in key order,
+    // each range merging as soon as the tiers it reads have landed.
+    let tiers = download_slices(storage, &kept, scratch.path(), reuse)
         .instrument(detail_span!(
             "fold.download",
             layers = kept.len(),
             dropped = layers.len() - kept.len()
         ))
         .await?;
-    if let Some(downloaded) = &io.downloaded {
-        downloaded.notify_one();
-    }
-    if let Some(measured) = &io.disk_per_slice_milli {
-        let slice_bytes = kept
-            .iter()
-            .map(layer_bytes)
-            .fold(0u64, |sum, size| sum.saturating_add(size));
-        let local_bytes: u64 = fs::read_dir(scratch.path())
-            .map(|entries| {
-                entries
-                    .flatten()
-                    .filter_map(|entry| entry.metadata().ok())
-                    .map(|meta| meta.len())
-                    .sum()
+    let ranges = {
+        let (sources, policy, tiers) = (sources.clone(), policy.clone(), Arc::clone(&tiers));
+        run_on_pool(pool, "term-index fold ranges", move || {
+            key_ranges_with(&sources, &policy, &|file| {
+                tiers.get(&file.path).map_or(0, |tier| tier.len)
             })
-            .unwrap_or(0);
-        if let Some(per_slice) = local_bytes
-            .saturating_mul(THOUSANDTHS)
-            .checked_div(slice_bytes)
-        {
-            measured.fetch_max(per_slice, AtomicOrdering::Relaxed);
+        })
+        .instrument(detail_span!("fold.key_ranges"))
+        .await
+        .map_err(|e| TermIndexError::Build(e.to_string()))??
+    };
+    let (fetches, arrivals) = tier_fetches(&sources, &ranges, &tiers);
+    let arrivals = Arc::new(arrivals);
+    let download = {
+        let (storage, dir, gate) = (
+            Arc::clone(storage),
+            scratch.path().to_path_buf(),
+            Arc::clone(&arrivals),
+        );
+        let jobs = fetches.into_iter().map(move |fetch| {
+            let (storage, dir, arrivals) = (Arc::clone(&storage), dir.clone(), Arc::clone(&gate));
+            let bytes = fetch.len;
+            let job = async move {
+                let bytes =
+                    fetch_verified(storage.as_ref(), None, &tier_uri(&fetch.tier), &fetch.tier)
+                        .await?;
+                write_object(tier_path(&dir, &fetch.slice), bytes).await?;
+                arrivals.landed(fetch.ranges);
+                Ok(())
+            };
+            (bytes, job)
+        });
+        let (arrivals, downloaded) = (Arc::clone(&arrivals), io.downloaded.clone());
+        async move {
+            let fetched = run_bytes_bounded("tier fetch", jobs).await;
+            if let Err(e) = &fetched {
+                arrivals.fail(e.to_string());
+            }
+            if let Some(downloaded) = downloaded {
+                downloaded.notify_one();
+            }
+            fetched
         }
-    }
+        .instrument(detail_span!("fold.tier_download"))
+    };
     let ordinals = ordinals.to_vec();
     let policy = policy.clone();
     // Each slice and tier object uploads as the merge cuts it; the root that
@@ -1701,24 +1775,51 @@ async fn fold_layers(
             .collect(),
         None => Vec::new(),
     };
-    let merged = run_on_pool(pool, "term-index fold", move || {
-        let merged = merge_layers_into(&sources, &ordinals, &policy, Some(&sink));
-        // The slice files are read; the scratch directory can go with the
-        // task rather than outlive the fold.
-        drop(scratch);
-        merged
-    })
-    .instrument(detail_span!("fold.merge"))
-    .await;
+    let merge = {
+        let (scratch, arrivals) = (Arc::clone(&scratch), Arc::clone(&arrivals));
+        run_on_pool(pool, "term-index fold", move || {
+            let merged =
+                merge_ranges_into(&sources, &ranges, &ordinals, &policy, Some(&sink), &|at| {
+                    arrivals.wait(at)
+                });
+            // A failed merge leaves no reader of the tiers still landing.
+            arrivals.fail("the merge ended".into());
+            drop(scratch);
+            merged
+        })
+        .instrument(detail_span!("fold.merge"))
+    };
+    let (fetched, merged) = tokio::join!(download, merge);
+    if let Some(measured) = &io.disk_per_slice_milli {
+        let slice_bytes = kept
+            .iter()
+            .map(layer_bytes)
+            .fold(0u64, |sum, size| sum.saturating_add(size));
+        let local_bytes: u64 = tiers.values().map(|tier| tier.len).sum::<u64>() + slice_bytes;
+        if let Some(per_slice) = local_bytes
+            .saturating_mul(THOUSANDTHS)
+            .checked_div(slice_bytes)
+        {
+            measured.fetch_max(per_slice, AtomicOrdering::Relaxed);
+        }
+    }
+    drop(scratch);
     let uploaded = uploads.instrument(detail_span!("fold.upload_tail")).await;
     // An upload that failed first is the cause; the merge saw only a closed sink.
     uploaded.map_err(|e| TermIndexError::Build(format!("term-index upload: {e}")))??;
+    // A failed fetch is the cause of a merge that stopped waiting for it.
+    fetched?;
     let merged = merged.map_err(|e| TermIndexError::Build(e.to_string()))??;
     debug_assert!(merged.tiers.is_empty() && merged.slices.is_empty());
-    for (slice, tier) in consumed {
-        let _ = async_fs::remove_file(slice).await;
-        let _ = async_fs::remove_file(tier).await;
-    }
+    // One blocking task: a round trip to the blocking pool per file took
+    // tens of seconds over a fold of tens of thousands of slices.
+    let _ = task::spawn_blocking(move || {
+        for (slice, tier) in consumed {
+            let _ = fs::remove_file(slice);
+            let _ = fs::remove_file(tier);
+        }
+    })
+    .await;
     let mut layer = merged.layer;
     layer.ordinals = merged_ordinals;
     Ok(layer)
@@ -2070,6 +2171,7 @@ fn layer_level(layer: &Layer) -> f64 {
     (layer_bytes(layer).max(1) as f64).log(FOLD_FAN_OUT as f64)
 }
 
+#[cfg(test)]
 /// Download every slice of `layers` into `dir`, verified against its
 /// hash, [`LAYER_FETCH_CONCURRENCY`] at a time, and return each layer's
 /// slice files in key order. A slice two layers share is fetched once.
@@ -2105,6 +2207,163 @@ pub(crate) async fn download_layers(
         });
     run_bounded(LAYER_FETCH_CONCURRENCY, "layer fetch", jobs).await?;
     Ok(slice_files(dir, layers))
+}
+
+/// A slice's tier object as a fold sees it once the slices are local.
+pub(crate) struct FoldTier {
+    slice: ContentHash,
+    tier: ContentHash,
+    len: u64,
+    /// Already in the fold's directory, linked from the kept copies.
+    present: bool,
+}
+
+/// Download every slice of `layers` into `dir`, verified against its hash,
+/// and look up each tier object's length, [`LAYER_FETCH_CONCURRENCY`] at a
+/// time; tier objects are fetched only where `reuse` holds them. Returns
+/// the tiers by the path of the slice that names them.
+async fn download_slices(
+    storage: &Arc<dyn StorageProvider>,
+    layers: &[Layer],
+    dir: &Path,
+    reuse: Option<&Path>,
+) -> Result<Arc<HashMap<PathBuf, FoldTier>>, TermIndexError> {
+    let tiers = Arc::new(Mutex::new(HashMap::new()));
+    let mut unique: HashSet<ContentHash> = HashSet::new();
+    let jobs = layers
+        .iter()
+        .flat_map(|layer| &layer.slices)
+        .filter(|slice| unique.insert(slice.content_hash))
+        .map(|slice| {
+            let (storage, tiers) = (Arc::clone(storage), Arc::clone(&tiers));
+            let path = slice_file_path(dir, &slice.content_hash);
+            let tier_file = tier_path(dir, &slice.content_hash);
+            let (hash, tier) = (slice.content_hash, slice.tier);
+            let reuse = reuse.map(Path::to_path_buf);
+            let bytes = slice.len;
+            let job = async move {
+                let reused = match &reuse {
+                    Some(reuse) => {
+                        link_reused(reuse, &hash, tier.is_some(), &path, &tier_file).await
+                    }
+                    None => false,
+                };
+                if !reused {
+                    let bytes =
+                        fetch_verified(storage.as_ref(), None, &slice_uri(&hash), &hash).await?;
+                    write_object(path.clone(), bytes).await?;
+                }
+                if let Some(tier) = tier {
+                    let len = match reused {
+                        true => async_fs::metadata(&tier_file).await?.len(),
+                        false => storage.head(&tier_uri(&tier)).await?.size,
+                    };
+                    let found = FoldTier {
+                        slice: hash,
+                        tier,
+                        len,
+                        present: reused,
+                    };
+                    tiers.lock().expect("fold tiers").insert(path, found);
+                }
+                Ok(())
+            };
+            (bytes, job)
+        });
+    run_bytes_bounded("slice fetch", jobs).await?;
+    let tiers = Arc::try_unwrap(tiers)
+        .map_err(|_| TermIndexError::Build("slice fetches outlived their run".into()))?
+        .into_inner()
+        .expect("fold tiers");
+    Ok(Arc::new(tiers))
+}
+
+/// A tier object a fold fetches, and the key ranges that read it.
+struct TierFetch {
+    slice: ContentHash,
+    tier: ContentHash,
+    len: u64,
+    ranges: RangeInclusive<usize>,
+}
+
+/// The tier objects `sources` still lack, in the order the merge's `ranges`
+/// read them, and the gate each range waits at until its own have landed.
+fn tier_fetches(
+    sources: &[Vec<SliceFile>],
+    ranges: &[KeyRange],
+    tiers: &HashMap<PathBuf, FoldTier>,
+) -> (Vec<TierFetch>, TierArrivals) {
+    let mut waiting = vec![0usize; ranges.len()];
+    let mut seen: HashSet<&Path> = HashSet::new();
+    let mut fetches: Vec<TierFetch> = sources
+        .iter()
+        .flatten()
+        .filter(|file| seen.insert(&file.path))
+        .filter_map(|file| {
+            let tier = tiers.get(&file.path).filter(|tier| !tier.present)?;
+            let reaches =
+                |(start, end): &KeyRange| slice_reaches(file, start.as_deref(), end.as_deref());
+            let first = ranges.iter().position(reaches)?;
+            let last = ranges.iter().rposition(reaches)?;
+            for count in &mut waiting[first..=last] {
+                *count += 1;
+            }
+            Some(TierFetch {
+                slice: tier.slice,
+                tier: tier.tier,
+                len: tier.len,
+                ranges: first..=last,
+            })
+        })
+        .collect();
+    fetches.sort_by_key(|fetch| *fetch.ranges.start());
+    (
+        fetches,
+        TierArrivals {
+            state: Mutex::new((waiting, None)),
+            landed: Condvar::new(),
+        },
+    )
+}
+
+/// Tier objects each key range still waits for, and why the waiting
+/// stopped when a fetch failed.
+struct TierArrivals {
+    state: Mutex<(Vec<usize>, Option<String>)>,
+    landed: Condvar,
+}
+
+impl TierArrivals {
+    fn landed(&self, ranges: RangeInclusive<usize>) {
+        let mut state = self.state.lock().expect("tier arrivals");
+        for count in &mut state.0[ranges] {
+            *count -= 1;
+        }
+        self.landed.notify_all();
+    }
+
+    fn fail(&self, why: String) {
+        self.state
+            .lock()
+            .expect("tier arrivals")
+            .1
+            .get_or_insert(why);
+        self.landed.notify_all();
+    }
+
+    /// Blocks until range `at` has every tier it reads.
+    fn wait(&self, at: usize) -> Result<(), TermIndexError> {
+        let mut state = self.state.lock().expect("tier arrivals");
+        loop {
+            if state.0[at] == 0 {
+                return Ok(());
+            }
+            if let Some(why) = &state.1 {
+                return Err(TermIndexError::Build(format!("tier fetch: {why}")));
+            }
+            state = self.landed.wait(state).expect("tier arrivals");
+        }
+    }
 }
 
 /// Link the slice named by `hash`, and its tier object when it has one,
@@ -10495,6 +10754,30 @@ mod tests {
             .expect("fold");
         assert_eq!(root.layers.len(), 1);
         assert_eq!(root.layers[0].slices.len(), 1, "a small run is one range");
+    }
+
+    /// A range starts once the tiers it reads have landed, whatever other
+    /// ranges wait for, and stops waiting when a fetch fails.
+    #[test]
+    fn a_range_waits_for_its_own_tiers_and_stops_on_a_failed_fetch() {
+        let arrivals = Arc::new(TierArrivals {
+            state: Mutex::new((vec![1, 2, 0], None)),
+            landed: Condvar::new(),
+        });
+        arrivals
+            .wait(2)
+            .expect("a range reading no fetched tier starts at once");
+        arrivals.landed(0..=1);
+        arrivals.wait(0).expect("range 0 has its tier");
+        let waiter = {
+            let arrivals = Arc::clone(&arrivals);
+            std::thread::spawn(move || arrivals.wait(1))
+        };
+        arrivals.fail("gone".into());
+        assert!(
+            waiter.join().expect("waiter").is_err(),
+            "range 1 still lacked a tier"
+        );
     }
 
     /// A failed put ends the upload while the merge still holds its sink
