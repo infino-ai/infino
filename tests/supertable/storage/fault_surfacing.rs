@@ -51,9 +51,14 @@ const VECTOR_ROWS: usize = 24;
 /// Rotation seed for the vector fixture's column.
 const VECTOR_ROT_SEED: u64 = 21;
 /// Writer threads for the vector fixture, and so the commit's packed-shard
-/// count. Two is the smallest width that puts one shard on the wire while
+/// count: the fixture's split target is 0, which cuts every commit one
+/// shard per pool thread, since its small batch would otherwise be one
+/// shard. Two is the smallest width that puts one shard on the wire while
 /// another is still packing — the shape the pipelined publish exists for.
 const VECTOR_WRITERS: usize = 2;
+/// Split target for the vector fixture: 0 cuts a commit by the pool width
+/// rather than by its bytes.
+const VECTOR_SPLIT_BY_POOL: u64 = 0;
 
 /// Commits made before the faulted optimize, so there is genuinely more
 /// than one superfile for maintenance to consider.
@@ -188,6 +193,7 @@ fn vector_table_options(storage: Arc<dyn StorageProvider>) -> SupertableOptions 
     )
     .expect("valid options")
     .with_writer_pool(pool)
+    .with_superfile_buffer_split_mb(VECTOR_SPLIT_BY_POOL)
     .with_storage(storage)
 }
 
