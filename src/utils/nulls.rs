@@ -16,9 +16,9 @@
 
 use std::sync::Arc;
 
-use arrow::compute::take;
+use arrow::compute::{concat, concat_batches, take};
 use arrow_array::{Array, ArrayRef, RecordBatch, UInt32Array, new_null_array};
-use arrow_schema::{ArrowError, DataType};
+use arrow_schema::{ArrowError, DataType, SchemaRef};
 
 /// One all-null array per type, every one `len` rows long, made on first
 /// use and handed out to every column of that type that holds nothing.
@@ -77,25 +77,61 @@ pub(crate) fn take_sharing_nulls(
     RecordBatch::try_new(batch.schema(), columns)
 }
 
+/// Whether `arrays` share one type and hold no value among them: each is
+/// empty or null throughout, and at least one has rows.
+fn null_in_all(arrays: &[&dyn Array]) -> bool {
+    let Some(first) = arrays.first() else {
+        return false;
+    };
+    arrays.iter().any(|array| !array.is_empty())
+        && arrays.iter().all(|array| {
+            array.data_type() == first.data_type() && (array.is_empty() || null_throughout(*array))
+        })
+}
+
+/// `batches` joined one after another under `schema`, as Arrow's
+/// `concat_batches` joins them, except that a column null in every batch
+/// becomes the shared null array of its type, as long as all their rows,
+/// rather than a new array. Arrow's concat hands a lone array back as it
+/// is but writes a new one for two or more, so batches whose absent
+/// columns share one null array each would otherwise join into a batch
+/// with a null array of its whole length for every such column.
+pub(crate) fn concat_sharing_nulls<'a>(
+    schema: &SchemaRef,
+    batches: impl IntoIterator<Item = &'a RecordBatch>,
+) -> Result<RecordBatch, ArrowError> {
+    let batches: Vec<&RecordBatch> = batches.into_iter().collect();
+    if batches.is_empty() || schema.fields().is_empty() {
+        return concat_batches(schema, batches);
+    }
+    let mut nulls = SharedNulls::new(batches.iter().map(|batch| batch.num_rows()).sum());
+    let columns = (0..schema.fields().len())
+        .map(|i| {
+            let arrays: Vec<&dyn Array> = batches
+                .iter()
+                .map(|batch| batch.column(i).as_ref())
+                .collect();
+            match null_in_all(&arrays) {
+                true => Ok(nulls.of(arrays[0].data_type())),
+                false => concat(&arrays),
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    RecordBatch::try_new(Arc::clone(schema), columns)
+}
+
+/// Helpers other modules' tests use to measure what a batch costs.
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_support {
     use std::collections::HashSet;
 
     use arrow::array::ArrayData;
-    use arrow_array::LargeStringArray;
-    use arrow_schema::{Field, Schema};
-
-    use super::*;
-
-    /// Rows in the test batches.
-    const ROWS: usize = 1024;
-    /// Null columns of each type in the wide test batch.
-    const NULL_COLUMNS_PER_TYPE: usize = 500;
+    use arrow_array::RecordBatch;
 
     /// Bytes the batch's buffers take, each distinct buffer counted once:
     /// what the batch costs, where `get_array_memory_size` counts a shared
     /// buffer once per column it appears in.
-    fn distinct_buffer_bytes(batch: &RecordBatch) -> usize {
+    pub(crate) fn distinct_buffer_bytes(batch: &RecordBatch) -> usize {
         fn walk(data: &ArrayData, seen: &mut HashSet<usize>, total: &mut usize) {
             let buffers = data
                 .buffers()
@@ -117,6 +153,21 @@ mod tests {
         }
         total
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use arrow_array::LargeStringArray;
+    use arrow_schema::{Field, Schema};
+
+    use super::{test_support::distinct_buffer_bytes, *};
+
+    /// Rows in the test batches.
+    const ROWS: usize = 1024;
+    /// Null columns of each type in the wide test batch.
+    const NULL_COLUMNS_PER_TYPE: usize = 500;
+    /// Batches with rows that the concat test joins.
+    const NARROW_BATCHES: usize = 3;
 
     /// A batch of `ROWS` rows: one filled string column, then
     /// [`NULL_COLUMNS_PER_TYPE`] null string columns and as many null
@@ -133,6 +184,45 @@ mod tests {
             columns.push(new_null_array(&DataType::Int64, ROWS));
         }
         RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("wide batch")
+    }
+
+    /// `filled`, `late`, then [`NULL_COLUMNS_PER_TYPE`] string columns and
+    /// as many integer columns, every one nullable.
+    fn narrow_schema() -> SchemaRef {
+        let mut fields = vec![
+            Field::new("filled", DataType::LargeUtf8, true),
+            Field::new("late", DataType::LargeUtf8, true),
+        ];
+        for i in 0..NULL_COLUMNS_PER_TYPE {
+            fields.push(Field::new(format!("s{i}"), DataType::LargeUtf8, true));
+            fields.push(Field::new(format!("n{i}"), DataType::Int64, true));
+        }
+        Arc::new(Schema::new(fields))
+    }
+
+    /// Batch `b` of the [`NARROW_BATCHES`], `rows` long, over
+    /// [`narrow_schema`]: `filled` holds a value in every row, `late` in
+    /// every other row of the last batch only, and every other column is
+    /// null, filled with one array per type as a batch that lacks the
+    /// columns is filled when it is conformed to its table.
+    fn narrow_batch(schema: &SchemaRef, b: usize, rows: usize) -> RecordBatch {
+        let mut nulls = SharedNulls::new(rows);
+        let columns = schema
+            .fields()
+            .iter()
+            .map(|field| -> ArrayRef {
+                match field.name().as_str() {
+                    "filled" => Arc::new(LargeStringArray::from_iter_values(
+                        (0..rows).map(|r| format!("b{b} r{r}")),
+                    )),
+                    "late" if b == NARROW_BATCHES - 1 => Arc::new(LargeStringArray::from_iter(
+                        (0..rows).map(|r| (r % 2 == 0).then(|| format!("late r{r}"))),
+                    )),
+                    _ => nulls.of(field.data_type()),
+                }
+            })
+            .collect();
+        RecordBatch::try_new(Arc::clone(schema), columns).expect("narrow batch")
     }
 
     #[test]
@@ -167,5 +257,39 @@ mod tests {
         assert!(Arc::ptr_eq(taken.column(1), taken.column(3)));
         assert!(Arc::ptr_eq(taken.column(2), taken.column(4)));
         assert!(distinct_buffer_bytes(&taken) * 100 < distinct_buffer_bytes(&expected));
+    }
+
+    /// Joining batches keeps every value `concat_batches` would give, and
+    /// writes no column that is null in all of them: each comes back as its
+    /// type's one shared array of the joined length, so the joined batch
+    /// costs its filled columns, not its width. A column that any batch
+    /// fills is joined as Arrow joins it, the other batches' nulls included.
+    #[test]
+    fn concat_sharing_nulls_matches_concat_batches_and_writes_no_null_column() {
+        let schema = narrow_schema();
+        let mut batches: Vec<RecordBatch> = (0..NARROW_BATCHES)
+            .map(|b| narrow_batch(&schema, b, ROWS))
+            .collect();
+        // A batch with no rows adds none, and leaves a null column null.
+        batches.insert(1, narrow_batch(&schema, 0, 0));
+        let expected = concat_batches(&schema, &batches).expect("concat");
+        let joined = concat_sharing_nulls(&schema, &batches).expect("concat sharing");
+        assert_eq!(joined, expected);
+        assert_eq!(joined.num_rows(), NARROW_BATCHES * ROWS);
+
+        let late = joined.column(1);
+        assert_eq!(
+            late.len() - late.null_count(),
+            ROWS / 2,
+            "late keeps its values"
+        );
+        let (strings, ints) = (joined.column(2), joined.column(3));
+        assert_eq!(strings.null_count(), joined.num_rows());
+        assert_eq!(ints.null_count(), joined.num_rows());
+        for pair in joined.columns()[2..].chunks(2) {
+            assert!(Arc::ptr_eq(&pair[0], strings), "one null string array");
+            assert!(Arc::ptr_eq(&pair[1], ints), "one null integer array");
+        }
+        assert!(distinct_buffer_bytes(&joined) * 100 < distinct_buffer_bytes(&expected));
     }
 }

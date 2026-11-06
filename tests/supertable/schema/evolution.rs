@@ -181,13 +181,38 @@ fn an_absent_nullable_column_is_null_filled_and_a_missing_required_one_refused()
     assert_eq!(db.schema(TABLE).expect("schema").schema_id(), 1);
 }
 
-/// A wide vector table appended to by batches that each carry a few of its
-/// columns: the commit fills the rest with one shared null array per type
-/// and gathers each shard's rows only from the columns that hold values, so
-/// every carried value reads back where it was written, every other cell
-/// reads null, and the vector and text indexes answer over the rows.
+/// How the narrow batches of [`narrow_batches_on_a_wide_vector_table`]
+/// reach the table.
+#[derive(Clone, Copy)]
+enum Commits {
+    /// One `append` per batch, each committed on its own.
+    EachAppend,
+    /// Every batch buffered by one writer, then committed together.
+    OnceForAll,
+}
+
+/// Each narrow batch committed on its own: every commit fills the absent
+/// columns with one shared null array per type and gathers each shard's
+/// rows only from the columns that hold values.
 #[test]
 fn narrow_batches_on_a_wide_vector_table_read_back_exactly() {
+    narrow_batches_on_a_wide_vector_table(Commits::EachAppend);
+}
+
+/// The narrow batches buffered by one writer and committed once: the
+/// commit joins the buffered batches, keeping the columns none of them
+/// carries as one shared null array, and the rows read back as when each
+/// batch is committed alone.
+#[test]
+fn narrow_batches_buffered_into_one_commit_read_back_exactly() {
+    narrow_batches_on_a_wide_vector_table(Commits::OnceForAll);
+}
+
+/// A wide vector table written by batches that each carry a few of its
+/// columns, committed as `commits` says: every carried value reads back
+/// where it was written, every other cell reads null, and the vector and
+/// text indexes answer over the rows.
+fn narrow_batches_on_a_wide_vector_table(commits: Commits) {
     /// Nullable columns beside the text and the vector.
     const WIDE_COLUMNS: usize = 300;
     /// Rows per append; enough for the vector index to train cells.
@@ -222,6 +247,10 @@ fn narrow_batches_on_a_wide_vector_table_read_back_exactly() {
         )
         .expect("create");
 
+    let mut writer = match commits {
+        Commits::EachAppend => None,
+        Commits::OnceForAll => Some(docs.local_handle().writer().expect("writer")),
+    };
     for (append, carried) in CARRIED.iter().enumerate() {
         let values = Float32Array::from(
             (0..ROWS * DIM)
@@ -247,13 +276,28 @@ fn narrow_batches_on_a_wide_vector_table_read_back_exactly() {
             );
             columns.push((format!("c{c}"), Arc::new(cells)));
         }
-        docs.append(&batch(
+        let narrow = batch(
             columns
                 .iter()
                 .map(|(n, a)| (n.as_str(), Arc::clone(a)))
                 .collect(),
-        ))
-        .expect("append a narrow batch");
+        );
+        match writer.as_mut() {
+            None => {
+                docs.append(&narrow).expect("append a narrow batch");
+            }
+            Some(writer) => {
+                writer.append(&narrow).expect("buffer a narrow batch");
+            }
+        }
+    }
+    if let Some(mut writer) = writer {
+        assert_eq!(
+            writer.buffered_batches(),
+            CARRIED.len(),
+            "every batch waits for the one commit"
+        );
+        writer.commit().expect("commit the buffered batches");
     }
 
     let count = |sql: &str| -> String { rows(&db, sql).concat() };
