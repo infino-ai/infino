@@ -92,6 +92,14 @@ macro_rules! test_visible {
         $(#[$m])*
         pub(crate) fn $($rest)*
     };
+    ($(#[$m:meta])* async fn $($rest:tt)*) => {
+        #[cfg(feature = "test-helpers")]
+        $(#[$m])*
+        pub async fn $($rest)*
+        #[cfg(not(feature = "test-helpers"))]
+        $(#[$m])*
+        pub(crate) async fn $($rest)*
+    };
     ($(#[$m:meta])* const $($rest:tt)*) => {
         #[cfg(feature = "test-helpers")]
         $(#[$m])*
