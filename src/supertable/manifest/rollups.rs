@@ -38,7 +38,9 @@ use uuid::Uuid;
 
 use crate::supertable::{
     manifest::{
-        encoding::{decode_scalar_stats, encode_scalar_stats},
+        encoding::{
+            BoundRowsError, decode_scalar_stats, encode_scalar_stats, require_single_row_bounds,
+        },
         list::ScalarStatsAgg,
         part::{ContentHash, PartId},
     },
@@ -126,18 +128,23 @@ pub enum RollupsError {
 }
 
 /// Encode `rollups` for part `part_id`, or `None` when they are small enough
-/// to stay inline in the list ([`INLINE_ROLLUPS_MAX_BYTES`]).
-pub fn encode(part_id: PartId, rollups: &HashMap<FieldId, ScalarStatsAgg>) -> Option<Vec<u8>> {
+/// to stay inline in the list ([`INLINE_ROLLUPS_MAX_BYTES`]). A bound that
+/// is not one row is refused, as the list refuses it inline.
+pub fn encode(
+    part_id: PartId,
+    rollups: &HashMap<FieldId, ScalarStatsAgg>,
+) -> Result<Option<Vec<u8>>, BoundRowsError> {
+    require_single_row_bounds(rollups)?;
     let ipc = encode_scalar_stats(rollups);
     if ipc.len() <= INLINE_ROLLUPS_MAX_BYTES {
-        return None;
+        return Ok(None);
     }
     let mut bytes = Vec::with_capacity(HEADER_BYTES + ipc.len());
     bytes.extend_from_slice(MAGIC);
     bytes.extend_from_slice(&VERSION.to_le_bytes());
     bytes.extend_from_slice(part_id.0.as_bytes());
     bytes.extend_from_slice(&ipc);
-    Some(bytes)
+    Ok(Some(bytes))
 }
 
 /// The rollups `bytes` hold, checked to be part `part_id`'s.
@@ -175,6 +182,7 @@ mod tests {
     use arrow_array::{ArrayRef, Int64Array};
 
     use super::*;
+    use crate::supertable::manifest::encoding::EncodeError;
 
     /// Columns enough that their rollups pass the inline cap.
     const WIDE_COLUMNS: u32 = 400;
@@ -212,7 +220,9 @@ mod tests {
     fn a_wide_part_s_rollups_round_trip_through_their_object() {
         let part = PartId::new_v4();
         let written = rollups(WIDE_COLUMNS);
-        let bytes = encode(part, &written).expect("wide rollups go to an object");
+        let bytes = encode(part, &written)
+            .expect("one-row bounds")
+            .expect("wide rollups go to an object");
         let read = parse(&bytes, part).expect("parse");
         assert_eq!(read.len(), written.len());
         for (id, agg) in &written {
@@ -226,7 +236,25 @@ mod tests {
     /// A narrow part's rollups stay inline in the list.
     #[test]
     fn a_narrow_part_s_rollups_stay_inline() {
-        assert!(encode(PartId::new_v4(), &rollups(NARROW_COLUMNS)).is_none());
+        let encoded = encode(PartId::new_v4(), &rollups(NARROW_COLUMNS)).expect("one-row bounds");
+        assert!(encoded.is_none());
+    }
+
+    /// A bound that is not one row is refused, naming the bound, as the
+    /// list refuses it for rollups it carries inline.
+    #[test]
+    fn a_bound_that_is_not_one_row_is_refused() {
+        let mut written = rollups(WIDE_COLUMNS);
+        written
+            .get_mut(&FieldId(FIRST_FIELD))
+            .expect("the first column")
+            .max = Arc::new(Int64Array::from(vec![1, 2]));
+        let err = encode(PartId::new_v4(), &written).expect_err("a two-row bound");
+        assert_eq!(err.bound, "scalar_stats_agg.max");
+        assert!(
+            matches!(err.source, EncodeError::WrongRowCount(2)),
+            "{err:?}"
+        );
     }
 
     /// The same rollups written for two parts are two objects, and each is
@@ -235,8 +263,12 @@ mod tests {
     fn an_object_names_its_part_and_is_refused_for_another() {
         let written = rollups(WIDE_COLUMNS);
         let (first, second) = (PartId::new_v4(), PartId::new_v4());
-        let first_bytes = encode(first, &written).expect("object");
-        let second_bytes = encode(second, &written).expect("object");
+        let object = |part| {
+            encode(part, &written)
+                .expect("one-row bounds")
+                .expect("object")
+        };
+        let (first_bytes, second_bytes) = (object(first), object(second));
         assert_ne!(
             ContentHash::of(&first_bytes),
             ContentHash::of(&second_bytes)
@@ -251,7 +283,9 @@ mod tests {
     #[test]
     fn a_malformed_object_is_refused() {
         let part = PartId::new_v4();
-        let bytes = encode(part, &rollups(WIDE_COLUMNS)).expect("object");
+        let bytes = encode(part, &rollups(WIDE_COLUMNS))
+            .expect("one-row bounds")
+            .expect("object");
         assert!(matches!(
             parse(&bytes[..HEADER_BYTES - 1], part),
             Err(RollupsError::Truncated { .. })

@@ -41,14 +41,14 @@ use crate::{
 #[cfg_attr(test, allow(dead_code))]
 pub(crate) const DEFAULT_SUPERFILE_RECLAIM_GRACE: Duration = Duration::from_secs(5 * 60);
 
-/// DELETEs one sweep keeps in flight. A compaction can drop thousands of superfiles in one commit;
+/// DELETEs one sweep, or one table purge, keeps in flight. A compaction can drop thousands of superfiles in one commit;
 /// issued one at a time that is minutes of wall clock, and unbounded it would crowd the
 /// object-store client the table's queries share. At thirty-two, the sweep after a compaction of
 /// a thousand superfiles and their term-index objects took fifteen seconds of 150 ms DELETEs; at
 /// 128, the sweep after one of 1,400 superfiles and 7,000 term-index objects took five seconds,
 /// 66 rounds of 70 ms. A DELETE carries no body, so the width costs no memory, and the store
 /// answers them at this rate without refusing.
-const RECLAIM_CONCURRENCY: usize = 256;
+pub(crate) const RECLAIM_CONCURRENCY: usize = 256;
 
 /// Most referenced-but-unlisted superfiles one sweep confirms with a HEAD. A table that has lost
 /// more than this is already reported loudly, and a HEAD each for thousands would stall the sweep.

@@ -540,6 +540,37 @@ pub(crate) fn require_single_row(arr: &ArrayRef) -> Result<(), EncodeError> {
     Ok(())
 }
 
+/// A rollups bound that is not one row, by the bound's name.
+#[derive(Debug, Error)]
+#[error("scalar stats encode failed for {bound}: {source}")]
+pub struct BoundRowsError {
+    /// Which bound: `scalar_stats_agg.min`, `.max` or `.sum`.
+    pub bound: &'static str,
+    #[source]
+    pub source: EncodeError,
+}
+
+/// The single-value contract over a set of rollups: every bound one row.
+/// [`encode_scalar_stats`] takes the arrays as they are, so every path that
+/// writes rollups, inline in the list or in an object of their own, checks
+/// them here first, and a commit fails on a bad bound with a typed error.
+pub(crate) fn require_single_row_bounds(
+    stats: &HashMap<FieldId, ScalarStatsAgg>,
+) -> Result<(), BoundRowsError> {
+    for agg in stats.values() {
+        for (bound, array) in [
+            ("scalar_stats_agg.min", Some(&agg.min)),
+            ("scalar_stats_agg.max", Some(&agg.max)),
+            ("scalar_stats_agg.sum", agg.sum.as_ref()),
+        ] {
+            if let Some(array) = array {
+                require_single_row(array).map_err(|source| BoundRowsError { bound, source })?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Decode the bytes produced by [`encode_length1_array`] back into the
 /// single length-1 [`ArrayRef`] (column 0 of the one-batch stream).
 pub(crate) fn decode_length1_array(bytes: &[u8]) -> Result<ArrayRef, DecodeError> {

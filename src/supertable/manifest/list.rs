@@ -52,7 +52,7 @@ use crate::{
             encoding::{
                 DecodeError, EncodeError, decode_cluster_centroids, decode_length1_array,
                 decode_scalar_stats, decode_value_counts, encode_cluster_centroids,
-                encode_scalar_stats, require_single_row,
+                encode_scalar_stats, require_single_row_bounds,
             },
             hll::HllSketch,
             merge_min_max_arrays,
@@ -1827,17 +1827,11 @@ fn entry_to_dto(e: &ManifestPartEntry) -> Result<ManifestPartEntryDto, ListEncod
     } else {
         Some(&e.scalar_stats_agg)
     };
-    for agg in carried.into_iter().flat_map(HashMap::values) {
-        for (field, array) in [
-            ("scalar_stats_agg.min", Some(&agg.min)),
-            ("scalar_stats_agg.max", Some(&agg.max)),
-            ("scalar_stats_agg.sum", agg.sum.as_ref()),
-        ] {
-            if let Some(array) = array {
-                require_single_row(array)
-                    .map_err(|source| ListEncodeError::ScalarStats { field, source })?;
-            }
-        }
+    if let Some(rollups) = carried {
+        require_single_row_bounds(rollups).map_err(|e| ListEncodeError::ScalarStats {
+            field: e.bound,
+            source: e.source,
+        })?;
     }
     Ok(ManifestPartEntryDto {
         part_id: e.part_id.0.to_string(),
@@ -1907,16 +1901,19 @@ fn entry_from_dto(
         PartId(Uuid::parse_str(&d.part_id).map_err(|e| ListParseError::BadPartId(e.to_string()))?);
     let content_hash = decode_hash(&d.content_hash)?;
     // A rollups object is named by all three fields or none, and a part
-    // that names one carries no rollups inline. The loader reads the object
-    // into the entry; until it has, the part counts as unread, so nothing
-    // folds rollups this handle has not seen.
+    // that names one carries no rollups inline, in either inline form (the
+    // one batch, or the per-bound map of the majors before it). The loader
+    // reads the object into the entry; until it has, the part counts as
+    // unread and carries no bounds, so nothing prunes on or folds rollups
+    // this handle has not seen.
+    let carries_inline = d.scalar_stats_agg_ipc.is_some() || !d.scalar_stats_agg.is_empty();
     let rollups = match (
         d.rollups_uri,
         d.rollups_content_hash.as_deref(),
         d.rollups_size_bytes,
     ) {
         (None, None, None) => RollupsAt::Inline,
-        (Some(uri), Some(hash), Some(size_bytes)) if d.scalar_stats_agg_ipc.is_none() => {
+        (Some(uri), Some(hash), Some(size_bytes)) if !carries_inline => {
             RollupsAt::Unread(RollupsRef {
                 uri,
                 content_hash: decode_hash(hash)?,
@@ -1932,7 +1929,7 @@ fn entry_from_dto(
                     uri.as_deref().unwrap_or("absent"),
                     hash.unwrap_or("absent"),
                     size.map_or("absent".to_string(), |size| size.to_string()),
-                    d.scalar_stats_agg_ipc.is_some()
+                    carries_inline
                 ),
             ));
         }
@@ -4327,6 +4324,35 @@ mod tests {
         );
     }
 
+    /// An entry's rollups in the per-column map the majors before the one
+    /// batch carried: one length-one IPC stream per bound, keyed by column.
+    /// This engine's encoder never writes it, so the tests that need the
+    /// shape build it here.
+    fn per_bound_rollups(entry: &ManifestPartEntry) -> BTreeMap<String, ScalarStatsAggDto> {
+        entry
+            .scalar_stats_agg
+            .iter()
+            .map(|(id, agg)| {
+                let key = wire_key(*id);
+                let bound = |array: &ArrayRef| {
+                    encode_b64(&encode_length1_array(&key, array).expect("a length-one array"))
+                };
+                let dto = ScalarStatsAggDto {
+                    min: bound(&agg.min),
+                    max: bound(&agg.max),
+                    null_count: agg.null_count,
+                    sum: agg.sum.as_ref().map(bound),
+                    hll: agg.hll.as_deref().map(encode_b64),
+                    value_counts: agg
+                        .value_counts
+                        .as_ref()
+                        .map(|counts| encode_b64(&encode_value_counts(counts).expect("encode"))),
+                };
+                (key, dto)
+            })
+            .collect()
+    }
+
     /// A list of the major before summaries sections, in the shape that
     /// major wrote: rollups as one IPC stream per bound in the per-column
     /// map, no batch and no section fields. It decodes to the same rollups
@@ -4343,26 +4369,7 @@ mod tests {
             part.summaries_uri = None;
             part.summaries_content_hash = None;
             part.summaries_size_bytes = None;
-            part.scalar_stats_agg = BTreeMap::new();
-            for (id, agg) in &entry.scalar_stats_agg {
-                let key = wire_key(*id);
-                let bound = |array: &ArrayRef| {
-                    encode_b64(&encode_length1_array(&key, array).expect("a length-one array"))
-                };
-                part.scalar_stats_agg.insert(
-                    key.clone(),
-                    ScalarStatsAggDto {
-                        min: bound(&agg.min),
-                        max: bound(&agg.max),
-                        null_count: agg.null_count,
-                        sum: agg.sum.as_ref().map(bound),
-                        hll: agg.hll.as_deref().map(encode_b64),
-                        value_counts: agg.value_counts.as_ref().map(|counts| {
-                            encode_b64(&encode_value_counts(counts).expect("encode"))
-                        }),
-                    },
-                );
-            }
+            part.scalar_stats_agg = per_bound_rollups(entry);
         }
         let bytes = serde_json::to_vec_pretty(&dto).expect("json");
         let text = from_utf8(&bytes).expect("utf8");
@@ -4384,11 +4391,19 @@ mod tests {
     }
 
     /// A list of the major before rollups objects, every part's rollups
-    /// inline, still decodes to them.
+    /// inline, still decodes to them. The bytes are this encoder's, restamped:
+    /// a part with inline rollups writes exactly what major 3 wrote, which
+    /// holds only while it writes no rollups-object field, so that is
+    /// asserted before the decode.
     #[test]
     fn a_list_of_the_major_before_rollups_objects_decodes() {
         let list = rich_list(2);
         let bytes = restamped(&list, "3.0");
+        let text = from_utf8(&bytes).expect("utf8");
+        assert!(
+            !text.contains("rollups_"),
+            "the shape a major 3 engine wrote: no rollups-object field"
+        );
         let decoded = decode(&bytes, &LegacyNames::none()).expect("major 3 decodes");
         for (back, original) in decoded.parts.iter().zip(&list.parts) {
             assert_eq!(back.rollups, RollupsAt::Inline);
@@ -4423,7 +4438,10 @@ mod tests {
     }
 
     /// A part naming a rollups object by some of its three fields, or one
-    /// beside inline rollups, is a damaged list, refused.
+    /// beside inline rollups in either form (the one batch, or the
+    /// per-column map of the earlier majors), is a damaged list, refused.
+    /// Decoded, a named part beside inline bounds would read as unread yet
+    /// carry bounds, and the list pruner could drop it on them.
     #[test]
     fn a_part_naming_a_rollups_object_halfway_or_beside_inline_ones_is_refused() {
         let mut list = rich_list(1);
@@ -4438,8 +4456,15 @@ mod tests {
         both.parts[0].rollups_content_hash = named.parts[0].rollups_content_hash.clone();
         both.parts[0].rollups_size_bytes = named.parts[0].rollups_size_bytes;
         assert!(inline.parts[0].scalar_stats_agg_ipc.is_some());
+        let mut beside_map = list_to_dto(&list).expect("encode");
+        beside_map.parts[0].scalar_stats_agg = per_bound_rollups(&list.parts[0]);
+        assert!(
+            beside_map.parts[0].scalar_stats_agg_ipc.is_none()
+                && !beside_map.parts[0].scalar_stats_agg.is_empty(),
+            "the object named beside the per-column map alone"
+        );
 
-        for damaged in [half, both] {
+        for damaged in [half, both, beside_map] {
             let bytes = serde_json::to_vec(&damaged).expect("json");
             assert!(matches!(
                 decode(&bytes, &LegacyNames::none()),
