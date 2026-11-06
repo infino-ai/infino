@@ -2349,9 +2349,10 @@ impl SupertableWriter {
                 release_mutation_lease(&wal_store, wal_id, owner).await;
                 supertable.inner().unfinished_wals.note(wal_id);
             } else {
-                // Best-effort cleanup of the WAL artifacts.
-                let _ = wal_store.delete_arrow(wal_id).await;
-                let _ = wal_store.delete_state(wal_id).await;
+                // Best-effort cleanup of the WAL artifacts, one DELETE each:
+                // the WAL GC reaps whatever is left.
+                let _ = wal_store.delete_arrow_once(wal_id).await;
+                let _ = wal_store.delete_state_once(wal_id).await;
             }
             Ok::<_, MutationError>((n_t, n_nf))
         };
@@ -2478,7 +2479,8 @@ impl SupertableWriter {
                 release_mutation_lease(&wal_store, wal_id, owner).await;
                 supertable.inner().unfinished_wals.note(wal_id);
             } else {
-                let _ = wal_store.delete_state(wal_id).await;
+                // Best-effort cleanup, as the update's.
+                let _ = wal_store.delete_state_once(wal_id).await;
             }
             Ok::<_, MutationError>((n_t, n_nf))
         };
@@ -5858,6 +5860,7 @@ async fn load_drain_remote_checkpoint(
     }
     let state = slow_vector_state::load_full_state(
         storage.as_ref(),
+        inner.options.metadata_disk_cache.as_ref(),
         uri,
         &hash,
         &inner.options.legacy_names(),
@@ -6208,7 +6211,6 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         .storage
         .clone()
         .ok_or_else(|| BuildError::Store("hidden drain requires storage".into()))?;
-    let shard_count = packed_cell_shard_count(&hidden_inner.options);
     let drain_pool = maint_pool()?;
     let consolidate = user_inner.options.drain_consolidate;
 
@@ -6222,11 +6224,15 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
     let (batches, mut remote_state) = if let Some(remote_state) =
         load_drain_remote_checkpoint(&hidden_inner).await?
     {
-        if remote_state.checkpoint.shard_count != shard_count {
-            return Err(BuildError::Store(format!(
-                "drain checkpoint shard count {} != configured writer width {shard_count}",
-                remote_state.checkpoint.shard_count
-            )));
+        // The recorded shard count, not this process's writer pool width,
+        // decides the shards: the width follows the machine, and a drain
+        // started on one machine is resumed by whichever one opens the table
+        // next. The epoch's finished shards are keyed by `cell % count`, so
+        // the resume must keep the count they were cut with.
+        if remote_state.checkpoint.shard_count == 0 {
+            return Err(BuildError::Store(
+                "drain checkpoint records no shards".into(),
+            ));
         }
         if remote_state.checkpoint.options_hash != current_options_hash {
             return Err(BuildError::Store(format!(
@@ -6286,7 +6292,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             &current_options_hash,
             &remote_state.checkpoint.sources,
             &remote_state.checkpoint.batch_layout,
-            shard_count,
+            remote_state.checkpoint.shard_count,
             consolidate,
         );
         if epoch_id != remote_state.checkpoint.epoch_id {
@@ -6324,6 +6330,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         };
         let batches = make_drain_batches(selected, budget);
         let batch_layout = drain_batch_layout(&batches);
+        let shard_count = packed_cell_shard_count(&hidden_inner.options);
         let epoch_id = drain_epoch_id(
             &current_options_hash,
             &source_refs,
@@ -6343,6 +6350,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         let remote_state = create_drain_remote_checkpoint(&hidden_inner, checkpoint).await?;
         (batches, remote_state)
     };
+    let shard_count = remote_state.checkpoint.shard_count;
 
     let store = user_inner.options.store.clone();
     let disk_cache = user_inner.options.disk_cache.clone();
@@ -7936,7 +7944,7 @@ fn cell_doc_counts_from_summary(
         if is_superseded(id) {
             continue;
         }
-        let n: u64 = cell.clusters.counts.iter().map(|&c| u64::from(c)).sum();
+        let n: u64 = cell.clusters.rows();
         out.push((id, u32::try_from(n).ok()?));
     }
     Some(out)
@@ -9757,6 +9765,7 @@ async fn pin_uploaded_superfiles(
             .unwrap_or(true)
             && let Ok(state) = slow_vector_state::load_full_state(
                 storage.as_ref(),
+                inner.options.metadata_disk_cache.as_ref(),
                 uri,
                 &hash,
                 &inner.options.legacy_names(),
@@ -11910,7 +11919,15 @@ async fn build_and_publish_centroid_router_section(
     {
         return None;
     }
-    let section = match fetch_centroid_section(storage, centroids_ref, entries).await {
+    let section = match fetch_centroid_section(
+        storage,
+        inner.options.metadata_disk_cache.as_ref(),
+        centroids_ref,
+        entries,
+        &inner.options.scratch_dir(),
+    )
+    .await
+    {
         Ok(section) => section,
         Err(error) => {
             tracing::warn!(%error, "centroid-router publish: centroid section fetch failed");
@@ -11960,7 +11977,15 @@ async fn previous_centroid_section(
     {
         return Some(Arc::clone(section));
     }
-    match fetch_centroid_section(storage, &reference, manifest.get_all_superfiles()).await {
+    match fetch_centroid_section(
+        storage,
+        options.metadata_disk_cache.as_ref(),
+        &reference,
+        manifest.get_all_superfiles(),
+        &options.scratch_dir(),
+    )
+    .await
+    {
         Ok(section) => {
             let section = Arc::new(section);
             *guard = Some(Arc::clone(&section));
@@ -13027,6 +13052,7 @@ pub(in crate::supertable) async fn stamp_slow_vector_state(
             Some(pending) => {
                 slow_vector_state::write_state_with_pending_drain(
                     storage.as_ref(),
+                    inner.options.metadata_disk_cache.as_ref(),
                     entries,
                     pending,
                     previous_section.as_deref(),
@@ -13036,6 +13062,7 @@ pub(in crate::supertable) async fn stamp_slow_vector_state(
             None => {
                 slow_vector_state::write_state(
                     storage.as_ref(),
+                    inner.options.metadata_disk_cache.as_ref(),
                     entries,
                     previous_section.as_deref(),
                 )
@@ -13947,6 +13974,7 @@ pub(crate) async fn try_commit_attempt(
                 previous_centroid_section(&opts, storage.as_ref(), current_manifest.as_ref()).await;
             let published = slow_vector_state::write_state(
                 storage.as_ref(),
+                opts.metadata_disk_cache.as_ref(),
                 entries,
                 previous_section.as_deref(),
             )
@@ -14381,12 +14409,11 @@ async fn put_new_hedged(
 pub(in crate::supertable) async fn put_content_addressed(
     storage: &dyn StorageProvider,
     uri_for: impl FnOnce(&part_mod::ContentHash) -> String,
-    bytes: Vec<u8>,
+    bytes: Bytes,
 ) -> Result<RoutingRef, StorageError> {
     let content_hash = part_mod::ContentHash::of(&bytes);
     let uri = uri_for(&content_hash);
     let span = detail_span!("put_content_addressed", len = bytes.len());
-    let bytes = Bytes::from(bytes);
     let put = async {
         match (bytes.len() as u64) >= CONTENT_ADDRESSED_MULTIPART_THRESHOLD_BYTES {
             true => put_superfile_multipart(storage, &uri, bytes).await,
@@ -15379,10 +15406,13 @@ mod tests {
             puts: AtomicUsize::new(0),
             first_lands_after: None,
         };
-        let reference =
-            put_content_addressed(&storage, |hash| format!("hedged/{hash}"), b"bytes".to_vec())
-                .await
-                .expect("the hedge answers");
+        let reference = put_content_addressed(
+            &storage,
+            |hash| format!("hedged/{hash}"),
+            b"bytes".to_vec().into(),
+        )
+        .await
+        .expect("the hedge answers");
         assert_eq!(
             storage.puts.load(Ordering::SeqCst),
             2,
@@ -15406,10 +15436,13 @@ mod tests {
             puts: AtomicUsize::new(0),
             first_lands_after: Some(stuck_after(0) * 4),
         };
-        let reference =
-            put_content_addressed(&storage, |hash| format!("hedged/{hash}"), b"bytes".to_vec())
-                .await
-                .expect("the first attempt lands");
+        let reference = put_content_addressed(
+            &storage,
+            |hash| format!("hedged/{hash}"),
+            b"bytes".to_vec().into(),
+        )
+        .await
+        .expect("the first attempt lands");
         assert_eq!(
             storage.puts.load(Ordering::SeqCst),
             2,
@@ -15442,7 +15475,7 @@ mod tests {
                 puts: AtomicUsize::new(0),
                 first_lands_after: Some(lands_after),
             };
-            put_content_addressed(&storage, |hash| format!("hedged/{hash}"), bytes)
+            put_content_addressed(&storage, |hash| format!("hedged/{hash}"), bytes.into())
                 .await
                 .expect("the first attempt lands");
             assert_eq!(storage.puts.load(Ordering::SeqCst), 1, "no hedge was sent");
@@ -16185,6 +16218,99 @@ mod tests {
                 "axis {axis}: exact matches are served from the hidden cells"
             );
         }
+    }
+
+    /// A drain interrupted on a machine with one writer pool width resumes on
+    /// a machine with another: the resume cuts the epoch's remaining shards
+    /// with the count the checkpoint recorded and drains every row once,
+    /// instead of refusing the table's drain on every machine but the first.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drain_resumes_with_recorded_shard_count_on_another_pool_width() {
+        /// Writer pool width of the machine that starts the drain.
+        const STARTED_WIDTH: usize = 2;
+        /// Writer pool width of the machine that resumes it.
+        const RESUMED_WIDTH: usize = 3;
+        const COMMITS: usize = 3;
+        let directory = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(directory.path()).expect("provider"));
+        let options = |width: usize| {
+            options_title_emb_serial(COMMIT_AS_DRAIN_TEST_DIM)
+                .with_storage(Arc::clone(&storage))
+                .with_writer_pool(writer_pool_with(width))
+                .with_drain_batch_superfiles(1)
+        };
+        let table = Supertable::create(options(STARTED_WIDTH)).expect("create");
+        for _ in 0..COMMITS {
+            let mut writer = table.writer().expect("writer");
+            writer
+                .append(&build_axis_vector_batch(
+                    COMMIT_AS_DRAIN_TEST_ROWS,
+                    COMMIT_AS_DRAIN_TEST_DIM,
+                ))
+                .expect("append");
+            writer.commit().expect("commit");
+        }
+        let (hidden, epoch_id) = current_drain_epoch(&table).await;
+        inject_drain_test_failure(epoch_id.clone(), DrainTestFailurePhase::AfterBatch, 1);
+        let first = drain_user_superfiles_to_hidden_cells(
+            Arc::clone(table.inner()),
+            Arc::clone(hidden.inner()),
+        )
+        .await;
+        assert!(first.is_err(), "first drain must stop at the failpoint");
+        let pending = load_drain_remote_checkpoint(hidden.inner())
+            .await
+            .expect("load pending slow state")
+            .expect("pending drain");
+        assert_eq!(pending.checkpoint.shard_count, STARTED_WIDTH);
+        drop(hidden);
+        drop(table);
+
+        let table = Supertable::open(options(RESUMED_WIDTH)).expect("reopen");
+        let (hidden, fresh_epoch_id) = current_drain_epoch(&table).await;
+        assert_ne!(
+            fresh_epoch_id, epoch_id,
+            "the new width must change what a fresh drain would record"
+        );
+        drain_user_superfiles_to_hidden_cells(
+            Arc::clone(table.inner()),
+            Arc::clone(hidden.inner()),
+        )
+        .await
+        .expect("resume on another pool width");
+        assert!(
+            !drain_scratch_dir(&epoch_id).exists(),
+            "the recorded epoch is the one that completed"
+        );
+        assert!(
+            load_drain_remote_checkpoint(hidden.inner())
+                .await
+                .expect("load settled slow state")
+                .is_none(),
+            "settled slow-CAS state contains no pending drain"
+        );
+
+        let hidden_manifest = Arc::clone(hidden.reader().expect("reader").manifest());
+        let drained = hidden_manifest.get_drained_ranges();
+        let user_manifest = Arc::clone(table.reader().expect("reader").manifest());
+        assert!(
+            user_manifest
+                .superfiles
+                .iter()
+                .all(|entry| drained.contains(entry.birth_version)),
+            "every commit's version is drained"
+        );
+        let hidden_rows: u64 = hidden_manifest
+            .superfiles
+            .iter()
+            .map(|entry| entry.n_docs)
+            .sum();
+        assert_eq!(
+            hidden_rows,
+            (COMMITS * COMMIT_AS_DRAIN_TEST_ROWS) as u64,
+            "every row lands in the hidden cells exactly once"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -20672,6 +20798,63 @@ supertable:
             "a failed delete must release its lease so the next sweep can take \
              the WAL immediately, still held by {:?}",
             doc.lease
+        );
+    }
+
+    /// A completed update or delete removes its WAL documents with the
+    /// one-shot delete, never the one that re-issues a transient failure:
+    /// the cleanup is best-effort and the WAL GC reaps what it leaves, so
+    /// the mutation must not wait through re-issue backoff for it. The
+    /// re-issuing delete is faulted on the WAL prefix, so a cleanup routed
+    /// through it both fires the fault and leaves the documents behind.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_completed_mutation_cleans_up_its_wal_without_reissue() {
+        let directory = TempDir::new().expect("tempdir");
+        let local: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(directory.path()).expect("provider"));
+        let faults = FaultStorage::wrap(local);
+        let storage: Arc<dyn StorageProvider> = Arc::<FaultStorage>::clone(&faults);
+        let table =
+            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+                .expect("create");
+        table
+            .append(&build_title_batch(&["alpha", "beta"]))
+            .expect("append");
+        faults.fail(FaultOp::Delete, "wal/mutations/", usize::MAX);
+
+        let updated = table
+            .update(
+                col("title").eq(lit("alpha")),
+                &build_title_batch(&["gamma"]),
+            )
+            .expect("update");
+        assert_eq!(updated.n_tombstoned(), 1);
+        let deleted = table.delete(col("title").eq(lit("beta"))).expect("delete");
+        assert_eq!(deleted.n_tombstoned(), 1);
+
+        assert_eq!(
+            faults.fired(),
+            0,
+            "the WAL cleanup must not go through the re-issuing delete"
+        );
+        let wal_ids = WalStore::new(storage)
+            .list_wal_ids()
+            .await
+            .expect("list wal ids");
+        assert!(
+            wal_ids.is_empty(),
+            "the one-shot delete must remove both mutations' WAL documents, found {wal_ids:?}"
+        );
+        let sidecars: Vec<String> = faults
+            .list_with_prefix("wal/mutations/")
+            .await
+            .expect("list wal prefix")
+            .into_iter()
+            .filter(|uri| uri.ends_with(".arrow"))
+            .collect();
+        assert!(
+            sidecars.is_empty(),
+            "the update's sidecar must be removed too, found {sidecars:?}"
         );
     }
 

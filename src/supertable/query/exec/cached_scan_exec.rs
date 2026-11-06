@@ -54,6 +54,7 @@ use datafusion::{
     },
 };
 use futures::{StreamExt, TryStreamExt, future, stream};
+use parquet::file::metadata::ParquetMetaData;
 use roaring::RoaringBitmap;
 use tokio::spawn;
 use tracing::Instrument;
@@ -83,6 +84,11 @@ const VIEW_BYTES_PER_ROW: usize = 16;
 pub(crate) struct CachedFile {
     pub(crate) uri: SuperfileUri,
     pub(crate) reader: Arc<SuperfileReader>,
+    /// The footer [`RowGroupFilter`] prunes by: the file's own, without the
+    /// bounds that leave out a float column's NaNs, as the Parquet scan
+    /// prunes by
+    /// ([`without_nan_blind_bounds`](crate::supertable::query::nan_bounds::without_nan_blind_bounds)).
+    pub(crate) footer: Arc<ParquetMetaData>,
     /// Rows in each row group, in file order.
     pub(crate) row_counts: Arc<[u32]>,
     /// The file's deleted rows, by position in the file.
@@ -110,12 +116,11 @@ impl RowGroupFilter {
     /// when the `WHERE` doesn't map onto the file, and every row group is
     /// read.
     fn plan(&self, file: &CachedFile) -> Option<ParquetAccessPlan> {
-        let meta = file.reader.parquet_metadata();
-        let pruning = file_pruning(&self.predicate, &self.adapter, &self.table, &meta)?;
+        let pruning = file_pruning(&self.predicate, &self.adapter, &self.table, &file.footer)?;
         let all = ParquetAccessPlan::new_all(file.row_counts.len());
         Some(statistics_pruned(
             all,
-            &meta,
+            &file.footer,
             &pruning,
             &file.uri.0.to_string(),
         ))

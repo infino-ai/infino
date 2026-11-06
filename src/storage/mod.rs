@@ -562,6 +562,16 @@ pub trait StorageProvider: Send + Sync + fmt::Debug {
     /// object returns `Ok(())`, not [`StorageError::NotFound`].
     async fn delete(&self, uri: &str) -> Result<(), StorageError>;
 
+    /// [`delete`](Self::delete) without the app-level re-issue of a
+    /// transient failure: one pass through the store client, idempotent the
+    /// same way. For best-effort cleanup whose caller ignores the result and
+    /// leaves a failure to a background sweep, so it does not wait through
+    /// the re-issue backoff. The default is [`delete`](Self::delete), right
+    /// for a provider that does not re-issue; a wrapper forwards it.
+    async fn delete_once(&self, uri: &str) -> Result<(), StorageError> {
+        self.delete(uri).await
+    }
+
     /// List object URIs under `prefix`. Returns the full URI of
     /// every object whose path starts with `prefix` (caller is
     /// responsible for slash-aware boundary checks if they want
@@ -785,6 +795,10 @@ impl StorageProvider for PrefixedStorageProvider {
 
     async fn delete(&self, uri: &str) -> Result<(), StorageError> {
         self.inner.delete(&self.prefixed(uri)).await
+    }
+
+    async fn delete_once(&self, uri: &str) -> Result<(), StorageError> {
+        self.inner.delete_once(&self.prefixed(uri)).await
     }
 
     async fn list_with_prefix(&self, prefix: &str) -> Result<Vec<String>, StorageError> {

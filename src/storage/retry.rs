@@ -10,7 +10,8 @@ use std::{error::Error, future::Future, ops::Range, pin::pin, time::Duration};
 
 use bytes::{Bytes, BytesMut};
 use object_store::{
-    Attribute, Attributes, BackoffConfig, GetOptions, PutMode, PutOptions, RetryConfig,
+    Attribute, Attributes, BackoffConfig, Error as ObjError, GetOptions, PutMode, PutOptions,
+    RetryConfig,
 };
 use tokio::{sync::Semaphore, time};
 use tracing::warn;
@@ -274,6 +275,59 @@ where
             warn!(uri, error = %e, "could not read back a failed create; reporting the precondition");
             Err(lost)
         }
+    }
+}
+
+/// Run a DELETE through the app-level transient budget.
+///
+/// A delete is idempotent: a re-issue of one that landed meets no object,
+/// and a missing object counts as deleted, so re-issuing is safe. A
+/// timeout or dropped connection on a DELETE reaches this layer as
+/// `TransientExhausted` (`object_store` retries a timeout only for an
+/// idempotent request, and the GCS client marks a DELETE as not
+/// idempotent), so without a re-issue one such failure fails the whole
+/// operation — a table purge removing thousands of objects, say.
+///
+/// `delete` performs one DELETE; `translate` maps the store's errors as the
+/// provider does. Only `TransientExhausted` is re-issued; `NotFound` is
+/// success and every other error is returned as it is.
+pub(crate) async fn delete_with_reissue<D, DFut, T>(
+    mut delete: D,
+    translate: T,
+) -> Result<(), StorageError>
+where
+    D: FnMut() -> DFut,
+    DFut: Future<Output = Result<(), ObjError>>,
+    T: Fn(ObjError) -> StorageError,
+{
+    with_reissue(|| {
+        let issued = delete();
+        let translate = &translate;
+        async move { settle_delete(issued.await, translate) }
+    })
+    .await
+}
+
+/// One DELETE, settled as [`delete_with_reissue`] settles each issue but
+/// never re-issued. For best-effort cleanup that a background sweep
+/// finishes if this fails: its caller ignores the result, so it must not
+/// wait through the re-issue backoff for it.
+pub(crate) async fn delete_once<DFut, T>(delete: DFut, translate: T) -> Result<(), StorageError>
+where
+    DFut: Future<Output = Result<(), ObjError>>,
+    T: Fn(ObjError) -> StorageError,
+{
+    settle_delete(delete.await, &translate)
+}
+
+/// A DELETE's answer as the caller sees it: a missing object is deleted.
+fn settle_delete(
+    answer: Result<(), ObjError>,
+    translate: &impl Fn(ObjError) -> StorageError,
+) -> Result<(), StorageError> {
+    match answer {
+        Ok(()) | Err(ObjError::NotFound { .. }) => Ok(()),
+        Err(e) => Err(translate(e)),
     }
 }
 
@@ -729,6 +783,174 @@ mod tests {
                 .await,
         );
         assert_eq!(store.heads.get(), 1);
+    }
+
+    // ---- delete_with_reissue ---------------------------------------------
+
+    /// The key every delete below targets.
+    const DELETE_URI: &str = "data/seg-00000002.sf.parquet";
+
+    /// How one issue of a delete goes.
+    #[derive(Clone, Copy)]
+    enum DeleteIssue {
+        /// The store answers it.
+        Answered,
+        /// It lands, then its answer is lost and the caller sees a timeout.
+        LandedAnswerLost,
+        /// It times out before reaching the store.
+        TimedOut,
+        /// The store refuses the credentials.
+        Refused,
+    }
+
+    /// The store's errors as the providers translate them.
+    fn translate_delete(e: ObjError) -> StorageError {
+        match e {
+            ObjError::PermissionDenied { .. } => StorageError::PermissionDenied {
+                uri: DELETE_URI.into(),
+            },
+            ObjError::Generic { source, .. } => StorageError::TransientExhausted {
+                uri: DELETE_URI.into(),
+                source,
+            },
+            other => StorageError::Permanent {
+                uri: DELETE_URI.into(),
+                source: Box::new(other),
+            },
+        }
+    }
+
+    /// An in-memory store holding one object, its deletes going as `issues`
+    /// says in turn and answered once they run out, each issue counted.
+    struct DeleteStore {
+        inner: InMemory,
+        path: ObjPath,
+        issues: Vec<DeleteIssue>,
+        issued: Cell<usize>,
+    }
+
+    impl DeleteStore {
+        async fn holding_one(issues: &[DeleteIssue]) -> Self {
+            let store = Self {
+                inner: InMemory::new(),
+                path: ObjPath::from(DELETE_URI),
+                issues: issues.to_vec(),
+                issued: Cell::new(0),
+            };
+            store
+                .inner
+                .put(&store.path, PutPayload::from_static(BYTES))
+                .await
+                .expect("put");
+            store
+        }
+
+        /// One issue of the delete.
+        async fn issue(&self) -> Result<(), ObjError> {
+            let n = self.issued.get();
+            self.issued.set(n + 1);
+            let timed_out = || ObjError::Generic {
+                store: "InMemory",
+                source: "operation timed out".into(),
+            };
+            match self.issues.get(n).copied().unwrap_or(DeleteIssue::Answered) {
+                DeleteIssue::Answered => self.answer().await,
+                DeleteIssue::LandedAnswerLost => {
+                    self.answer().await?;
+                    Err(timed_out())
+                }
+                DeleteIssue::TimedOut => Err(timed_out()),
+                DeleteIssue::Refused => Err(ObjError::PermissionDenied {
+                    path: DELETE_URI.into(),
+                    source: "refused".into(),
+                }),
+            }
+        }
+
+        /// The store's answer to a delete. `InMemory` answers a delete of a
+        /// missing object with success where GCS and Azure answer 404, so
+        /// this answers `NotFound` for one as they do.
+        async fn answer(&self) -> Result<(), ObjError> {
+            self.inner.head(&self.path).await?;
+            self.inner.delete(&self.path).await
+        }
+
+        async fn delete_with_reissue(&self) -> Result<(), StorageError> {
+            delete_with_reissue(|| self.issue(), translate_delete).await
+        }
+
+        async fn holds_object(&self) -> bool {
+            self.inner.head(&self.path).await.is_ok()
+        }
+    }
+
+    /// A delete that timed out before reaching the store is re-issued, and
+    /// the re-issue deletes the object.
+    #[tokio::test(start_paused = true)]
+    async fn a_timed_out_delete_is_reissued() {
+        let store = DeleteStore::holding_one(&[DeleteIssue::TimedOut]).await;
+        store
+            .delete_with_reissue()
+            .await
+            .expect("the re-issue deletes");
+        assert_eq!(store.issued.get(), 2);
+        assert!(!store.holds_object().await);
+    }
+
+    /// A delete that landed but whose answer was lost is re-issued, and the
+    /// re-issue's 404 is the delete's success.
+    #[tokio::test(start_paused = true)]
+    async fn a_reissued_delete_that_meets_no_object_succeeds() {
+        let store = DeleteStore::holding_one(&[DeleteIssue::LandedAnswerLost]).await;
+        store
+            .delete_with_reissue()
+            .await
+            .expect("a 404 on the re-issue is success");
+        assert_eq!(store.issued.get(), 2);
+        assert!(!store.holds_object().await);
+    }
+
+    /// Refused credentials are not re-issued: the same call fails the same
+    /// way, and the caller sees the refusal at once.
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_delete_is_not_reissued() {
+        let store = DeleteStore::holding_one(&[DeleteIssue::Refused]).await;
+        let err = store.delete_with_reissue().await.expect_err("refused");
+        assert!(
+            matches!(err, StorageError::PermissionDenied { .. }),
+            "expected PermissionDenied, got {err:?}"
+        );
+        assert_eq!(store.issued.get(), 1);
+        assert!(store.holds_object().await);
+    }
+
+    /// A delete whose every issue times out spends the re-issue budget and
+    /// reports the transient failure.
+    #[tokio::test(start_paused = true)]
+    async fn a_delete_that_keeps_timing_out_spends_the_budget() {
+        let issues = [DeleteIssue::TimedOut; MAX_TRANSIENT_RETRIES as usize + 1];
+        let store = DeleteStore::holding_one(&issues).await;
+        let err = store.delete_with_reissue().await.expect_err("budget spent");
+        assert!(matches!(err, StorageError::TransientExhausted { .. }));
+        assert_eq!(store.issued.get(), issues.len());
+    }
+
+    /// The best-effort delete is one issue: a timeout is reported, not
+    /// re-issued, and a 404 is success.
+    #[tokio::test(start_paused = true)]
+    async fn a_delete_once_is_not_reissued() {
+        let store = DeleteStore::holding_one(&[DeleteIssue::TimedOut]).await;
+        let err = delete_once(store.issue(), translate_delete)
+            .await
+            .expect_err("a timeout is reported");
+        assert!(matches!(err, StorageError::TransientExhausted { .. }));
+        assert_eq!(store.issued.get(), 1);
+        assert!(store.holds_object().await);
+
+        store.inner.delete(&store.path).await.expect("delete");
+        delete_once(store.issue(), translate_delete)
+            .await
+            .expect("a 404 is success");
     }
 
     #[tokio::test(start_paused = true)]

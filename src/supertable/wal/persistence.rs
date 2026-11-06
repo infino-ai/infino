@@ -415,6 +415,28 @@ impl WalStore {
         Ok(())
     }
 
+    /// [`delete_state`](Self::delete_state) with a single DELETE and no
+    /// re-issue of a transient failure, for the inline cleanup a mutation
+    /// runs once its WAL is complete. That caller ignores the result and the
+    /// GC sweep reaps whatever it leaves, so the mutation must not wait
+    /// through the storage layer's re-issue backoff for it.
+    pub async fn delete_state_once(&self, wal_id: WalId) -> Result<(), WalStoreError> {
+        self.delete_once(Self::state_path(wal_id)).await
+    }
+
+    /// [`delete_arrow`](Self::delete_arrow) without re-issue, as
+    /// [`delete_state_once`](Self::delete_state_once).
+    pub async fn delete_arrow_once(&self, wal_id: WalId) -> Result<(), WalStoreError> {
+        self.delete_once(Self::arrow_path(wal_id)).await
+    }
+
+    async fn delete_once(&self, path: String) -> Result<(), WalStoreError> {
+        self.storage
+            .delete_once(&path)
+            .await
+            .map_err(|source| WalStoreError::Storage { path, source })
+    }
+
     // ---- Arrow IPC sidecar (per-WAL `new_rows` payload) -----------------
 
     /// Write the IPC payload sidecar (UPDATE only). **Idempotent

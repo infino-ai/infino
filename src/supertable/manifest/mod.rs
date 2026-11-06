@@ -111,7 +111,7 @@ use crate::{
                 EncodedPart, PointerFile, frame_content_size, part_uri, read_pointer,
                 translate_contention, write_manifest, write_object_bytes, write_pointer,
             },
-            disk_cache::ManifestDiskCache,
+            disk_cache::MetadataDiskCache,
             encoding::SummaryWireMode,
             list::{
                 FORMAT_VERSION as LIST_FORMAT_VERSION, Manifest, ManifestPartEntry,
@@ -461,7 +461,7 @@ impl ManifestSnapshot {
         if let Some(storage) = storage
             && let Some(list) = list
         {
-            let manifest_cache = superfile_list.options.manifest_disk_cache.clone();
+            let manifest_cache = superfile_list.options.metadata_disk_cache.clone();
             let loader = Arc::new(ManifestPartLoader::new_with_legacy_names(
                 Arc::clone(&storage),
                 &list,
@@ -571,7 +571,7 @@ impl ManifestSnapshot {
             Arc::new(ManifestPartLoader::new_with_legacy_names(
                 storage.clone(),
                 &list,
-                options.manifest_disk_cache.clone(),
+                options.metadata_disk_cache.clone(),
                 false,
                 options.legacy_names(),
             ))
@@ -1117,7 +1117,7 @@ impl ManifestSnapshot {
         let loader = Arc::new(ManifestPartLoader::new_with_legacy_names(
             Arc::clone(&storage),
             &list,
-            options.manifest_disk_cache.clone(),
+            options.metadata_disk_cache.clone(),
             options.summary_centroids_from_superfiles,
             options.legacy_names(),
         ));
@@ -1180,6 +1180,7 @@ impl ManifestSnapshot {
                     // centroid scores come from the section.
                     let entries = slow_vector_state::load_state(
                         storage.as_ref(),
+                        options.metadata_disk_cache.as_ref(),
                         uri,
                         &hash,
                         &options.legacy_names(),
@@ -2901,7 +2902,7 @@ impl ManifestSnapshot {
             Arc::new(ManifestPartLoader::new_with_legacy_names(
                 storage.clone(),
                 &new_list,
-                opts.manifest_disk_cache.clone(),
+                opts.metadata_disk_cache.clone(),
                 false,
                 opts.legacy_names(),
             ))
@@ -3207,7 +3208,7 @@ fn section_entries(
 /// StorageProvider>` is shared with the `DiskCacheStore` —
 /// one auth handshake, one connection pool.
 ///
-/// An optional [`ManifestDiskCache`] short-circuits the storage GET
+/// An optional [`MetadataDiskCache`] short-circuits the storage GET
 /// when the part's compressed bytes are already on local disk. Because
 /// parts are content-addressed, a cache hit can never be stale.
 /// Decoded manifest parts a commit carries into the next snapshot.
@@ -3292,7 +3293,7 @@ pub struct ManifestPartLoader {
     /// On-disk cache for compressed part bytes. `None` disables the
     /// cache (in-process-only supertables, tests, or storage attached
     /// without a `disk_cache_root` configured).
-    manifest_disk_cache: Option<Arc<ManifestDiskCache>>,
+    metadata_disk_cache: Option<Arc<MetadataDiskCache>>,
     /// Consumer memory mode (`summary_centroids_from_superfiles`): load
     /// each part's routing sibling (counts + 1-bit slab, no fp32) when
     /// the list stamps one. Writer handles keep this off — part rebuilds
@@ -3325,9 +3326,9 @@ impl ManifestPartLoader {
     pub fn new_with_cache(
         storage: Arc<dyn StorageProvider>,
         list: &Manifest,
-        manifest_disk_cache: Option<Arc<ManifestDiskCache>>,
+        metadata_disk_cache: Option<Arc<MetadataDiskCache>>,
     ) -> Self {
-        Self::new_with_cache_and_mode(storage, list, manifest_disk_cache, false)
+        Self::new_with_cache_and_mode(storage, list, metadata_disk_cache, false)
     }
 
     /// Like [`Self::new_with_cache`] with the consumer routing mode
@@ -3336,13 +3337,13 @@ impl ManifestPartLoader {
     pub fn new_with_cache_and_mode(
         storage: Arc<dyn StorageProvider>,
         list: &Manifest,
-        manifest_disk_cache: Option<Arc<ManifestDiskCache>>,
+        metadata_disk_cache: Option<Arc<MetadataDiskCache>>,
         prefer_routing: bool,
     ) -> Self {
         Self::new_with_legacy_names(
             storage,
             list,
-            manifest_disk_cache,
+            metadata_disk_cache,
             prefer_routing,
             LegacyNames::none(),
         )
@@ -3354,7 +3355,7 @@ impl ManifestPartLoader {
     pub fn new_with_legacy_names(
         storage: Arc<dyn StorageProvider>,
         list: &Manifest,
-        manifest_disk_cache: Option<Arc<ManifestDiskCache>>,
+        metadata_disk_cache: Option<Arc<MetadataDiskCache>>,
         prefer_routing: bool,
         legacy: LegacyNames,
     ) -> Self {
@@ -3376,7 +3377,7 @@ impl ManifestPartLoader {
         }
         // Holds every part of the list, so a full load reuses the cache
         // instead of evicting parts before the next load reads them.
-        if let Some(cache) = &manifest_disk_cache {
+        if let Some(cache) = &metadata_disk_cache {
             cache.raise_budget(
                 part_bytes.saturating_add(part_bytes / MANIFEST_CACHE_HEADROOM_DIVISOR),
             );
@@ -3384,7 +3385,7 @@ impl ManifestPartLoader {
         Self {
             storage,
             parts_index: idx,
-            manifest_disk_cache,
+            metadata_disk_cache,
             prefer_routing,
             open_blob_budget: Arc::new(OpenBlobBudget::new(DEFAULT_OPEN_BLOB_BUDGET_BYTES)),
             term_index: tokio::sync::Mutex::new(None),
@@ -3412,7 +3413,7 @@ impl ManifestPartLoader {
         }
         match TermIndex::load(
             Arc::clone(&self.storage),
-            self.manifest_disk_cache.clone(),
+            self.metadata_disk_cache.clone(),
             reference,
         )
         .await
@@ -3506,7 +3507,7 @@ impl ManifestPartLoader {
     ) -> Result<ManifestPart, ManifestLoadError> {
         // Disk-cache hit: bytes are verified against `expected_hash`
         // inside `get`, so they're known-good here.
-        if let Some(cache) = &self.manifest_disk_cache
+        if let Some(cache) = &self.metadata_disk_cache
             && let Some(bytes) = cache.get(expected_hash).await
         {
             record("cache_hit", true);
@@ -3539,7 +3540,7 @@ impl ManifestPartLoader {
         .await?;
         // Populate the cache for next time (best-effort; the hash was
         // verified above, satisfying `put`'s contract).
-        if let Some(cache) = &self.manifest_disk_cache {
+        if let Some(cache) = &self.metadata_disk_cache {
             cache.put(*expected_hash, bytes).await;
         }
         Ok(parsed)
@@ -3552,7 +3553,7 @@ impl ManifestPartLoader {
         &self,
         reference: &SummariesRef,
     ) -> Result<Arc<SummariesSection>, ManifestLoadError> {
-        if let Some(cache) = &self.manifest_disk_cache
+        if let Some(cache) = &self.metadata_disk_cache
             && let Some(bytes) = cache.get(&reference.content_hash).await
         {
             let section = parse_summaries_off_thread(Bytes::from(bytes), None).await?;
@@ -3565,7 +3566,7 @@ impl ManifestPartLoader {
             .map_err(ManifestLoadError::Storage)?;
         let section =
             parse_summaries_off_thread(bytes.clone(), Some(reference.content_hash)).await?;
-        if let Some(cache) = &self.manifest_disk_cache {
+        if let Some(cache) = &self.metadata_disk_cache {
             cache.put(reference.content_hash, bytes).await;
         }
         Ok(Arc::new(section))
@@ -4412,6 +4413,13 @@ pub fn superfile_stem(source_name: &str) -> Option<String> {
 /// Takes existing (min, max) and other (min, max) arrays and returns the
 /// merged (min, max) where min is the smaller value and max is the larger.
 /// Both arrays are assumed to be length-1 and of the same type.
+///
+/// Values compare in the order [`column_min_max`] took each side's bounds
+/// in, Arrow's own: for floats that is IEEE total order, where a negative
+/// NaN comes before every number and a positive NaN after. A NaN bound
+/// therefore survives the merge whichever side it is on, as it would in
+/// the min or max of the two sides' values together; with `<=`, which is
+/// false whenever one side is a NaN, it survived only from one side.
 pub(crate) fn merge_min_max_arrays(
     existing_min: &ArrayRef,
     other_min: &ArrayRef,
@@ -4419,29 +4427,54 @@ pub(crate) fn merge_min_max_arrays(
     other_max: &ArrayRef,
 ) -> Option<(ArrayRef, ArrayRef)> {
     // Merge two optional bounds into the surviving one — smaller for a min,
-    // larger for a max. A `None` (the column is all-null on that side)
-    // yields to a present value; both `None` stays `None`, so an all-null
-    // column stays all-null through the fold, while a manifest part with any
-    // populated superfile keeps its real bound.
+    // larger for a max, by `le`. A `None` (the column is all-null on that
+    // side) yields to a present value; both `None` stays `None`, so an
+    // all-null column stays all-null through the fold, while a manifest part
+    // with any populated superfile keeps its real bound.
     #[inline]
-    fn merge_opt<T: PartialOrd>(a: Option<T>, b: Option<T>, keep_min: bool) -> Option<T> {
+    fn merge_opt<T>(
+        a: Option<T>,
+        b: Option<T>,
+        keep_min: bool,
+        le: impl Fn(&T, &T) -> bool,
+    ) -> Option<T> {
         match (a, b) {
-            (Some(a), Some(b)) => Some(if keep_min == (a <= b) { a } else { b }),
+            (Some(a), Some(b)) => Some(if keep_min == le(&a, &b) { a } else { b }),
             (Some(v), None) | (None, Some(v)) => Some(v),
             (None, None) => None,
         }
     }
 
+    // `a <= b` for a primitive array's values, as Arrow's min and max order
+    // them: total order for floats, the plain order for every other type.
+    #[inline]
+    fn native_le<T: ArrowNativeTypeOp>(a: &T, b: &T) -> bool {
+        a.is_le(*b)
+    }
+
     macro_rules! prim_merge {
-        ($array_ty:ty) => {{
+        ($array_ty:ty) => {
+            prim_merge!($array_ty, native_le)
+        };
+        ($array_ty:ty, $le:expr) => {{
             let exn = existing_min.as_any().downcast_ref::<$array_ty>()?;
             let otn = other_min.as_any().downcast_ref::<$array_ty>()?;
             let exx = existing_max.as_any().downcast_ref::<$array_ty>()?;
             let otx = other_max.as_any().downcast_ref::<$array_ty>()?;
             let at = |a: &$array_ty| (!a.is_null(0)).then(|| a.value(0));
             Some((
-                Arc::new(<$array_ty>::from(vec![merge_opt(at(exn), at(otn), true)])) as ArrayRef,
-                Arc::new(<$array_ty>::from(vec![merge_opt(at(exx), at(otx), false)])) as ArrayRef,
+                Arc::new(<$array_ty>::from(vec![merge_opt(
+                    at(exn),
+                    at(otn),
+                    true,
+                    $le,
+                )])) as ArrayRef,
+                Arc::new(<$array_ty>::from(vec![merge_opt(
+                    at(exx),
+                    at(otx),
+                    false,
+                    $le,
+                )])) as ArrayRef,
             ))
         }};
     }
@@ -4457,11 +4490,11 @@ pub(crate) fn merge_min_max_arrays(
             let at = |a: &$array_ty| (!a.is_null(0)).then(|| a.value(0));
             Some((
                 Arc::new(
-                    <$array_ty>::from(vec![merge_opt(at(exn), at(otn), true)])
+                    <$array_ty>::from(vec![merge_opt(at(exn), at(otn), true, native_le)])
                         .with_timezone_opt($tz.clone()),
                 ) as ArrayRef,
                 Arc::new(
-                    <$array_ty>::from(vec![merge_opt(at(exx), at(otx), false)])
+                    <$array_ty>::from(vec![merge_opt(at(exx), at(otx), false, native_le)])
                         .with_timezone_opt($tz.clone()),
                 ) as ArrayRef,
             ))
@@ -4480,7 +4513,7 @@ pub(crate) fn merge_min_max_arrays(
         DataType::Float32 => prim_merge!(Float32Array),
         DataType::Float64 => prim_merge!(Float64Array),
         // `false < true`, so min folds like AND and max like OR.
-        DataType::Boolean => prim_merge!(BooleanArray),
+        DataType::Boolean => prim_merge!(BooleanArray, PartialOrd::le),
         DataType::Utf8 => {
             let exn = existing_min.as_any().downcast_ref::<StringArray>()?;
             let otn = other_min.as_any().downcast_ref::<StringArray>()?;
@@ -4490,11 +4523,13 @@ pub(crate) fn merge_min_max_arrays(
                 (!exn.is_null(0)).then(|| exn.value(0)),
                 (!otn.is_null(0)).then(|| otn.value(0)),
                 true,
+                PartialOrd::le,
             );
             let max = merge_opt(
                 (!exx.is_null(0)).then(|| exx.value(0)),
                 (!otx.is_null(0)).then(|| otx.value(0)),
                 false,
+                PartialOrd::le,
             );
             Some((
                 Arc::new(StringArray::from(vec![min])),
@@ -4510,11 +4545,13 @@ pub(crate) fn merge_min_max_arrays(
                 (!exn.is_null(0)).then(|| exn.value(0)),
                 (!otn.is_null(0)).then(|| otn.value(0)),
                 true,
+                PartialOrd::le,
             );
             let max = merge_opt(
                 (!exx.is_null(0)).then(|| exx.value(0)),
                 (!otx.is_null(0)).then(|| otx.value(0)),
                 false,
+                PartialOrd::le,
             );
             Some((
                 Arc::new(LargeStringArray::from(vec![min])),
@@ -4527,8 +4564,8 @@ pub(crate) fn merge_min_max_arrays(
             let exx = existing_max.as_any().downcast_ref::<Decimal128Array>()?;
             let otx = other_max.as_any().downcast_ref::<Decimal128Array>()?;
             let at = |a: &Decimal128Array| (!a.is_null(0)).then(|| a.value(0));
-            let min = merge_opt(at(exn), at(otn), true);
-            let max = merge_opt(at(exx), at(otx), false);
+            let min = merge_opt(at(exn), at(otn), true, native_le);
+            let max = merge_opt(at(exx), at(otx), false, native_le);
             Some((
                 Arc::new(
                     Decimal128Array::from(vec![min])
@@ -5144,6 +5181,8 @@ pub struct ClusterCentroids {
     /// Per-cluster indexed doc count; length `n_cent`. Count-0 clusters
     /// are skipped by the selector.
     pub counts: Vec<u32>,
+    /// Sum of `counts`, so callers don't walk every cluster.
+    rows: u64,
     /// Lazily-built block-transposed centroid cache feeding the blocked
     /// SIMD scan kernels in `superfile::vector::distance`. Built once per
     /// instance on first scan; reset by `Clone` (a clone may mutate
@@ -5174,6 +5213,7 @@ impl Clone for ClusterCentroids {
             dim: self.dim,
             centroids: self.centroids.clone(),
             counts: self.counts.clone(),
+            rows: self.rows,
             transposed,
             admit_codes,
         }
@@ -5191,6 +5231,10 @@ impl PartialEq for ClusterCentroids {
 
 impl Eq for ClusterCentroids {}
 
+fn sum_counts(counts: &[u32]) -> u64 {
+    counts.iter().map(|&c| u64::from(c)).sum()
+}
+
 impl ClusterCentroids {
     /// The "no cluster centroids" value — a superfile without a vector
     /// index for the column.
@@ -5200,6 +5244,11 @@ impl ClusterCentroids {
 
     pub fn is_empty(&self) -> bool {
         self.n_cent == 0
+    }
+
+    /// Rows over all clusters: the sum of `counts`.
+    pub fn rows(&self) -> u64 {
+        self.rows
     }
 
     /// Zero-copy fp32 slice of cluster `c`'s centroid (length `dim`).
@@ -5264,6 +5313,7 @@ impl ClusterCentroids {
             n_cent,
             dim,
             centroids,
+            rows: sum_counts(&counts),
             counts,
             transposed: OnceLock::new(),
             admit_codes: OnceLock::new(),
@@ -5427,6 +5477,7 @@ impl ClusterCentroids {
             n_cent,
             dim,
             centroids: Vec::new(),
+            rows: sum_counts(&counts),
             counts,
             transposed: OnceLock::new(),
             admit_codes: {
@@ -5738,6 +5789,40 @@ mod tests {
         assert_eq!(scalar(&mx), ScalarValue::Int64(Some(9)));
         let (mn, mx) = merge_min_max_arrays(&null1, &null1, &null1, &null1).expect("merge null");
         assert!(mn.is_null(0) && mx.is_null(0));
+    }
+
+    /// Float bounds merge in total order, as Arrow's min and max of both
+    /// sides' values would: a negative NaN is the smaller min and a positive
+    /// NaN the larger max whichever side holds it, and a positive NaN min
+    /// (every value a NaN) yields to a number, for both float widths.
+    #[test]
+    fn merge_min_max_keeps_a_nan_bound_from_either_side() {
+        macro_rules! nan_case {
+            ($arr:ty, $t:ty) => {{
+                let one = |v: $t| Arc::new(<$arr>::from(vec![v])) as ArrayRef;
+                let value =
+                    |a: &ArrayRef| a.as_any().downcast_ref::<$arr>().expect("float").value(0);
+                let numbers = (one(-1.0), one(1.0));
+                let with_nans = (one(-<$t>::NAN), one(<$t>::NAN));
+                let all_nan = (one(<$t>::NAN), one(<$t>::NAN));
+                for (first, second) in [(&with_nans, &numbers), (&numbers, &with_nans)] {
+                    let (min, max) = merge_min_max_arrays(&first.0, &second.0, &first.1, &second.1)
+                        .expect("merge");
+                    let (min, max) = (value(&min), value(&max));
+                    assert!(min.is_nan() && min.is_sign_negative(), "{min}");
+                    assert!(max.is_nan() && max.is_sign_positive(), "{max}");
+                }
+                for (first, second) in [(&all_nan, &numbers), (&numbers, &all_nan)] {
+                    let (min, max) = merge_min_max_arrays(&first.0, &second.0, &first.1, &second.1)
+                        .expect("merge");
+                    let (min, max) = (value(&min), value(&max));
+                    assert_eq!(min, -1.0);
+                    assert!(max.is_nan() && max.is_sign_positive(), "{max}");
+                }
+            }};
+        }
+        nan_case!(Float64Array, f64);
+        nan_case!(Float32Array, f32);
     }
 
     #[test]
@@ -7417,7 +7502,7 @@ mod tests {
             let cache_root = std::env::temp_dir()
                 .join("infino-manifest-cache-loader-test-disk_cache_hit_second_loader");
             let _ = std::fs::remove_dir_all(&cache_root);
-            let cache = ManifestDiskCache::new(cache_root.clone(), 1 << 20).expect("cache");
+            let cache = MetadataDiskCache::new(cache_root.clone(), 1 << 20).expect("cache");
 
             // Loader A: cold — one storage GET, cache populated.
             let loader_a = ManifestPartLoader::new_with_cache(
@@ -7460,7 +7545,7 @@ mod tests {
             let cache_root = std::env::temp_dir()
                 .join("infino-manifest-cache-loader-test-grows_to_hold_every_part");
             let _ = std::fs::remove_dir_all(&cache_root);
-            let cache = ManifestDiskCache::new(cache_root.clone(), 1).expect("cache");
+            let cache = MetadataDiskCache::new(cache_root.clone(), 1).expect("cache");
 
             for _ in 0..2 {
                 let loader = ManifestPartLoader::new_with_cache(
@@ -8658,7 +8743,7 @@ mod tests {
             make_superfile_entry(100, hash_bucket_0_pk()),
             make_superfile_entry(50, hash_bucket_0_pk()),
         ];
-        let published = slow_vector_state::write_state(storage.as_ref(), &entries, None)
+        let published = slow_vector_state::write_state(storage.as_ref(), None, &entries, None)
             .await
             .expect("write blob");
         let (blob_uri, blob_hash) = (published.uri, published.content_hash);
@@ -8730,7 +8815,7 @@ mod tests {
     async fn state_blob_hydrates_stripped_for_all_consumers() {
         let (_dir, storage) = local_storage();
         let entries = vec![make_summary_entry(100), make_summary_entry(50)];
-        let published = slow_vector_state::write_state(storage.as_ref(), &entries, None)
+        let published = slow_vector_state::write_state(storage.as_ref(), None, &entries, None)
             .await
             .expect("write blobs");
         persist_two_entry_table(
@@ -9425,7 +9510,7 @@ mod tests {
             make_superfile_entry(100, hash_bucket_0_pk()),
             make_superfile_entry(50, hash_bucket_0_pk()),
         ];
-        let published = slow_vector_state::write_state(storage.as_ref(), &entries, None)
+        let published = slow_vector_state::write_state(storage.as_ref(), None, &entries, None)
             .await
             .expect("write blob");
         let (blob_uri, blob_hash) = (published.uri, published.content_hash);

@@ -1871,6 +1871,7 @@ mod vector_summary_tests {
         assert_eq!(decoded.n_cent, n_cent);
         assert_eq!(decoded.dim, DIM as u32);
         assert_eq!(decoded.counts, counts);
+        assert_eq!(decoded.rows(), 13, "row total is the sum of counts");
         assert!(
             !decoded.vectors_resident(),
             "routing decode must land in the stripped shape"

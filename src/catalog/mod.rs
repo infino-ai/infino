@@ -66,7 +66,7 @@ use datafusion::{
         },
     },
 };
-use futures::future::try_join_all;
+use futures::{StreamExt, TryStreamExt, stream};
 pub(crate) use index_spec::DEFAULT_ROT_SEED;
 pub use index_spec::{FtsField, IndexSpec};
 use manifest::{
@@ -141,7 +141,8 @@ use crate::{
     },
     supertable::{
         Supertable as SupertableHandle,
-        manifest::disk_cache::ManifestDiskCache,
+        gc::RECLAIM_CONCURRENCY,
+        manifest::disk_cache::MetadataDiskCache,
         options::SupertableOptions,
         query::{exec::common::collect_plan_metered, sql::sql_session_context},
         reader_cache::{DiskCacheConfig, DiskCacheError, DiskCacheStore},
@@ -599,7 +600,7 @@ impl Connection {
                 if let Some((cache, manifest_cache)) = disk_cache {
                     opts = opts
                         .with_disk_cache(cache)
-                        .with_manifest_disk_cache(manifest_cache);
+                        .with_metadata_disk_cache(manifest_cache);
                 }
 
                 // Honor the connection's read-consistency policy (default
@@ -782,7 +783,7 @@ impl Connection {
                 if let Some((cache, manifest_cache)) = disk_cache {
                     opts = opts
                         .with_disk_cache(cache)
-                        .with_manifest_disk_cache(manifest_cache);
+                        .with_metadata_disk_cache(manifest_cache);
                 }
                 // Honor the connection's read-consistency policy. Default is
                 // BoundedStaleness(1s): the per-query pointer re-check is
@@ -1023,11 +1024,18 @@ impl Connection {
                     // location. Listing is component-aware, so a sibling
                     // location sharing a string prefix never matches;
                     // deletes are idempotent, so re-running after a
-                    // partial failure converges.
+                    // partial failure converges. At most
+                    // `RECLAIM_CONCURRENCY` in flight, as GC deletes: a
+                    // table can hold many thousands of objects, and dialing
+                    // a connection for each at once crowds the client.
                     bridge_on_runtime(
                         async {
                             let objects = root.list_with_prefix(&location).await?;
-                            try_join_all(objects.iter().map(|uri| root.delete(uri))).await?;
+                            stream::iter(&objects)
+                                .map(|uri| root.delete(uri))
+                                .buffer_unordered(RECLAIM_CONCURRENCY)
+                                .try_collect::<()>()
+                                .await?;
                             Ok::<(), StorageError>(())
                         },
                         &shared_io_runtime(),
@@ -1870,7 +1878,7 @@ fn build_disk_cache(
     storage: &Arc<dyn StorageProvider>,
     name: &str,
     location: &str,
-) -> Result<Option<(Arc<DiskCacheStore>, Arc<ManifestDiskCache>)>, InfinoError> {
+) -> Result<Option<(Arc<DiskCacheStore>, Arc<MetadataDiskCache>)>, InfinoError> {
     let Some(cache_root) = options.cache_dir.as_ref() else {
         return Ok(None);
     };
@@ -1894,7 +1902,7 @@ fn build_disk_cache(
     if options.cache_budget_bytes.is_none() {
         cache.mark_budget_auto_sized();
     }
-    let manifest_cache = ManifestDiskCache::new(
+    let manifest_cache = MetadataDiskCache::new(
         table_root.join(MANIFEST_CACHE_SUBDIR),
         MANIFEST_CACHE_BUDGET_BYTES,
     )
@@ -4344,6 +4352,74 @@ mod tests {
             files_under_location(dir.path(), "docs-"),
             0,
             "purge must delete every object under the dropped table's location"
+        );
+    }
+
+    /// A purge keeps at most `RECLAIM_CONCURRENCY` deletes in flight, as GC
+    /// does, however many objects the table holds, and still deletes them
+    /// all.
+    #[test]
+    fn drop_with_purge_bounds_deletes_in_flight() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wrappers = Arc::new(Mutex::new(Vec::<Arc<FaultStorage>>::new()));
+        let wrapping = Arc::clone(&wrappers);
+        let options = ConnectOptions::new().with_storage_wrapper(move |inner| {
+            let wrapped = FaultStorage::wrap(inner);
+            wrapping
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(Arc::clone(&wrapped));
+            wrapped
+        });
+        let conn = connect_with(dir.path().to_str().expect("utf8 path"), options).expect("connect");
+        conn.create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create")
+            .append(&build_title_batch(&["a lazy sleeping fox"]))
+            .expect("append");
+
+        // More objects under the table's location than one round of
+        // deletes may take.
+        let location = fs::read_dir(dir.path())
+            .expect("read catalog root")
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.is_dir()
+                    && path
+                        .file_name()
+                        .is_some_and(|name| name.to_string_lossy().starts_with("docs-"))
+            })
+            .expect("the table's location");
+        let filler = location.join("filler");
+        fs::create_dir_all(&filler).expect("filler dir");
+        for i in 0..RECLAIM_CONCURRENCY + 64 {
+            fs::write(filler.join(i.to_string()), b"x").expect("filler object");
+        }
+
+        conn.drop_table("docs", true).expect("drop with purge");
+
+        let mut left = 0;
+        let mut dirs = vec![location];
+        while let Some(d) = dirs.pop() {
+            for entry in fs::read_dir(&d).into_iter().flatten().flatten() {
+                if entry.path().is_dir() {
+                    dirs.push(entry.path());
+                } else {
+                    left += 1;
+                }
+            }
+        }
+        assert_eq!(left, 0, "the purge deletes every object");
+        let most = wrappers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .map(|wrapped| wrapped.most_deletes_in_flight())
+            .max()
+            .expect("a wrapped provider");
+        assert!(
+            (2..=RECLAIM_CONCURRENCY).contains(&most),
+            "the purge runs deletes side by side, at most {RECLAIM_CONCURRENCY}; saw {most}"
         );
     }
 
@@ -7677,7 +7753,7 @@ storage:
             opts.disk_cache.is_none(),
             "memory table took the config's disk cache"
         );
-        assert!(opts.manifest_disk_cache.is_none());
+        assert!(opts.metadata_disk_cache.is_none());
         assert_eq!(opts.superfile_buffer_split_mb, 512);
     }
 }

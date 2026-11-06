@@ -7678,6 +7678,18 @@ mod tests {
     const DROP_TEST_JOBS: usize = MAX_FAILURES_IN_A_ROW + 1;
     /// Arms a fault for every pointer swap the dropped-batch tests can make.
     const EVERY_POINTER_SWAP: usize = 1_000;
+    /// Faults a pass stopped by the cap can fire: the cap's own, and one more
+    /// from a merge admitted while the capping commit was still out. With one
+    /// merge at a time the pass admits the next merge once a commit has been
+    /// out for [`MERGE_ADMIT_SETTLE`], before it knows that commit failed, and
+    /// that merge then finishes and commits like any merge running when the
+    /// cap is reached. Whether it was admitted depends on how long the commit
+    /// took, so a test can count on either number but not on one of them.
+    const MAX_FAULTS_AT_THE_CAP: usize = MAX_FAILURES_IN_A_ROW + 1;
+    /// Jobs in the tests that stop at the cap: one more than the merge the
+    /// capping commit may let in, so the last job is never started however
+    /// the timing falls.
+    const CAP_TEST_JOBS: usize = MAX_FAULTS_AT_THE_CAP + 1;
 
     /// A table over fault storage holding `jobs` pairs of mergeable
     /// superfiles, with one two-input job per pair.
@@ -7785,7 +7797,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn failures_in_a_row_stop_the_pass() {
         let dir = TempDir::new().expect("tempdir");
-        let (faults, st, jobs) = fault_st_with_pair_jobs(&dir, DROP_TEST_JOBS);
+        let (faults, st, jobs) = fault_st_with_pair_jobs(&dir, CAP_TEST_JOBS);
         let all_inputs: Vec<Uuid> = jobs.iter().flat_map(|j| j.inputs.clone()).collect();
         faults.fail(FaultOp::PutIfMatch, POINTER_PATH, EVERY_POINTER_SWAP);
 
@@ -7798,10 +7810,11 @@ mod tests {
             matches!(err, CompactionError::BatchDropped(_)),
             "unexpected error: {err:?}"
         );
-        assert_eq!(
-            faults.fired(),
-            MAX_FAILURES_IN_A_ROW,
-            "the job after the cap must not be started"
+        let fired = faults.fired();
+        assert!(
+            (MAX_FAILURES_IN_A_ROW..=MAX_FAULTS_AT_THE_CAP).contains(&fired),
+            "the pass stops at the cap and starts no job after the one the capping commit \
+             let in: {fired} faults"
         );
         let listed = listed_ids(&st);
         let wal_store = plain_wal_store(&dir);
@@ -7993,7 +8006,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn upload_and_commit_failures_share_the_cap() {
         let dir = TempDir::new().expect("tempdir");
-        let (faults, st, jobs) = fault_st_with_pair_jobs(&dir, DROP_TEST_JOBS);
+        let (faults, st, jobs) = fault_st_with_pair_jobs(&dir, CAP_TEST_JOBS);
         let all_inputs: Vec<Uuid> = jobs.iter().flat_map(|j| j.inputs.clone()).collect();
         faults.fail(FaultOp::PutAtomic, SUPERFILE_UPLOAD, 1);
         faults.fail(FaultOp::PutIfMatch, POINTER_PATH, EVERY_POINTER_SWAP);
@@ -8007,10 +8020,11 @@ mod tests {
             matches!(err, CompactionError::BatchDropped(_)),
             "unexpected error: {err:?}"
         );
-        assert_eq!(
-            faults.fired(),
-            MAX_FAILURES_IN_A_ROW,
-            "one upload and two commits failed, and the last job never started"
+        let fired = faults.fired();
+        assert!(
+            (MAX_FAILURES_IN_A_ROW..=MAX_FAULTS_AT_THE_CAP).contains(&fired),
+            "one upload and two commits failed, at most one more commit from the merge the \
+             capping commit let in, and the last job never started: {fired} faults"
         );
         assert_untouched(&dir, &st, &all_inputs).await;
     }
