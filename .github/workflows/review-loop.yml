@@ -1,0 +1,314 @@
+name: Review loop
+
+# `/autofix` on a PR runs review -> fix rounds until nothing is left for the fixer, then every check
+# CI runs; it approves when nothing is left for it to fix and those checks pass on the head commit.
+# Started by hand, it can also review without fixing. Only maintainers (write access) can start it,
+# after reading the diff.
+#
+# `warm` builds main and saves the build cache the loop starts from. A loop started by a PR comment
+# may read the cache but not write it (GitHub gives `issue_comment` runs a read-only cache), so the
+# cache is written here instead: when main's dependencies or toolchain change, weekly (a cache unread
+# for 7 days is evicted, and the runner image's toolchain moves), and by hand. It runs the same `loop`
+# job as a review, so its cache key and paths are the ones a review looks up.
+on:
+  issue_comment:
+    types: [created]
+  push:
+    branches: [main]
+    paths: [Cargo.lock, rust-toolchain.toml, .github/workflows/review-loop.yml]
+  schedule:
+    - cron: "23 3 * * 1"
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: PR number (not used by warm)
+        required: false
+      mode:
+        description: autofix, review (no fixes), or warm (build main into the cache)
+        default: autofix
+        type: choice
+        options: [autofix, review, warm]
+      reviewer_model:
+        description: Reviewer (Codex, through the Azure OpenAI endpoint)
+        default: gpt-6.1-sol
+      reviewer_effort:
+        description: Reviewer reasoning effort
+        default: high
+        type: choice
+        options: [medium, high, xhigh]
+      fixer_model:
+        description: Fixer (Claude Code, through Azure Foundry)
+        default: claude-opus-5-5-fast
+      max_iterations:
+        description: Most review rounds; a fix follows a review only when the reviewer asks for one
+        default: "3"
+
+# Reads use the workflow token; every write goes through the two bots' App tokens.
+permissions:
+  contents: read
+  pull-requests: read
+  issues: read
+
+jobs:
+  # Decide whether this event is a loop request, and with which settings, before paying for a runner
+  # with Rust and the agents on it.
+  request:
+    # GitHub cannot filter comment events by text, so this expression does the rough cut without a
+    # runner: other comments end as skipped, and the bots' own comments (App tokens start workflows,
+    # unlike the workflow token) are ignored. The step below checks the command exactly.
+    if: >-
+      github.event_name == 'workflow_dispatch' || github.event_name == 'push' ||
+      github.event_name == 'schedule' ||
+      (github.event.issue.pull_request && github.event.comment.user.type != 'Bot' &&
+       contains(github.event.comment.body, '/autofix'))
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+    outputs:
+      go: ${{ steps.req.outputs.go }}
+      pr: ${{ steps.req.outputs.pr }}
+      mode: ${{ steps.req.outputs.mode }}
+      reviewer: ${{ steps.req.outputs.reviewer }}
+      effort: ${{ steps.req.outputs.effort }}
+      fixer: ${{ steps.req.outputs.fixer }}
+      iter: ${{ steps.req.outputs.iter }}
+      head: ${{ steps.req.outputs.head }}
+    steps:
+      - name: Resolve the request
+        id: req
+        env:
+          EVENT: ${{ github.event_name }}
+          COMMENT: ${{ github.event.comment.body }}
+          COMMENTER: ${{ github.event.comment.user.login }}
+          ISSUE: ${{ github.event.issue.number }}
+          IN_PR: ${{ github.event.inputs.pr }}
+          IN_MODE: ${{ github.event.inputs.mode }}
+          IN_REVIEWER: ${{ github.event.inputs.reviewer_model }}
+          IN_EFFORT: ${{ github.event.inputs.reviewer_effort }}
+          IN_FIXER: ${{ github.event.inputs.fixer_model }}
+          IN_ITER: ${{ github.event.inputs.max_iterations }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          # The loop spends model credits, runs the PR's code with the model keys in its environment,
+          # and pushes to the PR's branch: only maintainers (write access now, as GitHub reports it)
+          # may start it. Their `/autofix` says they have read the diff and trust its code to run.
+          # Anyone else is ignored without a run; a failed lookup counts as no access.
+          allowed() {
+            perm=$(gh api "repos/$REPO/collaborators/$1/permission" --jq .permission 2>/dev/null) || return 1
+            case "$perm" in admin|maintain|write) return 0;; *) return 1;; esac
+          }
+          refuse() { echo "go=false" >> "$GITHUB_OUTPUT"; echo "::notice::$1 has no write access; nothing to do"; exit 0; }
+          if [ "$EVENT" = "issue_comment" ]; then
+            # The command is the comment's first non-blank line, so leading blank lines do not hide it.
+            command=$(printf '%s\n' "$COMMENT" | awk 'NF { print $1; exit }')
+            case "$command" in
+              /autofix) mode=autofix;;
+              *) echo "go=false" >> "$GITHUB_OUTPUT"; echo "not a loop command"; exit 0;;
+            esac
+            allowed "$COMMENTER" || refuse "$COMMENTER"
+            pr="$ISSUE"; reviewer=gpt-6.1-sol; effort=high; fixer=claude-opus-5-5-fast; iter=3
+          elif [ "$EVENT" = "push" ] || [ "$EVENT" = "schedule" ] || [ "$IN_MODE" = "warm" ]; then
+            # Builds main into the cache: no PR code, no model, no push.
+            { echo "go=true"; echo "mode=warm"; echo "pr=warm"; echo "head=main"; } >> "$GITHUB_OUTPUT"
+            echo "warm: build main into the cache"
+            exit 0
+          else
+            allowed "$ACTOR" || refuse "$ACTOR"
+            pr="$IN_PR"; mode="$IN_MODE"; reviewer="$IN_REVIEWER"; effort="$IN_EFFORT"
+            fixer="$IN_FIXER"; iter="$IN_ITER"
+          fi
+          case "$pr" in ''|*[!0-9]*) echo "::error::bad PR number"; exit 1;; esac
+          case "$iter" in ''|*[!0-9]*) echo "::error::bad max_iterations"; exit 1;; esac
+          meta=$(gh api "repos/$REPO/pulls/$pr")
+          # A fork's branch takes the App's push only when its author allows edits by maintainers;
+          # without that, the loop can review but has nowhere to put fixes.
+          fork=$(jq -r '.head.repo.full_name != .base.repo.full_name' <<<"$meta")
+          if [ "$fork" = true ] && [ "$(jq -r .maintainer_can_modify <<<"$meta")" != true ] && [ "$mode" = autofix ]; then
+            echo "::notice::the fork does not allow edits by maintainers; reviewing only"
+            mode=review
+          fi
+          # Checked out from this repository (all of the base branch's history is here, a fork's may
+          # lag); fixes are pushed to the PR's branch wherever it lives.
+          head="refs/pull/$pr/head"
+          {
+            echo "go=true"; echo "pr=$pr"; echo "mode=$mode"; echo "iter=$iter"; echo "head=$head"
+            echo "reviewer=$reviewer"; echo "effort=$effort"; echo "fixer=$fixer"
+          } >> "$GITHUB_OUTPUT"
+          echo "PR #$pr ($head): $mode, reviewer $reviewer ($effort), fixer $fixer, up to $iter rounds"
+
+  loop:
+    needs: request
+    if: needs.request.outputs.go == 'true'
+    # One loop per PR at a time; a second request waits rather than racing the first on the branch.
+    concurrency:
+      group: review-loop-${{ needs.request.outputs.pr }}
+      cancel-in-progress: false
+    # The rounds rebuild the crate after every fix and the final gates run every check CI runs; a
+    # larger runner, when the REVIEW_LOOP_RUNNER variable names one, makes both several times faster.
+    runs-on: ${{ vars.REVIEW_LOOP_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 300
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      CARGO_TERM_COLOR: always
+      RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=lld
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
+    steps:
+      - name: Check out the loop
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.REVIEW_LOOP_REPO }}
+          ssh-key: ${{ secrets.REVIEW_LOOP_DEPLOY_KEY }}
+          path: tools
+          sparse-checkout: .review-loop
+          persist-credentials: false
+
+      - name: Check out the PR
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.request.outputs.head }}
+          path: pr
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Every test binary of the crate, as the final test gate builds, overflows the runner's free
+      # disk, as it does for CI's test job; free the same space it does.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup
+          sudo docker image prune --all --force > /dev/null
+          sudo swapoff -a && sudo rm -f /mnt/swapfile
+          df -h /
+          echo "runner: $RUNNER_NAME, $(nproc) cores, $(free -g | awk '/Mem:/ {print $2}') GB"
+
+      - name: Install lld
+        run: sudo apt-get install -y --no-install-recommends lld
+
+      # The cache key hashes every installed Rust toolchain. The runner image's own `stable` moves
+      # when GitHub updates the image, which would change the key under an unchanged repo; with only
+      # the pinned toolchain left, the key changes only when the pin does.
+      - name: Install the PR's Rust toolchain
+        working-directory: pr
+        run: |
+          rustup toolchain install && rustup component add rustfmt clippy
+          rustup default "$(rustup show active-toolchain | cut -d' ' -f1)"
+          rustup toolchain uninstall stable || true
+          rustup toolchain list
+
+      # Caches the dependencies' build only (the action drops the crate's own artifacts, which a
+      # PR's changes would make stale). Only a warm run saves it, so the loop keeps one entry, built
+      # from main; a loop on a PR reads it, and the dependencies that differ (a few at most) rebuild.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: pr -> target
+          # Bumped when what the warm build puts in the cache changes: an exact key match is never
+          # saved again, so new contents need a new key.
+          prefix-key: v1-rust
+          save-if: ${{ needs.request.outputs.mode == 'warm' }}
+          # A warm build that fails part way still saves the dependencies it finished.
+          cache-on-failure: true
+
+      # The final gates run every check CI runs, with the tool versions CI pins: the suite under
+      # nextest with coverage floors, and the public API snapshot.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.143,cargo-llvm-cov@0.9.1,cargo-public-api
+
+      # The public API check builds rustdoc JSON, which needs nightly; CI pins one because a newer
+      # nightly changes the listing by itself. Installed after the cache step, so it stays out of
+      # the cache key.
+      - name: Install the nightly CI pins for the public API check
+        run: |
+          pin() { sed -n 's/^ *PUBLIC_API_NIGHTLY: *//p' | head -n 1; }
+          nightly=$(pin < pr/.github/workflows/ci.yml)
+          # A PR from before CI pinned one: the pin main's CI uses now.
+          nightly=${nightly:-$(gh api "repos/$REPO/contents/.github/workflows/ci.yml" --jq .content | base64 -d | pin)}
+          [ -n "$nightly" ] || { echo "::error::no PUBLIC_API_NIGHTLY pin in CI"; exit 1; }
+          rustup toolchain install "$nightly" --profile minimal
+          echo "PUBLIC_API_NIGHTLY=$nightly" >> "$GITHUB_ENV"
+
+      # Warm: build what a loop builds, in the foreground, and stop; the cache is saved after the job.
+      - name: Build main for the cache
+        if: needs.request.outputs.mode == 'warm'
+        working-directory: pr
+        run: |
+          cargo test --features test-helpers --lib --no-run
+          cargo test --features test-helpers --no-run
+          cargo clippy --all-targets --features test-helpers
+          # The final gates' other builds: the instrumented suite and the public API's rustdoc.
+          cargo llvm-cov --no-report nextest --features test-helpers,graph-index --no-tests=pass -E 'none()'
+          RUSTUP_TOOLCHAIN=$PUBLIC_API_NIGHTLY cargo public-api --simplified > /dev/null
+
+      # Overlaps the cold build with the first review. The fixer's and the gates' cargo calls wait
+      # on cargo's lock for it instead of each starting the same build: the library's tests first,
+      # which the fixer runs, then every test binary and clippy, which the final gates run.
+      - name: Start the Rust build in the background
+        if: needs.request.outputs.mode != 'warm'
+        working-directory: pr
+        run: |
+          # rust-cache turns incremental builds off for the job (they bloat a saved cache). Nothing
+          # built here is saved, and the fixer rebuilds the crate after every edit, so turn them on.
+          export CARGO_INCREMENTAL=1
+          nohup sh -c 'cargo test --features test-helpers --lib --no-run &&
+            cargo test --features test-helpers --no-run &&
+            cargo clippy --all-targets --features test-helpers &&
+            cargo llvm-cov --no-report nextest --features test-helpers,graph-index --no-tests=pass -E \"none()\" &&
+            RUSTUP_TOOLCHAIN=$PUBLIC_API_NIGHTLY cargo public-api --simplified > /dev/null' > "$RUNNER_TEMP/warm-build.log" 2>&1 &
+
+      - name: Install Claude Code and Codex
+        if: needs.request.outputs.mode != 'warm'
+        run: npm install -g @anthropic-ai/claude-code@2.1.317 @openai/codex@0.166.0
+
+      - uses: astral-sh/setup-uv@v6
+        if: needs.request.outputs.mode != 'warm'
+        with:
+          # The cache holds builds only; the loop's few Python packages download in seconds.
+          enable-cache: false
+
+      - name: Run the loop
+        if: needs.request.outputs.mode != 'warm'
+        env:
+          CLAUDE_CODE_USE_FOUNDRY: "1"
+          # Opus has its own Foundry deployment; the other Claude models share the general one.
+          ANTHROPIC_FOUNDRY_API_KEY: ${{ contains(needs.request.outputs.fixer, 'opus') && secrets.OPUS_FOUNDRY_API_KEY || secrets.ANTHROPIC_FOUNDRY_API_KEY }}
+          ANTHROPIC_FOUNDRY_BASE_URL: ${{ contains(needs.request.outputs.fixer, 'opus') && secrets.OPUS_FOUNDRY_BASE_URL || secrets.ANTHROPIC_FOUNDRY_BASE_URL }}
+          AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
+          # The runner is a throwaway machine; Codex's own sandbox needs kernel features it may lack.
+          REVIEWLOOP_CODEX_NO_SANDBOX: "1"
+          REVIEWER_APP_ID: ${{ secrets.REVIEWER_APP_ID }}
+          REVIEWER_APP_PRIVATE_KEY: ${{ secrets.REVIEWER_APP_PRIVATE_KEY }}
+          AUTOFIXER_APP_ID: ${{ secrets.AUTOFIXER_APP_ID }}
+          AUTOFIXER_APP_PRIVATE_KEY: ${{ secrets.AUTOFIXER_APP_PRIVATE_KEY }}
+          PR: ${{ needs.request.outputs.pr }}
+          MODE: ${{ needs.request.outputs.mode }}
+          REVIEWER: ${{ needs.request.outputs.reviewer }}
+          EFFORT: ${{ needs.request.outputs.effort }}
+          FIXER: ${{ needs.request.outputs.fixer }}
+          ITER: ${{ needs.request.outputs.iter }}
+          # Only comments by people with write access (and installed bots) reach the agents.
+          REVIEWLOOP_TRUST: writers
+        run: |
+          export CARGO_INCREMENTAL=1
+          args=(--repo "$REPO" --pr "$PR" --workdir pr
+                --reviewer-model "$REVIEWER" --reviewer-effort "$EFFORT" --fixer-model "$FIXER"
+                --max-iterations "$ITER")
+          [ "$MODE" = review ] && args+=(--review-only)
+          uv run --project tools/.review-loop reviewloop "${args[@]}"
+
+      - name: Show the background build
+        if: always() && needs.request.outputs.mode != 'warm'
+        run: tail -n 20 "$RUNNER_TEMP/warm-build.log" || true
+
+      # The run's files hold every prompt and the agents' whole output. Anyone can download a public
+      # repository's artifacts, so they are kept only for a private one.
+      - name: Keep the run's files
+        if: always() && needs.request.outputs.mode != 'warm' && github.event.repository.private
+        uses: actions/upload-artifact@v4
+        with:
+          name: review-loop-pr-${{ needs.request.outputs.pr }}-${{ github.run_id }}
+          path: |
+            runs/
+            ${{ runner.temp }}/warm-build.log
+          if-no-files-found: ignore
