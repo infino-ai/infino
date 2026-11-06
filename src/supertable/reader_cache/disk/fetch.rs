@@ -3243,6 +3243,10 @@ mod tests {
 
         assert!(store.is_mmap_promoted(&uri));
         assert_eq!(most_reserved, size - vec_len, "the hole is never reserved");
+        // The stream open's block write may still be queued: its run is charged before it lands,
+        // and it lands on the shared I/O runtime, which under load can run it after the download
+        // is done.
+        store.block_writes_settled().await;
         store.assert_budget_consistent();
     }
 
