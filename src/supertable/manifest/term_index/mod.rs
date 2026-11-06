@@ -10632,6 +10632,22 @@ mod tests {
         assert_eq!(root.layers[0].slices.len(), 1, "a small run is one range");
     }
 
+    /// One mark per slice is taken only when each layer has about a slice
+    /// per range: layers of one slice each, every one spanning the key
+    /// space, would put every mark at the start.
+    #[test]
+    fn one_mark_per_slice_needs_slices_spread_over_each_layer() {
+        assert!(build::one_mark_per_slice(1200, 4, 4, 64));
+        assert!(
+            !build::one_mark_per_slice(300, 128, 4, 64),
+            "enough slices per range, but layers of about two slices for four ranges"
+        );
+        assert!(
+            !build::one_mark_per_slice(200, 2, 4, 64),
+            "layers spread, but too few slices per range"
+        );
+    }
+
     /// A failed put ends the upload while the merge still holds its sink
     /// open, so the merge's next send fails and the merge stops.
     #[test]
