@@ -289,6 +289,14 @@ pub(crate) struct Run {
     pub(crate) legacy_bound: bool,
 }
 
+impl Run {
+    /// Heap bytes the run holds decoded: its postings and inline tier entries.
+    pub(crate) fn decoded_bytes(&self) -> usize {
+        let inline = self.tier.as_ref().map_or(0, |tier| tier.inline.len());
+        self.postings.len() * size_of::<Posting>() + inline * size_of::<TierEntry>()
+    }
+}
+
 /// A bound stored by the layout before tiers — the term's best BM25 score
 /// in a superfile at that superfile's own idf — as the key the current
 /// layout stores: the factor the score multiplies the idf by. `n` is the
@@ -1165,20 +1173,24 @@ impl<'a> Slice<'a> {
     }
 
     /// Up to `limit` terms from `start` on, `start` included (from the
-    /// first term when `None`), in key order, with their runs.
+    /// first term when `None`), in key order, with their runs, stopping
+    /// once they hold `max_bytes` decoded.
     pub(crate) fn terms_from(
         &self,
         start: Option<&[u8]>,
         limit: usize,
+        max_bytes: usize,
     ) -> Result<Vec<(Vec<u8>, Run)>, TermIndexError> {
         let mut out = Vec::new();
+        let mut held = 0;
         let mut failed: Option<TermIndexError> = None;
         self.dict
             .for_each_from(b"", start.unwrap_or_default(), |key, value| {
                 match self.run_at(value) {
                     Ok(run) => {
+                        held += key.len() + run.decoded_bytes();
                         out.push((key.to_vec(), run));
-                        out.len() < limit
+                        out.len() < limit && held < max_bytes
                     }
                     Err(e) => {
                         failed = Some(e);
@@ -1193,14 +1205,16 @@ impl<'a> Slice<'a> {
     }
 
     /// Up to `limit` terms after `after` (from the first term when `None`),
-    /// in key order, with their runs. A walk resumes by passing the last
-    /// key it got back.
+    /// in key order, with their runs, stopping once they hold `max_bytes`
+    /// decoded. A walk resumes by passing the last key it got back.
     pub(crate) fn terms_after(
         &self,
         after: Option<&[u8]>,
         limit: usize,
+        max_bytes: usize,
     ) -> Result<Vec<(Vec<u8>, Run)>, TermIndexError> {
         let mut out = Vec::new();
+        let mut held = 0;
         let mut failed: Option<TermIndexError> = None;
         self.dict
             .for_each_from(b"", after.unwrap_or_default(), |key, value| {
@@ -1209,8 +1223,9 @@ impl<'a> Slice<'a> {
                 }
                 match self.run_at(value) {
                     Ok(run) => {
+                        held += key.len() + run.decoded_bytes();
                         out.push((key.to_vec(), run));
-                        out.len() < limit
+                        out.len() < limit && held < max_bytes
                     }
                     Err(e) => {
                         failed = Some(e);

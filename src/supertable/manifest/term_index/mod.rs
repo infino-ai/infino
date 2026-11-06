@@ -3247,7 +3247,10 @@ mod tests {
         for (i, (_, bytes)) in m.slices.iter().enumerate() {
             let bytes = bytes_of(bytes);
             let slice = Slice::open(&bytes).expect("open");
-            for (key, run) in slice.terms_after(None, usize::MAX).expect("terms") {
+            for (key, run) in slice
+                .terms_after(None, usize::MAX, usize::MAX)
+                .expect("terms")
+            {
                 let mut entries: Vec<tier::TierEntry> = match &run.tier {
                     None => Vec::new(),
                     Some(t) if t.chunks.is_empty() => t.inline.clone(),
@@ -4327,6 +4330,54 @@ mod tests {
         assert!(runs.len() == 1 && runs[0].run.legacy_bound && runs[0].tier_object.is_none());
     }
 
+    /// A merge cursor's decoded batch stays within the memory a fold plans
+    /// per cursor, however many superfiles each of its terms spans.
+    #[test]
+    fn a_merge_cursor_batch_fits_the_fold_budget_per_cursor() {
+        const SUPERFILES: u128 = 64;
+        const TERMS: usize = 4096;
+        let dir = TempDir::new().expect("tempdir");
+        let names: Vec<String> = (0..TERMS).map(|t| format!("t{t:05}")).collect();
+        let terms: Vec<(&str, &str, u64)> = names.iter().map(|t| ("body", t.as_str(), 2)).collect();
+        let contributions: Vec<Contribution> = (0..SUPERFILES)
+            .map(|id| contribution(&dir, id, &terms))
+            .collect();
+        let policy = BuildPolicy::default();
+        let built = build(&contributions, &policy).expect("build");
+        let files: Vec<build::SliceFile> = built.root.layers[0]
+            .slices
+            .iter()
+            .map(|slice| {
+                let (_, bytes) = built
+                    .slices
+                    .iter()
+                    .find(|(hash, _)| *hash == slice.content_hash)
+                    .expect("the build holds the slice");
+                let path = dir
+                    .path()
+                    .join(format!("{}.slice", slice.content_hash.to_hex()));
+                fs::write(&path, bytes_of(bytes)).expect("place slice");
+                build::SliceFile {
+                    path,
+                    first_key: slice.first_key.clone(),
+                    last_key: slice.last_key.clone(),
+                    base: 0,
+                }
+            })
+            .collect();
+        let mut cursor = build::LayerCursor::new(&files, None, None, policy.tier_read_window_bytes);
+        let (mut seen, mut peak) = (0, 0);
+        while cursor.next().expect("next").is_some() {
+            seen += 1;
+            peak = peak.max(cursor.decoded_bytes());
+        }
+        assert_eq!(seen, TERMS);
+        assert!(
+            peak as u64 <= FOLD_CURSOR_BYTES,
+            "a batch held {peak} bytes decoded"
+        );
+    }
+
     /// A merge that rewrites a layer of the layout before tiers writes
     /// its bounds as the keys the current layout stores, through each
     /// superfile's scored document count.
@@ -5175,6 +5226,51 @@ mod tests {
                 .cloned(),
             reference
         );
+    }
+
+    /// Maintenance-only optimizes over an unchanged table with one superfile
+    /// per manifest part keep the root, even from a freshly opened handle
+    /// and after a compaction left replaced superfiles in it.
+    #[test]
+    fn repeat_maintenance_over_single_superfile_parts_keeps_the_root() {
+        const COMMITS: usize = 40;
+        const PASSES: usize = 4;
+        const MERGE_MIN_SUPERFILES: u64 = 4;
+        let (_dir, storage, _) = fresh_table();
+        let options = || fresh_options(&storage).with_target_superfiles_per_part(1);
+        let st = Supertable::open(options()).expect("open");
+        for layer in 0..COMMITS {
+            commit_layer(&st, layer);
+        }
+        st.optimize(&OptimizeOptions::compact(CompactionSettings {
+            min_superfiles_for_merge: MERGE_MIN_SUPERFILES,
+            ..CompactionSettings::default()
+        }))
+        .expect("compacting optimize");
+        for layer in 0..COMMITS {
+            commit_layer(&st, layer);
+        }
+        let maintenance = maintenance_only_options().with_steps(OptimizeSteps {
+            drain_hidden_cells: false,
+            compact: false,
+            ..OptimizeSteps::default()
+        });
+        st.optimize(&maintenance)
+            .expect("first maintenance optimize");
+        drop(st);
+        let term_index = |st: &Supertable| {
+            st.reader()
+                .expect("reader")
+                .manifest()
+                .term_index_ref()
+                .cloned()
+        };
+        for pass in 0..PASSES {
+            let st = Supertable::open(options().with_eager_load_threshold(0)).expect("open");
+            let before = term_index(&st);
+            st.optimize(&maintenance).expect("optimize");
+            assert_eq!(term_index(&st), before, "pass {pass} changed the root");
+        }
     }
 
     /// An append after the last optimize publishes its own delta layer, so
@@ -9842,7 +9938,7 @@ mod tests {
         let bytes = bytes_of(&built.slices[0].1);
         let terms = Slice::open(&bytes)
             .expect("open")
-            .terms_after(None, usize::MAX)
+            .terms_after(None, usize::MAX, usize::MAX)
             .expect("terms");
         let dictionary = format::SliceDictionary::open(&bytes).expect("dictionary");
         let starts = dictionary.block_starts().expect("starts");
