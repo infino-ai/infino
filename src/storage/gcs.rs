@@ -494,18 +494,23 @@ impl StorageProvider for GcsStorageProvider {
 
     async fn delete(&self, uri: &str) -> Result<(), StorageError> {
         let path = self.path(uri)?;
-        match self.store.delete(&path).await {
-            Ok(()) => {
-                self.meter.record_delete();
-                Ok(())
-            }
-            // Idempotent delete: NotFound is success for the caller.
-            Err(ObjError::NotFound { .. }) => {
-                self.meter.record_delete();
-                Ok(())
-            }
-            Err(e) => Err(translate(uri, e)),
-        }
+        retry::delete_with_reissue(
+            || async { self.store.delete(&path).await },
+            |e| translate(uri, e),
+        )
+        .await?;
+        self.meter.record_delete();
+        Ok(())
+    }
+
+    async fn delete_once(&self, uri: &str) -> Result<(), StorageError> {
+        let path = self.path(uri)?;
+        retry::delete_once(async { self.store.delete(&path).await }, |e| {
+            translate(uri, e)
+        })
+        .await?;
+        self.meter.record_delete();
+        Ok(())
     }
 
     async fn list_with_prefix_metadata(
