@@ -64,7 +64,7 @@ use arrow::compute::kernels::aggregate as agg;
 use arrow_array::*;
 use arrow_schema::{DataType, TimeUnit};
 use bytes::Bytes;
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use futures::{
     future, stream,
     stream::{StreamExt, TryStreamExt},
@@ -420,6 +420,12 @@ pub struct ManifestSnapshot {
     /// list loads no part. A part's content never changes, so successor
     /// snapshots share the map.
     derived_length_totals: Arc<DashMap<PartId, PartLengthTotals>>,
+    /// Parts whose inline rollups [`Self::store_inline_rollups`] encoded
+    /// and found under the inline cap, so a later commit leaves them
+    /// without encoding them again. A part's rollups never change, so
+    /// successor snapshots share the set, as they share
+    /// `derived_length_totals`.
+    inline_rollups_fit: Arc<DashSet<PartId>>,
 }
 
 impl fmt::Debug for ManifestSnapshot {
@@ -481,6 +487,7 @@ impl ManifestSnapshot {
                 stamped_drained_ranges: None,
                 stamped_schema: None,
                 derived_length_totals: Default::default(),
+                inline_rollups_fit: Default::default(),
             }
         } else {
             Self {
@@ -493,6 +500,7 @@ impl ManifestSnapshot {
                 stamped_drained_ranges: None,
                 stamped_schema: None,
                 derived_length_totals: Default::default(),
+                inline_rollups_fit: Default::default(),
             }
         }
     }
@@ -518,6 +526,7 @@ impl ManifestSnapshot {
             stamped_drained_ranges: None,
             stamped_schema: None,
             derived_length_totals: Default::default(),
+            inline_rollups_fit: Default::default(),
         }
     }
 
@@ -538,6 +547,7 @@ impl ManifestSnapshot {
             stamped_drained_ranges: None,
             stamped_schema: None,
             derived_length_totals: Default::default(),
+            inline_rollups_fit: Default::default(),
         }
     }
 
@@ -591,6 +601,7 @@ impl ManifestSnapshot {
             stamped_drained_ranges: None,
             stamped_schema: None,
             derived_length_totals: Default::default(),
+            inline_rollups_fit: Default::default(),
         }
     }
 
@@ -673,6 +684,7 @@ impl ManifestSnapshot {
             stamped_drained_ranges: self.stamped_drained_ranges.clone(),
             stamped_schema: Some(schema),
             derived_length_totals: Arc::clone(&self.derived_length_totals),
+            inline_rollups_fit: Arc::clone(&self.inline_rollups_fit),
         }
     }
 
@@ -1377,6 +1389,10 @@ impl ManifestSnapshot {
                 .as_ref()
                 .map(|cur| Arc::clone(&cur.derived_length_totals))
                 .unwrap_or_default(),
+            inline_rollups_fit: current_manifest
+                .as_ref()
+                .map(|cur| Arc::clone(&cur.inline_rollups_fit))
+                .unwrap_or_default(),
         };
 
         record("parts", new_manifest.parts.len() as u64);
@@ -1432,8 +1448,9 @@ impl ManifestSnapshot {
         };
         // Step 1+2: parallel write of (list, parts). `parts_to_write` is
         // every object the touched parts publish, by key: the parts, their
-        // routing siblings and their summaries sections
-        // (`EncodedPart::objects`).
+        // routing siblings, their summaries sections and rollups
+        // (`EncodedPart::objects`), and the rollups objects untouched parts'
+        // inline rollups moved to (`Self::store_inline_rollups`).
         //
         // Both futures are independent — the list's references to
         // each part's URI are content-addressable from the
@@ -1690,6 +1707,74 @@ impl ManifestSnapshot {
         }
     }
 
+    /// Move into objects of their own the rollups this manifest's list
+    /// still carries inline past [`rollups::INLINE_ROLLUPS_MAX_BYTES`], and
+    /// name each object in the list instead. Returns the objects by storage
+    /// key, for the commit to write with its parts, before the list that
+    /// names them.
+    ///
+    /// A part's rollups get an object of their own when the part is written,
+    /// so a part from a list before major 4 kept its rollups inline in every
+    /// list after it: on a wide table those rollups were most of the list,
+    /// and every commit rewrote them and every loser of a commit race read
+    /// them again. Every such part moves in the first commit that carries
+    /// it. That commit writes, once, the bytes its list would otherwise have
+    /// carried, so it costs no more than the commit before it did, and every
+    /// list after it is smaller.
+    ///
+    /// The objects are content-addressed and a part's rollups encode the same
+    /// way every time, so a retried commit names the same objects. A hidden
+    /// manifest's rollups stay inline, as its parts' do.
+    ///
+    /// Telling whether a part's rollups pass the cap takes encoding them, so
+    /// a part found under it is remembered (`inline_rollups_fit`) and not
+    /// encoded again: on a table whose rollups all stay inline, only a
+    /// commit's new parts are encoded, once each.
+    pub(crate) fn store_inline_rollups(&mut self) -> Result<Vec<(String, Bytes)>, ManifestError> {
+        if matches!(
+            self.partition_strategy(),
+            Some(PartitionStrategy::VectorCell { .. })
+        ) {
+            return Ok(Vec::new());
+        }
+        let Some(list) = self.list.as_mut() else {
+            return Ok(Vec::new());
+        };
+        let mut objects = Vec::new();
+        for entry in &mut list.parts {
+            if entry.rollups != RollupsAt::Inline
+                || self.inline_rollups_fit.contains(&entry.part_id)
+            {
+                continue;
+            }
+            let Some(bytes) = rollups::encode(entry.part_id, &entry.scalar_stats_agg)? else {
+                self.inline_rollups_fit.insert(entry.part_id);
+                continue;
+            };
+            let content_hash = ContentHash::of(&bytes);
+            let uri = rollups_uri(&content_hash);
+            entry.rollups = RollupsAt::Stored(RollupsRef {
+                uri: uri.clone(),
+                content_hash,
+                size_bytes: bytes.len() as u64,
+            });
+            objects.push((uri, Bytes::from(bytes)));
+        }
+        // Forget parts this list no longer holds, so the set stays the size
+        // of the list and not of every part the handle has seen.
+        let held: HashSet<PartId> = list.parts.iter().map(|entry| entry.part_id).collect();
+        self.inline_rollups_fit
+            .retain(|part_id| held.contains(part_id));
+        Ok(objects)
+    }
+
+    /// Whether [`Self::store_inline_rollups`] has found part `part_id`'s
+    /// rollups under the inline cap.
+    #[cfg(test)]
+    fn rollups_known_to_fit(&self, part_id: PartId) -> bool {
+        self.inline_rollups_fit.contains(&part_id)
+    }
+
     /// Build a successor manifest with `new_entries` appended.
     /// Preserves the persistence-side metadata (`list`, `loader`)
     /// from the predecessor; the per-part cache is fresh (an empty
@@ -1707,6 +1792,7 @@ impl ManifestSnapshot {
             stamped_drained_ranges: self.stamped_drained_ranges.clone(),
             stamped_schema: self.stamped_schema.clone(),
             derived_length_totals: Arc::clone(&self.derived_length_totals),
+            inline_rollups_fit: Arc::clone(&self.inline_rollups_fit),
         }
     }
 
@@ -1757,6 +1843,7 @@ impl ManifestSnapshot {
             stamped_drained_ranges: self.stamped_drained_ranges.clone(),
             stamped_schema: self.stamped_schema.clone(),
             derived_length_totals: Arc::clone(&self.derived_length_totals),
+            inline_rollups_fit: Arc::clone(&self.inline_rollups_fit),
         }
     }
 
@@ -1883,6 +1970,7 @@ impl ManifestSnapshot {
             stamped_drained_ranges: self.stamped_drained_ranges.clone(),
             stamped_schema: self.stamped_schema.clone(),
             derived_length_totals: Arc::clone(&self.derived_length_totals),
+            inline_rollups_fit: Arc::clone(&self.inline_rollups_fit),
         }
     }
 
@@ -1924,6 +2012,7 @@ impl ManifestSnapshot {
             stamped_drained_ranges: self.stamped_drained_ranges.clone(),
             stamped_schema: self.stamped_schema.clone(),
             derived_length_totals: Arc::clone(&self.derived_length_totals),
+            inline_rollups_fit: Arc::clone(&self.inline_rollups_fit),
         }
     }
 
@@ -1982,6 +2071,7 @@ impl ManifestSnapshot {
             stamped_drained_ranges: self.stamped_drained_ranges.clone(),
             stamped_schema: self.stamped_schema.clone(),
             derived_length_totals: Arc::clone(&self.derived_length_totals),
+            inline_rollups_fit: Arc::clone(&self.inline_rollups_fit),
         }
     }
 
@@ -2005,6 +2095,7 @@ impl ManifestSnapshot {
             stamped_drained_ranges: self.stamped_drained_ranges.clone(),
             stamped_schema: self.stamped_schema.clone(),
             derived_length_totals: Arc::clone(&self.derived_length_totals),
+            inline_rollups_fit: Arc::clone(&self.inline_rollups_fit),
         }
     }
 
@@ -2029,6 +2120,7 @@ impl ManifestSnapshot {
             stamped_drained_ranges: Some(ranges),
             stamped_schema: self.stamped_schema.clone(),
             derived_length_totals: Arc::clone(&self.derived_length_totals),
+            inline_rollups_fit: Arc::clone(&self.inline_rollups_fit),
         }
     }
 
@@ -2053,6 +2145,7 @@ impl ManifestSnapshot {
             stamped_drained_ranges: self.stamped_drained_ranges.clone(),
             stamped_schema: self.stamped_schema.clone(),
             derived_length_totals: Arc::clone(&self.derived_length_totals),
+            inline_rollups_fit: Arc::clone(&self.inline_rollups_fit),
         }
     }
 
@@ -2082,6 +2175,7 @@ impl ManifestSnapshot {
             stamped_drained_ranges: self.stamped_drained_ranges.clone(),
             stamped_schema: self.stamped_schema.clone(),
             derived_length_totals: Arc::clone(&self.derived_length_totals),
+            inline_rollups_fit: Arc::clone(&self.inline_rollups_fit),
         }
     }
 
@@ -2105,6 +2199,7 @@ impl ManifestSnapshot {
             stamped_drained_ranges: self.stamped_drained_ranges.clone(),
             stamped_schema: self.stamped_schema.clone(),
             derived_length_totals: Arc::clone(&self.derived_length_totals),
+            inline_rollups_fit: Arc::clone(&self.inline_rollups_fit),
         }
     }
 
@@ -2181,6 +2276,7 @@ impl ManifestSnapshot {
             stamped_drained_ranges: self.stamped_drained_ranges.clone(),
             stamped_schema: self.stamped_schema.clone(),
             derived_length_totals: Arc::clone(&self.derived_length_totals),
+            inline_rollups_fit: Arc::clone(&self.inline_rollups_fit),
         })
     }
 
@@ -2984,6 +3080,7 @@ impl ManifestSnapshot {
             stamped_drained_ranges: None,
             stamped_schema: None,
             derived_length_totals: Arc::clone(&self.derived_length_totals),
+            inline_rollups_fit: Arc::clone(&self.inline_rollups_fit),
         };
 
         Ok((new_manifest, parts_to_write))
@@ -5749,7 +5846,7 @@ mod tests {
     use std::{
         cmp::Reverse,
         env::var_os,
-        fs::{read_dir, read_to_string, remove_file},
+        fs::{read, read_dir, read_to_string, remove_file},
         hint::black_box,
         mem::size_of,
         path::{Path, PathBuf},
@@ -5778,7 +5875,8 @@ mod tests {
             Supertable,
             manifest::{
                 commit::{PartWriteResult, write_manifest_part, write_part_bytes},
-                list::{Manifest, PartitionStrategy},
+                list::{CellRoutingParams, Manifest, PartitionStrategy},
+                rollups::MANIFEST_ROLLUPS_DIR,
                 summaries::SummaryRow,
             },
             schema::LegacyNames,
@@ -6864,6 +6962,7 @@ mod tests {
                 stamped_drained_ranges: None,
                 stamped_schema: None,
                 derived_length_totals: Default::default(),
+                inline_rollups_fit: Default::default(),
             }
         }
 
@@ -6974,6 +7073,7 @@ mod tests {
                 stamped_drained_ranges: None,
                 stamped_schema: None,
                 derived_length_totals: Default::default(),
+                inline_rollups_fit: Default::default(),
             };
             assert_eq!(before.parts.len(), n_parts, "all parts start resident");
 
@@ -7742,6 +7842,7 @@ mod tests {
             stamped_drained_ranges: None,
             stamped_schema: None,
             derived_length_totals: Default::default(),
+            inline_rollups_fit: Default::default(),
         };
         let dbg = format!("{m:?}");
         assert!(dbg.contains("n_parts: 1"), "{dbg}");
@@ -7914,6 +8015,7 @@ mod tests {
             stamped_drained_ranges: None,
             stamped_schema: None,
             derived_length_totals: Default::default(),
+            inline_rollups_fit: Default::default(),
         })
     }
 
@@ -8074,6 +8176,7 @@ mod tests {
             stamped_drained_ranges: None,
             stamped_schema: None,
             derived_length_totals: Default::default(),
+            inline_rollups_fit: Default::default(),
         });
 
         // Remove every superfile from part A only → A is emptied, B untouched.
@@ -9525,6 +9628,7 @@ mod tests {
             stamped_drained_ranges: None,
             stamped_schema: None,
             derived_length_totals: Default::default(),
+            inline_rollups_fit: Default::default(),
         });
 
         let (new_manifest, parts) = old_manifest
@@ -9701,6 +9805,7 @@ mod tests {
             stamped_drained_ranges: None,
             stamped_schema: None,
             derived_length_totals: Default::default(),
+            inline_rollups_fit: Default::default(),
         });
 
         // Add new entry to the SAME partition (not a new/cold partition)
@@ -9863,6 +9968,7 @@ mod tests {
             stamped_drained_ranges: None,
             stamped_schema: None,
             derived_length_totals: Default::default(),
+            inline_rollups_fit: Default::default(),
         });
 
         // Commit one new superfile. Keep `new_entry` around — the second
@@ -10083,6 +10189,7 @@ mod tests {
             stamped_drained_ranges: None,
             stamped_schema: None,
             derived_length_totals: Default::default(),
+            inline_rollups_fit: Default::default(),
         });
 
         // Add 1 new superfile to same partition (2 + 1 = 3, within target)
@@ -10195,6 +10302,7 @@ mod tests {
             stamped_drained_ranges: None,
             stamped_schema: None,
             derived_length_totals: Default::default(),
+            inline_rollups_fit: Default::default(),
         });
 
         // Add 2 new superfiles to same partition (2 + 2 = 4, exceeds target of 2)
@@ -10336,6 +10444,7 @@ mod tests {
             stamped_drained_ranges: None,
             stamped_schema: None,
             derived_length_totals: Default::default(),
+            inline_rollups_fit: Default::default(),
         });
 
         // 2 + 1 = 3 superfiles — far under the 10_000 count target, so only
@@ -10480,6 +10589,7 @@ mod tests {
             stamped_drained_ranges: None,
             stamped_schema: None,
             derived_length_totals: Default::default(),
+            inline_rollups_fit: Default::default(),
         });
 
         // Add one new entry for the partition
@@ -10631,6 +10741,7 @@ mod tests {
             stamped_drained_ranges: None,
             stamped_schema: None,
             derived_length_totals: Default::default(),
+            inline_rollups_fit: Default::default(),
         });
 
         let new_entries = vec![make_new_entry_hinted(50, 0), make_new_entry_hinted(80, 1)];
@@ -10789,6 +10900,7 @@ mod tests {
             stamped_drained_ranges: None,
             stamped_schema: None,
             derived_length_totals: Default::default(),
+            inline_rollups_fit: Default::default(),
         });
 
         // Only touch partition A
@@ -10991,6 +11103,7 @@ mod tests {
             stamped_drained_ranges: None,
             stamped_schema: None,
             derived_length_totals: Default::default(),
+            inline_rollups_fit: Default::default(),
         });
 
         let new_entries = vec![make_new_entry_hinted(75, 0), make_new_entry_hinted(90, 1)];
@@ -11180,6 +11293,7 @@ mod tests {
             stamped_drained_ranges: None,
             stamped_schema: None,
             derived_length_totals: Default::default(),
+            inline_rollups_fit: Default::default(),
         });
 
         let (new_manifest, parts) = old_manifest
@@ -11289,6 +11403,7 @@ mod tests {
             stamped_drained_ranges: None,
             stamped_schema: None,
             derived_length_totals: Default::default(),
+            inline_rollups_fit: Default::default(),
         });
 
         let sf_new = make_new_entry(75);
@@ -11435,6 +11550,7 @@ mod tests {
             stamped_drained_ranges: None,
             stamped_schema: None,
             derived_length_totals: Default::default(),
+            inline_rollups_fit: Default::default(),
         });
 
         let (new_manifest, parts) = old_manifest
@@ -11590,6 +11706,7 @@ mod tests {
             stamped_drained_ranges: None,
             stamped_schema: None,
             derived_length_totals: Default::default(),
+            inline_rollups_fit: Default::default(),
         });
 
         let (new_manifest, parts_to_write) = old_manifest
@@ -11713,6 +11830,7 @@ mod tests {
             stamped_drained_ranges: None,
             stamped_schema: None,
             derived_length_totals: Default::default(),
+            inline_rollups_fit: Default::default(),
         });
 
         let (new_manifest, parts) = old_manifest
@@ -11812,6 +11930,7 @@ mod tests {
             stamped_drained_ranges: None,
             stamped_schema: None,
             derived_length_totals: Default::default(),
+            inline_rollups_fit: Default::default(),
         });
 
         // sf_ghost was never added to any part; its superfile_id won't match anything
@@ -11955,6 +12074,7 @@ mod tests {
             stamped_drained_ranges: None,
             stamped_schema: None,
             derived_length_totals: Default::default(),
+            inline_rollups_fit: Default::default(),
         });
 
         let (new_manifest, parts_to_write) = old_manifest
@@ -12054,6 +12174,7 @@ mod tests {
             stamped_drained_ranges: None,
             stamped_schema: None,
             derived_length_totals: Default::default(),
+            inline_rollups_fit: Default::default(),
         }
     }
 
@@ -12234,6 +12355,12 @@ mod tests {
     /// Spreads one commit's values from the next: commit `c` writes values
     /// from `c` times this up.
     const ROLLUPS_COMMIT_STRIDE: i64 = 10_000;
+    /// Cells of the grid a list is stamped with to read as a hidden one.
+    const HIDDEN_CELLS: u32 = 2;
+    /// Dimension of that grid's centroids.
+    const HIDDEN_DIM: u32 = 4;
+    /// Seed of that grid's synthetic centroids.
+    const HIDDEN_SEED: u64 = 7;
 
     /// A title to index and [`ROLLUPS_WIDE_COLUMNS`] nullable integers.
     fn rollups_wide_schema() -> Arc<Schema> {
@@ -12419,6 +12546,222 @@ mod tests {
             "the unread part is carried over as it was"
         );
         assert_eq!(committed.get_all_superfiles().len(), COMMITS + 1);
+    }
+
+    /// Publish `manifest` with every part's rollups inline, as a list before
+    /// major 4 carries them, over the pointer `storage` holds now.
+    fn publish_with_inline_rollups(
+        rt: &Runtime,
+        storage: &Arc<dyn StorageProvider>,
+        manifest: &ManifestSnapshot,
+    ) {
+        let inline = manifest.with_list_edited(true, |list| {
+            for entry in &mut list.parts {
+                entry.rollups = RollupsAt::Inline;
+            }
+        });
+        let (_, meta) = rt
+            .block_on(read_pointer(storage.as_ref()))
+            .expect("read pointer")
+            .expect("pointer present");
+        let etag = meta.etag.expect("localfs pointer etag");
+        rt.block_on(inline.write(storage.as_ref(), Some(etag.as_str()), &[]))
+            .expect("publish the inline list");
+    }
+
+    /// A wide table whose list carries its parts' rollups inline, as a list
+    /// before major 4 does: the next commit moves every part's rollups into
+    /// an object of its own, byte for byte what a fresh encode of them
+    /// writes, the list after it names them and carries none, and a fresh
+    /// handle reads back the rollups the inline list held. Moving them again
+    /// moves nothing, and a retried move names the same objects.
+    #[test]
+    fn a_commit_moves_rollups_an_earlier_list_left_inline_into_objects() {
+        let (dir, storage, st) = wide_rollups_table();
+        let rt = Runtime::new().expect("runtime");
+        let written = st.inner().manifest.load_full();
+        drop(st);
+        publish_with_inline_rollups(&rt, &storage, &written);
+        assert!(
+            newest_manifest_list(dir.path()).contains("scalar_stats_agg_ipc"),
+            "the fixture's list carries its rollups inline"
+        );
+
+        let reopened = Supertable::open(rollups_wide_options(&storage)).expect("open");
+        let inline = reopened.inner().manifest.load_full();
+        assert!(
+            inline
+                .get_all_list_entries()
+                .iter()
+                .all(|entry| entry.rollups == RollupsAt::Inline),
+            "the reopened list reads as inline"
+        );
+        commit_wide(&reopened, COMMITS);
+        let committed = reopened.inner().manifest.load_full();
+        let mut moved = 0;
+        for entry in committed.get_all_list_entries() {
+            let RollupsAt::Stored(reference) = &entry.rollups else {
+                panic!("part {} keeps its rollups inline", entry.part_id);
+            };
+            let bytes = read(dir.path().join(&reference.uri)).expect("the rollups object");
+            if let Some(was) = inline
+                .get_all_list_entries()
+                .iter()
+                .find(|was| was.part_id == entry.part_id)
+            {
+                let fresh = rollups::encode(was.part_id, &was.scalar_stats_agg)
+                    .expect("one-row bounds")
+                    .expect("past the inline cap");
+                assert_eq!(
+                    bytes, fresh,
+                    "part {}: the object a fresh encode of its inline rollups writes",
+                    entry.part_id
+                );
+                moved += 1;
+            }
+        }
+        assert!(moved > 0, "the commit moved parts it did not rebuild");
+        assert!(
+            !newest_manifest_list(dir.path()).contains("scalar_stats_agg_ipc"),
+            "no rollups inline after the commit"
+        );
+
+        fn named(snapshot: &ManifestSnapshot) -> Vec<(PartId, RollupsAt)> {
+            snapshot
+                .get_all_list_entries()
+                .iter()
+                .map(|entry| (entry.part_id, entry.rollups.clone()))
+                .collect()
+        }
+        let mut again = committed.with_list_edited(false, |_| {});
+        assert!(
+            again.store_inline_rollups().expect("move").is_empty(),
+            "a second move finds nothing inline"
+        );
+        assert_eq!(named(&again), named(&committed), "and changes no entry");
+        let first = inline
+            .with_list_edited(false, |_| {})
+            .store_inline_rollups()
+            .expect("move");
+        let retried = inline
+            .with_list_edited(false, |_| {})
+            .store_inline_rollups()
+            .expect("move");
+        assert!(!first.is_empty());
+        assert_eq!(first, retried, "a retried move writes the same objects");
+
+        drop(reopened);
+        let fresh = Supertable::open(rollups_wide_options(&storage)).expect("open");
+        let read = fresh.inner().manifest.load_full();
+        assert_eq!(
+            read.get_all_list_entries().len(),
+            committed.get_all_list_entries().len()
+        );
+        let mut untouched = 0;
+        for back in read.get_all_list_entries() {
+            assert!(
+                matches!(back.rollups, RollupsAt::Stored(_)),
+                "part {}: {:?}",
+                back.part_id,
+                back.rollups
+            );
+            if let Some(was) = inline
+                .get_all_list_entries()
+                .iter()
+                .find(|was| was.part_id == back.part_id)
+            {
+                assert_eq!(
+                    back.scalar_stats_agg, was.scalar_stats_agg,
+                    "part {}: the rollups the inline list held",
+                    back.part_id
+                );
+                untouched += 1;
+            }
+        }
+        assert!(untouched > 0, "the commit left some parts as they were");
+    }
+
+    /// Rollups under the inline cap stay inline: a narrow table's commit
+    /// writes no rollups object and its list still carries them. The commit
+    /// remembers each part it found under the cap, so the next one does not
+    /// encode it again, and forgets a part once a list no longer holds it.
+    #[test]
+    fn a_commit_leaves_rollups_under_the_cap_inline() {
+        let (dir, st) = multi_part_table();
+        commit_titles(&st, &["one more title"]);
+        let committed = st.inner().manifest.load_full();
+        assert!(committed.get_all_list_entries().len() > 1);
+        assert!(
+            committed
+                .get_all_list_entries()
+                .iter()
+                .all(|entry| entry.rollups == RollupsAt::Inline),
+            "narrow rollups stay inline"
+        );
+        let mut files = Vec::new();
+        files_under(dir.path(), &mut files);
+        assert!(
+            !files
+                .iter()
+                .any(|(path, _)| path.to_string_lossy().contains(MANIFEST_ROLLUPS_DIR)),
+            "no rollups object written"
+        );
+
+        for entry in committed.get_all_list_entries() {
+            assert!(
+                committed.rollups_known_to_fit(entry.part_id),
+                "part {} is remembered under the cap",
+                entry.part_id
+            );
+        }
+        let mut dropped = None;
+        let mut smaller = committed.with_list_edited(false, |list| {
+            dropped = list.parts.pop().map(|entry| entry.part_id);
+        });
+        let dropped = dropped.expect("a part to drop");
+        assert!(
+            smaller.store_inline_rollups().expect("move").is_empty(),
+            "nothing to move"
+        );
+        assert!(
+            !committed.rollups_known_to_fit(dropped),
+            "a part the list no longer holds is forgotten"
+        );
+    }
+
+    /// A hidden manifest keeps every part's rollups inline, past the cap or
+    /// not: moving them writes nothing and changes no entry.
+    #[test]
+    fn a_hidden_manifest_keeps_its_rollups_inline() {
+        let (_dir, storage, st) = wide_rollups_table();
+        let rt = Runtime::new().expect("runtime");
+        let written = st.inner().manifest.load_full();
+        drop(st);
+        publish_with_inline_rollups(&rt, &storage, &written);
+        let reopened = Supertable::open(rollups_wide_options(&storage)).expect("open");
+        let (clusters, _) = synth_clusters(HIDDEN_CELLS, HIDDEN_DIM, HIDDEN_SEED);
+        let mut hidden = reopened
+            .inner()
+            .manifest
+            .load_full()
+            .with_list_edited(false, |list| {
+                list.partition_strategy = PartitionStrategy::VectorCell {
+                    column: "emb".into(),
+                    clusters,
+                    routing: CellRoutingParams::default(),
+                };
+            });
+        assert!(
+            hidden.store_inline_rollups().expect("move").is_empty(),
+            "nothing written"
+        );
+        assert!(
+            hidden
+                .get_all_list_entries()
+                .iter()
+                .all(|entry| entry.rollups == RollupsAt::Inline),
+            "every entry kept inline"
+        );
     }
 
     #[test]
