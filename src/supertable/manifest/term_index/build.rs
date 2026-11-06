@@ -20,6 +20,8 @@
 //! only on its superfile, which never changes, so copying it out of an
 //! existing layer gives exactly what walking the superfile again would.
 
+#[cfg(test)]
+use std::os::unix::fs::FileExt;
 use std::{
     cmp::Reverse,
     collections::{BTreeMap, BinaryHeap, HashMap, VecDeque, btree_map::Entry},
@@ -28,7 +30,6 @@ use std::{
     io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     mem,
     ops::Range,
-    os::unix::fs::FileExt,
     path::{Path, PathBuf},
     sync::{Arc, Condvar, Mutex, PoisonError},
     time::Instant,
@@ -42,11 +43,13 @@ use tokio::sync::mpsc::UnboundedSender;
 use tracing::debug;
 use uuid::Uuid;
 
+#[cfg(test)]
+use super::format::{SLICE_HEADER_LEN, SliceDictionary};
 use super::{
     FOLD_CURSOR_BYTES, TermIndexError,
     format::{
-        Layer, Location, Posting, Root, Run, SLICE_HEADER_LEN, Slice, SliceDictionary, SliceRef,
-        TierRef, encode_run, encode_slice, legacy_bound_as_key, push_posting, read_posting,
+        Layer, Location, Posting, Root, Run, Slice, SliceRef, TierRef, encode_run, encode_slice,
+        legacy_bound_as_key, push_posting, read_posting,
     },
     tier::{
         BLOCK_ENTRIES, ColumnScoring, EncodedChunk, HeadGroup, SplicedBlock, TierChunk,
@@ -138,6 +141,7 @@ pub(crate) struct BuildPolicy {
     pub(crate) tier_read_window_bytes: u64,
     /// Marks a merge cuts each key range from, about; see
     /// [`MARKS_PER_RANGE`].
+    #[cfg(test)]
     pub(crate) merge_marks_per_range: usize,
     /// Whether a merge carries tier blocks over from its sources' chunks
     /// (see `splice_term`); off, every term takes the decoding path. Tests
@@ -306,6 +310,7 @@ impl Default for BuildPolicy {
             scoring_by_ordinal: Arc::new(Vec::new()),
             scoring_by_superfile: Arc::new(HashMap::new()),
             tier_read_window_bytes: TIER_READ_WINDOW_BYTES,
+            #[cfg(test)]
             merge_marks_per_range: MARKS_PER_RANGE,
             merge_ranges_max: None,
             #[cfg(test)]
@@ -2554,18 +2559,22 @@ pub(crate) fn cut_ranges<K: AsRef<[u8]>>(marks: &[(K, u64)], want: usize) -> Vec
 pub(crate) const MERGE_RANGE_MIN_BYTES: u64 = 64 * 1024 * 1024;
 /// Slices per key range from which a merge cuts its ranges at one mark per
 /// slice instead of reading each slice's dictionary.
+#[cfg(test)]
 const ONE_MARK_SLICES_PER_RANGE: usize = 256;
 /// Runs read past a group's first block to find where its tier chunks
 /// start, before the group joins the one before it.
+#[cfg(test)]
 const TIER_AT_SCAN_RUNS: usize = 8;
 /// Marks a merge cuts each key range from, about: enough to place a cut
 /// well within a range, few enough that sorting every slice's marks stays
 /// cheap. A slice's dictionary blocks are grouped to keep its share.
+#[cfg(test)]
 pub(crate) const MARKS_PER_RANGE: usize = 2048;
 
 /// Ranges a merge is cut into at most: each holds a cursor per layer
 /// with a slice's bytes and a few tier windows resident, so the width is
 /// bounded by memory as well as by threads.
+#[cfg(test)]
 pub(crate) const MERGE_RANGES_MAX: usize = 32;
 
 /// Whether `slice` holds a key in `start..end`.

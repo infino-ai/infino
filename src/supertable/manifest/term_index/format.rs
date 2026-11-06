@@ -996,6 +996,7 @@ pub(crate) fn encode_slice(dict: &[u8], postings: &[u8]) -> Vec<u8> {
 
 /// Where one dictionary block of a slice starts: its first key, and that
 /// key's run as an offset and length in the postings region.
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub(crate) struct BlockStart {
     pub(crate) key: Vec<u8>,
@@ -1005,6 +1006,7 @@ pub(crate) struct BlockStart {
 
 /// A slice's dictionary, read without its postings: what a merge needs to
 /// cut the key space into ranges.
+#[cfg(test)]
 pub(crate) struct SliceDictionary<'a> {
     dict: TermBlocks<'a>,
     dict_len: u64,
@@ -1012,6 +1014,7 @@ pub(crate) struct SliceDictionary<'a> {
     legacy: bool,
 }
 
+#[cfg(test)]
 impl<'a> SliceDictionary<'a> {
     /// The dictionary length a slice's first [`SLICE_HEADER_LEN`] bytes name.
     pub(crate) fn dict_len(header: &[u8]) -> Result<u64, TermIndexError> {
