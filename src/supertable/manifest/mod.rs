@@ -3108,7 +3108,7 @@ fn rebuild_part_and_entry(
     let rollups_object = if hidden {
         None
     } else {
-        rollups::encode(part_id, &aggregates.scalar_stats_agg).map(|bytes| {
+        rollups::encode(part_id, &aggregates.scalar_stats_agg)?.map(|bytes| {
             let hash = ContentHash::of(&bytes);
             (Bytes::from(bytes), hash)
         })
