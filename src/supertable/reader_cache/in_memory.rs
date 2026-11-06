@@ -33,7 +33,7 @@ use std::{
 
 use bytes::Bytes;
 
-use super::{ReaderCacheError, SuperfileReaderCache};
+use super::{ReaderCacheError, SuperfileReaderCache, disk::release_temp_file};
 use crate::{superfile::SuperfileReader, supertable::manifest::SuperfileUri};
 
 /// Per-URI entry. Holds the raw bytes alongside the parsed reader
@@ -91,6 +91,10 @@ impl SuperfileReaderCache for InMemoryReaderCache {
     }
 
     fn insert(&self, uri: SuperfileUri, bytes: Bytes) -> Result<(), ReaderCacheError> {
+        // Bytes arrive here once published, and the store keeps them for the
+        // table's life: the scratch file a build sealed them to has served
+        // its purpose and is unlinked now, not when the table drops.
+        release_temp_file(&bytes);
         // Optimistic read first — same-URI re-puts are the hot
         // path for the writer's idempotent-publish flow.
         {

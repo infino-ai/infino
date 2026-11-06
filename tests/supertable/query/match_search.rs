@@ -176,6 +176,17 @@ fn stable_ids(hits: &[SuperfileHit]) -> HashSet<i128> {
 /// into the hidden index. Storage is needed: without it the drain does
 /// nothing and search stays on the user table.
 fn drained_table(cells: usize, titles: &[String], flat: Vec<f32>) -> (TempDir, Supertable) {
+    drained_table_in_commits(cells, titles, flat, 1)
+}
+
+/// [`drained_table`], with the rows appended in `commits` equal runs, each
+/// committed to its own user superfiles, all drained together.
+fn drained_table_in_commits(
+    cells: usize,
+    titles: &[String],
+    flat: Vec<f32>,
+    commits: usize,
+) -> (TempDir, Supertable) {
     let dir = TempDir::new().expect("tempdir");
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
@@ -185,23 +196,35 @@ fn drained_table(cells: usize, titles: &[String], flat: Vec<f32>) -> (TempDir, S
             .with_vector_cell_counts(cells, cells),
     )
     .expect("create");
-    let fsl = FixedSizeListArray::try_new(
-        Arc::new(Field::new("item", DataType::Float32, true)),
-        DIM as i32,
-        Arc::new(Float32Array::from(flat)) as ArrayRef,
-        None,
-    )
-    .expect("FSL");
-    let title_arr = LargeStringArray::from(titles.iter().map(String::as_str).collect::<Vec<_>>());
-    let batch = RecordBatch::try_new(
-        st.options().schema.clone(),
-        vec![Arc::new(title_arr), Arc::new(fsl)],
-    )
-    .expect("batch");
-    let mut w = st.writer().expect("writer");
-    w.append(&batch).expect("append");
-    w.commit().expect("commit");
-    drop(w);
+    assert!(
+        commits > 0 && !titles.is_empty(),
+        "fixture: rows and commits"
+    );
+    assert_eq!(
+        flat.len(),
+        titles.len() * DIM,
+        "fixture: one vector per title"
+    );
+    let per_commit = titles.len().div_ceil(commits);
+    for (titles, flat) in titles.chunks(per_commit).zip(flat.chunks(per_commit * DIM)) {
+        let fsl = FixedSizeListArray::try_new(
+            Arc::new(Field::new("item", DataType::Float32, true)),
+            DIM as i32,
+            Arc::new(Float32Array::from(flat.to_vec())) as ArrayRef,
+            None,
+        )
+        .expect("FSL");
+        let title_arr =
+            LargeStringArray::from(titles.iter().map(String::as_str).collect::<Vec<_>>());
+        let batch = RecordBatch::try_new(
+            st.options().schema.clone(),
+            vec![Arc::new(title_arr), Arc::new(fsl)],
+        )
+        .expect("batch");
+        let mut w = st.writer().expect("writer");
+        w.append(&batch).expect("append");
+        w.commit().expect("commit");
+    }
     st.drain_vectors_to_cells_sync().expect("drain");
     (dir, st)
 }
@@ -1175,5 +1198,50 @@ fn filtered_knn_after_drain_finds_spread_matches_in_overlapping_groups() {
         SPREAD_K,
     );
     let (_dir, st) = drained_table(SPREAD_CELLS, &titles, rows.concat());
+    assert_filtered_top_k_is_best(&st, &query, SPREAD_K);
+}
+
+/// DRAINED table built from two commits, so the rows the filter keeps sit in
+/// two user superfiles. Their ids from both files must reach the hidden
+/// index: the true top-k has rows in each, and losing either file's ids
+/// drops them.
+#[test]
+fn filtered_knn_after_drain_maps_kept_rows_from_every_user_superfile() {
+    /// Tight groups, as in the single-commit spread test.
+    const NOISE: f32 = 0.05;
+    const COMMITS: usize = 2;
+
+    let mut rng = StdRng::seed_from_u64(SPREAD_SEED);
+    let centers = spread_centers(&mut rng);
+    // Move every other matching row into the second commit, so both commits
+    // hold matching rows near the query.
+    let mut rows = grouped_rows(&mut rng, &centers, SPREAD_ROWS_PER_GROUP, NOISE);
+    let half = rows.len() / COMMITS;
+    let (first, second) = rows.split_at_mut(half);
+    first
+        .iter_mut()
+        .zip(second.iter_mut())
+        .step_by(2 * SPREAD_MATCH_EVERY)
+        .for_each(|(a, b)| std::mem::swap(a, b));
+    let query = centers[0].clone();
+    let titles = needle_titles(
+        &rows,
+        |i| i.is_multiple_of(SPREAD_MATCH_EVERY),
+        &query,
+        SPREAD_K,
+    );
+    let best_rows: Vec<usize> = (0..titles.len())
+        .filter(|&i| titles[i].ends_with(" best"))
+        .collect();
+    assert!(
+        best_rows.iter().any(|&i| i < half) && best_rows.iter().any(|&i| i >= half),
+        "fixture: the true top-{SPREAD_K} must span both commits, got rows {best_rows:?}"
+    );
+    let (_dir, st) = drained_table_in_commits(SPREAD_CELLS, &titles, rows.concat(), COMMITS);
+    let user_superfiles = st.reader().expect("reader").manifest().superfiles.len();
+    assert!(
+        user_superfiles >= COMMITS,
+        "fixture: each commit writes its own user superfiles, got {user_superfiles}"
+    );
     assert_filtered_top_k_is_best(&st, &query, SPREAD_K);
 }

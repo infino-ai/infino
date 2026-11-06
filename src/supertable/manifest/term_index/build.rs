@@ -142,6 +142,22 @@ pub(crate) struct BuildPolicy {
     /// compare the two paths byte for byte.
     #[cfg(test)]
     pub(crate) splice_tiers: bool,
+    /// Called as each key range of a build or merge finishes, on the
+    /// thread that ran it, so a test can watch what happens meanwhile.
+    #[cfg(test)]
+    pub(crate) after_range: Option<RangeHook>,
+}
+
+/// A test's callback on [`BuildPolicy::after_range`].
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct RangeHook(pub(crate) Arc<dyn Fn() + Send + Sync>);
+
+#[cfg(test)]
+impl fmt::Debug for RangeHook {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("RangeHook(..)")
+    }
 }
 
 impl BuildPolicy {
@@ -233,6 +249,8 @@ impl Default for BuildPolicy {
             merge_ranges_max: None,
             #[cfg(test)]
             splice_tiers: true,
+            #[cfg(test)]
+            after_range: None,
         }
     }
 }
@@ -804,7 +822,7 @@ impl ContributionWriter {
             path: self.path,
             last_key: (self.n_terms > 0).then_some(self.prev_key),
             marks: self.marks,
-            _scratch: self.scratch,
+            _scratch: self.scratch.map(Arc::new),
         })
     }
 }
@@ -909,7 +927,7 @@ impl HeadSink {
             path,
             marks,
             last_key,
-            _scratch: Some(scratch),
+            _scratch: Some(Arc::new(scratch)),
         }))
     }
 }
@@ -1043,8 +1061,9 @@ pub(crate) fn first_contribution_difference(
     }
 }
 
-/// A finished, spilled contribution.
-#[derive(Debug)]
+/// A finished, spilled contribution. A copy shares the spill file, which
+/// goes with the last copy.
+#[derive(Debug, Clone)]
 pub(crate) struct Contribution {
     /// The superfile these terms came from.
     pub(crate) superfile_id: Uuid,
@@ -1061,8 +1080,8 @@ pub(crate) struct Contribution {
     /// The last record's key; `None` when there are no records.
     pub(crate) last_key: Option<Vec<u8>>,
     /// The scratch directory holding it, when this contribution owns one;
-    /// dropping the contribution removes both.
-    _scratch: Option<TempDir>,
+    /// dropping the contribution's last copy removes both.
+    _scratch: Option<Arc<TempDir>>,
 }
 
 /// Sequential reader over one spilled contribution.
@@ -1294,9 +1313,14 @@ struct LayerWriter {
     current_tier: Vec<u8>,
     slices: Vec<SliceRef>,
     slice_bytes: Vec<(ContentHash, BuiltBytes)>,
-    /// Where each cut slice and its tier object go at once, when set, in
-    /// place of `slice_bytes` and `tier_bytes`.
+    /// Where each cut slice and its tier object go at once, when set: in
+    /// place of `slice_bytes` and `tier_bytes`, or beside them when
+    /// `keeps_sent`.
     sink: Option<ObjectSink>,
+    /// Whether the objects handed to `sink` are kept as well. A build's
+    /// layer holds its own bytes, as a reserved layer must; a merge's
+    /// objects are handed over and not kept.
+    keeps_sent: bool,
     /// The tier objects of the slices cut so far, keyed by content hash.
     tier_bytes: Vec<(ContentHash, BuiltBytes)>,
     /// Where cut slices and tier objects are spilled, when they are.
@@ -1359,6 +1383,7 @@ impl LayerWriter {
             slice_bytes: Vec::new(),
             tier_bytes: Vec::new(),
             sink: None,
+            keeps_sent: true,
             spill,
             target_bytes: policy.slice_target_bytes,
             tier_entries_per_term: policy.tier_entries_per_term,
@@ -1379,6 +1404,7 @@ impl LayerWriter {
         let scoring = scoring_lookup(Arc::clone(&policy.scoring_by_ordinal), 0);
         Ok(Self {
             ordinals: Arc::from(ordinals.to_vec()),
+            keeps_sent: false,
             ..Self::new(policy, scoring)?
         })
     }
@@ -1550,20 +1576,20 @@ impl LayerWriter {
             let stem = reference.content_hash.to_hex();
             if let (Some(hash), Some(bytes)) = (tier, tier_bytes) {
                 let kept = self.keep(&format!("{stem}.{TIER_FILE_EXTENSION}"), bytes)?;
-                match &self.sink {
-                    Some(sink) => sink
-                        .send(("tier", hash, kept))
-                        .map_err(|_| uploader_gone())?,
-                    None => self.tier_bytes.push((hash, kept)),
-                }
+                hand_over(
+                    self.sink.as_ref(),
+                    self.keeps_sent,
+                    &mut self.tier_bytes,
+                    ("tier", hash, kept),
+                )?;
             }
             let kept = self.keep(&format!("{stem}.slice"), bytes)?;
-            match &self.sink {
-                Some(sink) => sink
-                    .send(("slice", reference.content_hash, kept))
-                    .map_err(|_| uploader_gone())?,
-                None => self.slice_bytes.push((reference.content_hash, kept)),
-            }
+            hand_over(
+                self.sink.as_ref(),
+                self.keeps_sent,
+                &mut self.slice_bytes,
+                ("slice", reference.content_hash, kept),
+            )?;
             self.slices.push(reference);
         }
         self.stats.cut_secs += started.elapsed().as_secs_f64();
@@ -1597,6 +1623,24 @@ impl LayerWriter {
             self.stats,
         ))
     }
+}
+
+/// Hand a cut object to `sink`, when there is one, and keep it in `kept`
+/// when there is none or the writer keeps what it sends.
+fn hand_over(
+    sink: Option<&ObjectSink>,
+    keeps_sent: bool,
+    kept: &mut Vec<(ContentHash, BuiltBytes)>,
+    (kind, hash, bytes): (&'static str, ContentHash, BuiltBytes),
+) -> Result<(), TermIndexError> {
+    let Some(sink) = sink else {
+        kept.push((hash, bytes));
+        return Ok(());
+    };
+    if keeps_sent {
+        kept.push((hash, bytes.clone()));
+    }
+    sink.send((kind, hash, bytes)).map_err(|_| uploader_gone())
 }
 
 /// A finished build: the root and every slice, ready to be written.
@@ -1650,7 +1694,7 @@ pub(crate) fn build_onto(
     contributions: &[Contribution],
     policy: &BuildPolicy,
 ) -> Result<Built, TermIndexError> {
-    let mut built = build_layer(contributions, policy)?;
+    let mut built = build_layer(contributions, policy, None)?;
     built
         .layer
         .place_at(base.superfiles.len() as u32, contributions.len() as u32);
@@ -1668,9 +1712,14 @@ pub(crate) fn build_onto(
 /// follow the order of `contributions` from zero: the layer stores them
 /// relative to a base it is given when the root places it
 /// ([`Layer::place_at`]), so it is built before that base is known.
+///
+/// With a `sink`, each slice and tier object is also handed to it as its
+/// range cuts it, so it can upload while the other ranges still build; the
+/// built layer keeps its own handles on them all the same.
 pub(crate) fn build_layer(
     contributions: &[Contribution],
     policy: &BuildPolicy,
+    sink: Option<&ObjectSink>,
 ) -> Result<BuiltLayer, TermIndexError> {
     let scoring = scoring_lookup(
         Arc::new(contributions.iter().map(|c| c.scoring.clone()).collect()),
@@ -1678,7 +1727,7 @@ pub(crate) fn build_layer(
     );
     let ranges = build_ranges(contributions, policy)?;
     let mut built = run_ranges(&ranges, policy, |start, end| {
-        build_range(contributions, start, end, policy, &scoring)
+        build_range(contributions, start, end, policy, &scoring, sink)
     })?;
     built.layer.ordinals = Some(0..contributions.len() as u32);
     Ok(BuiltLayer {
@@ -1749,6 +1798,7 @@ fn build_range(
     end: Option<&[u8]>,
     policy: &BuildPolicy,
     scoring: &ScoringOf,
+    sink: Option<&ObjectSink>,
 ) -> Result<MergedLayer, TermIndexError> {
     let mut readers = Vec::with_capacity(contributions.len());
     let mut heap: BinaryHeap<Reverse<MergeHead>> = BinaryHeap::new();
@@ -1783,6 +1833,7 @@ fn build_range(
     }
 
     let mut writer = LayerWriter::new(policy, scoring.clone())?;
+    writer.sink = sink.cloned();
     let mut run: Vec<Posting> = Vec::new();
     let mut entries: Vec<TierEntry> = Vec::new();
     let (mut n_terms, mut n_postings) = (0u64, 0u64);
@@ -2241,6 +2292,14 @@ fn run_ranges(
     policy: &BuildPolicy,
     one: impl Fn(Option<&[u8]>, Option<&[u8]>) -> Result<MergedLayer, TermIndexError> + Sync,
 ) -> Result<MergedLayer, TermIndexError> {
+    #[cfg(test)]
+    let one = |start: Option<&[u8]>, end: Option<&[u8]>| {
+        let part = one(start, end);
+        if let Some(hook) = &policy.after_range {
+            (hook.0)();
+        }
+        part
+    };
     if let [(start, end)] = ranges {
         return one(start.as_deref(), end.as_deref());
     }

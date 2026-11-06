@@ -43,10 +43,11 @@ use thiserror::Error;
 pub mod azure;
 pub(crate) mod counting;
 pub mod gcs;
+mod hedged_multipart;
 pub mod local_fs;
 pub(crate) mod options;
 mod retry;
-pub(crate) use retry::stuck_after;
+pub(crate) use retry::{hedged, stuck_after};
 pub mod s3;
 
 pub use azure::AzureStorageProvider;

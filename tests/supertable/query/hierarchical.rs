@@ -686,6 +686,128 @@ fn sql_is_not_null_prunes_all_null_parts() {
 }
 
 #[test]
+fn sql_or_across_columns_loads_only_the_parts_a_branch_can_match() {
+    // `tag IS NULL OR title = 'e0'`:
+    //  - part 0 holds the null tags; part 2 can hold 'e0'.
+    //  - part 1 has no null tag and no 'e0', so neither branch keeps it.
+    //  - every matching row still comes back: 4 null tags plus e0.
+    let dir = TempDir::new().expect("tempdir");
+    build_tag_parts(dir.path());
+    let cache_dir = TempDir::new().expect("cache");
+    let consumer = open_tag_consumer(dir.path(), cache_dir.path());
+
+    let rows: usize = consumer
+        .reader()
+        .expect("reader")
+        .query_sql("SELECT _id FROM supertable WHERE tag IS NULL OR title = 'e0'")
+        .expect("query")
+        .iter()
+        .map(|b| b.num_rows())
+        .sum();
+    assert_eq!(rows, 5, "4 null tags and the one e0 row");
+
+    let (loaded, total) = parts_loaded(&consumer);
+    assert_eq!(total, 3);
+    assert_eq!(loaded, 2, "part 1 matches neither branch; got {loaded}/3");
+}
+
+#[test]
+fn sql_or_of_terms_loads_only_the_parts_the_term_index_routes_to() {
+    // Every part holds "aaa" and "zzz" titles and both tags, so no part
+    // summary can rule a part out. Only the term index knows 'bravo' is in
+    // part 1 and 'charlie' in part 2, so it alone can skip part 0.
+    let dir = TempDir::new().expect("tempdir");
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+    let producer = Supertable::create(
+        tag_options()
+            .with_storage(Arc::clone(&storage))
+            .with_target_superfiles_per_part(2),
+    )
+    .expect("create");
+    for word in ["alpha", "bravo", "charlie"] {
+        for titles in [["aaa", word], ["zzz", word]] {
+            let mut w = producer.writer().expect("writer");
+            w.append(&tag_batch(&titles, &[Some("x"), Some("y")]))
+                .expect("append");
+            w.commit().expect("commit");
+        }
+    }
+    let cache_dir = TempDir::new().expect("cache");
+    let consumer = open_tag_consumer(dir.path(), cache_dir.path());
+    // Different tags per branch, so the planner cannot factor the `OR` out.
+    let rows: usize = consumer
+        .reader()
+        .expect("reader")
+        .query_sql(
+            "SELECT _id FROM supertable \
+             WHERE (title = 'bravo' AND tag = 'y') OR (title = 'charlie' AND tag = 'x')",
+        )
+        .expect("query")
+        .iter()
+        .map(|b| b.num_rows())
+        .sum();
+    assert_eq!(rows, 2, "one bravo row tagged y, no charlie row tagged x");
+    let (loaded, total) = parts_loaded(&consumer);
+    assert_eq!(total, 3);
+    assert_eq!(loaded, 2, "part 0 holds neither term; got {loaded}/3");
+}
+
+#[test]
+fn sql_or_returns_every_matching_row_at_both_prune_tiers() {
+    // The same `OR` shapes over a manifest loaded part by part (the part
+    // tier prunes first) and over a fully loaded one (only the superfile
+    // tier prunes): pruning must never drop a matching row, through a SQL
+    // scan or through a search function's `WHERE`.
+    let dir = TempDir::new().expect("tempdir");
+    build_tag_parts(dir.path());
+    let cases: &[(&str, usize)] = &[
+        ("tag IS NULL OR title = 'e0'", 5),
+        ("tag IS NULL OR title LIKE 'd%'", 6),
+        ("tag IS NOT NULL OR title = 'a1'", 9),
+        ("title = 'zz' OR tag = 'nope'", 0),
+        (
+            "(title = 'a0' AND tag IS NULL) OR (tag = 'x' AND title LIKE 'f%')",
+            2,
+        ),
+        ("title IN ('a0', 'e1') OR tag > 'x'", 5),
+    ];
+    for lazy in [true, false] {
+        let cache_dir = TempDir::new().expect("cache");
+        let consumer = if lazy {
+            open_tag_consumer(dir.path(), cache_dir.path())
+        } else {
+            let storage: Arc<dyn StorageProvider> =
+                Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+            Supertable::open(tag_options().with_storage(storage)).expect("open")
+        };
+        let reader = consumer.reader().expect("reader");
+        for (filter, expected) in cases {
+            let rows: usize = reader
+                .query_sql(&format!("SELECT _id FROM supertable WHERE {filter}"))
+                .expect("query")
+                .iter()
+                .map(|b| b.num_rows())
+                .sum();
+            assert_eq!(rows, *expected, "lazy={lazy}: {filter}");
+        }
+        if !lazy {
+            // A search function's `WHERE` goes through its own candidate scope.
+            let rows: usize = reader
+                .query_sql(
+                    "SELECT title FROM bm25_search('title', 'a0', 10) \
+                     WHERE tag IS NULL OR title = 'e0'",
+                )
+                .expect("search")
+                .iter()
+                .map(|b| b.num_rows())
+                .sum();
+            assert_eq!(rows, 1, "a0 matches the search and the OR's first branch");
+        }
+    }
+}
+
+#[test]
 fn fts_in_multitoken_bloom_spans_parts_and_skips_the_unmatched() {
     // Multi-word values, again min/max-blind (all parts [aaa,zzz]).
     // `title IN ('new york', 'los angeles', 'qx', 'qy')`:

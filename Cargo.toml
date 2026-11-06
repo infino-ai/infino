@@ -1,6 +1,6 @@
 [package]
 name = "infino"
-version = "0.11.25"
+version = "0.11.26"
 edition = "2024"
 # Pinned to the toolchain in rust-toolchain.toml. The vector SIMD path
 # uses AVX-512 intrinsics stabilized in 1.89 and std APIs from 1.87, so
@@ -336,7 +336,6 @@ ferroid = { version = "2", features = ["std", "alloc"] }
 # because builder.rs holds an `Arc<TempDir>` per builder to
 # back per-centroid bucket files and per-column input spills.
 tempfile = "3"
-hashbrown = "0.17.1"
 
 [dev-dependencies]
 # No `infino = { path=".", features=["test-helpers"] }` self-reference:
