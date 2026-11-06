@@ -47,7 +47,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Condvar, Mutex,
-        atomic::{AtomicU64, Ordering as AtomicOrdering},
+        atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering},
     },
 };
 
@@ -59,7 +59,7 @@ pub(crate) use build::{
 };
 #[cfg(test)]
 pub(crate) use build::{Built, build, first_contribution_difference};
-use build::{BuiltLayer, KeyRange, MERGE_RANGE_MIN_BYTES, build_layer, key_ranges_with, merge_ranges_into, rebase_run, slice_reaches};
+use build::{BuiltLayer, KeyRange, MERGE_RANGE_MIN_BYTES, TIER_FILE_EXTENSION, build_layer, key_ranges_with, merge_ranges_into, rebase_run, slice_reaches};
 use bytes::Bytes;
 #[cfg(test)]
 pub(crate) use format::TierRef;
@@ -1717,7 +1717,10 @@ async fn fold_layers(
         .await
         .map_err(|e| TermIndexError::Build(e.to_string()))??
     };
-    let (fetches, arrivals) = tier_fetches(&sources, &ranges, &tiers);
+    let spans = slice_spans(&sources, &ranges);
+    let (fetches, arrivals) = tier_fetches(&spans, ranges.len(), &tiers);
+    let readers = ScratchReaders::new(&spans, ranges.len());
+    drop(spans);
     let arrivals = Arc::new(arrivals);
     let download = {
         let (storage, dir, gate) = (
@@ -1778,10 +1781,15 @@ async fn fold_layers(
     let merge = {
         let (scratch, arrivals) = (Arc::clone(&scratch), Arc::clone(&arrivals));
         run_on_pool(pool, "term-index fold", move || {
-            let merged =
-                merge_ranges_into(&sources, &ranges, &ordinals, &policy, Some(&sink), &|at| {
-                    arrivals.wait(at)
-                });
+            let merged = merge_ranges_into(
+                &sources,
+                &ranges,
+                &ordinals,
+                &policy,
+                Some(&sink),
+                &|at| arrivals.wait(at),
+                &|at| readers.merged(at),
+            );
             // A failed merge leaves no reader of the tiers still landing.
             arrivals.fail("the merge ended".into());
             drop(scratch);
@@ -2286,33 +2294,48 @@ struct TierFetch {
     ranges: RangeInclusive<usize>,
 }
 
-/// The tier objects `sources` still lack, in the order the merge's `ranges`
-/// read them, and the gate each range waits at until its own have landed.
-fn tier_fetches(
-    sources: &[Vec<SliceFile>],
+/// Each distinct slice file of `sources` and the key ranges that read it.
+fn slice_spans<'a>(
+    sources: &'a [Vec<SliceFile>],
     ranges: &[KeyRange],
-    tiers: &HashMap<PathBuf, FoldTier>,
-) -> (Vec<TierFetch>, TierArrivals) {
-    let mut waiting = vec![0usize; ranges.len()];
+) -> Vec<(&'a SliceFile, RangeInclusive<usize>)> {
     let mut seen: HashSet<&Path> = HashSet::new();
-    let mut fetches: Vec<TierFetch> = sources
+    sources
         .iter()
         .flatten()
         .filter(|file| seen.insert(&file.path))
         .filter_map(|file| {
-            let tier = tiers.get(&file.path).filter(|tier| !tier.present)?;
             let reaches =
                 |(start, end): &KeyRange| slice_reaches(file, start.as_deref(), end.as_deref());
-            let first = ranges.iter().position(reaches)?;
-            let last = ranges.iter().rposition(reaches)?;
-            for count in &mut waiting[first..=last] {
+            Some((
+                file,
+                ranges.iter().position(reaches)?..=ranges.iter().rposition(reaches)?,
+            ))
+        })
+        .collect()
+}
+
+/// The tier objects the slices of `spans` still lack, in the order the
+/// merge's ranges read them, and the gate each of the `ranges` ranges waits
+/// at until its own have landed.
+fn tier_fetches(
+    spans: &[(&SliceFile, RangeInclusive<usize>)],
+    ranges: usize,
+    tiers: &HashMap<PathBuf, FoldTier>,
+) -> (Vec<TierFetch>, TierArrivals) {
+    let mut waiting = vec![0usize; ranges];
+    let mut fetches: Vec<TierFetch> = spans
+        .iter()
+        .filter_map(|(file, span)| {
+            let tier = tiers.get(&file.path).filter(|tier| !tier.present)?;
+            for count in &mut waiting[span.clone()] {
                 *count += 1;
             }
             Some(TierFetch {
                 slice: tier.slice,
                 tier: tier.tier,
                 len: tier.len,
-                ranges: first..=last,
+                ranges: span.clone(),
             })
         })
         .collect();
@@ -2324,6 +2347,42 @@ fn tier_fetches(
             landed: Condvar::new(),
         },
     )
+}
+
+/// The fold's local slice and tier files, each removed once the last key
+/// range that reads it has merged, so scratch empties as the merge goes.
+struct ScratchReaders {
+    files: Vec<PathBuf>,
+    left: Vec<AtomicUsize>,
+    by_range: Vec<Vec<usize>>,
+}
+
+impl ScratchReaders {
+    fn new(spans: &[(&SliceFile, RangeInclusive<usize>)], ranges: usize) -> Self {
+        let mut by_range = vec![Vec::new(); ranges];
+        for (at, (_, span)) in spans.iter().enumerate() {
+            for range in span.clone() {
+                by_range[range].push(at);
+            }
+        }
+        Self {
+            files: spans.iter().map(|(file, _)| file.path.clone()).collect(),
+            left: spans
+                .iter()
+                .map(|(_, span)| AtomicUsize::new(span.clone().count()))
+                .collect(),
+            by_range,
+        }
+    }
+
+    fn merged(&self, range: usize) {
+        for &at in &self.by_range[range] {
+            if self.left[at].fetch_sub(1, AtomicOrdering::AcqRel) == 1 {
+                let _ = fs::remove_file(&self.files[at]);
+                let _ = fs::remove_file(self.files[at].with_extension(TIER_FILE_EXTENSION));
+            }
+        }
+    }
 }
 
 /// Tier objects each key range still waits for, and why the waiting

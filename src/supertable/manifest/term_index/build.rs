@@ -2131,7 +2131,7 @@ impl LayerCursor {
 
 /// Extension of a slice's tier object on local disk, beside the slice file
 /// that shares its stem.
-const TIER_FILE_EXTENSION: &str = "tier";
+pub(crate) const TIER_FILE_EXTENSION: &str = "tier";
 
 /// Where a slice's tier object sits on local disk once downloaded or
 /// spilled: beside the slice file, named by the slice's hash.
@@ -2250,12 +2250,20 @@ pub(crate) fn merge_layers_into(
     sink: Option<&ObjectSink>,
 ) -> Result<MergedLayer, TermIndexError> {
     let ranges = detail_span!("fold.key_ranges").in_scope(|| key_ranges(sources, policy))?;
-    merge_ranges_into(sources, &ranges, ordinals, policy, sink, &|_| Ok(()))
+    merge_ranges_into(
+        sources,
+        &ranges,
+        ordinals,
+        policy,
+        sink,
+        &|_| Ok(()),
+        &|_| (),
+    )
 }
 
 /// [`merge_layers_into`] over key ranges already cut, calling `ready` with
-/// a range's index before the range reads its slices; an error from
-/// `ready` fails that range.
+/// a range's index before the range reads its slices (an error fails that
+/// range) and `merged` once it has read them.
 pub(crate) fn merge_ranges_into(
     sources: &[Vec<SliceFile>],
     ranges: &[KeyRange],
@@ -2263,9 +2271,10 @@ pub(crate) fn merge_ranges_into(
     policy: &BuildPolicy,
     sink: Option<&ObjectSink>,
     ready: &(dyn Fn(usize) -> Result<(), TermIndexError> + Sync),
+    merged: &(dyn Fn(usize) + Sync),
 ) -> Result<MergedLayer, TermIndexError> {
     // Each range merges the slices that reach into it, on its own writer.
-    let mut merged = run_ranges(ranges, policy, |start, end| {
+    let mut layer = run_ranges(ranges, policy, |start, end| {
         let at = ranges
             .iter()
             .position(|(s, _)| s.as_deref() == start)
@@ -2281,10 +2290,12 @@ pub(crate) fn merge_ranges_into(
                     .collect()
             })
             .collect();
-        merge_range(&in_range, start, end, ordinals, policy, sink)
+        let part = merge_range(&in_range, start, end, ordinals, policy, sink);
+        merged(at);
+        part
     })?;
-    merged.layer.ordinals = Some(ordinals_span(ordinals));
-    Ok(merged)
+    layer.layer.ordinals = Some(ordinals_span(ordinals));
+    Ok(layer)
 }
 
 /// The ordinals a merge through `ordinals` may name: from the smallest it
