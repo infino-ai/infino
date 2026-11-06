@@ -52,12 +52,13 @@ use crate::{
             encoding::{
                 DecodeError, EncodeError, decode_cluster_centroids, decode_length1_array,
                 decode_scalar_stats, decode_value_counts, encode_cluster_centroids,
-                encode_scalar_stats, require_single_row,
+                encode_scalar_stats, require_single_row_bounds,
             },
             head8,
             hll::HllSketch,
             merge_min_max_arrays,
             part::{BLAKE3_DIGEST_BYTES, BLAKE3_HEX_LEN, ContentHash, PartId},
+            rollups::{RollupsAt, RollupsRef},
             summaries::{SummariesRef, table_sketch},
             term_range::prefix_overlaps_range,
         },
@@ -83,7 +84,19 @@ use crate::{
 /// pruner then drops superfiles that match, and the sections are lost.
 /// So a major 2 engine must refuse the list rather than open it, which
 /// the major bump makes it do.
-pub const FORMAT_VERSION: &str = "3.0";
+///
+/// Major 4 moves a part's rollups, when they are larger than
+/// [`super::rollups::INLINE_ROLLUPS_MAX_BYTES`], into an object of their
+/// own the list entry names ([`super::rollups`]). A reader of major 3 finds
+/// those parts without rollups, which reads correctly, but writing, it
+/// folds the latest part's rollups from its own appends alone and rewrites
+/// the list without the rollups references: the list-level pruner then
+/// drops parts that match. So a major 3 engine must refuse the list too.
+pub const FORMAT_VERSION: &str = "4.0";
+
+/// The major before rollups objects: every part's rollups inline in the
+/// list. Read, never written.
+const FORMAT_MAJOR_SECTIONS: &str = "3";
 
 /// The major before summaries sections: statistics inline in the parts,
 /// rollups as one IPC stream per bound. Read, never written.
@@ -719,6 +732,10 @@ pub struct ManifestPartEntry {
     /// superfiles in this part. An empty map is interpreted as
     /// "always-keep" by the list-level pruner.
     pub scalar_stats_agg: HashMap<FieldId, ScalarStatsAgg>,
+    /// Where those rollups live: inline in the list, or in an object of
+    /// their own that the loader reads into `scalar_stats_agg`
+    /// ([`super::rollups`]).
+    pub rollups: RollupsAt,
     /// Per-FTS-column aggregate bloom-union + range-union.
     /// Empty → always-keep.
     pub fts_summary_agg: BTreeMap<FieldId, FtsSummaryAgg>,
@@ -1776,9 +1793,18 @@ struct ManifestPartEntryDto {
     /// The rollups as one Arrow IPC batch (base64), the wire form the
     /// parts use per superfile (`encode_scalar_stats`): at four thousand
     /// columns a part's rollups went from 5.3 MB to well under one, and
-    /// the list was rewritten whole at every commit.
+    /// the list was rewritten whole at every commit. Absent when the
+    /// rollups live in their own object (`rollups_*`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     scalar_stats_agg_ipc: Option<String>,
+    /// The part's rollups object, when its rollups live in one: the address
+    /// halves and the size, all three or none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rollups_uri: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rollups_content_hash: Option<String>, // "blake3:<hex>"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rollups_size_bytes: Option<u64>,
     fts_summary_agg: BTreeMap<String, FtsSummaryAggDto>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     fts_length_totals: Option<BTreeMap<String, ColumnLengthStatsDto>>,
@@ -1874,19 +1900,22 @@ fn decode_b64(s: &str, field: &'static str) -> Result<Vec<u8>, ListParseError> {
 }
 
 fn entry_to_dto(e: &ManifestPartEntry) -> Result<ManifestPartEntryDto, ListEncodeError> {
+    // Rollups that live in their own object are named, not carried: the
+    // object was written with the part, and a handle that could not read
+    // it still names it, so the list never loses it.
+    let stored = e.rollups.reference();
     // The batch encoder takes the arrays as they are; a bound that is not
     // one row is refused here, as a typed error, before anything is written.
-    for agg in e.scalar_stats_agg.values() {
-        for (field, array) in [
-            ("scalar_stats_agg.min", Some(&agg.min)),
-            ("scalar_stats_agg.max", Some(&agg.max)),
-            ("scalar_stats_agg.sum", agg.sum.as_ref()),
-        ] {
-            if let Some(array) = array {
-                require_single_row(array)
-                    .map_err(|source| ListEncodeError::ScalarStats { field, source })?;
-            }
-        }
+    let carried = if stored.is_some() {
+        None
+    } else {
+        Some(&e.scalar_stats_agg)
+    };
+    if let Some(rollups) = carried {
+        require_single_row_bounds(rollups).map_err(|e| ListEncodeError::ScalarStats {
+            field: e.bound,
+            source: e.source,
+        })?;
     }
     Ok(ManifestPartEntryDto {
         part_id: e.part_id.0.to_string(),
@@ -1902,7 +1931,10 @@ fn entry_to_dto(e: &ManifestPartEntry) -> Result<ManifestPartEntryDto, ListEncod
         summaries_size_bytes: e.summaries.as_ref().map(|s| s.size_bytes),
         id_range: (e.id_range.0.to_string(), e.id_range.1.to_string()),
         scalar_stats_agg: BTreeMap::new(),
-        scalar_stats_agg_ipc: Some(encode_b64(&encode_scalar_stats(&e.scalar_stats_agg))),
+        scalar_stats_agg_ipc: carried.map(|rollups| encode_b64(&encode_scalar_stats(rollups))),
+        rollups_uri: stored.map(|r| r.uri.clone()),
+        rollups_content_hash: stored.map(|r| encode_hash(&r.content_hash)),
+        rollups_size_bytes: stored.map(|r| r.size_bytes),
         fts_summary_agg: e
             .fts_summary_agg
             .iter()
@@ -1952,6 +1984,40 @@ fn entry_from_dto(
     let part_id =
         PartId(Uuid::parse_str(&d.part_id).map_err(|e| ListParseError::BadPartId(e.to_string()))?);
     let content_hash = decode_hash(&d.content_hash)?;
+    // A rollups object is named by all three fields or none, and a part
+    // that names one carries no rollups inline, in either inline form (the
+    // one batch, or the per-bound map of the majors before it). The loader
+    // reads the object into the entry; until it has, the part counts as
+    // unread and carries no bounds, so nothing prunes on or folds rollups
+    // this handle has not seen.
+    let carries_inline = d.scalar_stats_agg_ipc.is_some() || !d.scalar_stats_agg.is_empty();
+    let rollups = match (
+        d.rollups_uri,
+        d.rollups_content_hash.as_deref(),
+        d.rollups_size_bytes,
+    ) {
+        (None, None, None) => RollupsAt::Inline,
+        (Some(uri), Some(hash), Some(size_bytes)) if !carries_inline => {
+            RollupsAt::Unread(RollupsRef {
+                uri,
+                content_hash: decode_hash(hash)?,
+                size_bytes,
+            })
+        }
+        (uri, hash, size) => {
+            return Err(ListParseError::BadFieldValue(
+                "rollups",
+                format!(
+                    "uri {}, hash {}, size {}, inline {}: a rollups object is named by all three \
+                     or none, and never beside inline rollups",
+                    uri.as_deref().unwrap_or("absent"),
+                    hash.unwrap_or("absent"),
+                    size.map_or("absent".to_string(), |size| size.to_string()),
+                    carries_inline
+                ),
+            ));
+        }
+    };
     let mut scalar_stats_agg = match d.scalar_stats_agg_ipc.as_deref() {
         Some(encoded) => decode_scalar_stats(&decode_b64(encoded, "scalar_stats_agg_ipc")?, legacy)
             .map_err(|source| ListParseError::ScalarStats {
@@ -2095,6 +2161,7 @@ fn entry_from_dto(
                 ));
             }
         },
+        rollups,
         id_range: {
             let lo =
                 d.id_range.0.parse::<i128>().map_err(|_| {
@@ -2456,6 +2523,7 @@ fn check_major(fv: &str) -> Result<(), ListParseError> {
         .expect("constant has a dot");
     let got_major = fv.split('.').next().unwrap_or("");
     if got_major != supported_major
+        && got_major != FORMAT_MAJOR_SECTIONS
         && got_major != FORMAT_MAJOR_INLINE
         && got_major != FORMAT_MAJOR_NAMED
     {
@@ -2502,6 +2570,7 @@ mod tests {
             bloom::BloomBuilder,
             encoding::{encode_length1_array, encode_value_counts},
             part::{ContentHash, PartId},
+            rollups::rollups_uri,
         },
         *,
     };
@@ -3326,6 +3395,7 @@ mod tests {
         );
 
         ManifestPartEntry {
+            rollups: Default::default(),
             part_id: PartId(Uuid::from_bytes([seed; 16])),
             uri: format!("manifests/part-{seed:02x}.avro.zst"),
             n_superfiles: 9_847,
@@ -4382,12 +4452,41 @@ mod tests {
 
     #[test]
     fn incompatible_major_version_rejected() {
-        let bytes = restamped(&empty_list(), "4.0");
-        let err = decode(&bytes, &LegacyNames::none()).expect_err("major 4 must reject");
+        let bytes = restamped(&empty_list(), "5.0");
+        let err = decode(&bytes, &LegacyNames::none()).expect_err("major 5 must reject");
         assert!(
             matches!(err, ListParseError::IncompatibleMajorVersion { .. }),
             "expected IncompatibleMajorVersion, got {err:?}"
         );
+    }
+
+    /// An entry's rollups in the per-column map the majors before the one
+    /// batch carried: one length-one IPC stream per bound, keyed by column.
+    /// This engine's encoder never writes it, so the tests that need the
+    /// shape build it here.
+    fn per_bound_rollups(entry: &ManifestPartEntry) -> BTreeMap<String, ScalarStatsAggDto> {
+        entry
+            .scalar_stats_agg
+            .iter()
+            .map(|(id, agg)| {
+                let key = wire_key(*id);
+                let bound = |array: &ArrayRef| {
+                    encode_b64(&encode_length1_array(&key, array).expect("a length-one array"))
+                };
+                let dto = ScalarStatsAggDto {
+                    min: bound(&agg.min),
+                    max: bound(&agg.max),
+                    null_count: agg.null_count,
+                    sum: agg.sum.as_ref().map(bound),
+                    hll: agg.hll.as_deref().map(encode_b64),
+                    value_counts: agg
+                        .value_counts
+                        .as_ref()
+                        .map(|counts| encode_b64(&encode_value_counts(counts).expect("encode"))),
+                };
+                (key, dto)
+            })
+            .collect()
     }
 
     /// A list of the major before summaries sections, in the shape that
@@ -4406,26 +4505,7 @@ mod tests {
             part.summaries_uri = None;
             part.summaries_content_hash = None;
             part.summaries_size_bytes = None;
-            part.scalar_stats_agg = BTreeMap::new();
-            for (id, agg) in &entry.scalar_stats_agg {
-                let key = wire_key(*id);
-                let bound = |array: &ArrayRef| {
-                    encode_b64(&encode_length1_array(&key, array).expect("a length-one array"))
-                };
-                part.scalar_stats_agg.insert(
-                    key.clone(),
-                    ScalarStatsAggDto {
-                        min: bound(&agg.min),
-                        max: bound(&agg.max),
-                        null_count: agg.null_count,
-                        sum: agg.sum.as_ref().map(bound),
-                        hll: agg.hll.as_deref().map(encode_b64),
-                        value_counts: agg.value_counts.as_ref().map(|counts| {
-                            encode_b64(&encode_value_counts(counts).expect("encode"))
-                        }),
-                    },
-                );
-            }
+            part.scalar_stats_agg = per_bound_rollups(entry);
         }
         let bytes = serde_json::to_vec_pretty(&dto).expect("json");
         let text = from_utf8(&bytes).expect("utf8");
@@ -4441,9 +4521,92 @@ mod tests {
             assert_eq!(back.scalar_stats_agg, original.scalar_stats_agg);
         }
         assert!(
-            FORMAT_VERSION.starts_with("3."),
-            "this engine writes major 3"
+            FORMAT_VERSION.starts_with("4."),
+            "this engine writes major 4"
         );
+    }
+
+    /// A list of the major before rollups objects, every part's rollups
+    /// inline, still decodes to them. The bytes are this encoder's, restamped:
+    /// a part with inline rollups writes exactly what major 3 wrote, which
+    /// holds only while it writes no rollups-object field, so that is
+    /// asserted before the decode.
+    #[test]
+    fn a_list_of_the_major_before_rollups_objects_decodes() {
+        let list = rich_list(2);
+        let bytes = restamped(&list, "3.0");
+        let text = from_utf8(&bytes).expect("utf8");
+        assert!(
+            !text.contains("rollups_"),
+            "the shape a major 3 engine wrote: no rollups-object field"
+        );
+        let decoded = decode(&bytes, &LegacyNames::none()).expect("major 3 decodes");
+        for (back, original) in decoded.parts.iter().zip(&list.parts) {
+            assert_eq!(back.rollups, RollupsAt::Inline);
+            assert_eq!(back.scalar_stats_agg, original.scalar_stats_agg);
+        }
+    }
+
+    /// The address of a rollups object, for the tests that name one.
+    fn rollups_ref() -> RollupsRef {
+        let hash = ContentHash::of(b"a part's rollups");
+        RollupsRef {
+            uri: rollups_uri(&hash),
+            content_hash: hash,
+            size_bytes: 42,
+        }
+    }
+
+    /// A part whose rollups live in their own object is written naming it
+    /// and carrying none, and decodes as not yet read, its rollups empty:
+    /// the loader reads them, and until it has, nothing folds them.
+    #[test]
+    fn a_part_s_stored_rollups_are_named_not_carried() {
+        let mut list = rich_list(1);
+        list.parts[0].rollups = RollupsAt::Stored(rollups_ref());
+        let bytes = encode(&list).expect("encode");
+        let text = from_utf8(&bytes).expect("utf8");
+        assert!(!text.contains("scalar_stats_agg_ipc"), "no rollups carried");
+        assert!(text.contains(&rollups_ref().uri), "the object is named");
+        let decoded = decode(&bytes, &LegacyNames::none()).expect("decode");
+        assert_eq!(decoded.parts[0].rollups, RollupsAt::Unread(rollups_ref()));
+        assert!(decoded.parts[0].scalar_stats_agg.is_empty());
+    }
+
+    /// A part naming a rollups object by some of its three fields, or one
+    /// beside inline rollups in either form (the one batch, or the
+    /// per-column map of the earlier majors), is a damaged list, refused.
+    /// Decoded, a named part beside inline bounds would read as unread yet
+    /// carry bounds, and the list pruner could drop it on them.
+    #[test]
+    fn a_part_naming_a_rollups_object_halfway_or_beside_inline_ones_is_refused() {
+        let mut list = rich_list(1);
+        list.parts[0].rollups = RollupsAt::Stored(rollups_ref());
+        let named = list_to_dto(&list).expect("encode");
+
+        let mut half = list_to_dto(&list).expect("encode");
+        half.parts[0].rollups_size_bytes = None;
+        let inline = list_to_dto(&rich_list(1)).expect("encode");
+        let mut both = list_to_dto(&rich_list(1)).expect("encode");
+        both.parts[0].rollups_uri = named.parts[0].rollups_uri.clone();
+        both.parts[0].rollups_content_hash = named.parts[0].rollups_content_hash.clone();
+        both.parts[0].rollups_size_bytes = named.parts[0].rollups_size_bytes;
+        assert!(inline.parts[0].scalar_stats_agg_ipc.is_some());
+        let mut beside_map = list_to_dto(&list).expect("encode");
+        beside_map.parts[0].scalar_stats_agg = per_bound_rollups(&list.parts[0]);
+        assert!(
+            beside_map.parts[0].scalar_stats_agg_ipc.is_none()
+                && !beside_map.parts[0].scalar_stats_agg.is_empty(),
+            "the object named beside the per-column map alone"
+        );
+
+        for damaged in [half, both, beside_map] {
+            let bytes = serde_json::to_vec(&damaged).expect("json");
+            assert!(matches!(
+                decode(&bytes, &LegacyNames::none()),
+                Err(ListParseError::BadFieldValue("rollups", _))
+            ));
+        }
     }
 
     /// A part naming a section by some of its three fields is a damaged

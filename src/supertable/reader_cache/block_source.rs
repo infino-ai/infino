@@ -703,6 +703,7 @@ impl BlockCachedSource {
 
     /// Construct a sparse source whose owning entry has already reserved the
     /// complete object size.
+    #[cfg(test)]
     pub(crate) fn new_pre_reserved(
         inner: Arc<dyn LazyByteSource>,
         store: Weak<DiskCacheStore>,
@@ -4551,7 +4552,11 @@ mod tests {
             "the source gave back its own bytes and nothing was retained"
         );
         assert!(path.exists(), "the newer file stays");
-        assert_eq!(store.evict_block_files(u64::MAX), 0, "no record to evict");
+        assert_eq!(
+            store.evict_block_files(u64::MAX, None),
+            0,
+            "no record to evict"
+        );
         assert!(path.exists(), "the newer file survives eviction");
     }
 

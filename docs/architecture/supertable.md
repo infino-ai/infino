@@ -224,13 +224,14 @@ it. The section's size counts with the part's toward the split cap,
 since a commit to the part rewrites both; the rewrite carries the old
 section's rows over as they are.
 
-The list's major version moved with the section. The first commit by
-this engine on any table, including a maintenance publish that adds no
-data and the hidden vector index's sibling, writes the list at the new
-major, and an engine from before the section refuses it rather than
-fold a part's rollups from its own appends alone. So a deployment that
-has committed cannot be rolled back to an engine from before the
-section; it reads nothing of that table.
+The list's major version moves whenever a part's statistics move out
+of the list (the summaries section, major 3; the rollups object, major
+4). The first commit by an engine of a newer major on any table,
+including a maintenance publish that adds no data and the hidden vector
+index's sibling, writes the list at that major, and an engine of an
+older one refuses it rather than fold a part's rollups from its own
+appends alone. So a deployment that has committed cannot be rolled back
+past the major it wrote; an older engine reads nothing of that table.
 - **Full-text summary.** Per text column, the lexicographic range of
 its terms and the length statistics BM25 scores with. Which superfiles
 hold a given term is not recorded here: that is the table-level term
@@ -253,9 +254,22 @@ entries are grouped into manifest *parts*; a new commit's superfiles
 append to a partition's current part until that part crosses a soft
 cap on either entry count or compressed size, at which point the next
 commit starts a fresh part rather than rewriting the existing one. A
-top-level manifest list names the parts and carries the per-part
-aggregate summaries used for pruning, so a query can discard whole
-parts before touching any per-superfile entry.
+top-level manifest list names the parts and their per-part aggregate
+summaries used for pruning, so a query can discard whole parts before
+touching any per-superfile entry.
+
+A part's scalar rollups (each column's bounds and null count over the
+part) grow with the table's columns, and the list is rewritten whole at
+every commit and read whole again by a writer that lost a commit race.
+So rollups past a small inline cap live in an object of their own beside
+the part, content-addressed and written once with it, and the list
+names it. A handle reads each part's rollups once and keeps them; a
+refresh reads only those of parts it has not seen, and a commit writes
+only the rollups of the part it rebuilds. On a narrow table the rollups
+stay inline, where they cost less than a request of their own. A
+rollups object that cannot be read leaves its part kept by every prune,
+and a commit never rewrites that part, since the rollups it would fold
+from what it sees would leave out the part's earlier superfiles.
 
 Parts load on one of two paths, selected by a threshold on part count:
 

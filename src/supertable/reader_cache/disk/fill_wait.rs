@@ -30,8 +30,10 @@ use tokio::{sync::oneshot, time::sleep};
 
 use crate::{
     runtime_bridge::shared_io_runtime,
-    superfile::reader::SuperfileReader,
-    supertable::reader_cache::disk::{DiskCacheStore, reader_blocks_background_fill},
+    supertable::{
+        manifest::SuperfileUri,
+        reader_cache::disk::{BackgroundFill, DiskCacheStore},
+    },
 };
 
 /// How often the ticker re-checks the parked fills. It also sets the grace a reader gets between
@@ -76,10 +78,9 @@ impl PromotionDefer {
         }
     }
 
-    /// Whether the fill should still yield to `reader` being held by a
-    /// caller other than the cache entry.
-    pub(super) fn yields_to(self, reader: &Weak<SuperfileReader>) -> bool {
-        self.open_at(Instant::now()) && reader_blocks_background_fill(reader)
+    /// Whether the fill of `uri` should still yield to a query holding the file.
+    pub(super) fn yields_to(self, store: &DiskCacheStore, uri: &SuperfileUri) -> bool {
+        self.open_at(Instant::now()) && store.file_in_use(uri)
     }
 }
 
@@ -111,31 +112,33 @@ struct State {
 }
 
 struct Parked {
-    reader: Weak<SuperfileReader>,
+    uri: SuperfileUri,
+    fill: Arc<BackgroundFill>,
     defer: PromotionDefer,
     wait: FillWait,
-    /// The reader looked free on the previous tick. `strong_count == 1` also occurs briefly while
-    /// a caller is acquiring the cache entry, so a fill goes only after two free ticks in a row.
+    /// The file's reader looked free on the previous tick. `strong_count == 1` also occurs
+    /// briefly while a caller is acquiring the cache entry, so a fill goes only after two free
+    /// ticks in a row.
     free_last_tick: bool,
     wake: oneshot::Sender<()>,
 }
 
 impl Parked {
-    /// Whether the fill may go without waiting for the reader to be free: the reader is gone, the
+    /// Whether the fill may go without waiting for the file to be free: it was cancelled, the
     /// defer window has closed, or a test helper waits for promotion (see [`FillWait`]).
     fn released(&self, now: Instant, promotion_waiters: bool) -> bool {
-        self.reader.strong_count() == 0
+        self.fill.is_cancelled()
             || (self.wait == FillWait::Release && promotion_waiters)
             || !self.defer.open_at(now)
     }
 
     /// One tick's verdict: whether the fill may go now. Besides [`Self::released`], a fill goes
-    /// once its reader has been free on this tick and the one before.
-    fn may_go(&mut self, now: Instant, promotion_waiters: bool) -> bool {
+    /// once its file has been free on this tick and the one before.
+    fn may_go(&mut self, store: &DiskCacheStore, now: Instant, promotion_waiters: bool) -> bool {
         if self.released(now, promotion_waiters) {
             return true;
         }
-        let free = !reader_blocks_background_fill(&self.reader);
+        let free = !store.file_in_use(&self.uri);
         let go = free && self.free_last_tick;
         self.free_last_tick = free;
         go
@@ -147,13 +150,14 @@ impl FillWaiters {
         self.state.lock().expect("fill waiters poisoned")
     }
 
-    /// Park until the fill for `reader` may go: the reader is free (or gone), the defer window has
-    /// closed, or, for [`FillWait::Release`], a test helper waits for promotion. Then hand back the
-    /// store, or `None` if it was dropped meanwhile. Says nothing about which of these happened:
-    /// the caller checks the reader and the store itself.
+    /// Park until `fill` of `uri` may go: no query holds the file, the fill was cancelled, the
+    /// defer window has closed, or, for [`FillWait::Release`], a test helper waits for promotion.
+    /// Then hand back the store, or `None` if it was dropped meanwhile. Says nothing about which
+    /// of these happened: the caller checks the fill and the store itself.
     pub(super) async fn park(
         store: &Weak<DiskCacheStore>,
-        reader: &Weak<SuperfileReader>,
+        uri: &SuperfileUri,
+        fill: &Arc<BackgroundFill>,
         defer: PromotionDefer,
         wait: FillWait,
     ) -> Option<Arc<DiskCacheStore>> {
@@ -162,7 +166,8 @@ impl FillWaiters {
             let strong = store.upgrade()?;
             let (wake, woken) = oneshot::channel();
             let parked = Parked {
-                reader: reader.clone(),
+                uri: *uri,
+                fill: Arc::clone(fill),
                 defer,
                 wait,
                 free_last_tick: false,
@@ -192,12 +197,13 @@ impl FillWaiters {
     ///
     /// The list is scanned outside the lock, so a fill parking meanwhile never waits on a long
     /// scan; it lands in the list left behind and is merged back after.
-    fn tick(&self, promotion_waiters: bool) -> (Vec<oneshot::Sender<()>>, bool) {
+    fn tick(&self, store: &DiskCacheStore) -> (Vec<oneshot::Sender<()>>, bool) {
         let mut parked = mem::take(&mut self.lock().parked);
         let now = Instant::now();
+        let promotion_waiters = promotion_waiters(store);
         let ready = parked
             .extract_if(.., |p| {
-                p.wake.is_closed() || p.may_go(now, promotion_waiters)
+                p.wake.is_closed() || p.may_go(store, now, promotion_waiters)
             })
             .map(|p| p.wake)
             .collect();
@@ -233,7 +239,7 @@ async fn run_ticker(store: Weak<DiskCacheStore>) {
         let Some(strong) = store.upgrade() else {
             return;
         };
-        let (ready, more) = strong.fill_waiters.tick(promotion_waiters(&strong));
+        let (ready, more) = strong.fill_waiters.tick(&strong);
         // Let go of the store before waking anyone: a woken fill checks whether it holds the
         // store's last reference, and must not see ours.
         drop(strong);
@@ -254,21 +260,23 @@ fn promotion_waiters(store: &DiskCacheStore) -> bool {
 #[cfg(test)]
 mod tests {
     use std::{
-        sync::Weak,
+        sync::Arc,
         time::{Duration, Instant},
     };
 
     use tokio::sync::oneshot;
 
-    use crate::supertable::reader_cache::disk::fill_wait::{
-        FillWait, FillWaiters, Parked, PromotionDefer,
+    use crate::supertable::{
+        manifest::SuperfileUri,
+        reader_cache::disk::fill_wait::{FillWait, FillWaiters, Parked, PromotionDefer},
     };
 
-    /// A parked fill on no reader, with its receiver, so the sender reads as open.
+    /// A parked fill, with its receiver, so the sender reads as open.
     fn parked() -> (Parked, oneshot::Receiver<()>) {
         let (wake, woken) = oneshot::channel();
         let fill = Parked {
-            reader: Weak::new(),
+            uri: SuperfileUri::new_v4(),
+            fill: Arc::default(),
             defer: PromotionDefer::Forever,
             wait: FillWait::Quiescence,
             free_last_tick: false,

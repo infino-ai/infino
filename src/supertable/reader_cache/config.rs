@@ -48,8 +48,8 @@ pub enum ColdFetchMode {
     /// + cold-search byte budget against object storage
     /// (~6 GETs / ~2-3 MiB on a typical 1.5 GiB superfile).
     /// A background task downloads the full superfile to NVMe
-    /// after foreground lazy readers release, then mmaps it
-    /// + replaces the cache entry;
+    /// after foreground lazy readers release, then swaps it into
+    /// the cache entry, or leaves it on disk for the next read;
     /// any subsequent `reader(uri)` call returns the
     /// mmap-backed reader and the corresponding search issues
     /// **zero** S3 GETs.

@@ -26,6 +26,7 @@ use crate::{
             commit::{MANIFEST_DIR, MANIFEST_PARTS_DIR, POINTER_PATH, manifest_uri},
             list::RoutingRef,
             part::ContentHash,
+            rollups::MANIFEST_ROLLUPS_DIR,
             summaries::MANIFEST_SUMMARIES_DIR,
             term_index::{self, STORAGE_PREFIX as TERM_INDEX_STORAGE_PREFIX},
         },
@@ -114,8 +115,8 @@ fn build_live_set(manifest: &ManifestSnapshot) -> (HashSet<String>, bool) {
     (live, superfiles_complete)
 }
 
-/// Every object a manifest's list references besides the list itself: the parts and their routing
-/// siblings, and the list-level blobs (vector state and its sections, graph and router blobs, term
+/// Every object a manifest's list references besides the list itself: the parts, their routing
+/// siblings, summaries sections and rollups objects, and the list-level blobs (vector state and its sections, graph and router blobs, term
 /// stats, the term-index root). Read off the list with no I/O. The listing sweep keeps these and
 /// the deferred sweep diffs them, so a new kind of list reference is added here, once, for both.
 fn list_refs(manifest: &ManifestSnapshot) -> impl Iterator<Item = &str> {
@@ -123,6 +124,12 @@ fn list_refs(manifest: &ManifestSnapshot) -> impl Iterator<Item = &str> {
         iter::once(entry.uri.as_str())
             .chain(entry.routing.as_ref().map(|routing| routing.uri.as_str()))
             .chain(entry.summaries.as_ref().map(|section| section.uri.as_str()))
+            .chain(
+                entry
+                    .rollups
+                    .reference()
+                    .map(|rollups| rollups.uri.as_str()),
+            )
     });
 
     let blobs = [
@@ -418,6 +425,7 @@ pub(super) async fn gc_storage_sweep_for_inner(
         MANIFEST_DIR,
         MANIFEST_PARTS_DIR,
         MANIFEST_SUMMARIES_DIR,
+        MANIFEST_ROLLUPS_DIR,
         SLOW_VECTOR_STATE_STORAGE_PREFIX,
         TERM_INDEX_STORAGE_PREFIX,
         // Tombstone sidecars under `superfiles/` (live set includes the
@@ -687,6 +695,7 @@ mod tests {
                     FORMAT_VERSION, Manifest, ManifestPartEntry, PartitionStrategy, RoutingRef,
                 },
                 part::{ContentHash, PartId},
+                rollups::{RollupsAt, RollupsRef, rollups_uri},
                 summaries::{SummariesRef, summaries_uri},
             },
             slow_vector_state,
@@ -802,10 +811,12 @@ mod tests {
     }
 
     /// A manifest whose one part is listed but not loaded, naming
-    /// `summaries` as the part's section.
+    /// `summaries` as the part's section and its rollups where `rollups`
+    /// says.
     fn lazy_part_manifest(
         storage: Arc<dyn StorageProvider>,
         summaries: Option<SummariesRef>,
+        rollups: RollupsAt,
     ) -> ManifestSnapshot {
         let part_id = PartId::new_v4();
         ManifestSnapshot::new(
@@ -840,6 +851,7 @@ mod tests {
                 term_index: None,
                 term_index_complete: false,
                 parts: vec![ManifestPartEntry {
+                    rollups,
                     part_id,
                     uri: format!("manifest-parts/part-{part_id}.avro.zst"),
                     n_superfiles: 1,
@@ -862,7 +874,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let storage: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
-        let manifest = lazy_part_manifest(storage, None);
+        let manifest = lazy_part_manifest(storage, None, RollupsAt::Inline);
 
         let (_, superfiles_complete) = build_live_set(&manifest);
         assert!(!superfiles_complete);
@@ -880,10 +892,36 @@ mod tests {
             content_hash: ContentHash::of(b"section"),
             size_bytes: 7,
         };
-        let manifest = lazy_part_manifest(storage, Some(section.clone()));
+        let manifest = lazy_part_manifest(storage, Some(section.clone()), RollupsAt::Inline);
 
         let (live, _) = build_live_set(&manifest);
         assert!(live.contains(&section.uri));
+    }
+
+    /// A part's rollups object is live while the list names it, read or not:
+    /// a handle that could not read it still names it, so the sweep, which
+    /// lists the object's prefix, must keep it for the handles that can.
+    #[test]
+    fn build_live_set_contains_a_part_s_rollups_object() {
+        for stored in [true, false] {
+            let dir = tempdir().expect("tempdir");
+            let storage: Arc<dyn StorageProvider> =
+                Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+            let reference = RollupsRef {
+                uri: rollups_uri(&ContentHash::of(b"rollups")),
+                content_hash: ContentHash::of(b"rollups"),
+                size_bytes: 7,
+            };
+            let rollups = if stored {
+                RollupsAt::Stored(reference.clone())
+            } else {
+                RollupsAt::Unread(reference.clone())
+            };
+            let manifest = lazy_part_manifest(storage, None, rollups);
+
+            let (live, _) = build_live_set(&manifest);
+            assert!(live.contains(&reference.uri), "stored {stored}");
+        }
     }
 
     /// A section no list names is swept, and the one the list names stays.

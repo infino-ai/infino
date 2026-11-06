@@ -33,6 +33,7 @@ pub mod list_prune;
 pub mod options_hash;
 pub mod part;
 pub mod partition;
+pub mod rollups;
 pub mod summaries;
 pub(crate) mod term_index;
 use arrow_schema::Schema;
@@ -63,7 +64,7 @@ use arrow::compute::kernels::aggregate as agg;
 use arrow_array::*;
 use arrow_schema::{DataType, TimeUnit};
 use bytes::Bytes;
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use futures::{
     future, stream,
     stream::{StreamExt, TryStreamExt},
@@ -119,6 +120,7 @@ use crate::{
             },
             part::{ContentHash, ManifestPart, OpenBlobBudget, PartId, share_physical_schemas},
             partition::{assign_partition, encode_partition_key},
+            rollups::{RollupsAt, RollupsError, RollupsRef, rollups_uri},
             summaries::{
                 SummariesError, SummariesRef, SummariesSection, rows_from_entries, summaries_uri,
             },
@@ -418,6 +420,12 @@ pub struct ManifestSnapshot {
     /// list loads no part. A part's content never changes, so successor
     /// snapshots share the map.
     derived_length_totals: Arc<DashMap<PartId, PartLengthTotals>>,
+    /// Parts whose inline rollups [`Self::store_inline_rollups`] encoded
+    /// and found under the inline cap, so a later commit leaves them
+    /// without encoding them again. A part's rollups never change, so
+    /// successor snapshots share the set, as they share
+    /// `derived_length_totals`.
+    inline_rollups_fit: Arc<DashSet<PartId>>,
 }
 
 impl fmt::Debug for ManifestSnapshot {
@@ -479,6 +487,7 @@ impl ManifestSnapshot {
                 stamped_drained_ranges: None,
                 stamped_schema: None,
                 derived_length_totals: Default::default(),
+                inline_rollups_fit: Default::default(),
             }
         } else {
             Self {
@@ -491,6 +500,7 @@ impl ManifestSnapshot {
                 stamped_drained_ranges: None,
                 stamped_schema: None,
                 derived_length_totals: Default::default(),
+                inline_rollups_fit: Default::default(),
             }
         }
     }
@@ -516,6 +526,7 @@ impl ManifestSnapshot {
             stamped_drained_ranges: None,
             stamped_schema: None,
             derived_length_totals: Default::default(),
+            inline_rollups_fit: Default::default(),
         }
     }
 
@@ -536,6 +547,7 @@ impl ManifestSnapshot {
             stamped_drained_ranges: None,
             stamped_schema: None,
             derived_length_totals: Default::default(),
+            inline_rollups_fit: Default::default(),
         }
     }
 
@@ -589,6 +601,7 @@ impl ManifestSnapshot {
             stamped_drained_ranges: None,
             stamped_schema: None,
             derived_length_totals: Default::default(),
+            inline_rollups_fit: Default::default(),
         }
     }
 
@@ -671,6 +684,7 @@ impl ManifestSnapshot {
             stamped_drained_ranges: self.stamped_drained_ranges.clone(),
             stamped_schema: Some(schema),
             derived_length_totals: Arc::clone(&self.derived_length_totals),
+            inline_rollups_fit: Arc::clone(&self.inline_rollups_fit),
         }
     }
 
@@ -1094,7 +1108,7 @@ impl ManifestSnapshot {
                 actual: "None options".to_string(),
             });
         };
-        let list = list::decode(&list_bytes, &options.legacy_names())
+        let mut list = list::decode(&list_bytes, &options.legacy_names())
             .map_err(ManifestLoadError::ListParse)?;
 
         // Verify the caller's options match the
@@ -1121,6 +1135,17 @@ impl ManifestSnapshot {
             options.summary_centroids_from_superfiles,
             options.legacy_names(),
         ));
+        // The rollups the list names but does not carry, read before any
+        // reader or commit sees the entries.
+        fill_rollups(
+            &mut list,
+            current_manifest
+                .as_ref()
+                .and_then(|current| current.list.as_ref()),
+            &storage,
+            options.metadata_disk_cache.as_ref(),
+        )
+        .await?;
         let parts: DashMap<_, _> = DashMap::new();
         let mut all_superfiles: Vec<Arc<SuperfileEntry>> = Vec::new();
 
@@ -1364,6 +1389,10 @@ impl ManifestSnapshot {
                 .as_ref()
                 .map(|cur| Arc::clone(&cur.derived_length_totals))
                 .unwrap_or_default(),
+            inline_rollups_fit: current_manifest
+                .as_ref()
+                .map(|cur| Arc::clone(&cur.inline_rollups_fit))
+                .unwrap_or_default(),
         };
 
         record("parts", new_manifest.parts.len() as u64);
@@ -1419,8 +1448,9 @@ impl ManifestSnapshot {
         };
         // Step 1+2: parallel write of (list, parts). `parts_to_write` is
         // every object the touched parts publish, by key: the parts, their
-        // routing siblings and their summaries sections
-        // (`EncodedPart::objects`).
+        // routing siblings, their summaries sections and rollups
+        // (`EncodedPart::objects`), and the rollups objects untouched parts'
+        // inline rollups moved to (`Self::store_inline_rollups`).
         //
         // Both futures are independent — the list's references to
         // each part's URI are content-addressable from the
@@ -1677,6 +1707,74 @@ impl ManifestSnapshot {
         }
     }
 
+    /// Move into objects of their own the rollups this manifest's list
+    /// still carries inline past [`rollups::INLINE_ROLLUPS_MAX_BYTES`], and
+    /// name each object in the list instead. Returns the objects by storage
+    /// key, for the commit to write with its parts, before the list that
+    /// names them.
+    ///
+    /// A part's rollups get an object of their own when the part is written,
+    /// so a part from a list before major 4 kept its rollups inline in every
+    /// list after it: on a wide table those rollups were most of the list,
+    /// and every commit rewrote them and every loser of a commit race read
+    /// them again. Every such part moves in the first commit that carries
+    /// it. That commit writes, once, the bytes its list would otherwise have
+    /// carried, so it costs no more than the commit before it did, and every
+    /// list after it is smaller.
+    ///
+    /// The objects are content-addressed and a part's rollups encode the same
+    /// way every time, so a retried commit names the same objects. A hidden
+    /// manifest's rollups stay inline, as its parts' do.
+    ///
+    /// Telling whether a part's rollups pass the cap takes encoding them, so
+    /// a part found under it is remembered (`inline_rollups_fit`) and not
+    /// encoded again: on a table whose rollups all stay inline, only a
+    /// commit's new parts are encoded, once each.
+    pub(crate) fn store_inline_rollups(&mut self) -> Result<Vec<(String, Bytes)>, ManifestError> {
+        if matches!(
+            self.partition_strategy(),
+            Some(PartitionStrategy::VectorCell { .. })
+        ) {
+            return Ok(Vec::new());
+        }
+        let Some(list) = self.list.as_mut() else {
+            return Ok(Vec::new());
+        };
+        let mut objects = Vec::new();
+        for entry in &mut list.parts {
+            if entry.rollups != RollupsAt::Inline
+                || self.inline_rollups_fit.contains(&entry.part_id)
+            {
+                continue;
+            }
+            let Some(bytes) = rollups::encode(entry.part_id, &entry.scalar_stats_agg)? else {
+                self.inline_rollups_fit.insert(entry.part_id);
+                continue;
+            };
+            let content_hash = ContentHash::of(&bytes);
+            let uri = rollups_uri(&content_hash);
+            entry.rollups = RollupsAt::Stored(RollupsRef {
+                uri: uri.clone(),
+                content_hash,
+                size_bytes: bytes.len() as u64,
+            });
+            objects.push((uri, Bytes::from(bytes)));
+        }
+        // Forget parts this list no longer holds, so the set stays the size
+        // of the list and not of every part the handle has seen.
+        let held: HashSet<PartId> = list.parts.iter().map(|entry| entry.part_id).collect();
+        self.inline_rollups_fit
+            .retain(|part_id| held.contains(part_id));
+        Ok(objects)
+    }
+
+    /// Whether [`Self::store_inline_rollups`] has found part `part_id`'s
+    /// rollups under the inline cap.
+    #[cfg(test)]
+    fn rollups_known_to_fit(&self, part_id: PartId) -> bool {
+        self.inline_rollups_fit.contains(&part_id)
+    }
+
     /// Build a successor manifest with `new_entries` appended.
     /// Preserves the persistence-side metadata (`list`, `loader`)
     /// from the predecessor; the per-part cache is fresh (an empty
@@ -1694,6 +1792,7 @@ impl ManifestSnapshot {
             stamped_drained_ranges: self.stamped_drained_ranges.clone(),
             stamped_schema: self.stamped_schema.clone(),
             derived_length_totals: Arc::clone(&self.derived_length_totals),
+            inline_rollups_fit: Arc::clone(&self.inline_rollups_fit),
         }
     }
 
@@ -1744,6 +1843,7 @@ impl ManifestSnapshot {
             stamped_drained_ranges: self.stamped_drained_ranges.clone(),
             stamped_schema: self.stamped_schema.clone(),
             derived_length_totals: Arc::clone(&self.derived_length_totals),
+            inline_rollups_fit: Arc::clone(&self.inline_rollups_fit),
         }
     }
 
@@ -1870,6 +1970,7 @@ impl ManifestSnapshot {
             stamped_drained_ranges: self.stamped_drained_ranges.clone(),
             stamped_schema: self.stamped_schema.clone(),
             derived_length_totals: Arc::clone(&self.derived_length_totals),
+            inline_rollups_fit: Arc::clone(&self.inline_rollups_fit),
         }
     }
 
@@ -1911,6 +2012,7 @@ impl ManifestSnapshot {
             stamped_drained_ranges: self.stamped_drained_ranges.clone(),
             stamped_schema: self.stamped_schema.clone(),
             derived_length_totals: Arc::clone(&self.derived_length_totals),
+            inline_rollups_fit: Arc::clone(&self.inline_rollups_fit),
         }
     }
 
@@ -1969,6 +2071,7 @@ impl ManifestSnapshot {
             stamped_drained_ranges: self.stamped_drained_ranges.clone(),
             stamped_schema: self.stamped_schema.clone(),
             derived_length_totals: Arc::clone(&self.derived_length_totals),
+            inline_rollups_fit: Arc::clone(&self.inline_rollups_fit),
         }
     }
 
@@ -1992,6 +2095,7 @@ impl ManifestSnapshot {
             stamped_drained_ranges: self.stamped_drained_ranges.clone(),
             stamped_schema: self.stamped_schema.clone(),
             derived_length_totals: Arc::clone(&self.derived_length_totals),
+            inline_rollups_fit: Arc::clone(&self.inline_rollups_fit),
         }
     }
 
@@ -2016,6 +2120,7 @@ impl ManifestSnapshot {
             stamped_drained_ranges: Some(ranges),
             stamped_schema: self.stamped_schema.clone(),
             derived_length_totals: Arc::clone(&self.derived_length_totals),
+            inline_rollups_fit: Arc::clone(&self.inline_rollups_fit),
         }
     }
 
@@ -2040,6 +2145,7 @@ impl ManifestSnapshot {
             stamped_drained_ranges: self.stamped_drained_ranges.clone(),
             stamped_schema: self.stamped_schema.clone(),
             derived_length_totals: Arc::clone(&self.derived_length_totals),
+            inline_rollups_fit: Arc::clone(&self.inline_rollups_fit),
         }
     }
 
@@ -2069,6 +2175,7 @@ impl ManifestSnapshot {
             stamped_drained_ranges: self.stamped_drained_ranges.clone(),
             stamped_schema: self.stamped_schema.clone(),
             derived_length_totals: Arc::clone(&self.derived_length_totals),
+            inline_rollups_fit: Arc::clone(&self.inline_rollups_fit),
         }
     }
 
@@ -2092,6 +2199,7 @@ impl ManifestSnapshot {
             stamped_drained_ranges: self.stamped_drained_ranges.clone(),
             stamped_schema: self.stamped_schema.clone(),
             derived_length_totals: Arc::clone(&self.derived_length_totals),
+            inline_rollups_fit: Arc::clone(&self.inline_rollups_fit),
         }
     }
 
@@ -2168,6 +2276,7 @@ impl ManifestSnapshot {
             stamped_drained_ranges: self.stamped_drained_ranges.clone(),
             stamped_schema: self.stamped_schema.clone(),
             derived_length_totals: Arc::clone(&self.derived_length_totals),
+            inline_rollups_fit: Arc::clone(&self.inline_rollups_fit),
         })
     }
 
@@ -2522,8 +2631,19 @@ impl ManifestSnapshot {
             // not rewritten either: its rebuilt section would record its
             // superfiles as having no statistics, for good. It is kept as it
             // is, section reference and all, and the new superfiles go to
-            // a part of their own.
-            let existing_part = if at_cap {
+            // a part of their own. Nor is one whose rollups object this
+            // handle could not read: rollups folded from what it sees would
+            // leave out the part's earlier superfiles, and the list-level
+            // pruner would drop the part where they match.
+            let rollups_unread = entry.rollups.is_unread();
+            if rollups_unread {
+                warn!(
+                    part_id = %entry.part_id,
+                    "the latest part's rollups could not be read; the new superfiles go to a \
+                     part of their own"
+                );
+            }
+            let existing_part = if at_cap || rollups_unread {
                 None
             } else {
                 Some(self.get_part_by_id(entry.part_id).await?)
@@ -2960,6 +3080,7 @@ impl ManifestSnapshot {
             stamped_drained_ranges: None,
             stamped_schema: None,
             derived_length_totals: Arc::clone(&self.derived_length_totals),
+            inline_rollups_fit: Arc::clone(&self.inline_rollups_fit),
         };
 
         Ok((new_manifest, parts_to_write))
@@ -3078,6 +3199,25 @@ fn rebuild_part_and_entry(
     } else {
         section_entries(superfiles, part_id)?
     };
+    // Rollups past the inline cap go to an object of their own, written
+    // with the part, so the list a commit rewrites names them instead of
+    // carrying them. The hidden index keeps few scalar columns, inline.
+    let rollups_object = if hidden {
+        None
+    } else {
+        rollups::encode(part_id, &aggregates.scalar_stats_agg)?.map(|bytes| {
+            let hash = ContentHash::of(&bytes);
+            (Bytes::from(bytes), hash)
+        })
+    };
+    let rollups = match &rollups_object {
+        Some((bytes, hash)) => RollupsAt::Stored(RollupsRef {
+            uri: rollups_uri(hash),
+            content_hash: *hash,
+            size_bytes: bytes.len() as u64,
+        }),
+        None => RollupsAt::Inline,
+    };
     let part = ManifestPart {
         format_version: part::FORMAT_VERSION.into(),
         part_id,
@@ -3112,6 +3252,7 @@ fn rebuild_part_and_entry(
         }),
         id_range: aggregates.id_range,
         scalar_stats_agg: aggregates.scalar_stats_agg,
+        rollups,
         fts_summary_agg: aggregates.fts_summary_agg,
         fts_length_totals: aggregates::fts_length_totals(&part.superfiles),
         summaries: summaries.as_ref().map(|(bytes, hash)| SummariesRef {
@@ -3127,6 +3268,7 @@ fn rebuild_part_and_entry(
             encoded: Bytes::from(compressed),
             routing_encoded: routing.map(|(bytes, _)| Bytes::from(bytes)),
             summaries,
+            rollups: rollups_object,
         },
     ))
 }
@@ -3364,7 +3506,8 @@ impl ManifestPartLoader {
         for entry in &list.parts {
             part_bytes = part_bytes
                 .saturating_add(entry.size_bytes_compressed)
-                .saturating_add(entry.summaries.as_ref().map_or(0, |s| s.size_bytes));
+                .saturating_add(entry.summaries.as_ref().map_or(0, |s| s.size_bytes))
+                .saturating_add(entry.rollups.reference().map_or(0, |r| r.size_bytes));
             idx.insert(
                 entry.part_id,
                 PartRefs {
@@ -3712,6 +3855,124 @@ async fn parse_summaries_off_thread(
     }
 }
 
+/// Read into `list`'s entries the rollups that live in objects of their own
+/// ([`rollups`]), every part at once: from `current`'s entry for the same
+/// part and object when that handle read them, else through the disk cache,
+/// else from storage. A refresh after a lost commit race reads only the
+/// rollups of parts the handle has not seen.
+///
+/// An object that cannot be read, or is not its part's, leaves the part
+/// unread after a warning: its rollups only prune, and a reader that keeps
+/// the part is still right, while a commit will not rewrite the part (see
+/// [`RollupsAt::Unread`]). A credential refusal is not about the object and
+/// fails the load.
+async fn fill_rollups(
+    list: &mut Manifest,
+    current: Option<&Manifest>,
+    storage: &Arc<dyn StorageProvider>,
+    cache: Option<&Arc<MetadataDiskCache>>,
+) -> Result<(), ManifestLoadError> {
+    let held: HashMap<PartId, &ManifestPartEntry> = current
+        .map(|current| {
+            current
+                .parts
+                .iter()
+                .filter(|entry| matches!(entry.rollups, RollupsAt::Stored(_)))
+                .map(|entry| (entry.part_id, entry))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut to_read: Vec<(usize, PartId, RollupsRef)> = Vec::new();
+    for (at, entry) in list.parts.iter_mut().enumerate() {
+        let RollupsAt::Unread(reference) = &entry.rollups else {
+            continue;
+        };
+        match held.get(&entry.part_id) {
+            Some(held) if held.rollups.reference() == Some(reference) => {
+                entry.scalar_stats_agg = held.scalar_stats_agg.clone();
+                entry.rollups = RollupsAt::Stored(reference.clone());
+            }
+            _ => to_read.push((at, entry.part_id, reference.clone())),
+        }
+    }
+    if to_read.is_empty() {
+        return Ok(());
+    }
+    let reads = to_read
+        .iter()
+        .map(|(_, part_id, reference)| read_rollups(storage, cache, reference, *part_id))
+        .collect::<Vec<_>>();
+    let read = load_parts_bounded(reads).await;
+    for ((at, part_id, reference), result) in to_read.into_iter().zip(read) {
+        let entry = &mut list.parts[at];
+        match result {
+            Ok(rollups) => {
+                entry.scalar_stats_agg = rollups;
+                entry.rollups = RollupsAt::Stored(reference);
+            }
+            Err(error) if error.is_permission_denied() => return Err(error),
+            Err(error) => warn!(
+                %part_id,
+                uri = %reference.uri,
+                %error,
+                "rollups object unreadable; the part is kept by every prune and not rewritten"
+            ),
+        }
+    }
+    Ok(())
+}
+
+/// Fetch, verify and parse one part's rollups object: from the disk cache
+/// when it holds the bytes, else from storage and into the cache. The hash
+/// and the parse run off the runtime, as a part's do.
+async fn read_rollups(
+    storage: &Arc<dyn StorageProvider>,
+    cache: Option<&Arc<MetadataDiskCache>>,
+    reference: &RollupsRef,
+    part_id: PartId,
+) -> Result<HashMap<FieldId, ScalarStatsAgg>, ManifestLoadError> {
+    if let Some(cache) = cache
+        && let Some(bytes) = cache.get(&reference.content_hash).await
+    {
+        return parse_rollups_off_thread(Bytes::from(bytes), None, part_id).await;
+    }
+    let (bytes, _) = storage
+        .get(&reference.uri)
+        .await
+        .map_err(ManifestLoadError::Storage)?;
+    let rollups =
+        parse_rollups_off_thread(bytes.clone(), Some(reference.content_hash), part_id).await?;
+    if let Some(cache) = cache {
+        cache.put(reference.content_hash, bytes).await;
+    }
+    Ok(rollups)
+}
+
+/// Parse a rollups object off the runtime, first checking its bytes against
+/// `expected_hash` when they came from storage rather than the verified disk
+/// cache.
+async fn parse_rollups_off_thread(
+    bytes: Bytes,
+    expected_hash: Option<ContentHash>,
+    part_id: PartId,
+) -> Result<HashMap<FieldId, ScalarStatsAgg>, ManifestLoadError> {
+    let verify_then_parse = move || {
+        if let Some(expected) = expected_hash {
+            let actual = ContentHash::of(&bytes);
+            if actual != expected {
+                return Err(ManifestLoadError::ContentHashMismatch {
+                    expected: expected.to_hex(),
+                    actual: actual.to_hex(),
+                });
+            }
+        }
+        rollups::parse(&bytes, part_id).map_err(ManifestLoadError::from)
+    };
+    spawn_blocking(carry_span(verify_then_parse))
+        .await
+        .map_err(ManifestLoadError::task("rollups parse"))?
+}
+
 /// One consumer's hydrated user-table fp32 fine centroids, built once per
 /// manifest generation from the FULL manifest parts (the user table's
 /// content-addressed store for summary fp32 — the slow-CAS analog). Keyed
@@ -3876,6 +4137,11 @@ pub enum ManifestLoadError {
     /// (see `attach_summaries`), with the error in the log.
     #[error("summaries section: {0}")]
     Summaries(#[from] SummariesError),
+    /// A part's rollups object did not parse. Loads do not fail on it: the
+    /// part reads as unread instead (see `fill_rollups`), with the error in
+    /// the log.
+    #[error("rollups object: {0}")]
+    Rollups(#[from] RollupsError),
     /// A task loading part of the manifest did not finish: it panicked, or
     /// the runtime shut down under it. A fault of the engine's, not of the
     /// bytes it was loading.
@@ -5664,7 +5930,7 @@ mod tests {
     use std::{
         cmp::Reverse,
         env::var_os,
-        fs::{read_dir, read_to_string},
+        fs::{read, read_dir, read_to_string, remove_file},
         hint::black_box,
         mem::size_of,
         path::{Path, PathBuf},
@@ -5693,7 +5959,8 @@ mod tests {
             Supertable,
             manifest::{
                 commit::{PartWriteResult, write_manifest_part, write_part_bytes},
-                list::{Manifest, PartitionStrategy},
+                list::{CellRoutingParams, Manifest, PartitionStrategy},
+                rollups::MANIFEST_ROLLUPS_DIR,
                 summaries::SummaryRow,
             },
             schema::LegacyNames,
@@ -6754,6 +7021,7 @@ mod tests {
                 let size_compressed = bytes.len() as u64;
                 objects.insert(uri.clone(), Bytes::from(bytes));
                 entries.push(ManifestPartEntry {
+                    rollups: Default::default(),
                     part_id: p.part_id,
                     uri,
                     n_superfiles: p.superfiles.len() as u64,
@@ -6826,6 +7094,7 @@ mod tests {
                 stamped_drained_ranges: None,
                 stamped_schema: None,
                 derived_length_totals: Default::default(),
+                inline_rollups_fit: Default::default(),
             }
         }
 
@@ -6936,6 +7205,7 @@ mod tests {
                 stamped_drained_ranges: None,
                 stamped_schema: None,
                 derived_length_totals: Default::default(),
+                inline_rollups_fit: Default::default(),
             };
             assert_eq!(before.parts.len(), n_parts, "all parts start resident");
 
@@ -7679,6 +7949,7 @@ mod tests {
             term_index: None,
             term_index_complete: false,
             parts: vec![list::ManifestPartEntry {
+                rollups: Default::default(),
                 part_id: entry,
                 uri: "manifests/part-x".into(),
                 n_superfiles: 0,
@@ -7703,6 +7974,7 @@ mod tests {
             stamped_drained_ranges: None,
             stamped_schema: None,
             derived_length_totals: Default::default(),
+            inline_rollups_fit: Default::default(),
         };
         let dbg = format!("{m:?}");
         assert!(dbg.contains("n_parts: 1"), "{dbg}");
@@ -7875,6 +8147,7 @@ mod tests {
             stamped_drained_ranges: None,
             stamped_schema: None,
             derived_length_totals: Default::default(),
+            inline_rollups_fit: Default::default(),
         })
     }
 
@@ -7971,6 +8244,7 @@ mod tests {
         let (pa_id, pb_id) = (part_a.part_id, part_b.part_id);
 
         let part_entry = |part_id| ManifestPartEntry {
+            rollups: Default::default(),
             part_id,
             uri: String::new(),
             content_hash: ContentHash([0u8; 32]),
@@ -8034,6 +8308,7 @@ mod tests {
             stamped_drained_ranges: None,
             stamped_schema: None,
             derived_length_totals: Default::default(),
+            inline_rollups_fit: Default::default(),
         });
 
         // Remove every superfile from part A only → A is emptied, B untouched.
@@ -8701,6 +8976,7 @@ mod tests {
             term_index: None,
             term_index_complete: false,
             parts: vec![ManifestPartEntry {
+                rollups: Default::default(),
                 part_id: pw.part_id,
                 uri: pw.uri,
                 content_hash: pw.content_hash,
@@ -8917,6 +9193,7 @@ mod tests {
             term_index: None,
             term_index_complete: false,
             parts: vec![ManifestPartEntry {
+                rollups: Default::default(),
                 part_id: part.part_id,
                 uri: part_uri(&full_hash),
                 content_hash: full_hash,
@@ -9441,6 +9718,7 @@ mod tests {
             term_index: None,
             term_index_complete: false,
             parts: vec![ManifestPartEntry {
+                rollups: Default::default(),
                 part_id: pw.part_id,
                 uri: pw.uri.clone(),
                 content_hash: pw.content_hash,
@@ -9482,6 +9760,7 @@ mod tests {
             stamped_drained_ranges: None,
             stamped_schema: None,
             derived_length_totals: Default::default(),
+            inline_rollups_fit: Default::default(),
         });
 
         let (new_manifest, parts) = old_manifest
@@ -9620,6 +9899,7 @@ mod tests {
             term_index: None,
             term_index_complete: false,
             parts: vec![ManifestPartEntry {
+                rollups: Default::default(),
                 part_id: pw.part_id,
                 uri: pw.uri,
                 content_hash: pw.content_hash,
@@ -9657,6 +9937,7 @@ mod tests {
             stamped_drained_ranges: None,
             stamped_schema: None,
             derived_length_totals: Default::default(),
+            inline_rollups_fit: Default::default(),
         });
 
         // Add new entry to the SAME partition (not a new/cold partition)
@@ -9738,6 +10019,7 @@ mod tests {
         // Build a list entry mirroring a persisted part.
         let entry_for = |pw: &PartWriteResult| -> ManifestPartEntry {
             ManifestPartEntry {
+                rollups: Default::default(),
                 part_id: pw.part_id,
                 uri: pw.uri.clone(),
                 content_hash: pw.content_hash,
@@ -9818,6 +10100,7 @@ mod tests {
             stamped_drained_ranges: None,
             stamped_schema: None,
             derived_length_totals: Default::default(),
+            inline_rollups_fit: Default::default(),
         });
 
         // Commit one new superfile. Keep `new_entry` around — the second
@@ -10000,6 +10283,7 @@ mod tests {
             term_index: None,
             term_index_complete: false,
             parts: vec![ManifestPartEntry {
+                rollups: Default::default(),
                 part_id: pw.part_id,
                 uri: pw.uri,
                 content_hash: pw.content_hash,
@@ -10037,6 +10321,7 @@ mod tests {
             stamped_drained_ranges: None,
             stamped_schema: None,
             derived_length_totals: Default::default(),
+            inline_rollups_fit: Default::default(),
         });
 
         // Add 1 new superfile to same partition (2 + 1 = 3, within target)
@@ -10111,6 +10396,7 @@ mod tests {
             term_index: None,
             term_index_complete: false,
             parts: vec![ManifestPartEntry {
+                rollups: Default::default(),
                 part_id: pw.part_id,
                 uri: pw.uri,
                 content_hash: pw.content_hash,
@@ -10148,6 +10434,7 @@ mod tests {
             stamped_drained_ranges: None,
             stamped_schema: None,
             derived_length_totals: Default::default(),
+            inline_rollups_fit: Default::default(),
         });
 
         // Add 2 new superfiles to same partition (2 + 2 = 4, exceeds target of 2)
@@ -10249,6 +10536,7 @@ mod tests {
             term_index: None,
             term_index_complete: false,
             parts: vec![ManifestPartEntry {
+                rollups: Default::default(),
                 part_id: pw.part_id,
                 uri: pw.uri.clone(),
                 content_hash: pw.content_hash,
@@ -10288,6 +10576,7 @@ mod tests {
             stamped_drained_ranges: None,
             stamped_schema: None,
             derived_length_totals: Default::default(),
+            inline_rollups_fit: Default::default(),
         });
 
         // 2 + 1 = 3 superfiles — far under the 10_000 count target, so only
@@ -10378,6 +10667,7 @@ mod tests {
             term_index_complete: false,
             parts: vec![
                 ManifestPartEntry {
+                    rollups: Default::default(),
                     part_id: pw_old.part_id,
                     uri: pw_old.uri.clone(),
                     content_hash: pw_old.content_hash,
@@ -10392,6 +10682,7 @@ mod tests {
                     summaries: None,
                 },
                 ManifestPartEntry {
+                    rollups: Default::default(),
                     part_id: pw_latest.part_id,
                     uri: pw_latest.uri,
                     content_hash: pw_latest.content_hash,
@@ -10430,6 +10721,7 @@ mod tests {
             stamped_drained_ranges: None,
             stamped_schema: None,
             derived_length_totals: Default::default(),
+            inline_rollups_fit: Default::default(),
         });
 
         // Add one new entry for the partition
@@ -10524,6 +10816,7 @@ mod tests {
             term_index_complete: false,
             parts: vec![
                 ManifestPartEntry {
+                    rollups: Default::default(),
                     part_id: pw_a.part_id,
                     uri: pw_a.uri,
                     content_hash: pw_a.content_hash,
@@ -10538,6 +10831,7 @@ mod tests {
                     summaries: None,
                 },
                 ManifestPartEntry {
+                    rollups: Default::default(),
                     part_id: pw_b.part_id,
                     uri: pw_b.uri,
                     content_hash: pw_b.content_hash,
@@ -10579,6 +10873,7 @@ mod tests {
             stamped_drained_ranges: None,
             stamped_schema: None,
             derived_length_totals: Default::default(),
+            inline_rollups_fit: Default::default(),
         });
 
         let new_entries = vec![make_new_entry_hinted(50, 0), make_new_entry_hinted(80, 1)];
@@ -10680,6 +10975,7 @@ mod tests {
             term_index_complete: false,
             parts: vec![
                 ManifestPartEntry {
+                    rollups: Default::default(),
                     part_id: pw_a.part_id,
                     uri: pw_a.uri.clone(),
                     content_hash: pw_a.content_hash,
@@ -10694,6 +10990,7 @@ mod tests {
                     summaries: None,
                 },
                 ManifestPartEntry {
+                    rollups: Default::default(),
                     part_id: pw_b.part_id,
                     uri: pw_b.uri,
                     content_hash: pw_b.content_hash,
@@ -10735,6 +11032,7 @@ mod tests {
             stamped_drained_ranges: None,
             stamped_schema: None,
             derived_length_totals: Default::default(),
+            inline_rollups_fit: Default::default(),
         });
 
         // Only touch partition A
@@ -10850,6 +11148,7 @@ mod tests {
             term_index_complete: false,
             parts: vec![
                 ManifestPartEntry {
+                    rollups: Default::default(),
                     part_id: pw_a_old.part_id,
                     uri: pw_a_old.uri.clone(),
                     content_hash: pw_a_old.content_hash,
@@ -10864,6 +11163,7 @@ mod tests {
                     summaries: None,
                 },
                 ManifestPartEntry {
+                    rollups: Default::default(),
                     part_id: pw_a_latest.part_id,
                     uri: pw_a_latest.uri.clone(),
                     content_hash: pw_a_latest.content_hash,
@@ -10878,6 +11178,7 @@ mod tests {
                     summaries: None,
                 },
                 ManifestPartEntry {
+                    rollups: Default::default(),
                     part_id: pw_b_old.part_id,
                     uri: pw_b_old.uri.clone(),
                     content_hash: pw_b_old.content_hash,
@@ -10892,6 +11193,7 @@ mod tests {
                     summaries: None,
                 },
                 ManifestPartEntry {
+                    rollups: Default::default(),
                     part_id: pw_b_latest.part_id,
                     uri: pw_b_latest.uri.clone(),
                     content_hash: pw_b_latest.content_hash,
@@ -10933,6 +11235,7 @@ mod tests {
             stamped_drained_ranges: None,
             stamped_schema: None,
             derived_length_totals: Default::default(),
+            inline_rollups_fit: Default::default(),
         });
 
         let new_entries = vec![make_new_entry_hinted(75, 0), make_new_entry_hinted(90, 1)];
@@ -11085,6 +11388,7 @@ mod tests {
             term_index: None,
             term_index_complete: false,
             parts: vec![ManifestPartEntry {
+                rollups: Default::default(),
                 part_id: pw.part_id,
                 uri: pw.uri,
                 content_hash: pw.content_hash,
@@ -11121,6 +11425,7 @@ mod tests {
             stamped_drained_ranges: None,
             stamped_schema: None,
             derived_length_totals: Default::default(),
+            inline_rollups_fit: Default::default(),
         });
 
         let (new_manifest, parts) = old_manifest
@@ -11193,6 +11498,7 @@ mod tests {
             term_index: None,
             term_index_complete: false,
             parts: vec![ManifestPartEntry {
+                rollups: Default::default(),
                 part_id: pw.part_id,
                 uri: pw.uri,
                 content_hash: pw.content_hash,
@@ -11229,6 +11535,7 @@ mod tests {
             stamped_drained_ranges: None,
             stamped_schema: None,
             derived_length_totals: Default::default(),
+            inline_rollups_fit: Default::default(),
         });
 
         let sf_new = make_new_entry(75);
@@ -11318,6 +11625,7 @@ mod tests {
             term_index_complete: false,
             parts: vec![
                 ManifestPartEntry {
+                    rollups: Default::default(),
                     part_id: pw_a.part_id,
                     uri: pw_a.uri,
                     content_hash: pw_a.content_hash,
@@ -11332,6 +11640,7 @@ mod tests {
                     summaries: None,
                 },
                 ManifestPartEntry {
+                    rollups: Default::default(),
                     part_id: pw_b.part_id,
                     uri: pw_b.uri.clone(),
                     content_hash: pw_b.content_hash,
@@ -11373,6 +11682,7 @@ mod tests {
             stamped_drained_ranges: None,
             stamped_schema: None,
             derived_length_totals: Default::default(),
+            inline_rollups_fit: Default::default(),
         });
 
         let (new_manifest, parts) = old_manifest
@@ -11467,6 +11777,7 @@ mod tests {
             term_index_complete: false,
             parts: vec![
                 ManifestPartEntry {
+                    rollups: Default::default(),
                     part_id: pw_a_old.part_id,
                     uri: pw_a_old.uri.clone(),
                     content_hash: pw_a_old.content_hash,
@@ -11481,6 +11792,7 @@ mod tests {
                     summaries: None,
                 },
                 ManifestPartEntry {
+                    rollups: Default::default(),
                     part_id: pw_a_latest.part_id,
                     uri: pw_a_latest.uri.clone(),
                     content_hash: pw_a_latest.content_hash,
@@ -11526,6 +11838,7 @@ mod tests {
             stamped_drained_ranges: None,
             stamped_schema: None,
             derived_length_totals: Default::default(),
+            inline_rollups_fit: Default::default(),
         });
 
         let (new_manifest, parts_to_write) = old_manifest
@@ -11612,6 +11925,7 @@ mod tests {
             term_index: None,
             term_index_complete: false,
             parts: vec![ManifestPartEntry {
+                rollups: Default::default(),
                 part_id: pw.part_id,
                 uri: pw.uri,
                 content_hash: pw.content_hash,
@@ -11648,6 +11962,7 @@ mod tests {
             stamped_drained_ranges: None,
             stamped_schema: None,
             derived_length_totals: Default::default(),
+            inline_rollups_fit: Default::default(),
         });
 
         let (new_manifest, parts) = old_manifest
@@ -11710,6 +12025,7 @@ mod tests {
             term_index: None,
             term_index_complete: false,
             parts: vec![ManifestPartEntry {
+                rollups: Default::default(),
                 part_id: pw.part_id,
                 uri: pw.uri,
                 content_hash: pw.content_hash,
@@ -11746,6 +12062,7 @@ mod tests {
             stamped_drained_ranges: None,
             stamped_schema: None,
             derived_length_totals: Default::default(),
+            inline_rollups_fit: Default::default(),
         });
 
         // sf_ghost was never added to any part; its superfile_id won't match anything
@@ -11828,6 +12145,7 @@ mod tests {
             term_index_complete: false,
             parts: vec![
                 ManifestPartEntry {
+                    rollups: Default::default(),
                     part_id: pw_a_old.part_id,
                     uri: pw_a_old.uri,
                     content_hash: pw_a_old.content_hash,
@@ -11842,6 +12160,7 @@ mod tests {
                     summaries: None,
                 },
                 ManifestPartEntry {
+                    rollups: Default::default(),
                     part_id: pw_a_latest.part_id,
                     uri: pw_a_latest.uri,
                     content_hash: pw_a_latest.content_hash,
@@ -11887,6 +12206,7 @@ mod tests {
             stamped_drained_ranges: None,
             stamped_schema: None,
             derived_length_totals: Default::default(),
+            inline_rollups_fit: Default::default(),
         });
 
         let (new_manifest, parts_to_write) = old_manifest
@@ -11930,6 +12250,7 @@ mod tests {
         use list::{Manifest, ManifestPartEntry, PartitionStrategy};
         let parts = (0..n_parts)
             .map(|i| ManifestPartEntry {
+                rollups: Default::default(),
                 part_id: part::PartId(Uuid::from_u128(i as u128 + 1)),
                 uri: format!("manifests/part-{i}"),
                 n_superfiles: 0,
@@ -11985,6 +12306,7 @@ mod tests {
             stamped_drained_ranges: None,
             stamped_schema: None,
             derived_length_totals: Default::default(),
+            inline_rollups_fit: Default::default(),
         }
     }
 
@@ -12156,6 +12478,422 @@ mod tests {
             .iter()
             .map(|e| e.superfile_id)
             .collect()
+    }
+
+    /// Integer columns enough that a part's rollups pass the inline cap.
+    const ROLLUPS_WIDE_COLUMNS: usize = 600;
+    /// Rows in each commit of the wide fixture.
+    const ROLLUPS_WIDE_ROWS: usize = 3;
+    /// Spreads one commit's values from the next: commit `c` writes values
+    /// from `c` times this up.
+    const ROLLUPS_COMMIT_STRIDE: i64 = 10_000;
+    /// Cells of the grid a list is stamped with to read as a hidden one.
+    const HIDDEN_CELLS: u32 = 2;
+    /// Dimension of that grid's centroids.
+    const HIDDEN_DIM: u32 = 4;
+    /// Seed of that grid's synthetic centroids.
+    const HIDDEN_SEED: u64 = 7;
+
+    /// A title to index and [`ROLLUPS_WIDE_COLUMNS`] nullable integers.
+    fn rollups_wide_schema() -> Arc<Schema> {
+        let mut fields = vec![Field::new("title", DataType::LargeUtf8, false)];
+        fields.extend(
+            (0..ROLLUPS_WIDE_COLUMNS).map(|i| Field::new(format!("c_{i}"), DataType::Int64, true)),
+        );
+        Arc::new(Schema::new(fields))
+    }
+
+    /// Options for the wide fixture over `storage`, two superfiles a part.
+    fn rollups_wide_options(storage: &Arc<dyn StorageProvider>) -> SupertableOptions {
+        SupertableOptions::new(rollups_wide_schema(), vec![FtsConfig::new("title")], vec![])
+            .expect("options")
+            .with_target_superfiles_per_part(SUPERFILES_PER_PART)
+            .with_storage(Arc::clone(storage))
+    }
+
+    /// Commit `commit`'s rows: every column its own values, apart from the
+    /// next commit's.
+    fn commit_wide(st: &Supertable, commit: usize) {
+        let schema = rollups_wide_schema();
+        let base = i64::try_from(commit).expect("a few commits") * ROLLUPS_COMMIT_STRIDE;
+        let mut columns: Vec<ArrayRef> = vec![Arc::new(LargeStringArray::from_iter_values(
+            (0..ROLLUPS_WIDE_ROWS).map(|row| format!("title {commit} {row}")),
+        ))];
+        for c in 0..ROLLUPS_WIDE_COLUMNS {
+            let c = i64::try_from(c).expect("a few columns");
+            columns.push(Arc::new(Int64Array::from_iter_values(
+                (0..ROLLUPS_WIDE_ROWS as i64).map(|row| base + c + row),
+            )));
+        }
+        let batch = RecordBatch::try_new(schema, columns).expect("batch");
+        let mut w = st.writer().expect("writer");
+        w.append(&batch).expect("append");
+        w.commit().expect("commit");
+    }
+
+    /// A wide table whose superfiles span several parts, and its storage.
+    fn wide_rollups_table() -> (TempDir, Arc<dyn StorageProvider>, Supertable) {
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let st = Supertable::create(rollups_wide_options(&storage)).expect("create");
+        for commit in 0..COMMITS {
+            commit_wide(&st, commit);
+        }
+        (dir, storage, st)
+    }
+
+    /// The text of the newest manifest list under `root`.
+    fn newest_manifest_list(root: &Path) -> String {
+        let mut files = Vec::new();
+        files_under(root, &mut files);
+        let newest = files
+            .into_iter()
+            .filter(|(path, _)| is_manifest_list(path))
+            .max_by(|a, b| a.0.cmp(&b.0))
+            .expect("a list");
+        read_to_string(newest.0).expect("read the list")
+    }
+
+    /// On a wide table every part's rollups live in an object of their own
+    /// beside the part, the list names each and carries none, and a fresh
+    /// handle reads them back as the commits folded them: equal to rollups
+    /// recomputed from the part's superfiles.
+    #[test]
+    fn a_wide_table_s_rollups_live_beside_its_parts() {
+        let (dir, storage, st) = wide_rollups_table();
+        let rt = Runtime::new().expect("runtime");
+        let written = st.inner().manifest.load_full();
+        let entries = written.get_all_list_entries();
+        assert!(entries.len() > 1, "the fixture spans several parts");
+        for entry in entries {
+            let RollupsAt::Stored(reference) = &entry.rollups else {
+                panic!("part {} keeps its rollups inline", entry.part_id);
+            };
+            assert!(
+                dir.path().join(&reference.uri).exists(),
+                "{}",
+                reference.uri
+            );
+            let part = rt
+                .block_on(written.get_part_by_id(entry.part_id))
+                .expect("part");
+            assert_eq!(
+                entry.scalar_stats_agg,
+                aggregates::compute(&part.superfiles, None).scalar_stats_agg,
+                "part {}: the folded rollups are the part's",
+                entry.part_id
+            );
+        }
+        let list = newest_manifest_list(dir.path());
+        assert!(!list.contains("scalar_stats_agg_ipc"), "no rollups inline");
+
+        drop(st);
+        let fresh = Supertable::open(rollups_wide_options(&storage)).expect("open");
+        let read = fresh.inner().manifest.load_full();
+        assert_eq!(read.get_all_list_entries().len(), entries.len());
+        for (back, entry) in read.get_all_list_entries().iter().zip(entries) {
+            assert_eq!(back.rollups, entry.rollups);
+            assert_eq!(back.scalar_stats_agg, entry.scalar_stats_agg);
+        }
+    }
+
+    /// A refresh after another writer's commit reads only the rollups of
+    /// parts it has not seen: with the objects it already read gone from
+    /// storage, it still holds those parts' rollups.
+    #[test]
+    fn a_refresh_reuses_the_rollups_it_read() {
+        let (dir, storage, st) = wide_rollups_table();
+        let rt = Runtime::new().expect("runtime");
+        let reader = Supertable::open(rollups_wide_options(&storage)).expect("open");
+        let before = reader.inner().manifest.load_full();
+        for entry in before.get_all_list_entries() {
+            let reference = entry.rollups.reference().expect("stored rollups");
+            remove_file(dir.path().join(&reference.uri)).expect("remove");
+        }
+        commit_wide(&st, COMMITS);
+        assert!(rt.block_on(reader.refresh()).expect("refresh"), "advanced");
+        let after = reader.inner().manifest.load_full();
+        let mut kept = 0;
+        for entry in after.get_all_list_entries() {
+            assert!(
+                matches!(entry.rollups, RollupsAt::Stored(_)),
+                "part {}: {:?}",
+                entry.part_id,
+                entry.rollups
+            );
+            if let Some(seen) = before
+                .get_all_list_entries()
+                .iter()
+                .find(|seen| seen.part_id == entry.part_id)
+            {
+                assert_eq!(entry.scalar_stats_agg, seen.scalar_stats_agg);
+                kept += 1;
+            }
+        }
+        assert!(kept > 0, "the commit left some parts as they were");
+    }
+
+    /// A rollups object that cannot be read leaves its part unread: the
+    /// table opens, the part carries no rollups, so every prune keeps it,
+    /// and the next commit puts its superfiles in a part of their own rather
+    /// than fold rollups that would leave out the part's earlier superfiles.
+    #[test]
+    fn an_unreadable_rollups_object_leaves_its_part_unread_and_unrewritten() {
+        let (dir, storage, st) = wide_rollups_table();
+        let latest = st
+            .inner()
+            .manifest
+            .load()
+            .get_all_list_entries()
+            .last()
+            .expect("a part")
+            .clone();
+        drop(st);
+        let reference = latest.rollups.reference().expect("stored rollups").clone();
+        remove_file(dir.path().join(&reference.uri)).expect("remove");
+
+        let reopened = Supertable::open(rollups_wide_options(&storage)).expect("open");
+        let opened = reopened.inner().manifest.load_full();
+        let unread = opened
+            .get_all_list_entries()
+            .last()
+            .expect("a part")
+            .clone();
+        assert_eq!(unread.part_id, latest.part_id);
+        assert_eq!(unread.rollups, RollupsAt::Unread(reference.clone()));
+        assert!(unread.scalar_stats_agg.is_empty(), "kept by every prune");
+
+        commit_wide(&reopened, COMMITS);
+        let committed = reopened.inner().manifest.load_full();
+        let entries = committed.get_all_list_entries();
+        assert_eq!(
+            entries.len(),
+            opened.get_all_list_entries().len() + 1,
+            "the commit's superfiles have a part of their own"
+        );
+        assert!(
+            entries.iter().any(|entry| entry.part_id == latest.part_id
+                && entry.rollups == RollupsAt::Unread(reference.clone())),
+            "the unread part is carried over as it was"
+        );
+        assert_eq!(committed.get_all_superfiles().len(), COMMITS + 1);
+    }
+
+    /// Publish `manifest` with every part's rollups inline, as a list before
+    /// major 4 carries them, over the pointer `storage` holds now.
+    fn publish_with_inline_rollups(
+        rt: &Runtime,
+        storage: &Arc<dyn StorageProvider>,
+        manifest: &ManifestSnapshot,
+    ) {
+        let inline = manifest.with_list_edited(true, |list| {
+            for entry in &mut list.parts {
+                entry.rollups = RollupsAt::Inline;
+            }
+        });
+        let (_, meta) = rt
+            .block_on(read_pointer(storage.as_ref()))
+            .expect("read pointer")
+            .expect("pointer present");
+        let etag = meta.etag.expect("localfs pointer etag");
+        rt.block_on(inline.write(storage.as_ref(), Some(etag.as_str()), &[]))
+            .expect("publish the inline list");
+    }
+
+    /// A wide table whose list carries its parts' rollups inline, as a list
+    /// before major 4 does: the next commit moves every part's rollups into
+    /// an object of its own, byte for byte what a fresh encode of them
+    /// writes, the list after it names them and carries none, and a fresh
+    /// handle reads back the rollups the inline list held. Moving them again
+    /// moves nothing, and a retried move names the same objects.
+    #[test]
+    fn a_commit_moves_rollups_an_earlier_list_left_inline_into_objects() {
+        let (dir, storage, st) = wide_rollups_table();
+        let rt = Runtime::new().expect("runtime");
+        let written = st.inner().manifest.load_full();
+        drop(st);
+        publish_with_inline_rollups(&rt, &storage, &written);
+        assert!(
+            newest_manifest_list(dir.path()).contains("scalar_stats_agg_ipc"),
+            "the fixture's list carries its rollups inline"
+        );
+
+        let reopened = Supertable::open(rollups_wide_options(&storage)).expect("open");
+        let inline = reopened.inner().manifest.load_full();
+        assert!(
+            inline
+                .get_all_list_entries()
+                .iter()
+                .all(|entry| entry.rollups == RollupsAt::Inline),
+            "the reopened list reads as inline"
+        );
+        commit_wide(&reopened, COMMITS);
+        let committed = reopened.inner().manifest.load_full();
+        let mut moved = 0;
+        for entry in committed.get_all_list_entries() {
+            let RollupsAt::Stored(reference) = &entry.rollups else {
+                panic!("part {} keeps its rollups inline", entry.part_id);
+            };
+            let bytes = read(dir.path().join(&reference.uri)).expect("the rollups object");
+            if let Some(was) = inline
+                .get_all_list_entries()
+                .iter()
+                .find(|was| was.part_id == entry.part_id)
+            {
+                let fresh = rollups::encode(was.part_id, &was.scalar_stats_agg)
+                    .expect("one-row bounds")
+                    .expect("past the inline cap");
+                assert_eq!(
+                    bytes, fresh,
+                    "part {}: the object a fresh encode of its inline rollups writes",
+                    entry.part_id
+                );
+                moved += 1;
+            }
+        }
+        assert!(moved > 0, "the commit moved parts it did not rebuild");
+        assert!(
+            !newest_manifest_list(dir.path()).contains("scalar_stats_agg_ipc"),
+            "no rollups inline after the commit"
+        );
+
+        fn named(snapshot: &ManifestSnapshot) -> Vec<(PartId, RollupsAt)> {
+            snapshot
+                .get_all_list_entries()
+                .iter()
+                .map(|entry| (entry.part_id, entry.rollups.clone()))
+                .collect()
+        }
+        let mut again = committed.with_list_edited(false, |_| {});
+        assert!(
+            again.store_inline_rollups().expect("move").is_empty(),
+            "a second move finds nothing inline"
+        );
+        assert_eq!(named(&again), named(&committed), "and changes no entry");
+        let first = inline
+            .with_list_edited(false, |_| {})
+            .store_inline_rollups()
+            .expect("move");
+        let retried = inline
+            .with_list_edited(false, |_| {})
+            .store_inline_rollups()
+            .expect("move");
+        assert!(!first.is_empty());
+        assert_eq!(first, retried, "a retried move writes the same objects");
+
+        drop(reopened);
+        let fresh = Supertable::open(rollups_wide_options(&storage)).expect("open");
+        let read = fresh.inner().manifest.load_full();
+        assert_eq!(
+            read.get_all_list_entries().len(),
+            committed.get_all_list_entries().len()
+        );
+        let mut untouched = 0;
+        for back in read.get_all_list_entries() {
+            assert!(
+                matches!(back.rollups, RollupsAt::Stored(_)),
+                "part {}: {:?}",
+                back.part_id,
+                back.rollups
+            );
+            if let Some(was) = inline
+                .get_all_list_entries()
+                .iter()
+                .find(|was| was.part_id == back.part_id)
+            {
+                assert_eq!(
+                    back.scalar_stats_agg, was.scalar_stats_agg,
+                    "part {}: the rollups the inline list held",
+                    back.part_id
+                );
+                untouched += 1;
+            }
+        }
+        assert!(untouched > 0, "the commit left some parts as they were");
+    }
+
+    /// Rollups under the inline cap stay inline: a narrow table's commit
+    /// writes no rollups object and its list still carries them. The commit
+    /// remembers each part it found under the cap, so the next one does not
+    /// encode it again, and forgets a part once a list no longer holds it.
+    #[test]
+    fn a_commit_leaves_rollups_under_the_cap_inline() {
+        let (dir, st) = multi_part_table();
+        commit_titles(&st, &["one more title"]);
+        let committed = st.inner().manifest.load_full();
+        assert!(committed.get_all_list_entries().len() > 1);
+        assert!(
+            committed
+                .get_all_list_entries()
+                .iter()
+                .all(|entry| entry.rollups == RollupsAt::Inline),
+            "narrow rollups stay inline"
+        );
+        let mut files = Vec::new();
+        files_under(dir.path(), &mut files);
+        assert!(
+            !files
+                .iter()
+                .any(|(path, _)| path.to_string_lossy().contains(MANIFEST_ROLLUPS_DIR)),
+            "no rollups object written"
+        );
+
+        for entry in committed.get_all_list_entries() {
+            assert!(
+                committed.rollups_known_to_fit(entry.part_id),
+                "part {} is remembered under the cap",
+                entry.part_id
+            );
+        }
+        let mut dropped = None;
+        let mut smaller = committed.with_list_edited(false, |list| {
+            dropped = list.parts.pop().map(|entry| entry.part_id);
+        });
+        let dropped = dropped.expect("a part to drop");
+        assert!(
+            smaller.store_inline_rollups().expect("move").is_empty(),
+            "nothing to move"
+        );
+        assert!(
+            !committed.rollups_known_to_fit(dropped),
+            "a part the list no longer holds is forgotten"
+        );
+    }
+
+    /// A hidden manifest keeps every part's rollups inline, past the cap or
+    /// not: moving them writes nothing and changes no entry.
+    #[test]
+    fn a_hidden_manifest_keeps_its_rollups_inline() {
+        let (_dir, storage, st) = wide_rollups_table();
+        let rt = Runtime::new().expect("runtime");
+        let written = st.inner().manifest.load_full();
+        drop(st);
+        publish_with_inline_rollups(&rt, &storage, &written);
+        let reopened = Supertable::open(rollups_wide_options(&storage)).expect("open");
+        let (clusters, _) = synth_clusters(HIDDEN_CELLS, HIDDEN_DIM, HIDDEN_SEED);
+        let mut hidden = reopened
+            .inner()
+            .manifest
+            .load_full()
+            .with_list_edited(false, |list| {
+                list.partition_strategy = PartitionStrategy::VectorCell {
+                    column: "emb".into(),
+                    clusters,
+                    routing: CellRoutingParams::default(),
+                };
+            });
+        assert!(
+            hidden.store_inline_rollups().expect("move").is_empty(),
+            "nothing written"
+        );
+        assert!(
+            hidden
+                .get_all_list_entries()
+                .iter()
+                .all(|entry| entry.rollups == RollupsAt::Inline),
+            "every entry kept inline"
+        );
     }
 
     #[test]

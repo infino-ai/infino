@@ -261,6 +261,7 @@ mod tests {
     fn entry_from_superfiles(superfiles: &[Arc<SuperfileEntry>], seed: u8) -> ManifestPartEntry {
         let aggs = aggregates::compute(superfiles, None);
         ManifestPartEntry {
+            rollups: Default::default(),
             part_id: PartId(Uuid::from_bytes([seed; 16])),
             uri: format!("manifests/part-{seed:02x}.avro.zst"),
             n_superfiles: superfiles.len() as u64,

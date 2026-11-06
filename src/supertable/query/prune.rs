@@ -501,6 +501,7 @@ mod tests {
     fn part_from(segs: &[Arc<SuperfileEntry>], seed: u8) -> ManifestPartEntry {
         let aggs = aggregates::compute(segs, None);
         ManifestPartEntry {
+            rollups: Default::default(),
             part_id: PartId(Uuid::from_bytes([seed; 16])),
             uri: format!("manifests/part-{seed:02x}.avro.zst"),
             n_superfiles: segs.len() as u64,
