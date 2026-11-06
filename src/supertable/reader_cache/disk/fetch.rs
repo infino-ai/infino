@@ -3243,6 +3243,8 @@ mod tests {
 
         assert!(store.is_mmap_promoted(&uri));
         assert_eq!(most_reserved, size - vec_len, "the hole is never reserved");
+        // The open queued block-file runs; each stays charged but unlanded until its write ends.
+        store.block_writes_settled().await;
         store.assert_budget_consistent();
     }
 
