@@ -192,8 +192,8 @@ fn narrow_batches_on_a_wide_vector_table_read_back_exactly() {
     const WIDE_COLUMNS: usize = 300;
     /// Rows per append; enough for the vector index to train cells.
     const ROWS: usize = 64;
-    /// The vector's width.
-    const DIM: usize = 8;
+    /// The vector's width: the narrowest a vector index takes.
+    const DIM: usize = 16;
     /// The columns each append carries, by index into the wide ones.
     const CARRIED: [[usize; 2]; 2] = [[3, 150], [150, 299]];
     /// Neighbours asked of the vector search.
