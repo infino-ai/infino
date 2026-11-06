@@ -30,7 +30,10 @@ use std::{
     ops::Range,
     os::unix::fs::FileExt,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, PoisonError},
+    sync::{
+        Arc, Mutex, PoisonError,
+        atomic::{AtomicBool, Ordering as AtomicOrdering},
+    },
     time::Instant,
 };
 
@@ -2317,9 +2320,15 @@ fn run_ranges(
             let slots: Vec<Mutex<Option<Result<MergedLayer, TermIndexError>>>> =
                 ranges.iter().map(|_| Mutex::new(None)).collect();
             let one = &one;
+            let failed = &AtomicBool::new(false);
             pool.in_place_scope(|scope| {
                 for ((start, end), slot) in ranges.iter().zip(&slots) {
                     scope.spawn(move |_| {
+                        // A failed range ends the merge: ranges still queued
+                        // do no work, so a failed fold stops early.
+                        if failed.load(AtomicOrdering::Acquire) {
+                            return;
+                        }
                         let _span = detail_span!(
                             "build.range",
                             start = start.as_ref().map_or(0, |key| key.len()),
@@ -2328,20 +2337,27 @@ fn run_ranges(
                         )
                         .entered();
                         let part = one(start.as_deref(), end.as_deref());
+                        if part.is_err() {
+                            failed.store(true, AtomicOrdering::Release);
+                        }
                         *slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(part);
                     });
                 }
             });
-            slots
-                .into_iter()
-                .map(|slot| {
-                    slot.into_inner()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .ok_or_else(|| {
-                            TermIndexError::Build("a build range ended without a result".into())
-                        })?
-                })
-                .collect::<Result<Vec<_>, _>>()?
+            // Ranges skipped after a failure hold no result; the error
+            // returned is the failure's.
+            let mut parts = Vec::with_capacity(ranges.len());
+            for slot in slots {
+                if let Some(part) = slot.into_inner().unwrap_or_else(PoisonError::into_inner) {
+                    parts.push(part?);
+                }
+            }
+            if parts.len() < ranges.len() {
+                return Err(TermIndexError::Build(
+                    "a build range ended without a result".into(),
+                ));
+            }
+            parts
         }
         None => ranges
             .par_iter()
@@ -2705,6 +2721,35 @@ mod contribution_mark_tests {
 
     use super::*;
     use crate::superfile::fts::bm25::Bm25Params;
+
+    /// Once a range fails, the ranges still queued do no work, and the
+    /// error returned is the failure's.
+    #[test]
+    fn run_ranges_starts_no_range_after_one_fails() {
+        let pool = Arc::new(
+            ThreadPoolBuilder::new()
+                .num_threads(2)
+                .build()
+                .expect("pool"),
+        );
+        let policy = BuildPolicy {
+            pool: Some(pool),
+            ..BuildPolicy::default()
+        };
+        let ranges: Vec<KeyRange> = (0..32u8)
+            .map(|i| ((i > 0).then(|| vec![i]), (i < 31).then(|| vec![i + 1])))
+            .collect();
+        let ran = std::sync::atomic::AtomicUsize::new(0);
+        let result = run_ranges(&ranges, &policy, |_, _| {
+            ran.fetch_add(1, AtomicOrdering::Relaxed);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            Err(TermIndexError::Build("range failed".into()))
+        });
+        let error = result.err().expect("the merge fails").to_string();
+        assert!(error.contains("range failed"), "{error}");
+        let ran = ran.load(AtomicOrdering::Relaxed);
+        assert!(ran < ranges.len(), "every range ran: {ran}");
+    }
 
     /// A contribution gathered through a [`HeadSink`] from two columns, ids
     /// 3 and 12, with 3's terms handed over first: `"12\x1f…"` sorts before
