@@ -80,10 +80,7 @@ use std::{
     time::Instant,
 };
 
-use arrow::{
-    compute::{concat_batches, take},
-    ipc::writer::StreamWriter,
-};
+use arrow::{compute::take, ipc::writer::StreamWriter};
 use arrow_array::{
     Array, ArrayRef, Decimal128Array, FixedSizeListArray, Float32Array, LargeStringArray,
     RecordBatch, UInt32Array,
@@ -240,6 +237,7 @@ use crate::{
     },
     utils::{
         join::run_spawned,
+        nulls::{concat_sharing_nulls, take_sharing_nulls},
         trace::{self, detail_span, record},
     },
 };
@@ -8883,6 +8881,20 @@ async fn upload_prepared_shards(
     Ok((done.into_iter().map(|(_, p)| p).collect(), uploaded_bytes))
 }
 
+/// The buffer's scalar rows joined into one batch under `schema`, for a
+/// commit that gathers each shard's rows out of it. A column null in every
+/// buffered batch stays one shared null array: Arrow's concat writes a new
+/// array for every column once it joins two or more batches, so a buffer of
+/// narrow appends to a wide table would otherwise hold a null array of all
+/// its rows for every column the appends left out.
+fn buffered_scalar(
+    buffer: &[BufferedBatch],
+    schema: &Arc<Schema>,
+) -> Result<RecordBatch, BuildError> {
+    concat_sharing_nulls(schema, buffer.iter().map(|buffered| &buffered.scalar))
+        .map_err(|err| BuildError::Store(err.to_string()))
+}
+
 /// `stem` is the source label the commit's superfiles are keyed under, when
 /// the caller gave one; on the pipelined path the shards are prepared and
 /// uploaded from inside this function, so the label has to arrive here.
@@ -8916,7 +8928,6 @@ fn commit_shards_via_drain(
     // Collect ids + scalar batches; vectors stay in their Arrow buffers
     // behind zero-copy views (no flatten — see `VectorColumnView`).
     let mut stable_ids: Vec<i128> = Vec::new();
-    let mut scalar_batches: Vec<&RecordBatch> = Vec::with_capacity(buffer.len());
     for buffered in buffer {
         let id_col = buffered
             .scalar
@@ -8932,7 +8943,6 @@ fn commit_shards_via_drain(
         for i in 0..id_col.len() {
             stable_ids.push(id_col.value(i));
         }
-        scalar_batches.push(&buffered.scalar);
     }
     if stable_ids.is_empty() {
         return Ok((Vec::new(), Vec::new()));
@@ -8954,9 +8964,7 @@ fn commit_shards_via_drain(
         )));
     }
 
-    let scalar_schema = manifest.scalar_schema();
-    let source_scalar = concat_batches(&scalar_schema, scalar_batches.iter().copied())
-        .map_err(|err| BuildError::Store(err.to_string()))?;
+    let source_scalar = buffered_scalar(buffer, &manifest.scalar_schema())?;
     let local_by_id: HashMap<i128, u32> = stable_ids
         .iter()
         .enumerate()
@@ -9257,13 +9265,10 @@ fn build_shard_parquet_and_fts(
 > {
     let options = &inner.options;
     let take_indices = UInt32Array::from(ordered_locals.to_vec());
-    let columns: Vec<ArrayRef> = source_scalar
-        .columns()
-        .iter()
-        .map(|column| take(column.as_ref(), &take_indices, None))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|err| BuildError::Store(err.to_string()))?;
-    let scalar = RecordBatch::try_new(source_scalar.schema(), columns)
+    // A column the commit's rows leave null is not gathered: on a wide,
+    // sparse table that is nearly every column, and gathering each one
+    // wrote an offset per row per column for every shard at once.
+    let scalar = take_sharing_nulls(source_scalar, &take_indices)
         .map_err(|e| BuildError::Store(format!("shard rows: {e}")))?;
 
     // This shard's rows in IVF order — the one remaining vector copy on
@@ -14654,7 +14659,7 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use arrow::ipc::reader::StreamReader;
+    use arrow::{compute::concat_batches, ipc::reader::StreamReader};
     use arrow_array::{
         Array, Decimal128Array, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch,
         StringArray, StructArray,
@@ -14703,6 +14708,7 @@ mod tests {
             build_title_batch, decimal128_ids, default_supertable_options, distinct_unit_vectors,
             fault_storage::{FaultKind, FaultOp, FaultStorage},
         },
+        utils::nulls::test_support::distinct_buffer_bytes,
     };
 
     /// The name of the column a tightening schema document adds in
@@ -20645,6 +20651,87 @@ supertable:
         w.commit().expect("commit");
         assert_eq!(w.buffered_bytes(), 0, "buffer drained on commit");
         assert_eq!(w.buffered_batches(), 0);
+    }
+
+    /// Narrow appends buffered for one commit keep their null columns
+    /// shared when the commit joins them: every column no append carried is
+    /// one null array, and the joined batch costs about what the buffered
+    /// batches do, where Arrow's own join writes a null array of every row
+    /// for each such column.
+    #[test]
+    fn narrow_appends_joined_for_one_commit_share_their_null_columns() {
+        /// Nullable columns beside `title`.
+        const WIDE_COLUMNS: usize = 300;
+        /// Rows per append.
+        const ROWS: usize = 1024;
+        /// The one wide column each append carries beside `title`.
+        const CARRIED: [usize; 3] = [7, 150, 299];
+        /// Columns ahead of the wide ones in the buffered batches: `_id`
+        /// and `title`.
+        const LEADING_COLUMNS: usize = 2;
+        /// How far past the buffered batches' own cost their join may run:
+        /// it lays each carried column out again at the joined length, but
+        /// writes nothing per null column.
+        const JOIN_COST_SLACK: usize = 2;
+
+        let mut fields = vec![Field::new("title", DataType::LargeUtf8, false)];
+        fields.extend(
+            (0..WIDE_COLUMNS).map(|i| Field::new(format!("c{i}"), DataType::LargeUtf8, true)),
+        );
+        let options = SupertableOptions::new(
+            Arc::new(Schema::new(fields)),
+            vec![FtsConfig::new("title")],
+            vec![],
+        )
+        .expect("valid options");
+        let st = Supertable::create(options).expect("create");
+        let mut w = st.writer().expect("writer");
+        for (append, &c) in CARRIED.iter().enumerate() {
+            let narrow = Schema::new(vec![
+                Field::new("title", DataType::LargeUtf8, false),
+                Field::new(format!("c{c}"), DataType::LargeUtf8, true),
+            ]);
+            let titles = LargeStringArray::from_iter_values(
+                (0..ROWS).map(|r| format!("append {append} row {r}")),
+            );
+            // Every other row holds a value, the rest are null.
+            let cells = LargeStringArray::from_iter(
+                (0..ROWS).map(|r| (r % 2 == 0).then(|| format!("a{append} r{r}"))),
+            );
+            let batch =
+                RecordBatch::try_new(Arc::new(narrow), vec![Arc::new(titles), Arc::new(cells)])
+                    .expect("narrow batch");
+            w.append(&batch).expect("append");
+        }
+        assert_eq!(w.buffered_batches(), CARRIED.len(), "one commit's buffer");
+
+        let schema = w.inner.manifest.load().scalar_schema();
+        let joined = buffered_scalar(&w.buffer, &schema).expect("join the buffer");
+        let expected =
+            concat_batches(&schema, w.buffer.iter().map(|b| &b.scalar)).expect("concat the buffer");
+        assert_eq!(joined, expected, "the join holds every buffered value");
+        assert_eq!(joined.num_rows(), CARRIED.len() * ROWS);
+
+        let wide = &joined.columns()[LEADING_COLUMNS..];
+        let shared = &wide[0];
+        for (i, column) in wide.iter().enumerate() {
+            if CARRIED.contains(&i) {
+                assert_eq!(column.null_count(), joined.num_rows() - ROWS / 2, "c{i}");
+            } else {
+                assert!(Arc::ptr_eq(column, shared), "c{i} is the shared null array");
+            }
+        }
+        assert_eq!(shared.null_count(), joined.num_rows());
+        let buffered: usize = w
+            .buffer
+            .iter()
+            .map(|b| distinct_buffer_bytes(&b.scalar))
+            .sum();
+        assert!(
+            distinct_buffer_bytes(&joined) <= JOIN_COST_SLACK * buffered,
+            "the join costs {} bytes against the buffer's {buffered}",
+            distinct_buffer_bytes(&joined)
+        );
     }
 
     /// `put_superfile_replace` creates on first write (NotFound → put_atomic)

@@ -17,13 +17,14 @@ use std::{
     sync::Arc,
 };
 
-use arrow_array::{ArrayRef, RecordBatch, new_null_array};
+use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 
 use super::{
     ColumnIndex, IDENTITY_META_KEY, INDEX_META_KEY, TableSchema, change::SchemaChange,
     error::SchemaError, index_from_json, user_metadata,
 };
+use crate::utils::nulls::SharedNulls;
 
 /// A column a batch adds to the table.
 #[derive(Debug, Clone, PartialEq)]
@@ -93,6 +94,9 @@ pub fn resolve_batch(
             name: id_column.to_owned(),
         });
     }
+    // A nullable column the batch lacks is filled with the one null array
+    // of its type, as [`try_conform`] fills them.
+    let mut nulls = SharedNulls::new(batch.num_rows());
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
     let mut fields: Vec<Field> = Vec::with_capacity(schema.fields().len());
     for field in schema.fields() {
@@ -115,7 +119,7 @@ pub fn resolve_batch(
                 columns.push(Arc::clone(array));
             }
             Err(_) if field.nullable => {
-                columns.push(new_null_array(&field.data_type, batch.num_rows()));
+                columns.push(nulls.of(&field.data_type));
             }
             Err(_) => {
                 return Err(SchemaError::MissingColumn {
@@ -249,11 +253,15 @@ pub fn try_conform(batch: &RecordBatch, target: &Arc<Schema>) -> Result<RecordBa
     if batch.schema().fields() == target.fields() {
         return Ok(batch.clone());
     }
+    // Every column the batch lacks is the same null array of its type: on a
+    // wide table a batch that carries a few of its columns would otherwise
+    // be filled with an array of its rows for each of the rest.
+    let mut nulls = SharedNulls::new(batch.num_rows());
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(target.fields().len());
     for field in target.fields() {
         let array = match batch.schema().index_of(field.name()) {
             Ok(i) => Arc::clone(batch.column(i)),
-            Err(_) => new_null_array(field.data_type(), batch.num_rows()),
+            Err(_) => nulls.of(field.data_type()),
         };
         if !field.is_nullable() && array.null_count() > 0 {
             return Err(SchemaError::NullInNonNullable {
@@ -348,6 +356,48 @@ mod tests {
         let whole = batch(vec![("_id", ids()), ("title", titles())]);
         let shaped = try_conform(&whole, &target).expect("conform");
         assert_eq!(shaped.schema().fields(), target.fields());
+    }
+
+    /// Nullable columns a table of [`WIDE_COLUMNS`] has beside `title`.
+    const WIDE_COLUMNS: usize = 200;
+
+    /// `title`, then [`WIDE_COLUMNS`] nullable string and integer columns.
+    fn wide_table() -> TableSchema {
+        let mut fields = vec![Field::new("title", DataType::LargeUtf8, false)];
+        for i in 0..WIDE_COLUMNS {
+            let data_type = match i % 2 {
+                0 => DataType::LargeUtf8,
+                _ => DataType::Int64,
+            };
+            fields.push(Field::new(format!("c{i}"), data_type, true));
+        }
+        TableSchema::from_user_schema(&Schema::new(fields))
+    }
+
+    /// A batch that carries one column of a wide table is filled with one
+    /// null array per type for the rest, at append and at commit alike:
+    /// one array per column would cost its rows over again for every one.
+    #[test]
+    fn a_narrow_batch_is_null_filled_with_one_array_per_type() {
+        let t = wide_table();
+        let filled_with_shared_nulls = |shaped: &RecordBatch| {
+            let columns = &shaped.columns()[shaped.num_columns() - WIDE_COLUMNS..];
+            for (i, column) in columns.iter().enumerate() {
+                assert_eq!(column.null_count(), column.len(), "c{i} is null");
+                let first_of_type = &columns[i % 2];
+                assert!(Arc::ptr_eq(column, first_of_type), "c{i} shares its type's");
+            }
+        };
+        let narrow = batch(vec![("title", titles())]);
+        let resolved = resolve_batch(&narrow, &t, "_id").expect("resolve");
+        assert_eq!(resolved.batch.num_columns(), WIDE_COLUMNS + 1);
+        filled_with_shared_nulls(&resolved.batch);
+
+        let target = t.scalar_schema("_id");
+        let with_id = batch(vec![("_id", ids()), ("title", titles())]);
+        let shaped = try_conform(&with_id, &target).expect("conform");
+        assert_eq!(shaped.schema().fields(), target.fields());
+        filled_with_shared_nulls(&shaped);
     }
 
     #[test]

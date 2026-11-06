@@ -10,14 +10,15 @@
 use std::sync::Arc;
 
 use arrow_array::{
-    Array, ArrayRef, Float64Array, Int64Array, LargeStringArray, RecordBatch, StringArray,
+    Array, ArrayRef, FixedSizeListArray, Float32Array, Float64Array, Int64Array, LargeStringArray,
+    RecordBatch, StringArray,
 };
 use arrow_schema::{DataType, Field, Schema};
 use datafusion::prelude::{col, lit};
 use infino::{
     Bm25Params, ColumnIndex, CompactionSettings, Connection, FieldId, FieldPatch, IndexSpec,
-    InfinoError, OptimizeOptions, SchemaError, SchemaPatch, Stemmer, Stopwords, TableSchema,
-    connect, serde_json,
+    InfinoError, Metric, OptimizeOptions, SchemaError, SchemaPatch, Stemmer, Stopwords,
+    TableSchema, connect, serde_json,
 };
 use tempfile::TempDir;
 
@@ -178,6 +179,160 @@ fn an_absent_nullable_column_is_null_filled_and_a_missing_required_one_refused()
         "{err}"
     );
     assert_eq!(db.schema(TABLE).expect("schema").schema_id(), 1);
+}
+
+/// How the narrow batches of [`narrow_batches_on_a_wide_vector_table`]
+/// reach the table.
+#[derive(Clone, Copy)]
+enum Commits {
+    /// One `append` per batch, each committed on its own.
+    EachAppend,
+    /// Every batch buffered by one writer, then committed together.
+    OnceForAll,
+}
+
+/// Each narrow batch committed on its own: every commit fills the absent
+/// columns with one shared null array per type and gathers each shard's
+/// rows only from the columns that hold values.
+#[test]
+fn narrow_batches_on_a_wide_vector_table_read_back_exactly() {
+    narrow_batches_on_a_wide_vector_table(Commits::EachAppend);
+}
+
+/// The narrow batches buffered by one writer and committed once: the
+/// commit joins the buffered batches, keeping the columns none of them
+/// carries as one shared null array, and the rows read back as when each
+/// batch is committed alone.
+#[test]
+fn narrow_batches_buffered_into_one_commit_read_back_exactly() {
+    narrow_batches_on_a_wide_vector_table(Commits::OnceForAll);
+}
+
+/// A wide vector table written by batches that each carry a few of its
+/// columns, committed as `commits` says: every carried value reads back
+/// where it was written, every other cell reads null, and the vector and
+/// text indexes answer over the rows.
+fn narrow_batches_on_a_wide_vector_table(commits: Commits) {
+    /// Nullable columns beside the text and the vector.
+    const WIDE_COLUMNS: usize = 300;
+    /// Rows per append; enough for the vector index to train cells.
+    const ROWS: usize = 64;
+    /// The vector's width: the narrowest a vector index takes.
+    const DIM: usize = 16;
+    /// The columns each append carries, by index into the wide ones.
+    const CARRIED: [[usize; 2]; 2] = [[3, 150], [150, 299]];
+    /// Neighbours asked of the vector search.
+    const K: usize = 5;
+
+    let dir = TempDir::new().expect("tempdir");
+    let db = connect(dir.path().to_str().expect("utf8 path")).expect("connect");
+    let item = Arc::new(Field::new("item", DataType::Float32, true));
+    let mut fields = vec![
+        Field::new("title", DataType::LargeUtf8, false),
+        Field::new(
+            "emb",
+            DataType::FixedSizeList(Arc::clone(&item), DIM as i32),
+            false,
+        ),
+    ];
+    fields
+        .extend((0..WIDE_COLUMNS).map(|i| Field::new(format!("c{i}"), DataType::LargeUtf8, true)));
+    let docs = db
+        .create_table(
+            TABLE,
+            Arc::new(Schema::new(fields)),
+            IndexSpec::new()
+                .fts("title")
+                .vector("emb", DIM, Metric::L2Sq),
+        )
+        .expect("create");
+
+    let mut writer = match commits {
+        Commits::EachAppend => None,
+        Commits::OnceForAll => Some(docs.local_handle().writer().expect("writer")),
+    };
+    for (append, carried) in CARRIED.iter().enumerate() {
+        let values = Float32Array::from(
+            (0..ROWS * DIM)
+                .map(|i| ((append * ROWS * DIM + i) % 97) as f32)
+                .collect::<Vec<_>>(),
+        );
+        let emb =
+            FixedSizeListArray::try_new(Arc::clone(&item), DIM as i32, Arc::new(values), None)
+                .expect("vectors");
+        let mut columns: Vec<(String, ArrayRef)> = vec![
+            (
+                "title".into(),
+                Arc::new(LargeStringArray::from_iter_values(
+                    (0..ROWS).map(|r| format!("word{append} row{r}")),
+                )),
+            ),
+            ("emb".into(), Arc::new(emb)),
+        ];
+        for &c in carried {
+            // Every other row holds a value, the rest are null.
+            let cells = LargeStringArray::from_iter(
+                (0..ROWS).map(|r| (r % 2 == 0).then(|| format!("a{append} c{c} r{r}"))),
+            );
+            columns.push((format!("c{c}"), Arc::new(cells)));
+        }
+        let narrow = batch(
+            columns
+                .iter()
+                .map(|(n, a)| (n.as_str(), Arc::clone(a)))
+                .collect(),
+        );
+        match writer.as_mut() {
+            None => {
+                docs.append(&narrow).expect("append a narrow batch");
+            }
+            Some(writer) => {
+                writer.append(&narrow).expect("buffer a narrow batch");
+            }
+        }
+    }
+    if let Some(mut writer) = writer {
+        assert_eq!(
+            writer.buffered_batches(),
+            CARRIED.len(),
+            "every batch waits for the one commit"
+        );
+        writer.commit().expect("commit the buffered batches");
+    }
+
+    let count = |sql: &str| -> String { rows(&db, sql).concat() };
+    let total = (ROWS * CARRIED.len()).to_string();
+    assert_eq!(count("SELECT count(*) FROM docs"), total);
+    for (append, carried) in CARRIED.iter().enumerate() {
+        for &c in carried {
+            // `rows` sorts what it reads, so the expectation is sorted too.
+            let mut expected: Vec<String> = (0..ROWS)
+                .step_by(2)
+                .map(|r| format!("a{append} c{c} r{r}"))
+                .collect();
+            expected.sort();
+            let read = rows(
+                &db,
+                &format!("SELECT c{c} FROM docs WHERE c{c} LIKE 'a{append} %'"),
+            );
+            assert_eq!(read, expected, "c{c} of append {append}");
+        }
+    }
+    // A column no append carried is null in every row; one carried by the
+    // first append only is null in the second's rows and its own odd ones.
+    assert_eq!(count("SELECT count(c0) FROM docs"), "0");
+    assert_eq!(count("SELECT count(*) FROM docs WHERE c0 IS NULL"), total);
+    assert_eq!(count("SELECT count(c3) FROM docs"), (ROWS / 2).to_string());
+    assert_eq!(count("SELECT count(c150) FROM docs"), ROWS.to_string());
+
+    let hits = docs
+        .vector_search("emb", &[0.0f32; DIM], K, None, None)
+        .expect("vector search");
+    assert_eq!(hits.iter().map(|b| b.num_rows()).sum::<usize>(), K);
+    let text_hits = docs
+        .bm25_search("title", "word1", K, Default::default(), None)
+        .expect("text search");
+    assert_eq!(text_hits.iter().map(|b| b.num_rows()).sum::<usize>(), K);
 }
 
 #[test]

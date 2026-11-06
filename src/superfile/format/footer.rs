@@ -33,7 +33,6 @@ use std::{
 
 use arrow::{
     array::{Array, ArrayRef, AsArray, OffsetSizeTrait},
-    compute::concat_batches,
     record_batch::RecordBatch,
 };
 use arrow_schema::{DataType, Schema, SchemaRef};
@@ -61,6 +60,7 @@ use crate::{
     config::scratch_root,
     runtime_metrics::ingest::offset_window,
     superfile::{LazyByteSource, LazyByteSourceError, format::kv},
+    utils::nulls::concat_sharing_nulls,
 };
 
 /// Length of Parquet's trailing `PAR1` magic, in bytes.
@@ -755,7 +755,10 @@ impl PlannedBodyEncoder {
             sample_parts.push(batch.slice(0, take));
             wanted -= take;
         }
-        let sample = concat_batches(&self.schema, &sample_parts)?;
+        // Held batches of a wide table share one null array per type for
+        // the columns they lack; joined as Arrow joins them, the sample
+        // would hold a null array of a row group's rows for each of those.
+        let sample = concat_sharing_nulls(&self.schema, &sample_parts)?;
         let plain_columns = self.plan.choose(&self.schema, &sample)?;
         let mut encoder = ParquetBodyEncoder::with_plain_columns(
             &self.schema,
@@ -1355,6 +1358,7 @@ fn with_kv_list(metadata: &ParquetMetaData, kvs: Vec<KeyValue>) -> ParquetMetaDa
 mod tests {
     use std::slice;
 
+    use arrow::compute::concat_batches;
     use arrow_array::{
         BinaryViewArray, FixedSizeBinaryArray, FixedSizeListArray, Float64Array, LargeStringArray,
         StringArray, StringViewArray, StructArray, UInt64Array,
