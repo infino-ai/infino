@@ -20,7 +20,7 @@ use tracing::debug;
 use crate::{
     runtime_bridge::bridge_on_runtime,
     runtime_metrics::{ingest::visible_array_bytes, op_stats, rss::available_memory_bytes},
-    superfile::builder::{BuilderOptions, SuperfileBuilder},
+    superfile::builder::{BuilderOptions, SuperfileBuilder, project_to},
     supertable::{
         error::BuildError,
         handle::{Supertable, SupertableInner},
@@ -33,6 +33,7 @@ use crate::{
             prepare_user_superfile_batch, schedule_background_storage_reclaim, with_id_column,
         },
     },
+    utils::nulls::populated_columns,
 };
 
 /// Share of the memory free to the process that one wave may use, 2/5 = 40%.
@@ -326,17 +327,28 @@ fn build_hydrate_shard(
     // the compressed output is smaller, so this just avoids reallocating mid-encode.
     let mut bytes: Vec<u8> = Vec::with_capacity(chunk.footprint() as usize);
 
-    // Per-scalar-column stats for skip pruning, over the id-prepended batches.
-    // Stats are keyed by the field ids on the table's schema; the batches carry none.
-    let scalar_schema = manifest.scalar_schema();
+    // The superfile stores the columns the chunk's rows fill, as an append
+    // does: a nullable column none of them sets is left out and reads null.
+    let opts = base_opts
+        .clone()
+        .storing_only(&populated_columns(ided.iter()));
+    let stored = Arc::clone(&opts.schema);
+    let ided = ided
+        .iter()
+        .map(|b| project_to(b, &stored))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Per-column stats for skip pruning, over the id-prepended batches, for
+    // the columns the file stores. Stats are keyed by the field ids on the
+    // table's schema; the batches carry none.
     let scalar_refs: Vec<&RecordBatch> = ided.iter().collect();
 
     // Encode and build the stats at the same time, with the stats split over
     // columns. The memory budget lets a wave build only a few superfiles at
     // once, so this is what keeps the rest of the cores busy.
     let (encoded, scalar_stats) = join(
-        || SuperfileBuilder::build_no_blob_from_batches_to(base_opts.clone(), &ided, &mut bytes),
-        || ScalarStatsAgg::from_batches_par(&scalar_schema, &scalar_refs),
+        || SuperfileBuilder::build_no_blob_from_batches_to(opts, &ided, &mut bytes),
+        || ScalarStatsAgg::from_batches_par(&stored, &scalar_refs),
     );
     encoded?;
 

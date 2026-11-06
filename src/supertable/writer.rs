@@ -9314,13 +9314,20 @@ fn build_shard_parquet_and_fts(
         ordered_vectors.push(ordered);
     }
     let vector_slices: Vec<&[f32]> = ordered_vectors.iter().map(Vec::as_slice).collect();
+    // The shard stores the columns its rows fill, as a piece of an append
+    // does: a nullable column no row of it sets is left out, reads back as
+    // null, and has no statistics.
+    let populated = populated_columns([&scalar]);
     let mut builder = SuperfileBuilder::new(
-        builder_options_of(manifest).with_vector_layout(VectorLayout::MultiCellIvf),
+        builder_options_of(manifest)
+            .with_vector_layout(VectorLayout::MultiCellIvf)
+            .storing_only(&populated),
     )?;
+    let stored = Arc::clone(builder.input_schema());
+    let scalar = project_to(&scalar, &stored)?;
     builder.add_batch(&scalar, &vector_slices)?;
 
-    let scalar_schema = manifest.scalar_schema();
-    let scalar_stats = ScalarStatsAgg::from_batches(&scalar_schema, &[&scalar]);
+    let scalar_stats = ScalarStatsAgg::from_batches(&stored, &[&scalar]);
 
     let id_col = scalar
         .column(0)

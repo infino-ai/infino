@@ -10,9 +10,15 @@
 
 use std::{collections::HashSet, fs, path::Path, sync::Arc};
 
-use arrow_array::{Array, ArrayRef, Int64Array, LargeStringArray, RecordBatch};
+use arrow_array::{
+    Array, ArrayRef, FixedSizeListArray, Float32Array, Int64Array, LargeStringArray, RecordBatch,
+    RecordBatchIterator,
+};
 use arrow_schema::{DataType, Field, Schema};
-use infino::{CompactionSettings, Connection, IndexSpec, OptimizeOptions, Supertable, connect};
+use datafusion::prelude::{col, lit};
+use infino::{
+    CompactionSettings, Connection, IndexSpec, Metric, OptimizeOptions, Supertable, connect,
+};
 use tempfile::TempDir;
 
 const TABLE: &str = "wide";
@@ -27,6 +33,14 @@ const COMPACT_TARGET_MB: u64 = 1;
 const COMPACT_MIN_FILL_PERCENT: u8 = 1;
 /// Writes in the manifest-growth comparison.
 const GROWTH_WRITES: usize = 4;
+/// Dimension of the vector table's embedding column.
+const DIM: usize = 16;
+/// The vector table's embedding column.
+const EMBEDDING: &str = "emb";
+/// The vector table's nullable columns: fewer than the plain table's, so
+/// the vector index build stays quick.
+const VECTOR_TABLE_WIDTH: usize = 400;
+
 /// Where the table keeps its manifest parts, one per commit.
 const MANIFEST_PARTS_DIR: &str = "manifest-parts";
 /// Where the table keeps the per-superfile summaries a part points at.
@@ -261,5 +275,159 @@ fn what_a_write_records_follows_its_columns_not_the_width() {
     assert_eq!(
         wide, narrow,
         "(manifest records, superfile bytes) over {GROWTH_WRITES} writes"
+    );
+}
+
+/// `ROWS` rows over `schema`: the embedding set in every row, `value` in the
+/// columns `filled` names and null in every other.
+fn vector_rows_setting(schema: &Arc<Schema>, filled: &[usize], value: &str) -> RecordBatch {
+    let set: HashSet<String> = filled.iter().map(|&i| column(i)).collect();
+    let columns: Vec<ArrayRef> = schema
+        .fields()
+        .iter()
+        .map(|f| -> ArrayRef {
+            if f.name() == EMBEDDING {
+                let values: Vec<f32> = (0..ROWS * DIM)
+                    .map(|i| ((i * 7919) % 101) as f32 / 101.0 + 0.01)
+                    .collect();
+                let item = Arc::new(Field::new("item", DataType::Float32, true));
+                return Arc::new(
+                    FixedSizeListArray::try_new(
+                        item,
+                        DIM as i32,
+                        Arc::new(Float32Array::from(values)),
+                        None,
+                    )
+                    .expect("embeddings"),
+                );
+            }
+            match set.contains(f.name()) {
+                true => Arc::new(LargeStringArray::from(vec![Some(value); ROWS])),
+                false => Arc::new(LargeStringArray::from(vec![None::<&str>; ROWS])),
+            }
+        })
+        .collect();
+    RecordBatch::try_new(Arc::clone(schema), columns).expect("batch")
+}
+
+/// A table with a vector index commits through the cell-packed build; a
+/// write to it stores the columns its rows fill there too, reads an unset
+/// column as null, and still finds its rows by vector.
+#[test]
+fn a_vector_table_write_stores_only_the_columns_its_rows_fill() {
+    let dir = TempDir::new().expect("tempdir");
+    let db = connect(dir.path().to_str().expect("utf8")).expect("connect");
+    let item = Arc::new(Field::new("item", DataType::Float32, true));
+    let mut fields = vec![Field::new(
+        EMBEDDING,
+        DataType::FixedSizeList(item, DIM as i32),
+        false,
+    )];
+    fields
+        .extend((0..VECTOR_TABLE_WIDTH).map(|i| Field::new(column(i), DataType::LargeUtf8, true)));
+    let t = db
+        .create_table(
+            TABLE,
+            Arc::new(Schema::new(fields)),
+            IndexSpec::new().vector(EMBEDDING, DIM, Metric::Cosine),
+        )
+        .expect("create");
+    let filled: Vec<usize> = (0..FILLED)
+        .map(|i| i * (VECTOR_TABLE_WIDTH / FILLED))
+        .collect();
+    t.append(&vector_rows_setting(&t.schema(), &filled, "x"))
+        .expect("append");
+
+    let want: HashSet<String> = filled.iter().map(|&i| column(i)).collect();
+    let stored = stored_columns(&t);
+    assert!(!stored.is_empty(), "the write made superfiles");
+    for columns in stored {
+        assert_eq!(columns, want, "a file stores the columns its rows set");
+    }
+    for stats in stat_columns(&t) {
+        assert!(
+            stats <= FILLED + 1,
+            "stats only for what the file stores, not {stats}"
+        );
+    }
+    let unfilled = column(1);
+    assert_eq!(
+        count(
+            &db,
+            &format!("SELECT count(*) FROM {TABLE} WHERE {unfilled} IS NULL")
+        ),
+        ROWS as i64
+    );
+    assert_eq!(
+        count(
+            &db,
+            &format!("SELECT count(*) FROM {TABLE} WHERE {} = 'x'", column(0))
+        ),
+        ROWS as i64
+    );
+}
+
+/// An update writes its replacement rows as an append writes rows: the
+/// replacement superfile stores the columns they fill.
+#[test]
+fn an_update_stores_only_the_columns_its_rows_fill() {
+    let dir = TempDir::new().expect("tempdir");
+    let (db, t) = table(&dir, WIDTH);
+    let schema = t.schema();
+    t.append(&rows_setting(&schema, &[0, 1, 2], "x"))
+        .expect("append");
+    let stats = t
+        .update(
+            col(column(0)).eq(lit("x")),
+            &rows_setting(&schema, &[7], "y"),
+        )
+        .expect("update");
+    assert_eq!(stats.matched(), ROWS);
+
+    let replaced = HashSet::from([column(7)]);
+    assert!(
+        stored_columns(&t).contains(&replaced),
+        "the replacement stores only the column its rows set"
+    );
+    assert_eq!(
+        count(
+            &db,
+            &format!("SELECT count(*) FROM {TABLE} WHERE {} = 'y'", column(7))
+        ),
+        ROWS as i64
+    );
+    assert_eq!(
+        count(
+            &db,
+            &format!("SELECT count(*) FROM {TABLE} WHERE {} IS NULL", column(0))
+        ),
+        ROWS as i64
+    );
+}
+
+/// A bulk load stores the columns its rows fill, as an append does.
+#[test]
+fn a_bulk_load_stores_only_the_columns_its_rows_fill() {
+    let dir = TempDir::new().expect("tempdir");
+    let (db, t) = table(&dir, WIDTH);
+    let schema = t.schema();
+    let filled: Vec<usize> = (0..FILLED).map(|i| i * (WIDTH / FILLED)).collect();
+    let rows = rows_setting(&schema, &filled, "x");
+    let reader = RecordBatchIterator::new(vec![Ok(rows)], Arc::clone(&schema));
+    assert_eq!(t.hydrate(reader, ROWS).expect("bulk load"), ROWS);
+
+    let want: HashSet<String> = filled.iter().map(|&i| column(i)).collect();
+    for stored in stored_columns(&t) {
+        assert_eq!(stored, want, "a file stores the columns its rows set");
+    }
+    for stats in stat_columns(&t) {
+        assert_eq!(stats, FILLED + 1, "stats only for what the file stores");
+    }
+    assert_eq!(
+        count(
+            &db,
+            &format!("SELECT count(*) FROM {TABLE} WHERE {} IS NULL", column(1))
+        ),
+        ROWS as i64
     );
 }
