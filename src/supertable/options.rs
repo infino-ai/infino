@@ -1522,6 +1522,7 @@ impl SupertableOptions {
                 ),
                 eviction: Box::new(LruPolicy::new()),
                 crc_verification: cfg.supertable.crc_policy(),
+                fill_memory_budget: Some(Arc::clone(&self.connection_memory_budget)),
             };
             let cache = DiskCacheStore::new_unpinned(Arc::clone(&storage), disk_cfg)
                 .map_err(|e| BuildError::Store(format!("disk cache construction: {e}")))?;
@@ -2443,9 +2444,15 @@ supertable:
             Config::from_figment(Figment::new().merge(Yaml::string(&yaml))).expect("parse config");
         let opts = plain_opts().apply_config(&cfg).expect("apply_config");
         assert!(opts.storage.is_some());
+        let cache = opts
+            .disk_cache
+            .as_ref()
+            .expect("disk_cache_root ⇒ cache attached");
         assert!(
-            opts.disk_cache.is_some(),
-            "disk_cache_root ⇒ cache attached"
+            cache
+                .fill_memory_budget()
+                .is_some_and(|budget| Arc::ptr_eq(budget, &opts.connection_memory_budget)),
+            "the cache's downloads charge the budget the config set"
         );
         let _ = fs::remove_dir_all(&dir);
     }
