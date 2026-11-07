@@ -497,17 +497,32 @@ impl ConnectionMemoryBudget {
         n: usize,
         percent: usize,
     ) -> Option<Reservation> {
-        let over_share = |extra: usize| {
-            self.limit.is_some_and(|limit| {
-                self.used().saturating_add(extra).saturating_mul(100)
-                    > limit.saturating_mul(percent)
-            })
-        };
-        if over_share(n) {
+        if !self.fits_share(n, percent) {
             return None;
         }
         let reservation = self.try_reserve_without_reclaim(n).ok()?;
-        (!over_share(0)).then_some(reservation)
+        self.fits_share(0, percent).then_some(reservation)
+    }
+
+    /// [`Self::try_reserve_within_share`] for a download from object storage that runs on its
+    /// own, such as a cache fill: held as a cold read, so a refused cold read waits for it to be
+    /// written and given back instead of failing. Never waits itself.
+    pub(crate) fn try_admit_within_share(
+        self: &Arc<Self>,
+        n: usize,
+        percent: usize,
+    ) -> Option<ColdReadPermit> {
+        let mut held = self.lock_cold_read_bytes();
+        let reservation = self.try_reserve_within_share(n, percent)?;
+        Some(self.hold(&mut held, reservation))
+    }
+
+    /// Whether `n` more bytes keep the budget within `percent` of its limit, as things stand.
+    /// Always true for a measure-only budget.
+    pub(crate) fn fits_share(&self, n: usize, percent: usize) -> bool {
+        self.limit.is_none_or(|limit| {
+            self.used().saturating_add(n).saturating_mul(100) <= limit.saturating_mul(percent)
+        })
     }
 
     /// Bytes currently reserved.
@@ -1055,6 +1070,34 @@ mod tests {
         second
             .now_or_never()
             .expect("the read retries once the first one lets go")
+            .expect("and then fits");
+    }
+
+    /// A download admitted within its share holds memory as a cold read: a refused cold read waits
+    /// for it to come back instead of failing, and past the share the download gets nothing.
+    #[tokio::test]
+    async fn a_refused_cold_read_waits_for_a_download_admitted_within_its_share() {
+        const DOWNLOAD_SHARE_PERCENT: usize = 30;
+        let budget = ConnectionMemoryBudget::with_limit(SHARED_BUDGET);
+        let ceiling = budget.limit().expect("bounded");
+        let download = budget
+            .try_admit_within_share(ceiling / 4, DOWNLOAD_SHARE_PERCENT)
+            .expect("within the share");
+        assert!(
+            budget
+                .try_admit_within_share(ceiling / 10, DOWNLOAD_SHARE_PERCENT)
+                .is_none(),
+            "past the share, a download gets nothing"
+        );
+        let _outside = budget.try_reserve(ceiling / 2).expect("fits");
+        let mut read = Box::pin(budget.admit_cold_read(ceiling / 3));
+        assert!(
+            (&mut read).now_or_never().is_none(),
+            "a refused read waits while a download holds memory"
+        );
+        drop(download);
+        read.now_or_never()
+            .expect("the read retries once the download lets go")
             .expect("and then fits");
     }
 

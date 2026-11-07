@@ -9,11 +9,13 @@ use std::{
     env::temp_dir,
     fmt::{self, Debug},
     path::PathBuf,
-    sync::atomic::AtomicU64,
+    sync::{Arc, atomic::AtomicU64},
     time::Duration,
 };
 
-use crate::{config::CrcVerification, supertable::manifest::SuperfileUri};
+use crate::{
+    config::CrcVerification, memory::ConnectionMemoryBudget, supertable::manifest::SuperfileUri,
+};
 
 /// How `DiskCacheStore` services a cache miss.
 ///
@@ -148,6 +150,11 @@ pub struct DiskCacheConfig {
     /// directly can set the right value for their storage backend;
     /// the supertable sets both from one source.
     pub crc_verification: CrcVerification,
+    /// The memory budget a background download charges for the chunks it holds between their GET
+    /// and their write to disk. Tables opened through the catalog or from `config.yaml` set their
+    /// connection's budget, so the downloads of every table on the connection count against the
+    /// memory its queries use. `None` charges nothing.
+    pub fill_memory_budget: Option<Arc<ConnectionMemoryBudget>>,
 }
 
 /// Default Tier-1 disk-cache byte budget (10 GiB).
@@ -184,6 +191,7 @@ impl Default for DiskCacheConfig {
             promotion_defer_timeout: DEFAULT_PROMOTION_DEFER_TIMEOUT,
             eviction: Box::new(LruPolicy::new()),
             crc_verification: CrcVerification::default(),
+            fill_memory_budget: None,
         }
     }
 }

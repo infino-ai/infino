@@ -591,9 +591,14 @@ impl Connection {
                 // re-created table never reads a dropped generation's bytes,
                 // and the directory is claimed for this location, so a
                 // dropped generation's bytes do not stay on disk either.
-                let disk_cache =
-                    build_disk_cache(&self.inner.options, &table_storage, name, &location)
-                        .map_err(|e| e.with_context("create_table", Some(name)))?;
+                let disk_cache = build_disk_cache(
+                    &self.inner.options,
+                    &self.inner.connection_memory_budget,
+                    &table_storage,
+                    name,
+                    &location,
+                )
+                .map_err(|e| e.with_context("create_table", Some(name)))?;
                 // The range indexes ride in the schema the table's first
                 // manifest records, which is what every later open reads.
                 let mut opts = build_options(
@@ -777,9 +782,14 @@ impl Connection {
 
                 // Cache directory is keyed on the stable name, matching
                 // `create_table` (the on-storage subtree is `entry.location`).
-                let disk_cache =
-                    build_disk_cache(&self.inner.options, &table_storage, name, &entry.location)
-                        .map_err(|e| e.with_context("open_table", Some(name)))?;
+                let disk_cache = build_disk_cache(
+                    &self.inner.options,
+                    &self.inner.connection_memory_budget,
+                    &table_storage,
+                    name,
+                    &entry.location,
+                )
+                .map_err(|e| e.with_context("open_table", Some(name)))?;
                 let mut opts = build_options(
                     schema,
                     fts_cfg,
@@ -1941,6 +1951,7 @@ fn backend_to_provider(
 /// cache once the drain doubles their working set.
 fn build_disk_cache(
     options: &ConnectOptions,
+    memory_budget: &Arc<ConnectionMemoryBudget>,
     storage: &Arc<dyn StorageProvider>,
     name: &str,
     location: &str,
@@ -1953,6 +1964,7 @@ fn build_disk_cache(
     let mut cfg = DiskCacheConfig {
         cache_root: table_root.clone(),
         cold_fetch_mode: options.cold_fetch_mode.to_internal(),
+        fill_memory_budget: Some(Arc::clone(memory_budget)),
         ..Default::default()
     };
     if let Some(budget) = options.cache_budget_bytes {
@@ -4190,6 +4202,42 @@ mod tests {
             &reopened.local_handle().options().connection_memory_budget,
             &conn.inner.connection_memory_budget
         ));
+    }
+
+    /// A table's disk cache charges its background downloads to the connection's budget, the one
+    /// its queries use, whether the table was created or opened.
+    #[test]
+    fn table_disk_cache_downloads_charge_the_connection_memory_budget() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = tempfile::tempdir().expect("cache dir");
+        let uri = dir.path().to_str().expect("utf8 path").to_string();
+        let conn = connect_with(
+            &uri,
+            ConnectOptions::new().with_cache_dir(cache.path().to_path_buf()),
+        )
+        .expect("connect");
+        conn.create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create");
+        let reopened = connect_with(
+            &uri,
+            ConnectOptions::new().with_cache_dir(cache.path().to_path_buf()),
+        )
+        .expect("connect again");
+
+        for conn in [&conn, &reopened] {
+            let handle = conn.open_table_handle("docs").expect("open");
+            let store = handle
+                .options()
+                .disk_cache
+                .as_ref()
+                .expect("disk cache attached");
+            assert!(Arc::ptr_eq(
+                store
+                    .fill_memory_budget()
+                    .expect("downloads charge a budget"),
+                &conn.inner.connection_memory_budget
+            ));
+        }
     }
 
     #[test]

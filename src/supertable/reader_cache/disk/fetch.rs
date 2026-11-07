@@ -15,6 +15,7 @@ use std::{
         Arc, Weak,
         atomic::{AtomicU64, Ordering},
     },
+    time::Duration,
 };
 
 use async_trait::async_trait;
@@ -29,11 +30,13 @@ use tokio::{
     io::{AsyncSeekExt, AsyncWriteExt},
     sync::oneshot,
     task::{JoinHandle, JoinSet, spawn_blocking},
+    time::sleep,
 };
 use tracing::{Instrument, debug_span};
 
 use crate::{
     config::global as global_config,
+    memory::ColdReadPermit,
     runtime_bridge::carry_span,
     runtime_metrics::io::scope_background,
     storage::{StorageError, StorageProvider},
@@ -45,6 +48,7 @@ use crate::{
     supertable::{
         StorageRangeSource,
         manifest::{SubsectionOffsets, SuperfileUri},
+        query::read_ahead::BUDGET_SHARE_PERCENT as READ_AHEAD_SHARE_PERCENT,
         reader_cache::{
             block_source::{BlockCachedSource, SourceLayout},
             config::ColdFetchMode,
@@ -57,6 +61,17 @@ use crate::{
     },
     utils::trace::{OpOrigin, detached},
 };
+
+/// A background download starts a chunk only if, with the chunk, the connection uses at most this
+/// share of its memory limit. Half the share read-ahead gets: a download only saves a later read,
+/// so a running query's read-ahead, joins and sorts come first. A budget whose share is under one
+/// chunk (`cold_fetch_chunk_bytes`) downloads nothing, and its files keep being read in ranges.
+const FILL_BUDGET_SHARE_PERCENT: usize = READ_AHEAD_SHARE_PERCENT / 2;
+
+/// How long a background download waits before asking again for memory for its next chunk, when
+/// it has none in flight to give memory back. Queries free memory as they finish, so a short wait
+/// resumes the download soon after, and a try is cheap.
+const FILL_MEMORY_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 
 /// A hybrid fill's temp file, deleted on drop until the finalizer takes it over
 /// ([`Self::claim`]). Pwrites still in flight write into the unlinked file and free it as they
@@ -689,6 +704,12 @@ impl DiskCacheStore {
                     // The download's own file is gone: its cache directory was removed (a
                     // dropped store's, say). Like a cancel, nothing to retry.
                     Err(DiskCacheError::Io(error)) if error.kind() == ErrorKind::NotFound => {}
+                    // Queries hold the memory: expected under load, so not a warning. A read
+                    // after `FAILED_FILL_RETRY_AFTER` tries again.
+                    Err(DiskCacheError::FillOverMemoryBudget) => {
+                        tracing::debug!(target: "infino::cache", uri = %uri_owned.0, "fill: no memory budget for the next chunk");
+                        exit.failed();
+                    }
                     // The entry still serves reads. A read after `FAILED_FILL_RETRY_AFTER` tries
                     // again.
                     Err(error) => {
@@ -1341,8 +1362,8 @@ async fn cold_fetch_to_disk_cancelable(
     let mut next_chunk = 0u64;
     let mut in_flight = FuturesUnordered::new();
 
-    // Bound memory by `n_streams × chunk_size` and stop promptly when the
-    // short-lived cache that requested this background fill is dropped.
+    // At most `n_streams` chunks are in flight, each charged to the memory budget from its GET
+    // until it is written. Stop promptly when the store that wants the download is dropped.
     loop {
         while next_chunk < n_chunks && in_flight.len() < n_streams {
             // Skip chunks a prior attempt already wrote (resume cursor).
@@ -1364,18 +1385,35 @@ async fn cold_fetch_to_disk_cancelable(
                 next_chunk += 1;
                 continue;
             }
+            // The chunk sits in memory from its GET until it is written, so charge it to the
+            // budget first. Without room, wait for memory to come back and try again (see the
+            // `select!` below). A download with no chunk done yet stops instead: it throws nothing
+            // away, and a read after `FAILED_FILL_RETRY_AFTER` starts it again. One with chunks
+            // done waits, since stopping would download them again.
+            let chunk_bytes = fetch_ranges.iter().map(|(start, end)| end - start).sum();
+            let memory = match reserve_fill_chunk(store, chunk_bytes) {
+                Ok(memory) => memory,
+                Err(error) if in_flight.is_empty() && !filled.contains(&true) => {
+                    return Err(error);
+                }
+                Err(_) => break,
+            };
             let storage = Arc::clone(fetch_storage);
             let file = Arc::clone(&file);
             let key = storage_uri.to_string();
             // Fill GETs are tagged background (see `fetch_and_pwrite`) so query-window meters
             // attribute only foreground lazy/probe GETs to the cold query cost.
             in_flight.push(async move {
+                let _memory = memory;
                 for (range_start, range_end) in fetch_ranges {
                     fetch_and_pwrite(&storage, &key, &file, range_start, range_end, true).await?;
                 }
                 Ok::<u64, DiskCacheError>(chunk_idx)
             });
             next_chunk += 1;
+        }
+        if next_chunk == n_chunks && in_flight.is_empty() {
+            break;
         }
 
         let foreground = foreground_notify().notified();
@@ -1393,12 +1431,16 @@ async fn cold_fetch_to_disk_cancelable(
                     return Ok(stop);
                 }
             }
-            result = in_flight.next() => match result {
-                // Mark the chunk durable only once its write completes, so a
-                // pause mid-flight re-fetches just the unfinished chunks.
-                Some(result) => filled[result? as usize] = true,
-                None => break,
+            // Mark the chunk durable only once its write completes, so a pause mid-flight
+            // re-fetches just the unfinished chunks.
+            Some(result) = in_flight.next(), if !in_flight.is_empty() => {
+                filled[result? as usize] = true;
             }
+            // No chunk in flight, so the next one waits on memory: ask again shortly. The wait
+            // has no deadline, since giving up would download the written chunks again. It holds
+            // no memory, only the download slot that the store's other downloads, short of the
+            // same memory, could not use, and a cancel or a dropped store still ends it.
+            _ = sleep(FILL_MEMORY_RETRY_INTERVAL), if in_flight.is_empty() => {}
         }
         if background_store_abandoned(store) {
             return Ok(BackgroundFillOutcome::Abandoned);
@@ -1412,6 +1454,37 @@ async fn cold_fetch_to_disk_cancelable(
         .await
         .map_err(|error| DiskCacheError::SuperfileOpen(format!("fsync join: {error}")))??;
     Ok(BackgroundFillOutcome::Complete)
+}
+
+/// Reserve memory for a download chunk of `bytes` from the store's fill budget, within
+/// [`FILL_BUDGET_SHARE_PERCENT`]. Held as a cold read, so a query's cold read refused for room
+/// waits for the chunk to be written instead of failing. `Ok(None)` when the store has no budget.
+fn reserve_fill_chunk(
+    store: &DiskCacheStore,
+    bytes: u64,
+) -> Result<Option<ColdReadPermit>, DiskCacheError> {
+    let Some(budget) = &store.config.fill_memory_budget else {
+        return Ok(None);
+    };
+    budget
+        .try_admit_within_share(saturating_usize(bytes), FILL_BUDGET_SHARE_PERCENT)
+        .map(Some)
+        .ok_or(DiskCacheError::FillOverMemoryBudget)
+}
+
+/// Whether the store's fill budget has room for a download chunk of `bytes` as things stand, as
+/// [`reserve_fill_chunk`] would find it. Always, when the store has no budget.
+fn fill_chunk_fits(store: &DiskCacheStore, bytes: u64) -> bool {
+    store
+        .config
+        .fill_memory_budget
+        .as_ref()
+        .is_none_or(|budget| budget.fits_share(saturating_usize(bytes), FILL_BUDGET_SHARE_PERCENT))
+}
+
+/// `bytes` as a `usize`, capped at `usize::MAX` where it does not fit.
+fn saturating_usize(bytes: u64) -> usize {
+    usize::try_from(bytes).unwrap_or(usize::MAX)
 }
 
 /// Is `entry` the one the hybrid finalizer is promoting? Same reader, by pointer.
@@ -1519,6 +1592,11 @@ async fn lazy_background_fill(
     // Cancelled while it waited, or a whole copy landed: reserve nothing.
     if !store.fill_can_install(uri, fill) {
         return Ok(());
+    }
+    // No memory for a first chunk: stop before reserving disk, which can evict other files for a
+    // download that would not start.
+    if !fill_chunk_fits(&store, store.config.cold_fetch_chunk_bytes.min(size)) {
+        return Err(DiskCacheError::FillOverMemoryBudget);
     }
     // From here the idle cap keeps the file's entry, so the entry's Warm reservation covers the
     // download (see `reclaimable_lazy_entry`). With no entry, nobody has the file open: the
@@ -1825,6 +1903,7 @@ mod tests {
     };
 
     use crate::{
+        memory::ConnectionMemoryBudget,
         storage::{LocalFsStorageProvider, StorageProvider},
         superfile::{
             LazyByteSource,
@@ -1863,6 +1942,21 @@ mod tests {
     /// Chunk size of the download in the reopen test: small enough that the tiny fixture takes
     /// several, so its first chunk's GET stands apart from every other read.
     const DOWNLOAD_CHUNK_BYTES: u64 = 256;
+
+    /// Download streams in the memory-budget tests: more than the budget gives room for, so the
+    /// budget, not the stream count, bounds what a download holds.
+    const BUDGET_TEST_STREAMS: usize = 4;
+
+    /// A connection budget whose downloads' share is under one download chunk.
+    const BUDGET_UNDER_ONE_CHUNK: u64 = DOWNLOAD_CHUNK_BYTES;
+
+    /// A connection budget whose downloads' share (25% of its enforced 90%) holds one download
+    /// chunk but not two.
+    const BUDGET_FOR_ONE_CHUNK: u64 = DOWNLOAD_CHUNK_BYTES * 6;
+
+    /// How long a memory-budget test waits for a download to land the chunk in flight and be
+    /// refused the next: a few of its retries.
+    const MEMORY_REFUSAL_SETTLE: Duration = FILL_MEMORY_RETRY_INTERVAL.saturating_mul(3);
 
     /// Bytes a fill test reserves, and the size of the file it pretends to fill.
     const RESERVED_BYTES: u64 = 4096;
@@ -2034,26 +2128,34 @@ mod tests {
     fn recording_store(
         budget: Option<u64>,
     ) -> (TempDir, Arc<DiskCacheStore>, Arc<RecordingStorage>) {
+        recording_store_with(budget, |_| {})
+    }
+
+    /// [`recording_store`], with `tweak` applied to its config last.
+    fn recording_store_with(
+        budget: Option<u64>,
+        tweak: impl FnOnce(&mut DiskCacheConfig),
+    ) -> (TempDir, Arc<DiskCacheStore>, Arc<RecordingStorage>) {
         let dir = TempDir::new().expect("tempdir");
         let local: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("localfs"));
         let recording = RecordingStorage::over(local);
         let defaults = DiskCacheConfig::default();
-        let store = DiskCacheStore::new_unpinned(
-            Arc::clone(&recording) as Arc<dyn StorageProvider>,
-            DiskCacheConfig {
-                cache_root: dir.path().join("cache"),
-                cold_fetch_mode: ColdFetchMode::LazyForegroundWithBackgroundFill,
-                mmap_cold_threshold_secs: 0,
-                promotion_defer_timeout: Duration::ZERO,
-                prefetch_concurrency: 1,
-                cold_fetch_streams: 1,
-                cold_fetch_chunk_bytes: DOWNLOAD_CHUNK_BYTES,
-                disk_budget_bytes: budget.unwrap_or(defaults.disk_budget_bytes),
-                ..defaults
-            },
-        )
-        .expect("store");
+        let mut cfg = DiskCacheConfig {
+            cache_root: dir.path().join("cache"),
+            cold_fetch_mode: ColdFetchMode::LazyForegroundWithBackgroundFill,
+            mmap_cold_threshold_secs: 0,
+            promotion_defer_timeout: Duration::ZERO,
+            prefetch_concurrency: 1,
+            cold_fetch_streams: 1,
+            cold_fetch_chunk_bytes: DOWNLOAD_CHUNK_BYTES,
+            disk_budget_bytes: budget.unwrap_or(defaults.disk_budget_bytes),
+            ..defaults
+        };
+        tweak(&mut cfg);
+        let store =
+            DiskCacheStore::new_unpinned(Arc::clone(&recording) as Arc<dyn StorageProvider>, cfg)
+                .expect("store");
         (dir, store, recording)
     }
 
@@ -2146,6 +2248,140 @@ mod tests {
             .into_iter()
             .filter(|r| r.start == 0 && r.end == DOWNLOAD_CHUNK_BYTES)
             .count()
+    }
+
+    /// A store whose downloads charge `budget`, with more streams than the budget may give room
+    /// for.
+    fn memory_budgeted_store(
+        budget: &Arc<ConnectionMemoryBudget>,
+    ) -> (TempDir, Arc<DiskCacheStore>, Arc<RecordingStorage>) {
+        recording_store_with(None, |cfg| {
+            cfg.cold_fetch_streams = BUDGET_TEST_STREAMS;
+            cfg.fill_memory_budget = Some(Arc::clone(budget));
+        })
+    }
+
+    /// A download charges each chunk to the memory budget while it holds it, never more than its
+    /// streams, and gives all of it back.
+    #[tokio::test]
+    async fn a_download_charges_its_chunks_to_the_memory_budget() {
+        let budget = ConnectionMemoryBudget::measured();
+        let (_dir, store, recording) = memory_budgeted_store(&budget);
+        let (uri, _) = put_tiny_superfile(&recording).await;
+
+        warm_open(&store, &uri).await;
+        store
+            .wait_until_fills_settled(PROMOTE_TIMEOUT)
+            .await
+            .expect("the download finishes");
+
+        assert!(store.is_mmap_promoted(&uri), "the download lands");
+        assert!(
+            budget.peak() >= DOWNLOAD_CHUNK_BYTES as usize,
+            "chunks are charged"
+        );
+        assert!(
+            budget.peak() <= BUDGET_TEST_STREAMS * DOWNLOAD_CHUNK_BYTES as usize,
+            "never more than the streams hold"
+        );
+        assert_eq!(budget.used_bytes(), 0, "every chunk is given back");
+    }
+
+    /// With no room in the memory budget for a chunk, the download stops before its first GET and
+    /// counts as failed, so reads wait out the retry delay before starting it again.
+    #[tokio::test]
+    async fn a_download_with_no_memory_room_fetches_nothing() {
+        let budget = ConnectionMemoryBudget::with_limit(BUDGET_UNDER_ONE_CHUNK);
+        let (_dir, store, recording) = memory_budgeted_store(&budget);
+        let (uri, _) = put_tiny_superfile(&recording).await;
+        let from = recording.ranges_since(0).len();
+
+        warm_open(&store, &uri).await;
+        store
+            .wait_until_fills_settled(PROMOTE_TIMEOUT)
+            .await
+            .expect("the download stops");
+
+        assert!(!store.is_mmap_promoted(&uri), "nothing lands");
+        assert_eq!(first_chunks_since(&recording, from), 0, "no download GET");
+        assert!(
+            fill_of(&store, &uri).failed_at_us.get().is_some(),
+            "the download waits out the retry delay"
+        );
+        assert_eq!(budget.used_bytes(), 0, "nothing stays charged");
+    }
+
+    /// With room for one chunk, a download with more streams never holds two full chunks: it
+    /// waits for its own chunks to give memory back, and finishes.
+    #[tokio::test]
+    async fn a_download_waits_for_its_own_chunks_to_free_memory() {
+        let budget = ConnectionMemoryBudget::with_limit(BUDGET_FOR_ONE_CHUNK);
+        let (_dir, store, recording) = memory_budgeted_store(&budget);
+        let (uri, _) = put_tiny_superfile(&recording).await;
+
+        warm_open(&store, &uri).await;
+        store
+            .wait_until_fills_settled(PROMOTE_TIMEOUT)
+            .await
+            .expect("the download finishes");
+
+        assert!(store.is_mmap_promoted(&uri), "the download lands");
+        let chunk = DOWNLOAD_CHUNK_BYTES as usize;
+        assert!(
+            (chunk..2 * chunk).contains(&budget.peak()),
+            "never two full chunks at once, peak {}",
+            budget.peak()
+        );
+        assert_eq!(budget.used_bytes(), 0, "every chunk is given back");
+    }
+
+    /// A query takes the memory partway through a download, while none of its chunks is in
+    /// flight. The download keeps the chunks it has written and waits for room, instead of
+    /// stopping and downloading them again on retry; it finishes once the query lets go.
+    #[tokio::test]
+    async fn a_download_out_of_memory_midway_waits_and_keeps_its_chunks() {
+        let budget = ConnectionMemoryBudget::with_limit(BUDGET_FOR_ONE_CHUNK);
+        let (_dir, store, recording) = memory_budgeted_store(&budget);
+        let (uri, size) = put_tiny_superfile(&recording).await;
+        assert!(
+            size > 2 * DOWNLOAD_CHUNK_BYTES,
+            "a chunk left after the one in flight"
+        );
+        let permit = hold_fill_slot(&store).await;
+        warm_open(&store, &uri).await;
+        let from = recording.n_ranges();
+        // Hold the download's second chunk in flight, past the first one.
+        recording.pause_read_after(1);
+        drop(permit);
+        until_a_read_is_paused(&recording).await;
+
+        // A query takes enough that the next chunk is over the downloads' share.
+        let query = budget
+            .try_reserve(DOWNLOAD_CHUNK_BYTES as usize)
+            .expect("the query fits");
+        recording.resume();
+        sleep(MEMORY_REFUSAL_SETTLE).await;
+        assert!(
+            fill_of(&store, &uri).failed_at_us.get().is_none(),
+            "the download waits instead of failing"
+        );
+        assert!(!store.is_mmap_promoted(&uri), "the download is not done");
+
+        drop(query);
+        store
+            .wait_until_fills_settled(PROMOTE_TIMEOUT)
+            .await
+            .expect("the download finishes");
+        assert!(store.is_mmap_promoted(&uri), "the download lands");
+        let fetched = recording.ranges_since(from);
+        let distinct: HashSet<_> = fetched.iter().map(|r| (r.start, r.end)).collect();
+        assert_eq!(
+            distinct.len(),
+            fetched.len(),
+            "no chunk downloaded twice: {fetched:?}"
+        );
+        assert_eq!(fetched.len() as u64, size.div_ceil(DOWNLOAD_CHUNK_BYTES));
+        assert_eq!(budget.used_bytes(), 0, "every chunk is given back");
     }
 
     /// A file's download outlives its entry.
@@ -2476,22 +2712,69 @@ mod tests {
             cfg.prefetch_concurrency = 1;
         });
         let uri = SuperfileUri::new_v4();
+        insert_lazy_entry(&store, uri, ENTRY_BYTES);
+        let result = run_fill_of_reserved_bytes(&store, uri).await;
+        assert!(
+            matches!(result, Err(DiskCacheError::BudgetExceeded)),
+            "no room: it fails"
+        );
+        assert!(store.is_cached(&uri), "the file's entry stays");
+        store.assert_budget_consistent();
+    }
+
+    /// A download with no memory for its first chunk stops before it reserves disk:
+    /// - Another file fills the disk budget, so reserving disk for the download would evict it.
+    /// - The memory budget has no room for a chunk.
+    ///
+    /// So the download fails on memory, and the other file stays.
+    #[tokio::test]
+    async fn a_download_with_no_memory_room_evicts_nothing() {
+        const ENTRY_BYTES: u64 = 1;
+        let budget = ConnectionMemoryBudget::with_limit(BUDGET_UNDER_ONE_CHUNK);
+        let (_dir, store) = test_store_with(|cfg| {
+            cfg.disk_budget_bytes = RESERVED_BYTES;
+            cfg.prefetch_concurrency = 1;
+            cfg.fill_memory_budget = Some(Arc::clone(&budget));
+        });
+        let other = SuperfileUri::new_v4();
+        insert_lazy_entry(&store, other, RESERVED_BYTES - ENTRY_BYTES);
+        let uri = SuperfileUri::new_v4();
+        insert_lazy_entry(&store, uri, ENTRY_BYTES);
+        let result = run_fill_of_reserved_bytes(&store, uri).await;
+        assert!(
+            matches!(result, Err(DiskCacheError::FillOverMemoryBudget)),
+            "no memory: it fails"
+        );
+        assert!(store.is_cached(&other), "nothing evicted");
+        store.assert_budget_consistent();
+    }
+
+    /// Cache a lazy entry for `uri` holding `bytes` of the disk budget, over the tiny superfile.
+    fn insert_lazy_entry(store: &Arc<DiskCacheStore>, uri: SuperfileUri, bytes: u64) {
         let reader = SuperfileReader::open(tiny_superfile_bytes()).expect("tiny superfile opens");
-        assert!(store.try_reserve_without_evicting(ENTRY_BYTES));
+        assert!(store.try_reserve_without_evicting(bytes));
         store.cached.insert(
             uri,
             Arc::new(CachedEntry {
                 reader: Arc::new(reader),
                 residency: Residency::Paged {
-                    block_source: dummy_block_source(&store, uri),
+                    block_source: dummy_block_source(store, uri),
                 },
-                size_bytes: Arc::new(AtomicU64::new(ENTRY_BYTES)),
+                size_bytes: Arc::new(AtomicU64::new(bytes)),
                 accounting: EntryAccounting::Eager,
                 last_access_us: AtomicU64::new(0),
             }),
         );
-        let exit = FillExit::new(&store, uri, Arc::default());
-        let result = lazy_background_fill(
+    }
+
+    /// Run a download of a [`RESERVED_BYTES`] file for `uri` to its end, with no wait to yield to
+    /// readers.
+    async fn run_fill_of_reserved_bytes(
+        store: &Arc<DiskCacheStore>,
+        uri: SuperfileUri,
+    ) -> Result<(), DiskCacheError> {
+        let exit = FillExit::new(store, uri, Arc::default());
+        lazy_background_fill(
             &exit,
             uri.storage_path(),
             RESERVED_BYTES,
@@ -2499,14 +2782,7 @@ mod tests {
             None,
             PromotionDefer::start(Duration::ZERO),
         )
-        .await;
-        drop(exit);
-        assert!(
-            matches!(result, Err(DiskCacheError::BudgetExceeded)),
-            "no room: it fails"
-        );
-        assert!(store.is_cached(&uri), "the file's entry stays");
-        store.assert_budget_consistent();
+        .await
     }
 
     /// An erased file's waiting download is cancelled: GC deletes the object next, and the local
