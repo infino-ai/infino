@@ -2914,6 +2914,11 @@ mod tests {
             options::Consistency,
             query::dispatch::open_reader,
             schema::LegacyNames,
+            slow_vector_state::{self, PendingDrainState},
+            writer::{
+                DRAIN_CHECKPOINT_SCHEMA, REPACK_CHECKPOINT_SCHEMA, split_overflow_cell,
+                stamp_slow_vector_state,
+            },
         },
         test_helpers::default_tokenizer,
     };
@@ -6105,53 +6110,42 @@ mod tests {
         );
     }
 
-    /// A stale repack upload pin in the slow-CAS pending state must not
-    /// brick the drain: the checkpoint loader recognizes the foreign schema
-    /// and ignores it (pre-fix this failed with a checkpoint decode error).
-    #[test]
-    fn drain_tolerates_foreign_repack_pin() {
-        use std::sync::Arc;
+    /// Vector width of the small vector tables below.
+    const SMALL_VECTOR_DIM: usize = 16;
+    /// Fixed rotation seed, so the small vector tables build the same way each run.
+    const SMALL_VECTOR_ROT_SEED: u64 = 7;
 
-        use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray};
-        use arrow_schema::{DataType, Field, Schema};
+    fn small_vector_item_field() -> Arc<Field> {
+        Arc::new(Field::new("item", DataType::Float32, true))
+    }
 
-        use crate::{
-            superfile::{
-                builder::{FtsConfig, VectorConfig},
-                vector::{distance::Metric, rerank_codec::RerankCodec},
-            },
-            supertable::{
-                slow_vector_state::PendingDrainState,
-                writer::{REPACK_CHECKPOINT_SCHEMA, stamp_slow_vector_state},
-            },
-        };
-
-        let dim = 16usize;
-        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
-        let schema = Arc::new(Schema::new(vec![
+    fn small_vector_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
             Field::new("title", DataType::LargeUtf8, false),
             Field::new(
                 "emb",
-                DataType::FixedSizeList(item_field.clone(), dim as i32),
+                DataType::FixedSizeList(small_vector_item_field(), SMALL_VECTOR_DIM as i32),
                 false,
             ),
-        ]));
+        ]))
+    }
+
+    /// Options for a small table with a `title` FTS column and an `emb`
+    /// vector column, stored in `storage`.
+    fn small_vector_options(storage: Arc<dyn StorageProvider>) -> SupertableOptions {
         let pool = Arc::new(
             rayon::ThreadPoolBuilder::new()
                 .num_threads(1)
                 .build()
                 .expect("pool"),
         );
-        let dir = TempDir::new().expect("tempdir");
-        let storage: Arc<dyn StorageProvider> =
-            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
-        let options = SupertableOptions::new(
-            schema.clone(),
+        SupertableOptions::new(
+            small_vector_schema(),
             vec![FtsConfig::new("title")],
             vec![VectorConfig {
                 column: "emb".into(),
-                dim,
-                rot_seed: 7,
+                dim: SMALL_VECTOR_DIM,
+                rot_seed: SMALL_VECTOR_ROT_SEED,
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Sq8Residual,
                 provided_centroids: None,
@@ -6159,15 +6153,22 @@ mod tests {
         )
         .expect("valid options")
         .with_storage(storage)
-        .with_writer_pool(pool);
-        let st = Supertable::create(options).expect("create");
+        .with_writer_pool(pool)
+    }
 
-        const N: usize = 4;
-        let titles = LargeStringArray::from((0..N).map(|i| format!("doc-{i}")).collect::<Vec<_>>());
-        let flat = Float32Array::from(vec![1.0f32; N * dim]);
-        let fsl = FixedSizeListArray::new(item_field.clone(), dim as i32, Arc::new(flat), None);
-        let batch = arrow_array::RecordBatch::try_new(
-            schema.clone(),
+    /// Append and commit `rows` rows that all carry the same vector.
+    fn append_small_vector_rows(st: &Supertable, rows: usize) {
+        let titles =
+            LargeStringArray::from((0..rows).map(|i| format!("doc-{i}")).collect::<Vec<_>>());
+        let flat = Float32Array::from(vec![1.0f32; rows * SMALL_VECTOR_DIM]);
+        let fsl = FixedSizeListArray::new(
+            small_vector_item_field(),
+            SMALL_VECTOR_DIM as i32,
+            Arc::new(flat),
+            None,
+        );
+        let batch = RecordBatch::try_new(
+            small_vector_schema(),
             vec![
                 Arc::new(titles) as Arc<dyn Array>,
                 Arc::new(fsl) as Arc<dyn Array>,
@@ -6177,6 +6178,19 @@ mod tests {
         let mut w = st.writer().expect("writer");
         w.append(&batch).expect("append");
         w.commit().expect("commit");
+    }
+
+    /// A stale repack upload pin in the slow-CAS pending state must not
+    /// brick the drain: the checkpoint loader recognizes the foreign schema
+    /// and ignores it (pre-fix this failed with a checkpoint decode error).
+    #[test]
+    fn drain_tolerates_foreign_repack_pin() {
+        const ROWS: usize = 4;
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let st = Supertable::create(small_vector_options(storage)).expect("create");
+        append_small_vector_rows(&st, ROWS);
 
         // Plant a foreign (repack-schema) pin, as an aborted repack would
         // leave behind.
@@ -6209,74 +6223,12 @@ mod tests {
     /// unconsumable by construction.
     #[test]
     fn split_pin_replaces_stale_drain_checkpoint() {
-        use std::sync::Arc;
-
-        use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray};
-        use arrow_schema::{DataType, Field, Schema};
-
-        use crate::{
-            superfile::{
-                builder::{FtsConfig, VectorConfig},
-                vector::{distance::Metric, rerank_codec::RerankCodec},
-            },
-            supertable::{
-                manifest::list::PartitionStrategy,
-                slow_vector_state::PendingDrainState,
-                writer::{DRAIN_CHECKPOINT_SCHEMA, split_overflow_cell, stamp_slow_vector_state},
-            },
-        };
-
-        let dim = 16usize;
-        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("title", DataType::LargeUtf8, false),
-            Field::new(
-                "emb",
-                DataType::FixedSizeList(item_field.clone(), dim as i32),
-                false,
-            ),
-        ]));
-        let pool = Arc::new(
-            rayon::ThreadPoolBuilder::new()
-                .num_threads(1)
-                .build()
-                .expect("pool"),
-        );
+        const ROWS: usize = 6;
         let dir = TempDir::new().expect("tempdir");
         let storage: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
-        let options = SupertableOptions::new(
-            schema.clone(),
-            vec![FtsConfig::new("title")],
-            vec![VectorConfig {
-                column: "emb".into(),
-                dim,
-                rot_seed: 7,
-                metric: Metric::Cosine,
-                rerank_codec: RerankCodec::Sq8Residual,
-                provided_centroids: None,
-            }],
-        )
-        .expect("valid options")
-        .with_storage(storage)
-        .with_writer_pool(pool);
-        let st = Supertable::create(options).expect("create");
-
-        const N: usize = 6;
-        let titles = LargeStringArray::from((0..N).map(|i| format!("doc-{i}")).collect::<Vec<_>>());
-        let flat = Float32Array::from(vec![1.0f32; N * dim]);
-        let fsl = FixedSizeListArray::new(item_field.clone(), dim as i32, Arc::new(flat), None);
-        let batch = arrow_array::RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(titles) as Arc<dyn Array>,
-                Arc::new(fsl) as Arc<dyn Array>,
-            ],
-        )
-        .expect("batch");
-        let mut w = st.writer().expect("writer");
-        w.append(&batch).expect("append");
-        w.commit().expect("commit");
+        let st = Supertable::create(small_vector_options(storage)).expect("create");
+        append_small_vector_rows(&st, ROWS);
         st.drain_vectors_to_cells_sync().expect("drain to cells");
 
         let hidden = st
@@ -6317,6 +6269,78 @@ mod tests {
             .block_on_query(split_overflow_cell(hidden.inner().clone(), split_cell, 0.0))
             .expect("split proceeds over the stale drain checkpoint");
         assert!(outcome.is_some(), "split must commit");
+    }
+
+    /// A long drain loads the hidden table's manifest once, at its start, and
+    /// stamps its checkpoint hours later. Any commit in between moves the
+    /// pointer past that view. The stamp must reload and publish, not fail
+    /// with write contention on its first try.
+    #[test]
+    fn slow_state_stamp_reloads_a_view_behind_the_pointer() {
+        const ROWS: usize = 4;
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let st = Supertable::create(small_vector_options(Arc::clone(&storage))).expect("create");
+        append_small_vector_rows(&st, ROWS);
+
+        // This handle's view of the hidden table is taken now and kept, as a
+        // drain keeps its view across its whole build.
+        let hidden = st.vector_index_table().expect("hidden index").clone();
+        let pin = |step: u32| PendingDrainState {
+            metadata: serde_json::to_vec(&serde_json::json!({ "step": step }))
+                .expect("pin metadata"),
+            entries: Vec::new(),
+        };
+
+        // Another process opens the table and stamps the same hidden table,
+        // moving its pointer.
+        let other = Supertable::open(small_vector_options(Arc::clone(&storage))).expect("open");
+        let other_hidden = other.vector_index_table().expect("hidden index").clone();
+        other_hidden
+            .block_on_query(stamp_slow_vector_state(
+                other_hidden.inner(),
+                false,
+                Some(pin(1)),
+            ))
+            .expect("the other stamp publishes");
+        let moved_to = other_hidden.inner().manifest.load_full().get_manifest_id();
+        assert!(
+            hidden.inner().manifest.load_full().get_manifest_id() < moved_to,
+            "precondition: this handle's view is behind the pointer"
+        );
+
+        hidden
+            .block_on_query(stamp_slow_vector_state(hidden.inner(), false, Some(pin(2))))
+            .expect("a view behind the pointer reloads and publishes");
+        assert!(
+            hidden.inner().manifest.load_full().get_manifest_id() > moved_to,
+            "the stamp published on top of the other stamp"
+        );
+        let manifest = hidden.inner().manifest.load_full();
+        let (uri, hash) = manifest
+            .slow_vector_state_blob()
+            .expect("hidden manifest carries a slow-state ref");
+        let hidden_storage = hidden
+            .inner()
+            .options
+            .storage
+            .clone()
+            .expect("hidden table has storage");
+        let state = hidden
+            .block_on_query(slow_vector_state::load_full_state(
+                hidden_storage.as_ref(),
+                None,
+                uri,
+                &hash,
+                &LegacyNames::none(),
+            ))
+            .expect("slow state loads");
+        assert_eq!(
+            state.pending_drain.expect("pin is kept").metadata,
+            pin(2).metadata,
+            "this stamp's pin is the one published"
+        );
     }
 
     /// Directly exercises the over-cap cell split (`split_overflow_cell`). The

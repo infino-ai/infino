@@ -13059,155 +13059,142 @@ pub(in crate::supertable) async fn stamp_slow_vector_state(
     let Some(storage) = inner.options.storage.clone() else {
         return Ok(());
     };
-    let max_retries = inner.options.max_commit_retries.max(1);
-    let mut next_id_floor: u64 = 0;
+    // A drain stamps its checkpoint long after it loaded this view, so the
+    // pointer has usually moved. Reload first, so the first attempt does not
+    // build and upload a state for a view the publish would refuse.
+    refresh_inner_state_async(inner, &storage)
+        .await
+        .map_err(BuildError::from)?;
     // Cache the built centroid-router ref across CAS retries, keyed by the
     // published centroid-section URI (a content hash over this membership +
     // centroids). Reuse it while that key is unchanged; if a retry reloads a
     // manifest whose membership moved, the key differs and the section is
     // rebuilt for the new membership. The inner `Option` is absent when the
     // router is off or a step failed.
-    let mut centroid_graph_ref: Option<(
-        String,
-        Option<crate::supertable::manifest::list::RoutingRef>,
-    )> = None;
-    for attempt in 0..max_retries {
-        let old = inner.manifest.load_full();
-        // A prior attempt found its id occupied by a crash-orphaned
-        // manifest list — derive this attempt's successor past it.
-        let old = if next_id_floor > 0 {
-            Arc::new(old.with_next_manifest_id_floor(next_id_floor))
-        } else {
-            old
-        };
-        let entries = old.get_all_superfiles();
-        if entries.is_empty() && pending_drain.is_none() {
-            // Nothing to describe (pre-drain / empty table): no routing blob
-            // or centroid section to stamp, and a never-drained table has no
-            // graph ref either.
-            return Ok(());
-        }
-        // Carried-forward entries are stripped (routing-shaped hydration);
-        // their fp32 composes from the previous generation's section.
-        let previous_section =
-            previous_centroid_section(&inner.options, storage.as_ref(), &old).await;
-        let published = match pending_drain.as_ref() {
-            Some(pending) => {
-                slow_vector_state::write_state_with_pending_drain(
-                    storage.as_ref(),
-                    inner.options.metadata_disk_cache.as_ref(),
-                    entries,
-                    pending,
-                    previous_section.as_deref(),
-                )
-                .await
-            }
-            None => {
-                slow_vector_state::write_state(
-                    storage.as_ref(),
-                    inner.options.metadata_disk_cache.as_ref(),
-                    entries,
-                    previous_section.as_deref(),
-                )
-                .await
-            }
-        }
-        .map_err(|e| BuildError::Store(e.to_string()))?;
-        // The `hnsw` graph is built and stamped ONLY in the membership commit
-        // (Commit A), atomically with `drained_ranges`. This settle carries the
-        // prior ref forward untouched and NEVER builds. The graph is
-        // packing-invariant (keyed by `stable_id`), so the prior ref is correct
-        // in every case that reaches here: a drain already rebuilt it in
-        // Commit A; a compaction / merge / split repacks the same id population,
-        // so the same graph still covers it; a legacy generation carries no ref
-        // and stays on ivf until its next drain rebuilds one.
-        //
-        // Building here would let the graph be stamped outside the membership
-        // commit — a lag between the watermark and the graph is a window where a
-        // just-drained row is invisible to both arms, the exact visibility gap
-        // the atomic-drain stamp closes.
-        let graphs_ref = old.resident_vector_index_blob().cloned();
-        // Build + publish the centroid-router section once for this settle. A
-        // membership commit CLEARED the ref (its node map indexes the visible
-        // superfile set), so a present ref means a prior no-op settle already
-        // covered THIS membership — reuse it; absent means build it now. Gated
-        // on the router being enabled and best-effort: a `None` just leaves the
-        // ref unstamped and queries reconstruct the router in memory.
-        let centroid_graph = match &centroid_graph_ref {
-            Some((key, resolved)) if *key == published.centroids.uri => resolved.clone(),
-            _ => {
-                let resolved = match old.slow_vector_state_centroid_graph_blob() {
-                    // A present ref means a prior no-op settle already built the
-                    // router for THIS membership — reuse it.
-                    Some(existing) => Some(existing.clone()),
-                    // Router-section build gated off (bulk-ingest drain-tail, or a
-                    // Skip-policy compaction): leave the ref unstamped, and queries
-                    // reconstruct the router in memory. A later Force/Auto settle
-                    // publishes it.
-                    None if !calibrate_fanout => None,
-                    None => {
-                        build_and_publish_centroid_router_section(
-                            inner,
+    let centroid_graph_ref: Mutex<Option<(String, Option<RoutingRef>)>> = Mutex::new(None);
+    stamp_within(
+        inner,
+        &storage,
+        "slow vector-state",
+        CommitRetryBudget::of_table(inner),
+        |old| {
+            let (storage, pending_drain, centroid_graph_ref) =
+                (&storage, &pending_drain, &centroid_graph_ref);
+            async move {
+                let entries = old.get_all_superfiles();
+                if entries.is_empty() && pending_drain.is_none() {
+                    // Nothing to describe (pre-drain / empty table): no routing
+                    // blob or centroid section to stamp, and a never-drained
+                    // table has no graph ref either.
+                    return Ok(None);
+                }
+                // Carried-forward entries are stripped (routing-shaped
+                // hydration); their fp32 composes from the previous
+                // generation's section.
+                let previous_section =
+                    previous_centroid_section(&inner.options, storage.as_ref(), &old).await;
+                let published = match pending_drain.as_ref() {
+                    Some(pending) => {
+                        slow_vector_state::write_state_with_pending_drain(
                             storage.as_ref(),
-                            &old,
+                            inner.options.metadata_disk_cache.as_ref(),
                             entries,
-                            &published.centroids,
+                            pending,
+                            previous_section.as_deref(),
                         )
                         .await
                     }
-                };
-                centroid_graph_ref = Some((published.centroids.uri.clone(), resolved.clone()));
-                resolved
-            }
-        };
-        // No-op only when NOTHING changed — routing blob, centroid section, the
-        // resolved graph ref, and the centroid-router section all already match.
-        // The router `fanout_for_k` is stamped by the compaction recalibration on
-        // its single ground-truth scan, not here.
-        if let Some((cur_uri, cur_hash)) = old.slow_vector_state_blob()
-            && cur_uri == published.uri
-            && cur_hash == published.content_hash
-            && old.slow_vector_state_centroids_blob() == Some(&published.centroids)
-            && old.resident_vector_index_blob() == graphs_ref.as_ref()
-            && old.slow_vector_state_centroid_graph_blob() == centroid_graph.as_ref()
-        {
-            return Ok(());
-        }
-        let new_manifest = old.with_slow_vector_state(
-            published.uri,
-            published.content_hash,
-            published.centroids,
-            graphs_ref,
-            centroid_graph,
-        );
-        let attempted_id = new_manifest.get_manifest_id();
-        let prev_etag = get_current_manifest_etag(&storage, Arc::clone(&old))
-            .await
-            .inspect_err(|e| inner.note_commit_error(e))
-            .map_err(BuildError::from)?;
-        match new_manifest
-            .write(storage.as_ref(), prev_etag.as_deref(), &[])
-            .await
-        {
-            Ok(()) => {
-                inner.note_superseded(&old, &new_manifest, &[]);
-                inner.manifest.store(Arc::new(new_manifest));
-                return Ok(());
-            }
-            Err(SupertableCommitError::WriteContentionExhausted) if attempt + 1 < max_retries => {
-                next_id_floor = next_id_floor.max(
-                    refresh_and_orphaned_id_floor(inner, &storage, attempted_id)
+                    None => {
+                        slow_vector_state::write_state(
+                            storage.as_ref(),
+                            inner.options.metadata_disk_cache.as_ref(),
+                            entries,
+                            previous_section.as_deref(),
+                        )
                         .await
-                        .map_err(|e| BuildError::Store(e.to_string()))?,
-                );
-                sleep(backoff_delay(attempt)).await;
+                    }
+                }
+                .map_err(|e| BuildError::Store(e.to_string()))?;
+                // The `hnsw` graph is built and stamped ONLY in the membership
+                // commit (Commit A), atomically with `drained_ranges`. This
+                // settle carries the prior ref forward untouched and NEVER
+                // builds. The graph is packing-invariant (keyed by
+                // `stable_id`), so the prior ref is correct in every case that
+                // reaches here: a drain already rebuilt it in Commit A; a
+                // compaction / merge / split repacks the same id population, so
+                // the same graph still covers it; a legacy generation carries
+                // no ref and stays on ivf until its next drain rebuilds one.
+                //
+                // Building here would let the graph be stamped outside the
+                // membership commit — a lag between the watermark and the graph
+                // is a window where a just-drained row is invisible to both
+                // arms, the exact visibility gap the atomic-drain stamp closes.
+                let graphs_ref = old.resident_vector_index_blob().cloned();
+                // Build + publish the centroid-router section once for this
+                // settle. A membership commit CLEARED the ref (its node map
+                // indexes the visible superfile set), so a present ref means a
+                // prior no-op settle already covered THIS membership — reuse
+                // it; absent means build it now. Gated on the router being
+                // enabled and best-effort: a `None` just leaves the ref
+                // unstamped and queries reconstruct the router in memory.
+                let cached = centroid_graph_ref
+                    .lock()
+                    .expect("centroid graph cache")
+                    .clone();
+                let centroid_graph = match cached {
+                    Some((key, resolved)) if key == published.centroids.uri => resolved,
+                    _ => {
+                        let resolved = match old.slow_vector_state_centroid_graph_blob() {
+                            // A present ref means a prior no-op settle already
+                            // built the router for THIS membership — reuse it.
+                            Some(existing) => Some(existing.clone()),
+                            // Router-section build gated off (bulk-ingest
+                            // drain-tail, or a Skip-policy compaction): leave
+                            // the ref unstamped, and queries reconstruct the
+                            // router in memory. A later Force/Auto settle
+                            // publishes it.
+                            None if !calibrate_fanout => None,
+                            None => {
+                                build_and_publish_centroid_router_section(
+                                    inner,
+                                    storage.as_ref(),
+                                    &old,
+                                    entries,
+                                    &published.centroids,
+                                )
+                                .await
+                            }
+                        };
+                        *centroid_graph_ref.lock().expect("centroid graph cache") =
+                            Some((published.centroids.uri.clone(), resolved.clone()));
+                        resolved
+                    }
+                };
+                // No-op only when NOTHING changed — routing blob, centroid
+                // section, the resolved graph ref, and the centroid-router
+                // section all already match. The router `fanout_for_k` is
+                // stamped by the compaction recalibration on its single
+                // ground-truth scan, not here.
+                if let Some((cur_uri, cur_hash)) = old.slow_vector_state_blob()
+                    && cur_uri == published.uri
+                    && cur_hash == published.content_hash
+                    && old.slow_vector_state_centroids_blob() == Some(&published.centroids)
+                    && old.resident_vector_index_blob() == graphs_ref.as_ref()
+                    && old.slow_vector_state_centroid_graph_blob() == centroid_graph.as_ref()
+                {
+                    return Ok(None);
+                }
+                Ok(Some(old.with_slow_vector_state(
+                    published.uri,
+                    published.content_hash,
+                    published.centroids,
+                    graphs_ref,
+                    centroid_graph,
+                )))
             }
-            Err(e) => return Err(BuildError::Store(e.to_string())),
-        }
-    }
-    Err(BuildError::Store(
-        "slow vector-state refresh: write contention exhausted".into(),
-    ))
+        },
+    )
+    .await
 }
 
 /// Best-effort lease hand-back after a mutation drive failed part-way.
