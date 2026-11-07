@@ -3082,7 +3082,10 @@ mod tests {
     use crate::{
         Bm25SearchOptions, CompactionSettings, InfinoError, OptimizeOptions, OptimizeSteps,
         storage::LocalFsStorageProvider,
-        superfile::fts::bm25,
+        superfile::{
+            SuperfileReader,
+            fts::{bm25, short::SHORT_MAX_DF},
+        },
         supertable::{
             Supertable,
             manifest::{
@@ -3091,7 +3094,11 @@ mod tests {
                 options_hash::compute_options_hash,
             },
             optimize::compact::max_merge_input_bytes,
-            query::prune::select_superfiles,
+            query::{
+                candidate::CandidatePlan,
+                fts::{IndexedSuperfile, plan_locations_for},
+                prune::select_superfiles,
+            },
             schema::{LegacyNames, TableSchema},
             writer::{TERM_INDEX_BATCH_SUPERFILES, stamp_with_retries},
         },
@@ -4330,21 +4337,28 @@ mod tests {
         table_with(|o| o)
     }
 
-    /// Commit one layer: every title holds `shared`; layer `s` holds
-    /// `alpha` in the titles whose index is a multiple of `s + 2`. Returns
-    /// the layer's `alpha` count.
-    fn commit_layer(st: &crate::supertable::Supertable, layer: usize) -> u64 {
-        use arrow_array::{ArrayRef, LargeStringArray, RecordBatch};
-        let titles: Vec<String> = (0..DOCS_PER_LAYER)
+    /// `docs` titles for one layer, e.g. `alpha shared s0d000`,
+    /// `beta shared s0d001`. Every `layer + 2`-th title holds `alpha`.
+    fn layer_titles(layer: usize, docs: usize) -> Vec<String> {
+        let width = (docs - 1).to_string().len();
+        (0..docs)
             .map(|i| {
                 let topic = if i % (layer + 2) == 0 {
                     "alpha"
                 } else {
                     "beta"
                 };
-                format!("{topic} shared s{layer}d{i:02}")
+                format!("{topic} shared s{layer}d{i:0width$}")
             })
-            .collect();
+            .collect()
+    }
+
+    /// Commit one layer: every title holds `shared`; layer `s` holds
+    /// `alpha` in the titles whose index is a multiple of `s + 2`. Returns
+    /// the layer's `alpha` count.
+    fn commit_layer(st: &crate::supertable::Supertable, layer: usize) -> u64 {
+        use arrow_array::{ArrayRef, LargeStringArray, RecordBatch};
+        let titles = layer_titles(layer, DOCS_PER_LAYER);
         let alpha = titles.iter().filter(|t| t.starts_with("alpha")).count() as u64;
         let arr: ArrayRef = Arc::new(LargeStringArray::from(
             titles.iter().map(String::as_str).collect::<Vec<_>>(),
@@ -6959,6 +6973,119 @@ mod tests {
             total_rows += plain.map_or(0, |b| b.len());
         }
         assert!(total_rows > 0, "the fixture matches the plan");
+    }
+
+    /// Docs per superfile in the estimate test: 3x the short-posting limit,
+    /// so common words like `shared` are stored in the long (PFOR) form.
+    const WIDE_DOCS_PER_LAYER: usize = 3 * SHORT_MAX_DF;
+
+    /// Commit one layer of [`WIDE_DOCS_PER_LAYER`] titles. `shared` is stored
+    /// long, `alpha` short in layers 1 and 2, each `s{layer}d{i}` inline.
+    fn commit_wide_layer(st: &Supertable, layer: usize) {
+        commit_titles(st, &layer_titles(layer, WIDE_DOCS_PER_LAYER));
+    }
+
+    #[test]
+    fn the_estimate_reads_no_superfile_for_terms_the_index_located() {
+        // Three indexed layers, plus one from a writer with the index off.
+        //  - an indexed superfile takes each word's `df` from the index and
+        //    reads nothing.
+        //  - the unindexed superfile reads its dictionary as before.
+        //  - a word the index was never asked about also reads the dictionary.
+        // This test pins that both paths give the same estimate, for every
+        // posting form.
+        let (dir, storage, st) = fresh_table();
+        for layer in 0..LAYERS {
+            commit_wide_layer(&st, layer);
+        }
+        drop(st);
+        let peer = Supertable::open(fresh_options(&storage).with_term_index(false)).expect("peer");
+        commit_wide_layer(&peer, LAYERS);
+        drop(peer);
+        let st = Supertable::open(fresh_options(&storage)).expect("reopen");
+
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let reader = st.reader().expect("reader");
+        let manifest = reader.manifest();
+        let entries = manifest.get_all_superfiles().to_vec();
+        let index = rt
+            .block_on(manifest.term_index())
+            .expect("index")
+            .expect("the table keeps an index");
+        // What `title IN (...)` becomes (an OR of one AND per title), plus a
+        // plain OR of single words.
+        let title = |tokens: &[&str]| CandidatePlan::TermsAll {
+            column: "title".into(),
+            tokens: tokens.iter().map(|t| (*t).to_owned()).collect(),
+        };
+        let plan = CandidatePlan::And(vec![
+            CandidatePlan::Or(vec![
+                title(&["alpha", "shared", "s0d000"]),
+                title(&["beta", "shared", "s1d003"]),
+                title(&["alpha", "absent"]),
+            ]),
+            CandidatePlan::TermsAny {
+                column: "title".into(),
+                terms: vec!["shared".into(), "s2d004".into(), "absent".into()],
+            },
+        ]);
+        let locations = rt
+            .block_on(plan_locations_for(manifest, &plan, &entries))
+            .expect("locations");
+        // The fixture holds all three posting forms.
+        let located = rt
+            .block_on(index.locations(title_id(), &["alpha", "beta", "s0d000"], &entries))
+            .expect("located");
+        let forms = located.values().flatten().map(|(_, _, l)| l);
+        let forms: Vec<&Location> = forms.collect();
+        assert!(forms.iter().any(|l| matches!(l, Location::Pfor { .. })));
+        assert!(forms.iter().any(|l| matches!(l, Location::Short { .. })));
+        assert!(forms.iter().any(|l| matches!(l, Location::Inline { .. })));
+        // `s0d001` is not in `plan`, so the index was never asked about it.
+        let unasked = title(&["alpha", "s0d001"]);
+        let (mut matched, mut unindexed) = (0u64, 0usize);
+        for e in &entries {
+            let bytes = fs::read(dir.path().join(e.uri.storage_path())).expect("superfile bytes");
+            let sf = SuperfileReader::open(Bytes::from(bytes)).expect("open");
+            let located = Some(IndexedSuperfile {
+                locations: &locations,
+                superfile: e.superfile_id,
+            });
+            let estimate = |plan: &CandidatePlan, located| {
+                rt.block_on(plan.estimate(&sf, None, located))
+                    .expect("estimate")
+            };
+            let (from_dict, dict_work) = estimate(&plan, None);
+            let (from_index, index_work) = estimate(&plan, located);
+            assert_eq!(
+                from_index, from_dict,
+                "the index gives the dictionary's estimate"
+            );
+            assert!(dict_work.planned_ranges > 0, "the dictionary path reads");
+            match index.is_indexed(&e.superfile_id) {
+                true => assert_eq!(
+                    (index_work.planned_ranges, index_work.postings_bytes),
+                    (0, 0),
+                    "every leaf answered from the index, nothing read"
+                ),
+                false => {
+                    unindexed += 1;
+                    assert_eq!(
+                        index_work.planned_ranges, dict_work.planned_ranges,
+                        "an unlisted superfile reads its dictionary as before"
+                    );
+                }
+            }
+            let (fallback, fallback_work) = estimate(&unasked, located);
+            assert_eq!(fallback, estimate(&unasked, None).0);
+            assert!(
+                fallback_work.planned_ranges > 0,
+                "an unasked term reads the dictionary"
+            );
+            matched += from_dict;
+        }
+        assert_eq!(unindexed, 1, "the peer's superfile is not indexed");
+        assert!(matched > 0, "the fixture holds the plan's terms");
     }
 
     /// A term in every one of many superfiles keeps a location in each:

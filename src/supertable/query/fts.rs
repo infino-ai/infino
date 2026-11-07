@@ -665,9 +665,70 @@ impl SharedTopK {
 /// superfile's entry is known absent there. `by_superfile` is empty when
 /// the table has no index, or it could not answer, in which case every
 /// cursor build reads its superfile's dictionary as before.
+///
+/// `terms` and each superfile's entries are sorted, for [`HeldTerms`]'
+/// binary search.
 pub(crate) struct LocatedTerms {
     terms: Vec<String>,
     by_superfile: HashMap<Uuid, Arc<Vec<(String, u64, term_index::Location)>>>,
+}
+
+impl LocatedTerms {
+    /// What the index lists for `superfile`, or `None` if it lists nothing
+    /// there. `None` does not mean the terms are absent: the superfile may
+    /// not be indexed yet, so the caller reads its dictionary.
+    pub(crate) fn held(&self, superfile: Uuid) -> Option<HeldTerms<'_>> {
+        Some(HeldTerms {
+            asked: &self.terms,
+            held: self.by_superfile.get(&superfile)?,
+        })
+    }
+}
+
+/// The asked terms, and those of them one listed superfile holds. An asked
+/// term it does not hold is absent there; a term never asked is unknown.
+pub(crate) struct HeldTerms<'a> {
+    asked: &'a [String],
+    held: &'a [(String, u64, term_index::Location)],
+}
+
+impl<'a> HeldTerms<'a> {
+    /// The index's entry for `term`, when the superfile holds it.
+    fn entry(&self, term: &str) -> Option<&'a (String, u64, term_index::Location)> {
+        let held = self.held;
+        held.binary_search_by(|(t, _, _)| t.as_str().cmp(term))
+            .ok()
+            .map(|i| &held[i])
+    }
+
+    /// The `df` of `term` here, the same number the superfile's dictionary
+    /// holds. `0` if asked but not held, `None` if never asked.
+    pub(crate) fn df(&self, term: &str) -> Option<u64> {
+        match self.entry(term) {
+            Some((_, df, _)) => Some(*df),
+            None => self
+                .asked
+                .binary_search_by(|asked| asked.as_str().cmp(term))
+                .ok()
+                .map(|_| 0),
+        }
+    }
+}
+
+/// A superfile plus the query's [`PlanLocations`], so an estimate can ask
+/// the index about any column.
+#[derive(Clone, Copy)]
+pub(crate) struct IndexedSuperfile<'a> {
+    pub(crate) locations: &'a PlanLocations,
+    pub(crate) superfile: Uuid,
+}
+
+impl<'a> IndexedSuperfile<'a> {
+    /// [`LocatedTerms::held`] for `column`. Also `None` when the index was
+    /// not asked about `column`.
+    pub(crate) fn held(self, column: &str) -> Option<HeldTerms<'a>> {
+        self.locations.get(column)?.held(self.superfile)
+    }
 }
 
 /// Shared handle to one query's [`LocatedTerms`].
@@ -687,13 +748,22 @@ pub(crate) async fn index_locations_for(
     terms: &[&str],
     kept: &[Arc<SuperfileEntry>],
 ) -> Result<IndexLocations, QueryError> {
-    let owned: Vec<String> = terms.iter().map(|t| (*t).to_owned()).collect();
+    let mut owned: Vec<String> = terms.iter().map(|t| (*t).to_owned()).collect();
+    owned.sort_unstable();
+    owned.dedup();
+    let sorted: Vec<&str> = owned.iter().map(String::as_str).collect();
     let by_superfile = match (manifest.field_id(column), manifest.term_index().await?) {
         (Some(column), Some(index)) => index
-            .locations(column, terms, kept)
+            .locations(column, &sorted, kept)
             .await?
             .into_iter()
-            .map(|(k, v)| (k, Arc::new(v)))
+            .map(|(k, mut v)| {
+                // Sort for `HeldTerms`' binary search. Already sorted today,
+                // so this is one cheap pass; it keeps lookups right if that
+                // ever changes.
+                v.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                (k, Arc::new(v))
+            })
             .collect(),
         _ => HashMap::new(),
     };
@@ -748,15 +818,15 @@ pub(crate) async fn memo_from_locations(
     locations: &IndexLocations,
     superfile: Uuid,
 ) -> Option<Arc<FetchedTermMemo>> {
-    let located = locations.by_superfile.get(&superfile)?;
+    let located = locations.held(superfile)?;
     let pairs: Vec<(&str, u64, DictEntry)> = located
+        .held
         .iter()
         .filter_map(|(t, df, loc)| loc.to_dict_value().map(|v| (t.as_str(), *df, v)))
         .collect();
     let mut memo = r.term_memo_from_dict_values(&pairs).await.ok()?;
-    let present: HashSet<&str> = located.iter().map(|(t, _, _)| t.as_str()).collect();
-    for term in &locations.terms {
-        if !present.contains(term.as_str()) {
+    for term in located.asked {
+        if located.entry(term).is_none() {
             memo.note_absent(term);
         }
     }
@@ -4455,8 +4525,8 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        BoolMode, FanOut, SharedTopK, SuperfileHit, SupertableReader, build_work_units,
-        ceilings_at_table_avgdl, fanout_for,
+        BoolMode, FanOut, LocatedTerms, SharedTopK, SuperfileHit, SupertableReader,
+        build_work_units, ceilings_at_table_avgdl, fanout_for,
     };
     use crate::{
         config::{CompactionSettings, OptimizeOptions},
@@ -4479,6 +4549,7 @@ mod tests {
                 commit::{MANIFEST_PARTS_DIR, part_uri, read_pointer},
                 list,
                 part::{self, ContentHash},
+                term_index::Location,
             },
             schema::{DECIMAL128_PRECISION, DECIMAL128_SCALE, FieldId},
         },
@@ -7741,5 +7812,33 @@ mod tests {
                 "idf of `{t}` from the index equals the dictionaries' sum"
             );
         }
+    }
+
+    #[test]
+    fn located_terms_answer_dfs_only_for_asked_terms_in_listed_superfiles() {
+        // Asked `absent`, `alpha`, `beta`; superfile 1 holds `alpha`, `beta`.
+        //  - a held term gives its `df`.
+        //  - an asked term not held gives 0.
+        //  - a term never asked (`gamma`) gives `None`.
+        //  - an unlisted superfile gives `None`.
+        // This test pins when the estimate may skip reading the superfile.
+        let listed = Uuid::from_u128(1);
+        let located = LocatedTerms {
+            terms: vec!["absent".into(), "alpha".into(), "beta".into()],
+            by_superfile: HashMap::from([(
+                listed,
+                Arc::new(vec![
+                    ("alpha".to_owned(), 7, Location::None),
+                    ("beta".to_owned(), 3, Location::None),
+                ]),
+            )]),
+        };
+        let held = located.held(listed).expect("a listed superfile");
+        let dfs: Vec<Option<u64>> = ["beta", "absent", "alpha", "gamma"]
+            .iter()
+            .map(|t| held.df(t))
+            .collect();
+        assert_eq!(dfs, vec![Some(3), Some(0), Some(7), None]);
+        assert!(located.held(Uuid::from_u128(2)).is_none());
     }
 }
