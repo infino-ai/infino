@@ -55,7 +55,9 @@ use serde::{
 
 use crate::{
     runtime_metrics::rss::available_memory_bytes,
-    supertable::reader_cache::config::DEFAULT_PROMOTION_DEFER_TIMEOUT,
+    supertable::reader_cache::config::{
+        DEFAULT_COLD_FETCH_CHUNK_BYTES, DEFAULT_PROMOTION_DEFER_TIMEOUT,
+    },
 };
 
 /// Embedded baseline. Compiled in via `include_str!`.
@@ -1651,8 +1653,6 @@ const DEFAULT_DISK_BUDGET_BYTES: u64 = 10 * (1 << 30);
 const DEFAULT_MANIFEST_DISK_BUDGET_BYTES: u64 = 2 * (1 << 30);
 /// Default parallel cold-fetch streams at the config layer.
 const DEFAULT_COLD_FETCH_STREAMS: usize = 8;
-/// Default cold-fetch range chunk size (4 MiB).
-const DEFAULT_COLD_FETCH_CHUNK_BYTES: u64 = 4 * (1 << 20);
 /// Default concurrent background full-superfile fills.
 pub(crate) const DEFAULT_PREFETCH_CONCURRENCY: usize = 8;
 /// Default idle age (seconds) before an mmap is swept.
@@ -2078,6 +2078,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::supertable::reader_cache::DiskCacheConfig;
 
     /// Serialize tests that mutate process-global env so they don't
     /// race. `unsafe { std::env::set_var }` requires this in the 2024
@@ -2606,6 +2607,20 @@ supertable:
         assert_eq!(
             c.max_merge_input_mb, DEFAULT_COMPACTION_MAX_MERGE_INPUT_MB,
             "target + 2048"
+        );
+    }
+
+    #[test]
+    fn cold_fetch_chunk_default_matches_the_reader_cache() {
+        // A config built from defaults, through the shipped YAML or the
+        // Rust `Default`, must download whole files in the chunk size the
+        // reader cache was tuned for, not a smaller one.
+        let cache_default = DiskCacheConfig::default().cold_fetch_chunk_bytes;
+        let cfg = Config::defaults().expect("embedded default must parse");
+        assert_eq!(cfg.storage.cold_fetch_chunk_bytes, cache_default);
+        assert_eq!(
+            StorageSettings::default().cold_fetch_chunk_bytes,
+            cache_default
         );
     }
 
