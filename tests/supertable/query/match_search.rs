@@ -25,6 +25,7 @@ use std::{collections::HashSet, sync::Arc};
 
 use arrow_array::{ArrayRef, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
+use datafusion::prelude::{col, lit};
 use infino::{
     Bm25SearchOptions, Stemmer,
     storage::{LocalFsStorageProvider, StorageProvider},
@@ -36,7 +37,10 @@ use infino::{
             vector::{VectorFilter, VectorSearchOptions},
         },
     },
-    test_helpers::default_vector_config,
+    test_helpers::{
+        check_hits_probe::{self, Outcome},
+        default_vector_config,
+    },
 };
 use rand::{RngExt, SeedableRng, rngs::StdRng};
 use tempfile::TempDir;
@@ -207,26 +211,31 @@ fn drained_table_in_commits(
     );
     let per_commit = titles.len().div_ceil(commits);
     for (titles, flat) in titles.chunks(per_commit).zip(flat.chunks(per_commit * DIM)) {
-        let fsl = FixedSizeListArray::try_new(
-            Arc::new(Field::new("item", DataType::Float32, true)),
-            DIM as i32,
-            Arc::new(Float32Array::from(flat.to_vec())) as ArrayRef,
-            None,
-        )
-        .expect("FSL");
-        let title_arr =
-            LargeStringArray::from(titles.iter().map(String::as_str).collect::<Vec<_>>());
-        let batch = RecordBatch::try_new(
-            st.options().schema.clone(),
-            vec![Arc::new(title_arr), Arc::new(fsl)],
-        )
-        .expect("batch");
-        let mut w = st.writer().expect("writer");
-        w.append(&batch).expect("append");
-        w.commit().expect("commit");
+        commit_rows(&st, titles, flat);
     }
     st.drain_vectors_to_cells_sync().expect("drain");
     (dir, st)
+}
+
+/// Append `titles` and their `DIM`-wide vectors (`flat`) to `st` in one
+/// commit, without draining them.
+fn commit_rows(st: &Supertable, titles: &[String], flat: &[f32]) {
+    let fsl = FixedSizeListArray::try_new(
+        Arc::new(Field::new("item", DataType::Float32, true)),
+        DIM as i32,
+        Arc::new(Float32Array::from(flat.to_vec())) as ArrayRef,
+        None,
+    )
+    .expect("FSL");
+    let title_arr = LargeStringArray::from(titles.iter().map(String::as_str).collect::<Vec<_>>());
+    let batch = RecordBatch::try_new(
+        st.options().schema.clone(),
+        vec![Arc::new(title_arr), Arc::new(fsl)],
+    )
+    .expect("batch");
+    let mut w = st.writer().expect("writer");
+    w.append(&batch).expect("append");
+    w.commit().expect("commit");
 }
 
 /// The unranked `count` surface agrees with `token_match`'s cardinality
@@ -1146,6 +1155,9 @@ const SPREAD_CELLS: usize = 128;
 const SPREAD_SEED: u64 = 1168;
 /// Requested top-k for the spread-filter tests, well below the matches.
 const SPREAD_K: usize = 10;
+/// Noise around each group center for the tight-group tests: small enough
+/// that a group sits in few cells.
+const TIGHT_NOISE: f32 = 0.05;
 
 /// Random group centers for the spread-filter tests.
 fn spread_centers(rng: &mut StdRng) -> Vec<Vec<f32>> {
@@ -1244,4 +1256,358 @@ fn filtered_knn_after_drain_maps_kept_rows_from_every_user_superfile() {
         "fixture: each commit writes its own user superfiles, got {user_superfiles}"
     );
     assert_filtered_top_k_is_best(&st, &query, SPREAD_K);
+}
+
+/// The spread tests' tight groups, as `(centers, rows)`.
+fn tight_spread_rows() -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
+    let mut rng = StdRng::seed_from_u64(SPREAD_SEED);
+    let centers = spread_centers(&mut rng);
+    let rows = grouped_rows(&mut rng, &centers, SPREAD_ROWS_PER_GROUP, TIGHT_NOISE);
+    (centers, rows)
+}
+
+/// How many of `rows` the filter `is_match` keeps.
+fn kept_rows(rows: &[Vec<f32>], is_match: impl Fn(usize) -> bool) -> u64 {
+    (0..rows.len()).filter(|&i| is_match(i)).count() as u64
+}
+
+/// The filter of the broad-filter tests: three rows in four of every group.
+fn three_in_four(i: usize) -> bool {
+    !i.is_multiple_of(4)
+}
+
+/// DRAINED table, a filter that keeps three rows in four of every group.
+/// The search checks its hits against the filter instead of mapping the
+/// kept rows into the index, and still returns the exact top k.
+#[test]
+fn broad_filter_after_drain_checks_hits_and_keeps_the_exact_top_k() {
+    let (centers, rows) = tight_spread_rows();
+    let query = centers[0].clone();
+    let titles = needle_titles(&rows, three_in_four, &query, SPREAD_K);
+    let (_dir, st) = drained_table(SPREAD_CELLS, &titles, rows.concat());
+    assert_filtered_top_k_is_best(&st, &query, SPREAD_K);
+    let kept = kept_rows(&rows, three_in_four);
+    let outcomes = check_hits_probe::outcomes(kept);
+    assert!(
+        outcomes.contains(&Outcome::Checked) && !outcomes.contains(&Outcome::GaveUp),
+        "a filter keeping {kept} of {} rows must be served by checking hits, got {outcomes:?}",
+        rows.len()
+    );
+}
+
+/// DRAINED table, a filter that keeps one row in eight: too narrow for
+/// checking, so its rows are mapped into the index as before.
+#[test]
+fn narrow_filter_after_drain_maps_kept_rows() {
+    /// One row in this many matches.
+    const MATCH_EVERY: usize = 8;
+
+    let (centers, rows) = tight_spread_rows();
+    let query = centers[0].clone();
+    let is_match = |i: usize| i.is_multiple_of(MATCH_EVERY);
+    let titles = needle_titles(&rows, is_match, &query, SPREAD_K);
+    let (_dir, st) = drained_table(SPREAD_CELLS, &titles, rows.concat());
+    assert_filtered_top_k_is_best(&st, &query, SPREAD_K);
+    let kept = kept_rows(&rows, is_match);
+    let outcomes = check_hits_probe::outcomes(kept);
+    assert!(
+        outcomes.contains(&Outcome::Narrow) && !outcomes.contains(&Outcome::Checked),
+        "a filter keeping {kept} of {} rows must map its rows, got {outcomes:?}",
+        rows.len()
+    );
+}
+
+/// A broad filter that leaves out the query's own group, so the hits near
+/// the query fail the filter far more often than its share predicts.
+/// Checking gives up and the kept rows are mapped, so the result is the
+/// mapped path's: k rows, every one kept by the filter. (Not asserted to be
+/// the exact top k: with the query's group gone, the nearest kept group can
+/// sit in a cell the routed search does not read, on either path.)
+#[test]
+fn filter_tied_to_the_query_after_drain_gives_up_checking() {
+    let (centers, rows) = tight_spread_rows();
+    let query = centers[0].clone();
+    let is_match = |i: usize| i >= SPREAD_ROWS_PER_GROUP;
+    let titles: Vec<String> = (0..rows.len())
+        .map(|i| match is_match(i) {
+            true => format!("doc {i} needle"),
+            false => format!("doc {i}"),
+        })
+        .collect();
+    let (_dir, st) = drained_table(SPREAD_CELLS, &titles, rows.concat());
+    let reader = st.reader().expect("reader");
+    let hits = reader
+        .vector_hits(
+            "emb",
+            &query,
+            SPREAD_K,
+            VectorSearchOptions::new(),
+            Some(VectorFilter {
+                column: "title",
+                query: "needle",
+                mode: BoolMode::Or,
+            }),
+        )
+        .expect("filtered vector search");
+    let kept = stable_ids(
+        &reader
+            .token_match("title", "needle", BoolMode::Or)
+            .expect("token_match needle"),
+    );
+    assert_eq!(hits.len(), SPREAD_K, "k rows must return");
+    assert!(
+        stable_ids(&hits).is_subset(&kept),
+        "every row returned must be one the filter kept"
+    );
+    let outcomes = check_hits_probe::outcomes(kept_rows(&rows, is_match));
+    assert!(
+        outcomes.contains(&Outcome::GaveUp) && !outcomes.contains(&Outcome::Checked),
+        "the query's own group fails the filter, so checking must give up, got {outcomes:?}"
+    );
+}
+
+/// A broad filter after its nearest kept row is deleted. The index still
+/// holds the deleted row's vector, so it is the search's first hit; the
+/// check must drop it and return the next k kept rows.
+#[test]
+fn broad_filter_after_drain_drops_a_deleted_hit() {
+    let (centers, rows) = tight_spread_rows();
+    let query = centers[0].clone();
+    // Tag one more than k, so k remain after the delete.
+    let titles = needle_titles(&rows, three_in_four, &query, SPREAD_K + 1);
+    let nearest = (0..rows.len())
+        .filter(|&i| three_in_four(i))
+        .max_by(|&a, &b| cosine(&rows[a], &query).total_cmp(&cosine(&rows[b], &query)))
+        .expect("fixture: rows match");
+    let (_dir, st) = drained_table(SPREAD_CELLS, &titles, rows.concat());
+    let deleted = st
+        .delete(col("title").eq(lit(titles[nearest].clone())))
+        .expect("delete");
+    assert_eq!(deleted.n_tombstoned(), 1, "fixture: one row deleted");
+    assert_filtered_top_k_is_best(&st, &query, SPREAD_K);
+    // One fewer than the other broad test keeps, so the two never share a
+    // probe key.
+    let outcomes = check_hits_probe::outcomes(kept_rows(&rows, three_in_four) - 1);
+    assert!(
+        outcomes.contains(&Outcome::Checked),
+        "the broad filter must still be served by checking hits, got {outcomes:?}"
+    );
+}
+
+/// A table so small that the filter keeps fewer rows than k: checking can
+/// never find k passing hits, so the kept rows are mapped without a round of
+/// checking, and every kept row returns.
+#[test]
+fn broad_filter_keeping_fewer_rows_than_k_returns_every_kept_row() {
+    /// Rows in the table.
+    const ROWS: usize = 21;
+    /// One row in three is left out of the filter.
+    const SKIP_EVERY: usize = 3;
+    /// Asked for more than the filter keeps.
+    const K: usize = 20;
+    /// Hidden index cells for a table this small.
+    const CELLS: usize = 4;
+
+    let mut rng = StdRng::seed_from_u64(SPREAD_SEED);
+    let centers = spread_centers(&mut rng);
+    let rows = grouped_rows(&mut rng, &centers[..1], ROWS, TIGHT_NOISE);
+    let is_match = |i: usize| !i.is_multiple_of(SKIP_EVERY);
+    let kept = (0..ROWS).filter(|&i| is_match(i)).count();
+    let query = centers[0].clone();
+    let titles = needle_titles(&rows, is_match, &query, kept);
+    let (_dir, st) = drained_table(CELLS, &titles, rows.concat());
+    let reader = st.reader().expect("reader");
+    let hits = reader
+        .vector_hits(
+            "emb",
+            &query,
+            K,
+            VectorSearchOptions::new(),
+            Some(VectorFilter {
+                column: "title",
+                query: "needle",
+                mode: BoolMode::Or,
+            }),
+        )
+        .expect("filtered vector search");
+    let every_kept = stable_ids(
+        &reader
+            .token_match("title", "needle", BoolMode::Or)
+            .expect("token_match needle"),
+    );
+    assert_eq!(every_kept.len(), kept, "fixture: kept rows");
+    assert_eq!(stable_ids(&hits), every_kept, "every kept row must return");
+    let outcomes = check_hits_probe::outcomes(kept as u64);
+    assert!(
+        outcomes.contains(&Outcome::Narrow) && !outcomes.contains(&Outcome::GaveUp),
+        "checking cannot fill k = {K} from {kept} kept rows, so it must not run, got {outcomes:?}"
+    );
+}
+
+/// The filtered search for `needle` with `options`, and every row the
+/// filter keeps.
+fn needle_search(
+    st: &Supertable,
+    query: &[f32],
+    k: usize,
+    options: VectorSearchOptions,
+) -> (Vec<SuperfileHit>, HashSet<i128>) {
+    let reader = st.reader().expect("reader");
+    let hits = reader
+        .vector_hits(
+            "emb",
+            query,
+            k,
+            options,
+            Some(VectorFilter {
+                column: "title",
+                query: "needle",
+                mode: BoolMode::Or,
+            }),
+        )
+        .expect("filtered vector search");
+    let kept = stable_ids(
+        &reader
+            .token_match("title", "needle", BoolMode::Or)
+            .expect("token_match needle"),
+    );
+    (hits, kept)
+}
+
+/// A broad filter that leaves out the query's own group, asked for more
+/// rows than that group holds: the hits run past the group into kept ones,
+/// so the pass rate alone looks healthy. But the left-out group's cells give
+/// many hits and no pass, so they hold no kept row; the filtered search
+/// would not read them. Checking gives up and the kept rows are mapped.
+#[test]
+fn broad_filter_with_an_empty_cell_near_the_query_gives_up_checking() {
+    /// More than one group's rows, so the hits reach a kept group.
+    const K: usize = 40;
+
+    let (centers, rows) = tight_spread_rows();
+    let query = centers[0].clone();
+    // Every group but the first, less one row so this filter keeps a row
+    // count no other test keeps.
+    let is_match = |i: usize| i > SPREAD_ROWS_PER_GROUP;
+    let titles: Vec<String> = (0..rows.len())
+        .map(|i| match is_match(i) {
+            true => format!("doc {i} needle"),
+            false => format!("doc {i}"),
+        })
+        .collect();
+    let (_dir, st) = drained_table(SPREAD_CELLS, &titles, rows.concat());
+    let (hits, kept) = needle_search(&st, &query, K, VectorSearchOptions::new());
+    assert_eq!(hits.len(), K, "k rows must return");
+    assert!(
+        stable_ids(&hits).is_subset(&kept),
+        "every row returned must be one the filter kept"
+    );
+    let outcomes = check_hits_probe::outcomes(kept_rows(&rows, is_match));
+    assert!(
+        outcomes.contains(&Outcome::GaveUp) && !outcomes.contains(&Outcome::Checked),
+        "the query's own cells hold no kept row, so checking must give up, got {outcomes:?}"
+    );
+}
+
+/// DRAINED table from two commits and a broad filter: the check places each
+/// hit in whichever user superfile holds its row, so kept rows from both
+/// commits pass, and the exact top k returns.
+#[test]
+fn broad_filter_after_drain_checks_hits_from_every_user_superfile() {
+    /// Two rows in three match: a share no other broad test keeps.
+    fn two_in_three(i: usize) -> bool {
+        !i.is_multiple_of(3)
+    }
+    const COMMITS: usize = 2;
+
+    let (centers, rows) = tight_spread_rows();
+    let query = centers[0].clone();
+    let titles = needle_titles(&rows, two_in_three, &query, SPREAD_K);
+    let (_dir, st) = drained_table_in_commits(SPREAD_CELLS, &titles, rows.concat(), COMMITS);
+    let user_superfiles = st.reader().expect("reader").manifest().superfiles.len();
+    assert!(
+        user_superfiles >= COMMITS,
+        "fixture: each commit writes its own user superfiles, got {user_superfiles}"
+    );
+    assert_filtered_top_k_is_best(&st, &query, SPREAD_K);
+    let outcomes = check_hits_probe::outcomes(kept_rows(&rows, two_in_three));
+    assert!(
+        outcomes.contains(&Outcome::Checked) && !outcomes.contains(&Outcome::GaveUp),
+        "the broad filter must be served by checking hits, got {outcomes:?}"
+    );
+}
+
+/// DRAINED table plus an undrained tail whose rows sit nearest the query.
+/// The drained rows are checked, the tail is searched on the user table, and
+/// the merged top k holds the nearest kept rows of both.
+#[test]
+fn broad_filter_checks_drained_hits_and_merges_the_undrained_tail() {
+    /// Four rows in five match: a share no other broad test keeps.
+    fn four_in_five(i: usize) -> bool {
+        !i.is_multiple_of(5)
+    }
+    /// Tail rows, appended after the drain.
+    const TAIL_ROWS: usize = 8;
+    /// Tail rows sit this close to the query, nearer than any drained row.
+    const TAIL_NOISE: f32 = 0.01;
+
+    let (centers, mut rows) = tight_spread_rows();
+    let drained_rows = rows.len();
+    let mut rng = StdRng::seed_from_u64(SPREAD_SEED + 1);
+    rows.extend(grouped_rows(&mut rng, &centers[..1], TAIL_ROWS, TAIL_NOISE));
+    let query = centers[0].clone();
+    let titles = needle_titles(&rows, four_in_five, &query, SPREAD_K);
+    let (_dir, st) = drained_table(
+        SPREAD_CELLS,
+        &titles[..drained_rows],
+        rows[..drained_rows].concat(),
+    );
+    commit_rows(&st, &titles[drained_rows..], &rows[drained_rows..].concat());
+    let tail_best = (drained_rows..rows.len())
+        .filter(|&i| titles[i].ends_with(" best"))
+        .count();
+    assert!(
+        tail_best > 0 && tail_best < SPREAD_K,
+        "fixture: the top k mixes tail and drained rows, got {tail_best} from the tail"
+    );
+    assert_filtered_top_k_is_best(&st, &query, SPREAD_K);
+    let drained_kept = kept_rows(&rows[..drained_rows], four_in_five);
+    let outcomes = check_hits_probe::outcomes(drained_kept);
+    assert!(
+        outcomes.contains(&Outcome::Checked),
+        "the drained rows must be served by checking hits, got {outcomes:?}"
+    );
+}
+
+/// A caller's own `nprobe` keeps the mapped path: a filtered search serves
+/// an explicit width differently, so checking never runs.
+#[test]
+fn broad_filter_with_caller_nprobe_keeps_the_mapped_path() {
+    /// Five rows in six match: a share no other broad test keeps.
+    fn five_in_six(i: usize) -> bool {
+        !i.is_multiple_of(6)
+    }
+    /// The caller's cell width.
+    const NPROBE: usize = 4;
+
+    let (centers, rows) = tight_spread_rows();
+    let query = centers[0].clone();
+    let titles = needle_titles(&rows, five_in_six, &query, SPREAD_K);
+    let (_dir, st) = drained_table(SPREAD_CELLS, &titles, rows.concat());
+    let (hits, kept) = needle_search(
+        &st,
+        &query,
+        SPREAD_K,
+        VectorSearchOptions::new().with_nprobe(NPROBE),
+    );
+    assert_eq!(hits.len(), SPREAD_K, "k rows must return");
+    assert!(
+        stable_ids(&hits).is_subset(&kept),
+        "every row returned must be one the filter kept"
+    );
+    let outcomes = check_hits_probe::outcomes(kept_rows(&rows, five_in_six));
+    assert!(
+        outcomes.is_empty(),
+        "an explicit nprobe must skip checking, got {outcomes:?}"
+    );
 }
