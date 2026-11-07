@@ -670,27 +670,34 @@ pub(crate) async fn write_state(
         encode_entries(entries),
         entries,
         previous_section,
+        None,
     )
     .await
 }
 
-/// Publish current visible membership plus an in-progress drain checkpoint in
-/// the same content-addressed slow-CAS state referenced by the hidden manifest.
-/// Checkpoint (pending) state rides the routing-shaped blob; consumers ignore
-/// it, the drain-resume path reads it.
-pub(crate) async fn write_state_with_pending_drain(
+/// [`write_state`] for one attempt of a stamp. `pending` adds an in-progress
+/// drain checkpoint to the blob; consumers ignore it, the drain-resume path
+/// reads it. `published_before` is what an earlier attempt of the same stamp
+/// published.
+pub(crate) async fn write_state_for_stamp(
     storage: &dyn StorageProvider,
     cache: Option<&Arc<MetadataDiskCache>>,
     entries: &[Arc<SuperfileEntry>],
-    pending: &PendingDrainState,
+    pending: Option<&PendingDrainState>,
     previous_section: Option<&CentroidSection>,
+    published_before: Option<&PublishedState>,
 ) -> Result<PublishedState, SlowVectorStateError> {
+    let blob_bytes = match pending {
+        Some(pending) => encode_checkpoint_state(entries, pending),
+        None => encode_entries(entries),
+    };
     write_blob_and_section(
         storage,
         cache,
-        encode_checkpoint_state(entries, pending),
+        blob_bytes,
         entries,
         previous_section,
+        published_before,
     )
     .await
 }
@@ -698,15 +705,26 @@ pub(crate) async fn write_state_with_pending_drain(
 /// PUT the routing-shaped state blob and the fp32 centroid section
 /// concurrently — the two-object generation described on
 /// [`PublishedState`]. Both are also kept in `cache`.
+///
+/// When both objects hash to what `published_before` names, they are already
+/// stored and nothing is uploaded. This is safe while GC's `safety_gap` is
+/// longer than the stamp's retries, as for reused term-index slices.
 async fn write_blob_and_section(
     storage: &dyn StorageProvider,
     cache: Option<&Arc<MetadataDiskCache>>,
     blob_bytes: Vec<u8>,
     entries: &[Arc<SuperfileEntry>],
     previous_section: Option<&CentroidSection>,
+    published_before: Option<&PublishedState>,
 ) -> Result<PublishedState, SlowVectorStateError> {
     let blob_bytes = Bytes::from(blob_bytes);
     let centroid_bytes = Bytes::from(compose_centroid_section(entries, previous_section)?);
+    if let Some(before) = published_before
+        && ContentHash::of(&blob_bytes) == before.content_hash
+        && ContentHash::of(&centroid_bytes) == before.centroids.content_hash
+    {
+        return Ok(before.clone());
+    }
     let (blob, centroids) = tokio::join!(
         write_bytes(storage, blob_bytes.clone()),
         write_bytes(storage, centroid_bytes.clone())
@@ -1472,6 +1490,43 @@ mod tests {
         );
     }
 
+    /// A stamp retry that builds the same bytes as its earlier attempt reuses
+    /// that attempt's objects instead of uploading them again. The test
+    /// deletes the earlier blob only to see an upload: one would bring it back.
+    #[tokio::test]
+    async fn a_retry_with_the_same_bytes_uploads_nothing() {
+        let dir = tempdir().expect("tempdir");
+        let storage = LocalFsStorageProvider::new(dir.path()).expect("provider");
+        let entries = vec![entry(FIRST_N_DOCS, 1)];
+
+        let published = write_state_for_stamp(&storage, None, &entries, None, None, None)
+            .await
+            .expect("first attempt");
+        storage.delete(&published.uri).await.expect("delete blob");
+
+        let again = write_state_for_stamp(&storage, None, &entries, None, None, Some(&published))
+            .await
+            .expect("retry");
+        assert_eq!(again.uri, published.uri);
+        assert_eq!(again.content_hash, published.content_hash);
+        assert_eq!(again.centroids, published.centroids);
+        assert!(
+            storage.head(&published.uri).await.is_err(),
+            "the retry uploaded the blob again"
+        );
+
+        // Different entries are different bytes: those are uploaded.
+        let other = vec![entry(FIRST_N_DOCS, 2)];
+        let changed = write_state_for_stamp(&storage, None, &other, None, None, Some(&published))
+            .await
+            .expect("changed retry");
+        assert_ne!(changed.content_hash, published.content_hash);
+        storage
+            .head(&changed.uri)
+            .await
+            .expect("changed bytes are uploaded");
+    }
+
     /// The state blob is routing-shaped: entries decode straight into the
     /// stripped shape with the write-time admit slab intact, and fp32
     /// lives only in the section object next to it.
@@ -1536,9 +1591,10 @@ mod tests {
             metadata: b"epoch".to_vec(),
             entries: vec![entry_with_summary(SECOND_N_DOCS, 2)],
         };
-        let checkpoint = write_state_with_pending_drain(&storage, None, &entries, &pending, None)
-            .await
-            .expect("checkpoint write");
+        let checkpoint =
+            write_state_for_stamp(&storage, None, &entries, Some(&pending), None, None)
+                .await
+                .expect("checkpoint write");
         let state = load_full_state(
             &storage,
             None,
@@ -1585,9 +1641,10 @@ mod tests {
             metadata: b"epoch".to_vec(),
             entries: vec![entry_with_summary(SECOND_N_DOCS, 2)],
         };
-        let checkpoint = write_state_with_pending_drain(&storage, None, &entries, &pending, None)
-            .await
-            .expect("checkpoint write");
+        let checkpoint =
+            write_state_for_stamp(&storage, None, &entries, Some(&pending), None, None)
+                .await
+                .expect("checkpoint write");
         assert!(
             has_pending_drain(&storage, &checkpoint.uri)
                 .await
