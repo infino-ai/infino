@@ -91,6 +91,46 @@ pub mod served_shortlist_probe {
     }
 }
 
+/// Which way each filtered vector search served its drained rows, keyed by
+/// the rows its filter kept. Tests key their assertions by a kept count no
+/// other test uses; records are never removed, so parallel tests cannot
+/// take each other's.
+pub mod check_hits_probe {
+    use std::sync::Mutex;
+
+    /// How a filtered search on the vector index applied its filter.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Outcome {
+        /// The filter keeps too small a share; its rows were mapped.
+        Narrow,
+        /// Hits were checked against the filter.
+        Checked,
+        /// Checking gave up; the filter's rows were mapped.
+        GaveUp,
+    }
+
+    static RECORDS: Mutex<Vec<(u64, Outcome)>> = Mutex::new(Vec::new());
+
+    /// Called by the query path (test-helpers builds only).
+    pub fn record(kept: u64, outcome: Outcome) {
+        RECORDS
+            .lock()
+            .expect("check-hits probe lock")
+            .push((kept, outcome));
+    }
+
+    /// Every outcome recorded for a filter that kept `kept` rows.
+    pub fn outcomes(kept: u64) -> Vec<Outcome> {
+        RECORDS
+            .lock()
+            .expect("check-hits probe lock")
+            .iter()
+            .filter(|(k, _)| *k == kept)
+            .map(|(_, outcome)| *outcome)
+            .collect()
+    }
+}
+
 use std::{
     collections::HashSet,
     fs::{copy as copy_file, create_dir_all, read_dir},
