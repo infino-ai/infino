@@ -171,9 +171,12 @@ fn try_rewrite(plan: &LogicalPlan) -> DfResult<Option<LogicalPlan>> {
         return Ok(None);
     };
 
-    // Unfiltered aggregate over a complete, clean snapshot: every segment is
-    // covered, so emit one literal row directly. This handles SUM/AVG as well
-    // as COUNT/MIN/MAX and avoids invoking the provider's Parquet scan at all.
+    // Unfiltered aggregate over a complete snapshot: a clean segment is
+    // covered by its statistics. When every segment is clean, emit one
+    // literal row directly. This handles SUM/AVG as well as COUNT/MIN/MAX
+    // and avoids invoking the provider's Parquet scan at all. Otherwise only
+    // the segments with deletes (or an unknown tombstone state) or a
+    // missing stat are scanned.
     if let Some(scan) = peel_unfiltered_scan(agg.input.as_ref()) {
         let Some(provider) = provider_of(scan) else {
             return Ok(None);
@@ -185,12 +188,18 @@ fn try_rewrite(plan: &LogicalPlan) -> DfResult<Option<LogicalPlan>> {
             return Ok(None);
         };
         let manifest = provider.manifest();
-        if !superfiles.iter().all(|entry| {
-            provider.entry_is_clean(entry) && has_required_stats(manifest, entry, &kinds)
-        }) {
-            return Ok(None);
+        let (covered, boundary): (Vec<&Arc<SuperfileEntry>>, Vec<&Arc<SuperfileEntry>>) =
+            superfiles.iter().partition(|entry| {
+                provider.entry_is_clean(entry) && has_required_stats(manifest, entry, &kinds)
+            });
+        if !boundary.is_empty() {
+            if covered.is_empty() {
+                // Nothing answerable from statistics.
+                return Ok(None);
+            }
+            let boundary = boundary.iter().map(|entry| entry.superfile_id).collect();
+            return rewrite_with_residual(agg, scan, provider, &kinds, &covered, boundary, None);
         }
-        let covered: Vec<&Arc<SuperfileEntry>> = superfiles.iter().collect();
         let mut partials = Vec::with_capacity(kinds.len());
         for kind in &kinds {
             let Some(partial) = accumulate_partial(manifest, kind, &covered) else {
@@ -306,10 +315,33 @@ fn try_rewrite(plan: &LogicalPlan) -> DfResult<Option<LogicalPlan>> {
         return Ok(None);
     }
 
+    rewrite_with_residual(
+        agg,
+        scan,
+        provider,
+        &kinds,
+        &covered,
+        boundary,
+        Some(&predicate),
+    )
+}
+
+/// Answer `agg` from the `covered` segments' statistics plus a scan of the
+/// `boundary` segments, filtered by `predicate` when the query has one.
+fn rewrite_with_residual(
+    agg: &Aggregate,
+    scan: &TableScan,
+    provider: &SupertableProvider,
+    kinds: &[AggKind],
+    covered: &[&Arc<SuperfileEntry>],
+    boundary: HashSet<Uuid>,
+    predicate: Option<&Expr>,
+) -> DfResult<Option<LogicalPlan>> {
+    let manifest = provider.manifest();
     // Accumulate the covered partials per aggregate output.
     let mut partials: Vec<Partial> = Vec::with_capacity(kinds.len());
-    for kind in &kinds {
-        match accumulate_partial(manifest, kind, &covered) {
+    for kind in kinds {
+        match accumulate_partial(manifest, kind, covered) {
             Some(partial) => partials.push(partial),
             // A fold failure (overflow, type surprise) is always safe
             // to decline.
@@ -326,8 +358,10 @@ fn try_rewrite(plan: &LogicalPlan) -> DfResult<Option<LogicalPlan>> {
         scan.table_name.clone(),
         provider_as_source(restricted as Arc<dyn TableProvider>),
         None,
-    )?
-    .filter(predicate.clone())?;
+    )?;
+    if let Some(predicate) = predicate {
+        builder = builder.filter(predicate.clone())?;
+    }
 
     // Partial aggregates over the residual, one batch per output (AVG
     // needs two: sum + non-null count). Each column is named exactly, as
