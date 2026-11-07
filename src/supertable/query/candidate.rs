@@ -122,7 +122,10 @@ use crate::{
     supertable::{
         error::QueryError,
         manifest::{ManifestSnapshot, SuperfileEntry, SuperfileUri},
-        query::prune::{PruneLeaf, select_superfiles},
+        query::{
+            fts::IndexedSuperfile,
+            prune::{PruneLeaf, select_superfiles},
+        },
         schema::FieldId,
     },
 };
@@ -643,10 +646,15 @@ impl CandidatePlan {
     /// The second element sums the header-fetch work of every leaf df
     /// probe (and the dictionary walk of an unexpanded `LIKE` leaf), so
     /// the caller can flush it per superfile.
+    ///
+    /// `located` is the term index's view of this superfile. A leaf whose
+    /// words it lists takes their `df` from it and reads nothing; other
+    /// leaves read the superfile as before.
     pub(crate) fn estimate<'a>(
         &'a self,
         reader: &'a SuperfileReader,
         pool: Option<&'a ThreadPool>,
+        located: Option<IndexedSuperfile<'a>>,
     ) -> BoxFuture<'a, Result<(u64, MatchWork), ReadError>> {
         Box::pin(async move {
             let n_docs = reader.n_docs();
@@ -656,12 +664,9 @@ impl CandidatePlan {
                     if tokens.is_empty() {
                         return Ok((n_docs, MatchWork::default()));
                     }
-                    // Intersection ≤ the rarest token's df — resolved with one
-                    // batched df lookup (single dictionary parse + coalesced
-                    // header fetch) rather than one parse + fetch per token.
-                    let refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
-                    let (dfs, work) = reader.term_dfs(column, &refs).await?;
-                    let min_df = dfs.into_iter().min().unwrap_or(u64::MAX);
+                    // Intersection ≤ the rarest token's df.
+                    let (min_df, work) =
+                        fold_dfs(reader, located, column, tokens, u64::MAX, u64::min).await?;
                     Ok((min_df.min(n_docs), work))
                 }
                 CandidatePlan::TermsAny { column, terms } => {
@@ -669,9 +674,8 @@ impl CandidatePlan {
                         return Ok((0, MatchWork::default()));
                     }
                     // Union ≤ the sum of the terms' dfs.
-                    let refs: Vec<&str> = terms.iter().map(String::as_str).collect();
-                    let (dfs, work) = reader.term_dfs(column, &refs).await?;
-                    let sum = dfs.into_iter().fold(0u64, u64::saturating_add);
+                    let (sum, work) =
+                        fold_dfs(reader, located, column, terms, 0, u64::saturating_add).await?;
                     Ok((sum.min(n_docs), work))
                 }
                 CandidatePlan::TermsLike {
@@ -679,9 +683,10 @@ impl CandidatePlan {
                     tokens,
                     fold,
                 } => {
+                    // The index was never asked about the expanded words.
                     let (expanded, mut work) =
                         expand_like(reader, column, tokens, *fold, true, pool).await?;
-                    let (rows, est_work) = expanded.estimate(reader, pool).await?;
+                    let (rows, est_work) = expanded.estimate(reader, pool, None).await?;
                     work.merge(est_work);
                     Ok((rows, work))
                 }
@@ -702,7 +707,7 @@ impl CandidatePlan {
                     let mut m = n_docs;
                     let mut work = MatchWork::default();
                     for c in children {
-                        let (child, child_work) = c.estimate(reader, pool).await?;
+                        let (child, child_work) = c.estimate(reader, pool, located).await?;
                         work.merge(child_work);
                         m = m.min(child);
                     }
@@ -712,7 +717,7 @@ impl CandidatePlan {
                     let mut sum: u64 = 0;
                     let mut work = MatchWork::default();
                     for c in children {
-                        let (child, child_work) = c.estimate(reader, pool).await?;
+                        let (child, child_work) = c.estimate(reader, pool, located).await?;
                         work.merge(child_work);
                         sum = sum.saturating_add(child);
                     }
@@ -721,6 +726,30 @@ impl CandidatePlan {
             }
         })
     }
+}
+
+/// Fold the `df` of each of `terms` with `fold`, starting at `init`. Taken
+/// from the term index when it answers every term (no read), else from one
+/// batched lookup in the superfile's dictionary.
+async fn fold_dfs(
+    reader: &SuperfileReader,
+    located: Option<IndexedSuperfile<'_>>,
+    column: &str,
+    terms: &[String],
+    init: u64,
+    fold: fn(u64, u64) -> u64,
+) -> Result<(u64, MatchWork), ReadError> {
+    let indexed = located.and_then(|l| l.held(column)).and_then(|held| {
+        terms
+            .iter()
+            .try_fold(init, |acc, term| Some(fold(acc, held.df(term)?)))
+    });
+    if let Some(folded) = indexed {
+        return Ok((folded, MatchWork::default()));
+    }
+    let refs: Vec<&str> = terms.iter().map(String::as_str).collect();
+    let (dfs, work) = reader.term_dfs(column, &refs).await?;
+    Ok((dfs.into_iter().fold(init, fold), work))
 }
 
 impl CandidatePlan {

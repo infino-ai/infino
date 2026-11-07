@@ -135,7 +135,7 @@ use crate::{
                 common::{BoundPredicate, PushedPredicate, take_rows, unqualified},
                 metered_exec::MeteredExec,
             },
-            fts::{memos_from_plan_locations, plan_locations_for},
+            fts::{IndexedSuperfile, memos_from_plan_locations, plan_locations_for},
             nan_bounds::without_nan_blind_bounds,
             prune::{PruneLeaf, select_superfiles},
             range_counts::{RangeBucket, RangeCounts},
@@ -2009,8 +2009,9 @@ impl TableProvider for SupertableProvider {
                         // usable bound, scan the superfile.
                         //
                         // Selectivity gate: estimate the match count from
-                        // per-term `df` first (cheap, header-only). If a
-                        // predicate would match more than
+                        // per-term `df` first (from the term index, or a
+                        // posting-header read when the index doesn't list the
+                        // term). If a predicate would match more than
                         // `PUSHDOWN_MAX_FRACTION` of this superfile, skip the
                         // index path and let DataFusion scan: at that match
                         // density the rows saturate the data pages, so an index
@@ -2086,8 +2087,16 @@ impl TableProvider for SupertableProvider {
                         let est = match top_k {
                             Some(_) => 0,
                             None => {
+                                let located = IndexedSuperfile {
+                                    locations: plan_locations,
+                                    superfile: entry.superfile_id,
+                                };
                                 let (est, est_work) = plan
-                                    .estimate(prepared.reader.as_ref(), Some(reader_pool))
+                                    .estimate(
+                                        prepared.reader.as_ref(),
+                                        Some(reader_pool),
+                                        Some(located),
+                                    )
                                     .await
                                     .map_err(QueryError::from)?;
                                 predicate_work.merge(est_work);
