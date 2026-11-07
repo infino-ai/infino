@@ -293,6 +293,23 @@ fn cap_error_message(msg: String) -> String {
     truncate_to_bytes(cap_valid_fields_list(msg), MAX_ERROR_MESSAGE_BYTES)
 }
 
+/// Join `names` with `, `, keeping the first [`MAX_LISTED_VALID_FIELDS`] and
+/// summarizing the rest as `… and N more`. A list already within the cap is
+/// joined whole. Any message that enumerates a table's columns inherits that
+/// table's width: on a very wide table (thousands of columns) the list alone
+/// runs to hundreds of kilobytes and bloats logs and responses, so a message
+/// that includes one bounds it here. Used both to bound a propagated
+/// DataFusion schema error (below) and the projection check's own list of
+/// selectable columns.
+pub(crate) fn capped_column_list(names: &[&str]) -> String {
+    if names.len() <= MAX_LISTED_VALID_FIELDS {
+        return names.join(", ");
+    }
+    let shown = names[..MAX_LISTED_VALID_FIELDS].join(", ");
+    let more = names.len() - MAX_LISTED_VALID_FIELDS;
+    format!("{shown}, … and {more} more")
+}
+
 /// Keep the `No field named X. Valid fields are …` prefix and the first
 /// [`MAX_LISTED_VALID_FIELDS`] names, replacing the rest with `… and N more`.
 /// A message without the valid-fields marker, or one already within the cap,
@@ -309,9 +326,7 @@ fn cap_valid_fields_list(msg: String) -> String {
     if names.len() <= MAX_LISTED_VALID_FIELDS {
         return msg;
     }
-    let shown = names[..MAX_LISTED_VALID_FIELDS].join(", ");
-    let more = names.len() - MAX_LISTED_VALID_FIELDS;
-    format!("{head}{shown}, … and {more} more.")
+    format!("{head}{}.", capped_column_list(&names))
 }
 
 /// Cut `msg` to at most `max` bytes on a UTF-8 boundary, appending a marker
@@ -1100,6 +1115,39 @@ mod tests {
             msg.len() <= MAX_ERROR_MESSAGE_BYTES,
             "bounded under the backstop: {} bytes",
             msg.len()
+        );
+    }
+
+    /// `capped_column_list` joins a short list whole and, past the cap, keeps a
+    /// representative prefix plus an `… and N more` summary rather than every
+    /// name — the bound any message that enumerates a wide table's columns
+    /// relies on.
+    #[test]
+    fn capped_column_list_bounds_a_wide_list() {
+        assert_eq!(capped_column_list(&["a", "b", "c"]), "a, b, c");
+
+        const COLUMNS: usize = 5_000;
+        let names: Vec<String> = (0..COLUMNS).map(|i| format!("col{i}")).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let capped = capped_column_list(&refs);
+        assert!(capped.starts_with("col0, "), "keeps a sample: {capped}");
+        assert!(
+            capped.ends_with(&format!("and {} more", COLUMNS - MAX_LISTED_VALID_FIELDS)),
+            "summarizes the tail: {capped}"
+        );
+        assert!(
+            !capped.contains(&format!("col{}", COLUMNS - 1)),
+            "does not enumerate every column: {capped}"
+        );
+
+        // Exactly at the cap: joined whole, no summary.
+        let at_cap: Vec<String> = (0..MAX_LISTED_VALID_FIELDS)
+            .map(|i| format!("c{i}"))
+            .collect();
+        let at_cap_refs: Vec<&str> = at_cap.iter().map(String::as_str).collect();
+        assert!(
+            !capped_column_list(&at_cap_refs).contains("more"),
+            "at the cap, joins whole"
         );
     }
 
