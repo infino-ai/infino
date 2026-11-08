@@ -31,6 +31,8 @@
 //! `multi_thread` runtime (the default for `#[tokio::main]`, axum,
 //! actix, etc.).
 
+#[cfg(test)]
+use std::sync::mpsc;
 use std::{
     any::Any,
     fmt,
@@ -40,7 +42,7 @@ use std::{
     thread,
 };
 
-use rayon::ThreadPool;
+use rayon::{ThreadPool, ThreadPoolBuilder};
 use tokio::{
     runtime::{self, Handle, Runtime},
     sync::oneshot,
@@ -238,12 +240,56 @@ where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
 {
+    await_pool_job(pool, what, f, Unawaited::Run).await
+}
+
+/// [`run_on_pool`] for work only its caller needs, such as one superfile's
+/// match while planning a query: if the caller stops waiting (a cancelled
+/// query) before a pool thread picks the job up, the job is skipped. One
+/// already running finishes.
+///
+/// Not the default for [`run_on_pool`]: a job there may finish something
+/// other tasks wait on besides its caller, and a skip would leave them
+/// waiting. A match's result goes only to its caller.
+pub(crate) async fn run_on_pool_while_awaited<R, F>(
+    pool: &ThreadPool,
+    what: &'static str,
+    f: F,
+) -> Result<R, PoolDropped>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    await_pool_job(Some(pool), what, f, Unawaited::Skip).await
+}
+
+/// What a queued job does when it starts and its caller has stopped waiting.
+enum Unawaited {
+    Run,
+    Skip,
+}
+
+/// Spawn `f` on `pool` (or the global rayon pool if `None`) and await its
+/// result, for [`run_on_pool`] and [`run_on_pool_while_awaited`].
+async fn await_pool_job<R, F>(
+    pool: Option<&ThreadPool>,
+    what: &'static str,
+    f: F,
+    unawaited: Unawaited,
+) -> Result<R, PoolDropped>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
     let (tx, rx) = oneshot::channel();
     // The work runs inside the caller's span; the result is sent only once
     // the span has been left and released, so the awaiting task never
     // outruns a pool thread still holding the span open.
     let f = carry_span(move || catch_panic(what, f));
     let job = move || {
+        if matches!(unawaited, Unawaited::Skip) && tx.is_closed() {
+            return;
+        }
         if let Some(out) = f() {
             let _ = tx.send(out);
         }
@@ -296,7 +342,7 @@ where
     let spawned = std::thread::Builder::new()
         .name(format!("{what} driver"))
         .spawn(move || {
-            let pool = match rayon::ThreadPoolBuilder::new()
+            let pool = match ThreadPoolBuilder::new()
                 .num_threads(threads.max(1))
                 .thread_name(move |i| format!("merge-{i}"))
                 .build()
@@ -360,9 +406,26 @@ fn build_current_thread_runtime() -> runtime::Runtime {
         )
 }
 
+/// A pool of one thread, busy until the returned sender is dropped, for tests
+/// that need work to sit queued on a pool.
+#[cfg(test)]
+pub(crate) fn held_pool() -> (ThreadPool, mpsc::Sender<()>) {
+    let pool = ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .expect("pool");
+    let (release, held) = mpsc::channel::<()>();
+    pool.spawn(move || {
+        let _ = held.recv();
+    });
+    (pool, release)
+}
+
 #[cfg(test)]
 mod tests {
-    use std::sync::mpsc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use futures::FutureExt;
 
     use super::*;
 
@@ -416,7 +479,7 @@ mod tests {
     /// spawned task hands it to the pool, so no runtime worker computes.
     #[test]
     fn work_runs_inline_only_for_a_caller_blocking_on_it() {
-        let pool = rayon::ThreadPoolBuilder::new()
+        let pool = ThreadPoolBuilder::new()
             .num_threads(1)
             .build()
             .expect("pool");
@@ -499,7 +562,7 @@ mod tests {
 
     /// A pool of one thread, so a panicking job and the next one share it.
     fn one_thread_pool() -> ThreadPool {
-        rayon::ThreadPoolBuilder::new()
+        ThreadPoolBuilder::new()
             .num_threads(1)
             .build()
             .expect("pool")
@@ -551,5 +614,30 @@ mod tests {
             let _ = tx.send(7);
         });
         assert_eq!(rx.recv().expect("the pool runs on"), 7);
+    }
+
+    #[test]
+    fn work_nobody_waits_for_is_skipped() {
+        // A busy pool, and a job queued behind it whose caller then stops
+        // waiting, as a cancelled query does.
+        // - Once the pool is free, the job does not run.
+        // This test pins that a cancel stops queued work, not only the wait.
+        let (pool, release) = held_pool();
+        let ran = Arc::new(AtomicBool::new(false));
+        let job_ran = Arc::clone(&ran);
+        let waiting = run_on_pool_while_awaited(&pool, "job", move || {
+            job_ran.store(true, Ordering::SeqCst);
+        });
+        let mut waiting = Box::pin(waiting);
+        // The first poll queues the job; it cannot start on the held pool.
+        assert!((&mut waiting).now_or_never().is_none());
+        drop(waiting);
+        drop(release);
+        let (done, finished) = mpsc::channel();
+        pool.spawn(move || {
+            let _ = done.send(());
+        });
+        finished.recv().expect("the pool drained");
+        assert!(!ran.load(Ordering::SeqCst), "the dropped job ran");
     }
 }

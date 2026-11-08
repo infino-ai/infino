@@ -1940,10 +1940,12 @@ impl TableProvider for SupertableProvider {
         // the superfile). See `crate::supertable::query::candidate`.
         let manifest = &self.manifest;
         let range_cols = manifest.table_schema().range_column_types();
-        let candidate_plan =
-            CandidatePlan::from_filters(&bounded_filters, &fts_cols, &range_cols, &|col| {
-                manifest.try_fts_tokenizer_for(col)
-            });
+        let candidate_plan = Arc::new(CandidatePlan::from_filters(
+            &bounded_filters,
+            &fts_cols,
+            &range_cols,
+            &|col| manifest.try_fts_tokenizer_for(col),
+        ));
         // A `LIKE` leaf is bound to each superfile's dictionary once, up
         // front, so the estimate and the evaluation below share one walk.
         let needs_expansion = candidate_plan.has_like();
@@ -1997,14 +1999,25 @@ impl TableProvider for SupertableProvider {
             /// posting walks on this superfile.
             predicate_work: MatchWork,
         }
-        // The plan's dictionary walks (a `LIKE` leaf's expansion) are CPU
-        // work and run on the reader pool behind a oneshot; only their FST
-        // fetches stay on this runtime.
+        // The plan's CPU work runs on the reader pool behind a oneshot: a
+        // `LIKE` leaf's expansion, and a resident superfile's whole match. A
+        // lazy superfile's match stays on this task, where its reads wait on
+        // the store and overlap.
         let reader_pool: &ThreadPool = &self.manifest.options.reader_pool;
+        // Superfiles matching on the reader pool at once. More than its
+        // threads would only queue there, ahead of other queries' work, and
+        // each holds its postings and bitmaps, which the connection budget
+        // does not see. A match holds its slot only while on the pool, never
+        // across a read that waits.
+        let match_slots = Semaphore::new(reader_pool.current_num_threads());
+        let match_slots = &match_slots;
         // Superfiles answering exact conjuncts at once. Their walks and
         // unions run on the reader pool, so more in flight than it has
         // threads only queue there, each holding its fetched postings and
         // bitsets; what they do hold is charged to the connection budget.
+        // Kept apart from `match_slots`: an exact check holds its slot across
+        // its reads, so sharing would park resident matches behind cold
+        // fetches.
         let exact_slots = Semaphore::new(reader_pool.current_num_threads());
         let exact_slots = &exact_slots;
 
@@ -2014,10 +2027,13 @@ impl TableProvider for SupertableProvider {
         // dictionary fetch overlaps another's walk on the reader pool and a
         // third's posting reads, instead of each superfile waiting for the
         // one before it. The futures share this task rather than being
-        // spawned — the CPU is on the pool and the I/O is awaited, so the
-        // task only polls, and nothing here is `'static`. Results come back
-        // in survivor order, so the file list below stays deterministic in
-        // manifest order, and the first error (in time) ends the scan.
+        // spawned, so nothing here is `'static`: a resident superfile's match,
+        // which would block this task, goes to the pool, and a lazy one's
+        // reads are awaited. What stays here per superfile is light: the
+        // estimate (free when the term index lists the superfile) and
+        // bookkeeping. Results come back in survivor order, so the file list
+        // below stays deterministic in manifest order, and the first error
+        // (in time) ends the scan.
         // The columns the scan decodes, whose pages a selection may skip.
         let read_columns: Vec<&str> = match projection {
             Some(indices) => indices
@@ -2060,7 +2076,6 @@ impl TableProvider for SupertableProvider {
                         // cap binds even under the floor so an all-matching
                         // predicate never takes the index path.
                         let mut predicate_work = MatchWork::default();
-                        let expanded;
                         let plan = if needs_expansion {
                             // A whole-dictionary walk pays only when the
                             // column's stored text is large next to its
@@ -2092,10 +2107,9 @@ impl TableProvider for SupertableProvider {
                                 .await
                                 .map_err(QueryError::from)?;
                             predicate_work.merge(expand_work);
-                            expanded = plan;
-                            &expanded
+                            Arc::new(plan)
                         } else {
-                            candidate_plan
+                            Arc::clone(candidate_plan)
                         };
                         let gate = ((prepared.reader.n_docs() as f64 * PUSHDOWN_MAX_FRACTION)
                             as u64)
@@ -2157,7 +2171,12 @@ impl TableProvider for SupertableProvider {
                             )
                             .await;
                             let (bitmap, eval_work) = plan
-                                .evaluate(prepared.reader.as_ref(), Some(reader_pool), &memos)
+                                .evaluate_on_pool(
+                                    Arc::clone(&prepared.reader),
+                                    reader_pool,
+                                    match_slots,
+                                    memos,
+                                )
                                 .await
                                 .map_err(QueryError::from)?;
                             predicate_work.merge(eval_work);

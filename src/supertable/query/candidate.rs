@@ -103,11 +103,13 @@ use datafusion::{
     },
     scalar::ScalarValue,
 };
-use futures::future::BoxFuture;
+use futures::{FutureExt, future::BoxFuture};
 use rayon::ThreadPool;
 use roaring::RoaringBitmap;
+use tokio::sync::Semaphore;
 
 use crate::{
+    runtime_bridge::run_on_pool_while_awaited,
     superfile::{
         ReadError, SuperfileReader,
         fts::{
@@ -365,14 +367,6 @@ impl CandidatePlan {
         and_combine(filters.iter().map(|f| lower(f, &cols, resolve)).collect())
     }
 
-    /// Evaluate against one superfile's reader. `Ok(None)` means "no bound
-    /// — scan all rows"; `Ok(Some(bitmap))` is the candidate
-    /// `local_doc_id` superset (possibly empty). `TermsAll` is one
-    /// `token_match(.., And)`; `And`/`Or` intersect/union children.
-    /// The second element sums the posting-walk work of every `TermsAll`
-    /// leaf the evaluation touched (an early-out keeps the work already
-    /// done), so the caller can flush it per superfile. `pool` is the
-    /// reader pool a `LIKE` leaf's dictionary walk runs on.
     /// Every `(column, terms)` this plan resolves through exact term match,
     /// deduplicated per column — what a caller asks the table-level term
     /// index for, so each superfile can resolve them from its postings
@@ -409,6 +403,17 @@ impl CandidatePlan {
         out
     }
 
+    /// Evaluate against one superfile's reader. `Ok(None)` means "no bound,
+    /// scan all rows"; `Ok(Some(bitmap))` is the candidate `local_doc_id`
+    /// superset (possibly empty). `TermsAll` is one `token_match(.., And)`;
+    /// `And`/`Or` intersect/union children. The second element sums the
+    /// posting-walk work of every `TermsAll` leaf the evaluation touched (an
+    /// early-out keeps the work already done), so the caller can flush it per
+    /// superfile.
+    ///
+    /// `pool` is where a `LIKE` leaf's dictionary walk and a range decode
+    /// run. With `None`, a range decode runs inline when not in a tokio task
+    /// (as on a pool thread), but a `LIKE` walk goes to rayon's global pool.
     pub(crate) fn evaluate<'a>(
         &'a self,
         reader: &'a SuperfileReader,
@@ -498,6 +503,54 @@ impl CandidatePlan {
 }
 
 impl CandidatePlan {
+    /// [`Self::evaluate`] on a `pool` thread when `reader` holds its indexes
+    /// in memory (`parquet_bytes` is set; a hybrid reader lacks only its
+    /// vector blob, which a match never reads), so planning matches many
+    /// superfiles at once.
+    ///
+    /// A local read never yields: it hits memory or blocks the thread on a
+    /// page fault. So matches polled together on one task run one after
+    /// another; on the pool each gets its own thread. A lazy reader's reads
+    /// wait on the network and already overlap, so its match stays here.
+    ///
+    /// A match that would wait on the pool (another query filling a shared
+    /// cell) gives up there, releases its slot and reruns here: wasted work,
+    /// never a wrong answer. A match holds one of `slots` while on the pool,
+    /// which bounds how many one query puts there.
+    pub(crate) async fn evaluate_on_pool(
+        self: Arc<Self>,
+        reader: Arc<SuperfileReader>,
+        pool: &ThreadPool,
+        slots: &Semaphore,
+        mut memos: TermMemos,
+    ) -> Result<(Option<RoaringBitmap>, MatchWork), ReadError> {
+        // A `LIKE` leaf hands its dictionary walk to a pool itself, which
+        // would leave that walk running on the global pool when the poll
+        // below gives up. Callers expand `LIKE` first (see `Self::expand`).
+        if reader.parquet_bytes().is_some() && !self.has_like() {
+            let _slot = slots
+                .acquire()
+                .await
+                .map_err(|_| ReadError::TaskDropped("planning match slot"))?;
+            let plan = Arc::clone(&self);
+            let local = Arc::clone(&reader);
+            // `memos` rides along and comes back, so the fallback below can
+            // reuse it without a copy.
+            let (matched, returned) =
+                run_on_pool_while_awaited(pool, "planning match", move || {
+                    let matched = plan.evaluate(&local, None, &memos).now_or_never();
+                    (matched, memos)
+                })
+                .await
+                .map_err(|e| ReadError::TaskDropped(e.0))?;
+            if let Some(matched) = matched {
+                return matched;
+            }
+            memos = returned;
+        }
+        self.evaluate(&reader, Some(pool), &memos).await
+    }
+
     /// Manifest-only superfile survival gate for this plan: the superfile
     /// ids that *could* match by term blooms and the term index. `None`
     /// means no gate: the plan, or one of its `OR` branches, bounds no
@@ -1687,21 +1740,36 @@ fn collect_like_leaves(
 
 #[cfg(test)]
 mod tests {
-    use arrow_schema::DataType;
+    use std::time::Duration;
+
+    use arrow_array::{Int32Array, LargeStringArray, RecordBatch};
+    use arrow_schema::{DataType, Field, Schema};
+    use bytes::Bytes;
     use datafusion::{
         logical_expr::expr::InList,
         prelude::{cast, col, lit},
     };
+    use rayon::ThreadPoolBuilder;
+    use tokio::time::timeout;
     use uuid::Uuid;
 
     use super::*;
-    use crate::superfile::{
-        fts::{
-            analysis::{Stemmer, Stopwords, chain_tokenizer},
-            tokenize::{STANDARD_TOKENIZER, StandardTokenizer},
+    use crate::{
+        runtime_bridge::held_pool,
+        superfile::{
+            BytesLazyByteSource, LazyByteSource,
+            builder::{BuilderOptions, FtsConfig, SuperfileBuilder},
+            fts::{
+                analysis::{Stemmer, Stopwords, chain_tokenizer},
+                tokenize::{STANDARD_TOKENIZER, StandardTokenizer},
+            },
+            vector::layout::VectorLayout,
         },
-        vector::layout::VectorLayout,
+        test_helpers::decimal128_ids,
     };
+
+    /// How long a test waits for a match that must finish.
+    const MUST_FINISH: Duration = Duration::from_secs(10);
 
     fn fts_cols() -> HashSet<&'static str> {
         let mut s = HashSet::new();
@@ -2769,6 +2837,250 @@ mod tests {
         assert_eq!(
             ExactFilter::Or(vec![ExactFilter::And(vec![a.clone(), b]), a]).rows(&leaf_rows),
             rows(&[1, 2], &[3])
+        );
+    }
+
+    /// The range-indexed column in [`titled_superfile`].
+    const HITS: &str = "hits";
+
+    /// Four titles with a range-indexed `hits` column, and the table id of
+    /// `hits` that a range plan names:
+    ///
+    /// | row | title                   | hits |
+    /// |-----|-------------------------|------|
+    /// | 0   | rust async runtime      | 5    |
+    /// | 1   | python data pipeline    | 50   |
+    /// | 2   | rust embedded system    | 7    |
+    /// | 3   | javascript web frontend | 70   |
+    fn titled_superfile() -> (Bytes, FieldId) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("doc_id", DataType::Decimal128(38, 0), false),
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new(HITS, DataType::Int32, false),
+        ]));
+        let opts = BuilderOptions::new(
+            Arc::clone(&schema),
+            "doc_id",
+            vec![FtsConfig::new("title")],
+            vec![],
+        )
+        .with_range_columns(vec![HITS.into()]);
+        let hits = opts.field_id_of_column(HITS).expect("hits field id");
+        let mut builder = SuperfileBuilder::new(opts).expect("builder");
+        let titles = LargeStringArray::from(vec![
+            "rust async runtime",
+            "python data pipeline",
+            "rust embedded system",
+            "javascript web frontend",
+        ]);
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(decimal128_ids([10, 11, 12, 13])),
+                Arc::new(titles),
+                Arc::new(Int32Array::from(vec![5, 50, 7, 70])),
+            ],
+        )
+        .expect("batch");
+        builder.add_batch(&batch, &[]).expect("add batch");
+        (Bytes::from(builder.finish().expect("finish")), hits)
+    }
+
+    /// [`titled_superfile`] with all its bytes in memory.
+    fn resident_reader() -> Arc<SuperfileReader> {
+        Arc::new(SuperfileReader::open(titled_superfile().0).expect("open"))
+    }
+
+    fn hits_between(field: FieldId, lo: i64, hi: i64) -> CandidatePlan {
+        CandidatePlan::Range {
+            field,
+            kind: KeyKind::Signed,
+            lo: signed_key(lo),
+            hi: signed_key(hi),
+        }
+    }
+
+    fn one_thread_pool() -> ThreadPool {
+        ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("pool")
+    }
+
+    fn row_list(rows: Option<RoaringBitmap>) -> Option<Vec<u32>> {
+        rows.map(|r| r.iter().collect())
+    }
+
+    #[tokio::test]
+    async fn resident_plans_finish_in_one_poll_on_a_pool_thread() {
+        // A superfile with all its bytes in memory, and each plan shape the
+        // provider sends to the pool.
+        // - Polled once on a pool thread, every match finishes.
+        // - Each gives the rows the async match gives.
+        // This test pins that a resident match never has to rerun after its
+        // pool hop, which would do its work twice.
+        let (bytes, hits) = titled_superfile();
+        let reader = SuperfileReader::open(bytes).expect("open");
+        let pool = one_thread_pool();
+        let memos = TermMemos::new();
+        let any = |terms: &[&str]| CandidatePlan::TermsAny {
+            column: "title".into(),
+            terms: terms.iter().map(|t| t.to_string()).collect(),
+        };
+        let cases = [
+            ("one word", terms_all(&["rust"]), Some(vec![0, 2])),
+            (
+                "either of two words",
+                any(&["python", "web"]),
+                Some(vec![1, 3]),
+            ),
+            ("any of no words", any(&[]), Some(vec![])),
+            ("a range", hits_between(hits, 0, 10), Some(vec![0, 2])),
+            (
+                "a word and a range",
+                CandidatePlan::And(vec![terms_all(&["rust"]), hits_between(hits, 0, 6)]),
+                Some(vec![0]),
+            ),
+            (
+                "two words no row holds",
+                CandidatePlan::And(vec![terms_all(&["python"]), terms_all(&["rust"])]),
+                Some(vec![]),
+            ),
+            (
+                "one title or another",
+                CandidatePlan::Or(vec![terms_all(&["rust"]), terms_all(&["python"])]),
+                Some(vec![0, 1, 2]),
+            ),
+            (
+                "a word or anything",
+                CandidatePlan::Or(vec![terms_all(&["rust"]), CandidatePlan::Unbounded]),
+                None,
+            ),
+        ];
+        for (what, plan, want) in cases {
+            let (rows, _) = pool
+                .install(|| plan.evaluate(&reader, None, &memos).now_or_never())
+                .unwrap_or_else(|| panic!("{what}: the match waited on the pool"))
+                .expect(what);
+            let (async_rows, _) = plan
+                .evaluate(&reader, Some(&pool), &memos)
+                .await
+                .expect(what);
+            assert_eq!(row_list(rows.clone()), want, "{what}");
+            assert_eq!(rows, async_rows, "{what}: differs from the async match");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_resident_superfile_is_matched_on_the_pool() {
+        // A resident superfile, and a pool whose only thread is busy.
+        // - The first poll queues the match on the pool and does not finish.
+        // - Once the pool is free, it finishes with rows 0 and 2.
+        // This test pins that planning hands a resident superfile's match to
+        // the pool instead of running it on its own task.
+        let (pool, release) = held_pool();
+        let slots = Semaphore::new(1);
+        let mut matched = Box::pin(Arc::new(terms_all(&["rust"])).evaluate_on_pool(
+            resident_reader(),
+            &pool,
+            &slots,
+            TermMemos::new(),
+        ));
+        assert!(
+            (&mut matched).now_or_never().is_none(),
+            "the match waits for the pool"
+        );
+        drop(release);
+        let (rows, _) = timeout(MUST_FINISH, matched)
+            .await
+            .expect("finishes once the pool is free")
+            .expect("match");
+        assert_eq!(row_list(rows), Some(vec![0, 2]));
+    }
+
+    #[tokio::test]
+    async fn a_lazy_superfile_is_matched_off_the_pool() {
+        // The same superfile opened lazily, a busy pool, and no free slot.
+        // - The match finishes anyway, with rows 0 and 2.
+        // This test pins that a lazy superfile keeps the async path and takes
+        // no slot, so a match waiting on a download holds neither a pool
+        // thread nor a slot.
+        let source: Arc<dyn LazyByteSource> =
+            Arc::new(BytesLazyByteSource::new(titled_superfile().0));
+        let reader = Arc::new(SuperfileReader::open_lazy(source).await.expect("lazy open"));
+        let (pool, _release) = held_pool();
+        let no_slots = Semaphore::new(0);
+        let matched = Arc::new(terms_all(&["rust"])).evaluate_on_pool(
+            reader,
+            &pool,
+            &no_slots,
+            TermMemos::new(),
+        );
+        let (rows, _) = timeout(MUST_FINISH, matched)
+            .await
+            .expect("finishes while the pool is busy")
+            .expect("match");
+        assert_eq!(row_list(rows), Some(vec![0, 2]));
+    }
+
+    #[tokio::test]
+    async fn a_like_plan_is_matched_off_the_pool() {
+        // A resident superfile, a `LIKE` plan not yet bound to its words, a
+        // free pool, and no free slot.
+        // - The match finishes, with rows 0 and 2.
+        // This test pins that a plan whose dictionary walk hops to a pool on
+        // its own never takes the pool path, where that walk would be left
+        // running on the global pool.
+        let like = Arc::new(plan(col("title").like(lit("rust%"))));
+        let pool = one_thread_pool();
+        let no_slots = Semaphore::new(0);
+        let matched = like.evaluate_on_pool(resident_reader(), &pool, &no_slots, TermMemos::new());
+        let (rows, _) = timeout(MUST_FINISH, matched)
+            .await
+            .expect("finishes without a slot")
+            .expect("match");
+        assert_eq!(row_list(rows), Some(vec![0, 2]));
+    }
+
+    #[tokio::test]
+    async fn a_match_holds_its_slot_only_while_on_the_pool() {
+        // A resident superfile and one slot.
+        // - Queued on a busy pool, the match holds the slot.
+        // - Dropped, as a cancelled query drops it, it gives the slot back.
+        // - Run to the end on a free pool, it gives the slot back too.
+        // This test pins the bound on how many matches one query puts on the
+        // pool.
+        let reader = resident_reader();
+        let rust = Arc::new(terms_all(&["rust"]));
+        let slots = Semaphore::new(1);
+        let (busy, _release) = held_pool();
+        let mut queued = Box::pin(Arc::clone(&rust).evaluate_on_pool(
+            Arc::clone(&reader),
+            &busy,
+            &slots,
+            TermMemos::new(),
+        ));
+        assert!((&mut queued).now_or_never().is_none());
+        assert_eq!(slots.available_permits(), 0, "the queued match holds it");
+        drop(queued);
+        assert_eq!(
+            slots.available_permits(),
+            1,
+            "a dropped match gives it back"
+        );
+
+        let free = one_thread_pool();
+        timeout(
+            MUST_FINISH,
+            rust.evaluate_on_pool(reader, &free, &slots, TermMemos::new()),
+        )
+        .await
+        .expect("finishes on a free pool")
+        .expect("match");
+        assert_eq!(
+            slots.available_permits(),
+            1,
+            "a finished match gives it back"
         );
     }
 }
