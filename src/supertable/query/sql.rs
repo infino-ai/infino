@@ -1188,8 +1188,8 @@ mod tests {
         let plain = broad_scan_planned_reads(false);
         let indexed = broad_scan_planned_reads(true);
         assert_eq!(
-            plain - indexed,
-            DICTIONARY_ESTIMATE_READS * BROAD_SUPERFILES as u64,
+            plain.checked_sub(indexed),
+            Some(DICTIONARY_ESTIMATE_READS * BROAD_SUPERFILES as u64),
             "the indexed estimate read nothing: {indexed} vs {plain}"
         );
     }

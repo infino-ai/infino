@@ -2700,8 +2700,9 @@ impl TermIndex {
     }
 
     /// For each indexed superfile among `entries`, the `(term, df,
-    /// location)` of every one of `terms` it holds — what a reader needs
-    /// to build its cursors without reading the superfile's dictionary.
+    /// location)` of every one of `terms` it holds, in the order of `terms`:
+    /// what a reader needs to build its cursors without reading the
+    /// superfile's dictionary.
     pub(crate) async fn locations(
         &self,
         column: FieldId,

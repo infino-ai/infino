@@ -702,9 +702,11 @@ impl<'a> HeldTerms<'a> {
     }
 
     /// The `df` of `term` here, the same number the superfile's dictionary
-    /// holds. `0` if asked but not held, `None` if never asked.
+    /// holds. `0` if asked but not held, `None` if never asked or held with
+    /// no count (a term the index could not describe).
     pub(crate) fn df(&self, term: &str) -> Option<u64> {
         match self.entry(term) {
+            Some((_, 0, _)) => None,
             Some((_, df, _)) => Some(*df),
             None => self
                 .asked
@@ -757,11 +759,10 @@ pub(crate) async fn index_locations_for(
             .locations(column, &sorted, kept)
             .await?
             .into_iter()
-            .map(|(k, mut v)| {
-                // Sort for `HeldTerms`' binary search. Already sorted today,
-                // so this is one cheap pass; it keeps lookups right if that
-                // ever changes.
-                v.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+            .map(|(k, v)| {
+                // `locations` keeps the order of `sorted`, which
+                // `HeldTerms`' binary search needs.
+                debug_assert!(v.is_sorted_by(|a, b| a.0 <= b.0));
                 (k, Arc::new(v))
             })
             .collect(),
@@ -7816,29 +7817,37 @@ mod tests {
 
     #[test]
     fn located_terms_answer_dfs_only_for_asked_terms_in_listed_superfiles() {
-        // Asked `absent`, `alpha`, `beta`; superfile 1 holds `alpha`, `beta`.
+        // Asked `absent`, `alpha`, `beta`, `delta`; superfile 1 holds
+        // `alpha`, `beta`, and `delta` with no count.
         //  - a held term gives its `df`.
         //  - an asked term not held gives 0.
+        //  - a held term with no count (`delta`) gives `None`.
         //  - a term never asked (`gamma`) gives `None`.
         //  - an unlisted superfile gives `None`.
         // This test pins when the estimate may skip reading the superfile.
         let listed = Uuid::from_u128(1);
         let located = LocatedTerms {
-            terms: vec!["absent".into(), "alpha".into(), "beta".into()],
+            terms: vec![
+                "absent".into(),
+                "alpha".into(),
+                "beta".into(),
+                "delta".into(),
+            ],
             by_superfile: HashMap::from([(
                 listed,
                 Arc::new(vec![
                     ("alpha".to_owned(), 7, Location::None),
                     ("beta".to_owned(), 3, Location::None),
+                    ("delta".to_owned(), 0, Location::None),
                 ]),
             )]),
         };
         let held = located.held(listed).expect("a listed superfile");
-        let dfs: Vec<Option<u64>> = ["beta", "absent", "alpha", "gamma"]
+        let dfs: Vec<Option<u64>> = ["beta", "absent", "alpha", "delta", "gamma"]
             .iter()
             .map(|t| held.df(t))
             .collect();
-        assert_eq!(dfs, vec![Some(3), Some(0), Some(7), None]);
+        assert_eq!(dfs, vec![Some(3), Some(0), Some(7), None, None]);
         assert!(located.held(Uuid::from_u128(2)).is_none());
     }
 }
