@@ -1278,7 +1278,8 @@ impl Hnsw {
     /// from 0 in their old order. A survivor keeps its live neighbors and
     /// refills each slot a dropped neighbor held from that neighbor's own
     /// surviving neighbors ([`fill_vacated`]), so the region around a dropped
-    /// node stays connected and no list ends up shorter than it was.
+    /// node stays connected. A list comes back shorter only when those dropped
+    /// neighbors have too few survivors to fill its slots.
     /// `scorer` must hold the survivors first, in their new order; any nodes
     /// after them (ones about to be added with [`extend`](Self::extend)) are
     /// not read. Work grows with the survivors' neighbor lists, not with a
@@ -3765,8 +3766,8 @@ fn select_neighbors_heuristic<S: NodeScorer>(
 /// Pick up to `slots` of `candidates` (sorted nearest-first) to join `kept`.
 /// The diversity rule of [`select_neighbors_heuristic`] picks first, judged
 /// against `kept` too, so a refilled list spreads like a built one; any slots
-/// it leaves open go to the nearest candidates not yet picked, so a refilled
-/// list is never shorter than before the removal.
+/// it leaves open go to the nearest candidates not yet picked. Fewer than
+/// `slots` come back only when there are fewer candidates than slots.
 fn fill_vacated<S: NodeScorer>(
     scorer: &S,
     kept: &[u32],

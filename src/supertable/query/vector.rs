@@ -1428,12 +1428,10 @@ fn centroid_router_walk(
 /// the column's configured metric: it selects the scorer's ranking and the
 /// centroid transform, so the graph is built in the metric's own space.
 ///
-/// `serial` selects the HNSW build: the query path uses the parallel build (the
-/// router only SELECTS clusters, so its concurrent-insert reordering is
-/// harmless), while the drain-side PLACEMENT build passes `serial = true` so a
-/// retried or resumed commit that rebuilds the router scatters identical rows
-/// into identical cells (the same reason the coarse drain router uses
-/// `Hnsw::build_serial`).
+/// `serial` inserts on one thread instead of the rayon pool. Every production
+/// caller only ranks clusters with this graph and passes `false`; the drain's
+/// placement graph is built by
+/// [`SupertableReader::build_global_fine_assign_router`].
 fn build_centroid_router(
     superfiles: &[Arc<SuperfileEntry>],
     readers: &[Arc<SuperfileReader>],
@@ -5307,6 +5305,13 @@ impl SupertableReader {
     /// linear scan of the fine centroids) keeps placement log-N, so the same
     /// path is exercised at 10M, 100M and 1B, and an approximate pick is
     /// self-consistent (a nearby query walks the same graph to the same node).
+    ///
+    /// The graph comes from [`fine_graph_cache`], so it depends on what this
+    /// process built before (an update of the last graph, or a fresh build
+    /// after a restart) and is not a pure function of the section. That only
+    /// moves a borderline row between valid cells: a resumed drain redoes each
+    /// unfinished batch whole and keeps the finished ones, so no row is placed
+    /// twice or lost.
     ///
     /// Returns `None` — so the caller keeps coarse cell-grid placement — when
     /// there is nothing to place against yet (first drain, no centroid section,

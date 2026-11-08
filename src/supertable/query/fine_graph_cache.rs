@@ -22,7 +22,7 @@
 
 use std::{
     collections::HashSet,
-    sync::{LazyLock, Mutex},
+    sync::{LazyLock, Mutex, MutexGuard, PoisonError},
 };
 
 use uuid::Uuid;
@@ -54,11 +54,13 @@ pub(crate) enum GraphRole {
 /// table column (about 1.2 GB at 8.5M centroids), so the cache stays small.
 const MAX_CACHED_GRAPHS: usize = 4;
 
-/// Share of a cached graph's nodes that may be removed before the graph is
-/// rebuilt instead of updated. An updated graph keeps the quality of the build
-/// it started from, so once much of it is gone a fresh build costs little more
-/// and starts that quality over.
-const MAX_REMOVED_SHARE: f64 = 0.2;
+/// Share of a graph's nodes that may be removed or added, counted over every
+/// update since its last full build, before it is rebuilt instead of updated.
+/// An updated graph keeps the quality of the build it started from, so once
+/// much of it has changed a fresh build costs little more and starts that
+/// quality over. Counting additions keeps a table that only grows from
+/// patching one graph forever.
+const MAX_CHANGED_SHARE: f64 = 0.2;
 
 /// A graph over one table column's fine centroids, with the key of each node.
 struct CachedGraph {
@@ -70,6 +72,34 @@ struct CachedGraph {
     keys: Vec<FineNodeKey>,
     superfiles: HashSet<Uuid>,
     graph: Hnsw,
+    /// Nodes removed plus nodes added over the updates since the last full
+    /// build.
+    changed_since_build: usize,
+}
+
+impl CachedGraph {
+    /// Whether this is the `role` graph of the table column that owns any of
+    /// `superfiles`.
+    fn covers<'a>(
+        &self,
+        role: GraphRole,
+        column: FieldId,
+        dim: usize,
+        metric: Metric,
+        mut superfiles: impl Iterator<Item = &'a Uuid>,
+    ) -> bool {
+        self.role == role
+            && self.column == column
+            && self.dim == dim
+            && self.metric == metric
+            && superfiles.any(|id| self.superfiles.contains(id))
+    }
+}
+
+/// The cache, usable after a panic elsewhere left the lock poisoned: every
+/// entry is replaced whole, so none is ever left half-written.
+fn lock_cache() -> MutexGuard<'static, Vec<CachedGraph>> {
+    CACHE.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Cached graphs, least recently stored first.
@@ -85,8 +115,9 @@ pub(crate) enum GraphSource {
 }
 
 /// The `role` graph over `keys`, which must be sorted and distinct. A cached
-/// graph of the same role and table column is updated when few enough of its
-/// nodes are gone; otherwise the graph is built over every key. Returns the
+/// graph of the same role and table column is updated while few enough of its
+/// nodes have changed since its last full build; otherwise the graph is built
+/// over every key. Returns the
 /// graph, its scorer, `order` (`order[node]` is the index into `keys` of graph
 /// node `node`) and how the graph was produced. `make_scorer` receives `order`
 /// and must score the centroids of `keys` in that order. `parallel` inserts
@@ -110,27 +141,30 @@ where
         "keys must be sorted and distinct"
     );
     let params = HnswParams::default();
-    let (graph, scorer, order, source) = match take_cached(role, column, dim, metric, keys) {
-        Some(cached) => match update_plan(&cached.keys, keys) {
-            Some((keep, order, removed, added)) => {
-                let scorer = make_scorer(&order);
-                let kept = cached.graph.remove_nodes(&keep, &scorer);
-                let graph = if parallel {
-                    kept.extend(&scorer, params)
-                } else {
-                    kept.extend_serial(&scorer, params)
-                };
-                (
-                    graph,
-                    scorer,
-                    order,
-                    GraphSource::Updated { removed, added },
-                )
-            }
+    let (graph, scorer, order, source, changed_since_build) =
+        match take_cached(role, column, dim, metric, keys) {
+            Some(cached) => match update_plan(&cached.keys, cached.changed_since_build, keys) {
+                Some((keep, order, removed, added)) => {
+                    let scorer = make_scorer(&order);
+                    let changed = cached.changed_since_build + removed + added;
+                    let kept = cached.graph.remove_nodes(&keep, &scorer);
+                    let graph = if parallel {
+                        kept.extend(&scorer, params)
+                    } else {
+                        kept.extend_serial(&scorer, params)
+                    };
+                    (
+                        graph,
+                        scorer,
+                        order,
+                        GraphSource::Updated { removed, added },
+                        changed,
+                    )
+                }
+                None => build(keys, params, parallel, make_scorer),
+            },
             None => build(keys, params, parallel, make_scorer),
-        },
-        None => build(keys, params, parallel, make_scorer),
-    };
+        };
     store(CachedGraph {
         role,
         column,
@@ -139,6 +173,7 @@ where
         keys: order.iter().map(|&i| keys[i]).collect(),
         superfiles: keys.iter().map(|k| k.0).collect(),
         graph: graph.clone(),
+        changed_since_build,
     });
     (graph, scorer, order, source)
 }
@@ -148,7 +183,7 @@ fn build<S, F>(
     params: HnswParams,
     parallel: bool,
     make_scorer: F,
-) -> (Hnsw, S, Vec<usize>, GraphSource)
+) -> (Hnsw, S, Vec<usize>, GraphSource, usize)
 where
     S: NodeScorer + Sync,
     F: FnOnce(&[usize]) -> S,
@@ -160,15 +195,17 @@ where
     } else {
         Hnsw::build_serial(&scorer, params)
     };
-    (graph, scorer, order, GraphSource::Built)
+    (graph, scorer, order, GraphSource::Built, 0)
 }
 
 /// How to turn a graph over `cached` into one over `keys`: which cached nodes
 /// to keep, the new node order (survivors in their cached order, then the new
-/// keys in key order), and the removed and added counts. `None` when too many
-/// cached nodes are gone to update rather than rebuild.
+/// keys in key order), and the removed and added counts. `None` when this
+/// update together with the `changed_before` nodes of earlier ones would
+/// change too much of the graph to update rather than rebuild.
 fn update_plan(
     cached: &[FineNodeKey],
+    changed_before: usize,
     keys: &[FineNodeKey],
 ) -> Option<(Vec<bool>, Vec<usize>, usize, usize)> {
     let mut present = vec![false; keys.len()];
@@ -185,12 +222,13 @@ fn update_plan(
         }
     }
     let removed = cached.len() - order.len();
-    if removed as f64 > MAX_REMOVED_SHARE * cached.len() as f64 {
-        return None;
-    }
     let survivors = order.len();
     order.extend((0..keys.len()).filter(|&i| !present[i]));
     let added = order.len() - survivors;
+    let changed = changed_before + removed + added;
+    if changed as f64 > MAX_CHANGED_SHARE * cached.len().max(keys.len()) as f64 {
+        return None;
+    }
     Some((keep, order, removed, added))
 }
 
@@ -204,19 +242,26 @@ fn take_cached(
     metric: Metric,
     keys: &[FineNodeKey],
 ) -> Option<CachedGraph> {
-    let mut cache = CACHE.lock().expect("fine graph cache lock");
-    let at = cache.iter().position(|c| {
-        c.role == role
-            && c.column == column
-            && c.dim == dim
-            && c.metric == metric
-            && keys.iter().any(|k| c.superfiles.contains(&k.0))
-    })?;
+    let mut cache = lock_cache();
+    let at = cache
+        .iter()
+        .position(|c| c.covers(role, column, dim, metric, keys.iter().map(|k| &k.0)))?;
     Some(cache.remove(at))
 }
 
+/// Cache `entry`, replacing any graph of the same table column a concurrent
+/// build stored meanwhile, so the cache holds at most one per table column.
 fn store(entry: CachedGraph) {
-    let mut cache = CACHE.lock().expect("fine graph cache lock");
+    let mut cache = lock_cache();
+    cache.retain(|c| {
+        !c.covers(
+            entry.role,
+            entry.column,
+            entry.dim,
+            entry.metric,
+            entry.superfiles.iter(),
+        )
+    });
     cache.push(entry);
     if cache.len() > MAX_CACHED_GRAPHS {
         cache.remove(0);
@@ -327,7 +372,7 @@ mod tests {
             key(4, 0, 0),
         ];
         keys.sort();
-        let (keep, order, removed, added) = update_plan(&cached, &keys).expect("nothing removed");
+        let (keep, order, removed, added) = update_plan(&cached, 0, &keys).expect("small change");
         assert_eq!(keep, vec![true; 5]);
         assert_eq!((removed, added), (0, 1));
         let node_keys: Vec<FineNodeKey> = order.iter().map(|&i| keys[i]).collect();
@@ -336,15 +381,20 @@ mod tests {
     }
 
     #[test]
-    fn an_update_with_too_many_removals_is_a_rebuild() {
+    fn a_graph_that_changed_too_much_since_its_build_is_rebuilt() {
         let cached: Vec<FineNodeKey> = (0..10).map(|p| key(1, 0, p)).collect();
         // Seven of ten survive: 30% removed, over the limit.
-        let keys: Vec<FineNodeKey> = (0..7).map(|p| key(1, 0, p)).collect();
-        assert!(update_plan(&cached, &keys).is_none());
-        // Nine of ten survive: 10% removed, an update.
-        let keys: Vec<FineNodeKey> = (0..9).map(|p| key(1, 0, p)).collect();
-        let (keep, _, removed, added) = update_plan(&cached, &keys).expect("update");
+        let fewer: Vec<FineNodeKey> = (0..7).map(|p| key(1, 0, p)).collect();
+        assert!(update_plan(&cached, 0, &fewer).is_none());
+        // Ten survive and three are added: 30% added, over the limit too.
+        let more: Vec<FineNodeKey> = (0..13).map(|p| key(1, 0, p)).collect();
+        assert!(update_plan(&cached, 0, &more).is_none());
+        // One removed: an update...
+        let one_gone: Vec<FineNodeKey> = (0..9).map(|p| key(1, 0, p)).collect();
+        let (keep, _, removed, added) = update_plan(&cached, 0, &one_gone).expect("update");
         assert_eq!((removed, added), (1, 0));
         assert!(!keep[9]);
+        // ...unless earlier updates already changed two nodes since the build.
+        assert!(update_plan(&cached, 2, &one_gone).is_none());
     }
 }
