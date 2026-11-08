@@ -13,6 +13,8 @@
 use std::any::Any;
 use std::{sync::Arc, time::Duration};
 
+use std::{mem, ops::ControlFlow};
+
 use arrow_array::{RecordBatch, RecordBatchReader};
 use arrow_schema::SchemaRef;
 use datafusion::{
@@ -21,7 +23,10 @@ use datafusion::{
     error::DataFusionError,
     logical_expr::LogicalPlanBuilder,
     prelude::{Expr, lit},
-    sql::unparser::{expr_to_sql, plan_to_sql},
+    sql::{
+        sqlparser::ast::{self, BinaryOperator, VisitMut, visit_expressions_mut},
+        unparser::Unparser,
+    },
 };
 use serde_json::{Value, json};
 
@@ -73,12 +78,48 @@ fn mode_str(mode: BoolMode) -> &'static str {
     }
 }
 
+/// The unparser every statement for the wire is printed with: pretty, so an
+/// expression keeps only the parentheses its operators' precedence needs.
+fn unparser() -> Unparser<'static> {
+    Unparser::default().with_pretty(true)
+}
+
+/// `node` with every chain of ANDs or of ORs printed flat. The unparser wraps
+/// each binary expression in parentheses, and its pretty pass does not reach
+/// an aggregate's `FILTER (WHERE …)`, so a chain the plugin sends flat (an
+/// `exists` on an object, over each column under it) came back nested one
+/// level per OR: on 2026-11-08 the job scheduler's sweep of the alerting
+/// config, sixty-odd columns, reached the server nested past its parser's
+/// recursion limit and was refused, so no monitor was scheduled. AND and OR
+/// are associative in SQL's three-valued logic too, so the parentheses
+/// between two of the same operator mean nothing; any other keeps its own.
+fn flat_chains<V: VisitMut>(mut node: V) -> V {
+    let _ = visit_expressions_mut(&mut node, |expr| {
+        if let ast::Expr::BinaryOp { left, op, right } = expr
+            && matches!(op, BinaryOperator::And | BinaryOperator::Or)
+        {
+            for side in [left, right] {
+                if let ast::Expr::Nested(inner) = side.as_mut()
+                    && matches!(inner.as_ref(), ast::Expr::BinaryOp { op: inner_op, .. } if inner_op == op)
+                {
+                    let unwrapped =
+                        mem::replace(inner.as_mut(), ast::Expr::Value(ast::Value::Null.into()));
+                    **side = unwrapped;
+                }
+            }
+        }
+        ControlFlow::<()>::Continue(())
+    });
+    node
+}
+
 /// Render a mutation predicate to SQL for the wire. The public API takes a
 /// DataFusion `Expr`, but the endpoint takes a SQL string (the server parses it
 /// back against the table's schema), so unparse it here.
 fn predicate_to_sql(predicate: &Expr) -> Result<String, InfinoError> {
-    expr_to_sql(predicate)
-        .map(|sql| sql.to_string())
+    unparser()
+        .expr_to_sql(predicate)
+        .map(|sql| flat_chains(sql).to_string())
         .map_err(|e| {
             InfinoError::Query(format!(
                 "cannot express this predicate over the remote transport: {e}"
@@ -95,8 +136,8 @@ fn value_count_sql(table: &str, schema: &SchemaRef, column: &str) -> Result<Stri
     LogicalPlanBuilder::scan(TableReference::bare(table), source, None)
         .and_then(|scan| scan.aggregate(group, aggregate))
         .and_then(|grouped| grouped.build())
-        .and_then(|plan| plan_to_sql(&plan))
-        .map(|statement| statement.to_string())
+        .and_then(|plan| unparser().plan_to_sql(&plan))
+        .map(|statement| flat_chains(statement).to_string())
         .map_err(|e| {
             InfinoError::Query(format!(
                 "cannot express value_counts over the remote transport: {e}"
@@ -127,8 +168,8 @@ fn count_where_sql(
         })
         .and_then(|scan| scan.aggregate(Vec::<Expr>::new(), aggregates))
         .and_then(|counted| counted.build())
-        .and_then(|plan| plan_to_sql(&plan))
-        .map(|statement| statement.to_string())
+        .and_then(|plan| unparser().plan_to_sql(&plan))
+        .map(|statement| flat_chains(statement).to_string())
         .map_err(fail)
 }
 
@@ -515,7 +556,7 @@ impl Table for RemoteTable {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{sync::Arc, thread};
 
     use arrow_array::{RecordBatch, RecordBatchIterator};
     use arrow_schema::{ArrowError, DataType, Field, Schema};
@@ -524,6 +565,7 @@ mod tests {
         datasource::{empty::EmptyTable, provider_as_source},
         logical_expr::{LogicalPlanBuilder, in_subquery},
         prelude::{col, lit},
+        sql::parser::DFParserBuilder,
     };
 
     use super::{count_where_statements, value_count_sql};
@@ -549,6 +591,85 @@ mod tests {
         assert!(sql.contains("\"My Tag\""), "{sql}");
         assert!(sql.contains("GROUP BY"), "{sql}");
         assert!(sql.contains("\"count(*)\""), "{sql}");
+    }
+
+    /// Columns under the object an `exists` covers: more than the server's
+    /// parser nests (the alerting config's monitor has sixty-odd).
+    const WIDE_OR_COLUMNS: usize = 64;
+    /// The parser's recursion limit on the server, DataFusion's default
+    /// (`sql_parser.recursion_limit`).
+    const SERVER_RECURSION_LIMIT: usize = 50;
+    /// The stack the wide-expression test runs on: building and printing an
+    /// expression this deep recurses once per level, which an unoptimized
+    /// build's frames overflow on a test thread's default stack.
+    const WIDE_EXPRESSION_STACK_BYTES: usize = 16 * 1024 * 1024;
+    /// The deepest the statement's parentheses may nest: the FILTER's own,
+    /// the unparser's around the predicate, and the AND group inside it.
+    const MAX_PARENTHESIS_DEPTH: i32 = 3;
+    /// The table the alerting config is served from.
+    const ALERTING_CONFIG: &str = "os__opendistro-alerting-config";
+
+    /// A chain of ORs as wide as the plugin's `exists` on an object reaches the
+    /// server flat, so its parser takes it at its default recursion limit:
+    /// printed with a parenthesis per OR, the alerting config's sweep (sixty-odd
+    /// columns) was refused (`RecursionLimitExceeded`, 2026-11-08). Precedence
+    /// still holds where it must: an AND under an OR keeps its parentheses.
+    #[test]
+    fn a_wide_or_reaches_the_server_flat_enough_to_parse() {
+        thread::Builder::new()
+            .stack_size(WIDE_EXPRESSION_STACK_BYTES)
+            .spawn(wide_or_reaches_the_server_flat)
+            .expect("a test thread")
+            .join()
+            .expect("the test thread");
+    }
+
+    fn wide_or_reaches_the_server_flat() {
+        let names: Vec<String> = (0..WIDE_OR_COLUMNS)
+            .map(|i| format!("monitor.field_{i}"))
+            .collect();
+        let schema = Arc::new(Schema::new(
+            names
+                .iter()
+                .map(|n| Field::new(n, DataType::Utf8, true))
+                .collect::<Vec<_>>(),
+        ));
+        let any = names
+            .iter()
+            .map(|n| col(format!("\"{n}\"")).is_not_null())
+            .reduce(|a, b| a.or(b))
+            .expect("columns");
+        let grouped = col("\"monitor.field_0\"")
+            .is_not_null()
+            .and(col("\"monitor.field_1\"").is_null())
+            .or(col("\"monitor.field_2\"").is_null());
+        let statements =
+            count_where_statements(ALERTING_CONFIG, &schema, &[any, grouped]).expect("statements");
+        let sql = &statements[0].0;
+        let deepest = sql
+            .chars()
+            .scan(0i32, |depth, c| {
+                *depth += match c {
+                    '(' => 1,
+                    ')' => -1,
+                    _ => 0,
+                };
+                Some(*depth)
+            })
+            .max()
+            .unwrap_or(0);
+        assert!(
+            deepest <= MAX_PARENTHESIS_DEPTH,
+            "nested {deepest} deep: {sql}"
+        );
+        let column = |i: usize| format!(r#""{ALERTING_CONFIG}"."monitor.field_{i}""#);
+        let and_kept = format!("({} IS NOT NULL AND {} IS NULL) OR", column(0), column(1));
+        assert!(sql.contains(&and_kept), "{sql}");
+        DFParserBuilder::new(sql.as_str())
+            .with_recursion_limit(SERVER_RECURSION_LIMIT)
+            .build()
+            .and_then(|mut parser| parser.parse_statements())
+            .unwrap_or_else(|e| panic!("the server's parser refuses it: {e}\n{sql}"));
     }
 
     /// A hosted `count_where` sends every predicate in one aggregate of
