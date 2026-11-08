@@ -208,21 +208,29 @@ persisted table these do not sit in the entry: each manifest part has a
 summaries section beside it (one content-addressed object holding every
 superfile's statistics, one Arrow batch per column type, with a
 directory from column to its rows), and an entry holds its row of that
-section. A query decodes the columns it asks about: reading one column
-decodes the type group it sits in, every same-typed column's rows with
-it, once per handle for as long as the part is cached, so a handle's
-statistics cost grows with the column types its queries touch and stops
-at twice the section's bytes. A table of thousands of columns costs a
-handle no more per superfile than a table of ten. A
-section that cannot be read, or that is not its part's, leaves the
-part's superfiles without statistics for that handle: every prune keeps
-them, which is correct, and the load goes on. Such a handle never
-writes those statistics anew from the nothing it sees: an append goes
-to a part of its own, and a commit that would rewrite the part is
-refused, so the statistics wait in the section for a handle that reads
-it. The section's size counts with the part's toward the split cap,
-since a commit to the part rewrites both; the rewrite carries the old
-section's rows over as they are.
+section. The loader writes each section into the table's metadata disk
+cache, and a handle keeps only the section's header (the part id, the
+superfile ids, the directory and the group table): a query decodes the
+columns it asks about, reading the type group a column sits in back
+from the cache file on first use, every same-typed column's rows with
+it, once per handle for as long as the part is cached. So an open table
+costs each section's header, not its bytes, and a handle's statistics
+cost grows with the column types its queries touch. A table of
+thousands of columns costs a handle no more per superfile than a table
+of ten. Only a handle with no cache to read back from (an in-memory
+table, storage attached without a cache directory) keeps a section's
+bytes. A section that cannot be read, or that is not its part's, leaves
+the part's superfiles without statistics for that handle: every prune
+keeps them, which is correct, and the load goes on; a group whose cache
+file is gone when it is first read reads the same way, once, with a
+warning. Such a handle never writes those statistics anew from the
+nothing it sees: a commit that would rewrite the part first reads every
+group of its section and, when one cannot be read, appends to a part of
+its own instead, and a commit or a repair that would carry the
+unreadable entries is refused, so the statistics wait in the section
+for a handle that reads it. The section's size counts with the part's
+toward the split cap, since a commit to the part rewrites both; the
+rewrite carries the old section's rows over as they are.
 
 The list's major version moves whenever a part's statistics move out
 of the list (the summaries section, major 3; the rollups object, major

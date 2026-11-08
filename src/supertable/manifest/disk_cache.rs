@@ -36,7 +36,8 @@
 //! The two caches are independent and use separate byte budgets.
 
 use std::{
-    fs,
+    fs::{self, File},
+    io::{self, Read, Seek, SeekFrom},
     path::PathBuf,
     process,
     sync::{
@@ -129,7 +130,7 @@ impl MetadataDiskCache {
     /// pre-existing `part-<hex>.avro.zst` files and seeds the
     /// accounting index from them, so a freshly-opened process reuses
     /// the parts a prior run cached (restart survival).
-    pub fn new(cache_root: PathBuf, budget_bytes: u64) -> std::io::Result<Arc<Self>> {
+    pub fn new(cache_root: PathBuf, budget_bytes: u64) -> io::Result<Arc<Self>> {
         fs::create_dir_all(&cache_root)?;
         let cache = Self {
             cache_root,
@@ -147,7 +148,7 @@ impl MetadataDiskCache {
 
     /// The cache for this table's hidden vector index: its own directory,
     /// [`HIDDEN_INDEX_CACHE_SUBDIR`], beside this one, with the same budget.
-    pub(crate) fn for_hidden_index(&self) -> std::io::Result<Arc<Self>> {
+    pub(crate) fn for_hidden_index(&self) -> io::Result<Arc<Self>> {
         let parent = self.cache_root.parent().unwrap_or(&self.cache_root);
         Self::new(parent.join(HIDDEN_INDEX_CACHE_SUBDIR), self.budget_bytes())
     }
@@ -268,29 +269,36 @@ impl MetadataDiskCache {
     /// runs (a cancelled query) therefore leaves the cache as if it had
     /// waited: the part lands indexed and charged, never as a file the
     /// budget and eviction cannot see.
-    pub async fn put(self: &Arc<Self>, hash: ContentHash, bytes: Bytes) {
+    ///
+    /// Returns whether the bytes are in the cache afterwards, so a caller
+    /// that can read them back from here ([`Self::read_range`]) knows it
+    /// may let go of its own copy.
+    pub async fn put(self: &Arc<Self>, hash: ContentHash, bytes: Bytes) -> bool {
         if self.entries.contains_key(&hash) {
-            return;
+            return true;
         }
         let size = bytes.len() as u64;
         // A single part larger than the whole budget can never fit;
         // don't bother evicting everything for a doomed insert.
         if size > self.budget_bytes() {
-            return;
+            return false;
         }
         if !self.reserve(size) {
-            return;
+            return false;
         }
         let cache = Arc::clone(self);
         // A join error is a panic or a runtime shutting down. The cache is
         // best-effort either way, so the caller carries on.
-        let _ = spawn_blocking(move || cache.write_reserved(hash, &bytes)).await;
+        spawn_blocking(move || cache.write_reserved(hash, &bytes))
+            .await
+            .unwrap_or(false)
     }
 
     /// Write `bytes` under `hash` and index it, with `bytes.len()` already
     /// reserved. The reservation is given back when the write fails, or when
-    /// a concurrent put of the same hash indexed it first.
-    fn write_reserved(&self, hash: ContentHash, bytes: &[u8]) {
+    /// a concurrent put of the same hash indexed it first. Returns whether
+    /// the bytes are indexed afterwards.
+    fn write_reserved(&self, hash: ContentHash, bytes: &[u8]) -> bool {
         let size = bytes.len() as u64;
         let final_path = self.cache_path(&hash);
         let tmp_path = self.tmp_path(&hash);
@@ -301,7 +309,7 @@ impl MetadataDiskCache {
             // Roll back the reservation; leave no partial tmp behind.
             self.current_bytes.fetch_sub(size, Ordering::Release);
             let _ = fs::remove_file(&tmp_path);
-            return;
+            return false;
         }
 
         // Commit into the accounting index. If a concurrent put raced us to
@@ -318,6 +326,59 @@ impl MetadataDiskCache {
                 self.current_bytes.fetch_sub(size, Ordering::Release);
             }
         }
+        true
+    }
+
+    /// The size of the object cached under `hash`, when it is indexed.
+    pub(crate) fn size_of(&self, hash: &ContentHash) -> Option<u64> {
+        self.entries.get(hash).map(|entry| entry.size_bytes)
+    }
+
+    /// Read `len` bytes at `offset` of the object cached under `hash`,
+    /// without verifying them: the object was hash-verified before it was
+    /// written here, and a caller that reads a slice has nothing to check
+    /// it against. For an object a reader keeps open for a handle's life
+    /// and reads piecewise, the summaries sections beside the manifest
+    /// parts, so the handle holds the pieces it has read, not the object.
+    ///
+    /// Blocking: it reads the file on the calling thread. A caller on the
+    /// runtime wraps it in a blocking task; the section readers call it
+    /// where they decode, which is already CPU on that thread.
+    ///
+    /// An object that is not indexed, or whose file is gone, is an error of
+    /// kind `NotFound`, and a gone file leaves the index as a `get` of it
+    /// would. A range past the object's end is `UnexpectedEof`.
+    pub(crate) fn read_range(
+        &self,
+        hash: &ContentHash,
+        offset: u64,
+        len: usize,
+    ) -> io::Result<Vec<u8>> {
+        if !self.entries.contains_key(hash) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "object is not in the metadata cache",
+            ));
+        }
+        let mut file = match File::open(self.cache_path(hash)) {
+            Ok(file) => file,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                // File vanished out from under the index (manual delete,
+                // external eviction). Drop the stale entry.
+                self.drop_entry(hash);
+                self.n_misses.fetch_add(1, Ordering::AcqRel);
+                return Err(e);
+            }
+            Err(e) => return Err(e),
+        };
+        file.seek(SeekFrom::Start(offset))?;
+        let mut out = vec![0u8; len];
+        file.read_exact(&mut out)?;
+        if let Some(entry) = self.entries.get(hash) {
+            entry.last_access_us.store(self.now_us(), Ordering::Release);
+        }
+        self.n_hits.fetch_add(1, Ordering::AcqRel);
+        Ok(out)
     }
 
     /// Reserve `size` bytes of budget, evicting LRU victims as needed.
