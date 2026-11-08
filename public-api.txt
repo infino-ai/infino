@@ -1043,7 +1043,7 @@ pub fn infino::TableSchema::name_of(&self, infino::FieldId) -> core::option::Opt
 pub fn infino::TableSchema::schema_id(&self) -> u32
 pub fn infino::TableSchema::to_json(&self) -> serde_json::value::Value
 pub fn infino::TableSchema::tombstoned(&self) -> &[infino::FieldId]
-pub fn infino::TableSchema::user_schema(&self) -> alloc::sync::Arc<arrow_schema::schema::Schema>
+pub fn infino::TableSchema::user_schema(&self) -> alloc::rcs::arc::Arc<arrow_schema::schema::Schema>
 impl core::clone::Clone for infino::TableSchema
 pub fn infino::TableSchema::clone(&self) -> Self
 impl core::cmp::PartialEq for infino::TableSchema
