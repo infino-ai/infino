@@ -903,12 +903,16 @@ mod tests {
         LargeStringArray, RecordBatch, StringArray, StringViewArray,
     };
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
-    use datafusion::{datasource::MemTable, prelude::SessionContext};
+    use datafusion::{
+        datasource::MemTable,
+        prelude::{SessionContext, col, lit},
+    };
     use tokio::runtime::Runtime;
 
     use crate::{
         InfinoError,
         memory::ConnectionMemoryBudget,
+        runtime_metrics::op_stats::with_op_stats,
         storage::{LocalFsStorageProvider, StorageProvider},
         superfile::{
             builder::{FtsConfig, VectorConfig},
@@ -1129,6 +1133,65 @@ mod tests {
         let mut qopts = options_id_cat_title().with_storage(storage);
         qopts.connection_memory_budget = ConnectionMemoryBudget::with_limit(1);
         (dir, Supertable::open(qopts).expect("open"))
+    }
+
+    /// Rows per superfile in the metered-scan test. Every row holds `shared`,
+    /// so a search for it scans instead of using the index.
+    const BROAD_ROWS: usize = 300;
+    /// Superfiles in the metered-scan test, one per commit.
+    const BROAD_SUPERFILES: usize = 3;
+    /// Reads per superfile for a one-word estimate without the term index:
+    /// the dictionary, then the word's posting header.
+    const DICTIONARY_ESTIMATE_READS: u64 = 2;
+
+    /// Planned reads of a SQL scan that matches every row, with or without
+    /// a term index.
+    fn broad_scan_planned_reads(term_index: bool) -> u64 {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("localfs"));
+        let st = Supertable::create(
+            options_id_cat_title()
+                .with_storage(storage)
+                .with_term_index(term_index),
+        )
+        .expect("create");
+        for superfile in 0..BROAD_SUPERFILES {
+            let titles: Vec<String> = (0..BROAD_ROWS)
+                .map(|i| format!("shared s{superfile}d{i:03}"))
+                .collect();
+            let titles: Vec<&str> = titles.iter().map(String::as_str).collect();
+            let mut w = st.writer().expect("writer");
+            w.append(&build_cat_batch(0, &vec!["c"; BROAD_ROWS], &titles))
+                .expect("append");
+            w.commit().expect("commit");
+        }
+        let reader = st.reader().expect("reader");
+        let (ids, stats) =
+            with_op_stats(|| reader.scan_ids_matching(col("title").like(lit("shared %"))));
+        assert_eq!(
+            ids.expect("scan").len(),
+            BROAD_ROWS * BROAD_SUPERFILES,
+            "every row matches"
+        );
+        stats.planned_read_ranges
+    }
+
+    #[test]
+    fn a_metered_scan_estimates_from_the_term_index() {
+        // `title LIKE 'shared %'` on 3 superfiles, every row matches.
+        //  - every superfile is scanned, so no postings are read.
+        //  - the only reads that differ are the estimate's: 2 per superfile
+        //    without the index, 0 with it.
+        // This test pins that the SQL scan passes the term index to the
+        // estimate.
+        let plain = broad_scan_planned_reads(false);
+        let indexed = broad_scan_planned_reads(true);
+        assert_eq!(
+            plain.checked_sub(indexed),
+            Some(DICTIONARY_ESTIMATE_READS * BROAD_SUPERFILES as u64),
+            "the indexed estimate read nothing: {indexed} vs {plain}"
+        );
     }
 
     /// Build a small categorical batch — start id sequence at
