@@ -925,6 +925,7 @@ const MAX_LEVEL: u32 = 63;
 /// A built HNSW graph. Node-major adjacency: `neighbors[node][level]` is
 /// node `node`'s neighbor list at `level`, present for
 /// `level <= node_level[node]`.
+#[derive(Clone)]
 pub(crate) struct Hnsw {
     neighbors: Vec<Vec<Vec<u32>>>,
     node_level: Vec<u32>,
@@ -1175,6 +1176,29 @@ impl Hnsw {
     /// grows only where a new node links back into it (bounded by the reverse
     /// -link cap + heuristic shrink).
     pub(crate) fn extend<S: NodeScorer + Sync>(self, scorer: &S, params: HnswParams) -> Hnsw {
+        self.extend_impl(scorer, params, true)
+    }
+
+    /// Deterministic counterpart to [`extend`](Self::extend): inserts the new
+    /// nodes serially in id order, so the same graph and scorer always give
+    /// the same result.
+    pub(crate) fn extend_serial<S: NodeScorer + Sync>(
+        self,
+        scorer: &S,
+        params: HnswParams,
+    ) -> Hnsw {
+        self.extend_impl(scorer, params, false)
+    }
+
+    fn extend_impl<S: NodeScorer + Sync>(
+        self,
+        scorer: &S,
+        params: HnswParams,
+        parallel: bool,
+    ) -> Hnsw {
+        if self.len == 0 {
+            return Self::build_impl(scorer, params, parallel);
+        }
         let prior = self.len;
         let total = scorer.len();
         if total <= prior {
@@ -1212,10 +1236,17 @@ impl Hnsw {
             ef_construction: params.ef_construction,
         };
 
-        (prior as u32..total as u32).into_par_iter().for_each_init(
-            || VisitedSet::new(total),
-            |visited, node| builder.insert(scorer, node, visited),
-        );
+        if parallel {
+            (prior as u32..total as u32).into_par_iter().for_each_init(
+                || VisitedSet::new(total),
+                |visited, node| builder.insert(scorer, node, visited),
+            );
+        } else {
+            let mut visited = VisitedSet::new(total);
+            for node in prior as u32..total as u32 {
+                builder.insert(scorer, node, &mut visited);
+            }
+        }
 
         let entry = builder
             .entry
@@ -1238,6 +1269,99 @@ impl Hnsw {
             m0: params.m0,
             ef_construction: params.ef_construction,
             len: total,
+            #[cfg(feature = "graph-index")]
+            compact_base: false,
+        }
+    }
+
+    /// Drop every node whose `keep` flag is false and renumber the survivors
+    /// from 0 in their old order. A survivor keeps its live neighbors and
+    /// refills each slot a dropped neighbor held from that neighbor's own
+    /// surviving neighbors ([`fill_vacated`]), so the region around a dropped
+    /// node stays connected and no list ends up shorter than it was.
+    /// `scorer` must hold the survivors first, in their new order; any nodes
+    /// after them (ones about to be added with [`extend`](Self::extend)) are
+    /// not read. Work grows with the survivors' neighbor lists, not with a
+    /// rebuild's search.
+    pub(crate) fn remove_nodes<S: NodeScorer>(self, keep: &[bool], scorer: &S) -> Hnsw {
+        assert_eq!(keep.len(), self.len, "keep must flag every node");
+        let mut remap = vec![u32::MAX; self.len];
+        let mut next = 0u32;
+        for (old, &kept) in keep.iter().enumerate() {
+            if kept {
+                remap[old] = next;
+                next += 1;
+            }
+        }
+        let survivors = next as usize;
+        assert!(scorer.len() >= survivors, "scorer must hold every survivor");
+
+        let mut neighbors = Vec::with_capacity(survivors);
+        let mut node_level = Vec::with_capacity(survivors);
+        for old in (0..self.len).filter(|&old| keep[old]) {
+            let lists = &self.neighbors[old];
+            let mut kept_lists = Vec::with_capacity(lists.len());
+            for (level, list) in lists.iter().enumerate() {
+                // Live neighbors stay as they are; only the slots of dropped
+                // ones are refilled, from those dropped nodes' own neighbors.
+                let mut kept: Vec<u32> = list
+                    .iter()
+                    .filter(|&&nb| keep[nb as usize])
+                    .map(|&nb| remap[nb as usize])
+                    .collect();
+                let vacated = list.len() - kept.len();
+                if vacated > 0 {
+                    let mut through: Vec<u32> = list
+                        .iter()
+                        .filter(|&&nb| !keep[nb as usize])
+                        .filter_map(|&nb| self.neighbors[nb as usize].get(level))
+                        .flatten()
+                        .filter(|&&x| x as usize != old && keep[x as usize])
+                        .map(|&x| remap[x as usize])
+                        .filter(|x| !kept.contains(x))
+                        .collect();
+                    through.sort_unstable();
+                    through.dedup();
+                    let prep = scorer.prepare_node(remap[old]);
+                    let mut scored: Vec<Scored> = through
+                        .into_iter()
+                        .map(|node| Scored {
+                            node,
+                            dist: scorer.score(&prep, node),
+                        })
+                        .collect();
+                    scored.sort_unstable();
+                    let cap = if level == 0 { self.m0 } else { self.m };
+                    let slots = vacated.min(cap.saturating_sub(kept.len()));
+                    kept.extend(fill_vacated(scorer, &kept, scored, slots));
+                }
+                kept_lists.push(kept);
+            }
+            neighbors.push(kept_lists);
+            node_level.push(self.node_level[old]);
+        }
+
+        // The entry stays if it survived; otherwise the tallest survivor
+        // (lowest id on a tie) takes over, so descent still starts at the top.
+        let entry = if survivors == 0 {
+            0
+        } else if keep[self.entry as usize] {
+            remap[self.entry as usize]
+        } else {
+            let top = node_level.iter().copied().max().unwrap_or(0);
+            node_level
+                .iter()
+                .position(|&level| level == top)
+                .unwrap_or(0) as u32
+        };
+        Hnsw {
+            neighbors,
+            node_level,
+            entry,
+            m: self.m,
+            m0: self.m0,
+            ef_construction: self.ef_construction,
+            len: survivors,
             #[cfg(feature = "graph-index")]
             compact_base: false,
         }
@@ -3638,6 +3762,39 @@ fn select_neighbors_heuristic<S: NodeScorer>(
     selected
 }
 
+/// Pick up to `slots` of `candidates` (sorted nearest-first) to join `kept`.
+/// The diversity rule of [`select_neighbors_heuristic`] picks first, judged
+/// against `kept` too, so a refilled list spreads like a built one; any slots
+/// it leaves open go to the nearest candidates not yet picked, so a refilled
+/// list is never shorter than before the removal.
+fn fill_vacated<S: NodeScorer>(
+    scorer: &S,
+    kept: &[u32],
+    candidates: Vec<Scored>,
+    slots: usize,
+) -> Vec<u32> {
+    let mut picked: Vec<u32> = Vec::with_capacity(slots);
+    let mut passed: Vec<u32> = Vec::new();
+    for cand in candidates {
+        if picked.len() >= slots {
+            break;
+        }
+        let prep = scorer.prepare_node(cand.node);
+        let diverse = kept
+            .iter()
+            .chain(&picked)
+            .all(|&r| scorer.score(&prep, r) >= cand.dist);
+        if diverse {
+            picked.push(cand.node);
+        } else {
+            passed.push(cand.node);
+        }
+    }
+    let open = slots - picked.len();
+    picked.extend(passed.into_iter().take(open));
+    picked
+}
+
 /// Sequential reference build, retained only to anchor the timed
 /// serial-vs-parallel comparison test. Same insertion algorithm the
 /// parallel [`Hnsw::build`] runs, without the per-node locking — so it is
@@ -4284,6 +4441,117 @@ mod tests {
         let new_node = (n0 + delta / 2) as u32;
         let found = incremental.search(&scorer, &vectors[new_node as usize], 1, 64);
         assert_eq!(found[0].0, new_node, "appended node must be reachable");
+    }
+
+    /// Dimension of the vectors in the remove / churn tests.
+    const CHURN_DIM: usize = 32;
+    /// Neighbors returned per query when measuring recall.
+    const CHURN_K: usize = 10;
+    /// Search beam when measuring recall.
+    const CHURN_EF: usize = 64;
+    /// Largest recall gap allowed between an updated graph and a rebuild.
+    const CHURN_RECALL_SLACK: f64 = 0.03;
+
+    /// Recall@`CHURN_K` of `graph` against brute force over `scorer`.
+    fn recall_against_truth<S: NodeScorer>(graph: &Hnsw, scorer: &S, queries: &[Vec<f32>]) -> f64 {
+        let mut hit = 0usize;
+        for q in queries {
+            let truth: HashSet<u32> = brute_force(scorer, q, CHURN_K).into_iter().collect();
+            hit += graph
+                .search(scorer, q, CHURN_K, CHURN_EF)
+                .into_iter()
+                .filter(|(node, _)| truth.contains(node))
+                .count();
+        }
+        hit as f64 / (queries.len() * CHURN_K) as f64
+    }
+
+    #[test]
+    fn a_serial_extend_is_deterministic() {
+        let (n0, total) = (800usize, 1200usize);
+        let vectors = random_unit_vectors(total, CHURN_DIM, 0x5E41A1);
+        let prior_scorer = Sq16Scorer::from_unit_vectors(&vectors[..n0], CHURN_DIM);
+        let scorer = Sq16Scorer::from_unit_vectors(&vectors, CHURN_DIM);
+        let extend = || {
+            Hnsw::build_serial(&prior_scorer, HnswParams::default())
+                .extend_serial(&scorer, HnswParams::default())
+                .to_bytes()
+        };
+        assert_eq!(extend(), extend());
+    }
+
+    #[test]
+    fn removing_nodes_keeps_recall_close_to_a_rebuild() {
+        let n = 2000usize;
+        let vectors = random_unit_vectors(n, CHURN_DIM, 0xDE1E7E);
+        let scorer = Sq16Scorer::from_unit_vectors(&vectors, CHURN_DIM);
+        let graph = Hnsw::build_serial(&scorer, HnswParams::default());
+
+        // Drop every fifth node, the entry point among them.
+        let mut keep: Vec<bool> = (0..n).map(|i| i % 5 != 0).collect();
+        keep[graph.entry as usize] = false;
+        let survivors: Vec<Vec<f32>> = (0..n)
+            .filter(|&i| keep[i])
+            .map(|i| vectors[i].clone())
+            .collect();
+        let survivor_scorer = Sq16Scorer::from_unit_vectors(&survivors, CHURN_DIM);
+
+        let removed = graph.remove_nodes(&keep, &survivor_scorer);
+        assert_eq!(removed.len(), survivors.len());
+        let rebuilt = Hnsw::build_serial(&survivor_scorer, HnswParams::default());
+
+        let queries = random_unit_vectors(60, CHURN_DIM, 0xC0FFEE3);
+        let removed_recall = recall_against_truth(&removed, &survivor_scorer, &queries);
+        let rebuilt_recall = recall_against_truth(&rebuilt, &survivor_scorer, &queries);
+        assert!(
+            removed_recall >= rebuilt_recall - CHURN_RECALL_SLACK,
+            "after removal {removed_recall:.3}, rebuild {rebuilt_recall:.3}"
+        );
+        // Every survivor is still reachable by its own vector.
+        for (node, v) in survivors.iter().enumerate().step_by(37) {
+            let found = removed.search(&survivor_scorer, v, 1, CHURN_EF);
+            assert_eq!(found[0].0, node as u32, "survivor {node} unreachable");
+        }
+    }
+
+    #[test]
+    fn repeated_remove_and_extend_tracks_a_rebuild() {
+        let (start, rounds, churn) = (1500usize, 6usize, 300usize);
+        let pool = random_unit_vectors(start + rounds * churn, CHURN_DIM, 0xC4A2);
+        // Live vectors in graph order; each round drops `churn` of them and
+        // appends `churn` fresh ones, the way a drain and its merges replace
+        // fine clusters.
+        let mut live: Vec<Vec<f32>> = pool[..start].to_vec();
+        let mut graph = Hnsw::build_serial(
+            &Sq16Scorer::from_unit_vectors(&live, CHURN_DIM),
+            HnswParams::default(),
+        );
+        let queries = random_unit_vectors(60, CHURN_DIM, 0xC0FFEE4);
+        for round in 0..rounds {
+            let keep: Vec<bool> = (0..live.len())
+                .map(|i| (i + round) % (live.len() / churn) != 0)
+                .collect();
+            live = live
+                .into_iter()
+                .zip(&keep)
+                .filter(|(_, k)| **k)
+                .map(|(v, _)| v)
+                .collect();
+            graph = graph.remove_nodes(&keep, &Sq16Scorer::from_unit_vectors(&live, CHURN_DIM));
+            let fresh = start + round * churn;
+            live.extend_from_slice(&pool[fresh..fresh + churn]);
+            let scorer = Sq16Scorer::from_unit_vectors(&live, CHURN_DIM);
+            graph = graph.extend_serial(&scorer, HnswParams::default());
+            assert_eq!(graph.len(), live.len());
+
+            let rebuilt = Hnsw::build_serial(&scorer, HnswParams::default());
+            let updated_recall = recall_against_truth(&graph, &scorer, &queries);
+            let rebuilt_recall = recall_against_truth(&rebuilt, &scorer, &queries);
+            assert!(
+                updated_recall >= rebuilt_recall - CHURN_RECALL_SLACK,
+                "round {round}: updated {updated_recall:.3}, rebuild {rebuilt_recall:.3}"
+            );
+        }
     }
 
     /// A full `hnsw` bundle (graph + node→doc-id map + Sq16 plane)

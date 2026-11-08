@@ -85,7 +85,7 @@ use futures::{StreamExt, TryStreamExt, stream};
 use roaring::RoaringBitmap;
 use rustc_hash::FxHashSet;
 use tokio::{join, sync::OnceCell};
-use tracing::{Instrument, warn};
+use tracing::{Instrument, debug, warn};
 use uuid::Uuid;
 
 pub use crate::superfile::reader::VectorSearchOptions;
@@ -109,7 +109,7 @@ use crate::{
                 Metric, dequantize_sq16_adaptive_into, distance, normalize, relative_score_window,
             },
             flat::Sq4FlatIndex,
-            hnsw::{self, HnswParams, Plane, Sq4Scorer, Sq16Scorer, encode_hnsw},
+            hnsw::{self, Fp32Scorer, HnswParams, Plane, Sq4Scorer, Sq16Scorer, encode_hnsw},
             layout::VectorLayout,
             reader::{
                 EMPTY_FILTER_SELECTIVITY_MULT, ProbeTally, ScanCandidate, ScanOutcome,
@@ -136,6 +136,7 @@ use crate::{
             exec::common::{
                 SCORE_COLUMN, id_score_batch, resolve_hits_named, take_rows_byte_source,
             },
+            fine_graph_cache::{self, FineNodeKey, GraphRole},
             fts::{memo_from_locations, memos_from_plan_locations},
             provider::prune_leaves_for_filters,
             prune::{PruneLeaf, select_superfiles},
@@ -1444,16 +1445,41 @@ fn build_centroid_router(
     serial: bool,
     superseded: Option<&BTreeMap<Uuid, BTreeSet<u32>>>,
 ) -> Result<CentroidRouterGraph, QueryError> {
-    use crate::superfile::vector::hnsw::{Fp32Scorer, Hnsw, HnswParams};
-    let (vecs, node_map) = centroid_router_walk(
+    let (vecs, walk_map) = centroid_router_walk(
         superfiles, readers, column, column_id, section, metric, superseded,
     )?;
-    let scorer = Fp32Scorer::from_vectors(&vecs, dim, metric);
-    let graph = if serial {
-        Hnsw::build_serial(&scorer, HnswParams::default())
-    } else {
-        Hnsw::build(&scorer, HnswParams::default())
-    };
+    // Key each node by (superfile id, flat cluster) so the previous build of
+    // this table's graph can be updated rather than rebuilt.
+    let mut keyed: Vec<(FineNodeKey, usize)> = walk_map
+        .iter()
+        .enumerate()
+        .map(|(i, &(si, flat))| ((superfiles[si].superfile_id, None, flat), i))
+        .collect();
+    keyed.sort_unstable_by_key(|(key, _)| *key);
+    let (keys, walk_index): (Vec<FineNodeKey>, Vec<usize>) = keyed.into_iter().unzip();
+    let mut vecs = vecs;
+    let (graph, scorer, order, source) = fine_graph_cache::cached_graph(
+        GraphRole::Router,
+        column_id,
+        dim,
+        metric,
+        &keys,
+        !serial,
+        |order| {
+            let ordered: Vec<Vec<f32>> = order
+                .iter()
+                .map(|&i| mem::take(&mut vecs[walk_index[i]]))
+                .collect();
+            Fp32Scorer::from_vectors(&ordered, dim, metric)
+        },
+    );
+    debug!(
+        column,
+        ?source,
+        nodes = order.len(),
+        "centroid router graph"
+    );
+    let node_map = order.iter().map(|&i| walk_map[walk_index[i]]).collect();
     Ok(CentroidRouterGraph {
         scorer,
         graph,
@@ -5309,42 +5335,65 @@ impl SupertableReader {
         if centroids.is_empty() {
             return None;
         }
+        let empty_superseded = BTreeMap::new();
+        let superseded = manifest.get_superseded_cells().unwrap_or(&empty_superseded);
+        // Key every centroid by (superfile, cell, position in the cell). A
+        // cell's centroids arrive together, so the position is a running count.
+        let mut keyed: Vec<(FineNodeKey, Vec<f32>)> = Vec::with_capacity(centroids.len());
+        let mut last: Option<(Uuid, Option<u32>)> = None;
+        let mut pos = 0u32;
+        for (superfile_id, cell_id, mut v) in centroids {
+            if last == Some((superfile_id, cell_id)) {
+                pos += 1;
+            } else {
+                last = Some((superfile_id, cell_id));
+                pos = 0;
+            }
+            gfc_prepare_for_metric(metric, &mut v);
+            keyed.push(((superfile_id, cell_id, pos), v));
+        }
+        keyed.sort_unstable_by_key(|(key, _)| *key);
+        let (keys, mut vecs): (Vec<FineNodeKey>, Vec<Vec<f32>>) = keyed.into_iter().unzip();
+        let (graph, scorer, order, source) = fine_graph_cache::cached_graph(
+            GraphRole::Placement,
+            column_id,
+            dim,
+            metric,
+            &keys,
+            false,
+            |order| {
+                let ordered: Vec<Vec<f32>> =
+                    order.iter().map(|&i| mem::take(&mut vecs[i])).collect();
+                Fp32Scorer::from_vectors(&ordered, dim, metric)
+            },
+        );
+        debug!(column, ?source, nodes = order.len(), "fine placement graph");
         // `node_to_cell[node]` is the owning cell straight from the section. A
         // node whose cell has been SUPERSEDED by an in-place split is left as the
         // `u32::MAX` sentinel and skipped at assign time, so a row is never
         // placed into a superseded parent (which every query path filters out);
         // it falls back to a live cell instead.
-        let empty_superseded = BTreeMap::new();
-        let superseded = manifest.get_superseded_cells().unwrap_or(&empty_superseded);
-        let mut vecs: Vec<Vec<f32>> = Vec::with_capacity(centroids.len());
-        let mut node_map: Vec<(usize, u32)> = Vec::with_capacity(centroids.len());
-        let mut node_to_cell: Vec<u32> = Vec::with_capacity(centroids.len());
-        let mut any = false;
-        for (node, (superfile_id, cell_id, mut v)) in centroids.into_iter().enumerate() {
-            let cell = match cell_id {
-                Some(c)
-                    if !superseded
-                        .get(&superfile_id)
-                        .is_some_and(|s| s.contains(&c)) =>
-                {
-                    any = true;
-                    c
+        let node_to_cell: Vec<u32> = order
+            .iter()
+            .map(|&i| {
+                let (superfile_id, cell_id, _) = keys[i];
+                match cell_id {
+                    Some(c)
+                        if !superseded
+                            .get(&superfile_id)
+                            .is_some_and(|s| s.contains(&c)) =>
+                    {
+                        c
+                    }
+                    _ => u32::MAX,
                 }
-                _ => u32::MAX,
-            };
-            gfc_prepare_for_metric(metric, &mut v);
-            vecs.push(v);
-            node_map.push((node, node as u32));
-            node_to_cell.push(cell);
-        }
-        if !any {
+            })
+            .collect();
+        if node_to_cell.iter().all(|&c| c == u32::MAX) {
             return None;
         }
-        // Serial build so a retried/resumed drain that rebuilds the router from
-        // the same section scatters identical rows into identical cells.
-        use crate::superfile::vector::hnsw::{Fp32Scorer, Hnsw, HnswParams};
-        let scorer = Fp32Scorer::from_vectors(&vecs, dim, metric);
-        let graph = Hnsw::build_serial(&scorer, HnswParams::default());
+        let node_map: Vec<(usize, u32)> =
+            (0..order.len()).map(|node| (node, node as u32)).collect();
         let stamped = Arc::new(StampedCentroidRouter {
             generation: manifest.manifest_id,
             column: column.to_string(),
