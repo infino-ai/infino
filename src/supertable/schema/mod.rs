@@ -322,7 +322,11 @@ impl TableSchema {
     }
 
     /// The user schema: every live column in declared order, unstamped.
-    pub(crate) fn user_schema(&self) -> Arc<Schema> {
+    /// What [`Supertable::schema`](crate::Supertable::schema) answers for
+    /// an open table, from the document alone, so a caller that has the
+    /// document from [`Connection::schema`](crate::Connection::schema)
+    /// gets the Arrow view without opening the table.
+    pub fn user_schema(&self) -> Arc<Schema> {
         Arc::new(Schema::new(
             self.fields
                 .iter()

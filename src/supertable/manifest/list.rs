@@ -2516,6 +2516,30 @@ pub fn decode(bytes: &[u8], legacy: &LegacyNames) -> Result<Manifest, ListParseE
     list_from_dto(dto, legacy)
 }
 
+/// The schema document a list carries, and nothing else of the list: the
+/// part entries, their aggregates and the rest are skipped over, so a
+/// describe of a table with thousands of columns and hundreds of parts
+/// pays for the document alone. `None` on a list written before the
+/// document was carried; the caller then derives the schema from the
+/// creation record, as a full load does.
+pub fn decode_schema(bytes: &[u8]) -> Result<Option<Arc<TableSchema>>, ListParseError> {
+    #[derive(Deserialize)]
+    struct SchemaDto {
+        format_version: String,
+        #[serde(default)]
+        schema: Value,
+    }
+    let dto: SchemaDto = serde_json::from_slice(bytes)?;
+    check_major(&dto.format_version)?;
+    match &dto.schema {
+        Value::Object(_) => Ok(Some(Arc::new(
+            TableSchema::from_json(&dto.schema)
+                .map_err(|e| ListParseError::BadFieldValue("schema", e))?,
+        ))),
+        _ => Ok(None),
+    }
+}
+
 fn check_major(fv: &str) -> Result<(), ListParseError> {
     let supported_major = FORMAT_VERSION
         .split('.')
@@ -4768,6 +4792,36 @@ mod tests {
         let decoded = decode(&legacy, &LegacyNames::none()).expect("decode");
         assert!(decoded.schema.is_none(), "an empty slot is no document");
         assert!(decoded.commit_token.is_nil());
+    }
+
+    /// A describe decodes the document and skips the rest of the list: the
+    /// same document a full decode yields, and no document where the full
+    /// decode has none.
+    #[test]
+    fn decode_schema_reads_the_document_alone() {
+        let list = rich_list(1);
+        let bytes = encode(&list).expect("encode");
+        let document = decode_schema(&bytes).expect("decode");
+        assert_eq!(document, list.schema);
+        assert_eq!(
+            document,
+            decode(&bytes, &LegacyNames::none()).expect("decode").schema
+        );
+
+        let mut legacy: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        legacy["schema"] = serde_json::Value::Null;
+        let legacy = serde_json::to_vec(&legacy).expect("json");
+        assert!(
+            decode_schema(&legacy).expect("decode").is_none(),
+            "a list without a document has none to read"
+        );
+
+        let bytes = restamped(&list, "5.0");
+        let err = decode_schema(&bytes).expect_err("major 5 must reject");
+        assert!(
+            matches!(err, ListParseError::IncompatibleMajorVersion { .. }),
+            "expected IncompatibleMajorVersion, got {err:?}"
+        );
     }
 
     #[test]

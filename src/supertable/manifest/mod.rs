@@ -1061,6 +1061,32 @@ impl ManifestSnapshot {
         Self::load_with_pointer(current_manifest, storage, options, pointer).await
     }
 
+    /// The committed manifest's schema document, from the pointer and the
+    /// list alone: no part, summaries section or rollup is read, so a
+    /// describe costs the list whatever the table's width and superfile
+    /// count. A load keeps every part's entries and sections resident,
+    /// which at thousands of columns over thousands of superfiles is
+    /// gigabytes per table — far more than a describe of every table in a
+    /// database can hold at once.
+    ///
+    /// `None` when the list carries no document (written before one was),
+    /// for the caller to derive from the creation record as
+    /// [`Self::table_schema`] does. An absent pointer is the error
+    /// [`Self::load`] makes of it.
+    pub(crate) async fn read_schema_document(
+        storage: &dyn StorageProvider,
+    ) -> Result<Option<Arc<TableSchema>>, ManifestLoadError> {
+        let (pointer, _) = match read_pointer(storage).await? {
+            Some(p) => p,
+            None => return Err(ManifestLoadError::PointerNotFound),
+        };
+        let (list_bytes, _) = storage
+            .get(&pointer.manifest_uri)
+            .await
+            .map_err(ManifestLoadError::Storage)?;
+        list::decode_schema(&list_bytes).map_err(ManifestLoadError::ListParse)
+    }
+
     /// [`Self::load`] with the pointer already in hand. Split out so
     /// the refresh path can read the pointer itself (conditionally,
     /// via [`probe_pointer`]) and still share the list + parts
