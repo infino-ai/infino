@@ -122,6 +122,7 @@ use crate::{
         error::QueryError,
         manifest::{
             ColumnStats, ManifestSnapshot, add_sum_arrays, hll::HllSketch, list::ScalarValueCounts,
+            load_section_groups,
         },
         query::{
             candidate::{
@@ -1865,6 +1866,24 @@ impl TableProvider for SupertableProvider {
         // Every surviving superfile's tombstones, before the per-superfile
         // sweep below.
         self.prefetch_tombstones(&survivor_entries, now).await;
+
+        // The projected columns' statistics, read and decoded off the
+        // runtime, before the scan node's statistics read them in place
+        // below. No projection reads every column.
+        let statistics_columns: Vec<FieldId> = match projection {
+            Some(indices) => indices
+                .iter()
+                .filter_map(|i| self.schema.fields().get(*i))
+                .filter_map(|field| self.manifest.field_id(field.name()))
+                .collect(),
+            None => self
+                .schema
+                .fields()
+                .iter()
+                .filter_map(|field| self.manifest.field_id(field.name()))
+                .collect(),
+        };
+        load_section_groups(&survivor_entries, &statistics_columns).await;
 
         // A counting scan reads no row where a range index counts it (see
         // `range_count_exec`).

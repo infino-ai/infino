@@ -851,6 +851,25 @@ impl SummariesSection {
         })
     }
 
+    /// Read and decode, now, every group that holds a row of one of
+    /// `columns`, so the readers that follow find them decoded. Blocking:
+    /// the loader's caller runs it off the runtime
+    /// ([`load_section_groups`](super::load_section_groups)). A group that
+    /// cannot be read reads as it would on first use.
+    pub(crate) fn decode_groups_of(&self, columns: &[FieldId]) {
+        for column in columns {
+            let first = self
+                .directory
+                .partition_point(|entry| entry.field < *column);
+            for entry in self.directory[first..]
+                .iter()
+                .take_while(|entry| entry.field == *column)
+            {
+                let _ = self.group(entry.group as usize);
+            }
+        }
+    }
+
     /// Whether every group decodes, reading each that has not been read:
     /// what a writer asks before it re-encodes the section's rows into a
     /// new section, or carries an entry's statistics into a rewritten

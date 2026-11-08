@@ -213,7 +213,10 @@ cache, and a handle keeps only the section's header (the part id, the
 superfile ids, the directory and the group table): a query decodes the
 columns it asks about, reading the type group a column sits in back
 from the cache file on first use, every same-typed column's rows with
-it, once per handle for as long as the part is cached. So an open table
+it, once per handle for as long as the part is cached. The pruner and
+the scan read and decode the groups of the columns they test or project
+as blocking tasks before they read them, so a query's runtime threads do
+not wait on the file. So an open table
 costs each section's header, not its bytes, and a handle's statistics
 cost grows with the column types its queries touch. A table of
 thousands of columns costs a handle no more per superfile than a table

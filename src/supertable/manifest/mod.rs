@@ -56,8 +56,10 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     f32::consts::PI,
     fmt,
+    num::NonZeroUsize,
     ops::Deref,
     sync::{Arc, OnceLock},
+    thread::available_parallelism,
 };
 
 use arrow::compute::kernels::aggregate as agg;
@@ -66,7 +68,9 @@ use arrow_schema::{DataType, TimeUnit};
 use bytes::Bytes;
 use dashmap::{DashMap, DashSet};
 use futures::{
-    future, stream,
+    future,
+    future::join_all,
+    stream,
     stream::{StreamExt, TryStreamExt},
 };
 /// Re-export the per-column skip aggregates so callers can refer to them as
@@ -4323,6 +4327,56 @@ impl ScalarStats {
             Self::Unavailable => false,
         }
     }
+}
+
+/// Read and decode, off the runtime, the summaries section groups that
+/// hold `columns` for `entries`, before a caller on the runtime reads them.
+///
+/// The statistics readers are synchronous (the pruner, the planner's
+/// statistics, the rollup fold), and a section group is read back from the
+/// metadata disk cache and decoded on first use, which on a wide table is
+/// megabytes per part. A query path that knows its columns calls this
+/// first, so the read and the decode run as blocking tasks, a few sections
+/// each and as many tasks as the machine has threads, and the readers find
+/// the groups decoded. A reader that was not preceded by a load still
+/// works: it reads the group where it stands. Entries whose statistics are
+/// inline or unavailable have nothing to load.
+pub(crate) async fn load_section_groups(entries: &[Arc<SuperfileEntry>], columns: &[FieldId]) {
+    if columns.is_empty() {
+        return;
+    }
+    // Each section once: a part's entries share theirs. The set of
+    // addresses stays in this block, off the future across the await.
+    let sections: Vec<Arc<SummariesSection>> = {
+        let mut seen: FxHashSet<*const SummariesSection> = FxHashSet::default();
+        entries
+            .iter()
+            .filter_map(|entry| match &entry.scalar_stats {
+                ScalarStats::Section { section, .. } => Some(section),
+                ScalarStats::Inline(_) | ScalarStats::Unavailable => None,
+            })
+            .filter(|section| seen.insert(Arc::as_ptr(section)))
+            .cloned()
+            .collect()
+    };
+    if sections.is_empty() {
+        return;
+    }
+    let tasks = available_parallelism().map_or(1, NonZeroUsize::get);
+    let per_task = sections.len().div_ceil(tasks);
+    let columns: Arc<[FieldId]> = Arc::from(columns);
+    let loads = sections.chunks(per_task).map(|chunk| {
+        let chunk = chunk.to_vec();
+        let columns = Arc::clone(&columns);
+        spawn_blocking(carry_span(move || {
+            for section in chunk {
+                section.decode_groups_of(&columns);
+            }
+        }))
+    });
+    // A task that does not finish leaves its groups to be read on first
+    // use, which reads them as before; nothing is lost.
+    join_all(loads).await;
 }
 
 /// The map's own shape for tests that build and inspect decoded entries.
@@ -9538,6 +9592,8 @@ mod tests {
     /// Room for every part and section of the test tables in a metadata
     /// cache.
     const SECTION_TEST_CACHE_BUDGET_BYTES: u64 = 1 << 20;
+    /// A field id no test table has.
+    const NO_SUCH_COLUMN: FieldId = FieldId(u32::MAX);
 
     /// The options of [`published_sectioned_table`] with a metadata disk
     /// cache under `dir`, as a table opened with a cache directory has.
@@ -9619,6 +9675,40 @@ mod tests {
         assert!(
             section.resident_bytes() < reference.size_bytes as usize,
             "less than the section"
+        );
+    }
+
+    /// A query path loads the groups of the columns it will read before
+    /// it reads them: after the load the section holds those groups
+    /// decoded, read back from the cache off the runtime, and the readers
+    /// answer from them. A column nobody named is not loaded.
+    #[tokio::test]
+    async fn the_groups_a_query_names_are_loaded_before_it_reads_them() {
+        let (dir, storage, _, _) = published_sectioned_table().await;
+        let amount = fid("amount");
+        let (cached_opts, _cache) = opts_with_cache(&dir);
+        let loaded = ManifestSnapshot::load(None, Arc::clone(&storage), Some(cached_opts))
+            .await
+            .expect("load");
+        let entries = loaded.get_all_superfiles();
+        let section = Arc::clone(entries[0].scalar_stats.section().expect("a section"));
+
+        load_section_groups(entries, &[]).await;
+        assert_eq!(section.resident_bytes(), 0, "no column, nothing loaded");
+        load_section_groups(entries, &[NO_SUCH_COLUMN]).await;
+        assert_eq!(section.resident_bytes(), 0, "a column no group holds");
+
+        load_section_groups(entries, &[amount]).await;
+        let loaded_bytes = section.resident_bytes();
+        assert!(loaded_bytes > 0, "the column's group is decoded");
+        assert_eq!(
+            entries[1].scalar_stats.get(amount).as_ref(),
+            Some(&sectioned_stats(vec![10, 20]))
+        );
+        assert_eq!(
+            section.resident_bytes(),
+            loaded_bytes,
+            "the read found the group decoded"
         );
     }
 
