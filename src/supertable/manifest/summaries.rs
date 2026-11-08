@@ -857,17 +857,35 @@ impl SummariesSection {
     /// ([`load_section_groups`](super::load_section_groups)). A group that
     /// cannot be read reads as it would on first use.
     pub(crate) fn decode_groups_of(&self, columns: &[FieldId]) {
-        for column in columns {
+        for index in self.groups_of(columns) {
+            let _ = self.group(index);
+        }
+    }
+
+    /// Whether every group that holds a row of one of `columns` has been
+    /// read, decoded or not: what a query asks before it hands a section to
+    /// [`Self::decode_groups_of`], so a warm handle starts no task. Cheap:
+    /// it reads nothing.
+    pub(crate) fn groups_of_read(&self, columns: &[FieldId]) -> bool {
+        self.groups_of(columns).all(|index| {
+            self.decoded
+                .get(index)
+                .is_none_or(|cell| cell.get().is_some())
+        })
+    }
+
+    /// The groups that hold a row of one of `columns`, a group once per
+    /// column that names it.
+    fn groups_of<'a>(&'a self, columns: &'a [FieldId]) -> impl Iterator<Item = usize> + 'a {
+        columns.iter().flat_map(move |column| {
             let first = self
                 .directory
                 .partition_point(|entry| entry.field < *column);
-            for entry in self.directory[first..]
+            self.directory[first..]
                 .iter()
-                .take_while(|entry| entry.field == *column)
-            {
-                let _ = self.group(entry.group as usize);
-            }
-        }
+                .take_while(move |entry| entry.field == *column)
+                .map(|entry| entry.group as usize)
+        })
     }
 
     /// Whether every group decodes, reading each that has not been read:

@@ -4340,7 +4340,9 @@ impl ScalarStats {
 /// each and as many tasks as the machine has threads, and the readers find
 /// the groups decoded. A reader that was not preceded by a load still
 /// works: it reads the group where it stands. Entries whose statistics are
-/// inline or unavailable have nothing to load.
+/// inline or unavailable have nothing to load, and neither has a section
+/// whose groups for `columns` are already read, so a warm handle answers
+/// without starting a task.
 pub(crate) async fn load_section_groups(entries: &[Arc<SuperfileEntry>], columns: &[FieldId]) {
     if columns.is_empty() {
         return;
@@ -4356,6 +4358,7 @@ pub(crate) async fn load_section_groups(entries: &[Arc<SuperfileEntry>], columns
                 ScalarStats::Inline(_) | ScalarStats::Unavailable => None,
             })
             .filter(|section| seen.insert(Arc::as_ptr(section)))
+            .filter(|section| !section.groups_of_read(columns))
             .cloned()
             .collect()
     };
@@ -9698,7 +9701,12 @@ mod tests {
         load_section_groups(entries, &[NO_SUCH_COLUMN]).await;
         assert_eq!(section.resident_bytes(), 0, "a column no group holds");
 
+        assert!(!section.groups_of_read(&[amount]));
         load_section_groups(entries, &[amount]).await;
+        assert!(
+            section.groups_of_read(&[amount]),
+            "a warm handle loads nothing"
+        );
         let loaded_bytes = section.resident_bytes();
         assert!(loaded_bytes > 0, "the column's group is decoded");
         assert_eq!(
