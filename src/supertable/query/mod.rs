@@ -25,6 +25,7 @@ pub mod covered_agg;
 pub mod df_object_store;
 pub mod dispatch;
 pub mod exec;
+pub(crate) mod fine_graph_cache;
 pub mod fts;
 #[cfg(feature = "graph-index")]
 pub mod graph;
