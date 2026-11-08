@@ -1045,6 +1045,10 @@ mod tests {
     /// cold read, as the rest of a query (hit lookup, operators) holds it.
     const SHARED_BUDGET: u64 = 100 * KB;
 
+    /// Share of the limit a download may use in the share tests: room for a quarter of the
+    /// ceiling but not that plus a tenth, so one admission fits and a second does not.
+    const DOWNLOAD_SHARE_PERCENT: usize = 30;
+
     /// A budget whose ceiling is half held outside any cold read, the
     /// ceiling, and that outside reservation.
     fn half_held_budget() -> (Arc<ConnectionMemoryBudget>, usize, Reservation) {
@@ -1077,7 +1081,6 @@ mod tests {
     /// for it to come back instead of failing, and past the share the download gets nothing.
     #[tokio::test]
     async fn a_refused_cold_read_waits_for_a_download_admitted_within_its_share() {
-        const DOWNLOAD_SHARE_PERCENT: usize = 30;
         let budget = ConnectionMemoryBudget::with_limit(SHARED_BUDGET);
         let ceiling = budget.limit().expect("bounded");
         let download = budget

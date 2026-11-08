@@ -161,8 +161,8 @@ pub enum DiskCacheError {
     BudgetExceeded,
     /// A background download found no room in its memory budget for its first chunk. Queries come
     /// first: the download stops before its first GET, and a read after `FAILED_FILL_RETRY_AFTER`
-    /// starts it again. A download with chunks done waits for room instead.
-    #[error("memory budget has no room for a background download's next chunk")]
+    /// starts it again. Once it has reserved its disk, a download waits for room instead.
+    #[error("memory budget has no room for a background download's first chunk")]
     FillOverMemoryBudget,
     /// An invalid or conflicting configuration was supplied.
     #[error("config: {0}")]
