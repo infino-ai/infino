@@ -445,7 +445,10 @@ fn non_range_conjunct_declines_rewrite_and_stays_exact() {
     let sum_sql = format!("SELECT SUM(rating) FROM supertable WHERE {where_clause}");
 
     assert_eq!(scalar_i64(&st, &count_sql), commit_range_count(1, 2) - 1);
-    assert_eq!(scalar_i64(&st, &sum_sql), commit_range_sum(1, 2) - 1005);
+    assert_eq!(
+        scalar_i64(&st, &sum_sql),
+        commit_range_sum(1, 2) - DELETED_RATING
+    );
 
     let plan = explain(&st, &count_sql);
     assert!(
@@ -454,8 +457,14 @@ fn non_range_conjunct_declines_rewrite_and_stays_exact() {
     );
 }
 
-#[test]
-fn tombstoned_covered_segment_demotes_to_residual() {
+/// The rating of the one row [`build_tombstoned_table`] deletes, inside
+/// commit 1.
+const DELETED_RATING: i64 = 1005;
+
+/// The fixture table on storage with a disk cache (so deletes are tracked
+/// in a tombstone cache), with the row rated [`DELETED_RATING`] deleted.
+/// The temp dirs are returned so they outlive the table.
+fn build_tombstoned_table() -> (Supertable, TempDir, TempDir) {
     let dir = TempDir::new().expect("tempdir");
     let cache_dir = TempDir::new().expect("cache");
     let storage: Arc<dyn StorageProvider> =
@@ -486,12 +495,19 @@ fn tombstoned_covered_segment_demotes_to_residual() {
         w.commit().expect("commit");
     }
 
-    // Delete one row INSIDE the would-be-covered range: rating 1005.
-    let pending = w.delete(col("rating").eq(lit(1005i64))).expect("delete");
+    let pending = w
+        .delete(col("rating").eq(lit(DELETED_RATING)))
+        .expect("delete");
     assert_eq!(pending.matched, 1);
     w.commit().expect("commit delete");
     drop(w);
+    (st, dir, cache_dir)
+}
 
+#[test]
+fn tombstoned_covered_segment_demotes_to_residual() {
+    // The deleted row sits INSIDE the would-be-covered range.
+    let (st, _dir, _cache_dir) = build_tombstoned_table();
     let where_range = "rating BETWEEN 1000 AND 2999";
     let count_sql = format!("SELECT COUNT(*) FROM supertable WHERE {where_range}");
     let sum_sql = format!("SELECT SUM(rating) FROM supertable WHERE {where_range}");
@@ -500,13 +516,42 @@ fn tombstoned_covered_segment_demotes_to_residual() {
     // pre-delete numbers; the demotion must surface the post-delete
     // truth.
     assert_eq!(scalar_i64(&st, &count_sql), commit_range_count(1, 2) - 1);
-    assert_eq!(scalar_i64(&st, &sum_sql), commit_range_sum(1, 2) - 1005);
+    assert_eq!(
+        scalar_i64(&st, &sum_sql),
+        commit_range_sum(1, 2) - DELETED_RATING
+    );
     // A column's count from its null count would still hold the deleted row.
     let count_column_sql = format!("SELECT COUNT(category) FROM supertable WHERE {where_range}");
     assert_eq!(
         scalar_i64(&st, &count_column_sql),
         commit_range_count(1, 2) - 1
     );
+}
+
+/// An unfiltered aggregate over a table with deletes answers the clean
+/// segments from statistics and scans only the segment with the delete,
+/// instead of scanning every segment.
+#[test]
+fn unfiltered_aggregates_scan_only_segments_with_deletes() {
+    let (st, _dir, _cache_dir) = build_tombstoned_table();
+    let count_sql = "SELECT COUNT(*) FROM supertable";
+    let sum_sql = "SELECT SUM(rating) FROM supertable";
+
+    assert_eq!(
+        scalar_i64(&st, count_sql),
+        (COMMITS * ROWS_PER_COMMIT) as i64 - 1
+    );
+    assert_eq!(
+        scalar_i64(&st, sum_sql),
+        commit_range_sum(0, COMMITS - 1) - DELETED_RATING
+    );
+    for sql in [count_sql, sum_sql] {
+        let plan = explain(&st, sql);
+        assert!(
+            plan.contains("__resid_"),
+            "{sql}: clean segments must come from statistics:\n{plan}"
+        );
+    }
 }
 
 /// `IN`-list scalar pruning must keep every superfile holding a listed
