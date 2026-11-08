@@ -11,9 +11,7 @@
 
 #[cfg(any(test, feature = "test-helpers"))]
 use std::any::Any;
-use std::{sync::Arc, time::Duration};
-
-use std::{mem, ops::ControlFlow};
+use std::{mem, ops::ControlFlow, sync::Arc, time::Duration};
 
 use arrow_array::{RecordBatch, RecordBatchReader};
 use arrow_schema::SchemaRef;
