@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Process-wide cache of the fine-centroid graphs (the drain's placement graph
 //! and the graph queries route with), so a new generation updates the previous
 //! generation's graph instead of rebuilding it over every fine centroid.
