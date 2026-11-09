@@ -110,6 +110,7 @@ pub mod check_hits_probe {
     }
 
     static RECORDS: Mutex<Vec<(u64, Outcome)>> = Mutex::new(Vec::new());
+    static LEFT_OUT: Mutex<Vec<(u64, usize)>> = Mutex::new(Vec::new());
 
     /// Called by the query path (test-helpers builds only).
     pub fn record(kept: u64, outcome: Outcome) {
@@ -117,6 +118,26 @@ pub mod check_hits_probe {
             .lock()
             .expect("check-hits probe lock")
             .push((kept, outcome));
+    }
+
+    /// Called by the query path when a check round leaves out `cells` cells
+    /// holding no kept row (test-helpers builds only).
+    pub fn record_left_out(kept: u64, cells: usize) {
+        LEFT_OUT
+            .lock()
+            .expect("check-hits probe lock")
+            .push((kept, cells));
+    }
+
+    /// Cells left out, over every check, for a filter that kept `kept` rows.
+    pub fn left_out(kept: u64) -> usize {
+        LEFT_OUT
+            .lock()
+            .expect("check-hits probe lock")
+            .iter()
+            .filter(|(k, _)| *k == kept)
+            .map(|(_, cells)| cells)
+            .sum()
     }
 
     /// Every outcome recorded for a filter that kept `kept` rows.

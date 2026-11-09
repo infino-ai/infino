@@ -21,7 +21,7 @@
 
 #![deny(clippy::unwrap_used)]
 
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::HashSet, mem::swap, sync::Arc};
 
 use arrow_array::{ArrayRef, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
@@ -1234,7 +1234,7 @@ fn filtered_knn_after_drain_maps_kept_rows_from_every_user_superfile() {
         .iter_mut()
         .zip(second.iter_mut())
         .step_by(2 * SPREAD_MATCH_EVERY)
-        .for_each(|(a, b)| std::mem::swap(a, b));
+        .for_each(|(a, b)| swap(a, b));
     let query = centers[0].clone();
     let titles = needle_titles(
         &rows,
@@ -1317,14 +1317,15 @@ fn narrow_filter_after_drain_maps_kept_rows() {
     );
 }
 
-/// A broad filter that leaves out the query's own group, so the hits near
-/// the query fail the filter far more often than its share predicts.
-/// Checking gives up and the kept rows are mapped, so the result is the
-/// mapped path's: k rows, every one kept by the filter. (Not asserted to be
-/// the exact top k: with the query's group gone, the nearest kept group can
-/// sit in a cell the routed search does not read, on either path.)
+/// A broad filter that leaves out the query's own group, so every hit near
+/// the query fails the filter. The filtered search never reads that group's
+/// cells; the check leaves them out after its first round and reads the
+/// next cells, as the filtered search does: k rows, every one kept by the
+/// filter. (Not asserted to be the exact top k: with the query's group gone,
+/// the nearest kept group can sit in a cell the routed search does not read,
+/// on either path.)
 #[test]
-fn filter_tied_to_the_query_after_drain_gives_up_checking() {
+fn filter_tied_to_the_query_after_drain_reads_past_its_group() {
     let (centers, rows) = tight_spread_rows();
     let query = centers[0].clone();
     let is_match = |i: usize| i >= SPREAD_ROWS_PER_GROUP;
@@ -1361,8 +1362,8 @@ fn filter_tied_to_the_query_after_drain_gives_up_checking() {
     );
     let outcomes = check_hits_probe::outcomes(kept_rows(&rows, is_match));
     assert!(
-        outcomes.contains(&Outcome::GaveUp) && !outcomes.contains(&Outcome::Checked),
-        "the query's own group fails the filter, so checking must give up, got {outcomes:?}"
+        outcomes.contains(&Outcome::Checked) && !outcomes.contains(&Outcome::GaveUp),
+        "the query's own group is left out, so checking reads past it, got {outcomes:?}"
     );
 }
 
@@ -1478,9 +1479,9 @@ fn needle_search(
 /// rows than that group holds: the hits run past the group into kept ones,
 /// so the pass rate alone looks healthy. But the left-out group's cells give
 /// many hits and no pass, so they hold no kept row; the filtered search
-/// would not read them. Checking gives up and the kept rows are mapped.
+/// would not read them. The check leaves them out and reads past them.
 #[test]
-fn broad_filter_with_an_empty_cell_near_the_query_gives_up_checking() {
+fn broad_filter_with_an_empty_cell_near_the_query_reads_past_it() {
     /// More than one group's rows, so the hits reach a kept group.
     const K: usize = 40;
 
@@ -1504,8 +1505,47 @@ fn broad_filter_with_an_empty_cell_near_the_query_gives_up_checking() {
     );
     let outcomes = check_hits_probe::outcomes(kept_rows(&rows, is_match));
     assert!(
-        outcomes.contains(&Outcome::GaveUp) && !outcomes.contains(&Outcome::Checked),
-        "the query's own cells hold no kept row, so checking must give up, got {outcomes:?}"
+        outcomes.contains(&Outcome::Checked) && !outcomes.contains(&Outcome::GaveUp),
+        "the query's own cells hold no kept row, so checking reads past them, got {outcomes:?}"
+    );
+}
+
+/// A broad filter tied to the groups: it keeps two groups in three, so some
+/// cells hold no kept row. Two such cells near this query give the search
+/// only one or two hits each, all failing, too few to tell by count alone.
+/// The filtered search skips them and reads the next cells, one of which
+/// holds the 5th nearest kept row. The check leaves the failing cells out
+/// and reads the next cells too, so it returns the same top k.
+#[test]
+fn broad_filter_tied_to_the_groups_reads_past_cells_without_kept_rows() {
+    /// Wide groups, so neighbouring groups share the cells near a query.
+    const NOISE: f32 = 0.3;
+    /// Queries drawn after the corpus; the last one has the few-hit cells.
+    const QUERY_DRAWS: usize = 50;
+    /// Keeps the rows of two groups in every three.
+    fn two_groups_in_three(i: usize) -> bool {
+        !(i / SPREAD_ROWS_PER_GROUP).is_multiple_of(3)
+    }
+
+    let mut rng = StdRng::seed_from_u64(SPREAD_SEED);
+    let centers = spread_centers(&mut rng);
+    let rows = grouped_rows(&mut rng, &centers, SPREAD_ROWS_PER_GROUP, NOISE);
+    let query: Vec<f32> = (0..QUERY_DRAWS)
+        .map(|_| (0..DIM).map(|_| rng.random_range(-1.0f32..1.0)).collect())
+        .last()
+        .expect("fixture: queries drawn");
+    let titles = needle_titles(&rows, two_groups_in_three, &query, SPREAD_K);
+    let (_dir, st) = drained_table(SPREAD_CELLS, &titles, rows.concat());
+    assert_filtered_top_k_is_best(&st, &query, SPREAD_K);
+    let kept = kept_rows(&rows, two_groups_in_three);
+    let outcomes = check_hits_probe::outcomes(kept);
+    assert!(
+        outcomes.contains(&Outcome::Checked),
+        "the broad filter must be served by checking hits, got {outcomes:?}"
+    );
+    assert!(
+        check_hits_probe::left_out(kept) > 0,
+        "the check must leave out a cell holding no kept row"
     );
 }
 
@@ -1520,9 +1560,25 @@ fn broad_filter_after_drain_checks_hits_from_every_user_superfile() {
     }
     const COMMITS: usize = 2;
 
-    let (centers, rows) = tight_spread_rows();
+    let (centers, mut rows) = tight_spread_rows();
+    // Move every other row into the second commit, so both commits hold
+    // kept rows near the query.
+    let half = rows.len() / COMMITS;
+    let (first, second) = rows.split_at_mut(half);
+    first
+        .iter_mut()
+        .zip(second.iter_mut())
+        .step_by(2)
+        .for_each(|(a, b)| swap(a, b));
     let query = centers[0].clone();
     let titles = needle_titles(&rows, two_in_three, &query, SPREAD_K);
+    let best_rows: Vec<usize> = (0..titles.len())
+        .filter(|&i| titles[i].ends_with(" best"))
+        .collect();
+    assert!(
+        best_rows.iter().any(|&i| i < half) && best_rows.iter().any(|&i| i >= half),
+        "fixture: the true top-{SPREAD_K} must span both commits, got rows {best_rows:?}"
+    );
     let (_dir, st) = drained_table_in_commits(SPREAD_CELLS, &titles, rows.concat(), COMMITS);
     let user_superfiles = st.reader().expect("reader").manifest().superfiles.len();
     assert!(
