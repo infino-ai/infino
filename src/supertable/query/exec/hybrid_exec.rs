@@ -259,6 +259,7 @@ impl SupertableReader {
                         k,
                         options,
                         scope.allow.clone(),
+                        None,
                     )
                     .await?
                 }

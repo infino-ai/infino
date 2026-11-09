@@ -69,7 +69,9 @@ use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet},
     future::Future,
+    iter::repeat_n,
     mem,
+    ops::Range,
     sync::{
         Arc, Mutex, OnceLock, PoisonError,
         atomic::{self, AtomicU64},
@@ -90,7 +92,7 @@ use uuid::Uuid;
 
 pub use crate::superfile::reader::VectorSearchOptions;
 #[cfg(feature = "test-helpers")]
-use crate::test_helpers::{admit_trace, served_shortlist_probe};
+use crate::test_helpers::{admit_trace, check_hits_probe, served_shortlist_probe};
 #[cfg(feature = "detailed-tracing")]
 use crate::utils::trace::OpOrigin;
 use crate::{
@@ -179,6 +181,37 @@ const DELETE_REFILL_GROWTH_FACTOR: usize = 2;
 /// blind to the filter, so matching rows can sit entirely in cells the
 /// query never reads.
 const MATCHING_CELLS_READ_FACTOR: u64 = 2;
+
+/// A filter that keeps at least this share of the vector index's rows is
+/// served by checking hits ([`SupertableReader::drained_hits_by_check`])
+/// instead of mapping its rows into the index. Mapping reads every index
+/// row's `_id` whatever the filter keeps; checking instead ranks about
+/// `k ÷ share` hits, so it wins when the share is broad. Measured on a 1M-row
+/// table, checking won at half the rows kept and lost at a tenth for
+/// k = 100. Mapping grows with the table and checking does not, so this
+/// share is conservative on larger tables: it never picks checking where
+/// mapping is cheaper.
+const CHECK_HITS_MIN_SHARE: f64 = 0.5;
+
+/// Hits asked for on top of `k ÷ share kept`, so that a round with an
+/// unlucky pass rate still finds k passing hits.
+const CHECK_HITS_SLACK: f64 = 1.5;
+
+/// The check gives up and maps the filter's rows when a round's pass rate is
+/// below the filter's share kept divided by this. Such a filter is tied to
+/// the vectors, keeping few rows near the query, and more rounds would only
+/// add cost.
+const CHECK_HITS_GIVE_UP_FACTOR: f64 = 4.0;
+
+/// Rounds of checking before the filter's rows are mapped instead.
+const CHECK_HITS_MAX_ROUNDS: usize = 3;
+
+/// Rows of a cell checked first when all its hits failed the filter, spread
+/// evenly over the cell, before the rest. A filter that keeps rows at random
+/// keeps one of these with near certainty (all 16 fail with odds 1 in 65,536
+/// at half the rows kept), so only a cell the filter really wipes out has
+/// every row checked.
+const CHECK_CELL_SAMPLE_ROWS: usize = 16;
 
 test_visible! {
 /// Fallback fine-probe scale for untagged (pre-grid) user manifests, and
@@ -671,6 +704,71 @@ fn filtered_k(k: usize, matches: u64, rows: u64) -> usize {
     usize::try_from(scaled).unwrap_or(usize::MAX).max(k)
 }
 
+/// Hits to ask for so that, at `pass_rate`, about `k` x [`CHECK_HITS_SLACK`]
+/// of them pass. At least `k`; the float-to-int cast saturates.
+fn hits_for_pass_rate(k: usize, pass_rate: f64) -> usize {
+    ((k as f64 / pass_rate * CHECK_HITS_SLACK).ceil() as usize).max(k)
+}
+
+/// The hits the next check round asks for, after a round that asked for
+/// `want`, got `returned` and found `passed < k` of them kept; `None` gives
+/// up. It gives up when another round cannot help (the index returned fewer
+/// hits than asked, or `want` already covers every row) or would cost too
+/// much (the pass rate is below `share ÷ CHECK_HITS_GIVE_UP_FACTOR`, so the
+/// rows near the query are mostly filtered out). Otherwise it asks for
+/// enough hits at the pass rate seen, less one pass so a lucky round does
+/// not undersize the next, and at least double, so rounds stay few.
+fn next_check_want(
+    k: usize,
+    want: usize,
+    returned: usize,
+    passed: usize,
+    share: f64,
+    max_want: usize,
+) -> Option<usize> {
+    let pass_rate = passed as f64 / returned.max(1) as f64;
+    if returned < want || want >= max_want || pass_rate < share / CHECK_HITS_GIVE_UP_FACTOR {
+        return None;
+    }
+    let cautious_rate = passed.saturating_sub(1).max(1) as f64 / returned as f64;
+    Some(
+        hits_for_pass_rate(k, cautious_rate)
+            .max(want.saturating_mul(2))
+            .min(max_want),
+    )
+}
+
+/// Each cell that gave a hit, and whether the filter kept any of its hits.
+/// `cells[i]` is hit i's cell (see [`hit_cells`]) and `passed[i]` whether
+/// the filter kept it; a hit in an untagged cell names no cell.
+fn cell_passes(cells: &[Option<u32>], passed: &[bool]) -> HashMap<u32, bool> {
+    let mut by_cell: HashMap<u32, bool> = HashMap::new();
+    for (cell, &pass) in cells.iter().zip(passed) {
+        if let Some(cell) = cell {
+            *by_cell.entry(*cell).or_default() |= pass;
+        }
+    }
+    by_cell
+}
+
+/// The cell of each hit, from `layout`. `None` for a hit in an untagged or
+/// superseded cell, or in a superfile outside `layout`.
+fn hit_cells(hits: &[SuperfileHit], layout: &CellLayout) -> Vec<Option<u32>> {
+    let by_uri: HashMap<SuperfileUri, &[(Option<u32>, Range<u32>)]> = layout
+        .iter()
+        .map(|(uri, cells)| (*uri, cells.as_slice()))
+        .collect();
+    hits.iter()
+        .map(|hit| {
+            by_uri
+                .get(&hit.superfile)?
+                .iter()
+                .find(|(_, rows)| rows.contains(&hit.local_doc_id))?
+                .0
+        })
+        .collect()
+}
+
 /// The k a filtered query reads the width and depth laws at:
 /// [`filtered_k`] over `matching` (allowed rows per cell) and every live
 /// row of `superfiles`. Each drain wave puts its rows into the same cells,
@@ -734,6 +832,106 @@ fn postings_by_cell_from_summaries(
         }
     }
     (postings, any_tagged)
+}
+
+/// Each superfile's cells in summary order, with the local ids each holds:
+/// a superfile's rows follow its cells in that order (see [`allowed_cells`]).
+/// A superseded cell names no cell, as the search never reads it.
+type CellLayout = Vec<(SuperfileUri, Vec<(Option<u32>, Range<u32>)>)>;
+
+/// The [`CellLayout`] of `superfiles` for `column`, off the summaries alone,
+/// so no superfile is opened. A superfile with no summary for `column` is
+/// absent. `None` when a superfile's cells hold more rows than a local id
+/// can number.
+fn cell_layout(
+    superfiles: &[Arc<SuperfileEntry>],
+    column: FieldId,
+    superseded: &BTreeMap<Uuid, BTreeSet<u32>>,
+) -> Option<CellLayout> {
+    let mut layout = Vec::new();
+    for entry in superfiles {
+        let Some(summary) = entry.vector_summary.get(&column) else {
+            continue;
+        };
+        let mut cells = Vec::with_capacity(summary.cells.len());
+        let mut doc_base = 0u32;
+        for cell in &summary.cells {
+            let doc_end = doc_base.checked_add(u32::try_from(cell_rows(cell)).ok()?)?;
+            let cell_id = cell
+                .cell_id
+                .filter(|_| !cell_is_superseded(superseded, entry.superfile_id, cell.cell_id));
+            cells.push((cell_id, doc_base..doc_end));
+            doc_base = doc_end;
+        }
+        layout.push((entry.uri, cells));
+    }
+    Some(layout)
+}
+
+/// Every row of `layout`, by superfile, except the rows of the cells in
+/// `left_out`. A superfile with no row left is absent, which the search
+/// reads as no admitted row.
+fn indexed_rows_outside(
+    layout: &CellLayout,
+    left_out: &HashSet<u32>,
+) -> HashMap<SuperfileUri, Arc<RoaringBitmap>> {
+    let mut rows = HashMap::new();
+    for (uri, cells) in layout {
+        let mut bm = RoaringBitmap::new();
+        for (cell_id, cell_rows) in cells {
+            if !cell_id.is_some_and(|id| left_out.contains(&id)) {
+                bm.insert_range(cell_rows.clone());
+            }
+        }
+        if !bm.is_empty() {
+            rows.insert(*uri, Arc::new(bm));
+        }
+    }
+    rows
+}
+
+/// Where each of `cells` keeps its rows in `layout`: per superfile, in
+/// layout order, the local ids it holds. A cell with no row is absent.
+fn cell_row_ranges(
+    layout: &CellLayout,
+    cells: &HashSet<u32>,
+) -> HashMap<u32, Vec<(SuperfileUri, Range<u32>)>> {
+    let mut ranges: HashMap<u32, Vec<(SuperfileUri, Range<u32>)>> = HashMap::new();
+    for (uri, layout_cells) in layout {
+        for (cell_id, cell_rows) in layout_cells {
+            if let Some(id) = cell_id.filter(|id| cells.contains(id))
+                && !cell_rows.is_empty()
+            {
+                ranges
+                    .entry(id)
+                    .or_default()
+                    .push((*uri, cell_rows.clone()));
+            }
+        }
+    }
+    ranges
+}
+
+/// Up to `n` rows of a cell laid out as `ranges`, spread evenly over all of
+/// them (every row when the cell has `n` or fewer), as hits to check
+/// against a filter; their scores are unused. Spread rather than the first
+/// `n`: a cell's rows run oldest superfile first, so a filter on time would
+/// fail a prefix of them.
+fn spread_row_hits(ranges: &[(SuperfileUri, Range<u32>)], n: usize) -> Vec<SuperfileHit> {
+    let total: usize = ranges.iter().map(|(_, rows)| rows.len()).sum();
+    let step = total.div_ceil(n.max(1)).max(1);
+    ranges
+        .iter()
+        .flat_map(|(uri, rows)| {
+            rows.clone().map(move |local_doc_id| SuperfileHit {
+                superfile: *uri,
+                local_doc_id,
+                score: 0.0,
+                stable_id: None,
+            })
+        })
+        .step_by(step)
+        .collect()
 }
 
 /// 1-bit admit window for `ranked_cells` distinct tagged cells: the
@@ -1988,6 +2186,18 @@ pub(crate) async fn lookup_user_placements_by_id_opt(
     user_row_ids: &[i128],
     op_stats: &Option<Arc<OpStatsCollector>>,
 ) -> Result<Vec<Option<(Arc<SuperfileEntry>, u32)>>, QueryError> {
+    lookup_user_placements_in(manifest, user_row_ids, op_stats, |_| true).await
+}
+
+/// [`lookup_user_placements_by_id_opt`] over only the live superfiles
+/// `searched` accepts: an id that only other superfiles own is `None`, and
+/// their `_id` columns are never read nor indexed.
+async fn lookup_user_placements_in(
+    manifest: &ManifestSnapshot,
+    user_row_ids: &[i128],
+    op_stats: &Option<Arc<OpStatsCollector>>,
+    searched: impl Fn(&SuperfileEntry) -> bool,
+) -> Result<Vec<Option<(Arc<SuperfileEntry>, u32)>>, QueryError> {
     if user_row_ids.is_empty() {
         return Ok(Vec::new());
     }
@@ -1997,6 +2207,16 @@ pub(crate) async fn lookup_user_placements_by_id_opt(
         .await
         .map_err(QueryError::ManifestLoad)?;
     let mut placements: Vec<Option<(Arc<SuperfileEntry>, u32)>> = vec![None; user_row_ids.len()];
+    // The ids' positions in id order, so each superfile finds the ids inside
+    // its `[id_min, id_max]` span by binary search instead of scanning every
+    // id: O(files x log ids) rather than O(files x ids).
+    let mut by_id: Vec<usize> = (0..user_row_ids.len()).collect();
+    by_id.sort_unstable_by_key(|&index| user_row_ids[index]);
+    let in_span = |entry: &SuperfileEntry| {
+        let start = by_id.partition_point(|&index| user_row_ids[index] < entry.id_min);
+        let end = by_id.partition_point(|&index| user_row_ids[index] <= entry.id_max);
+        &by_id[start..end.max(start)]
+    };
     let mut gapped = Vec::new();
     // Uris in the current fresh read list, to evict cache entries for superfiles
     // that have since been superseded/GC'd (keeps the cache bounded to the live
@@ -2005,13 +2225,13 @@ pub(crate) async fn lookup_user_placements_by_id_opt(
 
     for entry in entries {
         live_uris.insert(entry.uri);
-        let matching: Vec<usize> = user_row_ids
+        if !searched(&entry) {
+            continue;
+        }
+        let matching: Vec<usize> = in_span(&entry)
             .iter()
-            .enumerate()
-            .filter_map(|(index, &id)| {
-                (placements[index].is_none() && id >= entry.id_min && id <= entry.id_max)
-                    .then_some(index)
-            })
+            .copied()
+            .filter(|&index| placements[index].is_none())
             .collect();
         if matching.is_empty() {
             continue;
@@ -2101,11 +2321,9 @@ pub(crate) async fn lookup_user_placements_by_id_opt(
         // both physical rows to `read_ids_for_locals` — first-wins resolves it to
         // the same superfile the pre-cache full scan did.
         for (entry, index) in &built {
-            for (i, &id) in user_row_ids.iter().enumerate() {
+            for &i in in_span(entry) {
                 if placements[i].is_none()
-                    && id >= entry.id_min
-                    && id <= entry.id_max
-                    && let Some(local) = index.local_for(id)
+                    && let Some(local) = index.local_for(user_row_ids[i])
                 {
                     placements[i] = Some((Arc::clone(entry), local));
                 }
@@ -4831,8 +5049,16 @@ impl SupertableReader {
         if superfiles.is_empty() {
             return Ok(Vec::new());
         }
-        self.vector_fanout_over_superfiles(superfiles.to_vec(), column, query, k, options, None)
-            .await
+        self.vector_fanout_over_superfiles(
+            superfiles.to_vec(),
+            column,
+            query,
+            k,
+            options,
+            None,
+            None,
+        )
+        .await
     }
 
     /// Global-fine fanout (`vector.ivf_router = centroid_graph`, reading the
@@ -5421,6 +5647,13 @@ impl SupertableReader {
     /// search and the filtered one; `hybrid_search`'s vector leg calls it
     /// directly so a pushed-down `WHERE` scopes both of its retrievers to
     /// the same superfiles and rows.
+    ///
+    /// `k_route`, on a filtered hidden-index search, is the k the width and
+    /// depth laws are read at in place of the one derived from `allow`'s
+    /// share of the rows. A caller that admits more rows than its filter
+    /// keeps (and checks the hits itself) passes the filter's own share, so
+    /// the search reads where the filtered search would. `None` everywhere
+    /// else.
     pub(crate) async fn vector_fanout_over_superfiles(
         &self,
         superfiles: Vec<Arc<SuperfileEntry>>,
@@ -5429,6 +5662,7 @@ impl SupertableReader {
         k: usize,
         options: VectorSearchOptions,
         allow: Option<HashMap<SuperfileUri, Arc<RoaringBitmap>>>,
+        k_route: Option<usize>,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
         let filtered = allow.is_some();
         let (resolved_nprobe, _) = options.resolve(filtered);
@@ -5713,11 +5947,12 @@ impl SupertableReader {
             .filter(|m| !m.is_empty());
         // The k nearest matching rows sit as far out as the `k_route`
         // nearest rows, so the width and depth laws are read at `k_route`.
-        let k_route = match &matching_by_cell {
-            Some(matching) => op_stats::timed_kernel(&self.op_stats, || {
+        let k_route = match (&matching_by_cell, k_route) {
+            (Some(_), Some(k_route)) => k_route,
+            (Some(matching), None) => op_stats::timed_kernel(&self.op_stats, || {
                 filtered_route_k(&superfiles, column_id, superseded, matching, k)
             }),
-            None => k,
+            (None, _) => k,
         };
         // When the cells holding matching rows are no bigger a read than
         // the routed search, probe every cluster of those cells instead of
@@ -7201,6 +7436,12 @@ impl SupertableReader {
     /// Filtered kNN: resolve the predicate on the user table, then search the
     /// hidden index when drained (same path as the bench). Pre-drain (no
     /// hidden superfiles) keeps the user-table fan-out.
+    ///
+    /// The drained rows take one of two paths. A broad filter checks the
+    /// hits of a search that admits every row
+    /// ([`Self::drained_hits_by_check`]); otherwise, or when checking gives
+    /// up, the kept rows are mapped into the index and the search admits only
+    /// them.
     async fn route_filtered_vector_hits_async(
         &self,
         user_superfiles: Vec<Arc<SuperfileEntry>>,
@@ -7243,9 +7484,17 @@ impl SupertableReader {
                 k,
                 options,
                 Some(user_allow.clone()),
+                None,
             )
             .await?
         };
+        if !drained_allow.is_empty()
+            && let Some(hidden_hits) = self
+                .drained_hits_by_check(&drained_allow, column, query, k, options)
+                .await?
+        {
+            return Ok(top_k_ascending(vec![hidden_hits, user_hits], k));
+        }
         let allow_set = self
             .stable_ids_from_user_allow_async(&drained_allow)
             .await?;
@@ -7266,6 +7515,300 @@ impl SupertableReader {
                 .await?
         };
         Ok(top_k_ascending(vec![hidden_hits, user_hits], k))
+    }
+
+    /// The filter's top k among the drained rows, found by searching every row
+    /// and keeping the hits the filter keeps. When the filter keeps most rows,
+    /// this beats mapping its rows into the index, which reads every kept `_id`
+    /// first. `None` sends the query to the mapped path.
+    ///
+    /// For eg: 1M rows, the filter keeps 900K (90%), k = 10:
+    ///
+    /// ```text
+    ///   keeps >= half the rows, and no nprobe given?
+    ///     │
+    ///     ├─ no ───────────────────────────────────► None
+    ///     ▼ yes
+    ///   want = 10 / 0.9 x 1.5 = 17
+    ///     │
+    ///     ▼
+    ///   search every row for `want` hits, ◄─────────────────┐
+    ///   less the cells left out                              │
+    ///     │                                                  │
+    ///     ▼                                                  │
+    ///   keep the hits the filter keeps                       │
+    ///     │                                                  │
+    ///     ├─ a cell gave hits, none kept,                    │
+    ///     │  and holds no kept row ───────── leave it out ───┤
+    ///     ├─ 10 or more kept ──────────────────────► top 10  │
+    ///     ├─ 3rd round, or too few kept ───────────► None    │
+    ///     └─ else: want = 10 / pass rate x 1.5 ──────────────┘
+    ///              (at least double)
+    /// ```
+    ///
+    /// Why a cell with no kept row is left out: the filtered search reads
+    /// only cells that hold a kept row. Where this search read a cell with
+    /// none, the filtered search read the next cell instead, and can find a
+    /// nearer kept row there. Leaving the cell out makes the next round read
+    /// that next cell too. For eg: with 2 of every 3 groups kept, a left-out
+    /// group's cell gives 2 hits, both fail; its slot goes to the next cell,
+    /// which holds the 5th nearest kept row.
+    ///
+    /// Hits all failing does not make a cell empty: with 90% of rows kept at
+    /// random, a cell that gives one hit fails it 1 time in 10. So the cell's
+    /// rows are checked first ([`Self::cells_without_kept_rows`]), and only a
+    /// cell with no kept row is left out, the same cells the filtered search
+    /// skips. A cell read that gave no hit at all is not seen, so it keeps
+    /// its slot. A cell left out on the 3rd round ends the check: only the
+    /// mapped path then reads the cell that takes its slot.
+    ///
+    /// Too few kept: under a quarter of the 90% we expect pass (the rows near
+    /// the query are mostly filtered out), or the index has no more rows.
+    async fn drained_hits_by_check(
+        &self,
+        drained_allow: &[(Arc<SuperfileEntry>, Arc<RoaringBitmap>)],
+        column: &str,
+        query: &[f32],
+        k: usize,
+        options: VectorSearchOptions,
+    ) -> Result<Option<Vec<SuperfileHit>>, QueryError> {
+        // A caller's own width is served differently on a filtered search;
+        // the mapped path keeps it.
+        if options.nprobe.is_some() {
+            return Ok(None);
+        }
+        let Some(vit) = self.vector_index_table() else {
+            return Ok(None);
+        };
+        let hidden_reader = vit.pinned_reader_with(self.op_stats.clone());
+        let Some(column_id) = hidden_reader.manifest().field_id(column) else {
+            return Ok(None);
+        };
+        let superfiles = hidden_reader
+            .manifest()
+            .get_all_superfiles_loaded()
+            .await
+            .map_err(QueryError::ManifestLoad)?;
+        // The indexed rows, counted as the filtered search counts them
+        // (`filtered_route_k`), so both read their laws at the same k. Deleted
+        // rows not yet compacted away still count, so `share` can read low:
+        // that only sends more queries to the mapped path, never a wrong
+        // answer.
+        let empty_superseded = BTreeMap::new();
+        let superseded = hidden_reader
+            .manifest()
+            .get_superseded_cells()
+            .unwrap_or(&empty_superseded);
+        let (rows_by_cell, _) =
+            postings_by_cell_from_summaries(&superfiles, column_id, None, superseded);
+        // Where each cell's rows sit. `None` only when a superfile holds more
+        // rows than a local id can number; the mapped path keeps that.
+        let Some(layout) = cell_layout(&superfiles, column_id, superseded) else {
+            return Ok(None);
+        };
+        let rows: u64 = rows_by_cell.values().sum();
+        let kept: u64 = drained_allow.iter().map(|(_, bm)| bm.len()).sum();
+        // No rows means an untagged index the filtered search routes without
+        // cells; the mapped path keeps it.
+        if rows == 0 || kept < k as u64 || (kept as f64) < CHECK_HITS_MIN_SHARE * rows as f64 {
+            #[cfg(feature = "test-helpers")]
+            check_hits_probe::record(kept, check_hits_probe::Outcome::Narrow);
+            return Ok(None);
+        }
+        let share = (kept as f64 / rows as f64).min(1.0);
+        let span = detail_span!(
+            "vector.check_hits",
+            kept = kept,
+            rows = rows,
+            rounds = tracing::field::Empty,
+            outcome = tracing::field::Empty,
+        );
+        async {
+            let kept_by_uri: HashMap<SuperfileUri, &RoaringBitmap> = drained_allow
+                .iter()
+                .map(|(entry, bm)| (entry.uri, bm.as_ref()))
+                .collect();
+            let k_route = filtered_k(k, kept, rows);
+            let max_want = usize::try_from(rows).unwrap_or(usize::MAX);
+            let mut want = hits_for_pass_rate(k, share).min(max_want);
+            // Cells with no kept row, left out of the search, and cells known
+            // to hold one (a kept hit, or a kept row found by checking), never
+            // checked again.
+            let mut left_out: HashSet<u32> = HashSet::new();
+            let mut holds_kept: HashSet<u32> = HashSet::new();
+            // Kept hits of every round, by row: a later round finds the
+            // earlier ones again.
+            let mut kept_hits: HashMap<(SuperfileUri, u32), SuperfileHit> = HashMap::new();
+            for round in 1..=CHECK_HITS_MAX_ROUNDS {
+                span.record("rounds", round);
+                // Every indexed row outside the left-out cells: index
+                // superfiles carry no tombstones (the filter's bitmaps leave
+                // out deleted rows).
+                let allow = indexed_rows_outside(&layout, &left_out);
+                let hits = hidden_reader
+                    .vector_fanout_over_superfiles(
+                        superfiles.clone(),
+                        column,
+                        query,
+                        want,
+                        options,
+                        Some(allow),
+                        Some(k_route),
+                    )
+                    .await?;
+                let passed = self
+                    .hits_kept_by_filter(hidden_reader.manifest(), &hits, &kept_by_uri)
+                    .await?;
+                let mut failed: HashSet<u32> = HashSet::new();
+                for (cell, any_pass) in cell_passes(&hit_cells(&hits, &layout), &passed) {
+                    if any_pass {
+                        holds_kept.insert(cell);
+                    } else if !holds_kept.contains(&cell) {
+                        failed.insert(cell);
+                    }
+                }
+                let returned = hits.len();
+                let passed_now = passed.iter().filter(|&&pass| pass).count();
+                for (hit, pass) in hits.into_iter().zip(passed) {
+                    if pass {
+                        kept_hits.insert((hit.superfile, hit.local_doc_id), hit);
+                    }
+                }
+                // A cell whose hits all failed can still hold kept rows (a
+                // random filter misses a few hits by chance); only a cell with
+                // none is left out, as the filtered search skips it.
+                let mut empty_cells = false;
+                if !failed.is_empty() {
+                    let without_kept = self
+                        .cells_without_kept_rows(
+                            hidden_reader.manifest(),
+                            &layout,
+                            &failed,
+                            &kept_by_uri,
+                        )
+                        .await?;
+                    #[cfg(feature = "test-helpers")]
+                    check_hits_probe::record_left_out(kept, without_kept.len());
+                    for cell in failed {
+                        if without_kept.contains(&cell) {
+                            empty_cells |= left_out.insert(cell);
+                        } else {
+                            holds_kept.insert(cell);
+                        }
+                    }
+                }
+                if empty_cells {
+                    continue;
+                }
+                if kept_hits.len() >= k {
+                    span.record("outcome", "checked");
+                    #[cfg(feature = "test-helpers")]
+                    check_hits_probe::record(kept, check_hits_probe::Outcome::Checked);
+                    return Ok(Some(top_k_ascending(
+                        vec![kept_hits.into_values().collect()],
+                        k,
+                    )));
+                }
+                let Some(next) = next_check_want(k, want, returned, passed_now, share, max_want)
+                else {
+                    break;
+                };
+                want = next;
+            }
+            span.record("outcome", "gave_up");
+            #[cfg(feature = "test-helpers")]
+            check_hits_probe::record(kept, check_hits_probe::Outcome::GaveUp);
+            Ok(None)
+        }
+        .instrument(span.clone())
+        .await
+    }
+
+    /// For each of `hits` (from the index whose manifest is
+    /// `hidden_manifest`), whether the filter kept its row: its user
+    /// superfile's bitmap in `kept_by_uri` holds it. The bitmaps leave out
+    /// deleted rows, so a deleted row's vector, still in the index, never
+    /// passes; so does a row of a user superfile not yet drained, which the
+    /// caller searches on its own.
+    async fn hits_kept_by_filter(
+        &self,
+        hidden_manifest: &ManifestSnapshot,
+        hits: &[SuperfileHit],
+        kept_by_uri: &HashMap<SuperfileUri, &RoaringBitmap>,
+    ) -> Result<Vec<bool>, QueryError> {
+        // Most hits carry their `_id` from the search; the rest (superfiles
+        // without an inline `_id` region) are read here.
+        let ids = hidden_hits_user_ids(
+            hidden_manifest,
+            hits,
+            self.options().id_column.as_str(),
+            &self.op_stats,
+        )
+        .await?;
+        // Only a kept file's placement can pass, so the rest are never
+        // searched: a gapped one would otherwise build its placement index.
+        let placements =
+            lookup_user_placements_in(self.manifest(), &ids, &self.op_stats, |entry| {
+                kept_by_uri.contains_key(&entry.uri)
+            })
+            .await?;
+        Ok(placements
+            .into_iter()
+            .map(|placement| {
+                placement.is_some_and(|(entry, local)| {
+                    kept_by_uri
+                        .get(&entry.uri)
+                        .is_some_and(|bm| bm.contains(local))
+                })
+            })
+            .collect())
+    }
+
+    /// Of `cells`, whose hits on a check round all failed the filter, the
+    /// ones holding no kept row: the cells the filtered search skips. First
+    /// [`CHECK_CELL_SAMPLE_ROWS`] rows spread over each cell are checked, then
+    /// every row of the cells still without a kept one, so a cell that only
+    /// missed by chance costs a few `_id` reads.
+    ///
+    /// For eg: 2 cells failed, the filter keeps 90% of rows at random:
+    ///
+    /// ```text
+    ///   cell 7: 16 rows spread over its 1,000 ── 14 kept ──► holds kept rows
+    ///   cell 9: 16 rows spread over its 1,000 ── none kept
+    ///             └► all 1,000 rows ── none kept ──► no kept row
+    /// ```
+    async fn cells_without_kept_rows(
+        &self,
+        hidden_manifest: &ManifestSnapshot,
+        layout: &CellLayout,
+        cells: &HashSet<u32>,
+        kept_by_uri: &HashMap<SuperfileUri, &RoaringBitmap>,
+    ) -> Result<HashSet<u32>, QueryError> {
+        let ranges = cell_row_ranges(layout, cells);
+        let mut open: HashSet<u32> = cells.clone();
+        for rows_per_cell in [CHECK_CELL_SAMPLE_ROWS, usize::MAX] {
+            if open.is_empty() {
+                break;
+            }
+            let mut rows = Vec::new();
+            let mut owners = Vec::new();
+            for &cell in &open {
+                let cell_ranges = ranges.get(&cell).map_or(&[][..], Vec::as_slice);
+                let cell_rows = spread_row_hits(cell_ranges, rows_per_cell);
+                owners.extend(repeat_n(cell, cell_rows.len()));
+                rows.extend(cell_rows);
+            }
+            let passed = self
+                .hits_kept_by_filter(hidden_manifest, &rows, kept_by_uri)
+                .await?;
+            for (cell, pass) in owners.iter().zip(passed) {
+                if pass {
+                    open.remove(cell);
+                }
+            }
+        }
+        // Every row of each cell still open was checked, none kept.
+        Ok(open)
     }
 
     /// Test/bench-only bitmap-filtered vector kNN. `allow_global` uses the
@@ -7649,6 +8192,7 @@ impl SupertableReader {
                     k,
                     options,
                     Some(prepared.allow_by_uri.clone()),
+                    None,
                 )
                 .await;
         }
@@ -7667,6 +8211,7 @@ impl SupertableReader {
             k,
             options,
             Some(prepared.allow_by_uri.clone()),
+            None,
         )
         .await
     }
@@ -8538,18 +9083,20 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
 
     use super::{
-        CentroidRouterGraph, IndexUnavailable, RABITQ_ADMIT_CELL_SHORTLIST_MIN, ReadIntent,
-        SCORE_COLUMN, ScanCandidate, VectorFilter, VectorSearchOptions, admit_extension_round,
-        admit_shortlist_window, allowed_cells, apply_width_pin, assemble_flat_sections,
-        assemble_hnsw_sections, build_centroid_router, calibrated_query_for,
+        CellLayout, CentroidRouterGraph, IndexUnavailable, RABITQ_ADMIT_CELL_SHORTLIST_MIN,
+        ReadIntent, SCORE_COLUMN, ScanCandidate, VectorFilter, VectorSearchOptions,
+        admit_extension_round, admit_shortlist_window, allowed_cells, apply_width_pin,
+        assemble_flat_sections, assemble_hnsw_sections, build_centroid_router,
+        calibrated_query_for, cell_layout, cell_passes, cell_row_ranges,
         cells_ranked_by_fine_score, decode_centroid_router_section, dispatch,
         encode_centroid_router_section, filtered_k, filtered_route_k, free_column_slot,
         free_columns_unambiguous, gate_fine_candidates_by_fragment, gfc_prepare_for_metric,
-        gfc_unit_normalize, hidden_hits_user_ids, id_score_projection_indices,
-        id_values_from_batch, is_hidden_vector_manifest, law_floor_serve_selection, law_read_rows,
-        lookup_user_placements_by_id, matching_cell_clusters, matching_rows_by_cell,
+        gfc_unit_normalize, hidden_hits_user_ids, hits_for_pass_rate, id_score_projection_indices,
+        id_values_from_batch, indexed_rows_outside, is_hidden_vector_manifest,
+        law_floor_serve_selection, law_read_rows, lookup_user_placements_by_id,
+        lookup_user_placements_in, matching_cell_clusters, matching_rows_by_cell, next_check_want,
         postings_by_cell_from_summaries, read_ids_for_locals, rerank_mult_from_law,
-        score_fine_candidates, select_global_shortlist, take_rows_byte_source,
+        score_fine_candidates, select_global_shortlist, spread_row_hits, take_rows_byte_source,
         union_cell_selection, wave_read_rows,
     };
     use crate::{
@@ -10439,6 +10986,40 @@ mod tests {
         }
     }
 
+    /// `lookup_user_placements_in` places ids only in the superfiles it
+    /// searches, and never reads nor caches the others' `_id` columns.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn placement_lookup_skips_unsearched_gapped_superfiles() {
+        let dim = 16;
+        let opts = options_one_superfile_per_commit(dim);
+        let store = Arc::clone(&opts.store);
+        let opts = Arc::new(opts);
+        // Overlapping gapped spans, so every id falls in both files' spans.
+        let searched = insert_gapped_entry(&[0, 4, 8], dim, &store, 0xA1);
+        let skipped = insert_gapped_entry(&[2, 6, 10], dim, &store, 0xB2);
+        let m = ManifestSnapshot::new(
+            1,
+            Arc::clone(&opts),
+            vec![Arc::clone(&searched), Arc::clone(&skipped)],
+            None,
+            None,
+        );
+
+        let got = lookup_user_placements_in(&m, &[4, 6], &None, |entry| entry.uri == searched.uri)
+            .await
+            .expect("placements");
+        let (owner, local) = got[0].as_ref().expect("id 4 is in the searched file");
+        assert_eq!((owner.uri, *local), (searched.uri, 1));
+        assert!(got[1].is_none(), "id 6 lives only in the skipped file");
+
+        let cache = opts.gapped_id_placement_cache.lock().await;
+        assert!(cache.entries.contains_key(&searched.uri));
+        assert!(
+            !cache.entries.contains_key(&skipped.uri),
+            "the skipped file's placement index is never built"
+        );
+    }
+
     #[test]
     fn vector_search_k_zero_short_circuits() {
         let st = Supertable::create(options_one_superfile_per_commit(16)).expect("create");
@@ -10882,6 +11463,84 @@ mod tests {
         assert_eq!(postings.get(&3), Some(&30));
     }
 
+    /// The layout lists each superfile's cells in summary order with the
+    /// local ids each holds; a superseded cell names no cell, and a
+    /// superfile with no summary for the column is absent.
+    #[test]
+    fn cell_layout_lays_out_each_superfiles_cells() {
+        let first = three_cell_entry(Uuid::from_u128(1));
+        let no_summary = Arc::new(synthetic_entry(Uuid::from_u128(3)));
+        let entries = [Arc::clone(&first), no_summary];
+        let superseded = BTreeMap::from([(Uuid::from_u128(1), BTreeSet::from([2u32]))]);
+
+        assert_eq!(
+            cell_layout(&entries, fid("emb"), &superseded),
+            Some(vec![(
+                first.uri,
+                vec![(Some(1), 0..5), (None, 5..9), (Some(3), 9..11)]
+            )])
+        );
+    }
+
+    /// A check round admits every row of the layout less the left-out
+    /// cells' id ranges; a superfile with no row left is absent.
+    #[test]
+    fn indexed_rows_outside_leaves_out_the_cells_asked() {
+        let first = SuperfileUri(Uuid::from_u128(1));
+        let layout: CellLayout =
+            vec![(first, vec![(Some(1), 0..5), (Some(2), 5..9), (None, 9..11)])];
+        let ids = |left_out: &[u32]| {
+            indexed_rows_outside(&layout, &left_out.iter().copied().collect())
+                .get(&first)
+                .map(|bm| bm.iter().collect::<Vec<u32>>())
+        };
+
+        assert_eq!(ids(&[]), Some((0..11).collect()));
+        assert_eq!(ids(&[2]), Some(vec![0, 1, 2, 3, 4, 9, 10]));
+        // An untagged cell is never left out.
+        assert_eq!(ids(&[1, 2]), Some(vec![9, 10]));
+        let all_tagged: CellLayout = vec![(first, vec![(Some(1), 0..5)])];
+        assert!(indexed_rows_outside(&all_tagged, &HashSet::from([1])).is_empty());
+    }
+
+    /// A cell's rows are its id range in every superfile that holds it, in
+    /// layout order; a cell not asked for, or with no row, is absent.
+    #[test]
+    fn cell_row_ranges_finds_each_cells_rows() {
+        let first = SuperfileUri(Uuid::from_u128(1));
+        let second = SuperfileUri(Uuid::from_u128(2));
+        let layout: CellLayout = vec![
+            (first, vec![(Some(1), 0..5), (Some(2), 5..9)]),
+            (second, vec![(Some(2), 0..3), (Some(3), 3..3)]),
+        ];
+        assert_eq!(
+            cell_row_ranges(&layout, &HashSet::from([2, 3])),
+            HashMap::from([(2, vec![(first, 5..9), (second, 0..3)])])
+        );
+    }
+
+    /// Rows are spread evenly across a cell's superfiles, not taken from the
+    /// front; a cell with no more rows than asked gives every row.
+    #[test]
+    fn spread_row_hits_spreads_across_the_cell() {
+        let first = SuperfileUri(Uuid::from_u128(1));
+        let second = SuperfileUri(Uuid::from_u128(2));
+        let ranges = [(first, 0..6), (second, 0..6)];
+        let rows = |n| -> Vec<(SuperfileUri, u32)> {
+            spread_row_hits(&ranges, n)
+                .iter()
+                .map(|hit| (hit.superfile, hit.local_doc_id))
+                .collect()
+        };
+        assert_eq!(
+            rows(4),
+            vec![(first, 0), (first, 3), (second, 0), (second, 3)]
+        );
+        assert_eq!(rows(12).len(), 12);
+        assert_eq!(rows(usize::MAX).len(), 12);
+        assert!(spread_row_hits(&[], 4).is_empty());
+    }
+
     /// Superfile with three cells for the matching-cell tests:
     ///
     /// | cell | rows (local ids) | flat clusters |
@@ -11012,6 +11671,49 @@ mod tests {
             filtered_route_k(&entries, fid("emb"), &superseded, &matching, 11),
             17
         );
+    }
+
+    /// Each tagged cell that gave a hit, with whether any of its hits passed;
+    /// a single pass marks the cell, and an untagged hit names no cell.
+    #[test]
+    fn cell_passes_marks_a_cell_with_any_kept_hit() {
+        let cells = [Some(7), Some(7), Some(8), Some(8), None];
+        let passed = [false, true, false, false, true];
+        assert_eq!(
+            cell_passes(&cells, &passed),
+            HashMap::from([(7, true), (8, false)])
+        );
+    }
+
+    /// A short round gives up when another round cannot help or the pass
+    /// rate is far below the share kept; otherwise the next round asks for
+    /// enough hits at the pass rate seen, at least double.
+    #[test]
+    fn next_check_want_gives_up_or_grows() {
+        const K: usize = 10;
+        const MAX: usize = 1_000;
+        // Index exhausted: fewer hits than asked.
+        assert_eq!(next_check_want(K, 30, 20, 8, 0.5, MAX), None);
+        // Already asked for every row.
+        assert_eq!(next_check_want(K, MAX, MAX, 8, 0.5, MAX), None);
+        // No pass, or a pass rate below share / 4: the rows near the query
+        // are filtered out.
+        assert_eq!(next_check_want(K, 30, 30, 0, 0.5, MAX), None);
+        assert_eq!(next_check_want(K, 100, 100, 10, 0.5, MAX), None);
+        // 8 of 30 at share 0.5: ask for 10 / (7 / 30) x 1.5 = 65 hits.
+        assert_eq!(next_check_want(K, 30, 30, 8, 0.5, MAX), Some(65));
+        // At least double, never past every row.
+        assert_eq!(next_check_want(K, 30, 30, 9, 0.5, MAX), Some(60));
+        assert_eq!(next_check_want(K, 600, 600, 160, 0.5, MAX), Some(MAX));
+    }
+
+    /// The hits to ask for cover `k ÷ pass rate` with slack, never fewer
+    /// than k, and saturate instead of overflowing.
+    #[test]
+    fn hits_for_pass_rate_scales_and_saturates() {
+        assert_eq!(hits_for_pass_rate(10, 0.5), 30);
+        assert_eq!(hits_for_pass_rate(10, 2.0), 10);
+        assert_eq!(hits_for_pass_rate(usize::MAX, 1e-9), usize::MAX);
     }
 
     /// The routing k is `k / selectivity`, never below `k`.
