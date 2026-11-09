@@ -25,9 +25,9 @@ use infino::{
     BoolMode, FieldPatch, IndexSpec, InfinoError, Metric, OptimizeOptions, SchemaPatch, Supertable,
     arrow_array::{
         Array, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch, StringArray,
-        UInt64Array,
+        TimestampMillisecondArray, UInt64Array,
     },
-    arrow_schema::{DataType, Field, Schema, SchemaRef},
+    arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit},
     connect,
 };
 use serde_json::Value;
@@ -567,6 +567,49 @@ fn a_companion_is_hidden_reopened_and_purged_with_its_table() {
 
 /// A table created without companions has none, finds none under its
 /// location, and its manifest list carries no key for them: it is the list
+/// Event times (ms since the epoch) on one host for the window-order test:
+/// gaps of 1 s and 5 s between them.
+const EVENT_MS: [i64; 3] = [1_000, 2_000, 7_000];
+const EVENT_HOST: &str = "app-01";
+
+/// A window ordered by a time difference is a query DataFusion does not
+/// support - it refuses it from its type coercion, worded as an internal
+/// error - so it reaches the caller as `Unsupported`, the caller's to
+/// rewrite (in seconds, say), not as `Backend`, an engine fault: a service
+/// answers the first with a client error and the second with a server error.
+#[test]
+fn a_window_ordered_by_a_time_difference_is_unsupported_not_a_fault() {
+    let dir = TempDir::new().expect("tempdir");
+    let db = connect(dir.path().to_str().expect("utf-8 path")).expect("connect");
+    let schema: SchemaRef = Arc::new(Schema::new(vec![
+        Field::new("h", DataType::LargeUtf8, false),
+        Field::new("t", DataType::Timestamp(TimeUnit::Millisecond, None), false),
+    ]));
+    let events = db
+        .create_table("events", schema.clone(), IndexSpec::new())
+        .expect("create_table");
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(LargeStringArray::from(vec![EVENT_HOST; EVENT_MS.len()])),
+            Arc::new(TimestampMillisecondArray::from(EVENT_MS.to_vec())),
+        ],
+    )
+    .expect("events batch");
+    events.append(&batch).expect("append");
+    let err = db
+        .query_sql(
+            "WITH e AS (SELECT h, t, LAG(t) OVER (PARTITION BY h ORDER BY t) prev FROM events) \
+             SELECT h, ROW_NUMBER() OVER (PARTITION BY h ORDER BY t - prev DESC) rn \
+             FROM e WHERE prev IS NOT NULL",
+        )
+        .expect_err("DataFusion does not order a window by a duration");
+    assert!(
+        matches!(err, InfinoError::Unsupported(_)),
+        "expected Unsupported, got {err:?}"
+    );
+}
+
 /// an engine without companions writes.
 #[test]
 fn a_table_without_companions_has_none_and_an_unchanged_list() {

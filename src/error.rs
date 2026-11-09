@@ -239,6 +239,7 @@ impl From<QueryError> for InfinoError {
 /// | refused credentials | `PermissionDenied` |
 /// | a read that failed: storage, object store or io, in the chain | `Io` |
 /// | `NotImplemented` | `Unsupported` |
+/// | `Internal` raised by DataFusion's type coercion (see [`raised_by_type_coercion`]) | `Unsupported` |
 /// | `SQL`, `Plan`, `SchemaError`, `Configuration`, `ArrowError` | `Query`: the query or its data |
 /// | `External` holding someone else's error (a regex that does not parse) | `Query` |
 /// | a pushed-down predicate that failed on the data | `Query` |
@@ -267,6 +268,10 @@ pub(crate) fn datafusion_error(e: &DataFusionError) -> InfinoError {
 pub(crate) fn datafusion_planning_error(e: &DataFusionError) -> InfinoError {
     classify_datafusion_error(e, true)
 }
+
+/// The name DataFusion's type-coercion analyzer rule gives the errors it
+/// raises (`DataFusionError::Context("type_coercion", …)`).
+const TYPE_COERCION_RULE: &str = "type_coercion";
 
 /// Marker DataFusion writes before the full column list in a
 /// `No field named X. Valid fields are …` schema error.
@@ -361,6 +366,7 @@ fn classify_datafusion_error(e: &DataFusionError, planning: bool) -> InfinoError
         // Nothing of ours or the store's under it: DataFusion's own variant.
         match e.find_root() {
             DataFusionError::NotImplemented(_) => InfinoError::Unsupported,
+            DataFusionError::Internal(_) if raised_by_type_coercion(e) => InfinoError::Unsupported,
             DataFusionError::SQL(..)
             | DataFusionError::Plan(_)
             | DataFusionError::SchemaError(..)
@@ -372,6 +378,20 @@ fn classify_datafusion_error(e: &DataFusionError, planning: bool) -> InfinoError
         }
     };
     variant(cap_error_message(e.to_string()))
+}
+
+/// Whether DataFusion's type coercion raised `e`. It words some of what it
+/// does not implement as `Internal` ("Cannot run range queries on datatype:
+/// Duration(ms)" for a window ordered by a time difference): the query's
+/// types are ones the engine cannot run, which the caller can rewrite, not a
+/// broken invariant, and a caller's own type mistakes there come as `Plan`.
+fn raised_by_type_coercion(e: &DataFusionError) -> bool {
+    error_chain(e).any(|link| {
+        matches!(
+            link.downcast_ref::<DataFusionError>(),
+            Some(DataFusionError::Context(rule, _)) if rule == TYPE_COERCION_RULE
+        )
+    })
 }
 
 /// Whether `link` is a read that failed: a storage, object store or io error.
@@ -983,6 +1003,34 @@ mod tests {
             InfinoError::from(QueryError::Store("s".into())).to_string(),
             "io: superfile store error during query: s"
         );
+    }
+
+    /// What DataFusion's type coercion refuses as `Internal` is `Unsupported`,
+    /// planning or not; an `Internal` from anywhere else is still a fault.
+    #[test]
+    fn an_internal_error_from_type_coercion_is_unsupported() {
+        let refused = DataFusionError::Context(
+            TYPE_COERCION_RULE.into(),
+            Box::new(DataFusionError::Internal(
+                "Cannot run range queries on datatype: Duration(ms)".into(),
+            )),
+        );
+        assert!(matches!(
+            datafusion_error(&refused),
+            InfinoError::Unsupported(_)
+        ));
+        assert!(matches!(
+            datafusion_planning_error(&refused),
+            InfinoError::Unsupported(_)
+        ));
+        let elsewhere = DataFusionError::Context(
+            "optimize_projections".into(),
+            Box::new(DataFusionError::Internal("bug".into())),
+        );
+        assert!(matches!(
+            datafusion_error(&elsewhere),
+            InfinoError::Backend(_)
+        ));
     }
 
     /// DataFusion's own `Execution` is the caller's only while planning; a
