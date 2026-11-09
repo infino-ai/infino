@@ -7535,8 +7535,11 @@ impl SupertableReader {
             .get_all_superfiles_loaded()
             .await
             .map_err(QueryError::ManifestLoad)?;
-        // The live indexed rows, counted as the filtered search counts them
-        // (`filtered_route_k`), so both read their laws at the same k.
+        // The indexed rows, counted as the filtered search counts them
+        // (`filtered_route_k`), so both read their laws at the same k. Deleted
+        // rows not yet compacted away still count, so `share` can read low:
+        // that only sends more queries to the mapped path, never a wrong
+        // answer.
         let empty_superseded = BTreeMap::new();
         let superseded = hidden_reader
             .manifest()
