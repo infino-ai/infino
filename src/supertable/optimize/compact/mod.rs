@@ -3098,7 +3098,7 @@ mod tests {
     use std::{
         collections::HashSet,
         env, fs,
-        io::Error as IoError,
+        io::{self, Error as IoError},
         mem,
         ops::Range,
         str,
@@ -3312,6 +3312,106 @@ mod tests {
         fn preserves_tombstones(&self) -> bool {
             true
         }
+    }
+
+    /// Counts the bytes the production merge writes, so a test can tell an
+    /// empty output from one the runner never built.
+    struct CountsOutputBytes {
+        written: Arc<AtomicUsize>,
+    }
+
+    /// A writer that forwards to the merge's output and counts what passes.
+    struct CountingWriter<'a> {
+        inner: &'a mut dyn Write,
+        written: &'a AtomicUsize,
+    }
+
+    impl Write for CountingWriter<'_> {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            let n = self.inner.write(buf)?;
+            self.written.fetch_add(n, Ordering::SeqCst);
+            Ok(n)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.inner.flush()
+        }
+    }
+
+    impl SuperfileMerge for CountsOutputBytes {
+        fn build(
+            &self,
+            inputs: MergeInputs<'_>,
+            output: &mut dyn Write,
+        ) -> Result<BuiltSuperfileStats, BuildError> {
+            let mut counting = CountingWriter {
+                inner: output,
+                written: &self.written,
+            };
+            CompactionMerge.build(inputs, &mut counting)
+        }
+
+        fn preserves_tombstones(&self) -> bool {
+            CompactionMerge.preserves_tombstones()
+        }
+    }
+
+    /// Compacting inputs whose every row is deleted reclaims them: the job
+    /// commits, the inputs leave the manifest, and nothing replaces them.
+    ///
+    /// The merge streams its output to a temp file and maps it back before
+    /// it looks at the row count. With no live rows the builder writes
+    /// nothing, so the runner maps a zero-length file; that must read as
+    /// empty bytes and end in the no-docs reclaim, not fail the job.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compacting_fully_deleted_inputs_reclaims_them() {
+        let dir = TempDir::new().expect("tempdir");
+        let st = make_st(&dir);
+        commit_titles(&st, &["alpha first", "alpha second"]);
+        commit_titles(&st, &["bravo first", "bravo second"]);
+        commit_titles(&st, &["charlie first", "charlie second"]);
+        let ids = listed_ids(&st);
+        assert_eq!(ids.len(), 3, "fixture");
+        let (doomed, survivor) = (&ids[..2], ids[2]);
+
+        let stats = st
+            .delete(
+                col("title")
+                    .like(lit("alpha%"))
+                    .or(col("title").like(lit("bravo%"))),
+            )
+            .expect("delete");
+        assert_eq!(stats.n_tombstoned(), 4, "every row of both inputs");
+
+        let written = Arc::new(AtomicUsize::new(0));
+        let outcome = st
+            .run_compaction_job_with(
+                CompactionJob {
+                    partition_key: Vec::new(),
+                    inputs: doomed.to_vec(),
+                    ..CompactionJob::default()
+                },
+                DEFAULT_STALE_SEAL_TIMEOUT,
+                Arc::new(CountsOutputBytes {
+                    written: Arc::clone(&written),
+                }),
+            )
+            .await
+            .expect("a fully deleted merge must reclaim, not fail");
+
+        assert!(matches!(outcome, JobOutcome::Committed), "{outcome:?}");
+        assert_eq!(
+            written.load(Ordering::SeqCst),
+            0,
+            "the merge must have built an empty output for the runner to map"
+        );
+        assert_eq!(
+            listed_ids(&st),
+            vec![survivor],
+            "the dead inputs leave with no replacement"
+        );
+        let reader = st.reader().expect("reader");
+        assert_eq!(reader.n_docs_total(), 2, "only the survivor's rows remain");
     }
 
     /// A delete that lands while a job is building must not be dropped by
