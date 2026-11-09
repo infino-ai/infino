@@ -790,9 +790,13 @@ pub struct ScalarStatsAgg {
     pub(crate) value_counts: Option<ScalarValueCounts>,
 }
 
+/// A column's exact value table. The entries are shared: a table is never
+/// changed once built, and a superfile's stats are copied whole as an entry
+/// moves into a part and its summaries, so a copy of a table is a count, not
+/// the up to [`MAX_EXACT_VALUE_COUNTS`] values it holds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ScalarValueCounts {
-    entries: Vec<(ScalarValue, u64)>,
+    entries: Arc<[(ScalarValue, u64)]>,
 }
 
 impl ScalarValueCounts {
@@ -886,7 +890,9 @@ impl ScalarValueCounts {
         {
             return None;
         }
-        Some(Self { entries })
+        Some(Self {
+            entries: entries.into(),
+        })
     }
 
     /// The table of `entries`, with the counts of a value that shows up more
@@ -912,7 +918,13 @@ impl ScalarValueCounts {
     }
 
     pub(crate) fn merged_with(&self, other: &Self) -> Option<Self> {
-        Self::from_entries(self.entries.iter().chain(&other.entries).cloned().collect())
+        Self::from_entries(
+            self.entries
+                .iter()
+                .chain(other.entries.iter())
+                .cloned()
+                .collect(),
+        )
     }
 
     /// The counts of a column that holds no value at all: every row null, or
@@ -920,7 +932,7 @@ impl ScalarValueCounts {
     /// is absent instead.
     pub(crate) fn empty() -> Self {
         Self {
-            entries: Vec::new(),
+            entries: Arc::from([]),
         }
     }
 
