@@ -151,7 +151,7 @@ use crate::{
     supertable::{
         Supertable as SupertableHandle,
         gc::RECLAIM_CONCURRENCY,
-        manifest::disk_cache::MetadataDiskCache,
+        manifest::{ManifestSnapshot, disk_cache::MetadataDiskCache},
         options::SupertableOptions,
         query::{exec::common::collect_plan_metered, sql::sql_session_context},
         reader_cache::{DiskCacheConfig, DiskCacheError, DiskCacheStore},
@@ -694,111 +694,27 @@ impl Connection {
                     return Ok(handle);
                 }
 
-                let (body, _etag) =
-                    bridge_on_runtime(read_catalog(root.as_ref()), &shared_io_runtime())
-                        .map_err(|e| e.with_context("open_table", Some(name)))?;
-                let entry = body.tables.get(name).ok_or_else(|| {
-                    InfinoError::NotFound(name.to_string()).with_context("open_table", Some(name))
-                })?;
-
-                let schema = schema_from_ipc(&entry.schema_ipc)
-                    .map_err(|e| e.with_context("open_table", Some(name)))?;
-                // Rebuild the index spec from the recorded declarations and
-                // lower it through the *same* path `create_table` used, so
-                // the defaults it applies (rotation seed, rerank codec) are
-                // identical and the table's options-hash check passes.
-                let mut spec = IndexSpec::new();
-                for (i, column) in entry.fts.iter().enumerate() {
-                    check_recorded_tokenizer(
-                        column,
-                        entry.fts_analyzers.get(i).map(String::as_str),
-                    )
-                    .map_err(|e| {
-                        InfinoError::Config(e.to_string()).with_context("open_table", Some(name))
-                    })?;
-                    // A missing or short list reads as the default.
-                    let stored = entry.fts_stored.get(i).copied().unwrap_or(true);
-                    let positions = entry.fts_positions.get(i).copied().unwrap_or(false);
-                    // A missing or empty filter name means no filter; a
-                    // name that does not resolve is different — the
-                    // recorded analysis cannot be reproduced, so the
-                    // table is unusable rather than usable-with-a-guess.
-                    let stopwords = match entry.fts_stopwords.get(i).map(String::as_str) {
-                        None | Some("") => Stopwords::None,
-                        Some(set) => Stopwords::from_name(set).ok_or_else(|| {
-                            InfinoError::Backend(format!(
-                                "table '{name}' column {column:?} records unknown stopwords \
-                                 {set:?}"
-                            ))
-                            .with_context("open_table", Some(name))
-                        })?,
-                    };
-                    let stemmer = match entry.fts_stemmers.get(i).map(String::as_str) {
-                        None | Some("") => Stemmer::None,
-                        Some(stem) => Stemmer::from_name(stem).ok_or_else(|| {
-                            InfinoError::Backend(format!(
-                                "table '{name}' column {column:?} records unknown stemmer \
-                                 {stem:?}"
-                            ))
-                            .with_context("open_table", Some(name))
-                        })?,
-                    };
-                    // The BM25 fallback is the frozen standard pair, not
-                    // the crate default.
-                    let k1 = entry.fts_k1.get(i).copied().unwrap_or(bm25::K1);
-                    let b = entry.fts_b.get(i).copied().unwrap_or(bm25::B);
-                    spec = spec.fts(
-                        FtsField::new(column.clone())
-                            .stopwords(stopwords)
-                            .stemmer(stemmer)
-                            .positions(positions)
-                            .stored(stored)
-                            .bm25(k1, b),
-                    );
-                }
-                for v in &entry.vectors {
-                    spec = spec.vector(
-                        v.column.clone(),
-                        v.dim,
-                        metric_from_str(&v.metric)
-                            .map_err(|e| e.with_context("open_table", Some(name)))?,
-                    );
-                }
-                let (fts_cfg, vec_cfg) = spec.to_configs();
-
-                let table_storage = backend_to_provider(
-                    &self.inner.backend.join(&entry.location),
-                    &self.inner.options,
-                    Arc::clone(&self.inner.usage_meter),
-                    self.inner.gcs_credential.as_ref(),
-                )
-                .map_err(|e| e.with_context("open_table", Some(name)))?
-                .expect("non-memory backend yields a storage provider");
+                let ResolvedTable {
+                    mut options,
+                    storage: table_storage,
+                    location,
+                } = self.resolve_table(root, name, "open_table")?;
 
                 // Cache directory is keyed on the stable name, matching
                 // `create_table` (the on-storage subtree is `entry.location`).
                 let disk_cache =
-                    build_disk_cache(&self.inner.options, &table_storage, name, &entry.location)
+                    build_disk_cache(&self.inner.options, &table_storage, name, &location)
                         .map_err(|e| e.with_context("open_table", Some(name)))?;
-                let mut opts = build_options(
-                    schema,
-                    fts_cfg,
-                    vec_cfg,
-                    Some(table_storage),
-                    Arc::clone(&self.inner.connection_memory_budget),
-                    config::global(),
-                )
-                .map_err(|e| e.with_context("open_table", Some(name)))?;
                 if let Some((cache, manifest_cache)) = disk_cache {
-                    opts = opts
+                    options = options
                         .with_disk_cache(cache)
                         .with_metadata_disk_cache(manifest_cache);
                 }
                 // Honor the connection's read-consistency policy. Default is
                 // BoundedStaleness(1s): the per-query pointer re-check is
                 // amortized across the window rather than paid on every query.
-                opts = opts.with_read_consistency(self.inner.options.read_consistency);
-                let handle = SupertableHandle::open(opts)
+                options = options.with_read_consistency(self.inner.options.read_consistency);
+                let handle = SupertableHandle::open(options)
                     .map_err(|e| InfinoError::from(e).with_context("open_table", Some(name)))?;
                 handles.insert(name.to_string(), handle.clone());
 
@@ -813,6 +729,109 @@ impl Connection {
             )
             .with_context("open_table", Some(name))),
         }
+    }
+
+    /// Table `name` as the catalog at `root` records it: its options, built
+    /// through the same path `create_table` used so the defaults it applies
+    /// (rotation seed, rerank codec) are identical and the table's
+    /// options-hash check passes, and its storage. What a describe needs
+    /// and what an open adds its disk cache to. `context` names the
+    /// operation in any error.
+    fn resolve_table(
+        &self,
+        root: &Arc<dyn StorageProvider>,
+        name: &str,
+        context: &'static str,
+    ) -> Result<ResolvedTable, InfinoError> {
+        let (body, _etag) = bridge_on_runtime(read_catalog(root.as_ref()), &shared_io_runtime())
+            .map_err(|e| e.with_context(context, Some(name)))?;
+        let entry = body.tables.get(name).ok_or_else(|| {
+            InfinoError::NotFound(name.to_string()).with_context(context, Some(name))
+        })?;
+
+        let schema =
+            schema_from_ipc(&entry.schema_ipc).map_err(|e| e.with_context(context, Some(name)))?;
+        // Rebuild the index spec from the recorded declarations and
+        // lower it through the *same* path `create_table` used, so
+        // the defaults it applies (rotation seed, rerank codec) are
+        // identical and the table's options-hash check passes.
+        let mut spec = IndexSpec::new();
+        for (i, column) in entry.fts.iter().enumerate() {
+            check_recorded_tokenizer(column, entry.fts_analyzers.get(i).map(String::as_str))
+                .map_err(|e| {
+                    InfinoError::Config(e.to_string()).with_context("open_table", Some(name))
+                })?;
+            // A missing or short list reads as the default.
+            let stored = entry.fts_stored.get(i).copied().unwrap_or(true);
+            let positions = entry.fts_positions.get(i).copied().unwrap_or(false);
+            // A missing or empty filter name means no filter; a
+            // name that does not resolve is different — the
+            // recorded analysis cannot be reproduced, so the
+            // table is unusable rather than usable-with-a-guess.
+            let stopwords = match entry.fts_stopwords.get(i).map(String::as_str) {
+                None | Some("") => Stopwords::None,
+                Some(set) => Stopwords::from_name(set).ok_or_else(|| {
+                    InfinoError::Backend(format!(
+                        "table '{name}' column {column:?} records unknown stopwords \
+                                 {set:?}"
+                    ))
+                    .with_context("open_table", Some(name))
+                })?,
+            };
+            let stemmer = match entry.fts_stemmers.get(i).map(String::as_str) {
+                None | Some("") => Stemmer::None,
+                Some(stem) => Stemmer::from_name(stem).ok_or_else(|| {
+                    InfinoError::Backend(format!(
+                        "table '{name}' column {column:?} records unknown stemmer \
+                                 {stem:?}"
+                    ))
+                    .with_context("open_table", Some(name))
+                })?,
+            };
+            // The BM25 fallback is the frozen standard pair, not
+            // the crate default.
+            let k1 = entry.fts_k1.get(i).copied().unwrap_or(bm25::K1);
+            let b = entry.fts_b.get(i).copied().unwrap_or(bm25::B);
+            spec = spec.fts(
+                FtsField::new(column.clone())
+                    .stopwords(stopwords)
+                    .stemmer(stemmer)
+                    .positions(positions)
+                    .stored(stored)
+                    .bm25(k1, b),
+            );
+        }
+        for v in &entry.vectors {
+            spec = spec.vector(
+                v.column.clone(),
+                v.dim,
+                metric_from_str(&v.metric).map_err(|e| e.with_context("open_table", Some(name)))?,
+            );
+        }
+        let (fts_cfg, vec_cfg) = spec.to_configs();
+
+        let storage = backend_to_provider(
+            &self.inner.backend.join(&entry.location),
+            &self.inner.options,
+            Arc::clone(&self.inner.usage_meter),
+            self.inner.gcs_credential.as_ref(),
+        )
+        .map_err(|e| e.with_context(context, Some(name)))?
+        .expect("non-memory backend yields a storage provider");
+        let options = build_options(
+            schema,
+            fts_cfg,
+            vec_cfg,
+            Some(Arc::clone(&storage)),
+            Arc::clone(&self.inner.connection_memory_budget),
+            config::global(),
+        )
+        .map_err(|e| e.with_context(context, Some(name)))?;
+        Ok(ResolvedTable {
+            options,
+            storage,
+            location: entry.location.clone(),
+        })
     }
 
     /// Open an existing table by name. Fails with
@@ -863,8 +882,42 @@ impl Connection {
                 .schema_document(name)
                 .map_err(|e| e.with_context("schema", Some(name)));
         }
-        let handle = self.open_table_handle(name)?;
-        Ok((*handle.table_schema()).clone())
+        match &self.inner.store {
+            CatalogStore::Memory(_) => {
+                let handle = self.open_table_handle(name)?;
+                Ok((*handle.table_schema()).clone())
+            }
+            CatalogStore::Storage { root, handles, .. } => {
+                // A handle already open answers with the document it holds,
+                // as every other read through this connection does.
+                if let Some(handle) = live_handle(handles, name) {
+                    return Ok((*handle.table_schema()).clone());
+                }
+                // Otherwise the pointer and the list, and nothing of the
+                // parts: an open loads every part and keeps its entries and
+                // summaries sections resident, which at thousands of columns
+                // over thousands of superfiles is gigabytes per table. A
+                // describe is not a reason to pay that — or to hold a
+                // handle — and a describe of every table in a database must
+                // fit in memory whatever the tables' width.
+                let resolved = self.resolve_table(root, name, "schema")?;
+                let document = bridge_on_runtime(
+                    ManifestSnapshot::read_schema_document(resolved.storage.as_ref()),
+                    &shared_io_runtime(),
+                )
+                .map_err(|e| InfinoError::from(e).with_context("schema", Some(name)))?;
+                // A list from before the document was carried: the schema is
+                // the creation record's, as an open reads it.
+                Ok(document
+                    .map(|document| (*document).clone())
+                    .unwrap_or_else(|| (*resolved.options.table_schema).clone()))
+            }
+            #[cfg(feature = "remote")]
+            CatalogStore::Remote(_) => Err(InfinoError::Backend(
+                "internal: a remote connection answers a describe above".to_string(),
+            )
+            .with_context("schema", Some(name))),
+        }
     }
 
     /// Change the schema of table `name` by merging `patch` into it, or
@@ -2019,6 +2072,19 @@ fn remove_table_cache(table_root: &Path) {
 /// The cached handle for `name`, or `None` (after evicting it) if its table was
 /// dropped and purged elsewhere — `handles` is per-process, so such a drop never
 /// reaches it. The `Ref` is dropped before `remove`, which would else deadlock.
+/// A table as the catalog records it, resolved by [`Connection::resolve_table`]
+/// before any of its manifest is read.
+struct ResolvedTable {
+    /// The table's options, without a disk cache: an open attaches one, a
+    /// describe never claims one.
+    options: SupertableOptions,
+    /// The table's own subtree of the catalog's storage.
+    storage: Arc<dyn StorageProvider>,
+    /// That subtree's location relative to the catalog root, which keys the
+    /// disk cache's generation.
+    location: String,
+}
+
 fn live_handle(
     handles: &DashMap<String, SupertableHandle>,
     name: &str,
@@ -3241,6 +3307,73 @@ mod tests {
             .bm25_search("title", "fox", TOP_K, Bm25SearchOptions::new(), None)
             .expect("bm25_search after append");
         assert_eq!(n_rows(&hits), 1, "expected one hit for 'fox' after append");
+    }
+
+    /// A describe of a table this connection has not opened reads the
+    /// manifest pointer and list and nothing of the parts: a table's cache
+    /// directory, which an open claims before it loads a part, is not even
+    /// created, and no handle is left behind. The document is still the
+    /// committed one — a schema change made through another connection is
+    /// in it — and once the table is open, the describe answers from the
+    /// handle like every other read.
+    #[test]
+    fn schema_of_an_unopened_table_reads_the_list_and_no_part() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let uri = format!("file://{}", dir.path().join("data").display());
+        {
+            let writer = connect(&uri).expect("connect");
+            let docs = writer
+                .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+                .expect("create_table");
+            // Two commits, so the manifest has parts to not read.
+            docs.append(&build_title_batch(&["the quick brown fox"]))
+                .expect("append");
+            docs.append(&build_title_batch(&["jumps over the lazy dog"]))
+                .expect("append");
+            let patch =
+                SchemaPatch::new(vec![FieldPatch::named("views").with_type(DataType::Int64)]);
+            writer
+                .apply_schema("docs", &patch, None)
+                .expect("apply_schema");
+        }
+
+        let cache_dir = dir.path().join("cache");
+        let reader =
+            connect_with(&uri, ConnectOptions::new().with_cache_dir(&cache_dir)).expect("connect");
+        let document = reader.schema("docs").expect("schema");
+        assert!(
+            document.fields().iter().any(|f| f.name == "views"),
+            "the describe reads the committed document, got {document:?}"
+        );
+        assert_eq!(
+            document.schema_id(),
+            2,
+            "one change after the creation document"
+        );
+        assert!(
+            !cache_dir.join("docs").exists(),
+            "a describe claims no cache directory and loads no part"
+        );
+        let CatalogStore::Storage { handles, .. } = &reader.inner.store else {
+            panic!("a file catalog is a storage catalog");
+        };
+        assert!(handles.is_empty(), "a describe leaves no handle open");
+
+        let opened = reader.open_table("docs").expect("open_table");
+        assert!(
+            cache_dir.join("docs").exists(),
+            "an open claims the cache directory the describe did not"
+        );
+        assert_eq!(
+            reader.schema("docs").expect("schema"),
+            document,
+            "an open table's describe is the handle's document"
+        );
+        assert_eq!(
+            document.user_schema(),
+            opened.schema(),
+            "the document's Arrow view is the open table's schema"
+        );
     }
 
     /// Row count via SQL — used by the memoization tests below.
