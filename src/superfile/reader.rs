@@ -27,7 +27,7 @@ use std::{
     ops::{Deref, Range},
     str,
     sync::{
-        Arc, OnceLock, RwLock,
+        Arc, OnceLock, PoisonError, RwLock,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -2776,7 +2776,14 @@ impl SuperfileReader {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
-        if let Some((cached, view)) = self.scored_fts.read().expect("scored fts memo").as_ref()
+        // A poisoned memo is read through: it holds one pair, replaced
+        // whole, so a panic while it was held leaves it a valid pair, and
+        // failing every later search on this reader would be worse.
+        if let Some((cached, view)) = self
+            .scored_fts
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
             && cached.matches(scoring)
         {
             return Ok(ScoredFts::Derived(Arc::clone(view)));
@@ -2788,7 +2795,10 @@ impl SuperfileReader {
         // Last writer wins. Two queries racing here derive the same view
         // from the same inputs — `with_scoring` is deterministic — so which
         // one lands is immaterial.
-        *self.scored_fts.write().expect("scored fts memo") =
+        *self
+            .scored_fts
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) =
             Some((ScoringKey::of(scoring), Arc::clone(&view)));
         Ok(ScoredFts::Derived(view))
     }
@@ -3568,7 +3578,7 @@ fn fts_reader_error_to_read(e: FtsError) -> ReadError {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::{collections::HashSet, thread};
 
     use arrow::compute::cast;
     use arrow_array::{Decimal128Array, Int64Array, LargeStringArray, RecordBatch};
@@ -4453,6 +4463,35 @@ mod tests {
     }
 
     // ── Additional coverage ───────────────────────────────────────────
+
+    #[test]
+    fn a_poisoned_scored_view_memo_still_serves() {
+        // A reader whose scored-view memo a panicking thread held, then two
+        // searches under one parameter pair.
+        // - The first derives a view, the second reuses it.
+        // This test pins that one panic does not fail every later search on
+        // the reader.
+        let r = SuperfileReader::open(build_simple_fts_only_superfile()).expect("open");
+        let poisoner = thread::scope(|s| {
+            s.spawn(|| {
+                let _held = r.scored_fts.write();
+                panic!("poison the memo");
+            })
+            .join()
+        });
+        assert!(poisoner.is_err() && r.scored_fts.is_poisoned());
+        let at = ScoringView {
+            params: Some(Bm25Params::new(1.4, 0.6)),
+            avgdl: None,
+        };
+        let derived = |out: Result<ScoredFts<'_>, ReadError>| match out.expect("search") {
+            ScoredFts::Derived(v) => v,
+            ScoredFts::Baked(_) => panic!("an override must derive a view"),
+        };
+        let first = derived(r.fts_scored(&at));
+        let again = derived(r.fts_scored(&at));
+        assert!(Arc::ptr_eq(&first, &again), "the memo still reuses a view");
+    }
 
     #[test]
     fn a_scored_view_is_memoized_per_parameter_pair() {

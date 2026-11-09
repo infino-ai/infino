@@ -67,7 +67,6 @@ use std::{
     mem,
     num::NonZeroUsize,
     ops::Range,
-    panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
     str::from_utf8,
     sync::{
@@ -123,7 +122,7 @@ use crate::{
     config::{self, CentroidAlignment, DrainConsolidate, ThreadCount, scratch_root},
     dynamic::rows_to_batch,
     memory::{ConnectionMemoryBudget, Reservation},
-    runtime_bridge::{bridge_on_runtime, bridge_sync_to_async, run_on_pool},
+    runtime_bridge::{bridge_on_runtime, bridge_sync_to_async, catch_panic, run_on_pool},
     runtime_metrics::{
         ingest::visible_array_bytes,
         op_stats::{self, OpStatsCollector, timed_kernel},
@@ -2784,8 +2783,8 @@ impl SupertableWriter {
         // side by side, their dictionaries merged into the pieces' order,
         // then every piece built from its rows of them.
         let pool = &options.writer_pool;
-        fn seal_task_lost() -> BuildError {
-            BuildError::Store("a seal task ended without a result".into())
+        fn seal_task_lost(what: &'static str) -> BuildError {
+            BuildError::Store(format!("{what} did not finish (it panicked)"))
         }
         // What the budget granted the lanes past their thresholds is held
         // with the rest of their reservations, through the seal: the
@@ -2799,6 +2798,7 @@ impl SupertableWriter {
         let freeze_stats = stats.clone();
         let frozen: Vec<FrozenLane> = run_spawned(
             pool,
+            "lane freeze",
             lanes,
             move |_, lane| {
                 let _span = detail_span!(
@@ -2844,6 +2844,7 @@ impl SupertableWriter {
         let piece_stem = stem.map(str::to_owned);
         let sealed_pieces = run_spawned(
             pool,
+            "piece build",
             (0..n_pieces).collect(),
             move |i, _| {
                 let _span = detail_span!("piece.build", parent: &parent, piece = i).entered();
@@ -4016,7 +4017,7 @@ impl LiveLanes {
                 // A panic is caught here and reported as the lane's error: a
                 // pool with no panic handler aborts the process on a spawned
                 // job's panic.
-                let fed = catch_unwind(AssertUnwindSafe(|| {
+                let fed = catch_panic("live lane feed", || {
                     timed_kernel(&stats, || {
                         lane.builder.set_spill_threshold_bytes(threshold);
                         let mut base = first_row;
@@ -4048,8 +4049,8 @@ impl LiveLanes {
                         Ok::<(), BuildError>(())
                     })
                     .map(|()| lane)
-                }))
-                .unwrap_or_else(|_| Err(BuildError::Store("a live lane's feed panicked".into())));
+                })
+                .unwrap_or_else(|| Err(BuildError::Store("a live lane's feed panicked".into())));
                 // The receiver is gone only if the writer was dropped
                 // mid-feed; there is nobody left to tell.
                 let _ = tx.send((i, fed));
@@ -7276,7 +7277,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                     (cal, clusters_for_freeze)
                 })
                 .await
-                .map_err(|e| BuildError::Store(format!("width-law freeze: {e}")))?;
+                .map_err(|e| BuildError::Store(e.to_string()))?;
             width_law = Some(frozen);
             running_clusters = clusters_back;
         }
@@ -10001,7 +10002,7 @@ pub(in crate::supertable) async fn split_overflow_cell_batch(
         move || plan_split_wave(plan_inputs, &plan_clusters, metric, modality_d),
     )
     .await
-    .map_err(|e| BuildError::Store(format!("cell split batch planning: {e}")))?;
+    .map_err(|e| BuildError::Store(e.to_string()))?;
     let mut planned: Vec<PlannedCellSplit> = Vec::new();
     for item in planned_or_noop {
         match item {
@@ -10079,7 +10080,7 @@ pub(in crate::supertable) async fn split_overflow_cell_batch(
         },
     )
     .await
-    .map_err(|e| BuildError::Store(format!("cell split batch child builds: {e}")))??;
+    .map_err(|e| BuildError::Store(e.to_string()))??;
     if built.iter().all(|b| b.prepared.is_empty()) {
         noop_cells.extend(built.iter().map(|b| b.cell));
         return Ok(SplitBatchOutcome::no_op_cells(noop_cells));
@@ -10493,7 +10494,7 @@ pub(in crate::supertable) async fn split_repack_bulk(
             })
             .instrument(plan_span)
             .await
-            .map_err(|e| BuildError::Store(format!("repack wave planning: {e}")))?;
+            .map_err(|e| BuildError::Store(e.to_string()))?;
         let mut planned: Vec<PlannedCellSplit> = Vec::new();
         for item in planned_or_noop {
             match item {
@@ -10620,7 +10621,7 @@ pub(in crate::supertable) async fn split_repack_bulk(
             })
             .instrument(pack_span)
             .await
-            .map_err(|e| BuildError::Store(format!("repack wave child packs: {e}")))??;
+            .map_err(|e| BuildError::Store(e.to_string()))??;
 
         for split in repacked {
             for parent in &split.parent_ids {
@@ -10694,7 +10695,7 @@ pub(in crate::supertable) async fn split_repack_bulk(
         })
         .instrument(assemble_span)
         .await
-        .map_err(|e| BuildError::Store(format!("repack shard assembly: {e}")))??;
+        .map_err(|e| BuildError::Store(e.to_string()))??;
     let mut new_entries_by_cell: Vec<(u32, Arc<SuperfileEntry>)> = Vec::new();
     for (shard, prepared_shard) in &prepared {
         if let Some(cells) = bucket_cells.get(shard) {
@@ -11353,7 +11354,7 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
     })
     .instrument(detail_span!("recalibrate.freeze"))
     .await
-    .map_err(|e| BuildError::Store(format!("recalibration freeze: {e}")))?;
+    .map_err(|e| BuildError::Store(e.to_string()))?;
     // Centroid-router fanout calibration rides the SAME scan: build the router
     // over the settled fine centroids (byte-identical to the settle-published
     // one — same superfile × flat node order, `HnswParams::default`) and select
@@ -11527,7 +11528,7 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
             })
             .instrument(shortlist_span.clone())
             .await
-            .map_err(|e| BuildError::Store(format!("recalibration shortlist: {e}")))?;
+            .map_err(|e| BuildError::Store(e.to_string()))?;
             pool_ms += pool_t0.elapsed().as_millis() as u64;
         }
     }
@@ -11608,7 +11609,7 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
                 })
                 .instrument(rescore_span.clone())
                 .await
-                .map_err(|e| BuildError::Store(format!("recalibration rescore: {e}")))?;
+                .map_err(|e| BuildError::Store(e.to_string()))?;
                 pool_ms += pool_t0.elapsed().as_millis() as u64;
             }
         }
@@ -11648,7 +11649,7 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
             })
             .instrument(rescore_span.clone())
             .await
-            .map_err(|e| BuildError::Store(format!("recalibration depth observation: {e}")))?;
+            .map_err(|e| BuildError::Store(e.to_string()))?;
         }
         depth_ms += depth_t0.elapsed().as_millis() as u64;
     }
@@ -11670,7 +11671,7 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
         cal.finish(&clusters, fanout_ctx)
     })
     .await
-    .map_err(|e| BuildError::Store(format!("recalibration finish: {e}")))?
+    .map_err(|e| BuildError::Store(e.to_string()))?
     else {
         return Ok(false);
     };
@@ -14676,6 +14677,7 @@ mod tests {
     use std::{
         fs,
         future::pending,
+        panic::{AssertUnwindSafe, catch_unwind},
         sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
