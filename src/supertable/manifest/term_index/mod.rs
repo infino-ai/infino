@@ -2399,9 +2399,13 @@ async fn stream_sources(
             .into_iter()
             .collect()
     };
-    let found: Vec<(ContentHash, u64)> = match missing.len() > CHECK_LIST_MIN_OBJECTS {
-        true => {
-            let listed = list_objects(storage).await?;
+    let listed = match missing.len() > CHECK_LIST_MIN_OBJECTS {
+        true => list_objects(storage).await?,
+        false => HashMap::new(),
+    };
+    // A store whose listing is empty answers tier by tier.
+    let found: Vec<(ContentHash, u64)> = match listed.is_empty() {
+        false => {
             missing
                 .iter()
                 .map(|tier| {
@@ -2418,7 +2422,7 @@ async fn stream_sources(
                 })
                 .collect::<Result<_, _>>()?
         }
-        false => stream::iter(missing.into_iter().map(|tier| {
+        true => stream::iter(missing.into_iter().map(|tier| {
             let storage = Arc::clone(storage);
             async move {
                 storage
@@ -3409,6 +3413,8 @@ mod tests {
         time::Duration,
     };
 
+    use async_trait::async_trait;
+    use object_store::MultipartUpload;
     use rayon::ThreadPoolBuilder;
     use tempfile::TempDir;
     use tokio::runtime::Runtime;
@@ -3420,7 +3426,7 @@ mod tests {
     };
     use crate::{
         Bm25SearchOptions, CompactionSettings, InfinoError, OptimizeOptions, OptimizeSteps,
-        storage::LocalFsStorageProvider,
+        storage::{LocalFsStorageProvider, ObjectMeta},
         superfile::fts::bm25,
         supertable::{
             Supertable,
@@ -11144,16 +11150,10 @@ mod tests {
         }
     }
 
-    /// A tier object gone from storage when a streamed fold sizes it calls
-    /// for a rebuild, as a download's miss does, whether a HEAD or, past
-    /// [`CHECK_LIST_MIN_OBJECTS`] unknown lengths, a listing finds it gone.
-    #[test]
-    fn a_streamed_fold_missing_a_tier_calls_for_rebuild() {
-        let store_dir = TempDir::new().expect("store");
-        let local: Arc<dyn StorageProvider> =
-            Arc::new(LocalFsStorageProvider::new(store_dir.path()).expect("local"));
-        let rt = Runtime::new().expect("runtime");
-        let layer_of = |slices: usize| Layer {
+    /// A layer of `slices` one-key slices, each naming a tier object; no
+    /// object is stored.
+    fn tiered_layer(slices: usize) -> Layer {
+        Layer {
             slices: (0..slices as u32)
                 .map(|i| {
                     let key = i.to_be_bytes().to_vec();
@@ -11167,17 +11167,112 @@ mod tests {
                 })
                 .collect(),
             ..Layer::default()
-        };
+        }
+    }
+
+    /// A provider that forwards what it must to a local directory and
+    /// leaves listing at the trait default, which lists nothing.
+    #[derive(Debug)]
+    struct Unlisted(LocalFsStorageProvider);
+
+    #[async_trait]
+    impl StorageProvider for Unlisted {
+        async fn head(&self, uri: &str) -> Result<ObjectMeta, StorageError> {
+            self.0.head(uri).await
+        }
+        async fn get(&self, uri: &str) -> Result<(Bytes, ObjectMeta), StorageError> {
+            self.0.get(uri).await
+        }
+        async fn get_range(&self, uri: &str, range: Range<u64>) -> Result<Bytes, StorageError> {
+            self.0.get_range(uri, range).await
+        }
+        async fn put_atomic(
+            &self,
+            uri: &str,
+            bytes: Bytes,
+        ) -> Result<Option<String>, StorageError> {
+            self.0.put_atomic(uri, bytes).await
+        }
+        async fn put_overwrite(&self, uri: &str, bytes: Bytes) -> Result<(), StorageError> {
+            self.0.put_overwrite(uri, bytes).await
+        }
+        async fn put_if_match(
+            &self,
+            uri: &str,
+            bytes: Bytes,
+            expected_etag: Option<&str>,
+        ) -> Result<Option<String>, StorageError> {
+            self.0.put_if_match(uri, bytes, expected_etag).await
+        }
+        async fn put_multipart(&self, uri: &str) -> Result<Box<dyn MultipartUpload>, StorageError> {
+            self.0.put_multipart(uri).await
+        }
+        async fn delete(&self, uri: &str) -> Result<(), StorageError> {
+            self.0.delete(uri).await
+        }
+    }
+
+    /// A tier object gone from storage when a streamed fold sizes it calls
+    /// for a rebuild, as a download's miss does, whether a HEAD or, past
+    /// [`CHECK_LIST_MIN_OBJECTS`] unknown lengths, a listing finds it gone.
+    #[test]
+    fn a_streamed_fold_missing_a_tier_calls_for_rebuild() {
+        let store_dir = TempDir::new().expect("store");
+        let local: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(store_dir.path()).expect("local"));
+        let rt = Runtime::new().expect("runtime");
         for slices in [1, CHECK_LIST_MIN_OBJECTS + 1] {
             match rt.block_on(stream_sources(
                 &local,
-                &[layer_of(slices)],
+                &[tiered_layer(slices)],
                 None,
                 &Mutex::default(),
             )) {
                 Err(e) if e.calls_for_rebuild() => {}
                 other => panic!("{slices} absent tiers: {other:?}"),
             }
+        }
+    }
+
+    /// Past [`CHECK_LIST_MIN_OBJECTS`] unknown tier lengths, a store whose
+    /// listing is empty is asked tier by tier, as
+    /// [`check_objects_listing_past`] asks it, rather than read as having
+    /// lost every tier; a tier truly gone still calls for a rebuild.
+    #[test]
+    fn a_streamed_fold_sizes_tiers_by_head_when_the_listing_is_empty() {
+        let store_dir = TempDir::new().expect("store");
+        let unlisted: Arc<dyn StorageProvider> = Arc::new(Unlisted(
+            LocalFsStorageProvider::new(store_dir.path()).expect("local"),
+        ));
+        let rt = Runtime::new().expect("runtime");
+        let layer = tiered_layer(CHECK_LIST_MIN_OBJECTS + 1);
+        let tiers: Vec<ContentHash> = layer.slices.iter().filter_map(|s| s.tier).collect();
+        let body = Bytes::from_static(b"tier");
+        for tier in &tiers {
+            rt.block_on(unlisted.put_overwrite(&tier_uri(tier), body.clone()))
+                .expect("put tier");
+        }
+        let tier_lens = Mutex::default();
+        let sources = rt
+            .block_on(stream_sources(
+                &unlisted,
+                &[layer.clone()],
+                None,
+                &tier_lens,
+            ))
+            .expect("every tier is stored");
+        assert_eq!(sources[0].len(), tiers.len());
+        assert!(
+            tiers
+                .iter()
+                .all(|tier| tier_lens.lock().expect("lens").get(tier) == Some(&(body.len() as u64))),
+            "each tier's length comes from its HEAD"
+        );
+        rt.block_on(unlisted.delete(&tier_uri(&tiers[0])))
+            .expect("delete");
+        match rt.block_on(stream_sources(&unlisted, &[layer], None, &Mutex::default())) {
+            Err(e) if e.calls_for_rebuild() => {}
+            other => panic!("a lost tier behind an empty listing: {other:?}"),
         }
     }
 
