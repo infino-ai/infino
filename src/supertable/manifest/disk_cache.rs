@@ -34,10 +34,19 @@
 //! Superfile *byte content* is cached one layer over, by
 //! [`DiskCacheStore`](crate::supertable::reader_cache::DiskCacheStore).
 //! The two caches are independent and use separate byte budgets.
+//!
+//! ## Objects read in place
+//!
+//! A summaries section is not read whole: a handle keeps the section's
+//! file here and reads its groups back from it piecewise, for as long as
+//! the handle lives. Such an object is pinned ([`MetadataDiskCache::pin`])
+//! while a handle reads from it, so eviction passes over it whatever else
+//! fills the budget, and each piece is checked against a hash taken when
+//! the whole object was verified ([`MetadataDiskCache::read_range_verified`]).
 
 use std::{
     fs::{self, File},
-    io::{self, Read, Seek, SeekFrom},
+    io::{self, Read, Seek, SeekFrom, Write},
     path::PathBuf,
     process,
     sync::{
@@ -66,6 +75,8 @@ const CACHE_TMP_SUFFIX: &str = ".tmp";
 /// Directory, beside a user table's cache, of its hidden vector index's
 /// cache.
 pub(crate) const HIDDEN_INDEX_CACHE_SUBDIR: &str = "hidden-index-metadata";
+/// How much of a cached object [`MetadataDiskCache::verify`] reads at a time.
+const VERIFY_CHUNK_BYTES: usize = 1 << 20;
 
 /// What a `get` found on disk for an indexed hash.
 enum CachedRead {
@@ -111,6 +122,10 @@ pub struct MetadataDiskCache {
     /// are on disk under [`Self::cache_path`]; this map exists only so
     /// eviction can pick victims without stat-ing the directory.
     entries: DashMap<ContentHash, CacheEntry>,
+    /// How many live [`CachePin`]s hold each object: an object a handle
+    /// reads in place, which eviction passes over. Kept apart from
+    /// `entries`, so a pin outlives its entry being removed and put again.
+    pins: DashMap<ContentHash, usize>,
     current_bytes: AtomicU64,
     n_hits: AtomicU64,
     n_misses: AtomicU64,
@@ -137,6 +152,7 @@ impl MetadataDiskCache {
             budget_bytes: AtomicU64::new(budget_bytes),
             started_at: Instant::now(),
             entries: DashMap::new(),
+            pins: DashMap::new(),
             current_bytes: AtomicU64::new(0),
             n_hits: AtomicU64::new(0),
             n_misses: AtomicU64::new(0),
@@ -302,7 +318,7 @@ impl MetadataDiskCache {
         let size = bytes.len() as u64;
         let final_path = self.cache_path(&hash);
         let tmp_path = self.tmp_path(&hash);
-        if fs::write(&tmp_path, bytes)
+        if write_synced(&tmp_path, bytes)
             .and_then(|()| fs::rename(&tmp_path, &final_path))
             .is_err()
         {
@@ -329,21 +345,56 @@ impl MetadataDiskCache {
         true
     }
 
+    /// Pin the object cached under `hash` for as long as the returned pin
+    /// lives: eviction passes over it, whatever else fills the budget, so a
+    /// handle that reads the object in place ([`Self::read_range_verified`])
+    /// does not find it gone midway. `None` when the object is not cached.
+    ///
+    /// A pinned object still counts against the budget, so pins that fill it
+    /// make later puts fail rather than evict them; a caller whose put fails
+    /// keeps its own copy. [`Self::remove`] and a corrupt read still take a
+    /// pinned object out: the first is an explicit erase, and a corrupt file
+    /// is of no use to its readers.
+    pub(crate) fn pin(self: &Arc<Self>, hash: ContentHash) -> Option<CachePin> {
+        // The pin is counted before the entry is looked up, and eviction
+        // checks it under the entry's lock (see `evict_at_least`), so an
+        // object is either pinned before eviction looks or gone when the
+        // lookup runs, never evicted pinned.
+        *self.pins.entry(hash).or_insert(0) += 1;
+        let pin = CachePin {
+            cache: Arc::clone(self),
+            hash,
+        };
+        self.entries.contains_key(&hash).then_some(pin)
+    }
+
+    /// Release one pin of `hash`.
+    fn unpin(&self, hash: &ContentHash) {
+        if let Entry::Occupied(mut pins) = self.pins.entry(*hash) {
+            *pins.get_mut() -= 1;
+            if *pins.get() == 0 {
+                pins.remove();
+            }
+        }
+    }
+
+    /// Whether a pin holds `hash`.
+    fn is_pinned(&self, hash: &ContentHash) -> bool {
+        self.pins.contains_key(hash)
+    }
+
     /// The size of the object cached under `hash`, when it is indexed.
     pub(crate) fn size_of(&self, hash: &ContentHash) -> Option<u64> {
         self.entries.get(hash).map(|entry| entry.size_bytes)
     }
 
     /// Read `len` bytes at `offset` of the object cached under `hash`,
-    /// without verifying them: the object was hash-verified before it was
-    /// written here, and a caller that reads a slice has nothing to check
-    /// it against. For an object a reader keeps open for a handle's life
-    /// and reads piecewise, the summaries sections beside the manifest
-    /// parts, so the handle holds the pieces it has read, not the object.
+    /// without verifying them. What a reader of an object's head uses
+    /// before it [verifies](Self::verify) the object and learns the
+    /// hashes of the pieces it will read with
+    /// [`Self::read_range_verified`].
     ///
-    /// Blocking: it reads the file on the calling thread. A caller on the
-    /// runtime wraps it in a blocking task; the section readers call it
-    /// where they decode, which is already CPU on that thread.
+    /// Blocking: it reads the file on the calling thread.
     ///
     /// An object that is not indexed, or whose file is gone, is an error of
     /// kind `NotFound`, and a gone file leaves the index as a `get` of it
@@ -354,31 +405,150 @@ impl MetadataDiskCache {
         offset: u64,
         len: usize,
     ) -> io::Result<Vec<u8>> {
+        let out = self.read_at(hash, offset, len)?;
+        self.touch(hash);
+        self.n_hits.fetch_add(1, Ordering::AcqRel);
+        Ok(out)
+    }
+
+    /// [`Self::read_range`], checked against `expected`, the hash of the
+    /// range taken when the whole object was verified ([`Self::verify`]).
+    /// For an object a reader keeps open for a handle's life and reads
+    /// piecewise, the summaries sections beside the manifest parts, so the
+    /// handle holds the pieces it has read, not the object, and still never
+    /// takes a piece the object did not hold.
+    ///
+    /// Blocking: it reads and hashes the range on the calling thread. A
+    /// caller on the runtime wraps it in a blocking task; the section
+    /// readers call it where they decode, which is already CPU on that
+    /// thread.
+    ///
+    /// A range that does not hash to `expected` is an error of kind
+    /// `InvalidData`, and the file is removed, as a `get` removes a corrupt
+    /// one: whatever reads the object next fetches it again. Otherwise as
+    /// [`Self::read_range`].
+    pub(crate) fn read_range_verified(
+        &self,
+        hash: &ContentHash,
+        offset: u64,
+        len: usize,
+        expected: &ContentHash,
+    ) -> io::Result<Vec<u8>> {
+        let out = self.read_at(hash, offset, len)?;
+        if ContentHash::of(&out) != *expected {
+            self.remove(hash);
+            self.n_misses.fetch_add(1, Ordering::AcqRel);
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "a range of a cached object does not hash to what it held when verified",
+            ));
+        }
+        self.touch(hash);
+        self.n_hits.fetch_add(1, Ordering::AcqRel);
+        Ok(out)
+    }
+
+    /// Read the object cached under `hash` end to end, check that it hashes
+    /// to `hash`, and return the hash of each of `ranges` (`(offset, len)`)
+    /// within it, for [`Self::read_range_verified`] to check the ranges
+    /// against later. The object is streamed, never held whole.
+    ///
+    /// Blocking: it reads and hashes the file on the calling thread.
+    ///
+    /// An object that does not hash to `hash`, such as a file a crash left
+    /// torn, is an error of kind `InvalidData`, and the file is removed, as
+    /// a `get` removes one. An object not indexed, or whose file is gone,
+    /// is `NotFound`. A range past the object's end is `UnexpectedEof`.
+    pub(crate) fn verify(
+        &self,
+        hash: &ContentHash,
+        ranges: &[(usize, usize)],
+    ) -> io::Result<Vec<ContentHash>> {
+        let mut file = self.open_indexed(hash)?;
+        let mut whole = blake3::Hasher::new();
+        let mut pieces: Vec<blake3::Hasher> =
+            ranges.iter().map(|_| blake3::Hasher::new()).collect();
+        let mut buffer = vec![0u8; VERIFY_CHUNK_BYTES];
+        let mut at = 0usize;
+        loop {
+            let n = match file.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            };
+            let chunk = &buffer[..n];
+            whole.update(chunk);
+            for ((offset, len), piece) in ranges.iter().zip(&mut pieces) {
+                let start = (*offset).max(at);
+                let end = offset.saturating_add(*len).min(at + n);
+                if start < end {
+                    piece.update(&chunk[start - at..end - at]);
+                }
+            }
+            at += n;
+        }
+        if ContentHash(*whole.finalize().as_bytes()) != *hash {
+            self.remove(hash);
+            self.n_misses.fetch_add(1, Ordering::AcqRel);
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "a cached object does not hash to its key",
+            ));
+        }
+        if ranges
+            .iter()
+            .any(|(offset, len)| offset.saturating_add(*len) > at)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "a range reaches past the cached object",
+            ));
+        }
+        self.touch(hash);
+        Ok(pieces
+            .into_iter()
+            .map(|piece| ContentHash(*piece.finalize().as_bytes()))
+            .collect())
+    }
+
+    /// Read `len` bytes at `offset` of the object cached under `hash`.
+    fn read_at(&self, hash: &ContentHash, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+        let mut file = self.open_indexed(hash)?;
+        file.seek(SeekFrom::Start(offset))?;
+        let mut out = vec![0u8; len];
+        file.read_exact(&mut out)?;
+        Ok(out)
+    }
+
+    /// Open the file of the object cached under `hash`. `NotFound` when the
+    /// object is not indexed, or its file is gone, which drops the entry as
+    /// a `get` of it would.
+    fn open_indexed(&self, hash: &ContentHash) -> io::Result<File> {
         if !self.entries.contains_key(hash) {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 "object is not in the metadata cache",
             ));
         }
-        let mut file = match File::open(self.cache_path(hash)) {
-            Ok(file) => file,
+        match File::open(self.cache_path(hash)) {
+            Ok(file) => Ok(file),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 // File vanished out from under the index (manual delete,
                 // external eviction). Drop the stale entry.
                 self.drop_entry(hash);
                 self.n_misses.fetch_add(1, Ordering::AcqRel);
-                return Err(e);
+                Err(e)
             }
-            Err(e) => return Err(e),
-        };
-        file.seek(SeekFrom::Start(offset))?;
-        let mut out = vec![0u8; len];
-        file.read_exact(&mut out)?;
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Mark `hash` as just used, for LRU eviction.
+    fn touch(&self, hash: &ContentHash) {
         if let Some(entry) = self.entries.get(hash) {
             entry.last_access_us.store(self.now_us(), Ordering::Release);
         }
-        self.n_hits.fetch_add(1, Ordering::AcqRel);
-        Ok(out)
     }
 
     /// Reserve `size` bytes of budget, evicting LRU victims as needed.
@@ -423,6 +593,7 @@ impl MetadataDiskCache {
         let mut candidates: Vec<(ContentHash, u64, u64)> = self
             .entries
             .iter()
+            .filter(|e| !self.is_pinned(e.key()))
             .map(|e| {
                 (
                     *e.key(),
@@ -441,8 +612,14 @@ impl MetadataDiskCache {
             }
             // Atomic gate: only the caller that wins the remove runs
             // the unlink + decrement, so concurrent evictions of the
-            // same victim can't double-count.
-            if self.entries.remove(&hash).is_some() {
+            // same victim can't double-count. The pin is checked under the
+            // entry's lock, which `pin` takes after counting its pin, so a
+            // pin taken since the candidates were listed is seen.
+            if self
+                .entries
+                .remove_if(&hash, |hash, _| !self.is_pinned(hash))
+                .is_some()
+            {
                 let _ = fs::remove_file(self.cache_path(&hash));
                 self.current_bytes.fetch_sub(size, Ordering::Release);
                 self.n_evictions.fetch_add(1, Ordering::AcqRel);
@@ -528,6 +705,49 @@ impl std::fmt::Debug for MetadataDiskCache {
             .field("n_entries", &self.entries.len())
             .finish()
     }
+}
+
+/// A pin of one cached object ([`MetadataDiskCache::pin`]): while it lives,
+/// eviction passes over the object.
+pub(crate) struct CachePin {
+    cache: Arc<MetadataDiskCache>,
+    hash: ContentHash,
+}
+
+impl CachePin {
+    /// The cache holding the object.
+    pub(crate) fn cache(&self) -> &MetadataDiskCache {
+        &self.cache
+    }
+
+    /// The object's content hash.
+    pub(crate) fn hash(&self) -> &ContentHash {
+        &self.hash
+    }
+}
+
+impl Drop for CachePin {
+    fn drop(&mut self) {
+        self.cache.unpin(&self.hash);
+    }
+}
+
+impl std::fmt::Debug for CachePin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CachePin")
+            .field("hash", &self.hash.to_hex())
+            .finish()
+    }
+}
+
+/// Write `bytes` to a new file at `path` and flush them to disk before
+/// returning, so a rename that publishes the file never publishes it
+/// ahead of its data: a crash leaves the old name or the whole file,
+/// never a torn one under the final name.
+fn write_synced(path: &std::path::Path, bytes: &[u8]) -> io::Result<()> {
+    let mut file = File::create(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
 }
 
 /// Build the on-disk file name for a cached part: `part-<hex>.avro.zst`.

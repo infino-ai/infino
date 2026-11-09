@@ -216,7 +216,11 @@ from the cache file on first use, every same-typed column's rows with
 it, once per handle for as long as the part is cached. The pruner and
 the scan read and decode the groups of the columns they test or project
 as blocking tasks before they read them, so a query's runtime threads do
-not wait on the file. So an open table
+not wait on the file. The cache file is verified against the section's
+hash when a handle opens it (a file a crash left torn is fetched from
+storage again), each group is checked against the hash it had then when
+it is read, and the file is pinned in the cache while the handle lives,
+so no other object in the cache's budget evicts it. So an open table
 costs each section's header, not its bytes, and a handle's statistics
 cost grows with the column types its queries touch. A table of
 thousands of columns costs a handle no more per superfile than a table
@@ -225,8 +229,9 @@ table, storage attached without a cache directory) keeps a section's
 bytes. A section that cannot be read, or that is not its part's, leaves
 the part's superfiles without statistics for that handle: every prune
 keeps them, which is correct, and the load goes on; a group whose cache
-file is gone when it is first read reads the same way, once, with a
-warning. Such a handle never writes those statistics anew from the
+file is gone, or no longer holds what was verified, reads the same way,
+with a warning, and is read again on the next use, so the handle
+recovers once a later load puts the file back. Such a handle never writes those statistics anew from the
 nothing it sees: a commit that would rewrite the part first reads every
 group of its section and, when one cannot be read, appends to a part of
 its own instead, and a commit or a repair that would carry the

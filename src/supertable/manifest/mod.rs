@@ -3688,15 +3688,17 @@ impl ManifestPartLoader {
     /// Fetch, verify and parse a summaries section: from the disk cache
     /// when it holds the section, else from storage and into the cache.
     ///
-    /// A section in the cache is parsed from its header and tables alone,
-    /// and its groups are read back from the cache file on first use, so
-    /// the handle holds none of its bytes. The bytes were hash-verified
-    /// when the cache took them; what the cache file reads back is trusted
-    /// as any file this process wrote, and a group that does not decode
-    /// reads as no statistics. A section from storage is verified and
+    /// A section in the cache is verified against its hash, streamed, and
+    /// parsed from its header and tables alone; its groups are read back
+    /// from the cache file on first use, each checked against the hash it
+    /// had when the file was verified, so the handle holds none of its
+    /// bytes and never reads a group the section did not hold. A cache file
+    /// that is not the section (a crash left it torn) is removed and the
+    /// section fetched from storage. A section from storage is verified and
     /// parsed whole, off the runtime as a part is, then handed to the cache
     /// and read from there too; only when the cache cannot take it does the
-    /// section keep its bytes.
+    /// section keep its bytes. Either way the section pins its cache file,
+    /// so no other occupant of the cache evicts it while the section lives.
     async fn load_summaries(
         &self,
         reference: &SummariesRef,
@@ -3716,8 +3718,13 @@ impl ManifestPartLoader {
             parse_summaries_off_thread(bytes.clone(), Some(reference.content_hash)).await?;
         if let Some(cache) = &self.metadata_disk_cache
             && cache.put(reference.content_hash, bytes).await
+            && let Some(pin) = cache.pin(reference.content_hash)
         {
-            section.read_groups_from(Arc::clone(cache), reference.content_hash);
+            section = summaries_task(move || {
+                section.read_groups_from(pin);
+                Ok(section)
+            })
+            .await?;
         }
         Ok(Arc::new(section))
     }
@@ -3857,14 +3864,15 @@ async fn parse_summaries_off_thread(
     summaries_task(verify_then_parse).await
 }
 
-/// Open the section cached under `hash` from its header, off the runtime:
-/// two reads of the cache file. `None` when the cache does not hold it.
+/// Open the section cached under `hash`, off the runtime: a verifying
+/// read of the cache file, which keeps its header. `None` when the cache
+/// does not hold it whole.
 async fn open_cached_summaries_off_thread(
     cache: Arc<MetadataDiskCache>,
     hash: ContentHash,
 ) -> Result<Option<SummariesSection>, ManifestLoadError> {
     summaries_task(move || {
-        SummariesSection::open_cached(cache, hash).map_err(ManifestLoadError::from)
+        SummariesSection::open_cached(&cache, hash).map_err(ManifestLoadError::from)
     })
     .await
 }
@@ -9678,6 +9686,49 @@ mod tests {
         assert!(
             section.resident_bytes() < reference.size_bytes as usize,
             "less than the section"
+        );
+    }
+
+    /// A cache file that is not the section it is named for, as a crash
+    /// that renamed a write ahead of its data could leave, is not read as
+    /// the section: the loader fetches the section from storage again and
+    /// reads its statistics, and caches it anew.
+    #[tokio::test]
+    async fn a_torn_section_cache_file_is_fetched_from_storage_again() {
+        let (dir, storage, _, reference) = published_sectioned_table().await;
+        let amount = fid("amount");
+        let (cached_opts, cache) = opts_with_cache(&dir);
+        drop(
+            ManifestSnapshot::load(None, Arc::clone(&storage), Some(Arc::clone(&cached_opts)))
+                .await
+                .expect("load"),
+        );
+        let file = dir
+            .path()
+            .join("metadata-cache")
+            .join(format!("part-{}.avro.zst", reference.content_hash.to_hex()));
+        let length = std::fs::metadata(&file).expect("cached").len() as usize;
+        std::fs::write(&file, vec![0xab; length]).expect("tear the file");
+
+        let reloaded = ManifestSnapshot::load(None, Arc::clone(&storage), Some(cached_opts))
+            .await
+            .expect("load");
+        let expected = [
+            sectioned_stats(vec![3, 9, 4]),
+            sectioned_stats(vec![10, 20]),
+        ];
+        for (row, entry) in reloaded.get_all_superfiles().iter().enumerate() {
+            assert!(entry.scalar_stats.readable());
+            assert_eq!(
+                entry.scalar_stats.get(amount).as_ref(),
+                Some(&expected[row])
+            );
+        }
+        assert!(cache.contains(&reference.content_hash), "cached anew");
+        assert_eq!(
+            std::fs::read(&file).expect("cached").len(),
+            length,
+            "the section, not the torn bytes"
         );
     }
 

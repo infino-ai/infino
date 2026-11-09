@@ -52,8 +52,11 @@
 use std::{
     collections::HashMap,
     fmt,
-    io::{Cursor, ErrorKind},
-    sync::{Arc, OnceLock},
+    io::Cursor,
+    sync::{
+        Arc, Mutex, OnceLock, PoisonError,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use arrow::{
@@ -75,7 +78,7 @@ use uuid::Uuid;
 use crate::supertable::{
     manifest::{
         SuperfileEntry, column_hll,
-        disk_cache::MetadataDiskCache,
+        disk_cache::{CachePin, MetadataDiskCache},
         encoding::stats_ipc_options,
         hll::HllSketch,
         list::{ScalarStatsAgg, ScalarValueCounts},
@@ -157,8 +160,9 @@ pub enum SummariesError {
     #[error("summaries section arrow: {0}")]
     Arrow(String),
     /// A group's bytes could not be read back from the metadata disk cache
-    /// the section was parsed through: the file is gone, or shorter than
-    /// the group table says.
+    /// the section was parsed through: the file is gone, shorter than the
+    /// group table says, or the range does not hash to what it held when
+    /// the section was verified.
     #[error("summaries section bytes could not be read back from the metadata cache: {0}")]
     CacheRead(String),
 }
@@ -479,22 +483,32 @@ enum GroupSource {
     Resident(Bytes),
     /// The section's file in the table's metadata disk cache, under its
     /// content hash: each group is read from it on first use, and the
-    /// handle holds no section bytes.
+    /// handle holds no section bytes. The pin keeps eviction off the file
+    /// while the section lives; each group's bytes are checked against
+    /// their hash, taken when the whole section was verified, so a file
+    /// that changed under the handle reads as unreadable, never as other
+    /// statistics.
     Cached {
-        cache: Arc<MetadataDiskCache>,
-        hash: ContentHash,
+        pin: CachePin,
+        /// Each group's hash, in group order.
+        group_hashes: Vec<ContentHash>,
     },
 }
 
 impl GroupSource {
-    /// The group bytes at `offset..offset + length`.
-    fn read(&self, offset: usize, length: usize) -> Result<Bytes, SummariesError> {
+    /// The bytes of group `index`, at `offset..offset + length`.
+    fn read(&self, index: usize, offset: usize, length: usize) -> Result<Bytes, SummariesError> {
         match self {
             Self::Resident(bytes) => Ok(bytes.slice(offset..offset + length)),
-            Self::Cached { cache, hash } => cache
-                .read_range(hash, offset as u64, length)
-                .map(Bytes::from)
-                .map_err(|error| SummariesError::CacheRead(error.to_string())),
+            Self::Cached { pin, group_hashes } => {
+                let expected = group_hashes.get(index).ok_or_else(|| {
+                    SummariesError::Malformed(format!("no hash for group {index}"))
+                })?;
+                pin.cache()
+                    .read_range_verified(pin.hash(), offset as u64, length, expected)
+                    .map(Bytes::from)
+                    .map_err(|error| SummariesError::CacheRead(error.to_string()))
+            }
         }
     }
 
@@ -529,13 +543,30 @@ struct FixedHeader {
 }
 
 impl FixedHeader {
-    /// Where the tables end and the groups begin.
+    /// Where the tables end and the groups begin. Saturates, so counts no
+    /// section could hold read as tables past any section's end.
     fn tables_end(&self, version_header_bytes: usize) -> usize {
         version_header_bytes
-            + self.n_superfiles * ID_BYTES
-            + self.n_entries * DIRECTORY_ENTRY_BYTES
-            + self.n_groups * GROUP_ENTRY_BYTES
+            .saturating_add(self.n_superfiles.saturating_mul(ID_BYTES))
+            .saturating_add(self.n_entries.saturating_mul(DIRECTORY_ENTRY_BYTES))
+            .saturating_add(self.n_groups.saturating_mul(GROUP_ENTRY_BYTES))
     }
+}
+
+/// The read state of one group.
+#[derive(Default)]
+struct GroupCell {
+    /// The group, decoded and checked, or why it does not decode: set once
+    /// the group's bytes are read, and kept, since the same bytes decode
+    /// the same way. A read that fails sets nothing (see `read_failed`).
+    decoded: OnceLock<Result<Group, SummariesError>>,
+    /// Held while the group is read, so concurrent first readers read it
+    /// once.
+    reading: Mutex<()>,
+    /// Whether the last read of the group's bytes failed. Such a failure
+    /// is not kept in `decoded`: the cache file may be back by the next
+    /// read, which tries again.
+    read_failed: AtomicBool,
 }
 
 /// A section, parsed to its directory; groups decode on first use, from
@@ -553,7 +584,7 @@ pub struct SummariesSection {
     directory: Vec<DirectoryEntry>,
     /// Each group's `(offset, length)` in the section.
     groups: Vec<(usize, usize)>,
-    decoded: Vec<OnceLock<Result<Group, SummariesError>>>,
+    cells: Vec<GroupCell>,
 }
 
 impl fmt::Debug for SummariesSection {
@@ -683,56 +714,86 @@ impl SummariesSection {
         Ok(Self::new(GroupSource::Resident(bytes), len, head))
     }
 
-    /// Parse the section cached under `hash` in `cache` from its header
-    /// and tables alone, two ranged reads of the cache file; the groups
-    /// are read from the file on first use, and the handle holds no
-    /// section bytes. `Ok(None)` when the cache does not hold the section,
-    /// so the caller fetches it from storage.
+    /// Open the section cached under `hash` in `cache`, holding its header
+    /// and tables: the file is verified against `hash` end to end, streamed
+    /// and never held whole, and each group's hash is kept, against which
+    /// the group is checked when it is read from the file on first use. The
+    /// section pins the file, so eviction leaves it while the section lives.
+    ///
+    /// `Ok(None)` when the cache does not hold the section, or holds a file
+    /// that is not it (one a crash left torn, which is removed), or cannot
+    /// read the file: the caller fetches the section from storage. An error
+    /// only for a file that is the section and does not parse.
     ///
     /// Blocking: it reads the cache file on the calling thread.
     pub fn open_cached(
-        cache: Arc<MetadataDiskCache>,
+        cache: &Arc<MetadataDiskCache>,
         hash: ContentHash,
     ) -> Result<Option<Self>, SummariesError> {
+        let Some(pin) = cache.pin(hash) else {
+            return Ok(None);
+        };
         let Some(len) = cache.size_of(&hash) else {
             return Ok(None);
         };
         let len = len as usize;
-        let read =
-            |offset: usize, length: usize| match cache.read_range(&hash, offset as u64, length) {
-                Ok(bytes) => Ok(Some(bytes)),
-                Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
-                Err(error) => Err(SummariesError::CacheRead(error.to_string())),
-            };
-        let Some(prefix) = read(0, HEADER_BYTES.min(len))? else {
-            return Ok(None);
+        let head = match read_cached_head(cache, &hash, len) {
+            Ok(Some(head)) => head,
+            Ok(None) => return Ok(None),
+            // A head that does not parse is the section's own defect only
+            // when the file is the section; a file that is not is removed
+            // by the check, and the section is fetched again.
+            Err(error) => {
+                return match cache.verify(&hash, &[]) {
+                    Ok(_) => Err(error),
+                    Err(_) => Ok(None),
+                };
+            }
         };
-        let tables_end = head_length(&prefix)?;
-        if tables_end > len {
-            return Err(SummariesError::Truncated {
-                what: "tables",
-                needed: tables_end,
-                had: len,
-            });
+        let (tables_bytes, tables_hash, head) = head;
+        let mut ranges = Vec::with_capacity(head.groups.len() + 1);
+        ranges.push((0, tables_bytes));
+        ranges.extend_from_slice(&head.groups);
+        let mut hashes = match cache.verify(&hash, &ranges) {
+            Ok(hashes) => hashes,
+            Err(error) => {
+                warn!(%error, hash = %hash.to_hex(), "cached summaries section could not be verified; reading it from storage");
+                return Ok(None);
+            }
+        };
+        // The tables parsed are the ones verified.
+        if hashes.remove(0) != tables_hash {
+            return Ok(None);
         }
-        let Some(tables) = read(0, tables_end)? else {
-            return Ok(None);
-        };
-        let head = parse_head(&tables, len)?;
         Ok(Some(Self::new(
-            GroupSource::Cached { cache, hash },
+            GroupSource::Cached {
+                pin,
+                group_hashes: hashes,
+            },
             len,
             head,
         )))
     }
 
     /// Let go of the resident bytes of a section the loader has just
-    /// written to `cache` under `hash`: the groups read from the cache
-    /// file from here on, as [`Self::open_cached`]'s do. The section's
-    /// groups are not yet decoded when the loader calls this, so nothing
-    /// read from the bytes is lost.
-    pub(crate) fn read_groups_from(&mut self, cache: Arc<MetadataDiskCache>, hash: ContentHash) {
-        self.source = GroupSource::Cached { cache, hash };
+    /// written to the cache that `pin` holds it in: the groups read from
+    /// the cache file from here on, as [`Self::open_cached`]'s do, each
+    /// checked against its hash, taken here from the bytes, which were
+    /// verified before they were parsed. The section's groups are not yet
+    /// decoded when the loader calls this, so nothing read from the bytes
+    /// is lost.
+    ///
+    /// Blocking: it hashes the section on the calling thread.
+    pub(crate) fn read_groups_from(&mut self, pin: CachePin) {
+        let GroupSource::Resident(bytes) = &self.source else {
+            return;
+        };
+        let group_hashes = self
+            .groups
+            .iter()
+            .map(|(offset, length)| ContentHash::of(&bytes[*offset..*offset + *length]))
+            .collect();
+        self.source = GroupSource::Cached { pin, group_hashes };
     }
 
     fn new(source: GroupSource, len: usize, head: Head) -> Self {
@@ -742,7 +803,7 @@ impl SummariesSection {
             directory,
             groups,
         } = head;
-        let decoded = (0..groups.len()).map(|_| OnceLock::new()).collect();
+        let cells = (0..groups.len()).map(|_| GroupCell::default()).collect();
         Self {
             source,
             len,
@@ -750,7 +811,7 @@ impl SummariesSection {
             superfile_ids,
             directory,
             groups,
-            decoded,
+            cells,
         }
     }
 
@@ -864,13 +925,14 @@ impl SummariesSection {
 
     /// Whether every group that holds a row of one of `columns` has been
     /// read, decoded or not: what a query asks before it hands a section to
-    /// [`Self::decode_groups_of`], so a warm handle starts no task. Cheap:
-    /// it reads nothing.
+    /// [`Self::decode_groups_of`], so a warm handle starts no task. A group
+    /// whose read failed has not been read, and the next load tries it
+    /// again. Cheap: it reads nothing.
     pub(crate) fn groups_of_read(&self, columns: &[FieldId]) -> bool {
         self.groups_of(columns).all(|index| {
-            self.decoded
+            self.cells
                 .get(index)
-                .is_none_or(|cell| cell.get().is_some())
+                .is_none_or(|cell| cell.decoded.get().is_some())
         })
     }
 
@@ -893,17 +955,19 @@ impl SummariesSection {
     /// new section, or carries an entry's statistics into a rewritten
     /// superfile, since a group that cannot be read would be written as no
     /// statistics, for good. False when any group cannot be read or does
-    /// not decode.
+    /// not decode. A group whose read failed before is read again, so a
+    /// section whose cache file is back reads whole again.
     pub(crate) fn all_groups_readable(&self) -> bool {
         (0..self.groups.len()).all(|index| self.group(index).is_some())
     }
 
-    /// Whether a group read so far could not be read or decoded. Cheap:
-    /// it reads nothing, so a handle can ask per superfile.
+    /// Whether a group does not decode, or its last read failed. Cheap: it
+    /// reads nothing, so a handle can ask per superfile.
     pub(crate) fn has_unreadable_group(&self) -> bool {
-        self.decoded
-            .iter()
-            .any(|cell| cell.get().is_some_and(|group| group.is_err()))
+        self.cells.iter().any(|cell| {
+            cell.read_failed.load(Ordering::Acquire)
+                || cell.decoded.get().is_some_and(|group| group.is_err())
+        })
     }
 
     /// Whether the section holds its bytes rather than reading them back
@@ -922,10 +986,10 @@ impl SummariesSection {
     pub fn resident_bytes(&self) -> usize {
         self.source.resident_bytes()
             + self
-                .decoded
+                .cells
                 .iter()
                 .zip(&self.groups)
-                .filter(|(cell, _)| cell.get().is_some_and(|group| group.is_ok()))
+                .filter(|(cell, _)| cell.decoded.get().is_some_and(|group| group.is_ok()))
                 .map(|(_, (_, length))| *length)
                 .sum::<usize>()
     }
@@ -933,39 +997,89 @@ impl SummariesSection {
     /// Group `index`, decoded on first use and checked against the
     /// directory: a run that reaches past the group's rows makes the whole
     /// group read as no statistics, since the directory and the group
-    /// disagree and neither can be trusted. A group whose bytes cannot be
-    /// read back from the cache reads the same way, and the failure is
-    /// kept, so it is logged once per group and not retried per column.
+    /// disagree and neither can be trusted. That is kept, and logged once.
+    ///
+    /// A group whose bytes cannot be read back from the cache (the file is
+    /// gone, or does not hold what it held when verified) reads as no
+    /// statistics too, but is not kept: the next read tries again, so a
+    /// handle recovers once the file is back. Logged once per run of
+    /// failures.
     fn group(&self, index: usize) -> Option<&Group> {
-        let cell = self.decoded.get(index)?;
-        let decoded = cell.get_or_init(|| {
-            let (offset, length) = self.groups[index];
-            let group = decode_group(&self.source.read(offset, length)?)?;
-            let rows = group.superfile.len();
-            let run_past_the_group = self
-                .directory
-                .iter()
-                .filter(|entry| entry.group as usize == index)
-                .any(|entry| {
-                    (entry.row_start as usize)
-                        .checked_add(entry.row_count as usize)
-                        .is_none_or(|end| end > rows)
-                });
-            if run_past_the_group {
-                return Err(SummariesError::Malformed(format!(
-                    "a directory run reaches past group {index}'s {rows} rows"
-                )));
-            }
-            Ok(group)
-        });
-        match decoded {
-            Ok(group) => Some(group),
-            Err(error) => {
-                warn!(%error, group = index, "summaries section group does not decode");
-                None
-            }
+        let cell = self.cells.get(index)?;
+        if let Some(decoded) = cell.decoded.get() {
+            return decoded.as_ref().ok();
         }
+        let _reading = cell.reading.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(decoded) = cell.decoded.get() {
+            return decoded.as_ref().ok();
+        }
+        let (offset, length) = self.groups[index];
+        let bytes = match self.source.read(index, offset, length) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                if !cell.read_failed.swap(true, Ordering::AcqRel) {
+                    warn!(%error, group = index, "summaries section group could not be read");
+                }
+                return None;
+            }
+        };
+        cell.read_failed.store(false, Ordering::Release);
+        let decoded = self.decode_checked(index, &bytes);
+        if let Err(error) = &decoded {
+            warn!(%error, group = index, "summaries section group does not decode");
+        }
+        cell.decoded.get_or_init(|| decoded).as_ref().ok()
     }
+
+    /// Decode group `index` from `bytes` and check it against the
+    /// directory (see [`Self::group`]).
+    fn decode_checked(&self, index: usize, bytes: &[u8]) -> Result<Group, SummariesError> {
+        let group = decode_group(bytes)?;
+        let rows = group.superfile.len();
+        let run_past_the_group = self
+            .directory
+            .iter()
+            .filter(|entry| entry.group as usize == index)
+            .any(|entry| {
+                (entry.row_start as usize)
+                    .checked_add(entry.row_count as usize)
+                    .is_none_or(|end| end > rows)
+            });
+        if run_past_the_group {
+            return Err(SummariesError::Malformed(format!(
+                "a directory run reaches past group {index}'s {rows} rows"
+            )));
+        }
+        Ok(group)
+    }
+}
+
+/// Read the head of the section cached under `hash`, `len` bytes long:
+/// `(tables_bytes, hash of those bytes, head)`, where `tables_bytes` is
+/// how many leading bytes hold the header and tables. `Ok(None)` when the
+/// file cannot be read. Not verified: [`SummariesSection::open_cached`]
+/// checks what this read against the whole file's hash.
+fn read_cached_head(
+    cache: &MetadataDiskCache,
+    hash: &ContentHash,
+    len: usize,
+) -> Result<Option<(usize, ContentHash, Head)>, SummariesError> {
+    let Ok(prefix) = cache.read_range(hash, 0, HEADER_BYTES.min(len)) else {
+        return Ok(None);
+    };
+    let tables_end = head_length(&prefix)?;
+    if tables_end > len {
+        return Err(SummariesError::Truncated {
+            what: "tables",
+            needed: tables_end,
+            had: len,
+        });
+    }
+    let Ok(tables) = cache.read_range(hash, 0, tables_end) else {
+        return Ok(None);
+    };
+    let head = parse_head(&tables, len)?;
+    Ok(Some((tables_end, ContentHash::of(&tables), head)))
 }
 
 /// Parse the fixed-width start of a section from `reader`: the magic, the
@@ -1010,12 +1124,23 @@ fn head_length(prefix: &[u8]) -> Result<usize, SummariesError> {
 /// section's whole length.
 fn parse_head(bytes: &[u8], len: usize) -> Result<Head, SummariesError> {
     let mut reader = Reader { bytes, at: 0 };
+    let fixed = parse_fixed_header(&mut reader)?;
+    // The counts size the allocations below, so they are checked against
+    // the bytes first: a malformed count must not reserve gigabytes.
+    let tables_end = fixed.tables_end(reader.at);
+    if tables_end > bytes.len() {
+        return Err(SummariesError::Truncated {
+            what: "tables",
+            needed: tables_end,
+            had: bytes.len(),
+        });
+    }
     let FixedHeader {
         part_id,
         n_superfiles,
         n_entries,
         n_groups,
-    } = parse_fixed_header(&mut reader)?;
+    } = fixed;
     let mut superfile_ids = Vec::with_capacity(n_superfiles);
     for _ in 0..n_superfiles {
         let id = reader.take(ID_BYTES, "superfile id")?;
@@ -1768,7 +1893,7 @@ mod tests {
         let bytes = SummariesSection::encode(part(), &ids, owned.rows()).expect("encode");
         let (_dir, cache, hash) = cache_holding(&bytes).await;
         let whole = SummariesSection::parse(Bytes::from(bytes.clone())).expect("parse");
-        let cached = SummariesSection::open_cached(Arc::clone(&cache), hash)
+        let cached = SummariesSection::open_cached(&cache, hash)
             .expect("open")
             .expect("the cache holds the section");
 
@@ -1816,7 +1941,7 @@ mod tests {
         let (_dir, cache, _) = cache_holding(&bytes).await;
         let other = ContentHash::of(b"another object");
         assert!(
-            SummariesSection::open_cached(Arc::clone(&cache), other)
+            SummariesSection::open_cached(&cache, other)
                 .expect("no error")
                 .is_none()
         );
@@ -1825,22 +1950,24 @@ mod tests {
         let short_hash = ContentHash::of(short);
         assert!(cache.put(short_hash, Bytes::copy_from_slice(short)).await);
         assert!(matches!(
-            SummariesSection::open_cached(cache, short_hash),
+            SummariesSection::open_cached(&cache, short_hash),
             Err(SummariesError::Truncated { what: "tables", .. })
         ));
     }
 
     /// A cache file gone before a group is read makes that group read as
-    /// no statistics, once, and marks the section as not readable whole;
-    /// a group read before stays. A section parsed whole that then reads
-    /// from the cache behaves as one opened from it.
+    /// no statistics and marks the section as not readable whole; a group
+    /// read before stays. The failure is not kept: once the file is back,
+    /// as a later load of the section puts it, the group reads, and the
+    /// section is readable whole again. A section parsed whole that then
+    /// reads from the cache behaves as one opened from it.
     #[tokio::test]
-    async fn a_group_whose_cache_file_is_gone_reads_as_no_statistics() {
+    async fn a_group_whose_cache_file_is_gone_reads_as_no_statistics_until_it_is_back() {
         let (ids, owned) = two_superfiles();
         let bytes = SummariesSection::encode(part(), &ids, owned.rows()).expect("encode");
         let (dir, cache, hash) = cache_holding(&bytes).await;
         let mut section = SummariesSection::parse(Bytes::from(bytes.clone())).expect("parse");
-        section.read_groups_from(Arc::clone(&cache), hash);
+        section.read_groups_from(cache.pin(hash).expect("cached"));
         assert!(!section.holds_bytes());
         let amount = section
             .stat(0, AMOUNT)
@@ -1858,19 +1985,186 @@ mod tests {
             Some(amount),
             "a decoded group stays"
         );
-        assert!(
-            section.stat(1, KIND).is_none(),
-            "the failure is kept; the group is not read again"
-        );
+        assert!(section.stat(1, KIND).is_none(), "still gone");
         assert!(
             section.row_has_statistics(0),
             "the superfile still has the statistics of the groups read"
         );
         assert!(
-            SummariesSection::open_cached(cache, hash)
+            SummariesSection::open_cached(&cache, hash)
                 .expect("no error")
                 .is_none(),
             "a later open finds the cache without the section"
         );
+
+        assert!(cache.put(hash, Bytes::from(bytes.clone())).await);
+        assert_eq!(
+            section.stat(1, KIND).as_ref(),
+            Some(
+                &owned
+                    .0
+                    .iter()
+                    .find(|(c, s, _)| *c == KIND && *s == 1)
+                    .expect("kind")
+                    .2
+            ),
+            "the group is read again once the file is back"
+        );
+        assert!(section.all_groups_readable(), "every group read again");
+        assert!(!section.has_unreadable_group());
+    }
+
+    /// Two encodings of one layout with other values, the same length:
+    /// what a cache file that no longer holds what was verified, a crash's
+    /// torn write or a corrupted block, can hold, and still decode.
+    fn section_and_impostor() -> (Vec<u8>, Vec<u8>) {
+        let ids = ids(2);
+        let section = |first: i64, second: i64| {
+            let owned = Owned(vec![
+                (
+                    AMOUNT,
+                    0,
+                    stats_of(Arc::new(Int64Array::from(vec![first, 9]))),
+                ),
+                (
+                    AMOUNT,
+                    1,
+                    stats_of(Arc::new(Int64Array::from(vec![second, 20]))),
+                ),
+            ]);
+            SummariesSection::encode(part(), &ids, owned.rows()).expect("encode")
+        };
+        let real = section(3, 10);
+        let impostor = section(4, 11);
+        assert_ne!(real, impostor);
+        assert_eq!(real.len(), impostor.len(), "the same layout");
+        (real, impostor)
+    }
+
+    /// The one file of the cache under `dir`.
+    fn the_cache_file(dir: &TempDir) -> std::path::PathBuf {
+        let mut files: Vec<_> = fs::read_dir(dir.path().join("cache"))
+            .expect("cache dir")
+            .map(|entry| entry.expect("entry").path())
+            .collect();
+        assert_eq!(files.len(), 1);
+        files.remove(0)
+    }
+
+    /// A cache file overwritten under a section a handle has open, with
+    /// bytes that decode to the same rows and other values, reads as no
+    /// statistics, never as the other values, and the file leaves the
+    /// cache, so the next load fetches the section again.
+    #[tokio::test]
+    async fn a_cache_file_that_changed_under_a_section_reads_as_unreadable_not_as_other_values() {
+        let (real, impostor) = section_and_impostor();
+        let (dir, cache, hash) = cache_holding(&real).await;
+        let opened = SummariesSection::open_cached(&cache, hash)
+            .expect("open")
+            .expect("cached");
+        let mut parsed = SummariesSection::parse(Bytes::from(real.clone())).expect("parse");
+        parsed.read_groups_from(cache.pin(hash).expect("cached"));
+        let impostor_section =
+            SummariesSection::parse(Bytes::from(impostor.clone())).expect("parse");
+        assert_ne!(impostor_section.stat(0, AMOUNT), None);
+
+        fs::write(the_cache_file(&dir), &impostor).expect("overwrite");
+        assert_eq!(
+            opened.stat(0, AMOUNT),
+            None,
+            "not the impostor's statistics"
+        );
+        assert!(opened.has_unreadable_group());
+        assert!(!opened.all_groups_readable());
+        assert!(!cache.contains(&hash), "the file left the cache");
+        assert_eq!(parsed.stat(0, AMOUNT), None);
+        assert!(!parsed.all_groups_readable());
+    }
+
+    /// A cache file that is not the section it is named for, as a crash
+    /// can leave one that the restart's scan indexes on its length alone,
+    /// is not opened: the open reads as not cached, so the loader fetches
+    /// the section from storage, and the file leaves the cache.
+    #[tokio::test]
+    async fn a_torn_cache_file_found_at_restart_is_fetched_again_not_read() {
+        let (real, impostor) = section_and_impostor();
+        let (dir, cache, hash) = cache_holding(&real).await;
+        drop(cache);
+        fs::write(the_cache_file(&dir), &impostor).expect("tear");
+
+        let restarted = MetadataDiskCache::new(dir.path().join("cache"), TEST_CACHE_BUDGET_BYTES)
+            .expect("cache");
+        assert!(restarted.contains(&hash), "indexed on its name and length");
+        assert!(
+            SummariesSection::open_cached(&restarted, hash)
+                .expect("no error")
+                .is_none(),
+            "not opened"
+        );
+        assert!(!restarted.contains(&hash), "the file left the cache");
+
+        // A head torn past parsing is fetched again too, not refused.
+        assert!(restarted.put(hash, Bytes::from(real.clone())).await);
+        fs::write(the_cache_file(&dir), vec![0xff; real.len()]).expect("tear");
+        assert!(
+            SummariesSection::open_cached(&restarted, hash)
+                .expect("no error")
+                .is_none()
+        );
+    }
+
+    /// A section a handle reads from the cache stays there while the
+    /// handle lives, whatever else fills the budget: another object that
+    /// needs the room is refused rather than evicting it. Once the section
+    /// is dropped, its file is evictable again.
+    #[tokio::test]
+    async fn a_live_section_is_not_evicted_by_another_occupant() {
+        let (ids, owned) = two_superfiles();
+        let bytes = SummariesSection::encode(part(), &ids, owned.rows()).expect("encode");
+        let dir = TempDir::new().expect("tempdir");
+        let other = vec![7u8; 64];
+        let cache = MetadataDiskCache::new(
+            dir.path().join("cache"),
+            (bytes.len() + other.len() / 2) as u64,
+        )
+        .expect("cache");
+        let hash = ContentHash::of(&bytes);
+        assert!(cache.put(hash, Bytes::from(bytes.clone())).await);
+        let section = SummariesSection::open_cached(&cache, hash)
+            .expect("open")
+            .expect("cached");
+
+        let other_hash = ContentHash::of(&other);
+        assert!(
+            !cache.put(other_hash, Bytes::from(other.clone())).await,
+            "no room but the live section's"
+        );
+        assert!(cache.contains(&hash));
+        assert!(section.all_groups_readable());
+        assert_eq!(
+            section.stat(0, AMOUNT),
+            SummariesSection::parse(Bytes::from(bytes))
+                .expect("parse")
+                .stat(0, AMOUNT)
+        );
+
+        drop(section);
+        assert!(cache.put(other_hash, Bytes::from(other)).await);
+        assert!(!cache.contains(&hash), "evicted once no section reads it");
+    }
+
+    /// A section whose counts promise more tables than it holds is refused
+    /// before the tables are sized from them, so a malformed count cannot
+    /// reserve gigabytes.
+    #[test]
+    fn a_section_whose_counts_overrun_it_is_refused_before_it_allocates() {
+        let (ids, owned) = two_superfiles();
+        let mut bytes = SummariesSection::encode(part(), &ids, owned.rows()).expect("encode");
+        let counts_at = MAGIC.len() + U32_BYTES + ID_BYTES;
+        bytes[counts_at..counts_at + U32_BYTES].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(matches!(
+            SummariesSection::parse(Bytes::from(bytes)),
+            Err(SummariesError::Truncated { what: "tables", .. })
+        ));
     }
 }
