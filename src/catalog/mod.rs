@@ -4966,10 +4966,13 @@ mod tests {
         table
     }
 
-    /// `n` distinct strings, `prefix` before each.
+    /// `n` distinct strings, `prefix` before each, each twice: values that
+    /// repeat, which a superfile counts exactly while they fit its cap.
     fn distinct_strings(prefix: &str, n: usize) -> ArrayRef {
         Arc::new(LargeStringArray::from(
-            (0..n).map(|i| format!("{prefix}{i}")).collect::<Vec<_>>(),
+            (0..2 * n)
+                .map(|i| format!("{prefix}{}", i / 2))
+                .collect::<Vec<_>>(),
         ))
     }
 

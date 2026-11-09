@@ -55,7 +55,7 @@ use crate::{
                 encode_scalar_stats, require_single_row_bounds,
             },
             head8,
-            hll::HllSketch,
+            hll::{HLL_REGISTERS, HllSketch},
             merge_min_max_arrays,
             part::{BLAKE3_DIGEST_BYTES, BLAKE3_HEX_LEN, ContentHash, PartId},
             rollups::{RollupsAt, RollupsRef},
@@ -939,6 +939,48 @@ impl ScalarValueCounts {
     pub(crate) fn entries(&self) -> &[(ScalarValue, u64)] {
         &self.entries
     }
+
+    /// Whether this table, counting `values` non-null values, says more
+    /// than the distinct sketch that stands in for a column without one:
+    /// its values repeat (its distinct values are at most
+    /// [`MOST_DISTINCT_TENTHS`] tenths of them), or it takes no more bytes
+    /// than the sketch's registers. A table of values nearly all seen once
+    /// is a copy of the column, not a summary of it.
+    fn summarises(&self, values: usize) -> bool {
+        self.entries.len().saturating_mul(10) <= values.saturating_mul(MOST_DISTINCT_TENTHS)
+            || self.value_bytes() <= HLL_REGISTERS
+    }
+
+    /// About the bytes the table's entries take stored: each value's own
+    /// bytes and its count.
+    fn value_bytes(&self) -> usize {
+        self.entries
+            .iter()
+            .map(|(value, _)| stored_value_bytes(value) + size_of::<u64>())
+            .sum()
+    }
+}
+
+/// The most a table larger than the sketch may have distinct values, in
+/// tenths of the values it counts, and still be kept (see
+/// [`ScalarValueCounts::summarises`]): one value in ten must be a repeat.
+const MOST_DISTINCT_TENTHS: usize = 9;
+
+/// The bytes `value` takes stored: a string's or a binary's length, a
+/// fixed-width value's width.
+fn stored_value_bytes(value: &ScalarValue) -> usize {
+    match value {
+        ScalarValue::Utf8(Some(s))
+        | ScalarValue::LargeUtf8(Some(s))
+        | ScalarValue::Utf8View(Some(s)) => s.len(),
+        ScalarValue::Binary(Some(b))
+        | ScalarValue::LargeBinary(Some(b))
+        | ScalarValue::BinaryView(Some(b)) => b.len(),
+        other => other
+            .data_type()
+            .primitive_width()
+            .unwrap_or(size_of::<u64>()),
+    }
 }
 
 /// `(row, value)` for each non-null value of an Arrow array iterator.
@@ -1119,11 +1161,19 @@ impl ScalarStatsAgg {
         // distinct estimate sketches a table's values where there is one,
         // reads the sketch where there is not, and nothing from a null
         // column.
-        let value_counts = ScalarValueCounts::from_pieces(pieces);
+        //
+        // A table is kept only where it summarises the values: where some
+        // repeat, or it is no larger than the sketch. A sparse column holds
+        // few values in a superfile, often all different, which fit the cap
+        // without repeating; its table is then a copy of the values, and on
+        // a table of thousands of such columns the tables would be most of
+        // what a commit adds to the manifest, about the bytes it wrote.
         let non_null: usize = pieces
             .iter()
             .map(|piece| piece.len() - piece.null_count())
             .sum();
+        let value_counts =
+            ScalarValueCounts::from_pieces(pieces).filter(|table| table.summarises(non_null));
         let hll = if value_counts.is_some() || non_null == 0 {
             None
         } else {
@@ -2587,6 +2637,7 @@ mod tests {
     //! jq-friendly.
     use std::{
         collections::{BTreeMap, HashMap},
+        ops::RangeInclusive,
         slice::from_ref,
         str::from_utf8,
         sync::Arc,
@@ -2825,8 +2876,10 @@ mod tests {
             ]
         );
 
+        // Each value twice: a table of distinct values larger than the sketch
+        // is kept only where they repeat.
         let at_the_cap: ArrayRef = Arc::new(Int64Array::from_iter_values(
-            0..MAX_EXACT_VALUE_COUNTS as i64,
+            (0..2 * MAX_EXACT_VALUE_COUNTS as i64).map(|i| i / 2),
         ));
         let at_the_cap = ScalarStatsAgg::from_column(&at_the_cap).expect("int stats");
         assert_eq!(
@@ -2927,15 +2980,13 @@ mod tests {
     /// sketch merges the same way.
     #[test]
     fn scalar_agg_merge_drops_value_counts_above_cap() {
-        let left: ArrayRef = Arc::new(Int64Array::from_iter_values(
-            0..=(MAX_EXACT_VALUE_COUNTS / 2) as i64,
-        ));
-        let right: ArrayRef = Arc::new(Int64Array::from_iter_values(
-            (MAX_EXACT_VALUE_COUNTS / 2 + 1) as i64..=MAX_EXACT_VALUE_COUNTS as i64,
-        ));
-        let whole: ArrayRef = Arc::new(Int64Array::from_iter_values(
-            0..=MAX_EXACT_VALUE_COUNTS as i64,
-        ));
+        // Each value twice, so each side's table summarises it.
+        let twice = |values: RangeInclusive<i64>| -> ArrayRef {
+            Arc::new(Int64Array::from_iter_values(values.flat_map(|v| [v, v])))
+        };
+        let left = twice(0..=(MAX_EXACT_VALUE_COUNTS / 2) as i64);
+        let right = twice((MAX_EXACT_VALUE_COUNTS / 2 + 1) as i64..=MAX_EXACT_VALUE_COUNTS as i64);
+        let whole = twice(0..=MAX_EXACT_VALUE_COUNTS as i64);
         let want = column_hll(from_ref(&whole)).expect("sketchable");
         let mut merged = ScalarStatsAgg::from_column(&left).expect("left stats");
         let right = ScalarStatsAgg::from_column(&right).expect("right stats");
@@ -2954,9 +3005,8 @@ mod tests {
             0..=(2 * MAX_EXACT_VALUE_COUNTS) as i64,
         ));
         let want = column_hll(from_ref(&doubled)).expect("sketchable");
-        let upper: ArrayRef = Arc::new(Int64Array::from_iter_values(
-            (MAX_EXACT_VALUE_COUNTS + 1) as i64..=(2 * MAX_EXACT_VALUE_COUNTS) as i64,
-        ));
+        let upper =
+            twice((MAX_EXACT_VALUE_COUNTS + 1) as i64..=(2 * MAX_EXACT_VALUE_COUNTS) as i64);
         let upper = ScalarStatsAgg::from_column(&upper).expect("upper stats");
         assert!(upper.value_counts.is_some());
         sketched.merge_with(&upper).expect("same type");
@@ -3075,6 +3125,66 @@ mod tests {
             3
         );
         assert!(agg.hll.is_none(), "the table counts the column exactly");
+    }
+
+    /// A table larger than the sketch is kept where some of its values
+    /// repeat and replaced by the sketch where nearly all appear once, as on
+    /// a sparse column whose few values in a superfile are all different; a
+    /// table no larger than the sketch is kept either way.
+    #[test]
+    fn an_exact_table_is_kept_only_where_it_summarises() {
+        const DISTINCT: i64 = 200;
+        let once: ArrayRef = Arc::new(Int64Array::from_iter(
+            (0..10 * DISTINCT).map(|i| (i % 10 == 0).then_some(i)),
+        ));
+        let once = ScalarStatsAgg::from_column(&once).expect("int stats");
+        assert!(once.value_counts.is_none(), "200 values seen once each");
+        assert!(once.hll.is_some(), "the sketch stands in for the table");
+        assert_eq!(once.null_count, Some(9 * DISTINCT as u64));
+
+        let twice: ArrayRef = Arc::new(Int64Array::from_iter_values(
+            (0..2 * DISTINCT).map(|i| i % DISTINCT),
+        ));
+        let twice = ScalarStatsAgg::from_column(&twice).expect("int stats");
+        assert_eq!(
+            twice.value_counts.expect("repeated values").entries().len(),
+            DISTINCT as usize
+        );
+        assert!(twice.hll.is_none());
+
+        // 200 values over 300 rows, as a country column in a small commit.
+        let some_repeat: ArrayRef =
+            Arc::new(Int64Array::from_iter_values((0..300).map(|i| i % DISTINCT)));
+        let some_repeat = ScalarStatsAgg::from_column(&some_repeat).expect("int stats");
+        assert!(
+            some_repeat.value_counts.is_some(),
+            "a third of the rows repeat"
+        );
+
+        // 200 values over 210 rows: nearly all seen once.
+        let few_repeat: ArrayRef =
+            Arc::new(Int64Array::from_iter_values((0..210).map(|i| i % DISTINCT)));
+        let few_repeat = ScalarStatsAgg::from_column(&few_repeat).expect("int stats");
+        assert!(few_repeat.value_counts.is_none(), "one row in 21 repeats");
+
+        let long_text: ArrayRef = Arc::new(StringArray::from_iter_values(
+            (0..40).map(|i| format!("{{\"key\": {i}, \"name\": \"item {i}\"}}")),
+        ));
+        let long_text = ScalarStatsAgg::from_column(&long_text).expect("utf8 stats");
+        assert!(
+            long_text.value_counts.is_none(),
+            "forty distinct documents outweigh the sketch"
+        );
+
+        let few: ArrayRef = Arc::new(Int64Array::from_iter_values(0..40));
+        let few = ScalarStatsAgg::from_column(&few).expect("int stats");
+        assert_eq!(
+            few.value_counts
+                .expect("forty integers fit the sketch's bytes")
+                .entries()
+                .len(),
+            40
+        );
     }
 
     #[test]
