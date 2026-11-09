@@ -33,6 +33,7 @@ INFINO_BENCH_SUPERFILE_DOCS=100000 \
 cargo bench -- diagnostic                # optional diagnostics
 cargo bench -- tombstone
 cargo bench -- wide-sparse               # compaction of a wide, sparse table (by name only)
+cargo bench -- hybrid-optimize           # optimize after a small hybrid build (by name only)
 ```
 
 Positional args after `--`: `[tier] [modality] [phase...] [corpus=…]`.

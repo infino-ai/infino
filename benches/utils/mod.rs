@@ -38,6 +38,7 @@ pub mod filtered_vector;
 pub mod fts_diag;
 pub mod fts_merge;
 pub mod fts_quality;
+pub mod hybrid_optimize;
 pub mod null_prune;
 pub mod recall_while_ingest;
 pub mod scale;
