@@ -89,7 +89,9 @@ use crate::{
         handle::{Supertable, SupertableReader},
         manifest::ManifestSnapshot,
         query::{
-            covered_agg::{CoveredAggregateRewrite, value_counts_nulls},
+            covered_agg::{
+                CoveredAggregateRewrite, load_unfiltered_aggregate_inputs, value_counts_nulls,
+            },
             exec::{
                 common::collect_plan_metered, fts_exec::register_bm25,
                 hybrid_exec::register_hybrid_search, match_exec::register_match,
@@ -358,6 +360,10 @@ impl SupertableReader {
                     df
                 }
             };
+            // The plan is optimized when it is made physical, below: an
+            // unfiltered aggregate's parts are loaded first, so the rewrite
+            // can answer it from manifest statistics.
+            load_unfiltered_aggregate_inputs(df.logical_plan()).await?;
             // Meter the executed plan on the thread-CPU clock, the same
             // way the catalog path does. The context is cached and
             // deliberately carries no collector, so without this the

@@ -153,7 +153,10 @@ use crate::{
         gc::RECLAIM_CONCURRENCY,
         manifest::{ManifestSnapshot, disk_cache::MetadataDiskCache},
         options::SupertableOptions,
-        query::{exec::common::collect_plan_metered, sql::sql_session_context},
+        query::{
+            covered_agg::load_unfiltered_aggregate_inputs, exec::common::collect_plan_metered,
+            sql::sql_session_context,
+        },
         reader_cache::{DiskCacheConfig, DiskCacheError, DiskCacheStore},
         schema::{ColumnIndex, TableSchema, change::SchemaPatch, error::SchemaError},
     },
@@ -1431,6 +1434,13 @@ impl Connection {
                 read_only_sql_options()
                     .verify_plan(&plan)
                     .map_err(|e| InfinoError::Query(format!("{READ_ONLY_REFUSAL} ({e})")))?;
+
+                // An unfiltered aggregate's parts are loaded before
+                // optimization, so the rewrite can answer it from manifest
+                // statistics.
+                load_unfiltered_aggregate_inputs(&plan)
+                    .await
+                    .map_err(InfinoError::from)?;
 
                 let df = planner_ctx
                     .execute_logical_plan(plan)

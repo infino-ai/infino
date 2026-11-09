@@ -63,7 +63,10 @@ use arrow_array::ArrayRef;
 use arrow_schema::DataType;
 use datafusion::{
     catalog::TableProvider,
-    common::{ScalarValue, tree_node::Transformed},
+    common::{
+        ScalarValue,
+        tree_node::{Transformed, TreeNode, TreeNodeRecursion},
+    },
     datasource::{DefaultTableSource, provider_as_source},
     error::{DataFusionError, Result as DfResult},
     functions::core::expr_fn::{coalesce, greatest, least},
@@ -154,6 +157,30 @@ enum Class {
     Boundary,
 }
 
+/// Load every manifest part of each table an unfiltered, ungrouped aggregate
+/// in `plan` reads, so the rewrite below finds the whole table resident and
+/// answers from statistics. That aggregate's scan would load every part
+/// anyway, so loading them before optimization adds no reads.
+pub(crate) async fn load_unfiltered_aggregate_inputs(plan: &LogicalPlan) -> Result<(), QueryError> {
+    let mut providers: Vec<&SupertableProvider> = Vec::new();
+    plan.apply(|node| {
+        if let LogicalPlan::Aggregate(agg) = node
+            && agg.group_expr.is_empty()
+            && let Some(scan) = peel_unfiltered_scan(agg.input.as_ref())
+            && let Some(provider) = provider_of(scan)
+            && !provider.is_segment_restricted()
+        {
+            providers.push(provider);
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })
+    .map_err(QueryError::DataFusion)?;
+    for provider in providers {
+        provider.load_every_part().await?;
+    }
+    Ok(())
+}
+
 fn try_rewrite(plan: &LogicalPlan) -> DfResult<Option<LogicalPlan>> {
     let LogicalPlan::Aggregate(agg) = plan else {
         return Ok(None);
@@ -184,10 +211,10 @@ fn try_rewrite(plan: &LogicalPlan) -> DfResult<Option<LogicalPlan>> {
         if provider.is_segment_restricted() {
             return Ok(None);
         }
-        let Some(superfiles) = provider.manifest().complete_flat_superfiles() else {
+        let manifest = provider.manifest();
+        let Some(superfiles) = manifest.resident_superfiles() else {
             return Ok(None);
         };
-        let manifest = provider.manifest();
         let (covered, boundary): (Vec<&Arc<SuperfileEntry>>, Vec<&Arc<SuperfileEntry>>) =
             superfiles.iter().partition(|entry| {
                 provider.entry_is_clean(entry) && has_required_stats(manifest, entry, &kinds)

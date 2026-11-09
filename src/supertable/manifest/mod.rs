@@ -975,6 +975,26 @@ impl ManifestSnapshot {
         }
     }
 
+    /// Every superfile of the table from memory, with no I/O: the flat view
+    /// when it is complete, otherwise the list's parts in order when every
+    /// one of them is already loaded. `None` while any part is unloaded.
+    pub(crate) fn resident_superfiles(&self) -> Option<Cow<'_, [Arc<SuperfileEntry>]>> {
+        if let Some(all) = self.complete_flat_superfiles() {
+            return Some(Cow::Borrowed(all));
+        }
+        let list = self.list.as_ref()?;
+        let mut all = Vec::new();
+        for entry in &list.parts {
+            all.extend(
+                self.get_cached_part_by_id(&entry.part_id)?
+                    .superfiles
+                    .iter()
+                    .cloned(),
+            );
+        }
+        Some(Cow::Owned(all))
+    }
+
     pub(crate) fn vector_index_storage_prefix(&self) -> Option<&str> {
         if let Some(list) = self.list.as_ref()
             && let Some(prefix) = list.vector_index_storage_prefix.as_deref()

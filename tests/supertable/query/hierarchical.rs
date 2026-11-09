@@ -33,7 +33,8 @@
 
 use std::sync::Arc;
 
-use arrow_array::{LargeStringArray, RecordBatch};
+use arrow::util::pretty::pretty_format_batches;
+use arrow_array::{Int64Array, LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use infino::{
     Bm25SearchOptions,
@@ -309,6 +310,47 @@ fn sql_loads_all_parts_returns_correct_count() {
         n_loaded, HIERARCHICAL_PART_COUNT,
         "SQL loads all parts (list-pushdown deferred); got {n_loaded}/5"
     );
+}
+
+/// An unfiltered `COUNT(*)` on a freshly opened lazy handle, with no part
+/// loaded yet, is answered from the manifest's statistics: the plan holds no
+/// table scan, and the count is exact.
+#[test]
+fn sql_unfiltered_count_on_a_lazy_handle_is_answered_from_stats() {
+    let dir = TempDir::new().expect("tempdir");
+    build_5_parts_with_distinct_terms(dir.path());
+    let cache_dir = TempDir::new().expect("cache");
+    let count = "SELECT COUNT(*) AS n FROM supertable";
+
+    let consumer = open_lazy_consumer(dir.path(), cache_dir.path());
+    assert_eq!(parts_loaded(&consumer), (0, HIERARCHICAL_PART_COUNT));
+    let explained = consumer
+        .reader()
+        .expect("reader")
+        .query_sql(&format!("EXPLAIN {count}"))
+        .expect("explain");
+    let plan = pretty_format_batches(&explained)
+        .expect("format plan")
+        .to_string();
+    assert!(
+        !plan.contains("TableScan"),
+        "answered from manifest stats, no scan:\n{plan}"
+    );
+
+    let consumer = open_lazy_consumer(dir.path(), cache_dir.path());
+    let batches = consumer
+        .reader()
+        .expect("reader")
+        .query_sql(count)
+        .expect("query");
+    let n = batches[0]
+        .column_by_name("n")
+        .expect("n column")
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("Int64")
+        .value(0);
+    assert_eq!(n, HIERARCHICAL_PART_COUNT as i64 * ROWS_PER_PART);
 }
 
 /// Build a manifest with `target_superfiles_per_part = 2`: each commit
