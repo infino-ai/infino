@@ -11256,7 +11256,7 @@ mod tests {
         let sources = rt
             .block_on(stream_sources(
                 &unlisted,
-                &[layer.clone()],
+                std::slice::from_ref(&layer),
                 None,
                 &tier_lens,
             ))
