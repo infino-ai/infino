@@ -36,7 +36,7 @@ use tracing::{Instrument, debug_span};
 
 use crate::{
     config::global as global_config,
-    memory::ColdReadPermit,
+    memory::{ColdReadPermit, ConnectionMemoryBudget},
     runtime_bridge::carry_span,
     runtime_metrics::io::scope_background,
     storage::{StorageError, StorageProvider},
@@ -62,10 +62,14 @@ use crate::{
     utils::trace::{OpOrigin, detached},
 };
 
-/// A background download starts a chunk only if, with the chunk, the connection uses at most this
-/// share of its memory limit. Half the share read-ahead gets: a download only saves a later read,
-/// so a running query's read-ahead, joins and sorts come first. A budget whose share is under one
-/// chunk (`cold_fetch_chunk_bytes`) downloads nothing, and its files keep being read in ranges.
+/// Share of the connection's memory limit that background downloads (all tables together) may
+/// hold. Half of read-ahead's share, since a download only speeds up a later read.
+///
+/// - Downloads count only their own bytes against it, so they keep going during a cold scan.
+/// - A download never takes the connection past the other 75%, so queries always keep this much
+///   room to grow.
+/// - If the share is smaller than one chunk (`cold_fetch_chunk_bytes`), nothing is downloaded and
+///   files are read in ranges.
 const FILL_BUDGET_SHARE_PERCENT: usize = READ_AHEAD_SHARE_PERCENT / 2;
 
 /// How long a background download waits before asking again for memory for its next chunk, when
@@ -704,10 +708,10 @@ impl DiskCacheStore {
                     // The download's own file is gone: its cache directory was removed (a
                     // dropped store's, say). Like a cancel, nothing to retry.
                     Err(DiskCacheError::Io(error)) if error.kind() == ErrorKind::NotFound => {}
-                    // Queries hold the memory: expected under load, so not a warning. A read
-                    // after `FAILED_FILL_RETRY_AFTER` tries again.
+                    // The budget is too small for any download. That is configuration, not a
+                    // fault, so no warning.
                     Err(DiskCacheError::FillOverMemoryBudget) => {
-                        tracing::debug!(target: "infino::cache", uri = %uri_owned.0, "fill: no memory budget for the next chunk");
+                        tracing::debug!(target: "infino::cache", uri = %uri_owned.0, "fill: memory budget share under one chunk");
                         exit.failed();
                     }
                     // The entry still serves reads. A read after `FAILED_FILL_RETRY_AFTER` tries
@@ -740,11 +744,12 @@ impl DiskCacheStore {
     /// discovers it through the first suffix-tail fetch.
     ///
     /// A Warm open (`allow_background_fill`) reserves the whole file for its
-    /// background download. When the budget cannot hold it, the open goes on
-    /// as a Stream open does: the entry stays lazy, charges only the blocks
-    /// it reads, and later reads of the file find it in the cache. Opening
-    /// the file again for each read would cost every read the footer and
-    /// column metadata over again, hundreds of small range reads a file.
+    /// background download. When the disk budget cannot hold it, or the memory
+    /// budget is too small for any download, the open goes on as a Stream open does: the
+    /// entry stays lazy, charges only the blocks it reads, and later reads of
+    /// the file find it in the cache. Opening the file again for each read
+    /// would cost every read the footer and column metadata over again,
+    /// hundreds of small range reads a file.
     pub(crate) async fn cold_fetch_lazy(
         self: &Arc<Self>,
         uri: &SuperfileUri,
@@ -754,6 +759,16 @@ impl DiskCacheStore {
         allow_background_fill: bool,
     ) -> Result<Arc<CachedEntry>, DiskCacheError> {
         let storage_uri = storage_key.to_owned();
+        // A Warm open reserves the whole file, which can evict other files. If the budget can
+        // never hold the download's first chunk, the download never runs, so open as Stream.
+        let chunk_bytes = self.config.cold_fetch_chunk_bytes.max(1);
+        let allow_background_fill = allow_background_fill
+            && fill_chunk_could_fit(
+                self,
+                offsets.map_or(chunk_bytes, |offsets| {
+                    first_fetch_bytes(offsets.total_size, chunk_bytes, offsets.vec)
+                }),
+            );
 
         // The whole file reserved for a background download, so the entry is charged its full
         // size up front; without it the block source charges what it fills. A guard, committed
@@ -1477,23 +1492,34 @@ fn reserve_fill_chunk(
         return Ok(None);
     };
     budget
-        .try_admit_within_share(saturating_usize(bytes), FILL_BUDGET_SHARE_PERCENT)
+        .try_admit_background(saturating_usize(bytes), FILL_BUDGET_SHARE_PERCENT)
         .map(Some)
         .ok_or(DiskCacheError::FillOverMemoryBudget)
 }
 
-/// Whether the store's fill budget has room for a download chunk of `bytes` as things stand, as
-/// [`reserve_fill_chunk`] would find it. Always, when the store has no budget or the download
-/// fetches nothing.
+/// Whether a download chunk of `bytes` has memory now, as [`reserve_fill_chunk`] would find it.
 fn fill_chunk_fits(store: &DiskCacheStore, bytes: u64) -> bool {
+    fill_budget_allows(store, bytes, ConnectionMemoryBudget::fits_background)
+}
+
+/// Whether a download chunk of `bytes` could ever get memory: false only when the budget is
+/// too small for any download.
+fn fill_chunk_could_fit(store: &DiskCacheStore, bytes: u64) -> bool {
+    fill_budget_allows(store, bytes, ConnectionMemoryBudget::share_holds)
+}
+
+/// Runs `check` on the store's fill budget. Always true with no budget or nothing to fetch.
+fn fill_budget_allows(
+    store: &DiskCacheStore,
+    bytes: u64,
+    check: impl FnOnce(&ConnectionMemoryBudget, usize, usize) -> bool,
+) -> bool {
     bytes == 0
         || store
             .config
             .fill_memory_budget
             .as_ref()
-            .is_none_or(|budget| {
-                budget.fits_share(saturating_usize(bytes), FILL_BUDGET_SHARE_PERCENT)
-            })
+            .is_none_or(|budget| check(budget, saturating_usize(bytes), FILL_BUDGET_SHARE_PERCENT))
 }
 
 /// `bytes` as a `usize`, capped at `usize::MAX` where it does not fit.
@@ -1566,7 +1592,7 @@ impl Drop for FillExit {
 
 /// The background download of a file (see [`BackgroundFill`]), step by step:
 /// 1. wait until no query holds the file, or `defer` runs out;
-/// 2. wait for a download slot;
+/// 2. wait for a download slot, then for memory for its first chunk;
 /// 3. reserve what the file's entry has not reserved already: the file minus its vector blob when
 ///    `skip_vec` leaves the blob in the block cache (see [`HoleFallbackSource`]);
 /// 4. download, pausing while a query reads the file inside `defer`;
@@ -1607,11 +1633,22 @@ async fn lazy_background_fill(
     if !store.fill_can_install(uri, fill) {
         return Ok(());
     }
-    // No memory for a first chunk: stop before reserving disk, which can evict other files for a
-    // download that would not start. Past this point the download waits for memory instead.
     let chunk_bytes = store.config.cold_fetch_chunk_bytes.max(1);
-    if !fill_chunk_fits(&store, first_fetch_bytes(size, chunk_bytes, skip_vec)) {
+    let first_chunk = first_fetch_bytes(size, chunk_bytes, skip_vec);
+    if !fill_chunk_could_fit(&store, first_chunk) {
         return Err(DiskCacheError::FillOverMemoryBudget);
+    }
+    // Wait for memory before reserving disk, since reserving disk can evict other files. Hold the
+    // store weakly while waiting, so dropping the table ends the download. Failing instead would
+    // leave the file to range reads until a later read restarts the download.
+    let mut store = store;
+    while !fill_chunk_fits(&store, first_chunk) {
+        drop(store);
+        sleep(FILL_MEMORY_RETRY_INTERVAL).await;
+        store = match weak_store.upgrade() {
+            Some(store) if store.fill_can_install(uri, fill) => store,
+            _ => return Ok(()),
+        };
     }
     // From here the idle cap keeps the file's entry, so the entry's Warm reservation covers the
     // download (see `reclaimable_lazy_entry`). With no entry, nobody has the file open: the
@@ -1665,10 +1702,9 @@ async fn lazy_background_fill(
             // first unwritten chunk. The store is dropped here, so it is not held while parked.
             BackgroundFillOutcome::Paused => {}
             BackgroundFillOutcome::Abandoned => return Ok(()),
-            // Wait without the store, so a dropped table's downloads end at the next attempt
-            // instead of keeping its cache alive until queries give memory back. Queries free
-            // memory as they finish, so the wait has no deadline: giving up would download the
-            // written chunks again.
+            // Wait without holding the store, so dropping the table ends the download. No
+            // deadline: queries give memory back when they finish, and giving up would throw
+            // away the chunks already written.
             BackgroundFillOutcome::ShortOfMemory => {
                 drop(store);
                 sleep(FILL_MEMORY_RETRY_INTERVAL).await;
@@ -1949,7 +1985,7 @@ mod tests {
     };
 
     use crate::{
-        memory::ConnectionMemoryBudget,
+        memory::{ConnectionMemoryBudget, Reservation},
         storage::{LocalFsStorageProvider, StorageProvider},
         superfile::{
             LazyByteSource,
@@ -2000,9 +2036,12 @@ mod tests {
     /// chunk but not two.
     const BUDGET_FOR_ONE_CHUNK: u64 = DOWNLOAD_CHUNK_BYTES * 6;
 
-    /// How long a memory-budget test waits for a download to land the chunk in flight and be
-    /// refused the next: a few of its retries.
-    const MEMORY_REFUSAL_SETTLE: Duration = FILL_MEMORY_RETRY_INTERVAL.saturating_mul(3);
+    /// Share of the limit a query holds in the memory-budget tests: everything downloads leave
+    /// to queries, so any download chunk has to wait.
+    const QUERY_SHARE_PERCENT: usize = 100 - FILL_BUDGET_SHARE_PERCENT;
+
+    /// Memory retries a waiting download makes before a test checks it is still waiting.
+    const MEMORY_RETRIES_WATCHED: u32 = 3;
 
     /// Bytes a fill test reserves, and the size of the file it pretends to fill.
     const RESERVED_BYTES: u64 = 4096;
@@ -2307,6 +2346,15 @@ mod tests {
         })
     }
 
+    /// A query's reservation of [`QUERY_SHARE_PERCENT`] of `budget`'s limit, so a download has no
+    /// memory for a chunk until it lets go.
+    fn query_holding_its_share(budget: &Arc<ConnectionMemoryBudget>) -> Reservation {
+        let limit = budget.limit().expect("bounded");
+        budget
+            .try_reserve(limit * QUERY_SHARE_PERCENT / 100)
+            .expect("the query fits")
+    }
+
     /// A download charges each chunk to the memory budget while it holds it, never more than its
     /// streams, and gives all of it back.
     #[tokio::test]
@@ -2396,9 +2444,7 @@ mod tests {
         let budget = ConnectionMemoryBudget::with_limit(BUDGET_FOR_ONE_CHUNK);
         let (dir, store, recording) = memory_budgeted_store(&budget);
         let (uri, size) = put_tiny_superfile(&recording).await;
-        let _query = budget
-            .try_reserve(DOWNLOAD_CHUNK_BYTES as usize)
-            .expect("the query fits");
+        let _query = query_holding_its_share(&budget);
         let from = recording.n_ranges();
 
         // A second handle, as a running download holds, so the store does not look dropped.
@@ -2450,6 +2496,64 @@ mod tests {
         assert_eq!(budget.used_bytes(), 0, "nothing stays charged");
     }
 
+    /// A query holds the memory a download needs to start. The file still opens Warm, the
+    /// download waits without reserving disk or fetching, and finishes once the query lets go.
+    #[tokio::test]
+    async fn a_download_waits_for_memory_to_start_and_then_finishes() {
+        let budget = ConnectionMemoryBudget::with_limit(BUDGET_FOR_ONE_CHUNK);
+        let (_dir, store, recording) = memory_budgeted_store(&budget);
+        let (uri, _) = put_tiny_superfile(&recording).await;
+        let query = query_holding_its_share(&budget);
+        let from = recording.n_ranges();
+
+        warm_open(&store, &uri).await;
+        let entry = store.cached.get(&uri).expect("the file is cached");
+        assert!(
+            matches!(entry.accounting, EntryAccounting::Eager),
+            "a busy budget still opens Warm: the download runs later"
+        );
+        drop(entry);
+        // It waits holding the store's only download slot.
+        timeout(READ_DEADLINE, async {
+            while store.prefetch_semaphore.available_permits() > 0 {
+                sleep(FILL_POLL_INTERVAL).await;
+            }
+        })
+        .await
+        .expect("the download takes its slot");
+        sleep(FILL_MEMORY_RETRY_INTERVAL * MEMORY_RETRIES_WATCHED).await;
+        let fill = fill_of(&store, &uri);
+        assert!(fill.failed_at_us.get().is_none(), "it waits, not fails");
+        assert_eq!(fill.reserved.load(Ordering::Acquire), 0, "no disk reserved");
+        assert_eq!(first_chunks_since(&recording, from), 0, "no download GET");
+
+        drop(query);
+        store
+            .wait_until_fills_settled(PROMOTE_TIMEOUT)
+            .await
+            .expect("the download finishes");
+        assert!(store.is_mmap_promoted(&uri), "the download lands");
+        assert_eq!(budget.used_bytes(), 0, "every chunk is given back");
+    }
+
+    /// A budget too small for any download opens Warm files as Stream: it charges only the blocks
+    /// it reads, instead of reserving the whole file (and evicting others) for a download that
+    /// never runs.
+    #[tokio::test]
+    async fn a_budget_too_small_for_downloads_opens_warm_files_as_stream() {
+        let budget = ConnectionMemoryBudget::with_limit(BUDGET_UNDER_ONE_CHUNK);
+        let (_dir, store, recording) = memory_budgeted_store(&budget);
+        let (uri, _) = put_tiny_superfile(&recording).await;
+
+        warm_open(&store, &uri).await;
+
+        let entry = store.cached.get(&uri).expect("the file is cached");
+        assert!(
+            matches!(entry.accounting, EntryAccounting::SourceOwned),
+            "opened as a Stream open, charging only its blocks"
+        );
+    }
+
     /// With room for one chunk, a download with more streams never holds two full chunks: it
     /// waits for its own chunks to give memory back, and finishes.
     #[tokio::test]
@@ -2494,26 +2598,25 @@ mod tests {
         drop(permit);
         until_a_read_is_paused(&recording).await;
 
-        // A query takes enough that the next chunk is over the downloads' share.
-        let query = budget
-            .try_reserve(DOWNLOAD_CHUNK_BYTES as usize)
-            .expect("the query fits");
+        // A query takes the memory the next chunk needs.
+        let query = query_holding_its_share(&budget);
         recording.resume();
-        sleep(MEMORY_REFUSAL_SETTLE).await;
-        assert!(
-            fill_of(&store, &uri).failed_at_us.get().is_none(),
-            "the download waits instead of failing"
-        );
-        assert!(!store.is_mmap_promoted(&uri), "the download is not done");
-        // The wait holds the store only weakly, so a dropped table's downloads end rather than
-        // keep its cache alive. Between waits a try holds it briefly, so poll.
-        timeout(MEMORY_REFUSAL_SETTLE, async {
+        // While waiting, the download drops its hold on the store. It takes it back briefly on
+        // each retry, so poll.
+        timeout(READ_DEADLINE, async {
             while Arc::strong_count(&store) > 1 {
                 sleep(FILL_POLL_INTERVAL).await;
             }
         })
         .await
-        .expect("the waiting download does not hold the store");
+        .expect("the download waits for memory without holding the store");
+        // Let it retry a few times while the query still holds the memory.
+        sleep(FILL_MEMORY_RETRY_INTERVAL * MEMORY_RETRIES_WATCHED).await;
+        assert!(
+            fill_of(&store, &uri).failed_at_us.get().is_none(),
+            "the download keeps waiting instead of failing"
+        );
+        assert!(!store.is_mmap_promoted(&uri), "the download is not done");
 
         drop(query);
         store
