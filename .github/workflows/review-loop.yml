@@ -164,7 +164,6 @@ jobs:
       RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=lld
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
       CARGO_PROFILE_TEST_DEBUG: line-tables-only
-      HAS_AUTOFIXER_APP: ${{ secrets.AUTOFIXER_APP_ID != '' }}
     steps:
       - name: Refuse a self-hosted runner
         if: runner.environment != 'github-hosted'
@@ -188,24 +187,6 @@ jobs:
           path: pr
           fetch-depth: 0
           persist-credentials: false
-
-      # The bots' installation tokens, minted before any of the PR's code runs, so the Apps' private
-      # keys never reach a step that runs it. A token lasts an hour and is revoked when the job ends.
-      - name: Token for the reviewer bot
-        id: reviewer-token
-        if: needs.request.outputs.mode != 'warm'
-        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
-        with:
-          app-id: ${{ secrets.REVIEWER_APP_ID }}
-          private-key: ${{ secrets.REVIEWER_APP_PRIVATE_KEY }}
-
-      - name: Token for the autofixer bot
-        id: autofixer-token
-        if: needs.request.outputs.mode != 'warm' && env.HAS_AUTOFIXER_APP == 'true'
-        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
-        with:
-          app-id: ${{ secrets.AUTOFIXER_APP_ID }}
-          private-key: ${{ secrets.AUTOFIXER_APP_PRIVATE_KEY }}
 
       # The team's rules as the base branch has them. The PR's own copies are part of the change under
       # review; the agents never take instructions from them.
@@ -327,10 +308,12 @@ jobs:
           AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
           # The runner is a throwaway machine; Codex's own sandbox needs kernel features it may lack.
           REVIEWLOOP_CODEX_NO_SANDBOX: "1"
-          REVIEWER_APP_TOKEN: ${{ steps.reviewer-token.outputs.token }}
-          REVIEWER_APP_SLUG: ${{ steps.reviewer-token.outputs.app-slug }}
-          AUTOFIXER_APP_TOKEN: ${{ steps.autofixer-token.outputs.token }}
-          AUTOFIXER_APP_SLUG: ${{ steps.autofixer-token.outputs.app-slug }}
+          # The loop mints the bot's installation token itself, and again before it expires: a token
+          # lasts an hour, and a run with a long final check outlasts it. The fixer's commits and
+          # comments go through the same App. The maintainer who comments `/autofix` has read the
+          # diff, so the PR's code running beside the key is code they chose to trust.
+          REVIEWER_APP_ID: ${{ secrets.REVIEWER_APP_ID }}
+          REVIEWER_APP_PRIVATE_KEY: ${{ secrets.REVIEWER_APP_PRIVATE_KEY }}
           PR: ${{ needs.request.outputs.pr }}
           MODE: ${{ needs.request.outputs.mode }}
           REVIEWER: ${{ needs.request.outputs.reviewer }}
