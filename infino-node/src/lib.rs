@@ -307,6 +307,18 @@ const IPC_CONTINUATION: u32 = 0xFFFF_FFFF;
 /// Byte width of one flatbuffer `Buffer` entry (i64 offset + i64 length).
 const IPC_BUFFER_ENTRY_BYTES: usize = 16;
 
+/// Native memory each live [`Connection`] reports to V8. An open handle owns
+/// engine memory the JS heap does not see — a bare connection measured about
+/// 24 KiB; this rounds it up.
+const CONNECTION_EXTERNAL_BYTES: i64 = 32 * 1024;
+/// Native memory each live [`Table`] reports to V8. An open table holds its
+/// manifest, schema and index metadata: small hybrid tables measured about
+/// 0.3 MiB (500 rows) to 0.7 MiB (2 000 rows, optimized), and it grows with
+/// the table. V8 collects once reported external memory has grown by a fixed
+/// amount since its last collection, so this sets how many dropped handles
+/// can wait for a collection, not a limit on what a table may hold.
+const TABLE_EXTERNAL_BYTES: i64 = 512 * 1024;
+
 /// Repair an IPC stream whose all-null Boolean columns arrived with a
 /// zero-length values buffer, returning the patched bytes.
 ///
@@ -902,7 +914,7 @@ impl IndexSpec {
 /// to probe object stores at connect (off by default) so bad credentials fail
 /// there rather than on the first table operation.
 #[napi]
-pub fn connect(uri: String, options: Option<ConnectOptions>) -> Result<Connection> {
+pub fn connect(env: Env, uri: String, options: Option<ConnectOptions>) -> Result<Connection> {
     let inner = match options {
         None => infino::connect(&uri),
         Some(o) => {
@@ -934,7 +946,7 @@ pub fn connect(uri: String, options: Option<ConnectOptions>) -> Result<Connectio
         }
     }
     .map_err(map_err)?;
-    Ok(Connection { inner })
+    Connection::new(env, inner)
 }
 
 /// Infino's build identifier (version + build hash) from the core crate.
@@ -945,9 +957,30 @@ pub fn builder_id() -> String {
 }
 
 /// A catalog connection. `const db = connect(uri)`.
-#[napi]
+///
+/// The engine connection is freed when V8 collects this object, and V8
+/// schedules collections by the memory it can see: the native size is
+/// reported to it on creation and released on finalize, so dropped handles
+/// are collected as their native memory grows, not only when the JS heap
+/// does. Node runs the finalizer from the event loop, so a loop that never
+/// yields holds every handle it dropped until it does.
+#[napi(custom_finalize)]
 pub struct Connection {
     inner: infino::Connection,
+}
+
+impl Connection {
+    fn new(mut env: Env, inner: infino::Connection) -> Result<Self> {
+        env.adjust_external_memory(CONNECTION_EXTERNAL_BYTES)?;
+        Ok(Connection { inner })
+    }
+}
+
+impl ObjectFinalize for Connection {
+    fn finalize(self, mut env: Env) -> Result<()> {
+        env.adjust_external_memory(-CONNECTION_EXTERNAL_BYTES)?;
+        Ok(())
+    }
 }
 
 #[napi]
@@ -965,21 +998,27 @@ impl Connection {
     /// an empty `apache-arrow` table built with the schema) and an
     /// `IndexSpec`.
     #[napi]
-    pub fn create_table(&self, name: String, schema: Buffer, indexes: &IndexSpec) -> Result<Table> {
+    pub fn create_table(
+        &self,
+        env: Env,
+        name: String,
+        schema: Buffer,
+        indexes: &IndexSpec,
+    ) -> Result<Table> {
         let schema = read_schema_ipc(&schema)?;
         let spec = indexes.to_rust()?;
         let inner = self
             .inner
             .create_table(&name, Arc::new(schema), spec)
             .map_err(map_err)?;
-        Ok(Table { inner })
+        Table::new(env, inner)
     }
 
     /// Open an existing table by name.
     #[napi]
-    pub fn open_table(&self, name: String) -> Result<Table> {
+    pub fn open_table(&self, env: Env, name: String) -> Result<Table> {
         let inner = self.inner.open_table(&name).map_err(map_err)?;
-        Ok(Table { inner })
+        Table::new(env, inner)
     }
 
     /// The table's schema document as JSON text, or — with `patch_json`, a
@@ -1038,10 +1077,24 @@ impl Connection {
     }
 }
 
-/// A single-table handle.
-#[napi]
+/// A single-table handle. Reports its native size to V8 like [`Connection`].
+#[napi(custom_finalize)]
 pub struct Table {
     inner: infino::Supertable,
+}
+
+impl Table {
+    fn new(mut env: Env, inner: infino::Supertable) -> Result<Self> {
+        env.adjust_external_memory(TABLE_EXTERNAL_BYTES)?;
+        Ok(Table { inner })
+    }
+}
+
+impl ObjectFinalize for Table {
+    fn finalize(self, mut env: Env) -> Result<()> {
+        env.adjust_external_memory(-TABLE_EXTERNAL_BYTES)?;
+        Ok(())
+    }
 }
 
 #[napi]
