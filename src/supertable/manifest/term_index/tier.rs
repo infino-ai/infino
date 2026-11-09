@@ -509,7 +509,6 @@ impl TierDirectory {
 
 impl<'a> TierChunk<'a> {
     /// Check a whole chunk: its directory's CRC and every block's.
-    #[cfg(test)]
     pub(crate) fn verify(bytes: &'a [u8], n_blocks: u32) -> Result<(), TermIndexError> {
         let chunk = Self::open(bytes, n_blocks)?;
         for i in 0..chunk.n_blocks() {

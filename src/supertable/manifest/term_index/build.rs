@@ -501,16 +501,8 @@ fn splice_term(
     for source in &term.sources {
         let mut chunks = Vec::with_capacity(source.chunks.len());
         for chunk in &source.chunks {
-            let start = chunk
-                .offset
-                .checked_sub(source.base)
-                .ok_or_else(|| TermIndexError::Malformed("tier chunk before its span".into()))?;
-            let end = start
-                .checked_add(chunk.len)
-                .filter(|end| *end <= source.bytes.len() as u64)
-                .ok_or_else(|| TermIndexError::Malformed("tier chunk past its object".into()))?;
             chunks.push(TierChunk::open(
-                &source.bytes[start as usize..end as usize],
+                chunk_bytes(&source.bytes, source.base, chunk)?,
                 chunk.n_blocks,
             )?);
         }
@@ -2168,7 +2160,22 @@ impl LayerCursor {
     /// them, else from a fresh window of at least `window_bytes` starting
     /// at them. A run with a tier always comes from a slice that has one,
     /// so a missing file is an error, not an empty tier.
+    ///
+    /// A streamed window is not checked against the object's hash, which
+    /// covers only the whole object, so every block of `chunks` is checked
+    /// against its CRC before the merge decodes or carries it.
     fn tier_span(&mut self, chunks: &[TierChunkRef]) -> Result<(Bytes, u64), TermIndexError> {
+        let (bytes, base) = self.read_tier_span(chunks)?;
+        if self.remote.is_some() {
+            for chunk in chunks {
+                TierChunk::verify(chunk_bytes(&bytes, base, chunk)?, chunk.n_blocks)?;
+            }
+        }
+        Ok((bytes, base))
+    }
+
+    /// [`LayerCursor::tier_span`] before the streamed chunks are checked.
+    fn read_tier_span(&mut self, chunks: &[TierChunkRef]) -> Result<(Bytes, u64), TermIndexError> {
         let base = chunks.iter().map(|c| c.offset).min().unwrap_or(0);
         let end = chunks
             .iter()
@@ -2306,6 +2313,24 @@ fn scoring_lookup(table: Arc<Vec<BTreeMap<FieldId, ColumnScoring>>>, base: u32) 
     })
 }
 
+/// The bytes of `chunk` in `object`, a span of its tier object starting
+/// at offset `base`.
+fn chunk_bytes<'a>(
+    object: &'a [u8],
+    base: u64,
+    chunk: &TierChunkRef,
+) -> Result<&'a [u8], TermIndexError> {
+    let start = chunk
+        .offset
+        .checked_sub(base)
+        .ok_or_else(|| TermIndexError::Malformed("tier chunk before its span".into()))?;
+    let end = start
+        .checked_add(chunk.len)
+        .filter(|end| *end <= object.len() as u64)
+        .ok_or_else(|| TermIndexError::Malformed("tier chunk past its object".into()))?;
+    Ok(&object[start as usize..end as usize])
+}
+
 /// Every entry of `chunks` in `object`, renumbered through `ordinals`;
 /// entries of superfiles that are gone are dropped.
 fn tier_entries(
@@ -2318,15 +2343,7 @@ fn tier_entries(
 ) -> Result<(), TermIndexError> {
     let mut block = Vec::new();
     for chunk in chunks {
-        let start = chunk
-            .offset
-            .checked_sub(base)
-            .ok_or_else(|| TermIndexError::Malformed("tier chunk before its span".into()))?;
-        let end = start
-            .checked_add(chunk.len)
-            .filter(|end| *end <= object.len() as u64)
-            .ok_or_else(|| TermIndexError::Malformed("tier chunk past its object".into()))?;
-        let bytes = &object[start as usize..end as usize];
+        let bytes = chunk_bytes(object, base, chunk)?;
         block.clear();
         TierChunk::open(bytes, chunk.n_blocks)?.entries(&mut block)?;
         out.extend(block.iter().filter_map(|e| {
