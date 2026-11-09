@@ -17,13 +17,16 @@ use tokio::sync::OwnedSemaphorePermit;
 #[cfg(test)]
 use tokio::time::timeout;
 
-#[cfg(test)]
-use crate::supertable::reader_cache::{
-    block_source::BlockCachedSource, disk::test_support::tiny_superfile_bytes,
-};
 use crate::supertable::{
     manifest::SuperfileUri,
     reader_cache::{config::EvictionCandidate, disk::*},
+};
+#[cfg(test)]
+use crate::{
+    memory::ConnectionMemoryBudget,
+    supertable::reader_cache::{
+        block_source::BlockCachedSource, disk::test_support::tiny_superfile_bytes,
+    },
 };
 
 /// How long a test waits for queued block writes to finish, before failing instead of hanging.
@@ -669,6 +672,12 @@ impl DiskCacheStore {
     }
 
     // Test helpers. Compiled only for tests, never into the shipped library.
+
+    /// The memory budget background downloads charge, if any.
+    #[cfg(test)]
+    pub(crate) fn fill_memory_budget(&self) -> Option<&Arc<ConnectionMemoryBudget>> {
+        self.config.fill_memory_budget.as_ref()
+    }
 
     /// Counts a queued block-file write until the returned ticket drops; see
     /// [`Self::block_writes_settled`].

@@ -824,6 +824,7 @@ fn fresh_disk_cache_with_mode(
         promotion_defer_timeout: BENCH_PROMOTION_DEFER_TIMEOUT,
         eviction: Box::new(LruPolicy::new()),
         crc_verification: CrcVerification::Never,
+        fill_memory_budget: None,
     };
     let cache = DiskCacheStore::new_unpinned(storage, cfg).expect("DiskCacheStore");
     (dir, cache)
