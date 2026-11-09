@@ -215,7 +215,8 @@ columns it asks about, reading the type group a column sits in back
 from the cache file on first use, every same-typed column's rows with
 it, once per handle for as long as the part is cached. The pruner and
 the scan read and decode the groups of the columns they test or project
-as blocking tasks before they read them, so a query's runtime threads do
+as blocking tasks before they read them, and so do the plan rewrites
+that answer from value and null counts, so a query's runtime threads do
 not wait on the file. The cache file is verified against the section's
 hash when a handle opens it (a file a crash left torn is fetched from
 storage again), each group is checked against the hash it had then when

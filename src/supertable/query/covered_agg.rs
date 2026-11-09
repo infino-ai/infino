@@ -79,7 +79,10 @@ use uuid::Uuid;
 
 use crate::supertable::{
     error::QueryError,
-    manifest::{ManifestSnapshot, SuperfileEntry, add_sum_arrays, list::ScalarValueCounts},
+    manifest::{
+        ManifestSnapshot, SuperfileEntry, add_sum_arrays, list::ScalarValueCounts,
+        load_section_groups_blocking,
+    },
     query::{
         provider::{CountedRange, SupertableProvider},
         range_counts::RangeBucket,
@@ -546,6 +549,9 @@ pub(crate) fn value_counts_nulls(
         return None;
     }
     let id = manifest.field_id(column)?;
+    // The null counts are read in place below; their groups are read and
+    // decoded off the runtime's queue first, as a scan's are.
+    load_section_groups_blocking(superfiles, &[id]);
     let mut nulls = Some(0u64);
     for entry in superfiles {
         if !provider.entry_is_clean(entry) {

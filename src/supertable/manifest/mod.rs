@@ -84,8 +84,9 @@ use rustc_hash::FxHashSet;
 pub use summaries::ColumnStats;
 use tokio::{
     join,
+    runtime::{Handle, RuntimeFlavor},
     sync::OnceCell,
-    task::{JoinError, spawn, spawn_blocking},
+    task::{JoinError, block_in_place, spawn, spawn_blocking},
 };
 use tracing::{Instrument, warn};
 use uuid::Uuid;
@@ -4388,6 +4389,38 @@ pub(crate) async fn load_section_groups(entries: &[Arc<SuperfileEntry>], columns
     // A task that does not finish leaves its groups to be read on first
     // use, which reads them as before; nothing is lost.
     join_all(loads).await;
+}
+
+/// [`load_section_groups`] for a synchronous caller that may stand on a
+/// runtime worker, such as a plan rewrite that answers from statistics.
+///
+/// On a multi-thread runtime it tells the runtime the worker blocks
+/// (`block_in_place`) and drives the load there, so the reads and decodes
+/// still run as blocking tasks and the worker's other tasks move to its
+/// siblings. Anywhere else (no runtime, or a current-thread one, which
+/// cannot hand its tasks off) it decodes on the calling thread, as a
+/// reader that was not preceded by a load would. A warm handle returns
+/// before either, reading nothing.
+pub(crate) fn load_section_groups_blocking(entries: &[Arc<SuperfileEntry>], columns: &[FieldId]) {
+    let unread = entries.iter().any(|entry| match &entry.scalar_stats {
+        ScalarStats::Section { section, .. } => !section.groups_of_read(columns),
+        ScalarStats::Inline(_) | ScalarStats::Unavailable => false,
+    });
+    if columns.is_empty() || !unread {
+        return;
+    }
+    match Handle::try_current() {
+        Ok(handle) if matches!(handle.runtime_flavor(), RuntimeFlavor::MultiThread) => {
+            block_in_place(|| handle.block_on(load_section_groups(entries, columns)));
+        }
+        _ => {
+            for entry in entries {
+                if let ScalarStats::Section { section, .. } = &entry.scalar_stats {
+                    section.decode_groups_of(columns);
+                }
+            }
+        }
+    }
 }
 
 /// The map's own shape for tests that build and inspect decoded entries.
@@ -9769,6 +9802,43 @@ mod tests {
             loaded_bytes,
             "the read found the group decoded"
         );
+    }
+
+    /// A synchronous reader on a multi-thread runtime's worker loads the
+    /// groups of its columns as the async load does; one on a
+    /// current-thread runtime, which cannot hand its worker's tasks off,
+    /// decodes them where it stands. Either way the groups are read after.
+    #[test]
+    fn a_synchronous_reader_loads_its_groups_before_it_reads_them() {
+        for multi_thread in [true, false] {
+            let runtime = match multi_thread {
+                true => tokio::runtime::Builder::new_multi_thread(),
+                false => tokio::runtime::Builder::new_current_thread(),
+            }
+            .enable_all()
+            .build()
+            .expect("runtime");
+            runtime.block_on(async {
+                let (dir, storage, _, _) = published_sectioned_table().await;
+                let amount = fid("amount");
+                let (cached_opts, _cache) = opts_with_cache(&dir);
+                let loaded = ManifestSnapshot::load(None, Arc::clone(&storage), Some(cached_opts))
+                    .await
+                    .expect("load");
+                let entries = loaded.get_all_superfiles();
+                let section = Arc::clone(entries[0].scalar_stats.section().expect("a section"));
+                assert!(!section.groups_of_read(&[amount]));
+                load_section_groups_blocking(entries, &[amount]);
+                assert!(
+                    section.groups_of_read(&[amount]),
+                    "multi_thread: {multi_thread}"
+                );
+                assert_eq!(
+                    entries[0].scalar_stats.get(amount).as_ref(),
+                    Some(&sectioned_stats(vec![3, 9, 4]))
+                );
+            });
+        }
     }
 
     /// A section whose cache file is gone when its groups are first read

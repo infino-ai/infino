@@ -122,7 +122,7 @@ use crate::{
         error::QueryError,
         manifest::{
             ColumnStats, ManifestSnapshot, add_sum_arrays, hll::HllSketch, list::ScalarValueCounts,
-            load_section_groups,
+            load_section_groups, load_section_groups_blocking,
         },
         query::{
             candidate::{
@@ -698,6 +698,10 @@ impl SupertableProvider {
                 let id = self.manifest.field_id(column)?;
                 let stored = self.manifest.stored_schema();
                 let data_type = stored.field_with_name(column).ok()?.data_type();
+                // The counts are the heaviest statistics a section holds;
+                // the sum reads them in place, so they are read and decoded
+                // off the runtime's queue first, as a scan's are.
+                load_section_groups_blocking(entries, &[id]);
                 self.value_count_carry
                     .sum(id, data_type, entries)
                     .map(Arc::new)
