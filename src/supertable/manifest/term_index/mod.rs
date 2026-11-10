@@ -1175,7 +1175,7 @@ impl FoldBudget {
             .saturating_add(FOLD_FIXED_BYTES)
     }
 
-    /// The most layers one fold reads, and its merge threads: every core,
+    /// The most layers one fold reads, and its merge threads: every thread,
     /// narrowed until [`FOLD_LAYERS_TARGET`] layers fit in memory and
     /// cursors, or failing that [`FOLD_FAN_OUT`]. A fold of the fan-out in
     /// one range runs whatever the budget, as small as a commit's fold.
@@ -1625,6 +1625,9 @@ pub(crate) async fn fold_at_optimize(
     // than threads so one slow range does not leave the others idle.
     let input_bytes: u64 = run.iter().map(layer_bytes).sum();
     let ranges = fold.ranges * FOLD_RANGES_PER_THREAD;
+    // A pool of the fold's own, as wide as the writer pool it was sized by:
+    // a streamed fold's merge threads block on fetches, which would stall
+    // the writer pool's other work.
     let merge_pool = ThreadPoolBuilder::new()
         .num_threads(fold.ranges)
         .thread_name(|i| format!("term-index-fold-{i}"))
@@ -9539,7 +9542,7 @@ mod tests {
     }
 
     /// A tight budget narrows the key ranges before it folds fewer than
-    /// the target's layers; a wide one takes every core it is given; few
+    /// the target's layers; a wide one takes every thread it is given; few
     /// open files bound the layers as memory does; the fan-out always folds.
     #[test]
     fn fold_budget_narrows_ranges_before_layers() {

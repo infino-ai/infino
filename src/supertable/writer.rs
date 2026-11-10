@@ -12593,9 +12593,8 @@ pub(in crate::supertable) async fn stamp_term_index(
     loop {
         // Memory is measured again each pass, as free disk is: a long call
         // sees other work start and stop beside it.
-        let fold_budget = term_index::FoldBudget::for_host(
-            std::thread::available_parallelism().map_or(1, usize::from),
-        );
+        let fold_budget =
+            term_index::FoldBudget::for_host(inner.options.writer_pool.current_num_threads());
         let published = AtomicBool::new(false);
         let kept_batch: Mutex<Option<KeptBatch>> = Mutex::new(None);
         let kept_fold: Mutex<Option<KeptFold>> = Mutex::new(None);
