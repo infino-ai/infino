@@ -1954,6 +1954,19 @@ pub(crate) struct SliceFile {
     pub(crate) base: u32,
 }
 
+impl SliceFile {
+    /// The slice's bytes and its tier object's, zero for a slice without one.
+    fn lens(&self) -> io::Result<(u64, u64)> {
+        match &self.source {
+            SliceSource::Remote(remote) => Ok((remote.len, remote.tier_len)),
+            SliceSource::Local(path) => Ok((
+                fs::metadata(path)?.len(),
+                fs::metadata(path.with_extension(TIER_FILE_EXTENSION)).map_or(0, |m| m.len()),
+            )),
+        }
+    }
+}
+
 /// `path`'s bytes, mapped read-only; empty for an empty file, which cannot
 /// be mapped.
 fn map_file(path: &Path) -> io::Result<Bytes> {
@@ -2137,13 +2150,10 @@ impl LayerCursor {
                         None => remote.spawn_fetch(),
                     };
                     self.bytes = remote.wait(fetch)?;
-                    self.next_fetch = self
-                        .files
-                        .front()
-                        .and_then(|next| match &next.source {
-                            SliceSource::Remote(remote) => Some(remote.spawn_fetch()),
-                            SliceSource::Local(_) => None,
-                        });
+                    self.next_fetch = self.files.front().and_then(|next| match &next.source {
+                        SliceSource::Remote(remote) => Some(remote.spawn_fetch()),
+                        SliceSource::Local(_) => None,
+                    });
                     self.read_secs += started.elapsed().as_secs_f64();
                     self.tier_file = None;
                     self.remote = Some(remote);
@@ -2659,12 +2669,7 @@ pub(crate) fn key_ranges(
     policy: &BuildPolicy,
 ) -> Result<Vec<KeyRange>, TermIndexError> {
     let files: Vec<&SliceFile> = sources.iter().flatten().collect();
-    let slice_len = |file: &SliceFile| -> io::Result<u64> {
-        match &file.source {
-            SliceSource::Remote(remote) => Ok(remote.len),
-            SliceSource::Local(path) => Ok(fs::metadata(path)?.len()),
-        }
-    };
+    let slice_len = |file: &SliceFile| file.lens().map(|(slice, _)| slice);
     let want = range_count(policy, MERGE_RANGE_MIN_BYTES, MERGE_RANGES_MAX, || {
         let mut bytes = 0u64;
         for file in &files {
@@ -2701,16 +2706,8 @@ pub(crate) fn key_ranges(
     if one_mark_per_slice(&layers, want, policy.one_mark_slices_per_range) {
         let mut marks = Vec::with_capacity(files.len());
         for file in &files {
-            let weight = match &file.source {
-                SliceSource::Remote(remote) => remote.len + remote.tier_len,
-                SliceSource::Local(path) => {
-                    fs::metadata(path)?.len()
-                        + fs::metadata(path.with_extension(TIER_FILE_EXTENSION))
-                            .map(|m| m.len())
-                            .unwrap_or(0)
-                }
-            };
-            marks.push((file.first_key.clone(), weight));
+            let (slice, tier) = file.lens()?;
+            marks.push((file.first_key.clone(), slice + tier));
         }
         marks.sort_by(|a, b| a.0.cmp(&b.0));
         return Ok(cut_ranges(&marks, want));
@@ -2734,9 +2731,7 @@ pub(crate) fn key_ranges(
         let bytes = read_at(0, SLICE_HEADER_LEN + dict_len as usize)?;
         let dictionary = SliceDictionary::open(&bytes)?;
         let starts = dictionary.block_starts()?;
-        let tier_len = fs::metadata(path.with_extension(TIER_FILE_EXTENSION))
-            .map(|m| m.len())
-            .unwrap_or(0);
+        let (_, tier_len) = file.lens()?;
         let group = starts.len().div_ceil(per_slice).max(1);
         // The tier offset where the group starting at block `from` begins.
         let tier_at = |from: usize| -> Result<Option<u64>, TermIndexError> {
