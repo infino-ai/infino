@@ -792,6 +792,12 @@ impl SupertableProvider {
         }
     }
 
+    /// A clone sharing this provider's snapshot, caches and reads of deleted
+    /// rows: one to read through later, as this provider would.
+    pub(crate) fn share(&self) -> Self {
+        self.sibling()
+    }
+
     /// `true` when this provider is a covered/residual residual scan —
     /// the rewrite's idempotency guard.
     pub(crate) fn is_segment_restricted(&self) -> bool {

@@ -323,7 +323,6 @@ impl SupertableReader {
         // snapshot — the pushdown-aware SupertableProvider plus the
         // search TVFs. See [`SupertableReader::sql_session_context`].
         let ctx = self.sql_session_context()?;
-        let tombstone_prefetch = self.tombstone_prefetch();
         let cached_plan = self.cached_sql_logical_plan(sql);
         let cache_reader = self.clone();
         // Picked up on the caller's thread, like reader mint: the drive
@@ -338,14 +337,6 @@ impl SupertableReader {
             // The scan runs strings as `Utf8View`; `expand_views_at_output`
             // (set in `budgeted_session_context`) coerces them back to
             // `LargeUtf8` at the plan output, so the result carries no view.
-            // Exact manifest statistics can eliminate an unfiltered aggregate
-            // before `TableProvider::scan` runs, but only after every
-            // superfile's delete view is known. The ordinary scan performs the
-            // same prefetch; doing it before planning lets repeated aggregate
-            // queries avoid constructing a Parquet plan altogether.
-            if let Some((cache, ids)) = tombstone_prefetch {
-                cache.prefetch(&ids, Instant::now()).await;
-            }
             let df = match cached_plan {
                 Some(plan) => ctx
                     .execute_logical_plan(plan)

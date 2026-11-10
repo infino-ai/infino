@@ -202,7 +202,7 @@ fn aligned_range_aggregates_use_covered_residual_and_stay_exact() {
 
     // Range covering commits 1..=2 entirely, with slack inside the
     // empty thousand-block gaps — commits 1 and 2 are fully covered,
-    // commits 0 and 3 disjoint, so the residual is EMPTY.
+    // commits 0 and 3 disjoint, so nothing is left to scan.
     let where_range = "rating BETWEEN 1000 AND 2999";
 
     let count_sql = format!("SELECT COUNT(*) FROM supertable WHERE {where_range}");
@@ -222,18 +222,13 @@ fn aligned_range_aggregates_use_covered_residual_and_stay_exact() {
         "avg {got_avg} vs {expected_avg}"
     );
 
-    // Exact low-cardinality counts fold all the way to a literal. The other
-    // aggregate kinds use the covered/residual plan.
-    let count_plan = explain(&st, &count_sql);
-    assert!(
-        !count_plan.contains("DataSourceExec") && !count_plan.contains("Parquet"),
-        "count should fold without a scan; plan was:\n{count_plan}"
-    );
-    for sql in [&sum_sql, &min_sql, &max_sql, &avg_sql] {
+    // Every segment the range keeps is covered, so every aggregate folds
+    // all the way to a literal, with no residual scan.
+    for sql in [&count_sql, &sum_sql, &min_sql, &max_sql, &avg_sql] {
         let plan = explain(&st, sql);
         assert!(
-            plan.contains("__resid_0"),
-            "{sql}: expected the covered/residual rewrite; plan was:\n{plan}"
+            !plan.contains("DataSourceExec") && !plan.contains("TableScan"),
+            "{sql}: should fold without a scan; plan was:\n{plan}"
         );
     }
 }

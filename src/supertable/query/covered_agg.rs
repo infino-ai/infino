@@ -65,21 +65,24 @@
 //! why an aggregate is left to the scan entirely.
 
 use std::{
+    cell::RefCell,
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet, HashMap},
+    ptr,
     sync::Arc,
 };
 
 use arrow_array::ArrayRef;
 use arrow_schema::DataType;
 use datafusion::{
-    catalog::{Session, TableProvider},
+    catalog::TableProvider,
     common::{
         DFSchema, ScalarValue,
         tree_node::{Transformed, TreeNodeRecursion},
     },
     datasource::{DefaultTableSource, provider_as_source},
     error::{DataFusionError, Result as DfResult},
+    execution::SessionState,
     functions::core::expr_fn::{coalesce, greatest, least},
     functions_aggregate::expr_fn::{count, max, min, sum},
     logical_expr::{
@@ -89,7 +92,7 @@ use datafusion::{
     optimizer::{OptimizerConfig, OptimizerRule, optimizer::ApplyOrder},
     prelude::{cast, col, ident},
 };
-use futures::future::try_join_all;
+use futures::future::{join_all, try_join_all};
 use roaring::RoaringBitmap;
 use tracing::debug;
 
@@ -197,22 +200,24 @@ enum Class {
 ///   * load every manifest part of each table an unfiltered, ungrouped
 ///     aggregate reads, subqueries included, so the rewrite finds the whole
 ///     table in memory (that aggregate's scan would load every part anyway);
-///   * read the deleted rows of each aggregated table's superfiles, so the
-///     rewrite's lookups of them are cache reads;
-///   * read the statistics of the deleted rows that let the rewrite answer
-///     superfiles with deletes from their statistics, where reading those
-///     rows costs fewer pages than scanning the live ones would (see
-///     [`read_wanted`]). They are kept for the table, so a later statement
-///     reads only rows deleted since.
+///   * for a table with deletes under an aggregate of a shape the rewrite
+///     answers, read its superfiles' deleted rows, so the rewrite's lookups
+///     of them are cache reads;
+///   * optimize the statement as it will be planned, and read the statistics
+///     of the deleted rows the rewrite would use to answer superfiles with
+///     deletes from their statistics, where reading those rows costs fewer
+///     pages than scanning the live ones would (see [`read_wanted`]). They
+///     are kept for the table, so a later statement reads only rows deleted
+///     since.
 ///
 /// The rewrite stays exact without any of this: what is not read here, it
 /// scans. `EXPLAIN` runs this too, as it plans the statement.
 pub(crate) async fn prepare_aggregate_inputs(
     plan: &LogicalPlan,
-    state: &dyn Session,
+    state: &SessionState,
 ) -> Result<(), QueryError> {
     let mut sources: Vec<Arc<dyn TableSource>> = Vec::new();
-    let mut aggregates: Vec<LogicalPlan> = Vec::new();
+    let mut aggregated: Vec<Arc<dyn TableSource>> = Vec::new();
     plan.apply_with_subqueries(|node| {
         if let LogicalPlan::Aggregate(agg) = node
             && let Some(scan) = aggregated_scan(agg)
@@ -220,37 +225,51 @@ pub(crate) async fn prepare_aggregate_inputs(
             if agg.group_expr.is_empty() && peel_unfiltered_scan(agg.input.as_ref()).is_some() {
                 sources.push(Arc::clone(&scan.source));
             }
-            aggregates.push(node.clone());
+            if answerable_shape(agg) {
+                aggregated.push(Arc::clone(&scan.source));
+            }
         }
         Ok(TreeNodeRecursion::Continue)
     })
     .map_err(QueryError::DataFusion)?;
-    try_join_all(sources.iter().filter_map(|source| {
-        let source = source.downcast_ref::<DefaultTableSource>()?;
-        let provider = source.table_provider.downcast_ref::<SupertableProvider>()?;
-        Some(provider.load_every_part())
-    }))
+    try_join_all(
+        sources
+            .iter()
+            .filter_map(|source| Some(supertable_provider(source)?.load_every_part())),
+    )
     .await?;
-    for node in &aggregates {
-        let LogicalPlan::Aggregate(agg) = node else {
-            continue;
-        };
-        let Some(provider) = aggregated_scan(agg).and_then(provider_of) else {
-            continue;
-        };
-        // A table without deletes has nothing to read: its statistics
-        // answer as they are.
-        if !provider.may_have_deletes() {
-            continue;
+
+    // A table without deletes has nothing to read: its statistics answer as
+    // they are. Each table's deleted rows are read once, before the rewrite
+    // looks them up.
+    let mut with_deletes: Vec<&SupertableProvider> = Vec::new();
+    for source in &aggregated {
+        if let Some(provider) = supertable_provider(source)
+            && provider.may_have_deletes()
+            && !with_deletes
+                .iter()
+                .any(|seen| ptr::eq(seen.deleted_stats(), provider.deleted_stats()))
+        {
+            with_deletes.push(provider);
         }
-        provider.prefetch_listed_tombstones().await;
-        let mut wanted = Wants::quiet();
-        // Only the deleted rows the rewrite would read matter here; a plan
-        // it fails to build is its own to report when it runs.
-        let _ = try_rewrite_wanting(node, &mut wanted);
-        if wanted.list.is_empty() {
-            continue;
-        }
+    }
+    if with_deletes.is_empty() {
+        return Ok(());
+    }
+    join_all(
+        with_deletes
+            .iter()
+            .map(|provider| provider.prefetch_listed_tombstones()),
+    )
+    .await;
+
+    // The rewrite runs on the plan the optimizer's other rules leave it:
+    // literals coerced, ranges simplified, aliases flattened. Optimizing the
+    // statement here, as it will be planned, has the rewrite name the
+    // deleted rows it would read in exactly that shape. A plan it fails to
+    // optimize is the planner's to report when it runs.
+    let wanted = collect_wanted(|| state.optimize(plan).map(|_| ()));
+    for (provider, wanted) in wanted {
         let cache = provider.deleted_stats();
         cache.prune_unlisted(|| {
             provider
@@ -259,27 +278,64 @@ pub(crate) async fn prepare_aggregate_inputs(
                 .map(|listed| listed.iter().map(|entry| entry.superfile_id).collect())
                 .unwrap_or_default()
         });
-        read_wanted(provider, state, cache, wanted.list).await;
+        read_wanted(&provider, state, cache, wanted).await;
     }
     Ok(())
 }
 
+/// Our provider behind `source`, when it is one.
+fn supertable_provider(source: &Arc<dyn TableSource>) -> Option<&SupertableProvider> {
+    source
+        .downcast_ref::<DefaultTableSource>()?
+        .table_provider
+        .downcast_ref::<SupertableProvider>()
+}
+
+/// Whether `agg` has a shape the rewrite answers: at most one grouping
+/// column, and only `COUNT`, `SUM`, `MIN`, `MAX` and `AVG`, none of them
+/// distinct or ordered. Any other aggregate never reads deleted rows' or
+/// tombstones' state.
+fn answerable_shape(agg: &Aggregate) -> bool {
+    agg.group_expr.len() <= 1
+        && agg.aggr_expr.iter().all(|expr| match unaliased(expr) {
+            Expr::AggregateFunction(func) => {
+                matches!(func.func.name(), "count" | "sum" | "min" | "max" | "avg")
+                    && !func.params.distinct
+                    && func.params.order_by.is_empty()
+            }
+            _ => false,
+        })
+}
+
+thread_local! {
+    /// While [`collect_wanted`] runs, the deleted rows the rewrite would
+    /// read, with the provider of each statement's table; `None` otherwise.
+    static WANTED: RefCell<Option<Vec<(SupertableProvider, Vec<Wanted>)>>> =
+        const { RefCell::new(None) };
+}
+
+/// The deleted rows the rewrite wants while `optimize` runs on this thread,
+/// by the provider to read them through. The rewrite logs nothing then: the
+/// statement's own optimization reports what it does.
+fn collect_wanted(
+    optimize: impl FnOnce() -> DfResult<()>,
+) -> Vec<(SupertableProvider, Vec<Wanted>)> {
+    WANTED.with(|wanted| *wanted.borrow_mut() = Some(Vec::new()));
+    // Its result is the planner's to report; only what it wanted matters.
+    let _ = optimize();
+    WANTED
+        .with(|wanted| wanted.borrow_mut().take())
+        .unwrap_or_default()
+}
+
 /// The deleted rows whose statistics a statement wants, and whether the
-/// rewrite looking for them only looks: then it logs nothing, as the
-/// optimizer's run of it reports the answer.
+/// rewrite looking for them only looks (see [`collect_wanted`]).
 struct Wants {
     list: Vec<Wanted>,
     quiet: bool,
 }
 
 impl Wants {
-    fn quiet() -> Self {
-        Self {
-            list: Vec::new(),
-            quiet: true,
-        }
-    }
-
     fn logged() -> Self {
         Self {
             list: Vec::new(),
@@ -299,7 +355,24 @@ fn aggregated_scan(agg: &Aggregate) -> Option<&TableScan> {
 }
 
 fn try_rewrite(plan: &LogicalPlan) -> DfResult<Option<LogicalPlan>> {
-    try_rewrite_wanting(plan, &mut Wants::logged())
+    let collecting = WANTED.with(|wanted| wanted.borrow().is_some());
+    let mut wants = Wants {
+        list: Vec::new(),
+        quiet: collecting,
+    };
+    let rewritten = try_rewrite_wanting(plan, &mut wants)?;
+    if collecting
+        && !wants.list.is_empty()
+        && let LogicalPlan::Aggregate(agg) = plan
+        && let Some(provider) = aggregated_scan(agg).and_then(provider_of)
+    {
+        WANTED.with(|wanted| {
+            if let Some(wanted) = wanted.borrow_mut().as_mut() {
+                wanted.push((provider.share(), wants.list));
+            }
+        });
+    }
+    Ok(rewritten)
 }
 
 /// [`try_rewrite`], adding to `wanted` the deleted rows whose statistics
@@ -355,29 +428,7 @@ fn try_rewrite_wanting(plan: &LogicalPlan, wanted: &mut Wants) -> DfResult<Optio
             return rewrite_with_residual(agg, scan, provider, &kinds, partials, split, None);
         }
         split.log();
-        let mut expressions = Vec::with_capacity(kinds.len());
-        for (i, partial) in partials.iter().enumerate() {
-            let field = agg.schema.field(i);
-            let output = field.data_type();
-            let expression = match partial {
-                Partial::Count(count) => lit(*count),
-                Partial::Sum(Some(value)) | Partial::Bound(Some(value)) => {
-                    covered_literal(value, output)
-                }
-                // No live value: SUM, MIN and MAX of nothing are NULL.
-                Partial::Sum(None) | Partial::Bound(None) | Partial::Avg(None) => {
-                    lit(ScalarValue::try_from(output)?)
-                }
-                Partial::Avg(Some((sum, count))) => {
-                    cast(lit(sum.clone()), DataType::Float64) / cast(lit(*count), DataType::Float64)
-                }
-            };
-            expressions.push(expression.alias(field.name().clone()));
-        }
-        let rewritten = LogicalPlanBuilder::empty(true)
-            .project(expressions)?
-            .build()?;
-        return Ok(Some(rewritten));
+        return literal_answer(agg, &partials).map(Some);
     }
 
     // Input shape: Filter over TableScan (a pure-column Projection in
@@ -408,15 +459,25 @@ fn try_rewrite_wanting(plan: &LogicalPlan, wanted: &mut Wants) -> DfResult<Optio
     let superfiles = manifest.complete_flat_superfiles();
     let id_column = manifest.options.id_column.as_str();
 
+    // A range index counts every superfile, deleted rows left out, from a
+    // block or two each: cheaper than scanning the ones with deletes, so
+    // with any to scan it answers below, and no deleted row is read for
+    // the value counts.
+    let range_indexed = provider.counted_range(&predicate).is_some();
+    let mut unread = Wants {
+        list: Vec::new(),
+        quiet: wanted.quiet,
+    };
+    let counts_wanted = match range_indexed {
+        true => &mut unread,
+        false => &mut *wanted,
+    };
     if matches!(kinds.as_slice(), [AggKind::CountStar])
         && let Some(counts_split) =
-            split_value_counts(provider, &range.column, false, "value count", wanted)
+            split_value_counts(provider, &range.column, false, "value count", counts_wanted)
     {
-        // A range index counts every superfile, deleted rows left out, from
-        // a block or two each: cheaper than scanning the ones with deletes,
-        // so with any to scan it answers below.
         let scans = counts_split.split.scans_any();
-        if (!scans || provider.counted_range(&predicate).is_none())
+        if (!scans || !range_indexed)
             && let Some(counts) = answered_counts(provider, &range.column, &counts_split)
             && let Some(count) = count_range_from_value_counts(counts.iter(), &range)
         {
@@ -471,6 +532,10 @@ fn try_rewrite_wanting(plan: &LogicalPlan, wanted: &mut Wants) -> DfResult<Optio
     ) else {
         return Ok(None);
     };
+    if !split.scans_any() {
+        split.log();
+        return literal_answer(agg, &partials).map(Some);
+    }
     rewrite_with_residual(
         agg,
         scan,
@@ -480,6 +545,33 @@ fn try_rewrite_wanting(plan: &LogicalPlan, wanted: &mut Wants) -> DfResult<Optio
         split,
         Some(&predicate),
     )
+}
+
+/// `agg` answered by `partials` alone, one literal row: every superfile it
+/// reads was answered from statistics, and none is scanned.
+fn literal_answer(agg: &Aggregate, partials: &[Partial]) -> DfResult<LogicalPlan> {
+    let mut expressions = Vec::with_capacity(partials.len());
+    for (i, partial) in partials.iter().enumerate() {
+        let field = agg.schema.field(i);
+        let output = field.data_type();
+        let expression = match partial {
+            Partial::Count(count) => lit(*count),
+            Partial::Sum(Some(value)) | Partial::Bound(Some(value)) => {
+                covered_literal(value, output)
+            }
+            // No live value: SUM, MIN and MAX of nothing are NULL.
+            Partial::Sum(None) | Partial::Bound(None) | Partial::Avg(None) => {
+                lit(ScalarValue::try_from(output)?)
+            }
+            Partial::Avg(Some((sum, count))) => {
+                cast(lit(sum.clone()), DataType::Float64) / cast(lit(*count), DataType::Float64)
+            }
+        };
+        expressions.push(expression.alias(field.name().clone()));
+    }
+    LogicalPlanBuilder::empty(true)
+        .project(expressions)?
+        .build()
 }
 
 /// A column an aggregate reads, as the manifest's statistics know it.
