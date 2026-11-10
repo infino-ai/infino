@@ -2433,10 +2433,8 @@ async fn stream_sources(
             }
         }))
         .buffer_unordered(TIER_HEAD_CONCURRENCY)
-        .collect::<Vec<_>>()
-        .await
-        .into_iter()
-        .collect::<Result<_, _>>()?,
+        .try_collect()
+        .await?,
     };
     let lens = {
         let mut lens = tier_lens.lock().expect("tier lengths");
@@ -11360,6 +11358,34 @@ mod tests {
                 other => panic!("{slices} absent tiers: {other:?}"),
             }
         }
+    }
+
+    /// A failed HEAD ends the sizing of a streamed fold's tiers: the HEADs
+    /// not yet sent are dropped, so an outage fails the fold after one wave
+    /// instead of after every tier's retries.
+    #[test]
+    fn a_failed_tier_head_stops_the_rest() {
+        let store_dir = TempDir::new().expect("store");
+        let local: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(store_dir.path()).expect("local"));
+        let faults = FaultStorage::wrap(local);
+        faults.fail(FaultOp::Head, TIER_URI_FRAGMENT, usize::MAX);
+        let faulty = Arc::clone(&faults) as Arc<dyn StorageProvider>;
+        let tiers = 4 * TIER_HEAD_CONCURRENCY;
+        assert!(tiers <= CHECK_LIST_MIN_OBJECTS, "sized by HEADs, not a listing");
+        let rt = Runtime::new().expect("runtime");
+        let sized = rt.block_on(stream_sources(
+            &faulty,
+            &[tiered_layer(tiers)],
+            None,
+            &Mutex::default(),
+        ));
+        assert!(sized.is_err());
+        assert!(
+            faults.fired() < tiers,
+            "every tier was asked: {}",
+            faults.fired()
+        );
     }
 
     /// Past [`CHECK_LIST_MIN_OBJECTS`] unknown tier lengths, a store whose
