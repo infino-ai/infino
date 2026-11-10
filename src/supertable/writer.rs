@@ -237,9 +237,7 @@ use crate::{
     },
     utils::{
         join::run_spawned,
-        nulls::{
-            concat_sharing_nulls, held_bytes, populated_columns, set_cell_bytes, take_sharing_nulls,
-        },
+        nulls::{concat_sharing_nulls, populated_columns, set_cell_bytes, take_sharing_nulls},
         trace::{self, detail_span, record},
     },
 };
@@ -832,7 +830,7 @@ fn split_target_bytes(options: &SupertableOptions) -> usize {
 
 /// How many superfiles a commit of `buffer` becomes: [`superfiles_per_commit`]'s
 /// count from the buffered bytes, capped by the writer pool. The bytes are
-/// what every scalar and vector column the buffer holds takes ([`held_bytes`]),
+/// what every scalar and vector column the buffer holds takes ([`visible_array_bytes`]),
 /// less the slots its null cells keep ([`set_cell_bytes`]). A wide, sparse batch's footprint is almost all such
 /// slots, and each superfile of a commit stores, describes and summarises
 /// every column its rows set, so cut by its footprint it would pay that
@@ -860,7 +858,7 @@ fn commit_buffered_bytes(buffer: &[BufferedBatch]) -> usize {
             set_cell_bytes(&b.scalar)
                 + b.vectors
                     .iter()
-                    .map(|v| held_bytes(v.as_ref()))
+                    .map(|v| usize::try_from(visible_array_bytes(v.as_ref())).unwrap_or(usize::MAX))
                     .sum::<usize>()
         })
         .sum()
@@ -14697,10 +14695,7 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use arrow::{
-        compute::concat_batches,
-        ipc::{reader::StreamReader, writer::StreamWriter},
-    };
+    use arrow::{compute::concat_batches, ipc::reader::StreamReader};
     use arrow_array::{
         Array, ArrayRef, Decimal128Array, FixedSizeListArray, Float32Array, Float64Array,
         Int32Array, LargeStringArray, RecordBatch, StringArray, StructArray,
@@ -18104,17 +18099,7 @@ mod tests {
         )
         .expect("batch");
 
-        let mut wire = Vec::new();
-        {
-            let mut writer = StreamWriter::try_new(&mut wire, &schema).expect("ipc writer");
-            writer.write(&batch).expect("ipc write");
-            writer.finish().expect("ipc finish");
-        }
-        let decoded = StreamReader::try_new(wire.as_slice(), None)
-            .expect("ipc reader")
-            .next()
-            .expect("one batch")
-            .expect("decode");
+        let decoded = ipc_round_trip(&batch);
 
         let vector_index = decoded.schema().index_of("embedding").expect("embedding");
         let vectors = Arc::new(
@@ -18143,6 +18128,10 @@ mod tests {
             .map(|c| c.to_data().get_slice_memory_size().expect("slice size"))
             .sum();
         let measured = commit_buffered_bytes(&buffered);
+        assert_eq!(
+            measured, own_bytes,
+            "commit sized by bytes the batch does not hold"
+        );
         assert_eq!(
             superfiles_per_commit(
                 IPC_SIZED_ROWS,
