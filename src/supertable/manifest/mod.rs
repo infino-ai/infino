@@ -56,8 +56,10 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     f32::consts::PI,
     fmt,
+    num::NonZeroUsize,
     ops::Deref,
     sync::{Arc, OnceLock},
+    thread::available_parallelism,
 };
 
 use arrow::compute::kernels::aggregate as agg;
@@ -66,7 +68,9 @@ use arrow_schema::{DataType, TimeUnit};
 use bytes::Bytes;
 use dashmap::{DashMap, DashSet};
 use futures::{
-    future, stream,
+    future,
+    future::join_all,
+    stream,
     stream::{StreamExt, TryStreamExt},
 };
 /// Re-export the per-column skip aggregates so callers can refer to them as
@@ -80,8 +84,9 @@ use rustc_hash::FxHashSet;
 pub use summaries::ColumnStats;
 use tokio::{
     join,
+    runtime::{Handle, RuntimeFlavor},
     sync::OnceCell,
-    task::{JoinError, spawn, spawn_blocking},
+    task::{JoinError, block_in_place, spawn, spawn_blocking},
 };
 use tracing::{Instrument, warn};
 use uuid::Uuid;
@@ -2667,11 +2672,13 @@ impl ManifestSnapshot {
             } else {
                 Some(self.get_part_by_id(entry.part_id).await?)
             };
+            // Reads every group of the part's section here, which the
+            // re-encode below would anyway.
             let existing_part = existing_part.filter(|part| {
-                let readable = !part
+                let readable = part
                     .superfiles
                     .iter()
-                    .any(|superfile| superfile.scalar_stats.is_unavailable());
+                    .all(|superfile| superfile.scalar_stats.readable());
                 if !readable {
                     warn!(
                         part_id = %entry.part_id,
@@ -3299,8 +3306,8 @@ fn rebuild_part_and_entry(
 /// hands its rows over as they are; nothing is decoded to be encoded
 /// again.
 ///
-/// An entry whose statistics this handle could not read
-/// ([`ScalarStats::Unavailable`]) is refused: a section written from what
+/// An entry whose statistics this handle cannot read, whole
+/// ([`ScalarStats::readable`]), is refused: a section written from what
 /// the handle sees would record the superfile as having none, for good.
 /// The commit fails instead, and a fresh handle reads the section again.
 ///
@@ -3311,10 +3318,7 @@ fn section_entries(
     entries: Vec<Arc<SuperfileEntry>>,
     part_id: PartId,
 ) -> Result<(Vec<Arc<SuperfileEntry>>, Option<(Bytes, ContentHash)>), ManifestError> {
-    if let Some(entry) = entries
-        .iter()
-        .find(|entry| entry.scalar_stats.is_unavailable())
-    {
+    if let Some(entry) = entries.iter().find(|entry| !entry.scalar_stats.readable()) {
         return Err(ManifestError::StatisticsUnavailable {
             superfile_id: entry.superfile_id,
         });
@@ -3709,16 +3713,27 @@ impl ManifestPartLoader {
     }
 
     /// Fetch, verify and parse a summaries section: from the disk cache
-    /// when it holds the bytes, else from storage and into the cache. The
-    /// hash and the parse run off the runtime, as a part's do.
+    /// when it holds the section, else from storage and into the cache.
+    ///
+    /// A section in the cache is verified against its hash, streamed, and
+    /// parsed from its header and tables alone; its groups are read back
+    /// from the cache file on first use, each checked against the hash it
+    /// had when the file was verified, so the handle holds none of its
+    /// bytes and never reads a group the section did not hold. A cache file
+    /// that is not the section (a crash left it torn) is removed and the
+    /// section fetched from storage. A section from storage is verified and
+    /// parsed whole, off the runtime as a part is, then handed to the cache
+    /// and read from there too; only when the cache cannot take it does the
+    /// section keep its bytes. Either way the section pins its cache file,
+    /// so no other occupant of the cache evicts it while the section lives.
     async fn load_summaries(
         &self,
         reference: &SummariesRef,
     ) -> Result<Arc<SummariesSection>, ManifestLoadError> {
         if let Some(cache) = &self.metadata_disk_cache
-            && let Some(bytes) = cache.get(&reference.content_hash).await
+            && let Some(section) =
+                open_cached_summaries_off_thread(Arc::clone(cache), reference.content_hash).await?
         {
-            let section = parse_summaries_off_thread(Bytes::from(bytes), None).await?;
             return Ok(Arc::new(section));
         }
         let (bytes, _) = self
@@ -3726,10 +3741,17 @@ impl ManifestPartLoader {
             .get(&reference.uri)
             .await
             .map_err(ManifestLoadError::Storage)?;
-        let section =
+        let mut section =
             parse_summaries_off_thread(bytes.clone(), Some(reference.content_hash)).await?;
-        if let Some(cache) = &self.metadata_disk_cache {
-            cache.put(reference.content_hash, bytes).await;
+        if let Some(cache) = &self.metadata_disk_cache
+            && cache.put(reference.content_hash, bytes).await
+            && let Some(pin) = cache.pin(reference.content_hash)
+        {
+            section = summaries_task(move || {
+                section.read_groups_from(pin);
+                Ok(section)
+            })
+            .await?;
         }
         Ok(Arc::new(section))
     }
@@ -3866,10 +3888,33 @@ async fn parse_summaries_off_thread(
         }
         SummariesSection::parse(bytes).map_err(ManifestLoadError::from)
     };
-    match spawn_blocking(carry_span(verify_then_parse)).await {
+    summaries_task(verify_then_parse).await
+}
+
+/// Open the section cached under `hash`, off the runtime: a verifying
+/// read of the cache file, which keeps its header. `None` when the cache
+/// does not hold it whole.
+async fn open_cached_summaries_off_thread(
+    cache: Arc<MetadataDiskCache>,
+    hash: ContentHash,
+) -> Result<Option<SummariesSection>, ManifestLoadError> {
+    summaries_task(move || {
+        SummariesSection::open_cached(&cache, hash).map_err(ManifestLoadError::from)
+    })
+    .await
+}
+
+/// Run `task`, a section read or parse, as a blocking task under the
+/// current span; a task that does not finish reads as a malformed section.
+async fn summaries_task<T, F>(task: F) -> Result<T, ManifestLoadError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, ManifestLoadError> + Send + 'static,
+{
+    match spawn_blocking(carry_span(task)).await {
         Ok(result) => result,
         Err(join_error) => Err(ManifestLoadError::Summaries(SummariesError::Malformed(
-            format!("section parse task failed: {join_error}"),
+            format!("section task failed: {join_error}"),
         ))),
     }
 }
@@ -4219,7 +4264,8 @@ pub enum ScalarStats {
     /// such an entry into a new section (`section_entries`) and appends
     /// beside its part rather than into it, so a failure to read the
     /// statistics never becomes their loss; a fresh handle reads the
-    /// section again.
+    /// section again. A [`Self::Section`] row whose group cannot be read
+    /// back from the cache is treated the same way ([`Self::readable`]).
     Unavailable,
 }
 
@@ -4291,9 +4337,115 @@ impl ScalarStats {
     }
 
     /// Whether the statistics live in a section this handle could not
-    /// read, so that no commit may write them anew from what it sees.
+    /// read, or has so far failed to read a group of, so that no commit may
+    /// write them anew from what it sees. Cheap: it reads nothing. A writer
+    /// asks [`Self::readable`], which reads everything first.
     pub fn is_unavailable(&self) -> bool {
-        matches!(self, Self::Unavailable)
+        match self {
+            Self::Inline(_) => false,
+            Self::Section { section, .. } => section.has_unreadable_group(),
+            Self::Unavailable => true,
+        }
+    }
+
+    /// Whether every statistic the superfile holds can be read by this
+    /// handle, reading every group of its section to find out. What a
+    /// writer asks before it writes the statistics anew from what it sees:
+    /// a commit that re-encodes a part's section, a repair that carries an
+    /// entry's statistics into a rewritten superfile. A statistic that
+    /// reads as none because a group could not be read would otherwise be
+    /// written as none, for good.
+    pub fn readable(&self) -> bool {
+        match self {
+            Self::Inline(_) => true,
+            Self::Section { section, .. } => section.all_groups_readable(),
+            Self::Unavailable => false,
+        }
+    }
+}
+
+/// Read and decode, off the runtime, the summaries section groups that
+/// hold `columns` for `entries`, before a caller on the runtime reads them.
+///
+/// The statistics readers are synchronous (the pruner, the planner's
+/// statistics, the rollup fold), and a section group is read back from the
+/// metadata disk cache and decoded on first use, which on a wide table is
+/// megabytes per part. A query path that knows its columns calls this
+/// first, so the read and the decode run as blocking tasks, a few sections
+/// each and as many tasks as the machine has threads, and the readers find
+/// the groups decoded. A reader that was not preceded by a load still
+/// works: it reads the group where it stands. Entries whose statistics are
+/// inline or unavailable have nothing to load, and neither has a section
+/// whose groups for `columns` are already read, so a warm handle answers
+/// without starting a task.
+pub(crate) async fn load_section_groups(entries: &[Arc<SuperfileEntry>], columns: &[FieldId]) {
+    if columns.is_empty() {
+        return;
+    }
+    // Each section once: a part's entries share theirs. The set of
+    // addresses stays in this block, off the future across the await.
+    let sections: Vec<Arc<SummariesSection>> = {
+        let mut seen: FxHashSet<*const SummariesSection> = FxHashSet::default();
+        entries
+            .iter()
+            .filter_map(|entry| match &entry.scalar_stats {
+                ScalarStats::Section { section, .. } => Some(section),
+                ScalarStats::Inline(_) | ScalarStats::Unavailable => None,
+            })
+            .filter(|section| seen.insert(Arc::as_ptr(section)))
+            .filter(|section| !section.groups_of_read(columns))
+            .cloned()
+            .collect()
+    };
+    if sections.is_empty() {
+        return;
+    }
+    let tasks = available_parallelism().map_or(1, NonZeroUsize::get);
+    let per_task = sections.len().div_ceil(tasks);
+    let columns: Arc<[FieldId]> = Arc::from(columns);
+    let loads = sections.chunks(per_task).map(|chunk| {
+        let chunk = chunk.to_vec();
+        let columns = Arc::clone(&columns);
+        spawn_blocking(carry_span(move || {
+            for section in chunk {
+                section.decode_groups_of(&columns);
+            }
+        }))
+    });
+    // A task that does not finish leaves its groups to be read on first
+    // use, which reads them as before; nothing is lost.
+    join_all(loads).await;
+}
+
+/// [`load_section_groups`] for a synchronous caller that may stand on a
+/// runtime worker, such as a plan rewrite that answers from statistics.
+///
+/// On a multi-thread runtime it tells the runtime the worker blocks
+/// (`block_in_place`) and drives the load there, so the reads and decodes
+/// still run as blocking tasks and the worker's other tasks move to its
+/// siblings. Anywhere else (no runtime, or a current-thread one, which
+/// cannot hand its tasks off) it decodes on the calling thread, as a
+/// reader that was not preceded by a load would. A warm handle returns
+/// before either, reading nothing.
+pub(crate) fn load_section_groups_blocking(entries: &[Arc<SuperfileEntry>], columns: &[FieldId]) {
+    let unread = entries.iter().any(|entry| match &entry.scalar_stats {
+        ScalarStats::Section { section, .. } => !section.groups_of_read(columns),
+        ScalarStats::Inline(_) | ScalarStats::Unavailable => false,
+    });
+    if columns.is_empty() || !unread {
+        return;
+    }
+    match Handle::try_current() {
+        Ok(handle) if matches!(handle.runtime_flavor(), RuntimeFlavor::MultiThread) => {
+            block_in_place(|| handle.block_on(load_section_groups(entries, columns)));
+        }
+        _ => {
+            for entry in entries {
+                if let ScalarStats::Section { section, .. } = &entry.scalar_stats {
+                    section.decode_groups_of(columns);
+                }
+            }
+        }
     }
 }
 
@@ -9505,6 +9657,283 @@ mod tests {
             .clone()
             .expect("the list names the section");
         (dir, storage, opts, reference)
+    }
+
+    /// Room for every part and section of the test tables in a metadata
+    /// cache.
+    const SECTION_TEST_CACHE_BUDGET_BYTES: u64 = 1 << 20;
+    /// A field id no test table has.
+    const NO_SUCH_COLUMN: FieldId = FieldId(u32::MAX);
+
+    /// The options of [`published_sectioned_table`] with a metadata disk
+    /// cache under `dir`, as a table opened with a cache directory has.
+    fn opts_with_cache(dir: &TempDir) -> (Arc<SupertableOptions>, Arc<MetadataDiskCache>) {
+        let cache = MetadataDiskCache::new(
+            dir.path().join("metadata-cache"),
+            SECTION_TEST_CACHE_BUDGET_BYTES,
+        )
+        .expect("cache");
+        let opts = SupertableOptions::new(simple_schema(), vec![], vec![])
+            .expect("valid options")
+            .with_metadata_disk_cache(Arc::clone(&cache));
+        (Arc::new(opts), cache)
+    }
+
+    /// A handle with a metadata cache reads a section through it: the
+    /// first load fetches the section and hands it to the cache, the next
+    /// opens it from the cache's file. Neither holds the section's bytes,
+    /// and the second needs the section in storage no more. A handle
+    /// without a cache keeps the bytes.
+    #[tokio::test]
+    async fn a_section_is_read_through_the_metadata_cache_and_not_held() {
+        let (dir, storage, opts, reference) = published_sectioned_table().await;
+        let amount = fid("amount");
+        let expected = [
+            sectioned_stats(vec![3, 9, 4]),
+            sectioned_stats(vec![10, 20]),
+        ];
+        let (cached_opts, cache) = opts_with_cache(&dir);
+
+        let without_cache = ManifestSnapshot::load(None, Arc::clone(&storage), Some(opts))
+            .await
+            .expect("load");
+        for entry in without_cache.get_all_superfiles() {
+            assert!(
+                entry
+                    .scalar_stats
+                    .section()
+                    .expect("a section")
+                    .holds_bytes()
+            );
+        }
+
+        let first =
+            ManifestSnapshot::load(None, Arc::clone(&storage), Some(Arc::clone(&cached_opts)))
+                .await
+                .expect("load");
+        assert!(
+            cache.contains(&reference.content_hash),
+            "the section is in the cache"
+        );
+        for (row, entry) in first.get_all_superfiles().iter().enumerate() {
+            let section = entry.scalar_stats.section().expect("a section");
+            assert!(!section.holds_bytes(), "the bytes went to the cache");
+            assert_eq!(
+                entry.scalar_stats.get(amount).as_ref(),
+                Some(&expected[row])
+            );
+        }
+
+        storage
+            .delete(&reference.uri)
+            .await
+            .expect("delete the section from storage");
+        let second = ManifestSnapshot::load(None, Arc::clone(&storage), Some(cached_opts))
+            .await
+            .expect("the cache serves the section");
+        let entries = second.get_all_superfiles();
+        let section = entries[0].scalar_stats.section().expect("a section");
+        assert!(!section.holds_bytes());
+        assert_eq!(section.resident_bytes(), 0, "nothing decoded yet");
+        for (row, entry) in entries.iter().enumerate() {
+            assert_eq!(
+                entry.scalar_stats.get(amount).as_ref(),
+                Some(&expected[row])
+            );
+        }
+        assert!(section.resident_bytes() > 0, "the group read is resident");
+        assert!(
+            section.resident_bytes() < reference.size_bytes as usize,
+            "less than the section"
+        );
+    }
+
+    /// A cache file that is not the section it is named for, as a crash
+    /// that renamed a write ahead of its data could leave, is not read as
+    /// the section: the loader fetches the section from storage again and
+    /// reads its statistics, and caches it anew.
+    #[tokio::test]
+    async fn a_torn_section_cache_file_is_fetched_from_storage_again() {
+        let (dir, storage, _, reference) = published_sectioned_table().await;
+        let amount = fid("amount");
+        let (cached_opts, cache) = opts_with_cache(&dir);
+        drop(
+            ManifestSnapshot::load(None, Arc::clone(&storage), Some(Arc::clone(&cached_opts)))
+                .await
+                .expect("load"),
+        );
+        let file = dir
+            .path()
+            .join("metadata-cache")
+            .join(format!("part-{}.avro.zst", reference.content_hash.to_hex()));
+        let length = std::fs::metadata(&file).expect("cached").len() as usize;
+        std::fs::write(&file, vec![0xab; length]).expect("tear the file");
+
+        let reloaded = ManifestSnapshot::load(None, Arc::clone(&storage), Some(cached_opts))
+            .await
+            .expect("load");
+        let expected = [
+            sectioned_stats(vec![3, 9, 4]),
+            sectioned_stats(vec![10, 20]),
+        ];
+        for (row, entry) in reloaded.get_all_superfiles().iter().enumerate() {
+            assert!(entry.scalar_stats.readable());
+            assert_eq!(
+                entry.scalar_stats.get(amount).as_ref(),
+                Some(&expected[row])
+            );
+        }
+        assert!(cache.contains(&reference.content_hash), "cached anew");
+        assert_eq!(
+            std::fs::read(&file).expect("cached").len(),
+            length,
+            "the section, not the torn bytes"
+        );
+    }
+
+    /// A query path loads the groups of the columns it will read before
+    /// it reads them: after the load the section holds those groups
+    /// decoded, read back from the cache off the runtime, and the readers
+    /// answer from them. A column nobody named is not loaded.
+    #[tokio::test]
+    async fn the_groups_a_query_names_are_loaded_before_it_reads_them() {
+        let (dir, storage, _, _) = published_sectioned_table().await;
+        let amount = fid("amount");
+        let (cached_opts, _cache) = opts_with_cache(&dir);
+        let loaded = ManifestSnapshot::load(None, Arc::clone(&storage), Some(cached_opts))
+            .await
+            .expect("load");
+        let entries = loaded.get_all_superfiles();
+        let section = Arc::clone(entries[0].scalar_stats.section().expect("a section"));
+
+        load_section_groups(entries, &[]).await;
+        assert_eq!(section.resident_bytes(), 0, "no column, nothing loaded");
+        load_section_groups(entries, &[NO_SUCH_COLUMN]).await;
+        assert_eq!(section.resident_bytes(), 0, "a column no group holds");
+
+        assert!(!section.groups_of_read(&[amount]));
+        load_section_groups(entries, &[amount]).await;
+        assert!(
+            section.groups_of_read(&[amount]),
+            "a warm handle loads nothing"
+        );
+        let loaded_bytes = section.resident_bytes();
+        assert!(loaded_bytes > 0, "the column's group is decoded");
+        assert_eq!(
+            entries[1].scalar_stats.get(amount).as_ref(),
+            Some(&sectioned_stats(vec![10, 20]))
+        );
+        assert_eq!(
+            section.resident_bytes(),
+            loaded_bytes,
+            "the read found the group decoded"
+        );
+    }
+
+    /// A synchronous reader on a multi-thread runtime's worker loads the
+    /// groups of its columns as the async load does; one on a
+    /// current-thread runtime, which cannot hand its worker's tasks off,
+    /// decodes them where it stands. Either way the groups are read after.
+    #[test]
+    fn a_synchronous_reader_loads_its_groups_before_it_reads_them() {
+        for multi_thread in [true, false] {
+            let runtime = match multi_thread {
+                true => tokio::runtime::Builder::new_multi_thread(),
+                false => tokio::runtime::Builder::new_current_thread(),
+            }
+            .enable_all()
+            .build()
+            .expect("runtime");
+            runtime.block_on(async {
+                let (dir, storage, _, _) = published_sectioned_table().await;
+                let amount = fid("amount");
+                let (cached_opts, _cache) = opts_with_cache(&dir);
+                let loaded = ManifestSnapshot::load(None, Arc::clone(&storage), Some(cached_opts))
+                    .await
+                    .expect("load");
+                let entries = loaded.get_all_superfiles();
+                let section = Arc::clone(entries[0].scalar_stats.section().expect("a section"));
+                assert!(!section.groups_of_read(&[amount]));
+                load_section_groups_blocking(entries, &[amount]);
+                assert!(
+                    section.groups_of_read(&[amount]),
+                    "multi_thread: {multi_thread}"
+                );
+                assert_eq!(
+                    entries[0].scalar_stats.get(amount).as_ref(),
+                    Some(&sectioned_stats(vec![3, 9, 4]))
+                );
+            });
+        }
+    }
+
+    /// A section whose cache file is gone when its groups are first read
+    /// reads as no statistics, and the handle will not write the part
+    /// anew from that: a commit refuses to section the entries, and an
+    /// append goes beside the part, which keeps its section. A fresh
+    /// handle reads the section from storage again.
+    #[tokio::test]
+    async fn a_section_whose_cache_file_is_gone_is_not_rewritten() {
+        let (dir, storage, _, reference) = published_sectioned_table().await;
+        let amount = fid("amount");
+        let (cached_opts, cache) = opts_with_cache(&dir);
+        let loaded =
+            ManifestSnapshot::load(None, Arc::clone(&storage), Some(Arc::clone(&cached_opts)))
+                .await
+                .expect("load");
+        let entries = loaded.get_all_superfiles();
+        assert!(
+            entries
+                .iter()
+                .all(|entry| !entry.scalar_stats.is_unavailable())
+        );
+
+        // Evict the section while the handle is open; nothing has read a
+        // group yet.
+        cache.remove(&reference.content_hash);
+        for entry in entries.iter() {
+            assert!(entry.scalar_stats.get(amount).is_none());
+            assert!(entry.scalar_stats.is_unavailable());
+            assert!(!entry.scalar_stats.readable());
+        }
+        assert!(matches!(
+            section_entries(entries.to_vec(), PartId::new_v4()),
+            Err(ManifestError::StatisticsUnavailable { .. })
+        ));
+
+        let before = loaded.get_all_list_entries().to_vec();
+        let mut third = (*make_new_entry(4)).clone();
+        third.scalar_stats =
+            ScalarStats::Inline(HashMap::from([(amount, sectioned_stats(vec![30, 40]))]));
+        let (committed, parts) = loaded
+            .update(&[Arc::new(third)], &[])
+            .await
+            .expect("the append is not refused");
+        let after = committed.get_all_list_entries();
+        assert_eq!(after.len(), 2, "a part of its own for the new superfile");
+        assert_eq!(after[0].summaries, before[0].summaries);
+        assert!(after[1].summaries.is_some());
+
+        let objects: Vec<(String, Bytes)> = parts.iter().flat_map(|p| p.objects()).collect();
+        let (_, meta) = read_pointer(storage.as_ref())
+            .await
+            .expect("read pointer")
+            .expect("pointer present");
+        let etag = meta.etag.expect("localfs pointer etag");
+        committed
+            .write(storage.as_ref(), Some(etag.as_str()), &objects)
+            .await
+            .expect("write");
+        let fresh = ManifestSnapshot::load(None, Arc::clone(&storage), Some(cached_opts))
+            .await
+            .expect("load");
+        let fresh_entries = fresh.get_all_superfiles();
+        assert_eq!(fresh_entries.len(), 3);
+        assert!(
+            fresh_entries
+                .iter()
+                .all(|entry| entry.scalar_stats.get(amount).is_some())
+        );
     }
 
     /// A section that cannot be read — corrupted, or gone — does not keep
