@@ -159,11 +159,11 @@ pub(crate) fn concat_sharing_nulls<'a>(
     RecordBatch::try_new(Arc::clone(schema), columns)
 }
 
-/// The Arrow footprint of `batch`'s columns less what their null cells keep
-/// ([`null_slot_bytes`] each): about what the values it holds take. A
-/// column with no nulls counts its whole footprint, so a dense batch counts
-/// what Arrow reports for it; on a wide, sparse batch, where nearly every
-/// cell is a null keeping a slot, it counts the cells that are set.
+/// The bytes `batch`'s columns hold ([`held_bytes`] each) less what their
+/// null cells keep ([`null_slot_bytes`] each): about what the values it holds
+/// take. A column with no nulls counts all it holds; on a wide, sparse batch,
+/// where nearly every cell is a null keeping a slot, it counts the cells that
+/// are set.
 pub(crate) fn set_cell_bytes(batch: &RecordBatch) -> usize {
     batch
         .columns()
@@ -171,11 +171,21 @@ pub(crate) fn set_cell_bytes(batch: &RecordBatch) -> usize {
         .map(|column| {
             let null_slots =
                 (column.null_count() as u64).saturating_mul(null_slot_bytes(column.data_type()));
-            column
-                .get_array_memory_size()
+            held_bytes(column.as_ref())
                 .saturating_sub(usize::try_from(null_slots).unwrap_or(usize::MAX))
         })
         .sum()
+}
+
+/// The bytes `array`'s own rows take in its buffers. Not
+/// [`Array::get_array_memory_size`], which counts each buffer's whole
+/// allocation: an array decoded from Arrow IPC is a slice of the one message
+/// buffer, so every column of the batch would count that whole message.
+pub(crate) fn held_bytes(array: &dyn Array) -> usize {
+    array
+        .to_data()
+        .get_slice_memory_size()
+        .unwrap_or_else(|_| array.get_array_memory_size())
 }
 
 /// Bytes one row of `schema` takes decoded into Arrow when every column in
@@ -281,7 +291,8 @@ mod tests {
             ],
         )
         .expect("dense batch");
-        assert_eq!(set_cell_bytes(&dense), dense.get_array_memory_size());
+        let dense_held: usize = dense.columns().iter().map(|c| held_bytes(c.as_ref())).sum();
+        assert_eq!(set_cell_bytes(&dense), dense_held);
 
         let one_in_a_hundred = |r: usize| r.is_multiple_of(100);
         let sparse = RecordBatch::try_new(
