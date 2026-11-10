@@ -7322,6 +7322,12 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                                 cell = *cell_id,
                                 rows = spill.n_rows(),
                                 score_ms = tracing::field::Empty,
+                                score_pool_queries = tracing::field::Empty,
+                                score_read_ms = tracing::field::Empty,
+                                score_estimate_ms = tracing::field::Empty,
+                                score_exact_ms = tracing::field::Empty,
+                                score_trim_ms = tracing::field::Empty,
+                                score_merge_ms = tracing::field::Empty,
                                 sample_ms = tracing::field::Empty,
                                 train_ms = tracing::field::Empty,
                                 n_cent = tracing::field::Empty,
@@ -7336,8 +7342,14 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                             // about to read anyway (before remove_files).
                             if let Some(cal) = width_law_ref {
                                 let score_t0 = time::Instant::now();
-                                cal.score_cell(*cell_id, spill)?;
+                                let profile = cal.score_cell(*cell_id, spill)?;
                                 record("score_ms", score_t0.elapsed().as_millis() as u64);
+                                record("score_pool_queries", profile.pool_queries as u64);
+                                record("score_read_ms", profile.read.as_millis() as u64);
+                                record("score_estimate_ms", profile.estimate.as_millis() as u64);
+                                record("score_exact_ms", profile.exact.as_millis() as u64);
+                                record("score_trim_ms", profile.trim.as_millis() as u64);
+                                record("score_merge_ms", profile.merge.as_millis() as u64);
                             }
                             let cell = build_spilled_packed_cell_from_rows(
                                 scratch,
