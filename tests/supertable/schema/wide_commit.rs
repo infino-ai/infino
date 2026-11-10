@@ -67,6 +67,10 @@ const TEXT_VALUE_BYTES: usize = 200;
 /// cost a few hundred KiB a column here.
 const PEAK_PER_COLUMN: usize = 64 * 1024;
 
+/// What a superfile's exact value tables may take together, as the writer
+/// budgets them.
+const VALUE_TABLES_BUDGET: usize = 128 * 1024;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Shape {
     /// [`SET_PER_ROW`] integer columns, every cell set.
@@ -346,12 +350,13 @@ fn a_wide_sparse_commit_peaks_by_the_cells_it_sets_not_its_width() {
 }
 
 /// Commits through one handle add their statistics to what it holds, not
-/// their values. On text columns whose values do not repeat, no superfile
-/// keeps an exact table of a column's values, which would be about the
-/// bytes written again, kept for the life of the handle: each keeps a
-/// sketch of a KiB and the bounds of each column it stores. And what the
-/// process keeps committed grows, over the last [`MEASURED_COMMITS`]
-/// commits, by less than the bytes each commit wrote.
+/// their values. A superfile keeps exact tables of its columns' values only
+/// within its budget for them, [`VALUE_TABLES_BUDGET`], so on text columns
+/// of a couple of hundred values each it keeps a few tables, not one a
+/// column, which would be about the bytes written again, kept for the life
+/// of the handle: the other columns keep a sketch of a KiB and their
+/// bounds. And what the process keeps committed grows, over the last
+/// [`MEASURED_COMMITS`] commits, by less than the bytes each commit wrote.
 #[test]
 fn repeated_commits_hold_their_statistics_not_their_values() {
     if child_if_named() {
@@ -362,9 +367,19 @@ fn repeated_commits_hold_their_statistics_not_their_values() {
     let commits = measure(TEST, Shape::WideText);
     let first = &commits[commits.len() - 1 - MEASURED_COMMITS];
     let last = &commits[commits.len() - 1];
-    assert_eq!(
-        last.tables, 0,
-        "values seen once each are sketched, not copied into a table"
+    // A column of a commit holds about `TEXT_ROWS * SET_PER_ROW /
+    // TEXT_COLUMNS` values; half that is a floor on what a kept table of
+    // them takes.
+    let least_table = TEXT_ROWS * SET_PER_ROW / TEXT_COLUMNS / 2 * TEXT_VALUE_BYTES;
+    let superfiles = last.superfiles - 1;
+    assert!(
+        last.tables * least_table <= superfiles * VALUE_TABLES_BUDGET,
+        "{} tables over {superfiles} superfiles pass their budget: {commits:?}",
+        last.tables
+    );
+    assert!(
+        last.tables < superfiles * TEXT_COLUMNS / 10,
+        "most columns are sketched, not copied into a table: {commits:?}"
     );
     let grown = last.committed.saturating_sub(first.committed) / MEASURED_COMMITS;
     assert!(

@@ -2330,7 +2330,7 @@ mod tests {
         Bm25SearchOptions, BoolMode, CompactionSettings, Consistency, FieldPatch, Metric,
         OptimizeOptions, SchemaPatch, Stemmer, Stopwords,
         catalog::manifest::CATALOG_PATH,
-        runtime_metrics::io::UriClass,
+        runtime_metrics::{io::UriClass, op_stats::with_op_stats},
         supertable::{
             manifest::commit::POINTER_PATH,
             query::{provider::TABLE_NAME, sql::value_count_schema},
@@ -4966,13 +4966,10 @@ mod tests {
         table
     }
 
-    /// `n` distinct strings, `prefix` before each, each twice: values that
-    /// repeat, which a superfile counts exactly while they fit its cap.
+    /// `n` distinct strings, `prefix` before each.
     fn distinct_strings(prefix: &str, n: usize) -> ArrayRef {
         Arc::new(LargeStringArray::from(
-            (0..2 * n)
-                .map(|i| format!("{prefix}{}", i / 2))
-                .collect::<Vec<_>>(),
+            (0..n).map(|i| format!("{prefix}{i}")).collect::<Vec<_>>(),
         ))
     }
 
@@ -4982,6 +4979,65 @@ mod tests {
         let conn = connect("memory://").expect("connect");
         create_cab_types(&conn, "cabs");
         assert_value_counts(&conn, "cabs", "title", Answered::FromStats);
+    }
+
+    /// A table fed by many small commits keeps each commit's exact value tables, a column
+    /// whose values all differ within a commit included (one reading per sensor per commit,
+    /// a unique id): a superfile of a few columns is well within its budget for them. The
+    /// sensor's value counts come from the statistics, and a point lookup on an id reads one
+    /// superfile of the many, by the bounds each commit's ids keep.
+    #[test]
+    fn small_commits_keep_their_exact_tables_and_a_point_lookup_reads_one() {
+        const COMMITS: usize = 30;
+        const SENSORS: usize = 100;
+        let conn = connect("memory://").expect("connect");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::LargeUtf8, false),
+            Field::new("sensor", DataType::Int64, false),
+        ]));
+        let table = conn
+            .create_table("readings", Arc::clone(&schema), IndexSpec::new())
+            .expect("create");
+        for commit in 0..COMMITS {
+            let ids: Vec<String> = (0..SENSORS)
+                .map(|sensor| format!("{commit:04}-{sensor:03}"))
+                .collect();
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(LargeStringArray::from(ids)),
+                    Arc::new(Int64Array::from_iter_values(0..SENSORS as i64)),
+                ],
+            )
+            .expect("batch");
+            table.append(&batch).expect("append");
+        }
+        let reader = table.local_handle().reader().expect("reader");
+        let superfiles = reader.manifest().get_all_superfiles();
+        assert_eq!(superfiles.len(), COMMITS, "one superfile a commit");
+        let id = reader.manifest().field_id("id").expect("id column");
+        for entry in superfiles {
+            assert!(
+                entry
+                    .scalar_stats
+                    .get(id)
+                    .is_some_and(|stats| stats.value_counts.is_some()),
+                "a commit of {SENSORS} distinct ids keeps their table"
+            );
+        }
+        assert_value_counts(&conn, "readings", "sensor", Answered::FromStats);
+
+        let (found, stats) = with_op_stats(|| {
+            conn.query_sql("SELECT sensor FROM readings WHERE id = '0017-042'")
+                .expect("point lookup")
+        });
+        assert_eq!(found.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+        // One superfile's rows are read, of the table's `COMMITS` superfiles.
+        assert_eq!(stats.planned_read_ranges, 1, "{stats:?}");
+        assert_eq!(
+            stats.rows_materialized, SENSORS as u64,
+            "the lookup reads the one superfile whose ids hold the value: {stats:?}"
+        );
     }
 
     /// Rows without a value count under a null key, as `GROUP BY` puts them in a null group.

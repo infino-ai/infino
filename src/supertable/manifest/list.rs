@@ -17,7 +17,7 @@
 
 use std::{
     cmp::Ordering,
-    collections::{BTreeMap, BTreeSet, HashMap, hash_map::Entry},
+    collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, hash_map::Entry},
     hash::{Hash, Hasher},
     slice,
     sync::Arc,
@@ -940,17 +940,6 @@ impl ScalarValueCounts {
         &self.entries
     }
 
-    /// Whether this table, counting `values` non-null values, says more
-    /// than the distinct sketch that stands in for a column without one:
-    /// its values repeat (its distinct values are at most
-    /// [`MOST_DISTINCT_TENTHS`] tenths of them), or it takes no more bytes
-    /// than the sketch's registers. A table of values nearly all seen once
-    /// is a copy of the column, not a summary of it.
-    fn summarises(&self, values: usize) -> bool {
-        self.entries.len().saturating_mul(10) <= values.saturating_mul(MOST_DISTINCT_TENTHS)
-            || self.value_bytes() <= HLL_REGISTERS
-    }
-
     /// About the bytes the table's entries take stored: each value's own
     /// bytes and its count.
     fn value_bytes(&self) -> usize {
@@ -961,10 +950,57 @@ impl ScalarValueCounts {
     }
 }
 
-/// The most a table larger than the sketch may have distinct values, in
-/// tenths of the values it counts, and still be kept (see
-/// [`ScalarValueCounts::summarises`]): one value in ten must be a repeat.
-const MOST_DISTINCT_TENTHS: usize = 9;
+/// The most bytes a superfile's exact value tables may take stored, all
+/// together, not counting tables no larger than the distinct sketch (see
+/// [`ValueTableBudget`]).
+///
+/// A table copies the values it counts, so on a table of thousands of
+/// sparse columns, whose few values in a superfile all fit the cap, the
+/// tables were most of what a commit added to the manifest: about the bytes
+/// it wrote. A budget per superfile bounds that by the superfile, whatever
+/// its width, while a superfile of a few columns, a small commit's, keeps
+/// every table it has: 128 KiB holds fifty tables of a hundred distinct
+/// 16-byte strings.
+pub(crate) const VALUE_TABLES_BUDGET_BYTES: usize = 128 * 1024;
+
+/// Which of one superfile's exact value tables it keeps.
+///
+/// A table no larger than the sketch that stands in for a column without
+/// one ([`HLL_REGISTERS`] bytes) is always kept: it costs no more than the
+/// sketch. The larger ones are kept smallest first while they fit
+/// [`VALUE_TABLES_BUDGET_BYTES`] together, so the budget keeps as many
+/// columns counted exactly as it can; the rest carry the sketch instead,
+/// as a column past the cap of distinct values does. Ties go to the lower
+/// column id. Which tables are kept does not depend on the order they are
+/// admitted in, so a build that counts its columns one at a time holds at
+/// most the budget and one table, not every column's.
+#[derive(Default)]
+struct ValueTableBudget {
+    /// The kept tables larger than the sketch, as `(bytes, column)`, the
+    /// largest on top.
+    kept: BinaryHeap<(usize, FieldId)>,
+    /// What the tables in `kept` take.
+    bytes: usize,
+}
+
+impl ValueTableBudget {
+    /// Admit `column`'s table of `bytes`, and hand each column whose table no
+    /// longer fits, `column` itself included, to `drop`.
+    fn admit(&mut self, column: FieldId, bytes: usize, mut drop: impl FnMut(FieldId)) {
+        if bytes <= HLL_REGISTERS {
+            return;
+        }
+        self.kept.push((bytes, column));
+        self.bytes += bytes;
+        while self.bytes > VALUE_TABLES_BUDGET_BYTES {
+            let Some((largest, column)) = self.kept.pop() else {
+                break;
+            };
+            self.bytes -= largest;
+            drop(column);
+        }
+    }
+}
 
 /// The bytes `value` takes stored: a string's or a binary's length, a
 /// fixed-width value's width.
@@ -1162,18 +1198,15 @@ impl ScalarStatsAgg {
         // reads the sketch where there is not, and nothing from a null
         // column.
         //
-        // A table is kept only where it summarises the values: where some
-        // repeat, or it is no larger than the sketch. A sparse column holds
-        // few values in a superfile, often all different, which fit the cap
-        // without repeating; its table is then a copy of the values, and on
-        // a table of thousands of such columns the tables would be most of
-        // what a commit adds to the manifest, about the bytes it wrote.
+        // A table larger than the whole budget for a superfile's tables is
+        // never kept; the rest are kept or not by the superfile's budget
+        // (see [`ValueTableBudget`]).
         let non_null: usize = pieces
             .iter()
             .map(|piece| piece.len() - piece.null_count())
             .sum();
-        let value_counts =
-            ScalarValueCounts::from_pieces(pieces).filter(|table| table.summarises(non_null));
+        let value_counts = ScalarValueCounts::from_pieces(pieces)
+            .filter(|table| table.value_bytes() <= VALUE_TABLES_BUDGET_BYTES);
         let hll = if value_counts.is_some() || non_null == 0 {
             None
         } else {
@@ -1204,11 +1237,25 @@ impl ScalarStatsAgg {
         if batches.is_empty() {
             return HashMap::new();
         }
-        scalar_schema
-            .fields()
-            .iter()
-            .filter_map(|field| ScalarStatsAgg::for_field(field, batches))
-            .collect()
+        // The batches are one superfile's rows, so its tables share one
+        // budget, applied as each column is counted.
+        let mut stats = HashMap::new();
+        let mut budget = ValueTableBudget::default();
+        for field in scalar_schema.fields() {
+            let Some((id, agg)) = ScalarStatsAgg::for_field(field, batches) else {
+                continue;
+            };
+            let bytes = agg.value_table_bytes();
+            stats.insert(id, agg);
+            if let Some(bytes) = bytes {
+                budget.admit(id, bytes, |dropped| {
+                    if let Some(agg) = stats.get_mut(&dropped) {
+                        agg.sketch_value_table();
+                    }
+                });
+            }
+        }
+        stats
     }
 
     /// [`ScalarStatsAgg::from_batches`] with one column per task on the current
@@ -1223,11 +1270,48 @@ impl ScalarStatsAgg {
         if batches.is_empty() {
             return HashMap::new();
         }
-        scalar_schema
+        let mut stats = scalar_schema
             .fields()
             .par_iter()
             .filter_map(|field| ScalarStatsAgg::for_field(field, batches))
-            .collect()
+            .collect();
+        Self::fit_value_tables(&mut stats);
+        stats
+    }
+
+    /// Keep one superfile's exact value tables within their budget (see
+    /// [`ValueTableBudget`]), each table past it replaced by the sketch of
+    /// its values. For statistics folded from parts of the superfile's rows,
+    /// as a merge's are, whose tables grow as they fold.
+    pub(crate) fn fit_value_tables(stats: &mut HashMap<FieldId, ScalarStatsAgg>) {
+        let mut tables: Vec<(usize, FieldId)> = stats
+            .iter()
+            .filter_map(|(id, agg)| Some((agg.value_table_bytes()?, *id)))
+            .collect();
+        tables.sort_unstable();
+        let mut budget = ValueTableBudget::default();
+        for (bytes, id) in tables {
+            budget.admit(id, bytes, |dropped| {
+                if let Some(agg) = stats.get_mut(&dropped) {
+                    agg.sketch_value_table();
+                }
+            });
+        }
+    }
+
+    /// The bytes the exact value table takes stored, when there is one.
+    fn value_table_bytes(&self) -> Option<usize> {
+        self.value_counts
+            .as_ref()
+            .map(ScalarValueCounts::value_bytes)
+    }
+
+    /// Replace the exact value table with the sketch of its values, which
+    /// is the column's sketch: a table's values hash as the column's do.
+    fn sketch_value_table(&mut self) {
+        if let Some(table) = self.value_counts.take() {
+            self.hll = table_sketch(&table).map(|sketch| sketch.as_bytes().to_vec());
+        }
     }
 
     /// One column's stats across `batches`, keyed by its field id. `None` when
@@ -2637,7 +2721,6 @@ mod tests {
     //! jq-friendly.
     use std::{
         collections::{BTreeMap, HashMap},
-        ops::RangeInclusive,
         slice::from_ref,
         str::from_utf8,
         sync::Arc,
@@ -2876,10 +2959,8 @@ mod tests {
             ]
         );
 
-        // Each value twice: a table of distinct values larger than the sketch
-        // is kept only where they repeat.
         let at_the_cap: ArrayRef = Arc::new(Int64Array::from_iter_values(
-            (0..2 * MAX_EXACT_VALUE_COUNTS as i64).map(|i| i / 2),
+            0..MAX_EXACT_VALUE_COUNTS as i64,
         ));
         let at_the_cap = ScalarStatsAgg::from_column(&at_the_cap).expect("int stats");
         assert_eq!(
@@ -2980,13 +3061,15 @@ mod tests {
     /// sketch merges the same way.
     #[test]
     fn scalar_agg_merge_drops_value_counts_above_cap() {
-        // Each value twice, so each side's table summarises it.
-        let twice = |values: RangeInclusive<i64>| -> ArrayRef {
-            Arc::new(Int64Array::from_iter_values(values.flat_map(|v| [v, v])))
-        };
-        let left = twice(0..=(MAX_EXACT_VALUE_COUNTS / 2) as i64);
-        let right = twice((MAX_EXACT_VALUE_COUNTS / 2 + 1) as i64..=MAX_EXACT_VALUE_COUNTS as i64);
-        let whole = twice(0..=MAX_EXACT_VALUE_COUNTS as i64);
+        let left: ArrayRef = Arc::new(Int64Array::from_iter_values(
+            0..=(MAX_EXACT_VALUE_COUNTS / 2) as i64,
+        ));
+        let right: ArrayRef = Arc::new(Int64Array::from_iter_values(
+            (MAX_EXACT_VALUE_COUNTS / 2 + 1) as i64..=MAX_EXACT_VALUE_COUNTS as i64,
+        ));
+        let whole: ArrayRef = Arc::new(Int64Array::from_iter_values(
+            0..=MAX_EXACT_VALUE_COUNTS as i64,
+        ));
         let want = column_hll(from_ref(&whole)).expect("sketchable");
         let mut merged = ScalarStatsAgg::from_column(&left).expect("left stats");
         let right = ScalarStatsAgg::from_column(&right).expect("right stats");
@@ -3005,8 +3088,9 @@ mod tests {
             0..=(2 * MAX_EXACT_VALUE_COUNTS) as i64,
         ));
         let want = column_hll(from_ref(&doubled)).expect("sketchable");
-        let upper =
-            twice((MAX_EXACT_VALUE_COUNTS + 1) as i64..=(2 * MAX_EXACT_VALUE_COUNTS) as i64);
+        let upper: ArrayRef = Arc::new(Int64Array::from_iter_values(
+            (MAX_EXACT_VALUE_COUNTS + 1) as i64..=(2 * MAX_EXACT_VALUE_COUNTS) as i64,
+        ));
         let upper = ScalarStatsAgg::from_column(&upper).expect("upper stats");
         assert!(upper.value_counts.is_some());
         sketched.merge_with(&upper).expect("same type");
@@ -3127,64 +3211,96 @@ mod tests {
         assert!(agg.hll.is_none(), "the table counts the column exactly");
     }
 
-    /// A table larger than the sketch is kept where some of its values
-    /// repeat and replaced by the sketch where nearly all appear once, as on
-    /// a sparse column whose few values in a superfile are all different; a
-    /// table no larger than the sketch is kept either way.
+    /// A superfile keeps its exact tables while they fit its budget: every
+    /// table no larger than the sketch, and the larger ones smallest first,
+    /// lower column ids first among equals. A table past the budget carries
+    /// the sketch of its values, the column's sketch. The same tables are
+    /// kept whether the columns are counted in turn, in parallel, or folded
+    /// from parts of the rows and fitted after.
     #[test]
-    fn an_exact_table_is_kept_only_where_it_summarises() {
+    fn a_superfile_keeps_its_exact_tables_within_its_budget() {
+        // 200 distinct integers: 3,200 bytes stored, past the sketch.
         const DISTINCT: i64 = 200;
-        let once: ArrayRef = Arc::new(Int64Array::from_iter(
-            (0..10 * DISTINCT).map(|i| (i % 10 == 0).then_some(i)),
-        ));
-        let once = ScalarStatsAgg::from_column(&once).expect("int stats");
-        assert!(once.value_counts.is_none(), "200 values seen once each");
-        assert!(once.hll.is_some(), "the sketch stands in for the table");
-        assert_eq!(once.null_count, Some(9 * DISTINCT as u64));
-
-        let twice: ArrayRef = Arc::new(Int64Array::from_iter_values(
-            (0..2 * DISTINCT).map(|i| i % DISTINCT),
-        ));
-        let twice = ScalarStatsAgg::from_column(&twice).expect("int stats");
-        assert_eq!(
-            twice.value_counts.expect("repeated values").entries().len(),
-            DISTINCT as usize
+        const TABLE_BYTES: usize = DISTINCT as usize * 16;
+        const LARGE: usize = 100;
+        const SMALL: usize = 300;
+        let user = Schema::new(
+            (0..LARGE)
+                .map(|c| format!("large{c:03}"))
+                .chain((0..SMALL).map(|c| format!("small{c:03}")))
+                .map(|name| Field::new(name, DataType::Int64, true))
+                .collect::<Vec<_>>(),
         );
-        assert!(twice.hll.is_none());
+        let schema = TableSchema::from_user_schema(&user).stamp_field_ids(&user, "_id");
+        // Every value once, as a unique id column in a small commit; the
+        // small columns hold 40 values, 640 bytes, under the sketch.
+        let column = |c: usize, rows: std::ops::Range<i64>| -> ArrayRef {
+            let distinct = if c < LARGE { DISTINCT } else { 40 };
+            Arc::new(Int64Array::from_iter_values(
+                rows.map(|r| (r % distinct) + 1_000 * c as i64),
+            ))
+        };
+        let batch = |rows: std::ops::Range<i64>| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                (0..LARGE + SMALL)
+                    .map(|c| column(c, rows.clone()))
+                    .collect(),
+            )
+            .expect("batch")
+        };
+        let whole = batch(0..DISTINCT);
+        let id =
+            |name: &str| field_id_of(schema.field_with_name(name).expect("field")).expect("id");
 
-        // 200 values over 300 rows, as a country column in a small commit.
-        let some_repeat: ArrayRef =
-            Arc::new(Int64Array::from_iter_values((0..300).map(|i| i % DISTINCT)));
-        let some_repeat = ScalarStatsAgg::from_column(&some_repeat).expect("int stats");
-        assert!(
-            some_repeat.value_counts.is_some(),
-            "a third of the rows repeat"
+        let fits = VALUE_TABLES_BUDGET_BYTES / TABLE_BYTES;
+        assert!(fits < LARGE, "the large tables together pass the budget");
+        let stats = ScalarStatsAgg::from_batches(&schema, &[&whole]);
+        for c in 0..LARGE {
+            let agg = &stats[&id(&format!("large{c:03}"))];
+            if c < fits {
+                assert_eq!(
+                    agg.value_counts
+                        .as_ref()
+                        .expect("within the budget")
+                        .entries()
+                        .len(),
+                    DISTINCT as usize
+                );
+                assert!(agg.hll.is_none());
+            } else {
+                assert!(agg.value_counts.is_none(), "large{c:03} is past the budget");
+                let want = column_hll(&[column(c, 0..DISTINCT)]).expect("sketchable");
+                assert_eq!(
+                    agg.hll.as_deref(),
+                    Some(want.as_bytes()),
+                    "the sketch of the table's values is the column's"
+                );
+            }
+        }
+        for c in 0..SMALL {
+            assert!(
+                stats[&id(&format!("small{c:03}"))].value_counts.is_some(),
+                "a table no larger than the sketch is always kept"
+            );
+        }
+
+        assert_eq!(ScalarStatsAgg::from_batches_par(&schema, &[&whole]), stats);
+
+        // Folded from halves, as a merge folds its batches, then fitted.
+        let mut folded = ScalarStatsAgg::from_batches(&schema, &[&batch(0..DISTINCT / 2)]);
+        ScalarStatsAgg::merge(
+            &mut folded,
+            &ScalarStatsAgg::from_batches(&schema, &[&batch(DISTINCT / 2..DISTINCT)]),
         );
+        ScalarStatsAgg::fit_value_tables(&mut folded);
+        assert_eq!(folded, stats);
 
-        // 200 values over 210 rows: nearly all seen once.
-        let few_repeat: ArrayRef =
-            Arc::new(Int64Array::from_iter_values((0..210).map(|i| i % DISTINCT)));
-        let few_repeat = ScalarStatsAgg::from_column(&few_repeat).expect("int stats");
-        assert!(few_repeat.value_counts.is_none(), "one row in 21 repeats");
-
-        let long_text: ArrayRef = Arc::new(StringArray::from_iter_values(
-            (0..40).map(|i| format!("{{\"key\": {i}, \"name\": \"item {i}\"}}")),
-        ));
-        let long_text = ScalarStatsAgg::from_column(&long_text).expect("utf8 stats");
-        assert!(
-            long_text.value_counts.is_none(),
-            "forty distinct documents outweigh the sketch"
-        );
-
-        let few: ArrayRef = Arc::new(Int64Array::from_iter_values(0..40));
-        let few = ScalarStatsAgg::from_column(&few).expect("int stats");
-        assert_eq!(
-            few.value_counts
-                .expect("forty integers fit the sketch's bytes")
-                .entries()
-                .len(),
-            40
-        );
+        // One column alone keeps its table: its values all differ, as a
+        // small commit's ids do.
+        let alone = ScalarStatsAgg::from_column(&column(0, 0..DISTINCT)).expect("int stats");
+        assert!(alone.value_counts.is_some());
+        assert!(alone.hll.is_none());
     }
 
     #[test]

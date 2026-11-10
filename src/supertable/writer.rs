@@ -5028,12 +5028,16 @@ pub(super) fn prepare_superfile(
 pub(super) fn prepare_superfile_named(
     inner: &SupertableInner,
     manifest: &ManifestSnapshot,
-    shard: ShardOutput,
+    mut shard: ShardOutput,
     stem: Option<&str>,
 ) -> Result<Option<PreparedSuperfile>, BuildError> {
     if shard.n_docs == 0 {
         return Ok(None);
     }
+    // A merge folds its statistics batch by batch, and the tables grow as
+    // they fold: hold the superfile's tables to their budget, as a build
+    // from rows does as it counts them.
+    ScalarStatsAgg::fit_value_tables(&mut shard.scalar_stats);
 
     let uri = SuperfileUri::new_v4();
 
