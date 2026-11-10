@@ -1525,14 +1525,16 @@ impl SupertableProvider {
         let total_rows: u64 = entries.iter().map(|e| e.n_docs).sum();
         let now = Instant::now();
 
-        // Tombstone view: resolved-from-cache only (this path must be
-        // sync and I/O-free). A missing/stale view degrades to
-        // Inexact, never blocks.
+        // Tombstone view: the deleted rows this provider reads (see
+        // [`Self::deleted_rows`]), so a statement reading each superfile's
+        // once counts the rows its own scan and statistics leave out, not
+        // a newer delete's. The scan prefetched them, so these are cache
+        // reads. A view that can't be read degrades to Inexact.
         let mut deleted: u64 = 0;
         let mut views_resolved = true;
-        if let Some(cache) = self.tombstone_cache.as_ref() {
+        if self.tombstone_cache.is_some() {
             for entry in entries {
-                match cache.bitmap_for(entry.superfile_id, now) {
+                match self.deleted_rows(entry.superfile_id, now) {
                     Ok(bitmap) => deleted += bitmap.len(),
                     Err(_) => {
                         views_resolved = false;
@@ -4224,6 +4226,47 @@ mod tests {
     /// derived from it: a delete committed later in the call is not seen, so
     /// the counts one call makes agree with each other. A plain provider
     /// asks the cache each time and sees it.
+    /// A scan's statistics count the deleted rows of the call's own read:
+    /// a delete committed after a statement read a superfile's deletes is
+    /// left out of the row count its residual scan reports as exact, as it
+    /// is left out of the statistics the statement answered from.
+    #[test]
+    fn statistics_count_the_deleted_rows_the_call_read() {
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let st =
+            Supertable::create(default_supertable_options().with_storage(storage)).expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&build_title_batch(&["alpha", "bravo", "charlie"]))
+            .expect("append");
+        w.commit().expect("commit");
+
+        let provider = provider_of(&st);
+        let entries = provider.manifest().superfiles.clone();
+        let once = provider.reading_tombstones_once();
+        let residual = once.restricted_to(HashSet::new());
+        assert_eq!(
+            once.tombstone_state(&entries[0]),
+            TombstoneState::Clean,
+            "the statement reads the superfile clean"
+        );
+
+        w.delete(col("title").eq(lit("bravo"))).expect("delete");
+        w.commit().expect("commit the delete");
+        let all = |_: &str| true;
+        assert_eq!(
+            provider.statistics_for(&entries, &all).num_rows,
+            Precision::Exact(2),
+            "a fresh read sees the delete"
+        );
+        assert_eq!(
+            residual.statistics_for(&entries, &all).num_rows,
+            Precision::Exact(3),
+            "the statement's own scan counts what the statement read"
+        );
+    }
+
     #[test]
     fn a_call_reading_tombstones_once_sees_one_set_of_deletes() {
         let dir = TempDir::new().expect("tempdir");
