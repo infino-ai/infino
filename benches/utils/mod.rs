@@ -43,6 +43,7 @@ pub mod null_prune;
 pub mod recall_while_ingest;
 pub mod scale;
 pub mod sql_diag;
+pub mod stats_deletes;
 pub mod supertable_update;
 pub mod tombstone_overhead;
 pub mod unified_object_store;

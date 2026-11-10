@@ -19,6 +19,7 @@ mod ranking_under_mutation;
 mod score_tolerance;
 pub mod skip_pruning;
 mod stats_fold;
+mod stats_with_deletes;
 mod stored_fields;
 mod superfiles_in_flight;
 mod term_index_off;

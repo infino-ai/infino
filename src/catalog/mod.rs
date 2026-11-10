@@ -5452,8 +5452,9 @@ mod tests {
         assert_eq!(single::<Int64Array>(&ranged, 0).value(0), 4);
     }
 
-    /// A grouped count filtered to the grouping column's non-null values is answered from the
-    /// value counts even though the column holds nulls; unfiltered, the null group needs the scan.
+    /// A grouped count is answered from the value counts even though the column holds nulls:
+    /// filtered to the non-null values, from the counts alone; unfiltered, with the null group
+    /// counted from the null counts.
     #[test]
     fn query_sql_answers_not_null_grouped_counts_from_value_counts() {
         let conn = connect("memory://").expect("connect");
@@ -5474,10 +5475,19 @@ mod tests {
         assert!(!scans(&plan), "answered from value counts, no scan");
 
         let whole = "SELECT title, count(*) FROM fares GROUP BY title";
+        assert_eq!(
+            nullable_grouped_counts(&conn.query_sql(whole).expect("grouped")),
+            vec![
+                (None, 2),
+                (Some("fhv".to_string()), 1),
+                (Some("green".to_string()), 1),
+                (Some("yellow".to_string()), 2)
+            ]
+        );
         let plan = conn
             .query_sql(&format!("EXPLAIN {whole}"))
             .expect("explain");
-        assert!(scans(&plan), "the null group is not in the value counts");
+        assert!(!scans(&plan), "the null group comes from the null counts");
     }
 
     /// `(group, count)` rows of a grouped count whose group column may be null, sorted.

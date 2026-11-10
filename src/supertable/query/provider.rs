@@ -402,6 +402,10 @@ pub(crate) struct SupertableProvider {
     /// rewrite's idempotency guard: a restricted provider is never
     /// rewritten again.
     segment_filter: Option<HashSet<Uuid>>,
+    /// What the scan of a restricted provider stands for, shown on its node
+    /// in `EXPLAIN`: how many superfiles statistics answered and why the
+    /// scanned ones were not. Set only by the covered/residual rewrite.
+    scan_note: Option<Arc<str>>,
     /// Query-independent scan setup, filled lazily per superfile. Residual
     /// providers share this cache with their parent because both pin the same
     /// manifest and immutable files.
@@ -441,6 +445,18 @@ pub(crate) struct CountedRange {
     pub(crate) kind: KeyKind,
     pub(crate) lo: u64,
     pub(crate) hi: u64,
+}
+
+/// A superfile's deleted rows, as [`SupertableProvider::tombstone_state`]
+/// reads them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TombstoneState {
+    /// No row is deleted.
+    Clean,
+    /// Some row is deleted.
+    Deleted,
+    /// The deleted rows could not be read.
+    Unknown,
 }
 
 /// What [`SupertableProvider::top_k`] carries: the sort column, its
@@ -515,6 +531,7 @@ impl SupertableProvider {
             tombstones_read: None,
             store_url: unique_store_url(),
             segment_filter: None,
+            scan_note: None,
             prepared_scan_files: Arc::new(DashMap::new()),
             scan_store: Arc::new(SuperfileObjectStore::new()),
             scan_footers: Arc::new(DashMap::new()),
@@ -545,6 +562,13 @@ impl SupertableProvider {
             count_range: None,
             ..self.sibling()
         }
+    }
+
+    /// This provider with `note` shown on its scan's node in `EXPLAIN` (see
+    /// [`Self::scan_note`]).
+    pub(crate) fn with_scan_note(mut self, note: String) -> Self {
+        self.scan_note = Some(Arc::from(note));
+        self
     }
 
     /// Clone of this provider for a scan that feeds `ORDER BY hint.column
@@ -649,6 +673,7 @@ impl SupertableProvider {
             tombstones_read: self.tombstones_read.clone(),
             store_url: unique_store_url(),
             segment_filter: self.segment_filter.clone(),
+            scan_note: self.scan_note.clone(),
             prepared_scan_files: Arc::clone(&self.prepared_scan_files),
             scan_store: Arc::clone(&self.scan_store),
             scan_footers: Arc::clone(&self.scan_footers),
@@ -670,16 +695,15 @@ impl SupertableProvider {
         &self.manifest
     }
 
-    /// Whether `entry` currently has a clean (empty, resolvable from
-    /// cache) tombstone view — the precondition for answering any part
-    /// of an aggregate from its manifest statistics.
-    pub(crate) fn entry_is_clean(&self, entry: &SuperfileEntry) -> bool {
-        match self.tombstone_cache.as_ref() {
-            None => true,
-            Some(cache) => cache
-                .bitmap_for(entry.superfile_id, Instant::now())
-                .map(|bitmap| bitmap.is_empty())
-                .unwrap_or(false),
+    /// `entry`'s deleted rows as this provider reads them (see
+    /// [`Self::deleted_rows`]): none, some, or unknown when they could not
+    /// be read. Only a clean superfile's statistics describe its live rows
+    /// as stored.
+    pub(crate) fn tombstone_state(&self, entry: &SuperfileEntry) -> TombstoneState {
+        match self.deleted_rows(entry.superfile_id, Instant::now()) {
+            Ok(rows) if rows.is_empty() => TombstoneState::Clean,
+            Ok(_) => TombstoneState::Deleted,
+            Err(_) => TombstoneState::Unknown,
         }
     }
 
@@ -2397,11 +2421,12 @@ impl TableProvider for SupertableProvider {
         let scan = DataSourceExec::from_data_source(config);
         let meter = |scan: Arc<dyn ExecutionPlan>| {
             let op_stats = self.scan_store.op_stats();
-            if filters.is_empty() {
+            let meter = if filters.is_empty() {
                 MeteredExec::new(scan, op_stats)
             } else {
                 MeteredExec::without_limit_pushdown(scan, op_stats)
-            }
+            };
+            meter.with_note(self.scan_note.clone())
         };
         let parquet: Arc<dyn ExecutionPlan> = Arc::new(
             meter(scan)
@@ -4267,12 +4292,12 @@ mod tests {
     }
 
     #[test]
-    fn entry_is_clean_true_without_tombstone_overlay() {
+    fn tombstone_state_clean_without_tombstone_overlay() {
         let (provider, _rt) = provider_over_two_superfiles();
         // In-memory tables carry no tombstone overlay, so every entry is
         // trivially clean.
         for entry in provider.manifest().superfiles.iter() {
-            assert!(provider.entry_is_clean(entry));
+            assert_eq!(provider.tombstone_state(entry), TombstoneState::Clean);
         }
     }
 

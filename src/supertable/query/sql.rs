@@ -90,7 +90,8 @@ use crate::{
         manifest::ManifestSnapshot,
         query::{
             covered_agg::{
-                CoveredAggregateRewrite, load_unfiltered_aggregate_inputs, value_counts_nulls,
+                CoveredAggregateRewrite, load_unfiltered_aggregate_inputs,
+                value_counts_from_statistics,
             },
             exec::{
                 common::collect_plan_metered, fts_exec::register_bm25,
@@ -441,17 +442,14 @@ impl SupertableReader {
             self.block_on(cache.prefetch(&ids, Instant::now()));
         }
         let provider = op_stats::suppressed(|| self.sql_provider());
-        let Some(Some(nulls)) = value_counts_nulls(&provider, column) else {
-            return Ok(None);
-        };
-        let Some(counts) = provider.exact_value_counts(column) else {
+        let Some((counts, nulls)) = value_counts_from_statistics(&provider, column) else {
             return Ok(None);
         };
         let value_type = schema.field(0).data_type();
-        let mut values = Vec::with_capacity(counts.entries().len() + 1);
-        let mut tallies = Vec::with_capacity(counts.entries().len() + 1);
+        let mut values = Vec::with_capacity(counts.len() + 1);
+        let mut tallies = Vec::with_capacity(counts.len() + 1);
         let null_group = (nulls > 0).then_some((ScalarValue::Null, nulls));
-        for (value, count) in counts.entries().iter().chain(null_group.as_ref()) {
+        for (value, count) in counts.iter().chain(null_group.as_ref()) {
             let Ok(count) = i64::try_from(*count) else {
                 return Ok(None);
             };

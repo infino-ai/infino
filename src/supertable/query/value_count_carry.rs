@@ -85,6 +85,55 @@ fn file_counts(entry: &SuperfileEntry, column: FieldId) -> FileCounts {
     }
 }
 
+/// `total`, a column's counts over a set of superfiles, without the counts
+/// `files` among them recorded: the counts of the rest of the set. `None`
+/// when one of `files` holds values it recorded no counts of, or recorded
+/// more of a value than `total` holds, which a sum over a set holding it
+/// never does. A value whose count reaches zero is left out.
+pub(crate) fn counts_without(
+    total: &ScalarValueCounts,
+    files: &[Arc<SuperfileEntry>],
+    column: FieldId,
+) -> Option<HashMap<ScalarValue, u64>> {
+    let mut left: HashMap<ScalarValue, u64> = total.entries().iter().cloned().collect();
+    for entry in files {
+        let counts = match file_counts(entry, column) {
+            FileCounts::NoValues => continue,
+            FileCounts::Unrecorded => return None,
+            FileCounts::Values(counts) => counts,
+        };
+        for (value, count) in counts.entries() {
+            let held = left.get_mut(value)?;
+            *held = held.checked_sub(*count)?;
+            if *held == 0 {
+                left.remove(value);
+            }
+        }
+    }
+    Some(left)
+}
+
+/// Column `column`'s counts over `files`, added up. `None` when one of them
+/// holds values it recorded no counts of, or they hold more than
+/// [`MAX_EXACT_VALUE_COUNTS`] distinct values together.
+pub(crate) fn counts_of(
+    files: &[Arc<SuperfileEntry>],
+    column: FieldId,
+) -> Option<HashMap<ScalarValue, u64>> {
+    let mut sum = CarriedColumn {
+        data_type: DataType::Null,
+        files: HashMap::new(),
+        sum: Sum::Counts(HashMap::new()),
+    };
+    for entry in files {
+        sum.add(entry, column);
+    }
+    match sum.sum {
+        Sum::Counts(counts) => Some(counts),
+        Sum::Unknown => None,
+    }
+}
+
 impl ValueCountCarry {
     /// Column `column`'s exact value counts over `files`, read as
     /// `data_type`: the carried sum brought to `files` by adding the
