@@ -1137,7 +1137,6 @@ impl FoldBudget {
         ranges: usize,
         local_milli: u64,
     ) -> bool {
-        let slices: usize = layers.iter().map(|layer| layer.slices.len()).sum();
         let per_slice = local_per_slice_milli(local_milli);
         let local = layers
             .iter()
@@ -1147,8 +1146,10 @@ impl FoldBudget {
             / THOUSANDTHS;
         local > self.cache_bytes
             && build::one_mark_per_slice(
-                slices,
-                layers.len(),
+                &layers
+                    .iter()
+                    .map(|layer| (layer.slices.len(), layer_bytes(layer)))
+                    .collect::<Vec<_>>(),
                 ranges,
                 build::ONE_MARK_SLICES_PER_RANGE,
             )
@@ -11515,14 +11516,27 @@ mod tests {
     /// space, would put every mark at the start.
     #[test]
     fn one_mark_per_slice_needs_slices_spread_over_each_layer() {
-        assert!(build::one_mark_per_slice(1200, 4, 4, 64));
+        let even = |layers: usize, slices: usize| vec![(slices, slices as u64 * 1000); layers];
+        assert!(build::one_mark_per_slice(&even(4, 300), 4, 64));
         assert!(
-            !build::one_mark_per_slice(300, 128, 4, 64),
-            "enough slices per range, but layers of about two slices for four ranges"
+            !build::one_mark_per_slice(&even(128, 2), 4, 64),
+            "enough slices per range, but layers of two slices for four ranges"
         );
         assert!(
-            !build::one_mark_per_slice(200, 2, 4, 64),
+            !build::one_mark_per_slice(&even(2, 100), 4, 64),
             "layers spread, but too few slices per range"
+        );
+        let mut one_fine = vec![(1, 600_000); 7];
+        one_fine.push((600, 600_000));
+        assert!(
+            !build::one_mark_per_slice(&one_fine, 4, 64),
+            "one fine layer can't spread seven one-slice layers' bytes"
+        );
+        let mut small_coarse = even(4, 300);
+        small_coarse.push((1, 1000));
+        assert!(
+            build::one_mark_per_slice(&small_coarse, 4, 64),
+            "a coarse layer of little of the bytes still cuts at one mark"
         );
     }
 
