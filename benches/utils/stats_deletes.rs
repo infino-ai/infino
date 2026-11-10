@@ -18,6 +18,11 @@
 //! versions as one more commit. Each stage is labeled with how many of the
 //! table's superfiles carry deletes, read from its manifest.
 //!
+//! A last stage replaces a quarter of the rows of some commits at once, then
+//! runs `optimize` with a target below every superfile's size, so each is
+//! already at target: what compaction reclaims of superfiles that are full
+//! shows in how many still carry deletes, and in the times after it.
+//!
 //! Invoked as `cargo bench -- stats-deletes`. Knobs:
 //! `INFINO_BENCH_STATS_DELETES_ROWS` (default 2 000 000),
 //! `INFINO_BENCH_STATS_DELETES_COLUMNS` (default 200),
@@ -36,7 +41,7 @@ use datafusion::{
     logical_expr::utils::disjunction,
     prelude::{col, lit},
 };
-use infino::{Connection, IndexSpec, connect};
+use infino::{CompactionSettings, Connection, IndexSpec, OptimizeOptions, connect};
 use rand::{RngExt, SeedableRng, rngs::StdRng};
 use tempfile::TempDir;
 
@@ -59,6 +64,14 @@ const FEW_EVERY: usize = 10;
 /// Commits the second stage updates, besides the first stage's: all but one
 /// in this many.
 const MOST_SKIP_EVERY: usize = 10;
+/// Commits the last stage replaces a quarter of: one in this many.
+const HEAVY_EVERY: usize = 5;
+/// Of a commit, the share the last stage's updates replace: one row in
+/// this many.
+const HEAVY_SHARE: usize = 4;
+/// The compaction target of the last stage's optimize, in MiB: below
+/// every superfile's size.
+const OPTIMIZE_TARGET_MB: u64 = 1;
 /// Distinct values of a low-cardinality column.
 const LOW_CARDINALITY: i64 = 12;
 /// The values of an integer of many values.
@@ -214,7 +227,7 @@ fn time(uri: &str, iters: usize, run: impl Fn(&Connection)) -> (Duration, Durati
     (first, percentile(&mut warm, P50))
 }
 
-/// Replace a run of [`ROWS_PER_UPDATE`] rows of each commit `commits`
+/// Replace a run of `run_rows` rows of each commit `commits`
 /// names: delete them, in one statement, then append their new versions as
 /// one more commit.
 fn update(
@@ -222,20 +235,21 @@ fn update(
     schema: &SchemaRef,
     columns: usize,
     commits: &[usize],
+    run_rows: usize,
     next_key: &mut i64,
     rng: &mut StdRng,
 ) {
     let table = conn.open_table(TABLE).expect("open");
     let runs = commits.iter().map(|&commit| {
         let start = (commit * ROWS_PER_COMMIT) as i64
-            + rng.random_range(0..(ROWS_PER_COMMIT - ROWS_PER_UPDATE)) as i64;
+            + rng.random_range(0..=(ROWS_PER_COMMIT - run_rows)) as i64;
         col("k")
             .gt_eq(lit(start))
-            .and(col("k").lt(lit(start + ROWS_PER_UPDATE as i64)))
+            .and(col("k").lt(lit(start + run_rows as i64)))
     });
     let runs = disjunction(runs.collect::<Vec<_>>()).expect("at least one run");
     table.delete(runs).expect("delete");
-    let keys: Vec<i64> = (0..commits.len() * ROWS_PER_UPDATE)
+    let keys: Vec<i64> = (0..commits.len() * run_rows)
         .map(|i| *next_key + i as i64)
         .collect();
     *next_key += keys.len() as i64;
@@ -249,8 +263,14 @@ fn superfile_counts(conn: &Connection) -> (usize, usize) {
     let table = conn.open_table(TABLE).expect("open");
     let reader = table.local_handle().reader().expect("reader");
     let manifest = reader.manifest();
-    let with_deletes = manifest.get_tombstone_seqs().map_or(0, |seqs| seqs.len());
-    (manifest.get_all_superfiles().len(), with_deletes)
+    let listed = manifest.get_all_superfiles();
+    let with_deletes = manifest.get_tombstone_seqs().map_or(0, |seqs| {
+        listed
+            .iter()
+            .filter(|entry| seqs.contains_key(&entry.superfile_id))
+            .count()
+    });
+    (listed.len(), with_deletes)
 }
 
 /// A stage's label: its superfiles with deletes, of all.
@@ -340,15 +360,62 @@ pub fn run() {
         "[stats-deletes] updating {} of {commits} commits...",
         few.len()
     );
-    update(&conn, &schema, columns, &few, &mut next_key, &mut rng);
+    update(
+        &conn,
+        &schema,
+        columns,
+        &few,
+        ROWS_PER_UPDATE,
+        &mut next_key,
+        &mut rng,
+    );
     report_rows.extend(measure(&uri, columns, iters, &stage(&conn)));
 
     let most: Vec<usize> = (0..commits)
         .filter(|f| f % FEW_EVERY != 0 && f % MOST_SKIP_EVERY != 1)
         .collect();
     eprintln!("[stats-deletes] updating {} more commits...", most.len());
-    update(&conn, &schema, columns, &most, &mut next_key, &mut rng);
+    update(
+        &conn,
+        &schema,
+        columns,
+        &most,
+        ROWS_PER_UPDATE,
+        &mut next_key,
+        &mut rng,
+    );
     report_rows.extend(measure(&uri, columns, iters, &stage(&conn)));
+
+    let heavy: Vec<usize> = (0..commits).filter(|f| f % HEAVY_EVERY == 0).collect();
+    eprintln!(
+        "[stats-deletes] replacing a quarter of {} commits, then optimizing...",
+        heavy.len()
+    );
+    update(
+        &conn,
+        &schema,
+        columns,
+        &heavy,
+        ROWS_PER_COMMIT / HEAVY_SHARE,
+        &mut next_key,
+        &mut rng,
+    );
+    eprintln!("[stats-deletes] before optimize: {}", stage(&conn));
+    let optimize = OptimizeOptions::compact(CompactionSettings {
+        target_superfile_size_mb: OPTIMIZE_TARGET_MB,
+        ..CompactionSettings::default()
+    });
+    let started = Instant::now();
+    conn.open_table(TABLE)
+        .expect("open")
+        .optimize(&optimize)
+        .expect("optimize");
+    eprintln!(
+        "[stats-deletes] optimize took {}",
+        fmt_time(started.elapsed().as_secs_f64() * NS_PER_SEC)
+    );
+    let after = format!("optimized: {}", stage(&conn));
+    report_rows.extend(measure(&uri, columns, iters, &after));
 
     let mut report = Report::load("stats-deletes");
     report.emit(&Section {
