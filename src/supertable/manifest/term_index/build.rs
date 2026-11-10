@@ -2490,7 +2490,7 @@ fn run_ranges(
                     scope.spawn(move |_| {
                         // A failed range ends the merge: ranges still queued
                         // do no work, so a failed fold stops early.
-                        if failed.load(AtomicOrdering::Acquire) {
+                        if failed.load(AtomicOrdering::Relaxed) {
                             return;
                         }
                         let _span = detail_span!(
@@ -2502,7 +2502,7 @@ fn run_ranges(
                         .entered();
                         let part = one(start.as_deref(), end.as_deref());
                         if part.is_err() {
-                            failed.store(true, AtomicOrdering::Release);
+                            failed.store(true, AtomicOrdering::Relaxed);
                         }
                         *slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(part);
                     });
