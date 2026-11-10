@@ -85,6 +85,7 @@ use std::{
 
 use arrow::record_batch::RecordBatch;
 use arrow_array::{Array, LargeStringArray};
+use datafusion::logical_expr::Expr;
 use futures::future::join;
 use roaring::RoaringBitmap;
 use tokio::sync::OnceCell;
@@ -145,6 +146,7 @@ use crate::{
             exec::common::{
                 hit_output_schema, resolve_hits_named, take_file_columns, take_rows_byte_source,
             },
+            provider::prune_leaves_for_filters,
             prune::{PruneLeaf, select_superfiles},
             tier,
         },
@@ -2587,6 +2589,7 @@ impl SupertableReader {
         column: &str,
         query: &str,
         mode: BoolMode,
+        filters: &[Expr],
     ) -> Result<
         (
             UnrankedMatchSet,
@@ -2670,14 +2673,19 @@ impl SupertableReader {
                 mode,
             },
         };
-        let prune_leaf =
-            presence_leaf(column, &match_set.terms, &match_set.phrases, match_set.mode);
-        let kept = select_fts_superfiles(
-            self.manifest().as_ref(),
-            slice::from_ref(&prune_leaf),
+        let manifest = self.manifest();
+        let mut leaves = vec![presence_leaf(
             column,
-        )
-        .await?;
+            &match_set.terms,
+            &match_set.phrases,
+            match_set.mode,
+        )];
+        leaves.extend(prune_leaves_for_filters(
+            manifest,
+            &manifest.scalar_schema(),
+            filters,
+        ));
+        let kept = select_fts_superfiles(manifest.as_ref(), &leaves, column).await?;
         Ok((match_set, negs, kept))
     }
 
@@ -2703,7 +2711,8 @@ impl SupertableReader {
         query: &str,
         mode: BoolMode,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
-        self.token_match_hits_async(column, query, mode, true).await
+        self.token_match_hits_async(column, query, mode, true, &[])
+            .await
     }
 
     /// [`Self::token_match_async`] with a say over whether every hit
@@ -2716,14 +2725,17 @@ impl SupertableReader {
     /// column, and that read is what the skip saves. Hits then carry a
     /// stable id only where the fan-out tagged one, and must not be asked
     /// for `_id`.
+    ///
+    /// Superfiles whose statistics cannot pass `filters` are not walked.
     pub(crate) async fn token_match_hits_async(
         &self,
         column: &str,
         query: &str,
         mode: BoolMode,
         stamp_stable_ids: bool,
+        filters: &[Expr],
     ) -> Result<Vec<SuperfileHit>, QueryError> {
-        let Some((units, kernel)) = self.match_kernel(column, query, mode).await? else {
+        let Some((units, kernel)) = self.match_kernel(column, query, mode, filters).await? else {
             return Ok(Vec::new());
         };
         let phases = self.phase_spans();
@@ -2768,14 +2780,17 @@ impl SupertableReader {
     /// pool ([`build_work_units`]), each walked and taken on its own and out
     /// as its own batch: a table compacted into one file would otherwise run
     /// the whole match on one thread.
+    ///
+    /// `filters` prune superfiles as in [`Self::token_match_hits_async`].
     pub(crate) async fn token_match_columns_async(
         &self,
         column: &str,
         query: &str,
         mode: BoolMode,
         names: &[&str],
+        filters: &[Expr],
     ) -> Result<Vec<RecordBatch>, QueryError> {
-        let Some((units, kernel)) = self.match_kernel(column, query, mode).await? else {
+        let Some((units, kernel)) = self.match_kernel(column, query, mode, filters).await? else {
             return Ok(Vec::new());
         };
         let reader_pool = Arc::clone(&self.manifest().options.reader_pool);
@@ -2882,7 +2897,7 @@ impl SupertableReader {
         mode: BoolMode,
         scope: &CandidateScope,
     ) -> Result<CandidateScope, QueryError> {
-        let Some((units, kernel)) = self.match_kernel(column, query, mode).await? else {
+        let Some((units, kernel)) = self.match_kernel(column, query, mode, &[]).await? else {
             return Ok(CandidateScope::empty());
         };
         let admitted: HashSet<SuperfileUri> =
@@ -2942,12 +2957,15 @@ impl SupertableReader {
 
     /// What every unranked match walk starts from: the superfiles the
     /// query's terms can match (`None` when there are none) and the kernel
-    /// that finds the matching rows in any one of them.
+    /// that finds the matching rows in any one of them. Superfiles whose
+    /// statistics cannot pass `filters` (a pushed-down `WHERE`) are dropped
+    /// in the same prune.
     async fn match_kernel(
         &self,
         column: &str,
         query: &str,
         mode: BoolMode,
+        filters: &[Expr],
     ) -> Result<Option<(Vec<(Arc<SuperfileEntry>, Uuid)>, Arc<MatchKernel>)>, QueryError> {
         let phases = self.phase_spans();
         let select_span = trace::phase(phases, || {
@@ -2958,7 +2976,7 @@ impl SupertableReader {
             )
         });
         let (match_set, negatives, kept) = self
-            .parse_and_prune(column, query, mode)
+            .parse_and_prune(column, query, mode, filters)
             .instrument(select_span.clone())
             .await?;
         select_span.record("survivors", kept.len());
@@ -3095,7 +3113,7 @@ impl SupertableReader {
         query: &str,
         mode: BoolMode,
     ) -> Result<u64, QueryError> {
-        let (match_set, negatives, kept) = self.parse_and_prune(column, query, mode).await?;
+        let (match_set, negatives, kept) = self.parse_and_prune(column, query, mode, &[]).await?;
         if kept.is_empty() {
             return Ok(0);
         }
@@ -3278,12 +3296,15 @@ impl SupertableReader {
     /// **no scoring**. See [`crate::superfile::SuperfileReader::exact_match`]
     /// for the per-superfile two-pass (token-AND prune + raw verify).
     ///
+    /// Superfiles whose statistics cannot pass `filters` are not read.
+    ///
     /// `pub(crate)` async kernel; the public surface is the sync
     /// [`SupertableReader::exact_match`].
     pub(crate) async fn exact_match_async(
         &self,
         column: &str,
         value: &str,
+        filters: &[Expr],
     ) -> Result<Vec<SuperfileHit>, QueryError> {
         let manifest = self.manifest();
         // `exact_match` prunes through the column's own term dictionary, so
@@ -3297,7 +3318,7 @@ impl SupertableReader {
         let term_strings: Vec<String> = tokenizer.tokenize(value).collect();
         // Tokens prune superfiles via the term bloom (AND); a token-less
         // value (e.g. punctuation only) can't prune, so keep all.
-        let leaves = if term_strings.is_empty() {
+        let mut leaves = if term_strings.is_empty() {
             Vec::new()
         } else {
             vec![PruneLeaf::TermPresence {
@@ -3306,6 +3327,11 @@ impl SupertableReader {
                 mode: BoolMode::And,
             }]
         };
+        leaves.extend(prune_leaves_for_filters(
+            manifest,
+            &manifest.scalar_schema(),
+            filters,
+        ));
         let phases = self.phase_spans();
         let select_span = trace::phase(phases, || {
             detail_span!(
@@ -3620,7 +3646,7 @@ impl SupertableReader {
     /// hits are **unranked** (`score` is `0.0`).
     pub fn exact_match(&self, column: &str, value: &str) -> Result<Vec<SuperfileHit>, QueryError> {
         let _foreground = ForegroundQueryGuard::enter();
-        self.block_on(self.exact_match_async(column, value))
+        self.block_on(self.exact_match_async(column, value, &[]))
     }
 }
 
