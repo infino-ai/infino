@@ -6450,6 +6450,55 @@ mod tests {
         }
     }
 
+    /// A catalog search call with the wrong number of arguments is refused
+    /// in the form it was written, the leading table counted, with the
+    /// table's indexed columns named. Left to the single-table function, a
+    /// `hybrid_search` that left out its vector column was told "expects 5
+    /// arguments (text_col, ...), got 4", which reads as if the table were
+    /// the mistake and names nothing to fix it with.
+    #[test]
+    fn a_catalog_search_with_the_wrong_count_names_the_table_form_and_its_columns() {
+        let conn = conn_with_vector_table();
+        let v = one_hot_csv(0);
+        let cases = [
+            (
+                format!("SELECT * FROM hybrid_search('vecs', 'title', 'rust', '{v}', 3)"),
+                "hybrid_search expects 6 arguments (table, text_col, q_text, vec_col, q_vec, k), got 5",
+            ),
+            (
+                "SELECT * FROM vector_search('vecs', 'emb', 3)".to_string(),
+                "vector_search expects 4 arguments (table, column, query_vector, k), got 3",
+            ),
+            (
+                "SELECT * FROM bm25_search('vecs', 'title')".to_string(),
+                "bm25_search expects 4 or 5 arguments (table, column, query, k[, mode]), got 2",
+            ),
+            (
+                "SELECT * FROM bm25_search_prefix('vecs', 'title', 'rus')".to_string(),
+                "bm25_search_prefix expects 4 arguments (table, column, prefix, k), got 3",
+            ),
+            (
+                "SELECT * FROM token_match('vecs', 'title')".to_string(),
+                "token_match expects 3 or 4 arguments (table, column, query[, mode]), got 2",
+            ),
+            (
+                "SELECT * FROM exact_match('vecs', 'title', 'rust', 'extra')".to_string(),
+                "exact_match expects 3 arguments (table, column, value), got 4",
+            ),
+        ];
+        for (sql, want) in cases {
+            let msg = conn
+                .query_sql(&sql)
+                .expect_err("a wrong argument count must be refused")
+                .to_string();
+            assert!(msg.contains(want), "{sql}: got {msg}");
+            assert!(
+                msg.contains("table \"vecs\" has full-text columns: title; vector columns: emb"),
+                "{sql}: the refusal names the table's indexed columns, got {msg}"
+            );
+        }
+    }
+
     /// The remaining catalog-level search TVFs — `bm25_search_prefix`,
     /// `vector_search`, and `hybrid_search` — resolve their leading
     /// table-name argument and forward the rest to the table's search

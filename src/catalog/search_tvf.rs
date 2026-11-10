@@ -42,11 +42,17 @@ use crate::{
         error::QueryError,
         handle::SupertableReader,
         query::exec::{
-            common::arg_to_string,
-            fts_exec::{BM25_PREFIX_UDTF, BM25_SEARCH_UDTF, Bm25PrefixFunc, Bm25SearchFunc},
-            hybrid_exec::{HYBRID_SEARCH_UDTF, HybridSearchFunc},
-            match_exec::{EXACT_MATCH_UDTF, ExactMatchFunc, TOKEN_MATCH_UDTF, TokenMatchFunc},
-            vector_exec::{VECTOR_SEARCH_UDTF, VectorSearchFunc},
+            common::{Arity, arg_to_string},
+            fts_exec::{
+                BM25_PREFIX_SEARCH_ARITY, BM25_PREFIX_UDTF, BM25_SEARCH_ARITY, BM25_SEARCH_UDTF,
+                Bm25PrefixFunc, Bm25SearchFunc,
+            },
+            hybrid_exec::{HYBRID_SEARCH_ARITY, HYBRID_SEARCH_UDTF, HybridSearchFunc},
+            match_exec::{
+                EXACT_MATCH_ARITY, EXACT_MATCH_UDTF, ExactMatchFunc, TOKEN_MATCH_ARITY,
+                TOKEN_MATCH_UDTF, TokenMatchFunc,
+            },
+            vector_exec::{VECTOR_SEARCH_ARITY, VECTOR_SEARCH_UDTF, VectorSearchFunc},
         },
         schema::sql_schema,
     },
@@ -163,6 +169,54 @@ impl TableResolver {
         let name = arg_to_string(first, &format!("{fn_name} table"))?;
         let resolved = self.resolve(&name)?;
         Ok((resolved, &args[1..]))
+    }
+
+    /// [`split_leading`](Self::split_leading), then the remaining arguments
+    /// checked against `arity` in the form the caller wrote: with the table
+    /// counted. Left to the single-table function, the count would leave the
+    /// table out ("expects 5 arguments (text_col, ...), got 4" for a call
+    /// that passed five), which reads as if the leading table were the
+    /// mistake. The refusal names the table's indexed columns, the
+    /// arguments a wrong count most often left out.
+    fn split_checked<'a>(
+        &self,
+        args: &'a [Expr],
+        fn_name: &str,
+        arity: Arity,
+    ) -> DfResult<(ResolvedTable, &'a [Expr])> {
+        let (table, rest) = self.split_leading(args, fn_name)?;
+        if arity.takes(rest.len()) {
+            return Ok((table, rest));
+        }
+        let manifest = table.reader.manifest();
+        let fts: Vec<String> = manifest
+            .fts_configs()
+            .into_iter()
+            .map(|c| c.column)
+            .collect();
+        let vectors: Vec<String> = manifest
+            .vector_configs()
+            .into_iter()
+            .map(|c| c.column)
+            .collect();
+        let listed = |columns: &[String]| {
+            if columns.is_empty() {
+                "none".to_string()
+            } else {
+                columns.join(", ")
+            }
+        };
+        // `args[0]` is the table name `split_leading` just read.
+        let table_name = arg_to_string(&args[0], &format!("{fn_name} table"))?;
+        Err(DataFusionError::Plan(format!(
+            "{fn_name} expects {} arguments (table, {}), got {}; table {table_name:?} has \
+             full-text columns: {}; vector columns: {}",
+            arity.count(1),
+            arity.arguments,
+            args.len(),
+            listed(&fts),
+            listed(&vectors),
+        )))
     }
 }
 
@@ -283,7 +337,9 @@ struct Bm25SearchCatalogFunc {
 }
 impl TableFunctionImpl for Bm25SearchCatalogFunc {
     fn call_with_args(&self, args: TableFunctionArgs) -> DfResult<Arc<dyn TableProvider>> {
-        let (t, rest) = self.resolver.split_leading(args.exprs(), "bm25_search")?;
+        let (t, rest) =
+            self.resolver
+                .split_checked(args.exprs(), BM25_SEARCH_UDTF, BM25_SEARCH_ARITY)?;
 
         Bm25SearchFunc::new(t.reader, t.scalar_schema)
             .call_with_args(TableFunctionArgs::new(rest, args.session()))
@@ -296,9 +352,11 @@ struct Bm25PrefixCatalogFunc {
 }
 impl TableFunctionImpl for Bm25PrefixCatalogFunc {
     fn call_with_args(&self, args: TableFunctionArgs) -> DfResult<Arc<dyn TableProvider>> {
-        let (t, rest) = self
-            .resolver
-            .split_leading(args.exprs(), "bm25_search_prefix")?;
+        let (t, rest) = self.resolver.split_checked(
+            args.exprs(),
+            BM25_PREFIX_UDTF,
+            BM25_PREFIX_SEARCH_ARITY,
+        )?;
 
         Bm25PrefixFunc::new(t.reader, t.scalar_schema)
             .call_with_args(TableFunctionArgs::new(rest, args.session()))
@@ -311,7 +369,9 @@ struct VectorSearchCatalogFunc {
 }
 impl TableFunctionImpl for VectorSearchCatalogFunc {
     fn call_with_args(&self, args: TableFunctionArgs) -> DfResult<Arc<dyn TableProvider>> {
-        let (t, rest) = self.resolver.split_leading(args.exprs(), "vector_search")?;
+        let (t, rest) =
+            self.resolver
+                .split_checked(args.exprs(), VECTOR_SEARCH_UDTF, VECTOR_SEARCH_ARITY)?;
 
         VectorSearchFunc::new(t.reader, t.scalar_schema)
             .call_with_args(TableFunctionArgs::new(rest, args.session()))
@@ -324,7 +384,9 @@ struct HybridSearchCatalogFunc {
 }
 impl TableFunctionImpl for HybridSearchCatalogFunc {
     fn call_with_args(&self, args: TableFunctionArgs) -> DfResult<Arc<dyn TableProvider>> {
-        let (t, rest) = self.resolver.split_leading(args.exprs(), "hybrid_search")?;
+        let (t, rest) =
+            self.resolver
+                .split_checked(args.exprs(), HYBRID_SEARCH_UDTF, HYBRID_SEARCH_ARITY)?;
 
         HybridSearchFunc::new(t.reader, t.scalar_schema)
             .call_with_args(TableFunctionArgs::new(rest, args.session()))
@@ -337,7 +399,9 @@ struct TokenMatchCatalogFunc {
 }
 impl TableFunctionImpl for TokenMatchCatalogFunc {
     fn call_with_args(&self, args: TableFunctionArgs) -> DfResult<Arc<dyn TableProvider>> {
-        let (t, rest) = self.resolver.split_leading(args.exprs(), "token_match")?;
+        let (t, rest) =
+            self.resolver
+                .split_checked(args.exprs(), TOKEN_MATCH_UDTF, TOKEN_MATCH_ARITY)?;
 
         TokenMatchFunc::new(t.reader, t.scalar_schema)
             .call_with_args(TableFunctionArgs::new(rest, args.session()))
@@ -350,7 +414,9 @@ struct ExactMatchCatalogFunc {
 }
 impl TableFunctionImpl for ExactMatchCatalogFunc {
     fn call_with_args(&self, args: TableFunctionArgs) -> DfResult<Arc<dyn TableProvider>> {
-        let (t, rest) = self.resolver.split_leading(args.exprs(), "exact_match")?;
+        let (t, rest) =
+            self.resolver
+                .split_checked(args.exprs(), EXACT_MATCH_UDTF, EXACT_MATCH_ARITY)?;
 
         ExactMatchFunc::new(t.reader, t.scalar_schema)
             .call_with_args(TableFunctionArgs::new(rest, args.session()))
