@@ -2434,19 +2434,21 @@ async fn stream_sources(
                 })
                 .collect::<Result<_, _>>()?
         }
-        true => stream::iter(missing.into_iter().map(|tier| {
-            let storage = Arc::clone(storage);
-            async move {
-                storage
-                    .head(&tier_uri(&tier))
-                    .await
-                    .map(|meta| (tier, meta.size))
-                    .map_err(TermIndexError::Storage)
-            }
-        }))
-        .buffer_unordered(TIER_HEAD_CONCURRENCY)
-        .try_collect()
-        .await?,
+        true => {
+            stream::iter(missing.into_iter().map(|tier| {
+                let storage = Arc::clone(storage);
+                async move {
+                    storage
+                        .head(&tier_uri(&tier))
+                        .await
+                        .map(|meta| (tier, meta.size))
+                        .map_err(TermIndexError::Storage)
+                }
+            }))
+            .buffer_unordered(TIER_HEAD_CONCURRENCY)
+            .try_collect()
+            .await?
+        }
     };
     let lens = {
         let mut lens = tier_lens.lock().expect("tier lengths");
@@ -11392,7 +11394,10 @@ mod tests {
         faults.fail(FaultOp::Head, TIER_URI_FRAGMENT, usize::MAX);
         let faulty = Arc::clone(&faults) as Arc<dyn StorageProvider>;
         let tiers = 4 * TIER_HEAD_CONCURRENCY;
-        assert!(tiers <= CHECK_LIST_MIN_OBJECTS, "sized by HEADs, not a listing");
+        assert!(
+            tiers <= CHECK_LIST_MIN_OBJECTS,
+            "sized by HEADs, not a listing"
+        );
         let rt = Runtime::new().expect("runtime");
         let sized = rt.block_on(stream_sources(
             &faulty,
@@ -11574,7 +11579,13 @@ mod tests {
             cursors: usize::MAX,
             cache_bytes,
         };
-        assert!(budget(local - 1).streams(&layers, 4, 4, THOUSANDTHS, build::ONE_MARK_SLICES_PER_RANGE));
+        assert!(budget(local - 1).streams(
+            &layers,
+            4,
+            4,
+            THOUSANDTHS,
+            build::ONE_MARK_SLICES_PER_RANGE
+        ));
         assert!(
             !budget(local).streams(&layers, 4, 4, THOUSANDTHS, build::ONE_MARK_SLICES_PER_RANGE),
             "the cache holds it"
@@ -11600,10 +11611,22 @@ mod tests {
             ..budget(0)
         };
         assert!(
-            four_threads.streams(&layers, 4, 16, THOUSANDTHS, build::ONE_MARK_SLICES_PER_RANGE),
+            four_threads.streams(
+                &layers,
+                4,
+                16,
+                THOUSANDTHS,
+                build::ONE_MARK_SLICES_PER_RANGE
+            ),
             "cursors are counted per thread, not per key range"
         );
-        assert!(!four_threads.streams(&layers, 5, 16, THOUSANDTHS, build::ONE_MARK_SLICES_PER_RANGE));
+        assert!(!four_threads.streams(
+            &layers,
+            5,
+            16,
+            THOUSANDTHS,
+            build::ONE_MARK_SLICES_PER_RANGE
+        ));
     }
 
     /// Objects a fold reads in place count as room, so a run prefetched onto
