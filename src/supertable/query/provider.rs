@@ -971,6 +971,22 @@ impl SupertableProvider {
         RangeCounts::new(self.sibling(), buckets)
     }
 
+    /// Load every part of a manifest whose resident view is incomplete, and
+    /// warm the delete views of all its superfiles, so a covered aggregate
+    /// finds the whole table in memory when the plan is optimized.
+    pub(crate) async fn load_every_part(&self) -> Result<(), QueryError> {
+        if self.manifest.complete_flat_superfiles().is_some() {
+            return Ok(());
+        }
+        let entries = self
+            .manifest
+            .get_all_superfiles_loaded()
+            .await
+            .map_err(QueryError::ManifestLoad)?;
+        self.prefetch_tombstones(&entries, Instant::now()).await;
+        Ok(())
+    }
+
     /// Warm every one of `survivors`' tombstone bitmaps in one batched fetch,
     /// mirroring the bm25 / vector fan-out (see `SidecarCache::prefetch`), so
     /// each later `bitmap_for` resolves from cache.

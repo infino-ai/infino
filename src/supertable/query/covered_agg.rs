@@ -63,18 +63,22 @@ use arrow_array::ArrayRef;
 use arrow_schema::DataType;
 use datafusion::{
     catalog::TableProvider,
-    common::{ScalarValue, tree_node::Transformed},
+    common::{
+        ScalarValue,
+        tree_node::{Transformed, TreeNodeRecursion},
+    },
     datasource::{DefaultTableSource, provider_as_source},
     error::{DataFusionError, Result as DfResult},
     functions::core::expr_fn::{coalesce, greatest, least},
     functions_aggregate::expr_fn::{count, max, min, sum},
     logical_expr::{
-        Aggregate, Expr, Filter, LogicalPlan, LogicalPlanBuilder, Operator, TableScan, lit,
-        utils::split_conjunction,
+        Aggregate, Expr, Filter, LogicalPlan, LogicalPlanBuilder, Operator, TableScan, TableSource,
+        lit, utils::split_conjunction,
     },
     optimizer::{OptimizerConfig, OptimizerRule, optimizer::ApplyOrder},
     prelude::{cast, col, ident},
 };
+use futures::future::try_join_all;
 use uuid::Uuid;
 
 use crate::supertable::{
@@ -157,6 +161,33 @@ enum Class {
     Boundary,
 }
 
+/// Load every manifest part of each table an unfiltered, ungrouped aggregate
+/// in `plan` reads, subqueries included, so the rewrite below finds the
+/// whole table in memory and answers from statistics. That aggregate's scan
+/// would load every part anyway, so loading them before optimization adds no
+/// reads.
+pub(crate) async fn load_unfiltered_aggregate_inputs(plan: &LogicalPlan) -> Result<(), QueryError> {
+    let mut sources: Vec<Arc<dyn TableSource>> = Vec::new();
+    plan.apply_with_subqueries(|node| {
+        if let LogicalPlan::Aggregate(agg) = node
+            && agg.group_expr.is_empty()
+            && let Some(scan) = peel_unfiltered_scan(agg.input.as_ref())
+            && provider_of(scan).is_some_and(|provider| !provider.is_segment_restricted())
+        {
+            sources.push(Arc::clone(&scan.source));
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })
+    .map_err(QueryError::DataFusion)?;
+    try_join_all(sources.iter().filter_map(|source| {
+        let source = source.downcast_ref::<DefaultTableSource>()?;
+        let provider = source.table_provider.downcast_ref::<SupertableProvider>()?;
+        Some(provider.load_every_part())
+    }))
+    .await?;
+    Ok(())
+}
+
 fn try_rewrite(plan: &LogicalPlan) -> DfResult<Option<LogicalPlan>> {
     let LogicalPlan::Aggregate(agg) = plan else {
         return Ok(None);
@@ -187,10 +218,10 @@ fn try_rewrite(plan: &LogicalPlan) -> DfResult<Option<LogicalPlan>> {
         if provider.is_segment_restricted() {
             return Ok(None);
         }
-        let Some(superfiles) = provider.manifest().complete_flat_superfiles() else {
+        let manifest = provider.manifest();
+        let Some(superfiles) = manifest.resident_superfiles() else {
             return Ok(None);
         };
-        let manifest = provider.manifest();
         let (covered, boundary): (Vec<&Arc<SuperfileEntry>>, Vec<&Arc<SuperfileEntry>>) =
             superfiles.iter().partition(|entry| {
                 provider.entry_is_clean(entry) && has_required_stats(manifest, entry, &kinds)
