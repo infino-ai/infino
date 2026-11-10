@@ -62,7 +62,6 @@ use crate::{
     config::scratch_root,
     runtime_metrics::ingest::offset_window,
     superfile::{LazyByteSource, LazyByteSourceError, format::kv},
-    utils::nulls::concat_sharing_nulls,
 };
 
 /// Length of Parquet's trailing `PAR1` magic, in bytes.
@@ -928,11 +927,11 @@ pub(crate) struct BodyPlan {
 
 impl BodyPlan {
     /// The candidates written without a dictionary, for a body whose first
-    /// rows are `sample`.
+    /// rows are the batches of `sample`, in order.
     fn choose(
         &self,
         schema: &Arc<Schema>,
-        sample: &RecordBatch,
+        sample: &[RecordBatch],
     ) -> Result<Vec<String>, FooterError> {
         if self.dictionary_candidates.is_empty() {
             return Ok(Vec::new());
@@ -945,8 +944,8 @@ impl BodyPlan {
         ))
     }
 
-    /// Compressed bytes of each candidate column when `sample` is encoded,
-    /// with its dictionary and without.
+    /// Compressed bytes of each candidate column when the batches of
+    /// `sample` are encoded in order, with its dictionary and without.
     ///
     /// Each candidate is encoded on its own, once each way, by writers made
     /// for it alone ([`FieldWriters`]) and dropped as soon as its sizes are
@@ -955,11 +954,14 @@ impl BodyPlan {
     /// candidates are not encoded at all. A column's encode depends only on
     /// its own values, the writer settings and the slices it is written in,
     /// which are the body's, so its sizes are those of an encode of the
-    /// whole sample.
+    /// whole sample. The sample's batches are encoded as they are, slices
+    /// of the rows written, never joined into one: a joined sample would
+    /// copy a slot per cell of the body, null or not, in proportion to its
+    /// width, where encoding the slices copies nothing.
     fn measure(
         &self,
         schema: &Arc<Schema>,
-        sample: &RecordBatch,
+        sample: &[RecordBatch],
     ) -> Result<(ColumnSizes, ColumnSizes), FooterError> {
         let limits = self.page_size_limits();
         let props = |plain: &[String]| {
@@ -978,7 +980,10 @@ impl BodyPlan {
             FieldWriters::new(&parquet, schema, with),
             FieldWriters::new(&parquet, schema, without),
         );
-        let slices = byte_bounded_slices(sample, MAX_WRITE_BYTES);
+        let slices: Vec<RecordBatch> = sample
+            .iter()
+            .flat_map(|batch| byte_bounded_slices(batch, MAX_WRITE_BYTES))
+            .collect();
         let fields: Vec<usize> = self
             .dictionary_candidates
             .iter()
@@ -1009,18 +1014,6 @@ impl BodyPlan {
         Ok((dictionary, plain))
     }
 
-    /// Rows the choice is measured on: a row group, or on a body so wide
-    /// that a row group of it holds more than [`SAMPLE_CELLS`] cells, the
-    /// rows that hold that many, and never fewer than [`MIN_SAMPLE_ROWS`].
-    /// A sample is copied out of the rows it is taken from, so a fixed
-    /// count of rows would cost the copy in proportion to the width.
-    pub(crate) fn sample_rows(&self, schema: &Schema) -> usize {
-        let columns = schema.fields().len().max(1);
-        self.row_group_size
-            .min((SAMPLE_CELLS / columns).max(MIN_SAMPLE_ROWS))
-            .max(1)
-    }
-
     fn page_size_limits(&self) -> Vec<(&str, usize)> {
         self.column_page_size_limits
             .iter()
@@ -1028,13 +1021,6 @@ impl BodyPlan {
             .collect()
     }
 }
-
-/// Most cells the dictionary choice is measured on (see
-/// [`BodyPlan::sample_rows`]): a row group of up to 128 columns.
-const SAMPLE_CELLS: usize = 1 << 23;
-
-/// Fewest rows the dictionary choice is measured on, however wide the body.
-const MIN_SAMPLE_ROWS: usize = DEFAULT_WRITE_BATCH_SIZE;
 
 /// The `candidates`, sorted, whose plain encoding (`plain`) is smaller than
 /// with a dictionary (`dictionary`). A candidate either side did not
@@ -1057,9 +1043,8 @@ fn plain_where_smaller(
 }
 
 /// [`ParquetBodyEncoder`] whose dictionaries are chosen by a [`BodyPlan`]
-/// from the first rows written: it holds rows until it has the rows the
-/// choice is measured on ([`BodyPlan::sample_rows`]: a row group, fewer on
-/// a body thousands of columns wide), or rows that decode to
+/// from the first rows written: it holds rows until it has a row group's,
+/// the rows the choice is measured on, or rows that decode to
 /// [`HELD_GROUP_BYTES`], or the body ends; chooses; then writes them and
 /// streams the rest straight through.
 pub(crate) struct PlannedBodyEncoder {
@@ -1102,11 +1087,8 @@ impl PlannedBodyEncoder {
         self.held_rows += batch.num_rows();
         self.held_bytes += decoded_bytes(batch);
         self.held.push(batch.clone());
-        // The bytes bound holds whoever keeps the rows: the sample is
-        // copied out of them.
-        if self.held_rows >= self.plan.sample_rows(&self.schema)
-            || self.held_bytes >= HELD_GROUP_BYTES
-        {
+        // The bytes bound holds whoever keeps the rows.
+        if self.held_rows >= self.plan.row_group_size || self.held_bytes >= HELD_GROUP_BYTES {
             self.start()?;
         }
         Ok(())
@@ -1115,24 +1097,21 @@ impl PlannedBodyEncoder {
     /// Choose the dictionaries from the held rows, open the encoder, and
     /// write them.
     ///
-    /// Only the sample (at most [`BodyPlan::sample_rows`]) is copied; the
-    /// held batches are written as they came, so a merge that feeds one
-    /// large input batch never holds a second copy of it.
+    /// The sample, the first row group's rows, is slices of the held
+    /// batches, and nothing is copied: the held batches are written as they
+    /// came, so a merge that feeds one large input batch never holds a
+    /// second copy of it, and a wide body's sample costs nothing per column.
     fn start(&mut self) -> Result<(), FooterError> {
-        let mut sample_parts = Vec::new();
-        let mut wanted = self.plan.sample_rows(&self.schema);
+        let mut sample = Vec::new();
+        let mut wanted = self.plan.row_group_size;
         for batch in &self.held {
             if wanted == 0 {
                 break;
             }
             let take = batch.num_rows().min(wanted);
-            sample_parts.push(batch.slice(0, take));
+            sample.push(batch.slice(0, take));
             wanted -= take;
         }
-        // Held batches of a wide table share one null array per type for
-        // the columns they lack; joined as Arrow joins them, the sample
-        // would hold a null array of a row group's rows for each of those.
-        let sample = concat_sharing_nulls(&self.schema, &sample_parts)?;
         let plain_columns = self.plan.choose(&self.schema, &sample)?;
         let mut encoder = ParquetBodyEncoder::with_plain_columns(
             &self.schema,
@@ -2381,7 +2360,7 @@ mod tests {
         let (schema, batch) = unique_and_status(2 * TEST_GROUP_ROWS);
         let plan = plan(&schema);
         assert_eq!(
-            plan.choose(&schema, &batch.slice(0, TEST_GROUP_ROWS))
+            plan.choose(&schema, &[batch.slice(0, TEST_GROUP_ROWS)])
                 .expect("choose"),
             vec!["unique".to_string()]
         );
@@ -2513,6 +2492,57 @@ mod tests {
                 ("unique".to_string(), false),
                 ("status".to_string(), true)
             ]]
+        );
+    }
+
+    /// On a body thousands of columns wide the dictionary choice is still
+    /// measured on a whole row group: the sample is slices of the rows
+    /// written, so it costs nothing per column. A column whose first
+    /// thousand values are distinct and whose others repeat four strings
+    /// is larger plain on those first rows alone, and smaller with its
+    /// dictionary over the group, so it keeps the dictionary.
+    #[test]
+    fn a_wide_body_chooses_its_dictionaries_on_a_whole_row_group() {
+        const COLUMNS: usize = 9_000;
+        const ROWS: usize = 16_384;
+        const DISTINCT_FIRST: usize = 1_024;
+        let mut fields = vec![Field::new("status", DataType::Utf8, false)];
+        fields.extend((1..COLUMNS).map(|c| Field::new(format!("c{c}"), DataType::Int64, true)));
+        let schema = Arc::new(Schema::new(fields));
+        let status = StringArray::from(
+            (0..ROWS as u64)
+                .map(|i| {
+                    let pick = match i < DISTINCT_FIRST as u64 {
+                        true => i.wrapping_mul(SCATTER),
+                        false => i.wrapping_mul(SCATTER) >> 62,
+                    };
+                    let value = (pick + 1).wrapping_mul(SCATTER_2);
+                    format!("{value:016x}{:016x}{value:016x}", !value)
+                })
+                .collect::<Vec<_>>(),
+        );
+        let nulls = arrow_array::new_null_array(&DataType::Int64, ROWS);
+        let mut columns: Vec<ArrayRef> = vec![Arc::new(status)];
+        columns.extend((1..COLUMNS).map(|_| Arc::clone(&nulls)));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), columns).expect("batch");
+        let plan = BodyPlan {
+            row_group_size: ROWS,
+            dictionary_candidates: vec!["status".to_string()],
+            ..plan(&schema)
+        };
+
+        assert_eq!(
+            plan.choose(&schema, &[batch.slice(0, DISTINCT_FIRST)])
+                .expect("choose on the first rows"),
+            vec!["status".to_string()],
+            "the first rows alone favour plain values"
+        );
+        let body = encode_parquet_body_planned(&schema, slice::from_ref(&batch), plan)
+            .expect("planned body");
+        assert_eq!(
+            dictionaries(&body)[0][0],
+            ("status".to_string(), true),
+            "measured over the row group, the column keeps its dictionary"
         );
     }
 
@@ -3097,7 +3127,9 @@ mod tests {
         };
         for together in [true, false] {
             plan.encode_groups_together = together;
-            let (with, without) = plan.measure(&schema, &batch).expect("measure");
+            let (with, without) = plan
+                .measure(&schema, slice::from_ref(&batch))
+                .expect("measure");
             assert_eq!(with, whole(&[]), "together={together}");
             assert_eq!(
                 without,
