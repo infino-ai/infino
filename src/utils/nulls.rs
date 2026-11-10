@@ -258,8 +258,8 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use arrow_array::{Int64Array, LargeStringArray, NullArray, StringViewArray};
-    use arrow_schema::{Field, Schema};
+    use arrow_array::{Int64Array, LargeStringArray, NullArray, StringViewArray, StructArray};
+    use arrow_schema::{Field, Fields, Schema};
 
     use super::{test_support::distinct_buffer_bytes, *};
 
@@ -337,6 +337,33 @@ mod tests {
         assert!(
             set >= VIEW_ROWS * VIEW_VALUE_LEN,
             "{set} bytes for {VIEW_ROWS} values of {VIEW_VALUE_LEN} bytes"
+        );
+    }
+
+    /// A view column nested in a struct counts its payload the same way:
+    /// Arrow's own sizing recurses into struct children and would see only
+    /// the fixed-width views.
+    #[test]
+    fn set_cell_bytes_counts_a_view_payload_inside_a_struct() {
+        let value = "x".repeat(VIEW_VALUE_LEN);
+        let child = Field::new("s", DataType::Utf8View, false);
+        let nested = StructArray::new(
+            Fields::from(vec![child]),
+            vec![Arc::new(StringViewArray::from_iter_values(
+                (0..VIEW_ROWS).map(|_| value.as_str()),
+            ))],
+            None,
+        );
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "st",
+            nested.data_type().clone(),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(nested)]).expect("struct batch");
+        let set = set_cell_bytes(&batch);
+        assert!(
+            set >= VIEW_ROWS * VIEW_VALUE_LEN,
+            "{set} bytes for {VIEW_ROWS} nested values of {VIEW_VALUE_LEN} bytes"
         );
     }
 

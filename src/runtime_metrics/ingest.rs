@@ -11,6 +11,7 @@ use std::mem;
 
 use arrow_array::{
     Array, BinaryViewArray, GenericListArray, OffsetSizeTrait, RecordBatch, StringViewArray,
+    StructArray,
 };
 use arrow_schema::DataType;
 
@@ -65,6 +66,9 @@ pub fn classify_batch_bytes(batch: &RecordBatch) -> (u64, u64) {
 ///   children only for `Struct`, so a sliced `List` bills its whole shared
 ///   values array — the over-count this function exists to avoid. Lists
 ///   size the child window their offsets actually name.
+/// - **Structs.** Arrow's sizing recurses into a struct's children on its
+///   own, so a view child inside one would be sized by the inline stride
+///   again. Structs size each child with this function instead.
 ///
 /// `Dictionary` keeps the over-count for a slice (every chunk counts the
 /// whole dictionary) and is left alone deliberately: its values are
@@ -79,6 +83,7 @@ pub(crate) fn visible_array_bytes(column: &dyn Array) -> u64 {
         DataType::Utf8View | DataType::BinaryView => view_visible_bytes(column),
         DataType::List(_) => list_window_bytes::<i32>(column),
         DataType::LargeList(_) => list_window_bytes::<i64>(column),
+        DataType::Struct(_) => struct_visible_bytes(column),
         _ => flat_visible_bytes(column),
     }
 }
@@ -130,6 +135,20 @@ fn null_bitmap_visible_bytes(column: &dyn Array) -> u64 {
     } else {
         0
     }
+}
+
+/// A struct column's null bitmap plus each child's visible footprint. A
+/// struct has no value buffers of its own, and its children are already
+/// windowed to the struct's rows.
+fn struct_visible_bytes(column: &dyn Array) -> u64 {
+    let Some(parent) = column.as_any().downcast_ref::<StructArray>() else {
+        return flat_visible_bytes(column);
+    };
+    parent
+        .columns()
+        .iter()
+        .map(|child| visible_array_bytes(child.as_ref()))
+        .fold(null_bitmap_visible_bytes(column), u64::saturating_add)
 }
 
 /// Slice-aware size for a type whose own layout describes it fully.

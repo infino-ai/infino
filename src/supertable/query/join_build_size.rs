@@ -281,9 +281,7 @@ impl BuildSizer {
 /// `column` copied into buffers of its own when it [`is_overcounted`] and the
 /// copy is charged less; `column` itself otherwise. The second test keeps a
 /// column the size check misjudges, like a `NULL` literal (no bytes to
-/// compare against) or a struct of strings it owns (the check counts a
-/// struct's strings at 16 bytes a row), from being swapped for a copy that
-/// saves nothing.
+/// compare against), from being swapped for a copy that saves nothing.
 fn right_size_column(column: &ArrayRef) -> DfResult<ArrayRef> {
     if !is_overcounted(column.as_ref()) {
         return Ok(Arc::clone(column));
@@ -788,9 +786,9 @@ mod tests {
         );
     }
 
-    /// A struct of long strings it owns reads as over-counted, since a
-    /// struct's strings are measured at 16 bytes a row, but copying it would
-    /// save nothing: it passes through as the same array.
+    /// A struct of long view strings it owns is measured with their
+    /// out-of-line payload, so it does not read as over-counted and passes
+    /// through as the same array.
     #[test]
     fn a_struct_that_owns_its_strings_passes_through() {
         let names: ArrayRef = Arc::new(StringViewArray::from_iter(
@@ -800,8 +798,8 @@ mod tests {
         let record: ArrayRef =
             Arc::new(StructArray::try_new(vec![field].into(), vec![names], None).expect("struct"));
         assert!(
-            is_overcounted(record.as_ref()),
-            "the size check misjudges the struct"
+            !is_overcounted(record.as_ref()),
+            "the struct's strings are measured with their payload"
         );
         let schema = Arc::new(Schema::new(vec![Field::new(
             "record",
