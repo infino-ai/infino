@@ -237,7 +237,7 @@ use crate::{
     },
     utils::{
         join::run_spawned,
-        nulls::{concat_sharing_nulls, populated_columns, take_sharing_nulls},
+        nulls::{concat_sharing_nulls, populated_columns, set_cell_bytes, take_sharing_nulls},
         trace::{self, detail_span, record},
     },
 };
@@ -832,7 +832,12 @@ fn split_target_bytes(options: &SupertableOptions) -> usize {
 /// count from the buffered bytes, capped by the writer pool. The bytes are the
 /// Arrow footprint of every scalar and vector column the buffer holds (Arrow
 /// reports capacity, not logical bytes — fine for a fanout heuristic that is
-/// clamped to the pool anyway). The one count for a commit cut by rows
+/// clamped to the pool anyway), less the slots its null cells keep
+/// ([`set_cell_bytes`]). A wide, sparse batch's footprint is almost all such
+/// slots, and each superfile of a commit stores, describes and summarises
+/// every column its rows set, so cut by its footprint it would pay that
+/// per-column cost once per piece for pieces its values do not need. The
+/// one count for a commit cut by rows
 /// ([`commit_piece_bounds`]) and for a vector commit cut by cells
 /// ([`commit_shards_via_drain`]), so a small commit stays one superfile
 /// whichever path builds it.
@@ -841,7 +846,7 @@ fn commit_superfile_count(buffer: &[BufferedBatch], options: &SupertableOptions)
     let buffered_bytes: usize = buffer
         .iter()
         .map(|b| {
-            b.scalar.get_array_memory_size()
+            set_cell_bytes(&b.scalar)
                 + b.vectors
                     .iter()
                     .map(|v| v.get_array_memory_size())
@@ -5023,12 +5028,16 @@ pub(super) fn prepare_superfile(
 pub(super) fn prepare_superfile_named(
     inner: &SupertableInner,
     manifest: &ManifestSnapshot,
-    shard: ShardOutput,
+    mut shard: ShardOutput,
     stem: Option<&str>,
 ) -> Result<Option<PreparedSuperfile>, BuildError> {
     if shard.n_docs == 0 {
         return Ok(None);
     }
+    // A merge folds its statistics batch by batch, and the tables grow as
+    // they fold: hold the superfile's tables to their budget, as a build
+    // from rows does as it counts them.
+    ScalarStatsAgg::fit_value_tables(&mut shard.scalar_stats);
 
     let uri = SuperfileUri::new_v4();
 

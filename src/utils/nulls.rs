@@ -159,6 +159,25 @@ pub(crate) fn concat_sharing_nulls<'a>(
     RecordBatch::try_new(Arc::clone(schema), columns)
 }
 
+/// The Arrow footprint of `batch`'s columns less what their null cells keep
+/// ([`null_slot_bytes`] each): about what the values it holds take. A
+/// column with no nulls counts its whole footprint, so a dense batch counts
+/// what Arrow reports for it; on a wide, sparse batch, where nearly every
+/// cell is a null keeping a slot, it counts the cells that are set.
+pub(crate) fn set_cell_bytes(batch: &RecordBatch) -> usize {
+    batch
+        .columns()
+        .iter()
+        .map(|column| {
+            let null_slots =
+                (column.null_count() as u64).saturating_mul(null_slot_bytes(column.data_type()));
+            column
+                .get_array_memory_size()
+                .saturating_sub(usize::try_from(null_slots).unwrap_or(usize::MAX))
+        })
+        .sum()
+}
+
 /// Bytes one row of `schema` takes decoded into Arrow when every column in
 /// it is null: what each column keeps a row whatever it holds (offsets for
 /// a string or list, the value slot of a fixed-width type), and nothing for
@@ -242,6 +261,48 @@ mod tests {
     use arrow_schema::{Field, Schema};
 
     use super::{test_support::distinct_buffer_bytes, *};
+
+    /// A dense batch counts its whole footprint; a sparse one, about what
+    /// its set cells take.
+    #[test]
+    fn set_cell_bytes_counts_what_the_set_cells_take() {
+        const SET_ROWS: usize = 10_000;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("n", DataType::Int64, true),
+            Field::new("s", DataType::LargeUtf8, true),
+        ]));
+        let dense = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from_iter_values(0..SET_ROWS as i64)),
+                Arc::new(LargeStringArray::from_iter_values(
+                    (0..SET_ROWS).map(|r| format!("value {r}")),
+                )),
+            ],
+        )
+        .expect("dense batch");
+        assert_eq!(set_cell_bytes(&dense), dense.get_array_memory_size());
+
+        let one_in_a_hundred = |r: usize| r.is_multiple_of(100);
+        let sparse = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from_iter(
+                    (0..SET_ROWS).map(|r| one_in_a_hundred(r).then_some(r as i64)),
+                )),
+                Arc::new(LargeStringArray::from_iter(
+                    (0..SET_ROWS).map(|r| one_in_a_hundred(r).then(|| format!("value {r}"))),
+                )),
+            ],
+        )
+        .expect("sparse batch");
+        let set = set_cell_bytes(&sparse);
+        assert!(
+            set > 0 && set * 20 < sparse.get_array_memory_size(),
+            "{set} of {} bytes",
+            sparse.get_array_memory_size()
+        );
+    }
 
     /// Rows in the test batches.
     const ROWS: usize = 1024;

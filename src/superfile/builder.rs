@@ -3684,8 +3684,11 @@ impl SuperfileBuilder {
     ) -> Result<ParquetLayout, BuildError> {
         let n_docs: u32 = batches.iter().map(|b| b.num_rows() as u32).sum();
         let mut sb = SuperfileBuilder::new(opts)?;
+        // `batches` outlive the encode, so the slices it holds of them cost
+        // nothing.
         let mut encoder =
-            PlannedBodyEncoder::new(&sb.opts.schema, sb.opts.body_plan(&sb.opts.schema));
+            PlannedBodyEncoder::new(&sb.opts.schema, sb.opts.body_plan(&sb.opts.schema))
+                .with_rows_held_by_caller();
         for batch in batches {
             encoder.write_batch(batch)?;
         }
