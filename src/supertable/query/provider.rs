@@ -968,7 +968,7 @@ impl SupertableProvider {
 
     /// Load every part of a manifest whose resident view is incomplete, and
     /// warm the delete views of all its superfiles, so a covered aggregate
-    /// sees the whole table without I/O at planning time.
+    /// finds the whole table in memory when the plan is optimized.
     pub(crate) async fn load_every_part(&self) -> Result<(), QueryError> {
         if self.manifest.complete_flat_superfiles().is_some() {
             return Ok(());

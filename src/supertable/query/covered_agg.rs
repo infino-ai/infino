@@ -65,19 +65,20 @@ use datafusion::{
     catalog::TableProvider,
     common::{
         ScalarValue,
-        tree_node::{Transformed, TreeNode, TreeNodeRecursion},
+        tree_node::{Transformed, TreeNodeRecursion},
     },
     datasource::{DefaultTableSource, provider_as_source},
     error::{DataFusionError, Result as DfResult},
     functions::core::expr_fn::{coalesce, greatest, least},
     functions_aggregate::expr_fn::{count, max, min, sum},
     logical_expr::{
-        Aggregate, Expr, Filter, LogicalPlan, LogicalPlanBuilder, Operator, TableScan, lit,
-        utils::split_conjunction,
+        Aggregate, Expr, Filter, LogicalPlan, LogicalPlanBuilder, Operator, TableScan, TableSource,
+        lit, utils::split_conjunction,
     },
     optimizer::{OptimizerConfig, OptimizerRule, optimizer::ApplyOrder},
     prelude::{cast, col, ident},
 };
+use futures::future::try_join_all;
 use uuid::Uuid;
 
 use crate::supertable::{
@@ -158,26 +159,29 @@ enum Class {
 }
 
 /// Load every manifest part of each table an unfiltered, ungrouped aggregate
-/// in `plan` reads, so the rewrite below finds the whole table resident and
-/// answers from statistics. That aggregate's scan would load every part
-/// anyway, so loading them before optimization adds no reads.
+/// in `plan` reads, subqueries included, so the rewrite below finds the
+/// whole table in memory and answers from statistics. That aggregate's scan
+/// would load every part anyway, so loading them before optimization adds no
+/// reads.
 pub(crate) async fn load_unfiltered_aggregate_inputs(plan: &LogicalPlan) -> Result<(), QueryError> {
-    let mut providers: Vec<&SupertableProvider> = Vec::new();
-    plan.apply(|node| {
+    let mut sources: Vec<Arc<dyn TableSource>> = Vec::new();
+    plan.apply_with_subqueries(|node| {
         if let LogicalPlan::Aggregate(agg) = node
             && agg.group_expr.is_empty()
             && let Some(scan) = peel_unfiltered_scan(agg.input.as_ref())
-            && let Some(provider) = provider_of(scan)
-            && !provider.is_segment_restricted()
+            && provider_of(scan).is_some_and(|provider| !provider.is_segment_restricted())
         {
-            providers.push(provider);
+            sources.push(Arc::clone(&scan.source));
         }
         Ok(TreeNodeRecursion::Continue)
     })
     .map_err(QueryError::DataFusion)?;
-    for provider in providers {
-        provider.load_every_part().await?;
-    }
+    try_join_all(sources.iter().filter_map(|source| {
+        let source = source.downcast_ref::<DefaultTableSource>()?;
+        let provider = source.table_provider.downcast_ref::<SupertableProvider>()?;
+        Some(provider.load_every_part())
+    }))
+    .await?;
     Ok(())
 }
 
