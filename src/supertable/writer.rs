@@ -12582,6 +12582,8 @@ pub(in crate::supertable) async fn stamp_term_index(
     let reuse_path = reuse.path().to_path_buf();
     // Local bytes per slice byte the call's folds have measured, in thousandths.
     let disk_per_slice = Arc::new(AtomicU64::new(0));
+    // Tier object lengths the call's folds stored, for its streamed folds.
+    let tier_lens = Arc::new(Mutex::new(HashMap::new()));
     // The next fold's inputs, fetched while this one merges and uploads.
     let prefetch = Prefetch::default();
     // One renumbering fold per call. Commits that land while it runs are
@@ -12607,6 +12609,7 @@ pub(in crate::supertable) async fn stamp_term_index(
                 &prefetch,
                 &disk_per_slice,
             );
+            let tier_lens = &tier_lens;
             let (kept_batch, kept_fold, renumbered) = (&kept_batch, &kept_fold, &renumbered);
             async move {
                 published.store(false, Ordering::Relaxed);
@@ -12705,8 +12708,8 @@ pub(in crate::supertable) async fn stamp_term_index(
                         ) && term_index::fold_disk_bound(reuse_path, disk_per_slice, 0)
                             .is_some_and(|bound| bound >= fold_bytes.saturating_mul(2));
                         let downloaded = Arc::new(Notify::new());
-                        if fold_budget.prefetches() {
-                            let next = term_index::layers_after(
+                        let next = match fold_budget.prefetches() {
+                            true => term_index::layers_after(
                                 &root,
                                 &fold,
                                 &live,
@@ -12714,7 +12717,20 @@ pub(in crate::supertable) async fn stamp_term_index(
                                 fold_budget,
                                 renumber,
                                 before_tiers,
-                            );
+                            ),
+                            false => Vec::new(),
+                        };
+                        // A fold that will stream reads nothing from local disk.
+                        let local_milli = disk_per_slice.load(Ordering::Relaxed);
+                        if !next.is_empty()
+                            && !fold_budget.streams(
+                                &next,
+                                fold.ranges(),
+                                fold.ranges() * term_index::FOLD_RANGES_PER_THREAD,
+                                local_milli,
+                                policy.one_mark_slices_per_range,
+                            )
+                        {
                             *prefetch.0.lock().expect("prefetch") =
                                 Some(spawn(term_index::prefetch_layers(
                                     Arc::clone(storage),
@@ -12734,6 +12750,8 @@ pub(in crate::supertable) async fn stamp_term_index(
                             keep_uploads: keep,
                             disk_per_slice_milli: Some(Arc::clone(disk_per_slice)),
                             downloaded: Some(Arc::clone(&downloaded)),
+                            stream: Some(fold_budget),
+                            tier_lens: Arc::clone(tier_lens),
                         };
                         let renumbers = fold.renumbers();
                         info!(
@@ -12743,6 +12761,10 @@ pub(in crate::supertable) async fn stamp_term_index(
                             ranges = fold.ranges(),
                             renumbers,
                             budget_mib = fold_budget.memory_bytes >> 20,
+                            cache_mib = fold_budget.cache_bytes >> 20,
+                            input_mib = fold_bytes >> 20,
+                            slices = root.layers[fold.run()].iter().map(|layer| layer.slices.len()).sum::<usize>(),
+                            local_milli,
                             "term index fold plan"
                         );
                         let output_at = fold.run().start;
