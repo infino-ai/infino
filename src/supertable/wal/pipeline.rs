@@ -565,7 +565,7 @@ async fn append_replacement_rows(
         )
         .await
         .map_err(|e| AppendPhaseError::SuperfileBuild {
-            message: format!("packed build: {e}"),
+            message: e.to_string(),
         })?
         .map_err(|e| AppendPhaseError::SuperfileBuild {
             message: format!("packed build: {e}"),

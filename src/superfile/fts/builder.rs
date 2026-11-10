@@ -1695,14 +1695,15 @@ pub(crate) fn freeze_lanes(
     lanes: Vec<FrozenLane>,
     pieces: Vec<Range<u32>>,
 ) -> Result<FrozenLanes, BuildError> {
-    fn lost() -> BuildError {
-        BuildError::Io(Error::other("a lane merge task ended without a result"))
+    fn lost(what: &'static str) -> BuildError {
+        BuildError::Io(Error::other(format!("{what} did not finish (it panicked)")))
     }
     check_lanes(&lanes)?;
     let n_columns = lanes.first().map_or(0, |lane| lane.columns.len());
     let shared_pieces = Arc::new(pieces.clone());
     let lanes = run_spawned(
         pool,
+        "fts lane cut",
         lanes,
         move |_, mut lane| {
             cut_lane(&mut lane, &shared_pieces);
@@ -1718,6 +1719,7 @@ pub(crate) fn freeze_lanes(
         let shared = Arc::clone(&lanes);
         let merged = run_spawned(
             pool,
+            "fts term-range merge",
             spans,
             move |_, spans| Ok(merge_term_range(&shared, column, &spans)),
             lost,

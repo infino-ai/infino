@@ -1840,7 +1840,7 @@ impl SupertableReader {
                             let kernel_column = column_arc.clone();
                             run_on_pool_unless_blocking(
                                 Some(&reader_pool),
-                                "ranged fts kernel: reader pool dropped result",
+                                "ranged fts kernel",
                                 move || {
                                     op_stats::timed_kernel(&kernel_stats, || {
                                         kernel_reader.bm25_search_or_range_prebuilt(
@@ -1913,7 +1913,7 @@ impl SupertableReader {
                                     let kernel_column = column_arc.clone();
                                     run_on_pool_unless_blocking(
                                         Some(&reader_pool),
-                                        "exact-count fts kernel: reader pool dropped result",
+                                        "exact-count fts kernel",
                                         move || {
                                             op_stats::timed_kernel(&kernel_stats, || {
                                                 kernel_reader.run_prepared_with_count_in_blob_ids(
@@ -1956,7 +1956,7 @@ impl SupertableReader {
                                     let kernel_column = column_arc.clone();
                                     run_on_pool_unless_blocking(
                                         Some(&reader_pool),
-                                        "un-ranged fts kernel: reader pool dropped result",
+                                        "un-ranged fts kernel",
                                         move || {
                                             op_stats::timed_kernel(&kernel_stats, || {
                                                 kernel_reader.run_prepared_in_blob_ids(
@@ -2831,11 +2831,9 @@ impl SupertableReader {
                         // blocks under one.
                         let (set, slice_reader, slice_kernel) =
                             (Arc::clone(set), Arc::clone(&r), Arc::clone(&kernel));
-                        run_on_pool_unless_blocking(
-                            Some(&reader_pool),
-                            "match slice: reader pool dropped result",
-                            move || slice_kernel.slice(&slice_reader, &set, start, end),
-                        )
+                        run_on_pool_unless_blocking(Some(&reader_pool), "match slice", move || {
+                            slice_kernel.slice(&slice_reader, &set, start, end)
+                        })
                         .await
                         .map_err(|e| QueryError::Internal(e.to_string()))??
                     }
