@@ -1783,13 +1783,13 @@ async fn fold_layers(
         Arc::clone(&io.tier_lens),
     ));
     // The kept layers are merged away, so the copies kept of them can go.
-    let consumed: Vec<(ContentHash, PathBuf, PathBuf)> = match reuse {
+    let consumed: Vec<((ContentHash, Option<ContentHash>), PathBuf, PathBuf)> = match reuse {
         Some(reuse) => kept
             .iter()
             .flat_map(|layer| &layer.slices)
             .map(|slice| {
                 (
-                    slice.content_hash,
+                    (slice.content_hash, slice.tier),
                     slice_file_path(reuse, &slice.content_hash),
                     tier_path(reuse, &slice.content_hash),
                 )
@@ -1811,22 +1811,24 @@ async fn fold_layers(
     uploaded.map_err(|e| TermIndexError::Build(format!("term-index upload: {e}")))??;
     let merged = merged.map_err(|e| TermIndexError::Build(e.to_string()))??;
     debug_assert!(merged.tiers.is_empty() && merged.slices.is_empty());
-    // An output byte for byte equal to an input is the same object, and
-    // when this fold keeps its uploads the copy kept is its output now.
-    let outputs: HashSet<ContentHash> = match io.keep_uploads {
+    // An output whose slice and tier are byte for byte an input's is the
+    // same pair of objects, and when this fold keeps its uploads the copy
+    // kept is its output now. A slice's hash does not cover its tier, so
+    // an equal slice over a different tier still drops the stale pair.
+    let outputs: HashSet<(ContentHash, Option<ContentHash>)> = match io.keep_uploads {
         true => merged
             .layer
             .slices
             .iter()
-            .map(|slice| slice.content_hash)
+            .map(|slice| (slice.content_hash, slice.tier))
             .collect(),
         false => HashSet::new(),
     };
     // One blocking task for all removals: a round trip to the blocking pool
     // per file costs tens of seconds on a fold of tens of thousands of slices.
     let _ = task::spawn_blocking(move || {
-        for (hash, slice, tier) in consumed {
-            if !outputs.contains(&hash) {
+        for (pair, slice, tier) in consumed {
+            if !outputs.contains(&pair) {
                 let _ = fs::remove_file(slice);
                 let _ = fs::remove_file(tier);
             }
@@ -11858,6 +11860,33 @@ mod tests {
                 .iter()
                 .all(|hash| slice_file_path(reuse.path(), hash).exists()),
             "the kept copy of an output equal to its input stays"
+        );
+        // An input naming another tier under the same slice holds a pair
+        // the output does not match: its kept copies go, whatever the slice.
+        let tiered: Vec<ContentHash> = first
+            .slices
+            .iter()
+            .filter(|slice| slice.tier.is_some())
+            .map(|slice| slice.content_hash)
+            .collect();
+        assert!(!tiered.is_empty(), "the layer has tier objects");
+        let other_tier = Layer {
+            slices: first
+                .slices
+                .iter()
+                .map(|slice| SliceRef {
+                    tier: slice.tier.map(|_| ContentHash::of(b"another tier")),
+                    ..slice.clone()
+                })
+                .collect(),
+            ..first.clone()
+        };
+        fold(std::slice::from_ref(&other_tier));
+        assert!(
+            tiered
+                .iter()
+                .all(|hash| !slice_file_path(reuse.path(), hash).exists()),
+            "a kept pair whose tier differs from the output's goes"
         );
     }
 }
