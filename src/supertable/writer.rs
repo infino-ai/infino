@@ -12727,6 +12727,7 @@ pub(in crate::supertable) async fn stamp_term_index(
                                 fold.ranges(),
                                 fold.ranges() * term_index::FOLD_RANGES_PER_THREAD,
                                 local_milli,
+                                policy.one_mark_slices_per_range,
                             )
                         {
                             *prefetch.0.lock().expect("prefetch") =
@@ -12748,8 +12749,7 @@ pub(in crate::supertable) async fn stamp_term_index(
                             keep_uploads: keep,
                             disk_per_slice_milli: Some(Arc::clone(disk_per_slice)),
                             downloaded: Some(Arc::clone(&downloaded)),
-                            stream: true,
-                            stream_budget: Some(fold_budget),
+                            stream: Some(fold_budget),
                             tier_lens: Arc::clone(tier_lens),
                         };
                         let renumbers = fold.renumbers();

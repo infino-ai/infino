@@ -36,7 +36,7 @@ use rayon::ThreadPoolBuilder;
 use tracing_subscriber::{EnvFilter, fmt};
 
 use super::{
-    build::{BuildPolicy, BuiltBytes, SliceFile, merge_layers, tier_path},
+    build::{BuildPolicy, BuiltBytes, SliceFile, SliceSource, merge_layers, tier_path},
     download_layers,
     format::Layer,
     slice_files, write_slices, write_tiers,
@@ -87,7 +87,7 @@ fn present_sources(dir: &Path, layers: &[Layer]) -> Option<Vec<Vec<SliceFile>>> 
     let files = slice_files(dir, layers);
     let complete = layers.iter().zip(&files).all(|(layer, files)| {
         layer.slices.iter().zip(files).all(|(slice, file)| {
-            file.path.is_file()
+            matches!(&file.source, SliceSource::Local(path) if path.is_file())
                 && (slice.tier.is_none() || tier_path(dir, &slice.content_hash).is_file())
         })
     });
@@ -211,8 +211,7 @@ fn fold_timing() {
             ..policy
         };
         let io = super::FoldIo {
-            stream: true,
-            stream_budget: Some(super::FoldBudget::for_host(pool_threads)),
+            stream: Some(super::FoldBudget::for_host(pool_threads)),
             ..super::FoldIo::default()
         };
         let t = Instant::now();
@@ -259,10 +258,10 @@ fn fold_timing() {
     let local_bytes: u64 = root
         .layers
         .iter()
-        .zip(&sources)
-        .flat_map(|(layer, files)| layer.slices.iter().zip(files))
-        .map(|(slice, file)| {
-            file_len(&file.path) + file_len(&tier_path(&scratch, &slice.content_hash))
+        .flat_map(|layer| &layer.slices)
+        .map(|slice| {
+            file_len(&super::slice_file_path(&scratch, &slice.content_hash))
+                + file_len(&tier_path(&scratch, &slice.content_hash))
         })
         .sum();
 

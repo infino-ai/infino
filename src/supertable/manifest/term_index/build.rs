@@ -1931,15 +1931,20 @@ const MERGE_BATCH_TERMS: usize = 4096;
 /// alone is larger is still decoded whole.
 const MERGE_BATCH_BYTES: usize = (FOLD_CURSOR_BYTES / 2) as usize;
 
-/// A slice on local disk, with the key range its layer records for it,
-/// so a merge can be range-cut and its sources selected without opening
-/// a slice.
+/// Where a merge reads a slice from.
+#[derive(Debug, Clone)]
+pub(crate) enum SliceSource {
+    /// The slice's bytes as downloaded or spilled, its tier object beside it.
+    Local(PathBuf),
+    /// Fetched from storage as the merge reaches it.
+    Remote(RemoteSlice),
+}
+
+/// A slice, with the key range its layer records for it, so a merge can be
+/// range-cut and its sources selected without opening a slice.
 #[derive(Debug, Clone)]
 pub(crate) struct SliceFile {
-    /// Where the merge fetches the slice when it is not on local disk.
-    pub(crate) remote: Option<RemoteSlice>,
-    /// The slice's bytes, as downloaded or spilled.
-    pub(crate) path: PathBuf,
+    pub(crate) source: SliceSource,
     /// Smallest key the slice holds.
     pub(crate) first_key: Vec<u8>,
     /// Largest key the slice holds.
@@ -2125,8 +2130,8 @@ impl LayerCursor {
                 fetch.abort();
             }
             self.remote_window = self.remote_window_min;
-            match file.remote {
-                Some(remote) => {
+            match file.source {
+                SliceSource::Remote(remote) => {
                     let fetch = match self.next_fetch.take() {
                         Some(fetch) => fetch,
                         None => remote.spawn_fetch(),
@@ -2135,16 +2140,18 @@ impl LayerCursor {
                     self.next_fetch = self
                         .files
                         .front()
-                        .and_then(|next| next.remote.as_ref())
-                        .map(RemoteSlice::spawn_fetch);
+                        .and_then(|next| match &next.source {
+                            SliceSource::Remote(remote) => Some(remote.spawn_fetch()),
+                            SliceSource::Local(_) => None,
+                        });
                     self.read_secs += started.elapsed().as_secs_f64();
                     self.tier_file = None;
                     self.remote = Some(remote);
                 }
-                None => {
-                    self.bytes = map_file(&file.path)?;
+                SliceSource::Local(path) => {
+                    self.bytes = map_file(&path)?;
                     self.decode_secs += started.elapsed().as_secs_f64();
-                    self.tier_file = Some(file.path.with_extension(TIER_FILE_EXTENSION));
+                    self.tier_file = Some(path.with_extension(TIER_FILE_EXTENSION));
                     self.remote = None;
                 }
             }
@@ -2653,9 +2660,9 @@ pub(crate) fn key_ranges(
 ) -> Result<Vec<KeyRange>, TermIndexError> {
     let files: Vec<&SliceFile> = sources.iter().flatten().collect();
     let slice_len = |file: &SliceFile| -> io::Result<u64> {
-        match &file.remote {
-            Some(remote) => Ok(remote.len),
-            None => Ok(fs::metadata(&file.path)?.len()),
+        match &file.source {
+            SliceSource::Remote(remote) => Ok(remote.len),
+            SliceSource::Local(path) => Ok(fs::metadata(path)?.len()),
         }
     };
     let want = range_count(policy, MERGE_RANGE_MIN_BYTES, MERGE_RANGES_MAX, || {
@@ -2694,11 +2701,11 @@ pub(crate) fn key_ranges(
     if one_mark_per_slice(&layers, want, policy.one_mark_slices_per_range) {
         let mut marks = Vec::with_capacity(files.len());
         for file in &files {
-            let weight = match &file.remote {
-                Some(remote) => remote.len + remote.tier_len,
-                None => {
-                    fs::metadata(&file.path)?.len()
-                        + fs::metadata(file.path.with_extension(TIER_FILE_EXTENSION))
+            let weight = match &file.source {
+                SliceSource::Remote(remote) => remote.len + remote.tier_len,
+                SliceSource::Local(path) => {
+                    fs::metadata(path)?.len()
+                        + fs::metadata(path.with_extension(TIER_FILE_EXTENSION))
                             .map(|m| m.len())
                             .unwrap_or(0)
                 }
@@ -2708,35 +2715,28 @@ pub(crate) fn key_ranges(
         marks.sort_by(|a, b| a.0.cmp(&b.0));
         return Ok(cut_ranges(&marks, want));
     }
+    // A fold streams only slices it cuts at one mark each, so every slice
+    // here is on local disk.
     let weigh = |file: &SliceFile| -> Result<Vec<(Vec<u8>, u64)>, TermIndexError> {
-        let handle = match &file.remote {
-            Some(_) => None,
-            None => Some(File::open(&file.path)?),
+        let SliceSource::Local(path) = &file.source else {
+            return Err(TermIndexError::Build(
+                "a streamed slice reached the dictionary cut".into(),
+            ));
         };
+        let handle = File::open(path)?;
         let read_at = |offset: u64, len: usize| -> Result<Vec<u8>, TermIndexError> {
-            match (&file.remote, &handle) {
-                (Some(remote), _) => Ok(remote.slice_range(offset..offset + len as u64)?.to_vec()),
-                (None, Some(handle)) => {
-                    let mut bytes = vec![0u8; len];
-                    handle.read_exact_at(&mut bytes, offset)?;
-                    Ok(bytes)
-                }
-                (None, None) => Err(TermIndexError::Build(
-                    "a slice neither local nor remote".into(),
-                )),
-            }
+            let mut bytes = vec![0u8; len];
+            handle.read_exact_at(&mut bytes, offset)?;
+            Ok(bytes)
         };
         let header = read_at(0, SLICE_HEADER_LEN)?;
         let dict_len = SliceDictionary::dict_len(&header)?;
         let bytes = read_at(0, SLICE_HEADER_LEN + dict_len as usize)?;
         let dictionary = SliceDictionary::open(&bytes)?;
         let starts = dictionary.block_starts()?;
-        let tier_len = match &file.remote {
-            Some(remote) => remote.tier_len,
-            None => fs::metadata(file.path.with_extension(TIER_FILE_EXTENSION))
-                .map(|m| m.len())
-                .unwrap_or(0),
-        };
+        let tier_len = fs::metadata(path.with_extension(TIER_FILE_EXTENSION))
+            .map(|m| m.len())
+            .unwrap_or(0);
         let group = starts.len().div_ceil(per_slice).max(1);
         // The tier offset where the group starting at block `from` begins.
         let tier_at = |from: usize| -> Result<Option<u64>, TermIndexError> {
