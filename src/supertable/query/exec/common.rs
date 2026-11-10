@@ -73,6 +73,7 @@ use tokio::sync::Semaphore;
 use tracing::{Instrument, Span, warn};
 
 use crate::{
+    error::{capped_column_list, closest_name},
     memory::{
         ConnectionMemoryBudget, over_process_limit, process_limit, process_limit_exceeded,
         process_over_limit,
@@ -506,8 +507,9 @@ pub(crate) fn validate_projection(
 
 /// Message for a projection naming a column the search output does not
 /// carry. Lists the selectable columns (`_id`, the visible scalar columns,
-/// and the trailing `score`) so the caller can correct the request. The list
-/// is bounded to a representative sample (see [`crate::error::capped_column_list`]):
+/// and the trailing `score`) so the caller can correct the request, after the
+/// closest one when it is close enough to suggest (see [`closest_name`]). The
+/// list is bounded to the names closest to `name` (see [`capped_column_list`]):
 /// a wide table carries thousands of columns, and the whole list in every
 /// rejected projection would run to hundreds of kilobytes in logs and responses.
 fn unknown_column_message(name: &str, output_schema: &SchemaRef) -> String {
@@ -516,8 +518,11 @@ fn unknown_column_message(name: &str, output_schema: &SchemaRef) -> String {
         .iter()
         .map(|f| f.name().as_str())
         .collect();
-    let available = crate::error::capped_column_list(&names);
-    format!("unknown column {name:?} in projection; valid columns: {available}")
+    let available = capped_column_list(&names, name);
+    let suggestion = closest_name(name, &names)
+        .map(|closest| format!("did you mean {closest:?}? "))
+        .unwrap_or_default();
+    format!("unknown column {name:?} in projection; {suggestion}valid columns: {available}")
 }
 
 impl SupertableReader {
