@@ -258,7 +258,10 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use arrow_array::{Int64Array, LargeStringArray, NullArray, StringViewArray, StructArray};
+    use arrow_array::{
+        DictionaryArray, FixedSizeListArray, Int32Array, Int64Array, LargeStringArray, NullArray,
+        StringViewArray, StructArray,
+    };
     use arrow_schema::{Field, Fields, Schema};
 
     use super::{test_support::distinct_buffer_bytes, *};
@@ -360,6 +363,53 @@ mod tests {
             false,
         )]));
         let batch = RecordBatch::try_new(schema, vec![Arc::new(nested)]).expect("struct batch");
+        let set = set_cell_bytes(&batch);
+        assert!(
+            set >= VIEW_ROWS * VIEW_VALUE_LEN,
+            "{set} bytes for {VIEW_ROWS} nested values of {VIEW_VALUE_LEN} bytes"
+        );
+    }
+
+    /// A view column under a fixed-size list inside a struct counts its
+    /// out-of-line payload.
+    #[test]
+    fn set_cell_bytes_counts_a_view_payload_inside_a_fixed_size_list() {
+        let value = "x".repeat(VIEW_VALUE_LEN);
+        let item = Arc::new(Field::new("item", DataType::Utf8View, false));
+        let list = FixedSizeListArray::new(
+            item,
+            1,
+            Arc::new(StringViewArray::from_iter_values(
+                (0..VIEW_ROWS).map(|_| value.as_str()),
+            )),
+            None,
+        );
+        let child = Field::new("l", list.data_type().clone(), false);
+        let nested = StructArray::new(Fields::from(vec![child]), vec![Arc::new(list)], None);
+        assert_counts_view_payload(nested.data_type().clone(), Arc::new(nested));
+    }
+
+    /// A view column in a nested type without its own arm, here a
+    /// dictionary's values, still counts its out-of-line payload.
+    #[test]
+    fn set_cell_bytes_counts_a_view_payload_inside_a_dictionary() {
+        let values: Vec<String> = (0..VIEW_ROWS)
+            .map(|r| format!("{r:0>width$}", width = VIEW_VALUE_LEN))
+            .collect();
+        let dictionary = DictionaryArray::new(
+            Int32Array::from_iter_values(0..VIEW_ROWS as i32),
+            Arc::new(StringViewArray::from_iter_values(
+                values.iter().map(String::as_str),
+            )),
+        );
+        assert_counts_view_payload(dictionary.data_type().clone(), Arc::new(dictionary));
+    }
+
+    /// Checks a one-column batch of `column` counts at least the
+    /// [`VIEW_ROWS`] × [`VIEW_VALUE_LEN`] bytes of view payload it holds.
+    fn assert_counts_view_payload(data_type: DataType, column: ArrayRef) {
+        let schema = Arc::new(Schema::new(vec![Field::new("c", data_type, false)]));
+        let batch = RecordBatch::try_new(schema, vec![column]).expect("nested view batch");
         let set = set_cell_bytes(&batch);
         assert!(
             set >= VIEW_ROWS * VIEW_VALUE_LEN,

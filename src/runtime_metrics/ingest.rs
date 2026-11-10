@@ -10,8 +10,8 @@
 use std::mem;
 
 use arrow_array::{
-    Array, BinaryViewArray, GenericListArray, OffsetSizeTrait, RecordBatch, StringViewArray,
-    StructArray,
+    Array, BinaryViewArray, FixedSizeListArray, GenericListArray, OffsetSizeTrait, RecordBatch,
+    StringViewArray, StructArray,
 };
 use arrow_schema::DataType;
 
@@ -66,9 +66,13 @@ pub fn classify_batch_bytes(batch: &RecordBatch) -> (u64, u64) {
 ///   children only for `Struct`, so a sliced `List` bills its whole shared
 ///   values array — the over-count this function exists to avoid. Lists
 ///   size the child window their offsets actually name.
-/// - **Structs.** Arrow's sizing recurses into a struct's children on its
-///   own, so a view child inside one would be sized by the inline stride
-///   again. Structs size each child with this function instead.
+/// - **Structs and fixed-size lists.** Arrow's sizing recurses into their
+///   children on its own, so a view child inside one would be sized by the
+///   inline stride again. They size each child with this function instead;
+///   both already window their children to their own rows.
+/// - **Any other nested type holding a view** (`Map`, `Dictionary`,
+///   `Union`, run-end or list-view encodings) uses the capacity-based
+///   size: an over-count, but never the inline-stride under-count.
 ///
 /// `Dictionary` keeps the over-count for a slice (every chunk counts the
 /// whole dictionary) and is left alone deliberately: its values are
@@ -84,7 +88,28 @@ pub(crate) fn visible_array_bytes(column: &dyn Array) -> u64 {
         DataType::List(_) => list_window_bytes::<i32>(column),
         DataType::LargeList(_) => list_window_bytes::<i64>(column),
         DataType::Struct(_) => struct_visible_bytes(column),
+        DataType::FixedSizeList(_, _) => fixed_size_list_visible_bytes(column),
+        nested if holds_view(nested) => column.get_array_memory_size() as u64,
         _ => flat_visible_bytes(column),
+    }
+}
+
+/// Whether `data_type` is a view type or has one anywhere among its
+/// children.
+fn holds_view(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Utf8View | DataType::BinaryView => true,
+        DataType::List(child)
+        | DataType::LargeList(child)
+        | DataType::ListView(child)
+        | DataType::LargeListView(child)
+        | DataType::FixedSizeList(child, _)
+        | DataType::Map(child, _) => holds_view(child.data_type()),
+        DataType::Struct(fields) => fields.iter().any(|f| holds_view(f.data_type())),
+        DataType::Union(fields, _) => fields.iter().any(|(_, f)| holds_view(f.data_type())),
+        DataType::Dictionary(_, values) => holds_view(values),
+        DataType::RunEndEncoded(_, values) => holds_view(values.data_type()),
+        _ => false,
     }
 }
 
@@ -149,6 +174,15 @@ fn struct_visible_bytes(column: &dyn Array) -> u64 {
         .iter()
         .map(|child| visible_array_bytes(child.as_ref()))
         .fold(null_bitmap_visible_bytes(column), u64::saturating_add)
+}
+
+/// A fixed-size list column's null bitmap plus its values' visible
+/// footprint. The values are already windowed to the list's rows.
+fn fixed_size_list_visible_bytes(column: &dyn Array) -> u64 {
+    let Some(list) = column.as_any().downcast_ref::<FixedSizeListArray>() else {
+        return flat_visible_bytes(column);
+    };
+    visible_array_bytes(list.values().as_ref()).saturating_add(null_bitmap_visible_bytes(column))
 }
 
 /// Slice-aware size for a type whose own layout describes it fully.
