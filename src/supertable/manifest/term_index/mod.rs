@@ -2371,22 +2371,32 @@ async fn stream_sources(
     tier_lens: &Mutex<HashMap<ContentHash, u64>>,
 ) -> Result<Vec<Vec<SliceFile>>, TermIndexError> {
     // A slice kept in `reuse` is read there only with its tier object
-    // beside it; a kept slice whose tier is gone is streamed whole.
-    let mut kept: HashMap<ContentHash, PathBuf> = HashMap::new();
-    if let Some(reuse) = reuse {
-        for slice in layers.iter().flat_map(|layer| &layer.slices) {
-            let path = slice_file_path(reuse, &slice.content_hash);
-            let tier_kept = match slice.tier {
-                None => true,
-                Some(_) => async_fs::try_exists(tier_path(reuse, &slice.content_hash))
-                    .await
-                    .unwrap_or(false),
-            };
-            if tier_kept && async_fs::try_exists(&path).await.unwrap_or(false) {
-                kept.insert(slice.content_hash, path);
-            }
+    // beside it; a kept slice whose tier is gone is streamed whole. One
+    // blocking task checks them all: a round trip to the blocking pool per
+    // file costs tens of seconds on a fold of tens of thousands of slices.
+    let kept: HashMap<ContentHash, PathBuf> = match reuse {
+        Some(reuse) => {
+            let (reuse, wanted) = (
+                reuse.to_path_buf(),
+                layers
+                    .iter()
+                    .flat_map(|layer| &layer.slices)
+                    .map(|slice| (slice.content_hash, slice.tier.is_some()))
+                    .collect::<Vec<_>>(),
+            );
+            task::spawn_blocking(move || {
+                wanted
+                    .into_iter()
+                    .filter(|(hash, tiered)| !tiered || tier_path(&reuse, hash).exists())
+                    .map(|(hash, _)| (hash, slice_file_path(&reuse, &hash)))
+                    .filter(|(_, path)| path.exists())
+                    .collect()
+            })
+            .await
+            .map_err(|e| TermIndexError::Build(format!("kept inputs: {e}")))?
         }
-    }
+        None => HashMap::new(),
+    };
     let missing: Vec<ContentHash> = {
         let known = tier_lens.lock().expect("tier lengths");
         layers
