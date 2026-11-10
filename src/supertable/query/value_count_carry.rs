@@ -60,6 +60,34 @@ enum Sum {
     Unknown,
 }
 
+impl Sum {
+    /// Adds `entry`'s counts of column `column`; an unknown sum stays so.
+    fn add(&mut self, entry: &SuperfileEntry, column: FieldId) {
+        let Sum::Counts(sum) = self else {
+            return;
+        };
+        let known = match file_counts(entry, column) {
+            FileCounts::NoValues => true,
+            FileCounts::Unrecorded => false,
+            FileCounts::Values(counts) => {
+                counts.entries().iter().all(|(value, count)| {
+                    let total = sum.entry(value.clone()).or_default();
+                    match total.checked_add(*count) {
+                        Some(added) => {
+                            *total = added;
+                            true
+                        }
+                        None => false,
+                    }
+                }) && sum.len() <= MAX_EXACT_VALUE_COUNTS
+            }
+        };
+        if !known {
+            *self = Sum::Unknown;
+        }
+    }
+}
+
 /// What one superfile adds to a column's sum.
 enum FileCounts {
     Values(ScalarValueCounts),
@@ -131,15 +159,11 @@ pub(crate) fn counts_of(
     files: &[Arc<SuperfileEntry>],
     column: FieldId,
 ) -> Option<HashMap<ScalarValue, u64>> {
-    let mut sum = CarriedColumn {
-        data_type: DataType::Null,
-        files: HashMap::new(),
-        sum: Sum::Counts(HashMap::new()),
-    };
+    let mut sum = Sum::Counts(HashMap::new());
     for entry in files {
         sum.add(entry, column);
     }
-    match sum.sum {
+    match sum {
         Sum::Counts(counts) => Some(counts),
         Sum::Unknown => None,
     }
@@ -204,28 +228,7 @@ impl CarriedColumn {
     /// Adds `entry`'s counts.
     fn add(&mut self, entry: &Arc<SuperfileEntry>, column: FieldId) {
         self.files.insert(entry.superfile_id, Arc::clone(entry));
-        let Sum::Counts(sum) = &mut self.sum else {
-            return;
-        };
-        let known = match file_counts(entry, column) {
-            FileCounts::NoValues => true,
-            FileCounts::Unrecorded => false,
-            FileCounts::Values(counts) => {
-                counts.entries().iter().all(|(value, count)| {
-                    let total = sum.entry(value.clone()).or_default();
-                    match total.checked_add(*count) {
-                        Some(added) => {
-                            *total = added;
-                            true
-                        }
-                        None => false,
-                    }
-                }) && sum.len() <= MAX_EXACT_VALUE_COUNTS
-            }
-        };
-        if !known {
-            self.sum = Sum::Unknown;
-        }
+        self.sum.add(entry, column);
     }
 
     /// Takes the counts of the superfiles `gone` off the sum. `false` when

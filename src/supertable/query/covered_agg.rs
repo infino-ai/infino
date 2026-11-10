@@ -694,8 +694,18 @@ fn answer_from_statistics(
         let mut terms = Vec::with_capacity(kinds.len());
         let mut want: BTreeSet<WantedColumn> = BTreeSet::new();
         let mut unknown = None;
+        // One view of each column per superfile, whatever number of
+        // aggregates read it.
+        let mut lives: HashMap<FieldId, Result<LiveColumn, Unknown>> = HashMap::new();
         for (kind, column) in kinds.iter().zip(&columns) {
-            match term(provider, kind, column.as_ref(), entry, &deleted) {
+            let live = column.as_ref().map(|column| {
+                lives
+                    .entry(column.id)
+                    .or_insert_with(|| live_of(provider, column, entry, &deleted))
+                    .as_ref()
+                    .map_err(|why| *why)
+            });
+            match term(kind, live, entry, &deleted) {
                 Ok(term) => terms.push(term),
                 Err(why) => {
                     if let (Unknown::DeletedRows, Some(column)) = (why, column) {
@@ -809,13 +819,29 @@ fn better_bound<'a>(a: &'a ScalarValue, b: &'a ScalarValue, max: bool) -> Option
     Some(if strictly_better(b, a, max)? { b } else { a })
 }
 
-/// What `entry`'s live rows give `kind`, `deleted` of its rows deleted.
-fn term(
+/// `column` of `entry` as its live rows have it, `deleted` of its rows
+/// deleted; unknown when its statistics are of a type the column no longer
+/// has.
+fn live_of<'a>(
     provider: &SupertableProvider,
-    kind: &AggKind,
-    column: Option<&StatsColumn>,
-    entry: &SuperfileEntry,
+    column: &StatsColumn,
+    entry: &'a SuperfileEntry,
     deleted: &Arc<RoaringBitmap>,
+) -> Result<LiveColumn<'a>, Unknown> {
+    if !file_lacks_column(entry, column.id) && !column.current_in(entry) {
+        return Err(Unknown::Scan);
+    }
+    let data_type = column.data_type.as_ref().ok_or(Unknown::Scan)?;
+    Ok(live_column(provider, entry, column.id, data_type, deleted))
+}
+
+/// What `entry`'s live rows give `kind`, `deleted` of its rows deleted,
+/// from `live`, the view of the column it reads (`None` for `COUNT(*)`).
+fn term(
+    kind: &AggKind,
+    live: Option<Result<&LiveColumn, Unknown>>,
+    entry: &SuperfileEntry,
+    deleted: &RoaringBitmap,
 ) -> Result<Term, Unknown> {
     let live_rows = || {
         entry
@@ -824,26 +850,22 @@ fn term(
             .and_then(|rows| i64::try_from(rows).ok())
             .ok_or(Unknown::Scan)
     };
-    let Some(column) = column else {
+    let Some(live) = live else {
         // `COUNT(*)`: the rows less the deleted ones.
         return live_rows().map(Term::Count);
     };
-    if !file_lacks_column(entry, column.id) && !column.current_in(entry) {
-        return Err(Unknown::Scan);
-    }
-    let data_type = column.data_type.as_ref().ok_or(Unknown::Scan)?;
-    let live = live_column(provider, entry, column.id, data_type, deleted);
+    let live = live?;
     let count = |live: &LiveColumn| {
         live.non_null()
             .and_then(|n| i64::try_from(n).map_err(|_| Unknown::Scan))
     };
     Ok(match kind {
         AggKind::CountStar => Term::Count(live_rows()?),
-        AggKind::Count(_) => Term::Count(count(&live)?),
+        AggKind::Count(_) => Term::Count(count(live)?),
         AggKind::Sum(_) => Term::Sum(live.sum()?),
         AggKind::Avg(_) => Term::Avg(match live.sum()? {
             None => None,
-            Some(sum) => Some((sum, count(&live)?)),
+            Some(sum) => Some((sum, count(live)?)),
         }),
         AggKind::Min(_) => Term::Bound(live.bound(false)?),
         AggKind::Max(_) => Term::Bound(live.bound(true)?),
@@ -858,7 +880,7 @@ fn live_column<'a>(
     entry: &'a SuperfileEntry,
     id: FieldId,
     data_type: &DataType,
-    deleted: &RoaringBitmap,
+    deleted: &Arc<RoaringBitmap>,
 ) -> LiveColumn<'a> {
     let lacks = file_lacks_column(entry, id);
     let delta = match deleted.is_empty() || lacks {

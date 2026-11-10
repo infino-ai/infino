@@ -29,7 +29,7 @@
 
 use std::{
     cmp::Ordering,
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     sync::{Arc, Mutex},
 };
 
@@ -53,7 +53,7 @@ use crate::{
     runtime_bridge::run_on_pool,
     supertable::{
         manifest::{ColumnStats, ScalarStatsAgg, SuperfileEntry, sub_sum_arrays},
-        query::provider::SupertableProvider,
+        query::{provider::SupertableProvider, value_count_carry::take_off},
         schema::FieldId,
     },
     utils::join::try_join_bounded,
@@ -120,12 +120,16 @@ impl DeletedStatsCache {
         superfile: Uuid,
         field: FieldId,
         data_type: &DataType,
-        rows: &RoaringBitmap,
+        rows: &Arc<RoaringBitmap>,
     ) -> Option<Arc<ScalarStatsAgg>> {
         let entries = self.entries.lock().expect("deleted-stats cache poisoned");
         let cached = entries.by_column.get(&(superfile, field))?;
-        (cached.data_type == *data_type && cached.rows.len() == rows.len() && *cached.rows == *rows)
-            .then(|| Arc::clone(&cached.stats))
+        // The tombstone cache hands out one bitmap per sidecar version, so
+        // the rows the statistics were read for are most often the very
+        // bitmap asked about; comparing them whole is the rare case.
+        let same_rows = Arc::ptr_eq(&cached.rows, rows)
+            || (cached.rows.len() == rows.len() && *cached.rows == **rows);
+        (cached.data_type == *data_type && same_rows).then(|| Arc::clone(&cached.stats))
     }
 
     /// The cached statistics of some of `rows`, to add the rest to: a
@@ -409,20 +413,25 @@ impl<'a> LiveColumn<'a> {
         if let Some(stored) = stats.value_counts()
             && let Ok(CountsChange::Less(less)) = self.counts_change()
         {
-            let mut live: BTreeMap<_, u64> = BTreeMap::new();
-            for (value, count) in stored.entries() {
-                live.insert(OrderedValue(value.clone()), *count);
+            let live = take_off(
+                stored.entries().iter().cloned().collect(),
+                less.iter().map(|(value, count)| (value, *count)),
+            )
+            .ok_or(Unknown::Scan)?;
+            let mut extreme: Option<&ScalarValue> = None;
+            for value in live.keys() {
+                extreme = Some(match extreme {
+                    None => value,
+                    Some(best) => {
+                        let order = value.partial_cmp(best).ok_or(Unknown::Scan)?;
+                        match (order, max) {
+                            (Ordering::Less, false) | (Ordering::Greater, true) => value,
+                            _ => best,
+                        }
+                    }
+                });
             }
-            for (value, count) in less {
-                let held = live.get_mut(&OrderedValue(value)).ok_or(Unknown::Scan)?;
-                *held = held.checked_sub(count).ok_or(Unknown::Scan)?;
-            }
-            let mut held = live.into_iter().filter(|(_, count)| *count > 0);
-            let extreme = match max {
-                false => held.next(),
-                true => held.next_back(),
-            };
-            return Ok(LiveBound::Exact(extreme.map(|(value, _)| value.0)));
+            return Ok(LiveBound::Exact(extreme.cloned()));
         }
         Ok(LiveBound::Beyond {
             bound,
@@ -459,24 +468,6 @@ impl<'a> LiveColumn<'a> {
         }
         let counts = delta.value_counts.as_ref().ok_or(Unknown::Scan)?;
         Ok(CountsChange::Less(counts.entries().to_vec()))
-    }
-}
-
-/// A value ordered as the value tables order theirs, for a `BTreeMap`.
-#[derive(Debug, Clone, PartialEq)]
-struct OrderedValue(ScalarValue);
-
-impl Eq for OrderedValue {}
-
-impl PartialOrd for OrderedValue {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for OrderedValue {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.0.partial_cmp(&other.0).unwrap_or(Ordering::Equal)
     }
 }
 
@@ -931,6 +922,20 @@ mod tests {
         assert_eq!(reader.deleted_stats().len(), 1, "MAX read the deleted row");
     }
 
+    /// When every row holding a superfile's least value is deleted, its
+    /// value counts less the deleted rows' give the live minimum, with no
+    /// scan; the greatest value, still live, stays the maximum.
+    #[test]
+    fn value_counts_give_the_bound_the_deleted_rows_held() {
+        let t = table();
+        t.append(0..FEW_ROWS, |k| k);
+        t.table.delete(col("v").eq(lit(0i64))).expect("delete");
+        let reader = t.reader();
+        let bounds = "SELECT MIN(v), MAX(v) FROM supertable";
+        assert_eq!(rows(&reader, bounds), vec![format!("1|{}", V_VALUES - 1)]);
+        assert!(!explain(&reader, bounds).contains("TableScan"));
+    }
+
     /// The cache answers only for exactly the deleted rows it read, and
     /// offers what it read of fewer rows to add the rest to.
     #[test]
@@ -938,7 +943,7 @@ mod tests {
         let cache = DeletedStatsCache::default();
         let superfile = Uuid::new_v4();
         let field = FieldId::ID_COLUMN;
-        let read: RoaringBitmap = FIRST_RUN.map(|k| k as u32).collect();
+        let read: Arc<RoaringBitmap> = Arc::new(FIRST_RUN.map(|k| k as u32).collect());
         let more: RoaringBitmap = FIRST_RUN.chain(SECOND_RUN).map(|k| k as u32).collect();
         let values: ArrayRef = Arc::new(Int64Array::from_iter_values(FIRST_RUN));
         let stats = ScalarStatsAgg::from_column(&values).expect("stats");
@@ -947,29 +952,24 @@ mod tests {
             field,
             CachedRows {
                 data_type: DataType::Int64,
-                rows: Arc::new(read.clone()),
+                rows: Arc::clone(&read),
                 stats: Arc::new(stats),
             },
         );
+        let get = |data_type: &DataType, rows: &Arc<RoaringBitmap>| {
+            cache.get(superfile, field, data_type, rows).is_some()
+        };
+        assert!(get(&DataType::Int64, &read), "the very bitmap read");
         assert!(
-            cache
-                .get(superfile, field, &DataType::Int64, &read)
-                .is_some()
+            get(&DataType::Int64, &Arc::new((*read).clone())),
+            "an equal bitmap"
         );
-        assert!(
-            cache
-                .get(superfile, field, &DataType::Int64, &more)
-                .is_none()
-        );
-        assert!(
-            cache
-                .get(superfile, field, &DataType::Int32, &read)
-                .is_none()
-        );
+        assert!(!get(&DataType::Int64, &Arc::new(more.clone())), "more rows");
+        assert!(!get(&DataType::Int32, &read), "another type");
         let base = cache
             .subset_of(superfile, field, &DataType::Int64, &more)
             .expect("a subset of the rows deleted since");
-        assert_eq!(*base.rows, read);
+        assert_eq!(base.rows, read);
         let fewer: RoaringBitmap = FIRST_RUN.skip(1).map(|k| k as u32).collect();
         assert!(
             cache
