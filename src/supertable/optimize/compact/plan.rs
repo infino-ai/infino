@@ -261,6 +261,13 @@ const RECLAIM_DELETED_PERCENT: u64 = 50;
 /// less; higher, a fifth to a half of a full file's bytes sit dead between
 /// rewrites. A sub-target file keeps the higher bar: it is merged with its
 /// neighbours as they fill a job, its deleted rows dropped then.
+///
+/// A rewrite packs the file with the neighbours its live bytes leave room
+/// for, so its output, as large in live bytes as the file was, packs with
+/// the same neighbours as before and is not merged again by the next pass.
+/// It is when the input cap or the memory a merge is given, which count the
+/// file's deleted rows too, kept a neighbour out that the smaller output
+/// takes it in next pass: the merge the cap had put off.
 const RECLAIM_FULL_DELETED_PERCENT: u64 = 20;
 
 /// Whether at least `percent` of `s`'s rows are deleted.
@@ -1066,7 +1073,7 @@ pub(in crate::supertable::optimize::compact) mod tests {
 
     /// A superfile at the target size is rewritten once a fifth of its rows
     /// are deleted, and not before: alone, or with the neighbours its live
-    /// rows leave room for, so its output is not merged again next pass.
+    /// rows leave room for.
     #[test]
     fn a_full_superfile_is_rewritten_once_a_fifth_is_deleted() {
         let cfg = reclaim_cfg();
@@ -1087,6 +1094,68 @@ pub(in crate::supertable::optimize::compact) mod tests {
         let mut inputs = jobs[0].inputs.clone();
         inputs.sort();
         assert_eq!(inputs, vec![full.superfile_id, neighbour.superfile_id]);
+    }
+
+    /// The superfiles after `jobs` ran over `stats`: each job's inputs
+    /// replaced by one superfile of its live rows, with no deletes.
+    fn after_pass(stats: &[SuperfileStats], jobs: &[CompactionJob]) -> Vec<SuperfileStats> {
+        let merged: HashSet<Uuid> = jobs.iter().flat_map(|job| job.inputs.clone()).collect();
+        let mut next: Vec<SuperfileStats> = stats
+            .iter()
+            .filter(|s| !merged.contains(&s.superfile_id))
+            .cloned()
+            .collect();
+        for (at, job) in jobs.iter().enumerate() {
+            let id_min = stats
+                .iter()
+                .filter(|s| job.inputs.contains(&s.superfile_id))
+                .map(|s| s.id_min)
+                .min()
+                .expect("a job has inputs");
+            next.push(SuperfileStats {
+                superfile_id: Uuid::from_u128(u128::MAX - at as u128),
+                size_bytes: job.estimated_output_bytes,
+                n_docs: job.live_docs,
+                tombstoned_docs: 0,
+                id_min,
+                ..seg(0, 0, 0, 0)
+            });
+        }
+        next
+    }
+
+    /// Over two passes, a full superfile a quarter deleted is rewritten
+    /// once: alone, its output is not merged with the same neighbours the
+    /// next pass, and packed with a neighbour, that job's output is left
+    /// alone too. Only when the input cap kept the neighbour out does the
+    /// smaller output take it in next pass.
+    #[test]
+    fn a_reclaimed_superfile_is_rewritten_once_over_two_passes() {
+        let cfg = reclaim_cfg();
+        let full = seg(3, 100, 1_000, 250);
+        for stats in [
+            vec![seg(1, 30, 1_000, 0), seg(2, 30, 1_000, 0), full.clone()],
+            vec![full.clone(), seg(4, 10, 1_000, 0)],
+        ] {
+            let first = select(&stats, &cfg);
+            assert_eq!(first.len(), 1, "{first:?}");
+            assert!(first[0].inputs.contains(&full.superfile_id));
+            let second = select(&after_pass(&stats, &first), &cfg);
+            assert!(second.is_empty(), "rewritten again: {second:?}");
+        }
+
+        let mut capped = reclaim_cfg();
+        capped.max_merge_input_mb = 105;
+        let stats = vec![full.clone(), seg(4, 10, 1_000, 0)];
+        let first = select(&stats, &capped);
+        assert_eq!(first.len(), 1);
+        assert_eq!(
+            first[0].inputs,
+            vec![full.superfile_id],
+            "the cap kept them apart"
+        );
+        let second = select(&after_pass(&stats, &first), &capped);
+        assert_eq!(second.len(), 1, "the smaller output takes the neighbour in");
     }
 
     /// A full superfile larger than one merge may read, or than the memory
