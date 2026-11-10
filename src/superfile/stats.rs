@@ -165,6 +165,53 @@ mod tests {
         assert!(stats.scalar_stats.contains_key(&FieldId(2)));
     }
 
+    /// A merge folds its statistics a decoded batch at a time, and whether
+    /// the merged superfile keeps a column's exact table must not hang on
+    /// where those batches were cut. A rating cycling through a hundred
+    /// values, in a batch of exactly a hundred rows, is a table of values
+    /// that each appear once; folded with batches where they repeat, the
+    /// merged superfile still counts the column exactly, so a filtered or
+    /// grouped count over it reads the statistics, not the rows.
+    #[test]
+    fn a_merge_keeps_a_column_table_wherever_its_batches_are_cut() {
+        const RATINGS: u64 = 100;
+        let schema = stamp_ids_by_position(&Arc::new(Schema::new(vec![
+            Field::new("doc_id", DataType::Decimal128(38, 0), false),
+            Field::new("rating", DataType::Int64, false),
+        ])));
+        let batch = |rows: std::ops::Range<u64>| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(decimal128_ids(rows.clone())),
+                    Arc::new(arrow_array::Int64Array::from_iter_values(
+                        rows.map(|doc| (doc % RATINGS) as i64),
+                    )),
+                ],
+            )
+            .expect("build RecordBatch")
+        };
+        let parts = [
+            batch(0..8_192),
+            batch(8_192..8_192 + RATINGS),
+            batch(8_292..9_000),
+        ];
+        let mut merged = SuperfileStats::from_children(&[]);
+        for part in &parts {
+            merged.merge(&SuperfileStats::try_compute_from_record_batch(part).expect("stats"));
+        }
+        let table = merged.scalar_stats[&FieldId(1)]
+            .value_counts
+            .as_ref()
+            .expect("the merged superfile counts the rating exactly");
+        assert_eq!(table.entries().len(), RATINGS as usize);
+        assert_eq!(
+            table.entries().iter().map(|(_, n)| n).sum::<u64>(),
+            9_000,
+            "every row counted"
+        );
+    }
+
     #[test]
     fn from_children_empty_returns_defaults() {
         let result = SuperfileStats::from_children(&[]);

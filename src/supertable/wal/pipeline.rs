@@ -75,7 +75,10 @@ use crate::{
     runtime_bridge::{bridge_sync_to_async, run_on_pool},
     runtime_metrics::op_stats::{OpStatsCollector, timed_kernel},
     storage::{StorageError, StorageProvider},
-    superfile::{ReadError, SuperfileReader, builder::SuperfileBuilder},
+    superfile::{
+        ReadError, SuperfileReader,
+        builder::{SuperfileBuilder, project_to},
+    },
     supertable::{
         ManifestSnapshot,
         error::{BuildError, CommitError as ManifestCommitError},
@@ -105,6 +108,7 @@ use crate::{
             with_id_column,
         },
     },
+    utils::nulls::populated_columns,
 };
 
 /// Outcome of one append-phase invocation.
@@ -511,17 +515,24 @@ async fn append_replacement_rows(
     // closure as well would count that CPU twice.
     let bytes = if manifest.vector_configs().is_empty() {
         timed_kernel(op_stats, || {
+            // The replacement stores the columns its rows fill, as an
+            // append does; a nullable column none of them sets reads null.
+            let populated = populated_columns([&scalar_with_id]);
             let mut builder =
-                SuperfileBuilder::new(builder_options_of(&manifest)).map_err(|e| {
-                    AppendPhaseError::SuperfileBuild {
+                SuperfileBuilder::new(builder_options_of(&manifest).storing_only(&populated))
+                    .map_err(|e| AppendPhaseError::SuperfileBuild {
                         message: format!("builder construction: {e}"),
-                    }
-                })?;
-            builder
-                .add_batch(&scalar_with_id, &vector_slices)
-                .map_err(|e| AppendPhaseError::SuperfileBuild {
+                    })?;
+            let stored = project_to(&scalar_with_id, builder.input_schema()).map_err(|e| {
+                AppendPhaseError::SuperfileBuild {
+                    message: format!("stored columns: {e}"),
+                }
+            })?;
+            builder.add_batch(&stored, &vector_slices).map_err(|e| {
+                AppendPhaseError::SuperfileBuild {
                     message: format!("add_batch: {e}"),
-                })?;
+                }
+            })?;
             let raw = builder
                 .finish()
                 .map_err(|e| AppendPhaseError::SuperfileBuild {
@@ -588,7 +599,8 @@ async fn append_replacement_rows(
     .map_err(|e| AppendPhaseError::SuperfileBuild {
         message: format!("term index contribution: {e}"),
     })?;
-    let scalar_stats = ScalarStatsAgg::from_batches(&manifest.scalar_schema(), &[&scalar_with_id]);
+    // Statistics for the columns the file stores, whichever build wrote it.
+    let scalar_stats = ScalarStatsAgg::from_batches(reader.schema(), &[&scalar_with_id]);
 
     let (id_min, id_max) = if flat_ids.is_empty() {
         (0, 0)

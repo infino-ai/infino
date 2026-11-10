@@ -40,6 +40,7 @@ use crate::{
             ManifestSnapshot, ScalarStatsAgg, SuperfileEntry,
             list::Manifest,
             list_prune::{prune_parts_for_fts_prefix, prune_parts_for_fts_terms},
+            load_section_groups,
             part::PartId,
             term_index::{TermIndex, TermIndexError},
         },
@@ -365,7 +366,18 @@ pub(crate) async fn select_superfiles(
         return Ok(Vec::new());
     }
 
-    // ---- Tier B: per-superfile prune.
+    // ---- Tier B: per-superfile prune. The statistics it reads are read
+    // and decoded off the runtime first; the masks below then read them in
+    // place.
+    let mut columns: Vec<FieldId> = Vec::new();
+    statistics_columns(leaves, &mut |column| {
+        if let Some(id) = manifest.field_id(column) {
+            columns.push(id);
+        }
+    });
+    columns.sort_unstable();
+    columns.dedup();
+    load_section_groups(&superfiles, &columns).await;
     let term_index = manifest.term_index().await?;
     let mask = keep_mask(manifest, &superfiles, term_index.as_deref(), leaves).await?;
 
@@ -384,6 +396,26 @@ pub(crate) async fn select_superfiles(
         stats.add_presence_pruning_survived(kept.len() as u64);
     }
     Ok(kept)
+}
+
+/// Every column whose per-superfile scalar statistics `leaves` test,
+/// handed to `found`, the branches of an `OR` included. Term and prefix
+/// leaves read the term index and the text summaries, not these.
+fn statistics_columns<'a>(leaves: &'a [PruneLeaf], found: &mut dyn FnMut(&'a str)) {
+    for leaf in leaves {
+        match leaf {
+            PruneLeaf::Scalar(predicate) => found(&predicate.column),
+            PruneLeaf::ScalarValueSet { column, .. } | PruneLeaf::NullCheck { column, .. } => {
+                found(column)
+            }
+            PruneLeaf::AnyOf(branches) => {
+                for branch in branches {
+                    statistics_columns(branch, found);
+                }
+            }
+            PruneLeaf::TermPresence { .. } | PruneLeaf::Prefix { .. } => {}
+        }
+    }
 }
 
 /// Which of `superfiles` a conjunction of `leaves` keeps, one bool each.
@@ -649,6 +681,40 @@ mod tests {
             op,
             value: ScalarValue::Int64(Some(v)),
         }
+    }
+
+    /// The pruner loads the statistics of every column a scalar, value-set
+    /// or null-check leaf tests, the branches of an `OR` included, and none
+    /// of the columns only a term or prefix leaf names.
+    #[test]
+    fn statistics_columns_names_every_scalar_leaf_column() {
+        let leaves = vec![
+            PruneLeaf::Scalar(pred("a", ScalarOp::Gt, 1)),
+            PruneLeaf::TermPresence {
+                column: "text".into(),
+                terms: vec!["x".into()],
+                mode: BoolMode::And,
+            },
+            PruneLeaf::AnyOf(vec![
+                vec![PruneLeaf::NullCheck {
+                    column: "b".into(),
+                    want_null: true,
+                }],
+                vec![
+                    PruneLeaf::ScalarValueSet {
+                        column: "c".into(),
+                        values: vec![ScalarValue::Int64(Some(1))],
+                    },
+                    PruneLeaf::Prefix {
+                        column: "prefixed".into(),
+                        prefix: b"p".to_vec(),
+                    },
+                ],
+            ]),
+        ];
+        let mut columns = Vec::new();
+        statistics_columns(&leaves, &mut |column| columns.push(column));
+        assert_eq!(columns, vec!["a", "b", "c"]);
     }
 
     #[test]

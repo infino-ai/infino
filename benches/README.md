@@ -32,6 +32,8 @@ INFINO_BENCH_SUPERFILE_DOCS=100000 \
 
 cargo bench -- diagnostic                # optional diagnostics
 cargo bench -- tombstone
+cargo bench -- wide-sparse               # compaction of a wide, sparse table (by name only)
+cargo bench -- hybrid-optimize           # optimize after a small hybrid build (by name only)
 ```
 
 Positional args after `--`: `[tier] [modality] [phase...] [corpus=…]`.
@@ -677,6 +679,20 @@ Engine top-k graded against a streaming BM25 oracle over the whole corpus, tie-a
 | SQL | 75.02 s | 13.3 K/s | 256 | 11.42 GiB | 9.44 GiB | 11.02 GiB |
 <!-- END: bench/supertable/ingest -->
 
+### Supertable compaction — wide, sparse table (300K rows, 2,500 columns)
+
+_Host: 11-core arm64 laptop · release build · `cargo bench -- wide-sparse`, optimize measured alone (`INFINO_BENCH_WIDE_SPARSE_DIR`) with `/usr/bin/time -l`_
+
+The table's schema grows to 2,500 nullable string, integer and list columns over 30 commits of 10,000 rows; each row fills two of twenty common columns and four of its commit's sixty-column family. Default `optimize`, one merge:
+
+| | stored | columns / superfile | footer / superfile | optimize | peak RSS | peak footprint |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| full-width superfiles, previous merge | 248.5 MiB | 1,703 | 413.7 KiB | 14.2 s | 16.9 GB | 19.1 GB |
+| full-width superfiles, current merge | 248.5 MiB | 1,703 | 413.7 KiB | 6.0 s | 1.01 GB | 0.92 GB |
+| superfiles storing the columns they fill | 147.8 MiB | 81 | 23.1 KiB | 3.5 s | 0.65 GB | 0.52 GB |
+
+The merge holds one null array per type for a batch's empty columns, folds its column statistics as they arrive, and bounds what its body encoder and decoders hold by bytes; a write stores only the nullable columns its rows set.
+
 ### Supertable FTS — compaction reorder leaf (5M-doc corpora, 1 GiB superfiles)
 
 _Host: 8-vCPU x86_64 cloud VM · release build · two optimize runs per arm_
@@ -928,3 +944,18 @@ Which terms get the second sub-block, each policy its own build and run, latency
 | previous format (none) | +5.3% | +8.3% | — |
 
 The order is the same on the held-out set and on every shape: the gain lives in the common terms, the ones a walk meets in every block it visits; keeping the rare and mid terms narrow costs nothing measurable (a run's noise is ±1–2%) and keeps their pruning at the finer grain. The default is one document in a thousand: the same speed as every term wide, the second-smallest data growth, and a density rather than a count so it carries across corpus sizes. The halved skip entries and block headers pay for most of the one-width-per-256-lanes cost of the doc-id and tf streams.
+
+<!-- BEGIN: bench/diagnostic/hybrid-optimize -->
+### Optimize after building a small hybrid table
+
+_Host: Intel(R) Xeon(R) CPU @ 2.80GHz · 8C/16T · 31 GiB RAM · linux/x86_64_
+
+One append of N rows (a 12-word BM25 column and a cosine vector column clustered around 32 centres), then one default `optimize()`, which drains the rows into the hidden vector-cell index and recalibrates its probe laws. Median of 3 fresh tables per shape, local filesystem.
+
+| Rows | Dim | Optimize p50 |
+| --- | --- | --- |
+| 600 | 64 | 1.32 s |
+| 2.4K | 64 | 1.82 s |
+| 6K | 64 | 1.95 s |
+| 6K | 384 | 2.27 s |
+<!-- END: bench/diagnostic/hybrid-optimize -->

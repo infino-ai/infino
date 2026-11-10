@@ -63,27 +63,34 @@ use arrow_array::ArrayRef;
 use arrow_schema::DataType;
 use datafusion::{
     catalog::TableProvider,
-    common::{ScalarValue, tree_node::Transformed},
+    common::{
+        ScalarValue,
+        tree_node::{Transformed, TreeNodeRecursion},
+    },
     datasource::{DefaultTableSource, provider_as_source},
     error::{DataFusionError, Result as DfResult},
     functions::core::expr_fn::{coalesce, greatest, least},
     functions_aggregate::expr_fn::{count, max, min, sum},
     logical_expr::{
-        Aggregate, Expr, Filter, LogicalPlan, LogicalPlanBuilder, Operator, TableScan, lit,
-        utils::split_conjunction,
+        Aggregate, Expr, Filter, LogicalPlan, LogicalPlanBuilder, Operator, TableScan, TableSource,
+        lit, utils::split_conjunction,
     },
     optimizer::{OptimizerConfig, OptimizerRule, optimizer::ApplyOrder},
     prelude::{cast, col, ident},
 };
+use futures::future::try_join_all;
 use uuid::Uuid;
 
 use crate::supertable::{
     error::QueryError,
-    manifest::{ManifestSnapshot, SuperfileEntry, add_sum_arrays, list::ScalarValueCounts},
+    manifest::{
+        ManifestSnapshot, SuperfileEntry, add_sum_arrays, list::ScalarValueCounts,
+        load_section_groups_blocking,
+    },
     query::{
         provider::{CountedRange, SupertableProvider},
         range_counts::RangeBucket,
-        skip::ColumnTypeGuard,
+        skip::{ColumnTypeGuard, file_lacks_column},
     },
     schema::{DECIMAL128_PRECISION, DECIMAL128_SCALE, FieldId},
 };
@@ -154,6 +161,33 @@ enum Class {
     Boundary,
 }
 
+/// Load every manifest part of each table an unfiltered, ungrouped aggregate
+/// in `plan` reads, subqueries included, so the rewrite below finds the
+/// whole table in memory and answers from statistics. That aggregate's scan
+/// would load every part anyway, so loading them before optimization adds no
+/// reads.
+pub(crate) async fn load_unfiltered_aggregate_inputs(plan: &LogicalPlan) -> Result<(), QueryError> {
+    let mut sources: Vec<Arc<dyn TableSource>> = Vec::new();
+    plan.apply_with_subqueries(|node| {
+        if let LogicalPlan::Aggregate(agg) = node
+            && agg.group_expr.is_empty()
+            && let Some(scan) = peel_unfiltered_scan(agg.input.as_ref())
+            && provider_of(scan).is_some_and(|provider| !provider.is_segment_restricted())
+        {
+            sources.push(Arc::clone(&scan.source));
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })
+    .map_err(QueryError::DataFusion)?;
+    try_join_all(sources.iter().filter_map(|source| {
+        let source = source.downcast_ref::<DefaultTableSource>()?;
+        let provider = source.table_provider.downcast_ref::<SupertableProvider>()?;
+        Some(provider.load_every_part())
+    }))
+    .await?;
+    Ok(())
+}
+
 fn try_rewrite(plan: &LogicalPlan) -> DfResult<Option<LogicalPlan>> {
     let LogicalPlan::Aggregate(agg) = plan else {
         return Ok(None);
@@ -171,9 +205,12 @@ fn try_rewrite(plan: &LogicalPlan) -> DfResult<Option<LogicalPlan>> {
         return Ok(None);
     };
 
-    // Unfiltered aggregate over a complete, clean snapshot: every segment is
-    // covered, so emit one literal row directly. This handles SUM/AVG as well
-    // as COUNT/MIN/MAX and avoids invoking the provider's Parquet scan at all.
+    // Unfiltered aggregate over a complete snapshot: a clean segment is
+    // covered by its statistics. When every segment is clean, emit one
+    // literal row directly. This handles SUM/AVG as well as COUNT/MIN/MAX
+    // and avoids invoking the provider's Parquet scan at all. Otherwise only
+    // the segments with deletes (or an unknown tombstone state) or a
+    // missing stat are scanned.
     if let Some(scan) = peel_unfiltered_scan(agg.input.as_ref()) {
         let Some(provider) = provider_of(scan) else {
             return Ok(None);
@@ -181,16 +218,22 @@ fn try_rewrite(plan: &LogicalPlan) -> DfResult<Option<LogicalPlan>> {
         if provider.is_segment_restricted() {
             return Ok(None);
         }
-        let Some(superfiles) = provider.manifest().complete_flat_superfiles() else {
+        let manifest = provider.manifest();
+        let Some(superfiles) = manifest.resident_superfiles() else {
             return Ok(None);
         };
-        let manifest = provider.manifest();
-        if !superfiles.iter().all(|entry| {
-            provider.entry_is_clean(entry) && has_required_stats(manifest, entry, &kinds)
-        }) {
-            return Ok(None);
+        let (covered, boundary): (Vec<&Arc<SuperfileEntry>>, Vec<&Arc<SuperfileEntry>>) =
+            superfiles.iter().partition(|entry| {
+                provider.entry_is_clean(entry) && has_required_stats(manifest, entry, &kinds)
+            });
+        if !boundary.is_empty() {
+            if covered.is_empty() {
+                // Nothing answerable from statistics.
+                return Ok(None);
+            }
+            let boundary = boundary.iter().map(|entry| entry.superfile_id).collect();
+            return rewrite_with_residual(agg, scan, provider, &kinds, &covered, boundary, None);
         }
-        let covered: Vec<&Arc<SuperfileEntry>> = superfiles.iter().collect();
         let mut partials = Vec::with_capacity(kinds.len());
         for kind in &kinds {
             let Some(partial) = accumulate_partial(manifest, kind, &covered) else {
@@ -306,10 +349,33 @@ fn try_rewrite(plan: &LogicalPlan) -> DfResult<Option<LogicalPlan>> {
         return Ok(None);
     }
 
+    rewrite_with_residual(
+        agg,
+        scan,
+        provider,
+        &kinds,
+        &covered,
+        boundary,
+        Some(&predicate),
+    )
+}
+
+/// Answer `agg` from the `covered` segments' statistics plus a scan of the
+/// `boundary` segments, filtered by `predicate` when the query has one.
+fn rewrite_with_residual(
+    agg: &Aggregate,
+    scan: &TableScan,
+    provider: &SupertableProvider,
+    kinds: &[AggKind],
+    covered: &[&Arc<SuperfileEntry>],
+    boundary: HashSet<Uuid>,
+    predicate: Option<&Expr>,
+) -> DfResult<Option<LogicalPlan>> {
+    let manifest = provider.manifest();
     // Accumulate the covered partials per aggregate output.
     let mut partials: Vec<Partial> = Vec::with_capacity(kinds.len());
-    for kind in &kinds {
-        match accumulate_partial(manifest, kind, &covered) {
+    for kind in kinds {
+        match accumulate_partial(manifest, kind, covered) {
             Some(partial) => partials.push(partial),
             // A fold failure (overflow, type surprise) is always safe
             // to decline.
@@ -326,8 +392,10 @@ fn try_rewrite(plan: &LogicalPlan) -> DfResult<Option<LogicalPlan>> {
         scan.table_name.clone(),
         provider_as_source(restricted as Arc<dyn TableProvider>),
         None,
-    )?
-    .filter(predicate.clone())?;
+    )?;
+    if let Some(predicate) = predicate {
+        builder = builder.filter(predicate.clone())?;
+    }
 
     // Partial aggregates over the residual, one batch per output (AVG
     // needs two: sum + non-null count). Each column is named exactly, as
@@ -512,15 +580,22 @@ pub(crate) fn value_counts_nulls(
         return None;
     }
     let id = manifest.field_id(column)?;
+    // The null counts are read in place below; their groups are read and
+    // decoded off the runtime's queue first, as a scan's are.
+    load_section_groups_blocking(superfiles, &[id]);
     let mut nulls = Some(0u64);
     for entry in superfiles {
         if !provider.entry_is_clean(entry) {
             return None;
         }
-        let file_nulls = entry
-            .scalar_stats
-            .column(id)
-            .and_then(|stats| stats.null_count());
+        // A file without the column holds it null in every row.
+        let file_nulls = match file_lacks_column(entry, id) {
+            true => Some(entry.n_docs),
+            false => entry
+                .scalar_stats
+                .column(id)
+                .and_then(|stats| stats.null_count()),
+        };
         nulls = nulls.zip(file_nulls).and_then(|(a, b)| a.checked_add(b));
     }
     Some(nulls)
@@ -608,10 +683,14 @@ fn accumulate_partial(
 }
 
 /// The non-null rows of `col` across `covered`: each superfile's row count
-/// less its recorded null count. `None` when a superfile lacks the null count.
+/// less its recorded null count, and none from a superfile that does not
+/// hold the column. `None` when a superfile holding it lacks the null count.
 fn non_null_count(covered: &[&Arc<SuperfileEntry>], col: FieldId) -> Option<i64> {
     let mut count: i64 = 0;
     for entry in covered {
+        if file_lacks_column(entry, col) {
+            continue;
+        }
         let nulls = entry.scalar_stats.column(col)?.null_count()?;
         let non_null = entry.n_docs.checked_sub(nulls)?;
         count = count.checked_add(i64::try_from(non_null).ok()?)?;
@@ -1159,9 +1238,16 @@ fn has_required_stats(
         }
         entry.scalar_stats.column(id)
     };
+    // A file without the column holds it null in every row: its count is
+    // known without statistics.
+    let absent = |col: &str| {
+        manifest
+            .field_id(col)
+            .is_some_and(|id| file_lacks_column(entry, id))
+    };
     kinds.iter().all(|kind| match kind {
         AggKind::CountStar => true,
-        AggKind::Count(col) => usable(col).is_some_and(|a| a.null_count().is_some()),
+        AggKind::Count(col) => absent(col) || usable(col).is_some_and(|a| a.null_count().is_some()),
         AggKind::Sum(col) => usable(col).is_some_and(|a| a.sum().is_some()),
         AggKind::Min(col) | AggKind::Max(col) => usable(col).is_some(),
         AggKind::Avg(col) => {

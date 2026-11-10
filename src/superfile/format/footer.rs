@@ -27,20 +27,22 @@ use std::{
     collections::HashMap,
     fs::File,
     io::{self, BufReader, Cursor, Read, Seek, SeekFrom, Write},
-    mem,
+    mem, slice,
     sync::Arc,
 };
 
 use arrow::{
-    array::{Array, ArrayRef, AsArray, OffsetSizeTrait},
+    array::{Array, ArrayRef, AsArray, OffsetSizeTrait, new_empty_array},
     record_batch::RecordBatch,
 };
-use arrow_schema::{DataType, Schema, SchemaRef};
+use arrow_schema::{DataType, FieldRef, Schema, SchemaRef};
 use bytes::Bytes;
 use parquet::{
     arrow::{
-        ArrowWriter,
-        arrow_writer::{ArrowLeafColumn, ArrowRowGroupWriterFactory, compute_leaves},
+        ArrowSchemaConverter, ArrowWriter,
+        arrow_writer::{
+            ArrowColumnChunk, ArrowColumnWriter, ArrowRowGroupWriterFactory, compute_leaves,
+        },
     },
     basic::Compression,
     file::{
@@ -48,10 +50,10 @@ use parquet::{
             FileMetaData, KeyValue, ParquetMetaData, ParquetMetaDataBuilder, ParquetMetaDataReader,
             ParquetMetaDataWriter,
         },
-        properties::{DEFAULT_WRITE_BATCH_SIZE, WriterProperties},
+        properties::{DEFAULT_WRITE_BATCH_SIZE, WriterProperties, WriterPropertiesPtr},
         writer::SerializedFileWriter,
     },
-    schema::types::ColumnPath,
+    schema::types::{ColumnPath, SchemaDescriptor, Type, TypePtr},
 };
 use rayon::prelude::*;
 use tempfile::NamedTempFile;
@@ -60,7 +62,6 @@ use crate::{
     config::scratch_root,
     runtime_metrics::ingest::offset_window,
     superfile::{LazyByteSource, LazyByteSourceError, format::kv},
-    utils::nulls::concat_sharing_nulls,
 };
 
 /// Length of Parquet's trailing `PAR1` magic, in bytes.
@@ -268,27 +269,82 @@ pub fn encode_parquet_body(
 /// chunks are appended group by group in column order, so the bytes are
 /// the same; only the encodes overlap. One group at a time, a body of few
 /// wide columns — a title and its id — encoded on about one thread.
+///
+/// A held group's column writers are made per column, as its encode
+/// starts, and closed as it ends ([`FieldWriters`]), so only the columns
+/// being encoded hold a writer: a few per thread, not one per column of
+/// the body. What a closed column keeps until its group is appended is its
+/// encoded pages.
+///
+/// What it holds is bounded by bytes as well as by groups: once the held
+/// slices decode to [`HELD_GROUP_BYTES`], the held full groups are encoded
+/// and the row group being filled is opened, its slices so far written to
+/// its column writers, and every later slice of that group written as it
+/// arrives, a task per column. A wide body — thousands of columns, each
+/// row costing a few bytes in each even where it is null — then holds its
+/// writers' encoded pages and one slice, not four row groups of its rows.
+/// Each writer still sees the same slices in the same order, so the bytes
+/// do not change. Where the caller keeps every row it writes for the whole
+/// encode ([`Self::with_rows_held_by_caller`]), holding their slices costs
+/// nothing, while an open group keeps a writer for every column of the
+/// body: the bound then only encodes the full groups held so far, and the
+/// group being filled is held until it is full.
 pub(crate) struct ParquetBodyEncoder {
     body_file: NamedTempFile,
     writer: SerializedFileWriter<File>,
     columns: ArrowRowGroupWriterFactory,
+    /// One field's column writers at a time, for the held groups.
+    field_writers: FieldWriters,
     schema: SchemaRef,
     row_group_size: usize,
-    /// The current row group's slices, in arrival order.
+    /// The current row group's slices, in arrival order, while it is held.
     held: Vec<RecordBatch>,
+    /// Rows of the current row group, held or already written.
     held_rows: usize,
     /// Full row groups not yet encoded, oldest first.
     full: Vec<Vec<RecordBatch>>,
+    /// What the rows of `full` and `held` decode to, by [`decoded_bytes`].
+    held_bytes: usize,
+    /// What `held_bytes` may reach before the current row group is written
+    /// as it arrives: [`HELD_GROUP_BYTES`].
+    held_group_bytes: usize,
+    /// The current row group's column writers, once it is written as its
+    /// slices arrive rather than held.
+    open: Option<Vec<ArrowColumnWriter>>,
+    /// Whether a group whose held slices pass the bound is opened and
+    /// written as it arrives; otherwise it is held until it is full.
+    opens_groups: bool,
+    /// Parquet leaf columns under each top-level field, in field order:
+    /// the run of column writers a field's task writes to.
+    leaves_per_field: Vec<usize>,
     /// Whether held groups are encoded side by side on the pool, or one at
     /// a time on this thread (see [`BodyPlan::encode_groups_together`]).
     together: bool,
 }
 
 /// Full row groups the encoder holds before encoding them side by side,
-/// one task per leaf column per group. The held groups are slices of the
+/// one task per column per group. The held groups are slices of the
 /// caller's batches, so holding them costs no copy; the encoded chunks of
 /// this many groups are what the encode holds beyond one group's.
 const ROW_GROUPS_ENCODED_TOGETHER: usize = 4;
+
+/// What the slices the encoder holds may decode to before it writes them
+/// (see [`ParquetBodyEncoder`]). A narrow body of ordinary rows holds its
+/// four row groups well under this; a body thousands of columns wide
+/// reaches it within one.
+pub(crate) const HELD_GROUP_BYTES: usize = 256 * 1024 * 1024;
+
+/// Bytes the rows of `batch` decode to: each column's share of its
+/// buffers, a buffer shared between columns counted once for each. That
+/// is what holding the batch is charged: a column's levels and pages grow
+/// with its rows the same way whether its buffer is shared or not.
+fn decoded_bytes(batch: &RecordBatch) -> usize {
+    batch
+        .columns()
+        .iter()
+        .map(|column| column.to_data().get_slice_memory_size().unwrap_or(0))
+        .sum()
+}
 
 impl ParquetBodyEncoder {
     pub(crate) fn new(
@@ -335,17 +391,51 @@ impl ParquetBodyEncoder {
         // carries the Arrow schema, exactly as before.
         let (writer, columns) = ArrowWriter::try_new(write_handle, schema.clone(), Some(props))?
             .into_serialized_writer()?;
+        let field_writers = FieldWriters::new(
+            writer.schema_descr(),
+            schema,
+            Arc::clone(writer.properties()),
+        );
+        let leaves_per_field = schema
+            .fields()
+            .iter()
+            .map(|field| {
+                compute_leaves(field.as_ref(), &new_empty_array(field.data_type()))
+                    .map(|leaves| leaves.len())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             body_file,
             writer,
             columns,
+            field_writers,
             schema: Arc::clone(schema),
             row_group_size: row_group_size.max(1),
             held: Vec::new(),
             held_rows: 0,
             full: Vec::new(),
+            held_bytes: 0,
+            held_group_bytes: HELD_GROUP_BYTES,
+            open: None,
+            opens_groups: true,
+            leaves_per_field,
             together,
         })
+    }
+
+    /// The encoder with `bytes` as its bound on what it holds.
+    #[cfg(test)]
+    fn holding_at_most(mut self, bytes: usize) -> Self {
+        self.held_group_bytes = bytes;
+        self
+    }
+
+    /// The encoder for rows its caller keeps until the encode finishes:
+    /// past the bound, it encodes the full groups it holds but never opens
+    /// a group (see [`ParquetBodyEncoder`]).
+    fn with_rows_held_by_caller(mut self) -> Self {
+        self.opens_groups = false;
+        self
     }
 
     /// Add `batch`, cutting it where a row group fills as `ArrowWriter` does.
@@ -354,92 +444,308 @@ impl ParquetBodyEncoder {
         while rest.num_rows() > 0 {
             let room = self.row_group_size - self.held_rows;
             let take = room.min(rest.num_rows());
-            self.held.push(rest.slice(0, take));
-            self.held_rows += take;
+            let part = rest.slice(0, take);
             rest = rest.slice(take, rest.num_rows() - take);
+            self.held_rows += take;
+            match self.open.as_mut() {
+                Some(writers) => encode_into(
+                    &self.schema,
+                    &self.leaves_per_field,
+                    writers,
+                    slice::from_ref(&part),
+                    self.together,
+                )?,
+                None => {
+                    self.held_bytes += decoded_bytes(&part);
+                    self.held.push(part);
+                    if self.held_bytes >= self.held_group_bytes {
+                        match self.opens_groups {
+                            true => self.open_current_group()?,
+                            false if !self.full.is_empty() => self.flush_row_groups()?,
+                            false => {}
+                        }
+                    }
+                }
+            }
             if self.held_rows >= self.row_group_size {
-                self.full.push(mem::take(&mut self.held));
                 self.held_rows = 0;
-                let held = match self.together {
-                    true => ROW_GROUPS_ENCODED_TOGETHER,
-                    false => 1,
-                };
-                if self.full.len() >= held {
-                    self.flush_row_groups()?;
+                match self.open.take() {
+                    Some(writers) => self.append_row_group(writers)?,
+                    None => {
+                        self.full.push(mem::take(&mut self.held));
+                        let held = match self.together {
+                            true => ROW_GROUPS_ENCODED_TOGETHER,
+                            false => 1,
+                        };
+                        if self.full.len() >= held {
+                            self.flush_row_groups()?;
+                        }
+                    }
                 }
             }
         }
         Ok(())
     }
 
-    /// Encode the held row groups, one task per leaf column per group, and
+    /// Stop holding the current row group: encode the full groups held
+    /// before it, then open its column writers and write its slices so far.
+    fn open_current_group(&mut self) -> Result<(), FooterError> {
+        self.flush_row_groups()?;
+        let index = self.writer.flushed_row_groups().len();
+        let mut writers = self.columns.create_column_writers(index)?;
+        let held = mem::take(&mut self.held);
+        self.held_bytes = 0;
+        encode_into(
+            &self.schema,
+            &self.leaves_per_field,
+            &mut writers,
+            &held,
+            self.together,
+        )?;
+        self.open = Some(writers);
+        Ok(())
+    }
+
+    /// Encode the held full row groups, one task per column per group, and
     /// append them in order.
+    ///
+    /// A task makes its column's writers, writes the group's slices and
+    /// closes them. Side by side, the closed chunks of every held group are
+    /// gathered and then appended; one at a time, each column's chunks are
+    /// appended as it closes, so the body holds one column's pages at most.
     fn flush_row_groups(&mut self) -> Result<(), FooterError> {
         let groups = mem::take(&mut self.full);
+        self.held_bytes = self.held.iter().map(decoded_bytes).sum();
         if groups.is_empty() {
             return Ok(());
         }
         let first_index = self.writer.flushed_row_groups().len();
-        // Each group's leaf-column writers and, per leaf column, its slices
-        // in the order the writer would get them.
-        let mut writers = Vec::with_capacity(groups.len());
-        let mut leaves: Vec<Vec<Vec<ArrowLeafColumn>>> = Vec::with_capacity(groups.len());
-        for (g, group) in groups.iter().enumerate() {
-            let group_writers = self.columns.create_column_writers(first_index + g)?;
-            let mut group_leaves: Vec<Vec<ArrowLeafColumn>> =
-                group_writers.iter().map(|_| Vec::new()).collect();
-            for batch in group {
-                for part in byte_bounded_slices(batch, MAX_WRITE_BYTES) {
-                    let mut leaf_index = 0;
-                    for (field, column) in self.schema.fields().iter().zip(part.columns()) {
-                        for leaf in compute_leaves(field.as_ref(), column)? {
-                            group_leaves[leaf_index].push(leaf);
-                            leaf_index += 1;
-                        }
+        let groups: Vec<Vec<RecordBatch>> = groups.iter().map(|g| write_slices(g)).collect();
+        let fields = self.schema.fields().len();
+        let Self {
+            writer,
+            field_writers,
+            together,
+            ..
+        } = self;
+        if !*together {
+            for (g, group) in groups.iter().enumerate() {
+                let mut row_group = writer.next_row_group()?;
+                for field in 0..fields {
+                    for chunk in field_writers.encode(field, first_index + g, group)? {
+                        chunk.append_to_row_group(&mut row_group)?;
                     }
                 }
+                row_group.close()?;
             }
-            writers.push(group_writers);
-            leaves.push(group_leaves);
+            return Ok(());
         }
-        drop(groups);
-        let mut tasks: Vec<_> = writers
-            .iter_mut()
-            .flatten()
-            .zip(leaves.iter().flatten())
+        let tasks: Vec<(usize, usize)> = (0..groups.len())
+            .flat_map(|g| (0..fields).map(move |field| (g, field)))
             .collect();
-        match self.together {
-            true => tasks.par_iter_mut().try_for_each(|(writer, leaves)| {
-                leaves.iter().try_for_each(|leaf| writer.write(leaf))
-            })?,
-            false => tasks.iter_mut().try_for_each(|(writer, leaves)| {
-                leaves.iter().try_for_each(|leaf| writer.write(leaf))
-            })?,
-        }
-        for group_writers in writers {
-            let mut row_group = self.writer.next_row_group()?;
-            for writer in group_writers {
-                writer.close()?.append_to_row_group(&mut row_group)?;
+        let chunks: Vec<Vec<ArrowColumnChunk>> = tasks
+            .par_iter()
+            .map(|&(g, field)| field_writers.encode(field, first_index + g, &groups[g]))
+            .collect::<Result<_, _>>()?;
+        let n_groups = groups.len();
+        drop(groups);
+        let mut chunks = chunks.into_iter();
+        for _ in 0..n_groups {
+            let mut row_group = writer.next_row_group()?;
+            for column in chunks.by_ref().take(fields).flatten() {
+                column.append_to_row_group(&mut row_group)?;
             }
             row_group.close()?;
         }
         Ok(())
     }
 
+    /// Close `writers`, one row group's, and append it to the body.
+    fn append_row_group(&mut self, writers: Vec<ArrowColumnWriter>) -> Result<(), FooterError> {
+        let mut row_group = self.writer.next_row_group()?;
+        for writer in writers {
+            writer.close()?.append_to_row_group(&mut row_group)?;
+        }
+        row_group.close()?;
+        Ok(())
+    }
+
     /// Close the writer and strip the Parquet footer, yielding the same
     /// [`EncodedBody`] as [`encode_parquet_body`].
     pub(crate) fn finish(mut self) -> Result<EncodedBody, FooterError> {
-        if !self.held.is_empty() {
-            self.full.push(mem::take(&mut self.held));
-            self.held_rows = 0;
+        match self.open.take() {
+            Some(writers) => self.append_row_group(writers)?,
+            None => {
+                if !self.held.is_empty() {
+                    self.full.push(mem::take(&mut self.held));
+                }
+                self.flush_row_groups()?;
+            }
         }
-        self.flush_row_groups()?;
         let Self {
             body_file, writer, ..
         } = self;
         writer.close()?;
         strip_parquet_footer(body_file)
     }
+}
+
+/// Makes the column writers of one top-level field of a body at a time.
+///
+/// [`ArrowRowGroupWriterFactory`] makes a row group's writers for every
+/// column at once, and each writer holds a codec and encoders of its own
+/// for as long as it is open: a zstd codec keeps a decompression context
+/// (about 100 KiB) beside its compression context (from a few KiB to over a
+/// MiB, by the largest page it has compressed), and a dictionary encoder a
+/// hash table of 4,096 slots (about 72 KiB for 64-bit values): on a body
+/// thousands of columns wide, a few hundred KiB a column whatever the
+/// column holds, while every one is open. A field's writers made here come from
+/// a schema of that field alone, whose leaves have the same paths, levels
+/// and types as in the whole body's schema, so the chunks they close append
+/// to the body's row group exactly as chunks of the whole schema's writers
+/// would; the body's writer checks each chunk's column against its own.
+struct FieldWriters {
+    /// The name of the body's schema root.
+    root: String,
+    /// The Parquet type of each top-level field, in field order.
+    fields: Vec<TypePtr>,
+    /// Each top-level Arrow field, in field order.
+    arrow: Vec<FieldRef>,
+    props: WriterPropertiesPtr,
+}
+
+impl FieldWriters {
+    /// Writers for the fields of `arrow`, whose Parquet schema is `parquet`,
+    /// with `props`.
+    fn new(parquet: &SchemaDescriptor, arrow: &Schema, props: WriterPropertiesPtr) -> Self {
+        Self {
+            root: parquet.root_schema().name().to_string(),
+            fields: parquet.root_schema().get_fields().to_vec(),
+            arrow: arrow.fields().iter().cloned().collect(),
+            props,
+        }
+    }
+
+    /// The column writers of field `field`, for row group `row_group`.
+    fn create(
+        &self,
+        field: usize,
+        row_group: usize,
+    ) -> Result<Vec<ArrowColumnWriter>, FooterError> {
+        let root = Type::group_type_builder(&self.root)
+            .with_fields(vec![Arc::clone(&self.fields[field])])
+            .build()?;
+        let file = SerializedFileWriter::new(io::sink(), Arc::new(root), Arc::clone(&self.props))?;
+        let arrow = Arc::new(Schema::new(vec![Arc::clone(&self.arrow[field])]));
+        Ok(ArrowRowGroupWriterFactory::new(&file, arrow).create_column_writers(row_group)?)
+    }
+
+    /// Column `field` of `batches`, written in order by fresh writers for
+    /// row group `row_group` and closed: the field's column chunks.
+    fn encode(
+        &self,
+        field: usize,
+        row_group: usize,
+        batches: &[RecordBatch],
+    ) -> Result<Vec<ArrowColumnChunk>, FooterError> {
+        let mut writers = self.create(field, row_group)?;
+        for batch in batches {
+            let leaves = compute_leaves(&self.arrow[field], batch.column(field))?;
+            for (writer, leaf) in writers.iter_mut().zip(leaves) {
+                writer.write(&leaf)?;
+            }
+        }
+        writers
+            .into_iter()
+            .map(|writer| writer.close().map_err(FooterError::from))
+            .collect()
+    }
+}
+
+/// One encode task: a top-level field's index, the slices to write, and
+/// the run of leaf column writers under that field.
+type ColumnTask<'a, 'w> = (usize, &'a [RecordBatch], &'w mut [ArrowColumnWriter]);
+
+/// `writers`, one row group's leaf column writers in schema order, cut
+/// into the run under each top-level field, by field index.
+fn column_tasks<'w>(
+    leaves_per_field: &[usize],
+    writers: &'w mut [ArrowColumnWriter],
+) -> Result<Vec<(usize, &'w mut [ArrowColumnWriter])>, FooterError> {
+    let mut rest = writers;
+    let mut tasks = Vec::with_capacity(leaves_per_field.len());
+    for (field, &leaves) in leaves_per_field.iter().enumerate() {
+        if rest.len() < leaves {
+            return Err(FooterError::Malformed(
+                "fewer column writers than the schema has leaves",
+            ));
+        }
+        let (own, after) = mem::take(&mut rest).split_at_mut(leaves);
+        rest = after;
+        tasks.push((field, own));
+    }
+    if !rest.is_empty() {
+        return Err(FooterError::Malformed(
+            "more column writers than the schema has leaves",
+        ));
+    }
+    Ok(tasks)
+}
+
+/// Run `tasks`, side by side on the pool when `together`.
+///
+/// A task computes its column's leaves (the levels and values the writer
+/// takes) from its slices as it writes them, so a column's levels exist
+/// only while its task runs: computed up front, every column's levels of
+/// every held group would be alive at once, two bytes a row per column for
+/// a nullable one.
+fn run_column_tasks(
+    schema: &Schema,
+    tasks: &mut [ColumnTask<'_, '_>],
+    together: bool,
+) -> Result<(), FooterError> {
+    let encode = |(field, batches, writers): &mut ColumnTask<'_, '_>| -> Result<(), FooterError> {
+        let field_ref = schema.field(*field);
+        for batch in batches.iter() {
+            let leaves = compute_leaves(field_ref, batch.column(*field))?;
+            for (writer, leaf) in writers.iter_mut().zip(leaves) {
+                writer.write(&leaf)?;
+            }
+        }
+        Ok(())
+    };
+    match together {
+        true => tasks.par_iter_mut().try_for_each(encode),
+        false => tasks.iter_mut().try_for_each(encode),
+    }
+}
+
+/// Write `batches` to `writers`, one row group's, a task per column.
+fn encode_into(
+    schema: &Schema,
+    leaves_per_field: &[usize],
+    writers: &mut [ArrowColumnWriter],
+    batches: &[RecordBatch],
+    together: bool,
+) -> Result<(), FooterError> {
+    let parts = write_slices(batches);
+    let mut tasks: Vec<ColumnTask<'_, '_>> = column_tasks(leaves_per_field, writers)?
+        .into_iter()
+        .map(|(field, own)| (field, parts.as_slice(), own))
+        .collect();
+    run_column_tasks(schema, &mut tasks, together)
+}
+
+/// `batches`, in order, each cut by [`byte_bounded_slices`] at
+/// [`MAX_WRITE_BYTES`]: the slices every column writer is handed, whether
+/// a row group is held and encoded whole or written as it arrives. Cut
+/// once per batch rather than in each column's task, since where a batch
+/// is cut depends on all of its columns.
+fn write_slices(batches: &[RecordBatch]) -> Vec<RecordBatch> {
+    batches
+        .iter()
+        .flat_map(|batch| byte_bounded_slices(batch, MAX_WRITE_BYTES))
+        .collect()
 }
 
 /// Writer properties for a body: `compression` everywhere, cut every
@@ -593,7 +899,7 @@ type ColumnSizes = HashMap<String, u64>;
 /// measured on the body's own rows:
 ///
 /// ```text
-///   first row group ─┬─ encode as configured ──────┐
+///   sample rows ─────┬─ encode as configured ──────┐
 ///                    └─ encode candidates plain ───┴─▶ per column: plain if smaller
 /// ```
 ///
@@ -621,17 +927,16 @@ pub(crate) struct BodyPlan {
 
 impl BodyPlan {
     /// The candidates written without a dictionary, for a body whose first
-    /// rows are `sample`.
+    /// rows are the batches of `sample`, in order.
     fn choose(
         &self,
         schema: &Arc<Schema>,
-        sample: &RecordBatch,
+        sample: &[RecordBatch],
     ) -> Result<Vec<String>, FooterError> {
         if self.dictionary_candidates.is_empty() {
             return Ok(Vec::new());
         }
-        let dictionary = self.measure(schema, sample, &[])?;
-        let plain = self.measure(schema, sample, &self.dictionary_candidates)?;
+        let (dictionary, plain) = self.measure(schema, sample)?;
         Ok(plain_where_smaller(
             &self.dictionary_candidates,
             &dictionary,
@@ -639,46 +944,81 @@ impl BodyPlan {
         ))
     }
 
+    /// Compressed bytes of each candidate column when the batches of
+    /// `sample` are encoded in order, with its dictionary and without.
+    ///
+    /// Each candidate is encoded on its own, once each way, by writers made
+    /// for it alone ([`FieldWriters`]) and dropped as soon as its sizes are
+    /// read: the measure holds the writers of the columns being measured,
+    /// not two encodes of every column of the body, and columns that are not
+    /// candidates are not encoded at all. A column's encode depends only on
+    /// its own values, the writer settings and the slices it is written in,
+    /// which are the body's, so its sizes are those of an encode of the
+    /// whole sample. The sample's batches are encoded as they are, slices
+    /// of the rows written, never joined into one: a joined sample would
+    /// copy a slot per cell of the body, null or not, in proportion to its
+    /// width, where encoding the slices copies nothing.
+    fn measure(
+        &self,
+        schema: &Arc<Schema>,
+        sample: &[RecordBatch],
+    ) -> Result<(ColumnSizes, ColumnSizes), FooterError> {
+        let limits = self.page_size_limits();
+        let props = |plain: &[String]| {
+            Arc::new(writer_properties(
+                self.compression,
+                self.row_group_size,
+                &limits,
+                plain,
+            ))
+        };
+        let (with, without) = (props(&[]), props(&self.dictionary_candidates));
+        let parquet = ArrowSchemaConverter::new()
+            .with_coerce_types(with.coerce_types())
+            .convert(schema)?;
+        let (with, without) = (
+            FieldWriters::new(&parquet, schema, with),
+            FieldWriters::new(&parquet, schema, without),
+        );
+        let slices: Vec<RecordBatch> = sample
+            .iter()
+            .flat_map(|batch| byte_bounded_slices(batch, MAX_WRITE_BYTES))
+            .collect();
+        let fields: Vec<usize> = self
+            .dictionary_candidates
+            .iter()
+            .filter_map(|name| schema.index_of(name).ok())
+            .collect();
+        let measure = |&field: &usize| -> Result<(usize, u64, u64), FooterError> {
+            let size = |writers: &FieldWriters| -> Result<u64, FooterError> {
+                Ok(writers
+                    .encode(field, 0, &slices)?
+                    .iter()
+                    .map(|chunk| {
+                        u64::try_from(chunk.close().metadata.compressed_size()).unwrap_or(0)
+                    })
+                    .sum())
+            };
+            Ok((field, size(&with)?, size(&without)?))
+        };
+        let sizes: Vec<(usize, u64, u64)> = match self.encode_groups_together {
+            true => fields.par_iter().map(measure).collect::<Result<_, _>>()?,
+            false => fields.iter().map(measure).collect::<Result<_, _>>()?,
+        };
+        let (mut dictionary, mut plain) = (ColumnSizes::new(), ColumnSizes::new());
+        for (field, with, without) in sizes {
+            let name = schema.field(field).name();
+            dictionary.insert(name.clone(), with);
+            plain.insert(name.clone(), without);
+        }
+        Ok((dictionary, plain))
+    }
+
     fn page_size_limits(&self) -> Vec<(&str, usize)> {
         self.column_page_size_limits
             .iter()
             .map(|(c, l)| (c.as_str(), *l))
             .collect()
-    }
-
-    /// Compressed bytes of each top-level column when `sample` is encoded
-    /// with no dictionary for `plain_columns`.
-    fn measure(
-        &self,
-        schema: &Arc<Schema>,
-        sample: &RecordBatch,
-        plain_columns: &[String],
-    ) -> Result<ColumnSizes, FooterError> {
-        let props = writer_properties(
-            self.compression,
-            self.row_group_size,
-            &self.page_size_limits(),
-            plain_columns,
-        );
-        let mut writer = ArrowWriter::try_new(io::sink(), schema.clone(), Some(props))?;
-        for part in byte_bounded_slices(sample, MAX_WRITE_BYTES) {
-            writer.write(&part)?;
-        }
-        let meta = writer.close()?;
-        let mut sizes = ColumnSizes::new();
-        for rg in meta.row_groups() {
-            for chunk in rg.columns() {
-                let column = chunk
-                    .column_path()
-                    .parts()
-                    .first()
-                    .cloned()
-                    .unwrap_or_default();
-                *sizes.entry(column).or_default() +=
-                    u64::try_from(chunk.compressed_size()).unwrap_or(0);
-            }
-        }
-        Ok(sizes)
     }
 }
 
@@ -703,15 +1043,21 @@ fn plain_where_smaller(
 }
 
 /// [`ParquetBodyEncoder`] whose dictionaries are chosen by a [`BodyPlan`]
-/// from the first rows written: it holds rows until it has one row group
-/// (or the body ends), chooses, then writes them and streams the rest
-/// straight through. The held rows are the row group the writer would
-/// buffer anyway.
+/// from the first rows written: it holds rows until it has a row group's,
+/// the rows the choice is measured on, or rows that decode to
+/// [`HELD_GROUP_BYTES`], or the body ends; chooses; then writes them and
+/// streams the rest straight through.
 pub(crate) struct PlannedBodyEncoder {
     schema: Arc<Schema>,
     plan: BodyPlan,
     held: Vec<RecordBatch>,
     held_rows: usize,
+    /// What `held` decodes to, by [`decoded_bytes`].
+    held_bytes: usize,
+    /// Whether the caller keeps every row it writes until the encode
+    /// finishes, handed on to the encoder (see
+    /// [`ParquetBodyEncoder::with_rows_held_by_caller`]).
+    rows_held_by_caller: bool,
     encoder: Option<ParquetBodyEncoder>,
 }
 
@@ -722,8 +1068,16 @@ impl PlannedBodyEncoder {
             plan,
             held: Vec::new(),
             held_rows: 0,
+            held_bytes: 0,
+            rows_held_by_caller: false,
             encoder: None,
         }
+    }
+
+    /// The encoder for rows its caller keeps until the encode finishes.
+    pub(crate) fn with_rows_held_by_caller(mut self) -> Self {
+        self.rows_held_by_caller = true;
+        self
     }
 
     pub(crate) fn write_batch(&mut self, batch: &RecordBatch) -> Result<(), FooterError> {
@@ -731,8 +1085,10 @@ impl PlannedBodyEncoder {
             return encoder.write_batch(batch);
         }
         self.held_rows += batch.num_rows();
+        self.held_bytes += decoded_bytes(batch);
         self.held.push(batch.clone());
-        if self.held_rows >= self.plan.row_group_size {
+        // The bytes bound holds whoever keeps the rows.
+        if self.held_rows >= self.plan.row_group_size || self.held_bytes >= HELD_GROUP_BYTES {
             self.start()?;
         }
         Ok(())
@@ -741,24 +1097,21 @@ impl PlannedBodyEncoder {
     /// Choose the dictionaries from the held rows, open the encoder, and
     /// write them.
     ///
-    /// Only the sample (at most one row group) is copied; the held batches
-    /// are written as they came, so a merge that feeds one large input
-    /// batch never holds a second copy of it.
+    /// The sample, the first row group's rows, is slices of the held
+    /// batches, and nothing is copied: the held batches are written as they
+    /// came, so a merge that feeds one large input batch never holds a
+    /// second copy of it, and a wide body's sample costs nothing per column.
     fn start(&mut self) -> Result<(), FooterError> {
-        let mut sample_parts = Vec::new();
+        let mut sample = Vec::new();
         let mut wanted = self.plan.row_group_size;
         for batch in &self.held {
             if wanted == 0 {
                 break;
             }
             let take = batch.num_rows().min(wanted);
-            sample_parts.push(batch.slice(0, take));
+            sample.push(batch.slice(0, take));
             wanted -= take;
         }
-        // Held batches of a wide table share one null array per type for
-        // the columns they lack; joined as Arrow joins them, the sample
-        // would hold a null array of a row group's rows for each of those.
-        let sample = concat_sharing_nulls(&self.schema, &sample_parts)?;
         let plain_columns = self.plan.choose(&self.schema, &sample)?;
         let mut encoder = ParquetBodyEncoder::with_plain_columns(
             &self.schema,
@@ -768,6 +1121,9 @@ impl PlannedBodyEncoder {
             &plain_columns,
             self.plan.encode_groups_together,
         )?;
+        if self.rows_held_by_caller {
+            encoder = encoder.with_rows_held_by_caller();
+        }
         for batch in mem::take(&mut self.held) {
             encoder.write_batch(&batch)?;
         }
@@ -791,7 +1147,9 @@ pub(crate) fn encode_parquet_body_planned(
     batches: &[RecordBatch],
     plan: BodyPlan,
 ) -> Result<EncodedBody, FooterError> {
-    let mut encoder = PlannedBodyEncoder::new(schema, plan);
+    // `batches` outlive the encode, so the slices it holds of them cost
+    // nothing.
+    let mut encoder = PlannedBodyEncoder::new(schema, plan).with_rows_held_by_caller();
     for batch in batches {
         encoder.write_batch(batch)?;
     }
@@ -1356,15 +1714,15 @@ fn with_kv_list(metadata: &ParquetMetaData, kvs: Vec<KeyValue>) -> ParquetMetaDa
 
 #[cfg(test)]
 mod tests {
-    use std::slice;
+    use std::{fs, slice};
 
-    use arrow::compute::concat_batches;
+    use arrow::{buffer::NullBuffer, compute::concat_batches};
     use arrow_array::{
-        BinaryViewArray, FixedSizeBinaryArray, FixedSizeListArray, Float64Array, LargeStringArray,
-        StringArray, StringViewArray, StructArray, UInt64Array,
+        ArrayRef, BinaryViewArray, FixedSizeBinaryArray, FixedSizeListArray, Float64Array,
+        Int64Array, LargeStringArray, StringArray, StringViewArray, StructArray, UInt64Array,
         builder::{ListBuilder, MapBuilder, StringBuilder},
     };
-    use arrow_schema::{DataType, Field};
+    use arrow_schema::{DataType, Field, Fields};
     use parquet::{
         arrow::arrow_reader::ParquetRecordBatchReaderBuilder,
         basic::ZstdLevel,
@@ -2002,7 +2360,7 @@ mod tests {
         let (schema, batch) = unique_and_status(2 * TEST_GROUP_ROWS);
         let plan = plan(&schema);
         assert_eq!(
-            plan.choose(&schema, &batch.slice(0, TEST_GROUP_ROWS))
+            plan.choose(&schema, &[batch.slice(0, TEST_GROUP_ROWS)])
                 .expect("choose"),
             vec!["unique".to_string()]
         );
@@ -2134,6 +2492,57 @@ mod tests {
                 ("unique".to_string(), false),
                 ("status".to_string(), true)
             ]]
+        );
+    }
+
+    /// On a body thousands of columns wide the dictionary choice is still
+    /// measured on a whole row group: the sample is slices of the rows
+    /// written, so it costs nothing per column. A column whose first
+    /// thousand values are distinct and whose others repeat four strings
+    /// is larger plain on those first rows alone, and smaller with its
+    /// dictionary over the group, so it keeps the dictionary.
+    #[test]
+    fn a_wide_body_chooses_its_dictionaries_on_a_whole_row_group() {
+        const COLUMNS: usize = 9_000;
+        const ROWS: usize = 16_384;
+        const DISTINCT_FIRST: usize = 1_024;
+        let mut fields = vec![Field::new("status", DataType::Utf8, false)];
+        fields.extend((1..COLUMNS).map(|c| Field::new(format!("c{c}"), DataType::Int64, true)));
+        let schema = Arc::new(Schema::new(fields));
+        let status = StringArray::from(
+            (0..ROWS as u64)
+                .map(|i| {
+                    let pick = match i < DISTINCT_FIRST as u64 {
+                        true => i.wrapping_mul(SCATTER),
+                        false => i.wrapping_mul(SCATTER) >> 62,
+                    };
+                    let value = (pick + 1).wrapping_mul(SCATTER_2);
+                    format!("{value:016x}{:016x}{value:016x}", !value)
+                })
+                .collect::<Vec<_>>(),
+        );
+        let nulls = arrow_array::new_null_array(&DataType::Int64, ROWS);
+        let mut columns: Vec<ArrayRef> = vec![Arc::new(status)];
+        columns.extend((1..COLUMNS).map(|_| Arc::clone(&nulls)));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), columns).expect("batch");
+        let plan = BodyPlan {
+            row_group_size: ROWS,
+            dictionary_candidates: vec!["status".to_string()],
+            ..plan(&schema)
+        };
+
+        assert_eq!(
+            plan.choose(&schema, &[batch.slice(0, DISTINCT_FIRST)])
+                .expect("choose on the first rows"),
+            vec!["status".to_string()],
+            "the first rows alone favour plain values"
+        );
+        let body = encode_parquet_body_planned(&schema, slice::from_ref(&batch), plan)
+            .expect("planned body");
+        assert_eq!(
+            dictionaries(&body)[0][0],
+            ("status".to_string(), true),
+            "measured over the row group, the column keeps its dictionary"
         );
     }
 
@@ -2318,6 +2727,34 @@ mod tests {
         }
     }
 
+    /// A row group written as it arrives, rather than held and encoded
+    /// whole, is cut at the cap the same way: its pages stay near the cap.
+    #[test]
+    fn a_streamed_row_group_keeps_pages_near_the_write_cap() {
+        let batch = text_batch(&[BIG_PAGE_VALUE_BYTES; BIG_PAGE_ROWS]);
+        let schema = batch.schema();
+        let mut encoder = ParquetBodyEncoder::new(
+            &schema,
+            Compression::ZSTD(ZstdLevel::default()),
+            // Longer than the batch, so its row group is still open after it.
+            2 * BIG_PAGE_ROWS,
+            &[],
+        )
+        .expect("encoder")
+        .holding_at_most(1);
+        encoder.write_batch(&batch).expect("write");
+        assert!(
+            encoder.open.is_some(),
+            "past the bound the row group is written as it arrives"
+        );
+        let body = encoder.finish().expect("finish");
+        let largest = largest_text_page(body, &schema);
+        assert!(
+            largest <= MAX_WRITE_BYTES + BIG_PAGE_VALUE_BYTES,
+            "largest page {largest} bytes"
+        );
+    }
+
     /// A slice long enough to hold whole runs of the writer's values ends
     /// on a run, so neighbouring columns keep their page row limit.
     #[test]
@@ -2445,5 +2882,299 @@ mod tests {
                 "{name} slice"
             );
         }
+    }
+
+    /// Columns of the wide test body.
+    const WIDE_COLUMNS: usize = 300;
+
+    /// One row in this many holds a value in a given wide column.
+    const WIDE_FILL_EVERY: usize = 7;
+
+    /// Rows per write to the wide encoder: not a divisor of the row group,
+    /// so groups are cut mid-write.
+    const WIDE_PIECE_ROWS: usize = 1_000;
+
+    /// A body of [`WIDE_COLUMNS`] nullable string and list columns, each
+    /// holding a value in one row in [`WIDE_FILL_EVERY`]; every row costs
+    /// a few bytes in every column, null or not.
+    fn wide_sparse(rows: usize) -> (Arc<Schema>, RecordBatch) {
+        let item = Arc::new(Field::new("item", DataType::Utf8, true));
+        let mut fields = Vec::with_capacity(WIDE_COLUMNS);
+        let mut columns: Vec<ArrayRef> = Vec::with_capacity(WIDE_COLUMNS);
+        for c in 0..WIDE_COLUMNS {
+            let filled = |r: usize| (r + c).is_multiple_of(WIDE_FILL_EVERY);
+            if c.is_multiple_of(2) {
+                fields.push(Field::new(format!("s{c}"), DataType::LargeUtf8, true));
+                columns.push(Arc::new(LargeStringArray::from_iter(
+                    (0..rows).map(|r| filled(r).then(|| format!("{c}:{r}"))),
+                )));
+            } else {
+                fields.push(Field::new(
+                    format!("l{c}"),
+                    DataType::List(Arc::clone(&item)),
+                    true,
+                ));
+                let mut list = ListBuilder::new(StringBuilder::new()).with_field(Arc::clone(&item));
+                for r in 0..rows {
+                    if filled(r) {
+                        list.values().append_value(format!("{c}"));
+                        list.values().append_value(format!("{r}"));
+                    }
+                    list.append(filled(r));
+                }
+                columns.push(Arc::new(list.finish()));
+            }
+        }
+        let schema = Arc::new(Schema::new(fields));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), columns).expect("wide batch");
+        (schema, batch)
+    }
+
+    /// The wide body's footer-stripped bytes, encoded holding at most
+    /// `bound` bytes, its rows kept by the caller or not; the most it held
+    /// after any write; and whether it wrote a row group as it arrived.
+    fn encode_wide(
+        schema: &Arc<Schema>,
+        batch: &RecordBatch,
+        bound: usize,
+        held_by_caller: bool,
+    ) -> (Vec<u8>, usize, bool) {
+        let mut encoder = ParquetBodyEncoder::new(
+            schema,
+            Compression::ZSTD(ZstdLevel::try_new(3).expect("valid zstd level")),
+            TEST_GROUP_ROWS,
+            &[],
+        )
+        .expect("encoder")
+        .holding_at_most(bound);
+        if held_by_caller {
+            encoder = encoder.with_rows_held_by_caller();
+        }
+        let mut most_held = 0;
+        let mut streamed = false;
+        let mut start = 0;
+        while start < batch.num_rows() {
+            let len = WIDE_PIECE_ROWS.min(batch.num_rows() - start);
+            encoder
+                .write_batch(&batch.slice(start, len))
+                .expect("write piece");
+            most_held = most_held.max(encoder.held_bytes);
+            streamed |= encoder.open.is_some();
+            start += len;
+        }
+        let body = encoder.finish().expect("finish");
+        let mut bytes = fs::read(body.body_file.path()).expect("read body");
+        bytes.truncate(usize::try_from(body.body_len).expect("body length"));
+        (bytes, most_held, streamed)
+    }
+
+    /// Rows of each write of the mixed body: a page is cut only where a
+    /// write ends, so both encodes are fed the same writes.
+    const MIXED_WRITE_ROWS: usize = 1_000;
+
+    /// A mixed body: a sparse integer, a string, a list of strings, a
+    /// struct of an integer and a string, and a dense id, `rows` rows.
+    fn mixed(rows: usize) -> (Arc<Schema>, RecordBatch) {
+        let item = Arc::new(Field::new("item", DataType::Utf8, true));
+        let inner = Fields::from(vec![
+            Field::new("n", DataType::Int64, true),
+            Field::new("s", DataType::Utf8, true),
+        ]);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::UInt64, false),
+            Field::new("sparse", DataType::Int64, true),
+            Field::new("text", DataType::LargeUtf8, true),
+            Field::new("tags", DataType::List(Arc::clone(&item)), true),
+            Field::new("pair", DataType::Struct(inner.clone()), true),
+        ]));
+        let mut tags = ListBuilder::new(StringBuilder::new()).with_field(Arc::clone(&item));
+        for r in 0..rows {
+            if r.is_multiple_of(3) {
+                tags.values().append_value(format!("t{}", r % 11));
+                tags.values().append_value(format!("u{}", r % 5));
+            }
+            tags.append(r.is_multiple_of(3));
+        }
+        let pair = StructArray::new(
+            inner,
+            vec![
+                Arc::new(Int64Array::from_iter(
+                    (0..rows).map(|r| r.is_multiple_of(4).then_some(r as i64)),
+                )),
+                Arc::new(StringArray::from_iter(
+                    (0..rows).map(|r| r.is_multiple_of(2).then(|| format!("s{}", r % 9))),
+                )),
+            ],
+            Some(NullBuffer::from_iter(
+                (0..rows).map(|r| !r.is_multiple_of(5)),
+            )),
+        );
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(UInt64Array::from_iter_values(
+                (0..rows as u64).map(|r| r.wrapping_mul(SCATTER)),
+            )),
+            Arc::new(Int64Array::from_iter(
+                (0..rows).map(|r| r.is_multiple_of(13).then_some(r as i64)),
+            )),
+            Arc::new(LargeStringArray::from_iter(
+                (0..rows).map(|r| (r % 2 == 1).then(|| format!("row {r} of the body"))),
+            )),
+            Arc::new(tags.finish()),
+            Arc::new(pair),
+        ];
+        let batch = RecordBatch::try_new(Arc::clone(&schema), columns).expect("mixed batch");
+        (schema, batch)
+    }
+
+    /// The bytes `ArrowWriter` writes for `batch`, written in slices of
+    /// [`MIXED_WRITE_ROWS`] rows, up to the end of its last row group, under
+    /// the body's writer properties.
+    fn arrow_writer_body(
+        schema: &Arc<Schema>,
+        batch: &RecordBatch,
+        plain_columns: &[String],
+    ) -> Vec<u8> {
+        let props = writer_properties(
+            Compression::ZSTD(ZstdLevel::try_new(3).expect("valid zstd level")),
+            TEST_GROUP_ROWS,
+            &[],
+            plain_columns,
+        );
+        let mut bytes = Vec::new();
+        let mut writer =
+            ArrowWriter::try_new(&mut bytes, Arc::clone(schema), Some(props)).expect("writer");
+        for start in (0..batch.num_rows()).step_by(MIXED_WRITE_ROWS) {
+            let len = MIXED_WRITE_ROWS.min(batch.num_rows() - start);
+            writer.write(&batch.slice(start, len)).expect("write");
+        }
+        let meta = writer.close().expect("close");
+        let end = meta
+            .row_groups()
+            .iter()
+            .flat_map(|rg| rg.columns())
+            .map(|c| {
+                let (start, len) = c.byte_range();
+                start + len
+            })
+            .max()
+            .expect("a column chunk");
+        bytes.truncate(usize::try_from(end).expect("body end"));
+        bytes
+    }
+
+    /// A body whose columns are encoded one at a time by writers made for
+    /// each alone, side by side or in turn, is the bytes `ArrowWriter`
+    /// writes with every column's writer open at once: nested and struct
+    /// columns included, with and without dictionaries.
+    #[test]
+    fn a_body_encoded_a_column_at_a_time_is_the_bytes_arrow_writer_writes() {
+        let (schema, batch) = mixed(3 * TEST_GROUP_ROWS + 123);
+        for plain in [Vec::new(), vec!["id".to_string(), "text".to_string()]] {
+            let want = arrow_writer_body(&schema, &batch, &plain);
+            for together in [true, false] {
+                let mut encoder = ParquetBodyEncoder::with_plain_columns(
+                    &schema,
+                    Compression::ZSTD(ZstdLevel::try_new(3).expect("valid zstd level")),
+                    TEST_GROUP_ROWS,
+                    &[],
+                    &plain,
+                    together,
+                )
+                .expect("encoder");
+                for start in (0..batch.num_rows()).step_by(MIXED_WRITE_ROWS) {
+                    let len = MIXED_WRITE_ROWS.min(batch.num_rows() - start);
+                    encoder
+                        .write_batch(&batch.slice(start, len))
+                        .expect("write");
+                }
+                let body = encoder.finish().expect("finish");
+                let mut got = fs::read(body.body_file.path()).expect("read body");
+                // The body keeps the page index after its row groups.
+                got.truncate(want.len());
+                assert_eq!(body.metadata.num_row_groups(), 4);
+                assert!(
+                    got == want,
+                    "together={together} plain={plain:?}: {} bytes against {}",
+                    got.len(),
+                    want.len()
+                );
+            }
+        }
+    }
+
+    /// The sizes the dictionary choice is made on, each candidate encoded on
+    /// its own, are the column chunk sizes of an `ArrowWriter` encode of the
+    /// whole sample, with and without the dictionaries.
+    #[test]
+    fn a_column_measured_alone_is_its_size_in_an_encode_of_the_whole_sample() {
+        let (schema, batch) = mixed(TEST_GROUP_ROWS);
+        let mut plan = plan(&schema);
+        plan.dictionary_candidates = ["id", "sparse", "text"].map(String::from).to_vec();
+        let whole = |plain: &[String]| -> ColumnSizes {
+            let props = writer_properties(plan.compression, plan.row_group_size, &[], plain);
+            let mut writer =
+                ArrowWriter::try_new(io::sink(), Arc::clone(&schema), Some(props)).expect("writer");
+            writer.write(&batch).expect("write");
+            let meta = writer.close().expect("close");
+            let mut sizes = ColumnSizes::new();
+            for chunk in meta.row_groups().iter().flat_map(|rg| rg.columns()) {
+                let column = chunk.column_path().parts()[0].clone();
+                if plan.dictionary_candidates.contains(&column) {
+                    *sizes.entry(column).or_default() += chunk.compressed_size() as u64;
+                }
+            }
+            sizes
+        };
+        for together in [true, false] {
+            plan.encode_groups_together = together;
+            let (with, without) = plan
+                .measure(&schema, slice::from_ref(&batch))
+                .expect("measure");
+            assert_eq!(with, whole(&[]), "together={together}");
+            assert_eq!(
+                without,
+                whole(&plan.dictionary_candidates),
+                "together={together}"
+            );
+        }
+    }
+
+    /// A body whose held rows would decode past the bound writes its row
+    /// group as the rows arrive instead of holding them, holds no more than
+    /// the bound and one write's rows, and writes exactly the bytes it
+    /// writes when it holds every group.
+    #[test]
+    fn a_wide_body_is_written_as_it_arrives_and_its_bytes_do_not_change() {
+        let (schema, batch) = wide_sparse(3 * TEST_GROUP_ROWS + TEST_GROUP_ROWS / 2);
+        let piece = decoded_bytes(&batch.slice(0, WIDE_PIECE_ROWS));
+        let bound = 2 * piece;
+
+        let (held, held_most, held_streamed) = encode_wide(&schema, &batch, usize::MAX, false);
+        let (bounded, bounded_most, bounded_streamed) = encode_wide(&schema, &batch, bound, false);
+        let (kept, kept_most, kept_streamed) = encode_wide(&schema, &batch, bound, true);
+
+        assert!(!held_streamed, "without a bound every group is held");
+        assert!(
+            bounded_streamed,
+            "past the bound the group is written as it arrives"
+        );
+        assert!(
+            bounded_most < bound + piece,
+            "held {bounded_most} bytes against a bound of {bound}"
+        );
+        assert!(
+            held_most > 4 * bounded_most,
+            "the unbounded encoder held {held_most}"
+        );
+        assert_eq!(held, bounded, "the bytes do not depend on what was held");
+        assert!(
+            !kept_streamed,
+            "rows the caller keeps are held, the group being filled included"
+        );
+        assert!(
+            kept_most < held_most,
+            "past the bound the full groups are encoded: held {kept_most} of {held_most}"
+        );
+        assert_eq!(held, kept, "nor on whether the caller keeps the rows");
     }
 }

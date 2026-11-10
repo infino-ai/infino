@@ -9,11 +9,13 @@ use std::{
     env::temp_dir,
     fmt::{self, Debug},
     path::PathBuf,
-    sync::atomic::AtomicU64,
+    sync::{Arc, atomic::AtomicU64},
     time::Duration,
 };
 
-use crate::{config::CrcVerification, supertable::manifest::SuperfileUri};
+use crate::{
+    config::CrcVerification, memory::ConnectionMemoryBudget, supertable::manifest::SuperfileUri,
+};
 
 /// How `DiskCacheStore` services a cache miss.
 ///
@@ -148,6 +150,11 @@ pub struct DiskCacheConfig {
     /// directly can set the right value for their storage backend;
     /// the supertable sets both from one source.
     pub crc_verification: CrcVerification,
+    /// The memory budget a background download charges for the chunks it holds between their GET
+    /// and their write to disk. Tables opened through the catalog or from `config.yaml` set their
+    /// connection's budget, so the downloads of every table on the connection count against the
+    /// memory its queries use. `None` charges nothing.
+    pub fill_memory_budget: Option<Arc<ConnectionMemoryBudget>>,
 }
 
 /// Default Tier-1 disk-cache byte budget (10 GiB).
@@ -157,7 +164,7 @@ const DEFAULT_COLD_FETCH_STREAMS: usize = 8;
 /// Default range-GET chunk size (32 MiB); peak in-flight bytes is
 /// `streams × chunk` (256 MiB). Large chunks keep a whole-file download to
 /// few GETs: a 1 GB superfile is 32.
-const DEFAULT_COLD_FETCH_CHUNK_BYTES: u64 = 32 * (1 << 20);
+pub(crate) const DEFAULT_COLD_FETCH_CHUNK_BYTES: u64 = 32 * (1 << 20);
 /// Default number of concurrent background full-superfile fills.
 const DEFAULT_PREFETCH_CONCURRENCY: usize = 8;
 /// Default idle age (seconds) before an mmap is `MADV_DONTNEED`-swept.
@@ -184,6 +191,7 @@ impl Default for DiskCacheConfig {
             promotion_defer_timeout: DEFAULT_PROMOTION_DEFER_TIMEOUT,
             eviction: Box::new(LruPolicy::new()),
             crc_verification: CrcVerification::default(),
+            fill_memory_budget: None,
         }
     }
 }

@@ -122,6 +122,7 @@ use crate::{
         error::QueryError,
         manifest::{
             ColumnStats, ManifestSnapshot, add_sum_arrays, hll::HllSketch, list::ScalarValueCounts,
+            load_section_groups, load_section_groups_blocking,
         },
         query::{
             candidate::{
@@ -135,7 +136,7 @@ use crate::{
                 common::{BoundPredicate, PushedPredicate, take_rows, unqualified},
                 metered_exec::MeteredExec,
             },
-            fts::{memos_from_plan_locations, plan_locations_for},
+            fts::{IndexedSuperfile, memos_from_plan_locations, plan_locations_for},
             nan_bounds::without_nan_blind_bounds,
             prune::{PruneLeaf, select_superfiles},
             range_counts::{RangeBucket, RangeCounts},
@@ -697,6 +698,10 @@ impl SupertableProvider {
                 let id = self.manifest.field_id(column)?;
                 let stored = self.manifest.stored_schema();
                 let data_type = stored.field_with_name(column).ok()?.data_type();
+                // The counts are the heaviest statistics a section holds;
+                // the sum reads them in place, so they are read and decoded
+                // off the runtime's queue first, as a scan's are.
+                load_section_groups_blocking(entries, &[id]);
                 self.value_count_carry
                     .sum(id, data_type, entries)
                     .map(Arc::new)
@@ -964,6 +969,22 @@ impl SupertableProvider {
     /// (see [`RangeCounts`]).
     pub(crate) fn range_counts(&self, buckets: Vec<RangeBucket>) -> RangeCounts {
         RangeCounts::new(self.sibling(), buckets)
+    }
+
+    /// Load every part of a manifest whose resident view is incomplete, and
+    /// warm the delete views of all its superfiles, so a covered aggregate
+    /// finds the whole table in memory when the plan is optimized.
+    pub(crate) async fn load_every_part(&self) -> Result<(), QueryError> {
+        if self.manifest.complete_flat_superfiles().is_some() {
+            return Ok(());
+        }
+        let entries = self
+            .manifest
+            .get_all_superfiles_loaded()
+            .await
+            .map_err(QueryError::ManifestLoad)?;
+        self.prefetch_tombstones(&entries, Instant::now()).await;
+        Ok(())
     }
 
     /// Warm every one of `survivors`' tombstone bitmaps in one batched fetch,
@@ -1866,6 +1887,24 @@ impl TableProvider for SupertableProvider {
         // sweep below.
         self.prefetch_tombstones(&survivor_entries, now).await;
 
+        // The projected columns' statistics, read and decoded off the
+        // runtime, before the scan node's statistics read them in place
+        // below. No projection reads every column.
+        let statistics_columns: Vec<FieldId> = match projection {
+            Some(indices) => indices
+                .iter()
+                .filter_map(|i| self.schema.fields().get(*i))
+                .filter_map(|field| self.manifest.field_id(field.name()))
+                .collect(),
+            None => self
+                .schema
+                .fields()
+                .iter()
+                .filter_map(|field| self.manifest.field_id(field.name()))
+                .collect(),
+        };
+        load_section_groups(&survivor_entries, &statistics_columns).await;
+
         // A counting scan reads no row where a range index counts it (see
         // `range_count_exec`).
         if let Some(range) = &self.count_range {
@@ -2009,8 +2048,9 @@ impl TableProvider for SupertableProvider {
                         // usable bound, scan the superfile.
                         //
                         // Selectivity gate: estimate the match count from
-                        // per-term `df` first (cheap, header-only). If a
-                        // predicate would match more than
+                        // per-term `df` first (from the term index, or a
+                        // posting-header read when the index doesn't list the
+                        // term). If a predicate would match more than
                         // `PUSHDOWN_MAX_FRACTION` of this superfile, skip the
                         // index path and let DataFusion scan: at that match
                         // density the rows saturate the data pages, so an index
@@ -2086,8 +2126,16 @@ impl TableProvider for SupertableProvider {
                         let est = match top_k {
                             Some(_) => 0,
                             None => {
+                                let located = IndexedSuperfile {
+                                    locations: plan_locations,
+                                    superfile: entry.superfile_id,
+                                };
                                 let (est, est_work) = plan
-                                    .estimate(prepared.reader.as_ref(), Some(reader_pool))
+                                    .estimate(
+                                        prepared.reader.as_ref(),
+                                        Some(reader_pool),
+                                        Some(located),
+                                    )
                                     .await
                                     .map_err(QueryError::from)?;
                                 predicate_work.merge(est_work);

@@ -159,6 +159,10 @@ pub enum DiskCacheError {
     /// A lazy open never raises it: past the budget it stays a lazy entry.
     #[error("disk cache budget exceeded with no eligible victims")]
     BudgetExceeded,
+    /// The memory budget is too small for a background download's first chunk, so the download
+    /// stops before its first GET. If the chunk fits but queries hold the memory, it waits instead.
+    #[error("memory budget share is too small for a background download's first chunk")]
+    FillOverMemoryBudget,
     /// An invalid or conflicting configuration was supplied.
     #[error("config: {0}")]
     Config(String),

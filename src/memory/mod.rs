@@ -187,6 +187,8 @@ pub struct ConnectionMemoryBudget {
     // Cold reads waiting for room, so a release wakes them only when there
     // are any: most releases pay one atomic load.
     cold_read_waiters: AtomicUsize,
+    // Bytes background downloads hold. Also counted in `used` and `cold_read_bytes`.
+    background_bytes: AtomicUsize,
     // Sent on every release while a cold read is waiting, to all of them.
     released: Notify,
 }
@@ -211,6 +213,7 @@ impl ConnectionMemoryBudget {
             reclaimers: Mutex::new(Vec::new()),
             cold_read_bytes: Mutex::new(0),
             cold_read_waiters: AtomicUsize::new(0),
+            background_bytes: AtomicUsize::new(0),
             released: Notify::new(),
         })
     }
@@ -240,6 +243,7 @@ impl ConnectionMemoryBudget {
             reclaimers: Mutex::new(Vec::new()),
             cold_read_bytes: Mutex::new(0),
             cold_read_waiters: AtomicUsize::new(0),
+            background_bytes: AtomicUsize::new(0),
             released: Notify::new(),
         })
     }
@@ -402,6 +406,7 @@ impl ConnectionMemoryBudget {
         *held += reservation.size;
         ColdReadPermit {
             reservation: Some(reservation),
+            background: 0,
         }
     }
 
@@ -497,17 +502,71 @@ impl ConnectionMemoryBudget {
         n: usize,
         percent: usize,
     ) -> Option<Reservation> {
-        let over_share = |extra: usize| {
-            self.limit.is_some_and(|limit| {
-                self.used().saturating_add(extra).saturating_mul(100)
-                    > limit.saturating_mul(percent)
-            })
-        };
-        if over_share(n) {
+        if !self.fits_share(n, percent) {
             return None;
         }
         let reservation = self.try_reserve_without_reclaim(n).ok()?;
-        (!over_share(0)).then_some(reservation)
+        self.fits_share(0, percent).then_some(reservation)
+    }
+
+    /// Reserve `n` bytes for a background download (a cache fill), or `None` if it does not fit.
+    ///
+    /// - All downloads together hold at most `percent` of the limit.
+    /// - A download never takes the connection past `100 - percent`, so queries keep room.
+    /// - It is held as a cold read, so a cold read refused for room waits for it instead of
+    ///   failing.
+    ///
+    /// Never waits and never asks anyone to give memory back.
+    pub(crate) fn try_admit_background(
+        self: &Arc<Self>,
+        n: usize,
+        percent: usize,
+    ) -> Option<ColdReadPermit> {
+        // Claim the share first, so two downloads racing for the last of it can't both get in.
+        self.background_bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
+                let next = held.checked_add(n)?;
+                self.within(next, percent).then_some(next)
+            })
+            .ok()?;
+        let mut held = self.lock_cold_read_bytes();
+        let Some(reservation) = self.try_reserve_within_share(n, 100usize.saturating_sub(percent))
+        else {
+            self.background_bytes.fetch_sub(n, Ordering::Relaxed);
+            return None;
+        };
+        let mut permit = self.hold(&mut held, reservation);
+        permit.background = n;
+        Some(permit)
+    }
+
+    /// Whether [`Self::try_admit_background`] would admit `n` bytes right now. Always true for a
+    /// measure-only budget.
+    pub(crate) fn fits_background(&self, n: usize, percent: usize) -> bool {
+        self.within(
+            self.background_bytes
+                .load(Ordering::Relaxed)
+                .saturating_add(n),
+            percent,
+        ) && self.fits_share(n, 100usize.saturating_sub(percent))
+    }
+
+    /// Whether `n` bytes fit in a download share of `percent` at all, with nothing else held.
+    /// Always true for a measure-only budget.
+    pub(crate) fn share_holds(&self, n: usize, percent: usize) -> bool {
+        self.within(n, percent)
+    }
+
+    /// Whether `n` more bytes keep the budget within `percent` of its limit, as things stand.
+    /// Always true for a measure-only budget.
+    pub(crate) fn fits_share(&self, n: usize, percent: usize) -> bool {
+        self.within(self.used().saturating_add(n), percent)
+    }
+
+    /// Whether `bytes` are at most `percent` of the limit. Always true for a measure-only budget.
+    fn within(&self, bytes: usize, percent: usize) -> bool {
+        self.limit
+            .is_none_or(|limit| bytes.saturating_mul(100) <= limit.saturating_mul(percent))
     }
 
     /// Bytes currently reserved.
@@ -651,6 +710,8 @@ impl Drop for ColdReadWaiting<'_> {
 pub(crate) struct ColdReadPermit {
     // Always `Some` until dropped; taken in `drop` to release it under the lock.
     reservation: Option<Reservation>,
+    // How many of those bytes belong to a background download.
+    background: usize,
 }
 
 impl Drop for ColdReadPermit {
@@ -662,6 +723,9 @@ impl Drop for ColdReadPermit {
         {
             let mut held = budget.lock_cold_read_bytes();
             *held -= reservation.size;
+            budget
+                .background_bytes
+                .fetch_sub(self.background, Ordering::Relaxed);
             // Released under the lock, so a refused read never sees the count
             // without the bytes.
             drop(reservation);
@@ -1030,6 +1094,10 @@ mod tests {
     /// cold read, as the rest of a query (hit lookup, operators) holds it.
     const SHARED_BUDGET: u64 = 100 * KB;
 
+    /// Share of the limit a download may use in the share tests: room for a quarter of the
+    /// ceiling but not that plus a tenth, so one admission fits and a second does not.
+    const DOWNLOAD_SHARE_PERCENT: usize = 30;
+
     /// A budget whose ceiling is half held outside any cold read, the
     /// ceiling, and that outside reservation.
     fn half_held_budget() -> (Arc<ConnectionMemoryBudget>, usize, Reservation) {
@@ -1056,6 +1124,77 @@ mod tests {
             .now_or_never()
             .expect("the read retries once the first one lets go")
             .expect("and then fits");
+    }
+
+    /// A download admitted within its share holds memory as a cold read: a refused cold read waits
+    /// for it to come back instead of failing, and past the share the download gets nothing.
+    #[tokio::test]
+    async fn a_refused_cold_read_waits_for_a_download_admitted_within_its_share() {
+        let budget = ConnectionMemoryBudget::with_limit(SHARED_BUDGET);
+        let ceiling = budget.limit().expect("bounded");
+        let download = budget
+            .try_admit_background(ceiling / 4, DOWNLOAD_SHARE_PERCENT)
+            .expect("within the share");
+        assert!(
+            budget
+                .try_admit_background(ceiling / 10, DOWNLOAD_SHARE_PERCENT)
+                .is_none(),
+            "past the share, a download gets nothing"
+        );
+        let _outside = budget.try_reserve(ceiling / 2).expect("fits");
+        let mut read = Box::pin(budget.admit_cold_read(ceiling / 3));
+        assert!(
+            (&mut read).now_or_never().is_none(),
+            "a refused read waits while a download holds memory"
+        );
+        drop(download);
+        read.now_or_never()
+            .expect("the read retries once the download lets go")
+            .expect("and then fits");
+    }
+
+    /// A download gets its share even while the rest of the connection holds more than that
+    /// (read-ahead in a cold scan, say), and gets the share back when it drops its bytes.
+    #[test]
+    fn a_download_gets_its_share_whatever_else_the_connection_holds() {
+        let budget = ConnectionMemoryBudget::with_limit(SHARED_BUDGET);
+        let ceiling = budget.limit().expect("bounded");
+        let _outside = budget.try_reserve(ceiling * 2 / 5).expect("fits");
+        assert!(budget.fits_background(ceiling / 4, DOWNLOAD_SHARE_PERCENT));
+        let download = budget
+            .try_admit_background(ceiling / 4, DOWNLOAD_SHARE_PERCENT)
+            .expect("within the download share, past the connection's");
+        assert!(
+            !budget.fits_background(ceiling / 10, DOWNLOAD_SHARE_PERCENT),
+            "downloads together stay within their share"
+        );
+        drop(download);
+        assert!(
+            budget
+                .try_admit_background(ceiling / 4, DOWNLOAD_SHARE_PERCENT)
+                .is_some(),
+            "a dropped download gives its bytes back to the share"
+        );
+    }
+
+    /// A download never takes the connection past the rest of the limit, even with share to
+    /// spare, so queries keep room to grow.
+    #[test]
+    fn a_download_leaves_queries_room_to_grow() {
+        let (budget, ceiling, _outside) = half_held_budget();
+        assert!(!budget.fits_background(ceiling / 4, DOWNLOAD_SHARE_PERCENT));
+        assert!(
+            budget
+                .try_admit_background(ceiling / 4, DOWNLOAD_SHARE_PERCENT)
+                .is_none(),
+            "half held plus a quarter is past the 70% a download may bring the connection to"
+        );
+        assert!(
+            budget
+                .try_admit_background(ceiling / 10, DOWNLOAD_SHARE_PERCENT)
+                .is_some(),
+            "a smaller download still fits under it"
+        );
     }
 
     /// Every waiting read retries when memory comes back, not just one.

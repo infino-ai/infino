@@ -33,13 +33,16 @@
 
 use std::sync::Arc;
 
-use arrow_array::{LargeStringArray, RecordBatch};
+use arrow::util::pretty::pretty_format_batches;
+use arrow_array::{Float64Array, Int64Array, LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
+use datafusion::prelude::{col, lit};
 use infino::{
     Bm25SearchOptions,
     superfile::{builder::FtsConfig, fts::reader::BoolMode},
     supertable::{
         Supertable, SupertableOptions,
+        schema::change::{FieldPatch, SchemaPatch},
         storage::{LocalFsStorageProvider, StorageProvider},
     },
     test_helpers::{build_title_batch, default_disk_cache, default_supertable_options},
@@ -308,6 +311,273 @@ fn sql_loads_all_parts_returns_correct_count() {
         n_loaded, HIERARCHICAL_PART_COUNT,
         "SQL loads all parts (list-pushdown deferred); got {n_loaded}/5"
     );
+}
+
+/// An unfiltered `COUNT(*)` on a freshly opened lazy handle, with no part
+/// loaded yet, is answered from the manifest's statistics: the plan holds no
+/// table scan, and the count is exact.
+#[test]
+fn sql_unfiltered_count_on_a_lazy_handle_is_answered_from_stats() {
+    let dir = TempDir::new().expect("tempdir");
+    build_5_parts_with_distinct_terms(dir.path());
+    let cache_dir = TempDir::new().expect("cache");
+    let count = "SELECT COUNT(*) AS n FROM supertable";
+
+    let consumer = open_lazy_consumer(dir.path(), cache_dir.path());
+    assert_eq!(parts_loaded(&consumer), (0, HIERARCHICAL_PART_COUNT));
+    let explained = consumer
+        .reader()
+        .expect("reader")
+        .query_sql(&format!("EXPLAIN {count}"))
+        .expect("explain");
+    let plan = pretty_format_batches(&explained)
+        .expect("format plan")
+        .to_string();
+    assert!(
+        !plan.contains("TableScan"),
+        "answered from manifest stats, no scan:\n{plan}"
+    );
+
+    let consumer = open_lazy_consumer(dir.path(), cache_dir.path());
+    let batches = consumer
+        .reader()
+        .expect("reader")
+        .query_sql(count)
+        .expect("query");
+    let n = batches[0]
+        .column_by_name("n")
+        .expect("n column")
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("Int64")
+        .value(0);
+    assert_eq!(n, HIERARCHICAL_PART_COUNT as i64 * ROWS_PER_PART);
+}
+
+/// Fares of the fare fixture, one commit (and so one part) per pair.
+const FARES: [[i64; 2]; 5] = [[1, 2], [3, 4], [5, 6], [7, 8], [9, 10]];
+/// The fare the delete case removes; its superfile is the only one with
+/// deleted rows.
+const DELETED_FARE: i64 = 5;
+/// The file suffix a scanned superfile carries in a physical plan.
+const SUPERFILE_SUFFIX: &str = ".sf.parquet";
+/// The aggregates the fare tests run, answered from statistics on a clean
+/// table.
+const FARE_AGGREGATES: &str = "SELECT COUNT(*) AS n, SUM(fare) AS total, MIN(fare) AS lo, \
+     MAX(fare) AS hi, AVG(fare) AS mean FROM supertable";
+
+fn fare_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("title", DataType::LargeUtf8, false),
+        Field::new("fare", DataType::Int64, false),
+    ]))
+}
+
+fn fare_options() -> SupertableOptions {
+    let pool = Arc::new(
+        ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("rayon pool"),
+    );
+    SupertableOptions::new(fare_schema(), vec![FtsConfig::new("title")], vec![])
+        .expect("fare options")
+        .with_writer_pool(pool)
+}
+
+/// One part per [`FARES`] pair, titled `t<commit>`; with `delete`, the row
+/// holding [`DELETED_FARE`] is then deleted.
+fn build_fare_parts(storage_dir: &std::path::Path, delete: bool) {
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(storage_dir).expect("provider"));
+    let producer = Supertable::create(
+        fare_options()
+            .with_storage(Arc::clone(&storage))
+            .with_target_superfiles_per_part(TARGET_SUPERFILES_PER_PART),
+    )
+    .expect("create");
+    for (i, fares) in FARES.iter().enumerate() {
+        let title = format!("t{i}");
+        let batch = RecordBatch::try_new(
+            fare_schema(),
+            vec![
+                Arc::new(LargeStringArray::from(vec![title.as_str(); fares.len()])),
+                Arc::new(Int64Array::from(fares.to_vec())),
+            ],
+        )
+        .expect("fare batch");
+        let mut w = producer.writer().expect("writer");
+        w.append(&batch).expect("append");
+        w.commit().expect("commit");
+    }
+    if delete {
+        let mut w = producer.writer().expect("writer");
+        w.delete(col("fare").eq(lit(DELETED_FARE))).expect("delete");
+        w.commit().expect("commit delete");
+    }
+}
+
+fn open_lazy_fare_consumer(
+    storage_dir: &std::path::Path,
+    cache_dir: &std::path::Path,
+) -> Supertable {
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(storage_dir).expect("provider"));
+    let cache = default_disk_cache(Arc::clone(&storage), cache_dir);
+    Supertable::open(
+        fare_options()
+            .with_storage(Arc::clone(&storage))
+            .with_eager_load_threshold(EAGER_LOAD_THRESHOLD_FORCE_LAZY)
+            .with_disk_cache(Arc::clone(&cache)),
+    )
+    .expect("open")
+}
+
+/// `EXPLAIN sql` on `consumer`, formatted.
+fn explain(consumer: &Supertable, sql: &str) -> String {
+    let explained = consumer
+        .reader()
+        .expect("reader")
+        .query_sql(&format!("EXPLAIN {sql}"))
+        .expect("explain");
+    pretty_format_batches(&explained)
+        .expect("format plan")
+        .to_string()
+}
+
+/// [`FARE_AGGREGATES`] on `consumer`: count, sum, min, max and mean.
+fn fare_aggregates(consumer: &Supertable) -> (i64, i64, i64, i64, f64) {
+    let batches = consumer
+        .reader()
+        .expect("reader")
+        .query_sql(FARE_AGGREGATES)
+        .expect("query");
+    let int = |name: &str| {
+        batches[0]
+            .column_by_name(name)
+            .expect("column")
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("Int64")
+            .value(0)
+    };
+    let mean = batches[0]
+        .column_by_name("mean")
+        .expect("mean column")
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .expect("Float64")
+        .value(0);
+    (int("n"), int("total"), int("lo"), int("hi"), mean)
+}
+
+/// `SUM`, `MIN`, `MAX` and `AVG` beside `COUNT(*)` on a lazy handle are
+/// answered from statistics too, and exactly.
+#[test]
+fn sql_unfiltered_aggregates_on_a_lazy_handle_are_answered_from_stats() {
+    let dir = TempDir::new().expect("tempdir");
+    build_fare_parts(dir.path(), false);
+    let cache_dir = TempDir::new().expect("cache");
+
+    let consumer = open_lazy_fare_consumer(dir.path(), cache_dir.path());
+    assert_eq!(parts_loaded(&consumer), (0, FARES.len()));
+    let plan = explain(&consumer, FARE_AGGREGATES);
+    assert!(
+        !plan.contains("TableScan"),
+        "answered from manifest stats, no scan:\n{plan}"
+    );
+
+    let consumer = open_lazy_fare_consumer(dir.path(), cache_dir.path());
+    let fares: Vec<i64> = FARES.iter().flatten().copied().collect();
+    let total: i64 = fares.iter().sum();
+    assert_eq!(
+        fare_aggregates(&consumer),
+        (
+            fares.len() as i64,
+            total,
+            fares[0],
+            fares[fares.len() - 1],
+            total as f64 / fares.len() as f64
+        )
+    );
+}
+
+/// With rows deleted from one superfile, a lazy handle scans only that
+/// superfile and answers the rest from statistics; the result leaves the
+/// deleted row out.
+#[test]
+fn sql_unfiltered_aggregates_on_a_lazy_handle_see_deletes() {
+    let dir = TempDir::new().expect("tempdir");
+    build_fare_parts(dir.path(), true);
+    let cache_dir = TempDir::new().expect("cache");
+
+    let consumer = open_lazy_fare_consumer(dir.path(), cache_dir.path());
+    let plan = explain(&consumer, FARE_AGGREGATES);
+    assert_eq!(
+        plan.matches(SUPERFILE_SUFFIX).count(),
+        1,
+        "only the superfile with deletes is scanned:\n{plan}"
+    );
+
+    let consumer = open_lazy_fare_consumer(dir.path(), cache_dir.path());
+    let fares: Vec<i64> = FARES
+        .iter()
+        .flatten()
+        .copied()
+        .filter(|fare| *fare != DELETED_FARE)
+        .collect();
+    let total: i64 = fares.iter().sum();
+    assert_eq!(
+        fare_aggregates(&consumer),
+        (
+            fares.len() as i64,
+            total,
+            fares[0],
+            fares[fares.len() - 1],
+            total as f64 / fares.len() as f64
+        )
+    );
+}
+
+/// An unfiltered aggregate inside a scalar subquery is answered from
+/// statistics on a lazy handle too.
+#[test]
+fn sql_unfiltered_aggregate_in_a_subquery_on_a_lazy_handle_is_answered_from_stats() {
+    let dir = TempDir::new().expect("tempdir");
+    build_fare_parts(dir.path(), false);
+    let cache_dir = TempDir::new().expect("cache");
+
+    let consumer = open_lazy_fare_consumer(dir.path(), cache_dir.path());
+    let plan = explain(
+        &consumer,
+        "SELECT (SELECT SUM(fare) FROM supertable) AS total",
+    );
+    assert!(
+        !plan.contains("TableScan"),
+        "answered from manifest stats, no scan:\n{plan}"
+    );
+}
+
+/// A filtered or grouped aggregate does not load the parts up front: a
+/// filter on one title still loads only the part that holds it.
+#[test]
+fn sql_filtered_aggregates_on_a_lazy_handle_load_only_matching_parts() {
+    let dir = TempDir::new().expect("tempdir");
+    build_fare_parts(dir.path(), false);
+    let cache_dir = TempDir::new().expect("cache");
+
+    for sql in [
+        "SELECT COUNT(*) FROM supertable WHERE title = 't1'",
+        "SELECT title, COUNT(*) FROM supertable WHERE title = 't1' GROUP BY title",
+    ] {
+        let consumer = open_lazy_fare_consumer(dir.path(), cache_dir.path());
+        consumer
+            .reader()
+            .expect("reader")
+            .query_sql(sql)
+            .expect("query");
+        assert_eq!(parts_loaded(&consumer), (1, FARES.len()), "{sql}");
+    }
 }
 
 /// Build a manifest with `target_superfiles_per_part = 2`: each commit
@@ -635,11 +905,104 @@ fn open_tag_consumer(storage_dir: &std::path::Path, cache_dir: &std::path::Path)
     .expect("open")
 }
 
+/// How many superfiles of the loaded parts hold the `tag` column at all. A
+/// file whose rows leave a nullable column null throughout does not store
+/// it.
+fn files_holding_tag(consumer: &Supertable) -> usize {
+    let r = consumer.reader().expect("reader");
+    let m = r.manifest();
+    m.get_all_list_entries()
+        .iter()
+        .filter_map(|e| m.get_cached_part_by_id(&e.part_id))
+        .flat_map(|part| part.superfiles.clone())
+        .filter(|e| {
+            e.physical_schema
+                .as_ref()
+                .is_some_and(|p| p.column_by_name("tag").is_some())
+        })
+        .count()
+}
+
+/// [`tag_options`] with `tag` declared not null when the table is created.
+fn strict_tag_options() -> SupertableOptions {
+    let pool = Arc::new(
+        ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("rayon pool"),
+    );
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("title", DataType::LargeUtf8, false),
+        Field::new("tag", DataType::LargeUtf8, false),
+    ]));
+    SupertableOptions::new(schema, vec![FtsConfig::new("title")], vec![])
+        .expect("strict tag options")
+        .with_writer_pool(pool)
+        .with_target_superfiles_per_part(2)
+}
+
+/// A column created not null and relaxed to nullable is no longer in every
+/// file: a write whose rows leave it null does not store it, so the part
+/// tier must not prune `IS NULL` on an aggregate over the files that do.
+#[test]
+fn sql_is_null_finds_rows_written_after_a_column_was_relaxed() {
+    let dir = TempDir::new().expect("tempdir");
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+    let producer = Supertable::create(strict_tag_options().with_storage(Arc::clone(&storage)))
+        .expect("create");
+    let strict = Arc::new(Schema::new(vec![
+        Field::new("title", DataType::LargeUtf8, false),
+        Field::new("tag", DataType::LargeUtf8, false),
+    ]));
+    let set = RecordBatch::try_new(
+        strict,
+        vec![
+            Arc::new(LargeStringArray::from(vec!["a0", "a1"])),
+            Arc::new(LargeStringArray::from(vec!["x", "y"])),
+        ],
+    )
+    .expect("batch");
+    producer.append(&set).expect("append tagged rows");
+    producer
+        .apply_schema(
+            &SchemaPatch::new(vec![FieldPatch::named("tag").with_nullable(true)]),
+            None,
+        )
+        .expect("relax tag");
+    producer
+        .append(&tag_batch(&["b0", "b1"], &[None, None]))
+        .expect("append untagged rows");
+
+    let cache_dir = TempDir::new().expect("cache");
+    let cache = default_disk_cache(Arc::clone(&storage), cache_dir.path());
+    let consumer = Supertable::open(
+        strict_tag_options()
+            .with_storage(Arc::clone(&storage))
+            .with_eager_load_threshold(EAGER_LOAD_THRESHOLD_FORCE_LAZY)
+            .with_disk_cache(cache),
+    )
+    .expect("open");
+    let rows: usize = consumer
+        .reader()
+        .expect("reader")
+        .query_sql("SELECT _id FROM supertable WHERE tag IS NULL")
+        .expect("query")
+        .iter()
+        .map(|b| b.num_rows())
+        .sum();
+    assert_eq!(rows, 2, "the rows written after the relax read a null tag");
+}
+
 #[test]
 fn sql_is_null_prunes_no_null_parts() {
     // `tag IS NULL`:
-    //  - parts 1 and 2 have null_count == 0, so they're dropped.
-    //  - only part 0 (all-null tag) loads; its 4 rows match.
+    //  - part 0's files leave the all-null tag out; parts 1 and 2 have
+    //    null_count == 0.
+    //  - a part's null count covers only the files that store the column,
+    //    and a file may leave a nullable one out, so the part tier keeps
+    //    every part; the superfile tier drops the files with no null.
+    //  - part 0's 4 rows match.
     let dir = TempDir::new().expect("tempdir");
     build_tag_parts(dir.path());
     let cache_dir = TempDir::new().expect("cache");
@@ -657,13 +1020,23 @@ fn sql_is_null_prunes_no_null_parts() {
 
     let (loaded, total) = parts_loaded(&consumer);
     assert_eq!(total, 3);
-    assert_eq!(loaded, 1, "no-null parts pruned; got {loaded}/3");
+    assert_eq!(
+        loaded, 3,
+        "no part's null count speaks for files that leave the column out"
+    );
+    assert_eq!(
+        files_holding_tag(&consumer),
+        4,
+        "part 0's files store no tag"
+    );
 }
 
 #[test]
 fn sql_is_not_null_prunes_all_null_parts() {
     // `tag IS NOT NULL`:
-    //  - part 0 is entirely null (min stat is null), so it's dropped.
+    //  - part 0 is entirely null, so its files leave the column out: the
+    //    part has no aggregate for it and is kept, and its files are
+    //    dropped at the superfile tier, which sees they do not hold it.
     //  - parts 1 and 2 load; their 8 rows match.
     let dir = TempDir::new().expect("tempdir");
     build_tag_parts(dir.path());
@@ -682,14 +1055,23 @@ fn sql_is_not_null_prunes_all_null_parts() {
 
     let (loaded, total) = parts_loaded(&consumer);
     assert_eq!(total, 3);
-    assert_eq!(loaded, 2, "all-null part 0 pruned; got {loaded}/3");
+    assert_eq!(loaded, 3, "part 0 has no tag aggregate to prune on");
+    assert_eq!(
+        files_holding_tag(&consumer),
+        4,
+        "part 0's files store no tag"
+    );
 }
 
 #[test]
 fn sql_or_across_columns_loads_only_the_parts_a_branch_can_match() {
     // `tag IS NULL OR title = 'e0'`:
-    //  - part 0 holds the null tags; part 2 can hold 'e0'.
-    //  - part 1 has no null tag and no 'e0', so neither branch keeps it.
+    //  - part 0 holds the null tags (its files leave `tag` out); part 2 can
+    //    hold 'e0'.
+    //  - part 1 has no null tag and no 'e0', but a part's null count covers
+    //    only the files that store a nullable column, so the `IS NULL`
+    //    branch keeps every part (#1240); the superfile tier skips part 1's
+    //    files, which hold `tag` with no null and no 'e0'.
     //  - every matching row still comes back: 4 null tags plus e0.
     let dir = TempDir::new().expect("tempdir");
     build_tag_parts(dir.path());
@@ -708,7 +1090,10 @@ fn sql_or_across_columns_loads_only_the_parts_a_branch_can_match() {
 
     let (loaded, total) = parts_loaded(&consumer);
     assert_eq!(total, 3);
-    assert_eq!(loaded, 2, "part 1 matches neither branch; got {loaded}/3");
+    assert_eq!(
+        loaded, 3,
+        "no part's null count speaks for files that leave the column out"
+    );
 }
 
 #[test]
