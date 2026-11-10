@@ -359,8 +359,6 @@ const FARES: [[i64; 2]; 5] = [[1, 2], [3, 4], [5, 6], [7, 8], [9, 10]];
 /// The fare the delete case removes; its superfile is the only one with
 /// deleted rows.
 const DELETED_FARE: i64 = 5;
-/// The file suffix a scanned superfile carries in a physical plan.
-const SUPERFILE_SUFFIX: &str = ".sf.parquet";
 /// The aggregates the fare tests run, answered from statistics on a clean
 /// table.
 const FARE_AGGREGATES: &str = "SELECT COUNT(*) AS n, SUM(fare) AS total, MIN(fare) AS lo, \
@@ -502,9 +500,9 @@ fn sql_unfiltered_aggregates_on_a_lazy_handle_are_answered_from_stats() {
     );
 }
 
-/// With rows deleted from one superfile, a lazy handle scans only that
-/// superfile and answers the rest from statistics; the result leaves the
-/// deleted row out.
+/// With rows deleted from one superfile, a lazy handle answers every
+/// superfile from statistics, that one corrected for its deleted rows, with
+/// no scan; the result leaves the deleted row out.
 #[test]
 fn sql_unfiltered_aggregates_on_a_lazy_handle_see_deletes() {
     let dir = TempDir::new().expect("tempdir");
@@ -513,10 +511,9 @@ fn sql_unfiltered_aggregates_on_a_lazy_handle_see_deletes() {
 
     let consumer = open_lazy_fare_consumer(dir.path(), cache_dir.path());
     let plan = explain(&consumer, FARE_AGGREGATES);
-    assert_eq!(
-        plan.matches(SUPERFILE_SUFFIX).count(),
-        1,
-        "only the superfile with deletes is scanned:\n{plan}"
+    assert!(
+        !plan.contains("TableScan"),
+        "answered from statistics past the deleted rows:\n{plan}"
     );
 
     let consumer = open_lazy_fare_consumer(dir.path(), cache_dir.path());

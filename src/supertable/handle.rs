@@ -63,6 +63,7 @@ use crate::{
         optimize::compact::RetiredScratch,
         options::Consistency,
         query::{
+            deleted_stats::DeletedStatsCache,
             fts::GlobalIdfCache,
             scalar_cache::DecodedScalarCache,
             sql::{SqlSchemas, build_sql_schemas},
@@ -191,6 +192,9 @@ pub(super) struct SupertableInner {
     /// Table-wide value counts carried from snapshot to snapshot, so the
     /// first statement after a commit merges only the superfiles it changed.
     pub(super) value_count_carry: Arc<ValueCountCarry>,
+    /// Statistics of superfiles' deleted rows, kept across statements so a
+    /// statement reads only the rows deleted since one before.
+    pub(super) deleted_stats: Arc<DeletedStatsCache>,
     /// Per-generation cache of global BM25 idf per (column, term),
     /// shared by every reader minted from this handle so repeat
     /// queries skip the dictionary gather
@@ -2267,6 +2271,7 @@ async fn build_handle(
         sql_logical_plan_cache: Mutex::new(None),
         decoded_scalar_cache: DecodedScalarCache::default(),
         value_count_carry: Arc::default(),
+        deleted_stats: Arc::default(),
         global_idf_cache: GlobalIdfCache::default(),
         tombstone_cache,
         handle_id,
@@ -2802,6 +2807,12 @@ impl SupertableReader {
     /// provider built over this table.
     pub(crate) fn value_count_carry(&self) -> Arc<ValueCountCarry> {
         Arc::clone(&self.inner.value_count_carry)
+    }
+
+    /// The statistics of superfiles' deleted rows kept for the table,
+    /// shared by every provider built over it.
+    pub(crate) fn deleted_stats(&self) -> Arc<DeletedStatsCache> {
+        Arc::clone(&self.inner.deleted_stats)
     }
 
     /// Cached `SessionContext` keyed on the manifest `Arc`, reused by

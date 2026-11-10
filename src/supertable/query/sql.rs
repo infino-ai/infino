@@ -90,8 +90,7 @@ use crate::{
         manifest::ManifestSnapshot,
         query::{
             covered_agg::{
-                CoveredAggregateRewrite, load_unfiltered_aggregate_inputs,
-                value_counts_from_statistics,
+                CoveredAggregateRewrite, prepare_aggregate_inputs, value_counts_from_statistics,
             },
             exec::{
                 common::collect_plan_metered, fts_exec::register_bm25,
@@ -362,9 +361,9 @@ impl SupertableReader {
                 }
             };
             // The plan is optimized when it is made physical, below: an
-            // unfiltered aggregate's parts are loaded first, so the rewrite
-            // can answer it from manifest statistics.
-            load_unfiltered_aggregate_inputs(df.logical_plan()).await?;
+            // aggregate's inputs (parts, deleted rows) are read first, so the
+            // rewrite can answer it from manifest statistics.
+            prepare_aggregate_inputs(df.logical_plan(), &ctx.state()).await?;
             // Meter the executed plan on the thread-CPU clock, the same
             // way the catalog path does. The context is cached and
             // deliberately carries no collector, so without this the
@@ -418,6 +417,7 @@ impl SupertableReader {
                 .await
                 .and_then(|table| table.aggregate(group, aggregate))
                 .map_err(QueryError::DataFusion)?;
+            prepare_aggregate_inputs(df.logical_plan(), &ctx.state()).await?;
             Self::collect_metered_df(df, ctx.task_ctx(), &op_stats).await
         };
         conform_value_counts(&self.block_on(drive)?, &schema)
@@ -581,6 +581,7 @@ impl SupertableReader {
     fn sql_provider(&self) -> SupertableProvider {
         SupertableProvider::new(self.sql_schemas().scan().clone(), self)
             .with_value_count_carry(self.value_count_carry())
+            .with_deleted_stats(self.deleted_stats())
     }
 
     /// Build (or reuse the cached) [`SessionContext`] for the

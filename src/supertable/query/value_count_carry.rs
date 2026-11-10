@@ -97,20 +97,31 @@ pub(crate) fn counts_without(
 ) -> Option<HashMap<ScalarValue, u64>> {
     let mut left: HashMap<ScalarValue, u64> = total.entries().iter().cloned().collect();
     for entry in files {
-        let counts = match file_counts(entry, column) {
-            FileCounts::NoValues => continue,
+        match file_counts(entry, column) {
+            FileCounts::NoValues => {}
             FileCounts::Unrecorded => return None,
-            FileCounts::Values(counts) => counts,
-        };
-        for (value, count) in counts.entries() {
-            let held = left.get_mut(value)?;
-            *held = held.checked_sub(*count)?;
-            if *held == 0 {
-                left.remove(value);
+            FileCounts::Values(counts) => {
+                left = take_off(left, counts.entries().iter().map(|(v, n)| (v, *n)))?;
             }
         }
     }
     Some(left)
+}
+
+/// `counts` with each of `less` taken off, a value reaching zero left out;
+/// `None` when one takes off more than `counts` holds.
+pub(crate) fn take_off<'a>(
+    mut counts: HashMap<ScalarValue, u64>,
+    less: impl Iterator<Item = (&'a ScalarValue, u64)>,
+) -> Option<HashMap<ScalarValue, u64>> {
+    for (value, count) in less {
+        let held = counts.get_mut(value)?;
+        *held = held.checked_sub(count)?;
+        if *held == 0 {
+            counts.remove(value);
+        }
+    }
+    Some(counts)
 }
 
 /// Column `column`'s counts over `files`, added up. `None` when one of them

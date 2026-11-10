@@ -528,11 +528,11 @@ fn tombstoned_covered_segment_demotes_to_residual() {
     );
 }
 
-/// An unfiltered aggregate over a table with deletes answers the clean
-/// segments from statistics and scans only the segment with the delete,
-/// instead of scanning every segment.
+/// An unfiltered aggregate over a table with deletes answers every segment
+/// from statistics, the one with the delete corrected for its deleted row,
+/// with no scan.
 #[test]
-fn unfiltered_aggregates_scan_only_segments_with_deletes() {
+fn unfiltered_aggregates_correct_segments_with_deletes() {
     let (st, _dir, _cache_dir) = build_tombstoned_table();
     let count_sql = "SELECT COUNT(*) FROM supertable";
     let sum_sql = "SELECT SUM(rating) FROM supertable";
@@ -548,8 +548,8 @@ fn unfiltered_aggregates_scan_only_segments_with_deletes() {
     for sql in [count_sql, sum_sql] {
         let plan = explain(&st, sql);
         assert!(
-            plan.contains("__resid_"),
-            "{sql}: clean segments must come from statistics:\n{plan}"
+            !plan.contains("TableScan"),
+            "{sql}: every segment must come from statistics:\n{plan}"
         );
     }
 }

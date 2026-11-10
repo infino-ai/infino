@@ -388,7 +388,7 @@ impl ColumnStats<'_> {
     }
 
     /// Whether the superfile carries an exact value table for the column.
-    fn has_value_table(&self) -> bool {
+    pub(crate) fn has_value_table(&self) -> bool {
         match self {
             Self::Inline(agg) => agg.value_counts.is_some(),
             Self::Section(row) => row.value_table_array().is_some(),

@@ -154,7 +154,7 @@ use crate::{
         manifest::{ManifestSnapshot, disk_cache::MetadataDiskCache},
         options::SupertableOptions,
         query::{
-            covered_agg::load_unfiltered_aggregate_inputs, exec::common::collect_plan_metered,
+            covered_agg::prepare_aggregate_inputs, exec::common::collect_plan_metered,
             sql::sql_session_context,
         },
         reader_cache::{DiskCacheConfig, DiskCacheError, DiskCacheStore},
@@ -1435,10 +1435,10 @@ impl Connection {
                     .verify_plan(&plan)
                     .map_err(|e| InfinoError::Query(format!("{READ_ONLY_REFUSAL} ({e})")))?;
 
-                // An unfiltered aggregate's parts are loaded before
-                // optimization, so the rewrite can answer it from manifest
+                // An aggregate's inputs are read before optimization (parts,
+                // deleted rows), so the rewrite can answer it from manifest
                 // statistics.
-                load_unfiltered_aggregate_inputs(&plan)
+                prepare_aggregate_inputs(&plan, &planner_ctx.state())
                     .await
                     .map_err(InfinoError::from)?;
 
@@ -5270,15 +5270,16 @@ mod tests {
         );
     }
 
-    /// After a delete the per-file counts still hold the deleted row, so the grouped count
-    /// answers; an unknown column is an error.
+    /// After a delete the per-file counts still hold the deleted row: the first count runs the
+    /// grouped count, which reads the deleted row's statistics, and from then on the statistics
+    /// answer, corrected for it. An unknown column is an error.
     #[test]
-    fn value_counts_run_the_grouped_count_over_deletes_and_refuse_unknown_columns() {
+    fn value_counts_correct_for_deletes_and_refuse_unknown_columns() {
         let (conn, _dir) = storage_conn();
         create_cab_types(&conn, "cabs");
         let table = conn.open_table("cabs").expect("open");
         table.delete(col("title").eq(lit("green"))).expect("delete");
-        assert_value_counts(&conn, "cabs", "title", Answered::ByGroupBy);
+        assert_value_counts(&conn, "cabs", "title", Answered::FromStats);
         assert!(table.value_counts("no_such_column").is_err());
     }
 

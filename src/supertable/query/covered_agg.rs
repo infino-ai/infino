@@ -66,14 +66,14 @@
 
 use std::{
     cmp::Ordering,
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     sync::Arc,
 };
 
 use arrow_array::ArrayRef;
 use arrow_schema::DataType;
 use datafusion::{
-    catalog::TableProvider,
+    catalog::{Session, TableProvider},
     common::{
         DFSchema, ScalarValue,
         tree_node::{Transformed, TreeNodeRecursion},
@@ -83,13 +83,14 @@ use datafusion::{
     functions::core::expr_fn::{coalesce, greatest, least},
     functions_aggregate::expr_fn::{count, max, min, sum},
     logical_expr::{
-        Aggregate, Expr, Filter, LogicalPlan, LogicalPlanBuilder, Operator, TableScan, TableSource,
-        lit, utils::split_conjunction,
+        Aggregate, EmptyRelation, Expr, Filter, LogicalPlan, LogicalPlanBuilder, Operator,
+        TableScan, TableSource, lit, utils::split_conjunction,
     },
     optimizer::{OptimizerConfig, OptimizerRule, optimizer::ApplyOrder},
     prelude::{cast, col, ident},
 };
 use futures::future::try_join_all;
+use roaring::RoaringBitmap;
 use tracing::debug;
 
 use crate::supertable::{
@@ -99,10 +100,13 @@ use crate::supertable::{
         load_section_groups_blocking,
     },
     query::{
+        deleted_stats::{
+            CountsChange, LiveBound, LiveColumn, Unknown, Wanted, WantedColumn, read_wanted,
+        },
         provider::{CountedRange, SupertableProvider, TombstoneState},
         range_counts::RangeBucket,
         skip::{ColumnTypeGuard, file_lacks_column},
-        value_count_carry::{counts_of, counts_without},
+        value_count_carry::{counts_of, counts_without, take_off},
     },
     schema::{DECIMAL128_PRECISION, DECIMAL128_SCALE, FieldId},
 };
@@ -152,6 +156,20 @@ enum AggKind {
     Avg(String),
 }
 
+impl AggKind {
+    /// The column the aggregate reads; `None` for `COUNT(*)`.
+    fn column(&self) -> Option<&str> {
+        match self {
+            Self::CountStar => None,
+            Self::Count(column)
+            | Self::Sum(column)
+            | Self::Min(column)
+            | Self::Max(column)
+            | Self::Avg(column) => Some(column),
+        }
+    }
+}
+
 /// One side of the range, with inclusivity.
 #[derive(Clone)]
 struct Bound {
@@ -173,20 +191,36 @@ enum Class {
     Boundary,
 }
 
-/// Load every manifest part of each table an unfiltered, ungrouped aggregate
-/// in `plan` reads, subqueries included, so the rewrite below finds the
-/// whole table in memory and answers from statistics. That aggregate's scan
-/// would load every part anyway, so loading them before optimization adds no
-/// reads.
-pub(crate) async fn load_unfiltered_aggregate_inputs(plan: &LogicalPlan) -> Result<(), QueryError> {
+/// Prepare `plan`'s aggregates to be answered from statistics, before it is
+/// optimized:
+///
+///   * load every manifest part of each table an unfiltered, ungrouped
+///     aggregate reads, subqueries included, so the rewrite finds the whole
+///     table in memory (that aggregate's scan would load every part anyway);
+///   * read the deleted rows of each aggregated table's superfiles, so the
+///     rewrite's lookups of them are cache reads;
+///   * read the statistics of the deleted rows that let the rewrite answer
+///     superfiles with deletes from their statistics, where reading those
+///     rows costs fewer pages than scanning the live ones would (see
+///     [`read_wanted`]). They are kept for the table, so a later statement
+///     reads only rows deleted since.
+///
+/// The rewrite stays exact without any of this: what is not read here, it
+/// scans. `EXPLAIN` runs this too, as it plans the statement.
+pub(crate) async fn prepare_aggregate_inputs(
+    plan: &LogicalPlan,
+    state: &dyn Session,
+) -> Result<(), QueryError> {
     let mut sources: Vec<Arc<dyn TableSource>> = Vec::new();
+    let mut aggregates: Vec<LogicalPlan> = Vec::new();
     plan.apply_with_subqueries(|node| {
         if let LogicalPlan::Aggregate(agg) = node
-            && agg.group_expr.is_empty()
-            && let Some(scan) = peel_unfiltered_scan(agg.input.as_ref())
-            && provider_of(scan).is_some_and(|provider| !provider.is_segment_restricted())
+            && let Some(scan) = aggregated_scan(agg)
         {
-            sources.push(Arc::clone(&scan.source));
+            if agg.group_expr.is_empty() && peel_unfiltered_scan(agg.input.as_ref()).is_some() {
+                sources.push(Arc::clone(&scan.source));
+            }
+            aggregates.push(node.clone());
         }
         Ok(TreeNodeRecursion::Continue)
     })
@@ -197,14 +231,84 @@ pub(crate) async fn load_unfiltered_aggregate_inputs(plan: &LogicalPlan) -> Resu
         Some(provider.load_every_part())
     }))
     .await?;
+    for node in &aggregates {
+        let LogicalPlan::Aggregate(agg) = node else {
+            continue;
+        };
+        let Some(provider) = aggregated_scan(agg).and_then(provider_of) else {
+            continue;
+        };
+        // A table without deletes has nothing to read: its statistics
+        // answer as they are.
+        if !provider.may_have_deletes() {
+            continue;
+        }
+        provider.prefetch_listed_tombstones().await;
+        let mut wanted = Wants::quiet();
+        // Only the deleted rows the rewrite would read matter here; a plan
+        // it fails to build is its own to report when it runs.
+        let _ = try_rewrite_wanting(node, &mut wanted);
+        if wanted.list.is_empty() {
+            continue;
+        }
+        let cache = provider.deleted_stats();
+        cache.prune_unlisted(|| {
+            provider
+                .manifest()
+                .resident_superfiles()
+                .map(|listed| listed.iter().map(|entry| entry.superfile_id).collect())
+                .unwrap_or_default()
+        });
+        read_wanted(provider, state, cache, wanted.list).await;
+    }
     Ok(())
 }
 
+/// The deleted rows whose statistics a statement wants, and whether the
+/// rewrite looking for them only looks: then it logs nothing, as the
+/// optimizer's run of it reports the answer.
+struct Wants {
+    list: Vec<Wanted>,
+    quiet: bool,
+}
+
+impl Wants {
+    fn quiet() -> Self {
+        Self {
+            list: Vec::new(),
+            quiet: true,
+        }
+    }
+
+    fn logged() -> Self {
+        Self {
+            list: Vec::new(),
+            quiet: false,
+        }
+    }
+}
+
+/// The scan an aggregate the rewrite may answer reads: under no filter, or
+/// under one filter, behind at most a projection of columns.
+fn aggregated_scan(agg: &Aggregate) -> Option<&TableScan> {
+    let scan = peel_unfiltered_scan(agg.input.as_ref())
+        .or_else(|| peel_input(agg.input.as_ref()).map(|(_, scan)| scan))?;
+    provider_of(scan)
+        .is_some_and(|provider| !provider.is_segment_restricted())
+        .then_some(scan)
+}
+
 fn try_rewrite(plan: &LogicalPlan) -> DfResult<Option<LogicalPlan>> {
+    try_rewrite_wanting(plan, &mut Wants::logged())
+}
+
+/// [`try_rewrite`], adding to `wanted` the deleted rows whose statistics
+/// would answer superfiles it leaves to the scan.
+fn try_rewrite_wanting(plan: &LogicalPlan, wanted: &mut Wants) -> DfResult<Option<LogicalPlan>> {
     let LogicalPlan::Aggregate(agg) = plan else {
         return Ok(None);
     };
-    if let Some(rewritten) = rewrite_grouped_count_from_value_counts(agg)? {
+    if let Some(rewritten) = rewrite_grouped_count_from_value_counts(agg, wanted)? {
         return Ok(Some(rewritten));
     }
     if !agg.group_expr.is_empty() {
@@ -217,12 +321,12 @@ fn try_rewrite(plan: &LogicalPlan) -> DfResult<Option<LogicalPlan>> {
         return Ok(None);
     };
 
-    // Unfiltered aggregate over a complete snapshot: a clean segment is
-    // covered by its statistics. When every segment is clean, emit one
+    // Unfiltered aggregate over a complete snapshot: every superfile is
+    // answered from its statistics, corrected for its deleted rows, where
+    // those answer for its live rows. When every superfile is, emit one
     // literal row directly. This handles SUM/AVG as well as COUNT/MIN/MAX
     // and avoids invoking the provider's Parquet scan at all. Otherwise only
-    // the segments with deletes (or an unknown tombstone state) or a
-    // missing stat are scanned.
+    // the superfiles they don't answer for are scanned.
     if let Some(scan) = peel_unfiltered_scan(agg.input.as_ref()) {
         let Some(provider) = provider_of(scan) else {
             return Ok(None);
@@ -230,25 +334,21 @@ fn try_rewrite(plan: &LogicalPlan) -> DfResult<Option<LogicalPlan>> {
         if provider.is_segment_restricted() {
             return Ok(None);
         }
+        // One read of each superfile's deleted rows for the statement: the
+        // statistics and the residual scan see the same ones.
+        let provider = &provider.reading_tombstones_once();
         let manifest = provider.manifest();
         let Some(superfiles) = manifest.resident_superfiles() else {
             return Ok(None);
         };
-        let mut split = Split::new("unfiltered aggregate");
-        for entry in superfiles.iter() {
-            match scan_reason(provider, entry, || {
-                has_required_stats(manifest, entry, &kinds)
-            }) {
-                None => split.answer(entry),
-                Some(reason) => split.scan(reason, entry),
-            }
-        }
-        if split.scans_any() && split.answered.is_empty() {
-            split.decline("no superfile is answerable from statistics");
-            return Ok(None);
-        }
-        let Some(partials) = accumulate_partials(manifest, &kinds, &split.answered) else {
-            split.decline("a statistic does not fold");
+        let Some((partials, split)) = answer_from_statistics(
+            provider,
+            &kinds,
+            &superfiles,
+            None,
+            "unfiltered aggregate",
+            wanted,
+        ) else {
             return Ok(None);
         };
         if split.scans_any() {
@@ -256,19 +356,21 @@ fn try_rewrite(plan: &LogicalPlan) -> DfResult<Option<LogicalPlan>> {
         }
         split.log();
         let mut expressions = Vec::with_capacity(kinds.len());
-        for (i, (kind, partial)) in kinds.iter().zip(&partials).enumerate() {
+        for (i, partial) in partials.iter().enumerate() {
             let field = agg.schema.field(i);
-            let expression = match (kind, partial) {
-                (AggKind::CountStar | AggKind::Count(_), Partial::Count(count)) => lit(*count),
-                (AggKind::Sum(_), Partial::Sum(value))
-                | (AggKind::Min(_), Partial::Bound(value))
-                | (AggKind::Max(_), Partial::Bound(value)) => {
-                    covered_literal(value, field.data_type())
+            let output = field.data_type();
+            let expression = match partial {
+                Partial::Count(count) => lit(*count),
+                Partial::Sum(Some(value)) | Partial::Bound(Some(value)) => {
+                    covered_literal(value, output)
                 }
-                (AggKind::Avg(_), Partial::Avg { sum, count }) => {
+                // No live value: SUM, MIN and MAX of nothing are NULL.
+                Partial::Sum(None) | Partial::Bound(None) | Partial::Avg(None) => {
+                    lit(ScalarValue::try_from(output)?)
+                }
+                Partial::Avg(Some((sum, count))) => {
                     cast(lit(sum.clone()), DataType::Float64) / cast(lit(*count), DataType::Float64)
                 }
-                _ => return Ok(None),
             };
             expressions.push(expression.alias(field.name().clone()));
         }
@@ -294,6 +396,7 @@ fn try_rewrite(plan: &LogicalPlan) -> DfResult<Option<LogicalPlan>> {
     let Some(range) = extract_range(&predicate) else {
         return Ok(None);
     };
+    let provider = &provider.reading_tombstones_once();
 
     let manifest = provider.manifest();
     // Hierarchical manifests may expose a partial flat view. Answer from
@@ -307,7 +410,7 @@ fn try_rewrite(plan: &LogicalPlan) -> DfResult<Option<LogicalPlan>> {
 
     if matches!(kinds.as_slice(), [AggKind::CountStar])
         && let Some(counts_split) =
-            split_value_counts(provider, &range.column, false, "value count")
+            split_value_counts(provider, &range.column, false, "value count", wanted)
     {
         // A range index counts every superfile, deleted rows left out, from
         // a block or two each: cheaper than scanning the ones with deletes,
@@ -358,32 +461,14 @@ fn try_rewrite(plan: &LogicalPlan) -> DfResult<Option<LogicalPlan>> {
     let Some(superfiles) = superfiles else {
         return Ok(None);
     };
-    // Classify every segment.
-    let mut split = Split::new("range aggregate");
-    for entry in superfiles {
-        match classify(manifest, entry, id_column, &range) {
-            Class::Disjoint => split.skip(),
-            Class::Covered => {
-                match scan_reason(provider, entry, || {
-                    has_required_stats(manifest, entry, &kinds)
-                }) {
-                    None => split.answer(entry),
-                    Some(reason) => split.scan(reason, entry),
-                }
-            }
-            Class::Boundary => split.scan(ScanReason::Boundary, entry),
-        }
-    }
-    if split.answered.is_empty() {
-        // Nothing answerable from statistics — the rewrite would only
-        // add plan noise over the normal scan.
-        split.decline("no superfile is answerable from statistics");
-        return Ok(None);
-    }
-    let Some(partials) = accumulate_partials(manifest, &kinds, &split.answered) else {
-        // A fold failure (overflow, type surprise) is always safe to
-        // decline.
-        split.decline("a statistic does not fold");
+    let Some((partials, split)) = answer_from_statistics(
+        provider,
+        &kinds,
+        superfiles,
+        Some((&range, id_column)),
+        "range aggregate",
+        wanted,
+    ) else {
         return Ok(None);
     };
     rewrite_with_residual(
@@ -397,32 +482,393 @@ fn try_rewrite(plan: &LogicalPlan) -> DfResult<Option<LogicalPlan>> {
     )
 }
 
-/// Why `entry` must be scanned rather than answered from its statistics,
-/// whose other requirements `has_stats` checks; `None` when its statistics
-/// answer for it.
-fn scan_reason(
-    provider: &SupertableProvider,
-    entry: &SuperfileEntry,
-    has_stats: impl FnOnce() -> bool,
-) -> Option<ScanReason> {
-    match provider.tombstone_state(entry) {
-        TombstoneState::Deleted => Some(ScanReason::DeletedRows),
-        TombstoneState::Unknown => Some(ScanReason::DeletesUnknown),
-        TombstoneState::Clean => (!has_stats()).then_some(ScanReason::MissingStatistics),
+/// A column an aggregate reads, as the manifest's statistics know it.
+struct StatsColumn {
+    name: String,
+    id: FieldId,
+    /// The type the table stores the column as, which its deleted rows are
+    /// read as.
+    data_type: Option<DataType>,
+    guard: ColumnTypeGuard,
+}
+
+impl StatsColumn {
+    fn new(manifest: &ManifestSnapshot, name: &str) -> Option<Self> {
+        let id = manifest.field_id(name)?;
+        let data_type = manifest
+            .stored_schema()
+            .field_with_name(name)
+            .ok()
+            .map(|field| field.data_type().clone());
+        Some(Self {
+            name: name.to_string(),
+            id,
+            data_type,
+            guard: ColumnTypeGuard::new(manifest, id),
+        })
+    }
+
+    /// Whether `entry`'s statistics for the column describe its values as
+    /// the table reads them today.
+    ///
+    /// A statistic is only usable when it was recorded in the type the
+    /// table reads the column as today. After a retype the recorded bounds
+    /// describe the old type, and they do not survive the cast: a
+    /// `LargeUtf8` column holding "7" and "10" records min "10" and max "7"
+    /// lexicographically, so answering `MAX` from them after a change to
+    /// `Int64` returns 7 and `MIN` returns 10 — wrong, and wrong in opposite
+    /// directions. A sum or a null count recorded in the old type is no
+    /// better. So a file whose statistics have gone stale, or a column
+    /// mid-conversion whose files disagree, falls back to the scan, which
+    /// reads the data through the cast and derives the answer afresh.
+    /// Compaction re-derives the statistics in the new type when it
+    /// rewrites the file, and the statistics answer again.
+    fn current_in(&self, entry: &SuperfileEntry) -> bool {
+        !self.guard.aggregates_mix_types() && !self.guard.stats_are_stale(entry)
+    }
+
+    /// The column as a read of deleted rows names it.
+    fn wanted(&self) -> WantedColumn {
+        WantedColumn {
+            field: self.id,
+            name: self.name.clone(),
+        }
     }
 }
 
-/// Each aggregate's contribution from the `covered` superfiles' statistics;
-/// `None` when one does not fold (overflow, a type surprise).
-fn accumulate_partials(
-    manifest: &ManifestSnapshot,
+/// What one superfile's live rows give one aggregate.
+enum Term {
+    Count(i64),
+    /// The sum; `None` when no live row holds a value.
+    Sum(Option<ScalarValue>),
+    /// The sum and the count of the values; `None` when there are none.
+    Avg(Option<(ScalarValue, i64)>),
+    Bound(LiveBound),
+}
+
+/// The terms of one superfile answered from statistics, one per aggregate.
+struct Answered {
+    entry: Arc<SuperfileEntry>,
+    deleted: Arc<RoaringBitmap>,
+    terms: Vec<Term>,
+}
+
+/// Answer `kinds` from the statistics of each of `superfiles` that holds a
+/// row the `range` (with the table's id column) keeps, corrected for its
+/// deleted rows, and split off the ones they don't answer for to be
+/// scanned. Deleted rows whose statistics would answer a scanned superfile
+/// are added to `wanted`. `None`, logged, when nothing is answered or the
+/// answers do not fold.
+fn answer_from_statistics(
+    provider: &SupertableProvider,
     kinds: &[AggKind],
-    covered: &[Arc<SuperfileEntry>],
-) -> Option<Vec<Partial>> {
-    kinds
+    superfiles: &[Arc<SuperfileEntry>],
+    range: Option<(&RangeFilter, &str)>,
+    shape: &'static str,
+    wanted: &mut Wants,
+) -> Option<(Vec<Partial>, Split)> {
+    let manifest = provider.manifest();
+    let mut split = Split::new(shape, wanted.quiet);
+    let columns: Vec<Option<StatsColumn>> = kinds
         .iter()
-        .map(|kind| accumulate_partial(manifest, kind, covered))
-        .collect()
+        .map(|kind| match kind.column() {
+            None => Some(None),
+            Some(name) => StatsColumn::new(manifest, name).map(Some),
+        })
+        .collect::<Option<_>>()?;
+    let mut candidates: Vec<Answered> = Vec::new();
+    for entry in superfiles {
+        if let Some((range, id_column)) = range {
+            match classify(manifest, entry, id_column, range) {
+                Class::Disjoint => {
+                    split.skip();
+                    continue;
+                }
+                Class::Boundary => {
+                    split.scan(ScanReason::Boundary, entry);
+                    continue;
+                }
+                Class::Covered => {}
+            }
+        }
+        let deleted = match provider.tombstone_state(entry) {
+            TombstoneState::Clean => Arc::new(RoaringBitmap::new()),
+            TombstoneState::Deleted(rows) => rows,
+            TombstoneState::Unknown => {
+                split.scan(ScanReason::DeletesUnknown, entry);
+                continue;
+            }
+        };
+        let mut terms = Vec::with_capacity(kinds.len());
+        let mut want: BTreeSet<WantedColumn> = BTreeSet::new();
+        let mut unknown = None;
+        for (kind, column) in kinds.iter().zip(&columns) {
+            match term(provider, kind, column.as_ref(), entry, &deleted) {
+                Ok(term) => terms.push(term),
+                Err(why) => {
+                    if let (Unknown::DeletedRows, Some(column)) = (why, column) {
+                        want.insert(column.wanted());
+                    }
+                    unknown = Some(unknown.map_or(why, |seen: Unknown| seen.max(why)));
+                }
+            }
+        }
+        match unknown {
+            None => candidates.push(Answered {
+                entry: Arc::clone(entry),
+                deleted,
+                terms,
+            }),
+            Some(why) => {
+                split.scan(scan_reason(why, &deleted), entry);
+                if why == Unknown::DeletedRows {
+                    wanted.list.push(Wanted {
+                        entry: Arc::clone(entry),
+                        deleted,
+                        columns: want,
+                    });
+                }
+            }
+        }
+    }
+
+    // A superfile bounding a column only from one side answers MIN or MAX
+    // when another superfile's exact bound is no worse: the answer lies on
+    // that bound or beyond it, whatever the first one's live rows hold.
+    for (at, kind) in kinds.iter().enumerate() {
+        let max = match kind {
+            AggKind::Min(_) => false,
+            AggKind::Max(_) => true,
+            _ => continue,
+        };
+        let best = candidates
+            .iter()
+            .filter_map(|answered| match &answered.terms[at] {
+                Term::Bound(LiveBound::Exact(Some(value))) => Some(value),
+                _ => None,
+            })
+            .try_fold(None, |best: Option<&ScalarValue>, value| {
+                Some(Some(match best {
+                    None => value,
+                    Some(best) => better_bound(best, value, max)?,
+                }))
+            })
+            .flatten()
+            .cloned();
+        let mut kept = Vec::with_capacity(candidates.len());
+        for mut answered in candidates {
+            if let Term::Bound(LiveBound::Beyond {
+                bound,
+                deleted_rows,
+            }) = &answered.terms[at]
+            {
+                let beaten = best
+                    .as_ref()
+                    .and_then(|best| strictly_better(bound, best, max))
+                    .is_some_and(|better| !better);
+                if !beaten {
+                    if *deleted_rows && let Some(column) = &columns[at] {
+                        wanted.list.push(Wanted {
+                            entry: Arc::clone(&answered.entry),
+                            deleted: Arc::clone(&answered.deleted),
+                            columns: [column.wanted()].into_iter().collect(),
+                        });
+                    }
+                    split.scan(ScanReason::DeletedRows, &answered.entry);
+                    continue;
+                }
+                answered.terms[at] = Term::Bound(LiveBound::Exact(None));
+            }
+            kept.push(answered);
+        }
+        candidates = kept;
+    }
+
+    if candidates.is_empty() && split.scans_any() {
+        // Nothing answerable from statistics — the rewrite would only add
+        // plan noise over the normal scan.
+        split.decline("no superfile is answerable from statistics");
+        return None;
+    }
+    let Some(partials) = fold_terms(kinds, &candidates) else {
+        // A fold failure (overflow, type surprise) is always safe to
+        // decline.
+        split.decline("a statistic does not fold");
+        return None;
+    };
+    for answered in candidates {
+        split.answer_past(&answered.entry, !answered.deleted.is_empty());
+    }
+    Some((partials, split))
+}
+
+/// Whether `candidate` is a strictly better bound than `than` — lower for a
+/// minimum, higher for a maximum; `None` when they don't compare.
+fn strictly_better(candidate: &ScalarValue, than: &ScalarValue, max: bool) -> Option<bool> {
+    let order = candidate.partial_cmp(than)?;
+    Some(match max {
+        false => order.is_lt(),
+        true => order.is_gt(),
+    })
+}
+
+/// The better of two bounds (see [`strictly_better`]), `a` on a tie.
+fn better_bound<'a>(a: &'a ScalarValue, b: &'a ScalarValue, max: bool) -> Option<&'a ScalarValue> {
+    Some(if strictly_better(b, a, max)? { b } else { a })
+}
+
+/// What `entry`'s live rows give `kind`, `deleted` of its rows deleted.
+fn term(
+    provider: &SupertableProvider,
+    kind: &AggKind,
+    column: Option<&StatsColumn>,
+    entry: &SuperfileEntry,
+    deleted: &Arc<RoaringBitmap>,
+) -> Result<Term, Unknown> {
+    let live_rows = || {
+        entry
+            .n_docs
+            .checked_sub(deleted.len())
+            .and_then(|rows| i64::try_from(rows).ok())
+            .ok_or(Unknown::Scan)
+    };
+    let Some(column) = column else {
+        // `COUNT(*)`: the rows less the deleted ones.
+        return live_rows().map(Term::Count);
+    };
+    if !file_lacks_column(entry, column.id) && !column.current_in(entry) {
+        return Err(Unknown::Scan);
+    }
+    let data_type = column.data_type.as_ref().ok_or(Unknown::Scan)?;
+    let live = live_column(provider, entry, column.id, data_type, deleted);
+    let count = |live: &LiveColumn| {
+        live.non_null()
+            .and_then(|n| i64::try_from(n).map_err(|_| Unknown::Scan))
+    };
+    Ok(match kind {
+        AggKind::CountStar => Term::Count(live_rows()?),
+        AggKind::Count(_) => Term::Count(count(&live)?),
+        AggKind::Sum(_) => Term::Sum(live.sum()?),
+        AggKind::Avg(_) => Term::Avg(match live.sum()? {
+            None => None,
+            Some(sum) => Some((sum, count(&live)?)),
+        }),
+        AggKind::Min(_) => Term::Bound(live.bound(false)?),
+        AggKind::Max(_) => Term::Bound(live.bound(true)?),
+    })
+}
+
+/// `entry`'s column `id`, read as `data_type`, as its live rows have it,
+/// `deleted` of its rows deleted: corrected by the statistics the table
+/// keeps of exactly those rows, when it has them.
+fn live_column<'a>(
+    provider: &SupertableProvider,
+    entry: &'a SuperfileEntry,
+    id: FieldId,
+    data_type: &DataType,
+    deleted: &RoaringBitmap,
+) -> LiveColumn<'a> {
+    let lacks = file_lacks_column(entry, id);
+    let delta = match deleted.is_empty() || lacks {
+        true => None,
+        false => provider
+            .deleted_stats()
+            .get(entry.superfile_id, id, data_type, deleted),
+    };
+    LiveColumn::new(entry, id, lacks, deleted.len(), delta)
+}
+
+/// Each aggregate's contribution from `answered`; `None` when one does not
+/// fold (overflow, a type surprise).
+fn fold_terms(kinds: &[AggKind], answered: &[Answered]) -> Option<Vec<Partial>> {
+    let mut partials = Vec::with_capacity(kinds.len());
+    for (at, kind) in kinds.iter().enumerate() {
+        let terms = answered.iter().map(|answered| &answered.terms[at]);
+        let partial = match kind {
+            AggKind::CountStar | AggKind::Count(_) => {
+                let mut total = 0i64;
+                for term in terms {
+                    let Term::Count(count) = term else {
+                        return None;
+                    };
+                    total = total.checked_add(*count)?;
+                }
+                Partial::Count(total)
+            }
+            AggKind::Sum(_) => {
+                let mut total: Option<ArrayRef> = None;
+                for term in terms {
+                    let Term::Sum(sum) = term else {
+                        return None;
+                    };
+                    total = add_sum(total, sum.as_ref())?;
+                }
+                Partial::Sum(match total {
+                    None => None,
+                    Some(total) => Some(ScalarValue::try_from_array(&total, 0).ok()?),
+                })
+            }
+            AggKind::Avg(_) => {
+                let (mut total, mut values): (Option<ArrayRef>, i64) = (None, 0);
+                for term in terms {
+                    let Term::Avg(avg) = term else {
+                        return None;
+                    };
+                    if let Some((sum, count)) = avg {
+                        total = add_sum(total, Some(sum))?;
+                        values = values.checked_add(*count)?;
+                    }
+                }
+                let sum = total.and_then(|total| ScalarValue::try_from_array(&total, 0).ok());
+                Partial::Avg(match (sum, values) {
+                    (Some(sum), values) if values > 0 => Some((sum, values)),
+                    (None, 0) => None,
+                    _ => return None,
+                })
+            }
+            AggKind::Min(_) | AggKind::Max(_) => {
+                let max = matches!(kind, AggKind::Max(_));
+                let mut best: Option<ScalarValue> = None;
+                for term in terms {
+                    match term {
+                        Term::Bound(LiveBound::Exact(None)) => {}
+                        Term::Bound(LiveBound::Exact(Some(value))) => {
+                            best = Some(match best {
+                                None => value.clone(),
+                                Some(best) => better_bound(&best, value, max)?.clone(),
+                            });
+                        }
+                        _ => return None,
+                    }
+                }
+                Partial::Bound(best)
+            }
+        };
+        partials.push(partial);
+    }
+    Some(partials)
+}
+
+/// `total` plus `sum`, as one-row sum arrays; `total` unchanged for no sum.
+/// `None` when they don't add (overflow, a type mismatch).
+fn add_sum(total: Option<ArrayRef>, sum: Option<&ScalarValue>) -> Option<Option<ArrayRef>> {
+    let Some(sum) = sum else {
+        return Some(total);
+    };
+    let sum = sum.to_array().ok()?;
+    Some(Some(match total {
+        None => sum,
+        Some(total) => add_sum_arrays(&total, &sum)?,
+    }))
+}
+
+/// Why a superfile whose live rows its statistics don't answer for is
+/// scanned, by why they don't and whether it has deleted rows.
+fn scan_reason(why: Unknown, deleted: &RoaringBitmap) -> ScanReason {
+    match (why, deleted.is_empty()) {
+        (Unknown::DeletedRows, _) | (Unknown::Scan, false) => ScanReason::DeletedRows,
+        (Unknown::Scan, true) => ScanReason::MissingStatistics,
+    }
 }
 
 /// Why one superfile is scanned rather than answered from its statistics.
@@ -430,7 +876,7 @@ fn accumulate_partials(
 enum ScanReason {
     /// The range cuts across its bounds, or its range column holds nulls.
     Boundary,
-    /// It has deleted rows, which its statistics still count.
+    /// It has deleted rows its statistics can't be corrected for.
     DeletedRows,
     /// Its deleted rows could not be read.
     DeletesUnknown,
@@ -458,27 +904,36 @@ struct Split {
     shape: &'static str,
     /// Superfiles answered from statistics.
     answered: Vec<Arc<SuperfileEntry>>,
+    /// Of those, the ones with deleted rows, corrected for them.
+    corrected: usize,
     /// Superfiles that hold no row the aggregate reads.
     skipped: usize,
     /// Superfiles scanned.
     scanned: Vec<Arc<SuperfileEntry>>,
     /// How many are scanned for each reason.
     reasons: BTreeMap<ScanReason, usize>,
+    /// Log nothing: the split is only looked at (see [`Wants`]).
+    quiet: bool,
 }
 
 impl Split {
-    fn new(shape: &'static str) -> Self {
+    fn new(shape: &'static str, quiet: bool) -> Self {
         Self {
+            quiet,
             shape,
             answered: Vec::new(),
+            corrected: 0,
             skipped: 0,
             scanned: Vec::new(),
             reasons: BTreeMap::new(),
         }
     }
 
-    fn answer(&mut self, entry: &Arc<SuperfileEntry>) {
+    /// `entry` answered from its statistics, `corrected` for its deleted
+    /// rows when it has some.
+    fn answer_past(&mut self, entry: &Arc<SuperfileEntry>, corrected: bool) {
         self.answered.push(Arc::clone(entry));
+        self.corrected += usize::from(corrected);
     }
 
     fn skip(&mut self) {
@@ -507,7 +962,7 @@ impl Split {
 
     /// What the residual scan stands for, as `EXPLAIN` shows it: e.g.
     /// "scans 2 superfiles (2 with deleted rows); 14 answered from
-    /// statistics".
+    /// statistics, 9 of them past their deleted rows".
     fn note(&self) -> String {
         let reasons: Vec<String> = self
             .reasons
@@ -520,6 +975,12 @@ impl Split {
             reasons.join(", "),
             self.answered.len()
         );
+        if self.corrected > 0 {
+            note.push_str(&format!(
+                ", {} of them past their deleted rows",
+                self.corrected
+            ));
+        }
         if self.skipped > 0 {
             note.push_str(&format!(", {} outside the range", self.skipped));
         }
@@ -528,9 +989,13 @@ impl Split {
 
     /// Record the split taken.
     fn log(&self) {
+        if self.quiet {
+            return;
+        }
         debug!(
             shape = self.shape,
             answered = self.answered.len(),
+            corrected = self.corrected,
             skipped = self.skipped,
             scanned = ?self.reasons,
             "aggregate answered from statistics"
@@ -539,9 +1004,13 @@ impl Split {
 
     /// Record why the aggregate is left to the scan.
     fn decline(&self, why: &str) {
+        if self.quiet {
+            return;
+        }
         debug!(
             shape = self.shape,
             answered = self.answered.len(),
+            corrected = self.corrected,
             skipped = self.skipped,
             scanned = ?self.reasons,
             why,
@@ -617,44 +1086,50 @@ fn rewrite_with_residual(
 
     // Final projection: combine each residual partial with its covered
     // literal, aliased to the original aggregate's output name so the
-    // rewritten plan's schema matches the original node's exactly.
+    // rewritten plan's schema matches the original node's exactly. A
+    // covered side with no live value leaves the residual's own answer,
+    // NULL when the residual has none either.
     let mut final_exprs: Vec<Expr> = Vec::with_capacity(kinds.len());
     for (i, (kind, partial)) in kinds.iter().zip(&partials).enumerate() {
         let field = agg.schema.field(i);
         let name = field.name().clone();
+        let resid = |suffix: &str| col(format!("__resid_{i}_{suffix}"));
         let expr = match (kind, partial) {
             (AggKind::CountStar | AggKind::Count(_), Partial::Count(n)) => {
                 // COUNT over an empty residual is 0, never NULL.
-                (col(format!("__resid_{i}_cnt")) + lit(*n)).alias(name)
+                resid("cnt") + lit(*n)
             }
-            (AggKind::Sum(_), Partial::Sum(value)) => {
+            (AggKind::Sum(_), Partial::Sum(None)) => resid("sum"),
+            (AggKind::Sum(_), Partial::Sum(Some(value))) => {
                 let zero = typed_zero(value)?;
-                (coalesce(vec![col(format!("__resid_{i}_sum")), lit(zero)]) + lit(value.clone()))
-                    .alias(name)
+                coalesce(vec![resid("sum"), lit(zero)]) + lit(value.clone())
             }
-            (AggKind::Min(_), Partial::Bound(value)) => least(vec![
-                col(format!("__resid_{i}_min")),
+            (AggKind::Min(_), Partial::Bound(None)) => resid("min"),
+            (AggKind::Min(_), Partial::Bound(Some(value))) => least(vec![
+                resid("min"),
                 covered_literal(value, field.data_type()),
-            ])
-            .alias(name),
-            (AggKind::Max(_), Partial::Bound(value)) => greatest(vec![
-                col(format!("__resid_{i}_max")),
+            ]),
+            (AggKind::Max(_), Partial::Bound(None)) => resid("max"),
+            (AggKind::Max(_), Partial::Bound(Some(value))) => greatest(vec![
+                resid("max"),
                 covered_literal(value, field.data_type()),
-            ])
-            .alias(name),
-            (AggKind::Avg(_), Partial::Avg { sum, count }) => {
+            ]),
+            (AggKind::Avg(_), Partial::Avg(None)) => {
+                resid("sum") / cast(resid("cnt"), DataType::Float64)
+            }
+            (AggKind::Avg(_), Partial::Avg(Some((sum, count)))) => {
                 // The residual partial is Float64 by construction (its sum
                 // is over an explicit cast), so the whole combiner stays in
                 // Float64 — the coalesce zero and the covered sum must
                 // match it, since nothing coerces after this rule.
-                let total_sum = coalesce(vec![col(format!("__resid_{i}_sum")), lit(0.0_f64)])
+                let total_sum = coalesce(vec![resid("sum"), lit(0.0_f64)])
                     + cast(lit(sum.clone()), DataType::Float64);
-                let total_cnt = col(format!("__resid_{i}_cnt")) + lit(*count);
-                (total_sum / cast(total_cnt, DataType::Float64)).alias(name)
+                let total_cnt = resid("cnt") + lit(*count);
+                total_sum / cast(total_cnt, DataType::Float64)
             }
             _ => return Ok(None),
         };
-        final_exprs.push(expr);
+        final_exprs.push(expr.alias(name));
     }
 
     let rewritten = builder.project(final_exprs)?.build()?;
@@ -693,7 +1168,10 @@ fn covered_literal(value: &ScalarValue, output: &DataType) -> Expr {
 ///             │         └─ TableScan(the scanned superfiles)
 ///             └─ Values(value, count)               -- from statistics
 /// ```
-fn rewrite_grouped_count_from_value_counts(aggregate: &Aggregate) -> DfResult<Option<LogicalPlan>> {
+fn rewrite_grouped_count_from_value_counts(
+    aggregate: &Aggregate,
+    wanted: &mut Wants,
+) -> DfResult<Option<LogicalPlan>> {
     let [Expr::Column(group_column)] = aggregate.group_expr.as_slice() else {
         return Ok(None);
     };
@@ -719,8 +1197,12 @@ fn rewrite_grouped_count_from_value_counts(aggregate: &Aggregate) -> DfResult<Op
     if provider.is_segment_restricted() {
         return Ok(None);
     }
+    // One read of each superfile's deleted rows for the statement: the
+    // counts and the residual scan see the same ones.
+    let provider = &provider.reading_tombstones_once();
     let column = group_column.name.as_str();
-    let Some(counts_split) = split_value_counts(provider, column, !nulls_filtered, "grouped count")
+    let Some(counts_split) =
+        split_value_counts(provider, column, !nulls_filtered, "grouped count", wanted)
     else {
         return Ok(None);
     };
@@ -755,24 +1237,22 @@ fn rewrite_grouped_count_from_value_counts(aggregate: &Aggregate) -> DfResult<Op
     }
 
     if !split.scans_any() {
-        // A column with no value at all has no group to list, and a values
-        // list takes at least one row; the scan answers the empty grouping.
-        if rows.is_empty() {
-            split.decline("the column holds no value");
-            return Ok(None);
-        }
         split.log();
-        let aliases: Vec<Expr> = aggregate
-            .schema
-            .fields()
-            .iter()
-            .enumerate()
-            .map(|(index, field)| col(format!("column{}", index + 1)).alias(field.name()))
+        // No live row holds a group: the grouping is empty.
+        if rows.is_empty() {
+            return Ok(Some(LogicalPlan::EmptyRelation(EmptyRelation {
+                produce_one_row: false,
+                schema: Arc::clone(&aggregate.schema),
+            })));
+        }
+        // Named and qualified exactly as the aggregate's output, which may be
+        // the plan's root: the schema a rule leaves must be the one it found.
+        let columns = (1..=aggregate.schema.fields().len())
+            .map(|index| col(format!("column{index}")))
             .collect();
         return Ok(Some(
             LogicalPlanBuilder::values_with_schema(rows, &aggregate.schema)?
-                .project(aliases)?
-                .alias(scan.table_name.clone())?
+                .project(as_output(&aggregate.schema, columns))?
                 .build()?,
         ));
     }
@@ -845,41 +1325,34 @@ fn as_output(schema: &DFSchema, exprs: Vec<Expr>) -> Vec<Expr> {
         .collect()
 }
 
-/// The rows of column `id` in `entry` that hold no value: all of them when
-/// the superfile does not hold the column, else its recorded null count.
-/// `None` when it records none.
-fn file_null_count(entry: &SuperfileEntry, id: FieldId) -> Option<u64> {
-    match file_lacks_column(entry, id) {
-        true => Some(entry.n_docs),
-        false => entry
-            .scalar_stats
-            .column(id)
-            .and_then(|stats| stats.null_count()),
-    }
-}
-
 /// How a column's value counts answer one statement: the superfiles whose
-/// statistics describe their live rows, and the rows among them holding no
-/// value; the rest are scanned.
+/// statistics, corrected for their deleted rows, describe their live rows,
+/// and the rows among them holding no value; the rest are scanned.
 struct CountsSplit {
     id: FieldId,
     split: Split,
-    /// The answered superfiles' null rows; 0 unless they were counted.
+    /// What each answered superfile's deleted rows take off its stored
+    /// counts, in the order of `split.answered`.
+    changes: Vec<CountsChange>,
+    /// The answered superfiles' live null rows; 0 unless they were counted.
     nulls: u64,
 }
 
 /// Split the superfiles for counting `column` by value from statistics: one
-/// with deleted rows, or (with `count_nulls`) without a recorded null count,
-/// is scanned. `None`, logged, when the counts can't answer at all: a
-/// segment-restricted provider (the rewrite's own residual), a manifest not
-/// fully loaded, a column mid-retype, or no superfile answered.
+/// whose deleted rows' values are not known, or (with `count_nulls`) whose
+/// live null rows are not, is scanned, and the deleted rows whose
+/// statistics would tell are added to `wanted`. `None`, logged, when the
+/// counts can't answer at all: a segment-restricted provider (the rewrite's
+/// own residual), a manifest not fully loaded, a column mid-retype, or no
+/// superfile answered.
 fn split_value_counts(
     provider: &SupertableProvider,
     column: &str,
     count_nulls: bool,
     shape: &'static str,
+    wanted: &mut Wants,
 ) -> Option<CountsSplit> {
-    let mut split = Split::new(shape);
+    let split = Split::new(shape, wanted.quiet);
     if provider.is_segment_restricted() {
         return None;
     }
@@ -892,39 +1365,68 @@ fn split_value_counts(
         split.decline("the column's statistics are of another type");
         return None;
     }
-    let id = manifest.field_id(column)?;
+    let stats_column = StatsColumn::new(manifest, column)?;
+    let data_type = stats_column.data_type.clone()?;
+    let id = stats_column.id;
     // The null counts and value counts are read in place; their groups are
     // read and decoded off the runtime's queue first, as a scan's are.
     load_section_groups_blocking(superfiles, &[id]);
-    let mut nulls = 0u64;
+    let mut counts_split = CountsSplit {
+        id,
+        split,
+        changes: Vec::new(),
+        nulls: 0,
+    };
     for entry in superfiles {
-        let file_nulls = file_null_count(entry, id);
-        match scan_reason(provider, entry, || !count_nulls || file_nulls.is_some()) {
-            None => {
-                split.answer(entry);
-                if count_nulls {
-                    let Some(total) = nulls.checked_add(file_nulls.unwrap_or(0)) else {
-                        split.decline("the null count overflows");
-                        return None;
-                    };
-                    nulls = total;
+        let deleted = match provider.tombstone_state(entry) {
+            TombstoneState::Clean => Arc::new(RoaringBitmap::new()),
+            TombstoneState::Deleted(rows) => rows,
+            TombstoneState::Unknown => {
+                counts_split.split.scan(ScanReason::DeletesUnknown, entry);
+                continue;
+            }
+        };
+        let live = live_column(provider, entry, id, &data_type, &deleted);
+        let answer = live.counts_change().and_then(|change| match count_nulls {
+            true => live.live_nulls().map(|nulls| (change, nulls)),
+            false => Ok((change, 0)),
+        });
+        match answer {
+            Ok((change, nulls)) => {
+                let Some(total) = counts_split.nulls.checked_add(nulls) else {
+                    counts_split.split.decline("the null count overflows");
+                    return None;
+                };
+                counts_split.nulls = total;
+                counts_split.changes.push(change);
+                counts_split.split.answer_past(entry, !deleted.is_empty());
+            }
+            Err(why) => {
+                counts_split.split.scan(scan_reason(why, &deleted), entry);
+                if why == Unknown::DeletedRows {
+                    wanted.list.push(Wanted {
+                        entry: Arc::clone(entry),
+                        deleted,
+                        columns: [stats_column.wanted()].into_iter().collect(),
+                    });
                 }
             }
-            Some(reason) => split.scan(reason, entry),
         }
     }
-    if split.answered.is_empty() && split.scans_any() {
-        split.decline("no superfile is answerable from statistics");
+    if counts_split.split.answered.is_empty() && counts_split.split.scans_any() {
+        counts_split
+            .split
+            .decline("no superfile is answerable from statistics");
         return None;
     }
-    Some(CountsSplit { id, split, nulls })
+    Some(counts_split)
 }
 
 /// A column's value counts over the superfiles a [`CountsSplit`] answers.
 enum Counts {
-    /// Every superfile's: the table's own counts.
+    /// Every superfile's, none with deletes: the table's own counts.
     Table(Arc<ScalarValueCounts>),
-    /// Some of them.
+    /// Some of them, or some with deletes.
     Answered(HashMap<ScalarValue, u64>),
 }
 
@@ -944,35 +1446,54 @@ impl Counts {
     }
 }
 
-/// `column`'s value counts over the superfiles `counts_split` answers: the
-/// table's carried counts less the scanned superfiles' own, or, where those
-/// can't be taken off (a scanned superfile holding more distinct values
-/// than it counts), the answered superfiles' counts added up. `None` when
-/// the answered superfiles' values are not all counted.
+/// `column`'s live value counts over the superfiles `counts_split`
+/// answers: the table's carried counts less the scanned superfiles' own,
+/// or, where those can't be taken off (a scanned superfile holding more
+/// distinct values than it counts), the answered superfiles' counts added
+/// up; then less what each answered superfile's deleted rows held. `None`
+/// when the answered superfiles' values are not all counted.
 fn answered_counts(
     provider: &SupertableProvider,
     column: &str,
     counts_split: &CountsSplit,
 ) -> Option<Counts> {
     let total = provider.exact_value_counts(column);
-    let scanned = &counts_split.split.scanned;
-    if scanned.is_empty() {
+    let CountsSplit {
+        id, split, changes, ..
+    } = counts_split;
+    let unchanged = changes.iter().all(|c| *c == CountsChange::Unchanged);
+    if !split.scans_any() && unchanged {
         return total.map(Counts::Table);
     }
-    total
-        .and_then(|total| counts_without(&total, scanned, counts_split.id))
-        .or_else(|| counts_of(&counts_split.split.answered, counts_split.id))
-        .map(Counts::Answered)
+    let mut counts = total
+        .and_then(|total| counts_without(&total, &split.scanned, *id))
+        .or_else(|| counts_of(&split.answered, *id))?;
+    for (entry, change) in split.answered.iter().zip(changes) {
+        match change {
+            CountsChange::Unchanged => {}
+            CountsChange::All => {
+                let stored = entry.scalar_stats.column(*id)?.value_counts()?;
+                counts = take_off(counts, stored.entries().iter().map(|(v, n)| (v, *n)))?;
+            }
+            CountsChange::Less(less) => {
+                counts = take_off(counts, less.iter().map(|(v, n)| (v, *n)))?;
+            }
+        }
+    }
+    Some(Counts::Answered(counts))
 }
 
 /// `column`'s live rows by value, and the rows holding no value, when the
-/// manifest's statistics describe every superfile's live rows (see
-/// [`split_value_counts`]); `None` otherwise.
+/// manifest's statistics, corrected for each superfile's deleted rows from
+/// what the table has read of them, describe every superfile's live rows
+/// (see [`split_value_counts`]); `None` otherwise.
 pub(crate) fn value_counts_from_statistics(
     provider: &SupertableProvider,
     column: &str,
 ) -> Option<(Vec<(ScalarValue, u64)>, u64)> {
-    let counts_split = split_value_counts(provider, column, true, "value_counts")?;
+    let provider = &provider.reading_tombstones_once();
+    let counts_split =
+        split_value_counts(provider, column, true, "value_counts", &mut Wants::logged())?;
     if counts_split.split.scans_any() {
         return None;
     }
@@ -1012,112 +1533,16 @@ fn value_matches_range(value: &ScalarValue, range: &RangeFilter) -> Option<bool>
     Some(true)
 }
 
-/// Covered-side partial state per aggregate output.
+/// Each aggregate's contribution from the superfiles answered from
+/// statistics.
 enum Partial {
     Count(i64),
-    Sum(ScalarValue),
-    Bound(ScalarValue),
-    Avg { sum: ScalarValue, count: i64 },
-}
-
-/// Fold one aggregate's covered contribution from manifest stats.
-/// `None` = decline the rewrite (overflow / unexpected shape).
-fn accumulate_partial(
-    manifest: &ManifestSnapshot,
-    kind: &AggKind,
-    covered: &[Arc<SuperfileEntry>],
-) -> Option<Partial> {
-    match kind {
-        AggKind::CountStar => {
-            let mut total: i64 = 0;
-            for entry in covered {
-                total = total.checked_add(i64::try_from(entry.n_docs).ok()?)?;
-            }
-            Some(Partial::Count(total))
-        }
-        AggKind::Count(col) => Some(Partial::Count(non_null_count(
-            covered,
-            manifest.field_id(col)?,
-        )?)),
-        AggKind::Sum(col) => Some(Partial::Sum(fold_sums(covered, manifest.field_id(col)?)?)),
-        AggKind::Min(col) => {
-            let (min, _) = fold_bounds(covered, manifest.field_id(col)?)?;
-            Some(Partial::Bound(min))
-        }
-        AggKind::Max(col) => {
-            let (_, max) = fold_bounds(covered, manifest.field_id(col)?)?;
-            Some(Partial::Bound(max))
-        }
-        AggKind::Avg(col) => {
-            let col = manifest.field_id(col)?;
-            let sum = fold_sums(covered, col)?;
-            let count = non_null_count(covered, col)?;
-            if count == 0 {
-                // All covered values NULL: AVG semantics get fiddly
-                // (0/0); decline and let the scan answer.
-                return None;
-            }
-            Some(Partial::Avg { sum, count })
-        }
-    }
-}
-
-/// The non-null rows of `col` across `covered`: each superfile's row count
-/// less its recorded null count, and none from a superfile that does not
-/// hold the column. `None` when a superfile holding it lacks the null count.
-fn non_null_count(covered: &[Arc<SuperfileEntry>], col: FieldId) -> Option<i64> {
-    let mut count: i64 = 0;
-    for entry in covered {
-        if file_lacks_column(entry, col) {
-            continue;
-        }
-        let nulls = entry.scalar_stats.column(col)?.null_count()?;
-        let non_null = entry.n_docs.checked_sub(nulls)?;
-        count = count.checked_add(i64::try_from(non_null).ok()?)?;
-    }
-    Some(count)
-}
-
-fn fold_sums(covered: &[Arc<SuperfileEntry>], col: FieldId) -> Option<ScalarValue> {
-    let mut acc: Option<ArrayRef> = None;
-    for entry in covered {
-        let part = entry.scalar_stats.column(col)?.sum()?;
-        acc = Some(match acc {
-            None => part,
-            Some(total) => add_sum_arrays(&total, &part)?,
-        });
-    }
-    ScalarValue::try_from_array(&acc?, 0).ok()
-}
-
-fn fold_bounds(
-    covered: &[Arc<SuperfileEntry>],
-    col: FieldId,
-) -> Option<(ScalarValue, ScalarValue)> {
-    let mut acc: Option<(ScalarValue, ScalarValue)> = None;
-    for entry in covered {
-        let (min, max) = entry.scalar_stats.column(col)?.min_max_values()?;
-        if min.is_null() || max.is_null() {
-            return None;
-        }
-        acc = match acc {
-            None => Some((min, max)),
-            Some((cur_min, cur_max)) => {
-                let new_min = if min.partial_cmp(&cur_min)? == Ordering::Less {
-                    min
-                } else {
-                    cur_min
-                };
-                let new_max = if max.partial_cmp(&cur_max)? == Ordering::Greater {
-                    max
-                } else {
-                    cur_max
-                };
-                Some((new_min, new_max))
-            }
-        };
-    }
-    acc
+    /// The sum; `None` when no answered row holds a value.
+    Sum(Option<ScalarValue>),
+    /// The bound; `None` when no answered row holds a value.
+    Bound(Option<ScalarValue>),
+    /// The sum and count of the values; `None` when there are none.
+    Avg(Option<(ScalarValue, i64)>),
 }
 
 /// A zero literal of the same type as `value`, for `coalesce` over an
@@ -1237,10 +1662,7 @@ fn bucket_counts(exprs: &[Expr]) -> Option<Vec<(Expr, Option<Expr>)>> {
     exprs
         .iter()
         .map(|expr| {
-            let inner = match expr {
-                Expr::Alias(alias) => alias.expr.as_ref(),
-                other => other,
-            };
+            let inner = unaliased(expr);
             let Expr::AggregateFunction(agg) = inner else {
                 return None;
             };
@@ -1268,15 +1690,22 @@ fn counts_rows(name: &str, args: &[Expr]) -> bool {
     }
 }
 
+/// `expr` under every alias it carries. A plan built through the DataFrame
+/// API names an aggregate as it is made (`count_all()` is `COUNT(*)` named
+/// so) and again as it is selected, and is only flattened once analyzed.
+fn unaliased(mut expr: &Expr) -> &Expr {
+    while let Expr::Alias(alias) = expr {
+        expr = alias.expr.as_ref();
+    }
+    expr
+}
+
 /// Parse the aggregate outputs; `None` if any is unsupported.
 fn parse_aggregates(exprs: &[Expr]) -> Option<Vec<AggKind>> {
     let mut kinds = Vec::with_capacity(exprs.len());
     for expr in exprs {
-        // Outputs may carry an alias wrapper.
-        let inner = match expr {
-            Expr::Alias(alias) => alias.expr.as_ref(),
-            other => other,
-        };
+        // Outputs may carry an alias wrapper, or several.
+        let inner = unaliased(expr);
         let Expr::AggregateFunction(agg) = inner else {
             return None;
         };
@@ -1578,7 +2007,7 @@ fn classify(
 /// apart and order them as the old type did: a `Utf8` `"7"` and a retyped `7`
 /// are separate keys, and `"7" >= "10"` holds as text where `7 >= 10` does
 /// not. The scan sees the column as the table now holds it, so a shortcut has
-/// to decline exactly where [`has_required_stats`] does.
+/// to decline exactly where [`StatsColumn::current_in`] does.
 fn counts_describe_column(
     manifest: &ManifestSnapshot,
     column: &str,
@@ -1589,51 +2018,6 @@ fn counts_describe_column(
     };
     let guard = ColumnTypeGuard::new(manifest, id);
     !guard.aggregates_mix_types() && !superfiles.iter().any(|e| guard.stats_are_stale(e))
-}
-
-/// Do the manifest stats cover everything `kinds` needs from a
-/// covered segment?
-///
-/// A statistic is only usable when it was recorded in the type the table
-/// reads the column as today. After a retype the recorded bounds describe
-/// the old type, and they do not survive the cast: a `LargeUtf8` column
-/// holding "7" and "10" records min "10" and max "7" lexicographically, so
-/// answering `MAX` from them after a change to `Int64` returns 7 and `MIN`
-/// returns 10 — wrong, and wrong in opposite directions. A sum or a null
-/// count recorded in the old type is no better. So a file whose statistics
-/// have gone stale, or a column mid-conversion whose files disagree, falls
-/// back to the scan, which reads the data through the cast and derives the
-/// answer afresh. Compaction re-derives the statistics in the new type when
-/// it rewrites the file, and the covered path picks up again.
-fn has_required_stats(
-    manifest: &ManifestSnapshot,
-    entry: &SuperfileEntry,
-    kinds: &[AggKind],
-) -> bool {
-    let usable = |col: &str| {
-        let id = manifest.field_id(col)?;
-        let guard = ColumnTypeGuard::new(manifest, id);
-        if guard.aggregates_mix_types() || guard.stats_are_stale(entry) {
-            return None;
-        }
-        entry.scalar_stats.column(id)
-    };
-    // A file without the column holds it null in every row: its count is
-    // known without statistics.
-    let absent = |col: &str| {
-        manifest
-            .field_id(col)
-            .is_some_and(|id| file_lacks_column(entry, id))
-    };
-    kinds.iter().all(|kind| match kind {
-        AggKind::CountStar => true,
-        AggKind::Count(col) => absent(col) || usable(col).is_some_and(|a| a.null_count().is_some()),
-        AggKind::Sum(col) => usable(col).is_some_and(|a| a.sum().is_some()),
-        AggKind::Min(col) | AggKind::Max(col) => usable(col).is_some(),
-        AggKind::Avg(col) => {
-            usable(col).is_some_and(|a| a.sum().is_some() && a.null_count().is_some())
-        }
-    })
 }
 
 #[cfg(test)]

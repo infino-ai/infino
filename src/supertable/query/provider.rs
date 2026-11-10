@@ -128,6 +128,7 @@ use crate::{
             candidate::{
                 CandidatePlan, ExactFilter, exact_filter, like_prune_leaves, single_range,
             },
+            deleted_stats::DeletedStatsCache,
             df_object_store::SuperfileObjectStore,
             exec::{
                 cached_scan_exec::{
@@ -219,6 +220,58 @@ struct PreparedScanFile {
 }
 
 impl PreparedScanFile {
+    /// The data pages of `columns` holding any of `read`, and those holding
+    /// a row `deleted` leaves live; `None` when the footer carries no page
+    /// index. Rows are numbered across the row groups in order.
+    fn page_costs(
+        &self,
+        columns: &[&str],
+        read: &RoaringBitmap,
+        deleted: &RoaringBitmap,
+    ) -> Option<(u64, u64)> {
+        let offsets = self.footer.offset_index()?;
+        let leaves = self.footer.file_metadata().schema_descr();
+        let wanted: Vec<usize> = (0..leaves.num_columns())
+            .filter(|leaf| {
+                leaves
+                    .column(*leaf)
+                    .path()
+                    .parts()
+                    .first()
+                    .is_some_and(|name| columns.contains(&name.as_str()))
+            })
+            .collect();
+        // A file naming none of the columns (written before a rename) has
+        // no pages to weigh.
+        if wanted.is_empty() {
+            return None;
+        }
+        let (mut read_pages, mut live_pages) = (0u64, 0u64);
+        let mut start = 0u64;
+        for (group, chunks) in offsets.iter().enumerate() {
+            let rows = u64::from(*self.row_counts.get(group)?);
+            for leaf in &wanted {
+                let pages = chunks.get(*leaf)?.page_locations();
+                for (at, page) in pages.iter().enumerate() {
+                    let first = start + u64::try_from(page.first_row_index).ok()?;
+                    let end = match pages.get(at + 1) {
+                        Some(next) => start + u64::try_from(next.first_row_index).ok()?,
+                        None => start + rows,
+                    };
+                    let span = u32::try_from(first).ok()?..u32::try_from(end).ok()?;
+                    if read.range_cardinality(span.clone()) > 0 {
+                        read_pages += 1;
+                    }
+                    if deleted.range_cardinality(span) < end - first {
+                        live_pages += 1;
+                    }
+                }
+            }
+            start += rows;
+        }
+        Some((read_pages, live_pages))
+    }
+
     /// The average data pages of `columns` in this file; `None` when the
     /// page index names none of them.
     fn pages_per_column(&self, columns: &[&str]) -> Option<u64> {
@@ -434,6 +487,12 @@ pub(crate) struct SupertableProvider {
     /// range holds, counted from the range index rather than read
     /// ([`Self::range_count_exec`]).
     count_range: Option<CountedRange>,
+    /// Set by [`Self::reading_rows`]: the scan reads only these rows of
+    /// this one superfile, deleted or not.
+    read_rows: Option<(Arc<SuperfileEntry>, Arc<RoaringBitmap>)>,
+    /// The statistics of superfiles' deleted rows, kept for the table (see
+    /// [`DeletedStatsCache`]).
+    deleted_stats: Arc<DeletedStatsCache>,
 }
 
 /// What [`SupertableProvider::count_range`] carries: the column, its id
@@ -449,12 +508,12 @@ pub(crate) struct CountedRange {
 
 /// A superfile's deleted rows, as [`SupertableProvider::tombstone_state`]
 /// reads them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum TombstoneState {
     /// No row is deleted.
     Clean,
-    /// Some row is deleted.
-    Deleted,
+    /// These rows, never none, are deleted.
+    Deleted(Arc<RoaringBitmap>),
     /// The deleted rows could not be read.
     Unknown,
 }
@@ -539,6 +598,8 @@ impl SupertableProvider {
             value_count_carry: Arc::default(),
             top_k: None,
             count_range: None,
+            read_rows: None,
+            deleted_stats: Arc::default(),
         }
     }
 
@@ -547,6 +608,51 @@ impl SupertableProvider {
     pub(crate) fn with_value_count_carry(mut self, carry: Arc<ValueCountCarry>) -> Self {
         self.value_count_carry = carry;
         self
+    }
+
+    /// This provider keeping deleted rows' statistics in the table's
+    /// `cache`, so a statement reads only the rows deleted since one before.
+    pub(crate) fn with_deleted_stats(mut self, cache: Arc<DeletedStatsCache>) -> Self {
+        self.deleted_stats = cache;
+        self
+    }
+
+    /// The statistics of superfiles' deleted rows kept for the table.
+    pub(crate) fn deleted_stats(&self) -> &DeletedStatsCache {
+        &self.deleted_stats
+    }
+
+    /// Clone of this provider whose scan reads `rows` of superfile `entry`
+    /// and nothing else, deleted or not: the deleted rows whose statistics
+    /// correct the superfile's own. Shares the parent's snapshot, prepared
+    /// files and scan store, as [`Self::restricted_to`] does.
+    pub(crate) fn reading_rows(
+        &self,
+        entry: Arc<SuperfileEntry>,
+        rows: Arc<RoaringBitmap>,
+    ) -> Self {
+        Self {
+            segment_filter: Some([entry.superfile_id].into_iter().collect()),
+            top_k: None,
+            count_range: None,
+            read_rows: Some((entry, rows)),
+            ..self.sibling()
+        }
+    }
+
+    /// The data pages of `columns` in `entry` that hold any of `read`, and
+    /// those that hold a row `deleted` leaves live: what reading `read`
+    /// costs against what scanning the live rows does. `None` when the
+    /// file carries no page index.
+    pub(crate) async fn page_costs(
+        &self,
+        entry: Arc<SuperfileEntry>,
+        columns: &[&str],
+        read: &RoaringBitmap,
+        deleted: &RoaringBitmap,
+    ) -> DfResult<Option<(u64, u64)>> {
+        let prepared = self.prepared_scan_file(entry).await?;
+        Ok(prepared.page_costs(columns, read, deleted))
     }
 
     /// Clone of this provider restricted to `segments` — used by the
@@ -681,6 +787,8 @@ impl SupertableProvider {
             value_count_carry: Arc::clone(&self.value_count_carry),
             top_k: self.top_k.clone(),
             count_range: self.count_range.clone(),
+            read_rows: self.read_rows.clone(),
+            deleted_stats: Arc::clone(&self.deleted_stats),
         }
     }
 
@@ -702,7 +810,7 @@ impl SupertableProvider {
     pub(crate) fn tombstone_state(&self, entry: &SuperfileEntry) -> TombstoneState {
         match self.deleted_rows(entry.superfile_id, Instant::now()) {
             Ok(rows) if rows.is_empty() => TombstoneState::Clean,
-            Ok(_) => TombstoneState::Deleted,
+            Ok(rows) => TombstoneState::Deleted(rows),
             Err(_) => TombstoneState::Unknown,
         }
     }
@@ -1009,6 +1117,27 @@ impl SupertableProvider {
             .map_err(QueryError::ManifestLoad)?;
         self.prefetch_tombstones(&entries, Instant::now()).await;
         Ok(())
+    }
+
+    /// Whether any listed superfile may have deleted rows, from the
+    /// tombstone sequence view alone: no sidecar is read.
+    pub(crate) fn may_have_deletes(&self) -> bool {
+        let Some(cache) = self.tombstone_cache.as_ref() else {
+            return false;
+        };
+        self.manifest.resident_superfiles().is_none_or(|listed| {
+            listed
+                .iter()
+                .any(|entry| cache.may_have_tombstones(entry.superfile_id))
+        })
+    }
+
+    /// Read every listed superfile's deleted rows into the tombstone cache,
+    /// so the statistics rewrite's lookups of them are cache reads.
+    pub(crate) async fn prefetch_listed_tombstones(&self) {
+        if let Some(listed) = self.manifest.resident_superfiles() {
+            self.prefetch_tombstones(&listed, Instant::now()).await;
+        }
     }
 
     /// Warm every one of `survivors`' tombstone bitmaps in one batched fetch,
@@ -1876,10 +2005,14 @@ impl TableProvider for SupertableProvider {
             survivors = tracing::field::Empty,
         );
 
-        let survivor_entries = self
-            .select_survivors(filters)
-            .instrument(select_span.clone())
-            .await?;
+        let survivor_entries = match &self.read_rows {
+            Some((entry, _)) => vec![Arc::clone(entry)],
+            None => {
+                self.select_survivors(filters)
+                    .instrument(select_span.clone())
+                    .await?
+            }
+        };
 
         select_span.record("survivors", survivor_entries.len());
         trace::end(select_span);
@@ -2068,6 +2201,16 @@ impl TableProvider for SupertableProvider {
                     let candidate_plan = &candidate_plan;
                     let read_columns = &read_columns;
                     async move {
+                        // Only the rows asked for, deleted or not: no index
+                        // narrows them and no delete overlay drops any.
+                        if let Some((_, rows)) = &self.read_rows {
+                            return Ok(SuperfileScan {
+                                prepared,
+                                candidates: Some(rows.as_ref().clone()),
+                                tombstones: Arc::new(RoaringBitmap::new()),
+                                predicate_work: MatchWork::default(),
+                            });
+                        }
                         // Resolve candidate rows from the index. `None` => no
                         // usable bound, scan the superfile.
                         //
@@ -2356,7 +2499,7 @@ impl TableProvider for SupertableProvider {
             });
             let wanted = |name: &str| projected.as_ref().is_none_or(|set| set.contains(name));
             let stats = self.statistics_for(&survivor_entries, &wanted);
-            if filters.is_empty() {
+            if filters.is_empty() && self.read_rows.is_none() {
                 stats
             } else {
                 stats.to_inexact()

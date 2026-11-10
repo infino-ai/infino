@@ -5227,6 +5227,26 @@ pub(crate) fn add_sum_arrays(a: &ArrayRef, b: &ArrayRef) -> Option<ArrayRef> {
     }
 }
 
+/// `a` less `b`, two length-1 integer sums of the same type (see
+/// [`column_sum`]): the sum of the values `a` added up that `b` did not.
+/// `None` on a type mismatch, a float sum (whose difference is not the sum
+/// of the rest), or overflow.
+pub(crate) fn sub_sum_arrays(a: &ArrayRef, b: &ArrayRef) -> Option<ArrayRef> {
+    match (a.data_type(), b.data_type()) {
+        (DataType::Int64, DataType::Int64) => {
+            let x = a.as_any().downcast_ref::<Int64Array>()?.value(0);
+            let y = b.as_any().downcast_ref::<Int64Array>()?.value(0);
+            Some(Arc::new(Int64Array::from(vec![x.checked_sub(y)?])) as ArrayRef)
+        }
+        (DataType::UInt64, DataType::UInt64) => {
+            let x = a.as_any().downcast_ref::<UInt64Array>()?.value(0);
+            let y = b.as_any().downcast_ref::<UInt64Array>()?.value(0);
+            Some(Arc::new(UInt64Array::from(vec![x.checked_sub(y)?])) as ArrayRef)
+        }
+        _ => None,
+    }
+}
+
 /// HyperLogLog distinct sketch over a column's non-null values.
 /// `None` for types the sketch doesn't cover. Values hash by their
 /// canonical byte representation (little-endian for numerics, raw

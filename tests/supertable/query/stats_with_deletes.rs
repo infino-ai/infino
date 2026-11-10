@@ -31,7 +31,9 @@ use datafusion::{
     common::ScalarValue,
     prelude::{col, lit},
 };
-use infino::{Connection, IndexSpec, Supertable, connect};
+use infino::{
+    Connection, IndexSpec, OptimizeOptions, Supertable, connect, supertable::SupertableReader,
+};
 use rand::{RngExt, SeedableRng, rngs::StdRng};
 use tempfile::TempDir;
 
@@ -363,15 +365,31 @@ fn statement(select: &str, filter: Option<&str>, group: Option<&str>) -> Stateme
 
 /// Every statement the statistics may answer, over `fixture`'s columns.
 fn statements(fixture: &mut Fixture) -> Vec<Statement> {
-    let mut out = vec![statement("COUNT(*)", None, None)];
     let ranges = fixture.key_edges();
+    statements_over(&ranges)
+}
+
+/// Every statement the statistics may answer over superfiles `files`, with
+/// ranges of `k` that cover whole superfiles only.
+fn statements_on(files: &[Vec<Row>]) -> Vec<Statement> {
+    let mut edges = vec![0i64];
+    for rows in files {
+        edges.push(edges.last().copied().unwrap_or(0) + rows.len() as i64);
+    }
+    let last = edges.last().copied().unwrap_or(0);
+    statements_over(&[(0, last), (edges[1], last)])
+}
+
+/// Every statement the statistics may answer, with ranges `ranges` of `k`.
+fn statements_over(ranges: &[(i64, i64)]) -> Vec<Statement> {
+    let mut out = vec![statement("COUNT(*)", None, None)];
     for (name, numeric) in COLUMNS {
         let mut select = format!("COUNT(*), COUNT({name}), MIN({name}), MAX({name})");
         if numeric {
             select.push_str(&format!(", SUM({name}), AVG({name})"));
         }
         out.push(statement(&select, None, None));
-        for (lo, hi) in &ranges {
+        for (lo, hi) in ranges {
             out.push(statement(
                 &select,
                 Some(&format!("k BETWEEN {lo} AND {hi}")),
@@ -422,10 +440,10 @@ fn uses_statistics(explained: &str) -> bool {
 /// Every statement of [`statements`] matches its scan on `fixture`, through
 /// the connection and through a reader of the table; and each column's
 /// value counts match its grouped scan. Returns how many statements were
-/// answered at least in part from statistics.
-fn assert_answers_match_scans(fixture: &mut Fixture, when: &str) -> usize {
+/// answered at least in part from statistics, and how many wholly.
+fn assert_answers_match_scans(fixture: &mut Fixture, when: &str) -> (usize, usize) {
     let reader = fixture.table.local_handle().reader().expect("reader");
-    let mut from_statistics = 0;
+    let (mut from_statistics, mut fully) = (0, 0);
     for statement in statements(fixture) {
         let (answered_sql, scanned_sql) = (statement.sql(false), statement.sql(true));
         let scanned = rows_of(&fixture.conn.query_sql(&scanned_sql).expect("scan"));
@@ -435,8 +453,12 @@ fn assert_answers_match_scans(fixture: &mut Fixture, when: &str) -> usize {
             !uses_statistics(&explain(&fixture.conn, &scanned_sql)),
             "{when}: the oracle must scan: {scanned_sql}"
         );
-        if uses_statistics(&explain(&fixture.conn, &answered_sql)) {
+        let explained = explain(&fixture.conn, &answered_sql);
+        if uses_statistics(&explained) {
             from_statistics += 1;
+        }
+        if !uses_scan(&explained) {
+            fully += 1;
         }
         let through_reader = answered_sql.replace(&format!("FROM {TABLE}"), "FROM supertable");
         let read = rows_of(&reader.query_sql(&through_reader).expect("reader answer"));
@@ -451,7 +473,7 @@ fn assert_answers_match_scans(fixture: &mut Fixture, when: &str) -> usize {
             &format!("{when}: value_counts({name})"),
         );
     }
-    from_statistics
+    (from_statistics, fully)
 }
 
 /// On random tables, before any delete and after each of two rounds of
@@ -461,21 +483,160 @@ fn assert_answers_match_scans(fixture: &mut Fixture, when: &str) -> usize {
 fn aggregates_from_statistics_match_the_scan_under_random_deletes() {
     // Statements answered at least in part from statistics, before and
     // after deletes, across every seed.
-    let (mut clean, mut deleted) = (0, 0);
+    let (mut clean, mut deleted, mut wholly) = (0, 0, 0);
     for seed in 0..SEEDS {
         let mut fixture = Fixture::new(seed);
-        clean += assert_answers_match_scans(&mut fixture, &format!("seed {seed}, no deletes"));
-        fixture.delete_some();
-        deleted += assert_answers_match_scans(&mut fixture, &format!("seed {seed}, first deletes"));
-        fixture.delete_some();
-        deleted +=
-            assert_answers_match_scans(&mut fixture, &format!("seed {seed}, second deletes"));
+        clean += assert_answers_match_scans(&mut fixture, &format!("seed {seed}, no deletes")).0;
+        for round in ["first", "second"] {
+            fixture.delete_some();
+            let (some, all) =
+                assert_answers_match_scans(&mut fixture, &format!("seed {seed}, {round} deletes"));
+            deleted += some;
+            wholly += all;
+        }
     }
-    eprintln!("from statistics: {clean} before deletes, {deleted} after");
+    eprintln!("from statistics: {clean} before deletes, {deleted} after ({wholly} with no scan)");
     assert!(
         clean > 0 && deleted > 0,
         "the statistics answer some statements"
     );
+    assert!(
+        wholly > 0,
+        "deleted rows are corrected for, not only scanned"
+    );
+}
+
+/// A table of `files`, each one superfile, through a fresh connection.
+fn table_of(files: &[Vec<Row>]) -> (TempDir, Connection, Supertable) {
+    let dir = TempDir::new().expect("tempdir");
+    let conn = connect(dir.path().to_str().expect("utf8 path")).expect("connect");
+    let table = conn
+        .create_table(TABLE, schema(), IndexSpec::new())
+        .expect("create");
+    for rows in files {
+        table.append(&batch(rows)).expect("append");
+    }
+    (dir, conn, table)
+}
+
+/// A row with key `k`, `i` and `f` as given and every other column null.
+fn numbers(k: i64, i: Option<i64>, f: Option<f64>) -> Row {
+    Row {
+        k,
+        g: None,
+        u: None,
+        i,
+        j: None,
+        b: None,
+        f,
+    }
+}
+
+/// Whether a plan reads a table.
+fn uses_scan(explained: &str) -> bool {
+    explained.contains("TableScan")
+}
+
+/// `statement` answered as its forced scan answers it, through `conn`.
+fn assert_matches_scan(conn: &Connection, statement: &Statement) {
+    assert_same_rows(
+        &rows_of(&conn.query_sql(&statement.sql(false)).expect("answer")),
+        &rows_of(&conn.query_sql(&statement.sql(true)).expect("scan")),
+        &statement.sql(false),
+    );
+}
+
+/// A float sum is never corrected for deleted rows: the superfile with
+/// deletes is scanned, and `EXPLAIN` says so. An integer sum over the same
+/// rows is corrected, with no scan.
+#[test]
+fn a_float_sum_scans_the_superfile_with_deletes() {
+    let quarters = |keys: Range<i64>| -> Vec<Row> {
+        keys.map(|k| numbers(k, Some(k), Some(k as f64 / QUARTER)))
+            .collect()
+    };
+    let (_dir, conn, table) = table_of(&[quarters(0..4), quarters(4..8)]);
+    table.delete(col("k").eq(lit(5i64))).expect("delete");
+    let float = statement("SUM(f), AVG(f)", None, None);
+    assert_matches_scan(&conn, &float);
+    let explained = explain(&conn, &float.sql(false));
+    assert!(
+        explained.contains("scans 1 superfiles (1 with deleted rows); 1 answered from statistics"),
+        "{explained}"
+    );
+    let integer = statement("SUM(i), AVG(i)", None, None);
+    assert_matches_scan(&conn, &integer);
+    assert!(!uses_scan(&explain(&conn, &integer.sql(false))));
+}
+
+/// A superfile whose rows are all deleted holds nothing, and one whose
+/// values are all in deleted rows holds no value: its group is gone, and
+/// SUM, AVG, MIN and MAX over nothing are NULL, all with no scan.
+#[test]
+fn deleted_values_leave_nothing_behind() {
+    let (_dir, conn, table) = table_of(&[
+        (0..3).map(|k| numbers(k, Some(k), None)).collect(),
+        vec![numbers(3, Some(7), None), numbers(4, None, None)],
+    ]);
+    table
+        .delete(col("k").lt(lit(4i64)))
+        .expect("delete every value");
+    for aggregates in [
+        statement(
+            "COUNT(*), COUNT(i), SUM(i), AVG(i), MIN(i), MAX(i)",
+            None,
+            None,
+        ),
+        statement("i, COUNT(*)", None, Some("i")),
+        statement("i, COUNT(*)", Some("i IS NOT NULL"), Some("i")),
+    ] {
+        assert_matches_scan(&conn, &aggregates);
+        let sql = aggregates.sql(false);
+        assert!(!uses_scan(&explain(&conn, &sql)), "{sql}");
+    }
+    let totals = statement("COUNT(*), COUNT(i), SUM(i), MIN(i)", None, None);
+    assert_eq!(
+        rows_of(&conn.query_sql(&totals.sql(false)).expect("answer")),
+        vec![vec![Cell::Int(1), Cell::Int(0), Cell::Null, Cell::Null]]
+    );
+}
+
+/// A reader pinned before later deletes, and before a compaction replaced
+/// its superfiles, answers every aggregate from statistics as its own scan
+/// answers it, whatever deleted rows a newer reader has read since.
+#[test]
+fn a_pinned_reader_answers_as_its_own_scan_across_deletes_and_compaction() {
+    let mut fixture = Fixture::new(SEEDS);
+    fixture.delete_some();
+    let statements = statements_on(&fixture.files);
+    let check = |reader: &SupertableReader, when: &str| {
+        for statement in &statements {
+            let sql = |forced| {
+                statement
+                    .sql(forced)
+                    .replace(&format!("FROM {TABLE}"), "FROM supertable")
+            };
+            assert_same_rows(
+                &rows_of(&reader.query_sql(&sql(false)).expect("answer")),
+                &rows_of(&reader.query_sql(&sql(true)).expect("scan")),
+                &format!("{when}: {}", sql(false)),
+            );
+        }
+    };
+    let pinned = fixture.table.local_handle().reader().expect("reader");
+    check(&pinned, "pinned, its own deletes");
+    fixture.delete_some();
+    fixture.delete_some();
+    let newer = fixture.table.local_handle().reader().expect("reader");
+    check(&newer, "newer reader");
+    check(&pinned, "pinned, after later deletes");
+    fixture
+        .table
+        .optimize(&OptimizeOptions::default())
+        .expect("optimize");
+    let compacted = fixture.table.local_handle().reader().expect("reader");
+    check(&compacted, "after compaction");
+    check(&pinned, "pinned, after compaction");
 }
 
 /// `(group, count)` rows of a grouped count over `g`, the null group as
@@ -498,10 +659,10 @@ fn group_counts(batches: &[RecordBatch]) -> BTreeMap<Option<String>, i64> {
 }
 
 /// Two superfiles, one with a deleted row: `g`'s grouped count, the null
-/// group included, answers the clean superfile from its value counts and
-/// scans only the other, and `EXPLAIN` says so.
+/// group included, answers both from their value counts, the one with the
+/// delete corrected for its deleted row, with no scan.
 #[test]
-fn grouped_count_scans_only_the_superfile_with_deletes() {
+fn grouped_count_corrects_the_superfile_with_deletes() {
     let dir = TempDir::new().expect("tempdir");
     let conn = connect(dir.path().to_str().expect("utf8 path")).expect("connect");
     let table = conn
@@ -546,8 +707,8 @@ fn grouped_count_scans_only_the_superfile_with_deletes() {
     );
     let explained = explain(&conn, &sql);
     assert!(
-        explained.contains("scans 1 superfiles (1 with deleted rows); 1 answered from statistics"),
-        "the scan stands for the one superfile with deletes:\n{explained}"
+        !uses_scan(&explained),
+        "answered from statistics:\n{explained}"
     );
     let counts = table.value_counts("g").expect("value counts");
     assert_eq!(group_counts(from_ref(&counts)), expected);

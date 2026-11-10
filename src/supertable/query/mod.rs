@@ -22,6 +22,7 @@
 pub mod candidate;
 pub(crate) mod column_cache;
 pub mod covered_agg;
+pub(crate) mod deleted_stats;
 pub mod df_object_store;
 pub mod dispatch;
 pub mod exec;
