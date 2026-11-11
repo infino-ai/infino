@@ -988,7 +988,19 @@ mod tests {
         t.compact(&cfg).expect("compact");
         assert_eq!(files(&t), before, "no compaction while attached");
 
+        // optimize stands down as a whole: its term-index fold would merge replicas' layers too.
+        assert!(t.has_attached_replicas().expect("attached"));
+        let layers = layout(&t).0;
+        t.optimize(&crate::OptimizeOptions::compact(cfg.clone()))
+            .expect("optimize");
+        assert_eq!(
+            (files(&t), layout(&t).0),
+            (before, layers),
+            "optimize changed nothing"
+        );
+
         std::fs::remove_dir_all(dir.path().join("_replicas")).expect("detach");
+        assert!(!t.has_attached_replicas().expect("detached"));
         t.gc(std::time::Duration::ZERO).expect("gc");
         assert!(!orphan.exists(), "reclaimed once detached");
         t.compact(&cfg).expect("compact");
