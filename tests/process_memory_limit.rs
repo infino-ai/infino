@@ -11,6 +11,15 @@
 //! the statement part-way through, and the same connection must answer again
 //! once the memory has gone back.
 //!
+//! The limit also covers planning. A scan opens the files it keeps while it
+//! is planned, and on a table of tens of thousands of files their metadata
+//! alone can pass the limit before execution starts. With planning held on
+//! its first read (the table's term index, which the scan prunes with before
+//! it opens a file), a statement whose process passes the limit must be
+//! refused while it is still planning, through a connection and through a
+//! table's own SQL, which plan on separate paths. Once the memory is
+//! back under the same limit, the same statement answers.
+//!
 //! Its own test binary, and one test, because the limit belongs to the whole
 //! process: tests running beside it would move the reading, and each phase
 //! sets the limit for everything in the process.
@@ -20,17 +29,24 @@
 
 use std::{
     fs,
-    sync::Arc,
+    hint::black_box,
+    sync::{Arc, Mutex, PoisonError, mpsc},
     thread,
     time::{Duration, Instant},
 };
 
 use infino::{
-    Connection, IndexSpec, InfinoError,
+    ConnectOptions, Connection, IndexSpec, InfinoError,
     arrow_array::{LargeStringArray, RecordBatch},
     arrow_schema::{DataType, Field, Schema},
-    connect,
+    connect, connect_with,
     memory::set_process_memory_limit,
+    runtime_metrics::op_stats::with_op_stats,
+    supertable::{
+        Supertable, SupertableOptions, SupertableReader,
+        storage::{LocalFsStorageProvider, StorageProvider},
+    },
+    test_helpers::{build_title_batch, default_supertable_options, slow_storage::SlowStorage},
 };
 use tempfile::TempDir;
 
@@ -56,6 +72,28 @@ const DRAIN_POLL: Duration = Duration::from_millis(100);
 const KIB: u64 = 1024;
 /// A statement that reads almost nothing.
 const SMALL_QUERY: &str = "SELECT name FROM docs WHERE name = 'doc 7'";
+/// A statement answered from the manifest: it opens the table and reads no
+/// superfile.
+const OPEN_QUERY: &str = "SELECT count(*) FROM docs";
+/// A statement whose scan reads storage while it plans: it prunes the table's
+/// files for the `LIKE` with the term index before it opens them.
+const SCAN_QUERY: &str = "SELECT count(*) FROM docs WHERE name LIKE 'doc 1%'";
+/// [`OPEN_QUERY`] through a table's own SQL.
+const TABLE_OPEN_QUERY: &str = "SELECT count(*) FROM supertable";
+/// [`SCAN_QUERY`] through a table's own SQL.
+const TABLE_SCAN_QUERY: &str = "SELECT count(*) FROM supertable WHERE title LIKE 'doc 1%'";
+/// Reads are held, not slowed: the test acts while planning waits on one.
+const NO_READ_DELAY: Duration = Duration::ZERO;
+/// Bytes the test itself takes to push the process past the limit: well past
+/// [`HEADROOM_BYTES`], so the sampler sees it however the allocator rounds.
+const PUSH_BYTES: usize = 4 * HEADROOM_BYTES as usize;
+/// A byte written to every page the push takes, so the pages are resident.
+const PUSH_FILL: u8 = 0x5a;
+/// How long a refusal may take once the process is over the limit: the
+/// sampler reads every 100 ms, so this is generous.
+const REFUSAL_BOUND: Duration = Duration::from_secs(10);
+/// How long the scan may take to reach its first read.
+const PLANNING_READ_DEADLINE: Duration = Duration::from_secs(30);
 
 /// The process's anonymous resident bytes, as the limit reads them.
 fn rss_anon_bytes() -> u64 {
@@ -108,6 +146,118 @@ fn rows(conn: &Connection, sql: &str) -> Result<usize, InfinoError> {
     Ok(conn.query_sql(sql)?.iter().map(|b| b.num_rows()).sum())
 }
 
+/// A connection to `dir` whose storage reads go through [`SlowStorage`], and
+/// the stores it built.
+fn holding_conn(dir: &TempDir) -> (Connection, Arc<Mutex<Vec<Arc<SlowStorage>>>>) {
+    let stores = Arc::new(Mutex::new(Vec::<Arc<SlowStorage>>::new()));
+    let built = Arc::clone(&stores);
+    let options = ConnectOptions::new().with_storage_wrapper(move |inner| {
+        let slow = SlowStorage::wrap(inner, NO_READ_DELAY);
+        built
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(Arc::clone(&slow));
+        slow
+    });
+    let conn = connect_with(dir.path().to_str().expect("utf8 tempdir path"), options)
+        .expect("connect with held reads");
+    (conn, stores)
+}
+
+/// Apply `act` to every store built so far.
+fn each_store(stores: &Mutex<Vec<Arc<SlowStorage>>>, act: impl Fn(&SlowStorage)) {
+    stores
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .for_each(|store| act(store));
+}
+
+/// Reads started on every store built so far.
+fn reads(stores: &Mutex<Vec<Arc<SlowStorage>>>) -> usize {
+    stores
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .map(|store| store.reads())
+        .sum()
+}
+
+/// Options for a table of full-text indexed titles, on `storage`. The index
+/// gives the table a term index, which planning reads to prune.
+fn titles_options(storage: Arc<dyn StorageProvider>) -> SupertableOptions {
+    default_supertable_options().with_storage(storage)
+}
+
+/// A table of [`ROWS`] titles `doc 0`, `doc 1`, ... in one file, in `dir`,
+/// and the storage it is on.
+fn titles_table(dir: &TempDir) -> Arc<dyn StorageProvider> {
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("titles storage"));
+    let titles: Vec<String> = (0..ROWS).map(|i| format!("doc {i}")).collect();
+    let titles: Vec<&str> = titles.iter().map(String::as_str).collect();
+    let table = Supertable::create(titles_options(Arc::clone(&storage))).expect("create titles");
+    let mut writer = table.writer().expect("titles writer");
+    writer
+        .append(&build_title_batch(&titles))
+        .expect("append titles");
+    writer.commit().expect("commit titles");
+    storage
+}
+
+/// Rows `sql` returns through `reader`'s own SQL.
+fn table_rows(reader: &SupertableReader, sql: &str) -> Result<usize, InfinoError> {
+    let batches = reader.query_sql(sql).map_err(InfinoError::from)?;
+    Ok(batches.iter().map(|b| b.num_rows()).sum())
+}
+
+/// Wait until the process's anonymous memory is back under `limit`.
+fn wait_under(limit: u64) {
+    let started = Instant::now();
+    while rss_anon_bytes() > limit {
+        assert!(
+            started.elapsed() < DRAIN_DEADLINE,
+            "the refused statement's memory did not go back under the limit within {DRAIN_DEADLINE:?}"
+        );
+        thread::sleep(DRAIN_POLL);
+    }
+}
+
+/// Set the limit [`HEADROOM_BYTES`] above the process's memory now, run
+/// `query` on a thread of its own, wait until it starts a read (`reads` counts
+/// them, and the caller holds them), then push the process past the limit.
+/// Returns the limit and how `query` ended.
+///
+/// A held read never finishes, so only a refusal can end `query`: a statement
+/// that is not raced against the limit while it plans waits out
+/// [`REFUSAL_BOUND`] and fails the test.
+fn refused_while_planning(
+    reads: impl Fn() -> usize,
+    query: impl FnOnce() -> Result<usize, InfinoError> + Send + 'static,
+) -> (u64, Result<usize, InfinoError>) {
+    let reads_before = reads();
+    let limit = rss_anon_bytes() + HEADROOM_BYTES;
+    set_process_memory_limit(Some(limit));
+    let (sent, received) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = sent.send(query());
+    });
+    let started = Instant::now();
+    while reads() == reads_before {
+        assert!(
+            started.elapsed() < PLANNING_READ_DEADLINE,
+            "the scan made no read within {PLANNING_READ_DEADLINE:?}"
+        );
+        thread::sleep(DRAIN_POLL);
+    }
+    let push = black_box(vec![PUSH_FILL; PUSH_BYTES]);
+    let ended = received
+        .recv_timeout(REFUSAL_BOUND)
+        .expect("a statement still planning is refused once the process is over the limit");
+    drop(push);
+    (limit, ended)
+}
+
 fn is_process_limit_refusal(err: &InfinoError) -> bool {
     matches!(err, InfinoError::OverBudget(msg) if msg.contains("process memory limit"))
 }
@@ -144,16 +294,53 @@ fn a_statement_that_grows_past_the_process_memory_limit_is_refused() {
     // The refusal ended one statement, not the connection: once the memory the
     // statement held has gone back under the limit, the same connection
     // answers.
-    let started = Instant::now();
-    while rss_anon_bytes() > limit {
-        assert!(
-            started.elapsed() < DRAIN_DEADLINE,
-            "the refused statement's memory did not go back under the limit within {DRAIN_DEADLINE:?}"
-        );
-        thread::sleep(DRAIN_POLL);
-    }
+    wait_under(limit);
     assert_eq!(
         rows(&conn, SMALL_QUERY).expect("the connection answers after a refusal"),
         1
     );
+
+    // A statement still planning is refused once the process passes the
+    // limit. A fresh connection opens the table from the manifest, then holds
+    // every read, so the scan's first read waits in planning.
+    let (planning_conn, stores) = holding_conn(&dir);
+    set_process_memory_limit(Some(u64::MAX));
+    rows(&planning_conn, OPEN_QUERY).expect("opens docs");
+    each_store(&stores, SlowStorage::hold_reads);
+    let querying = planning_conn.clone();
+    let (limit, ended) =
+        refused_while_planning(|| reads(&stores), move || rows(&querying, SCAN_QUERY));
+    let err = ended.expect_err("the process is over the limit");
+    assert!(is_process_limit_refusal(&err), "got {err:?}");
+    wait_under(limit);
+    each_store(&stores, SlowStorage::release_reads);
+    assert_eq!(
+        rows(&planning_conn, SCAN_QUERY).expect("the connection answers under the same limit"),
+        1
+    );
+
+    // The same through a table's own SQL, which plans on its own path.
+    let table_dir = TempDir::new().expect("titles tempdir");
+    let held = SlowStorage::wrap(titles_table(&table_dir), NO_READ_DELAY);
+    set_process_memory_limit(Some(u64::MAX));
+    let reader = Supertable::open(titles_options(held.clone()))
+        .expect("open titles")
+        .reader()
+        .expect("titles reader");
+    table_rows(&reader, TABLE_OPEN_QUERY).expect("opens titles");
+    held.hold_reads();
+    let querying = reader.clone();
+    let (limit, ended) = refused_while_planning(
+        || held.reads(),
+        move || table_rows(&querying, TABLE_SCAN_QUERY),
+    );
+    let err = ended.expect_err("the process is over the limit");
+    assert!(is_process_limit_refusal(&err), "got {err:?}");
+    wait_under(limit);
+    held.release_reads();
+    // Under the limit the statement runs on a task of its own, which still
+    // bills the caller: its plan weighed the table's one superfile.
+    let (answered, stats) = with_op_stats(|| table_rows(&reader, TABLE_SCAN_QUERY));
+    assert_eq!(answered.expect("the table answers under the same limit"), 1);
+    assert_eq!(stats.superfiles_considered, 1);
 }

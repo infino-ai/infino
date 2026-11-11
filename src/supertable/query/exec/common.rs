@@ -80,7 +80,7 @@ use crate::{
     },
     runtime_bridge::{run_on_pool, run_on_pool_unless_blocking},
     runtime_metrics::{
-        op_stats::{OpStatsCollector, timed_section},
+        op_stats::{OpStatsCollector, attached_to_future, timed_section},
         rss::total_memory_bytes,
     },
     superfile::{
@@ -343,9 +343,8 @@ impl TableProvider for CallScopedTable {
 /// through here; error mapping stays with the caller, whose surface it
 /// belongs to.
 ///
-/// When the process has a memory limit (see `memory::resident`), the collect
-/// races it, and a process past the limit ends the statement with a
-/// `ResourcesExhausted` refusal.
+/// The process memory limit is watched by the statement around this, from
+/// its planning on (see [`run_within_process_limit`]).
 pub(crate) async fn collect_plan_metered(
     plan: &Arc<dyn ExecutionPlan>,
     task_ctx: Arc<TaskContext>,
@@ -353,42 +352,49 @@ pub(crate) async fn collect_plan_metered(
 ) -> DfResult<Vec<RecordBatch>> {
     let metered: Arc<dyn ExecutionPlan> =
         Arc::new(MeteredExec::new(Arc::clone(plan), op_stats.clone()));
-    let collected = collect(metered, task_ctx);
-    let batches = match process_limit() {
-        None => collected.await?,
-        // With a process limit, run the collect as its own task and race it
-        // against the sampler. The streamed batches are never reserved, so
-        // this is the only bound on them.
-        //  - over the limit before we start: refuse without spawning anything.
-        //  - own task, because a plan over cached data can finish all its work
-        //    in one poll, so a check in the same task would only run once the
-        //    result is ready.
-        //  - limit wins: dropping the task stops DataFusion's partition tasks
-        //    and the search functions' fan-out. A batch already being
-        //    processed still finishes first.
-        //  - `biased` checks the limit first, so a reading over it wins even if
-        //    the result lands in the same wakeup.
-        Some(limit) => {
-            if let Some(anon) = process_over_limit(limit) {
-                return Err(over_process_limit(anon, limit));
-            }
-            let collecting = SpawnedTask::spawn(collected);
-            tokio::select! {
-                biased;
-                anon = process_limit_exceeded(limit) => {
-                    return Err(over_process_limit(anon, limit));
-                }
-                joined = collecting => {
-                    joined.map_err(|join| DataFusionError::ExecutionJoin(Box::new(join)))??
-                }
-            }
-        }
-    };
+    let batches = collect(metered, task_ctx).await?;
     // Harvesting the unwrapped plan and the wrapped one reach the same
     // leaves — the walk dedupes by node identity and sums childless nodes
     // only, and the meter delegates `execute` to this same tree.
     harvest_datafusion_metrics(plan, op_stats);
     Ok(batches)
+}
+
+/// Run one SQL statement, its planning through its execution, raced against
+/// the process memory limit (see `memory::resident`). The limit has to watch
+/// both: execution streams batches the connection budget never sees, and
+/// planning opens every file a scan keeps and holds each one's metadata, which
+/// on a table of tens of thousands of files passes the limit before execution
+/// starts. A process past the limit ends the statement with a
+/// `ResourcesExhausted` refusal; a panic in it comes back as `ExecutionJoin`.
+///  - with no limit, `statement` runs right here: no task, nothing raced.
+///  - over the limit before it starts: refused, and `statement` never runs.
+///  - otherwise it runs as a task of its own: work over cached data can
+///    finish in one poll, so a check in the same task would only run once the
+///    result is ready. The task carries this call's span and `collector`, so
+///    the move changes neither the trace nor what the query reports.
+///  - limit wins: dropping the task aborts it, which stops what it was doing
+///    (file opens while planning, DataFusion's partition tasks and the search
+///    functions' fan-out while executing). Work already inside a poll still
+///    finishes that poll first.
+///  - `biased` checks the limit first, so a reading over it wins even if the
+///    result lands in the same wakeup.
+pub(crate) async fn run_within_process_limit<T: Send + 'static>(
+    collector: Option<Arc<OpStatsCollector>>,
+    statement: impl Future<Output = T> + Send + 'static,
+) -> DfResult<T> {
+    let Some(limit) = process_limit() else {
+        return Ok(statement.await);
+    };
+    if let Some(anon) = process_over_limit(limit) {
+        return Err(over_process_limit(anon, limit));
+    }
+    let running = SpawnedTask::spawn(attached_to_future(collector, statement.in_current_span()));
+    tokio::select! {
+        biased;
+        anon = process_limit_exceeded(limit) => Err(over_process_limit(anon, limit)),
+        joined = running => joined.map_err(|join| DataFusionError::ExecutionJoin(Box::new(join))),
+    }
 }
 
 /// Fold DataFusion's row instrumentation into the per-query stats after a

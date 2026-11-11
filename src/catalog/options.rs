@@ -7,13 +7,13 @@
 //! uses the default.
 
 use std::{collections::HashMap, path::PathBuf};
-#[cfg(test)]
+#[cfg(any(test, feature = "test-helpers"))]
 use std::{
     fmt::{Debug, Formatter, Result as FmtResult},
     sync::Arc,
 };
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-helpers"))]
 use crate::storage::StorageProvider;
 use crate::supertable::{Consistency, reader_cache::ColdFetchMode as InternalColdFetchMode};
 
@@ -91,18 +91,18 @@ pub struct ConnectOptions {
     pub(crate) api_key: Option<String>,
     /// Test-only: wraps every storage provider the connection builds (the
     /// catalog root and each table's), so a test can slow or count reads.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-helpers"))]
     pub(crate) storage_wrapper: Option<StorageWrapper>,
 }
 
 /// See [`ConnectOptions::storage_wrapper`].
-#[cfg(test)]
+#[cfg(any(test, feature = "test-helpers"))]
 #[derive(Clone)]
 pub(crate) struct StorageWrapper(
     pub(crate) Arc<dyn Fn(Arc<dyn StorageProvider>) -> Arc<dyn StorageProvider> + Send + Sync>,
 );
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-helpers"))]
 impl Debug for StorageWrapper {
     fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         f.write_str("StorageWrapper")
@@ -116,15 +116,20 @@ impl ConnectOptions {
         Self::default()
     }
 
-    /// Test-only: pass every storage provider this connection builds through
-    /// `wrap`.
-    #[cfg(test)]
-    pub(crate) fn with_storage_wrapper(
-        mut self,
-        wrap: impl Fn(Arc<dyn StorageProvider>) -> Arc<dyn StorageProvider> + Send + Sync + 'static,
-    ) -> Self {
-        self.storage_wrapper = Some(StorageWrapper(Arc::new(wrap)));
-        self
+    #[cfg(any(test, feature = "test-helpers"))]
+    test_visible! {
+        /// Test-only: pass every storage provider this connection builds
+        /// through `wrap`, so a test can slow, count or hold its reads.
+        fn with_storage_wrapper(
+            mut self,
+            wrap: impl Fn(Arc<dyn StorageProvider>) -> Arc<dyn StorageProvider>
+            + Send
+            + Sync
+            + 'static,
+        ) -> Self {
+            self.storage_wrapper = Some(StorageWrapper(Arc::new(wrap)));
+            self
+        }
     }
 
     /// Enable a local disk cache rooted at `dir` (off by default). Cold

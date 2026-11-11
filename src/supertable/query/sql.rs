@@ -53,7 +53,7 @@
 //! output and never reaches a caller — a `SELECT`, `GROUP BY` key, or
 //! `MIN`/`MAX` over a string column always comes back `LargeUtf8`.
 
-use std::{collections::HashSet, sync::Arc, time::Instant};
+use std::{collections::HashSet, future::Future, sync::Arc, time::Instant};
 
 use arrow::{
     compute::{cast, concat_batches},
@@ -93,8 +93,10 @@ use crate::{
                 CoveredAggregateRewrite, load_unfiltered_aggregate_inputs, value_counts_nulls,
             },
             exec::{
-                common::collect_plan_metered, fts_exec::register_bm25,
-                hybrid_exec::register_hybrid_search, match_exec::register_match,
+                common::{collect_plan_metered, run_within_process_limit},
+                fts_exec::register_bm25,
+                hybrid_exec::register_hybrid_search,
+                match_exec::register_match,
                 vector_exec::register_vector_search,
             },
             provider::{SupertableProvider, TABLE_NAME, view_string_schema},
@@ -332,6 +334,7 @@ impl SupertableReader {
         // context still report the plan's CPU — the meter rides the
         // wrapper below, not the context.
         let op_stats = op_stats::current();
+        let collector = op_stats.clone();
 
         let sql = sql.to_owned();
         let drive = async move {
@@ -371,11 +374,7 @@ impl SupertableReader {
             Self::collect_metered_df(df, ctx.task_ctx(), &op_stats).await
         };
 
-        // Drive through the shared sync→async bridge: ambient
-        // runtime → block_in_place on the ambient handle; otherwise
-        // the lazily-built owned query_runtime. See
-        // [`SupertableReader::block_on`].
-        self.block_on(drive)
+        self.block_on_statement(collector, drive)
     }
 
     /// The tombstone cache and every superfile of a fully loaded snapshot,
@@ -410,6 +409,7 @@ impl SupertableReader {
         }
         let ctx = self.sql_session_context()?;
         let op_stats = op_stats::current();
+        let collector = op_stats.clone();
         let (group, aggregate) = value_count_exprs(column);
         let drive = async move {
             let df = ctx
@@ -419,7 +419,7 @@ impl SupertableReader {
                 .map_err(QueryError::DataFusion)?;
             Self::collect_metered_df(df, ctx.task_ctx(), &op_stats).await
         };
-        conform_value_counts(&self.block_on(drive)?, &schema)
+        conform_value_counts(&self.block_on_statement(collector, drive)?, &schema)
     }
 
     /// [`Self::value_counts`] from the manifest's statistics alone, as rows
@@ -531,6 +531,7 @@ impl SupertableReader {
     ) -> Result<Vec<RecordBatch>, QueryError> {
         let ctx = self.sql_session_context()?;
         let op_stats = op_stats::current();
+        let collector = op_stats.clone();
         let drive = async move {
             let df = ctx
                 .table(TABLE_NAME)
@@ -543,7 +544,7 @@ impl SupertableReader {
                 .map_err(QueryError::DataFusion)?;
             Self::collect_metered_df(df, ctx.task_ctx(), &op_stats).await
         };
-        self.block_on(drive)
+        self.block_on_statement(collector, drive)
     }
 
     /// [`Self::count_where`] from the range index, the manifest and the
@@ -680,6 +681,19 @@ impl SupertableReader {
         Ok(ctx)
     }
 
+    /// Drive one SQL statement on this reader's runtime (see
+    /// [`Self::block_on`]), raced against the process memory limit from its
+    /// planning to its last batch (see [`run_within_process_limit`]).
+    /// `collector` is the caller's, for the task the race runs it on.
+    fn block_on_statement<T: Send + 'static>(
+        &self,
+        collector: Option<Arc<OpStatsCollector>>,
+        statement: impl Future<Output = Result<T, QueryError>> + Send + 'static,
+    ) -> Result<T, QueryError> {
+        self.block_on(run_within_process_limit(collector, statement))
+            .map_err(QueryError::DataFusion)?
+    }
+
     /// Plan one DataFrame, then run it through the shared
     /// meter-collect-harvest step every SQL execution site uses
     /// ([`collect_plan_metered`]).
@@ -724,6 +738,7 @@ impl SupertableReader {
         // Picked up on the caller's thread, before any runtime hop, so the
         // harvest below folds into this op's collector.
         let op_stats = op_stats::current();
+        let collector = op_stats.clone();
         let _foreground = ForegroundQueryGuard::enter();
         // Resolve against this reader's pinned snapshot. Callers that need
         // current-state semantics create a fresh reader immediately before
@@ -762,7 +777,7 @@ impl SupertableReader {
                 })?
         };
 
-        self.block_on(drive)
+        self.block_on_statement(collector, drive)
     }
 }
 
@@ -1150,9 +1165,10 @@ mod tests {
     /// the dictionary, then the word's posting header.
     const DICTIONARY_ESTIMATE_READS: u64 = 2;
 
-    /// Planned reads of a SQL scan that matches every row, with or without
-    /// a term index.
-    fn broad_scan_planned_reads(term_index: bool) -> u64 {
+    /// [`BROAD_SUPERFILES`] superfiles of [`BROAD_ROWS`] titles each, every
+    /// title starting `shared `, with or without a term index. The directory
+    /// holds the table's storage.
+    fn broad_table(term_index: bool) -> (tempfile::TempDir, Supertable) {
         let dir = tempfile::tempdir().expect("tempdir");
         let storage: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("localfs"));
@@ -1172,6 +1188,13 @@ mod tests {
                 .expect("append");
             w.commit().expect("commit");
         }
+        (dir, st)
+    }
+
+    /// Planned reads of a SQL scan that matches every row, with or without
+    /// a term index.
+    fn broad_scan_planned_reads(term_index: bool) -> u64 {
+        let (_dir, st) = broad_table(term_index);
         let reader = st.reader().expect("reader");
         let (ids, stats) =
             with_op_stats(|| reader.scan_ids_matching(col("title").like(lit("shared %"))));
@@ -1198,6 +1221,21 @@ mod tests {
             Some(DICTIONARY_ESTIMATE_READS * BROAD_SUPERFILES as u64),
             "the indexed estimate read nothing: {indexed} vs {plain}"
         );
+    }
+
+    #[test]
+    fn a_table_sql_query_reports_the_superfiles_its_plan_considered() {
+        // Planning runs on a task of its own, raced against the process
+        // memory limit, and the scan counts the superfiles it weighed into
+        // the caller's collector while it plans. The task must carry that
+        // collector, or every count reads 0.
+        let (_dir, st) = broad_table(false);
+        let reader = st.reader().expect("reader");
+        let (batches, stats) = with_op_stats(|| {
+            reader.query_sql("SELECT count(*) FROM supertable WHERE title LIKE 'shared s1%'")
+        });
+        batches.expect("query");
+        assert_eq!(stats.superfiles_considered, BROAD_SUPERFILES as u64);
     }
 
     /// Build a small categorical batch — start id sequence at
