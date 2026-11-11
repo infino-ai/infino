@@ -850,7 +850,10 @@ fn commit_superfile_count(buffer: &[BufferedBatch], options: &SupertableOptions)
     )
 }
 
-/// The bytes [`commit_superfile_count`] sizes a commit of `buffer` by.
+/// The bytes [`commit_superfile_count`] sizes a commit of `buffer` by. Each
+/// column is sized by the rows it holds, not by its buffers: every column of
+/// an IPC-decoded batch points into the one message buffer, so Arrow's
+/// buffer-based size counts that whole buffer once per column.
 fn commit_buffered_bytes(buffer: &[BufferedBatch]) -> usize {
     buffer
         .iter()
@@ -18039,14 +18042,14 @@ mod tests {
     /// Rows in the IPC-decoded commit-sizing test: a typical append's shape,
     /// scaled down.
     const IPC_SIZED_ROWS: usize = 2048;
-    /// Vector width in the IPC-decoded commit-sizing test.
+    /// Vector width in the IPC-decoded commit-sizing tests.
     const IPC_SIZED_DIM: i32 = 768;
-    /// Split target in the IPC-decoded commit-sizing test, small enough that
-    /// the batch spans several superfiles.
-    const IPC_SIZED_SPLIT_BYTES: usize = 1 << 20;
-    /// Pool width in the IPC-decoded commit-sizing test, wide enough that the
-    /// byte count alone decides the superfile count.
-    const IPC_SIZED_POOL: usize = 192;
+    /// Writer pool width in the IPC-decoded append test, wider than the
+    /// superfile count its batch splits into.
+    const IPC_APPEND_POOL: usize = 16;
+    /// Split target, in MiB, in the IPC-decoded append test: small enough
+    /// that its batch spans several superfiles.
+    const IPC_APPEND_SPLIT_MB: u64 = 1;
 
     #[test]
     fn an_ipc_decoded_commit_is_sized_by_its_own_bytes() {
@@ -18132,20 +18135,50 @@ mod tests {
             measured, own_bytes,
             "commit sized by bytes the batch does not hold"
         );
+    }
+
+    #[test]
+    fn an_ipc_decoded_append_commits_as_many_superfiles_as_the_batch_itself() {
+        // The same rows appended as built and as decoded from one IPC message
+        // must commit to the same number of superfiles, through the whole
+        // append path: resolving the batch, minting `_id`, and moving the
+        // vectors out of the scalar batch.
+        let dim = IPC_SIZED_DIM as usize;
+        let schema = schema_id_title_emb(dim);
+        let titles = LargeStringArray::from_iter_values(
+            (0..IPC_SIZED_ROWS).map(|i| format!("https://example.com/page-{i:08}")),
+        );
+        let values =
+            Float32Array::from_iter_values((0..IPC_SIZED_ROWS * dim).map(|i| (i % 97) as f32));
+        let DataType::FixedSizeList(item, _) = fixed_list_f32(dim) else {
+            unreachable!("fixed_list_f32 builds a fixed-size list");
+        };
+        let embedding = FixedSizeListArray::new(item, IPC_SIZED_DIM, Arc::new(values), None);
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(titles), Arc::new(embedding)],
+        )
+        .expect("batch");
+
+        let superfiles_after_append = |batch: &RecordBatch| -> usize {
+            let options = options_with_vector(dim)
+                .with_writer_pool(writer_pool_with(IPC_APPEND_POOL))
+                .with_superfile_buffer_split_mb(IPC_APPEND_SPLIT_MB);
+            let table = Supertable::create(options).expect("create");
+            let mut writer = table.writer().expect("writer");
+            writer.append(batch).expect("append");
+            writer.commit().expect("commit");
+            table.reader().expect("reader").n_superfiles()
+        };
+        let built = superfiles_after_append(&batch);
+        let decoded = superfiles_after_append(&ipc_round_trip(&batch));
+        assert!(
+            built > 1,
+            "the batch must span several superfiles for the count to mean anything, got {built}"
+        );
         assert_eq!(
-            superfiles_per_commit(
-                IPC_SIZED_ROWS,
-                measured,
-                IPC_SIZED_POOL,
-                IPC_SIZED_SPLIT_BYTES
-            ),
-            superfiles_per_commit(
-                IPC_SIZED_ROWS,
-                own_bytes,
-                IPC_SIZED_POOL,
-                IPC_SIZED_SPLIT_BYTES
-            ),
-            "commit sized at {measured} bytes for a batch of {own_bytes}",
+            decoded, built,
+            "an IPC-decoded append committed to {decoded} superfiles, the batch itself to {built}"
         );
     }
 

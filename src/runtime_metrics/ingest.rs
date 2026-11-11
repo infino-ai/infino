@@ -223,16 +223,26 @@ fn list_window_bytes<O: OffsetSizeTrait>(column: &dyn Array) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{ops::Range, sync::Arc};
 
+    use arrow::buffer::OffsetBuffer;
     use arrow_array::{
-        Array, FixedSizeListArray, Float32Array, LargeStringArray, ListArray, RecordBatch,
-        StringViewArray,
+        Array, ArrayRef, FixedSizeListArray, Float32Array, LargeStringArray, ListArray,
+        RecordBatch, StringViewArray, StructArray,
         builder::{ListBuilder, StringBuilder},
     };
     use arrow_schema::{DataType, Field, Schema};
 
     use super::{classify_batch_bytes, visible_array_bytes};
+
+    /// Rows in the nested slice tests' full arrays.
+    const LIST_ROWS: usize = 64;
+    /// First row of the nested slice tests' window.
+    const WINDOW_START: usize = 20;
+    /// Rows in the nested slice tests' window.
+    const WINDOW_ROWS: usize = 5;
+    /// Strings in each list row of the nested slice tests.
+    const ITEMS_PER_ROW: usize = 3;
 
     /// Strings long enough to live outside a view's inline 12-byte prefix,
     /// which is the only case where the view layout hides its payload.
@@ -319,6 +329,113 @@ mod tests {
             visible_array_bytes(&standalone),
             "a mid-array window must price like the same rows standing alone"
         );
+    }
+
+    #[test]
+    fn a_sliced_list_of_view_structs_counts_only_its_window() {
+        // The window has to carry through two levels: the list's offsets
+        // name a range of struct rows, and the struct's view child must be
+        // walked over that range only.
+        let full = list_of_view_structs(0..LIST_ROWS);
+        let window = full.slice(WINDOW_START, WINDOW_ROWS);
+        let standalone = list_of_view_structs(WINDOW_START..WINDOW_START + WINDOW_ROWS);
+        assert_eq!(
+            visible_array_bytes(&window),
+            visible_array_bytes(&standalone),
+            "a sliced List<Struct<Utf8View>> must count like the same rows standing alone"
+        );
+    }
+
+    #[test]
+    fn a_sliced_struct_of_lists_counts_only_its_window() {
+        // A struct's slice reaches its list child, but the list's values
+        // stay shared with the parent; Arrow's slice size counts all of them.
+        let full = struct_of_lists(0..LIST_ROWS);
+        let window = full.slice(WINDOW_START, WINDOW_ROWS);
+        let standalone = struct_of_lists(WINDOW_START..WINDOW_START + WINDOW_ROWS);
+        let window_bytes = visible_array_bytes(&window);
+        assert_eq!(
+            window_bytes,
+            visible_array_bytes(&standalone),
+            "a sliced Struct<List<Utf8>> must count like the same rows standing alone"
+        );
+        let arrow_slice_bytes = window
+            .to_data()
+            .get_slice_memory_size()
+            .expect("slice size") as u64;
+        assert!(
+            window_bytes < arrow_slice_bytes,
+            "the window must not count the list's whole values: \
+             {window_bytes} vs Arrow's {arrow_slice_bytes}"
+        );
+    }
+
+    #[test]
+    fn a_struct_of_view_strings_bills_its_payload() {
+        // The struct arm also prices ingest: a view child inside a struct
+        // must bill its out-of-line payload, like a top-level view column.
+        let strings = StringViewArray::from(OUT_OF_LINE.to_vec());
+        let column = StructArray::from(vec![(
+            Arc::new(Field::new("body", DataType::Utf8View, false)),
+            Arc::new(strings) as ArrayRef,
+        )]);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "doc",
+            column.data_type().clone(),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(column)]).expect("batch");
+        let (text, vector) = classify_batch_bytes(&batch);
+        let payload: u64 = OUT_OF_LINE.iter().map(|s| s.len() as u64).sum();
+        assert!(
+            text > payload,
+            "a struct of view strings must bill its payload: {text} vs {payload}"
+        );
+        assert_eq!(vector, 0, "a struct is not a vector column");
+    }
+
+    /// A `List<Struct<Utf8View>>` with three out-of-line strings per row,
+    /// one row for each value of `rows`.
+    fn list_of_view_structs(rows: Range<usize>) -> ListArray {
+        let field = Arc::new(Field::new("body", DataType::Utf8View, false));
+        let strings: Vec<String> = rows
+            .clone()
+            .flat_map(|row| (0..ITEMS_PER_ROW).map(move |item| long_text(row, item)))
+            .collect();
+        let structs = StructArray::from(vec![(
+            Arc::clone(&field),
+            Arc::new(StringViewArray::from_iter_values(strings)) as ArrayRef,
+        )]);
+        let offsets = OffsetBuffer::from_lengths(rows.map(|_| ITEMS_PER_ROW));
+        ListArray::new(
+            Arc::new(Field::new("item", structs.data_type().clone(), false)),
+            offsets,
+            Arc::new(structs),
+            None,
+        )
+    }
+
+    /// A `Struct<List<Utf8>>` with three strings per list, one row for each
+    /// value of `rows`.
+    fn struct_of_lists(rows: Range<usize>) -> StructArray {
+        let mut builder = ListBuilder::new(StringBuilder::new());
+        for row in rows {
+            for item in 0..ITEMS_PER_ROW {
+                builder.values().append_value(long_text(row, item));
+            }
+            builder.append(true);
+        }
+        let lists = builder.finish();
+        StructArray::from(vec![(
+            Arc::new(Field::new("tags", lists.data_type().clone(), false)),
+            Arc::new(lists) as ArrayRef,
+        )])
+    }
+
+    /// A string long enough to live outside a view's inline prefix, unique
+    /// to its row and item.
+    fn long_text(row: usize, item: usize) -> String {
+        format!("row {row:06} item {item} padded past the inline view prefix")
     }
 
     #[test]
