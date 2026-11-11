@@ -18,7 +18,8 @@
 //! it opens a file), a statement whose process passes the limit must be
 //! refused while it is still planning, through a connection and through a
 //! table's own SQL, which plan on separate paths. Once the memory is
-//! back under the same limit, the same statement answers.
+//! back under the same limit, the same statement answers. A delete's
+//! predicate scan, refused the same way, must stop rather than read on.
 //!
 //! Its own test binary, and one test, because the limit belongs to the whole
 //! process: tests running beside it would move the reading, and each phase
@@ -35,6 +36,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use datafusion::prelude::{col, lit};
 use infino::{
     ConnectOptions, Connection, IndexSpec, InfinoError,
     arrow_array::{LargeStringArray, RecordBatch},
@@ -82,6 +84,11 @@ const SCAN_QUERY: &str = "SELECT count(*) FROM docs WHERE name LIKE 'doc 1%'";
 const TABLE_OPEN_QUERY: &str = "SELECT count(*) FROM supertable";
 /// [`SCAN_QUERY`] through a table's own SQL.
 const TABLE_SCAN_QUERY: &str = "SELECT count(*) FROM supertable WHERE title LIKE 'doc 1%'";
+/// The titles [`TABLE_SCAN_QUERY`] matches, as a delete's predicate.
+const DELETED_TITLES: &str = "doc 1%";
+/// A fragment of the path of every term index object: the delete's scan
+/// reads one while it plans.
+const TERM_INDEX_OBJECTS: &str = "term-index/";
 /// Reads are held, not slowed: the test acts while planning waits on one.
 const NO_READ_DELAY: Duration = Duration::ZERO;
 /// Bytes the test itself takes to push the process past the limit: well past
@@ -343,4 +350,36 @@ fn a_statement_that_grows_past_the_process_memory_limit_is_refused() {
     let (answered, stats) = with_op_stats(|| table_rows(&reader, TABLE_SCAN_QUERY));
     assert_eq!(answered.expect("the table answers under the same limit"), 1);
     assert_eq!(stats.superfiles_considered, 1);
+
+    // A delete resolves its predicate with a scan of its own, which must stop
+    // with the refusal: a scan left running would keep reading, past the
+    // limit, with nothing watching it. Its held read is dropped with it. The
+    // delete first rereads the table's pointer, so only the scan's term index
+    // reads are held. A table opened afresh has none of them cached.
+    held.hold_reads_of(TERM_INDEX_OBJECTS);
+    let mut writer = Supertable::open(titles_options(held.clone()))
+        .expect("reopen titles")
+        .writer()
+        .expect("titles writer");
+    let (limit, ended) = refused_while_planning(
+        || held.reads_of(TERM_INDEX_OBJECTS),
+        move || {
+            writer
+                .delete(col("title").like(lit(DELETED_TITLES)))
+                .map(|pending| pending.matched)
+                .map_err(InfinoError::from)
+        },
+    );
+    let err = ended.expect_err("the process is over the limit");
+    assert!(is_process_limit_refusal(&err), "got {err:?}");
+    let started = Instant::now();
+    while held.in_flight() > 0 {
+        assert!(
+            started.elapsed() < REFUSAL_BOUND,
+            "the refused delete's scan still has a read in flight after {REFUSAL_BOUND:?}"
+        );
+        thread::sleep(DRAIN_POLL);
+    }
+    wait_under(limit);
+    held.release_reads();
 }

@@ -62,7 +62,7 @@ use arrow::{
 use arrow_array::{Array, Decimal128Array, Int64Array, new_empty_array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::{
-    common::{Column, DFSchema, ScalarValue, tree_node::TreeNode},
+    common::{Column, DFSchema, ScalarValue, runtime::SpawnedTask, tree_node::TreeNode},
     dataframe::DataFrame,
     datasource::DefaultTableSource,
     error::DataFusionError,
@@ -75,7 +75,6 @@ use datafusion::{
     optimizer::simplify_expressions::ExprSimplifier,
 };
 use futures::future::try_join_all;
-use tokio::runtime::Handle;
 use uuid::Uuid;
 
 #[cfg(feature = "detailed-tracing")]
@@ -752,29 +751,30 @@ impl SupertableReader {
         // Resolve on this runtime's 16 MiB workers, not the calling thread
         // `block_on` polls on: predicate planning depth must not hang on a
         // caller's stack. A panic surfaces through the join as a query error.
+        // A `SpawnedTask` aborts the task when dropped, so a refusal by the
+        // process memory limit stops the resolve rather than detaching it.
         let drive = async move {
-            Handle::current()
-                .spawn(async move {
-                    let df = ctx
-                        .table(TABLE_NAME)
-                        .await
-                        .map_err(QueryError::DataFusion)?
-                        .filter(expr)
-                        .map_err(QueryError::DataFusion)?
-                        .select_columns(&[id_column.as_str()])
-                        .map_err(QueryError::DataFusion)?;
-                    // Same three steps as `query_sql`, and for the same reason:
-                    // this scan's rows are real decoded rows. Collecting the
-                    // DataFrame directly reported CPU, page bytes and ranges for a
-                    // mutation's predicate resolve while leaving its row count at
-                    // zero.
-                    let batches = Self::collect_metered_df(df, ctx.task_ctx(), &op_stats).await?;
-                    extract_id_column(&batches)
-                })
-                .await
-                .map_err(|join| {
-                    QueryError::Internal(format!("predicate resolve task failed: {join}"))
-                })?
+            SpawnedTask::spawn(async move {
+                let df = ctx
+                    .table(TABLE_NAME)
+                    .await
+                    .map_err(QueryError::DataFusion)?
+                    .filter(expr)
+                    .map_err(QueryError::DataFusion)?
+                    .select_columns(&[id_column.as_str()])
+                    .map_err(QueryError::DataFusion)?;
+                // Same three steps as `query_sql`, and for the same reason:
+                // this scan's rows are real decoded rows. Collecting the
+                // DataFrame directly reported CPU, page bytes and ranges for a
+                // mutation's predicate resolve while leaving its row count at
+                // zero.
+                let batches = Self::collect_metered_df(df, ctx.task_ctx(), &op_stats).await?;
+                extract_id_column(&batches)
+            })
+            .await
+            .map_err(|join| {
+                QueryError::Internal(format!("predicate resolve task failed: {join}"))
+            })?
         };
 
         self.block_on_statement(collector, drive)

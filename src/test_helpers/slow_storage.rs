@@ -45,8 +45,10 @@ pub struct SlowStorage {
     max_in_flight: AtomicUsize,
     /// Each read's start and finish, in order, by the object it read.
     read_log: Mutex<Vec<ReadEvent>>,
-    /// Whether reads are parked before they reach the inner provider.
-    held: watch::Sender<bool>,
+    /// Which reads are parked before they reach the inner provider: those of
+    /// an object whose path contains this fragment (an empty one parks all),
+    /// or none.
+    held: watch::Sender<Option<String>>,
 }
 
 impl SlowStorage {
@@ -59,19 +61,25 @@ impl SlowStorage {
             in_flight: AtomicUsize::new(0),
             max_in_flight: AtomicUsize::new(0),
             read_log: Mutex::new(Vec::new()),
-            held: watch::Sender::new(false),
+            held: watch::Sender::new(None),
         })
     }
 
     /// Park reads, those in flight and those to come, until
     /// [`Self::release_reads`]. A parked read still counts as started.
     pub fn hold_reads(&self) {
-        self.held.send_replace(true);
+        self.hold_reads_of("");
+    }
+
+    /// [`Self::hold_reads`] for reads of an object whose path contains
+    /// `fragment` only; other reads go on.
+    pub fn hold_reads_of(&self, fragment: &str) {
+        self.held.send_replace(Some(fragment.to_owned()));
     }
 
     /// Let parked reads go on.
     pub fn release_reads(&self) {
-        self.held.send_replace(false);
+        self.held.send_replace(None);
     }
 
     /// Reads started so far, finished or not.
@@ -121,10 +129,14 @@ impl SlowStorage {
         self.max_in_flight.load(Ordering::SeqCst)
     }
 
-    /// What a read waits for: the delay, then any hold.
-    async fn wait(&self) {
+    /// What a read of `uri` waits for: the delay, then any hold on it.
+    async fn wait(&self, uri: &str) {
         sleep(self.delay).await;
-        let _ = self.held.subscribe().wait_for(|held| !held).await;
+        let _ = self
+            .held
+            .subscribe()
+            .wait_for(|held| !held.as_deref().is_some_and(|f| uri.contains(f)))
+            .await;
     }
 
     /// Count a read in for as long as the returned guard lives, so a read
@@ -183,13 +195,13 @@ impl StorageProvider for SlowStorage {
 
     async fn get(&self, uri: &str) -> Result<(Bytes, ObjectMeta), StorageError> {
         let _read = self.start_read(uri);
-        self.wait().await;
+        self.wait(uri).await;
         self.inner.get(uri).await
     }
 
     async fn get_range(&self, uri: &str, range: Range<u64>) -> Result<Bytes, StorageError> {
         let _read = self.start_read(uri);
-        self.wait().await;
+        self.wait(uri).await;
         self.inner.get_range(uri, range).await
     }
 
