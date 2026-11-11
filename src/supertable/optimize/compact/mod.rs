@@ -3102,7 +3102,7 @@ async fn clear_completed_conversions(inner: &SupertableInner) -> Result<(), Comp
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::HashSet,
+        collections::{BTreeSet, HashSet},
         env, fs,
         io::{self, Error as IoError},
         mem,
@@ -5787,6 +5787,76 @@ mod tests {
             min_superfiles_for_merge: 2,
             ..small_compact_cfg()
         }
+    }
+
+    /// A merge of a multi-cell table writes its rows in its cells' order:
+    /// after it, a vector search still finds exactly the rows whose vector
+    /// is nearest, by their text, and a text search the rows holding the
+    /// token, as before it.
+    #[test]
+    fn a_multi_cell_merge_keeps_its_vector_and_text_results() {
+        let dir = TempDir::new().expect("tempdir");
+        let st = make_multi_cell_st(&dir);
+        commit_multi_cell_superfiles(&st, 0);
+        commit_multi_cell_superfiles(&st, MULTI_CELL_COMMITS);
+        st.block_on_query(assert_merges_are_multi_cell(&st));
+        let commits = 2 * MULTI_CELL_COMMITS;
+        // Row `row` of commit `commit` is one-hot at the dimension below.
+        let hot = |commit: usize, row: usize| (commit * MULTI_CELL_ROWS + row) % MULTI_CELL_DIM;
+        let per_dim = commits * MULTI_CELL_ROWS / MULTI_CELL_DIM;
+        let results = |st: &Supertable| {
+            let vector: Vec<BTreeSet<String>> = (0..MULTI_CELL_DIM)
+                .map(|dim| {
+                    let mut query = vec![0.0f32; MULTI_CELL_DIM];
+                    query[dim] = 1.0;
+                    let batches = st
+                        .vector_search(
+                            "emb",
+                            &query,
+                            per_dim,
+                            VectorSearchOptions::new(),
+                            None,
+                            Some(&["title"]),
+                        )
+                        .expect("vector search");
+                    titles_of(&batches).into_iter().collect()
+                })
+                .collect();
+            let text: Vec<BTreeSet<String>> = (0..commits)
+                .map(|n| {
+                    let batches = st
+                        .bm25_search(
+                            "title",
+                            &n.to_string(),
+                            commits * MULTI_CELL_ROWS,
+                            Bm25SearchOptions::new().with_mode(BoolMode::Or),
+                            Some(&["title"]),
+                        )
+                        .expect("text search");
+                    titles_of(&batches).into_iter().collect()
+                })
+                .collect();
+            (vector, text)
+        };
+        let before = results(&st);
+        for (dim, titles) in before.0.iter().enumerate() {
+            let want: BTreeSet<String> = (0..commits)
+                .flat_map(|c| (0..MULTI_CELL_ROWS).map(move |r| (c, r)))
+                .filter(|&(c, r)| hot(c, r) == dim)
+                .map(|(c, r)| format!("commit {c} row {r}"))
+                .collect();
+            assert_eq!(titles, &want, "guard: dimension {dim}'s rows");
+        }
+        let files = st.reader().expect("reader").n_superfiles();
+
+        st.optimize(&OptimizeOptions::compact(multi_cell_compact_cfg()))
+            .expect("optimize");
+
+        assert!(
+            st.reader().expect("reader").n_superfiles() < files,
+            "guard: the table merged"
+        );
+        assert_eq!(results(&st), before);
     }
 
     #[test]

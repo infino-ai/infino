@@ -666,6 +666,19 @@ impl KeptRows {
 }
 
 impl KeptRead {
+    /// The read of file rows `rows`, ascending and distinct, of the file
+    /// `metadata` describes, or `None` when there are none.
+    pub(crate) fn of_rows(metadata: &ParquetMetaData, rows: &[u64]) -> Option<KeptRead> {
+        let mut runs: Vec<Range<u64>> = Vec::new();
+        for &row in rows {
+            match runs.last_mut() {
+                Some(run) if run.end == row => run.end += 1,
+                _ => runs.push(row..row + 1),
+            }
+        }
+        Self::of_runs(metadata, &runs)
+    }
+
     /// The read of the file rows in `runs`, ascending and disjoint.
     fn of_runs(metadata: &ParquetMetaData, runs: &[Range<u64>]) -> Option<KeptRead> {
         let (first, last) = (runs.first()?.start, runs.last()?.end);
