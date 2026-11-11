@@ -5993,6 +5993,7 @@ mod tests {
     use arrow_array::{Decimal128Array, Int64Array, LargeStringArray, StringArray, UInt64Array};
     use arrow_schema::Field;
     use bytes::Bytes;
+    use parquet::file::{metadata::ParquetMetaData, page_index::column_index::ColumnIndexMetaData};
     use rand::{RngExt, SeedableRng, rngs::StdRng};
     use rayon::ThreadPoolBuilder;
     use roaring::RoaringBitmap;
@@ -8636,6 +8637,139 @@ mod tests {
             );
             assert_eq!(survivors, narrow.n_docs() as i64, "{label}");
         }
+    }
+
+    /// Per row group and column chunk of `metadata`: whether the chunk has
+    /// a dictionary page, a column index entry and an offset index entry.
+    fn page_index_shape(metadata: &ParquetMetaData) -> Vec<Vec<(bool, bool, bool)>> {
+        let columns = metadata.column_index();
+        let offsets = metadata.offset_index();
+        metadata
+            .row_groups()
+            .iter()
+            .enumerate()
+            .map(|(g, group)| {
+                (0..group.num_columns())
+                    .map(|c| {
+                        (
+                            group.column(c).dictionary_page_offset().is_some(),
+                            columns.is_some_and(|index| {
+                                !matches!(index[g][c], ColumnIndexMetaData::NONE)
+                            }),
+                            offsets.is_some_and(|index| !index[g][c].page_locations().is_empty()),
+                        )
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// A merged superfile carries what a query prunes pages by, as a fresh
+    /// build of the same rows does: every column chunk keeps its dictionary
+    /// page, its column index and its offset index, whether the merge wrote
+    /// whole rows or a field at a time.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_merged_superfile_keeps_the_page_index_a_fresh_build_writes() {
+        let inputs = merge_inputs_of_sizes(
+            &[120, 90, 70],
+            false,
+            &[&[3, 4], &[], &[0]],
+            sorted_merge_docs,
+        );
+        let group = WINDOW_ROW_GROUP_ROWS[0];
+        let (fresh, _) = SuperfileBuilder::build_from_readers(&inputs).expect("re-index");
+        let fresh = SuperfileReader::open(Bytes::from(fresh)).expect("open fresh");
+        let rows = fts_merge(
+            &inputs,
+            None,
+            fresh.parquet_metadata().row_groups()[0].num_rows() as usize,
+        );
+        let window = DecodeWindow {
+            pass_fields: 1,
+            ..DecodeWindow::current()
+        };
+        let passes = with_decode_window(window, || fts_merge(&inputs, None, group));
+        let fresh_shape = page_index_shape(
+            &fresh
+                .parquet_metadata_with_page_index()
+                .await
+                .expect("fresh page index"),
+        );
+        assert!(
+            fresh_shape
+                .iter()
+                .flatten()
+                .all(|&(_, column, offset)| column && offset),
+            "guard: a fresh build writes a column and offset index for every chunk"
+        );
+        for (label, (bytes, _)) in [("rows", rows), ("a field at a time", passes)] {
+            let merged = SuperfileReader::open(Bytes::from(bytes)).expect("open merged");
+            let shape = page_index_shape(
+                &merged
+                    .parquet_metadata_with_page_index()
+                    .await
+                    .expect("merged page index"),
+            );
+            assert!(
+                shape
+                    .iter()
+                    .flatten()
+                    .all(|&(_, column, offset)| column && offset),
+                "{label}: every chunk keeps its column and offset index"
+            );
+            let dictionaries = |shape: &[Vec<(bool, bool, bool)>]| -> Vec<bool> {
+                shape[0]
+                    .iter()
+                    .map(|&(dictionary, _, _)| dictionary)
+                    .collect()
+            };
+            assert_eq!(
+                dictionaries(&shape),
+                dictionaries(&fresh_shape),
+                "{label}: the same columns keep their dictionaries"
+            );
+        }
+    }
+
+    /// A merge reads an input's offset index alone, to skip the pages of
+    /// rows it does not read; that read is the merge's own and leaves the
+    /// input's page index, which a query on the same reader prunes pages
+    /// with, whole: the column index and the offset index.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_merges_offset_index_read_leaves_the_query_page_index_whole() {
+        let opts = sorted_merge_opts(false);
+        let mut small_groups = opts.clone();
+        small_groups.row_group_size = WINDOW_ROW_GROUP_ROWS[0];
+        let reader = merge_input(&small_groups, 0, &sorted_merge_docs(0, 0, 200));
+        assert!(
+            reader.parquet_metadata().row_groups().len() > 1,
+            "guard: several row groups"
+        );
+        let merge = reader.arrow_metadata(true).expect("merge metadata");
+        assert!(
+            merge.metadata().offset_index().is_some(),
+            "the merge skips by it"
+        );
+        assert!(
+            merge.metadata().column_index().is_none(),
+            "the merge reads no column index"
+        );
+        assert!(
+            reader.loaded_parquet_metadata_with_page_index().is_none(),
+            "the merge's read is not the reader's"
+        );
+        let query = reader
+            .parquet_metadata_with_page_index()
+            .await
+            .expect("query page index");
+        assert!(query.column_index().is_some(), "a query still prunes by it");
+        assert!(query.offset_index().is_some());
+        assert!(
+            page_index_shape(&query)
+                .iter()
+                .flatten()
+                .all(|&(_, column, offset)| column && offset)
+        );
     }
 
     /// An input every row of which is deleted holds no rows of any row
