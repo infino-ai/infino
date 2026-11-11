@@ -433,6 +433,13 @@ where
 /// a few megabytes at the most.
 pub(crate) const PASS_FIELDS: usize = 64;
 
+/// What a merge keeps for each column it is writing, beside the rows: the
+/// column's writer, with up to a page of values, a dictionary of up to a
+/// page and a codec's contexts, and its decoder in each input being read,
+/// with a dictionary and a decompressed page. A page is a mebibyte by the
+/// writer's default, so a few of them, rounded up.
+pub(crate) const MERGE_COLUMN_BYTES: u64 = 4 * 1024 * 1024;
+
 /// The most decoded rows a merge holds at once, by bytes: the batches
 /// decoded and not yet encoded, the batch being decoded, and the rows its
 /// body encoder holds to choose dictionaries and to encode a column at a
