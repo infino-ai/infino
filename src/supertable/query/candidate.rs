@@ -107,6 +107,7 @@ use futures::{FutureExt, future::BoxFuture};
 use rayon::ThreadPool;
 use roaring::RoaringBitmap;
 use tokio::sync::Semaphore;
+use tracing::debug;
 
 use crate::{
     runtime_bridge::run_on_pool_while_awaited,
@@ -559,6 +560,12 @@ impl CandidatePlan {
             if let Some(matched) = matched {
                 return matched;
             }
+            // Rare and harmless once, but if resident matches fell back
+            // routinely they would each do their work twice, and a bench
+            // would still read flat against main.
+            debug!(
+                "a resident match could not finish on the pool; rerunning it on the planning task"
+            );
             memos = returned;
         }
         self.evaluate(&reader, Some(pool), &memos).await
@@ -2941,16 +2948,21 @@ mod tests {
 
     #[tokio::test]
     async fn resident_plans_finish_in_one_poll_on_a_pool_thread() {
-        // A superfile with all its bytes in memory, and each plan shape the
-        // provider sends to the pool.
+        // Both resident shapes of one superfile: all its bytes in memory, and
+        // the disk cache's local copy (opened lazily over a source, then
+        // given its bytes), and each plan shape the provider sends to the pool.
         // - Polled once on a pool thread, every match finishes.
         // - Each gives the rows the async match gives.
         // This test pins that a resident match never has to rerun after its
         // pool hop, which would do its work twice.
         let (bytes, hits) = titled_superfile();
-        let reader = SuperfileReader::open(bytes).expect("open");
+        let in_memory = SuperfileReader::open(bytes.clone()).expect("open");
+        let source: Arc<dyn LazyByteSource> = Arc::new(BytesLazyByteSource::new(bytes.clone()));
+        let mut disk_copy = SuperfileReader::open_lazy(source).await.expect("lazy open");
+        disk_copy
+            .install_resident_parquet(bytes, (0, 0))
+            .expect("install the local copy");
         let pool = one_thread_pool();
-        let memos = TermMemos::new();
         let any = |terms: &[&str]| CandidatePlan::TermsAny {
             column: "title".into(),
             terms: terms.iter().map(|t| t.to_string()).collect(),
@@ -2985,17 +2997,24 @@ mod tests {
                 None,
             ),
         ];
-        for (what, plan, want) in cases {
-            let (rows, _) = pool
-                .install(|| plan.evaluate(&reader, None, &memos).now_or_never())
-                .unwrap_or_else(|| panic!("{what}: the match waited on the pool"))
-                .expect(what);
-            let (async_rows, _) = plan
-                .evaluate(&reader, Some(&pool), &memos)
-                .await
-                .expect(what);
-            assert_eq!(row_list(rows.clone()), want, "{what}");
-            assert_eq!(rows, async_rows, "{what}: differs from the async match");
+        for (shape, reader) in [("in memory", &in_memory), ("disk copy", &disk_copy)] {
+            // Fresh memos per shape, so the second one reads its own indexes.
+            let memos = TermMemos::new();
+            for (what, plan, want) in &cases {
+                let (rows, _) = pool
+                    .install(|| plan.evaluate(reader, None, &memos).now_or_never())
+                    .unwrap_or_else(|| panic!("{shape}, {what}: the match waited on the pool"))
+                    .expect(what);
+                let (async_rows, _) = plan
+                    .evaluate(reader, Some(&pool), &memos)
+                    .await
+                    .expect(what);
+                assert_eq!(row_list(rows.clone()), *want, "{shape}, {what}");
+                assert_eq!(
+                    rows, async_rows,
+                    "{shape}, {what}: differs from the async match"
+                );
+            }
         }
     }
 
