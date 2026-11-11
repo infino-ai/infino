@@ -490,6 +490,10 @@ pub struct SupertableOptions {
     /// what lets a query rule the superfile out without opening it. To
     /// keep no tiers, set `term_tier_entries_per_term` to zero.
     pub term_head_depth: Option<usize>,
+    /// Whether another table grafts this one as it loads (see `merge::graft`). Commits then fold in the
+    /// background, each fold keeping ordinals relative to its own range, so the graft can move it like a commit's
+    /// layer.
+    pub term_index_replica: bool,
     /// Whether a ranked query merges its terms' tiers only when that is
     /// measured to pay on this table: a running cost per tier entry
     /// against the opens the merge could save, and per class of query the
@@ -942,6 +946,7 @@ impl SupertableOptions {
             bound_ordered_open_window: DEFAULT_BOUND_ORDERED_OPEN_WINDOW,
             term_tier_entries_per_term: None,
             term_head_depth: None,
+            term_index_replica: false,
             tier_merge_gate: true,
             term_index: true,
             superfiles_in_flight: default_superfiles_in_flight(),
@@ -1125,6 +1130,12 @@ impl SupertableOptions {
         self
     }
 
+    /// Whether this table is a replica (see [`Self::term_index_replica`]).
+    pub fn with_term_index_replica(mut self, replica: bool) -> Self {
+        self.term_index_replica = replica;
+        self
+    }
+
     /// Whether the table keeps a term index (see [`Self::term_index`]).
     pub fn with_term_index(mut self, keep: bool) -> Self {
         self.term_index = keep;
@@ -1162,6 +1173,7 @@ impl SupertableOptions {
             pool: Some(Arc::clone(&self.writer_pool)),
             spill_to_disk: true,
             scratch_root: self.disk_cache.as_ref().map(|c| c.scratch_root()),
+            replica_folds: self.term_index_replica,
             ..BuildPolicy::default()
         }
     }
