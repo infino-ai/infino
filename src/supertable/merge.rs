@@ -29,9 +29,12 @@ use crate::{
         handle::Supertable,
         manifest::{
             ManifestSnapshot, SuperfileEntry,
-            term_index::{self, Root},
+            term_index::{self, Root, format::Layer},
         },
-        writer::{CommitListMetadata, persist_commit_async, stamp_term_index, stamp_with_retries},
+        writer::{
+            CommitListMetadata, persist_commit_async, persist_graft_async, scoring_by_superfile,
+            stamp_term_index, stamp_with_retries,
+        },
     },
 };
 
@@ -98,13 +101,20 @@ pub struct GraftReport {
     pub term_index_spliced: bool,
     /// Commits the superfiles took.
     pub commits: usize,
+    /// Source superfiles left out because the destination already lists a
+    /// superfile of the same name: the same batch, loaded by another source.
+    pub duplicates: usize,
+    /// Rows the duplicates hold.
+    pub duplicate_rows: u64,
 }
 
 /// The source's state a graft works from, read once.
 struct Source {
     todo: Vec<Arc<SuperfileEntry>>,
     already_merged: usize,
-    /// Every live source superfile, merged or not.
+    duplicates: usize,
+    duplicate_rows: u64,
+    /// Every live source superfile, merged or not, but for the duplicates.
     ids: HashSet<Uuid>,
     /// The source's root, when its layers can be stacked.
     root: Option<Root>,
@@ -144,15 +154,18 @@ async fn read_source(
     reuse_term_index: bool,
 ) -> Result<Source, QueryError> {
     check(dst, src)?;
-    let listed: HashSet<Uuid> = dst
-        .get_all_superfiles_loaded()
-        .await
-        .map_err(internal)?
+    let dst_entries = dst.get_all_superfiles_loaded().await.map_err(internal)?;
+    let listed: HashSet<Uuid> = dst_entries.iter().map(|e| e.superfile_id).collect();
+    // A batch's superfiles share its name. One whose name the destination already lists came from a resent
+    // batch, so the first copy grafted is kept.
+    let names: HashSet<&str> = dst_entries
         .iter()
-        .map(|e| e.superfile_id)
+        .filter_map(|e| e.stem.as_deref())
         .collect();
     let mut todo = vec![];
     let mut already_merged = 0;
+    let mut duplicates = 0;
+    let mut duplicate_rows = 0;
     let mut ids = HashSet::new();
     for e in src
         .get_all_superfiles_loaded()
@@ -160,11 +173,17 @@ async fn read_source(
         .map_err(internal)?
         .iter()
     {
-        ids.insert(e.superfile_id);
         if listed.contains(&e.superfile_id) {
+            ids.insert(e.superfile_id);
             already_merged += 1;
             continue;
         }
+        if e.stem.as_deref().is_some_and(|n| names.contains(n)) {
+            duplicates += 1;
+            duplicate_rows += e.n_docs;
+            continue;
+        }
+        ids.insert(e.superfile_id);
         // A summaries row of the source's part means nothing in ours.
         if e.scalar_stats.is_unavailable() {
             return Err(internal("graft: a source superfile has no statistics"));
@@ -187,6 +206,8 @@ async fn read_source(
     Ok(Source {
         todo,
         already_merged,
+        duplicates,
+        duplicate_rows,
         ids,
         root,
     })
@@ -236,15 +257,9 @@ pub fn objects_to_copy(
 /// Commits every superfile of `src` that `dst` does not list yet, the
 /// objects [`objects_to_copy`] named being in `dst`'s storage already.
 ///
-/// The superfiles are committed first, so they are live before the index
-/// names them: a fold anywhere drops postings only of superfiles not live.
-/// With `reuse_term_index` and a complete source index, the source's layers
-/// are then stacked onto `dst`'s, so no superfile is read; otherwise the
-/// refresh run last reads them. The refresh runs no folds: the layers stay
-/// stacked for the next optimize to fold. That
-/// refresh is also what marks the index complete again. Safe to re-run
-/// after a failure at any step: listed superfiles and stacked layers are
-/// skipped.
+/// Each commit adds superfiles together with the source layers that index them, so the index is never
+/// incomplete and no superfile is read; without a reusable source index the closing refresh reads them. Safe to
+/// re-run after a failure at any step.
 ///
 /// Errors when the tables are not compatible (see `check`), when an object
 /// is missing under `dst`, or when a commit fails.
@@ -269,10 +284,18 @@ pub fn graft(
         let s = read_source(&inner.manifest.load_full(), &src_m, reuse_term_index).await?;
         let mut report = GraftReport {
             already_merged: s.already_merged,
+            duplicates: s.duplicates,
+            duplicate_rows: s.duplicate_rows,
             ..GraftReport::default()
         };
         // One part per commit: a commit re-encodes the parts it adds to.
         let chunk = inner.options.target_superfiles_per_part.max(1) as usize;
+        // A splice may list source superfiles the destination already holds and those this call commits, never
+        // one still to come: a fold could drop its postings while it is not live.
+        let mut live: HashSet<Uuid> = s.ids.clone();
+        for e in &s.todo {
+            live.remove(&e.superfile_id);
+        }
         for entries in s.todo.chunks(chunk) {
             // Checked right before the commit that lists them.
             stream::iter(entries)
@@ -288,18 +311,29 @@ pub fn graft(
                 .buffer_unordered(HEADS_IN_FLIGHT)
                 .try_collect::<Vec<()>>()
                 .await?;
-            persist_commit_async(
-                inner,
-                Arc::clone(&storage),
-                entries.to_vec(),
-                &[],
-                vec![],
-                vec![],
-                CommitListMetadata::empty(),
-                vec![],
-            )
-            .await
-            .map_err(internal)?;
+            live.extend(entries.iter().map(|e| e.superfile_id));
+            match &s.root {
+                Some(root) => {
+                    let splice = |current: &Root| spliced_root(current, root, &live);
+                    persist_graft_async(inner, Arc::clone(&storage), entries.to_vec(), &splice)
+                        .await
+                        .map_err(internal)?;
+                }
+                None => {
+                    persist_commit_async(
+                        inner,
+                        Arc::clone(&storage),
+                        entries.to_vec(),
+                        &[],
+                        vec![],
+                        vec![],
+                        CommitListMetadata::empty(),
+                        vec![],
+                    )
+                    .await
+                    .map_err(internal)?;
+                }
+            }
             report.merged += entries.len();
             report.commits += 1;
             failpoint("commit")?;
@@ -313,41 +347,174 @@ pub fn graft(
     })
 }
 
-/// `dst`'s root with `src`'s layers stacked on it: `src`'s superfiles are
-/// listed after `dst`'s, and each of its layers moves up by `dst`'s length,
-/// which the layer base makes a renumbering of no stored posting. `None`
-/// when no grafted superfile is left to list, or a `src` layer predates
-/// ordinal ranges and so may name any ordinal.
+/// Folds the next run of a replica's term-index layers and publishes it in place of the run; returns whether it
+/// published. Commits only append, so the run stays put; if it moved, this returns false and the next call retries.
+pub fn fold_replica(table: &Supertable) -> Result<bool, QueryError> {
+    fold_replica_runs(table, false)
+}
+
+/// Folds every layer a replica holds into one; run it after the replica's last commit, so the grafted table ends
+/// with about one layer per replica.
+pub fn fold_replica_all(table: &Supertable) -> Result<bool, QueryError> {
+    fold_replica_runs(table, true)
+}
+
+fn fold_replica_runs(table: &Supertable, whole: bool) -> Result<bool, QueryError> {
+    let inner = table.inner();
+    let storage = inner
+        .options
+        .storage
+        .clone()
+        .ok_or_else(|| internal("fold: the table has no storage"))?;
+    table.block_on_query(async {
+        {
+            // The loader commits through other handles; refresh so the fold and its publish start from the
+            // committed state.
+            inner.refresh().await.map_err(internal)?;
+            let manifest = inner.manifest.load_full();
+            let Some(index) = manifest.term_index().await.map_err(internal)? else {
+                return Ok(false);
+            };
+            let root = index.root().clone();
+            let scoring = scoring_by_superfile(&manifest);
+            let policy = term_index::BuildPolicy {
+                scoring_by_ordinal: Arc::new(
+                    root.superfiles
+                        .iter()
+                        .map(|id| scoring.get(id).cloned().unwrap_or_default())
+                        .collect(),
+                ),
+                ..inner.options.term_index_build_policy()
+            };
+            let foldable = vec![true; root.layers.len()];
+            let pool = Some(&*inner.options.reader_pool);
+            let Some((run, merged)) =
+                term_index::fold_next(&storage, &root, &foldable, &policy, pool, whole)
+                    .await
+                    .map_err(internal)?
+            else {
+                return Ok(false);
+            };
+            let replaced = &root.layers[run.clone()];
+            let published = AtomicBool::new(false);
+            stamp_with_retries(
+                inner,
+                &storage,
+                "replica fold",
+                |old: Arc<ManifestSnapshot>| {
+                    let (published, merged, run, storage) =
+                        (&published, merged.clone(), run.clone(), &storage);
+                    async move {
+                        published.store(false, Ordering::Relaxed);
+                        let Some(current) = old.term_index().await.map_err(store)? else {
+                            return Ok(None);
+                        };
+                        let mut next = current.root().clone();
+                        if next.layers.get(run.clone()) != Some(replaced) {
+                            return Ok(None);
+                        }
+                        next.layers.splice(run, [merged]);
+                        let reference = term_index::write_root(storage.as_ref(), &next)
+                            .await
+                            .map_err(store)?;
+                        published.store(true, Ordering::Relaxed);
+                        Ok(Some(
+                            old.with_term_index(reference, old.term_index_complete()),
+                        ))
+                    }
+                },
+            )
+            .await
+            .map_err(internal)?;
+            Ok(published.load(Ordering::Relaxed))
+        }
+    })
+}
+
+/// `dst`'s root with every `src` layer it does not hold yet appended, each listing its own span of `src` ordinals;
+/// `None` when nothing moves. A superfile listed again is set to nil in its earlier slot, and a `dst` layer left
+/// with only nil slots is dropped, so a replica's fold replaces the layers it merged. Superfiles outside
+/// `grafted` are listed as nil.
 fn spliced_root(dst: &Root, src: &Root, grafted: &HashSet<Uuid>) -> Option<Root> {
-    let offset = dst.superfiles.len() as u32;
-    let listed: HashSet<Uuid> = dst.superfiles.iter().copied().collect();
-    // A superfile not being grafted, or one `dst` already lists, is nil
-    // here: no live entry matches nil, so its postings are ignored like a
-    // dead one's and no superfile is listed twice.
-    let added: Vec<Uuid> = src
+    if src.layers.iter().any(|l| l.ordinals.is_none()) {
+        return None;
+    }
+    let key = |l: &Layer| {
+        (
+            l.slices
+                .iter()
+                .map(|s| s.content_hash.0)
+                .collect::<Vec<_>>(),
+            l.ordinals.as_ref().map_or(0, |r| r.len()),
+        )
+    };
+    let held: HashSet<_> = dst.layers.iter().map(key).collect();
+    let listed: HashSet<Uuid> = dst
         .superfiles
         .iter()
-        .map(|u| {
-            if grafted.contains(u) && !listed.contains(u) {
-                *u
-            } else {
-                Uuid::nil()
-            }
+        .copied()
+        .filter(|u| !u.is_nil())
+        .collect();
+    let span = |l: &Layer| {
+        let r = l.ordinals.clone().unwrap_or(0..0);
+        // A fold written with absolute ordinals has its base below its range.
+        l.base.min(r.start) as usize..r.end as usize
+    };
+    let moves: Vec<&Layer> = src
+        .layers
+        .iter()
+        .filter(|l| {
+            let names = &src.superfiles[span(l)];
+            names.iter().any(|u| grafted.contains(u))
+                && (!held.contains(&key(l))
+                    || names
+                        .iter()
+                        .any(|u| grafted.contains(u) && !listed.contains(u)))
         })
         .collect();
-    if added.iter().all(Uuid::is_nil) {
+    if moves.is_empty() {
         return None;
     }
     let mut root = dst.clone();
-    root.superfiles.extend(added);
-    root.id_mins.extend(&src.id_mins);
-    for layer in &src.layers {
+    let mut relisted: HashSet<Uuid> = HashSet::new();
+    let mut moved_layers = vec![];
+    for layer in moves {
+        let lo = span(layer).start as u32;
+        let offset = root.superfiles.len() as u32;
+        for (u, id_min) in src.superfiles[span(layer)]
+            .iter()
+            .zip(&src.id_mins[span(layer)])
+        {
+            let keep = grafted.contains(u);
+            root.superfiles.push(if keep { *u } else { Uuid::nil() });
+            root.id_mins.push(*id_min);
+            if keep {
+                relisted.insert(*u);
+            }
+        }
         let range = layer.ordinals.clone()?;
         let mut moved = layer.clone();
-        moved.base = layer.base + offset;
-        moved.ordinals = Some(range.start + offset..range.end + offset);
-        root.layers.push(moved);
+        moved.base = layer.base - lo + offset;
+        moved.ordinals = Some(range.start - lo + offset..range.end - lo + offset);
+        moved_layers.push(moved);
     }
+    // Earlier slots of what was just listed again.
+    let first_new = dst.superfiles.len();
+    for slot in &mut root.superfiles[..first_new] {
+        if relisted.contains(slot) {
+            *slot = Uuid::nil();
+        }
+    }
+    let superfiles = &root.superfiles;
+    root.layers.retain(|l| {
+        l.ordinals.as_ref().is_none_or(|r| {
+            r.is_empty()
+                || superfiles[r.start as usize..r.end as usize]
+                    .iter()
+                    .any(|u| !u.is_nil())
+        })
+    });
+    root.layers.extend(moved_layers);
     Some(root)
 }
 
@@ -409,88 +576,194 @@ mod tests {
 
     fn layer(base: u32, range: std::ops::Range<u32>) -> Layer {
         Layer {
-            slices: vec![],
+            slices: vec![slice(base as u8)],
             ordinals: Some(range),
             base,
         }
     }
 
-    #[test]
-    fn spliced_root_moves_src_layers_past_dst() {
-        let a = Uuid::from_u128(1);
-        let (b1, b2) = (Uuid::from_u128(2), Uuid::from_u128(3));
-        let dst = Root {
-            superfiles: vec![a],
-            id_mins: vec![10],
-            layers: vec![layer(0, 0..1)],
-        };
-        let src = Root {
-            superfiles: vec![b1, b2],
-            id_mins: vec![20, 30],
-            layers: vec![layer(0, 0..2), layer(1, 1..2)],
-        };
-        let root = spliced_root(&dst, &src, &HashSet::from([b2])).unwrap();
-        assert_eq!(root.superfiles, vec![a, Uuid::nil(), b2]);
-        assert_eq!(root.id_mins, vec![10, 20, 30]);
+    /// A slice whose content hash is `tag`, so layers built apart differ.
+    fn slice(tag: u8) -> crate::supertable::manifest::term_index::format::SliceRef {
+        crate::supertable::manifest::term_index::format::SliceRef {
+            first_key: vec![],
+            last_key: vec![],
+            content_hash: crate::supertable::manifest::part::ContentHash([tag; 32]),
+            tier: None,
+            len: 0,
+        }
+    }
+
+    fn ids(n: u128) -> Vec<Uuid> {
+        (1..=n).map(Uuid::from_u128).collect()
+    }
+
+    /// Each live id once, and every layer's range inside the list.
+    fn assert_sound(root: &Root) {
+        let live: Vec<_> = root.superfiles.iter().filter(|u| !u.is_nil()).collect();
+        let unique: HashSet<_> = live.iter().collect();
         assert_eq!(
-            (root.layers[1].base, root.layers[1].ordinals.clone()),
-            (1, Some(1..3))
+            live.len(),
+            unique.len(),
+            "an id listed twice: {:?}",
+            root.superfiles
         );
+        assert_eq!(root.superfiles.len(), root.id_mins.len());
+        for l in &root.layers {
+            let r = l.ordinals.clone().expect("range");
+            assert!(r.end as usize <= root.superfiles.len() && l.base <= r.start);
+        }
+    }
+
+    #[test]
+    fn spliced_root_moves_new_deltas_and_lists_only_their_span() {
+        let u = ids(4);
+        let src = Root {
+            superfiles: u.clone(),
+            id_mins: vec![10, 20, 30, 40],
+            layers: vec![layer(0, 0..1), layer(1, 1..2), layer(2, 2..4)],
+        };
+        let first = spliced_root(&Root::default(), &src, &HashSet::from([u[0], u[1]])).unwrap();
+        assert_eq!(first.superfiles, u[..2]);
+        assert_eq!(first.layers.len(), 2);
+        let all: HashSet<Uuid> = u.iter().copied().collect();
+        let root = spliced_root(&first, &src, &all).unwrap();
+        assert_eq!(root.superfiles[2..], [u[2], u[3]]);
+        assert_eq!(root.id_mins[2..], [30, 40]);
         assert_eq!(
             (root.layers[2].base, root.layers[2].ordinals.clone()),
-            (2, Some(2..3))
+            (2, Some(2..4))
         );
-        // Already listed: nothing to add.
-        assert!(spliced_root(&root, &src, &HashSet::from([b2])).is_none());
-        // Shares b1 with dst: b1 is nil in the stacked part, b2 is added.
-        let dst = Root {
-            superfiles: vec![a, b1],
-            id_mins: vec![10, 20],
-            layers: vec![layer(0, 0..2)],
+        assert_sound(&root);
+        assert!(
+            spliced_root(&root, &src, &all).is_none(),
+            "nothing left to move"
+        );
+    }
+
+    #[test]
+    fn a_fold_of_grafted_layers_replaces_them() {
+        let u = ids(3);
+        let all: HashSet<Uuid> = u.iter().copied().collect();
+        let deltas = Root {
+            superfiles: u.clone(),
+            id_mins: vec![1, 2, 3],
+            layers: vec![layer(0, 0..1), layer(1, 1..2), layer(2, 2..3)],
         };
-        let root = spliced_root(&dst, &src, &HashSet::from([b1, b2])).unwrap();
-        assert_eq!(root.superfiles, vec![a, b1, Uuid::nil(), b2]);
-        let unranged = Root {
+        let other = Root {
+            superfiles: vec![Uuid::from_u128(99)],
+            id_mins: vec![9],
+            layers: vec![layer(0, 0..1)],
+        };
+        let t = spliced_root(&Root::default(), &deltas, &all).unwrap();
+        let t = spliced_root(&t, &other, &HashSet::from([Uuid::from_u128(99)])).unwrap();
+        // The replica folds its first two layers into one kept relative to its range.
+        let mut fold = layer(0, 0..2);
+        fold.slices = vec![];
+        fold.base = 0;
+        let folded = Root {
+            layers: vec![
+                Layer {
+                    slices: vec![slice(7)],
+                    ..fold
+                },
+                deltas.layers[2].clone(),
+            ],
+            ..deltas.clone()
+        };
+        let root = spliced_root(&t, &folded, &all).unwrap();
+        assert_sound(&root);
+        // The two replaced layers are gone; the other replica's and the third delta stay.
+        assert_eq!(root.layers.len(), 3);
+        assert_eq!(root.superfiles.iter().filter(|x| **x == u[0]).count(), 1);
+        assert!(spliced_root(&root, &folded, &all).is_none(), "idempotent");
+    }
+
+    #[test]
+    fn a_fold_spanning_grafted_and_new_superfiles_lists_both() {
+        let u = ids(2);
+        let deltas = Root {
+            superfiles: u.clone(),
+            id_mins: vec![1, 2],
+            layers: vec![layer(0, 0..1), layer(1, 1..2)],
+        };
+        let t = spliced_root(&Root::default(), &deltas, &HashSet::from([u[0]])).unwrap();
+        assert_eq!(t.superfiles, vec![u[0]]);
+        let folded = Root {
+            layers: vec![Layer {
+                slices: vec![slice(8)],
+                ..layer(0, 0..2)
+            }],
+            ..deltas
+        };
+        let all: HashSet<Uuid> = u.iter().copied().collect();
+        let root = spliced_root(&t, &folded, &all).unwrap();
+        assert_sound(&root);
+        assert_eq!(root.layers.len(), 1, "the old delta is replaced");
+        let live: Vec<_> = root
+            .superfiles
+            .iter()
+            .filter(|x| !x.is_nil())
+            .copied()
+            .collect();
+        assert_eq!(live, u);
+    }
+
+    #[test]
+    fn spliced_root_refuses_layers_without_ranges() {
+        let src = Root {
+            superfiles: ids(1),
+            id_mins: vec![1],
             layers: vec![Layer {
                 slices: vec![],
                 ordinals: None,
                 base: 0,
             }],
-            ..src
         };
-        assert!(spliced_root(&dst, &unranged, &HashSet::from([b2])).is_none());
+        assert!(spliced_root(&Root::default(), &src, &ids(1).into_iter().collect()).is_none());
     }
 
     /// A table in its own temp dir with one term-index layer per commit.
     fn table(tag: &str, commits: usize) -> (tempfile::TempDir, Supertable) {
-        use arrow_array::{ArrayRef, LargeStringArray, RecordBatch};
-        use arrow_schema::{DataType, Field, Schema};
+        table_as(tag, commits, false)
+    }
 
-        use crate::{
-            storage::LocalFsStorageProvider, superfile::builder::FtsConfig,
-            supertable::SupertableOptions,
-        };
-
-        let dir = tempfile::TempDir::new().expect("tempdir");
+    fn options_at(
+        dir: &std::path::Path,
+        schema: &arrow_schema::SchemaRef,
+        replica: bool,
+    ) -> crate::supertable::SupertableOptions {
         let storage: Arc<dyn StorageProvider> =
-            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("local fs"));
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "title",
-            DataType::LargeUtf8,
-            false,
-        )]));
+            Arc::new(crate::storage::LocalFsStorageProvider::new(dir).expect("local fs"));
         let pool = Arc::new(
             rayon::ThreadPoolBuilder::new()
                 .num_threads(2)
                 .build()
                 .expect("pool"),
         );
-        let options =
-            SupertableOptions::new(Arc::clone(&schema), vec![FtsConfig::new("title")], vec![])
-                .expect("options")
-                .with_writer_pool(pool)
-                .with_storage(storage);
-        let st = Supertable::create(options).expect("create");
+        crate::supertable::SupertableOptions::new(
+            Arc::clone(schema),
+            vec![crate::superfile::builder::FtsConfig::new("title")],
+            vec![],
+        )
+        .expect("options")
+        .with_writer_pool(pool)
+        .with_term_index_replica(replica)
+        // As the loader and the coordinator open tables: a reader sees what other handles committed.
+        .with_read_consistency(crate::Consistency::Strong)
+        .with_storage(storage)
+    }
+
+    fn table_as(tag: &str, commits: usize, replica: bool) -> (tempfile::TempDir, Supertable) {
+        use arrow_array::{ArrayRef, LargeStringArray, RecordBatch};
+        use arrow_schema::{DataType, Field, Schema};
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "title",
+            DataType::LargeUtf8,
+            false,
+        )]));
+        let st = Supertable::create(options_at(dir.path(), &schema, replica)).expect("create");
         for c in 0..commits {
             let titles: Vec<String> = (0..50).map(|i| format!("shared {tag}c{c}d{i}")).collect();
             let arr: ArrayRef = Arc::new(LargeStringArray::from(
@@ -510,6 +783,259 @@ mod tests {
             v["layers"].as_u64().expect("an index"),
             v["complete"].as_bool().expect("complete flag"),
         )
+    }
+
+    #[test]
+    fn grafting_folding_replicas_keeps_the_index_short_and_whole() {
+        use arrow_array::{ArrayRef, LargeStringArray, RecordBatch};
+        let (dst_dir, dst) = table("t", 0);
+        let replicas: Vec<_> = ["p", "q"]
+            .iter()
+            .map(|tag| (tag.to_string(), table_as(tag, 0, true)))
+            .collect();
+        // Each replica's fold thread keeps one handle of its own for the whole load, as the loader does.
+        let folders: Vec<Supertable> = replicas
+            .iter()
+            .map(|(_, (dir, src))| {
+                let schema = src
+                    .reader()
+                    .expect("reader")
+                    .manifest()
+                    .get_opts()
+                    .schema
+                    .clone();
+                Supertable::open(options_at(dir.path(), &schema, true)).expect("open")
+            })
+            .collect();
+        let mut committed = 0;
+        for round in 0..10 {
+            for ((tag, (dir, src)), folder) in replicas.iter().zip(&folders) {
+                let schema = src
+                    .reader()
+                    .expect("reader")
+                    .manifest()
+                    .get_opts()
+                    .schema
+                    .clone();
+                for c in 0..7 {
+                    let titles: Vec<String> = (0..20)
+                        .map(|i| format!("shared {tag}r{round}c{c}d{i}"))
+                        .collect();
+                    let arr: ArrayRef = Arc::new(LargeStringArray::from(
+                        titles.iter().map(String::as_str).collect::<Vec<_>>(),
+                    ));
+                    let mut w = src.writer().expect("writer");
+                    w.append(&RecordBatch::try_new(schema.clone(), vec![arr]).expect("batch"))
+                        .expect("append");
+                    w.commit().expect("commit");
+                    committed += 20;
+                }
+                while fold_replica(folder).expect("fold") {}
+                // Replicas write into t's storage; here a copy stands in for that.
+                let reader = src.reader().expect("reader");
+                for key in std::fs::read_dir(dir.path().join("term-index"))
+                    .expect("ls")
+                    .map(|e| {
+                        format!(
+                            "term-index/{}",
+                            e.expect("entry").file_name().to_string_lossy()
+                        )
+                    })
+                    .chain(
+                        objects_to_copy(&dst, &reader, true)
+                            .expect("objects")
+                            .superfiles
+                            .into_iter()
+                            .map(|(k, _)| k),
+                    )
+                {
+                    let to = dst_dir.path().join(&key);
+                    if !to.exists() {
+                        std::fs::create_dir_all(to.parent().expect("parent")).expect("mkdir");
+                        std::fs::copy(dir.path().join(&key), to).expect("copy");
+                    }
+                }
+                graft(&dst, &reader, true).expect("graft");
+                let (layers, complete) = layout(&dst);
+                assert!(complete, "complete after every graft");
+                // Each replica keeps under eight layers per size level: at 70 commits
+                // at most 7 + 7 + 1, against one per commit without folds.
+                assert!(layers <= 2 * 15, "round {round}: {layers} layers");
+            }
+        }
+        // The end of the load: each replica folds everything it holds into one layer.
+        for ((_, (dir, src)), folder) in replicas.iter().zip(&folders) {
+            assert!(fold_replica_all(folder).expect("final fold"));
+            assert!(
+                !fold_replica_all(folder).expect("final fold"),
+                "one layer left"
+            );
+            let reader = src.reader().expect("reader");
+            for key in std::fs::read_dir(dir.path().join("term-index"))
+                .expect("ls")
+                .map(|e| {
+                    format!(
+                        "term-index/{}",
+                        e.expect("entry").file_name().to_string_lossy()
+                    )
+                })
+            {
+                let to = dst_dir.path().join(&key);
+                if !to.exists() {
+                    std::fs::copy(dir.path().join(&key), to).expect("copy");
+                }
+            }
+            graft(&dst, &reader, true).expect("graft");
+        }
+        let (layers, complete) = layout(&dst);
+        assert!(complete && layers <= 2, "one layer per replica: {layers}");
+        let hits = dst
+            .reader()
+            .expect("reader")
+            .token_match(
+                "title",
+                "shared",
+                crate::superfile::fts::reader::BoolMode::Or,
+            )
+            .expect("search");
+        assert_eq!(hits.len(), committed, "every row once");
+    }
+
+    #[test]
+    fn a_batch_loaded_by_two_sources_is_grafted_once() {
+        use arrow_array::{ArrayRef, LargeStringArray, RecordBatch};
+        let (dst_dir, dst) = table("d", 0);
+        let load = |tag: &str, names: &[&str]| {
+            let (dir, t) = table(tag, 0);
+            let schema = t
+                .reader()
+                .expect("reader")
+                .manifest()
+                .get_opts()
+                .schema
+                .clone();
+            for name in names {
+                let titles: Vec<String> = (0..50).map(|i| format!("shared {name}d{i}")).collect();
+                let arr: ArrayRef = Arc::new(LargeStringArray::from(
+                    titles.iter().map(String::as_str).collect::<Vec<_>>(),
+                ));
+                t.append_named(
+                    &RecordBatch::try_new(schema.clone(), vec![arr]).expect("batch"),
+                    name,
+                )
+                .expect("append");
+            }
+            (dir, t)
+        };
+        let (a_dir, a) = load("a", &["x", "y"]);
+        let (b_dir, b) = load("b", &["y", "z"]);
+        let mut duplicates = 0;
+        for (dir, src) in [(&a_dir, &a), (&b_dir, &b)] {
+            let reader = src.reader().expect("reader");
+            let objects = objects_to_copy(&dst, &reader, true).expect("objects");
+            for key in objects
+                .superfiles
+                .iter()
+                .map(|(k, _)| k)
+                .chain(&objects.term_index)
+            {
+                let to = dst_dir.path().join(key);
+                std::fs::create_dir_all(to.parent().expect("parent")).expect("mkdir");
+                std::fs::copy(dir.path().join(key), to).expect("copy");
+            }
+            duplicates += graft(&dst, &reader, true).expect("graft").duplicates;
+        }
+        assert_eq!(duplicates, 1, "b's copy of y");
+        let r = dst.reader().expect("reader");
+        assert_eq!(
+            r.manifest()
+                .superfiles
+                .iter()
+                .map(|e| e.n_docs)
+                .sum::<u64>(),
+            3 * 50
+        );
+        let hits = r
+            .token_match(
+                "title",
+                "shared",
+                crate::superfile::fts::reader::BoolMode::Or,
+            )
+            .expect("search");
+        assert_eq!(hits.len(), 3 * 50);
+        assert!(layout(&dst).1, "complete");
+    }
+
+    #[test]
+    fn attached_replicas_keep_gc_and_compaction_off_the_table() {
+        let (dir, t) = table("a", 9);
+        let orphan = dir.path().join("data/seg-orphan.sf.parquet");
+        std::fs::write(&orphan, b"replica superfile not grafted yet").expect("orphan");
+        let pointer = dir.path().join("_replicas/r0/_supertable/current");
+        std::fs::create_dir_all(pointer.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&pointer, b"x").expect("pointer");
+        let files = |t: &Supertable| t.reader().expect("reader").manifest().superfiles.len();
+        let before = files(&t);
+
+        t.gc(std::time::Duration::ZERO).expect("gc");
+        assert!(orphan.exists(), "kept while a replica is attached");
+        let mut cfg = CompactionSettings {
+            target_superfile_size_mb: 1,
+            min_fill_percent: 1,
+            ..CompactionSettings::default()
+        };
+        cfg.steps.recalibrate = crate::RecalibratePolicy::Skip;
+        t.compact(&cfg).expect("compact");
+        assert_eq!(files(&t), before, "no compaction while attached");
+
+        std::fs::remove_dir_all(dir.path().join("_replicas")).expect("detach");
+        t.gc(std::time::Duration::ZERO).expect("gc");
+        assert!(!orphan.exists(), "reclaimed once detached");
+        t.compact(&cfg).expect("compact");
+        assert!(files(&t) < before, "compacts once detached");
+    }
+
+    #[test]
+    fn a_graft_commit_alone_leaves_the_index_complete() {
+        let (dst_dir, dst) = table("a", 2);
+        let (src_dir, src) = table("b", 3);
+        let reader = src.reader().expect("reader");
+        let objects = objects_to_copy(&dst, &reader, true).expect("objects");
+        for key in objects
+            .superfiles
+            .iter()
+            .map(|(k, _)| k)
+            .chain(&objects.term_index)
+        {
+            let to = dst_dir.path().join(key);
+            std::fs::create_dir_all(to.parent().expect("parent")).expect("mkdir");
+            std::fs::copy(src_dir.path().join(key), to).expect("copy");
+        }
+        let inner = dst.inner();
+        let storage = inner.options.storage.clone().expect("storage");
+        dst.block_on_query(async {
+            let s = read_source(&inner.manifest.load_full(), reader.manifest(), true)
+                .await
+                .expect("source");
+            let root = s.root.expect("a stackable source index");
+            let splice = |current: &Root| spliced_root(current, &root, &s.ids);
+            persist_graft_async(inner, storage, s.todo, &splice)
+                .await
+                .expect("commit");
+        });
+        // No refresh ran: the commit itself listed the superfiles and their postings.
+        let (_, complete) = layout(&dst);
+        assert!(complete, "complete right after the commit");
+        let hits = dst
+            .reader()
+            .expect("reader")
+            .token_match(
+                "title",
+                "shared",
+                crate::superfile::fts::reader::BoolMode::Or,
+            )
+            .expect("search");
+        assert_eq!(hits.len(), 5 * 50);
     }
 
     #[test]
