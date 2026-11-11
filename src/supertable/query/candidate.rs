@@ -132,6 +132,13 @@ use crate::{
     },
 };
 
+/// Deepest plan (`AND`/`OR` levels) matched on the reader pool. A match
+/// recurses once per level, and a pool thread has rayon's default stack
+/// (or what a caller's pool sets), far smaller than the 16 MiB query runtime
+/// threads that match deeper plans. A debug build overflows a 2 MiB pool
+/// thread between 150 and 200 levels; real filters sit far below 64.
+const MAX_POOL_PLAN_DEPTH: usize = 64;
+
 /// What a SQL `WHERE` pushed into a search TVF admits, resolved once per
 /// query against the pinned snapshot and shared by every retriever the
 /// query runs (`hybrid_search` runs two): the superfiles that may hold a
@@ -513,6 +520,9 @@ impl CandidatePlan {
     /// another; on the pool each gets its own thread. A lazy reader's reads
     /// wait on the network and already overlap, so its match stays here.
     ///
+    /// A plan deeper than [`MAX_POOL_PLAN_DEPTH`] stays here too: its match
+    /// would overflow a pool thread's stack, which aborts the process.
+    ///
     /// A match that would wait on the pool (another query filling a shared
     /// cell) gives up there, releases its slot and reruns here: wasted work,
     /// never a wrong answer. A match holds one of `slots` while on the pool,
@@ -527,7 +537,10 @@ impl CandidatePlan {
         // A `LIKE` leaf hands its dictionary walk to a pool itself, which
         // would leave that walk running on the global pool when the poll
         // below gives up. Callers expand `LIKE` first (see `Self::expand`).
-        if reader.parquet_bytes().is_some() && !self.has_like() {
+        if reader.parquet_bytes().is_some()
+            && !self.has_like()
+            && self.depth() <= MAX_POOL_PLAN_DEPTH
+        {
             let _slot = slots
                 .acquire()
                 .await
@@ -810,6 +823,20 @@ impl CandidatePlan {
     /// ([`TermsLike`](Self::TermsLike)). The provider expands such a plan
     /// once per superfile and estimates / evaluates the result, instead of
     /// paying the dictionary walk in both steps.
+    /// How many `AND`/`OR` levels deep this plan nests; a leaf is 1.
+    fn depth(&self) -> usize {
+        match self {
+            CandidatePlan::And(children) | CandidatePlan::Or(children) => {
+                1 + children.iter().map(CandidatePlan::depth).max().unwrap_or(0)
+            }
+            CandidatePlan::TermsAll { .. }
+            | CandidatePlan::TermsAny { .. }
+            | CandidatePlan::TermsLike { .. }
+            | CandidatePlan::Range { .. }
+            | CandidatePlan::Unbounded => 1,
+        }
+    }
+
     pub(crate) fn has_like(&self) -> bool {
         match self {
             CandidatePlan::TermsLike { .. } => true,
@@ -2994,6 +3021,34 @@ mod tests {
         let (rows, _) = timeout(MUST_FINISH, matched)
             .await
             .expect("finishes once the pool is free")
+            .expect("match");
+        assert_eq!(row_list(rows), Some(vec![0, 2]));
+    }
+
+    #[tokio::test]
+    async fn a_deep_plan_is_matched_off_the_pool() {
+        // A resident superfile, a busy pool, and a plan nesting `AND` and `OR`
+        // one level deeper than the pool takes.
+        // - The match finishes anyway, with rows 0 and 2.
+        // This test pins that a deep plan stays on the planning task, whose
+        // stack holds it; on a pool thread it overflows and aborts.
+        let mut deep = terms_all(&["rust"]);
+        for level in 1..=MAX_POOL_PLAN_DEPTH {
+            let other = terms_all(&["rust"]);
+            deep = if level % 2 == 0 {
+                CandidatePlan::And(vec![deep, other])
+            } else {
+                CandidatePlan::Or(vec![deep, other])
+            };
+        }
+        assert_eq!(deep.depth(), MAX_POOL_PLAN_DEPTH + 1);
+        let (pool, _release) = held_pool();
+        let slots = Semaphore::new(1);
+        let matched =
+            Arc::new(deep).evaluate_on_pool(resident_reader(), &pool, &slots, TermMemos::new());
+        let (rows, _) = timeout(MUST_FINISH, matched)
+            .await
+            .expect("finishes without the busy pool")
             .expect("match");
         assert_eq!(row_list(rows), Some(vec![0, 2]));
     }
