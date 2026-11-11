@@ -1296,7 +1296,13 @@ impl PassBodyEncoder {
             body_file,
             writer,
             schema: Arc::clone(schema),
-            plain_fields: vec![None; schema.fields().len()],
+            // A field that is no candidate keeps its dictionary: nothing to
+            // choose, so its pass need not hold rows to measure.
+            plain_fields: schema
+                .fields()
+                .iter()
+                .map(|field| (!plan.dictionary_candidates.contains(field.name())).then_some(false))
+                .collect(),
             plan,
             dictionary,
             plain,

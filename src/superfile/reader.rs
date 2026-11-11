@@ -549,7 +549,26 @@ fn page_index_from_bytes(
     footer: &ParquetMetaData,
     bytes: &Bytes,
 ) -> Result<Arc<ParquetMetaData>, ReadError> {
-    let mut loader = page_index_loader(footer);
+    read_page_index_from_bytes(page_index_loader(footer), bytes)
+}
+
+/// `footer` with only its offset index read out of the file's resident
+/// `bytes`: what a row selection skips pages by, without the column index,
+/// every page's bounds, which on a wide file is far larger.
+fn offset_index_from_bytes(
+    footer: &ParquetMetaData,
+    bytes: &Bytes,
+) -> Result<Arc<ParquetMetaData>, ReadError> {
+    let loader = page_index_loader(footer).with_column_index_policy(PageIndexPolicy::Skip);
+    read_page_index_from_bytes(loader, bytes)
+}
+
+/// The footer `loader` holds with the page index it is set to read, read
+/// out of the file's resident `bytes`.
+fn read_page_index_from_bytes(
+    mut loader: ParquetMetaDataReader,
+    bytes: &Bytes,
+) -> Result<Arc<ParquetMetaData>, ReadError> {
     loader
         .read_page_indexes(bytes)
         .map_err(footer::FooterError::from)?;
@@ -642,7 +661,13 @@ impl KeptRows {
         metadata: &ParquetMetaData,
         survivors: Range<u64>,
     ) -> Option<KeptRead> {
-        let runs = self.file_runs(survivors);
+        KeptRead::of_runs(metadata, &self.file_runs(survivors))
+    }
+}
+
+impl KeptRead {
+    /// The read of the file rows in `runs`, ascending and disjoint.
+    fn of_runs(metadata: &ParquetMetaData, runs: &[Range<u64>]) -> Option<KeptRead> {
         let (first, last) = (runs.first()?.start, runs.last()?.end);
         // The row groups holding rows `first..last`, and the file row the
         // first of them starts at.
@@ -661,7 +686,7 @@ impl KeptRows {
         }
         let mut at = base.unwrap_or(0);
         let mut selectors = Vec::with_capacity(2 * runs.len() + 1);
-        for run in &runs {
+        for run in runs {
             if run.start > at {
                 selectors.push(RowSelector::skip(row_count(run.start - at)));
             }
@@ -1463,27 +1488,19 @@ impl SuperfileReader {
         &self,
         offset_index: bool,
     ) -> Result<ArrowReaderMetadata, ReadError> {
+        // Flag before footer, as the page-index load stores the indexed
+        // footer before it sets the flag: a set flag means the footer read
+        // next carries the index.
+        let loaded = self.page_index_loaded.initialized();
         let resident = self.resident_arrow_metadata()?;
-        if !offset_index
-            || self.page_index_loaded.initialized()
-            || resident.metadata().offset_index().is_some()
-        {
+        if !offset_index || loaded || resident.metadata().offset_index().is_some() {
             return Ok(resident);
         }
         let bytes = self
             .bytes
             .as_ref()
             .ok_or(ReadError::LazyReaderUnsupported)?;
-        let mut loader =
-            ParquetMetaDataReader::new_with_metadata(resident.metadata().as_ref().clone())
-                .with_column_index_policy(PageIndexPolicy::Skip)
-                .with_offset_index_policy(PageIndexPolicy::Optional);
-        loader
-            .read_page_indexes(bytes)
-            .map_err(footer::FooterError::from)?;
-        resolve_arrow(Arc::new(
-            loader.finish().map_err(footer::FooterError::from)?,
-        ))
+        resolve_arrow(offset_index_from_bytes(resident.metadata(), bytes)?)
     }
 
     /// The rows `read` names (see [`KeptRows::read`]), the top-level columns

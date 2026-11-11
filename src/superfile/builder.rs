@@ -3685,7 +3685,9 @@ impl SuperfileBuilder {
             let segments: Vec<(usize, Range<u64>)> = (0..inputs.len())
                 .filter_map(|i| {
                     let (start, end) = (starts[i], starts[i] + kept[i].len());
-                    (start < group_end && end > group_start).then(|| {
+                    // An input none of whose rows survives holds no rows of
+                    // any group, wherever its empty run falls.
+                    (start < end && start < group_end && end > group_start).then(|| {
                         (
                             i,
                             group_start.max(start) - start..group_end.min(end) - start,
@@ -8351,6 +8353,31 @@ mod tests {
             );
             assert_eq!(survivors, narrow.n_docs() as i64, "{label}");
         }
+    }
+
+    /// An input every row of which is deleted holds no rows of any row
+    /// group, wherever it falls among the others: a merge writing its body
+    /// a field at a time skips it, as one writing rows does.
+    #[test]
+    fn a_merge_written_a_field_at_a_time_skips_an_input_with_no_rows_left() {
+        let all: Vec<u32> = (0..40).collect();
+        let inputs = merge_inputs_of_sizes(
+            &[10, 40, 10, 40],
+            false,
+            &[&[], &all, &[2], &all],
+            sorted_merge_docs,
+        );
+        let window = DecodeWindow {
+            pass_fields: 1,
+            ..DecodeWindow::current()
+        };
+        let narrow = with_decode_window(window, || {
+            fts_merge(&inputs, None, WINDOW_ROW_GROUP_ROWS[0])
+        });
+        let wide = fts_merge(&inputs, None, WINDOW_ROW_GROUP_ROWS[0]);
+        let merged =
+            assert_same_merge(narrow, wide, "an input of no rows mid-group").expect("rows survive");
+        assert_eq!(merged.n_docs(), 19);
     }
 
     /// A merge that re-analyzes its inputs' text, because one was written

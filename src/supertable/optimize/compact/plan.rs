@@ -125,10 +125,15 @@ impl MergeMemory {
             .saturating_mul(INPUT_FOOTER_BYTES_PER_COLUMN)
     }
 
-    /// Whether a merge of that shape is within [`Self::limit`].
-    fn admits(&self, input_bytes: u64, output_bytes: u64, live_docs: u64) -> bool {
-        self.limit
-            .is_none_or(|limit| self.footprint(input_bytes, output_bytes, live_docs) <= limit)
+    /// Whether a merge of that shape, of `inputs` input files, is within
+    /// [`Self::limit`]: its footprint and its inputs' footers, what the
+    /// runner charges it at admission.
+    fn admits(&self, input_bytes: u64, output_bytes: u64, live_docs: u64, inputs: usize) -> bool {
+        self.limit.is_none_or(|limit| {
+            self.footprint(input_bytes, output_bytes, live_docs)
+                .saturating_add(self.input_footers(inputs))
+                <= limit
+        })
     }
 }
 
@@ -376,6 +381,7 @@ impl PendingJob {
                 self.raw_bytes + s.size_bytes,
                 self.live_bytes + s.live_bytes(),
                 self.live_docs + s.live_docs(),
+                self.members.len() + 1,
             )
     }
 
@@ -776,6 +782,34 @@ pub(in crate::supertable::optimize::compact) mod tests {
         assert!(!p.fits(&b, target, max_memory, &MergeMemory::default()));
     }
 
+    /// A job is cut where its inputs' footers, which a merge holds open to
+    /// its end, would pass the limit, though its bytes and rows fit: the
+    /// planner charges a job what the runner charges it at admission.
+    #[test]
+    fn pending_job_fits_charges_its_inputs_footers() {
+        let (target, max_input) = (mib(1_000), mib(1_000));
+        let wide = MergeMemory {
+            fields: WIDE_FIELDS,
+            ..MergeMemory::default()
+        };
+        let mut p = PendingJob::default();
+        p.push(&seg(1, 1, 10, 0));
+        let b = seg(2, 1, 10, 0);
+        let bytes = wide.footprint(
+            p.raw_bytes + b.size_bytes,
+            p.live_bytes + b.live_bytes(),
+            p.live_docs + b.live_docs(),
+        );
+        let footers = wide.input_footers(2);
+        assert!(footers > 0, "guard: a wide table's footers are charged");
+        let within = |limit| MergeMemory {
+            limit: Some(limit),
+            ..wide
+        };
+        assert!(p.fits(&b, target, max_input, &within(bytes + footers)));
+        assert!(!p.fits(&b, target, max_input, &within(bytes + footers - 1)));
+    }
+
     /// A decoded row of a table thousands of columns wide, nearly all null.
     const WIDE_ROW_BYTES: u64 = 20_000;
 
@@ -823,8 +857,9 @@ pub(in crate::supertable::optimize::compact) mod tests {
         let mut seen = HashSet::new();
         for job in &jobs {
             assert!(job.inputs.len() >= 2);
-            let footprint =
-                bounded.footprint(job.input_bytes, job.estimated_output_bytes, job.live_docs);
+            let footprint = bounded
+                .footprint(job.input_bytes, job.estimated_output_bytes, job.live_docs)
+                .saturating_add(bounded.input_footers(job.inputs.len()));
             assert!(
                 footprint <= limit,
                 "a job expected to hold {footprint} bytes"
