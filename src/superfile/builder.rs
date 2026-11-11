@@ -74,12 +74,13 @@ use std::{
     str::from_utf8,
     sync::{Arc, Condvar, Mutex, PoisonError, mpsc::sync_channel},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use arrow::compute::interleave;
 use arrow_array::{
-    Array, ArrayRef, Decimal128Array, LargeStringArray, RecordBatch, RecordBatchReader,
+    Array, ArrayRef, Decimal128Array, LargeStringArray, RecordBatch, RecordBatchOptions,
+    RecordBatchReader,
 };
 use arrow_schema::{ArrowError, DataType, Field, Schema};
 use parquet::{
@@ -104,9 +105,10 @@ use crate::{
         format::{
             self,
             footer::{
-                BodyPlan, EncodedBody, HELD_GROUP_BYTES, ParquetLayout, PlannedBodyEncoder,
-                RangeStream, decoded_bytes, encode_parquet_body_planned, extract_kv_map,
-                splice_carried_body_to, splice_index_streams_to,
+                BodyPlan, EncodedBody, FooterError, HELD_GROUP_BYTES, ParquetLayout,
+                PassBodyEncoder, PassWriter, PlannedBodyEncoder, RangeStream, decoded_bytes,
+                encode_parquet_body_planned, extract_kv_map, splice_carried_body_to,
+                splice_index_streams_to,
             },
             kv,
         },
@@ -125,6 +127,7 @@ use crate::{
         id_space::{FtsDocId, RowId, StableId},
         ids::{self, PackedIdEncoder, PackedIdOutput},
         range::{self, KeyKind, RangeColumnSpec},
+        reader::{KeptRead, KeptRows},
         stats::SuperfileStats,
         vector::{
             builder::{
@@ -176,10 +179,10 @@ const DECODE_BATCH_BYTES: u64 = 16 * 1024 * 1024;
 /// reader's default batch size.
 const READ_BATCH_ROWS: u64 = 1024;
 
-/// The bounds on what a merge holds decoded: [`DECODE_BATCH_BYTES`],
-/// [`DECODED_AHEAD_BYTES`] and [`HELD_GROUP_BYTES`], read once when the
-/// merge starts, so a test can narrow them for a merge it can afford to
-/// build.
+/// The bounds on what a merge holds: [`DECODE_BATCH_BYTES`],
+/// [`DECODED_AHEAD_BYTES`], [`HELD_GROUP_BYTES`] and [`PASS_FIELDS`], read
+/// once when the merge starts, so a test can narrow them for a merge it can
+/// afford to build.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DecodeWindow {
     /// What one decoded batch aims to decode to.
@@ -188,6 +191,8 @@ pub(crate) struct DecodeWindow {
     pub(crate) ahead_bytes: u64,
     /// What the rows the body encoder holds may decode to.
     pub(crate) held_group_bytes: usize,
+    /// Most top-level fields written at once: [`PASS_FIELDS`].
+    pub(crate) pass_fields: usize,
 }
 
 impl DecodeWindow {
@@ -201,43 +206,78 @@ impl DecodeWindow {
             batch_bytes: DECODE_BATCH_BYTES,
             ahead_bytes: DECODED_AHEAD_BYTES,
             held_group_bytes: HELD_GROUP_BYTES,
+            pass_fields: PASS_FIELDS,
         }
     }
 
-    /// Rows to decode `reader`'s rows in, for a merge whose output has
-    /// `schema`: as many as [`Self::batch_bytes`] holds at what a row
-    /// decodes to ([`decoded_row_bytes`]), at most [`READ_BATCH_ROWS`] and
-    /// at least one.
-    fn batch_rows(&self, reader: &SuperfileReader, schema: &Schema) -> usize {
-        let row_bytes = decoded_row_bytes(&reader.parquet_metadata(), schema).max(1);
+    /// Rows to decode a file's rows in, for a merge whose output has
+    /// `schema`, the file's columns `columns` of them (all when `None`),
+    /// where `values` is [`value_bytes_per_row`] of the file: as many as
+    /// [`Self::batch_bytes`] holds at what a row decodes to
+    /// ([`decoded_row_bytes`]), at most [`READ_BATCH_ROWS`] and at least one.
+    fn batch_rows(
+        &self,
+        values: &HashMap<String, u64>,
+        schema: &Schema,
+        columns: Option<&HashSet<&str>>,
+    ) -> usize {
+        let row_bytes = decoded_row_bytes(values, schema, columns).max(1);
         usize::try_from((self.batch_bytes / row_bytes).clamp(1, READ_BATCH_ROWS)).unwrap_or(1)
     }
 }
 
-/// About what one row of the file `metadata` describes decodes to in a
-/// merge whose output has `schema`: [`null_row_bytes`], what any row costs
-/// however few columns it fills, plus the file's string and binary values
-/// averaged over its rows. The footer records those values' bytes
-/// unencoded, so a column stored as a dictionary counts what it decodes to,
-/// not the few bits a row it stores; a file written without that record
-/// counts its byte-array chunks' uncompressed bytes instead.
-fn decoded_row_bytes(metadata: &ParquetMetaData, schema: &Schema) -> u64 {
-    let rows = u64::try_from(metadata.file_metadata().num_rows())
-        .unwrap_or(0)
-        .max(1);
-    let values: u64 = metadata
-        .row_groups()
+/// What one row of each top-level column of the file `metadata` describes
+/// holds in variable-length values, at the most over its row groups:
+/// string and binary values, which the footer records unencoded, so a
+/// column stored as a dictionary counts what it decodes to, not the few
+/// bits a row it stores (a file written without that record counts the
+/// chunk's uncompressed bytes); and the fixed-width values of a nested
+/// column, whose count per row the schema does not give. The most a row
+/// group's rows hold rather than the file's average, so a run of large
+/// rows in one row group is not averaged away over the rest.
+fn value_bytes_per_row(metadata: &ParquetMetaData) -> HashMap<String, u64> {
+    let mut most: HashMap<String, u64> = HashMap::new();
+    for row_group in metadata.row_groups() {
+        let rows = u64::try_from(row_group.num_rows()).unwrap_or(0).max(1);
+        let mut group: HashMap<&str, u64> = HashMap::new();
+        for chunk in row_group.columns() {
+            let parts = chunk.column_path().parts();
+            let Some(root) = parts.first() else {
+                continue;
+            };
+            let bytes = match chunk.column_type() {
+                PhysicalType::BYTE_ARRAY => chunk
+                    .unencoded_byte_array_data_bytes()
+                    .unwrap_or_else(|| chunk.uncompressed_size()),
+                _ if parts.len() > 1 => chunk.uncompressed_size(),
+                _ => 0,
+            };
+            *group.entry(root.as_str()).or_default() += u64::try_from(bytes).unwrap_or(0);
+        }
+        for (root, bytes) in group {
+            let per_row = bytes.div_ceil(rows);
+            let entry = most.entry(root.to_string()).or_default();
+            *entry = (*entry).max(per_row);
+        }
+    }
+    most
+}
+
+/// About what one row of a file decodes to in a merge whose output has
+/// `schema`, read with the file's columns `columns` (all when `None`):
+/// [`null_row_bytes`], what any row costs however few columns it fills,
+/// plus those columns' `values` ([`value_bytes_per_row`]).
+fn decoded_row_bytes(
+    values: &HashMap<String, u64>,
+    schema: &Schema,
+    columns: Option<&HashSet<&str>>,
+) -> u64 {
+    let values: u64 = values
         .iter()
-        .flat_map(|row_group| row_group.columns())
-        .filter(|chunk| chunk.column_type() == PhysicalType::BYTE_ARRAY)
-        .map(|chunk| {
-            let bytes = chunk
-                .unencoded_byte_array_data_bytes()
-                .unwrap_or_else(|| chunk.uncompressed_size());
-            u64::try_from(bytes).unwrap_or(0)
-        })
+        .filter(|(root, _)| columns.is_none_or(|columns| columns.contains(root.as_str())))
+        .map(|(_, bytes)| bytes)
         .sum();
-    null_row_bytes(schema).saturating_add(values / rows)
+    null_row_bytes(schema).saturating_add(values)
 }
 
 /// The decoded bytes a merge's batches hold between being decoded and
@@ -317,6 +357,81 @@ impl Drop for CloseOnDrop<'_> {
         self.0.close();
     }
 }
+
+/// Run `decode` on a thread of its own and hand each batch it yields, with
+/// its `stats_of` and how long this thread waited for it, to `consume` on
+/// this one, in the order decoded. The decoder computes the stats beside
+/// the decode and runs ahead of `consume` while the batches it has handed
+/// over and `consume` has not finished hold less than `ahead_bytes`
+/// decoded ([`DecodedBytes`]), and at most [`DECODED_BATCHES_AHEAD`] of
+/// them. The first error, the decoder's or `consume`'s, ends both.
+fn decode_alongside<I>(
+    ahead_bytes: u64,
+    decode: impl FnOnce() -> Result<I, BuildError> + Send,
+    stats_of: impl Fn(&RecordBatch) -> Result<SuperfileStats, BuildError> + Send,
+    mut consume: impl FnMut(RecordBatch, SuperfileStats, Duration) -> Result<(), BuildError>,
+) -> Result<(), BuildError>
+where
+    I: Iterator<Item = Result<RecordBatch, BuildError>>,
+{
+    let in_flight = DecodedBytes::new(ahead_bytes);
+    let (sender, decoded) = sync_channel::<DecodedBatch>(DECODED_BATCHES_AHEAD);
+    thread::scope(|scope| -> Result<(), BuildError> {
+        // Owned here, so a consume that fails drops them on the way out:
+        // the decoder's next send fails, and a decoder waiting for bytes to
+        // come back is woken, instead of the scope waiting on a decoder
+        // that never returns.
+        let decoded = decoded;
+        let _close = CloseOnDrop(&in_flight);
+        let in_flight = &in_flight;
+        scope.spawn(move || {
+            let batches = match decode() {
+                Ok(batches) => batches,
+                Err(e) => {
+                    let _ = sender.send(Err(e));
+                    return;
+                }
+            };
+            for batch in batches {
+                let decoded = batch.and_then(|batch| {
+                    let stats = stats_of(&batch)?;
+                    let bytes = decoded_bytes(&batch) as u64;
+                    Ok((batch, stats, bytes))
+                });
+                if let Ok((_, _, bytes)) = &decoded
+                    && !in_flight.take(*bytes)
+                {
+                    return;
+                }
+                let failed = decoded.is_err();
+                // The receiver is gone once the merge has failed.
+                if sender.send(decoded).is_err() || failed {
+                    return;
+                }
+            }
+        });
+        loop {
+            let start = Instant::now();
+            let Ok(next) = decoded.recv() else {
+                break;
+            };
+            let (batch, stats, bytes) = next?;
+            consume(batch, stats, start.elapsed())?;
+            in_flight.give_back(bytes);
+        }
+        Ok(())
+    })
+}
+
+/// Most top-level fields a merge writes at once. A merge of a table no
+/// wider streams whole rows through its body encoder, which opens a writer
+/// for every column of a row group too large to hold: at most this many.
+/// A wider one writes each row group a run of this many fields at a time
+/// ([`PassBodyEncoder`]), reading only those columns of its inputs, so its
+/// writers are this many whatever the table's width. A writer keeps up to
+/// a page of values, a dictionary of up to a page and a codec's contexts,
+/// a few megabytes at the most.
+pub(crate) const PASS_FIELDS: usize = 64;
 
 /// The most decoded rows a merge holds at once, by bytes: the batches
 /// decoded and not yet encoded, the batch being decoded, and the rows its
@@ -3451,55 +3566,18 @@ impl SuperfileBuilder {
         reanalyze: bool,
         window: DecodeWindow,
     ) -> Result<(), BuildError> {
-        let id_column = self.opts.id_column.clone();
         let mut timings = FtsMergeTimings::default();
         let copy_span =
             detail_span!("merge_copy_rows", read_parquet = 0, write_parquet = 0).entered();
         for input in inputs {
             let opts = self.opts.clone();
-            let batch_rows = window.batch_rows(&input.reader, &opts.schema);
-            let in_flight = DecodedBytes::new(window.ahead_bytes);
-            let (sender, decoded) = sync_channel::<DecodedBatch>(DECODED_BATCHES_AHEAD);
-            thread::scope(|scope| -> Result<(), BuildError> {
-                // Owned here, so an encode that fails drops them on the
-                // way out: the decoder's next send fails, and a decoder
-                // waiting for bytes to come back is woken, instead of the
-                // scope waiting on a decoder that never returns.
-                let decoded = decoded;
-                let _close = CloseOnDrop(&in_flight);
-                let in_flight = &in_flight;
-                scope.spawn(move || {
-                    let batches = match input.batches_of(&opts, batch_rows) {
-                        Ok(batches) => batches,
-                        Err(e) => {
-                            let _ = sender.send(Err(e));
-                            return;
-                        }
-                    };
-                    for batch in batches {
-                        let decoded = batch.and_then(|batch| {
-                            let stats = SuperfileStats::try_compute_from_record_batch(&batch)?;
-                            let bytes = decoded_bytes(&batch) as u64;
-                            Ok((batch, stats, bytes))
-                        });
-                        if let Ok((_, _, bytes)) = &decoded
-                            && !in_flight.take(*bytes)
-                        {
-                            return;
-                        }
-                        let failed = decoded.is_err();
-                        // The receiver is gone once the merge has failed.
-                        if sender.send(decoded).is_err() || failed {
-                            return;
-                        }
-                    }
-                });
-                loop {
-                    let start = std::time::Instant::now();
-                    let Ok(next) = decoded.recv() else {
-                        break;
-                    };
-                    let (record_batch, batch_stats, bytes) = next?;
+            let values = value_bytes_per_row(&input.reader.parquet_metadata());
+            let batch_rows = window.batch_rows(&values, &opts.schema, None);
+            decode_alongside(
+                window.ahead_bytes,
+                || input.batches_of(&opts, batch_rows),
+                SuperfileStats::try_compute_from_record_batch,
+                |record_batch, batch_stats, waited| {
                     #[cfg(test)]
                     if tests::encode_fault() {
                         return Err(BuildError::Io(Error::other(
@@ -3507,32 +3585,232 @@ impl SuperfileBuilder {
                         )));
                     }
                     // Time spent waiting on the decoder, not decoding.
-                    timings.read_parquet += start.elapsed();
+                    timings.read_parquet += waited;
                     // Folded as it arrives: a table's width of column
                     // stats per decoded batch, held to the end, is what a
                     // wide table's merge would otherwise accumulate.
                     stats.merge(&batch_stats);
 
-                    let start = std::time::Instant::now();
+                    let start = Instant::now();
                     body_encoder.write_batch(&record_batch)?;
                     timings.write_parquet += start.elapsed();
 
-                    push_stable_ids(id_sidecar, &record_batch, &id_column)?;
+                    push_stable_ids(id_sidecar, &record_batch, &self.opts.id_column)?;
 
                     let rows = record_batch.num_rows() as u32;
                     if reanalyze {
                         self.index_fts_batch(&record_batch, rows)?;
                     }
                     self.next_local_doc_id += rows;
-                    drop(record_batch);
-                    in_flight.give_back(bytes);
-                }
-                Ok(())
-            })?;
+                    Ok(())
+                },
+            )?;
         }
         copy_span.record("read_parquet", timings.read_parquet.as_millis());
         copy_span.record("write_parquet", timings.write_parquet.as_millis());
         Ok(())
+    }
+
+    /// [`Self::copy_input_bodies`] for a body wider than [`PASS_FIELDS`]:
+    /// each output row group is written [`PASS_FIELDS`] fields at a time
+    /// ([`PassBodyEncoder`]), every pass reading only its columns of the
+    /// inputs' rows the group holds. The row groups keep their row count
+    /// and the rows their order, the rows of the inputs in input order less
+    /// their deleted ones; what is decoded at once is one pass's columns of
+    /// a few rows, and what is open at once is one pass's writers, however
+    /// wide the table and however large its rows.
+    fn copy_in_passes(
+        &mut self,
+        inputs: &[MergeInput],
+        body: &mut PassBodyEncoder,
+        id_sidecar: &mut Option<PackedIdEncoder<BufWriter<NamedTempFile>>>,
+        stats: &mut SuperfileStats,
+        reanalyze: bool,
+        window: DecodeWindow,
+    ) -> Result<(), BuildError> {
+        let fields = self.parquet_schema.fields().len();
+        let width = window.pass_fields.max(1);
+        let passes: Vec<Range<usize>> = (0..fields)
+            .step_by(width)
+            .map(|start| start..(start + width).min(fields))
+            .collect();
+        let kept: Vec<KeptRows> = inputs
+            .iter()
+            .map(|input| {
+                let rows = input.reader.parquet_metadata().file_metadata().num_rows();
+                KeptRows::new(u64::try_from(rows).unwrap_or(0), input.deleted.as_deref())
+            })
+            .collect();
+        // Where each input's kept rows start among the output's.
+        let starts: Vec<u64> = kept
+            .iter()
+            .scan(0, |at, kept| {
+                let start = *at;
+                *at += kept.len();
+                Some(start)
+            })
+            .collect();
+        let total: u64 = kept.iter().map(KeptRows::len).sum();
+        let group_rows = self.opts.row_group_size.max(1) as u64;
+        // Every input's shape is checked, as the row-by-row copy checks it,
+        // even one none of whose rows survives to be read.
+        for input in inputs {
+            check_id_column(&input.reader, &self.opts)?;
+            let file = input
+                .reader
+                .arrow_metadata(false)
+                .map_err(|_| BuildError::BatchReadError)?;
+            adapt_batch(
+                RecordBatch::new_empty(Arc::clone(file.schema())),
+                input.adapter.as_ref(),
+                &self.opts.schema,
+            )?;
+        }
+        let mut timings = FtsMergeTimings::default();
+        let copy_span =
+            detail_span!("merge_copy_rows", read_parquet = 0, write_parquet = 0).entered();
+        let mut open: Vec<Option<PassInput>> = (0..inputs.len()).map(|_| None).collect();
+        let mut group_start = 0;
+        while group_start < total {
+            let group_end = (group_start + group_rows).min(total);
+            // Each input holding rows of the group, and which of its kept
+            // rows those are.
+            let segments: Vec<(usize, Range<u64>)> = (0..inputs.len())
+                .filter_map(|i| {
+                    let (start, end) = (starts[i], starts[i] + kept[i].len());
+                    (start < group_end && end > group_start).then(|| {
+                        (
+                            i,
+                            group_start.max(start) - start..group_end.min(end) - start,
+                        )
+                    })
+                })
+                .collect();
+            for (i, survivors) in &segments {
+                if open[*i].is_none() {
+                    // An input read whole within the group reads its rows
+                    // from the first; one whose rows run past the group's
+                    // edge is read once per group it reaches, each read
+                    // seeking past the rows before it, and takes the offset
+                    // index to skip their pages rather than decode them.
+                    let whole = *survivors == (0..kept[*i].len());
+                    let metadata = inputs[*i]
+                        .reader
+                        .arrow_metadata(!whole)
+                        .map_err(|_| BuildError::BatchReadError)?;
+                    let values = value_bytes_per_row(metadata.metadata());
+                    open[*i] = Some(PassInput { metadata, values });
+                }
+            }
+            // Each segment's read, built once for every pass over it.
+            let reads: Vec<KeptRead> = segments
+                .iter()
+                .map(|(i, survivors)| {
+                    let input = open[*i].as_ref().ok_or(BuildError::BatchReadError)?;
+                    kept[*i]
+                        .read(input.metadata.metadata(), survivors.clone())
+                        .ok_or(BuildError::BatchReadError)
+                })
+                .collect::<Result<_, _>>()?;
+            let first_doc = self.next_local_doc_id;
+            body.write_row_group(&passes, |pass, writer| {
+                self.copy_pass(
+                    PassSource {
+                        inputs,
+                        segments: &segments,
+                        reads: &reads,
+                        open: &open,
+                        window,
+                    },
+                    pass,
+                    writer,
+                    first_doc,
+                    id_sidecar,
+                    stats,
+                    reanalyze,
+                    &mut timings,
+                )
+            })?;
+            for &(i, _) in &segments {
+                if starts[i] + kept[i].len() <= group_end {
+                    open[i] = None;
+                }
+            }
+            group_start = group_end;
+        }
+        copy_span.record("read_parquet", timings.read_parquet.as_millis());
+        copy_span.record("write_parquet", timings.write_parquet.as_millis());
+        Ok(())
+    }
+
+    /// Write one pass of a row group: the fields `pass` of the rows
+    /// `source` names, decoded on a thread of their own while `writer`
+    /// writes the last ([`decode_alongside`]). The pass holding the id
+    /// column counts the rows and feeds the stable-id sidecar; a
+    /// re-analyzed merge indexes the full-text columns the pass holds under
+    /// the doc ids from `first_doc` on.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one pass's share of the merge's running state"
+    )]
+    fn copy_pass(
+        &mut self,
+        source: PassSource<'_>,
+        pass: Range<usize>,
+        writer: &mut PassWriter<'_>,
+        first_doc: u32,
+        id_sidecar: &mut Option<PackedIdEncoder<BufWriter<NamedTempFile>>>,
+        stats: &mut SuperfileStats,
+        reanalyze: bool,
+        timings: &mut FtsMergeTimings,
+    ) -> Result<(), BuildError> {
+        let pass_schema = Arc::new(
+            self.parquet_schema
+                .project(&pass.clone().collect::<Vec<_>>())
+                .map_err(|e| BuildError::Footer(e.into()))?,
+        );
+        // The id column is the body's first field (see `merge_rows_to`).
+        let holds_ids = pass.start == 0;
+        // Where each full-text column is in this pass's batches, if here.
+        let fts_here: Vec<Option<usize>> = self
+            .fts_col_idxs
+            .iter()
+            .map(|idx| idx.filter(|i| pass.contains(i)).map(|i| i - pass.start))
+            .collect();
+        let index_fts = reanalyze && fts_here.iter().any(Option::is_some);
+        let Self {
+            fts_builder,
+            next_local_doc_id,
+            opts,
+            ..
+        } = self;
+        let mut doc = first_doc;
+        let decoded_schema = Arc::clone(&pass_schema);
+        decode_alongside(
+            source.window.ahead_bytes,
+            move || Ok(source.batches(decoded_schema)),
+            move |batch| match holds_ids {
+                true => SuperfileStats::try_compute_from_record_batch(batch),
+                false => Ok(SuperfileStats::of_columns(batch)),
+            },
+            |batch, batch_stats, waited| {
+                timings.read_parquet += waited;
+                stats.merge(&batch_stats);
+                let start = Instant::now();
+                writer.write(&batch)?;
+                timings.write_parquet += start.elapsed();
+                let rows = batch.num_rows() as u32;
+                if holds_ids {
+                    push_stable_ids(id_sidecar, &batch, &opts.id_column)?;
+                    *next_local_doc_id += rows;
+                }
+                if index_fts && let Some(fb) = fts_builder.as_mut() {
+                    index_fts_rows(fb, &fts_here, &batch, doc)?;
+                }
+                doc += rows;
+                Ok(())
+            },
+        )
     }
 
     fn merge_rows_to<W: Write>(
@@ -3549,12 +3827,32 @@ impl SuperfileBuilder {
         // the multi-cell path supplies preordered batches and retains them until
         // they are written.
         let window = DecodeWindow::current();
-        let mut body_encoder = PlannedBodyEncoder::new(
-            &superfile_builder.parquet_schema,
-            superfile_builder
-                .opts
-                .body_plan(&superfile_builder.parquet_schema),
-        );
+        let plan = superfile_builder
+            .opts
+            .body_plan(&superfile_builder.parquet_schema);
+        let mut body_encoder = match &ordered {
+            None if superfile_builder.parquet_schema.fields().len() > window.pass_fields
+                && superfile_builder.parquet_projection.is_none()
+                && superfile_builder
+                    .parquet_schema
+                    .index_of(&superfile_builder.opts.id_column)
+                    .is_ok_and(|id| id == 0) =>
+            {
+                MergeBody::Passes(PassBodyEncoder::new(
+                    &superfile_builder.parquet_schema,
+                    plan,
+                )?)
+            }
+            None => MergeBody::Rows(PlannedBodyEncoder::new(
+                &superfile_builder.parquet_schema,
+                plan,
+            )),
+            // The preordered batches are held until the merge ends.
+            Some(_) => MergeBody::Rows(
+                PlannedBodyEncoder::new(&superfile_builder.parquet_schema, plan)
+                    .with_rows_held_by_caller(),
+            ),
+        };
 
         let (ordered_batches, mut stats) = match ordered {
             Some((batches, stats)) => (Some(batches), SuperfileStats::from_children(&stats)),
@@ -3635,16 +3933,24 @@ impl SuperfileBuilder {
                 ),
                 false => Ok(None),
             },
-            || match ordered_batches.is_none() {
-                true => superfile_builder.copy_input_bodies(
+            || match (&mut body_encoder, ordered_batches.is_none()) {
+                (_, false) => Ok(()),
+                (MergeBody::Rows(body), true) => superfile_builder.copy_input_bodies(
                     inputs,
-                    &mut body_encoder,
+                    body,
                     &mut id_sidecar,
                     &mut stats,
                     reanalyze,
                     window,
                 ),
-                false => Ok(()),
+                (MergeBody::Passes(body), true) => superfile_builder.copy_in_passes(
+                    inputs,
+                    body,
+                    &mut id_sidecar,
+                    &mut stats,
+                    reanalyze,
+                    window,
+                ),
             },
         );
         let order = order?;
@@ -4836,6 +5142,133 @@ pub(crate) fn merge_builder_opts(
     Ok(opts)
 }
 
+/// How a merge writes its body: whole rows through a [`PlannedBodyEncoder`],
+/// or, for a body wider than [`PASS_FIELDS`], a pass of fields at a time
+/// through a [`PassBodyEncoder`].
+enum MergeBody {
+    Rows(PlannedBodyEncoder),
+    Passes(PassBodyEncoder),
+}
+
+impl MergeBody {
+    /// Write `batch`, whole rows of the body; only a body written by rows
+    /// takes them.
+    fn write_batch(&mut self, batch: &RecordBatch) -> Result<(), BuildError> {
+        match self {
+            MergeBody::Rows(body) => Ok(body.write_batch(batch)?),
+            MergeBody::Passes(_) => Err(BuildError::Footer(FooterError::Malformed(
+                "a body written by passes takes no whole rows",
+            ))),
+        }
+    }
+
+    fn finish(self) -> Result<EncodedBody, BuildError> {
+        Ok(match self {
+            MergeBody::Rows(body) => body.finish()?,
+            MergeBody::Passes(body) => body.finish()?,
+        })
+    }
+}
+
+/// What a pass-written merge keeps of an input from the first row group
+/// holding its rows to the last: the footer it reads it through, and what a
+/// row of each of its columns holds ([`value_bytes_per_row`]).
+struct PassInput {
+    metadata: ArrowReaderMetadata,
+    values: HashMap<String, u64>,
+}
+
+/// The rows one row group of a pass-written merge reads: the inputs, each
+/// input holding rows of the group and which of its kept rows those are,
+/// each such segment's read, the inputs being read, and the decode window.
+#[derive(Clone, Copy)]
+struct PassSource<'a> {
+    inputs: &'a [MergeInput],
+    segments: &'a [(usize, Range<u64>)],
+    reads: &'a [KeptRead],
+    open: &'a [Option<PassInput>],
+    window: DecodeWindow,
+}
+
+/// A merge's decoded batches, one at a time.
+type DecodedBatches<'a> = Box<dyn Iterator<Item = Result<RecordBatch, BuildError>> + Send + 'a>;
+
+impl<'a> PassSource<'a> {
+    /// The group's rows, the fields of `schema` of them, in output order,
+    /// each input's reshaped to `schema` as [`adapted_batches`] reshapes it.
+    fn batches(self, schema: Arc<Schema>) -> DecodedBatches<'a> {
+        Box::new(self.segments.iter().zip(self.reads).flat_map(
+            move |((i, survivors), read)| -> DecodedBatches<'a> {
+                match self.segment(*i, survivors.clone(), read, Arc::clone(&schema)) {
+                    Ok(batches) => batches,
+                    Err(e) => Box::new(iter::once(Err(e))),
+                }
+            },
+        ))
+    }
+
+    /// Input `i`'s kept rows `survivors`, read by `read`, the fields of
+    /// `schema` of them.
+    fn segment(
+        self,
+        i: usize,
+        survivors: Range<u64>,
+        read: &'a KeptRead,
+        schema: Arc<Schema>,
+    ) -> Result<DecodedBatches<'a>, BuildError> {
+        let input = &self.inputs[i];
+        let open = self.open[i].as_ref().ok_or(BuildError::BatchReadError)?;
+        let metadata = &open.metadata;
+        let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        let stored: Vec<&str> = match &input.adapter {
+            Some(map) => map.stored_names(&names),
+            None => names,
+        };
+        let file_schema = metadata.schema();
+        let columns: Vec<usize> = stored
+            .iter()
+            .filter_map(|name| file_schema.index_of(name).ok())
+            .collect();
+        let read_names: HashSet<&str> = stored.iter().copied().collect();
+        let batch_rows = self
+            .window
+            .batch_rows(&open.values, &schema, Some(&read_names));
+        let adapter = input.adapter.as_ref();
+        let reshape = move |batch: RecordBatch| -> Result<RecordBatch, BuildError> {
+            let batch = match adapter {
+                Some(_) => batch,
+                None => project_to(&batch, &schema)?,
+            };
+            let batch = adapt_batch(batch, adapter, &schema)?;
+            share_null_columns(batch).map_err(|e| BuildError::Footer(e.into()))
+        };
+        if columns.is_empty() {
+            // The file stores none of the pass's columns: its rows read as
+            // nulls, counted without a read.
+            let rows = survivors.end - survivors.start;
+            let step = batch_rows as u64;
+            return Ok(Box::new((0..rows).step_by(batch_rows).map(move |at| {
+                let options = RecordBatchOptions::new()
+                    .with_row_count(Some(usize::try_from(step.min(rows - at)).unwrap_or(0)));
+                let empty = RecordBatch::try_new_with_options(
+                    Arc::new(Schema::empty()),
+                    Vec::new(),
+                    &options,
+                )
+                .map_err(|e| BuildError::Footer(e.into()))?;
+                reshape(empty)
+            })));
+        }
+        let batches = input
+            .reader
+            .kept_record_batches(metadata, read, &columns, batch_rows)
+            .map_err(|_| BuildError::BatchReadError)?;
+        Ok(Box::new(batches.map(move |batch| {
+            reshape(batch.map_err(|_| BuildError::BatchReadError)?)
+        })))
+    }
+}
+
 /// One input to a merge: the file, the rows left out of the output, and
 /// how the file's columns line up with the output's.
 pub struct MergeInput {
@@ -5264,6 +5697,7 @@ mod tests {
         f()
     }
 
+    use arrow::compute::concat_batches;
     use arrow_array::{Decimal128Array, Int64Array, LargeStringArray, StringArray, UInt64Array};
     use arrow_schema::Field;
     use bytes::Bytes;
@@ -7756,25 +8190,37 @@ mod tests {
         assert!(failed, "the encode's error comes back");
     }
 
-    /// Random merges checked by [`a_merge_in_a_narrow_window_writes_what_a_wide_one_writes`].
-    const WINDOW_CASES: u64 = 24;
+    /// Random merges checked by
+    /// [`a_merge_in_a_narrow_window_writes_what_a_wide_one_writes`].
+    const WINDOW_CASES: u64 = 32;
     /// Most inputs, and most documents per input, in one of those merges.
     const WINDOW_MAX_INPUTS: usize = 4;
     const WINDOW_MAX_DOCS: u32 = 300;
     /// Upper bounds on the narrowed window's batch, in-flight and held
     /// bytes: a few rows of the fixture each, so every merge decodes in
-    /// many batches, waits on the bytes in flight, and cuts its row groups.
+    /// many batches and waits on the bytes in flight.
     const WINDOW_MAX_BATCH_BYTES: u64 = 4_096;
     const WINDOW_MAX_AHEAD_BYTES: u64 = 8_192;
     const WINDOW_MAX_HELD_BYTES: usize = 16_384;
+    /// Most fields the narrowed window writes at once: up to the fixture's
+    /// three, so a merge goes one, two, or all of them at a time.
+    const WINDOW_MAX_PASS_FIELDS: usize = 3;
+    /// Row-group sizes the merges are written at: small, so a merge writes
+    /// many row groups and an input's rows land in several.
+    const WINDOW_ROW_GROUP_ROWS: [usize; 3] = [16, 97, 256];
 
     /// The merged superfile of `inputs`, written term by term under the
-    /// decode window this thread is in, and its stats.
+    /// decode window this thread is in with `row_group_size` rows a row
+    /// group, from `base` or the first input's options, and its stats.
     fn fts_merge(
         inputs: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
+        base: Option<BuilderOptions>,
+        row_group_size: usize,
     ) -> (Vec<u8>, SuperfileStats) {
         let merge_inputs = same_shape_inputs(inputs);
-        let base = BuilderOptions::new_from_reader(&merge_inputs[0].reader);
+        let mut base =
+            base.unwrap_or_else(|| BuilderOptions::new_from_reader(&merge_inputs[0].reader));
+        base.row_group_size = row_group_size;
         let mut out = Vec::new();
         let stats = SuperfileBuilder::fts_merge_to(
             &merge_inputs,
@@ -7795,12 +8241,59 @@ mod tests {
             .expect("resolve ids through the sidecar")
     }
 
-    /// A merge held to a window of a few rows, decoding in many small
-    /// batches, waiting on the bytes in flight and cutting its row groups by
-    /// bytes, writes what a merge under the default window writes: the same
+    /// The rows of each of `reader`'s row groups.
+    fn group_rows(reader: &SuperfileReader) -> Vec<i64> {
+        reader
+            .parquet_metadata()
+            .row_groups()
+            .iter()
+            .map(|rg| rg.num_rows())
+            .collect()
+    }
+
+    /// `narrow` and `wide`, two merges of the same inputs, hold the same
     /// rows in the same order, the same stats, the same full-text index and
-    /// the same stable ids; and the rows a re-index of the same inputs
-    /// writes. Over random inputs, deletes and windows.
+    /// the same stable ids, in row groups of the same rows.
+    fn assert_same_merge(
+        (narrow, narrow_stats): (Vec<u8>, SuperfileStats),
+        (wide, wide_stats): (Vec<u8>, SuperfileStats),
+        label: &str,
+    ) -> Option<SuperfileReader> {
+        assert_eq!(narrow_stats.n_docs, wide_stats.n_docs, "{label}");
+        assert_eq!(narrow_stats.id_min, wide_stats.id_min, "{label}");
+        assert_eq!(narrow_stats.id_max, wide_stats.id_max, "{label}");
+        assert_eq!(
+            narrow_stats.scalar_stats, wide_stats.scalar_stats,
+            "{label}"
+        );
+        if wide_stats.n_docs == 0 {
+            assert!(narrow.is_empty() && wide.is_empty(), "{label}");
+            return None;
+        }
+        let narrow = SuperfileReader::open(Bytes::from(narrow)).expect("open narrow");
+        let wide = SuperfileReader::open(Bytes::from(wide)).expect("open wide");
+        assert_eq!(
+            narrow.get_record_batch(None).expect("narrow rows"),
+            wide.get_record_batch(None).expect("wide rows"),
+            "{label}"
+        );
+        assert_eq!(group_rows(&narrow), group_rows(&wide), "{label}");
+        assert_eq!(
+            collect_fts_content(&narrow),
+            collect_fts_content(&wide),
+            "{label}"
+        );
+        assert_eq!(sidecar_ids(&narrow), sidecar_ids(&wide), "{label}");
+        Some(narrow)
+    }
+
+    /// A merge held to a window of a few rows, decoding in many small
+    /// batches, waiting on the bytes in flight and writing its row groups a
+    /// field or two at a time, writes what a merge under the default window
+    /// writes: the same rows in the same order and the same row groups, the
+    /// same stats, the same full-text index and the same stable ids; and
+    /// the rows a re-index of the same inputs writes. Over random inputs,
+    /// deletes, windows and row-group sizes.
     #[test]
     fn a_merge_in_a_narrow_window_writes_what_a_wide_one_writes() {
         for case in 0..WINDOW_CASES {
@@ -7822,50 +8315,73 @@ mod tests {
                 batch_bytes: rng.random_range(1..=WINDOW_MAX_BATCH_BYTES),
                 ahead_bytes: rng.random_range(1..=WINDOW_MAX_AHEAD_BYTES),
                 held_group_bytes: rng.random_range(1..=WINDOW_MAX_HELD_BYTES),
+                pass_fields: rng.random_range(1..=WINDOW_MAX_PASS_FIELDS),
             };
+            let group = WINDOW_ROW_GROUP_ROWS[rng.random_range(0..WINDOW_ROW_GROUP_ROWS.len())];
             let inputs = merge_inputs_of_sizes(&sizes, positions, &delete_refs, sorted_merge_docs);
-            let label = format!("case {case}: sizes {sizes:?}, window {window:?}");
+            let label =
+                format!("case {case}: sizes {sizes:?}, window {window:?}, groups of {group}");
 
-            let (narrow, narrow_stats) = with_decode_window(window, || fts_merge(&inputs));
-            let (wide, wide_stats) = fts_merge(&inputs);
-            assert_eq!(narrow_stats.n_docs, wide_stats.n_docs, "{label}");
-            assert_eq!(narrow_stats.id_min, wide_stats.id_min, "{label}");
-            assert_eq!(narrow_stats.id_max, wide_stats.id_max, "{label}");
-            assert_eq!(
-                narrow_stats.scalar_stats, wide_stats.scalar_stats,
-                "{label}"
-            );
-            if wide_stats.n_docs == 0 {
-                assert!(narrow.is_empty() && wide.is_empty(), "{label}");
+            let narrow = with_decode_window(window, || fts_merge(&inputs, None, group));
+            let wide = fts_merge(&inputs, None, group);
+            let Some(narrow) = assert_same_merge(narrow, wide, &label) else {
                 continue;
-            }
-            let narrow = SuperfileReader::open(Bytes::from(narrow)).expect("open narrow");
-            let wide = SuperfileReader::open(Bytes::from(wide)).expect("open wide");
+            };
             let (reindex, _) = SuperfileBuilder::build_from_readers(&inputs).expect("re-index");
             let reindex = SuperfileReader::open(Bytes::from(reindex)).expect("open re-index");
-
-            let rows = narrow.get_record_batch(None).expect("narrow rows");
             assert_eq!(
-                rows,
-                wide.get_record_batch(None).expect("wide rows"),
-                "{label}"
-            );
-            assert_eq!(
-                rows,
+                narrow.get_record_batch(None).expect("narrow rows"),
                 reindex.get_record_batch(None).expect("re-index rows"),
                 "{label}"
             );
-            assert_eq!(
-                collect_fts_content(&narrow),
-                collect_fts_content(&wide),
-                "{label}"
+            let survivors: i64 = group_rows(&narrow).iter().sum();
+            let groups = group_rows(&narrow);
+            assert!(
+                groups[..groups.len() - 1]
+                    .iter()
+                    .all(|&rows| rows == group as i64),
+                "{label}: every row group but the last is full: {groups:?}"
             );
-            assert_eq!(sidecar_ids(&narrow), sidecar_ids(&wide), "{label}");
-            assert_eq!(
-                narrow.parquet_metadata().num_row_groups(),
-                wide.parquet_metadata().num_row_groups(),
-                "{label}: the window does not move the row groups"
-            );
+            assert_eq!(survivors, narrow.n_docs() as i64, "{label}");
+        }
+    }
+
+    /// A merge that re-analyzes its inputs' text, because one was written
+    /// before a column's index was added, indexes the same terms under the
+    /// same documents when it writes its body a field at a time: the full
+    /// text columns' passes index them as they go by.
+    #[test]
+    fn a_merge_written_a_field_at_a_time_re_analyzes_its_inputs_text_the_same() {
+        let schema = schema_with_fts();
+        let title_only = BuilderOptions::new(
+            Arc::clone(&schema),
+            "doc_id",
+            vec![FtsConfig::new("title")],
+            vec![],
+        );
+        let both = sorted_merge_opts(false);
+        let first = merge_input(&title_only, 0, &sorted_merge_docs(0, 0, 150));
+        let second = merge_input(&both, 150, &sorted_merge_docs(1, 150, 200));
+        let inputs = vec![
+            (first, tombstones(&[3, 7, 40])),
+            (second, tombstones(&[0, 199])),
+        ];
+        let base = BuilderOptions::new_from_reader(&inputs[1].0);
+        assert_eq!(
+            base.fts_carry_of(&inputs[0].0).expect("carry"),
+            FtsCarry::Reanalyze,
+            "the first input indexes another column set"
+        );
+        for pass_fields in 1..=WINDOW_MAX_PASS_FIELDS {
+            let window = DecodeWindow {
+                pass_fields,
+                ..DecodeWindow::current()
+            };
+            let narrow = with_decode_window(window, || {
+                fts_merge(&inputs, Some(base.clone()), WINDOW_ROW_GROUP_ROWS[1])
+            });
+            let wide = fts_merge(&inputs, Some(base.clone()), WINDOW_ROW_GROUP_ROWS[1]);
+            assert_same_merge(narrow, wide, &format!("{pass_fields} fields at a time"));
         }
     }
 
@@ -7887,7 +8403,8 @@ mod tests {
             })
             .collect();
         let reader = merge_input(&opts, 0, &docs);
-        let row_bytes = decoded_row_bytes(&reader.parquet_metadata(), &opts.schema);
+        let values = value_bytes_per_row(&reader.parquet_metadata());
+        let row_bytes = decoded_row_bytes(&values, &opts.schema, None);
         assert!(
             row_bytes >= VALUE_BYTES as u64,
             "a row decodes to its value, {row_bytes} bytes counted"
@@ -7901,16 +8418,80 @@ mod tests {
             batch_bytes,
             ..DecodeWindow::current()
         };
-        let rows = window(16 * row_bytes).batch_rows(&reader, &opts.schema);
+        let rows = window(16 * row_bytes).batch_rows(&values, &opts.schema, None);
         assert!(
             (8..=16).contains(&rows),
             "about sixteen rows a batch: {rows}"
         );
-        assert_eq!(window(1).batch_rows(&reader, &opts.schema), 1);
+        assert_eq!(window(1).batch_rows(&values, &opts.schema, None), 1);
         assert_eq!(
-            window(u64::MAX).batch_rows(&reader, &opts.schema),
+            window(u64::MAX).batch_rows(&values, &opts.schema, None),
             READ_BATCH_ROWS as usize
         );
+        // Read without the title, a row decodes to far less, and a batch
+        // holds more of them.
+        let body_only: HashSet<&str> = ["doc_id", "body"].into_iter().collect();
+        assert!(
+            window(16 * row_bytes).batch_rows(&values, &opts.schema, Some(&body_only)) > rows,
+            "a batch of fewer columns holds more rows"
+        );
+    }
+
+    /// The rows of one superfile read back by kept row, some of its columns
+    /// at a time, are the rows a whole read less its deleted ones holds:
+    /// over row groups, deletes, ranges and columns, the reads seeking into
+    /// the row groups that hold the range through the page index.
+    #[test]
+    fn kept_rows_read_back_what_a_whole_read_holds() {
+        const ROWS: u32 = 300;
+        const GROUP_ROWS: usize = 37;
+        const BATCH_ROWS: usize = 16;
+        const CASES: u64 = 12;
+        const RANGES: usize = 6;
+        let mut opts = sorted_merge_opts(false);
+        opts.row_group_size = GROUP_ROWS;
+        let reader = merge_input(&opts, 0, &sorted_merge_docs(0, 0, ROWS));
+        assert!(reader.parquet_metadata().num_row_groups() > 1);
+        let metadata = reader.arrow_metadata(true).expect("indexed metadata");
+        assert!(
+            metadata.metadata().offset_index().is_some(),
+            "the page index is loaded"
+        );
+        for case in 0..CASES {
+            let mut rng = StdRng::seed_from_u64(case);
+            let share = rng.random_range(0.0..0.7);
+            let deleted: RoaringBitmap = (0..ROWS).filter(|_| rng.random_bool(share)).collect();
+            let deleted = Arc::new(deleted);
+            let kept = KeptRows::new(u64::from(ROWS), Some(&deleted));
+            let whole = reader
+                .get_record_batch(Some(Arc::clone(&deleted)))
+                .expect("whole read");
+            assert_eq!(kept.len(), whole.num_rows() as u64);
+            for _ in 0..RANGES {
+                let len = whole.num_rows();
+                let start = rng.random_range(0..len.max(1));
+                let end = rng.random_range(start..=len);
+                if start == end {
+                    continue;
+                }
+                let read = kept
+                    .read(metadata.metadata(), start as u64..end as u64)
+                    .expect("kept rows to read");
+                for columns in [vec![0], vec![2], vec![0, 1, 2], vec![1, 2]] {
+                    let batches: Vec<RecordBatch> = reader
+                        .kept_record_batches(&metadata, &read, &columns, BATCH_ROWS)
+                        .expect("kept read")
+                        .collect::<Result<_, _>>()
+                        .expect("decode");
+                    let want = whole
+                        .slice(start, end - start)
+                        .project(&columns)
+                        .expect("project");
+                    let got = concat_batches(&want.schema(), &batches).expect("concat");
+                    assert_eq!(got, want, "case {case}: rows {start}..{end} of {columns:?}");
+                }
+            }
+        }
     }
 
     /// The decoder takes a batch's bytes before it hands the batch over and

@@ -558,6 +558,131 @@ fn page_index_from_bytes(
     ))
 }
 
+/// The rows of a file a merge keeps, every row but its deleted ones, as
+/// runs of consecutive file rows: what numbers the kept rows, the merge's
+/// survivors, from 0, and maps a run of them back to the file's rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct KeptRows {
+    /// Runs of kept file rows, ascending.
+    runs: Vec<Range<u64>>,
+    /// Kept rows before each run.
+    before: Vec<u64>,
+    /// Kept rows in all.
+    len: u64,
+}
+
+impl KeptRows {
+    /// The rows of a file of `rows` rows but those in `deleted`.
+    pub(crate) fn new(rows: u64, deleted: Option<&RoaringBitmap>) -> Self {
+        let mut runs = Vec::new();
+        let mut at = 0u64;
+        for row in deleted.into_iter().flatten().map(u64::from) {
+            if row >= rows {
+                break;
+            }
+            if row > at {
+                runs.push(at..row);
+            }
+            at = row + 1;
+        }
+        if rows > at {
+            runs.push(at..rows);
+        }
+        let mut before = Vec::with_capacity(runs.len());
+        let mut len = 0;
+        for run in &runs {
+            before.push(len);
+            len += run.end - run.start;
+        }
+        Self { runs, before, len }
+    }
+
+    /// How many rows are kept.
+    pub(crate) fn len(&self) -> u64 {
+        self.len
+    }
+
+    /// The file rows of kept rows `survivors`, as ascending runs.
+    pub(crate) fn file_runs(&self, survivors: Range<u64>) -> Vec<Range<u64>> {
+        let end = survivors.end.min(self.len);
+        if survivors.start >= end {
+            return Vec::new();
+        }
+        // The run holding the first survivor: the last starting at or
+        // before it.
+        let first = self.before.partition_point(|&b| b <= survivors.start) - 1;
+        let mut out = Vec::new();
+        for (run, &before) in self.runs[first..].iter().zip(&self.before[first..]) {
+            if before >= end {
+                break;
+            }
+            let from = run.start + survivors.start.saturating_sub(before);
+            let to = run.start + (end - before).min(run.end - run.start);
+            out.push(from..to);
+        }
+        out
+    }
+}
+
+/// What a read of some of a file's kept rows reads: the row groups holding
+/// them and the selection of those rows within those groups, built once
+/// and shared by every read of the same rows (see
+/// [`SuperfileReader::kept_record_batches`]).
+#[derive(Debug, Clone)]
+pub(crate) struct KeptRead {
+    row_groups: Vec<usize>,
+    selection: RowSelection,
+}
+
+impl KeptRows {
+    /// The read of kept rows `survivors` of the file `metadata` describes,
+    /// or `None` when there are none.
+    pub(crate) fn read(
+        &self,
+        metadata: &ParquetMetaData,
+        survivors: Range<u64>,
+    ) -> Option<KeptRead> {
+        let runs = self.file_runs(survivors);
+        let (first, last) = (runs.first()?.start, runs.last()?.end);
+        // The row groups holding rows `first..last`, and the file row the
+        // first of them starts at.
+        let mut row_groups = Vec::new();
+        let mut base = None;
+        let mut end = 0u64;
+        let mut start = 0u64;
+        for (index, group) in metadata.row_groups().iter().enumerate() {
+            let rows = u64::try_from(group.num_rows()).unwrap_or(0);
+            if start < last && start + rows > first {
+                row_groups.push(index);
+                base.get_or_insert(start);
+                end = start + rows;
+            }
+            start += rows;
+        }
+        let mut at = base.unwrap_or(0);
+        let mut selectors = Vec::with_capacity(2 * runs.len() + 1);
+        for run in &runs {
+            if run.start > at {
+                selectors.push(RowSelector::skip(row_count(run.start - at)));
+            }
+            selectors.push(RowSelector::select(row_count(run.end - run.start)));
+            at = run.end;
+        }
+        if end > at {
+            selectors.push(RowSelector::skip(row_count(end - at)));
+        }
+        Some(KeptRead {
+            row_groups,
+            selection: RowSelection::from(selectors),
+        })
+    }
+}
+
+/// `rows` as the row count a [`RowSelector`] takes.
+fn row_count(rows: u64) -> usize {
+    usize::try_from(rows).unwrap_or(usize::MAX)
+}
+
 /// `parquet` with its Arrow schema resolved as the eager open resolves it
 /// (default options), so a rebuilt [`Footer::Resident`] decodes the file
 /// exactly as the one it replaces did.
@@ -1323,6 +1448,68 @@ impl SuperfileReader {
             }
         }
         builder
+            .build()
+            .map_err(|e| ReadError::Columnar(e.to_string()))
+    }
+
+    /// This reader's Arrow metadata for the synchronous decodes, with the
+    /// offset index they skip whole pages through when `offset_index`: the
+    /// resident footer when it carries what is asked, else one parsed for
+    /// the caller out of the resident bytes and not kept, so a reader
+    /// shared with queries is left as it is. Only the offset index is
+    /// parsed: a row selection skips by page locations, and a wide file's
+    /// column index, every page's bounds, is far larger.
+    pub(crate) fn arrow_metadata(
+        &self,
+        offset_index: bool,
+    ) -> Result<ArrowReaderMetadata, ReadError> {
+        let resident = self.resident_arrow_metadata()?;
+        if !offset_index
+            || self.page_index_loaded.initialized()
+            || resident.metadata().offset_index().is_some()
+        {
+            return Ok(resident);
+        }
+        let bytes = self
+            .bytes
+            .as_ref()
+            .ok_or(ReadError::LazyReaderUnsupported)?;
+        let mut loader =
+            ParquetMetaDataReader::new_with_metadata(resident.metadata().as_ref().clone())
+                .with_column_index_policy(PageIndexPolicy::Skip)
+                .with_offset_index_policy(PageIndexPolicy::Optional);
+        loader
+            .read_page_indexes(bytes)
+            .map_err(footer::FooterError::from)?;
+        resolve_arrow(Arc::new(
+            loader.finish().map_err(footer::FooterError::from)?,
+        ))
+    }
+
+    /// The rows `read` names (see [`KeptRows::read`]), the top-level columns
+    /// `columns` of them in file order, `batch_rows` rows to a batch,
+    /// decoded through `metadata` ([`Self::arrow_metadata`]). Only the row
+    /// groups holding them are read, and within those a footer with the
+    /// offset index skips the pages before and after them.
+    pub(crate) fn kept_record_batches(
+        &self,
+        metadata: &ArrowReaderMetadata,
+        read: &KeptRead,
+        columns: &[usize],
+        batch_rows: usize,
+    ) -> Result<ParquetRecordBatchReader, ReadError> {
+        let bytes = self
+            .bytes
+            .as_ref()
+            .ok_or(ReadError::LazyReaderUnsupported)?;
+        ParquetRecordBatchReaderBuilder::new_with_metadata(bytes.clone(), metadata.clone())
+            .with_row_groups(read.row_groups.clone())
+            .with_row_selection(read.selection.clone())
+            .with_projection(ProjectionMask::roots(
+                metadata.parquet_schema(),
+                columns.iter().copied(),
+            ))
+            .with_batch_size(batch_rows.max(1))
             .build()
             .map_err(|e| ReadError::Columnar(e.to_string()))
     }

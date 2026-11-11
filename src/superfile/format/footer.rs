@@ -27,7 +27,9 @@ use std::{
     collections::HashMap,
     fs::File,
     io::{self, BufReader, Cursor, Read, Seek, SeekFrom, Write},
-    mem, slice,
+    mem,
+    ops::Range,
+    slice,
     sync::Arc,
 };
 
@@ -379,18 +381,7 @@ impl ParquetBodyEncoder {
             plain_columns,
         );
 
-        // Encode to a scratch temp file rather than a `Vec`, so the body —
-        // multi-GB at corpus scale — never materializes whole in RAM. The
-        // writer owns an independent handle to the same file (`reopen`); the
-        // struct's `body_file` handle reads the footer back after close, and
-        // their cursors don't alias.
-        let scratch_root = scratch_root();
-        let body_file = NamedTempFile::new_in(&scratch_root)?;
-        let write_handle = body_file.reopen()?;
-        // Built through `ArrowWriter` so the file starts, and its footer
-        // carries the Arrow schema, exactly as before.
-        let (writer, columns) = ArrowWriter::try_new(write_handle, schema.clone(), Some(props))?
-            .into_serialized_writer()?;
+        let (body_file, writer, columns) = scratch_body(schema, props)?;
         let field_writers = FieldWriters::new(
             writer.schema_descr(),
             schema,
@@ -531,7 +522,8 @@ impl ParquetBodyEncoder {
             for (g, group) in groups.iter().enumerate() {
                 let mut row_group = writer.next_row_group()?;
                 for field in 0..fields {
-                    for chunk in field_writers.encode(field, first_index + g, group)? {
+                    let columns = group.iter().map(|batch| batch.column(field));
+                    for chunk in field_writers.encode(field, first_index + g, columns)? {
                         chunk.append_to_row_group(&mut row_group)?;
                     }
                 }
@@ -544,7 +536,10 @@ impl ParquetBodyEncoder {
             .collect();
         let chunks: Vec<Vec<ArrowColumnChunk>> = tasks
             .par_iter()
-            .map(|&(g, field)| field_writers.encode(field, first_index + g, &groups[g]))
+            .map(|&(g, field)| {
+                let columns = groups[g].iter().map(|batch| batch.column(field));
+                field_writers.encode(field, first_index + g, columns)
+            })
             .collect::<Result<_, _>>()?;
         let n_groups = groups.len();
         drop(groups);
@@ -639,25 +634,38 @@ impl FieldWriters {
         Ok(ArrowRowGroupWriterFactory::new(&file, arrow).create_column_writers(row_group)?)
     }
 
-    /// Column `field` of `batches`, written in order by fresh writers for
-    /// row group `row_group` and closed: the field's column chunks.
-    fn encode(
+    /// `columns`, the values of field `field` in order, written by fresh
+    /// writers for row group `row_group` and closed: the field's column
+    /// chunks.
+    fn encode<'c>(
         &self,
         field: usize,
         row_group: usize,
-        batches: &[RecordBatch],
+        columns: impl IntoIterator<Item = &'c ArrayRef>,
     ) -> Result<Vec<ArrowColumnChunk>, FooterError> {
         let mut writers = self.create(field, row_group)?;
-        for batch in batches {
-            let leaves = compute_leaves(&self.arrow[field], batch.column(field))?;
-            for (writer, leaf) in writers.iter_mut().zip(leaves) {
-                writer.write(&leaf)?;
-            }
+        for column in columns {
+            self.write(field, &mut writers, column)?;
         }
         writers
             .into_iter()
             .map(|writer| writer.close().map_err(FooterError::from))
             .collect()
+    }
+
+    /// Write `column`, values of field `field`, to `writers`, that field's
+    /// open column writers.
+    fn write(
+        &self,
+        field: usize,
+        writers: &mut [ArrowColumnWriter],
+        column: &ArrayRef,
+    ) -> Result<(), FooterError> {
+        let leaves = compute_leaves(&self.arrow[field], column)?;
+        for (writer, leaf) in writers.iter_mut().zip(leaves) {
+            writer.write(&leaf)?;
+        }
+        Ok(())
     }
 }
 
@@ -965,6 +973,23 @@ impl BodyPlan {
         schema: &Arc<Schema>,
         sample: &[RecordBatch],
     ) -> Result<(ColumnSizes, ColumnSizes), FooterError> {
+        let slices = write_slices(sample);
+        let candidates: Vec<(usize, Vec<ArrayRef>)> = self
+            .dictionary_candidates
+            .iter()
+            .filter_map(|name| schema.index_of(name).ok())
+            .map(|field| (field, sample_columns(&slices, field)))
+            .collect();
+        let (with, without) = self.field_writers(schema)?;
+        self.measure_columns(schema, &with, &without, &candidates)
+    }
+
+    /// Writers for the fields of `schema` under this plan: every field with
+    /// its dictionary, and every candidate without.
+    fn field_writers(
+        &self,
+        schema: &Arc<Schema>,
+    ) -> Result<(FieldWriters, FieldWriters), FooterError> {
         let limits = self.page_size_limits();
         let props = |plain: &[String]| {
             Arc::new(writer_properties(
@@ -978,34 +1003,63 @@ impl BodyPlan {
         let parquet = ArrowSchemaConverter::new()
             .with_coerce_types(with.coerce_types())
             .convert(schema)?;
-        let (with, without) = (
+        Ok((
             FieldWriters::new(&parquet, schema, with),
             FieldWriters::new(&parquet, schema, without),
-        );
-        let slices: Vec<RecordBatch> = sample
+        ))
+    }
+
+    /// The names of `candidates`, each a field of `schema` and its sample's
+    /// values ([`sample_columns`]), written without a dictionary: those
+    /// [`plain_where_smaller`] picks from their sizes measured by `with`
+    /// and `without`.
+    fn plain_among(
+        &self,
+        schema: &Schema,
+        with: &FieldWriters,
+        without: &FieldWriters,
+        candidates: &[(usize, Vec<ArrayRef>)],
+    ) -> Result<Vec<String>, FooterError> {
+        let names: Vec<String> = candidates
             .iter()
-            .flat_map(|batch| byte_bounded_slices(batch, MAX_WRITE_BYTES))
+            .map(|(field, _)| schema.field(*field).name().clone())
             .collect();
-        let fields: Vec<usize> = self
-            .dictionary_candidates
-            .iter()
-            .filter_map(|name| schema.index_of(name).ok())
-            .collect();
-        let measure = |&field: &usize| -> Result<(usize, u64, u64), FooterError> {
+        let (dictionary, plain) = self.measure_columns(schema, with, without, candidates)?;
+        Ok(plain_where_smaller(&names, &dictionary, &plain))
+    }
+
+    /// Compressed bytes of each of `candidates`, a field of `schema` and its
+    /// sample's values in the slices the writer is handed, encoded by `with`
+    /// (its dictionary) and by `without`.
+    ///
+    /// Each candidate is encoded on its own, once each way, by writers made
+    /// for it alone and dropped as soon as its sizes are read (see
+    /// [`Self::measure`]).
+    fn measure_columns(
+        &self,
+        schema: &Schema,
+        with: &FieldWriters,
+        without: &FieldWriters,
+        candidates: &[(usize, Vec<ArrayRef>)],
+    ) -> Result<(ColumnSizes, ColumnSizes), FooterError> {
+        let measure = |(field, columns): &(usize, Vec<ArrayRef>)| {
             let size = |writers: &FieldWriters| -> Result<u64, FooterError> {
                 Ok(writers
-                    .encode(field, 0, &slices)?
+                    .encode(*field, 0, columns)?
                     .iter()
                     .map(|chunk| {
                         u64::try_from(chunk.close().metadata.compressed_size()).unwrap_or(0)
                     })
                     .sum())
             };
-            Ok((field, size(&with)?, size(&without)?))
+            Ok::<_, FooterError>((*field, size(with)?, size(without)?))
         };
         let sizes: Vec<(usize, u64, u64)> = match self.encode_groups_together {
-            true => fields.par_iter().map(measure).collect::<Result<_, _>>()?,
-            false => fields.iter().map(measure).collect::<Result<_, _>>()?,
+            true => candidates
+                .par_iter()
+                .map(measure)
+                .collect::<Result<_, _>>()?,
+            false => candidates.iter().map(measure).collect::<Result<_, _>>()?,
         };
         let (mut dictionary, mut plain) = (ColumnSizes::new(), ColumnSizes::new());
         for (field, with, without) in sizes {
@@ -1022,6 +1076,11 @@ impl BodyPlan {
             .map(|(c, l)| (c.as_str(), *l))
             .collect()
     }
+}
+
+/// Column `at` of each of `slices`: one field's values in a sample.
+fn sample_columns(slices: &[RecordBatch], at: usize) -> Vec<ArrayRef> {
+    slices.iter().map(|s| Arc::clone(s.column(at))).collect()
 }
 
 /// The `candidates`, sorted, whose plain encoding (`plain`) is smaller than
@@ -1159,6 +1218,289 @@ pub(crate) fn encode_parquet_body_planned(
         encoder.write_batch(batch)?;
     }
     encoder.finish()
+}
+
+/// A body's scratch file and the Parquet writer over it, with the factory
+/// for a whole row group's column writers.
+///
+/// The body is encoded to a scratch temp file rather than a `Vec`, so it —
+/// multi-GB at corpus scale — never materializes whole in RAM. The writer
+/// owns an independent handle to the same file (`reopen`); the returned
+/// file handle reads the footer back after close, and their cursors don't
+/// alias. Built through `ArrowWriter` so the file starts, and its footer
+/// carries the Arrow schema, exactly as an `ArrowWriter`'s does.
+fn scratch_body(
+    schema: &Arc<Schema>,
+    props: WriterProperties,
+) -> Result<
+    (
+        NamedTempFile,
+        SerializedFileWriter<File>,
+        ArrowRowGroupWriterFactory,
+    ),
+    FooterError,
+> {
+    let body_file = NamedTempFile::new_in(scratch_root())?;
+    let write_handle = body_file.reopen()?;
+    let (writer, columns) = ArrowWriter::try_new(write_handle, Arc::clone(schema), Some(props))?
+        .into_serialized_writer()?;
+    Ok((body_file, writer, columns))
+}
+
+/// A Parquet body written a row group at a time, each row group a run of
+/// top-level fields at a time: a pass.
+///
+/// [`ParquetBodyEncoder`] is handed whole rows and holds them, every column,
+/// until a row group's are encoded, or opens a writer for every column of
+/// the body. A body thousands of columns wide whose rows decode to many
+/// times what they store can afford neither: a row group of its rows can
+/// decode to many gigabytes, and its writers, a few hundred kilobytes to a
+/// few megabytes each, to gigabytes more. Here the caller hands a row
+/// group's rows over once per pass, only that pass's columns of them, and
+/// only that pass's writers are open: what the encode holds is the writers
+/// of one pass and the rows the caller hands it at a time, however wide the
+/// body and however large its rows. The row groups keep their row count, so
+/// the body is laid out as one written whole: the same row groups, the
+/// same columns, the same pages but where a write ends.
+///
+/// The dictionaries are chosen as [`PlannedBodyEncoder`] chooses them,
+/// from the first row group: the first rows of each pass's columns, up to
+/// a row group's or [`BodyPlan::held_group_bytes`] of them, are held and
+/// measured with and without each candidate's dictionary before that
+/// pass's writers are made.
+pub(crate) struct PassBodyEncoder {
+    body_file: NamedTempFile,
+    writer: SerializedFileWriter<File>,
+    schema: SchemaRef,
+    plan: BodyPlan,
+    /// Writers for every field with its dictionary.
+    dictionary: FieldWriters,
+    /// Writers for the candidate fields without one.
+    plain: FieldWriters,
+    /// Per field, whether it is written without its dictionary, once the
+    /// first row group's pass over it has chosen.
+    plain_fields: Vec<Option<bool>>,
+}
+
+impl PassBodyEncoder {
+    pub(crate) fn new(schema: &Arc<Schema>, plan: BodyPlan) -> Result<Self, FooterError> {
+        let (dictionary, plain) = plan.field_writers(schema)?;
+        let props = writer_properties(
+            plan.compression,
+            plan.row_group_size,
+            &plan.page_size_limits(),
+            &[],
+        );
+        let (body_file, writer, _) = scratch_body(schema, props)?;
+        Ok(Self {
+            body_file,
+            writer,
+            schema: Arc::clone(schema),
+            plain_fields: vec![None; schema.fields().len()],
+            plan,
+            dictionary,
+            plain,
+        })
+    }
+
+    /// Write the body's next row group, its fields in the runs `passes`, in
+    /// order: contiguous, together every field of the body once. For each
+    /// pass `fill` is handed the pass's fields and a [`PassWriter`], and
+    /// writes it the row group's rows, those fields of them in field order,
+    /// in row order; every pass must be handed the same rows.
+    pub(crate) fn write_row_group<E: From<FooterError>>(
+        &mut self,
+        passes: &[Range<usize>],
+        mut fill: impl FnMut(Range<usize>, &mut PassWriter<'_>) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let fields = self.schema.fields().len();
+        let covered = passes.iter().try_fold(0, |next, pass| {
+            (pass.start == next && pass.end > next).then_some(pass.end)
+        });
+        if covered != Some(fields) {
+            return Err(
+                FooterError::Malformed("passes do not cover the fields once, in order").into(),
+            );
+        }
+        let Self {
+            writer,
+            schema,
+            plan,
+            dictionary,
+            plain,
+            plain_fields,
+            ..
+        } = self;
+        let index = writer.flushed_row_groups().len();
+        let mut row_group = writer.next_row_group().map_err(FooterError::from)?;
+        let mut rows: Option<usize> = None;
+        for pass in passes {
+            let mut pass_writer = PassWriter {
+                fields: pass.clone(),
+                row_group: index,
+                schema,
+                plan,
+                dictionary,
+                plain,
+                plain_fields: &mut plain_fields[pass.clone()],
+                held: Vec::new(),
+                held_bytes: 0,
+                open: None,
+                rows: 0,
+            };
+            fill(pass.clone(), &mut pass_writer)?;
+            let (pass_rows, chunks) = pass_writer.close()?;
+            if *rows.get_or_insert(pass_rows) != pass_rows {
+                return Err(
+                    FooterError::Malformed("passes of a row group hold different rows").into(),
+                );
+            }
+            for chunk in chunks {
+                chunk
+                    .append_to_row_group(&mut row_group)
+                    .map_err(FooterError::from)?;
+            }
+        }
+        row_group.close().map_err(FooterError::from)?;
+        Ok(())
+    }
+
+    /// Close the writer and strip the Parquet footer, yielding the same
+    /// [`EncodedBody`] as [`ParquetBodyEncoder::finish`].
+    pub(crate) fn finish(self) -> Result<EncodedBody, FooterError> {
+        let Self {
+            body_file, writer, ..
+        } = self;
+        writer.close()?;
+        strip_parquet_footer(body_file)
+    }
+}
+
+/// One pass of a [`PassBodyEncoder`] row group: the writers of its fields,
+/// fed the row group's rows of those fields a batch at a time.
+pub(crate) struct PassWriter<'a> {
+    fields: Range<usize>,
+    row_group: usize,
+    schema: &'a Schema,
+    plan: &'a BodyPlan,
+    dictionary: &'a FieldWriters,
+    plain: &'a FieldWriters,
+    /// The pass's fields' dictionary choices, `None` until made.
+    plain_fields: &'a mut [Option<bool>],
+    /// Rows held to choose the pass's dictionaries before its writers are
+    /// made; only ever in the body's first row group.
+    held: Vec<RecordBatch>,
+    held_bytes: usize,
+    /// Each field's column writers, in field order, once made.
+    open: Option<Vec<Vec<ArrowColumnWriter>>>,
+    rows: usize,
+}
+
+impl PassWriter<'_> {
+    /// Write `batch`, the pass's fields of the row group's next rows, in
+    /// field order.
+    pub(crate) fn write(&mut self, batch: &RecordBatch) -> Result<(), FooterError> {
+        if batch.num_columns() != self.fields.len() {
+            return Err(FooterError::Malformed(
+                "a pass batch holds other fields than the pass",
+            ));
+        }
+        self.rows += batch.num_rows();
+        if self.open.is_none() && self.plain_fields.iter().any(Option::is_none) {
+            self.held_bytes += decoded_bytes(batch);
+            self.held.push(batch.clone());
+            if self.held_bytes >= self.plan.held_group_bytes {
+                self.open_writers()?;
+            }
+            return Ok(());
+        }
+        if self.open.is_none() {
+            self.open_writers()?;
+        }
+        self.write_open(batch)
+    }
+
+    /// Choose the dictionaries of the fields that have none chosen from the
+    /// rows held, make every field's writers, and write the held rows.
+    fn open_writers(&mut self) -> Result<(), FooterError> {
+        if self.plain_fields.iter().any(Option::is_none) {
+            let slices = write_slices(&self.held);
+            let candidates: Vec<(usize, Vec<ArrayRef>)> = self
+                .fields
+                .clone()
+                .filter(|&field| {
+                    self.plan
+                        .dictionary_candidates
+                        .contains(self.schema.field(field).name())
+                })
+                .map(|field| {
+                    let at = field - self.fields.start;
+                    (field, sample_columns(&slices, at))
+                })
+                .collect();
+            let plain =
+                self.plan
+                    .plain_among(self.schema, self.dictionary, self.plain, &candidates)?;
+            for (at, field) in self.fields.clone().enumerate() {
+                let written_plain = plain.contains(self.schema.field(field).name());
+                self.plain_fields[at].get_or_insert(written_plain);
+            }
+        }
+        let writers = self
+            .fields
+            .clone()
+            .zip(self.plain_fields.iter())
+            .map(|(field, plain)| match plain {
+                Some(true) => self.plain.create(field, self.row_group),
+                _ => self.dictionary.create(field, self.row_group),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.open = Some(writers);
+        self.held_bytes = 0;
+        for batch in mem::take(&mut self.held) {
+            self.write_open(&batch)?;
+        }
+        Ok(())
+    }
+
+    /// Write `batch` to the open writers, a task per field, side by side on
+    /// the pool when the plan encodes that way.
+    fn write_open(&mut self, batch: &RecordBatch) -> Result<(), FooterError> {
+        let Some(open) = self.open.as_mut() else {
+            return Err(FooterError::Malformed(
+                "a pass written before its writers were made",
+            ));
+        };
+        let start = self.fields.start;
+        let writers = self.dictionary;
+        for slice in byte_bounded_slices(batch, MAX_WRITE_BYTES) {
+            let write = |(at, field_writers): (usize, &mut Vec<ArrowColumnWriter>)| {
+                writers.write(start + at, field_writers, slice.column(at))
+            };
+            match self.plan.encode_groups_together {
+                true => open.par_iter_mut().enumerate().try_for_each(write)?,
+                false => open.iter_mut().enumerate().try_for_each(write)?,
+            }
+        }
+        Ok(())
+    }
+
+    /// Close the pass's writers: the rows written and the pass's column
+    /// chunks, in field order.
+    fn close(mut self) -> Result<(usize, Vec<ArrowColumnChunk>), FooterError> {
+        if self.open.is_none() {
+            self.open_writers()?;
+        }
+        let chunks = self
+            .open
+            .take()
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|writer| writer.close().map_err(FooterError::from))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((self.rows, chunks))
+    }
 }
 
 /// Read back the just-written Parquet footer from `body_file`, decode its
@@ -3106,6 +3448,126 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// `group`, rows `group_start..` of a body written in pieces of
+    /// [`MIXED_WRITE_ROWS`] rows from its first, handed to `write` cut where
+    /// those pieces are: the writes the body's row group gets when the whole
+    /// body is written in those pieces.
+    fn write_group_in_pieces(
+        group: &RecordBatch,
+        group_start: usize,
+        mut write: impl FnMut(&RecordBatch) -> Result<(), FooterError>,
+    ) -> Result<(), FooterError> {
+        let end = group_start + group.num_rows();
+        let mut at = group_start;
+        while at < end {
+            let next = end.min((at / MIXED_WRITE_ROWS + 1) * MIXED_WRITE_ROWS);
+            write(&group.slice(at - group_start, next - at))?;
+            at = next;
+        }
+        Ok(())
+    }
+
+    /// `batch` written by a [`PassBodyEncoder`] under `plan`, `width` fields
+    /// at a time, a row group of [`TEST_GROUP_ROWS`] rows at a time, each
+    /// pass handed its fields in pieces of [`MIXED_WRITE_ROWS`] rows.
+    fn write_in_passes(
+        schema: &Arc<Schema>,
+        batch: &RecordBatch,
+        plan: BodyPlan,
+        width: usize,
+    ) -> EncodedBody {
+        let fields = schema.fields().len();
+        let passes: Vec<Range<usize>> = (0..fields)
+            .step_by(width)
+            .map(|start| start..(start + width).min(fields))
+            .collect();
+        let mut encoder = PassBodyEncoder::new(schema, plan).expect("encoder");
+        for start in (0..batch.num_rows()).step_by(TEST_GROUP_ROWS) {
+            let group = batch.slice(start, TEST_GROUP_ROWS.min(batch.num_rows() - start));
+            encoder
+                .write_row_group(&passes, |pass, writer| -> Result<(), FooterError> {
+                    let part = group
+                        .project(&pass.collect::<Vec<_>>())
+                        .expect("project the pass");
+                    write_group_in_pieces(&part, start, |piece| writer.write(piece))
+                })
+                .expect("row group");
+        }
+        encoder.finish().expect("finish")
+    }
+
+    /// A body written a pass of fields at a time is the bytes `ArrowWriter`
+    /// writes for the same rows written in the same pieces with every
+    /// column's writer open at once, nested and struct columns included,
+    /// whatever the pass width.
+    #[test]
+    fn a_body_written_in_passes_is_the_bytes_arrow_writer_writes() {
+        let (schema, batch) = mixed(3 * TEST_GROUP_ROWS + 123);
+        let want = arrow_writer_body(&schema, &batch, &[]);
+        let plan = BodyPlan {
+            dictionary_candidates: Vec::new(),
+            ..plan(&schema)
+        };
+        for width in 1..=schema.fields().len() {
+            let body = write_in_passes(&schema, &batch, plan.clone(), width);
+            assert_eq!(body.metadata.num_row_groups(), 4);
+            let mut got = fs::read(body.body_file.path()).expect("read body");
+            got.truncate(want.len());
+            assert!(got == want, "{width} fields at a time");
+        }
+    }
+
+    /// A body written in passes chooses each column's dictionary as one
+    /// written by rows chooses it, from the first row group, so the two
+    /// bodies are the same bytes whatever the pass width.
+    #[test]
+    fn a_body_written_in_passes_chooses_the_dictionaries_rows_choose() {
+        let (schema, batch) = mixed(3 * TEST_GROUP_ROWS + 123);
+        let mut rows = PlannedBodyEncoder::new(&schema, plan(&schema));
+        for start in (0..batch.num_rows()).step_by(MIXED_WRITE_ROWS) {
+            let len = MIXED_WRITE_ROWS.min(batch.num_rows() - start);
+            rows.write_batch(&batch.slice(start, len)).expect("write");
+        }
+        let rows = rows.finish().expect("finish");
+        let want = fs::read(rows.body_file.path()).expect("read body");
+        for width in 1..=schema.fields().len() {
+            let body = write_in_passes(&schema, &batch, plan(&schema), width);
+            let got = fs::read(body.body_file.path()).expect("read body");
+            assert!(got == want, "{width} fields at a time");
+        }
+    }
+
+    /// A pass's rows must be a row group's: a pass handed fewer or more
+    /// rows than the passes before it, or other columns than its fields,
+    /// fails the row group rather than writing a malformed body.
+    #[test]
+    fn a_pass_of_other_rows_or_columns_fails_its_row_group() {
+        let (schema, batch) = mixed(TEST_GROUP_ROWS);
+        let passes = [0..2, 2..schema.fields().len()];
+        let mut encoder = PassBodyEncoder::new(&schema, plan(&schema)).expect("encoder");
+        let short = encoder.write_row_group(&passes, |pass, writer| {
+            let rows = match pass.start {
+                0 => batch.num_rows(),
+                _ => batch.num_rows() - 1,
+            };
+            writer.write(
+                &batch
+                    .slice(0, rows)
+                    .project(&pass.collect::<Vec<_>>())
+                    .expect("project"),
+            )
+        });
+        assert!(short.is_err(), "a pass of fewer rows fails");
+        let mut encoder = PassBodyEncoder::new(&schema, plan(&schema)).expect("encoder");
+        let wide = encoder.write_row_group(&passes, |_, writer| writer.write(&batch));
+        assert!(wide.is_err(), "a pass of other columns fails");
+        let mut encoder = PassBodyEncoder::new(&schema, plan(&schema)).expect("encoder");
+        let gap = encoder.write_row_group(&[0..1, 2..schema.fields().len()], |_, _| {
+            Ok::<(), FooterError>(())
+        });
+        assert!(gap.is_err(), "passes that skip a field fail");
     }
 
     /// The sizes the dictionary choice is made on, each candidate encoded on
