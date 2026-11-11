@@ -1284,6 +1284,16 @@ impl SuperfileReader {
         &self,
         deleted_docs_bitmap: Option<Arc<RoaringBitmap>>,
     ) -> Result<ParquetRecordBatchReader, ReadError> {
+        self.record_batches_of(deleted_docs_bitmap, None)
+    }
+
+    /// [`Self::record_batches`], `batch_rows` rows to a batch, or the
+    /// Parquet reader's default when `None`.
+    pub(crate) fn record_batches_of(
+        &self,
+        deleted_docs_bitmap: Option<Arc<RoaringBitmap>>,
+        batch_rows: Option<usize>,
+    ) -> Result<ParquetRecordBatchReader, ReadError> {
         let bytes = self
             .bytes
             .as_ref()
@@ -1298,6 +1308,9 @@ impl SuperfileReader {
 
         let mut builder =
             ParquetRecordBatchReaderBuilder::new_with_metadata(bytes.clone(), arrow_meta);
+        if let Some(rows) = batch_rows {
+            builder = builder.with_batch_size(rows.max(1));
+        }
         if let Some(plan) = plan {
             let row_groups = plan.row_group_indexes();
             let selection = plan

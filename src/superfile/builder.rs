@@ -72,7 +72,7 @@ use std::{
     iter,
     ops::Range,
     str::from_utf8,
-    sync::{Arc, mpsc::sync_channel},
+    sync::{Arc, Condvar, Mutex, PoisonError, mpsc::sync_channel},
     thread,
     time::Duration,
 };
@@ -87,7 +87,7 @@ use parquet::{
         ProjectionMask,
         arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder},
     },
-    basic::{Compression, ZstdLevel},
+    basic::{Compression, Type as PhysicalType, ZstdLevel},
     errors::ParquetError,
     file::{metadata::ParquetMetaData, reader::ChunkReader},
 };
@@ -105,8 +105,8 @@ use crate::{
             self,
             footer::{
                 BodyPlan, EncodedBody, HELD_GROUP_BYTES, ParquetLayout, PlannedBodyEncoder,
-                RangeStream, encode_parquet_body_planned, extract_kv_map, splice_carried_body_to,
-                splice_index_streams_to,
+                RangeStream, decoded_bytes, encode_parquet_body_planned, extract_kv_map,
+                splice_carried_body_to, splice_index_streams_to,
             },
             kv,
         },
@@ -159,34 +159,173 @@ const REORDER_MIN_DOCS: usize = 4_096;
 /// decoding through a row group's encode, which takes many batches at once.
 const DECODED_BATCHES_AHEAD: usize = 64;
 
-/// What the batches decoded ahead may decode to, at the least: a wide
-/// table's batch, a few bytes a row in each of thousands of columns, gets
-/// as many batches ahead as fit in this rather than [`DECODED_BATCHES_AHEAD`].
+/// What the batches a merge has decoded and not yet encoded may decode to,
+/// measured: the decoder waits while the batches in flight hold this much,
+/// so a wide or long-valued table's merge keeps a few of its batches ahead
+/// rather than [`DECODED_BATCHES_AHEAD`].
 const DECODED_AHEAD_BYTES: u64 = 64 * 1024 * 1024;
 
-/// Rows in a batch a superfile's rows are read back in: the Parquet
+/// What one decoded batch of a merge input aims to decode to. A batch is
+/// cut by rows before it is decoded, so the rows are chosen from what the
+/// input's footer says a row decodes to ([`DecodeWindow::batch_rows`]): a row
+/// a few hundred kilobytes long decoded [`READ_BATCH_ROWS`] at a time
+/// would make every batch hundreds of megabytes.
+const DECODE_BATCH_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Most rows in a batch a superfile's rows are read back in: the Parquet
 /// reader's default batch size.
 const READ_BATCH_ROWS: u64 = 1024;
 
-/// Batches to decode ahead for a merge whose output has `schema`: up to
-/// [`DECODED_BATCHES_AHEAD`], as many as [`DECODED_AHEAD_BYTES`] holds
-/// at the floor [`null_row_bytes`] puts on a decoded row, and at least one.
-fn decoded_batches_ahead(schema: &Schema) -> usize {
-    let batch_bytes = READ_BATCH_ROWS
-        .saturating_mul(null_row_bytes(schema))
-        .max(1);
-    usize::try_from(DECODED_AHEAD_BYTES / batch_bytes)
-        .unwrap_or(DECODED_BATCHES_AHEAD)
-        .clamp(1, DECODED_BATCHES_AHEAD)
+/// The bounds on what a merge holds decoded: [`DECODE_BATCH_BYTES`],
+/// [`DECODED_AHEAD_BYTES`] and [`HELD_GROUP_BYTES`], read once when the
+/// merge starts, so a test can narrow them for a merge it can afford to
+/// build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DecodeWindow {
+    /// What one decoded batch aims to decode to.
+    pub(crate) batch_bytes: u64,
+    /// What the batches decoded and not yet encoded may decode to.
+    pub(crate) ahead_bytes: u64,
+    /// What the rows the body encoder holds may decode to.
+    pub(crate) held_group_bytes: usize,
 }
 
-/// The most decoded rows a merge holds at once: the batches decoded ahead,
-/// the rows its body encoder holds to choose dictionaries, and the rows it
-/// holds before encoding them, each bounded by bytes. However many rows a
-/// merge has and however wide they are, this window is all of them that
-/// is decoded at a time.
+impl DecodeWindow {
+    /// The bounds a merge started now runs under.
+    pub(crate) fn current() -> Self {
+        #[cfg(test)]
+        if let Some(window) = tests::decode_window_override() {
+            return window;
+        }
+        Self {
+            batch_bytes: DECODE_BATCH_BYTES,
+            ahead_bytes: DECODED_AHEAD_BYTES,
+            held_group_bytes: HELD_GROUP_BYTES,
+        }
+    }
+
+    /// Rows to decode `reader`'s rows in, for a merge whose output has
+    /// `schema`: as many as [`Self::batch_bytes`] holds at what a row
+    /// decodes to ([`decoded_row_bytes`]), at most [`READ_BATCH_ROWS`] and
+    /// at least one.
+    fn batch_rows(&self, reader: &SuperfileReader, schema: &Schema) -> usize {
+        let row_bytes = decoded_row_bytes(&reader.parquet_metadata(), schema).max(1);
+        usize::try_from((self.batch_bytes / row_bytes).clamp(1, READ_BATCH_ROWS)).unwrap_or(1)
+    }
+}
+
+/// About what one row of the file `metadata` describes decodes to in a
+/// merge whose output has `schema`: [`null_row_bytes`], what any row costs
+/// however few columns it fills, plus the file's string and binary values
+/// averaged over its rows. The footer records those values' bytes
+/// unencoded, so a column stored as a dictionary counts what it decodes to,
+/// not the few bits a row it stores; a file written without that record
+/// counts its byte-array chunks' uncompressed bytes instead.
+fn decoded_row_bytes(metadata: &ParquetMetaData, schema: &Schema) -> u64 {
+    let rows = u64::try_from(metadata.file_metadata().num_rows())
+        .unwrap_or(0)
+        .max(1);
+    let values: u64 = metadata
+        .row_groups()
+        .iter()
+        .flat_map(|row_group| row_group.columns())
+        .filter(|chunk| chunk.column_type() == PhysicalType::BYTE_ARRAY)
+        .map(|chunk| {
+            let bytes = chunk
+                .unencoded_byte_array_data_bytes()
+                .unwrap_or_else(|| chunk.uncompressed_size());
+            u64::try_from(bytes).unwrap_or(0)
+        })
+        .sum();
+    null_row_bytes(schema).saturating_add(values / rows)
+}
+
+/// The decoded bytes a merge's batches hold between being decoded and
+/// being encoded, and the wait that keeps them under a bound.
+///
+/// The decoder takes a batch's bytes before handing it over and the encoder
+/// gives them back once it has written the batch; the decoder waits while
+/// taking them would pass the bound, unless nothing is in flight, so one
+/// batch larger than the bound still passes. Closed once the encoder stops,
+/// so a decoder waiting on bytes that will never come back returns.
+struct DecodedBytes {
+    state: Mutex<DecodedBytesState>,
+    changed: Condvar,
+    limit: u64,
+}
+
+#[derive(Default)]
+struct DecodedBytesState {
+    in_flight: u64,
+    closed: bool,
+}
+
+impl DecodedBytes {
+    fn new(limit: u64) -> Self {
+        Self {
+            state: Mutex::default(),
+            changed: Condvar::new(),
+            limit,
+        }
+    }
+
+    /// Take `bytes` for a decoded batch, waiting while the batches in flight
+    /// hold too much. False once closed: nobody will encode the batch.
+    fn take(&self, bytes: u64) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        while !state.closed
+            && state.in_flight > 0
+            && state.in_flight.saturating_add(bytes) > self.limit
+        {
+            state = self
+                .changed
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        if state.closed {
+            return false;
+        }
+        state.in_flight = state.in_flight.saturating_add(bytes);
+        true
+    }
+
+    /// Give back `bytes` of a batch that has been encoded.
+    fn give_back(&self, bytes: u64) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.in_flight = state.in_flight.saturating_sub(bytes);
+        self.changed.notify_all();
+    }
+
+    /// Stop handing out bytes: the encoder takes no more batches.
+    fn close(&self) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.closed = true;
+        self.changed.notify_all();
+    }
+}
+
+/// A decoded batch on its way from a merge's decoder to its encoder: the
+/// rows, their stats, and what they decode to, by
+/// [`decoded_bytes`].
+type DecodedBatch = Result<(RecordBatch, SuperfileStats, u64), BuildError>;
+
+/// Closes [`DecodedBytes`] as the encode ends, however it ends.
+struct CloseOnDrop<'a>(&'a DecodedBytes);
+
+impl Drop for CloseOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.close();
+    }
+}
+
+/// The most decoded rows a merge holds at once, by bytes: the batches
+/// decoded and not yet encoded, the batch being decoded, and the rows its
+/// body encoder holds to choose dictionaries and to encode a column at a
+/// time. However many rows a merge has and however large they are, this
+/// window is all of them that is decoded at a time, but for a single row
+/// larger than it.
 pub(crate) const MERGE_DECODED_WINDOW_BYTES: u64 =
-    DECODED_AHEAD_BYTES + 2 * HELD_GROUP_BYTES as u64;
+    DECODED_AHEAD_BYTES + DECODE_BATCH_BYTES + HELD_GROUP_BYTES as u64;
 
 /// Bytes in a mebibyte, for the merge memory budget the config states in MiB.
 const BYTES_PER_MIB: u64 = 1 << 20;
@@ -1146,6 +1285,7 @@ impl BuilderOptions {
             dictionary_candidates,
             column_page_size_limits: vec![(self.id_column.clone(), self.id_page_size_limit)],
             encode_groups_together: !self.finish_serial,
+            held_group_bytes: DecodeWindow::current().held_group_bytes,
         }
     }
 
@@ -2808,7 +2948,13 @@ impl SuperfileBuilder {
         } else {
             self.check_rebuildable(reader)?;
         }
-        let batches = adapted_batches(reader, deleted_docs_bitmap.clone(), adapter, &self.opts)?;
+        let batches = adapted_batches(
+            reader,
+            deleted_docs_bitmap.clone(),
+            adapter,
+            &self.opts,
+            None,
+        )?;
 
         let mut vectors: Vec<Vec<f32>> = Vec::new();
         if let Some(v) = reader.vec() {
@@ -3291,9 +3437,11 @@ impl SuperfileBuilder {
     /// and the stable ids beside them. A thread of its own decodes the
     /// next few batches and computes their stats while this one encodes
     /// the last; they arrive in the order they were read, so the output is
-    /// the same. Nothing is decoded and retained whole. A re-analyzed
-    /// merge indexes the rows as they go by, under the doc ids they are
-    /// written at.
+    /// the same. Nothing is decoded and retained whole: an input is decoded
+    /// in batches of about [`DECODE_BATCH_BYTES`], and the decoder waits
+    /// while the batches it has handed over and the encoder has not written
+    /// decode to [`DECODED_AHEAD_BYTES`]. A re-analyzed merge indexes the
+    /// rows as they go by, under the doc ids they are written at.
     fn copy_input_bodies(
         &mut self,
         inputs: &[MergeInput],
@@ -3301,6 +3449,7 @@ impl SuperfileBuilder {
         id_sidecar: &mut Option<PackedIdEncoder<BufWriter<NamedTempFile>>>,
         stats: &mut SuperfileStats,
         reanalyze: bool,
+        window: DecodeWindow,
     ) -> Result<(), BuildError> {
         let id_column = self.opts.id_column.clone();
         let mut timings = FtsMergeTimings::default();
@@ -3308,17 +3457,19 @@ impl SuperfileBuilder {
             detail_span!("merge_copy_rows", read_parquet = 0, write_parquet = 0).entered();
         for input in inputs {
             let opts = self.opts.clone();
-            let (sender, decoded) = sync_channel::<Result<(RecordBatch, SuperfileStats), BuildError>>(
-                decoded_batches_ahead(&opts.schema),
-            );
+            let batch_rows = window.batch_rows(&input.reader, &opts.schema);
+            let in_flight = DecodedBytes::new(window.ahead_bytes);
+            let (sender, decoded) = sync_channel::<DecodedBatch>(DECODED_BATCHES_AHEAD);
             thread::scope(|scope| -> Result<(), BuildError> {
-                // Owned here, so an encode that fails drops it on the
-                // way out and the decoder's next send fails, instead of
-                // the scope waiting on a decoder blocked on a full
-                // channel.
+                // Owned here, so an encode that fails drops them on the
+                // way out: the decoder's next send fails, and a decoder
+                // waiting for bytes to come back is woken, instead of the
+                // scope waiting on a decoder that never returns.
                 let decoded = decoded;
+                let _close = CloseOnDrop(&in_flight);
+                let in_flight = &in_flight;
                 scope.spawn(move || {
-                    let batches = match input.batches(&opts) {
+                    let batches = match input.batches_of(&opts, batch_rows) {
                         Ok(batches) => batches,
                         Err(e) => {
                             let _ = sender.send(Err(e));
@@ -3328,8 +3479,14 @@ impl SuperfileBuilder {
                     for batch in batches {
                         let decoded = batch.and_then(|batch| {
                             let stats = SuperfileStats::try_compute_from_record_batch(&batch)?;
-                            Ok((batch, stats))
+                            let bytes = decoded_bytes(&batch) as u64;
+                            Ok((batch, stats, bytes))
                         });
+                        if let Ok((_, _, bytes)) = &decoded
+                            && !in_flight.take(*bytes)
+                        {
+                            return;
+                        }
                         let failed = decoded.is_err();
                         // The receiver is gone once the merge has failed.
                         if sender.send(decoded).is_err() || failed {
@@ -3342,7 +3499,7 @@ impl SuperfileBuilder {
                     let Ok(next) = decoded.recv() else {
                         break;
                     };
-                    let (record_batch, batch_stats) = next?;
+                    let (record_batch, batch_stats, bytes) = next?;
                     #[cfg(test)]
                     if tests::encode_fault() {
                         return Err(BuildError::Io(Error::other(
@@ -3367,6 +3524,8 @@ impl SuperfileBuilder {
                         self.index_fts_batch(&record_batch, rows)?;
                     }
                     self.next_local_doc_id += rows;
+                    drop(record_batch);
+                    in_flight.give_back(bytes);
                 }
                 Ok(())
             })?;
@@ -3389,6 +3548,7 @@ impl SuperfileBuilder {
         // finished body in the builder. Ordinary merges read one input at a time;
         // the multi-cell path supplies preordered batches and retains them until
         // they are written.
+        let window = DecodeWindow::current();
         let mut body_encoder = PlannedBodyEncoder::new(
             &superfile_builder.parquet_schema,
             superfile_builder
@@ -3482,6 +3642,7 @@ impl SuperfileBuilder {
                     &mut id_sidecar,
                     &mut stats,
                     reanalyze,
+                    window,
                 ),
                 false => Ok(()),
             },
@@ -4738,6 +4899,22 @@ impl MergeInput {
             self.deleted.clone(),
             self.adapter.as_ref(),
             opts,
+            None,
+        )
+    }
+
+    /// [`Self::batches`], `batch_rows` rows to a batch.
+    fn batches_of(
+        &self,
+        opts: &BuilderOptions,
+        batch_rows: usize,
+    ) -> Result<impl Iterator<Item = Result<RecordBatch, BuildError>> + use<'_>, BuildError> {
+        adapted_batches(
+            &self.reader,
+            self.deleted.clone(),
+            self.adapter.as_ref(),
+            opts,
+            Some(batch_rows),
         )
     }
 }
@@ -4804,11 +4981,12 @@ fn adapted_batches<'a>(
     deleted: Option<Arc<RoaringBitmap>>,
     adapter: Option<&'a FileSchemaMap>,
     opts: &BuilderOptions,
+    batch_rows: Option<usize>,
 ) -> Result<impl Iterator<Item = Result<RecordBatch, BuildError>> + use<'a>, BuildError> {
     check_id_column(reader, opts)?;
     let schema = Arc::clone(&opts.schema);
     let batches = reader
-        .record_batches(deleted)
+        .record_batches_of(deleted, batch_rows)
         .map_err(|_| BuildError::BatchReadError)?;
     // Check the file's shape even when no row survives to be read.
     adapt_batch(RecordBatch::new_empty(batches.schema()), adapter, &schema)?;
@@ -5033,6 +5211,30 @@ mod tests {
         /// Set by a test whose merge's encode loop must fail on its first
         /// batch.
         static ENCODE_FAULT: Cell<bool> = const { Cell::new(false) };
+        /// Set by [`with_decode_window`] for the thread starting a merge.
+        static DECODE_WINDOW: Cell<Option<DecodeWindow>> = const { Cell::new(None) };
+    }
+
+    /// The narrowed decode window, if this thread is inside
+    /// [`with_decode_window`].
+    pub(super) fn decode_window_override() -> Option<DecodeWindow> {
+        DECODE_WINDOW.with(Cell::get)
+    }
+
+    /// Run `f` with merges started on this thread held to `window`, so a
+    /// merge a test can afford to build still decodes in several batches,
+    /// waits on the bytes in flight and cuts its row groups by bytes.
+    fn with_decode_window<T>(window: DecodeWindow, f: impl FnOnce() -> T) -> T {
+        /// Clears the override however `f` leaves.
+        struct Clear;
+        impl Drop for Clear {
+            fn drop(&mut self) {
+                DECODE_WINDOW.with(|w| w.set(None));
+            }
+        }
+        DECODE_WINDOW.with(|w| w.set(Some(window)));
+        let _clear = Clear;
+        f()
     }
 
     /// Whether this thread's merge fails its encode on the first batch.
@@ -7552,6 +7754,194 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(60))
             .expect("merge hung after the encode failed");
         assert!(failed, "the encode's error comes back");
+    }
+
+    /// Random merges checked by [`a_merge_in_a_narrow_window_writes_what_a_wide_one_writes`].
+    const WINDOW_CASES: u64 = 24;
+    /// Most inputs, and most documents per input, in one of those merges.
+    const WINDOW_MAX_INPUTS: usize = 4;
+    const WINDOW_MAX_DOCS: u32 = 300;
+    /// Upper bounds on the narrowed window's batch, in-flight and held
+    /// bytes: a few rows of the fixture each, so every merge decodes in
+    /// many batches, waits on the bytes in flight, and cuts its row groups.
+    const WINDOW_MAX_BATCH_BYTES: u64 = 4_096;
+    const WINDOW_MAX_AHEAD_BYTES: u64 = 8_192;
+    const WINDOW_MAX_HELD_BYTES: usize = 16_384;
+
+    /// The merged superfile of `inputs`, written term by term under the
+    /// decode window this thread is in, and its stats.
+    fn fts_merge(
+        inputs: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
+    ) -> (Vec<u8>, SuperfileStats) {
+        let merge_inputs = same_shape_inputs(inputs);
+        let base = BuilderOptions::new_from_reader(&merge_inputs[0].reader);
+        let mut out = Vec::new();
+        let stats = SuperfileBuilder::fts_merge_to(
+            &merge_inputs,
+            base,
+            &mut out,
+            PostingMerge::TermByTerm,
+            None,
+        )
+        .expect("merge");
+        (out, stats)
+    }
+
+    /// Every stable id the sidecar of `reader` resolves, in row order.
+    fn sidecar_ids(reader: &SuperfileReader) -> RecordBatch {
+        let locals: Vec<u32> = (0..reader.n_docs() as u32).collect();
+        reader
+            .take_by_local_doc_ids(&locals, &["doc_id"])
+            .expect("resolve ids through the sidecar")
+    }
+
+    /// A merge held to a window of a few rows, decoding in many small
+    /// batches, waiting on the bytes in flight and cutting its row groups by
+    /// bytes, writes what a merge under the default window writes: the same
+    /// rows in the same order, the same stats, the same full-text index and
+    /// the same stable ids; and the rows a re-index of the same inputs
+    /// writes. Over random inputs, deletes and windows.
+    #[test]
+    fn a_merge_in_a_narrow_window_writes_what_a_wide_one_writes() {
+        for case in 0..WINDOW_CASES {
+            let mut rng = StdRng::seed_from_u64(case);
+            let n_inputs = rng.random_range(1..=WINDOW_MAX_INPUTS);
+            let sizes: Vec<u32> = (0..n_inputs)
+                .map(|_| rng.random_range(1..=WINDOW_MAX_DOCS))
+                .collect();
+            let deletes: Vec<Vec<u32>> = sizes
+                .iter()
+                .map(|&docs| {
+                    let share = rng.random_range(0.0..0.6);
+                    (0..docs).filter(|_| rng.random_bool(share)).collect()
+                })
+                .collect();
+            let delete_refs: Vec<&[u32]> = deletes.iter().map(Vec::as_slice).collect();
+            let positions = rng.random_bool(0.5);
+            let window = DecodeWindow {
+                batch_bytes: rng.random_range(1..=WINDOW_MAX_BATCH_BYTES),
+                ahead_bytes: rng.random_range(1..=WINDOW_MAX_AHEAD_BYTES),
+                held_group_bytes: rng.random_range(1..=WINDOW_MAX_HELD_BYTES),
+            };
+            let inputs = merge_inputs_of_sizes(&sizes, positions, &delete_refs, sorted_merge_docs);
+            let label = format!("case {case}: sizes {sizes:?}, window {window:?}");
+
+            let (narrow, narrow_stats) = with_decode_window(window, || fts_merge(&inputs));
+            let (wide, wide_stats) = fts_merge(&inputs);
+            assert_eq!(narrow_stats.n_docs, wide_stats.n_docs, "{label}");
+            assert_eq!(narrow_stats.id_min, wide_stats.id_min, "{label}");
+            assert_eq!(narrow_stats.id_max, wide_stats.id_max, "{label}");
+            assert_eq!(
+                narrow_stats.scalar_stats, wide_stats.scalar_stats,
+                "{label}"
+            );
+            if wide_stats.n_docs == 0 {
+                assert!(narrow.is_empty() && wide.is_empty(), "{label}");
+                continue;
+            }
+            let narrow = SuperfileReader::open(Bytes::from(narrow)).expect("open narrow");
+            let wide = SuperfileReader::open(Bytes::from(wide)).expect("open wide");
+            let (reindex, _) = SuperfileBuilder::build_from_readers(&inputs).expect("re-index");
+            let reindex = SuperfileReader::open(Bytes::from(reindex)).expect("open re-index");
+
+            let rows = narrow.get_record_batch(None).expect("narrow rows");
+            assert_eq!(
+                rows,
+                wide.get_record_batch(None).expect("wide rows"),
+                "{label}"
+            );
+            assert_eq!(
+                rows,
+                reindex.get_record_batch(None).expect("re-index rows"),
+                "{label}"
+            );
+            assert_eq!(
+                collect_fts_content(&narrow),
+                collect_fts_content(&wide),
+                "{label}"
+            );
+            assert_eq!(sidecar_ids(&narrow), sidecar_ids(&wide), "{label}");
+            assert_eq!(
+                narrow.parquet_metadata().num_row_groups(),
+                wide.parquet_metadata().num_row_groups(),
+                "{label}: the window does not move the row groups"
+            );
+        }
+    }
+
+    /// A merge input's rows are read in batches of the rows its footer
+    /// says fit the window's batch bytes: a row of long values repeated
+    /// often enough to store as a dictionary is counted at what it decodes
+    /// to, not the few bits it stores, and a batch is never more than the
+    /// reader's default nor fewer than one row.
+    #[test]
+    fn a_merge_input_is_read_in_batches_sized_by_what_its_rows_decode_to() {
+        const VALUE_BYTES: usize = 4_096;
+        const ROWS: u32 = 2_000;
+        const DISTINCT_VALUES: u32 = 4;
+        let opts = sorted_merge_opts(false);
+        let docs: Vec<(String, String)> = (0..ROWS)
+            .map(|d| {
+                let title = format!("{}", d % DISTINCT_VALUES).repeat(VALUE_BYTES);
+                (title, "b".to_string())
+            })
+            .collect();
+        let reader = merge_input(&opts, 0, &docs);
+        let row_bytes = decoded_row_bytes(&reader.parquet_metadata(), &opts.schema);
+        assert!(
+            row_bytes >= VALUE_BYTES as u64,
+            "a row decodes to its value, {row_bytes} bytes counted"
+        );
+        let stored = reader.parquet_metadata().row_groups()[0].compressed_size() as u64;
+        assert!(
+            stored < u64::from(ROWS) * VALUE_BYTES as u64 / 10,
+            "the fixture stores its values small: {stored} bytes"
+        );
+        let window = |batch_bytes| DecodeWindow {
+            batch_bytes,
+            ..DecodeWindow::current()
+        };
+        let rows = window(16 * row_bytes).batch_rows(&reader, &opts.schema);
+        assert!(
+            (8..=16).contains(&rows),
+            "about sixteen rows a batch: {rows}"
+        );
+        assert_eq!(window(1).batch_rows(&reader, &opts.schema), 1);
+        assert_eq!(
+            window(u64::MAX).batch_rows(&reader, &opts.schema),
+            READ_BATCH_ROWS as usize
+        );
+    }
+
+    /// The decoder takes a batch's bytes before it hands the batch over and
+    /// waits while the batches in flight hold the bound, except that one
+    /// batch always passes, so a batch larger than the bound is not stuck;
+    /// bytes given back let it go on, and closing wakes it to stop.
+    #[test]
+    fn decoded_bytes_hold_the_decoder_to_the_bound() {
+        const LIMIT: u64 = 100;
+        const WAIT: std::time::Duration = std::time::Duration::from_millis(50);
+        let bytes = DecodedBytes::new(LIMIT);
+        assert!(
+            bytes.take(3 * LIMIT),
+            "a batch passes when none is in flight"
+        );
+        std::thread::scope(|scope| {
+            let waiter = scope.spawn(|| bytes.take(1));
+            std::thread::sleep(WAIT);
+            assert!(!waiter.is_finished(), "the next batch waits past the bound");
+            bytes.give_back(3 * LIMIT);
+            assert!(waiter.join().expect("waiter"), "bytes given back let it on");
+        });
+        assert!(bytes.take(LIMIT - 1), "within the bound it does not wait");
+        std::thread::scope(|scope| {
+            let waiter = scope.spawn(|| bytes.take(LIMIT));
+            std::thread::sleep(WAIT);
+            assert!(!waiter.is_finished(), "past the bound it waits");
+            bytes.close();
+            assert!(!waiter.join().expect("waiter"), "closing stops it");
+        });
+        assert!(!bytes.take(0), "nothing is taken once closed");
     }
 
     #[tokio::test]

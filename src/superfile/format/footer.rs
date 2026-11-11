@@ -338,7 +338,7 @@ pub(crate) const HELD_GROUP_BYTES: usize = 256 * 1024 * 1024;
 /// buffers, a buffer shared between columns counted once for each. That
 /// is what holding the batch is charged: a column's levels and pages grow
 /// with its rows the same way whether its buffer is shared or not.
-fn decoded_bytes(batch: &RecordBatch) -> usize {
+pub(crate) fn decoded_bytes(batch: &RecordBatch) -> usize {
     batch
         .columns()
         .iter()
@@ -424,7 +424,6 @@ impl ParquetBodyEncoder {
     }
 
     /// The encoder with `bytes` as its bound on what it holds.
-    #[cfg(test)]
     fn holding_at_most(mut self, bytes: usize) -> Self {
         self.held_group_bytes = bytes;
         self
@@ -923,6 +922,9 @@ pub(crate) struct BodyPlan {
     /// whatever else is queued — one such piece carried another's whole
     /// fifty-second build.
     pub(crate) encode_groups_together: bool,
+    /// What the rows the encoder holds, to choose the dictionaries and
+    /// before it encodes them, may decode to: [`HELD_GROUP_BYTES`].
+    pub(crate) held_group_bytes: usize,
 }
 
 impl BodyPlan {
@@ -1044,9 +1046,9 @@ fn plain_where_smaller(
 
 /// [`ParquetBodyEncoder`] whose dictionaries are chosen by a [`BodyPlan`]
 /// from the first rows written: it holds rows until it has a row group's,
-/// the rows the choice is measured on, or rows that decode to
-/// [`HELD_GROUP_BYTES`], or the body ends; chooses; then writes them and
-/// streams the rest straight through.
+/// the rows the choice is measured on, or rows that decode to the plan's
+/// [`BodyPlan::held_group_bytes`], or the body ends; chooses; then writes
+/// them and streams the rest straight through.
 pub(crate) struct PlannedBodyEncoder {
     schema: Arc<Schema>,
     plan: BodyPlan,
@@ -1088,7 +1090,9 @@ impl PlannedBodyEncoder {
         self.held_bytes += decoded_bytes(batch);
         self.held.push(batch.clone());
         // The bytes bound holds whoever keeps the rows.
-        if self.held_rows >= self.plan.row_group_size || self.held_bytes >= HELD_GROUP_BYTES {
+        if self.held_rows >= self.plan.row_group_size
+            || self.held_bytes >= self.plan.held_group_bytes
+        {
             self.start()?;
         }
         Ok(())
@@ -1120,7 +1124,8 @@ impl PlannedBodyEncoder {
             &self.plan.page_size_limits(),
             &plain_columns,
             self.plan.encode_groups_together,
-        )?;
+        )?
+        .holding_at_most(self.plan.held_group_bytes);
         if self.rows_held_by_caller {
             encoder = encoder.with_rows_held_by_caller();
         }
@@ -2281,6 +2286,7 @@ mod tests {
             dictionary_candidates: schema.fields().iter().map(|f| f.name().clone()).collect(),
             column_page_size_limits: Vec::new(),
             encode_groups_together: true,
+            held_group_bytes: HELD_GROUP_BYTES,
         }
     }
 
