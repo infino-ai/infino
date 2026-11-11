@@ -5636,6 +5636,7 @@ pub(super) async fn persist_superfile_publish_batch_async(
             list_metadata,
             batch.term_contributions,
             reserved_layers,
+            None,
         )
         .await
         .map_err(BuildError::from)?;
@@ -11824,6 +11825,7 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
             None,
             None,
             None,
+            None,
         )
         .await
         {
@@ -12957,7 +12959,7 @@ pub(in crate::supertable) fn scoring_by_ordinal(
 /// Each superfile's scoring facts per full-text column, by superfile id:
 /// what [`scoring_by_ordinal`] lays out by a root's ordinals, and what a
 /// commit hands the fold that may follow it, before its ordinals exist.
-fn scoring_by_superfile(
+pub(in crate::supertable) fn scoring_by_superfile(
     manifest: &ManifestSnapshot,
 ) -> HashMap<Uuid, BTreeMap<FieldId, term_index::ColumnScoring>> {
     let columns: Vec<(FieldId, Bm25Params)> = manifest
@@ -13497,6 +13499,30 @@ pub(in crate::supertable) async fn persist_commit_async(
         list_metadata,
         term_contributions,
         None,
+        None,
+    )
+    .await
+}
+
+/// Commits another table's superfiles with their term-index layers stacked
+/// by `splice` in the same manifest (see `merge::graft`).
+pub(in crate::supertable) async fn persist_graft_async(
+    inner: &SupertableInner,
+    storage: Arc<dyn StorageProvider>,
+    new_entries: Vec<Arc<SuperfileEntry>>,
+    splice: TermIndexSplice<'_>,
+) -> Result<Arc<ManifestSnapshot>, SupertableCommitError> {
+    persist_commit_with_layer_async(
+        inner,
+        storage,
+        new_entries,
+        &[],
+        vec![],
+        vec![],
+        CommitListMetadata::empty(),
+        vec![],
+        None,
+        Some(splice),
     )
     .await
 }
@@ -13513,6 +13539,7 @@ async fn persist_commit_with_layer_async(
     list_metadata: CommitListMetadata,
     term_contributions: Vec<TermContribution>,
     mut reserved_layers: Option<&mut [ReservedSegment]>,
+    splice: Option<TermIndexSplice<'_>>,
 ) -> Result<Arc<ManifestSnapshot>, SupertableCommitError> {
     let storage_async = Arc::clone(&storage);
     let opts = Arc::clone(&inner.options);
@@ -13559,6 +13586,7 @@ async fn persist_commit_with_layer_async(
                 reserved_layers.as_deref_mut(),
                 None,
                 None,
+                splice,
             )
             .await
             {
@@ -13964,6 +13992,11 @@ pub(crate) trait CommitFence: Send {
     fn check(&mut self) -> BoxFuture<'_, Result<(), SupertableCommitError>>;
 }
 
+/// Given the current root, the root a graft commit publishes with another table's layers on it, or `None` when it
+/// adds nothing (see `merge::graft`).
+pub(crate) type TermIndexSplice<'a> =
+    &'a (dyn Fn(&term_index::Root) -> Option<term_index::Root> + Send + Sync);
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn try_commit_attempt(
     storage: Arc<dyn StorageProvider>,
@@ -13986,6 +14019,9 @@ pub(crate) async fn try_commit_attempt(
     mut rebuilt_parts: Option<&mut RebuiltParts>,
     // Checked immediately before the pointer PUT; see [`CommitFence`].
     fence: Option<&mut dyn CommitFence>,
+    // Set by a graft: the commit's superfiles carry no contributions, their
+    // postings are layers this stacks on the current root.
+    splice: Option<TermIndexSplice<'_>>,
 ) -> Result<ManifestSnapshot, SupertableCommitError> {
     // 1. Write each new superfile's bytes to storage in parallel.
     write_superfile_list(
@@ -14147,7 +14183,37 @@ pub(crate) async fn try_commit_attempt(
         }
         _ => None,
     };
-    if let Some(reference) = unreadable_prior {
+    let spliced = match splice.filter(|_| term_contributions.is_empty()) {
+        None => None,
+        Some(splice) => {
+            let current = match current_manifest.term_index_ref() {
+                // Unreadable for now: fail the attempt and retry rather than publish superfiles the index cannot
+                // list.
+                Some(reference) => term_index::load_root(storage.as_ref(), reference)
+                    .await
+                    .map_err(|e| BuildError::Store(e.to_string()))?,
+                None => term_index::Root::default(),
+            };
+            match splice(&current) {
+                None => None,
+                Some(root) => {
+                    let listed: HashSet<Uuid> = root.superfiles.iter().copied().collect();
+                    let complete = (current_manifest.term_index_complete()
+                        || current_manifest.holds_no_superfiles())
+                        && new_entries.iter().all(|e| listed.contains(&e.superfile_id));
+                    // No fold here: a fold across replicas would leave a layer that neither replica's fold can
+                    // replace.
+                    let reference = term_index::write_root(storage.as_ref(), &root)
+                        .await
+                        .map_err(|e| BuildError::Store(e.to_string()))?;
+                    Some((reference, complete))
+                }
+            }
+        }
+    };
+    if let Some((reference, complete)) = spliced {
+        new_manifest = new_manifest.with_term_index_ref(reference, complete);
+    } else if let Some(reference) = unreadable_prior {
         new_manifest = new_manifest.with_term_index_ref(reference, false);
     } else if !term_contributions.is_empty() {
         // A delta on top of a complete index stays complete; the first
@@ -21585,6 +21651,7 @@ mod lost_write_span_tests {
                 None,
                 None,
                 fence,
+                None,
             )
             .instrument(attempt_span()),
         );
