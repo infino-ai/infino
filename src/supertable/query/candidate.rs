@@ -1767,24 +1767,25 @@ fn collect_like_leaves(
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{sync::Mutex, time::Duration};
 
     use arrow_array::{Int32Array, LargeStringArray, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
+    use async_trait::async_trait;
     use bytes::Bytes;
     use datafusion::{
         logical_expr::expr::InList,
         prelude::{cast, col, lit},
     };
     use rayon::ThreadPoolBuilder;
-    use tokio::time::timeout;
+    use tokio::{task::yield_now, time::timeout};
     use uuid::Uuid;
 
     use super::*;
     use crate::{
         runtime_bridge::held_pool,
         superfile::{
-            BytesLazyByteSource, LazyByteSource,
+            BytesLazyByteSource, LazyByteSource, LazyByteSourceError, OpenOptions,
             builder::{BuilderOptions, FtsConfig, SuperfileBuilder},
             fts::{
                 analysis::{Stemmer, Stopwords, chain_tokenizer},
@@ -3095,6 +3096,85 @@ mod tests {
             .expect("finishes without a slot")
             .expect("match");
         assert_eq!(row_list(rows), Some(vec![0, 2]));
+    }
+
+    /// A source whose every read waits one turn first, as a shared cell
+    /// another query is filling does, and notes how many `slots` were free
+    /// when it was asked.
+    struct SlotWatchingSource {
+        bytes: BytesLazyByteSource,
+        slots: Arc<Semaphore>,
+        free_at_read: Mutex<Vec<usize>>,
+    }
+
+    #[async_trait]
+    impl LazyByteSource for SlotWatchingSource {
+        fn size(&self) -> u64 {
+            self.bytes.size()
+        }
+
+        async fn range(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
+            self.free_at_read
+                .lock()
+                .expect("free_at_read lock")
+                .push(self.slots.available_permits());
+            yield_now().await;
+            self.bytes.range(start, len).await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_match_that_waits_on_the_pool_reruns_here_without_its_slot() {
+        // A resident superfile whose index reads wait one turn, and one slot.
+        // - On the pool the match reads while holding the slot, and gives up.
+        // - It reruns here with the slot free, and finds rows 0 and 2.
+        // This test pins the fallback: a match the pool cannot finish in one
+        // poll still answers, and does not hold a slot while it reruns.
+        let bytes = titled_superfile().0;
+        let slots = Arc::new(Semaphore::new(1));
+        let source = Arc::new(SlotWatchingSource {
+            bytes: BytesLazyByteSource::new(bytes.clone()),
+            slots: Arc::clone(&slots),
+            free_at_read: Mutex::new(Vec::new()),
+        });
+        let as_source: Arc<dyn LazyByteSource> = Arc::clone(&source) as Arc<dyn LazyByteSource>;
+        let mut reader = SuperfileReader::open_lazy_with(as_source, OpenOptions::default())
+            .await
+            .expect("lazy open");
+        reader
+            .install_resident_parquet(bytes, (0, 0))
+            .expect("promote");
+        source
+            .free_at_read
+            .lock()
+            .expect("free_at_read lock")
+            .clear();
+
+        let pool = one_thread_pool();
+        let (rows, _) = timeout(
+            MUST_FINISH,
+            Arc::new(terms_all(&["rust"])).evaluate_on_pool(
+                Arc::new(reader),
+                &pool,
+                &slots,
+                TermMemos::new(),
+            ),
+        )
+        .await
+        .expect("finishes")
+        .expect("match");
+        assert_eq!(row_list(rows), Some(vec![0, 2]));
+        let free_at_read = source.free_at_read.lock().expect("free_at_read lock");
+        assert_eq!(
+            free_at_read.first(),
+            Some(&0),
+            "the first read is on the pool, holding the slot"
+        );
+        assert_eq!(
+            free_at_read.last(),
+            Some(&1),
+            "the rerun reads with the slot free"
+        );
     }
 
     #[tokio::test]
