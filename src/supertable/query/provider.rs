@@ -2173,6 +2173,7 @@ impl TableProvider for SupertableProvider {
                             let (bitmap, eval_work) = plan
                                 .evaluate_on_pool(
                                     Arc::clone(&prepared.reader),
+                                    entry.superfile_id,
                                     reader_pool,
                                     match_slots,
                                     memos,

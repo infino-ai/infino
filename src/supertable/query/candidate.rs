@@ -108,6 +108,7 @@ use rayon::ThreadPool;
 use roaring::RoaringBitmap;
 use tokio::sync::Semaphore;
 use tracing::debug;
+use uuid::Uuid;
 
 use crate::{
     runtime_bridge::run_on_pool_while_awaited,
@@ -531,6 +532,7 @@ impl CandidatePlan {
     pub(crate) async fn evaluate_on_pool(
         self: Arc<Self>,
         reader: Arc<SuperfileReader>,
+        superfile: Uuid,
         pool: &ThreadPool,
         slots: &Semaphore,
         mut memos: TermMemos,
@@ -564,6 +566,7 @@ impl CandidatePlan {
             // routinely they would each do their work twice, and a bench
             // would still read flat against main.
             debug!(
+                %superfile,
                 "a resident match could not finish on the pool; rerunning it on the planning task"
             );
             memos = returned;
@@ -830,6 +833,19 @@ impl CandidatePlan {
     /// ([`TermsLike`](Self::TermsLike)). The provider expands such a plan
     /// once per superfile and estimates / evaluates the result, instead of
     /// paying the dictionary walk in both steps.
+    pub(crate) fn has_like(&self) -> bool {
+        match self {
+            CandidatePlan::TermsLike { .. } => true,
+            CandidatePlan::And(children) | CandidatePlan::Or(children) => {
+                children.iter().any(CandidatePlan::has_like)
+            }
+            CandidatePlan::TermsAll { .. }
+            | CandidatePlan::TermsAny { .. }
+            | CandidatePlan::Range { .. }
+            | CandidatePlan::Unbounded => false,
+        }
+    }
+
     /// How many `AND`/`OR` levels deep this plan nests; a leaf is 1.
     fn depth(&self) -> usize {
         match self {
@@ -841,19 +857,6 @@ impl CandidatePlan {
             | CandidatePlan::TermsLike { .. }
             | CandidatePlan::Range { .. }
             | CandidatePlan::Unbounded => 1,
-        }
-    }
-
-    pub(crate) fn has_like(&self) -> bool {
-        match self {
-            CandidatePlan::TermsLike { .. } => true,
-            CandidatePlan::And(children) | CandidatePlan::Or(children) => {
-                children.iter().any(CandidatePlan::has_like)
-            }
-            CandidatePlan::TermsAll { .. }
-            | CandidatePlan::TermsAny { .. }
-            | CandidatePlan::Range { .. }
-            | CandidatePlan::Unbounded => false,
         }
     }
 
@@ -3029,6 +3032,7 @@ mod tests {
         let slots = Semaphore::new(1);
         let mut matched = Box::pin(Arc::new(terms_all(&["rust"])).evaluate_on_pool(
             resident_reader(),
+            Uuid::nil(),
             &pool,
             &slots,
             TermMemos::new(),
@@ -3064,8 +3068,13 @@ mod tests {
         assert_eq!(deep.depth(), MAX_POOL_PLAN_DEPTH + 1);
         let (pool, _release) = held_pool();
         let slots = Semaphore::new(1);
-        let matched =
-            Arc::new(deep).evaluate_on_pool(resident_reader(), &pool, &slots, TermMemos::new());
+        let matched = Arc::new(deep).evaluate_on_pool(
+            resident_reader(),
+            Uuid::nil(),
+            &pool,
+            &slots,
+            TermMemos::new(),
+        );
         let (rows, _) = timeout(MUST_FINISH, matched)
             .await
             .expect("finishes without the busy pool")
@@ -3087,6 +3096,7 @@ mod tests {
         let no_slots = Semaphore::new(0);
         let matched = Arc::new(terms_all(&["rust"])).evaluate_on_pool(
             reader,
+            Uuid::nil(),
             &pool,
             &no_slots,
             TermMemos::new(),
@@ -3109,7 +3119,13 @@ mod tests {
         let like = Arc::new(plan(col("title").like(lit("rust%"))));
         let pool = one_thread_pool();
         let no_slots = Semaphore::new(0);
-        let matched = like.evaluate_on_pool(resident_reader(), &pool, &no_slots, TermMemos::new());
+        let matched = like.evaluate_on_pool(
+            resident_reader(),
+            Uuid::nil(),
+            &pool,
+            &no_slots,
+            TermMemos::new(),
+        );
         let (rows, _) = timeout(MUST_FINISH, matched)
             .await
             .expect("finishes without a slot")
@@ -3174,6 +3190,7 @@ mod tests {
             MUST_FINISH,
             Arc::new(terms_all(&["rust"])).evaluate_on_pool(
                 Arc::new(reader),
+                Uuid::nil(),
                 &pool,
                 &slots,
                 TermMemos::new(),
@@ -3210,6 +3227,7 @@ mod tests {
         let (busy, _release) = held_pool();
         let mut queued = Box::pin(Arc::clone(&rust).evaluate_on_pool(
             Arc::clone(&reader),
+            Uuid::nil(),
             &busy,
             &slots,
             TermMemos::new(),
@@ -3226,7 +3244,7 @@ mod tests {
         let free = one_thread_pool();
         timeout(
             MUST_FINISH,
-            rust.evaluate_on_pool(reader, &free, &slots, TermMemos::new()),
+            rust.evaluate_on_pool(reader, Uuid::nil(), &free, &slots, TermMemos::new()),
         )
         .await
         .expect("finishes on a free pool")
