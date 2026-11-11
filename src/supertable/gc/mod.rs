@@ -421,23 +421,30 @@ pub(super) async fn gc_storage_sweep_for_inner(
 
     let mut report = GcReport::default();
 
+    // Attached replicas' superfiles and slices sit here unlisted until grafted.
+    let attached = !crate::storage::attached_replicas(storage.as_ref())
+        .await?
+        .is_empty();
     let mut prefixes = vec![
         MANIFEST_DIR,
         MANIFEST_PARTS_DIR,
         MANIFEST_SUMMARIES_DIR,
         MANIFEST_ROLLUPS_DIR,
         SLOW_VECTOR_STATE_STORAGE_PREFIX,
-        TERM_INDEX_STORAGE_PREFIX,
         // Tombstone sidecars under `superfiles/` (live set includes the
         // paths for current superfiles; orphans age out past the safety gap).
         SUPERFILES_DIR,
     ];
-    if superfiles_complete {
+    if !attached {
+        prefixes.push(TERM_INDEX_STORAGE_PREFIX);
+    }
+    let sweep_data = superfiles_complete && !attached;
+    if sweep_data {
         prefixes.push(SUPERFILE_DATA_DIR);
     }
 
     // `data/` is only listed when membership is complete, so the check needs that too.
-    let check_integrity = superfiles_complete;
+    let check_integrity = sweep_data;
 
     let mut candidates: Vec<(String, u64, SystemTime)> = Vec::new();
     // Referenced superfiles the `data/` listing returned. Only a shortfall against the referenced
