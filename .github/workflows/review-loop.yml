@@ -161,7 +161,7 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       REPO: ${{ github.repository }}
       CARGO_TERM_COLOR: always
-      RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=lld
+      RUSTFLAGS: -D warnings
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
       CARGO_PROFILE_TEST_DEBUG: line-tables-only
     steps:
@@ -214,8 +214,6 @@ jobs:
           df -h /
           echo "runner: $RUNNER_NAME, $(nproc) cores, $(free -g | awk '/Mem:/ {print $2}') GB"
 
-      - name: Install lld
-        run: sudo apt-get install -y --no-install-recommends lld
 
       # The cache key hashes every installed Rust toolchain. The runner image's own `stable` moves
       # when GitHub updates the image, which would change the key under an unchanged repo; with only
