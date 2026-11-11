@@ -25,16 +25,15 @@ jobs:
     name: Format & Clippy
     runs-on: ubuntu-latest
     env:
-      # The suite links dozens of binaries; lld cuts the link phase.
+      # The suite links dozens of binaries; the toolchain's bundled lld (the
+      # default on x86_64 Linux since Rust 1.90) keeps the link phase short.
       # Full DWARF is never read in CI — line tables are enough for
       # backtraces (llvm-cov uses its own instrumentation, not DWARF).
-      RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=lld
+      RUSTFLAGS: -D warnings
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
       CARGO_PROFILE_TEST_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@v4
-      - name: Install lld
-        run: sudo apt-get install -y --no-install-recommends lld
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -49,7 +48,7 @@ jobs:
     name: Tests & coverage
     runs-on: ubuntu-latest
     env:
-      RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=lld
+      RUSTFLAGS: -D warnings
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
       CARGO_PROFILE_TEST_DEBUG: line-tables-only
     steps:
@@ -67,8 +66,6 @@ jobs:
           sudo docker image prune --all --force > /dev/null
           sudo swapoff -a && sudo rm -f /mnt/swapfile
           df -h /
-      - name: Install lld
-        run: sudo apt-get install -y --no-install-recommends lld
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # Prebuilt binaries in seconds, instead of `cargo install` (minutes
@@ -85,13 +82,11 @@ jobs:
     name: Doctest, remote & storage
     runs-on: ubuntu-latest
     env:
-      RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=lld
+      RUSTFLAGS: -D warnings
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
       CARGO_PROFILE_TEST_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@v4
-      - name: Install lld
-        run: sudo apt-get install -y --no-install-recommends lld
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
