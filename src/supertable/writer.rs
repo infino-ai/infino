@@ -828,11 +828,9 @@ fn split_target_bytes(options: &SupertableOptions) -> usize {
 }
 
 /// How many superfiles a commit of `buffer` becomes: [`superfiles_per_commit`]'s
-/// count from the buffered bytes, capped by the writer pool. The bytes are the
-/// Arrow footprint of every scalar and vector column the buffer holds (Arrow
-/// reports capacity, not logical bytes — fine for a fanout heuristic that is
-/// clamped to the pool anyway), less the slots its null cells keep
-/// ([`set_cell_bytes`]). A wide, sparse batch's footprint is almost all such
+/// count from the buffered bytes, capped by the writer pool. The bytes are
+/// what every scalar and vector column the buffer holds takes ([`visible_array_bytes`]),
+/// less the slots its null cells keep ([`set_cell_bytes`]). A wide, sparse batch's footprint is almost all such
 /// slots, and each superfile of a commit stores, describes and summarises
 /// every column its rows set, so cut by its footprint it would pay that
 /// per-column cost once per piece for pieces its values do not need. The
@@ -842,23 +840,30 @@ fn split_target_bytes(options: &SupertableOptions) -> usize {
 /// whichever path builds it.
 fn commit_superfile_count(buffer: &[BufferedBatch], options: &SupertableOptions) -> usize {
     let total_rows: usize = buffer.iter().map(|b| b.scalar.num_rows()).sum();
-    let buffered_bytes: usize = buffer
+    let n_threads = options.writer_pool.current_num_threads().max(1);
+    superfiles_per_commit(
+        total_rows,
+        commit_buffered_bytes(buffer),
+        n_threads,
+        split_target_bytes(options),
+    )
+}
+
+/// The bytes [`commit_superfile_count`] sizes a commit of `buffer` by. Each
+/// column is sized by the rows it holds, not by its buffers: every column of
+/// an IPC-decoded batch points into the one message buffer, so Arrow's
+/// buffer-based size counts that whole buffer once per column.
+fn commit_buffered_bytes(buffer: &[BufferedBatch]) -> usize {
+    buffer
         .iter()
         .map(|b| {
             set_cell_bytes(&b.scalar)
                 + b.vectors
                     .iter()
-                    .map(|v| v.get_array_memory_size())
+                    .map(|v| usize::try_from(visible_array_bytes(v.as_ref())).unwrap_or(usize::MAX))
                     .sum::<usize>()
         })
-        .sum();
-    let n_threads = options.writer_pool.current_num_threads().max(1);
-    superfiles_per_commit(
-        total_rows,
-        buffered_bytes,
-        n_threads,
-        split_target_bytes(options),
-    )
+        .sum()
 }
 
 /// Where a commit of `buffer` is cut into superfiles: `bounds[i]..bounds[i + 1]`
@@ -14731,8 +14736,8 @@ mod tests {
 
     use arrow::{compute::concat_batches, ipc::reader::StreamReader};
     use arrow_array::{
-        Array, Decimal128Array, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch,
-        StringArray, StructArray,
+        Array, ArrayRef, Decimal128Array, FixedSizeListArray, Float32Array, Float64Array,
+        Int32Array, LargeStringArray, RecordBatch, StringArray, StructArray,
     };
     use arrow_schema::{DataType, Field, Fields, Schema};
     use datafusion::prelude::{col, lit};
@@ -18069,6 +18074,149 @@ mod tests {
     }
 
     // ---- rayon-shard parallelism -------------------------------------
+
+    /// Rows in the IPC-decoded commit-sizing test: a typical append's shape,
+    /// scaled down.
+    const IPC_SIZED_ROWS: usize = 2048;
+    /// Vector width in the IPC-decoded commit-sizing tests.
+    const IPC_SIZED_DIM: i32 = 768;
+    /// Writer pool width in the IPC-decoded append test, wider than the
+    /// superfile count its batch splits into.
+    const IPC_APPEND_POOL: usize = 16;
+    /// Split target, in MiB, in the IPC-decoded append test: small enough
+    /// that its batch spans several superfiles.
+    const IPC_APPEND_SPLIT_MB: u64 = 1;
+
+    #[test]
+    fn an_ipc_decoded_commit_is_sized_by_its_own_bytes() {
+        // An append arrives as one Arrow IPC message, and every column decodes
+        // as a slice of that one message buffer. The commit must be sized by
+        // the bytes the batch holds, not by the shared buffer once per column.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("url", DataType::Utf8, false),
+            Field::new("dump", DataType::Utf8, false),
+            Field::new("score", DataType::Float64, false),
+            Field::new("tokens", DataType::Int32, false),
+            Field::new(
+                "embedding",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float32, false)),
+                    IPC_SIZED_DIM,
+                ),
+                false,
+            ),
+        ]));
+        let text = |prefix: &str| -> ArrayRef {
+            Arc::new(StringArray::from_iter_values(
+                (0..IPC_SIZED_ROWS).map(|i| format!("{prefix}-{i:08}")),
+            ))
+        };
+        let values = Float32Array::from_iter_values(
+            (0..IPC_SIZED_ROWS * IPC_SIZED_DIM as usize).map(|i| i as f32),
+        );
+        let embedding = FixedSizeListArray::new(
+            Arc::new(Field::new("item", DataType::Float32, false)),
+            IPC_SIZED_DIM,
+            Arc::new(values),
+            None,
+        );
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                text("id"),
+                text("https://example.com/page"),
+                text("CC-MAIN"),
+                Arc::new(Float64Array::from_iter_values(
+                    (0..IPC_SIZED_ROWS).map(|i| i as f64),
+                )),
+                Arc::new(Int32Array::from_iter_values(
+                    (0..IPC_SIZED_ROWS).map(|i| i as i32),
+                )),
+                Arc::new(embedding),
+            ],
+        )
+        .expect("batch");
+
+        let decoded = ipc_round_trip(&batch);
+
+        let vector_index = decoded.schema().index_of("embedding").expect("embedding");
+        let vectors = Arc::new(
+            decoded
+                .column(vector_index)
+                .as_any()
+                .downcast_ref::<FixedSizeListArray>()
+                .expect("fixed-size list")
+                .values()
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .expect("f32 values")
+                .clone(),
+        );
+        let mut scalar = decoded.clone();
+        scalar.remove_column(vector_index);
+        let buffered = [BufferedBatch {
+            scalar,
+            vectors: vec![vectors],
+        }];
+
+        // What the batch holds: its own bytes, before any IPC round trip.
+        let own_bytes: usize = batch
+            .columns()
+            .iter()
+            .map(|c| c.to_data().get_slice_memory_size().expect("slice size"))
+            .sum();
+        let measured = commit_buffered_bytes(&buffered);
+        assert_eq!(
+            measured, own_bytes,
+            "commit sized by bytes the batch does not hold"
+        );
+    }
+
+    #[test]
+    fn an_ipc_decoded_append_commits_as_many_superfiles_as_the_batch_itself() {
+        // The same rows appended as built and as decoded from one IPC message
+        // must commit to the same number of superfiles, through the whole
+        // append path: resolving the batch, minting `_id`, and moving the
+        // vectors out of the scalar batch.
+        let dim = IPC_SIZED_DIM as usize;
+        let schema = schema_id_title_emb(dim);
+        let titles = LargeStringArray::from_iter_values(
+            (0..IPC_SIZED_ROWS).map(|i| format!("https://example.com/page-{i:08}")),
+        );
+        let values =
+            Float32Array::from_iter_values((0..IPC_SIZED_ROWS * dim).map(|i| (i % 97) as f32));
+        let DataType::FixedSizeList(item, _) = fixed_list_f32(dim) else {
+            unreachable!("fixed_list_f32 builds a fixed-size list");
+        };
+        let embedding = FixedSizeListArray::new(item, IPC_SIZED_DIM, Arc::new(values), None);
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(titles), Arc::new(embedding)],
+        )
+        .expect("batch");
+
+        let superfiles_after_append = |batch: &RecordBatch| -> usize {
+            let options = options_with_vector(dim)
+                .with_writer_pool(writer_pool_with(IPC_APPEND_POOL))
+                .with_superfile_buffer_split_mb(IPC_APPEND_SPLIT_MB);
+            let table = Supertable::create(options).expect("create");
+            let mut writer = table.writer().expect("writer");
+            writer.append(batch).expect("append");
+            writer.commit().expect("commit");
+            table.reader().expect("reader").n_superfiles()
+        };
+        let built = superfiles_after_append(&batch);
+        let decoded = superfiles_after_append(&ipc_round_trip(&batch));
+        assert!(
+            built > 1,
+            "the batch must span several superfiles for the count to mean anything, got {built}"
+        );
+        assert_eq!(
+            decoded, built,
+            "an IPC-decoded append committed to {decoded} superfiles, the batch itself to {built}"
+        );
+    }
 
     #[test]
     fn commit_superfile_count_follows_bytes_not_pool_size() {

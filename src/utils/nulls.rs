@@ -20,6 +20,8 @@ use arrow::compute::{concat, concat_batches, take};
 use arrow_array::{Array, ArrayRef, RecordBatch, UInt32Array, new_null_array};
 use arrow_schema::{ArrowError, DataType, Schema, SchemaRef};
 
+use crate::runtime_metrics::ingest::visible_array_bytes;
+
 /// One all-null array per type, every one `len` rows long, made on first
 /// use and handed out to every column of that type that holds nothing.
 pub(crate) struct SharedNulls {
@@ -159,11 +161,11 @@ pub(crate) fn concat_sharing_nulls<'a>(
     RecordBatch::try_new(Arc::clone(schema), columns)
 }
 
-/// The Arrow footprint of `batch`'s columns less what their null cells keep
-/// ([`null_slot_bytes`] each): about what the values it holds take. A
-/// column with no nulls counts its whole footprint, so a dense batch counts
-/// what Arrow reports for it; on a wide, sparse batch, where nearly every
-/// cell is a null keeping a slot, it counts the cells that are set.
+/// The bytes `batch`'s columns hold ([`visible_array_bytes`] each) less what
+/// their null cells keep ([`null_slot_bytes`] each): about what the values it holds
+/// take. A column with no nulls counts all it holds; on a wide, sparse batch,
+/// where nearly every cell is a null keeping a slot, it counts the cells that
+/// are set.
 pub(crate) fn set_cell_bytes(batch: &RecordBatch) -> usize {
     batch
         .columns()
@@ -171,9 +173,8 @@ pub(crate) fn set_cell_bytes(batch: &RecordBatch) -> usize {
         .map(|column| {
             let null_slots =
                 (column.null_count() as u64).saturating_mul(null_slot_bytes(column.data_type()));
-            column
-                .get_array_memory_size()
-                .saturating_sub(usize::try_from(null_slots).unwrap_or(usize::MAX))
+            let set = visible_array_bytes(column.as_ref()).saturating_sub(null_slots);
+            usize::try_from(set).unwrap_or(usize::MAX)
         })
         .sum()
 }
@@ -257,8 +258,11 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use arrow_array::{Int64Array, LargeStringArray, NullArray};
-    use arrow_schema::{Field, Schema};
+    use arrow_array::{
+        DictionaryArray, FixedSizeListArray, Int32Array, Int64Array, LargeStringArray, NullArray,
+        StringViewArray, StructArray,
+    };
+    use arrow_schema::{Field, Fields, Schema};
 
     use super::{test_support::distinct_buffer_bytes, *};
 
@@ -281,7 +285,12 @@ mod tests {
             ],
         )
         .expect("dense batch");
-        assert_eq!(set_cell_bytes(&dense), dense.get_array_memory_size());
+        let dense_held: u64 = dense
+            .columns()
+            .iter()
+            .map(|c| visible_array_bytes(c.as_ref()))
+            .sum();
+        assert_eq!(set_cell_bytes(&dense) as u64, dense_held);
 
         let one_in_a_hundred = |r: usize| r.is_multiple_of(100);
         let sparse = RecordBatch::try_new(
@@ -301,6 +310,110 @@ mod tests {
             set > 0 && set * 20 < sparse.get_array_memory_size(),
             "{set} of {} bytes",
             sparse.get_array_memory_size()
+        );
+    }
+
+    /// Rows in the view-column sizing test.
+    const VIEW_ROWS: usize = 2048;
+    /// Length of each value in the view-column sizing test: far past what a
+    /// view holds inline, so every value lives in a payload buffer.
+    const VIEW_VALUE_LEN: usize = 4096;
+
+    /// A view column counts the payload its values keep out of line, not
+    /// only the fixed-width views that point at it.
+    #[test]
+    fn set_cell_bytes_counts_a_view_columns_payload() {
+        let value = "x".repeat(VIEW_VALUE_LEN);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "s",
+            DataType::Utf8View,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringViewArray::from_iter_values(
+                (0..VIEW_ROWS).map(|_| value.as_str()),
+            ))],
+        )
+        .expect("view batch");
+        let set = set_cell_bytes(&batch);
+        assert!(
+            set >= VIEW_ROWS * VIEW_VALUE_LEN,
+            "{set} bytes for {VIEW_ROWS} values of {VIEW_VALUE_LEN} bytes"
+        );
+    }
+
+    /// A view column nested in a struct counts its payload the same way:
+    /// Arrow's own sizing recurses into struct children and would see only
+    /// the fixed-width views.
+    #[test]
+    fn set_cell_bytes_counts_a_view_payload_inside_a_struct() {
+        let value = "x".repeat(VIEW_VALUE_LEN);
+        let child = Field::new("s", DataType::Utf8View, false);
+        let nested = StructArray::new(
+            Fields::from(vec![child]),
+            vec![Arc::new(StringViewArray::from_iter_values(
+                (0..VIEW_ROWS).map(|_| value.as_str()),
+            ))],
+            None,
+        );
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "st",
+            nested.data_type().clone(),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(nested)]).expect("struct batch");
+        let set = set_cell_bytes(&batch);
+        assert!(
+            set >= VIEW_ROWS * VIEW_VALUE_LEN,
+            "{set} bytes for {VIEW_ROWS} nested values of {VIEW_VALUE_LEN} bytes"
+        );
+    }
+
+    /// A view column under a fixed-size list inside a struct counts its
+    /// out-of-line payload.
+    #[test]
+    fn set_cell_bytes_counts_a_view_payload_inside_a_fixed_size_list() {
+        let value = "x".repeat(VIEW_VALUE_LEN);
+        let item = Arc::new(Field::new("item", DataType::Utf8View, false));
+        let list = FixedSizeListArray::new(
+            item,
+            1,
+            Arc::new(StringViewArray::from_iter_values(
+                (0..VIEW_ROWS).map(|_| value.as_str()),
+            )),
+            None,
+        );
+        let child = Field::new("l", list.data_type().clone(), false);
+        let nested = StructArray::new(Fields::from(vec![child]), vec![Arc::new(list)], None);
+        assert_counts_view_payload(nested.data_type().clone(), Arc::new(nested));
+    }
+
+    /// A view column in a nested type without its own arm, here a
+    /// dictionary's values, still counts its out-of-line payload.
+    #[test]
+    fn set_cell_bytes_counts_a_view_payload_inside_a_dictionary() {
+        let values: Vec<String> = (0..VIEW_ROWS)
+            .map(|r| format!("{r:0>width$}", width = VIEW_VALUE_LEN))
+            .collect();
+        let dictionary = DictionaryArray::new(
+            Int32Array::from_iter_values(0..VIEW_ROWS as i32),
+            Arc::new(StringViewArray::from_iter_values(
+                values.iter().map(String::as_str),
+            )),
+        );
+        assert_counts_view_payload(dictionary.data_type().clone(), Arc::new(dictionary));
+    }
+
+    /// Checks a one-column batch of `column` counts at least the
+    /// [`VIEW_ROWS`] × [`VIEW_VALUE_LEN`] bytes of view payload it holds.
+    fn assert_counts_view_payload(data_type: DataType, column: ArrayRef) {
+        let schema = Arc::new(Schema::new(vec![Field::new("c", data_type, false)]));
+        let batch = RecordBatch::try_new(schema, vec![column]).expect("nested view batch");
+        let set = set_cell_bytes(&batch);
+        assert!(
+            set >= VIEW_ROWS * VIEW_VALUE_LEN,
+            "{set} bytes for {VIEW_ROWS} nested values of {VIEW_VALUE_LEN} bytes"
         );
     }
 

@@ -285,7 +285,7 @@ jobs:
           nohup sh -c 'cargo test --features test-helpers --lib --no-run &&
             cargo test --features test-helpers --no-run &&
             cargo clippy --all-targets --features test-helpers &&
-            cargo llvm-cov --no-report nextest --features test-helpers,graph-index --no-tests=pass -E \"none()\" &&
+            cargo llvm-cov --no-report nextest --features test-helpers,graph-index --no-tests=pass -E "none()" &&
             RUSTUP_TOOLCHAIN=$PUBLIC_API_NIGHTLY cargo public-api --simplified > /dev/null' > "$RUNNER_TEMP/warm-build.log" 2>&1 &
 
       - name: Install Claude Code and Codex
