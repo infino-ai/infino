@@ -6211,6 +6211,22 @@ mod tests {
             !msg.contains("DataFusion") && !msg.contains("Execution error"),
             "must not leak query-engine internals: {msg}"
         );
+
+        // A near miss names the column it was likely meant to be.
+        let near = r
+            .bm25_search(
+                "title",
+                "rust",
+                5,
+                Bm25SearchOptions::new().with_mode(BoolMode::Or),
+                Some(&["titel"]),
+            )
+            .expect_err("a misspelt projection column must error")
+            .to_string();
+        assert!(
+            near.contains("did you mean \"title\"?"),
+            "suggests the column: {near}"
+        );
     }
 
     #[test]
