@@ -57,6 +57,19 @@ impl SuperfileStats {
         })
     }
 
+    /// Stats of `batch`, some of a superfile's columns of some of its rows,
+    /// the id column not among them: its columns' stats alone. The rows
+    /// are counted, and the id range taken, from the batch that holds the
+    /// id column.
+    pub(crate) fn of_columns(batch: &RecordBatch) -> Self {
+        Self {
+            n_docs: 0,
+            id_min: i128::MAX,
+            id_max: i128::MIN,
+            scalar_stats: ScalarStatsAgg::from_batches(&batch.schema(), &[batch]),
+        }
+    }
+
     pub fn from_children(stats: &[Self]) -> Self {
         let mut total = Self {
             n_docs: 0,

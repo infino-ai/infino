@@ -442,10 +442,13 @@ pub struct CompactionSettings {
     /// closes them out first — it is the backstop for a partition of unusually
     /// large superfiles, not a typical job's size.
     ///
-    /// It is also NOT a bound on the merge's resident set, which runs several
-    /// times higher once rows are decoded and the output encoded, and it does
-    /// not govern how many merges run at once: the runner admits them against
-    /// the host's free memory.
+    /// It is also not what bounds a merge's memory: a merge streams its rows
+    /// through a window of decoded bytes, writing a bounded number of
+    /// columns at a time, so what it holds does not grow with its input
+    /// (a merge that must rebuild an input's vector or full-text index from
+    /// its rows still holds them). Nor does it govern how many merges run
+    /// at once: the runner admits them against the host's free memory. It
+    /// is a file-size choice.
     ///
     /// The YAML key `max_memory_mb` is the deprecated name of this setting;
     /// the loader folds it into this field with a warning, as the one entry
