@@ -39,7 +39,8 @@
 
 use std::{
     collections::HashSet,
-    ops::Range,
+    mem::size_of,
+    ops::{Add, Range},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -72,6 +73,15 @@ const DECODE_ROOT: &str = "page_index";
 /// (each has a header), so it also marks the entry as not loaded
 /// ([`is_loaded`]).
 const UNLOADED_PAGE_SIZE: i32 = 0;
+
+/// The memory one column chunk not loaded takes in a footer, as arrow-rs's
+/// `memory_size()` counts it: its `NONE` column index, its offset index and
+/// that index's one page location ([`unloaded_offset_index`]). A reader
+/// subtracts it to tell the page index it decoded from the placeholders
+/// around it.
+pub(crate) const UNLOADED_CHUNK_BYTES: u64 = (size_of::<ColumnIndexMetaData>()
+    + size_of::<OffsetIndexMetaData>()
+    + size_of::<PageLocation>()) as u64;
 
 /// Which top-level columns' page index a load brings in.
 #[derive(Clone, Debug)]
@@ -167,6 +177,9 @@ pub(crate) struct PageIndexBytes {
     /// File offset of the first byte.
     start: u64,
     bytes: Bytes,
+    /// Whether these bytes are a copy of their own ([`Self::copied`]) rather
+    /// than a slice of bytes the reader holds anyway ([`Self::slice`]).
+    copy: bool,
 }
 
 impl PageIndexBytes {
@@ -181,6 +194,12 @@ impl PageIndexBytes {
         self.bytes.len() as u64
     }
 
+    /// The memory keeping these bytes takes: their length when they are a
+    /// copy, nothing when they are a slice of a resident file.
+    pub(crate) fn held_len(&self) -> u64 {
+        if self.copy { self.len() } else { 0 }
+    }
+
     /// `span`'s bytes, out of `read`, which starts at file offset `start`;
     /// `None` when `read` doesn't hold all of `span`. A slice, so it shares
     /// `read`'s buffer: right for a resident file, whose bytes stay anyway.
@@ -188,6 +207,7 @@ impl PageIndexBytes {
         Some(Self {
             start: span.start,
             bytes: slice_at(read, start, span)?,
+            copy: false,
         })
     }
 
@@ -198,6 +218,7 @@ impl PageIndexBytes {
         Some(Self {
             start: kept.start,
             bytes: Bytes::copy_from_slice(&kept.bytes),
+            copy: true,
         })
     }
 
@@ -295,6 +316,18 @@ impl PageIndexBytes {
 pub(crate) struct LoadCost {
     pub(crate) decode: Duration,
     pub(crate) copy: Duration,
+}
+
+impl Add for LoadCost {
+    type Output = Self;
+
+    /// Two loads' costs together.
+    fn add(self, other: Self) -> Self {
+        Self {
+            decode: self.decode + other.decode,
+            copy: self.copy + other.copy,
+        }
+    }
 }
 
 /// The bytes of page index (column and offset index) the leaves in `leaves`
@@ -742,6 +775,26 @@ mod tests {
                 "selected: {selected}"
             );
         }
+    }
+
+    /// [`UNLOADED_CHUNK_BYTES`] is what arrow-rs counts for a chunk not
+    /// loaded: a footer of placeholders only takes exactly that per chunk
+    /// over the bare footer, plus each row group's two entry lists. A
+    /// dependency bump that changes the layout fails here instead of
+    /// skewing a reader's memory rule.
+    #[test]
+    fn a_chunk_not_loaded_takes_the_placeholder_size_arrow_counts() {
+        let (bytes, footer) = fixture();
+        let placeholders = load(&kept(&bytes, &footer), &footer, &[]);
+        let chunks =
+            (footer.num_row_groups() * footer.file_metadata().schema_descr().num_columns()) as u64;
+        let lists = footer.num_row_groups() as u64
+            * (size_of::<Vec<ColumnIndexMetaData>>() + size_of::<Vec<OffsetIndexMetaData>>())
+                as u64;
+        assert_eq!(
+            (placeholders.memory_size() - footer.memory_size()) as u64,
+            chunks * UNLOADED_CHUNK_BYTES + lists
+        );
     }
 
     #[test]

@@ -78,7 +78,7 @@ use crate::{
         },
         id_space::{FtsDocId, RowId},
         ids::{self, PackedIds},
-        page_index::{IndexColumns, LoadCost, PageIndexBytes, index_len},
+        page_index::{IndexColumns, LoadCost, PageIndexBytes, UNLOADED_CHUNK_BYTES, index_len},
         range::{KeyKind, RangeDirectory, same_keys},
         vector::{
             layout::VectorLayout,
@@ -258,10 +258,20 @@ impl Footer {
 /// another, could spend far more than one load of every column. It keeps
 /// what its loads have cost ([`LoadCosts`]), and when the next one would take
 /// that past the cost of loading every column, it loads every column
-/// instead: the classic rent-or-buy rule, so a reader spends about twice
-/// what one full load costs at most, while one serving a steady set of
-/// columns keeps only those. Costs are the time this reader's own loads
-/// took, so the rule fits each file's shape without a tuned constant.
+/// instead: the classic rent-or-buy rule, while a reader serving a steady
+/// set of columns keeps only those. Costs are the time this reader's own
+/// loads took, so the rule fits each file's shape without a tuned constant;
+/// the cost of loading every column is projected from them, so the bound is
+/// approximate: about twice one full load where loads are large enough to
+/// show the decode's cost per byte, more on a file of thousands of columns
+/// asked for one column at a time, where a fixed cost per load dominates
+/// and the projection runs high.
+///
+/// A reader holds no more page index than one that decodes every column, as
+/// far as a projection tells: a partial page index costs its decoded
+/// entries, a placeholder per chunk not loaded, and the kept bytes; once a
+/// load brings that to what every column decoded is projected to take, the
+/// same load decodes the rest ([`IndexLoad::decode`]).
 ///
 /// The state changes only after the footer it describes is stored, so an
 /// error mid-load leaves both as they were.
@@ -279,6 +289,9 @@ enum PageIndex {
         loaded: RoaringBitmap,
         bytes: PageIndexBytes,
         costs: LoadCosts,
+        /// The memory the footer takes without its page index, so a load can
+        /// tell what the page index it holds takes.
+        bare: u64,
     },
     /// The footer holds every leaf's page index, or the file has none to
     /// load; nothing more is kept.
@@ -594,8 +607,12 @@ fn decimal_stat(bytes: &[u8]) -> Option<i128> {
 
 /// The page-index state a resident file starts loading from: its page
 /// index sliced out of the file's `bytes` (no copy), or complete when the
-/// file has none.
-fn resident_page_index(parquet: &ParquetMetaData, bytes: &Bytes) -> Result<PageIndex, ReadError> {
+/// file has none. `bare` is the memory the footer takes without a page index.
+fn resident_page_index(
+    parquet: &ParquetMetaData,
+    bytes: &Bytes,
+    bare: u64,
+) -> Result<PageIndex, ReadError> {
     let Some(span) = PageIndexBytes::span(parquet) else {
         return Ok(PageIndex::Complete);
     };
@@ -605,18 +622,19 @@ fn resident_page_index(parquet: &ParquetMetaData, bytes: &Bytes) -> Result<PageI
             bytes.len()
         )))
     })?;
-    Ok(PageIndex::partial(bytes))
+    Ok(PageIndex::partial(bytes, bare))
 }
 
 impl PageIndex {
     /// The state before any column is decoded, holding `bytes`, the file's
-    /// page index.
-    fn partial(bytes: PageIndexBytes) -> Self {
+    /// page index, for a footer that takes `bare` bytes without it.
+    fn partial(bytes: PageIndexBytes, bare: u64) -> Self {
         PageIndex::Partial {
             columns: IndexColumns::none(),
             loaded: RoaringBitmap::new(),
             bytes,
             costs: LoadCosts::default(),
+            bare,
         }
     }
 }
@@ -674,32 +692,95 @@ struct IndexLoad {
     added: RoaringBitmap,
     bytes: PageIndexBytes,
     costs: LoadCosts,
+    /// The memory the footer takes without its page index.
+    bare: u64,
 }
 
 impl IndexLoad {
     /// The footer with `added`'s page index decoded in, `None` when it needs
-    /// no new copy, and the reader's load costs after it.
-    fn decode(&self) -> Result<(Option<Arc<Footer>>, LoadCosts), ReadError> {
+    /// no new copy, the reader's load costs after it, and the leaves it
+    /// added: `added`, or every leaf not loaded when holding the page index
+    /// partly would take more memory than holding all of it
+    /// ([`Self::rest_if_above_full`]).
+    fn decode(&self) -> Result<DecodedLoad, ReadError> {
         let parquet = self.current.parquet();
         // A footer already indexed needs no new copy for no new leaf (a
         // column the file does not store), and such an ask costs nothing;
         // a footer not yet indexed gets its entries even then, so
         // DataFusion's opener never loads the page index itself.
         if self.added.is_empty() && parquet.offset_index().is_some() {
-            return Ok((None, self.costs));
+            return Ok((None, self.costs, RoaringBitmap::new()));
         }
-        let (indexed, load) = self
+        let (mut indexed, mut load) = self
             .bytes
             .apply(parquet, &self.added)
             .map_err(footer::FooterError::from)?;
+        let mut added = self.added.clone();
+        let rest = self.rest_if_above_full(&indexed, &added);
+        if !rest.is_empty() {
+            let (all, more) = self
+                .bytes
+                .apply(&indexed, &rest)
+                .map_err(footer::FooterError::from)?;
+            indexed = all;
+            load = load + more;
+            added |= rest;
+        }
         let building = Instant::now();
         let footer = Arc::new(self.current.over(Arc::new(indexed))?);
         let costs = self
             .costs
-            .after(load, building.elapsed(), index_len(parquet, &self.added));
-        Ok((Some(footer), costs))
+            .after(load, building.elapsed(), index_len(parquet, &added));
+        Ok((Some(footer), costs, added))
+    }
+
+    /// The leaves not loaded once `indexed` holds `added` too, when keeping
+    /// the page index partly would take at least the memory every leaf's
+    /// decoded entries are projected to take; none otherwise.
+    ///
+    /// Partly held, the page index costs its decoded entries, a placeholder
+    /// per chunk not loaded ([`UNLOADED_CHUNK_BYTES`]) and the kept bytes
+    /// (nothing for a resident file, which holds them anyway). Every chunk's
+    /// entry takes at least a placeholder's size, and its pages more, so
+    /// every leaf decoded is projected as a placeholder per chunk plus the
+    /// pages of the leaves decoded so far, scaled by their share of the page
+    /// index's bytes. Both come from sizes, not timings, so the same file
+    /// always switches at the same load.
+    ///
+    /// The projection can be a few percent off either way, so "no more than
+    /// every column decoded" is approximate. And a load that has decoded no
+    /// index bytes yet (a first ask for no column, as range counts and
+    /// top-k make) has nothing to project from and stays partial: it holds
+    /// placeholders and the kept bytes, below every column decoded on files
+    /// of several pages a chunk, above it by about the kept bytes on files of
+    /// one page a chunk.
+    fn rest_if_above_full(
+        &self,
+        indexed: &ParquetMetaData,
+        added: &RoaringBitmap,
+    ) -> RoaringBitmap {
+        let schema = indexed.file_metadata().schema_descr();
+        let loaded = &self.loaded | added;
+        let rest = IndexColumns::All.leaves(schema) - &loaded;
+        let loaded_bytes = index_len(indexed, &loaded);
+        if rest.is_empty() || loaded_bytes == 0 {
+            return RoaringBitmap::new();
+        }
+        let row_groups = indexed.num_row_groups() as u64;
+        let held = (indexed.memory_size() as u64).saturating_sub(self.bare);
+        let entries = schema.num_columns() as u64 * row_groups * UNLOADED_CHUNK_BYTES;
+        let pages = held.saturating_sub(entries);
+        let full = entries as f64 + pages as f64 * self.bytes.len() as f64 / loaded_bytes as f64;
+        match (held + self.bytes.held_len()) as f64 >= full {
+            true => rest,
+            false => RoaringBitmap::new(),
+        }
     }
 }
+
+/// What [`IndexLoad::decode`] returns: the new footer, `None` when none was
+/// needed, the reader's load costs after the load, and the leaves it added.
+type DecodedLoad = (Option<Arc<Footer>>, LoadCosts, RoaringBitmap);
 
 /// What a reader's page-index loads have taken, for the rent-or-buy rule
 /// (see [`PageIndex`]): the time spent in all, what the latest footer copy
@@ -891,6 +972,19 @@ impl KeptRead {
 /// `rows` as the row count a [`RowSelector`] takes.
 fn row_count(rows: u64) -> usize {
     usize::try_from(rows).unwrap_or(usize::MAX)
+}
+
+/// The memory `parquet` takes, measured while it has no page index: the
+/// base a reader subtracts to tell what its page index takes
+/// ([`IndexLoad::rest_if_above_full`]). Measured on an indexed footer it
+/// would count the index as base and the memory rule would never fire, so
+/// that is a bug, caught here in debug builds.
+fn bare_size(parquet: &ParquetMetaData) -> u64 {
+    debug_assert!(
+        parquet.offset_index().is_none() && parquet.column_index().is_none(),
+        "a bare footer size measured on a footer holding a page index"
+    );
+    parquet.memory_size() as u64
 }
 
 /// `parquet` with its Arrow schema resolved as the eager open resolves it
@@ -1351,13 +1445,29 @@ impl SuperfileReader {
     }
 
     /// [`Self::parquet_metadata_to_read`] for the columns `names`, by the
-    /// file's own names. A read of columns already loaded, the usual case on
-    /// a warm reader, builds no column set.
-    pub(crate) fn parquet_metadata_to_read_named(
+    /// file's own names, for a caller on the async runtime: a widen takes its
+    /// turn with other loads and decodes on `pool`, as
+    /// [`Self::page_indexed_footer`] does, so the calling task never decodes
+    /// or copies the footer. Like the synchronous one, it never starts a first
+    /// load. A read of columns already loaded, the usual case on a warm
+    /// reader, builds no column set.
+    pub(crate) async fn parquet_metadata_to_read_named_on(
         &self,
         names: &[&str],
+        pool: Option<&ThreadPool>,
     ) -> Result<Arc<ParquetMetaData>, ReadError> {
-        Ok(Arc::clone(self.footer_to_read_named(names)?.parquet()))
+        if let Some(loaded) = self.loaded_parquet_metadata_named(names) {
+            return Ok(loaded);
+        }
+        let current = self.footer.load_full();
+        if current.parquet().offset_index().is_none() {
+            return Ok(Arc::clone(current.parquet()));
+        }
+        let _turn = self.page_index_load.lock().await;
+        let (_, footer) = self
+            .add_page_index_on(&IndexColumns::named(names), pool)
+            .await?;
+        Ok(Arc::clone(footer.parquet()))
     }
 
     /// [`Self::parquet_metadata_with_page_index`] for the columns `names`,
@@ -1445,7 +1555,7 @@ impl SuperfileReader {
                         },
                     },
                 )?;
-                PageIndex::partial(bytes)
+                PageIndex::partial(bytes, bare_size(&parquet))
             }
         };
         let mut state = self.lock_page_index();
@@ -1526,19 +1636,21 @@ impl SuperfileReader {
             let Some(file) = &self.bytes else {
                 return Ok(LoadStep::Done(IndexColumns::none(), current));
             };
-            let fresh = resident_page_index(current.parquet(), file)?;
+            let bare = bare_size(current.parquet());
+            let fresh = resident_page_index(current.parquet(), file, bare)?;
             let mut state = self.lock_page_index();
             if matches!(*state, PageIndex::Unloaded) {
                 *state = fresh;
             }
         }
-        let (loaded, bytes, costs) = match &*self.lock_page_index() {
+        let (loaded, bytes, costs, bare) = match &*self.lock_page_index() {
             PageIndex::Partial {
                 loaded,
                 bytes,
                 costs,
+                bare,
                 ..
-            } => (loaded.clone(), bytes.clone(), *costs),
+            } => (loaded.clone(), bytes.clone(), *costs, *bare),
             // Complete with no index: the footer is all there is.
             _ => {
                 self.index_columns.store(Some(Arc::new(IndexColumns::All)));
@@ -1561,6 +1673,7 @@ impl SuperfileReader {
             added,
             bytes,
             costs,
+            bare,
         }))
     }
 
@@ -1571,7 +1684,7 @@ impl SuperfileReader {
         &self,
         columns: &IndexColumns,
         load: IndexLoad,
-        (indexed, costs): (Option<Arc<Footer>>, LoadCosts),
+        (indexed, costs, added): DecodedLoad,
     ) -> Option<(IndexColumns, Arc<Footer>)> {
         let mut state = self.lock_page_index();
         if !Arc::ptr_eq(&self.footer.load(), &load.current) {
@@ -1586,7 +1699,7 @@ impl SuperfileReader {
             .file_metadata()
             .schema_descr()
             .num_columns() as u64;
-        let loaded = &load.loaded | &load.added;
+        let loaded = &load.loaded | &added;
         // A chunk without an offset index drops the whole page index, as
         // arrow-rs does: nothing more can load.
         let complete = loaded.len() == leaves
@@ -1609,6 +1722,7 @@ impl SuperfileReader {
                 loaded,
                 bytes: load.bytes,
                 costs,
+                bare: load.bare,
             },
         };
         self.index_columns.store(Some(Arc::new(held.clone())));
@@ -1896,16 +2010,19 @@ impl SuperfileReader {
                 columns,
                 loaded,
                 costs,
+                bare,
                 ..
-            } => Some((columns.clone(), loaded.clone(), *costs)),
+            } => Some((columns.clone(), loaded.clone(), *costs, *bare)),
             PageIndex::Unloaded => Some((
                 IndexColumns::none(),
                 RoaringBitmap::new(),
                 LoadCosts::default(),
+                bare_size(parquet),
             )),
         };
-        let (next, indexed) = match (prior, resident_page_index(parquet, &bytes)?) {
-            (Some((columns, loaded, costs)), PageIndex::Partial { bytes: index, .. }) => {
+        let bare = prior.as_ref().map_or(0, |(.., bare)| *bare);
+        let (next, indexed) = match (prior, resident_page_index(parquet, &bytes, bare)?) {
+            (Some((columns, loaded, costs, bare)), PageIndex::Partial { bytes: index, .. }) => {
                 let indexed = match parquet.offset_index() {
                     Some(_) => None,
                     None => Some(Arc::new(
@@ -1922,6 +2039,7 @@ impl SuperfileReader {
                     loaded,
                     bytes: index,
                     costs,
+                    bare,
                 };
                 (next, indexed)
             }
@@ -4420,6 +4538,43 @@ mod tests {
         ]))
     }
 
+    /// Rows in the paged fixture: several data pages a column chunk, as real
+    /// files have, so a page index loaded for some columns takes less memory
+    /// than one loaded for every column. On a file of a page or two a chunk,
+    /// the kept bytes and the placeholders outweigh the columns left out.
+    const PAGED_ROWS: u64 = 32_768;
+    /// `Int64` columns `n0`, `n1`, ... beside `doc_id` and `title` in the
+    /// paged fixture.
+    const PAGED_INT_COLUMNS: usize = 6;
+
+    /// A superfile of `doc_id`, an FTS-indexed `title` and
+    /// [`PAGED_INT_COLUMNS`] `Int64` columns, [`PAGED_ROWS`] rows.
+    fn paged_superfile() -> Bytes {
+        let mut fields = schema_with_text().fields().to_vec();
+        fields.extend(
+            (0..PAGED_INT_COLUMNS)
+                .map(|c| Arc::new(Field::new(format!("n{c}"), DataType::Int64, false))),
+        );
+        let schema = Arc::new(Schema::new(fields));
+        let rows = PAGED_ROWS;
+        let mut columns: Vec<ArrayRef> = vec![
+            Arc::new(decimal128_ids(0..rows)),
+            Arc::new(LargeStringArray::from_iter_values(
+                (0..rows).map(|r| format!("title {r}")),
+            )),
+        ];
+        columns.extend((0..PAGED_INT_COLUMNS).map(|c| {
+            Arc::new(Int64Array::from_iter_values(
+                (0..rows as i64).map(|r| r * (c as i64 + 1)),
+            )) as ArrayRef
+        }));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), columns).expect("batch");
+        let opts = BuilderOptions::new(schema, "doc_id", vec![FtsConfig::new("title")], vec![]);
+        let mut builder = SuperfileBuilder::new(opts).expect("builder");
+        builder.add_batch(&batch, &[]).expect("add_batch");
+        Bytes::from(builder.finish().expect("finish"))
+    }
+
     fn build_simple_fts_only_superfile() -> Bytes {
         let schema = schema_with_text();
         let opts = BuilderOptions::new(
@@ -5685,8 +5840,12 @@ mod tests {
 
     impl RecordingSource {
         fn new() -> Arc<Self> {
+            Self::over(build_simple_fts_only_superfile())
+        }
+
+        fn over(bytes: Bytes) -> Arc<Self> {
             Arc::new(Self {
-                inner: BytesLazyByteSource::new(build_simple_fts_only_superfile()),
+                inner: BytesLazyByteSource::new(bytes),
                 reads: RwLock::default(),
             })
         }
@@ -5734,7 +5893,7 @@ mod tests {
     /// bytes the first read kept.
     #[tokio::test]
     async fn page_index_loads_read_once_and_only_for_columns_not_held() {
-        let source = RecordingSource::new();
+        let source = RecordingSource::over(paged_superfile());
         let (reader, opened) = recorded_reader(&source).await;
         let title = IndexColumns::named(&["title"]);
         let leaf = |name: &str| {
@@ -5830,7 +5989,7 @@ mod tests {
     /// forgetting what its footer holds.
     #[tokio::test]
     async fn a_failed_load_leaves_the_page_index_as_it_was() {
-        let bytes = build_simple_fts_only_superfile();
+        let bytes = paged_superfile();
         // A damaged column index fails the decode; a damaged offset index
         // would not (arrow-rs drops the whole page index then, as on main).
         let doc_id_index = column_index_range_of(&bytes, "doc_id");
@@ -6007,6 +6166,61 @@ mod tests {
                 .expect("builder");
         builder.add_batch(&batch, &[]).expect("add_batch");
         Bytes::from(builder.finish().expect("finish"))
+    }
+
+    /// The memory `reader`'s page index takes: decoded entries and
+    /// placeholders, plus the bytes it keeps to decode more.
+    fn page_index_held(reader: &SuperfileReader) -> u64 {
+        let footer = reader.parquet_metadata().memory_size() as u64;
+        match &*reader.lock_page_index() {
+            PageIndex::Partial { bytes, bare, .. } => footer - bare + bytes.held_len(),
+            _ => panic!("a page index loaded partly"),
+        }
+    }
+
+    /// A lazy reader never holds more page index than one that decodes every
+    /// column: a load that would take it there decodes the rest in the same
+    /// call and keeps no bytes, while one that stays below keeps only its
+    /// columns. Sizes, not timings, decide, so this holds on every run.
+    #[tokio::test]
+    async fn a_lazy_reader_never_holds_more_page_index_than_every_column_decoded() {
+        let bytes = paged_superfile();
+        let full = {
+            let reader = lazy_reader(bytes.clone()).await;
+            let bare = reader.parquet_metadata().memory_size() as u64;
+            reader
+                .parquet_metadata_with_page_index(&IndexColumns::All)
+                .await
+                .expect("load");
+            reader.parquet_metadata().memory_size() as u64 - bare
+        };
+        let mut names: Vec<String> = (0..PAGED_INT_COLUMNS).map(|c| format!("n{c}")).collect();
+        names.push("title".to_owned());
+
+        // One column: decoded entries, placeholders and the kept bytes stay
+        // below every column decoded, so the reader keeps one column.
+        let reader = lazy_reader(bytes.clone()).await;
+        reader
+            .parquet_metadata_with_page_index(&IndexColumns::named(&names[1..2]))
+            .await
+            .expect("load");
+        assert!(page_index_held(&reader) < full);
+
+        // Every column but one: the kept bytes alone outweigh the column not
+        // loaded, so the same call decodes it too.
+        let reader = lazy_reader(bytes).await;
+        let mut most = names[1..].to_vec();
+        most.push("doc_id".to_owned());
+        reader
+            .parquet_metadata_with_page_index(&IndexColumns::named(&most))
+            .await
+            .expect("load");
+        assert!(matches!(*reader.lock_page_index(), PageIndex::Complete));
+        assert!(
+            reader
+                .loaded_parquet_metadata_named(&[names[0].as_str()])
+                .is_some()
+        );
     }
 
     /// A reader asked for one new column after another stops copying its

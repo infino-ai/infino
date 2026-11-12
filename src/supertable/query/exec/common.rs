@@ -1712,7 +1712,8 @@ pub(crate) async fn read_file_row_group(
     } else {
         let refs: Vec<&str> = physical.iter().map(String::as_str).collect();
         let views: Vec<&str> = views.iter().map(String::as_str).collect();
-        read_row_group_byte_source(rd, row_group, &refs, &views).await?
+        read_row_group_byte_source(rd, row_group, &refs, &views, &manifest.options.reader_pool)
+            .await?
     };
     match adapter {
         None => Ok(read),
@@ -1726,17 +1727,20 @@ pub(crate) async fn read_file_row_group(
 /// streamed through its byte source so the disk cache's block layer serves
 /// repeated reads. Reading whole row groups needs no page index, but once
 /// the reader has loaded one for other columns, these columns must be in it:
-/// the footer fails a read of a column whose page index it does not hold.
+/// the footer fails a read of a column whose page index it does not hold. A
+/// load that adds them decodes on `pool`.
 async fn read_row_group_byte_source(
     reader: &SuperfileReader,
     row_group: usize,
     names: &[&str],
     views: &[&str],
+    pool: &ThreadPool,
 ) -> DfResult<RecordBatch> {
     let input = ByteSourceAsyncReader {
         source: Source::Lazy(reader.byte_source()),
         metadata: reader
-            .parquet_metadata_to_read_named(names)
+            .parquet_metadata_to_read_named_on(names, Some(pool))
+            .await
             .map_err(QueryError::from)?,
         prefetched: Vec::new(),
     };
@@ -3579,6 +3583,82 @@ mod tests {
             .downcast_ref::<LargeStringArray>()
             .expect("title col");
         (0..arr.len()).map(|i| arr.value(i).to_string()).collect()
+    }
+
+    /// Rows in [`paged_titled_superfile_bytes`]: several data pages a column
+    /// chunk, so a page index loaded for one column stays partial rather than
+    /// costing more than every column's.
+    const PAGED_ROWS: u64 = 32_768;
+    /// `Int64` columns beside `doc_id` and `title` in that fixture.
+    const PAGED_INT_COLUMNS: usize = 4;
+
+    /// A superfile of `doc_id`, `title` (`"title {row}"`) and
+    /// [`PAGED_INT_COLUMNS`] `Int64` columns `n0`, `n1`, ..., [`PAGED_ROWS`]
+    /// rows.
+    fn paged_titled_superfile_bytes() -> Bytes {
+        let mut fields = vec![
+            decimal128_id_field("doc_id"),
+            Field::new("title", DataType::LargeUtf8, false),
+        ];
+        fields.extend(
+            (0..PAGED_INT_COLUMNS).map(|c| Field::new(format!("n{c}"), DataType::Int64, false)),
+        );
+        let schema = Arc::new(Schema::new(fields));
+        let mut columns: Vec<ArrayRef> = vec![
+            Arc::new(decimal128_ids(0..PAGED_ROWS)),
+            Arc::new(LargeStringArray::from_iter_values(
+                (0..PAGED_ROWS).map(|r| format!("title {r}")),
+            )),
+        ];
+        columns.extend((0..PAGED_INT_COLUMNS).map(|c| {
+            Arc::new(Int64Array::from_iter_values(
+                (0..PAGED_ROWS as i64).map(|r| r * (c as i64 + 1)),
+            )) as ArrayRef
+        }));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), columns).expect("batch");
+        let mut b = SuperfileBuilder::new(BuilderOptions::new(schema, "doc_id", vec![], vec![]))
+            .expect("builder");
+        b.add_batch(&batch, &[]).expect("add_batch");
+        Bytes::from(b.finish().expect("finish builder"))
+    }
+
+    /// A lazy reader whose page index an earlier scan loaded for other
+    /// columns still reads a column it lacks, through both byte-source paths:
+    /// each asks for the columns it reads instead of taking the footer as it
+    /// stands, which holds only placeholders for the rest.
+    #[tokio::test]
+    async fn a_narrowed_lazy_reader_reads_other_columns_through_its_byte_source() {
+        let bytes = paged_titled_superfile_bytes();
+        let narrowed = || async {
+            let source: Arc<dyn LazyByteSource> = Arc::new(RecordingSource::new(bytes.clone()));
+            let reader = SuperfileReader::open_lazy(source).await.expect("open lazy");
+            reader
+                .parquet_metadata_with_page_index(&IndexColumns::named(&["n0"]))
+                .await
+                .expect("narrow load");
+            assert!(
+                reader.loaded_parquet_metadata_named(&["title"]).is_none(),
+                "the narrow load left `title` out"
+            );
+            reader
+        };
+        let pool = ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("pool");
+
+        let reader = narrowed().await;
+        let whole = read_row_group_byte_source(&reader, 0, &["title"], &[], &pool)
+            .await
+            .expect("row group read");
+        let expected: Vec<String> = (0..PAGED_ROWS).map(|r| format!("title {r}")).collect();
+        assert_eq!(titles_of(&whole), expected);
+
+        let reader = narrowed().await;
+        let taken = take_rows_byte_source(&reader, &[3, 0], &["title"], Some(&pool), None)
+            .await
+            .expect("take");
+        assert_eq!(titles_of(&taken), vec!["title 3", "title 0"]);
     }
 
     /// A take whose prefetch lacks bytes its decode reads falls back to
