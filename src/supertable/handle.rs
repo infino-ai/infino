@@ -19,7 +19,7 @@ use std::{
     fmt,
     future::Future,
     sync::{
-        Arc, Mutex, MutexGuard, OnceLock, Weak,
+        Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak,
         atomic::{AtomicBool, AtomicU64},
     },
     time::{Duration, Instant},
@@ -279,9 +279,12 @@ pub(super) struct SupertableInner {
     /// by content hash: maintenance checks that the objects its root names
     /// are there, and asks storage only about the ones not found before.
     pub(super) term_index_objects_seen: Mutex<HashSet<ContentHash>>,
-    /// Batch keys a replica handle has taken (see `merge::append_batch`), so a resend that
-    /// arrives while the first copy is in flight is not committed beside it.
-    pub(super) batches_taken: Mutex<HashSet<String>>,
+    /// Batch keys a replica handle has taken (see `merge::append_batch`): `true` once committed,
+    /// `false` while in flight, so a resend waits for the first copy instead of joining its commit.
+    /// One short key per batch for the handle's life.
+    pub(super) batches_taken: Mutex<HashMap<String, bool>>,
+    /// Woken when a batch in `batches_taken` commits or fails.
+    pub(super) batches_settled: Condvar,
     /// Compaction commits' leftovers being dropped off their path, joined
     /// before a pass returns and, failing that, when the table goes. See
     /// [`RetiredScratch`].
@@ -2291,6 +2294,7 @@ async fn build_handle(
         sql_schemas: ArcSwapOption::empty(),
         term_index_objects_seen: Mutex::default(),
         batches_taken: Mutex::default(),
+        batches_settled: Condvar::new(),
         retired_scratch: RetiredScratch::default(),
     });
     install_disk_cache_pinning(&inner);

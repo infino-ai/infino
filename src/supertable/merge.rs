@@ -33,10 +33,7 @@ use crate::{
             ManifestSnapshot, SuperfileEntry,
             term_index::{self, Root, format::Layer},
         },
-        writer::{
-            CommitListMetadata, persist_commit_async, persist_graft_async, scoring_by_superfile,
-            stamp_term_index, stamp_with_retries,
-        },
+        writer::{persist_graft_async, scoring_by_superfile, stamp_term_index, stamp_with_retries},
     },
 };
 
@@ -362,28 +359,16 @@ pub fn graft(
                 .try_collect::<Vec<()>>()
                 .await?;
             live.extend(entries.iter().map(|e| e.superfile_id));
-            match &s.root {
-                Some(root) => {
-                    let splice = |current: &Root| spliced_root(current, root, &live);
-                    persist_graft_async(inner, Arc::clone(&storage), entries.to_vec(), &splice)
-                        .await
-                        .map_err(internal)?;
-                }
-                None => {
-                    persist_commit_async(
-                        inner,
-                        Arc::clone(&storage),
-                        entries.to_vec(),
-                        &[],
-                        vec![],
-                        vec![],
-                        CommitListMetadata::empty(),
-                        vec![],
-                    )
-                    .await
-                    .map_err(internal)?;
-                }
-            }
+            // Without a stackable source index nothing is spliced and the refresh below indexes
+            // the superfiles; the commit refuses ones the destination holds either way.
+            let splice = |current: &Root| {
+                s.root
+                    .as_ref()
+                    .and_then(|root| spliced_root(current, root, &live))
+            };
+            persist_graft_async(inner, Arc::clone(&storage), entries.to_vec(), &splice)
+                .await
+                .map_err(internal)?;
             report.merged += entries.len();
             report.commits += 1;
         }
@@ -396,7 +381,7 @@ pub fn graft(
 }
 
 /// Appends `batch` to a replica as batch `id` and commits it; returns `false`, writing nothing, when
-/// this handle already took that id. A graft adds one copy of a batch to the table it loads
+/// this handle already committed that id (a call that finds it in flight waits for the outcome). A graft adds one copy of a batch to the table it loads
 /// into, whichever replica or retry delivered it, so a caller may resend a batch freely.
 ///
 /// Errors when `table` is not a replica (see [`open_replica`]), or as the append does.
@@ -405,33 +390,33 @@ pub fn append_batch(
     batch: &RecordBatch,
     id: &str,
 ) -> Result<bool, InfinoError> {
-    if !table.inner().options.term_index_replica {
+    let inner = table.inner();
+    if !inner.options.term_index_replica {
         return Err(InfinoError::Unsupported(
             "append_batch is for replica tables".into(),
         ));
     }
     let key = batch_key(id);
-    if !table
-        .inner()
-        .batches_taken
-        .lock()
-        .expect("batch set")
-        .insert(key.clone())
-    {
-        return Ok(false);
+    let mut taken = inner.batches_taken.lock().expect("batch set");
+    loop {
+        match taken.get(&key) {
+            Some(true) => return Ok(false),
+            // In flight: its outcome decides whether this copy is needed.
+            Some(false) => taken = inner.batches_settled.wait(taken).expect("batch set"),
+            None => break,
+        }
     }
-    table
-        .append_named(batch, &key)
-        .map(|()| true)
-        .inspect_err(|_| {
-            // Not committed, so a resend may take it again.
-            table
-                .inner()
-                .batches_taken
-                .lock()
-                .expect("batch set")
-                .remove(&key);
-        })
+    taken.insert(key.clone(), false);
+    drop(taken);
+    let appended = table.append_named(batch, &key);
+    let mut taken = inner.batches_taken.lock().expect("batch set");
+    match appended {
+        Ok(()) => taken.insert(key, true),
+        // Not committed, so a resend may take it.
+        Err(_) => taken.remove(&key),
+    };
+    inner.batches_settled.notify_all();
+    appended.map(|()| true)
 }
 
 /// Opens replica `name` of `table`, creating it if absent: `table`'s schema and settings, its
@@ -510,7 +495,8 @@ pub fn fold_replica(table: &Supertable) -> Result<bool, QueryError> {
 }
 
 /// Folds every layer a replica holds into one; run it after the replica's last commit, so the grafted table ends
-/// with about one layer per replica.
+/// with about one layer per replica. The merge reads every layer at once: its scratch directory needs room for
+/// the replica's whole term index.
 pub fn fold_replica_all(table: &Supertable) -> Result<bool, QueryError> {
     fold_replica_runs(table, true)
 }
@@ -1242,6 +1228,97 @@ mod tests {
         };
         assert_eq!(rows(&t), 100);
         assert_eq!(rows(&a), 100);
+    }
+
+    #[test]
+    fn concurrent_resends_of_a_batch_commit_once() {
+        use arrow_array::{ArrayRef, LargeStringArray, RecordBatch};
+        let (_dir, t) = table("t", 0);
+        let schema = t
+            .reader()
+            .expect("reader")
+            .manifest()
+            .get_opts()
+            .schema
+            .clone();
+        let replica = open_replica(&t, "r0").expect("replica");
+        let arr: ArrayRef = Arc::new(LargeStringArray::from(vec!["shared x"; 50]));
+        let batch = RecordBatch::try_new(schema, vec![arr]).expect("batch");
+        let outcomes: Vec<bool> = std::thread::scope(|s| {
+            let sends: Vec<_> = (0..4)
+                .map(|_| s.spawn(|| append_batch(&replica, &batch, "b1").expect("append")))
+                .collect();
+            sends
+                .into_iter()
+                .map(|h| h.join().expect("thread"))
+                .collect()
+        });
+        assert_eq!(
+            outcomes.iter().filter(|&&taken| taken).count(),
+            1,
+            "{outcomes:?}"
+        );
+        graft(&t, &replica.reader().expect("reader"), true).expect("graft");
+        let rows: u64 = t
+            .reader()
+            .expect("reader")
+            .manifest()
+            .superfiles
+            .iter()
+            .map(|e| e.n_docs)
+            .sum();
+        assert_eq!(rows, 50);
+    }
+
+    #[test]
+    fn a_stale_coordinator_without_index_reuse_adds_no_rows() {
+        use arrow_array::{ArrayRef, LargeStringArray, RecordBatch};
+        let (dir, t) = table("t", 1);
+        let schema = t
+            .reader()
+            .expect("reader")
+            .manifest()
+            .get_opts()
+            .schema
+            .clone();
+        let a = Supertable::open(options_at(dir.path(), &schema, false)).expect("open");
+        let r0 = open_replica(&t, "r0").expect("replica");
+        let r1 = open_replica(&t, "r1").expect("replica");
+        for r in [&r0, &r1] {
+            let arr: ArrayRef = Arc::new(LargeStringArray::from(vec!["shared x"; 50]));
+            append_batch(
+                r,
+                &RecordBatch::try_new(schema.clone(), vec![arr]).expect("batch"),
+                "b1",
+            )
+            .expect("append");
+        }
+        graft(&t, &r0.reader().expect("reader"), false).expect("B grafts r0");
+        // A, behind, grafts r1's copy of the same batch through the path that indexes by reading.
+        let _ = graft(&a, &r1.reader().expect("reader"), false);
+        let rows: u64 = t
+            .reader()
+            .expect("reader")
+            .manifest()
+            .superfiles
+            .iter()
+            .map(|e| e.n_docs)
+            .sum();
+        assert_eq!(rows, 100, "the table's own 50 and b1 once");
+    }
+
+    #[test]
+    fn reindex_waits_for_a_load_and_never_rewrites_a_replica() {
+        let (_dir, t) = table("t", 1);
+        let replica = open_replica(&t, "r0").expect("replica");
+        let opts = crate::ReindexOptions::default();
+        assert!(
+            replica.reindex(&opts).is_err(),
+            "a replica is never rewritten"
+        );
+        assert!(t.reindex(&opts).is_err(), "not while replicas are attached");
+        detach_replicas(&t).expect("detach");
+        t.reindex(&opts).expect("reindex once detached");
     }
 
     #[test]
