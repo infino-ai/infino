@@ -641,6 +641,10 @@ fn a_where_on_full_text_columns_follows_a_name_swap() {
             "SELECT title FROM bm25_search('docs', 'title', 'rust', 10) WHERE a = 'v'",
             &["rust one"],
         ),
+        (
+            "SELECT title FROM bm25_search('docs', 'title', 'rust', 10) WHERE b LIKE 'q%'",
+            &["rust two"],
+        ),
     ];
     for (sql, want) in cases {
         assert_eq!(rows(&db, sql), *want, "{sql}");
