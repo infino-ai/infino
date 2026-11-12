@@ -761,8 +761,8 @@ export class Connection {
    * by `id` when it carries one and by `name` otherwise; an unmatched field
    * is added, a different type changes the column, `dropped: true` retires
    * it, and a field not mentioned is untouched. `expectedSchemaId` is a
-   * compare-and-set against the current `schema_id`. Not yet available on a
-   * hosted (`https://`) connection; it raises an error there.
+   * compare-and-set against the current `schema_id`. On a hosted connection
+   * this calls `POST /v1/schema`.
    */
   schema(name: string, patch?: SchemaPatch, expectedSchemaId?: number): TableSchema {
     const text = guard(this.remote, () =>
