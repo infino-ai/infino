@@ -210,8 +210,8 @@ pub use superfile::{
     },
     vector::{distance::Metric, rerank_codec::RerankCodec},
 };
-/// A load several replicas write into one table at once (see [`Supertable::begin_load`]).
-pub use supertable::load::{LoadOutcome, LoadReplica, LoadState, ReplicaAccount};
+/// An import several replicas write into one table at once (see [`Supertable::begin_import`]).
+pub use supertable::import::{ImportOutcome, ImportReplica, ImportState, ReplicaAccount, Writers};
 pub use supertable::{
     Consistency, GcError, GcReport, MutationStats, OptimizeError, ReindexError,
     query::vector::VectorFilter,

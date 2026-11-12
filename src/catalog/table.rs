@@ -12,7 +12,11 @@
 
 #[cfg(any(test, feature = "test-helpers"))]
 use std::any::Any;
-use std::{fmt, sync::Arc, time::Duration};
+use std::{
+    fmt,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
 
 use arrow_array::{RecordBatch, RecordBatchReader};
 use arrow_schema::SchemaRef;
@@ -20,16 +24,16 @@ use datafusion::prelude::Expr;
 use serde_json::Value;
 
 use crate::{
-    Bm25SearchOptions, BoolMode, GcError, GcReport, InfinoError, LoadOutcome, LoadReplica,
-    LoadState, MutationStats, OptimizeError, OptimizeOptions, ReindexError, ReindexOptions,
-    ReplicaAccount, VectorFilter,
+    Bm25SearchOptions, BoolMode, GcError, GcReport, ImportOutcome, ImportReplica, ImportState,
+    InfinoError, MutationStats, OptimizeError, OptimizeOptions, ReindexError, ReindexOptions,
+    ReplicaAccount, VectorFilter, Writers,
     catalog::ensure_expr_within_connective_cap,
     superfile::VectorSearchOptions,
     supertable::{
         Supertable as SupertableHandle,
         companion::check_purpose,
         hydrate::hydrate_from_reader,
-        load,
+        import,
         reindex::{PlannedRepair, ReindexReport, StalenessReport},
         schema::{TableSchema, change::SchemaPatch},
     },
@@ -250,6 +254,7 @@ impl Table for SupertableHandle {
         batches: &mut dyn RecordBatchReader,
         target_rows: usize,
     ) -> Result<usize, InfinoError> {
+        import::refuse_during_import(self, "a hydrate")?;
         Ok(hydrate_from_reader(self, batches, target_rows)?)
     }
     fn reindex(&self, opts: &ReindexOptions) -> Result<ReindexReport, ReindexError> {
@@ -809,62 +814,86 @@ impl Supertable {
     }
 
     /// The local engine table behind this handle; a hosted table takes no loads.
-    fn local_for_load(&self) -> Result<&SupertableHandle, InfinoError> {
+    fn local_for_import(&self) -> Result<&SupertableHandle, InfinoError> {
         self.inner
             .local_engine()
-            .ok_or_else(|| InfinoError::Unsupported("loads run on local tables".into()))
+            .ok_or_else(|| InfinoError::Unsupported("imports run on local tables".into()))
     }
 
-    /// Begins load `load` on this table, or reports the state it is in: several replicas then
-    /// write its batches at once ([`Self::open_load_replica`]), the table stays queryable as
-    /// [`Self::graft_load`] adds them, and [`Self::finish_load`] closes it with an exact account.
-    pub fn begin_load(&self, load: &str) -> Result<LoadState, InfinoError> {
-        load::begin_load(self.local_for_load()?, load)
-    }
-
-    /// The loads on this table that are open or finishing, so a coordinator that restarted can
-    /// take them up again.
-    pub fn open_loads(&self) -> Result<Vec<String>, InfinoError> {
-        load::open_loads(self.local_for_load()?)
-    }
-
-    /// Whether `load` is unknown, open, finishing or finished on this table.
-    pub fn load_state(&self, load: &str) -> Result<LoadState, InfinoError> {
-        load::load_state(self.local_for_load()?, load)
-    }
-
-    /// Node `node`'s replica of open load `load`; errors when the load is not open.
-    pub fn open_load_replica(&self, load: &str, node: &str) -> Result<LoadReplica, InfinoError> {
-        load::open_load_replica(self.local_for_load()?, load, node)
-    }
-
-    /// Seals `node`'s replica of `load` on its behalf, when that node is gone for good.
-    pub fn seal_absent_replica(&self, load: &str, node: &str) -> Result<(), InfinoError> {
-        load::seal_absent_replica(self.local_for_load()?, load, node)
-    }
-
-    /// Adds to this table what `load`'s replicas committed since the last call; one caller per
-    /// load runs it every few seconds while the load is open.
-    pub fn graft_load(&self, load: &str) -> Result<Vec<ReplicaAccount>, InfinoError> {
-        load::graft_load(self.local_for_load()?, load)
-    }
-
-    /// Finishes `load`: once every replica is sealed, adds what is left, checks every replica's
-    /// batches are in the table once (and the rows, given `expected_rows`), records the outcome
-    /// and detaches the load's replicas. A finished load reports its outcome again. Errors, with
-    /// the load left open, when a replica is unsealed or unaccounted for or the rows differ.
-    pub fn finish_load(
+    /// Begins import `import` on this table, or reports the state it is in: several replicas then
+    /// write its batches at once ([`Self::open_import_replica`]), the table stays queryable as
+    /// [`Self::graft_import`] adds them, and [`Self::finish_import`] closes it with an exact account.
+    pub fn begin_import(
         &self,
-        load: &str,
-        expected_rows: Option<u64>,
-    ) -> Result<LoadOutcome, InfinoError> {
-        load::finish_load(self.local_for_load()?, load, expected_rows)
+        import: &str,
+        writers: Option<Writers>,
+    ) -> Result<ImportState, InfinoError> {
+        import::begin_import(self.local_for_import()?, import, writers)
     }
 
-    /// Whether any load's replicas are attached to this table; its maintenance waits while they
+    /// Aborts `import`: the batches grafted so far stay, the rest are dropped; errors once it is
+    /// finished or was never begun.
+    pub fn abort_import(&self, import: &str) -> Result<(), InfinoError> {
+        import::abort_import(self.local_for_import()?, import)
+    }
+
+    /// When a replica of `import` last committed, read from storage; `None` when it has none.
+    pub fn import_activity(&self, import: &str) -> Result<Option<SystemTime>, InfinoError> {
+        import::import_activity(self.local_for_import()?, import)
+    }
+
+    /// How many replicas write `import`; errors when it was never begun.
+    pub fn import_writers(&self, import: &str) -> Result<Writers, InfinoError> {
+        import::import_writers(self.local_for_import()?, import)
+    }
+
+    /// The imports on this table that are open or finishing, so a coordinator that restarted can
+    /// take them up again.
+    pub fn open_imports(&self) -> Result<Vec<String>, InfinoError> {
+        import::open_imports(self.local_for_import()?)
+    }
+
+    /// Whether `import` is unknown, open, finishing or finished on this table.
+    pub fn import_state(&self, import: &str) -> Result<ImportState, InfinoError> {
+        import::import_state(self.local_for_import()?, import)
+    }
+
+    /// Node `node`'s replica of open import `import`; errors when the import is not open.
+    pub fn open_import_replica(
+        &self,
+        import: &str,
+        node: &str,
+    ) -> Result<ImportReplica, InfinoError> {
+        import::open_import_replica(self.local_for_import()?, import, node)
+    }
+
+    /// Seals `node`'s replica of `import` on its behalf, when that node is gone for good.
+    pub fn seal_absent_replica(&self, import: &str, node: &str) -> Result<(), InfinoError> {
+        import::seal_absent_replica(self.local_for_import()?, import, node)
+    }
+
+    /// Adds to this table what `import`'s replicas committed since the last call; one caller per
+    /// import runs it every few seconds while the import is open.
+    pub fn graft_import(&self, import: &str) -> Result<Vec<ReplicaAccount>, InfinoError> {
+        import::graft_import(self.local_for_import()?, import)
+    }
+
+    /// Finishes `import`: once every replica is sealed, adds what is left, checks every replica's
+    /// batches are in the table once (and the rows, given `expected_rows`), records the outcome
+    /// and detaches the import's replicas. A finished import reports its outcome again. Errors, with
+    /// the import left open, when a replica is unsealed or unaccounted for or the rows differ.
+    pub fn finish_import(
+        &self,
+        import: &str,
+        expected_rows: Option<u64>,
+    ) -> Result<ImportOutcome, InfinoError> {
+        import::finish_import(self.local_for_import()?, import, expected_rows)
+    }
+
+    /// Whether any import's replicas are attached to this table; its maintenance waits while they
     /// are.
     pub fn has_attached_replicas(&self) -> Result<bool, InfinoError> {
-        self.local_for_load()?
+        self.local_for_import()?
             .has_attached_replicas()
             .map_err(|e| InfinoError::Backend(e.to_string()))
     }

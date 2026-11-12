@@ -1252,6 +1252,7 @@ impl Supertable {
         patch: &SchemaPatch,
         expected: Option<u32>,
     ) -> Result<Arc<TableSchema>, InfinoError> {
+        super::import::refuse_during_import(self, "a schema change")?;
         let mut w = self
             .writer()
             .map_err(|e| InfinoError::from(e).with_context("apply_schema", None))?;
@@ -1298,6 +1299,7 @@ impl Supertable {
         predicate: Expr,
         new_rows: &RecordBatch,
     ) -> Result<MutationStats, InfinoError> {
+        super::import::refuse_during_import(self, "an update")?;
         let mut w = self
             .writer()
             .map_err(|e| InfinoError::from(e).with_context("update", None))?;
@@ -1341,6 +1343,7 @@ impl Supertable {
         tracing::instrument(skip_all, fields(role = self.role().as_str(), origin = OpOrigin::Ingest.as_str()))
     )]
     pub fn delete(&self, predicate: Expr) -> Result<MutationStats, InfinoError> {
+        super::import::refuse_during_import(self, "a delete")?;
         let mut w = self
             .writer()
             .map_err(|e| InfinoError::from(e).with_context("delete", None))?;

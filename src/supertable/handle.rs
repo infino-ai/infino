@@ -285,7 +285,7 @@ pub(super) struct SupertableInner {
     pub(super) batches_taken: Mutex<HashMap<String, bool>>,
     /// Woken when a batch in `batches_taken` commits or fails.
     pub(super) batches_settled: Condvar,
-    /// Replicas a load's grafts read, kept across rounds (see `load::graft_load`).
+    /// Replicas an import's grafts read, kept across rounds (see `import::graft_import`).
     pub(super) replica_handles: Mutex<HashMap<String, Supertable>>,
     /// Compaction commits' leftovers being dropped off their path, joined
     /// before a pass returns and, failing that, when the table goes. See
