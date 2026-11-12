@@ -141,6 +141,7 @@ impl core::panic::unwind_safe::RefUnwindSafe for infino::InfinoError
 impl core::panic::unwind_safe::UnwindSafe for infino::InfinoError
 pub enum infino::LoadState
 pub infino::LoadState::Finished(infino::LoadOutcome)
+pub infino::LoadState::Finishing
 pub infino::LoadState::Open
 pub infino::LoadState::Unknown
 impl core::clone::Clone for infino::LoadState

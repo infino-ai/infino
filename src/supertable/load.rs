@@ -61,6 +61,8 @@ pub enum LoadState {
     Unknown,
     /// Begun and taking batches.
     Open,
+    /// A finish is running: existing replicas keep taking batches, and no new one opens.
+    Finishing,
     /// Finished, with what it delivered.
     Finished(LoadOutcome),
 }
@@ -132,17 +134,72 @@ fn replica_prefix(load: &str) -> String {
     format!("{load}.")
 }
 
-/// `load`'s record on `table` and the version a conditional write replaces it at.
+/// A load's stored record.
+#[derive(Serialize, Deserialize)]
+struct Record {
+    #[serde(flatten)]
+    state: LoadState,
+    /// Unique to each finish's claim, so two claims never store the same bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    claim: Option<String>,
+}
+
+/// `load`'s state on `table` and the version a conditional write replaces it at.
 fn read_record(table: &Supertable, load: &str) -> Result<(LoadState, Option<String>), InfinoError> {
     check_id("load", load)?;
     let storage = storage_of(table)?;
     table.block_on_query(async {
         match storage.get(&record_key(load)).await {
-            Ok((bytes, meta)) => Ok((serde_json::from_slice(&bytes).map_err(backend)?, meta.etag)),
+            Ok((bytes, meta)) => {
+                let record: Record = serde_json::from_slice(&bytes).map_err(backend)?;
+                Ok((record.state, meta.etag))
+            }
             Err(StorageError::NotFound { .. }) => Ok((LoadState::Unknown, None)),
             Err(e) => Err(backend(e)),
         }
     })
+}
+
+/// Replaces `load`'s record at `version` with `state`; the new version, or `None` when another
+/// writer replaced it first.
+fn write_record(
+    table: &Supertable,
+    load: &str,
+    state: LoadState,
+    version: Option<&str>,
+) -> Result<Option<String>, InfinoError> {
+    let claim = matches!(state, LoadState::Finishing).then(|| uuid::Uuid::new_v4().to_string());
+    let bytes = serde_json::to_vec(&Record { state, claim }).map_err(backend)?;
+    let storage = storage_of(table)?;
+    let written = table.block_on_query(async {
+        match storage
+            .put_if_match(&record_key(load), Bytes::from(bytes), version)
+            .await
+        {
+            Ok(etag) => Ok(Some(etag)),
+            Err(e) if e.is_conflict() => Ok(None),
+            Err(e) => Err(backend(e)),
+        }
+    })?;
+    match written {
+        Some(Some(etag)) => Ok(Some(etag)),
+        Some(None) => Err(InfinoError::Unsupported(
+            "a load needs storage that versions its objects".into(),
+        )),
+        None => Ok(None),
+    }
+}
+
+/// The error for a load that is not open: final once it is finished or was never begun, worth
+/// retrying while a finish runs.
+fn not_open(load: &str, state: &LoadState) -> InfinoError {
+    match state {
+        LoadState::Finishing => {
+            InfinoError::Conflict(format!("load {load} is finishing and takes no new replica"))
+        }
+        LoadState::Finished(_) => InfinoError::NotFound(format!("load {load} is finished")),
+        _ => InfinoError::NotFound(format!("load {load} was never begun")),
+    }
 }
 
 /// The state `load` is in on `table`.
@@ -155,7 +212,11 @@ pub fn load_state(table: &Supertable, load: &str) -> Result<LoadState, InfinoErr
 pub fn begin_load(table: &Supertable, load: &str) -> Result<LoadState, InfinoError> {
     check_id("load", load)?;
     let storage = storage_of(table)?;
-    let open = serde_json::to_vec(&LoadState::Open).map_err(backend)?;
+    let open = serde_json::to_vec(&Record {
+        state: LoadState::Open,
+        claim: None,
+    })
+    .map_err(backend)?;
     let created = table.block_on_query(async {
         match storage
             .put_atomic(&record_key(load), Bytes::from(open))
@@ -180,25 +241,30 @@ pub fn open_load_replica(
     node: &str,
 ) -> Result<LoadReplica, InfinoError> {
     check_id("node", node)?;
-    match load_state(table, load)? {
-        LoadState::Open => {}
-        state => {
-            return Err(InfinoError::Conflict(format!(
-                "load {load} is not open: {state:?}"
-            )));
+    let state = load_state(table, load)?;
+    if !matches!(state, LoadState::Open | LoadState::Finishing) {
+        return Err(not_open(load, &state));
+    }
+    let name = replica_name(load, node);
+    let replica = match merge::open_existing_replica(table, &name).map_err(backend)? {
+        Some(replica) => replica,
+        None if state != LoadState::Open => return Err(not_open(load, &state)),
+        None => {
+            let replica = merge::open_replica(table, &name).map_err(backend)?;
+            // A finish lists replicas after it records `Finishing`, so a replica created after
+            // that may be missing from its listing and would never be grafted.
+            let state = load_state(table, load)?;
+            if state != LoadState::Open {
+                detach(table, &format!("{REPLICAS_DIR}{name}/"))?;
+                return Err(not_open(load, &state));
+            }
+            replica
         }
-    }
-    let replica = merge::open_replica(table, &replica_name(load, node)).map_err(backend)?;
-    // A finish between the check above and this replica's creation would never graft it.
-    if load_state(table, load)? != LoadState::Open {
-        detach_load(table, load)?;
-        return Err(InfinoError::Conflict(format!(
-            "load {load} finished while this replica opened"
-        )));
-    }
+    };
     let sealed = is_sealed(&replica)?;
     Ok(LoadReplica {
         table: replica,
+        owner: table.clone(),
         load: load.to_owned(),
         closed: AtomicBool::new(sealed),
         in_flight: Mutex::new(0),
@@ -249,6 +315,8 @@ impl Drop for InFlight<'_> {
 /// One node's replica of a load. Share one per node: it tracks the batches in flight.
 pub struct LoadReplica {
     table: Supertable,
+    /// The table the load fills, which holds the load's record.
+    owner: Supertable,
     load: String,
     /// Set by [`Self::seal`]: no batch is taken after it.
     closed: AtomicBool,
@@ -275,7 +343,11 @@ impl LoadReplica {
                 self.load
             )));
         }
-        Ok(appended)
+        // A finish deletes the seal marker when it detaches, so its record is checked too.
+        match load_state(&self.owner, &self.load)? {
+            LoadState::Open | LoadState::Finishing => Ok(appended),
+            state => Err(not_open(&self.load, &state)),
+        }
     }
 
     fn sealed_error(&self) -> InfinoError {
@@ -315,23 +387,35 @@ impl LoadReplica {
 /// committed is grafted as it stands, without its final fold. Errors when there is no such replica.
 pub fn seal_absent_replica(table: &Supertable, load: &str, node: &str) -> Result<(), InfinoError> {
     check_id("node", node)?;
-    if load_state(table, load)? != LoadState::Open {
-        return Err(InfinoError::Conflict(format!("load {load} is not open")));
+    let state = load_state(table, load)?;
+    if !matches!(state, LoadState::Open | LoadState::Finishing) {
+        return Err(not_open(load, &state));
     }
-    match merge::open_existing_replica(table, &replica_name(load, node)).map_err(backend)? {
-        Some(replica) => mark_sealed(&replica),
-        None => Err(InfinoError::NotFound(format!(
+    let name = replica_name(load, node);
+    let Some(replica) = merge::open_existing_replica(table, &name).map_err(backend)? else {
+        return Err(InfinoError::NotFound(format!(
             "load {load} has no replica on node {node}"
-        ))),
+        )));
+    };
+    mark_sealed(&replica)?;
+    // If a finish detached in between, this marker would count as an attached replica.
+    let state = load_state(table, load)?;
+    if let LoadState::Finished(_) = state {
+        detach(table, &format!("{REPLICAS_DIR}{name}/"))?;
+        return Err(not_open(load, &state));
     }
+    Ok(())
 }
 
 /// Grafts into `table` what every replica of open load `load` committed since the last round, and
 /// accounts for each; nothing for a finished load.
 pub fn graft_load(table: &Supertable, load: &str) -> Result<Vec<ReplicaAccount>, InfinoError> {
     match load_state(table, load)? {
-        LoadState::Open => {}
-        LoadState::Finished(_) => return Ok(vec![]),
+        LoadState::Open | LoadState::Finishing => {}
+        LoadState::Finished(_) => {
+            forget_handles(table, &format!("{REPLICAS_DIR}{}", replica_prefix(load)));
+            return Ok(vec![]);
+        }
         LoadState::Unknown => {
             return Err(InfinoError::NotFound(format!(
                 "load {load} was never begun"
@@ -392,8 +476,11 @@ fn cached_replica(table: &Supertable, name: &str) -> Result<Option<Supertable>, 
 /// detaches the load's replicas. A finished load reports its outcome again, finishing any detach
 /// a crash cut short.
 ///
-/// Errors, leaving the load open and its replicas attached, when a replica is not sealed, a
-/// replica is not accounted for, or the rows differ from `expected_rows`.
+/// While it runs the load is [`LoadState::Finishing`] and takes no new replica; a later finish takes
+/// over one that crashed. Errors with [`InfinoError::Conflict`], leaving the load open and its
+/// replicas attached, when a replica is not sealed, a replica is not accounted for, the rows differ
+/// from `expected_rows`, or another finish is running; [`InfinoError::NotFound`] for a load never
+/// begun.
 pub fn finish_load(
     table: &Supertable,
     load: &str,
@@ -405,30 +492,64 @@ pub fn finish_load(
             detach_load(table, load)?;
             return Ok(outcome);
         }
-        LoadState::Unknown => {
-            return Err(InfinoError::NotFound(format!(
-                "load {load} was never begun"
-            )));
-        }
-        LoadState::Open => {}
+        LoadState::Unknown => return Err(not_open(load, &state)),
+        LoadState::Open | LoadState::Finishing => {}
     }
-    let mut accounts = graft_load(table, load)?;
+    // The claim is the record's version: a finish that crashed is taken over, and one that was
+    // taken over can neither finish nor reopen the load.
+    let Some(claim) = write_record(table, load, LoadState::Finishing, version.as_deref())? else {
+        return finished_by_another(table, load);
+    };
+    let finished = finish_claimed(table, load, expected_rows, &claim);
+    if finished.is_err() {
+        write_record(table, load, LoadState::Open, Some(&claim))?;
+    }
+    finished
+}
+
+/// What a finish that lost its claim reports: the outcome once the other finish recorded it.
+fn finished_by_another(table: &Supertable, load: &str) -> Result<LoadOutcome, InfinoError> {
+    match load_state(table, load)? {
+        LoadState::Finished(outcome) => {
+            detach_load(table, load)?;
+            Ok(outcome)
+        }
+        _ => Err(InfinoError::Conflict(format!(
+            "another finish of load {load} is running"
+        ))),
+    }
+}
+
+fn check_sealed(load: &str, accounts: &[ReplicaAccount]) -> Result<(), InfinoError> {
     let unsealed: Vec<&str> = accounts
         .iter()
         .filter(|a| !a.sealed)
         .map(|a| a.replica.as_str())
         .collect();
-    if !unsealed.is_empty() {
-        return Err(InfinoError::Conflict(format!(
+    match unsealed.is_empty() {
+        true => Ok(()),
+        false => Err(InfinoError::Conflict(format!(
             "load {load}: replicas not sealed: {unsealed:?}"
-        )));
+        ))),
     }
+}
+
+/// The finish of `load` once it holds `claim`.
+fn finish_claimed(
+    table: &Supertable,
+    load: &str,
+    expected_rows: Option<u64>,
+    claim: &str,
+) -> Result<LoadOutcome, InfinoError> {
+    let mut accounts = graft_load(table, load)?;
+    check_sealed(load, &accounts)?;
     for _ in 1..FINISH_ROUNDS {
         if accounts.iter().all(|a| a.merged == 0) {
             break;
         }
         accounts = graft_load(table, load)?;
     }
+    check_sealed(load, &accounts)?;
     let unaccounted: Vec<&str> = accounts
         .iter()
         .filter(|a| !a.is_accounted())
@@ -450,51 +571,46 @@ pub fn finish_load(
             outcome.rows
         )));
     }
-    let storage = storage_of(table)?;
-    let record = serde_json::to_vec(&LoadState::Finished(outcome.clone())).map_err(backend)?;
-    // Written only over the open record this finish read; a finish that lost the race reports
-    // the winner's outcome.
-    let won = table.block_on_query(async {
-        match storage
-            .put_if_match(&record_key(load), Bytes::from(record), version.as_deref())
-            .await
-        {
-            Ok(_) => Ok(true),
-            Err(e) if e.is_conflict() => Ok(false),
-            Err(e) => Err(backend(e)),
-        }
-    })?;
-    if !won {
-        return match load_state(table, load)? {
-            LoadState::Finished(outcome) => {
-                detach_load(table, load)?;
-                Ok(outcome)
-            }
-            state => Err(InfinoError::Conflict(format!(
-                "load {load} changed during its finish: {state:?}"
-            ))),
-        };
+    if write_record(
+        table,
+        load,
+        LoadState::Finished(outcome.clone()),
+        Some(claim),
+    )?
+    .is_none()
+    {
+        return finished_by_another(table, load);
     }
     detach_load(table, load)?;
     Ok(outcome)
 }
 
-/// Deletes the manifests of `load`'s replicas under [`REPLICAS_DIR`].
+/// Deletes `load`'s replicas under [`REPLICAS_DIR`].
 fn detach_load(table: &Supertable, load: &str) -> Result<usize, InfinoError> {
-    let storage = storage_of(table)?;
+    detach(table, &format!("{REPLICAS_DIR}{}", replica_prefix(load)))
+}
+
+/// Drops the cached handles of replicas whose objects start with `key_prefix`.
+fn forget_handles(table: &Supertable, key_prefix: &str) {
     table
         .inner()
         .replica_handles
         .lock()
         .expect("replica handles")
-        .retain(|name, _| !name.starts_with(&replica_prefix(load)));
-    let prefix = format!("{REPLICAS_DIR}{}", replica_prefix(load));
+        .retain(|name, _| !format!("{REPLICAS_DIR}{name}/").starts_with(key_prefix));
+}
+
+/// Deletes the replica objects under `key_prefix`, then settles the attached marker.
+fn detach(table: &Supertable, key_prefix: &str) -> Result<usize, InfinoError> {
+    let storage = storage_of(table)?;
+    forget_handles(table, key_prefix);
     table.block_on_query(async {
+        // Listed by directory: a store may match a prefix only at whole path segments.
         let keys = storage
             .list_with_prefix(REPLICAS_DIR)
             .await
             .map_err(backend)?;
-        let mine: Vec<&String> = keys.iter().filter(|k| k.starts_with(&prefix)).collect();
+        let mine: Vec<&String> = keys.iter().filter(|k| k.starts_with(key_prefix)).collect();
         stream::iter(&mine)
             .map(|key| {
                 let storage = &storage;
@@ -722,5 +838,72 @@ mod tests {
             Err(InfinoError::Conflict(_))
         ));
         assert_eq!(finish_load(&t, "l1", None).expect("finish").rows, 10);
+    }
+
+    #[test]
+    fn a_replica_created_while_a_finish_runs_is_refused() {
+        let (_dir, t) = table();
+        begin_load(&t, "l1").expect("begin");
+        let early = open_load_replica(&t, "l1", "n1").expect("replica");
+        // A finish records its claim before it lists the replicas.
+        let (_, version) = read_record(&t, "l1").expect("record");
+        let claim = write_record(&t, "l1", LoadState::Finishing, version.as_deref())
+            .expect("claim")
+            .expect("won");
+        assert!(matches!(
+            open_load_replica(&t, "l1", "n2"),
+            Err(InfinoError::Conflict(_))
+        ));
+        assert_eq!(
+            merge::attached_replicas(&t).expect("attached"),
+            vec!["l1.n1".to_owned()],
+            "the refused replica left nothing behind"
+        );
+        assert!(early.append_batch(&batch(10), "b1").expect("append"));
+        let reopened = open_load_replica(&t, "l1", "n1").expect("an existing replica reopens");
+        reopened.seal().expect("seal");
+        // A second finish takes the claim over; the first can no longer write.
+        assert_eq!(finish_load(&t, "l1", Some(10)).expect("finish").rows, 10);
+        assert!(
+            write_record(&t, "l1", LoadState::Open, Some(&claim))
+                .expect("write")
+                .is_none()
+        );
+        assert!(matches!(
+            open_load_replica(&t, "l1", "n2"),
+            Err(InfinoError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn a_failed_finish_reopens_the_load_for_new_replicas() {
+        let (_dir, t) = table();
+        begin_load(&t, "l1").expect("begin");
+        let r = open_load_replica(&t, "l1", "n1").expect("replica");
+        r.append_batch(&batch(10), "b1").expect("append");
+        r.seal().expect("seal");
+        assert!(matches!(
+            finish_load(&t, "l1", Some(20)),
+            Err(InfinoError::Conflict(_))
+        ));
+        assert_eq!(load_state(&t, "l1").expect("state"), LoadState::Open);
+        let late = open_load_replica(&t, "l1", "n2").expect("a new replica opens");
+        late.append_batch(&batch(10), "b2")
+            .expect("the missing batch");
+        late.seal().expect("seal");
+        assert_eq!(finish_load(&t, "l1", Some(20)).expect("finish").rows, 20);
+    }
+
+    #[test]
+    fn an_append_after_the_finish_detached_is_refused() {
+        let (_dir, t) = table();
+        begin_load(&t, "l1").expect("begin");
+        let r = open_load_replica(&t, "l1", "n1").expect("replica");
+        r.append_batch(&batch(10), "b1").expect("append");
+        seal_absent_replica(&t, "l1", "n1").expect("sealed for it");
+        assert_eq!(finish_load(&t, "l1", None).expect("finish").rows, 10);
+        assert!(r.append_batch(&batch(10), "b2").is_err());
+        assert!(!t.has_attached_replicas().expect("attached"));
+        assert_eq!(rows(&t), 10);
     }
 }
