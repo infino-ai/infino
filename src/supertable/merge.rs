@@ -9,7 +9,7 @@
 //! `graft` commits, so the destination's gc never sees a key it lists.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -166,29 +166,43 @@ async fn read_source(
     check(dst, src)?;
     let dst_entries = dst.get_all_superfiles_loaded().await.map_err(internal)?;
     let listed: HashSet<Uuid> = dst_entries.iter().map(|e| e.superfile_id).collect();
-    // A batch's superfiles share its name. One whose name the destination already lists came from a resent
-    // batch, so the first copy grafted is kept.
+    // A batch's superfiles share its name and its commit. A resent batch is a second copy: of the
+    // superfiles named alike, only the source's first commit of that name counts, and none if the
+    // destination took the batch from another source.
     let names: HashSet<&str> = dst_entries
         .iter()
         .filter_map(|e| e.stem.as_deref())
         .collect();
+    let src_entries = src.get_all_superfiles_loaded().await.map_err(internal)?;
+    let mut first_commit: HashMap<&str, u64> = HashMap::new();
+    let mut own: HashSet<&str> = HashSet::new();
+    for e in src_entries.iter() {
+        if let Some(name) = e.stem.as_deref() {
+            let first = first_commit.entry(name).or_insert(e.birth_version);
+            *first = (*first).min(e.birth_version);
+            if listed.contains(&e.superfile_id) {
+                own.insert(name);
+            }
+        }
+    }
+    let is_copy = |e: &SuperfileEntry| {
+        e.stem.as_deref().is_some_and(|name| {
+            first_commit.get(name) != Some(&e.birth_version)
+                || (names.contains(name) && !own.contains(name))
+        })
+    };
     let mut todo = vec![];
     let mut already_merged = 0;
     let mut duplicates = 0;
     let mut duplicate_rows = 0;
     let mut ids = HashSet::new();
-    for e in src
-        .get_all_superfiles_loaded()
-        .await
-        .map_err(internal)?
-        .iter()
-    {
+    for e in src_entries.iter() {
         if listed.contains(&e.superfile_id) {
             ids.insert(e.superfile_id);
             already_merged += 1;
             continue;
         }
-        if e.stem.as_deref().is_some_and(|n| names.contains(n)) {
+        if is_copy(e) {
             duplicates += 1;
             duplicate_rows += e.n_docs;
             continue;
@@ -1136,6 +1150,49 @@ mod tests {
         assert_eq!(detach_replicas(&t).expect("detach"), 2);
         assert!(attached_replicas(&t).expect("list").is_empty());
         assert!(!t.has_attached_replicas().expect("detached"));
+    }
+
+    #[test]
+    fn a_batch_resent_to_the_same_replica_is_grafted_once() {
+        use arrow_array::{ArrayRef, LargeStringArray, RecordBatch};
+        let (_dir, t) = table("t", 0);
+        let schema = t
+            .reader()
+            .expect("reader")
+            .manifest()
+            .get_opts()
+            .schema
+            .clone();
+        let replica = open_replica(&t, "r0").expect("replica");
+        for name in ["b1", "b2", "b1"] {
+            let titles: Vec<String> = (0..50).map(|i| format!("shared {name}d{i}")).collect();
+            let arr: ArrayRef = Arc::new(LargeStringArray::from(
+                titles.iter().map(String::as_str).collect::<Vec<_>>(),
+            ));
+            replica
+                .append_named(
+                    &RecordBatch::try_new(schema.clone(), vec![arr]).expect("batch"),
+                    name,
+                )
+                .expect("append");
+        }
+        let report = graft(&t, &replica.reader().expect("reader"), true).expect("graft");
+        assert_eq!(
+            (report.merged, report.duplicates, report.duplicate_rows),
+            (2, 1, 50)
+        );
+        let rows: u64 = t
+            .reader()
+            .expect("reader")
+            .manifest()
+            .superfiles
+            .iter()
+            .map(|e| e.n_docs)
+            .sum();
+        assert_eq!(rows, 100, "b1 once, b2 once");
+        // A later round finds nothing new and still counts the copy.
+        let again = graft(&t, &replica.reader().expect("reader"), true).expect("graft");
+        assert_eq!((again.merged, again.duplicates), (0, 1));
     }
 
     #[test]
