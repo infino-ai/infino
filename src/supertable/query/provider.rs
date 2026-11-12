@@ -4636,8 +4636,9 @@ mod tests {
         let category = prepare(&["category"]);
         assert_eq!(indexed_columns(&category), names(&["category"]));
         let both = prepare(&["title"]);
-        // Both, or every column: on files this small one more footer copy
-        // costs more than the whole index, so the reader loads it all.
+        // Both, or every column: on files this small, holding two columns'
+        // page index and the bytes to decode the rest takes as much memory as
+        // every column decoded, so the reader loads it all.
         assert!(indexed_columns(&both).is_superset(&names(&["category", "title"])));
         assert!(Arc::ptr_eq(&category.reader, &both.reader));
         assert!(Arc::ptr_eq(&prepare(&["category"]), &both));

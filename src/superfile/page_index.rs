@@ -37,13 +37,7 @@
 //! column was decoded, and the reader keeps its bytes, so a later load decodes
 //! from memory and never reads storage again.
 
-use std::{
-    collections::HashSet,
-    mem::size_of,
-    ops::{Add, Range},
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{collections::HashSet, mem::size_of, ops::Range, sync::Arc};
 
 use bytes::Bytes;
 use parquet::{
@@ -225,8 +219,7 @@ impl PageIndexBytes {
     /// `parquet` with the page index of the leaves in `added` decoded and the
     /// rest as `parquet` holds it: loaded where an earlier load decoded it,
     /// [`unloaded_offset_index`] and `NONE` elsewhere. arrow-rs owns the
-    /// footer by value, so this is a new copy of it; the [`LoadCost`] says
-    /// what the decode and the copy each took.
+    /// footer by value, so this is a new copy of it.
     ///
     /// When a chunk of `added` has no offset index, the result has no page
     /// index at all: arrow-rs drops both parts then too, since without page
@@ -236,23 +229,17 @@ impl PageIndexBytes {
         &self,
         parquet: &ParquetMetaData,
         added: &RoaringBitmap,
-    ) -> ParquetResult<(ParquetMetaData, LoadCost)> {
-        let started = Instant::now();
+    ) -> ParquetResult<ParquetMetaData> {
         let (fresh_columns, fresh_offsets) = self.decode(parquet, added)?;
-        let decoded = Instant::now();
         let mut indexed = parquet.clone().into_builder();
         let held_columns = indexed.take_column_index();
         let held_offsets = indexed.take_offset_index();
-        let cost = |copied: Instant| LoadCost {
-            decode: decoded - started,
-            copy: copied - decoded,
-        };
         let Some(fresh_offsets) = fresh_offsets else {
             let indexed = indexed
                 .set_column_index(None)
                 .set_offset_index(None)
                 .build();
-            return Ok((indexed, cost(Instant::now())));
+            return Ok(indexed);
         };
         let offsets = merge(
             parquet,
@@ -268,7 +255,7 @@ impl PageIndexBytes {
             .set_column_index(Some(columns))
             .set_offset_index(Some(offsets))
             .build();
-        Ok((indexed, cost(Instant::now())))
+        Ok(indexed)
     }
 
     /// The column and offset index of the leaves in `leaves`, decoded from
@@ -306,26 +293,6 @@ impl PageIndexBytes {
                 "page index decode over {}..{end} did not finish: {other:?}",
                 self.start
             ))),
-        }
-    }
-}
-
-/// What one load took: decoding the added columns' page index, and copying
-/// the footer to attach it to (see [`PageIndexBytes::apply`]).
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct LoadCost {
-    pub(crate) decode: Duration,
-    pub(crate) copy: Duration,
-}
-
-impl Add for LoadCost {
-    type Output = Self;
-
-    /// Two loads' costs together.
-    fn add(self, other: Self) -> Self {
-        Self {
-            decode: self.decode + other.decode,
-            copy: self.copy + other.copy,
         }
     }
 }
@@ -614,7 +581,6 @@ mod tests {
         index
             .apply(parquet, &leaves.iter().copied().collect())
             .expect("apply")
-            .0
     }
 
     /// Which leaves of each row group carry a column index.
