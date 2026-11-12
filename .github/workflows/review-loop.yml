@@ -1,8 +1,8 @@
 name: Review loop
 
 # `/autofix` on a PR runs review -> fix rounds until nothing is left for the fixer, then every check
-# CI runs; it approves when nothing is left for it to fix and those checks pass on the head commit.
-# Its approval does not count toward merging: main's ruleset requires one from the maintainers' team.
+# CI runs; when nothing is left for it to fix and those checks pass on the head commit, it says so in a
+# comment. It never approves: a person reviews and approves.
 # Started by hand, it can also review without fixing. Only maintainers (write access) can start it,
 # after reading the diff.
 #
@@ -63,6 +63,11 @@ jobs:
       (github.event.issue.pull_request && github.event.comment.user.type != 'Bot' &&
        contains(github.event.comment.body, '/autofix'))
     runs-on: ubuntu-latest
+    # Write on issues only to react to the command; this job checks out and runs nothing of the PR.
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: write
     env:
       GH_TOKEN: ${{ github.token }}
       REPO: ${{ github.repository }}
@@ -83,6 +88,7 @@ jobs:
           EVENT: ${{ github.event_name }}
           COMMENT: ${{ github.event.comment.body }}
           COMMENTER: ${{ github.event.comment.user.login }}
+          COMMENT_ID: ${{ github.event.comment.id }}
           ISSUE: ${{ github.event.issue.number }}
           IN_PR: ${{ github.event.inputs.pr }}
           IN_MODE: ${{ github.event.inputs.mode }}
@@ -110,6 +116,8 @@ jobs:
               *) echo "go=false" >> "$GITHUB_OUTPUT"; echo "not a loop command"; exit 0;;
             esac
             allowed "$COMMENTER" || refuse "$COMMENTER"
+            # 👀 on the command: it was seen and a run is starting. A reaction that fails starts the run anyway.
+            gh api -X POST "repos/$REPO/issues/comments/$COMMENT_ID/reactions" -f content=eyes --silent || true
             pr="$ISSUE"; reviewer=gpt-6.1-sol; effort=high; fixer=claude-opus-5-5-fast; iter=3
           elif [ "$EVENT" = "push" ] || [ "$EVENT" = "schedule" ] || [ "$IN_MODE" = "warm" ]; then
             # Builds main into the cache: no PR code, no model, no push.
@@ -161,7 +169,7 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       REPO: ${{ github.repository }}
       CARGO_TERM_COLOR: always
-      RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=lld
+      RUSTFLAGS: -D warnings
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
       CARGO_PROFILE_TEST_DEBUG: line-tables-only
     steps:
@@ -214,8 +222,6 @@ jobs:
           df -h /
           echo "runner: $RUNNER_NAME, $(nproc) cores, $(free -g | awk '/Mem:/ {print $2}') GB"
 
-      - name: Install lld
-        run: sudo apt-get install -y --no-install-recommends lld
 
       # The cache key hashes every installed Rust toolchain. The runner image's own `stable` moves
       # when GitHub updates the image, which would change the key under an unchanged repo; with only

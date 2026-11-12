@@ -80,7 +80,7 @@ use crate::{
     },
     runtime_bridge::{run_on_pool, run_on_pool_unless_blocking},
     runtime_metrics::{
-        op_stats::{OpStatsCollector, timed_section},
+        op_stats::{OpStatsCollector, attached_to_future, timed_section},
         rss::total_memory_bytes,
     },
     superfile::{
@@ -343,9 +343,8 @@ impl TableProvider for CallScopedTable {
 /// through here; error mapping stays with the caller, whose surface it
 /// belongs to.
 ///
-/// When the process has a memory limit (see `memory::resident`), the collect
-/// races it, and a process past the limit ends the statement with a
-/// `ResourcesExhausted` refusal.
+/// The process memory limit is watched around the whole statement (see
+/// [`run_within_process_limit`]).
 pub(crate) async fn collect_plan_metered(
     plan: &Arc<dyn ExecutionPlan>,
     task_ctx: Arc<TaskContext>,
@@ -353,42 +352,44 @@ pub(crate) async fn collect_plan_metered(
 ) -> DfResult<Vec<RecordBatch>> {
     let metered: Arc<dyn ExecutionPlan> =
         Arc::new(MeteredExec::new(Arc::clone(plan), op_stats.clone()));
-    let collected = collect(metered, task_ctx);
-    let batches = match process_limit() {
-        None => collected.await?,
-        // With a process limit, run the collect as its own task and race it
-        // against the sampler. The streamed batches are never reserved, so
-        // this is the only bound on them.
-        //  - over the limit before we start: refuse without spawning anything.
-        //  - own task, because a plan over cached data can finish all its work
-        //    in one poll, so a check in the same task would only run once the
-        //    result is ready.
-        //  - limit wins: dropping the task stops DataFusion's partition tasks
-        //    and the search functions' fan-out. A batch already being
-        //    processed still finishes first.
-        //  - `biased` checks the limit first, so a reading over it wins even if
-        //    the result lands in the same wakeup.
-        Some(limit) => {
-            if let Some(anon) = process_over_limit(limit) {
-                return Err(over_process_limit(anon, limit));
-            }
-            let collecting = SpawnedTask::spawn(collected);
-            tokio::select! {
-                biased;
-                anon = process_limit_exceeded(limit) => {
-                    return Err(over_process_limit(anon, limit));
-                }
-                joined = collecting => {
-                    joined.map_err(|join| DataFusionError::ExecutionJoin(Box::new(join)))??
-                }
-            }
-        }
-    };
+    let batches = collect(metered, task_ctx).await?;
     // Harvesting the unwrapped plan and the wrapped one reach the same
     // leaves — the walk dedupes by node identity and sums childless nodes
     // only, and the meter delegates `execute` to this same tree.
     harvest_datafusion_metrics(plan, op_stats);
     Ok(batches)
+}
+
+/// Run one SQL statement, planning through its last batch, raced against the process memory limit
+/// (see `memory::resident`). Planning holds the metadata of every file a scan keeps, which on a
+/// table of tens of thousands of files passes the limit before execution starts; execution streams
+/// batches the connection budget never sees. A refusal is `ResourcesExhausted`, a panic comes back
+/// as `ExecutionJoin`.
+///  - no limit: `statement` runs right here, nothing raced.
+///  - over the limit before it starts: refused, `statement` never runs.
+///  - otherwise it runs on a task of its own, as work over cached data can finish in one poll and a
+///    check in the same task would only run after it. The task keeps this call's span and
+///    `collector`.
+///  - limit wins: the task is dropped, which aborts it (file opens while planning, DataFusion's
+///    partition tasks and the search fan-out while executing). Work already inside a poll finishes
+///    that poll first.
+///  - `biased`: a reading over the limit wins even if the result lands in the same wakeup.
+pub(crate) async fn run_within_process_limit<T: Send + 'static>(
+    collector: Option<Arc<OpStatsCollector>>,
+    statement: impl Future<Output = T> + Send + 'static,
+) -> DfResult<T> {
+    let Some(limit) = process_limit() else {
+        return Ok(statement.await);
+    };
+    if let Some(anon) = process_over_limit(limit) {
+        return Err(over_process_limit(anon, limit));
+    }
+    let running = SpawnedTask::spawn(attached_to_future(collector, statement.in_current_span()));
+    tokio::select! {
+        biased;
+        anon = process_limit_exceeded(limit) => Err(over_process_limit(anon, limit)),
+        joined = running => joined.map_err(|join| DataFusionError::ExecutionJoin(Box::new(join))),
+    }
 }
 
 /// Fold DataFusion's row instrumentation into the per-query stats after a
@@ -2409,6 +2410,62 @@ fn finish_take(
         columns.push(take(selected.column(idx), &indices, None).map_err(QueryError::internal)?);
     }
     RecordBatch::try_new(out_schema, columns).map_err(|e| QueryError::internal(e).into())
+}
+
+/// The arguments a search function takes in its column-first form: how
+/// many, and how an error names them. The single-table function checks a
+/// call against it, and the catalog's table-first form checks against the
+/// same with the table in front, so the two never disagree about a count.
+/// The graph walks, which take the table first only, check against one too.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Arity {
+    /// Fewest arguments.
+    pub(crate) min: usize,
+    /// Most arguments; `min` when none is optional.
+    pub(crate) max: usize,
+    /// The arguments as an error names them, e.g. `"column, query, k[, mode]"`.
+    pub(crate) arguments: &'static str,
+}
+
+impl Arity {
+    /// Whether a column-first call with `got` arguments has the right count.
+    pub(crate) fn takes(&self, got: usize) -> bool {
+        (self.min..=self.max).contains(&got)
+    }
+
+    /// The count an error states with `leading` more arguments in front:
+    /// `3`, or `3 or 4` when the last is optional.
+    pub(crate) fn count(&self, leading: usize) -> String {
+        if self.min == self.max {
+            (self.min + leading).to_string()
+        } else {
+            format!("{} or {}", self.min + leading, self.max + leading)
+        }
+    }
+
+    /// The refusal for a call of `name` that passed `got` arguments after
+    /// the `leading` ones, stated in the form the caller wrote: the leading
+    /// arguments named and counted. `leading` is empty for a column-first
+    /// call and `["table"]` for a table-first one.
+    pub(crate) fn expects(&self, name: &str, got: usize, leading: &[&str]) -> String {
+        let mut named = leading.to_vec();
+        named.push(self.arguments);
+        format!(
+            "{name} expects {} arguments ({}), got {}",
+            self.count(leading.len()),
+            named.join(", "),
+            got + leading.len()
+        )
+    }
+
+    /// Refuses a column-first call of `name` with `got` arguments when that
+    /// is the wrong count.
+    pub(crate) fn check(&self, name: &str, got: usize) -> DfResult<()> {
+        if self.takes(got) {
+            return Ok(());
+        }
+        Err(DataFusionError::Plan(self.expects(name, got, &[])))
+    }
 }
 
 /// Extract a string literal argument (a column name, query text, ...).
