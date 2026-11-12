@@ -22,11 +22,25 @@ pub struct SplitStorageProvider {
 /// grafted.
 pub const REPLICAS_DIR: &str = "_replicas/";
 
-/// Names of the replicas attached to the table on `storage`.
+/// Names of the replicas attached to the table on `storage`: those with an object left under
+/// [`REPLICAS_DIR`]. Judged by objects, since a local directory outlives its last file.
 pub(crate) async fn attached_replicas(
     storage: &dyn StorageProvider,
 ) -> Result<Vec<String>, StorageError> {
-    storage.list_child_prefixes(REPLICAS_DIR).await
+    let mut names: Vec<String> = storage
+        .list_with_prefix(REPLICAS_DIR)
+        .await?
+        .iter()
+        .filter_map(|key| {
+            key.strip_prefix(REPLICAS_DIR)?
+                .split('/')
+                .next()
+                .map(str::to_owned)
+        })
+        .collect();
+    names.sort();
+    names.dedup();
+    Ok(names)
 }
 
 impl SplitStorageProvider {
