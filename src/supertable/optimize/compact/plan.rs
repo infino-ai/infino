@@ -23,7 +23,10 @@ use uuid::Uuid;
 
 use crate::{
     config::CompactionSettings,
-    superfile::builder::{MERGE_COLUMN_BYTES, MERGE_DECODED_WINDOW_BYTES, PASS_FIELDS},
+    superfile::builder::{
+        DEFAULT_ROW_GROUP_ROWS, MERGE_COLUMN_BYTES, MERGE_DECODED_WINDOW_BYTES,
+        MERGE_GATHERED_READ_BYTES, PASS_FIELDS,
+    },
     supertable::manifest::{list::DrainedVersionRanges, listed_once},
 };
 
@@ -48,6 +51,20 @@ pub(super) const INDEXED_MERGE_ROW_BYTES: u64 = 16;
 /// table of 2,900 mostly string columns, rounded up.
 pub(crate) const INPUT_FOOTER_BYTES_PER_COLUMN: u64 = 1024;
 
+/// Bytes a merge writing its rows in an order of its own (a vector-indexed
+/// table's, whose cells order its rows) keeps per row beside
+/// [`INDEXED_MERGE_ROW_BYTES`]. Each row's stable id, input and file row,
+/// sorted to be looked up, is 25 bytes. The ids in the cells' order are 16
+/// and each output row's input and file row 8. Rounded up.
+pub(crate) const GATHERED_MERGE_ROW_BYTES: u64 = 56;
+
+/// What one column chunk of an input takes in the footer a merge writing
+/// its rows in an order of its own reads them through: its chunk metadata
+/// and the offset index locating its pages, so that a row group's rows are
+/// read without the pages around them. The merge holds this copy of every
+/// input's footer from start to end. A few pages a chunk, rounded up.
+pub(crate) const OFFSET_INDEXED_CHUNK_BYTES: u64 = 512;
+
 /// What a merge of a table holds while it runs, and the most the planner
 /// may give one merge.
 ///
@@ -69,6 +86,13 @@ pub(crate) const INPUT_FOOTER_BYTES_PER_COLUMN: u64 = 1024;
 /// Beside its rows, a merge keeps a writer and a decoder for each column it
 /// writes at once: every column of a narrow table, [`PASS_FIELDS`] of a
 /// wide one however wide, [`MERGE_COLUMN_BYTES`] each.
+///
+/// A merge writing its rows in an order of its own, a vector-indexed
+/// table's, keeps more. It holds a pass's input rows as it reads them
+/// beside the window ([`MERGE_GATHERED_READ_BYTES`]), and the order and
+/// each row's place in its input ([`GATHERED_MERGE_ROW_BYTES`] a row). It
+/// reads every input through a footer with an offset index, one
+/// [`OFFSET_INDEXED_CHUNK_BYTES`] for each column of each input row group.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct MergeMemory {
     /// What one row of the table decodes to at the least
@@ -79,6 +103,9 @@ pub(crate) struct MergeMemory {
     pub(crate) fields: u64,
     /// Whether merges keep per-row bookkeeping: the table has an index.
     pub(crate) indexed: bool,
+    /// Whether merges write their rows in an order of their own, the one
+    /// the cells of a vector index give: the table has a vector index.
+    pub(crate) gathered: bool,
     /// The most one planned merge may be expected to hold: what the host
     /// can give a merge. `None` where it cannot be read, which never
     /// bounds a job.
@@ -86,15 +113,40 @@ pub(crate) struct MergeMemory {
 }
 
 impl MergeMemory {
-    /// What a merge of `input_bytes` stored, writing `output_bytes`, over
-    /// `live_docs` rows is expected to hold once it is running. Not a model
-    /// of everything a merge allocates (term cardinality and posting
-    /// density add to an indexed one), and the host reading, not this, is
-    /// what finally bounds how many run at once.
-    pub(crate) fn footprint(&self, input_bytes: u64, output_bytes: u64, live_docs: u64) -> u64 {
+    /// What a merge of `inputs` input files, `input_bytes` stored, writing
+    /// `output_bytes`, over `live_docs` rows is expected to hold once it is
+    /// running, its inputs' footers ([`Self::input_footers`]) among it.
+    /// Not a model of everything a merge allocates: term cardinality and
+    /// posting density add to an indexed one. The host reading, not this,
+    /// is what finally bounds how many run at once.
+    pub(crate) fn footprint(
+        &self,
+        input_bytes: u64,
+        output_bytes: u64,
+        live_docs: u64,
+        inputs: usize,
+    ) -> u64 {
         let bookkeeping = match self.indexed {
             true => live_docs.saturating_mul(INDEXED_MERGE_ROW_BYTES),
             false => 0,
+        };
+        let gathered = match (self.gathered, live_docs) {
+            (false, _) | (_, 0) => 0,
+            (true, _) => {
+                // Each input holds at most a row group more than its rows
+                // fill.
+                let row_groups = live_docs
+                    .div_ceil(DEFAULT_ROW_GROUP_ROWS as u64)
+                    .saturating_add(inputs as u64);
+                live_docs
+                    .saturating_mul(GATHERED_MERGE_ROW_BYTES)
+                    .saturating_add(MERGE_GATHERED_READ_BYTES)
+                    .saturating_add(
+                        row_groups
+                            .saturating_mul(self.fields)
+                            .saturating_mul(OFFSET_INDEXED_CHUNK_BYTES),
+                    )
+            }
         };
         let decoded = live_docs
             .saturating_mul(self.row_bytes)
@@ -109,8 +161,10 @@ impl MergeMemory {
         input_bytes
             .saturating_add(output_bytes)
             .saturating_add(bookkeeping)
+            .saturating_add(gathered)
             .saturating_add(decoded)
             .saturating_add(columns)
+            .saturating_add(self.input_footers(inputs))
     }
 
     /// What the footers of `inputs` input files take while a merge holds
@@ -119,20 +173,17 @@ impl MergeMemory {
     /// A merge opens every input as it starts and holds it to its end, so
     /// on a wide table a merge of many small inputs holds this much beside
     /// its rows.
-    pub(crate) fn input_footers(&self, inputs: usize) -> u64 {
+    fn input_footers(&self, inputs: usize) -> u64 {
         (inputs as u64)
             .saturating_mul(self.fields)
             .saturating_mul(INPUT_FOOTER_BYTES_PER_COLUMN)
     }
 
-    /// Whether a merge of that shape, of `inputs` input files, is within
-    /// [`Self::limit`]: its footprint and its inputs' footers, what the
-    /// runner charges it at admission.
+    /// Whether a merge of that shape is within [`Self::limit`]: its
+    /// footprint, what the runner charges it at admission.
     fn admits(&self, input_bytes: u64, output_bytes: u64, live_docs: u64, inputs: usize) -> bool {
         self.limit.is_none_or(|limit| {
-            self.footprint(input_bytes, output_bytes, live_docs)
-                .saturating_add(self.input_footers(inputs))
-                <= limit
+            self.footprint(input_bytes, output_bytes, live_docs, inputs) <= limit
         })
     }
 }
@@ -795,19 +846,25 @@ pub(in crate::supertable::optimize::compact) mod tests {
         let mut p = PendingJob::default();
         p.push(&seg(1, 1, 10, 0));
         let b = seg(2, 1, 10, 0);
-        let bytes = wide.footprint(
+        let shape = (
             p.raw_bytes + b.size_bytes,
             p.live_bytes + b.live_bytes(),
             p.live_docs + b.live_docs(),
         );
+        let bytes = wide.footprint(shape.0, shape.1, shape.2, 2);
         let footers = wide.input_footers(2);
         assert!(footers > 0, "guard: a wide table's footers are charged");
+        assert_eq!(
+            bytes,
+            wide.footprint(shape.0, shape.1, shape.2, 0) + footers,
+            "the footprint carries the footers"
+        );
         let within = |limit| MergeMemory {
             limit: Some(limit),
             ..wide
         };
-        assert!(p.fits(&b, target, max_input, &within(bytes + footers)));
-        assert!(!p.fits(&b, target, max_input, &within(bytes + footers - 1)));
+        assert!(p.fits(&b, target, max_input, &within(bytes)));
+        assert!(!p.fits(&b, target, max_input, &within(bytes - 1)));
     }
 
     /// A decoded row of a table thousands of columns wide, nearly all null.
@@ -857,9 +914,12 @@ pub(in crate::supertable::optimize::compact) mod tests {
         let mut seen = HashSet::new();
         for job in &jobs {
             assert!(job.inputs.len() >= 2);
-            let footprint = bounded
-                .footprint(job.input_bytes, job.estimated_output_bytes, job.live_docs)
-                .saturating_add(bounded.input_footers(job.inputs.len()));
+            let footprint = bounded.footprint(
+                job.input_bytes,
+                job.estimated_output_bytes,
+                job.live_docs,
+                job.inputs.len(),
+            );
             assert!(
                 footprint <= limit,
                 "a job expected to hold {footprint} bytes"
@@ -886,6 +946,7 @@ pub(in crate::supertable::optimize::compact) mod tests {
             row_bytes: WIDE_ROW_BYTES,
             fields: WIDE_FIELDS,
             indexed: false,
+            gathered: false,
             limit: Some(1),
         };
         let jobs = select_within(&segs, &cfg, &memory);

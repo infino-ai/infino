@@ -1764,6 +1764,7 @@ impl Supertable {
             row_bytes: null_row_bytes(&scalar_schema),
             fields: scalar_schema.fields().len() as u64,
             indexed: !manifest.fts_configs().is_empty() || !manifest.vector_configs().is_empty(),
+            gathered: !manifest.vector_configs().is_empty(),
             limit: host.map(|(available, _)| {
                 available.saturating_mul(100 - MERGE_MEMORY_RESERVE_PERCENT) / 100
             }),
@@ -2150,14 +2151,16 @@ const MERGE_ADMIT_SETTLE: Duration = Duration::from_millis(250);
 /// what the plan knows about it (see [`MergeMemory::footprint`]): its
 /// inputs, its output, an indexed table's per-row bookkeeping, the window
 /// of decoded rows its table's width makes, the columns it writes at once,
-/// and its inputs' footers ([`MergeMemory::input_footers`]). The host
-/// reading, not this, is what finally bounds the width: this only stands in
-/// for a merge's allocation between its admission and the reading that
-/// shows it.
+/// and its inputs' footers. The host reading, not this, is what finally
+/// bounds the width: this only stands in for a merge's allocation between
+/// its admission and the reading that shows it.
 fn expected_merge_footprint(job: &CompactionJob, memory: &MergeMemory) -> u64 {
-    memory
-        .footprint(job.input_bytes, job.estimated_output_bytes, job.live_docs)
-        .saturating_add(memory.input_footers(job.inputs.len()))
+    memory.footprint(
+        job.input_bytes,
+        job.estimated_output_bytes,
+        job.live_docs,
+        job.inputs.len(),
+    )
 }
 
 /// How many of `jobs` the host's memory lets run at once, as the width the
@@ -3130,7 +3133,8 @@ mod tests {
 
     use super::{
         plan::{
-            INDEXED_MERGE_ROW_BYTES, INPUT_FOOTER_BYTES_PER_COLUMN,
+            GATHERED_MERGE_ROW_BYTES, INDEXED_MERGE_ROW_BYTES, INPUT_FOOTER_BYTES_PER_COLUMN,
+            OFFSET_INDEXED_CHUNK_BYTES,
             tests::{default_cfg, seg},
         },
         *,
@@ -3147,8 +3151,8 @@ mod tests {
         storage::{ObjectMeta, StorageError},
         superfile::{
             builder::{
-                FtsConfig, MERGE_COLUMN_BYTES, MERGE_DECODED_WINDOW_BYTES, PASS_FIELDS,
-                VectorConfig,
+                DEFAULT_ROW_GROUP_ROWS, FtsConfig, MERGE_COLUMN_BYTES, MERGE_DECODED_WINDOW_BYTES,
+                MERGE_GATHERED_READ_BYTES, PASS_FIELDS, VectorConfig,
             },
             fts::{bm25::Bm25Params, reader::Bm25SearchOptions},
             reader::SuperfileReader,
@@ -3188,6 +3192,7 @@ mod tests {
         row_bytes: 0,
         fields: 0,
         indexed: true,
+        gathered: false,
         limit: None,
     };
 
@@ -7731,6 +7736,39 @@ mod tests {
         );
     }
 
+    /// A merge writing its rows in an order of its own is charged the input
+    /// rows a pass reads before ordering them, the order and each row's
+    /// place, and a column chunk of offset index for each column of each
+    /// input row group. A merge with no rows is charged none of it.
+    #[test]
+    fn a_gathered_merge_is_charged_its_order_reads_and_offset_index() {
+        let job = |live_docs, inputs: u128| CompactionJob {
+            inputs: (0..inputs).map(Uuid::from_u128).collect(),
+            live_docs,
+            ..CompactionJob::default()
+        };
+        let plain = MergeMemory {
+            fields: NARROW_FIELDS,
+            ..MergeMemory::default()
+        };
+        let gathered = MergeMemory {
+            gathered: true,
+            ..plain
+        };
+        let extra = |live_docs, inputs| {
+            expected_merge_footprint(&job(live_docs, inputs), &gathered)
+                - expected_merge_footprint(&job(live_docs, inputs), &plain)
+        };
+        assert_eq!(extra(0, 3), 0, "a merge with no rows reads none");
+        let live_docs = 3 * DEFAULT_ROW_GROUP_ROWS as u64 + 1;
+        assert_eq!(
+            extra(live_docs, 3),
+            live_docs * GATHERED_MERGE_ROW_BYTES
+                + MERGE_GATHERED_READ_BYTES
+                + (4 + 3) * NARROW_FIELDS * OFFSET_INDEXED_CHUNK_BYTES
+        );
+    }
+
     /// A table's merges are charged its width: the scalar schema's decoded
     /// row and its columns, and whether it carries an index.
     #[tokio::test(flavor = "multi_thread")]
@@ -7743,6 +7781,7 @@ mod tests {
         assert!(memory.row_bytes > 0);
         assert_eq!(memory.fields, scalar_schema.fields().len() as u64);
         assert!(memory.indexed, "the default table indexes its title");
+        assert!(!memory.gathered, "the default table has no vector index");
         assert_eq!(memory.limit, None, "an unread host sets no limit");
         let gib = 1u64 << 30;
         assert_eq!(

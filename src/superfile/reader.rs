@@ -38,7 +38,7 @@ use arrow_array::{
     Array, ArrayRef, Decimal128Array, LargeStringArray, RecordBatch, RecordBatchOptions,
     RecordBatchReader, UInt32Array,
 };
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
 use bytes::Bytes;
 use futures::{
     FutureExt,
@@ -1501,14 +1501,12 @@ impl SuperfileReader {
         &self,
         offset_index: bool,
     ) -> Result<ArrowReaderMetadata, ReadError> {
-        // Flag before footer, as the page-index load stores the indexed
-        // footer before it sets the flag: a set flag means the footer read
-        // next carries the index.
-        let loaded = self.page_index_loaded.initialized();
-        let resident = self.resident_arrow_metadata()?;
-        if !offset_index || loaded || resident.metadata().offset_index().is_some() {
-            return Ok(resident);
+        // A loaded page index stays loaded, so the footer read after this
+        // check carries it too.
+        if !offset_index || self.loaded_parquet_metadata_with_page_index().is_some() {
+            return self.resident_arrow_metadata();
         }
+        let resident = self.resident_arrow_metadata()?;
         let bytes = self
             .bytes
             .as_ref()
@@ -3680,21 +3678,45 @@ fn gather_rows(
             Ok((batch, row - starts[batch]))
         })
         .collect::<Result<Vec<_>, _>>()?;
+    interleave_rows(schema, batches, &at).map_err(|e| ReadError::Columnar(e.to_string()))
+}
+
+/// One batch of `schema` holding the rows `at` names, in its order: each
+/// entry is a batch of `batches` and a row of that batch. Only the batches
+/// `at` names are handed to the interleave, so a short run of rows drawn
+/// from a few of many batches costs in proportion to those few.
+pub(crate) fn interleave_rows(
+    schema: &SchemaRef,
+    batches: &[RecordBatch],
+    at: &[(usize, usize)],
+) -> Result<RecordBatch, ArrowError> {
+    // Each named batch's slot among the ones handed over, in first-use order.
+    let mut slot = vec![usize::MAX; batches.len()];
+    let mut used = Vec::new();
+    let at: Vec<(usize, usize)> = at
+        .iter()
+        .map(|&(batch, row)| {
+            if slot[batch] == usize::MAX {
+                slot[batch] = used.len();
+                used.push(batch);
+            }
+            (slot[batch], row)
+        })
+        .collect();
     let columns = (0..schema.fields().len())
         .map(|column| {
-            let arrays: Vec<&dyn Array> = batches
+            let arrays: Vec<&dyn Array> = used
                 .iter()
-                .map(|batch| batch.column(column).as_ref())
+                .map(|&batch| batches[batch].column(column).as_ref())
                 .collect();
-            interleave(&arrays, &at).map_err(|e| ReadError::Columnar(e.to_string()))
+            interleave(&arrays, &at)
         })
         .collect::<Result<Vec<_>, _>>()?;
     RecordBatch::try_new_with_options(
         Arc::clone(schema),
         columns,
-        &RecordBatchOptions::new().with_row_count(Some(ids.len())),
+        &RecordBatchOptions::new().with_row_count(Some(at.len())),
     )
-    .map_err(|e| ReadError::Columnar(e.to_string()))
 }
 
 /// Rank-back `take` indices restoring the caller's id order (duplicates
@@ -4375,6 +4397,45 @@ mod tests {
         // Positions in `sorted`: 7→2, 2→1, 7→2, 0→0.
         let got: Vec<u32> = (0..indices.len()).map(|i| indices.value(i)).collect();
         assert_eq!(got, vec![2, 1, 2, 0]);
+    }
+
+    /// Only the batches the rows name reach the interleave: a batch none
+    /// of them names is left alone even when it could not be interleaved
+    /// with the rest, and the rows come back in the order given.
+    #[test]
+    fn interleave_rows_hands_over_only_the_batches_it_names() {
+        let schema: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
+        let ints = |rows: std::ops::Range<i64>| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int64Array::from_iter_values(rows)) as ArrayRef],
+            )
+            .expect("batch")
+        };
+        // The middle batch's column is a different type, so interleaving it
+        // with the others fails.
+        let odd = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "n",
+                DataType::LargeUtf8,
+                false,
+            )])),
+            vec![Arc::new(LargeStringArray::from(vec!["x"])) as ArrayRef],
+        )
+        .expect("batch");
+        let batches = vec![ints(0..3), odd, ints(10..14)];
+        let gathered =
+            interleave_rows(&schema, &batches, &[(2, 3), (0, 1), (2, 0)]).expect("interleave");
+        let got = gathered
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("Int64")
+            .values()
+            .to_vec();
+        assert_eq!(got, vec![13, 1, 10]);
+        assert!(interleave_rows(&schema, &batches, &[(1, 0), (0, 0)]).is_err());
     }
 
     /// The whole-column gather takes rows from across the decoded batches,

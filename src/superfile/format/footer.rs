@@ -37,7 +37,7 @@ use arrow::{
     array::{Array, ArrayRef, AsArray, OffsetSizeTrait, new_empty_array},
     record_batch::RecordBatch,
 };
-use arrow_schema::{DataType, FieldRef, Schema, SchemaRef};
+use arrow_schema::{DataType, Field, FieldRef, Schema, SchemaRef};
 use bytes::Bytes;
 use parquet::{
     arrow::{
@@ -661,12 +661,22 @@ impl FieldWriters {
         writers: &mut [ArrowColumnWriter],
         column: &ArrayRef,
     ) -> Result<(), FooterError> {
-        let leaves = compute_leaves(&self.arrow[field], column)?;
-        for (writer, leaf) in writers.iter_mut().zip(leaves) {
-            writer.write(&leaf)?;
-        }
-        Ok(())
+        write_leaves(&self.arrow[field], column, writers)
     }
+}
+
+/// Write `column`, the values of `field`, to `writers`, the column writers
+/// of that field's leaves in order.
+fn write_leaves(
+    field: &Field,
+    column: &ArrayRef,
+    writers: &mut [ArrowColumnWriter],
+) -> Result<(), FooterError> {
+    let leaves = compute_leaves(field, column)?;
+    for (writer, leaf) in writers.iter_mut().zip(leaves) {
+        writer.write(&leaf)?;
+    }
+    Ok(())
 }
 
 /// One encode task: a top-level field's index, the slices to write, and
@@ -713,13 +723,9 @@ fn run_column_tasks(
 ) -> Result<(), FooterError> {
     let encode = |(field, batches, writers): &mut ColumnTask<'_, '_>| -> Result<(), FooterError> {
         let field_ref = schema.field(*field);
-        for batch in batches.iter() {
-            let leaves = compute_leaves(field_ref, batch.column(*field))?;
-            for (writer, leaf) in writers.iter_mut().zip(leaves) {
-                writer.write(&leaf)?;
-            }
-        }
-        Ok(())
+        batches
+            .iter()
+            .try_for_each(|batch| write_leaves(field_ref, batch.column(*field), writers))
     };
     match together {
         true => tasks.par_iter_mut().try_for_each(encode),
