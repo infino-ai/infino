@@ -285,6 +285,8 @@ pub(super) struct SupertableInner {
     pub(super) batches_taken: Mutex<HashMap<String, bool>>,
     /// Woken when a batch in `batches_taken` commits or fails.
     pub(super) batches_settled: Condvar,
+    /// Replicas a load's grafts read, kept across rounds (see `load::graft_load`).
+    pub(super) replica_handles: Mutex<HashMap<String, Supertable>>,
     /// Compaction commits' leftovers being dropped off their path, joined
     /// before a pass returns and, failing that, when the table goes. See
     /// [`RetiredScratch`].
@@ -2295,6 +2297,7 @@ async fn build_handle(
         term_index_objects_seen: Mutex::default(),
         batches_taken: Mutex::default(),
         batches_settled: Condvar::new(),
+        replica_handles: Mutex::default(),
         retired_scratch: RetiredScratch::default(),
     });
     install_disk_cache_pinning(&inner);

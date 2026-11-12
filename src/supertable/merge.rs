@@ -23,10 +23,10 @@ use uuid::Uuid;
 
 use crate::{
     Consistency, InfinoError,
-    storage::{SplitStorageProvider, StorageProvider},
+    storage::{SplitStorageProvider, StorageError, StorageProvider},
     supertable::{
-        SupertableReader,
-        error::{BuildError, QueryError},
+        SupertableOptions, SupertableReader,
+        error::{BuildError, OpenError, QueryError},
         gc::term_index_slices,
         handle::Supertable,
         manifest::{
@@ -66,6 +66,30 @@ fn is_batch_key(stem: &str) -> bool {
 /// The batch key `entry` is stored under, if it is one.
 pub(crate) fn batch_of(entry: &SuperfileEntry) -> Option<&str> {
     entry.stem.as_deref().filter(|s| is_batch_key(s))
+}
+
+/// How long a graft waits for another graft, a compaction or a reindex on its handle to finish.
+const SLOT_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// How often a waiting graft looks for the slot again.
+const SLOT_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// The handle's compaction slot, once whatever holds it lets go; grafts on one handle take turns.
+fn wait_for_slot(
+    dst: &Supertable,
+) -> Result<crate::supertable::optimize::compact::CompactionSlot<'_>, QueryError> {
+    let start = std::time::Instant::now();
+    loop {
+        if let Some(slot) = dst.try_hold_compaction_slot() {
+            return Ok(slot);
+        }
+        if start.elapsed() >= SLOT_WAIT {
+            return Err(internal(
+                "graft: a compaction, reindex or graft held the table too long",
+            ));
+        }
+        std::thread::sleep(SLOT_POLL);
+    }
 }
 
 /// Replica manifest objects [`detach_replicas`] deletes at once.
@@ -308,9 +332,7 @@ pub fn graft(
     let src_m = Arc::clone(src.manifest());
     // Keeps a compaction in this process from rewriting grafted superfiles
     // before their layers are stacked, which would leave them to be read.
-    let _slot = dst
-        .try_hold_compaction_slot()
-        .ok_or_else(|| internal("graft: a compaction or reindex is running"))?;
+    let _slot = wait_for_slot(dst)?;
     dst.block_on_query(async {
         // Another coordinator may have grafted since this handle last looked.
         inner.refresh().await.map_err(internal)?;
@@ -423,6 +445,33 @@ pub fn append_batch(
 /// manifest under [`crate::storage::REPLICAS_DIR`]`<name>/` and its objects in `table`, with
 /// replica folds on, reads that see other handles' commits, and no disk cache of its own.
 pub fn open_replica(table: &Supertable, name: &str) -> Result<Supertable, QueryError> {
+    let replica = Supertable::create(replica_options(table, name)?).map_err(internal)?;
+    table.block_on_query(async {
+        crate::storage::mark_attached(storage_of_table(table)?.as_ref())
+            .await
+            .map_err(internal)
+    })?;
+    Ok(replica)
+}
+
+/// Replica `name` of `table` if it exists. Never creates one, so a reader racing a detach finds
+/// nothing and attaches no empty replica.
+pub fn open_existing_replica(
+    table: &Supertable,
+    name: &str,
+) -> Result<Option<Supertable>, QueryError> {
+    match Supertable::open(replica_options(table, name)?) {
+        Ok(replica) => Ok(Some(replica)),
+        Err(
+            OpenError::PointerUnreadable(StorageError::NotFound { .. })
+            | OpenError::Storage(StorageError::NotFound { .. }),
+        ) => Ok(None),
+        Err(e) if e.to_string().contains("pointer not found") => Ok(None),
+        Err(e) => Err(internal(e)),
+    }
+}
+
+fn replica_options(table: &Supertable, name: &str) -> Result<SupertableOptions, QueryError> {
     // One path segment, so `attached_replicas` names it back as given.
     if name.is_empty() || name.contains('/') {
         return Err(internal(format!(
@@ -446,13 +495,7 @@ pub fn open_replica(table: &Supertable, name: &str) -> Result<Supertable, QueryE
     options.metadata_disk_cache = None;
     options.term_index_replica = true;
     options.read_consistency = Consistency::Strong;
-    let replica = Supertable::create(options).map_err(internal)?;
-    table.block_on_query(async {
-        crate::storage::mark_attached(storage_of_table(table)?.as_ref())
-            .await
-            .map_err(internal)
-    })?;
-    Ok(replica)
+    Ok(options)
 }
 
 fn storage_of_table(table: &Supertable) -> Result<Arc<dyn StorageProvider>, QueryError> {
