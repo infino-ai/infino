@@ -51,6 +51,7 @@ use std::{
 
 use bytes::Bytes;
 use rayon::prelude::*;
+use xxhash_rust::xxh3::Xxh3;
 
 use crate::superfile::vector::{
     distance::{
@@ -2616,6 +2617,317 @@ impl Hnsw {
     }
 }
 
+/// Magic of an encoded [`GraphChange`].
+const GRAPH_CHANGE_MAGIC: &[u8; 8] = b"INFCGC01";
+
+/// Why a [`GraphChange`] could not be made or applied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GraphChangeError {
+    /// The graph it applies to is not the one it was made from.
+    WrongBase,
+    /// The two graphs are not one generation of the other: the newer is
+    /// shorter, its parameters differ, a hole came back, or a surviving
+    /// node's tower changed height.
+    NotASuccessor,
+    /// A list names a node past the graph or a hole, a removed node was not
+    /// live, or the entry point is not a live node.
+    Invalid,
+    /// The applied graph does not hash to the checksum the change carries.
+    ChecksumMismatch,
+}
+
+/// The difference between two generations of one graph whose node ids are
+/// stable ([`Hnsw::unlink_nodes`] and [`Hnsw::extend`] keep them): which live
+/// nodes became holes, which surviving nodes' lists changed, the nodes added
+/// past the old end, and the new entry point. Applying it to the older graph
+/// gives the newer one exactly, which both sides check by checksum, so a
+/// reader can follow a writer by fetching only what changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GraphChange {
+    /// Slots in the graph the change applies to.
+    base_len: u32,
+    /// [`Hnsw::checksum`] of the graph the change applies to.
+    base_checksum: u64,
+    /// Entry point after the change.
+    entry: u32,
+    /// Base nodes that are holes after the change, ascending.
+    removed: Vec<u32>,
+    /// Lists of surviving base nodes that changed, as `(node, level, list)`,
+    /// in node then level order.
+    rewritten: Vec<(u32, u32, Vec<u32>)>,
+    /// Nodes past `base_len`, in id order: each node's lists by level, or no
+    /// lists for a node that is already a hole.
+    appended: Vec<Vec<Vec<u32>>>,
+    /// [`Hnsw::checksum`] of the graph after the change.
+    checksum: u64,
+}
+
+impl Hnsw {
+    /// A hash of everything a search reads: the parameters, the entry point,
+    /// and every node's tower and neighbor lists, holes included. Two graphs
+    /// with the same checksum search the same way.
+    pub(crate) fn checksum(&self) -> u64 {
+        let mut h = Xxh3::new();
+        for word in [
+            self.len as u64,
+            self.m as u64,
+            self.m0 as u64,
+            self.ef_construction as u64,
+            self.entry as u64,
+        ] {
+            h.update(&word.to_le_bytes());
+        }
+        for (lists, &level) in self.neighbors.iter().zip(&self.node_level) {
+            h.update(&(lists.len() as u32).to_le_bytes());
+            h.update(&level.to_le_bytes());
+            for list in lists {
+                h.update(&(list.len() as u32).to_le_bytes());
+                for id in list {
+                    h.update(&id.to_le_bytes());
+                }
+            }
+        }
+        h.digest()
+    }
+
+    /// The change that turns `self` into `next`. `next` must be a later
+    /// generation of `self`: at least as long, with the same parameters, no
+    /// hole of `self` live again, and every surviving node at its old height.
+    pub(crate) fn diff(&self, next: &Hnsw) -> Result<GraphChange, GraphChangeError> {
+        if next.len < self.len
+            || next.m != self.m
+            || next.m0 != self.m0
+            || next.ef_construction != self.ef_construction
+        {
+            return Err(GraphChangeError::NotASuccessor);
+        }
+        let mut removed = Vec::new();
+        let mut rewritten = Vec::new();
+        for node in 0..self.len {
+            let (before, after) = (&self.neighbors[node], &next.neighbors[node]);
+            match (before.is_empty(), after.is_empty()) {
+                (true, true) => {}
+                (true, false) => return Err(GraphChangeError::NotASuccessor),
+                (false, true) => removed.push(node as u32),
+                (false, false) => {
+                    if before.len() != after.len() || self.node_level[node] != next.node_level[node]
+                    {
+                        return Err(GraphChangeError::NotASuccessor);
+                    }
+                    for (level, (old, new)) in before.iter().zip(after).enumerate() {
+                        if old != new {
+                            rewritten.push((node as u32, level as u32, new.clone()));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(GraphChange {
+            base_len: self.len as u32,
+            base_checksum: self.checksum(),
+            entry: next.entry,
+            removed,
+            rewritten,
+            appended: next.neighbors[self.len..].to_vec(),
+            checksum: next.checksum(),
+        })
+    }
+
+    /// Apply `change` to this graph, which must be the graph it was made
+    /// from. Every id the change carries is checked before the graph is
+    /// touched, and the result must hash to the change's checksum, so a
+    /// change that does not fit comes back as an error rather than a graph
+    /// that searches differently from the writer's.
+    pub(crate) fn apply_change(mut self, change: &GraphChange) -> Result<Hnsw, GraphChangeError> {
+        if self.len != change.base_len as usize || self.checksum() != change.base_checksum {
+            return Err(GraphChangeError::WrongBase);
+        }
+        let len = self.len + change.appended.len();
+        let mut hole = vec![false; len];
+        for (node, lists) in self.neighbors.iter().enumerate() {
+            hole[node] = lists.is_empty();
+        }
+        for &node in &change.removed {
+            if node as usize >= self.len || hole[node as usize] {
+                return Err(GraphChangeError::Invalid);
+            }
+            hole[node as usize] = true;
+        }
+        for (offset, lists) in change.appended.iter().enumerate() {
+            if lists.len() > MAX_LEVEL as usize + 1 {
+                return Err(GraphChangeError::Invalid);
+            }
+            hole[self.len + offset] = lists.is_empty();
+        }
+        let names_live = |list: &[u32]| {
+            list.iter()
+                .all(|&id| (id as usize) < len && !hole[id as usize])
+        };
+        for (node, level, list) in &change.rewritten {
+            let (node, level) = (*node as usize, *level as usize);
+            if node >= self.len
+                || hole[node]
+                || level >= self.neighbors[node].len()
+                || !names_live(list)
+            {
+                return Err(GraphChangeError::Invalid);
+            }
+        }
+        if !change
+            .appended
+            .iter()
+            .flatten()
+            .all(|list| names_live(list))
+        {
+            return Err(GraphChangeError::Invalid);
+        }
+        let any_live = hole.iter().any(|h| !h);
+        if (change.entry as usize) >= len || (any_live && hole[change.entry as usize]) {
+            return Err(GraphChangeError::Invalid);
+        }
+
+        for &node in &change.removed {
+            self.neighbors[node as usize] = Vec::new();
+            self.node_level[node as usize] = 0;
+        }
+        for (node, level, list) in &change.rewritten {
+            self.neighbors[*node as usize][*level as usize] = list.clone();
+        }
+        for lists in &change.appended {
+            self.node_level.push(lists.len().saturating_sub(1) as u32);
+            self.neighbors.push(lists.clone());
+        }
+        self.len = len;
+        self.entry = change.entry;
+        if self.checksum() != change.checksum {
+            return Err(GraphChangeError::ChecksumMismatch);
+        }
+        Ok(self)
+    }
+}
+
+impl GraphChange {
+    /// Checksum of the graph after the change.
+    pub(crate) fn checksum(&self) -> u64 {
+        self.checksum
+    }
+
+    /// Nodes the change removes, rewrites a list of, and appends, for
+    /// telemetry and for deciding when to rebuild instead.
+    pub(crate) fn counts(&self) -> (usize, usize, usize) {
+        (
+            self.removed.len(),
+            self.rewritten.len(),
+            self.appended.len(),
+        )
+    }
+
+    /// The change as bytes: magic, the two checksums, base length and entry,
+    /// then the removed ids, the rewritten lists and the appended towers,
+    /// each count-prefixed. Paired with [`from_bytes`](Self::from_bytes).
+    pub(crate) fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(GRAPH_CHANGE_MAGIC);
+        out.extend_from_slice(&self.base_checksum.to_le_bytes());
+        out.extend_from_slice(&self.checksum.to_le_bytes());
+        out.extend_from_slice(&self.base_len.to_le_bytes());
+        out.extend_from_slice(&self.entry.to_le_bytes());
+        put_u32s(&mut out, &self.removed);
+        out.extend_from_slice(&(self.rewritten.len() as u64).to_le_bytes());
+        for (node, level, list) in &self.rewritten {
+            out.extend_from_slice(&node.to_le_bytes());
+            out.extend_from_slice(&level.to_le_bytes());
+            put_u32s(&mut out, list);
+        }
+        out.extend_from_slice(&(self.appended.len() as u64).to_le_bytes());
+        for lists in &self.appended {
+            out.extend_from_slice(&(lists.len() as u32).to_le_bytes());
+            for list in lists {
+                put_u32s(&mut out, list);
+            }
+        }
+        out
+    }
+
+    /// Decode [`to_bytes`](Self::to_bytes). `None` on a bad magic, a
+    /// truncation or trailing bytes; every count is checked against the bytes
+    /// left before anything is reserved. Ids are checked when the change is
+    /// applied, against the graph it applies to.
+    pub(crate) fn from_bytes(bytes: &[u8]) -> Option<GraphChange> {
+        let mut c = Cursor::new(bytes);
+        if c.take(GRAPH_CHANGE_MAGIC.len())? != GRAPH_CHANGE_MAGIC {
+            return None;
+        }
+        let base_checksum = c.u64()?;
+        let checksum = c.u64()?;
+        let base_len = c.u32()?;
+        let entry = c.u32()?;
+        let removed = take_u32s(&mut c)?;
+        // A rewritten record is at least node, level and a list count.
+        let rewritten_count = bounded_count(&mut c, 16)?;
+        let mut rewritten = Vec::with_capacity(rewritten_count);
+        for _ in 0..rewritten_count {
+            let node = c.u32()?;
+            let level = c.u32()?;
+            rewritten.push((node, level, take_u32s(&mut c)?));
+        }
+        // An appended record is at least its list count.
+        let appended_count = bounded_count(&mut c, 4)?;
+        let mut appended = Vec::with_capacity(appended_count);
+        for _ in 0..appended_count {
+            let levels = c.u32()?;
+            if levels > MAX_LEVEL + 1 {
+                return None;
+            }
+            let mut lists = Vec::with_capacity(levels as usize);
+            for _ in 0..levels {
+                lists.push(take_u32s(&mut c)?);
+            }
+            appended.push(lists);
+        }
+        if c.remaining() != 0 {
+            return None;
+        }
+        Some(GraphChange {
+            base_len,
+            base_checksum,
+            entry,
+            removed,
+            rewritten,
+            appended,
+            checksum,
+        })
+    }
+}
+
+/// Append `ids` as a `u64` count then the ids.
+fn put_u32s(out: &mut Vec<u8>, ids: &[u32]) {
+    out.extend_from_slice(&(ids.len() as u64).to_le_bytes());
+    for id in ids {
+        out.extend_from_slice(&id.to_le_bytes());
+    }
+}
+
+/// Read a `u64` count of records at least `min_record_bytes` long each,
+/// rejecting one the bytes left could not hold.
+fn bounded_count(c: &mut Cursor<'_>, min_record_bytes: usize) -> Option<usize> {
+    let count = usize::try_from(c.u64()?).ok()?;
+    if count.checked_mul(min_record_bytes)? > c.remaining() {
+        return None;
+    }
+    Some(count)
+}
+
+/// Read what [`put_u32s`] wrote.
+fn take_u32s(c: &mut Cursor<'_>) -> Option<Vec<u32>> {
+    let count = bounded_count(c, 4)?;
+    let mut ids = Vec::with_capacity(count);
+    for _ in 0..count {
+        ids.push(c.u32()?);
+    }
+    Some(ids)
+}
+
 /// On-disk magic for a persisted `hnsw` data bundle (graph + node→doc-id map +
 /// node-ordered Sq16 plane), the self-contained payload a resident data index
 /// is rebuilt from at open.
@@ -4992,6 +5304,201 @@ mod tests {
         assert_eq!(compacted.len(), survivors.len());
         assert_eq!(compacted.live_len(), survivors.len());
         assert_holes_unreachable(&compacted);
+    }
+
+    /// One churn round on a graph with stable ids: unlink every
+    /// `stride`-th live node (offset by `round`), then append `added` fresh
+    /// vectors to `slots`. Returns the next generation.
+    fn churn_round(
+        graph: Hnsw,
+        slots: &mut Vec<Vec<f32>>,
+        fresh: &[Vec<f32>],
+        stride: usize,
+        round: usize,
+    ) -> Hnsw {
+        let scorer = Sq16Scorer::from_unit_vectors(slots, CHURN_DIM);
+        let removed: Vec<u32> = (0..graph.len() as u32)
+            .filter(|&n| !graph.is_hole(n) && (n as usize + round).is_multiple_of(stride))
+            .collect();
+        let graph = graph.unlink_nodes(&removed, &scorer);
+        slots.extend_from_slice(fresh);
+        let scorer = Sq16Scorer::from_unit_vectors(slots, CHURN_DIM);
+        graph.extend_serial(&scorer, HnswParams::default())
+    }
+
+    #[test]
+    fn a_reader_following_changes_matches_the_writer_exactly() {
+        let (start, rounds, added) = (1200usize, 10usize, 150usize);
+        let pool = random_unit_vectors(start + rounds * added, CHURN_DIM, 0xF0110);
+        let mut slots = pool[..start].to_vec();
+        let mut writer = Hnsw::build_serial(
+            &Sq16Scorer::from_unit_vectors(&slots, CHURN_DIM),
+            HnswParams::default(),
+        );
+        // The reader starts from the writer's base and only ever sees
+        // encoded changes.
+        let mut reader = writer.clone();
+        let queries = random_unit_vectors(20, CHURN_DIM, 0xF0111);
+        for round in 0..rounds {
+            let fresh = &pool[start + round * added..start + (round + 1) * added];
+            let next = churn_round(writer.clone(), &mut slots, fresh, 9, round);
+            let change = writer.diff(&next).expect("a successor");
+            let (removed, rewritten, appended) = change.counts();
+            assert!(removed > 0 && rewritten > 0 && appended == added);
+            let decoded = GraphChange::from_bytes(&change.to_bytes()).expect("decode");
+            assert_eq!(decoded, change);
+            reader = reader.apply_change(&decoded).expect("apply");
+            writer = next;
+            assert_eq!(reader.checksum(), writer.checksum(), "round {round}");
+            assert_eq!(reader.to_bytes(), writer.to_bytes(), "round {round}");
+            let scorer = Sq16Scorer::from_unit_vectors(&slots, CHURN_DIM);
+            for q in &queries {
+                assert_eq!(
+                    reader.search(&scorer, q, CHURN_K, CHURN_EF),
+                    writer.search(&scorer, q, CHURN_K, CHURN_EF)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_change_applies_only_to_its_own_base() {
+        let n = 500usize;
+        let pool = random_unit_vectors(n + 100, CHURN_DIM, 0xBA5E);
+        let mut slots = pool[..n].to_vec();
+        let base = Hnsw::build_serial(
+            &Sq16Scorer::from_unit_vectors(&slots, CHURN_DIM),
+            HnswParams::default(),
+        );
+        let next = churn_round(base.clone(), &mut slots, &pool[n..], 7, 0);
+        let change = base.diff(&next).expect("a successor");
+        // Applying twice: the second base is `next`, not `base`.
+        let once = base.clone().apply_change(&change).expect("apply");
+        assert_eq!(
+            once.apply_change(&change).err(),
+            Some(GraphChangeError::WrongBase)
+        );
+        // A different graph of the same length.
+        let other = Hnsw::build_serial(
+            &Sq16Scorer::from_unit_vectors(&pool[100..100 + n], CHURN_DIM),
+            HnswParams::default(),
+        );
+        assert_eq!(
+            other.apply_change(&change).err(),
+            Some(GraphChangeError::WrongBase)
+        );
+    }
+
+    #[test]
+    fn a_damaged_change_is_rejected_without_panicking() {
+        let n = 300usize;
+        let pool = random_unit_vectors(n + 40, CHURN_DIM, 0xDA3A);
+        let mut slots = pool[..n].to_vec();
+        let base = Hnsw::build_serial(
+            &Sq16Scorer::from_unit_vectors(&slots, CHURN_DIM),
+            HnswParams::default(),
+        );
+        let next = churn_round(base.clone(), &mut slots, &pool[n..], 11, 0);
+        let bytes = base.diff(&next).expect("a successor").to_bytes();
+        let expected = next.checksum();
+
+        for cut in 0..bytes.len() {
+            assert!(
+                GraphChange::from_bytes(&bytes[..cut]).is_none(),
+                "truncation at {cut} decoded"
+            );
+        }
+        let mut longer = bytes.clone();
+        longer.push(0);
+        assert!(
+            GraphChange::from_bytes(&longer).is_none(),
+            "trailing byte decoded"
+        );
+
+        // Flip one bit in every byte in turn: the change either fails to
+        // decode, fails to apply, or applies to exactly the writer's graph
+        // (a flip in a slot the checksum covers cannot go unnoticed).
+        for at in 0..bytes.len() {
+            let mut damaged = bytes.clone();
+            damaged[at] ^= 0x10;
+            if let Some(change) = GraphChange::from_bytes(&damaged)
+                && let Ok(graph) = base.clone().apply_change(&change)
+            {
+                assert_eq!(graph.checksum(), expected, "flip at {at} applied wrongly");
+                assert_eq!(graph.checksum(), change.checksum());
+            }
+        }
+    }
+
+    #[test]
+    fn diff_refuses_a_graph_that_is_not_a_successor() {
+        let n = 400usize;
+        let vectors = random_unit_vectors(n, CHURN_DIM, 0x5CC);
+        let scorer = Sq16Scorer::from_unit_vectors(&vectors, CHURN_DIM);
+        let graph = Hnsw::build_serial(&scorer, HnswParams::default());
+        let shorter = Hnsw::build_serial(
+            &Sq16Scorer::from_unit_vectors(&vectors[..n - 1], CHURN_DIM),
+            HnswParams::default(),
+        );
+        assert_eq!(
+            graph.diff(&shorter).expect_err("shorter"),
+            GraphChangeError::NotASuccessor
+        );
+
+        let holed = graph.clone().unlink_nodes(&[3, 4], &scorer);
+        // A hole that comes back is not a later generation.
+        assert_eq!(
+            holed.diff(&graph).expect_err("revived hole"),
+            GraphChangeError::NotASuccessor
+        );
+
+        let params = HnswParams {
+            m0: 24,
+            ..HnswParams::default()
+        };
+        let other_params = Hnsw::build_serial(&scorer, params);
+        assert_eq!(
+            graph.diff(&other_params).expect_err("other params"),
+            GraphChangeError::NotASuccessor
+        );
+    }
+
+    #[test]
+    fn nodes_added_and_removed_in_one_generation_arrive_as_holes() {
+        let (n, added) = (400usize, 60usize);
+        let pool = random_unit_vectors(n + added, CHURN_DIM, 0xADD0);
+        let base = Hnsw::build_serial(
+            &Sq16Scorer::from_unit_vectors(&pool[..n], CHURN_DIM),
+            HnswParams::default(),
+        );
+        let scorer = Sq16Scorer::from_unit_vectors(&pool, CHURN_DIM);
+        let grown = base.clone().extend_serial(&scorer, HnswParams::default());
+        // Two of the new nodes go again before the generation is published.
+        let next = grown.unlink_nodes(&[n as u32 + 5, n as u32 + 6], &scorer);
+        let change = base.diff(&next).expect("a successor");
+        let applied = base
+            .apply_change(&GraphChange::from_bytes(&change.to_bytes()).expect("decode"))
+            .expect("apply");
+        assert_eq!(applied.checksum(), next.checksum());
+        assert!(applied.is_hole(n as u32 + 5) && applied.is_hole(n as u32 + 6));
+        assert_eq!(applied.live_len(), n + added - 2);
+    }
+
+    #[test]
+    fn an_empty_change_round_trips() {
+        let n = 200usize;
+        let vectors = random_unit_vectors(n, CHURN_DIM, 0xE3E3);
+        let graph = Hnsw::build_serial(
+            &Sq16Scorer::from_unit_vectors(&vectors, CHURN_DIM),
+            HnswParams::default(),
+        );
+        let change = graph.diff(&graph).expect("itself");
+        assert_eq!(change.counts(), (0, 0, 0));
+        let applied = graph
+            .clone()
+            .apply_change(&GraphChange::from_bytes(&change.to_bytes()).expect("decode"))
+            .expect("apply");
+        assert_eq!(applied.to_bytes(), graph.to_bytes());
     }
 
     /// A full `hnsw` bundle (graph + node→doc-id map + Sq16 plane)
