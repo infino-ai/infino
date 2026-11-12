@@ -1104,6 +1104,7 @@ pub fn infino::Supertable::hydrate(&self, impl arrow_array::record_batch::Record
 pub fn infino::Supertable::index_staleness(&self, &infino::ReindexOptions) -> core::result::Result<infino::StalenessReport, infino::ReindexError>
 pub fn infino::Supertable::load_state(&self, &str) -> core::result::Result<infino::LoadState, infino::InfinoError>
 pub fn infino::Supertable::open_load_replica(&self, &str, &str) -> core::result::Result<infino::LoadReplica, infino::InfinoError>
+pub fn infino::Supertable::open_loads(&self) -> core::result::Result<alloc::vec::Vec<alloc::string::String>, infino::InfinoError>
 pub fn infino::Supertable::optimize(&self, &infino::OptimizeOptions) -> core::result::Result<(), infino::OptimizeError>
 pub fn infino::Supertable::reindex(&self, &infino::ReindexOptions) -> core::result::Result<infino::ReindexReport, infino::ReindexError>
 pub fn infino::Supertable::reindex_plan(&self, &infino::ReindexOptions) -> core::result::Result<alloc::vec::Vec<infino::PlannedRepair>, infino::ReindexError>

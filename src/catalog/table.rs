@@ -822,7 +822,13 @@ impl Supertable {
         load::begin_load(self.local_for_load()?, load)
     }
 
-    /// Whether `load` is unknown, open or finished on this table.
+    /// The loads on this table that are open or finishing, so a coordinator that restarted can
+    /// take them up again.
+    pub fn open_loads(&self) -> Result<Vec<String>, InfinoError> {
+        load::open_loads(self.local_for_load()?)
+    }
+
+    /// Whether `load` is unknown, open, finishing or finished on this table.
     pub fn load_state(&self, load: &str) -> Result<LoadState, InfinoError> {
         load::load_state(self.local_for_load()?, load)
     }

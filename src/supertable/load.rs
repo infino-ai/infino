@@ -207,6 +207,33 @@ pub fn load_state(table: &Supertable, load: &str) -> Result<LoadState, InfinoErr
     read_record(table, load).map(|(state, _)| state)
 }
 
+/// The loads on `table` that are open or finishing, so a coordinator that restarted can take
+/// them up again.
+pub fn open_loads(table: &Supertable) -> Result<Vec<String>, InfinoError> {
+    let storage = storage_of(table)?;
+    let keys = table
+        .block_on_query(storage.list_with_prefix(LOADS_DIR))
+        .map_err(backend)?;
+    let mut open = vec![];
+    for key in keys {
+        let Some(load) = key
+            .strip_prefix(LOADS_DIR)
+            .and_then(|k| k.strip_suffix(".json"))
+        else {
+            continue;
+        };
+        if check_id("load", load).is_ok()
+            && matches!(
+                load_state(table, load)?,
+                LoadState::Open | LoadState::Finishing
+            )
+        {
+            open.push(load.to_owned());
+        }
+    }
+    Ok(open)
+}
+
 /// Begins `load` on `table`, or reports the state it is already in: beginning an open load again is
 /// harmless, and a finished one stays finished (a new load needs a new id).
 pub fn begin_load(table: &Supertable, load: &str) -> Result<LoadState, InfinoError> {
@@ -917,5 +944,16 @@ mod tests {
         assert!(r.append_batch(&batch(10), "b2").is_err());
         assert!(!t.has_attached_replicas().expect("attached"));
         assert_eq!(rows(&t), 10);
+    }
+
+    #[test]
+    fn open_loads_lists_the_unfinished_ones() {
+        let (_dir, t) = table();
+        assert!(open_loads(&t).expect("none").is_empty());
+        for load in ["la", "lb"] {
+            begin_load(&t, load).expect("begin");
+        }
+        finish_load(&t, "la", None).expect("finish");
+        assert_eq!(open_loads(&t).expect("open"), vec!["lb".to_owned()]);
     }
 }

@@ -52,3 +52,4 @@ Supertable::has_attached_replicas	exempt	Rust-embedder API for loads spread over
 Supertable::load_state	exempt	Rust-embedder API for loads spread over several engine processes that share one table's storage; a single-process binding has no other process to coordinate
 Supertable::open_load_replica	exempt	Rust-embedder API for loads spread over several engine processes that share one table's storage; a single-process binding has no other process to coordinate
 Supertable::seal_absent_replica	exempt	Rust-embedder API for loads spread over several engine processes that share one table's storage; a single-process binding has no other process to coordinate
+Supertable::open_loads	exempt	Rust-embedder API for loads spread over several engine processes that share one table's storage; a single-process binding has no other process to coordinate
