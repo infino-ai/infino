@@ -1393,6 +1393,47 @@ impl Hnsw {
         self
     }
 
+    /// The graph with its holes dropped and the live nodes renumbered from 0
+    /// in their old order, and `kept[new] = old` for each of them. No list
+    /// names a hole, so nothing needs repair: every list is only renumbered.
+    pub(crate) fn without_holes(&self) -> (Hnsw, Vec<u32>) {
+        let kept: Vec<u32> = (0..self.len as u32).filter(|&n| !self.is_hole(n)).collect();
+        let mut remap = vec![u32::MAX; self.len];
+        for (new, &old) in kept.iter().enumerate() {
+            remap[old as usize] = new as u32;
+        }
+        let neighbors = kept
+            .iter()
+            .map(|&old| {
+                self.neighbors[old as usize]
+                    .iter()
+                    .map(|list| list.iter().map(|&nb| remap[nb as usize]).collect())
+                    .collect()
+            })
+            .collect();
+        let node_level = kept
+            .iter()
+            .map(|&old| self.node_level[old as usize])
+            .collect();
+        let entry = if kept.is_empty() {
+            0
+        } else {
+            remap[self.entry as usize]
+        };
+        let graph = Hnsw {
+            neighbors,
+            node_level,
+            entry,
+            m: self.m,
+            m0: self.m0,
+            ef_construction: self.ef_construction,
+            len: kept.len(),
+            #[cfg(feature = "graph-index")]
+            compact_base: false,
+        };
+        (graph, kept)
+    }
+
     /// Whether `node` is a hole left by [`unlink_nodes`](Self::unlink_nodes).
     /// A live node always has at least its level-0 list, even when empty.
     #[inline]
@@ -4904,6 +4945,32 @@ mod tests {
                 graph.search(&scorer, q, CHURN_K, CHURN_EF),
                 decoded.search(&scorer, q, CHURN_K, CHURN_EF)
             );
+        }
+    }
+
+    #[test]
+    fn dropping_holes_keeps_every_search_result() {
+        let n = 900usize;
+        let vectors = random_unit_vectors(n, CHURN_DIM, 0xD7D7);
+        let scorer = Sq16Scorer::from_unit_vectors(&vectors, CHURN_DIM);
+        let mut removed: Vec<u32> = (0..n as u32).filter(|i| i % 5 == 3).collect();
+        let graph = Hnsw::build_serial(&scorer, HnswParams::default());
+        removed.push(graph.entry);
+        let graph = graph.unlink_nodes(&removed, &scorer);
+        let (compact, kept) = graph.without_holes();
+        assert_eq!(compact.len(), graph.live_len());
+        assert_holes_unreachable(&compact);
+        let kept_vectors: Vec<Vec<f32>> =
+            kept.iter().map(|&o| vectors[o as usize].clone()).collect();
+        let kept_scorer = Sq16Scorer::from_unit_vectors(&kept_vectors, CHURN_DIM);
+        for q in &random_unit_vectors(30, CHURN_DIM, 0xD8D8) {
+            let old: Vec<(u32, f32)> = graph.search(&scorer, q, CHURN_K, CHURN_EF);
+            let new: Vec<(u32, f32)> = compact
+                .search(&kept_scorer, q, CHURN_K, CHURN_EF)
+                .into_iter()
+                .map(|(node, d)| (kept[node as usize], d))
+                .collect();
+            assert_eq!(old, new);
         }
     }
 
