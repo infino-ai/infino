@@ -116,7 +116,7 @@ use crate::{
             reader::{BoolMode, ContainsRows, MatchWork},
             tokenize::{Tokenizer, unique_tokens},
         },
-        page_index::{IndexColumns, is_loaded},
+        page_index::{IndexColumns, loaded_pages},
     },
     supertable::{
         SuperfileEntry, SupertableReader,
@@ -222,10 +222,24 @@ struct PreparedScanFile {
     tier: OpenTier,
     /// The columns whose page index `footer` holds (it may hold more): a
     /// later scan of this provider needing others prepares the file again.
-    columns: IndexColumns,
+    /// `None` when prepared without a page index, for the range-index reads
+    /// alone ([`SupertableProvider::range_scan_file`]); such a file serves no
+    /// scan, since a footer handed to DataFusion without a page index makes
+    /// its opener fetch the index itself.
+    columns: Option<IndexColumns>,
 }
 
 impl PreparedScanFile {
+    /// Whether this file serves a caller needing the page index of
+    /// `columns`, or none at all when `None`.
+    fn serves(&self, columns: Option<&IndexColumns>) -> bool {
+        match (columns, &self.columns) {
+            (None, _) => true,
+            (Some(wanted), Some(held)) => held.covers(wanted),
+            (Some(_), None) => false,
+        }
+    }
+
     /// The average data pages of `columns` in this file; `None` when the
     /// page index names none of them.
     fn pages_per_column(&self, columns: &[&str]) -> Option<u64> {
@@ -266,7 +280,7 @@ impl ScanFileOpener {
         self,
         entry: Arc<SuperfileEntry>,
         cell: PreparedScanCell,
-        columns: &IndexColumns,
+        columns: Option<&IndexColumns>,
         reader: Option<(Arc<SuperfileReader>, OpenTier)>,
     ) -> DfResult<Arc<PreparedScanFile>> {
         let resident = reader.or_else(|| {
@@ -281,7 +295,12 @@ impl ScanFileOpener {
             .map(|reader| (reader, OpenTier::Memory))
         });
         if let Some((reader, tier)) = &resident
-            && let Some((held, parquet_meta)) = reader.loaded_page_indexed_footer(columns)
+            && let Some((held, parquet_meta)) = match columns {
+                None => Some((None, reader.parquet_metadata())),
+                Some(columns) => reader
+                    .loaded_page_indexed_footer(columns)
+                    .map(|(held, footer)| (Some(held), footer)),
+            }
         {
             let prepared = cell
                 .get_or_try_init(|| async {
@@ -298,7 +317,7 @@ impl ScanFileOpener {
                 .await?;
             return Ok(Arc::clone(prepared));
         }
-        let columns = columns.clone();
+        let columns = columns.cloned();
         let open = async move {
             let prepared = cell
                 .get_or_try_init(|| async {
@@ -323,10 +342,16 @@ impl ScanFileOpener {
                     // opener fetch the index through the metered store, but
                     // only for lazily opened readers, so `sql_page_bytes`
                     // would depend on the reader cache's state.
-                    let (held, parquet_meta) = reader
-                        .page_indexed_footer(&columns, None)
-                        .await
-                        .map_err(QueryError::from)?;
+                    let (held, parquet_meta) = match &columns {
+                        None => (None, reader.parquet_metadata()),
+                        Some(columns) => {
+                            let (held, footer) = reader
+                                .page_indexed_footer(columns, None)
+                                .await
+                                .map_err(QueryError::from)?;
+                            (Some(held), footer)
+                        }
+                    };
                     prepare_scan_file(
                         &self.scan_store,
                         &self.scan_footers,
@@ -351,7 +376,9 @@ impl ScanFileOpener {
 /// DataFusion's Parquet opener reads it through, and describe it for the
 /// scan. The footer registered is the one pruning may read
 /// ([`without_nan_blind_bounds`]); `columns` are the ones whose page index
-/// `parquet_meta` holds.
+/// `parquet_meta` holds. A file prepared without a page index (`None`) is
+/// for the range-index reads alone and serves no scan, so nothing is
+/// registered or derived for it.
 fn prepare_scan_file(
     scan_store: &SuperfileObjectStore,
     scan_footers: &ScanFooters,
@@ -359,7 +386,7 @@ fn prepare_scan_file(
     reader: Arc<SuperfileReader>,
     tier: OpenTier,
     parquet_meta: Arc<ParquetMetaData>,
-    columns: IndexColumns,
+    columns: Option<IndexColumns>,
 ) -> DfResult<Arc<PreparedScanFile>> {
     let path = ObjPath::from(entry.storage_path());
     let source = reader.byte_source();
@@ -372,18 +399,14 @@ fn prepare_scan_file(
         .into();
     let rows_end = rows_end(&reader, &parquet_meta);
     let mut pages: HashMap<String, u64> = HashMap::new();
-    if let Some(offsets) = parquet_meta.offset_index() {
-        let leaves = parquet_meta.file_metadata().schema_descr();
-        for row_group in offsets {
-            // A column whose page index is not loaded has no pages to count.
-            for (leaf, chunk) in row_group
-                .iter()
-                .enumerate()
-                .filter(|(_, chunk)| is_loaded(chunk))
+    let leaves = parquet_meta.file_metadata().schema_descr();
+    for row_group in 0..parquet_meta.num_row_groups() {
+        // A column whose page index is not loaded has no pages to count.
+        for leaf in 0..leaves.num_columns() {
+            if let Some(located) = loaded_pages(&parquet_meta, row_group, leaf)
+                && let Some(name) = leaves.column(leaf).path().parts().first()
             {
-                if let Some(name) = leaves.column(leaf).path().parts().first() {
-                    *pages.entry(name.clone()).or_default() += chunk.page_locations().len() as u64;
-                }
+                *pages.entry(name.clone()).or_default() += located.len() as u64;
             }
         }
     }
@@ -399,6 +422,19 @@ fn prepare_scan_file(
             .column(column)
             .and_then(|stats| stats.min_max_values())
     };
+    let Some(scanned) = &columns else {
+        return Ok(Arc::new(PreparedScanFile {
+            reader,
+            path,
+            size,
+            rows_end,
+            row_counts,
+            pages,
+            footer: parquet_meta,
+            tier,
+            columns,
+        }));
+    };
     let footer = if entry.scalar_stats.is_unavailable() {
         without_nan_blind_bounds(parquet_meta, bounds)?
     } else {
@@ -410,7 +446,7 @@ fn prepare_scan_file(
     register_footer(
         scan_footers,
         path.clone(),
-        ScanFooter::new(Arc::clone(&footer), columns.clone()),
+        ScanFooter::new(Arc::clone(&footer), scanned.clone()),
     );
     Ok(Arc::new(PreparedScanFile {
         reader,
@@ -1237,7 +1273,7 @@ impl SupertableProvider {
         let pool: &ThreadPool = &self.manifest.options.reader_pool;
         let counts = try_join_bounded(
             survivors.iter().cloned().map(|entry| {
-                let prepared = self.prepared_scan_file(Arc::clone(&entry), IndexColumns::none());
+                let prepared = self.range_scan_file(Arc::clone(&entry));
                 async move {
                     let prepared = prepared.await?;
                     let reader = &prepared.reader;
@@ -1333,7 +1369,7 @@ impl SupertableProvider {
         let in_flight = self.manifest.options.superfiles_in_flight;
         let ends = try_join_bounded(
             survivors.iter().cloned().map(|entry| {
-                let prepared = self.prepared_scan_file(Arc::clone(&entry), IndexColumns::none());
+                let prepared = self.range_scan_file(Arc::clone(&entry));
                 async move {
                     let prepared = prepared.await?;
                     let tombstones = self.deleted_rows(entry.superfile_id, now)?;
@@ -1432,7 +1468,7 @@ impl SupertableProvider {
         let pool: &ThreadPool = &self.manifest.options.reader_pool;
         let rows = try_join_bounded(
             survivors.iter().cloned().map(|entry| {
-                let prepared = self.prepared_scan_file(Arc::clone(&entry), IndexColumns::none());
+                let prepared = self.range_scan_file(Arc::clone(&entry));
                 async move {
                     let prepared = prepared.await?;
                     let tombstones = self.deleted_rows(entry.superfile_id, now)?;
@@ -1521,6 +1557,28 @@ impl SupertableProvider {
         entry: Arc<SuperfileEntry>,
         columns: IndexColumns,
     ) -> impl Future<Output = DfResult<Arc<PreparedScanFile>>> + Send + 'static {
+        self.prepared_file(entry, Some(columns))
+    }
+
+    /// `entry` prepared for the range-index reads (counts, ends, rows),
+    /// which read no page: [`Self::prepared_scan_file`] without loading a
+    /// page index. A file a scan prepared already serves as it is; one
+    /// prepared here serves no scan, so a later scan prepares it again and
+    /// loads its page index then, from the reader this one opened.
+    fn range_scan_file(
+        &self,
+        entry: Arc<SuperfileEntry>,
+    ) -> impl Future<Output = DfResult<Arc<PreparedScanFile>>> + Send + 'static {
+        self.prepared_file(entry, None)
+    }
+
+    /// [`Self::prepared_scan_file`] for the page index of `columns`, or for
+    /// none at all when `None` ([`Self::range_scan_file`]).
+    fn prepared_file(
+        &self,
+        entry: Arc<SuperfileEntry>,
+        columns: Option<IndexColumns>,
+    ) -> impl Future<Output = DfResult<Arc<PreparedScanFile>>> + Send + 'static {
         let files = Arc::clone(&self.prepared_scan_files);
         let opener = ScanFileOpener {
             store: Arc::clone(&self.store),
@@ -1541,11 +1599,11 @@ impl SupertableProvider {
                 None => {
                     opener
                         .clone()
-                        .prepare(Arc::clone(&entry), cell, &columns, None)
+                        .prepare(Arc::clone(&entry), cell, columns.as_ref(), None)
                         .await?
                 }
             };
-            if prepared.columns.covers(&columns) {
+            if prepared.serves(columns.as_ref()) {
                 return Ok(prepared);
             }
             // Prepared for other columns: prepare it again, and keep that for
@@ -1555,7 +1613,7 @@ impl SupertableProvider {
                 .prepare(
                     entry.clone(),
                     Arc::new(OnceCell::new()),
-                    &columns,
+                    columns.as_ref(),
                     Some(reader),
                 )
                 .await?;
@@ -1564,7 +1622,7 @@ impl SupertableProvider {
                 .or_insert_with(|| Arc::new(OnceCell::new()));
             if kept
                 .get()
-                .is_none_or(|kept| !kept.columns.covers(&wider.columns))
+                .is_none_or(|kept| !kept.serves(wider.columns.as_ref()))
             {
                 *kept = Arc::new(OnceCell::new_with(Some(Arc::clone(&wider))));
             }
@@ -4642,6 +4700,43 @@ mod tests {
         assert!(indexed_columns(&both).is_superset(&names(&["category", "title"])));
         assert!(Arc::ptr_eq(&category.reader, &both.reader));
         assert!(Arc::ptr_eq(&prepare(&["category"]), &both));
+    }
+
+    /// The range-index reads (counts, ends, rows) read no page, so their
+    /// file is prepared without loading the page index or registering a
+    /// footer for DataFusion. It serves no scan: a scan of the same file
+    /// prepares it again, from the same reader, and loads its page index
+    /// then.
+    #[test]
+    fn a_range_read_prepares_its_file_without_a_page_index() {
+        let (provider, rt) = provider_over_two_superfiles();
+        let entry = Arc::clone(&provider.manifest().superfiles[0]);
+        let ranged = rt
+            .block_on(provider.range_scan_file(Arc::clone(&entry)))
+            .expect("range prepare");
+        assert!(ranged.columns.is_none());
+        assert!(
+            ranged.reader.parquet_metadata().offset_index().is_none(),
+            "no page index loaded"
+        );
+        assert!(
+            provider.scan_footers.get(&ranged.path).is_none(),
+            "no footer registered for DataFusion"
+        );
+        let again = rt
+            .block_on(provider.range_scan_file(Arc::clone(&entry)))
+            .expect("range prepare again");
+        assert!(Arc::ptr_eq(&again, &ranged), "a range read reuses it");
+        let scanned = rt
+            .block_on(provider.prepared_scan_file(Arc::clone(&entry), IndexColumns::none()))
+            .expect("scan prepare");
+        assert!(!Arc::ptr_eq(&scanned, &ranged), "a scan prepares it again");
+        assert!(Arc::ptr_eq(&scanned.reader, &ranged.reader));
+        assert!(
+            scanned.footer.offset_index().is_some(),
+            "with its page index"
+        );
+        assert!(provider.scan_footers.get(&scanned.path).is_some());
     }
 
     /// Two scans asking for different columns at once share one open, and

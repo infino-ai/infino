@@ -20,10 +20,14 @@
 //! single-superfile SuperfileReader does no I/O after `open()`; a
 //! storage layer can layer cold-fetch heuristics on top.
 
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::{
     borrow::Cow,
     collections::HashMap,
-    fmt, io,
+    fmt,
+    future::{Future, ready},
+    io,
     ops::{Deref, Range},
     str,
     sync::{
@@ -40,7 +44,7 @@ use arrow_array::{
 };
 use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
 use bytes::Bytes;
-use futures::future::try_join_all;
+use futures::{FutureExt, future::try_join_all};
 use parquet::{
     arrow::{
         ProjectionMask,
@@ -337,6 +341,17 @@ pub struct SuperfileReader {
     /// decode one after another, each finding what the one before loaded,
     /// rather than all decoding the same columns.
     page_index_load: AsyncMutex<()>,
+    /// Taken across a synchronous page-index load ([`Self::add_page_index`]),
+    /// so pool threads reading one resident file at once decode its new
+    /// columns once, rather than each copying the footer. A caller waits at
+    /// most one decode, about what decoding itself would take. Separate from
+    /// [`Self::page_index_load`]: that one is held across a hop to the
+    /// reader pool, and pool threads blocking on it could leave no thread to
+    /// run the decode it waits for.
+    page_index_sync_load: StdMutex<()>,
+    /// Page-index decodes started, so tests can count them.
+    #[cfg(test)]
+    page_index_decodes: AtomicUsize,
     /// The page-indexed footer as a table's scans of this superfile prune
     /// by, with the footer it was derived from: derived by the first scan
     /// that asks ([`Self::scan_footer`]) and shared by every later one until
@@ -745,8 +760,8 @@ impl IndexLoad {
     ///
     /// The projection can be a few percent off either way, so "no more than
     /// every column decoded" is approximate. And a load that has decoded no
-    /// index bytes yet (a first ask for no column, as range counts and
-    /// top-k make) has nothing to project from and stays partial: it holds
+    /// index bytes yet (a first ask for no column, as a scan reading no
+    /// column makes) has nothing to project from and stays partial: it holds
     /// placeholders and the kept bytes, below every column decoded on files
     /// of several pages a chunk, above it by about the kept bytes on files of
     /// one page a chunk.
@@ -777,6 +792,12 @@ impl IndexLoad {
 /// What [`IndexLoad::decode`] returns: the new footer, `None` when none was
 /// needed, and the leaves it added.
 type DecodedLoad = (Option<Arc<Footer>>, RoaringBitmap);
+
+/// `load` decoded, handed back with its result so the caller can install it.
+fn decoded(load: IndexLoad) -> (IndexLoad, Result<DecodedLoad, ReadError>) {
+    let decoded = load.decode();
+    (load, decoded)
+}
 
 /// The rows of a file a merge keeps, every row but its deleted ones, as
 /// runs of consecutive file rows: what numbers the kept rows, the merge's
@@ -922,17 +943,16 @@ fn row_count(rows: u64) -> usize {
     usize::try_from(rows).unwrap_or(usize::MAX)
 }
 
-/// The memory `parquet` takes, measured while it has no page index: the
-/// base a reader subtracts to tell what its page index takes
-/// ([`IndexLoad::rest_if_above_full`]). Measured on an indexed footer it
-/// would count the index as base and the memory rule would never fire, so
-/// that is a bug, caught here in debug builds.
+/// The memory `parquet` takes without its page index: the base a reader
+/// subtracts to tell what its page index takes
+/// ([`IndexLoad::rest_if_above_full`]). Every caller measures a footer that
+/// holds none yet; one that did is measured without it, at the price of a
+/// copy, since counting the index as base would turn the memory rule off.
 fn bare_size(parquet: &ParquetMetaData) -> u64 {
-    debug_assert!(
-        parquet.offset_index().is_none() && parquet.column_index().is_none(),
-        "a bare footer size measured on a footer holding a page index"
-    );
-    parquet.memory_size() as u64
+    if parquet.offset_index().is_none() && parquet.column_index().is_none() {
+        return parquet.memory_size() as u64;
+    }
+    without_page_index(parquet).memory_size() as u64
 }
 
 /// `parquet` with its Arrow schema resolved as the eager open resolves it
@@ -1148,6 +1168,9 @@ impl SuperfileReader {
             page_index: StdMutex::new(PageIndex::Unloaded),
             page_index_read: OnceCell::new(),
             page_index_load: AsyncMutex::new(()),
+            page_index_sync_load: StdMutex::new(()),
+            #[cfg(test)]
+            page_index_decodes: AtomicUsize::new(0),
             scan_footer: ArcSwapOption::empty(),
             source: Some(source),
             schema,
@@ -1296,6 +1319,9 @@ impl SuperfileReader {
             page_index: StdMutex::new(PageIndex::Unloaded),
             page_index_read: OnceCell::new(),
             page_index_load: AsyncMutex::new(()),
+            page_index_sync_load: StdMutex::new(()),
+            #[cfg(test)]
+            page_index_decodes: AtomicUsize::new(0),
             scan_footer: ArcSwapOption::empty(),
             source: None,
             schema,
@@ -1318,7 +1344,10 @@ impl SuperfileReader {
     /// pages: once a page index is loaded, the footer fails a read of any
     /// column it holds no page index for. A path that reads pages goes
     /// through [`Self::parquet_metadata_to_read`] or
-    /// `page_indexed_footer` with its columns.
+    /// `page_indexed_footer` with its columns, and a caller counting pages
+    /// takes them through [`loaded_pages`](crate::superfile::page_index::loaded_pages),
+    /// since a column not loaded holds
+    /// a placeholder page.
     pub fn parquet_metadata(&self) -> Arc<ParquetMetaData> {
         Arc::clone(self.footer.load().parquet())
     }
@@ -1426,24 +1455,24 @@ impl SuperfileReader {
         &self,
         names: &[&str],
     ) -> Option<Arc<ParquetMetaData>> {
-        // Columns before footer, as `indexed_footer` reads them.
+        self.holds_names(names).then(|| self.parquet_metadata())
+    }
+
+    /// Whether the footer holds the page index of the columns `names`, by
+    /// the file's own names, without building a set of them. Reads the
+    /// columns, so a caller reads the footer after, as [`Self::indexed_footer`]
+    /// does: a load stores the footer first.
+    fn holds_names(&self, names: &[&str]) -> bool {
         self.index_columns
             .load()
             .as_deref()
             .is_some_and(|held| held.covers_names(names))
-            .then(|| self.parquet_metadata())
     }
 
     /// [`Self::footer_to_read`] for the columns `names`, checking the columns
     /// held before building a set of them.
     fn footer_to_read_named(&self, names: &[&str]) -> Result<Arc<Footer>, ReadError> {
-        // Columns before footer, as `indexed_footer` reads them.
-        if self
-            .index_columns
-            .load()
-            .as_deref()
-            .is_some_and(|held| held.covers_names(names))
-        {
+        if self.holds_names(names) {
             return Ok(self.footer.load_full());
         }
         self.footer_to_read(&IndexColumns::named(names))
@@ -1520,25 +1549,20 @@ impl SuperfileReader {
     /// holds, and the columns it holds; never reads storage. A resident
     /// reader with nothing loaded starts from its own bytes; a lazy one
     /// returns its footer as it is (no page index, which every read can use).
-    ///
-    /// The decode, a copy of the footer, runs outside the lock: the lock is
-    /// taken only to read the state and to install the result, so a widen
-    /// never parks a runtime thread behind another one's decode. If another
-    /// caller installed a footer meanwhile, this one starts again from it.
+    /// The decode runs here, one caller at a time
+    /// ([`Self::page_index_sync_load`]).
     fn add_page_index(
         &self,
         columns: &IndexColumns,
     ) -> Result<(IndexColumns, Arc<Footer>), ReadError> {
-        loop {
-            let load = match self.plan_page_index_load(columns)? {
-                LoadStep::Done(held, footer) => return Ok((held, footer)),
-                LoadStep::Decode(load) => load,
-            };
-            let decoded = load.decode()?;
-            if let Some(done) = self.install_page_index(columns, load, decoded) {
-                return Ok(done);
-            }
-        }
+        let _turn = self
+            .page_index_sync_load
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        // A decode run in place never waits, so the load is ready at once.
+        self.load_page_index(columns, |load| ready(Ok(decoded(load))))
+            .now_or_never()
+            .unwrap_or(Err(ReadError::TaskDropped(PAGE_INDEX_DECODE)))
     }
 
     /// [`Self::add_page_index`] with the decode on `pool`, awaited, so a
@@ -1552,18 +1576,35 @@ impl SuperfileReader {
         let Some(pool) = pool else {
             return self.add_page_index(columns);
         };
+        self.load_page_index(columns, |load| {
+            run_on_pool_unless_blocking(Some(pool), PAGE_INDEX_DECODE, move || decoded(load))
+                .map(|ran| ran.map_err(|_| ReadError::TaskDropped(PAGE_INDEX_DECODE)))
+        })
+        .await
+    }
+
+    /// Loads `columns`' page index: plans from the state, has `decode` run
+    /// the decode, a copy of the footer, outside the lock, and installs the
+    /// result. The lock is taken only to read the state and to install, so
+    /// a widen never parks a thread behind another's decode under it. If
+    /// another caller installed a footer meanwhile, plans again from it.
+    async fn load_page_index<F, Fut>(
+        &self,
+        columns: &IndexColumns,
+        decode: F,
+    ) -> Result<(IndexColumns, Arc<Footer>), ReadError>
+    where
+        F: Fn(IndexLoad) -> Fut,
+        Fut: Future<Output = Result<(IndexLoad, Result<DecodedLoad, ReadError>), ReadError>>,
+    {
         loop {
             let load = match self.plan_page_index_load(columns)? {
                 LoadStep::Done(held, footer) => return Ok((held, footer)),
                 LoadStep::Decode(load) => load,
             };
-            let (load, decoded) =
-                run_on_pool_unless_blocking(Some(pool), PAGE_INDEX_DECODE, move || {
-                    let decoded = load.decode();
-                    (load, decoded)
-                })
-                .await
-                .map_err(|_| ReadError::TaskDropped(PAGE_INDEX_DECODE))?;
+            #[cfg(test)]
+            self.page_index_decodes.fetch_add(1, Ordering::Relaxed);
+            let (load, decoded) = decode(load).await?;
             if let Some(done) = self.install_page_index(columns, load, decoded?) {
                 return Ok(done);
             }
@@ -1577,21 +1618,24 @@ impl SuperfileReader {
             return Ok(LoadStep::Done(held, footer));
         }
         let current = self.footer.load_full();
-        // A resident reader's first load starts from its own bytes. The
-        // walk over the footer that finds them runs before the lock, and
-        // the first caller to finish installs its result.
-        if matches!(*self.lock_page_index(), PageIndex::Unloaded) {
-            let Some(file) = &self.bytes else {
+        // A resident reader's first load starts from its own bytes, found by
+        // a walk over the footer that runs before the lock; the first caller
+        // to take the lock after it installs its result.
+        let fresh = match &self.bytes {
+            Some(file) if matches!(*self.lock_page_index(), PageIndex::Unloaded) => Some(
+                resident_page_index(current.parquet(), file, bare_size(current.parquet()))?,
+            ),
+            _ => None,
+        };
+        let mut state = self.lock_page_index();
+        if matches!(*state, PageIndex::Unloaded) {
+            // A lazy reader not read yet: its footer, with no page index.
+            let Some(fresh) = fresh else {
                 return Ok(LoadStep::Done(IndexColumns::none(), current));
             };
-            let bare = bare_size(current.parquet());
-            let fresh = resident_page_index(current.parquet(), file, bare)?;
-            let mut state = self.lock_page_index();
-            if matches!(*state, PageIndex::Unloaded) {
-                *state = fresh;
-            }
+            *state = fresh;
         }
-        let (loaded, bytes, widens, bare) = match &*self.lock_page_index() {
+        let (loaded, bytes, widens, bare) = match &*state {
             PageIndex::Partial {
                 loaded,
                 bytes,
@@ -1605,6 +1649,7 @@ impl SuperfileReader {
                 return Ok(LoadStep::Done(IndexColumns::All, self.footer.load_full()));
             }
         };
+        drop(state);
         let parquet = current.parquet();
         let schema = parquet.file_metadata().schema_descr();
         let mut added = columns.leaves(schema) - &loaded;
@@ -1658,9 +1703,8 @@ impl SuperfileReader {
             false => held.union(columns),
         };
         if let Some(indexed) = indexed {
-            self.footer.store(indexed);
-            // The derived footer may be the replaced one itself; let it go.
-            self.scan_footer.store(None);
+            self.footer.store(Arc::clone(&indexed));
+            self.drop_stale_scan_footer(indexed.parquet());
         }
         *state = match complete {
             true => PageIndex::Complete,
@@ -1674,6 +1718,22 @@ impl SuperfileReader {
         };
         self.index_columns.store(Some(Arc::new(held.clone())));
         Some((held, self.footer.load_full()))
+    }
+
+    /// Lets go of the derived scan footer unless it was derived from
+    /// `current`, the footer just stored: one derived from the replaced
+    /// footer would hold it in memory. A scan that derived from `current`
+    /// between the store and this check keeps its entry, so the next scan
+    /// reuses it rather than deriving a second copy; one that derived from
+    /// the replaced footer and stores after this check takes its own entry
+    /// back out ([`Self::scan_footer`]).
+    fn drop_stale_scan_footer(&self, current: &Arc<ParquetMetaData>) {
+        let Some(entry) = self.scan_footer.load_full() else {
+            return;
+        };
+        if !Weak::ptr_eq(&entry.from, &Arc::downgrade(current)) {
+            self.scan_footer.compare_and_swap(&Some(entry), None);
+        }
     }
 
     /// The page-index state, locked. The state is replaced in one assignment
@@ -1732,10 +1792,20 @@ impl SuperfileReader {
     /// ([`Self::footer_to_read`]), or [`ReadError::LazyReaderUnsupported`]
     /// when the file isn't resident.
     fn resident_arrow_metadata(&self, names: &[&str]) -> Result<ArrowReaderMetadata, ReadError> {
+        self.resident_arrow(|| self.footer_to_read_named(names))
+    }
+
+    /// The Arrow metadata of the footer `footer` returns, for a synchronous
+    /// decode of the resident bytes, or [`ReadError::LazyReaderUnsupported`]
+    /// when the file isn't resident, checked before `footer` is called.
+    fn resident_arrow(
+        &self,
+        footer: impl FnOnce() -> Result<Arc<Footer>, ReadError>,
+    ) -> Result<ArrowReaderMetadata, ReadError> {
         if !self.is_resident() {
             return Err(ReadError::LazyReaderUnsupported);
         }
-        match &*self.footer_to_read_named(names)? {
+        match &*footer()? {
             Footer::Resident(arrow) => Ok(arrow.clone()),
             Footer::Lazy(_) => Err(ReadError::LazyReaderUnsupported),
         }
@@ -1947,49 +2017,39 @@ impl SuperfileReader {
         // reader changes, so an error leaves it as it was.
         let current = self.footer.load_full();
         let parquet = current.parquet();
-        let prior = match &*self
+        let next = match &*self
             .page_index
             .get_mut()
             .unwrap_or_else(PoisonError::into_inner)
         {
-            PageIndex::Complete => None,
+            PageIndex::Complete => PageIndex::Complete,
+            PageIndex::Unloaded => resident_page_index(parquet, &bytes, bare_size(parquet))?,
+            // The resident slice replaces the kept bytes; what was loaded,
+            // and the widens toward loading every column, carry over.
             PageIndex::Partial {
                 columns,
                 loaded,
                 widens,
                 bare,
                 ..
-            } => Some((columns.clone(), loaded.clone(), *widens, *bare)),
-            PageIndex::Unloaded => Some((
-                IndexColumns::none(),
-                RoaringBitmap::new(),
-                0,
-                bare_size(parquet),
-            )),
-        };
-        let bare = prior.as_ref().map_or(0, |(.., bare)| *bare);
-        let (next, indexed) = match (prior, resident_page_index(parquet, &bytes, bare)?) {
-            (Some((columns, loaded, widens, bare)), PageIndex::Partial { bytes: index, .. }) => {
-                let indexed = match parquet.offset_index() {
-                    Some(_) => None,
-                    None => Some(Arc::new(
-                        index
-                            .apply(parquet, &RoaringBitmap::new())
-                            .map_err(footer::FooterError::from)?,
-                    )),
-                };
-                // The widens so far carry over: the promoted reader keeps
-                // counting toward loading every column.
-                let next = PageIndex::Partial {
-                    columns,
-                    loaded,
+            } => match resident_page_index(parquet, &bytes, *bare)? {
+                PageIndex::Partial { bytes: index, .. } => PageIndex::Partial {
+                    columns: columns.clone(),
+                    loaded: loaded.clone(),
                     bytes: index,
-                    widens,
-                    bare,
-                };
-                (next, indexed)
-            }
-            _ => (PageIndex::Complete, None),
+                    widens: *widens,
+                    bare: *bare,
+                },
+                other => other,
+            },
+        };
+        let indexed = match (&next, parquet.offset_index()) {
+            (PageIndex::Partial { bytes: index, .. }, None) => Some(Arc::new(
+                index
+                    .apply(parquet, &RoaringBitmap::new())
+                    .map_err(footer::FooterError::from)?,
+            )),
+            _ => None,
         };
         let held = match &next {
             PageIndex::Partial { columns, .. } => columns.clone(),
@@ -2051,10 +2111,7 @@ impl SuperfileReader {
             .bytes
             .as_ref()
             .ok_or(ReadError::LazyReaderUnsupported)?;
-        let arrow_meta = match &*self.footer_to_read(&IndexColumns::All)? {
-            Footer::Resident(arrow) => arrow.clone(),
-            Footer::Lazy(_) => return Err(ReadError::LazyReaderUnsupported),
-        };
+        let arrow_meta = self.resident_arrow(|| self.footer_to_read(&IndexColumns::All))?;
         let plan = if let Some(deleted_docs_bitmap) = deleted_docs_bitmap {
             tombstone_access_plan(bytes, deleted_docs_bitmap.as_ref())
                 .map_err(|e| ReadError::Columnar(e.to_string()))?
@@ -4449,7 +4506,7 @@ fn fts_reader_error_to_read(e: FtsError) -> ReadError {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashSet, thread};
+    use std::{collections::HashSet, sync::Barrier, thread};
 
     use arrow::compute::cast;
     use arrow_array::{ArrayRef, Decimal128Array, Int64Array, LargeStringArray, RecordBatch};
@@ -4474,7 +4531,9 @@ mod tests {
         supertable::query::{
             df_object_store::EXACT_MERGE_GAP_BYTES, read_ahead::fixture::Superfile,
         },
-        test_helpers::{capture_logs, decimal128_ids, default_vector_config},
+        test_helpers::{
+            TitleColumn, capture_logs, decimal128_ids, default_vector_config, int_columns_superfile,
+        },
     };
 
     fn schema_with_text() -> Arc<Schema> {
@@ -4496,29 +4555,7 @@ mod tests {
     /// A superfile of `doc_id`, an FTS-indexed `title` and
     /// [`PAGED_INT_COLUMNS`] `Int64` columns, [`PAGED_ROWS`] rows.
     fn paged_superfile() -> Bytes {
-        let mut fields = schema_with_text().fields().to_vec();
-        fields.extend(
-            (0..PAGED_INT_COLUMNS)
-                .map(|c| Arc::new(Field::new(format!("n{c}"), DataType::Int64, false))),
-        );
-        let schema = Arc::new(Schema::new(fields));
-        let rows = PAGED_ROWS;
-        let mut columns: Vec<ArrayRef> = vec![
-            Arc::new(decimal128_ids(0..rows)),
-            Arc::new(LargeStringArray::from_iter_values(
-                (0..rows).map(|r| format!("title {r}")),
-            )),
-        ];
-        columns.extend((0..PAGED_INT_COLUMNS).map(|c| {
-            Arc::new(Int64Array::from_iter_values(
-                (0..rows as i64).map(|r| r * (c as i64 + 1)),
-            )) as ArrayRef
-        }));
-        let batch = RecordBatch::try_new(Arc::clone(&schema), columns).expect("batch");
-        let opts = BuilderOptions::new(schema, "doc_id", vec![FtsConfig::new("title")], vec![]);
-        let mut builder = SuperfileBuilder::new(opts).expect("builder");
-        builder.add_batch(&batch, &[]).expect("add_batch");
-        Bytes::from(builder.finish().expect("finish"))
+        int_columns_superfile("n", PAGED_INT_COLUMNS, PAGED_ROWS, TitleColumn::FullText)
     }
 
     fn build_simple_fts_only_superfile() -> Bytes {
@@ -5732,8 +5769,7 @@ mod tests {
     /// Concurrent loads on one reader given a pool decode there, not on the
     /// runtime, and one at a time: while the first decode waits for the
     /// pool, the others wait for it rather than each planning a decode and
-    /// copy of the same index. A planned decode holds the footer it copies,
-    /// so the footer's count of holders counts the decodes in flight.
+    /// copy of the same index, and then find it loaded.
     #[tokio::test]
     async fn concurrent_page_index_loads_decode_once_on_the_pool() {
         /// Loads started at once on the one reader.
@@ -5763,11 +5799,18 @@ mod tests {
             loads.iter().all(|load| !load.is_finished()),
             "no load decodes on the runtime while the pool is busy"
         );
-        let plain = reader.footer.load_full();
-        // The reader's own hold, `plain`, and the one decode in flight.
-        assert_eq!(Arc::strong_count(&plain), 3, "one decode in flight");
-        drop((plain, release));
+        assert_eq!(
+            reader.page_index_decodes.load(Ordering::Relaxed),
+            1,
+            "one decode in flight"
+        );
+        drop(release);
         let footers = try_join_all(loads).await.expect("loads");
+        assert_eq!(
+            reader.page_index_decodes.load(Ordering::Relaxed),
+            1,
+            "the others found it loaded"
+        );
         assert!(
             footers
                 .iter()
@@ -5775,6 +5818,93 @@ mod tests {
             "every load gets the one footer"
         );
         assert!(matches!(*reader.lock_page_index(), PageIndex::Complete));
+    }
+
+    /// A load that replaces the footer lets go of a scan footer derived from
+    /// the replaced one, which would hold it in memory, and keeps one a scan
+    /// derived from the new footer, so the next scan reuses it rather than
+    /// deriving a second copy.
+    #[tokio::test]
+    async fn a_widen_keeps_only_a_scan_footer_derived_from_the_new_footer() {
+        let reader = SuperfileReader::open(paged_superfile()).expect("open");
+        let derive = |footer: Arc<ParquetMetaData>| Ok::<_, ()>(Arc::new((*footer).clone()));
+        let first = reader
+            .parquet_metadata_with_page_index(&IndexColumns::named(&["n0"]))
+            .await
+            .expect("first load");
+        reader
+            .scan_footer(Arc::clone(&first), derive)
+            .expect("derive");
+        let second = reader
+            .parquet_metadata_with_page_index(&IndexColumns::named(&["n1"]))
+            .await
+            .expect("widen");
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "guard: the widen replaced it"
+        );
+        assert!(
+            reader.scan_footer.load_full().is_none(),
+            "one derived from the replaced footer is let go"
+        );
+        let derived = reader
+            .scan_footer(Arc::clone(&second), derive)
+            .expect("derive");
+        reader.drop_stale_scan_footer(&second);
+        let reused = reader
+            .scan_footer(Arc::clone(&second), |_| Err(()))
+            .expect("one derived from the current footer is kept");
+        assert!(Arc::ptr_eq(&reused, &derived));
+    }
+
+    /// Threads reading a resident file at once, each needing a column its
+    /// partial page index lacks, as pool threads reading its row groups do,
+    /// decode it once: the synchronous loads take turns, and each after the
+    /// first finds the column loaded rather than copying the footer again.
+    #[tokio::test]
+    async fn concurrent_sync_page_index_loads_decode_once() {
+        /// Threads asking at once.
+        const THREADS: usize = 8;
+        let reader = SuperfileReader::open(many_columns_superfile()).expect("open");
+        reader
+            .parquet_metadata_with_page_index(&IndexColumns::named(&["c0"]))
+            .await
+            .expect("first load");
+        assert!(
+            matches!(*reader.lock_page_index(), PageIndex::Partial { .. }),
+            "guard: the threads widen a partial page index"
+        );
+        let before = reader.page_index_decodes.load(Ordering::Relaxed);
+        let start = Barrier::new(THREADS);
+        let footers: Vec<Arc<ParquetMetaData>> = thread::scope(|scope| {
+            let handles: Vec<_> = (0..THREADS)
+                .map(|_| {
+                    scope.spawn(|| {
+                        start.wait();
+                        Arc::clone(
+                            reader
+                                .resident_arrow_metadata(&["c1"])
+                                .expect("load")
+                                .metadata(),
+                        )
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("thread"))
+                .collect()
+        });
+        assert_eq!(
+            reader.page_index_decodes.load(Ordering::Relaxed),
+            before + 1
+        );
+        assert!(
+            footers
+                .iter()
+                .all(|footer| Arc::ptr_eq(footer, &footers[0])),
+            "every thread reads the one footer"
+        );
     }
 
     /// A source that records each read, and whether it asked for exactly
@@ -6068,23 +6198,7 @@ mod tests {
     /// A resident superfile of `MANY_COLUMNS` `Int64` columns `c0`, `c1`, ...
     /// beside its id column.
     fn many_columns_superfile() -> Bytes {
-        let mut fields = vec![Field::new("doc_id", DataType::Decimal128(38, 0), false)];
-        fields
-            .extend((0..MANY_COLUMNS).map(|c| Field::new(format!("c{c}"), DataType::Int64, false)));
-        let schema = Arc::new(Schema::new(fields));
-        let rows = MANY_COLUMNS_ROWS;
-        let mut columns: Vec<ArrayRef> = vec![Arc::new(decimal128_ids(0..rows))];
-        columns.extend((0..MANY_COLUMNS).map(|c| {
-            Arc::new(Int64Array::from_iter_values(
-                (0..rows as i64).map(|r| r * c as i64),
-            )) as ArrayRef
-        }));
-        let batch = RecordBatch::try_new(Arc::clone(&schema), columns).expect("batch");
-        let mut builder =
-            SuperfileBuilder::new(BuilderOptions::new(schema, "doc_id", vec![], vec![]))
-                .expect("builder");
-        builder.add_batch(&batch, &[]).expect("add_batch");
-        Bytes::from(builder.finish().expect("finish"))
+        int_columns_superfile("c", MANY_COLUMNS, MANY_COLUMNS_ROWS, TitleColumn::None)
     }
 
     /// The memory `reader`'s page index takes: decoded entries and
@@ -6166,6 +6280,24 @@ mod tests {
             .await
             .expect("load");
         assert!(matches!(*reader.lock_page_index(), PageIndex::Complete));
+    }
+
+    /// The bare footer size a reader measures its page index against is
+    /// the footer's without any page index, even when measured on a footer
+    /// that holds one.
+    #[test]
+    fn the_bare_size_leaves_out_a_page_index_the_footer_holds() {
+        let bytes = paged_superfile();
+        let bare = SuperfileReader::open(bytes.clone())
+            .expect("open")
+            .parquet_metadata();
+        assert!(bare.offset_index().is_none(), "guard: opened without one");
+        let mut loader = ParquetMetaDataReader::new_with_metadata((*bare).clone())
+            .with_page_index_policy(PageIndexPolicy::Required);
+        loader.read_page_indexes(&bytes).expect("page index");
+        let indexed = loader.finish().expect("finish");
+        assert!(indexed.memory_size() > bare.memory_size());
+        assert_eq!(bare_size(&indexed), bare_size(&bare));
     }
 
     /// A merge reads every column of an input whose page index a query has

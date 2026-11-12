@@ -162,8 +162,9 @@ use std::{
 #[cfg(test)]
 use std::{io, sync::Mutex};
 
-use arrow_array::{Decimal128Array, LargeStringArray, RecordBatch};
+use arrow_array::{ArrayRef, Decimal128Array, Int64Array, LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
+use bytes::Bytes;
 use rayon::ThreadPoolBuilder;
 #[cfg(test)]
 use tracing::{Level, subscriber::with_default};
@@ -174,7 +175,7 @@ use crate::{
     config::CrcVerification,
     storage::{LocalFsStorageProvider, StorageProvider},
     superfile::{
-        builder::{FtsConfig, VectorConfig},
+        builder::{BuilderOptions, FtsConfig, SuperfileBuilder, VectorConfig},
         fts::tokenize::{StandardTokenizer, Tokenizer},
         vector::{distance::Metric, rerank_codec::RerankCodec},
     },
@@ -302,6 +303,54 @@ pub fn decimal128_ids<I: IntoIterator<Item = u64>>(ids: I) -> Decimal128Array {
 /// superfile fixtures).
 pub fn decimal128_id_field(name: &str) -> Field {
     Field::new(name, DataType::Decimal128(38, 0), false)
+}
+
+/// A `title` column in [`int_columns_superfile`].
+#[derive(Clone, Copy, Debug)]
+pub enum TitleColumn {
+    /// No `title` column.
+    None,
+    /// A `title` column, not indexed.
+    Plain,
+    /// A `title` column with a full-text index.
+    FullText,
+}
+
+/// The bytes of a superfile of a `doc_id` column, a `title` column holding
+/// `"title {row}"` as `title` asks, and `columns` `Int64` columns
+/// `{prefix}0`, `{prefix}1`, ... holding each row number times one more
+/// than the column's, `rows` rows. Enough rows give each column chunk
+/// several data pages, as page-index tests need.
+pub fn int_columns_superfile(prefix: &str, columns: usize, rows: u64, title: TitleColumn) -> Bytes {
+    let mut fields = vec![decimal128_id_field("doc_id")];
+    let mut arrays: Vec<ArrayRef> = vec![Arc::new(decimal128_ids(0..rows))];
+    if !matches!(title, TitleColumn::None) {
+        fields.push(Field::new("title", DataType::LargeUtf8, false));
+        arrays.push(Arc::new(LargeStringArray::from_iter_values(
+            (0..rows).map(|row| format!("title {row}")),
+        )));
+    }
+    for column in 0..columns {
+        fields.push(Field::new(
+            format!("{prefix}{column}"),
+            DataType::Int64,
+            false,
+        ));
+        let scale = column as i64 + 1;
+        arrays.push(Arc::new(Int64Array::from_iter_values(
+            (0..rows as i64).map(|row| row * scale),
+        )));
+    }
+    let schema = Arc::new(Schema::new(fields));
+    let batch = RecordBatch::try_new(Arc::clone(&schema), arrays).expect("batch");
+    let fts = match title {
+        TitleColumn::FullText => vec![FtsConfig::new("title")],
+        TitleColumn::None | TitleColumn::Plain => vec![],
+    };
+    let mut builder =
+        SuperfileBuilder::new(BuilderOptions::new(schema, "doc_id", fts, vec![])).expect("builder");
+    builder.add_batch(&batch, &[]).expect("add_batch");
+    Bytes::from(builder.finish().expect("finish"))
 }
 
 /// The engine's default tokenizer, for tests + benches:

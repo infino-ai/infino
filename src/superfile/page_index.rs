@@ -337,10 +337,24 @@ fn unloaded_offset_index(chunk: &ColumnChunkMetaData) -> OffsetIndexMetaData {
 }
 
 /// Whether `index` is a column's real offset index, not
-/// [`unloaded_offset_index`]: what a caller counting or reading page
-/// locations from the metadata checks first.
-pub(crate) fn is_loaded(index: &OffsetIndexMetaData) -> bool {
+/// [`unloaded_offset_index`]. Callers outside this module take page
+/// locations through [`loaded_pages`], which checks it.
+pub(in crate::superfile) fn is_loaded(index: &OffsetIndexMetaData) -> bool {
     !matches!(index.page_locations().as_slice(), [page] if page.compressed_page_size == UNLOADED_PAGE_SIZE)
+}
+
+/// The page locations of leaf `leaf` in row group `row_group` of `parquet`,
+/// or `None` when the footer holds none for it: no page index, or a
+/// placeholder for a column not loaded ([`unloaded_offset_index`]), whose
+/// single page would count wrong and fails a read. Every caller that
+/// counts or reads pages from a footer takes them here.
+pub(crate) fn loaded_pages(
+    parquet: &ParquetMetaData,
+    row_group: usize,
+    leaf: usize,
+) -> Option<&[PageLocation]> {
+    let index = parquet.offset_index()?.get(row_group)?.get(leaf)?;
+    is_loaded(index).then(|| index.page_locations().as_slice())
 }
 
 /// `parquet` cut down to the leaves in `leaves`, for the page-index decoder:
@@ -480,11 +494,17 @@ fn index_range(offset: Option<i64>, length: Option<i32>) -> Option<Range<u64>> {
 
 #[cfg(test)]
 mod tests {
-    use arrow_array::{ArrayRef, Int64Array, RecordBatch, StructArray};
+    use std::io::Cursor;
+
+    use arrow_array::{
+        ArrayRef, Int64Array, ListArray, RecordBatch, StructArray, types::Int64Type,
+    };
     use arrow_schema::{DataType, Field, Fields, Schema};
+    use futures::TryStreamExt;
     use parquet::{
         arrow::{
-            ArrowWriter, PARQUET_FIELD_ID_META_KEY, ProjectionMask,
+            ArrowWriter, PARQUET_FIELD_ID_META_KEY, ParquetRecordBatchStreamBuilder,
+            ProjectionMask,
             arrow_reader::{
                 ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
                 RowSelection, RowSelector,
@@ -642,23 +662,61 @@ mod tests {
         leaf: usize,
         selected: bool,
     ) -> Result<usize, String> {
-        let arrow = ArrowReaderMetadata::try_new(Arc::new(parquet), ArrowReaderOptions::new())
-            .map_err(|e| e.to_string())?;
-        let mask = ProjectionMask::leaves(arrow.metadata().file_metadata().schema_descr(), [leaf]);
+        let (arrow, mask) = leaf_read(parquet, leaf)?;
         let mut builder = ParquetRecordBatchReaderBuilder::new_with_metadata(bytes.clone(), arrow)
             .with_projection(mask);
         if selected {
-            builder = builder.with_row_selection(RowSelection::from(vec![
-                RowSelector::skip(SKIPPED),
-                RowSelector::select(SELECTED),
-                RowSelector::skip(rows().count() - SKIPPED - SELECTED),
-            ]));
+            builder = builder.with_row_selection(selection());
         }
         let mut read = 0;
         for batch in builder.build().map_err(|e| e.to_string())? {
             read += batch.map_err(|e| e.to_string())?.num_rows();
         }
         Ok(read)
+    }
+
+    /// [`read_leaf`] through the async reader DataFusion and the byte-source
+    /// paths read with.
+    async fn read_leaf_async(
+        bytes: &Bytes,
+        parquet: ParquetMetaData,
+        leaf: usize,
+        selected: bool,
+    ) -> Result<usize, String> {
+        let (arrow, mask) = leaf_read(parquet, leaf)?;
+        let mut builder =
+            ParquetRecordBatchStreamBuilder::new_with_metadata(Cursor::new(bytes.to_vec()), arrow)
+                .with_projection(mask);
+        if selected {
+            builder = builder.with_row_selection(selection());
+        }
+        let batches: Vec<RecordBatch> = builder
+            .build()
+            .map_err(|e| e.to_string())?
+            .try_collect()
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(batches.iter().map(RecordBatch::num_rows).sum())
+    }
+
+    /// The Arrow metadata of `parquet` and the projection of leaf `leaf`.
+    fn leaf_read(
+        parquet: ParquetMetaData,
+        leaf: usize,
+    ) -> Result<(ArrowReaderMetadata, ProjectionMask), String> {
+        let arrow = ArrowReaderMetadata::try_new(Arc::new(parquet), ArrowReaderOptions::new())
+            .map_err(|e| e.to_string())?;
+        let mask = ProjectionMask::leaves(arrow.metadata().file_metadata().schema_descr(), [leaf]);
+        Ok((arrow, mask))
+    }
+
+    /// The fixture's selected read: [`SELECTED`] rows after [`SKIPPED`].
+    fn selection() -> RowSelection {
+        RowSelection::from(vec![
+            RowSelector::skip(SKIPPED),
+            RowSelector::select(SELECTED),
+            RowSelector::skip(rows().count() - SKIPPED - SELECTED),
+        ])
     }
 
     #[test]
@@ -738,6 +796,30 @@ mod tests {
         for selected in [false, true] {
             assert!(
                 read_leaf(&bytes, indexed.clone(), 0, selected).is_err(),
+                "selected: {selected}"
+            );
+        }
+    }
+
+    /// The same through the async reader: a column not loaded fails there
+    /// too, all of it or a selection, while a loaded one returns its rows.
+    #[tokio::test]
+    async fn an_async_read_of_a_column_not_loaded_fails_rather_than_returning_no_rows() {
+        let (bytes, footer) = fixture();
+        let indexed = load(&kept(&bytes, &footer), &footer, &[1]);
+        assert_eq!(
+            read_leaf_async(&bytes, indexed.clone(), 1, false).await,
+            Ok(rows().count())
+        );
+        assert_eq!(
+            read_leaf_async(&bytes, indexed.clone(), 1, true).await,
+            Ok(SELECTED)
+        );
+        for selected in [false, true] {
+            assert!(
+                read_leaf_async(&bytes, indexed.clone(), 0, selected)
+                    .await
+                    .is_err(),
                 "selected: {selected}"
             );
         }
@@ -840,6 +922,48 @@ mod tests {
         );
         assert_eq!(loaded_leaves(&indexed), vec![vec![1, 2]; GROUPS]);
         assert_eq!(located_leaves(&indexed), vec![vec![1, 2]; GROUPS]);
+    }
+
+    /// A list column's page index carries what a flat one does not: a
+    /// repetition-level histogram per page, and nulls inside its lists. The
+    /// load decodes each leaf through a footer that rebuilds it as a flat
+    /// optional leaf, and must still give arrow-rs's own entries, leaf by
+    /// leaf or all at once.
+    #[test]
+    fn a_list_column_loads_the_page_index_arrow_loads() {
+        let item = Arc::new(Field::new("item", DataType::Int64, true));
+        let lists = ListArray::from_iter_primitive::<Int64Type, _, _>(rows().map(|r| {
+            (r % 7 != 0).then(|| {
+                (0..r % 4)
+                    .map(|i| (i != 2).then_some(r * 10 + i))
+                    .collect::<Vec<_>>()
+            })
+        }));
+        let schema = Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("tags", DataType::List(item), true),
+            Field::new("c", DataType::Int64, false),
+        ]);
+        let column = || Arc::new(Int64Array::from_iter_values(rows())) as ArrayRef;
+        let batch =
+            RecordBatch::try_new(Arc::new(schema), vec![column(), Arc::new(lists), column()])
+                .expect("batch");
+        let (bytes, footer) = written(batch, paged().build());
+        let full = full(&bytes, &footer);
+        let tags = &full.column_index().expect("column index")[0][1];
+        assert!(
+            tags.repetition_level_histogram(0).is_some(),
+            "guard: the list leaf's column index carries level histograms"
+        );
+        let index = kept(&bytes, &footer);
+        let at_once = load(&index, &footer, &[0, 1, 2]);
+        let one_by_one = [1, 2, 0].into_iter().fold(footer.clone(), |parquet, leaf| {
+            load(&index, &parquet, &[leaf])
+        });
+        for indexed in [at_once, one_by_one] {
+            assert_eq!(indexed.column_index(), full.column_index());
+            assert_eq!(indexed.offset_index(), full.offset_index());
+        }
     }
 
     /// A file written with no page index has nothing to load, so its scans

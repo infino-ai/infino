@@ -86,7 +86,7 @@ use crate::{
     superfile::{
         ReadError, SuperfileReader,
         lazy_source::Source,
-        page_index::{IndexColumns, is_loaded},
+        page_index::{IndexColumns, loaded_pages},
         reader::{
             WHOLE_COLUMN_TAKE_DIVISOR, in_projection_order, rank_back_indices,
             row_selection_for_ids, view_read_options, whole_row_group,
@@ -1941,13 +1941,7 @@ fn hit_pages(
     spans: &mut Vec<Range<u64>>,
 ) {
     let (offset, len) = metadata.row_group(index).column(c).byte_range();
-    let pages = metadata
-        .offset_index()
-        .and_then(|oi| oi.get(index))
-        .and_then(|cols| cols.get(c))
-        .filter(|oi| is_loaded(oi))
-        .map(|oi| oi.page_locations())
-        .filter(|pages| !pages.is_empty());
+    let pages = loaded_pages(metadata, index, c).filter(|pages| !pages.is_empty());
     let Some(pages) = pages else {
         spans.push(offset..offset + len);
         return;
@@ -2074,16 +2068,13 @@ pub(crate) async fn take_rows_byte_source(
             }
         }
     }
-    let metadata = match reader.loaded_parquet_metadata_named(names) {
-        Some(metadata) => metadata,
-        None => {
-            reader
-                .page_indexed_footer(&IndexColumns::named(names), pool)
-                .await
-                .map_err(QueryError::from)?
-                .1
-        }
-    };
+    // The footer holding these columns' page index; one already loaded is
+    // returned before any lock or decode.
+    let metadata = reader
+        .page_indexed_footer(&IndexColumns::named(names), pool)
+        .await
+        .map_err(QueryError::from)?
+        .1;
     let source = Source::Lazy(reader.byte_source());
     // Fetch the take's column chunks at once rather than letting the decode
     // fetch them a row group at a time: a hit set spread over hundreds of
@@ -2580,7 +2571,8 @@ mod tests {
             },
         },
         test_helpers::{
-            build_title_batch, decimal128_id_field, decimal128_ids, default_supertable_options,
+            TitleColumn, build_title_batch, decimal128_id_field, decimal128_ids,
+            default_supertable_options, int_columns_superfile,
         },
     };
 
@@ -3596,30 +3588,7 @@ mod tests {
     /// [`PAGED_INT_COLUMNS`] `Int64` columns `n0`, `n1`, ..., [`PAGED_ROWS`]
     /// rows.
     fn paged_titled_superfile_bytes() -> Bytes {
-        let mut fields = vec![
-            decimal128_id_field("doc_id"),
-            Field::new("title", DataType::LargeUtf8, false),
-        ];
-        fields.extend(
-            (0..PAGED_INT_COLUMNS).map(|c| Field::new(format!("n{c}"), DataType::Int64, false)),
-        );
-        let schema = Arc::new(Schema::new(fields));
-        let mut columns: Vec<ArrayRef> = vec![
-            Arc::new(decimal128_ids(0..PAGED_ROWS)),
-            Arc::new(LargeStringArray::from_iter_values(
-                (0..PAGED_ROWS).map(|r| format!("title {r}")),
-            )),
-        ];
-        columns.extend((0..PAGED_INT_COLUMNS).map(|c| {
-            Arc::new(Int64Array::from_iter_values(
-                (0..PAGED_ROWS as i64).map(|r| r * (c as i64 + 1)),
-            )) as ArrayRef
-        }));
-        let batch = RecordBatch::try_new(Arc::clone(&schema), columns).expect("batch");
-        let mut b = SuperfileBuilder::new(BuilderOptions::new(schema, "doc_id", vec![], vec![]))
-            .expect("builder");
-        b.add_batch(&batch, &[]).expect("add_batch");
-        Bytes::from(b.finish().expect("finish builder"))
+        int_columns_superfile("n", PAGED_INT_COLUMNS, PAGED_ROWS, TitleColumn::Plain)
     }
 
     /// A lazy reader whose page index an earlier scan loaded for other

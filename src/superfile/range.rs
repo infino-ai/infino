@@ -1491,12 +1491,20 @@ mod tests {
     #[tokio::test]
     async fn a_carry_reads_the_range_columns_a_scan_did_not_load() {
         let (opts, bytes) = fixture_superfile();
+        let carried = carry_after_scan_load(opts.clone(), bytes).await;
+        assert_ranges(&carried, &opts, "carried after a scan's load").await;
+    }
+
+    /// `bytes` opened, its page index loaded for `title` alone as a scan
+    /// would, then carried without decoding its body into a superfile built
+    /// for `table`, and that superfile opened.
+    async fn carry_after_scan_load(table: BuilderOptions, bytes: Bytes) -> SuperfileReader {
         let source = SuperfileReader::open(bytes).expect("open");
         source
             .parquet_metadata_with_page_index(&IndexColumns::named(&["title"]))
             .await
             .expect("a scan's load");
-        let mut carry = SuperfileBuilder::new(opts.clone()).expect("carry builder");
+        let mut carry = SuperfileBuilder::new(table).expect("carry builder");
         carry
             .carry_fts_from_reader_scoped(&source, None, CarryScope::AllColumns)
             .expect("carry the FTS blob");
@@ -1505,8 +1513,7 @@ mod tests {
         carry
             .finish_carrying_body_to(&source, &mut out)
             .expect("carry");
-        let carried = SuperfileReader::open(Bytes::from(out)).expect("open carried");
-        assert_ranges(&carried, &opts, "carried after a scan's load").await;
+        SuperfileReader::open(Bytes::from(out)).expect("open carried")
     }
 
     /// The fixture's table after it renamed `qty` to `quantity` and added a
@@ -1570,23 +1577,9 @@ mod tests {
     #[tokio::test]
     async fn a_carry_reads_a_renamed_range_column_by_id_after_a_scan_load() {
         let (opts, bytes) = fixture_superfile();
-        let source = SuperfileReader::open(bytes).expect("open");
-        source
-            .parquet_metadata_with_page_index(&IndexColumns::named(&["title"]))
-            .await
-            .expect("a scan's load");
         let id = |column: &str| opts.field_id_of_column(column).expect("field id");
         let table = renamed_table(&opts, FieldId(id("title").0 + 1));
-        let mut carry = SuperfileBuilder::new(table).expect("carry builder");
-        carry
-            .carry_fts_from_reader_scoped(&source, None, CarryScope::AllColumns)
-            .expect("carry the FTS blob");
-        carry.set_carried_doc_count(source.n_docs());
-        let mut out = Vec::new();
-        carry
-            .finish_carrying_body_to(&source, &mut out)
-            .expect("carry");
-        let carried = SuperfileReader::open(Bytes::from(out)).expect("open carried");
+        let carried = carry_after_scan_load(table, bytes).await;
         assert_ranges(
             &carried,
             &opts,
