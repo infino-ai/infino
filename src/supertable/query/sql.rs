@@ -53,7 +53,7 @@
 //! output and never reaches a caller — a `SELECT`, `GROUP BY` key, or
 //! `MIN`/`MAX` over a string column always comes back `LargeUtf8`.
 
-use std::{collections::HashSet, sync::Arc, time::Instant};
+use std::{collections::HashSet, future::Future, sync::Arc, time::Instant};
 
 use arrow::{
     compute::{cast, concat_batches},
@@ -62,7 +62,7 @@ use arrow::{
 use arrow_array::{Array, Decimal128Array, Int64Array, new_empty_array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::{
-    common::{Column, DFSchema, ScalarValue, tree_node::TreeNode},
+    common::{Column, DFSchema, ScalarValue, runtime::SpawnedTask, tree_node::TreeNode},
     dataframe::DataFrame,
     datasource::DefaultTableSource,
     error::DataFusionError,
@@ -75,7 +75,6 @@ use datafusion::{
     optimizer::simplify_expressions::ExprSimplifier,
 };
 use futures::future::try_join_all;
-use tokio::runtime::Handle;
 use uuid::Uuid;
 
 #[cfg(feature = "detailed-tracing")]
@@ -93,8 +92,10 @@ use crate::{
                 CoveredAggregateRewrite, load_unfiltered_aggregate_inputs, value_counts_nulls,
             },
             exec::{
-                common::collect_plan_metered, fts_exec::register_bm25,
-                hybrid_exec::register_hybrid_search, match_exec::register_match,
+                common::{collect_plan_metered, run_within_process_limit},
+                fts_exec::register_bm25,
+                hybrid_exec::register_hybrid_search,
+                match_exec::register_match,
                 vector_exec::register_vector_search,
             },
             provider::{SupertableProvider, TABLE_NAME, view_string_schema},
@@ -332,6 +333,7 @@ impl SupertableReader {
         // context still report the plan's CPU — the meter rides the
         // wrapper below, not the context.
         let op_stats = op_stats::current();
+        let collector = op_stats.clone();
 
         let sql = sql.to_owned();
         let drive = async move {
@@ -371,11 +373,7 @@ impl SupertableReader {
             Self::collect_metered_df(df, ctx.task_ctx(), &op_stats).await
         };
 
-        // Drive through the shared sync→async bridge: ambient
-        // runtime → block_in_place on the ambient handle; otherwise
-        // the lazily-built owned query_runtime. See
-        // [`SupertableReader::block_on`].
-        self.block_on(drive)
+        self.block_on_statement(collector, drive)
     }
 
     /// The tombstone cache and every superfile of a fully loaded snapshot,
@@ -410,6 +408,7 @@ impl SupertableReader {
         }
         let ctx = self.sql_session_context()?;
         let op_stats = op_stats::current();
+        let collector = op_stats.clone();
         let (group, aggregate) = value_count_exprs(column);
         let drive = async move {
             let df = ctx
@@ -419,7 +418,7 @@ impl SupertableReader {
                 .map_err(QueryError::DataFusion)?;
             Self::collect_metered_df(df, ctx.task_ctx(), &op_stats).await
         };
-        conform_value_counts(&self.block_on(drive)?, &schema)
+        conform_value_counts(&self.block_on_statement(collector, drive)?, &schema)
     }
 
     /// [`Self::value_counts`] from the manifest's statistics alone, as rows
@@ -531,6 +530,7 @@ impl SupertableReader {
     ) -> Result<Vec<RecordBatch>, QueryError> {
         let ctx = self.sql_session_context()?;
         let op_stats = op_stats::current();
+        let collector = op_stats.clone();
         let drive = async move {
             let df = ctx
                 .table(TABLE_NAME)
@@ -543,7 +543,7 @@ impl SupertableReader {
                 .map_err(QueryError::DataFusion)?;
             Self::collect_metered_df(df, ctx.task_ctx(), &op_stats).await
         };
-        self.block_on(drive)
+        self.block_on_statement(collector, drive)
     }
 
     /// [`Self::count_where`] from the range index, the manifest and the
@@ -680,6 +680,17 @@ impl SupertableReader {
         Ok(ctx)
     }
 
+    /// [`Self::block_on`] for one SQL statement, raced against the process memory limit (see
+    /// [`run_within_process_limit`]). `collector` is the caller's, carried onto the race's task.
+    fn block_on_statement<T: Send + 'static>(
+        &self,
+        collector: Option<Arc<OpStatsCollector>>,
+        statement: impl Future<Output = Result<T, QueryError>> + Send + 'static,
+    ) -> Result<T, QueryError> {
+        self.block_on(run_within_process_limit(collector, statement))
+            .map_err(QueryError::DataFusion)?
+    }
+
     /// Plan one DataFrame, then run it through the shared
     /// meter-collect-harvest step every SQL execution site uses
     /// ([`collect_plan_metered`]).
@@ -724,6 +735,7 @@ impl SupertableReader {
         // Picked up on the caller's thread, before any runtime hop, so the
         // harvest below folds into this op's collector.
         let op_stats = op_stats::current();
+        let collector = op_stats.clone();
         let _foreground = ForegroundQueryGuard::enter();
         // Resolve against this reader's pinned snapshot. Callers that need
         // current-state semantics create a fresh reader immediately before
@@ -734,35 +746,36 @@ impl SupertableReader {
         let ctx = self.metered_session_context()?;
         let id_column = self.options().id_column.clone();
 
-        // Resolve on this runtime's 16 MiB workers, not the calling thread
-        // `block_on` polls on: predicate planning depth must not hang on a
-        // caller's stack. A panic surfaces through the join as a query error.
+        // Resolve on this runtime's 16 MiB workers, not the calling thread `block_on` polls on:
+        // predicate planning depth must not hang on a caller's stack. A panic surfaces through the
+        // join as a query error. As a `SpawnedTask`, a refusal by the process memory limit aborts
+        // the resolve instead of detaching it, and the task carries this op's collector for the
+        // prune's counts.
+        let resolving = op_stats.clone();
         let drive = async move {
-            Handle::current()
-                .spawn(async move {
-                    let df = ctx
-                        .table(TABLE_NAME)
-                        .await
-                        .map_err(QueryError::DataFusion)?
-                        .filter(expr)
-                        .map_err(QueryError::DataFusion)?
-                        .select_columns(&[id_column.as_str()])
-                        .map_err(QueryError::DataFusion)?;
-                    // Same three steps as `query_sql`, and for the same reason:
-                    // this scan's rows are real decoded rows. Collecting the
-                    // DataFrame directly reported CPU, page bytes and ranges for a
-                    // mutation's predicate resolve while leaving its row count at
-                    // zero.
-                    let batches = Self::collect_metered_df(df, ctx.task_ctx(), &op_stats).await?;
-                    extract_id_column(&batches)
-                })
+            let resolve = async move {
+                let df = ctx
+                    .table(TABLE_NAME)
+                    .await
+                    .map_err(QueryError::DataFusion)?
+                    .filter(expr)
+                    .map_err(QueryError::DataFusion)?
+                    .select_columns(&[id_column.as_str()])
+                    .map_err(QueryError::DataFusion)?;
+                // Same three steps as `query_sql`, and for the same reason: this scan's rows are
+                // real decoded rows. Collecting the DataFrame directly reported CPU, page bytes and
+                // ranges for a mutation's predicate resolve while leaving its row count at zero.
+                let batches = Self::collect_metered_df(df, ctx.task_ctx(), &op_stats).await?;
+                extract_id_column(&batches)
+            };
+            SpawnedTask::spawn(op_stats::attached_to_future(resolving, resolve))
                 .await
                 .map_err(|join| {
                     QueryError::Internal(format!("predicate resolve task failed: {join}"))
                 })?
         };
 
-        self.block_on(drive)
+        self.block_on_statement(collector, drive)
     }
 }
 
@@ -1150,9 +1163,9 @@ mod tests {
     /// the dictionary, then the word's posting header.
     const DICTIONARY_ESTIMATE_READS: u64 = 2;
 
-    /// Planned reads of a SQL scan that matches every row, with or without
-    /// a term index.
-    fn broad_scan_planned_reads(term_index: bool) -> u64 {
+    /// [`BROAD_SUPERFILES`] superfiles of [`BROAD_ROWS`] titles each, all starting with "shared",
+    /// with or without a term index. The directory holds the table's storage.
+    fn broad_table(term_index: bool) -> (tempfile::TempDir, Supertable) {
         let dir = tempfile::tempdir().expect("tempdir");
         let storage: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("localfs"));
@@ -1172,6 +1185,12 @@ mod tests {
                 .expect("append");
             w.commit().expect("commit");
         }
+        (dir, st)
+    }
+
+    /// Planned reads of a SQL scan that matches every row, with or without a term index.
+    fn broad_scan_planned_reads(term_index: bool) -> u64 {
+        let (_dir, st) = broad_table(term_index);
         let reader = st.reader().expect("reader");
         let (ids, stats) =
             with_op_stats(|| reader.scan_ids_matching(col("title").like(lit("shared %"))));
@@ -1198,6 +1217,26 @@ mod tests {
             Some(DICTIONARY_ESTIMATE_READS * BROAD_SUPERFILES as u64),
             "the indexed estimate read nothing: {indexed} vs {plain}"
         );
+    }
+
+    #[test]
+    fn a_table_scan_reports_the_superfiles_its_plan_considered() {
+        // 3 superfiles, a table SQL query and a delete's predicate scan over them.
+        //  - both prune while planning, and count the superfiles weighed into the caller's stats.
+        //  - no process limit here: the SQL runs inline, the delete's scan on a task of its own.
+        // This test pins both counts; `tests/process_memory_limit.rs` checks SQL under a limit.
+        let (_dir, st) = broad_table(false);
+        let reader = st.reader().expect("reader");
+        let (batches, stats) = with_op_stats(|| {
+            reader.query_sql("SELECT count(*) FROM supertable WHERE title LIKE 'shared s1%'")
+        });
+        batches.expect("query");
+        assert_eq!(stats.superfiles_considered, BROAD_SUPERFILES as u64);
+
+        let (ids, stats) =
+            with_op_stats(|| reader.scan_ids_matching(col("title").like(lit("shared s1%"))));
+        ids.expect("delete scan");
+        assert_eq!(stats.superfiles_considered, BROAD_SUPERFILES as u64);
     }
 
     /// Build a small categorical batch — start id sequence at

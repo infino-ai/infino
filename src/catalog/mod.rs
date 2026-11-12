@@ -154,7 +154,8 @@ use crate::{
         manifest::{ManifestSnapshot, disk_cache::MetadataDiskCache},
         options::SupertableOptions,
         query::{
-            covered_agg::load_unfiltered_aggregate_inputs, exec::common::collect_plan_metered,
+            covered_agg::load_unfiltered_aggregate_inputs,
+            exec::common::{collect_plan_metered, run_within_process_limit},
             sql::sql_session_context,
         },
         reader_cache::{DiskCacheConfig, DiskCacheError, DiskCacheStore},
@@ -1407,7 +1408,8 @@ impl Connection {
             || op_stats.clone(),
             || Some(Arc::clone(&self.inner.usage_meter)),
         );
-        let drive = async move {
+        let collector = op_stats.clone();
+        let statement = async move {
             // Plan on this runtime's 16 MiB workers, not the calling thread `block_on` polls on:
             // planner recursion depth must not hang on a stack the engine does not own. A panic
             // surfaces through the join as a query error.
@@ -1460,9 +1462,10 @@ impl Connection {
             }
             .instrument(detail_span!("sql.plan"))
             .in_current_span();
-            // A `SpawnedTask` aborts the task when dropped, so a cancel stops
-            // the file opens planning is making instead of leaving them to
-            // run on, detached.
+            // A `SpawnedTask` aborts the task when dropped, so a cancel stops the file opens
+            // planning is making instead of leaving them to run on, detached. The task carries the
+            // query's collector, as the prune counts the superfiles it weighed into it.
+            let planning = op_stats::attached_to_future(op_stats.clone(), planning);
             let (task_ctx, plan) = SpawnedTask::spawn(planning).await.map_err(|join| {
                 // A panic while planning is the engine's fault, never the query's.
                 InfinoError::Backend(format!("planning task failed: {join}"))
@@ -1493,6 +1496,13 @@ impl Connection {
                 .into_iter()
                 .map(crate::supertable::schema::strip_field_ids)
                 .collect::<Vec<_>>())
+        };
+        // The process memory limit watches the whole statement: planning holds the metadata of
+        // every file a scan keeps, and execution streams batches the budget never sees.
+        let drive = async move {
+            run_within_process_limit(collector, statement)
+                .await
+                .map_err(|e| datafusion_error(&e))?
         };
         // The cancel races the whole query. Dropping `drive` stops planning
         // (its `SpawnedTask`) and execution (DataFusion aborts its partition
@@ -1993,7 +2003,7 @@ fn backend_to_provider(
         }
     };
     // Tests slow or count reads by wrapping what the connection builds.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-helpers"))]
     let provider = match &options.storage_wrapper {
         Some(wrap) => provider.map(|provider| (wrap.0)(provider)),
         None => provider,
@@ -5042,7 +5052,9 @@ mod tests {
                 .expect("point lookup")
         });
         assert_eq!(found.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
-        // One superfile's rows are read, of the table's `COMMITS` superfiles.
+        // One superfile's rows are read, of the table's `COMMITS` superfiles. The prune weighs all
+        // of them on the planning task, and still counts them into this query's stats.
+        assert_eq!(stats.superfiles_considered, COMMITS as u64, "{stats:?}");
         assert_eq!(stats.planned_read_ranges, 1, "{stats:?}");
         assert_eq!(
             stats.rows_materialized, SENSORS as u64,
