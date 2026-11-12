@@ -14186,6 +14186,22 @@ pub(crate) async fn try_commit_attempt(
     let spliced = match splice.filter(|_| term_contributions.is_empty()) {
         None => None,
         Some(splice) => {
+            // Two grafts that read the table at once both carry the same superfiles: the one
+            // that publishes second must not list them again.
+            let live: HashSet<Uuid> = current_manifest
+                .get_all_superfiles_loaded()
+                .await
+                .map_err(|e| BuildError::Store(e.to_string()))?
+                .iter()
+                .map(|e| e.superfile_id)
+                .collect();
+            if let Some(e) = new_entries.iter().find(|e| live.contains(&e.superfile_id)) {
+                return Err(BuildError::Store(format!(
+                    "graft: superfile {} is already in the table",
+                    e.superfile_id
+                ))
+                .into());
+            }
             let current = match current_manifest.term_index_ref() {
                 // Unreadable for now: fail the attempt and retry rather than publish superfiles the index cannot
                 // list.

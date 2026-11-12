@@ -34,7 +34,6 @@ pub(crate) mod hidden_deleted;
 pub(crate) mod hydrate;
 pub mod lazy_source;
 pub mod manifest;
-#[cfg(any(test, feature = "test-helpers"))]
 pub mod merge;
 pub mod mutations;
 pub(crate) mod opann;

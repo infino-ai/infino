@@ -21,7 +21,8 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::{
-    storage::StorageProvider,
+    Consistency,
+    storage::{SplitStorageProvider, StorageProvider},
     supertable::{
         SupertableReader,
         error::{BuildError, QueryError},
@@ -42,6 +43,9 @@ use crate::{
 /// latency over tens of thousands of superfiles.
 const HEADS_IN_FLIGHT: usize = 64;
 
+/// Replica manifest objects [`detach_replicas`] deletes at once.
+const DELETES_IN_FLIGHT: usize = 64;
+
 fn internal(e: impl std::fmt::Display) -> QueryError {
     QueryError::Internal(e.to_string())
 }
@@ -52,11 +56,17 @@ fn store(e: impl std::fmt::Display) -> BuildError {
 
 /// Fails when `INFINO_GRAFT_FAILPOINT` names `step`, so a test can stop a
 /// graft where a crash would.
+#[cfg(any(test, feature = "test-helpers"))]
 fn failpoint(step: &str) -> Result<(), QueryError> {
     match std::env::var("INFINO_GRAFT_FAILPOINT") {
         Ok(v) if v == step => Err(internal(format!("graft: failpoint {step}"))),
         _ => Ok(()),
     }
+}
+
+#[cfg(not(any(test, feature = "test-helpers")))]
+fn failpoint(_step: &str) -> Result<(), QueryError> {
+    Ok(())
 }
 
 /// The pinned term index's shape: layers, listed superfiles, and whether
@@ -281,6 +291,8 @@ pub fn graft(
         .try_hold_compaction_slot()
         .ok_or_else(|| internal("graft: a compaction or reindex is running"))?;
     dst.block_on_query(async {
+        // Another coordinator may have grafted since this handle last looked.
+        inner.refresh().await.map_err(internal)?;
         let s = read_source(&inner.manifest.load_full(), &src_m, reuse_term_index).await?;
         let mut report = GraftReport {
             already_merged: s.already_merged,
@@ -344,6 +356,63 @@ pub fn graft(
         failpoint("splice")?;
         stamp_term_index(inner, 0).await.map_err(internal)?;
         Ok(report)
+    })
+}
+
+/// Opens replica `name` of `table`, creating it if absent: `table`'s schema and settings, its
+/// manifest under [`crate::storage::REPLICAS_DIR`]`<name>/` and its objects in `table`, with
+/// replica folds on, reads that see other handles' commits, and no disk cache of its own.
+pub fn open_replica(table: &Supertable, name: &str) -> Result<Supertable, QueryError> {
+    let mut options = (*table.inner().options).clone();
+    let storage = options
+        .storage
+        .clone()
+        .ok_or_else(|| internal("replica: the table has no storage"))?;
+    options.storage = Some(Arc::new(SplitStorageProvider::for_replica(storage, name)));
+    // The table's caches are bound to its own storage, where the replica's manifest is not.
+    options.disk_cache = None;
+    options.metadata_disk_cache = None;
+    options.term_index_replica = true;
+    options.read_consistency = Consistency::Strong;
+    Supertable::create(options).map_err(internal)
+}
+
+/// Names of the replicas attached to `table` (see [`crate::storage::REPLICAS_DIR`]).
+pub fn attached_replicas(table: &Supertable) -> Result<Vec<String>, QueryError> {
+    let Some(storage) = table.inner().options.storage.clone() else {
+        return Ok(vec![]);
+    };
+    table.block_on_query(async {
+        crate::storage::attached_replicas(storage.as_ref())
+            .await
+            .map_err(internal)
+    })
+}
+
+/// Deletes every replica manifest under `table`, ending the attachment: gc, compaction and
+/// optimize run on it again, and the next gc reclaims what replicas wrote but never committed.
+/// Call it once the last graft is in and the rows are checked; returns the objects deleted.
+pub fn detach_replicas(table: &Supertable) -> Result<usize, QueryError> {
+    let storage = table
+        .inner()
+        .options
+        .storage
+        .clone()
+        .ok_or_else(|| internal("detach: the table has no storage"))?;
+    table.block_on_query(async {
+        let keys = storage
+            .list_with_prefix(crate::storage::REPLICAS_DIR)
+            .await
+            .map_err(internal)?;
+        stream::iter(&keys)
+            .map(|key| {
+                let storage = &storage;
+                async move { storage.delete(key).await.map_err(internal) }
+            })
+            .buffer_unordered(DELETES_IN_FLIGHT)
+            .try_collect::<Vec<()>>()
+            .await?;
+        Ok(keys.len())
     })
 }
 
@@ -622,11 +691,12 @@ mod tests {
             id_mins: vec![10, 20, 30, 40],
             layers: vec![layer(0, 0..1), layer(1, 1..2), layer(2, 2..4)],
         };
-        let first = spliced_root(&Root::default(), &src, &HashSet::from([u[0], u[1]])).unwrap();
+        let first = spliced_root(&Root::default(), &src, &HashSet::from([u[0], u[1]]))
+            .expect("something to move");
         assert_eq!(first.superfiles, u[..2]);
         assert_eq!(first.layers.len(), 2);
         let all: HashSet<Uuid> = u.iter().copied().collect();
-        let root = spliced_root(&first, &src, &all).unwrap();
+        let root = spliced_root(&first, &src, &all).expect("something to move");
         assert_eq!(root.superfiles[2..], [u[2], u[3]]);
         assert_eq!(root.id_mins[2..], [30, 40]);
         assert_eq!(
@@ -654,8 +724,9 @@ mod tests {
             id_mins: vec![9],
             layers: vec![layer(0, 0..1)],
         };
-        let t = spliced_root(&Root::default(), &deltas, &all).unwrap();
-        let t = spliced_root(&t, &other, &HashSet::from([Uuid::from_u128(99)])).unwrap();
+        let t = spliced_root(&Root::default(), &deltas, &all).expect("something to move");
+        let t = spliced_root(&t, &other, &HashSet::from([Uuid::from_u128(99)]))
+            .expect("something to move");
         // The replica folds its first two layers into one kept relative to its range.
         let mut fold = layer(0, 0..2);
         fold.slices = vec![];
@@ -670,7 +741,7 @@ mod tests {
             ],
             ..deltas.clone()
         };
-        let root = spliced_root(&t, &folded, &all).unwrap();
+        let root = spliced_root(&t, &folded, &all).expect("something to move");
         assert_sound(&root);
         // The two replaced layers are gone; the other replica's and the third delta stay.
         assert_eq!(root.layers.len(), 3);
@@ -686,7 +757,8 @@ mod tests {
             id_mins: vec![1, 2],
             layers: vec![layer(0, 0..1), layer(1, 1..2)],
         };
-        let t = spliced_root(&Root::default(), &deltas, &HashSet::from([u[0]])).unwrap();
+        let t = spliced_root(&Root::default(), &deltas, &HashSet::from([u[0]]))
+            .expect("something to move");
         assert_eq!(t.superfiles, vec![u[0]]);
         let folded = Root {
             layers: vec![Layer {
@@ -696,7 +768,7 @@ mod tests {
             ..deltas
         };
         let all: HashSet<Uuid> = u.iter().copied().collect();
-        let root = spliced_root(&t, &folded, &all).unwrap();
+        let root = spliced_root(&t, &folded, &all).expect("something to move");
         assert_sound(&root);
         assert_eq!(root.layers.len(), 1, "the old delta is replaced");
         let live: Vec<_> = root
@@ -964,6 +1036,106 @@ mod tests {
             .expect("search");
         assert_eq!(hits.len(), 3 * 50);
         assert!(layout(&dst).1, "complete");
+    }
+
+    #[test]
+    fn a_replica_writes_into_the_table_and_grafts_without_copies() {
+        use arrow_array::{ArrayRef, LargeStringArray, RecordBatch};
+        let (_dir, t) = table("t", 1);
+        let schema = t
+            .reader()
+            .expect("reader")
+            .manifest()
+            .get_opts()
+            .schema
+            .clone();
+        let replica = open_replica(&t, "r0").expect("replica");
+        for name in ["b1", "b2"] {
+            let titles: Vec<String> = (0..50).map(|i| format!("shared {name}d{i}")).collect();
+            let arr: ArrayRef = Arc::new(LargeStringArray::from(
+                titles.iter().map(String::as_str).collect::<Vec<_>>(),
+            ));
+            replica
+                .append_named(
+                    &RecordBatch::try_new(schema.clone(), vec![arr]).expect("batch"),
+                    name,
+                )
+                .expect("append");
+        }
+        assert!(t.has_attached_replicas().expect("attached"));
+        let again = open_replica(&t, "r0").expect("reopen");
+        let report = graft(&t, &again.reader().expect("reader"), true).expect("graft");
+        assert_eq!(report.merged, 2);
+        let hits = t
+            .reader()
+            .expect("reader")
+            .token_match(
+                "title",
+                "shared",
+                crate::superfile::fts::reader::BoolMode::Or,
+            )
+            .expect("search");
+        assert_eq!(hits.len(), 3 * 50, "the table's own rows and both batches");
+        assert!(layout(&t).1, "complete");
+    }
+
+    #[test]
+    fn a_second_coordinator_with_a_stale_view_adds_no_rows() {
+        use arrow_array::{ArrayRef, LargeStringArray, RecordBatch};
+        let (dir, t) = table("t", 1);
+        let schema = t
+            .reader()
+            .expect("reader")
+            .manifest()
+            .get_opts()
+            .schema
+            .clone();
+        // Coordinator A opens the table before B grafts, so its view is stale.
+        let a = Supertable::open(options_at(dir.path(), &schema, false)).expect("open");
+        let replica = open_replica(&t, "r0").expect("replica");
+        let arr: ArrayRef = Arc::new(LargeStringArray::from(vec!["shared x"; 50]));
+        replica
+            .append_named(
+                &RecordBatch::try_new(schema.clone(), vec![arr]).expect("batch"),
+                "b1",
+            )
+            .expect("append");
+        let reader = replica.reader().expect("reader");
+        graft(&t, &reader, true).expect("B grafts");
+        // A's graft either fails or adds nothing; the next round re-reads and moves on.
+        if let Ok(report) = graft(&a, &reader, true) {
+            assert_eq!(report.merged, 0, "{report:?}");
+        }
+        let rows = |h: &Supertable| {
+            h.reader()
+                .expect("reader")
+                .manifest()
+                .superfiles
+                .iter()
+                .map(|e| e.n_docs)
+                .sum::<u64>()
+        };
+        assert_eq!(rows(&t), 100);
+        assert_eq!(rows(&a), 100);
+    }
+
+    #[test]
+    fn detach_replicas_ends_the_attachment() {
+        let (dir, t) = table("a", 1);
+        for name in ["r0", "r1"] {
+            let pointer = dir
+                .path()
+                .join(format!("_replicas/{name}/_supertable/current"));
+            std::fs::create_dir_all(pointer.parent().expect("parent")).expect("mkdir");
+            std::fs::write(&pointer, b"x").expect("pointer");
+        }
+        let mut names = attached_replicas(&t).expect("list");
+        names.sort();
+        assert_eq!(names, ["r0", "r1"]);
+        assert!(t.has_attached_replicas().expect("attached"));
+        assert_eq!(detach_replicas(&t).expect("detach"), 2);
+        assert!(attached_replicas(&t).expect("list").is_empty());
+        assert!(!t.has_attached_replicas().expect("detached"));
     }
 
     #[test]

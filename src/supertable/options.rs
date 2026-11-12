@@ -390,6 +390,7 @@ impl Default for Consistency {
 /// commit-flush threshold). Held by `SupertableInner` as
 /// `Arc<SupertableOptions>` so readers, the writer, and rayon
 /// shard workers all see the same instances without copying.
+#[derive(Clone)]
 pub struct SupertableOptions {
     /// User-declared Arrow schema. Contains every
     /// `fts_columns[i].column` (LargeUtf8) and every
