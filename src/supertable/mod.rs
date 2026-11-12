@@ -33,6 +33,7 @@ pub mod handle;
 pub(crate) mod hidden_deleted;
 pub(crate) mod hydrate;
 pub mod lazy_source;
+pub mod load;
 pub mod manifest;
 pub mod merge;
 pub mod mutations;
