@@ -9,11 +9,13 @@
 //! [`select`] returns.
 //!
 //! The packing is single-level and single-pass. A superfile already at
-//! target size is done and never re-merged, and each candidate lands in
-//! **at most one** job, which is what lets the jobs run independently.
-//! At most, not exactly: a candidate is dropped when it is already at
-//! target size or sealed by another compactor, and a trailing group that
-//! clears neither leg of the merge trigger is left for a later pass. The
+//! target size is done and never re-merged, unless enough of its rows are
+//! deleted ([`RECLAIM_FULL_DELETED_PERCENT`]) to rewrite it without them.
+//! Each candidate lands in **at most one** job, which is what lets the jobs
+//! run independently. At most, not exactly: a candidate is dropped when it
+//! is already at target size with few deletes or sealed by another
+//! compactor, and a trailing group that clears no leg of the merge trigger
+//! is left for a later pass. The
 //! property the concurrent runner depends on is that no two jobs name the
 //! same superfile, which [`prop_jobs_never_share_an_input`] pins.
 
@@ -190,8 +192,9 @@ pub fn select(superfiles: &[SuperfileStats], cfg: &CompactionSettings) -> Vec<Co
 /// [`select`], with no job of more than one input planned past what
 /// `memory` admits: a merge expected to hold more than the host can give
 /// it is cut where its inputs reach that, as a job is cut at the target
-/// size. One superfile that alone exceeds it still starts a job, which is
-/// what lets a stale-typed file be rewritten on any host.
+/// size. One stale-typed superfile that alone exceeds it still starts a
+/// job, which is what lets a stale-typed file be rewritten on any host; one
+/// rewritten only to drop its deleted rows does not.
 pub(crate) fn select_within(
     superfiles: &[SuperfileStats],
     cfg: &CompactionSettings,
@@ -243,6 +246,51 @@ pub(crate) fn select_within(
 /// deleted rows hold with it.
 const RECLAIM_DELETED_PERCENT: u64 = 50;
 
+/// A full superfile (see [`is_full`]) is rewritten without its deleted rows,
+/// alone if no neighbour joins it, once this share is deleted. It is lower
+/// than [`RECLAIM_DELETED_PERCENT`] because a full file has little room left
+/// for a merge to take it in, so its deleted rows would otherwise stay.
+const RECLAIM_FULL_DELETED_PERCENT: u64 = 20;
+
+/// Whether `s` already meets the fill floor a merge packs to, so no merge
+/// grows it. Judged by the bytes the file holds, deleted rows included, so a
+/// file a burst of deletes took far below the floor between passes still
+/// counts, and a target-sized file rewritten at
+/// [`RECLAIM_FULL_DELETED_PERCENT`] is still full under the default 80% floor.
+fn is_full(s: &SuperfileStats, full_bytes: u64) -> bool {
+    s.size_bytes >= full_bytes
+}
+
+/// Whether at least `percent` of `s`'s rows are deleted.
+fn deleted_at_least(s: &SuperfileStats, percent: u64) -> bool {
+    s.tombstoned_docs as u128 * 100 >= s.n_docs.max(1) as u128 * percent as u128
+}
+
+/// Whether enough of `s`'s rows are deleted that a job holding it runs
+/// however small: [`RECLAIM_FULL_DELETED_PERCENT`] for a full file,
+/// [`RECLAIM_DELETED_PERCENT`] otherwise.
+fn reclaim_due(s: &SuperfileStats, full_bytes: u64) -> bool {
+    let percent = match is_full(s, full_bytes) {
+        true => RECLAIM_FULL_DELETED_PERCENT,
+        false => RECLAIM_DELETED_PERCENT,
+    };
+    deleted_at_least(s, percent)
+}
+
+/// Whether `s` is rewritten on its own when no neighbour joins it: it is
+/// full, deleted enough, and one merge can take it, within the input cap and
+/// the memory a merge is given.
+fn reclaims_alone(
+    s: &SuperfileStats,
+    full_bytes: u64,
+    max_input_bytes: u64,
+    memory: &MergeMemory,
+) -> bool {
+    is_full(s, full_bytes)
+        && reclaim_due(s, full_bytes)
+        && PendingJob::default().admits(s, max_input_bytes, memory)
+}
+
 fn pack_partition(
     key: &[u8],
     segs: Vec<&SuperfileStats>,
@@ -254,10 +302,17 @@ fn pack_partition(
     jobs: &mut Vec<CompactionJob>,
 ) {
     // Exclude superfiles already at target size — they are done and
-    // re-compacting them gains nothing.
+    // re-compacting them gains nothing — unless enough of their rows are
+    // deleted to rewrite them without those, and one merge can take them.
+    let full_bytes = min_output_bytes;
     let mut candidates: Vec<&SuperfileStats> = segs
         .into_iter()
-        .filter(|s| !s.sealed_by_other && (s.size_bytes < target_bytes || s.stale_type))
+        .filter(|s| {
+            !s.sealed_by_other
+                && (s.size_bytes < target_bytes
+                    || s.stale_type
+                    || reclaims_alone(s, full_bytes, max_input_bytes, memory))
+        })
         .collect();
 
     // Neighbours by document id pack together: ingest gives each superfile
@@ -290,7 +345,10 @@ fn pack_partition(
                 jobs,
             );
         }
-        pending.push(s);
+        let starts_job = pending.members.is_empty();
+        pending.push(s, full_bytes);
+        pending.reclaim_alone =
+            starts_job && reclaims_alone(s, full_bytes, max_input_bytes, memory);
     }
     pending.emit(
         key,
@@ -319,9 +377,13 @@ struct PendingJob {
     /// Whether an input holds a column in a type the table has moved on
     /// from; the job then runs however small.
     stale_type: bool,
-    /// Whether an input is at least [`RECLAIM_DELETED_PERCENT`] deleted;
-    /// the job then runs however small, to reclaim the space.
+    /// Whether an input is deleted enough to be rewritten (see
+    /// [`reclaim_due`]); the job then runs however small, to reclaim the
+    /// space.
     reclaiming: bool,
+    /// Whether the job's first input may be rewritten on its own (see
+    /// [`reclaims_alone`]).
+    reclaim_alone: bool,
 }
 
 impl PendingJob {
@@ -332,8 +394,13 @@ impl PendingJob {
         max_input_bytes: u64,
         memory: &MergeMemory,
     ) -> bool {
-        self.live_bytes + s.live_bytes() <= target_bytes
-            && self.raw_bytes + s.size_bytes <= max_input_bytes
+        self.live_bytes + s.live_bytes() <= target_bytes && self.admits(s, max_input_bytes, memory)
+    }
+
+    /// Whether one merge can take `s` with the inputs it has: within the
+    /// input cap and the memory a merge is given.
+    fn admits(&self, s: &SuperfileStats, max_input_bytes: u64, memory: &MergeMemory) -> bool {
+        self.raw_bytes + s.size_bytes <= max_input_bytes
             && memory.admits(
                 self.raw_bytes + s.size_bytes,
                 self.live_bytes + s.live_bytes(),
@@ -341,7 +408,7 @@ impl PendingJob {
             )
     }
 
-    fn push(&mut self, s: &SuperfileStats) {
+    fn push(&mut self, s: &SuperfileStats, full_bytes: u64) {
         self.raw_bytes += s.size_bytes;
         self.members.push(Member {
             id: s.superfile_id,
@@ -352,8 +419,7 @@ impl PendingJob {
         self.live_bytes += s.live_bytes();
         self.live_docs += s.live_docs();
         self.stale_type |= s.stale_type;
-        self.reclaiming |= s.tombstoned_docs as u128 * 100
-            >= s.n_docs.max(1) as u128 * RECLAIM_DELETED_PERCENT as u128;
+        self.reclaiming |= reclaim_due(s, full_bytes);
     }
 
     /// Emit a CompactionJob when the pending inputs clear either leg of the
@@ -363,9 +429,10 @@ impl PendingJob {
     ///   fires even when the live bytes sit far below the size floor.
     ///
     /// A job holding a stale-typed input runs however small, one input
-    /// included: the rewrite converges the type. One holding a mostly
-    /// deleted input runs however small too, with the two inputs a merge
-    /// needs: the rewrite reclaims the deleted rows' space.
+    /// included: the rewrite converges the type. One holding an input
+    /// deleted enough runs however small too, one input included when it is
+    /// full and one merge can take it: the rewrite reclaims the deleted rows'
+    /// space.
     fn emit(
         &mut self,
         key: &[u8],
@@ -377,7 +444,11 @@ impl PendingJob {
         let size_ready = self.members.len() >= 2 && self.live_bytes >= min_output_bytes;
         let count_ready = self.members.len() >= min_superfiles_for_merge;
         let converging = self.stale_type && !self.members.is_empty();
-        let reclaiming = self.reclaiming && self.members.len() >= 2;
+        let reclaiming = match self.members.len() {
+            0 => false,
+            1 => self.reclaim_alone,
+            _ => self.reclaiming,
+        };
         if size_ready || count_ready || converging || reclaiming {
             // A job's inputs were gathered in id order; they merge
             // most-deleted first, then smallest, then by id. The merged
@@ -413,9 +484,12 @@ impl PendingJob {
 
 #[cfg(test)]
 pub(in crate::supertable::optimize::compact) mod tests {
-    use std::collections::{HashMap, HashSet};
+    use std::{
+        collections::{HashMap, HashSet},
+        slice::from_ref,
+    };
 
-    use proptest::prelude::*;
+    use proptest::{bool::weighted, option::of as optional, prelude::*};
     use uuid::Uuid;
 
     use super::*;
@@ -598,9 +672,10 @@ pub(in crate::supertable::optimize::compact) mod tests {
     /// Packing by id must not strand a mostly deleted superfile: four
     /// 300 MiB superfiles fill a job without the 900 MiB one at the
     /// highest id that is 72% deleted, which the reclaim leg then rewrites
-    /// with the neighbour left over. Alone it waits, as every merge needs
-    /// two inputs; under the share it waits for its neighbours as any
-    /// other does.
+    /// with the neighbour left over. Alone it is rewritten alone, as it meets
+    /// the fill floor; one below the floor as deleted waits alone, as every
+    /// merge needs two inputs. Under the share it waits for its neighbours as
+    /// any other does.
     #[test]
     fn a_mostly_deleted_superfile_is_rewritten_by_the_next_pass() {
         let mut segs: Vec<_> = (0..4).map(|i| seg(i, 300, 1000, 0)).collect();
@@ -612,7 +687,14 @@ pub(in crate::supertable::optimize::compact) mod tests {
             .find(|j| j.inputs.contains(&dead_heavy.superfile_id))
             .expect("the mostly deleted superfile is in a job");
         assert_eq!(holder.inputs.len(), 2, "with the neighbour left over");
-        assert!(select(&segs[4..], &default_cfg()).is_empty(), "alone");
+        let alone = select(&segs[4..], &default_cfg());
+        assert_eq!(alone.len(), 1, "alone");
+        assert_eq!(alone[0].inputs, vec![dead_heavy.superfile_id]);
+        let below_floor = seg(4, 500, 1000, 720);
+        assert!(
+            select(from_ref(&below_floor), &default_cfg()).is_empty(),
+            "below the floor, alone it waits"
+        );
         segs[4] = seg(4, 900, 1000, 100);
         let jobs = select(&segs, &default_cfg());
         assert!(
@@ -713,7 +795,7 @@ pub(in crate::supertable::optimize::compact) mod tests {
         let mut p = PendingJob::default();
         let a = seg(1, 60, 1000, 0); // 60 MiB live
         assert!(p.fits(&a, target, max_memory, &MergeMemory::default()));
-        p.push(&a);
+        p.push(&a, target);
         assert_eq!(p.live_bytes, mib(60));
         assert_eq!(p.members.len(), 1);
         // A second 60 MiB superfile would overflow the 100 MiB target.
@@ -733,7 +815,7 @@ pub(in crate::supertable::optimize::compact) mod tests {
         let mut p = PendingJob::default();
         let a = seg(1, 60, 1000, 0); // 60 MiB raw, 60 MiB live
         assert!(p.fits(&a, target, max_memory, &MergeMemory::default()));
-        p.push(&a);
+        p.push(&a, target);
         let b = seg(2, 60, 1000, 0); // would push raw to 120 MiB > 100 MiB cap
         assert!(!p.fits(&b, target, max_memory, &MergeMemory::default()));
     }
@@ -837,6 +919,7 @@ pub(in crate::supertable::optimize::compact) mod tests {
             tombstone_pct in 0u64..=100,
             sealed_by_other in any::<bool>(),
             birth_version in 0u64..100,
+            stale_type in weighted(PROP_STALE_SHARE),
         ) -> SuperfileStats {
             SuperfileStats {
                 superfile_id: Uuid::from_u128(index as u128 + 1),
@@ -847,10 +930,13 @@ pub(in crate::supertable::optimize::compact) mod tests {
                 id_min: index as i128,
                 sealed_by_other,
                 birth_version,
-                stale_type: false,
+                stale_type,
             }
         }
     }
+
+    /// Share of generated superfiles holding a column in a stale type.
+    const PROP_STALE_SHARE: f64 = 0.1;
 
     fn arb_stats_vec() -> impl Strategy<Value = Vec<SuperfileStats>> {
         (0..=PROP_MAX_SUPERFILES).prop_flat_map(|len| (0..len).map(arb_stats).collect::<Vec<_>>())
@@ -896,13 +982,26 @@ pub(in crate::supertable::optimize::compact) mod tests {
             let by_id: HashMap<Uuid, &SuperfileStats> =
                 stats.iter().map(|s| (s.superfile_id, s)).collect();
 
+            let max_input_bytes = max_merge_input_bytes(&cfg);
+            let full_bytes = full_bytes(&cfg);
+            let memory = MergeMemory::default();
             let mut claimed: HashSet<Uuid> = HashSet::new();
             for job in &jobs {
-                prop_assert!(
-                    job.inputs.len() >= 2,
-                    "a job with fewer than two inputs is a no-op rewrite: {:?}",
-                    job
-                );
+                // One input alone is a rewrite that converges a type or
+                // drops deleted rows, of a file one merge can take.
+                match job.inputs.as_slice() {
+                    [] => prop_assert!(false, "a job of no input"),
+                    [only] => {
+                        let s = by_id.get(only).expect("input is a candidate");
+                        prop_assert!(
+                            s.stale_type
+                                || reclaims_alone(s, full_bytes, max_input_bytes, &memory),
+                            "a job of one input rewrites nothing: {:?}",
+                            job
+                        );
+                    }
+                    _ => {}
+                }
                 for id in &job.inputs {
                     prop_assert!(
                         claimed.insert(*id),
@@ -917,7 +1016,12 @@ pub(in crate::supertable::optimize::compact) mod tests {
                     // which is the other half of "no two compactors touch it".
                     let s = by_id.get(id).expect("input is a candidate");
                     prop_assert!(!s.sealed_by_other, "sealed input {id} was packed");
-                    prop_assert!(s.size_bytes < target_bytes, "at-target input {id} was packed");
+                    prop_assert!(
+                        s.size_bytes < target_bytes
+                            || s.stale_type
+                            || reclaims_alone(s, full_bytes, max_input_bytes, &memory),
+                        "at-target input {id} with few deletes was packed"
+                    );
                     prop_assert_eq!(
                         &s.partition_key,
                         &job.partition_key,
@@ -928,14 +1032,262 @@ pub(in crate::supertable::optimize::compact) mod tests {
         }
     }
 
+    proptest! {
+        /// An at-target superfile is planned exactly when at least
+        /// [`RECLAIM_FULL_DELETED_PERCENT`] of it is deleted and one merge
+        /// can take it, under the input cap and the memory a merge is given;
+        /// a full one below the target, at least then.
+        #[test]
+        fn prop_full_superfiles_are_reclaimed_past_the_share_within_the_caps(
+            stats in arb_stats_vec(),
+            cfg in arb_cfg(),
+            limit_mib in optional(1u64..8192),
+        ) {
+            let memory = MergeMemory {
+                limit: limit_mib.map(mib),
+                ..MergeMemory::default()
+            };
+            let jobs = select_within(&stats, &cfg, &memory);
+            let target_bytes = cfg.target_superfile_size_mb.saturating_mul(MIB);
+            let max_input_bytes = max_merge_input_bytes(&cfg);
+            let job_of: HashMap<Uuid, &CompactionJob> = jobs
+                .iter()
+                .flat_map(|job| job.inputs.iter().map(move |id| (*id, job)))
+                .collect();
+            for job in &jobs {
+                if job.inputs.len() > 1 {
+                    prop_assert!(job.input_bytes <= max_input_bytes, "over the input cap");
+                    prop_assert!(
+                        memory.footprint(job.input_bytes, job.estimated_output_bytes, job.live_docs)
+                            <= memory.limit.unwrap_or(u64::MAX),
+                        "past the memory a merge is given"
+                    );
+                }
+            }
+            let full_bytes = full_bytes(&cfg);
+            let full = stats.iter().filter(|s| {
+                s.size_bytes >= full_bytes && !s.sealed_by_other && !s.stale_type
+            });
+            for s in full {
+                let due = deleted_at_least(s, RECLAIM_FULL_DELETED_PERCENT)
+                    && s.size_bytes <= max_input_bytes
+                    && memory.admits(s.size_bytes, s.live_bytes(), s.live_docs());
+                let planned = job_of.contains_key(&s.superfile_id);
+                match s.size_bytes >= target_bytes {
+                    true => prop_assert_eq!(planned, due, "{:?} in {:?}", s, job_of.get(&s.superfile_id)),
+                    false => prop_assert!(planned || !due, "{:?} left out", s),
+                }
+            }
+        }
+    }
+
+    fn reclaim_cfg() -> CompactionSettings {
+        CompactionSettings {
+            target_superfile_size_mb: 100,
+            ..CompactionSettings::default()
+        }
+    }
+
+    /// The fill floor `select` packs to under `cfg`, which is also the size
+    /// a full superfile reaches.
+    fn full_bytes(cfg: &CompactionSettings) -> u64 {
+        let target_bytes = cfg.target_superfile_size_mb.saturating_mul(MIB);
+        (target_bytes as u128 * cfg.min_fill_percent.clamp(0, 100) as u128 / 100) as u64
+    }
+
+    /// A target-sized superfile rewritten at a fifth deleted comes out at the
+    /// fill floor, still full, so it is rewritten again at a fifth. The
+    /// second rewrite comes out below the floor, where it waits alone for
+    /// neighbours however deleted, as any small file does.
     #[test]
-    fn pending_job_emit_requires_two_inputs() {
-        // A single-input pending job never emits even if it reaches the fill
-        // floor and the count trigger (emit takes a pre-clamped count of 2, so
-        // one input clears neither the size nor the count leg).
+    fn a_rewritten_full_superfile_is_reclaimed_at_a_fifth_again() {
+        let cfg = reclaim_cfg();
+        let first = seg(1, 100, 1_000, 200);
+        let jobs = select(from_ref(&first), &cfg);
+        assert_eq!(jobs.len(), 1, "{jobs:?}");
+        let mut output = after_pass(from_ref(&first), &jobs).remove(0);
+        assert_eq!(output.size_bytes, mib(80));
+        assert!(output.size_bytes >= full_bytes(&cfg), "the output is full");
+
+        output.tombstoned_docs = output.n_docs / 5 - 1;
+        assert!(select(from_ref(&output), &cfg).is_empty(), "under a fifth");
+        output.tombstoned_docs = output.n_docs / 5;
+        let jobs = select(from_ref(&output), &cfg);
+        assert_eq!(jobs.len(), 1, "a fifth again: {jobs:?}");
+        assert_eq!(jobs[0].inputs, vec![output.superfile_id]);
+
+        let mut below_floor = after_pass(from_ref(&output), &jobs).remove(0);
+        assert_eq!(below_floor.size_bytes, mib(64));
+        below_floor.tombstoned_docs = below_floor.n_docs * 3 / 5;
+        assert!(
+            select(from_ref(&below_floor), &cfg).is_empty(),
+            "below the floor, alone it waits"
+        );
+        let neighbour = seg(9, 10, 1_000, 0);
+        assert_eq!(
+            select(&[below_floor, neighbour], &cfg).len(),
+            1,
+            "with a neighbour"
+        );
+    }
+
+    /// A superfile at the target size is rewritten once a fifth of its rows
+    /// are deleted, and not before: alone, or with the neighbours its live
+    /// rows leave room for.
+    #[test]
+    fn a_full_superfile_is_rewritten_once_a_fifth_is_deleted() {
+        let cfg = reclaim_cfg();
+        let below = seg(1, 100, 1_000, 199);
+        assert!(select(from_ref(&below), &cfg).is_empty());
+        let full = seg(1, 100, 1_000, 200);
+        let jobs = select(from_ref(&full), &cfg);
+        assert_eq!(jobs.len(), 1, "{jobs:?}");
+        assert_eq!(jobs[0].inputs, vec![full.superfile_id]);
+        assert_eq!(jobs[0].live_docs, 800);
+        assert_eq!(jobs[0].estimated_output_bytes, mib(80));
+
+        let neighbour = seg(2, 10, 1_000, 0);
+        let jobs = select(&[below, neighbour.clone()], &cfg);
+        assert!(jobs.is_empty(), "under the share nothing is due: {jobs:?}");
+        let jobs = select(&[full.clone(), neighbour.clone()], &cfg);
+        assert_eq!(jobs.len(), 1, "{jobs:?}");
+        let mut inputs = jobs[0].inputs.clone();
+        inputs.sort();
+        assert_eq!(inputs, vec![full.superfile_id, neighbour.superfile_id]);
+    }
+
+    /// The superfiles after `jobs` ran over `stats`: each job's inputs
+    /// replaced by one superfile of its live rows, with no deletes.
+    fn after_pass(stats: &[SuperfileStats], jobs: &[CompactionJob]) -> Vec<SuperfileStats> {
+        let merged: HashSet<Uuid> = jobs.iter().flat_map(|job| job.inputs.clone()).collect();
+        let mut next: Vec<SuperfileStats> = stats
+            .iter()
+            .filter(|s| !merged.contains(&s.superfile_id))
+            .cloned()
+            .collect();
+        for (at, job) in jobs.iter().enumerate() {
+            let id_min = stats
+                .iter()
+                .filter(|s| job.inputs.contains(&s.superfile_id))
+                .map(|s| s.id_min)
+                .min()
+                .expect("a job has inputs");
+            next.push(SuperfileStats {
+                superfile_id: Uuid::from_u128(u128::MAX - at as u128),
+                size_bytes: job.estimated_output_bytes,
+                n_docs: job.live_docs,
+                tombstoned_docs: 0,
+                id_min,
+                ..seg(0, 0, 0, 0)
+            });
+        }
+        next
+    }
+
+    /// Over two passes, a full superfile a quarter deleted is rewritten
+    /// once: alone, its output is not merged with the same neighbours the
+    /// next pass, and packed with a neighbour, that job's output is left
+    /// alone too. Only when the input cap kept the neighbour out does the
+    /// smaller output take it in next pass.
+    #[test]
+    fn a_reclaimed_superfile_is_rewritten_once_over_two_passes() {
+        let cfg = reclaim_cfg();
+        let full = seg(3, 100, 1_000, 250);
+        for stats in [
+            vec![seg(1, 30, 1_000, 0), seg(2, 30, 1_000, 0), full.clone()],
+            vec![full.clone(), seg(4, 10, 1_000, 0)],
+        ] {
+            let first = select(&stats, &cfg);
+            assert_eq!(first.len(), 1, "{first:?}");
+            assert!(first[0].inputs.contains(&full.superfile_id));
+            let second = select(&after_pass(&stats, &first), &cfg);
+            assert!(second.is_empty(), "rewritten again: {second:?}");
+        }
+
+        let mut capped = reclaim_cfg();
+        capped.max_merge_input_mb = 105;
+        let stats = vec![full.clone(), seg(4, 10, 1_000, 0)];
+        let first = select(&stats, &capped);
+        assert_eq!(first.len(), 1);
+        assert_eq!(
+            first[0].inputs,
+            vec![full.superfile_id],
+            "the cap kept them apart"
+        );
+        let second = select(&after_pass(&stats, &first), &capped);
+        assert_eq!(second.len(), 1, "the smaller output takes the neighbour in");
+    }
+
+    /// A full superfile larger than one merge may read, or than the memory
+    /// a merge is given, stays as it is however deleted.
+    #[test]
+    fn a_full_superfile_one_merge_cannot_take_stays() {
+        let mut cfg = reclaim_cfg();
+        cfg.max_merge_input_mb = 150;
+        let huge = seg(1, 200, 1_000, 900);
+        assert!(
+            select(from_ref(&huge), &cfg).is_empty(),
+            "over the input cap"
+        );
+        cfg.max_merge_input_mb = 400;
+        assert_eq!(select(from_ref(&huge), &cfg).len(), 1, "within it");
+        let tight = MergeMemory {
+            limit: Some(mib(100)),
+            ..MergeMemory::default()
+        };
+        assert!(
+            select_within(from_ref(&huge), &cfg, &tight).is_empty(),
+            "past the memory a merge is given"
+        );
+    }
+
+    /// A full superfile one merge cannot take is passed over, so the small
+    /// neighbours on either side of it still pack together.
+    #[test]
+    fn a_full_superfile_one_merge_cannot_take_does_not_split_its_neighbours() {
+        let mut cfg = reclaim_cfg();
+        cfg.max_merge_input_mb = 150;
+        let stats = vec![
+            seg(1, 45, 1_000, 0),
+            seg(2, 200, 1_000, 900),
+            seg(3, 45, 1_000, 0),
+        ];
+        let jobs = select(&stats, &cfg);
+        assert_eq!(jobs.len(), 1, "{jobs:?}");
+        let mut inputs = jobs[0].inputs.clone();
+        inputs.sort();
+        assert_eq!(inputs, vec![stats[0].superfile_id, stats[2].superfile_id]);
+    }
+
+    /// What a reclaim writes has no deleted rows, so the next pass never
+    /// selects it again.
+    #[test]
+    fn a_reclaimed_superfile_is_not_selected_again() {
+        let cfg = reclaim_cfg();
+        let full = seg(1, 150, 1_000, 300);
+        let jobs = select(from_ref(&full), &cfg);
+        assert_eq!(jobs.len(), 1);
+        let job = &jobs[0];
+        let output = SuperfileStats {
+            superfile_id: Uuid::from_u128(3),
+            size_bytes: job.estimated_output_bytes,
+            n_docs: job.live_docs,
+            tombstoned_docs: 0,
+            ..seg(3, 0, 0, 0)
+        };
+        assert!(output.size_bytes >= mib(cfg.target_superfile_size_mb));
+        assert!(select(from_ref(&output), &cfg).is_empty());
+    }
+
+    #[test]
+    fn pending_job_emit_requires_two_inputs_without_a_reclaim() {
+        // A single input with no deleted rows to reclaim never emits, even if
+        // it reaches the fill floor and the count trigger (emit takes a
+        // pre-clamped count of 2, so one input clears neither the size nor
+        // the count leg). Only a reclaim emits a job of one input.
         let mut jobs = Vec::new();
         let mut p = PendingJob::default();
-        p.push(&seg(1, 200, 1000, 0));
+        p.push(&seg(1, 200, 1000, 0), mib(1024));
         p.emit(&[], 0, 2, None, &mut jobs);
         assert!(jobs.is_empty(), "single-input job must not emit");
         // Reset to default after emit attempt.
@@ -965,11 +1317,11 @@ pub(in crate::supertable::optimize::compact) mod tests {
 
         let mut huge = seg(2, 500, 1_000, 0);
         assert!(
-            select(&[huge.clone()], &cfg).is_empty(),
+            select(from_ref(&huge), &cfg).is_empty(),
             "a target-sized file is left alone"
         );
         huge.stale_type = true;
-        let jobs = select(&[huge.clone()], &cfg);
+        let jobs = select(from_ref(&huge), &cfg);
         assert_eq!(jobs.len(), 1, "unless its type is stale");
         assert_eq!(jobs[0].inputs, vec![huge.superfile_id]);
     }
