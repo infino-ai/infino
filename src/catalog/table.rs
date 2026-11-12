@@ -20,14 +20,16 @@ use datafusion::prelude::Expr;
 use serde_json::Value;
 
 use crate::{
-    Bm25SearchOptions, BoolMode, GcError, GcReport, InfinoError, MutationStats, OptimizeError,
-    OptimizeOptions, ReindexError, ReindexOptions, VectorFilter,
+    Bm25SearchOptions, BoolMode, GcError, GcReport, InfinoError, LoadOutcome, LoadReplica,
+    LoadState, MutationStats, OptimizeError, OptimizeOptions, ReindexError, ReindexOptions,
+    ReplicaAccount, VectorFilter,
     catalog::ensure_expr_within_connective_cap,
     superfile::VectorSearchOptions,
     supertable::{
         Supertable as SupertableHandle,
         companion::check_purpose,
         hydrate::hydrate_from_reader,
+        load,
         reindex::{PlannedRepair, ReindexReport, StalenessReport},
         schema::{TableSchema, change::SchemaPatch},
     },
@@ -121,6 +123,12 @@ pub(crate) trait Table: Send + Sync {
     /// public [`Supertable`]. Not part of any shipped surface.
     #[cfg(any(test, feature = "test-helpers"))]
     fn as_any(&self) -> &dyn Any;
+
+    /// The local engine table behind this handle, for what only a local table does (loads);
+    /// `None` for a hosted table.
+    fn local_engine(&self) -> Option<&SupertableHandle> {
+        None
+    }
 }
 
 // The local (embedded) implementation forwards each operation to the engine
@@ -267,6 +275,9 @@ impl Table for SupertableHandle {
         expected: Option<u32>,
     ) -> Result<TableSchema, InfinoError> {
         Ok((*SupertableHandle::apply_schema(self, patch, expected)?).clone())
+    }
+    fn local_engine(&self) -> Option<&SupertableHandle> {
+        Some(self)
     }
     #[cfg(any(test, feature = "test-helpers"))]
     fn as_any(&self) -> &dyn Any {
@@ -795,6 +806,58 @@ impl Supertable {
         expected: Option<u32>,
     ) -> Result<TableSchema, InfinoError> {
         self.inner.apply_schema(patch, expected)
+    }
+
+    /// The local engine table behind this handle; a hosted table takes no loads.
+    fn local_for_load(&self) -> Result<&SupertableHandle, InfinoError> {
+        self.inner
+            .local_engine()
+            .ok_or_else(|| InfinoError::Unsupported("loads run on local tables".into()))
+    }
+
+    /// Begins load `load` on this table, or reports the state it is in: several replicas then
+    /// write its batches at once ([`Self::open_load_replica`]), the table stays queryable as
+    /// [`Self::graft_load`] adds them, and [`Self::finish_load`] closes it with an exact account.
+    pub fn begin_load(&self, load: &str) -> Result<LoadState, InfinoError> {
+        load::begin_load(self.local_for_load()?, load)
+    }
+
+    /// Whether `load` is unknown, open or finished on this table.
+    pub fn load_state(&self, load: &str) -> Result<LoadState, InfinoError> {
+        load::load_state(self.local_for_load()?, load)
+    }
+
+    /// Node `node`'s replica of open load `load`; errors when the load is not open.
+    pub fn open_load_replica(&self, load: &str, node: &str) -> Result<LoadReplica, InfinoError> {
+        load::open_load_replica(self.local_for_load()?, load, node)
+    }
+
+    /// Seals `node`'s replica of `load` on its behalf, when that node is gone for good.
+    pub fn seal_absent_replica(&self, load: &str, node: &str) -> Result<(), InfinoError> {
+        load::seal_absent_replica(self.local_for_load()?, load, node)
+    }
+
+    /// Adds to this table what `load`'s replicas committed since the last call; one caller per
+    /// load runs it every few seconds while the load is open.
+    pub fn graft_load(&self, load: &str) -> Result<Vec<ReplicaAccount>, InfinoError> {
+        load::graft_load(self.local_for_load()?, load)
+    }
+
+    /// Finishes `load` once every replica is sealed (see [`load::finish_load`]).
+    pub fn finish_load(
+        &self,
+        load: &str,
+        expected_rows: Option<u64>,
+    ) -> Result<LoadOutcome, InfinoError> {
+        load::finish_load(self.local_for_load()?, load, expected_rows)
+    }
+
+    /// Whether any load's replicas are attached to this table; its maintenance waits while they
+    /// are.
+    pub fn has_attached_replicas(&self) -> Result<bool, InfinoError> {
+        self.local_for_load()?
+            .has_attached_replicas()
+            .map_err(|e| InfinoError::Backend(e.to_string()))
     }
 
     /// Test-only: the underlying local engine handle. Panics for a hosted
