@@ -113,6 +113,31 @@ impl core::marker::Unpin for infino::GcError
 impl core::marker::UnsafeUnpin for infino::GcError
 impl !core::panic::unwind_safe::RefUnwindSafe for infino::GcError
 impl !core::panic::unwind_safe::UnwindSafe for infino::GcError
+pub enum infino::ImportState
+pub infino::ImportState::Aborted
+pub infino::ImportState::Finished(infino::ImportOutcome)
+pub infino::ImportState::Finishing
+pub infino::ImportState::Open
+pub infino::ImportState::Unknown
+impl core::clone::Clone for infino::ImportState
+pub fn infino::ImportState::clone(&self) -> Self
+impl core::cmp::Eq for infino::ImportState
+impl core::cmp::PartialEq for infino::ImportState
+pub fn infino::ImportState::eq(&self, &Self) -> bool
+impl core::fmt::Debug for infino::ImportState
+pub fn infino::ImportState::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for infino::ImportState
+impl serde_core::ser::Serialize for infino::ImportState
+pub fn infino::ImportState::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for infino::ImportState
+pub fn infino::ImportState::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
+impl core::marker::Freeze for infino::ImportState
+impl core::marker::Send for infino::ImportState
+impl core::marker::Sync for infino::ImportState
+impl core::marker::Unpin for infino::ImportState
+impl core::marker::UnsafeUnpin for infino::ImportState
+impl core::panic::unwind_safe::RefUnwindSafe for infino::ImportState
+impl core::panic::unwind_safe::UnwindSafe for infino::ImportState
 #[non_exhaustive] pub enum infino::InfinoError
 pub infino::InfinoError::AlreadyExists(alloc::string::String)
 pub infino::InfinoError::Backend(alloc::string::String)
@@ -139,30 +164,6 @@ impl core::marker::Unpin for infino::InfinoError
 impl core::marker::UnsafeUnpin for infino::InfinoError
 impl core::panic::unwind_safe::RefUnwindSafe for infino::InfinoError
 impl core::panic::unwind_safe::UnwindSafe for infino::InfinoError
-pub enum infino::LoadState
-pub infino::LoadState::Finished(infino::LoadOutcome)
-pub infino::LoadState::Finishing
-pub infino::LoadState::Open
-pub infino::LoadState::Unknown
-impl core::clone::Clone for infino::LoadState
-pub fn infino::LoadState::clone(&self) -> Self
-impl core::cmp::Eq for infino::LoadState
-impl core::cmp::PartialEq for infino::LoadState
-pub fn infino::LoadState::eq(&self, &Self) -> bool
-impl core::fmt::Debug for infino::LoadState
-pub fn infino::LoadState::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl core::marker::StructuralPartialEq for infino::LoadState
-impl serde_core::ser::Serialize for infino::LoadState
-pub fn infino::LoadState::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
-impl<'de> serde_core::de::Deserialize<'de> for infino::LoadState
-pub fn infino::LoadState::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
-impl core::marker::Freeze for infino::LoadState
-impl core::marker::Send for infino::LoadState
-impl core::marker::Sync for infino::LoadState
-impl core::marker::Unpin for infino::LoadState
-impl core::marker::UnsafeUnpin for infino::LoadState
-impl core::panic::unwind_safe::RefUnwindSafe for infino::LoadState
-impl core::panic::unwind_safe::UnwindSafe for infino::LoadState
 pub enum infino::Metric
 pub infino::Metric::Cosine
 pub infino::Metric::L2Sq
@@ -500,6 +501,31 @@ impl core::marker::Unpin for infino::SuperfileIndex
 impl core::marker::UnsafeUnpin for infino::SuperfileIndex
 impl core::panic::unwind_safe::RefUnwindSafe for infino::SuperfileIndex
 impl core::panic::unwind_safe::UnwindSafe for infino::SuperfileIndex
+pub enum infino::Writers
+pub infino::Writers::Auto
+pub infino::Writers::Count(core::num::nonzero::NonZeroU32)
+impl core::clone::Clone for infino::Writers
+pub fn infino::Writers::clone(&self) -> Self
+impl core::cmp::Eq for infino::Writers
+impl core::cmp::PartialEq for infino::Writers
+pub fn infino::Writers::eq(&self, &Self) -> bool
+impl core::default::Default for infino::Writers
+pub fn infino::Writers::default() -> Self
+impl core::fmt::Debug for infino::Writers
+pub fn infino::Writers::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for infino::Writers
+impl core::marker::StructuralPartialEq for infino::Writers
+impl serde_core::ser::Serialize for infino::Writers
+pub fn infino::Writers::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for infino::Writers
+pub fn infino::Writers::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
+impl core::marker::Freeze for infino::Writers
+impl core::marker::Send for infino::Writers
+impl core::marker::Sync for infino::Writers
+impl core::marker::Unpin for infino::Writers
+impl core::marker::UnsafeUnpin for infino::Writers
+impl core::panic::unwind_safe::RefUnwindSafe for infino::Writers
+impl core::panic::unwind_safe::UnwindSafe for infino::Writers
 #[non_exhaustive] pub struct infino::Bm25Params
 pub infino::Bm25Params::b: f32
 pub infino::Bm25Params::k1: f32
@@ -789,6 +815,42 @@ impl core::marker::Unpin for infino::GcSettings
 impl core::marker::UnsafeUnpin for infino::GcSettings
 impl core::panic::unwind_safe::RefUnwindSafe for infino::GcSettings
 impl core::panic::unwind_safe::UnwindSafe for infino::GcSettings
+pub struct infino::ImportOutcome
+pub infino::ImportOutcome::duplicate_rows: u64
+pub infino::ImportOutcome::duplicates: usize
+pub infino::ImportOutcome::rows: u64
+impl core::clone::Clone for infino::ImportOutcome
+pub fn infino::ImportOutcome::clone(&self) -> Self
+impl core::cmp::Eq for infino::ImportOutcome
+impl core::cmp::PartialEq for infino::ImportOutcome
+pub fn infino::ImportOutcome::eq(&self, &Self) -> bool
+impl core::fmt::Debug for infino::ImportOutcome
+pub fn infino::ImportOutcome::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for infino::ImportOutcome
+impl serde_core::ser::Serialize for infino::ImportOutcome
+pub fn infino::ImportOutcome::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for infino::ImportOutcome
+pub fn infino::ImportOutcome::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
+impl core::marker::Freeze for infino::ImportOutcome
+impl core::marker::Send for infino::ImportOutcome
+impl core::marker::Sync for infino::ImportOutcome
+impl core::marker::Unpin for infino::ImportOutcome
+impl core::marker::UnsafeUnpin for infino::ImportOutcome
+impl core::panic::unwind_safe::RefUnwindSafe for infino::ImportOutcome
+impl core::panic::unwind_safe::UnwindSafe for infino::ImportOutcome
+pub struct infino::ImportReplica
+impl infino::ImportReplica
+pub fn infino::ImportReplica::append_batch(&self, &arrow_array::record_batch::RecordBatch, &str) -> core::result::Result<bool, infino::InfinoError>
+pub fn infino::ImportReplica::fold(&self) -> core::result::Result<bool, infino::InfinoError>
+pub fn infino::ImportReplica::is_sealed(&self) -> bool
+pub fn infino::ImportReplica::seal(&self) -> core::result::Result<(), infino::InfinoError>
+impl !core::marker::Freeze for infino::ImportReplica
+impl core::marker::Send for infino::ImportReplica
+impl core::marker::Sync for infino::ImportReplica
+impl core::marker::Unpin for infino::ImportReplica
+impl core::marker::UnsafeUnpin for infino::ImportReplica
+impl !core::panic::unwind_safe::RefUnwindSafe for infino::ImportReplica
+impl !core::panic::unwind_safe::UnwindSafe for infino::ImportReplica
 pub struct infino::IndexSpec
 impl infino::IndexSpec
 pub fn infino::IndexSpec::companion(self, impl core::convert::Into<alloc::string::String>, arrow_schema::schema::SchemaRef, infino::IndexSpec) -> Self
@@ -809,42 +871,6 @@ impl core::marker::Unpin for infino::IndexSpec
 impl core::marker::UnsafeUnpin for infino::IndexSpec
 impl core::panic::unwind_safe::RefUnwindSafe for infino::IndexSpec
 impl core::panic::unwind_safe::UnwindSafe for infino::IndexSpec
-pub struct infino::LoadOutcome
-pub infino::LoadOutcome::duplicate_rows: u64
-pub infino::LoadOutcome::duplicates: usize
-pub infino::LoadOutcome::rows: u64
-impl core::clone::Clone for infino::LoadOutcome
-pub fn infino::LoadOutcome::clone(&self) -> Self
-impl core::cmp::Eq for infino::LoadOutcome
-impl core::cmp::PartialEq for infino::LoadOutcome
-pub fn infino::LoadOutcome::eq(&self, &Self) -> bool
-impl core::fmt::Debug for infino::LoadOutcome
-pub fn infino::LoadOutcome::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl core::marker::StructuralPartialEq for infino::LoadOutcome
-impl serde_core::ser::Serialize for infino::LoadOutcome
-pub fn infino::LoadOutcome::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
-impl<'de> serde_core::de::Deserialize<'de> for infino::LoadOutcome
-pub fn infino::LoadOutcome::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
-impl core::marker::Freeze for infino::LoadOutcome
-impl core::marker::Send for infino::LoadOutcome
-impl core::marker::Sync for infino::LoadOutcome
-impl core::marker::Unpin for infino::LoadOutcome
-impl core::marker::UnsafeUnpin for infino::LoadOutcome
-impl core::panic::unwind_safe::RefUnwindSafe for infino::LoadOutcome
-impl core::panic::unwind_safe::UnwindSafe for infino::LoadOutcome
-pub struct infino::LoadReplica
-impl infino::LoadReplica
-pub fn infino::LoadReplica::append_batch(&self, &arrow_array::record_batch::RecordBatch, &str) -> core::result::Result<bool, infino::InfinoError>
-pub fn infino::LoadReplica::fold(&self) -> core::result::Result<bool, infino::InfinoError>
-pub fn infino::LoadReplica::is_sealed(&self) -> bool
-pub fn infino::LoadReplica::seal(&self) -> core::result::Result<(), infino::InfinoError>
-impl !core::marker::Freeze for infino::LoadReplica
-impl core::marker::Send for infino::LoadReplica
-impl core::marker::Sync for infino::LoadReplica
-impl core::marker::Unpin for infino::LoadReplica
-impl core::marker::UnsafeUnpin for infino::LoadReplica
-impl !core::panic::unwind_safe::RefUnwindSafe for infino::LoadReplica
-impl !core::panic::unwind_safe::UnwindSafe for infino::LoadReplica
 #[non_exhaustive] pub struct infino::MutationStats
 impl infino::MutationStats
 pub fn infino::MutationStats::matched(&self) -> usize
@@ -1083,28 +1109,31 @@ impl core::panic::unwind_safe::RefUnwindSafe for infino::StalenessReport
 impl core::panic::unwind_safe::UnwindSafe for infino::StalenessReport
 pub struct infino::Supertable
 impl infino::Supertable
+pub fn infino::Supertable::abort_import(&self, &str) -> core::result::Result<(), infino::InfinoError>
 pub fn infino::Supertable::append(&self, &arrow_array::record_batch::RecordBatch) -> core::result::Result<(), infino::InfinoError>
 pub fn infino::Supertable::append_named(&self, &arrow_array::record_batch::RecordBatch, &str) -> core::result::Result<(), infino::InfinoError>
 pub fn infino::Supertable::append_rows(&self, &[serde_json::value::Value]) -> core::result::Result<(), infino::InfinoError>
 pub fn infino::Supertable::append_rows_named(&self, &[serde_json::value::Value], &str) -> core::result::Result<(), infino::InfinoError>
 pub fn infino::Supertable::apply_schema(&self, &infino::SchemaPatch, core::option::Option<u32>) -> core::result::Result<infino::TableSchema, infino::InfinoError>
-pub fn infino::Supertable::begin_load(&self, &str) -> core::result::Result<infino::LoadState, infino::InfinoError>
+pub fn infino::Supertable::begin_import(&self, &str, core::option::Option<infino::Writers>) -> core::result::Result<infino::ImportState, infino::InfinoError>
 pub fn infino::Supertable::bm25_search(&self, &str, &str, usize, infino::Bm25SearchOptions, core::option::Option<&[&str]>) -> core::result::Result<alloc::vec::Vec<arrow_array::record_batch::RecordBatch>, infino::InfinoError>
 pub fn infino::Supertable::companion(&self, &str) -> core::result::Result<core::option::Option<infino::Supertable>, infino::InfinoError>
 pub fn infino::Supertable::count(&self, &str, &str, infino::BoolMode) -> core::result::Result<u64, infino::InfinoError>
 pub fn infino::Supertable::count_where(&self, &[datafusion_expr::expr::Expr]) -> core::result::Result<alloc::vec::Vec<u64>, infino::InfinoError>
 pub fn infino::Supertable::delete(&self, datafusion_expr::expr::Expr) -> core::result::Result<infino::MutationStats, infino::InfinoError>
 pub fn infino::Supertable::exact_match(&self, &str, &str, core::option::Option<&[&str]>) -> core::result::Result<alloc::vec::Vec<arrow_array::record_batch::RecordBatch>, infino::InfinoError>
-pub fn infino::Supertable::finish_load(&self, &str, core::option::Option<u64>) -> core::result::Result<infino::LoadOutcome, infino::InfinoError>
+pub fn infino::Supertable::finish_import(&self, &str, core::option::Option<u64>) -> core::result::Result<infino::ImportOutcome, infino::InfinoError>
 pub fn infino::Supertable::gc(&self, core::time::Duration) -> core::result::Result<infino::GcReport, infino::GcError>
-pub fn infino::Supertable::graft_load(&self, &str) -> core::result::Result<alloc::vec::Vec<infino::ReplicaAccount>, infino::InfinoError>
+pub fn infino::Supertable::graft_import(&self, &str) -> core::result::Result<alloc::vec::Vec<infino::ReplicaAccount>, infino::InfinoError>
 pub fn infino::Supertable::has_attached_replicas(&self) -> core::result::Result<bool, infino::InfinoError>
 pub fn infino::Supertable::hybrid_search(&self, &str, &str, infino::BoolMode, &str, &[f32], usize, core::option::Option<&[&str]>) -> core::result::Result<alloc::vec::Vec<arrow_array::record_batch::RecordBatch>, infino::InfinoError>
 pub fn infino::Supertable::hydrate(&self, impl arrow_array::record_batch::RecordBatchReader, usize) -> core::result::Result<usize, infino::InfinoError>
+pub fn infino::Supertable::import_activity(&self, &str) -> core::result::Result<core::option::Option<std::time::SystemTime>, infino::InfinoError>
+pub fn infino::Supertable::import_state(&self, &str) -> core::result::Result<infino::ImportState, infino::InfinoError>
+pub fn infino::Supertable::import_writers(&self, &str) -> core::result::Result<infino::Writers, infino::InfinoError>
 pub fn infino::Supertable::index_staleness(&self, &infino::ReindexOptions) -> core::result::Result<infino::StalenessReport, infino::ReindexError>
-pub fn infino::Supertable::load_state(&self, &str) -> core::result::Result<infino::LoadState, infino::InfinoError>
-pub fn infino::Supertable::open_load_replica(&self, &str, &str) -> core::result::Result<infino::LoadReplica, infino::InfinoError>
-pub fn infino::Supertable::open_loads(&self) -> core::result::Result<alloc::vec::Vec<alloc::string::String>, infino::InfinoError>
+pub fn infino::Supertable::open_import_replica(&self, &str, &str) -> core::result::Result<infino::ImportReplica, infino::InfinoError>
+pub fn infino::Supertable::open_imports(&self) -> core::result::Result<alloc::vec::Vec<alloc::string::String>, infino::InfinoError>
 pub fn infino::Supertable::optimize(&self, &infino::OptimizeOptions) -> core::result::Result<(), infino::OptimizeError>
 pub fn infino::Supertable::reindex(&self, &infino::ReindexOptions) -> core::result::Result<infino::ReindexReport, infino::ReindexError>
 pub fn infino::Supertable::reindex_plan(&self, &infino::ReindexOptions) -> core::result::Result<alloc::vec::Vec<infino::PlannedRepair>, infino::ReindexError>
