@@ -8221,11 +8221,13 @@ impl SupertableReader {
     /// row must never be a kNN candidate).
     ///
     /// The caller passes a plan that is bounded as lowered, and for a plan
-    /// without a `LIKE` leaf `evaluate` therefore returns `Some(bitmap)`
-    /// for every superfile — a `None` there is a planner bug and is
-    /// reported as one. A `LIKE` leaf is bound per superfile: a token that
-    /// widens past the dictionary cap in *this* superfile makes `evaluate`
-    /// return `None` there, meaning the index constrains nothing for that
+    /// without a `LIKE` or range leaf `evaluate` therefore returns
+    /// `Some(bitmap)` for every superfile — a `None` there is a planner bug
+    /// and is reported as one. A `LIKE` leaf is bound per superfile: a token
+    /// that widens past the dictionary cap in *this* superfile makes
+    /// `evaluate` return `None` there. So does a range leaf on a superfile
+    /// with no range index for the column, or one keyed by the column's
+    /// earlier type. Either way the index constrains nothing for that
     /// superfile, so every one of its rows stays a kNN candidate — the
     /// `FilterExec` above the TVF re-applies the exact predicate. Treating
     /// it as the empty set would drop matching rows.
@@ -8235,7 +8237,7 @@ impl SupertableReader {
         plan: &CandidatePlan,
     ) -> Result<HashMap<SuperfileUri, Arc<RoaringBitmap>>, QueryError> {
         let plan_arc = Arc::new(plan.clone());
-        let unbounded_is_legitimate = plan.has_like();
+        let unbounded_is_legitimate = plan.may_evaluate_unbounded();
         let op_stats = self.op_stats.clone();
         // A `LIKE` leaf's dictionary walk is CPU work: it runs on the reader
         // pool, not on the tokio worker driving this fan-out.
