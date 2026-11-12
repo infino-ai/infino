@@ -251,6 +251,8 @@ pub(crate) type RangeColumns = HashMap<String, (FieldId, DataType)>;
 struct IndexedColumns<'a, 'b> {
     fts: &'a HashSet<&'b str>,
     range: &'a RangeColumns,
+    /// A column's table field id, by its current name.
+    field_id: &'a dyn Fn(&str) -> Option<FieldId>,
 }
 
 /// Per column, the prefetched-term memo a superfile's plan evaluation
@@ -263,6 +265,12 @@ pub(crate) type TermMemos = HashMap<String, Arc<FetchedTermMemo>>;
 /// once from a SQL `WHERE` clause and [`evaluate`](CandidatePlan::evaluate)d
 /// per superfile to a superset of the rows satisfying the FTS-resolvable
 /// part of the predicate.
+///
+/// A term leaf names its column by its current name and also keeps its
+/// table `field` id. A superfile written before a rename keys its
+/// dictionary by the old name, so each superfile lookup maps the column
+/// to that superfile's own name through the id
+/// ([`SuperfileReader::column_alias`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CandidatePlan {
     /// Rows whose `column` contains every one of `tokens` (term-AND).
@@ -274,13 +282,21 @@ pub(crate) enum CandidatePlan {
     /// scan pass. (An `exact_match`-per-leaf alternative was measured and
     /// rejected: it decodes the predicate column in its own pass 2, once
     /// per `OR`/`IN` branch, on top of the scan — multi-decode.)
-    TermsAll { column: String, tokens: Vec<String> },
+    TermsAll {
+        column: String,
+        field: Option<FieldId>,
+        tokens: Vec<String>,
+    },
     /// Rows whose `column` contains any one of `terms` (term-OR): one
     /// `LIKE` fragment token bound to a superfile's vocabulary by
     /// [`expand`](Self::expand). Resolved by a single `token_match(.., Or)`;
     /// empty `terms` (nothing in that superfile's dictionary qualifies)
     /// matches no row, so the superfile is skipped without a scan.
-    TermsAny { column: String, terms: Vec<String> },
+    TermsAny {
+        column: String,
+        field: Option<FieldId>,
+        terms: Vec<String>,
+    },
     /// Rows whose `column` satisfies every `LIKE` fragment token, before
     /// the superfile is known: a complete token must be indexed as itself,
     /// an open-edged one as some term it is the head / tail / infix of.
@@ -291,6 +307,7 @@ pub(crate) enum CandidatePlan {
     /// letters whose case-folding class Arrow widens past lowercasing.
     TermsLike {
         column: String,
+        field: Option<FieldId>,
         tokens: Vec<LikeToken>,
         fold: bool,
     },
@@ -360,11 +377,14 @@ impl CandidatePlan {
     ///
     /// `range_cols` maps each range-indexed column to its type: a range or
     /// equality on one of them lowers to a [`Range`](Self::Range) leaf.
+    /// `field_id` maps a column name to its table field id, kept on each
+    /// term leaf.
     pub(crate) fn from_filters(
         filters: &[Expr],
         fts_cols: &HashSet<&str>,
         range_cols: &RangeColumns,
         resolve: &dyn Fn(&str) -> Option<Arc<dyn Tokenizer>>,
+        field_id: &dyn Fn(&str) -> Option<FieldId>,
     ) -> CandidatePlan {
         if fts_cols.is_empty() && range_cols.is_empty() {
             return CandidatePlan::Unbounded;
@@ -372,6 +392,7 @@ impl CandidatePlan {
         let cols = IndexedColumns {
             fts: fts_cols,
             range: range_cols,
+            field_id,
         };
         and_combine(filters.iter().map(|f| lower(f, &cols, resolve)).collect())
     }
@@ -383,12 +404,12 @@ impl CandidatePlan {
     pub(crate) fn term_requests(&self) -> HashMap<String, Vec<String>> {
         fn walk(plan: &CandidatePlan, out: &mut HashMap<String, Vec<String>>) {
             match plan {
-                CandidatePlan::TermsAll { column, tokens } => {
+                CandidatePlan::TermsAll { column, tokens, .. } => {
                     out.entry(column.clone())
                         .or_default()
                         .extend(tokens.iter().cloned());
                 }
-                CandidatePlan::TermsAny { column, terms } => {
+                CandidatePlan::TermsAny { column, terms, .. } => {
                     out.entry(column.clone())
                         .or_default()
                         .extend(terms.iter().cloned());
@@ -432,15 +453,28 @@ impl CandidatePlan {
         Box::pin(async move {
             match self {
                 CandidatePlan::Unbounded => Ok((None, MatchWork::default())),
-                CandidatePlan::TermsAll { column, tokens } => {
+                CandidatePlan::TermsAll {
+                    column,
+                    field,
+                    tokens,
+                } => {
                     let refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
                     let memo = memos.get(column).map(Arc::as_ref);
                     let (docs, work) = reader
-                        .token_match_prefetched(column, &refs, BoolMode::And, memo)
+                        .token_match_prefetched(
+                            reader.column_alias(*field, column),
+                            &refs,
+                            BoolMode::And,
+                            memo,
+                        )
                         .await?;
                     Ok((Some(docs.into_iter().map(RowId::get).collect()), work))
                 }
-                CandidatePlan::TermsAny { column, terms } => {
+                CandidatePlan::TermsAny {
+                    column,
+                    field,
+                    terms,
+                } => {
                     // No qualifying term in this superfile ⇒ no row, decided
                     // here rather than left to the match's empty-input rule.
                     if terms.is_empty() {
@@ -449,17 +483,23 @@ impl CandidatePlan {
                     let refs: Vec<&str> = terms.iter().map(String::as_str).collect();
                     let memo = memos.get(column).map(Arc::as_ref);
                     let (docs, work) = reader
-                        .token_match_prefetched(column, &refs, BoolMode::Or, memo)
+                        .token_match_prefetched(
+                            reader.column_alias(*field, column),
+                            &refs,
+                            BoolMode::Or,
+                            memo,
+                        )
                         .await?;
                     Ok((Some(docs.into_iter().map(RowId::get).collect()), work))
                 }
                 CandidatePlan::TermsLike {
                     column,
+                    field,
                     tokens,
                     fold,
                 } => {
                     let (expanded, mut work) =
-                        expand_like(reader, column, tokens, *fold, true, pool).await?;
+                        expand_like(reader, column, *field, tokens, *fold, true, pool).await?;
                     let (docs, eval_work) = expanded.evaluate(reader, pool, memos).await?;
                     work.merge(eval_work);
                     Ok((docs, work))
@@ -639,7 +679,7 @@ impl CandidatePlan {
     fn append_prune_leaves(&self, leaves: &mut Vec<PruneLeaf>) -> bool {
         match self {
             CandidatePlan::Unbounded => true,
-            CandidatePlan::TermsAll { column, tokens } => {
+            CandidatePlan::TermsAll { column, tokens, .. } => {
                 if tokens.is_empty() {
                     return true;
                 }
@@ -650,7 +690,7 @@ impl CandidatePlan {
                 });
                 true
             }
-            CandidatePlan::TermsAny { column, terms } => {
+            CandidatePlan::TermsAny { column, terms, .. } => {
                 if !terms.is_empty() {
                     leaves.push(PruneLeaf::TermPresence {
                         column: column.clone(),
@@ -664,6 +704,7 @@ impl CandidatePlan {
                 column,
                 tokens,
                 fold,
+                ..
             } => {
                 // A complete token must be present as itself → term bloom;
                 // a token open only on the right must head some term → lex
@@ -736,32 +777,50 @@ impl CandidatePlan {
             let n_docs = reader.n_docs();
             match self {
                 CandidatePlan::Unbounded => Ok((n_docs, MatchWork::default())),
-                CandidatePlan::TermsAll { column, tokens } => {
+                CandidatePlan::TermsAll {
+                    column,
+                    field,
+                    tokens,
+                } => {
                     if tokens.is_empty() {
                         return Ok((n_docs, MatchWork::default()));
                     }
                     // Intersection ≤ the rarest token's df.
                     let (min_df, work) =
-                        fold_dfs(reader, located, column, tokens, u64::MAX, u64::min).await?;
+                        fold_dfs(reader, located, column, *field, tokens, u64::MAX, u64::min)
+                            .await?;
                     Ok((min_df.min(n_docs), work))
                 }
-                CandidatePlan::TermsAny { column, terms } => {
+                CandidatePlan::TermsAny {
+                    column,
+                    field,
+                    terms,
+                } => {
                     if terms.is_empty() {
                         return Ok((0, MatchWork::default()));
                     }
                     // Union ≤ the sum of the terms' dfs.
-                    let (sum, work) =
-                        fold_dfs(reader, located, column, terms, 0, u64::saturating_add).await?;
+                    let (sum, work) = fold_dfs(
+                        reader,
+                        located,
+                        column,
+                        *field,
+                        terms,
+                        0,
+                        u64::saturating_add,
+                    )
+                    .await?;
                     Ok((sum.min(n_docs), work))
                 }
                 CandidatePlan::TermsLike {
                     column,
+                    field,
                     tokens,
                     fold,
                 } => {
                     // The index was never asked about the expanded words.
                     let (expanded, mut work) =
-                        expand_like(reader, column, tokens, *fold, true, pool).await?;
+                        expand_like(reader, column, *field, tokens, *fold, true, pool).await?;
                     let (rows, est_work) = expanded.estimate(reader, pool, None).await?;
                     work.merge(est_work);
                     Ok((rows, work))
@@ -811,6 +870,7 @@ async fn fold_dfs(
     reader: &SuperfileReader,
     located: Option<IndexedSuperfile<'_>>,
     column: &str,
+    field: Option<FieldId>,
     terms: &[String],
     init: u64,
     fold: fn(u64, u64) -> u64,
@@ -824,7 +884,9 @@ async fn fold_dfs(
         return Ok((folded, MatchWork::default()));
     }
     let refs: Vec<&str> = terms.iter().map(String::as_str).collect();
-    let (dfs, work) = reader.term_dfs(column, &refs).await?;
+    let (dfs, work) = reader
+        .term_dfs(reader.column_alias(field, column), &refs)
+        .await?;
     Ok((dfs.into_iter().fold(init, fold), work))
 }
 
@@ -893,9 +955,13 @@ impl CandidatePlan {
             match self {
                 CandidatePlan::TermsLike {
                     column,
+                    field,
                     tokens,
                     fold,
-                } => expand_like(reader, column, tokens, *fold, full_walk_pays(column), pool).await,
+                } => {
+                    let full_walk = full_walk_pays(column);
+                    expand_like(reader, column, *field, tokens, *fold, full_walk, pool).await
+                }
                 CandidatePlan::And(children) => {
                     let (expanded, work) =
                         expand_children(reader, children, full_walk_pays, pool).await?;
@@ -938,6 +1004,7 @@ async fn expand_children(
 async fn expand_like(
     reader: &SuperfileReader,
     column: &str,
+    field: Option<FieldId>,
     tokens: &[LikeToken],
     fold: bool,
     allow_full_walk: bool,
@@ -947,7 +1014,7 @@ async fn expand_like(
     let patterns: Vec<TermPattern<'_>> = tokens.iter().map(LikeToken::pattern).collect();
     let (expansions, work) = reader
         .expand_terms(
-            column,
+            reader.column_alias(field, column),
             &patterns,
             fold,
             LIKE_MAX_TERMS,
@@ -960,6 +1027,7 @@ async fn expand_like(
         .map(|terms| match terms {
             Some(terms) => CandidatePlan::TermsAny {
                 column: column.to_owned(),
+                field,
                 terms,
             },
             None => CandidatePlan::Unbounded,
@@ -974,7 +1042,6 @@ fn lower(
     cols: &IndexedColumns<'_, '_>,
     resolve: &dyn Fn(&str) -> Option<Arc<dyn Tokenizer>>,
 ) -> CandidatePlan {
-    let fts_cols = cols.fts;
     match expr {
         Expr::BinaryExpr(be) => match be.op {
             Operator::And => and_combine(vec![
@@ -990,16 +1057,16 @@ fn lower(
             {
                 comparison_range(&be.left, be.op, &be.right, cols.range)
             }
-            Operator::Eq => eq_leaf(&be.left, &be.right, fts_cols, resolve),
+            Operator::Eq => eq_leaf(&be.left, &be.right, cols, resolve),
             // Inequality and arithmetic ops aren't bounded.
             _ => CandidatePlan::Unbounded,
         },
         // `BETWEEN a AND b` on a range-indexed column is the interval.
         Expr::Between(between) if !between.negated => between_range(between, cols.range),
         // `IN (a, b, …)` on an FTS column is an OR of equalities.
-        Expr::InList(il) if !il.negated => in_list_leaf(il, fts_cols, resolve),
+        Expr::InList(il) if !il.negated => in_list_leaf(il, cols, resolve),
         // `LIKE` on an FTS column is bounded through the term dictionary.
-        Expr::Like(like) => like_leaf(like, fts_cols, resolve),
+        Expr::Like(like) => like_leaf(like, cols, resolve),
         // NOT, IS NULL, functions, etc. — not soundly bounded.
         _ => CandidatePlan::Unbounded,
     }
@@ -1201,7 +1268,7 @@ fn integer_literal(value: &ScalarValue) -> Option<i128> {
 fn eq_leaf(
     left: &Expr,
     right: &Expr,
-    fts_cols: &HashSet<&str>,
+    cols: &IndexedColumns<'_, '_>,
     resolve: &dyn Fn(&str) -> Option<Arc<dyn Tokenizer>>,
 ) -> CandidatePlan {
     let (column, value) = match (left, right) {
@@ -1209,13 +1276,13 @@ fn eq_leaf(
         (Expr::Literal(v, _), Expr::Column(c)) => (&c.name, v),
         _ => return CandidatePlan::Unbounded,
     };
-    terms_all(column, value, fts_cols, resolve)
+    terms_all(column, value, cols, resolve)
 }
 
 /// Lower `col IN ('a', 'b', …)` on an FTS column to an OR of term-ANDs.
 fn in_list_leaf(
     il: &InList,
-    fts_cols: &HashSet<&str>,
+    cols: &IndexedColumns<'_, '_>,
     resolve: &dyn Fn(&str) -> Option<Arc<dyn Tokenizer>>,
 ) -> CandidatePlan {
     let Expr::Column(c) = il.expr.as_ref() else {
@@ -1226,7 +1293,7 @@ fn in_list_leaf(
         let Expr::Literal(v, _) = item else {
             return CandidatePlan::Unbounded;
         };
-        branches.push(terms_all(&c.name, v, fts_cols, resolve));
+        branches.push(terms_all(&c.name, v, cols, resolve));
     }
     or_combine(branches)
 }
@@ -1242,10 +1309,10 @@ fn in_list_leaf(
 /// pattern with no usable token.
 fn like_leaf(
     like: &Like,
-    fts_cols: &HashSet<&str>,
+    cols: &IndexedColumns<'_, '_>,
     resolve: &dyn Fn(&str) -> Option<Arc<dyn Tokenizer>>,
 ) -> CandidatePlan {
-    let Some(parts) = like_parts(like, fts_cols, resolve) else {
+    let Some(parts) = like_parts(like, cols.fts, resolve) else {
         return CandidatePlan::Unbounded;
     };
     let LikeParts {
@@ -1269,11 +1336,13 @@ fn like_leaf(
     if exact_terms {
         return CandidatePlan::TermsAll {
             column: column.to_owned(),
+            field: (cols.field_id)(column),
             tokens: tokens.into_iter().map(|t| t.text).collect(),
         };
     }
     CandidatePlan::TermsLike {
         column: column.to_owned(),
+        field: (cols.field_id)(column),
         tokens,
         fold,
     }
@@ -1639,10 +1708,10 @@ fn admits(token: LikeToken, fold: bool) -> Option<LikeToken> {
 fn terms_all(
     column: &str,
     value: &ScalarValue,
-    fts_cols: &HashSet<&str>,
+    cols: &IndexedColumns<'_, '_>,
     resolve: &dyn Fn(&str) -> Option<Arc<dyn Tokenizer>>,
 ) -> CandidatePlan {
-    if !fts_cols.contains(column) {
+    if !cols.fts.contains(column) {
         return CandidatePlan::Unbounded;
     }
     let Some(s) = scalar_str(value) else {
@@ -1657,6 +1726,7 @@ fn terms_all(
     }
     CandidatePlan::TermsAll {
         column: column.to_owned(),
+        field: (cols.field_id)(column),
         tokens,
     }
 }
@@ -1768,8 +1838,14 @@ fn collect_like_leaves(
             collect_like_leaves(&be.right, fts_cols, resolve, out);
         }
         Expr::Like(like) => {
-            // A single leaf is always one conjunctive group.
-            like_leaf(like, fts_cols, resolve).append_prune_leaves(out);
+            // A single leaf is always one conjunctive group. Prune leaves
+            // name columns only, so no field id is needed.
+            let cols = IndexedColumns {
+                fts: fts_cols,
+                range: &RangeColumns::new(),
+                field_id: &|_| None,
+            };
+            like_leaf(like, &cols, resolve).append_prune_leaves(out);
         }
         _ => {}
     }
@@ -1958,7 +2034,8 @@ mod tests {
                     &[expr],
                     &fts_cols(),
                     &RangeColumns::new(),
-                    &stemming_resolver
+                    &stemming_resolver,
+                    &|_| None,
                 ),
                 CandidatePlan::Unbounded,
                 "LIKE {pattern:?} on a stemmed column must not be bounded"
@@ -1978,11 +2055,13 @@ mod tests {
             &fts_cols(),
             &RangeColumns::new(),
             &stemming_resolver,
+            &|_| None,
         );
         assert_eq!(
             plan,
             CandidatePlan::TermsAll {
                 column: "title".to_string(),
+                field: None,
                 tokens: vec!["run".to_string(), "studi".to_string()],
             }
         );
@@ -1994,7 +2073,8 @@ mod tests {
                 &[col("title").eq(lit("of the"))],
                 &fts_cols(),
                 &RangeColumns::new(),
-                &stopping_resolver
+                &stopping_resolver,
+                &|_| None,
             ),
             CandidatePlan::Unbounded
         );
@@ -2006,6 +2086,7 @@ mod tests {
             &fts_cols(),
             &RangeColumns::new(),
             &standard_resolver,
+            &|_| None,
         )
     }
 
@@ -2017,6 +2098,7 @@ mod tests {
     fn candidate_plan_flattens_into_bloom_survival_groups() {
         let terms = |c: &str, t: &str| CandidatePlan::TermsAll {
             column: c.to_string(),
+            field: None,
             tokens: vec![t.to_string()],
         };
 
@@ -2056,6 +2138,7 @@ mod tests {
             p,
             CandidatePlan::TermsAll {
                 column: "title".into(),
+                field: None,
                 tokens: vec!["rust".into(), "async".into()],
             }
         );
@@ -2068,6 +2151,7 @@ mod tests {
             p,
             CandidatePlan::TermsAll {
                 column: "title".into(),
+                field: None,
                 tokens: vec!["rust".into()],
             }
         );
@@ -2104,7 +2188,13 @@ mod tests {
     }
 
     fn range_plan(filters: &[Expr]) -> CandidatePlan {
-        CandidatePlan::from_filters(filters, &HashSet::new(), &range_cols(), &standard_resolver)
+        CandidatePlan::from_filters(
+            filters,
+            &HashSet::new(),
+            &range_cols(),
+            &standard_resolver,
+            &|_| None,
+        )
     }
 
     fn range(column: &str, kind: KeyKind, lo: u64, hi: u64) -> CandidatePlan {
@@ -2240,6 +2330,7 @@ mod tests {
             p,
             CandidatePlan::TermsAll {
                 column: "title".into(),
+                field: None,
                 tokens: vec!["rust".into()],
             }
         );
@@ -2312,6 +2403,7 @@ mod tests {
             p,
             CandidatePlan::TermsAll {
                 column: "title".into(),
+                field: None,
                 tokens: vec!["rust".into()],
             }
         );
@@ -2333,6 +2425,7 @@ mod tests {
     fn terms_like(tokens: Vec<LikeToken>) -> CandidatePlan {
         CandidatePlan::TermsLike {
             column: "title".into(),
+            field: None,
             tokens,
             fold: false,
         }
@@ -2341,6 +2434,7 @@ mod tests {
     fn terms_ilike(tokens: Vec<LikeToken>) -> CandidatePlan {
         CandidatePlan::TermsLike {
             column: "title".into(),
+            field: None,
             tokens,
             fold: true,
         }
@@ -2349,6 +2443,7 @@ mod tests {
     fn terms_all(tokens: &[&str]) -> CandidatePlan {
         CandidatePlan::TermsAll {
             column: "title".into(),
+            field: None,
             tokens: tokens.iter().map(|t| (*t).into()).collect(),
         }
     }
@@ -2679,6 +2774,7 @@ mod tests {
             &HashSet::new(),
             &RangeColumns::new(),
             &standard_resolver,
+            &|_| None,
         );
         assert_eq!(p, CandidatePlan::Unbounded);
     }
@@ -2690,6 +2786,7 @@ mod tests {
         let filters = [col("title").eq(lit("Running"))];
         let terms = |tokens: &[&str]| CandidatePlan::TermsAll {
             column: "title".to_owned(),
+            field: None,
             tokens: tokens.iter().map(|t| t.to_string()).collect(),
         };
         assert_eq!(
@@ -2697,7 +2794,8 @@ mod tests {
                 &filters,
                 &fts_cols(),
                 &RangeColumns::new(),
-                &standard_resolver
+                &standard_resolver,
+                &|_| None,
             ),
             terms(&["running"])
         );
@@ -2706,7 +2804,8 @@ mod tests {
                 &filters,
                 &fts_cols(),
                 &RangeColumns::new(),
-                &stemming_resolver
+                &stemming_resolver,
+                &|_| None,
             ),
             terms(&["run"])
         );
@@ -2968,6 +3067,7 @@ mod tests {
         let pool = one_thread_pool();
         let any = |terms: &[&str]| CandidatePlan::TermsAny {
             column: "title".into(),
+            field: None,
             terms: terms.iter().map(|t| t.to_string()).collect(),
         };
         let cases = [

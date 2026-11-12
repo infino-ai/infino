@@ -810,9 +810,14 @@ impl SupertableProvider {
         let budget = &self.manifest.options.connection_memory_budget;
         let mut leaf_rows: HashMap<(&str, &str), ContainsRows> = HashMap::new();
         for (column, needles) in by_column {
+            // A superfile written before a rename keys its dictionary by
+            // the column's old name.
+            let file_column = prepared
+                .reader
+                .column_alias(self.manifest.field_id(column), column);
             let (rows, column_work) = prepared
                 .reader
-                .contains_rows(column, &needles, Some(pool), Some(budget))
+                .contains_rows(file_column, &needles, Some(pool), Some(budget))
                 .await
                 .map_err(QueryError::from)?;
             // One result per needle, or the zip below would pair needles
@@ -1945,6 +1950,7 @@ impl TableProvider for SupertableProvider {
             &fts_cols,
             &range_cols,
             &|col| manifest.try_fts_tokenizer_for(col),
+            &|col| manifest.field_id(col),
         ));
         // A `LIKE` leaf is bound to each superfile's dictionary once, up
         // front, so the estimate and the evaluation below share one walk.

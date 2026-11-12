@@ -582,6 +582,71 @@ fn the_schema_write_adds_renames_and_drops_and_reads_follow() {
     assert_eq!(docs.schema().fields().len(), 3);
 }
 
+/// Two full-text columns that swap names: a superfile written before the
+/// swap keys each dictionary by the old name, so every index-backed
+/// `WHERE` must find a column's terms by its id, not its current name.
+#[test]
+fn a_where_on_full_text_columns_follows_a_name_swap() {
+    let db = connect("memory://").expect("connect");
+    let docs = db
+        .create_table(
+            TABLE,
+            Arc::new(Schema::new(vec![
+                Field::new("title", DataType::LargeUtf8, false),
+                Field::new("a", DataType::LargeUtf8, false),
+                Field::new("b", DataType::LargeUtf8, false),
+            ])),
+            IndexSpec::new().fts("title").fts("a").fts("b"),
+        )
+        .expect("create");
+    docs.append(&batch(vec![
+        ("title", titles(&["rust one", "rust two", "rust three"])),
+        ("a", titles(&["p", "q", "p"])),
+        ("b", titles(&["v", "w", "w"])),
+    ]))
+    .expect("append");
+
+    let before = db
+        .apply_schema(TABLE, &patch(vec![]), None)
+        .expect("read the schema");
+    let a_id = before.id_of("a").expect("a");
+    let b_id = before.id_of("b").expect("b");
+    for (name, id) in [("tmp", a_id), ("a", b_id), ("b", a_id)] {
+        db.apply_schema(
+            TABLE,
+            &patch(vec![FieldPatch::named(name).with_id(id)]),
+            None,
+        )
+        .expect("rename");
+    }
+    assert_eq!(
+        rows(&db, "SELECT title, a, b FROM docs"),
+        vec!["rust one|v|p", "rust three|w|p", "rust two|w|q"]
+    );
+
+    let cases: &[(&str, &[&str])] = &[
+        ("SELECT title FROM docs WHERE a = 'v'", &["rust one"]),
+        ("SELECT title FROM docs WHERE b = 'q'", &["rust two"]),
+        (
+            "SELECT title FROM docs WHERE a IN ('v', 'x')",
+            &["rust one"],
+        ),
+        ("SELECT title FROM docs WHERE a LIKE 'v'", &["rust one"]),
+        ("SELECT title FROM docs WHERE b LIKE 'q%'", &["rust two"]),
+        (
+            "SELECT title FROM docs WHERE a ILIKE '%w%'",
+            &["rust three", "rust two"],
+        ),
+        (
+            "SELECT title FROM bm25_search('docs', 'title', 'rust', 10) WHERE a = 'v'",
+            &["rust one"],
+        ),
+    ];
+    for (sql, want) in cases {
+        assert_eq!(rows(&db, sql), *want, "{sql}");
+    }
+}
+
 #[test]
 fn the_read_document_applies_as_a_no_op_and_the_expected_id_guards_the_write() {
     let db = connect("memory://").expect("connect");
