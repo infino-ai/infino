@@ -1892,6 +1892,15 @@ impl ManifestSnapshot {
         }
     }
 
+    /// Successor manifest (bumped id) with `index` as the table's cell grid: how a table gets
+    /// its grid ahead of its first vector commit.
+    pub(crate) fn with_global_vector_index_published(
+        &self,
+        index: list::GlobalVectorIndex,
+    ) -> Self {
+        self.with_list_edited(true, |list| list.global_vector_index = Some(index))
+    }
+
     /// The manifest's term-index root reference, when one has been built.
     /// See `manifest::term_index`.
     pub(crate) fn term_index_ref(&self) -> Option<&RoutingRef> {

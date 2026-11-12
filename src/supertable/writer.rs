@@ -1719,6 +1719,40 @@ fn bootstrap_centroids_from_batch(
     ))
 }
 
+/// The grids a table's first vector commit trains from `buffer`; `None` without a vector column
+/// or rows.
+fn bootstrap_global_vector_index(
+    options: &SupertableOptions,
+    manifest: &ManifestSnapshot,
+    buffer: &[BufferedBatch],
+) -> Option<GlobalVectorIndex> {
+    let vc = manifest.vector_configs().into_iter().next()?;
+    let hidden_cells = hidden_vector_cell_count(options);
+    let grid = bootstrap_centroids_from_batch(buffer, vc.dim, hidden_cells)?;
+    let user_cells = user_vector_cell_count(options);
+    let user_grid = (user_cells != hidden_cells)
+        .then(|| bootstrap_centroids_from_batch(buffer, vc.dim, user_cells))
+        .flatten();
+    Some(GlobalVectorIndex {
+        column: vc.column,
+        grid,
+        user_grid,
+    })
+}
+
+/// The grids a first commit of `batch` would train, for a caller that stamps them before it.
+pub(in crate::supertable) fn train_global_vector_index(
+    options: &SupertableOptions,
+    manifest: &ManifestSnapshot,
+    batch: &RecordBatch,
+) -> Result<Option<GlobalVectorIndex>, BuildError> {
+    let buffer = [BufferedBatch {
+        scalar: batch.clone(),
+        vectors: owned_vector_arrays(batch, manifest)?,
+    }];
+    Ok(bootstrap_global_vector_index(options, manifest, &buffer))
+}
+
 impl SupertableWriter {
     /// Number of buffered batches not yet committed. Useful for
     /// tests + diagnostics; not part of the production hot path.
@@ -3158,27 +3192,12 @@ impl SupertableWriter {
         // into pending OCC metadata (not a bare ArcSwap.store). The pack path
         // below reads the same local `pending_gvi` / existing manifest grid;
         // the stamp lands with the membership commit (S10).
-        let pending_gvi: Option<GlobalVectorIndex> = if manifest.get_global_vector_index().is_none()
-            && !buffer.is_empty()
-            && let Some(vc) = manifest.vector_configs().first()
-            && let Some(grid) = bootstrap_centroids_from_batch(
-                buffer,
-                vc.dim,
-                hidden_vector_cell_count(&self.inner.options),
-            ) {
-            let hidden_cells = hidden_vector_cell_count(&self.inner.options);
-            let user_cells = user_vector_cell_count(&self.inner.options);
-            let user_grid = (user_cells != hidden_cells)
-                .then(|| bootstrap_centroids_from_batch(buffer, vc.dim, user_cells))
-                .flatten();
-            Some(GlobalVectorIndex {
-                column: vc.column.clone(),
-                grid,
-                user_grid,
-            })
-        } else {
-            None
-        };
+        let pending_gvi: Option<GlobalVectorIndex> =
+            if manifest.get_global_vector_index().is_none() && !buffer.is_empty() {
+                bootstrap_global_vector_index(&self.inner.options, &manifest, buffer)
+            } else {
+                None
+            };
 
         let total_rows: usize = buffer.iter().map(|b| b.scalar.num_rows()).sum();
         if total_rows == 0 {

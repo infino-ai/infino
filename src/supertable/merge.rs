@@ -33,7 +33,10 @@ use crate::{
             ManifestSnapshot, SuperfileEntry,
             term_index::{self, Root, format::Layer},
         },
-        writer::{persist_graft_async, scoring_by_superfile, stamp_term_index, stamp_with_retries},
+        writer::{
+            CommitListMetadata, persist_graft_async, persist_list_metadata_async,
+            scoring_by_superfile, stamp_term_index, stamp_with_retries, train_global_vector_index,
+        },
     },
 };
 
@@ -179,15 +182,14 @@ fn check(dst: &ManifestSnapshot, src: &ManifestSnapshot) -> Result<(), QueryErro
     if src.get_tombstone_seqs().is_some_and(|t| !t.is_empty()) {
         return refuse("the source has deleted rows; optimize it first");
     }
-    for t in [src, dst] {
-        if !t.vector_configs().is_empty()
-            || !t.companions().is_empty()
-            || t.slow_vector_state_blob().is_some()
-        {
-            return refuse(
-                "a table has vector columns or companion tables, which a graft does not carry",
-            );
-        }
+    if !src.companions().is_empty() || src.slow_vector_state_blob().is_some() {
+        return refuse("the source has companion tables or a drained vector index");
+    }
+    // Vector cells are numbered by the grid they were packed on; under another grid the
+    // destination's searches would probe the wrong cells.
+    if src.global_vector_index().is_some() && src.global_vector_index() != dst.global_vector_index()
+    {
+        return refuse("the source packed its vectors on another cell grid than the destination's");
     }
     Ok(())
 }
@@ -471,6 +473,55 @@ pub fn open_existing_replica(
     }
 }
 
+/// Gives `replica` the cell grid `table` packs vectors on, before the replica's first commit trains
+/// one of its own; a table without a grid gets the one `batch` trains, whichever replica stamps first.
+pub(crate) fn share_vector_grid(
+    table: &Supertable,
+    replica: &Supertable,
+    batch: &RecordBatch,
+) -> Result<(), QueryError> {
+    let manifest = replica.inner().manifest.load_full();
+    if manifest.vector_configs().is_empty() || manifest.global_vector_index().is_some() {
+        return Ok(());
+    }
+    let inner = table.inner();
+    let storage = storage_of_table(table)?;
+    let grid = table.block_on_query(async {
+        inner.refresh().await.map_err(internal)?;
+        if inner.manifest.load().global_vector_index().is_none() {
+            let Some(trained) =
+                train_global_vector_index(&inner.options, &manifest, batch).map_err(internal)?
+            else {
+                return Ok(None);
+            };
+            stamp_with_retries(inner, &storage, "import grid", |old| {
+                let trained = trained.clone();
+                async move {
+                    Ok(old
+                        .global_vector_index()
+                        .is_none()
+                        .then(|| old.with_global_vector_index_published(trained)))
+                }
+            })
+            .await
+            .map_err(internal)?;
+        }
+        Ok::<_, QueryError>(inner.manifest.load().get_global_vector_index())
+    })?;
+    let Some(grid) = grid else {
+        return Ok(());
+    };
+    replica
+        .block_on_query(persist_list_metadata_async(
+            replica.inner(),
+            CommitListMetadata {
+                global_vector_index: Some(grid),
+                ..CommitListMetadata::empty()
+            },
+        ))
+        .map_err(internal)
+}
+
 fn replica_options(table: &Supertable, name: &str) -> Result<SupertableOptions, QueryError> {
     // One path segment, so `attached_replicas` names it back as given.
     if name.is_empty() || name.contains('/') {
@@ -493,6 +544,8 @@ fn replica_options(table: &Supertable, name: &str) -> Result<SupertableOptions, 
         .or(options.term_index_scratch_root);
     options.disk_cache = None;
     options.metadata_disk_cache = None;
+    // A companion is written through the table, never through a replica.
+    options.companions = Vec::new();
     options.term_index_replica = true;
     options.read_consistency = Consistency::Strong;
     Ok(options)

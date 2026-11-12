@@ -291,15 +291,6 @@ pub fn begin_import(
 ) -> Result<ImportState, InfinoError> {
     check_id("import", import)?;
     let storage = storage_of(table)?;
-    let snapshot = table.inner().manifest.load();
-    if !snapshot.vector_configs().is_empty()
-        || !snapshot.companions().is_empty()
-        || snapshot.slow_vector_state_blob().is_some()
-    {
-        return Err(InfinoError::Unsupported(
-            "an import can't fill a table with vector columns or companion tables".into(),
-        ));
-    }
     if read_record(table, import)?.0.state == ImportState::Unknown
         && open_imports(table)?.len() >= MAX_OPEN_IMPORTS
     {
@@ -500,6 +491,7 @@ impl ImportReplica {
                 self.import
             )));
         }
+        merge::share_vector_grid(&self.owner, &self.table, batch).map_err(backend)?;
         // Keyed by import, so imports reusing a batch id never meet.
         let appended = merge::append_batch(&self.table, batch, &format!("{}/{id}", self.import))?;
         if self.check_sealed()? {
@@ -1354,5 +1346,364 @@ mod tests {
         graft_import(&t, "l1").expect("grafts go on");
         r.seal().expect("seal");
         assert_eq!(finish_import(&t, "l1", Some(10)).expect("finish").rows, 10);
+    }
+
+    const DIM: usize = 16;
+    const CLUSTERS: usize = 16;
+    const PER_CLUSTER: usize = 100;
+    const TOP_K: usize = 10;
+
+    fn kind_schema(vector: bool) -> SchemaRef {
+        let mut fields = vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new("n", DataType::Int64, false),
+        ];
+        if vector {
+            let item = Arc::new(Field::new("item", DataType::Float32, true));
+            fields.push(Field::new(
+                "emb",
+                DataType::FixedSizeList(item, DIM as i32),
+                false,
+            ));
+        }
+        Arc::new(Schema::new(fields))
+    }
+
+    /// A table of one kind: with or without a full-text column, with or without a vector column.
+    fn kind_table(fts: bool, vector: bool) -> (tempfile::TempDir, Supertable) {
+        use crate::superfile::vector::{distance::Metric, rerank_codec::RerankCodec};
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("local fs"));
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(2)
+                .build()
+                .expect("pool"),
+        );
+        let fts_columns = if fts {
+            vec![FtsConfig::new("title")]
+        } else {
+            vec![]
+        };
+        let vector_columns = if vector {
+            vec![crate::superfile::builder::VectorConfig {
+                column: "emb".into(),
+                dim: DIM,
+                rot_seed: 7,
+                metric: Metric::L2Sq,
+                rerank_codec: RerankCodec::Fp32,
+                provided_centroids: None,
+            }]
+        } else {
+            vec![]
+        };
+        let options = SupertableOptions::new(kind_schema(vector), fts_columns, vector_columns)
+            .expect("options")
+            .with_writer_pool(pool)
+            .with_vector_cell_counts(CLUSTERS, CLUSTERS)
+            .with_read_consistency(crate::Consistency::Strong)
+            .with_storage(storage);
+        (dir, Supertable::create(options).expect("create"))
+    }
+
+    /// Row `n`'s vector: its cluster's corner of the cube, scaled, plus a small offset of its own.
+    fn row_vector(n: usize) -> Vec<f32> {
+        let cluster = n / PER_CLUSTER;
+        let mut rng = crate::test_helpers::xorshift(n as u64 + 1);
+        (0..DIM)
+            .map(|d| {
+                let corner = if cluster >> (d % 4) & 1 == 1 {
+                    10.0
+                } else {
+                    -10.0
+                };
+                corner + (rng() % 1000) as f32 / 1000.0
+            })
+            .collect()
+    }
+
+    /// Quarter `part` of the rows, each titled with its cluster: every cluster's rows when not
+    /// `skewed`, a quarter of the clusters when it is.
+    fn kind_batch(vector: bool, skewed: bool, part: usize) -> RecordBatch {
+        use arrow_array::{FixedSizeListArray, Float32Array, Int64Array};
+        let rows: Vec<usize> = (0..CLUSTERS * PER_CLUSTER)
+            .filter(|n| match skewed {
+                true => n / PER_CLUSTER / (CLUSTERS / 4) == part,
+                false => n % 4 == part,
+            })
+            .collect();
+        let titles: Vec<String> = rows
+            .iter()
+            .map(|n| format!("shared c{:02}", n / PER_CLUSTER))
+            .collect();
+        let mut columns: Vec<ArrayRef> = vec![
+            Arc::new(LargeStringArray::from(
+                titles.iter().map(String::as_str).collect::<Vec<_>>(),
+            )),
+            Arc::new(Int64Array::from(
+                rows.iter().map(|&n| n as i64).collect::<Vec<_>>(),
+            )),
+        ];
+        if vector {
+            let flat: Vec<f32> = rows.iter().flat_map(|&n| row_vector(n)).collect();
+            let item = Arc::new(Field::new("item", DataType::Float32, true));
+            columns.push(Arc::new(FixedSizeListArray::new(
+                item,
+                DIM as i32,
+                Arc::new(Float32Array::from(flat)),
+                None,
+            )));
+        }
+        RecordBatch::try_new(kind_schema(vector), columns).expect("batch")
+    }
+
+    fn ns(batches: &[RecordBatch]) -> Vec<i64> {
+        use arrow_array::{Array, Int64Array};
+        batches
+            .iter()
+            .flat_map(|b| {
+                let col = b.column(b.schema().index_of("n").expect("n"));
+                let col = col.as_any().downcast_ref::<Int64Array>().expect("int64");
+                col.values().to_vec()
+            })
+            .collect()
+    }
+
+    fn sql_count(t: &Supertable) -> i64 {
+        use arrow_array::{Array, Int64Array};
+        let out = t
+            .reader()
+            .expect("reader")
+            .query_sql("SELECT COUNT(*) FROM supertable")
+            .expect("count");
+        out[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int64")
+            .value(0)
+    }
+
+    /// The share of the true nearest rows, over a query at every cluster, that vector search returns.
+    fn recall(t: &Supertable) -> f64 {
+        use crate::superfile::reader::VectorSearchOptions;
+        let total = CLUSTERS * PER_CLUSTER;
+        let mut found = 0;
+        for cluster in 0..CLUSTERS {
+            let q = row_vector(cluster * PER_CLUSTER);
+            let mut by_distance: Vec<(f32, i64)> = (0..total)
+                .map(|n| {
+                    let v = row_vector(n);
+                    let d: f32 = q.iter().zip(&v).map(|(a, b)| (a - b) * (a - b)).sum();
+                    (d, n as i64)
+                })
+                .collect();
+            by_distance.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
+            let expected: std::collections::HashSet<i64> =
+                by_distance[..TOP_K].iter().map(|(_, n)| *n).collect();
+            let got = ns(&t
+                .vector_search(
+                    "emb",
+                    &q,
+                    TOP_K,
+                    VectorSearchOptions::new(),
+                    None,
+                    Some(&["n"]),
+                )
+                .expect("vector search"));
+            found += got.iter().filter(|n| expected.contains(n)).count();
+        }
+        found as f64 / (CLUSTERS * TOP_K) as f64
+    }
+
+    /// The four batches committed one after another by the table's own writer.
+    fn appended(fts: bool, vector: bool, skewed: bool) -> (tempfile::TempDir, Supertable) {
+        let (dir, t) = kind_table(fts, vector);
+        for part in 0..4 {
+            let mut w = t.writer().expect("writer");
+            w.append(&kind_batch(vector, skewed, part)).expect("append");
+            w.commit().expect("commit");
+        }
+        (dir, t)
+    }
+
+    /// Two replicas import a table of one kind, each from an empty start and each holding half
+    /// the rows; every query the kind supports then answers over all rows, before and after
+    /// the optimize that follows an import, and vector search finds what it finds in a table
+    /// that appended the same batches itself.
+    fn import_then_query(fts: bool, vector: bool, skewed: bool) {
+        use crate::superfile::fts::reader::{Bm25SearchOptions, BoolMode};
+        let (_dir, t) = kind_table(fts, vector);
+        begin_import(&t, "i", None).expect("begin");
+        let (a, b) = (
+            open_import_replica(&t, "i", "n1").expect("a"),
+            open_import_replica(&t, "i", "n2").expect("b"),
+        );
+        a.append_batch(&kind_batch(vector, skewed, 0), "p0")
+            .expect("append");
+        b.append_batch(&kind_batch(vector, skewed, 1), "p1")
+            .expect("append");
+        a.append_batch(&kind_batch(vector, skewed, 2), "p2")
+            .expect("append");
+        b.append_batch(&kind_batch(vector, skewed, 3), "p3")
+            .expect("append");
+        let (_control_dir, control) = appended(fts, vector, skewed);
+        graft_import(&t, "i").expect("graft");
+        a.seal().expect("seal");
+        b.seal().expect("seal");
+        let total = (CLUSTERS * PER_CLUSTER) as u64;
+        finish_import(&t, "i", Some(total)).expect("finish");
+
+        for round in ["grafted", "optimized"] {
+            assert_eq!(sql_count(&t), total as i64, "{round}: sql count");
+            if fts {
+                let reader = t.reader().expect("reader");
+                assert_eq!(
+                    reader
+                        .count("title", "shared", BoolMode::Or)
+                        .expect("count"),
+                    total,
+                    "{round}: every row matches the shared term"
+                );
+                let top = ns(&t
+                    .bm25_search(
+                        "title",
+                        "c11",
+                        TOP_K,
+                        Bm25SearchOptions::default(),
+                        Some(&["n"]),
+                    )
+                    .expect("bm25"));
+                assert_eq!(top.len(), TOP_K, "{round}: bm25 hits");
+                assert!(
+                    top.iter().all(|n| *n as usize / PER_CLUSTER == 11),
+                    "{round}: bm25 hits are cluster 11's rows: {top:?}"
+                );
+            }
+            if vector {
+                let (got, own) = (recall(&t), recall(&control));
+                eprintln!("{round} skewed={skewed}: recall imported {got}, appended {own}");
+                assert!(
+                    got >= own - 0.01,
+                    "{round}: vector recall {got}, appended {own}"
+                );
+                assert!(skewed || got >= 0.99, "{round}: vector recall {got}");
+            }
+            if fts && vector {
+                let top = ns(&t
+                    .hybrid_search(
+                        "title",
+                        "c05",
+                        BoolMode::Or,
+                        "emb",
+                        &row_vector(5 * PER_CLUSTER),
+                        crate::superfile::reader::VectorSearchOptions::new(),
+                        TOP_K,
+                        Some(&["n"]),
+                    )
+                    .expect("hybrid"));
+                assert_eq!(top.len(), TOP_K, "{round}: hybrid hits");
+                assert!(
+                    top.iter().all(|n| *n as usize / PER_CLUSTER == 5),
+                    "{round}: hybrid hits are cluster 5's rows: {top:?}"
+                );
+            }
+            if round == "grafted" {
+                t.optimize(&crate::OptimizeOptions::default())
+                    .expect("optimize");
+                control
+                    .optimize(&crate::OptimizeOptions::default())
+                    .expect("optimize");
+                if vector {
+                    let hidden = t.reader().expect("reader").vector_index_table().cloned();
+                    let drained = hidden
+                        .expect("hidden index")
+                        .reader()
+                        .expect("reader")
+                        .manifest()
+                        .n_docs_total();
+                    assert!(
+                        drained >= total,
+                        "optimize drains every grafted row: {drained}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_import_fills_a_pure_sql_table() {
+        import_then_query(false, false, false);
+    }
+
+    #[test]
+    fn an_import_fills_a_full_text_table() {
+        import_then_query(true, false, false);
+    }
+
+    #[test]
+    fn an_import_fills_a_vector_table() {
+        import_then_query(false, true, false);
+    }
+
+    #[test]
+    fn an_import_fills_a_vector_and_full_text_table() {
+        import_then_query(true, true, false);
+    }
+
+    /// The grid comes from the first batch alone, here a quarter of the clusters: recall is
+    /// then whatever the same batches give a table that appends them itself.
+    #[test]
+    fn an_import_of_skewed_batches_searches_like_an_appended_table() {
+        import_then_query(true, true, true);
+    }
+
+    /// A replica filled without the import's grid step trains a grid of its own, and the graft
+    /// says so instead of listing superfiles the table would search by the wrong cells.
+    #[test]
+    fn a_replica_on_its_own_grid_is_refused() {
+        let (_dir, t) = kind_table(false, true);
+        let mut w = t.writer().expect("writer");
+        w.append(&kind_batch(true, true, 0)).expect("append");
+        w.commit().expect("commit");
+        let replica = merge::open_replica(&t, "raw").expect("replica");
+        merge::append_batch(&replica, &kind_batch(true, true, 1), "b").expect("append");
+        let error =
+            merge::graft(&t, &replica.reader().expect("reader"), true).expect_err("another grid");
+        assert!(error.to_string().contains("cell grid"), "{error}");
+    }
+
+    /// A table with a companion imports; the companion and its rows stay as they were.
+    #[test]
+    fn an_import_leaves_a_companion_table_alone() {
+        use crate::supertable::companion::CompanionSpec;
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("local fs"));
+        let options = SupertableOptions::new(schema(), vec![FtsConfig::new("title")], vec![])
+            .expect("options")
+            .with_read_consistency(crate::Consistency::Strong)
+            .with_companions(vec![CompanionSpec {
+                purpose: "sync".into(),
+                schema: schema(),
+                fts_columns: vec![],
+                vector_columns: vec![],
+            }])
+            .with_storage(storage);
+        let t = Supertable::create(options).expect("create");
+        let companion = t.companion("sync").expect("open").expect("declared");
+        let mut w = companion.writer().expect("writer");
+        w.append(&batch(3)).expect("append");
+        w.commit().expect("commit");
+
+        begin_import(&t, "i", None).expect("begin");
+        let a = open_import_replica(&t, "i", "n1").expect("a");
+        assert!(a.append_batch(&batch(10), "b1").expect("append"));
+        a.seal().expect("seal");
+        finish_import(&t, "i", Some(10)).expect("finish");
+        assert_eq!(rows(&t), 10);
+        let companion = t.companion("sync").expect("open").expect("still declared");
+        assert_eq!(rows(&companion), 3);
     }
 }
