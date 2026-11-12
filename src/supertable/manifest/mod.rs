@@ -100,8 +100,9 @@ use crate::{
         fts::reader::ColumnLengthStats,
         vector::{
             distance::{
-                COSINE_DISTANCE_BASE, L2_CROSS_TERM_COEFF, Metric, all_centroid_scores_transposed,
-                distance, dot, insert_ranked, nearest_k_centroids_transposed,
+                CENTROID_ASSIGN_ROWS_PER_TASK, COSINE_DISTANCE_BASE, L2_CROSS_TERM_COEFF, Metric,
+                all_centroid_scores_transposed, distance, dot, insert_ranked,
+                nearest_k_centroids_transposed, nearest_k_centroids_transposed_rows,
                 transpose_centroids_cluster_major,
             },
             layout::VectorLayout,
@@ -6113,8 +6114,9 @@ impl ClusterCentroids {
         .unwrap_or(0)
     }
 
-    /// Assign each row in `vectors` to its nearest cell. Parallel over rows;
-    /// each assignment uses [`Self::nearest_cell`].
+    /// Assign each row in `vectors` to its nearest cell. Parallel over row
+    /// chunks, each scored as a tile of rows; every assignment matches
+    /// [`Self::nearest_cell`] on that row.
     pub fn assign_rows(&self, metric: Metric, vectors: &[f32], assignments: &mut [u32]) {
         let dim = self.dim as usize;
         assert_eq!(vectors.len() % dim, 0, "assign_rows: vectors len mismatch");
@@ -6128,10 +6130,23 @@ impl ClusterCentroids {
             return;
         }
         assignments
-            .par_iter_mut()
+            .par_chunks_mut(CENTROID_ASSIGN_ROWS_PER_TASK)
             .enumerate()
-            .for_each(|(d, slot)| {
-                *slot = self.nearest_cell(metric, &vectors[d * dim..(d + 1) * dim]);
+            .for_each(|(task, slots)| {
+                let start = task * CENTROID_ASSIGN_ROWS_PER_TASK;
+                let rows = &vectors[start * dim..(start + slots.len()) * dim];
+                let tops = nearest_k_centroids_transposed_rows(
+                    metric,
+                    rows,
+                    self.transposed(),
+                    self.n_cent as usize,
+                    dim,
+                    Some(&self.counts),
+                    1,
+                );
+                for (slot, top) in slots.iter_mut().zip(tops) {
+                    *slot = top.first().map(|&(cell, _)| cell).unwrap_or(0);
+                }
             });
     }
 }
