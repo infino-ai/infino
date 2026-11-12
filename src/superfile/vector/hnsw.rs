@@ -1204,7 +1204,12 @@ impl Hnsw {
         if total <= prior {
             return self;
         }
-        let prior_entry = self.entry;
+        // Every prior node is a hole only when the entry is: the first new
+        // node then seeds the entry the way node 0 seeds a fresh build, and
+        // inserting starts after it.
+        let all_holes = self.is_hole(self.entry);
+        let prior_entry = if all_holes { prior as u32 } else { self.entry };
+        let first_insert = if all_holes { prior + 1 } else { prior };
         let ml = 1.0 / (params.m.max(2) as f64).ln();
 
         // Prior levels kept; new nodes get their seeded levels.
@@ -1237,13 +1242,15 @@ impl Hnsw {
         };
 
         if parallel {
-            (prior as u32..total as u32).into_par_iter().for_each_init(
-                || VisitedSet::new(total),
-                |visited, node| builder.insert(scorer, node, visited),
-            );
+            (first_insert as u32..total as u32)
+                .into_par_iter()
+                .for_each_init(
+                    || VisitedSet::new(total),
+                    |visited, node| builder.insert(scorer, node, visited),
+                );
         } else {
             let mut visited = VisitedSet::new(total);
-            for node in prior as u32..total as u32 {
+            for node in first_insert as u32..total as u32 {
                 builder.insert(scorer, node, &mut visited);
             }
         }
@@ -1297,48 +1304,16 @@ impl Hnsw {
         let survivors = next as usize;
         assert!(scorer.len() >= survivors, "scorer must hold every survivor");
 
+        let dropped = |node: u32| !keep[node as usize];
         let mut neighbors = Vec::with_capacity(survivors);
         let mut node_level = Vec::with_capacity(survivors);
         for old in (0..self.len).filter(|&old| keep[old]) {
-            let lists = &self.neighbors[old];
-            let mut kept_lists = Vec::with_capacity(lists.len());
-            for (level, list) in lists.iter().enumerate() {
-                // Live neighbors stay as they are; only the slots of dropped
-                // ones are refilled, from those dropped nodes' own neighbors.
-                let mut kept: Vec<u32> = list
-                    .iter()
-                    .filter(|&&nb| keep[nb as usize])
-                    .map(|&nb| remap[nb as usize])
-                    .collect();
-                let vacated = list.len() - kept.len();
-                if vacated > 0 {
-                    let mut through: Vec<u32> = list
-                        .iter()
-                        .filter(|&&nb| !keep[nb as usize])
-                        .filter_map(|&nb| self.neighbors[nb as usize].get(level))
-                        .flatten()
-                        .filter(|&&x| x as usize != old && keep[x as usize])
-                        .map(|&x| remap[x as usize])
-                        .filter(|x| !kept.contains(x))
-                        .collect();
-                    through.sort_unstable();
-                    through.dedup();
-                    let prep = scorer.prepare_node(remap[old]);
-                    let mut scored: Vec<Scored> = through
-                        .into_iter()
-                        .map(|node| Scored {
-                            node,
-                            dist: scorer.score(&prep, node),
-                        })
-                        .collect();
-                    scored.sort_unstable();
-                    let cap = if level == 0 { self.m0 } else { self.m };
-                    let slots = vacated.min(cap.saturating_sub(kept.len()));
-                    kept.extend(fill_vacated(scorer, &kept, scored, slots));
-                }
-                kept_lists.push(kept);
-            }
-            neighbors.push(kept_lists);
+            neighbors.push(self.repaired_lists(
+                old as u32,
+                dropped,
+                |node| remap[node as usize],
+                scorer,
+            ));
             node_level.push(self.node_level[old]);
         }
 
@@ -1346,14 +1321,10 @@ impl Hnsw {
         // (lowest id on a tie) takes over, so descent still starts at the top.
         let entry = if survivors == 0 {
             0
-        } else if keep[self.entry as usize] {
+        } else if keep[self.entry as usize] && !self.is_hole(self.entry) {
             remap[self.entry as usize]
         } else {
-            let top = node_level.iter().copied().max().unwrap_or(0);
-            node_level
-                .iter()
-                .position(|&level| level == top)
-                .unwrap_or(0) as u32
+            tallest_live(&neighbors, &node_level).unwrap_or(0)
         };
         Hnsw {
             neighbors,
@@ -1366,6 +1337,128 @@ impl Hnsw {
             #[cfg(feature = "graph-index")]
             compact_base: false,
         }
+    }
+
+    /// Remove the nodes in `removed` without renumbering the rest: each one
+    /// becomes a hole, a slot with no neighbor lists that no list names, so
+    /// no search reaches it and every other node keeps its id. The live nodes
+    /// that linked to a removed node have those slots refilled the way
+    /// [`remove_nodes`](Self::remove_nodes) refills them. If the entry point
+    /// is removed, the tallest live node (lowest id on a tie) takes over.
+    ///
+    /// Ids already holes, and repeated ids, are ignored. `scorer` is indexed
+    /// by the graph's own ids; a hole's row is never read. Holes are filled
+    /// only by building a new graph; [`extend`](Self::extend) appends after
+    /// them.
+    pub(crate) fn unlink_nodes<S: NodeScorer>(mut self, removed: &[u32], scorer: &S) -> Hnsw {
+        let mut gone = vec![false; self.len];
+        let mut any = false;
+        for &node in removed {
+            assert!(
+                (node as usize) < self.len,
+                "removed node {node} is past the graph"
+            );
+            if !self.is_hole(node) {
+                gone[node as usize] = true;
+                any = true;
+            }
+        }
+        if !any {
+            return self;
+        }
+        let dropped = |node: u32| gone[node as usize];
+        let repaired: Vec<(usize, Vec<Vec<u32>>)> = (0..self.len)
+            .filter(|&node| !gone[node] && !self.is_hole(node as u32))
+            .filter(|&node| {
+                self.neighbors[node]
+                    .iter()
+                    .flatten()
+                    .any(|&nb| gone[nb as usize])
+            })
+            .map(|node| {
+                let lists = self.repaired_lists(node as u32, dropped, |id| id, scorer);
+                (node, lists)
+            })
+            .collect();
+        for (node, lists) in repaired {
+            self.neighbors[node] = lists;
+        }
+        for (node, _) in gone.iter().enumerate().filter(|(_, g)| **g) {
+            self.neighbors[node] = Vec::new();
+            self.node_level[node] = 0;
+        }
+        if gone[self.entry as usize] {
+            self.entry = tallest_live(&self.neighbors, &self.node_level).unwrap_or(0);
+        }
+        self
+    }
+
+    /// Whether `node` is a hole left by [`unlink_nodes`](Self::unlink_nodes).
+    /// A live node always has at least its level-0 list, even when empty.
+    #[inline]
+    pub(crate) fn is_hole(&self, node: u32) -> bool {
+        self.neighbors[node as usize].is_empty()
+    }
+
+    /// Live nodes: every slot that is not a hole.
+    pub(crate) fn live_len(&self) -> usize {
+        self.neighbors
+            .iter()
+            .filter(|lists| !lists.is_empty())
+            .count()
+    }
+
+    /// `node`'s neighbor lists with the neighbors `dropped` says are gone
+    /// taken out and their slots refilled from those neighbors' own lists at
+    /// the same level, renumbered through `map`. Live neighbors stay in
+    /// place. The refill candidates are scored from `map(node)` with
+    /// `scorer`, which is indexed by mapped ids, and picked by
+    /// [`fill_vacated`]; a list comes back shorter only when the dropped
+    /// neighbors have too few live neighbors to fill it.
+    fn repaired_lists<S: NodeScorer>(
+        &self,
+        node: u32,
+        dropped: impl Fn(u32) -> bool,
+        map: impl Fn(u32) -> u32,
+        scorer: &S,
+    ) -> Vec<Vec<u32>> {
+        let lists = &self.neighbors[node as usize];
+        let mut out = Vec::with_capacity(lists.len());
+        for (level, list) in lists.iter().enumerate() {
+            let mut kept: Vec<u32> = list
+                .iter()
+                .filter(|&&nb| !dropped(nb))
+                .map(|&nb| map(nb))
+                .collect();
+            let vacated = list.len() - kept.len();
+            if vacated > 0 {
+                let mut through: Vec<u32> = list
+                    .iter()
+                    .filter(|&&nb| dropped(nb))
+                    .filter_map(|&nb| self.neighbors[nb as usize].get(level))
+                    .flatten()
+                    .filter(|&&x| x != node && !dropped(x))
+                    .map(|&x| map(x))
+                    .filter(|x| !kept.contains(x))
+                    .collect();
+                through.sort_unstable();
+                through.dedup();
+                let prep = scorer.prepare_node(map(node));
+                let mut scored: Vec<Scored> = through
+                    .into_iter()
+                    .map(|nb| Scored {
+                        node: nb,
+                        dist: scorer.score(&prep, nb),
+                    })
+                    .collect();
+                scored.sort_unstable();
+                let cap = if level == 0 { self.m0 } else { self.m };
+                let slots = vacated.min(cap.saturating_sub(kept.len()));
+                kept.extend(fill_vacated(scorer, &kept, scored, slots));
+            }
+            out.push(kept);
+        }
+        out
     }
 
     /// Walk greedily downhill at `level` from `entry`, hopping to the
@@ -1493,7 +1586,8 @@ impl Hnsw {
         ef: usize,
         visited: &mut VisitedSet,
     ) -> Vec<(u32, f32)> {
-        if self.len == 0 || k == 0 {
+        // The entry is a hole only when every node is one.
+        if self.len == 0 || k == 0 || self.is_hole(self.entry) {
             return Vec::new();
         }
         let prepared = scorer.prepare(query);
@@ -1554,7 +1648,9 @@ impl Hnsw {
     /// Node `node`'s base-layer neighbours.
     #[cfg(feature = "graph-index")]
     pub(crate) fn base_neighbors(&self, node: u32) -> &[u32] {
-        &self.neighbors[node as usize][0]
+        self.neighbors[node as usize]
+            .first()
+            .map_or(&[][..], Vec::as_slice)
     }
 
     /// Heap the decoded adjacency occupies, for a residency log line.
@@ -2241,7 +2337,8 @@ impl Hnsw {
     fn write_strided_base(&self, out: &mut Vec<u8>) {
         let m0 = self.m0.max(1);
         for levels in &self.neighbors {
-            let l0 = &levels[0];
+            // A hole has no lists and is written as a node with no edges.
+            let l0 = levels.first().map_or(&[][..], Vec::as_slice);
             for slot in 0..m0 {
                 let id = l0.get(slot).copied().unwrap_or(ADJ_SENTINEL);
                 out.extend_from_slice(&id.to_le_bytes());
@@ -2255,11 +2352,11 @@ impl Hnsw {
         let mut offset = 0u64;
         out.extend_from_slice(&offset.to_le_bytes());
         for levels in &self.neighbors {
-            offset += levels[0].len() as u64;
+            offset += levels.first().map_or(0, Vec::len) as u64;
             out.extend_from_slice(&offset.to_le_bytes());
         }
-        for levels in &self.neighbors {
-            for &id in &levels[0] {
+        for levels in self.neighbors.iter().filter_map(|levels| levels.first()) {
+            for &id in levels {
                 out.extend_from_slice(&id.to_le_bytes());
             }
         }
@@ -3763,6 +3860,22 @@ fn select_neighbors_heuristic<S: NodeScorer>(
     selected
 }
 
+/// The tallest live node (lowest id on a tie), the entry point a graph falls
+/// back to when its own is removed; `None` when every slot is a hole. A hole
+/// is a node with no neighbor lists.
+fn tallest_live(neighbors: &[Vec<Vec<u32>>], node_level: &[u32]) -> Option<u32> {
+    let mut best: Option<(u32, u32)> = None;
+    for (node, (lists, &level)) in neighbors.iter().zip(node_level).enumerate() {
+        if lists.is_empty() {
+            continue;
+        }
+        if best.is_none_or(|(_, top)| level > top) {
+            best = Some((node as u32, level));
+        }
+    }
+    best.map(|(node, _)| node)
+}
+
 /// Pick up to `slots` of `candidates` (sorted nearest-first) to join `kept`.
 /// The diversity rule of [`select_neighbors_heuristic`] picks first, judged
 /// against `kept` too, so a refilled list spreads like a built one; any slots
@@ -4553,6 +4666,265 @@ mod tests {
                 "round {round}: updated {updated_recall:.3}, rebuild {rebuilt_recall:.3}"
             );
         }
+    }
+
+    /// Exhaustive nearest-`k` live node ids: brute force that skips holes.
+    fn brute_force_live<S: NodeScorer>(
+        graph: &Hnsw,
+        scorer: &S,
+        query: &[f32],
+        k: usize,
+    ) -> Vec<u32> {
+        let prepared = scorer.prepare(query);
+        let mut all: Vec<Scored> = (0..graph.len() as u32)
+            .filter(|&n| !graph.is_hole(n))
+            .map(|n| Scored {
+                node: n,
+                dist: scorer.score(&prepared, n),
+            })
+            .collect();
+        all.sort_unstable();
+        all.into_iter().take(k).map(|s| s.node).collect()
+    }
+
+    /// Recall@`CHURN_K` of `graph` against brute force over its live nodes.
+    fn live_recall<S: NodeScorer>(graph: &Hnsw, scorer: &S, queries: &[Vec<f32>]) -> f64 {
+        let mut hit = 0usize;
+        for q in queries {
+            let truth: HashSet<u32> = brute_force_live(graph, scorer, q, CHURN_K)
+                .into_iter()
+                .collect();
+            hit += graph
+                .search(scorer, q, CHURN_K, CHURN_EF)
+                .into_iter()
+                .filter(|(node, _)| truth.contains(node))
+                .count();
+        }
+        hit as f64 / (queries.len() * CHURN_K) as f64
+    }
+
+    /// Asserts the hole invariants: no list names a hole, the entry is live
+    /// unless every node is a hole, and every live node is reachable from the
+    /// entry over layer 0.
+    fn assert_holes_unreachable(graph: &Hnsw) {
+        for (node, lists) in graph.neighbors.iter().enumerate() {
+            for &nb in lists.iter().flatten() {
+                assert!(!graph.is_hole(nb), "node {node} links to hole {nb}");
+            }
+        }
+        if graph.live_len() == 0 {
+            return;
+        }
+        assert!(!graph.is_hole(graph.entry), "entry is a hole");
+        let mut seen = vec![false; graph.len()];
+        let mut stack = vec![graph.entry];
+        seen[graph.entry as usize] = true;
+        while let Some(node) = stack.pop() {
+            for &nb in &graph.neighbors[node as usize][0] {
+                if !seen[nb as usize] {
+                    seen[nb as usize] = true;
+                    stack.push(nb);
+                }
+            }
+        }
+        let unreached = (0..graph.len() as u32)
+            .filter(|&n| !graph.is_hole(n) && !seen[n as usize])
+            .count();
+        assert_eq!(
+            unreached, 0,
+            "{unreached} live nodes unreachable from the entry"
+        );
+    }
+
+    #[test]
+    fn unlinking_keeps_ids_and_recall_close_to_a_rebuild() {
+        let n = 2000usize;
+        let vectors = random_unit_vectors(n, CHURN_DIM, 0xDE1E7E);
+        let scorer = Sq16Scorer::from_unit_vectors(&vectors, CHURN_DIM);
+        let graph = Hnsw::build_serial(&scorer, HnswParams::default());
+        let entry = graph.entry;
+
+        // Drop every fifth node, the entry point among them.
+        let mut removed: Vec<u32> = (0..n as u32).filter(|i| i % 5 == 0).collect();
+        removed.push(entry);
+        let unlinked = graph.unlink_nodes(&removed, &scorer);
+
+        assert_eq!(unlinked.len(), n, "slots are kept");
+        let holes: HashSet<u32> = removed.iter().copied().collect();
+        assert_eq!(unlinked.live_len(), n - holes.len());
+        for &hole in &holes {
+            assert!(unlinked.is_hole(hole));
+        }
+        assert_holes_unreachable(&unlinked);
+
+        // Recall over the live nodes stays close to a rebuild of them.
+        let live: Vec<u32> = (0..n as u32).filter(|i| !holes.contains(i)).collect();
+        let live_vectors: Vec<Vec<f32>> =
+            live.iter().map(|&i| vectors[i as usize].clone()).collect();
+        let live_scorer = Sq16Scorer::from_unit_vectors(&live_vectors, CHURN_DIM);
+        let rebuilt = Hnsw::build_serial(&live_scorer, HnswParams::default());
+        let queries = random_unit_vectors(60, CHURN_DIM, 0xC0FFEE3);
+        let unlinked_recall = live_recall(&unlinked, &scorer, &queries);
+        let rebuilt_recall = recall_against_truth(&rebuilt, &live_scorer, &queries);
+        assert!(
+            unlinked_recall >= rebuilt_recall - CHURN_RECALL_SLACK,
+            "after unlink {unlinked_recall:.3}, rebuild {rebuilt_recall:.3}"
+        );
+        // A live node is found by its own vector under its original id.
+        for &node in live.iter().step_by(37) {
+            let found = unlinked.search(&scorer, &vectors[node as usize], 1, CHURN_EF);
+            assert_eq!(found[0].0, node, "live node {node} lost its id");
+        }
+        // No search returns a hole.
+        for q in &queries {
+            for (node, _) in unlinked.search(&scorer, q, CHURN_K, CHURN_EF) {
+                assert!(!unlinked.is_hole(node), "search returned hole {node}");
+            }
+        }
+    }
+
+    #[test]
+    fn unlinking_holes_repeats_or_nothing_changes_nothing() {
+        let n = 600usize;
+        let vectors = random_unit_vectors(n, CHURN_DIM, 0xA11CE);
+        let scorer = Sq16Scorer::from_unit_vectors(&vectors, CHURN_DIM);
+        let graph = Hnsw::build_serial(&scorer, HnswParams::default());
+        let before = graph.to_bytes();
+        let graph = graph.unlink_nodes(&[], &scorer);
+        assert_eq!(graph.to_bytes(), before, "an empty unlink is a no-op");
+
+        let once = graph.unlink_nodes(&[7, 7, 19], &scorer);
+        let once_bytes = once.to_bytes();
+        let again = once.unlink_nodes(&[7, 19], &scorer);
+        assert_eq!(
+            again.to_bytes(),
+            once_bytes,
+            "unlinking holes again is a no-op"
+        );
+        assert_eq!(again.live_len(), n - 2);
+    }
+
+    #[test]
+    fn unlinking_is_deterministic() {
+        let n = 1200usize;
+        let vectors = random_unit_vectors(n, CHURN_DIM, 0xB0B);
+        let scorer = Sq16Scorer::from_unit_vectors(&vectors, CHURN_DIM);
+        let removed: Vec<u32> = (0..n as u32).filter(|i| i % 3 == 1).collect();
+        let run = || {
+            Hnsw::build_serial(&scorer, HnswParams::default())
+                .unlink_nodes(&removed, &scorer)
+                .to_bytes()
+        };
+        assert_eq!(run(), run());
+    }
+
+    #[test]
+    fn unlinking_every_node_then_appending_serves_only_new_nodes() {
+        let (n0, added) = (300usize, 200usize);
+        let vectors = random_unit_vectors(n0 + added, CHURN_DIM, 0xE4E4);
+        let prior = Sq16Scorer::from_unit_vectors(&vectors[..n0], CHURN_DIM);
+        let all: Vec<u32> = (0..n0 as u32).collect();
+        let empty = Hnsw::build_serial(&prior, HnswParams::default()).unlink_nodes(&all, &prior);
+        assert_eq!(empty.live_len(), 0);
+        assert!(
+            empty
+                .search(&prior, &vectors[0], CHURN_K, CHURN_EF)
+                .is_empty(),
+            "a graph of holes returns nothing"
+        );
+
+        let scorer = Sq16Scorer::from_unit_vectors(&vectors, CHURN_DIM);
+        let grown = empty.extend_serial(&scorer, HnswParams::default());
+        assert_eq!(grown.len(), n0 + added);
+        assert_eq!(grown.live_len(), added);
+        assert_holes_unreachable(&grown);
+        for node in (n0..n0 + added).step_by(17) {
+            let found = grown.search(&scorer, &vectors[node], 1, CHURN_EF);
+            assert_eq!(found[0].0, node as u32, "appended node {node} unreachable");
+        }
+    }
+
+    #[test]
+    fn repeated_unlink_and_extend_tracks_a_rebuild() {
+        let (start, rounds, churn) = (1500usize, 8usize, 300usize);
+        let pool = random_unit_vectors(start + rounds * churn, CHURN_DIM, 0xC4A3);
+        // `slots` holds every vector ever given a node id, holes included, so
+        // the scorer stays indexed by the graph's own ids.
+        let mut slots: Vec<Vec<f32>> = pool[..start].to_vec();
+        let mut graph = Hnsw::build_serial(
+            &Sq16Scorer::from_unit_vectors(&slots, CHURN_DIM),
+            HnswParams::default(),
+        );
+        let queries = random_unit_vectors(60, CHURN_DIM, 0xC0FFEE4);
+        for round in 0..rounds {
+            let scorer = Sq16Scorer::from_unit_vectors(&slots, CHURN_DIM);
+            let live: Vec<u32> = (0..graph.len() as u32)
+                .filter(|&n| !graph.is_hole(n))
+                .collect();
+            let removed: Vec<u32> = live
+                .iter()
+                .copied()
+                .filter(|n| (*n as usize + round).is_multiple_of(live.len() / churn))
+                .collect();
+            graph = graph.unlink_nodes(&removed, &scorer);
+            let fresh = start + round * churn;
+            slots.extend_from_slice(&pool[fresh..fresh + churn]);
+            let scorer = Sq16Scorer::from_unit_vectors(&slots, CHURN_DIM);
+            graph = graph.extend_serial(&scorer, HnswParams::default());
+            assert_eq!(graph.len(), slots.len());
+            assert_holes_unreachable(&graph);
+
+            let live_vectors: Vec<Vec<f32>> = (0..graph.len())
+                .filter(|&n| !graph.is_hole(n as u32))
+                .map(|n| slots[n].clone())
+                .collect();
+            let live_scorer = Sq16Scorer::from_unit_vectors(&live_vectors, CHURN_DIM);
+            let rebuilt = Hnsw::build_serial(&live_scorer, HnswParams::default());
+            let updated_recall = live_recall(&graph, &scorer, &queries);
+            let rebuilt_recall = recall_against_truth(&rebuilt, &live_scorer, &queries);
+            assert!(
+                updated_recall >= rebuilt_recall - CHURN_RECALL_SLACK,
+                "round {round}: updated {updated_recall:.3}, rebuild {rebuilt_recall:.3}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unlinked_graph_searches_the_same_after_a_round_trip() {
+        let n = 900usize;
+        let vectors = random_unit_vectors(n, CHURN_DIM, 0x7171);
+        let scorer = Sq16Scorer::from_unit_vectors(&vectors, CHURN_DIM);
+        let removed: Vec<u32> = (0..n as u32).filter(|i| i % 4 == 2).collect();
+        let graph =
+            Hnsw::build_serial(&scorer, HnswParams::default()).unlink_nodes(&removed, &scorer);
+        let decoded = Hnsw::from_bytes(&graph.to_bytes()).expect("decode");
+        let queries = random_unit_vectors(30, CHURN_DIM, 0x7272);
+        for q in &queries {
+            assert_eq!(
+                graph.search(&scorer, q, CHURN_K, CHURN_EF),
+                decoded.search(&scorer, q, CHURN_K, CHURN_EF)
+            );
+        }
+    }
+
+    #[test]
+    fn removing_nodes_from_an_unlinked_graph_drops_its_holes() {
+        let n = 800usize;
+        let vectors = random_unit_vectors(n, CHURN_DIM, 0x9A9A);
+        let scorer = Sq16Scorer::from_unit_vectors(&vectors, CHURN_DIM);
+        let removed: Vec<u32> = (0..n as u32).filter(|i| i % 6 == 0).collect();
+        let graph =
+            Hnsw::build_serial(&scorer, HnswParams::default()).unlink_nodes(&removed, &scorer);
+        let keep: Vec<bool> = (0..n as u32).map(|i| !graph.is_hole(i)).collect();
+        let survivors: Vec<Vec<f32>> = (0..n)
+            .filter(|&i| keep[i])
+            .map(|i| vectors[i].clone())
+            .collect();
+        let survivor_scorer = Sq16Scorer::from_unit_vectors(&survivors, CHURN_DIM);
+        let compacted = graph.remove_nodes(&keep, &survivor_scorer);
+        assert_eq!(compacted.len(), survivors.len());
+        assert_eq!(compacted.live_len(), survivors.len());
+        assert_holes_unreachable(&compacted);
     }
 
     /// A full `hnsw` bundle (graph + node→doc-id map + Sq16 plane)
