@@ -194,8 +194,6 @@ pub use dynamic::rows_to_batch;
 pub use error::InfinoError;
 /// JSON documents for `append_rows` / `update_rows`; import as `infino::serde_json`.
 pub use serde_json;
-/// A load several replicas write into one table at once (see [`Supertable::begin_load`]).
-pub use supertable::load::{LoadOutcome, LoadReplica, LoadState, ReplicaAccount};
 // `VectorSearchOptions` (probe width / rerank budget) is deliberately
 // NOT part of the public surface: serving is drain-calibrated, and
 // manual tuning is a test-and-bench-only instrument (recall sweeps,
@@ -212,6 +210,8 @@ pub use superfile::{
     },
     vector::{distance::Metric, rerank_codec::RerankCodec},
 };
+/// A load several replicas write into one table at once (see [`Supertable::begin_load`]).
+pub use supertable::load::{LoadOutcome, LoadReplica, LoadState, ReplicaAccount};
 pub use supertable::{
     Consistency, GcError, GcReport, MutationStats, OptimizeError, ReindexError,
     query::vector::VectorFilter,
