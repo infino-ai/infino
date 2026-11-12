@@ -2415,6 +2415,7 @@ fn finish_take(
 /// many, and how an error names them. The single-table function checks a
 /// call against it, and the catalog's table-first form checks against the
 /// same with the table in front, so the two never disagree about a count.
+/// The graph walks, which take the table first only, check against one too.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Arity {
     /// Fewest arguments.
@@ -2441,17 +2442,28 @@ impl Arity {
         }
     }
 
+    /// The refusal for a call of `name` that passed `got` arguments after
+    /// the `leading` ones, stated in the form the caller wrote: the leading
+    /// arguments named and counted. `leading` is empty for a column-first
+    /// call and `["table"]` for a table-first one.
+    pub(crate) fn expects(&self, name: &str, got: usize, leading: &[&str]) -> String {
+        let mut named = leading.to_vec();
+        named.push(self.arguments);
+        format!(
+            "{name} expects {} arguments ({}), got {}",
+            self.count(leading.len()),
+            named.join(", "),
+            got + leading.len()
+        )
+    }
+
     /// Refuses a column-first call of `name` with `got` arguments when that
     /// is the wrong count.
     pub(crate) fn check(&self, name: &str, got: usize) -> DfResult<()> {
         if self.takes(got) {
             return Ok(());
         }
-        Err(DataFusionError::Plan(format!(
-            "{name} expects {} arguments ({}), got {got}",
-            self.count(0),
-            self.arguments
-        )))
+        Err(DataFusionError::Plan(self.expects(name, got, &[])))
     }
 }
 

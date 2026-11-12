@@ -6452,10 +6452,11 @@ mod tests {
 
     /// A catalog search call with the wrong number of arguments is refused
     /// in the form it was written, the leading table counted, with the
-    /// table's indexed columns named. Left to the single-table function, a
-    /// `hybrid_search` that left out its vector column was told "expects 5
-    /// arguments (text_col, ...), got 4", which reads as if the table were
-    /// the mistake and names nothing to fix it with.
+    /// table's indexed columns of the kind the function takes named. Left to
+    /// the single-table function, a `hybrid_search` that left out its vector
+    /// column was told "expects 5 arguments (text_col, ...), got 4", which
+    /// reads as if the table were the mistake and names nothing to fix it
+    /// with.
     #[test]
     fn a_catalog_search_with_the_wrong_count_names_the_table_form_and_its_columns() {
         let conn = conn_with_vector_table();
@@ -6464,37 +6465,116 @@ mod tests {
             (
                 format!("SELECT * FROM hybrid_search('vecs', 'title', 'rust', '{v}', 3)"),
                 "hybrid_search expects 6 arguments (table, text_col, q_text, vec_col, q_vec, k), got 5",
+                "table \"vecs\" has full-text columns: title; vector columns: emb",
             ),
             (
                 "SELECT * FROM vector_search('vecs', 'emb', 3)".to_string(),
                 "vector_search expects 4 arguments (table, column, query_vector, k), got 3",
+                "table \"vecs\" has vector columns: emb",
             ),
             (
                 "SELECT * FROM bm25_search('vecs', 'title')".to_string(),
                 "bm25_search expects 4 or 5 arguments (table, column, query, k[, mode]), got 2",
+                "table \"vecs\" has full-text columns: title",
             ),
             (
                 "SELECT * FROM bm25_search_prefix('vecs', 'title', 'rus')".to_string(),
                 "bm25_search_prefix expects 4 arguments (table, column, prefix, k), got 3",
+                "table \"vecs\" has full-text columns: title",
             ),
             (
                 "SELECT * FROM token_match('vecs', 'title')".to_string(),
                 "token_match expects 3 or 4 arguments (table, column, query[, mode]), got 2",
+                "table \"vecs\" has full-text columns: title",
             ),
             (
                 "SELECT * FROM exact_match('vecs', 'title', 'rust', 'extra')".to_string(),
                 "exact_match expects 3 arguments (table, column, value), got 4",
+                "table \"vecs\" has full-text columns: title",
+            ),
+        ];
+        for (sql, want_count, want_columns) in cases {
+            let msg = conn
+                .query_sql(&sql)
+                .expect_err("a wrong argument count must be refused")
+                .to_string();
+            assert!(msg.contains(want_count), "{sql}: got {msg}");
+            assert!(
+                msg.ends_with(want_columns),
+                "{sql}: the refusal names only the indexed columns the function takes, got {msg}"
+            );
+        }
+    }
+
+    /// A table without the kind of index a function takes is told so: a
+    /// `vector_search` with the wrong count on a table holding only a
+    /// full-text index is refused with "vector columns: none", not with the
+    /// full-text column it could not have meant.
+    #[test]
+    fn a_wrong_count_on_a_table_without_the_index_names_none() {
+        let conn = connect("memory://").expect("connect");
+        conn.create_table("notes", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create notes")
+            .append(&build_title_batch(&["rust async"]))
+            .expect("append notes");
+        let cases = [
+            (
+                "SELECT * FROM vector_search('notes', 'title', 3)",
+                "table \"notes\" has vector columns: none",
+            ),
+            (
+                "SELECT * FROM bm25_search('notes', 'title')",
+                "table \"notes\" has full-text columns: title",
             ),
         ];
         for (sql, want) in cases {
             let msg = conn
+                .query_sql(sql)
+                .expect_err("a wrong argument count must be refused")
+                .to_string();
+            assert!(msg.ends_with(want), "{sql}: got {msg}");
+        }
+    }
+
+    /// The single-table form, the search functions a table reader's own SQL
+    /// registers, keeps its column-first refusal word for word: no table
+    /// counted and no column list.
+    #[test]
+    fn a_single_table_search_with_the_wrong_count_keeps_its_message() {
+        let conn = conn_with_vector_table();
+        let reader = conn
+            .open_table_handle("vecs")
+            .expect("handle")
+            .reader()
+            .expect("reader");
+        let v = one_hot_csv(0);
+        let cases = [
+            (
+                format!("SELECT * FROM hybrid_search('title', 'rust', '{v}', 3)"),
+                "hybrid_search expects 5 arguments (text_col, q_text, vec_col, q_vec, k), got 4",
+            ),
+            (
+                "SELECT * FROM vector_search('emb', 3)".to_string(),
+                "vector_search expects 3 arguments (column, query_vector, k), got 2",
+            ),
+            (
+                "SELECT * FROM bm25_search('title')".to_string(),
+                "bm25_search expects 3 or 4 arguments (column, query, k[, mode]), got 1",
+            ),
+            (
+                "SELECT * FROM exact_match('title')".to_string(),
+                "exact_match expects 2 arguments (column, value), got 1",
+            ),
+        ];
+        for (sql, want) in cases {
+            let msg = reader
                 .query_sql(&sql)
                 .expect_err("a wrong argument count must be refused")
                 .to_string();
             assert!(msg.contains(want), "{sql}: got {msg}");
             assert!(
-                msg.contains("table \"vecs\" has full-text columns: title; vector columns: emb"),
-                "{sql}: the refusal names the table's indexed columns, got {msg}"
+                !msg.contains("columns:"),
+                "{sql}: the single-table refusal names no columns, got {msg}"
             );
         }
     }
