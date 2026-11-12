@@ -33,7 +33,6 @@ pub(crate) async fn mark_attached(storage: &dyn StorageProvider) -> Result<(), S
         .await
 }
 
-/// Whether the table on `storage` may have replicas attached; an unreadable marker counts as yes.
 /// Whether the table at `storage` has replicas attached; a storage error is returned, not guessed.
 pub(crate) async fn is_attached(storage: &dyn StorageProvider) -> Result<bool, StorageError> {
     match storage.head(ATTACHED_MARKER).await {
@@ -43,6 +42,7 @@ pub(crate) async fn is_attached(storage: &dyn StorageProvider) -> Result<bool, S
     }
 }
 
+/// Whether the table on `storage` may have replicas attached; an unreadable marker counts as yes.
 pub(crate) async fn may_be_attached(storage: &dyn StorageProvider) -> bool {
     !matches!(
         storage.head(ATTACHED_MARKER).await,

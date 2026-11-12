@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     InfinoError,
     storage::{REPLICAS_DIR, StorageError, StorageProvider},
-    supertable::{handle::Supertable, merge},
+    supertable::{SupertableOptions, handle::Supertable, merge},
 };
 
 /// Where a table keeps its imports' records; outside [`REPLICAS_DIR`], so a record never counts as
@@ -138,6 +138,10 @@ fn record_key(import: &str) -> String {
     format!("{IMPORTS_DIR}{import}.json")
 }
 
+fn report_key(import: &str) -> String {
+    format!("{IMPORTS_DIR}{import}.reported")
+}
+
 fn replica_name(import: &str, node: &str) -> String {
     format!("{import}.{node}")
 }
@@ -146,8 +150,8 @@ fn replica_prefix(import: &str) -> String {
     format!("{import}.")
 }
 
-/// How many replicas write an import's batches. The engine records it; whoever routes the batches
-/// keeps to it.
+/// How many replicas write an import's batches. The engine refuses a replica past the count;
+/// routing batches only to the allowed replicas saves the refused attempts.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Writers {
@@ -254,12 +258,13 @@ pub fn import_writers(table: &Supertable, import: &str) -> Result<Writers, Infin
 }
 
 /// The imports on `table` that are open or finishing, so a coordinator that restarted can take
-/// them up again.
+/// them up again. Detaches what an ended import's crashed abort or finish left attached.
 pub fn open_imports(table: &Supertable) -> Result<Vec<String>, InfinoError> {
     let storage = storage_of(table)?;
     let keys = table
         .block_on_query(storage.list_with_prefix(IMPORTS_DIR))
         .map_err(backend)?;
+    let attached = merge::attached_replicas(table).map_err(backend)?;
     let mut open = vec![];
     for key in keys {
         let Some(import) = key
@@ -268,13 +273,20 @@ pub fn open_imports(table: &Supertable) -> Result<Vec<String>, InfinoError> {
         else {
             continue;
         };
-        if check_id("import", import).is_ok()
-            && matches!(
-                import_state(table, import)?,
-                ImportState::Open | ImportState::Finishing
-            )
-        {
-            open.push(import.to_owned());
+        if check_id("import", import).is_err() {
+            continue;
+        }
+        match import_state(table, import)? {
+            ImportState::Open | ImportState::Finishing => open.push(import.to_owned()),
+            // An abort or finish that crashed before its detach left these behind.
+            ImportState::Finished(_) | ImportState::Aborted
+                if attached
+                    .iter()
+                    .any(|name| name.starts_with(&replica_prefix(import))) =>
+            {
+                detach_import(table, import)?;
+            }
+            _ => {}
         }
     }
     Ok(open)
@@ -536,7 +548,12 @@ impl ImportReplica {
                 n = self.settled.wait(n).expect("in-flight count");
             }
         }
-        if is_sealed(&self.table)? {
+        if is_sealed(&self.table)?
+            || matches!(
+                import_state(&self.owner, &self.import)?,
+                ImportState::Finished(_) | ImportState::Aborted
+            )
+        {
             return Ok(());
         }
         merge::fold_replica_all(&self.table).map_err(backend)?;
@@ -673,8 +690,9 @@ pub fn abort_import(table: &Supertable, import: &str) -> Result<(), InfinoError>
     )))
 }
 
-/// When a replica of `import` last committed, or `None` when it has no replica; the same answer on
-/// every node, so an idle import can be judged from storage.
+/// When `import`'s record or any object of its replicas (commits, folds, seal markers) last
+/// changed, or `None` when it was never begun; the same answer on every node, so an idle import
+/// can be judged from storage.
 pub fn import_activity(
     table: &Supertable,
     import: &str,
@@ -682,33 +700,74 @@ pub fn import_activity(
     check_id("import", import)?;
     let storage = storage_of(table)?;
     let prefix = format!("{REPLICAS_DIR}{}", replica_prefix(import));
-    let objects = table
-        .block_on_query(storage.list_with_prefix_metadata(REPLICAS_DIR))
-        .map_err(backend)?;
+    let (record, objects) = table.block_on_query(async {
+        let record = match storage.head(&record_key(import)).await {
+            Ok(meta) => Some(meta.last_modified),
+            Err(StorageError::NotFound { .. }) => None,
+            Err(e) => return Err(backend(e)),
+        };
+        let objects = storage
+            .list_with_prefix_metadata(REPLICAS_DIR)
+            .await
+            .map_err(backend)?;
+        Ok((record, objects))
+    })?;
+    let Some(record) = record else {
+        return Ok(None);
+    };
     Ok(objects
         .into_iter()
         .filter(|(key, _)| key.starts_with(&prefix))
         .map(|(_, meta)| meta.last_modified)
+        .chain([record])
         .max())
 }
 
-/// Refuses `op` on a replica, and on a table while an import has replicas attached: rows not yet
-/// grafted would miss the change, and a schema change would stop every graft.
-pub(crate) fn refuse_during_import(table: &Supertable, op: &str) -> Result<(), InfinoError> {
-    if table.inner().options.term_index_replica {
-        return Err(InfinoError::Unsupported(format!(
-            "{op} on an import's replica"
+/// Claims the one report of finished `import`'s outcome (for billing it once): `true` for the
+/// first caller on any node, `false` after. Errors with [`InfinoError::NotFound`] unless the
+/// import is finished.
+pub fn claim_import_report(table: &Supertable, import: &str) -> Result<bool, InfinoError> {
+    let state = import_state(table, import)?;
+    if !matches!(state, ImportState::Finished(_)) {
+        return Err(InfinoError::NotFound(format!(
+            "import {import} is not finished: {state:?}"
         )));
     }
-    let Some(storage) = table.inner().options.storage.clone() else {
-        return Ok(());
-    };
-    match table.block_on_query(crate::storage::is_attached(storage.as_ref())) {
-        Ok(false) => Ok(()),
-        Ok(true) => Err(InfinoError::Conflict(format!(
+    let storage = storage_of(table)?;
+    table.block_on_query(async {
+        match storage
+            .put_atomic(&report_key(import), Bytes::from_static(b"reported"))
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(e) if e.is_conflict() => Ok(false),
+            Err(e) => Err(backend(e)),
+        }
+    })
+}
+
+/// Whether an import has replicas attached to the table `options` open; never for a table
+/// without storage.
+pub(crate) async fn is_import_open(options: &SupertableOptions) -> Result<bool, StorageError> {
+    match &options.storage {
+        Some(storage) => crate::storage::is_attached(storage.as_ref()).await,
+        None => Ok(false),
+    }
+}
+
+/// Refuses `op` on a replica, and on a table while an import has replicas attached: rows not yet
+/// grafted would miss what it writes.
+pub(crate) fn refuse_during_import(table: &Supertable, op: &str) -> Result<(), InfinoError> {
+    let options = &table.inner().options;
+    let open = options.term_index_replica
+        || table
+            .block_on_query(is_import_open(options))
+            .map_err(backend)?;
+    match open {
+        false => Ok(()),
+        true => Err(InfinoError::Conflict(format!(
             "{op} waits until the table's open imports finish or are aborted"
         ))),
-        Err(e) => Err(backend(e)),
     }
 }
 
@@ -753,7 +812,7 @@ pub fn finish_import(
         version.as_deref(),
     )?
     else {
-        return finished_by_another(table, import);
+        return finished_by_another(table, import, expected_rows);
     };
     let finished = finish_claimed(table, import, expected_rows, writers, &claim);
     if finished.is_err() {
@@ -763,11 +822,21 @@ pub fn finish_import(
 }
 
 /// What a finish that lost its claim reports: the outcome once the other finish recorded it.
-fn finished_by_another(table: &Supertable, import: &str) -> Result<ImportOutcome, InfinoError> {
+fn finished_by_another(
+    table: &Supertable,
+    import: &str,
+    expected_rows: Option<u64>,
+) -> Result<ImportOutcome, InfinoError> {
     match import_state(table, import)? {
         ImportState::Finished(outcome) => {
             detach_import(table, import)?;
-            Ok(outcome)
+            match expected_rows.filter(|&w| w != outcome.rows) {
+                Some(want) => Err(InfinoError::Cardinality(format!(
+                    "import {import} finished with {} rows, not {want}",
+                    outcome.rows
+                ))),
+                None => Ok(outcome),
+            }
         }
         ImportState::Aborted => Err(not_open(import, &ImportState::Aborted)),
         _ => Err(InfinoError::Conflict(format!(
@@ -837,7 +906,7 @@ fn finish_claimed(
     )?
     .is_none()
     {
-        return finished_by_another(table, import);
+        return finished_by_another(table, import, expected_rows);
     }
     detach_import(table, import)?;
     Ok(outcome)
@@ -1288,13 +1357,30 @@ mod tests {
     }
 
     #[test]
-    fn activity_comes_from_the_replicas_commits() {
+    fn activity_starts_at_begin_and_follows_the_replicas() {
         let (_dir, t) = table();
+        assert_eq!(import_activity(&t, "l1").expect("never begun"), None);
         begin_import(&t, "l1", None).expect("begin");
-        assert_eq!(import_activity(&t, "l1").expect("none yet"), None);
+        let begun = import_activity(&t, "l1")
+            .expect("activity")
+            .expect("the record counts");
         let r = open_import_replica(&t, "l1", "n1").expect("replica");
         r.append_batch(&batch(10), "b1").expect("append");
-        assert!(import_activity(&t, "l1").expect("activity").is_some());
+        assert!(import_activity(&t, "l1").expect("activity").expect("some") >= begun);
+    }
+
+    #[test]
+    fn a_finished_import_is_reported_once() {
+        let (_dir, t) = table();
+        begin_import(&t, "l1", None).expect("begin");
+        assert!(matches!(
+            claim_import_report(&t, "l1"),
+            Err(InfinoError::NotFound(_))
+        ));
+        finish_import(&t, "l1", None).expect("finish");
+        assert!(claim_import_report(&t, "l1").expect("first"));
+        assert!(!claim_import_report(&t, "l1").expect("second"));
+        assert!(open_imports(&t).expect("open").is_empty());
     }
 
     #[test]
@@ -1705,5 +1791,91 @@ mod tests {
         assert_eq!(rows(&t), 10);
         let companion = t.companion("sync").expect("open").expect("still declared");
         assert_eq!(rows(&companion), 3);
+    }
+
+    #[test]
+    fn a_plain_first_commit_racing_the_import_rebuilds_on_its_grid() {
+        let (dir, t) = kind_table(false, true);
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("local fs"));
+        let mut options = (*t.inner().options).clone();
+        options.storage = Some(storage);
+        // Another process's handle, opened before the import stamps its grid.
+        let other = Supertable::open(options).expect("open other");
+        begin_import(&t, "i", None).expect("begin");
+        let a = open_import_replica(&t, "i", "n1").expect("a");
+        a.append_batch(&kind_batch(true, true, 0), "p0")
+            .expect("append");
+        let stamped = t.inner().manifest.load().get_global_vector_index();
+        let mut w = other.writer().expect("writer");
+        w.append(&kind_batch(true, true, 1)).expect("append");
+        w.commit().expect("the plain commit lands");
+        let fresh = t.reader().expect("reader");
+        assert_eq!(
+            fresh.manifest().get_global_vector_index(),
+            stamped,
+            "the plain commit kept the import's grid"
+        );
+        a.seal().expect("seal");
+        finish_import(&t, "i", None).expect("finish");
+    }
+
+    #[test]
+    fn the_writer_refuses_changes_while_an_import_is_open() {
+        use datafusion::prelude::{col, lit};
+        let (_dir, t) = table();
+        t.append(&batch(5)).expect("plain rows");
+        begin_import(&t, "l1", None).expect("begin");
+        let r = open_import_replica(&t, "l1", "n1").expect("replica");
+        r.append_batch(&batch(10), "b1").expect("append");
+        let mut w = t.writer().expect("writer");
+        assert!(matches!(
+            w.delete(col("title").eq(lit("shared x"))),
+            Err(crate::supertable::mutations::MutationError::ImportOpen)
+        ));
+        drop(w);
+        let wide = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new("extra", DataType::LargeUtf8, true),
+        ]));
+        let cols: Vec<ArrayRef> = vec![
+            Arc::new(LargeStringArray::from(vec!["shared x"; 2])),
+            Arc::new(LargeStringArray::from(vec!["e"; 2])),
+        ];
+        assert!(matches!(
+            t.append(&RecordBatch::try_new(wide, cols).expect("batch")),
+            Err(InfinoError::Conflict(_))
+        ));
+        t.append(&batch(3))
+            .expect("a plain append that keeps the columns");
+        r.seal().expect("seal");
+        finish_import(&t, "l1", Some(10)).expect("finish");
+        assert_eq!(rows(&t), 18);
+    }
+
+    #[test]
+    fn a_crashed_abort_is_cleaned_up_by_the_next_listing() {
+        use datafusion::prelude::{col, lit};
+        let (_dir, t) = table();
+        begin_import(&t, "l1", None).expect("begin");
+        let r = open_import_replica(&t, "l1", "n1").expect("replica");
+        r.append_batch(&batch(10), "b1").expect("append");
+        // An abort that died after its record write, before its detach.
+        let (record, version) = read_record(&t, "l1").expect("record");
+        write_record(
+            &t,
+            "l1",
+            ImportState::Aborted,
+            record.writers,
+            version.as_deref(),
+        )
+        .expect("write")
+        .expect("won");
+        assert!(t.has_attached_replicas().expect("attached"));
+        assert!(open_imports(&t).expect("open").is_empty());
+        assert!(!t.has_attached_replicas().expect("detached by the listing"));
+        t.delete(col("title").eq(lit("shared x")))
+            .expect("writes run again");
+        r.seal().expect("sealing after the end is harmless");
     }
 }

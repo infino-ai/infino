@@ -1252,7 +1252,6 @@ impl Supertable {
         patch: &SchemaPatch,
         expected: Option<u32>,
     ) -> Result<Arc<TableSchema>, InfinoError> {
-        super::import::refuse_during_import(self, "a schema change")?;
         let mut w = self
             .writer()
             .map_err(|e| InfinoError::from(e).with_context("apply_schema", None))?;
@@ -1299,7 +1298,6 @@ impl Supertable {
         predicate: Expr,
         new_rows: &RecordBatch,
     ) -> Result<MutationStats, InfinoError> {
-        super::import::refuse_during_import(self, "an update")?;
         let mut w = self
             .writer()
             .map_err(|e| InfinoError::from(e).with_context("update", None))?;
@@ -1343,7 +1341,6 @@ impl Supertable {
         tracing::instrument(skip_all, fields(role = self.role().as_str(), origin = OpOrigin::Ingest.as_str()))
     )]
     pub fn delete(&self, predicate: Expr) -> Result<MutationStats, InfinoError> {
-        super::import::refuse_during_import(self, "a delete")?;
         let mut w = self
             .writer()
             .map_err(|e| InfinoError::from(e).with_context("delete", None))?;
@@ -1754,6 +1751,18 @@ pub(in crate::supertable) fn train_global_vector_index(
 }
 
 impl SupertableWriter {
+    /// Whether a change to the rows or the schema must wait: an import has replicas attached to
+    /// the table, or this table is an import's replica.
+    fn is_import_open(&self) -> Result<bool, StorageError> {
+        if self.inner.options.term_index_replica {
+            return Ok(true);
+        }
+        bridge_on_runtime(
+            super::import::is_import_open(&self.inner.options),
+            &self.inner.query_runtime(),
+        )
+    }
+
     /// Number of buffered batches not yet committed. Useful for
     /// tests + diagnostics; not part of the production hot path.
     pub fn buffered_batches(&self) -> usize {
@@ -1975,6 +1984,9 @@ impl SupertableWriter {
     ///
     /// [`commit`]: SupertableWriter::commit
     pub fn delete(&mut self, predicate: Expr) -> Result<PendingDelete, MutationError> {
+        if self.is_import_open()? {
+            return Err(MutationError::ImportOpen);
+        }
         // Pre-flight: storage must be attached for the WAL
         // pipeline to drive this op at commit time.
         let _ = self
@@ -2048,6 +2060,9 @@ impl SupertableWriter {
         predicate: Expr,
         new_rows: RecordBatch,
     ) -> Result<PendingUpdate, MutationError> {
+        if self.is_import_open()? {
+            return Err(MutationError::ImportOpen);
+        }
         // Pre-flight: storage attached.
         let _ = self
             .inner
@@ -3035,6 +3050,12 @@ impl SupertableWriter {
         patch: &SchemaPatch,
         expected: Option<u32>,
     ) -> Result<Arc<TableSchema>, BuildError> {
+        if self
+            .is_import_open()
+            .map_err(|e| BuildError::Store(e.to_string()))?
+        {
+            return Err(BuildError::ImportOpen);
+        }
         // Buffered rows were resolved against the schema as it stands, and
         // the change is about to move it out from under them: a retype
         // leaves them unable to commit at all (every later commit is
@@ -3123,6 +3144,13 @@ impl SupertableWriter {
             &self.inner.options.id_column,
         )?
         .map(Arc::new);
+        if schema_change.is_some()
+            && self
+                .is_import_open()
+                .map_err(|e| BuildError::Store(e.to_string()))?
+        {
+            return Err(BuildError::ImportOpen);
+        }
         let manifest = match &schema_change {
             Some(schema) => Arc::new(base.with_schema(Arc::clone(schema))),
             None => base,
@@ -13455,6 +13483,19 @@ impl CommitListMetadata {
             if current != expected {
                 return Err(SupertableCommitError::SchemaMoved { expected, current });
             }
+        }
+        // A grid trained by this commit is only valid while the table has none: an import (or
+        // another first commit) that stamped one first means rebuilding on that one.
+        if let Some(ours) = &self.global_vector_index
+            && base
+                .get_global_vector_index()
+                .is_some_and(|theirs| &theirs != ours)
+        {
+            let current = base.table_schema().schema_id();
+            return Err(SupertableCommitError::SchemaMoved {
+                expected: current,
+                current,
+            });
         }
         if let Some(next) = &self.schema
             && !base.get_all_superfiles().is_empty()

@@ -184,6 +184,11 @@ pub enum BuildError {
     /// `From<BuildError> for InfinoError`.
     #[error("write contention: a concurrent writer won the commit race")]
     WriteContention,
+    /// An import has replicas attached to the table, and the write would change its schema
+    /// (or the write ran on a replica): every later graft would refuse a schema the replicas
+    /// don't share.
+    #[error("the table has an open import; schema changes wait until it finishes or is aborted")]
+    ImportOpen,
 
     #[error("rayon thread pool creation failed: {0}")]
     ThreadPoolCreation(String),
@@ -254,6 +259,8 @@ impl BuildError {
             // The schema moved under this build: rebuilding against the
             // winner's schema and reissuing can succeed.
             BuildError::SchemaMoved { .. } => true,
+            // An import is open: the same write succeeds once it finishes.
+            BuildError::ImportOpen => true,
             BuildError::Schema(SchemaError::SchemaConflict { .. }) => true,
             BuildError::StorageConstruction(e) => e.is_conflict(),
             _ => false,

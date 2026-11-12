@@ -128,7 +128,7 @@ pub(crate) trait Table: Send + Sync {
     #[cfg(any(test, feature = "test-helpers"))]
     fn as_any(&self) -> &dyn Any;
 
-    /// The local engine table behind this handle, for what only a local table does (loads);
+    /// The local engine table behind this handle, for what only a local table does (imports);
     /// `None` for a hosted table.
     fn local_engine(&self) -> Option<&SupertableHandle> {
         None
@@ -813,7 +813,7 @@ impl Supertable {
         self.inner.apply_schema(patch, expected)
     }
 
-    /// The local engine table behind this handle; a hosted table takes no loads.
+    /// The local engine table behind this handle; a hosted table takes no imports.
     fn local_for_import(&self) -> Result<&SupertableHandle, InfinoError> {
         self.inner
             .local_engine()
@@ -831,13 +831,20 @@ impl Supertable {
         import::begin_import(self.local_for_import()?, import, writers)
     }
 
+    /// Claims the one report of finished `import`'s outcome: `true` for the first caller on any
+    /// node, `false` after; errors unless it is finished.
+    pub fn claim_import_report(&self, import: &str) -> Result<bool, InfinoError> {
+        import::claim_import_report(self.local_for_import()?, import)
+    }
+
     /// Aborts `import`: the batches grafted so far stay, the rest are dropped; errors once it is
     /// finished or was never begun.
     pub fn abort_import(&self, import: &str) -> Result<(), InfinoError> {
         import::abort_import(self.local_for_import()?, import)
     }
 
-    /// When a replica of `import` last committed, read from storage; `None` when it has none.
+    /// When `import`'s record or replicas last changed, read from storage; `None` when it was never
+    /// begun.
     pub fn import_activity(&self, import: &str) -> Result<Option<SystemTime>, InfinoError> {
         import::import_activity(self.local_for_import()?, import)
     }
@@ -853,7 +860,7 @@ impl Supertable {
         import::open_imports(self.local_for_import()?)
     }
 
-    /// Whether `import` is unknown, open, finishing or finished on this table.
+    /// Whether `import` is unknown, open, finishing, finished or aborted on this table.
     pub fn import_state(&self, import: &str) -> Result<ImportState, InfinoError> {
         import::import_state(self.local_for_import()?, import)
     }
