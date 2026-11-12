@@ -6223,6 +6223,49 @@ mod tests {
         );
     }
 
+    /// A merge reads every column of an input whose page index a query has
+    /// loaded for only some: the footer it reads through holds the offset
+    /// index of every column, or no page index at all, never the query's
+    /// placeholders, and the reader's own page index is left as it was.
+    #[tokio::test]
+    async fn a_merge_reads_every_column_of_a_reader_holding_some_of_its_page_index() {
+        let bytes = paged_superfile();
+        let reader = SuperfileReader::open(bytes).expect("open");
+        reader
+            .parquet_metadata_with_page_index(&IndexColumns::named(&["n1"]))
+            .await
+            .expect("load");
+        assert!(
+            matches!(*reader.lock_page_index(), PageIndex::Partial { .. }),
+            "guard: the reader holds the page index of some columns"
+        );
+        for offset_index in [false, true] {
+            let metadata = reader.arrow_metadata(offset_index).expect("metadata");
+            assert_eq!(
+                metadata.metadata().offset_index().is_some(),
+                offset_index,
+                "offset index asked: {offset_index}"
+            );
+            assert!(metadata.metadata().column_index().is_none());
+            let rows = metadata.metadata().file_metadata().num_rows() as u64;
+            let survivors = 1..rows - 1;
+            let read = KeptRows::new(rows, None)
+                .read(metadata.metadata(), survivors.clone())
+                .expect("rows to read");
+            let columns: Vec<usize> = (0..metadata.schema().fields().len()).collect();
+            let read_rows: usize = reader
+                .kept_record_batches(&metadata, &read, &columns, PAGED_ROWS as usize)
+                .expect("reader")
+                .map(|batch| batch.expect("every column reads").num_rows())
+                .sum();
+            assert_eq!(read_rows as u64, survivors.end - survivors.start);
+        }
+        assert!(matches!(
+            *reader.lock_page_index(),
+            PageIndex::Partial { .. }
+        ));
+    }
+
     /// A reader asked for one new column after another stops copying its
     /// footer per column: once those loads would cost more than loading every
     /// column, it loads every column, long before it has been asked for each.
