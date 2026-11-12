@@ -2411,6 +2411,62 @@ fn finish_take(
     RecordBatch::try_new(out_schema, columns).map_err(|e| QueryError::internal(e).into())
 }
 
+/// The arguments a search function takes in its column-first form: how
+/// many, and how an error names them. The single-table function checks a
+/// call against it, and the catalog's table-first form checks against the
+/// same with the table in front, so the two never disagree about a count.
+/// The graph walks, which take the table first only, check against one too.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Arity {
+    /// Fewest arguments.
+    pub(crate) min: usize,
+    /// Most arguments; `min` when none is optional.
+    pub(crate) max: usize,
+    /// The arguments as an error names them, e.g. `"column, query, k[, mode]"`.
+    pub(crate) arguments: &'static str,
+}
+
+impl Arity {
+    /// Whether a column-first call with `got` arguments has the right count.
+    pub(crate) fn takes(&self, got: usize) -> bool {
+        (self.min..=self.max).contains(&got)
+    }
+
+    /// The count an error states with `leading` more arguments in front:
+    /// `3`, or `3 or 4` when the last is optional.
+    pub(crate) fn count(&self, leading: usize) -> String {
+        if self.min == self.max {
+            (self.min + leading).to_string()
+        } else {
+            format!("{} or {}", self.min + leading, self.max + leading)
+        }
+    }
+
+    /// The refusal for a call of `name` that passed `got` arguments after
+    /// the `leading` ones, stated in the form the caller wrote: the leading
+    /// arguments named and counted. `leading` is empty for a column-first
+    /// call and `["table"]` for a table-first one.
+    pub(crate) fn expects(&self, name: &str, got: usize, leading: &[&str]) -> String {
+        let mut named = leading.to_vec();
+        named.push(self.arguments);
+        format!(
+            "{name} expects {} arguments ({}), got {}",
+            self.count(leading.len()),
+            named.join(", "),
+            got + leading.len()
+        )
+    }
+
+    /// Refuses a column-first call of `name` with `got` arguments when that
+    /// is the wrong count.
+    pub(crate) fn check(&self, name: &str, got: usize) -> DfResult<()> {
+        if self.takes(got) {
+            return Ok(());
+        }
+        Err(DataFusionError::Plan(self.expects(name, got, &[])))
+    }
+}
+
 /// Extract a string literal argument (a column name, query text, ...).
 pub(crate) fn arg_to_string(expr: &Expr, what: &str) -> DfResult<String> {
     match expr {

@@ -54,8 +54,8 @@ use crate::{
         handle::{SupertableReader, WeakReader},
         query::exec::{
             common::{
-                arg_to_string, live_reader, output_schema_with_score, resolve_hits, scope_to_call,
-                traced_tvf, traced_tvf_rows,
+                Arity, arg_to_string, live_reader, output_schema_with_score, resolve_hits,
+                scope_to_call, traced_tvf, traced_tvf_rows,
             },
             fts_exec::arg_to_bool_mode,
         },
@@ -67,6 +67,19 @@ use crate::{
 pub(crate) const TOKEN_MATCH_UDTF: &str = "token_match";
 /// SQL name for the unranked exact-match TVF.
 pub(crate) const EXACT_MATCH_UDTF: &str = "exact_match";
+/// Arguments of `token_match(column, query)`; the optional `mode` makes it
+/// `token_match(column, query, mode)`.
+pub(crate) const TOKEN_MATCH_ARITY: Arity = Arity {
+    min: 2,
+    max: 3,
+    arguments: "column, query[, mode]",
+};
+/// Arguments of `exact_match(column, value)`.
+pub(crate) const EXACT_MATCH_ARITY: Arity = Arity {
+    min: 2,
+    max: 2,
+    arguments: "column, value",
+};
 
 /// Register `token_match` + `exact_match` on `ctx`, bound to the
 /// query's pinned `reader` + scalar `schema`. Called from
@@ -120,12 +133,7 @@ impl TokenMatchFunc {
 impl TableFunctionImpl for TokenMatchFunc {
     fn call_with_args(&self, args: TableFunctionArgs) -> DfResult<Arc<dyn TableProvider>> {
         let args = args.exprs();
-        if args.len() != 2 && args.len() != 3 {
-            return Err(DataFusionError::Plan(format!(
-                "token_match expects 2 or 3 arguments (column, query[, mode]), got {}",
-                args.len()
-            )));
-        }
+        TOKEN_MATCH_ARITY.check(TOKEN_MATCH_UDTF, args.len())?;
         let column = arg_to_string(&args[0], "token_match column")?;
         let query = arg_to_string(&args[1], "token_match query")?;
         let mode = match args.get(2) {
@@ -168,12 +176,7 @@ impl ExactMatchFunc {
 impl TableFunctionImpl for ExactMatchFunc {
     fn call_with_args(&self, args: TableFunctionArgs) -> DfResult<Arc<dyn TableProvider>> {
         let args = args.exprs();
-        if args.len() != 2 {
-            return Err(DataFusionError::Plan(format!(
-                "exact_match expects 2 arguments (column, value), got {}",
-                args.len()
-            )));
-        }
+        EXACT_MATCH_ARITY.check(EXACT_MATCH_UDTF, args.len())?;
         let column = arg_to_string(&args[0], "exact_match column")?;
         let value = arg_to_string(&args[1], "exact_match value")?;
         let reader = live_reader(&self.reader, "exact_match")?;
