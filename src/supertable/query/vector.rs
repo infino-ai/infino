@@ -7359,11 +7359,7 @@ impl SupertableReader {
                     .map_err(QueryError::from)?;
                 // The predicate-resolution leg of filtered vector search
                 // is FTS work like any other; flush it per superfile.
-                if let Some(stats) = &op_stats {
-                    stats.add_fts_postings_bytes(work.postings_bytes);
-                    stats.add_planned_read_ranges(work.planned_ranges);
-                    stats.add_kernel_cpu_ns(work.kernel_cpu_ns);
-                }
+                work.add_to(op_stats.as_deref());
                 Ok(row_bitmap(&docs))
             }
         })
@@ -8370,11 +8366,7 @@ impl SupertableReader {
                     .map_err(QueryError::from)?;
                 // The SQL predicate's posting walks, summed across the
                 // plan tree — the pushdown leg of the vector TVF.
-                if let Some(stats) = &op_stats {
-                    stats.add_fts_postings_bytes(work.postings_bytes);
-                    stats.add_planned_read_ranges(work.planned_ranges);
-                    stats.add_kernel_cpu_ns(work.kernel_cpu_ns);
-                }
+                work.add_to(op_stats.as_deref());
                 match bitmap {
                     Some(bitmap) => Ok(bitmap),
                     None if unbounded_is_legitimate => {
