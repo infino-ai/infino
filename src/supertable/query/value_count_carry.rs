@@ -14,6 +14,7 @@
 
 use std::{
     collections::HashMap,
+    mem,
     sync::{Arc, Mutex},
 };
 
@@ -60,6 +61,34 @@ enum Sum {
     Unknown,
 }
 
+impl Sum {
+    /// Adds `entry`'s counts of column `column`; an unknown sum stays so.
+    fn add(&mut self, entry: &SuperfileEntry, column: FieldId) {
+        let Sum::Counts(sum) = self else {
+            return;
+        };
+        let known = match file_counts(entry, column) {
+            FileCounts::NoValues => true,
+            FileCounts::Unrecorded => false,
+            FileCounts::Values(counts) => {
+                counts.entries().iter().all(|(value, count)| {
+                    let total = sum.entry(value.clone()).or_default();
+                    match total.checked_add(*count) {
+                        Some(added) => {
+                            *total = added;
+                            true
+                        }
+                        None => false,
+                    }
+                }) && sum.len() <= MAX_EXACT_VALUE_COUNTS
+            }
+        };
+        if !known {
+            *self = Sum::Unknown;
+        }
+    }
+}
+
 /// What one superfile adds to a column's sum.
 enum FileCounts {
     Values(ScalarValueCounts),
@@ -82,6 +111,62 @@ fn file_counts(entry: &SuperfileEntry, column: FieldId) -> FileCounts {
         Some(counts) => FileCounts::Values(counts),
         None if stats.all_null() => FileCounts::NoValues,
         None => FileCounts::Unrecorded,
+    }
+}
+
+/// `total`, a column's counts over a set of superfiles, without the counts
+/// `files` among them recorded: the counts of the rest of the set. `None`
+/// when one of `files` holds values it recorded no counts of, or recorded
+/// more of a value than `total` holds, which a sum over a set holding it
+/// never does. A value whose count reaches zero is left out.
+pub(crate) fn counts_without(
+    total: &ScalarValueCounts,
+    files: &[Arc<SuperfileEntry>],
+    column: FieldId,
+) -> Option<HashMap<ScalarValue, u64>> {
+    let mut left: HashMap<ScalarValue, u64> = total.entries().iter().cloned().collect();
+    for entry in files {
+        match file_counts(entry, column) {
+            FileCounts::NoValues => {}
+            FileCounts::Unrecorded => return None,
+            FileCounts::Values(counts) => {
+                left = take_off(left, counts.entries().iter().map(|(v, n)| (v, *n)))?;
+            }
+        }
+    }
+    Some(left)
+}
+
+/// `counts` with each of `less` taken off, a value reaching zero left out;
+/// `None` when one takes off more than `counts` holds.
+pub(crate) fn take_off<'a>(
+    mut counts: HashMap<ScalarValue, u64>,
+    less: impl Iterator<Item = (&'a ScalarValue, u64)>,
+) -> Option<HashMap<ScalarValue, u64>> {
+    for (value, count) in less {
+        let held = counts.get_mut(value)?;
+        *held = held.checked_sub(count)?;
+        if *held == 0 {
+            counts.remove(value);
+        }
+    }
+    Some(counts)
+}
+
+/// Column `column`'s counts over `files`, added up. `None` when one of them
+/// holds values it recorded no counts of, or they hold more than
+/// [`MAX_EXACT_VALUE_COUNTS`] distinct values together.
+pub(crate) fn counts_of(
+    files: &[Arc<SuperfileEntry>],
+    column: FieldId,
+) -> Option<HashMap<ScalarValue, u64>> {
+    let mut sum = Sum::Counts(HashMap::new());
+    for entry in files {
+        sum.add(entry, column);
+    }
+    match sum {
+        Sum::Counts(counts) => Some(counts),
+        Sum::Unknown => None,
     }
 }
 
@@ -144,28 +229,7 @@ impl CarriedColumn {
     /// Adds `entry`'s counts.
     fn add(&mut self, entry: &Arc<SuperfileEntry>, column: FieldId) {
         self.files.insert(entry.superfile_id, Arc::clone(entry));
-        let Sum::Counts(sum) = &mut self.sum else {
-            return;
-        };
-        let known = match file_counts(entry, column) {
-            FileCounts::NoValues => true,
-            FileCounts::Unrecorded => false,
-            FileCounts::Values(counts) => {
-                counts.entries().iter().all(|(value, count)| {
-                    let total = sum.entry(value.clone()).or_default();
-                    match total.checked_add(*count) {
-                        Some(added) => {
-                            *total = added;
-                            true
-                        }
-                        None => false,
-                    }
-                }) && sum.len() <= MAX_EXACT_VALUE_COUNTS
-            }
-        };
-        if !known {
-            self.sum = Sum::Unknown;
-        }
+        self.sum.add(entry, column);
     }
 
     /// Takes the counts of the superfiles `gone` off the sum. `false` when
@@ -184,19 +248,11 @@ impl CarriedColumn {
                 FileCounts::Unrecorded => return false,
                 FileCounts::Values(counts) => counts,
             };
-            for (value, count) in counts.entries() {
-                let Some(total) = sum.get_mut(value) else {
-                    return false;
-                };
-                let Some(left) = total.checked_sub(*count) else {
-                    return false;
-                };
-                if left == 0 {
-                    sum.remove(value);
-                } else {
-                    *total = left;
-                }
-            }
+            let less = counts.entries().iter().map(|(v, n)| (v, *n));
+            let Some(left) = take_off(mem::take(sum), less) else {
+                return false;
+            };
+            *sum = left;
         }
         true
     }

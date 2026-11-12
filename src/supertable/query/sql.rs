@@ -89,7 +89,7 @@ use crate::{
         manifest::ManifestSnapshot,
         query::{
             covered_agg::{
-                CoveredAggregateRewrite, load_unfiltered_aggregate_inputs, value_counts_nulls,
+                CoveredAggregateRewrite, prepare_aggregate_inputs, value_counts_from_statistics,
             },
             exec::{
                 common::{collect_plan_metered, run_within_process_limit},
@@ -244,7 +244,7 @@ pub(crate) fn sql_session_context(
     let ctx = budgeted_session_context(budget)?;
     // Appended after the built-in rules, so they see pushed-down, normalized
     // plans: a `LIMIT` already folded into its sort as the fetch.
-    ctx.add_optimizer_rule(Arc::new(CoveredAggregateRewrite));
+    ctx.add_optimizer_rule(Arc::new(CoveredAggregateRewrite::default()));
     ctx.add_optimizer_rule(Arc::new(RangeTopK));
     Ok(ctx)
 }
@@ -324,7 +324,6 @@ impl SupertableReader {
         // snapshot — the pushdown-aware SupertableProvider plus the
         // search TVFs. See [`SupertableReader::sql_session_context`].
         let ctx = self.sql_session_context()?;
-        let tombstone_prefetch = self.tombstone_prefetch();
         let cached_plan = self.cached_sql_logical_plan(sql);
         let cache_reader = self.clone();
         // Picked up on the caller's thread, like reader mint: the drive
@@ -340,14 +339,6 @@ impl SupertableReader {
             // The scan runs strings as `Utf8View`; `expand_views_at_output`
             // (set in `budgeted_session_context`) coerces them back to
             // `LargeUtf8` at the plan output, so the result carries no view.
-            // Exact manifest statistics can eliminate an unfiltered aggregate
-            // before `TableProvider::scan` runs, but only after every
-            // superfile's delete view is known. The ordinary scan performs the
-            // same prefetch; doing it before planning lets repeated aggregate
-            // queries avoid constructing a Parquet plan altogether.
-            if let Some((cache, ids)) = tombstone_prefetch {
-                cache.prefetch(&ids, Instant::now()).await;
-            }
             let df = match cached_plan {
                 Some(plan) => ctx
                     .execute_logical_plan(plan)
@@ -363,9 +354,9 @@ impl SupertableReader {
                 }
             };
             // The plan is optimized when it is made physical, below: an
-            // unfiltered aggregate's parts are loaded first, so the rewrite
-            // can answer it from manifest statistics.
-            load_unfiltered_aggregate_inputs(df.logical_plan()).await?;
+            // aggregate's inputs (parts, deleted rows) are read first, so the
+            // rewrite can answer it from manifest statistics.
+            prepare_aggregate_inputs(df.logical_plan(), &ctx.state()).await?;
             // Meter the executed plan on the thread-CPU clock, the same
             // way the catalog path does. The context is cached and
             // deliberately carries no collector, so without this the
@@ -416,6 +407,7 @@ impl SupertableReader {
                 .await
                 .and_then(|table| table.aggregate(group, aggregate))
                 .map_err(QueryError::DataFusion)?;
+            prepare_aggregate_inputs(df.logical_plan(), &ctx.state()).await?;
             Self::collect_metered_df(df, ctx.task_ctx(), &op_stats).await
         };
         conform_value_counts(&self.block_on_statement(collector, drive)?, &schema)
@@ -440,17 +432,14 @@ impl SupertableReader {
             self.block_on(cache.prefetch(&ids, Instant::now()));
         }
         let provider = op_stats::suppressed(|| self.sql_provider());
-        let Some(Some(nulls)) = value_counts_nulls(&provider, column) else {
-            return Ok(None);
-        };
-        let Some(counts) = provider.exact_value_counts(column) else {
+        let Some((counts, nulls)) = value_counts_from_statistics(&provider, column) else {
             return Ok(None);
         };
         let value_type = schema.field(0).data_type();
-        let mut values = Vec::with_capacity(counts.entries().len() + 1);
-        let mut tallies = Vec::with_capacity(counts.entries().len() + 1);
+        let mut values = Vec::with_capacity(counts.len() + 1);
+        let mut tallies = Vec::with_capacity(counts.len() + 1);
         let null_group = (nulls > 0).then_some((ScalarValue::Null, nulls));
-        for (value, count) in counts.entries().iter().chain(null_group.as_ref()) {
+        for (value, count) in counts.iter().chain(null_group.as_ref()) {
             let Ok(count) = i64::try_from(*count) else {
                 return Ok(None);
             };
@@ -583,6 +572,7 @@ impl SupertableReader {
     fn sql_provider(&self) -> SupertableProvider {
         SupertableProvider::new(self.sql_schemas().scan().clone(), self)
             .with_value_count_carry(self.value_count_carry())
+            .with_deleted_stats(self.deleted_stats())
     }
 
     /// Build (or reuse the cached) [`SessionContext`] for the

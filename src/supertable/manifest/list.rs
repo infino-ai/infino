@@ -942,7 +942,7 @@ impl ScalarValueCounts {
 
     /// About the bytes the table's entries take stored: each value's own
     /// bytes and its count.
-    fn value_bytes(&self) -> usize {
+    pub(crate) fn value_bytes(&self) -> usize {
         self.entries
             .iter()
             .map(|(value, _)| stored_value_bytes(value) + size_of::<u64>())

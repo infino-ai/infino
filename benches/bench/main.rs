@@ -36,12 +36,12 @@
 //!   `all`       : explicit "every tier × modality × phase" (the default).
 //!                 Matrix only — diagnostics are NEVER implied by `all` or
 //!                 by a bare `cargo bench`.
-//!   diagnostic  : `scale` | `tombstone` | `update` | `sql-diag` | `fts-diag` | `fts-merge` | `object-store` | `concurrent` | `disk-warm` | `write-diag` | `filtered-vector` | `wide-sparse` | `null-prune` | `hybrid-optimize`,
+//!   diagnostic  : `scale` | `tombstone` | `update` | `sql-diag` | `fts-diag` | `fts-merge` | `object-store` | `concurrent` | `disk-warm` | `write-diag` | `filtered-vector` | `wide-sparse` | `null-prune` | `hybrid-optimize` | `stats-deletes`,
 //!                 by name, or grouped under the `diagnostic` keyword —
 //!                 `cargo bench -- diagnostic` runs all ten,
 //!                 `cargo bench -- diagnostic scale tombstone` a subset.
 //!                 `filtered-vector` (builds 1M-row tables), `wide-sparse`
-//!                 (a 2 500-column table), `null-prune` and `hybrid-optimize`
+//!                 (a 2 500-column table), `null-prune`, `hybrid-optimize` and `stats-deletes`
 //!                 run by name only.
 //!
 //! The matrix tests run = (selected tiers) × (selected modalities).
@@ -83,6 +83,7 @@ enum Diagnostic {
     WideSparse,
     NullPrune,
     HybridOptimize,
+    StatsDeletes,
 }
 
 impl Diagnostic {
@@ -103,6 +104,7 @@ impl Diagnostic {
             Diagnostic::WideSparse => "wide-sparse",
             Diagnostic::NullPrune => "null-prune",
             Diagnostic::HybridOptimize => "hybrid-optimize",
+            Diagnostic::StatsDeletes => "stats-deletes",
         }
     }
 
@@ -131,6 +133,7 @@ impl Diagnostic {
             Diagnostic::WideSparse => infino_bench_utils::wide_sparse::run(),
             Diagnostic::NullPrune => infino_bench_utils::null_prune::run(),
             Diagnostic::HybridOptimize => infino_bench_utils::hybrid_optimize::run(),
+            Diagnostic::StatsDeletes => infino_bench_utils::stats_deletes::run(),
         }
     }
 }
@@ -355,7 +358,7 @@ fn print_usage_and_exit(code: i32) -> ! {
          \x20           quality = FTS BM25 parity vs a textbook oracle, the two fts cells only)\n\
          all       : every tier x modality x phase (the default for a bare\n\
          \x20           `cargo bench`); matrix only — never implies diagnostics\n\
-         Diagnostic: scale | tombstone | update | sql-diag | fts-diag | fts-merge | object-store | concurrent | disk-warm | recall_while_ingest | filtered-vector | wide-sparse | null-prune | hybrid-optimize,\n\
+         Diagnostic: scale | tombstone | update | sql-diag | fts-diag | fts-merge | object-store | concurrent | disk-warm | recall_while_ingest | filtered-vector | wide-sparse | null-prune | hybrid-optimize | stats-deletes,\n\
          \x20           or `diagnostic` for the grouped set / `diagnostic <names>` for a subset\n\
          \n\
          corpus=<spec>     : corpus source. Default: `realistic` for the two fts\n\
@@ -479,6 +482,7 @@ fn parse_args() -> Selection {
             "wide-sparse" | "wide_sparse" => diagnostics.push(Diagnostic::WideSparse),
             "null-prune" | "null_prune" => diagnostics.push(Diagnostic::NullPrune),
             "hybrid-optimize" | "hybrid_optimize" => diagnostics.push(Diagnostic::HybridOptimize),
+            "stats-deletes" | "stats_deletes" => diagnostics.push(Diagnostic::StatsDeletes),
             "diagnostic" | "diagnostics" => want_diagnostics = true,
             other => match other.split_once('=') {
                 Some(("corpus", spec)) => corpus_spec = Some(spec.to_string()),
