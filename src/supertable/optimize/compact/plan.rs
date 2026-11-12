@@ -926,7 +926,7 @@ pub(in crate::supertable::optimize::compact) mod tests {
             ..MergeMemory::default()
         };
         let mut p = PendingJob::default();
-        p.push(&seg(1, 1, 10, 0));
+        p.push(&seg(1, 1, 10, 0), target);
         let b = seg(2, 1, 10, 0);
         let shape = (
             p.raw_bytes + b.size_bytes,
@@ -1197,7 +1197,12 @@ pub(in crate::supertable::optimize::compact) mod tests {
                 if job.inputs.len() > 1 {
                     prop_assert!(job.input_bytes <= max_input_bytes, "over the input cap");
                     prop_assert!(
-                        memory.footprint(job.input_bytes, job.estimated_output_bytes, job.live_docs)
+                        memory.footprint(
+                            job.input_bytes,
+                            job.estimated_output_bytes,
+                            job.live_docs,
+                            job.inputs.len(),
+                        )
                             <= memory.limit.unwrap_or(u64::MAX),
                         "past the memory a merge is given"
                     );
@@ -1210,7 +1215,7 @@ pub(in crate::supertable::optimize::compact) mod tests {
             for s in full {
                 let due = deleted_at_least(s, RECLAIM_FULL_DELETED_PERCENT)
                     && s.size_bytes <= max_input_bytes
-                    && memory.admits(s.size_bytes, s.live_bytes(), s.live_docs());
+                    && memory.admits(s.size_bytes, s.live_bytes(), s.live_docs(), 1);
                 let planned = job_of.contains_key(&s.superfile_id);
                 match s.size_bytes >= target_bytes {
                     true => prop_assert_eq!(planned, due, "{:?} in {:?}", s, job_of.get(&s.superfile_id)),
