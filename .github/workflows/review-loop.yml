@@ -63,10 +63,12 @@ jobs:
       (github.event.issue.pull_request && github.event.comment.user.type != 'Bot' &&
        contains(github.event.comment.body, '/autofix'))
     runs-on: ubuntu-latest
-    # Write on issues only to react to the command; this job checks out and runs nothing of the PR.
+    # Write only to react to the command (a comment on a PR counts as the PR's, so reacting to it
+    # takes pull-requests: write as well as issues: write); this job checks out and runs nothing of
+    # the PR.
     permissions:
       contents: read
-      pull-requests: read
+      pull-requests: write
       issues: write
     env:
       GH_TOKEN: ${{ github.token }}
