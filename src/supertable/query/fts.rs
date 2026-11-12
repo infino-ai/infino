@@ -87,6 +87,7 @@ use arrow::record_batch::RecordBatch;
 use arrow_array::{Array, LargeStringArray};
 use datafusion::logical_expr::Expr;
 use futures::future::join;
+use rayon::ThreadPool;
 use roaring::RoaringBitmap;
 use tokio::sync::OnceCell;
 use tracing::{Instrument, debug, warn};
@@ -144,7 +145,8 @@ use crate::{
             candidate::{CandidatePlan, CandidateScope, TermMemos},
             dispatch,
             exec::common::{
-                hit_output_schema, resolve_hits_named, take_file_columns, take_rows_byte_source,
+                candidate_plan_for_filters, hit_output_schema, resolve_hits_named,
+                take_file_columns, take_rows_byte_source,
             },
             provider::prune_leaves_for_filters,
             prune::{PruneLeaf, select_superfiles},
@@ -297,10 +299,48 @@ struct MatchKernel {
     negatives: Vec<String>,
     negative_phrases: Vec<Phrase<String>>,
     locations: IndexLocations,
+    /// The pushed-down `WHERE`'s rows, when its indexes can bound them.
+    row_filter: Option<RowFilter>,
     op_stats: Option<Arc<op_stats::OpStatsCollector>>,
 }
 
 impl MatchKernel {
+    /// `docs` of superfile `suid` without the rows the `WHERE` rules out,
+    /// when [`RowFilter::rows`] finds them; `hits` bounds how many rows the
+    /// match keeps there.
+    async fn keep_filtered(
+        &self,
+        r: &SuperfileReader,
+        suid: Uuid,
+        hits: u64,
+        mut docs: Vec<RowId>,
+    ) -> Result<Vec<RowId>, QueryError> {
+        let Some(filter) = &self.row_filter else {
+            return Ok(docs);
+        };
+        if docs.is_empty() {
+            return Ok(docs);
+        }
+        if let Some(rows) = filter.rows(r, suid, hits).await? {
+            docs.retain(|d| rows.contains(d.get()));
+        }
+        Ok(docs)
+    }
+
+    /// The most rows the match can keep in superfile `suid`: the sum of
+    /// its terms' document counts there, or `n_docs` when the index does not
+    /// list the superfile. Exact for the term unions [`Self::slices`] runs.
+    fn hits_bound(&self, suid: Uuid, n_docs: u64) -> u64 {
+        let Some(held) = self.locations.held(suid) else {
+            return n_docs;
+        };
+        self.terms
+            .iter()
+            .filter_map(|t| held.entry(t).map(|(_, df, _)| *df))
+            .sum::<u64>()
+            .min(n_docs)
+    }
+
     /// What every walk of superfile `suid` starts from: the matched column
     /// under the name `r` knows it by, the index's memo of the terms'
     /// postings there, and the terms.
@@ -361,7 +401,8 @@ impl MatchKernel {
         };
         // One flush per superfile: positive + negation walks.
         self.flush(&work);
-        Ok(docs)
+        let hits = docs.len() as u64;
+        self.keep_filtered(r, suid, hits, docs).await
     }
 
     /// Whether one superfile's walk may be cut into doc-id slices: a plain
@@ -397,6 +438,95 @@ impl MatchKernel {
     }
 
     /// Adds a walk's work to the statement's statistics.
+    fn flush(&self, work: &MatchWork) {
+        if let Some(stats) = &self.op_stats {
+            stats.add_fts_postings_bytes(work.postings_bytes);
+            stats.add_planned_read_ranges(work.planned_ranges);
+            stats.add_kernel_cpu_ns(work.kernel_cpu_ns);
+        }
+    }
+}
+
+/// The rows a pushed-down `WHERE` keeps in each superfile, read from its
+/// indexes on the reader the match already opened, so a match takes no
+/// column for a row the filter rules out. A row set is a superset of the
+/// rows that pass: the `FilterExec` above the scan still decides the rows.
+struct RowFilter {
+    /// The `WHERE` as a bounded candidate plan with no `LIKE` leaf.
+    plan: CandidatePlan,
+    /// The index's locations for the plan's terms in the kept superfiles.
+    locations: PlanLocations,
+    pool: Arc<ThreadPool>,
+    op_stats: Option<Arc<op_stats::OpStatsCollector>>,
+    /// Each superfile's rows, found once and shared by its slices.
+    found: Mutex<HashMap<Uuid, Arc<OnceCell<Option<Arc<RoaringBitmap>>>>>>,
+}
+
+impl RowFilter {
+    /// The filter for `filters` over `kept`, or `None` when the indexes
+    /// bound no row. A `LIKE` is left to the `FilterExec`: binding it walks
+    /// each superfile's dictionary.
+    async fn new(
+        manifest: &ManifestSnapshot,
+        filters: &[Expr],
+        kept: &[Arc<SuperfileEntry>],
+        op_stats: Option<Arc<op_stats::OpStatsCollector>>,
+    ) -> Result<Option<Self>, QueryError> {
+        if filters.is_empty() {
+            return Ok(None);
+        }
+        let plan = candidate_plan_for_filters(manifest, filters);
+        if matches!(plan, CandidatePlan::Unbounded) || plan.has_like() {
+            return Ok(None);
+        }
+        let locations = plan_locations_for(manifest, &plan, kept).await?;
+        Ok(Some(Self {
+            plan,
+            locations,
+            pool: Arc::clone(&manifest.options.reader_pool),
+            op_stats,
+            found: Mutex::new(HashMap::new()),
+        }))
+    }
+
+    /// The rows of superfile `suid` the filter can keep, or `None` when it
+    /// does not narrow them. `hits` bounds the rows the match keeps there:
+    /// the filter's postings are walked only when it keeps fewer rows than
+    /// that, so the walk never costs more than the match's own.
+    async fn rows(
+        &self,
+        r: &SuperfileReader,
+        suid: Uuid,
+        hits: u64,
+    ) -> Result<Option<Arc<RoaringBitmap>>, QueryError> {
+        let cell = {
+            let mut found = self.found.lock().expect("row filter lock poisoned");
+            Arc::clone(found.entry(suid).or_default())
+        };
+        let rows = cell
+            .get_or_try_init(|| async {
+                let located = IndexedSuperfile {
+                    locations: &self.locations,
+                    superfile: suid,
+                };
+                let (estimate, work) = self
+                    .plan
+                    .estimate(r, Some(&self.pool), Some(located))
+                    .await?;
+                self.flush(&work);
+                if estimate >= hits {
+                    return Ok::<_, QueryError>(None);
+                }
+                let memos = memos_from_plan_locations(r, &self.locations, suid).await;
+                let (rows, work) = self.plan.evaluate(r, Some(&self.pool), &memos).await?;
+                self.flush(&work);
+                Ok(rows.map(Arc::new))
+            })
+            .await?;
+        Ok(rows.clone())
+    }
+
+    /// Adds the filter's index work to the statement's statistics.
     fn flush(&self, work: &MatchWork) {
         if let Some(stats) = &self.op_stats {
             stats.add_fts_postings_bytes(work.postings_bytes);
@@ -2726,7 +2856,8 @@ impl SupertableReader {
     /// stable id only where the fan-out tagged one, and must not be asked
     /// for `_id`.
     ///
-    /// Superfiles whose statistics cannot pass `filters` are not walked.
+    /// Superfiles whose statistics cannot pass `filters` are not walked, and
+    /// where the filters' indexes bound their rows, only those rows come out.
     pub(crate) async fn token_match_hits_async(
         &self,
         column: &str,
@@ -2846,11 +2977,15 @@ impl SupertableReader {
                         // blocks under one.
                         let (set, slice_reader, slice_kernel) =
                             (Arc::clone(set), Arc::clone(&r), Arc::clone(&kernel));
-                        run_on_pool_unless_blocking(Some(&reader_pool), "match slice", move || {
-                            slice_kernel.slice(&slice_reader, &set, start, end)
-                        })
+                        let docs = run_on_pool_unless_blocking(
+                            Some(&reader_pool),
+                            "match slice",
+                            move || slice_kernel.slice(&slice_reader, &set, start, end),
+                        )
                         .await
-                        .map_err(|e| QueryError::Internal(e.to_string()))??
+                        .map_err(|e| QueryError::Internal(e.to_string()))??;
+                        let hits = kernel.hits_bound(suid, r.n_docs());
+                        kernel.keep_filtered(&r, suid, hits, docs).await?
                     }
                 };
                 let mut locals: Vec<u32> = docs.into_iter().map(RowId::get).collect();
@@ -2998,6 +3133,8 @@ impl SupertableReader {
                 detail_span!("fts.term_index", terms = all_terms.len())
             }))
             .await?;
+        let row_filter =
+            RowFilter::new(self.manifest(), filters, &kept, self.op_stats.clone()).await?;
         let units: Vec<(Arc<SuperfileEntry>, Uuid)> = kept
             .into_iter()
             .map(|e| {
@@ -3016,6 +3153,7 @@ impl SupertableReader {
             negatives: negatives.terms,
             negative_phrases: negatives.phrases,
             locations,
+            row_filter,
             op_stats: self.op_stats.clone(),
         };
         Ok(Some((units, Arc::new(kernel))))
@@ -3296,7 +3434,8 @@ impl SupertableReader {
     /// **no scoring**. See [`crate::superfile::SuperfileReader::exact_match`]
     /// for the per-superfile two-pass (token-AND prune + raw verify).
     ///
-    /// Superfiles whose statistics cannot pass `filters` are not read.
+    /// Superfiles whose statistics cannot pass `filters` are not read, and
+    /// where the filters' indexes bound their rows, only those are verified.
     ///
     /// `pub(crate)` async kernel; the public surface is the sync
     /// [`SupertableReader::exact_match`].
@@ -3355,6 +3494,9 @@ impl SupertableReader {
                 detail_span!("fts.term_index", terms = token_refs.len())
             }))
             .await?;
+        let row_filter = RowFilter::new(manifest, filters, &kept, self.op_stats.clone())
+            .await?
+            .map(Arc::new);
         let units: Vec<(Arc<SuperfileEntry>, ())> = kept.into_iter().map(|e| (e, ())).collect();
         let column_field_id = self.manifest().field_id(column);
         let column_arc = Arc::new(column.to_owned());
@@ -3372,6 +3514,7 @@ impl SupertableReader {
             let value_arc = Arc::clone(&value_arc);
             let tokens_arc = Arc::clone(&tokens_arc);
             let locations = Arc::clone(&locations);
+            let row_filter = row_filter.clone();
             let op_stats = op_stats.clone();
             let reader_pool = Arc::clone(&reader_pool);
             let budget = Arc::clone(&budget);
@@ -3381,7 +3524,7 @@ impl SupertableReader {
                 // what finds the column in either file.
                 let column_arc = r.column_alias(column_field_id, &column_arc).to_owned();
 
-                let candidates: Vec<u32> = if tokens_arc.is_empty() {
+                let mut candidates: Vec<u32> = if tokens_arc.is_empty() {
                     (0..r.n_docs() as u32).collect()
                 } else {
                     let memo = memo_from_locations(&r, &locations, entry.superfile_id).await;
@@ -3401,6 +3544,14 @@ impl SupertableReader {
                     }
                     docs.into_iter().map(RowId::get).collect()
                 };
+                if let Some(filter) = &row_filter
+                    && !candidates.is_empty()
+                {
+                    let hits = candidates.len() as u64;
+                    if let Some(rows) = filter.rows(&r, entry.superfile_id, hits).await? {
+                        candidates.retain(|d| rows.contains(*d));
+                    }
+                }
                 if candidates.is_empty() {
                     return Ok(Vec::new());
                 }
