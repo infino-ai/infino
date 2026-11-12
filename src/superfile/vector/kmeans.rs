@@ -30,8 +30,8 @@ use rand::{RngExt, SeedableRng, rngs::StdRng};
 use rayon::prelude::*;
 
 use crate::superfile::vector::distance::{
-    Metric, add_f32_to_f64_acc, f64_acc_mean_into_f32, nearest_centroid_transposed,
-    transpose_centroids_cluster_major,
+    CENTROID_ASSIGN_ROWS_PER_TASK, Metric, add_f32_to_f64_acc, f64_acc_mean_into_f32,
+    nearest_centroid_transposed_rows, transpose_centroids_cluster_major,
 };
 
 /// Offset added to a column's `rot_seed` to seed k-means. Keeps the
@@ -227,16 +227,8 @@ fn lloyd_refine(
         // kernel (one transpose per iteration; at small k the transpose is
         // proportionally tiny). Single scan owner, no scalar branch; argmin
         // tie-breaking matches the naive loop (lowest index wins).
-        assignments = {
-            let transposed = transpose_centroids_cluster_major(&centroids, k, dim);
-            (0..n)
-                .into_par_iter()
-                .map(|d| {
-                    let v = &vectors[d * dim..(d + 1) * dim];
-                    nearest_centroid_transposed(Metric::L2Sq, v, &transposed, k, dim).0
-                })
-                .collect()
-        };
+        let transposed = transpose_centroids_cluster_major(&centroids, k, dim);
+        assign_to_transposed_centroids(vectors, &transposed, dim, k, &mut assignments);
 
         // Update — per-thread (sums, counts) accumulators reduced
         // pairwise. Sums in f64 for numeric stability; counts in u64
@@ -360,11 +352,12 @@ pub(crate) fn assign_to_transposed_centroids(
         "assign_to_transposed_centroids: one assignment per row"
     );
     assignments
-        .par_iter_mut()
+        .par_chunks_mut(CENTROID_ASSIGN_ROWS_PER_TASK)
         .enumerate()
-        .for_each(|(d, slot)| {
-            let v = &vectors[d * dim..(d + 1) * dim];
-            *slot = nearest_centroid_transposed(Metric::L2Sq, v, transposed, k, dim).0;
+        .for_each(|(task, slots)| {
+            let start = task * CENTROID_ASSIGN_ROWS_PER_TASK;
+            let rows = &vectors[start * dim..(start + slots.len()) * dim];
+            nearest_centroid_transposed_rows(Metric::L2Sq, rows, transposed, k, dim, slots);
         });
 }
 
