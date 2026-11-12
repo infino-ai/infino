@@ -1202,10 +1202,11 @@ pub(in crate::supertable::optimize::compact) mod tests {
     }
 
     #[test]
-    fn pending_job_emit_requires_two_inputs() {
-        // A single-input pending job never emits even if it reaches the fill
-        // floor and the count trigger (emit takes a pre-clamped count of 2, so
-        // one input clears neither the size nor the count leg).
+    fn pending_job_emit_requires_two_inputs_without_a_reclaim() {
+        // A single input with no deleted rows to reclaim never emits, even if
+        // it reaches the fill floor and the count trigger (emit takes a
+        // pre-clamped count of 2, so one input clears neither the size nor
+        // the count leg). Only a reclaim emits a job of one input.
         let mut jobs = Vec::new();
         let mut p = PendingJob::default();
         p.push(&seg(1, 200, 1000, 0), mib(1024));

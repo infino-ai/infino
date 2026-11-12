@@ -4227,11 +4227,6 @@ mod tests {
         assert_eq!(provider.surviving_superfile_count(&after).await, 0);
     }
 
-    /// Under [`SupertableProvider::reading_tombstones_once`] a superfile's
-    /// deleted rows are those its first read found, for every provider
-    /// derived from it: a delete committed later in the call is not seen, so
-    /// the counts one call makes agree with each other. A plain provider
-    /// asks the cache each time and sees it.
     /// A scan's statistics count the deleted rows of the call's own read:
     /// a delete committed after a statement read a superfile's deletes is
     /// left out of the row count its residual scan reports as exact, as it
@@ -4273,6 +4268,11 @@ mod tests {
         );
     }
 
+    /// Under [`SupertableProvider::reading_tombstones_once`] a superfile's
+    /// deleted rows are those its first read found, for every provider
+    /// derived from it: a delete committed later in the call is not seen, so
+    /// the counts one call makes agree with each other. A plain provider
+    /// asks the cache each time and sees it.
     #[test]
     fn a_call_reading_tombstones_once_sees_one_set_of_deletes() {
         let dir = TempDir::new().expect("tempdir");

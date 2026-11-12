@@ -76,6 +76,8 @@ const DELETE_SCATTERED: u32 = 2;
 const DELETE_RUN: u32 = 3;
 /// Chance a row goes in a scattered delete.
 const SCATTERED_CHANCE: f64 = 0.2;
+/// Ranges on `i` and `j`, every aggregate taken over each.
+const RANGES_ON_COLUMNS: [&str; 4] = ["i BETWEEN -1 AND 1", "i >= 2", "j BETWEEN 1 AND 3", "j < 0"];
 /// The columns aggregated: name, and whether SUM/AVG apply.
 const COLUMNS: [(&str, bool); 6] = [
     ("g", false),
@@ -202,12 +204,10 @@ struct Fixture {
 }
 
 impl Fixture {
-    fn new(seed: u64) -> Self {
+    fn new(seed: u64, index: IndexSpec) -> Self {
         let dir = TempDir::new().expect("tempdir");
         let conn = connect(dir.path().to_str().expect("utf8 path")).expect("connect");
-        let table = conn
-            .create_table(TABLE, schema(), IndexSpec::new())
-            .expect("create");
+        let table = conn.create_table(TABLE, schema(), index).expect("create");
         let mut rng = StdRng::seed_from_u64(seed);
         let n_files = rng.random_range(MIN_FILES..=MAX_FILES);
         let mut files = Vec::with_capacity(n_files);
@@ -485,7 +485,7 @@ fn aggregates_from_statistics_match_the_scan_under_random_deletes() {
     // after deletes, across every seed.
     let (mut clean, mut deleted, mut wholly) = (0, 0, 0);
     for seed in 0..SEEDS {
-        let mut fixture = Fixture::new(seed);
+        let mut fixture = Fixture::new(seed, IndexSpec::new());
         clean += assert_answers_match_scans(&mut fixture, &format!("seed {seed}, no deletes")).0;
         for round in ["first", "second"] {
             fixture.delete_some();
@@ -503,6 +503,60 @@ fn aggregates_from_statistics_match_the_scan_under_random_deletes() {
     assert!(
         wholly > 0,
         "deleted rows are corrected for, not only scanned"
+    );
+}
+
+/// Whether a plan counts rows from a range index: its scan reads no column
+/// and holds the whole filter.
+fn counts_from_range_index(explained: &str) -> bool {
+    explained.contains("projection=[], full_filters=")
+}
+
+/// On random tables with range indexes on `i` and `j`, before any delete
+/// and after each of two rounds of random deletes, `COUNT(*)` and every
+/// column's `COUNT`, `MIN`, `MAX` and `SUM` over a range of `i` or `j`
+/// equal the scan of the same statement. A range
+/// `COUNT(*)` on an indexed column is answered from value counts while no
+/// superfile with deletes needs a scan, and counted from the range index
+/// once one does.
+#[test]
+fn range_indexed_aggregates_match_the_scan_under_random_deletes() {
+    let (mut from_counts, mut from_index) = (0, 0);
+    for seed in 0..SEEDS {
+        let mut fixture = Fixture::new(seed, IndexSpec::new().range("i").range("j"));
+        for round in ["no", "first", "second"] {
+            if round != "no" {
+                fixture.delete_some();
+            }
+            for filter in RANGES_ON_COLUMNS {
+                for (name, numeric) in COLUMNS {
+                    let mut select = format!("COUNT(*), COUNT({name}), MIN({name}), MAX({name})");
+                    if numeric {
+                        select.push_str(&format!(", SUM({name})"));
+                    }
+                    let answered = statement(&select, Some(filter), None);
+                    let (sql, forced) = (answered.sql(false), answered.sql(true));
+                    assert_same_rows(
+                        &rows_of(&fixture.conn.query_sql(&sql).expect("answer")),
+                        &rows_of(&fixture.conn.query_sql(&forced).expect("scan")),
+                        &format!("seed {seed}, {round} deletes: {sql}"),
+                    );
+                }
+                let count = statement("COUNT(*)", Some(filter), None);
+                assert_matches_scan(&fixture.conn, &count);
+                let explained = explain(&fixture.conn, &count.sql(false));
+                if !uses_scan(&explained) {
+                    from_counts += 1;
+                } else if counts_from_range_index(&explained) {
+                    from_index += 1;
+                }
+            }
+        }
+    }
+    eprintln!("range COUNT(*): {from_counts} from value counts, {from_index} from the range index");
+    assert!(
+        from_counts > 0 && from_index > 0,
+        "both the value counts and the range index answer some range counts"
     );
 }
 
@@ -637,7 +691,7 @@ fn deleted_values_leave_nothing_behind() {
 /// answers it, whatever deleted rows a newer reader has read since.
 #[test]
 fn a_pinned_reader_answers_as_its_own_scan_across_deletes_and_compaction() {
-    let mut fixture = Fixture::new(SEEDS);
+    let mut fixture = Fixture::new(SEEDS, IndexSpec::new());
     fixture.delete_some();
     let statements = statements_on(&fixture.files);
     let check = |reader: &SupertableReader, when: &str| {
