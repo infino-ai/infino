@@ -582,6 +582,23 @@ fn the_schema_write_adds_renames_and_drops_and_reads_follow() {
     assert_eq!(docs.schema().fields().len(), 3);
 }
 
+/// Swaps the names of columns `a` and `b`, each keeping its field id.
+fn swap_a_and_b(db: &Connection) {
+    let before = db
+        .apply_schema(TABLE, &patch(vec![]), None)
+        .expect("read the schema");
+    let a_id = before.id_of("a").expect("a");
+    let b_id = before.id_of("b").expect("b");
+    for (name, id) in [("tmp", a_id), ("a", b_id), ("b", a_id)] {
+        db.apply_schema(
+            TABLE,
+            &patch(vec![FieldPatch::named(name).with_id(id)]),
+            None,
+        )
+        .expect("rename");
+    }
+}
+
 /// Two full-text columns that swap names: a superfile written before the
 /// swap keys each dictionary by the old name, so every index-backed
 /// `WHERE` must find a column's terms by its id, not its current name.
@@ -606,19 +623,7 @@ fn a_where_on_full_text_columns_follows_a_name_swap() {
     ]))
     .expect("append");
 
-    let before = db
-        .apply_schema(TABLE, &patch(vec![]), None)
-        .expect("read the schema");
-    let a_id = before.id_of("a").expect("a");
-    let b_id = before.id_of("b").expect("b");
-    for (name, id) in [("tmp", a_id), ("a", b_id), ("b", a_id)] {
-        db.apply_schema(
-            TABLE,
-            &patch(vec![FieldPatch::named(name).with_id(id)]),
-            None,
-        )
-        .expect("rename");
-    }
+    swap_a_and_b(&db);
     assert_eq!(
         rows(&db, "SELECT title, a, b FROM docs"),
         vec!["rust one|v|p", "rust three|w|p", "rust two|w|q"]
@@ -645,6 +650,58 @@ fn a_where_on_full_text_columns_follows_a_name_swap() {
             "SELECT title FROM bm25_search('docs', 'title', 'rust', 10) WHERE b LIKE 'q%'",
             &["rust two"],
         ),
+    ];
+    for (sql, want) in cases {
+        assert_eq!(rows(&db, sql), *want, "{sql}");
+    }
+}
+
+/// The rows an exact `ILIKE` is checked on — the few a bound leaves, and
+/// the doubtful ones a dotted capital I leaves — are read from their
+/// stored text, which a superfile written before a name swap holds under
+/// the old names: the check must read each column by its id.
+#[test]
+fn an_exact_where_checks_rows_by_id_after_a_name_swap() {
+    let db = connect("memory://").expect("connect");
+    let docs = db
+        .create_table(
+            TABLE,
+            Arc::new(Schema::new(vec![
+                Field::new("title", DataType::LargeUtf8, false),
+                Field::new("a", DataType::LargeUtf8, false),
+                Field::new("b", DataType::LargeUtf8, false),
+            ])),
+            IndexSpec::new().fts("title").fts("a").fts("b"),
+        )
+        .expect("create");
+    docs.append(&batch(vec![
+        (
+            "title",
+            titles(&["one", "two", "three", "four", "five", "six"]),
+        ),
+        ("a", titles(&["qx", "p", "p", "p", "p", "p"])),
+        ("b", titles(&["v", "w", "w", "w", "w", "w"])),
+    ]))
+    .expect("append");
+    docs.append(&batch(vec![
+        ("title", titles(&["seven"])),
+        ("a", titles(&["x\u{130}"])),
+        ("b", titles(&["xi"])),
+    ]))
+    .expect("append");
+    swap_a_and_b(&db);
+
+    let cases: &[(&str, &[&str])] = &[
+        (
+            "SELECT title FROM docs WHERE b LIKE 'q%' AND a ILIKE '%x%'",
+            &[],
+        ),
+        (
+            "SELECT title FROM docs WHERE b LIKE 'q%' AND b ILIKE '%x%'",
+            &["one"],
+        ),
+        ("SELECT title FROM docs WHERE b ILIKE '%xi%'", &[]),
+        ("SELECT title FROM docs WHERE a ILIKE '%xi%'", &["seven"]),
     ];
     for (sql, want) in cases {
         assert_eq!(rows(&db, sql), *want, "{sql}");
