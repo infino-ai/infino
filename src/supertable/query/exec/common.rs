@@ -2072,10 +2072,13 @@ pub(crate) async fn take_rows_byte_source(
     }
     let metadata = match reader.loaded_parquet_metadata_named(names) {
         Some(metadata) => metadata,
-        None => reader
-            .parquet_metadata_with_page_index(&IndexColumns::named(names))
-            .await
-            .map_err(QueryError::from)?,
+        None => {
+            reader
+                .page_indexed_footer(&IndexColumns::named(names), pool)
+                .await
+                .map_err(QueryError::from)?
+                .1
+        }
     };
     let source = Source::Lazy(reader.byte_source());
     // Fetch the take's column chunks at once rather than letting the decode

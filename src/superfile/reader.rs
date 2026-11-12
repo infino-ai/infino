@@ -56,7 +56,7 @@ use parquet::{
 };
 use rayon::ThreadPool;
 use roaring::RoaringBitmap;
-use tokio::sync::OnceCell;
+use tokio::sync::{Mutex as AsyncMutex, OnceCell};
 use tracing::warn;
 
 #[cfg(test)]
@@ -121,6 +121,10 @@ const SIDECAR_MIN_ROW_SHARE: u64 = 2;
 /// the rows cluster (matches close in time, as a log's are) and whole
 /// pages hold none of them.
 pub(crate) const WHOLE_COLUMN_TAKE_DIVISOR: u64 = 16;
+
+/// Names a page-index decode handed to the reader pool, for the error a
+/// panic in it returns.
+const PAGE_INDEX_DECODE: &str = "page index decode";
 
 pub(crate) fn vector_layout_from_kv(kv_map: &HashMap<String, String>) -> VectorLayout {
     kv_map
@@ -313,6 +317,11 @@ pub struct SuperfileReader {
     /// first callers wait on the same read, and a failed read is tried again
     /// by the next caller.
     page_index_read: OnceCell<()>,
+    /// Taken across an async page-index load
+    /// ([`Self::page_indexed_footer`]), so concurrent loads on the reader
+    /// decode one after another, each finding what the one before loaded,
+    /// rather than all decoding the same columns.
+    page_index_load: AsyncMutex<()>,
     /// The page-indexed footer as a table's scans of this superfile prune
     /// by, with the footer it was derived from: derived by the first scan
     /// that asks ([`Self::scan_footer`]) and shared by every later one until
@@ -641,6 +650,55 @@ fn offset_index_from_bytes(
     Ok(Arc::new(
         loader.finish().map_err(footer::FooterError::from)?,
     ))
+}
+
+/// What a page-index load of some columns does next
+/// ([`SuperfileReader::add_page_index`]).
+enum LoadStep {
+    /// Nothing: the footer holds the columns, and these are the columns it
+    /// holds.
+    Done(IndexColumns, Arc<Footer>),
+    /// Decode more of the page index into a new footer.
+    Decode(IndexLoad),
+}
+
+/// A planned page-index load: everything its decode reads, owned, so the
+/// decode can run on the reader pool, and what installing it checks.
+struct IndexLoad {
+    /// The footer the load decodes into; the result installs only while
+    /// it is still the reader's.
+    current: Arc<Footer>,
+    /// The leaves `current` holds the page index of.
+    loaded: RoaringBitmap,
+    /// The leaves this load adds.
+    added: RoaringBitmap,
+    bytes: PageIndexBytes,
+    costs: LoadCosts,
+}
+
+impl IndexLoad {
+    /// The footer with `added`'s page index decoded in, `None` when it needs
+    /// no new copy, and the reader's load costs after it.
+    fn decode(&self) -> Result<(Option<Arc<Footer>>, LoadCosts), ReadError> {
+        let parquet = self.current.parquet();
+        // A footer already indexed needs no new copy for no new leaf (a
+        // column the file does not store), and such an ask costs nothing;
+        // a footer not yet indexed gets its entries even then, so
+        // DataFusion's opener never loads the page index itself.
+        if self.added.is_empty() && parquet.offset_index().is_some() {
+            return Ok((None, self.costs));
+        }
+        let (indexed, load) = self
+            .bytes
+            .apply(parquet, &self.added)
+            .map_err(footer::FooterError::from)?;
+        let building = Instant::now();
+        let footer = Arc::new(self.current.over(Arc::new(indexed))?);
+        let costs = self
+            .costs
+            .after(load, building.elapsed(), index_len(parquet, &self.added));
+        Ok((Some(footer), costs))
+    }
 }
 
 /// What a reader's page-index loads have taken, for the rent-or-buy rule
@@ -1047,6 +1105,7 @@ impl SuperfileReader {
             index_columns: ArcSwapOption::empty(),
             page_index: StdMutex::new(PageIndex::Unloaded),
             page_index_read: OnceCell::new(),
+            page_index_load: AsyncMutex::new(()),
             scan_footer: ArcSwapOption::empty(),
             source: Some(source),
             schema,
@@ -1194,6 +1253,7 @@ impl SuperfileReader {
             index_columns: ArcSwapOption::empty(),
             page_index: StdMutex::new(PageIndex::Unloaded),
             page_index_read: OnceCell::new(),
+            page_index_load: AsyncMutex::new(()),
             scan_footer: ArcSwapOption::empty(),
             source: None,
             schema,
@@ -1248,19 +1308,25 @@ impl SuperfileReader {
     /// every column, the reader reads its page index once. Each load replaces
     /// the footer (see [`Footer`]), so the reader keeps one copy of its
     /// row-group metadata.
+    #[cfg(test)]
     pub(crate) async fn parquet_metadata_with_page_index(
         &self,
         columns: &IndexColumns,
     ) -> Result<Arc<ParquetMetaData>, ReadError> {
-        Ok(self.page_indexed_footer(columns).await?.1)
+        Ok(self.page_indexed_footer(columns, None).await?.1)
     }
 
     /// [`Self::parquet_metadata_with_page_index`], with the columns the
     /// footer holds the page index of (it may hold more than `columns`,
-    /// never fewer).
+    /// never fewer), decoding on `pool` when given.
+    ///
+    /// Concurrent loads on one reader take turns: a caller waits, without
+    /// holding a thread, for the load before it, and decodes only what that
+    /// load left out, so they never decode and copy the same index twice.
     pub(crate) async fn page_indexed_footer(
         &self,
         columns: &IndexColumns,
+        pool: Option<&ThreadPool>,
     ) -> Result<(IndexColumns, Arc<ParquetMetaData>), ReadError> {
         if let Some(loaded) = self.loaded_page_indexed_footer(columns) {
             return Ok(loaded);
@@ -1270,7 +1336,8 @@ impl SuperfileReader {
                 .get_or_try_init(|| self.read_page_index(source.as_ref()))
                 .await?;
         }
-        let (held, footer) = self.add_page_index(columns)?;
+        let _turn = self.page_index_load.lock().await;
+        let (held, footer) = self.add_page_index_on(columns, pool).await?;
         Ok((held, Arc::clone(footer.parquet())))
     }
 
@@ -1405,98 +1472,147 @@ impl SuperfileReader {
         columns: &IndexColumns,
     ) -> Result<(IndexColumns, Arc<Footer>), ReadError> {
         loop {
-            if let Some(loaded) = self.indexed_footer(columns) {
-                return Ok(loaded);
-            }
-            let current = self.footer.load_full();
-            // A resident reader's first load starts from its own bytes. The
-            // walk over the footer that finds them runs before the lock, and
-            // the first caller to finish installs its result.
-            if matches!(*self.lock_page_index(), PageIndex::Unloaded) {
-                let Some(file) = &self.bytes else {
-                    return Ok((IndexColumns::none(), current));
-                };
-                let fresh = resident_page_index(current.parquet(), file)?;
-                let mut state = self.lock_page_index();
-                if matches!(*state, PageIndex::Unloaded) {
-                    *state = fresh;
-                }
-            }
-            let (loaded, bytes, costs) = match &*self.lock_page_index() {
-                PageIndex::Partial {
-                    loaded,
-                    bytes,
-                    costs,
-                    ..
-                } => (loaded.clone(), bytes.clone(), *costs),
-                // Complete with no index: the footer is all there is.
-                _ => {
-                    self.index_columns.store(Some(Arc::new(IndexColumns::All)));
-                    return Ok((IndexColumns::All, self.footer.load_full()));
-                }
+            let load = match self.plan_page_index_load(columns)? {
+                LoadStep::Done(held, footer) => return Ok((held, footer)),
+                LoadStep::Decode(load) => load,
             };
-            let parquet = current.parquet();
-            let schema = parquet.file_metadata().schema_descr();
-            let leaves = schema.num_columns() as u64;
-            let mut added = columns.leaves(schema) - &loaded;
-            // Rent or buy (see `PageIndex`): load every column instead once
-            // this load would take what loads have cost past one full load.
-            if !added.is_empty()
-                && costs.load_everything_instead(index_len(parquet, &added), bytes.len())
-            {
-                added = IndexColumns::All.leaves(schema) - &loaded;
+            let decoded = load.decode()?;
+            if let Some(done) = self.install_page_index(columns, load, decoded) {
+                return Ok(done);
             }
-            // A footer already indexed needs no new copy for no new leaf (a
-            // column the file does not store), and such an ask costs nothing;
-            // a footer not yet indexed gets its entries even then, so
-            // DataFusion's opener never loads the page index itself.
-            let (indexed, costs) = match added.is_empty() && parquet.offset_index().is_some() {
-                true => (None, costs),
-                false => {
-                    let (indexed, load) = bytes
-                        .apply(parquet, &added)
-                        .map_err(footer::FooterError::from)?;
-                    let building = Instant::now();
-                    let footer = Arc::new(current.over(Arc::new(indexed))?);
-                    let costs = costs.after(load, building.elapsed(), index_len(parquet, &added));
-                    (Some(footer), costs)
-                }
-            };
-            let mut state = self.lock_page_index();
-            if !Arc::ptr_eq(&self.footer.load(), &current) {
-                continue;
-            }
-            let PageIndex::Partial { columns: held, .. } = &*state else {
-                continue;
-            };
-            let loaded = &loaded | &added;
-            // A chunk without an offset index drops the whole page index, as
-            // arrow-rs does: nothing more can load.
-            let complete = loaded.len() == leaves
-                || indexed
-                    .as_ref()
-                    .is_some_and(|footer| footer.parquet().offset_index().is_none());
-            let held = match complete {
-                true => IndexColumns::All,
-                false => held.union(columns),
-            };
-            if let Some(indexed) = indexed {
-                self.footer.store(indexed);
-                // The derived footer may be the replaced one itself; let it go.
-                self.scan_footer.store(None);
-            }
-            *state = match complete {
-                true => PageIndex::Complete,
-                false => PageIndex::Partial {
-                    columns: held.clone(),
-                    loaded,
-                    bytes,
-                    costs,
-                },
-            };
-            self.index_columns.store(Some(Arc::new(held.clone())));
-            return Ok((held, self.footer.load_full()));
         }
+    }
+
+    /// [`Self::add_page_index`] with the decode on `pool`, awaited, so a
+    /// tokio worker drives I/O rather than the decode and footer copy. With
+    /// no pool the decode runs here.
+    async fn add_page_index_on(
+        &self,
+        columns: &IndexColumns,
+        pool: Option<&ThreadPool>,
+    ) -> Result<(IndexColumns, Arc<Footer>), ReadError> {
+        let Some(pool) = pool else {
+            return self.add_page_index(columns);
+        };
+        loop {
+            let load = match self.plan_page_index_load(columns)? {
+                LoadStep::Done(held, footer) => return Ok((held, footer)),
+                LoadStep::Decode(load) => load,
+            };
+            let (load, decoded) =
+                run_on_pool_unless_blocking(Some(pool), PAGE_INDEX_DECODE, move || {
+                    let decoded = load.decode();
+                    (load, decoded)
+                })
+                .await
+                .map_err(|_| ReadError::TaskDropped(PAGE_INDEX_DECODE))?;
+            if let Some(done) = self.install_page_index(columns, load, decoded?) {
+                return Ok(done);
+            }
+        }
+    }
+
+    /// What a load of `columns` must do from the state now: nothing, with
+    /// the footer that already holds them, or the decode to run.
+    fn plan_page_index_load(&self, columns: &IndexColumns) -> Result<LoadStep, ReadError> {
+        if let Some((held, footer)) = self.indexed_footer(columns) {
+            return Ok(LoadStep::Done(held, footer));
+        }
+        let current = self.footer.load_full();
+        // A resident reader's first load starts from its own bytes. The
+        // walk over the footer that finds them runs before the lock, and
+        // the first caller to finish installs its result.
+        if matches!(*self.lock_page_index(), PageIndex::Unloaded) {
+            let Some(file) = &self.bytes else {
+                return Ok(LoadStep::Done(IndexColumns::none(), current));
+            };
+            let fresh = resident_page_index(current.parquet(), file)?;
+            let mut state = self.lock_page_index();
+            if matches!(*state, PageIndex::Unloaded) {
+                *state = fresh;
+            }
+        }
+        let (loaded, bytes, costs) = match &*self.lock_page_index() {
+            PageIndex::Partial {
+                loaded,
+                bytes,
+                costs,
+                ..
+            } => (loaded.clone(), bytes.clone(), *costs),
+            // Complete with no index: the footer is all there is.
+            _ => {
+                self.index_columns.store(Some(Arc::new(IndexColumns::All)));
+                return Ok(LoadStep::Done(IndexColumns::All, self.footer.load_full()));
+            }
+        };
+        let parquet = current.parquet();
+        let schema = parquet.file_metadata().schema_descr();
+        let mut added = columns.leaves(schema) - &loaded;
+        // Rent or buy (see `PageIndex`): load every column instead once
+        // this load would take what loads have cost past one full load.
+        if !added.is_empty()
+            && costs.load_everything_instead(index_len(parquet, &added), bytes.len())
+        {
+            added = IndexColumns::All.leaves(schema) - &loaded;
+        }
+        Ok(LoadStep::Decode(IndexLoad {
+            current,
+            loaded,
+            added,
+            bytes,
+            costs,
+        }))
+    }
+
+    /// Installs `decoded`, what `load` decoded for `columns`, and returns the
+    /// footer and the columns it holds; `None` when another caller installed
+    /// a footer since `load` was planned, so the load starts again from it.
+    fn install_page_index(
+        &self,
+        columns: &IndexColumns,
+        load: IndexLoad,
+        (indexed, costs): (Option<Arc<Footer>>, LoadCosts),
+    ) -> Option<(IndexColumns, Arc<Footer>)> {
+        let mut state = self.lock_page_index();
+        if !Arc::ptr_eq(&self.footer.load(), &load.current) {
+            return None;
+        }
+        let PageIndex::Partial { columns: held, .. } = &*state else {
+            return None;
+        };
+        let leaves = load
+            .current
+            .parquet()
+            .file_metadata()
+            .schema_descr()
+            .num_columns() as u64;
+        let loaded = &load.loaded | &load.added;
+        // A chunk without an offset index drops the whole page index, as
+        // arrow-rs does: nothing more can load.
+        let complete = loaded.len() == leaves
+            || indexed
+                .as_ref()
+                .is_some_and(|footer| footer.parquet().offset_index().is_none());
+        let held = match complete {
+            true => IndexColumns::All,
+            false => held.union(columns),
+        };
+        if let Some(indexed) = indexed {
+            self.footer.store(indexed);
+            // The derived footer may be the replaced one itself; let it go.
+            self.scan_footer.store(None);
+        }
+        *state = match complete {
+            true => PageIndex::Complete,
+            false => PageIndex::Partial {
+                columns: held.clone(),
+                loaded,
+                bytes: load.bytes,
+                costs,
+            },
+        };
+        self.index_columns.store(Some(Arc::new(held.clone())));
+        Some((held, self.footer.load_full()))
     }
 
     /// The page-index state, locked. The state is replaced in one assignment
@@ -4283,6 +4399,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        runtime_bridge::held_pool,
         superfile::{
             builder::{BuilderOptions, FtsConfig, SuperfileBuilder},
             format::footer::with_forged_footer_kv,
@@ -5509,6 +5626,53 @@ mod tests {
             "both callers must get the one load"
         );
         assert_serves_only(&reader, &first, &plain);
+    }
+
+    /// Concurrent loads on one reader given a pool decode there, not on the
+    /// runtime, and one at a time: while the first decode waits for the
+    /// pool, the others wait for it rather than each planning a decode and
+    /// copy of the same index. A planned decode holds the footer it copies,
+    /// so the footer's count of holders counts the decodes in flight.
+    #[tokio::test]
+    async fn concurrent_page_index_loads_decode_once_on_the_pool() {
+        const LOADS: usize = 8;
+        let reader =
+            Arc::new(SuperfileReader::open(build_simple_fts_only_superfile()).expect("open"));
+        let (pool, release) = held_pool();
+        let pool = Arc::new(pool);
+        let loads: Vec<_> = (0..LOADS)
+            .map(|_| {
+                let (reader, pool) = (Arc::clone(&reader), Arc::clone(&pool));
+                tokio::spawn(async move {
+                    reader
+                        .page_indexed_footer(&IndexColumns::All, Some(&pool))
+                        .await
+                        .expect("load")
+                        .1
+                })
+            })
+            .collect();
+        // Nothing here reads storage, so each yield lets every load run on
+        // to where it waits.
+        for _ in 0..LOADS {
+            yield_now().await;
+        }
+        assert!(
+            loads.iter().all(|load| !load.is_finished()),
+            "no load decodes on the runtime while the pool is busy"
+        );
+        let plain = reader.footer.load_full();
+        // The reader's own hold, `plain`, and the one decode in flight.
+        assert_eq!(Arc::strong_count(&plain), 3, "one decode in flight");
+        drop((plain, release));
+        let footers = try_join_all(loads).await.expect("loads");
+        assert!(
+            footers
+                .iter()
+                .all(|footer| Arc::ptr_eq(footer, &footers[0])),
+            "every load gets the one footer"
+        );
+        assert!(matches!(*reader.lock_page_index(), PageIndex::Complete));
     }
 
     /// A source that records each read, and whether it asked for exactly

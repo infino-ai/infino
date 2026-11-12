@@ -324,7 +324,7 @@ impl ScanFileOpener {
                     // only for lazily opened readers, so `sql_page_bytes`
                     // would depend on the reader cache's state.
                     let (held, parquet_meta) = reader
-                        .page_indexed_footer(&columns)
+                        .page_indexed_footer(&columns, None)
                         .await
                         .map_err(QueryError::from)?;
                     prepare_scan_file(
