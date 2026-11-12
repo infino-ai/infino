@@ -31,7 +31,7 @@ use serde_json::{Value, json};
 use super::{RemoteCatalog, read_arrow, read_json, wire};
 use crate::{
     Bm25SearchOptions, BoolMode, GcError, GcReport, InfinoError, MutationStats, OptimizeError,
-    OptimizeOptions, ReindexError, ReindexOptions, Supertable, VectorFilter,
+    OptimizeOptions, ReindexError, ReindexOptions, StagedAppend, Supertable, VectorFilter,
     catalog::table::Table,
     dynamic::rows_to_batch,
     superfile::VectorSearchOptions,
@@ -243,6 +243,20 @@ impl Table for RemoteTable {
     /// name has nowhere to travel. Refused rather than silently dropped: a
     /// caller asking for named superfiles and getting unnamed ones would have
     /// no way to tell.
+    /// Staging writes superfiles to the table's storage, which the hosted
+    /// side owns: a hosted table appends.
+    fn stage(&self, _batch: &RecordBatch) -> Result<StagedAppend, InfinoError> {
+        Err(InfinoError::Unsupported(
+            "stage is not available on a hosted table; use append".into(),
+        ))
+    }
+
+    fn attach(&self, _staged: &[StagedAppend]) -> Result<(), InfinoError> {
+        Err(InfinoError::Unsupported(
+            "attach is not available on a hosted table; use append".into(),
+        ))
+    }
+
     fn append_named(&self, _batch: &RecordBatch, source_name: &str) -> Result<(), InfinoError> {
         Err(InfinoError::Backend(format!(
             "append_named({source_name:?}) is not available on a hosted table: the append wire \

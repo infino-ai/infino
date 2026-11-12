@@ -219,6 +219,7 @@ pub use supertable::{
         change::{FieldPatch, SchemaPatch},
         error::SchemaError,
     },
+    writer::StagedAppend,
 };
 
 /// Convenience builders for test fixtures. Visible to:
