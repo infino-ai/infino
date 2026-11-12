@@ -160,10 +160,7 @@ pub(in crate::supertable) async fn reclaim(
     report.still_referenced = kept.len();
     // Attached replicas name superfiles and slices this table may have retired (a fold they
     // replaced, a resend's identical slice): those wait for the sweep after the replicas detach.
-    // An unreadable listing counts as attached.
-    let attached = crate::storage::attached_replicas(storage.as_ref())
-        .await
-        .map_or(true, |names| !names.is_empty());
+    let attached = crate::storage::may_be_attached(storage.as_ref()).await;
     if attached {
         targets.retain(|key| {
             let data = key

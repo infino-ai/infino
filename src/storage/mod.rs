@@ -56,8 +56,8 @@ pub use gcs::GcsStorageProvider;
 pub use local_fs::LocalFsStorageProvider;
 pub(crate) use options::StorageOptions;
 pub use s3::S3StorageProvider;
-pub(crate) use split::attached_replicas;
 pub use split::{REPLICAS_DIR, SplitStorageProvider};
+pub(crate) use split::{attached_replicas, mark_attached, may_be_attached, settle_attached};
 
 use crate::runtime_metrics::io::UsageMeter;
 

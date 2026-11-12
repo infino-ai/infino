@@ -22,6 +22,41 @@ pub struct SplitStorageProvider {
 /// grafted.
 pub const REPLICAS_DIR: &str = "_replicas/";
 
+/// A table's marker that replicas may be attached, beside [`REPLICAS_DIR`] rather than in it: one
+/// HEAD answers what a listing of the replicas would, for paths that must not list.
+const ATTACHED_MARKER: &str = "_replicas.attached";
+
+/// Records that a replica of the table on `storage` exists; after the replica's manifest.
+pub(crate) async fn mark_attached(storage: &dyn StorageProvider) -> Result<(), StorageError> {
+    storage
+        .put_overwrite(ATTACHED_MARKER, Bytes::from_static(b"attached"))
+        .await
+}
+
+/// Whether the table on `storage` may have replicas attached; an unreadable marker counts as yes.
+pub(crate) async fn may_be_attached(storage: &dyn StorageProvider) -> bool {
+    !matches!(
+        storage.head(ATTACHED_MARKER).await,
+        Err(StorageError::NotFound { .. })
+    )
+}
+
+/// Clears the marker once no replica is attached. A replica that attaches meanwhile writes its
+/// marker after its manifest, so the listing after the delete sees it and the marker is restored.
+pub(crate) async fn settle_attached(storage: &dyn StorageProvider) -> Result<(), StorageError> {
+    if !attached_replicas(storage).await?.is_empty() {
+        return Ok(());
+    }
+    match storage.delete(ATTACHED_MARKER).await {
+        Ok(()) | Err(StorageError::NotFound { .. }) => {}
+        Err(e) => return Err(e),
+    }
+    if !attached_replicas(storage).await?.is_empty() {
+        mark_attached(storage).await?;
+    }
+    Ok(())
+}
+
 /// Names of the replicas attached to the table on `storage`: those with an object left under
 /// [`REPLICAS_DIR`]. Judged by objects, since a local directory outlives its last file.
 pub(crate) async fn attached_replicas(

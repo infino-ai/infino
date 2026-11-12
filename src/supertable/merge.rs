@@ -446,7 +446,22 @@ pub fn open_replica(table: &Supertable, name: &str) -> Result<Supertable, QueryE
     options.metadata_disk_cache = None;
     options.term_index_replica = true;
     options.read_consistency = Consistency::Strong;
-    Supertable::create(options).map_err(internal)
+    let replica = Supertable::create(options).map_err(internal)?;
+    table.block_on_query(async {
+        crate::storage::mark_attached(storage_of_table(table)?.as_ref())
+            .await
+            .map_err(internal)
+    })?;
+    Ok(replica)
+}
+
+fn storage_of_table(table: &Supertable) -> Result<Arc<dyn StorageProvider>, QueryError> {
+    table
+        .inner()
+        .options
+        .storage
+        .clone()
+        .ok_or_else(|| internal("the table has no storage"))
 }
 
 /// Names of the replicas attached to `table` (see [`crate::storage::REPLICAS_DIR`]).
@@ -484,6 +499,9 @@ pub fn detach_replicas(table: &Supertable) -> Result<usize, QueryError> {
             .buffer_unordered(DELETES_IN_FLIGHT)
             .try_collect::<Vec<()>>()
             .await?;
+        crate::storage::settle_attached(storage.as_ref())
+            .await
+            .map_err(internal)?;
         Ok(keys.len())
     })
 }
