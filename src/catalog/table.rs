@@ -843,7 +843,10 @@ impl Supertable {
         load::graft_load(self.local_for_load()?, load)
     }
 
-    /// Finishes `load` once every replica is sealed (see [`load::finish_load`]).
+    /// Finishes `load`: once every replica is sealed, adds what is left, checks every replica's
+    /// batches are in the table once (and the rows, given `expected_rows`), records the outcome
+    /// and detaches the load's replicas. A finished load reports its outcome again. Errors, with
+    /// the load left open, when a replica is unsealed or unaccounted for or the rows differ.
     pub fn finish_load(
         &self,
         load: &str,

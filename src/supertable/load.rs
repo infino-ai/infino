@@ -244,7 +244,8 @@ impl LoadReplica {
         appended
     }
 
-    /// One background fold of this replica's index (see [`merge::fold_replica`]).
+    /// Folds the next run of this replica's index layers, as a background thread calls it while
+    /// the load runs; `false` when there was nothing to fold.
     pub fn fold(&self) -> Result<bool, InfinoError> {
         merge::fold_replica(&self.table).map_err(backend)
     }
