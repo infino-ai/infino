@@ -51,15 +51,19 @@ use infino::{
     },
 };
 use tempfile::TempDir;
+use uuid::Uuid;
 
 const TOP_K: usize = 10;
 /// Disk-cache budget for the drop-through tests: large enough that eviction
 /// never fires, so anything missing from the cache was dropped by gc.
 const CACHE_BUDGET_BYTES: u64 = 1 << 30;
 
+/// The compaction target of [`small_optimize_opts`], in MiB.
+const SMALL_TARGET_MB: u64 = 1;
+
 fn small_optimize_opts() -> OptimizeOptions {
     OptimizeOptions::compact(CompactionSettings {
-        target_superfile_size_mb: 1,
+        target_superfile_size_mb: SMALL_TARGET_MB,
         min_fill_percent: 1,
         ..CompactionSettings::default()
     })
@@ -1125,4 +1129,119 @@ fn optimize_refetches_a_corrupt_cached_input_instead_of_merging_it() {
         "never does not look, so the same corrupt copy must be merged straight \
          in: that is the behaviour the default no longer has"
     );
+}
+
+/// Rows of the full-size superfile the reclaim tests write: enough unique
+/// titles to pass the 1 MiB target of [`small_optimize_opts`].
+const FULL_ROWS: usize = 60_000;
+/// Bytes in a MiB.
+const MIB: u64 = 1 << 20;
+/// A multiplier that spreads a row number's bits, so each title holds a
+/// token no other does.
+const TITLE_SPREAD: u64 = 0x9E37_79B9_7F4A_7C15;
+
+/// Row `i`'s title: its number, sorted as text, and a token of its own.
+fn full_title(i: usize) -> String {
+    format!("a{i:06} t{:016x}", (i as u64).wrapping_mul(TITLE_SPREAD))
+}
+
+/// A table on storage with one superfile of [`FULL_ROWS`] rows, at least
+/// the 1 MiB target in size.
+fn full_superfile_table(dir: &TempDir) -> Supertable {
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+    let st =
+        Supertable::create(default_supertable_options().with_storage(storage)).expect("create");
+    let titles: Vec<String> = (0..FULL_ROWS).map(full_title).collect();
+    let titles: Vec<&str> = titles.iter().map(String::as_str).collect();
+    commit_titles(&st, &titles);
+    let reader = st.reader().expect("reader");
+    let entries = reader.manifest().get_all_superfiles();
+    assert_eq!(entries.len(), 1, "one commit, one superfile");
+    let entry = &entries[0];
+    let size = entry
+        .subsection_offsets
+        .as_ref()
+        .map_or(0, |offsets| offsets.total_size);
+    assert!(
+        size >= SMALL_TARGET_MB * MIB,
+        "the superfile is at the target: {size} bytes"
+    );
+    st
+}
+
+/// Delete the rows numbered below `rows`.
+fn delete_first(st: &Supertable, rows: usize) {
+    st.delete(col("title").lt(lit(format!("a{rows:06}"))))
+        .expect("delete");
+}
+
+/// The superfile ids of `st`'s current snapshot.
+fn superfile_ids(st: &Supertable) -> Vec<Uuid> {
+    st.reader()
+        .expect("reader")
+        .manifest()
+        .get_all_superfiles()
+        .iter()
+        .map(|entry| entry.superfile_id)
+        .collect()
+}
+
+/// What the reclaim tests check is unchanged: the live rows' count and
+/// bounds, and whether a deleted row's and a live row's tokens are found.
+fn reclaim_answers(st: &Supertable, deleted: usize) -> (Vec<RecordBatch>, usize, usize) {
+    let reader = st.reader().expect("reader");
+    let aggregates = reader
+        .query_sql("SELECT COUNT(*), MIN(title), MAX(title) FROM supertable WHERE random() >= 0")
+        .expect("aggregates");
+    let token = |i: usize| {
+        let title = full_title(i);
+        let token = title.split(' ').nth(1).expect("token").to_string();
+        reader
+            .bm25_hits(
+                "title",
+                &token,
+                TOP_K,
+                Bm25SearchOptions::new().with_mode(BoolMode::Or),
+            )
+            .expect("search")
+            .len()
+    };
+    (aggregates, token(deleted - 1), token(deleted))
+}
+
+/// A superfile at the target size with a third of its rows deleted is
+/// rewritten on its own by the next optimize, without them, and answers as
+/// before; the rewrite is not rewritten again.
+#[test]
+fn optimize_reclaims_deleted_rows_from_a_full_superfile() {
+    let dir = TempDir::new().expect("tempdir");
+    let st = full_superfile_table(&dir);
+    let deleted = FULL_ROWS / 3;
+    delete_first(&st, deleted);
+    let before = superfile_ids(&st);
+    let answers = reclaim_answers(&st, deleted);
+    assert_eq!((answers.1, answers.2), (0, 1), "a deleted row is not found");
+
+    st.optimize(&small_optimize_opts()).expect("optimize");
+    let after = superfile_ids(&st);
+    assert_eq!(after.len(), 1, "rewritten alone, into one superfile");
+    assert_ne!(after, before, "the superfile was rewritten");
+    let reader = st.reader().expect("reader");
+    assert_eq!(reader.n_docs_total(), (FULL_ROWS - deleted) as u64);
+    assert_eq!(reclaim_answers(&st, deleted), answers);
+
+    st.optimize(&small_optimize_opts()).expect("optimize again");
+    assert_eq!(superfile_ids(&st), after, "nothing left to reclaim");
+}
+
+/// Under a fifth deleted, a full superfile is left as it is.
+#[test]
+fn optimize_leaves_a_full_superfile_with_few_deletes() {
+    let dir = TempDir::new().expect("tempdir");
+    let st = full_superfile_table(&dir);
+    delete_first(&st, FULL_ROWS / 10);
+    let before = superfile_ids(&st);
+    st.optimize(&small_optimize_opts()).expect("optimize");
+    assert_eq!(superfile_ids(&st), before);
 }
