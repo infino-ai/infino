@@ -618,9 +618,11 @@ fn ranges_the_planner_rewrites_read_their_deleted_rows_once() {
     let file = |keys: Range<i64>, j: i32| -> Vec<Row> {
         keys.map(|k| row(k, j, (k % 3 != 0).then_some(k))).collect()
     };
-    let (_dir, conn, table) = table_of(&[file(0..10, 1), file(10..20, 2), file(20..30, 9)]);
-    table.delete(col("k").eq(lit(14i64))).expect("delete");
+    // Each filter on a table of its own, so no case is answered from rows
+    // another one read.
     for filter in ["j BETWEEN 0 AND 4", "j >= CAST(1 AS BIGINT) AND j < 5"] {
+        let (_dir, conn, table) = table_of(&[file(0..10, 1), file(10..20, 2), file(20..30, 9)]);
+        table.delete(col("k").eq(lit(14i64))).expect("delete");
         let aggregates = statement("COUNT(*), COUNT(i), SUM(i), MIN(i)", Some(filter), None);
         assert_matches_scan(&conn, &aggregates);
         let explained = explain(&conn, &aggregates.sql(false));

@@ -28,8 +28,9 @@
 //! is scanned instead: the live rows are then the smaller read.
 
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
-    sync::{Arc, Mutex},
+    collections::{BTreeSet, HashMap},
+    mem,
+    sync::Arc,
 };
 
 use arrow::{
@@ -52,60 +53,34 @@ use crate::{
     runtime_bridge::run_on_pool,
     supertable::{
         manifest::{ColumnStats, ScalarStatsAgg, SuperfileEntry, sub_sum_arrays},
-        query::{provider::SupertableProvider, value_count_carry::take_off},
+        query::{provider::SupertableProvider, scalar_cache::ByteLru, value_count_carry::take_off},
         schema::FieldId,
     },
     utils::join::try_join_bounded,
 };
 
-/// Deleted-row statistics kept per table, at most. Each is one column's
-/// bounds, counts and value table (at most the per-superfile cap of distinct
-/// values) for one superfile.
-const MAX_CACHED: usize = 65_536;
-
-/// Bytes the kept statistics may take per table, about: their value tables,
-/// and the deleted rows they cover, each superfile's counted once however
-/// many of its columns share them.
+/// Bytes the kept statistics may take per table, about: their value tables
+/// and the deleted rows they cover. Past it, those used least recently go.
 const MAX_CACHED_BYTES: usize = 64 * 1024 * 1024;
-
-/// Past either bound, the statistics used least recently are dropped until
-/// the cache holds this share of it, so a run of inserts drops once rather
-/// than on every insert.
-const EVICT_TO: f64 = 0.75;
-
-/// Statistics kept before a statement drops those of superfiles its
-/// snapshot no longer lists.
-const PRUNE_ABOVE: usize = MAX_CACHED / 2;
 
 /// Share of a superfile's rows that may be read to correct its statistics;
 /// past it, scanning the live rows reads less.
 const MAX_READ_SHARE: f64 = 0.5;
 
 /// The statistics of superfiles' deleted rows, per superfile and column,
-/// shared by every reader of a table.
-#[derive(Debug, Default)]
-pub(crate) struct DeletedStatsCache {
-    entries: Mutex<Entries>,
-}
-
-#[derive(Debug, Default)]
-struct Entries {
-    by_column: HashMap<(Uuid, FieldId), Kept>,
-    /// The deleted rows the kept statistics cover, per superfile and bitmap
-    /// (by address, as the entries holding it keep it alive): its bytes and
-    /// how many entries hold it. A superfile's columns read in one statement
-    /// share one bitmap, counted once.
-    rows: HashMap<(Uuid, usize), (usize, usize)>,
-    /// About the bytes the value tables and the rows hold.
-    bytes: usize,
-    /// A count of uses, the latest stamped on each entry used.
-    clock: u64,
-}
-
+/// shared by every reader of a table. Those of a superfile compaction
+/// replaced are read no more, and age out.
 #[derive(Debug)]
-struct Kept {
-    cached: CachedRows,
-    last_used: u64,
+pub(crate) struct DeletedStatsCache {
+    kept: ByteLru<(Uuid, FieldId), CachedRows>,
+}
+
+impl Default for DeletedStatsCache {
+    fn default() -> Self {
+        Self {
+            kept: ByteLru::new(MAX_CACHED_BYTES),
+        }
+    }
 }
 
 /// One column's statistics over one superfile's deleted rows.
@@ -120,81 +95,15 @@ struct CachedRows {
 }
 
 impl CachedRows {
-    /// About the bytes the entry's value table holds.
-    fn value_bytes(&self) -> usize {
-        self.stats
+    /// About the bytes the entry holds: its value table, the deleted rows it
+    /// covers, and the entry itself.
+    fn bytes(&self) -> usize {
+        let values = self
+            .stats
             .value_counts
             .as_ref()
-            .map_or(0, |counts| counts.value_bytes())
-    }
-}
-
-impl Entries {
-    /// The entry for `superfile`'s column `field`, stamped as used now.
-    fn used(&mut self, superfile: Uuid, field: FieldId) -> Option<&CachedRows> {
-        self.clock += 1;
-        let clock = self.clock;
-        let kept = self.by_column.get_mut(&(superfile, field))?;
-        kept.last_used = clock;
-        Some(&kept.cached)
-    }
-
-    fn insert(&mut self, superfile: Uuid, field: FieldId, cached: CachedRows) {
-        self.remove(superfile, field);
-        self.bytes += cached.value_bytes();
-        let (bytes, users) = self
-            .rows
-            .entry((superfile, Arc::as_ptr(&cached.rows) as usize))
-            .or_insert_with(|| (cached.rows.serialized_size(), 0));
-        if *users == 0 {
-            self.bytes += *bytes;
-        }
-        *users += 1;
-        self.clock += 1;
-        self.by_column.insert(
-            (superfile, field),
-            Kept {
-                cached,
-                last_used: self.clock,
-            },
-        );
-    }
-
-    fn remove(&mut self, superfile: Uuid, field: FieldId) {
-        let Some(Kept { cached, .. }) = self.by_column.remove(&(superfile, field)) else {
-            return;
-        };
-        self.bytes -= cached.value_bytes();
-        let key = (superfile, Arc::as_ptr(&cached.rows) as usize);
-        if let Some((bytes, users)) = self.rows.get_mut(&key) {
-            *users -= 1;
-            if *users == 0 {
-                self.bytes -= *bytes;
-                self.rows.remove(&key);
-            }
-        }
-    }
-
-    /// Past either bound, drop the statistics used least recently until
-    /// the cache holds [`EVICT_TO`] of it.
-    fn evict(&mut self) {
-        if self.by_column.len() <= MAX_CACHED && self.bytes <= MAX_CACHED_BYTES {
-            return;
-        }
-        let keep_entries = (MAX_CACHED as f64 * EVICT_TO) as usize;
-        let keep_bytes = (MAX_CACHED_BYTES as f64 * EVICT_TO) as usize;
-        let mut by_age: Vec<(u64, (Uuid, FieldId))> = self
-            .by_column
-            .iter()
-            .map(|(key, kept)| (kept.last_used, *key))
-            .collect();
-        by_age.sort_unstable_by_key(|(last_used, _)| *last_used);
-        for (_, (superfile, field)) in by_age {
-            if self.by_column.len() <= keep_entries && self.bytes <= keep_bytes {
-                break;
-            }
-            self.remove(superfile, field);
-        }
+            .map_or(0, |counts| counts.value_bytes());
+        values + self.rows.serialized_size() + mem::size_of::<(Self, ScalarStatsAgg)>()
     }
 }
 
@@ -208,8 +117,7 @@ impl DeletedStatsCache {
         data_type: &DataType,
         rows: &Arc<RoaringBitmap>,
     ) -> Option<Arc<ScalarStatsAgg>> {
-        let mut entries = self.entries.lock().expect("deleted-stats cache poisoned");
-        let cached = entries.used(superfile, field)?;
+        let cached = self.kept.get(&(superfile, field))?;
         // The tombstone cache hands out one bitmap per sidecar version, so
         // the rows the statistics were read for are most often the very
         // bitmap asked about; comparing them whole is the rare case.
@@ -227,65 +135,26 @@ impl DeletedStatsCache {
         data_type: &DataType,
         rows: &RoaringBitmap,
     ) -> Option<CachedRows> {
-        let mut entries = self.entries.lock().expect("deleted-stats cache poisoned");
-        let cached = entries.used(superfile, field)?;
-        (cached.data_type == *data_type && cached.rows.is_subset(rows)).then(|| cached.clone())
+        let cached = self.kept.get(&(superfile, field))?;
+        (cached.data_type == *data_type && cached.rows.is_subset(rows)).then_some(cached)
     }
 
     fn insert(&self, superfile: Uuid, field: FieldId, cached: CachedRows) {
-        let mut entries = self.entries.lock().expect("deleted-stats cache poisoned");
-        entries.insert(superfile, field, cached);
-        entries.evict();
-    }
-
-    /// Once many statistics are kept, drop those of superfiles `listed`
-    /// does not name: a superfile compaction replaced is read no more.
-    pub(crate) fn prune_unlisted(&self, listed: impl FnOnce() -> HashSet<Uuid>) {
-        let mut entries = self.entries.lock().expect("deleted-stats cache poisoned");
-        if entries.by_column.len() <= PRUNE_ABOVE {
-            return;
-        }
-        let listed = listed();
-        let unlisted: Vec<(Uuid, FieldId)> = entries
-            .by_column
-            .keys()
-            .filter(|(superfile, _)| !listed.contains(superfile))
-            .copied()
-            .collect();
-        for (superfile, field) in unlisted {
-            entries.remove(superfile, field);
-        }
+        let bytes = cached.bytes();
+        self.kept.insert((superfile, field), cached, bytes);
     }
 
     /// The deleted rows the statistics of `superfile`'s column `field`
     /// cover, when kept.
     #[cfg(test)]
     pub(crate) fn rows_of(&self, superfile: Uuid, field: FieldId) -> Option<Arc<RoaringBitmap>> {
-        self.entries
-            .lock()
-            .expect("deleted-stats cache poisoned")
-            .by_column
-            .get(&(superfile, field))
-            .map(|kept| Arc::clone(&kept.cached.rows))
+        self.kept.get(&(superfile, field)).map(|cached| cached.rows)
     }
 
     /// The statistics kept, one per superfile and column.
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
-        self.entries
-            .lock()
-            .expect("deleted-stats cache poisoned")
-            .by_column
-            .len()
-    }
-
-    /// About the bytes the kept statistics hold.
-    #[cfg(test)]
-    fn bytes(&self) -> usize {
-        self.entries
-            .lock()
-            .expect("deleted-stats cache poisoned")
-            .bytes
+        self.kept.len()
     }
 }
 
@@ -628,6 +497,16 @@ pub(crate) async fn read_requested(
     let _ = try_join_bounded(reads, in_flight).await;
 }
 
+/// Columns of one superfile that still need the same deleted rows read, so
+/// they are read together.
+struct ReadGroup {
+    /// The deleted rows none of the columns' kept statistics cover.
+    unread: RoaringBitmap,
+    /// Each column, the type it is read as, and the statistics kept over
+    /// the rest of the deleted rows, to add the read ones to.
+    columns: Vec<(RequestedColumn, DataType, Option<CachedRows>)>,
+}
+
 /// [`read_requested`] for one superfile.
 async fn read_superfile(
     provider: &SupertableProvider,
@@ -637,12 +516,7 @@ async fn read_superfile(
     requests: DeletedRowStatsRequest,
 ) -> DfResult<()> {
     let superfile = requests.entry.superfile_id;
-    // Columns grouped by the rows they still need, so columns cached over
-    // the same deletes are read together.
-    let mut groups: Vec<(
-        RoaringBitmap,
-        Vec<(RequestedColumn, DataType, Option<CachedRows>)>,
-    )> = Vec::new();
+    let mut groups: Vec<ReadGroup> = Vec::new();
     for column in requests.columns {
         let Ok(field) = stored.field_with_name(&column.name) else {
             continue;
@@ -659,12 +533,15 @@ async fn read_superfile(
         if let Some(base) = &base {
             unread -= base.rows.as_ref();
         }
-        match groups.iter_mut().find(|(rows, _)| *rows == unread) {
-            Some((_, columns)) => columns.push((column, data_type, base)),
-            None => groups.push((unread, vec![(column, data_type, base)])),
+        match groups.iter_mut().find(|group| group.unread == unread) {
+            Some(group) => group.columns.push((column, data_type, base)),
+            None => groups.push(ReadGroup {
+                unread,
+                columns: vec![(column, data_type, base)],
+            }),
         }
     }
-    for (unread, columns) in groups {
+    for ReadGroup { unread, columns } in groups {
         let names: Vec<&str> = columns.iter().map(|(c, _, _)| c.name.as_str()).collect();
         if unread.len() as f64 > requests.entry.n_docs as f64 * MAX_READ_SHARE {
             debug!(%superfile, rows = unread.len(), "more deleted rows to read than live ones");
@@ -1078,16 +955,12 @@ mod tests {
                 .subset_of(superfile, field, &DataType::Int64, &fewer)
                 .is_none()
         );
-        cache.prune_unlisted(HashSet::new);
-        assert_eq!(cache.len(), 1, "few kept: none dropped");
     }
 
-    /// A superfile's columns that share the deleted rows they cover are
-    /// charged for them once; past its bound the cache drops the statistics
-    /// used least recently, keeping the rest.
+    /// Past its bound the cache drops the statistics used least recently,
+    /// keeping the rest.
     #[test]
     fn a_full_cache_drops_the_statistics_used_least_recently() {
-        let cache = DeletedStatsCache::default();
         let rows: Arc<RoaringBitmap> = Arc::new(FIRST_RUN.map(|k| k as u32).collect());
         let values: ArrayRef = Arc::new(Int64Array::from_iter_values(FIRST_RUN));
         let stats = Arc::new(ScalarStatsAgg::from_column(&values).expect("stats"));
@@ -1096,42 +969,24 @@ mod tests {
             rows: Arc::clone(&rows),
             stats: Arc::clone(&stats),
         };
-        let shared = Uuid::new_v4();
-        cache.insert(shared, FieldId::ID_COLUMN, cached());
-        cache.insert(shared, FieldId(1), cached());
-        assert_eq!(
-            cache.bytes(),
-            2 * cached().value_bytes() + rows.serialized_size(),
-            "the shared rows are charged once"
-        );
-
-        let cache = DeletedStatsCache::default();
-        // One deleted row each, so the count of statistics, not their bytes,
-        // is the bound reached.
-        let one_row: Arc<RoaringBitmap> = Arc::new(RoaringBitmap::from([0]));
-        let one_value: ArrayRef = Arc::new(Int64Array::from_iter_values([0]));
-        let one_stats = Arc::new(ScalarStatsAgg::from_column(&one_value).expect("stats"));
-        let cached = || CachedRows {
-            data_type: DataType::Int64,
-            rows: Arc::clone(&one_row),
-            stats: Arc::clone(&one_stats),
+        // Room for two.
+        let cache = DeletedStatsCache {
+            kept: ByteLru::new(2 * cached().bytes()),
         };
-        let superfiles: Vec<Uuid> = (0..MAX_CACHED).map(|_| Uuid::new_v4()).collect();
-        for superfile in &superfiles {
-            cache.insert(*superfile, FieldId::ID_COLUMN, cached());
-        }
-        assert!(cache.bytes() < MAX_CACHED_BYTES);
+        let superfiles = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
+        cache.insert(superfiles[0], FieldId::ID_COLUMN, cached());
+        cache.insert(superfiles[1], FieldId::ID_COLUMN, cached());
         let kept = |superfile: Uuid| {
             cache
-                .get(superfile, FieldId::ID_COLUMN, &DataType::Int64, &one_row)
+                .get(superfile, FieldId::ID_COLUMN, &DataType::Int64, &rows)
                 .is_some()
         };
         assert!(kept(superfiles[0]), "used just now");
-        cache.insert(Uuid::new_v4(), FieldId::ID_COLUMN, cached());
-        assert_eq!(cache.len(), (MAX_CACHED as f64 * EVICT_TO) as usize);
+        cache.insert(superfiles[2], FieldId::ID_COLUMN, cached());
+        assert_eq!(cache.len(), 2);
         assert!(kept(superfiles[0]), "used recently: kept");
         assert!(!kept(superfiles[1]), "used least recently: dropped");
-        assert!(kept(superfiles[MAX_CACHED - 1]), "the newest: kept");
+        assert!(kept(superfiles[2]), "the newest: kept");
     }
 
     /// `value_counts` reads a superfile's deleted rows on its first call,

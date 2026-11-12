@@ -118,6 +118,10 @@ use crate::supertable::{
     schema::{DECIMAL128_PRECISION, DECIMAL128_SCALE, FieldId},
 };
 
+/// What a dry run's rewrite collects: the deleted rows each rewritten
+/// aggregate wants, by the provider to read them through.
+type StatsCollector = Mutex<Vec<(SupertableProvider, Vec<DeletedRowStatsRequest>)>>;
+
 /// The covered/residual aggregate rewrite. Registered on the
 /// `query_sql` session after DataFusion's built-in rules.
 #[derive(Default)]
@@ -126,7 +130,7 @@ pub(crate) struct CoveredAggregateRewrite {
     /// deleted rows each rewritten aggregate wants, by the provider to read
     /// them through. A collecting rule logs nothing; the statement's own
     /// optimization reports what it does.
-    collector: Option<Arc<Mutex<Vec<(SupertableProvider, Vec<DeletedRowStatsRequest>)>>>>,
+    collector: Option<Arc<StatsCollector>>,
 }
 
 impl fmt::Debug for CoveredAggregateRewrite {
@@ -223,8 +227,8 @@ enum Class {
 ///     of them are cache reads;
 ///   * optimize the statement as it will be planned, and read the statistics
 ///     of the deleted rows the rewrite would use to answer superfiles with
-///     deletes from their statistics, where reading those rows costs fewer
-///     pages than scanning the live ones would (see [`read_requested`]). They
+///     deletes from their statistics, where those rows are at most half of
+///     the superfile's (see [`read_requested`]). They
 ///     are kept for the table, so a later statement reads only rows deleted
 ///     since.
 ///
@@ -243,7 +247,7 @@ pub(crate) async fn prepare_aggregate_inputs(
             if agg.group_expr.is_empty() && peel_unfiltered_scan(agg.input.as_ref()).is_some() {
                 sources.push(Arc::clone(&scan.source));
             }
-            if answerable_shape(agg) && reads_deleted_rows(agg) {
+            if answerable_shape(agg) {
                 aggregated.push(Arc::clone(&scan.source));
             }
         }
@@ -293,15 +297,7 @@ pub(crate) async fn prepare_aggregate_inputs(
     }
     let requests = mem::take(&mut *collector.lock().expect("requests rows poisoned"));
     for (provider, requests) in requests {
-        let cache = provider.deleted_stats();
-        cache.prune_unlisted(|| {
-            provider
-                .manifest()
-                .resident_superfiles()
-                .map(|listed| listed.iter().map(|entry| entry.superfile_id).collect())
-                .unwrap_or_default()
-        });
-        read_requested(&provider, state, cache, requests).await;
+        read_requested(&provider, state, provider.deleted_stats(), requests).await;
     }
     Ok(())
 }
@@ -331,10 +327,7 @@ fn answerable_shape(agg: &Aggregate) -> bool {
 }
 
 /// `state` with the rewrite collecting into `collector` what it wants.
-fn dry_run(
-    state: &SessionState,
-    collector: &Arc<Mutex<Vec<(SupertableProvider, Vec<DeletedRowStatsRequest>)>>>,
-) -> SessionState {
+fn dry_run(state: &SessionState, collector: &Arc<StatsCollector>) -> SessionState {
     let collecting: Arc<dyn OptimizerRule + Send + Sync> = Arc::new(CoveredAggregateRewrite {
         collector: Some(Arc::clone(collector)),
     });
@@ -349,22 +342,6 @@ fn dry_run(
     SessionStateBuilder::new_from_existing(state.clone())
         .with_optimizer_rules(rules)
         .build()
-}
-
-/// Whether the rewrite may read deleted rows' statistics for `agg`: over
-/// the whole table, a range on one column, or a grouping column's non-null
-/// values. Under any other filter it declines, so the pre-pass reads
-/// nothing for it.
-fn reads_deleted_rows(agg: &Aggregate) -> bool {
-    if peel_unfiltered_scan(agg.input.as_ref()).is_some() {
-        return true;
-    }
-    match agg.group_expr.as_slice() {
-        [] => peel_input(agg.input.as_ref())
-            .is_some_and(|(predicate, _)| extract_range(&predicate).is_some()),
-        [Expr::Column(column)] => peel_not_null_filter(agg.input.as_ref(), &column.name).is_some(),
-        _ => false,
-    }
 }
 
 /// The deleted rows whose statistics a statement wants, and whether the
@@ -394,7 +371,7 @@ fn aggregated_scan(agg: &Aggregate) -> Option<&TableScan> {
 
 fn try_rewrite(
     plan: &LogicalPlan,
-    collector: Option<&Mutex<Vec<(SupertableProvider, Vec<DeletedRowStatsRequest>)>>>,
+    collector: Option<&StatsCollector>,
 ) -> DfResult<Option<LogicalPlan>> {
     let mut wants = StatsRequests {
         list: Vec::new(),
@@ -498,7 +475,8 @@ fn try_rewrite_wanting(
     // block or two each: cheaper than scanning the ones with deletes, so
     // with any to scan it answers below, and no deleted row is read for
     // the value counts.
-    let range_indexed = provider.counted_range(&predicate).is_some();
+    let counted = provider.counted_range(&predicate);
+    let range_indexed = counted.is_some();
     let mut unread = StatsRequests {
         list: Vec::new(),
         quiet: requests.quiet,
@@ -541,7 +519,7 @@ fn try_rewrite_wanting(
     // A range-indexed column counts the range from each superfile's index:
     // the count reads a block or two per superfile, not the rows.
     if matches!(kinds.as_slice(), [AggKind::CountStar])
-        && let Some(counted) = provider.counted_range(&predicate)
+        && let Some(counted) = counted
     {
         let input = counting_scan(provider, scan, counted, &predicate)?;
         return Ok(Some(LogicalPlan::Aggregate(
