@@ -1276,7 +1276,7 @@ impl SuperfileReader {
     /// pages: once a page index is loaded, the footer fails a read of any
     /// column it holds no page index for. A path that reads pages goes
     /// through [`Self::parquet_metadata_to_read`] or
-    /// [`Self::parquet_metadata_with_page_index`] with its columns.
+    /// `page_indexed_footer` with its columns.
     pub fn parquet_metadata(&self) -> Arc<ParquetMetaData> {
         Arc::clone(self.footer.load().parquet())
     }
@@ -5635,6 +5635,7 @@ mod tests {
     /// so the footer's count of holders counts the decodes in flight.
     #[tokio::test]
     async fn concurrent_page_index_loads_decode_once_on_the_pool() {
+        /// Loads started at once on the one reader.
         const LOADS: usize = 8;
         let reader =
             Arc::new(SuperfileReader::open(build_simple_fts_only_superfile()).expect("open"));

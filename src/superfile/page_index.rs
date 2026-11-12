@@ -67,6 +67,12 @@ use roaring::RoaringBitmap;
 /// Name of the group holding the leaves a load decodes (see [`leaves_only`]).
 const DECODE_ROOT: &str = "page_index";
 
+/// The offset index a column not loaded gets ([`unloaded_offset_index`]):
+/// one page of this size at the chunk's own start. No real page is empty
+/// (each has a header), so it also marks the entry as not loaded
+/// ([`is_loaded`]).
+const UNLOADED_PAGE_SIZE: i32 = 0;
+
 /// Which top-level columns' page index a load brings in.
 #[derive(Clone, Debug)]
 pub(crate) enum IndexColumns {
@@ -308,12 +314,6 @@ fn index_ranges(chunk: &ColumnChunkMetaData) -> impl Iterator<Item = Range<u64>>
         .into_iter()
         .chain(offset_index_range(chunk))
 }
-
-/// The offset index a column not loaded gets ([`unloaded_offset_index`]):
-/// one page of this size at the chunk's own start. No real page is empty
-/// (each has a header), so it also marks the entry as not loaded
-/// ([`is_loaded`]).
-const UNLOADED_PAGE_SIZE: i32 = 0;
 
 /// The offset index a column chunk not loaded gets: one empty page at the
 /// chunk's start. Any read of the column fails, all of it or a selection:
