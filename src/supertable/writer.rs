@@ -14186,16 +14186,22 @@ pub(crate) async fn try_commit_attempt(
     let spliced = match splice.filter(|_| term_contributions.is_empty()) {
         None => None,
         Some(splice) => {
-            // Two grafts that read the table at once both carry the same superfiles: the one
-            // that publishes second must not list them again.
-            let live: HashSet<Uuid> = current_manifest
+            // Two grafts that read the table at once carry the same superfiles, or the same batch
+            // from two replicas: the one that publishes second must not add it again.
+            let current = current_manifest
                 .get_all_superfiles_loaded()
                 .await
-                .map_err(|e| BuildError::Store(e.to_string()))?
+                .map_err(|e| BuildError::Store(e.to_string()))?;
+            let live: HashSet<Uuid> = current.iter().map(|e| e.superfile_id).collect();
+            let live_batches: HashSet<&str> = current
                 .iter()
-                .map(|e| e.superfile_id)
+                .filter_map(|e| crate::supertable::merge::batch_of(e))
                 .collect();
-            if let Some(e) = new_entries.iter().find(|e| live.contains(&e.superfile_id)) {
+            if let Some(e) = new_entries.iter().find(|e| {
+                live.contains(&e.superfile_id)
+                    || crate::supertable::merge::batch_of(e)
+                        .is_some_and(|b| live_batches.contains(b))
+            }) {
                 return Err(BuildError::Store(format!(
                     "graft: superfile {} is already in the table",
                     e.superfile_id

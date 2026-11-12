@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
-//! Merging one supertable into another without rewriting its rows: the
-//! source's superfiles are committed into the destination as they are, and
-//! the source's term-index layers are stacked onto the destination's.
+//! Loading one table from several replica tables at once, without rewriting a row.
 //!
-//! The caller places the objects (`objects_to_copy` names them) before
-//! `graft` commits, so the destination's gc never sees a key it lists.
+//! Each replica ([`open_replica`]) writes its superfiles and term-index slices straight into
+//! the table's storage and keeps only its manifest apart; [`graft`] then commits what a replica
+//! committed, with the layers that index it, into the table in one manifest. A table whose
+//! replicas live elsewhere has their objects placed first ([`objects_to_copy`] names them).
 
 use std::{
     collections::{HashMap, HashSet},
@@ -16,12 +16,13 @@ use std::{
     },
 };
 
+use arrow_array::RecordBatch;
 use futures::{StreamExt, TryStreamExt, stream};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::{
-    Consistency,
+    Consistency, InfinoError,
     storage::{SplitStorageProvider, StorageProvider},
     supertable::{
         SupertableReader,
@@ -43,6 +44,33 @@ use crate::{
 /// latency over tens of thousands of superfiles.
 const HEADS_IN_FLIGHT: usize = 64;
 
+/// What a batch key starts with (see [`append_batch`]); no other stem is taken for one.
+const BATCH_KEY_PREFIX: &str = "lb";
+
+/// Hex digits of the batch id's hash a batch key keeps: 160 bits, so two ids never share one.
+const BATCH_KEY_HEX: usize = 40;
+
+/// The superfile stem a replica stores batch `id` under: short, already in the form stems are
+/// normalized to, and distinct for distinct ids, unlike the id itself, which normalizing can merge.
+fn batch_key(id: &str) -> String {
+    let hex = blake3::hash(id.as_bytes()).to_hex();
+    format!("{BATCH_KEY_PREFIX}{}", &hex[..BATCH_KEY_HEX])
+}
+
+/// Whether `stem` is a batch key, the only stems a graft drops copies of.
+fn is_batch_key(stem: &str) -> bool {
+    stem.len() == BATCH_KEY_PREFIX.len() + BATCH_KEY_HEX
+        && stem.strip_prefix(BATCH_KEY_PREFIX).is_some_and(|hex| {
+            hex.bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        })
+}
+
+/// The batch key `entry` is stored under, if it is one.
+pub(crate) fn batch_of(entry: &SuperfileEntry) -> Option<&str> {
+    entry.stem.as_deref().filter(|s| is_batch_key(s))
+}
+
 /// Replica manifest objects [`detach_replicas`] deletes at once.
 const DELETES_IN_FLIGHT: usize = 64;
 
@@ -52,21 +80,6 @@ fn internal(e: impl std::fmt::Display) -> QueryError {
 
 fn store(e: impl std::fmt::Display) -> BuildError {
     BuildError::Store(e.to_string())
-}
-
-/// Fails when `INFINO_GRAFT_FAILPOINT` names `step`, so a test can stop a
-/// graft where a crash would.
-#[cfg(any(test, feature = "test-helpers"))]
-fn failpoint(step: &str) -> Result<(), QueryError> {
-    match std::env::var("INFINO_GRAFT_FAILPOINT") {
-        Ok(v) if v == step => Err(internal(format!("graft: failpoint {step}"))),
-        _ => Ok(()),
-    }
-}
-
-#[cfg(not(any(test, feature = "test-helpers")))]
-fn failpoint(_step: &str) -> Result<(), QueryError> {
-    Ok(())
 }
 
 /// The pinned term index's shape: layers, listed superfiles, and whether
@@ -111,8 +124,8 @@ pub struct GraftReport {
     pub term_index_spliced: bool,
     /// Commits the superfiles took.
     pub commits: usize,
-    /// Source superfiles left out because the destination already lists a
-    /// superfile of the same name: the same batch, loaded by another source.
+    /// Source superfiles left out as copies of a batch: one the destination already holds from
+    /// another source, or a later delivery of a batch this source holds already.
     pub duplicates: usize,
     /// Rows the duplicates hold.
     pub duplicate_rows: u64,
@@ -166,18 +179,15 @@ async fn read_source(
     check(dst, src)?;
     let dst_entries = dst.get_all_superfiles_loaded().await.map_err(internal)?;
     let listed: HashSet<Uuid> = dst_entries.iter().map(|e| e.superfile_id).collect();
-    // A batch's superfiles share its name and its commit. A resent batch is a second copy: of the
-    // superfiles named alike, only the source's first commit of that name counts, and none if the
-    // destination took the batch from another source.
-    let names: HashSet<&str> = dst_entries
-        .iter()
-        .filter_map(|e| e.stem.as_deref())
-        .collect();
+    // A batch's superfiles share its key and its commit. A resent batch is a second copy: of the
+    // superfiles under one key, only the source's first commit of it counts, and none if the
+    // destination took the batch from another source. Other stems are labels, never copies.
+    let names: HashSet<&str> = dst_entries.iter().filter_map(|e| batch_of(e)).collect();
     let src_entries = src.get_all_superfiles_loaded().await.map_err(internal)?;
     let mut first_commit: HashMap<&str, u64> = HashMap::new();
     let mut own: HashSet<&str> = HashSet::new();
     for e in src_entries.iter() {
-        if let Some(name) = e.stem.as_deref() {
+        if let Some(name) = batch_of(e) {
             let first = first_commit.entry(name).or_insert(e.birth_version);
             *first = (*first).min(e.birth_version);
             if listed.contains(&e.superfile_id) {
@@ -186,7 +196,7 @@ async fn read_source(
         }
     }
     let is_copy = |e: &SuperfileEntry| {
-        e.stem.as_deref().is_some_and(|name| {
+        batch_of(e).is_some_and(|name| {
             first_commit.get(name) != Some(&e.birth_version)
                 || (names.contains(name) && !own.contains(name))
         })
@@ -314,15 +324,29 @@ pub fn graft(
             duplicate_rows: s.duplicate_rows,
             ..GraftReport::default()
         };
-        // One part per commit: a commit re-encodes the parts it adds to.
+        // About one part per commit (a commit re-encodes the parts it adds to), and a batch's
+        // superfiles always in one, so a second graft of the batch is refused at commit.
         let chunk = inner.options.target_superfiles_per_part.max(1) as usize;
+        let mut todo = s.todo.clone();
+        todo.sort_by(|a, b| (batch_of(a), a.birth_version).cmp(&(batch_of(b), b.birth_version)));
+        let mut chunks: Vec<&[Arc<SuperfileEntry>]> = vec![];
+        let mut start = 0;
+        for end in 1..=todo.len() {
+            let batch_ends = end == todo.len()
+                || batch_of(&todo[end]).is_none()
+                || batch_of(&todo[end]) != batch_of(&todo[end - 1]);
+            if end - start >= chunk && batch_ends || end == todo.len() {
+                chunks.push(&todo[start..end]);
+                start = end;
+            }
+        }
         // A splice may list source superfiles the destination already holds and those this call commits, never
         // one still to come: a fold could drop its postings while it is not live.
         let mut live: HashSet<Uuid> = s.ids.clone();
         for e in &s.todo {
             live.remove(&e.superfile_id);
         }
-        for entries in s.todo.chunks(chunk) {
+        for entries in chunks {
             // Checked right before the commit that lists them.
             stream::iter(entries)
                 .map(|e| {
@@ -362,28 +386,77 @@ pub fn graft(
             }
             report.merged += entries.len();
             report.commits += 1;
-            failpoint("commit")?;
         }
         if let Some(root) = &s.root {
             report.term_index_spliced = splice_term_index(dst, &storage, root, &s.ids).await?;
         }
-        failpoint("splice")?;
         stamp_term_index(inner, 0).await.map_err(internal)?;
         Ok(report)
     })
+}
+
+/// Appends `batch` to a replica as batch `id` and commits it; returns `false`, writing nothing, when
+/// this handle already took that id. A graft adds one copy of a batch to the table it loads
+/// into, whichever replica or retry delivered it, so a caller may resend a batch freely.
+///
+/// Errors when `table` is not a replica (see [`open_replica`]), or as the append does.
+pub fn append_batch(
+    table: &Supertable,
+    batch: &RecordBatch,
+    id: &str,
+) -> Result<bool, InfinoError> {
+    if !table.inner().options.term_index_replica {
+        return Err(InfinoError::Unsupported(
+            "append_batch is for replica tables".into(),
+        ));
+    }
+    let key = batch_key(id);
+    if !table
+        .inner()
+        .batches_taken
+        .lock()
+        .expect("batch set")
+        .insert(key.clone())
+    {
+        return Ok(false);
+    }
+    table
+        .append_named(batch, &key)
+        .map(|()| true)
+        .inspect_err(|_| {
+            // Not committed, so a resend may take it again.
+            table
+                .inner()
+                .batches_taken
+                .lock()
+                .expect("batch set")
+                .remove(&key);
+        })
 }
 
 /// Opens replica `name` of `table`, creating it if absent: `table`'s schema and settings, its
 /// manifest under [`crate::storage::REPLICAS_DIR`]`<name>/` and its objects in `table`, with
 /// replica folds on, reads that see other handles' commits, and no disk cache of its own.
 pub fn open_replica(table: &Supertable, name: &str) -> Result<Supertable, QueryError> {
+    // One path segment, so `attached_replicas` names it back as given.
+    if name.is_empty() || name.contains('/') {
+        return Err(internal(format!(
+            "replica name {name:?}: one non-empty path segment"
+        )));
+    }
     let mut options = (*table.inner().options).clone();
     let storage = options
         .storage
         .clone()
         .ok_or_else(|| internal("replica: the table has no storage"))?;
     options.storage = Some(Arc::new(SplitStorageProvider::for_replica(storage, name)));
-    // The table's caches are bound to its own storage, where the replica's manifest is not.
+    // The table's caches are bound to its own storage, where the replica's manifest is not; its
+    // scratch directory still holds the replica's folds.
+    options.term_index_scratch_root = options
+        .disk_cache
+        .as_ref()
+        .map(|c| c.scratch_root())
+        .or(options.term_index_scratch_root);
     options.disk_cache = None;
     options.metadata_disk_cache = None;
     options.term_index_replica = true;
@@ -543,6 +616,35 @@ fn spliced_root(dst: &Root, src: &Root, grafted: &HashSet<Uuid>) -> Option<Root>
         // A fold written with absolute ordinals has its base below its range.
         l.base.min(r.start) as usize..r.end as usize
     };
+    // Each `dst` layer's listed superfiles, to tell a `src` layer older than what `dst` holds.
+    let dst_sets: Vec<_> = dst
+        .layers
+        .iter()
+        .map(|l| {
+            let r = l.ordinals.clone().unwrap_or(0..0);
+            let ids: HashSet<Uuid> = dst.superfiles[r.start as usize..r.end as usize]
+                .iter()
+                .copied()
+                .filter(|u| !u.is_nil())
+                .collect();
+            (key(l), ids)
+        })
+        .collect();
+    // A replica's folds only merge, so a `src` layer whose grafted superfiles one other `dst` layer
+    // already holds all of is older than that layer: a stale `src` read, which must not undo it.
+    let superseded = |l: &Layer| {
+        let ids: Vec<Uuid> = src.superfiles[span(l)]
+            .iter()
+            .copied()
+            .filter(|u| grafted.contains(u))
+            .collect();
+        // A stale read is older than `dst`, so it names nothing `dst` does not list yet.
+        !ids.is_empty()
+            && ids.iter().all(|u| listed.contains(u))
+            && dst_sets
+                .iter()
+                .any(|(k, set)| *k != key(l) && ids.iter().all(|u| set.contains(u)))
+    };
     let moves: Vec<&Layer> = src
         .layers
         .iter()
@@ -553,6 +655,7 @@ fn spliced_root(dst: &Root, src: &Root, grafted: &HashSet<Uuid>) -> Option<Root>
                     || names
                         .iter()
                         .any(|u| grafted.contains(u) && !listed.contains(u)))
+                && !superseded(l)
         })
         .collect();
     if moves.is_empty() {
@@ -632,13 +735,15 @@ async fn splice_term_index(
                     spliced.store(done, Ordering::Relaxed);
                     return Ok(None);
                 };
-                // Left incomplete: the refresh that follows checks every live
-                // superfile is listed and its objects present before marking it.
+                // A swap lists again the superfiles the root already listed, so a complete index
+                // stays complete; one this splice completes is marked by the stamp that follows.
                 let reference = term_index::write_root(storage.as_ref(), &root)
                     .await
                     .map_err(store)?;
                 spliced.store(true, Ordering::Relaxed);
-                Ok(Some(old.with_term_index(reference, false)))
+                Ok(Some(
+                    old.with_term_index(reference, old.term_index_complete()),
+                ))
             }
         },
     )
@@ -761,6 +866,11 @@ mod tests {
         assert_eq!(root.layers.len(), 3);
         assert_eq!(root.superfiles.iter().filter(|x| **x == u[0]).count(), 1);
         assert!(spliced_root(&root, &folded, &all).is_none(), "idempotent");
+        // A read of the replica from before its fold must not move the replaced layers back.
+        assert!(
+            spliced_root(&root, &deltas, &all).is_none(),
+            "a stale read leaves the fold in place"
+        );
     }
 
     #[test]
@@ -992,7 +1102,7 @@ mod tests {
         use arrow_array::{ArrayRef, LargeStringArray, RecordBatch};
         let (dst_dir, dst) = table("d", 0);
         let load = |tag: &str, names: &[&str]| {
-            let (dir, t) = table(tag, 0);
+            let (dir, t) = table_as(tag, 0, true);
             let schema = t
                 .reader()
                 .expect("reader")
@@ -1005,7 +1115,8 @@ mod tests {
                 let arr: ArrayRef = Arc::new(LargeStringArray::from(
                     titles.iter().map(String::as_str).collect::<Vec<_>>(),
                 ));
-                t.append_named(
+                append_batch(
+                    &t,
                     &RecordBatch::try_new(schema.clone(), vec![arr]).expect("batch"),
                     name,
                 )
@@ -1069,12 +1180,12 @@ mod tests {
             let arr: ArrayRef = Arc::new(LargeStringArray::from(
                 titles.iter().map(String::as_str).collect::<Vec<_>>(),
             ));
-            replica
-                .append_named(
-                    &RecordBatch::try_new(schema.clone(), vec![arr]).expect("batch"),
-                    name,
-                )
-                .expect("append");
+            append_batch(
+                &replica,
+                &RecordBatch::try_new(schema.clone(), vec![arr]).expect("batch"),
+                name,
+            )
+            .expect("append");
         }
         assert!(t.has_attached_replicas().expect("attached"));
         let again = open_replica(&t, "r0").expect("reopen");
@@ -1108,12 +1219,12 @@ mod tests {
         let a = Supertable::open(options_at(dir.path(), &schema, false)).expect("open");
         let replica = open_replica(&t, "r0").expect("replica");
         let arr: ArrayRef = Arc::new(LargeStringArray::from(vec!["shared x"; 50]));
-        replica
-            .append_named(
-                &RecordBatch::try_new(schema.clone(), vec![arr]).expect("batch"),
-                "b1",
-            )
-            .expect("append");
+        append_batch(
+            &replica,
+            &RecordBatch::try_new(schema.clone(), vec![arr]).expect("batch"),
+            "b1",
+        )
+        .expect("append");
         let reader = replica.reader().expect("reader");
         graft(&t, &reader, true).expect("B grafts");
         // A's graft either fails or adds nothing; the next round re-reads and moves on.
@@ -1163,20 +1274,22 @@ mod tests {
             .get_opts()
             .schema
             .clone();
-        let replica = open_replica(&t, "r0").expect("replica");
-        for name in ["b1", "b2", "b1"] {
+        let batch = |name: &str| {
             let titles: Vec<String> = (0..50).map(|i| format!("shared {name}d{i}")).collect();
             let arr: ArrayRef = Arc::new(LargeStringArray::from(
                 titles.iter().map(String::as_str).collect::<Vec<_>>(),
             ));
-            replica
-                .append_named(
-                    &RecordBatch::try_new(schema.clone(), vec![arr]).expect("batch"),
-                    name,
-                )
-                .expect("append");
-        }
-        let report = graft(&t, &replica.reader().expect("reader"), true).expect("graft");
+            RecordBatch::try_new(schema.clone(), vec![arr]).expect("batch")
+        };
+        let replica = open_replica(&t, "r0").expect("replica");
+        assert!(append_batch(&replica, &batch("b1"), "b1").expect("append"));
+        assert!(append_batch(&replica, &batch("b2"), "b2").expect("append"));
+        // The same handle takes a batch once, so a resend in flight never shares its commit.
+        assert!(!append_batch(&replica, &batch("b1"), "b1").expect("resend"));
+        // A restarted loader has a new handle: its copy commits, and the graft leaves it out.
+        let restarted = open_replica(&t, "r0").expect("reopen");
+        assert!(append_batch(&restarted, &batch("b1"), "b1").expect("resend"));
+        let report = graft(&t, &restarted.reader().expect("reader"), true).expect("graft");
         assert_eq!(
             (report.merged, report.duplicates, report.duplicate_rows),
             (2, 1, 50)
@@ -1190,9 +1303,90 @@ mod tests {
             .map(|e| e.n_docs)
             .sum();
         assert_eq!(rows, 100, "b1 once, b2 once");
-        // A later round finds nothing new and still counts the copy.
-        let again = graft(&t, &replica.reader().expect("reader"), true).expect("graft");
+        let again = graft(&t, &restarted.reader().expect("reader"), true).expect("graft");
         assert_eq!((again.merged, again.duplicates), (0, 1));
+    }
+
+    #[test]
+    fn only_batch_keys_are_dropped_as_copies() {
+        use arrow_array::{ArrayRef, LargeStringArray, RecordBatch};
+        let (_dir, t) = table("t", 0);
+        let schema = t
+            .reader()
+            .expect("reader")
+            .manifest()
+            .get_opts()
+            .schema
+            .clone();
+        let batch = || {
+            let arr: ArrayRef = Arc::new(LargeStringArray::from(vec!["shared x"; 50]));
+            RecordBatch::try_new(schema.clone(), vec![arr]).expect("batch")
+        };
+        let replica = open_replica(&t, "r0").expect("replica");
+        // Ids a stem would normalize alike stay apart as batch keys.
+        assert!(append_batch(&replica, &batch(), "shard-00").expect("append"));
+        assert!(append_batch(&replica, &batch(), "shard_00").expect("append"));
+        // An ordinary name appended in two commits is one source, not a resend.
+        replica
+            .append_named(&batch(), "customers.parquet")
+            .expect("append");
+        replica
+            .append_named(&batch(), "customers.parquet")
+            .expect("append");
+        let report = graft(&t, &replica.reader().expect("reader"), true).expect("graft");
+        assert_eq!((report.merged, report.duplicates), (4, 0));
+        assert!(
+            append_batch(&t, &batch(), "b").is_err(),
+            "only replicas take batches"
+        );
+    }
+
+    #[test]
+    fn a_replica_is_never_compacted_or_optimized() {
+        use arrow_array::{ArrayRef, LargeStringArray, RecordBatch};
+        let (_dir, t) = table("t", 0);
+        let schema = t
+            .reader()
+            .expect("reader")
+            .manifest()
+            .get_opts()
+            .schema
+            .clone();
+        let replica = open_replica(&t, "r0").expect("replica");
+        for i in 0..9 {
+            let arr: ArrayRef = Arc::new(LargeStringArray::from(vec!["shared x"; 10]));
+            append_batch(
+                &replica,
+                &RecordBatch::try_new(schema.clone(), vec![arr]).expect("batch"),
+                &format!("b{i}"),
+            )
+            .expect("append");
+        }
+        let files = |h: &Supertable| h.reader().expect("reader").manifest().superfiles.len();
+        let cfg = CompactionSettings {
+            target_superfile_size_mb: 1,
+            min_fill_percent: 1,
+            ..CompactionSettings::default()
+        };
+        replica.compact(&cfg).expect("compact");
+        replica
+            .optimize(&crate::OptimizeOptions::compact(cfg))
+            .expect("optimize");
+        assert_eq!(
+            files(&replica),
+            9,
+            "a compacted replica would be grafted twice"
+        );
+        graft(&t, &replica.reader().expect("reader"), true).expect("graft");
+        let rows: u64 = t
+            .reader()
+            .expect("reader")
+            .manifest()
+            .superfiles
+            .iter()
+            .map(|e| e.n_docs)
+            .sum();
+        assert_eq!(rows, 90);
     }
 
     #[test]

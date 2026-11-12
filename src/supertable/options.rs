@@ -495,6 +495,8 @@ pub struct SupertableOptions {
     /// background, each fold keeping ordinals relative to its own range, so the graft can move it like a commit's
     /// layer.
     pub term_index_replica: bool,
+    /// Where term-index builds and folds keep scratch when the table has no disk cache to hold it.
+    pub term_index_scratch_root: Option<PathBuf>,
     /// Whether a ranked query merges its terms' tiers only when that is
     /// measured to pay on this table: a running cost per tier entry
     /// against the opens the merge could save, and per class of query the
@@ -948,6 +950,7 @@ impl SupertableOptions {
             term_tier_entries_per_term: None,
             term_head_depth: None,
             term_index_replica: false,
+            term_index_scratch_root: None,
             tier_merge_gate: true,
             term_index: true,
             superfiles_in_flight: default_superfiles_in_flight(),
@@ -1173,7 +1176,11 @@ impl SupertableOptions {
                 .clamp(1, HEAD_DEPTH_MAX),
             pool: Some(Arc::clone(&self.writer_pool)),
             spill_to_disk: true,
-            scratch_root: self.disk_cache.as_ref().map(|c| c.scratch_root()),
+            scratch_root: self
+                .disk_cache
+                .as_ref()
+                .map(|c| c.scratch_root())
+                .or_else(|| self.term_index_scratch_root.clone()),
             replica_folds: self.term_index_replica,
             ..BuildPolicy::default()
         }

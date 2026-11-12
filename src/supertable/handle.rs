@@ -279,6 +279,9 @@ pub(super) struct SupertableInner {
     /// by content hash: maintenance checks that the objects its root names
     /// are there, and asks storage only about the ones not found before.
     pub(super) term_index_objects_seen: Mutex<HashSet<ContentHash>>,
+    /// Batch keys a replica handle has taken (see `merge::append_batch`), so a resend that
+    /// arrives while the first copy is in flight is not committed beside it.
+    pub(super) batches_taken: Mutex<HashSet<String>>,
     /// Compaction commits' leftovers being dropped off their path, joined
     /// before a pass returns and, failing that, when the table goes. See
     /// [`RetiredScratch`].
@@ -2287,6 +2290,7 @@ async fn build_handle(
         hidden_deleted_cache: Mutex::new(None),
         sql_schemas: ArcSwapOption::empty(),
         term_index_objects_seen: Mutex::default(),
+        batches_taken: Mutex::default(),
         retired_scratch: RetiredScratch::default(),
     });
     install_disk_cache_pinning(&inner);
