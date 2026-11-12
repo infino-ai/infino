@@ -77,7 +77,7 @@ use crate::{
             SuperfileHit,
             candidate::CandidateScope,
             exec::common::{
-                PushedPredicate, arg_to_string, arg_to_usize, candidate_plan_for_filters,
+                Arity, PushedPredicate, arg_to_string, arg_to_usize, candidate_plan_for_filters,
                 exact_scope, fill_ceiling, fill_top_k_within, live_reader,
                 output_schema_with_score, scope_to_call, top_k_statistics, traced_tvf,
                 widening_ended_short,
@@ -92,13 +92,19 @@ pub(crate) const BM25_SEARCH_UDTF: &str = "bm25_search";
 /// SQL name for the prefix BM25 TVF.
 pub(crate) const BM25_PREFIX_UDTF: &str = "bm25_search_prefix";
 
-/// Minimum argument count for `bm25_search(column, query, k)`.
-const BM25_SEARCH_ARG_COUNT_MIN: usize = 3;
-/// Maximum argument count: the optional `mode` makes it
-/// `bm25_search(column, query, k, mode)`.
-const BM25_SEARCH_ARG_COUNT_MAX: usize = 4;
-/// Argument count for `bm25_search_prefix(column, prefix, k)`.
-const BM25_PREFIX_SEARCH_ARG_COUNT: usize = 3;
+/// Arguments of `bm25_search(column, query, k)`; the optional `mode` makes
+/// it `bm25_search(column, query, k, mode)`.
+pub(crate) const BM25_SEARCH_ARITY: Arity = Arity {
+    min: 3,
+    max: 4,
+    arguments: "column, query, k[, mode]",
+};
+/// Arguments of `bm25_search_prefix(column, prefix, k)`.
+pub(crate) const BM25_PREFIX_SEARCH_ARITY: Arity = Arity {
+    min: 3,
+    max: 3,
+    arguments: "column, prefix, k",
+};
 
 /// Register `bm25_search` + `bm25_search_prefix` on `ctx`, bound to
 /// the query's pinned `reader` + scalar `schema`. Called from
@@ -153,13 +159,7 @@ impl Bm25SearchFunc {
 impl TableFunctionImpl for Bm25SearchFunc {
     fn call_with_args(&self, args: TableFunctionArgs) -> DfResult<Arc<dyn TableProvider>> {
         let args = args.exprs();
-        if args.len() != BM25_SEARCH_ARG_COUNT_MIN && args.len() != BM25_SEARCH_ARG_COUNT_MAX {
-            return Err(DataFusionError::Plan(format!(
-                "bm25_search expects {BM25_SEARCH_ARG_COUNT_MIN} or {BM25_SEARCH_ARG_COUNT_MAX} \
-                 arguments (column, query, k[, mode]), got {}",
-                args.len()
-            )));
-        }
+        BM25_SEARCH_ARITY.check(BM25_SEARCH_UDTF, args.len())?;
         let column = arg_to_string(&args[0], "bm25_search column")?;
         let query = arg_to_string(&args[1], "bm25_search query")?;
         let k = arg_to_usize(&args[2], "bm25_search k")?;
@@ -205,13 +205,7 @@ impl TableFunctionImpl for Bm25PrefixFunc {
     fn call_with_args(&self, args: TableFunctionArgs) -> DfResult<Arc<dyn TableProvider>> {
         let args = args.exprs();
 
-        if args.len() != BM25_PREFIX_SEARCH_ARG_COUNT {
-            return Err(DataFusionError::Plan(format!(
-                "bm25_search_prefix expects {BM25_PREFIX_SEARCH_ARG_COUNT} arguments \
-                 (column, prefix, k), got {}",
-                args.len()
-            )));
-        }
+        BM25_PREFIX_SEARCH_ARITY.check(BM25_PREFIX_UDTF, args.len())?;
 
         let column = arg_to_string(&args[0], "bm25_search_prefix column")?;
         let prefix = arg_to_string(&args[1], "bm25_search_prefix prefix")?;

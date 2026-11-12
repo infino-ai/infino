@@ -65,7 +65,7 @@ use crate::{
         query::{
             candidate::CandidatePlan,
             exec::common::{
-                PushedPredicate, arg_to_string, arg_to_usize, candidate_plan_for_filters,
+                Arity, PushedPredicate, arg_to_string, arg_to_usize, candidate_plan_for_filters,
                 exact_scope, fill_top_k, fill_top_k_within, live_reader, output_schema_with_score,
                 resolve_hits, scope_to_call, top_k_statistics, traced_tvf, widening_ended_short,
             },
@@ -80,8 +80,12 @@ use crate::{
 /// SQL name the TVF is registered under.
 pub(crate) const VECTOR_SEARCH_UDTF: &str = "vector_search";
 
-/// Argument count for `vector_search(column, query_vector, k)`.
-const VECTOR_SEARCH_ARG_COUNT: usize = 3;
+/// Arguments of `vector_search(column, query_vector, k)`.
+pub(crate) const VECTOR_SEARCH_ARITY: Arity = Arity {
+    min: 3,
+    max: 3,
+    arguments: "column, query_vector, k",
+};
 
 /// Register `vector_search(column, query, k)` on `ctx`, bound to the
 /// query's pinned `reader` + scalar `schema`. Called from
@@ -121,13 +125,7 @@ impl VectorSearchFunc {
 impl TableFunctionImpl for VectorSearchFunc {
     fn call_with_args(&self, args: TableFunctionArgs) -> DfResult<Arc<dyn TableProvider>> {
         let args = args.exprs();
-        if args.len() != VECTOR_SEARCH_ARG_COUNT {
-            return Err(DataFusionError::Plan(format!(
-                "vector_search expects {VECTOR_SEARCH_ARG_COUNT} arguments \
-                 (column, query_vector, k), got {}",
-                args.len()
-            )));
-        }
+        VECTOR_SEARCH_ARITY.check(VECTOR_SEARCH_UDTF, args.len())?;
         let column = arg_to_string(&args[0], "column")?;
         let query = arg_to_query_vector(&args[1])?;
         let k = arg_to_usize(&args[2], "k")?;

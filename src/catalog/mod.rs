@@ -154,7 +154,8 @@ use crate::{
         manifest::{ManifestSnapshot, disk_cache::MetadataDiskCache},
         options::SupertableOptions,
         query::{
-            covered_agg::prepare_aggregate_inputs, exec::common::collect_plan_metered,
+            covered_agg::prepare_aggregate_inputs,
+            exec::common::{collect_plan_metered, run_within_process_limit},
             sql::sql_session_context,
         },
         reader_cache::{DiskCacheConfig, DiskCacheError, DiskCacheStore},
@@ -1407,7 +1408,8 @@ impl Connection {
             || op_stats.clone(),
             || Some(Arc::clone(&self.inner.usage_meter)),
         );
-        let drive = async move {
+        let collector = op_stats.clone();
+        let statement = async move {
             // Plan on this runtime's 16 MiB workers, not the calling thread `block_on` polls on:
             // planner recursion depth must not hang on a stack the engine does not own. A panic
             // surfaces through the join as a query error.
@@ -1460,9 +1462,10 @@ impl Connection {
             }
             .instrument(detail_span!("sql.plan"))
             .in_current_span();
-            // A `SpawnedTask` aborts the task when dropped, so a cancel stops
-            // the file opens planning is making instead of leaving them to
-            // run on, detached.
+            // A `SpawnedTask` aborts the task when dropped, so a cancel stops the file opens
+            // planning is making instead of leaving them to run on, detached. The task carries the
+            // query's collector, as the prune counts the superfiles it weighed into it.
+            let planning = op_stats::attached_to_future(op_stats.clone(), planning);
             let (task_ctx, plan) = SpawnedTask::spawn(planning).await.map_err(|join| {
                 // A panic while planning is the engine's fault, never the query's.
                 InfinoError::Backend(format!("planning task failed: {join}"))
@@ -1493,6 +1496,13 @@ impl Connection {
                 .into_iter()
                 .map(crate::supertable::schema::strip_field_ids)
                 .collect::<Vec<_>>())
+        };
+        // The process memory limit watches the whole statement: planning holds the metadata of
+        // every file a scan keeps, and execution streams batches the budget never sees.
+        let drive = async move {
+            run_within_process_limit(collector, statement)
+                .await
+                .map_err(|e| datafusion_error(&e))?
         };
         // The cancel races the whole query. Dropping `drive` stops planning
         // (its `SpawnedTask`) and execution (DataFusion aborts its partition
@@ -1993,7 +2003,7 @@ fn backend_to_provider(
         }
     };
     // Tests slow or count reads by wrapping what the connection builds.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-helpers"))]
     let provider = match &options.storage_wrapper {
         Some(wrap) => provider.map(|provider| (wrap.0)(provider)),
         None => provider,
@@ -5042,7 +5052,9 @@ mod tests {
                 .expect("point lookup")
         });
         assert_eq!(found.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
-        // One superfile's rows are read, of the table's `COMMITS` superfiles.
+        // One superfile's rows are read, of the table's `COMMITS` superfiles. The prune weighs all
+        // of them on the planning task, and still counts them into this query's stats.
+        assert_eq!(stats.superfiles_considered, COMMITS as u64, "{stats:?}");
         assert_eq!(stats.planned_read_ranges, 1, "{stats:?}");
         assert_eq!(
             stats.rows_materialized, SENSORS as u64,
@@ -6457,6 +6469,135 @@ mod tests {
                 (count(0), count(1)),
                 (want_first, want_second),
                 "{what}: each call answers its own count"
+            );
+        }
+    }
+
+    /// A catalog search call with the wrong number of arguments is refused
+    /// in the form it was written, the leading table counted, with the
+    /// table's indexed columns of the kind the function takes named. Left to
+    /// the single-table function, a `hybrid_search` that left out its vector
+    /// column was told "expects 5 arguments (text_col, ...), got 4", which
+    /// reads as if the table were the mistake and names nothing to fix it
+    /// with.
+    #[test]
+    fn a_catalog_search_with_the_wrong_count_names_the_table_form_and_its_columns() {
+        let conn = conn_with_vector_table();
+        let v = one_hot_csv(0);
+        let cases = [
+            (
+                format!("SELECT * FROM hybrid_search('vecs', 'title', 'rust', '{v}', 3)"),
+                "hybrid_search expects 6 arguments (table, text_col, q_text, vec_col, q_vec, k), got 5",
+                "table \"vecs\" has full-text columns: title; vector columns: emb",
+            ),
+            (
+                "SELECT * FROM vector_search('vecs', 'emb', 3)".to_string(),
+                "vector_search expects 4 arguments (table, column, query_vector, k), got 3",
+                "table \"vecs\" has vector columns: emb",
+            ),
+            (
+                "SELECT * FROM bm25_search('vecs', 'title')".to_string(),
+                "bm25_search expects 4 or 5 arguments (table, column, query, k[, mode]), got 2",
+                "table \"vecs\" has full-text columns: title",
+            ),
+            (
+                "SELECT * FROM bm25_search_prefix('vecs', 'title', 'rus')".to_string(),
+                "bm25_search_prefix expects 4 arguments (table, column, prefix, k), got 3",
+                "table \"vecs\" has full-text columns: title",
+            ),
+            (
+                "SELECT * FROM token_match('vecs', 'title')".to_string(),
+                "token_match expects 3 or 4 arguments (table, column, query[, mode]), got 2",
+                "table \"vecs\" has full-text columns: title",
+            ),
+            (
+                "SELECT * FROM exact_match('vecs', 'title', 'rust', 'extra')".to_string(),
+                "exact_match expects 3 arguments (table, column, value), got 4",
+                "table \"vecs\" has full-text columns: title",
+            ),
+        ];
+        for (sql, want_count, want_columns) in cases {
+            let msg = conn
+                .query_sql(&sql)
+                .expect_err("a wrong argument count must be refused")
+                .to_string();
+            assert!(msg.contains(want_count), "{sql}: got {msg}");
+            assert!(
+                msg.ends_with(want_columns),
+                "{sql}: the refusal names only the indexed columns the function takes, got {msg}"
+            );
+        }
+    }
+
+    /// A table without the kind of index a function takes is told so: a
+    /// `vector_search` with the wrong count on a table holding only a
+    /// full-text index is refused with "vector columns: none", not with the
+    /// full-text column it could not have meant.
+    #[test]
+    fn a_wrong_count_on_a_table_without_the_index_names_none() {
+        let conn = connect("memory://").expect("connect");
+        conn.create_table("notes", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create notes")
+            .append(&build_title_batch(&["rust async"]))
+            .expect("append notes");
+        let cases = [
+            (
+                "SELECT * FROM vector_search('notes', 'title', 3)",
+                "table \"notes\" has vector columns: none",
+            ),
+            (
+                "SELECT * FROM bm25_search('notes', 'title')",
+                "table \"notes\" has full-text columns: title",
+            ),
+        ];
+        for (sql, want) in cases {
+            let msg = conn
+                .query_sql(sql)
+                .expect_err("a wrong argument count must be refused")
+                .to_string();
+            assert!(msg.ends_with(want), "{sql}: got {msg}");
+        }
+    }
+
+    /// The single-table form, the search functions a table reader's own SQL
+    /// registers, keeps its column-first refusal word for word: no table
+    /// counted and no column list.
+    #[test]
+    fn a_single_table_search_with_the_wrong_count_keeps_its_message() {
+        let conn = conn_with_vector_table();
+        let reader = conn
+            .open_table_handle("vecs")
+            .expect("handle")
+            .reader()
+            .expect("reader");
+        let v = one_hot_csv(0);
+        let cases = [
+            (
+                format!("SELECT * FROM hybrid_search('title', 'rust', '{v}', 3)"),
+                "hybrid_search expects 5 arguments (text_col, q_text, vec_col, q_vec, k), got 4",
+            ),
+            (
+                "SELECT * FROM vector_search('emb', 3)".to_string(),
+                "vector_search expects 3 arguments (column, query_vector, k), got 2",
+            ),
+            (
+                "SELECT * FROM bm25_search('title')".to_string(),
+                "bm25_search expects 3 or 4 arguments (column, query, k[, mode]), got 1",
+            ),
+            (
+                "SELECT * FROM exact_match('title')".to_string(),
+                "exact_match expects 2 arguments (column, value), got 1",
+            ),
+        ];
+        for (sql, want) in cases {
+            let msg = reader
+                .query_sql(&sql)
+                .expect_err("a wrong argument count must be refused")
+                .to_string();
+            assert!(msg.contains(want), "{sql}: got {msg}");
+            assert!(
+                !msg.contains("columns:"),
+                "{sql}: the single-table refusal names no columns, got {msg}"
             );
         }
     }

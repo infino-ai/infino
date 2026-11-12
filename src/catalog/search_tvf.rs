@@ -37,16 +37,23 @@ use super::Connection;
 use crate::supertable::query::exec::graph_exec::{GraphFunc, Traversal};
 use crate::{
     InfinoError,
+    error::capped_column_list,
     runtime_metrics::op_stats::{self, OpStatsCollector},
     supertable::{
         error::QueryError,
         handle::SupertableReader,
         query::exec::{
-            common::arg_to_string,
-            fts_exec::{BM25_PREFIX_UDTF, BM25_SEARCH_UDTF, Bm25PrefixFunc, Bm25SearchFunc},
-            hybrid_exec::{HYBRID_SEARCH_UDTF, HybridSearchFunc},
-            match_exec::{EXACT_MATCH_UDTF, ExactMatchFunc, TOKEN_MATCH_UDTF, TokenMatchFunc},
-            vector_exec::{VECTOR_SEARCH_UDTF, VectorSearchFunc},
+            common::{Arity, arg_to_string},
+            fts_exec::{
+                BM25_PREFIX_SEARCH_ARITY, BM25_PREFIX_UDTF, BM25_SEARCH_ARITY, BM25_SEARCH_UDTF,
+                Bm25PrefixFunc, Bm25SearchFunc,
+            },
+            hybrid_exec::{HYBRID_SEARCH_ARITY, HYBRID_SEARCH_UDTF, HybridSearchFunc},
+            match_exec::{
+                EXACT_MATCH_ARITY, EXACT_MATCH_UDTF, ExactMatchFunc, TOKEN_MATCH_ARITY,
+                TOKEN_MATCH_UDTF, TokenMatchFunc,
+            },
+            vector_exec::{VECTOR_SEARCH_ARITY, VECTOR_SEARCH_UDTF, VectorSearchFunc},
         },
         schema::sql_schema,
     },
@@ -148,12 +155,13 @@ impl TableResolver {
     }
 
     /// Pop the leading table-name argument and resolve it, returning the
-    /// snapshot + the remaining (column-first) args for the inner TVF.
+    /// snapshot, the name as written, and the remaining (column-first) args
+    /// for the inner TVF.
     fn split_leading<'a>(
         &self,
         args: &'a [Expr],
         fn_name: &str,
-    ) -> DfResult<(ResolvedTable, &'a [Expr])> {
+    ) -> DfResult<(ResolvedTable, String, &'a [Expr])> {
         let first = args.first().ok_or_else(|| {
             DataFusionError::Plan(format!(
                 "{fn_name} expects a leading table-name argument: \
@@ -162,8 +170,88 @@ impl TableResolver {
         })?;
         let name = arg_to_string(first, &format!("{fn_name} table"))?;
         let resolved = self.resolve(&name)?;
-        Ok((resolved, &args[1..]))
+        Ok((resolved, name, &args[1..]))
     }
+
+    /// [`split_leading`](Self::split_leading), then the remaining arguments
+    /// checked against `arity` in the form the caller wrote: with the table
+    /// counted. Left to the single-table function, the count would leave the
+    /// table out ("expects 5 arguments (text_col, ...), got 4" for a call
+    /// that passed five), which reads as if the leading table were the
+    /// mistake. The refusal names the table's indexed columns of the kind
+    /// the function takes, the arguments a wrong count most often left out.
+    fn split_checked<'a>(
+        &self,
+        args: &'a [Expr],
+        fn_name: &str,
+        arity: Arity,
+        takes: IndexedColumns,
+    ) -> DfResult<(ResolvedTable, &'a [Expr])> {
+        let (table, table_name, rest) = self.split_leading(args, fn_name)?;
+        if arity.takes(rest.len()) {
+            return Ok((table, rest));
+        }
+        // The first column argument, when it reads as a name, ranks a list
+        // past the cap closest first.
+        let written = rest
+            .first()
+            .and_then(|e| arg_to_string(e, fn_name).ok())
+            .unwrap_or_default();
+        let listed = |kind: &str, columns: Vec<String>| {
+            let names: Vec<&str> = columns.iter().map(String::as_str).collect();
+            let list = if names.is_empty() {
+                "none".to_string()
+            } else {
+                // A wide table's list would otherwise run past the cap on
+                // an error message and be cut mid-list.
+                capped_column_list(&names, &written)
+            };
+            format!("{kind} columns: {list}")
+        };
+        let manifest = table.reader.manifest();
+        let full_text = || {
+            listed(
+                "full-text",
+                manifest
+                    .fts_configs()
+                    .into_iter()
+                    .map(|c| c.column)
+                    .collect(),
+            )
+        };
+        let vector = || {
+            listed(
+                "vector",
+                manifest
+                    .vector_configs()
+                    .into_iter()
+                    .map(|c| c.column)
+                    .collect(),
+            )
+        };
+        let columns = match takes {
+            IndexedColumns::FullText => full_text(),
+            IndexedColumns::Vector => vector(),
+            IndexedColumns::Both => format!("{}; {}", full_text(), vector()),
+        };
+        Err(DataFusionError::Plan(format!(
+            "{}; table {table_name:?} has {columns}",
+            arity.expects(fn_name, rest.len(), &["table"]),
+        )))
+    }
+}
+
+/// The indexed columns a search function takes, so a refusal names only the
+/// columns the call could have meant: a `vector_search` has no use for the
+/// full-text ones.
+#[derive(Debug, Clone, Copy)]
+enum IndexedColumns {
+    /// `bm25_search`, `bm25_search_prefix`, `token_match`, `exact_match`.
+    FullText,
+    /// `vector_search`.
+    Vector,
+    /// `hybrid_search`.
+    Both,
 }
 
 /// Register the catalog search TVFs (table-name-first form) on `ctx`,
@@ -256,7 +344,10 @@ impl TableFunctionImpl for GraphCatalogFunc {
         let name = self.traversal.name();
         let (edges, rest) = match &self.edge_table {
             Some(edge_table) => (self.graph.resolve(edge_table)?, args.exprs()),
-            None => self.graph.split_leading(args.exprs(), name)?,
+            None => {
+                let (edges, _, rest) = self.graph.split_leading(args.exprs(), name)?;
+                (edges, rest)
+            }
         };
         let first = rest.first().ok_or_else(|| {
             DataFusionError::Plan(format!(
@@ -283,7 +374,12 @@ struct Bm25SearchCatalogFunc {
 }
 impl TableFunctionImpl for Bm25SearchCatalogFunc {
     fn call_with_args(&self, args: TableFunctionArgs) -> DfResult<Arc<dyn TableProvider>> {
-        let (t, rest) = self.resolver.split_leading(args.exprs(), "bm25_search")?;
+        let (t, rest) = self.resolver.split_checked(
+            args.exprs(),
+            BM25_SEARCH_UDTF,
+            BM25_SEARCH_ARITY,
+            IndexedColumns::FullText,
+        )?;
 
         Bm25SearchFunc::new(t.reader, t.scalar_schema)
             .call_with_args(TableFunctionArgs::new(rest, args.session()))
@@ -296,9 +392,12 @@ struct Bm25PrefixCatalogFunc {
 }
 impl TableFunctionImpl for Bm25PrefixCatalogFunc {
     fn call_with_args(&self, args: TableFunctionArgs) -> DfResult<Arc<dyn TableProvider>> {
-        let (t, rest) = self
-            .resolver
-            .split_leading(args.exprs(), "bm25_search_prefix")?;
+        let (t, rest) = self.resolver.split_checked(
+            args.exprs(),
+            BM25_PREFIX_UDTF,
+            BM25_PREFIX_SEARCH_ARITY,
+            IndexedColumns::FullText,
+        )?;
 
         Bm25PrefixFunc::new(t.reader, t.scalar_schema)
             .call_with_args(TableFunctionArgs::new(rest, args.session()))
@@ -311,7 +410,12 @@ struct VectorSearchCatalogFunc {
 }
 impl TableFunctionImpl for VectorSearchCatalogFunc {
     fn call_with_args(&self, args: TableFunctionArgs) -> DfResult<Arc<dyn TableProvider>> {
-        let (t, rest) = self.resolver.split_leading(args.exprs(), "vector_search")?;
+        let (t, rest) = self.resolver.split_checked(
+            args.exprs(),
+            VECTOR_SEARCH_UDTF,
+            VECTOR_SEARCH_ARITY,
+            IndexedColumns::Vector,
+        )?;
 
         VectorSearchFunc::new(t.reader, t.scalar_schema)
             .call_with_args(TableFunctionArgs::new(rest, args.session()))
@@ -324,7 +428,12 @@ struct HybridSearchCatalogFunc {
 }
 impl TableFunctionImpl for HybridSearchCatalogFunc {
     fn call_with_args(&self, args: TableFunctionArgs) -> DfResult<Arc<dyn TableProvider>> {
-        let (t, rest) = self.resolver.split_leading(args.exprs(), "hybrid_search")?;
+        let (t, rest) = self.resolver.split_checked(
+            args.exprs(),
+            HYBRID_SEARCH_UDTF,
+            HYBRID_SEARCH_ARITY,
+            IndexedColumns::Both,
+        )?;
 
         HybridSearchFunc::new(t.reader, t.scalar_schema)
             .call_with_args(TableFunctionArgs::new(rest, args.session()))
@@ -337,7 +446,12 @@ struct TokenMatchCatalogFunc {
 }
 impl TableFunctionImpl for TokenMatchCatalogFunc {
     fn call_with_args(&self, args: TableFunctionArgs) -> DfResult<Arc<dyn TableProvider>> {
-        let (t, rest) = self.resolver.split_leading(args.exprs(), "token_match")?;
+        let (t, rest) = self.resolver.split_checked(
+            args.exprs(),
+            TOKEN_MATCH_UDTF,
+            TOKEN_MATCH_ARITY,
+            IndexedColumns::FullText,
+        )?;
 
         TokenMatchFunc::new(t.reader, t.scalar_schema)
             .call_with_args(TableFunctionArgs::new(rest, args.session()))
@@ -350,7 +464,12 @@ struct ExactMatchCatalogFunc {
 }
 impl TableFunctionImpl for ExactMatchCatalogFunc {
     fn call_with_args(&self, args: TableFunctionArgs) -> DfResult<Arc<dyn TableProvider>> {
-        let (t, rest) = self.resolver.split_leading(args.exprs(), "exact_match")?;
+        let (t, rest) = self.resolver.split_checked(
+            args.exprs(),
+            EXACT_MATCH_UDTF,
+            EXACT_MATCH_ARITY,
+            IndexedColumns::FullText,
+        )?;
 
         ExactMatchFunc::new(t.reader, t.scalar_schema)
             .call_with_args(TableFunctionArgs::new(rest, args.session()))
