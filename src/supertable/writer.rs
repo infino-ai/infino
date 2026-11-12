@@ -67,7 +67,6 @@ use std::{
     mem,
     num::NonZeroUsize,
     ops::Range,
-    panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
     str::from_utf8,
     sync::{
@@ -123,7 +122,7 @@ use crate::{
     config::{self, CentroidAlignment, DrainConsolidate, ThreadCount, scratch_root},
     dynamic::rows_to_batch,
     memory::{ConnectionMemoryBudget, Reservation},
-    runtime_bridge::{bridge_on_runtime, bridge_sync_to_async, run_on_pool},
+    runtime_bridge::{bridge_on_runtime, bridge_sync_to_async, catch_panic, run_on_pool},
     runtime_metrics::{
         ingest::visible_array_bytes,
         op_stats::{self, OpStatsCollector, timed_kernel},
@@ -829,11 +828,9 @@ fn split_target_bytes(options: &SupertableOptions) -> usize {
 }
 
 /// How many superfiles a commit of `buffer` becomes: [`superfiles_per_commit`]'s
-/// count from the buffered bytes, capped by the writer pool. The bytes are the
-/// Arrow footprint of every scalar and vector column the buffer holds (Arrow
-/// reports capacity, not logical bytes — fine for a fanout heuristic that is
-/// clamped to the pool anyway), less the slots its null cells keep
-/// ([`set_cell_bytes`]). A wide, sparse batch's footprint is almost all such
+/// count from the buffered bytes, capped by the writer pool. The bytes are
+/// what every scalar and vector column the buffer holds takes ([`visible_array_bytes`]),
+/// less the slots its null cells keep ([`set_cell_bytes`]). A wide, sparse batch's footprint is almost all such
 /// slots, and each superfile of a commit stores, describes and summarises
 /// every column its rows set, so cut by its footprint it would pay that
 /// per-column cost once per piece for pieces its values do not need. The
@@ -843,23 +840,30 @@ fn split_target_bytes(options: &SupertableOptions) -> usize {
 /// whichever path builds it.
 fn commit_superfile_count(buffer: &[BufferedBatch], options: &SupertableOptions) -> usize {
     let total_rows: usize = buffer.iter().map(|b| b.scalar.num_rows()).sum();
-    let buffered_bytes: usize = buffer
+    let n_threads = options.writer_pool.current_num_threads().max(1);
+    superfiles_per_commit(
+        total_rows,
+        commit_buffered_bytes(buffer),
+        n_threads,
+        split_target_bytes(options),
+    )
+}
+
+/// The bytes [`commit_superfile_count`] sizes a commit of `buffer` by. Each
+/// column is sized by the rows it holds, not by its buffers: every column of
+/// an IPC-decoded batch points into the one message buffer, so Arrow's
+/// buffer-based size counts that whole buffer once per column.
+fn commit_buffered_bytes(buffer: &[BufferedBatch]) -> usize {
+    buffer
         .iter()
         .map(|b| {
             set_cell_bytes(&b.scalar)
                 + b.vectors
                     .iter()
-                    .map(|v| v.get_array_memory_size())
+                    .map(|v| usize::try_from(visible_array_bytes(v.as_ref())).unwrap_or(usize::MAX))
                     .sum::<usize>()
         })
-        .sum();
-    let n_threads = options.writer_pool.current_num_threads().max(1);
-    superfiles_per_commit(
-        total_rows,
-        buffered_bytes,
-        n_threads,
-        split_target_bytes(options),
-    )
+        .sum()
 }
 
 /// Where a commit of `buffer` is cut into superfiles: `bounds[i]..bounds[i + 1]`
@@ -2789,8 +2793,8 @@ impl SupertableWriter {
         // side by side, their dictionaries merged into the pieces' order,
         // then every piece built from its rows of them.
         let pool = &options.writer_pool;
-        fn seal_task_lost() -> BuildError {
-            BuildError::Store("a seal task ended without a result".into())
+        fn seal_task_lost(what: &'static str) -> BuildError {
+            BuildError::Store(format!("{what} did not finish (it panicked)"))
         }
         // What the budget granted the lanes past their thresholds is held
         // with the rest of their reservations, through the seal: the
@@ -2804,6 +2808,7 @@ impl SupertableWriter {
         let freeze_stats = stats.clone();
         let frozen: Vec<FrozenLane> = run_spawned(
             pool,
+            "lane freeze",
             lanes,
             move |_, lane| {
                 let _span = detail_span!(
@@ -2849,6 +2854,7 @@ impl SupertableWriter {
         let piece_stem = stem.map(str::to_owned);
         let sealed_pieces = run_spawned(
             pool,
+            "piece build",
             (0..n_pieces).collect(),
             move |i, _| {
                 let _span = detail_span!("piece.build", parent: &parent, piece = i).entered();
@@ -4021,7 +4027,7 @@ impl LiveLanes {
                 // A panic is caught here and reported as the lane's error: a
                 // pool with no panic handler aborts the process on a spawned
                 // job's panic.
-                let fed = catch_unwind(AssertUnwindSafe(|| {
+                let fed = catch_panic("live lane feed", || {
                     timed_kernel(&stats, || {
                         lane.builder.set_spill_threshold_bytes(threshold);
                         let mut base = first_row;
@@ -4053,8 +4059,8 @@ impl LiveLanes {
                         Ok::<(), BuildError>(())
                     })
                     .map(|()| lane)
-                }))
-                .unwrap_or_else(|_| Err(BuildError::Store("a live lane's feed panicked".into())));
+                })
+                .unwrap_or_else(|| Err(BuildError::Store("a live lane's feed panicked".into())));
                 // The receiver is gone only if the writer was dropped
                 // mid-feed; there is nobody left to tell.
                 let _ = tx.send((i, fed));
@@ -7285,7 +7291,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                     (cal, clusters_for_freeze)
                 })
                 .await
-                .map_err(|e| BuildError::Store(format!("width-law freeze: {e}")))?;
+                .map_err(|e| BuildError::Store(e.to_string()))?;
             width_law = Some(frozen);
             running_clusters = clusters_back;
         }
@@ -7322,6 +7328,12 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                                 cell = *cell_id,
                                 rows = spill.n_rows(),
                                 score_ms = tracing::field::Empty,
+                                score_pool_queries = tracing::field::Empty,
+                                score_read_ms = tracing::field::Empty,
+                                score_estimate_ms = tracing::field::Empty,
+                                score_exact_ms = tracing::field::Empty,
+                                score_trim_ms = tracing::field::Empty,
+                                score_merge_ms = tracing::field::Empty,
                                 sample_ms = tracing::field::Empty,
                                 train_ms = tracing::field::Empty,
                                 n_cent = tracing::field::Empty,
@@ -7336,8 +7348,14 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                             // about to read anyway (before remove_files).
                             if let Some(cal) = width_law_ref {
                                 let score_t0 = time::Instant::now();
-                                cal.score_cell(*cell_id, spill)?;
+                                let profile = cal.score_cell(*cell_id, spill)?;
                                 record("score_ms", score_t0.elapsed().as_millis() as u64);
+                                record("score_pool_queries", profile.pool_queries as u64);
+                                record("score_read_ms", profile.read.as_millis() as u64);
+                                record("score_estimate_ms", profile.estimate.as_millis() as u64);
+                                record("score_exact_ms", profile.exact.as_millis() as u64);
+                                record("score_trim_ms", profile.trim.as_millis() as u64);
+                                record("score_merge_ms", profile.merge.as_millis() as u64);
                             }
                             let cell = build_spilled_packed_cell_from_rows(
                                 scratch,
@@ -10010,7 +10028,7 @@ pub(in crate::supertable) async fn split_overflow_cell_batch(
         move || plan_split_wave(plan_inputs, &plan_clusters, metric, modality_d),
     )
     .await
-    .map_err(|e| BuildError::Store(format!("cell split batch planning: {e}")))?;
+    .map_err(|e| BuildError::Store(e.to_string()))?;
     let mut planned: Vec<PlannedCellSplit> = Vec::new();
     for item in planned_or_noop {
         match item {
@@ -10088,7 +10106,7 @@ pub(in crate::supertable) async fn split_overflow_cell_batch(
         },
     )
     .await
-    .map_err(|e| BuildError::Store(format!("cell split batch child builds: {e}")))??;
+    .map_err(|e| BuildError::Store(e.to_string()))??;
     if built.iter().all(|b| b.prepared.is_empty()) {
         noop_cells.extend(built.iter().map(|b| b.cell));
         return Ok(SplitBatchOutcome::no_op_cells(noop_cells));
@@ -10502,7 +10520,7 @@ pub(in crate::supertable) async fn split_repack_bulk(
             })
             .instrument(plan_span)
             .await
-            .map_err(|e| BuildError::Store(format!("repack wave planning: {e}")))?;
+            .map_err(|e| BuildError::Store(e.to_string()))?;
         let mut planned: Vec<PlannedCellSplit> = Vec::new();
         for item in planned_or_noop {
             match item {
@@ -10629,7 +10647,7 @@ pub(in crate::supertable) async fn split_repack_bulk(
             })
             .instrument(pack_span)
             .await
-            .map_err(|e| BuildError::Store(format!("repack wave child packs: {e}")))??;
+            .map_err(|e| BuildError::Store(e.to_string()))??;
 
         for split in repacked {
             for parent in &split.parent_ids {
@@ -10703,7 +10721,7 @@ pub(in crate::supertable) async fn split_repack_bulk(
         })
         .instrument(assemble_span)
         .await
-        .map_err(|e| BuildError::Store(format!("repack shard assembly: {e}")))??;
+        .map_err(|e| BuildError::Store(e.to_string()))??;
     let mut new_entries_by_cell: Vec<(u32, Arc<SuperfileEntry>)> = Vec::new();
     for (shard, prepared_shard) in &prepared {
         if let Some(cells) = bucket_cells.get(shard) {
@@ -11362,7 +11380,7 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
     })
     .instrument(detail_span!("recalibrate.freeze"))
     .await
-    .map_err(|e| BuildError::Store(format!("recalibration freeze: {e}")))?;
+    .map_err(|e| BuildError::Store(e.to_string()))?;
     // Centroid-router fanout calibration rides the SAME scan: build the router
     // over the settled fine centroids (byte-identical to the settle-published
     // one — same superfile × flat node order, `HnswParams::default`) and select
@@ -11536,7 +11554,7 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
             })
             .instrument(shortlist_span.clone())
             .await
-            .map_err(|e| BuildError::Store(format!("recalibration shortlist: {e}")))?;
+            .map_err(|e| BuildError::Store(e.to_string()))?;
             pool_ms += pool_t0.elapsed().as_millis() as u64;
         }
     }
@@ -11617,7 +11635,7 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
                 })
                 .instrument(rescore_span.clone())
                 .await
-                .map_err(|e| BuildError::Store(format!("recalibration rescore: {e}")))?;
+                .map_err(|e| BuildError::Store(e.to_string()))?;
                 pool_ms += pool_t0.elapsed().as_millis() as u64;
             }
         }
@@ -11657,7 +11675,7 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
             })
             .instrument(rescore_span.clone())
             .await
-            .map_err(|e| BuildError::Store(format!("recalibration depth observation: {e}")))?;
+            .map_err(|e| BuildError::Store(e.to_string()))?;
         }
         depth_ms += depth_t0.elapsed().as_millis() as u64;
     }
@@ -11679,7 +11697,7 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
         cal.finish(&clusters, fanout_ctx)
     })
     .await
-    .map_err(|e| BuildError::Store(format!("recalibration finish: {e}")))?
+    .map_err(|e| BuildError::Store(e.to_string()))?
     else {
         return Ok(false);
     };
@@ -12581,6 +12599,8 @@ pub(in crate::supertable) async fn stamp_term_index(
     let reuse_path = reuse.path().to_path_buf();
     // Local bytes per slice byte the call's folds have measured, in thousandths.
     let disk_per_slice = Arc::new(AtomicU64::new(0));
+    // Tier object lengths the call's folds stored, for its streamed folds.
+    let tier_lens = Arc::new(Mutex::new(HashMap::new()));
     // The next fold's inputs, fetched while this one merges and uploads.
     let prefetch = Prefetch::default();
     // One renumbering fold per call. Commits that land while it runs are
@@ -12606,6 +12626,7 @@ pub(in crate::supertable) async fn stamp_term_index(
                 &prefetch,
                 &disk_per_slice,
             );
+            let tier_lens = &tier_lens;
             let (kept_batch, kept_fold, renumbered) = (&kept_batch, &kept_fold, &renumbered);
             async move {
                 published.store(false, Ordering::Relaxed);
@@ -12704,8 +12725,8 @@ pub(in crate::supertable) async fn stamp_term_index(
                         ) && term_index::fold_disk_bound(reuse_path, disk_per_slice, 0)
                             .is_some_and(|bound| bound >= fold_bytes.saturating_mul(2));
                         let downloaded = Arc::new(Notify::new());
-                        if fold_budget.prefetches() {
-                            let next = term_index::layers_after(
+                        let next = match fold_budget.prefetches() {
+                            true => term_index::layers_after(
                                 &root,
                                 &fold,
                                 &live,
@@ -12713,7 +12734,20 @@ pub(in crate::supertable) async fn stamp_term_index(
                                 fold_budget,
                                 renumber,
                                 before_tiers,
-                            );
+                            ),
+                            false => Vec::new(),
+                        };
+                        // A fold that will stream reads nothing from local disk.
+                        let local_milli = disk_per_slice.load(Ordering::Relaxed);
+                        if !next.is_empty()
+                            && !fold_budget.streams(
+                                &next,
+                                fold.ranges(),
+                                fold.ranges() * term_index::FOLD_RANGES_PER_THREAD,
+                                local_milli,
+                                policy.one_mark_slices_per_range,
+                            )
+                        {
                             *prefetch.0.lock().expect("prefetch") =
                                 Some(spawn(term_index::prefetch_layers(
                                     Arc::clone(storage),
@@ -12733,6 +12767,8 @@ pub(in crate::supertable) async fn stamp_term_index(
                             keep_uploads: keep,
                             disk_per_slice_milli: Some(Arc::clone(disk_per_slice)),
                             downloaded: Some(Arc::clone(&downloaded)),
+                            stream: Some(fold_budget),
+                            tier_lens: Arc::clone(tier_lens),
                         };
                         let renumbers = fold.renumbers();
                         info!(
@@ -12742,6 +12778,10 @@ pub(in crate::supertable) async fn stamp_term_index(
                             ranges = fold.ranges(),
                             renumbers,
                             budget_mib = fold_budget.memory_bytes >> 20,
+                            cache_mib = fold_budget.cache_bytes >> 20,
+                            input_mib = fold_bytes >> 20,
+                            slices = root.layers[fold.run()].iter().map(|layer| layer.slices.len()).sum::<usize>(),
+                            local_milli,
                             "term index fold plan"
                         );
                         let output_at = fold.run().start;
@@ -14685,6 +14725,7 @@ mod tests {
     use std::{
         fs,
         future::pending,
+        panic::{AssertUnwindSafe, catch_unwind},
         sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
@@ -14695,8 +14736,8 @@ mod tests {
 
     use arrow::{compute::concat_batches, ipc::reader::StreamReader};
     use arrow_array::{
-        Array, Decimal128Array, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch,
-        StringArray, StructArray,
+        Array, ArrayRef, Decimal128Array, FixedSizeListArray, Float32Array, Float64Array,
+        Int32Array, LargeStringArray, RecordBatch, StringArray, StructArray,
     };
     use arrow_schema::{DataType, Field, Fields, Schema};
     use datafusion::prelude::{col, lit};
@@ -18033,6 +18074,149 @@ mod tests {
     }
 
     // ---- rayon-shard parallelism -------------------------------------
+
+    /// Rows in the IPC-decoded commit-sizing test: a typical append's shape,
+    /// scaled down.
+    const IPC_SIZED_ROWS: usize = 2048;
+    /// Vector width in the IPC-decoded commit-sizing tests.
+    const IPC_SIZED_DIM: i32 = 768;
+    /// Writer pool width in the IPC-decoded append test, wider than the
+    /// superfile count its batch splits into.
+    const IPC_APPEND_POOL: usize = 16;
+    /// Split target, in MiB, in the IPC-decoded append test: small enough
+    /// that its batch spans several superfiles.
+    const IPC_APPEND_SPLIT_MB: u64 = 1;
+
+    #[test]
+    fn an_ipc_decoded_commit_is_sized_by_its_own_bytes() {
+        // An append arrives as one Arrow IPC message, and every column decodes
+        // as a slice of that one message buffer. The commit must be sized by
+        // the bytes the batch holds, not by the shared buffer once per column.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("url", DataType::Utf8, false),
+            Field::new("dump", DataType::Utf8, false),
+            Field::new("score", DataType::Float64, false),
+            Field::new("tokens", DataType::Int32, false),
+            Field::new(
+                "embedding",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float32, false)),
+                    IPC_SIZED_DIM,
+                ),
+                false,
+            ),
+        ]));
+        let text = |prefix: &str| -> ArrayRef {
+            Arc::new(StringArray::from_iter_values(
+                (0..IPC_SIZED_ROWS).map(|i| format!("{prefix}-{i:08}")),
+            ))
+        };
+        let values = Float32Array::from_iter_values(
+            (0..IPC_SIZED_ROWS * IPC_SIZED_DIM as usize).map(|i| i as f32),
+        );
+        let embedding = FixedSizeListArray::new(
+            Arc::new(Field::new("item", DataType::Float32, false)),
+            IPC_SIZED_DIM,
+            Arc::new(values),
+            None,
+        );
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                text("id"),
+                text("https://example.com/page"),
+                text("CC-MAIN"),
+                Arc::new(Float64Array::from_iter_values(
+                    (0..IPC_SIZED_ROWS).map(|i| i as f64),
+                )),
+                Arc::new(Int32Array::from_iter_values(
+                    (0..IPC_SIZED_ROWS).map(|i| i as i32),
+                )),
+                Arc::new(embedding),
+            ],
+        )
+        .expect("batch");
+
+        let decoded = ipc_round_trip(&batch);
+
+        let vector_index = decoded.schema().index_of("embedding").expect("embedding");
+        let vectors = Arc::new(
+            decoded
+                .column(vector_index)
+                .as_any()
+                .downcast_ref::<FixedSizeListArray>()
+                .expect("fixed-size list")
+                .values()
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .expect("f32 values")
+                .clone(),
+        );
+        let mut scalar = decoded.clone();
+        scalar.remove_column(vector_index);
+        let buffered = [BufferedBatch {
+            scalar,
+            vectors: vec![vectors],
+        }];
+
+        // What the batch holds: its own bytes, before any IPC round trip.
+        let own_bytes: usize = batch
+            .columns()
+            .iter()
+            .map(|c| c.to_data().get_slice_memory_size().expect("slice size"))
+            .sum();
+        let measured = commit_buffered_bytes(&buffered);
+        assert_eq!(
+            measured, own_bytes,
+            "commit sized by bytes the batch does not hold"
+        );
+    }
+
+    #[test]
+    fn an_ipc_decoded_append_commits_as_many_superfiles_as_the_batch_itself() {
+        // The same rows appended as built and as decoded from one IPC message
+        // must commit to the same number of superfiles, through the whole
+        // append path: resolving the batch, minting `_id`, and moving the
+        // vectors out of the scalar batch.
+        let dim = IPC_SIZED_DIM as usize;
+        let schema = schema_id_title_emb(dim);
+        let titles = LargeStringArray::from_iter_values(
+            (0..IPC_SIZED_ROWS).map(|i| format!("https://example.com/page-{i:08}")),
+        );
+        let values =
+            Float32Array::from_iter_values((0..IPC_SIZED_ROWS * dim).map(|i| (i % 97) as f32));
+        let DataType::FixedSizeList(item, _) = fixed_list_f32(dim) else {
+            unreachable!("fixed_list_f32 builds a fixed-size list");
+        };
+        let embedding = FixedSizeListArray::new(item, IPC_SIZED_DIM, Arc::new(values), None);
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(titles), Arc::new(embedding)],
+        )
+        .expect("batch");
+
+        let superfiles_after_append = |batch: &RecordBatch| -> usize {
+            let options = options_with_vector(dim)
+                .with_writer_pool(writer_pool_with(IPC_APPEND_POOL))
+                .with_superfile_buffer_split_mb(IPC_APPEND_SPLIT_MB);
+            let table = Supertable::create(options).expect("create");
+            let mut writer = table.writer().expect("writer");
+            writer.append(batch).expect("append");
+            writer.commit().expect("commit");
+            table.reader().expect("reader").n_superfiles()
+        };
+        let built = superfiles_after_append(&batch);
+        let decoded = superfiles_after_append(&ipc_round_trip(&batch));
+        assert!(
+            built > 1,
+            "the batch must span several superfiles for the count to mean anything, got {built}"
+        );
+        assert_eq!(
+            decoded, built,
+            "an IPC-decoded append committed to {decoded} superfiles, the batch itself to {built}"
+        );
+    }
 
     #[test]
     fn commit_superfile_count_follows_bytes_not_pool_size() {

@@ -31,20 +31,24 @@
 //! `multi_thread` runtime (the default for `#[tokio::main]`, axum,
 //! actix, etc.).
 
+#[cfg(test)]
+use std::sync::mpsc;
 use std::{
+    any::Any,
     fmt,
     future::Future,
+    panic::{AssertUnwindSafe, catch_unwind},
     sync::{Arc, OnceLock},
     thread,
 };
 
-use rayon::ThreadPool;
+use rayon::{ThreadPool, ThreadPoolBuilder};
 use tokio::{
     runtime::{self, Handle, Runtime},
     sync::oneshot,
     task::{self, block_in_place},
 };
-use tracing::{Instrument, Span};
+use tracing::{Instrument, Span, error};
 
 /// Fallback worker count for [`build_query_runtime`] when the host's available
 /// parallelism can't be determined.
@@ -127,13 +131,65 @@ where
     }
 }
 
-/// Async→rayon bridge: dispatch CPU work onto the configured reader pool
-pub(crate) fn spawn_on<F: FnOnce() + Send + 'static>(pool: Option<&ThreadPool>, f: F) {
-    let f = carry_span(f);
+/// Async→rayon bridge: dispatch CPU work onto `pool` (rayon's global pool if
+/// `None`) without waiting for it. `f` hands its result back through what it
+/// captured, such as a channel's sender; a panic in `f` is logged as the job
+/// `what` and drops that sender, so the caller sees a closed channel (see
+/// [`catch_panic`]).
+pub(crate) fn spawn_on<F: FnOnce() + Send + 'static>(
+    pool: Option<&ThreadPool>,
+    what: &'static str,
+    f: F,
+) {
+    let job = carry_span(move || {
+        let _ = catch_panic(what, f);
+    });
     match pool {
-        Some(pool) => pool.spawn(f),
-        None => rayon::spawn(f),
+        Some(pool) => pool.spawn(job),
+        None => rayon::spawn(job),
     }
+}
+
+/// Run `f`, turning a panic into `None` and an error log naming the job
+/// `what`. Every bridge in this file and [`run_spawned`] run their jobs
+/// through it, inside [`carry_span`] so the log lands in the caller's span.
+///
+/// Rayon aborts the process when a job started with `spawn` panics on a pool
+/// with no panic handler, which is every pool here: one query's bad decode
+/// would take down every query on the server, where on tokio it fails only
+/// its task. Caught, it fails only its caller, which gets [`PoolDropped`].
+/// The panic hook still prints where it happened; this line adds which job,
+/// in which query.
+///
+/// The `AssertUnwindSafe` holds because a bridged job computes a result for
+/// its caller from what it was given, and changes shared state, if at all, in
+/// one step that lands whole or not at all: a cache insert made under a lock
+/// held over nothing that can panic, or a term-index fold whose root is
+/// written after its slices. So a panic poisons no lock and leaves no state
+/// half-changed. A job that changes shared state over several steps must
+/// keep that true.
+///
+/// [`run_spawned`]: crate::utils::join::run_spawned
+pub(crate) fn catch_panic<R>(what: &'static str, f: impl FnOnce() -> R) -> Option<R> {
+    catch_unwind(AssertUnwindSafe(f))
+        .map_err(|payload| {
+            error!(
+                job = what,
+                panic = panic_text(&*payload),
+                "pool job panicked"
+            );
+        })
+        .ok()
+}
+
+/// A panic's message: `panic!` with a literal carries a `&str`, with
+/// arguments a `String`; anything else has none.
+fn panic_text(payload: &(dyn Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("non-string panic payload")
 }
 
 /// Wrap `f` so it runs inside the caller's tracing span on whatever thread ends
@@ -153,14 +209,19 @@ where
     }
 }
 
-/// The pool task's sender was dropped before sending a result surfaced as
-/// an error rather than a second panic.
+/// A pool job did not finish: it panicked (see [`catch_panic`]), or, for
+/// [`run_on_own_pool`], its thread or pool could not start. `0` names the
+/// job.
 #[derive(Debug)]
 pub(crate) struct PoolDropped(pub(crate) &'static str);
 
 impl fmt::Display for PoolDropped {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.0)
+        write!(
+            f,
+            "{} did not finish (it panicked, or its thread could not start)",
+            self.0
+        )
     }
 }
 
@@ -168,8 +229,8 @@ impl std::error::Error for PoolDropped {}
 
 /// Run `f` on `pool` (or the global rayon pool if `None`) and bridge the
 /// result back to the awaiting async task via a oneshot, so no tokio worker
-/// blocks under the compute. `what` becomes the [`PoolDropped`] message if
-/// the pool task dies before sending
+/// blocks under the compute. `what` names the job in the [`PoolDropped`] a
+/// panic in `f` returns.
 pub(crate) async fn run_on_pool<R, F>(
     pool: Option<&ThreadPool>,
     what: &'static str,
@@ -179,13 +240,59 @@ where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
 {
+    await_pool_job(pool, what, f, Unawaited::Run).await
+}
+
+/// [`run_on_pool`] for work only its caller needs, such as one superfile's
+/// match while planning a query: if the caller stops waiting (a cancelled
+/// query) before a pool thread picks the job up, the job is skipped. One
+/// already running finishes.
+///
+/// Not the default for [`run_on_pool`]: a job there may finish something
+/// other tasks wait on besides its caller, and a skip would leave them
+/// waiting. A match's result goes only to its caller.
+pub(crate) async fn run_on_pool_while_awaited<R, F>(
+    pool: &ThreadPool,
+    what: &'static str,
+    f: F,
+) -> Result<R, PoolDropped>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    await_pool_job(Some(pool), what, f, Unawaited::Skip).await
+}
+
+/// What a queued job does when it starts and its caller has stopped waiting.
+enum Unawaited {
+    Run,
+    Skip,
+}
+
+/// Spawn `f` on `pool` (or the global rayon pool if `None`) and await its
+/// result, for [`run_on_pool`] and [`run_on_pool_while_awaited`].
+async fn await_pool_job<R, F>(
+    pool: Option<&ThreadPool>,
+    what: &'static str,
+    f: F,
+    unawaited: Unawaited,
+) -> Result<R, PoolDropped>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
     let (tx, rx) = oneshot::channel();
     // The work runs inside the caller's span; the result is sent only once
     // the span has been left and released, so the awaiting task never
     // outruns a pool thread still holding the span open.
-    let f = carry_span(f);
+    let f = carry_span(move || catch_panic(what, f));
     let job = move || {
-        let _ = tx.send(f());
+        if matches!(unawaited, Unawaited::Skip) && tx.is_closed() {
+            return;
+        }
+        if let Some(out) = f() {
+            let _ = tx.send(out);
+        }
     };
     match pool {
         Some(pool) => pool.spawn(job),
@@ -201,7 +308,8 @@ where
 /// caller's latency. A spawned task still hands `f` to the pool, so no
 /// runtime worker ever blocks under the compute. Futures joined under one
 /// `block_on` share its thread, so their kernels run one after another
-/// there; a caller wanting them in parallel spawns them.
+/// there; a caller wanting them in parallel spawns them. A panic in `f`
+/// returns [`PoolDropped`] either way.
 pub(crate) async fn run_on_pool_unless_blocking<R, F>(
     pool: Option<&ThreadPool>,
     what: &'static str,
@@ -212,7 +320,7 @@ where
     R: Send + 'static,
 {
     if task::try_id().is_none() {
-        return Ok(f());
+        return catch_panic(what, f).ok_or(PoolDropped(what));
     }
     run_on_pool(pool, what, f).await
 }
@@ -230,11 +338,11 @@ where
     R: Send + 'static,
 {
     let (tx, rx) = oneshot::channel();
-    let f = carry_span(f);
+    let f = carry_span(move || catch_panic(what, f));
     let spawned = std::thread::Builder::new()
         .name(format!("{what} driver"))
         .spawn(move || {
-            let pool = match rayon::ThreadPoolBuilder::new()
+            let pool = match ThreadPoolBuilder::new()
                 .num_threads(threads.max(1))
                 .thread_name(move |i| format!("merge-{i}"))
                 .build()
@@ -243,7 +351,9 @@ where
                 // No pool, no result: the receiver reports the job as dropped.
                 Err(_) => return,
             };
-            let _ = tx.send(pool.install(f));
+            if let Some(out) = pool.install(f) {
+                let _ = tx.send(out);
+            }
         });
     if spawned.is_err() {
         return Err(PoolDropped(what));
@@ -296,9 +406,26 @@ fn build_current_thread_runtime() -> runtime::Runtime {
         )
 }
 
+/// A pool of one thread, busy until the returned sender is dropped, for tests
+/// that need work to sit queued on a pool.
+#[cfg(test)]
+pub(crate) fn held_pool() -> (ThreadPool, mpsc::Sender<()>) {
+    let pool = ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .expect("pool");
+    let (release, held) = mpsc::channel::<()>();
+    pool.spawn(move || {
+        let _ = held.recv();
+    });
+    (pool, release)
+}
+
 #[cfg(test)]
 mod tests {
-    use std::sync::mpsc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use futures::FutureExt;
 
     use super::*;
 
@@ -322,7 +449,7 @@ mod tests {
         assert!(dispatcher.is_some(), "span ids must be assigned");
 
         let (tx, rx) = mpsc::channel();
-        spawn_on(None, move || {
+        spawn_on(None, "span probe", move || {
             let _ = tx.send(Span::current().id());
         });
 
@@ -352,7 +479,7 @@ mod tests {
     /// spawned task hands it to the pool, so no runtime worker computes.
     #[test]
     fn work_runs_inline_only_for_a_caller_blocking_on_it() {
-        let pool = rayon::ThreadPoolBuilder::new()
+        let pool = ThreadPoolBuilder::new()
             .num_threads(1)
             .build()
             .expect("pool");
@@ -431,5 +558,86 @@ mod tests {
             seen, owned_id,
             "an ambient runtime must not capture the drive"
         );
+    }
+
+    /// A pool of one thread, so a panicking job and the next one share it.
+    fn one_thread_pool() -> ThreadPool {
+        ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("pool")
+    }
+
+    #[test]
+    fn a_panic_in_awaited_pool_work_fails_only_its_caller() {
+        // A job that panics, on a pool of ours and on rayon's global pool,
+        // then a job that does not; and one that panics run inline, by a
+        // caller blocking on it.
+        // - Each panicking job's caller gets `PoolDropped` naming the job.
+        // - The same pool runs the next job.
+        // This test pins that a panic fails one query, not the process:
+        // without the catch, rayon aborts this test binary, and the inline
+        // panic unwinds into the caller.
+        let pool = one_thread_pool();
+        for pool in [Some(&pool), None] {
+            let failed =
+                bridge_sync_to_async(run_on_pool(pool, "job", || -> u32 { panic!("bad input") }));
+            assert!(matches!(failed, Err(PoolDropped("job"))), "got {failed:?}");
+            let next = bridge_sync_to_async(run_on_pool(pool, "job", || 7));
+            assert_eq!(next.expect("the pool runs on"), 7);
+        }
+        let failed = bridge_sync_to_async(run_on_pool_unless_blocking(
+            Some(&pool),
+            "job",
+            || -> u32 { panic!("bad input") },
+        ));
+        assert!(matches!(failed, Err(PoolDropped("job"))), "got {failed:?}");
+    }
+
+    #[test]
+    fn a_panic_in_spawned_pool_work_closes_its_channel() {
+        // A job handed off with no wait that panics before it sends, then
+        // one that sends.
+        // - The first job's receiver sees its sender gone.
+        // - The pool runs the second job.
+        // This test pins that a fire-and-forget job's panic reaches its
+        // caller as a closed channel, not a process abort.
+        let pool = one_thread_pool();
+        let (tx, rx) = mpsc::channel::<u32>();
+        spawn_on(Some(&pool), "job", move || {
+            let _held = tx;
+            panic!("bad input");
+        });
+        assert!(rx.recv().is_err(), "the panicking job's sender was dropped");
+        let (tx, rx) = mpsc::channel();
+        spawn_on(Some(&pool), "job", move || {
+            let _ = tx.send(7);
+        });
+        assert_eq!(rx.recv().expect("the pool runs on"), 7);
+    }
+
+    #[test]
+    fn work_nobody_waits_for_is_skipped() {
+        // A busy pool, and a job queued behind it whose caller then stops
+        // waiting, as a cancelled query does.
+        // - Once the pool is free, the job does not run.
+        // This test pins that a cancel stops queued work, not only the wait.
+        let (pool, release) = held_pool();
+        let ran = Arc::new(AtomicBool::new(false));
+        let job_ran = Arc::clone(&ran);
+        let waiting = run_on_pool_while_awaited(&pool, "job", move || {
+            job_ran.store(true, Ordering::SeqCst);
+        });
+        let mut waiting = Box::pin(waiting);
+        // The first poll queues the job; it cannot start on the held pool.
+        assert!((&mut waiting).now_or_never().is_none());
+        drop(waiting);
+        drop(release);
+        let (done, finished) = mpsc::channel();
+        pool.spawn(move || {
+            let _ = done.send(());
+        });
+        finished.recv().expect("the pool drained");
+        assert!(!ran.load(Ordering::SeqCst), "the dropped job ran");
     }
 }

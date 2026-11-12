@@ -33,6 +33,7 @@ use std::{
         Mutex, PoisonError,
         atomic::{AtomicU32, Ordering as AtomicOrdering},
     },
+    time::{Duration, Instant},
 };
 
 use rayon::prelude::*;
@@ -1817,6 +1818,39 @@ pub(crate) struct FanoutScoreCtx<'a> {
     pub(crate) prefix_cap: usize,
 }
 
+/// Where [`WidthLawCalibration::score_cell`] spent its time, for the drain's
+/// trace. Clocks are read only in builds with the `detailed-tracing` feature;
+/// in other builds every time stays zero and costs nothing.
+#[derive(Default)]
+pub(crate) struct ScoreProfile {
+    /// Queries whose rerank pool holds this cell. Each row gets one 1-bit
+    /// estimate per such query, on top of one exact distance per query.
+    pub(crate) pool_queries: usize,
+    /// Reading and decoding the cell's spill.
+    pub(crate) read: Duration,
+    /// 1-bit estimates and histogram updates for the pool queries.
+    pub(crate) estimate: Duration,
+    /// Dequantize plus one exact distance per query, per row.
+    pub(crate) exact: Duration,
+    /// Cutting each chunk's per-query candidates back to the largest law `k`.
+    pub(crate) trim: Duration,
+    /// The final merge into the shared accumulators, lock waits included.
+    pub(crate) merge: Duration,
+}
+
+/// A clock read for [`ScoreProfile`]; `None` unless detailed tracing is
+/// built in.
+fn profile_clock() -> Option<Instant> {
+    cfg!(feature = "detailed-tracing").then(Instant::now)
+}
+
+/// Add the time since `start` to `total`, when a clock was read.
+fn add_elapsed(total: &mut Duration, start: Option<Instant>) {
+    if let Some(start) = start {
+        *total += start.elapsed();
+    }
+}
+
 /// The mutable per-cell accumulators [`WidthLawCalibration::score_slice`]
 /// appends into: the width/rerank candidate partials, the estimate-histogram
 /// deltas, and (only when the fanout is being calibrated) the prefix-pool
@@ -1826,6 +1860,7 @@ struct ScoreSink<'a> {
     hist_local: &'a mut HashMap<usize, Vec<u64>>,
     /// Empty when the fanout is not being calibrated.
     prefix_partial: &'a mut [Vec<PrefixCand>],
+    profile: &'a mut ScoreProfile,
 }
 
 impl WidthLawCalibration {
@@ -1984,19 +2019,26 @@ impl WidthLawCalibration {
 
     /// Score every row of one spilled cell against the frozen queries and
     /// merge into the per-query candidate lists. Safe to call from the
-    /// pack fan-out workers; the merge takes one lock per cell.
-    pub(crate) fn score_cell(&self, cell: u32, spill: &SpilledCellRows) -> Result<(), BuildError> {
+    /// pack fan-out workers; the merge takes one lock per cell. Returns
+    /// where the time went, for the caller's trace.
+    pub(crate) fn score_cell(
+        &self,
+        cell: u32,
+        spill: &SpilledCellRows,
+    ) -> Result<ScoreProfile, BuildError> {
         let Some(frozen) = self.frozen.as_ref() else {
             return Err(BuildError::Store(
                 "width-law score_cell before freeze".into(),
             ));
         };
+        let mut profile = ScoreProfile::default();
         let n_queries = frozen.ids.len();
         if n_queries == 0 {
-            return Ok(());
+            return Ok(profile);
         }
         let mut partial: Vec<Vec<(f32, u32, i128, f32)>> = vec![Vec::new(); n_queries];
         let members = self.pool_members(cell);
+        profile.pool_queries = members.len();
         let mut hist_local: HashMap<usize, Vec<u64>> = HashMap::new();
         // The drain never calibrates the router fanout (no `FanoutScoreCtx`),
         // so the prefix partials stay empty here.
@@ -2005,12 +2047,15 @@ impl WidthLawCalibration {
         let mut remaining = spill.n_rows();
         let mut scratch = vec![0f32; self.dim];
         while remaining > 0 {
+            let read_t0 = profile_clock();
             let chunk = reader.next_chunk(WIDTH_LAW_SCORE_CHUNK.min(remaining))?;
+            add_elapsed(&mut profile.read, read_t0);
             remaining -= chunk.len();
             let mut sink = ScoreSink {
                 partial: &mut partial,
                 hist_local: &mut hist_local,
                 prefix_partial: &mut prefix_partial,
+                profile: &mut profile,
             };
             self.score_slice(
                 frozen,
@@ -2022,8 +2067,10 @@ impl WidthLawCalibration {
                 None,
             );
         }
+        let merge_t0 = profile_clock();
         self.merge_partial(partial, hist_local, None);
-        Ok(())
+        add_elapsed(&mut profile.merge, merge_t0);
+        Ok(profile)
     }
 
     /// [`Self::score_cell`] for already-materialized rows: an exhaustive fp32
@@ -2058,11 +2105,13 @@ impl WidthLawCalibration {
             Vec::new()
         };
         let mut scratch = vec![0f32; self.dim];
+        let mut profile = ScoreProfile::default();
         for chunk in rows.chunks(WIDTH_LAW_SCORE_CHUNK) {
             let mut sink = ScoreSink {
                 partial: &mut partial,
                 hist_local: &mut hist_local,
                 prefix_partial: &mut prefix_partial,
+                profile: &mut profile,
             };
             self.score_slice(
                 frozen,
@@ -2486,10 +2535,16 @@ impl WidthLawCalibration {
         let k_max = WIDTH_LAW_MAX_K;
         let rl = self.rerank.as_ref();
         let mut est_of = vec![f32::NEG_INFINITY; frozen.ids.len()];
+        // Exact time is the loop's time minus the estimate time, so a row
+        // reads the clock only when it has pool queries to estimate.
+        let loop_t0 = profile_clock();
+        let mut estimate = Duration::ZERO;
         for row in rows {
             if let Some(rl) = rl
                 && row.rabitq_code.len() == rl.quant.code_bytes()
+                && !members.is_empty()
             {
+                let est_t0 = profile_clock();
                 for &qi in members {
                     // Self-hit: the sampled query's own row is not a
                     // distractor. `finish` already excludes it from the
@@ -2520,6 +2575,7 @@ impl WidthLawCalibration {
                         bins[bin] = bins[bin].saturating_add(1);
                     }
                 }
+                add_elapsed(&mut estimate, est_t0);
             }
             dequantize_row_into(&row.encoded, scratch);
             if self.metric == Metric::Cosine {
@@ -2564,10 +2620,16 @@ impl WidthLawCalibration {
                 }
             }
         }
+        if let Some(loop_t0) = loop_t0 {
+            sink.profile.exact += loop_t0.elapsed().saturating_sub(estimate);
+        }
+        sink.profile.estimate += estimate;
         // Bound the per-cell partials the same way the merge does.
+        let trim_t0 = profile_clock();
         for cand in sink.partial.iter_mut() {
             truncate_ascending(cand, k_max);
         }
+        add_elapsed(&mut sink.profile.trim, trim_t0);
         if let Some(ctx) = fanout {
             for cand in sink.prefix_partial.iter_mut() {
                 truncate_prefix_ascending(cand, ctx.prefix_cap);
@@ -3298,8 +3360,10 @@ mod tests {
     use std::sync::Arc;
 
     use bytes::Bytes;
+    use tempfile::tempdir;
 
     use super::*;
+    use crate::superfile::vector::spill::MaterializedRowSpillWriter;
 
     /// Every stage crosses at the target itself — no padded per-stage
     /// variant, no derived second constant. Pins that the shipped
@@ -3594,6 +3658,29 @@ mod tests {
                 laws_a.fine_for_k, laws_b.fine_for_k,
                 "fine law diverged under the gate ({metric:?})"
             );
+
+            // Spilled path (the drain's `score_cell`): same laws as the
+            // in-memory path, and its profile reports the cell's pool.
+            let cal_c = build();
+            let directory = tempdir().expect("tempdir");
+            let mut pooled_cells = 0;
+            for (cell, rows) in &per_cell {
+                let mut writer =
+                    MaterializedRowSpillWriter::create(directory.path(), *cell, DIM, DIM / 8)
+                        .expect("spill writer");
+                for row in rows {
+                    writer.append(row).expect("spill row");
+                }
+                let spill = writer.finish().expect("finish spill");
+                let profile = cal_c.score_cell(*cell, &spill).expect("score_cell");
+                assert_eq!(profile.pool_queries, cal_c.pool_members(*cell).len());
+                pooled_cells += usize::from(profile.pool_queries > 0);
+            }
+            assert!(pooled_cells > 0, "the 1-bit estimate branch must run");
+            let laws_c = cal_c.finish(&grid, None).expect("spilled laws");
+            assert_eq!(laws_a.width_for_k, laws_c.width_for_k, "{metric:?}");
+            assert_eq!(laws_a.rerank_for_k, laws_c.rerank_for_k, "{metric:?}");
+            assert_eq!(laws_a.fine_for_k, laws_c.fine_for_k, "{metric:?}");
         }
     }
 

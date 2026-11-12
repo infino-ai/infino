@@ -161,7 +161,7 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       REPO: ${{ github.repository }}
       CARGO_TERM_COLOR: always
-      RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=lld
+      RUSTFLAGS: -D warnings
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
       CARGO_PROFILE_TEST_DEBUG: line-tables-only
     steps:
@@ -214,8 +214,6 @@ jobs:
           df -h /
           echo "runner: $RUNNER_NAME, $(nproc) cores, $(free -g | awk '/Mem:/ {print $2}') GB"
 
-      - name: Install lld
-        run: sudo apt-get install -y --no-install-recommends lld
 
       # The cache key hashes every installed Rust toolchain. The runner image's own `stable` moves
       # when GitHub updates the image, which would change the key under an unchanged repo; with only
@@ -285,7 +283,7 @@ jobs:
           nohup sh -c 'cargo test --features test-helpers --lib --no-run &&
             cargo test --features test-helpers --no-run &&
             cargo clippy --all-targets --features test-helpers &&
-            cargo llvm-cov --no-report nextest --features test-helpers,graph-index --no-tests=pass -E \"none()\" &&
+            cargo llvm-cov --no-report nextest --features test-helpers,graph-index --no-tests=pass -E "none()" &&
             RUSTUP_TOOLCHAIN=$PUBLIC_API_NIGHTLY cargo public-api --simplified > /dev/null' > "$RUNNER_TEMP/warm-build.log" 2>&1 &
 
       - name: Install Claude Code and Codex

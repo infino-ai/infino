@@ -4915,7 +4915,7 @@ async fn scan_shortlist(
         let allow_owned = ctx.allow.clone();
         let deny_owned = ctx.deny.clone();
         let (tx, rx) = oneshot::channel();
-        spawn_on(ctx.pool.as_deref(), move || {
+        spawn_on(ctx.pool.as_deref(), "vector shortlist scan", move || {
             let acc = meta_owned
                 .par_chunks(chunk)
                 .zip(blocks_owned.par_chunks(chunk))
@@ -4982,7 +4982,8 @@ async fn scan_shortlist(
                 );
             let _ = tx.send(acc);
         });
-        rx.await.map_err(|_| VectorError::TaskDropped("scan"))?
+        rx.await
+            .map_err(|_| VectorError::TaskDropped("shortlist scan"))?
     } else {
         timed_section(|| {
             let cap = coarse_limit.saturating_mul(SHORTLIST_TRUNCATE_SLACK);
@@ -5450,24 +5451,20 @@ where
     if n_tasks <= 1 {
         return Ok(timed_section(|| items.iter().map(&f).collect()));
     }
-    run_on_pool(
-        pool.as_deref(),
-        "rerank rayon task dropped result",
-        move || {
-            let chunk = items.len().div_ceil(n_tasks).max(1);
-            let per_chunk: Vec<(Vec<R>, u64)> = items
-                .par_chunks(chunk)
-                .map(|c| timed_section(|| c.iter().map(&f).collect()))
-                .collect();
-            let mut out = Vec::with_capacity(items.len());
-            let mut kernel_ns = 0u64;
-            for (chunk_out, ns) in per_chunk {
-                out.extend(chunk_out);
-                kernel_ns += ns;
-            }
-            (out, kernel_ns)
-        },
-    )
+    run_on_pool(pool.as_deref(), "vector rerank", move || {
+        let chunk = items.len().div_ceil(n_tasks).max(1);
+        let per_chunk: Vec<(Vec<R>, u64)> = items
+            .par_chunks(chunk)
+            .map(|c| timed_section(|| c.iter().map(&f).collect()))
+            .collect();
+        let mut out = Vec::with_capacity(items.len());
+        let mut kernel_ns = 0u64;
+        for (chunk_out, ns) in per_chunk {
+            out.extend(chunk_out);
+            kernel_ns += ns;
+        }
+        (out, kernel_ns)
+    })
     .await
     .map_err(|_| VectorError::TaskDropped("rerank"))
 }

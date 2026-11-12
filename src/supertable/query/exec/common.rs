@@ -73,6 +73,7 @@ use tokio::sync::Semaphore;
 use tracing::{Instrument, Span, warn};
 
 use crate::{
+    error::{capped_column_list, closest_name},
     memory::{
         ConnectionMemoryBudget, over_process_limit, process_limit, process_limit_exceeded,
         process_over_limit,
@@ -506,8 +507,9 @@ pub(crate) fn validate_projection(
 
 /// Message for a projection naming a column the search output does not
 /// carry. Lists the selectable columns (`_id`, the visible scalar columns,
-/// and the trailing `score`) so the caller can correct the request. The list
-/// is bounded to a representative sample (see [`crate::error::capped_column_list`]):
+/// and the trailing `score`) so the caller can correct the request, after the
+/// closest one when it is close enough to suggest (see [`closest_name`]). The
+/// list is bounded to the names closest to `name` (see [`capped_column_list`]):
 /// a wide table carries thousands of columns, and the whole list in every
 /// rejected projection would run to hundreds of kilobytes in logs and responses.
 fn unknown_column_message(name: &str, output_schema: &SchemaRef) -> String {
@@ -516,8 +518,11 @@ fn unknown_column_message(name: &str, output_schema: &SchemaRef) -> String {
         .iter()
         .map(|f| f.name().as_str())
         .collect();
-    let available = crate::error::capped_column_list(&names);
-    format!("unknown column {name:?} in projection; valid columns: {available}")
+    let available = capped_column_list(&names, name);
+    let suggestion = closest_name(name, &names)
+        .map(|closest| format!("did you mean {closest:?}? "))
+        .unwrap_or_default();
+    format!("unknown column {name:?} in projection; {suggestion}valid columns: {available}")
 }
 
 impl SupertableReader {
@@ -944,7 +949,7 @@ pub(crate) async fn exact_scope(
                 // to rows here.
                 let (held, ns) = run_on_pool(
                     Some(&manifest.options.reader_pool),
-                    "exact scope check: reader pool dropped result",
+                    "exact scope check",
                     move || {
                         timed_section(|| {
                             bound.mask(&batch).map(|mask| {
@@ -1491,7 +1496,7 @@ async fn resolve_columns(
         let out_schema = Arc::clone(&out_schema);
         let decoded: Vec<((usize, RecordBatch), u64)> = run_on_pool(
             Some(&manifest.options.reader_pool),
-            "resolve decode: reader pool dropped result",
+            "resolve decode",
             move || {
                 let name_refs: Vec<&str> = owned_names.iter().map(String::as_str).collect();
                 resident
@@ -1629,7 +1634,7 @@ pub(crate) async fn take_file_columns(
     let rd = Arc::clone(rd);
     let (batch, ns) = run_on_pool(
         Some(&manifest.options.reader_pool),
-        "file columns decode: reader pool dropped result",
+        "file columns decode",
         move || {
             let name_refs: Vec<&str> = owned_names.iter().map(String::as_str).collect();
             timed_section(|| take_resident_file(&rd, &locals, &name_refs, &adapter, &out_schema))
@@ -1685,7 +1690,7 @@ pub(crate) async fn read_file_row_group(
         let rd = Arc::clone(rd);
         let (read, ns) = run_on_pool(
             Some(&manifest.options.reader_pool),
-            "row group decode: reader pool dropped result",
+            "row group decode",
             move || {
                 let refs: Vec<&str> = physical.iter().map(String::as_str).collect();
                 let views: Vec<&str> = views.iter().map(String::as_str).collect();
@@ -2028,14 +2033,10 @@ pub(crate) async fn take_rows(
     let owned_reader = Arc::clone(reader);
     let ids = local_doc_ids.to_vec();
     let owned_names: Vec<String> = names.iter().map(|name| (*name).to_owned()).collect();
-    run_on_pool(
-        Some(pool),
-        "take rows: reader pool dropped result",
-        move || {
-            let name_refs: Vec<&str> = owned_names.iter().map(String::as_str).collect();
-            owned_reader.take_by_local_doc_ids(&ids, &name_refs)
-        },
-    )
+    run_on_pool(Some(pool), "take rows", move || {
+        let name_refs: Vec<&str> = owned_names.iter().map(String::as_str).collect();
+        owned_reader.take_by_local_doc_ids(&ids, &name_refs)
+    })
     .await
     .map_err(QueryError::internal)?
     .map_err(|e| DataFusionError::from(QueryError::from(e)))
@@ -2205,14 +2206,10 @@ async fn take_prefetched(
         );
         let ids = local_doc_ids.to_vec();
         let owned: Vec<String> = names.iter().map(|n| (*n).to_string()).collect();
-        let decoded = run_on_pool_unless_blocking(
-            pool,
-            "take decode: reader pool dropped result",
-            move || {
-                let names: Vec<&str> = owned.iter().map(String::as_str).collect();
-                take_rows_prefetched(chunks, metadata, &schema, n_docs, &ids, &names)
-            },
-        )
+        let decoded = run_on_pool_unless_blocking(pool, "take decode", move || {
+            let names: Vec<&str> = owned.iter().map(String::as_str).collect();
+            take_rows_prefetched(chunks, metadata, &schema, n_docs, &ids, &names)
+        })
         .await
         .map_err(QueryError::internal)?;
         match decoded {

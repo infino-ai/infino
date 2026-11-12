@@ -6,12 +6,13 @@
 
 use std::{
     future::Future,
-    panic::{AssertUnwindSafe, catch_unwind},
     sync::{Arc, mpsc::sync_channel},
 };
 
 use futures::stream::{FuturesUnordered, StreamExt};
 use rayon::ThreadPool;
+
+use crate::runtime_bridge::{carry_span, catch_panic};
 
 /// Run `futures` at most `limit` at a time and return their outputs in input
 /// order.
@@ -67,16 +68,18 @@ where
 /// and the pool ran at half its width. Every task reports before this
 /// returns, so a failed task's siblings finish rather than outlive it.
 ///
-/// A task that panics is `lost`'s error: the panic is caught in the task,
-/// since a pool with no panic handler aborts the process on a spawned
-/// job's panic. Each task lets go of `work` before it reports, so once
-/// this returns no task holds anything `work` captured: a caller that
-/// shared state with the tasks through an `Arc` can take it back.
+/// A task that panics is `lost(what)`'s error: the panic is caught and
+/// logged in the task as `what` (see [`catch_panic`]), since a pool with no panic
+/// handler aborts the process on a spawned job's panic. Each task lets go
+/// of `work` before it reports, so once this returns no task holds anything
+/// `work` captured: a caller that shared state with the tasks through an
+/// `Arc` can take it back.
 pub(crate) fn run_spawned<T, R, E, F>(
     pool: &ThreadPool,
+    what: &'static str,
     items: Vec<T>,
     work: F,
-    lost: fn() -> E,
+    lost: fn(&'static str) -> E,
 ) -> Result<Vec<R>, E>
 where
     T: Send + 'static,
@@ -89,13 +92,15 @@ where
     let work = Arc::new(work);
     for (i, item) in items.into_iter().enumerate() {
         let (tx, work) = (tx.clone(), Arc::clone(&work));
+        // Runs in the caller's span, which it leaves before the send below,
+        // and lets go of `work` as it returns.
+        let task = carry_span(move || catch_panic(what, || work(i, item)));
         pool.spawn(move || {
-            let result = catch_unwind(AssertUnwindSafe(|| work(i, item)));
-            drop(work);
+            let result = task();
             // A panicked task reports nothing; its slot stays empty and the
             // caller reads it as lost. The receiver is gone only if the
             // caller gave up; there is nobody left to tell.
-            if let Ok(result) = result {
+            if let Some(result) = result {
                 let _ = tx.send((i, result));
             }
         });
@@ -107,7 +112,7 @@ where
     }
     results
         .into_iter()
-        .map(|result| result.ok_or_else(lost)?)
+        .map(|result| result.ok_or_else(|| lost(what))?)
         .collect()
 }
 
@@ -141,9 +146,10 @@ mod tests {
     fn spawned_results_come_back_in_the_items_order() {
         let out = run_spawned(
             &pool(),
+            "task",
             (0..TASKS).collect(),
             |i, item: usize| Ok::<_, String>(i * 1000 + item),
-            || "lost".to_string(),
+            |what| format!("{what} lost"),
         )
         .expect("every task reports");
         assert_eq!(out, (0..TASKS).map(|i| i * 1001).collect::<Vec<_>>());
@@ -153,12 +159,13 @@ mod tests {
     fn a_failed_task_is_the_runs_error() {
         let out = run_spawned(
             &pool(),
+            "task",
             (0..TASKS).collect(),
             |_, item: usize| match item {
                 7 => Err("seven".to_string()),
                 _ => Ok(item),
             },
-            || "lost".to_string(),
+            |what| format!("{what} lost"),
         );
         assert_eq!(out, Err("seven".to_string()));
     }
@@ -169,14 +176,15 @@ mod tests {
     fn a_panicking_task_is_lost_not_an_abort() {
         let out = run_spawned(
             &pool(),
+            "task",
             (0..TASKS).collect(),
             |_, item: usize| {
                 assert_ne!(item, 11, "a task that panics");
                 Ok::<_, String>(item)
             },
-            || "lost".to_string(),
+            |what| format!("{what} lost"),
         );
-        assert_eq!(out, Err("lost".to_string()));
+        assert_eq!(out, Err("task lost".to_string()));
     }
 
     /// Once the run returns, no task still holds what the work captured, so
@@ -188,9 +196,10 @@ mod tests {
             let held = Arc::clone(&shared);
             run_spawned(
                 &pool(),
+                "task",
                 (0..TASKS).collect(),
                 move |_, _: usize| Ok::<_, String>(held.len()),
-                || "lost".to_string(),
+                |what| format!("{what} lost"),
             )
             .expect("every task reports");
             assert!(
