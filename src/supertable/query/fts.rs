@@ -126,7 +126,7 @@ use crate::{
             bm25::Bm25Params,
             reader::{
                 Bm25SearchOptions, ClauseLists, ColumnLengthStats, FetchedTermMemo, GlobalTermIdf,
-                LiveFloor, MatchWork, OR_WINDOW_MIN_TERMS, OrCursorSet, PreparedClauses, QueryIdf,
+                LiveFloor, OR_WINDOW_MIN_TERMS, OrCursorSet, PreparedClauses, QueryIdf,
                 ScoringView,
             },
             tokenize::Phrase,
@@ -400,7 +400,7 @@ impl MatchKernel {
             docs
         };
         // One flush per superfile: positive + negation walks.
-        self.flush(&work);
+        work.add_to(self.op_stats.as_deref());
         let hits = docs.len() as u64;
         self.keep_filtered(r, suid, hits, docs).await
     }
@@ -419,7 +419,7 @@ impl MatchKernel {
     async fn cursor_set(&self, r: &SuperfileReader, suid: Uuid) -> Result<OrCursorSet, QueryError> {
         let (column, memo, refs) = self.file_inputs(r, suid).await;
         let (set, work) = r.match_cursor_set(&column, &refs, memo.as_deref()).await?;
-        self.flush(&work);
+        work.add_to(self.op_stats.as_deref());
         Ok(set)
     }
 
@@ -433,17 +433,8 @@ impl MatchKernel {
         end: u32,
     ) -> Result<Vec<RowId>, QueryError> {
         let (rows, work) = r.token_match_range_prebuilt(set, start, end)?;
-        self.flush(&work);
+        work.add_to(self.op_stats.as_deref());
         Ok(rows)
-    }
-
-    /// Adds a walk's work to the statement's statistics.
-    fn flush(&self, work: &MatchWork) {
-        if let Some(stats) = &self.op_stats {
-            stats.add_fts_postings_bytes(work.postings_bytes);
-            stats.add_planned_read_ranges(work.planned_ranges);
-            stats.add_kernel_cpu_ns(work.kernel_cpu_ns);
-        }
     }
 }
 
@@ -513,26 +504,23 @@ impl RowFilter {
                     .plan
                     .estimate(r, Some(&self.pool), Some(located))
                     .await?;
-                self.flush(&work);
+                work.add_to(self.op_stats.as_deref());
                 if estimate >= hits {
                     return Ok::<_, QueryError>(None);
                 }
-                let memos = memos_from_plan_locations(r, &self.locations, suid).await;
-                let (rows, work) = self.plan.evaluate(r, Some(&self.pool), &memos).await?;
-                self.flush(&work);
+                let rows = evaluate_with_locations(
+                    &self.plan,
+                    r,
+                    &self.pool,
+                    &self.locations,
+                    suid,
+                    self.op_stats.as_deref(),
+                )
+                .await?;
                 Ok(rows.map(Arc::new))
             })
             .await?;
         Ok(rows.clone())
-    }
-
-    /// Adds the filter's index work to the statement's statistics.
-    fn flush(&self, work: &MatchWork) {
-        if let Some(stats) = &self.op_stats {
-            stats.add_fts_postings_bytes(work.postings_bytes);
-            stats.add_planned_read_ranges(work.planned_ranges);
-            stats.add_kernel_cpu_ns(work.kernel_cpu_ns);
-        }
     }
 }
 
@@ -936,6 +924,22 @@ pub(crate) async fn memos_from_plan_locations(
         }
     }
     memos
+}
+
+/// [`CandidatePlan::evaluate`] on `superfile`, its terms read through
+/// `locations`. The work is added to `stats`.
+pub(crate) async fn evaluate_with_locations(
+    plan: &CandidatePlan,
+    r: &SuperfileReader,
+    pool: &ThreadPool,
+    locations: &PlanLocations,
+    superfile: Uuid,
+    stats: Option<&op_stats::OpStatsCollector>,
+) -> Result<Option<RoaringBitmap>, QueryError> {
+    let memos = memos_from_plan_locations(r, locations, superfile).await;
+    let (rows, work) = plan.evaluate(r, Some(pool), &memos).await?;
+    work.add_to(stats);
+    Ok(rows)
 }
 
 /// A prefetched-term memo for `superfile` built from the index's
@@ -2547,11 +2551,7 @@ impl SupertableReader {
                         // from scoring): df only, from the dictionary value
                         // + header hint — no postings body.
                         let (dfs, work) = r.term_dfs(&column_arc, &refs).await?;
-                        if let Some(stats) = &op_stats {
-                            stats.add_fts_postings_bytes(work.postings_bytes);
-                            stats.add_planned_read_ranges(work.planned_ranges);
-                            stats.add_kernel_cpu_ns(work.kernel_cpu_ns);
-                        }
+                        work.add_to(op_stats.as_deref());
                         Ok((suid, dfs, None))
                     }
                 }
@@ -3368,11 +3368,7 @@ impl SupertableReader {
                         } else {
                             RoaringBitmap::new()
                         };
-                        if let Some(stats) = &op_stats {
-                            stats.add_fts_postings_bytes(work.postings_bytes);
-                            stats.add_planned_read_ranges(work.planned_ranges);
-                            stats.add_kernel_cpu_ns(work.kernel_cpu_ns);
-                        }
+                        work.add_to(op_stats.as_deref());
                         let n = docs
                             .iter()
                             .filter(|d| {
@@ -3415,11 +3411,7 @@ impl SupertableReader {
                         )
                         .await?
                     };
-                    if let Some(stats) = &op_stats {
-                        stats.add_fts_postings_bytes(work.postings_bytes);
-                        stats.add_planned_read_ranges(work.planned_ranges);
-                        stats.add_kernel_cpu_ns(work.kernel_cpu_ns);
-                    }
+                    work.add_to(op_stats.as_deref());
                     Ok(n)
                 }
             },
@@ -3537,11 +3529,7 @@ impl SupertableReader {
                     // byte and range legs are deliberately unpriced — both
                     // take paths report no planned ranges by design, so the
                     // counter stays identical warm or cold.
-                    if let Some(stats) = &op_stats {
-                        stats.add_fts_postings_bytes(work.postings_bytes);
-                        stats.add_planned_read_ranges(work.planned_ranges);
-                        stats.add_kernel_cpu_ns(work.kernel_cpu_ns);
-                    }
+                    work.add_to(op_stats.as_deref());
                     docs.into_iter().map(RowId::get).collect()
                 };
                 if let Some(filter) = &row_filter

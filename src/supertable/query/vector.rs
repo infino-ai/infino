@@ -139,7 +139,7 @@ use crate::{
                 SCORE_COLUMN, id_score_batch, resolve_hits_named, take_rows_byte_source,
             },
             fine_graph_cache::{self, FineNodeKey, GraphRole},
-            fts::{memo_from_locations, memos_from_plan_locations},
+            fts::{evaluate_with_locations, memo_from_locations},
             provider::prune_leaves_for_filters,
             prune::{PruneLeaf, select_superfiles},
             superfile_reader::OpenTierCounts,
@@ -7258,11 +7258,7 @@ impl SupertableReader {
                     .map_err(QueryError::from)?;
                 // The predicate-resolution leg of filtered vector search
                 // is FTS work like any other; flush it per superfile.
-                if let Some(stats) = &op_stats {
-                    stats.add_fts_postings_bytes(work.postings_bytes);
-                    stats.add_planned_read_ranges(work.planned_ranges);
-                    stats.add_kernel_cpu_ns(work.kernel_cpu_ns);
-                }
+                work.add_to(op_stats.as_deref());
                 Ok(docs.into_iter().map(RowId::get).collect::<RoaringBitmap>())
             }
         })
@@ -8251,18 +8247,15 @@ impl SupertableReader {
             let reader_pool = Arc::clone(&reader_pool);
             let locations = Arc::clone(&locations);
             async move {
-                let memos = memos_from_plan_locations(&r, &locations, entry.superfile_id).await;
-                let (bitmap, work) = plan
-                    .evaluate(r.as_ref(), Some(&reader_pool), &memos)
-                    .await
-                    .map_err(QueryError::from)?;
-                // The SQL predicate's posting walks, summed across the
-                // plan tree — the pushdown leg of the vector TVF.
-                if let Some(stats) = &op_stats {
-                    stats.add_fts_postings_bytes(work.postings_bytes);
-                    stats.add_planned_read_ranges(work.planned_ranges);
-                    stats.add_kernel_cpu_ns(work.kernel_cpu_ns);
-                }
+                let bitmap = evaluate_with_locations(
+                    &plan,
+                    r.as_ref(),
+                    &reader_pool,
+                    &locations,
+                    entry.superfile_id,
+                    op_stats.as_deref(),
+                )
+                .await?;
                 match bitmap {
                     Some(bitmap) => Ok(bitmap),
                     None if unbounded_is_legitimate => {

@@ -2255,12 +2255,9 @@ impl TableProvider for SupertableProvider {
         // walks, flushed through the same collector that meters this
         // scan's pages — once the fan-out is in, so the tallies land in
         // manifest order whatever order the superfiles finished in.
-        if let Some(stats) = self.scan_store.op_stats() {
-            for seg in &superfiles {
-                stats.add_fts_postings_bytes(seg.predicate_work.postings_bytes);
-                stats.add_planned_read_ranges(seg.predicate_work.planned_ranges);
-                stats.add_kernel_cpu_ns(seg.predicate_work.kernel_cpu_ns);
-            }
+        let stats = self.scan_store.op_stats();
+        for seg in &superfiles {
+            seg.predicate_work.add_to(stats.as_deref());
         }
 
         // The store DataFusion resolves the scan's URL to. Byte reads go

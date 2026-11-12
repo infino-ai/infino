@@ -7,6 +7,7 @@
 //! `fts::reader::*` surface; the summing helpers are `pub(super)`.
 
 use super::{cursor::TermCursor, phrase::AnyCursor};
+use crate::runtime_metrics::op_stats::OpStatsCollector;
 
 /// Sum of the posting-byte ranges a cursor set indexes into (each cursor's
 /// term metadata + skip table + posting blocks). Feeds the per-query work
@@ -97,5 +98,14 @@ impl MatchWork {
         self.postings_bytes += other.postings_bytes;
         self.planned_ranges += other.planned_ranges;
         self.kernel_cpu_ns += other.kernel_cpu_ns;
+    }
+
+    /// Adds these tallies to the statement's stats, if it collects any.
+    pub(crate) fn add_to(self, stats: Option<&OpStatsCollector>) {
+        if let Some(stats) = stats {
+            stats.add_fts_postings_bytes(self.postings_bytes);
+            stats.add_planned_read_ranges(self.planned_ranges);
+            stats.add_kernel_cpu_ns(self.kernel_cpu_ns);
+        }
     }
 }
