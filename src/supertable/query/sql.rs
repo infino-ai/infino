@@ -680,10 +680,8 @@ impl SupertableReader {
         Ok(ctx)
     }
 
-    /// Drive one SQL statement on this reader's runtime (see
-    /// [`Self::block_on`]), raced against the process memory limit from its
-    /// planning to its last batch (see [`run_within_process_limit`]).
-    /// `collector` is the caller's, for the task the race runs it on.
+    /// [`Self::block_on`] for one SQL statement, raced against the process memory limit (see
+    /// [`run_within_process_limit`]). `collector` is the caller's, carried onto the race's task.
     fn block_on_statement<T: Send + 'static>(
         &self,
         collector: Option<Arc<OpStatsCollector>>,
@@ -748,13 +746,14 @@ impl SupertableReader {
         let ctx = self.metered_session_context()?;
         let id_column = self.options().id_column.clone();
 
-        // Resolve on this runtime's 16 MiB workers, not the calling thread
-        // `block_on` polls on: predicate planning depth must not hang on a
-        // caller's stack. A panic surfaces through the join as a query error.
-        // A `SpawnedTask` aborts the task when dropped, so a refusal by the
-        // process memory limit stops the resolve rather than detaching it.
+        // Resolve on this runtime's 16 MiB workers, not the calling thread `block_on` polls on:
+        // predicate planning depth must not hang on a caller's stack. A panic surfaces through the
+        // join as a query error. As a `SpawnedTask`, a refusal by the process memory limit aborts
+        // the resolve instead of detaching it, and the task carries this op's collector for the
+        // prune's counts.
+        let resolving = op_stats.clone();
         let drive = async move {
-            SpawnedTask::spawn(async move {
+            let resolve = async move {
                 let df = ctx
                     .table(TABLE_NAME)
                     .await
@@ -763,18 +762,17 @@ impl SupertableReader {
                     .map_err(QueryError::DataFusion)?
                     .select_columns(&[id_column.as_str()])
                     .map_err(QueryError::DataFusion)?;
-                // Same three steps as `query_sql`, and for the same reason:
-                // this scan's rows are real decoded rows. Collecting the
-                // DataFrame directly reported CPU, page bytes and ranges for a
-                // mutation's predicate resolve while leaving its row count at
-                // zero.
+                // Same three steps as `query_sql`, and for the same reason: this scan's rows are
+                // real decoded rows. Collecting the DataFrame directly reported CPU, page bytes and
+                // ranges for a mutation's predicate resolve while leaving its row count at zero.
                 let batches = Self::collect_metered_df(df, ctx.task_ctx(), &op_stats).await?;
                 extract_id_column(&batches)
-            })
-            .await
-            .map_err(|join| {
-                QueryError::Internal(format!("predicate resolve task failed: {join}"))
-            })?
+            };
+            SpawnedTask::spawn(op_stats::attached_to_future(resolving, resolve))
+                .await
+                .map_err(|join| {
+                    QueryError::Internal(format!("predicate resolve task failed: {join}"))
+                })?
         };
 
         self.block_on_statement(collector, drive)
@@ -1165,9 +1163,8 @@ mod tests {
     /// the dictionary, then the word's posting header.
     const DICTIONARY_ESTIMATE_READS: u64 = 2;
 
-    /// [`BROAD_SUPERFILES`] superfiles of [`BROAD_ROWS`] titles each, every
-    /// title starting `shared `, with or without a term index. The directory
-    /// holds the table's storage.
+    /// [`BROAD_SUPERFILES`] superfiles of [`BROAD_ROWS`] titles each, all starting with "shared",
+    /// with or without a term index. The directory holds the table's storage.
     fn broad_table(term_index: bool) -> (tempfile::TempDir, Supertable) {
         let dir = tempfile::tempdir().expect("tempdir");
         let storage: Arc<dyn StorageProvider> =
@@ -1191,8 +1188,7 @@ mod tests {
         (dir, st)
     }
 
-    /// Planned reads of a SQL scan that matches every row, with or without
-    /// a term index.
+    /// Planned reads of a SQL scan that matches every row, with or without a term index.
     fn broad_scan_planned_reads(term_index: bool) -> u64 {
         let (_dir, st) = broad_table(term_index);
         let reader = st.reader().expect("reader");
@@ -1224,17 +1220,22 @@ mod tests {
     }
 
     #[test]
-    fn a_table_sql_query_reports_the_superfiles_its_plan_considered() {
-        // Planning runs on a task of its own, raced against the process
-        // memory limit, and the scan counts the superfiles it weighed into
-        // the caller's collector while it plans. The task must carry that
-        // collector, or every count reads 0.
+    fn a_table_scan_reports_the_superfiles_its_plan_considered() {
+        // 3 superfiles, a table SQL query and a delete's predicate scan over them.
+        //  - both prune while planning, and count the superfiles weighed into the caller's stats.
+        //  - no process limit here: the SQL runs inline, the delete's scan on a task of its own.
+        // This test pins both counts; `tests/process_memory_limit.rs` checks SQL under a limit.
         let (_dir, st) = broad_table(false);
         let reader = st.reader().expect("reader");
         let (batches, stats) = with_op_stats(|| {
             reader.query_sql("SELECT count(*) FROM supertable WHERE title LIKE 'shared s1%'")
         });
         batches.expect("query");
+        assert_eq!(stats.superfiles_considered, BROAD_SUPERFILES as u64);
+
+        let (ids, stats) =
+            with_op_stats(|| reader.scan_ids_matching(col("title").like(lit("shared s1%"))));
+        ids.expect("delete scan");
         assert_eq!(stats.superfiles_considered, BROAD_SUPERFILES as u64);
     }
 

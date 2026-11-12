@@ -45,9 +45,8 @@ pub struct SlowStorage {
     max_in_flight: AtomicUsize,
     /// Each read's start and finish, in order, by the object it read.
     read_log: Mutex<Vec<ReadEvent>>,
-    /// Which reads are parked before they reach the inner provider: those of
-    /// an object whose path contains this fragment (an empty one parks all),
-    /// or none.
+    /// Which reads are parked before they reach the inner provider: those of an object whose path
+    /// contains this fragment (an empty one parks all), or none.
     held: watch::Sender<Option<String>>,
 }
 
@@ -71,8 +70,8 @@ impl SlowStorage {
         self.hold_reads_of("");
     }
 
-    /// [`Self::hold_reads`] for reads of an object whose path contains
-    /// `fragment` only; other reads go on.
+    /// [`Self::hold_reads`] for reads of an object whose path contains `fragment` only; other reads
+    /// go on.
     pub fn hold_reads_of(&self, fragment: &str) {
         self.held.send_replace(Some(fragment.to_owned()));
     }

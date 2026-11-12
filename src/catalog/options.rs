@@ -118,8 +118,8 @@ impl ConnectOptions {
 
     #[cfg(any(test, feature = "test-helpers"))]
     test_visible! {
-        /// Test-only: pass every storage provider this connection builds
-        /// through `wrap`, so a test can slow, count or hold its reads.
+        /// Test-only: pass every storage provider this connection builds through `wrap`, so a test
+        /// can slow, count or hold its reads.
         fn with_storage_wrapper(
             mut self,
             wrap: impl Fn(Arc<dyn StorageProvider>) -> Arc<dyn StorageProvider>

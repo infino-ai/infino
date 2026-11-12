@@ -343,8 +343,8 @@ impl TableProvider for CallScopedTable {
 /// through here; error mapping stays with the caller, whose surface it
 /// belongs to.
 ///
-/// The process memory limit is watched by the statement around this, from
-/// its planning on (see [`run_within_process_limit`]).
+/// The process memory limit is watched around the whole statement (see
+/// [`run_within_process_limit`]).
 pub(crate) async fn collect_plan_metered(
     plan: &Arc<dyn ExecutionPlan>,
     task_ctx: Arc<TaskContext>,
@@ -360,25 +360,20 @@ pub(crate) async fn collect_plan_metered(
     Ok(batches)
 }
 
-/// Run one SQL statement, its planning through its execution, raced against
-/// the process memory limit (see `memory::resident`). The limit has to watch
-/// both: execution streams batches the connection budget never sees, and
-/// planning opens every file a scan keeps and holds each one's metadata, which
-/// on a table of tens of thousands of files passes the limit before execution
-/// starts. A process past the limit ends the statement with a
-/// `ResourcesExhausted` refusal; a panic in it comes back as `ExecutionJoin`.
-///  - with no limit, `statement` runs right here: no task, nothing raced.
-///  - over the limit before it starts: refused, and `statement` never runs.
-///  - otherwise it runs as a task of its own: work over cached data can
-///    finish in one poll, so a check in the same task would only run once the
-///    result is ready. The task carries this call's span and `collector`, so
-///    the move changes neither the trace nor what the query reports.
-///  - limit wins: dropping the task aborts it, which stops what it was doing
-///    (file opens while planning, DataFusion's partition tasks and the search
-///    functions' fan-out while executing). Work already inside a poll still
-///    finishes that poll first.
-///  - `biased` checks the limit first, so a reading over it wins even if the
-///    result lands in the same wakeup.
+/// Run one SQL statement, planning through its last batch, raced against the process memory limit
+/// (see `memory::resident`). Planning holds the metadata of every file a scan keeps, which on a
+/// table of tens of thousands of files passes the limit before execution starts; execution streams
+/// batches the connection budget never sees. A refusal is `ResourcesExhausted`, a panic comes back
+/// as `ExecutionJoin`.
+///  - no limit: `statement` runs right here, nothing raced.
+///  - over the limit before it starts: refused, `statement` never runs.
+///  - otherwise it runs on a task of its own, as work over cached data can finish in one poll and a
+///    check in the same task would only run after it. The task keeps this call's span and
+///    `collector`.
+///  - limit wins: the task is dropped, which aborts it (file opens while planning, DataFusion's
+///    partition tasks and the search fan-out while executing). Work already inside a poll finishes
+///    that poll first.
+///  - `biased`: a reading over the limit wins even if the result lands in the same wakeup.
 pub(crate) async fn run_within_process_limit<T: Send + 'static>(
     collector: Option<Arc<OpStatsCollector>>,
     statement: impl Future<Output = T> + Send + 'static,
