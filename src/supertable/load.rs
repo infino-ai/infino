@@ -332,12 +332,12 @@ impl LoadReplica {
         let _in_flight = InFlight::enter(self)?;
         // Another node sealed this replica (`seal_absent_replica`): a batch committed after the
         // finish read it would never reach the table, so it is not acknowledged.
-        if is_sealed(&self.table)? {
+        if self.check_sealed()? {
             return Err(self.sealed_error());
         }
         // Keyed by load, so loads reusing a batch id never meet.
         let appended = merge::append_batch(&self.table, batch, &format!("{}/{id}", self.load))?;
-        if is_sealed(&self.table)? {
+        if self.check_sealed()? {
             return Err(InfinoError::Conflict(format!(
                 "load {}: this replica was sealed during the append; send the batch again",
                 self.load
@@ -348,6 +348,15 @@ impl LoadReplica {
             LoadState::Open | LoadState::Finishing => Ok(appended),
             state => Err(not_open(&self.load, &state)),
         }
+    }
+
+    /// Whether the replica is sealed in storage; once it is, [`Self::is_sealed`] says so too.
+    fn check_sealed(&self) -> Result<bool, InfinoError> {
+        let sealed = is_sealed(&self.table)?;
+        if sealed {
+            self.closed.store(true, Ordering::Release);
+        }
+        Ok(sealed)
     }
 
     fn sealed_error(&self) -> InfinoError {
@@ -377,7 +386,9 @@ impl LoadReplica {
         mark_sealed(&self.table)
     }
 
-    /// Whether the replica takes no more batches.
+    /// Whether the replica takes no more batches: sealed here, or found sealed in storage by an
+    /// append (a [`InfinoError::Conflict`] from [`Self::append_batch`] with this `false` is plain
+    /// write contention).
     pub fn is_sealed(&self) -> bool {
         self.closed.load(Ordering::Acquire)
     }
@@ -837,6 +848,7 @@ mod tests {
             r.append_batch(&batch(10), "b2"),
             Err(InfinoError::Conflict(_))
         ));
+        assert!(r.is_sealed(), "the append saw the seal");
         assert_eq!(finish_load(&t, "l1", None).expect("finish").rows, 10);
     }
 
