@@ -16,9 +16,11 @@
 //! use the manifest's segment bounds. Segments fall into three classes:
 //!
 //!   * **disjoint** — bounds outside the range: contribute nothing;
-//!   * **covered** — bounds fully inside the range AND tombstone-free
-//!     AND carrying the stats the aggregate needs: their contribution
-//!     is computed from manifest statistics, no scan;
+//!   * **covered** — bounds fully inside the range AND carrying the
+//!     stats the aggregate needs, as its live rows have them: their
+//!     contribution is computed from manifest statistics, no scan. A
+//!     segment with deletes has its statistics corrected for its deleted
+//!     rows (see [`super::deleted_stats`]);
 //!   * **boundary** — everything else: scanned for real (the
 //!     *residual*), with the original predicate re-applied.
 //!
@@ -42,9 +44,10 @@
 //!   * the filter must be EXACTLY a conjunction of range comparisons
 //!     over one column (an unrecognized conjunct disables the rewrite
 //!     — partial predicate coverage would answer the wrong query);
-//!   * a segment with any (or unknown) tombstones demotes to
-//!     boundary — one superfile's deletes send that superfile to the scan,
-//!     not the whole table;
+//!   * a segment with deletes whose statistics are not corrected for
+//!     them exactly, or whose deletes are unknown, demotes to boundary —
+//!     one superfile's deletes send that superfile to the scan, not the
+//!     whole table;
 //!   * a segment whose range column holds any (or an unknown number of)
 //!     nulls is boundary: a NULL never matches the range, but the
 //!     segment's statistics count its row;
@@ -65,11 +68,11 @@
 //! why an aggregate is left to the scan entirely.
 
 use std::{
-    cell::RefCell,
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet, HashMap},
-    ptr,
-    sync::Arc,
+    fmt, mem, ptr,
+    sync::{Arc, Mutex},
+    time::Instant,
 };
 
 use arrow_array::ArrayRef;
@@ -82,7 +85,7 @@ use datafusion::{
     },
     datasource::{DefaultTableSource, provider_as_source},
     error::{DataFusionError, Result as DfResult},
-    execution::SessionState,
+    execution::{SessionState, SessionStateBuilder},
     functions::core::expr_fn::{coalesce, greatest, least},
     functions_aggregate::expr_fn::{count, max, min, sum},
     logical_expr::{
@@ -104,9 +107,10 @@ use crate::supertable::{
     },
     query::{
         deleted_stats::{
-            CountsChange, LiveBound, LiveColumn, Unknown, Wanted, WantedColumn, read_wanted,
+            CountsChange, DeletedRowStatsRequest, LiveBound, LiveColumn, RequestedColumn, Unknown,
+            better_bound, read_requested, strictly_better,
         },
-        provider::{CountedRange, SupertableProvider, TombstoneState},
+        provider::{CountedRange, SupertableProvider},
         range_counts::RangeBucket,
         skip::{ColumnTypeGuard, file_lacks_column},
         value_count_carry::{counts_of, counts_without, take_off},
@@ -116,8 +120,22 @@ use crate::supertable::{
 
 /// The covered/residual aggregate rewrite. Registered on the
 /// `query_sql` session after DataFusion's built-in rules.
-#[derive(Debug, Default)]
-pub(crate) struct CoveredAggregateRewrite;
+#[derive(Default)]
+pub(crate) struct CoveredAggregateRewrite {
+    /// Set on the rule of a dry run (see [`prepare_aggregate_inputs`]): the
+    /// deleted rows each rewritten aggregate wants, by the provider to read
+    /// them through. A collecting rule logs nothing; the statement's own
+    /// optimization reports what it does.
+    collector: Option<Arc<Mutex<Vec<(SupertableProvider, Vec<DeletedRowStatsRequest>)>>>>,
+}
+
+impl fmt::Debug for CoveredAggregateRewrite {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CoveredAggregateRewrite")
+            .field("collecting", &self.collector.is_some())
+            .finish()
+    }
+}
 
 impl OptimizerRule for CoveredAggregateRewrite {
     fn name(&self) -> &str {
@@ -140,7 +158,7 @@ impl OptimizerRule for CoveredAggregateRewrite {
         // `try_rewrite` declines with `None`. An error is a failure building
         // our replacement from the manifest's own statistics: ours, never the
         // query's, so it crosses DataFusion as an engine fault.
-        match try_rewrite(&plan).map_err(QueryError::internal)? {
+        match try_rewrite(&plan, self.collector.as_deref()).map_err(QueryError::internal)? {
             Some(rewritten) => Ok(Transformed::yes(rewritten)),
             None => Ok(Transformed::no(plan)),
         }
@@ -206,7 +224,7 @@ enum Class {
 ///   * optimize the statement as it will be planned, and read the statistics
 ///     of the deleted rows the rewrite would use to answer superfiles with
 ///     deletes from their statistics, where reading those rows costs fewer
-///     pages than scanning the live ones would (see [`read_wanted`]). They
+///     pages than scanning the live ones would (see [`read_requested`]). They
 ///     are kept for the table, so a later statement reads only rows deleted
 ///     since.
 ///
@@ -225,7 +243,7 @@ pub(crate) async fn prepare_aggregate_inputs(
             if agg.group_expr.is_empty() && peel_unfiltered_scan(agg.input.as_ref()).is_some() {
                 sources.push(Arc::clone(&scan.source));
             }
-            if answerable_shape(agg) {
+            if answerable_shape(agg) && reads_deleted_rows(agg) {
                 aggregated.push(Arc::clone(&scan.source));
             }
         }
@@ -268,8 +286,13 @@ pub(crate) async fn prepare_aggregate_inputs(
     // statement here, as it will be planned, has the rewrite name the
     // deleted rows it would read in exactly that shape. A plan it fails to
     // optimize is the planner's to report when it runs.
-    let wanted = collect_wanted(|| state.optimize(plan).map(|_| ()));
-    for (provider, wanted) in wanted {
+    let collector = Arc::default();
+    if let Err(error) = dry_run(state, &collector).optimize(plan) {
+        debug!(%error, "aggregate inputs left unread: the statement does not optimize");
+        return Ok(());
+    }
+    let requests = mem::take(&mut *collector.lock().expect("requests rows poisoned"));
+    for (provider, requests) in requests {
         let cache = provider.deleted_stats();
         cache.prune_unlisted(|| {
             provider
@@ -278,7 +301,7 @@ pub(crate) async fn prepare_aggregate_inputs(
                 .map(|listed| listed.iter().map(|entry| entry.superfile_id).collect())
                 .unwrap_or_default()
         });
-        read_wanted(&provider, state, cache, wanted).await;
+        read_requested(&provider, state, cache, requests).await;
     }
     Ok(())
 }
@@ -307,35 +330,52 @@ fn answerable_shape(agg: &Aggregate) -> bool {
         })
 }
 
-thread_local! {
-    /// While [`collect_wanted`] runs, the deleted rows the rewrite would
-    /// read, with the provider of each statement's table; `None` otherwise.
-    static WANTED: RefCell<Option<Vec<(SupertableProvider, Vec<Wanted>)>>> =
-        const { RefCell::new(None) };
+/// `state` with the rewrite collecting into `collector` what it wants.
+fn dry_run(
+    state: &SessionState,
+    collector: &Arc<Mutex<Vec<(SupertableProvider, Vec<DeletedRowStatsRequest>)>>>,
+) -> SessionState {
+    let collecting: Arc<dyn OptimizerRule + Send + Sync> = Arc::new(CoveredAggregateRewrite {
+        collector: Some(Arc::clone(collector)),
+    });
+    let rules = state
+        .optimizers()
+        .iter()
+        .map(|rule| match rule.name() == collecting.name() {
+            true => Arc::clone(&collecting),
+            false => Arc::clone(rule),
+        })
+        .collect();
+    SessionStateBuilder::new_from_existing(state.clone())
+        .with_optimizer_rules(rules)
+        .build()
 }
 
-/// The deleted rows the rewrite wants while `optimize` runs on this thread,
-/// by the provider to read them through. The rewrite logs nothing then: the
-/// statement's own optimization reports what it does.
-fn collect_wanted(
-    optimize: impl FnOnce() -> DfResult<()>,
-) -> Vec<(SupertableProvider, Vec<Wanted>)> {
-    WANTED.with(|wanted| *wanted.borrow_mut() = Some(Vec::new()));
-    // Its result is the planner's to report; only what it wanted matters.
-    let _ = optimize();
-    WANTED
-        .with(|wanted| wanted.borrow_mut().take())
-        .unwrap_or_default()
+/// Whether the rewrite may read deleted rows' statistics for `agg`: over
+/// the whole table, a range on one column, or a grouping column's non-null
+/// values. Under any other filter it declines, so the pre-pass reads
+/// nothing for it.
+fn reads_deleted_rows(agg: &Aggregate) -> bool {
+    if peel_unfiltered_scan(agg.input.as_ref()).is_some() {
+        return true;
+    }
+    match agg.group_expr.as_slice() {
+        [] => peel_input(agg.input.as_ref())
+            .is_some_and(|(predicate, _)| extract_range(&predicate).is_some()),
+        [Expr::Column(column)] => peel_not_null_filter(agg.input.as_ref(), &column.name).is_some(),
+        _ => false,
+    }
 }
 
 /// The deleted rows whose statistics a statement wants, and whether the
-/// rewrite looking for them only looks (see [`collect_wanted`]).
-struct Wants {
-    list: Vec<Wanted>,
+/// rewrite looking for them only looks (see
+/// [`CoveredAggregateRewrite::collector`]).
+struct StatsRequests {
+    list: Vec<DeletedRowStatsRequest>,
     quiet: bool,
 }
 
-impl Wants {
+impl StatsRequests {
     fn logged() -> Self {
         Self {
             list: Vec::new(),
@@ -349,39 +389,41 @@ impl Wants {
 fn aggregated_scan(agg: &Aggregate) -> Option<&TableScan> {
     let scan = peel_unfiltered_scan(agg.input.as_ref())
         .or_else(|| peel_input(agg.input.as_ref()).map(|(_, scan)| scan))?;
-    provider_of(scan)
-        .is_some_and(|provider| !provider.is_segment_restricted())
-        .then_some(scan)
+    provider_of(scan).is_some().then_some(scan)
 }
 
-fn try_rewrite(plan: &LogicalPlan) -> DfResult<Option<LogicalPlan>> {
-    let collecting = WANTED.with(|wanted| wanted.borrow().is_some());
-    let mut wants = Wants {
+fn try_rewrite(
+    plan: &LogicalPlan,
+    collector: Option<&Mutex<Vec<(SupertableProvider, Vec<DeletedRowStatsRequest>)>>>,
+) -> DfResult<Option<LogicalPlan>> {
+    let mut wants = StatsRequests {
         list: Vec::new(),
-        quiet: collecting,
+        quiet: collector.is_some(),
     };
     let rewritten = try_rewrite_wanting(plan, &mut wants)?;
-    if collecting
+    if let Some(collector) = collector
         && !wants.list.is_empty()
         && let LogicalPlan::Aggregate(agg) = plan
         && let Some(provider) = aggregated_scan(agg).and_then(provider_of)
     {
-        WANTED.with(|wanted| {
-            if let Some(wanted) = wanted.borrow_mut().as_mut() {
-                wanted.push((provider.share(), wants.list));
-            }
-        });
+        collector
+            .lock()
+            .expect("requests rows poisoned")
+            .push((provider.share(), wants.list));
     }
     Ok(rewritten)
 }
 
-/// [`try_rewrite`], adding to `wanted` the deleted rows whose statistics
+/// [`try_rewrite`], adding to `requests` the deleted rows whose statistics
 /// would answer superfiles it leaves to the scan.
-fn try_rewrite_wanting(plan: &LogicalPlan, wanted: &mut Wants) -> DfResult<Option<LogicalPlan>> {
+fn try_rewrite_wanting(
+    plan: &LogicalPlan,
+    requests: &mut StatsRequests,
+) -> DfResult<Option<LogicalPlan>> {
     let LogicalPlan::Aggregate(agg) = plan else {
         return Ok(None);
     };
-    if let Some(rewritten) = rewrite_grouped_count_from_value_counts(agg, wanted)? {
+    if let Some(rewritten) = rewrite_grouped_count_from_value_counts(agg, requests)? {
         return Ok(Some(rewritten));
     }
     if !agg.group_expr.is_empty() {
@@ -404,9 +446,6 @@ fn try_rewrite_wanting(plan: &LogicalPlan, wanted: &mut Wants) -> DfResult<Optio
         let Some(provider) = provider_of(scan) else {
             return Ok(None);
         };
-        if provider.is_segment_restricted() {
-            return Ok(None);
-        }
         // One read of each superfile's deleted rows for the statement: the
         // statistics and the residual scan see the same ones.
         let provider = &provider.reading_tombstones_once();
@@ -420,7 +459,7 @@ fn try_rewrite_wanting(plan: &LogicalPlan, wanted: &mut Wants) -> DfResult<Optio
             &superfiles,
             None,
             "unfiltered aggregate",
-            wanted,
+            requests,
         ) else {
             return Ok(None);
         };
@@ -440,10 +479,6 @@ fn try_rewrite_wanting(plan: &LogicalPlan, wanted: &mut Wants) -> DfResult<Optio
     let Some(provider) = provider_of(scan) else {
         return Ok(None);
     };
-    if provider.is_segment_restricted() {
-        // Our own residual scan — never rewrite again.
-        return Ok(None);
-    }
     let Some(range) = extract_range(&predicate) else {
         return Ok(None);
     };
@@ -464,13 +499,13 @@ fn try_rewrite_wanting(plan: &LogicalPlan, wanted: &mut Wants) -> DfResult<Optio
     // with any to scan it answers below, and no deleted row is read for
     // the value counts.
     let range_indexed = provider.counted_range(&predicate).is_some();
-    let mut unread = Wants {
+    let mut unread = StatsRequests {
         list: Vec::new(),
-        quiet: wanted.quiet,
+        quiet: requests.quiet,
     };
     let counts_wanted = match range_indexed {
         true => &mut unread,
-        false => &mut *wanted,
+        false => &mut *requests,
     };
     if matches!(kinds.as_slice(), [AggKind::CountStar])
         && let Some(counts_split) =
@@ -528,7 +563,7 @@ fn try_rewrite_wanting(plan: &LogicalPlan, wanted: &mut Wants) -> DfResult<Optio
         superfiles,
         Some((&range, id_column)),
         "range aggregate",
-        wanted,
+        requests,
     ) else {
         return Ok(None);
     };
@@ -620,8 +655,8 @@ impl StatsColumn {
     }
 
     /// The column as a read of deleted rows names it.
-    fn wanted(&self) -> WantedColumn {
-        WantedColumn {
+    fn requests(&self) -> RequestedColumn {
+        RequestedColumn {
             field: self.id,
             name: self.name.clone(),
         }
@@ -649,7 +684,7 @@ struct Answered {
 /// row the `range` (with the table's id column) keeps, corrected for its
 /// deleted rows, and split off the ones they don't answer for to be
 /// scanned. Deleted rows whose statistics would answer a scanned superfile
-/// are added to `wanted`. `None`, logged, when nothing is answered or the
+/// are added to `requests`. `None`, logged, when nothing is answered or the
 /// answers do not fold.
 fn answer_from_statistics(
     provider: &SupertableProvider,
@@ -657,10 +692,10 @@ fn answer_from_statistics(
     superfiles: &[Arc<SuperfileEntry>],
     range: Option<(&RangeFilter, &str)>,
     shape: &'static str,
-    wanted: &mut Wants,
+    requests: &mut StatsRequests,
 ) -> Option<(Vec<Partial>, Split)> {
     let manifest = provider.manifest();
-    let mut split = Split::new(shape, wanted.quiet);
+    let mut split = Split::new(shape, requests.quiet);
     let columns: Vec<Option<StatsColumn>> = kinds
         .iter()
         .map(|kind| match kind.column() {
@@ -683,16 +718,12 @@ fn answer_from_statistics(
                 Class::Covered => {}
             }
         }
-        let deleted = match provider.tombstone_state(entry) {
-            TombstoneState::Clean => Arc::new(RoaringBitmap::new()),
-            TombstoneState::Deleted(rows) => rows,
-            TombstoneState::Unknown => {
-                split.scan(ScanReason::DeletesUnknown, entry);
-                continue;
-            }
+        let Ok(deleted) = provider.deleted_rows(entry.superfile_id, Instant::now()) else {
+            split.scan(ScanReason::DeletesUnknown, entry);
+            continue;
         };
         let mut terms = Vec::with_capacity(kinds.len());
-        let mut want: BTreeSet<WantedColumn> = BTreeSet::new();
+        let mut want: BTreeSet<RequestedColumn> = BTreeSet::new();
         let mut unknown = None;
         // One view of each column per superfile, whatever number of
         // aggregates read it.
@@ -708,8 +739,8 @@ fn answer_from_statistics(
             match term(kind, live, entry, &deleted) {
                 Ok(term) => terms.push(term),
                 Err(why) => {
-                    if let (Unknown::DeletedRows, Some(column)) = (why, column) {
-                        want.insert(column.wanted());
+                    if let (Unknown::Unread, Some(column)) = (why, column) {
+                        want.insert(column.requests());
                     }
                     unknown = Some(unknown.map_or(why, |seen: Unknown| seen.max(why)));
                 }
@@ -723,8 +754,8 @@ fn answer_from_statistics(
             }),
             Some(why) => {
                 split.scan(scan_reason(why, &deleted), entry);
-                if why == Unknown::DeletedRows {
-                    wanted.list.push(Wanted {
+                if why == Unknown::Unread {
+                    requests.list.push(DeletedRowStatsRequest {
                         entry: Arc::clone(entry),
                         deleted,
                         columns: want,
@@ -734,9 +765,39 @@ fn answer_from_statistics(
         }
     }
 
-    // A superfile bounding a column only from one side answers MIN or MAX
-    // when another superfile's exact bound is no worse: the answer lies on
-    // that bound or beyond it, whatever the first one's live rows hold.
+    let candidates = settle_one_sided_bounds(kinds, &columns, candidates, &mut split, requests);
+
+    if candidates.is_empty() && split.scans_any() {
+        // Nothing answerable from statistics — the rewrite would only add
+        // plan noise over the normal scan.
+        split.decline("no superfile is answerable from statistics");
+        return None;
+    }
+    let Some(partials) = fold_terms(kinds, &candidates) else {
+        // A fold failure (overflow, type surprise) is always safe to
+        // decline.
+        split.decline("a statistic does not fold");
+        return None;
+    };
+    for answered in candidates {
+        split.answer_past(&answered.entry, !answered.deleted.is_empty());
+    }
+    Some((partials, split))
+}
+
+/// The `candidates` whose `MIN` or `MAX` bounds a column only from one side
+/// (see [`LiveBound::OneSided`]) settled: such a bound answers when another
+/// superfile's exact bound is no worse, since the answer lies on that bound
+/// or beyond it, whatever the first one's live rows hold. A superfile it
+/// does not answer for is split off to be scanned, its deleted rows added
+/// to `requests` when their statistics would answer it.
+fn settle_one_sided_bounds(
+    kinds: &[AggKind],
+    columns: &[Option<StatsColumn>],
+    mut candidates: Vec<Answered>,
+    split: &mut Split,
+    requests: &mut StatsRequests,
+) -> Vec<Answered> {
     for (at, kind) in kinds.iter().enumerate() {
         let max = match kind {
             AggKind::Min(_) => false,
@@ -759,9 +820,9 @@ fn answer_from_statistics(
             .cloned();
         let mut kept = Vec::with_capacity(candidates.len());
         for mut answered in candidates {
-            if let Term::Bound(LiveBound::Beyond {
+            if let Term::Bound(LiveBound::OneSided {
                 bound,
-                deleted_rows,
+                exact_once_read,
             }) = &answered.terms[at]
             {
                 let beaten = best
@@ -769,11 +830,11 @@ fn answer_from_statistics(
                     .and_then(|best| strictly_better(bound, best, max))
                     .is_some_and(|better| !better);
                 if !beaten {
-                    if *deleted_rows && let Some(column) = &columns[at] {
-                        wanted.list.push(Wanted {
+                    if *exact_once_read && let Some(column) = &columns[at] {
+                        requests.list.push(DeletedRowStatsRequest {
                             entry: Arc::clone(&answered.entry),
                             deleted: Arc::clone(&answered.deleted),
-                            columns: [column.wanted()].into_iter().collect(),
+                            columns: [column.requests()].into_iter().collect(),
                         });
                     }
                     split.scan(ScanReason::DeletedRows, &answered.entry);
@@ -785,38 +846,7 @@ fn answer_from_statistics(
         }
         candidates = kept;
     }
-
-    if candidates.is_empty() && split.scans_any() {
-        // Nothing answerable from statistics — the rewrite would only add
-        // plan noise over the normal scan.
-        split.decline("no superfile is answerable from statistics");
-        return None;
-    }
-    let Some(partials) = fold_terms(kinds, &candidates) else {
-        // A fold failure (overflow, type surprise) is always safe to
-        // decline.
-        split.decline("a statistic does not fold");
-        return None;
-    };
-    for answered in candidates {
-        split.answer_past(&answered.entry, !answered.deleted.is_empty());
-    }
-    Some((partials, split))
-}
-
-/// Whether `candidate` is a strictly better bound than `than` — lower for a
-/// minimum, higher for a maximum; `None` when they don't compare.
-fn strictly_better(candidate: &ScalarValue, than: &ScalarValue, max: bool) -> Option<bool> {
-    let order = candidate.partial_cmp(than)?;
-    Some(match max {
-        false => order.is_lt(),
-        true => order.is_gt(),
-    })
-}
-
-/// The better of two bounds (see [`strictly_better`]), `a` on a tie.
-fn better_bound<'a>(a: &'a ScalarValue, b: &'a ScalarValue, max: bool) -> Option<&'a ScalarValue> {
-    Some(if strictly_better(b, a, max)? { b } else { a })
+    candidates
 }
 
 /// `column` of `entry` as its live rows have it, `deleted` of its rows
@@ -980,7 +1010,7 @@ fn add_sum(total: Option<ArrayRef>, sum: Option<&ScalarValue>) -> Option<Option<
 /// scanned, by why they don't and whether it has deleted rows.
 fn scan_reason(why: Unknown, deleted: &RoaringBitmap) -> ScanReason {
     match (why, deleted.is_empty()) {
-        (Unknown::DeletedRows, _) | (Unknown::Scan, false) => ScanReason::DeletedRows,
+        (Unknown::Unread, _) | (Unknown::Scan, false) => ScanReason::DeletedRows,
         (Unknown::Scan, true) => ScanReason::MissingStatistics,
     }
 }
@@ -1026,7 +1056,7 @@ struct Split {
     scanned: Vec<Arc<SuperfileEntry>>,
     /// How many are scanned for each reason.
     reasons: BTreeMap<ScanReason, usize>,
-    /// Log nothing: the split is only looked at (see [`Wants`]).
+    /// Log nothing: the split is only looked at (see [`StatsRequests`]).
     quiet: bool,
 }
 
@@ -1284,7 +1314,7 @@ fn covered_literal(value: &ScalarValue, output: &DataType) -> Expr {
 /// ```
 fn rewrite_grouped_count_from_value_counts(
     aggregate: &Aggregate,
-    wanted: &mut Wants,
+    requests: &mut StatsRequests,
 ) -> DfResult<Option<LogicalPlan>> {
     let [Expr::Column(group_column)] = aggregate.group_expr.as_slice() else {
         return Ok(None);
@@ -1308,15 +1338,12 @@ fn rewrite_grouped_count_from_value_counts(
     let Some(provider) = provider_of(scan) else {
         return Ok(None);
     };
-    if provider.is_segment_restricted() {
-        return Ok(None);
-    }
     // One read of each superfile's deleted rows for the statement: the
     // counts and the residual scan see the same ones.
     let provider = &provider.reading_tombstones_once();
     let column = group_column.name.as_str();
     let Some(counts_split) =
-        split_value_counts(provider, column, !nulls_filtered, "grouped count", wanted)
+        split_value_counts(provider, column, !nulls_filtered, "grouped count", requests)
     else {
         return Ok(None);
     };
@@ -1328,27 +1355,15 @@ fn rewrite_grouped_count_from_value_counts(
     };
     let CountsSplit { split, nulls, .. } = counts_split;
 
-    let group_type = aggregate.schema.field(0).data_type().clone();
-    let mut rows = Vec::with_capacity(counts.len() + 1);
-    for (value, count) in counts.iter() {
-        let Ok(count) = i64::try_from(count) else {
-            split.decline("a count overflows");
+    let group_type = aggregate.schema.field(0).data_type();
+    let nulls = if nulls_filtered { 0 } else { nulls };
+    let rows = match group_rows(&counts, nulls, group_type) {
+        Ok(rows) => rows,
+        Err(why) => {
+            split.decline(why);
             return Ok(None);
-        };
-        let Ok(value) = value.cast_to(&group_type) else {
-            split.decline("a value does not cast to the column's type");
-            return Ok(None);
-        };
-        rows.push(vec![lit(value), lit(count)]);
-    }
-    if !nulls_filtered && nulls > 0 {
-        let (Ok(nulls), Ok(null)) = (i64::try_from(nulls), ScalarValue::try_from(&group_type))
-        else {
-            split.decline("the null group does not fit");
-            return Ok(None);
-        };
-        rows.push(vec![lit(null), lit(nulls)]);
-    }
+        }
+    };
 
     if !split.scans_any() {
         split.log();
@@ -1372,10 +1387,58 @@ fn rewrite_grouped_count_from_value_counts(
     }
 
     split.log();
-    let restricted = Arc::new(split.restrict(provider));
+    let restricted = split.restrict(provider);
+    union_with_scanned_groups(
+        aggregate,
+        scan,
+        restricted,
+        group_column,
+        nulls_filtered,
+        rows,
+    )
+    .map(Some)
+}
+
+/// One row of `(value, count)` per value of `counts`, cast to the grouping
+/// column's `group_type`, and one for the null group when `nulls` rows are
+/// null; why not, when one does not fit.
+fn group_rows(
+    counts: &Counts,
+    nulls: u64,
+    group_type: &DataType,
+) -> Result<Vec<Vec<Expr>>, &'static str> {
+    let mut rows = Vec::with_capacity(counts.len() + 1);
+    for (value, count) in counts.iter() {
+        let count = i64::try_from(count).map_err(|_| "a count overflows")?;
+        let value = value
+            .cast_to(group_type)
+            .map_err(|_| "a value does not cast to the column's type")?;
+        rows.push(vec![lit(value), lit(count)]);
+    }
+    if nulls > 0 {
+        let (Ok(nulls), Ok(null)) = (i64::try_from(nulls), ScalarValue::try_from(group_type))
+        else {
+            return Err("the null group does not fit");
+        };
+        rows.push(vec![lit(null), lit(nulls)]);
+    }
+    Ok(rows)
+}
+
+/// The grouped count over the `restricted` scan of `scan`'s superfiles,
+/// added up by value with the `rows` answered from statistics, and named
+/// as `aggregate`'s output.
+fn union_with_scanned_groups(
+    aggregate: &Aggregate,
+    scan: &TableScan,
+    restricted: SupertableProvider,
+    group_column: &datafusion::common::Column,
+    nulls_filtered: bool,
+    rows: Vec<Vec<Expr>>,
+) -> DfResult<LogicalPlan> {
     let mut scanned = LogicalPlanBuilder::scan(
         scan.table_name.clone(),
-        provider_as_source(restricted as Arc<dyn TableProvider>),
+        provider_as_source(Arc::new(restricted) as Arc<dyn TableProvider>),
         None,
     )?;
     if nulls_filtered {
@@ -1412,17 +1475,15 @@ fn rewrite_grouped_count_from_value_counts(
         vec![col(GROUP_VALUE)],
         vec![sum(col(GROUP_COUNT)).alias(GROUP_COUNT)],
     )?;
-    Ok(Some(
-        summed
-            .project(as_output(
-                &aggregate.schema,
-                vec![
-                    col(GROUP_VALUE),
-                    coalesce(vec![col(GROUP_COUNT), lit(0i64)]),
-                ],
-            ))?
-            .build()?,
-    ))
+    summed
+        .project(as_output(
+            &aggregate.schema,
+            vec![
+                col(GROUP_VALUE),
+                coalesce(vec![col(GROUP_COUNT), lit(0i64)]),
+            ],
+        ))?
+        .build()
 }
 
 /// The grouped count's value and count, between its own nodes.
@@ -1455,7 +1516,7 @@ struct CountsSplit {
 /// Split the superfiles for counting `column` by value from statistics: one
 /// whose deleted rows' values are not known, or (with `count_nulls`) whose
 /// live null rows are not, is scanned, and the deleted rows whose
-/// statistics would tell are added to `wanted`. `None`, logged, when the
+/// statistics would tell are added to `requests`. `None`, logged, when the
 /// counts can't answer at all: a segment-restricted provider (the rewrite's
 /// own residual), a manifest not fully loaded, a column mid-retype, or no
 /// superfile answered.
@@ -1464,9 +1525,9 @@ fn split_value_counts(
     column: &str,
     count_nulls: bool,
     shape: &'static str,
-    wanted: &mut Wants,
+    requests: &mut StatsRequests,
 ) -> Option<CountsSplit> {
-    let split = Split::new(shape, wanted.quiet);
+    let split = Split::new(shape, requests.quiet);
     if provider.is_segment_restricted() {
         return None;
     }
@@ -1492,13 +1553,9 @@ fn split_value_counts(
         nulls: 0,
     };
     for entry in superfiles {
-        let deleted = match provider.tombstone_state(entry) {
-            TombstoneState::Clean => Arc::new(RoaringBitmap::new()),
-            TombstoneState::Deleted(rows) => rows,
-            TombstoneState::Unknown => {
-                counts_split.split.scan(ScanReason::DeletesUnknown, entry);
-                continue;
-            }
+        let Ok(deleted) = provider.deleted_rows(entry.superfile_id, Instant::now()) else {
+            counts_split.split.scan(ScanReason::DeletesUnknown, entry);
+            continue;
         };
         let live = live_column(provider, entry, id, &data_type, &deleted);
         let answer = live.counts_change().and_then(|change| match count_nulls {
@@ -1517,11 +1574,11 @@ fn split_value_counts(
             }
             Err(why) => {
                 counts_split.split.scan(scan_reason(why, &deleted), entry);
-                if why == Unknown::DeletedRows {
-                    wanted.list.push(Wanted {
+                if why == Unknown::Unread {
+                    requests.list.push(DeletedRowStatsRequest {
                         entry: Arc::clone(entry),
                         deleted,
-                        columns: [stats_column.wanted()].into_iter().collect(),
+                        columns: [stats_column.requests()].into_iter().collect(),
                     });
                 }
             }
@@ -1606,8 +1663,13 @@ pub(crate) fn value_counts_from_statistics(
     column: &str,
 ) -> Option<(Vec<(ScalarValue, u64)>, u64)> {
     let provider = &provider.reading_tombstones_once();
-    let counts_split =
-        split_value_counts(provider, column, true, "value_counts", &mut Wants::logged())?;
+    let counts_split = split_value_counts(
+        provider,
+        column,
+        true,
+        "value_counts",
+        &mut StatsRequests::logged(),
+    )?;
     if counts_split.split.scans_any() {
         return None;
     }
@@ -1721,9 +1783,6 @@ fn rewrite_bucketed_range_counts(agg: &Aggregate) -> DfResult<Option<LogicalPlan
     let Some(provider) = provider_of(scan) else {
         return Ok(None);
     };
-    if provider.is_segment_restricted() {
-        return Ok(None);
-    }
 
     let mut ranges = Vec::with_capacity(buckets.len());
     for (i, (_, filter)) in buckets.into_iter().enumerate() {
@@ -1918,7 +1977,8 @@ fn peel_not_null_filter<'a>(input: &'a LogicalPlan, column: &str) -> Option<&'a 
     }
 }
 
-/// The provider behind a scan, when it is ours and the scan carries no
+/// The provider behind a scan, when it is ours, not this rule's own
+/// residual scan (which is never rewritten again), and the scan carries no
 /// filter the provider answers exactly.
 ///
 /// An exact filter leaves no `Filter` node above the scan — DataFusion
@@ -1933,7 +1993,10 @@ fn provider_of(scan: &TableScan) -> Option<&SupertableProvider> {
     // its provided `downcast_ref` (auto-derefs the `Arc`).
     let source = scan.source.downcast_ref::<DefaultTableSource>()?;
     let provider = source.table_provider.downcast_ref::<SupertableProvider>()?;
-    (!provider.has_exact_filter(&scan.filters) && !provider.is_counting()).then_some(provider)
+    (!provider.is_segment_restricted()
+        && !provider.has_exact_filter(&scan.filters)
+        && !provider.is_counting())
+    .then_some(provider)
 }
 
 /// Strictly extract a single-column range from the predicate: a
@@ -2281,7 +2344,7 @@ mod tests {
     #[test]
     #[allow(deprecated)] // `supports_rewrite` is the targeted method.
     fn rule_opts_into_rewrite_and_reports_name() {
-        let rule = CoveredAggregateRewrite;
+        let rule = CoveredAggregateRewrite::default();
         assert!(rule.supports_rewrite(), "rule must use the rewrite path");
         assert_eq!(rule.name(), "covered_aggregate_rewrite");
     }

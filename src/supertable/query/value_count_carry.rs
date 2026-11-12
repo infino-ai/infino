@@ -14,6 +14,7 @@
 
 use std::{
     collections::HashMap,
+    mem,
     sync::{Arc, Mutex},
 };
 
@@ -247,19 +248,11 @@ impl CarriedColumn {
                 FileCounts::Unrecorded => return false,
                 FileCounts::Values(counts) => counts,
             };
-            for (value, count) in counts.entries() {
-                let Some(total) = sum.get_mut(value) else {
-                    return false;
-                };
-                let Some(left) = total.checked_sub(*count) else {
-                    return false;
-                };
-                if left == 0 {
-                    sum.remove(value);
-                } else {
-                    *total = left;
-                }
-            }
+            let less = counts.entries().iter().map(|(v, n)| (v, *n));
+            let Some(left) = take_off(mem::take(sum), less) else {
+                return false;
+            };
+            *sum = left;
         }
         true
     }

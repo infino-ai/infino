@@ -24,11 +24,10 @@
 //! The deleted rows' statistics are kept per superfile and column in a
 //! [`DeletedStatsCache`] on the table, keyed by the exact rows they cover. A
 //! superfile's deletes only grow, so a later read takes only the rows
-//! deleted since. Reading them costs the pages those rows sit on; when the
-//! live rows sit on fewer, the superfile is scanned instead.
+//! deleted since. A superfile with more than half its rows still to read
+//! is scanned instead: the live rows are then the smaller read.
 
 use std::{
-    cmp::Ordering,
     collections::{BTreeSet, HashMap, HashSet},
     sync::{Arc, Mutex},
 };
@@ -78,9 +77,9 @@ const EVICT_TO: f64 = 0.75;
 /// snapshot no longer lists.
 const PRUNE_ABOVE: usize = MAX_CACHED / 2;
 
-/// Share of a superfile's rows that may be read to correct its statistics
-/// when its file carries no page index to weigh the read against the scan.
-const MAX_READ_SHARE_WITHOUT_PAGES: f64 = 0.5;
+/// Share of a superfile's rows that may be read to correct its statistics;
+/// past it, scanning the live rows reads less.
+const MAX_READ_SHARE: f64 = 0.5;
 
 /// The statistics of superfiles' deleted rows, per superfile and column,
 /// shared by every reader of a table.
@@ -294,7 +293,7 @@ impl DeletedStatsCache {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Unknown {
     /// The deleted rows' statistics would tell, and are not read yet.
-    DeletedRows,
+    Unread,
     /// Nothing short of a scan tells.
     Scan,
 }
@@ -306,11 +305,11 @@ pub(crate) enum LiveBound {
     Exact(Option<ScalarValue>),
     /// Every live value lies on this side of `bound` (at or above it for a
     /// minimum, at or below for a maximum), or there is none: exact enough
-    /// when another superfile's exact bound is no worse. `deleted_rows`:
-    /// the deleted rows' statistics could make it exact.
-    Beyond {
+    /// when another superfile's exact bound is no worse. `exact_once_read`:
+    /// reading the deleted rows' statistics makes it exact.
+    OneSided {
         bound: ScalarValue,
-        deleted_rows: bool,
+        exact_once_read: bool,
     },
 }
 
@@ -375,7 +374,7 @@ impl<'a> LiveColumn<'a> {
     }
 
     fn delta(&self) -> Result<&ScalarStatsAgg, Unknown> {
-        self.delta.as_deref().ok_or(Unknown::DeletedRows)
+        self.delta.as_deref().ok_or(Unknown::Unread)
     }
 
     /// The deleted rows that hold a value.
@@ -474,9 +473,9 @@ impl<'a> LiveColumn<'a> {
             return Ok(LiveBound::Exact(Some(bound)));
         }
         let Some(delta) = self.delta.as_deref() else {
-            return Ok(LiveBound::Beyond {
+            return Ok(LiveBound::OneSided {
                 bound,
-                deleted_rows: true,
+                exact_once_read: true,
             });
         };
         // No deleted row held a value: the stored bound is a live row's.
@@ -495,12 +494,7 @@ impl<'a> LiveColumn<'a> {
         }
         // Every deleted value lies strictly inside the bound: a live row
         // holds it.
-        let inside = match (deleted_bound.partial_cmp(&bound), max) {
-            (Some(order), false) => order.is_gt(),
-            (Some(order), true) => order.is_lt(),
-            (None, _) => return Err(Unknown::Scan),
-        };
-        if inside {
+        if strictly_better(&bound, &deleted_bound, max).ok_or(Unknown::Scan)? {
             return Ok(LiveBound::Exact(Some(bound)));
         }
         // The value counts less the deleted rows' are the live ones.
@@ -516,20 +510,14 @@ impl<'a> LiveColumn<'a> {
             for value in live.keys() {
                 extreme = Some(match extreme {
                     None => value,
-                    Some(best) => {
-                        let order = value.partial_cmp(best).ok_or(Unknown::Scan)?;
-                        match (order, max) {
-                            (Ordering::Less, false) | (Ordering::Greater, true) => value,
-                            _ => best,
-                        }
-                    }
+                    Some(best) => better_bound(best, value, max).ok_or(Unknown::Scan)?,
                 });
             }
             return Ok(LiveBound::Exact(extreme.cloned()));
         }
-        Ok(LiveBound::Beyond {
+        Ok(LiveBound::OneSided {
             bound,
-            deleted_rows: false,
+            exact_once_read: false,
         })
     }
 
@@ -587,49 +575,51 @@ fn is_nan(value: &ScalarValue) -> bool {
 
 /// A column whose deleted rows' statistics a statement wants.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct WantedColumn {
+pub(crate) struct RequestedColumn {
     pub(crate) field: FieldId,
     pub(crate) name: String,
 }
 
 /// One superfile whose deleted rows' statistics a statement wants, for
 /// some of its columns.
-pub(crate) struct Wanted {
+pub(crate) struct DeletedRowStatsRequest {
     pub(crate) entry: Arc<SuperfileEntry>,
     /// Its deleted rows, as the statement read them.
     pub(crate) deleted: Arc<RoaringBitmap>,
-    pub(crate) columns: BTreeSet<WantedColumn>,
+    pub(crate) columns: BTreeSet<RequestedColumn>,
 }
 
-/// Read and cache the deleted rows' statistics `wanted` names, through
-/// `provider`, where reading them costs no more pages than scanning the
-/// live rows would. Each superfile reads only the rows its cached
+/// Read and cache the deleted rows' statistics `requests` names, through
+/// `provider`, where they are no more than [`MAX_READ_SHARE`] of the
+/// superfile's rows. Each superfile reads only the rows its cached
 /// statistics do not cover yet. A read that fails leaves the superfile to
 /// the scan.
-pub(crate) async fn read_wanted(
+pub(crate) async fn read_requested(
     provider: &SupertableProvider,
     state: &dyn Session,
     cache: &DeletedStatsCache,
-    wanted: Vec<Wanted>,
+    requests: Vec<DeletedRowStatsRequest>,
 ) {
     let stored = provider.manifest().stored_schema();
     let in_flight = provider.manifest().options.superfiles_in_flight;
-    // One read per superfile, of every column wanted of it.
-    let mut by_superfile: HashMap<Uuid, Wanted> = HashMap::new();
-    for wanted in wanted {
-        match by_superfile.get_mut(&wanted.entry.superfile_id) {
-            Some(seen) if *seen.deleted == *wanted.deleted => seen.columns.extend(wanted.columns),
+    // One read per superfile, of every column requested of it.
+    let mut by_superfile: HashMap<Uuid, DeletedRowStatsRequest> = HashMap::new();
+    for requests in requests {
+        match by_superfile.get_mut(&requests.entry.superfile_id) {
+            Some(seen) if *seen.deleted == *requests.deleted => {
+                seen.columns.extend(requests.columns)
+            }
             Some(_) => {}
             None => {
-                by_superfile.insert(wanted.entry.superfile_id, wanted);
+                by_superfile.insert(requests.entry.superfile_id, requests);
             }
         }
     }
-    let reads = by_superfile.into_values().map(|wanted| {
+    let reads = by_superfile.into_values().map(|requests| {
         let stored = Arc::clone(&stored);
         async move {
-            let superfile = wanted.entry.superfile_id;
-            if let Err(error) = read_superfile(provider, state, cache, &stored, wanted).await {
+            let superfile = requests.entry.superfile_id;
+            if let Err(error) = read_superfile(provider, state, cache, &stored, requests).await {
                 debug!(%superfile, %error, "deleted rows not read; the superfile is scanned");
             }
             Ok::<(), DataFusionError>(())
@@ -638,34 +628,34 @@ pub(crate) async fn read_wanted(
     let _ = try_join_bounded(reads, in_flight).await;
 }
 
-/// [`read_wanted`] for one superfile.
+/// [`read_requested`] for one superfile.
 async fn read_superfile(
     provider: &SupertableProvider,
     state: &dyn Session,
     cache: &DeletedStatsCache,
     stored: &Schema,
-    wanted: Wanted,
+    requests: DeletedRowStatsRequest,
 ) -> DfResult<()> {
-    let superfile = wanted.entry.superfile_id;
+    let superfile = requests.entry.superfile_id;
     // Columns grouped by the rows they still need, so columns cached over
     // the same deletes are read together.
     let mut groups: Vec<(
         RoaringBitmap,
-        Vec<(WantedColumn, DataType, Option<CachedRows>)>,
+        Vec<(RequestedColumn, DataType, Option<CachedRows>)>,
     )> = Vec::new();
-    for column in wanted.columns {
+    for column in requests.columns {
         let Ok(field) = stored.field_with_name(&column.name) else {
             continue;
         };
         let data_type = field.data_type().clone();
         if cache
-            .get(superfile, column.field, &data_type, &wanted.deleted)
+            .get(superfile, column.field, &data_type, &requests.deleted)
             .is_some()
         {
             continue;
         }
-        let base = cache.subset_of(superfile, column.field, &data_type, &wanted.deleted);
-        let mut unread = (*wanted.deleted).clone();
+        let base = cache.subset_of(superfile, column.field, &data_type, &requests.deleted);
+        let mut unread = (*requests.deleted).clone();
         if let Some(base) = &base {
             unread -= base.rows.as_ref();
         }
@@ -676,21 +666,12 @@ async fn read_superfile(
     }
     for (unread, columns) in groups {
         let names: Vec<&str> = columns.iter().map(|(c, _, _)| c.name.as_str()).collect();
-        let pays = match provider
-            .page_costs(Arc::clone(&wanted.entry), &names, &unread, &wanted.deleted)
-            .await?
-        {
-            Some((read, live)) => read <= live,
-            None => {
-                (unread.len() as f64) <= wanted.entry.n_docs as f64 * MAX_READ_SHARE_WITHOUT_PAGES
-            }
-        };
-        if !pays {
-            debug!(%superfile, rows = unread.len(), "deleted rows cost more pages than the live rows");
+        if unread.len() as f64 > requests.entry.n_docs as f64 * MAX_READ_SHARE {
+            debug!(%superfile, rows = unread.len(), "more deleted rows to read than live ones");
             continue;
         }
         let n_unread = unread.len();
-        let read = read_rows(provider, state, &wanted.entry, Arc::new(unread), &names).await?;
+        let read = read_rows(provider, state, &requests.entry, Arc::new(unread), &names).await?;
         // The statistics are CPU work over every row read: the reader pool's.
         let folded = run_on_pool(
             Some(&provider.manifest().options.reader_pool),
@@ -718,7 +699,7 @@ async fn read_superfile(
                 column.field,
                 CachedRows {
                     data_type,
-                    rows: Arc::clone(&wanted.deleted),
+                    rows: Arc::clone(&requests.deleted),
                     stats: Arc::new(stats),
                 },
             );
@@ -777,6 +758,29 @@ async fn read_rows(
         .collect())
 }
 
+/// Whether `candidate` is a strictly better bound than `than` — lower for a
+/// minimum, higher for a maximum; `None` when they don't compare.
+pub(crate) fn strictly_better(
+    candidate: &ScalarValue,
+    than: &ScalarValue,
+    max: bool,
+) -> Option<bool> {
+    let order = candidate.partial_cmp(than)?;
+    Some(match max {
+        false => order.is_lt(),
+        true => order.is_gt(),
+    })
+}
+
+/// The better of two bounds (see [`strictly_better`]), `a` on a tie.
+pub(crate) fn better_bound<'a>(
+    a: &'a ScalarValue,
+    b: &'a ScalarValue,
+    max: bool,
+) -> Option<&'a ScalarValue> {
+    Some(if strictly_better(b, a, max)? { b } else { a })
+}
+
 #[cfg(test)]
 mod tests {
     use std::{collections::HashSet, ops::Range, slice::from_ref, sync::Arc};
@@ -796,8 +800,7 @@ mod tests {
         test_helpers::default_disk_cache,
     };
 
-    /// Rows of the superfile whose deleted rows sit on more pages than its
-    /// live ones: ten pages of the writer's page row limit.
+    /// Rows of the superfile whose deletes cover most of it.
     const MANY_ROWS: i64 = 40_960;
     /// Rows of a small superfile.
     const FEW_ROWS: i64 = 1_000;
@@ -965,11 +968,11 @@ mod tests {
         );
     }
 
-    /// A superfile whose deleted rows sit on more pages than its live ones
-    /// is scanned rather than corrected; one whose deletes are a short run
-    /// is corrected.
+    /// A superfile with more deleted rows to read than live ones is scanned
+    /// rather than corrected; one whose deletes are a short run is
+    /// corrected.
     #[test]
-    fn deleted_rows_on_more_pages_than_the_live_ones_are_scanned() {
+    fn a_superfile_mostly_deleted_is_scanned() {
         let t = table();
         t.append(0..MANY_ROWS, |k| k);
         t.append(MANY_ROWS..MANY_ROWS + FEW_ROWS, |k| k);

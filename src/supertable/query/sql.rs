@@ -244,7 +244,7 @@ pub(crate) fn sql_session_context(
     let ctx = budgeted_session_context(budget)?;
     // Appended after the built-in rules, so they see pushed-down, normalized
     // plans: a `LIMIT` already folded into its sort as the fetch.
-    ctx.add_optimizer_rule(Arc::new(CoveredAggregateRewrite));
+    ctx.add_optimizer_rule(Arc::new(CoveredAggregateRewrite::default()));
     ctx.add_optimizer_rule(Arc::new(RangeTopK));
     Ok(ctx)
 }

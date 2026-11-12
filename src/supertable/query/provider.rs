@@ -220,58 +220,6 @@ struct PreparedScanFile {
 }
 
 impl PreparedScanFile {
-    /// The data pages of `columns` holding any of `read`, and those holding
-    /// a row `deleted` leaves live; `None` when the footer carries no page
-    /// index. Rows are numbered across the row groups in order.
-    fn page_costs(
-        &self,
-        columns: &[&str],
-        read: &RoaringBitmap,
-        deleted: &RoaringBitmap,
-    ) -> Option<(u64, u64)> {
-        let offsets = self.footer.offset_index()?;
-        let leaves = self.footer.file_metadata().schema_descr();
-        let wanted: Vec<usize> = (0..leaves.num_columns())
-            .filter(|leaf| {
-                leaves
-                    .column(*leaf)
-                    .path()
-                    .parts()
-                    .first()
-                    .is_some_and(|name| columns.contains(&name.as_str()))
-            })
-            .collect();
-        // A file naming none of the columns (written before a rename) has
-        // no pages to weigh.
-        if wanted.is_empty() {
-            return None;
-        }
-        let (mut read_pages, mut live_pages) = (0u64, 0u64);
-        let mut start = 0u64;
-        for (group, chunks) in offsets.iter().enumerate() {
-            let rows = u64::from(*self.row_counts.get(group)?);
-            for leaf in &wanted {
-                let pages = chunks.get(*leaf)?.page_locations();
-                for (at, page) in pages.iter().enumerate() {
-                    let first = start + u64::try_from(page.first_row_index).ok()?;
-                    let end = match pages.get(at + 1) {
-                        Some(next) => start + u64::try_from(next.first_row_index).ok()?,
-                        None => start + rows,
-                    };
-                    let span = u32::try_from(first).ok()?..u32::try_from(end).ok()?;
-                    if read.range_cardinality(span.clone()) > 0 {
-                        read_pages += 1;
-                    }
-                    if deleted.range_cardinality(span) < end - first {
-                        live_pages += 1;
-                    }
-                }
-            }
-            start += rows;
-        }
-        Some((read_pages, live_pages))
-    }
-
     /// The average data pages of `columns` in this file; `None` when the
     /// page index names none of them.
     fn pages_per_column(&self, columns: &[&str]) -> Option<u64> {
@@ -506,18 +454,6 @@ pub(crate) struct CountedRange {
     pub(crate) hi: u64,
 }
 
-/// A superfile's deleted rows, as [`SupertableProvider::tombstone_state`]
-/// reads them.
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) enum TombstoneState {
-    /// No row is deleted.
-    Clean,
-    /// These rows, never none, are deleted.
-    Deleted(Arc<RoaringBitmap>),
-    /// The deleted rows could not be read.
-    Unknown,
-}
-
 /// What [`SupertableProvider::top_k`] carries: the sort column, its
 /// direction and the sort's row count, and whether the sort orders by more
 /// keys after the column (`ties`): then rows tied with the `k`-th key are
@@ -640,21 +576,6 @@ impl SupertableProvider {
         }
     }
 
-    /// The data pages of `columns` in `entry` that hold any of `read`, and
-    /// those that hold a row `deleted` leaves live: what reading `read`
-    /// costs against what scanning the live rows does. `None` when the
-    /// file carries no page index.
-    pub(crate) async fn page_costs(
-        &self,
-        entry: Arc<SuperfileEntry>,
-        columns: &[&str],
-        read: &RoaringBitmap,
-        deleted: &RoaringBitmap,
-    ) -> DfResult<Option<(u64, u64)>> {
-        let prepared = self.prepared_scan_file(entry).await?;
-        Ok(prepared.page_costs(columns, read, deleted))
-    }
-
     /// Clone of this provider restricted to `segments` — used by the
     /// covered/residual aggregate rewrite for the residual (boundary
     /// segment) scan. It shares the parent's snapshot, prepared files and
@@ -717,7 +638,7 @@ impl SupertableProvider {
     /// The rows of superfile `superfile_id` deleted as of `now`, empty with
     /// no tombstone overlay; under [`Self::reading_tombstones_once`], the
     /// rows its first read found.
-    fn deleted_rows(
+    pub(crate) fn deleted_rows(
         &self,
         superfile_id: Uuid,
         now: Instant,
@@ -807,18 +728,6 @@ impl SupertableProvider {
     /// The pinned manifest snapshot (covered/residual rewrite input).
     pub(crate) fn manifest(&self) -> &Arc<ManifestSnapshot> {
         &self.manifest
-    }
-
-    /// `entry`'s deleted rows as this provider reads them (see
-    /// [`Self::deleted_rows`]): none, some, or unknown when they could not
-    /// be read. Only a clean superfile's statistics describe its live rows
-    /// as stored.
-    pub(crate) fn tombstone_state(&self, entry: &SuperfileEntry) -> TombstoneState {
-        match self.deleted_rows(entry.superfile_id, Instant::now()) {
-            Ok(rows) if rows.is_empty() => TombstoneState::Clean,
-            Ok(rows) => TombstoneState::Deleted(rows),
-            Err(_) => TombstoneState::Unknown,
-        }
     }
 
     /// Exact table-wide frequencies for one low-cardinality column, empty
@@ -4267,9 +4176,10 @@ mod tests {
         let entries = provider.manifest().superfiles.clone();
         let once = provider.reading_tombstones_once();
         let residual = once.restricted_to(HashSet::new());
-        assert_eq!(
-            once.tombstone_state(&entries[0]),
-            TombstoneState::Clean,
+        assert!(
+            once.deleted_rows(entries[0].superfile_id, Instant::now())
+                .expect("deleted rows")
+                .is_empty(),
             "the statement reads the superfile clean"
         );
 
@@ -4504,12 +4414,13 @@ mod tests {
     }
 
     #[test]
-    fn tombstone_state_clean_without_tombstone_overlay() {
+    fn no_rows_deleted_without_tombstone_overlay() {
         let (provider, _rt) = provider_over_two_superfiles();
         // In-memory tables carry no tombstone overlay, so every entry is
         // trivially clean.
         for entry in provider.manifest().superfiles.iter() {
-            assert_eq!(provider.tombstone_state(entry), TombstoneState::Clean);
+            let deleted = provider.deleted_rows(entry.superfile_id, Instant::now());
+            assert!(deleted.expect("deleted rows").is_empty());
         }
     }
 
