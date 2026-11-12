@@ -27,11 +27,6 @@ use crate::{
 };
 
 impl Supertable {
-    /// Merge small or underfilled superfiles into larger ones, then run a
-    /// best-effort gc sweep (orphaned superfiles/manifests + dead tombstone
-    /// sidecars) and a best-effort WAL sweep (completed mutation state and
-    /// arrow sidecars). Pass [`OptimizeOptions::default`] for engine
-    /// defaults. Requires durable storage.
     /// Whether replicas are loading into this table (see `storage::REPLICAS_DIR`). While they are,
     /// [`Self::optimize`] does nothing; maintenance outside it should wait too.
     pub fn has_attached_replicas(&self) -> Result<bool, OptimizeError> {
@@ -43,6 +38,12 @@ impl Supertable {
             .map_err(|e| OptimizeError::Refresh(e.to_string()))
     }
 
+    /// Merge small or underfilled superfiles into larger ones, then run a
+    /// best-effort gc sweep (orphaned superfiles/manifests + dead tombstone
+    /// sidecars) and a best-effort WAL sweep (completed mutation state and
+    /// arrow sidecars). Pass [`OptimizeOptions::default`] for engine
+    /// defaults. Requires durable storage. Does nothing on a replica, or while replicas are
+    /// loading into the table (see [`Self::has_attached_replicas`]).
     #[doc(alias = "compact")]
     // Shares every step below with the detached background sweeps, so the
     // span tags it `optimize`: same code, but a caller is blocked on it and
@@ -57,6 +58,11 @@ impl Supertable {
     pub fn optimize(&self, opts: &OptimizeOptions) -> Result<(), OptimizeError> {
         // Replicas' objects sit in the table unlisted until grafted, and their folds read slices the
         // table's own fold would retire: maintenance waits until the loader detaches them.
+        // A replica's superfiles are tracked by id until grafted, so it is never compacted or gc'd.
+        if self.inner().options.term_index_replica {
+            tracing::info!("optimize skipped: this table is a replica of another");
+            return Ok(());
+        }
         if self.has_attached_replicas()? {
             tracing::info!("optimize skipped: replicas are loading into this table");
             return Ok(());

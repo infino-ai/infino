@@ -421,6 +421,10 @@ pub(super) async fn gc_storage_sweep_for_inner(
 
     let mut report = GcReport::default();
 
+    // A replica's objects belong to the table it loads into, which sweeps them after detaching.
+    if inner.options.term_index_replica {
+        return Ok(GcReport::default());
+    }
     // Attached replicas' superfiles and slices sit here unlisted until grafted.
     let attached = !crate::storage::attached_replicas(storage.as_ref())
         .await?
