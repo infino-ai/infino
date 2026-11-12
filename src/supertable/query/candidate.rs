@@ -103,7 +103,10 @@ use datafusion::{
     },
     scalar::ScalarValue,
 };
-use futures::{FutureExt, future::BoxFuture};
+use futures::{
+    FutureExt,
+    future::{BoxFuture, try_join_all},
+};
 use rayon::ThreadPool;
 use roaring::RoaringBitmap;
 use tokio::sync::Semaphore;
@@ -127,7 +130,7 @@ use crate::{
         error::QueryError,
         manifest::{ManifestSnapshot, SuperfileEntry, SuperfileUri},
         query::{
-            fts::IndexedSuperfile,
+            fts::{IndexedSuperfile, PlanLocations, memos_from_plan_locations},
             prune::{PruneLeaf, select_superfiles},
         },
         schema::FieldId,
@@ -140,6 +143,12 @@ use crate::{
 /// threads that match deeper plans. A debug build overflows a 2 MiB pool
 /// thread between 150 and 200 levels; real filters sit far below 64.
 const MAX_POOL_PLAN_DEPTH: usize = 64;
+
+/// The most superfiles one pool job resolves in
+/// [`CandidatePlan::resolve_resident_on_pool`]. Small jobs leave the pool to
+/// other queries' work between them, while thousands of superfiles still cost
+/// only about one hand-off per pool thread.
+const MAX_FILES_PER_POOL_JOB: usize = 32;
 
 /// What a SQL `WHERE` pushed into a search TVF admits, resolved once per
 /// query against the pinned snapshot and shared by every retriever the
@@ -551,6 +560,32 @@ impl CandidatePlan {
     }
 }
 
+/// When one superfile's index pays for its scan: the plan's estimated match
+/// count is at most `index` and below `density_cap`. Past either, the rows
+/// the index keeps fill the data pages anyway, so the scan reads them all.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SelectionGate {
+    pub(crate) index: u64,
+    pub(crate) density_cap: u64,
+}
+
+impl SelectionGate {
+    fn pays(self, estimate: u64) -> bool {
+        estimate <= self.index && estimate < self.density_cap
+    }
+}
+
+/// One superfile's rows from its index (`None`: scan it all), and the work
+/// finding them took.
+pub(crate) type Resolved = Result<(Option<RoaringBitmap>, MatchWork), ReadError>;
+
+/// One superfile for [`CandidatePlan::resolve_resident_on_pool`].
+pub(crate) struct PoolFile {
+    pub(crate) reader: Arc<SuperfileReader>,
+    pub(crate) superfile: Uuid,
+    pub(crate) gate: SelectionGate,
+}
+
 impl CandidatePlan {
     /// [`Self::evaluate`] on a `pool` thread when `reader` holds its indexes
     /// in memory (`parquet_bytes` is set; a hybrid reader lacks only its
@@ -612,6 +647,136 @@ impl CandidatePlan {
             memos = returned;
         }
         self.evaluate(&reader, Some(pool), &memos).await
+    }
+
+    /// Each resident superfile's whole index step, on `pool`: estimate how
+    /// many rows the plan matches and, when the index pays (`gate`), load
+    /// its words' postings ranges from `locations` and match.
+    ///
+    /// Run on the planning task, these steps go one superfile after another,
+    /// since a local read never yields, and the estimate's first read of a
+    /// cold mapped file is a page fault. On the pool they run side by side.
+    /// The superfiles go out in jobs of up to [`MAX_FILES_PER_POOL_JOB`],
+    /// about one per pool thread, so the hand-off is paid per job rather than
+    /// per superfile, and other work on the pool gets threads between jobs.
+    /// Each job holds one of `slots` while on the pool.
+    ///
+    /// Entry `i` answers `files[i]`. It is `None` when that superfile goes
+    /// back to [`Self::resolve`] on the planning task: its reader is lazy,
+    /// a step would wait (another query filling a shared cell), or the plan
+    /// cannot run on a pool thread, as [`Self::evaluate_on_pool`] explains.
+    pub(crate) async fn resolve_resident_on_pool(
+        self: Arc<Self>,
+        files: Vec<PoolFile>,
+        locations: Arc<PlanLocations>,
+        pool: &ThreadPool,
+        slots: &Semaphore,
+    ) -> Result<Vec<Option<Resolved>>, ReadError> {
+        if self.has_like() || self.depth() > MAX_POOL_PLAN_DEPTH {
+            return Ok(files.iter().map(|_| None).collect());
+        }
+        let per_job = files
+            .len()
+            .div_ceil(pool.current_num_threads().max(1))
+            .clamp(1, MAX_FILES_PER_POOL_JOB);
+        let mut files = files.into_iter().peekable();
+        let mut jobs = Vec::new();
+        while files.peek().is_some() {
+            let job: Vec<PoolFile> = files.by_ref().take(per_job).collect();
+            let plan = Arc::clone(&self);
+            let locations = Arc::clone(&locations);
+            jobs.push(async move {
+                let _slot = slots
+                    .acquire()
+                    .await
+                    .map_err(|_| ReadError::TaskDropped("planning match slot"))?;
+                run_on_pool_while_awaited(pool, "planning match", move || {
+                    job.iter()
+                        .map(|file| plan.resolve_resident(file, &locations))
+                        .collect::<Vec<_>>()
+                })
+                .await
+                .map_err(|e| ReadError::TaskDropped(e.0))
+            });
+        }
+        Ok(try_join_all(jobs).await?.into_iter().flatten().collect())
+    }
+
+    /// [`Self::resolve`] for one superfile on a pool thread, in one poll;
+    /// `None` when it is lazy or a step would wait.
+    fn resolve_resident(&self, file: &PoolFile, locations: &PlanLocations) -> Option<Resolved> {
+        file.reader.parquet_bytes()?;
+        let resolved = async {
+            let (memos, mut work) = self
+                .bind(&file.reader, file.superfile, locations, file.gate, None)
+                .await?;
+            let Some(memos) = memos else {
+                return Ok((None, work));
+            };
+            let (rows, matched) = self.evaluate(&file.reader, None, &memos).await?;
+            work.merge(matched);
+            Ok((rows, work))
+        }
+        .now_or_never();
+        if resolved.is_none() {
+            // Rare and harmless once; routine fallbacks would do each
+            // superfile's work twice.
+            debug!(
+                superfile = %file.superfile,
+                "a resident index step could not finish on the pool; rerunning it on the planning task"
+            );
+        }
+        resolved
+    }
+
+    /// One superfile's whole index step on the planning task: estimate,
+    /// and when the index pays (`gate`), load the postings ranges and match
+    /// through [`Self::evaluate_on_pool`]. For the superfiles
+    /// [`Self::resolve_resident_on_pool`] hands back, and plans it never
+    /// takes.
+    pub(crate) async fn resolve(
+        self: Arc<Self>,
+        reader: Arc<SuperfileReader>,
+        superfile: Uuid,
+        locations: &PlanLocations,
+        gate: SelectionGate,
+        pool: &ThreadPool,
+        slots: &Semaphore,
+    ) -> Resolved {
+        let (memos, mut work) = self
+            .bind(&reader, superfile, locations, gate, Some(pool))
+            .await?;
+        let Some(memos) = memos else {
+            return Ok((None, work));
+        };
+        let (rows, matched) = self
+            .evaluate_on_pool(reader, superfile, pool, slots, memos)
+            .await?;
+        work.merge(matched);
+        Ok((rows, work))
+    }
+
+    /// The steps before a match: estimate the plan's rows in `superfile`
+    /// and, when the index pays (`gate`), load its words' postings ranges.
+    /// `None` memos mean the index does not pay: scan the superfile.
+    async fn bind(
+        &self,
+        reader: &SuperfileReader,
+        superfile: Uuid,
+        locations: &PlanLocations,
+        gate: SelectionGate,
+        pool: Option<&ThreadPool>,
+    ) -> Result<(Option<TermMemos>, MatchWork), ReadError> {
+        let located = IndexedSuperfile {
+            locations,
+            superfile,
+        };
+        let (estimate, work) = self.estimate(reader, pool, Some(located)).await?;
+        if !gate.pays(estimate) {
+            return Ok((None, work));
+        }
+        let memos = memos_from_plan_locations(reader, locations, superfile).await;
+        Ok((Some(memos), work))
     }
 
     /// Manifest-only superfile survival gate for this plan: the superfile
@@ -3388,5 +3553,196 @@ mod tests {
             1,
             "a finished match gives it back"
         );
+    }
+
+    /// A gate the index always passes.
+    const OPEN_GATE: SelectionGate = SelectionGate {
+        index: u64::MAX,
+        density_cap: u64::MAX,
+    };
+
+    /// Rows per superfile from [`CandidatePlan::resolve_resident_on_pool`]:
+    /// `None` for one it handed back, else that superfile's rows.
+    fn resolved_rows(resolved: Vec<Option<Resolved>>) -> Vec<Option<Option<Vec<u32>>>> {
+        resolved
+            .into_iter()
+            .map(|r| r.map(|r| row_list(r.expect("resolve").0)))
+            .collect()
+    }
+
+    fn pool_files(reader: &Arc<SuperfileReader>, n: usize, gate: SelectionGate) -> Vec<PoolFile> {
+        (0..n)
+            .map(|i| PoolFile {
+                reader: Arc::clone(reader),
+                superfile: Uuid::from_u128(i as u128),
+                gate,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn resident_superfiles_resolve_on_the_pool_in_order() {
+        // 2 * MAX_FILES_PER_POOL_JOB + 1 superfiles, so three jobs on a
+        // one-thread pool, and one slot:
+        // - every resident superfile with an open gate gives rows 0 and 2,
+        // - one whose gate the estimate (2 rows) fails gives "scan it",
+        // - one opened lazily is handed back to the planning task.
+        // This test pins that results come back in input order across jobs,
+        // and that the gate and the lazy hand-back hold on the pool.
+        let n = 2 * MAX_FILES_PER_POOL_JOB + 1;
+        let (closed, lazy) = (MAX_FILES_PER_POOL_JOB, n - 1);
+        let mut files = pool_files(&resident_reader(), n, OPEN_GATE);
+        files[closed].gate = SelectionGate {
+            index: 1,
+            density_cap: u64::MAX,
+        };
+        let source: Arc<dyn LazyByteSource> =
+            Arc::new(BytesLazyByteSource::new(titled_superfile().0));
+        files[lazy].reader = Arc::new(SuperfileReader::open_lazy(source).await.expect("lazy open"));
+
+        let pool = one_thread_pool();
+        let slots = Semaphore::new(1);
+        let resolved = timeout(
+            MUST_FINISH,
+            Arc::new(terms_all(&["rust"])).resolve_resident_on_pool(
+                files,
+                Arc::new(PlanLocations::new()),
+                &pool,
+                &slots,
+            ),
+        )
+        .await
+        .expect("finishes")
+        .expect("resolve");
+
+        let mut want = vec![Some(Some(vec![0, 2])); n];
+        want[closed] = Some(None);
+        want[lazy] = None;
+        assert_eq!(resolved_rows(resolved), want);
+        assert_eq!(slots.available_permits(), 1, "every job gave its slot back");
+    }
+
+    #[tokio::test]
+    async fn resident_superfiles_resolve_on_the_pool_not_here() {
+        // Resident superfiles, a pool whose only thread is busy, one slot.
+        // - The first poll queues a job and does not finish; the job holds
+        //   the slot.
+        // - Once the pool is free, every superfile gives rows 0 and 2.
+        // This test pins that the estimate and the match run on the pool,
+        // not on the planning task.
+        let (pool, release) = held_pool();
+        let slots = Semaphore::new(1);
+        let mut resolving = Box::pin(Arc::new(terms_all(&["rust"])).resolve_resident_on_pool(
+            pool_files(&resident_reader(), 3, OPEN_GATE),
+            Arc::new(PlanLocations::new()),
+            &pool,
+            &slots,
+        ));
+        assert!(
+            (&mut resolving).now_or_never().is_none(),
+            "the step waits for the pool"
+        );
+        assert_eq!(slots.available_permits(), 0, "the queued job holds it");
+        drop(release);
+        let resolved = timeout(MUST_FINISH, resolving)
+            .await
+            .expect("finishes once the pool is free")
+            .expect("resolve");
+        assert_eq!(resolved_rows(resolved), vec![Some(Some(vec![0, 2])); 3]);
+    }
+
+    #[tokio::test]
+    async fn like_and_deep_plans_are_handed_back() {
+        // Resident superfiles, a busy pool, no free slot, and two plans the
+        // pool never takes: an unbound `LIKE` and one level too deep.
+        // - Both come back at once, every superfile handed back.
+        // This test pins that neither waits on the pool: the `LIKE` walk
+        // hops to a pool on its own, and the deep match would overflow a
+        // pool thread's stack.
+        let mut deep = terms_all(&["rust"]);
+        for _ in 0..MAX_POOL_PLAN_DEPTH {
+            deep = CandidatePlan::And(vec![deep, terms_all(&["rust"])]);
+        }
+        let like = plan(col("title").like(lit("rust%")));
+        let (pool, _release) = held_pool();
+        let no_slots = Semaphore::new(0);
+        for (what, plan) in [("like", like), ("deep", deep)] {
+            let resolved = Arc::new(plan)
+                .resolve_resident_on_pool(
+                    pool_files(&resident_reader(), 2, OPEN_GATE),
+                    Arc::new(PlanLocations::new()),
+                    &pool,
+                    &no_slots,
+                )
+                .now_or_never()
+                .unwrap_or_else(|| panic!("{what}: waited on the pool"))
+                .expect(what);
+            assert_eq!(resolved_rows(resolved), vec![None, None], "{what}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_pool_and_the_planning_task_resolve_alike() {
+        // One resident superfile, and each plan shape the provider resolves:
+        // a word, a range, both, either, and a gate the estimate fails.
+        // - On the pool and on the planning task, each gives the same rows.
+        // This test pins that moving the estimate and the postings load onto
+        // the pool changes where they run, not what they answer.
+        let hits = titled_superfile().1;
+        let closed = SelectionGate {
+            index: 0,
+            density_cap: u64::MAX,
+        };
+        let cases = [
+            ("a word", terms_all(&["rust"]), OPEN_GATE, Some(vec![0, 2])),
+            (
+                "a range",
+                hits_between(hits, 0, 10),
+                OPEN_GATE,
+                Some(vec![0, 2]),
+            ),
+            (
+                "a word and a range",
+                CandidatePlan::And(vec![terms_all(&["rust"]), hits_between(hits, 6, 10)]),
+                OPEN_GATE,
+                Some(vec![2]),
+            ),
+            (
+                "one word or another",
+                CandidatePlan::Or(vec![terms_all(&["rust"]), terms_all(&["python"])]),
+                OPEN_GATE,
+                Some(vec![0, 1, 2]),
+            ),
+            ("a failed gate", terms_all(&["rust"]), closed, None),
+        ];
+        let reader = resident_reader();
+        let pool = one_thread_pool();
+        let slots = Semaphore::new(1);
+        let locations = Arc::new(PlanLocations::new());
+        for (what, plan, gate, want) in cases {
+            let plan = Arc::new(plan);
+            let on_pool = Arc::clone(&plan)
+                .resolve_resident_on_pool(
+                    pool_files(&reader, 1, gate),
+                    Arc::clone(&locations),
+                    &pool,
+                    &slots,
+                )
+                .await
+                .expect(what);
+            let (here, _) = plan
+                .resolve(
+                    Arc::clone(&reader),
+                    Uuid::nil(),
+                    &locations,
+                    gate,
+                    &pool,
+                    &slots,
+                )
+                .await
+                .expect(what);
+            assert_eq!(resolved_rows(on_pool), vec![Some(want.clone())], "{what}");
+            assert_eq!(row_list(here), want, "{what}");
+        }
     }
 }
