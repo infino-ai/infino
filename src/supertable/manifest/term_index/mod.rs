@@ -1045,6 +1045,24 @@ pub(crate) async fn fold_next(
     let ordinals: Vec<Option<u32>> = (0..root.superfiles.len() as u32)
         .map(|o| o.checked_sub(base))
         .collect();
+    // The merge looks a superfile's scoring up by its renumbered ordinal.
+    let shifted;
+    let policy = match base {
+        0 => policy,
+        _ => {
+            shifted = BuildPolicy {
+                scoring_by_ordinal: Arc::new(
+                    policy
+                        .scoring_by_ordinal
+                        .get(base as usize..)
+                        .unwrap_or_default()
+                        .to_vec(),
+                ),
+                ..policy.clone()
+            };
+            &shifted
+        }
+    };
     let mut merged =
         fold_layers(storage, layers, &ordinals, policy, &FoldIo::default(), pool).await?;
     if base > 0 {
