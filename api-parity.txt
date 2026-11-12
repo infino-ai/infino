@@ -56,3 +56,4 @@ Supertable::open_imports	exempt	Rust-embedder API for imports spread over severa
 Supertable::abort_import	exempt	Rust-embedder API for imports spread over several engine processes that share one table's storage; a single-process binding has no other process to coordinate
 Supertable::import_activity	exempt	Rust-embedder API for imports spread over several engine processes that share one table's storage; a single-process binding has no other process to coordinate
 Supertable::import_writers	exempt	Rust-embedder API for imports spread over several engine processes that share one table's storage; a single-process binding has no other process to coordinate
+Supertable::claim_import_report	exempt	Rust-embedder API for imports spread over several engine processes that share one table's storage; a single-process binding has no other process to coordinate
