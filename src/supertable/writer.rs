@@ -14253,17 +14253,18 @@ pub(in crate::supertable) async fn refresh_inner_state_async(
     storage: &Arc<dyn StorageProvider>,
 ) -> Result<(), SupertableCommitError> {
     let current = inner.manifest.load_full();
-    let manifest = match ManifestSnapshot::load(Some(current), storage.clone(), None).await {
-        Ok(manifest) => manifest,
-        Err(ManifestLoadError::PointerNotFound) => return Ok(()),
-        Err(ManifestLoadError::AlreadyLoaded) => return Ok(()),
-        Err(err) => {
-            return Err(SupertableCommitError::ManifestError(
-                ManifestError::ManifestLoadError(err),
-            ));
-        }
-    };
-    inner.manifest.store(manifest);
+    let manifest =
+        match ManifestSnapshot::load(Some(Arc::clone(&current)), storage.clone(), None).await {
+            Ok(manifest) => manifest,
+            Err(ManifestLoadError::PointerNotFound) => return Ok(()),
+            Err(ManifestLoadError::AlreadyLoaded) => return Ok(()),
+            Err(err) => {
+                return Err(SupertableCommitError::ManifestError(
+                    ManifestError::ManifestLoadError(err),
+                ));
+            }
+        };
+    inner.install_manifest(&current, manifest);
     inner.reconcile_tombstone_seqs();
     Ok(())
 }

@@ -5,6 +5,7 @@
 //! sitting there, the per-URI path helpers, and drop a superfile's local copy.
 
 use std::{
+    collections::HashSet,
     fs,
     os::unix::fs::MetadataExt,
     path::Path,
@@ -296,9 +297,11 @@ impl DiskCacheStore {
         }
         self.block_files.insert(
             *uri,
-            UnindexedFile {
+            BlockFileRecord {
                 size_bytes: filled,
-                mtime_us: file_mtime_us(&meta),
+                read: BlockFileRead::NotSinceStart {
+                    mtime_us: file_mtime_us(&meta),
+                },
             },
         );
         tracing::info!(target: "infino::cache", uri = %uri.0, filled, "cache build: adopted .blocks on scan");
@@ -443,16 +446,16 @@ impl DiskCacheStore {
         &self,
         uri: &SuperfileUri,
         source: &BlockCachedSource,
-        now_us: u64,
+        last_read_us: u64,
     ) {
         let filled = source.filled_bytes_handle().load(Ordering::Acquire);
         if filled == 0 || !source.path_names_its_file() {
             return;
         }
         self.current_bytes.fetch_add(filled, Ordering::Release);
-        let file = UnindexedFile {
+        let file = BlockFileRecord {
             size_bytes: filled,
-            mtime_us: now_us,
+            read: BlockFileRead::At { us: last_read_us },
         };
         if let Some(prior) = self.block_files.insert(*uri, file) {
             self.current_bytes
@@ -520,6 +523,8 @@ impl DiskCacheStore {
             .cached
             .get(uri)
             .is_some_and(|entry| entry.block_source().is_some());
+        // Ranked as read now, as the open that adopted the file just asked for it: the source was
+        // dropped before any read, so it has no read time of its own.
         if !lazy_entry_owns_path {
             self.retain_block_file(uri, source, self.now_us());
         }
@@ -541,6 +546,60 @@ impl DiskCacheStore {
         self.release_scanned_block_file(uri);
         self.current_bytes.fetch_add(bytes, Ordering::Release);
         self.trim_cold_to_budget();
+    }
+
+    /// Mark `uris` dead: the table's newest manifest no longer lists them, so no new query will read
+    /// them. Nothing is deleted, since a query on an older snapshot may still read them. Eviction
+    /// takes a dead file first among files of its kind (never-opened copies, block files found at
+    /// startup, then entries and the block files of dropped ones) unless a query still holds it,
+    /// and a dead file's background download is cancelled, since its whole copy would never be
+    /// read. GC in this process erases the files when it deletes them from storage; where GC runs
+    /// in another process, this is what moves them to the front of eviction instead of leaving them
+    /// to age out.
+    pub(crate) fn mark_dead(&self, uris: &[SuperfileUri]) {
+        for uri in uris {
+            // Under the entry's lock, as every cancel is, so a download landing now either lands
+            // first or sees the cancel.
+            let slot = self.cached.entry(*uri);
+            if let Some((_, fill)) = self.fills.remove(uri) {
+                fill.cancelled.store(true, Ordering::Release);
+            }
+            drop(slot);
+        }
+        let held: Vec<SuperfileUri> = uris
+            .iter()
+            .copied()
+            .filter(|uri| self.holds_file(uri))
+            .collect();
+        if held.is_empty() {
+            return;
+        }
+        self.n_dead_marked
+            .fetch_add(held.len() as u64, Ordering::Relaxed);
+        // Rebuilt rather than changed in place, so an eviction pass that took the old set keeps
+        // reading it. Files the cache no longer holds are forgotten, so the set stays as small as
+        // what is on disk.
+        let mut dead = self.dead.lock().expect("dead-file set poisoned");
+        let mut next: HashSet<SuperfileUri> = dead
+            .iter()
+            .copied()
+            .filter(|uri| self.holds_file(uri))
+            .collect();
+        next.extend(held);
+        *dead = Arc::new(next);
+    }
+
+    /// The dead files ([`Self::mark_dead`]), shared so the caller holds no lock while it walks the
+    /// cache's maps.
+    pub(crate) fn dead_files(&self) -> Arc<HashSet<SuperfileUri>> {
+        Arc::clone(&self.dead.lock().expect("dead-file set poisoned"))
+    }
+
+    /// Whether any form of `uri` is on disk here: an entry, a block file, or a never-opened copy.
+    fn holds_file(&self, uri: &SuperfileUri) -> bool {
+        self.cached.contains_key(uri)
+            || self.block_files.contains_key(uri)
+            || self.unindexed.contains_key(uri)
     }
 
     /// Erase every local trace of a superfile: its in-memory index entry, the promoted file, the

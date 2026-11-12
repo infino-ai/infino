@@ -218,9 +218,8 @@ impl Debug for DiskCacheConfig {
 pub struct EvictionCandidate {
     pub uri: SuperfileUri,
     pub size_bytes: u64,
-    /// Microseconds-since-construction at which this entry
-    /// was last accessed. Monotonic per `DiskCacheStore`
-    /// instance.
+    /// When the file was last read, in microseconds on the store's clock (its last open, for a
+    /// whole-file copy read straight from its mmap); 0 for a dead file no query holds.
     pub last_access_us: u64,
 }
 

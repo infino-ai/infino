@@ -13,7 +13,7 @@ use std::{
     path::PathBuf,
     process,
     sync::{
-        Arc, OnceLock,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     thread,
@@ -183,6 +183,8 @@ pub(crate) struct CachedEntry {
     size_bytes: Arc<AtomicU64>,
     /// Who releases `size_bytes` when the entry drops.
     accounting: EntryAccounting,
+    /// When the entry was last opened, on the store's clock ([`DiskCacheStore::now_us`]). Reads of
+    /// a block source between opens are stamped on the source; [`Self::last_read_us`] takes both.
     last_access_us: AtomicU64,
 }
 
@@ -332,6 +334,15 @@ impl CachedEntry {
         )
     }
 
+    /// When the entry was last read, for eviction: its last open or its block source's last read,
+    /// whichever is later. A whole-file copy is read straight from its mmap, so for one without a
+    /// block source this is its last open.
+    fn last_read_us(&self) -> u64 {
+        let opened = self.last_access_us.load(Ordering::Acquire);
+        self.block_source()
+            .map_or(opened, |source| opened.max(source.last_read_us()))
+    }
+
     /// The live block source: a [`Residency::Paged`] entry's source, or the retained vector hole of
     /// a [`Residency::Mapped`] entry.
     fn block_source(&self) -> Option<&Arc<BlockCachedSource>> {
@@ -370,6 +381,94 @@ enum EntryAccounting {
 /// One in-flight walk for a URI: concurrent readers share the `OnceCell` and its result.
 type Coordinator = Arc<OnceCell<Result<Arc<CachedEntry>, DiskCacheError>>>;
 
+/// Why the cache fetched bytes from object storage and did not keep them; see [`UnkeptBytes`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Unkept {
+    /// See [`UnkeptBytes::write_queue_full`].
+    WriteQueueFull,
+    /// See [`UnkeptBytes::run_taken`].
+    RunTaken,
+    /// See [`UnkeptBytes::no_room`].
+    NoRoom,
+    /// See [`UnkeptBytes::full_text_section`].
+    FullTextSection,
+    /// See [`UnkeptBytes::passthrough`].
+    Passthrough,
+    /// See [`UnkeptBytes::uncached_reads`].
+    UncachedRead,
+}
+
+/// Bytes the cache fetched from object storage and did not keep, by cause, so a warm query that
+/// still fetched says why. Each GET counts once, under the cause that kept its bytes out; a read
+/// that fetched a run and then went around the cache for its bytes counts both GETs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UnkeptBytes {
+    /// A run fetched when the write queue was full ([`WRITE_BEHIND_CAP_BYTES`]). No room was
+    /// made for it, so it evicted nothing.
+    pub write_queue_full: u64,
+    /// A run fetched when another run starting at the same block was already in memory, waiting
+    /// for its write: a prefetch's or a hedge's copy of blocks a read is fetching.
+    pub run_taken: u64,
+    /// A run fetched when eviction could free nothing for it.
+    pub no_room: u64,
+    /// A read in the full-text section, which reads do not fill.
+    pub full_text_section: u64,
+    /// A read sent around the block cache: the source was no longer the live one, the GET came
+    /// back short, or a local read failed.
+    pub passthrough: u64,
+    /// A read whose caller asked not to cache it, missing the cache. Counted apart, since it is
+    /// not the cache failing to keep what it was asked to.
+    pub uncached_reads: u64,
+}
+
+impl UnkeptBytes {
+    /// Every cause together.
+    pub fn total(&self) -> u64 {
+        self.write_queue_full
+            + self.run_taken
+            + self.no_room
+            + self.full_text_section
+            + self.passthrough
+            + self.uncached_reads
+    }
+}
+
+/// The live counters behind [`UnkeptBytes`], one per [`Unkept`] cause.
+#[derive(Default)]
+struct UnkeptCounters {
+    write_queue_full: AtomicU64,
+    run_taken: AtomicU64,
+    no_room: AtomicU64,
+    full_text_section: AtomicU64,
+    passthrough: AtomicU64,
+    uncached_reads: AtomicU64,
+}
+
+impl UnkeptCounters {
+    fn counter(&self, why: Unkept) -> &AtomicU64 {
+        match why {
+            Unkept::WriteQueueFull => &self.write_queue_full,
+            Unkept::RunTaken => &self.run_taken,
+            Unkept::NoRoom => &self.no_room,
+            Unkept::FullTextSection => &self.full_text_section,
+            Unkept::Passthrough => &self.passthrough,
+            Unkept::UncachedRead => &self.uncached_reads,
+        }
+    }
+
+    fn snapshot(&self) -> UnkeptBytes {
+        let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+        UnkeptBytes {
+            write_queue_full: load(&self.write_queue_full),
+            run_taken: load(&self.run_taken),
+            no_room: load(&self.no_room),
+            full_text_section: load(&self.full_text_section),
+            passthrough: load(&self.passthrough),
+            uncached_reads: load(&self.uncached_reads),
+        }
+    }
+}
+
 /// Snapshot of the disk cache's load. Surfaced via
 /// [`DiskCacheStore::stats`] for the supertable's
 /// observability hook and for tests that need to assert on
@@ -389,9 +488,39 @@ pub struct CacheStats {
     pub n_madvise_calls: u64,
     /// Total count of entries dropped because GC deleted from objectstore.
     pub n_gc_drops: u64,
+    /// Bytes fetched from object storage and not kept, by cause.
+    pub unkept_bytes: UnkeptBytes,
+    /// Reads that waited on another read's GET past its stuck time and sent their own.
+    pub n_hedges: u64,
+    /// The bytes those reads' own GETs asked for.
+    pub hedged_bytes: u64,
+    /// Files on disk here marked dead because a newer manifest no longer lists them; see
+    /// [`DiskCacheStore::mark_dead`].
+    pub n_dead_marked: u64,
 }
 
-/// A cache file found on disk at open but not opened yet. Its bytes already count against the budget.
+/// A block file on disk with no live entry, kept so a later open adopts its blocks. Its bytes count
+/// against the budget.
+#[derive(Debug, Clone, Copy)]
+struct BlockFileRecord {
+    size_bytes: u64,
+    read: BlockFileRead,
+}
+
+/// When a [`BlockFileRecord`]'s file was last read, which sets its place in eviction.
+#[derive(Debug, Clone, Copy)]
+enum BlockFileRead {
+    /// Found on disk at startup and not read since. Evicted after the never-opened whole copies and
+    /// before any entry, oldest mtime first: mtime is on the wall clock, which the store's own
+    /// clock cannot be compared to.
+    NotSinceStart { mtime_us: u64 },
+    /// Read in this process, at this time on the store's clock. Evicted beside live entries, least
+    /// recently read first.
+    At { us: u64 },
+}
+
+/// A whole-file copy on disk that no read has opened: found by the startup scan, or landed by a
+/// background download with no entry to install. Its bytes already count against the budget.
 #[derive(Debug, Clone, Copy)]
 struct UnindexedFile {
     size_bytes: u64,
@@ -412,9 +541,17 @@ pub struct DiskCacheStore {
     /// One in-flight walk per URI (tiers 2 to 4). The first caller to miss creates the cell and
     /// runs the walk; later callers await it. Removed once the walk settles.
     coordinators: DashMap<SuperfileUri, Coordinator>,
-    /// Files on disk that no read has opened yet. Filled by `scan_cache_root`, drained by reuse or eviction.
+    /// Whole-file copies on disk that no read has opened yet: found by `scan_cache_root`, or left
+    /// by a background download that landed with no entry to install. Drained by reuse or eviction.
     unindexed: DashMap<SuperfileUri, UnindexedFile>,
-    block_files: DashMap<SuperfileUri, UnindexedFile>,
+    /// Block files on disk that no live entry holds: found at startup, or left by a dropped lazy
+    /// entry for a later open to adopt. Evicted in [`BlockFileRead`] order.
+    block_files: DashMap<SuperfileUri, BlockFileRecord>,
+    /// Files on disk here that the table's newest manifest no longer lists ([`Self::mark_dead`]).
+    /// Kept by URI, so a file stays dead whatever form it takes next (entry, block file, copy).
+    /// Never locked while a guard of one of the maps above is held, so it takes no part in a lock
+    /// cycle with them.
+    dead: Mutex<Arc<HashSet<SuperfileUri>>>,
     current_bytes: AtomicU64,
     /// Bytes of fetched runs handed to the block-file writers and not written yet. Past
     /// [`WRITE_BEHIND_CAP_BYTES`] a read's run is not cached, so a slow disk limits memory, not
@@ -454,6 +591,12 @@ pub struct DiskCacheStore {
     n_evictions: AtomicU64,
     n_gc_drops: AtomicU64,
     n_madvise_calls: AtomicU64,
+    /// See [`CacheStats::unkept_bytes`].
+    unkept_bytes: UnkeptCounters,
+    n_hedges: AtomicU64,
+    hedged_bytes: AtomicU64,
+    /// See [`CacheStats::n_dead_marked`].
+    n_dead_marked: AtomicU64,
     /// Number of callers explicitly waiting for lazy background
     /// promotion. A waiter means promotion is now latency-critical,
     /// so the background task may start even if a lazy reader Arc is
@@ -470,7 +613,7 @@ pub struct DiskCacheStore {
     /// clone the current `Arc<dyn Fn>` out from under the
     /// mutex and invoke it lock-free, so the mutex is held
     /// only for the Arc bump.
-    pinned_fn: std::sync::Mutex<Arc<dyn Fn() -> HashSet<SuperfileUri> + Send + Sync>>,
+    pinned_fn: Mutex<Arc<dyn Fn() -> HashSet<SuperfileUri> + Send + Sync>>,
     /// Global cap on concurrent background full-superfile fills.
     prefetch_semaphore: Arc<Semaphore>,
     /// Background fills waiting for a query to let go of their file.
@@ -558,6 +701,7 @@ impl DiskCacheStore {
             coordinators: DashMap::new(),
             unindexed: DashMap::new(),
             block_files: DashMap::new(),
+            dead: Mutex::new(Arc::default()),
             current_bytes: AtomicU64::new(0),
             write_behind_bytes: AtomicU64::new(0),
             ahead_bytes: AtomicU64::new(0),
@@ -575,8 +719,12 @@ impl DiskCacheStore {
             n_evictions: AtomicU64::new(0),
             n_gc_drops: AtomicU64::new(0),
             n_madvise_calls: AtomicU64::new(0),
+            unkept_bytes: UnkeptCounters::default(),
+            n_hedges: AtomicU64::new(0),
+            hedged_bytes: AtomicU64::new(0),
+            n_dead_marked: AtomicU64::new(0),
             n_promotion_waiters: AtomicU64::new(0),
-            pinned_fn: std::sync::Mutex::new(pinned_fn),
+            pinned_fn: Mutex::new(pinned_fn),
             prefetch_semaphore,
             fill_waiters: FillWaiters::default(),
             fills: DashMap::new(),
@@ -653,7 +801,24 @@ impl DiskCacheStore {
             n_evictions: self.n_evictions.load(Ordering::Acquire),
             n_madvise_calls: self.n_madvise_calls.load(Ordering::Acquire),
             n_gc_drops: self.n_gc_drops.load(Ordering::Acquire),
+            unkept_bytes: self.unkept_bytes.snapshot(),
+            n_hedges: self.n_hedges.load(Ordering::Acquire),
+            hedged_bytes: self.hedged_bytes.load(Ordering::Acquire),
+            n_dead_marked: self.n_dead_marked.load(Ordering::Acquire),
         }
+    }
+
+    /// Count `bytes` fetched and not kept, for `why`.
+    pub(crate) fn count_unkept(&self, why: Unkept, bytes: u64) {
+        self.unkept_bytes
+            .counter(why)
+            .fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Count a read that sent its own GET of `bytes` after waiting on another read's.
+    pub(crate) fn count_hedge(&self, bytes: u64) {
+        self.n_hedges.fetch_add(1, Ordering::Relaxed);
+        self.hedged_bytes.fetch_add(bytes, Ordering::Relaxed);
     }
 
     /// Current disk budget in bytes — the live value, not the
@@ -732,6 +897,12 @@ impl DiskCacheStore {
 
     pub(crate) fn now_us(&self) -> u64 {
         self.started_at.elapsed().as_micros() as u64
+    }
+
+    /// The instant [`Self::now_us`] counts from, so a block source can stamp reads on the same
+    /// clock without reaching the store on every read.
+    pub(crate) fn clock_start(&self) -> Instant {
+        self.started_at
     }
 
     /// Build a per-URI cache file path under `cache_root`.

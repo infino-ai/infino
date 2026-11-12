@@ -7,6 +7,7 @@
 #[cfg(test)]
 use std::time::Duration;
 use std::{
+    collections::HashSet,
     fs, mem,
     sync::{Arc, atomic::Ordering},
 };
@@ -47,6 +48,10 @@ impl Drop for AheadRoom {
             .fetch_sub(self.bytes, Ordering::AcqRel);
     }
 }
+
+/// The read time a dead file ranks at in eviction ([`DiskCacheStore::mark_dead`]): the store's
+/// start, before anything read since.
+const DEAD_RANK_US: u64 = 0;
 
 impl DiskCacheStore {
     /// Whether dropping `uri`'s `entry` would actually release memory: it must be a
@@ -157,13 +162,12 @@ impl DiskCacheStore {
             .iter()
             .filter(|e| {
                 self.reclaimable_lazy_entry(e.key(), e.value())
-                    && now_us.saturating_sub(e.value().last_access_us.load(Ordering::Acquire))
-                        >= threshold_us
+                    && now_us.saturating_sub(e.value().last_read_us()) >= threshold_us
             })
             .map(|e| *e.key())
             .collect();
         for uri in idle {
-            self.release_lazy_entry(&uri, now_us);
+            self.release_lazy_entry(&uri);
         }
     }
 
@@ -192,21 +196,20 @@ impl DiskCacheStore {
             .cached
             .iter()
             .filter(|e| self.reclaimable_lazy_entry(e.key(), e.value()))
-            .map(|e| (e.value().last_access_us.load(Ordering::Acquire), *e.key()))
+            .map(|e| (e.value().last_read_us(), *e.key()))
             .collect();
         let Some(over) = unheld.len().checked_sub(cap) else {
             return;
         };
         unheld.sort_unstable();
-        let now_us = self.now_us();
         for (_, uri) in unheld.into_iter().take(over) {
-            self.release_lazy_entry(&uri, now_us);
+            self.release_lazy_entry(&uri);
         }
     }
 
     /// Remove `uri`'s entry if it is still a lazy one only the cache holds,
     /// releasing its budget and keeping its block file.
-    fn release_lazy_entry(&self, uri: &SuperfileUri, now_us: u64) {
+    fn release_lazy_entry(&self, uri: &SuperfileUri) {
         // Re-check under the shard guard: a query may have taken a
         // reference since the snapshot, in which case dropping the
         // entry would free nothing and cost that query a re-open.
@@ -216,7 +219,7 @@ impl DiskCacheStore {
         {
             self.release_entry_accounting(&removed);
             if let Some(source) = removed.block_source() {
-                self.retain_block_file(uri, source, now_us);
+                self.retain_block_file(uri, source, removed.last_read_us());
             }
         }
     }
@@ -298,8 +301,8 @@ impl DiskCacheStore {
         n_advised
     }
 
-    /// Evict never-opened files (whole-file copies, then retained block files) to
-    /// bring `current_bytes` back under budget. Only cold candidates are freed;
+    /// Evict files no entry holds (never-opened whole copies, then block files, each
+    /// oldest first) to bring `current_bytes` back under budget. Only cold candidates are freed;
     /// live cached entries are left to the async reservation path. Runs on paths
     /// that add already-on-disk bytes without a reservation (restart scan, block
     /// adoption), so a read-only reopen still self-corrects to budget.
@@ -316,8 +319,9 @@ impl DiskCacheStore {
         }
     }
 
-    /// Delete never-opened files, oldest first, until `bytes_needed` is freed. Returns the bytes
-    /// freed. These go before live entries: nothing holds them, so deleting one is safe and cheap.
+    /// Delete never-opened whole copies, dead ones first, then oldest first, until `bytes_needed` is
+    /// freed. Returns the bytes freed. These go before live entries: nothing holds them, so deleting
+    /// one is safe and cheap.
     pub(crate) fn evict_unindexed(&self, bytes_needed: u64, keep: Option<&SuperfileUri>) -> u64 {
         // Usually empty after warmup; skip the snapshot allocation.
         if self.unindexed.is_empty() {
@@ -331,7 +335,8 @@ impl DiskCacheStore {
             .map(|e| (*e.key(), e.value().size_bytes, e.value().mtime_us))
             .collect();
 
-        candidates.sort_by_key(|(_, _, mtime_us)| *mtime_us);
+        let dead = self.dead_files();
+        candidates.sort_by_key(|(uri, _, mtime_us)| (!dead.contains(uri), *mtime_us));
 
         let mut freed: u64 = 0;
         for (uri, size, _) in candidates {
@@ -354,37 +359,72 @@ impl DiskCacheStore {
         freed
     }
 
+    /// Delete block files no entry holds until `bytes_needed` is freed: dead ones first, then those
+    /// not read since startup, oldest mtime first, then those read in this process, least recently
+    /// read first. Returns the bytes freed.
     pub(crate) fn evict_block_files(&self, bytes_needed: u64, keep: Option<&SuperfileUri>) -> u64 {
+        self.evict_block_files_where(bytes_needed, keep, |_| true)
+    }
+
+    /// [`Self::evict_block_files`] over the block files not read since startup only.
+    fn evict_unread_block_files(&self, bytes_needed: u64, keep: Option<&SuperfileUri>) -> u64 {
+        self.evict_block_files_where(bytes_needed, keep, |read| {
+            matches!(read, BlockFileRead::NotSinceStart { .. })
+        })
+    }
+
+    fn evict_block_files_where(
+        &self,
+        bytes_needed: u64,
+        keep: Option<&SuperfileUri>,
+        eligible: impl Fn(&BlockFileRead) -> bool,
+    ) -> u64 {
         if self.block_files.is_empty() {
             return 0;
         }
 
-        let mut candidates: Vec<(SuperfileUri, u64, u64)> = self
+        let mut candidates: Vec<(SuperfileUri, BlockFileRead)> = self
             .block_files
             .iter()
-            .filter(|e| Some(e.key()) != keep)
-            .map(|e| (*e.key(), e.value().size_bytes, e.value().mtime_us))
+            .filter(|e| Some(e.key()) != keep && eligible(&e.value().read))
+            .map(|e| (*e.key(), e.value().read))
             .collect();
 
-        candidates.sort_by_key(|(_, _, mtime_us)| *mtime_us);
+        // Dead files first; then files not read since startup before those read since, each
+        // oldest first. mtimes and store-clock times are never compared with each other.
+        let dead = self.dead_files();
+        candidates.sort_by_key(|(uri, read)| {
+            let (read_since_start, at) = match *read {
+                BlockFileRead::NotSinceStart { mtime_us } => (false, mtime_us),
+                BlockFileRead::At { us } => (true, us),
+            };
+            (!dead.contains(uri), read_since_start, at)
+        });
 
         let mut freed: u64 = 0;
-        for (uri, size, _) in candidates {
+        for (uri, _) in candidates {
             if freed >= bytes_needed {
                 break;
             }
-
-            if self.block_files.remove(&uri).is_some() {
-                tracing::info!(target: "infino::cache", uri = %uri.0, size, "evict: .blocks (budget)");
-                let _ = fs::remove_file(self.blocks_path(&uri));
-                let _ = fs::remove_file(self.blocks_idx_path(&uri));
-                self.current_bytes.fetch_sub(size, Ordering::Release);
-                self.n_evictions.fetch_add(1, Ordering::AcqRel);
-                freed += size;
-            }
+            freed += self.evict_block_file(&uri);
         }
 
         freed
+    }
+
+    /// Delete `uri`'s block file record and files, returning the bytes freed, or 0 if another
+    /// eviction took it first: only the winner of the remove deletes and subtracts.
+    fn evict_block_file(&self, uri: &SuperfileUri) -> u64 {
+        let Some((_, file)) = self.block_files.remove(uri) else {
+            return 0;
+        };
+        let size = file.size_bytes;
+        tracing::info!(target: "infino::cache", uri = %uri.0, size, "evict: .blocks (budget)");
+        let _ = fs::remove_file(self.blocks_path(uri));
+        let _ = fs::remove_file(self.blocks_idx_path(uri));
+        self.current_bytes.fetch_sub(size, Ordering::Release);
+        self.n_evictions.fetch_add(1, Ordering::AcqRel);
+        size
     }
 
     /// Reserve `bytes`, evicting as needed, with no guard: the bytes stay reserved until the caller
@@ -604,12 +644,13 @@ impl DiskCacheStore {
         bytes_needed: u64,
         keep: Option<&SuperfileUri>,
     ) -> Result<(), DiskCacheError> {
-        // Never-opened files go first; freeing one cannot hurt a live reader.
+        // Files no read has opened go first (whole copies, then block files found at startup and not
+        // read since): nothing holds them, so freeing one cannot hurt a live reader.
         let freed = self.evict_unindexed(bytes_needed, keep);
         if freed >= bytes_needed {
             return Ok(());
         }
-        let freed = freed + self.evict_block_files(bytes_needed - freed, keep);
+        let freed = freed + self.evict_unread_block_files(bytes_needed - freed, keep);
         if freed >= bytes_needed {
             return Ok(());
         }
@@ -627,15 +668,62 @@ impl DiskCacheStore {
         };
         let mut pinned = pinned_fn();
         pinned.extend(keep.copied());
-        let candidates: Vec<EvictionCandidate> = self
+        // Live entries and the block files of entries dropped since compete by last read: a block
+        // file read a minute ago outlives an entry opened an hour ago and not read since. A dead
+        // file ranks first, unless a query on an older snapshot still holds it.
+        let live: Vec<(EvictionCandidate, bool)> = self
             .cached
             .iter()
-            .map(|e| EvictionCandidate {
-                uri: *e.key(),
-                size_bytes: e.value().size_bytes.load(Ordering::Acquire),
-                last_access_us: e.value().last_access_us.load(Ordering::Acquire),
+            .map(|e| {
+                let candidate = EvictionCandidate {
+                    uri: *e.key(),
+                    size_bytes: e.value().size_bytes.load(Ordering::Acquire),
+                    last_access_us: e.value().last_read_us(),
+                };
+                (candidate, e.value().held_by_query())
             })
             .collect();
+        // Copied out before `cached` is asked about them: waiting on a `cached` shard while holding
+        // a `block_files` one would invert the order `land_on_disk` takes the two in, a deadlock.
+        let records: Vec<(SuperfileUri, BlockFileRecord)> = self
+            .block_files
+            .iter()
+            .map(|e| (*e.key(), *e.value()))
+            .collect();
+        let dead = self.dead_files();
+        let rank = |candidate: EvictionCandidate, held: bool| EvictionCandidate {
+            last_access_us: if !held && dead.contains(&candidate.uri) {
+                DEAD_RANK_US
+            } else {
+                candidate.last_access_us
+            },
+            ..candidate
+        };
+        let mut candidates: Vec<EvictionCandidate> = Vec::with_capacity(live.len() + records.len());
+        candidates.extend(
+            live.into_iter()
+                .map(|(candidate, held)| rank(candidate, held)),
+        );
+        let mut retained = HashSet::new();
+        for (uri, record) in records {
+            let BlockFileRead::At { us } = record.read else {
+                continue;
+            };
+            // A live block source owns its file. Beside a whole copy, the file serves no read, so
+            // it goes first.
+            let last_access_us = match self.cached.get(&uri).map(|e| e.block_source().is_some()) {
+                Some(true) => continue,
+                Some(false) => DEAD_RANK_US,
+                None => us,
+            };
+            retained.insert(uri);
+            let candidate = EvictionCandidate {
+                uri,
+                size_bytes: record.size_bytes,
+                last_access_us,
+            };
+            candidates.push(rank(candidate, false));
+        }
         let victims = self
             .config
             .eviction
@@ -649,6 +737,10 @@ impl DiskCacheStore {
             return Err(DiskCacheError::BudgetExceeded);
         }
         for uri in victims {
+            if retained.contains(&uri) {
+                self.evict_block_file(&uri);
+                continue;
+            }
             // Atomic gate against concurrent eviction: only
             // the caller that wins the removal runs
             // unlink + decrement. Without this gate, two
@@ -801,7 +893,12 @@ impl<'a> Drop for Reservation<'a> {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, time::Duration};
+    use std::{
+        sync::{Arc, atomic::Ordering},
+        time::Duration,
+    };
+
+    use tempfile::TempDir;
 
     use crate::{
         superfile::LazyByteSource,
@@ -814,6 +911,191 @@ mod tests {
             },
         },
     };
+
+    // ----- eviction order: last read, dead files -----
+
+    /// A store holding a whole file, `live`, opened at `opened_us`, and the block
+    /// file of a dropped entry, `retained`, last read at `read_us`, both of one
+    /// size. Returns the store, the two URIs and that size.
+    async fn live_and_retained(
+        opened_us: u64,
+        read_us: u64,
+    ) -> (
+        TempDir,
+        Arc<DiskCacheStore>,
+        SuperfileUri,
+        SuperfileUri,
+        u64,
+    ) {
+        let (dir, store) = test_store();
+        let live = SuperfileUri::new_v4();
+        store
+            .insert_warm(&live, tiny_superfile_bytes())
+            .await
+            .expect("warm");
+        store
+            .cached
+            .get(&live)
+            .expect("live entry")
+            .last_access_us
+            .store(opened_us, Ordering::Release);
+        let size = store.stats().current_bytes;
+        let retained = SuperfileUri::new_v4();
+        store.block_files.insert(
+            retained,
+            BlockFileRecord {
+                size_bytes: size,
+                read: BlockFileRead::At { us: read_us },
+            },
+        );
+        store.current_bytes.fetch_add(size, Ordering::Release);
+        (dir, store, live, retained, size)
+    }
+
+    /// Live entries and the block files of dropped entries are evicted together,
+    /// by last read: whichever was read longer ago goes first.
+    #[tokio::test]
+    async fn live_and_retained_files_are_evicted_by_last_read() {
+        let (_dir, store, live, retained, size) = live_and_retained(1, 2).await;
+        store.evict_at_least(size).await.expect("evict");
+        assert!(
+            !store.cached.contains_key(&live),
+            "the live file was read longer ago"
+        );
+        assert!(store.block_files.contains_key(&retained));
+
+        let (_dir, store, live, retained, size) = live_and_retained(2, 1).await;
+        store.evict_at_least(size).await.expect("evict");
+        assert!(store.cached.contains_key(&live));
+        assert!(
+            !store.block_files.contains_key(&retained),
+            "the retained file was read longer ago"
+        );
+    }
+
+    /// A file the newest manifest no longer lists is evicted before any file still
+    /// read, however recently it was read, and is kept until then, since a query on
+    /// an older snapshot may still read it.
+    #[tokio::test]
+    async fn a_dead_file_is_evicted_first_and_kept_until_then() {
+        let (_dir, store, live, retained, size) = live_and_retained(2, 1).await;
+        store.mark_dead(&[live, SuperfileUri::new_v4()]);
+        assert!(store.cached.contains_key(&live), "marking deletes nothing");
+        assert_eq!(
+            store.stats().n_dead_marked,
+            1,
+            "only files the cache holds are counted"
+        );
+
+        store.evict_at_least(size).await.expect("evict");
+        assert!(
+            !store.cached.contains_key(&live),
+            "the dead file goes first"
+        );
+        assert!(store.block_files.contains_key(&retained));
+    }
+
+    /// A dead file goes first in each form the cache keeps a file in, ahead of an older file
+    /// of the same form: a never-opened copy, a block file found at startup, and the block
+    /// file of a dropped entry, which then goes before a live entry read longer ago.
+    #[tokio::test]
+    async fn a_dead_file_goes_first_in_every_form() {
+        let (_dir, store) = test_store();
+        let (older, dead) = (SuperfileUri::new_v4(), SuperfileUri::new_v4());
+        for (uri, mtime_us) in [(older, 1), (dead, 2)] {
+            let file = UnindexedFile {
+                size_bytes: 1,
+                mtime_us,
+            };
+            store.unindexed.insert(uri, file);
+        }
+        store.current_bytes.fetch_add(2, Ordering::Release);
+        store.mark_dead(&[dead]);
+        assert_eq!(store.evict_unindexed(1, None), 1);
+        assert!(
+            store.unindexed.contains_key(&older),
+            "the older copy is kept"
+        );
+
+        let (older, dead) = (SuperfileUri::new_v4(), SuperfileUri::new_v4());
+        for (uri, mtime_us) in [(older, 1), (dead, 2)] {
+            let file = BlockFileRecord {
+                size_bytes: 1,
+                read: BlockFileRead::NotSinceStart { mtime_us },
+            };
+            store.block_files.insert(uri, file);
+        }
+        store.current_bytes.fetch_add(2, Ordering::Release);
+        store.mark_dead(&[dead]);
+        assert_eq!(store.evict_block_files(1, None), 1);
+        assert!(
+            store.block_files.contains_key(&older),
+            "the older block file is kept"
+        );
+
+        let (_dir, store, live, retained, size) = live_and_retained(1, 2).await;
+        store.mark_dead(&[retained]);
+        store.evict_at_least(size).await.expect("evict");
+        assert!(
+            store.cached.contains_key(&live),
+            "read longer ago, but not dead"
+        );
+        assert!(!store.block_files.contains_key(&retained));
+    }
+
+    /// A dead entry a query on an older snapshot still holds ranks by its last read, not
+    /// first: evicting it would send the rest of that query's reads to object storage.
+    #[tokio::test]
+    async fn a_dead_entry_a_query_holds_is_not_evicted_first() {
+        let (_dir, store, live, retained, size) = live_and_retained(2, 1).await;
+        let query = Arc::clone(&store.cached.get(&live).expect("entry").reader);
+        store.mark_dead(&[live]);
+        store.evict_at_least(size).await.expect("evict");
+        assert!(
+            store.cached.contains_key(&live),
+            "held, so ranked by its read"
+        );
+        assert!(!store.block_files.contains_key(&retained));
+        drop(query);
+    }
+
+    /// Marking a file dead cancels its background download, since its whole copy would never be
+    /// read, also when the download goes on without an entry.
+    #[tokio::test]
+    async fn marking_a_file_dead_cancels_its_download() {
+        let (_dir, store, live, _, _) = live_and_retained(1, 2).await;
+        let entryless = SuperfileUri::new_v4();
+        let fills: Vec<Arc<BackgroundFill>> = [live, entryless]
+            .map(|uri| {
+                let fill: Arc<BackgroundFill> = Arc::default();
+                store.fills.insert(uri, Arc::clone(&fill));
+                fill
+            })
+            .into();
+        store.mark_dead(&[live, entryless]);
+        assert!(fills.iter().all(|fill| fill.is_cancelled()));
+        assert!(store.fills.is_empty(), "unregistered");
+    }
+
+    /// A block file beside a whole copy of the same file serves no read, so it goes before any
+    /// entry, and evicting it leaves the whole copy in place.
+    #[tokio::test]
+    async fn a_block_file_beside_a_whole_copy_goes_first() {
+        let (_dir, store, live, retained, _) = live_and_retained(1, 2).await;
+        let shadowed = BlockFileRecord {
+            size_bytes: 1,
+            read: BlockFileRead::At { us: 3 },
+        };
+        store.block_files.insert(live, shadowed);
+        store.current_bytes.fetch_add(1, Ordering::Release);
+        store.evict_at_least(1).await.expect("evict");
+        assert!(
+            !store.block_files.contains_key(&live),
+            "the block file went"
+        );
+        assert!(store.cached.contains_key(&live), "the whole copy stays");
+        assert!(store.block_files.contains_key(&retained));
+    }
 
     #[tokio::test]
     async fn downloads_ahead_of_reads_get_half_the_unwritten_runs_cap() {
