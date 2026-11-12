@@ -1020,7 +1020,8 @@ mod tests {
     use crate::{
         superfile::{
             BytesLazyByteSource, LazyByteSource, SuperfileReader,
-            builder::{BuilderOptions, FtsConfig, SuperfileBuilder},
+            builder::{BuilderOptions, CarryScope, FtsConfig, SuperfileBuilder},
+            page_index::IndexColumns,
         },
         supertable::schema::{FieldId, with_field_id},
     };
@@ -1482,16 +1483,36 @@ mod tests {
         assert_ranges(&carried, &opts, "carried").await;
     }
 
+    /// A layout repair carries the body without decoding it, then reads the
+    /// range columns and `_id` back to rebuild the region. A scan may have
+    /// loaded the source's page index for other columns only, and the footer
+    /// fails a read of a column it holds no page index for, so the rebuild
+    /// must ask for its own columns.
     #[tokio::test]
-    async fn a_carried_body_finds_its_range_columns_by_id() {
-        // The table renamed `qty` to `quantity` and added a range-indexed
-        // `added` after the fixture was written. The carried body holds
-        // `qty` under its old name and no `added` at all: the rewrite indexes
-        // `qty` under its id and leaves `added` out, instead of failing.
+    async fn a_carry_reads_the_range_columns_a_scan_did_not_load() {
         let (opts, bytes) = fixture_superfile();
         let source = SuperfileReader::open(bytes).expect("open");
-        let id = |column: &str| opts.field_id_of_column(column).expect("field id");
-        let added_id = FieldId(id("title").0 + 1);
+        source
+            .parquet_metadata_with_page_index(&IndexColumns::named(&["title"]))
+            .await
+            .expect("a scan's load");
+        let mut carry = SuperfileBuilder::new(opts.clone()).expect("carry builder");
+        carry
+            .carry_fts_from_reader_scoped(&source, None, CarryScope::AllColumns)
+            .expect("carry the FTS blob");
+        carry.set_carried_doc_count(source.n_docs());
+        let mut out = Vec::new();
+        carry
+            .finish_carrying_body_to(&source, &mut out)
+            .expect("carry");
+        let carried = SuperfileReader::open(Bytes::from(out)).expect("open carried");
+        assert_ranges(&carried, &opts, "carried after a scan's load").await;
+    }
+
+    /// The fixture's table after it renamed `qty` to `quantity` and added a
+    /// range-indexed `added` (id `added_id`): what a rewrite of a file the
+    /// fixture wrote is built with.
+    fn renamed_table(opts: &BuilderOptions, added_id: FieldId) -> BuilderOptions {
         let mut fields: Vec<Field> = opts
             .schema
             .fields()
@@ -1505,13 +1526,26 @@ mod tests {
             &Field::new("added", DataType::Int64, true),
             added_id,
         ));
-        let table = BuilderOptions::new(
+        BuilderOptions::new(
             Arc::new(Schema::new(fields)),
             "_id",
             vec![FtsConfig::new("title")],
             vec![],
         )
-        .with_range_columns(vec!["price".into(), "quantity".into(), "added".into()]);
+        .with_range_columns(vec!["price".into(), "quantity".into(), "added".into()])
+    }
+
+    #[tokio::test]
+    async fn a_carried_body_finds_its_range_columns_by_id() {
+        // The table renamed `qty` to `quantity` and added a range-indexed
+        // `added` after the fixture was written. The carried body holds
+        // `qty` under its old name and no `added` at all: the rewrite indexes
+        // `qty` under its id and leaves `added` out, instead of failing.
+        let (opts, bytes) = fixture_superfile();
+        let source = SuperfileReader::open(bytes).expect("open");
+        let id = |column: &str| opts.field_id_of_column(column).expect("field id");
+        let added_id = FieldId(id("title").0 + 1);
+        let table = renamed_table(&opts, added_id);
 
         let mut carry = SuperfileBuilder::new(table).expect("carry builder");
         carry.reanalyze_fts_from_reader(&source).expect("reanalyze");
@@ -1527,6 +1561,38 @@ mod tests {
             .await
             .expect("rows");
         assert!(added.is_none(), "a column the body lacks is not indexed");
+    }
+
+    /// The same rename, after a scan loaded the source's page index for
+    /// another column, carried without decoding the body: the region rebuild
+    /// reads `qty` through the footer, so it must ask for it by id, since its
+    /// table name is now `quantity`.
+    #[tokio::test]
+    async fn a_carry_reads_a_renamed_range_column_by_id_after_a_scan_load() {
+        let (opts, bytes) = fixture_superfile();
+        let source = SuperfileReader::open(bytes).expect("open");
+        source
+            .parquet_metadata_with_page_index(&IndexColumns::named(&["title"]))
+            .await
+            .expect("a scan's load");
+        let id = |column: &str| opts.field_id_of_column(column).expect("field id");
+        let table = renamed_table(&opts, FieldId(id("title").0 + 1));
+        let mut carry = SuperfileBuilder::new(table).expect("carry builder");
+        carry
+            .carry_fts_from_reader_scoped(&source, None, CarryScope::AllColumns)
+            .expect("carry the FTS blob");
+        carry.set_carried_doc_count(source.n_docs());
+        let mut out = Vec::new();
+        carry
+            .finish_carrying_body_to(&source, &mut out)
+            .expect("carry");
+        let carried = SuperfileReader::open(Bytes::from(out)).expect("open carried");
+        assert_ranges(
+            &carried,
+            &opts,
+            "carried under the new schema after a scan's load",
+        )
+        .await;
     }
 
     #[tokio::test]

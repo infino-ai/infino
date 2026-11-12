@@ -86,6 +86,7 @@ use crate::{
     superfile::{
         ReadError, SuperfileReader,
         lazy_source::Source,
+        page_index::{IndexColumns, is_loaded},
         reader::{
             WHOLE_COLUMN_TAKE_DIVISOR, in_projection_order, rank_back_indices,
             row_selection_for_ids, view_read_options, whole_row_group,
@@ -1723,7 +1724,9 @@ pub(crate) async fn read_file_row_group(
 
 /// [`SuperfileReader::read_row_group`] for a lazily opened superfile,
 /// streamed through its byte source so the disk cache's block layer serves
-/// repeated reads. Reading whole row groups needs no page index.
+/// repeated reads. Reading whole row groups needs no page index, but once
+/// the reader has loaded one for other columns, these columns must be in it:
+/// the footer fails a read of a column whose page index it does not hold.
 async fn read_row_group_byte_source(
     reader: &SuperfileReader,
     row_group: usize,
@@ -1732,7 +1735,9 @@ async fn read_row_group_byte_source(
 ) -> DfResult<RecordBatch> {
     let input = ByteSourceAsyncReader {
         source: Source::Lazy(reader.byte_source()),
-        metadata: reader.parquet_metadata(),
+        metadata: reader
+            .parquet_metadata_to_read_named(names)
+            .map_err(QueryError::from)?,
         prefetched: Vec::new(),
     };
     let options = if views.is_empty() {
@@ -1936,6 +1941,7 @@ fn hit_pages(
         .offset_index()
         .and_then(|oi| oi.get(index))
         .and_then(|cols| cols.get(c))
+        .filter(|oi| is_loaded(oi))
         .map(|oi| oi.page_locations())
         .filter(|pages| !pages.is_empty());
     let Some(pages) = pages else {
@@ -2064,10 +2070,13 @@ pub(crate) async fn take_rows_byte_source(
             }
         }
     }
-    let metadata = reader
-        .parquet_metadata_with_page_index()
-        .await
-        .map_err(QueryError::from)?;
+    let metadata = match reader.loaded_parquet_metadata_named(names) {
+        Some(metadata) => metadata,
+        None => reader
+            .parquet_metadata_with_page_index(&IndexColumns::named(names))
+            .await
+            .map_err(QueryError::from)?,
+    };
     let source = Source::Lazy(reader.byte_source());
     // Fetch the take's column chunks at once rather than letting the decode
     // fetch them a row group at a time: a hit set spread over hundreds of
@@ -3577,7 +3586,7 @@ mod tests {
         let source: Arc<dyn LazyByteSource> = Arc::new(RecordingSource::new(bytes));
         let reader = SuperfileReader::open_lazy(source).await.expect("open lazy");
         let metadata = reader
-            .parquet_metadata_with_page_index()
+            .parquet_metadata_with_page_index(&IndexColumns::All)
             .await
             .expect("metadata");
         let root = reader.schema().index_of("title").expect("title");
@@ -3626,7 +3635,7 @@ mod tests {
             .await
             .expect("open lazy");
         let metadata = reader
-            .parquet_metadata_with_page_index()
+            .parquet_metadata_with_page_index(&IndexColumns::All)
             .await
             .expect("metadata");
         let root = reader.schema().index_of("title").expect("title");

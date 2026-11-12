@@ -111,6 +111,12 @@ pub const FIELD_ID_META_KEY: &str = "PARQUET:field_id";
 pub struct FieldId(pub u32);
 
 impl FieldId {
+    /// This id as a Parquet schema field id: what the stored Parquet schema
+    /// carries for the column (`None` past `i32::MAX`, which no table mints).
+    pub(crate) fn parquet_id(self) -> Option<i32> {
+        i32::try_from(self.0).ok()
+    }
+
     /// The supertable-injected id column. Not a user column and never
     /// minted, so it is the one id outside `1..=last_field_id`. It is
     /// stamped on the id column's field so every stored column carries an

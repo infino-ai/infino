@@ -125,6 +125,7 @@ use crate::{
         },
         id_space::{FtsDocId, RowId},
         ids::{self, PackedIdEncoder, PackedIdOutput},
+        page_index::IndexColumns,
         range::{self, KeyKind, RangeColumnSpec},
         reader::{KeptRead, KeptRows, interleave_rows},
         stats::SuperfileStats,
@@ -4591,7 +4592,8 @@ impl SuperfileBuilder {
         // The footer the reader holds, decoded when it opened (with the page
         // index too if a scan has loaded it); decoding the bytes again would
         // buy nothing. Read once, so the keys and the row groups below come
-        // from the same parse.
+        // from the same parse. Only its keys and row groups are used here:
+        // pages are read through `parquet_metadata_to_read`.
         let source_footer = source.parquet_metadata();
         let src_kv = extract_kv_map(&source_footer).map_err(BuildError::Footer)?;
         // `None` only when the footer declares no such blob. A declared one
@@ -4669,8 +4671,28 @@ impl SuperfileBuilder {
         let fts_length = fts_file.as_file().metadata().map_err(BuildError::Io)?.len();
         // The range region is the table's to decide, not the source's: built
         // again from the carried rows, so a column range-indexed since the
-        // source was written gets its region here.
-        let range = range_region_of_body(body.clone(), source.parquet_metadata(), &self.opts)?;
+        // source was written gets its region here. It reads the range columns
+        // (found in the body by field id, so by id here too: the body may
+        // hold one under a name since renamed) and the id column, so it asks
+        // for their page index first: once a scan has loaded the page index
+        // for other columns, the footer fails a read of any column it holds
+        // no page index for.
+        let field_id = |name: &str| {
+            self.opts
+                .field_id_of_column(name)
+                .and_then(FieldId::parquet_id)
+        };
+        let read = IndexColumns::of(
+            self.opts
+                .range_columns
+                .iter()
+                .map(|name| (field_id(name), name.as_str()))
+                .chain([(None, self.opts.id_column.as_str())]),
+        );
+        let metadata = source
+            .parquet_metadata_to_read(&read)
+            .map_err(|e| BuildError::Io(Error::other(e)))?;
+        let range = range_region_of_body(body.clone(), metadata, &self.opts)?;
         splice_carried_body_to(
             Cursor::new(&body),
             body.len() as u64,
@@ -6107,6 +6129,7 @@ mod tests {
                 builder::RADIX_SORT_MIN_TRIPLES, reader::BoolMode, short::SHORT_MAX_DF,
                 sorted_merge::TERMS_PER_CHUNK,
             },
+            page_index::IndexColumns,
             vector::{
                 builder::build_merged_subsection_from_materialized,
                 cell_posting::EncodedCellRow,
@@ -8791,7 +8814,7 @@ mod tests {
         let passes = with_decode_window(window, || fts_merge(&inputs, None, group));
         let fresh_shape = page_index_shape(
             &fresh
-                .parquet_metadata_with_page_index()
+                .parquet_metadata_with_page_index(&IndexColumns::All)
                 .await
                 .expect("fresh page index"),
         );
@@ -8806,7 +8829,7 @@ mod tests {
             let merged = SuperfileReader::open(Bytes::from(bytes)).expect("open merged");
             let shape = page_index_shape(
                 &merged
-                    .parquet_metadata_with_page_index()
+                    .parquet_metadata_with_page_index(&IndexColumns::All)
                     .await
                     .expect("merged page index"),
             );
@@ -8855,11 +8878,11 @@ mod tests {
             "the merge reads no column index"
         );
         assert!(
-            reader.loaded_parquet_metadata_with_page_index().is_none(),
+            reader.parquet_metadata().offset_index().is_none(),
             "the merge's read is not the reader's"
         );
         let query = reader
-            .parquet_metadata_with_page_index()
+            .parquet_metadata_with_page_index(&IndexColumns::All)
             .await
             .expect("query page index");
         assert!(query.column_index().is_some(), "a query still prunes by it");
@@ -10530,7 +10553,7 @@ mod tests {
         let footer_only = SuperfileReader::open(bytes.clone()).expect("open source");
         let indexed = SuperfileReader::open(bytes).expect("open source");
         let loaded = indexed
-            .parquet_metadata_with_page_index()
+            .parquet_metadata_with_page_index(&IndexColumns::All)
             .await
             .expect("load the page index");
         assert!(
