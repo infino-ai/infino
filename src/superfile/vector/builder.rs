@@ -2170,6 +2170,27 @@ fn sample_fp32_rows(vectors: &[f32], sample_size: usize, dim: usize, seed: u64) 
 ///
 /// Nothing is fsynced: a caller that reopens the files after a crash syncs
 /// them itself.
+/// The most memory a [`build_cell_subsection_from_source`] over `n_docs`
+/// rows of `row_bytes` each holds at once, page cache included: its fp32
+/// training sample, a bucket writer and an Sq8 ruler per cluster, and the
+/// bytes it writes. Each row is written twice, to its cluster's bucket file
+/// and to the finished subsection, and written bytes sit in the page cache,
+/// charged to the process's memory, until they reach disk. A caller running
+/// many cell builds at once sizes them by this.
+pub(crate) fn cell_build_peak_bytes(
+    dim: usize,
+    requested_n_cent: usize,
+    n_docs: usize,
+    row_bytes: usize,
+) -> u64 {
+    let n_cent = effective_cell_n_cent(requested_n_cent, n_docs);
+    let sample_rows = partition_kmeans_sample_size(n_cent, n_docs).min(n_docs);
+    let sample = sample_rows * dim * size_of::<f32>();
+    let per_cluster = n_cent * (BUCKET_BUF_SIZE + 2 * dim * size_of::<f32>());
+    let written = 2 * n_docs * row_bytes;
+    (sample + per_cluster + written) as u64
+}
+
 pub(crate) fn build_cell_subsection_from_source(
     cfg: VectorConfig,
     requested_n_cent: usize,
@@ -3474,6 +3495,24 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[test]
+    fn a_cell_build_counts_its_sample_and_what_it_writes() {
+        // A drain cell of 2.8M rows at 768 dimensions, Sq16 spill rows: the
+        // writes (each row twice) dominate the training sample.
+        const ROWS: usize = 2_800_000;
+        const ROW_BYTES: usize = 1_661;
+        let peak = cell_build_peak_bytes(768, 2_200, ROWS, ROW_BYTES);
+        let written = (2 * ROWS * ROW_BYTES) as u64;
+        assert!(peak > written, "the writes alone are {written}, got {peak}");
+        assert!(
+            (10_000_000_000..12_500_000_000).contains(&peak),
+            "about 11 GB for this cell, got {peak}"
+        );
+        // Twice the rows, about twice the memory.
+        let bigger = cell_build_peak_bytes(768, 4_400, 2 * ROWS, ROW_BYTES);
+        assert!(bigger > 2 * written && bigger < 2 * peak + peak / 4);
+    }
     use crate::superfile::vector::{
         cell_posting::EncodedCellRow, reader::VectorReader, spill::MaterializedRowSpillWriter,
     };
