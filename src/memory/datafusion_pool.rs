@@ -219,7 +219,7 @@ mod tests {
         execution::memory_pool::MemoryConsumer,
         physical_plan::{ExecutionPlan, collect, displayable, metrics::MetricsSet},
     };
-    use tokio::runtime::Runtime;
+    use tokio::runtime::{Builder, Runtime};
 
     use super::*;
     use crate::{memory::tests::Holder, supertable::query::join_build_size::RIGHT_SIZED_BATCHES};
@@ -714,7 +714,14 @@ mod tests {
         let expected_count = (GROUPS * PROBE_REPEATS) as i64;
         let expected_sum = (PROBE_REPEATS * GROUPS * (GROUPS - 1) / 2) as i64;
 
-        let runtime = Runtime::new().expect("tokio runtime");
+        // One thread, so the partitions interleave the same way on every run.
+        // On a multi-thread runtime a loaded machine can run the partitioned
+        // joins one after another, and then their uncopied builds are never
+        // charged at once and the plain session can fit the budget.
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
         runtime.block_on(async {
             for mode in ["CollectLeft", "Partitioned"] {
                 let budget = ConnectionMemoryBudget::with_limit(CONFIGURED);
