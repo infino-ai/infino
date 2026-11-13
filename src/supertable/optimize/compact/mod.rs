@@ -77,9 +77,9 @@ use crate::{
         writer::{
             CommitFence, CommitListMetadata, NewEntryBirthVersions, PreparedSuperfile, ShardOutput,
             backoff_delay, finalize_compaction_commit, maint_pool, orphaned_id_floor,
-            persist_list_metadata_async, prepare_superfile_named, recalibrate_probe_laws,
-            refresh_slow_vector_state, split_overflow_cells, term_head_sink_for,
-            try_commit_attempt, write_superfile_list,
+            pending_drain_sources, persist_list_metadata_async, prepare_superfile_named,
+            recalibrate_probe_laws, refresh_slow_vector_state, split_overflow_cells,
+            term_head_sink_for, try_commit_attempt, write_superfile_list,
         },
     },
     utils::{
@@ -483,7 +483,7 @@ pub(crate) mod plan;
 #[cfg(test)]
 pub(crate) use plan::select;
 pub(crate) use plan::{CompactionJob, SuperfileStats, max_merge_input_bytes};
-use plan::{MIB, MergeMemory, select_within, split_stats_at_drain_watermark};
+use plan::{MIB, MergeMemory, select_within, split_stats_by_drain_state};
 
 /// Cap on compaction input opens in flight, counted across the whole process
 /// rather than per merge. Several merges run at once, and it is their combined
@@ -729,16 +729,28 @@ impl Supertable {
                 );
             }
 
-            // A user table with a hidden vector index selects jobs per side of
-            // the drain watermark, never across it (see
-            // [`split_stats_at_drain_watermark`] for why a mixed merge loses
-            // vectors). Tables without a hidden sibling select over everything.
+            // A user table with a hidden vector index selects jobs within the
+            // drained group and within the undrained one, never across them,
+            // and leaves the sources of a drain in progress out of both (see
+            // [`split_stats_by_drain_state`] for why either would lose
+            // vectors). Tables without a hidden sibling select over
+            // everything. When the drain in progress cannot be read, only the
+            // drained group is merged: an undrained merge might take its
+            // sources.
             let stat_groups: Vec<Vec<SuperfileStats>> = match inner.vector_index_table.as_ref() {
                 Some(hidden) => {
                     let drained = hidden.inner().manifest.load_full().get_drained_ranges();
-                    let (drained_stats, undrained_stats) =
-                        split_stats_at_drain_watermark(stats, &drained);
-                    vec![drained_stats, undrained_stats]
+                    match pending_drain_sources(hidden.inner()).await {
+                        Ok(pending) => split_stats_by_drain_state(stats, &drained, &pending).into(),
+                        Err(error) => {
+                            warn!(
+                                "compaction: the drain in progress could not be read ({error}); merging only drained superfiles this pass"
+                            );
+                            let [drained_stats, _] =
+                                split_stats_by_drain_state(stats, &drained, &HashSet::new());
+                            vec![drained_stats]
+                        }
+                    }
                 }
                 None => vec![stats],
             };

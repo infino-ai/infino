@@ -7311,10 +7311,12 @@ mod tests {
         let plan = CandidatePlan::And(vec![
             CandidatePlan::TermsAll {
                 column: "title".into(),
+                field: None,
                 tokens: vec!["alpha".into(), "shared".into()],
             },
             CandidatePlan::TermsAny {
                 column: "title".into(),
+                field: None,
                 terms: vec!["s0d00".into(), "s1d02".into(), "absent".into()],
             },
         ]);
@@ -7398,6 +7400,7 @@ mod tests {
         // plain OR of single words.
         let title = |tokens: &[&str]| CandidatePlan::TermsAll {
             column: "title".into(),
+            field: None,
             tokens: tokens.iter().map(|t| (*t).to_owned()).collect(),
         };
         let plan = CandidatePlan::And(vec![
@@ -7408,6 +7411,7 @@ mod tests {
             ]),
             CandidatePlan::TermsAny {
                 column: "title".into(),
+                field: None,
                 terms: vec!["shared".into(), "s2d004".into(), "absent".into()],
             },
         ]);

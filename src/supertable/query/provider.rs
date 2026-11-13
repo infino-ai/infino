@@ -115,7 +115,6 @@ use crate::{
             reader::{BoolMode, ContainsRows, MatchWork},
             tokenize::{Tokenizer, unique_tokens},
         },
-        range::KeyKind,
     },
     supertable::{
         SuperfileEntry, SupertableReader,
@@ -134,7 +133,7 @@ use crate::{
                 cached_scan_exec::{
                     CachedFile, CachedScanExec, RowGroupFilter, has_columns, projected_schema,
                 },
-                common::{BoundPredicate, PushedPredicate, take_rows, unqualified},
+                common::{BoundPredicate, PushedPredicate, take_file_columns, unqualified},
                 metered_exec::MeteredExec,
             },
             fts::{IndexedSuperfile, memos_from_plan_locations, plan_locations_for},
@@ -444,12 +443,12 @@ pub(crate) struct SupertableProvider {
 }
 
 /// What [`SupertableProvider::count_range`] carries: the column, its id
-/// and key kind, and the interval of keys the `WHERE` holds, exactly.
+/// and type, and the interval of keys the `WHERE` holds, exactly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CountedRange {
     pub(crate) column: String,
     pub(crate) field: FieldId,
-    pub(crate) kind: KeyKind,
+    pub(crate) data_type: DataType,
     pub(crate) lo: u64,
     pub(crate) hi: u64,
 }
@@ -676,11 +675,11 @@ impl SupertableProvider {
         let conjuncts: Vec<Expr> = split_conjunction(predicate).into_iter().cloned().collect();
         let column = predicate.column_refs().into_iter().next()?.name.clone();
         let range_cols = self.manifest.table_schema().range_column_types();
-        let (field, kind, lo, hi) = single_range(&conjuncts, &column, &range_cols)?;
+        let (field, data_type, lo, hi) = single_range(&conjuncts, &column, &range_cols)?;
         Some(CountedRange {
             column,
             field,
-            kind,
+            data_type,
             lo,
             hi,
         })
@@ -841,7 +840,7 @@ impl SupertableProvider {
         if let Some(bound) = bound.filter(|bound| bound.len() <= gate) {
             let checked = bound - tombstones;
             let verified = check
-                .rows_holding(&prepared.reader, &checked, pool, batch_size)
+                .rows_holding(&self.manifest, &prepared.reader, &checked, batch_size)
                 .await?;
             self.count_rows_checked(checked.len(), verified.len());
             return Ok((verified, work));
@@ -857,9 +856,14 @@ impl SupertableProvider {
         let budget = &self.manifest.options.connection_memory_budget;
         let mut leaf_rows: HashMap<(&str, &str), ContainsRows> = HashMap::new();
         for (column, needles) in by_column {
+            // A superfile written before a rename keys its dictionary by
+            // the column's old name.
+            let file_column = prepared
+                .reader
+                .column_alias(self.manifest.field_id(column), column);
             let (rows, column_work) = prepared
                 .reader
-                .contains_rows(column, &needles, Some(pool), Some(budget))
+                .contains_rows(file_column, &needles, Some(pool), Some(budget))
                 .await
                 .map_err(QueryError::from)?;
             // One result per needle, or the zip below would pair needles
@@ -899,7 +903,7 @@ impl SupertableProvider {
         }
         rows.doubtful -= tombstones;
         let verified = check
-            .rows_holding(&prepared.reader, &rows.doubtful, pool, batch_size)
+            .rows_holding(&self.manifest, &prepared.reader, &rows.doubtful, batch_size)
             .await?;
         self.count_rows_checked(rows.doubtful.len(), verified.len());
         Ok((rows.proven | verified, work))
@@ -1084,11 +1088,12 @@ impl SupertableProvider {
                     let prepared = prepared.await?;
                     let reader = &prepared.reader;
                     let tombstones = self.deleted_rows(entry.superfile_id, now)?;
-                    let (field, kind, lo, hi) = (range.field, range.kind, range.lo, range.hi);
+                    let (field, data_type, lo, hi) =
+                        (range.field, &range.data_type, range.lo, range.hi);
                     let count = match tombstones.is_empty() {
-                        true => reader.range_count(field, kind, lo, hi).await,
+                        true => reader.range_count(field, data_type, lo, hi).await,
                         false => reader
-                            .range_rows(field, kind, lo, hi, Some(pool))
+                            .range_rows(field, data_type, lo, hi, Some(pool))
                             .await
                             .map(|rows| rows.map(|rows| (rows - tombstones.as_ref()).len())),
                     };
@@ -1166,9 +1171,11 @@ impl SupertableProvider {
             return Ok(None);
         };
         let range_cols = self.manifest.table_schema().range_column_types();
-        let Some((field, kind, lo, hi)) = single_range(filters, &hint.column, &range_cols) else {
+        let Some((field, data_type, lo, hi)) = single_range(filters, &hint.column, &range_cols)
+        else {
             return Ok(None);
         };
+        let data_type = &data_type;
         let in_flight = self.manifest.options.superfiles_in_flight;
         let ends = try_join_bounded(
             survivors.iter().cloned().map(|entry| {
@@ -1178,7 +1185,14 @@ impl SupertableProvider {
                     let tombstones = self.deleted_rows(entry.superfile_id, now)?;
                     let ends = prepared
                         .reader
-                        .range_ends(field, kind, (lo, hi), hint.k, hint.descending, &tombstones)
+                        .range_ends(
+                            field,
+                            data_type,
+                            (lo, hi),
+                            hint.k,
+                            hint.descending,
+                            &tombstones,
+                        )
                         .await
                         .map_err(QueryError::from)?;
                     Ok::<_, DataFusionError>(ends.map(|ends| (entry.superfile_id, ends)))
@@ -1223,7 +1237,7 @@ impl SupertableProvider {
                 true => (cut, hi),
             };
             return self
-                .range_rows_live(survivors, field, kind, through, now)
+                .range_rows_live(survivors, field, data_type, through, now)
                 .await
                 .map(Some);
         }
@@ -1256,7 +1270,7 @@ impl SupertableProvider {
         &self,
         survivors: &[Arc<SuperfileEntry>],
         field: FieldId,
-        kind: KeyKind,
+        data_type: &DataType,
         (lo, hi): (u64, u64),
         now: Instant,
     ) -> DfResult<HashMap<Uuid, RoaringBitmap>> {
@@ -1270,7 +1284,7 @@ impl SupertableProvider {
                     let tombstones = self.deleted_rows(entry.superfile_id, now)?;
                     let rows = prepared
                         .reader
-                        .range_rows(field, kind, lo, hi, Some(pool))
+                        .range_rows(field, data_type, lo, hi, Some(pool))
                         .await
                         .map_err(QueryError::from)?
                         .ok_or_else(|| {
@@ -1702,6 +1716,9 @@ struct ExactCheck {
     predicate: BoundPredicate,
     /// Those columns' names, in the bound schema's order.
     columns: Vec<String>,
+    /// The bound schema: the table's types for those columns, which a
+    /// superfile's rows are adapted to before the check.
+    schema: SchemaRef,
 }
 
 impl ExactCheck {
@@ -1736,18 +1753,20 @@ impl ExactCheck {
             filter: ExactFilter::And(conjuncts),
             predicate,
             columns,
+            schema: bound_schema,
         }))
     }
 
     /// Of `rows` in `reader`'s superfile, the ones the conjunction holds
     /// for, read from their stored text `batch_size` rows at a time. The
     /// ids are drawn from `rows` one batch at a time, never copied out
-    /// whole.
+    /// whole. Each column is read by its field id, so a superfile written
+    /// before a rename gives the column the name now refers to.
     async fn rows_holding(
         &self,
+        manifest: &ManifestSnapshot,
         reader: &Arc<SuperfileReader>,
         rows: &RoaringBitmap,
-        pool: &ThreadPool,
         batch_size: usize,
     ) -> DfResult<RoaringBitmap> {
         let names: Vec<&str> = self.columns.iter().map(String::as_str).collect();
@@ -1758,8 +1777,9 @@ impl ExactCheck {
             if chunk.is_empty() {
                 break;
             }
-            let chunk = chunk.as_slice();
-            let batch = take_rows(reader, chunk, &names, pool).await?;
+            let batch =
+                take_file_columns(manifest, reader, chunk.clone(), &names, &self.schema, &None)
+                    .await?;
             if batch.num_rows() != chunk.len() {
                 return Err(DataFusionError::Internal(format!(
                     "read {} rows to check {} against their text",
@@ -2019,6 +2039,7 @@ impl TableProvider for SupertableProvider {
             &fts_cols,
             &range_cols,
             &|col| manifest.try_fts_tokenizer_for(col),
+            &|col| manifest.field_id(col),
         ));
         // A `LIKE` leaf is bound to each superfile's dictionary once, up
         // front, so the estimate and the evaluation below share one walk.
