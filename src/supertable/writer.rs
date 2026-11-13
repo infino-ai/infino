@@ -89,6 +89,7 @@ use blake3::Hasher as Blake3Hasher;
 use bytes::Bytes;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use datafusion::prelude::Expr;
+use fs4::available_space;
 use futures::{
     future::{BoxFuture, try_join_all},
     stream::{self, FuturesUnordered, StreamExt},
@@ -170,7 +171,10 @@ use crate::{
             reader::{VectorColumnConfig, VectorReader},
             rerank_codec::RerankCodec,
             rotation::RandomRotation,
-            spill::{MaterializedRowSpillState, MaterializedRowSpillWriter, SpilledCellRows},
+            spill::{
+                MaterializedRowSpillState, MaterializedRowSpillWriter, SpilledCellRows,
+                record_bytes,
+            },
         },
     },
     supertable::{
@@ -5883,6 +5887,31 @@ fn save_drain_local_checkpoint(
     Ok(())
 }
 
+/// The user superfiles the drain in progress on `hidden` reads, by id; empty
+/// when no drain is in progress. Compaction keeps them out of merges with
+/// any other superfile until that drain finishes (see
+/// `split_stats_by_drain_state`).
+pub(in crate::supertable) async fn pending_drain_sources(
+    hidden: &SupertableInner,
+) -> Result<HashSet<Uuid>, BuildError> {
+    let Some(state) = load_drain_remote_checkpoint(hidden).await? else {
+        return Ok(HashSet::new());
+    };
+    state
+        .checkpoint
+        .sources
+        .iter()
+        .map(|source| {
+            Uuid::parse_str(&source.superfile_id).map_err(|e| {
+                BuildError::Store(format!(
+                    "drain checkpoint names superfile {:?}: {e}",
+                    source.superfile_id
+                ))
+            })
+        })
+        .collect()
+}
+
 async fn load_drain_remote_checkpoint(
     inner: &SupertableInner,
 ) -> Result<Option<DrainRemoteState>, BuildError> {
@@ -5984,6 +6013,124 @@ async fn create_drain_remote_checkpoint(
     };
     save_drain_remote_checkpoint(inner, &mut state).await?;
     Ok(state)
+}
+
+/// Share of the scratch disk's free space one drain may fill with its spill:
+/// the spill takes half, and the cell build writes each cell's output beside
+/// its spill until the cell is done, which the other half holds.
+const DRAIN_SPILL_FREE_SPACE_DIVISOR: u64 = 2;
+
+/// What held a drain to fewer rows than were waiting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DrainRowLimit {
+    /// `vector.drain_max_rows`.
+    Configured,
+    /// What the free space on the scratch disk can spill.
+    ScratchDisk,
+}
+
+impl DrainRowLimit {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Configured => "vector.drain_max_rows",
+            Self::ScratchDisk => "scratch disk free space",
+        }
+    }
+}
+
+/// The most rows a new drain takes on: `configured` when it is set (`0` is
+/// unset), or what `free_bytes / DRAIN_SPILL_FREE_SPACE_DIVISOR` holds at
+/// `spill_row_bytes` per spilled row, whichever is less. `free_bytes` is
+/// `None` when the scratch disk cannot be read, which leaves only the
+/// configured limit. `None` when nothing limits the drain.
+fn drain_row_limit(
+    configured: u64,
+    free_bytes: Option<u64>,
+    spill_row_bytes: u64,
+) -> Option<(u64, DrainRowLimit)> {
+    let disk = free_bytes.map(|free| {
+        (
+            free / DRAIN_SPILL_FREE_SPACE_DIVISOR / spill_row_bytes.max(1),
+            DrainRowLimit::ScratchDisk,
+        )
+    });
+    let configured = (configured > 0).then_some((configured, DrainRowLimit::Configured));
+    match (configured, disk) {
+        (Some(c), Some(d)) => Some(if c.0 <= d.0 { c } else { d }),
+        (one, other) => one.or(other),
+    }
+}
+
+/// The oldest of `sources` (sorted by `birth_version`) a drain of at most
+/// `limit` rows takes, counting `copies_per_row` spilled copies of each row.
+/// Whole commit versions only: commit A marks every version up to the
+/// drain's newest as drained, so a version split across two drains would be
+/// marked drained with part of its rows left out. The first version is
+/// always taken, however many rows it has, so every drain makes progress.
+/// Returns the taken sources and the rows they hold.
+fn take_drain_sources(
+    sources: Vec<Arc<SuperfileEntry>>,
+    limit: u64,
+    copies_per_row: f32,
+) -> (Vec<Arc<SuperfileEntry>>, u64) {
+    debug_assert!(
+        sources
+            .windows(2)
+            .all(|w| w[0].birth_version <= w[1].birth_version)
+    );
+    let spilled = |rows: u64| (rows as f64 * f64::from(copies_per_row.max(1.0))) as u64;
+    let mut taken: Vec<Arc<SuperfileEntry>> = Vec::with_capacity(sources.len());
+    let mut rows = 0u64;
+    let mut sources = sources.into_iter().peekable();
+    while let Some(first) = sources.peek() {
+        let version = first.birth_version;
+        let mut group = Vec::new();
+        while let Some(source) = sources.next_if(|s| s.birth_version == version) {
+            group.push(source);
+        }
+        let group_rows: u64 = group.iter().map(|s| s.n_docs).sum();
+        if !taken.is_empty() && spilled(rows.saturating_add(group_rows)) > limit {
+            break;
+        }
+        rows = rows.saturating_add(group_rows);
+        taken.extend(group);
+    }
+    (taken, rows)
+}
+
+/// The sources a new drain epoch of `column` takes from `undrained` (sorted
+/// by `birth_version`): the oldest commits up to the row limit of
+/// [`drain_row_limit`], read from `options` and the scratch disk.
+fn new_drain_epoch_sources(
+    options: &SupertableOptions,
+    column: &str,
+    undrained: Vec<Arc<SuperfileEntry>>,
+) -> Vec<Arc<SuperfileEntry>> {
+    let Some(vc) = options.vector_columns.iter().find(|vc| vc.column == column) else {
+        return undrained;
+    };
+    let spill_row_bytes =
+        record_bytes(vc.dim, vc.dim.div_ceil(u8::BITS as usize), vc.rerank_codec) as u64;
+    let free_bytes = available_space(scratch_root()).ok();
+    let Some((limit, why)) = drain_row_limit(options.drain_max_rows, free_bytes, spill_row_bytes)
+    else {
+        return undrained;
+    };
+    let waiting_superfiles = undrained.len();
+    let waiting_rows: u64 = undrained.iter().map(|s| s.n_docs).sum();
+    let (taken, taken_rows) = take_drain_sources(undrained, limit, drain_replica_target_factor());
+    if taken.len() < waiting_superfiles {
+        info!(
+            taken_superfiles = taken.len(),
+            waiting_superfiles,
+            taken_rows,
+            waiting_rows,
+            limit_rows = limit,
+            limit = why.label(),
+            "[supertable drain] taking the oldest commits up to the row limit; the rest wait for the next drain"
+        );
+    }
+    taken
 }
 
 fn make_drain_batches(
@@ -6362,6 +6509,10 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                 .cmp(&right.birth_version)
                 .then_with(|| left.superfile_id.cmp(&right.superfile_id))
         });
+        // A new epoch takes the oldest commits up to the row limit; the rest
+        // wait for the next drain. A resumed epoch above follows its
+        // checkpoint, so the limit only ever applies here.
+        let selected = new_drain_epoch_sources(&user_inner.options, &column, selected);
         let source_refs: Vec<DrainCheckpointSource> = selected
             .iter()
             .map(|entry| drain_checkpoint_source(entry))
@@ -16155,6 +16306,252 @@ mod tests {
         );
     }
 
+    /// A source with `rows` rows committed at `birth_version`.
+    fn drain_source(id: u128, birth_version: u64, rows: u64) -> Arc<SuperfileEntry> {
+        let mut entry = (*fp_entry(id)).clone();
+        entry.birth_version = birth_version;
+        entry.n_docs = rows;
+        Arc::new(entry)
+    }
+
+    #[test]
+    fn a_drain_row_limit_is_the_smaller_of_config_and_disk() {
+        // 1,000 bytes free holds 500 at the spill's half share: 5 rows of 100.
+        assert_eq!(
+            drain_row_limit(0, Some(1_000), 100),
+            Some((5, DrainRowLimit::ScratchDisk))
+        );
+        assert_eq!(
+            drain_row_limit(3, Some(1_000), 100),
+            Some((3, DrainRowLimit::Configured))
+        );
+        assert_eq!(
+            drain_row_limit(9, Some(1_000), 100),
+            Some((5, DrainRowLimit::ScratchDisk))
+        );
+        assert_eq!(
+            drain_row_limit(7, None, 100),
+            Some((7, DrainRowLimit::Configured))
+        );
+        assert_eq!(drain_row_limit(0, None, 100), None, "nothing limits it");
+        assert_eq!(
+            drain_row_limit(0, Some(0), 100),
+            Some((0, DrainRowLimit::ScratchDisk)),
+            "a full disk limits it to the first commit"
+        );
+    }
+
+    #[test]
+    fn a_drain_takes_whole_commits_oldest_first_up_to_its_row_limit() {
+        let ids = |taken: &[Arc<SuperfileEntry>]| -> Vec<u128> {
+            taken.iter().map(|s| s.superfile_id.as_u128()).collect()
+        };
+        // Version 3 is one commit of two superfiles.
+        let sources = || {
+            vec![
+                drain_source(1, 2, 10),
+                drain_source(2, 3, 10),
+                drain_source(3, 3, 10),
+                drain_source(4, 5, 10),
+            ]
+        };
+        let (taken, rows) = take_drain_sources(sources(), 30, 1.0);
+        assert_eq!((ids(&taken), rows), (vec![1, 2, 3], 30));
+        // 25 rows would split version 3, so the drain stops before it.
+        let (taken, rows) = take_drain_sources(sources(), 25, 1.0);
+        assert_eq!((ids(&taken), rows), (vec![1], 10));
+        // The first commit is taken even when it alone passes the limit.
+        let (taken, rows) = take_drain_sources(sources(), 0, 1.0);
+        assert_eq!((ids(&taken), rows), (vec![1], 10));
+        // Everything fits: every source, in order.
+        let (taken, rows) = take_drain_sources(sources(), u64::MAX, 1.0);
+        assert_eq!((ids(&taken), rows), (vec![1, 2, 3, 4], 40));
+        // Replicas spill extra copies: 1.5 copies per row turn 30 rows into
+        // 45 spilled, past a limit of 40.
+        let (taken, rows) = take_drain_sources(sources(), 40, 1.5);
+        assert_eq!((ids(&taken), rows), (vec![1], 10));
+        let (taken, _) = take_drain_sources(Vec::new(), 10, 1.0);
+        assert!(taken.is_empty());
+    }
+
+    /// A drain held to one commit's rows drains one commit per run, oldest
+    /// first, and the drained ranges grow by exactly that commit each time,
+    /// until every row is in the hidden index.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_row_limited_drain_finishes_over_several_runs() {
+        const COMMITS: usize = 3;
+        let directory = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(directory.path()).expect("provider"));
+        let table = Supertable::create(
+            options_title_emb_serial(COMMIT_AS_DRAIN_TEST_DIM)
+                .with_storage(Arc::clone(&storage))
+                .with_drain_max_rows(COMMIT_AS_DRAIN_TEST_ROWS as u64),
+        )
+        .expect("create");
+        for _ in 0..COMMITS {
+            let mut writer = table.writer().expect("writer");
+            writer
+                .append(&build_axis_vector_batch(
+                    COMMIT_AS_DRAIN_TEST_ROWS,
+                    COMMIT_AS_DRAIN_TEST_DIM,
+                ))
+                .expect("append");
+            writer.commit().expect("commit");
+        }
+        let hidden = table
+            .inner()
+            .vector_index_table
+            .as_ref()
+            .expect("hidden table")
+            .clone();
+        let mut versions: Vec<u64> = table
+            .inner()
+            .manifest
+            .load_full()
+            .get_all_superfiles_loaded()
+            .await
+            .expect("user sources")
+            .iter()
+            .map(|s| s.birth_version)
+            .collect();
+        versions.sort_unstable();
+        versions.dedup();
+        assert_eq!(versions.len(), COMMITS);
+
+        for run in 1..=COMMITS {
+            drain_user_superfiles_to_hidden_cells(
+                Arc::clone(table.inner()),
+                Arc::clone(hidden.inner()),
+            )
+            .await
+            .expect("drain");
+            let drained = hidden.inner().manifest.load_full().get_drained_ranges();
+            for (i, version) in versions.iter().enumerate() {
+                assert_eq!(
+                    drained.contains(*version),
+                    i < run,
+                    "run {run}: commit {i} (version {version})"
+                );
+            }
+        }
+        let hidden_rows: u64 = hidden
+            .inner()
+            .manifest
+            .load_full()
+            .get_all_superfiles_loaded()
+            .await
+            .expect("hidden superfiles")
+            .iter()
+            .map(|s| s.n_docs)
+            .sum();
+        assert_eq!(hidden_rows, (COMMITS * COMMIT_AS_DRAIN_TEST_ROWS) as u64);
+    }
+
+    /// Compaction that runs while a row-limited drain is stopped partway must
+    /// not merge that drain's sources with later commits: the merged file
+    /// would carry a version the drain then marks drained, and the later
+    /// commits' rows would never reach the hidden index. Every row does.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn compaction_during_a_stopped_drain_keeps_every_row() {
+        const COMMITS: usize = 4;
+        let directory = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(directory.path()).expect("provider"));
+        // One commit per drain, one superfile per batch.
+        let table = Supertable::create(
+            options_title_emb_serial(COMMIT_AS_DRAIN_TEST_DIM)
+                .with_storage(Arc::clone(&storage))
+                .with_drain_batch_superfiles(1)
+                .with_drain_max_rows(COMMIT_AS_DRAIN_TEST_ROWS as u64),
+        )
+        .expect("create");
+        for _ in 0..COMMITS {
+            let mut writer = table.writer().expect("writer");
+            writer
+                .append(&build_axis_vector_batch(
+                    COMMIT_AS_DRAIN_TEST_ROWS,
+                    COMMIT_AS_DRAIN_TEST_DIM,
+                ))
+                .expect("append");
+            writer.commit().expect("commit");
+        }
+        let hidden = table
+            .inner()
+            .vector_index_table
+            .as_ref()
+            .expect("hidden table")
+            .clone();
+
+        // Stop the first drain after its batch, before it commits: its epoch
+        // stays pending.
+        let (_, epoch_id) = current_drain_epoch(&table).await;
+        inject_drain_test_failure(epoch_id, DrainTestFailurePhase::AfterBatch, 1);
+        drain_user_superfiles_to_hidden_cells(
+            Arc::clone(table.inner()),
+            Arc::clone(hidden.inner()),
+        )
+        .await
+        .expect_err("the drain stops at the failpoint");
+        let pending = pending_drain_sources(hidden.inner())
+            .await
+            .expect("pending");
+        assert_eq!(pending.len(), 1, "the drain took the oldest commit only");
+
+        // Compact everything that may be merged while the drain is stopped.
+        table
+            .compact_async(&CompactionSettings {
+                min_fill_percent: 100,
+                min_superfiles_for_merge: 2,
+                ..CompactionSettings::default()
+            })
+            .await
+            .expect("compact");
+        let after = table
+            .inner()
+            .manifest
+            .load_full()
+            .get_all_superfiles_loaded()
+            .await
+            .expect("user superfiles");
+        for id in &pending {
+            assert!(
+                after.iter().any(|s| s.superfile_id == *id),
+                "the stopped drain's source must not be merged away"
+            );
+        }
+        assert!(
+            after.len() < COMMITS,
+            "the later commits do merge with each other"
+        );
+
+        // Resume, then drain whatever is left.
+        for _ in 0..COMMITS {
+            drain_user_superfiles_to_hidden_cells(
+                Arc::clone(table.inner()),
+                Arc::clone(hidden.inner()),
+            )
+            .await
+            .expect("drain");
+        }
+        let drained = hidden.inner().manifest.load_full().get_drained_ranges();
+        assert!(
+            after.iter().all(|s| drained.contains(s.birth_version)),
+            "every user superfile is drained"
+        );
+        let hidden_rows: u64 = hidden
+            .inner()
+            .manifest
+            .load_full()
+            .get_all_superfiles_loaded()
+            .await
+            .expect("hidden superfiles")
+            .iter()
+            .map(|s| s.n_docs)
+            .sum();
+        assert_eq!(hidden_rows, (COMMITS * COMMIT_AS_DRAIN_TEST_ROWS) as u64);
+    }
+
     #[test]
     fn drain_batches_from_layout_follows_the_recorded_groups() {
         let at = |id: u128, birth_version: u64| {
@@ -16896,6 +17293,11 @@ mod tests {
                 .cmp(&right.birth_version)
                 .then_with(|| left.superfile_id.cmp(&right.superfile_id))
         });
+        let column = user_manifest
+            .get_global_vector_index()
+            .expect("global vector index")
+            .column;
+        let sources = new_drain_epoch_sources(&table.inner().options, &column, sources);
         let batch_cfg = drain_batch_superfiles(&table.inner().options);
         let budget = if batch_cfg < 0 {
             usize::MAX
