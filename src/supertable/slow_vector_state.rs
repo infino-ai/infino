@@ -50,7 +50,7 @@ use crate::{
     supertable::{
         manifest::{
             SuperfileEntry, VectorSummary,
-            disk_cache::MetadataDiskCache,
+            disk_cache::{CacheHold, MetadataDiskCache},
             encoding::SummaryWireMode,
             list::RoutingRef,
             part::{self, ContentHash, ManifestPart, PartId},
@@ -552,6 +552,10 @@ pub(crate) async fn fetch_centroid_section(
 ) -> Result<CentroidSection, SlowVectorStateError> {
     let io_err = |e: io::Error| SlowVectorStateError::Storage(format!("section spill: {e}"));
     let expected_len = section_len(entries) as u64;
+    // Every open reads the whole section, so the cache keeps it whole.
+    if let Some(cache) = cache {
+        cache.hold(CacheHold::CentroidSection, expected_len);
+    }
     let spill = create_spill(scratch_dir).map_err(|e| {
         SlowVectorStateError::Storage(format!(
             "centroid section spill under {}: {e}",
@@ -732,6 +736,8 @@ async fn write_blob_and_section(
     let (uri, content_hash) = blob?;
     let (centroids_uri, centroids_hash) = centroids?;
     if let Some(cache) = cache {
+        cache.hold(CacheHold::VectorStateBlob, blob_bytes.len() as u64);
+        cache.hold(CacheHold::CentroidSection, centroid_bytes.len() as u64);
         cache.put(content_hash, blob_bytes).await;
         cache.put(centroids_hash, centroid_bytes).await;
     }
@@ -1073,6 +1079,9 @@ pub(crate) async fn load_full_state(
             true,
         ),
     };
+    if let Some(cache) = cache {
+        cache.hold(CacheHold::VectorStateBlob, bytes.len() as u64);
+    }
     let blob = bytes.clone();
     let expected = *expected;
     let legacy = legacy.clone();

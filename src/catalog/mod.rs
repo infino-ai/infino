@@ -166,8 +166,8 @@ use crate::{
 
 /// Subdirectory under a tables cache root holding the manifest-part cache.
 const MANIFEST_CACHE_SUBDIR: &str = "manifest-parts";
-/// Starting budget for a table's manifest-part cache. Opening a manifest
-/// raises it to hold every part of that manifest.
+/// Starting budget for a table's manifest-part cache. The cache grows past it
+/// to hold the table's current manifest whole, and shrinks back with it.
 const MANIFEST_CACHE_BUDGET_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// Open (or create) a catalog rooted at `uri`.

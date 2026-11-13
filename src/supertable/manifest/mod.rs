@@ -118,7 +118,7 @@ use crate::{
                 EncodedPart, PointerFile, frame_content_size, part_uri, read_pointer,
                 translate_contention, write_manifest, write_object_bytes, write_pointer,
             },
-            disk_cache::MetadataDiskCache,
+            disk_cache::{CacheHold, MetadataDiskCache},
             encoding::SummaryWireMode,
             list::{
                 FORMAT_VERSION as LIST_FORMAT_VERSION, Manifest, ManifestPartEntry,
@@ -180,10 +180,6 @@ pub(crate) const DEFAULT_VECTOR_INDEX_PREFIX: &str = "_vector_index";
 /// attempt that wrote them, so what this bounds is how much stays alive
 /// between attempts. A part past it is rebuilt on each attempt, as before.
 const REBUILT_PARTS_MAX_BYTES: usize = 256 * 1024 * 1024;
-/// Headroom over a list's part bytes when sizing the manifest disk cache, in
-/// divisor form (`bytes + bytes / this`), for the term-index slices and
-/// routing siblings that share the cache.
-const MANIFEST_CACHE_HEADROOM_DIVISOR: u64 = 10;
 
 /// One immutable point-in-time view of the supertable.
 ///
@@ -3565,9 +3561,7 @@ impl ManifestPartLoader {
         // Holds every part of the list, so a full load reuses the cache
         // instead of evicting parts before the next load reads them.
         if let Some(cache) = &metadata_disk_cache {
-            cache.raise_budget(
-                part_bytes.saturating_add(part_bytes / MANIFEST_CACHE_HEADROOM_DIVISOR),
-            );
+            cache.hold(CacheHold::Manifest, part_bytes);
         }
         Self {
             storage,
