@@ -1383,7 +1383,10 @@ impl Slot {
     /// it out. The bar only rises, so a superfile it passes stays passed.
     fn reads_on(&self, bar: f32, ties: bool) -> bool {
         let above = self.ub > bar || (ties && self.ub == bar) || self.ub.is_nan();
-        let near = !bar.is_finite() || bar <= 0.0 || self.ub <= bar * NEAR_BAR;
+        // A superfile not yet bounded (no block of its heads read) is read:
+        // its first blocks are what bound it.
+        let near =
+            !bar.is_finite() || bar <= 0.0 || !self.ub.is_finite() || self.ub <= bar * NEAR_BAR;
         let settling = self.heads.iter().any(|h| h.settles && !h.done);
         self.live && above && (near || settling)
     }
@@ -2313,6 +2316,10 @@ mod tests {
             "a tie the index can answer"
         );
         assert!(bound(50.0).reads_on(f32::NEG_INFINITY, false), "no bar yet");
+        assert!(
+            bound(f32::INFINITY).reads_on(bar, false),
+            "not yet bounded: its first blocks bound it"
+        );
     }
 
     /// A source of `chunks` chunks of `chunk_bytes` each.
