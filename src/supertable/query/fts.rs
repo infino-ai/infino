@@ -947,18 +947,23 @@ fn ceilings_at_table_avgdl(
 }
 
 /// How a ranked search runs.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum RankedPass {
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum RankedPass<'a> {
     /// The `k` best, pruned: past one open window of superfiles the tier
     /// merge always runs.
     Top,
-    /// A later round of a search under a `WHERE`, asking for more than the
-    /// caller's `k` because the predicate turned down rows of the round
-    /// before. The merge runs only where the table's learned call takes it:
-    /// a merge seeds a threshold for the round's whole `k`, which the
-    /// predicate then turns down in part, so it reads the tiers deeper on
-    /// every round without telling the search which superfiles to leave out.
-    Widening,
+    /// One round of a search under a `WHERE`, which asks again for more
+    /// than the caller's `k` when the predicate turns down rows of the
+    /// round before. Past one open window a round merges by force only
+    /// while the flag holds, and leaves in it whether its merge paid: the
+    /// opens it spared, at the table's cost per open, against the merge's
+    /// own wall. A predicate that keeps most of the top rows needs a round
+    /// or two, and the merge spares most of the table on each; one that
+    /// turns nearly all of them down widens round after round, each merge
+    /// reading deeper for a threshold the predicate then discards, and
+    /// sparing nothing. Otherwise the round keeps to the table's learned
+    /// call.
+    Round(&'a AtomicBool),
     /// Every match scored, nothing pruned, and the exact match count with
     /// the hits.
     ExactCount,
@@ -1057,7 +1062,7 @@ impl SupertableReader {
         k: usize,
         opts: Bm25SearchOptions,
         scope: Option<&CandidateScope>,
-        pass: RankedPass,
+        pass: RankedPass<'_>,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
         let (hits, _) = self
             .bm25_scored_async(column, query, k, opts, scope, pass)
@@ -1076,7 +1081,7 @@ impl SupertableReader {
         k: usize,
         opts: Bm25SearchOptions,
         scope: Option<&CandidateScope>,
-        pass: RankedPass,
+        pass: RankedPass<'_>,
     ) -> Result<(Vec<SuperfileHit>, u64), QueryError> {
         if k == 0 {
             return Ok((Vec::new(), 0));
@@ -1225,9 +1230,13 @@ impl SupertableReader {
         bm25_params: Option<Bm25Params>,
         score_tolerance: f32,
         scope: Option<&CandidateScope>,
-        pass: RankedPass,
+        pass: RankedPass<'_>,
     ) -> Result<(Vec<SuperfileHit>, u64), QueryError> {
-        let exact_count = pass == RankedPass::ExactCount;
+        let exact_count = matches!(pass, RankedPass::ExactCount);
+        let merge_pays = match pass {
+            RankedPass::Round(pays) => Some(pays),
+            RankedPass::Top | RankedPass::ExactCount => None,
+        };
         let ScoredClauses {
             musts,
             shoulds,
@@ -1408,10 +1417,10 @@ impl SupertableReader {
         // by the length rescale, open them all. Its measured costs still
         // decide how deep it reads. Within a window the table's learned
         // call stands.
-        // A widening round under a `WHERE` keeps to the learned call: see
-        // [`RankedPass::Widening`].
+        // A round under a `WHERE` merges by force only while its merges
+        // pay: see [`RankedPass::Round`].
         let forced = tiers_serve
-            && pass != RankedPass::Widening
+            && merge_pays.is_none_or(|pays| pays.load(AtomicOrdering::Relaxed))
             && kept.len() > manifest.options.ordered_open_window();
         let merge_now =
             tiers_serve && (forced || !learned || self.tier_policy().merge(policy_class));
@@ -1465,6 +1474,12 @@ impl SupertableReader {
         // postings in a layer without a tier, a superfile the root does
         // not list: the class learns there is nothing to merge here.
         let declined = AtomicBool::new(false);
+        // What the merge spared and what it cost, for a round that leaves
+        // whether its merge paid ([`RankedPass::Round`]): the superfiles it
+        // ruled out or answered for, the units the fan-out then skipped,
+        // and the merge's wall.
+        let spared = AtomicU64::new(0);
+        let merge_wall_ns = AtomicU64::new(0);
         let merge_terms: Vec<String> = all_terms.iter().map(|t| (*t).to_owned()).collect();
         let merge_term_refs: Vec<&str> = merge_terms.iter().map(String::as_str).collect();
         let merge_kept: Vec<Arc<SuperfileEntry>> = match merge_now {
@@ -2101,6 +2116,8 @@ impl SupertableReader {
             let reader = self;
             let selected = &selected;
             let pruned = &pruned;
+            let spared = &spared;
+            let merge_wall_ns = &merge_wall_ns;
             // What a selection does to the units it is handed: the
             // superfiles the index answers for are settled and their
             // scores folded into the floor, the ruled-out dropped, the rest
@@ -2109,6 +2126,7 @@ impl SupertableReader {
                 if let Some(stats) = &reader.op_stats {
                     stats.add_tier_read(selection.tier_bytes, selection.entries_read);
                 }
+                merge_wall_ns.store(selection.merge_ns, AtomicOrdering::Relaxed);
                 if let Some(per_entry) = selection.merge_ns.checked_div(selection.entries_read) {
                     reader.note_tier_entry_cost(per_entry);
                 }
@@ -2182,6 +2200,7 @@ impl SupertableReader {
                     }
                     span.record("resolved", resolved);
                     span.record("ruled_out", ruled_out);
+                    spared.fetch_add(resolved + ruled_out, AtomicOrdering::Relaxed);
                     selected.store(true, AtomicOrdering::Relaxed);
                     pruned.store(
                         resolved + ruled_out > 0 || selection.theta_lb.is_finite(),
@@ -2260,16 +2279,21 @@ impl SupertableReader {
                 // (tombstoned ones are already gone) into the floor.
                 let id_max_of: HashMap<SuperfileUri, i128> =
                     units.iter().map(|(_, p)| (p.uri, p.id_max)).collect();
+                let skipped = &spared;
                 dispatch::fanout_local_hits_ordered(
                     self,
                     units,
                     window,
                     move |params: &UnitParams| {
                         let floor = competitive_floor(floor_handle.floor(), score_tolerance);
-                        !ceiling_can_compete(params.ceiling, floor)
+                        let skip = !ceiling_can_compete(params.ceiling, floor)
                             || (tie_walk
                                 && params.ceiling == floor
-                                && floor_handle.tie_skippable(floor, params.id_min))
+                                && floor_handle.tie_skippable(floor, params.id_min));
+                        if skip {
+                            skipped.fetch_add(1, AtomicOrdering::Relaxed);
+                        }
+                        skip
                     },
                     kernel,
                     move |hits: &Vec<SuperfileHit>| {
@@ -2296,6 +2320,20 @@ impl SupertableReader {
         if tiers_serve && !selected.load(AtomicOrdering::Relaxed) {
             fanout_records.record("resolved", 0u64);
             fanout_records.record("ruled_out", 0u64);
+        }
+        // A round leaves whether its merge paid for the next to read. The
+        // skips are not all the merge's doing — ceilings alone skip some —
+        // so this leans towards merging again; a merge that spared nothing
+        // worth its wall, or did not report, stops the forcing.
+        if let Some(pays) = merge_pays
+            && merge_now
+        {
+            let paid = selected.load(AtomicOrdering::Relaxed)
+                && spared
+                    .load(AtomicOrdering::Relaxed)
+                    .saturating_mul(self.open_cost_ns())
+                    >= merge_wall_ns.load(AtomicOrdering::Relaxed);
+            pays.store(paid, AtomicOrdering::Relaxed);
         }
         let mut per_unit = per_unit;
         per_unit.extend(settled_before);
