@@ -780,11 +780,11 @@ mod tests {
 
     /// A column read through metadata that holds its page index returns its
     /// rows; one read through metadata that doesn't fails, all of it or a
-    /// selection, rather than returning no rows.
-    /// The fixture's columns are dictionary encoded, so a read of one starts
-    /// with a dictionary page before its data pages.
-    #[test]
-    fn a_read_of_a_column_not_loaded_fails_rather_than_returning_no_rows() {
+    /// selection, rather than returning no rows, through the sync and the
+    /// async reader. The fixture's columns are dictionary encoded, so a read
+    /// of one starts with a dictionary page before its data pages.
+    #[tokio::test]
+    async fn a_read_of_a_column_not_loaded_fails_rather_than_returning_no_rows() {
         let (bytes, footer) = fixture();
         assert!(
             footer
@@ -807,20 +807,6 @@ mod tests {
             Ok(rows().count())
         );
         assert_eq!(read_leaf(&bytes, indexed.clone(), 1, true), Ok(SELECTED));
-        for selected in [false, true] {
-            assert!(
-                read_leaf(&bytes, indexed.clone(), 0, selected).is_err(),
-                "selected: {selected}"
-            );
-        }
-    }
-
-    /// The same through the async reader: a column not loaded fails there
-    /// too, all of it or a selection, while a loaded one returns its rows.
-    #[tokio::test]
-    async fn an_async_read_of_a_column_not_loaded_fails_rather_than_returning_no_rows() {
-        let (bytes, footer) = fixture();
-        let indexed = load(&kept(&bytes, &footer), &footer, &[1]);
         assert_eq!(
             read_leaf_async(&bytes, indexed.clone(), 1, false).await,
             Ok(rows().count())
@@ -831,10 +817,14 @@ mod tests {
         );
         for selected in [false, true] {
             assert!(
+                read_leaf(&bytes, indexed.clone(), 0, selected).is_err(),
+                "sync, selected: {selected}"
+            );
+            assert!(
                 read_leaf_async(&bytes, indexed.clone(), 0, selected)
                     .await
                     .is_err(),
-                "selected: {selected}"
+                "async, selected: {selected}"
             );
         }
     }

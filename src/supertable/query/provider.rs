@@ -117,6 +117,7 @@ use crate::{
             tokenize::{Tokenizer, unique_tokens},
         },
         page_index::{IndexColumns, loaded_pages},
+        reader::{Columns, FirstLoad},
     },
     supertable::{
         SuperfileEntry, SupertableReader,
@@ -298,7 +299,7 @@ impl ScanFileOpener {
             && let Some((held, parquet_meta)) = match columns {
                 None => Some((None, reader.parquet_metadata())),
                 Some(columns) => reader
-                    .loaded_page_indexed_footer(columns)
+                    .loaded_page_indexed_footer(Columns::Set(columns))
                     .map(|(held, footer)| (Some(held), footer)),
             }
         {
@@ -346,7 +347,7 @@ impl ScanFileOpener {
                         None => (None, reader.parquet_metadata()),
                         Some(columns) => {
                             let (held, footer) = reader
-                                .page_indexed_footer(columns, None)
+                                .page_indexed_footer(Columns::Set(columns), FirstLoad::Start, None)
                                 .await
                                 .map_err(QueryError::from)?;
                             (Some(held), footer)

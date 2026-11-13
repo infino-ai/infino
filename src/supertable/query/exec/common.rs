@@ -88,7 +88,7 @@ use crate::{
         lazy_source::Source,
         page_index::loaded_pages,
         reader::{
-            WHOLE_COLUMN_TAKE_DIVISOR, in_projection_order, rank_back_indices,
+            Columns, FirstLoad, WHOLE_COLUMN_TAKE_DIVISOR, in_projection_order, rank_back_indices,
             row_selection_for_ids, view_read_options, whole_row_group,
         },
     },
@@ -1589,7 +1589,7 @@ fn take_resident_file(
 /// `names` at `locals` of one lazily opened superfile, streamed through
 /// its byte source so the disk cache's block layer serves repeated reads.
 async fn take_lazy_file(
-    rd: &SuperfileReader,
+    rd: &Arc<SuperfileReader>,
     locals: &[u32],
     names: &[&str],
     adapter: &Option<FileSchemaMap>,
@@ -1730,7 +1730,7 @@ pub(crate) async fn read_file_row_group(
 /// the footer fails a read of a column whose page index it does not hold. A
 /// load that adds them decodes on `pool`.
 async fn read_row_group_byte_source(
-    reader: &SuperfileReader,
+    reader: &Arc<SuperfileReader>,
     row_group: usize,
     names: &[&str],
     views: &[&str],
@@ -1739,9 +1739,10 @@ async fn read_row_group_byte_source(
     let input = ByteSourceAsyncReader {
         source: Source::Lazy(reader.byte_source()),
         metadata: reader
-            .parquet_metadata_to_read_named_on(names, Some(pool))
+            .page_indexed_footer(Columns::Names(names), FirstLoad::Skip, Some(pool))
             .await
-            .map_err(QueryError::from)?,
+            .map_err(QueryError::from)?
+            .1,
         prefetched: Vec::new(),
     };
     let options = if views.is_empty() {
@@ -2034,7 +2035,7 @@ impl AsyncFileReader for ByteSourceAsyncReader {
 /// make the priced counter cache-dependent. The invariant materialization
 /// signals are `rows_materialized` and the decode CPU brackets.
 pub(crate) async fn take_rows_byte_source(
-    reader: &SuperfileReader,
+    reader: &Arc<SuperfileReader>,
     local_doc_ids: &[u32],
     names: &[&str],
     pool: Option<&ThreadPool>,
@@ -2068,8 +2069,8 @@ pub(crate) async fn take_rows_byte_source(
             }
         }
     }
-    let metadata = reader
-        .page_indexed_footer_named(names, pool)
+    let (_, metadata) = reader
+        .page_indexed_footer(Columns::Names(names), FirstLoad::Start, pool)
         .await
         .map_err(QueryError::from)?;
     let source = Source::Lazy(reader.byte_source());
@@ -3604,10 +3605,12 @@ mod tests {
                 .await
                 .expect("narrow load");
             assert!(
-                reader.loaded_parquet_metadata_named(&["title"]).is_none(),
+                reader
+                    .loaded_page_indexed_footer(Columns::Names(&["title"]))
+                    .is_none(),
                 "the narrow load left `title` out"
             );
-            reader
+            Arc::new(reader)
         };
         let pool = ThreadPoolBuilder::new()
             .num_threads(1)

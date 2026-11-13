@@ -127,7 +127,7 @@ use crate::{
         ids::{self, PackedIdEncoder, PackedIdOutput},
         page_index::IndexColumns,
         range::{self, KeyKind, RangeColumnSpec},
-        reader::{KeptRead, KeptRows, interleave_rows},
+        reader::{Columns, KeptRead, KeptRows, interleave_rows},
         stats::SuperfileStats,
         vector::{
             builder::{
@@ -4690,7 +4690,7 @@ impl SuperfileBuilder {
                 .chain([(None, self.opts.id_column.as_str())]),
         );
         let metadata = source
-            .parquet_metadata_to_read(&read)
+            .parquet_metadata_to_read(Columns::Set(&read))
             .map_err(|e| BuildError::Io(Error::other(e)))?;
         let range = range_region_of_body(body.clone(), metadata, &self.opts)?;
         splice_carried_body_to(
