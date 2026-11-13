@@ -34,9 +34,12 @@ use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use datafusion::{
     catalog::{Session, TableFunctionArgs, TableFunctionImpl, TableProvider},
+    common::tree_node::Transformed,
+    datasource::{DefaultTableSource, provider_as_source},
     error::{DataFusionError, Result as DfResult},
     execution::{TaskContext, context::SessionContext},
-    logical_expr::{Expr, TableProviderFilterPushDown, TableType},
+    logical_expr::{Expr, LogicalPlan, Sort, TableProviderFilterPushDown, TableType},
+    optimizer::{OptimizerConfig, OptimizerRule, optimizer::ApplyOrder},
     physical_expr::EquivalenceProperties,
     physical_plan::{
         DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
@@ -54,11 +57,12 @@ use crate::{
         handle::{SupertableReader, WeakReader},
         query::exec::{
             common::{
-                Arity, arg_to_string, live_reader, output_schema_with_score, resolve_hits,
-                scope_to_call, traced_tvf, traced_tvf_rows,
+                Arity, PushedPredicate, arg_to_string, live_reader, output_schema_with_score,
+                resolve_hits, scope_to_call, traced_tvf, traced_tvf_rows,
             },
             fts_exec::arg_to_bool_mode,
         },
+        query::{match_order::MatchOrder, range_top_k::with_scan_source},
     },
     utils::trace::detail_span,
 };
@@ -149,6 +153,7 @@ impl TableFunctionImpl for TokenMatchFunc {
                 query: MatchQuery::Token { query, mode },
                 scalar_schema: Arc::clone(&self.scalar_schema),
                 output_schema: Arc::clone(&self.output_schema),
+                order: None,
             }),
         )
     }
@@ -188,6 +193,7 @@ impl TableFunctionImpl for ExactMatchFunc {
                 query: MatchQuery::Exact { value },
                 scalar_schema: Arc::clone(&self.scalar_schema),
                 output_schema: Arc::clone(&self.output_schema),
+                order: None,
             }),
         )
     }
@@ -195,12 +201,37 @@ impl TableFunctionImpl for ExactMatchFunc {
 
 /// One parsed match invocation as a `TableProvider`. `scan` lowers to
 /// [`MatchExec`].
-struct MatchTable {
+pub(crate) struct MatchTable {
     reader: Arc<SupertableReader>,
     column: String,
     query: MatchQuery,
     scalar_schema: SchemaRef,
     output_schema: SchemaRef,
+    /// The `ORDER BY column LIMIT n` above the match, when the plan is one
+    /// the walk can honour (see [`MatchTopK`]).
+    order: Option<OrderHint>,
+}
+
+/// An `ORDER BY column [DESC] LIMIT fetch` over a match.
+#[derive(Debug, Clone)]
+pub(crate) struct OrderHint {
+    column: String,
+    descending: bool,
+    fetch: usize,
+}
+
+impl MatchTable {
+    /// This match with `hint` for its walk.
+    fn with_order(&self, hint: OrderHint) -> Self {
+        Self {
+            reader: Arc::clone(&self.reader),
+            column: self.column.clone(),
+            query: self.query.clone(),
+            scalar_schema: Arc::clone(&self.scalar_schema),
+            output_schema: Arc::clone(&self.output_schema),
+            order: Some(hint),
+        }
+    }
 }
 
 impl fmt::Debug for MatchTable {
@@ -208,6 +239,7 @@ impl fmt::Debug for MatchTable {
         f.debug_struct("MatchTable")
             .field("column", &self.column)
             .field("query", &self.query)
+            .field("order", &self.order)
             .finish()
     }
 }
@@ -237,7 +269,8 @@ impl TableProvider for MatchTable {
             Arc::clone(&self.output_schema),
             projection.cloned(),
         )?
-        .with_filters(filters.to_vec());
+        .with_filters(filters.to_vec())
+        .with_order(self.order.clone());
         Ok(Arc::new(exec))
     }
 
@@ -250,6 +283,92 @@ impl TableProvider for MatchTable {
     ) -> DfResult<Vec<TableProviderFilterPushDown>> {
         Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
     }
+}
+
+/// [`MatchTopK`]: `ORDER BY column LIMIT n` over `token_match` /
+/// `exact_match` hands the match the order and the limit, so it opens its
+/// superfiles in the column's order and stops once none left can place a
+/// row (see [`MatchOrder`]). The rule only marks the match's provider; the
+/// sort and the filters stay above it, and the answer is the one they give
+/// over the rows the match returns. It fires for a sort on a single plain
+/// column, through filters, plain column projections and aliases; whether
+/// the walk can honour it is the match's call, made when it runs.
+#[derive(Debug, Default)]
+pub(crate) struct MatchTopK;
+
+impl OptimizerRule for MatchTopK {
+    fn name(&self) -> &str {
+        "match_top_k"
+    }
+
+    fn apply_order(&self) -> Option<ApplyOrder> {
+        Some(ApplyOrder::TopDown)
+    }
+
+    fn supports_rewrite(&self) -> bool {
+        true
+    }
+
+    fn rewrite(
+        &self,
+        plan: LogicalPlan,
+        _config: &dyn OptimizerConfig,
+    ) -> DfResult<Transformed<LogicalPlan>> {
+        match order_match(&plan)? {
+            Some(rewritten) => Ok(Transformed::yes(rewritten)),
+            None => Ok(Transformed::no(plan)),
+        }
+    }
+}
+
+/// The sort with its match's provider swapped for one carrying the order,
+/// or `None` when the plan is not a sort over a match.
+fn order_match(plan: &LogicalPlan) -> DfResult<Option<LogicalPlan>> {
+    let LogicalPlan::Sort(Sort {
+        expr,
+        input,
+        fetch: Some(fetch),
+    }) = plan
+    else {
+        return Ok(None);
+    };
+    let [sort_expr] = expr.as_slice() else {
+        return Ok(None);
+    };
+    let Expr::Column(column) = &sort_expr.expr else {
+        return Ok(None);
+    };
+    let mut node = input.as_ref();
+    let scan = loop {
+        match node {
+            LogicalPlan::Projection(projection)
+                if projection.expr.iter().all(|e| matches!(e, Expr::Column(_))) =>
+            {
+                node = projection.input.as_ref();
+            }
+            LogicalPlan::Filter(filter) => node = filter.input.as_ref(),
+            LogicalPlan::SubqueryAlias(alias) => node = alias.input.as_ref(),
+            LogicalPlan::TableScan(scan) => break scan,
+            _ => return Ok(None),
+        }
+    };
+    let Some(table) = scan
+        .source
+        .downcast_ref::<DefaultTableSource>()
+        .and_then(|source| source.table_provider.downcast_ref::<MatchTable>())
+    else {
+        return Ok(None);
+    };
+    if table.order.is_some() {
+        return Ok(None);
+    }
+    let hinted = Arc::new(table.with_order(OrderHint {
+        column: column.name.clone(),
+        descending: !sort_expr.asc,
+        fetch: *fetch,
+    }));
+    let source = provider_as_source(hinted as Arc<dyn TableProvider>);
+    Ok(Some(with_scan_source(plan, &source)?))
 }
 
 /// Custom `ExecutionPlan` that runs an unranked match kernel on the
@@ -265,6 +384,8 @@ struct MatchExec {
     projected_schema: SchemaRef,
     /// The pushed-down `WHERE`, used only to read less.
     filters: Vec<Expr>,
+    /// The `ORDER BY column LIMIT n` above, when the walk can honour it.
+    order: Option<OrderHint>,
     cache: Arc<PlanProperties>,
 }
 
@@ -300,12 +421,18 @@ impl MatchExec {
             projection,
             projected_schema,
             filters: Vec::new(),
+            order: None,
             cache,
         })
     }
 
     fn with_filters(mut self, filters: Vec<Expr>) -> Self {
         self.filters = filters;
+        self
+    }
+
+    fn with_order(mut self, order: Option<OrderHint>) -> Self {
+        self.order = order;
         self
     }
 
@@ -320,6 +447,15 @@ impl MatchExec {
             MatchQuery::Exact { .. } => {
                 format!("MatchExec: kind=exact, column={}", self.column)
             }
+        };
+        let text = match &self.order {
+            Some(hint) => format!(
+                "{text}, order={} {} fetch={}",
+                hint.column,
+                if hint.descending { "desc" } else { "asc" },
+                hint.fetch
+            ),
+            None => text,
         };
         if self.filters.is_empty() {
             text
@@ -379,6 +515,7 @@ impl ExecutionPlan for MatchExec {
         let projection = self.projection.clone();
         let projected_schema = Arc::clone(&self.projected_schema);
         let filters = self.filters.clone();
+        let order_hint = self.order.clone();
 
         // What the consumer reads decides how much of a hit to build. A
         // projection of no columns at all is `COUNT(*)`: the count
@@ -393,9 +530,11 @@ impl ExecutionPlan for MatchExec {
             (Some(indices), Some(id_idx)) => indices.contains(&id_idx),
             (Some(_), None) => false,
         };
-        // A count with a filter takes the hit walk below, which prunes by it.
-        let counts_only =
-            filters.is_empty() && matches!(&projection, Some(indices) if indices.is_empty());
+        // A count with a filter takes the hit walk below, which prunes by it;
+        // so does a match under an `ORDER BY ... LIMIT`, which walks in order.
+        let counts_only = filters.is_empty()
+            && order_hint.is_none()
+            && matches!(&projection, Some(indices) if indices.is_empty());
         let score_idx = scalar_schema.fields().len();
         let needs_score = match &projection {
             None => true,
@@ -419,6 +558,7 @@ impl ExecutionPlan for MatchExec {
         if !counts_only
             && !needs_ids
             && !needs_score
+            && order_hint.is_none()
             && let (Some(indices), MatchQuery::Token { query, mode }) =
                 (projection.clone(), query.clone())
         {
@@ -484,14 +624,41 @@ impl ExecutionPlan for MatchExec {
                 )
                 .map_err(|e| QueryError::internal(e).into());
             }
+            // Under an `ORDER BY column LIMIT n` the walk can honour, the
+            // match opens its superfiles in the column's order and stops
+            // once none left can place a row.
+            let order = match &order_hint {
+                Some(hint) => {
+                    let predicate = PushedPredicate::compile(&filters, &output_schema);
+                    MatchOrder::new(
+                        &reader,
+                        &hint.column,
+                        hint.descending,
+                        hint.fetch,
+                        predicate.as_ref(),
+                        &output_schema,
+                    )?
+                    .map(Arc::new)
+                }
+                None => None,
+            };
             let hits = match &query {
                 MatchQuery::Token { query, mode } => {
                     reader
-                        .token_match_hits_async(&column, query, *mode, needs_ids, &filters)
+                        .token_match_hits_async(
+                            &column,
+                            query,
+                            *mode,
+                            needs_ids,
+                            &filters,
+                            order.as_ref(),
+                        )
                         .await
                 }
                 MatchQuery::Exact { value } => {
-                    reader.exact_match_async(&column, value, &filters).await
+                    reader
+                        .exact_match_async(&column, value, &filters, order.as_ref())
+                        .await
                 }
             }?;
             resolve_hits(
@@ -530,6 +697,7 @@ mod tests {
     use tokio::runtime::Runtime;
 
     use super::{EXACT_MATCH_UDTF, ExactMatchFunc, MatchExec, MatchQuery, TokenMatchFunc};
+    use crate::supertable::query::match_order::ORDERED_WINDOW;
     use crate::{
         Connection, FieldPatch, IndexSpec, SchemaPatch, connect,
         runtime_metrics::op_stats::with_op_stats,
@@ -870,7 +1038,7 @@ mod tests {
                         .into_iter()
                         .collect();
                     let hits = reader
-                        .token_match_hits_async("title", "rust", BoolMode::Or, true, &filters)
+                        .token_match_hits_async("title", "rust", BoolMode::Or, true, &filters, None)
                         .await
                         .expect("hits");
                     let batches = reader
@@ -884,7 +1052,7 @@ mod tests {
                         .await
                         .expect("columns");
                     let exact = reader
-                        .exact_match_async("title", "rust", &filters)
+                        .exact_match_async("title", "rust", &filters, None)
                         .await
                         .expect("exact");
                     let taken: usize = batches.iter().map(RecordBatch::num_rows).sum();
@@ -1430,5 +1598,148 @@ mod tests {
                 .is_err(),
             "invalid bool mode must error"
         );
+    }
+
+    /// Superfiles of the hourly match table, one commit each, hours ascending.
+    const HOURLY_FILES: i64 = 24;
+    /// Leading hours the rare monument is viewed in.
+    const MONUMENT_HOURS: i64 = 5;
+    /// Filler pages per hour.
+    const HOURLY_FILLER: usize = 20;
+
+    /// A page-view log: per hour, "Zyzzyva" in two languages, the monument
+    /// in its first hours, and filler — one superfile per hour, so `hour`
+    /// orders the superfiles as time orders a log's.
+    fn hourly_conn() -> Connection {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new("lang", DataType::Utf8, false),
+            Field::new("hour", DataType::Int64, false),
+        ]));
+        let commits: Vec<RecordBatch> = (0..HOURLY_FILES)
+            .map(|hour| {
+                let mut titles: Vec<String> = vec!["Zyzzyva".into(), "Zyzzyva".into()];
+                let mut langs: Vec<&str> = vec!["en", "de"];
+                if hour < MONUMENT_HOURS {
+                    titles.push("Hunnestad Monument".into());
+                    langs.push("sv");
+                }
+                for i in 0..HOURLY_FILLER {
+                    titles.push(format!("page {hour} {i}"));
+                    langs.push("en");
+                }
+                let n = titles.len();
+                RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![
+                        Arc::new(LargeStringArray::from(
+                            titles.iter().map(String::as_str).collect::<Vec<_>>(),
+                        )),
+                        Arc::new(StringArray::from(langs)),
+                        Arc::new(Int64Array::from(vec![hour; n])),
+                    ],
+                )
+                .expect("batch")
+            })
+            .collect();
+        metered_table(&schema, IndexSpec::new().fts("title"), &commits)
+    }
+
+    /// The `hour`s `sql` returns, in its order.
+    fn hours(conn: &Connection, sql: &str) -> Vec<i64> {
+        conn.query_sql(sql)
+            .expect("query_sql")
+            .iter()
+            .flat_map(|b| {
+                let hours = b
+                    .column_by_name("hour")
+                    .expect("hour")
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("Int64")
+                    .clone();
+                hours.values().to_vec()
+            })
+            .collect()
+    }
+
+    /// `ORDER BY hour DESC LIMIT n` over a match opens the newest superfiles
+    /// holding a match the `WHERE` keeps, and no more than a window past
+    /// them; a second sort key, which the walk does not honour, opens every
+    /// one and returns the same hours.
+    #[test]
+    fn token_match_order_by_time_desc_limit_opens_newest_only() {
+        const N: usize = 3;
+        let conn = hourly_conn();
+        let ordered = format!(
+            "SELECT hour, lang FROM token_match('{METERED_TABLE}', 'title', 'zyzzyva') \
+             WHERE lang = 'en' ORDER BY hour DESC LIMIT {N}"
+        );
+        let unordered = format!(
+            "SELECT hour, lang FROM token_match('{METERED_TABLE}', 'title', 'zyzzyva') \
+             WHERE lang = 'en' ORDER BY hour DESC, lang LIMIT {N}"
+        );
+        assert_eq!(hours(&conn, &ordered), hours(&conn, &unordered));
+        assert_eq!(hours(&conn, &ordered), vec![23, 22, 21]);
+        let (rows, opened) = metered_rows(&conn, &ordered);
+        assert_eq!(rows, N);
+        assert!(
+            opened <= (N + ORDERED_WINDOW) as u64,
+            "opened {opened} superfiles for the newest {N}"
+        );
+        let (_, all) = metered_rows(&conn, &unordered);
+        assert_eq!(all, HOURLY_FILES as u64, "a second sort key walks them all");
+    }
+
+    /// Ascending, through `exact_match`: the oldest superfiles first.
+    #[test]
+    fn exact_match_order_by_time_asc_limit_opens_oldest_only() {
+        const N: usize = 2;
+        let conn = hourly_conn();
+        let sql = format!(
+            "SELECT hour FROM exact_match('{METERED_TABLE}', 'title', 'Hunnestad Monument') \
+             ORDER BY hour LIMIT {N}"
+        );
+        assert_eq!(hours(&conn, &sql), vec![0, 1]);
+        let (_, opened) = metered_rows(&conn, &sql);
+        assert!(
+            opened <= (N + ORDERED_WINDOW) as u64,
+            "opened {opened} superfiles for the oldest {N}"
+        );
+    }
+
+    /// A `WHERE` the walk cannot check before ranking leaves the match to
+    /// every superfile, and the answer as the sort gives it.
+    #[test]
+    fn order_by_time_under_an_uncheckable_where_walks_every_superfile() {
+        let conn = hourly_conn();
+        let sql = format!(
+            "SELECT hour FROM token_match('{METERED_TABLE}', 'title', 'zyzzyva') \
+             WHERE score >= 0 ORDER BY hour DESC LIMIT 2"
+        );
+        assert_eq!(hours(&conn, &sql), vec![23, 23]);
+        let (_, opened) = metered_rows(&conn, &sql);
+        assert_eq!(opened, HOURLY_FILES as u64);
+    }
+
+    /// The plan names the order the match walks in.
+    #[test]
+    fn explain_match_exec_carries_the_order() {
+        let conn = hourly_conn();
+        let plan = conn
+            .query_sql(&format!(
+                "EXPLAIN SELECT hour FROM token_match('{METERED_TABLE}', 'title', 'zyzzyva') \
+                 ORDER BY hour DESC LIMIT 5"
+            ))
+            .expect("explain");
+        let text: String = plan
+            .iter()
+            .flat_map(|b| {
+                (0..b.num_rows())
+                    .map(|i| array_value_to_string(b.column(1), i).expect("plan text"))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert!(text.contains("order=hour desc fetch=5"), "{text}");
     }
 }

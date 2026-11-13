@@ -75,6 +75,7 @@ use std::{
     cmp::Ordering,
     collections::{BTreeSet, HashMap, HashSet},
     fmt,
+    future::Future,
     iter::repeat_n,
     slice,
     sync::{
@@ -148,6 +149,7 @@ use crate::{
                 RowCheck, hit_output_schema, resolve_hits_named, take_file_columns,
                 take_rows_byte_source,
             },
+            match_order::{MatchOrder, ORDERED_WINDOW},
             provider::prune_leaves_for_filters,
             prune::{PruneLeaf, select_superfiles},
             tier,
@@ -2803,8 +2805,68 @@ impl SupertableReader {
         query: &str,
         mode: BoolMode,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
-        self.token_match_hits_async(column, query, mode, true, &[])
+        self.token_match_hits_async(column, query, mode, true, &[], None)
             .await
+    }
+
+    /// An unranked match's walk of `units` with `body`: every superfile at
+    /// once, or, under an `ORDER BY column LIMIT n` the walk can honour
+    /// ([`MatchOrder`]), in the column's order a few at a time, leaving out
+    /// the rows the `WHERE` drops and stopping once no superfile left can
+    /// place a row.
+    async fn match_fanout<P, B, Fut>(
+        &self,
+        mut units: Vec<(Arc<SuperfileEntry>, P)>,
+        body: B,
+        order: Option<&Arc<MatchOrder>>,
+    ) -> Result<Vec<Vec<SuperfileHit>>, QueryError>
+    where
+        P: Send + 'static,
+        B: Fn(
+                Arc<SuperfileReader>,
+                Arc<SuperfileEntry>,
+                Option<Arc<SidecarCache>>,
+                Instant,
+                P,
+            ) -> Fut
+            + Clone
+            + Send
+            + 'static,
+        Fut: Future<Output = Result<Vec<SuperfileHit>, QueryError>> + Send + 'static,
+    {
+        let Some(order) = order.filter(|order| order.order(&mut units)) else {
+            return dispatch::fanout_with(self, units, true, self.open_intent(), body).await;
+        };
+        let units: Vec<(Arc<SuperfileEntry>, (SuperfileUri, P))> = units
+            .into_iter()
+            .map(|(entry, params)| {
+                let uri = entry.uri;
+                (entry, (uri, params))
+            })
+            .collect();
+        let walk = Arc::clone(order);
+        let ordered = move |r: Arc<SuperfileReader>,
+                            entry: Arc<SuperfileEntry>,
+                            cache: Option<Arc<SidecarCache>>,
+                            now: Instant,
+                            (_, params): (SuperfileUri, P)| {
+            let body = body.clone();
+            let walk = Arc::clone(&walk);
+            async move {
+                let hits = body(Arc::clone(&r), entry, cache, now, params).await?;
+                walk.keep(&r, hits).await
+            }
+        };
+        dispatch::fanout_with_ordered(
+            self,
+            units,
+            ORDERED_WINDOW,
+            |(uri, _): &(SuperfileUri, P)| order.passed(uri),
+            ordered,
+            |_| {},
+            None::<dispatch::ReplanFuture<'_, _, _>>,
+        )
+        .await
     }
 
     /// [`Self::token_match_async`] with a say over whether every hit
@@ -2826,13 +2888,14 @@ impl SupertableReader {
         mode: BoolMode,
         stamp_stable_ids: bool,
         filters: &[Expr],
+        order: Option<&Arc<MatchOrder>>,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
         let Some((units, kernel)) = self.match_kernel(column, query, mode, filters).await? else {
             return Ok(Vec::new());
         };
         let phases = self.phase_spans();
         let fanout_span = trace::phase(phases, || tiered_span!("fts.fanout", units = units.len()));
-        let per_unit = dispatch::fanout_local_hits(self, units, move |r, suid| {
+        let body = dispatch::local_hits_body(move |r: Arc<SuperfileReader>, suid: Uuid| {
             let kernel = Arc::clone(&kernel);
             async move {
                 Ok(kernel
@@ -2842,9 +2905,11 @@ impl SupertableReader {
                     .map(|d| (d.get(), 0.0f32))
                     .collect::<Vec<_>>())
             }
-        })
-        .instrument(fanout_span)
-        .await?;
+        });
+        let per_unit = self
+            .match_fanout(units, body, order)
+            .instrument(fanout_span)
+            .await?;
         // Exact pre-size: `Flatten`'s size_hint is opaque, and growth
         // reallocations copy the whole hit vec repeatedly at 1M hits.
         let total: usize = per_unit.iter().map(Vec::len).sum();
@@ -3346,6 +3411,7 @@ impl SupertableReader {
         column: &str,
         value: &str,
         filters: &[Expr],
+        order: Option<&Arc<MatchOrder>>,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
         let manifest = self.manifest();
         // `exact_match` prunes through the column's own term dictionary, so
@@ -3519,7 +3585,8 @@ impl SupertableReader {
             }
         };
         let fanout_span = trace::phase(phases, || tiered_span!("fts.fanout", units = units.len()));
-        let per_unit = dispatch::fanout_with(self, units, true, self.open_intent(), body)
+        let per_unit = self
+            .match_fanout(units, body, order)
             .instrument(fanout_span)
             .await?;
         let mut hits: Vec<SuperfileHit> = per_unit.into_iter().flatten().collect();
@@ -3687,7 +3754,7 @@ impl SupertableReader {
     /// hits are **unranked** (`score` is `0.0`).
     pub fn exact_match(&self, column: &str, value: &str) -> Result<Vec<SuperfileHit>, QueryError> {
         let _foreground = ForegroundQueryGuard::enter();
-        self.block_on(self.exact_match_async(column, value, &[]))
+        self.block_on(self.exact_match_async(column, value, &[], None))
     }
 }
 

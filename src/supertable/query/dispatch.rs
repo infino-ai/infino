@@ -1009,7 +1009,7 @@ where
 
 /// The per-unit body of the local-hits fan-outs: run the kernel, tag its
 /// hits with the superfile, and drop the tombstoned ones.
-fn local_hits_body<P, K, Fut>(
+pub(crate) fn local_hits_body<P, K, Fut>(
     kernel: K,
 ) -> impl Fn(
     Arc<SuperfileReader>,

@@ -164,7 +164,10 @@ fn provider_of(scan: &TableScan) -> Option<&SupertableProvider> {
 
 /// `plan` with the scan at the bottom of its single-input chain reading
 /// from `source`.
-fn with_scan_source(plan: &LogicalPlan, source: &Arc<dyn TableSource>) -> DfResult<LogicalPlan> {
+pub(crate) fn with_scan_source(
+    plan: &LogicalPlan,
+    source: &Arc<dyn TableSource>,
+) -> DfResult<LogicalPlan> {
     if let LogicalPlan::TableScan(scan) = plan {
         return Ok(LogicalPlan::TableScan(TableScan {
             source: Arc::clone(source),

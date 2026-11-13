@@ -95,7 +95,7 @@ use crate::{
                 common::{collect_plan_metered, run_within_process_limit},
                 fts_exec::register_bm25,
                 hybrid_exec::register_hybrid_search,
-                match_exec::register_match,
+                match_exec::{MatchTopK, register_match},
                 vector_exec::register_vector_search,
             },
             provider::{SupertableProvider, TABLE_NAME, view_string_schema},
@@ -246,6 +246,7 @@ pub(crate) fn sql_session_context(
     // plans: a `LIMIT` already folded into its sort as the fetch.
     ctx.add_optimizer_rule(Arc::new(CoveredAggregateRewrite::default()));
     ctx.add_optimizer_rule(Arc::new(RangeTopK));
+    ctx.add_optimizer_rule(Arc::new(MatchTopK));
     Ok(ctx)
 }
 
