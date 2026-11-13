@@ -2119,16 +2119,10 @@ impl TableProvider for SupertableProvider {
 
         // Pass 1 (per superfile): each survivor's candidate rows.
         //
-        // Resident superfiles first, all on the pool: a local read never
-        // yields, so their index steps polled on this task would run one
-        // superfile after another. The rest, and every superfile of a plan
-        // that binds `LIKE` per superfile first, resolve below in their own
-        // futures, `superfiles_in_flight` at a time, so one superfile's
-        // dictionary fetch overlaps another's posting reads. Those futures
-        // share this task rather than being spawned, so nothing here is
-        // `'static`. Results come back in survivor order, so the file list
-        // below stays deterministic in manifest order, and the first error
-        // ends the scan.
+        // Resident superfiles go to the pool first when they outnumber its threads: a local read
+        // never yields, so on this task they would run one after another. The rest, and plans that
+        // bind `LIKE` per superfile, resolve below on this task, `superfiles_in_flight` at a time.
+        // Results keep survivor order; the first error ends the scan.
         // The columns the scan decodes, whose pages a selection may skip.
         let read_columns: Vec<&str> = match projection {
             Some(indices) => indices

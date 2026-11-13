@@ -150,6 +150,10 @@ const MAX_POOL_PLAN_DEPTH: usize = 64;
 /// only about one hand-off per pool thread.
 const MAX_FILES_PER_POOL_JOB: usize = 32;
 
+/// Fewest superfiles per job for the pool pass to run. At one per job, waking the threads costs
+/// more than the work and slows the scan right after (58 superfiles, 90 threads: +1 ms).
+const MIN_FILES_PER_POOL_JOB: usize = 2;
+
 /// What a SQL `WHERE` pushed into a search TVF admits, resolved once per
 /// query against the pinned snapshot and shared by every retriever the
 /// query runs (`hybrid_search` runs two): the superfiles that may hold a
@@ -665,6 +669,7 @@ impl CandidatePlan {
     /// back to [`Self::resolve`] on the planning task: its reader is lazy,
     /// a step would wait (another query filling a shared cell), or the plan
     /// cannot run on a pool thread, as [`Self::evaluate_on_pool`] explains.
+    /// All `None` when there are too few files for [`MIN_FILES_PER_POOL_JOB`] per job.
     pub(crate) async fn resolve_resident_on_pool(
         self: Arc<Self>,
         files: Vec<PoolFile>,
@@ -672,13 +677,12 @@ impl CandidatePlan {
         pool: &ThreadPool,
         slots: &Semaphore,
     ) -> Result<Vec<Option<Resolved>>, ReadError> {
-        if self.has_like() || self.depth() > MAX_POOL_PLAN_DEPTH {
+        let per_job = files.len().div_ceil(pool.current_num_threads().max(1));
+        if per_job < MIN_FILES_PER_POOL_JOB || self.has_like() || self.depth() > MAX_POOL_PLAN_DEPTH
+        {
             return Ok(files.iter().map(|_| None).collect());
         }
-        let per_job = files
-            .len()
-            .div_ceil(pool.current_num_threads().max(1))
-            .clamp(1, MAX_FILES_PER_POOL_JOB);
+        let per_job = per_job.min(MAX_FILES_PER_POOL_JOB);
         let mut files = files.into_iter().peekable();
         let mut jobs = Vec::new();
         while files.peek().is_some() {
@@ -3721,9 +3725,10 @@ mod tests {
         let locations = Arc::new(PlanLocations::new());
         for (what, plan, gate, want) in cases {
             let plan = Arc::new(plan);
+            // Two superfiles: the fewest a one-thread pool takes.
             let on_pool = Arc::clone(&plan)
                 .resolve_resident_on_pool(
-                    pool_files(&reader, 1, gate),
+                    pool_files(&reader, MIN_FILES_PER_POOL_JOB, gate),
                     Arc::clone(&locations),
                     &pool,
                     &slots,
@@ -3741,8 +3746,55 @@ mod tests {
                 )
                 .await
                 .expect(what);
-            assert_eq!(resolved_rows(on_pool), vec![Some(want.clone())], "{what}");
+            assert_eq!(
+                resolved_rows(on_pool),
+                vec![Some(want.clone()); MIN_FILES_PER_POOL_JOB],
+                "{what}"
+            );
             assert_eq!(row_list(here), want, "{what}");
         }
+    }
+
+    #[tokio::test]
+    async fn too_few_superfiles_stay_on_the_planning_task() {
+        // `THREADS` superfiles (one per job) stay here; one more (two per job) go to the pool.
+        const THREADS: usize = 4;
+        let pool = ThreadPoolBuilder::new()
+            .num_threads(THREADS)
+            .build()
+            .expect("pool");
+        let plan = Arc::new(terms_all(&["rust"]));
+        let reader = resident_reader();
+
+        let no_slots = Semaphore::new(0);
+        let few = Arc::clone(&plan)
+            .resolve_resident_on_pool(
+                pool_files(&reader, THREADS, OPEN_GATE),
+                Arc::new(PlanLocations::new()),
+                &pool,
+                &no_slots,
+            )
+            .now_or_never()
+            .expect("handed back without waiting")
+            .expect("resolve");
+        assert_eq!(resolved_rows(few), vec![None; THREADS]);
+
+        let slots = Semaphore::new(THREADS);
+        let enough = timeout(
+            MUST_FINISH,
+            plan.resolve_resident_on_pool(
+                pool_files(&reader, THREADS + 1, OPEN_GATE),
+                Arc::new(PlanLocations::new()),
+                &pool,
+                &slots,
+            ),
+        )
+        .await
+        .expect("finishes")
+        .expect("resolve");
+        assert_eq!(
+            resolved_rows(enough),
+            vec![Some(Some(vec![0, 2])); THREADS + 1]
+        );
     }
 }
