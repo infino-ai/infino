@@ -1189,6 +1189,40 @@ fn comparison_range(
     }
 }
 
+/// `filter` as one interval of keys on a range-indexed column that is not
+/// a float: a comparison or a `BETWEEN` against literals, as the scan
+/// bounds it, with the column's id and type. The range index holds exactly
+/// the rows whose key lies in the interval, so where every superfile has
+/// the index these are exactly the filter's rows (a NULL holds no key and
+/// passes no comparison). Floats are left out, for their NaNs and signed
+/// zeros. `None` for any other filter.
+pub(crate) fn exact_range(
+    filter: &Expr,
+    range_cols: &RangeColumns,
+) -> Option<(FieldId, DataType, u64, u64)> {
+    let plan = match filter {
+        Expr::BinaryExpr(be)
+            if matches!(
+                be.op,
+                Operator::Eq | Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq
+            ) =>
+        {
+            comparison_range(&be.left, be.op, &be.right, range_cols)
+        }
+        Expr::Between(between) if !between.negated => between_range(between, range_cols),
+        _ => return None,
+    };
+    match plan {
+        CandidatePlan::Range {
+            field,
+            data_type,
+            lo,
+            hi,
+        } if !data_type.is_floating() => Some((field, data_type, lo, hi)),
+        _ => None,
+    }
+}
+
 /// Lower `column BETWEEN low AND high` on a range-indexed column.
 fn between_range(between: &Between, range_cols: &RangeColumns) -> CandidatePlan {
     let (Expr::Column(c), Expr::Literal(low, _), Expr::Literal(high, _)) = (

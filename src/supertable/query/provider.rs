@@ -126,7 +126,8 @@ use crate::{
         },
         query::{
             candidate::{
-                CandidatePlan, ExactFilter, exact_filter, like_prune_leaves, single_range,
+                CandidatePlan, ExactFilter, exact_filter, exact_range, like_prune_leaves,
+                single_range,
             },
             deleted_stats::DeletedStatsCache,
             df_object_store::SuperfileObjectStore,
@@ -813,6 +814,30 @@ impl SupertableProvider {
             .any(|filter| self.exact_filter(filter, &fts_cols).is_some())
     }
 
+    /// Each of `filters` as an exact interval on a range-indexed column
+    /// ([`exact_range`]), or `None`. Only beside a conjunct the dictionary
+    /// answers exactly (`with_text`): the scan then intersects the range
+    /// index's rows with the dictionary's, and with every conjunct exact
+    /// DataFusion hands the scan its `LIMIT`. Alone, a range stays a bound
+    /// that a `FilterExec` verifies, which the covered-aggregate rewrite and
+    /// the counting scan rely on. [`supports_filters_pushdown`] and
+    /// [`scan`] decide the same way over the same conjuncts.
+    fn exact_ranges<'e>(
+        &self,
+        filters: impl IntoIterator<Item = &'e Expr>,
+        with_text: bool,
+    ) -> Vec<Option<(FieldId, DataType, u64, u64)>> {
+        let range_cols = self.manifest.table_schema().range_column_types();
+        filters
+            .into_iter()
+            .map(|filter| {
+                with_text
+                    .then(|| exact_range(filter, &range_cols))
+                    .flatten()
+            })
+            .collect()
+    }
+
     /// The rows of one superfile its exact conjuncts hold for, within
     /// `bound` (the other conjuncts' candidate rows, when the index bounded
     /// them). Every leaf's rows come from the dictionary
@@ -929,6 +954,26 @@ impl SupertableProvider {
                 .cloned()
                 .unwrap_or_default()
         });
+        // The range conjuncts, from the range index: its rows are exactly
+        // the interval's. A superfile without the index has its rows
+        // checked against their values instead, with the rest below.
+        for (field, data_type, lo, hi) in &check.ranges {
+            match prepared
+                .reader
+                .range_rows(*field, data_type, *lo, *hi, Some(pool))
+                .await
+                .map_err(QueryError::from)?
+            {
+                Some(in_range) => {
+                    rows.proven &= &in_range;
+                    rows.doubtful &= &in_range;
+                }
+                None => {
+                    rows.doubtful |= &rows.proven;
+                    rows.proven = RoaringBitmap::new();
+                }
+            }
+        }
         if let Some(bound) = bound {
             rows.proven &= bound;
             rows.doubtful &= bound;
@@ -1758,6 +1803,9 @@ struct ExactCheck {
     /// The conjunction as the dictionary answers it: an `AND` of the
     /// conjuncts.
     filter: ExactFilter,
+    /// The conjuncts the range index answers, beside the dictionary's:
+    /// each an interval of keys on a range-indexed column.
+    ranges: Vec<(FieldId, DataType, u64, u64)>,
     /// The conjunction, bound to the columns it reads.
     predicate: BoundPredicate,
     /// Those columns' names, in the bound schema's order.
@@ -1773,6 +1821,7 @@ impl ExactCheck {
     fn compile(
         filters: &[Expr],
         conjuncts: Vec<ExactFilter>,
+        ranges: Vec<(FieldId, DataType, u64, u64)>,
         schema: &SchemaRef,
     ) -> DfResult<Option<Self>> {
         if conjuncts.is_empty() {
@@ -1797,6 +1846,7 @@ impl ExactCheck {
             .collect();
         Ok(Some(Self {
             filter: ExactFilter::And(conjuncts),
+            ranges,
             predicate,
             columns,
             schema: bound_schema,
@@ -1945,11 +1995,17 @@ impl TableProvider for SupertableProvider {
             return Ok(vec![TableProviderFilterPushDown::Exact; filters.len()]);
         }
         let fts_cols = self.fts_cols_set();
-        Ok(filters
+        let text: Vec<bool> = filters
             .iter()
-            .map(|filter| match self.exact_filter(filter, &fts_cols) {
-                Some(_) => TableProviderFilterPushDown::Exact,
-                None => TableProviderFilterPushDown::Inexact,
+            .map(|filter| self.exact_filter(filter, &fts_cols).is_some())
+            .collect();
+        let ranges = self.exact_ranges(filters.iter().copied(), text.contains(&true));
+        Ok(text
+            .iter()
+            .zip(ranges)
+            .map(|(&text, range)| match text || range.is_some() {
+                true => TableProviderFilterPushDown::Exact,
+                false => TableProviderFilterPushDown::Inexact,
             })
             .collect())
     }
@@ -2060,16 +2116,27 @@ impl TableProvider for SupertableProvider {
         let mut exact_filters: Vec<Expr> = Vec::new();
         let mut exact_conjuncts: Vec<ExactFilter> = Vec::new();
         let mut bounded_filters: Vec<Expr> = Vec::new();
-        for filter in filters {
-            match self.exact_filter(filter, &fts_cols) {
-                Some(exact) => {
+        let text: Vec<Option<ExactFilter>> = filters
+            .iter()
+            .map(|filter| self.exact_filter(filter, &fts_cols))
+            .collect();
+        let ranges = self.exact_ranges(filters.iter(), text.iter().any(Option::is_some));
+        let mut exact_ranges = Vec::new();
+        for ((filter, text), range) in filters.iter().zip(text).zip(ranges) {
+            match (text, range) {
+                (Some(exact), _) => {
                     exact_filters.push(filter.clone());
                     exact_conjuncts.push(exact);
                 }
-                None => bounded_filters.push(filter.clone()),
+                (None, Some(range)) => {
+                    exact_filters.push(filter.clone());
+                    exact_ranges.push(range);
+                }
+                (None, None) => bounded_filters.push(filter.clone()),
             }
         }
-        let exact_check = ExactCheck::compile(&exact_filters, exact_conjuncts, &self.schema)?;
+        let exact_check =
+            ExactCheck::compile(&exact_filters, exact_conjuncts, exact_ranges, &self.schema)?;
         let exact_check = exact_check.as_ref();
         // With every conjunct answered exactly, DataFusion keeps no filter
         // above the scan, so its LIMIT is the scan's: any `limit` live rows
