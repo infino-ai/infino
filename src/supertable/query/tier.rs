@@ -447,10 +447,6 @@ struct HeadState {
     /// Which of the term's sources holds this superfile's head, when
     /// chunked.
     source: Option<usize>,
-    /// Whether the head is a required term's and whole: read to its end it
-    /// settles which documents carry the term, ruling the superfile out
-    /// when none carries every required one.
-    settles: bool,
 }
 
 impl HeadState {
@@ -465,7 +461,6 @@ impl HeadState {
             ceiling: 0.0,
             done: true,
             source: None,
-            settles: false,
         }
     }
 }
@@ -835,7 +830,6 @@ pub(crate) async fn prepare_merge<'a>(
                     ceiling,
                     done: !chunked,
                     source,
-                    settles: query.required & (1 << ti) != 0 && p.tail.is_finite() && p.tail <= 0.0,
                 };
                 if chunked {
                     first_round += p.df.min(BLOCK_ENTRIES as u64);
@@ -1182,7 +1176,7 @@ impl PreparedMerge<'_> {
             let near = merge
                 .slots
                 .iter()
-                .filter(|s| s.reads_on(bar_after, exact_scores))
+                .filter(|s| s.reads_on(bar_after, exact_scores) && s.near(bar_after))
                 .count() as u64;
             let worth =
                 pays(settled, 1, open_cost_ns, round_ns) || pays(near, 1, open_cost_ns, round_ns);
@@ -1373,22 +1367,22 @@ fn kth_candidate(slots: &[Slot], k: usize) -> (Option<f32>, i128) {
 
 impl Slot {
     /// Whether the merge still reads for the superfile against `bar`, the
-    /// threshold or the floor: it is live and its bound clears the bar, by
-    /// no more than [`NEAR_BAR`] once there is a bar. A superfile bounded
-    /// below it is ruled out or skipped whatever more of its heads would
-    /// show, and one bounded at it is skipped on the tie — unless `ties`
-    /// (the index can answer for a superfile read to its end, which beats
-    /// opening it); one bounded far above it is opened whatever its next
-    /// blocks show, unless a required term's whole head, read on, may rule
-    /// it out. The bar only rises, so a superfile it passes stays passed.
+    /// threshold or the floor: it is live and its bound clears the bar. A
+    /// superfile bounded below it is ruled out or skipped whatever more of
+    /// its heads would show, and one bounded at it is skipped on the tie —
+    /// unless `ties` (the index can answer for a superfile read to its end,
+    /// which beats opening it). The bar only rises and a bound only falls,
+    /// so a superfile it passes stays passed.
     fn reads_on(&self, bar: f32, ties: bool) -> bool {
-        let above = self.ub > bar || (ties && self.ub == bar) || self.ub.is_nan();
-        // A superfile not yet bounded (no block of its heads read) is read:
-        // its first blocks are what bound it.
-        let near =
-            !bar.is_finite() || bar <= 0.0 || !self.ub.is_finite() || self.ub <= bar * NEAR_BAR;
-        let settling = self.heads.iter().any(|h| h.settles && !h.done);
-        self.live && above && (near || settling)
+        self.live && (self.ub > bar || (ties && self.ub == bar) || self.ub.is_nan())
+    }
+
+    /// Whether the superfile's bound clears `bar` by little enough that
+    /// its next blocks may bring it down to the bar: what makes a round
+    /// worth reading (see [`NEAR_BAR`]). A superfile not yet bounded
+    /// counts, its first blocks being what bound it.
+    fn near(&self, bar: f32) -> bool {
+        !bar.is_finite() || bar <= 0.0 || !self.ub.is_finite() || self.ub <= bar * NEAR_BAR
     }
 
     /// Take in one entry: document `row` read under term `ti` with
@@ -2296,11 +2290,11 @@ mod tests {
         );
     }
 
-    /// The merge reads on for a superfile whose bound clears the bar by
-    /// little, not for one bounded far above it, below it, or — unless the
-    /// index can answer for it — at it.
+    /// The merge reads on for a superfile whose bound clears the bar, not
+    /// for one bounded below it or — unless the index can answer for it —
+    /// at it; a round is worth reading for those near the bar.
     #[test]
-    fn the_merge_reads_on_only_near_the_bar() {
+    fn the_merge_reads_on_above_the_bar_and_counts_those_near_it() {
         let bound = |ub: f32| {
             let mut s = Slot::new(1, 1.0, None);
             s.ub = ub;
@@ -2308,18 +2302,17 @@ mod tests {
         };
         let bar = 10.0;
         assert!(bound(10.5).reads_on(bar, false));
-        assert!(!bound(12.0).reads_on(bar, false), "far above the bar");
+        assert!(bound(12.0).reads_on(bar, false), "far above, still read");
         assert!(!bound(9.0).reads_on(bar, false), "below the bar");
         assert!(!bound(10.0).reads_on(bar, false), "a tie, skipped by id");
         assert!(
             bound(10.0).reads_on(bar, true),
             "a tie the index can answer"
         );
-        assert!(bound(50.0).reads_on(f32::NEG_INFINITY, false), "no bar yet");
-        assert!(
-            bound(f32::INFINITY).reads_on(bar, false),
-            "not yet bounded: its first blocks bound it"
-        );
+        assert!(bound(10.5).near(bar));
+        assert!(!bound(12.0).near(bar), "far above the bar");
+        assert!(bound(50.0).near(f32::NEG_INFINITY), "no bar yet");
+        assert!(bound(f32::INFINITY).near(bar), "not yet bounded");
     }
 
     /// A source of `chunks` chunks of `chunk_bytes` each.

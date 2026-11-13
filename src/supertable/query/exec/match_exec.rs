@@ -55,14 +55,17 @@ use crate::{
     supertable::{
         error::QueryError,
         handle::{SupertableReader, WeakReader},
-        query::exec::{
-            common::{
-                Arity, PushedPredicate, arg_to_string, live_reader, output_schema_with_score,
-                resolve_hits, scope_to_call, traced_tvf, traced_tvf_rows,
+        query::{
+            exec::{
+                common::{
+                    Arity, PushedPredicate, arg_to_string, live_reader, output_schema_with_score,
+                    resolve_hits, scope_to_call, traced_tvf, traced_tvf_rows,
+                },
+                fts_exec::arg_to_bool_mode,
             },
-            fts_exec::arg_to_bool_mode,
+            match_order::MatchOrder,
+            range_top_k::with_scan_source,
         },
-        query::{match_order::MatchOrder, range_top_k::with_scan_source},
     },
     utils::trace::detail_span,
 };
@@ -697,7 +700,6 @@ mod tests {
     use tokio::runtime::Runtime;
 
     use super::{EXACT_MATCH_UDTF, ExactMatchFunc, MatchExec, MatchQuery, TokenMatchFunc};
-    use crate::supertable::query::match_order::ORDERED_WINDOW;
     use crate::{
         Connection, FieldPatch, IndexSpec, SchemaPatch, connect,
         runtime_metrics::op_stats::with_op_stats,
@@ -707,7 +709,10 @@ mod tests {
             Supertable, SupertableOptions,
             error::QueryError,
             handle::SupertableReader,
-            query::exec::common::{output_schema_with_score, test_support::sql_row_count},
+            query::{
+                exec::common::{output_schema_with_score, test_support::sql_row_count},
+                match_order::ORDERED_WINDOW,
+            },
         },
     };
 

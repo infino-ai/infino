@@ -21,8 +21,7 @@ use infino::{
     runtime_metrics::op_stats::{OpStats, with_op_stats},
     storage::{LocalFsStorageProvider, StorageProvider},
     superfile::builder::FtsConfig,
-    supertable::manifest::SuperfileUri,
-    supertable::{Supertable, SupertableOptions},
+    supertable::{Supertable, SupertableOptions, manifest::SuperfileUri},
 };
 use tempfile::TempDir;
 
