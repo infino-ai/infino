@@ -102,8 +102,10 @@ const BOUND_SLACK: f32 = 1.0 + 8.0 * f32::EPSILON;
 /// costs what its first block costs, one ranged read, and the rounds after
 /// the first then need no storage round trip. A larger tier — a common
 /// term's, tens of blocks for every superfile — reads its first block alone,
-/// and the rest in one wave only if the merge goes on past it, which at a
-/// small k it rarely does.
+/// and each later block only in the round that merges it, which at a small
+/// k is rarely reached. Measured on a term index over fifty thousand
+/// superfiles: a common term's whole tier is 80 to 100 MB, its first blocks
+/// 11 to 13 MB.
 const TIER_FIRST_WAVE_MAX_BYTES: u64 = 4 << 20;
 /// Most distinct terms, phrase members included, the merge serves: a
 /// document's terms are a bit mask. Past two bare terms a candidate's sum
@@ -277,8 +279,12 @@ impl TierPolicy {
 }
 /// Entries the merge reads per query before it stops regardless of what is
 /// still in play. What has been read by then still bounds every superfile
-/// soundly; the merge just stops refining.
-const MAX_ENTRIES_PER_QUERY: u64 = 1 << 20;
+/// soundly; the merge just stops refining. A query whose first round alone
+/// would pass it is not merged. Sized for a table of tens of thousands of
+/// superfiles: a common term's first round there is one block of up to 64
+/// entries per superfile (about three million at fifty thousand), and every
+/// entry read is held, with its contribution, until the merge reports.
+const MAX_ENTRIES_PER_QUERY: u64 = 1 << 23;
 /// Superfiles one pool job decodes in a round. A superfile's share of a
 /// round is several microseconds, so jobs this size still dwarf the
 /// pool's scheduling while a round of a hundred superfiles spreads over
@@ -340,6 +346,12 @@ pub(crate) struct TierQuery<'a> {
     /// Whether to skip the merge where its first round, at that per-entry
     /// cost, costs more than every open it could save at the open cost.
     pub(crate) merge_gate: bool,
+    /// Whether the merge runs whatever the gate would say: a table with
+    /// more kept superfiles than one open window, where the opens the
+    /// merge can save dwarf a round's cost and only the merge can tell
+    /// tied superfiles apart. The measured costs still decide how deep it
+    /// reads.
+    pub(crate) forced: bool,
 }
 
 /// The merge's outcome for one query.
@@ -522,6 +534,35 @@ fn pays(opens: u64, rounds: u64, open_cost_ns: u64, round_ns: u64) -> bool {
     u128::from(opens) * u128::from(open_cost_ns) >= u128::from(rounds) * u128::from(round_ns)
 }
 
+/// Whether the first wave reads a term's chunked tier whole: when the
+/// term's tier across all its sources is small enough that the whole of it
+/// costs what its first blocks cost, one ranged read per source. Judged per
+/// term, not per source: a common term spread over many layers is small in
+/// each and large in all, and read whole it would cost the merge every
+/// block of every superfile when a round or two of them is what it reads.
+fn read_whole_first(term_sources: &[Source]) -> bool {
+    let whole: u64 = term_sources
+        .iter()
+        .flat_map(|s| s.chunks.iter())
+        .map(|c| c.len)
+        .sum();
+    whole <= TIER_FIRST_WAVE_MAX_BYTES
+}
+
+/// Per term and source, whether a live superfile still reads a head from
+/// it: a chunk no live head reads is not fetched.
+fn sources_read_on(slots: &[Slot], sources: &[Vec<Source>]) -> Vec<Vec<bool>> {
+    let mut needed: Vec<Vec<bool>> = sources.iter().map(|s| vec![false; s.len()]).collect();
+    for slot in slots.iter().filter(|s| s.live) {
+        for (ti, head) in slot.heads.iter().enumerate() {
+            if let (false, Some(si)) = (head.done, head.source) {
+                needed[ti][si] = true;
+            }
+        }
+    }
+    needed
+}
+
 /// Fold `sample` into the running average in `cell`, moving it a
 /// `2^-shift` of the way from its old value; the first sample sets it.
 pub(crate) fn fold_mean(cell: &AtomicU64, sample: u64, shift: u32) {
@@ -544,6 +585,7 @@ pub(crate) struct PreparedMerge<'a> {
     sources: Vec<Vec<Source>>,
     required: TermMask,
     merge_gate: bool,
+    forced: bool,
     open_cost_ns: u64,
     /// Whether the sums are the kernel's bit for bit, so a superfile whose
     /// heads were read whole can be answered from the index.
@@ -577,21 +619,13 @@ pub(crate) async fn prepare_merge<'a>(
     // more than every open it could save at the open cost measured here,
     // it cannot pay back and the ceilings serve instead.
     if query.merge_gate
+        && !query.forced
         && query.open_cost_ns > 0
         && query.entry_cost_ns > 0
         && (nt as u64)
             .saturating_mul(BLOCK_ENTRIES as u64)
             .saturating_mul(query.entry_cost_ns)
             > query.open_cost_ns
-    {
-        return Ok(None);
-    }
-    // The first round decodes a block per term per kept superfile: a query
-    // whose first round alone would pass the entry cap is not merged.
-    if (nt as u64)
-        .saturating_mul(kept.len() as u64)
-        .saturating_mul(BLOCK_ENTRIES as u64)
-        > MAX_ENTRIES_PER_QUERY
     {
         return Ok(None);
     }
@@ -657,6 +691,9 @@ pub(crate) async fn prepare_merge<'a>(
     };
     let mut sources: Vec<Vec<Source>> = (0..nt).map(|_| Vec::new()).collect();
     let mut inline: Vec<(usize, TierEntry)> = Vec::new();
+    // What the first round decodes: the first block of every chunked head,
+    // which holds the head's documents up to a block's worth.
+    let mut first_round = 0u64;
     for (ti, runs) in runs_per_term.iter().enumerate() {
         let idf_table = idf[ti];
         for SliceRun {
@@ -718,11 +755,19 @@ pub(crate) async fn prepare_merge<'a>(
                     done: !chunked,
                     source,
                 };
+                if chunked {
+                    first_round += p.df.min(BLOCK_ENTRIES as u64);
+                }
             }
             if !chunked {
                 inline.extend(tier.inline.iter().map(|e| (ti, *e)));
             }
         }
+    }
+
+    // A query whose first round alone would pass the entry cap is not merged.
+    if first_round > MAX_ENTRIES_PER_QUERY {
+        return Ok(None);
     }
 
     // A contribution is the kernel's own arithmetic, so a one- or two-term
@@ -817,6 +862,7 @@ pub(crate) async fn prepare_merge<'a>(
         sources,
         required: query.required,
         merge_gate: query.merge_gate,
+        forced: query.forced,
         open_cost_ns: query.open_cost_ns,
         exact_scores,
         resident,
@@ -829,18 +875,20 @@ impl PreparedMerge<'_> {
     /// of these terms can: the reads land in the chunk cache, and that query
     /// finds them resident and merges before it opens.
     pub(crate) fn prefetch(self, index: Arc<TermIndex>) {
-        for source in self.sources.iter().flatten() {
-            let whole: u64 = source.chunks.iter().map(|c| c.len).sum();
-            let upto = match whole > TIER_FIRST_WAVE_MAX_BYTES {
-                true => 1,
-                false => source.chunks.len(),
-            };
-            let chunks = source.chunks[..upto].to_vec();
-            let object = source.object;
-            let index = Arc::clone(&index);
-            task::spawn(async move {
-                let _ = index.tier_chunks(&object, &chunks).await;
-            });
+        for term_sources in &self.sources {
+            let whole = read_whole_first(term_sources);
+            for source in term_sources {
+                let upto = match whole {
+                    true => source.chunks.len(),
+                    false => source.chunks.len().min(1),
+                };
+                let chunks = source.chunks[..upto].to_vec();
+                let object = source.object;
+                let index = Arc::clone(&index);
+                task::spawn(async move {
+                    let _ = index.tier_chunks(&object, &chunks).await;
+                });
+            }
         }
     }
 
@@ -853,6 +901,7 @@ impl PreparedMerge<'_> {
             sources,
             required,
             merge_gate,
+            forced,
             open_cost_ns,
             exact_scores,
             ..
@@ -860,44 +909,51 @@ impl PreparedMerge<'_> {
         // A round merges the next block of every live head. The blocks of one
         // depth lie together, one chunk per term and layer. The first wave
         // reads a small tier whole and a large tier's first block, every
-        // term's at once; a second wave, issued only if the merge goes on,
-        // reads what a large tier has left, so the merge costs one storage
-        // round trip at a small k and two at most. A read the merge no longer
-        // waits for still lands in the chunk cache, for the next query of the
-        // term.
+        // term's at once; each later round reads, of a large tier, only the
+        // next block's chunk, and only where a live superfile still reads
+        // that term's head. A common term's tier on a table of tens of
+        // thousands of superfiles is tens of chunks of megabytes each, and
+        // a merge that stops after a round or two needs none of the rest.
         let max_rounds = match crate::config::global().diagnostics.tier_rounds {
             0 => usize::MAX,
             n => n as usize,
         };
         // With the gate off the merge is under test and reads on while a round
         // excludes anything, whatever the opens were measured to cost: the
-        // rounds it takes then depend on the table alone.
-        let open_cost_ns = if merge_gate { open_cost_ns } else { 0 };
+        // rounds it takes then depend on the table alone. A merge forced by
+        // the table's size keeps the measured costs: they decide its depth.
+        let open_cost_ns = if merge_gate || forced {
+            open_cost_ns
+        } else {
+            0
+        };
+        let whole_first: Vec<bool> = sources.iter().map(|s| read_whole_first(s)).collect();
         let mut tier_bytes = 0u64;
         let mut merge_ns = 0u64;
         let mut merge = merge;
         let mut sources = sources;
         for round in 0..max_rounds {
             // What this round still has to read, per source: a small tier
-            // whole in the first wave; a large one's first block in the first
-            // wave and every block after it in the second, so no round past
-            // the first costs a round trip of its own.
+            // whole in the first wave; of a large one, the chunk at this
+            // round's depth, where a live head still reads it.
+            let needed = sources_read_on(&merge.slots, &sources);
             let reads: Vec<(usize, usize, Range<usize>)> = sources
                 .iter()
                 .enumerate()
                 .flat_map(|(ti, term_sources)| {
+                    let whole = whole_first[ti];
+                    let needed = &needed[ti];
                     term_sources
                         .iter()
                         .enumerate()
                         .filter_map(move |(si, source)| {
                             let have = source.data.len();
-                            if have > round || have >= source.chunks.len() {
+                            if have > round || have >= source.chunks.len() || !needed[si] {
                                 return None;
                             }
-                            let whole: u64 = source.chunks.iter().map(|c| c.len).sum();
-                            let upto = match round == 0 && whole > TIER_FIRST_WAVE_MAX_BYTES {
-                                true => 1,
-                                false => source.chunks.len(),
+                            let upto = match whole {
+                                true => source.chunks.len(),
+                                false => round + 1,
                             };
                             Some((ti, si, have..upto))
                         })
@@ -1803,5 +1859,73 @@ mod tests {
         slot.refresh(&shape, &[1.0], 2, 1.0, 1.0, &mut Scratch::default());
         assert_eq!(slot.top, vec![0.6], "row 4 is deleted");
         assert!((slot.ub - 0.6).abs() < 1e-6);
+    }
+
+    /// A source of `chunks` chunks of `chunk_bytes` each.
+    fn source(chunks: usize, chunk_bytes: u64) -> Source {
+        Source {
+            object: ContentHash([0; 32]),
+            chunks: (0..chunks)
+                .map(|i| TierChunkRef {
+                    offset: i as u64 * chunk_bytes,
+                    len: chunk_bytes,
+                    n_blocks: 1,
+                })
+                .collect(),
+            data: Vec::new(),
+            base: 0,
+        }
+    }
+
+    /// The first wave reads a term whole by the term's tier across all its
+    /// sources: small in every layer is not small, when the layers are
+    /// many.
+    #[test]
+    fn first_wave_reads_whole_only_when_the_terms_tier_is_small() {
+        const MB: u64 = 1 << 20;
+        let small = vec![source(3, MB)];
+        assert!(read_whole_first(&small), "3 MB in all is read whole");
+        let spread: Vec<Source> = (0..14).map(|_| source(4, MB / 2)).collect();
+        assert!(
+            spread
+                .iter()
+                .all(|s| s.chunks.iter().map(|c| c.len).sum::<u64>() <= 2 * MB),
+            "every source alone is small"
+        );
+        assert!(
+            !read_whole_first(&spread),
+            "fourteen sources of 2 MB are 28 MB: first blocks only"
+        );
+    }
+
+    /// A later round fetches a source's chunk only where a live superfile
+    /// still reads that term's head there.
+    #[test]
+    fn later_rounds_read_only_sources_a_live_head_reads() {
+        let sources = vec![vec![source(4, 1), source(4, 1)], vec![source(4, 1)]];
+        let mut reading = Slot::new(2, 1.0, None);
+        reading.heads[0] = HeadState {
+            done: false,
+            source: Some(1),
+            ..HeadState::absent()
+        };
+        reading.heads[1] = HeadState {
+            done: true,
+            source: Some(0),
+            ..HeadState::absent()
+        };
+        let mut ruled_out = Slot::new(2, 1.0, None);
+        ruled_out.live = false;
+        ruled_out.heads[0] = HeadState {
+            done: false,
+            source: Some(0),
+            ..HeadState::absent()
+        };
+        let needed = sources_read_on(&[reading, ruled_out], &sources);
+        assert_eq!(
+            needed,
+            vec![vec![false, true], vec![false]],
+            "only the live, unfinished head's source is read on"
+        );
     }
 }

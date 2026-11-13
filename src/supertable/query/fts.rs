@@ -1374,7 +1374,17 @@ impl SupertableReader {
         );
         let ranked_started = Instant::now();
         let learned = manifest.options.tier_merge_gate;
-        let merge_now = tiers_serve && (!learned || self.tier_policy().merge(policy_class));
+        // Past one open window of superfiles the merge always runs: there
+        // the opens it can save run to the table's size, and on a table
+        // whose best documents tie across superfiles — the same title in
+        // every hour of a time-ordered log — only the documents the merge
+        // reads tell the tied superfiles apart, where the ceilings, loose
+        // by the length rescale, open them all. Its measured costs still
+        // decide how deep it reads. Within a window the table's learned
+        // call stands.
+        let forced = tiers_serve && kept.len() > manifest.options.ordered_open_window();
+        let merge_now =
+            tiers_serve && (forced || !learned || self.tier_policy().merge(policy_class));
         // The deny sets, resolved only for a merge: it reads past the
         // deleted rows, and the units then admit rows by the same sets, so
         // a delete committed between the two reads cannot leave the
@@ -1484,6 +1494,7 @@ impl SupertableReader {
                     open_cost_ns: self.open_cost_ns(),
                     entry_cost_ns: self.tier_entry_cost_ns(),
                     merge_gate: manifest.options.tier_merge_gate,
+                    forced,
                 });
             }
         }
@@ -2246,8 +2257,10 @@ impl SupertableReader {
         let hits = select_top_k_stable(self, per_unit, k, &id_mins).await?;
         // Noted for the way the policy chose, whether or not the merge
         // then ran: a shape it declines every time is thereby measured as
-        // the cost of asking, and the class settles on not asking.
-        if tiers_serve && learned {
+        // the cost of asking, and the class settles on not asking. A merge
+        // the table's size forced was not the policy's choice, and what it
+        // cost says nothing of a query within one window.
+        if tiers_serve && learned && !forced {
             // A merge that reported says whether it did anything; one that
             // declined did nothing by construction; one that did not get
             // to report says nothing.
