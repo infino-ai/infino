@@ -145,7 +145,7 @@ use crate::{
 const MAX_POOL_PLAN_DEPTH: usize = 64;
 
 /// Most superfiles in one pool job. Small jobs let other queries use the pool in between.
-const MAX_FILES_PER_POOL_JOB: usize = 32;
+const MAX_FILES_PER_POOL_JOB: usize = 8;
 
 /// Fewest superfiles per pool job. With one each, waking the threads costs more than the work.
 const MIN_FILES_PER_POOL_JOB: usize = 2;
@@ -650,8 +650,9 @@ impl CandidatePlan {
         self.evaluate(&reader, Some(pool), &memos).await
     }
 
-    /// Runs [`Self::resolve`] for resident superfiles on `pool`, about one job per thread. On the
-    /// planning task they would run one by one, since a local read never waits.
+    /// Runs [`Self::resolve`] for resident superfiles on `pool`, in jobs of up to
+    /// [`MAX_FILES_PER_POOL_JOB`]. On the planning task they would run one by one, since a local read
+    /// never waits.
     ///
     /// Entry `i` is for `files[i]`. It is `None`, and the caller resolves that file itself, when:
     /// - its reader is lazy, or a step would wait on another query,
@@ -664,16 +665,23 @@ impl CandidatePlan {
         pool: &ThreadPool,
         slots: &Semaphore,
     ) -> Result<Vec<Option<Resolved>>, ReadError> {
-        let per_job = files.len().div_ceil(pool.current_num_threads().max(1));
+        let mut resolved: Vec<Option<Resolved>> = files.iter().map(|_| None).collect();
+        // Lazy files go back to the caller without a job, and don't count toward the job size.
+        let resident: Vec<(usize, PoolFile)> = files
+            .into_iter()
+            .enumerate()
+            .filter(|(_, file)| file.reader.parquet_bytes().is_some())
+            .collect();
+        let per_job = resident.len().div_ceil(pool.current_num_threads().max(1));
         if per_job < MIN_FILES_PER_POOL_JOB || self.has_like() || self.depth() > MAX_POOL_PLAN_DEPTH
         {
-            return Ok(files.iter().map(|_| None).collect());
+            return Ok(resolved);
         }
         let per_job = per_job.min(MAX_FILES_PER_POOL_JOB);
-        let mut files = files.into_iter().peekable();
+        let mut resident = resident.into_iter().peekable();
         let mut jobs = Vec::new();
-        while files.peek().is_some() {
-            let job: Vec<PoolFile> = files.by_ref().take(per_job).collect();
+        while resident.peek().is_some() {
+            let job: Vec<(usize, PoolFile)> = resident.by_ref().take(per_job).collect();
             let plan = Arc::clone(&self);
             let locations = Arc::clone(&locations);
             jobs.push(async move {
@@ -683,28 +691,25 @@ impl CandidatePlan {
                     .map_err(|_| ReadError::TaskDropped("planning match slot"))?;
                 run_on_pool_while_awaited(pool, "planning match", move || {
                     job.iter()
-                        .map(|file| Arc::clone(&plan).resolve_resident(file, &locations))
+                        .map(|(i, file)| (*i, Arc::clone(&plan).resolve_resident(file, &locations)))
                         .collect::<Vec<_>>()
                 })
                 .await
                 .map_err(|e| ReadError::TaskDropped(e.0))
             });
         }
-        let per_job = try_join_all(jobs).await?;
-        per_job
-            .into_iter()
-            .flatten()
-            .map(Option::transpose)
-            .collect()
+        for (i, result) in try_join_all(jobs).await?.into_iter().flatten() {
+            resolved[i] = result.transpose()?;
+        }
+        Ok(resolved)
     }
 
-    /// [`Self::resolve`] for one superfile in one poll. `None` if it is lazy or a step would wait.
+    /// [`Self::resolve`] for one resident superfile in one poll. `None` if a step would wait.
     fn resolve_resident(
         self: Arc<Self>,
         file: &PoolFile,
         locations: &PlanLocations,
     ) -> Option<Result<Resolved, ReadError>> {
-        file.reader.parquet_bytes()?;
         let reader = Arc::clone(&file.reader);
         let resolved = self
             .resolve(reader, file.superfile, locations, file.gate, None)
@@ -3647,13 +3652,18 @@ mod tests {
 
     #[tokio::test]
     async fn the_pool_and_the_planning_task_resolve_alike() {
-        // One resident superfile and each plan shape: a word, a range, both, either, a failed gate.
+        // One resident superfile and each plan shape: a word, a range, both, either, failed gates.
         // - The pool and the planning task give the same rows.
         // This test pins that moving the work to the pool doesn't change the answer.
         let hits = titled_superfile().1;
         let closed = SelectionGate {
             index: 0,
             density_cap: u64::MAX,
+        };
+        // "rust" matches 2 rows, so a cap of 2 sends the superfile to a scan.
+        let at_cap = SelectionGate {
+            index: u64::MAX,
+            density_cap: 2,
         };
         let cases = [
             ("a word", terms_all(&["rust"]), OPEN_GATE, Some(vec![0, 2])),
@@ -3676,6 +3686,12 @@ mod tests {
                 Some(vec![0, 1, 2]),
             ),
             ("a failed gate", terms_all(&["rust"]), closed, None),
+            (
+                "an estimate at the density cap",
+                terms_all(&["rust"]),
+                at_cap,
+                None,
+            ),
         ];
         let reader = resident_reader();
         let pool = one_thread_pool();
@@ -3709,6 +3725,32 @@ mod tests {
                 "{what}"
             );
             assert_eq!(row_list(here.rows), want, "{what}");
+        }
+    }
+
+    #[tokio::test]
+    async fn lazy_superfiles_never_queue_a_job() {
+        // A busy one-thread pool and no free slot.
+        // - Only lazy superfiles: all handed back at once.
+        // - The same plus one resident superfile: one per job is too few, all handed back at once.
+        // This test pins that lazy files are left out before any job is sized or queued.
+        let source: Arc<dyn LazyByteSource> =
+            Arc::new(BytesLazyByteSource::new(titled_superfile().0));
+        let lazy = Arc::new(SuperfileReader::open_lazy(source).await.expect("lazy open"));
+        let (pool, _release) = held_pool();
+        let no_slots = Semaphore::new(0);
+        let plan = Arc::new(terms_all(&["rust"]));
+        let lazy_files = || pool_files(&lazy, 2 * MIN_FILES_PER_POOL_JOB, OPEN_GATE);
+        let mut mixed = lazy_files();
+        mixed.extend(pool_files(&resident_reader(), 1, OPEN_GATE));
+        for (what, files) in [("lazy", lazy_files()), ("lazy and one resident", mixed)] {
+            let n = files.len();
+            let resolved = Arc::clone(&plan)
+                .resolve_resident_on_pool(files, Arc::new(PlanLocations::new()), &pool, &no_slots)
+                .now_or_never()
+                .unwrap_or_else(|| panic!("{what}: waited on the pool"))
+                .expect(what);
+            assert_eq!(resolved_rows(resolved), vec![None; n], "{what}");
         }
     }
 
