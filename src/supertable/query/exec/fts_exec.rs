@@ -35,17 +35,18 @@
 //! [`CandidateScope`](crate::supertable::query::candidate::CandidateScope):
 //! the superfiles the manifest statistics and term blooms keep, and —
 //! when an FTS-indexed column bounds the rows — the candidate rows the
-//! kernel admits into its heap. The function ranks within the scope and
-//! applies the exact predicate to the rows it gets. A first round at `k`
-//! fills a predicate most top-ranked rows satisfy; short of `k`, it ranks
-//! once more under a gate ([`RowCheck`]) that each superfile checks as it
-//! opens, over the rows the query's terms match there, so its kernel
-//! admits only rows the predicate keeps: the answer is the top `k` among
-//! them however deep they rank, at the cost of a decode over the matches
-//! of the superfiles the search opens, never the table's. A predicate that
-//! cannot be checked before ranking (one on `score`) widens the search
-//! until `k` survive or the fill's ceiling is reached ([`fill_ceiling`]).
-//! `bm25_search_prefix` takes the widening alone.
+//! kernel admits into its heap. The function then ranks within the scope,
+//! applies the exact predicate to the rows it gets, and widens the search
+//! until `k` survive or the fill's ceiling is reached
+//! ([`fill_ceiling`]). Stopped short at a ceiling below the table's
+//! size, the rows the predicate keeps may rank below everything it looked
+//! at: the function then checks the predicate on the rows the query's
+//! terms match ([`SupertableReader::match_scope`], [`exact_scope`]) and
+//! ranks once more within exactly the ones it keeps, so the answer is the
+//! top `k` among matching rows however deep they rank, at the cost of a
+//! decode over the query's matches rather than the table. A predicate that
+//! cannot be evaluated before ranking (one on `score`) keeps what the
+//! widening found. `bm25_search_prefix` takes the widening alone.
 
 use std::{fmt, sync::Arc};
 
@@ -76,10 +77,10 @@ use crate::{
             SuperfileHit,
             candidate::CandidateScope,
             exec::common::{
-                Arity, PushedPredicate, RowCheck, WIDEN_ROUNDS_BEFORE_GATE, arg_to_string,
-                arg_to_usize, candidate_plan_for_filters, fill_ceiling, fill_top_k_within,
-                live_reader, output_schema_with_score, scope_to_call, top_k_statistics, traced_tvf,
-                widen_ceiling,
+                Arity, PushedPredicate, arg_to_string, arg_to_usize, candidate_plan_for_filters,
+                exact_scope, fill_ceiling, fill_top_k_within, live_reader,
+                output_schema_with_score, scope_to_call, top_k_statistics, traced_tvf,
+                widening_ended_short,
             },
         },
     },
@@ -449,35 +450,28 @@ impl ExecutionPlan for Bm25Exec {
                 output_schema: &output_schema,
                 projection: projection.as_deref(),
             };
-            // A predicate checked as each superfile opens: a few widening
-            // rounds first, which a predicate most top-ranked rows satisfy
-            // fills by the search alone; short of `k`, one search under the
-            // gate, whose kernels admit only the rows the predicate keeps,
-            // so its `k` hits are the `k` best of them — every superfile it
-            // skips never checked, every one it opens checked once.
-            if let (Some(scope), Some(predicate), Bm25Query::Terms { query: text, mode }) =
+            // Widen within the scope first, up to the fill's ceiling: the
+            // rounds stop as soon as `k` of the kernel's best pass the
+            // predicate, which for a predicate most top-ranked rows satisfy
+            // is a round or two of the search alone.
+            let widened = call.rows(scope.as_ref(), None).await?;
+            let (Some(scope), Some(predicate), Bm25Query::Terms { query: text, mode }) =
                 (scope.as_ref(), predicate.as_ref(), &query)
-                && let Some(check) = RowCheck::new(&reader, predicate, &output_schema)?
-            {
-                let first = call
-                    .rows(
-                        Some(scope),
-                        Some(widen_ceiling(k, WIDEN_ROUNDS_BEFORE_GATE)),
-                    )
-                    .await?;
-                if first.num_rows() >= k {
-                    return Ok(first);
-                }
-                let gated = reader
-                    .gated_scope(&column, text, *mode, scope, check)
-                    .await?;
-                return call.rows(Some(&gated), Some(k)).await;
+            else {
+                return Ok(widened);
+            };
+            if !widening_ended_short(&reader, k, widened.num_rows()) {
+                return Ok(widened);
             }
-            // Otherwise — a predicate that cannot be checked before ranking,
-            // one on `score`, or prefix search — widen within the scope, up
-            // to the fill's ceiling: the rounds stop as soon as `k` of the
-            // kernel's best pass the predicate.
-            call.rows(scope.as_ref(), None).await
+            // Short at the ceiling: rows the predicate keeps may rank below
+            // every hit the widening looked at. Check the predicate on the
+            // rows the query's terms match, and rank once within exactly the
+            // ones it keeps.
+            let matched = reader.match_scope(&column, text, *mode, scope).await?;
+            match exact_scope(&reader, &matched, predicate, &output_schema).await? {
+                Some(exact) => call.rows(Some(&exact), Some(k)).await,
+                None => Ok(widened),
+            }
         };
 
         let span = match &self.query {
@@ -583,16 +577,13 @@ pub(crate) fn arg_to_bool_mode(expr: &Expr) -> DfResult<BoolMode> {
 
 #[cfg(test)]
 mod tests {
-    use arrow_array::{
-        Array, Float32Array, Int64Array, LargeStringArray, RecordBatch, StringArray,
-    };
+    use arrow_array::{Array, Float32Array, Int64Array, LargeStringArray, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::prelude::{col, lit};
 
     use super::*;
     use crate::{
         FieldPatch, SchemaPatch,
-        runtime_metrics::op_stats::{OpStats, with_op_stats},
         storage::{LocalFsStorageProvider, StorageProvider},
         superfile::builder::FtsConfig,
         supertable::{
@@ -1298,19 +1289,30 @@ mod tests {
             .expect("filtered query_sql");
         assert_eq!(rows_of(&rows), N_RARE_KEPT);
 
-        // What the gate decoded to check: the term's few matches, never
-        // the strong rows that rank above them.
-        let (_, stats) = with_op_stats(|| {
+        // What the exact pass is handed to check: the same scope the
+        // function builds for this `WHERE`, narrowed to the term's matches.
+        let filters = vec![col("bucket").eq(lit(1_i64))];
+        let plan = candidate_plan_for_filters(reader.manifest(), &filters);
+        let matched = reader.block_on(async {
+            let scope = reader
+                .candidate_scope(&filters, &plan)
+                .await
+                .expect("scope");
             reader
-                .query_sql(&format!(
-                    "SELECT title FROM bm25_search('title', 'zyzzyva', {k}) WHERE bucket = 1"
-                ))
-                .expect("filtered query_sql")
+                .match_scope("title", "zyzzyva", BoolMode::Or, &scope)
+                .await
+                .expect("match scope")
         });
-        assert!(
-            stats.rows_materialized <= (N_RARE + 2 * k) as u64,
-            "decoded {} rows: the gate checks the term's matches, not the table's rows",
-            stats.rows_materialized
+        let checked: u64 = matched
+            .allow
+            .as_ref()
+            .expect("a bounded scope")
+            .values()
+            .map(|rows| rows.len())
+            .sum();
+        assert_eq!(
+            checked, N_RARE as u64,
+            "the exact pass checks the term's matches, not the table's rows"
         );
     }
 
@@ -1679,107 +1681,5 @@ mod tests {
             prefix.contains("Bm25Exec") && prefix.contains("kind=prefix"),
             "prefix describe missing: {prefix}"
         );
-    }
-
-    /// Superfiles of the hourly table below: past one open window.
-    const HOUR_SUPERFILES: usize = 24;
-    /// The open window a ranked search of that table uses.
-    const HOUR_WINDOW: usize = 2;
-    /// Rows of the top title per superfile, all in the language the
-    /// predicate drops.
-    const HOUR_TOP_ROWS: usize = 4;
-    /// Filler rows per superfile.
-    const HOUR_FILLER: usize = 40;
-    /// Head depth: short of every superfile's matches, so the index cannot
-    /// answer for a superfile and a search must open it.
-    const HOUR_HEAD_DEPTH: usize = 4;
-
-    /// A table of hourly superfiles whose best documents for `python` all
-    /// fail `lang = 'de'`: each holds the title "Python" in English several
-    /// times, a lower-ranked German page, and filler.
-    fn hourly_table(dir: &tempfile::TempDir) -> Supertable {
-        let storage: Arc<dyn StorageProvider> =
-            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("title", DataType::LargeUtf8, false),
-            Field::new("lang", DataType::Utf8, false),
-        ]));
-        let options =
-            SupertableOptions::new(Arc::clone(&schema), vec![FtsConfig::new("title")], vec![])
-                .expect("valid options")
-                .with_storage(storage)
-                .with_bound_ordered_open_window(HOUR_WINDOW)
-                .with_term_head_depth(HOUR_HEAD_DEPTH);
-        let st = Supertable::create(options).expect("create");
-        let mut w = st.writer().expect("writer");
-        for s in 0..HOUR_SUPERFILES {
-            let mut titles: Vec<String> = vec!["Python".to_owned(); HOUR_TOP_ROWS];
-            let mut langs: Vec<&str> = vec!["en"; HOUR_TOP_ROWS];
-            titles.push("Python language guide".to_owned());
-            langs.push("de");
-            for i in 0..HOUR_FILLER {
-                titles.push(format!("snake page {s} {i}"));
-                langs.push("en");
-            }
-            let batch = RecordBatch::try_new(
-                Arc::clone(&schema),
-                vec![
-                    Arc::new(LargeStringArray::from(
-                        titles.iter().map(String::as_str).collect::<Vec<_>>(),
-                    )),
-                    Arc::new(StringArray::from(langs)),
-                ],
-            )
-            .expect("batch");
-            w.append(&batch).expect("append");
-            w.commit().expect("commit");
-        }
-        drop(w);
-        st
-    }
-
-    /// The rows and the work of `sql` run through a metered context.
-    fn metered_sql(st: &Supertable, sql: &str) -> (usize, OpStats) {
-        let (rows, stats) = with_op_stats(|| {
-            let reader = st.reader().expect("reader");
-            let ctx = reader.metered_session_context().expect("context");
-            reader.block_on(async {
-                ctx.sql(sql)
-                    .await
-                    .expect("plan")
-                    .collect()
-                    .await
-                    .expect("collect")
-            })
-        });
-        (rows_of(&rows), stats)
-    }
-
-    /// A `WHERE` the index cannot bound that every top-ranked row fails:
-    /// after its widening rounds the search checks the predicate as each
-    /// superfile opens, so it opens each superfile at most once more —
-    /// where widening on to its ceiling would open them round after round —
-    /// and returns the `k` best rows the predicate keeps.
-    #[test]
-    fn bm25_search_tvf_where_every_top_row_fails_opens_each_superfile_once() {
-        const K: usize = 4;
-        let dir = tempfile::TempDir::new().expect("tempdir");
-        let st = hourly_table(&dir);
-        let sql =
-            format!("SELECT title FROM bm25_search('title', 'python', {K}) WHERE lang = 'de'");
-        for run in 0..2 {
-            let (n, stats) = metered_sql(&st, &sql);
-            assert_eq!(n, K, "run {run}: the k best German rows");
-            // The gated pass opens each superfile once; the widening rounds
-            // before it, at `k` and twice `k` hits, open the few that hold
-            // them — tied rows a superfile's top title fills.
-            let widening = (2 * K).div_ceil(HOUR_TOP_ROWS) + 2 * HOUR_WINDOW;
-            let most = (HOUR_SUPERFILES + WIDEN_ROUNDS_BEFORE_GATE as usize * widening) as u64;
-            assert!(
-                stats.score_pruning_survived <= most,
-                "run {run}: opened {}, at most {most}",
-                stats.score_pruning_survived
-            );
-        }
     }
 }

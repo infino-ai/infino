@@ -366,12 +366,6 @@ pub(crate) struct TierQuery<'a> {
     /// tied superfiles apart. The measured costs still decide how deep it
     /// reads.
     pub(crate) forced: bool,
-    /// Whether the search admits only the rows a predicate keeps, checked
-    /// as each superfile opens: a document the heads show may be one the
-    /// predicate drops, so the merge bounds and orders — its bounds hold
-    /// for every row, kept or not — but seeds no threshold and answers for
-    /// no superfile.
-    pub(crate) filtered: bool,
 }
 
 /// The merge's outcome for one query.
@@ -850,8 +844,7 @@ pub(crate) async fn prepare_merge<'a>(
     // sum is the score bit for bit (addition commutes); a longer sum can
     // land an ulp from the kernel's, which adds in its own order, so its
     // bounds take the slack a product of roundings needs.
-    let exact_scores =
-        nt <= EXACT_SUM_TERMS && query.phrases.is_empty() && !query.negated && !query.filtered;
+    let exact_scores = nt <= EXACT_SUM_TERMS && query.phrases.is_empty() && !query.negated;
     let atoms = query.scoring.count_ones() as usize + query.phrases.len();
     let shape = Shape {
         exact_sums: atoms <= EXACT_SUM_TERMS && !query.negated,
@@ -864,10 +857,7 @@ pub(crate) async fn prepare_merge<'a>(
         // other columns they cannot check — and only
         // through a bare term it scores on, since a phrase alone may not
         // match at all.
-        trusted: !query.negated
-            && !query.filtered
-            && query.phrases.iter().all(|p| !p.1)
-            && query.scoring != 0,
+        trusted: !query.negated && query.phrases.iter().all(|p| !p.1) && query.scoring != 0,
     };
     // A shape whose candidates cannot be trusted yields no threshold: before
     // any open it rules a superfile out only through a required head the

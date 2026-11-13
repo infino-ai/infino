@@ -634,7 +634,7 @@ impl SupertableReader {
     /// outlives the scope that created it — and it is the same trade the
     /// catalog's `Connection::query_sql` already makes, building a fresh
     /// provider per query so the scope's collector rides along.
-    pub(crate) fn metered_session_context(&self) -> Result<SessionContext, QueryError> {
+    fn metered_session_context(&self) -> Result<SessionContext, QueryError> {
         self.build_session_context(Arc::new(self.clone()))
     }
 
