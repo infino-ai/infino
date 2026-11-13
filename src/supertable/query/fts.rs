@@ -2603,7 +2603,9 @@ impl SupertableReader {
     }
 
     /// Every term in `column` starting with `prefix_leaf`'s prefix, across
-    /// the superfiles in `kept`, deduplicated and in byte order.
+    /// the superfiles in `kept`, deduplicated and in byte order: from the
+    /// term index for the superfiles it covers, from the dictionaries of
+    /// the rest.
     async fn expand_prefix(
         &self,
         column: &str,
@@ -2616,6 +2618,32 @@ impl SupertableReader {
             ));
         };
         let column_field_id = self.manifest().field_id(column);
+        // The index holds every term of the superfiles it covers, in byte
+        // order: those expand from it, and only the superfiles it does not
+        // cover open to read their dictionaries.
+        let mut terms: BTreeSet<Vec<u8>> = BTreeSet::new();
+        let index = self
+            .manifest()
+            .term_index()
+            .await
+            .map_err(QueryError::from)?;
+        let kept: Vec<Arc<SuperfileEntry>> = match (&index, column_field_id, str::from_utf8(prefix))
+        {
+            (Some(index), Some(field), Ok(text)) => {
+                let (covered, rest): (Vec<_>, Vec<_>) = kept
+                    .into_iter()
+                    .partition(|entry| index.is_indexed(&entry.superfile_id));
+                let live: HashSet<Uuid> = covered.iter().map(|e| e.superfile_id).collect();
+                if !live.is_empty() {
+                    terms = index
+                        .prefix_terms(field, text, &live)
+                        .await
+                        .map_err(QueryError::from)?;
+                }
+                rest
+            }
+            _ => kept,
+        };
         let column_arc: Arc<str> = Arc::from(column);
         let prefix_arc: Arc<[u8]> = Arc::from(prefix.as_slice());
         let pool = Arc::clone(&self.manifest().options.reader_pool);
@@ -2643,7 +2671,7 @@ impl SupertableReader {
             },
         )
         .await?;
-        let terms: BTreeSet<Vec<u8>> = per_superfile.into_iter().flatten().collect();
+        terms.extend(per_superfile.into_iter().flatten());
         // Dictionary keys are valid UTF-8 by construction: a tokenizer emits
         // `&str` terms.
         Ok(terms

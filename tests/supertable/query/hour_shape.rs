@@ -21,6 +21,7 @@ use infino::{
     runtime_metrics::op_stats::{OpStats, with_op_stats},
     storage::{LocalFsStorageProvider, StorageProvider},
     superfile::builder::FtsConfig,
+    supertable::manifest::SuperfileUri,
     supertable::{Supertable, SupertableOptions},
 };
 use tempfile::TempDir;
@@ -101,6 +102,8 @@ pub struct Shape {
     pub depth: Option<usize>,
     /// The ranked open window.
     pub window: usize,
+    /// Whether the table keeps a term index at all.
+    pub index: bool,
 }
 
 pub fn options(dir: &TempDir, shape: Shape) -> SupertableOptions {
@@ -117,6 +120,9 @@ pub fn options(dir: &TempDir, shape: Shape) -> SupertableOptions {
     }
     if let Some(depth) = shape.depth {
         options = options.with_term_head_depth(depth);
+    }
+    if !shape.index {
+        options = options.with_term_index(false);
     }
     options
 }
@@ -227,6 +233,7 @@ pub fn wide(depth: Option<usize>) -> Pair {
         tiers: true,
         depth,
         window: WINDOW,
+        index: true,
     })
 }
 
@@ -275,6 +282,7 @@ fn a_table_within_the_window_keeps_the_learned_gate() {
         tiers: true,
         depth: None,
         window: SUPERFILES,
+        index: true,
     });
     let most = (0..REPEATS)
         .map(|_| opens_and_equal(&p, "python", 10))
@@ -380,6 +388,70 @@ fn filtered_searches_answer_as_without_tiers() {
                 let (a, _) = filtered(&p.with, query, k, filter);
                 let (b, _) = filtered(&p.without, query, k, filter);
                 assert_eq!(a, b, "{query} WHERE {filter} run {run}");
+            }
+        }
+    }
+}
+
+/// A prefix search's hits as `(superfile by id order, row, score)`, with
+/// the query's work.
+pub fn prefix_hits(st: &Supertable, prefix: &str, k: usize) -> (Vec<(usize, u32, f32)>, OpStats) {
+    let reader = st.reader().expect("reader");
+    let mut order: Vec<(i128, SuperfileUri)> = reader
+        .manifest()
+        .superfiles
+        .iter()
+        .map(|e| (e.id_min, e.uri))
+        .collect();
+    order.sort();
+    let (hits, stats) = with_op_stats(|| {
+        st.reader()
+            .expect("reader")
+            .bm25_search_prefix("title", prefix, k)
+            .expect("prefix search")
+    });
+    let rows = hits
+        .iter()
+        .map(|h| {
+            let place = order
+                .iter()
+                .position(|(_, u)| *u == h.superfile)
+                .expect("a hit names a listed superfile");
+            (place, h.local_doc_id, h.score)
+        })
+        .collect();
+    (rows, stats)
+}
+
+/// A prefix search expands its prefix from the term index, not from every
+/// superfile's dictionary: it opens the superfiles its ranking needs — a
+/// prefix of one tied title opens as the title does — where reading the
+/// dictionaries opened them all first; and it answers as a table without
+/// an index, which reads them.
+#[test]
+fn a_prefix_expands_from_the_term_index() {
+    let p = wide(None);
+    let dir = TempDir::new().expect("tempdir");
+    let unindexed = table(
+        &dir,
+        Shape {
+            tiers: false,
+            depth: None,
+            window: WINDOW,
+            index: false,
+        },
+    );
+    for (prefix, k) in [("zyzz", 10), ("pyth", 10), ("obam", 5), ("mus", 10)] {
+        for run in 0..2 {
+            let (a, stats) = prefix_hits(&p.with, prefix, k);
+            let (b, _) = prefix_hits(&unindexed, prefix, k);
+            assert_eq!(a, b, "{prefix:?} run {run}");
+            if prefix == "zyzz" {
+                assert!(
+                    opened(&stats) <= TIED_TERM_OPENS,
+                    "{prefix:?} run {run}: opened {}",
+                    opened(&stats)
+                );
             }
         }
     }
