@@ -38,7 +38,9 @@ use datafusion::{
     datasource::{DefaultTableSource, provider_as_source},
     error::{DataFusionError, Result as DfResult},
     execution::{TaskContext, context::SessionContext},
-    logical_expr::{Expr, LogicalPlan, Sort, TableProviderFilterPushDown, TableType},
+    logical_expr::{
+        Expr, LogicalPlan, TableProviderFilterPushDown, TableType, utils::split_conjunction,
+    },
     optimizer::{OptimizerConfig, OptimizerRule, optimizer::ApplyOrder},
     physical_expr::EquivalenceProperties,
     physical_plan::{
@@ -58,13 +60,13 @@ use crate::{
         query::{
             exec::{
                 common::{
-                    Arity, PushedPredicate, arg_to_string, live_reader, output_schema_with_score,
-                    resolve_hits, scope_to_call, traced_tvf, traced_tvf_rows,
+                    Arity, arg_to_string, live_reader, output_schema_with_score, resolve_hits,
+                    scope_to_call, traced_tvf, traced_tvf_rows, unqualified,
                 },
                 fts_exec::arg_to_bool_mode,
             },
             match_order::MatchOrder,
-            range_top_k::with_scan_source,
+            range_top_k::{sort_over_scan, with_scan_source},
         },
     },
     utils::trace::detail_span,
@@ -204,7 +206,7 @@ impl TableFunctionImpl for ExactMatchFunc {
 
 /// One parsed match invocation as a `TableProvider`. `scan` lowers to
 /// [`MatchExec`].
-pub(crate) struct MatchTable {
+struct MatchTable {
     reader: Arc<SupertableReader>,
     column: String,
     query: MatchQuery,
@@ -217,7 +219,7 @@ pub(crate) struct MatchTable {
 
 /// An `ORDER BY column [DESC] LIMIT fetch` over a match.
 #[derive(Debug, Clone)]
-pub(crate) struct OrderHint {
+struct OrderHint {
     column: String,
     descending: bool,
     fetch: usize,
@@ -293,9 +295,11 @@ impl TableProvider for MatchTable {
 /// superfiles in the column's order and stops once none left can place a
 /// row (see [`MatchOrder`]). The rule only marks the match's provider; the
 /// sort and the filters stay above it, and the answer is the one they give
-/// over the rows the match returns. It fires for a sort on a single plain
-/// column, through filters, plain column projections and aliases; whether
-/// the walk can honour it is the match's call, made when it runs.
+/// over the rows the match returns. It fires for a sort on a single stored
+/// integer, date or timestamp column, through plain column projections,
+/// aliases and filters the scan was handed too. Whether the walk can
+/// evaluate the `WHERE`, and whether every superfile's statistics can rank
+/// it, is the match's call, made when it runs.
 #[derive(Debug, Default)]
 pub(crate) struct MatchTopK;
 
@@ -325,50 +329,46 @@ impl OptimizerRule for MatchTopK {
 }
 
 /// The sort with its match's provider swapped for one carrying the order,
-/// or `None` when the plan is not a sort over a match.
+/// or `None` when the plan is not a sort the walk can honour over a match.
 fn order_match(plan: &LogicalPlan) -> DfResult<Option<LogicalPlan>> {
-    let LogicalPlan::Sort(Sort {
-        expr,
-        input,
-        fetch: Some(fetch),
-    }) = plan
-    else {
+    let Some(sort) = sort_over_scan(plan) else {
         return Ok(None);
     };
-    let [sort_expr] = expr.as_slice() else {
+    if !sort.later.is_empty() || sort.fetch == 0 {
         return Ok(None);
-    };
-    let Expr::Column(column) = &sort_expr.expr else {
-        return Ok(None);
-    };
-    let mut node = input.as_ref();
-    let scan = loop {
-        match node {
-            LogicalPlan::Projection(projection)
-                if projection.expr.iter().all(|e| matches!(e, Expr::Column(_))) =>
-            {
-                node = projection.input.as_ref();
-            }
-            LogicalPlan::Filter(filter) => node = filter.input.as_ref(),
-            LogicalPlan::SubqueryAlias(alias) => node = alias.input.as_ref(),
-            LogicalPlan::TableScan(scan) => break scan,
-            _ => return Ok(None),
-        }
-    };
-    let Some(table) = scan
+    }
+    let Some(table) = sort
+        .scan
         .source
         .downcast_ref::<DefaultTableSource>()
         .and_then(|source| source.table_provider.downcast_ref::<MatchTable>())
     else {
         return Ok(None);
     };
-    if table.order.is_some() {
+    if table.order.is_some()
+        || MatchOrder::sort_key(table.reader.manifest(), &sort.column.name).is_none()
+    {
         return Ok(None);
     }
+    // The walk counts the rows the scan's filters keep. A filter DataFusion
+    // left above the scan alone — a volatile one, one holding a subquery —
+    // would drop rows the walk counted, and it could stop short.
+    let pushed: Vec<Expr> = sort
+        .scan
+        .filters
+        .iter()
+        .flat_map(split_conjunction)
+        .map(|e| unqualified(e.clone()))
+        .collect::<DfResult<_>>()?;
+    for predicate in sort.predicates {
+        if !pushed.contains(&unqualified(predicate)?) {
+            return Ok(None);
+        }
+    }
     let hinted = Arc::new(table.with_order(OrderHint {
-        column: column.name.clone(),
-        descending: !sort_expr.asc,
-        fetch: *fetch,
+        column: sort.column.name.clone(),
+        descending: !sort.first.asc,
+        fetch: sort.fetch,
     }));
     let source = provider_as_source(hinted as Arc<dyn TableProvider>);
     Ok(Some(with_scan_source(plan, &source)?))
@@ -518,7 +518,21 @@ impl ExecutionPlan for MatchExec {
         let projection = self.projection.clone();
         let projected_schema = Arc::clone(&self.projected_schema);
         let filters = self.filters.clone();
-        let order_hint = self.order.clone();
+        // Under an `ORDER BY column LIMIT n` the walk can honour, the match
+        // opens its superfiles in the column's order and stops once none
+        // left can place a row.
+        let order = match &self.order {
+            Some(hint) => MatchOrder::new(
+                &reader,
+                &hint.column,
+                hint.descending,
+                hint.fetch,
+                &filters,
+                &output_schema,
+            )?
+            .map(Arc::new),
+            None => None,
+        };
 
         // What the consumer reads decides how much of a hit to build. A
         // projection of no columns at all is `COUNT(*)`: the count
@@ -536,7 +550,7 @@ impl ExecutionPlan for MatchExec {
         // A count with a filter takes the hit walk below, which prunes by it;
         // so does a match under an `ORDER BY ... LIMIT`, which walks in order.
         let counts_only = filters.is_empty()
-            && order_hint.is_none()
+            && order.is_none()
             && matches!(&projection, Some(indices) if indices.is_empty());
         let score_idx = scalar_schema.fields().len();
         let needs_score = match &projection {
@@ -561,7 +575,7 @@ impl ExecutionPlan for MatchExec {
         if !counts_only
             && !needs_ids
             && !needs_score
-            && order_hint.is_none()
+            && order.is_none()
             && let (Some(indices), MatchQuery::Token { query, mode }) =
                 (projection.clone(), query.clone())
         {
@@ -627,24 +641,6 @@ impl ExecutionPlan for MatchExec {
                 )
                 .map_err(|e| QueryError::internal(e).into());
             }
-            // Under an `ORDER BY column LIMIT n` the walk can honour, the
-            // match opens its superfiles in the column's order and stops
-            // once none left can place a row.
-            let order = match &order_hint {
-                Some(hint) => {
-                    let predicate = PushedPredicate::compile(&filters, &output_schema);
-                    MatchOrder::new(
-                        &reader,
-                        &hint.column,
-                        hint.descending,
-                        hint.fetch,
-                        predicate.as_ref(),
-                        &output_schema,
-                    )?
-                    .map(Arc::new)
-                }
-                None => None,
-            };
             let hits = match &query {
                 MatchQuery::Token { query, mode } => {
                     reader
@@ -687,19 +683,24 @@ mod tests {
     use std::{fmt, sync::Arc};
 
     use arrow::util::display::array_value_to_string;
-    use arrow_array::{Array, Date32Array, Int64Array, LargeStringArray, RecordBatch, StringArray};
+    use arrow_array::{
+        Array, Date32Array, Int64Array, LargeStringArray, RecordBatch, StringArray,
+        TimestampNanosecondArray,
+    };
     use arrow_schema::{DataType, Field, Schema, TimeUnit};
     use datafusion::{
         error::DataFusionError,
         execution::TaskContext,
-        physical_plan::{DisplayFormatType, ExecutionPlan},
+        physical_plan::{DisplayFormatType, ExecutionPlan, collect},
         prelude::{col, lit},
     };
     use rayon::ThreadPoolBuilder;
     use tempfile::TempDir;
     use tokio::runtime::Runtime;
 
-    use super::{EXACT_MATCH_UDTF, ExactMatchFunc, MatchExec, MatchQuery, TokenMatchFunc};
+    use super::{
+        EXACT_MATCH_UDTF, ExactMatchFunc, MatchExec, MatchQuery, OrderHint, TokenMatchFunc,
+    };
     use crate::{
         Connection, FieldPatch, IndexSpec, SchemaPatch, connect,
         runtime_metrics::op_stats::with_op_stats,
@@ -711,7 +712,7 @@ mod tests {
             handle::SupertableReader,
             query::{
                 exec::common::{output_schema_with_score, test_support::sql_row_count},
-                match_order::ORDERED_WINDOW,
+                match_order::{MatchOrder, ORDERED_WINDOW},
             },
         },
     };
@@ -1078,7 +1079,21 @@ mod tests {
     /// one superfile per batch of `commits`. Its `query_sql` meters the
     /// work a match function does; `Supertable::query_sql` does not.
     fn metered_table(schema: &Arc<Schema>, spec: IndexSpec, commits: &[RecordBatch]) -> Connection {
-        let conn = connect("memory://").expect("connect");
+        metered_table_in(
+            connect("memory://").expect("connect"),
+            schema,
+            spec,
+            commits,
+        )
+    }
+
+    /// [`metered_table`] created in `conn`.
+    fn metered_table_in(
+        conn: Connection,
+        schema: &Arc<Schema>,
+        spec: IndexSpec,
+        commits: &[RecordBatch],
+    ) -> Connection {
         let table = conn
             .create_table(METERED_TABLE, Arc::clone(schema), spec)
             .expect("create");
@@ -1612,17 +1627,26 @@ mod tests {
     /// Filler pages per hour.
     const HOURLY_FILLER: usize = 20;
 
-    /// A page-view log: per hour, "Zyzzyva" in two languages, the monument
-    /// in its first hours, and filler — one superfile per hour, so `hour`
-    /// orders the superfiles as time orders a log's.
-    fn hourly_conn() -> Connection {
+    /// A page-view log: per superfile, "Zyzzyva" in two languages, the
+    /// monument in the first hours, and filler, every row of superfile `i`
+    /// at hour `file_hours[i]` — so `hour` orders the superfiles as time
+    /// orders a log's. With `null_hour_in` naming a superfile, `hour` is
+    /// nullable and that superfile's English "Zyzzyva" has no hour. The
+    /// table is created in `conn`.
+    fn page_view_log(
+        conn: Connection,
+        file_hours: &[i64],
+        null_hour_in: Option<usize>,
+    ) -> Connection {
         let schema = Arc::new(Schema::new(vec![
             Field::new("title", DataType::LargeUtf8, false),
             Field::new("lang", DataType::Utf8, false),
-            Field::new("hour", DataType::Int64, false),
+            Field::new("hour", DataType::Int64, null_hour_in.is_some()),
         ]));
-        let commits: Vec<RecordBatch> = (0..HOURLY_FILES)
-            .map(|hour| {
+        let commits: Vec<RecordBatch> = file_hours
+            .iter()
+            .enumerate()
+            .map(|(file, &hour)| {
                 let mut titles: Vec<String> = vec!["Zyzzyva".into(), "Zyzzyva".into()];
                 let mut langs: Vec<&str> = vec!["en", "de"];
                 if hour < MONUMENT_HOURS {
@@ -1633,7 +1657,10 @@ mod tests {
                     titles.push(format!("page {hour} {i}"));
                     langs.push("en");
                 }
-                let n = titles.len();
+                let mut hours = vec![Some(hour); titles.len()];
+                if null_hour_in == Some(file) {
+                    hours[0] = None;
+                }
                 RecordBatch::try_new(
                     Arc::clone(&schema),
                     vec![
@@ -1641,13 +1668,23 @@ mod tests {
                             titles.iter().map(String::as_str).collect::<Vec<_>>(),
                         )),
                         Arc::new(StringArray::from(langs)),
-                        Arc::new(Int64Array::from(vec![hour; n])),
+                        Arc::new(Int64Array::from(hours)),
                     ],
                 )
                 .expect("batch")
             })
             .collect();
-        metered_table(&schema, IndexSpec::new().fts("title"), &commits)
+        metered_table_in(conn, &schema, IndexSpec::new().fts("title"), &commits)
+    }
+
+    /// One superfile per hour of [`HOURLY_FILES`].
+    fn every_hour() -> Vec<i64> {
+        (0..HOURLY_FILES).collect()
+    }
+
+    /// The page-view log in memory, one superfile per hour.
+    fn hourly_conn() -> Connection {
+        page_view_log(connect("memory://").expect("connect"), &every_hour(), None)
     }
 
     /// The `hour`s `sql` returns, in its order.
@@ -1713,8 +1750,8 @@ mod tests {
         );
     }
 
-    /// A `WHERE` the walk cannot check before ranking leaves the match to
-    /// every superfile, and the answer as the sort gives it.
+    /// A `WHERE` the walk cannot evaluate from stored columns leaves the
+    /// match to every superfile, and the answer as the sort gives it.
     #[test]
     fn order_by_time_under_an_uncheckable_where_walks_every_superfile() {
         let conn = hourly_conn();
@@ -1727,24 +1764,318 @@ mod tests {
         assert_eq!(opened, HOURLY_FILES as u64);
     }
 
-    /// The plan names the order the match walks in.
-    #[test]
-    fn explain_match_exec_carries_the_order() {
-        let conn = hourly_conn();
-        let plan = conn
-            .query_sql(&format!(
-                "EXPLAIN SELECT hour FROM token_match('{METERED_TABLE}', 'title', 'zyzzyva') \
-                 ORDER BY hour DESC LIMIT 5"
-            ))
-            .expect("explain");
-        let text: String = plan
+    /// The `EXPLAIN` of `sql` over `conn`, every plan line joined.
+    fn explain_conn(conn: &Connection, sql: &str) -> String {
+        conn.query_sql(&format!("EXPLAIN {sql}"))
+            .expect("explain")
             .iter()
             .flat_map(|b| {
                 (0..b.num_rows())
                     .map(|i| array_value_to_string(b.column(1), i).expect("plan text"))
                     .collect::<Vec<_>>()
             })
-            .collect();
+            .collect()
+    }
+
+    /// The plan names the order the match walks in.
+    #[test]
+    fn explain_match_exec_carries_the_order() {
+        let conn = hourly_conn();
+        let text = explain_conn(
+            &conn,
+            &format!(
+                "SELECT hour FROM token_match('{METERED_TABLE}', 'title', 'zyzzyva') \
+                 ORDER BY hour DESC LIMIT 5"
+            ),
+        );
         assert!(text.contains("order=hour desc fetch=5"), "{text}");
+    }
+
+    /// The `column` values `sql` returns as text, in its order; a null is
+    /// empty.
+    fn column_text(conn: &Connection, sql: &str, column: &str) -> Vec<String> {
+        conn.query_sql(sql)
+            .expect("query_sql")
+            .iter()
+            .flat_map(|b| {
+                let values = b.column_by_name(column).expect("column");
+                (0..values.len())
+                    .map(|i| array_value_to_string(values, i).expect("value text"))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// The `column` values `SELECT column FROM token_match(term) filter
+    /// ORDER BY order limit` returns, held to the same query with `_id` as
+    /// a second sort key, which the walk does not honour.
+    fn walked(
+        conn: &Connection,
+        term: &str,
+        filter: &str,
+        order: &str,
+        limit: &str,
+        column: &str,
+    ) -> Vec<String> {
+        let tvf = format!("token_match('{METERED_TABLE}', 'title', '{term}')");
+        let sql = format!("SELECT {column} FROM {tvf} {filter} ORDER BY {order} {limit}");
+        let got = column_text(conn, &sql, column);
+        let whole = format!("SELECT {column} FROM {tvf} {filter} ORDER BY {order}, _id {limit}");
+        assert_eq!(got, column_text(conn, &whole, column), "{sql}");
+        got
+    }
+
+    /// Text of every hour in `hours`, as [`walked`] returns them.
+    fn hour_text(hours: &[i64]) -> Vec<String> {
+        hours.iter().map(i64::to_string).collect()
+    }
+
+    /// A `WHERE` DataFusion keeps above the scan rather than pushing to it
+    /// — a volatile one, one holding a subquery — is not one the walk can
+    /// count rows by: it is not taken, and the answer is the sort's.
+    #[test]
+    fn order_by_time_under_a_where_left_above_the_scan_keeps_its_rows() {
+        let conn = hourly_conn();
+        for filter in ["WHERE hour + random() * 0 < 20", "WHERE hour < (SELECT 20)"] {
+            assert_eq!(
+                walked(&conn, "zyzzyva", filter, "hour DESC", "LIMIT 3", "hour"),
+                hour_text(&[19, 19, 18]),
+                "{filter}"
+            );
+        }
+    }
+
+    /// Day of the superfile written before the retype: later than every day
+    /// written after it, so a walk that read its statistics as the new
+    /// type's values would rank it last.
+    const DAY_BEFORE_RETYPE: i32 = 1000;
+    /// Days of the superfiles written after the retype.
+    const DAYS_AFTER_RETYPE: [i64; 2] = [1, 2];
+    /// Nanoseconds in a day.
+    const NANOS_PER_DAY: i64 = 86_400_000_000_000;
+
+    /// A date column retyped to a timestamp leaves its older superfiles'
+    /// statistics in days: the walk does not rank by them, and the newest
+    /// day is the one the older superfile holds.
+    #[test]
+    fn order_by_a_retyped_time_column_ignores_stale_statistics() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new("day", DataType::Date32, false),
+        ]));
+        let before = titled_batch(
+            &schema,
+            &["Zyzzyva", "page"],
+            Arc::new(Date32Array::from(vec![DAY_BEFORE_RETYPE; 2])),
+        );
+        let conn = metered_table(&schema, IndexSpec::new().fts("title"), &[before]);
+        let nanos = DataType::Timestamp(TimeUnit::Nanosecond, None);
+        conn.apply_schema(
+            METERED_TABLE,
+            &SchemaPatch::new(vec![FieldPatch::named("day").with_type(nanos.clone())]),
+            None,
+        )
+        .expect("retype");
+        let retyped = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new("day", nanos, false),
+        ]));
+        let table = conn.open_table(METERED_TABLE).expect("table");
+        for day in DAYS_AFTER_RETYPE {
+            let at = TimestampNanosecondArray::from(vec![day * NANOS_PER_DAY; 2]);
+            table
+                .append(&titled_batch(&retyped, &["Zyzzyva", "page"], Arc::new(at)))
+                .expect("append");
+        }
+        let got = walked(&conn, "zyzzyva", "", "day DESC", "LIMIT 1", "day");
+        assert_eq!(got.len(), 1);
+    }
+
+    /// A pushed `WHERE` the match cannot compile is no `WHERE` the walk can
+    /// count rows by: it takes none, and every match comes back for the
+    /// filter above to judge.
+    #[test]
+    fn an_order_under_a_where_that_does_not_compile_walks_every_superfile() {
+        let conn = hourly_conn();
+        let reader = Arc::new(
+            conn.open_table(METERED_TABLE)
+                .expect("table")
+                .local_handle()
+                .reader()
+                .expect("reader"),
+        );
+        let scalar_schema = reader.manifest().scalar_schema();
+        let output_schema = output_schema_with_score(&scalar_schema);
+        let exec = MatchExec::try_new(
+            Arc::clone(&reader),
+            "title".into(),
+            MatchQuery::Token {
+                query: "zyzzyva".into(),
+                mode: BoolMode::Or,
+            },
+            scalar_schema,
+            output_schema,
+            None,
+        )
+        .expect("try_new")
+        .with_filters(vec![col("ghost").eq(lit(1_i64))])
+        .with_order(Some(OrderHint {
+            column: "hour".into(),
+            descending: true,
+            fetch: 1,
+        }));
+        let batches = reader
+            .block_on(collect(Arc::new(exec), Arc::new(TaskContext::default())))
+            .expect("rows");
+        let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(rows, 2 * HOURLY_FILES as usize);
+    }
+
+    /// A sort the walk cannot order by — a string column — leaves the
+    /// match unmarked: the plan names no order, and the answer is the
+    /// sort's.
+    #[test]
+    fn order_by_a_column_the_walk_cannot_order_marks_no_order() {
+        let conn = hourly_conn();
+        assert_eq!(
+            walked(&conn, "zyzzyva", "", "lang", "LIMIT 5", "lang"),
+            vec!["de".to_owned(); 5]
+        );
+        let plan = explain_conn(
+            &conn,
+            &format!(
+                "SELECT lang FROM token_match('{METERED_TABLE}', 'title', 'zyzzyva') \
+                 ORDER BY lang LIMIT 5"
+            ),
+        );
+        assert!(
+            plan.contains("MatchExec") && !plan.contains("order="),
+            "{plan}"
+        );
+    }
+
+    /// A limit landing among rows tied on the sort key, two superfiles of
+    /// the same newest hour: the walk opens both and returns tied rows.
+    #[test]
+    fn a_limit_landing_mid_tie_across_superfiles_returns_tied_rows() {
+        let newest = HOURLY_FILES - 1;
+        let mut file_hours = every_hour();
+        file_hours.push(newest);
+        let conn = page_view_log(connect("memory://").expect("connect"), &file_hours, None);
+        // Four "Zyzzyva" rows hold the newest hour, two in each superfile.
+        assert_eq!(
+            walked(&conn, "zyzzyva", "", "hour DESC", "LIMIT 3", "hour"),
+            hour_text(&[newest; 3])
+        );
+        // The English ones are one per superfile.
+        assert_eq!(
+            walked(
+                &conn,
+                "zyzzyva",
+                "WHERE lang = 'en'",
+                "hour DESC",
+                "LIMIT 2",
+                "hour"
+            ),
+            hour_text(&[newest; 2])
+        );
+    }
+
+    /// An offset is part of the sort's fetch: the walk keeps enough rows
+    /// for the rows it skips and the rows it returns.
+    #[test]
+    fn order_by_time_with_an_offset_skips_the_newest() {
+        let conn = hourly_conn();
+        let sql_tail = "LIMIT 2 OFFSET 3";
+        assert_eq!(
+            walked(&conn, "zyzzyva", "", "hour DESC", sql_tail, "hour"),
+            hour_text(&[22, 21])
+        );
+        let plan = explain_conn(
+            &conn,
+            &format!(
+                "SELECT hour FROM token_match('{METERED_TABLE}', 'title', 'zyzzyva') \
+                 ORDER BY hour DESC {sql_tail}"
+            ),
+        );
+        assert!(plan.contains("order=hour desc fetch=5"), "{plan}");
+    }
+
+    /// Deleted matches place no row: with the newest hours' matches
+    /// deleted, the walk goes on to the hours below them.
+    #[test]
+    fn order_by_time_leaves_out_deleted_matches() {
+        // A delete needs storage.
+        let dir = TempDir::new().expect("tempdir");
+        let conn = page_view_log(
+            connect(dir.path().to_str().expect("utf8 path")).expect("connect"),
+            &every_hour(),
+            None,
+        );
+        conn.open_table(METERED_TABLE)
+            .expect("table")
+            .delete(
+                col("title")
+                    .eq(lit("Zyzzyva"))
+                    .and(col("hour").gt_eq(lit(22_i64))),
+            )
+            .expect("delete");
+        assert_eq!(
+            walked(&conn, "zyzzyva", "", "hour DESC", "LIMIT 3", "hour"),
+            hour_text(&[21, 21, 20])
+        );
+    }
+
+    /// The superfile whose English "Zyzzyva" has no hour.
+    const FILE_WITH_A_NULL_HOUR: usize = 5;
+
+    /// A null in the sort column sorts first under a descending sort,
+    /// outside every superfile's range: the walk opens every superfile.
+    #[test]
+    fn order_by_a_column_holding_a_null_puts_it_first() {
+        let conn = page_view_log(
+            connect("memory://").expect("connect"),
+            &every_hour(),
+            Some(FILE_WITH_A_NULL_HOUR),
+        );
+        let mut want = vec![String::new()];
+        want.extend(hour_text(&[23, 23]));
+        assert_eq!(
+            walked(&conn, "zyzzyva", "", "hour DESC", "LIMIT 3", "hour"),
+            want
+        );
+    }
+
+    /// A term no row holds returns nothing under the walk.
+    #[test]
+    fn order_by_time_over_no_match_is_empty() {
+        let conn = hourly_conn();
+        assert!(walked(&conn, "nothingatall", "", "hour DESC", "LIMIT 3", "hour").is_empty());
+    }
+
+    /// Opens a fan-out may keep in flight, as the window test caps it.
+    const WIDEST: usize = 16;
+    /// Answered superfiles past which the window test's walk is capped.
+    const PAST_WIDEST: usize = 100;
+
+    /// While the walk holds fewer rows than it needs, its window grows with
+    /// the superfiles that have answered, up to the fan-out's width: a
+    /// selective `WHERE` does not open every superfile two at a time.
+    #[test]
+    fn the_ordered_window_grows_while_rows_are_short() {
+        let conn = hourly_conn();
+        let reader = conn
+            .open_table(METERED_TABLE)
+            .expect("table")
+            .local_handle()
+            .reader()
+            .expect("reader");
+        let output_schema = output_schema_with_score(&reader.manifest().scalar_schema());
+        let order = MatchOrder::new(&reader, "hour", true, 3, &[], &output_schema)
+            .expect("order")
+            .expect("hour is orderable");
+        assert_eq!(order.window(0, WIDEST), ORDERED_WINDOW);
+        assert_eq!(order.window(WIDEST / 2, WIDEST), WIDEST / 2);
+        assert_eq!(order.window(PAST_WIDEST, WIDEST), WIDEST);
     }
 }

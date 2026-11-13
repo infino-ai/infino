@@ -1216,7 +1216,7 @@ fn between_range(between: &Between, range_cols: &RangeColumns) -> CandidatePlan 
 /// null, a NaN, or a literal the column's keys do not share — a timestamp
 /// of another unit, a negative value for an unsigned column, an integer a
 /// float cannot hold exactly.
-fn literal_key(value: &ScalarValue, data_type: &DataType) -> Option<(KeyKind, u64)> {
+pub(crate) fn literal_key(value: &ScalarValue, data_type: &DataType) -> Option<(KeyKind, u64)> {
     let kind = KeyKind::of(data_type)?;
     let key = |k| Some((kind, k));
     match kind {

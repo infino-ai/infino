@@ -72,7 +72,7 @@
 
 use std::{
     borrow::Cow,
-    cmp::Ordering,
+    cmp::{Ordering, Reverse},
     collections::{BTreeSet, HashMap, HashSet},
     future::Future,
     iter::repeat_n,
@@ -147,7 +147,7 @@ use crate::{
             exec::common::{
                 hit_output_schema, resolve_hits_named, take_file_columns, take_rows_byte_source,
             },
-            match_order::{MatchOrder, ORDERED_WINDOW},
+            match_order::MatchOrder,
             provider::prune_leaves_for_filters,
             prune::{PruneLeaf, select_superfiles},
             tier,
@@ -2783,7 +2783,7 @@ impl SupertableReader {
     /// place a row.
     async fn match_fanout<P, B, Fut>(
         &self,
-        mut units: Vec<(Arc<SuperfileEntry>, P)>,
+        units: Vec<(Arc<SuperfileEntry>, P)>,
         body: B,
         order: Option<&Arc<MatchOrder>>,
     ) -> Result<Vec<Vec<SuperfileHit>>, QueryError>
@@ -2801,22 +2801,24 @@ impl SupertableReader {
             + 'static,
         Fut: Future<Output = Result<Vec<SuperfileHit>, QueryError>> + Send + 'static,
     {
-        let Some(order) = order.filter(|order| order.order(&mut units)) else {
+        let Some((order, best)) = order.and_then(|order| Some((order, order.best_ranks(&units)?)))
+        else {
             return dispatch::fanout_with(self, units, true, self.open_intent(), body).await;
         };
-        let units: Vec<(Arc<SuperfileEntry>, (SuperfileUri, P))> = units
+        // Each unit carries its best rank, best first.
+        let mut units: Vec<(Arc<SuperfileEntry>, (u64, P))> = units
             .into_iter()
-            .map(|(entry, params)| {
-                let uri = entry.uri;
-                (entry, (uri, params))
-            })
+            .zip(best)
+            .map(|((entry, params), best)| (entry, (best, params)))
             .collect();
+        units.sort_by_key(|(_, (best, _))| Reverse(*best));
+        let widest = self.options().superfiles_in_flight;
         let walk = Arc::clone(order);
         let ordered = move |r: Arc<SuperfileReader>,
                             entry: Arc<SuperfileEntry>,
                             cache: Option<Arc<SidecarCache>>,
                             now: Instant,
-                            (_, params): (SuperfileUri, P)| {
+                            (_, params): (u64, P)| {
             let body = body.clone();
             let walk = Arc::clone(&walk);
             async move {
@@ -2827,8 +2829,8 @@ impl SupertableReader {
         dispatch::fanout_with_ordered(
             self,
             units,
-            ORDERED_WINDOW,
-            |(uri, _): &(SuperfileUri, P)| order.passed(uri),
+            |answered| order.window(answered, widest),
+            |(best, _): &(u64, P)| order.passed(*best),
             ordered,
             |_| {},
             None::<dispatch::ReplanFuture<'_, _, _>>,

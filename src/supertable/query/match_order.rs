@@ -26,40 +26,43 @@
 //! they give over the rows the walk returns; the walk only leaves out
 //! superfiles that cannot place a row. It applies to a single sort column
 //! of integer, date or timestamp type that every candidate superfile holds
-//! statistics for and no nulls in (a null sorts first under a descending
-//! sort, outside every range), under a `WHERE` it can check itself; any
-//! other shape opens every superfile, as before.
+//! current statistics for and no nulls in (a null sorts first under a
+//! descending sort, outside every range), under a `WHERE` it can evaluate
+//! from stored columns; any other shape opens every superfile, as before.
 
 use std::{
     cmp::Reverse,
-    collections::{BinaryHeap, HashMap},
+    collections::BinaryHeap,
     sync::{Arc, Mutex},
 };
 
-use arrow::compute::cast;
-use arrow_array::{Array, Int64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use datafusion::{error::Result as DfResult, scalar::ScalarValue};
+use datafusion::{error::Result as DfResult, logical_expr::Expr};
 use roaring::RoaringBitmap;
 
 use crate::{
     runtime_metrics::op_stats::OpStatsCollector,
-    superfile::SuperfileReader,
+    superfile::{
+        SuperfileReader,
+        range::{KeyKind, push_keys},
+    },
     supertable::{
         error::QueryError,
         handle::SupertableReader,
-        manifest::{ManifestSnapshot, SuperfileEntry, SuperfileUri},
+        manifest::{ManifestSnapshot, SuperfileEntry},
         query::{
             SuperfileHit,
+            candidate::literal_key,
             exec::common::{PushedPredicate, RowCheck, take_file_columns},
+            skip::ColumnTypeGuard,
         },
         schema::FieldId,
     },
 };
 
-/// Superfiles an ordered walk opens at once: enough to overlap one open's
-/// round trip with the next, few enough that the walk stops within a
-/// superfile or two of the last one that placed a row.
+/// Superfiles an ordered walk opens at once once it holds its rows: enough
+/// to overlap one open's round trip with the next, few enough that the
+/// walk stops within a superfile or two of the last one that placed a row.
 pub(crate) const ORDERED_WINDOW: usize = 2;
 
 /// An `ORDER BY column LIMIT n` a match walk honours: the column, its
@@ -68,124 +71,147 @@ pub(crate) struct MatchOrder {
     manifest: Arc<ManifestSnapshot>,
     column: String,
     field: FieldId,
+    data_type: DataType,
+    kind: KeyKind,
+    guard: ColumnTypeGuard,
     descending: bool,
     fetch: usize,
     check: Option<RowCheck>,
     key_schema: SchemaRef,
     op_stats: Option<Arc<OpStatsCollector>>,
-    /// Each candidate superfile's best rank (see [`Self::rank`]), set by
-    /// [`Self::order`].
-    best_of: Mutex<HashMap<SuperfileUri, i128>>,
     /// The ranks of the `fetch` best keys found so far, the worst on top.
-    found: Mutex<BinaryHeap<Reverse<i128>>>,
+    found: Mutex<BinaryHeap<Reverse<u64>>>,
 }
 
 impl MatchOrder {
+    /// The id, live type and key kind of `column` when the walk can order
+    /// by it: a stored integer, date or timestamp column.
+    pub(crate) fn sort_key(
+        manifest: &ManifestSnapshot,
+        column: &str,
+    ) -> Option<(FieldId, DataType, KeyKind)> {
+        let field = manifest.field_id(column)?;
+        let data_type = manifest
+            .stored_schema()
+            .field_with_name(column)
+            .ok()?
+            .data_type()
+            .clone();
+        match KeyKind::of(&data_type)? {
+            kind @ (KeyKind::Signed | KeyKind::Unsigned) => Some((field, data_type, kind)),
+            KeyKind::Float => None,
+        }
+    }
+
     /// The order `ORDER BY column [DESC] LIMIT fetch` asks for over a match
-    /// under `predicate`, the `WHERE` pushed to the match (`None` when there
-    /// is none). `None` when the walk cannot honour it: the column is not a
-    /// stored integer, date or timestamp column, or the `WHERE` reads a
-    /// column the walk cannot check before ranking.
+    /// under `filters`, the `WHERE` pushed to the match. `None` when the
+    /// walk cannot honour it: the column is not one [`Self::sort_key`]
+    /// takes, or the `WHERE` is one the walk cannot evaluate from stored
+    /// columns, so it could not tell which rows count.
     pub(crate) fn new(
         reader: &SupertableReader,
         column: &str,
         descending: bool,
         fetch: usize,
-        predicate: Option<&PushedPredicate>,
+        filters: &[Expr],
         output_schema: &SchemaRef,
     ) -> DfResult<Option<Self>> {
         let manifest = Arc::clone(reader.manifest());
-        let Some(field) = manifest.field_id(column) else {
+        let Some((field, data_type, kind)) = Self::sort_key(&manifest, column) else {
             return Ok(None);
         };
-        let stored = manifest.stored_schema();
-        let Ok(data_type) = stored
-            .field_with_name(column)
-            .map(|f| f.data_type().clone())
-        else {
-            return Ok(None);
-        };
-        if !orderable(&data_type) || fetch == 0 {
+        if fetch == 0 {
             return Ok(None);
         }
-        let check = match predicate {
-            Some(predicate) => match RowCheck::new(reader, predicate, output_schema)? {
-                Some(check) => Some(check),
-                None => return Ok(None),
-            },
-            None => None,
+        let check = match filters.is_empty() {
+            true => None,
+            false => {
+                let Some(predicate) = PushedPredicate::compile(filters, output_schema) else {
+                    return Ok(None);
+                };
+                let Some(check) = RowCheck::new(reader, &predicate, output_schema)? else {
+                    return Ok(None);
+                };
+                Some(check)
+            }
         };
-        let key_schema = Arc::new(Schema::new(vec![Field::new(column, data_type, true)]));
+        let key_schema = Arc::new(Schema::new(vec![Field::new(
+            column,
+            data_type.clone(),
+            true,
+        )]));
         Ok(Some(Self {
+            guard: ColumnTypeGuard::new(&manifest, field),
             manifest,
             column: column.to_owned(),
             field,
+            data_type,
+            kind,
             descending,
             fetch,
             check,
             key_schema,
             op_stats: reader.op_stats.clone(),
-            best_of: Mutex::new(HashMap::new()),
             found: Mutex::new(BinaryHeap::new()),
         }))
     }
 
     /// A key's rank in the walk: higher is better, whichever the sort's
     /// direction.
-    fn rank(&self, key: i64) -> i128 {
+    fn rank(&self, key: u64) -> u64 {
         match self.descending {
-            true => i128::from(key),
-            false => -i128::from(key),
+            true => key,
+            false => !key,
         }
     }
 
-    /// `units` in the walk's order, best range first; `false`, leaving them
-    /// as they are, when a superfile holds no statistics for the column or
-    /// may hold a null in it: the walk cannot then know what it leaves out.
-    pub(crate) fn order<P>(&self, units: &mut [(Arc<SuperfileEntry>, P)]) -> bool {
-        let mut best_of = HashMap::with_capacity(units.len());
-        for (entry, _) in units.iter() {
-            let Some(stats) = entry.scalar_stats.column(self.field) else {
-                return false;
-            };
-            if stats.null_count() != Some(0) {
-                return false;
-            }
-            let Some((min, max)) = stats.min_max_values() else {
-                return false;
-            };
-            let best = match self.descending {
-                true => key_of(&max),
-                false => key_of(&min),
-            };
-            let Some(best) = best else {
-                return false;
-            };
-            best_of.insert(entry.uri, self.rank(best));
-        }
-        units.sort_by_key(|(entry, _)| Reverse(best_of[&entry.uri]));
-        *self.best_of.lock().expect("match order mutex poisoned") = best_of;
-        true
+    /// Each unit's best rank — of the best key its superfile can hold — in
+    /// the units' order. `None` when a superfile holds no statistics for
+    /// the column, may hold a null in it (a null sorts first under a
+    /// descending sort, outside every range), lacks the column, or holds it
+    /// in a type the table has since left: the walk cannot then know what
+    /// it leaves out.
+    pub(crate) fn best_ranks<P>(&self, units: &[(Arc<SuperfileEntry>, P)]) -> Option<Vec<u64>> {
+        units
+            .iter()
+            .map(|(entry, _)| {
+                if self.guard.absent_from(entry) || self.guard.stats_are_stale(entry) {
+                    return None;
+                }
+                let stats = entry.scalar_stats.column(self.field)?;
+                if stats.null_count() != Some(0) {
+                    return None;
+                }
+                let (min, max) = stats.min_max_values()?;
+                let best = match self.descending {
+                    true => max,
+                    false => min,
+                };
+                let (_, key) = literal_key(&best, &self.data_type)?;
+                Some(self.rank(key))
+            })
+            .collect()
     }
 
-    /// Whether superfile `uri` can no longer place a row: `fetch` rows are
-    /// in hand and its best key is worse than the worst of them. A key that
-    /// ties the worst is kept, since the sort may break the tie for it.
-    pub(crate) fn passed(&self, uri: &SuperfileUri) -> bool {
-        let Some(best) = self
-            .best_of
-            .lock()
-            .expect("match order mutex poisoned")
-            .get(uri)
-            .copied()
-        else {
-            return false;
-        };
+    /// Whether a superfile whose best rank is `best` can no longer place a
+    /// row: `fetch` rows are in hand and its best key is worse than the
+    /// worst of them.
+    pub(crate) fn passed(&self, best: u64) -> bool {
         let found = self.found.lock().expect("match order mutex poisoned");
-        if found.len() < self.fetch {
-            return false;
+        found.len() >= self.fetch && found.peek().is_some_and(|Reverse(worst)| best < *worst)
+    }
+
+    /// Superfiles to keep open at once once `answered` have answered. While
+    /// the walk holds fewer than `fetch` rows, as many as have answered, up
+    /// to `widest`: under a `WHERE` few rows pass, a fixed window would open
+    /// every superfile [`ORDERED_WINDOW`] at a time. Once it holds them,
+    /// [`ORDERED_WINDOW`], so it stops soon after the last row placed.
+    pub(crate) fn window(&self, answered: usize, widest: usize) -> usize {
+        let short = self.found.lock().expect("match order mutex poisoned").len() < self.fetch;
+        match short {
+            true => answered.clamp(ORDERED_WINDOW, widest.max(ORDERED_WINDOW)),
+            false => ORDERED_WINDOW,
         }
-        found.peek().is_some_and(|Reverse(worst)| best < *worst)
     }
 
     /// Of `hits`, the matches of one superfile read through `r`, those the
@@ -221,13 +247,8 @@ impl MatchOrder {
         )
         .await
         .map_err(QueryError::DataFusion)?;
-        let keys = cast(batch.column(0), &DataType::Int64).map_err(QueryError::internal)?;
-        let keys = keys
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .ok_or_else(|| QueryError::Internal("an ordered match key is not an integer".into()))?;
         let mut found = self.found.lock().expect("match order mutex poisoned");
-        for key in keys.iter().flatten() {
+        push_keys(batch.column(0).as_ref(), self.kind, 0, |key, _| {
             let rank = self.rank(key);
             if found.len() < self.fetch {
                 found.push(Reverse(rank));
@@ -235,44 +256,9 @@ impl MatchOrder {
                 found.pop();
                 found.push(Reverse(rank));
             }
-        }
+            Ok(())
+        })
+        .map_err(QueryError::internal)?;
         Ok(hits)
-    }
-}
-
-/// Whether a column of `data_type` orders as its 64-bit integer value.
-fn orderable(data_type: &DataType) -> bool {
-    matches!(
-        data_type,
-        DataType::Int8
-            | DataType::Int16
-            | DataType::Int32
-            | DataType::Int64
-            | DataType::UInt8
-            | DataType::UInt16
-            | DataType::UInt32
-            | DataType::Date32
-            | DataType::Date64
-            | DataType::Timestamp(_, _)
-    )
-}
-
-/// A statistic of an [`orderable`] column as the 64-bit value it orders as.
-fn key_of(value: &ScalarValue) -> Option<i64> {
-    match value {
-        ScalarValue::Int8(Some(v)) => Some(i64::from(*v)),
-        ScalarValue::Int16(Some(v)) => Some(i64::from(*v)),
-        ScalarValue::Int32(Some(v)) => Some(i64::from(*v)),
-        ScalarValue::Int64(Some(v)) => Some(*v),
-        ScalarValue::UInt8(Some(v)) => Some(i64::from(*v)),
-        ScalarValue::UInt16(Some(v)) => Some(i64::from(*v)),
-        ScalarValue::UInt32(Some(v)) => Some(i64::from(*v)),
-        ScalarValue::Date32(Some(v)) => Some(i64::from(*v)),
-        ScalarValue::Date64(Some(v))
-        | ScalarValue::TimestampSecond(Some(v), _)
-        | ScalarValue::TimestampMillisecond(Some(v), _)
-        | ScalarValue::TimestampMicrosecond(Some(v), _)
-        | ScalarValue::TimestampNanosecond(Some(v), _) => Some(*v),
-        _ => None,
     }
 }

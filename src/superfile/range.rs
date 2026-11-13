@@ -399,7 +399,7 @@ fn encode_directory(columns: &[ColumnEntry], blocks: &[BlockEntry]) -> Vec<u8> {
 
 /// Feed `array`'s non-null values to `sink` as `(key, row)`, row `i` of the
 /// array being `first_row + i`.
-fn push_keys(
+pub(crate) fn push_keys(
     array: &dyn Array,
     kind: KeyKind,
     first_row: u32,

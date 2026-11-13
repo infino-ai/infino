@@ -895,7 +895,7 @@ pub(crate) async fn exact_scope(
     let kept = fanout_with_ordered(
         reader,
         units,
-        window,
+        |_| window,
         |_| false,
         body,
         |_| {},
@@ -933,18 +933,11 @@ pub(crate) struct RowCheck {
     budget: Arc<ConnectionMemoryBudget>,
 }
 
-impl fmt::Debug for RowCheck {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("RowCheck")
-            .field("columns", &self.names)
-            .finish_non_exhaustive()
-    }
-}
-
 impl RowCheck {
     /// `predicate` bound to the stored columns it reads. `None` when it reads
     /// no column or one no superfile stores — the score, the id column, an
-    /// index-only text column — so it cannot be checked before ranking.
+    /// index-only text column — so it cannot be evaluated from stored
+    /// columns.
     pub(crate) fn new(
         reader: &SupertableReader,
         predicate: &PushedPredicate,
