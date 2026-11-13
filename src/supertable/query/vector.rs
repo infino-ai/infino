@@ -7393,7 +7393,11 @@ impl SupertableReader {
                     .await?,
             ),
         };
-        Ok(CandidateScope { superfiles, allow })
+        Ok(CandidateScope {
+            superfiles,
+            allow,
+            gate: None,
+        })
     }
 
     /// The stable `_id`s of the rows the filter kept in each drained user

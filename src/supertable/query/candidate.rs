@@ -91,7 +91,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    mem,
+    fmt, mem,
     sync::Arc,
 };
 
@@ -168,6 +168,24 @@ pub(crate) struct CandidateScope {
     /// every row of every superfile above is a candidate, and the caller
     /// fills its top-k by over-fetching under the exact predicate.
     pub(crate) allow: Option<HashMap<SuperfileUri, Arc<RoaringBitmap>>>,
+    /// A predicate checked on each superfile when it is opened, when set:
+    /// its kernel then admits only the rows of [`Self::allow`] (every row
+    /// when unbounded) the gate also keeps, so a ranked search's `k` hits are
+    /// the `k` best rows the predicate keeps, in one pass, and a superfile
+    /// the search never opens is never checked.
+    pub(crate) gate: Option<Arc<dyn RowGate>>,
+}
+
+/// The rows of an opened superfile a predicate keeps, checked when the
+/// superfile is opened rather than for every superfile before a search.
+pub(crate) trait RowGate: Send + Sync + fmt::Debug {
+    /// Of superfile `suid`, read through `r`, the rows the search can
+    /// return that the predicate keeps.
+    fn rows<'a>(
+        &'a self,
+        r: &'a Arc<SuperfileReader>,
+        suid: Uuid,
+    ) -> BoxFuture<'a, Result<RoaringBitmap, QueryError>>;
 }
 
 impl CandidateScope {
@@ -176,6 +194,7 @@ impl CandidateScope {
         Self {
             superfiles: Vec::new(),
             allow: Some(HashMap::new()),
+            gate: None,
         }
     }
 
@@ -1857,6 +1876,7 @@ mod tests {
             superfiles: vec![Arc::clone(&a), Arc::clone(&b), Arc::clone(&c)],
             // `b` evaluated to no candidate row and was dropped from the map.
             allow: Some(HashMap::from([(a.uri, rows(2)), (c.uri, rows(4))])),
+            gate: None,
         };
         assert_eq!(
             uris(bounded.admitted_superfiles().collect()),
@@ -1866,6 +1886,7 @@ mod tests {
         let unbounded = CandidateScope {
             superfiles: vec![Arc::clone(&a), Arc::clone(&b)],
             allow: None,
+            gate: None,
         };
         assert_eq!(
             uris(unbounded.admitted_superfiles().collect()),
@@ -1890,6 +1911,7 @@ mod tests {
                 (whole.uri, rows(4)),
                 (partial.uri, rows(3)),
             ])),
+            gate: None,
         };
         assert!(
             !scope.bounds_rows(&[Arc::clone(&whole)]),
@@ -1901,6 +1923,7 @@ mod tests {
         let unbounded = CandidateScope {
             superfiles: vec![Arc::clone(&partial)],
             allow: None,
+            gate: None,
         };
         assert!(!unbounded.bounds_rows(&[partial]));
     }

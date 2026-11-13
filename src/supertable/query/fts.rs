@@ -1362,6 +1362,10 @@ impl SupertableReader {
             && all_terms.len() <= tier::MAX_TIER_TERMS
             && manifest.term_index_complete()
             && !config::global().diagnostics.disable_tier_selection;
+        // A predicate checked as each superfile opens: its kernel admits only
+        // the rows it keeps, so the merge, which reads every row's entries,
+        // bounds and orders but offers no threshold and answers for nothing.
+        let gate = scope.and_then(|s| s.gate.clone());
         // Whether to merge at all is the table's learned call per class of
         // query; the search is timed from here so the call can be judged.
         let rarest_idf = all_terms
@@ -1505,6 +1509,7 @@ impl SupertableReader {
                     entry_cost_ns: self.tier_entry_cost_ns(),
                     merge_gate: manifest.options.tier_merge_gate,
                     forced,
+                    filtered: gate.is_some(),
                 });
             }
         }
@@ -1574,7 +1579,12 @@ impl SupertableReader {
         // kernel prunes and does not count. A superfile with deleted rows
         // is walked by the clause kernels, which admit only its live rows;
         // the ranged union kernel has no such gate.
-        let fanout = match exact_count || has_phrases || per_row_scope.is_some() || tombstoned {
+        let fanout = match exact_count
+            || has_phrases
+            || per_row_scope.is_some()
+            || gate.is_some()
+            || tombstoned
+        {
             true => FanOut::PerSuperfile,
             false => fanout_for(musts.len(), shoulds.len(), !negatives.is_empty()),
         };
@@ -1702,7 +1712,20 @@ impl SupertableReader {
                     .cloned()
                     .unwrap_or_else(|| Arc::new(RoaringBitmap::new()))
             });
+            let gate = gate.clone();
             async move {
+                // A predicate checked as the superfile opens narrows its
+                // admitted rows to the ones it keeps.
+                let allow = match &gate {
+                    Some(gate) => {
+                        let kept = gate.rows(&r, suid).await?;
+                        Some(Arc::new(match &allow {
+                            Some(within) => kept & within.as_ref(),
+                            None => kept,
+                        }))
+                    }
+                    None => allow,
+                };
                 // A file written before a rename labels the column as it was
                 // then, and its dictionary is keyed by that label; the id is
                 // what finds the column in either file.
@@ -2983,6 +3006,7 @@ impl SupertableReader {
         Ok(CandidateScope {
             superfiles,
             allow: Some(allow),
+            gate: None,
         })
     }
 
