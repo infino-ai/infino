@@ -12,10 +12,12 @@
 //! table without them.
 #![deny(clippy::unwrap_used)]
 
-use std::sync::Arc;
+use std::{ops::Range, sync::Arc};
 
 use arrow::util::display::array_value_to_string;
 use arrow_array::{ArrayRef, Int64Array, LargeStringArray, RecordBatch, StringArray};
+use arrow_schema::{DataType, Field, Schema};
+use datafusion::prelude::{col, lit};
 use infino::{
     Bm25SearchOptions,
     runtime_metrics::op_stats::{OpStats, with_op_stats},
@@ -37,6 +39,9 @@ pub const WINDOW: usize = 4;
 pub const FILLER_PER_HOUR: usize = 90;
 /// Hours the rare monument is viewed in, from the first.
 pub const MONUMENT_HOURS: usize = 20;
+/// Hours, from the first, whose rows of the tied title a test deletes:
+/// more than the superfiles holding the top ten span.
+const DELETED_HOURS: i64 = 12;
 
 /// Titles viewed in every hour, in both languages: their best documents tie
 /// across every superfile.
@@ -58,12 +63,12 @@ pub const POPULAR: [&str; 12] = [
 /// Languages each popular title is viewed in.
 pub const LANGS: [&str; 2] = ["en", "de"];
 
-pub fn schema() -> Arc<arrow_schema::Schema> {
-    Arc::new(arrow_schema::Schema::new(vec![
-        arrow_schema::Field::new("title", arrow_schema::DataType::LargeUtf8, false),
-        arrow_schema::Field::new("lang", arrow_schema::DataType::Utf8, false),
-        arrow_schema::Field::new("hits", arrow_schema::DataType::Int64, false),
-        arrow_schema::Field::new("hour", arrow_schema::DataType::Int64, false),
+pub fn schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("title", DataType::LargeUtf8, false),
+        Field::new("lang", DataType::Utf8, false),
+        Field::new("hits", DataType::Int64, false),
+        Field::new("hour", DataType::Int64, false),
     ]))
 }
 
@@ -129,8 +134,14 @@ pub fn options(dir: &TempDir, shape: Shape) -> SupertableOptions {
 /// The table: one commit per superfile, hours ascending.
 pub fn table(dir: &TempDir, shape: Shape) -> Supertable {
     let st = Supertable::create(options(dir, shape)).expect("create");
+    commit_superfiles(&st, 0..SUPERFILES);
+    st
+}
+
+/// Commit superfiles `range` of the table's hours, one commit each.
+pub fn commit_superfiles(st: &Supertable, range: Range<usize>) {
     let mut w = st.writer().expect("writer");
-    for s in 0..SUPERFILES {
+    for s in range {
         let mut titles = Vec::new();
         let mut langs = Vec::new();
         let mut hits = Vec::new();
@@ -155,8 +166,6 @@ pub fn table(dir: &TempDir, shape: Shape) -> Supertable {
             .expect("append");
         w.commit().expect("commit");
     }
-    drop(w);
-    st
 }
 
 /// The ranked answer as `(hour, lang, title, score)` rows, in rank order,
@@ -350,28 +359,86 @@ fn a_lone_phrase_tied_in_every_superfile_opens_a_window() {
     }
 }
 
+/// Query shapes whose candidates the merge cannot trust — a negated term, a
+/// required term or phrase, a bare term beside a phrase, a phrase that
+/// repeats a word — answer as the table without tiers does, row for row,
+/// with heads whole or cut short.
+#[test]
+fn untrusted_shapes_answer_as_without_tiers() {
+    for depth in [None, Some(16)] {
+        let p = wide(depth);
+        for query in [
+            "music -film",
+            "python -programming",
+            "+python +programming",
+            "+obama \"barack obama\"",
+            "obama \"barack obama\"",
+            "\"obama obama\"",
+        ] {
+            for _ in 0..REPEATS {
+                opens_and_equal(&p, query, 10);
+            }
+        }
+    }
+}
+
+/// A `k` past every document the tied term matches: the merge finds no
+/// `k`-th candidate, seeds nothing, and every match is returned.
+#[test]
+fn a_k_past_every_match_answers_as_without_tiers() {
+    for depth in [None, Some(16)] {
+        let p = wide(depth);
+        for (query, k) in [("zyzzyva", 1000), ("monument", 1000), ("music", 500)] {
+            for _ in 0..REPEATS {
+                opens_and_equal(&p, query, k);
+            }
+        }
+    }
+}
+
+/// Rows of the tied title deleted from the first superfiles, which hold
+/// the lowest `_id`s the merge's threshold would otherwise draw on: the
+/// merge reads past them, and the answer is the table without tiers'.
+#[test]
+fn deleted_tied_rows_answer_as_without_tiers() {
+    for depth in [None, Some(16)] {
+        let p = wide(depth);
+        for st in [&p.with, &p.without] {
+            let mut w = st.writer().expect("writer");
+            w.delete(
+                col("title")
+                    .eq(lit("Music"))
+                    .and(col("hour").lt(lit(DELETED_HOURS))),
+            )
+            .expect("delete");
+            w.commit().expect("commit delete");
+        }
+        for _ in 0..REPEATS {
+            opens_and_equal(&p, "music", 10);
+        }
+    }
+}
+
 /// A ranked search under a `WHERE` the index cannot bound, as rows in rank
-/// order. (Through the reader's own SQL, which is not metered: what such a
-/// search opens is tested where a metered context is reachable.)
-pub fn filtered(st: &Supertable, query: &str, k: usize, filter: &str) -> (Vec<String>, OpStats) {
-    let (batches, stats) = with_op_stats(|| {
-        st.reader()
-            .expect("reader")
-            .query_sql(&format!(
-                "SELECT hour, lang, title, score FROM bm25_search('title', '{query}', {k}) \
-                 WHERE {filter} ORDER BY score DESC, _id"
-            ))
-            .expect("filtered search")
-    });
-    (rows(&batches), stats)
+/// order.
+pub fn filtered(st: &Supertable, query: &str, k: usize, filter: &str) -> Vec<String> {
+    let batches = st
+        .reader()
+        .expect("reader")
+        .query_sql(&format!(
+            "SELECT hour, lang, title, score FROM bm25_search('title', '{query}', {k}) \
+             WHERE {filter} ORDER BY score DESC, _id"
+        ))
+        .expect("filtered search");
+    rows(&batches)
 }
 
 /// Ranked searches under a `WHERE` the index cannot bound — on the
 /// language, on hits, on the hour — answer as the table without tiers
 /// does, row for row, whether the predicate keeps most of the top-ranked
-/// rows or few of them: the merge under a predicate seeds no threshold of
-/// its own, and the search widens until it holds the `k` best rows the
-/// predicate keeps.
+/// rows or few of them: each widening round is an ordinary ranked search
+/// for more rows, whose merge bounds every superfile soundly, and the
+/// search widens until it holds the `k` best rows the predicate keeps.
 #[test]
 fn filtered_searches_answer_as_without_tiers() {
     for depth in [None, Some(16)] {
@@ -384,8 +451,8 @@ fn filtered_searches_answer_as_without_tiers() {
             ("obama", 5, "hour >= 90 AND lang = 'en'"),
         ] {
             for run in 0..2 {
-                let (a, _) = filtered(&p.with, query, k, filter);
-                let (b, _) = filtered(&p.without, query, k, filter);
+                let a = filtered(&p.with, query, k, filter);
+                let b = filtered(&p.without, query, k, filter);
                 assert_eq!(a, b, "{query} WHERE {filter} run {run}");
             }
         }
@@ -453,5 +520,53 @@ fn a_prefix_expands_from_the_term_index() {
                 );
             }
         }
+    }
+}
+
+/// Every match of the prefix, so a term the expansion dropped would drop
+/// rows; past every document the prefixes below match.
+const EVERY_MATCH: usize = 1 << 20;
+
+/// A table whose first superfiles were written with no term index and the
+/// rest with one: the index covers only the later superfiles, so a prefix
+/// expands from the index for those and from the dictionaries of the
+/// earlier ones, and every match of either answers as a table without an
+/// index.
+#[test]
+fn a_prefix_expands_over_superfiles_the_index_does_not_cover() {
+    let unindexed_shape = Shape {
+        tiers: false,
+        depth: None,
+        window: WINDOW,
+        index: false,
+    };
+    let dir = TempDir::new().expect("tempdir");
+    let early = Supertable::create(options(&dir, unindexed_shape)).expect("create");
+    commit_superfiles(&early, 0..SUPERFILES / 2);
+    drop(early);
+    let mixed = Supertable::open(options(
+        &dir,
+        Shape {
+            index: true,
+            ..unindexed_shape
+        },
+    ))
+    .expect("open");
+    commit_superfiles(&mixed, SUPERFILES / 2..SUPERFILES);
+    let reference_dir = TempDir::new().expect("tempdir");
+    let reference = table(&reference_dir, unindexed_shape);
+    // The early half has no index: its dictionaries are what a prefix
+    // there expands from, so each of those superfiles is opened.
+    let (_, stats) = prefix_hits(&mixed, "zyzz", 10);
+    assert!(
+        opened(&stats) >= (SUPERFILES / 2) as u64,
+        "opened {}: the unindexed half reads its dictionaries",
+        opened(&stats)
+    );
+    for prefix in ["zyzz", "pyth", "mus", "of", "monu"] {
+        let (a, _) = prefix_hits(&mixed, prefix, EVERY_MATCH);
+        let (b, _) = prefix_hits(&reference, prefix, EVERY_MATCH);
+        assert!(!a.is_empty(), "{prefix:?} matches");
+        assert_eq!(a, b, "{prefix:?}");
     }
 }

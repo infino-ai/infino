@@ -110,9 +110,10 @@ const TIER_FIRST_WAVE_MAX_BYTES: u64 = 4 << 20;
 /// Most distinct terms, phrase members included, the merge serves: a
 /// document's terms are a bit mask. Past two bare terms a candidate's sum
 /// carries slack (see [`EXACT_SUM_TERMS`]); the bounds hold for any
-/// number, and the gate on the merge (see `SupertableOptions::
-/// tier_merge_gate`) is what keeps a many-term query from paying for a
-/// first round that cannot pay back.
+/// number. A many-term query is kept from paying for a first round that
+/// cannot pay back by the first round's entry limit
+/// ([`MAX_FIRST_ROUND_ENTRIES`]) and, within one open window, by the
+/// table's learned gate (see `SupertableOptions::tier_merge_gate`).
 pub(crate) const MAX_TIER_TERMS: usize = 64;
 
 /// How far above the bar — the threshold, or the floor the opens built — a
@@ -287,6 +288,7 @@ impl TierPolicy {
         }
     }
 }
+
 /// Entries the merge's first round may decode: a query whose first round
 /// alone would pass it is not merged. Sized for a table of tens of
 /// thousands of superfiles: a common term's first round there is one block
@@ -294,10 +296,11 @@ impl TierPolicy {
 /// thousand, so two such terms merge and a third declines.
 const MAX_FIRST_ROUND_ENTRIES: u64 = 1 << 23;
 /// Entries the merge reads per query before it stops regardless of what is
-/// still in play. What has been read by then still bounds every superfile
-/// soundly; the merge just stops refining. Reads are held only for the
-/// superfiles still in play — a superfile ruled out lets its go — so what
-/// the merge holds at once is well under this.
+/// still in play, checked after each round. What has been read by then
+/// still bounds every superfile soundly; the merge just stops refining.
+/// Reads are held only for the superfiles the merge still reads for — one
+/// ruled out or fallen below the bar lets its go — so what the merge holds
+/// at once is well under this.
 const MAX_ENTRIES_PER_QUERY: u64 = 1 << 26;
 /// Superfiles one pool job decodes in a round. A superfile's share of a
 /// round is several microseconds, so jobs this size still dwarf the
@@ -486,7 +489,7 @@ fn pack_tf_len(tf: u32, len: u8) -> u32 {
 /// The term frequency and length bucket [`pack_tf_len`] packed;
 /// [`TF_UNKNOWN`] for a frequency too large to pack.
 fn unpack_tf_len(packed: u32) -> (u32, u8) {
-    (packed >> LEN_BITS, (packed & 0xff) as u8)
+    (packed >> LEN_BITS, (packed & ((1 << LEN_BITS) - 1)) as u8)
 }
 
 /// The shape of the query the merge bounds: which terms a match must
@@ -615,17 +618,12 @@ fn read_whole_first(term_sources: &[Source]) -> bool {
     whole <= TIER_FIRST_WAVE_MAX_BYTES
 }
 
-/// Per term and source, whether a superfile still within reach of `bar`
-/// (see [`Slot::reads_on`]) reads a head from it: a chunk no such head
-/// reads is not fetched.
-fn sources_read_on(
-    slots: &[Slot],
-    sources: &[Vec<Source>],
-    bar: f32,
-    ties: bool,
-) -> Vec<Vec<bool>> {
+/// Per term and source, whether a superfile still within reach of the bar
+/// (`reachable`, see [`Slot::reads_on`]) reads a head from it: a chunk no
+/// such head reads is not fetched.
+fn sources_read_on(slots: &[Slot], reachable: &[bool], sources: &[Vec<Source>]) -> Vec<Vec<bool>> {
     let mut needed: Vec<Vec<bool>> = sources.iter().map(|s| vec![false; s.len()]).collect();
-    for slot in slots.iter().filter(|s| s.reads_on(bar, ties)) {
+    for (slot, _) in slots.iter().zip(reachable).filter(|(_, r)| **r) {
         for (ti, head) in slot.heads.iter().enumerate() {
             if let (false, Some(si)) = (head.done, head.source) {
                 needed[ti][si] = true;
@@ -853,10 +851,9 @@ pub(crate) async fn prepare_merge<'a>(
         phrases: query.phrases.clone(),
         // A document the heads show matches only if nothing unseen can
         // unmake it: no must-phrase whose adjacency the heads cannot
-        // verify, no negated term the heads do not read, no predicate on
-        // other columns they cannot check — and only
-        // through a bare term it scores on, since a phrase alone may not
-        // match at all.
+        // verify, no negated term the heads do not read — and only through
+        // a bare term it scores on, since a phrase alone may not match at
+        // all.
         trusted: !query.negated && query.phrases.iter().all(|p| !p.1) && query.scoring != 0,
     };
     // A shape whose candidates cannot be trusted yields no threshold: before
@@ -901,8 +898,7 @@ pub(crate) async fn prepare_merge<'a>(
         if slot.touched {
             slot.refresh(
                 &merge.shape,
-                &merge.scoring.idf,
-                &merge.scoring.norm,
+                &merge.scoring,
                 k,
                 lb_slack,
                 ub_slack,
@@ -960,7 +956,8 @@ impl PreparedMerge<'_> {
     ///
     /// `floor` reads the running k-th score the opens beside the merge have
     /// built (`NEG_INFINITY` until they have k): a superfile whose bound is
-    /// at or below it, or below the merge's own threshold, is skipped or
+    /// below it or the merge's own threshold — or at it, unless the index
+    /// can answer for the superfile (see [`Slot::reads_on`]) — is skipped or
     /// ruled out whatever more of its heads would show, so the merge reads
     /// no further for it, and goes on reading only while a round brings
     /// enough superfiles to that point to pay for itself.
@@ -1018,7 +1015,7 @@ impl PreparedMerge<'_> {
             // What this round still has to read, per source: a small tier
             // whole in the first wave; of a large one, the chunk at this
             // round's depth, where a head still within reach reads it.
-            let needed = sources_read_on(&merge.slots, &sources, bar, exact_scores);
+            let needed = sources_read_on(&merge.slots, &reachable, &sources);
             let reads: Vec<(usize, usize, Range<usize>)> = sources
                 .iter()
                 .enumerate()
@@ -1055,6 +1052,7 @@ impl PreparedMerge<'_> {
             }
             // Decode, score, join and bound the round as one job on the reader
             // pool: the next block of every live superfile whose head goes on.
+            let reachable_in_round = reachable.clone();
             let (merge_back, sources_back, outcome) =
                 run_on_pool(Some(pool), "tier merge", move || {
                     let mut merge = merge;
@@ -1064,13 +1062,18 @@ impl PreparedMerge<'_> {
                             (0..merge.slots.len()).map(|_| Vec::new()).collect();
                         let mut read_any = false;
                         for (slot_i, slot) in merge.slots.iter_mut().enumerate() {
-                            if !slot.reads_on(bar, exact_scores) {
+                            if !reachable_in_round[slot_i] {
                                 // Stopped for good: a round reads every head
                                 // at its own depth, so a superfile that missed
                                 // one cannot take up the next — its heads
-                                // would claim a block they never read.
+                                // would claim a block they never read. Its
+                                // bound is below the bar, so no document of
+                                // it places and its reads can go; its
+                                // candidates stay for the threshold.
                                 for state in slot.heads.iter_mut() {
                                     state.done = true;
+                                    state.docs = Vec::new();
+                                    state.pending = Vec::new();
                                 }
                                 continue;
                             }
@@ -1279,15 +1282,7 @@ impl Merge {
                         }
                     }
                     if slot.touched {
-                        slot.refresh(
-                            shape,
-                            &scoring.idf,
-                            &scoring.norm,
-                            k,
-                            lb_slack,
-                            ub_slack,
-                            &mut scratch,
-                        );
+                        slot.refresh(shape, scoring, k, lb_slack, ub_slack, &mut scratch);
                     }
                 }
                 n
@@ -1329,10 +1324,10 @@ impl Merge {
     }
 }
 
-/// The k-th best candidate across `slots`, if there are `k`, and the highest
-/// `_id` among the superfiles the walk drew its `k` candidates from: a k-way
-/// walk over each superfile's sorted candidates, taking equal candidates
-/// from the lowest `_id` ranges first.
+/// The k-th best candidate across `slots` and the highest `_id` among the
+/// superfiles the walk drew its `k` candidates from: a k-way walk over each
+/// superfile's sorted candidates, taking equal candidates from the lowest
+/// `_id` ranges first. `(None, i128::MAX)` when there are fewer than `k`.
 fn kth_candidate(slots: &[Slot], k: usize) -> (Option<f32>, i128) {
     let mut heap: BinaryHeap<(OrdF32, Reverse<i128>, usize, usize)> = BinaryHeap::new();
     for (si, slot) in slots.iter().enumerate() {
@@ -1352,7 +1347,10 @@ fn kth_candidate(slots: &[Slot], k: usize) -> (Option<f32>, i128) {
             heap.push((OrdF32(next), Reverse(slot_id_max), si, at + 1));
         }
     }
-    (kth, id_max)
+    match kth {
+        Some(_) => (kth, id_max),
+        None => (None, i128::MAX),
+    }
 }
 
 impl Slot {
@@ -1439,17 +1437,16 @@ impl Slot {
     /// all. The lower bound is the best bare sum of a document carrying
     /// every required term, where such a document can be trusted to match,
     /// and the candidates are those sums narrowed by the lower slack.
-    #[allow(clippy::too_many_arguments)]
     fn refresh(
         &mut self,
         shape: &Shape,
-        idf: &[f32],
-        norm: &[f32; 256],
+        scoring: &Scoring,
         k: usize,
         lb_slack: f32,
         ub_slack: f32,
         scratch: &mut Scratch,
     ) {
+        let (idf, norm) = (scoring.idf.as_slice(), &*scoring.norm);
         self.touched = false;
         for h in self.heads.iter_mut() {
             if h.pending.is_empty() {
@@ -1526,16 +1523,14 @@ impl Slot {
         scratch.zero.resize(nt, 0.0);
         scratch.tf_len.clear();
         scratch.tf_len.resize(nt, 0);
-        let no_tf_len = std::mem::take(&mut scratch.tf_len);
         let mut ub = if settled == 0 {
-            doc_ub(0, &scratch.zero, &no_tf_len)
+            doc_ub(0, &scratch.zero, &scratch.tf_len)
         } else {
             f32::NEG_INFINITY
         };
         let mut lb = f32::NEG_INFINITY;
         scratch.candidates.clear();
         let mut candidates = std::mem::take(&mut scratch.candidates);
-        scratch.tf_len = no_tf_len;
         self.join(scratch, |_, mask, contrib, tf_len| {
             if mask & settled != settled {
                 return;
@@ -1673,6 +1668,14 @@ mod tests {
     /// A length norm the same for every bucket.
     const FLAT_NORM: [f32; 256] = [1.0; 256];
 
+    /// Scoring at `idf` with a norm of one in every length bucket.
+    fn flat(idf: &[f32]) -> Scoring {
+        Scoring {
+            idf: idf.to_vec(),
+            norm: Arc::new(FLAT_NORM),
+        }
+    }
+
     /// Cases the bound oracle below draws.
     const BOUND_CASES: u64 = 4_000;
     /// Documents in the oracle's universe per case.
@@ -1763,15 +1766,7 @@ mod tests {
                 slot.heads[ti].done = whole;
                 truth.push(contribution);
             }
-            slot.refresh(
-                &shape,
-                &idf,
-                &FLAT_NORM,
-                10,
-                1.0,
-                1.0,
-                &mut Scratch::default(),
-            );
+            slot.refresh(&shape, &flat(&idf), 10, 1.0, 1.0, &mut Scratch::default());
             let (ub, lb) = (slot.ub, slot.lb);
             // The truth: the best document carrying every required term,
             // scored as the kernel would at worst for the bound — every
@@ -2053,7 +2048,7 @@ mod tests {
         }
         slot.heads[0].tail = 0.5;
         slot.heads[0].ceiling = 0.8;
-        slot.refresh(&shape, &idf, &FLAT_NORM, 3, 1.0, 1.0, &mut scratch);
+        slot.refresh(&shape, &flat(&idf), 3, 1.0, 1.0, &mut scratch);
         let first = slot.ub;
         // Document 4 carries both terms: 0.8 + 0.7. Document 1 is read under
         // term 1 only, so it may still carry term 0 up to the tail: 0.9 + 0.5.
@@ -2069,7 +2064,7 @@ mod tests {
             slot.absorb(0, doc, c, UNREAD_TF_LEN);
         }
         slot.heads[0].tail = 0.2;
-        slot.refresh(&shape, &idf, &FLAT_NORM, 3, 1.0, 1.0, &mut scratch);
+        slot.refresh(&shape, &flat(&idf), 3, 1.0, 1.0, &mut scratch);
         assert!(slot.ub <= first, "ub rose from {first} to {}", slot.ub);
         assert!(close(&slot.top, &[1.5, 1.35, 0.9]), "top {:?}", slot.top);
         assert!(
@@ -2097,15 +2092,7 @@ mod tests {
         slot.heads[0].tail = 0.0;
         slot.heads[0].ceiling = 0.8;
         slot.heads[0].done = true;
-        slot.refresh(
-            &shape,
-            &[1.0],
-            &FLAT_NORM,
-            2,
-            1.0,
-            1.0,
-            &mut Scratch::default(),
-        );
+        slot.refresh(&shape, &flat(&[1.0]), 2, 1.0, 1.0, &mut Scratch::default());
         assert_eq!(slot.top, vec![0.6], "row 4 is deleted");
         assert!((slot.ub - 0.6).abs() < 1e-6);
     }
@@ -2204,10 +2191,13 @@ mod tests {
     fn phrase_score_rises_with_frequency_up_to_its_exact_cap() {
         const MIN_NORM: f32 = 0.3;
         const NORMS: u32 = 400;
+        /// Step between the norms tried: irregular, so they do not fall on
+        /// round values only.
+        const NORM_STEP: f32 = 0.137;
         const IDFS: [f32; 5] = [0.01, 0.7, 3.3, 17.0, 45.0];
         for idf in IDFS {
             for n in 0..NORMS {
-                let norm = MIN_NORM + n as f32 * 0.137;
+                let norm = MIN_NORM + n as f32 * NORM_STEP;
                 for tf in 0..PHRASE_TF_EXACT_MAX {
                     let lower = score_with_dl_norm_k1(idf, tf, norm);
                     let higher = score_with_dl_norm_k1(idf, tf + 1, norm);
@@ -2263,15 +2253,7 @@ mod tests {
         slot.heads[1].tail = 0.1;
         slot.heads[1].ceiling = 0.5;
         slot.heads[1].seen = true;
-        slot.refresh(
-            &shape,
-            &idf,
-            &FLAT_NORM,
-            1,
-            1.0,
-            1.0,
-            &mut Scratch::default(),
-        );
+        slot.refresh(&shape, &flat(&idf), 1, 1.0, 1.0, &mut Scratch::default());
         let by_kernel = score_with_dl_norm_k1(2.0, 1, 1.0);
         assert!(
             slot.ub < by_kernel / 2.0,
@@ -2365,7 +2347,12 @@ mod tests {
             source: Some(0),
             ..HeadState::absent()
         };
-        let needed = sources_read_on(&[reading, ruled_out], &sources, f32::NEG_INFINITY, true);
+        let slots = [reading, ruled_out];
+        let reachable: Vec<bool> = slots
+            .iter()
+            .map(|s| s.reads_on(f32::NEG_INFINITY, true))
+            .collect();
+        let needed = sources_read_on(&slots, &reachable, &sources);
         assert_eq!(
             needed,
             vec![vec![false, true], vec![false]],
