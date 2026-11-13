@@ -644,3 +644,91 @@ fn a_range_index_on_a_column_it_cannot_key_is_refused() {
     db.create_table("t", schema, IndexSpec::new().range("n"))
         .expect("an integer column takes a range index");
 }
+
+/// A range beside an exact text filter is answered from the range index
+/// too: the scan intersects the interval's rows with the term dictionary's,
+/// and with every conjunct exact it is handed the `LIMIT`. Every answer
+/// is a table's without range indexes, over files with deleted rows, and
+/// nothing in the plan evaluates the range or the text.
+#[test]
+fn a_range_beside_an_exact_text_filter_answers_as_a_scan_does() {
+    let dir = TempDir::new().expect("tempdir");
+    let db = connect(dir.path().to_str().expect("utf-8 path")).expect("connect");
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("seq", DataType::Int64, false),
+        Field::new("day", DataType::Date32, false),
+        Field::new("price", DataType::Float64, false),
+        Field::new("title", DataType::LargeUtf8, false),
+    ]));
+    let words = ["rust async", "go channels", "rust traits", "java streams"];
+    let batch = |first: i64| {
+        let seq: Vec<i64> = (first..first + ROWS_PER_FILE).collect();
+        RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(seq.clone())),
+                Arc::new(Date32Array::from(
+                    seq.iter()
+                        .map(|i| FIRST_DAY + ((i * 13) % DAYS) as i32)
+                        .collect::<Vec<_>>(),
+                )),
+                Arc::new(Float64Array::from(
+                    seq.iter().map(|i| (i % 100) as f64).collect::<Vec<_>>(),
+                )),
+                Arc::new(LargeStringArray::from(
+                    seq.iter()
+                        .map(|i| words[(*i as usize * 7) % words.len()])
+                        .collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .expect("batch")
+    };
+    for (table, spec) in [
+        ("plain", IndexSpec::new().fts("title")),
+        (
+            "ranged",
+            IndexSpec::new()
+                .fts("title")
+                .range("seq")
+                .range("day")
+                .range("price"),
+        ),
+    ] {
+        let t = db
+            .create_table(table, Arc::clone(&schema), spec)
+            .expect("create");
+        for file in 0..FILES {
+            t.append(&batch(file * ROWS_PER_FILE)).expect("append");
+        }
+        t.delete(col("seq").lt(lit(DELETED_BELOW))).expect("delete");
+    }
+    let queries = [
+        "SELECT seq FROM {t} WHERE text_match(title, 'rust') AND seq >= 300 AND seq < 4100 ORDER BY seq",
+        "SELECT COUNT(*) FROM {t} WHERE text_match(title, 'rust') AND seq >= 300 AND seq < 4100",
+        "SELECT COUNT(*) FROM (SELECT seq FROM {t} WHERE text_match(title, 'rust') AND seq > 450 AND seq <= 9000 LIMIT 7)",
+        "SELECT COUNT(*) FROM (SELECT seq FROM {t} WHERE text_match(title, 'rust go') AND seq BETWEEN 100 AND 700 LIMIT 300)",
+        "SELECT seq FROM {t} WHERE text_match(title, 'go') AND day >= DATE '2022-03-01' AND day < DATE '2022-03-10' ORDER BY seq",
+        "SELECT COUNT(*) FROM {t} WHERE title ILIKE '%java%' AND seq >= 2000",
+        "SELECT COUNT(*) FROM {t} WHERE text_match(title, 'rust') AND seq > 10 AND seq < 5",
+        "SELECT COUNT(*) FROM {t} WHERE text_match(title, 'rust') AND seq = 1001",
+        // A float range stays a verified bound beside the text.
+        "SELECT COUNT(*) FROM {t} WHERE text_match(title, 'rust') AND price >= 10 AND price < 20",
+        // So does a range alone.
+        "SELECT COUNT(*) FROM {t} WHERE seq >= 300 AND seq < 4100",
+    ];
+    for query in queries {
+        assert_eq!(
+            answer(&db, query, "ranged"),
+            answer(&db, query, "plain"),
+            "{query}"
+        );
+    }
+    let plan = answer(
+        &db,
+        "EXPLAIN SELECT seq FROM {t} WHERE text_match(title, 'rust') AND seq >= 300 AND seq < 4100 LIMIT 5",
+        "ranged",
+    );
+    let physical = &plan[plan.find("physical_plan").expect("a physical plan")..];
+    assert!(!physical.contains(FILTER_OPERATOR), "{physical}");
+}

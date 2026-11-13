@@ -958,6 +958,12 @@ impl SupertableProvider {
         // the interval's. A superfile without the index has its rows
         // checked against their values instead, with the rest below.
         for (field, data_type, lo, hi) in &check.ranges {
+            if lo > hi {
+                // An empty interval holds no row.
+                rows.proven = RoaringBitmap::new();
+                rows.doubtful = RoaringBitmap::new();
+                continue;
+            }
             match prepared
                 .reader
                 .range_rows(*field, data_type, *lo, *hi, Some(pool))
@@ -1844,9 +1850,21 @@ impl ExactCheck {
             .iter()
             .map(|field| field.name().clone())
             .collect();
+        // Conjuncts on one column are one interval (`ts >= a AND ts < b`):
+        // each alone is half the key space, read whole from the index.
+        let mut merged: Vec<(FieldId, DataType, u64, u64)> = Vec::new();
+        for (field, data_type, lo, hi) in ranges {
+            match merged.iter_mut().find(|(f, _, _, _)| *f == field) {
+                Some((_, _, l, h)) => {
+                    *l = (*l).max(lo);
+                    *h = (*h).min(hi);
+                }
+                None => merged.push((field, data_type, lo, hi)),
+            }
+        }
         Ok(Some(Self {
             filter: ExactFilter::And(conjuncts),
-            ranges,
+            ranges: merged,
             predicate,
             columns,
             schema: bound_schema,
