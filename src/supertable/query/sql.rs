@@ -494,8 +494,15 @@ impl SupertableReader {
             return Ok(counts);
         }
         // A FILTER clause cannot hold a subquery: a predicate that reads
-        // another relation is counted under its own WHERE.
-        if predicates.iter().any(holds_subquery) {
+        // another relation is counted under its own WHERE. So is one with a
+        // `text_match`, which the scan answers from the postings under a
+        // WHERE but a FILTER clause would evaluate on every row, and a lone
+        // predicate, which a WHERE counts the same and lets the scan narrow.
+        if predicates.len() == 1
+            || predicates.iter().any(|p| {
+                holds_subquery(p) || crate::supertable::query::text_match::holds_text_match(p)
+            })
+        {
             return predicates
                 .into_iter()
                 .map(|predicate| {
@@ -2785,6 +2792,56 @@ mod tests {
             );
             assert_eq!(predicate, function, "{query} ({mode})");
         }
+    }
+
+    #[test]
+    fn count_where_counts_a_text_match_as_its_statement_does() {
+        // Alone, beside another predicate, and with a predicate that is no
+        // text match, each count is the statement's COUNT(*) WHERE.
+        use datafusion::logical_expr::{ScalarUDF, col, lit};
+
+        use crate::supertable::query::text_match::TextMatchFunc;
+        let (st, _) = exact_ilike_table(Stemmer::None);
+        let reader = st.reader().expect("reader");
+        let text_match = ScalarUDF::from(TextMatchFunc::new());
+        let matches = |query: &str, mode: &str| {
+            text_match.call(vec![
+                col("title"),
+                lit(query.to_owned()),
+                lit(mode.to_owned()),
+            ])
+        };
+        let count_sql = |filter: &str| {
+            let batches = reader
+                .query_sql(&format!(
+                    "SELECT COUNT(*) AS c FROM supertable WHERE {filter}"
+                ))
+                .expect("count");
+            rendered_rows(&batches)
+        };
+        let one = reader
+            .count_where(&[matches("bbc taxi", "or")])
+            .expect("count_where");
+        assert_eq!(
+            vec![format!("{}", one[0])],
+            count_sql("text_match(title, 'bbc taxi', 'or')")
+                .iter()
+                .map(|row| row.trim_matches(|c| c == '[' || c == ']').to_owned())
+                .collect::<Vec<_>>()
+        );
+        let both = reader
+            .count_where(&[matches("bbc news", "and"), col("category").eq(lit("y"))])
+            .expect("count_where");
+        let expected: Vec<u64> = ["text_match(title, 'bbc news', 'and')", "category = 'y'"]
+            .iter()
+            .map(|filter| {
+                count_sql(filter)[0]
+                    .trim_matches(|c| c == '[' || c == ']')
+                    .parse()
+                    .expect("a count")
+            })
+            .collect();
+        assert_eq!(both, expected);
     }
 
     #[test]

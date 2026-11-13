@@ -58,7 +58,7 @@ use arrow_array::{
 };
 use arrow_schema::DataType;
 use datafusion::{
-    common::{ScalarValue, exec_err, plan_err},
+    common::{ScalarValue, exec_err, plan_err, tree_node::TreeNode},
     error::Result as DfResult,
     execution::context::SessionContext,
     logical_expr::{
@@ -127,6 +127,17 @@ pub(crate) fn text_match_call(expr: &Expr) -> Option<(String, Vec<String>, TextM
         None => TextMatchMode::Any,
     };
     Some((column.name.clone(), query_tokens(query), mode))
+}
+
+/// Whether `expr` calls `text_match` anywhere in it.
+pub(crate) fn holds_text_match(expr: &Expr) -> bool {
+    expr.exists(|e| {
+        Ok(matches!(
+            e,
+            Expr::ScalarFunction(ScalarFunction { func, .. }) if func.name() == TEXT_MATCH_UDF
+        ))
+    })
+    .unwrap_or(true)
 }
 
 fn string_literal(expr: &Expr) -> Option<&str> {
