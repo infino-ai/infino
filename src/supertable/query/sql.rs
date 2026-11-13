@@ -665,6 +665,8 @@ impl SupertableReader {
         register_bm25(&ctx, Arc::clone(&reader), schemas.scalar().clone());
         // Unranked token / exact match TVFs (siblings of bm25_search).
         register_match(&ctx, Arc::clone(&reader), schemas.scalar().clone());
+        // `text_match`, the token match as a WHERE predicate.
+        crate::supertable::query::text_match::register_text_match(&ctx);
         register_hybrid_search(&ctx, Arc::clone(&reader), schemas.scalar().clone());
 
         Ok(ctx)
@@ -2703,6 +2705,115 @@ mod tests {
         ] {
             assert_same_rows(&rt, &oracle, &st, sql, "a rewritten filter");
         }
+    }
+
+    /// `text_match` filters over the exact-`ILIKE` fixture: one token, several
+    /// under either mode, a token no row holds, a query of no token, tokens
+    /// that `standard` splits off punctuation, and trees with other
+    /// conjuncts, one of them under `NOT`.
+    const TEXT_MATCH_FILTERS: &[&str] = &[
+        "text_match(title, 'bbc')",
+        "text_match(title, 'BBC news', 'and')",
+        "text_match(title, 'bbc taxi kelvin', 'or')",
+        "text_match(title, 'bbc taxi', 'AND')",
+        "text_match(title, 'zzq')",
+        "text_match(title, ' ,; ')",
+        "text_match(title, 'don''t')",
+        "text_match(title, '3.5 u.s')",
+        "text_match(title, 'bbc') AND category = 'y'",
+        "text_match(title, 'bbc') OR category = 'y'",
+        "text_match(title, 'bbc') OR text_match(title, 'rank')",
+        "NOT text_match(title, 'bbc')",
+        "text_match(title, 'bbc') AND title ILIKE '%news%'",
+    ];
+
+    #[test]
+    fn query_sql_text_match_matches_datafusion_on_a_memtable() {
+        // On a `standard` column the scan answers `text_match` from the
+        // postings; under a stemmer DataFusion calls the function row by
+        // row. The oracle always calls it row by row, so both paths must
+        // return the function's own rows, through every query shape.
+        let rt = Runtime::new().expect("runtime");
+        for stemmer in [Stemmer::None, Stemmer::English] {
+            let name = &format!("{stemmer:?}");
+            let (st, oracle) = exact_ilike_table(stemmer);
+            crate::supertable::query::text_match::register_text_match(&oracle);
+            for filter in TEXT_MATCH_FILTERS {
+                for sql in [
+                    format!("SELECT title FROM supertable WHERE {filter}"),
+                    format!("SELECT COUNT(*) FROM supertable WHERE {filter}"),
+                    format!(
+                        "SELECT category, COUNT(*) FROM supertable WHERE {filter} GROUP BY category"
+                    ),
+                    format!(
+                        "SELECT COUNT(*) FROM \
+                         (SELECT title FROM supertable WHERE {filter} LIMIT 3)"
+                    ),
+                ] {
+                    assert_same_rows(&rt, &oracle, &st, &sql, name);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn text_match_holds_the_rows_token_match_returns() {
+        // The predicate and the table function are the same match: a row
+        // passes `text_match` exactly when `token_match` returns it.
+        let (st, _) = exact_ilike_table(Stemmer::None);
+        let reader = st.reader().expect("reader");
+        for (query, mode) in [
+            ("bbc", "or"),
+            ("bbc news", "and"),
+            ("bbc taxi kelvin", "or"),
+            ("taxi rank", "and"),
+            ("zzq", "or"),
+        ] {
+            let predicate = rendered_rows(
+                &reader
+                    .query_sql(&format!(
+                        "SELECT _id FROM supertable WHERE text_match(title, '{query}', '{mode}') ORDER BY _id"
+                    ))
+                    .expect("text_match"),
+            );
+            let function = rendered_rows(
+                &reader
+                    .query_sql(&format!(
+                        "SELECT _id FROM token_match('title', '{query}', '{mode}') ORDER BY _id"
+                    ))
+                    .expect("token_match"),
+            );
+            assert_eq!(predicate, function, "{query} ({mode})");
+        }
+    }
+
+    #[test]
+    fn a_text_match_on_a_standard_column_is_checked_nowhere() {
+        // Exact on `standard`: listed among the scan's full filters, and
+        // nothing in the physical plan evaluates it. Under a stemmer the
+        // postings would disagree with the function, so it stays a filter.
+        let (st, _) = exact_ilike_table(Stemmer::None);
+        for sql in [
+            "SELECT title FROM supertable WHERE text_match(title, 'bbc news', 'and')",
+            "SELECT title FROM supertable WHERE text_match(title, 'bbc') OR text_match(title, 'taxi')",
+            "SELECT COUNT(*) FROM supertable WHERE text_match(title, 'bbc taxi')",
+        ] {
+            let (logical, physical) = explain(&st, sql);
+            assert!(
+                logical.lines().any(|line| line.contains("TableScan")
+                    && line
+                        .split_once("full_filters=")
+                        .is_some_and(|(_, full)| full.contains("text_match"))),
+                "{sql}: no scan answers text_match in full: {logical}"
+            );
+            assert!(!physical.contains("text_match"), "{sql}: {physical}");
+        }
+        let (stemmed, _) = exact_ilike_table(Stemmer::English);
+        let plan = explain_physical(
+            &stemmed,
+            "SELECT title FROM supertable WHERE text_match(title, 'bbc')",
+        );
+        assert!(plan.contains("text_match"), "{plan}");
     }
 
     /// `AND` / `OR` trees over the exact-`ILIKE` fixture's one column: exact

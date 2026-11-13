@@ -616,6 +616,81 @@ impl FtsReader {
         Ok((out, work))
     }
 
+    /// For each of `terms`, the Parquet rows of `column` that hold the term
+    /// as one of their tokens: the term's own postings, read from its one
+    /// dictionary key. Every row is proven ([`ContainsRows::doubtful`] is
+    /// empty): the rows a term's postings hold are by definition the rows
+    /// that have it as a token, and the caller (the table layer's
+    /// `text_match`) asks for the tokens `standard` gives a value, so each
+    /// term is looked up as `standard` wrote it. One result per term, in
+    /// order; a term the column never indexed has none.
+    ///
+    /// Errors as [`Self::contains_rows`] does: `FtsError::UnknownColumn`
+    /// when `column` is not FTS-indexed here, `FtsError::ExactNeedsStandard`
+    /// when this superfile indexed it with another analyzer.
+    pub(crate) async fn term_rows(
+        &self,
+        column: &str,
+        terms: &[&str],
+        pool: Option<&ThreadPool>,
+        budget: Option<&Arc<ConnectionMemoryBudget>>,
+    ) -> Result<(Vec<ContainsRows>, MatchWork), FtsError> {
+        let column_id = self.resolve_column_id(column)?;
+        let col = &self.columns[column_id as usize];
+        let analyzer = col.tokenizer.name();
+        if analyzer != STANDARD_TOKENIZER {
+            return Err(FtsError::ExactNeedsStandard {
+                column: column.to_owned(),
+                analyzer: analyzer.to_owned(),
+            });
+        }
+        let mut work = MatchWork::default();
+        if terms.is_empty() {
+            return Ok((Vec::new(), work));
+        }
+        let dict_bytes = self.dict_bytes_async().await?;
+        work.planned_ranges += 1;
+        let owned_column = column.to_owned();
+        let patterns: Vec<OwnedPattern> = terms
+            .iter()
+            .map(|term| OwnedPattern::Exact((*term).to_owned()))
+            .collect();
+        // Each term's own key: a walk of the keys it prefixes, which keeps
+        // only the one equal to it (see `walk_dictionary`).
+        let walks = vec![Walk::Subtree; patterns.len()];
+        let charge = budget.map(ValueCharge::new).transpose()?;
+        let (walked, walk_ns) = run_on_pool(pool, "term walk", move || {
+            timed_section(|| {
+                walk_dictionary(
+                    &dict_bytes,
+                    &owned_column,
+                    &patterns,
+                    &walks,
+                    false,
+                    usize::MAX,
+                    false,
+                    Keep::Values,
+                    charge,
+                )
+            })
+        })
+        .await
+        .map_err(|_| FtsError::TaskDropped("term walk"))?;
+        work.kernel_cpu_ns += walk_ns;
+        let (walked, _values) = walked?;
+        let mut out = Vec::with_capacity(terms.len());
+        for walked in walked {
+            let proven = self
+                .union_rows(col, walked.proven, pool, budget, &mut work)
+                .await?;
+            out.push(ContainsRows {
+                proven,
+                doubtful: RoaringBitmap::new(),
+            });
+        }
+        Ok((out, work))
+    }
+
     /// The Parquet rows the postings behind `values` hold, unioned. Inline
     /// (df=1) values carry their document; the rest are fetched in waves
     /// of at most [`CONTAINS_FETCH_BATCH_BYTES`] on this runtime and ORed
@@ -815,11 +890,20 @@ fn walk_dictionary(
             break;
         }
         if *walk == Walk::Subtree {
+            // An exact pattern's subtree holds the term and the longer terms
+            // it prefixes; only the term itself is admitted.
+            let exact = match pattern {
+                OwnedPattern::Exact(text) => Some(text.as_str()),
+                _ => None,
+            };
             dict.for_each_prefix(&make_key(column, pattern.borrow().text()), |key, value| {
                 let Ok(term) = str::from_utf8(&key[term_start..]) else {
                     bad_key = true;
                     return false;
                 };
+                if exact.is_some_and(|text| text != term) {
+                    return true;
+                }
                 if !slot.admit(term, value, false, keep, max_terms) {
                     return false;
                 }

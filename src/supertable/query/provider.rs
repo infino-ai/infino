@@ -845,27 +845,38 @@ impl SupertableProvider {
             self.count_rows_checked(checked.len(), verified.len());
             return Ok((verified, work));
         }
-        // Each column's distinct needles, in first-seen order.
-        let mut by_column: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+        // Each column's distinct needles, in first-seen order: those an
+        // indexed term must contain (`ILIKE`), and those that must be an
+        // indexed term (`text_match`).
+        let mut by_column: BTreeMap<(&str, bool), Vec<&str>> = BTreeMap::new();
         for leaf in check.filter.leaves() {
-            let needles = by_column.entry(leaf.column.as_str()).or_default();
+            let needles = by_column
+                .entry((leaf.column.as_str(), leaf.whole))
+                .or_default();
             if !needles.contains(&leaf.needle.as_str()) {
                 needles.push(&leaf.needle);
             }
         }
         let budget = &self.manifest.options.connection_memory_budget;
-        let mut leaf_rows: HashMap<(&str, &str), ContainsRows> = HashMap::new();
-        for (column, needles) in by_column {
+        let mut leaf_rows: HashMap<(&str, &str, bool), ContainsRows> = HashMap::new();
+        for ((column, whole), needles) in by_column {
             // A superfile written before a rename keys its dictionary by
             // the column's old name.
             let file_column = prepared
                 .reader
                 .column_alias(self.manifest.field_id(column), column);
-            let (rows, column_work) = prepared
-                .reader
-                .contains_rows(file_column, &needles, Some(pool), Some(budget))
-                .await
-                .map_err(QueryError::from)?;
+            let (rows, column_work) = if whole {
+                prepared
+                    .reader
+                    .term_rows(file_column, &needles, Some(pool), Some(budget))
+                    .await
+            } else {
+                prepared
+                    .reader
+                    .contains_rows(file_column, &needles, Some(pool), Some(budget))
+                    .await
+            }
+            .map_err(QueryError::from)?;
             // One result per needle, or the zip below would pair needles
             // with another needle's rows.
             if rows.len() != needles.len() {
@@ -876,16 +887,18 @@ impl SupertableProvider {
                 )));
             }
             work.merge(column_work);
-            leaf_rows.extend(needles.into_iter().map(|needle| (column, needle)).zip(rows));
+            leaf_rows.extend(
+                needles
+                    .into_iter()
+                    .map(|needle| (column, needle, whole))
+                    .zip(rows),
+            );
         }
         // Every leaf the tree reads has its rows; checked up front so the
         // lookup below cannot miss.
-        if let Some(leaf) = check
-            .filter
-            .leaves()
-            .into_iter()
-            .find(|leaf| !leaf_rows.contains_key(&(leaf.column.as_str(), leaf.needle.as_str())))
-        {
+        if let Some(leaf) = check.filter.leaves().into_iter().find(|leaf| {
+            !leaf_rows.contains_key(&(leaf.column.as_str(), leaf.needle.as_str(), leaf.whole))
+        }) {
             return Err(DataFusionError::Internal(format!(
                 "exact rows of column {:?}: no result for needle {:?}",
                 leaf.column, leaf.needle
@@ -893,7 +906,7 @@ impl SupertableProvider {
         }
         let mut rows = check.filter.rows(&|leaf| {
             leaf_rows
-                .get(&(leaf.column.as_str(), leaf.needle.as_str()))
+                .get(&(leaf.column.as_str(), leaf.needle.as_str(), leaf.whole))
                 .cloned()
                 .unwrap_or_default()
         });
