@@ -409,7 +409,7 @@ impl SpilledCellRows {
 /// the fixed prefix plus the RaBitQ code and the codec's per-vector rerank body
 /// (`RerankCodec::per_vector_bytes(dim)` — `2·dim` for the residual family's
 /// `codes`/`residuals` legs).
-fn record_bytes(dim: usize, rabitq_len: usize, codec: RerankCodec) -> usize {
+pub(crate) fn record_bytes(dim: usize, rabitq_len: usize, codec: RerankCodec) -> usize {
     ROW_SPILL_PREFIX_BYTES + rabitq_len + codec.per_vector_bytes(dim)
 }
 

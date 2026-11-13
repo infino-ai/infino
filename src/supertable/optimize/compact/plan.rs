@@ -19,7 +19,10 @@
 //! property the concurrent runner depends on is that no two jobs name the
 //! same superfile, which [`prop_jobs_never_share_an_input`] pins.
 
-use std::{collections::BTreeMap, mem};
+use std::{
+    collections::{BTreeMap, HashSet},
+    mem,
+};
 
 use uuid::Uuid;
 
@@ -209,7 +212,7 @@ pub struct SuperfileStats {
     /// Commit version the superfile was born at. A merged superfile carries
     /// the OLDEST input's `birth_version`, so user-table merge jobs must
     /// never mix inputs from opposite sides of the hidden drain watermark
-    /// (see [`split_stats_at_drain_watermark`]).
+    /// (see [`split_stats_by_drain_state`]).
     pub birth_version: u64,
     /// Whether the file holds some column in a type other than the
     /// table's. Such a file is rewritten by the next compaction whatever
@@ -231,22 +234,43 @@ impl SuperfileStats {
     }
 }
 
-/// Split merge candidates at the hidden drain watermark: inputs whose
-/// `birth_version` the hidden index has already drained versus inputs it has
-/// not. A merged superfile is stamped with the OLDEST input `birth_version`
-/// (see `run_compaction_job`), so a job mixing the two sides would inherit a
-/// drained version and the drain's `!drained.contains(birth_version)` filter
-/// would skip it — the undrained inputs' vectors would silently never enter
-/// the hidden index (a permanent recall hole). Merging within either side is
-/// safe: all-drained stays drained, all-undrained keeps an undrained version
-/// and is drained as one source.
-pub(super) fn split_stats_at_drain_watermark(
+/// Split merge candidates into the groups a merge may draw from, leaving
+/// out what no merge may touch: inputs whose `birth_version` the hidden
+/// index has already drained, and every other undrained input. The sources
+/// of the drain in progress (`pending_epoch`, by id) are in neither, so they
+/// are not merged at all until that drain finishes.
+///
+/// A merged superfile is stamped with the OLDEST input `birth_version` (see
+/// `run_compaction_job`), and the drain marks versions drained, not
+/// superfiles:
+///
+/// - a job mixing drained and undrained inputs would inherit a drained
+///   version, and the drain's `!drained.contains(birth_version)` filter
+///   would skip it, so the undrained inputs' vectors would never enter the
+///   hidden index (a permanent recall hole);
+/// - a job mixing the drain in progress with later inputs would inherit a
+///   version that drain is about to mark drained, though it drains only its
+///   own sources, with the same result for the later inputs;
+/// - a job merging the drain in progress's own sources would remove them
+///   from the manifest, and a resumed drain looks each of its sources up
+///   there by id: it would fail on every attempt and never finish.
+///
+/// Merging within either group is safe: all-drained stays drained, and the
+/// rest keep an undrained version and are drained as one source.
+pub(super) fn split_stats_by_drain_state(
     stats: Vec<SuperfileStats>,
     drained: &DrainedVersionRanges,
-) -> (Vec<SuperfileStats>, Vec<SuperfileStats>) {
-    stats
-        .into_iter()
-        .partition(|s| drained.contains(s.birth_version))
+    pending_epoch: &HashSet<Uuid>,
+) -> [Vec<SuperfileStats>; 2] {
+    let mut groups: [Vec<SuperfileStats>; 2] = Default::default();
+    for s in stats {
+        if pending_epoch.contains(&s.superfile_id) {
+            continue;
+        }
+        let group = usize::from(!drained.contains(s.birth_version));
+        groups[group].push(s);
+    }
+    groups
 }
 
 /// A set of superfiles to merge into one new superfile.
@@ -666,7 +690,8 @@ pub(in crate::supertable::optimize::compact) mod tests {
         assert_eq!(mixed.len(), 1);
         assert_eq!(mixed[0].inputs.len(), 3, "guard: unsplit selection mixes");
 
-        let (drained_side, undrained_side) = split_stats_at_drain_watermark(all, &drained);
+        let [drained_side, undrained_side] =
+            split_stats_by_drain_state(all, &drained, &HashSet::new());
         assert_eq!(
             drained_side
                 .iter()
@@ -685,6 +710,41 @@ pub(in crate::supertable::optimize::compact) mod tests {
             !jobs[0].inputs.contains(&Uuid::from_u128(1)),
             "undrained job must not contain the drained input"
         );
+    }
+
+    #[test]
+    fn the_drain_in_progress_is_left_out_of_every_merge() {
+        let drained = DrainedVersionRanges::from_intervals(vec![(0, 10)]).expect("ranges");
+        let at = |id: u128, version: u64| {
+            let mut s = seg(id, 1, 1000, 0);
+            s.birth_version = version;
+            s
+        };
+        // 1 is drained, 2 and 3 are sources of the drain in progress, 4 and 5
+        // were committed after it started.
+        let all = vec![at(1, 5), at(2, 20), at(3, 21), at(4, 22), at(5, 23)];
+        let pending: HashSet<Uuid> = [2, 3].into_iter().map(Uuid::from_u128).collect();
+        let ids = |group: &[SuperfileStats]| -> Vec<u128> {
+            group.iter().map(|s| s.superfile_id.as_u128()).collect()
+        };
+        let [drained_side, rest] = split_stats_by_drain_state(all, &drained, &pending);
+        assert_eq!(ids(&drained_side), vec![1]);
+        assert_eq!(
+            ids(&rest),
+            vec![4, 5],
+            "the drain's own sources are in no group"
+        );
+
+        let cfg = CompactionSettings {
+            target_superfile_size_mb: 2048,
+            min_fill_percent: 0,
+            ..CompactionSettings::default()
+        };
+        let jobs = select(&rest, &cfg);
+        assert_eq!(jobs.len(), 1);
+        let mut inputs: Vec<u128> = jobs[0].inputs.iter().map(|id| id.as_u128()).collect();
+        inputs.sort_unstable();
+        assert_eq!(inputs, vec![4, 5]);
     }
 
     pub(in crate::supertable::optimize::compact) fn default_cfg() -> CompactionSettings {

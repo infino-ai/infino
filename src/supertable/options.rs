@@ -672,6 +672,13 @@ pub struct SupertableOptions {
     /// batches that checkpoint recorded; this setting shapes the next fresh
     /// drain.
     pub drain_batch_superfiles: i64,
+    /// Most user rows one hidden-index drain takes on; `0` sets no fixed
+    /// limit. A drain also takes no more rows than its scratch disk can
+    /// spill. Defaults to `vector.drain_max_rows` from config;
+    /// [`Self::with_drain_max_rows`] overrides per table. Like the batch
+    /// size, it shapes the next fresh drain, not one resumed from its
+    /// checkpoint.
+    pub drain_max_rows: u64,
     /// Recall the drain calibration targets when it stamps this table's
     /// probe laws — the recall/latency lever. Width crosses at this
     /// value and the depth stages at a padded form of it, so lowering
@@ -967,6 +974,7 @@ impl SupertableOptions {
             target_superfiles_per_part: DEFAULT_TARGET_SUPERFILES_PER_PART,
             part_size_threshold_bytes: DEFAULT_PART_SIZE_THRESHOLD_BYTES,
             drain_batch_superfiles: crate::config::global().vector.drain_batch_superfiles,
+            drain_max_rows: crate::config::global().vector.drain_max_rows,
             target_recall: crate::config::global().vector.target_recall,
             drain_consolidate: DrainConsolidate::Kmeans,
             eager_load_threshold_parts: DEFAULT_EAGER_LOAD_THRESHOLD_PARTS,
@@ -1239,6 +1247,13 @@ impl SupertableOptions {
         self
     }
 
+    /// Override the most user rows one hidden-index drain takes on (`0` sets
+    /// no fixed limit). See [`Self::drain_max_rows`].
+    pub fn with_drain_max_rows(mut self, rows: u64) -> Self {
+        self.drain_max_rows = rows;
+        self
+    }
+
     /// Override the calibration's recall target for this table. Takes
     /// effect on the NEXT drain or recalibration: the laws already
     /// stamped in the manifest keep serving until then.
@@ -1437,6 +1452,7 @@ impl SupertableOptions {
         self.superfile_buffer_split_mb = cfg.supertable.superfile_buffer_split_mb;
         self.crc_verification = cfg.supertable.crc_policy();
         self.drain_batch_superfiles = cfg.vector.drain_batch_superfiles;
+        self.drain_max_rows = cfg.vector.drain_max_rows;
         self.target_recall = cfg.vector.target_recall;
         self.drain_consolidate = cfg.vector.drain_consolidate;
         if cfg.supertable.id_column != self.id_column {

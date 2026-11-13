@@ -480,6 +480,13 @@ vector:
   # instead. Raise above 1.0 only with evidence it helps at your scale.
   drain_replica_target_factor: 1.0
 
+  # Most user rows one drain takes on; the rest wait for the next drain.
+  # A drain takes whole commits, oldest first, and always at least one.
+  # 0 sets no fixed limit. Either way a drain takes no more rows than half
+  # the free space on its scratch disk can spill, so a large backlog is
+  # drained over several optimizes instead of filling the disk.
+  drain_max_rows: 0
+
   # Per-cell consolidation op the drain applies:
   #   kmeans — re-cluster each cell's rows (default).
   #   splice — keep each superfile's local clusters verbatim.
