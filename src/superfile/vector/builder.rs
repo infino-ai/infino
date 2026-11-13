@@ -2162,14 +2162,6 @@ fn sample_fp32_rows(vectors: &[f32], sample_size: usize, dim: usize, seed: u64) 
     sample
 }
 
-/// Shared cell-pack core: build one complete cell-IVF subsection from any
-/// [`CellPackSource`], writing the subsection and stable-id stream directly
-/// to disk. The single builder behind the drain (spilled rows), the
-/// commit-time cell pack (fp32 buffer), and maintenance rebuilds (in-RAM
-/// encoded rows).
-///
-/// Nothing is fsynced: a caller that reopens the files after a crash syncs
-/// them itself.
 /// The most memory a [`build_cell_subsection_from_source`] over `n_docs`
 /// rows of `row_bytes` each holds at once, page cache included: its fp32
 /// training sample, a bucket writer and an Sq8 ruler per cluster, and the
@@ -2191,6 +2183,14 @@ pub(crate) fn cell_build_peak_bytes(
     (sample + per_cluster + written) as u64
 }
 
+/// Shared cell-pack core: build one complete cell-IVF subsection from any
+/// [`CellPackSource`], writing the subsection and stable-id stream directly
+/// to disk. The single builder behind the drain (spilled rows), the
+/// commit-time cell pack (fp32 buffer), and maintenance rebuilds (in-RAM
+/// encoded rows).
+///
+/// Nothing is fsynced: a caller that reopens the files after a crash syncs
+/// them itself.
 pub(crate) fn build_cell_subsection_from_source(
     cfg: VectorConfig,
     requested_n_cent: usize,
