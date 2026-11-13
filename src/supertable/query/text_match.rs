@@ -199,9 +199,28 @@ fn holds(
     value: &str,
     tokens: &[String],
     mode: TextMatchMode,
+    lowered: &mut String,
 ) -> bool {
     if tokens.is_empty() {
         return false;
+    }
+    // Every token `standard` takes from ASCII text is that text's piece,
+    // lowercased: so a query token missing from the lowercased value as a
+    // substring is no token of it, and most values are decided without
+    // being tokenized. (Non-ASCII text can lowercase into an ASCII token,
+    // the Kelvin sign into `k`, so it is always tokenized.)
+    if value.is_ascii() && tokens.iter().all(|t| t.is_ascii()) {
+        lowered.clear();
+        lowered.push_str(value);
+        lowered.make_ascii_lowercase();
+        let present = |t: &String| lowered.contains(t.as_str());
+        let possible = match mode {
+            TextMatchMode::Any => tokens.iter().any(present),
+            TextMatchMode::All => tokens.iter().all(present),
+        };
+        if !possible {
+            return false;
+        }
     }
     let mut found = vec![false; tokens.len()];
     let mut left = tokens.len();
@@ -232,9 +251,10 @@ fn match_strings<'a>(
 ) -> BooleanArray {
     let tokenizer = StandardTokenizer::new();
     let mut out = BooleanBuilder::with_capacity(len);
+    let mut lowered = String::new();
     for value in values {
         match value {
-            Some(value) => out.append_value(holds(&tokenizer, value, tokens, mode)),
+            Some(value) => out.append_value(holds(&tokenizer, value, tokens, mode, &mut lowered)),
             None => out.append_null(),
         }
     }
@@ -347,6 +367,40 @@ mod tests {
         assert_eq!(
             eval(&values, "bear MONKEY", TextMatchMode::All),
             vec![Some(true), Some(false), Some(false), None, Some(false)]
+        );
+    }
+
+    #[test]
+    fn the_substring_check_never_drops_a_token() {
+        // Mixed case, a token inside punctuation, a cut-length word, and
+        // non-ASCII text that lowercases into an ASCII token.
+        let long = "x".repeat(300);
+        let values = [
+            Some("The BBC's REPORT"),
+            Some("bbc-funded (BBC)"),
+            Some(long.as_str()),
+            Some("\u{212A}elvin"),
+            Some("Kelvinator"),
+        ];
+        assert_eq!(
+            eval(&values, "bbc's kelvin", TextMatchMode::Any),
+            vec![
+                Some(true),
+                Some(false),
+                Some(false),
+                Some(true),
+                Some(false)
+            ]
+        );
+        assert_eq!(
+            eval(&values, &long, TextMatchMode::All),
+            vec![
+                Some(false),
+                Some(false),
+                Some(true),
+                Some(false),
+                Some(false)
+            ]
         );
     }
 

@@ -2960,6 +2960,52 @@ mod tests {
     const TITLE_BODY_EXACT_TREES: usize = 5;
 
     #[test]
+    fn a_text_match_tree_across_columns_is_exact_and_matches_datafusion() {
+        // Leaves on two columns, under OR and AND, are one exact tree, as
+        // ILIKE leaves on two columns are; NULLs hold no token.
+        let rt = Runtime::new().expect("runtime");
+        let titles: Vec<Option<&str>> = TITLE_BODY_ROWS.iter().map(|(t, _)| *t).collect();
+        let bodies: Vec<Option<&str>> = TITLE_BODY_ROWS.iter().map(|(_, b)| *b).collect();
+        let batch = RecordBatch::try_new(
+            schema_title_body(),
+            vec![
+                Arc::new(LargeStringArray::from(titles)),
+                Arc::new(LargeStringArray::from(bodies)),
+            ],
+        )
+        .expect("batch");
+        let st = Supertable::create(
+            SupertableOptions::new(
+                schema_title_body(),
+                vec![FtsConfig::new("title"), FtsConfig::new("body")],
+                vec![],
+            )
+            .expect("valid options")
+            .with_writer_pool(one_superfile_per_commit_pool()),
+        )
+        .expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&batch).expect("append");
+        w.commit().expect("commit");
+        let oracle = memtable_oracle(schema_title_body(), vec![batch]);
+        crate::supertable::query::text_match::register_text_match(&oracle);
+        for tree in [
+            "text_match(title, 'bbc') OR text_match(body, 'bbc')",
+            "text_match(title, 'bbc news', 'and') OR text_match(body, 'evening news', 'and')",
+            "text_match(title, 'bbc') AND text_match(body, 'news')",
+        ] {
+            for sql in [
+                format!("SELECT title, body FROM supertable WHERE {tree}"),
+                format!("SELECT COUNT(*) FROM supertable WHERE {tree}"),
+            ] {
+                let physical = explain_physical(&st, &sql);
+                assert!(!physical.contains("text_match"), "{sql}: {physical}");
+                assert_same_rows(&rt, &oracle, &st, &sql, tree);
+            }
+        }
+    }
+
+    #[test]
     fn exact_ilike_trees_across_nullable_columns_match_datafusion() {
         // A NULL holds no term, so every leaf reads it as false; with only
         // AND and OR above the leaves that is SQL's answer too, which the
