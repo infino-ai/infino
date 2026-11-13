@@ -1313,7 +1313,7 @@ impl SuperfileReader {
     /// the reader reads its page index once. Each load replaces the footer
     /// (see [`Footer`]), so the reader keeps one copy of its row-group
     /// metadata. With [`FirstLoad::Skip`] a reader with nothing loaded returns
-    /// its footer as it is. A decode runs on `pool` when given.
+    /// its footer as it is. A decode runs on `pool` when given, and in place otherwise.
     pub(crate) async fn page_indexed_footer(
         self: &Arc<Self>,
         columns: Columns<'_>,
@@ -1330,12 +1330,17 @@ impl SuperfileReader {
                 .get_or_try_init(|| self.read_page_index(source.as_ref()))
                 .await?;
         }
-        let reader = Arc::clone(self);
-        let columns = columns.to_set();
-        let load = move || reader.footer_for(Columns::Set(&columns), first);
-        let (held, footer) = run_on_pool_unless_blocking(pool, PAGE_INDEX_DECODE, load)
-            .await
-            .map_err(|_| ReadError::TaskDropped(PAGE_INDEX_DECODE))??;
+        let (held, footer) = match pool {
+            None => self.footer_for(columns, first)?,
+            Some(pool) => {
+                let reader = Arc::clone(self);
+                let columns = columns.to_set();
+                let load = move || reader.footer_for(Columns::Set(&columns), first);
+                run_on_pool_unless_blocking(Some(pool), PAGE_INDEX_DECODE, load)
+                    .await
+                    .map_err(|_| ReadError::TaskDropped(PAGE_INDEX_DECODE))??
+            }
+        };
         Ok((held, Arc::clone(footer.parquet())))
     }
 
@@ -1441,8 +1446,8 @@ impl SuperfileReader {
     ///
     /// A load holds the page-index lock across its decode, so concurrent loads
     /// decode each column once, and a caller waits at most one decode, about
-    /// what decoding itself would take. Async callers run this on the reader
-    /// pool ([`Self::page_indexed_footer`]), so no tokio worker waits here.
+    /// what decoding itself would take. An async caller given a pool runs this on
+    /// it ([`Self::page_indexed_footer`]), so no tokio worker waits here.
     fn footer_for(
         &self,
         columns: Columns<'_>,
