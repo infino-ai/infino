@@ -4694,10 +4694,7 @@ mod tests {
         let category = prepare(&["category"]);
         assert_eq!(indexed_columns(&category), names(&["category"]));
         let both = prepare(&["title"]);
-        // Both, or every column: on files this small, holding two columns'
-        // page index and the bytes to decode the rest takes as much memory as
-        // every column decoded, so the reader loads it all.
-        assert!(indexed_columns(&both).is_superset(&names(&["category", "title"])));
+        assert_eq!(indexed_columns(&both), names(&["category", "title"]));
         assert!(Arc::ptr_eq(&category.reader, &both.reader));
         assert!(Arc::ptr_eq(&prepare(&["category"]), &both));
     }
@@ -4727,9 +4724,11 @@ mod tests {
             .block_on(provider.range_scan_file(Arc::clone(&entry)))
             .expect("range prepare again");
         assert!(Arc::ptr_eq(&again, &ranged), "a range read reuses it");
-        let scanned = rt
-            .block_on(provider.prepared_scan_file(Arc::clone(&entry), IndexColumns::none()))
-            .expect("scan prepare");
+        let scan = || {
+            rt.block_on(provider.prepared_scan_file(Arc::clone(&entry), IndexColumns::none()))
+                .expect("scan prepare")
+        };
+        let scanned = scan();
         assert!(!Arc::ptr_eq(&scanned, &ranged), "a scan prepares it again");
         assert!(Arc::ptr_eq(&scanned.reader, &ranged.reader));
         assert!(
@@ -4737,6 +4736,16 @@ mod tests {
             "with its page index"
         );
         assert!(provider.scan_footers.get(&scanned.path).is_some());
+        // The scan's file replaced the range read's for later callers: the
+        // next scan and the next range read both reuse it.
+        assert!(Arc::ptr_eq(&scan(), &scanned), "a second scan reuses it");
+        let ranged_after = rt
+            .block_on(provider.range_scan_file(Arc::clone(&entry)))
+            .expect("range prepare after the scan");
+        assert!(
+            Arc::ptr_eq(&ranged_after, &scanned),
+            "a range read after the scan reuses it"
+        );
     }
 
     /// Two scans asking for different columns at once share one open, and

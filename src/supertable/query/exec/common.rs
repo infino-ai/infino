@@ -86,7 +86,7 @@ use crate::{
     superfile::{
         ReadError, SuperfileReader,
         lazy_source::Source,
-        page_index::{IndexColumns, loaded_pages},
+        page_index::loaded_pages,
         reader::{
             WHOLE_COLUMN_TAKE_DIVISOR, in_projection_order, rank_back_indices,
             row_selection_for_ids, view_read_options, whole_row_group,
@@ -2068,13 +2068,10 @@ pub(crate) async fn take_rows_byte_source(
             }
         }
     }
-    // The footer holding these columns' page index; one already loaded is
-    // returned before any lock or decode.
     let metadata = reader
-        .page_indexed_footer(&IndexColumns::named(names), pool)
+        .page_indexed_footer_named(names, pool)
         .await
-        .map_err(QueryError::from)?
-        .1;
+        .map_err(QueryError::from)?;
     let source = Source::Lazy(reader.byte_source());
     // Fetch the take's column chunks at once rather than letting the decode
     // fetch them a row group at a time: a hit set spread over hundreds of
@@ -2560,6 +2557,7 @@ mod tests {
             builder::{BuilderOptions, FtsConfig, SuperfileBuilder, VectorConfig},
             fts::reader::{Bm25SearchOptions, BoolMode},
             lazy_source::{LazyByteSource, LazyByteSourceError},
+            page_index::IndexColumns,
             vector::{distance::Metric, layout::VectorLayout, rerank_codec::RerankCodec},
         },
         supertable::{

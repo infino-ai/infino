@@ -230,8 +230,19 @@ impl PageIndexBytes {
         parquet: &ParquetMetaData,
         added: &RoaringBitmap,
     ) -> ParquetResult<ParquetMetaData> {
-        let (fresh_columns, fresh_offsets) = self.decode(parquet, added)?;
-        let mut indexed = parquet.clone().into_builder();
+        self.apply_into(parquet.clone(), added)
+    }
+
+    /// [`Self::apply`] on a footer the caller hands over, so it is not
+    /// copied again: for a load that decodes more into a footer it has just
+    /// built.
+    pub(crate) fn apply_into(
+        &self,
+        parquet: ParquetMetaData,
+        added: &RoaringBitmap,
+    ) -> ParquetResult<ParquetMetaData> {
+        let (fresh_columns, fresh_offsets) = self.decode(&parquet, added)?;
+        let mut indexed = parquet.into_builder();
         let held_columns = indexed.take_column_index();
         let held_offsets = indexed.take_offset_index();
         let Some(fresh_offsets) = fresh_offsets else {
@@ -242,15 +253,19 @@ impl PageIndexBytes {
             return Ok(indexed);
         };
         let offsets = merge(
-            parquet,
+            indexed.row_groups(),
             held_offsets,
             Some(fresh_offsets),
             added,
             unloaded_offset_index,
         );
-        let columns = merge(parquet, held_columns, fresh_columns, added, |_| {
-            ColumnIndexMetaData::NONE
-        });
+        let columns = merge(
+            indexed.row_groups(),
+            held_columns,
+            fresh_columns,
+            added,
+            |_| ColumnIndexMetaData::NONE,
+        );
         let indexed = indexed
             .set_column_index(Some(columns))
             .set_offset_index(Some(offsets))
@@ -424,7 +439,7 @@ fn leaves_only(
 /// added or not, so its entries stay with their leaves. Entries are moved,
 /// not copied.
 fn merge<T>(
-    parquet: &ParquetMetaData,
+    row_groups: &[RowGroupMetaData],
     held: Option<Vec<Vec<T>>>,
     fresh: Option<Vec<Vec<T>>>,
     added: &RoaringBitmap,
@@ -432,8 +447,7 @@ fn merge<T>(
 ) -> Vec<Vec<T>> {
     let mut held = held.unwrap_or_default().into_iter();
     let mut fresh = fresh.unwrap_or_default().into_iter();
-    parquet
-        .row_groups()
+    row_groups
         .iter()
         .map(|row_group| {
             let mut held = held.next().unwrap_or_default().into_iter();
