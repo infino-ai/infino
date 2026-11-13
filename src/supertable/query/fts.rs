@@ -522,9 +522,9 @@ struct SharedTopK {
 /// Ordered by score, then by `_id` range *descending*, so of two equal
 /// scores the one from the higher range is the lesser and leaves the
 /// heap first: the stable top-k keeps the lower `_id` of a tie, and so
-/// does the heap — a seed placeholder (`i128::MAX`) in particular gives
-/// way to a real score equal to it. BM25 scores are finite, but `f32`
-/// still needs an `Ord` shim.
+/// does the heap — a seed placeholder from the tier merge in particular
+/// gives way to a real score equal to it from a lower range. BM25 scores
+/// are finite, but `f32` still needs an `Ord` shim.
 #[derive(PartialEq, Clone, Copy)]
 struct FloorEntry {
     score: f32,
@@ -645,8 +645,11 @@ impl SharedTopK {
     /// ranks behind each of those, and one below it is out regardless.
     /// Sound for any `_id` ranges: every `_id` of this superfile is at
     /// least `id_min`, and every tied document's is at most its
-    /// superfile's `id_max`. A seed placeholder carries `i128::MAX` and so
-    /// never justifies a skip.
+    /// superfile's `id_max`. A seed placeholder from the tier merge stands
+    /// for `k` real documents scoring at least its score, from superfiles
+    /// whose `_id`s are at most its `id_max`; while one is among the top
+    /// `k`, those documents rank at least as high as the last entry, so a
+    /// tie behind it is behind `k` real documents.
     ///
     /// Of the entries at the floor the last is the one from the highest
     /// range (equal scores order by range descending), so one look settles
@@ -2127,9 +2130,12 @@ impl SupertableReader {
                     });
                     // The tiers' lower bound on the k-th score is a floor
                     // every kernel may prune against; the real scores that
-                    // replace these placeholders only raise it.
+                    // replace these placeholders only raise it. They stand
+                    // for k real documents at `_id`s no higher than the
+                    // threshold's, so a superfile that can only tie them and
+                    // holds only higher `_id`s is skipped on the tie.
                     if selection.theta_lb.is_finite() {
-                        merger.merge(i128::MAX, repeat_n(selection.theta_lb, k));
+                        merger.merge(selection.theta_id_max, repeat_n(selection.theta_lb, k));
                     }
                     let resolved = answered.len() as u64;
                     if resolved > 0 && let Some(stats) = &reader.op_stats {

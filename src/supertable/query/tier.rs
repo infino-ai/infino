@@ -49,7 +49,7 @@
 //! are scaled to the table's as the ceilings are.
 
 use std::{
-    cmp::Ordering as CmpOrdering,
+    cmp::{Ordering as CmpOrdering, Reverse},
     collections::{BinaryHeap, HashMap, HashSet},
     ops::Range,
     sync::{
@@ -362,6 +362,15 @@ pub(crate) struct TierSelection {
     /// Lower bound on the final k-th score; `NEG_INFINITY` when fewer than
     /// `k` documents were seen with every required term.
     pub(crate) theta_lb: f32,
+    /// The highest `_id` among the superfiles holding the `k` candidates
+    /// that set [`Self::theta_lb`], equal candidates taken from the lowest
+    /// `_id` ranges first. The `k` candidates are real documents scoring at
+    /// least the threshold, at `_id`s no higher than this, so a document
+    /// that only ties the threshold in a superfile whose `_id`s all lie
+    /// above it ranks behind all `k`: seeding the floor with it lets the
+    /// fan-out skip such a superfile on the tie. `i128::MAX` when no
+    /// threshold was found.
+    pub(crate) theta_id_max: i128,
     /// Per superfile the index answers for outright — every term's head
     /// there was read to its end, with scores the kernel would compute bit
     /// for bit — its place among the kept and its matching documents as
@@ -473,6 +482,9 @@ struct Slot {
     scale_up: f32,
     /// Rows deleted from the superfile: read past, never candidates.
     deny: Option<Arc<RoaringBitmap>>,
+    /// The highest `_id` the superfile holds; `i128::MAX` until known,
+    /// which never lets a threshold it sets justify a skip.
+    id_max: i128,
 }
 
 impl Slot {
@@ -488,6 +500,7 @@ impl Slot {
             ordinal: u32::MAX,
             scale_up,
             deny,
+            id_max: i128::MAX,
         }
     }
 }
@@ -521,6 +534,8 @@ struct Merge {
     lb_slack: f32,
     ub_slack: f32,
     theta_lb: f32,
+    /// See [`TierSelection::theta_id_max`].
+    theta_id_max: i128,
     entries_read: u64,
 }
 
@@ -676,11 +691,9 @@ pub(crate) async fn prepare_merge<'a>(
         } else {
             1.0
         };
-        slots.push(Slot::new(
-            nt,
-            scale_up,
-            query.deny.get(slots.len()).cloned().flatten(),
-        ));
+        let mut slot = Slot::new(nt, scale_up, query.deny.get(slots.len()).cloned().flatten());
+        slot.id_max = e.id_max;
+        slots.push(slot);
     }
     // The slot of a superfile the index files under `ordinal`; `None` for
     // one the query does not keep.
@@ -831,6 +844,7 @@ pub(crate) async fn prepare_merge<'a>(
         lb_slack,
         ub_slack,
         theta_lb: f32::NEG_INFINITY,
+        theta_id_max: i128::MAX,
         entries_read,
     };
     let mut scratch = Scratch::default();
@@ -1113,6 +1127,7 @@ impl PreparedMerge<'_> {
         Ok(Some(TierSelection {
             bounds,
             theta_lb: merge.theta_lb,
+            theta_id_max: merge.theta_id_max,
             resolved,
             tier_bytes,
             entries_read: merge.entries_read,
@@ -1180,25 +1195,16 @@ impl Merge {
         // Threshold: the k-th best sum over documents the query returns,
         // across every superfile read, in play or not. Each superfile's
         // top candidates are sorted, so a k-way walk finds it in k steps.
-        let mut heap: BinaryHeap<(OrdF32, usize, usize)> = BinaryHeap::new();
-        for (si, slot) in self.slots.iter().enumerate() {
-            if let Some(&best) = slot.top.first() {
-                heap.push((OrdF32(best), si, 0));
-            }
-        }
-        let mut kth = None;
-        for _ in 0..k {
-            let Some((OrdF32(value), si, at)) = heap.pop() else {
-                kth = None;
-                break;
-            };
-            kth = Some(value);
-            if let Some(&next) = self.slots[si].top.get(at + 1) {
-                heap.push((OrdF32(next), si, at + 1));
-            }
-        }
+        // Equal candidates come from the lowest `_id` ranges first, so the
+        // highest `_id` the walk draws on is as low as the k allow.
+        let (kth, id_max) = kth_candidate(&self.slots, k);
         if let Some(kth) = kth {
-            self.theta_lb = self.theta_lb.max(kth);
+            if kth > self.theta_lb {
+                self.theta_lb = kth;
+                self.theta_id_max = id_max;
+            } else if kth == self.theta_lb {
+                self.theta_id_max = self.theta_id_max.min(id_max);
+            }
         }
         // Rule out what cannot compete.
         let mut excluded = 0usize;
@@ -1213,6 +1219,32 @@ impl Merge {
         }
         excluded
     }
+}
+
+/// The k-th best candidate across `slots`, if there are `k`, and the highest
+/// `_id` among the superfiles the walk drew its `k` candidates from: a k-way
+/// walk over each superfile's sorted candidates, taking equal candidates
+/// from the lowest `_id` ranges first.
+fn kth_candidate(slots: &[Slot], k: usize) -> (Option<f32>, i128) {
+    let mut heap: BinaryHeap<(OrdF32, Reverse<i128>, usize, usize)> = BinaryHeap::new();
+    for (si, slot) in slots.iter().enumerate() {
+        if let Some(&best) = slot.top.first() {
+            heap.push((OrdF32(best), Reverse(slot.id_max), si, 0));
+        }
+    }
+    let mut kth = None;
+    let mut id_max = i128::MIN;
+    for _ in 0..k {
+        let Some((OrdF32(value), Reverse(slot_id_max), si, at)) = heap.pop() else {
+            return (None, i128::MAX);
+        };
+        kth = Some(value);
+        id_max = id_max.max(slot_id_max);
+        if let Some(&next) = slots[si].top.get(at + 1) {
+            heap.push((OrdF32(next), Reverse(slot_id_max), si, at + 1));
+        }
+    }
+    (kth, id_max)
 }
 
 impl Slot {
@@ -1859,6 +1891,41 @@ mod tests {
         slot.refresh(&shape, &[1.0], 2, 1.0, 1.0, &mut Scratch::default());
         assert_eq!(slot.top, vec![0.6], "row 4 is deleted");
         assert!((slot.ub - 0.6).abs() < 1e-6);
+    }
+
+    /// The threshold's `_id` is the highest among the superfiles its `k`
+    /// candidates come from, and equal candidates are drawn from the lowest
+    /// `_id` ranges first.
+    #[test]
+    fn seed_carries_max_id_of_theta_candidates() {
+        let slot = |top: &[f32], id_max: i128| {
+            let mut s = Slot::new(1, 1.0, None);
+            s.top = top.to_vec();
+            s.id_max = id_max;
+            s
+        };
+        let slots = [
+            slot(&[5.0], 12),
+            slot(&[5.0, 4.0], 9),
+            slot(&[5.0], 7),
+            slot(&[6.0], 20),
+        ];
+        assert_eq!(kth_candidate(&slots, 1), (Some(6.0), 20));
+        assert_eq!(
+            kth_candidate(&slots, 3),
+            (Some(5.0), 20),
+            "6.0 from 20, then the 5.0 ties from 7 and 9"
+        );
+        assert_eq!(
+            kth_candidate(&slots[..3], 2),
+            (Some(5.0), 9),
+            "of three tied superfiles the two lowest"
+        );
+        assert_eq!(
+            kth_candidate(&slots, 6),
+            (None, i128::MAX),
+            "five candidates are not six"
+        );
     }
 
     /// A source of `chunks` chunks of `chunk_bytes` each.

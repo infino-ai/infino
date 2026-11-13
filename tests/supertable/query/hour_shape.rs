@@ -285,3 +285,31 @@ fn a_table_within_the_window_keeps_the_learned_gate() {
         "every run opened at most {most}: the gate never took its other way"
     );
 }
+
+/// Tied rows of "Music" in each superfile: the title in both languages in
+/// both its hours.
+const MUSIC_PER_SUPERFILE: u64 = (LANGS.len() * HOURS_PER_SUPERFILE) as u64;
+
+/// A term whose best documents tie in every superfile, with heads too
+/// shallow to be answered from the index: once the merge has seeded the
+/// floor, the superfiles past the ones holding the top `k` are skipped on
+/// the tie, by `_id` order. The floor the merge seeds carries the highest
+/// `_id` of the superfiles its candidates came from; one that claimed no
+/// `_id` would leave every tied superfile to be opened.
+#[test]
+fn a_merge_seeded_floor_skips_tied_superfiles_by_id() {
+    let p = wide(Some(16));
+    for query in ["music", "film"] {
+        // The first ask reads its tiers beside its first opens; the later
+        // asks find them resident and merge before any open.
+        opens_and_equal(&p, query, 10);
+        for run in 1..REPEATS {
+            let n = opens_and_equal(&p, query, 10);
+            assert!(
+                n <= 10u64.div_ceil(MUSIC_PER_SUPERFILE),
+                "{query:?} run {run}: opened {n}, but {} superfiles hold the top 10",
+                10u64.div_ceil(MUSIC_PER_SUPERFILE)
+            );
+        }
+    }
+}
