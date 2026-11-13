@@ -208,6 +208,25 @@ impl KeyKind {
     }
 }
 
+/// Whether keys built from values of type `a` mean the same as keys of
+/// type `b`: the same kind and, for dates and timestamps, the same unit. A
+/// wider integer or float keeps its values, so its keys too; a day count
+/// read as nanoseconds does not. A time zone does not change a timestamp's
+/// stored value.
+pub(crate) fn same_keys(a: &DataType, b: &DataType) -> bool {
+    let is_time = |t: &DataType| {
+        matches!(
+            t,
+            DataType::Date32 | DataType::Date64 | DataType::Timestamp(_, _)
+        )
+    };
+    match (a, b) {
+        (DataType::Timestamp(x, _), DataType::Timestamp(y, _)) => x == y,
+        _ if is_time(a) || is_time(b) => a == b,
+        _ => KeyKind::of(a).is_some() && KeyKind::of(a) == KeyKind::of(b),
+    }
+}
+
 /// The key of a signed value.
 pub(crate) fn signed_key(v: i64) -> u64 {
     (v as u64) ^ SIGN_BIT
@@ -994,7 +1013,7 @@ mod tests {
         BooleanArray, Date32Array, Decimal128Array, Float64Array, Int32Array, Int64Array,
         LargeStringArray, UInt16Array,
     };
-    use arrow_schema::{Field, Schema};
+    use arrow_schema::{Field, Schema, TimeUnit};
     use bytes::Bytes;
 
     use super::*;
@@ -1066,6 +1085,25 @@ mod tests {
             "the estimate is off by at most the two cut blocks"
         );
         (rows, count)
+    }
+
+    /// Keys carry over a change only when they still count the same unit.
+    #[test]
+    fn keys_carry_over_a_widening_but_not_a_change_of_unit() {
+        let ns = DataType::Timestamp(TimeUnit::Nanosecond, None);
+        let ns_utc = DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()));
+        let ms = DataType::Timestamp(TimeUnit::Millisecond, None);
+        assert!(same_keys(&DataType::Int32, &DataType::Int64));
+        assert!(same_keys(&DataType::UInt8, &DataType::UInt64));
+        assert!(same_keys(&DataType::Float32, &DataType::Float64));
+        assert!(same_keys(&DataType::Date32, &DataType::Date32));
+        assert!(same_keys(&ns, &ns_utc));
+        assert!(!same_keys(&DataType::Date32, &ns));
+        assert!(!same_keys(&DataType::Date32, &DataType::Date64));
+        assert!(!same_keys(&ms, &ns));
+        assert!(!same_keys(&DataType::Int64, &ns));
+        assert!(!same_keys(&DataType::Int64, &DataType::Float64));
+        assert!(!same_keys(&DataType::LargeUtf8, &DataType::LargeUtf8));
     }
 
     /// A one-row superfile's region, with two indexed columns, parses and
@@ -1384,13 +1422,13 @@ mod tests {
             let (lo_key, hi_key) = (float_key(lo), float_key(hi));
             let want = oracle(&price, |v: f64| lo <= v && v <= hi);
             let rows = reader
-                .range_rows(id("price"), KeyKind::Float, lo_key, hi_key, None)
+                .range_rows(id("price"), &DataType::Float64, lo_key, hi_key, None)
                 .await
                 .expect("rows")
                 .expect("price is indexed");
             assert_eq!(rows, want, "{what}: price rows in [{lo}, {hi}]");
             let count = reader
-                .range_count(id("price"), KeyKind::Float, lo_key, hi_key)
+                .range_count(id("price"), &DataType::Float64, lo_key, hi_key)
                 .await
                 .expect("count")
                 .expect("price is indexed");
@@ -1399,7 +1437,7 @@ mod tests {
         let rows = reader
             .range_rows(
                 id("qty"),
-                KeyKind::Signed,
+                &DataType::Int32,
                 signed_key(-3),
                 signed_key(3),
                 None,
@@ -1414,12 +1452,12 @@ mod tests {
         );
         // A column the region does not hold, or one keyed another way, is
         // left to a scan.
-        for (column, kind) in [("title", KeyKind::Signed), ("price", KeyKind::Signed)] {
+        for (column, data_type) in [("title", DataType::LargeUtf8), ("price", DataType::Int64)] {
             let none = reader
-                .range_rows(id(column), kind, 0, u64::MAX, None)
+                .range_rows(id(column), &data_type, 0, u64::MAX, None)
                 .await
                 .expect("rows");
-            assert!(none.is_none(), "{what}: {column} as {kind:?}");
+            assert!(none.is_none(), "{what}: {column} as {data_type:?}");
         }
     }
 
@@ -1485,7 +1523,7 @@ mod tests {
         let carried = SuperfileReader::open(Bytes::from(out)).expect("open carried");
         assert_ranges(&carried, &opts, "carried under the new schema").await;
         let added = carried
-            .range_rows(added_id, KeyKind::Signed, 0, u64::MAX, None)
+            .range_rows(added_id, &DataType::Int64, 0, u64::MAX, None)
             .await
             .expect("rows");
         assert!(added.is_none(), "a column the body lacks is not indexed");
@@ -1516,7 +1554,7 @@ mod tests {
             SuperfileReader::open(Bytes::from(builder.finish().expect("finish"))).expect("open");
         let price = opts.field_id_of_column("price").expect("field id");
         let rows = reader
-            .range_rows(price, KeyKind::Float, 0, u64::MAX, None)
+            .range_rows(price, &DataType::Float64, 0, u64::MAX, None)
             .await
             .expect("rows");
         assert!(rows.is_none());
@@ -1620,7 +1658,7 @@ mod tests {
                     // sizing nothing by `k`.
                     for k in [1, 5, 10, 40, TIE_ROWS, usize::MAX] {
                         let ends = reader
-                            .range_ends(field, KeyKind::Signed, all, k, descending, &skip)
+                            .range_ends(field, &DataType::Int64, all, k, descending, &skip)
                             .await
                             .expect("ends")
                             .expect("level is indexed");

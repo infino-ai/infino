@@ -311,8 +311,8 @@ pub(crate) enum CandidatePlan {
         tokens: Vec<LikeToken>,
         fold: bool,
     },
-    /// Rows whose column with table id `field` holds a value keyed
-    /// ([`KeyKind`]) within `lo..=hi`: a range or equality predicate on a
+    /// Rows whose column with table id `field`, of type `data_type` now,
+    /// holds a value keyed within `lo..=hi`: a range or equality predicate on a
     /// range-indexed column,
     /// every conjunct on the column folded into one interval. Resolved per
     /// superfile from its range index; a superfile without one for the
@@ -322,7 +322,7 @@ pub(crate) enum CandidatePlan {
     /// `lo > hi` holds no row.
     Range {
         field: FieldId,
-        kind: KeyKind,
+        data_type: DataType,
         lo: u64,
         hi: u64,
     },
@@ -506,11 +506,11 @@ impl CandidatePlan {
                 }
                 CandidatePlan::Range {
                     field,
-                    kind,
+                    data_type,
                     lo,
                     hi,
                 } => {
-                    let rows = reader.range_rows(*field, *kind, *lo, *hi, pool).await?;
+                    let rows = reader.range_rows(*field, data_type, *lo, *hi, pool).await?;
                     Ok((rows, MatchWork::default()))
                 }
                 CandidatePlan::And(children) => {
@@ -831,11 +831,11 @@ impl CandidatePlan {
                 // superfile with no index for the column is unbounded.
                 CandidatePlan::Range {
                     field,
-                    kind,
+                    data_type,
                     lo,
                     hi,
                 } => {
-                    let rows = reader.range_estimate(*field, *kind, *lo, *hi).await?;
+                    let rows = reader.range_estimate(*field, data_type, *lo, *hi).await?;
                     Ok((rows.map_or(n_docs, |n| n.min(n_docs)), MatchWork::default()))
                 }
                 CandidatePlan::And(children) => {
@@ -904,6 +904,24 @@ impl CandidatePlan {
             CandidatePlan::TermsAll { .. }
             | CandidatePlan::TermsAny { .. }
             | CandidatePlan::Range { .. }
+            | CandidatePlan::Unbounded => false,
+        }
+    }
+
+    /// Whether a superfile may evaluate this plan to no bound at all: a
+    /// [`TermsLike`](Self::TermsLike) token can widen past what the index
+    /// enumerates, and a [`Range`](Self::Range) finds no usable index in a
+    /// superfile written before the column was range-indexed, or with keys
+    /// of the column's earlier type. Either way that superfile's rows are
+    /// left to the filter.
+    pub(crate) fn may_evaluate_unbounded(&self) -> bool {
+        match self {
+            CandidatePlan::TermsLike { .. } | CandidatePlan::Range { .. } => true,
+            CandidatePlan::And(children) | CandidatePlan::Or(children) => {
+                children.iter().any(CandidatePlan::may_evaluate_unbounded)
+            }
+            CandidatePlan::TermsAll { .. }
+            | CandidatePlan::TermsAny { .. }
             | CandidatePlan::Unbounded => false,
         }
     }
@@ -1084,9 +1102,9 @@ pub(crate) fn single_range(
     filters: &[Expr],
     column: &str,
     range_cols: &RangeColumns,
-) -> Option<(FieldId, KeyKind, u64, u64)> {
+) -> Option<(FieldId, DataType, u64, u64)> {
     let (field, data_type) = range_cols.get(column)?;
-    let kind = KeyKind::of(data_type)?;
+    KeyKind::of(data_type)?;
     let mut interval = (0, u64::MAX);
     for filter in filters {
         let plan = match filter {
@@ -1105,7 +1123,7 @@ pub(crate) fn single_range(
         }
         interval = (interval.0.max(lo), interval.1.min(hi));
     }
-    Some((*field, kind, interval.0, interval.1))
+    Some((*field, data_type.clone(), interval.0, interval.1))
 }
 
 /// The range-indexed column (its id and type) and the literal of a
@@ -1138,7 +1156,7 @@ fn comparison_range(
     else {
         return CandidatePlan::Unbounded;
     };
-    let Some((kind, key)) = literal_key(value, data_type) else {
+    let Some((_, key)) = literal_key(value, data_type) else {
         return CandidatePlan::Unbounded;
     };
     // `literal < column` is `column > literal`.
@@ -1165,7 +1183,7 @@ fn comparison_range(
     };
     CandidatePlan::Range {
         field,
-        kind,
+        data_type: data_type.clone(),
         lo,
         hi,
     }
@@ -1184,9 +1202,9 @@ fn between_range(between: &Between, range_cols: &RangeColumns) -> CandidatePlan 
         return CandidatePlan::Unbounded;
     };
     match (literal_key(low, data_type), literal_key(high, data_type)) {
-        (Some((kind, lo)), Some((_, hi))) => CandidatePlan::Range {
+        (Some((_, lo)), Some((_, hi))) => CandidatePlan::Range {
             field: *field,
-            kind,
+            data_type: data_type.clone(),
             lo,
             hi,
         },
@@ -1764,7 +1782,7 @@ fn and_combine(children: Vec<CandidatePlan>) -> CandidatePlan {
 fn fold_into(flat: &mut Vec<CandidatePlan>, child: CandidatePlan) {
     if let CandidatePlan::Range {
         field,
-        kind,
+        data_type,
         lo,
         hi,
     } = &child && let Some(CandidatePlan::Range {
@@ -1772,7 +1790,7 @@ fn fold_into(flat: &mut Vec<CandidatePlan>, child: CandidatePlan) {
         hi: hi_acc,
         ..
     }) = flat.iter_mut().find(
-        |p| matches!(p, CandidatePlan::Range { field: f, kind: k, .. } if f == field && k == kind),
+        |p| matches!(p, CandidatePlan::Range { field: f, data_type: t, .. } if f == field && t == data_type),
     ) {
         *lo_acc = (*lo_acc).max(*lo);
         *hi_acc = (*hi_acc).min(*hi);
@@ -2197,10 +2215,11 @@ mod tests {
         )
     }
 
-    fn range(column: &str, kind: KeyKind, lo: u64, hi: u64) -> CandidatePlan {
+    fn range(column: &str, lo: u64, hi: u64) -> CandidatePlan {
+        let (field, data_type) = range_cols()[column].clone();
         CandidatePlan::Range {
-            field: range_cols()[column].0,
-            kind,
+            field,
+            data_type,
             lo,
             hi,
         }
@@ -2211,31 +2230,31 @@ mod tests {
         let signed = |v: i64| signed_key(v);
         assert_eq!(
             range_plan(&[col("qty").gt(lit(5i32))]),
-            range("qty", KeyKind::Signed, signed(6), u64::MAX),
+            range("qty", signed(6), u64::MAX),
             "a strict integer bound is the next key"
         );
         assert_eq!(
             range_plan(&[lit(5i32).gt(col("qty"))]),
-            range("qty", KeyKind::Signed, 0, signed(4)),
+            range("qty", 0, signed(4)),
             "`5 > qty` is `qty < 5`"
         );
         assert_eq!(
             range_plan(&[col("qty").gt_eq(lit(5i32))]),
-            range("qty", KeyKind::Signed, signed(5), u64::MAX)
+            range("qty", signed(5), u64::MAX)
         );
         assert_eq!(
             range_plan(&[col("price").gt(lit(2.5f64))]),
-            range("price", KeyKind::Float, float_key(2.5) + 1, u64::MAX),
+            range("price", float_key(2.5) + 1, u64::MAX),
             "a strict float bound is the next key in the total order"
         );
         assert_eq!(
             range_plan(&[col("qty").eq(lit(7i64))]),
-            range("qty", KeyKind::Signed, signed(7), signed(7)),
+            range("qty", signed(7), signed(7)),
             "an integer literal of another width"
         );
         assert_eq!(
             range_plan(&[col("price").lt_eq(lit(2.5f64))]),
-            range("price", KeyKind::Float, 0, float_key(2.5))
+            range("price", 0, float_key(2.5))
         );
     }
 
@@ -2246,11 +2265,11 @@ mod tests {
         let filters = [col("qty").gt_eq(lit(-3i32)), col("qty").lt(lit(9i32))];
         assert_eq!(
             range_plan(&filters),
-            range("qty", KeyKind::Signed, signed_key(-3), signed_key(8))
+            range("qty", signed_key(-3), signed_key(8))
         );
         assert_eq!(
             range_plan(&[col("qty").between(lit(-3i32), lit(9i32))]),
-            range("qty", KeyKind::Signed, signed_key(-3), signed_key(9))
+            range("qty", signed_key(-3), signed_key(9))
         );
         // Disjoint conjuncts hold no row.
         let empty = range_plan(&[col("qty").gt(lit(9i32)), col("qty").lt(lit(-3i32))]);
@@ -2270,7 +2289,7 @@ mod tests {
         // Arrow orders `-0.0` below `0.0`, so each is one key.
         assert_eq!(
             range_plan(&[col("price").eq(lit(0.0f64))]),
-            range("price", KeyKind::Float, float_key(0.0), float_key(0.0))
+            range("price", float_key(0.0), float_key(0.0))
         );
         assert_eq!(
             range_plan(&[col("price").gt(lit(f64::NAN))]),
@@ -2278,7 +2297,7 @@ mod tests {
         );
         assert_eq!(
             range_plan(&[col("price").gt(lit(3i64))]),
-            range("price", KeyKind::Float, float_key(3.0) + 1, u64::MAX)
+            range("price", float_key(3.0) + 1, u64::MAX)
         );
         assert_eq!(
             range_plan(&[col("price").gt(lit(i64::MAX))]),
@@ -2298,7 +2317,7 @@ mod tests {
         let millis = Expr::Literal(ScalarValue::TimestampMillisecond(Some(1), None), None);
         assert_eq!(
             range_plan(&[col("ts").gt_eq(millis)]),
-            range("ts", KeyKind::Signed, signed_key(1), u64::MAX)
+            range("ts", signed_key(1), u64::MAX)
         );
         assert_eq!(
             range_plan(&[col("qty").gt(lit("5"))]),
@@ -2728,6 +2747,21 @@ mod tests {
     }
 
     #[test]
+    fn a_like_or_a_range_leaf_may_evaluate_unbounded() {
+        assert!(plan(col("title").like(lit("rust%"))).may_evaluate_unbounded());
+        assert!(range("qty", 0, u64::MAX).may_evaluate_unbounded());
+        assert!(
+            CandidatePlan::And(vec![
+                plan(col("title").eq(lit("alpha"))),
+                range("qty", 0, u64::MAX),
+            ])
+            .may_evaluate_unbounded()
+        );
+        assert!(!plan(col("title").eq(lit("alpha"))).may_evaluate_unbounded());
+        assert!(!CandidatePlan::Unbounded.may_evaluate_unbounded());
+    }
+
+    #[test]
     fn has_like_finds_a_dictionary_leaf_anywhere_in_the_tree() {
         assert!(plan(col("title").like(lit("rust%"))).has_like());
         assert!(
@@ -3031,7 +3065,7 @@ mod tests {
     fn hits_between(field: FieldId, lo: i64, hi: i64) -> CandidatePlan {
         CandidatePlan::Range {
             field,
-            kind: KeyKind::Signed,
+            data_type: DataType::Int32,
             lo: signed_key(lo),
             hi: signed_key(hi),
         }
