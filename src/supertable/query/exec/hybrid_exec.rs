@@ -108,6 +108,7 @@ use crate::{
                 },
                 vector_exec::arg_to_query_vector,
             },
+            fts::RankedPass,
             vector::{
                 calibrated_query, free_columns_unambiguous, hits_id_score_batch,
                 id_score_projection_indices, sql_id_score_projection,
@@ -292,6 +293,7 @@ impl SupertableReader {
                 k,
                 Bm25SearchOptions::new().with_mode(mode),
                 scope.candidates(),
+                RankedPass::Top,
             )
             .instrument(trace::phase(phases, || detail_span!("hybrid.bm25")));
         let vector_leg =

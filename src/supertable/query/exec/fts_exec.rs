@@ -82,6 +82,7 @@ use crate::{
                 output_schema_with_score, scope_to_call, top_k_statistics, traced_tvf,
                 widening_ended_short,
             },
+            fts::RankedPass,
         },
     },
     utils::trace::detail_span,
@@ -529,6 +530,10 @@ impl RankedCall<'_> {
                         want,
                         Bm25SearchOptions::new().with_mode(*mode),
                         scope,
+                        match want > self.k {
+                            true => RankedPass::Widening,
+                            false => RankedPass::Top,
+                        },
                     )
                     .await
             }

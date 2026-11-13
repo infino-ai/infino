@@ -946,6 +946,24 @@ fn ceilings_at_table_avgdl(
     }
 }
 
+/// How a ranked search runs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum RankedPass {
+    /// The `k` best, pruned: past one open window of superfiles the tier
+    /// merge always runs.
+    Top,
+    /// A later round of a search under a `WHERE`, asking for more than the
+    /// caller's `k` because the predicate turned down rows of the round
+    /// before. The merge runs only where the table's learned call takes it:
+    /// a merge seeds a threshold for the round's whole `k`, which the
+    /// predicate then turns down in part, so it reads the tiers deeper on
+    /// every round without telling the search which superfiles to leave out.
+    Widening,
+    /// Every match scored, nothing pruned, and the exact match count with
+    /// the hits.
+    ExactCount,
+}
+
 /// A ranked query's clauses, owned and resolved to terms: what the scoring
 /// core takes, whether they came from parsing a query or expanding a
 /// prefix.
@@ -1021,7 +1039,7 @@ impl SupertableReader {
         k: usize,
         opts: Bm25SearchOptions,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
-        self.bm25_search_scoped_async(column, query, k, opts, None)
+        self.bm25_search_scoped_async(column, query, k, opts, None, RankedPass::Top)
             .await
     }
 
@@ -1039,16 +1057,18 @@ impl SupertableReader {
         k: usize,
         opts: Bm25SearchOptions,
         scope: Option<&CandidateScope>,
+        pass: RankedPass,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
         let (hits, _) = self
-            .bm25_scored_async(column, query, k, opts, scope, false)
+            .bm25_scored_async(column, query, k, opts, scope, pass)
             .await?;
         Ok(hits)
     }
 
-    /// The shared body of the ranked searches. With `exact_count` every
-    /// match is scored in one pass and the exact match count comes back
-    /// with the hits; otherwise the kernels prune and the count is 0.
+    /// The shared body of the ranked searches. Under
+    /// [`RankedPass::ExactCount`] every match is scored in one pass and the
+    /// exact match count comes back with the hits; otherwise the kernels
+    /// prune and the count is 0.
     async fn bm25_scored_async(
         &self,
         column: &str,
@@ -1056,7 +1076,7 @@ impl SupertableReader {
         k: usize,
         opts: Bm25SearchOptions,
         scope: Option<&CandidateScope>,
-        exact_count: bool,
+        pass: RankedPass,
     ) -> Result<(Vec<SuperfileHit>, u64), QueryError> {
         if k == 0 {
             return Ok((Vec::new(), 0));
@@ -1151,7 +1171,7 @@ impl SupertableReader {
             bm25_params,
             score_tolerance,
             scope,
-            exact_count,
+            pass,
         )
         .await
     }
@@ -1192,8 +1212,8 @@ impl SupertableReader {
     }
 
     /// Ranks `clauses` over the superfiles in `kept`, with idf from the
-    /// whole table: the shared core of term and prefix search. With
-    /// `exact_count` nothing is pruned and no superfile is skipped, and
+    /// whole table: the shared core of term and prefix search. Under
+    /// [`RankedPass::ExactCount`] nothing is pruned and no superfile is skipped, and
     /// the exact match count (deleted rows excluded) comes back with the
     /// hits; otherwise the count is 0.
     async fn bm25_search_clauses(
@@ -1205,8 +1225,9 @@ impl SupertableReader {
         bm25_params: Option<Bm25Params>,
         score_tolerance: f32,
         scope: Option<&CandidateScope>,
-        exact_count: bool,
+        pass: RankedPass,
     ) -> Result<(Vec<SuperfileHit>, u64), QueryError> {
+        let exact_count = pass == RankedPass::ExactCount;
         let ScoredClauses {
             musts,
             shoulds,
@@ -1387,7 +1408,11 @@ impl SupertableReader {
         // by the length rescale, open them all. Its measured costs still
         // decide how deep it reads. Within a window the table's learned
         // call stands.
-        let forced = tiers_serve && kept.len() > manifest.options.ordered_open_window();
+        // A widening round under a `WHERE` keeps to the learned call: see
+        // [`RankedPass::Widening`].
+        let forced = tiers_serve
+            && pass != RankedPass::Widening
+            && kept.len() > manifest.options.ordered_open_window();
         let merge_now =
             tiers_serve && (forced || !learned || self.tier_policy().merge(policy_class));
         // The deny sets, resolved only for a merge: it reads past the
@@ -2536,7 +2561,7 @@ impl SupertableReader {
         // Prefix search takes no search options, so columns score with the
         // parameters they declared.
         let (hits, _) = self
-            .bm25_search_clauses(column, clauses, kept, k, None, 0.0, None, false)
+            .bm25_search_clauses(column, clauses, kept, k, None, 0.0, None, RankedPass::Top)
             .await?;
         Ok(hits)
     }
@@ -3716,7 +3741,7 @@ impl SupertableReader {
                 .await?;
             return Ok((Vec::new(), count));
         }
-        self.bm25_scored_async(column, query, k, opts, None, true)
+        self.bm25_scored_async(column, query, k, opts, None, RankedPass::ExactCount)
             .await
     }
 
