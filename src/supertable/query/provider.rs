@@ -2071,6 +2071,15 @@ impl TableProvider for SupertableProvider {
         }
         let exact_check = ExactCheck::compile(&exact_filters, exact_conjuncts, &self.schema)?;
         let exact_check = exact_check.as_ref();
+        // With every conjunct answered exactly, DataFusion keeps no filter
+        // above the scan, so its LIMIT is the scan's: any `limit` live rows
+        // of the selection answer it. Each superfile then selects at most
+        // that many, and a wide column is decoded for those rows alone
+        // rather than for every row the conjuncts keep.
+        let exact_limit = match (exact_check, limit) {
+            (Some(_), Some(limit)) if bounded_filters.is_empty() => Some(limit as u64),
+            _ => None,
+        };
         let batch_size = state.config().batch_size();
 
         // Pass 1 — build the index candidate plan once for this scan. It
@@ -2363,7 +2372,13 @@ impl TableProvider for SupertableProvider {
                                     )
                                     .await?;
                                 predicate_work.merge(exact_work);
-                                Some(rows)
+                                Some(match exact_limit {
+                                    Some(limit) => {
+                                        let live = rows - tombstones.as_ref();
+                                        live.iter().take(limit as usize).collect()
+                                    }
+                                    None => rows,
+                                })
                             }
                             None => candidates,
                         };
