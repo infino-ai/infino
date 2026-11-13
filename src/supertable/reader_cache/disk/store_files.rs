@@ -548,45 +548,39 @@ impl DiskCacheStore {
         self.trim_cold_to_budget();
     }
 
-    /// Mark `uris` dead: the table's newest manifest no longer lists them, so no new query will read
-    /// them. Nothing is deleted, since a query on an older snapshot may still read them. Eviction
-    /// takes a dead file first among files of its kind (never-opened copies, block files found at
-    /// startup, then entries and the block files of dropped ones) unless a query still holds it,
-    /// and a dead file's background download is cancelled, since its whole copy would never be
-    /// read. GC in this process erases the files when it deletes them from storage; where GC runs
-    /// in another process, this is what moves them to the front of eviction instead of leaving them
-    /// to age out.
+    /// Mark `uris` dead: the table's newest manifest no longer lists them, so no new query reads
+    /// them. Nothing is deleted, since a query on an older snapshot may still read them, but
+    /// eviction takes them first unless a query holds them, and their downloads are cancelled.
+    /// Without this, a file GC deletes in another process would age out like a live one.
     pub(crate) fn mark_dead(&self, uris: &[SuperfileUri]) {
-        for uri in uris {
-            // Under the entry's lock, as every cancel is, so a download landing now either lands
-            // first or sees the cancel.
-            let slot = self.cached.entry(*uri);
-            if let Some((_, fill)) = self.fills.remove(uri) {
-                fill.cancelled.store(true, Ordering::Release);
-            }
-            drop(slot);
-        }
         let held: Vec<SuperfileUri> = uris
             .iter()
             .copied()
             .filter(|uri| self.holds_file(uri))
             .collect();
-        if held.is_empty() {
-            return;
+        if !held.is_empty() {
+            // Rebuilt rather than changed in place, so an eviction pass that took the old set
+            // keeps reading it. Files the cache no longer holds are forgotten, so the set stays as
+            // small as what is on disk.
+            let mut dead = self.dead.lock().expect("dead-file set poisoned");
+            let mut next: HashSet<SuperfileUri> = dead
+                .iter()
+                .copied()
+                .filter(|uri| self.holds_file(uri))
+                .collect();
+            let before = next.len();
+            next.extend(held);
+            // Only files not already dead: two handles over one table each mark what a commit
+            // dropped.
+            self.n_dead_marked
+                .fetch_add((next.len() - before) as u64, Ordering::Relaxed);
+            *dead = Arc::new(next);
         }
-        self.n_dead_marked
-            .fetch_add(held.len() as u64, Ordering::Relaxed);
-        // Rebuilt rather than changed in place, so an eviction pass that took the old set keeps
-        // reading it. Files the cache no longer holds are forgotten, so the set stays as small as
-        // what is on disk.
-        let mut dead = self.dead.lock().expect("dead-file set poisoned");
-        let mut next: HashSet<SuperfileUri> = dead
-            .iter()
-            .copied()
-            .filter(|uri| self.holds_file(uri))
-            .collect();
-        next.extend(held);
-        *dead = Arc::new(next);
+        // After the set changes: a download registered before this cancel is cancelled, and one
+        // registered after it finds the file dead (see [`Self::maybe_spawn_background_fill`]).
+        for uri in uris {
+            self.remove_entry_cancelling_fill(uri, |_| false);
+        }
     }
 
     /// The dead files ([`Self::mark_dead`]), shared so the caller holds no lock while it walks the

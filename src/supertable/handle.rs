@@ -369,10 +369,9 @@ impl SupertableInner {
         cache.reconcile(tombstone_seq_view(&manifest));
     }
 
-    /// Install `manifest`, a successor of `current`: loaded from storage, or committed here by a
-    /// compaction. Superfiles the commits between them dropped are read by no new query, and GC
-    /// may delete them much later, or in another process: the cache marks them dead, to evict them
-    /// ahead of files still in use while queries on `current` keep reading them.
+    /// Install `manifest`, loaded from storage as a successor of `current`. The cache marks dead the
+    /// superfiles the commits between them dropped, in this process or another: no new query reads
+    /// them, so they are evicted first, while queries on `current` may still read them.
     pub(in crate::supertable) fn install_manifest(
         &self,
         current: &ManifestSnapshot,

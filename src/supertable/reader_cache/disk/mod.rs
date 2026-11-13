@@ -398,6 +398,9 @@ pub(crate) enum Unkept {
     UncachedRead,
 }
 
+/// How many [`Unkept`] causes there are, one live counter each: the last one's index, plus one.
+const N_UNKEPT: usize = Unkept::UncachedRead as usize + 1;
+
 /// Bytes the cache fetched from object storage and did not keep, by cause, so a warm query that
 /// still fetched says why. Each GET counts once, under the cause that kept its bytes out; a read
 /// that fetched a run and then went around the cache for its bytes counts both GETs.
@@ -430,42 +433,6 @@ impl UnkeptBytes {
             + self.full_text_section
             + self.passthrough
             + self.uncached_reads
-    }
-}
-
-/// The live counters behind [`UnkeptBytes`], one per [`Unkept`] cause.
-#[derive(Default)]
-struct UnkeptCounters {
-    write_queue_full: AtomicU64,
-    run_taken: AtomicU64,
-    no_room: AtomicU64,
-    full_text_section: AtomicU64,
-    passthrough: AtomicU64,
-    uncached_reads: AtomicU64,
-}
-
-impl UnkeptCounters {
-    fn counter(&self, why: Unkept) -> &AtomicU64 {
-        match why {
-            Unkept::WriteQueueFull => &self.write_queue_full,
-            Unkept::RunTaken => &self.run_taken,
-            Unkept::NoRoom => &self.no_room,
-            Unkept::FullTextSection => &self.full_text_section,
-            Unkept::Passthrough => &self.passthrough,
-            Unkept::UncachedRead => &self.uncached_reads,
-        }
-    }
-
-    fn snapshot(&self) -> UnkeptBytes {
-        let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
-        UnkeptBytes {
-            write_queue_full: load(&self.write_queue_full),
-            run_taken: load(&self.run_taken),
-            no_room: load(&self.no_room),
-            full_text_section: load(&self.full_text_section),
-            passthrough: load(&self.passthrough),
-            uncached_reads: load(&self.uncached_reads),
-        }
     }
 }
 
@@ -591,8 +558,8 @@ pub struct DiskCacheStore {
     n_evictions: AtomicU64,
     n_gc_drops: AtomicU64,
     n_madvise_calls: AtomicU64,
-    /// See [`CacheStats::unkept_bytes`].
-    unkept_bytes: UnkeptCounters,
+    /// See [`CacheStats::unkept_bytes`], indexed by [`Unkept`].
+    unkept_bytes: [AtomicU64; N_UNKEPT],
     n_hedges: AtomicU64,
     hedged_bytes: AtomicU64,
     /// See [`CacheStats::n_dead_marked`].
@@ -719,7 +686,7 @@ impl DiskCacheStore {
             n_evictions: AtomicU64::new(0),
             n_gc_drops: AtomicU64::new(0),
             n_madvise_calls: AtomicU64::new(0),
-            unkept_bytes: UnkeptCounters::default(),
+            unkept_bytes: Default::default(),
             n_hedges: AtomicU64::new(0),
             hedged_bytes: AtomicU64::new(0),
             n_dead_marked: AtomicU64::new(0),
@@ -801,7 +768,17 @@ impl DiskCacheStore {
             n_evictions: self.n_evictions.load(Ordering::Acquire),
             n_madvise_calls: self.n_madvise_calls.load(Ordering::Acquire),
             n_gc_drops: self.n_gc_drops.load(Ordering::Acquire),
-            unkept_bytes: self.unkept_bytes.snapshot(),
+            unkept_bytes: {
+                let load = |why: Unkept| self.unkept_bytes[why as usize].load(Ordering::Relaxed);
+                UnkeptBytes {
+                    write_queue_full: load(Unkept::WriteQueueFull),
+                    run_taken: load(Unkept::RunTaken),
+                    no_room: load(Unkept::NoRoom),
+                    full_text_section: load(Unkept::FullTextSection),
+                    passthrough: load(Unkept::Passthrough),
+                    uncached_reads: load(Unkept::UncachedRead),
+                }
+            },
             n_hedges: self.n_hedges.load(Ordering::Acquire),
             hedged_bytes: self.hedged_bytes.load(Ordering::Acquire),
             n_dead_marked: self.n_dead_marked.load(Ordering::Acquire),
@@ -810,9 +787,7 @@ impl DiskCacheStore {
 
     /// Count `bytes` fetched and not kept, for `why`.
     pub(crate) fn count_unkept(&self, why: Unkept, bytes: u64) {
-        self.unkept_bytes
-            .counter(why)
-            .fetch_add(bytes, Ordering::Relaxed);
+        self.unkept_bytes[why as usize].fetch_add(bytes, Ordering::Relaxed);
     }
 
     /// Count a read that sent its own GET of `bytes` after waiting on another read's.

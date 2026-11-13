@@ -1004,33 +1004,22 @@ impl ManifestSnapshot {
     /// The superfiles `older` lists and this snapshot does not: compacted or deleted by the commits
     /// between them. Parts are immutable, so a part id both lists hold names the same superfiles,
     /// and only the parts that differ are compared: an append costs the parts it rewrote, not the
-    /// table. Without parts on both sides, the whole memberships are compared. Empty when the
-    /// superfiles to compare are not all in memory, since one missing from an unloaded part may
-    /// only be unloaded.
+    /// table. Empty when a changed part is not in memory, since a superfile missing from an
+    /// unloaded part may only be unloaded, and for a snapshot with no part list (a table with no
+    /// storage, which never loads a newer manifest).
     pub(crate) fn superfiles_dropped_since(&self, older: &Self) -> Vec<SuperfileUri> {
-        let (gone, added) = match (
+        let (Some(gone), Some(added)) = (
             older.superfiles_outside(self),
             self.superfiles_outside(older),
-        ) {
-            (Some(gone), Some(added)) => (gone, added),
-            _ => match (older.resident_superfiles(), self.resident_superfiles()) {
-                (Some(gone), Some(added)) => (
-                    gone.iter().map(|entry| entry.uri).collect(),
-                    added.iter().map(|entry| entry.uri).collect(),
-                ),
-                _ => return Vec::new(),
-            },
+        ) else {
+            return Vec::new();
         };
-        if gone.is_empty() {
-            return gone;
-        }
         let kept: FxHashSet<SuperfileUri> = added.into_iter().collect();
         gone.into_iter().filter(|uri| !kept.contains(uri)).collect()
     }
 
     /// The superfiles of this snapshot's parts that `other`'s list does not hold, by part id.
-    /// `None` when either has no list (a flat membership with no parts to compare), or when one
-    /// of those parts is not loaded.
+    /// `None` when either has no list, or when one of those parts is not loaded.
     fn superfiles_outside(&self, other: &Self) -> Option<Vec<SuperfileUri>> {
         let (list, other_list) = (self.list.as_ref()?, other.list.as_ref()?);
         let other_parts: FxHashSet<PartId> =
@@ -12912,32 +12901,6 @@ mod tests {
         assert!(empty.get_cached_part_by_list_idx(0).is_none());
     }
 
-    /// A newer snapshot reports the superfiles it no longer lists, and none it
-    /// added or kept.
-    #[test]
-    fn superfiles_dropped_since_names_only_the_removed_ones() {
-        let (kept, removed, added) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
-        let older = ManifestSnapshot::new(
-            1,
-            opts(),
-            vec![seg_entry(kept, 4), seg_entry(removed, 4)],
-            None,
-            None,
-        );
-        let newer = ManifestSnapshot::new(
-            2,
-            opts(),
-            vec![seg_entry(kept, 4), seg_entry(added, 8)],
-            None,
-            None,
-        );
-        assert_eq!(
-            newer.superfiles_dropped_since(&older),
-            vec![SuperfileUri(removed)]
-        );
-        assert!(older.superfiles_dropped_since(&older).is_empty());
-    }
-
     /// A snapshot with one list part per `(id, superfiles, loaded)`, each part
     /// in memory when `loaded`.
     fn snapshot_of_parts(parts: &[(u128, &[Uuid], bool)]) -> ManifestSnapshot {
@@ -12964,8 +12927,8 @@ mod tests {
     /// With parts, only the parts that differ are compared: a compaction that
     /// rewrote one part names the superfiles it dropped and not the one it
     /// carried into the new part, and a part both snapshots share is never
-    /// read, loaded or not. A changed part that is not loaded leaves the
-    /// answer unknown, so it is empty.
+    /// read, loaded or not. A changed part that is not loaded, or a snapshot
+    /// with no part list, leaves the answer unknown, so it is empty.
     #[test]
     fn superfiles_dropped_since_compares_only_changed_parts() {
         let [kept, carried, compacted, output] = [(); 4].map(|()| Uuid::new_v4());
@@ -12983,25 +12946,9 @@ mod tests {
 
         let unloaded = snapshot_of_parts(&[(1, &[kept], false), (3, &[carried, output], false)]);
         assert!(unloaded.superfiles_dropped_since(&older).is_empty());
-    }
 
-    /// A snapshot whose parts are not loaded lists none of its superfiles, so
-    /// it cannot say which were dropped, and says none rather than all.
-    #[test]
-    fn superfiles_dropped_since_is_empty_when_a_snapshot_is_not_loaded() {
-        let loaded =
-            ManifestSnapshot::new(1, opts(), vec![seg_entry(Uuid::new_v4(), 4)], None, None);
-        let mut list = list_with_parts(2);
-        for part in &mut list.parts {
-            part.n_superfiles = 3;
-        }
-        let unloaded = manifest_with_list(list);
-        assert!(
-            unloaded.resident_superfiles().is_none(),
-            "no part is loaded"
-        );
-        assert!(unloaded.superfiles_dropped_since(&loaded).is_empty());
-        assert!(loaded.superfiles_dropped_since(&unloaded).is_empty());
+        let flat = ManifestSnapshot::new(1, opts(), vec![seg_entry(compacted, 4)], None, None);
+        assert!(newer.superfiles_dropped_since(&flat).is_empty());
     }
 
     /// `ManifestSnapshot::new` with no storage/list takes the in-process-only

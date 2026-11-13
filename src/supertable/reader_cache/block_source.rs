@@ -115,7 +115,7 @@ use std::{
     any::Any,
     array,
     collections::BTreeMap,
-    fs,
+    fs, mem,
     os::unix::fs::{FileExt, MetadataExt},
     panic::resume_unwind,
     path::PathBuf,
@@ -348,6 +348,27 @@ enum Fill {
     /// Ahead of reads: uses only free budget and waits for its own write, so
     /// the cap never refuses it; it holds the bytes until then either way.
     Prefetch,
+}
+
+/// A fetched run's room in the store's write queue, taken before the run is admitted. It goes
+/// back on drop unless handed to the run, so an admission that stops early, or whose future is
+/// dropped while it waits for budget, never keeps it.
+struct QueueRoom<'a> {
+    store: &'a DiskCacheStore,
+    bytes: u64,
+}
+
+impl QueueRoom<'_> {
+    /// The run holds the room from here, and gives it back once written or dropped.
+    fn hand_on(self) {
+        mem::forget(self);
+    }
+}
+
+impl Drop for QueueRoom<'_> {
+    fn drop(&mut self) {
+        self.store.release_write_behind(self.bytes);
+    }
 }
 
 /// A fetched run of blocks waiting to be written to the block file, made by
@@ -1965,6 +1986,7 @@ impl BlockCachedSource {
         let source = self.me.upgrade()?;
 
         let run_len = bytes.len() as u64;
+        // 1. Room in the write queue, given back as `queued` drops unless the run takes it.
         match fill {
             Fill::Read => {
                 if !store.try_admit_write_behind(run_len) {
@@ -1974,30 +1996,32 @@ impl BlockCachedSource {
             }
             Fill::Prefetch => store.admit_write_behind(run_len),
         }
-        // Another run owns this key until it is written, so an unregistered one is served but not
-        // cached. A run every read dropped is no run: its claim, when it drops, finds another id
-        // here and leaves this one alone.
+        let queued = QueueRoom {
+            store,
+            bytes: run_len,
+        };
+        // 2. No other run at `first`. Another run owns this key until it is written, so an
+        // unregistered one is served but not cached. A run every read dropped is no run: its
+        // claim, when it drops, finds another id here and leaves this one alone.
         let registered = claim.is_some();
         let taken = |runs: &BTreeMap<u32, MemoryRun>| {
             !registered && runs.get(&first).is_some_and(|run| !run.dropped())
         };
         let refuse = |why: Unkept| -> Option<FetchedRun> {
-            store.release_write_behind(run_len);
             store.count_unkept(why, run_len);
             None
         };
         if taken(&self.runs.lock().expect("runs mutex poisoned")) {
             return refuse(Unkept::RunTaken);
         }
-        let reservation = match reservation {
-            Some(reserved) => Some(reserved),
-            None if self.owns_accounting && matches!(fill, Fill::Read) => {
-                match store.reserve(run_len).await {
-                    Ok(reserved) => Some(reserved),
-                    Err(_) => return refuse(Unkept::NoRoom),
-                }
-            }
-            None => None,
+        // 3. Budget. A prefetch reserved before its GET; a read's run reserves now, evicting as
+        // needed.
+        let reservation = match (reservation, fill) {
+            (None, Fill::Read) if self.owns_accounting => match store.reserve(run_len).await {
+                Ok(reserved) => Some(reserved),
+                Err(_) => return refuse(Unkept::NoRoom),
+            },
+            (reservation, _) => reservation,
         };
 
         let claimed = claim.map(Claim::hand_on);
@@ -2037,6 +2061,7 @@ impl BlockCachedSource {
             run_len
         });
 
+        queued.hand_on();
         Some(FetchedRun {
             source,
             store: Arc::clone(store),
@@ -2448,10 +2473,11 @@ impl BlockCachedSource {
         start: u64,
         len: u64,
     ) -> Result<Bytes, LazyByteSourceError> {
+        let bytes = self.inner.range(start, len).await?;
         if let Some(store) = self.store.upgrade() {
             store.count_unkept(why, len);
         }
-        self.inner.range(start, len).await
+        Ok(bytes)
     }
 
     /// Whether every block of the range is on disk or being written, without
@@ -3140,6 +3166,33 @@ mod tests {
         let unkept = store.stats().unkept_bytes;
         assert_eq!(unkept.passthrough, 2 * 64, "each read's own bytes");
         assert_eq!(unkept.total(), 2 * 64);
+
+        // A GET that fails fetched nothing, so it adds nothing.
+        assert!(src.range(OBJ as u64 - 1, 64).await.is_err());
+        assert_eq!(inner.calls(), 3, "the failed GET was sent");
+        assert_eq!(store.stats().unkept_bytes.total(), 2 * 64);
+    }
+
+    /// Write-queue room taken for a run goes back when the admission stops before the run holds
+    /// it, also when its future is dropped mid-wait, and stays taken once handed to the run.
+    #[test]
+    fn queue_room_goes_back_unless_handed_on() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        store.admit_write_behind(1);
+        drop(QueueRoom {
+            store: &store,
+            bytes: 1,
+        });
+        assert_eq!(store.write_behind_in_use(), 0, "given back");
+        store.admit_write_behind(1);
+        QueueRoom {
+            store: &store,
+            bytes: 1,
+        }
+        .hand_on();
+        assert_eq!(store.write_behind_in_use(), 1, "the run holds it");
+        store.release_write_behind(1);
     }
 
     /// A source whose FTS hole is `hole`, over an `obj`-byte blob,
