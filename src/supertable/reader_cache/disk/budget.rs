@@ -726,11 +726,13 @@ impl DiskCacheStore {
             .iter()
             .map(|f| f.value().reserved.load(Ordering::Acquire))
             .sum();
+        let scratch = self.scratch_bytes.load(Ordering::Acquire);
         assert_eq!(
             self.current_bytes.load(Ordering::Acquire),
-            entries + unindexed + block_files + fills,
+            entries + unindexed + block_files + fills + scratch,
             "budget ledger drifted from what the cache holds (entries {entries}, \
-             unindexed {unindexed}, block files {block_files}, fills {fills})"
+             unindexed {unindexed}, block files {block_files}, fills {fills}, \
+             scratch {scratch})"
         );
     }
 
@@ -771,6 +773,62 @@ impl Drop for BlockWriteTicket {
         if self.0.block_writes.fetch_sub(1, Ordering::AcqRel) == 1 {
             self.0.block_writes_idle.notify_waiters();
         }
+    }
+}
+
+/// Scratch bytes charged to a cache's budget: files a table's builds write
+/// beside its cache (a drain's spill, a merge's output), which take the same
+/// disk the cache does. One budget covers both, so making room for scratch
+/// evicts cache files, and scratch never goes past what the budget leaves.
+/// The charge follows what the scratch holds through [`Self::set`] and is
+/// given back when dropped.
+pub(crate) struct ScratchCharge {
+    store: Arc<DiskCacheStore>,
+    bytes: u64,
+}
+
+impl DiskCacheStore {
+    /// An empty charge on this cache's budget, for scratch to grow into.
+    pub(crate) fn scratch_charge(self: &Arc<Self>) -> ScratchCharge {
+        ScratchCharge {
+            store: Arc::clone(self),
+            bytes: 0,
+        }
+    }
+}
+
+impl ScratchCharge {
+    /// Charge `bytes`, what the scratch is about to hold. Growing evicts
+    /// cache files, least recently used first, until it fits; shrinking
+    /// gives the difference back. `BudgetExceeded` when the budget cannot
+    /// hold it even with every evictable file gone, the charge unchanged.
+    pub(crate) async fn set(&mut self, bytes: u64) -> Result<(), DiskCacheError> {
+        if bytes > self.bytes {
+            let grow = bytes - self.bytes;
+            self.store.reserve_manual(grow).await?;
+            self.store.scratch_bytes.fetch_add(grow, Ordering::AcqRel);
+        } else {
+            self.release(self.bytes - bytes);
+        }
+        self.bytes = bytes;
+        Ok(())
+    }
+
+    /// The bytes charged now.
+    #[cfg(test)]
+    pub(crate) fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    fn release(&self, bytes: u64) {
+        self.store.scratch_bytes.fetch_sub(bytes, Ordering::AcqRel);
+        self.store.current_bytes.fetch_sub(bytes, Ordering::Release);
+    }
+}
+
+impl Drop for ScratchCharge {
+    fn drop(&mut self) {
+        self.release(self.bytes);
     }
 }
 
@@ -1080,6 +1138,43 @@ mod tests {
         );
         store.assert_budget_consistent();
         assert_eq!(store.stats().current_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn scratch_takes_its_room_from_the_cache_within_one_budget() {
+        let file = tiny_superfile_bytes().len() as u64;
+        // Room for exactly two cached files.
+        let (_dir, store) = test_store_with(|cfg| cfg.disk_budget_bytes = 2 * file);
+        let (first, second) = (SuperfileUri::new_v4(), SuperfileUri::new_v4());
+        for uri in [&first, &second] {
+            store
+                .insert_warm(uri, tiny_superfile_bytes())
+                .await
+                .expect("cached");
+        }
+        assert_eq!(store.stats().current_bytes, 2 * file);
+
+        // Scratch for one file's worth evicts a cached file to fit.
+        let mut charge = store.scratch_charge();
+        charge.set(file).await.expect("room made");
+        assert_eq!(charge.bytes(), file);
+        assert_eq!(store.stats().current_bytes, 2 * file, "still one budget");
+        assert_eq!(store.stats().n_evictions, 1);
+        store.assert_budget_consistent();
+
+        // More than the whole budget cannot be held, and the charge stays.
+        let err = charge.set(3 * file).await.expect_err("past the budget");
+        assert!(matches!(err, DiskCacheError::BudgetExceeded));
+        assert_eq!(charge.bytes(), file);
+        store.assert_budget_consistent();
+
+        // Shrinking and dropping give the room back.
+        charge.set(0).await.expect("shrink");
+        assert_eq!(store.stats().current_bytes, file);
+        charge.set(file).await.expect("grow again into free room");
+        drop(charge);
+        assert_eq!(store.stats().current_bytes, file);
+        store.assert_budget_consistent();
     }
 
     #[tokio::test]

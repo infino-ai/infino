@@ -449,6 +449,10 @@ pub struct DiskCacheStore {
     /// One-shot latch so an explicit budget smaller than the table
     /// footprint warns once, not on every reconcile.
     budget_warned: AtomicBool,
+    /// Bytes of scratch charged to the budget through [`ScratchCharge`]s:
+    /// files a build writes beside the cache, held in the same budget so
+    /// the cache and its table's scratch never hold more than it together.
+    pub(crate) scratch_bytes: AtomicU64,
     n_cold_fetches: AtomicU64,
     n_disk_reuses: AtomicU64,
     n_evictions: AtomicU64,
@@ -508,7 +512,7 @@ mod read;
 mod sources;
 mod store_files;
 
-pub(crate) use budget::Reservation;
+pub(crate) use budget::{Reservation, ScratchCharge};
 pub(crate) use fetch::{open_batch_overlay, skip_background_fill};
 pub(crate) use sources::{
     ArcMmapOwner, mmap_readonly_bytes, mmap_temp_file_bytes, release_temp_file, temp_file_behind,
@@ -570,6 +574,7 @@ impl DiskCacheStore {
             budget_auto_sized: AtomicBool::new(false),
             lazy_entry_cap: AtomicUsize::new(default_superfiles_in_flight()),
             budget_warned: AtomicBool::new(false),
+            scratch_bytes: AtomicU64::new(0),
             n_cold_fetches: AtomicU64::new(0),
             n_disk_reuses: AtomicU64::new(0),
             n_evictions: AtomicU64::new(0),

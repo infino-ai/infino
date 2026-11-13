@@ -68,7 +68,10 @@ use crate::{
         },
         opann::rerank_pool_hint,
         query::{dispatch::open_whole_superfile, vector},
-        reader_cache::{SuperfileReaderCache, disk::mmap_temp_file_bytes},
+        reader_cache::{
+            SuperfileReaderCache,
+            disk::{ScratchCharge, mmap_temp_file_bytes},
+        },
         schema::{FieldId, PhysicalSchema, TableSchema, map::FileSchemaMap},
         wal::{
             Etag, SealRecord, TombstonesSidecar, WalStore, WalStoreError,
@@ -1197,6 +1200,29 @@ impl Supertable {
         let opts = Arc::clone(&inner.options);
         let max_retries = opts.max_commit_retries.max(1);
 
+        // The merge writes its output to scratch beside the table's disk
+        // cache and holds it until the job commits, so it is charged to the
+        // same budget the cache keeps to, evicting cache files to make room.
+        // Charged before the inputs are sealed, so a job the budget cannot
+        // hold leaves nothing to undo.
+        let scratch = match opts.disk_cache.as_ref() {
+            Some(cache) => {
+                let mut charge = cache.scratch_charge();
+                charge
+                    .set(job.estimated_output_bytes)
+                    .await
+                    .map_err(|error| {
+                        CompactionError::Build(format!(
+                            "the table's disk budget cannot hold this merge's output of about {} \
+                             bytes beside the cache: {error}",
+                            job.estimated_output_bytes
+                        ))
+                    })?;
+                Some(charge)
+            }
+            None => None,
+        };
+
         // Seal every input sidecar so no writer can land a tombstone
         // on a file that's about to disappear, and so another
         // compactor doesn't pick up the same inputs. If we die
@@ -1326,6 +1352,7 @@ impl Supertable {
             bytes_for_cache,
             merged_superfile_id,
             term_contributions,
+            _scratch: scratch,
         })
     }
 
@@ -2558,6 +2585,9 @@ pub(crate) struct PreparedJob {
     bytes_for_cache: Option<(SuperfileUri, Bytes)>,
     merged_superfile_id: Uuid,
     term_contributions: Vec<TermContribution>,
+    /// The merged output's charge on the table's disk budget, given back
+    /// when the job is dropped after its commit.
+    _scratch: Option<ScratchCharge>,
 }
 
 /// Re-stamps a batch's seals once the uploads are behind it.
@@ -9340,6 +9370,7 @@ mod tests {
             bytes_for_cache: None,
             merged_superfile_id: Uuid::new_v4(),
             term_contributions: Vec::new(),
+            _scratch: None,
         }
     }
 
