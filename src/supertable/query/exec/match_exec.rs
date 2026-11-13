@@ -1068,18 +1068,25 @@ mod tests {
     }
 
     /// A table of `title` and `tag`, both full-text indexed, one superfile
-    /// per batch of `(title, tag)` rows.
-    fn tagged_table(commits: &[&[(&str, &str)]]) -> Supertable {
+    /// per batch of `(title, tag)` rows, read with `reader_threads` when set.
+    fn tagged_table(reader_threads: Option<usize>, commits: &[&[(&str, &str)]]) -> Supertable {
         let schema = Arc::new(Schema::new(vec![
             Field::new("title", DataType::LargeUtf8, false),
             Field::new("tag", DataType::LargeUtf8, false),
         ]));
-        let options = SupertableOptions::new(
+        let mut options = SupertableOptions::new(
             Arc::clone(&schema),
             vec![FtsConfig::new("title"), FtsConfig::new("tag")],
             vec![],
         )
         .expect("valid options");
+        if let Some(threads) = reader_threads {
+            let pool = ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .expect("reader pool");
+            options = options.with_reader_pool(Arc::new(pool));
+        }
         let st = Supertable::create(options).expect("create");
         for rows in commits {
             let titles: Vec<&str> = rows.iter().map(|(t, _)| *t).collect();
@@ -1124,11 +1131,14 @@ mod tests {
     /// row, the second holds no `y` and is pruned, and the third is all `y`.
     #[test]
     fn match_kernels_return_only_the_rows_an_indexed_where_keeps() {
-        let st = tagged_table(&[
-            &[("rust", "x"), ("rust", "y"), ("rust", "x")],
-            &[("rust", "x"), ("rust", "x")],
-            &[("rust", "y"), ("rust", "y")],
-        ]);
+        let st = tagged_table(
+            None,
+            &[
+                &[("rust", "x"), ("rust", "y"), ("rust", "x")],
+                &[("rust", "x"), ("rust", "x")],
+                &[("rust", "y"), ("rust", "y")],
+            ],
+        );
         assert_eq!(kernel_rows(&st, "rust", &[]), (7, 7, 7), "premise");
         let y = [col("tag").eq(lit("y"))];
         assert_eq!(kernel_rows(&st, "rust", &y), (3, 3, 3), "only the y rows");
@@ -1146,19 +1156,56 @@ mod tests {
     /// under `tag = 'y'` (two rows) the five `rust` hits are narrowed to one.
     #[test]
     fn a_filter_narrows_only_where_it_keeps_fewer_rows_than_the_match() {
-        let st = tagged_table(&[&[
-            ("rare", "x"),
-            ("rare", "y"),
-            ("rust", "x"),
-            ("rust", "x"),
-            ("rust", "x"),
-            ("rust", "x"),
-            ("rust", "y"),
-        ]]);
+        let st = tagged_table(
+            None,
+            &[&[
+                ("rare", "x"),
+                ("rare", "y"),
+                ("rust", "x"),
+                ("rust", "x"),
+                ("rust", "x"),
+                ("rust", "x"),
+                ("rust", "y"),
+            ]],
+        );
         let x = [col("tag").eq(lit("x"))];
         assert_eq!(kernel_rows(&st, "rare", &x), (2, 2, 2), "not narrowed");
         let y = [col("tag").eq(lit("y"))];
         assert_eq!(kernel_rows(&st, "rust", &y), (1, 1, 1), "narrowed");
+    }
+
+    /// One row in this many of the sliced fixture is tagged `y`.
+    const SLICED_TAG_EVERY: usize = 1_000;
+
+    /// A match cut into doc-id slices is narrowed too: each slice keeps
+    /// only its `y` rows, and the slices share one walk of the filter.
+    #[test]
+    fn a_sliced_match_returns_only_the_rows_an_indexed_where_keeps() {
+        let rows: Vec<(&str, &str)> = (0..SLICED_ROWS)
+            .map(|i| match i % SLICED_TAG_EVERY {
+                0 => ("rust", "y"),
+                _ => ("rust", "x"),
+            })
+            .collect();
+        let st = tagged_table(Some(SLICING_READER_THREADS), &[&rows]);
+        let y = [col("tag").eq(lit("y"))];
+        let reader = st.reader().expect("reader");
+        let slices: Vec<usize> = reader
+            .block_on(reader.token_match_columns_async(
+                "title",
+                "rust",
+                BoolMode::Or,
+                &["title"],
+                &y,
+            ))
+            .expect("columns")
+            .iter()
+            .map(RecordBatch::num_rows)
+            .collect();
+        let kept = SLICED_ROWS / SLICED_TAG_EVERY;
+        assert!(slices.len() > 1, "{slices:?} is one batch");
+        assert_eq!(slices.iter().sum::<usize>(), kept, "only the y rows");
+        assert_eq!(kernel_rows(&st, "rust", &y), (kept, kept, kept));
     }
 
     /// Row narrowing finds a renamed column's terms by its id: after two
