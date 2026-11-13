@@ -209,10 +209,12 @@ impl KeyKind {
 }
 
 /// Whether keys built from values of type `a` mean the same as keys of
-/// type `b`: the same kind and, for dates and timestamps, the same unit. A
-/// wider integer or float keeps its values, so its keys too; a day count
-/// read as nanoseconds does not. A time zone does not change a timestamp's
-/// stored value.
+/// type `b`, the type `a`'s values are now read as: the same kind, no
+/// narrower and, for dates and timestamps, the same unit. A wider integer
+/// or float keeps its values, so its keys too; a narrower one rounds or
+/// nulls some (`1.00000001` read as `Float32` is `1.0`), and a day count
+/// read as nanoseconds is another value. A time zone does not change a
+/// timestamp's stored value.
 pub(crate) fn same_keys(a: &DataType, b: &DataType) -> bool {
     let is_time = |t: &DataType| {
         matches!(
@@ -223,7 +225,11 @@ pub(crate) fn same_keys(a: &DataType, b: &DataType) -> bool {
     match (a, b) {
         (DataType::Timestamp(x, _), DataType::Timestamp(y, _)) => x == y,
         _ if is_time(a) || is_time(b) => a == b,
-        _ => KeyKind::of(a).is_some() && KeyKind::of(a) == KeyKind::of(b),
+        _ => {
+            KeyKind::of(a).is_some()
+                && KeyKind::of(a) == KeyKind::of(b)
+                && a.primitive_width() <= b.primitive_width()
+        }
     }
 }
 
@@ -1089,13 +1095,15 @@ mod tests {
 
     /// Keys carry over a change only when they still count the same unit.
     #[test]
-    fn keys_carry_over_a_widening_but_not_a_change_of_unit() {
+    fn keys_carry_over_a_widening_but_not_a_narrowing_or_a_change_of_unit() {
         let ns = DataType::Timestamp(TimeUnit::Nanosecond, None);
         let ns_utc = DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()));
         let ms = DataType::Timestamp(TimeUnit::Millisecond, None);
         assert!(same_keys(&DataType::Int32, &DataType::Int64));
         assert!(same_keys(&DataType::UInt8, &DataType::UInt64));
         assert!(same_keys(&DataType::Float32, &DataType::Float64));
+        assert!(!same_keys(&DataType::Float64, &DataType::Float32));
+        assert!(!same_keys(&DataType::Int64, &DataType::Int32));
         assert!(same_keys(&DataType::Date32, &DataType::Date32));
         assert!(same_keys(&ns, &ns_utc));
         assert!(!same_keys(&DataType::Date32, &ns));

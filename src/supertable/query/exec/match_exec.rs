@@ -517,7 +517,9 @@ mod tests {
     use std::{fmt, sync::Arc};
 
     use arrow::util::display::array_value_to_string;
-    use arrow_array::{Array, Date32Array, Int64Array, LargeStringArray, RecordBatch, StringArray};
+    use arrow_array::{
+        Array, Date32Array, Float64Array, Int64Array, LargeStringArray, RecordBatch, StringArray,
+    };
     use arrow_schema::{DataType, Field, Schema, TimeUnit};
     use datafusion::{
         error::DataFusionError,
@@ -1247,10 +1249,12 @@ mod tests {
     }
 
     /// A `WHERE` on a range-indexed column retyped after its superfile was
-    /// written still finds the row it keeps, on every match path.
+    /// written still finds the row it keeps, on every match path. A float
+    /// narrowed to `Float32` rounds `1.00000001` to `1.0`, a key the file's
+    /// range index never wrote.
     #[test]
     fn sql_where_on_a_retyped_range_column_keeps_its_rows() {
-        let cases: [(Arc<dyn Array>, DataType, &str, &str); 2] = [
+        let cases: [(Arc<dyn Array>, DataType, &str, &str); 3] = [
             (
                 Arc::new(Int64Array::from(vec![1_i64, 2])),
                 DataType::Float64,
@@ -1262,6 +1266,12 @@ mod tests {
                 DataType::Timestamp(TimeUnit::Nanosecond, None),
                 "TIMESTAMP '1970-01-02 00:00:00'",
                 "TIMESTAMP '1970-01-08 00:00:00'",
+            ),
+            (
+                Arc::new(Float64Array::from(vec![1.000_000_01_f64, 2.0])),
+                DataType::Float32,
+                "CAST(1 AS REAL)",
+                "CAST(7 AS REAL)",
             ),
         ];
         for (values, new_type, kept, absent) in cases {

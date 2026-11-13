@@ -89,7 +89,7 @@ use datafusion::logical_expr::Expr;
 use futures::future::join;
 use rayon::ThreadPool;
 use roaring::RoaringBitmap;
-use tokio::sync::OnceCell;
+use tokio::sync::{OnceCell, Semaphore};
 use tracing::{Instrument, debug, warn};
 use uuid::Uuid;
 
@@ -310,7 +310,7 @@ impl MatchKernel {
     /// match keeps there.
     async fn keep_filtered(
         &self,
-        r: &SuperfileReader,
+        r: &Arc<SuperfileReader>,
         suid: Uuid,
         hits: u64,
         mut docs: Vec<RowId>,
@@ -362,7 +362,7 @@ impl MatchKernel {
 
     /// The rows of superfile `suid`, read through `r`, that the match
     /// keeps: the positive walk minus any row a negated atom reaches.
-    async fn docs(&self, r: &SuperfileReader, suid: Uuid) -> Result<Vec<RowId>, QueryError> {
+    async fn docs(&self, r: &Arc<SuperfileReader>, suid: Uuid) -> Result<Vec<RowId>, QueryError> {
         let (column, memo, refs) = self.file_inputs(r, suid).await;
         // Any phrase atom (match or negated) takes the phrase-aware walk;
         // plain-token queries keep the optimized token_match path.
@@ -444,10 +444,13 @@ impl MatchKernel {
 /// rows that pass: the `FilterExec` above the scan still decides the rows.
 struct RowFilter {
     /// The `WHERE` as a bounded candidate plan with no `LIKE` leaf.
-    plan: CandidatePlan,
+    plan: Arc<CandidatePlan>,
     /// The index's locations for the plan's terms in the kept superfiles.
     locations: PlanLocations,
     pool: Arc<ThreadPool>,
+    /// Superfiles evaluating the plan on `pool` at once: more than its
+    /// threads would only queue there, each holding its postings.
+    slots: Semaphore,
     op_stats: Option<Arc<op_stats::OpStatsCollector>>,
     /// Each superfile's rows, found once and shared by its slices.
     found: Mutex<HashMap<Uuid, Arc<OnceCell<Option<Arc<RoaringBitmap>>>>>>,
@@ -471,10 +474,12 @@ impl RowFilter {
             return Ok(None);
         }
         let locations = plan_locations_for(manifest, &plan, kept).await?;
+        let pool = Arc::clone(&manifest.options.reader_pool);
         Ok(Some(Self {
-            plan,
+            plan: Arc::new(plan),
             locations,
-            pool: Arc::clone(&manifest.options.reader_pool),
+            slots: Semaphore::new(pool.current_num_threads()),
+            pool,
             op_stats,
             found: Mutex::new(HashMap::new()),
         }))
@@ -483,10 +488,11 @@ impl RowFilter {
     /// The rows of superfile `suid` the filter can keep, or `None` when it
     /// does not narrow them. `hits` bounds the rows the match keeps there:
     /// the filter's postings are walked only when it keeps fewer rows than
-    /// that, so the walk never costs more than the match's own.
+    /// that, so the walk never costs more than the match's own. The walk
+    /// of a resident superfile runs on the reader pool, not on this task.
     async fn rows(
         &self,
-        r: &SuperfileReader,
+        r: &Arc<SuperfileReader>,
         suid: Uuid,
         hits: u64,
     ) -> Result<Option<Arc<RoaringBitmap>>, QueryError> {
@@ -508,15 +514,11 @@ impl RowFilter {
                 if estimate >= hits {
                     return Ok::<_, QueryError>(None);
                 }
-                let rows = evaluate_with_locations(
-                    &self.plan,
-                    r,
-                    &self.pool,
-                    &self.locations,
-                    suid,
-                    self.op_stats.as_deref(),
-                )
-                .await?;
+                let memos = memos_from_plan_locations(r, &self.locations, suid).await;
+                let (rows, work) = Arc::clone(&self.plan)
+                    .evaluate_on_pool(Arc::clone(r), suid, &self.pool, &self.slots, memos)
+                    .await?;
+                work.add_to(self.op_stats.as_deref());
                 Ok(rows.map(Arc::new))
             })
             .await?;
