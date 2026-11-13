@@ -564,9 +564,13 @@ pub(crate) fn candidate_plan_for_filters(
         .map(|c| c.column.as_str())
         .collect();
     let range_cols = manifest.table_schema().range_column_types();
-    CandidatePlan::from_filters(filters, &fts_cols, &range_cols, &|col| {
-        manifest.try_fts_tokenizer_for(col)
-    })
+    CandidatePlan::from_filters(
+        filters,
+        &fts_cols,
+        &range_cols,
+        &|col| manifest.try_fts_tokenizer_for(col),
+        &|col| manifest.field_id(col),
+    )
 }
 
 /// The exact `WHERE` a search table function was handed, ready to run
@@ -2016,31 +2020,6 @@ impl AsyncFileReader for ByteSourceAsyncReader {
         let metadata = Arc::clone(&self.metadata);
         async move { Ok(metadata) }.boxed()
     }
-}
-
-/// The `names` columns at `local_doc_ids` of one superfile, in that order:
-/// decoded on `pool` when its Parquet bytes are resident, streamed through
-/// its byte source otherwise. The split [`resolve_hits`] makes across many
-/// superfiles at once, for a caller holding one.
-pub(crate) async fn take_rows(
-    reader: &Arc<SuperfileReader>,
-    local_doc_ids: &[u32],
-    names: &[&str],
-    pool: &ThreadPool,
-) -> DfResult<RecordBatch> {
-    if !reader.can_take_by_local_doc_ids() {
-        return take_rows_byte_source(reader, local_doc_ids, names, Some(pool), None).await;
-    }
-    let owned_reader = Arc::clone(reader);
-    let ids = local_doc_ids.to_vec();
-    let owned_names: Vec<String> = names.iter().map(|name| (*name).to_owned()).collect();
-    run_on_pool(Some(pool), "take rows", move || {
-        let name_refs: Vec<&str> = owned_names.iter().map(String::as_str).collect();
-        owned_reader.take_by_local_doc_ids(&ids, &name_refs)
-    })
-    .await
-    .map_err(QueryError::internal)?
-    .map_err(|e| DataFusionError::from(QueryError::from(e)))
 }
 
 /// Stream projected rows through a reader's cache-aware byte source.
