@@ -1163,6 +1163,64 @@ mod tests {
         assert_eq!(kernel_rows(&st, "rust", &y), (1, 1, 1), "narrowed");
     }
 
+    /// A match cut into doc-id slices narrows each slice: one superfile of
+    /// 100,000 `rust` rows on a two-thread reader pool takes two slices,
+    /// and under `tag = 'y'` each returns only its one `y` row.
+    #[test]
+    fn a_sliced_match_returns_only_the_rows_an_indexed_where_keeps() {
+        /// Two slices' worth: `SUBRANGE_MIN_DOCS` is 50,000.
+        const ROWS: usize = 100_000;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new("tag", DataType::LargeUtf8, false),
+        ]));
+        let pool = Arc::new(
+            ThreadPoolBuilder::new()
+                .num_threads(2)
+                .build()
+                .expect("pool"),
+        );
+        let options = SupertableOptions::new(
+            Arc::clone(&schema),
+            vec![FtsConfig::new("title"), FtsConfig::new("tag")],
+            vec![],
+        )
+        .expect("valid options")
+        .with_reader_pool(pool);
+        let st = Supertable::create(options).expect("create");
+        let mut tags = vec!["x"; ROWS];
+        tags[0] = "y";
+        tags[ROWS - 1] = "y";
+        let mut w = st.writer().expect("writer");
+        w.append(&titled_batch(
+            &schema,
+            &vec!["rust"; ROWS],
+            Arc::new(LargeStringArray::from(tags)),
+        ))
+        .expect("append");
+        w.commit().expect("commit");
+        let reader = st.reader().expect("reader");
+        assert_eq!(reader.manifest().superfiles.len(), 1, "premise");
+        let rt = Runtime::new().expect("runtime");
+        let batch_rows = |filters: &[Expr]| -> Vec<usize> {
+            rt.block_on(reader.token_match_columns_async(
+                "title",
+                "rust",
+                BoolMode::Or,
+                &["tag"],
+                filters,
+            ))
+            .expect("columns")
+            .iter()
+            .map(RecordBatch::num_rows)
+            .filter(|&n| n > 0)
+            .collect()
+        };
+        assert_eq!(batch_rows(&[]), [ROWS / 2; 2], "premise: two slices");
+        let y = [col("tag").eq(lit("y"))];
+        assert_eq!(batch_rows(&y), [1, 1], "each slice keeps its y row");
+    }
+
     /// Row narrowing finds a renamed column's terms by its id: after two
     /// full-text columns swap names, every match path still returns the
     /// row the filter keeps.

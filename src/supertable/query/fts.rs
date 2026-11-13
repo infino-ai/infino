@@ -330,6 +330,8 @@ impl MatchKernel {
     /// The most rows the match can keep in superfile `suid`: the sum of
     /// its terms' document counts there, or `n_docs` when the index does not
     /// list the superfile. Exact for the term unions [`Self::slices`] runs.
+    /// The sum saturates: a count comes from the index's stored entry, and
+    /// a corrupt one must not wrap the bound.
     fn hits_bound(&self, suid: Uuid, n_docs: u64) -> u64 {
         let Some(held) = self.locations.held(suid) else {
             return n_docs;
@@ -337,7 +339,7 @@ impl MatchKernel {
         self.terms
             .iter()
             .filter_map(|t| held.entry(t).map(|(_, df, _)| *df))
-            .sum::<u64>()
+            .fold(0u64, u64::saturating_add)
             .min(n_docs)
     }
 
@@ -4691,7 +4693,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        BoolMode, FanOut, LocatedTerms, SharedTopK, SuperfileHit, SupertableReader,
+        BoolMode, FanOut, LocatedTerms, MatchKernel, SharedTopK, SuperfileHit, SupertableReader,
         build_work_units, ceilings_at_table_avgdl, fanout_for,
     };
     use crate::{
@@ -8030,5 +8032,59 @@ mod tests {
             .collect();
         assert_eq!(dfs, vec![Some(3), Some(0), Some(7), None, None]);
         assert!(located.held(Uuid::from_u128(2)).is_none());
+    }
+
+    /// A match kernel over `terms` whose index lists `held` for superfile
+    /// `listed`.
+    fn kernel_over(
+        terms: &[&str],
+        listed: Uuid,
+        held: Vec<(String, u64, Location)>,
+    ) -> MatchKernel {
+        let terms: Vec<String> = terms.iter().map(|t| (*t).to_owned()).collect();
+        MatchKernel {
+            column_field_id: None,
+            column: "title".to_owned(),
+            mode: BoolMode::Or,
+            phrase_involved: false,
+            has_negatives: false,
+            terms: terms.clone(),
+            phrases: Vec::new(),
+            negatives: Vec::new(),
+            negative_phrases: Vec::new(),
+            locations: Arc::new(LocatedTerms {
+                terms,
+                by_superfile: HashMap::from([(listed, Arc::new(held))]),
+            }),
+            row_filter: None,
+            op_stats: None,
+        }
+    }
+
+    /// The hit bound sums the index's counts without wrapping: counts of
+    /// `u64::MAX` and `1` bound the match by the file's rows, not by zero,
+    /// and in-range counts still sum below them.
+    #[test]
+    fn the_hit_bound_saturates_a_corrupt_count() {
+        let listed = Uuid::from_u128(1);
+        let corrupt = kernel_over(
+            &["alpha", "beta"],
+            listed,
+            vec![
+                ("alpha".to_owned(), u64::MAX, Location::None),
+                ("beta".to_owned(), 1, Location::None),
+            ],
+        );
+        assert_eq!(corrupt.hits_bound(listed, 100), 100);
+        let sound = kernel_over(
+            &["alpha", "beta"],
+            listed,
+            vec![
+                ("alpha".to_owned(), 7, Location::None),
+                ("beta".to_owned(), 3, Location::None),
+            ],
+        );
+        assert_eq!(sound.hits_bound(listed, 100), 10);
+        assert_eq!(sound.hits_bound(Uuid::from_u128(2), 100), 100, "unlisted");
     }
 }
