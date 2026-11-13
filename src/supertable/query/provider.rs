@@ -120,20 +120,24 @@ use crate::{
         SuperfileEntry, SupertableReader,
         error::QueryError,
         manifest::{
-            ColumnStats, ManifestSnapshot, add_sum_arrays, hll::HllSketch, list::ScalarValueCounts,
-            load_section_groups, load_section_groups_blocking,
+            ColumnStats, ManifestSnapshot, SuperfileUri, add_sum_arrays, hll::HllSketch,
+            list::ScalarValueCounts, load_section_groups, load_section_groups_blocking,
         },
         query::{
             candidate::{
                 CandidatePlan, ExactFilter, exact_filter, like_prune_leaves, single_range,
             },
+            column_cache::{ColumnKey, DecodedColumnCache},
             deleted_stats::DeletedStatsCache,
             df_object_store::SuperfileObjectStore,
             exec::{
                 cached_scan_exec::{
                     CachedFile, CachedScanExec, RowGroupFilter, has_columns, projected_schema,
                 },
-                common::{BoundPredicate, PushedPredicate, take_file_columns, unqualified},
+                common::{
+                    BoundPredicate, PushedPredicate, read_file_row_group, take_file_columns,
+                    unqualified,
+                },
                 metered_exec::MeteredExec,
             },
             fts::{IndexedSuperfile, memos_from_plan_locations, plan_locations_for},
@@ -459,6 +463,9 @@ pub(crate) struct CountedRange {
 /// told apart by those keys, so every one of them can be in the answer.
 /// When the one later key is the id, ascending (`ties_by_id`), a superfile
 /// that keeps its tied rows in id order answers with its first rows alone.
+/// `filters` is empty when every filter under the sort is a range on the
+/// column; otherwise it is every one of them, which the scan checks on the
+/// rows it reads in the index's order ([`SupertableProvider::filtered_top_k_rows`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TopKHint {
     pub(crate) column: String,
@@ -466,7 +473,21 @@ pub(crate) struct TopKHint {
     pub(crate) k: usize,
     pub(crate) ties: bool,
     pub(crate) ties_by_id: bool,
+    pub(crate) filters: Vec<Expr>,
 }
+
+/// How many times `k` rows, across every superfile, a filtered top-k reads
+/// first in the range index's order before checking them, and grows by each
+/// round after.
+const FILTERED_TOP_K_GROWTH: usize = 4;
+
+/// Rows a filtered top-k checks, across every superfile, before it gives up
+/// and the scan reads every row the filters admit: a filter that few rows
+/// pass would otherwise read the table in the index's order, row by row.
+/// At least this many, and [`FILTERED_TOP_K_MAX_K_MULTIPLE`] times `k`.
+const FILTERED_TOP_K_MIN_ROWS: usize = 2048;
+/// See [`FILTERED_TOP_K_MIN_ROWS`].
+const FILTERED_TOP_K_MAX_K_MULTIPLE: usize = 64;
 
 /// Manual `Debug` (required by `TableProvider`): the cache /
 /// disk-cache fields are trait objects without a `Debug` bound, so
@@ -1170,6 +1191,9 @@ impl SupertableProvider {
         let Some(hint) = self.top_k.as_ref() else {
             return Ok(None);
         };
+        if !hint.filters.is_empty() {
+            return self.filtered_top_k_rows(survivors, hint, now).await;
+        }
         let range_cols = self.manifest.table_schema().range_column_types();
         let Some((field, data_type, lo, hi)) = single_range(filters, &hint.column, &range_cols)
         else {
@@ -1260,6 +1284,349 @@ impl SupertableProvider {
                 })
                 .collect(),
         ))
+    }
+
+    /// [`Self::top_k_rows`] for a hint whose filters are not all a range on
+    /// its column. Each superfile's first rows inside the range, in the
+    /// range index's order, are read in rounds of a growing size, and the
+    /// rows a round has not met before are checked against the filters that
+    /// are not that range, reading only the columns those filters name.
+    ///
+    /// A superfile whose round came back full can still hold rows as good as
+    /// the worst key it gave, but none better; the best of those worst keys
+    /// across such superfiles is the frontier, and every row with a key
+    /// better than it has been read and checked. Once `k` rows pass with keys
+    /// better than the frontier, the `k`-th best of them is a cutoff that
+    /// every row of the answer is within, ties and all: the rows returned
+    /// are the passing ones within it, so later sort keys (the id or any
+    /// other) order the same rows they would over a full scan. When every
+    /// superfile has given every row in the range, the passing rows are all
+    /// there are — unless no filter bounds the column, where a NULL can be
+    /// in the answer and no range index holds one.
+    ///
+    /// `None`, and the scan reads every row the filters admit, when a filter
+    /// cannot be checked here, a survivor has no range index over the
+    /// column, nulls might be in the answer, or the rows checked — or those
+    /// the filters' pass rate so far says the answer would take — pass
+    /// [`FILTERED_TOP_K_MIN_ROWS`] (or [`FILTERED_TOP_K_MAX_K_MULTIPLE`]
+    /// times `k`): a filter few rows pass is answered by the scan it already
+    /// had, after a bounded, cheap look.
+    async fn filtered_top_k_rows(
+        &self,
+        survivors: &[Arc<SuperfileEntry>],
+        hint: &TopKHint,
+        now: Instant,
+    ) -> DfResult<Option<HashMap<Uuid, RoaringBitmap>>> {
+        if hint.k == 0 {
+            return Ok(None);
+        }
+        let range_cols = self.manifest.table_schema().range_column_types();
+        let (on_column, rest): (Vec<Expr>, Vec<Expr>) =
+            hint.filters.iter().cloned().partition(|filter| {
+                single_range(std::slice::from_ref(filter), &hint.column, &range_cols).is_some()
+            });
+        let Some((field, data_type, lo, hi)) = single_range(&on_column, &hint.column, &range_cols)
+        else {
+            return Ok(None);
+        };
+        let data_type = &data_type;
+        let Some(pushed) = PushedPredicate::compile(&rest, &self.schema) else {
+            return Ok(None);
+        };
+        if pushed.columns().is_empty() {
+            return Ok(None);
+        }
+        let bound_schema = Arc::new(
+            self.schema
+                .project(pushed.columns())
+                .map_err(QueryError::internal)?,
+        );
+        let predicate = &pushed.bind(&bound_schema)?;
+        let bound_schema = &bound_schema;
+        let names: &Vec<&str> = &bound_schema
+            .fields()
+            .iter()
+            .map(|field| field.name().as_str())
+            .collect();
+        let in_flight = self.manifest.options.superfiles_in_flight;
+        let cache = self.manifest.options.decoded_columns.as_deref();
+        let schema_id = self.manifest.table_schema().schema_id();
+        let op_stats = &self.scan_store.op_stats();
+        let descending = hint.descending;
+        // Whether key `a` comes before key `b` in the sort.
+        let better = move |a: u64, b: u64| match descending {
+            false => a < b,
+            true => a > b,
+        };
+
+        /// One survivor's reading so far.
+        struct Read {
+            id: Uuid,
+            uri: SuperfileUri,
+            prepared: Arc<PreparedScanFile>,
+            tombstones: Arc<RoaringBitmap>,
+            /// Rows checked against the filters, in any round.
+            checked: RoaringBitmap,
+            /// Those that passed, with their keys.
+            passing: Vec<(u64, u32)>,
+            /// The worst key the last round gave.
+            worst: Option<u64>,
+            /// The last round gave every row the range holds.
+            exhausted: bool,
+        }
+        let mut reads = try_join_bounded(
+            survivors.iter().cloned().map(|entry| {
+                let prepared = self.prepared_scan_file(Arc::clone(&entry));
+                async move {
+                    Ok::<_, DataFusionError>(Read {
+                        id: entry.superfile_id,
+                        uri: entry.uri,
+                        prepared: prepared.await?,
+                        tombstones: self.deleted_rows(entry.superfile_id, now)?,
+                        checked: RoaringBitmap::new(),
+                        passing: Vec::new(),
+                        worst: None,
+                        exhausted: false,
+                    })
+                }
+            }),
+            in_flight,
+        )
+        .await?;
+        let ceiling = hint
+            .k
+            .saturating_mul(FILTERED_TOP_K_MAX_K_MULTIPLE)
+            .max(FILTERED_TOP_K_MIN_ROWS);
+        let mut want = hint.k.saturating_mul(FILTERED_TOP_K_GROWTH);
+        loop {
+            // Owned inputs: futures over borrowed ones, held across an await
+            // in the scan's `async_trait` method, trip rustc's "not general
+            // enough" (see `try_join_bounded`).
+            #[allow(clippy::type_complexity)]
+            let open: Vec<(
+                usize,
+                SuperfileUri,
+                Arc<PreparedScanFile>,
+                Arc<RoaringBitmap>,
+                RoaringBitmap,
+            )> = reads
+                .iter()
+                .enumerate()
+                .filter(|(_, read)| !read.exhausted)
+                .map(|(i, read)| {
+                    (
+                        i,
+                        read.uri,
+                        Arc::clone(&read.prepared),
+                        Arc::clone(&read.tombstones),
+                        read.checked.clone(),
+                    )
+                })
+                .collect();
+            let rounds = try_join_bounded(
+                open.into_iter()
+                    .map(|(i, uri, prepared, tombstones, checked)| async move {
+                        let Some(ends) = prepared
+                            .reader
+                            .range_ends(field, data_type, (lo, hi), want, descending, &tombstones)
+                            .await
+                            .map_err(QueryError::from)?
+                        else {
+                            return Ok(None);
+                        };
+                        let exhausted = ends.pairs.len() < want;
+                        let worst = ends
+                            .pairs
+                            .iter()
+                            .map(|(key, _)| *key)
+                            .reduce(|a, b| if better(a, b) { b } else { a });
+                        let mut fresh: Vec<(u64, u32)> = ends
+                            .pairs
+                            .into_iter()
+                            .filter(|(_, row)| !checked.contains(*row))
+                            .collect();
+                        fresh.sort_unstable_by_key(|(_, row)| *row);
+                        let ids: Vec<u32> = fresh.iter().map(|(_, row)| *row).collect();
+                        // With a decoded-column cache, rows are checked from
+                        // their row groups' filter columns, kept: those a
+                        // row group lacks are decoded whole and kept, as a
+                        // scan of the column keeps them, so the next statement
+                        // finds them. Without one, the rows alone are read.
+                        let mut checks: Vec<(Vec<(u64, u32)>, RecordBatch)> = Vec::new();
+                        let taken = match cache {
+                            Some(cache) => {
+                                let row_counts = &prepared.row_counts;
+                                let (kept, rest) = kept_filter_columns(
+                                    cache,
+                                    uri,
+                                    schema_id,
+                                    row_counts,
+                                    &fresh,
+                                    bound_schema,
+                                )?;
+                                checks.extend(kept);
+                                for row_group in row_groups_of(row_counts, &rest) {
+                                    let read = read_file_row_group(
+                                        &self.manifest,
+                                        &prepared.reader,
+                                        row_group,
+                                        names,
+                                        bound_schema,
+                                        op_stats,
+                                    )
+                                    .await?;
+                                    for (column, field) in
+                                        read.columns().iter().zip(bound_schema.fields())
+                                    {
+                                        let column =
+                                            arrow::compute::cast(column, field.data_type())?;
+                                        let bytes = column.get_array_memory_size();
+                                        cache.insert(
+                                            ColumnKey {
+                                                uri,
+                                                schema_id,
+                                                column: field.name().clone(),
+                                                row_group,
+                                            },
+                                            column,
+                                            bytes,
+                                        );
+                                    }
+                                }
+                                let (kept, rest) = kept_filter_columns(
+                                    cache,
+                                    uri,
+                                    schema_id,
+                                    row_counts,
+                                    &rest,
+                                    bound_schema,
+                                )?;
+                                checks.extend(kept);
+                                rest
+                            }
+                            None => fresh,
+                        };
+                        if !taken.is_empty() {
+                            let rows: Vec<u32> = taken.iter().map(|(_, row)| *row).collect();
+                            let batch = take_file_columns(
+                                &self.manifest,
+                                &prepared.reader,
+                                rows.clone(),
+                                names,
+                                bound_schema,
+                                op_stats,
+                            )
+                            .await?;
+                            if batch.num_rows() != rows.len() {
+                                return Err(DataFusionError::Internal(format!(
+                                    "read {} rows to check {} for a filtered top-k",
+                                    batch.num_rows(),
+                                    rows.len()
+                                )));
+                            }
+                            // Taken columns hold the stored types; the
+                            // filters were planned over the scan's (a view
+                            // type for a string, say).
+                            let columns = batch
+                                .columns()
+                                .iter()
+                                .zip(bound_schema.fields())
+                                .map(|(column, field)| {
+                                    arrow::compute::cast(column, field.data_type())
+                                })
+                                .collect::<Result<Vec<_>, _>>()?;
+                            checks.push((
+                                taken,
+                                RecordBatch::try_new(Arc::clone(bound_schema), columns)?,
+                            ));
+                        }
+                        let mut passing = Vec::new();
+                        for (pairs, batch) in checks {
+                            let mask = predicate.mask(&batch)?;
+                            passing.extend(
+                                pairs
+                                    .iter()
+                                    .zip(mask.iter())
+                                    .filter(|(_, holds)| *holds == Some(true))
+                                    .map(|(pair, _)| *pair),
+                            );
+                        }
+                        Ok::<_, DataFusionError>(Some((i, exhausted, worst, ids, passing)))
+                    }),
+                in_flight,
+            )
+            .await?;
+            for round in rounds {
+                let Some((i, exhausted, worst, ids, passing)) = round else {
+                    return Ok(None);
+                };
+                let read = &mut reads[i];
+                read.exhausted = exhausted;
+                read.worst = worst;
+                read.checked.extend(ids);
+                read.passing.extend(passing);
+            }
+            let frontier = reads
+                .iter()
+                .filter(|read| !read.exhausted)
+                .filter_map(|read| read.worst)
+                .reduce(|a, b| if better(a, b) { a } else { b });
+            let mut keys: Vec<u64> = reads
+                .iter()
+                .flat_map(|read| read.passing.iter().map(|(key, _)| *key))
+                .filter(|key| frontier.is_none_or(|edge| better(*key, edge)))
+                .collect();
+            if keys.len() >= hint.k {
+                let cut = *keys
+                    .select_nth_unstable_by(hint.k - 1, |a, b| match descending {
+                        false => a.cmp(b),
+                        true => b.cmp(a),
+                    })
+                    .1;
+                return Ok(Some(
+                    reads
+                        .into_iter()
+                        .map(|read| {
+                            let rows: RoaringBitmap = read
+                                .passing
+                                .into_iter()
+                                .filter(|(key, _)| !better(cut, *key))
+                                .map(|(_, row)| row)
+                                .collect();
+                            (read.id, rows)
+                        })
+                        .collect(),
+                ));
+            }
+            if frontier.is_none() {
+                // Every row in the range was read. With no range on the
+                // column, nulls (after every value) can fill the answer.
+                if on_column.is_empty() {
+                    return Ok(None);
+                }
+                return Ok(Some(
+                    reads
+                        .into_iter()
+                        .map(|read| {
+                            (
+                                read.id,
+                                read.passing.into_iter().map(|(_, row)| row).collect(),
+                            )
+                        })
+                        .collect(),
+                ));
+            }
+            // Give up once the rows checked, or the rows the filters' pass
+            // rate so far says the answer still needs, pass the ceiling.
+            let checked: u64 = reads.iter().map(|read| read.checked.len()).sum();
+            let passed = reads.iter().map(|read| read.passing.len()).sum::<usize>() as u64;
+            let short = (hint.k as u64).saturating_sub(passed);
+            let needed = checked.saturating_add(short.saturating_mul(checked) / passed.max(1));
+            if checked >= ceiling as u64 || needed > ceiling as u64 {
+                return Ok(None);
+            }
+            want = want.saturating_mul(FILTERED_TOP_K_GROWTH).min(ceiling);
+        }
     }
 
     /// Each survivor's live rows whose key lies in `lo..=hi`, from its range
@@ -1805,6 +2172,105 @@ impl ExactCheck {
 /// [`LIKE_WALK_MIN_BYTES_PER_TERM`]. A missing term count (0) passes.
 fn full_walk_pays(terms: u64, bytes: u64) -> bool {
     terms == 0 || bytes / terms >= LIKE_WALK_MIN_BYTES_PER_TERM
+}
+
+/// Of `rows` (`(key, row)`, ascending by row) in the superfile `uri`, the
+/// ones whose row group has every column of `schema` kept decoded in
+/// `cache`, with those columns' values at them as a batch of `schema`; and
+/// the rest, whose columns must be read. The kept columns are typed as the
+/// scan types them, which `schema` (a projection of the scan's) does too.
+#[allow(clippy::type_complexity)]
+fn kept_filter_columns(
+    cache: &DecodedColumnCache,
+    uri: SuperfileUri,
+    schema_id: u32,
+    row_counts: &[u32],
+    rows: &[(u64, u32)],
+    schema: &SchemaRef,
+) -> DfResult<(Option<(Vec<(u64, u32)>, RecordBatch)>, Vec<(u64, u32)>)> {
+    let mut kept_pairs: Vec<(u64, u32)> = Vec::new();
+    let mut parts: Vec<Vec<ArrayRef>> = vec![Vec::new(); schema.fields().len()];
+    let mut rest: Vec<(u64, u32)> = Vec::new();
+    let mut start: u32 = 0;
+    let mut at = 0;
+    for (row_group, &count) in row_counts.iter().enumerate() {
+        let end = start.saturating_add(count);
+        let from = at;
+        while at < rows.len() && rows[at].1 < end {
+            at += 1;
+        }
+        let group = &rows[from..at];
+        if !group.is_empty() {
+            let columns: Option<Vec<ArrayRef>> = schema
+                .fields()
+                .iter()
+                .map(|field| {
+                    cache.get(&ColumnKey {
+                        uri,
+                        schema_id,
+                        column: field.name().clone(),
+                        row_group,
+                    })
+                })
+                .collect();
+            match columns {
+                Some(columns)
+                    if columns.iter().zip(schema.fields()).all(|(column, field)| {
+                        column.len() == count as usize && column.data_type() == field.data_type()
+                    }) =>
+                {
+                    let local = arrow::array::UInt32Array::from_iter_values(
+                        group.iter().map(|(_, row)| row - start),
+                    );
+                    for (part, column) in parts.iter_mut().zip(&columns) {
+                        part.push(arrow::compute::take(column.as_ref(), &local, None)?);
+                    }
+                    kept_pairs.extend_from_slice(group);
+                }
+                _ => rest.extend_from_slice(group),
+            }
+        }
+        start = end;
+        if at == rows.len() {
+            break;
+        }
+    }
+    rest.extend_from_slice(&rows[at..]);
+    if kept_pairs.is_empty() {
+        return Ok((None, rest));
+    }
+    let columns = parts
+        .iter()
+        .map(|part| {
+            let refs: Vec<&dyn arrow::array::Array> = part.iter().map(|a| a.as_ref()).collect();
+            arrow::compute::concat(&refs)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let batch = RecordBatch::try_new(Arc::clone(schema), columns)?;
+    Ok((Some((kept_pairs, batch)), rest))
+}
+
+/// The row groups, ascending, that `rows` (`(key, row)`, ascending by row)
+/// fall in, given each row group's row count.
+fn row_groups_of(row_counts: &[u32], rows: &[(u64, u32)]) -> Vec<usize> {
+    let mut groups = Vec::new();
+    let mut start: u32 = 0;
+    let mut at = 0;
+    for (row_group, &count) in row_counts.iter().enumerate() {
+        let end = start.saturating_add(count);
+        let from = at;
+        while at < rows.len() && rows[at].1 < end {
+            at += 1;
+        }
+        if at > from {
+            groups.push(row_group);
+        }
+        if at == rows.len() {
+            break;
+        }
+        start = end;
+    }
+    groups
 }
 
 /// Footers of the files this table's scans have opened, by path.
