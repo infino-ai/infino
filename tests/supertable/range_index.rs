@@ -17,9 +17,12 @@
 
 use std::sync::Arc;
 
-use arrow::util::pretty::pretty_format_batches;
-use arrow_array::{Array, Date32Array, Float64Array, Int32Array, Int64Array, RecordBatch};
-use arrow_schema::{DataType, Field, Schema};
+use arrow::{compute::cast, util::pretty::pretty_format_batches};
+use arrow_array::{
+    Array, Date32Array, Float64Array, Int32Array, Int64Array, LargeStringArray, RecordBatch,
+    TimestampNanosecondArray,
+};
+use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use datafusion::{
     logical_expr::LogicalPlanBuilder,
     prelude::{col, in_subquery, lit},
@@ -128,6 +131,21 @@ const RENAMED_QUERIES: &[&str] = &[
     "SELECT amount FROM {t} WHERE amount > 200 ORDER BY amount LIMIT 10",
     "SELECT qty FROM {t} WHERE qty < -150 ORDER BY qty LIMIT 10",
 ];
+
+/// The shapes both tables answer once `day` is retyped from days to
+/// nanoseconds and `qty` widened to `Int64`. A superfile written before
+/// keys `day` by days, which a nanosecond bound must not be read against.
+const RETYPED_QUERIES: &[&str] = &[
+    "SELECT count(*) AS n FROM {t} WHERE day >= TIMESTAMP '2022-06-01 00:00:00'",
+    "SELECT seq FROM {t} WHERE day = TIMESTAMP '2022-01-08 00:00:00' ORDER BY seq",
+    "SELECT seq FROM {t} WHERE day >= TIMESTAMP '2022-06-01 00:00:00' AND day < TIMESTAMP '2022-06-03 00:00:00' ORDER BY seq",
+    "SELECT day FROM {t} WHERE day > TIMESTAMP '2022-03-01 00:00:00' ORDER BY day LIMIT 10",
+    "SELECT day FROM {t} ORDER BY day DESC LIMIT 5",
+    "SELECT count(*) AS n FROM {t} WHERE qty > 100",
+    "SELECT qty FROM {t} WHERE qty < -200 ORDER BY qty DESC LIMIT 10",
+];
+/// Nanoseconds in a day.
+const NANOS_PER_DAY: i64 = 86_400_000_000_000;
 
 fn schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
@@ -445,6 +463,134 @@ fn a_range_index_follows_its_column_through_a_rename_and_not_into_a_reused_name(
             .expect("append");
     }
     assert_same_answers(&db, RENAMED_QUERIES, "after a rename and a reused name");
+}
+
+#[test]
+fn a_range_index_written_before_a_retype_answers_only_where_its_keys_still_hold() {
+    let dir = TempDir::new().expect("tempdir");
+    let db = connect(dir.path().to_str().expect("utf-8 path")).expect("connect");
+    create(&db);
+    let retype = SchemaPatch::new(vec![
+        FieldPatch::named("day").with_type(DataType::Timestamp(TimeUnit::Nanosecond, None)),
+        FieldPatch::named("qty").with_type(DataType::Int64),
+    ]);
+    for table in ["plain", "ranged"] {
+        db.apply_schema(table, &retype, None).expect("retype");
+    }
+    assert_same_answers(&db, RETYPED_QUERIES, "after a retype");
+    // A wider integer keeps its keys, so the old index still serves `qty`.
+    let query = format!("EXPLAIN ANALYZE {TIE_BROKEN_TOP_K}");
+    let ranged_rows = scan_rows(&answer(&db, &query, "ranged"));
+    assert!(
+        ranged_rows <= TIE_BROKEN_TOP_K_MAX_ROWS,
+        "{query}: the indexed scan read {ranged_rows} rows"
+    );
+
+    // One more superfile, written under the new types.
+    let old = rows(FILES * ROWS_PER_FILE);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("seq", DataType::Int64, false),
+        Field::new("qty", DataType::Int64, true),
+        Field::new("price", DataType::Float64, false),
+        Field::new(
+            "day",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            false,
+        ),
+    ]));
+    let qty = cast(old.column(1), &DataType::Int64).expect("qty");
+    let days = old
+        .column(3)
+        .as_any()
+        .downcast_ref::<Date32Array>()
+        .expect("days");
+    let day: TimestampNanosecondArray = days
+        .values()
+        .iter()
+        .map(|d| Some(i64::from(*d) * NANOS_PER_DAY))
+        .collect();
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::clone(old.column(0)),
+            qty,
+            Arc::clone(old.column(2)),
+            Arc::new(day),
+        ],
+    )
+    .expect("batch");
+    for table in ["plain", "ranged"] {
+        db.open_table(table)
+            .expect("open")
+            .append(&batch)
+            .expect("append");
+    }
+    assert_same_answers(&db, RETYPED_QUERIES, "after a retype and an append");
+}
+
+/// A search function's `WHERE` on a retyped range-indexed column answers
+/// as it does with no range index: a superfile whose index no longer keys
+/// the column's values is left to the filter, not reported as a planner
+/// bug. Covers a change of key unit and of key kind.
+#[test]
+fn a_search_where_on_a_retyped_range_column_answers_as_without_the_index() {
+    let dir = TempDir::new().expect("tempdir");
+    let db = connect(dir.path().to_str().expect("utf-8 path")).expect("connect");
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("title", DataType::LargeUtf8, false),
+        Field::new("day", DataType::Date32, false),
+        Field::new("qty", DataType::Int64, false),
+    ]));
+    let n = 50;
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(LargeStringArray::from(
+                (0..n).map(|i| format!("rust {i}")).collect::<Vec<_>>(),
+            )),
+            Arc::new(Date32Array::from(
+                (0..n).map(|i| FIRST_DAY + i % 5).collect::<Vec<_>>(),
+            )),
+            Arc::new(Int64Array::from(
+                (0..n).map(|i| i64::from(i % 7)).collect::<Vec<_>>(),
+            )),
+        ],
+    )
+    .expect("batch");
+    for (table, spec) in [
+        ("plain", IndexSpec::new().fts("title")),
+        (
+            "ranged",
+            IndexSpec::new().fts("title").range("day").range("qty"),
+        ),
+    ] {
+        db.create_table(table, Arc::clone(&schema), spec)
+            .expect("create")
+            .append(&batch)
+            .expect("append");
+        db.apply_schema(
+            table,
+            &SchemaPatch::new(vec![
+                FieldPatch::named("day").with_type(DataType::Timestamp(TimeUnit::Nanosecond, None)),
+                FieldPatch::named("qty").with_type(DataType::Float64),
+            ]),
+            None,
+        )
+        .expect("retype");
+    }
+    let search = "SELECT title FROM bm25_search('{t}', 'title', 'rust', 100)";
+    let queries = [
+        format!("{search} WHERE day = TIMESTAMP '2022-01-08 00:00:00' ORDER BY title"),
+        format!("{search} WHERE qty = 3.0 ORDER BY title"),
+    ];
+    for query in &queries {
+        let plain = answer(&db, query, "plain");
+        assert!(
+            plain.matches("rust").count() > 1,
+            "premise: {query}: {plain}"
+        );
+        assert_eq!(answer(&db, query, "ranged"), plain, "{query}");
+    }
 }
 
 /// Superfiles of a single row each, as a writer committing one document at

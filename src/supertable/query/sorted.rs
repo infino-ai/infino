@@ -70,11 +70,11 @@ impl SupertableReader {
                 "sorted_search: column '{column}' has no range index"
             )));
         };
-        let Some(kind) = KeyKind::of(data_type) else {
+        if KeyKind::of(data_type).is_none() {
             return Err(QueryError::InvalidQuery(format!(
                 "sorted_search: column '{column}' is not of a range-indexed type"
             )));
-        };
+        }
         if k == 0 {
             return Ok(Some(Vec::new()));
         }
@@ -90,36 +90,40 @@ impl SupertableReader {
             .cloned()
             .map(|e| (e, ()))
             .collect();
+        let data_type = data_type.clone();
         let body = move |r: Arc<SuperfileReader>,
                          entry: Arc<SuperfileEntry>,
                          tombstone_cache: Option<Arc<SidecarCache>>,
                          now: Instant,
-                         _: ()| async move {
-            let deleted = match &tombstone_cache {
-                Some(cache) => tombstone_deny_set(cache, entry.superfile_id, now)?,
-                None => None,
-            };
-            let none = RoaringBitmap::new();
-            let ends = r
-                .range_ends(
-                    field,
-                    kind,
-                    (0, u64::MAX),
-                    k,
-                    descending,
-                    deleted.as_deref().unwrap_or(&none),
-                )
-                .await
-                .map_err(QueryError::from)?;
-            let Some(ends) = ends.filter(|ends| ends.ties_in_id_order) else {
-                return Ok::<Option<Candidates>, QueryError>(None);
-            };
-            let keys: Vec<u64> = ends.pairs.iter().map(|(key, _)| *key).collect();
-            let hits = tag_hits(
-                &entry,
-                ends.pairs.iter().map(|(_, row)| (*row, 0.0)).collect(),
-            );
-            Ok(Some(keys.into_iter().zip(hits).collect()))
+                         _: ()| {
+            let data_type = data_type.clone();
+            async move {
+                let deleted = match &tombstone_cache {
+                    Some(cache) => tombstone_deny_set(cache, entry.superfile_id, now)?,
+                    None => None,
+                };
+                let none = RoaringBitmap::new();
+                let ends = r
+                    .range_ends(
+                        field,
+                        &data_type,
+                        (0, u64::MAX),
+                        k,
+                        descending,
+                        deleted.as_deref().unwrap_or(&none),
+                    )
+                    .await
+                    .map_err(QueryError::from)?;
+                let Some(ends) = ends.filter(|ends| ends.ties_in_id_order) else {
+                    return Ok::<Option<Candidates>, QueryError>(None);
+                };
+                let keys: Vec<u64> = ends.pairs.iter().map(|(key, _)| *key).collect();
+                let hits = tag_hits(
+                    &entry,
+                    ends.pairs.iter().map(|(_, row)| (*row, 0.0)).collect(),
+                );
+                Ok(Some(keys.into_iter().zip(hits).collect()))
+            }
         };
         let per_superfile = dispatch::fanout_with(self, units, true, self.open_intent(), body)
             .instrument(detail_span!("sorted.fanout"))

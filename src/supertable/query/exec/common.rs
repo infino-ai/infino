@@ -564,9 +564,13 @@ pub(crate) fn candidate_plan_for_filters(
         .map(|c| c.column.as_str())
         .collect();
     let range_cols = manifest.table_schema().range_column_types();
-    CandidatePlan::from_filters(filters, &fts_cols, &range_cols, &|col| {
-        manifest.try_fts_tokenizer_for(col)
-    })
+    CandidatePlan::from_filters(
+        filters,
+        &fts_cols,
+        &range_cols,
+        &|col| manifest.try_fts_tokenizer_for(col),
+        &|col| manifest.field_id(col),
+    )
 }
 
 /// The exact `WHERE` a search table function was handed, ready to run

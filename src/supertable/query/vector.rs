@@ -139,7 +139,7 @@ use crate::{
                 SCORE_COLUMN, id_score_batch, resolve_hits_named, take_rows_byte_source,
             },
             fine_graph_cache::{self, FineNodeKey, GraphRole},
-            fts::{memo_from_locations, memos_from_plan_locations},
+            fts::{evaluate_with_locations, memo_from_locations},
             provider::prune_leaves_for_filters,
             prune::{PruneLeaf, select_superfiles},
             superfile_reader::OpenTierCounts,
@@ -7258,11 +7258,7 @@ impl SupertableReader {
                     .map_err(QueryError::from)?;
                 // The predicate-resolution leg of filtered vector search
                 // is FTS work like any other; flush it per superfile.
-                if let Some(stats) = &op_stats {
-                    stats.add_fts_postings_bytes(work.postings_bytes);
-                    stats.add_planned_read_ranges(work.planned_ranges);
-                    stats.add_kernel_cpu_ns(work.kernel_cpu_ns);
-                }
+                work.add_to(op_stats.as_deref());
                 Ok(docs.into_iter().map(RowId::get).collect::<RoaringBitmap>())
             }
         })
@@ -8221,11 +8217,13 @@ impl SupertableReader {
     /// row must never be a kNN candidate).
     ///
     /// The caller passes a plan that is bounded as lowered, and for a plan
-    /// without a `LIKE` leaf `evaluate` therefore returns `Some(bitmap)`
-    /// for every superfile — a `None` there is a planner bug and is
-    /// reported as one. A `LIKE` leaf is bound per superfile: a token that
-    /// widens past the dictionary cap in *this* superfile makes `evaluate`
-    /// return `None` there, meaning the index constrains nothing for that
+    /// without a `LIKE` or range leaf `evaluate` therefore returns
+    /// `Some(bitmap)` for every superfile — a `None` there is a planner bug
+    /// and is reported as one. A `LIKE` leaf is bound per superfile: a token
+    /// that widens past the dictionary cap in *this* superfile makes
+    /// `evaluate` return `None` there. So does a range leaf on a superfile
+    /// with no range index for the column, or one keyed by the column's
+    /// earlier type. Either way the index constrains nothing for that
     /// superfile, so every one of its rows stays a kNN candidate — the
     /// `FilterExec` above the TVF re-applies the exact predicate. Treating
     /// it as the empty set would drop matching rows.
@@ -8235,7 +8233,7 @@ impl SupertableReader {
         plan: &CandidatePlan,
     ) -> Result<HashMap<SuperfileUri, Arc<RoaringBitmap>>, QueryError> {
         let plan_arc = Arc::new(plan.clone());
-        let unbounded_is_legitimate = plan.has_like();
+        let unbounded_is_legitimate = plan.may_evaluate_unbounded();
         let op_stats = self.op_stats.clone();
         // A `LIKE` leaf's dictionary walk is CPU work: it runs on the reader
         // pool, not on the tokio worker driving this fan-out.
@@ -8249,18 +8247,15 @@ impl SupertableReader {
             let reader_pool = Arc::clone(&reader_pool);
             let locations = Arc::clone(&locations);
             async move {
-                let memos = memos_from_plan_locations(&r, &locations, entry.superfile_id).await;
-                let (bitmap, work) = plan
-                    .evaluate(r.as_ref(), Some(&reader_pool), &memos)
-                    .await
-                    .map_err(QueryError::from)?;
-                // The SQL predicate's posting walks, summed across the
-                // plan tree — the pushdown leg of the vector TVF.
-                if let Some(stats) = &op_stats {
-                    stats.add_fts_postings_bytes(work.postings_bytes);
-                    stats.add_planned_read_ranges(work.planned_ranges);
-                    stats.add_kernel_cpu_ns(work.kernel_cpu_ns);
-                }
+                let bitmap = evaluate_with_locations(
+                    &plan,
+                    r.as_ref(),
+                    &reader_pool,
+                    &locations,
+                    entry.superfile_id,
+                    op_stats.as_deref(),
+                )
+                .await?;
                 match bitmap {
                     Some(bitmap) => Ok(bitmap),
                     None if unbounded_is_legitimate => {
@@ -15170,9 +15165,13 @@ mod tests {
         let manifest = reader.manifest();
         let fts_cols: HashSet<&str> = HashSet::from(["title"]);
         let filters = [col("title").eq(lit("doc"))];
-        let plan = CandidatePlan::from_filters(&filters, &fts_cols, &RangeColumns::new(), &|col| {
-            manifest.try_fts_tokenizer_for(col)
-        });
+        let plan = CandidatePlan::from_filters(
+            &filters,
+            &fts_cols,
+            &RangeColumns::new(),
+            &|col| manifest.try_fts_tokenizer_for(col),
+            &|col| manifest.field_id(col),
+        );
 
         let mut q = vec![0.0f32; dim];
         q[0] = 1.0;

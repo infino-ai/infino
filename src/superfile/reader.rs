@@ -81,7 +81,7 @@ use crate::{
         },
         id_space::{FtsDocId, RowId},
         ids::{self, PackedIds},
-        range::{KeyKind, RangeDirectory},
+        range::{KeyKind, RangeDirectory, same_keys},
         vector::{
             layout::VectorLayout,
             reader::{self as vector_reader, ProbeTally, ScanCandidate, ScanOutcome, VectorReader},
@@ -89,7 +89,7 @@ use crate::{
     },
     supertable::{
         query::{df_object_store::merged_within, provider::tombstone_access_plan},
-        schema::FieldId,
+        schema::{FieldId, field_id_of},
     },
     utils::terms::DictEntry,
 };
@@ -1613,21 +1613,35 @@ impl SuperfileReader {
     }
 
     /// The range index's directory and the column's id in it, when the
-    /// superfile range-indexes the column with table id `field` with keys of
-    /// `kind`. The column is found by its id, not its name, so a file written
-    /// before a rename still serves it, and one written before the name was
-    /// dropped and reused does not. `None` otherwise — no region, the column
-    /// not in it, or keyed another way (a file written before the column's
-    /// type changed) — and the caller scans the column. The directory is
-    /// fetched once per reader.
+    /// superfile range-indexes the column with table id `field` with keys
+    /// that mean what keys of `data_type`, the column's type now, do. The
+    /// column is found by its id, not its name, so a file written before a
+    /// rename still serves it, and one written before the name was dropped
+    /// and reused does not. `None` otherwise — no region, the column not in
+    /// it, or keyed another way (a file written before the column's type
+    /// changed, e.g. days before a change to nanoseconds) — and the caller
+    /// scans the column. The directory is fetched once per reader.
     async fn range_column(
         &self,
         field: FieldId,
-        kind: KeyKind,
+        data_type: &DataType,
     ) -> Result<Option<(Arc<RangeDirectory>, u32)>, ReadError> {
         let Some(loc) = self.range_region else {
             return Ok(None);
         };
+        let Some(kind) = KeyKind::of(data_type) else {
+            return Ok(None);
+        };
+        // The type this file wrote the column with, which its keys follow.
+        let written_with = self
+            .schema()
+            .fields()
+            .iter()
+            .find(|f| field_id_of(f) == Some(field))
+            .map(|f| f.data_type());
+        if !written_with.is_some_and(|t| same_keys(t, data_type)) {
+            return Ok(None);
+        }
         let directory = self
             .range_directory
             .get_or_try_init(|| async {
@@ -1672,15 +1686,15 @@ impl SuperfileReader {
 
     /// An estimate of the rows whose key lies in `lo..=hi`, from the range
     /// index's directory alone (see `RangeColumn::estimate`); `None` when
-    /// the superfile does not range-index the column with keys of `kind`.
+    /// the superfile does not range-index the column with keys of `data_type`.
     pub(crate) async fn range_estimate(
         &self,
         field: FieldId,
-        kind: KeyKind,
+        data_type: &DataType,
         lo: u64,
         hi: u64,
     ) -> Result<Option<u64>, ReadError> {
-        let Some((directory, field_id)) = self.range_column(field, kind).await? else {
+        let Some((directory, field_id)) = self.range_column(field, data_type).await? else {
             return Ok(None);
         };
         Ok(directory.column(field_id).map(|c| c.estimate(lo, hi)))
@@ -1689,16 +1703,16 @@ impl SuperfileReader {
     /// The rows whose key lies in `lo..=hi`, read from the range
     /// index: one read of the blocks the range reaches, decoded on `pool`.
     /// `None` when the superfile does not range-index the column with keys of
-    /// `kind`; the caller scans the column.
+    /// `data_type`; the caller scans the column.
     pub(crate) async fn range_rows(
         &self,
         field: FieldId,
-        kind: KeyKind,
+        data_type: &DataType,
         lo: u64,
         hi: u64,
         pool: Option<&ThreadPool>,
     ) -> Result<Option<RoaringBitmap>, ReadError> {
-        let Some((directory, field_id)) = self.range_column(field, kind).await? else {
+        let Some((directory, field_id)) = self.range_column(field, data_type).await? else {
             return Ok(None);
         };
         let Some(loc) = self.range_region else {
@@ -1736,17 +1750,17 @@ impl SuperfileReader {
     /// are read from its near end, one at a time, until `k` rows are found,
     /// so the read is a block or two however wide the interval. Fewer than
     /// `k` when the interval holds fewer. `None` when the superfile does
-    /// not range-index the column with keys of `kind`.
+    /// not range-index the column with keys of `data_type`.
     pub(crate) async fn range_ends(
         &self,
         field: FieldId,
-        kind: KeyKind,
+        data_type: &DataType,
         (lo, hi): (u64, u64),
         k: usize,
         descending: bool,
         skip: &RoaringBitmap,
     ) -> Result<Option<RangeEnds>, ReadError> {
-        let Some((directory, field_id)) = self.range_column(field, kind).await? else {
+        let Some((directory, field_id)) = self.range_column(field, data_type).await? else {
             return Ok(None);
         };
         let Some(loc) = self.range_region else {
@@ -1816,15 +1830,15 @@ impl SuperfileReader {
     /// How many rows' keys lie in `lo..=hi`, from the range index:
     /// the blocks wholly inside the range count from the directory, and only
     /// the blocks it cuts — at most two — are read. `None` when the
-    /// superfile does not range-index the column with keys of `kind`.
+    /// superfile does not range-index the column with keys of `data_type`.
     pub(crate) async fn range_count(
         &self,
         field: FieldId,
-        kind: KeyKind,
+        data_type: &DataType,
         lo: u64,
         hi: u64,
     ) -> Result<Option<u64>, ReadError> {
-        let Some((directory, field_id)) = self.range_column(field, kind).await? else {
+        let Some((directory, field_id)) = self.range_column(field, data_type).await? else {
             return Ok(None);
         };
         let Some(loc) = self.range_region else {

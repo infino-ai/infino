@@ -193,7 +193,6 @@ mod tests {
     use crate::{
         config::OptimizeOptions,
         storage::{LocalFsStorageProvider, StorageProvider},
-        superfile::range::KeyKind,
         supertable::{
             Supertable, SupertableOptions, SupertableReader, query::scalar_cache::ByteLru,
         },
@@ -352,7 +351,7 @@ mod tests {
             let ends = runtime
                 .block_on(file.range_ends(
                     field,
-                    KeyKind::Signed,
+                    &DataType::Int64,
                     (0, u64::MAX),
                     1,
                     false,
