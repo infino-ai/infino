@@ -216,7 +216,7 @@ use crate::{
         },
         reader_cache::{
             DiskCacheStore, ReadIntent,
-            disk::{ScratchCharge, mmap_temp_file_bytes, temp_file_behind},
+            disk::{DiskCharge, mmap_temp_file_bytes, temp_file_behind},
         },
         schema::{
             DECIMAL128_PRECISION, DECIMAL128_SCALE, FieldId, LegacyNames, PhysicalSchema,
@@ -5941,7 +5941,7 @@ fn dir_bytes(dir: &Path) -> u64 {
 /// When the budget cannot hold it, the drain stops at its last checkpoint
 /// and resumes from there once there is room.
 async fn charge_drain_scratch(
-    charge: &mut Option<ScratchCharge>,
+    charge: &mut Option<DiskCharge>,
     scratch: &Path,
     more: u64,
     before: &str,
@@ -6731,7 +6731,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         .options
         .disk_cache
         .as_ref()
-        .map(|cache| cache.scratch_charge());
+        .map(|cache| cache.disk_charge());
     let mut local_checkpoint =
         load_drain_local_checkpoint(&drain_scratch, &remote_state.checkpoint.epoch_id)?
             .unwrap_or_else(|| DrainLocalCheckpoint::new(remote_state.checkpoint.epoch_id.clone()));
@@ -16808,7 +16808,7 @@ mod tests {
         .expect_err("the batch does not fit the budget");
         assert!(err.to_string().contains("disk budget"), "{err}");
         assert_eq!(
-            cache.scratch_bytes.load(Ordering::Acquire),
+            cache.outside_bytes.load(Ordering::Acquire),
             0,
             "nothing stays charged"
         );
@@ -16909,7 +16909,7 @@ mod tests {
         // The drain's scratch was charged to the table's disk budget while it
         // ran, and every byte of it was given back once it finished.
         let cache = options.disk_cache.as_ref().expect("disk cache");
-        assert_eq!(cache.scratch_bytes.load(Ordering::Acquire), 0);
+        assert_eq!(cache.outside_bytes.load(Ordering::Acquire), 0);
         cache.assert_budget_consistent();
     }
 

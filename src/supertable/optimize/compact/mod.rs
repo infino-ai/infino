@@ -70,7 +70,7 @@ use crate::{
         query::{dispatch::open_whole_superfile, vector},
         reader_cache::{
             SuperfileReaderCache,
-            disk::{ScratchCharge, mmap_temp_file_bytes},
+            disk::{DiskCharge, mmap_temp_file_bytes},
         },
         schema::{FieldId, PhysicalSchema, TableSchema, map::FileSchemaMap},
         wal::{
@@ -1207,7 +1207,7 @@ impl Supertable {
         // hold leaves nothing to undo.
         let scratch = match opts.disk_cache.as_ref() {
             Some(cache) => {
-                let mut charge = cache.scratch_charge();
+                let mut charge = cache.disk_charge();
                 charge
                     .set(job.estimated_output_bytes)
                     .await
@@ -2587,7 +2587,7 @@ pub(crate) struct PreparedJob {
     term_contributions: Vec<TermContribution>,
     /// The merged output's charge on the table's disk budget, given back
     /// when the job is dropped after its commit.
-    _scratch: Option<ScratchCharge>,
+    _scratch: Option<DiskCharge>,
 }
 
 /// Re-stamps a batch's seals once the uploads are behind it.

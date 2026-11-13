@@ -726,13 +726,13 @@ impl DiskCacheStore {
             .iter()
             .map(|f| f.value().reserved.load(Ordering::Acquire))
             .sum();
-        let scratch = self.scratch_bytes.load(Ordering::Acquire);
+        let outside = self.outside_bytes.load(Ordering::Acquire);
         assert_eq!(
             self.current_bytes.load(Ordering::Acquire),
-            entries + unindexed + block_files + fills + scratch,
+            entries + unindexed + block_files + fills + outside,
             "budget ledger drifted from what the cache holds (entries {entries}, \
              unindexed {unindexed}, block files {block_files}, fills {fills}, \
-             scratch {scratch})"
+             outside {outside})"
         );
     }
 
@@ -776,29 +776,30 @@ impl Drop for BlockWriteTicket {
     }
 }
 
-/// Scratch bytes charged to a cache's budget: files a table's builds write
-/// beside its cache (a drain's spill, a merge's output), which take the same
-/// disk the cache does. One budget covers both, so making room for scratch
-/// evicts cache files, and scratch never goes past what the budget leaves.
-/// The charge follows what the scratch holds through [`Self::set`] and is
-/// given back when dropped.
-pub(crate) struct ScratchCharge {
+/// Bytes charged to a cache's budget for files the table keeps beside the
+/// cache on the same disk: its scratch (a drain's spill, a merge's output)
+/// and its metadata cache. One budget covers them and the cache's own
+/// files, so making room for them evicts cache files, and together they
+/// never take more disk than the budget. The charge follows what the files
+/// hold through [`Self::set`] and is given back when dropped.
+pub(crate) struct DiskCharge {
     store: Arc<DiskCacheStore>,
     bytes: u64,
 }
 
 impl DiskCacheStore {
-    /// An empty charge on this cache's budget, for scratch to grow into.
-    pub(crate) fn scratch_charge(self: &Arc<Self>) -> ScratchCharge {
-        ScratchCharge {
+    /// An empty charge on this cache's budget, for files beside it to grow
+    /// into.
+    pub(crate) fn disk_charge(self: &Arc<Self>) -> DiskCharge {
+        DiskCharge {
             store: Arc::clone(self),
             bytes: 0,
         }
     }
 }
 
-impl ScratchCharge {
-    /// Charge `bytes`, what the scratch is about to hold. Growing evicts
+impl DiskCharge {
+    /// Charge `bytes`, what the files are about to hold. Growing evicts
     /// cache files, least recently used first, until it fits; shrinking
     /// gives the difference back. `BudgetExceeded` when the budget cannot
     /// hold it even with every evictable file gone, the charge unchanged.
@@ -806,7 +807,7 @@ impl ScratchCharge {
         if bytes > self.bytes {
             let grow = bytes - self.bytes;
             self.store.reserve_manual(grow).await?;
-            self.store.scratch_bytes.fetch_add(grow, Ordering::AcqRel);
+            self.store.outside_bytes.fetch_add(grow, Ordering::AcqRel);
         } else {
             self.release(self.bytes - bytes);
         }
@@ -821,12 +822,12 @@ impl ScratchCharge {
     }
 
     fn release(&self, bytes: u64) {
-        self.store.scratch_bytes.fetch_sub(bytes, Ordering::AcqRel);
+        self.store.outside_bytes.fetch_sub(bytes, Ordering::AcqRel);
         self.store.current_bytes.fetch_sub(bytes, Ordering::Release);
     }
 }
 
-impl Drop for ScratchCharge {
+impl Drop for DiskCharge {
     fn drop(&mut self) {
         self.release(self.bytes);
     }
@@ -1155,7 +1156,7 @@ mod tests {
         assert_eq!(store.stats().current_bytes, 2 * file);
 
         // Scratch for one file's worth evicts a cached file to fit.
-        let mut charge = store.scratch_charge();
+        let mut charge = store.disk_charge();
         charge.set(file).await.expect("room made");
         assert_eq!(charge.bytes(), file);
         assert_eq!(store.stats().current_bytes, 2 * file, "still one budget");
