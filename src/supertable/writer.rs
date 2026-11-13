@@ -16449,21 +16449,24 @@ mod tests {
     }
 
     /// Compaction that runs while a row-limited drain is stopped partway must
-    /// not merge that drain's sources with later commits: the merged file
-    /// would carry a version the drain then marks drained, and the later
-    /// commits' rows would never reach the hidden index. Every row does.
+    /// leave that drain's sources alone. Merged with a later commit, a source
+    /// would hand the merged file a version the drain then marks drained, and
+    /// the later rows would never reach the hidden index; merged with another
+    /// of its sources, it would leave the manifest, and the resumed drain,
+    /// which looks its sources up there, would fail on every attempt. The
+    /// drain here has two sources, so both can happen. Every row lands.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn compaction_during_a_stopped_drain_keeps_every_row() {
-        const COMMITS: usize = 4;
+        const COMMITS: usize = 5;
         let directory = TempDir::new().expect("tempdir");
         let storage: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(directory.path()).expect("provider"));
-        // One commit per drain, one superfile per batch.
+        // Two commits per drain, one superfile per batch.
         let table = Supertable::create(
             options_title_emb_serial(COMMIT_AS_DRAIN_TEST_DIM)
                 .with_storage(Arc::clone(&storage))
                 .with_drain_batch_superfiles(1)
-                .with_drain_max_rows(COMMIT_AS_DRAIN_TEST_ROWS as u64),
+                .with_drain_max_rows(2 * COMMIT_AS_DRAIN_TEST_ROWS as u64),
         )
         .expect("create");
         for _ in 0..COMMITS {
@@ -16496,7 +16499,7 @@ mod tests {
         let pending = pending_drain_sources(hidden.inner())
             .await
             .expect("pending");
-        assert_eq!(pending.len(), 1, "the drain took the oldest commit only");
+        assert_eq!(pending.len(), 2, "the drain took the two oldest commits");
 
         // Compact everything that may be merged while the drain is stopped.
         table

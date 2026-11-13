@@ -234,12 +234,15 @@ impl SuperfileStats {
     }
 }
 
-/// Split merge candidates into the groups a merge must not cross: inputs
-/// whose `birth_version` the hidden index has already drained, inputs of the
-/// drain in progress (`pending_epoch`, its sources by id), and every other
-/// undrained input. A merged superfile is stamped with the OLDEST input
-/// `birth_version` (see `run_compaction_job`), and the drain marks versions
-/// drained, not superfiles:
+/// Split merge candidates into the groups a merge may draw from, leaving
+/// out what no merge may touch: inputs whose `birth_version` the hidden
+/// index has already drained, and every other undrained input. The sources
+/// of the drain in progress (`pending_epoch`, by id) are in neither, so they
+/// are not merged at all until that drain finishes.
+///
+/// A merged superfile is stamped with the OLDEST input `birth_version` (see
+/// `run_compaction_job`), and the drain marks versions drained, not
+/// superfiles:
 ///
 /// - a job mixing drained and undrained inputs would inherit a drained
 ///   version, and the drain's `!drained.contains(birth_version)` filter
@@ -247,25 +250,24 @@ impl SuperfileStats {
 ///   hidden index (a permanent recall hole);
 /// - a job mixing the drain in progress with later inputs would inherit a
 ///   version that drain is about to mark drained, though it drains only its
-///   own sources, with the same result for the later inputs.
+///   own sources, with the same result for the later inputs;
+/// - a job merging the drain in progress's own sources would remove them
+///   from the manifest, and a resumed drain looks each of its sources up
+///   there by id: it would fail on every attempt and never finish.
 ///
-/// Merging within a group is safe: all-drained stays drained, the drain in
-/// progress reads its sources as they were, and the rest keep an undrained
-/// version and are drained as one source.
+/// Merging within either group is safe: all-drained stays drained, and the
+/// rest keep an undrained version and are drained as one source.
 pub(super) fn split_stats_by_drain_state(
     stats: Vec<SuperfileStats>,
     drained: &DrainedVersionRanges,
     pending_epoch: &HashSet<Uuid>,
-) -> [Vec<SuperfileStats>; 3] {
-    let mut groups: [Vec<SuperfileStats>; 3] = Default::default();
+) -> [Vec<SuperfileStats>; 2] {
+    let mut groups: [Vec<SuperfileStats>; 2] = Default::default();
     for s in stats {
-        let group = if drained.contains(s.birth_version) {
-            0
-        } else if pending_epoch.contains(&s.superfile_id) {
-            1
-        } else {
-            2
-        };
+        if pending_epoch.contains(&s.superfile_id) {
+            continue;
+        }
+        let group = usize::from(!drained.contains(s.birth_version));
         groups[group].push(s);
     }
     groups
@@ -688,9 +690,8 @@ pub(in crate::supertable::optimize::compact) mod tests {
         assert_eq!(mixed.len(), 1);
         assert_eq!(mixed[0].inputs.len(), 3, "guard: unsplit selection mixes");
 
-        let [drained_side, pending_side, undrained_side] =
+        let [drained_side, undrained_side] =
             split_stats_by_drain_state(all, &drained, &HashSet::new());
-        assert!(pending_side.is_empty(), "no drain in progress");
         assert_eq!(
             drained_side
                 .iter()
@@ -712,7 +713,7 @@ pub(in crate::supertable::optimize::compact) mod tests {
     }
 
     #[test]
-    fn a_merge_never_crosses_the_drain_in_progress() {
+    fn the_drain_in_progress_is_left_out_of_every_merge() {
         let drained = DrainedVersionRanges::from_intervals(vec![(0, 10)]).expect("ranges");
         let at = |id: u128, version: u64| {
             let mut s = seg(id, 1, 1000, 0);
@@ -726,24 +727,24 @@ pub(in crate::supertable::optimize::compact) mod tests {
         let ids = |group: &[SuperfileStats]| -> Vec<u128> {
             group.iter().map(|s| s.superfile_id.as_u128()).collect()
         };
-        let [drained_side, pending_side, rest] =
-            split_stats_by_drain_state(all, &drained, &pending);
+        let [drained_side, rest] = split_stats_by_drain_state(all, &drained, &pending);
         assert_eq!(ids(&drained_side), vec![1]);
-        assert_eq!(ids(&pending_side), vec![2, 3]);
-        assert_eq!(ids(&rest), vec![4, 5]);
+        assert_eq!(
+            ids(&rest),
+            vec![4, 5],
+            "the drain's own sources are in no group"
+        );
 
         let cfg = CompactionSettings {
             target_superfile_size_mb: 2048,
             min_fill_percent: 0,
             ..CompactionSettings::default()
         };
-        for group in [&pending_side, &rest] {
-            let jobs = select(group, &cfg);
-            assert_eq!(jobs.len(), 1, "each group merges its own two inputs");
-            let mut inputs: Vec<u128> = jobs[0].inputs.iter().map(|id| id.as_u128()).collect();
-            inputs.sort_unstable();
-            assert_eq!(inputs, ids(group));
-        }
+        let jobs = select(&rest, &cfg);
+        assert_eq!(jobs.len(), 1);
+        let mut inputs: Vec<u128> = jobs[0].inputs.iter().map(|id| id.as_u128()).collect();
+        inputs.sort_unstable();
+        assert_eq!(inputs, vec![4, 5]);
     }
 
     pub(in crate::supertable::optimize::compact) fn default_cfg() -> CompactionSettings {

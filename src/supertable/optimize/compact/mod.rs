@@ -729,12 +729,14 @@ impl Supertable {
                 );
             }
 
-            // A user table with a hidden vector index selects jobs within each
-            // drain group (drained, the drain in progress, the rest), never
-            // across them (see [`split_stats_by_drain_state`] for why a mixed
-            // merge loses vectors). Tables without a hidden sibling select over
+            // A user table with a hidden vector index selects jobs within the
+            // drained group and within the undrained one, never across them,
+            // and leaves the sources of a drain in progress out of both (see
+            // [`split_stats_by_drain_state`] for why either would lose
+            // vectors). Tables without a hidden sibling select over
             // everything. When the drain in progress cannot be read, only the
-            // drained group is merged: an undrained merge might cross it.
+            // drained group is merged: an undrained merge might take its
+            // sources.
             let stat_groups: Vec<Vec<SuperfileStats>> = match inner.vector_index_table.as_ref() {
                 Some(hidden) => {
                     let drained = hidden.inner().manifest.load_full().get_drained_ranges();
@@ -744,7 +746,7 @@ impl Supertable {
                             warn!(
                                 "compaction: the drain in progress could not be read ({error}); merging only drained superfiles this pass"
                             );
-                            let [drained_stats, ..] =
+                            let [drained_stats, _] =
                                 split_stats_by_drain_state(stats, &drained, &HashSet::new());
                             vec![drained_stats]
                         }
