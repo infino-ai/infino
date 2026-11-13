@@ -272,6 +272,7 @@ class OptimizeOptions:
         target_superfile_size_mb: int | None = ...,
         stale_seal_timeout_ms: int | None = ...,
         recalibrate: Literal["auto", "force", "skip"] | None = ...,
+        # max_memory_mb: deprecated old name of max_merge_input_mb; honoured when that is absent.
         max_memory_mb: int | None = ...,
     ) -> None: ...
 
