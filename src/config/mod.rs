@@ -1605,10 +1605,11 @@ pub struct StorageSettings {
     /// in a `manifest-parts/` subdirectory of `disk_cache_root`. The
     /// loader reads part bytes from local disk on a hit instead of
     /// fetching from object storage. Independent of `disk_budget_bytes`
-    /// (which sizes the superfile-content cache). Default 2 GiB. The cache
-    /// grows past this to hold the table's current manifest whole (a
-    /// hidden vector index's cache, its state and centroid section), and
-    /// shrinks back as they do.
+    /// (which sizes the superfile-content cache). Default 2 GiB. This is
+    /// the working room for objects fetched a piece at a time (the term
+    /// index's slices); on top of it the cache holds the table's current
+    /// manifest whole (a hidden vector index's cache, its state and
+    /// centroid section), growing and shrinking with them.
     pub manifest_disk_budget_bytes: u64,
     pub cold_fetch_mode: StorageColdFetchMode,
     pub cold_fetch_streams: usize,

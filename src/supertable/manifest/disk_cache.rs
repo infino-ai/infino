@@ -146,7 +146,9 @@ pub struct MetadataCacheStats {
 /// blocking task. A `get` verifies the bytes (blake3) in that same task.
 pub struct MetadataDiskCache {
     cache_root: PathBuf,
-    /// The budget the cache was opened with.
+    /// The budget the cache was opened with: working room for the objects
+    /// fetched a piece at a time (the term index's slices), on top of what
+    /// it holds whole.
     configured_bytes: u64,
     /// Bytes to hold for each [`CacheHold`], set to the latest size of that
     /// object, so the budget follows the objects as they grow and shrink.
@@ -694,14 +696,14 @@ impl MetadataDiskCache {
         }
     }
 
-    /// The current byte budget: the configured budget, or what the held
-    /// objects need ([`Self::hold`]) when that is more.
+    /// The current byte budget: what the held objects need ([`Self::hold`])
+    /// plus the configured budget, which stays free for objects fetched a
+    /// piece at a time however large the held ones are.
     pub fn budget_bytes(&self) -> u64 {
-        let held = CacheHold::ALL
+        CacheHold::ALL
             .iter()
             .map(|what| self.holds[what.slot()].load(Ordering::Acquire))
-            .fold(0u64, u64::saturating_add);
-        self.configured_bytes.max(held)
+            .fold(self.configured_bytes, u64::saturating_add)
     }
 
     /// Hold `what`, now `bytes` long, whole: the budget covers it plus
@@ -872,17 +874,16 @@ mod tests {
         let root = tmp_root("hold-budget");
         let _ = fs::remove_dir_all(&root);
         let cache = MetadataDiskCache::new(root.clone(), 100).expect("cache");
-        // Below the configured budget, the configured budget stands.
-        cache.hold(CacheHold::Manifest, 50);
         assert_eq!(cache.budget_bytes(), 100);
-        // Holds add up, each with a tenth of headroom.
+        // What is held comes on top of the configured budget, each hold with
+        // a tenth of headroom.
         cache.hold(CacheHold::Manifest, 1_000);
-        assert_eq!(cache.budget_bytes(), 1_100);
+        assert_eq!(cache.budget_bytes(), 1_200);
         cache.hold(CacheHold::CentroidSection, 2_000);
-        assert_eq!(cache.budget_bytes(), 3_300);
+        assert_eq!(cache.budget_bytes(), 3_400);
         // A smaller manifest lowers the budget again.
         cache.hold(CacheHold::Manifest, 0);
-        assert_eq!(cache.budget_bytes(), 2_200);
+        assert_eq!(cache.budget_bytes(), 2_300);
         cache.hold(CacheHold::CentroidSection, 0);
         assert_eq!(cache.budget_bytes(), 100);
         let _ = fs::remove_dir_all(&root);
