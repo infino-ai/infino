@@ -277,14 +277,18 @@ impl TierPolicy {
         }
     }
 }
+/// Entries the merge's first round may decode: a query whose first round
+/// alone would pass it is not merged. Sized for a table of tens of
+/// thousands of superfiles: a common term's first round there is one block
+/// of up to 64 entries per superfile, about three million at fifty
+/// thousand, so two such terms merge and a third declines.
+const MAX_FIRST_ROUND_ENTRIES: u64 = 1 << 23;
 /// Entries the merge reads per query before it stops regardless of what is
 /// still in play. What has been read by then still bounds every superfile
-/// soundly; the merge just stops refining. A query whose first round alone
-/// would pass it is not merged. Sized for a table of tens of thousands of
-/// superfiles: a common term's first round there is one block of up to 64
-/// entries per superfile (about three million at fifty thousand), and every
-/// entry read is held, with its contribution, until the merge reports.
-const MAX_ENTRIES_PER_QUERY: u64 = 1 << 23;
+/// soundly; the merge just stops refining. Reads are held only for the
+/// superfiles still in play — a superfile ruled out lets its go — so what
+/// the merge holds at once is well under this.
+const MAX_ENTRIES_PER_QUERY: u64 = 1 << 26;
 /// Superfiles one pool job decodes in a round. A superfile's share of a
 /// round is several microseconds, so jobs this size still dwarf the
 /// pool's scheduling while a round of a hundred superfiles spreads over
@@ -455,6 +459,15 @@ const LEN_BITS: u32 = 8;
 /// pack: the document's phrase bound then falls back to its contribution.
 const TF_UNKNOWN: u32 = u32::MAX >> LEN_BITS;
 
+/// The largest frequency a phrase is bounded at by the kernel's own
+/// arithmetic. The score `idf·tf / (tf + norm)` rises with `tf` by at least
+/// `norm / (tf·(tf + 1 + norm))` of itself per step, with a norm no smaller
+/// than `k1·(1 − b)` (0.3 at the defaults): up to this frequency the step
+/// is more than twice the rounding the arithmetic can add, so a document
+/// at a lower frequency never rounds above the bound. Past it the phrase
+/// is bounded by its members' keys, with slack.
+const PHRASE_TF_EXACT_MAX: u32 = 512;
+
 /// A document's term frequency and one-byte length bucket in one word.
 fn pack_tf_len(tf: u32, len: u8) -> u32 {
     (tf.min(TF_UNKNOWN) << LEN_BITS) | u32::from(len)
@@ -592,11 +605,11 @@ fn read_whole_first(term_sources: &[Source]) -> bool {
     whole <= TIER_FIRST_WAVE_MAX_BYTES
 }
 
-/// Per term and source, whether a live superfile still reads a head from
-/// it: a chunk no live head reads is not fetched.
-fn sources_read_on(slots: &[Slot], sources: &[Vec<Source>]) -> Vec<Vec<bool>> {
+/// Per term and source, whether a superfile still within reach of `bar`
+/// reads a head from it: a chunk no such head reads is not fetched.
+fn sources_read_on(slots: &[Slot], sources: &[Vec<Source>], bar: f32) -> Vec<Vec<bool>> {
     let mut needed: Vec<Vec<bool>> = sources.iter().map(|s| vec![false; s.len()]).collect();
-    for slot in slots.iter().filter(|s| s.live) {
+    for slot in slots.iter().filter(|s| s.reads_on(bar)) {
         for (ti, head) in slot.heads.iter().enumerate() {
             if let (false, Some(si)) = (head.done, head.source) {
                 needed[ti][si] = true;
@@ -807,7 +820,7 @@ pub(crate) async fn prepare_merge<'a>(
     }
 
     // A query whose first round alone would pass the entry cap is not merged.
-    if first_round > MAX_ENTRIES_PER_QUERY {
+    if first_round > MAX_FIRST_ROUND_ENTRIES {
         return Ok(None);
     }
 
@@ -927,7 +940,17 @@ impl PreparedMerge<'_> {
     }
 
     /// Read the chunked heads and merge, round by round.
-    pub(crate) async fn run(self) -> Result<Option<TierSelection>, TermIndexError> {
+    ///
+    /// `floor` reads the running k-th score the opens beside the merge have
+    /// built (`NEG_INFINITY` until they have k): a superfile whose bound is
+    /// at or below it, or below the merge's own threshold, is skipped or
+    /// ruled out whatever more of its heads would show, so the merge reads
+    /// no further for it, and goes on reading only while a round brings
+    /// enough superfiles to that point to pay for itself.
+    pub(crate) async fn run(
+        self,
+        floor: Arc<dyn Fn() -> f32 + Send + Sync>,
+    ) -> Result<Option<TierSelection>, TermIndexError> {
         let PreparedMerge {
             index,
             pool,
@@ -967,10 +990,14 @@ impl PreparedMerge<'_> {
         let mut merge = merge;
         let mut sources = sources;
         for round in 0..max_rounds {
+            // The bar a superfile's bound must clear to still matter: the
+            // merge's threshold, or the floor the opens have built.
+            let bar = merge.theta_lb.max(floor());
+            let reachable: Vec<bool> = merge.slots.iter().map(|s| s.reads_on(bar)).collect();
             // What this round still has to read, per source: a small tier
             // whole in the first wave; of a large one, the chunk at this
-            // round's depth, where a live head still reads it.
-            let needed = sources_read_on(&merge.slots, &sources);
+            // round's depth, where a head still within reach reads it.
+            let needed = sources_read_on(&merge.slots, &sources, bar);
             let reads: Vec<(usize, usize, Range<usize>)> = sources
                 .iter()
                 .enumerate()
@@ -1016,7 +1043,7 @@ impl PreparedMerge<'_> {
                             (0..merge.slots.len()).map(|_| Vec::new()).collect();
                         let mut read_any = false;
                         for (slot_i, slot) in merge.slots.iter_mut().enumerate() {
-                            if !slot.live {
+                            if !slot.reads_on(bar) {
                                 continue;
                             }
                             for (ti, state) in slot.heads.iter_mut().enumerate() {
@@ -1056,15 +1083,6 @@ impl PreparedMerge<'_> {
                             let started = Instant::now();
                             let excluded = merge.round(&reads);
                             let round_ns = started.elapsed().as_nanos() as u64;
-                            // Worth reading on: the opens this round saved, at what
-                            // an open costs here, cover what the round cost. With
-                            // the open cost unknown, any exclusion is taken as worth
-                            // it. A round that found no threshold saved nothing and
-                            // is not read past: the joint documents a conjunction
-                            // needs for one sit deeper than the heads' top blocks,
-                            // and reading on for them has bought nothing where it
-                            // was measured.
-                            let worth = pays(excluded as u64, 1, open_cost_ns, round_ns);
                             // A required term whose head the index holds whole
                             // settles, read to its end, which documents carry the
                             // term — ruling out, or answering for, every live
@@ -1085,20 +1103,7 @@ impl PreparedMerge<'_> {
                                 let live = merge.slots.iter().filter(|s| s.live).count() as u64;
                                 pays(live, u64::from(rounds), open_cost_ns, round_ns)
                             });
-                            let read_on = worth || settling;
-                            tracing::debug!(
-                                round,
-                                excluded,
-                                live = merge.slots.iter().filter(|s| s.live).count(),
-                                theta = merge.theta_lb,
-                                entries = merge.entries_read,
-                                round_us = round_ns / 1000,
-                                open_cost_us = open_cost_ns / 1000,
-                                settling,
-                                read_on,
-                                "tier merge round"
-                            );
-                            Some((round_ns, read_on))
+                            Some((round_ns, excluded, settling))
                         }
                     };
                     (merge, sources, outcome)
@@ -1107,10 +1112,42 @@ impl PreparedMerge<'_> {
                 .map_err(|e| TermIndexError::Open(QueryError::Internal(e.to_string())))?;
             merge = merge_back;
             sources = sources_back;
-            let Some((round_ns, read_on)) = outcome else {
+            let Some((round_ns, excluded, settling)) = outcome else {
                 break;
             };
             merge_ns += round_ns;
+            // Worth reading on: the superfiles this round brought out of
+            // reach — ruled out, or bounded at or below the bar, so skipped
+            // whatever their heads hold — at what an open costs here, cover
+            // what a round costs; the next round is taken to settle as many
+            // as this one did. With the open cost unknown, any is taken as
+            // worth it. A round that settled none is not read past: on a
+            // query whose best documents are the sum of different
+            // documents' terms, deeper blocks keep every bound above the
+            // bar, and reading them buys nothing.
+            let bar_after = merge.theta_lb.max(floor());
+            let settled = merge
+                .slots
+                .iter()
+                .zip(&reachable)
+                .filter(|(s, was)| **was && !s.reads_on(bar_after))
+                .count() as u64;
+            let worth = pays(settled, 1, open_cost_ns, round_ns);
+            let read_on = worth || settling;
+            tracing::debug!(
+                round,
+                excluded,
+                settled,
+                live = merge.slots.iter().filter(|s| s.live).count(),
+                theta = merge.theta_lb,
+                bar = bar_after,
+                entries = merge.entries_read,
+                round_us = round_ns / 1000,
+                open_cost_us = open_cost_ns / 1000,
+                settling,
+                read_on,
+                "tier merge round"
+            );
             if !read_on || merge.entries_read >= MAX_ENTRIES_PER_QUERY {
                 break;
             }
@@ -1242,6 +1279,12 @@ impl Merge {
                 if slot.live && slot.ub < theta {
                     slot.live = false;
                     excluded += 1;
+                    // Out of play for good: its candidates stay for the
+                    // threshold, its reads are no longer needed.
+                    for h in slot.heads.iter_mut() {
+                        h.docs = Vec::new();
+                        h.pending = Vec::new();
+                    }
                 }
             }
         }
@@ -1276,6 +1319,14 @@ fn kth_candidate(slots: &[Slot], k: usize) -> (Option<f32>, i128) {
 }
 
 impl Slot {
+    /// Whether the merge still reads for the superfile against `bar`, the
+    /// threshold or the floor: it is live and its bound clears the bar. A
+    /// superfile bounded at or below it is ruled out or skipped whatever
+    /// more of its heads would show; the bar only rises, so it stays so.
+    fn reads_on(&self, bar: f32) -> bool {
+        self.live && (self.ub > bar || self.ub.is_nan())
+    }
+
     /// Take in one entry: document `row` read under term `ti` with
     /// contribution `c` and its frequency and length packed by
     /// [`pack_tf_len`]. It waits in the term's pending list until the next
@@ -1470,15 +1521,18 @@ fn merge_sorted(docs: &mut Vec<Read>, incoming: &[Read], scratch: &mut Vec<Read>
 }
 
 /// What phrase `members` (term indices in phrase order, a repeated word
-/// repeated) scores in a document read under every member, as the kernel
-/// scores a phrase: one atom weighted by the members' idf summed in phrase
-/// order, at the phrase's frequency. The phrase occurs at most as often as
-/// its scarcest member allows (a member repeated r times needs r
-/// occurrences per match), and the score rises with frequency, so this is
-/// an upper bound, and the kernel's own score, bit for bit, where the
-/// phrase occurs that often. `None` when a member was not read for the
-/// document or its frequency was too large to keep: the caller then bounds
-/// the phrase by its members' contributions.
+/// repeated) scores at most in a document read under one or more of them,
+/// as the kernel scores a phrase: one atom weighted by the members' idf
+/// summed in phrase order, at the phrase's frequency. Each occurrence of
+/// the phrase puts every member at its own position, one per occurrence
+/// start, so the phrase occurs at most as often as any member does; the
+/// members read for the document give that frequency and the document's
+/// length, and the score rises with frequency, so this is an upper bound —
+/// and the kernel's own score, bit for bit, where the phrase occurs that
+/// often. A member not read for the document needs no frequency: the
+/// phrase cannot occur more often than a read member allows. `None` when
+/// no member was read at a frequency up to [`PHRASE_TF_EXACT_MAX`]: the
+/// caller then bounds the phrase by its members' keys.
 fn phrase_atom_bound(
     members: &[usize],
     mask: TermMask,
@@ -1487,23 +1541,19 @@ fn phrase_atom_bound(
     norm: &[f32; 256],
 ) -> Option<f32> {
     let mut idf_sum = 0.0f32;
-    let mut most = u32::MAX;
-    let mut len = None;
+    let mut most: Option<(u32, u8)> = None;
     for &t in members {
-        if mask & (1 << t) == 0 {
-            return None;
-        }
-        let (tf, l) = unpack_tf_len(tf_len[t]);
-        if tf == TF_UNKNOWN {
-            return None;
-        }
-        let repeats = members.iter().filter(|&&m| m == t).count() as u32;
-        most = most.min(tf / repeats);
-        len = Some(l);
         idf_sum += idf[t];
+        if mask & (1 << t) == 0 {
+            continue;
+        }
+        let (tf, len) = unpack_tf_len(tf_len[t]);
+        if tf <= PHRASE_TF_EXACT_MAX && most.is_none_or(|(m, _)| tf < m) {
+            most = Some((tf, len));
+        }
     }
-    let len = len?;
-    Some(score_with_dl_norm_k1(idf_sum, most, norm[usize::from(len)]))
+    let (tf, len) = most?;
+    Some(score_with_dl_norm_k1(idf_sum, tf, norm[usize::from(len)]))
 }
 
 /// The sum of a document's bare-term contributions.
@@ -2039,9 +2089,10 @@ mod tests {
         );
     }
 
-    /// A phrase over documents read under every member is bounded as the
-    /// kernel scores it: never below the score at any frequency the
-    /// members allow, and equal to it, bit for bit, at the most they allow.
+    /// A phrase over documents read under one or more members is bounded
+    /// as the kernel scores it: never below the score at any frequency the
+    /// read members allow, and equal to it, bit for bit, at the most they
+    /// allow.
     #[test]
     fn phrase_atom_bound_never_below_the_kernel_and_equal_at_its_most() {
         const CASES: u64 = 20_000;
@@ -2068,14 +2119,17 @@ mod tests {
             let len = (next() % 256) as u8;
             let tf: Vec<u32> = (0..nt).map(|_| 1 + (next() % MAX_TF) as u32).collect();
             let packed: Vec<u32> = tf.iter().map(|&t| pack_tf_len(t, len)).collect();
-            let mask: TermMask = (1 << nt) - 1;
+            // Any subset of the members read, one at least.
+            let read = members[(next() % members.len() as u64) as usize];
+            let mask: TermMask = ((1 << nt) - 1) & (next() | (1 << read));
             let most = members
                 .iter()
-                .map(|&t| tf[t] / members.iter().filter(|&&m| m == t).count() as u32)
+                .filter(|&&t| mask & (1 << t) != 0)
+                .map(|&t| tf[t])
                 .min()
-                .expect("members");
+                .expect("a member read");
             let idf_sum = members.iter().fold(0.0f32, |sum, &t| sum + idf[t]);
-            let bound = phrase_atom_bound(&members, mask, &packed, &idf, &norm).expect("all read");
+            let bound = phrase_atom_bound(&members, mask, &packed, &idf, &norm).expect("one read");
             for phrase_tf in 0..=most {
                 let kernel = score_with_dl_norm_k1(idf_sum, phrase_tf, norm[usize::from(len)]);
                 assert!(bound >= kernel, "{members:?} tf {tf:?} at {phrase_tf}");
@@ -2086,14 +2140,47 @@ mod tests {
         }
     }
 
-    /// A phrase with a member not read for the document, or a frequency
-    /// too large to keep, is left to the bound by contributions.
+    /// Up to the frequency the phrase bound is exact at, the kernel's score
+    /// rises strictly with frequency under every idf and every length norm
+    /// the defaults allow: a document at a lower frequency never rounds
+    /// above the bound.
     #[test]
-    fn phrase_atom_bound_needs_every_member_and_its_frequency() {
+    fn phrase_score_rises_with_frequency_up_to_its_exact_cap() {
+        const MIN_NORM: f32 = 0.3;
+        const NORMS: u32 = 400;
+        const IDFS: [f32; 5] = [0.01, 0.7, 3.3, 17.0, 45.0];
+        for idf in IDFS {
+            for n in 0..NORMS {
+                let norm = MIN_NORM + n as f32 * 0.137;
+                for tf in 0..PHRASE_TF_EXACT_MAX {
+                    let lower = score_with_dl_norm_k1(idf, tf, norm);
+                    let higher = score_with_dl_norm_k1(idf, tf + 1, norm);
+                    assert!(higher > lower, "idf {idf} norm {norm} tf {tf}");
+                }
+            }
+        }
+    }
+
+    /// A phrase over a document read under no member with a frequency
+    /// small enough to keep is left to the bound by keys; one member is
+    /// enough, and a repeated member is not divided by its repeats (an
+    /// occurrence of "a a" can start at every "a" but the last).
+    #[test]
+    fn phrase_atom_bound_needs_one_member_with_its_frequency() {
         let norm = [1.0f32; 256];
-        let packed = [pack_tf_len(1, 3), pack_tf_len(u32::MAX, 3)];
-        assert!(phrase_atom_bound(&[0, 1], 0b01, &packed, &[1.0, 1.0], &norm).is_none());
-        assert!(phrase_atom_bound(&[0, 1], 0b11, &packed, &[1.0, 1.0], &norm).is_none());
+        let idf = [1.0, 1.0];
+        let packed = [pack_tf_len(3, 3), pack_tf_len(u32::MAX, 3)];
+        assert!(phrase_atom_bound(&[0, 1], 0b10, &packed, &idf, &norm).is_none());
+        assert!(phrase_atom_bound(&[0, 1], 0b00, &packed, &idf, &norm).is_none());
+        assert_eq!(
+            phrase_atom_bound(&[0, 1], 0b01, &packed, &idf, &norm),
+            Some(score_with_dl_norm_k1(2.0, 3, 1.0))
+        );
+        assert_eq!(
+            phrase_atom_bound(&[0, 0], 0b01, &packed, &idf, &norm),
+            Some(score_with_dl_norm_k1(2.0, 3, 1.0)),
+            "\"a a\" occurs twice in \"a a a\": no division by repeats"
+        );
         assert_eq!(unpack_tf_len(pack_tf_len(7, 200)), (7, 200));
     }
 
@@ -2157,7 +2244,7 @@ mod tests {
             source: Some(0),
             ..HeadState::absent()
         };
-        let needed = sources_read_on(&[reading, ruled_out], &sources);
+        let needed = sources_read_on(&[reading, ruled_out], &sources, f32::NEG_INFINITY);
         assert_eq!(
             needed,
             vec![vec![false, true], vec![false]],

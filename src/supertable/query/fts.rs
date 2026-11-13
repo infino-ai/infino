@@ -2055,6 +2055,11 @@ impl SupertableReader {
             let global_idf = merge_idf;
             let pool = &manifest.options.reader_pool;
             let span = fanout_span.clone();
+            // The floor the opens build, read by the merge between rounds:
+            // what it need no longer read for.
+            let floor_reader = Arc::clone(&merge_floor);
+            let live_floor: Arc<dyn Fn() -> f32 + Send + Sync> =
+                Arc::new(move || floor_reader.floor());
             let merger = merge_floor;
             // The kept superfiles in the order the merge bounds them.
             let merged_ids: Vec<Uuid> = merge_kept.iter().map(|e| e.superfile_id).collect();
@@ -2176,7 +2181,7 @@ impl SupertableReader {
             let window = manifest.options.ordered_open_window();
             match prepared {
                 Some(prepared) if prepared.resident => {
-                    let selection = prepared.run().await.unwrap_or_else(|e| {
+                    let selection = prepared.run(live_floor).await.unwrap_or_else(|e| {
                         unreadable(e);
                         None
                     });
@@ -2197,7 +2202,7 @@ impl SupertableReader {
                 }
                 Some(prepared) => {
                     replan = Some(Box::pin(async move {
-                        match prepared.run().await {
+                        match prepared.run(live_floor).await {
                             Ok(Some(selection)) => Some(make_plan(selection)),
                             Ok(None) => None,
                             Err(e) => {
