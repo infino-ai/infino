@@ -13121,14 +13121,23 @@ pub(in crate::supertable) async fn stamp_slow_vector_state(
     // rebuilt for the new membership. The inner `Option` is absent when the
     // router is off or a step failed.
     let centroid_graph_ref: Mutex<Option<(String, Option<RoutingRef>)>> = Mutex::new(None);
+    // What the last attempt published. Other writers move the pointer without
+    // changing what this stamp writes (a mutation records deleted ids in the
+    // hidden table), so a retry often builds the same bytes and need not
+    // upload them again.
+    let published_before: Mutex<Option<slow_vector_state::PublishedState>> = Mutex::new(None);
     stamp_within(
         inner,
         &storage,
         "slow vector-state",
         CommitRetryBudget::of_table(inner),
         |old| {
-            let (storage, pending_drain, centroid_graph_ref) =
-                (&storage, &pending_drain, &centroid_graph_ref);
+            let (storage, pending_drain, centroid_graph_ref, published_before) = (
+                &storage,
+                &pending_drain,
+                &centroid_graph_ref,
+                &published_before,
+            );
             async move {
                 let entries = old.get_all_superfiles();
                 if entries.is_empty() && pending_drain.is_none() {
@@ -13142,28 +13151,21 @@ pub(in crate::supertable) async fn stamp_slow_vector_state(
                 // generation's section.
                 let previous_section =
                     previous_centroid_section(&inner.options, storage.as_ref(), &old).await;
-                let published = match pending_drain.as_ref() {
-                    Some(pending) => {
-                        slow_vector_state::write_state_with_pending_drain(
-                            storage.as_ref(),
-                            inner.options.metadata_disk_cache.as_ref(),
-                            entries,
-                            pending,
-                            previous_section.as_deref(),
-                        )
-                        .await
-                    }
-                    None => {
-                        slow_vector_state::write_state(
-                            storage.as_ref(),
-                            inner.options.metadata_disk_cache.as_ref(),
-                            entries,
-                            previous_section.as_deref(),
-                        )
-                        .await
-                    }
-                }
+                let before = published_before
+                    .lock()
+                    .expect("published state cache")
+                    .clone();
+                let published = slow_vector_state::write_state_for_stamp(
+                    storage.as_ref(),
+                    inner.options.metadata_disk_cache.as_ref(),
+                    entries,
+                    pending_drain.as_ref(),
+                    previous_section.as_deref(),
+                    before.as_ref(),
+                )
+                .await
                 .map_err(|e| BuildError::Store(e.to_string()))?;
+                *published_before.lock().expect("published state cache") = Some(published.clone());
                 // The `hnsw` graph is built and stamped ONLY in the membership
                 // commit (Commit A), atomically with `drained_ranges`. This
                 // settle carries the prior ref forward untouched and NEVER
