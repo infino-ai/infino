@@ -1462,10 +1462,17 @@ impl SupertableReader {
             // A phrase's members in order, a repeated word repeated: the
             // kernel weights every occurrence.
             let members = |p: &[String]| -> Vec<usize> { p.iter().filter_map(index_of).collect() };
+            // A query that is one phrase and nothing else matches only the
+            // documents that hold it: the phrase is required, as a must is,
+            // and a document lacking a member is no match.
+            let lone_phrase = musts.is_empty()
+                && must_phrases.is_empty()
+                && shoulds.is_empty()
+                && should_phrases.len() == 1;
             let tier_phrases: Vec<(Vec<usize>, bool)> = must_phrases
                 .iter()
                 .map(|p| (members(p), true))
-                .chain(should_phrases.iter().map(|p| (members(p), false)))
+                .chain(should_phrases.iter().map(|p| (members(p), lone_phrase)))
                 .collect();
             let required = bits(&musts)
                 | tier_phrases

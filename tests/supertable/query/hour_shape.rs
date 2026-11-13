@@ -286,8 +286,8 @@ fn a_table_within_the_window_keeps_the_learned_gate() {
     );
 }
 
-/// Tied rows of "Music" in each superfile: the title in both languages in
-/// both its hours.
+/// Tied rows of a popular title ("Music", "Barack Obama", …) in each
+/// superfile: the title in both languages in both its hours.
 const MUSIC_PER_SUPERFILE: u64 = (LANGS.len() * HOURS_PER_SUPERFILE) as u64;
 
 /// A term whose best documents tie in every superfile, with heads too
@@ -310,6 +310,35 @@ fn a_merge_seeded_floor_skips_tied_superfiles_by_id() {
                 "{query:?} run {run}: opened {n}, but {} superfiles hold the top 10",
                 10u64.div_ceil(MUSIC_PER_SUPERFILE)
             );
+        }
+    }
+}
+
+/// A query that is one quoted phrase, whose holder ties in every
+/// superfile: the merge bounds each superfile by the phrase scored as the
+/// kernel scores it, so once the first opens have built the floor every
+/// superfile past them only ties it and is skipped by `_id` order. The
+/// merge seeds no floor of its own (the heads cannot see adjacency), so
+/// the opens that build it are those holding the top `k` plus at most one
+/// window in flight beside them.
+#[test]
+fn a_lone_phrase_tied_in_every_superfile_opens_a_window() {
+    for depth in [None, Some(16)] {
+        let p = wide(depth);
+        for query in [
+            "\"barack obama\"",
+            "\"harry potter\"",
+            "\"quantum chromodynamics\"",
+        ] {
+            opens_and_equal(&p, query, 10);
+            for run in 1..REPEATS {
+                let n = opens_and_equal(&p, query, 10);
+                let most = 10u64.div_ceil(MUSIC_PER_SUPERFILE) + WINDOW as u64;
+                assert!(
+                    n <= most,
+                    "{query} depth {depth:?} run {run}: opened {n} of {SUPERFILES}, at most {most}"
+                );
+            }
         }
     }
 }
