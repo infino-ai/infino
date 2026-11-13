@@ -110,7 +110,8 @@ use uuid::Uuid;
 
 use crate::{
     superfile::{
-        SuperfileReader,
+        ReadError, SuperfileReader,
+        error::FtsError,
         fts::{
             reader::{BoolMode, ContainsRows, MatchWork},
             tokenize::{Tokenizer, unique_tokens},
@@ -865,7 +866,7 @@ impl SupertableProvider {
             let file_column = prepared
                 .reader
                 .column_alias(self.manifest.field_id(column), column);
-            let (rows, column_work) = if whole {
+            let read = if whole {
                 prepared
                     .reader
                     .term_rows(file_column, &needles, Some(pool), Some(budget))
@@ -875,8 +876,26 @@ impl SupertableProvider {
                     .reader
                     .contains_rows(file_column, &needles, Some(pool), Some(budget))
                     .await
-            }
-            .map_err(QueryError::from)?;
+            };
+            let (rows, column_work) = match read {
+                Ok(read) => read,
+                // A `text_match` column this superfile holds no `standard`
+                // postings for (it was written before the column's index,
+                // or under another analyzer): every live row is doubtful,
+                // so each is checked against its text below.
+                Err(e) if whole && holds_no_postings(&e) => {
+                    let total: u64 = prepared.row_counts.iter().map(|&n| u64::from(n)).sum();
+                    let mut every = RoaringBitmap::new();
+                    every.insert_range(0..u32::try_from(total).unwrap_or(u32::MAX));
+                    every -= tombstones;
+                    let doubtful = ContainsRows {
+                        proven: RoaringBitmap::new(),
+                        doubtful: every,
+                    };
+                    (vec![doubtful; needles.len()], MatchWork::default())
+                }
+                Err(e) => return Err(QueryError::from(e).into()),
+            };
             // One result per needle, or the zip below would pair needles
             // with another needle's rows.
             if rows.len() != needles.len() {
@@ -1717,6 +1736,20 @@ fn spans_full_domain(min: &ScalarValue, max: &ScalarValue) -> bool {
     // supported target, so the comparison cannot fail either.
     !min.data_type().is_floating()
         && max.distance(min).map(|d| d as u64) == Some(FULL_DOMAIN_ENDPOINT_DISTANCE)
+}
+
+/// Whether `e` says a superfile has no `standard` postings for a column:
+/// no FTS section at all, no index on the column, or one under another
+/// analyzer.
+fn holds_no_postings(e: &ReadError) -> bool {
+    match e {
+        ReadError::MissingKv(_) => true,
+        ReadError::Fts(f) => matches!(
+            f.as_ref(),
+            FtsError::UnknownColumn(_) | FtsError::ExactNeedsStandard { .. }
+        ),
+        _ => false,
+    }
 }
 
 /// A scan's exact conjuncts ([`SupertableProvider::exact_filter`]),

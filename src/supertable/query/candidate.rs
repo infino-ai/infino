@@ -1473,17 +1473,22 @@ pub(crate) fn exact_contains(
 
 /// `filter` as the [`ExactFilter`] of a `text_match(column, query, mode)`
 /// call: one whole-token leaf per query token, under `AND` for `'and'` and
-/// `OR` for `'or'`. `None` when it is no such call, its column is not FTS
-/// indexed by `standard` (the function's own analyzer, so the postings
-/// agree with it), or its query holds no token (no row matches; the
-/// function says so row by row).
+/// `OR` for `'or'`. `None` when it is no such call, the table's schema does
+/// not index its column by `standard` (the function's own analyzer, so the
+/// postings agree with it), or its query holds no token (no row matches;
+/// the function says so row by row).
+///
+/// The column is taken from the schema, not from the FTS columns the table
+/// was created with, so a text column added later is answered too. A
+/// superfile written before its index has no postings for it: the scan
+/// checks that superfile's rows against their text instead (see the
+/// provider's `exact_rows`).
 fn exact_text_match(
     filter: &Expr,
-    fts_cols: &HashSet<&str>,
     resolve: &dyn Fn(&str) -> Option<Arc<dyn Tokenizer>>,
 ) -> Option<ExactFilter> {
     let (column, tokens, mode) = crate::supertable::query::text_match::text_match_call(filter)?;
-    if !fts_cols.contains(column.as_str()) || resolve(&column)?.name() != STANDARD_TOKENIZER {
+    if resolve(&column)?.name() != STANDARD_TOKENIZER {
         return None;
     }
     let mut leaves: Vec<ExactFilter> = tokens
@@ -1607,7 +1612,7 @@ pub(crate) fn exact_filter(
                 false => ExactFilter::Or(flat),
             })
         }
-        _ => exact_text_match(filter, fts_cols, resolve)
+        _ => exact_text_match(filter, resolve)
             .or_else(|| exact_contains(filter, fts_cols, resolve).map(ExactFilter::Contains)),
     }
 }
