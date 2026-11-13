@@ -89,7 +89,7 @@ use blake3::Hasher as Blake3Hasher;
 use bytes::Bytes;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use datafusion::prelude::Expr;
-use fs4::available_space;
+use fs4::{available_space, total_space};
 use futures::{
     future::{BoxFuture, try_join_all},
     stream::{self, FuturesUnordered, StreamExt},
@@ -5825,8 +5825,109 @@ fn drain_epoch_id(
     hasher.finalize().to_hex().to_string()
 }
 
-fn drain_scratch_dir(epoch_id: &str) -> PathBuf {
-    scratch_root().join("infino-drain").join(epoch_id)
+/// Directory, under a table's scratch directory, of its drains' spills: one
+/// subdirectory per drain epoch.
+const DRAIN_SCRATCH_SUBDIR: &str = "infino-drain";
+
+/// Share of the scratch disk a drain leaves free, in divisor form
+/// (`total / this`): a batch whose spill would eat into it is not started.
+const DRAIN_SCRATCH_RESERVE_DIVISOR: u64 = 20;
+
+/// Where `options`' table keeps its drain epochs: beside its disk cache when
+/// it has one, else under the process scratch root.
+fn drain_scratch_parent(options: &SupertableOptions) -> PathBuf {
+    options.scratch_dir().join(DRAIN_SCRATCH_SUBDIR)
+}
+
+fn drain_scratch_dir(options: &SupertableOptions, epoch_id: &str) -> PathBuf {
+    drain_scratch_parent(options).join(epoch_id)
+}
+
+/// Where a drain epoch's spill lived before drains kept it with their table.
+fn legacy_drain_scratch_dir(epoch_id: &str) -> PathBuf {
+    scratch_root().join(DRAIN_SCRATCH_SUBDIR).join(epoch_id)
+}
+
+/// Make `scratch` the epoch's spill directory, created if absent. An epoch
+/// whose spill is still at the process scratch root, where drains kept it
+/// before, is moved here, so a drain stopped before an upgrade resumes
+/// instead of spilling its batches again. Then, when the table has a scratch
+/// directory of its own, every other epoch in it is removed: a table's
+/// checkpoint names only one epoch, so the rest can never resume. Under the
+/// shared process scratch root the other epochs may be other tables', so
+/// they are left alone.
+fn prepare_drain_scratch(
+    options: &SupertableOptions,
+    epoch_id: &str,
+    scratch: &Path,
+) -> Result<(), BuildError> {
+    let legacy = legacy_drain_scratch_dir(epoch_id);
+    if legacy != scratch && !scratch.exists() && legacy.exists() {
+        if let Some(parent) = scratch.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|error| BuildError::Store(format!("drain scratch create: {error}")))?;
+        }
+        match fs::rename(&legacy, scratch) {
+            Ok(()) => info!(
+                from = %legacy.display(),
+                to = %scratch.display(),
+                "[supertable drain] moved this drain's spill beside its table"
+            ),
+            Err(error) => warn!(
+                from = %legacy.display(),
+                %error,
+                "[supertable drain] could not move this drain's spill; its batches are spilled again"
+            ),
+        }
+    }
+    fs::create_dir_all(scratch)
+        .map_err(|error| BuildError::Store(format!("drain scratch create: {error}")))?;
+    if options.disk_cache.is_none() {
+        return Ok(());
+    }
+    let Ok(listing) = fs::read_dir(drain_scratch_parent(options)) else {
+        return Ok(());
+    };
+    for entry in listing.flatten() {
+        if entry.file_name() == epoch_id || !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        let path = entry.path();
+        match fs::remove_dir_all(&path) {
+            Ok(()) => info!(
+                path = %path.display(),
+                "[supertable drain] removed the spill of an earlier drain that cannot resume"
+            ),
+            Err(error) => {
+                warn!(path = %path.display(), %error, "[supertable drain] could not remove an earlier drain's spill")
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The free and total bytes of the filesystem holding `path`, read at its
+/// nearest existing ancestor. `None` when neither can be read.
+fn scratch_space(path: &Path) -> Option<(u64, u64)> {
+    let existing = path.ancestors().find(|dir| dir.exists())?;
+    Some((available_space(existing).ok()?, total_space(existing).ok()?))
+}
+
+/// Whether a batch spilling `needed` bytes fits on a scratch disk with `free`
+/// of `total` bytes free, leaving `total / DRAIN_SCRATCH_RESERVE_DIVISOR`
+/// free after it.
+fn drain_batch_fits(free: u64, total: u64, needed: u64) -> bool {
+    needed.saturating_add(total / DRAIN_SCRATCH_RESERVE_DIVISOR) <= free
+}
+
+/// Bytes one spilled row of `column` takes in a drain's spill, or `None` when
+/// `options` has no such vector column.
+fn drain_spill_row_bytes(options: &SupertableOptions, column: &str) -> Option<u64> {
+    let vc = options
+        .vector_columns
+        .iter()
+        .find(|vc| vc.column == column)?;
+    Some(record_bytes(vc.dim, vc.dim.div_ceil(u8::BITS as usize), vc.rerank_codec) as u64)
 }
 
 fn drain_local_checkpoint_path(scratch: &Path) -> PathBuf {
@@ -6106,12 +6207,10 @@ fn new_drain_epoch_sources(
     column: &str,
     undrained: Vec<Arc<SuperfileEntry>>,
 ) -> Vec<Arc<SuperfileEntry>> {
-    let Some(vc) = options.vector_columns.iter().find(|vc| vc.column == column) else {
+    let Some(spill_row_bytes) = drain_spill_row_bytes(options, column) else {
         return undrained;
     };
-    let spill_row_bytes =
-        record_bytes(vc.dim, vc.dim.div_ceil(u8::BITS as usize), vc.rerank_codec) as u64;
-    let free_bytes = available_space(scratch_root()).ok();
+    let free_bytes = scratch_space(&drain_scratch_parent(options)).map(|(free, _)| free);
     let Some((limit, why)) = drain_row_limit(options.drain_max_rows, free_bytes, spill_row_bytes)
     else {
         return undrained;
@@ -6437,7 +6536,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             .filter(|source| drained.contains(source.birth_version))
             .count();
         if n_drained == remote_state.checkpoint.sources.len() {
-            let scratch = drain_scratch_dir(&remote_state.checkpoint.epoch_id);
+            let scratch = drain_scratch_dir(&user_inner.options, &remote_state.checkpoint.epoch_id);
             if let Err(error) = fs::remove_dir_all(&scratch)
                 && error.kind() != io::ErrorKind::NotFound
             {
@@ -6576,9 +6675,13 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
     // The batch budget bounds source materialization. Kmeans rows accumulate
     // in per-cell disk spills; complete cell IVFs and final worker shards are
     // built only after every source batch is durable.
-    let drain_scratch = drain_scratch_dir(&remote_state.checkpoint.epoch_id);
-    fs::create_dir_all(&drain_scratch)
-        .map_err(|error| BuildError::Store(format!("drain scratch create: {error}")))?;
+    let drain_scratch = drain_scratch_dir(&user_inner.options, &remote_state.checkpoint.epoch_id);
+    prepare_drain_scratch(
+        &user_inner.options,
+        &remote_state.checkpoint.epoch_id,
+        &drain_scratch,
+    )?;
+    let spill_row_bytes = drain_spill_row_bytes(&user_inner.options, &column);
     let mut local_checkpoint =
         load_drain_local_checkpoint(&drain_scratch, &remote_state.checkpoint.epoch_id)?
             .unwrap_or_else(|| DrainLocalCheckpoint::new(remote_state.checkpoint.epoch_id.clone()));
@@ -6804,6 +6907,26 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
     for (batch_idx, (_, batch_sources)) in batches.iter().enumerate() {
         if batch_idx < local_checkpoint.batches_done {
             continue;
+        }
+        // Stop at the last checkpoint rather than fill the disk: everything
+        // else on it (the caches, other tables' work) fails once it is full.
+        // The drain resumes here once there is room.
+        if let (Some(row_bytes), Some((free, total))) =
+            (spill_row_bytes, scratch_space(&drain_scratch))
+        {
+            let batch_rows: u64 = batch_sources.iter().map(|s| s.n_docs).sum();
+            let needed = (batch_rows as f64
+                * f64::from(drain_replica_target_factor())
+                * row_bytes as f64) as u64;
+            if !drain_batch_fits(free, total, needed) {
+                return Err(BuildError::Store(format!(
+                    "drain stopped before batch {} of {n_batches}: its spill needs {needed} bytes and \
+                     the scratch disk has {free} of {total} free, with {} kept in reserve; it \
+                     resumes from this batch once there is room",
+                    batch_idx + 1,
+                    total / DRAIN_SCRATCH_RESERVE_DIVISOR,
+                )));
+            }
         }
         let batch_t0 = std::time::Instant::now();
         // Timeline diagnostic only: snapshot GETs for this batch without
@@ -16282,9 +16405,12 @@ mod tests {
         )
         .await;
         assert!(first.is_err(), "first drain must stop at the failpoint");
-        let local = load_drain_local_checkpoint(&drain_scratch_dir(&epoch_id), &epoch_id)
-            .expect("load local checkpoint")
-            .expect("local checkpoint");
+        let local = load_drain_local_checkpoint(
+            &drain_scratch_dir(&table.inner().options, &epoch_id),
+            &epoch_id,
+        )
+        .expect("load local checkpoint")
+        .expect("local checkpoint");
         assert_eq!(local.batches_done, 1);
 
         drain_user_superfiles_to_hidden_cells(
@@ -16294,7 +16420,7 @@ mod tests {
         .await
         .expect("resume drain");
         assert!(
-            !drain_scratch_dir(&epoch_id).exists(),
+            !drain_scratch_dir(&table.inner().options, &epoch_id).exists(),
             "successful final CAS removes local checkpoint scratch"
         );
         assert!(
@@ -16556,6 +16682,99 @@ mod tests {
     }
 
     #[test]
+    fn a_drain_batch_fits_only_with_the_reserve_left_free() {
+        // A 1,000-byte disk keeps 50 in reserve.
+        assert!(drain_batch_fits(500, 1_000, 450));
+        assert!(!drain_batch_fits(500, 1_000, 451));
+        assert!(drain_batch_fits(50, 1_000, 0));
+        assert!(!drain_batch_fits(49, 1_000, 0));
+    }
+
+    /// A table with a disk cache keeps its drain spill beside it. A drain
+    /// moves in an epoch's spill from where drains used to keep it, resumes
+    /// from it, and removes the spills of earlier epochs that cannot resume.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_drain_keeps_its_spill_with_its_table() {
+        const COMMITS: usize = 3;
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path().join("store")).expect("provider"));
+        let cache = DiskCacheStore::new_unpinned(
+            Arc::clone(&storage),
+            DiskCacheConfig {
+                cache_root: dir.path().join("cache"),
+                ..Default::default()
+            },
+        )
+        .expect("cache store");
+        let table = Supertable::create(
+            options_title_emb_serial(COMMIT_AS_DRAIN_TEST_DIM)
+                .with_storage(Arc::clone(&storage))
+                .with_disk_cache(cache)
+                .with_drain_batch_superfiles(1),
+        )
+        .expect("create");
+        for _ in 0..COMMITS {
+            let mut writer = table.writer().expect("writer");
+            writer
+                .append(&build_axis_vector_batch(
+                    COMMIT_AS_DRAIN_TEST_ROWS,
+                    COMMIT_AS_DRAIN_TEST_DIM,
+                ))
+                .expect("append");
+            writer.commit().expect("commit");
+        }
+        let options = &table.inner().options;
+        assert!(
+            drain_scratch_parent(options).starts_with(dir.path().join("cache")),
+            "the spill lives beside the table's cache"
+        );
+        let (hidden, epoch_id) = current_drain_epoch(&table).await;
+
+        // Stop after one batch, then put that spill where drains used to
+        // keep it, as a process from before the move would have left it.
+        inject_drain_test_failure(epoch_id.clone(), DrainTestFailurePhase::AfterBatch, 1);
+        drain_user_superfiles_to_hidden_cells(
+            Arc::clone(table.inner()),
+            Arc::clone(hidden.inner()),
+        )
+        .await
+        .expect_err("the drain stops at the failpoint");
+        let here = drain_scratch_dir(options, &epoch_id);
+        let legacy = legacy_drain_scratch_dir(&epoch_id);
+        fs::create_dir_all(legacy.parent().expect("parent")).expect("legacy parent");
+        fs::rename(&here, &legacy).expect("move the spill to the old place");
+        // And an earlier epoch's spill that can never resume.
+        let stale = drain_scratch_parent(options).join("an-earlier-epoch");
+        fs::create_dir_all(&stale).expect("stale epoch");
+        fs::write(stale.join("cell-0.rows"), b"rows").expect("stale spill");
+
+        drain_user_superfiles_to_hidden_cells(
+            Arc::clone(table.inner()),
+            Arc::clone(hidden.inner()),
+        )
+        .await
+        .expect("resume");
+        assert!(
+            !legacy.exists(),
+            "the old spill was moved in, not left behind"
+        );
+        assert!(!stale.exists(), "the earlier epoch's spill is removed");
+        assert!(!here.exists(), "a finished drain removes its own spill");
+        let hidden_rows: u64 = hidden
+            .inner()
+            .manifest
+            .load_full()
+            .get_all_superfiles_loaded()
+            .await
+            .expect("hidden superfiles")
+            .iter()
+            .map(|s| s.n_docs)
+            .sum();
+        assert_eq!(hidden_rows, (COMMITS * COMMIT_AS_DRAIN_TEST_ROWS) as u64);
+    }
+
+    #[test]
     fn drain_batches_from_layout_follows_the_recorded_groups() {
         let at = |id: u128, birth_version: u64| {
             let mut entry = (*fp_entry(id)).clone();
@@ -16708,10 +16927,13 @@ mod tests {
             .await
             .expect("restore recorded layout");
         assert_eq!(
-            load_drain_local_checkpoint(&drain_scratch_dir(&epoch_id), &epoch_id)
-                .expect("load local checkpoint")
-                .expect("local checkpoint")
-                .batches_done,
+            load_drain_local_checkpoint(
+                &drain_scratch_dir(&table.inner().options, &epoch_id),
+                &epoch_id
+            )
+            .expect("load local checkpoint")
+            .expect("local checkpoint")
+            .batches_done,
             1,
             "the refused resume must not touch the finished batch"
         );
@@ -16723,7 +16945,7 @@ mod tests {
         .await
         .expect("resume under a different batch size");
         assert!(
-            !drain_scratch_dir(&epoch_id).exists(),
+            !drain_scratch_dir(&table.inner().options, &epoch_id).exists(),
             "the recorded epoch is the one that completed"
         );
         assert!(
@@ -16850,7 +17072,7 @@ mod tests {
         .await
         .expect("resume on another pool width");
         assert!(
-            !drain_scratch_dir(&epoch_id).exists(),
+            !drain_scratch_dir(&table.inner().options, &epoch_id).exists(),
             "the recorded epoch is the one that completed"
         );
         assert!(
@@ -16932,7 +17154,8 @@ mod tests {
             .expect("checkpointed shard remains live through GC");
 
         // Simulate replacement on a node without the local spill/cell files.
-        fs::remove_dir_all(drain_scratch_dir(&epoch_id)).expect("drop local scratch");
+        fs::remove_dir_all(drain_scratch_dir(&table.inner().options, &epoch_id))
+            .expect("drop local scratch");
         drain_user_superfiles_to_hidden_cells(
             Arc::clone(table.inner()),
             Arc::clone(hidden.inner()),
