@@ -48,10 +48,7 @@
 //! cannot be evaluated before ranking (one on `score`) keeps what the
 //! widening found. `bm25_search_prefix` takes the widening alone.
 
-use std::{
-    fmt,
-    sync::{Arc, atomic::AtomicBool},
-};
+use std::{fmt, sync::Arc};
 
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
@@ -85,7 +82,6 @@ use crate::{
                 output_schema_with_score, scope_to_call, top_k_statistics, traced_tvf,
                 widening_ended_short,
             },
-            fts::RankedPass,
         },
     },
     utils::trace::detail_span,
@@ -453,7 +449,6 @@ impl ExecutionPlan for Bm25Exec {
                 scalar_schema: &scalar_schema,
                 output_schema: &output_schema,
                 projection: projection.as_deref(),
-                merge_pays: AtomicBool::new(true),
             };
             // Widen within the scope first, up to the fill's ceiling: the
             // rounds stop as soon as `k` of the kernel's best pass the
@@ -515,9 +510,6 @@ struct RankedCall<'a> {
     scalar_schema: &'a SchemaRef,
     output_schema: &'a SchemaRef,
     projection: Option<&'a [usize]>,
-    /// Whether the last round's tier merge paid, carried from round to
-    /// round (see [`RankedPass::Round`]); the first round finds it set.
-    merge_pays: AtomicBool,
 }
 
 impl RankedCall<'_> {
@@ -537,7 +529,6 @@ impl RankedCall<'_> {
                         want,
                         Bm25SearchOptions::new().with_mode(*mode),
                         scope,
-                        RankedPass::Round(&self.merge_pays),
                     )
                     .await
             }
