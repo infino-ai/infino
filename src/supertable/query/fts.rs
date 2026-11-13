@@ -74,6 +74,7 @@ use std::{
     borrow::Cow,
     cmp::Ordering,
     collections::{BTreeSet, HashMap, HashSet},
+    fmt,
     iter::repeat_n,
     slice,
     sync::{
@@ -86,7 +87,7 @@ use std::{
 use arrow::record_batch::RecordBatch;
 use arrow_array::{Array, LargeStringArray};
 use datafusion::logical_expr::Expr;
-use futures::future::join;
+use futures::future::{BoxFuture, join};
 use roaring::RoaringBitmap;
 use tokio::sync::OnceCell;
 use tracing::{Instrument, debug, warn};
@@ -141,10 +142,11 @@ use crate::{
         },
         query::{
             SuperfileHit,
-            candidate::{CandidatePlan, CandidateScope, TermMemos},
+            candidate::{CandidatePlan, CandidateScope, RowGate, TermMemos},
             dispatch,
             exec::common::{
-                hit_output_schema, resolve_hits_named, take_file_columns, take_rows_byte_source,
+                RowCheck, hit_output_schema, resolve_hits_named, take_file_columns,
+                take_rows_byte_source,
             },
             provider::prune_leaves_for_filters,
             prune::{PruneLeaf, select_superfiles},
@@ -298,6 +300,42 @@ struct MatchKernel {
     negative_phrases: Vec<Phrase<String>>,
     locations: IndexLocations,
     op_stats: Option<Arc<op_stats::OpStatsCollector>>,
+}
+
+/// The rows of an opened superfile a ranked search under a `WHERE` can
+/// return: those its query's terms match, as the unranked match walks
+/// them, that the predicate keeps. Checked as each superfile opens, so a
+/// search that opens a handful of superfiles checks a handful.
+struct MatchGate {
+    kernel: Arc<MatchKernel>,
+    check: RowCheck,
+}
+
+impl fmt::Debug for MatchGate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MatchGate")
+            .field("check", &self.check)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RowGate for MatchGate {
+    fn rows<'a>(
+        &'a self,
+        r: &'a Arc<SuperfileReader>,
+        suid: Uuid,
+    ) -> BoxFuture<'a, Result<RoaringBitmap, QueryError>> {
+        Box::pin(async move {
+            let matched: RoaringBitmap = self
+                .kernel
+                .docs(r, suid)
+                .await?
+                .into_iter()
+                .map(RowId::get)
+                .collect();
+            self.check.keep(r, &matched).await
+        })
+    }
 }
 
 impl MatchKernel {
@@ -2936,77 +2974,25 @@ impl SupertableReader {
             .await
     }
 
-    /// `scope` narrowed to the rows `query`'s terms match under `mode`: the
-    /// rows a BM25 search of the same query can return, which is all a
-    /// `WHERE` on that search ever needs checked. A superfile the term
-    /// bloom rules out, or that the scope does not admit, is not opened;
-    /// in the rest the match is intersected with the scope's set when it
-    /// bounds one (already free of tombstones) and has the superfile's
-    /// tombstones taken out when it does not. The result is bounded, its
-    /// sets free of tombstones, and holds only superfiles with a row left.
-    pub(crate) async fn match_scope(
+    /// `scope` with a gate that checks `check` on each superfile as a ranked
+    /// search of `query` opens it, over the rows the query's terms match: a
+    /// search within the result returns the `k` best rows the predicate
+    /// keeps in one pass. A query that matches nothing gets the empty scope.
+    pub(crate) async fn gated_scope(
         &self,
         column: &str,
         query: &str,
         mode: BoolMode,
         scope: &CandidateScope,
+        check: RowCheck,
     ) -> Result<CandidateScope, QueryError> {
-        let Some((units, kernel)) = self.match_kernel(column, query, mode, &[]).await? else {
+        let Some((_, kernel)) = self.match_kernel(column, query, mode, &[]).await? else {
             return Ok(CandidateScope::empty());
         };
-        let admitted: HashSet<SuperfileUri> =
-            scope.admitted_superfiles().map(|entry| entry.uri).collect();
-        let units: Vec<(Arc<SuperfileEntry>, (Uuid, Option<Arc<RoaringBitmap>>))> = units
-            .into_iter()
-            .filter(|(entry, _)| admitted.contains(&entry.uri))
-            .map(|(entry, suid)| {
-                let within = scope
-                    .allow
-                    .as_ref()
-                    .and_then(|allow| allow.get(&entry.uri).cloned());
-                (entry, (suid, within))
-            })
-            .collect();
-        let body = move |r: Arc<SuperfileReader>,
-                         entry: Arc<SuperfileEntry>,
-                         cache: Option<Arc<SidecarCache>>,
-                         now: Instant,
-                         (suid, within): (Uuid, Option<Arc<RoaringBitmap>>)| {
-            let kernel = Arc::clone(&kernel);
-            async move {
-                let mut rows: RoaringBitmap = kernel
-                    .docs(&r, suid)
-                    .await?
-                    .into_iter()
-                    .map(RowId::get)
-                    .collect();
-                match within {
-                    Some(within) => rows &= within.as_ref(),
-                    None => {
-                        if let Some(cache) = cache.as_ref()
-                            && let Some(deny) =
-                                dispatch::tombstone_deny_set(cache, entry.superfile_id, now)?
-                        {
-                            rows -= deny.as_ref();
-                        }
-                    }
-                }
-                Ok((entry, rows))
-            }
-        };
-        let matched = dispatch::fanout_with(self, units, true, self.open_intent(), body).await?;
-        let mut superfiles = Vec::with_capacity(matched.len());
-        let mut allow = HashMap::with_capacity(matched.len());
-        for (entry, rows) in matched {
-            if !rows.is_empty() {
-                allow.insert(entry.uri, Arc::new(rows));
-                superfiles.push(entry);
-            }
-        }
         Ok(CandidateScope {
-            superfiles,
-            allow: Some(allow),
-            gate: None,
+            superfiles: scope.superfiles.clone(),
+            allow: scope.allow.clone(),
+            gate: Some(Arc::new(MatchGate { kernel, check })),
         })
     }
 

@@ -160,6 +160,18 @@ static SEARCH_CALL_SEQ: AtomicU64 = AtomicU64::new(0);
 /// selectivity turns out to be.
 const OVER_FETCH_GROWTH: usize = 2;
 
+/// Rounds a ranked search under a checkable `WHERE` widens before it checks
+/// the predicate as each superfile opens instead: a predicate most of the
+/// top-ranked rows satisfy is filled within them, often from the index
+/// alone; one that keeps few of them is not, and on a large table each
+/// further round opens the superfiles it ranks anew.
+pub(crate) const WIDEN_ROUNDS_BEFORE_GATE: u32 = 2;
+
+/// The ceiling that lets a widening fill run `rounds` rounds from `k`.
+pub(crate) fn widen_ceiling(k: usize, rounds: u32) -> usize {
+    k.saturating_mul(OVER_FETCH_GROWTH.saturating_pow(rounds.saturating_sub(1)))
+}
+
 /// How many times `k` a fill may grow to before it gives up and returns
 /// what it has (see [`over_fetch_ceiling`]). Without a ceiling the growth
 /// runs to the table's row count, so a predicate the index cannot bound

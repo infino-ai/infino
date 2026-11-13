@@ -342,3 +342,45 @@ fn a_lone_phrase_tied_in_every_superfile_opens_a_window() {
         }
     }
 }
+
+/// A ranked search under a `WHERE` the index cannot bound, as rows in rank
+/// order. (Through the reader's own SQL, which is not metered: what such a
+/// search opens is tested where a metered context is reachable.)
+pub fn filtered(st: &Supertable, query: &str, k: usize, filter: &str) -> (Vec<String>, OpStats) {
+    let (batches, stats) = with_op_stats(|| {
+        st.reader()
+            .expect("reader")
+            .query_sql(&format!(
+                "SELECT hour, lang, title, score FROM bm25_search('title', '{query}', {k}) \
+                 WHERE {filter} ORDER BY score DESC, _id"
+            ))
+            .expect("filtered search")
+    });
+    (rows(&batches), stats)
+}
+
+/// Ranked searches under a `WHERE` the index cannot bound — on the
+/// language, on hits, on the hour — answer as the table without tiers
+/// does, row for row, whether the predicate keeps most of the top-ranked
+/// rows or few of them: the merge under a predicate seeds no threshold of
+/// its own, and a search that checks the predicate as each superfile opens
+/// still returns the `k` best rows it keeps.
+#[test]
+fn filtered_searches_answer_as_without_tiers() {
+    for depth in [None, Some(16)] {
+        let p = wide(depth);
+        for (query, k, filter) in [
+            ("python", 10, "lang = 'de'"),
+            ("music", 10, "hits > 1990"),
+            ("\"barack obama\"", 10, "lang = 'de'"),
+            ("zyzzyva", 10, "hour < 3"),
+            ("obama", 5, "hour >= 90 AND lang = 'en'"),
+        ] {
+            for run in 0..2 {
+                let (a, _) = filtered(&p.with, query, k, filter);
+                let (b, _) = filtered(&p.without, query, k, filter);
+                assert_eq!(a, b, "{query} WHERE {filter} run {run}");
+            }
+        }
+    }
+}
