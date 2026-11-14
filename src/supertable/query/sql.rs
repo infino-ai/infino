@@ -53,7 +53,12 @@
 //! output and never reaches a caller — a `SELECT`, `GROUP BY` key, or
 //! `MIN`/`MAX` over a string column always comes back `LargeUtf8`.
 
-use std::{collections::HashSet, future::Future, sync::Arc, time::Instant};
+use std::{
+    collections::{HashMap, HashSet},
+    future::Future,
+    sync::{Arc, Mutex},
+    time::Instant,
+};
 
 use arrow::{
     compute::{cast, concat_batches},
@@ -62,15 +67,16 @@ use arrow::{
 use arrow_array::{Array, Decimal128Array, Int64Array, new_empty_array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::{
+    common::tree_node::{Transformed, TreeNodeRecursion},
     common::{Column, DFSchema, ScalarValue, runtime::SpawnedTask, tree_node::TreeNode},
     dataframe::DataFrame,
-    datasource::DefaultTableSource,
+    datasource::{DefaultTableSource, provider_as_source},
     error::DataFusionError,
     execution::{TaskContext, context::SessionContext},
     functions_aggregate::{count::count_all, expr_fn::count},
     logical_expr::{
-        Expr, ExprFunctionExt, LogicalPlan, lit, simplify::SimplifyContext,
-        utils::split_conjunction,
+        Expr, ExprFunctionExt, LogicalPlan, LogicalTableSource, TableScan, lit,
+        simplify::SimplifyContext, utils::split_conjunction,
     },
     optimizer::simplify_expressions::ExprSimplifier,
 };
@@ -232,6 +238,125 @@ fn cacheable_scalar_plan(plan: &LogicalPlan) -> bool {
 
     let mut found_scan = false;
     visit(plan, &mut found_scan) && found_scan
+}
+
+/// Most statements a connection keeps the parsed plans of; past it the
+/// kept plans are dropped and the next statements start the cache over.
+const STATEMENT_PLANS: usize = 256;
+
+/// A connection's parsed statements, by their text: the logical plan a
+/// statement parses to, before any optimization, and the catalog tables it
+/// names. Parsing and building that plan is a fifth of a small statement's
+/// planning; the optimizer and the physical planner still run for every
+/// statement, on its own snapshot of each table.
+///
+/// A plan is kept only when every table it scans, its subqueries' included,
+/// is a catalog table ([`cacheable_scalar_plan`]'s rule): a search function's
+/// relation holds a live reader. A kept plan scans a placeholder carrying
+/// only the table's schema, so it pins no snapshot; [`Self::bind`] puts the
+/// statement's own tables back.
+#[derive(Default)]
+pub(crate) struct StatementPlans(Mutex<HashMap<String, (Vec<String>, LogicalPlan)>>);
+
+impl StatementPlans {
+    /// The catalog tables `sql` names and its parsed plan, when kept.
+    pub(crate) fn get(&self, sql: &str) -> Option<(Vec<String>, LogicalPlan)> {
+        self.0.lock().ok()?.get(sql).cloned()
+    }
+
+    /// Keep `plan`, what `sql` parses to, with the catalog `tables` it names,
+    /// when every table it scans is a catalog table.
+    pub(crate) fn keep(&self, sql: &str, tables: Vec<String>, plan: &LogicalPlan) {
+        let mut catalog_tables_only = true;
+        let mut scans = 0usize;
+        let walked = plan.apply_with_subqueries(|node| {
+            if let LogicalPlan::TableScan(scan) = node {
+                scans += 1;
+                let catalog_table = scan
+                    .source
+                    .downcast_ref::<DefaultTableSource>()
+                    .is_some_and(|s| {
+                        s.table_provider
+                            .downcast_ref::<SupertableProvider>()
+                            .is_some()
+                    });
+                if !catalog_table {
+                    catalog_tables_only = false;
+                    return Ok(TreeNodeRecursion::Stop);
+                }
+            }
+            Ok(TreeNodeRecursion::Continue)
+        });
+        if walked.is_err() || !catalog_tables_only || scans == 0 {
+            return;
+        }
+        let Ok(stripped) = plan
+            .clone()
+            .transform_up_with_subqueries(|node| match node {
+                LogicalPlan::TableScan(scan) => {
+                    let source = Arc::new(LogicalTableSource::new(scan.source.schema()));
+                    Ok(Transformed::yes(LogicalPlan::TableScan(TableScan {
+                        source,
+                        ..scan
+                    })))
+                }
+                other => Ok(Transformed::no(other)),
+            })
+        else {
+            return;
+        };
+        let Ok(mut plans) = self.0.lock() else {
+            return;
+        };
+        if plans.len() >= STATEMENT_PLANS && !plans.contains_key(sql) {
+            plans.clear();
+        }
+        plans.insert(sql.to_owned(), (tables, stripped.data));
+    }
+
+    /// `plan`, a kept one, scanning the tables registered in `ctx` in place of
+    /// its placeholders, or `None` when a table is missing from `ctx` or its
+    /// schema is no longer the one the plan was parsed against: the
+    /// statement is then parsed again.
+    pub(crate) async fn bind(
+        plan: LogicalPlan,
+        ctx: &SessionContext,
+    ) -> Result<Option<LogicalPlan>, DataFusionError> {
+        let mut names = Vec::new();
+        plan.apply_with_subqueries(|node| {
+            if let LogicalPlan::TableScan(scan) = node {
+                names.push(scan.table_name.clone());
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+        let mut tables = HashMap::new();
+        for name in names {
+            if tables.contains_key(&name) {
+                continue;
+            }
+            let Ok(provider) = ctx.table_provider(name.clone()).await else {
+                return Ok(None);
+            };
+            tables.insert(name, provider);
+        }
+        let mut stale = false;
+        let bound = plan.transform_up_with_subqueries(|node| match node {
+            LogicalPlan::TableScan(scan) => {
+                let provider = &tables[&scan.table_name];
+                if provider.schema() != scan.source.schema() {
+                    stale = true;
+                    return Ok(Transformed::no(LogicalPlan::TableScan(scan)));
+                }
+                let source = provider_as_source(Arc::clone(provider));
+                Ok(Transformed::yes(LogicalPlan::TableScan(TableScan {
+                    source,
+                    ..scan
+                })))
+            }
+            other => Ok(Transformed::no(other)),
+        })?;
+        Ok((!stale).then_some(bound.data))
+    }
 }
 
 /// The SQL context every entry point plans in: DataFusion's memory gated on `budget`, plus the
