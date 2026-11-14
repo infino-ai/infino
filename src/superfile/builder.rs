@@ -4284,6 +4284,11 @@ impl SuperfileBuilder {
         let finish_span =
             detail_span!("merge_finish", rows = superfile_builder.next_local_doc_id).entered();
 
+        // The stats were folded batch by batch, each batch's value tables
+        // budgeted only among the columns it held: budget the whole, so the
+        // stats are the same however many columns a pass wrote.
+        out.stats.fit_value_tables();
+
         // Every input fully tombstoned → no rows: match `finish_to`'s
         // empty-superfile contract (write nothing, return the merged stats).
         if superfile_builder.next_local_doc_id == 0 {

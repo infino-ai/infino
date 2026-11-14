@@ -930,13 +930,13 @@ mod tests {
         },
         supertable::{
             Supertable, SupertableOptions,
-            manifest::ManifestSnapshot,
+            manifest::{ManifestSnapshot, list::MAX_EXACT_VALUE_COUNTS},
             query::{candidate::LIKE_MAX_TERMS, sql::build_sql_schemas},
         },
     };
 
     /// One more than the manifest's exact-value cardinality cap.
-    const HIGH_CARDINALITY_ROWS: usize = 257;
+    const HIGH_CARDINALITY_ROWS: usize = MAX_EXACT_VALUE_COUNTS + 1;
 
     /// Titles for the `LIKE` oracle, chosen so the index superset and the
     /// exact match differ: `fox` as a whole word, as a head (`foxes`), a
