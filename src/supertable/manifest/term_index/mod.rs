@@ -38,7 +38,7 @@ pub(crate) mod tier;
 
 use std::{
     cmp::Reverse,
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     fmt, fs,
     future::Future,
     io,
@@ -3079,6 +3079,33 @@ impl TermIndex {
                 }
             }
         }
+        Ok(out)
+    }
+
+    /// Every term of `column` starting with `prefix` that one of `live`
+    /// holds, each once, in byte order: a prefix query's expansion read
+    /// from the index rather than from every superfile's dictionary. A
+    /// term only superfiles outside `live` hold — removed from the table,
+    /// their postings not yet folded away — is left out.
+    pub(crate) async fn prefix_terms(
+        &self,
+        column: FieldId,
+        prefix: &str,
+        live: &HashSet<Uuid>,
+    ) -> Result<BTreeSet<Vec<u8>>, TermIndexError> {
+        let head = column.term_key("").len();
+        let mut out = BTreeSet::new();
+        self.for_each_prefix(column, prefix, |key, run| {
+            let held = run.iter().any(|p| {
+                self.superfile_id(p.superfile)
+                    .is_some_and(|id| live.contains(&id))
+            });
+            if held && let Some(term) = key.get(head..) {
+                out.insert(term.to_vec());
+            }
+            true
+        })
+        .await?;
         Ok(out)
     }
 
@@ -7551,6 +7578,18 @@ mod tests {
             let prefixed = rt.block_on(index.route_prefix(fid("body"), "t0")).expect("prefix");
             let expect: HashSet<Uuid> = (0..10).flat_map(holders).collect();
             prop_assert_eq!(prefixed, expect);
+            // A prefix's terms, as only the even superfiles hold them: a
+            // term the others alone hold is no longer in the table.
+            let live: HashSet<Uuid> = (0..corpus.len())
+                .filter(|i| i % 2 == 0)
+                .map(|i| Uuid::from_u128(i as u128 + 1))
+                .collect();
+            let terms = rt.block_on(index.prefix_terms(fid("body"), "t0", &live)).expect("terms");
+            let expect: BTreeSet<Vec<u8>> = (0..10)
+                .filter(|&t| holders(t).iter().any(|id| live.contains(id)))
+                .map(|t| alphabet[t].as_bytes().to_vec())
+                .collect();
+            prop_assert_eq!(terms, expect);
             prop_assert!(rt.block_on(index.route(fid("body"), &["nope"], BoolMode::Or)).expect("route").is_empty());
         });
     }

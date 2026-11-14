@@ -184,7 +184,7 @@ const OVER_FETCH_MAX_HITS: usize = 100_000;
 /// `EXACT_SCOPE_TAKE_ROWS` × [`WHOLE_COLUMN_TAKE_DIVISOR`] rows a chunk this
 /// size is a sparse take, which decodes only the pages its rows land on, so
 /// the predicate's columns over a large superfile never sit in memory whole.
-const EXACT_SCOPE_TAKE_ROWS: usize = 1 << 20;
+pub(crate) const EXACT_SCOPE_TAKE_ROWS: usize = 1 << 20;
 
 /// Rows of the first chunk [`exact_scope`] reads of a variable-width column,
 /// before it knows how many bytes a row decodes to.
@@ -843,33 +843,18 @@ pub(crate) async fn exact_scope(
     predicate: &PushedPredicate,
     output_schema: &SchemaRef,
 ) -> DfResult<Option<CandidateScope>> {
-    let manifest = Arc::clone(reader.manifest());
-    let stored = manifest.stored_schema();
-    let id_column = reader.options().id_column.as_str();
-    let mut names = Vec::with_capacity(predicate.columns().len());
-    for &index in predicate.columns() {
-        let name = output_schema.field(index).name();
-        if name == SCORE_COLUMN || name == id_column || stored.field_with_name(name).is_err() {
-            return Ok(None);
-        }
-        names.push(name.clone());
-    }
-    if names.is_empty() {
+    let Some(check) = RowCheck::new(reader, predicate, output_schema)? else {
         return Ok(None);
-    }
-    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-    let out_schema = hit_output_schema(&stored, &refs)?;
-    let fixed_width = out_schema
-        .fields()
-        .iter()
-        .all(|field| field.data_type().primitive_width().is_some());
-    let bound = Arc::new(predicate.bind(&out_schema)?);
-    let names = Arc::new(names);
-    let op_stats = reader.op_stats.clone();
-    let budget = Arc::clone(&manifest.options.connection_memory_budget);
+    };
+    let check = Arc::new(check);
     // Superfiles are checked this many at a time, each holding one chunk:
     // the most the pass holds at once, whatever the table's size.
-    let window = manifest.options.reader_pool.current_num_threads().max(1);
+    let window = reader
+        .manifest()
+        .options
+        .reader_pool
+        .current_num_threads()
+        .max(1);
     // A bounded scope hands each superfile its set, tombstones already
     // subtracted; an unbounded one hands `None`, read as all of its rows.
     let units: Vec<(Arc<SuperfileEntry>, Option<Arc<RoaringBitmap>>)> = scope
@@ -887,12 +872,7 @@ pub(crate) async fn exact_scope(
                      cache: Option<Arc<SidecarCache>>,
                      now: Instant,
                      rows: Option<Arc<RoaringBitmap>>| {
-        let manifest = Arc::clone(&manifest);
-        let names = Arc::clone(&names);
-        let out_schema = Arc::clone(&out_schema);
-        let bound = Arc::clone(&bound);
-        let op_stats = op_stats.clone();
-        let budget = Arc::clone(&budget);
+        let check = Arc::clone(&check);
         async move {
             let candidates = match rows {
                 Some(rows) => rows,
@@ -908,82 +888,14 @@ pub(crate) async fn exact_scope(
                     Arc::new(all)
                 }
             };
-            // Fixed-width columns over a superfile a chunk could cover are
-            // read in one take, which reads each column once; past that, in
-            // chunks small enough to stay sparse takes. Variable-width
-            // columns are read in chunks sized by their decoded bytes.
-            let n_docs = usize::try_from(r.n_docs()).map_err(QueryError::internal)?;
-            let whole_file_rows =
-                EXACT_SCOPE_TAKE_ROWS.saturating_mul(WHOLE_COLUMN_TAKE_DIVISOR as usize);
-            let mut take_rows = match (fixed_width, n_docs <= whole_file_rows) {
-                (true, true) => n_docs.max(1),
-                (true, false) => EXACT_SCOPE_TAKE_ROWS,
-                (false, _) => EXACT_SCOPE_FIRST_TAKE_ROWS,
-            };
-            let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-            let mut kept = RoaringBitmap::new();
-            let mut remaining = candidates.iter();
-            loop {
-                let chunk: Vec<u32> = remaining.by_ref().take(take_rows).collect();
-                if chunk.is_empty() {
-                    break;
-                }
-                if let Some(stats) = &op_stats {
-                    stats.add_rows_materialized(chunk.len() as u64);
-                }
-                let batch =
-                    take_file_columns(&manifest, &r, chunk.clone(), &refs, &out_schema, &op_stats)
-                        .await
-                        .map_err(QueryError::DataFusion)?;
-                // The chunk's columns count against the connection's budget
-                // while they are checked; a budget they don't fit refuses
-                // the query, as a SQL operator that can't spill is refused.
-                let bytes = batch.get_array_memory_size();
-                let _held = budget.try_reserve(bytes).map_err(|over| {
-                    QueryError::OverBudget(format!("during a WHERE's exact pass, {over}"))
-                })?;
-                if !fixed_width {
-                    let per_row = (bytes / chunk.len()).max(1);
-                    take_rows = (EXACT_SCOPE_TAKE_BYTES / per_row)
-                        .clamp(EXACT_SCOPE_FIRST_TAKE_ROWS, EXACT_SCOPE_TAKE_ROWS);
-                }
-                let bound = Arc::clone(&bound);
-                // The predicate runs over up to a chunk of rows: compute, so
-                // the reader pool takes it rather than the tokio worker. It
-                // hands back the positions it holds at; the chunk maps them
-                // to rows here.
-                let (held, ns) = run_on_pool(
-                    Some(&manifest.options.reader_pool),
-                    "exact scope check",
-                    move || {
-                        timed_section(|| {
-                            bound.mask(&batch).map(|mask| {
-                                mask.iter()
-                                    .enumerate()
-                                    .filter_map(|(at, holds)| (holds == Some(true)).then_some(at))
-                                    .collect::<Vec<usize>>()
-                            })
-                        })
-                    },
-                )
-                .await
-                .map_err(QueryError::internal)?;
-                if let Some(stats) = &op_stats {
-                    stats.add_kernel_cpu_ns(ns);
-                }
-                kept.extend(
-                    held.map_err(QueryError::DataFusion)?
-                        .into_iter()
-                        .map(|at| chunk[at]),
-                );
-            }
+            let kept = check.keep(&r, &candidates).await?;
             Ok((entry.uri, kept))
         }
     };
     let kept = fanout_with_ordered(
         reader,
         units,
-        window,
+        |_| window,
         |_| false,
         body,
         |_| {},
@@ -999,6 +911,155 @@ pub(crate) async fn exact_scope(
         superfiles: scope.superfiles.clone(),
         allow: Some(allow),
     }))
+}
+
+/// A pushed-down predicate bound to the stored columns it reads, checked
+/// over a superfile's rows by decoding those columns for just those rows.
+///
+/// What it holds at once is bounded, whatever the superfile's size:
+/// fixed-width columns over a superfile small enough that its rows are a
+/// dense take ([`WHOLE_COLUMN_TAKE_DIVISOR`]) are read in one take, a
+/// larger one in sparse chunks of [`EXACT_SCOPE_TAKE_ROWS`]; variable-width
+/// columns in chunks of about [`EXACT_SCOPE_TAKE_BYTES`] decoded; and each
+/// chunk is reserved against the connection's memory budget while it is
+/// checked, a budget it doesn't fit refusing the query.
+pub(crate) struct RowCheck {
+    manifest: Arc<ManifestSnapshot>,
+    names: Vec<String>,
+    out_schema: SchemaRef,
+    bound: Arc<BoundPredicate>,
+    fixed_width: bool,
+    op_stats: Option<Arc<OpStatsCollector>>,
+    budget: Arc<ConnectionMemoryBudget>,
+}
+
+impl RowCheck {
+    /// `predicate` bound to the stored columns it reads. `None` when it reads
+    /// no column or one no superfile stores — the score, the id column, an
+    /// index-only text column — so it cannot be evaluated from stored
+    /// columns.
+    pub(crate) fn new(
+        reader: &SupertableReader,
+        predicate: &PushedPredicate,
+        output_schema: &SchemaRef,
+    ) -> DfResult<Option<Self>> {
+        let manifest = Arc::clone(reader.manifest());
+        let stored = manifest.stored_schema();
+        let id_column = reader.options().id_column.as_str();
+        let mut names = Vec::with_capacity(predicate.columns().len());
+        for &index in predicate.columns() {
+            let name = output_schema.field(index).name();
+            if name == SCORE_COLUMN || name == id_column || stored.field_with_name(name).is_err() {
+                return Ok(None);
+            }
+            names.push(name.clone());
+        }
+        if names.is_empty() {
+            return Ok(None);
+        }
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let out_schema = hit_output_schema(&stored, &refs)?;
+        let fixed_width = out_schema
+            .fields()
+            .iter()
+            .all(|field| field.data_type().primitive_width().is_some());
+        let bound = Arc::new(predicate.bind(&out_schema)?);
+        let budget = Arc::clone(&manifest.options.connection_memory_budget);
+        Ok(Some(Self {
+            manifest,
+            names,
+            out_schema,
+            bound,
+            fixed_width,
+            op_stats: reader.op_stats.clone(),
+            budget,
+        }))
+    }
+
+    /// Of `candidates`, rows of the superfile `r` reads, those the
+    /// predicate holds at.
+    pub(crate) async fn keep(
+        &self,
+        r: &Arc<SuperfileReader>,
+        candidates: &RoaringBitmap,
+    ) -> Result<RoaringBitmap, QueryError> {
+        // Fixed-width columns over a superfile a chunk could cover are
+        // read in one take, which reads each column once; past that, in
+        // chunks small enough to stay sparse takes. Variable-width
+        // columns are read in chunks sized by their decoded bytes.
+        let n_docs = usize::try_from(r.n_docs()).map_err(QueryError::internal)?;
+        let whole_file_rows =
+            EXACT_SCOPE_TAKE_ROWS.saturating_mul(WHOLE_COLUMN_TAKE_DIVISOR as usize);
+        let mut take_rows = match (self.fixed_width, n_docs <= whole_file_rows) {
+            (true, true) => n_docs.max(1),
+            (true, false) => EXACT_SCOPE_TAKE_ROWS,
+            (false, _) => EXACT_SCOPE_FIRST_TAKE_ROWS,
+        };
+        let refs: Vec<&str> = self.names.iter().map(String::as_str).collect();
+        let mut kept = RoaringBitmap::new();
+        let mut remaining = candidates.iter();
+        loop {
+            let chunk: Vec<u32> = remaining.by_ref().take(take_rows).collect();
+            if chunk.is_empty() {
+                break;
+            }
+            if let Some(stats) = &self.op_stats {
+                stats.add_rows_materialized(chunk.len() as u64);
+            }
+            let batch = take_file_columns(
+                &self.manifest,
+                r,
+                chunk.clone(),
+                &refs,
+                &self.out_schema,
+                &self.op_stats,
+            )
+            .await
+            .map_err(QueryError::DataFusion)?;
+            // The chunk's columns count against the connection's budget
+            // while they are checked; a budget they don't fit refuses
+            // the query, as a SQL operator that can't spill is refused.
+            let bytes = batch.get_array_memory_size();
+            let _held = self.budget.try_reserve(bytes).map_err(|over| {
+                QueryError::OverBudget(format!("during a WHERE's exact pass, {over}"))
+            })?;
+            if !self.fixed_width {
+                let per_row = (bytes / chunk.len()).max(1);
+                take_rows = (EXACT_SCOPE_TAKE_BYTES / per_row)
+                    .clamp(EXACT_SCOPE_FIRST_TAKE_ROWS, EXACT_SCOPE_TAKE_ROWS);
+            }
+            let bound = Arc::clone(&self.bound);
+            // The predicate runs over up to a chunk of rows: compute, so
+            // the reader pool takes it rather than the tokio worker. It
+            // hands back the positions it holds at; the chunk maps them
+            // to rows here.
+            let (held, ns) = run_on_pool(
+                Some(&self.manifest.options.reader_pool),
+                "exact scope check",
+                move || {
+                    timed_section(|| {
+                        bound.mask(&batch).map(|mask| {
+                            mask.iter()
+                                .enumerate()
+                                .filter_map(|(at, holds)| (holds == Some(true)).then_some(at))
+                                .collect::<Vec<usize>>()
+                        })
+                    })
+                },
+            )
+            .await
+            .map_err(QueryError::internal)?;
+            if let Some(stats) = &self.op_stats {
+                stats.add_kernel_cpu_ns(ns);
+            }
+            kept.extend(
+                held.map_err(QueryError::DataFusion)?
+                    .into_iter()
+                    .map(|at| chunk[at]),
+            );
+        }
+        Ok(kept)
+    }
 }
 
 /// Output column carrying the per-hit score (vector distance or BM25

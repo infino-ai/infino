@@ -72,8 +72,9 @@
 
 use std::{
     borrow::Cow,
-    cmp::Ordering,
+    cmp::{Ordering, Reverse},
     collections::{BTreeSet, HashMap, HashSet},
+    future::Future,
     iter::repeat_n,
     slice,
     sync::{
@@ -146,6 +147,7 @@ use crate::{
             exec::common::{
                 hit_output_schema, resolve_hits_named, take_file_columns, take_rows_byte_source,
             },
+            match_order::MatchOrder,
             provider::prune_leaves_for_filters,
             prune::{PruneLeaf, select_superfiles},
             tier,
@@ -522,9 +524,9 @@ struct SharedTopK {
 /// Ordered by score, then by `_id` range *descending*, so of two equal
 /// scores the one from the higher range is the lesser and leaves the
 /// heap first: the stable top-k keeps the lower `_id` of a tie, and so
-/// does the heap — a seed placeholder (`i128::MAX`) in particular gives
-/// way to a real score equal to it. BM25 scores are finite, but `f32`
-/// still needs an `Ord` shim.
+/// does the heap — a seed placeholder from the tier merge in particular
+/// gives way to a real score equal to it from a lower range. BM25 scores
+/// are finite, but `f32` still needs an `Ord` shim.
 #[derive(PartialEq, Clone, Copy)]
 struct FloorEntry {
     score: f32,
@@ -645,8 +647,11 @@ impl SharedTopK {
     /// ranks behind each of those, and one below it is out regardless.
     /// Sound for any `_id` ranges: every `_id` of this superfile is at
     /// least `id_min`, and every tied document's is at most its
-    /// superfile's `id_max`. A seed placeholder carries `i128::MAX` and so
-    /// never justifies a skip.
+    /// superfile's `id_max`. A seed placeholder from the tier merge stands
+    /// for `k` real documents scoring at least its score, from superfiles
+    /// whose `_id`s are at most its `id_max`; while one is among the top
+    /// `k`, those documents rank at least as high as the last entry, so a
+    /// tie behind it is behind `k` real documents.
     ///
     /// Of the entries at the floor the last is the one from the highest
     /// range (equal scores order by range descending), so one look settles
@@ -1374,7 +1379,17 @@ impl SupertableReader {
         );
         let ranked_started = Instant::now();
         let learned = manifest.options.tier_merge_gate;
-        let merge_now = tiers_serve && (!learned || self.tier_policy().merge(policy_class));
+        // Past one open window of superfiles the merge always runs: there
+        // the opens it can save run to the table's size, and on a table
+        // whose best documents tie across superfiles — the same title in
+        // every hour of a time-ordered log — only the documents the merge
+        // reads tell the tied superfiles apart, where the ceilings, loose
+        // by the length rescale, open them all. Its measured costs still
+        // decide how deep it reads. Within a window the table's learned
+        // call stands.
+        let forced = tiers_serve && kept.len() > manifest.options.ordered_open_window();
+        let merge_now =
+            tiers_serve && (forced || !learned || self.tier_policy().merge(policy_class));
         // The deny sets, resolved only for a merge: it reads past the
         // deleted rows, and the units then admit rows by the same sets, so
         // a delete committed between the two reads cannot leave the
@@ -1449,6 +1464,9 @@ impl SupertableReader {
             // A phrase's members in order, a repeated word repeated: the
             // kernel weights every occurrence.
             let members = |p: &[String]| -> Vec<usize> { p.iter().filter_map(index_of).collect() };
+            // A superfile lacking a word of a should-phrase bounds it at
+            // zero through that word's empty head, so only a must-phrase's
+            // words need be required.
             let tier_phrases: Vec<(Vec<usize>, bool)> = must_phrases
                 .iter()
                 .map(|p| (members(p), true))
@@ -1484,6 +1502,8 @@ impl SupertableReader {
                     open_cost_ns: self.open_cost_ns(),
                     entry_cost_ns: self.tier_entry_cost_ns(),
                     merge_gate: manifest.options.tier_merge_gate,
+                    forced,
+                    budget: Arc::clone(&manifest.options.connection_memory_budget),
                 });
             }
         }
@@ -2034,6 +2054,11 @@ impl SupertableReader {
             let global_idf = merge_idf;
             let pool = &manifest.options.reader_pool;
             let span = fanout_span.clone();
+            // The floor the opens build, read by the merge between rounds:
+            // what it need no longer read for.
+            let floor_reader = Arc::clone(&merge_floor);
+            let live_floor: Arc<dyn Fn() -> f32 + Send + Sync> =
+                Arc::new(move || floor_reader.floor());
             let merger = merge_floor;
             // The kept superfiles in the order the merge bounds them.
             let merged_ids: Vec<Uuid> = merge_kept.iter().map(|e| e.superfile_id).collect();
@@ -2116,9 +2141,12 @@ impl SupertableReader {
                     });
                     // The tiers' lower bound on the k-th score is a floor
                     // every kernel may prune against; the real scores that
-                    // replace these placeholders only raise it.
+                    // replace these placeholders only raise it. They stand
+                    // for k real documents at `_id`s no higher than the
+                    // threshold's, so a superfile that can only tie them and
+                    // holds only higher `_id`s is skipped on the tie.
                     if selection.theta_lb.is_finite() {
-                        merger.merge(i128::MAX, repeat_n(selection.theta_lb, k));
+                        merger.merge(selection.theta_id_max, repeat_n(selection.theta_lb, k));
                     }
                     let resolved = answered.len() as u64;
                     if resolved > 0 && let Some(stats) = &reader.op_stats {
@@ -2152,7 +2180,7 @@ impl SupertableReader {
             let window = manifest.options.ordered_open_window();
             match prepared {
                 Some(prepared) if prepared.resident => {
-                    let selection = prepared.run().await.unwrap_or_else(|e| {
+                    let selection = prepared.run(live_floor).await.unwrap_or_else(|e| {
                         unreadable(e);
                         None
                     });
@@ -2173,7 +2201,7 @@ impl SupertableReader {
                 }
                 Some(prepared) => {
                     replan = Some(Box::pin(async move {
-                        match prepared.run().await {
+                        match prepared.run(live_floor).await {
                             Ok(Some(selection)) => Some(make_plan(selection)),
                             Ok(None) => None,
                             Err(e) => {
@@ -2246,8 +2274,10 @@ impl SupertableReader {
         let hits = select_top_k_stable(self, per_unit, k, &id_mins).await?;
         // Noted for the way the policy chose, whether or not the merge
         // then ran: a shape it declines every time is thereby measured as
-        // the cost of asking, and the class settles on not asking.
-        if tiers_serve && learned {
+        // the cost of asking, and the class settles on not asking. A merge
+        // the table's size forced was not the policy's choice, and what it
+        // cost says nothing of a query within one window.
+        if tiers_serve && learned && !forced {
             // A merge that reported says whether it did anything; one that
             // declined did nothing by construction; one that did not get
             // to report says nothing.
@@ -2509,7 +2539,9 @@ impl SupertableReader {
     }
 
     /// Every term in `column` starting with `prefix_leaf`'s prefix, across
-    /// the superfiles in `kept`, deduplicated and in byte order.
+    /// the superfiles in `kept`, deduplicated and in byte order: from the
+    /// term index for the superfiles it covers, from the dictionaries of
+    /// the rest.
     async fn expand_prefix(
         &self,
         column: &str,
@@ -2522,6 +2554,32 @@ impl SupertableReader {
             ));
         };
         let column_field_id = self.manifest().field_id(column);
+        // The index holds every term of the superfiles it covers, in byte
+        // order: those expand from it, and only the superfiles it does not
+        // cover open to read their dictionaries.
+        let mut terms: BTreeSet<Vec<u8>> = BTreeSet::new();
+        let index = self
+            .manifest()
+            .term_index()
+            .await
+            .map_err(QueryError::from)?;
+        let kept: Vec<Arc<SuperfileEntry>> = match (&index, column_field_id, str::from_utf8(prefix))
+        {
+            (Some(index), Some(field), Ok(text)) => {
+                let (covered, rest): (Vec<_>, Vec<_>) = kept
+                    .into_iter()
+                    .partition(|entry| index.is_indexed(&entry.superfile_id));
+                let live: HashSet<Uuid> = covered.iter().map(|e| e.superfile_id).collect();
+                if !live.is_empty() {
+                    terms = index
+                        .prefix_terms(field, text, &live)
+                        .await
+                        .map_err(QueryError::from)?;
+                }
+                rest
+            }
+            _ => kept,
+        };
         let column_arc: Arc<str> = Arc::from(column);
         let prefix_arc: Arc<[u8]> = Arc::from(prefix.as_slice());
         let pool = Arc::clone(&self.manifest().options.reader_pool);
@@ -2549,7 +2607,7 @@ impl SupertableReader {
             },
         )
         .await?;
-        let terms: BTreeSet<Vec<u8>> = per_superfile.into_iter().flatten().collect();
+        terms.extend(per_superfile.into_iter().flatten());
         // Dictionary keys are valid UTF-8 by construction: a tokenizer emits
         // `&str` terms.
         Ok(terms
@@ -2711,8 +2769,70 @@ impl SupertableReader {
         query: &str,
         mode: BoolMode,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
-        self.token_match_hits_async(column, query, mode, true, &[])
+        self.token_match_hits_async(column, query, mode, true, &[], None)
             .await
+    }
+
+    /// An unranked match's walk of `units` with `body`: every superfile at
+    /// once, or, under an `ORDER BY column LIMIT n` the walk can honour
+    /// ([`MatchOrder`]), in the column's order a few at a time, leaving out
+    /// the rows the `WHERE` drops and stopping once no superfile left can
+    /// place a row.
+    async fn match_fanout<P, B, Fut>(
+        &self,
+        units: Vec<(Arc<SuperfileEntry>, P)>,
+        body: B,
+        order: Option<&Arc<MatchOrder>>,
+    ) -> Result<Vec<Vec<SuperfileHit>>, QueryError>
+    where
+        P: Send + 'static,
+        B: Fn(
+                Arc<SuperfileReader>,
+                Arc<SuperfileEntry>,
+                Option<Arc<SidecarCache>>,
+                Instant,
+                P,
+            ) -> Fut
+            + Clone
+            + Send
+            + 'static,
+        Fut: Future<Output = Result<Vec<SuperfileHit>, QueryError>> + Send + 'static,
+    {
+        let Some((order, best)) = order.and_then(|order| Some((order, order.best_ranks(&units)?)))
+        else {
+            return dispatch::fanout_with(self, units, true, self.open_intent(), body).await;
+        };
+        // Each unit carries its best rank, best first.
+        let mut units: Vec<(Arc<SuperfileEntry>, (u64, P))> = units
+            .into_iter()
+            .zip(best)
+            .map(|((entry, params), best)| (entry, (best, params)))
+            .collect();
+        units.sort_by_key(|(_, (best, _))| Reverse(*best));
+        let widest = self.options().superfiles_in_flight;
+        let walk = Arc::clone(order);
+        let ordered = move |r: Arc<SuperfileReader>,
+                            entry: Arc<SuperfileEntry>,
+                            cache: Option<Arc<SidecarCache>>,
+                            now: Instant,
+                            (_, params): (u64, P)| {
+            let body = body.clone();
+            let walk = Arc::clone(&walk);
+            async move {
+                let hits = body(Arc::clone(&r), entry, cache, now, params).await?;
+                walk.keep(&r, hits).await
+            }
+        };
+        dispatch::fanout_with_ordered(
+            self,
+            units,
+            |answered| MatchOrder::window(answered, widest),
+            |(best, _): &(u64, P)| order.passed(*best),
+            ordered,
+            |_| {},
+            None::<dispatch::ReplanFuture<'_, _, _>>,
+        )
+        .await
     }
 
     /// [`Self::token_match_async`] with a say over whether every hit
@@ -2734,13 +2854,14 @@ impl SupertableReader {
         mode: BoolMode,
         stamp_stable_ids: bool,
         filters: &[Expr],
+        order: Option<&Arc<MatchOrder>>,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
         let Some((units, kernel)) = self.match_kernel(column, query, mode, filters).await? else {
             return Ok(Vec::new());
         };
         let phases = self.phase_spans();
         let fanout_span = trace::phase(phases, || tiered_span!("fts.fanout", units = units.len()));
-        let per_unit = dispatch::fanout_local_hits(self, units, move |r, suid| {
+        let body = dispatch::local_hits_body(move |r: Arc<SuperfileReader>, suid: Uuid| {
             let kernel = Arc::clone(&kernel);
             async move {
                 Ok(kernel
@@ -2750,9 +2871,11 @@ impl SupertableReader {
                     .map(|d| (d.get(), 0.0f32))
                     .collect::<Vec<_>>())
             }
-        })
-        .instrument(fanout_span)
-        .await?;
+        });
+        let per_unit = self
+            .match_fanout(units, body, order)
+            .instrument(fanout_span)
+            .await?;
         // Exact pre-size: `Flatten`'s size_hint is opaque, and growth
         // reallocations copy the whole hit vec repeatedly at 1M hits.
         let total: usize = per_unit.iter().map(Vec::len).sum();
@@ -3305,6 +3428,7 @@ impl SupertableReader {
         column: &str,
         value: &str,
         filters: &[Expr],
+        order: Option<&Arc<MatchOrder>>,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
         let manifest = self.manifest();
         // `exact_match` prunes through the column's own term dictionary, so
@@ -3478,7 +3602,8 @@ impl SupertableReader {
             }
         };
         let fanout_span = trace::phase(phases, || tiered_span!("fts.fanout", units = units.len()));
-        let per_unit = dispatch::fanout_with(self, units, true, self.open_intent(), body)
+        let per_unit = self
+            .match_fanout(units, body, order)
             .instrument(fanout_span)
             .await?;
         let mut hits: Vec<SuperfileHit> = per_unit.into_iter().flatten().collect();
@@ -3646,7 +3771,7 @@ impl SupertableReader {
     /// hits are **unranked** (`score` is `0.0`).
     pub fn exact_match(&self, column: &str, value: &str) -> Result<Vec<SuperfileHit>, QueryError> {
         let _foreground = ForegroundQueryGuard::enter();
-        self.block_on(self.exact_match_async(column, value, &[]))
+        self.block_on(self.exact_match_async(column, value, &[], None))
     }
 }
 
