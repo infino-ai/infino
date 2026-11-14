@@ -2437,30 +2437,41 @@ impl TableProvider for SupertableProvider {
 
         // The files a scan of kept decoded columns would read (built below,
         // once the Parquet scan it stands in for is). Not for a scan the index
-        // narrowed to a few rows (the Parquet scan decodes just their pages),
-        // nor for a scan of no column — except the rows a top-k reads from
-        // the range index: up to the cutoff, ties included, they are spread
-        // over the file, so the Parquet scan decodes a page of every wide
-        // column for each, where kept columns hand them over decoded.
+        // narrowed to a few rows in every superfile (the Parquet scan decodes
+        // just their pages), nor for a scan of no column — except:
+        // - the rows a top-k reads from the range index: up to the cutoff,
+        //   ties included, they are spread over the file, so the Parquet scan
+        //   decodes a page of every wide column for each, where kept columns
+        //   hand them over decoded;
+        // - a scan the index narrowed in some superfiles only: the others are
+        //   read whole, which kept columns serve, and the Parquet scan the
+        //   narrowed ones would keep it on would decode every superfile again
+        //   on every statement. The narrowed ones hand over their rows from
+        //   the same kept columns.
         let output = projected_schema(&self.schema, projection)?;
-        let top_k_selected = top_k_rows.is_some();
+        let narrowed = superfiles
+            .iter()
+            .filter(|seg| seg.candidates.is_some())
+            .count();
+        let partly_narrowed = narrowed > 0 && narrowed < superfiles.len();
+        let selects_rows = top_k_rows.is_some() || partly_narrowed;
         let cached_files = (self.manifest.options.decoded_columns.is_some()
             && has_columns(&output)
-            && (top_k_selected || superfiles.iter().all(|seg| seg.candidates.is_none())))
-        .then(|| {
-            superfiles
-                .iter()
-                .zip(&survivor_entries)
-                .map(|(seg, entry)| CachedFile {
-                    uri: entry.uri,
-                    reader: Arc::clone(&seg.prepared.reader),
-                    footer: Arc::clone(&seg.prepared.footer),
-                    row_counts: Arc::clone(&seg.prepared.row_counts),
-                    tombstones: Arc::clone(&seg.tombstones),
-                    selected: top_k_selected.then(|| seg.candidates.clone()).flatten(),
-                })
-                .collect::<Vec<_>>()
-        });
+            && (selects_rows || narrowed == 0))
+            .then(|| {
+                superfiles
+                    .iter()
+                    .zip(&survivor_entries)
+                    .map(|(seg, entry)| CachedFile {
+                        uri: entry.uri,
+                        reader: Arc::clone(&seg.prepared.reader),
+                        footer: Arc::clone(&seg.prepared.footer),
+                        row_counts: Arc::clone(&seg.prepared.row_counts),
+                        tombstones: Arc::clone(&seg.tombstones),
+                        selected: selects_rows.then(|| seg.candidates.clone()).flatten(),
+                    })
+                    .collect::<Vec<_>>()
+            });
         let cached_stats = cached_files
             .is_some()
             .then(|| scan_stats.clone().project(projection));
