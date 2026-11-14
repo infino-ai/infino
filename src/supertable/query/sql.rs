@@ -53,7 +53,12 @@
 //! output and never reaches a caller — a `SELECT`, `GROUP BY` key, or
 //! `MIN`/`MAX` over a string column always comes back `LargeUtf8`.
 
-use std::{collections::HashSet, future::Future, sync::Arc, time::Instant};
+use std::{
+    collections::HashSet,
+    future::Future,
+    sync::{Arc, OnceLock},
+    time::Instant,
+};
 
 use arrow::{
     compute::{cast, concat_batches},
@@ -62,11 +67,15 @@ use arrow::{
 use arrow_array::{Array, Decimal128Array, Int64Array, new_empty_array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::{
+    catalog::{CatalogProviderList, MemoryCatalogProviderList},
     common::{Column, DFSchema, ScalarValue, runtime::SpawnedTask, tree_node::TreeNode},
     dataframe::DataFrame,
     datasource::DefaultTableSource,
     error::DataFusionError,
-    execution::{TaskContext, context::SessionContext},
+    execution::{
+        SessionStateDefaults, TaskContext,
+        context::{SessionContext, SessionState},
+    },
     functions_aggregate::{count::count_all, expr_fn::count},
     logical_expr::{
         Expr, ExprFunctionExt, LogicalPlan, lit, simplify::SimplifyContext,
@@ -248,6 +257,47 @@ pub(crate) fn sql_session_context(
     ctx.add_optimizer_rule(Arc::new(RangeTopK));
     ctx.add_optimizer_rule(Arc::new(MatchTopK));
     Ok(ctx)
+}
+
+/// [`sql_session_context`] built once and handed out as a copy per
+/// statement: its configuration, its optimizer rules and DataFusion's
+/// function library are the same for every statement on a connection, and
+/// building them again took a seventh of a small statement's time. Each copy
+/// gets a catalog list of its own, so the tables and table functions one
+/// statement registers are never seen by another.
+#[derive(Default)]
+pub(crate) struct SessionTemplate(OnceLock<SessionState>);
+
+impl SessionTemplate {
+    /// A context for one statement, as [`sql_session_context`] builds it,
+    /// with an empty catalog of its own.
+    pub(crate) fn context(
+        &self,
+        budget: &Arc<ConnectionMemoryBudget>,
+    ) -> Result<SessionContext, DataFusionError> {
+        let template = match self.0.get() {
+            Some(template) => template,
+            None => {
+                let built = sql_session_context(budget)?.state();
+                self.0.get_or_init(|| built)
+            }
+        };
+        // A copy of the template shares its catalog list: a fresh list, with
+        // the default catalog and schema the template was built with.
+        let mut state = template.clone();
+        let catalogs = MemoryCatalogProviderList::new();
+        let default_catalog = SessionStateDefaults::default_catalog(
+            state.config(),
+            state.table_factories(),
+            state.runtime_env(),
+        );
+        catalogs.register_catalog(
+            state.config().options().catalog.default_catalog.clone(),
+            Arc::new(default_catalog),
+        );
+        state.register_catalog_list(Arc::new(catalogs));
+        Ok(SessionContext::new_with_state(state))
+    }
 }
 
 impl SupertableReader {
