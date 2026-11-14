@@ -430,10 +430,37 @@ impl MatchKernel {
 }
 
 /// The row filter walks a superfile's postings only when the match keeps at
-/// least this many times the rows the filter's estimate keeps. Below it the
-/// walk drops too few rows to pay for itself, and the narrowed rows miss the
-/// decoded-column cache an unnarrowed repeat would hit.
+/// least this many times the rows the filter's estimate keeps, for a match
+/// that takes no column but the filter's own. Below it the walk drops too few
+/// rows to pay for itself, and the narrowed rows miss the decoded-column cache
+/// an unnarrowed repeat would hit.
 const ROW_FILTER_MIN_HITS_RATIO: u64 = 2;
+
+/// [`ROW_FILTER_MIN_HITS_RATIO`] for a match that takes more for each hit: its
+/// id and score, or a column the filter does not read. Each row the walk drops
+/// saves that work, so the walk pays once its estimate is at most the hits.
+const ROW_FILTER_MIN_HITS_RATIO_TAKING_MORE: u64 = 1;
+
+/// The ratio a match's row filter walks at (see [`ROW_FILTER_MIN_HITS_RATIO`]):
+/// [`ROW_FILTER_MIN_HITS_RATIO_TAKING_MORE`] when the match takes a column of
+/// `names` that `filters` do not read.
+fn row_filter_ratio(names: &[&str], filters: &[Expr]) -> u64 {
+    let read: HashSet<&str> = filters
+        .iter()
+        .flat_map(Expr::column_refs)
+        .map(|column| column.name.as_str())
+        .collect();
+    match names.iter().any(|name| !read.contains(name)) {
+        true => ROW_FILTER_MIN_HITS_RATIO_TAKING_MORE,
+        false => ROW_FILTER_MIN_HITS_RATIO,
+    }
+}
+
+/// Whether a row filter whose estimate keeps `estimate` rows is walked for a
+/// match keeping `hits`, at `ratio` (see [`ROW_FILTER_MIN_HITS_RATIO`]).
+fn walks_row_filter(estimate: u64, hits: u64, ratio: u64) -> bool {
+    estimate.saturating_mul(ratio) <= hits
+}
 
 /// The rows a pushed-down `WHERE` keeps in each superfile, read from its
 /// indexes on the reader the match already opened, so a match takes no
@@ -450,6 +477,9 @@ struct RowFilter {
     op_stats: Option<Arc<op_stats::OpStatsCollector>>,
     /// Each superfile's rows, found once and shared by its slices.
     found: SuperfileCells<Option<Arc<RoaringBitmap>>>,
+    /// How many times the filter's estimate the match must keep for the
+    /// filter to be walked ([`ROW_FILTER_MIN_HITS_RATIO`]).
+    min_hits_ratio: u64,
 }
 
 impl RowFilter {
@@ -461,6 +491,7 @@ impl RowFilter {
         filters: &[Expr],
         kept: &[Arc<SuperfileEntry>],
         op_stats: Option<Arc<op_stats::OpStatsCollector>>,
+        min_hits_ratio: u64,
     ) -> Result<Option<Self>, QueryError> {
         if filters.is_empty() {
             return Ok(None);
@@ -478,13 +509,14 @@ impl RowFilter {
             pool,
             op_stats,
             found: SuperfileCells::default(),
+            min_hits_ratio,
         }))
     }
 
     /// The rows of superfile `suid` the filter can keep, or `None` when it
     /// does not narrow them. `hits` bounds the rows the match keeps there:
-    /// the filter's postings are walked only when its estimate is well
-    /// below that (see [`ROW_FILTER_MIN_HITS_RATIO`]).
+    /// the filter's postings are walked only when its estimate is below
+    /// that (see [`ROW_FILTER_MIN_HITS_RATIO`]).
     async fn rows(
         &self,
         r: &Arc<SuperfileReader>,
@@ -503,7 +535,7 @@ impl RowFilter {
                     .estimate(r, Some(&self.pool), Some(located))
                     .await?;
                 self.flush(&work);
-                if estimate.saturating_mul(ROW_FILTER_MIN_HITS_RATIO) > hits {
+                if !walks_row_filter(estimate, hits, self.min_hits_ratio) {
                     return Ok::<_, QueryError>(None);
                 }
                 // The walk is CPU work: on the pool, not on a runtime worker.
@@ -2859,7 +2891,11 @@ impl SupertableReader {
         stamp_stable_ids: bool,
         filters: &[Expr],
     ) -> Result<Vec<SuperfileHit>, QueryError> {
-        let Some((units, kernel)) = self.match_kernel(column, query, mode, filters).await? else {
+        let ratio = ROW_FILTER_MIN_HITS_RATIO_TAKING_MORE;
+        let Some((units, kernel)) = self
+            .match_kernel(column, query, mode, filters, ratio)
+            .await?
+        else {
             return Ok(Vec::new());
         };
         let phases = self.phase_spans();
@@ -2914,7 +2950,11 @@ impl SupertableReader {
         names: &[&str],
         filters: &[Expr],
     ) -> Result<Vec<RecordBatch>, QueryError> {
-        let Some((units, kernel)) = self.match_kernel(column, query, mode, filters).await? else {
+        let ratio = row_filter_ratio(names, filters);
+        let Some((units, kernel)) = self
+            .match_kernel(column, query, mode, filters, ratio)
+            .await?
+        else {
             return Ok(Vec::new());
         };
         let reader_pool = Arc::clone(&self.manifest().options.reader_pool);
@@ -3027,7 +3067,9 @@ impl SupertableReader {
         mode: BoolMode,
         scope: &CandidateScope,
     ) -> Result<CandidateScope, QueryError> {
-        let Some((units, kernel)) = self.match_kernel(column, query, mode, &[]).await? else {
+        let ratio = ROW_FILTER_MIN_HITS_RATIO;
+        let Some((units, kernel)) = self.match_kernel(column, query, mode, &[], ratio).await?
+        else {
             return Ok(CandidateScope::empty());
         };
         let admitted: HashSet<SuperfileUri> =
@@ -3096,6 +3138,7 @@ impl SupertableReader {
         query: &str,
         mode: BoolMode,
         filters: &[Expr],
+        min_hits_ratio: u64,
     ) -> Result<Option<(Vec<(Arc<SuperfileEntry>, Uuid)>, Arc<MatchKernel>)>, QueryError> {
         let phases = self.phase_spans();
         let select_span = trace::phase(phases, || {
@@ -3128,7 +3171,13 @@ impl SupertableReader {
                 .instrument(trace::phase(phases, || {
                     detail_span!("fts.term_index", terms = all_terms.len())
                 })),
-            RowFilter::new(self.manifest(), filters, &kept, self.op_stats.clone()),
+            RowFilter::new(
+                self.manifest(),
+                filters,
+                &kept,
+                self.op_stats.clone(),
+                min_hits_ratio,
+            ),
         )
         .await;
         let (locations, row_filter) = (locations?, row_filter?);
@@ -3491,7 +3540,13 @@ impl SupertableReader {
                 .instrument(trace::phase(phases, || {
                     detail_span!("fts.term_index", terms = token_refs.len())
                 })),
-            RowFilter::new(manifest, filters, &kept, self.op_stats.clone()),
+            RowFilter::new(
+                manifest,
+                filters,
+                &kept,
+                self.op_stats.clone(),
+                ROW_FILTER_MIN_HITS_RATIO,
+            ),
         )
         .await;
         let (locations, row_filter) = (locations?, row_filter?.map(Arc::new));
@@ -4395,7 +4450,60 @@ mod tests {
         time::Instant,
     };
 
+    use super::{
+        ROW_FILTER_MIN_HITS_RATIO, ROW_FILTER_MIN_HITS_RATIO_TAKING_MORE, row_filter_ratio,
+        walks_row_filter,
+    };
     use crate::supertable::manifest::ScalarStats;
+
+    /// Rows a match keeps in a superfile, for the row filter's gate.
+    const GATE_HITS: u64 = 3_500;
+    /// A filter's estimate below those hits but above half of them: a time
+    /// range keeping 6% of a superfile under a match keeping 8.5% of it.
+    const GATE_ESTIMATE: u64 = 2_500;
+
+    /// A match that takes only the filter's columns walks the filter when it
+    /// keeps twice its estimate; one that takes more for each hit walks it
+    /// when it keeps the estimate, since each row dropped saves that work.
+    #[test]
+    fn the_row_filter_is_walked_sooner_for_a_match_taking_more() {
+        assert!(!walks_row_filter(
+            GATE_ESTIMATE,
+            GATE_HITS,
+            ROW_FILTER_MIN_HITS_RATIO
+        ));
+        assert!(walks_row_filter(
+            GATE_ESTIMATE,
+            GATE_HITS,
+            ROW_FILTER_MIN_HITS_RATIO_TAKING_MORE
+        ));
+        assert!(walks_row_filter(
+            GATE_ESTIMATE,
+            2 * GATE_ESTIMATE,
+            ROW_FILTER_MIN_HITS_RATIO
+        ));
+        assert!(!walks_row_filter(
+            GATE_HITS + 1,
+            GATE_HITS,
+            ROW_FILTER_MIN_HITS_RATIO_TAKING_MORE
+        ));
+    }
+
+    /// A match taking a column its filters do not read takes more for each
+    /// hit; one taking only the columns they read does not.
+    #[test]
+    fn a_match_taking_a_column_its_filters_do_not_read_takes_more() {
+        let filters = [col("ts").gt_eq(lit(1_i64)).and(col("ts").lt(lit(2_i64)))];
+        assert_eq!(
+            row_filter_ratio(&["ts"], &filters),
+            ROW_FILTER_MIN_HITS_RATIO
+        );
+        assert_eq!(
+            row_filter_ratio(&["ts", "host"], &filters),
+            ROW_FILTER_MIN_HITS_RATIO_TAKING_MORE
+        );
+        assert_eq!(row_filter_ratio(&[], &filters), ROW_FILTER_MIN_HITS_RATIO);
+    }
 
     /// A phrase's members are conjunctive, so a quoted phrase on its own
     /// prunes on all of them.
