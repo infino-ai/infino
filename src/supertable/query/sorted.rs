@@ -493,7 +493,9 @@ mod tests {
         let st = table(&dir);
         let intervals: [(Expr, &str); 5] = [
             (
-                col("key").gt_eq(lit(10_i64)).and(col("key").lt(lit(20_i64))),
+                col("key")
+                    .gt_eq(lit(10_i64))
+                    .and(col("key").lt(lit(20_i64))),
                 "key >= 10 AND key < 20",
             ),
             (col("key").gt(lit(45_i64)), "key > 45"),
