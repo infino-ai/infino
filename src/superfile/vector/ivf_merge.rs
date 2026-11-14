@@ -1081,9 +1081,12 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::superfile::vector::{
-        builder::{VectorConfig, build_merged_subsection_from_fp32},
-        rerank_codec::{SQ8_FIXED_OFFSET, SQ8_FIXED_SCALE},
+    use crate::{
+        config::scratch_root,
+        superfile::vector::{
+            builder::{VectorConfig, build_merged_subsection_from_fp32},
+            rerank_codec::{SQ8_FIXED_OFFSET, SQ8_FIXED_SCALE},
+        },
     };
 
     /// Dim of the tiny fixture corpus.
@@ -1212,7 +1215,8 @@ mod tests {
             rerank_codec: RerankCodec::Sq8FixedResidual,
             provided_centroids: Some(Arc::from(centroids)),
         };
-        build_merged_subsection_from_fp32(cfg, N_CENT, Arc::new(vectors), &ids).expect("cell build")
+        build_merged_subsection_from_fp32(cfg, N_CENT, Arc::new(vectors), &ids, &scratch_root())
+            .expect("cell build")
     }
 
     /// Stable `_id`s follow the same survivor numbering as the splice: a
@@ -1307,7 +1311,7 @@ mod tests {
             rerank_codec: RerankCodec::Sq16,
             provided_centroids: Some(Arc::from(centroids)),
         };
-        build_merged_subsection_from_fp32(cfg, N_CENT, Arc::new(vectors), &ids)
+        build_merged_subsection_from_fp32(cfg, N_CENT, Arc::new(vectors), &ids, &scratch_root())
             .expect("Sq16 cell build")
     }
 
@@ -1385,8 +1389,14 @@ mod tests {
                 rerank_codec: codec,
                 provided_centroids: Some(Arc::from(centroids.clone())),
             };
-            let sub = build_merged_subsection_from_fp32(cfg, 1, Arc::new(vectors.clone()), &ids)
-                .expect("cell build");
+            let sub = build_merged_subsection_from_fp32(
+                cfg,
+                1,
+                Arc::new(vectors.clone()),
+                &ids,
+                &scratch_root(),
+            )
+            .expect("cell build");
             sq8_ivf_merge_input_from_subsection(
                 &sub.bytes,
                 D,
@@ -1561,7 +1571,7 @@ mod tests {
                 rerank_codec: RerankCodec::Sq16Adaptive,
                 provided_centroids: Some(Arc::from(vec![0.0f32; D])),
             };
-            build_merged_subsection_from_fp32(cfg, 1, Arc::new(vectors), &ids)
+            build_merged_subsection_from_fp32(cfg, 1, Arc::new(vectors), &ids, &scratch_root())
                 .expect("Sq16Adaptive cell build")
         };
 

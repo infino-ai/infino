@@ -55,6 +55,10 @@ const FTS_OPEN_HEADER_FALLBACK_BYTES: u64 = 48;
 /// without busy-spinning.
 const MMAP_PROMOTION_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
+/// Directory, under the cache root, where the table's builds keep their
+/// temporary files.
+const SCRATCH_SUBDIR: &str = "scratch";
+
 /// Most bytes of fetched runs a store holds in memory before they are written to block files. Past
 /// this, reads still get their bytes but don't cache them, so a slow disk costs refetches later,
 /// not memory or query time.
@@ -518,7 +522,12 @@ impl DiskCacheStore {
     /// Where a build may spill its scratch: beside the cache, on the disk
     /// sized for the table, rather than in the system temporary directory.
     pub(crate) fn scratch_root(&self) -> PathBuf {
-        self.config.cache_root.join("scratch")
+        let dir = self.config.cache_root.join(SCRATCH_SUBDIR);
+        // Made on each call, so a build still has it after the cache
+        // folder was cleared under an open table. A failure shows up when
+        // the build creates its first file there.
+        let _ = fs::create_dir_all(&dir);
+        dir
     }
 
     /// Whether this cache's checksum policy verifies a superfile a merge
