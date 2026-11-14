@@ -37,7 +37,12 @@
 //! column was decoded, and the reader keeps its bytes, so a later load decodes
 //! from memory and never reads storage again.
 
-use std::{collections::HashSet, mem::size_of, ops::Range, sync::Arc};
+use std::{
+    collections::HashSet,
+    mem::size_of,
+    ops::Range,
+    sync::{Arc, LazyLock},
+};
 
 use bytes::Bytes;
 use parquet::{
@@ -77,6 +82,9 @@ pub(crate) const UNLOADED_CHUNK_BYTES: u64 = (size_of::<ColumnIndexMetaData>()
     + size_of::<OffsetIndexMetaData>()
     + size_of::<PageLocation>()) as u64;
 
+/// The set of no column, shared so [`IndexColumns::none`] allocates nothing.
+static NO_COLUMNS: LazyLock<Arc<IndexColumnSet>> = LazyLock::new(Arc::default);
+
 /// Which top-level columns' page index a load brings in.
 #[derive(Clone, Debug)]
 pub(crate) enum IndexColumns {
@@ -97,7 +105,7 @@ pub(crate) struct IndexColumnSet {
 impl IndexColumns {
     /// No column.
     pub(crate) fn none() -> Self {
-        Self::Only(Arc::default())
+        Self::Only(Arc::clone(&NO_COLUMNS))
     }
 
     /// The columns named, each with its field id when it has one.
@@ -141,6 +149,16 @@ impl IndexColumns {
             (Self::Only(mine), Self::Only(theirs)) => {
                 theirs.ids.is_subset(&mine.ids) && theirs.names.is_subset(&mine.names)
             }
+        }
+    }
+
+    /// Whether these include every column of `names`, as
+    /// [`Self::covers`] would for [`Self::named`]`(names)`, without building
+    /// a set: what a warm take checks.
+    pub(crate) fn holds_names(&self, names: &[&str]) -> bool {
+        match self {
+            Self::All => true,
+            Self::Only(set) => names.iter().all(|name| set.names.contains(*name)),
         }
     }
 

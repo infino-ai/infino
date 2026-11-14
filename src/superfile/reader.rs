@@ -1275,7 +1275,7 @@ impl SuperfileReader {
         &self,
         columns: &IndexColumns,
     ) -> Option<(IndexColumns, Arc<ParquetMetaData>)> {
-        let (held, footer) = self.held_footer(columns)?;
+        let (held, footer) = self.held_footer(|held| held.covers(columns))?;
         Some((held, Arc::clone(footer.parquet())))
     }
 
@@ -1302,8 +1302,12 @@ impl SuperfileReader {
         first: FirstLoad,
         pool: Option<&ThreadPool>,
     ) -> Result<(IndexColumns, Arc<ParquetMetaData>), ReadError> {
+        // Held first: a warm caller walks no leaves.
+        if let Some((held, footer)) = self.held_footer(|held| held.covers(columns)) {
+            return Ok((held, Arc::clone(footer.parquet())));
+        }
         let first = self.first_load(columns, first);
-        if let Some((held, footer)) = self.ready_footer(columns, first) {
+        if let Some((held, footer)) = self.ready_footer(|held| held.covers(columns), first) {
             return Ok((held, Arc::clone(footer.parquet())));
         }
         if first == FirstLoad::Start
@@ -1320,6 +1324,22 @@ impl SuperfileReader {
             .await
             .map_err(|_| ReadError::TaskDropped(PAGE_INDEX_DECODE))??;
         Ok((held, Arc::clone(footer.parquet())))
+    }
+
+    /// [`Self::page_indexed_footer`] for columns by the file's own names, as
+    /// a take reads them. A reader that needs no load answers without building
+    /// a column set, so a warm take allocates nothing and walks no leaves.
+    pub(crate) async fn page_indexed_footer_named(
+        self: &Arc<Self>,
+        names: &[&str],
+        first: FirstLoad,
+        pool: Option<&ThreadPool>,
+    ) -> Result<Arc<ParquetMetaData>, ReadError> {
+        if let Some((_, footer)) = self.ready_footer(|held| held.holds_names(names), first) {
+            return Ok(Arc::clone(footer.parquet()));
+        }
+        let columns = IndexColumns::named(names);
+        Ok(self.page_indexed_footer(&columns, first, pool).await?.1)
     }
 
     /// [`Self::page_indexed_footer`] for a test, decoding in place.
@@ -1366,22 +1386,25 @@ impl SuperfileReader {
         }
     }
 
-    /// The footer, and the columns it holds, when those include `columns`.
+    /// The footer, and the columns it holds, when `holds` accepts those.
     /// Reads the columns before the footer: a load stores the footer first.
-    fn held_footer(&self, columns: &IndexColumns) -> Option<(IndexColumns, Arc<Footer>)> {
-        let held = self.index_columns.load_full()?;
-        held.covers(columns)
-            .then(|| ((*held).clone(), self.footer.load_full()))
+    fn held_footer(
+        &self,
+        holds: impl Fn(&IndexColumns) -> bool,
+    ) -> Option<(IndexColumns, Arc<Footer>)> {
+        let held = self.index_columns.load();
+        let held = held.as_ref()?;
+        holds(held).then(|| ((**held).clone(), self.footer.load_full()))
     }
 
     /// [`Self::held_footer`], or with [`FirstLoad::Skip`] a footer with no page
     /// index, which every read can use. `None` means a load would do work.
     fn ready_footer(
         &self,
-        columns: &IndexColumns,
+        holds: impl Fn(&IndexColumns) -> bool,
         first: FirstLoad,
     ) -> Option<(IndexColumns, Arc<Footer>)> {
-        if let Some(held) = self.held_footer(columns) {
+        if let Some(held) = self.held_footer(holds) {
             return Some(held);
         }
         let current = self.footer.load_full();
@@ -1447,12 +1470,13 @@ impl SuperfileReader {
         columns: &IndexColumns,
         first: FirstLoad,
     ) -> Result<(IndexColumns, Arc<Footer>), ReadError> {
-        if let Some(ready) = self.ready_footer(columns, first) {
+        let holds = |held: &IndexColumns| held.covers(columns);
+        if let Some(ready) = self.ready_footer(holds, first) {
             return Ok(ready);
         }
         let mut state = self.lock_page_index();
         // A load before this one may have added them.
-        if let Some(ready) = self.ready_footer(columns, first) {
+        if let Some(ready) = self.ready_footer(holds, first) {
             return Ok(ready);
         }
         let current = self.footer.load_full();
@@ -1483,10 +1507,10 @@ impl SuperfileReader {
         if widening && *widens >= WIDENS_BEFORE_LOADING_EVERY_COLUMN {
             added = IndexColumns::All.leaves(schema) - loaded;
         }
-        // A footer already indexed needs no new copy for no new leaf (a column
-        // the file does not store); one not yet indexed gets its entries even
-        // then, so DataFusion's opener never loads the page index itself.
-        let indexed = if added.is_empty() && parquet.offset_index().is_some() {
+        // No new leaf (the columns are loaded, or the file stores none of them)
+        // needs no new footer. A load that starts the page index always adds a
+        // leaf ([`Self::first_load`]), so the footer here is indexed already.
+        let indexed = if added.is_empty() {
             None
         } else {
             #[cfg(test)]
@@ -1601,6 +1625,21 @@ impl SuperfileReader {
             .resident()
             .cloned()
             .ok_or(ReadError::LazyReaderUnsupported)
+    }
+
+    /// [`Self::resident_arrow_metadata`] for columns by the file's own names. A
+    /// reader that needs no load answers without building a column set.
+    fn resident_arrow_metadata_named(
+        &self,
+        names: &[&str],
+    ) -> Result<ArrowReaderMetadata, ReadError> {
+        if let Some((_, footer)) =
+            self.ready_footer(|held| held.holds_names(names), FirstLoad::Skip)
+            && let Some(arrow) = footer.resident()
+        {
+            return Ok(arrow.clone());
+        }
+        self.resident_arrow_metadata(&IndexColumns::named(names))
     }
 
     /// Arrow schema of the user-visible columns (Parquet rows).
@@ -2516,7 +2555,7 @@ impl SuperfileReader {
             // bytes — callers fan these across `options.reader_pool`. Asks for
             // the page index of the columns Parquet serves only, not of an
             // `_id` the sidecar answers.
-            let arrow_meta = self.resident_arrow_metadata(&IndexColumns::named(&parquet_names))?;
+            let arrow_meta = self.resident_arrow_metadata_named(&parquet_names)?;
             let builder = ParquetRecordBatchReaderBuilder::new_with_metadata(bytes, arrow_meta);
             let mask = ProjectionMask::roots(builder.parquet_schema(), col_indices.iter().copied());
             let builder = builder.with_projection(mask);
@@ -2626,7 +2665,7 @@ impl SuperfileReader {
             .as_ref()
             .ok_or(ReadError::LazyReaderUnsupported)?
             .clone();
-        let mut arrow_meta = self.resident_arrow_metadata(&IndexColumns::named(projection))?;
+        let mut arrow_meta = self.resident_arrow_metadata_named(projection)?;
         if !views.is_empty() {
             arrow_meta = ArrowReaderMetadata::try_new(
                 Arc::clone(arrow_meta.metadata()),

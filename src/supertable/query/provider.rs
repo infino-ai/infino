@@ -340,11 +340,12 @@ impl ScanFileOpener {
                         .await
                         .map_err(QueryError::store)?,
                     };
-                    // Loaded through the reader's own byte source. Serving
-                    // DataFusion a footer without a page index would make its
-                    // opener fetch the index through the metered store, but
-                    // only for lazily opened readers, so `sql_page_bytes`
-                    // would depend on the reader cache's state.
+                    // Loaded through the reader's own byte source, so
+                    // DataFusion's opener never fetches the index through the
+                    // metered store (only a lazily opened reader would, making
+                    // `sql_page_bytes` depend on the reader cache's state). A
+                    // scan of no column the file stores gets the plain footer:
+                    // with no page predicate the opener loads no page index.
                     let (held, parquet_meta) = match &columns {
                         None => (None, reader.parquet_metadata()),
                         Some(columns) => {
@@ -3435,7 +3436,10 @@ mod tests {
     use object_store::OBJECT_STORE_COALESCE_DEFAULT;
     use parquet::{
         arrow::arrow_reader::{RowSelection, RowSelector},
-        file::page_index::column_index::ColumnIndexMetaData,
+        file::{
+            metadata::{PageIndexPolicy, ParquetMetaDataReader},
+            page_index::column_index::ColumnIndexMetaData,
+        },
     };
     use rand::{RngExt, SeedableRng, rngs::StdRng};
     use rayon::ThreadPoolBuilder;
@@ -3454,6 +3458,8 @@ mod tests {
                 analysis::{Stemmer, Stopwords, chain_tokenizer},
                 tokenize::StandardTokenizer,
             },
+            lazy_source::LazyByteSource,
+            page_index::PageIndexBytes,
             vector::layout::VectorLayout,
         },
         supertable::{
@@ -5849,6 +5855,100 @@ mod tests {
                 .filter(|_| rng.random_bool(RANDOM_CACHED_ODDS))
                 .collect(),
         }
+    }
+
+    /// Whether DataFusion's own Parquet opener reads any byte of `file`'s page
+    /// index when it scans the file as `table` (which may hold columns the file
+    /// lacks) through the plain footer: the one a scan of no column the file
+    /// stores gets ([`SuperfileReader::page_indexed_footer`]). Reads are exact,
+    /// with no cache to widen them, so each one DataFusion makes is recorded.
+    async fn opener_reads_the_page_index(
+        file: &WideFile,
+        table: SchemaRef,
+        projection: Vec<usize>,
+        filter: Option<Expr>,
+    ) -> bool {
+        let span = PageIndexBytes::span(&file.1).expect("the file has a page index");
+        let plain = ParquetMetaDataReader::new()
+            .with_page_index_policy(PageIndexPolicy::Skip)
+            .parse_and_finish(&file.0)
+            .expect("plain footer");
+        assert!(plain.offset_index().is_none(), "no page index");
+        let size = file.0.len() as u64;
+        let superfile = fixture::Superfile::new(file.0.clone(), false);
+        let path = ObjPath::from("t/sf.parquet");
+        let store = Arc::new(SuperfileObjectStore::new());
+        store.insert_source(
+            path.clone(),
+            Arc::clone(&superfile) as Arc<dyn LazyByteSource>,
+        );
+        let footers: Arc<ScanFooters> = Arc::new(DashMap::new());
+        footers.insert(
+            path.clone(),
+            Arc::new(ScanFooter::new(Arc::new(plain), IndexColumns::none())),
+        );
+        let read_ahead = Arc::new(ScanReadAhead::new(
+            Arc::clone(&store),
+            ConnectionMemoryBudget::measured(),
+            Arc::clone(&table),
+        ));
+        read_ahead.disable();
+        let factory = ScanReaderFactory {
+            read_ahead,
+            footers,
+        };
+        let mut parquet = ParquetSource::new(Arc::clone(&table))
+            .with_parquet_file_reader_factory(Arc::new(factory));
+        if let Some(filter) = &filter {
+            let df_schema = DFSchema::try_from(Arc::clone(&table)).expect("schema");
+            let predicate = create_physical_expr(filter, &df_schema, &ExecutionProps::new())
+                .expect("predicate");
+            parquet = parquet.with_predicate(predicate);
+        }
+        let url = ObjectStoreUrl::parse("infino-test://t/").expect("url");
+        let file_group = FileGroup::new(vec![PartitionedFile::new(path.to_string(), size)]);
+        let config = FileScanConfigBuilder::new(url.clone(), Arc::new(parquet))
+            .with_file_group(file_group)
+            .with_projection_indices(Some(projection))
+            .expect("projection")
+            .build();
+        let ctx = SessionContext::new();
+        ctx.runtime_env().register_object_store(url.as_ref(), store);
+        collect(DataSourceExec::from_data_source(config), ctx.task_ctx())
+            .await
+            .expect("scan");
+        superfile
+            .reads()
+            .iter()
+            .any(|read| read.start < span.end && span.start < read.end)
+    }
+
+    /// A scan of no column the file stores (a `COUNT(*)`, or only a column
+    /// added after the file was written) gets the plain footer, and
+    /// DataFusion's opener then reads no page index of its own either: with no
+    /// page predicate it loads none. So such a scan makes no page-index GET. A
+    /// filter on a stored column through the same footer does read it, which
+    /// shows the check sees such a read.
+    #[tokio::test]
+    async fn a_scan_of_no_stored_column_reads_no_page_index_in_datafusion() {
+        let file = fixture::wide_file(WIDE_ROWS_PER_GROUP, WIDE_PAGE_ROWS);
+        let mut fields = fixture::schema().fields().to_vec();
+        fields.push(Arc::new(Field::new("added", DataType::Int64, true)));
+        let table: SchemaRef = Arc::new(Schema::new(fields));
+        let added = table.index_of("added").expect("added");
+        let stored = table.index_of("a").expect("a");
+        let reads = |projection: Vec<usize>, filter: Option<Expr>| {
+            opener_reads_the_page_index(&file, Arc::clone(&table), projection, filter)
+        };
+        assert!(!reads(Vec::new(), None).await, "a COUNT(*)");
+        assert!(
+            !reads(vec![added], Some(col("added").eq(lit(5i64)))).await,
+            "a filter on a column the file doesn't store"
+        );
+        assert!(
+            reads(vec![stored], Some(col("a").lt(lit(5i64)))).await,
+            "a filter on a stored column reads the page index"
+        );
     }
 
     #[tokio::test]

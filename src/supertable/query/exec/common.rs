@@ -86,7 +86,7 @@ use crate::{
     superfile::{
         ReadError, SuperfileReader,
         lazy_source::Source,
-        page_index::{IndexColumns, loaded_pages, slice_at},
+        page_index::{loaded_pages, slice_at},
         reader::{
             FirstLoad, WHOLE_COLUMN_TAKE_DIVISOR, in_projection_order, rank_back_indices,
             row_selection_for_ids, view_read_options, whole_row_group,
@@ -1739,10 +1739,9 @@ async fn read_row_group_byte_source(
     let input = ByteSourceAsyncReader {
         source: Source::Lazy(reader.byte_source()),
         metadata: reader
-            .page_indexed_footer(&IndexColumns::named(names), FirstLoad::Skip, Some(pool))
+            .page_indexed_footer_named(names, FirstLoad::Skip, Some(pool))
             .await
-            .map_err(QueryError::from)?
-            .1,
+            .map_err(QueryError::from)?,
         prefetched: Vec::new(),
     };
     let options = if views.is_empty() {
@@ -2067,8 +2066,8 @@ pub(crate) async fn take_rows_byte_source(
             }
         }
     }
-    let (_, metadata) = reader
-        .page_indexed_footer(&IndexColumns::named(names), FirstLoad::Start, pool)
+    let metadata = reader
+        .page_indexed_footer_named(names, FirstLoad::Start, pool)
         .await
         .map_err(QueryError::from)?;
     let source = Source::Lazy(reader.byte_source());
