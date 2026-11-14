@@ -552,6 +552,16 @@ impl DiskCacheStore {
     /// them. Nothing is deleted, since a query on an older snapshot may still read them, but
     /// eviction takes them first unless a query holds them, and their downloads are cancelled.
     /// Without this, a file GC deletes in another process would age out like a live one.
+    ///
+    /// ```text
+    ///   compaction committed here  ──┐
+    ///   (note_superseded)            ├─►  superfiles the new  ─►  mark_dead
+    ///   newer manifest loaded      ──┘    manifest dropped           │
+    ///   (install_manifest)                                           ├─► join the dead set
+    ///                                                                ├─► downloads cancelled
+    ///                                                                └─► evicted first, unless
+    ///                                                                    a query holds them
+    /// ```
     pub(crate) fn mark_dead(&self, uris: &[SuperfileUri]) {
         let held: Vec<SuperfileUri> = uris
             .iter()

@@ -1965,13 +1965,33 @@ impl BlockCachedSource {
     }
 
     /// Queues fetched run `[first, last]` for writing, or returns `None` and keeps nothing (a
-    /// registered run then leaves `runs`), counting the bytes as not kept. The run must, in order:
-    /// 1. take its share of the store's cap on unwritten runs. A read's run is refused when the cap
-    ///    is full; a prefetch's always takes it, since its caller waits for the write;
-    /// 2. if unregistered (a prefetch's or a hedge's), find no other run starting at `first`;
-    /// 3. if a read's on a source that owns its accounting, reserve its budget, evicting as needed.
+    /// registered run then leaves `runs`), counting the bytes as not kept. The caller already has
+    /// the bytes from its GET and serves them either way.
     ///
-    /// Room is made last, so a run the cap or another run turns away never evicts a file.
+    /// ```text
+    ///   fetched run
+    ///        │
+    ///        ▼
+    ///   1. room in the write queue?  ── no ──►  keep nothing, count `write_queue_full`
+    ///      (a prefetch always gets room:
+    ///       its caller waits for the write)
+    ///        │ yes
+    ///        ▼
+    ///   2. another run at `first`?   ── yes ─►  keep nothing, count `run_taken`
+    ///      (unregistered runs only:
+    ///       a prefetch's or a hedge's)
+    ///        │ no
+    ///        ▼
+    ///   3. reserve budget,           ── no room ─►  keep nothing, count `no_room`
+    ///      evicting as needed
+    ///      (a read's run, on a source
+    ///       that owns its accounting)
+    ///        │ ok
+    ///        ▼
+    ///   queue the run for writing
+    /// ```
+    ///
+    /// Room is made last, so a run the queue or another run turns away never evicts a file.
     /// A registered run keeps the `claim`'s entry; an unregistered one gets a new entry.
     async fn admit_run(
         &self,

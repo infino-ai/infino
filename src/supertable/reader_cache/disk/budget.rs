@@ -668,8 +668,29 @@ impl DiskCacheStore {
         self.evict_except(bytes_needed, None).await
     }
 
-    /// Drive the eviction policy until either `bytes_needed` is freed or no eligible victims remain
-    /// (→ `BudgetExceeded`), taking nothing of `keep`: its entry, copy or block file.
+    /// Frees `bytes_needed`, taking nothing of `keep` (its entry, copy or block file), in this
+    /// order, stopping as soon as enough is freed:
+    ///
+    /// ```text
+    ///   ┌─ 1. files no read needs ───────────────────────────────────────────────┐
+    ///   │ block files beside a whole copy           the entry reads the copy     │
+    ///   │ whole copies no read has opened           dead first, then oldest      │
+    ///   │ block files found at startup, not read    dead first, then oldest      │
+    ///   └────────────────────────────────────────────────────────────────────────┘
+    ///                          │ still short
+    ///                          ▼
+    ///   ┌─ 2. one list, least recently read first ───────────────────────────────┐
+    ///   │ live entries                    a copy read through its mmap ranks by  │
+    ///   │                                 its last open (those reads skip us)    │
+    ///   │ block files read since startup  whose entry was dropped                │
+    ///   │                                                                        │
+    ///   │ a dead file no query holds  ─►  ranks first                            │
+    ///   │ a pinned file               ─►  skipped                                │
+    ///   └────────────────────────────────────────────────────────────────────────┘
+    ///                          │ nothing freed at all
+    ///                          ▼
+    ///                    BudgetExceeded
+    /// ```
     pub(super) async fn evict_except(
         &self,
         bytes_needed: u64,
