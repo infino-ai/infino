@@ -127,7 +127,7 @@ use crate::{
     runtime_metrics::{
         ingest::visible_array_bytes,
         op_stats::{self, OpStatsCollector, timed_kernel},
-        rss::available_memory_bytes,
+        rss::{available_memory_bytes, status_anon_rss_bytes, total_memory_bytes},
     },
     storage::{StorageError, StorageProvider, hedged},
     superfile::{
@@ -156,7 +156,7 @@ use crate::{
             builder::{
                 MultiCellSubsectionSource, build_merged_subsection_from_fp32,
                 build_merged_subsection_from_materialized,
-                build_merged_subsection_from_spilled_materialized,
+                build_merged_subsection_from_spilled_materialized, cell_build_peak_bytes,
             },
             cell_posting::{EncodedCellRow, MaterializedIvfRow, transcode_clamped_components},
             distance::Metric,
@@ -179,7 +179,7 @@ use crate::{
     },
     supertable::{
         CommitError as SupertableCommitError, ManifestLoadError,
-        build::{fanout_shards, fanout_shards_metered},
+        build::{fanout_shards, fanout_shards_metered, fanout_within_memory},
         error::{BuildError, ManifestError},
         handle::{
             GLOBAL_VECTOR_KMEANS_ITERS, GLOBAL_VECTOR_KMEANS_SEED, Supertable, SupertableInner,
@@ -7590,86 +7590,106 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                     .map(move |(cell_id, source)| (shard_idx, cell_id, source))
             })
             .collect();
-        let built_cells: Vec<(usize, u32, SpilledPackedCell)> =
-            fanout_shards(drain_pool, &cell_tasks, |&(shard_idx, cell_id, source)| {
-                let cell =
-                    match source {
-                        DrainCellSource::Packed(cell) => cell.clone(),
-                        DrainCellSource::Rows(spill) => {
-                            let _cell_span = detail_span!(
-                                "drain_cell",
-                                parent: &cell_build_span,
-                                cell = *cell_id,
-                                rows = spill.n_rows(),
-                                score_ms = tracing::field::Empty,
-                                score_pool_queries = tracing::field::Empty,
-                                score_read_ms = tracing::field::Empty,
-                                score_estimate_ms = tracing::field::Empty,
-                                score_exact_ms = tracing::field::Empty,
-                                score_trim_ms = tracing::field::Empty,
-                                score_merge_ms = tracing::field::Empty,
-                                sample_ms = tracing::field::Empty,
-                                train_ms = tracing::field::Empty,
-                                n_cent = tracing::field::Empty,
-                                bucket_ms = tracing::field::Empty,
-                                fsync_ms = tracing::field::Empty,
-                                write_ms = tracing::field::Empty,
-                                crc_ms = tracing::field::Empty,
-                                checkpoint_ms = tracing::field::Empty,
-                            )
-                            .entered();
-                            // Calibration reads the spill the pack pass is
-                            // about to read anyway (before remove_files).
-                            if let Some(cal) = width_law_ref {
-                                let score_t0 = time::Instant::now();
-                                let profile = cal.score_cell(*cell_id, spill)?;
-                                record("score_ms", score_t0.elapsed().as_millis() as u64);
-                                record("score_pool_queries", profile.pool_queries as u64);
-                                record("score_read_ms", profile.read.as_millis() as u64);
-                                record("score_estimate_ms", profile.estimate.as_millis() as u64);
-                                record("score_exact_ms", profile.exact.as_millis() as u64);
-                                record("score_trim_ms", profile.trim.as_millis() as u64);
-                                record("score_merge_ms", profile.merge.as_millis() as u64);
-                            }
-                            let cell = build_spilled_packed_cell_from_rows(
-                                scratch,
-                                *cell_id,
-                                spill,
-                                &vector_config,
-                            )?;
-                            // The checkpoint below reopens these files on
-                            // resume, so they must reach disk first. Its
-                            // directory fsync makes the renames durable.
-                            let fsync_t0 = time::Instant::now();
-                            for path in [&cell.subsection_path, &cell.stable_ids_path] {
-                                File::open(path).and_then(|file| file.sync_all()).map_err(
-                                    |error| BuildError::Store(format!("cell fsync: {error}")),
-                                )?;
-                            }
-                            record("fsync_ms", fsync_t0.elapsed().as_millis() as u64);
-                            let checkpoint_t0 = time::Instant::now();
-                            {
-                                let mut state = checkpoint.lock().map_err(|_| {
-                                    BuildError::Store("drain checkpoint lock poisoned".into())
-                                })?;
-                                state.spills.remove(cell_id);
-                                state.built_cells.insert(
-                                    *cell_id,
-                                    DrainLocalCell {
-                                        n_docs: cell.n_docs,
-                                        subsection_len: cell.subsection_len,
-                                        rerank_codec_id: cell.rerank_codec.codec_id(),
-                                    },
-                                );
-                                save_drain_local_checkpoint(&drain_scratch, &state)?;
-                            }
-                            record("checkpoint_ms", checkpoint_t0.elapsed().as_millis() as u64);
-                            spill.remove_files();
-                            cell
-                        }
-                    };
-                Ok::<_, BuildError>((shard_idx, *cell_id, cell))
-            })?;
+        let build_one = |&(shard_idx, cell_id, source): &(usize, &u32, &DrainCellSource)| {
+            let cell = match source {
+                DrainCellSource::Packed(cell) => cell.clone(),
+                DrainCellSource::Rows(spill) => {
+                    let _cell_span = detail_span!(
+                        "drain_cell",
+                        parent: &cell_build_span,
+                        cell = *cell_id,
+                        rows = spill.n_rows(),
+                        score_ms = tracing::field::Empty,
+                        score_pool_queries = tracing::field::Empty,
+                        score_read_ms = tracing::field::Empty,
+                        score_estimate_ms = tracing::field::Empty,
+                        score_exact_ms = tracing::field::Empty,
+                        score_trim_ms = tracing::field::Empty,
+                        score_merge_ms = tracing::field::Empty,
+                        sample_ms = tracing::field::Empty,
+                        train_ms = tracing::field::Empty,
+                        n_cent = tracing::field::Empty,
+                        bucket_ms = tracing::field::Empty,
+                        fsync_ms = tracing::field::Empty,
+                        write_ms = tracing::field::Empty,
+                        crc_ms = tracing::field::Empty,
+                        checkpoint_ms = tracing::field::Empty,
+                    )
+                    .entered();
+                    // Calibration reads the spill the pack pass is
+                    // about to read anyway (before remove_files).
+                    if let Some(cal) = width_law_ref {
+                        let score_t0 = time::Instant::now();
+                        let profile = cal.score_cell(*cell_id, spill)?;
+                        record("score_ms", score_t0.elapsed().as_millis() as u64);
+                        record("score_pool_queries", profile.pool_queries as u64);
+                        record("score_read_ms", profile.read.as_millis() as u64);
+                        record("score_estimate_ms", profile.estimate.as_millis() as u64);
+                        record("score_exact_ms", profile.exact.as_millis() as u64);
+                        record("score_trim_ms", profile.trim.as_millis() as u64);
+                        record("score_merge_ms", profile.merge.as_millis() as u64);
+                    }
+                    let cell = build_spilled_packed_cell_from_rows(
+                        scratch,
+                        *cell_id,
+                        spill,
+                        &vector_config,
+                    )?;
+                    // The checkpoint below reopens these files on
+                    // resume, so they must reach disk first. Its
+                    // directory fsync makes the renames durable.
+                    let fsync_t0 = time::Instant::now();
+                    for path in [&cell.subsection_path, &cell.stable_ids_path] {
+                        File::open(path)
+                            .and_then(|file| file.sync_all())
+                            .map_err(|error| BuildError::Store(format!("cell fsync: {error}")))?;
+                    }
+                    record("fsync_ms", fsync_t0.elapsed().as_millis() as u64);
+                    let checkpoint_t0 = time::Instant::now();
+                    {
+                        let mut state = checkpoint.lock().map_err(|_| {
+                            BuildError::Store("drain checkpoint lock poisoned".into())
+                        })?;
+                        state.spills.remove(cell_id);
+                        state.built_cells.insert(
+                            *cell_id,
+                            DrainLocalCell {
+                                n_docs: cell.n_docs,
+                                subsection_len: cell.subsection_len,
+                                rerank_codec_id: cell.rerank_codec.codec_id(),
+                            },
+                        );
+                        save_drain_local_checkpoint(&drain_scratch, &state)?;
+                    }
+                    record("checkpoint_ms", checkpoint_t0.elapsed().as_millis() as u64);
+                    spill.remove_files();
+                    cell
+                }
+            };
+            Ok::<_, BuildError>((shard_idx, *cell_id, cell))
+        };
+        // How many cells build at once is set by memory, not by the pool's
+        // threads: a cell holds its sample and the files it writes, which
+        // the page cache keeps charged to this process, so a pool's worth of
+        // large cells can pass the process's memory limit and stall every
+        // thread reclaiming pages.
+        let built_cells: Vec<(usize, u32, SpilledPackedCell)> = match drain_cell_memory_budget() {
+            Some(budget) => {
+                info!(
+                    budget_bytes = budget,
+                    cells = cell_tasks.len(),
+                    "[supertable drain] building cells within a memory budget"
+                );
+                fanout_within_memory(
+                    drain_pool,
+                    &cell_tasks,
+                    budget,
+                    |&(_, _, source)| drain_cell_build_bytes(source, &vector_config),
+                    build_one,
+                )?
+            }
+            None => fanout_shards(drain_pool, &cell_tasks, build_one)?,
+        };
         let mut packed_per_shard: Vec<Vec<(u32, SpilledPackedCell)>> = shard_sources
             .iter()
             .map(|(_, cells)| Vec::with_capacity(cells.len()))
@@ -8849,6 +8869,40 @@ fn assign_cells<'a>(
 /// the cell's row count (independent of any caller knob), via the shared
 /// [`fine_run_target_n_cent`] — the same sizing merge re-applies, so a cell's
 /// fine runs stay near target through drains and compactions alike.
+/// Share of the memory free when a drain starts building cells that those
+/// builds may hold at once, in divisor form. The rest is for the page cache
+/// of the spills they read, which the process's memory limit counts too,
+/// and for everything else the process is running.
+const DRAIN_CELL_MEMORY_SHARE_DIVISOR: u64 = 2;
+
+/// The memory a drain's cell builds may hold at once: a share of what is
+/// left under the process's memory limit (its cgroup's, else the host's)
+/// after the memory the process already holds. `None` when no limit can be
+/// read, which leaves the builds bound only by the pool's threads.
+fn drain_cell_memory_budget() -> Option<u64> {
+    let limit = total_memory_bytes()?;
+    let in_use = status_anon_rss_bytes().unwrap_or(0);
+    Some(limit.saturating_sub(in_use) / DRAIN_CELL_MEMORY_SHARE_DIVISOR)
+}
+
+/// The most memory building `source` holds at once (see
+/// [`cell_build_peak_bytes`]); a cell already packed costs nothing.
+fn drain_cell_build_bytes(source: &DrainCellSource, vector_config: &VectorConfig) -> u64 {
+    match source {
+        DrainCellSource::Packed(_) => 0,
+        DrainCellSource::Rows(spill) => {
+            let rows = spill.n_rows();
+            let (cell_config, n_cent) = drain_cell_vector_config(vector_config, rows);
+            let row_bytes = record_bytes(
+                cell_config.dim,
+                cell_config.dim.div_ceil(u8::BITS as usize),
+                spill.rerank_codec(),
+            );
+            cell_build_peak_bytes(cell_config.dim, n_cent, rows, row_bytes)
+        }
+    }
+}
+
 fn drain_cell_vector_config(cfg: &VectorConfig, n_rows: usize) -> (VectorConfig, usize) {
     debug_assert!(n_rows > 0);
     let rerank_codec = if cfg.rerank_codec.is_ivf_mergeable() {
