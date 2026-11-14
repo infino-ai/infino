@@ -243,6 +243,27 @@ fn not_open(import: &str, state: &ImportState) -> InfinoError {
     }
 }
 
+/// Where an import stands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportStatus {
+    /// Its state.
+    pub state: ImportState,
+    /// How many replicas write it.
+    pub writers: Writers,
+    /// When its record or any replica object last changed; `None` when it was never begun.
+    pub last_activity: Option<SystemTime>,
+}
+
+/// Where `import` stands on `table`, read from storage.
+pub fn import_status(table: &Supertable, import: &str) -> Result<ImportStatus, InfinoError> {
+    let (record, _) = read_record(table, import)?;
+    Ok(ImportStatus {
+        last_activity: import_activity(table, import)?,
+        state: record.state,
+        writers: record.writers,
+    })
+}
+
 /// The state `import` is in on `table`.
 pub fn import_state(table: &Supertable, import: &str) -> Result<ImportState, InfinoError> {
     read_record(table, import).map(|(record, _)| record.state)

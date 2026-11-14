@@ -12,11 +12,7 @@
 
 #[cfg(any(test, feature = "test-helpers"))]
 use std::any::Any;
-use std::{
-    fmt,
-    sync::Arc,
-    time::{Duration, SystemTime},
-};
+use std::{fmt, sync::Arc, time::Duration};
 
 use arrow_array::{RecordBatch, RecordBatchReader};
 use arrow_schema::SchemaRef;
@@ -25,8 +21,8 @@ use serde_json::Value;
 
 use crate::{
     Bm25SearchOptions, BoolMode, GcError, GcReport, ImportOutcome, ImportReplica, ImportState,
-    InfinoError, MutationStats, OptimizeError, OptimizeOptions, ReindexError, ReindexOptions,
-    ReplicaAccount, VectorFilter, Writers,
+    ImportStatus, InfinoError, MutationStats, OptimizeError, OptimizeOptions, ReindexError,
+    ReindexOptions, ReplicaAccount, VectorFilter, Writers,
     catalog::ensure_expr_within_connective_cap,
     superfile::VectorSearchOptions,
     supertable::{
@@ -821,48 +817,15 @@ impl Supertable {
     }
 
     /// Begins import `import` on this table, or reports the state it is in: several replicas then
-    /// write its batches at once ([`Self::open_import_replica`]), the table stays queryable as
-    /// [`Self::graft_import`] adds them, and [`Self::finish_import`] closes it with an exact account.
+    /// write its batches at once ([`Self::open_import_replica`]), the table stays queryable as the
+    /// coordinator grafts them ([`Self::import_coordinator`]), and [`Self::finish_import`] closes
+    /// it with an exact account.
     pub fn begin_import(
         &self,
         import: &str,
         writers: Option<Writers>,
     ) -> Result<ImportState, InfinoError> {
         import::begin_import(self.local_for_import()?, import, writers)
-    }
-
-    /// Claims the one report of finished `import`'s outcome: `true` for the first caller on any
-    /// node, `false` after; errors unless it is finished.
-    pub fn claim_import_report(&self, import: &str) -> Result<bool, InfinoError> {
-        import::claim_import_report(self.local_for_import()?, import)
-    }
-
-    /// Aborts `import`: the batches grafted so far stay, the rest are dropped; errors once it is
-    /// finished or was never begun.
-    pub fn abort_import(&self, import: &str) -> Result<(), InfinoError> {
-        import::abort_import(self.local_for_import()?, import)
-    }
-
-    /// When `import`'s record or replicas last changed, read from storage; `None` when it was never
-    /// begun.
-    pub fn import_activity(&self, import: &str) -> Result<Option<SystemTime>, InfinoError> {
-        import::import_activity(self.local_for_import()?, import)
-    }
-
-    /// How many replicas write `import`; errors when it was never begun.
-    pub fn import_writers(&self, import: &str) -> Result<Writers, InfinoError> {
-        import::import_writers(self.local_for_import()?, import)
-    }
-
-    /// The imports on this table that are open or finishing, so a coordinator that restarted can
-    /// take them up again.
-    pub fn open_imports(&self) -> Result<Vec<String>, InfinoError> {
-        import::open_imports(self.local_for_import()?)
-    }
-
-    /// Whether `import` is unknown, open, finishing, finished or aborted on this table.
-    pub fn import_state(&self, import: &str) -> Result<ImportState, InfinoError> {
-        import::import_state(self.local_for_import()?, import)
     }
 
     /// Node `node`'s replica of open import `import`; errors when the import is not open.
@@ -872,17 +835,6 @@ impl Supertable {
         node: &str,
     ) -> Result<ImportReplica, InfinoError> {
         import::open_import_replica(self.local_for_import()?, import, node)
-    }
-
-    /// Seals `node`'s replica of `import` on its behalf, when that node is gone for good.
-    pub fn seal_absent_replica(&self, import: &str, node: &str) -> Result<(), InfinoError> {
-        import::seal_absent_replica(self.local_for_import()?, import, node)
-    }
-
-    /// Adds to this table what `import`'s replicas committed since the last call; one caller per
-    /// import runs it every few seconds while the import is open.
-    pub fn graft_import(&self, import: &str) -> Result<Vec<ReplicaAccount>, InfinoError> {
-        import::graft_import(self.local_for_import()?, import)
     }
 
     /// Finishes `import`: once every replica is sealed, adds what is left, checks every replica's
@@ -897,12 +849,23 @@ impl Supertable {
         import::finish_import(self.local_for_import()?, import, expected_rows)
     }
 
-    /// Whether any import's replicas are attached to this table; its maintenance waits while they
-    /// are.
-    pub fn has_attached_replicas(&self) -> Result<bool, InfinoError> {
-        self.local_for_import()?
-            .has_attached_replicas()
-            .map_err(|e| InfinoError::Backend(e.to_string()))
+    /// Aborts `import`: the batches grafted so far stay, the rest are dropped; errors once it is
+    /// finished or was never begun.
+    pub fn abort_import(&self, import: &str) -> Result<(), InfinoError> {
+        import::abort_import(self.local_for_import()?, import)
+    }
+
+    /// Where `import` stands: its state, its writers and when it last changed.
+    pub fn import_status(&self, import: &str) -> Result<ImportStatus, InfinoError> {
+        import::import_status(self.local_for_import()?, import)
+    }
+
+    /// The calls only an import's coordinator makes: grafting, sealing for gone nodes, finding
+    /// open imports after a restart, and claiming the report of a finished import.
+    pub fn import_coordinator(&self) -> Result<ImportCoordinator<'_>, InfinoError> {
+        Ok(ImportCoordinator {
+            table: self.local_for_import()?,
+        })
     }
 
     /// Test-only: the underlying local engine handle. Panics for a hosted
@@ -922,5 +885,35 @@ impl Supertable {
 impl fmt::Debug for Supertable {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Supertable").finish_non_exhaustive()
+    }
+}
+
+/// The calls only an import's coordinator makes; see [`Supertable::import_coordinator`].
+pub struct ImportCoordinator<'a> {
+    table: &'a SupertableHandle,
+}
+
+impl ImportCoordinator<'_> {
+    /// Adds to the table what `import`'s replicas committed since the last call; one caller per
+    /// import runs it every few seconds while the import is open.
+    pub fn graft(&self, import: &str) -> Result<Vec<ReplicaAccount>, InfinoError> {
+        import::graft_import(self.table, import)
+    }
+
+    /// Seals `node`'s replica of `import` on its behalf, when that node is gone.
+    pub fn seal_absent(&self, import: &str, node: &str) -> Result<(), InfinoError> {
+        import::seal_absent_replica(self.table, import, node)
+    }
+
+    /// The imports on the table that are open or finishing, so a coordinator that restarted can
+    /// take them up again.
+    pub fn open_imports(&self) -> Result<Vec<String>, InfinoError> {
+        import::open_imports(self.table)
+    }
+
+    /// Claims the one report of finished `import`'s outcome: `true` for the first caller on any
+    /// node, `false` after; errors unless it is finished.
+    pub fn claim_report(&self, import: &str) -> Result<bool, InfinoError> {
+        import::claim_import_report(self.table, import)
     }
 }

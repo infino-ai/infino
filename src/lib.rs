@@ -170,18 +170,18 @@ mod utils;
 /// Import as `infino::arrow_schema` and `infino::arrow_array`.
 pub use arrow_array;
 pub use arrow_schema;
-/// Single-table handle: `append` / `update` / `delete` / `bm25_search`
-/// / `vector_search` / `schema`. The public handle is the catalog wrapper,
-/// which serves a local or a hosted table behind one type; the engine's
-/// concrete handle stays internal (reachable as `supertable::Supertable`
-/// only under `test-helpers`).
-pub use catalog::Supertable;
 /// Catalog entry points and handle: open a `Connection`, then create /
 /// open / drop / list tables.
 pub use catalog::{
     ColdFetchMode, ConnectOptions, Connection, FtsField, IndexSpec, QueryCancel, connect,
     connect_with,
 };
+/// Single-table handle: `append` / `update` / `delete` / `bm25_search`
+/// / `vector_search` / `schema`. The public handle is the catalog wrapper,
+/// which serves a local or a hosted table behind one type; the engine's
+/// concrete handle stays internal (reachable as `supertable::Supertable`
+/// only under `test-helpers`).
+pub use catalog::{ImportCoordinator, Supertable};
 pub use config::{
     CompactionSettings, CompactionSteps, GcSettings, OptimizeOptions, OptimizeSteps,
     RecalibratePolicy, ReindexMode, ReindexOptions, ReindexTarget, SuperfileIndex,
@@ -211,7 +211,9 @@ pub use superfile::{
     vector::{distance::Metric, rerank_codec::RerankCodec},
 };
 /// An import several replicas write into one table at once (see [`Supertable::begin_import`]).
-pub use supertable::import::{ImportOutcome, ImportReplica, ImportState, ReplicaAccount, Writers};
+pub use supertable::import::{
+    ImportOutcome, ImportReplica, ImportState, ImportStatus, ReplicaAccount, Writers,
+};
 pub use supertable::{
     Consistency, GcError, GcReport, MutationStats, OptimizeError, ReindexError,
     query::vector::VectorFilter,
