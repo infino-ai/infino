@@ -1331,6 +1331,40 @@ fn comparison_range(
     }
 }
 
+/// `filter` as one interval of keys on a range-indexed column that is not
+/// a float: a comparison or a `BETWEEN` against literals, as the scan
+/// bounds it, with the column's id and type. The range index holds exactly
+/// the rows whose key lies in the interval, so where every superfile has
+/// the index these are exactly the filter's rows (a NULL holds no key and
+/// passes no comparison). Floats are left out, for their NaNs and signed
+/// zeros. `None` for any other filter.
+pub(crate) fn exact_range(
+    filter: &Expr,
+    range_cols: &RangeColumns,
+) -> Option<(FieldId, DataType, u64, u64)> {
+    let plan = match filter {
+        Expr::BinaryExpr(be)
+            if matches!(
+                be.op,
+                Operator::Eq | Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq
+            ) =>
+        {
+            comparison_range(&be.left, be.op, &be.right, range_cols)
+        }
+        Expr::Between(between) if !between.negated => between_range(between, range_cols),
+        _ => return None,
+    };
+    match plan {
+        CandidatePlan::Range {
+            field,
+            data_type,
+            lo,
+            hi,
+        } if !data_type.is_floating() => Some((field, data_type, lo, hi)),
+        _ => None,
+    }
+}
+
 /// Lower `column BETWEEN low AND high` on a range-indexed column.
 fn between_range(between: &Between, range_cols: &RangeColumns) -> CandidatePlan {
     let (Expr::Column(c), Expr::Literal(low, _), Expr::Literal(high, _)) = (
@@ -1557,15 +1591,20 @@ fn like_parts<'a>(
     })
 }
 
-/// A `WHERE` conjunct the term dictionary answers exactly: `column ILIKE
-/// '%needle%'`, with the rows it matches read from the postings rather
-/// than the text (see [`exact_contains`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A `WHERE` conjunct the term dictionary answers exactly, with the rows it
+/// matches read from the postings rather than the text: `column ILIKE
+/// '%needle%'` (see [`exact_contains`]), the rows of every indexed term
+/// that contains `needle`, or one token of a `text_match` (`whole`), the
+/// rows of the indexed term that is `needle`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct ExactContains {
     /// The FTS column.
     pub(crate) column: String,
     /// The pattern's literal, lowercased: one whole `standard` token.
     pub(crate) needle: String,
+    /// Whether the rows are the term `needle`'s own (`text_match`) rather
+    /// than those of every term containing it (`ILIKE`).
+    pub(crate) whole: bool,
 }
 
 /// `filter` as an [`ExactContains`], or `None` when it stays a bounded,
@@ -1604,7 +1643,48 @@ pub(crate) fn exact_contains(
     one_token.then(|| ExactContains {
         column: parts.column.to_owned(),
         needle,
+        whole: false,
     })
+}
+
+/// `filter` as the [`ExactFilter`] of a `text_match(column, query, mode)`
+/// call: one whole-token leaf per query token, under `AND` for `'and'` and
+/// `OR` for `'or'`. `None` when it is no such call, the table's schema does
+/// not index its column by `standard` (the function's own analyzer, so the
+/// postings agree with it), or its query holds no token (no row matches;
+/// the function says so row by row).
+///
+/// The column is taken from the schema, not from the FTS columns the table
+/// was created with, so a text column added later is answered too. A
+/// superfile written before its index has no postings for it: the scan
+/// checks that superfile's rows against their text instead (see the
+/// provider's `exact_rows`).
+fn exact_text_match(
+    filter: &Expr,
+    resolve: &dyn Fn(&str) -> Option<Arc<dyn Tokenizer>>,
+) -> Option<ExactFilter> {
+    let (column, tokens, mode) = crate::supertable::query::text_match::text_match_call(filter)?;
+    if resolve(&column)?.name() != STANDARD_TOKENIZER {
+        return None;
+    }
+    let mut leaves: Vec<ExactFilter> = tokens
+        .into_iter()
+        .map(|needle| {
+            ExactFilter::Contains(ExactContains {
+                column: column.clone(),
+                needle,
+                whole: true,
+            })
+        })
+        .collect();
+    match leaves.len() {
+        0 => None,
+        1 => leaves.pop(),
+        _ => Some(match mode {
+            crate::supertable::query::text_match::TextMatchMode::All => ExactFilter::And(leaves),
+            crate::supertable::query::text_match::TextMatchMode::Any => ExactFilter::Or(leaves),
+        }),
+    }
 }
 
 /// An `AND` / `OR` tree of [`ExactContains`] leaves, e.g. `title ILIKE
@@ -1708,7 +1788,8 @@ pub(crate) fn exact_filter(
                 false => ExactFilter::Or(flat),
             })
         }
-        _ => exact_contains(filter, fts_cols, resolve).map(ExactFilter::Contains),
+        _ => exact_text_match(filter, resolve)
+            .or_else(|| exact_contains(filter, fts_cols, resolve).map(ExactFilter::Contains)),
     }
 }
 
@@ -2996,6 +3077,7 @@ mod tests {
         Some(ExactContains {
             column: "title".into(),
             needle: text.into(),
+            whole: false,
         })
     }
 
@@ -3085,6 +3167,7 @@ mod tests {
         ExactFilter::Contains(ExactContains {
             column: column.into(),
             needle: needle.into(),
+            whole: false,
         })
     }
 

@@ -47,6 +47,7 @@ pub(crate) mod sorted;
 pub(crate) mod sorted_root;
 pub mod sql;
 pub mod superfile_reader;
+pub(crate) mod text_match;
 pub(crate) mod tier;
 pub(crate) mod topk_row_filter;
 pub(crate) mod value_count_carry;

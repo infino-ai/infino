@@ -1491,3 +1491,90 @@ fn a_reader_running_while_the_schema_grows_sees_only_coherent_snapshots() {
         "one row per generation"
     );
 }
+
+/// A text column added after the table was created is not among the FTS
+/// columns the table was created with, yet `text_match` on it is answered
+/// from its postings, and a superfile written before the column existed,
+/// which holds no postings for it, has its rows checked against their
+/// (null) text. Every answer is `token_match`'s.
+#[test]
+fn a_text_match_on_a_text_column_added_later_answers_as_token_match_does() {
+    let db = connect("memory://").expect("connect");
+    let docs = db
+        .create_table(TABLE, title_schema(), IndexSpec::new().fts("title"))
+        .expect("create");
+    docs.append(&batch(vec![("title", titles(&["rust one", "go two"]))]))
+        .expect("append before the column");
+    db.apply_schema(
+        TABLE,
+        &SchemaPatch::new(vec![
+            FieldPatch::named("body")
+                .with_type(DataType::LargeUtf8)
+                .with_index(ColumnIndex::Fts {
+                    stopwords: Stopwords::None,
+                    stemmer: Stemmer::None,
+                    positions: true,
+                    stored: true,
+                    bm25: Bm25Params::default(),
+                }),
+        ]),
+        None,
+    )
+    .expect("add an indexed text column");
+    docs.append_rows(&[
+        serde_json::json!({"title": "three", "body": "rust and Go"}),
+        serde_json::json!({"title": "four", "body": "nothing here"}),
+    ])
+    .expect("append with the column");
+
+    for (query, mode, want) in [
+        ("rust", "or", &["three"][..]),
+        ("go rust", "and", &["three"][..]),
+        ("nothing missing", "or", &["four"][..]),
+        ("zzq", "or", &[][..]),
+    ] {
+        let predicate =
+            format!("SELECT title FROM {TABLE} WHERE text_match(body, '{query}', '{mode}')");
+        assert_eq!(rows(&db, &predicate), want, "{predicate}");
+        let function = format!(
+            "SELECT title FROM {TABLE} WHERE _id IN \
+             (SELECT _id FROM token_match('{TABLE}', 'body', '{query}', '{mode}'))"
+        );
+        assert_eq!(rows(&db, &function), want, "{function}");
+    }
+    // Beside a leaf on the column the table was created with: both files.
+    assert_eq!(
+        rows(
+            &db,
+            &format!(
+                "SELECT title FROM {TABLE} WHERE text_match(title, 'rust') OR text_match(body, 'rust')"
+            )
+        ),
+        vec!["rust one", "three"]
+    );
+    assert_eq!(
+        rows(
+            &db,
+            &format!(
+                "SELECT COUNT(*) FROM {TABLE} WHERE text_match(title, 'go') OR text_match(body, 'go')"
+            )
+        ),
+        vec!["2"]
+    );
+    // Exact: nothing in the plan evaluates it.
+    let plan = rows(
+        &db,
+        &format!(
+            "EXPLAIN SELECT title FROM {TABLE} WHERE text_match(title, 'rust') OR text_match(body, 'rust')"
+        ),
+    );
+    let physical: Vec<&String> = plan
+        .iter()
+        .filter(|r| r.starts_with("physical_plan"))
+        .collect();
+    assert!(!physical.is_empty(), "{plan:?}");
+    assert!(
+        physical.iter().all(|r| !r.contains("text_match")),
+        "{plan:?}"
+    );
+}

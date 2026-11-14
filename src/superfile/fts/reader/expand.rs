@@ -616,6 +616,51 @@ impl FtsReader {
         Ok((out, work))
     }
 
+    /// For each of `terms`, the Parquet rows of `column` that hold the term
+    /// as one of their tokens: the term's own postings, through the same
+    /// cursors [`Self::token_match`] walks, served from `prefetched` (the
+    /// table's term index) where it holds the term. Every row is proven
+    /// ([`ContainsRows::doubtful`] is empty): the rows a term's postings hold
+    /// are by definition the rows that have it as a token, and the caller
+    /// (the table layer's `text_match`) asks for the tokens `standard` gives
+    /// a value, so each term is looked up as `standard` wrote it. One result
+    /// per term, in order; a term the column never indexed has no rows.
+    ///
+    /// Errors as [`Self::contains_rows`] does: `FtsError::UnknownColumn`
+    /// when `column` is not FTS-indexed here, `FtsError::ExactNeedsStandard`
+    /// when this superfile indexed it with another analyzer.
+    pub(crate) async fn term_rows(
+        &self,
+        column: &str,
+        terms: &[&str],
+        prefetched: Option<&crate::superfile::fts::reader::FetchedTermMemo>,
+    ) -> Result<(Vec<ContainsRows>, MatchWork), FtsError> {
+        let column_id = self.resolve_column_id(column)?;
+        let analyzer = self.columns[column_id as usize].tokenizer.name();
+        if analyzer != STANDARD_TOKENIZER {
+            return Err(FtsError::ExactNeedsStandard {
+                column: column.to_owned(),
+                analyzer: analyzer.to_owned(),
+            });
+        }
+        let mut work = MatchWork::default();
+        let mut out = Vec::with_capacity(terms.len());
+        for term in terms {
+            let (rows, term_work) = self
+                .token_match_prefetched(column, &[term], crate::BoolMode::Or, prefetched)
+                .await?;
+            work.merge(term_work);
+            out.push(ContainsRows {
+                proven: rows
+                    .into_iter()
+                    .map(crate::superfile::id_space::RowId::get)
+                    .collect(),
+                doubtful: RoaringBitmap::new(),
+            });
+        }
+        Ok((out, work))
+    }
+
     /// The Parquet rows the postings behind `values` hold, unioned. Inline
     /// (df=1) values carry their document; the rest are fetched in waves
     /// of at most [`CONTAINS_FETCH_BATCH_BYTES`] on this runtime and ORed
