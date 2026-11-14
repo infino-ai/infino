@@ -65,6 +65,12 @@ use crate::{
 /// whose first superfiles place every row stops within one or two of them.
 pub(crate) const ORDERED_WINDOW: usize = 2;
 
+/// The walk runs only when at least one in this many pairs of superfiles
+/// adjacent in its order hold ranges that do not overlap: a table written
+/// in the column's order separates nearly every pair, one whose every
+/// superfile spans the column's values separates none.
+const SEPARATED_SHARE_DENOMINATOR: usize = 2;
+
 /// An `ORDER BY column LIMIT n` a match walk honours: the column, its
 /// direction, the limit, and the `WHERE` it checks to know which rows count.
 pub(crate) struct MatchOrder {
@@ -170,27 +176,43 @@ impl MatchOrder {
     /// the column, may hold a null in it (a null sorts first under a
     /// descending sort, outside every range), lacks the column, or holds it
     /// in a type the table has since left: the walk cannot then know what
-    /// it leaves out.
+    /// it leaves out. `None` too when the superfiles' ranges overlap: the
+    /// walk passes a superfile only once the rows in hand beat its best
+    /// key, which a range overlapping its neighbours' rarely allows, so it
+    /// would read every superfile's key column for nothing.
     pub(crate) fn best_ranks<P>(&self, units: &[(Arc<SuperfileEntry>, P)]) -> Option<Vec<u64>> {
-        units
+        let ranges: Vec<(u64, u64)> = units
             .iter()
-            .map(|(entry, _)| {
-                if self.guard.absent_from(entry) || self.guard.stats_are_stale(entry) {
-                    return None;
-                }
-                let stats = entry.scalar_stats.column(self.field)?;
-                if stats.null_count() != Some(0) {
-                    return None;
-                }
-                let (min, max) = stats.min_max_values()?;
-                let best = match self.descending {
-                    true => max,
-                    false => min,
-                };
-                let (_, key) = literal_key(&best, &self.data_type)?;
-                Some(self.rank(key))
-            })
-            .collect()
+            .map(|(entry, _)| self.rank_range(entry))
+            .collect::<Option<_>>()?;
+        let mut walk_order = ranges.clone();
+        walk_order.sort_unstable_by_key(|&(best, _)| Reverse(best));
+        let separated = walk_order
+            .windows(2)
+            .filter(|pair| pair[0].1 >= pair[1].0)
+            .count();
+        if separated * SEPARATED_SHARE_DENOMINATOR < walk_order.len().saturating_sub(1) {
+            return None;
+        }
+        Some(ranges.into_iter().map(|(best, _)| best).collect())
+    }
+
+    /// The best and worst rank a row of `entry` can take, from its
+    /// statistics; `None` when they cannot be trusted (see
+    /// [`Self::best_ranks`]).
+    fn rank_range(&self, entry: &SuperfileEntry) -> Option<(u64, u64)> {
+        if self.guard.absent_from(entry) || self.guard.stats_are_stale(entry) {
+            return None;
+        }
+        let stats = entry.scalar_stats.column(self.field)?;
+        if stats.null_count() != Some(0) {
+            return None;
+        }
+        let (min, max) = stats.min_max_values()?;
+        let (_, min) = literal_key(&min, &self.data_type)?;
+        let (_, max) = literal_key(&max, &self.data_type)?;
+        let (min, max) = (self.rank(min), self.rank(max));
+        Some((min.max(max), min.min(max)))
     }
 
     /// Whether a superfile whose best rank is `best` can no longer place a

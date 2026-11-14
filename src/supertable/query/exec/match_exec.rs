@@ -710,6 +710,7 @@ mod tests {
             Supertable, SupertableOptions,
             error::QueryError,
             handle::SupertableReader,
+            manifest::SuperfileEntry,
             query::{
                 exec::common::{output_schema_with_score, test_support::sql_row_count},
                 match_order::{MatchOrder, ORDERED_WINDOW},
@@ -2052,6 +2053,68 @@ mod tests {
         let conn = hourly_conn();
         assert!(walked(&conn, "nothingatall", "", "hour DESC", "LIMIT 3", "hour").is_empty());
     }
+
+    /// A sort column whose range spans the same values in every superfile:
+    /// no superfile can be passed, so the walk declines and the match takes
+    /// the ordinary fan-out, with the same answer.
+    #[test]
+    fn order_by_a_column_overlapping_in_every_superfile_does_not_walk() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new("hour", DataType::Int64, false),
+        ]));
+        let commits: Vec<RecordBatch> = (0..OVERLAPPING_FILES)
+            .map(|file| {
+                RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![
+                        Arc::new(LargeStringArray::from(vec!["Zyzzyva", "Zyzzyva"])),
+                        Arc::new(Int64Array::from(vec![0, OVERLAPPING_TOP + file])),
+                    ],
+                )
+                .expect("batch")
+            })
+            .collect();
+        let conn = metered_table_in(
+            connect("memory://").expect("connect"),
+            &schema,
+            IndexSpec::new().fts("title"),
+            &commits,
+        );
+        assert!(!walks_by_hour(&conn), "overlapping ranges must not walk");
+        walked(&conn, "zyzzyva", "", "hour DESC", "LIMIT 3", "hour");
+        assert!(
+            walks_by_hour(&hourly_conn()),
+            "superfiles of one hour each walk"
+        );
+    }
+
+    /// Whether `ORDER BY hour DESC LIMIT 3` walks the metered table's
+    /// superfiles in order.
+    fn walks_by_hour(conn: &Connection) -> bool {
+        let reader = conn
+            .open_table(METERED_TABLE)
+            .expect("table")
+            .local_handle()
+            .reader()
+            .expect("reader");
+        let output_schema = output_schema_with_score(&reader.manifest().scalar_schema());
+        let order = MatchOrder::new(&reader, "hour", true, 3, &[], &output_schema)
+            .expect("order")
+            .expect("hour is orderable");
+        let units: Vec<(Arc<SuperfileEntry>, ())> = reader
+            .manifest()
+            .superfiles
+            .iter()
+            .map(|e| (Arc::clone(e), ()))
+            .collect();
+        order.best_ranks(&units).is_some()
+    }
+
+    /// Superfiles of the overlapping-range test.
+    const OVERLAPPING_FILES: i64 = 6;
+    /// The top of the overlapping-range test's first superfile's range.
+    const OVERLAPPING_TOP: i64 = 1000;
 
     /// Opens a fan-out may keep in flight, as the window test caps it.
     const WIDEST: usize = 16;
