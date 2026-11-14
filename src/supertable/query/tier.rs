@@ -1210,18 +1210,17 @@ impl PreparedMerge<'_> {
             // rounds may yet save, at what a round costs: a round settles
             // few of them, the next ones many, as the blocks reach the
             // documents that tie. A shape whose candidates cannot be trusted
-            // seeds no threshold, so until the opens build a floor there is
-            // no bar for a superfile to be near, and reading on would only
-            // refine bounds nothing yet compares against.
-            let bar_ahead = bar_after.is_finite() || merge.shape.trusted;
-            let near = match bar_ahead {
-                true => merge
-                    .slots
-                    .iter()
-                    .filter(|s| s.reads_on(bar_after, exact_scores) && s.near(bar_after))
-                    .count() as u64,
-                false => 0,
-            };
+            // seeds no threshold, so before the opens build a floor every
+            // superfile is near: the merge reads on, and the bounds it
+            // tightens are what the floor rules superfiles out by once the
+            // first opens set it. On a phrase tied across an hourly table
+            // that is the difference between opening a few superfiles and
+            // opening tens of thousands.
+            let near = merge
+                .slots
+                .iter()
+                .filter(|s| s.reads_on(bar_after, exact_scores) && s.near(bar_after))
+                .count() as u64;
             let worth =
                 pays(settled, 1, open_cost_ns, round_ns) || pays(near, 1, open_cost_ns, round_ns);
             let read_on = worth || settling;
