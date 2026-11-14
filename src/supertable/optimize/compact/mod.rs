@@ -44,7 +44,7 @@ use tracing::{Instrument, Span, debug, info, warn};
 use uuid::Uuid;
 
 use crate::{
-    config::{CompactionSettings, RecalibratePolicy, global, scratch_root},
+    config::{CompactionSettings, RecalibratePolicy, global},
     runtime_bridge::{
         bridge_on_runtime, run_on_own_pool, run_on_pool, run_on_pool_unless_blocking,
     },
@@ -1057,7 +1057,7 @@ impl Supertable {
             // put_multipart). The file stays behind the bytes, so a publish
             // to a directory on this host links it into place instead of
             // writing the output a second time.
-            let mut output = NamedTempFile::new_in(scratch_root())
+            let mut output = NamedTempFile::new_in(builder_options.scratch_dir())
                 .map_err(|e| BuildError::Store(format!("merge temp create: {e}")))?;
             let stats = {
                 let mut writer = BufWriter::new(output.as_file_mut());
@@ -3118,14 +3118,15 @@ async fn clear_completed_conversions(inner: &SupertableInner) -> Result<(), Comp
 mod tests {
     use std::{
         collections::{BTreeSet, HashSet},
-        env, fs,
+        env,
+        fs::{self, File},
         io::{self, Error as IoError},
         mem,
         ops::Range,
         str,
         sync::{Arc, Mutex, atomic::AtomicUsize},
         thread,
-        time::Duration,
+        time::{Duration, UNIX_EPOCH},
     };
 
     use arrow::util::pretty::pretty_format_batches;
@@ -4841,6 +4842,14 @@ mod tests {
     fn table_with_disk_cache(
         dir: &TempDir,
     ) -> (Supertable, Arc<dyn StorageProvider>, Arc<DiskCacheStore>) {
+        table_with_disk_cache_from(dir, default_supertable_options())
+    }
+
+    /// [`table_with_disk_cache`] for a table made with `options`.
+    fn table_with_disk_cache_from(
+        dir: &TempDir,
+        options: SupertableOptions,
+    ) -> (Supertable, Arc<dyn StorageProvider>, Arc<DiskCacheStore>) {
         let storage: Arc<dyn StorageProvider> = local_storage(dir);
         let cache = DiskCacheStore::new_unpinned(
             Arc::clone(&storage),
@@ -4853,7 +4862,7 @@ mod tests {
         )
         .expect("disk cache");
         let st = Supertable::create(
-            default_supertable_options()
+            options
                 .with_storage(Arc::clone(&storage))
                 .with_disk_cache(Arc::clone(&cache)),
         )
@@ -5046,6 +5055,41 @@ mod tests {
             wait_until_cached(&cache, &entry.uri).await;
         }
         assert_cache_copies_are_links(storage.as_ref(), &cache, entries.iter().map(Arc::as_ref));
+    }
+
+    /// A merge on a table with a disk cache makes its temporary files in
+    /// the cache's scratch folder and leaves none behind.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compact_keeps_its_temporary_files_with_its_table() {
+        let dir = TempDir::new().expect("tempdir");
+        // No term index, whose build spills to the same folder.
+        let (st, _storage, _cache) =
+            table_with_disk_cache_from(&dir, default_supertable_options().with_term_index(false));
+        commit_ten_small_files(&st);
+        let before = superfile_count(&st);
+        let scratch = st.inner().options.scratch_dir();
+        assert!(scratch.starts_with(dir.path()));
+        // A file made in a directory moves the directory's modification time.
+        File::open(&scratch)
+            .and_then(|d| d.set_modified(UNIX_EPOCH))
+            .expect("backdate the scratch folder");
+
+        st.compact_async(&small_compact_cfg())
+            .await
+            .expect("compact");
+        assert!(superfile_count(&st) < before, "the pass merged");
+
+        let modified = fs::metadata(&scratch)
+            .and_then(|m| m.modified())
+            .expect("modification time");
+        assert!(modified > UNIX_EPOCH, "the merge's files were made there");
+        // The merged file goes once the cache warm lets its bytes go.
+        let deadline = Instant::now() + WARM_LANDS_WITHIN;
+        while fs::read_dir(&scratch).expect("read scratch").count() > 0 {
+            assert!(Instant::now() < deadline, "a file is left behind");
+            time::sleep(WARM_POLL).await;
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]

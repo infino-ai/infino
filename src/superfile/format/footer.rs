@@ -29,6 +29,7 @@ use std::{
     io::{self, BufReader, Cursor, Read, Seek, SeekFrom, Write},
     mem,
     ops::Range,
+    path::{Path, PathBuf},
     slice,
     sync::Arc,
 };
@@ -362,10 +363,12 @@ impl ParquetBodyEncoder {
             column_page_size_limits,
             &[],
             true,
+            &scratch_root(),
         )
     }
 
-    /// [`Self::new`] with the dictionary turned off for `plain_columns`.
+    /// [`Self::new`] with the dictionary turned off for `plain_columns` and
+    /// the body's scratch file under `scratch`.
     fn with_plain_columns(
         schema: &Arc<Schema>,
         compression: Compression,
@@ -373,6 +376,7 @@ impl ParquetBodyEncoder {
         column_page_size_limits: &[(&str, usize)],
         plain_columns: &[String],
         together: bool,
+        scratch: &Path,
     ) -> Result<Self, FooterError> {
         let props = writer_properties(
             compression,
@@ -381,7 +385,7 @@ impl ParquetBodyEncoder {
             plain_columns,
         );
 
-        let (body_file, writer, columns) = scratch_body(schema, props)?;
+        let (body_file, writer, columns) = scratch_body(schema, props, scratch)?;
         let field_writers = FieldWriters::new(
             writer.schema_descr(),
             schema,
@@ -939,6 +943,8 @@ pub(crate) struct BodyPlan {
     /// What the rows the encoder holds, to choose the dictionaries and
     /// before it encodes them, may decode to: [`HELD_GROUP_BYTES`].
     pub(crate) held_group_bytes: usize,
+    /// The directory the body's scratch file is created in.
+    pub(crate) scratch: PathBuf,
 }
 
 impl BodyPlan {
@@ -1189,6 +1195,7 @@ impl PlannedBodyEncoder {
             &self.plan.page_size_limits(),
             &plain_columns,
             self.plan.encode_groups_together,
+            &self.plan.scratch,
         )?
         .holding_at_most(self.plan.held_group_bytes);
         if self.rows_held_by_caller {
@@ -1234,10 +1241,12 @@ pub(crate) fn encode_parquet_body_planned(
 /// owns an independent handle to the same file (`reopen`); the returned
 /// file handle reads the footer back after close, and their cursors don't
 /// alias. Built through `ArrowWriter` so the file starts, and its footer
-/// carries the Arrow schema, exactly as an `ArrowWriter`'s does.
+/// carries the Arrow schema, exactly as an `ArrowWriter`'s does. The file is
+/// created under `scratch`.
 fn scratch_body(
     schema: &Arc<Schema>,
     props: WriterProperties,
+    scratch: &Path,
 ) -> Result<
     (
         NamedTempFile,
@@ -1246,7 +1255,7 @@ fn scratch_body(
     ),
     FooterError,
 > {
-    let body_file = NamedTempFile::new_in(scratch_root())?;
+    let body_file = NamedTempFile::new_in(scratch)?;
     let write_handle = body_file.reopen()?;
     let (writer, columns) = ArrowWriter::try_new(write_handle, Arc::clone(schema), Some(props))?
         .into_serialized_writer()?;
@@ -1297,7 +1306,7 @@ impl PassBodyEncoder {
             &plan.page_size_limits(),
             &[],
         );
-        let (body_file, writer, _) = scratch_body(schema, props)?;
+        let (body_file, writer, _) = scratch_body(schema, props, &plan.scratch)?;
         Ok(Self {
             body_file,
             writer,
@@ -2641,6 +2650,7 @@ mod tests {
             column_page_size_limits: Vec::new(),
             encode_groups_together: true,
             held_group_bytes: HELD_GROUP_BYTES,
+            scratch: scratch_root(),
         }
     }
 
@@ -3439,6 +3449,7 @@ mod tests {
                     &[],
                     &plain,
                     together,
+                    &scratch_root(),
                 )
                 .expect("encoder");
                 for start in (0..batch.num_rows()).step_by(MIXED_WRITE_ROWS) {

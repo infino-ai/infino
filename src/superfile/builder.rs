@@ -71,6 +71,7 @@ use std::{
     io::{self, BufReader, BufWriter, Cursor, Error, Read, Seek, SeekFrom, Write},
     iter,
     ops::Range,
+    path::{Path, PathBuf},
     str::from_utf8,
     sync::{Arc, Condvar, Mutex, PoisonError, mpsc::sync_channel},
     thread,
@@ -131,7 +132,7 @@ use crate::{
         vector::{
             builder::{
                 MultiCellSubsectionSource, VectorBuilder,
-                build_merged_subsection_from_materialized, finish_multi_cell_blob_to,
+                build_merged_subsection_from_materialized_in, finish_multi_cell_blob_to,
             },
             cell_posting::{CellPostingBuilder, MaterializedIvfRow},
             distance::Metric,
@@ -1249,6 +1250,9 @@ pub struct BuilderOptions {
     /// seen to carry another's fifty-second build. A build with the pool
     /// to itself, such as a compaction merge, leaves it off.
     pub(crate) finish_serial: bool,
+    /// The directory the build's temporary files are created in. `None`
+    /// uses `storage.scratch_root`.
+    pub(crate) scratch: Option<PathBuf>,
 }
 
 /// Default per-column data-page size limit for the id column
@@ -1398,7 +1402,20 @@ impl BuilderOptions {
             merge_input_mb: None,
             range_columns: Vec::new(),
             finish_serial: false,
+            scratch: None,
         }
+    }
+
+    /// Create the build's temporary files in `dir` (see
+    /// [`BuilderOptions::scratch`]). The directory must exist.
+    pub(crate) fn with_scratch(mut self, dir: PathBuf) -> Self {
+        self.scratch = Some(dir);
+        self
+    }
+
+    /// The directory the build's temporary files are created in.
+    pub(crate) fn scratch_dir(&self) -> PathBuf {
+        self.scratch.clone().unwrap_or_else(scratch_root)
     }
 
     /// Range-index `columns` (see [`BuilderOptions::range_columns`]).
@@ -1454,6 +1471,7 @@ impl BuilderOptions {
             column_page_size_limits: vec![(self.id_column.clone(), self.id_page_size_limit)],
             encode_groups_together: !self.finish_serial,
             held_group_bytes: HELD_GROUP_BYTES,
+            scratch: self.scratch_dir(),
         }
     }
 
@@ -2085,7 +2103,10 @@ impl SuperfileBuilder {
             // finish time; no streaming VectorBuilder is needed.
             (None, None)
         } else {
-            let mut vb = VectorBuilder::new();
+            let mut vb = match &opts.scratch {
+                Some(dir) => VectorBuilder::with_scratch(dir.clone())?,
+                None => VectorBuilder::new(),
+            };
             for vc in &opts.vector_columns {
                 vb.register_column(vc.clone())?;
             }
@@ -2686,6 +2707,7 @@ impl SuperfileBuilder {
             .cloned()
             .ok_or(BuildError::VectorReadError)?;
         let mut superfile_builder = SuperfileBuilder::new(builder_opts)?;
+        let scratch = superfile_builder.opts.scratch_dir();
 
         let any_tombstones = inputs
             .iter()
@@ -2789,10 +2811,11 @@ impl SuperfileBuilder {
                 }
                 let stable_ids: Vec<i128> = rows.iter().map(|r| r.stable_id).collect();
                 let n_cent = effective_fine_n_cent(vec_cfg.dim, vec_cfg.rerank_codec, rows.len());
-                let merged = build_merged_subsection_from_materialized(
+                let merged = build_merged_subsection_from_materialized_in(
                     vec_cfg.clone(),
                     n_cent.max(1),
                     rows,
+                    &scratch,
                 )?;
                 if stable_ids.len() != merged.n_docs as usize {
                     return Err(BuildError::VectorSchemaMismatch(format!(
@@ -2911,10 +2934,11 @@ impl SuperfileBuilder {
                 }
                 let stable_ids: Vec<i128> = rows.iter().map(|r| r.stable_id).collect();
                 let n_cent = effective_fine_n_cent(vec_cfg.dim, vec_cfg.rerank_codec, rows.len());
-                let merged = build_merged_subsection_from_materialized(
+                let merged = build_merged_subsection_from_materialized_in(
                     vec_cfg.clone(),
                     n_cent.max(1),
                     rows,
+                    &scratch,
                 )?;
                 if stable_ids.len() != merged.n_docs as usize {
                     return Err(BuildError::VectorSchemaMismatch(format!(
@@ -4107,7 +4131,8 @@ impl SuperfileBuilder {
         // row.
         let mut out = MergeOut {
             id_sidecar: Some(PackedIdEncoder::new(BufWriter::new(
-                NamedTempFile::new_in(scratch_root()).map_err(BuildError::Io)?,
+                NamedTempFile::new_in(superfile_builder.opts.scratch_dir())
+                    .map_err(BuildError::Io)?,
             ))),
             stats,
             reanalyze,
@@ -4445,6 +4470,7 @@ impl SuperfileBuilder {
         // above: with a vector index present, finalize blobs first (the vector
         // finalizer already saturates the pool), then encode the body;
         // otherwise hide the body encode behind the blob finish.
+        let scratch = self.opts.scratch_dir();
         let (body, fts_file, vec_file) = if has_vector {
             let (fts_file, vec_file) = stream_index_blobs_to_scratch(
                 fts_builder,
@@ -4452,6 +4478,7 @@ impl SuperfileBuilder {
                 cell_posting_builder,
                 prebuilt_multi_cell,
                 self.opts.finish_serial,
+                &scratch,
             )?;
             (encode_body()?, fts_file, vec_file)
         } else if self.opts.finish_serial {
@@ -4461,6 +4488,7 @@ impl SuperfileBuilder {
                 cell_posting_builder,
                 prebuilt_multi_cell,
                 true,
+                &scratch,
             )?;
             (encode_body()?, fts_file, vec_file)
         } else {
@@ -4471,6 +4499,7 @@ impl SuperfileBuilder {
                     cell_posting_builder,
                     prebuilt_multi_cell,
                     false,
+                    &scratch,
                 )
             });
             let (fts_file, vec_file) = blobs_res?;
@@ -4527,6 +4556,7 @@ impl SuperfileBuilder {
             cell_posting_builder,
             prebuilt_multi_cell,
             self.opts.finish_serial,
+            &self.opts.scratch_dir(),
         )?;
         // The caller streamed the rows into `body` and kept none of them, so
         // the range region reads its columns back from the body.
@@ -4664,8 +4694,14 @@ impl SuperfileBuilder {
             ));
         }
 
-        let (fts_file, _empty_vec) =
-            stream_index_blobs_to_scratch(fts_builder, None, None, None, self.opts.finish_serial)?;
+        let (fts_file, _empty_vec) = stream_index_blobs_to_scratch(
+            fts_builder,
+            None,
+            None,
+            None,
+            self.opts.finish_serial,
+            &self.opts.scratch_dir(),
+        )?;
         let fts_length = fts_file.as_file().metadata().map_err(BuildError::Io)?.len();
         // The range region is the table's to decide, not the source's: built
         // again from the carried rows, so a column range-indexed since the
@@ -4750,8 +4786,8 @@ impl SuperfileBuilder {
             &self.batches,
             self.opts.body_plan(&self.parquet_schema),
         )?;
-        let scratch_root = scratch_root();
-        let mut vector_file = tempfile::tempfile_in(&scratch_root).map_err(BuildError::Io)?;
+        let mut vector_file =
+            tempfile::tempfile_in(self.opts.scratch_dir()).map_err(BuildError::Io)?;
         finish_multi_cell_blob_to(cells, BufWriter::new(&mut vector_file))?;
         let vector_length = vector_file.seek(SeekFrom::End(0)).map_err(BuildError::Io)?;
         vector_file
@@ -5022,7 +5058,10 @@ fn fts_builder_for(opts: &BuilderOptions) -> Result<Option<FtsBuilder>, BuildErr
     if opts.fts_columns.is_empty() {
         return Ok(None);
     }
-    let mut fb = FtsBuilder::new();
+    let mut fb = match &opts.scratch {
+        Some(dir) => FtsBuilder::with_scratch(dir.clone())?,
+        None => FtsBuilder::new(),
+    };
     for fc in &opts.fts_columns {
         // The whole chain, not just the base: a column that declares a
         // stopword set or a stemmer must be indexed through them, or the
@@ -5074,18 +5113,18 @@ pub(crate) fn index_fts_rows(
 /// the positional FTS blob is multi-GB; streaming it (and the vector blob) to
 /// disk instead of a `Vec` keeps a memory-tight build or merge under its RSS
 /// budget. `reopen()` gives an independent handle at offset 0, so the write
-/// handle here and the read handle at splice time don't share a cursor.
+/// handle here and the read handle at splice time don't share a cursor. The
+/// files are created under `scratch`.
 fn stream_index_blobs_to_scratch(
     fts_builder: Option<FtsBuilder>,
     vec_builder: Option<VectorBuilder>,
     cell_posting_builder: Option<CellPostingBuilder>,
     prebuilt_multi_cell: Option<Vec<(u32, MergedIvfSubsection)>>,
     serial: bool,
+    scratch: &Path,
 ) -> Result<(NamedTempFile, NamedTempFile), BuildError> {
-    let scratch_root = scratch_root();
-
-    let fts_file = NamedTempFile::new_in(&scratch_root)?;
-    let vec_file = NamedTempFile::new_in(&scratch_root)?;
+    let fts_file = NamedTempFile::new_in(scratch)?;
+    let vec_file = NamedTempFile::new_in(scratch)?;
 
     let fts_write = fts_file.reopen().map_err(BuildError::Io)?;
     let vec_write = vec_file.reopen().map_err(BuildError::Io)?;
@@ -5155,12 +5194,13 @@ fn range_specs_in(specs: Vec<RangeColumnSpec>, schema: &Schema) -> Vec<RangeColu
 /// The range index region over `batches`, the superfile's rows in file
 /// order, for `specs` (already resolved against the batches' schema by
 /// [`range_specs_in`]). `id_column` names the id column the batches carry,
-/// so the region keeps the rows sharing a key in its order. No region when
-/// `specs` is empty.
+/// so the region keeps the rows sharing a key in its order. The build
+/// spills under `scratch`. No region when `specs` is empty.
 fn range_region_of<I>(
     batches: I,
     specs: &[RangeColumnSpec],
     id_column: Option<&str>,
+    scratch: &Path,
 ) -> Result<RangeRegion, BuildError>
 where
     I: IntoIterator<Item = Result<RecordBatch, ArrowError>>,
@@ -5172,8 +5212,7 @@ where
             directory_length: 0,
         });
     }
-    let region =
-        range::build_region(batches, specs, id_column, &scratch_root()).map_err(BuildError::Io)?;
+    let region = range::build_region(batches, specs, id_column, scratch).map_err(BuildError::Io)?;
     let length = region.len();
     let directory_length = region.directory.len() as u64;
     Ok(RangeStream {
@@ -5196,7 +5235,12 @@ fn range_region_of_batches(
         .index_of(&opts.id_column)
         .is_ok()
         .then_some(opts.id_column.as_str());
-    range_region_of(batches.iter().cloned().map(Ok), &specs, id_column)
+    range_region_of(
+        batches.iter().cloned().map(Ok),
+        &specs,
+        id_column,
+        &opts.scratch_dir(),
+    )
 }
 
 /// The range index region over the rows of a Parquet body, for the columns
@@ -5214,14 +5258,14 @@ fn range_region_of_body<R: ChunkReader + 'static>(
     opts: &BuilderOptions,
 ) -> Result<RangeRegion, BuildError> {
     if opts.range_columns.is_empty() {
-        return range_region_of(iter::empty(), &[], None);
+        return range_region_of(iter::empty(), &[], None, &opts.scratch_dir());
     }
     let parquet = |e: ParquetError| BuildError::Io(Error::other(e));
     let arrow_meta =
         ArrowReaderMetadata::try_new(metadata, ArrowReaderOptions::new()).map_err(parquet)?;
     let specs = range_specs_in(opts.range_column_specs(), arrow_meta.schema());
     if specs.is_empty() {
-        return range_region_of(iter::empty(), &[], None);
+        return range_region_of(iter::empty(), &[], None, &opts.scratch_dir());
     }
     let id_root = arrow_meta.schema().index_of(&opts.id_column).ok();
     let roots: Vec<usize> = specs
@@ -5234,7 +5278,12 @@ fn range_region_of_body<R: ChunkReader + 'static>(
         .with_projection(projection)
         .build()
         .map_err(parquet)?;
-    range_region_of(batches, &specs, id_root.map(|_| opts.id_column.as_str()))
+    range_region_of(
+        batches,
+        &specs,
+        id_root.map(|_| opts.id_column.as_str()),
+        &opts.scratch_dir(),
+    )
 }
 
 /// Splice an encoded body, the two on-disk blobs, the packed stable-id
@@ -6022,12 +6071,13 @@ mod tests {
     use std::{
         cell::Cell,
         collections::HashMap,
+        fs::{self, File},
         io::empty,
         iter::once,
         slice,
         sync::Arc,
         thread::{self, LocalKey},
-        time::Duration,
+        time::{Duration, UNIX_EPOCH},
     };
 
     thread_local! {
@@ -6097,6 +6147,7 @@ mod tests {
     use rand::{RngExt, SeedableRng, rngs::StdRng};
     use rayon::ThreadPoolBuilder;
     use roaring::RoaringBitmap;
+    use tempfile::TempDir;
 
     use super::*;
     use crate::{
@@ -6374,6 +6425,56 @@ mod tests {
                 }
             ),
             "got {err:?}"
+        );
+    }
+
+    /// A build given a scratch directory creates its temporary files in it
+    /// and leaves none behind.
+    #[test]
+    fn a_build_with_a_scratch_directory_keeps_its_temporary_files_there() {
+        let dir = TempDir::new().expect("tempdir");
+        let scratch = dir.path().to_path_buf();
+        let entries = || fs::read_dir(&scratch).expect("read scratch").count();
+
+        let opts = opts_minimal().with_scratch(scratch.clone());
+        let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
+        assert_eq!(entries(), 1, "the full-text spill directory");
+        let schema = b.opts.schema.clone();
+        b.add_batch(&batch_two_rows(&schema), &[])
+            .expect("add_batch");
+        let bytes = b.finish().expect("finish");
+        SuperfileReader::open(Bytes::from(bytes)).expect("open");
+        assert_eq!(entries(), 0, "nothing is left behind");
+    }
+
+    /// A build with no index writes its body and blob files to the scratch
+    /// directory it is given.
+    #[cfg(unix)]
+    #[test]
+    fn a_build_without_indexes_writes_its_files_to_its_scratch_directory() {
+        let dir = TempDir::new().expect("tempdir");
+        let scratch = dir.path().to_path_buf();
+        // A file made in a directory moves the directory's modification time.
+        File::open(&scratch)
+            .and_then(|d| d.set_modified(UNIX_EPOCH))
+            .expect("backdate the scratch directory");
+
+        let opts = BuilderOptions::new(schema_with_fts(), "doc_id", vec![], vec![])
+            .with_scratch(scratch.clone());
+        let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
+        let schema = b.opts.schema.clone();
+        b.add_batch(&batch_two_rows(&schema), &[])
+            .expect("add_batch");
+        b.finish().expect("finish");
+
+        let modified = fs::metadata(&scratch)
+            .and_then(|m| m.modified())
+            .expect("modification time");
+        assert!(modified > UNIX_EPOCH, "files were made in the directory");
+        assert_eq!(
+            fs::read_dir(&scratch).expect("read scratch").count(),
+            0,
+            "nothing is left behind"
         );
     }
 

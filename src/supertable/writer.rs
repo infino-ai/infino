@@ -155,7 +155,7 @@ use crate::{
         vector::{
             builder::{
                 MultiCellSubsectionSource, build_merged_subsection_from_fp32,
-                build_merged_subsection_from_materialized,
+                build_merged_subsection_from_materialized_in,
                 build_merged_subsection_from_spilled_materialized, cell_build_peak_bytes,
             },
             cell_posting::{EncodedCellRow, MaterializedIvfRow, transcode_clamped_components},
@@ -4196,10 +4196,10 @@ fn seal_shard(
     head_sink: Option<(term_index::HeadSink, usize)>,
     id_bounds: (i128, i128, u64),
     scalar_stats: HashMap<FieldId, ScalarStatsAgg>,
+    scratch: &Path,
 ) -> Result<ShardOutput, BuildError> {
     let (id_min, id_max, n_docs) = id_bounds;
-    let scratch_root = scratch_root();
-    let mut output = NamedTempFile::new_in(&scratch_root)
+    let mut output = NamedTempFile::new_in(scratch)
         .map_err(|error| BuildError::Store(format!("shard temp create: {error}")))?;
     {
         let mut writer = BufWriter::new(output.as_file_mut());
@@ -4310,7 +4310,14 @@ fn build_piece(
     // `from_batches` borrows them. A column the file leaves out has none.
     let stored_refs: Vec<&RecordBatch> = stored_scalars.iter().collect();
     let scalar_stats = ScalarStatsAgg::from_batches(&stored, &stored_refs);
-    seal_shard(builder, superfile_id, head_sink, bounds, scalar_stats)
+    seal_shard(
+        builder,
+        superfile_id,
+        head_sink,
+        bounds,
+        scalar_stats,
+        &options.scratch_dir(),
+    )
 }
 
 /// The sink a shard build hands its terms to, with the head depth, when
@@ -8922,6 +8929,7 @@ fn drain_cell_vector_config(cfg: &VectorConfig, n_rows: usize) -> (VectorConfig,
 fn drain_pack_assigned_cell(
     group: AssignedCellGroup<'_>,
     cfg: &VectorConfig,
+    scratch: &Path,
 ) -> Result<PackedCellGroup, BuildError> {
     let AssignedCellGroup { cell_id, members } = group;
     if members.is_empty() {
@@ -8939,8 +8947,13 @@ fn drain_pack_assigned_cell(
         }
     }
     // Drain's fp32 in-memory stream pack (why fp32 support exists).
-    let subsection =
-        build_merged_subsection_from_fp32(cell_cfg, cell_n_cent, Arc::new(corpus), &stable_ids)?;
+    let subsection = build_merged_subsection_from_fp32(
+        cell_cfg,
+        cell_n_cent,
+        Arc::new(corpus),
+        &stable_ids,
+        scratch,
+    )?;
     Ok(PackedCellGroup {
         cell_id,
         subsection,
@@ -9005,7 +9018,7 @@ fn build_one_shard_from_packed_cells(
     let scalar_stats =
         ScalarStatsAgg::from_batches(&inner.manifest.load().scalar_schema(), &[&scalar]);
 
-    let scratch_root = scratch_root();
+    let scratch_root = inner.options.scratch_dir();
 
     // Stream the compacted superfile to a temp file, then mmap it back as
     // zero-copy `Bytes` (same idiom as the append-commit build path) instead of
@@ -9565,6 +9578,7 @@ fn build_one_packed_shard_via_drain(
         return Ok(None);
     }
 
+    let scratch = inner.options.scratch_dir();
     // Drain packs this shard's cell IVFs; Parquet+FTS build overlaps it.
     let (packed_groups, body_and_fts) = rayon::join(
         || {
@@ -9575,7 +9589,7 @@ fn build_one_packed_shard_via_drain(
                         cell_id: *cell_id,
                         members: group.members.clone(),
                     };
-                    drain_pack_assigned_cell(owned, vc)
+                    drain_pack_assigned_cell(owned, vc, &scratch)
                 })
                 .collect::<Result<Vec<_>, BuildError>>()
         },
@@ -9598,12 +9612,11 @@ fn build_one_packed_shard_via_drain(
         .collect();
     builder.set_prebuilt_multi_cell_ivfs(subsections)?;
 
-    let scratch_root = scratch_root();
     // Stream the compacted superfile to a temp file, then mmap it back as
     // zero-copy `Bytes` (same idiom as the append-commit build path) instead of
     // materializing the merged superfile as an anon `Vec<u8>` — the merge
     // output is corpus-sized and OOMs a memory-tight host during compaction.
-    let mut output = NamedTempFile::new_in(&scratch_root)
+    let mut output = NamedTempFile::new_in(&scratch)
         .map_err(|error| BuildError::Store(format!("compacted shard temp create: {error}")))?;
     {
         let mut writer = BufWriter::new(output.as_file_mut());
@@ -9960,11 +9973,11 @@ fn pending_metadata_schema(metadata: &[u8]) -> Option<u32> {
 }
 
 /// Pass-scoped scratch for the bulk repack's row spills and packed cell
-/// subsections (the drain's `env::temp_dir()` convention — `TMPDIR`
-/// controls placement). Removed on success; an aborted pass leaves
-/// local-disk garbage only.
-fn repack_scratch_dir() -> PathBuf {
-    scratch_root()
+/// subsections, under the table's scratch folder. Removed on success; an
+/// aborted pass leaves local-disk garbage only.
+fn repack_scratch_dir(options: &SupertableOptions) -> PathBuf {
+    options
+        .scratch_dir()
         .join("infino-repack")
         .join(Uuid::new_v4().to_string())
 }
@@ -10240,7 +10253,12 @@ fn build_split_subcell(
     // ~13K-row child carrying a ~126K-row parent's `n_cent` over-fragments
     // its fine routing.
     let (cfg, cell_n_cent) = drain_cell_vector_config(&base_cfg, rows.len());
-    let sub = build_merged_subsection_from_materialized(cfg, cell_n_cent, rows)?;
+    let sub = build_merged_subsection_from_materialized_in(
+        cfg,
+        cell_n_cent,
+        rows,
+        &inner.options.scratch_dir(),
+    )?;
     let shard_id = packed_cell_shard(cell_id, shard_count) as u32;
     build_prepared_from_packed_cells(inner, shard_id, vec![(cell_id, sub, stable_ids)]).map(Some)
 }
@@ -10730,7 +10748,7 @@ pub(in crate::supertable) async fn split_repack_bulk(
             let _ = fs::remove_dir_all(&self.path);
         }
     }
-    let scratch = repack_scratch_dir();
+    let scratch = repack_scratch_dir(&inner.options);
     fs::create_dir_all(&scratch)
         .map_err(|error| BuildError::Store(format!("repack scratch create: {error}")))?;
     let _scratch_guard = RepackScratchGuard {
@@ -15053,7 +15071,7 @@ mod tests {
     }
 
     use std::{
-        fs,
+        fs::{self, File},
         future::pending,
         panic::{AssertUnwindSafe, catch_unwind},
         sync::{
@@ -15061,7 +15079,7 @@ mod tests {
             atomic::{AtomicUsize, Ordering},
         },
         thread,
-        time::{Duration, Instant},
+        time::{Duration, Instant, UNIX_EPOCH},
     };
 
     use arrow::{compute::concat_batches, ipc::reader::StreamReader};
@@ -18725,7 +18743,8 @@ mod tests {
         };
         for group in assigned {
             let n_members = group.members.len();
-            let packed = drain_pack_assigned_cell(group, &cfg).expect("drain pack");
+            let packed =
+                drain_pack_assigned_cell(group, &cfg, &scratch_root()).expect("drain pack");
             assert_eq!(packed.stable_ids.len(), n_members);
             assert_eq!(packed.subsection.n_docs as usize, n_members);
         }
@@ -20085,6 +20104,53 @@ mod tests {
             .as_ref()
             .expect("cache attached");
         assert_cache_copies_are_links(storage.as_ref(), cache, entries.iter().map(Arc::as_ref));
+    }
+
+    /// A commit to a table with a disk cache makes its temporary files in
+    /// the cache's scratch folder and leaves none behind.
+    #[cfg(unix)]
+    #[test]
+    fn a_commit_keeps_its_temporary_files_with_its_table() {
+        const ROWS_PER_BATCH: usize = 500;
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path().join("store")).expect("provider"));
+        let cache = DiskCacheStore::new_unpinned(
+            Arc::clone(&storage),
+            DiskCacheConfig {
+                cache_root: dir.path().join("cache"),
+                ..Default::default()
+            },
+        )
+        .expect("cache store");
+        // No term index, whose build spills to the same folder.
+        let st = Supertable::create(
+            options_id_title()
+                .with_term_index(false)
+                .with_storage(Arc::clone(&storage))
+                .with_disk_cache(cache),
+        )
+        .expect("create");
+        let scratch = st.inner().options.scratch_dir();
+        assert!(scratch.starts_with(dir.path().join("cache")));
+        // A file made in a directory moves the directory's modification time.
+        File::open(&scratch)
+            .and_then(|d| d.set_modified(UNIX_EPOCH))
+            .expect("backdate the scratch folder");
+
+        let mut w = st.writer().expect("writer");
+        w.append(&live_batch(0, ROWS_PER_BATCH)).expect("append");
+        w.commit().expect("commit");
+
+        let modified = fs::metadata(&scratch)
+            .and_then(|m| m.modified())
+            .expect("modification time");
+        assert!(modified > UNIX_EPOCH, "the build's files were made there");
+        assert_eq!(
+            fs::read_dir(&scratch).expect("read scratch").count(),
+            0,
+            "nothing is left behind"
+        );
     }
 
     /// The commit-time split cuts the buffer where [`piece_bounds`] puts
