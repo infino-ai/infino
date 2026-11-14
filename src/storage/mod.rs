@@ -572,6 +572,24 @@ pub trait StorageProvider: Send + Sync + fmt::Debug {
         self.delete(uri).await
     }
 
+    /// `uri` as `(bucket, object key)` on a store that copies between its providers server side;
+    /// `None` where this provider can't. A wrapper forwards it.
+    fn server_side_key(&self, _uri: &str) -> Option<(String, String)> {
+        None
+    }
+
+    /// Places `from`'s object `from_uri` at `uri` here unless one is there already (`false`).
+    /// The default reads it through this process; a store that copies server side overrides it,
+    /// and a wrapper forwards it.
+    async fn copy_in(
+        &self,
+        uri: &str,
+        from: &dyn StorageProvider,
+        from_uri: &str,
+    ) -> Result<bool, StorageError> {
+        copy_through(self, uri, from, from_uri).await
+    }
+
     /// List object URIs under `prefix`. Returns the full URI of
     /// every object whose path starts with `prefix` (caller is
     /// responsible for slash-aware boundary checks if they want
@@ -730,6 +748,21 @@ impl PrefixedStorageProvider {
     }
 }
 
+/// [`StorageProvider::copy_in`] by reading `from_uri` and writing it create-only at `uri`.
+pub(crate) async fn copy_through<P: StorageProvider + ?Sized>(
+    to: &P,
+    uri: &str,
+    from: &dyn StorageProvider,
+    from_uri: &str,
+) -> Result<bool, StorageError> {
+    let (bytes, _) = from.get(from_uri).await?;
+    match to.put_atomic(uri, bytes).await {
+        Ok(_) => Ok(true),
+        Err(e) if e.is_conflict() => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
 #[async_trait::async_trait]
 impl StorageProvider for PrefixedStorageProvider {
     async fn head(&self, uri: &str) -> Result<ObjectMeta, StorageError> {
@@ -799,6 +832,21 @@ impl StorageProvider for PrefixedStorageProvider {
 
     async fn delete_once(&self, uri: &str) -> Result<(), StorageError> {
         self.inner.delete_once(&self.prefixed(uri)).await
+    }
+
+    fn server_side_key(&self, uri: &str) -> Option<(String, String)> {
+        self.inner.server_side_key(&self.prefixed(uri))
+    }
+
+    async fn copy_in(
+        &self,
+        uri: &str,
+        from: &dyn StorageProvider,
+        from_uri: &str,
+    ) -> Result<bool, StorageError> {
+        self.inner
+            .copy_in(&self.prefixed(uri), from, from_uri)
+            .await
     }
 
     async fn list_with_prefix(&self, prefix: &str) -> Result<Vec<String>, StorageError> {
