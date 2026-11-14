@@ -156,7 +156,7 @@ use crate::{
         query::{
             covered_agg::prepare_aggregate_inputs,
             exec::common::{collect_plan_metered, run_within_process_limit},
-            sql::sql_session_context,
+            sql::SessionTemplate,
         },
         reader_cache::{DiskCacheConfig, DiskCacheError, DiskCacheStore},
         schema::{ColumnIndex, TableSchema, change::SchemaPatch, error::SchemaError},
@@ -257,6 +257,7 @@ pub fn connect_with(
             options,
             store,
             connection_memory_budget,
+            sql_session_template: SessionTemplate::default(),
             usage_meter,
             gcs_credential,
             #[cfg(feature = "graph-index")]
@@ -291,6 +292,7 @@ fn connect_remote(backend: Backend, options: ConnectOptions) -> Result<Connectio
             options,
             store: CatalogStore::Remote(Arc::new(remote)),
             connection_memory_budget,
+            sql_session_template: SessionTemplate::default(),
             usage_meter: UsageMeter::new(),
             gcs_credential: None,
             #[cfg(feature = "graph-index")]
@@ -323,6 +325,9 @@ struct ConnectionInner {
     /// (cloned `Arc`) into every table's `SupertableOptions`. See
     /// [`crate::memory`].
     connection_memory_budget: Arc<ConnectionMemoryBudget>,
+    /// The session every statement on this connection plans in, built once
+    /// and copied per statement (see [`SessionTemplate`]).
+    sql_session_template: SessionTemplate,
     /// Sole object-store usage ledger for this connection (shared into every
     /// table provider). Benches and billing snapshot this meter.
     usage_meter: Arc<UsageMeter>,
@@ -1316,7 +1321,10 @@ impl Connection {
         // same constructor as a table reader's, so covered aggregates are
         // answered from manifest statistics here too. A session built from
         // our own budget config failing is ours, not the query's.
-        let ctx = sql_session_context(&self.inner.connection_memory_budget)
+        let ctx = self
+            .inner
+            .sql_session_template
+            .context(&self.inner.connection_memory_budget)
             .map_err(|e| InfinoError::Backend(e.to_string()).with_context("query_sql", None))?;
 
         // One snapshot of the session for parsing and table lookup; planning
@@ -4992,6 +5000,46 @@ mod tests {
         Arc::new(LargeStringArray::from(
             (0..n).map(|i| format!("{prefix}{i}")).collect::<Vec<_>>(),
         ))
+    }
+
+    /// Statements share the connection's session template but never each
+    /// other's catalog: a statement sees the rows committed before it, and a
+    /// table dropped after one statement read it is gone for the next, not
+    /// left registered from the earlier one.
+    #[test]
+    fn each_statement_plans_in_a_catalog_of_its_own() {
+        let conn = connect("memory://").expect("connect");
+        let field = Field::new("tag", DataType::LargeUtf8, true);
+        let table = one_column_table(&conn, "tags", field.clone(), distinct_strings("a", 3));
+        one_column_table(&conn, "other", field, distinct_strings("b", 2));
+        let count = |sql: &str| -> i64 {
+            let batches = conn.query_sql(sql).expect("sql");
+            batches[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("count")
+                .value(0)
+        };
+        assert_eq!(count("SELECT COUNT(*) FROM tags"), 3);
+        table
+            .append(
+                &RecordBatch::try_new(table.schema(), vec![distinct_strings("c", 4)])
+                    .expect("batch"),
+            )
+            .expect("append");
+        assert_eq!(
+            count("SELECT COUNT(*) FROM tags"),
+            7,
+            "rows committed since"
+        );
+        assert_eq!(count("SELECT COUNT(*) FROM other"), 2);
+        conn.drop_table("tags", false).expect("drop");
+        assert!(
+            conn.query_sql("SELECT COUNT(*) FROM tags").is_err(),
+            "a dropped table is not left registered by an earlier statement"
+        );
+        assert_eq!(count("SELECT COUNT(*) FROM other"), 2);
     }
 
     /// A table's value counts are its `GROUP BY` counts, merged across superfiles.
