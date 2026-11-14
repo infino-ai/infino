@@ -23,11 +23,15 @@
 //!
 //! The rule only marks the scan, with a provider carrying the hint; the
 //! provider does the reading (`SupertableProvider::top_k_rows`), since that
-//! needs the superfiles. It fires only when every filter under the sort is
-//! a range on the sort column: a filter on another column could reject the
-//! rows the index puts first, and the cutoff would then drop rows that
-//! belong in the answer. A sort with nulls first and no filter is left
-//! alone too, as nulls are in no range index and would come first. The
+//! needs the superfiles. When every filter under the sort is a range on the
+//! sort column, the index's first rows are the answer's. A filter on another
+//! column could reject those rows, so then the hint carries every filter,
+//! and the scan reads rows in the index's order in growing batches and
+//! checks them, until `k` pass with a key no unread row can beat; a filter
+//! few rows pass gives up after a bounded read, and the scan reads every
+//! row the filters admit, as it would without the hint. A sort with nulls
+//! first and no range on the column is left alone, as nulls are in no
+//! range index and would come first. The
 //! sort may order by more keys after the column (`ORDER BY price, id`, the
 //! tie-break a paged search adds): those order only the rows tied on the
 //! column, so the scan then reads every row tied with the cutoff too. The
@@ -139,11 +143,29 @@ fn try_rewrite(plan: &LogicalPlan) -> DfResult<Option<LogicalPlan>> {
         later,
         [only] if only.asc && matches!(&only.expr, Expr::Column(c) if c.name == id_column)
     );
-    if single_range(&predicates, &column.name, &range_cols).is_none() {
+    // The filters that are ranges on the sort column, and the rest, which the
+    // scan checks on the rows it reads in the index's order.
+    let (on_column, rest): (Vec<&Expr>, Vec<&Expr>) = predicates
+        .iter()
+        .partition(|p| single_range(std::slice::from_ref(*p), &column.name, &range_cols).is_some());
+    if single_range(&[], &column.name, &range_cols).is_none() {
         return Ok(None);
     }
-    if predicates.is_empty() && sort_expr.nulls_first {
+    if rest.iter().any(|p| p.is_volatile()) {
         return Ok(None);
+    }
+    if on_column.is_empty() && sort_expr.nulls_first {
+        return Ok(None);
+    }
+    // Every filter once: an inexact one is both in the plan and pushed to
+    // the scan.
+    let mut filters: Vec<Expr> = Vec::new();
+    if !rest.is_empty() {
+        for p in &predicates {
+            if !filters.contains(p) {
+                filters.push(p.clone());
+            }
+        }
     }
     let hinted = Arc::new(provider.with_top_k(TopKHint {
         column: column.name.clone(),
@@ -151,6 +173,7 @@ fn try_rewrite(plan: &LogicalPlan) -> DfResult<Option<LogicalPlan>> {
         k: *k,
         ties: !later.is_empty(),
         ties_by_id,
+        filters,
     }));
     let source = provider_as_source(hinted as Arc<dyn TableProvider>);
     Ok(Some(with_scan_source(plan, &source)?))
@@ -446,6 +469,151 @@ mod tests {
                     expected_then_seq(above.unwrap_or(BELOW_EVERY_KEY), *descending, *limit),
                     "{pass}: {sql}"
                 );
+            }
+        }
+    }
+
+    /// The `seq`s a top-k over the live rows that `keep` holds for answers,
+    /// `key` above `above` (when given), ordered by `key` either way and then
+    /// by `seq` ascending or, with `seq_desc`, descending.
+    fn expected_where(
+        keep: &dyn Fn(i64) -> bool,
+        above: Option<i64>,
+        descending: bool,
+        seq_desc: bool,
+        limit: usize,
+    ) -> Vec<i64> {
+        let mut rows: Vec<(i64, i64)> = (DELETED_BELOW..FILES * ROWS_PER_FILE)
+            .filter(|s| keep(*s))
+            .map(|s| (key(s), s))
+            .filter(|(k, _)| above.is_none_or(|a| *k > a))
+            .collect();
+        rows.sort_by(|a, b| {
+            let by_key = match descending {
+                false => a.0.cmp(&b.0),
+                true => b.0.cmp(&a.0),
+            };
+            let by_seq = match seq_desc {
+                false => a.1.cmp(&b.1),
+                true => b.1.cmp(&a.1),
+            };
+            by_key.then(by_seq)
+        });
+        rows.into_iter().take(limit).map(|(_, s)| s).collect()
+    }
+
+    /// A top-k with a filter on another column than the sort's answers as a
+    /// full sort of the rows the filter keeps does: filters many rows pass,
+    /// with and without a range on the sort column, one too narrow to hold
+    /// `k` of them, either way, with ties
+    /// broken by `seq` or by `_id`; a filter one row passes and one none
+    /// does; deleted rows left out; checked from read columns and from kept
+    /// ones; before and after an optimize.
+    #[test]
+    fn a_top_k_filtered_on_another_column_answers_as_a_full_sort() {
+        let dir = TempDir::new().expect("tempdir");
+        let st = table(&dir);
+        type Keep = fn(i64) -> bool;
+        let thirds: Keep = |s| s % 3 == 0;
+        let sevens: Keep = |s| s % 10 == 7;
+        let one: Keep = |s| s == 5000;
+        let none: Keep = |_| false;
+        let cases: &[(&str, Keep, Option<i64>, bool, bool, usize)] = &[
+            (
+                "SELECT seq, key FROM supertable WHERE seq % 3 = 0 ORDER BY key ASC NULLS LAST, seq ASC NULLS LAST LIMIT 10",
+                thirds,
+                None,
+                false,
+                false,
+                10,
+            ),
+            (
+                "SELECT seq, key FROM supertable WHERE seq % 3 = 0 ORDER BY key DESC NULLS LAST, seq ASC NULLS LAST LIMIT 10",
+                thirds,
+                None,
+                true,
+                false,
+                10,
+            ),
+            (
+                "SELECT seq, key FROM supertable WHERE seq % 3 = 0 AND key > 40 ORDER BY key DESC, seq DESC LIMIT 25",
+                thirds,
+                Some(40),
+                true,
+                true,
+                25,
+            ),
+            (
+                "SELECT seq, key, pad FROM supertable WHERE pad LIKE '%7' ORDER BY key ASC NULLS LAST, seq ASC NULLS LAST LIMIT 130",
+                sevens,
+                None,
+                false,
+                false,
+                130,
+            ),
+            (
+                "SELECT seq, key FROM supertable WHERE seq % 3 = 0 ORDER BY key DESC NULLS LAST, _id ASC LIMIT 7",
+                thirds,
+                None,
+                true,
+                false,
+                7,
+            ),
+            (
+                "SELECT seq, key FROM supertable WHERE seq % 3 = 0 AND key > 90 ORDER BY key ASC NULLS LAST, _id ASC LIMIT 45",
+                thirds,
+                Some(90),
+                false,
+                false,
+                45,
+            ),
+            (
+                "SELECT seq, key FROM supertable WHERE seq % 3 = 0 AND key > 98 ORDER BY key DESC NULLS LAST, seq ASC NULLS LAST LIMIT 45",
+                thirds,
+                Some(98),
+                true,
+                false,
+                45,
+            ),
+            (
+                "SELECT seq, key FROM supertable WHERE seq = 5000 ORDER BY key ASC NULLS LAST, seq ASC NULLS LAST LIMIT 10",
+                one,
+                None,
+                false,
+                false,
+                10,
+            ),
+            (
+                "SELECT seq, key FROM supertable WHERE seq = 5000 AND key > 1 ORDER BY key DESC NULLS LAST, seq ASC NULLS LAST LIMIT 10",
+                one,
+                Some(1),
+                true,
+                false,
+                10,
+            ),
+            (
+                "SELECT seq, key FROM supertable WHERE seq < 0 ORDER BY key ASC NULLS LAST, seq ASC NULLS LAST LIMIT 10",
+                none,
+                None,
+                false,
+                false,
+                10,
+            ),
+        ];
+        for pass in ["appended", "optimized"] {
+            if pass == "optimized" {
+                st.optimize(&OptimizeOptions::default()).expect("optimize");
+            }
+            let reader = st.reader().expect("reader");
+            // The second run checks rows from the columns the first kept.
+            for run in ["decoded", "kept"] {
+                for (sql, keep, above, descending, seq_desc, limit) in cases {
+                    assert_eq!(
+                        seqs(&reader.query_sql(sql).expect("sql")),
+                        expected_where(keep, *above, *descending, *seq_desc, *limit),
+                        "{pass}, {run}: {sql}"
+                    );
+                }
             }
         }
     }
