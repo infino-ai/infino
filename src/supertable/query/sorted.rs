@@ -20,6 +20,11 @@
 use std::{sync::Arc, time::Instant};
 
 use arrow::record_batch::RecordBatch;
+use datafusion::{
+    common::DFSchema,
+    logical_expr::{Expr, simplify::SimplifyContext, utils::split_conjunction},
+    optimizer::simplify_expressions::ExprSimplifier,
+};
 use roaring::RoaringBitmap;
 use tracing::{Instrument, debug};
 
@@ -32,6 +37,7 @@ use crate::{
         manifest::SuperfileEntry,
         query::{
             SuperfileHit,
+            candidate::single_range,
             dispatch::{self, tag_hits, tombstone_deny_set},
             exec::common::resolve_hits_named,
         },
@@ -63,6 +69,22 @@ impl SupertableReader {
         descending: bool,
         k: usize,
     ) -> Result<Option<Vec<SuperfileHit>>, QueryError> {
+        self.sorted_hits_within_async(column, descending, k, None)
+            .await
+    }
+
+    /// [`Self::sorted_hits_async`] over the rows whose key lies in
+    /// `interval` (keys as the range index encodes them, both ends
+    /// inclusive) when one is given. A row without a value lies in no
+    /// interval, so fewer than `k` rows in it is the whole answer, not a
+    /// page the index cannot fill.
+    async fn sorted_hits_within_async(
+        &self,
+        column: &str,
+        descending: bool,
+        k: usize,
+        interval: Option<(u64, u64)>,
+    ) -> Result<Option<Vec<SuperfileHit>>, QueryError> {
         let manifest = self.manifest();
         let range_cols = manifest.table_schema().range_column_types();
         let Some((field, data_type)) = range_cols.get(column) else {
@@ -80,9 +102,10 @@ impl SupertableReader {
         }
         // More rows than the table holds cannot all have a value: the rows
         // without one would fill the page, so the indexes cannot answer.
-        if u64::try_from(k).map_or(true, |k| k > self.rows_held()) {
+        if interval.is_none() && u64::try_from(k).map_or(true, |k| k > self.rows_held()) {
             return Ok(None);
         }
+        let bounds = interval.unwrap_or((0, u64::MAX));
         let field = *field;
         let units: Vec<_> = manifest
             .superfiles
@@ -107,7 +130,7 @@ impl SupertableReader {
                     .range_ends(
                         field,
                         &data_type,
-                        (0, u64::MAX),
+                        bounds,
                         k,
                         descending,
                         deleted.as_deref().unwrap_or(&none),
@@ -136,7 +159,7 @@ impl SupertableReader {
         };
         let (keys, mut hits): (Vec<u64>, Vec<SuperfileHit>) =
             candidates.into_iter().flatten().unzip();
-        if hits.len() < k {
+        if hits.len() < k && interval.is_none() {
             return Ok(None);
         }
         dispatch::attach_stable_ids_to_hits(self, &mut hits).await?;
@@ -157,6 +180,42 @@ impl SupertableReader {
         self.manifest().superfiles.iter().map(|e| e.n_docs).sum()
     }
 
+    /// The column `filter` bounds (`column`, or with `None` the one column
+    /// it names) and the interval of that column's range index keys it
+    /// keeps, when `filter`, simplified, is one interval on a range-indexed
+    /// column: comparisons and `BETWEEN`s against literals, `AND`ed. `None`
+    /// otherwise.
+    fn sorted_interval(
+        &self,
+        column: Option<&str>,
+        filter: &Expr,
+    ) -> Result<Option<(String, (u64, u64))>, QueryError> {
+        let schema = DFSchema::try_from(self.sql_schemas().scan().as_ref().clone())
+            .map_err(QueryError::DataFusion)?;
+        let simplifier = ExprSimplifier::new(
+            SimplifyContext::builder()
+                .with_schema(Arc::new(schema))
+                .build(),
+        );
+        let filter = simplifier
+            .simplify(filter.clone())
+            .map_err(|e| QueryError::InvalidQuery(format!("sorted_search_where: {e}")))?;
+        let column = match column {
+            Some(column) => column.to_string(),
+            None => {
+                let named = filter.column_refs();
+                let mut names = named.iter().map(|c| c.name.as_str());
+                match (names.next(), names.next()) {
+                    (Some(name), None) => name.to_string(),
+                    _ => return Ok(None),
+                }
+            }
+        };
+        let conjuncts: Vec<Expr> = split_conjunction(&filter).into_iter().cloned().collect();
+        let range_cols = self.manifest().table_schema().range_column_types();
+        Ok(single_range(&conjuncts, &column, &range_cols).map(|(_, _, lo, hi)| (column, (lo, hi))))
+    }
+
     /// Sync [`Self::sorted_hits_async`] through the sync→async bridge.
     pub(crate) fn sorted_hits(
         &self,
@@ -170,6 +229,58 @@ impl SupertableReader {
 }
 
 impl Supertable {
+    /// The first `k` rows `filter` keeps by `column`, ascending or (with
+    /// `descending`) descending, rows sharing a value ordered by `_id`
+    /// ascending: what `SELECT … WHERE filter ORDER BY column, _id LIMIT k`
+    /// answers, read from the column's range index without planning a
+    /// statement, as [`Supertable::sorted_search`] reads it. With `column`
+    /// `None` the column is the one `filter` names.
+    ///
+    /// `filter` must be one interval on a range-indexed column once
+    /// simplified (comparisons and `BETWEEN`s against literals of the
+    /// column's type, `AND`ed), and every superfile must hold the column's
+    /// range index with its ties in `_id` order. Otherwise `None`, and the
+    /// caller plans the statement. A row without a value is in no interval,
+    /// so fewer than `k` rows come back when fewer are in it.
+    pub fn sorted_search_where(
+        &self,
+        column: Option<&str>,
+        filter: &Expr,
+        descending: bool,
+        k: usize,
+        projection: Option<&[&str]>,
+    ) -> Result<Option<Vec<RecordBatch>>, InfinoError> {
+        debug!(?column, descending, k, "sorted_search_where");
+        let close_out = self.close_out();
+        let reader = self.reader()?;
+        let context =
+            |e: QueryError| InfinoError::from(e).with_context("sorted_search_where", None);
+        reader.check_projection(projection).map_err(context)?;
+        let Some((column, interval)) = reader.sorted_interval(column, filter).map_err(context)?
+        else {
+            return Ok(None);
+        };
+        let k = k.min(usize::try_from(reader.rows_held()).unwrap_or(usize::MAX));
+        let hits = {
+            let _foreground = ForegroundQueryGuard::enter();
+            reader
+                .block_on(reader.sorted_hits_within_async(&column, descending, k, Some(interval)))
+                .map_err(context)?
+        };
+        let Some(hits) = hits else {
+            return Ok(None);
+        };
+        let batches = vec![
+            self.block_on_query(
+                resolve_hits_named(&reader, &hits, projection)
+                    .instrument(detail_span!("search.resolve", hits = hits.len())),
+            )
+            .map_err(context)?,
+        ];
+        close_out.finish_batches(&batches);
+        Ok(Some(batches))
+    }
+
     /// The first `k` rows by `column`, a range-indexed column, ascending
     /// or (with `descending`) descending, rows sharing a value ordered by
     /// `_id` ascending, and rows without a value last: what `SELECT … ORDER
@@ -370,6 +481,90 @@ mod tests {
                 (0..ids.len()).map(move |i| ids.value(i))
             })
             .collect()
+    }
+
+    /// Over one interval of `key`, every ask answers as the same filtered
+    /// sort in SQL does, row for row, before and after an optimize, from
+    /// the range indexes: an interval holds no null, so a short page is the
+    /// whole answer. With no column named, the interval's own column sorts.
+    #[test]
+    fn sorted_search_where_answers_as_the_filtered_sql_sort() {
+        let dir = TempDir::new().expect("tempdir");
+        let st = table(&dir);
+        let intervals: [(Expr, &str); 5] = [
+            (
+                col("key")
+                    .gt_eq(lit(10_i64))
+                    .and(col("key").lt(lit(20_i64))),
+                "key >= 10 AND key < 20",
+            ),
+            (col("key").gt(lit(45_i64)), "key > 45"),
+            (col("key").lt_eq(lit(3_i64)), "key <= 3"),
+            (
+                col("key").between(lit(7_i64), lit(7_i64)),
+                "key BETWEEN 7 AND 7",
+            ),
+            (col("key").gt(lit(1_000_i64)), "key > 1000"),
+        ];
+        for pass in ["appended", "optimized"] {
+            if pass == "optimized" {
+                st.optimize(&OptimizeOptions::default()).expect("optimize");
+            }
+            let reader = st.reader().expect("reader");
+            for (filter, sql) in &intervals {
+                for &(descending, k) in ASKS {
+                    for column in [Some("key"), None] {
+                        let got = st
+                            .sorted_search_where(
+                                column,
+                                filter,
+                                descending,
+                                k,
+                                Some(&["_id", "seq", "key"]),
+                            )
+                            .expect("sorted_search_where")
+                            .unwrap_or_else(|| panic!("{pass}: {sql}: the index answers"));
+                        let direction = if descending { "DESC" } else { "ASC" };
+                        let want = reader
+                            .query_sql(&format!(
+                                "SELECT _id, seq, key FROM supertable WHERE {sql} ORDER BY key {direction} NULLS LAST, _id ASC LIMIT {k}"
+                            ))
+                            .expect("sql");
+                        let what = format!("{pass}: {sql}, descending {descending}, k {k}");
+                        assert_eq!(ids(&got), ids(&want), "{what}");
+                        assert_eq!(ints(&got, "seq"), ints(&want, "seq"), "{what}");
+                        assert_eq!(ints(&got, "key"), ints(&want, "key"), "{what}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// A filter that is not one interval on a range-indexed column is left
+    /// to the caller's statement: an `OR`, a column without a range index,
+    /// two columns with none named, or another column than the one named.
+    #[test]
+    fn sorted_search_where_declines_what_is_not_one_interval() {
+        let dir = TempDir::new().expect("tempdir");
+        let st = table(&dir);
+        let declined: [(Option<&str>, Expr); 4] = [
+            (
+                Some("key"),
+                col("key").eq(lit(3_i64)).or(col("key").eq(lit(5_i64))),
+            ),
+            (Some("seq"), col("seq").gt(lit(10_i64))),
+            (
+                None,
+                col("key").gt(lit(10_i64)).and(col("seq").gt(lit(10_i64))),
+            ),
+            (Some("key"), col("seq").gt(lit(10_i64))),
+        ];
+        for (column, filter) in &declined {
+            let got = st
+                .sorted_search_where(*column, filter, false, 10, Some(&["_id", "key"]))
+                .expect("sorted_search_where");
+            assert!(got.is_none(), "{column:?} {filter}: left to a statement");
+        }
     }
 
     /// Every ask answers as the same sort in SQL does, row for row, before
