@@ -117,7 +117,7 @@ use crate::{
             tokenize::{Tokenizer, unique_tokens},
         },
         page_index::{IndexColumns, loaded_pages},
-        reader::{Columns, FirstLoad},
+        reader::FirstLoad,
     },
     supertable::{
         SuperfileEntry, SupertableReader,
@@ -262,6 +262,8 @@ struct ScanFileOpener {
     open_intent: ReadIntent,
     scan_store: Arc<SuperfileObjectStore>,
     scan_footers: Arc<ScanFooters>,
+    /// Where a file's page-index decode runs, off the query runtime.
+    reader_pool: Arc<ThreadPool>,
 }
 
 impl ScanFileOpener {
@@ -299,7 +301,7 @@ impl ScanFileOpener {
             && let Some((held, parquet_meta)) = match columns {
                 None => Some((None, reader.parquet_metadata())),
                 Some(columns) => reader
-                    .loaded_page_indexed_footer(Columns::Set(columns))
+                    .loaded_page_indexed_footer(columns)
                     .map(|(held, footer)| (Some(held), footer)),
             }
         {
@@ -347,7 +349,11 @@ impl ScanFileOpener {
                         None => (None, reader.parquet_metadata()),
                         Some(columns) => {
                             let (held, footer) = reader
-                                .page_indexed_footer(Columns::Set(columns), FirstLoad::Start, None)
+                                .page_indexed_footer(
+                                    columns,
+                                    FirstLoad::Start,
+                                    Some(&self.reader_pool),
+                                )
                                 .await
                                 .map_err(QueryError::from)?;
                             (Some(held), footer)
@@ -1588,6 +1594,7 @@ impl SupertableProvider {
             open_intent: self.open_intent,
             scan_store: Arc::clone(&self.scan_store),
             scan_footers: Arc::clone(&self.scan_footers),
+            reader_pool: Arc::clone(&self.manifest.options.reader_pool),
         };
         async move {
             let cell = Arc::clone(
@@ -4726,8 +4733,10 @@ mod tests {
             .expect("range prepare again");
         assert!(Arc::ptr_eq(&again, &ranged), "a range read reuses it");
         let scan = || {
-            rt.block_on(provider.prepared_scan_file(Arc::clone(&entry), IndexColumns::none()))
-                .expect("scan prepare")
+            rt.block_on(
+                provider.prepared_scan_file(Arc::clone(&entry), IndexColumns::named(&["title"])),
+            )
+            .expect("scan prepare")
         };
         let scanned = scan();
         assert!(!Arc::ptr_eq(&scanned, &ranged), "a scan prepares it again");

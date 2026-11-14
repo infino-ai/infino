@@ -83,7 +83,7 @@ pub(crate) enum IndexColumns {
     /// Every column.
     All,
     /// The columns of a set: a scan's filter and read columns, a take's
-    /// projection, or none for a load that only reads the index into memory.
+    /// projection, or none, for a load that starts no page index.
     Only(Arc<IndexColumnSet>),
 }
 
@@ -130,14 +130,6 @@ impl IndexColumns {
                         || set.names.contains(root.name())
                 })
                 .collect(),
-        }
-    }
-
-    /// Whether these columns include every column in `names`, by name.
-    pub(crate) fn covers_names(&self, names: &[&str]) -> bool {
-        match self {
-            Self::All => true,
-            Self::Only(set) => names.iter().all(|name| set.names.contains(*name)),
         }
     }
 
@@ -470,7 +462,7 @@ fn merge<T>(
 
 /// The bytes of file `span` out of `bytes`, which start at file offset
 /// `start`; `None` when `bytes` doesn't hold all of `span`.
-fn slice_at(bytes: &Bytes, start: u64, span: &Range<u64>) -> Option<Bytes> {
+pub(crate) fn slice_at(bytes: &Bytes, start: u64, span: &Range<u64>) -> Option<Bytes> {
     let from = usize::try_from(span.start.checked_sub(start)?).ok()?;
     let to = usize::try_from(span.end.checked_sub(start)?).ok()?;
     (from <= to && to <= bytes.len()).then(|| bytes.slice(from..to))

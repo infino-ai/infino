@@ -86,9 +86,9 @@ use crate::{
     superfile::{
         ReadError, SuperfileReader,
         lazy_source::Source,
-        page_index::loaded_pages,
+        page_index::{IndexColumns, loaded_pages, slice_at},
         reader::{
-            Columns, FirstLoad, WHOLE_COLUMN_TAKE_DIVISOR, in_projection_order, rank_back_indices,
+            FirstLoad, WHOLE_COLUMN_TAKE_DIVISOR, in_projection_order, rank_back_indices,
             row_selection_for_ids, view_read_options, whole_row_group,
         },
     },
@@ -1739,7 +1739,7 @@ async fn read_row_group_byte_source(
     let input = ByteSourceAsyncReader {
         source: Source::Lazy(reader.byte_source()),
         metadata: reader
-            .page_indexed_footer(Columns::Names(names), FirstLoad::Skip, Some(pool))
+            .page_indexed_footer(&IndexColumns::named(names), FirstLoad::Skip, Some(pool))
             .await
             .map_err(QueryError::from)?
             .1,
@@ -1797,9 +1797,7 @@ impl ByteSourceAsyncReader {
 fn prefetched_slice(spans: &[(Range<u64>, Bytes)], range: &Range<u64>) -> Option<Bytes> {
     let at = spans.partition_point(|(span, _)| span.end <= range.start);
     let (span, bytes) = spans.get(at)?;
-    (span.start <= range.start && range.end <= span.end).then(|| {
-        bytes.slice((range.start - span.start) as usize..(range.end - span.start) as usize)
-    })
+    slice_at(bytes, span.start, range)
 }
 
 /// A take's prefetched spans as a file the synchronous Parquet reader can
@@ -2070,7 +2068,7 @@ pub(crate) async fn take_rows_byte_source(
         }
     }
     let (_, metadata) = reader
-        .page_indexed_footer(Columns::Names(names), FirstLoad::Start, pool)
+        .page_indexed_footer(&IndexColumns::named(names), FirstLoad::Start, pool)
         .await
         .map_err(QueryError::from)?;
     let source = Source::Lazy(reader.byte_source());
@@ -3606,7 +3604,7 @@ mod tests {
                 .expect("narrow load");
             assert!(
                 reader
-                    .loaded_page_indexed_footer(Columns::Names(&["title"]))
+                    .loaded_page_indexed_footer(&IndexColumns::named(&["title"]))
                     .is_none(),
                 "the narrow load left `title` out"
             );
