@@ -36,10 +36,11 @@
 //! object-store retries fire correctly.
 
 use std::{
+    collections::HashMap,
     error::Error,
     io,
     sync::{
-        Arc,
+        Arc, LazyLock, Mutex,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -134,7 +135,14 @@ pub async fn superfile_reader_tiered(
     }
 
     // 3. Storage-only fallback, for handles configured with durable storage
-    // but no disk cache. A lazy reader over range reads of the object: a
+    // but no disk cache. A reader this tier opened before is reused: its
+    // footer and page indexes were parsed once (see `LazyReaders`).
+    if storage.is_some()
+        && let Some(reader) = LAZY_READERS.get(uri)
+    {
+        return Ok((reader, OpenTier::Memory));
+    }
+    // Otherwise a lazy reader over range reads of the object: a
     // query then fetches the footer and the row groups it touches, and the
     // scan's read-ahead batches the rest. Fetching the whole object here
     // cost a one-hour query over a 1 GiB superfile the whole gigabyte, and a
@@ -194,10 +202,81 @@ pub async fn superfile_reader_tiered(
         let reader = SuperfileReader::open_lazy_with(source, OpenOptions { verify_crc: false })
             .await
             .map_err(|source| ReaderCacheError::OpenFailed { source })?;
-        return Ok((Arc::new(reader), OpenTier::Lazy));
+        let reader = LAZY_READERS.insert(*uri, Arc::new(reader));
+        return Ok((reader, OpenTier::Lazy));
     }
 
     Err(ReaderCacheError::NotFound { uri: *uri })
+}
+
+/// Most lazy readers [`LAZY_READERS`] keeps; past it the least recently
+/// used one is dropped (a caller holding it keeps it alive).
+const LAZY_READERS_MAX: usize = 256;
+
+/// The lazy readers the storage-only tier opened, by superfile, for the
+/// process.
+///
+/// A query over a table with durable storage and no disk cache (a local
+/// `file://` table, say) opened every superfile it read anew: a footer read
+/// and parse, then on its first scan the page indexes, read and parsed for
+/// every column. On a table of a hundred columns that was most of a short
+/// query's planning, paid again by every query. A superfile never changes
+/// once written and its uri names it alone, so its reader, with what it
+/// parsed, is good for every later query. A lazy reader holds its parsed
+/// metadata and the open's tail bytes, not the file, so the count bound
+/// keeps the cache small.
+static LAZY_READERS: LazyLock<LazyReaders<SuperfileReader>> =
+    LazyLock::new(|| LazyReaders::new(LAZY_READERS_MAX));
+
+/// Readers by superfile, at most `max` of them, the least recently handed
+/// out dropped first.
+struct LazyReaders<R> {
+    max: usize,
+    /// Each reader, with the tick it was last handed out at, and the tick.
+    readers: Mutex<(HashMap<SuperfileUri, (Arc<R>, u64)>, u64)>,
+}
+
+impl<R> LazyReaders<R> {
+    fn new(max: usize) -> Self {
+        Self {
+            max: max.max(1),
+            readers: Mutex::new((HashMap::new(), 0)),
+        }
+    }
+
+    fn get(&self, uri: &SuperfileUri) -> Option<Arc<R>> {
+        let mut guard = self.readers.lock().unwrap_or_else(|e| e.into_inner());
+        let (readers, tick) = &mut *guard;
+        *tick += 1;
+        let now = *tick;
+        readers.get_mut(uri).map(|(reader, used)| {
+            *used = now;
+            Arc::clone(reader)
+        })
+    }
+
+    /// Keep `reader` for `uri`, or hand back the one a concurrent open kept
+    /// first, so every caller shares one reader and its parsed metadata.
+    fn insert(&self, uri: SuperfileUri, reader: Arc<R>) -> Arc<R> {
+        let mut guard = self.readers.lock().unwrap_or_else(|e| e.into_inner());
+        let (readers, tick) = &mut *guard;
+        *tick += 1;
+        let now = *tick;
+        if let Some((kept, used)) = readers.get_mut(&uri) {
+            *used = now;
+            return Arc::clone(kept);
+        }
+        if readers.len() >= self.max
+            && let Some(oldest) = readers
+                .iter()
+                .min_by_key(|(_, (_, used))| *used)
+                .map(|(uri, _)| *uri)
+        {
+            readers.remove(&oldest);
+        }
+        readers.insert(uri, (Arc::clone(&reader), now));
+        reader
+    }
 }
 
 /// The in-memory tiers of [`superfile_reader_tiered`] alone, with nothing to
@@ -218,7 +297,11 @@ pub(crate) fn superfile_reader_in_memory(
         Err(ReaderCacheError::NotFound { .. }) => {}
         Err(_) => return None,
     }
-    disk_cache?.reader_in_memory(uri, storage_key, intent, storage)
+    match disk_cache {
+        Some(cache) => cache.reader_in_memory(uri, storage_key, intent, storage),
+        // The storage-only tier's reader, when it opened this one before.
+        None => storage.and_then(|_| LAZY_READERS.get(uri)),
+    }
 }
 
 /// How many of a read's opens each cache tier served. One line of counts on the
@@ -522,6 +605,64 @@ mod tests {
         );
     }
 
+    /// A second cacheless open of a superfile is served the reader the first
+    /// opened, footer parsed and all, without touching the object; and the
+    /// in-memory lookup the scan tries first finds it too.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_cacheless_open_reuses_the_reader_the_first_one_opened() {
+        let dir = TempDir::new().expect("tempdir");
+        let meter = UsageMeter::new();
+        let storage: Arc<dyn StorageProvider> = Arc::new(
+            LocalFsStorageProvider::new_with_meter(dir.path(), Arc::clone(&meter))
+                .expect("localfs"),
+        );
+        let uri = SuperfileUri::new_v4();
+        put_at_storage(&storage, &uri, minimal_superfile_bytes()).await;
+        let store = empty_store();
+        let key = uri.storage_path();
+        let open = || {
+            superfile_reader_tiered(
+                &store,
+                None,
+                Some(&storage),
+                &uri,
+                &key,
+                None,
+                ReadIntent::Warm,
+            )
+        };
+        let (first, tier) = open().await.expect("first open");
+        assert_eq!(tier, OpenTier::Lazy);
+        let before = meter.snapshot();
+        let (second, tier) = open().await.expect("second open");
+        assert_eq!(tier, OpenTier::Memory);
+        assert!(Arc::ptr_eq(&first, &second), "one reader for the superfile");
+        let data = meter.snapshot().since(&before).class_io(UriClass::UserData);
+        assert_eq!(data.get_count, 0, "the second open read nothing");
+        let resident = superfile_reader_in_memory(
+            &empty_store(),
+            None,
+            Some(&storage),
+            &uri,
+            &uri.storage_path(),
+            ReadIntent::Warm,
+        )
+        .expect("the in-memory lookup finds it");
+        assert!(Arc::ptr_eq(&first, &resident));
+        // Without storage the tier does not apply, and neither does its cache.
+        assert!(
+            superfile_reader_in_memory(
+                &empty_store(),
+                None,
+                None,
+                &uri,
+                &uri.storage_path(),
+                ReadIntent::Warm
+            )
+            .is_none()
+        );
+    }
+
     // ---- tier 1: non-NotFound error short-circuits ---------------------
 
     /// In-memory tier that always fails with a non-`NotFound` error.
@@ -778,5 +919,29 @@ mod tests {
             QueryError::Unsupported(m) => assert!(m.contains("reindex"), "{m}"),
             other => panic!("expected Unsupported, got {other:?}"),
         }
+    }
+
+    /// The storage-only tier's reader cache: one reader per superfile for
+    /// every caller, the first kept when two opens race, and the least
+    /// recently used dropped past the bound.
+    #[test]
+    fn lazy_readers_share_one_reader_and_drop_the_least_recently_used() {
+        use uuid::Uuid;
+
+        let uri = |n: u128| SuperfileUri(Uuid::from_u128(n));
+        let cache: LazyReaders<u32> = LazyReaders::new(2);
+        assert!(cache.get(&uri(1)).is_none());
+        let first = cache.insert(uri(1), Arc::new(10));
+        // A racing open's reader is not kept: every caller gets the first.
+        let raced = cache.insert(uri(1), Arc::new(11));
+        assert!(Arc::ptr_eq(&first, &raced));
+        assert!(Arc::ptr_eq(&first, &cache.get(&uri(1)).expect("kept")));
+        cache.insert(uri(2), Arc::new(20));
+        // 1 was handed out last, so 2 is the least recently used.
+        assert_eq!(cache.get(&uri(1)).as_deref(), Some(&10));
+        cache.insert(uri(3), Arc::new(30));
+        assert!(cache.get(&uri(2)).is_none(), "the least recently used goes");
+        assert_eq!(cache.get(&uri(1)).as_deref(), Some(&10));
+        assert_eq!(cache.get(&uri(3)).as_deref(), Some(&30));
     }
 }
