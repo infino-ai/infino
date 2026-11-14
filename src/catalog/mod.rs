@@ -4899,10 +4899,12 @@ mod tests {
 
     /// Distinct values one append of the past-the-cap fixture holds: more than a superfile
     /// records counts for.
-    const PAST_THE_FILE_CAP: usize = 300;
+    const PAST_THE_FILE_CAP: usize =
+        crate::supertable::manifest::list::MAX_EXACT_VALUE_COUNTS * 5 / 4;
     /// Distinct values in each of two appends of the past-the-cap fixture: fewer than a
     /// superfile's cap, more than it between them.
-    const UNDER_THE_FILE_CAP: usize = 200;
+    const UNDER_THE_FILE_CAP: usize =
+        crate::supertable::manifest::list::MAX_EXACT_VALUE_COUNTS * 3 / 4;
     /// Superfiles that trigger a merge in the value-count fixture's compaction, whatever
     /// their size: as few as merging takes.
     const MERGE_AT_SUPERFILES: u64 = 2;

@@ -109,7 +109,7 @@ const FORMAT_MAJOR_NAMED: &str = "1";
 /// Maximum distinct values retained as an exact per-column frequency table.
 /// Columns crossing the cap carry no table, so high-cardinality data has
 /// bounded manifest cost.
-pub(crate) const MAX_EXACT_VALUE_COUNTS: usize = 256;
+pub(crate) const MAX_EXACT_VALUE_COUNTS: usize = 1024;
 
 /// Cells probed per query — exactly one, the grid-nearest. The p=1 read
 /// shape is the design point (one cell fetch, ~fine_nprobe × 2 MiB runs).
