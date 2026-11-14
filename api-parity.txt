@@ -45,3 +45,4 @@ Supertable::companion	exempt	companion tables are declared through the Rust Inde
 Supertable::hydrate	exempt	experimental SQL-only bulk-load; engine-only, not yet wrapped in bindings
 Supertable::tokenize	exempt	How the index reads a text; Rust-embedder API for a caller judging its own texts against a column's terms, not a data operation the bindings wrap.
 Supertable::update_rows	exempt	the bindings' update(predicate, rows) routes record input through it; their public shape is the one update
+Supertable::merge_tables	exempt	Rust-embedder API for building a table from tables loaded apart, often on other machines; the bindings load one table in one process

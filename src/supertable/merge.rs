@@ -17,7 +17,6 @@ use std::{
 };
 
 use futures::{StreamExt, TryStreamExt, stream};
-use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::{
@@ -39,6 +38,13 @@ use crate::{
 /// latency over tens of thousands of superfiles.
 const HEADS_IN_FLIGHT: usize = 64;
 
+/// Copies [`merge_tables`] keeps in flight when the store copies server side: each is one small request.
+const SERVER_COPIES_IN_FLIGHT: usize = 256;
+
+/// Copies [`merge_tables`] keeps in flight when they stream through this process: each holds a
+/// superfile in memory.
+const STREAMED_COPIES_IN_FLIGHT: usize = 4;
+
 fn internal(e: impl std::fmt::Display) -> QueryError {
     QueryError::Internal(e.to_string())
 }
@@ -56,21 +62,6 @@ fn failpoint(step: &str) -> Result<(), QueryError> {
     }
 }
 
-/// The pinned term index's shape: layers, listed superfiles, and whether
-/// the manifest marks it complete.
-pub fn term_index_layout(reader: &SupertableReader) -> Result<Value, QueryError> {
-    let m = reader.manifest();
-    let index = reader.block_on(m.term_index()).map_err(internal)?;
-    Ok(match index {
-        None => json!(null),
-        Some(ix) => json!({
-            "layers": ix.root().layers.len(),
-            "covered": ix.root().superfiles.len(),
-            "complete": m.term_index_complete(),
-        }),
-    })
-}
-
 /// Objects `graft` needs under the destination, at the same keys as in the
 /// source: the superfiles the destination does not list yet, with sizes,
 /// and with `reuse_term_index` every slice and tier the source's root names.
@@ -83,6 +74,21 @@ pub struct GraftObjects {
     /// Whether the source's term-index layers can be stacked; when not, a
     /// graft makes the destination read every superfile to index it.
     pub spliceable: bool,
+}
+
+/// What [`Supertable::merge_tables`](crate::Supertable::merge_tables) did.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct MergeReport {
+    /// Superfiles committed into the table by this call.
+    pub merged: usize,
+    /// Rows those superfiles hold.
+    pub rows: u64,
+    /// Objects copied into the table's storage.
+    pub copied: usize,
+    /// Objects the table's storage held already, from an earlier run.
+    pub present: usize,
+    /// Sources whose term-index layers were stacked; the table indexed the others' superfiles itself.
+    pub spliced: usize,
 }
 
 /// What a `graft` did.
@@ -397,8 +403,72 @@ async fn splice_term_index(
     Ok(spliced.load(Ordering::Relaxed))
 }
 
+fn storage_of_table(table: &Supertable) -> Result<Arc<dyn StorageProvider>, QueryError> {
+    table
+        .inner()
+        .options
+        .storage
+        .clone()
+        .ok_or_else(|| internal("merge: the table has no storage"))
+}
+
+/// Moves every row of `sources` into `table`: copies their superfiles and term-index layers into
+/// `table`'s storage (server side where the store can), then commits them with their index, one
+/// source at a time. Safe to run again after a failure; what `table` holds already is skipped.
+/// Sources are left as they were; drop them after. Errors when a source differs from `table` in
+/// schema, partitioning or vector cell grid, or when a source changes during the merge.
+pub fn merge_tables(
+    table: &Supertable,
+    sources: &[&Supertable],
+) -> Result<MergeReport, QueryError> {
+    let storage = storage_of_table(table)?;
+    let mut report = MergeReport::default();
+    for source in sources {
+        let reader = source.reader().map_err(internal)?;
+        let mut objects = objects_to_copy(table, &reader, true)?;
+        let spliced = objects.spliceable;
+        if !spliced {
+            objects = objects_to_copy(table, &reader, false)?;
+        }
+        let source_storage = storage_of_table(source)?;
+        let server_side = matches!(
+            (storage.server_side_key(""), source_storage.server_side_key("")),
+            (Some((a, _)), Some((b, _))) if a == b
+        );
+        let keys: Vec<&String> = objects
+            .superfiles
+            .iter()
+            .map(|(key, _)| key)
+            .chain(&objects.term_index)
+            .collect();
+        let copied: Vec<bool> = table
+            .block_on_query(
+                stream::iter(&keys)
+                    .map(|key| {
+                        let (storage, source_storage) = (&storage, &source_storage);
+                        async move { storage.copy_in(key, source_storage.as_ref(), key).await }
+                    })
+                    .buffer_unordered(match server_side {
+                        true => SERVER_COPIES_IN_FLIGHT,
+                        false => STREAMED_COPIES_IN_FLIGHT,
+                    })
+                    .try_collect(),
+            )
+            .map_err(internal)?;
+        let grafted = graft(table, &reader, spliced)?;
+        report.merged += grafted.merged;
+        report.rows += objects.rows;
+        report.copied += copied.iter().filter(|&&c| c).count();
+        report.present += copied.iter().filter(|&&c| !c).count();
+        report.spliced += usize::from(spliced);
+    }
+    Ok(report)
+}
+
 #[cfg(test)]
 mod tests {
+    use serde_json::{Value, json};
+
     use super::*;
     use crate::{
         CompactionSettings,
@@ -429,7 +499,7 @@ mod tests {
             id_mins: vec![20, 30],
             layers: vec![layer(0, 0..2), layer(1, 1..2)],
         };
-        let root = spliced_root(&dst, &src, &HashSet::from([b2])).unwrap();
+        let root = spliced_root(&dst, &src, &HashSet::from([b2])).expect("spliced");
         assert_eq!(root.superfiles, vec![a, Uuid::nil(), b2]);
         assert_eq!(root.id_mins, vec![10, 20, 30]);
         assert_eq!(
@@ -448,7 +518,7 @@ mod tests {
             id_mins: vec![10, 20],
             layers: vec![layer(0, 0..2)],
         };
-        let root = spliced_root(&dst, &src, &HashSet::from([b1, b2])).unwrap();
+        let root = spliced_root(&dst, &src, &HashSet::from([b1, b2])).expect("spliced");
         assert_eq!(root.superfiles, vec![a, b1, Uuid::nil(), b2]);
         let unranged = Root {
             layers: vec![Layer {
@@ -502,6 +572,21 @@ mod tests {
             w.commit().expect("commit");
         }
         (dir, st)
+    }
+
+    /// The pinned term index's shape: layers, listed superfiles, and whether
+    /// the manifest marks it complete.
+    fn term_index_layout(reader: &SupertableReader) -> Result<Value, QueryError> {
+        let m = reader.manifest();
+        let index = reader.block_on(m.term_index()).map_err(internal)?;
+        Ok(match index {
+            None => json!(null),
+            Some(ix) => json!({
+                "layers": ix.root().layers.len(),
+                "covered": ix.root().superfiles.len(),
+                "complete": m.term_index_complete(),
+            }),
+        })
     }
 
     fn layout(st: &Supertable) -> (u64, bool) {

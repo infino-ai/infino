@@ -212,6 +212,7 @@ pub use superfile::{
 };
 pub use supertable::{
     Consistency, GcError, GcReport, MutationStats, OptimizeError, ReindexError,
+    merge::MergeReport,
     query::vector::VectorFilter,
     reindex::{PlannedRepair, ReindexReport, StalenessReport},
     schema::{
