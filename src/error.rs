@@ -239,6 +239,7 @@ impl From<QueryError> for InfinoError {
 /// | refused credentials | `PermissionDenied` |
 /// | a read that failed: storage, object store or io, in the chain | `Io` |
 /// | `NotImplemented` | `Unsupported` |
+/// | `Internal` from DataFusion's type coercion refusing a window's order type (see [`unrunnable_window_order`]) | `Unsupported` |
 /// | `SQL`, `Plan`, `SchemaError`, `Configuration`, `ArrowError` | `Query`: the query or its data |
 /// | `External` holding someone else's error (a regex that does not parse) | `Query` |
 /// | a pushed-down predicate that failed on the data | `Query` |
@@ -267,6 +268,15 @@ pub(crate) fn datafusion_error(e: &DataFusionError) -> InfinoError {
 pub(crate) fn datafusion_planning_error(e: &DataFusionError) -> InfinoError {
     classify_datafusion_error(e, true)
 }
+
+/// The name DataFusion's type-coercion analyzer rule gives the errors it
+/// raises (`DataFusionError::Context("type_coercion", …)`).
+const TYPE_COERCION_RULE: &str = "type_coercion";
+
+/// How DataFusion's type coercion begins the `Internal` it raises for a
+/// window whose `ORDER BY` has a type it cannot range over ("Cannot run range
+/// queries on datatype: Duration(ms)").
+const UNRUNNABLE_WINDOW_ORDER: &str = "Cannot run range queries on datatype: ";
 
 /// Markers DataFusion writes before the full column list in a
 /// `No field named X` schema error: after a period on the same line, or on a
@@ -435,6 +445,9 @@ fn classify_datafusion_error(e: &DataFusionError, planning: bool) -> InfinoError
         // Nothing of ours or the store's under it: DataFusion's own variant.
         match e.find_root() {
             DataFusionError::NotImplemented(_) => InfinoError::Unsupported,
+            DataFusionError::Internal(msg) if unrunnable_window_order(e, msg) => {
+                InfinoError::Unsupported
+            }
             DataFusionError::SQL(..)
             | DataFusionError::Plan(_)
             | DataFusionError::SchemaError(..)
@@ -446,6 +459,24 @@ fn classify_datafusion_error(e: &DataFusionError, planning: bool) -> InfinoError
         }
     };
     variant(cap_error_message(e.to_string()))
+}
+
+/// Whether `e`, whose root `Internal` says `msg`, is DataFusion's type
+/// coercion refusing a window ordered by a type it cannot range over (a time
+/// difference, `Duration(ms)`). That is a query the engine does not run, which
+/// the caller can rewrite, not a broken invariant. Only this message counts:
+/// the same rule raises `Internal` for its own broken states too ("ORDER BY
+/// column cannot be empty", "Unexpected time data type", a higher-order
+/// function's lambda checks, a `BETWEEN` it fails to coerce), and those stay
+/// `Backend`. A caller's own type mistakes there come as `Plan`.
+fn unrunnable_window_order(e: &DataFusionError, msg: &str) -> bool {
+    msg.starts_with(UNRUNNABLE_WINDOW_ORDER)
+        && error_chain(e).any(|link| {
+            matches!(
+                link.downcast_ref::<DataFusionError>(),
+                Some(DataFusionError::Context(rule, _)) if rule == TYPE_COERCION_RULE
+            )
+        })
 }
 
 /// Whether `link` is a read that failed: a storage, object store or io error.
@@ -1057,6 +1088,45 @@ mod tests {
             InfinoError::from(QueryError::Store("s".into())).to_string(),
             "io: superfile store error during query: s"
         );
+    }
+
+    /// A window order type coercion cannot range over is `Unsupported`,
+    /// planning or not. Any other `Internal` from that rule, and the same
+    /// message from anywhere else, is still a fault.
+    #[test]
+    fn a_window_order_type_coercion_refuses_is_unsupported() {
+        let under = |rule: &str, msg: &str| {
+            DataFusionError::Context(rule.into(), Box::new(DataFusionError::Internal(msg.into())))
+        };
+        let refused = under(
+            TYPE_COERCION_RULE,
+            "Cannot run range queries on datatype: Duration(ms)",
+        );
+        assert!(matches!(
+            datafusion_error(&refused),
+            InfinoError::Unsupported(_)
+        ));
+        assert!(matches!(
+            datafusion_planning_error(&refused),
+            InfinoError::Unsupported(_)
+        ));
+        for broken in [
+            under(TYPE_COERCION_RULE, "ORDER BY column cannot be empty"),
+            under(TYPE_COERCION_RULE, "Unexpected time data type Date32"),
+            under(
+                "optimize_projections",
+                "Cannot run range queries on datatype: Duration(ms)",
+            ),
+        ] {
+            assert!(
+                matches!(datafusion_error(&broken), InfinoError::Backend(_)),
+                "{broken}"
+            );
+            assert!(
+                matches!(datafusion_planning_error(&broken), InfinoError::Backend(_)),
+                "{broken}"
+            );
+        }
     }
 
     /// DataFusion's own `Execution` is the caller's only while planning; a
