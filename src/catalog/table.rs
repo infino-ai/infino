@@ -504,7 +504,7 @@ impl Supertable {
     /// counted. Rows come in no particular order.
     ///
     /// Read from the table's statistics, with no query planned, when they
-    /// count every live row exactly: no file with deletes, at most 256
+    /// count every live row exactly: no file with deletes, at most 1024
     /// distinct values across the table and in each file, and the column not
     /// in the middle of a type change. A file whose column holds only nulls
     /// counts as its nulls. Otherwise the grouped count runs. An unknown
