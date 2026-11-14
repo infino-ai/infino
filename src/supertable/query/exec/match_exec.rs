@@ -522,6 +522,7 @@ mod tests {
     use datafusion::{
         error::DataFusionError,
         execution::TaskContext,
+        logical_expr::Expr,
         physical_plan::{DisplayFormatType, ExecutionPlan},
         prelude::{col, lit},
     };
@@ -1063,6 +1064,232 @@ mod tests {
                 );
                 assert_eq!(metered_rows(&conn, &sql).0, rows, "{sql}");
             }
+        }
+    }
+
+    /// A table of `title` and `tag`, both full-text indexed, one superfile
+    /// per batch of `(title, tag)` rows, read with `reader_threads` when set.
+    fn tagged_table(reader_threads: Option<usize>, commits: &[&[(&str, &str)]]) -> Supertable {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new("tag", DataType::LargeUtf8, false),
+        ]));
+        let mut options = SupertableOptions::new(
+            Arc::clone(&schema),
+            vec![FtsConfig::new("title"), FtsConfig::new("tag")],
+            vec![],
+        )
+        .expect("valid options");
+        if let Some(threads) = reader_threads {
+            let pool = ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .expect("reader pool");
+            options = options.with_reader_pool(Arc::new(pool));
+        }
+        let st = Supertable::create(options).expect("create");
+        for rows in commits {
+            let titles: Vec<&str> = rows.iter().map(|(t, _)| *t).collect();
+            let tags: Vec<&str> = rows.iter().map(|(_, g)| *g).collect();
+            let mut w = st.writer().expect("writer");
+            w.append(&titled_batch(
+                &schema,
+                &titles,
+                Arc::new(LargeStringArray::from(tags)),
+            ))
+            .expect("append");
+            w.commit().expect("commit");
+        }
+        st
+    }
+
+    /// Rows each match kernel returns for `term` under `filters`, before any
+    /// `FilterExec`: the hit walk, the column take and the exact match.
+    fn kernel_rows(st: &Supertable, term: &str, filters: &[Expr]) -> (usize, usize, usize) {
+        let reader = st.reader().expect("reader");
+        let rt = Runtime::new().expect("runtime");
+        rt.block_on(async {
+            let hits = reader
+                .token_match_hits_async("title", term, BoolMode::Or, true, filters)
+                .await
+                .expect("hits");
+            let batches = reader
+                .token_match_columns_async("title", term, BoolMode::Or, &["title"], filters)
+                .await
+                .expect("columns");
+            let exact = reader
+                .exact_match_async("title", term, filters)
+                .await
+                .expect("exact");
+            let taken: usize = batches.iter().map(RecordBatch::num_rows).sum();
+            (hits.len(), taken, exact.len())
+        })
+    }
+
+    /// A `WHERE` on an indexed column narrows the rows each match kernel
+    /// returns inside a superfile: the first superfile keeps only its `y`
+    /// row, the second holds no `y` and is pruned, and the third is all `y`.
+    #[test]
+    fn match_kernels_return_only_the_rows_an_indexed_where_keeps() {
+        let st = tagged_table(
+            None,
+            &[
+                &[("rust", "x"), ("rust", "y"), ("rust", "x")],
+                &[("rust", "x"), ("rust", "x")],
+                &[("rust", "y"), ("rust", "y")],
+            ],
+        );
+        assert_eq!(kernel_rows(&st, "rust", &[]), (7, 7, 7), "premise");
+        let y = [col("tag").eq(lit("y"))];
+        assert_eq!(kernel_rows(&st, "rust", &y), (3, 3, 3), "only the y rows");
+        let z = [col("tag").eq(lit("z"))];
+        assert_eq!(
+            kernel_rows(&st, "rust", &z),
+            (0, 0, 0),
+            "no row is tagged z"
+        );
+    }
+
+    /// The filter narrows a superfile only where its index says it keeps
+    /// fewer rows than the match: under `tag = 'x'` (five rows) the two
+    /// `rare` hits come back unnarrowed, for the `FilterExec` to check, and
+    /// under `tag = 'y'` (two rows) the five `rust` hits are narrowed to one.
+    #[test]
+    fn a_filter_narrows_only_where_it_keeps_fewer_rows_than_the_match() {
+        let st = tagged_table(
+            None,
+            &[&[
+                ("rare", "x"),
+                ("rare", "y"),
+                ("rust", "x"),
+                ("rust", "x"),
+                ("rust", "x"),
+                ("rust", "x"),
+                ("rust", "y"),
+            ]],
+        );
+        let x = [col("tag").eq(lit("x"))];
+        assert_eq!(kernel_rows(&st, "rare", &x), (2, 2, 2), "not narrowed");
+        let y = [col("tag").eq(lit("y"))];
+        assert_eq!(kernel_rows(&st, "rust", &y), (1, 1, 1), "narrowed");
+    }
+
+    /// One row in this many of the sliced fixture is tagged `y`.
+    const SLICED_TAG_EVERY: usize = 1_000;
+
+    /// A match cut into doc-id slices is narrowed too: each slice keeps
+    /// only its `y` rows, and the slices share one walk of the filter.
+    #[test]
+    fn a_sliced_match_returns_only_the_rows_an_indexed_where_keeps() {
+        let rows: Vec<(&str, &str)> = (0..SLICED_ROWS)
+            .map(|i| match i % SLICED_TAG_EVERY {
+                0 => ("rust", "y"),
+                _ => ("rust", "x"),
+            })
+            .collect();
+        let st = tagged_table(Some(SLICING_READER_THREADS), &[&rows]);
+        let y = [col("tag").eq(lit("y"))];
+        let reader = st.reader().expect("reader");
+        let slices: Vec<usize> = reader
+            .block_on(reader.token_match_columns_async(
+                "title",
+                "rust",
+                BoolMode::Or,
+                &["title"],
+                &y,
+            ))
+            .expect("columns")
+            .iter()
+            .map(RecordBatch::num_rows)
+            .collect();
+        let kept = SLICED_ROWS / SLICED_TAG_EVERY;
+        assert!(slices.len() > 1, "{slices:?} is one batch");
+        assert_eq!(slices.iter().sum::<usize>(), kept, "only the y rows");
+        assert_eq!(kernel_rows(&st, "rust", &y), (kept, kept, kept));
+    }
+
+    /// Row narrowing finds a renamed column's terms by its id: after two
+    /// full-text columns swap names, every match path still returns the
+    /// row the filter keeps.
+    #[test]
+    fn sql_where_narrowing_follows_a_name_swap() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new("a", DataType::LargeUtf8, false),
+            Field::new("b", DataType::LargeUtf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(LargeStringArray::from(vec!["rust"; 3])),
+                Arc::new(LargeStringArray::from(vec!["p", "q", "p"])),
+                Arc::new(LargeStringArray::from(vec!["v", "w", "w"])),
+            ],
+        )
+        .expect("batch");
+        let spec = IndexSpec::new().fts("title").fts("a").fts("b");
+        let conn = metered_table(&schema, spec, &[batch]);
+        let id = |name: &str| {
+            conn.schema(METERED_TABLE)
+                .expect("schema")
+                .fields()
+                .iter()
+                .find(|f| f.name == name)
+                .expect("field")
+                .id
+        };
+        let (a, b) = (id("a"), id("b"));
+        for (name, field) in [("tmp", a), ("a", b), ("b", a)] {
+            conn.apply_schema(
+                METERED_TABLE,
+                &SchemaPatch::new(vec![FieldPatch::named(name).with_id(field)]),
+                None,
+            )
+            .expect("rename");
+        }
+        for sql in match_path_sqls("rust") {
+            for filter in ["a = 'v'", "b = 'q'"] {
+                let filtered = format!("{sql} WHERE {filter}");
+                assert_eq!(metered_rows(&conn, &filtered).0, 1, "{filtered}");
+            }
+        }
+    }
+
+    /// A deleted row stays out of a narrowed match.
+    #[test]
+    fn sql_where_narrowing_leaves_out_deleted_rows() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new("tag", DataType::LargeUtf8, false),
+            Field::new("n", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(LargeStringArray::from(vec!["rust"; 3])),
+                Arc::new(LargeStringArray::from(vec!["x", "y", "y"])),
+                Arc::new(Int64Array::from(vec![0_i64, 1, 2])),
+            ],
+        )
+        .expect("batch");
+        // Deletes need durable storage.
+        let dir = TempDir::new().expect("tempdir");
+        let conn = connect(dir.path().to_str().expect("utf-8 path")).expect("connect");
+        conn.create_table(
+            METERED_TABLE,
+            Arc::clone(&schema),
+            IndexSpec::new().fts("title").fts("tag"),
+        )
+        .expect("create")
+        .append(&batch)
+        .expect("append");
+        conn.open_table(METERED_TABLE)
+            .expect("open")
+            .delete(col("n").eq(lit(1_i64)))
+            .expect("delete");
+        for sql in match_path_sqls("rust") {
+            let filtered = format!("{sql} WHERE tag = 'y'");
+            assert_eq!(metered_rows(&conn, &filtered).0, 1, "{filtered}");
         }
     }
 

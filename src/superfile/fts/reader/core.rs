@@ -2035,6 +2035,12 @@ impl OrCursorSet {
     pub(crate) fn planned_ranges(&self) -> u64 {
         term_cursor_ranges(&self.cursors)
     }
+
+    /// The summed document counts of the set's terms: an upper bound on
+    /// the rows the union matches.
+    pub(crate) fn df_sum(&self) -> u64 {
+        self.cursors.iter().map(|c| c.df).sum()
+    }
 }
 
 /// Merge a `row -> score` map into top-k by descending score, ties
