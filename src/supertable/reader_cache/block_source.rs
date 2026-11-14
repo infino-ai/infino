@@ -115,7 +115,7 @@ use std::{
     any::Any,
     array,
     collections::BTreeMap,
-    fs,
+    fs, mem,
     os::unix::fs::{FileExt, MetadataExt},
     panic::resume_unwind,
     path::PathBuf,
@@ -126,7 +126,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     task::{Context, Poll},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
@@ -145,13 +145,19 @@ use tokio::{
 };
 use tracing::Instrument;
 
-use super::disk::{ArcMmapOwner, DiskCacheStore, Reservation};
+use super::disk::{ArcMmapOwner, DiskCacheStore, Reservation, Unkept};
 use crate::{
     runtime_bridge::shared_io_runtime,
     storage::{StorageError, stuck_after},
     superfile::{CacheBlocks, CacheRoom, LazyByteSource, LazyByteSourceError},
     supertable::manifest::SuperfileUri,
 };
+
+/// How often a source stamps the time of its last read. Eviction orders files by it, and a
+/// second is far finer than the time between a file's reads and its eviction. Stamping every read
+/// would write the stamp's cache line on every read, which concurrent readers of a hot file then
+/// fight over; a load that finds the stamp fresh leaves the line shared.
+const READ_STAMP_EVERY: Duration = Duration::from_secs(1);
 
 /// Cache block size: the unit the cache tracks, fills and indexes. Every GET
 /// covers whole blocks, so a read of at least [`MIN_GET_BYTES`] fetches at most
@@ -279,6 +285,12 @@ pub(crate) struct BlockCachedSource {
     /// past any of them.
     read_ends: [AtomicU64; READ_ENDS],
     next_read_end: AtomicUsize,
+    /// The store's clock ([`DiskCacheStore::clock_start`]), so reads are stamped without reaching
+    /// the store.
+    clock: Instant,
+    /// When a read last asked for bytes of this file, in microseconds on `clock`, stamped at most
+    /// every [`READ_STAMP_EVERY`]; 0 before the first read.
+    last_read_us: AtomicU64,
     state: OnceLock<Option<BlockFile>>,
     /// Filled-block set. Guarded by a sync mutex; never held across await.
     filled: Mutex<RoaringBitmap>,
@@ -336,6 +348,27 @@ enum Fill {
     /// Ahead of reads: uses only free budget and waits for its own write, so
     /// the cap never refuses it; it holds the bytes until then either way.
     Prefetch,
+}
+
+/// A fetched run's room in the store's write queue, taken before the run is admitted. It goes
+/// back on drop unless handed to the run, so an admission that stops early, or whose future is
+/// dropped while it waits for budget, never keeps it.
+struct QueueRoom<'a> {
+    store: &'a DiskCacheStore,
+    bytes: u64,
+}
+
+impl QueueRoom<'_> {
+    /// The run holds the room from here, and gives it back once written or dropped.
+    fn hand_on(self) {
+        mem::forget(self);
+    }
+}
+
+impl Drop for QueueRoom<'_> {
+    fn drop(&mut self) {
+        self.store.release_write_behind(self.bytes);
+    }
 }
 
 /// A fetched run of blocks waiting to be written to the block file, made by
@@ -768,6 +801,9 @@ impl BlockCachedSource {
         owns_accounting: bool,
         layout: SourceLayout,
     ) -> Arc<Self> {
+        let clock = store
+            .upgrade()
+            .map_or_else(Instant::now, |store| store.clock_start());
         Arc::new_cyclic(|me| Self {
             inner,
             store,
@@ -782,6 +818,8 @@ impl BlockCachedSource {
             },
             read_ends: array::from_fn(|_| AtomicU64::new(u64::MAX)),
             next_read_end: AtomicUsize::new(0),
+            clock,
+            last_read_us: AtomicU64::new(0),
             state: OnceLock::new(),
             filled: Mutex::new(RoaringBitmap::new()),
             filled_bytes: Arc::new(AtomicU64::new(0)),
@@ -1207,6 +1245,21 @@ impl BlockCachedSource {
             }
         }
         (start, end)
+    }
+
+    /// Stamp now as this file's last read, unless an earlier read stamped it under
+    /// [`READ_STAMP_EVERY`] ago. The first read always stamps, even in the store's first second.
+    fn stamp_read(&self) {
+        let now = self.clock.elapsed().as_micros() as u64;
+        let last = self.last_read_us.load(Ordering::Relaxed);
+        if last == 0 || now.saturating_sub(last) >= READ_STAMP_EVERY.as_micros() as u64 {
+            self.last_read_us.store(now, Ordering::Relaxed);
+        }
+    }
+
+    /// When a read last asked for bytes of this file, on the store's clock; 0 if none has.
+    pub(crate) fn last_read_us(&self) -> u64 {
+        self.last_read_us.load(Ordering::Relaxed)
     }
 
     /// Records where a read ended, over the oldest of the recent ends.
@@ -1667,7 +1720,7 @@ impl BlockCachedSource {
     /// (its first and last block). Past [`Self::hedge_after`] it also GETs those
     /// blocks itself and keeps whichever lands first; a hedge that ends without
     /// bytes is dropped and the wait goes on. A fetch that ends elsewhere for
-    /// its own reasons (its budget, a short GET) leaves this read to fetch its
+    /// its own reasons (its source replaced, a short GET) leaves this read to fetch its
     /// blocks itself, as it would have without waiting. Returns the block the
     /// bytes start at, and how the fetch ended.
     async fn wait_or_hedge(
@@ -1684,7 +1737,7 @@ impl BlockCachedSource {
             Ok(fetched) => fetched,
             Err(_) => select! {
                 fetched = &mut fetch => fetched,
-                hedged = self.fetch_now(bf, first, last, None) => match hedged {
+                hedged = self.hedge(bf, first, last) => match hedged {
                     Fetched::Bytes(_) => return (first, hedged),
                     _ => fetch.await,
                 },
@@ -1694,6 +1747,15 @@ impl BlockCachedSource {
             Fetched::Elsewhere => (first, self.fetch_now(bf, first, last, None).await),
             fetched => (run_first, fetched),
         }
+    }
+
+    /// [`Self::fetch_now`] for a read that gave up waiting on another read's GET, counted in
+    /// [`CacheStats::n_hedges`](super::disk::CacheStats::n_hedges).
+    async fn hedge(&self, bf: &BlockFile, first: u32, last: u32) -> Fetched {
+        if let Some(store) = self.store.upgrade() {
+            store.count_hedge(Self::run_bytes(bf.size, first, last).1);
+        }
+        self.fetch_now(bf, first, last, None).await
     }
 
     /// How long a read waits on another read's GET of `bytes` before it GETs the
@@ -1861,18 +1923,16 @@ impl BlockCachedSource {
         windows
     }
 
-    /// Fetches blocks `[first, last]` with one GET, reserving their budget
-    /// first, and queues them for writing. Returns:
-    /// - `None` when the read has to go elsewhere: the store is gone or this
-    ///   source is no longer the live entry, no budget is left, or the GET
-    ///   returned another length (the object is not the one this reader opened);
-    /// - the bytes and no run when they are fetched but not queued: the cap on
-    ///   unwritten runs is full, or another run starting at the same block is in
-    ///   memory.
+    /// Fetches blocks `[first, last]` with one GET and queues them for writing. Returns:
+    /// - `None` when the read has to go elsewhere: the store is gone or this source is no longer
+    ///   the live entry, a prefetch finds no free budget, or the GET returned another length (the
+    ///   object is not the one this reader opened);
+    /// - the bytes and no run when they are fetched but not kept (see [`Self::admit_run`]).
     ///
-    /// If the caller is dropped mid-GET, the reservation gives its bytes back.
-    /// `claim` is the run's entry in `runs` when a read registered it; see
-    /// [`Self::admit_run`].
+    /// A prefetch reserves its budget before the GET, from free space only: nobody waits on its
+    /// bytes, so a GET it could not keep is wasted. A read's run reserves after it, in
+    /// [`Self::admit_run`]. If the caller is dropped mid-GET, the reservation gives its bytes back.
+    /// `claim` is the run's entry in `runs` when a read registered it.
     async fn fetch_missing(
         &self,
         bf: &BlockFile,
@@ -1885,18 +1945,12 @@ impl BlockCachedSource {
             return Ok(None);
         };
         let (run_start, run_len) = Self::run_bytes(bf.size, first, last);
-
-        let reservation = if self.owns_accounting {
-            let reserved = match fill {
-                Fill::Read => store.reserve(run_len).await.ok(),
-                Fill::Prefetch => store.try_reserve(run_len),
-            };
-            let Some(reserved) = reserved else {
-                return Ok(None);
-            };
-            Some(reserved)
-        } else {
-            None
+        let reservation = match fill {
+            Fill::Prefetch if self.owns_accounting => match store.try_reserve(run_len) {
+                Some(reserved) => Some(reserved),
+                None => return Ok(None),
+            },
+            Fill::Prefetch | Fill::Read => None,
         };
 
         let bytes = self.inner.range(run_start, run_len).await?;
@@ -1904,18 +1958,42 @@ impl BlockCachedSource {
             return Ok(None);
         }
 
-        let run = self.admit_run(&store, first, last, &bytes, reservation, fill, claim);
+        let run = self
+            .admit_run(&store, first, last, &bytes, reservation, fill, claim)
+            .await;
         Ok(Some((bytes, run)))
     }
 
-    /// Queues fetched run `[first, last]` for writing: takes its share of the
-    /// store's cap on unwritten runs, keeps its bytes in `runs`, and hands it the
-    /// reserved budget. A registered run keeps the `claim`'s entry; an
-    /// unregistered one (a prefetch's or a hedge's) gets a new entry. `None`
-    /// (the reservation is given back, and a registered run leaves `runs`) if a
-    /// read finds the cap full, or an unregistered run finds another run
-    /// starting at `first`.
-    fn admit_run(
+    /// Queues fetched run `[first, last]` for writing, or returns `None` and keeps nothing (a
+    /// registered run then leaves `runs`), counting the bytes as not kept. The caller already has
+    /// the bytes from its GET and serves them either way.
+    ///
+    /// ```text
+    ///   fetched run
+    ///        │
+    ///        ▼
+    ///   1. room in the write queue?  ── no ──►  keep nothing, count `write_queue_full`
+    ///      (a prefetch always gets room:
+    ///       its caller waits for the write)
+    ///        │ yes
+    ///        ▼
+    ///   2. another run at `first`?   ── yes ─►  keep nothing, count `run_taken`
+    ///      (unregistered runs only:
+    ///       a prefetch's or a hedge's)
+    ///        │ no
+    ///        ▼
+    ///   3. reserve budget,           ── no room ─►  keep nothing, count `no_room`
+    ///      evicting as needed
+    ///      (a read's run, on a source
+    ///       that owns its accounting)
+    ///        │ ok
+    ///        ▼
+    ///   queue the run for writing
+    /// ```
+    ///
+    /// Room is made last, so a run the queue or another run turns away never evicts a file.
+    /// A registered run keeps the `claim`'s entry; an unregistered one gets a new entry.
+    async fn admit_run(
         &self,
         store: &Arc<DiskCacheStore>,
         first: u32,
@@ -1928,14 +2006,43 @@ impl BlockCachedSource {
         let source = self.me.upgrade()?;
 
         let run_len = bytes.len() as u64;
+        // 1. Room in the write queue, given back as `queued` drops unless the run takes it.
         match fill {
             Fill::Read => {
                 if !store.try_admit_write_behind(run_len) {
+                    store.count_unkept(Unkept::WriteQueueFull, run_len);
                     return None;
                 }
             }
             Fill::Prefetch => store.admit_write_behind(run_len),
         }
+        let queued = QueueRoom {
+            store,
+            bytes: run_len,
+        };
+        // 2. No other run at `first`. Another run owns this key until it is written, so an
+        // unregistered one is served but not cached. A run every read dropped is no run: its
+        // claim, when it drops, finds another id here and leaves this one alone.
+        let registered = claim.is_some();
+        let taken = |runs: &BTreeMap<u32, MemoryRun>| {
+            !registered && runs.get(&first).is_some_and(|run| !run.dropped())
+        };
+        let refuse = |why: Unkept| -> Option<FetchedRun> {
+            store.count_unkept(why, run_len);
+            None
+        };
+        if taken(&self.runs.lock().expect("runs mutex poisoned")) {
+            return refuse(Unkept::RunTaken);
+        }
+        // 3. Budget. A prefetch reserved before its GET; a read's run reserves now, evicting as
+        // needed.
+        let reservation = match (reservation, fill) {
+            (None, Fill::Read) if self.owns_accounting => match store.reserve(run_len).await {
+                Ok(reserved) => Some(reserved),
+                Err(_) => return refuse(Unkept::NoRoom),
+            },
+            (reservation, _) => reservation,
+        };
 
         let claimed = claim.map(Claim::hand_on);
         let mut runs = self.runs.lock().expect("runs mutex poisoned");
@@ -1950,13 +2057,10 @@ impl BlockCachedSource {
                 id
             }
             None => {
-                // Another run owns this key until it is written, so this one is
-                // served but not cached. A run every read dropped is no run: its
-                // claim, when it drops, finds another id here and leaves this
-                // one alone.
-                if runs.get(&first).is_some_and(|run| !run.dropped()) {
-                    store.release_write_behind(run_len);
-                    return None;
+                // Another run can have taken the key while the budget was reserved; the
+                // reservation then gives its bytes back as it drops.
+                if taken(&runs) {
+                    return refuse(Unkept::RunTaken);
                 }
                 let id = self.next_run_id.fetch_add(1, Ordering::Relaxed);
                 runs.insert(
@@ -1977,6 +2081,7 @@ impl BlockCachedSource {
             run_len
         });
 
+        queued.hand_on();
         Some(FetchedRun {
             source,
             store: Arc::clone(store),
@@ -2261,6 +2366,7 @@ impl LazyByteSource for BlockCachedSource {
     fn note_read(&self, start: u64, len: u64) {
         if len > 0 {
             self.note_read_end(start.saturating_add(len));
+            self.stamp_read();
         }
     }
 
@@ -2306,7 +2412,7 @@ impl LazyByteSource for BlockCachedSource {
             Some(bytes) => Ok(bytes),
             None => match self.whole_file() {
                 Some(file) => file.range(start, len).await,
-                None => self.inner.range(start, len).await,
+                None => self.fetch_around(Unkept::UncachedRead, start, len).await,
             },
         };
         self.note_read(start, len);
@@ -2375,8 +2481,23 @@ impl BlockCachedSource {
 
         match self.whole_file() {
             Some(file) => file.range(start, len).await,
-            None => self.inner.range(start, len).await,
+            None if in_hole => self.fetch_around(Unkept::FullTextSection, start, len).await,
+            None => self.fetch_around(Unkept::Passthrough, start, len).await,
         }
+    }
+
+    /// GETs `[start, start+len)` around the block cache, counting it as not kept for `why`.
+    async fn fetch_around(
+        &self,
+        why: Unkept,
+        start: u64,
+        len: u64,
+    ) -> Result<Bytes, LazyByteSourceError> {
+        let bytes = self.inner.range(start, len).await?;
+        if let Some(store) = self.store.upgrade() {
+            store.count_unkept(why, len);
+        }
+        Ok(bytes)
     }
 
     /// Whether every block of the range is on disk or being written, without
@@ -2468,6 +2589,16 @@ mod tests {
 
     /// How long a test waits to see that something does not happen.
     const STAYS_PUT: Duration = Duration::from_millis(50);
+
+    /// A wait long enough for the store's microsecond clock to move, so two
+    /// events a test orders get different times.
+    const CLOCK_STEP: Duration = Duration::from_millis(2);
+
+    /// The block file name of a test's only source in its directory.
+    const SOLE_BLOCK_FILE: &str = "wb.blocks";
+
+    /// A disk budget smaller than any run, so eviction can never make room for one.
+    const NO_ROOM_BUDGET_BYTES: u64 = 1;
 
     /// Blocks until `cond` holds, failing with `what` after [`NO_WAIT_DEADLINE`]
     /// of real time. For tests on a paused clock waiting on work on the I/O
@@ -3052,6 +3183,36 @@ mod tests {
         assert_eq!(inner.calls(), 2, "uncached passthrough on both reads");
         assert_eq!(src.filled_bytes_handle().load(Ordering::Acquire), 0);
         assert_eq!(store.stats().current_bytes, 0);
+        let unkept = store.stats().unkept_bytes;
+        assert_eq!(unkept.passthrough, 2 * 64, "each read's own bytes");
+        assert_eq!(unkept.total(), 2 * 64);
+
+        // A GET that fails fetched nothing, so it adds nothing.
+        assert!(src.range(OBJ as u64 - 1, 64).await.is_err());
+        assert_eq!(inner.calls(), 3, "the failed GET was sent");
+        assert_eq!(store.stats().unkept_bytes.total(), 2 * 64);
+    }
+
+    /// Write-queue room taken for a run goes back when the admission stops before the run holds
+    /// it, also when its future is dropped mid-wait, and stays taken once handed to the run.
+    #[test]
+    fn queue_room_goes_back_unless_handed_on() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        store.admit_write_behind(1);
+        drop(QueueRoom {
+            store: &store,
+            bytes: 1,
+        });
+        assert_eq!(store.write_behind_in_use(), 0, "given back");
+        store.admit_write_behind(1);
+        QueueRoom {
+            store: &store,
+            bytes: 1,
+        }
+        .hand_on();
+        assert_eq!(store.write_behind_in_use(), 1, "the run holds it");
+        store.release_write_behind(1);
     }
 
     /// A source whose FTS hole is `hole`, over an `obj`-byte blob,
@@ -3096,6 +3257,9 @@ mod tests {
         let _ = src.range(read_start, 1000).await.expect("hole read again");
         assert_eq!(inner.calls(), 2, "hole reads pass through");
         assert_eq!(src.filled_bytes_handle().load(Ordering::Acquire), 0);
+        let unkept = store.stats().unkept_bytes;
+        assert_eq!(unkept.full_text_section, 2 * 1000);
+        assert_eq!(unkept.total(), 2 * 1000);
 
         // Blocks 2..=14 in 4-block chunks: 4 GETs.
         src.prefetch(hole.0, hole.1, 4 * b, 2)
@@ -3229,8 +3393,9 @@ mod tests {
         }
     }
 
-    /// A read dropped while its GET is in flight gives back the budget it
-    /// reserved for the fill.
+    /// Nothing is left reserved by a fetch dropped while its GET is in flight:
+    /// a read has reserved nothing yet, and a prefetch gives back what it
+    /// reserved before the GET.
     #[tokio::test]
     async fn dropped_fill_releases_its_reservation() {
         let dir = tempdir().expect("tempdir");
@@ -3246,11 +3411,23 @@ mod tests {
         );
         store.install_block_entry_for_test(uri, Arc::clone(&src));
 
-        // The fill reserves, then waits on the GET, and the read is dropped.
+        // A read reserves only once its GET lands, so one still waiting holds nothing.
         let mut read = Box::pin(src.range(0, 100));
         assert!(poll!(read.as_mut()).is_pending(), "the GET hangs");
-        wait_until(|| store.stats().current_bytes > 0, "the fill reserves").await;
+        sleep(STAYS_PUT).await;
+        assert_eq!(
+            store.stats().current_bytes,
+            0,
+            "a read reserves after its GET"
+        );
         drop(read);
+
+        // A prefetch reserves free room before its GET; dropped mid-GET, it gives it back.
+        let block = CACHE_BLOCK_BYTES;
+        let mut prefetch = Box::pin(src.prefetch(0, block, block, 1));
+        assert!(poll!(prefetch.as_mut()).is_pending(), "the GET hangs");
+        wait_until(|| store.stats().current_bytes > 0, "the prefetch reserves").await;
+        drop(prefetch);
         // The GET's task is cancelled on the I/O runtime, which then drops it.
         wait_until(
             || store.stats().current_bytes == 0,
@@ -4713,8 +4890,19 @@ mod tests {
         store: &Arc<DiskCacheStore>,
         inner: Arc<dyn LazyByteSource>,
     ) -> (SuperfileUri, Arc<BlockCachedSource>) {
+        installed_source_at(dir, store, inner, SOLE_BLOCK_FILE)
+    }
+
+    /// [`installed_source`] with its block file at `dir/name`, so two sources can share a
+    /// directory.
+    fn installed_source_at(
+        dir: &Path,
+        store: &Arc<DiskCacheStore>,
+        inner: Arc<dyn LazyByteSource>,
+        name: &str,
+    ) -> (SuperfileUri, Arc<BlockCachedSource>) {
         let uri = SuperfileUri::new_v4();
-        let src = BlockCachedSource::new(inner, Arc::downgrade(store), uri, dir.join("wb.blocks"));
+        let src = BlockCachedSource::new(inner, Arc::downgrade(store), uri, dir.join(name));
         store.install_block_entry_for_test(uri, Arc::clone(&src));
         (uri, src)
     }
@@ -4725,10 +4913,34 @@ mod tests {
         store: &Arc<DiskCacheStore>,
         obj: usize,
     ) -> (SuperfileUri, Arc<CountingSource>, Arc<BlockCachedSource>) {
+        counting_source_at(dir, store, obj, SOLE_BLOCK_FILE)
+    }
+
+    /// [`counting_source`] with its block file at `dir/name`.
+    fn counting_source_at(
+        dir: &Path,
+        store: &Arc<DiskCacheStore>,
+        obj: usize,
+        name: &str,
+    ) -> (SuperfileUri, Arc<CountingSource>, Arc<BlockCachedSource>) {
         let inner = Arc::new(CountingSource::new(obj));
-        let (uri, src) =
-            installed_source(dir, store, Arc::clone(&inner) as Arc<dyn LazyByteSource>);
+        let (uri, src) = installed_source_at(
+            dir,
+            store,
+            Arc::clone(&inner) as Arc<dyn LazyByteSource>,
+            name,
+        );
         (uri, inner, src)
+    }
+
+    /// Takes the whole cap on unwritten runs in `b`-byte runs, as a slow disk would leave it.
+    /// Returns the bytes taken, for the test to give back.
+    fn fill_write_queue(store: &DiskCacheStore, b: u64) -> u64 {
+        let mut taken = 0;
+        while store.try_admit_write_behind(b) {
+            taken += b;
+        }
+        taken
     }
 
     /// An exact read that misses fetches just the blocks it touches, not a
@@ -4773,6 +4985,11 @@ mod tests {
         assert_eq!(inner.fetched_bytes(), len, "just the bytes asked for");
         assert_eq!(src.range_uncached(start, len).await.expect("repeat"), want);
         assert_eq!(inner.calls(), 2, "nothing was kept");
+        assert_eq!(
+            store.stats().unkept_bytes.uncached_reads,
+            2 * len,
+            "both GETs count as uncached reads"
+        );
 
         assert_eq!(src.range_exact(start, len).await.expect("kept"), want);
         let (b0, b1) = BlockCachedSource::block_span(start, len);
@@ -5579,10 +5796,7 @@ mod tests {
             Arc::clone(&inner) as Arc<dyn LazyByteSource>,
         );
         let bf = src.block_file().expect("block file");
-        let mut taken = 0;
-        while store.try_admit_write_behind(b) {
-            taken += b;
-        }
+        let taken = fill_write_queue(&store, b);
 
         let mut read = pin!(src.range(0, 10));
         assert!(
@@ -5679,10 +5893,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let store = test_store(dir.path(), u64::MAX);
         let (uri, inner, src) = counting_source(dir.path(), &store, 2 * b as usize);
-        let mut taken = 0;
-        while store.try_admit_write_behind(b) {
-            taken += b;
-        }
+        let taken = fill_write_queue(&store, b);
 
         let want = inner.blob.slice(0..64);
         assert_eq!(src.range(0, 64).await.expect("read"), want);
@@ -5699,6 +5910,162 @@ mod tests {
         assert_eq!(src.range(0, 64).await.expect("read with room"), want);
         store.block_writes_settled().await;
         assert_eq!(src.filled_bytes_handle().load(Ordering::Acquire), b);
+        store.remove_block_entry_for_test(&uri);
+    }
+
+    /// A read that finds the write queue full reserves nothing, so it evicts
+    /// nothing: the file cached before it keeps its blocks. Its bytes count as
+    /// not kept, once, under that cause.
+    #[tokio::test]
+    async fn a_read_the_write_queue_refuses_evicts_nothing() {
+        let b = UNIT;
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), b);
+        let (old_uri, _, old) = counting_source_at(dir.path(), &store, b as usize, "old.blocks");
+        let _ = old.range(0, 64).await.expect("fill the budget");
+        store.block_writes_settled().await;
+        assert_eq!(store.stats().current_bytes, b, "the budget is full");
+
+        let (new_uri, inner, src) =
+            counting_source_at(dir.path(), &store, b as usize, "new.blocks");
+        let taken = fill_write_queue(&store, b);
+        assert_eq!(
+            src.range(0, 64).await.expect("read"),
+            inner.blob.slice(0..64)
+        );
+
+        let stats = store.stats();
+        assert_eq!(stats.n_evictions, 0, "the refused read made no room");
+        assert_eq!(stats.current_bytes, b, "the older file keeps its blocks");
+        assert_eq!(stats.unkept_bytes.write_queue_full, b);
+        assert_eq!(stats.unkept_bytes.total(), b);
+        assert_eq!(inner.calls(), 1);
+
+        store.release_write_behind(taken);
+        store.remove_block_entry_for_test(&old_uri);
+        store.remove_block_entry_for_test(&new_uri);
+    }
+
+    /// Eviction goes by when a file was last read, not when it was opened: a file
+    /// opened first and read last outlives one opened last and read first.
+    #[tokio::test]
+    async fn a_file_read_last_outlives_one_opened_last() {
+        let b = UNIT;
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let (first_uri, _, first) =
+            counting_source_at(dir.path(), &store, b as usize, "first.blocks");
+        sleep(CLOCK_STEP).await;
+        let (last_uri, _, last) = counting_source_at(dir.path(), &store, b as usize, "last.blocks");
+        sleep(CLOCK_STEP).await;
+        let _ = last.range(0, 64).await.expect("read the file opened last");
+        sleep(CLOCK_STEP).await;
+        let _ = first
+            .range(0, 64)
+            .await
+            .expect("read the file opened first");
+        store.block_writes_settled().await;
+
+        store.evict_at_least(b).await.expect("evict one file");
+        assert!(store.is_cached(&first_uri), "read last, kept");
+        assert!(!store.is_cached(&last_uri), "read first, evicted");
+        store.remove_block_entry_for_test(&first_uri);
+    }
+
+    /// Reads that miss one run while the write queue is full share its one GET,
+    /// as reads of a run that is kept do, and its bytes count once.
+    #[tokio::test]
+    async fn reads_of_a_run_the_write_queue_refuses_share_one_get() {
+        let b = UNIT;
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let inner = held_source(b as usize);
+        let (uri, src) = installed_source(
+            dir.path(),
+            &store,
+            Arc::clone(&inner) as Arc<dyn LazyByteSource>,
+        );
+        let taken = fill_write_queue(&store, b);
+
+        let reads = join_all((0..4u64).map(|i| src.range(i * 100, 64)));
+        let release = async {
+            wait_until(
+                || inner.held.load(Ordering::Acquire) == 1,
+                "the first read's GET holds",
+            )
+            .await;
+            sleep(STAYS_PUT).await;
+            inner.release();
+        };
+        let (got, ()) = tokio::join!(reads, release);
+        for (i, read) in (0..4usize).zip(got) {
+            let at = i * 100;
+            assert_eq!(read.expect("read"), inner.inner.blob.slice(at..at + 64));
+        }
+        assert_eq!(inner.inner.calls(), 1, "one GET for all four reads");
+        assert_eq!(store.stats().unkept_bytes.write_queue_full, b);
+        assert_eq!(store.stats().unkept_bytes.total(), b);
+
+        store.release_write_behind(taken);
+        store.remove_block_entry_for_test(&uri);
+    }
+
+    /// The write queue decides when the GET lands, not when the read misses: a run
+    /// whose queue was full at the miss and drained during its GET is kept, so the
+    /// next read of those blocks makes no GET.
+    #[tokio::test]
+    async fn a_run_is_kept_when_the_write_queue_drains_during_its_get() {
+        let b = UNIT;
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let inner = held_source(b as usize);
+        let (uri, src) = installed_source(
+            dir.path(),
+            &store,
+            Arc::clone(&inner) as Arc<dyn LazyByteSource>,
+        );
+        let taken = fill_write_queue(&store, b);
+
+        let drain = async {
+            wait_until(
+                || inner.held.load(Ordering::Acquire) == 1,
+                "the read's GET holds",
+            )
+            .await;
+            store.release_write_behind(taken);
+            inner.release();
+        };
+        let (got, ()) = tokio::join!(src.range(0, 64), drain);
+        assert_eq!(got.expect("read"), inner.inner.blob.slice(0..64));
+        store.block_writes_settled().await;
+        assert_eq!(store.stats().unkept_bytes.total(), 0, "the run was kept");
+
+        let _ = src.range(0, 64).await.expect("read again");
+        assert_eq!(
+            inner.inner.calls(),
+            1,
+            "the second read finds the blocks local"
+        );
+        store.remove_block_entry_for_test(&uri);
+    }
+
+    /// A read whose run finds no room after its GET, because eviction can free
+    /// nothing, is served those bytes: one GET, nothing kept, counted once.
+    #[tokio::test]
+    async fn a_run_with_no_room_is_served_by_its_one_get() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), NO_ROOM_BUDGET_BYTES);
+        let (uri, inner, src) = counting_source(dir.path(), &store, UNIT as usize);
+
+        assert_eq!(
+            src.range(0, 64).await.expect("read"),
+            inner.blob.slice(0..64)
+        );
+        let stats = store.stats();
+        assert_eq!(inner.calls(), 1);
+        assert_eq!(stats.current_bytes, 0, "nothing kept");
+        assert_eq!(stats.unkept_bytes.no_room, inner.fetched_bytes());
+        assert_eq!(stats.unkept_bytes.total(), inner.fetched_bytes());
         store.remove_block_entry_for_test(&uri);
     }
 
@@ -5743,10 +6110,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let store = test_store(dir.path(), u64::MAX);
         let (uri, inner, src) = counting_source(dir.path(), &store, 3 * b as usize);
-        let mut taken = 0;
-        while store.try_admit_write_behind(b) {
-            taken += b;
-        }
+        let taken = fill_write_queue(&store, b);
 
         src.prefetch(0, 3 * b, b, 1).await.expect("prefetch");
         assert_eq!(inner.calls(), 3);
@@ -5924,10 +6288,7 @@ mod tests {
             &store,
             Arc::clone(&inner) as Arc<dyn LazyByteSource>,
         );
-        let mut taken = 0;
-        while store.try_admit_write_behind(b) {
-            taken += b;
-        }
+        let taken = fill_write_queue(&store, b);
 
         let mut one = pin!(src.range(0, 64));
         let mut two = pin!(src.range(10, 64));
@@ -6070,6 +6431,13 @@ mod tests {
         assert_eq!(hedged, inner.inner.blob.slice(10..74));
         assert!(started.elapsed() >= stuck_after(0), "it waited first");
         assert_eq!(inner.inner.calls(), 1, "then GET the block itself");
+        let stats = store.stats();
+        assert_eq!(stats.n_hedges, 1);
+        assert_eq!(stats.hedged_bytes, CACHE_BLOCK_BYTES);
+        assert_eq!(
+            stats.unkept_bytes.run_taken, CACHE_BLOCK_BYTES,
+            "the stuck run owns the block until it is written, so the hedge's copy is not kept"
+        );
 
         inner.release();
         assert_eq!(

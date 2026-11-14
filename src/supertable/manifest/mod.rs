@@ -1001,6 +1001,41 @@ impl ManifestSnapshot {
         Some(Cow::Owned(all))
     }
 
+    /// The superfiles `older` lists and this snapshot does not: compacted or deleted by the commits
+    /// between them. Parts are immutable, so a part id both lists hold names the same superfiles,
+    /// and only the parts that differ are compared: an append costs the parts it rewrote, not the
+    /// table. Empty when a changed part is not in memory, since a superfile missing from an
+    /// unloaded part may only be unloaded, and for a snapshot with no part list (a table with no
+    /// storage, which never loads a newer manifest).
+    pub(crate) fn superfiles_dropped_since(&self, older: &Self) -> Vec<SuperfileUri> {
+        let (Some(gone), Some(added)) = (
+            older.superfiles_outside(self),
+            self.superfiles_outside(older),
+        ) else {
+            return Vec::new();
+        };
+        let kept: FxHashSet<SuperfileUri> = added.into_iter().collect();
+        gone.into_iter().filter(|uri| !kept.contains(uri)).collect()
+    }
+
+    /// The superfiles of this snapshot's parts that `other`'s list does not hold, by part id.
+    /// `None` when either has no list, or when one of those parts is not loaded.
+    fn superfiles_outside(&self, other: &Self) -> Option<Vec<SuperfileUri>> {
+        let (list, other_list) = (self.list.as_ref()?, other.list.as_ref()?);
+        let other_parts: FxHashSet<PartId> =
+            other_list.parts.iter().map(|entry| entry.part_id).collect();
+        let mut uris = Vec::new();
+        for entry in list
+            .parts
+            .iter()
+            .filter(|entry| !other_parts.contains(&entry.part_id))
+        {
+            let part = self.get_cached_part_by_id(&entry.part_id)?;
+            uris.extend(part.superfiles.iter().map(|superfile| superfile.uri));
+        }
+        Some(uris)
+    }
+
     pub(crate) fn vector_index_storage_prefix(&self) -> Option<&str> {
         if let Some(list) = self.list.as_ref()
             && let Some(prefix) = list.vector_index_storage_prefix.as_deref()
@@ -12864,6 +12899,56 @@ mod tests {
         // A manifest with no list has no parts to resolve by index.
         let empty = ManifestSnapshot::empty(opts());
         assert!(empty.get_cached_part_by_list_idx(0).is_none());
+    }
+
+    /// A snapshot with one list part per `(id, superfiles, loaded)`, each part
+    /// in memory when `loaded`.
+    fn snapshot_of_parts(parts: &[(u128, &[Uuid], bool)]) -> ManifestSnapshot {
+        let mut list = list_with_parts(parts.len());
+        for (entry, (id, uuids, _)) in list.parts.iter_mut().zip(parts) {
+            entry.part_id = part::PartId(Uuid::from_u128(*id));
+            entry.n_superfiles = uuids.len() as u64;
+        }
+        let snapshot = manifest_with_list(list);
+        for (id, uuids, _) in parts.iter().filter(|(_, _, loaded)| *loaded) {
+            let part_id = part::PartId(Uuid::from_u128(*id));
+            let part = ManifestPart {
+                format_version: part::FORMAT_VERSION.into(),
+                part_id,
+                superfiles: uuids.iter().map(|uuid| seg_entry(*uuid, 4)).collect(),
+            };
+            snapshot
+                .parts
+                .insert(part_id, Arc::new(OnceCell::new_with(Some(Arc::new(part)))));
+        }
+        snapshot
+    }
+
+    /// With parts, only the parts that differ are compared: a compaction that
+    /// rewrote one part names the superfiles it dropped and not the one it
+    /// carried into the new part, and a part both snapshots share is never
+    /// read, loaded or not. A changed part that is not loaded, or a snapshot
+    /// with no part list, leaves the answer unknown, so it is empty.
+    #[test]
+    fn superfiles_dropped_since_compares_only_changed_parts() {
+        let [kept, carried, compacted, output] = [(); 4].map(|()| Uuid::new_v4());
+        let older = snapshot_of_parts(&[(1, &[kept], false), (2, &[carried, compacted], true)]);
+        let newer = snapshot_of_parts(&[(1, &[kept], false), (3, &[carried, output], true)]);
+        assert!(
+            older.resident_superfiles().is_none(),
+            "part 1 is not loaded"
+        );
+        assert_eq!(
+            newer.superfiles_dropped_since(&older),
+            vec![SuperfileUri(compacted)]
+        );
+        assert!(newer.superfiles_dropped_since(&newer).is_empty());
+
+        let unloaded = snapshot_of_parts(&[(1, &[kept], false), (3, &[carried, output], false)]);
+        assert!(unloaded.superfiles_dropped_since(&older).is_empty());
+
+        let flat = ManifestSnapshot::new(1, opts(), vec![seg_entry(compacted, 4)], None, None);
+        assert!(newer.superfiles_dropped_since(&flat).is_empty());
     }
 
     /// `ManifestSnapshot::new` with no storage/list takes the in-process-only

@@ -655,6 +655,9 @@ impl DiskCacheStore {
         let fill = Arc::<BackgroundFill>::default();
         match self.fills.entry(*uri) {
             Entry::Occupied(current) if !current.get().may_retry(now_us) => return,
+            // No new query reads a dead file, so its whole copy would never be read. Checked under
+            // the slot's lock, which `mark_dead` takes to cancel after it marks the file.
+            _ if self.dead_files().contains(uri) => return,
             slot => drop(slot.insert(Arc::clone(&fill))),
         }
         // Built before the task is spawned, so the download is unregistered even if the task never
@@ -2933,6 +2936,20 @@ mod tests {
 
         store.maybe_spawn_background_fill(&uri, &uri.storage_path(), &entry, None);
         assert!(store.fills.is_empty(), "no second download");
+    }
+
+    /// A dead file's lazy entry, opened by a query on an older snapshot, starts no download: no new
+    /// query reads the file, so its whole copy would never be read.
+    #[tokio::test]
+    async fn a_dead_file_is_not_downloaded() {
+        let (_dir, store) = test_store();
+        let uri = SuperfileUri::new_v4();
+        store.install_block_entry_for_test(uri, dummy_block_source(&store, uri));
+        let entry = Arc::clone(&store.cached.get(&uri).expect("the lazy entry"));
+        store.mark_dead(&[uri]);
+
+        store.maybe_spawn_background_fill(&uri, &uri.storage_path(), &entry, None);
+        assert!(store.fills.is_empty(), "no download");
     }
 
     /// Eviction for a download never takes the file the download is for: not its entry, not a copy

@@ -37,7 +37,9 @@ use crate::{
         error::GcError,
         gc::{delete_objects, list_refs, refresh_to_committed, term_index_slices},
         handle::SupertableInner,
-        manifest::{ManifestLoadError, SuperfileEntry, commit::manifest_uri, list::RoutingRef},
+        manifest::{
+            ManifestLoadError, SuperfileEntry, SuperfileUri, commit::manifest_uri, list::RoutingRef,
+        },
         wal::persistence::WalStore,
     },
 };
@@ -244,14 +246,23 @@ async fn orphaned_slices(
 impl SupertableInner {
     /// Record what the commit from `base` to `new` dropped, for the next deferred sweep on this
     /// handle. Called from the success arm of every loop that swaps the manifest pointer, with that
-    /// attempt's own base, so a lost attempt records nothing.
+    /// attempt's own base, so a lost attempt records nothing. The cache marks the `removed`
+    /// superfiles dead: no new query reads them, so they are evicted ahead of files in use.
     pub(in crate::supertable) fn note_superseded(
         &self,
         base: &ManifestSnapshot,
         new: &ManifestSnapshot,
         removed: &[Arc<SuperfileEntry>],
     ) {
+        if let Some(cache) = self.options.disk_cache.as_ref()
+            && !removed.is_empty()
+        {
+            let uris: Vec<SuperfileUri> = removed.iter().map(|entry| entry.uri).collect();
+            cache.mark_dead(&uris);
+        }
+
         let superseded = Superseded::between(base, new, removed);
+
         if !superseded.is_empty() {
             self.hold_superseded(superseded);
         }
