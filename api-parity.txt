@@ -47,13 +47,7 @@ Supertable::tokenize	exempt	How the index reads a text; Rust-embedder API for a 
 Supertable::update_rows	exempt	the bindings' update(predicate, rows) routes record input through it; their public shape is the one update
 Supertable::begin_import	exempt	Rust-embedder API for imports spread over several engine processes that share one table's storage; a single-process binding has no other process to coordinate
 Supertable::finish_import	exempt	Rust-embedder API for imports spread over several engine processes that share one table's storage; a single-process binding has no other process to coordinate
-Supertable::graft_import	exempt	Rust-embedder API for imports spread over several engine processes that share one table's storage; a single-process binding has no other process to coordinate
-Supertable::has_attached_replicas	exempt	Rust-embedder API for imports spread over several engine processes that share one table's storage; a single-process binding has no other process to coordinate
-Supertable::import_state	exempt	Rust-embedder API for imports spread over several engine processes that share one table's storage; a single-process binding has no other process to coordinate
 Supertable::open_import_replica	exempt	Rust-embedder API for imports spread over several engine processes that share one table's storage; a single-process binding has no other process to coordinate
-Supertable::seal_absent_replica	exempt	Rust-embedder API for imports spread over several engine processes that share one table's storage; a single-process binding has no other process to coordinate
-Supertable::open_imports	exempt	Rust-embedder API for imports spread over several engine processes that share one table's storage; a single-process binding has no other process to coordinate
 Supertable::abort_import	exempt	Rust-embedder API for imports spread over several engine processes that share one table's storage; a single-process binding has no other process to coordinate
-Supertable::import_activity	exempt	Rust-embedder API for imports spread over several engine processes that share one table's storage; a single-process binding has no other process to coordinate
-Supertable::import_writers	exempt	Rust-embedder API for imports spread over several engine processes that share one table's storage; a single-process binding has no other process to coordinate
-Supertable::claim_import_report	exempt	Rust-embedder API for imports spread over several engine processes that share one table's storage; a single-process binding has no other process to coordinate
+Supertable::import_status	exempt	Rust-embedder API for imports spread over several engine processes that share one table's storage; a single-process binding has no other process to coordinate
+Supertable::import_coordinator	exempt	Rust-embedder API for imports spread over several engine processes that share one table's storage; a single-process binding has no other process to coordinate

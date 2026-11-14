@@ -815,6 +815,19 @@ impl core::marker::Unpin for infino::GcSettings
 impl core::marker::UnsafeUnpin for infino::GcSettings
 impl core::panic::unwind_safe::RefUnwindSafe for infino::GcSettings
 impl core::panic::unwind_safe::UnwindSafe for infino::GcSettings
+pub struct infino::ImportCoordinator<'a>
+impl infino::ImportCoordinator<'_>
+pub fn infino::ImportCoordinator<'_>::claim_report(&self, &str) -> core::result::Result<bool, infino::InfinoError>
+pub fn infino::ImportCoordinator<'_>::graft(&self, &str) -> core::result::Result<alloc::vec::Vec<infino::ReplicaAccount>, infino::InfinoError>
+pub fn infino::ImportCoordinator<'_>::open_imports(&self) -> core::result::Result<alloc::vec::Vec<alloc::string::String>, infino::InfinoError>
+pub fn infino::ImportCoordinator<'_>::seal_absent(&self, &str, &str) -> core::result::Result<(), infino::InfinoError>
+impl<'a> core::marker::Freeze for infino::ImportCoordinator<'a>
+impl<'a> core::marker::Send for infino::ImportCoordinator<'a>
+impl<'a> core::marker::Sync for infino::ImportCoordinator<'a>
+impl<'a> core::marker::Unpin for infino::ImportCoordinator<'a>
+impl<'a> core::marker::UnsafeUnpin for infino::ImportCoordinator<'a>
+impl<'a> !core::panic::unwind_safe::RefUnwindSafe for infino::ImportCoordinator<'a>
+impl<'a> !core::panic::unwind_safe::UnwindSafe for infino::ImportCoordinator<'a>
 pub struct infino::ImportOutcome
 pub infino::ImportOutcome::duplicate_rows: u64
 pub infino::ImportOutcome::duplicates: usize
@@ -851,6 +864,25 @@ impl core::marker::Unpin for infino::ImportReplica
 impl core::marker::UnsafeUnpin for infino::ImportReplica
 impl !core::panic::unwind_safe::RefUnwindSafe for infino::ImportReplica
 impl !core::panic::unwind_safe::UnwindSafe for infino::ImportReplica
+pub struct infino::ImportStatus
+pub infino::ImportStatus::last_activity: core::option::Option<std::time::SystemTime>
+pub infino::ImportStatus::state: infino::ImportState
+pub infino::ImportStatus::writers: infino::Writers
+impl core::clone::Clone for infino::ImportStatus
+pub fn infino::ImportStatus::clone(&self) -> Self
+impl core::cmp::Eq for infino::ImportStatus
+impl core::cmp::PartialEq for infino::ImportStatus
+pub fn infino::ImportStatus::eq(&self, &Self) -> bool
+impl core::fmt::Debug for infino::ImportStatus
+pub fn infino::ImportStatus::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for infino::ImportStatus
+impl core::marker::Freeze for infino::ImportStatus
+impl core::marker::Send for infino::ImportStatus
+impl core::marker::Sync for infino::ImportStatus
+impl core::marker::Unpin for infino::ImportStatus
+impl core::marker::UnsafeUnpin for infino::ImportStatus
+impl core::panic::unwind_safe::RefUnwindSafe for infino::ImportStatus
+impl core::panic::unwind_safe::UnwindSafe for infino::ImportStatus
 pub struct infino::IndexSpec
 impl infino::IndexSpec
 pub fn infino::IndexSpec::companion(self, impl core::convert::Into<alloc::string::String>, arrow_schema::schema::SchemaRef, infino::IndexSpec) -> Self
@@ -1117,7 +1149,6 @@ pub fn infino::Supertable::append_rows_named(&self, &[serde_json::value::Value],
 pub fn infino::Supertable::apply_schema(&self, &infino::SchemaPatch, core::option::Option<u32>) -> core::result::Result<infino::TableSchema, infino::InfinoError>
 pub fn infino::Supertable::begin_import(&self, &str, core::option::Option<infino::Writers>) -> core::result::Result<infino::ImportState, infino::InfinoError>
 pub fn infino::Supertable::bm25_search(&self, &str, &str, usize, infino::Bm25SearchOptions, core::option::Option<&[&str]>) -> core::result::Result<alloc::vec::Vec<arrow_array::record_batch::RecordBatch>, infino::InfinoError>
-pub fn infino::Supertable::claim_import_report(&self, &str) -> core::result::Result<bool, infino::InfinoError>
 pub fn infino::Supertable::companion(&self, &str) -> core::result::Result<core::option::Option<infino::Supertable>, infino::InfinoError>
 pub fn infino::Supertable::count(&self, &str, &str, infino::BoolMode) -> core::result::Result<u64, infino::InfinoError>
 pub fn infino::Supertable::count_where(&self, &[datafusion_expr::expr::Expr]) -> core::result::Result<alloc::vec::Vec<u64>, infino::InfinoError>
@@ -1125,21 +1156,16 @@ pub fn infino::Supertable::delete(&self, datafusion_expr::expr::Expr) -> core::r
 pub fn infino::Supertable::exact_match(&self, &str, &str, core::option::Option<&[&str]>) -> core::result::Result<alloc::vec::Vec<arrow_array::record_batch::RecordBatch>, infino::InfinoError>
 pub fn infino::Supertable::finish_import(&self, &str, core::option::Option<u64>) -> core::result::Result<infino::ImportOutcome, infino::InfinoError>
 pub fn infino::Supertable::gc(&self, core::time::Duration) -> core::result::Result<infino::GcReport, infino::GcError>
-pub fn infino::Supertable::graft_import(&self, &str) -> core::result::Result<alloc::vec::Vec<infino::ReplicaAccount>, infino::InfinoError>
-pub fn infino::Supertable::has_attached_replicas(&self) -> core::result::Result<bool, infino::InfinoError>
 pub fn infino::Supertable::hybrid_search(&self, &str, &str, infino::BoolMode, &str, &[f32], usize, core::option::Option<&[&str]>) -> core::result::Result<alloc::vec::Vec<arrow_array::record_batch::RecordBatch>, infino::InfinoError>
 pub fn infino::Supertable::hydrate(&self, impl arrow_array::record_batch::RecordBatchReader, usize) -> core::result::Result<usize, infino::InfinoError>
-pub fn infino::Supertable::import_activity(&self, &str) -> core::result::Result<core::option::Option<std::time::SystemTime>, infino::InfinoError>
-pub fn infino::Supertable::import_state(&self, &str) -> core::result::Result<infino::ImportState, infino::InfinoError>
-pub fn infino::Supertable::import_writers(&self, &str) -> core::result::Result<infino::Writers, infino::InfinoError>
+pub fn infino::Supertable::import_coordinator(&self) -> core::result::Result<infino::ImportCoordinator<'_>, infino::InfinoError>
+pub fn infino::Supertable::import_status(&self, &str) -> core::result::Result<infino::ImportStatus, infino::InfinoError>
 pub fn infino::Supertable::index_staleness(&self, &infino::ReindexOptions) -> core::result::Result<infino::StalenessReport, infino::ReindexError>
 pub fn infino::Supertable::open_import_replica(&self, &str, &str) -> core::result::Result<infino::ImportReplica, infino::InfinoError>
-pub fn infino::Supertable::open_imports(&self) -> core::result::Result<alloc::vec::Vec<alloc::string::String>, infino::InfinoError>
 pub fn infino::Supertable::optimize(&self, &infino::OptimizeOptions) -> core::result::Result<(), infino::OptimizeError>
 pub fn infino::Supertable::reindex(&self, &infino::ReindexOptions) -> core::result::Result<infino::ReindexReport, infino::ReindexError>
 pub fn infino::Supertable::reindex_plan(&self, &infino::ReindexOptions) -> core::result::Result<alloc::vec::Vec<infino::PlannedRepair>, infino::ReindexError>
 pub fn infino::Supertable::schema(&self) -> arrow_schema::schema::SchemaRef
-pub fn infino::Supertable::seal_absent_replica(&self, &str, &str) -> core::result::Result<(), infino::InfinoError>
 pub fn infino::Supertable::sorted_search(&self, &str, bool, usize, core::option::Option<&[&str]>) -> core::result::Result<alloc::vec::Vec<arrow_array::record_batch::RecordBatch>, infino::InfinoError>
 pub fn infino::Supertable::token_match(&self, &str, &str, infino::BoolMode, core::option::Option<&[&str]>) -> core::result::Result<alloc::vec::Vec<arrow_array::record_batch::RecordBatch>, infino::InfinoError>
 pub fn infino::Supertable::tokenize(&self, &str, &str) -> core::result::Result<alloc::vec::Vec<alloc::string::String>, infino::InfinoError>
