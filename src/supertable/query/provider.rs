@@ -126,8 +126,8 @@ use crate::{
         },
         query::{
             candidate::{
-                CandidatePlan, ExactFilter, TermMemos, exact_filter, exact_range,
-                like_prune_leaves, single_range,
+                CandidatePlan, ExactFilter, PoolFile, Resolved, SelectionGate, TermMemos,
+                exact_filter, exact_range, like_prune_leaves, single_range,
             },
             deleted_stats::DeletedStatsCache,
             df_object_store::SuperfileObjectStore,
@@ -139,8 +139,7 @@ use crate::{
                 metered_exec::MeteredExec,
             },
             fts::{
-                IndexedSuperfile, PlanLocations, index_locations_for, memos_from_plan_locations,
-                plan_locations_for,
+                PlanLocations, index_locations_for, memos_from_plan_locations, plan_locations_for,
             },
             nan_bounds::without_nan_blind_bounds,
             prune::{PruneLeaf, select_superfiles},
@@ -347,6 +346,11 @@ const PUSHDOWN_MIN_ROWS: u64 = 4096;
 /// `IN` aggregate ran 2.5× slower through the index path than the
 /// plain scan.
 const PUSHDOWN_MAX_DENSITY: f64 = 0.5;
+
+/// Most rows an index may select: [`PUSHDOWN_MAX_FRACTION`] of all, at least [`PUSHDOWN_MIN_ROWS`].
+fn pushdown_rows(n_docs: u64) -> u64 {
+    ((n_docs as f64 * PUSHDOWN_MAX_FRACTION) as u64).max(PUSHDOWN_MIN_ROWS)
+}
 
 /// Gate for a `LIKE` token that needs a superfile's whole dictionary
 /// walked (a suffix or infix, or an `ILIKE` token that may be spelled
@@ -2281,7 +2285,7 @@ impl TableProvider for SupertableProvider {
         // The term index's locations for the predicate's terms: each
         // superfile then resolves them from its postings, not its dictionary.
         let plan_locations =
-            plan_locations_for(&self.manifest, &candidate_plan, &survivor_entries).await?;
+            Arc::new(plan_locations_for(&self.manifest, &candidate_plan, &survivor_entries).await?);
         let plan_locations = &plan_locations;
         // The same for the exact conjuncts' whole terms (`text_match`): each
         // superfile then reads a term's postings from where the index says
@@ -2363,19 +2367,6 @@ impl TableProvider for SupertableProvider {
         let exact_slots = Semaphore::new(reader_pool.current_num_threads());
         let exact_slots = &exact_slots;
 
-        // Pass 1 (per superfile), fanned out: every survivor resolves its
-        // candidate rows in its own future and `try_join_bounded` drives up
-        // to `superfiles_in_flight` of them together, so one superfile's
-        // dictionary fetch overlaps another's walk on the reader pool and a
-        // third's posting reads, instead of each superfile waiting for the
-        // one before it. The futures share this task rather than being
-        // spawned, so nothing here is `'static`: a resident superfile's match,
-        // which would block this task, goes to the pool, and a lazy one's
-        // reads are awaited. What stays here per superfile is light: the
-        // estimate (free when the term index lists the superfile) and
-        // bookkeeping. Results come back in survivor order, so the file list
-        // below stays deterministic in manifest order, and the first error
-        // (in time) ends the scan.
         // The columns the scan decodes, whose pages a selection may skip.
         let read_columns: Vec<&str> = match projection {
             Some(indices) => indices
@@ -2390,6 +2381,53 @@ impl TableProvider for SupertableProvider {
                 .map(|field| field.name().as_str())
                 .collect(),
         };
+        // When each superfile's index is worth using. A range pays only by the pages it skips, so
+        // it is also capped at the read columns' page count, with no floor.
+        let selection_gate = |plan: &CandidatePlan, prepared: &PreparedScanFile| {
+            let n_docs = prepared.reader.n_docs();
+            let index = match plan.only_ranges() {
+                true => {
+                    let fraction = (n_docs as f64 * PUSHDOWN_MAX_FRACTION) as u64;
+                    prepared
+                        .pages_per_column(&read_columns)
+                        .map_or(fraction, |pages| pages.min(fraction))
+                }
+                false => pushdown_rows(n_docs),
+            };
+            let density_cap = (n_docs as f64 * PUSHDOWN_MAX_DENSITY) as u64;
+            SelectionGate { index, density_cap }
+        };
+        let selection_gate = &selection_gate;
+        // Both passes below are the scan's predicate work. Opening files is in `scan.open_files`.
+        let predicates_span = detail_span!("scan.index_predicates", files = survivor_entries.len());
+
+        // Pass 1: each superfile's candidate rows. Resident ones go to the pool first, as a local
+        // read never waits and here they'd run one by one. The rest resolve below. Results keep
+        // survivor order, and the first error ends the scan.
+        let resident: Vec<Option<Resolved>> = match top_k_rows {
+            Some(_) => survivor_entries.iter().map(|_| None).collect(),
+            None => {
+                let files = survivor_entries
+                    .iter()
+                    .zip(&prepared_files)
+                    .map(|(entry, prepared)| PoolFile {
+                        reader: Arc::clone(&prepared.reader),
+                        superfile: entry.superfile_id,
+                        gate: selection_gate(&candidate_plan, prepared),
+                    })
+                    .collect();
+                Arc::clone(&candidate_plan)
+                    .resolve_resident_on_pool(
+                        files,
+                        Arc::clone(plan_locations),
+                        reader_pool,
+                        match_slots,
+                    )
+                    .instrument(predicates_span.clone())
+                    .await
+                    .map_err(QueryError::from)?
+            }
+        };
         let superfiles: Vec<SuperfileScan> = try_join_bounded(
             // Owned entries: a closure over borrowed ones, held across an
             // await in this `async_trait` method, trips rustc's "`FnOnce` is
@@ -2398,9 +2436,9 @@ impl TableProvider for SupertableProvider {
                 .iter()
                 .cloned()
                 .zip(prepared_files)
-                .map(|(entry, prepared)| {
+                .zip(resident)
+                .map(|((entry, prepared), resolved)| {
                     let candidate_plan = &candidate_plan;
-                    let read_columns = &read_columns;
                     async move {
                         // Only the rows asked for, deleted or not: no index
                         // narrows them and no delete overlay drops any.
@@ -2414,19 +2452,6 @@ impl TableProvider for SupertableProvider {
                         }
                         // Resolve candidate rows from the index. `None` => no
                         // usable bound, scan the superfile.
-                        //
-                        // Selectivity gate: estimate the match count from
-                        // per-term `df` first (from the term index, or a
-                        // posting-header read when the index doesn't list the
-                        // term). If a predicate would match more than
-                        // `PUSHDOWN_MAX_FRACTION` of this superfile, skip the
-                        // index path and let DataFusion scan: at that match
-                        // density the rows saturate the data pages, so an index
-                        // `RowSelection` can't skip any page and only adds
-                        // posting-walk + selection overhead. The floor keeps
-                        // the pushdown active on small superfiles; the density
-                        // cap binds even under the floor so an all-matching
-                        // predicate never takes the index path.
                         let mut predicate_work = MatchWork::default();
                         let plan = if needs_expansion {
                             // A whole-dictionary walk pays only when the
@@ -2463,77 +2488,27 @@ impl TableProvider for SupertableProvider {
                         } else {
                             Arc::clone(candidate_plan)
                         };
-                        let gate = ((prepared.reader.n_docs() as f64 * PUSHDOWN_MAX_FRACTION)
-                            as u64)
-                            .max(PUSHDOWN_MIN_ROWS);
-                        let density_cap =
-                            (prepared.reader.n_docs() as f64 * PUSHDOWN_MAX_DENSITY) as u64;
-                        // The floor keeps text predicates on the index over
-                        // small superfiles, where each row a selection spares
-                        // is text not decoded and checked. A range selects
-                        // numbers, cheap to decode and check: its selection
-                        // pays only by the pages it skips, so only with fewer
-                        // rows than the columns read have pages. With more,
-                        // nearly every page holds a selected row and the
-                        // selection decodes them all, slower than the scan.
-                        // A file with no page index keeps the fraction.
-                        let index_gate = match plan.only_ranges() {
-                            true => {
-                                let fraction = (prepared.reader.n_docs() as f64
-                                    * PUSHDOWN_MAX_FRACTION)
-                                    as u64;
-                                prepared
-                                    .pages_per_column(read_columns)
-                                    .map_or(fraction, |pages| pages.min(fraction))
-                            }
-                            false => gate,
-                        };
-                        let top_k = top_k_rows.as_ref();
-                        let est = match top_k {
-                            Some(_) => 0,
-                            None => {
-                                let located = IndexedSuperfile {
-                                    locations: plan_locations,
-                                    superfile: entry.superfile_id,
-                                };
-                                let (est, est_work) = plan
-                                    .estimate(
-                                        prepared.reader.as_ref(),
-                                        Some(reader_pool),
-                                        Some(located),
-                                    )
-                                    .await
-                                    .map_err(QueryError::from)?;
-                                predicate_work.merge(est_work);
-                                est
-                            }
-                        };
-                        let candidates = if let Some(rows) = top_k {
+                        let candidates = if let Some(rows) = top_k_rows.as_ref() {
                             // A top-k scan reads only the rows the range
                             // index put first; a superfile none of them is in
                             // reads nothing.
                             Some(rows.get(&entry.superfile_id).cloned().unwrap_or_default())
-                        } else if est > index_gate || est >= density_cap {
-                            None
                         } else {
-                            let memos = memos_from_plan_locations(
-                                prepared.reader.as_ref(),
-                                plan_locations,
-                                entry.superfile_id,
-                            )
-                            .await;
-                            let (bitmap, eval_work) = plan
-                                .evaluate_on_pool(
-                                    Arc::clone(&prepared.reader),
-                                    entry.superfile_id,
-                                    reader_pool,
-                                    match_slots,
-                                    memos,
-                                )
-                                .await
-                                .map_err(QueryError::from)?;
-                            predicate_work.merge(eval_work);
-                            bitmap
+                            let resolved = match resolved {
+                                Some(resolved) => resolved,
+                                None => Arc::clone(&plan)
+                                    .resolve(
+                                        Arc::clone(&prepared.reader),
+                                        entry.superfile_id,
+                                        plan_locations,
+                                        selection_gate(&plan, &prepared),
+                                        Some((reader_pool, match_slots)),
+                                    )
+                                    .await
+                                    .map_err(QueryError::from)?,
+                            };
+                            predicate_work.merge(resolved.work);
+                            resolved.rows
                         };
 
                         // This superfile's tombstoned rows (empty when no
@@ -2565,7 +2540,7 @@ impl TableProvider for SupertableProvider {
                                         check,
                                         &memos,
                                         candidates.as_ref(),
-                                        gate,
+                                        pushdown_rows(prepared.reader.n_docs()),
                                         &tombstones,
                                         batch_size,
                                         exact_limit,
@@ -2593,13 +2568,7 @@ impl TableProvider for SupertableProvider {
                 }),
             in_flight,
         )
-        // The per-superfile predicate work above: index candidate plans,
-        // their evaluation, and the tombstone overlay. Distinct from opening
-        // the files, which was paid for in `scan.open_files`.
-        .instrument(detail_span!(
-            "scan.index_predicates",
-            files = survivor_entries.len()
-        ))
+        .instrument(predicates_span)
         .await?;
 
         // The pushdown predicates' df probes, dictionary walks and posting

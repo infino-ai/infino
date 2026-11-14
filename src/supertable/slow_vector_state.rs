@@ -50,7 +50,7 @@ use crate::{
     supertable::{
         manifest::{
             SuperfileEntry, VectorSummary,
-            disk_cache::MetadataDiskCache,
+            disk_cache::{KeptWhole, MetadataDiskCache},
             encoding::SummaryWireMode,
             list::RoutingRef,
             part::{self, ContentHash, ManifestPart, PartId},
@@ -552,6 +552,10 @@ pub(crate) async fn fetch_centroid_section(
 ) -> Result<CentroidSection, SlowVectorStateError> {
     let io_err = |e: io::Error| SlowVectorStateError::Storage(format!("section spill: {e}"));
     let expected_len = section_len(entries) as u64;
+    // Every open reads the whole section, so the cache keeps it whole.
+    if let Some(cache) = cache {
+        cache.keep_whole(KeptWhole::CentroidSection, expected_len);
+    }
     let spill = create_spill(scratch_dir).map_err(|e| {
         SlowVectorStateError::Storage(format!(
             "centroid section spill under {}: {e}",
@@ -570,7 +574,6 @@ pub(crate) async fn fetch_centroid_section(
         None => {
             fetch_section_into(storage, reference, expected_len, &spill).await?;
             if let Some(cache) = cache
-                && expected_len <= cache.budget_bytes()
                 && let Ok(bytes) = async_fs::read(spill.path()).await
             {
                 cache.put(reference.content_hash, bytes.into()).await;
@@ -732,6 +735,8 @@ async fn write_blob_and_section(
     let (uri, content_hash) = blob?;
     let (centroids_uri, centroids_hash) = centroids?;
     if let Some(cache) = cache {
+        cache.keep_whole(KeptWhole::VectorStateBlob, blob_bytes.len() as u64);
+        cache.keep_whole(KeptWhole::CentroidSection, centroid_bytes.len() as u64);
         cache.put(content_hash, blob_bytes).await;
         cache.put(centroids_hash, centroid_bytes).await;
     }
@@ -1073,6 +1078,9 @@ pub(crate) async fn load_full_state(
             true,
         ),
     };
+    if let Some(cache) = cache {
+        cache.keep_whole(KeptWhole::VectorStateBlob, bytes.len() as u64);
+    }
     let blob = bytes.clone();
     let expected = *expected;
     let legacy = legacy.clone();
