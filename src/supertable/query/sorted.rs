@@ -255,8 +255,8 @@ impl SupertableReader {
         }
         let (bounds, rest): (Vec<Expr>, Vec<Expr>) = split_conjunction(&filter)
             .into_iter()
+            .filter(|&c| !matches!(c, Expr::Literal(ScalarValue::Boolean(Some(true)), _)))
             .cloned()
-            .filter(|c| !matches!(c, Expr::Literal(ScalarValue::Boolean(Some(true)), _)))
             .partition(|c| single_range(std::slice::from_ref(c), &column, &range_cols).is_some());
         let Some((_, _, lo, hi)) = single_range(&bounds, &column, &range_cols) else {
             return Ok(None);
