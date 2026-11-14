@@ -67,8 +67,11 @@ use arrow::{
 use arrow_array::{Array, Decimal128Array, Int64Array, new_empty_array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::{
-    common::tree_node::{Transformed, TreeNodeRecursion},
-    common::{Column, DFSchema, ScalarValue, runtime::SpawnedTask, tree_node::TreeNode},
+    common::{
+        Column, DFSchema, ScalarValue,
+        runtime::SpawnedTask,
+        tree_node::{Transformed, TreeNode, TreeNodeRecursion},
+    },
     dataframe::DataFrame,
     datasource::{DefaultTableSource, provider_as_source},
     error::DataFusionError,
