@@ -113,7 +113,12 @@ impl MatchOrder {
     /// under `filters`, the `WHERE` pushed to the match. `None` when the
     /// walk cannot honour it: the column is not one [`Self::sort_key`]
     /// takes, or the `WHERE` is one the walk cannot evaluate from stored
-    /// columns, so it could not tell which rows count.
+    /// columns, so it could not tell which rows count. `None` too when the
+    /// table's superfiles hold overlapping ranges of the column: the walk
+    /// passes a superfile only once the rows in hand beat its best key,
+    /// which a range overlapping its neighbours' rarely allows, so it would
+    /// read every superfile's key column for nothing, and the match is left
+    /// to the fan-out it takes without an order.
     pub(crate) fn new(
         reader: &SupertableReader,
         column: &str,
@@ -146,7 +151,7 @@ impl MatchOrder {
             data_type.clone(),
             true,
         )]));
-        Ok(Some(Self {
+        let order = Self {
             guard: ColumnTypeGuard::new(&manifest, field),
             manifest,
             column: column.to_owned(),
@@ -159,7 +164,26 @@ impl MatchOrder {
             key_schema,
             op_stats: reader.op_stats.clone(),
             found: Mutex::new(BinaryHeap::new()),
-        }))
+        };
+        Ok(order.ranges_separate().then_some(order))
+    }
+
+    /// Whether at least one in [`SEPARATED_SHARE_DENOMINATOR`] pairs of
+    /// superfiles adjacent in the walk's order hold ranges of the column
+    /// that do not overlap, over the superfiles whose statistics rank it.
+    fn ranges_separate(&self) -> bool {
+        let mut walk_order: Vec<(u64, u64)> = self
+            .manifest
+            .superfiles
+            .iter()
+            .filter_map(|entry| self.rank_range(entry))
+            .collect();
+        walk_order.sort_unstable_by_key(|&(best, _)| Reverse(best));
+        let separated = walk_order
+            .windows(2)
+            .filter(|pair| pair[0].1 >= pair[1].0)
+            .count();
+        separated * SEPARATED_SHARE_DENOMINATOR >= walk_order.len().saturating_sub(1)
     }
 
     /// A key's rank in the walk: higher is better, whichever the sort's
@@ -176,25 +200,12 @@ impl MatchOrder {
     /// the column, may hold a null in it (a null sorts first under a
     /// descending sort, outside every range), lacks the column, or holds it
     /// in a type the table has since left: the walk cannot then know what
-    /// it leaves out. `None` too when the superfiles' ranges overlap: the
-    /// walk passes a superfile only once the rows in hand beat its best
-    /// key, which a range overlapping its neighbours' rarely allows, so it
-    /// would read every superfile's key column for nothing.
+    /// it leaves out.
     pub(crate) fn best_ranks<P>(&self, units: &[(Arc<SuperfileEntry>, P)]) -> Option<Vec<u64>> {
-        let ranges: Vec<(u64, u64)> = units
+        units
             .iter()
-            .map(|(entry, _)| self.rank_range(entry))
-            .collect::<Option<_>>()?;
-        let mut walk_order = ranges.clone();
-        walk_order.sort_unstable_by_key(|&(best, _)| Reverse(best));
-        let separated = walk_order
-            .windows(2)
-            .filter(|pair| pair[0].1 >= pair[1].0)
-            .count();
-        if separated * SEPARATED_SHARE_DENOMINATOR < walk_order.len().saturating_sub(1) {
-            return None;
-        }
-        Some(ranges.into_iter().map(|(best, _)| best).collect())
+            .map(|(entry, _)| self.rank_range(entry).map(|(best, _)| best))
+            .collect()
     }
 
     /// The best and worst rank a row of `entry` can take, from its

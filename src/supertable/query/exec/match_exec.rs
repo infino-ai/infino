@@ -2055,8 +2055,8 @@ mod tests {
     }
 
     /// A sort column whose range spans the same values in every superfile:
-    /// no superfile can be passed, so the walk declines and the match takes
-    /// the ordinary fan-out, with the same answer.
+    /// no superfile can be passed, so no order is attached and the match
+    /// takes the plan it takes without one, with the same answer.
     #[test]
     fn order_by_a_column_overlapping_in_every_superfile_does_not_walk() {
         let schema = Arc::new(Schema::new(vec![
@@ -2099,9 +2099,11 @@ mod tests {
             .reader()
             .expect("reader");
         let output_schema = output_schema_with_score(&reader.manifest().scalar_schema());
-        let order = MatchOrder::new(&reader, "hour", true, 3, &[], &output_schema)
-            .expect("order")
-            .expect("hour is orderable");
+        let Some(order) =
+            MatchOrder::new(&reader, "hour", true, 3, &[], &output_schema).expect("order")
+        else {
+            return false;
+        };
         let units: Vec<(Arc<SuperfileEntry>, ())> = reader
             .manifest()
             .superfiles
