@@ -5267,7 +5267,7 @@ impl SupertableReader {
         let mut pooled: Vec<(usize, ScanCandidate)> = Vec::new();
         for (si, scan) in scans {
             let entry = &superfiles[si];
-            let reader = readers[si].as_ref();
+            let reader = &readers[si];
             // The scan wave above already ran; fold each superfile's work
             // in here, on the calling thread, now that the concurrent block
             // has been collected. Note this whole path sits behind
@@ -5323,7 +5323,7 @@ impl SupertableReader {
             }
             for (si, selected) in by_seg {
                 let entry = &superfiles[si];
-                let reader = readers[si].as_ref();
+                let reader = &readers[si];
                 let file_column = reader.column_alias(column_field_id, column);
                 let (hits, rerank_ns) = reader
                     .vector_rerank_selected(

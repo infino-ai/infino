@@ -314,7 +314,7 @@ pub(crate) fn apply_tombstone_filter(
 /// warm FTS at microseconds instead of tens of milliseconds — the same class
 /// of bug as the SQL vector id-only fast path.
 pub(crate) async fn attach_stable_ids(
-    reader: &SuperfileReader,
+    reader: &Arc<SuperfileReader>,
     entry: &SuperfileEntry,
     hits: &mut [SuperfileHit],
     fetch_lazy_id_page: bool,

@@ -38,6 +38,7 @@ pub mod ids;
 #[cfg(not(feature = "test-helpers"))]
 pub(crate) mod ids;
 pub mod lazy_source;
+pub(crate) mod page_index;
 pub(crate) mod range;
 pub mod reader;
 pub mod stats;

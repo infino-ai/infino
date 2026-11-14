@@ -86,8 +86,9 @@ use crate::{
     superfile::{
         ReadError, SuperfileReader,
         lazy_source::Source,
+        page_index::{loaded_pages, slice_at},
         reader::{
-            WHOLE_COLUMN_TAKE_DIVISOR, in_projection_order, rank_back_indices,
+            FirstLoad, WHOLE_COLUMN_TAKE_DIVISOR, in_projection_order, rank_back_indices,
             row_selection_for_ids, view_read_options, whole_row_group,
         },
     },
@@ -1588,7 +1589,7 @@ fn take_resident_file(
 /// `names` at `locals` of one lazily opened superfile, streamed through
 /// its byte source so the disk cache's block layer serves repeated reads.
 async fn take_lazy_file(
-    rd: &SuperfileReader,
+    rd: &Arc<SuperfileReader>,
     locals: &[u32],
     names: &[&str],
     adapter: &Option<FileSchemaMap>,
@@ -1711,7 +1712,8 @@ pub(crate) async fn read_file_row_group(
     } else {
         let refs: Vec<&str> = physical.iter().map(String::as_str).collect();
         let views: Vec<&str> = views.iter().map(String::as_str).collect();
-        read_row_group_byte_source(rd, row_group, &refs, &views).await?
+        read_row_group_byte_source(rd, row_group, &refs, &views, &manifest.options.reader_pool)
+            .await?
     };
     match adapter {
         None => Ok(read),
@@ -1723,16 +1725,23 @@ pub(crate) async fn read_file_row_group(
 
 /// [`SuperfileReader::read_row_group`] for a lazily opened superfile,
 /// streamed through its byte source so the disk cache's block layer serves
-/// repeated reads. Reading whole row groups needs no page index.
+/// repeated reads. Reading whole row groups needs no page index, but once
+/// the reader has loaded one for other columns, these columns must be in it:
+/// the footer fails a read of a column whose page index it does not hold. A
+/// load that adds them decodes on `pool`.
 async fn read_row_group_byte_source(
-    reader: &SuperfileReader,
+    reader: &Arc<SuperfileReader>,
     row_group: usize,
     names: &[&str],
     views: &[&str],
+    pool: &ThreadPool,
 ) -> DfResult<RecordBatch> {
     let input = ByteSourceAsyncReader {
         source: Source::Lazy(reader.byte_source()),
-        metadata: reader.parquet_metadata(),
+        metadata: reader
+            .page_indexed_footer_named(names, FirstLoad::Skip, Some(pool))
+            .await
+            .map_err(QueryError::from)?,
         prefetched: Vec::new(),
     };
     let options = if views.is_empty() {
@@ -1787,9 +1796,7 @@ impl ByteSourceAsyncReader {
 fn prefetched_slice(spans: &[(Range<u64>, Bytes)], range: &Range<u64>) -> Option<Bytes> {
     let at = spans.partition_point(|(span, _)| span.end <= range.start);
     let (span, bytes) = spans.get(at)?;
-    (span.start <= range.start && range.end <= span.end).then(|| {
-        bytes.slice((range.start - span.start) as usize..(range.end - span.start) as usize)
-    })
+    slice_at(bytes, span.start, range)
 }
 
 /// A take's prefetched spans as a file the synchronous Parquet reader can
@@ -1932,12 +1939,7 @@ fn hit_pages(
     spans: &mut Vec<Range<u64>>,
 ) {
     let (offset, len) = metadata.row_group(index).column(c).byte_range();
-    let pages = metadata
-        .offset_index()
-        .and_then(|oi| oi.get(index))
-        .and_then(|cols| cols.get(c))
-        .map(|oi| oi.page_locations())
-        .filter(|pages| !pages.is_empty());
+    let pages = loaded_pages(metadata, index, c).filter(|pages| !pages.is_empty());
     let Some(pages) = pages else {
         spans.push(offset..offset + len);
         return;
@@ -2030,7 +2032,7 @@ impl AsyncFileReader for ByteSourceAsyncReader {
 /// make the priced counter cache-dependent. The invariant materialization
 /// signals are `rows_materialized` and the decode CPU brackets.
 pub(crate) async fn take_rows_byte_source(
-    reader: &SuperfileReader,
+    reader: &Arc<SuperfileReader>,
     local_doc_ids: &[u32],
     names: &[&str],
     pool: Option<&ThreadPool>,
@@ -2065,7 +2067,7 @@ pub(crate) async fn take_rows_byte_source(
         }
     }
     let metadata = reader
-        .parquet_metadata_with_page_index()
+        .page_indexed_footer_named(names, FirstLoad::Start, pool)
         .await
         .map_err(QueryError::from)?;
     let source = Source::Lazy(reader.byte_source());
@@ -2553,6 +2555,7 @@ mod tests {
             builder::{BuilderOptions, FtsConfig, SuperfileBuilder, VectorConfig},
             fts::reader::{Bm25SearchOptions, BoolMode},
             lazy_source::{LazyByteSource, LazyByteSourceError},
+            page_index::IndexColumns,
             vector::{distance::Metric, layout::VectorLayout, rerank_codec::RerankCodec},
         },
         supertable::{
@@ -2564,7 +2567,8 @@ mod tests {
             },
         },
         test_helpers::{
-            build_title_batch, decimal128_id_field, decimal128_ids, default_supertable_options,
+            TitleColumn, build_title_batch, decimal128_id_field, decimal128_ids,
+            default_supertable_options, int_columns_superfile,
         },
     };
 
@@ -3569,6 +3573,61 @@ mod tests {
         (0..arr.len()).map(|i| arr.value(i).to_string()).collect()
     }
 
+    /// Rows in [`paged_titled_superfile_bytes`]: several data pages a column
+    /// chunk, so a page index loaded for one column stays partial rather than
+    /// costing more than every column's.
+    const PAGED_ROWS: u64 = 32_768;
+    /// `Int64` columns beside `doc_id` and `title` in that fixture.
+    const PAGED_INT_COLUMNS: usize = 4;
+
+    /// A superfile of `doc_id`, `title` (`"title {row}"`) and
+    /// [`PAGED_INT_COLUMNS`] `Int64` columns `n0`, `n1`, ..., [`PAGED_ROWS`]
+    /// rows.
+    fn paged_titled_superfile_bytes() -> Bytes {
+        int_columns_superfile("n", PAGED_INT_COLUMNS, PAGED_ROWS, TitleColumn::Plain)
+    }
+
+    /// A lazy reader whose page index an earlier scan loaded for other
+    /// columns still reads a column it lacks, through both byte-source paths:
+    /// each asks for the columns it reads instead of taking the footer as it
+    /// stands, which holds only placeholders for the rest.
+    #[tokio::test]
+    async fn a_narrowed_lazy_reader_reads_other_columns_through_its_byte_source() {
+        let bytes = paged_titled_superfile_bytes();
+        let narrowed = || async {
+            let source: Arc<dyn LazyByteSource> = Arc::new(RecordingSource::new(bytes.clone()));
+            let reader = SuperfileReader::open_lazy(source).await.expect("open lazy");
+            reader
+                .parquet_metadata_with_page_index(&IndexColumns::named(&["n0"]))
+                .await
+                .expect("narrow load");
+            assert!(
+                reader
+                    .loaded_page_indexed_footer(&IndexColumns::named(&["title"]))
+                    .is_none(),
+                "the narrow load left `title` out"
+            );
+            Arc::new(reader)
+        };
+        let pool = ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("pool");
+
+        let reader = narrowed().await;
+        let whole = read_row_group_byte_source(&reader, 0, &["title"], &[], &pool)
+            .await
+            .expect("row group read");
+        let expected: Vec<String> = (0..PAGED_ROWS).map(|r| format!("title {r}")).collect();
+        assert_eq!(titles_of(&whole), expected);
+
+        let reader = narrowed().await;
+        let taken = take_rows_byte_source(&reader, &[3, 0], &["title"], Some(&pool), None)
+            .await
+            .expect("take");
+        assert_eq!(titles_of(&taken), vec!["title 3", "title 0"]);
+    }
+
     /// A take whose prefetch lacks bytes its decode reads falls back to
     /// streaming through the source, returns the same rows, and is counted.
     #[tokio::test]
@@ -3577,7 +3636,7 @@ mod tests {
         let source: Arc<dyn LazyByteSource> = Arc::new(RecordingSource::new(bytes));
         let reader = SuperfileReader::open_lazy(source).await.expect("open lazy");
         let metadata = reader
-            .parquet_metadata_with_page_index()
+            .parquet_metadata_with_page_index(&IndexColumns::All)
             .await
             .expect("metadata");
         let root = reader.schema().index_of("title").expect("title");
@@ -3626,7 +3685,7 @@ mod tests {
             .await
             .expect("open lazy");
         let metadata = reader
-            .parquet_metadata_with_page_index()
+            .parquet_metadata_with_page_index(&IndexColumns::All)
             .await
             .expect("metadata");
         let root = reader.schema().index_of("title").expect("title");
