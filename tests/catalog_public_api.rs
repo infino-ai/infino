@@ -565,8 +565,6 @@ fn a_companion_is_hidden_reopened_and_purged_with_its_table() {
     );
 }
 
-/// A table created without companions has none, finds none under its
-/// location, and its manifest list carries no key for them: it is the list
 /// Event times (ms since the epoch) on one host for the window-order test:
 /// gaps of 1 s and 5 s between them.
 const EVENT_MS: [i64; 3] = [1_000, 2_000, 7_000];
@@ -610,6 +608,8 @@ fn a_window_ordered_by_a_time_difference_is_unsupported_not_a_fault() {
     );
 }
 
+/// A table created without companions has none, finds none under its
+/// location, and its manifest list carries no key for them: it is the list
 /// an engine without companions writes.
 #[test]
 fn a_table_without_companions_has_none_and_an_unchanged_list() {
