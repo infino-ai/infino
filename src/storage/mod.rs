@@ -49,12 +49,17 @@ pub(crate) mod options;
 mod retry;
 pub(crate) use retry::{hedged, stuck_after};
 pub mod s3;
+mod split;
 
 pub use azure::AzureStorageProvider;
 pub use gcs::GcsStorageProvider;
 pub use local_fs::LocalFsStorageProvider;
 pub(crate) use options::StorageOptions;
 pub use s3::S3StorageProvider;
+pub use split::{REPLICAS_DIR, SplitStorageProvider};
+pub(crate) use split::{
+    attached_replicas, is_attached, mark_attached, may_be_attached, settle_attached,
+};
 
 use crate::runtime_metrics::io::UsageMeter;
 

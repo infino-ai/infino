@@ -983,7 +983,10 @@ async fn publish_root(
         },
         false => policy.clone(),
     };
-    if let Err(error) = fold_tail(storage, &mut root, named, &fold_policy, pool).await {
+    // A replica's commits only append: its folds run beside them (`merge::fold_replica`).
+    if !policy.replica_folds
+        && let Err(error) = fold_tail(storage, &mut root, named, &fold_policy, pool).await
+    {
         warn!(%error, "term index: folding layers at commit failed; publishing the root unfolded");
     }
     write_root(storage.as_ref(), &root).await
@@ -1011,6 +1014,64 @@ async fn publish_root(
 /// yet: a fold that retired them would leave objects no root ever named,
 /// which the commit's sweep, reading what retired roots named, could not
 /// find. A publish that carries several appends adds a layer for each.
+/// Merges the next run of `foldable` layers that [`next_fold`] picks, or every layer with `whole`, and returns it
+/// with the range it replaces. A replica's fold stores ordinals from the start of its range, so it moves onto
+/// another root like a commit's delta.
+pub(crate) async fn fold_next(
+    storage: &Arc<dyn StorageProvider>,
+    root: &Root,
+    foldable: &[bool],
+    policy: &BuildPolicy,
+    pool: Option<&ThreadPool>,
+    whole: bool,
+) -> Result<Option<(Range<usize>, Layer)>, TermIndexError> {
+    let run = match whole {
+        true if root.layers.len() > 1 => Some(0..root.layers.len()),
+        true => None,
+        false => next_fold(root, foldable, policy),
+    };
+    let Some(run) = run else {
+        return Ok(None);
+    };
+    let layers = &root.layers[run.clone()];
+    let base = match policy.replica_folds {
+        true => layers
+            .iter()
+            .map(|l| l.ordinals.as_ref().map_or(0, |r| r.start).min(l.base))
+            .min()
+            .unwrap_or(0),
+        false => 0,
+    };
+    let ordinals: Vec<Option<u32>> = (0..root.superfiles.len() as u32)
+        .map(|o| o.checked_sub(base))
+        .collect();
+    // The merge looks a superfile's scoring up by its renumbered ordinal.
+    let shifted;
+    let policy = match base {
+        0 => policy,
+        _ => {
+            shifted = BuildPolicy {
+                scoring_by_ordinal: Arc::new(
+                    policy
+                        .scoring_by_ordinal
+                        .get(base as usize..)
+                        .unwrap_or_default()
+                        .to_vec(),
+                ),
+                ..policy.clone()
+            };
+            &shifted
+        }
+    };
+    let mut merged =
+        fold_layers(storage, layers, &ordinals, policy, &FoldIo::default(), pool).await?;
+    if base > 0 {
+        merged.base += base;
+        merged.ordinals = merged.ordinals.map(|r| r.start + base..r.end + base);
+    }
+    Ok(Some((run, merged)))
+}
+
 pub(crate) async fn fold_tail(
     storage: &Arc<dyn StorageProvider>,
     root: &mut Root,
@@ -1018,20 +1079,10 @@ pub(crate) async fn fold_tail(
     policy: &BuildPolicy,
     pool: Option<&ThreadPool>,
 ) -> Result<(), TermIndexError> {
-    // Every ordinal keeps its place: the fold renumbers nothing.
-    let ordinals: Vec<Option<u32>> = (0..root.superfiles.len() as u32).map(Some).collect();
     // Whether each layer is one the replaced root named.
     let mut foldable: Vec<bool> = (0..root.layers.len()).map(|i| i < named).collect();
-    while let Some(run) = next_fold(root, &foldable, policy) {
-        let merged = fold_layers(
-            storage,
-            &root.layers[run.clone()],
-            &ordinals,
-            policy,
-            &FoldIo::default(),
-            pool,
-        )
-        .await?;
+    while let Some((run, merged)) = fold_next(storage, root, &foldable, policy, pool, false).await?
+    {
         root.layers.drain(run.clone());
         root.layers.insert(run.start, merged);
         foldable.drain(run.clone());
@@ -1928,7 +1979,13 @@ fn next_fold(root: &Root, foldable: &[bool], policy: &BuildPolicy) -> Option<Ran
         let end = (start..root.layers.len())
             .find(|&i| !foldable[i])
             .unwrap_or(root.layers.len());
-        if let Some(run) = fold_run(&root.layers[start..end], policy.slice_target_bytes as u64) {
+        // A replica is its manifest's only writer, so no commit waits on a large fold and the slice bound does not
+        // apply.
+        let bound = match policy.replica_folds {
+            true => u64::MAX,
+            false => policy.slice_target_bytes as u64,
+        };
+        if let Some(run) = fold_run(&root.layers[start..end], bound) {
             return Some(start + run.start..start + run.end);
         }
         start = end;

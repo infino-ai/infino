@@ -606,7 +606,8 @@ impl From<SupertableBuildError> for InfinoError {
             // has had the retries spent on its behalf.
             SupertableBuildError::SupertableInUse
             | SupertableBuildError::WriteContention
-            | SupertableBuildError::SchemaMoved { .. } => InfinoError::Conflict(message),
+            | SupertableBuildError::SchemaMoved { .. }
+            | SupertableBuildError::ImportOpen => InfinoError::Conflict(message),
             // Ours: a store, scratch file, thread pool or cache directory
             // failing while the write ran, none of it the caller's to fix.
             SupertableBuildError::Store(_)
@@ -667,6 +668,7 @@ impl From<MutationError> for InfinoError {
             MutationError::InvalidNewRows(b) => InfinoError::from(b),
             // Matches the read path: a purged table's name resolves to nothing.
             MutationError::TableGone => InfinoError::NotFound(msg),
+            MutationError::ImportOpen => InfinoError::Conflict(msg),
             _ => InfinoError::Backend(msg),
         }
     }

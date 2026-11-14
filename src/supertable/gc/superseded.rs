@@ -37,7 +37,10 @@ use crate::{
         error::GcError,
         gc::{delete_objects, list_refs, refresh_to_committed, term_index_slices},
         handle::SupertableInner,
-        manifest::{ManifestLoadError, SuperfileEntry, commit::manifest_uri, list::RoutingRef},
+        manifest::{
+            ManifestLoadError, SUPERFILE_DATA_DIR, SuperfileEntry, commit::manifest_uri,
+            list::RoutingRef, term_index::STORAGE_PREFIX as TERM_INDEX_STORAGE_PREFIX,
+        },
         wal::persistence::WalStore,
     },
 };
@@ -155,9 +158,21 @@ pub(in crate::supertable) async fn reclaim(
         .into_iter()
         .partition(|key| referenced.contains(key.as_str()));
     report.still_referenced = kept.len();
-    targets.extend(
-        orphaned_slices(storage.as_ref(), &term_index_roots, latest.term_index_ref()).await,
-    );
+    // Attached replicas name superfiles and slices this table may have retired (a fold they
+    // replaced, a resend's identical slice): those wait for the sweep after the replicas detach.
+    let attached = crate::storage::may_be_attached(storage.as_ref()).await;
+    if attached {
+        targets.retain(|key| {
+            let data = key
+                .strip_prefix(SUPERFILE_DATA_DIR)
+                .is_some_and(|rest| rest.starts_with('/'));
+            !data && !key.starts_with(TERM_INDEX_STORAGE_PREFIX)
+        });
+    } else {
+        targets.extend(
+            orphaned_slices(storage.as_ref(), &term_index_roots, latest.term_index_ref()).await,
+        );
+    }
 
     delete_objects(inner, &storage, targets, |key, result| match result {
         Ok(()) => report.deleted += 1,
