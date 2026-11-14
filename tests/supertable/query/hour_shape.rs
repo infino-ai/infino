@@ -282,8 +282,10 @@ fn a_table_past_the_open_window_always_merges() {
     }
 }
 
-/// Within one window the learned gate still decides: it tries the way
-/// without the merge, which opens every tied superfile.
+/// Within one window the learned gate still decides: it takes both its
+/// ways, one opening every tied superfile, the other merging and opening a
+/// handful. The table holds exactly one window of superfiles, so a merge
+/// forced at the window itself would leave only the second.
 #[test]
 fn a_table_within_the_window_keeps_the_learned_gate() {
     let p = pair(Shape {
@@ -292,14 +294,91 @@ fn a_table_within_the_window_keeps_the_learned_gate() {
         window: SUPERFILES,
         index: true,
     });
-    let most = (0..REPEATS)
+    // The first run opens every superfile whatever the gate says: its
+    // merge runs beside opens a whole table wide.
+    opens_and_equal(&p, "python", 10);
+    let opens: Vec<u64> = (1..GATE_REPEATS)
         .map(|_| opens_and_equal(&p, "python", 10))
-        .max()
-        .unwrap_or(0);
+        .collect();
     assert!(
-        most > TIED_TERM_OPENS,
-        "every run opened at most {most}: the gate never took its other way"
+        opens.iter().any(|&n| n > TIED_TERM_OPENS),
+        "{opens:?}: the gate never took its way without the merge"
     );
+    assert!(
+        opens.iter().any(|&n| n <= TIED_TERM_OPENS),
+        "{opens:?}: the gate never merged"
+    );
+}
+
+/// Runs a test of the learned gate repeats: enough for it to have tried
+/// both its ways after the first.
+const GATE_REPEATS: usize = 12;
+
+/// Superfiles of the lone-phrase test that hold the whole phrase.
+const PHRASE_HOLDERS: usize = 2;
+
+/// A table of [`SUPERFILES`] superfiles past one window: the first
+/// [`PHRASE_HOLDERS`] hold "Barack Obama", the rest one of its words only,
+/// "Barack Hussein" or "Michelle Obama" in turn. Fewer than ten rows hold
+/// the phrase, so a top ten never fills and builds no floor.
+fn lone_phrase_table(dir: &TempDir, tiers: bool) -> Supertable {
+    let st = Supertable::create(options(
+        dir,
+        Shape {
+            tiers,
+            depth: None,
+            window: WINDOW,
+            index: true,
+        },
+    ))
+    .expect("create");
+    let mut w = st.writer().expect("writer");
+    for s in 0..SUPERFILES {
+        let title = match (s < PHRASE_HOLDERS, s % 2) {
+            (true, _) => "Barack Obama",
+            (false, 0) => "Barack Hussein",
+            (false, _) => "Michelle Obama",
+        };
+        let titles = vec![title, "Page of the archive"];
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(LargeStringArray::from(titles)),
+            Arc::new(StringArray::from(vec!["en", "en"])),
+            Arc::new(Int64Array::from(vec![1, 1])),
+            Arc::new(Int64Array::from(vec![s as i64, s as i64])),
+        ];
+        w.append(&RecordBatch::try_new(schema(), columns).expect("batch"))
+            .expect("append");
+        w.commit().expect("commit");
+    }
+    st
+}
+
+/// A query that is one quoted phrase matches only the documents holding
+/// every word of it: a superfile holding one word and not the other bounds
+/// the phrase at zero through the missing word's empty head, and is ruled
+/// out before it is opened. Only the superfiles holding the phrase open.
+#[test]
+fn a_lone_phrase_rules_out_superfiles_holding_one_of_its_words() {
+    let (with_dir, without_dir) = (
+        TempDir::new().expect("tempdir"),
+        TempDir::new().expect("tempdir"),
+    );
+    let p = Pair {
+        with: lone_phrase_table(&with_dir, true),
+        without: lone_phrase_table(&without_dir, false),
+        _with_dir: with_dir,
+        _without_dir: without_dir,
+    };
+    // The first ask reads its tiers beside its first opens; the later
+    // asks find them resident and merge before any open.
+    opens_and_equal(&p, "\"barack obama\"", 10);
+    for run in 1..REPEATS {
+        let n = opens_and_equal(&p, "\"barack obama\"", 10);
+        assert_eq!(
+            n, PHRASE_HOLDERS as u64,
+            "run {run}: opened {n}, but only {PHRASE_HOLDERS} superfiles hold the phrase"
+        );
+    }
 }
 
 /// Tied rows of a popular title ("Music", "Barack Obama", …) in each

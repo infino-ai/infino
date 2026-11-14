@@ -767,9 +767,10 @@ where
 }
 
 /// [`fanout_with`] for units the caller has ordered by how much they can
-/// still contribute: at most `window(answered)` units are in flight, once
-/// `answered` of them have answered, units start in the given order, and `skip_before_open` is asked about each unit just
-/// before its superfile would be opened — so a unit that can no longer
+/// still contribute: at most `window(answered)` units are in flight once
+/// `answered` of them have answered, units start in the given order, and
+/// `skip_before_open` is asked about each unit just before its superfile
+/// would be opened — so a unit that can no longer
 /// change the outcome (its score ceiling is below the running k-th score)
 /// is never opened at all. Results come back in completion order, which
 /// the callers here merge order-independently.

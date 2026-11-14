@@ -184,7 +184,7 @@ const OVER_FETCH_MAX_HITS: usize = 100_000;
 /// `EXACT_SCOPE_TAKE_ROWS` × [`WHOLE_COLUMN_TAKE_DIVISOR`] rows a chunk this
 /// size is a sparse take, which decodes only the pages its rows land on, so
 /// the predicate's columns over a large superfile never sit in memory whole.
-const EXACT_SCOPE_TAKE_ROWS: usize = 1 << 20;
+pub(crate) const EXACT_SCOPE_TAKE_ROWS: usize = 1 << 20;
 
 /// Rows of the first chunk [`exact_scope`] reads of a variable-width column,
 /// before it knows how many bytes a row decodes to.

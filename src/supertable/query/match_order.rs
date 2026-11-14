@@ -36,11 +36,13 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::{error::Result as DfResult, logical_expr::Expr};
 use roaring::RoaringBitmap;
 
 use crate::{
+    runtime_bridge::run_on_pool,
     runtime_metrics::op_stats::OpStatsCollector,
     superfile::{
         SuperfileReader,
@@ -53,7 +55,7 @@ use crate::{
         query::{
             SuperfileHit,
             candidate::literal_key,
-            exec::common::{PushedPredicate, RowCheck, take_file_columns},
+            exec::common::{EXACT_SCOPE_TAKE_ROWS, PushedPredicate, RowCheck, take_file_columns},
             skip::ColumnTypeGuard,
         },
         schema::FieldId,
@@ -189,10 +191,7 @@ impl MatchOrder {
     /// A key's rank in the walk: higher is better, whichever the sort's
     /// direction.
     fn rank(&self, key: u64) -> u64 {
-        match self.descending {
-            true => key,
-            false => !key,
-        }
+        rank_of(key, self.descending)
     }
 
     /// Each unit's best rank — of the best key its superfile can hold — in
@@ -267,29 +266,81 @@ impl MatchOrder {
         if hits.is_empty() {
             return Ok(hits);
         }
-        let locals: Vec<u32> = kept.iter().collect();
-        let batch = take_file_columns(
-            &self.manifest,
-            r,
-            locals,
-            &[self.column.as_str()],
-            &self.key_schema,
-            &self.op_stats,
-        )
-        .await
-        .map_err(QueryError::DataFusion)?;
-        let mut found = self.found.lock().expect("match order mutex poisoned");
-        push_keys(batch.column(0).as_ref(), self.kind, 0, |key, _| {
-            let rank = self.rank(key);
-            if found.len() < self.fetch {
-                found.push(Reverse(rank));
-            } else if found.peek().is_some_and(|Reverse(worst)| rank > *worst) {
-                found.pop();
-                found.push(Reverse(rank));
+        // The keys are read in chunks, each reserved against the
+        // connection's budget while it is folded, and folded on the reader
+        // pool: a chunk's best `fetch` ranks are all the walk's best can
+        // take from it, so only those reach the lock.
+        let budget = &self.manifest.options.connection_memory_budget;
+        let mut remaining = kept.iter();
+        loop {
+            let chunk: Vec<u32> = remaining.by_ref().take(EXACT_SCOPE_TAKE_ROWS).collect();
+            if chunk.is_empty() {
+                break;
             }
-            Ok(())
-        })
-        .map_err(QueryError::internal)?;
+            let batch = take_file_columns(
+                &self.manifest,
+                r,
+                chunk,
+                &[self.column.as_str()],
+                &self.key_schema,
+                &self.op_stats,
+            )
+            .await
+            .map_err(QueryError::DataFusion)?;
+            let _held = budget
+                .try_reserve(batch.get_array_memory_size())
+                .map_err(|over| {
+                    QueryError::OverBudget(format!("during an ordered match walk, {over}"))
+                })?;
+            let (kind, descending, fetch) = (self.kind, self.descending, self.fetch);
+            let best = run_on_pool(
+                Some(&self.manifest.options.reader_pool),
+                "ordered match keys",
+                move || best_of_chunk(&batch, kind, descending, fetch),
+            )
+            .await
+            .map_err(QueryError::internal)??;
+            let mut found = self.found.lock().expect("match order mutex poisoned");
+            for rank in best {
+                keep_best(&mut found, self.fetch, rank);
+            }
+        }
         Ok(hits)
+    }
+}
+
+/// A key's rank in a walk sorting `descending`: higher is better, whichever
+/// the direction.
+fn rank_of(key: u64, descending: bool) -> u64 {
+    match descending {
+        true => key,
+        false => !key,
+    }
+}
+
+/// The best `fetch` ranks among the keys in `batch`'s first column.
+fn best_of_chunk(
+    batch: &RecordBatch,
+    kind: KeyKind,
+    descending: bool,
+    fetch: usize,
+) -> Result<Vec<u64>, QueryError> {
+    let mut best: BinaryHeap<Reverse<u64>> = BinaryHeap::with_capacity(fetch.min(batch.num_rows()));
+    push_keys(batch.column(0).as_ref(), kind, 0, |key, _| {
+        keep_best(&mut best, fetch, rank_of(key, descending));
+        Ok(())
+    })
+    .map_err(QueryError::internal)?;
+    Ok(best.into_iter().map(|Reverse(rank)| rank).collect())
+}
+
+/// Take `rank` into `best`, the `fetch` best ranks so far with the worst on
+/// top.
+fn keep_best(best: &mut BinaryHeap<Reverse<u64>>, fetch: usize, rank: u64) {
+    if best.len() < fetch {
+        best.push(Reverse(rank));
+    } else if best.peek().is_some_and(|Reverse(worst)| rank > *worst) {
+        best.pop();
+        best.push(Reverse(rank));
     }
 }

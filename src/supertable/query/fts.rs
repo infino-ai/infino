@@ -1464,17 +1464,13 @@ impl SupertableReader {
             // A phrase's members in order, a repeated word repeated: the
             // kernel weights every occurrence.
             let members = |p: &[String]| -> Vec<usize> { p.iter().filter_map(index_of).collect() };
-            // A query that is one phrase and nothing else matches only the
-            // documents that hold it: the phrase is required, as a must is,
-            // and a document lacking a member is no match.
-            let lone_phrase = musts.is_empty()
-                && must_phrases.is_empty()
-                && shoulds.is_empty()
-                && should_phrases.len() == 1;
+            // A superfile lacking a word of a should-phrase bounds it at
+            // zero through that word's empty head, so only a must-phrase's
+            // words need be required.
             let tier_phrases: Vec<(Vec<usize>, bool)> = must_phrases
                 .iter()
                 .map(|p| (members(p), true))
-                .chain(should_phrases.iter().map(|p| (members(p), lone_phrase)))
+                .chain(should_phrases.iter().map(|p| (members(p), false)))
                 .collect();
             let required = bits(&musts)
                 | tier_phrases
@@ -1507,6 +1503,7 @@ impl SupertableReader {
                     entry_cost_ns: self.tier_entry_cost_ns(),
                     merge_gate: manifest.options.tier_merge_gate,
                     forced,
+                    budget: Arc::clone(&manifest.options.connection_memory_budget),
                 });
             }
         }

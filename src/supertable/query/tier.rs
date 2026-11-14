@@ -71,6 +71,7 @@ use uuid::Uuid;
 
 use super::fts::baked_avgdl;
 use crate::{
+    memory::{ConnectionMemoryBudget, Reservation},
     runtime_bridge::run_on_pool,
     superfile::fts::{
         bm25::{Bm25Params, score_with_dl_norm_k1},
@@ -298,10 +299,16 @@ const MAX_FIRST_ROUND_ENTRIES: u64 = 1 << 23;
 /// Entries the merge reads per query before it stops regardless of what is
 /// still in play, checked after each round. What has been read by then
 /// still bounds every superfile soundly; the merge just stops refining.
-/// Reads are held only for the superfiles the merge still reads for — one
-/// ruled out or fallen below the bar lets its go — so what the merge holds
-/// at once is well under this.
+/// What a round reads is reserved against the connection's memory budget
+/// before it is read, and a round the budget does not fit stops the merge
+/// the same way, so this caps the merge's work, not its memory.
 const MAX_ENTRIES_PER_QUERY: u64 = 1 << 26;
+/// Whether a merge whose first round decodes `entries` runs: a query whose
+/// first round alone would pass [`MAX_FIRST_ROUND_ENTRIES`] is not merged.
+fn first_round_fits(entries: u64) -> bool {
+    entries <= MAX_FIRST_ROUND_ENTRIES
+}
+
 /// Superfiles one pool job decodes in a round. A superfile's share of a
 /// round is several microseconds, so jobs this size still dwarf the
 /// pool's scheduling while a round of a hundred superfiles spreads over
@@ -369,6 +376,9 @@ pub(crate) struct TierQuery<'a> {
     /// tied superfiles apart. The measured costs still decide how deep it
     /// reads.
     pub(crate) forced: bool,
+    /// The connection's memory budget, which every round's reads are
+    /// reserved against.
+    pub(crate) budget: Arc<ConnectionMemoryBudget>,
 }
 
 /// The merge's outcome for one query.
@@ -474,12 +484,19 @@ const TF_UNKNOWN: u32 = u32::MAX >> LEN_BITS;
 
 /// The largest frequency a phrase is bounded at by the kernel's own
 /// arithmetic. The score `idf·tf / (tf + norm)` rises with `tf` by at least
-/// `norm / (tf·(tf + 1 + norm))` of itself per step, with a norm no smaller
-/// than `k1·(1 − b)` (0.3 at the defaults): up to this frequency the step
-/// is more than twice the rounding the arithmetic can add, so a document
-/// at a lower frequency never rounds above the bound. Past it the phrase
-/// is bounded by its members' keys, with slack.
+/// `norm / (tf·(tf + 1 + norm))` of itself per step: up to this frequency,
+/// at a norm of at least [`PHRASE_EXACT_MIN_NORM`], the step is more than
+/// twice the rounding the arithmetic can add, so a document at a lower
+/// frequency never rounds above the bound. Past it the phrase is bounded
+/// by its members' keys, with slack.
 const PHRASE_TF_EXACT_MAX: u32 = 512;
+/// The smallest length norm at which the phrase bound is the kernel's
+/// score with no slack: `k1·(1 − b)`, the least a norm can be, at the
+/// defaults. A larger `b` lets a short document in a column of long ones
+/// take a norm near zero, where the score stops rising with `tf` in f32
+/// and one at a lower frequency can round an ulp above it; the bound
+/// there takes the slack.
+const PHRASE_EXACT_MIN_NORM: f32 = 0.3;
 
 /// A document's term frequency and one-byte length bucket in one word.
 fn pack_tf_len(tf: u32, len: u8) -> u32 {
@@ -655,8 +672,8 @@ pub(crate) struct PreparedMerge<'a> {
     sources: Vec<Vec<Source>>,
     required: TermMask,
     merge_gate: bool,
-    forced: bool,
     open_cost_ns: u64,
+    budget: Arc<ConnectionMemoryBudget>,
     /// Whether the sums are the kernel's bit for bit, so a superfile whose
     /// heads were read whole can be answered from the index.
     exact_scores: bool,
@@ -833,8 +850,7 @@ pub(crate) async fn prepare_merge<'a>(
         }
     }
 
-    // A query whose first round alone would pass the entry cap is not merged.
-    if first_round > MAX_FIRST_ROUND_ENTRIES {
+    if !first_round_fits(first_round) {
         return Ok(None);
     }
 
@@ -922,7 +938,7 @@ pub(crate) async fn prepare_merge<'a>(
         sources,
         required: query.required,
         merge_gate: query.merge_gate,
-        forced: query.forced,
+        budget: Arc::clone(&query.budget),
         open_cost_ns: query.open_cost_ns,
         exact_scores,
         resident,
@@ -972,8 +988,8 @@ impl PreparedMerge<'_> {
             sources,
             required,
             merge_gate,
-            forced,
             open_cost_ns,
+            budget,
             exact_scores,
             ..
         } = self;
@@ -991,18 +1007,17 @@ impl PreparedMerge<'_> {
         };
         // With the gate off the merge is under test and reads on while a round
         // excludes anything, whatever the opens were measured to cost: the
-        // rounds it takes then depend on the table alone. A merge forced by
-        // the table's size keeps the measured costs: they decide its depth.
-        let open_cost_ns = if merge_gate || forced {
-            open_cost_ns
-        } else {
-            0
-        };
+        // rounds it takes then depend on the table alone. With it on, as it
+        // is by default, the measured costs decide its depth, forced or not.
+        let open_cost_ns = if merge_gate { open_cost_ns } else { 0 };
         let whole_first: Vec<bool> = sources.iter().map(|s| read_whole_first(s)).collect();
         let mut tier_bytes = 0u64;
         let mut merge_ns = 0u64;
         let mut merge = merge;
         let mut sources = sources;
+        // What the rounds read, held against the connection's budget until
+        // the merge reports.
+        let mut held: Option<Reservation> = None;
         for round in 0..max_rounds {
             // The bar a superfile's bound must clear to still matter: the
             // merge's threshold, or the floor the opens have built.
@@ -1038,6 +1053,35 @@ impl PreparedMerge<'_> {
                         })
                 })
                 .collect();
+            // Reserved before it is read: the round's chunks, and a block of
+            // entries for every head of every superfile still within reach.
+            // A round the budget does not fit is not read; the bounds read
+            // so far stand.
+            let chunk_bytes: u64 = reads
+                .iter()
+                .flat_map(|(ti, si, span)| sources[*ti][*si].chunks[span.clone()].iter())
+                .map(|c| c.len)
+                .sum();
+            let within_reach = reachable.iter().filter(|r| **r).count();
+            let round_bytes = usize::try_from(chunk_bytes)
+                .unwrap_or(usize::MAX)
+                .saturating_add(
+                    within_reach
+                        .saturating_mul(sources.len())
+                        .saturating_mul(BLOCK_ENTRIES)
+                        .saturating_mul(size_of::<Read>()),
+                );
+            let fits = match &mut held {
+                Some(reservation) => reservation.try_grow(round_bytes).is_ok(),
+                None => budget
+                    .try_reserve(round_bytes)
+                    .map(|reservation| held = Some(reservation))
+                    .is_ok(),
+            };
+            if !fits {
+                tracing::debug!(round, round_bytes, "tier merge stops: round over budget");
+                break;
+            }
             let fetches: Vec<_> = reads
                 .iter()
                 .map(|(ti, si, span)| {
@@ -1165,12 +1209,19 @@ impl PreparedMerge<'_> {
             // Or the superfiles still read on for, each one an open the next
             // rounds may yet save, at what a round costs: a round settles
             // few of them, the next ones many, as the blocks reach the
-            // documents that tie.
-            let near = merge
-                .slots
-                .iter()
-                .filter(|s| s.reads_on(bar_after, exact_scores) && s.near(bar_after))
-                .count() as u64;
+            // documents that tie. A shape whose candidates cannot be trusted
+            // seeds no threshold, so until the opens build a floor there is
+            // no bar for a superfile to be near, and reading on would only
+            // refine bounds nothing yet compares against.
+            let bar_ahead = bar_after.is_finite() || merge.shape.trusted;
+            let near = match bar_ahead {
+                true => merge
+                    .slots
+                    .iter()
+                    .filter(|s| s.reads_on(bar_after, exact_scores) && s.near(bar_after))
+                    .count() as u64,
+                false => 0,
+            };
             let worth =
                 pays(settled, 1, open_cost_ns, round_ns) || pays(near, 1, open_cost_ns, round_ns);
             let read_on = worth || settling;
@@ -1507,7 +1558,10 @@ impl Slot {
                 // but blind to an unread member's tail. The lower of the
                 // two bounds the phrase.
                 match phrase_atom_bound(members, mask, tf_len, idf, norm) {
-                    Some(score) if score <= by_keys * ub_slack => ub += score,
+                    Some((score, exact_score)) if score <= by_keys * ub_slack => {
+                        exact &= exact_score;
+                        ub += score;
+                    }
                     _ => {
                         exact = false;
                         ub += by_keys;
@@ -1581,16 +1635,17 @@ fn merge_sorted(docs: &mut Vec<Read>, incoming: &[Read], scratch: &mut Vec<Read>
 /// length, and the score rises with frequency, so this is an upper bound —
 /// and the kernel's own score, bit for bit, where the phrase occurs that
 /// often. A member not read for the document needs no frequency: the
-/// phrase cannot occur more often than a read member allows. `None` when
-/// no member was read at a frequency up to [`PHRASE_TF_EXACT_MAX`]: the
-/// caller then bounds the phrase by its members' keys.
+/// phrase cannot occur more often than a read member allows. Comes with
+/// whether it needs no slack: not below [`PHRASE_EXACT_MIN_NORM`]. `None`
+/// when no member was read at a frequency up to [`PHRASE_TF_EXACT_MAX`]:
+/// the caller then bounds the phrase by its members' keys.
 fn phrase_atom_bound(
     members: &[usize],
     mask: TermMask,
     tf_len: &[u32],
     idf: &[f32],
     norm: &[f32; 256],
-) -> Option<f32> {
+) -> Option<(f32, bool)> {
     let mut idf_sum = 0.0f32;
     let mut most: Option<(u32, u8)> = None;
     for &t in members {
@@ -1604,7 +1659,11 @@ fn phrase_atom_bound(
         }
     }
     let (tf, len) = most?;
-    Some(score_with_dl_norm_k1(idf_sum, tf, norm[usize::from(len)]))
+    let norm = norm[usize::from(len)];
+    Some((
+        score_with_dl_norm_k1(idf_sum, tf, norm),
+        norm >= PHRASE_EXACT_MIN_NORM,
+    ))
 }
 
 /// The sum of a document's bare-term contributions.
@@ -2172,7 +2231,9 @@ mod tests {
                 .min()
                 .expect("a member read");
             let idf_sum = members.iter().fold(0.0f32, |sum, &t| sum + idf[t]);
-            let bound = phrase_atom_bound(&members, mask, &packed, &idf, &norm).expect("one read");
+            let (bound, exact) =
+                phrase_atom_bound(&members, mask, &packed, &idf, &norm).expect("one read");
+            assert!(exact, "every norm here is at least the exact minimum");
             for phrase_tf in 0..=most {
                 let kernel = score_with_dl_norm_k1(idf_sum, phrase_tf, norm[usize::from(len)]);
                 assert!(bound >= kernel, "{members:?} tf {tf:?} at {phrase_tf}");
@@ -2189,7 +2250,6 @@ mod tests {
     /// above the bound.
     #[test]
     fn phrase_score_rises_with_frequency_up_to_its_exact_cap() {
-        const MIN_NORM: f32 = 0.3;
         const NORMS: u32 = 400;
         /// Step between the norms tried: irregular, so they do not fall on
         /// round values only.
@@ -2197,7 +2257,7 @@ mod tests {
         const IDFS: [f32; 5] = [0.01, 0.7, 3.3, 17.0, 45.0];
         for idf in IDFS {
             for n in 0..NORMS {
-                let norm = MIN_NORM + n as f32 * NORM_STEP;
+                let norm = PHRASE_EXACT_MIN_NORM + n as f32 * NORM_STEP;
                 for tf in 0..PHRASE_TF_EXACT_MAX {
                     let lower = score_with_dl_norm_k1(idf, tf, norm);
                     let higher = score_with_dl_norm_k1(idf, tf + 1, norm);
@@ -2205,6 +2265,67 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// On a table of fifty thousand superfiles a common term's first round
+    /// is a full block in every superfile: two such terms merge, a third
+    /// declines. A fixture that small cannot reach the cap, so the cap is
+    /// pinned here at the scale it is sized for.
+    #[test]
+    fn two_common_terms_merge_and_a_third_declines_at_fifty_thousand_superfiles() {
+        const SUPERFILES: u64 = 50_000;
+        let per_term = SUPERFILES * BLOCK_ENTRIES as u64;
+        assert!(first_round_fits(per_term));
+        assert!(first_round_fits(2 * per_term));
+        assert!(!first_round_fits(3 * per_term));
+    }
+
+    /// At `b = 1` a short document in a column of long ones takes a norm
+    /// near zero, where the score stops rising with frequency in f32: the
+    /// kernel's score at a lower frequency can round above the score at the
+    /// members' frequency (at `k1 = 1.2`, an average length of 50,000 and
+    /// idf 0.7, the score at 388 is above the score at 389). The bound
+    /// there takes the slack, and with it is never below the kernel.
+    #[test]
+    fn a_phrase_bound_below_the_exact_norm_takes_the_slack() {
+        const AVGDL: f32 = 50_000.0;
+        /// Each member's idf: the phrase weighs 0.7.
+        const IDF: f32 = 0.35;
+        const TERMS: usize = 2;
+        let params = Bm25Params { k1: 1.2, b: 1.0 };
+        let scoring = Scoring::new(vec![IDF; TERMS], params, AVGDL);
+        let ub_slack = 1.0 + (8 + TERMS) as f32 * f32::EPSILON;
+        let mut inexact = 0;
+        for len in 0..=u8::MAX {
+            let norm = scoring.norm[usize::from(len)];
+            for tf in 1..=PHRASE_TF_EXACT_MAX {
+                let packed = [pack_tf_len(tf, len); TERMS];
+                let (bound, exact) =
+                    phrase_atom_bound(&[0, 1], 0b11, &packed, &scoring.idf, &scoring.norm)
+                        .expect("both read");
+                assert_eq!(exact, norm >= PHRASE_EXACT_MIN_NORM, "len {len}");
+                let bound = match exact {
+                    true => bound,
+                    false => {
+                        inexact += 1;
+                        bound * ub_slack
+                    }
+                };
+                // The kernel at lower frequencies a matching document can
+                // hold the phrase at (one at least).
+                for at in [tf - 1, tf.saturating_sub(2), tf / 2]
+                    .into_iter()
+                    .filter(|&at| at > 0)
+                {
+                    let kernel = score_with_dl_norm_k1(2.0 * IDF, at, norm);
+                    assert!(bound >= kernel, "len {len} tf {tf} at {at}");
+                }
+            }
+        }
+        assert!(
+            inexact > 0,
+            "b = 1 must reach norms below the exact minimum"
+        );
     }
 
     /// A phrase over a document read under no member with a frequency
@@ -2220,11 +2341,11 @@ mod tests {
         assert!(phrase_atom_bound(&[0, 1], 0b00, &packed, &idf, &norm).is_none());
         assert_eq!(
             phrase_atom_bound(&[0, 1], 0b01, &packed, &idf, &norm),
-            Some(score_with_dl_norm_k1(2.0, 3, 1.0))
+            Some((score_with_dl_norm_k1(2.0, 3, 1.0), true))
         );
         assert_eq!(
             phrase_atom_bound(&[0, 0], 0b01, &packed, &idf, &norm),
-            Some(score_with_dl_norm_k1(2.0, 3, 1.0)),
+            Some((score_with_dl_norm_k1(2.0, 3, 1.0), true)),
             "\"a a\" occurs twice in \"a a a\": no division by repeats"
         );
         assert_eq!(unpack_tf_len(pack_tf_len(7, 200)), (7, 200));

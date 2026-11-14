@@ -685,7 +685,7 @@ mod tests {
     use arrow::util::display::array_value_to_string;
     use arrow_array::{
         Array, Date32Array, Int64Array, LargeStringArray, RecordBatch, StringArray,
-        TimestampNanosecondArray,
+        TimestampNanosecondArray, UInt64Array,
     };
     use arrow_schema::{DataType, Field, Schema, TimeUnit};
     use datafusion::{
@@ -1842,6 +1842,71 @@ mod tests {
                 walked(&conn, "zyzzyva", filter, "hour DESC", "LIMIT 3", "hour"),
                 hour_text(&[19, 19, 18]),
                 "{filter}"
+            );
+        }
+    }
+
+    /// Superfiles of the typed-column walk test, one hour each.
+    const TYPED_FILES: i64 = 12;
+    /// Nanoseconds in an hour.
+    const NANOS_PER_HOUR: i64 = 3_600_000_000_000;
+    /// Views each superfile of the typed-column walk test adds to the last.
+    const VIEWS_STEP: u64 = 10;
+
+    /// A walk over a zoned timestamp column, and over an unsigned one, ranks
+    /// superfiles by their ranges as it does an `Int64`: it opens the ones
+    /// holding the best keys and a window past them, and returns the rows
+    /// the full sort does.
+    #[test]
+    fn order_by_a_timestamp_or_unsigned_column_walks() {
+        const N: usize = 3;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new(
+                "at",
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                false,
+            ),
+            Field::new("views", DataType::UInt64, false),
+        ]));
+        let commits: Vec<RecordBatch> = (0..TYPED_FILES)
+            .map(|file| {
+                let at = file * NANOS_PER_HOUR;
+                let views = file as u64 * VIEWS_STEP;
+                RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![
+                        Arc::new(LargeStringArray::from(vec!["Zyzzyva", "Zyzzyva"])),
+                        Arc::new(
+                            TimestampNanosecondArray::from(vec![at, at + 1]).with_timezone("UTC"),
+                        ),
+                        Arc::new(UInt64Array::from(vec![views, views + 1])),
+                    ],
+                )
+                .expect("batch")
+            })
+            .collect();
+        let conn = metered_table(&schema, IndexSpec::new().fts("title"), &commits);
+        for (order, column) in [
+            ("at DESC", "at"),
+            ("at", "at"),
+            ("views DESC", "views"),
+            ("views", "views"),
+        ] {
+            assert_eq!(
+                walked(&conn, "zyzzyva", "", order, &format!("LIMIT {N}"), column).len(),
+                N,
+                "{order}"
+            );
+            let sql = format!(
+                "SELECT {column} FROM token_match('{METERED_TABLE}', 'title', 'zyzzyva') \
+                 ORDER BY {order} LIMIT {N}"
+            );
+            let (rows, opened) = metered_rows(&conn, &sql);
+            assert_eq!(rows, N, "{order}");
+            assert!(
+                opened <= (N + ORDERED_WINDOW) as u64,
+                "{order}: opened {opened} of {TYPED_FILES} superfiles for {N} rows"
             );
         }
     }
