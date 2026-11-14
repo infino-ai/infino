@@ -2058,24 +2058,14 @@ mod tests {
     /// Answered superfiles past which the window test's walk is capped.
     const PAST_WIDEST: usize = 100;
 
-    /// While the walk holds fewer rows than it needs, its window grows with
-    /// the superfiles that have answered, up to the fan-out's width: a
-    /// selective `WHERE` does not open every superfile two at a time.
+    /// The walk's window grows with the superfiles that have answered, up
+    /// to the fan-out's width: a walk that cannot stop early — a selective
+    /// `WHERE`, or ranges that overlap in every superfile — does not open
+    /// every superfile two at a time.
     #[test]
-    fn the_ordered_window_grows_while_rows_are_short() {
-        let conn = hourly_conn();
-        let reader = conn
-            .open_table(METERED_TABLE)
-            .expect("table")
-            .local_handle()
-            .reader()
-            .expect("reader");
-        let output_schema = output_schema_with_score(&reader.manifest().scalar_schema());
-        let order = MatchOrder::new(&reader, "hour", true, 3, &[], &output_schema)
-            .expect("order")
-            .expect("hour is orderable");
-        assert_eq!(order.window(0, WIDEST), ORDERED_WINDOW);
-        assert_eq!(order.window(WIDEST / 2, WIDEST), WIDEST / 2);
-        assert_eq!(order.window(PAST_WIDEST, WIDEST), WIDEST);
+    fn the_ordered_window_grows_with_the_superfiles_answered() {
+        assert_eq!(MatchOrder::window(0, WIDEST), ORDERED_WINDOW);
+        assert_eq!(MatchOrder::window(WIDEST / 2, WIDEST), WIDEST / 2);
+        assert_eq!(MatchOrder::window(PAST_WIDEST, WIDEST), WIDEST);
     }
 }

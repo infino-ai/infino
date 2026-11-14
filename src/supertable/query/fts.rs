@@ -2829,7 +2829,7 @@ impl SupertableReader {
         dispatch::fanout_with_ordered(
             self,
             units,
-            |answered| order.window(answered, widest),
+            |answered| MatchOrder::window(answered, widest),
             |(best, _): &(u64, P)| order.passed(*best),
             ordered,
             |_| {},

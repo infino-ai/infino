@@ -60,9 +60,9 @@ use crate::{
     },
 };
 
-/// Superfiles an ordered walk opens at once once it holds its rows: enough
-/// to overlap one open's round trip with the next, few enough that the
-/// walk stops within a superfile or two of the last one that placed a row.
+/// Superfiles an ordered walk opens at once to begin with: enough to
+/// overlap one open's round trip with the next, few enough that a walk
+/// whose first superfiles place every row stops within one or two of them.
 pub(crate) const ORDERED_WINDOW: usize = 2;
 
 /// An `ORDER BY column LIMIT n` a match walk honours: the column, its
@@ -201,17 +201,15 @@ impl MatchOrder {
         found.len() >= self.fetch && found.peek().is_some_and(|Reverse(worst)| best < *worst)
     }
 
-    /// Superfiles to keep open at once once `answered` have answered. While
-    /// the walk holds fewer than `fetch` rows, as many as have answered, up
-    /// to `widest`: under a `WHERE` few rows pass, a fixed window would open
-    /// every superfile [`ORDERED_WINDOW`] at a time. Once it holds them,
-    /// [`ORDERED_WINDOW`], so it stops soon after the last row placed.
-    pub(crate) fn window(&self, answered: usize, widest: usize) -> usize {
-        let short = self.found.lock().expect("match order mutex poisoned").len() < self.fetch;
-        match short {
-            true => answered.clamp(ORDERED_WINDOW, widest.max(ORDERED_WINDOW)),
-            false => ORDERED_WINDOW,
-        }
+    /// Superfiles to keep open at once once `answered` have answered: as
+    /// many as have answered, from [`ORDERED_WINDOW`] up to `widest`. A walk
+    /// that stops early stops while its window is small, opening at most
+    /// about twice the superfiles it needs; one that cannot stop — a `WHERE`
+    /// few rows pass, or a column whose ranges overlap in every superfile —
+    /// reaches the fan-out's width in a few steps instead of opening every
+    /// superfile a fixed few at a time.
+    pub(crate) fn window(answered: usize, widest: usize) -> usize {
+        answered.clamp(ORDERED_WINDOW, widest.max(ORDERED_WINDOW))
     }
 
     /// Of `hits`, the matches of one superfile read through `r`, those the
