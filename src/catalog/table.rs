@@ -74,6 +74,11 @@ pub(crate) trait Table: Send + Sync {
         k: usize,
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, InfinoError>;
+    fn head(
+        &self,
+        k: usize,
+        projection: Option<&[&str]>,
+    ) -> Result<Option<Vec<RecordBatch>>, InfinoError>;
     fn count(&self, column: &str, query: &str, mode: BoolMode) -> Result<u64, InfinoError>;
     fn count_where(&self, predicates: &[Expr]) -> Result<Vec<u64>, InfinoError>;
     fn value_counts(&self, column: &str) -> Result<RecordBatch, InfinoError>;
@@ -187,6 +192,13 @@ impl Table for SupertableHandle {
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, InfinoError> {
         SupertableHandle::sorted_search(self, column, descending, k, projection)
+    }
+    fn head(
+        &self,
+        k: usize,
+        projection: Option<&[&str]>,
+    ) -> Result<Option<Vec<RecordBatch>>, InfinoError> {
+        SupertableHandle::head(self, k, projection).map(Some)
     }
     fn count(&self, column: &str, query: &str, mode: BoolMode) -> Result<u64, InfinoError> {
         SupertableHandle::count(self, column, query, mode)
@@ -420,6 +432,35 @@ impl Supertable {
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, InfinoError> {
         self.inner.exact_match(column, value, projection)
+    }
+
+    /// The first `k` live rows of the table in storage order, read without
+    /// planning a statement: rows a `SELECT … LIMIT k` with no `WHERE` and
+    /// no `ORDER BY` could return, deleted rows left out, fewer when the
+    /// table holds fewer. Rows carry `score` fixed at `0.0`; `projection`
+    /// follows `bm25_search`'s rules. A hosted table answers `None`, for the
+    /// caller to run the statement.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use infino::arrow_array::{Int64Array, RecordBatch};
+    /// # use infino::arrow_schema::{DataType, Field, Schema};
+    /// # use infino::{connect, IndexSpec};
+    /// # let db = connect("memory://")?;
+    /// # let schema = Arc::new(Schema::new(vec![Field::new("size", DataType::Int64, false)]));
+    /// # let logs = db.create_table("logs", schema.clone(), IndexSpec::new())?;
+    /// # logs.append(&RecordBatch::try_new(
+    /// #     schema, vec![Arc::new(Int64Array::from(vec![30, 10, 20]))])?)?;
+    /// let page = logs.head(2, Some(&["size"]))?.expect("a local table answers");
+    /// assert_eq!(page[0].num_rows(), 2);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn head(
+        &self,
+        k: usize,
+        projection: Option<&[&str]>,
+    ) -> Result<Option<Vec<RecordBatch>>, InfinoError> {
+        self.inner.head(k, projection)
     }
 
     /// The first `k` rows by one range-indexed column, ascending or (with
