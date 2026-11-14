@@ -19,11 +19,22 @@
 
 use std::{sync::Arc, time::Instant};
 
-use arrow::record_batch::RecordBatch;
+use arrow::{
+    array::{Array, AsArray},
+    record_batch::RecordBatch,
+};
 use datafusion::{
-    common::DFSchema,
-    logical_expr::{Expr, simplify::SimplifyContext, utils::split_conjunction},
-    optimizer::simplify_expressions::ExprSimplifier,
+    common::{DFSchema, ScalarValue, tree_node::TreeNode},
+    execution::context::ExecutionProps,
+    logical_expr::{
+        Expr,
+        simplify::SimplifyContext,
+        utils::{conjunction, split_conjunction},
+    },
+    optimizer::{
+        analyzer::type_coercion::TypeCoercionRewriter, simplify_expressions::ExprSimplifier,
+    },
+    physical_expr::create_physical_expr,
 };
 use roaring::RoaringBitmap;
 use tracing::{Instrument, debug};
@@ -34,7 +45,7 @@ use crate::{
     supertable::{
         error::QueryError,
         handle::{Supertable, SupertableReader},
-        manifest::SuperfileEntry,
+        manifest::{SuperfileEntry, hll::HllSketch},
         query::{
             SuperfileHit,
             candidate::single_range,
@@ -55,6 +66,32 @@ const SQL_TABLE: &str = "supertable";
 
 /// One superfile's candidates: `(key, hit)` for its first rows by the key.
 type Candidates = Vec<(u64, SuperfileHit)>;
+
+/// The most rows a [`Supertable::sorted_search_where`] walk reads in the
+/// index's order to find the rows its other conditions keep. Past it the
+/// caller's statement answers instead: a condition that keeps so few rows
+/// reads them faster from a scan than one window at a time.
+const MAX_WALKED_ROWS: usize = 4096;
+
+/// How many times the rows a walk expects to need its windows read, so
+/// that a window usually holds the page at the first try.
+const WINDOW_MARGIN: f64 = 2.0;
+
+/// How much larger a window is than the last when the last kept no row.
+const WINDOW_GROWTH: usize = 4;
+
+/// What [`Supertable::sorted_search_where`] reads a filter as: the column
+/// the rows come in order of, the interval of its keys the filter keeps
+/// (the whole key space when no condition bounds it), and the conditions
+/// left over, which the rows read are checked against.
+struct SortedFilter {
+    column: String,
+    interval: (u64, u64),
+    /// Whether a condition bounds the column, so a row without a value is
+    /// out of the answer rather than an unread row that might be in it.
+    bounded: bool,
+    rest: Option<Expr>,
+}
 
 impl SupertableReader {
     /// The first `k` rows by `column` (descending with `descending`), ties
@@ -180,16 +217,17 @@ impl SupertableReader {
         self.manifest().superfiles.iter().map(|e| e.n_docs).sum()
     }
 
-    /// The column `filter` bounds (`column`, or with `None` the one column
-    /// it names) and the interval of that column's range index keys it
-    /// keeps, when `filter`, simplified, is one interval on a range-indexed
-    /// column: comparisons and `BETWEEN`s against literals, `AND`ed. `None`
-    /// otherwise.
-    fn sorted_interval(
+    /// How `filter` reads in the order of `column` (or, with `None`, of the
+    /// one column it names): its comparisons and `BETWEEN`s on that column
+    /// against literals, `AND`ed, are the interval of the column's range
+    /// index keys to read, and its other conditions are left to check row
+    /// by row. `None` when the column has no range index, or when no column
+    /// is named and the filter names more than one.
+    fn sorted_filter(
         &self,
         column: Option<&str>,
         filter: &Expr,
-    ) -> Result<Option<(String, (u64, u64))>, QueryError> {
+    ) -> Result<Option<SortedFilter>, QueryError> {
         let schema = DFSchema::try_from(self.sql_schemas().scan().as_ref().clone())
             .map_err(QueryError::DataFusion)?;
         let simplifier = ExprSimplifier::new(
@@ -211,9 +249,227 @@ impl SupertableReader {
                 }
             }
         };
-        let conjuncts: Vec<Expr> = split_conjunction(&filter).into_iter().cloned().collect();
         let range_cols = self.manifest().table_schema().range_column_types();
-        Ok(single_range(&conjuncts, &column, &range_cols).map(|(_, _, lo, hi)| (column, (lo, hi))))
+        if !range_cols.contains_key(&column) {
+            return Ok(None);
+        }
+        let (bounds, rest): (Vec<Expr>, Vec<Expr>) = split_conjunction(&filter)
+            .into_iter()
+            .cloned()
+            .filter(|c| !matches!(c, Expr::Literal(ScalarValue::Boolean(Some(true)), _)))
+            .partition(|c| single_range(std::slice::from_ref(c), &column, &range_cols).is_some());
+        let Some((_, _, lo, hi)) = single_range(&bounds, &column, &range_cols) else {
+            return Ok(None);
+        };
+        Ok(Some(SortedFilter {
+            column,
+            interval: (lo, hi),
+            bounded: !bounds.is_empty(),
+            rest: conjunction(rest),
+        }))
+    }
+
+    /// The share of the table's rows `condition` is expected to keep, from
+    /// the superfiles' column statistics: a column equal to a literal keeps
+    /// about one row in the column's distinct values (counted exactly where
+    /// a superfile keeps a value table, estimated from its distinct sketch
+    /// elsewhere), an `IN` list one per value, and an `AND` the product of
+    /// its sides. Any other condition, or a column a superfile keeps no
+    /// statistic of, counts as keeping every row: the walk then learns the
+    /// share from the rows it reads.
+    fn expected_share(&self, condition: &Expr) -> f64 {
+        split_conjunction(condition)
+            .into_iter()
+            .map(|c| self.conjunct_share(c))
+            .product::<f64>()
+            .clamp(0.0, 1.0)
+    }
+
+    /// [`Self::expected_share`] of one conjunct.
+    fn conjunct_share(&self, conjunct: &Expr) -> f64 {
+        let (column, values) = match conjunct {
+            Expr::BinaryExpr(be) if be.op == datafusion::logical_expr::Operator::Eq => {
+                match (be.left.as_ref(), be.right.as_ref()) {
+                    (Expr::Column(c), Expr::Literal(..)) | (Expr::Literal(..), Expr::Column(c)) => {
+                        (c.name.as_str(), 1.0)
+                    }
+                    _ => return 1.0,
+                }
+            }
+            Expr::InList(list) if !list.negated => match list.expr.as_ref() {
+                Expr::Column(c) if list.list.iter().all(|v| matches!(v, Expr::Literal(..))) => {
+                    (c.name.as_str(), list.list.len() as f64)
+                }
+                _ => return 1.0,
+            },
+            _ => return 1.0,
+        };
+        let manifest = self.manifest();
+        let Some(field) = manifest.table_schema().id_of(column) else {
+            return 1.0;
+        };
+        // Rows expected to hold each value, summed over the superfiles.
+        let mut expected = 0.0;
+        let mut rows = 0.0;
+        for entry in manifest.superfiles.iter() {
+            rows += entry.n_docs as f64;
+            let Some(stats) = entry.scalar_stats.column(field) else {
+                return 1.0;
+            };
+            if stats.all_null() {
+                continue;
+            }
+            let distinct = match stats.value_counts() {
+                Some(table) => table.entries().len() as f64,
+                None => match stats.sketch().and_then(HllSketch::from_bytes) {
+                    Some(sketch) => sketch.estimate(),
+                    None => return 1.0,
+                },
+            };
+            let present = entry.n_docs.saturating_sub(stats.null_count().unwrap_or(0)) as f64;
+            if distinct >= 1.0 {
+                expected += present * (values / distinct).min(1.0);
+            }
+        }
+        if rows == 0.0 { 1.0 } else { expected / rows }
+    }
+
+    /// Which of `hits` `condition` keeps, read from the hits' own rows: the
+    /// columns it names are resolved for them and it is evaluated over
+    /// those. `None` when it cannot be evaluated alone, outside a statement
+    /// (a subquery, a function only a statement registers), or names a
+    /// column the table does not store.
+    async fn kept_by(
+        &self,
+        hits: &[SuperfileHit],
+        condition: &Expr,
+    ) -> Result<Option<Vec<bool>>, QueryError> {
+        let stored = self.manifest().stored_schema();
+        let mut names: Vec<String> = condition
+            .column_refs()
+            .into_iter()
+            .map(|c| c.name.clone())
+            .collect();
+        names.sort();
+        names.dedup();
+        if names.is_empty() || names.iter().any(|n| stored.field_with_name(n).is_err()) {
+            return Ok(None);
+        }
+        let projection: Vec<&str> = names.iter().map(String::as_str).collect();
+        let rows = resolve_hits_named(self, hits, Some(&projection)).await?;
+        let Ok(schema) = DFSchema::try_from(rows.schema().as_ref().clone()) else {
+            return Ok(None);
+        };
+        let Ok(coerced) = condition
+            .clone()
+            .rewrite(&mut TypeCoercionRewriter::new(&schema))
+            .map(|t| t.data)
+        else {
+            return Ok(None);
+        };
+        let Ok(predicate) = create_physical_expr(&coerced, &schema, &ExecutionProps::new()) else {
+            return Ok(None);
+        };
+        let Some(kept) = predicate
+            .evaluate(&rows)
+            .and_then(|v| v.into_array(rows.num_rows()))
+            .ok()
+        else {
+            return Ok(None);
+        };
+        let Some(kept) = kept.as_boolean_opt() else {
+            return Ok(None);
+        };
+        // A condition a row's nulls leave unknown does not keep it, as in a
+        // statement's WHERE.
+        Ok(Some(
+            (0..kept.len())
+                .map(|i| kept.is_valid(i) && kept.value(i))
+                .collect(),
+        ))
+    }
+
+    /// The first `k` rows `filter` keeps in its column's order, as hits in
+    /// that order: the interval's rows read from the range indexes a window
+    /// at a time, each window checked against the conditions the interval
+    /// leaves, until `k` are kept or the interval ends. `None` when the
+    /// indexes cannot answer, when the conditions cannot be evaluated alone,
+    /// or when [`MAX_WALKED_ROWS`] rows do not find `k`; and, with no
+    /// condition bounding the column, when its rows with a value run out
+    /// first, since the rows without one sort after them unread.
+    async fn sorted_hits_where_async(
+        &self,
+        filter: &SortedFilter,
+        descending: bool,
+        k: usize,
+    ) -> Result<Option<Vec<SuperfileHit>>, QueryError> {
+        let Some(rest) = &filter.rest else {
+            if !filter.bounded {
+                return self.sorted_hits_async(&filter.column, descending, k).await;
+            }
+            return self
+                .sorted_hits_within_async(&filter.column, descending, k, Some(filter.interval))
+                .await;
+        };
+        if k == 0 {
+            return Ok(Some(Vec::new()));
+        }
+        // Rows to read for `k` to pass, at the share the statistics expect;
+        // a walk expected to run past its limit is left to the statement
+        // before it reads a row.
+        let needed = |share: f64| k as f64 / share;
+        let window_for = |share: f64| {
+            ((needed(share) * WINDOW_MARGIN).ceil() as usize).clamp(k, MAX_WALKED_ROWS)
+        };
+        let share = self.expected_share(rest);
+        if share <= 0.0 || needed(share) > MAX_WALKED_ROWS as f64 {
+            return Ok(None);
+        }
+        let mut window = window_for(share);
+        loop {
+            let window_now = window.min(MAX_WALKED_ROWS);
+            let Some(hits) = self
+                .sorted_hits_within_async(
+                    &filter.column,
+                    descending,
+                    window_now,
+                    Some(filter.interval),
+                )
+                .await?
+            else {
+                return Ok(None);
+            };
+            let ended = hits.len() < window_now;
+            let Some(kept) = self.kept_by(&hits, rest).await? else {
+                return Ok(None);
+            };
+            let passed = kept.iter().filter(|kept| **kept).count();
+            let page: Vec<SuperfileHit> = hits
+                .iter()
+                .zip(kept)
+                .filter_map(|(hit, kept)| kept.then_some(*hit))
+                .take(k)
+                .collect();
+            if page.len() == k || (ended && filter.bounded) {
+                return Ok(Some(page));
+            }
+            if ended || window_now == MAX_WALKED_ROWS {
+                return Ok(None);
+            }
+            // The next window from the share the rows read kept; past the
+            // limit, the statement answers sooner than the walk would.
+            let window_next = match passed {
+                0 => window_now.saturating_mul(WINDOW_GROWTH),
+                _ => {
+                    let seen = passed as f64 / window_now as f64;
+                    if needed(seen) > MAX_WALKED_ROWS as f64 {
+                        return Ok(None);
+                    }
+                    window_for(seen)
+                }
+            };
+            window = window_next.max(window_now.saturating_mul(2));
+        }
     }
 
     /// Sync [`Self::sorted_hits_async`] through the sync→async bridge.
@@ -236,12 +492,17 @@ impl Supertable {
     /// statement, as [`Supertable::sorted_search`] reads it. With `column`
     /// `None` the column is the one `filter` names.
     ///
-    /// `filter` must be one interval on a range-indexed column once
-    /// simplified (comparisons and `BETWEEN`s against literals of the
-    /// column's type, `AND`ed), and every superfile must hold the column's
-    /// range index with its ties in `_id` order. Otherwise `None`, and the
-    /// caller plans the statement. A row without a value is in no interval,
-    /// so fewer than `k` rows come back when fewer are in it.
+    /// The filter's comparisons and `BETWEEN`s on the column against
+    /// literals, `AND`ed, pick the interval of the index to read; a row
+    /// without a value is in no interval, so fewer than `k` rows come back
+    /// when fewer are in it. Its other conditions, `AND`ed to those, are
+    /// checked on the rows the index gives, a window at a time, until `k`
+    /// pass. Every superfile must hold the column's range index with its
+    /// ties in `_id` order. `None`, for the caller to plan the statement,
+    /// when the column has no range index, when no column is named and the
+    /// filter names several, when the other conditions need a statement
+    /// to evaluate (a subquery, say), or when they keep too few of the rows
+    /// read in order to find `k` within a few thousand.
     pub fn sorted_search_where(
         &self,
         column: Option<&str>,
@@ -256,15 +517,14 @@ impl Supertable {
         let context =
             |e: QueryError| InfinoError::from(e).with_context("sorted_search_where", None);
         reader.check_projection(projection).map_err(context)?;
-        let Some((column, interval)) = reader.sorted_interval(column, filter).map_err(context)?
-        else {
+        let Some(filter) = reader.sorted_filter(column, filter).map_err(context)? else {
             return Ok(None);
         };
         let k = k.min(usize::try_from(reader.rows_held()).unwrap_or(usize::MAX));
         let hits = {
             let _foreground = ForegroundQueryGuard::enter();
             reader
-                .block_on(reader.sorted_hits_within_async(&column, descending, k, Some(interval)))
+                .block_on(reader.sorted_hits_where_async(&filter, descending, k))
                 .map_err(context)?
         };
         let Some(hits) = hits else {
@@ -540,24 +800,112 @@ mod tests {
         }
     }
 
-    /// A filter that is not one interval on a range-indexed column is left
-    /// to the caller's statement: an `OR`, a column without a range index,
-    /// two columns with none named, or another column than the one named.
+    /// With conditions beside the interval, on other columns or on the
+    /// sorted one, every ask the walk answers is the same filtered sort in
+    /// SQL, row for row, before and after an optimize; the asks within a
+    /// few thousand rows of the order are answered. With no condition
+    /// bounding the column, a walk that runs past its rows with a value
+    /// leaves the nulls to the statement.
     #[test]
-    fn sorted_search_where_declines_what_is_not_one_interval() {
+    fn sorted_search_where_checks_the_other_conditions_on_the_rows_in_order() {
         let dir = TempDir::new().expect("tempdir");
         let st = table(&dir);
-        let declined: [(Option<&str>, Expr); 4] = [
+        // The first three keep a third or more of the rows in any stretch of
+        // the order, so a page of up to 125 is found within the walk.
+        let filters: [(Expr, &str); 6] = [
             (
-                Some("key"),
-                col("key").eq(lit(3_i64)).or(col("key").eq(lit(5_i64))),
+                col("key")
+                    .gt_eq(lit(10_i64))
+                    .and((col("seq") % lit(3_i64)).eq(lit(0_i64))),
+                "key >= 10 AND seq % 3 = 0",
             ),
+            ((col("seq") % lit(2_i64)).eq(lit(1_i64)), "seq % 2 = 1"),
+            (
+                col("key").lt(lit(25_i64)).and(
+                    col("seq")
+                        .gt(lit(4_000_i64))
+                        .or(col("seq").lt(lit(1_000_i64))),
+                ),
+                "key < 25 AND (seq > 4000 OR seq < 1000)",
+            ),
+            (
+                col("key").eq(lit(3_i64)).or(col("key").eq(lit(5_i64))),
+                "(key = 3 OR key = 5)",
+            ),
+            (
+                col("key").gt(lit(40_i64)).and(
+                    col("seq").in_list(vec![lit(301_i64), lit(302_i64), lit(4_444_i64)], false),
+                ),
+                "key > 40 AND seq IN (301, 302, 4444)",
+            ),
+            (col("seq").lt(lit(0_i64)), "seq < 0"),
+        ];
+        for pass in ["appended", "optimized"] {
+            if pass == "optimized" {
+                st.optimize(&OptimizeOptions::default()).expect("optimize");
+            }
+            let reader = st.reader().expect("reader");
+            for (at, (filter, sql)) in filters.iter().enumerate() {
+                for &(descending, k) in ASKS {
+                    let got = st
+                        .sorted_search_where(
+                            Some("key"),
+                            filter,
+                            descending,
+                            k,
+                            Some(&["_id", "seq", "key"]),
+                        )
+                        .expect("sorted_search_where");
+                    let what = format!("{pass}: {sql}, descending {descending}, k {k}");
+                    let Some(got) = got else {
+                        assert!(at > 2 || k > 125, "{what}: a dense condition is answered");
+                        continue;
+                    };
+                    let direction = if descending { "DESC" } else { "ASC" };
+                    let want = reader
+                        .query_sql(&format!(
+                            "SELECT _id, seq, key FROM supertable WHERE {sql} ORDER BY key {direction} NULLS LAST, _id ASC LIMIT {k}"
+                        ))
+                        .expect("sql");
+                    assert_eq!(ids(&got), ids(&want), "{what}");
+                    assert_eq!(ints(&got, "seq"), ints(&want, "seq"), "{what}");
+                    assert_eq!(ints(&got, "key"), ints(&want, "key"), "{what}");
+                }
+            }
+        }
+    }
+
+    /// A filter the index cannot be read for is left to the caller's
+    /// statement: a column without a range index, two columns with none
+    /// named, a condition that keeps no row of the order with no condition
+    /// bounding the column (the walk ends, and the rows without a value
+    /// are unread), a condition only a statement evaluates, and an equality
+    /// on a column whose statistics count thousands of distinct values,
+    /// which a walk would need more rows than it reads to fill.
+    #[test]
+    fn sorted_search_where_declines_what_the_index_cannot_answer() {
+        let dir = TempDir::new().expect("tempdir");
+        let st = table(&dir);
+        let declined: [(Option<&str>, Expr); 5] = [
+            (Some("key"), col("seq").eq(lit(5_000_i64))),
             (Some("seq"), col("seq").gt(lit(10_i64))),
             (
                 None,
                 col("key").gt(lit(10_i64)).and(col("seq").gt(lit(10_i64))),
             ),
-            (Some("key"), col("seq").gt(lit(10_i64))),
+            (Some("key"), col("seq").lt(lit(0_i64))),
+            (
+                Some("key"),
+                datafusion::logical_expr::in_subquery(
+                    col("seq"),
+                    Arc::new(
+                        datafusion::logical_expr::LogicalPlanBuilder::empty(true)
+                            .project(vec![lit(1_i64)])
+                            .and_then(|b| b.build())
+                            .expect("plan"),
+                    ),
+                ),
+            ),
         ];
         for (column, filter) in &declined {
             let got = st

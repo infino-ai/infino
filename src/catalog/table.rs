@@ -471,11 +471,15 @@ impl Supertable {
         self.inner.sorted_search(column, descending, k, projection)
     }
 
-    /// The first `k` rows `filter` keeps by a range-indexed column, read from
-    /// its range index without planning a statement, when `filter` is one
-    /// interval on that column (`column`, or with `None` the one column
-    /// `filter` names); `None` otherwise, for the caller to plan the
-    /// statement. Ties come in `_id` order. A hosted table always answers
+    /// The first `k` rows `filter` keeps by a range-indexed column (`column`,
+    /// or with `None` the one column `filter` names), read from its range
+    /// index without planning a statement: the filter's comparisons on the
+    /// column pick the stretch of the index to read, and its other
+    /// conditions are checked on the rows read, a window at a time. `None`,
+    /// for the caller to plan the statement, when the column has no range
+    /// index, when the other conditions need a statement to evaluate, or
+    /// when they keep too few of the rows read to fill the page within a
+    /// few thousand. Ties come in `_id` order. A hosted table always answers
     /// `None`. `projection` follows [`Supertable::sorted_search`]'s rules.
     pub fn sorted_search_where(
         &self,
