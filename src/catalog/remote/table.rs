@@ -391,6 +391,18 @@ impl Table for RemoteTable {
     /// The wire has no predicate-count call, so the counts travel as SQL
     /// aggregates ([`count_where_statements`]) and the hosted side answers
     /// them.
+    fn sorted_search_where(
+        &self,
+        _column: Option<&str>,
+        _filter: &Expr,
+        _descending: bool,
+        _k: usize,
+        _projection: Option<&[&str]>,
+    ) -> Result<Option<Vec<RecordBatch>>, InfinoError> {
+        // The transport has no sorted call over a range index; the caller
+        // plans the statement, which the endpoint runs as any other.
+        Ok(None)
+    }
     fn count_where(&self, predicates: &[Expr]) -> Result<Vec<u64>, InfinoError> {
         let mut counts = Vec::with_capacity(predicates.len());
         for (sql, n) in count_where_statements(&self.table_name, &self.schema, predicates)? {
