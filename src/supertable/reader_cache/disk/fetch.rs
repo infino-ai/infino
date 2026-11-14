@@ -655,18 +655,17 @@ impl DiskCacheStore {
         let fill = Arc::<BackgroundFill>::default();
         match self.fills.entry(*uri) {
             Entry::Occupied(current) if !current.get().may_retry(now_us) => return,
-            // No new query reads a dead file, so its whole copy would never be read. Checked under
-            // the slot's lock, which `mark_dead` takes to cancel after it marks the file.
-            _ if self.dead_files().contains(uri) => return,
             slot => drop(slot.insert(Arc::clone(&fill))),
         }
         // Built before the task is spawned, so the download is unregistered even if the task never
         // runs.
         let exit = FillExit::new(self, *uri, fill);
-        // The file may have been evicted since `entry` was looked up. Eviction cancels under the
-        // entry's lock (see [`Self::remove_entry_cancelling_fill`]): either it cancelled this
-        // download, or the entry is gone here.
-        if !self.cached.contains_key(uri) {
+        // Checked after the download is registered, so a download racing an eviction or a dead
+        // mark is either cancelled by it (see [`Self::remove_entry_cancelling_fill`]) or sees it
+        // here:
+        // - the file may have been evicted since `entry` was looked up;
+        // - no new query reads a dead file, so its whole copy would never be read.
+        if !self.cached.contains_key(uri) || self.dead_files().contains(uri) {
             return;
         }
         // A Stream-opened (SourceOwned) entry charges only its filled blocks, so `size_bytes` is
@@ -1978,6 +1977,7 @@ mod tests {
     };
 
     use bytes::Bytes;
+    use dashmap::try_result::TryResult;
     use futures::FutureExt;
     use tempfile::TempDir;
     use tokio::{
@@ -2950,6 +2950,40 @@ mod tests {
 
         store.maybe_spawn_background_fill(&uri, &uri.storage_path(), &entry, None);
         assert!(store.fills.is_empty(), "no download");
+    }
+
+    /// How long a test waits for a thread to reach the lock it should block on.
+    const LOCK_WAIT: Duration = Duration::from_secs(5);
+
+    /// A Warm read starting a download reads the dead-file set holding no lock on the download
+    /// map. [`DiskCacheStore::mark_dead`] cancels under an entry's lock, which then takes the
+    /// download map, so waiting on the set under the map's lock could close a deadlock.
+    #[tokio::test]
+    async fn a_download_start_reads_the_dead_set_holding_no_map_lock() {
+        let (_dir, store) = test_store();
+        let uri = SuperfileUri::new_v4();
+        store.install_block_entry_for_test(uri, dummy_block_source(&store, uri));
+        let entry = Arc::clone(&store.cached.get(&uri).expect("the lazy entry"));
+        store.mark_dead(&[uri]);
+
+        let dead = store.dead.lock().expect("dead-file set");
+        let start = {
+            let store = Arc::clone(&store);
+            thread::spawn(move || {
+                store.maybe_spawn_background_fill(&uri, &uri.storage_path(), &entry, None);
+            })
+        };
+        let deadline = Instant::now() + LOCK_WAIT;
+        while !matches!(store.fills.try_get(&uri), TryResult::Present(_)) {
+            assert!(Instant::now() < deadline, "the download map stayed locked");
+            thread::yield_now();
+        }
+        drop(dead);
+        start.join().expect("download start");
+        assert!(
+            store.fills.is_empty(),
+            "the dead file's download is unregistered"
+        );
     }
 
     /// Eviction for a download never takes the file the download is for: not its entry, not a copy

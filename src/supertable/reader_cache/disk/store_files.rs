@@ -568,23 +568,28 @@ impl DiskCacheStore {
             .copied()
             .filter(|uri| self.holds_file(uri))
             .collect();
-        if !held.is_empty() {
-            // Rebuilt rather than changed in place, so an eviction pass that took the old set
-            // keeps reading it. Files the cache no longer holds are forgotten, so the set stays as
-            // small as what is on disk.
-            let mut dead = self.dead.lock().expect("dead-file set poisoned");
-            let mut next: HashSet<SuperfileUri> = dead
+        // Rebuilt rather than changed in place, so an eviction pass that took the old set keeps
+        // reading it. Files the cache no longer holds are forgotten, so the set stays as small as
+        // what is on disk. Built outside the set's lock, since no map is read under it, and swapped
+        // in only if no other mark changed the set meanwhile.
+        while !held.is_empty() {
+            let current = self.dead_files();
+            let mut next: HashSet<SuperfileUri> = current
                 .iter()
                 .copied()
                 .filter(|uri| self.holds_file(uri))
                 .collect();
             let before = next.len();
-            next.extend(held);
-            // Only files not already dead: two handles over one table each mark what a commit
-            // dropped.
-            self.n_dead_marked
-                .fetch_add((next.len() - before) as u64, Ordering::Relaxed);
-            *dead = Arc::new(next);
+            next.extend(held.iter().copied());
+            let mut dead = self.dead.lock().expect("dead-file set poisoned");
+            if Arc::ptr_eq(&dead, &current) {
+                // Only files not already dead: two handles over one table each mark what a commit
+                // dropped.
+                self.n_dead_marked
+                    .fetch_add((next.len() - before) as u64, Ordering::Relaxed);
+                *dead = Arc::new(next);
+                break;
+            }
         }
         // After the set changes: a download registered before this cancel is cancelled, and one
         // registered after it finds the file dead (see [`Self::maybe_spawn_background_fill`]).

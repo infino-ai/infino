@@ -1004,9 +1004,10 @@ impl ManifestSnapshot {
     /// The superfiles `older` lists and this snapshot does not: compacted or deleted by the commits
     /// between them. Parts are immutable, so a part id both lists hold names the same superfiles,
     /// and only the parts that differ are compared: an append costs the parts it rewrote, not the
-    /// table. Empty when a changed part is not in memory, since a superfile missing from an
-    /// unloaded part may only be unloaded, and for a snapshot with no part list (a table with no
-    /// storage, which never loads a newer manifest).
+    /// table. A changed part is read from memory or, when a commit here kept only its newest parts
+    /// in memory, from the complete flat view. Empty when a changed part is in neither, since a
+    /// superfile missing from an unloaded part may only be unloaded, and for a snapshot with no
+    /// part list (a table with no storage, which never loads a newer manifest).
     pub(crate) fn superfiles_dropped_since(&self, older: &Self) -> Vec<SuperfileUri> {
         let (Some(gone), Some(added)) = (
             older.superfiles_outside(self),
@@ -1019,19 +1020,32 @@ impl ManifestSnapshot {
     }
 
     /// The superfiles of this snapshot's parts that `other`'s list does not hold, by part id.
-    /// `None` when either has no list, or when one of those parts is not loaded.
+    /// `None` when either has no list, or when one of those parts is neither loaded nor placed by a
+    /// complete flat view.
     fn superfiles_outside(&self, other: &Self) -> Option<Vec<SuperfileUri>> {
         let (list, other_list) = (self.list.as_ref()?, other.list.as_ref()?);
         let other_parts: FxHashSet<PartId> =
             other_list.parts.iter().map(|entry| entry.part_id).collect();
+        // Only a flat view as long as the parts it stands in for: one hydrated from a blob is
+        // taken complete without that check.
+        let total: u64 = list.parts.iter().map(|entry| entry.n_superfiles).sum();
+        let flat = self
+            .complete_flat_superfiles()
+            .filter(|flat| flat.len() as u64 == total);
         let mut uris = Vec::new();
-        for entry in list
-            .parts
-            .iter()
-            .filter(|entry| !other_parts.contains(&entry.part_id))
-        {
-            let part = self.get_cached_part_by_id(&entry.part_id)?;
-            uris.extend(part.superfiles.iter().map(|superfile| superfile.uri));
+        let mut end: usize = 0;
+        for entry in &list.parts {
+            let start = end;
+            end = end.checked_add(usize::try_from(entry.n_superfiles).ok()?)?;
+            if other_parts.contains(&entry.part_id) {
+                continue;
+            }
+            // The flat view keeps part order (see `parts_holding`), so a part's superfiles are its
+            // slice of it.
+            match self.get_cached_part_by_id(&entry.part_id) {
+                Some(part) => uris.extend(part.superfiles.iter().map(|s| s.uri)),
+                None => uris.extend(flat?.get(start..end)?.iter().map(|s| s.uri)),
+            }
         }
         Some(uris)
     }
@@ -3440,7 +3454,7 @@ fn section_entries(
 /// demand; the alternative — keeping every live part — grows with the table
 /// on an append-only ingest, because nothing is ever removed from the live
 /// set and each decoded part holds its entries' inline open blobs.
-const RESIDENT_PARTS_CARRIED_FORWARD: usize = 4;
+pub(in crate::supertable) const RESIDENT_PARTS_CARRIED_FORWARD: usize = 4;
 
 /// Manifest parts fetched + decoded concurrently during one snapshot load.
 ///
@@ -12949,6 +12963,28 @@ mod tests {
 
         let flat = ManifestSnapshot::new(1, opts(), vec![seg_entry(compacted, 4)], None, None);
         assert!(newer.superfiles_dropped_since(&flat).is_empty());
+    }
+
+    /// A changed part that is not in memory, as after a commit that kept only its newest parts, is
+    /// read from the complete flat view, which keeps part order.
+    #[test]
+    fn superfiles_dropped_since_reads_unloaded_parts_from_a_complete_flat_view() {
+        let [kept, carried, compacted, output] = [(); 4].map(|()| Uuid::new_v4());
+        let flat_only = |parts: &[(u128, &[Uuid], bool)]| {
+            let mut snapshot = snapshot_of_parts(parts);
+            snapshot.superfile_list.superfiles = parts
+                .iter()
+                .flat_map(|(_, uuids, _)| uuids.iter())
+                .map(|uuid| seg_entry(*uuid, 4))
+                .collect();
+            snapshot
+        };
+        let older = flat_only(&[(1, &[kept], false), (2, &[carried, compacted], false)]);
+        let newer = flat_only(&[(1, &[kept], false), (3, &[carried, output], false)]);
+        assert_eq!(
+            newer.superfiles_dropped_since(&older),
+            vec![SuperfileUri(compacted)]
+        );
     }
 
     /// `ManifestSnapshot::new` with no storage/list takes the in-process-only

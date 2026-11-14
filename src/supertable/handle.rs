@@ -2930,7 +2930,7 @@ mod tests {
         supertable::{
             gc::superseded::reclaim,
             manifest::{
-                ScalarStats, SuperfileEntry, SuperfileUri,
+                RESIDENT_PARTS_CARRIED_FORWARD, ScalarStats, SuperfileEntry, SuperfileUri,
                 commit::{POINTER_PATH, get_current_manifest_etag},
                 disk_cache::MetadataDiskCache,
                 list::PartitionStrategy,
@@ -9674,6 +9674,72 @@ mod tests {
             cache.stats().n_dead_marked,
             replaced.len() as u64 + n_live,
             "each cached superfile the second compaction replaced"
+        );
+    }
+
+    /// Superfiles per manifest part in the refresh tests that need many parts.
+    const SUPERFILES_PER_PART: u64 = 1;
+
+    /// A handle that has committed since it loaded the table keeps only its newest parts in
+    /// memory, the older ones in its flat view alone. A refresh that finds another handle
+    /// compacted those older superfiles still marks them dead.
+    #[test]
+    fn refresh_after_own_commits_marks_superfiles_in_unloaded_parts_dead() {
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        // A part per superfile, so the consumer's commits push the first ones out of memory.
+        let table_opts = || opts().with_target_superfiles_per_part(SUPERFILES_PER_PART);
+        let producer = Supertable::create(table_opts().with_storage(Arc::clone(&storage)))
+            .expect("create storage-backed table");
+        for title in ["alpha doc", "beta doc"] {
+            let mut w = producer.writer().expect("writer");
+            w.append(&title_batch(&[title])).expect("append");
+            w.commit().expect("commit");
+        }
+
+        let cache_dir = TempDir::new().expect("cache tempdir");
+        let cache = disk_cache_at(&storage, cache_dir.path());
+        let consumer = Supertable::open(
+            table_opts()
+                .with_storage(Arc::clone(&storage))
+                .with_disk_cache(Arc::clone(&cache)),
+        )
+        .expect("open the consumer");
+        consumer.open_all_superfiles();
+        let replaced: Vec<SuperfileUri> = consumer
+            .inner
+            .manifest
+            .load()
+            .get_all_superfiles()
+            .iter()
+            .map(|entry| entry.uri)
+            .collect();
+        assert!(replaced.iter().all(|uri| cache.is_cached(uri)));
+
+        for _ in 0..=RESIDENT_PARTS_CARRIED_FORWARD {
+            let mut w = consumer.writer().expect("writer");
+            w.append(&title_batch(&["gamma doc"])).expect("append");
+            w.commit().expect("commit");
+        }
+        assert!(
+            consumer
+                .inner
+                .manifest
+                .load()
+                .get_cached_part_by_list_idx(0)
+                .is_none(),
+            "the oldest part is no longer in memory"
+        );
+
+        producer
+            .optimize(&OptimizeOptions::compact(compaction_test_settings()))
+            .expect("compact every superfile into one");
+        assert!(bridge_sync_to_async(consumer.refresh()).expect("refresh"));
+        let dead = cache.dead_files();
+        assert!(
+            replaced.iter().all(|uri| dead.contains(uri)),
+            "each cached superfile the compaction replaced"
         );
     }
 

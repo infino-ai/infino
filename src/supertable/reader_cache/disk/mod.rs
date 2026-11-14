@@ -516,8 +516,8 @@ pub struct DiskCacheStore {
     block_files: DashMap<SuperfileUri, BlockFileRecord>,
     /// Files on disk here that the table's newest manifest no longer lists ([`Self::mark_dead`]).
     /// Kept by URI, so a file stays dead whatever form it takes next (entry, block file, copy).
-    /// Never locked while a guard of one of the maps above is held, so it takes no part in a lock
-    /// cycle with them.
+    /// A leaf lock: never taken while a guard of one of the maps above is held, and no map is read
+    /// while it is held, so it takes no part in a lock cycle with them.
     dead: Mutex<Arc<HashSet<SuperfileUri>>>,
     current_bytes: AtomicU64,
     /// Bytes of fetched runs handed to the block-file writers and not written yet. Past
