@@ -353,9 +353,13 @@ fn a_range_indexed_table_answers_as_a_scan_does_through_deletes_compaction_and_r
     assert_same_answers(&db, QUERIES, "after load");
 
     // A count over a range-indexed column reads no row to check the range,
-    // on an integer and on a float column alike.
+    // on an integer and on a float column alike. The integer is `seq`, whose
+    // file holds a distinct value per row: `qty`'s 500 values fit the exact
+    // value table, so the plain table counts a range of them from its
+    // statistics too, and only a column past that table shows the scan the
+    // index saves.
     for query in [
-        "EXPLAIN SELECT count(*) FROM {t} WHERE qty >= -10 AND qty < 10",
+        "EXPLAIN SELECT count(*) FROM {t} WHERE seq >= 100 AND seq < 2000",
         "EXPLAIN SELECT count(*) FROM {t} WHERE price > 990.5",
     ] {
         assert!(
