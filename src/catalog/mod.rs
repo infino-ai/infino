@@ -153,7 +153,11 @@ use crate::{
         gc::RECLAIM_CONCURRENCY,
         manifest::{ManifestSnapshot, disk_cache::MetadataDiskCache},
         options::SupertableOptions,
-        query::{exec::common::collect_plan_metered, sql::sql_session_context},
+        query::{
+            covered_agg::prepare_aggregate_inputs,
+            exec::common::{collect_plan_metered, run_within_process_limit},
+            sql::sql_session_context,
+        },
         reader_cache::{DiskCacheConfig, DiskCacheError, DiskCacheStore},
         schema::{ColumnIndex, TableSchema, change::SchemaPatch, error::SchemaError},
     },
@@ -1404,7 +1408,8 @@ impl Connection {
             || op_stats.clone(),
             || Some(Arc::clone(&self.inner.usage_meter)),
         );
-        let drive = async move {
+        let collector = op_stats.clone();
+        let statement = async move {
             // Plan on this runtime's 16 MiB workers, not the calling thread `block_on` polls on:
             // planner recursion depth must not hang on a stack the engine does not own. A panic
             // surfaces through the join as a query error.
@@ -1432,6 +1437,13 @@ impl Connection {
                     .verify_plan(&plan)
                     .map_err(|e| InfinoError::Query(format!("{READ_ONLY_REFUSAL} ({e})")))?;
 
+                // An aggregate's inputs are read before optimization (parts,
+                // deleted rows), so the rewrite can answer it from manifest
+                // statistics.
+                prepare_aggregate_inputs(&plan, &planner_ctx.state())
+                    .await
+                    .map_err(InfinoError::from)?;
+
                 let df = planner_ctx
                     .execute_logical_plan(plan)
                     .await
@@ -1450,9 +1462,10 @@ impl Connection {
             }
             .instrument(detail_span!("sql.plan"))
             .in_current_span();
-            // A `SpawnedTask` aborts the task when dropped, so a cancel stops
-            // the file opens planning is making instead of leaving them to
-            // run on, detached.
+            // A `SpawnedTask` aborts the task when dropped, so a cancel stops the file opens
+            // planning is making instead of leaving them to run on, detached. The task carries the
+            // query's collector, as the prune counts the superfiles it weighed into it.
+            let planning = op_stats::attached_to_future(op_stats.clone(), planning);
             let (task_ctx, plan) = SpawnedTask::spawn(planning).await.map_err(|join| {
                 // A panic while planning is the engine's fault, never the query's.
                 InfinoError::Backend(format!("planning task failed: {join}"))
@@ -1483,6 +1496,13 @@ impl Connection {
                 .into_iter()
                 .map(crate::supertable::schema::strip_field_ids)
                 .collect::<Vec<_>>())
+        };
+        // The process memory limit watches the whole statement: planning holds the metadata of
+        // every file a scan keeps, and execution streams batches the budget never sees.
+        let drive = async move {
+            run_within_process_limit(collector, statement)
+                .await
+                .map_err(|e| datafusion_error(&e))?
         };
         // The cancel races the whole query. Dropping `drive` stops planning
         // (its `SpawnedTask`) and execution (DataFusion aborts its partition
@@ -1983,7 +2003,7 @@ fn backend_to_provider(
         }
     };
     // Tests slow or count reads by wrapping what the connection builds.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-helpers"))]
     let provider = match &options.storage_wrapper {
         Some(wrap) => provider.map(|provider| (wrap.0)(provider)),
         None => provider,
@@ -2330,7 +2350,7 @@ mod tests {
         Bm25SearchOptions, BoolMode, CompactionSettings, Consistency, FieldPatch, Metric,
         OptimizeOptions, SchemaPatch, Stemmer, Stopwords,
         catalog::manifest::CATALOG_PATH,
-        runtime_metrics::io::UriClass,
+        runtime_metrics::{io::UriClass, op_stats::with_op_stats},
         supertable::{
             manifest::commit::POINTER_PATH,
             query::{provider::TABLE_NAME, sql::value_count_schema},
@@ -4981,6 +5001,67 @@ mod tests {
         assert_value_counts(&conn, "cabs", "title", Answered::FromStats);
     }
 
+    /// A table fed by many small commits keeps each commit's exact value tables, a column
+    /// whose values all differ within a commit included (one reading per sensor per commit,
+    /// a unique id): a superfile of a few columns is well within its budget for them. The
+    /// sensor's value counts come from the statistics, and a point lookup on an id reads one
+    /// superfile of the many, by the bounds each commit's ids keep.
+    #[test]
+    fn small_commits_keep_their_exact_tables_and_a_point_lookup_reads_one() {
+        const COMMITS: usize = 30;
+        const SENSORS: usize = 100;
+        let conn = connect("memory://").expect("connect");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::LargeUtf8, false),
+            Field::new("sensor", DataType::Int64, false),
+        ]));
+        let table = conn
+            .create_table("readings", Arc::clone(&schema), IndexSpec::new())
+            .expect("create");
+        for commit in 0..COMMITS {
+            let ids: Vec<String> = (0..SENSORS)
+                .map(|sensor| format!("{commit:04}-{sensor:03}"))
+                .collect();
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(LargeStringArray::from(ids)),
+                    Arc::new(Int64Array::from_iter_values(0..SENSORS as i64)),
+                ],
+            )
+            .expect("batch");
+            table.append(&batch).expect("append");
+        }
+        let reader = table.local_handle().reader().expect("reader");
+        let superfiles = reader.manifest().get_all_superfiles();
+        assert_eq!(superfiles.len(), COMMITS, "one superfile a commit");
+        let id = reader.manifest().field_id("id").expect("id column");
+        for entry in superfiles {
+            assert!(
+                entry
+                    .scalar_stats
+                    .get(id)
+                    .is_some_and(|stats| stats.value_counts.is_some()),
+                "a commit of {SENSORS} distinct ids keeps their table"
+            );
+        }
+        assert_value_counts(&conn, "readings", "sensor", Answered::FromStats);
+
+        let (found, stats) = with_op_stats(|| {
+            conn.query_sql("SELECT sensor FROM readings WHERE id = '0017-042'")
+                .expect("point lookup")
+        });
+        assert_eq!(found.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+        // One superfile's rows are read, of the table's `COMMITS` superfiles. The prune weighs all
+        // of them on the planning task, and still counts them into this query's stats.
+        assert_eq!(stats.superfiles_considered, COMMITS as u64, "{stats:?}");
+        assert_eq!(stats.planned_read_ranges, 1, "{stats:?}");
+        assert_eq!(
+            stats.rows_materialized, SENSORS as u64,
+            "the lookup reads the one superfile whose ids hold the value: {stats:?}"
+        );
+    }
+
     /// Rows without a value count under a null key, as `GROUP BY` puts them in a null group.
     #[test]
     fn value_counts_count_missing_values_under_a_null_key() {
@@ -5201,15 +5282,16 @@ mod tests {
         );
     }
 
-    /// After a delete the per-file counts still hold the deleted row, so the grouped count
-    /// answers; an unknown column is an error.
+    /// After a delete the per-file counts still hold the deleted row: the first count runs the
+    /// grouped count, which reads the deleted row's statistics, and from then on the statistics
+    /// answer, corrected for it. An unknown column is an error.
     #[test]
-    fn value_counts_run_the_grouped_count_over_deletes_and_refuse_unknown_columns() {
+    fn value_counts_correct_for_deletes_and_refuse_unknown_columns() {
         let (conn, _dir) = storage_conn();
         create_cab_types(&conn, "cabs");
         let table = conn.open_table("cabs").expect("open");
         table.delete(col("title").eq(lit("green"))).expect("delete");
-        assert_value_counts(&conn, "cabs", "title", Answered::ByGroupBy);
+        assert_value_counts(&conn, "cabs", "title", Answered::FromStats);
         assert!(table.value_counts("no_such_column").is_err());
     }
 
@@ -5383,8 +5465,9 @@ mod tests {
         assert_eq!(single::<Int64Array>(&ranged, 0).value(0), 4);
     }
 
-    /// A grouped count filtered to the grouping column's non-null values is answered from the
-    /// value counts even though the column holds nulls; unfiltered, the null group needs the scan.
+    /// A grouped count is answered from the value counts even though the column holds nulls:
+    /// filtered to the non-null values, from the counts alone; unfiltered, with the null group
+    /// counted from the null counts.
     #[test]
     fn query_sql_answers_not_null_grouped_counts_from_value_counts() {
         let conn = connect("memory://").expect("connect");
@@ -5405,10 +5488,19 @@ mod tests {
         assert!(!scans(&plan), "answered from value counts, no scan");
 
         let whole = "SELECT title, count(*) FROM fares GROUP BY title";
+        assert_eq!(
+            nullable_grouped_counts(&conn.query_sql(whole).expect("grouped")),
+            vec![
+                (None, 2),
+                (Some("fhv".to_string()), 1),
+                (Some("green".to_string()), 1),
+                (Some("yellow".to_string()), 2)
+            ]
+        );
         let plan = conn
             .query_sql(&format!("EXPLAIN {whole}"))
             .expect("explain");
-        assert!(scans(&plan), "the null group is not in the value counts");
+        assert!(!scans(&plan), "the null group comes from the null counts");
     }
 
     /// `(group, count)` rows of a grouped count whose group column may be null, sorted.
@@ -6377,6 +6469,135 @@ mod tests {
                 (count(0), count(1)),
                 (want_first, want_second),
                 "{what}: each call answers its own count"
+            );
+        }
+    }
+
+    /// A catalog search call with the wrong number of arguments is refused
+    /// in the form it was written, the leading table counted, with the
+    /// table's indexed columns of the kind the function takes named. Left to
+    /// the single-table function, a `hybrid_search` that left out its vector
+    /// column was told "expects 5 arguments (text_col, ...), got 4", which
+    /// reads as if the table were the mistake and names nothing to fix it
+    /// with.
+    #[test]
+    fn a_catalog_search_with_the_wrong_count_names_the_table_form_and_its_columns() {
+        let conn = conn_with_vector_table();
+        let v = one_hot_csv(0);
+        let cases = [
+            (
+                format!("SELECT * FROM hybrid_search('vecs', 'title', 'rust', '{v}', 3)"),
+                "hybrid_search expects 6 arguments (table, text_col, q_text, vec_col, q_vec, k), got 5",
+                "table \"vecs\" has full-text columns: title; vector columns: emb",
+            ),
+            (
+                "SELECT * FROM vector_search('vecs', 'emb', 3)".to_string(),
+                "vector_search expects 4 arguments (table, column, query_vector, k), got 3",
+                "table \"vecs\" has vector columns: emb",
+            ),
+            (
+                "SELECT * FROM bm25_search('vecs', 'title')".to_string(),
+                "bm25_search expects 4 or 5 arguments (table, column, query, k[, mode]), got 2",
+                "table \"vecs\" has full-text columns: title",
+            ),
+            (
+                "SELECT * FROM bm25_search_prefix('vecs', 'title', 'rus')".to_string(),
+                "bm25_search_prefix expects 4 arguments (table, column, prefix, k), got 3",
+                "table \"vecs\" has full-text columns: title",
+            ),
+            (
+                "SELECT * FROM token_match('vecs', 'title')".to_string(),
+                "token_match expects 3 or 4 arguments (table, column, query[, mode]), got 2",
+                "table \"vecs\" has full-text columns: title",
+            ),
+            (
+                "SELECT * FROM exact_match('vecs', 'title', 'rust', 'extra')".to_string(),
+                "exact_match expects 3 arguments (table, column, value), got 4",
+                "table \"vecs\" has full-text columns: title",
+            ),
+        ];
+        for (sql, want_count, want_columns) in cases {
+            let msg = conn
+                .query_sql(&sql)
+                .expect_err("a wrong argument count must be refused")
+                .to_string();
+            assert!(msg.contains(want_count), "{sql}: got {msg}");
+            assert!(
+                msg.ends_with(want_columns),
+                "{sql}: the refusal names only the indexed columns the function takes, got {msg}"
+            );
+        }
+    }
+
+    /// A table without the kind of index a function takes is told so: a
+    /// `vector_search` with the wrong count on a table holding only a
+    /// full-text index is refused with "vector columns: none", not with the
+    /// full-text column it could not have meant.
+    #[test]
+    fn a_wrong_count_on_a_table_without_the_index_names_none() {
+        let conn = connect("memory://").expect("connect");
+        conn.create_table("notes", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create notes")
+            .append(&build_title_batch(&["rust async"]))
+            .expect("append notes");
+        let cases = [
+            (
+                "SELECT * FROM vector_search('notes', 'title', 3)",
+                "table \"notes\" has vector columns: none",
+            ),
+            (
+                "SELECT * FROM bm25_search('notes', 'title')",
+                "table \"notes\" has full-text columns: title",
+            ),
+        ];
+        for (sql, want) in cases {
+            let msg = conn
+                .query_sql(sql)
+                .expect_err("a wrong argument count must be refused")
+                .to_string();
+            assert!(msg.ends_with(want), "{sql}: got {msg}");
+        }
+    }
+
+    /// The single-table form, the search functions a table reader's own SQL
+    /// registers, keeps its column-first refusal word for word: no table
+    /// counted and no column list.
+    #[test]
+    fn a_single_table_search_with_the_wrong_count_keeps_its_message() {
+        let conn = conn_with_vector_table();
+        let reader = conn
+            .open_table_handle("vecs")
+            .expect("handle")
+            .reader()
+            .expect("reader");
+        let v = one_hot_csv(0);
+        let cases = [
+            (
+                format!("SELECT * FROM hybrid_search('title', 'rust', '{v}', 3)"),
+                "hybrid_search expects 5 arguments (text_col, q_text, vec_col, q_vec, k), got 4",
+            ),
+            (
+                "SELECT * FROM vector_search('emb', 3)".to_string(),
+                "vector_search expects 3 arguments (column, query_vector, k), got 2",
+            ),
+            (
+                "SELECT * FROM bm25_search('title')".to_string(),
+                "bm25_search expects 3 or 4 arguments (column, query, k[, mode]), got 1",
+            ),
+            (
+                "SELECT * FROM exact_match('title')".to_string(),
+                "exact_match expects 2 arguments (column, value), got 1",
+            ),
+        ];
+        for (sql, want) in cases {
+            let msg = reader
+                .query_sql(&sql)
+                .expect_err("a wrong argument count must be refused")
+                .to_string();
+            assert!(msg.contains(want), "{sql}: got {msg}");
+            assert!(
+                !msg.contains("columns:"),
+                "{sql}: the single-table refusal names no columns, got {msg}"
             );
         }
     }

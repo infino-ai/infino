@@ -41,9 +41,13 @@ use crate::{
             distance::{
                 Metric, distance, encode_sq16_adaptive_row, encode_sq16_row,
                 mean_f32_cluster_major, normalize, sq16_adaptive_norm_sq, sq16_decoded_norm_sq,
+                transpose_centroids_cluster_major,
             },
             ivf_merge::MergedIvfSubsection,
-            kmeans::{assign_to_centroids, kmeans, kmeans_with_assignments},
+            kmeans::{
+                assign_to_centroids, assign_to_transposed_centroids, kmeans,
+                kmeans_with_assignments,
+            },
             quant::BitQuantizer,
             rerank_codec::{RerankCodec, SQ8_FIXED_OFFSET, SQ8_FIXED_SCALE},
             reservoir::{Reservoir, default_kmeans_sample_size, partition_kmeans_sample_size},
@@ -1646,7 +1650,7 @@ fn bucket_encoded_rows_chunk(
     rows: &[MaterializedIvfRow],
     base_local: u32,
     cfg: &VectorConfig,
-    centroids: &[f32],
+    transposed: &[f32],
     n_cent: usize,
     bucket_writers: &mut [BufWriter<File>],
     bucket_counts: &mut [u32],
@@ -1688,7 +1692,7 @@ fn bucket_encoded_rows_chunk(
             );
         });
     let mut assignments = vec![0u32; rows.len()];
-    assign_to_centroids(&decoded, centroids, dim, n_cent, &mut assignments);
+    assign_to_transposed_centroids(&decoded, transposed, dim, n_cent, &mut assignments);
     for (row_idx, (row, &cluster)) in rows.iter().zip(&assignments).enumerate() {
         let payload = if fixed_single_plane {
             BucketRecordPayload::FixedPlane(&row.encoded.codes)
@@ -1729,6 +1733,8 @@ fn stream_materialized_rows_to_buckets(
 ) -> Result<(), BuildError> {
     let chunk_rows = materialized_chunk_rows_for_dim(cfg.dim);
     let mut min_max = sq8_min_max;
+    // Once per cell, not per chunk: the table is n_cent × dim.
+    let transposed = transpose_centroids_cluster_major(centroids, n_cent, cfg.dim);
     let mut reader = spill.reader()?;
     let mut next_local = 0u32;
     while next_local < spill.n_rows() as u32 {
@@ -1740,7 +1746,7 @@ fn stream_materialized_rows_to_buckets(
             &rows,
             next_local,
             cfg,
-            centroids,
+            &transposed,
             n_cent,
             bucket_writers,
             bucket_counts,
@@ -1773,12 +1779,13 @@ fn stream_ram_rows_to_buckets(
 ) -> Result<(), BuildError> {
     let chunk_rows = materialized_chunk_rows_for_dim(cfg.dim);
     let mut min_max = sq8_min_max;
+    let transposed = transpose_centroids_cluster_major(centroids, n_cent, cfg.dim);
     for (chunk_idx, chunk) in rows.chunks(chunk_rows).enumerate() {
         bucket_encoded_rows_chunk(
             chunk,
             (chunk_idx * chunk_rows) as u32,
             cfg,
-            centroids,
+            &transposed,
             n_cent,
             bucket_writers,
             bucket_counts,
@@ -1870,6 +1877,7 @@ fn stream_fp32_rows_to_buckets(
     } else {
         Vec::new()
     };
+    let transposed = transpose_centroids_cluster_major(centroids, n_cent, dim);
     let mut row_base = 0usize;
     while row_base < n_docs {
         let take = (n_docs - row_base).min(chunk_rows);
@@ -1887,7 +1895,7 @@ fn stream_fp32_rows_to_buckets(
             raw
         };
         let mut assignments = vec![0u32; take];
-        assign_to_centroids(chunk, centroids, dim, n_cent, &mut assignments);
+        assign_to_transposed_centroids(chunk, &transposed, dim, n_cent, &mut assignments);
         chunk_rotated[..take * dim]
             .par_chunks_mut(dim)
             .zip(chunk.par_chunks(dim))
@@ -3388,6 +3396,7 @@ fn run_pass2(
     let mut chunk_assignments = vec![0u32; chunk_rows_cap];
     let mut chunk_codes = vec![0u8; chunk_rows_cap * code_bytes];
     let mut global_doc_id: u32 = 0;
+    let transposed = transpose_centroids_cluster_major(centroids, n_cent, dim);
 
     while let Some(chunk) = source.next_chunk() {
         let actual_rows = chunk.len() / dim;
@@ -3398,7 +3407,7 @@ fn run_pass2(
         // build_subsection. RaBitQ's random rotation is only
         // applied for encoding, not for clustering.
         let asgn = &mut chunk_assignments[..actual_rows];
-        assign_to_centroids(&chunk[..actual_rows * dim], centroids, dim, n_cent, asgn);
+        assign_to_transposed_centroids(&chunk[..actual_rows * dim], &transposed, dim, n_cent, asgn);
 
         // Rotate in parallel — each row's rotation is independent
         // and rayon's per-row chunk size is dim*4 bytes, well

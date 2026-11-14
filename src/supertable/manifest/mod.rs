@@ -100,8 +100,9 @@ use crate::{
         fts::reader::ColumnLengthStats,
         vector::{
             distance::{
-                COSINE_DISTANCE_BASE, L2_CROSS_TERM_COEFF, Metric, all_centroid_scores_transposed,
-                distance, dot, insert_ranked, nearest_k_centroids_transposed,
+                CENTROID_ASSIGN_ROWS_PER_TASK, COSINE_DISTANCE_BASE, L2_CROSS_TERM_COEFF, Metric,
+                all_centroid_scores_transposed, distance, dot, insert_ranked,
+                nearest_k_centroids_transposed, nearest_k_centroids_transposed_rows,
                 transpose_centroids_cluster_major,
             },
             layout::VectorLayout,
@@ -978,6 +979,26 @@ impl ManifestSnapshot {
                     .then_some(self.superfile_list.superfiles.as_slice())
             }
         }
+    }
+
+    /// Every superfile of the table from memory, with no I/O: the flat view
+    /// when it is complete, otherwise the list's parts in order when every
+    /// one of them is already loaded. `None` while any part is unloaded.
+    pub(crate) fn resident_superfiles(&self) -> Option<Cow<'_, [Arc<SuperfileEntry>]>> {
+        if let Some(all) = self.complete_flat_superfiles() {
+            return Some(Cow::Borrowed(all));
+        }
+        let list = self.list.as_ref()?;
+        let mut all = Vec::new();
+        for entry in &list.parts {
+            all.extend(
+                self.get_cached_part_by_id(&entry.part_id)?
+                    .superfiles
+                    .iter()
+                    .cloned(),
+            );
+        }
+        Some(Cow::Owned(all))
     }
 
     pub(crate) fn vector_index_storage_prefix(&self) -> Option<&str> {
@@ -5207,6 +5228,26 @@ pub(crate) fn add_sum_arrays(a: &ArrayRef, b: &ArrayRef) -> Option<ArrayRef> {
     }
 }
 
+/// `a` less `b`, two length-1 integer sums of the same type (see
+/// [`column_sum`]): the sum of the values `a` added up that `b` did not.
+/// `None` on a type mismatch, a float sum (whose difference is not the sum
+/// of the rest), or overflow.
+pub(crate) fn sub_sum_arrays(a: &ArrayRef, b: &ArrayRef) -> Option<ArrayRef> {
+    match (a.data_type(), b.data_type()) {
+        (DataType::Int64, DataType::Int64) => {
+            let x = a.as_any().downcast_ref::<Int64Array>()?.value(0);
+            let y = b.as_any().downcast_ref::<Int64Array>()?.value(0);
+            Some(Arc::new(Int64Array::from(vec![x.checked_sub(y)?])) as ArrayRef)
+        }
+        (DataType::UInt64, DataType::UInt64) => {
+            let x = a.as_any().downcast_ref::<UInt64Array>()?.value(0);
+            let y = b.as_any().downcast_ref::<UInt64Array>()?.value(0);
+            Some(Arc::new(UInt64Array::from(vec![x.checked_sub(y)?])) as ArrayRef)
+        }
+        _ => None,
+    }
+}
+
 /// HyperLogLog distinct sketch over a column's non-null values.
 /// `None` for types the sketch doesn't cover. Values hash by their
 /// canonical byte representation (little-endian for numerics, raw
@@ -6073,8 +6114,9 @@ impl ClusterCentroids {
         .unwrap_or(0)
     }
 
-    /// Assign each row in `vectors` to its nearest cell. Parallel over rows;
-    /// each assignment uses [`Self::nearest_cell`].
+    /// Assign each row in `vectors` to its nearest cell. Parallel over row
+    /// chunks, each scored as a tile of rows; every assignment matches
+    /// [`Self::nearest_cell`] on that row.
     pub fn assign_rows(&self, metric: Metric, vectors: &[f32], assignments: &mut [u32]) {
         let dim = self.dim as usize;
         assert_eq!(vectors.len() % dim, 0, "assign_rows: vectors len mismatch");
@@ -6088,10 +6130,23 @@ impl ClusterCentroids {
             return;
         }
         assignments
-            .par_iter_mut()
+            .par_chunks_mut(CENTROID_ASSIGN_ROWS_PER_TASK)
             .enumerate()
-            .for_each(|(d, slot)| {
-                *slot = self.nearest_cell(metric, &vectors[d * dim..(d + 1) * dim]);
+            .for_each(|(task, slots)| {
+                let start = task * CENTROID_ASSIGN_ROWS_PER_TASK;
+                let rows = &vectors[start * dim..(start + slots.len()) * dim];
+                let tops = nearest_k_centroids_transposed_rows(
+                    metric,
+                    rows,
+                    self.transposed(),
+                    self.n_cent as usize,
+                    dim,
+                    Some(&self.counts),
+                    1,
+                );
+                for (slot, top) in slots.iter_mut().zip(tops) {
+                    *slot = top.first().map(|&(cell, _)| cell).unwrap_or(0);
+                }
             });
     }
 }

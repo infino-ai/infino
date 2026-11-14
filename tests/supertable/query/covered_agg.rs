@@ -202,7 +202,7 @@ fn aligned_range_aggregates_use_covered_residual_and_stay_exact() {
 
     // Range covering commits 1..=2 entirely, with slack inside the
     // empty thousand-block gaps — commits 1 and 2 are fully covered,
-    // commits 0 and 3 disjoint, so the residual is EMPTY.
+    // commits 0 and 3 disjoint, so nothing is left to scan.
     let where_range = "rating BETWEEN 1000 AND 2999";
 
     let count_sql = format!("SELECT COUNT(*) FROM supertable WHERE {where_range}");
@@ -222,18 +222,13 @@ fn aligned_range_aggregates_use_covered_residual_and_stay_exact() {
         "avg {got_avg} vs {expected_avg}"
     );
 
-    // Exact low-cardinality counts fold all the way to a literal. The other
-    // aggregate kinds use the covered/residual plan.
-    let count_plan = explain(&st, &count_sql);
-    assert!(
-        !count_plan.contains("DataSourceExec") && !count_plan.contains("Parquet"),
-        "count should fold without a scan; plan was:\n{count_plan}"
-    );
-    for sql in [&sum_sql, &min_sql, &max_sql, &avg_sql] {
+    // Every segment the range keeps is covered, so every aggregate folds
+    // all the way to a literal, with no residual scan.
+    for sql in [&count_sql, &sum_sql, &min_sql, &max_sql, &avg_sql] {
         let plan = explain(&st, sql);
         assert!(
-            plan.contains("__resid_0"),
-            "{sql}: expected the covered/residual rewrite; plan was:\n{plan}"
+            !plan.contains("DataSourceExec") && !plan.contains("TableScan"),
+            "{sql}: should fold without a scan; plan was:\n{plan}"
         );
     }
 }
@@ -528,11 +523,11 @@ fn tombstoned_covered_segment_demotes_to_residual() {
     );
 }
 
-/// An unfiltered aggregate over a table with deletes answers the clean
-/// segments from statistics and scans only the segment with the delete,
-/// instead of scanning every segment.
+/// An unfiltered aggregate over a table with deletes answers every segment
+/// from statistics, the one with the delete corrected for its deleted row,
+/// with no scan.
 #[test]
-fn unfiltered_aggregates_scan_only_segments_with_deletes() {
+fn unfiltered_aggregates_correct_segments_with_deletes() {
     let (st, _dir, _cache_dir) = build_tombstoned_table();
     let count_sql = "SELECT COUNT(*) FROM supertable";
     let sum_sql = "SELECT SUM(rating) FROM supertable";
@@ -548,8 +543,8 @@ fn unfiltered_aggregates_scan_only_segments_with_deletes() {
     for sql in [count_sql, sum_sql] {
         let plan = explain(&st, sql);
         assert!(
-            plan.contains("__resid_"),
-            "{sql}: clean segments must come from statistics:\n{plan}"
+            !plan.contains("TableScan"),
+            "{sql}: every segment must come from statistics:\n{plan}"
         );
     }
 }

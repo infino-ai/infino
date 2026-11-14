@@ -2390,26 +2390,22 @@ async fn build_gapped_placement_index(
         .try_reserve(scratch_bytes)
         .ok();
     let pool = Arc::clone(&manifest.options.reader_pool);
-    let index = run_on_pool(
-        Some(&pool),
-        "gapped id-map: reader pool dropped result",
-        move || {
-            let mut pairs: Vec<(i128, u32)> = ids.into_iter().zip(locals.iter().copied()).collect();
-            // Sort by id, ties by local, so dedup keeps the SMALLEST local for a
-            // repeated id — first-wins in Parquet row order, matching the old scan.
-            pairs.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-            pairs.dedup_by_key(|p| p.0);
-            let mut sorted_ids = Vec::with_capacity(pairs.len());
-            let mut sorted_locals = Vec::with_capacity(pairs.len());
-            for (id, local) in pairs {
-                sorted_ids.push(id);
-                sorted_locals.push(local);
-            }
-            // Scratch is dead here; release before the index outlives it.
-            drop(scratch);
-            GappedPlacementIndex::new(sorted_ids, sorted_locals)
-        },
-    )
+    let index = run_on_pool(Some(&pool), "gapped id-map", move || {
+        let mut pairs: Vec<(i128, u32)> = ids.into_iter().zip(locals.iter().copied()).collect();
+        // Sort by id, ties by local, so dedup keeps the SMALLEST local for a
+        // repeated id — first-wins in Parquet row order, matching the old scan.
+        pairs.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        pairs.dedup_by_key(|p| p.0);
+        let mut sorted_ids = Vec::with_capacity(pairs.len());
+        let mut sorted_locals = Vec::with_capacity(pairs.len());
+        for (id, local) in pairs {
+            sorted_ids.push(id);
+            sorted_locals.push(local);
+        }
+        // Scratch is dead here; release before the index outlives it.
+        drop(scratch);
+        GappedPlacementIndex::new(sorted_ids, sorted_locals)
+    })
     .await
     .map_err(|e| QueryError::Internal(e.to_string()))?;
     Ok(Arc::new(index))
@@ -2528,7 +2524,7 @@ async fn read_ids_for_locals(
             let locals = Arc::clone(local_ids);
             run_on_pool(
                 Some(&manifest.options.reader_pool),
-                "inline stable-id decode: reader pool dropped result",
+                "inline stable-id decode",
                 move || {
                     reader
                         .vec()
@@ -2574,7 +2570,7 @@ async fn read_ids_for_locals(
             let id_column = id_column.to_string();
             run_on_pool(
                 Some(&manifest.options.reader_pool),
-                "scalar id decode: reader pool dropped result",
+                "scalar id decode",
                 move || {
                     op_stats::timed_section(|| {
                         reader
@@ -2646,7 +2642,7 @@ async fn ids_from_sidecar(
     let id_range = (entry.id_min, entry.id_max);
     let (decoded, decode_ns) = run_on_pool(
         Some(&manifest.options.reader_pool),
-        "id sidecar decode: reader pool dropped result",
+        "id sidecar decode",
         move || {
             op_stats::timed_section(|| {
                 let every = sidecar.verified_ids(&metadata, &id_column, id_range)?;
@@ -3751,7 +3747,7 @@ pub(crate) async fn assemble_flat_sections(
     // on the reader pool, not inline on a tokio worker.
     let (index, recall) = run_on_pool(
         Some(&manifest.options.reader_pool),
-        "flat build + gate: reader pool dropped result",
+        "flat build + gate",
         move || {
             let index = Sq4FlatIndex::from_sq16_plane(
                 &sq16_codes,
@@ -3908,7 +3904,7 @@ pub(crate) async fn assemble_hnsw_sections(
         let (pm0, pef) = (m0_cands.clone(), ef_cands.clone());
         let pchoice = run_on_pool(
             Some(&manifest.options.reader_pool),
-            "hnsw probe calibrate: reader pool dropped result",
+            "hnsw probe calibrate",
             move || {
                 // A Sq16 subsample: walk and reference are the same plane
                 // here, since this probe only sizes `m0` against scale.
@@ -4041,7 +4037,7 @@ pub(crate) async fn assemble_hnsw_sections(
     let n_rows = doc_ids.len();
     let (scorer, sq4, choice, ef_curve, graph) = run_on_pool(
         Some(&manifest.options.reader_pool),
-        "hnsw calibrate: reader pool dropped result",
+        "hnsw calibrate",
         move || {
             // The 4-bit plane is a re-quantization of the very rows being
             // calibrated: a rotation and a moment pass per row, so it belongs
@@ -4414,7 +4410,7 @@ pub(crate) async fn assemble_hnsw_incremental(
     // tokio worker or the global rayon pool — matching the full-build path.
     let (scorer, sq4, graph, recall) = run_on_pool(
         Some(&manifest.options.reader_pool),
-        "hnsw incremental extend + recheck: reader pool dropped result",
+        "hnsw incremental extend + recheck",
         move || {
             let params = HnswParams {
                 ef_construction,
@@ -4615,7 +4611,7 @@ impl SupertableReader {
         // that worker's I/O for the scan's full duration.
         let hits: Vec<SuperfileHit> = run_on_pool(
             Some(&manifest.options.reader_pool),
-            "flat serving scan: reader pool dropped result",
+            "flat serving scan",
             move || {
                 let index = sections_for_scan
                     .data
@@ -4744,7 +4740,7 @@ impl SupertableReader {
         let refine_k = config::global().vector.hnsw_refine_k;
         let hits: Vec<SuperfileHit> = run_on_pool(
             Some(&manifest.options.reader_pool),
-            "hnsw serving walk: reader pool dropped result",
+            "hnsw serving walk",
             move || {
                 let data = sections_for_walk
                     .data
@@ -8110,7 +8106,7 @@ impl SupertableReader {
                     stable_ids_by_local_for_routing(&manifest, &entry, &reader, &op_stats).await?;
                 run_on_pool(
                     Some(&manifest.options.reader_pool),
-                    "allowed-row probe: reader pool dropped result",
+                    "allowed-row probe",
                     move || {
                         // Locals ascend, so the bitmap is appended to, never searched.
                         let kept = (0u32..)
@@ -8225,11 +8221,13 @@ impl SupertableReader {
     /// row must never be a kNN candidate).
     ///
     /// The caller passes a plan that is bounded as lowered, and for a plan
-    /// without a `LIKE` leaf `evaluate` therefore returns `Some(bitmap)`
-    /// for every superfile — a `None` there is a planner bug and is
-    /// reported as one. A `LIKE` leaf is bound per superfile: a token that
-    /// widens past the dictionary cap in *this* superfile makes `evaluate`
-    /// return `None` there, meaning the index constrains nothing for that
+    /// without a `LIKE` or range leaf `evaluate` therefore returns
+    /// `Some(bitmap)` for every superfile — a `None` there is a planner bug
+    /// and is reported as one. A `LIKE` leaf is bound per superfile: a token
+    /// that widens past the dictionary cap in *this* superfile makes
+    /// `evaluate` return `None` there. So does a range leaf on a superfile
+    /// with no range index for the column, or one keyed by the column's
+    /// earlier type. Either way the index constrains nothing for that
     /// superfile, so every one of its rows stays a kNN candidate — the
     /// `FilterExec` above the TVF re-applies the exact predicate. Treating
     /// it as the empty set would drop matching rows.
@@ -8239,7 +8237,7 @@ impl SupertableReader {
         plan: &CandidatePlan,
     ) -> Result<HashMap<SuperfileUri, Arc<RoaringBitmap>>, QueryError> {
         let plan_arc = Arc::new(plan.clone());
-        let unbounded_is_legitimate = plan.has_like();
+        let unbounded_is_legitimate = plan.may_evaluate_unbounded();
         let op_stats = self.op_stats.clone();
         // A `LIKE` leaf's dictionary walk is CPU work: it runs on the reader
         // pool, not on the tokio worker driving this fan-out.
@@ -15174,9 +15172,13 @@ mod tests {
         let manifest = reader.manifest();
         let fts_cols: HashSet<&str> = HashSet::from(["title"]);
         let filters = [col("title").eq(lit("doc"))];
-        let plan = CandidatePlan::from_filters(&filters, &fts_cols, &RangeColumns::new(), &|col| {
-            manifest.try_fts_tokenizer_for(col)
-        });
+        let plan = CandidatePlan::from_filters(
+            &filters,
+            &fts_cols,
+            &RangeColumns::new(),
+            &|col| manifest.try_fts_tokenizer_for(col),
+            &|col| manifest.field_id(col),
+        );
 
         let mut q = vec![0.0f32; dim];
         q[0] = 1.0;

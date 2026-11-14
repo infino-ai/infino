@@ -1045,11 +1045,12 @@ mod tests {
             metadata: b"epoch".to_vec(),
             entries: vec![Arc::clone(&pinned)],
         };
-        let checkpoint = slow_vector_state::write_state_with_pending_drain(
+        let checkpoint = slow_vector_state::write_state_for_stamp(
             storage.as_ref(),
             None,
             &[],
-            &pending,
+            Some(&pending),
+            None,
             None,
         )
         .await

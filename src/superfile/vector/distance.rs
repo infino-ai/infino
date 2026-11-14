@@ -14,6 +14,7 @@
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
+use std::array;
 #[cfg(test)]
 use std::sync::Arc;
 
@@ -47,6 +48,15 @@ const AVX512_F32_LANES: usize = 16;
 /// AVX-512 f32 lane count; the portable fallback consumes each 16-lane block as
 /// two 8-lane halves.
 pub(crate) const CENTROID_BATCH_LANES: usize = AVX512_F32_LANES;
+
+/// Rows the multi-row centroid scorers score together. Each centroid load is
+/// reused across this many rows, and each row keeps its own accumulator, so
+/// the AVX-512 tile holds 8 accumulators — well inside the 32-register file.
+const CENTROID_ROW_TILE: usize = 8;
+
+/// Rows per rayon task for the multi-row nearest-centroid assigners: a
+/// multiple of [`CENTROID_ROW_TILE`], large enough to amortize task overhead.
+pub(crate) const CENTROID_ASSIGN_ROWS_PER_TASK: usize = 64;
 
 /// Byte width of one little-endian `f32`. A byte-backed vector of
 /// dimension `d` occupies `d * F32_BYTES` bytes.
@@ -245,11 +255,83 @@ fn for_each_centroid_block_scores(
     }
 }
 
+/// Multi-row sibling of [`for_each_centroid_block_scores`]: score every row
+/// of the row-major `rows` (`rows.len() / dim` rows) against every block,
+/// feeding `reduce(row, base, scores)`. Rows go through the kernels in tiles
+/// of [`CENTROID_ROW_TILE`] so each centroid load serves the whole tile; the
+/// leftover rows take the single-row driver. Each row still sees its blocks
+/// in ascending order, and every score is bit-identical to the single-row
+/// driver's: a row's accumulator sums the same terms in the same order.
+fn for_each_row_centroid_block_scores(
+    metric: Metric,
+    rows: &[f32],
+    transposed: &[f32],
+    n_cent: usize,
+    dim: usize,
+    mut reduce: impl FnMut(usize, usize, &[f32]),
+) {
+    debug_assert_eq!(rows.len() % dim, 0);
+    debug_assert_eq!(
+        transposed.len(),
+        n_cent.div_ceil(CENTROID_BATCH_LANES) * dim * CENTROID_BATCH_LANES
+    );
+    let n_rows = rows.len() / dim;
+    let n_blocks = n_cent.div_ceil(CENTROID_BATCH_LANES);
+    let tiled_rows = n_rows - n_rows % CENTROID_ROW_TILE;
+    for tile_start in (0..tiled_rows).step_by(CENTROID_ROW_TILE) {
+        let tile: [&[f32]; CENTROID_ROW_TILE] = array::from_fn(|i| {
+            let row = tile_start + i;
+            &rows[row * dim..(row + 1) * dim]
+        });
+
+        #[cfg(target_arch = "x86_64")]
+        if avx512_enabled() {
+            for block in 0..n_blocks {
+                // SAFETY: gated by runtime CPUID detection in `avx512_enabled()`.
+                let scores = unsafe {
+                    score_centroid_block16_rows_transposed_avx512(
+                        metric, &tile, transposed, dim, block,
+                    )
+                };
+                for (i, row_scores) in scores.iter().enumerate() {
+                    reduce(tile_start + i, block * CENTROID_BATCH_LANES, row_scores);
+                }
+            }
+            continue;
+        }
+
+        for block in 0..n_blocks {
+            let base_centroid = block * CENTROID_BATCH_LANES;
+            for half in 0..CENTROID_BATCH_LANES / F32X8_LANES {
+                let lane_offset = half * F32X8_LANES;
+                let scores = score_centroid_block8_rows_transposed_wide(
+                    metric,
+                    &tile,
+                    transposed,
+                    dim,
+                    block,
+                    lane_offset,
+                );
+                for (i, row_scores) in scores.iter().enumerate() {
+                    reduce(tile_start + i, base_centroid + lane_offset, row_scores);
+                }
+            }
+        }
+    }
+    for row in tiled_rows..n_rows {
+        let query = &rows[row * dim..(row + 1) * dim];
+        for_each_centroid_block_scores(metric, query, transposed, n_cent, dim, |base, scores| {
+            reduce(row, base, scores)
+        });
+    }
+}
+
 /// Return the single closest centroid in a block-transposed fp32 centroid
-/// cache: the k-means assign step's hot call. Same blocked scoring kernels
-/// as [`nearest_k_centroids_transposed`], reduced with a scalar best tracker
-/// (no per-call allocation) and the same tie-breaking as the naive scalar
-/// loop — lowest centroid index wins on equal scores.
+/// cache. Same blocked scoring kernels as [`nearest_k_centroids_transposed`],
+/// reduced with a scalar best tracker and the same tie-breaking as the naive
+/// scalar loop — lowest centroid index wins on equal scores. The single-row
+/// reference the tests pin [`nearest_centroid_transposed_rows`] against.
+#[cfg(test)]
 pub(crate) fn nearest_centroid_transposed(
     metric: Metric,
     query: &[f32],
@@ -268,6 +350,41 @@ pub(crate) fn nearest_centroid_transposed(
         }
     });
     best
+}
+
+/// Write each row's closest centroid in a block-transposed fp32 centroid
+/// cache into `out` (one slot per row of the row-major `rows`): the k-means
+/// assign step's hot call. Scores rows in tiles through
+/// [`for_each_row_centroid_block_scores`]; lowest centroid index wins on
+/// equal scores, matching the naive scalar loop.
+pub(crate) fn nearest_centroid_transposed_rows(
+    metric: Metric,
+    rows: &[f32],
+    transposed: &[f32],
+    n_cent: usize,
+    dim: usize,
+    out: &mut [u32],
+) {
+    debug_assert!(n_cent > 0);
+    debug_assert_eq!(out.len(), rows.len() / dim);
+    out.fill(0);
+    let mut best_scores = vec![f32::INFINITY; out.len()];
+    for_each_row_centroid_block_scores(
+        metric,
+        rows,
+        transposed,
+        n_cent,
+        dim,
+        |row, base, scores| {
+            for (lane, &score) in scores.iter().enumerate() {
+                let centroid = base + lane;
+                if centroid < n_cent && score < best_scores[row] {
+                    best_scores[row] = score;
+                    out[row] = centroid as u32;
+                }
+            }
+        },
+    );
 }
 
 /// Return the closest two centroids in a block-transposed fp32 centroid cache.
@@ -317,6 +434,44 @@ pub(crate) fn nearest_k_centroids_transposed(
         }
     });
     top
+}
+
+/// [`nearest_k_centroids_transposed`] for every row of the row-major `rows`:
+/// returns one ascending top-`k` list per row, each identical to the
+/// single-row call (same scores, same `counts` filter, same tie-breaking).
+pub(crate) fn nearest_k_centroids_transposed_rows(
+    metric: Metric,
+    rows: &[f32],
+    transposed: &[f32],
+    n_cent: usize,
+    dim: usize,
+    counts: Option<&[u32]>,
+    k: usize,
+) -> Vec<Vec<(u32, f32)>> {
+    debug_assert!(counts.is_none_or(|counts| counts.len() >= n_cent));
+    let n_rows = rows.len() / dim;
+    let mut tops: Vec<Vec<(u32, f32)>> = (0..n_rows)
+        .map(|_| Vec::with_capacity(k.saturating_add(1)))
+        .collect();
+    if k == 0 {
+        return tops;
+    }
+    for_each_row_centroid_block_scores(
+        metric,
+        rows,
+        transposed,
+        n_cent,
+        dim,
+        |row, base, scores| {
+            for (lane, &score) in scores.iter().enumerate() {
+                let centroid = base + lane;
+                if centroid < n_cent && centroid_included(counts, centroid) {
+                    insert_ranked(&mut tops[row], k, centroid as u32, score);
+                }
+            }
+        },
+    );
+    tops
 }
 
 #[inline]
@@ -409,20 +564,67 @@ fn score_centroid_block8_transposed_wide(
         }
     }
     let mut scores = acc.to_array();
+    finish_centroid_scores(metric, &mut scores);
+    scores
+}
+
+/// [`score_centroid_block8_transposed_wide`] for a tile of rows: each
+/// 8-lane centroid load is shared by every row, and each row's accumulator
+/// runs the same operations in the same order as the single-row kernel.
+#[inline]
+fn score_centroid_block8_rows_transposed_wide(
+    metric: Metric,
+    rows: &[&[f32]; CENTROID_ROW_TILE],
+    transposed: &[f32],
+    dim: usize,
+    block: usize,
+    lane_offset: usize,
+) -> [[f32; F32X8_LANES]; CENTROID_ROW_TILE] {
+    let mut acc = [f32x8::ZERO; CENTROID_ROW_TILE];
+    let block_base = block * dim * CENTROID_BATCH_LANES;
+    for d in 0..dim {
+        let row = block_base + d * CENTROID_BATCH_LANES + lane_offset;
+        let c = f32x8::from(
+            <[f32; F32X8_LANES]>::try_from(&transposed[row..row + F32X8_LANES])
+                .expect("transposed centroid row has 8-lane half"),
+        );
+        for (acc, query) in acc.iter_mut().zip(rows) {
+            let q = f32x8::splat(query[d]);
+            match metric {
+                Metric::L2Sq => {
+                    let diff = q - c;
+                    *acc += diff * diff;
+                }
+                Metric::Cosine | Metric::NegDot => {
+                    *acc += q * c;
+                }
+            }
+        }
+    }
+    acc.map(|acc| {
+        let mut scores = acc.to_array();
+        finish_centroid_scores(metric, &mut scores);
+        scores
+    })
+}
+
+/// Turn the accumulated per-lane sums into distances: `Σ(q−c)²` is already
+/// the L2² distance; dot sums become `COSINE_DISTANCE_BASE − dot` or `−dot`.
+#[inline]
+fn finish_centroid_scores(metric: Metric, scores: &mut [f32]) {
     match metric {
         Metric::Cosine => {
-            for score in &mut scores {
+            for score in scores {
                 *score = COSINE_DISTANCE_BASE - *score;
             }
         }
         Metric::NegDot => {
-            for score in &mut scores {
+            for score in scores {
                 *score = -*score;
             }
         }
         Metric::L2Sq => {}
     }
-    scores
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -456,18 +658,50 @@ unsafe fn score_centroid_block16_transposed_avx512(
         }
         let mut scores = [0f32; AVX512_F32_LANES];
         _mm512_storeu_ps(scores.as_mut_ptr(), acc);
-        match metric {
-            Metric::Cosine => {
-                for score in &mut scores {
-                    *score = COSINE_DISTANCE_BASE - *score;
-                }
+        finish_centroid_scores(metric, &mut scores);
+        scores
+    }
+}
+
+/// [`score_centroid_block16_transposed_avx512`] for a tile of rows: each
+/// 16-lane centroid load is shared by every row, and each row's accumulator
+/// runs the same operations in the same order as the single-row kernel.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn score_centroid_block16_rows_transposed_avx512(
+    metric: Metric,
+    rows: &[&[f32]; CENTROID_ROW_TILE],
+    transposed: &[f32],
+    dim: usize,
+    block: usize,
+) -> [[f32; AVX512_F32_LANES]; CENTROID_ROW_TILE] {
+    // SAFETY: called only after `avx512_enabled()`. Each load reads one full
+    // 16-f32 transposed row. The transposed cache is allocated as
+    // `n_blocks * dim * 16`, and callers pass `block < n_blocks`.
+    unsafe {
+        let mut acc = [_mm512_setzero_ps(); CENTROID_ROW_TILE];
+        let block_base = block * dim * CENTROID_BATCH_LANES;
+        for d in 0..dim {
+            let c = _mm512_loadu_ps(
+                transposed
+                    .as_ptr()
+                    .add(block_base + d * CENTROID_BATCH_LANES),
+            );
+            for (acc, query) in acc.iter_mut().zip(rows) {
+                let q = _mm512_set1_ps(query[d]);
+                *acc = match metric {
+                    Metric::L2Sq => {
+                        let diff = _mm512_sub_ps(q, c);
+                        _mm512_fmadd_ps(diff, diff, *acc)
+                    }
+                    Metric::Cosine | Metric::NegDot => _mm512_fmadd_ps(q, c, *acc),
+                };
             }
-            Metric::NegDot => {
-                for score in &mut scores {
-                    *score = -*score;
-                }
-            }
-            Metric::L2Sq => {}
+        }
+        let mut scores = [[0f32; AVX512_F32_LANES]; CENTROID_ROW_TILE];
+        for (row_scores, acc) in scores.iter_mut().zip(acc) {
+            _mm512_storeu_ps(row_scores.as_mut_ptr(), acc);
+            finish_centroid_scores(metric, row_scores);
         }
         scores
     }
@@ -3178,6 +3412,131 @@ mod tests {
             let blocked =
                 nearest_centroid_transposed(Metric::L2Sq, &tie_query, &transposed, n_cent, dim);
             assert_eq!(blocked.0, 3, "tie must resolve to the lowest index");
+        }
+    }
+
+    /// Row counts around the multi-row tile: empty, tail only, one exact
+    /// tile, a tile plus a tail, two tiles, and several tiles plus a tail.
+    const ROW_TILE_TEST_ROW_COUNTS: [usize; 7] = [0, 1, 7, 8, 9, 16, 67];
+    /// Centroid counts around the 16-lane block: one centroid, one full
+    /// block, a partial trailing block, and many blocks with a partial tail.
+    const ROW_TILE_TEST_N_CENTS: [usize; 4] = [1, 16, 19, 130];
+    /// An odd dimension, so no SIMD-width alignment is assumed.
+    const ROW_TILE_TEST_DIM: usize = 33;
+    /// The row (when present) that copies centroid 0, which the fixture also
+    /// duplicates at the last index, so it ties exactly.
+    const ROW_TILE_TEST_TIE_ROW: usize = 2;
+    /// The row (when present) carrying a NaN component.
+    const ROW_TILE_TEST_NAN_ROW: usize = 5;
+
+    /// Rows and cluster-major centroids for the multi-row equivalence tests:
+    /// the last centroid duplicates centroid 0, one row sits exactly on it,
+    /// and one row carries a NaN.
+    fn row_tile_fixture(n_rows: usize, n_cent: usize) -> (Vec<f32>, Vec<f32>) {
+        let dim = ROW_TILE_TEST_DIM;
+        let mut centroids: Vec<f32> = (0..n_cent * dim)
+            .map(|i| ((i * 31 + 7) % 29) as f32 * 0.04 - 0.5)
+            .collect();
+        let first = centroids[..dim].to_vec();
+        centroids[(n_cent - 1) * dim..].copy_from_slice(&first);
+        let mut rows: Vec<f32> = (0..n_rows * dim)
+            .map(|i| ((i * 13 + 3) % 23) as f32 * 0.05 - 0.4)
+            .collect();
+        if n_rows > ROW_TILE_TEST_TIE_ROW {
+            let at = ROW_TILE_TEST_TIE_ROW * dim;
+            rows[at..at + dim].copy_from_slice(&first);
+        }
+        if n_rows > ROW_TILE_TEST_NAN_ROW {
+            rows[ROW_TILE_TEST_NAN_ROW * dim] = f32::NAN;
+        }
+        (rows, centroids)
+    }
+
+    /// The multi-row argmin must equal the single-row argmin on every row,
+    /// across metrics, partial tiles, partial centroid blocks, exact ties
+    /// and NaN rows.
+    #[test]
+    fn nearest_centroid_transposed_rows_matches_single_row() {
+        let dim = ROW_TILE_TEST_DIM;
+        for metric in [Metric::L2Sq, Metric::Cosine, Metric::NegDot] {
+            for n_cent in ROW_TILE_TEST_N_CENTS {
+                for n_rows in ROW_TILE_TEST_ROW_COUNTS {
+                    let (rows, centroids) = row_tile_fixture(n_rows, n_cent);
+                    let transposed = transpose_centroids_cluster_major(&centroids, n_cent, dim);
+                    let mut got = vec![u32::MAX; n_rows];
+                    nearest_centroid_transposed_rows(
+                        metric,
+                        &rows,
+                        &transposed,
+                        n_cent,
+                        dim,
+                        &mut got,
+                    );
+                    for (r, &got) in got.iter().enumerate() {
+                        let row = &rows[r * dim..(r + 1) * dim];
+                        let want =
+                            nearest_centroid_transposed(metric, row, &transposed, n_cent, dim);
+                        assert_eq!(
+                            got, want.0,
+                            "{metric:?} n_cent {n_cent} n_rows {n_rows} row {r}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The multi-row top-k must equal the single-row top-k on every row,
+    /// scores compared bit for bit, with and without the zero-count filter.
+    #[test]
+    fn nearest_k_centroids_transposed_rows_matches_single_row() {
+        let dim = ROW_TILE_TEST_DIM;
+        for metric in [Metric::L2Sq, Metric::Cosine, Metric::NegDot] {
+            for n_cent in ROW_TILE_TEST_N_CENTS {
+                // Every third centroid empty, so the filter drops some
+                // centroids in every block.
+                let counts: Vec<u32> = (0..n_cent).map(|c| u32::from(c % 3 != 1)).collect();
+                for n_rows in ROW_TILE_TEST_ROW_COUNTS {
+                    let (rows, centroids) = row_tile_fixture(n_rows, n_cent);
+                    let transposed = transpose_centroids_cluster_major(&centroids, n_cent, dim);
+                    for counts in [None, Some(counts.as_slice())] {
+                        for k in [0, 1, 3] {
+                            let got = nearest_k_centroids_transposed_rows(
+                                metric,
+                                &rows,
+                                &transposed,
+                                n_cent,
+                                dim,
+                                counts,
+                                k,
+                            );
+                            assert_eq!(got.len(), n_rows);
+                            for (r, got) in got.iter().enumerate() {
+                                let row = &rows[r * dim..(r + 1) * dim];
+                                let want = nearest_k_centroids_transposed(
+                                    metric,
+                                    row,
+                                    &transposed,
+                                    n_cent,
+                                    dim,
+                                    counts,
+                                    k,
+                                );
+                                let bits = |top: &[(u32, f32)]| -> Vec<(u32, u32)> {
+                                    top.iter().map(|&(c, s)| (c, s.to_bits())).collect()
+                                };
+                                assert_eq!(
+                                    bits(got),
+                                    bits(&want),
+                                    "{metric:?} n_cent {n_cent} n_rows {n_rows} k {k} \
+                                     filtered {} row {r}",
+                                    counts.is_some()
+                                );
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 

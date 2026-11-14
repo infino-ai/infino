@@ -367,6 +367,16 @@
               }
             }
           },
+          "403": {
+            "description": "The database holds append-only tables. Only an Infino administrator can delete it.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
           "412": {
             "description": "The database changed concurrently; retry the request.",
             "content": {
@@ -498,6 +508,9 @@
           "401": {
             "description": "Missing or invalid API key."
           },
+          "403": {
+            "description": "The table is append-only: its rows cannot be deleted or updated and it cannot be dropped. Appending still works. Only an Infino administrator can take a table out of append-only."
+          },
           "409": {
             "description": "Another write to the same table was in flight, so this one was not applied. A table takes one write at a time. Transient — reissue the identical request after the `Retry-After` interval, or batch more rows per request to need fewer of them."
           },
@@ -550,6 +563,9 @@
           },
           "401": {
             "description": "Missing or invalid API key."
+          },
+          "403": {
+            "description": "The table is append-only: its rows cannot be deleted or updated and it cannot be dropped. Appending still works. Only an Infino administrator can take a table out of append-only."
           },
           "409": {
             "description": "Another catalog change was in flight, so this one was not applied. Every table in a database is dropped through one catalog. Transient — reissue the identical request after the `Retry-After` interval."
@@ -733,10 +749,10 @@
         },
         "responses": {
           "200": {
-            "description": "Matching rows as an Arrow IPC stream (application/vnd.apache.arrow.stream), or JSON when the request sends `Accept: application/json`."
+            "description": "Matching rows as an Arrow IPC stream (application/vnd.apache.arrow.stream), or JSON when the request sends `Accept: application/json`. With `validate`, always JSON: `{\"rows\": [...], \"validation\": {...}}`. The validation carries `valid`, `check` (`no_rows`, `aggregate`, `anchors` or `unchecked`), `anchors` (the terms read off the question), `rows` (how many were considered), and when the result does not answer the question, `reason` and `absent` (the terms the searched column holds nowhere, so no query will find them). For a GROUP BY over a search function it adds `group_column`, `groups` (each group's whole length in lines and its lines holding each search term) and `note`, so a total over the top k is not read as a size. `valid: true` means the rows answer something the question asked, not that the answer is right."
           },
           "400": {
-            "description": "Invalid request body."
+            "description": "Invalid request body. With `validate`, also a GROUP BY over a search function with a literal k under 300, refused before it runs because its totals rank a share of the top k rather than the table; the message names the call and the two shapes that rank the whole table. Not transient: rewrite the statement."
           },
           "401": {
             "description": "Missing or invalid API key."
@@ -930,7 +946,7 @@
             "description": "Missing or invalid API key."
           },
           "403": {
-            "description": "The account already stores one of its limits — rows, or vectors (one per row of a table with a vector column) — so no more can be added. Which ceiling applies depends on the account: one with no payment method on file is held to the smaller free-plan ceiling, and adding a payment method raises it. The response body names which limit was reached, the numbers, and whether a payment method would raise it. Delete rows to free space; reads and deletes are never refused for this reason. Not transient: retrying without freeing space fails identically."
+            "description": "The account already stores one of its limits — rows, or vectors (one per row of a table with a vector column) — so no more can be added. Which ceiling applies depends on the account: one with no payment method on file is held to the smaller free-plan ceiling, and adding a payment method raises it. The response body names which limit was reached, the numbers, and whether a payment method would raise it. Delete rows to free space; reads and deletes are never refused for this reason. Not transient: retrying without freeing space fails identically. Or: The table is append-only: its rows cannot be deleted or updated and it cannot be dropped. Appending still works. Only an Infino administrator can take a table out of append-only."
           },
           "409": {
             "description": "Another write to the same table was in flight, so this one was not applied. A table takes one write at a time. Transient — reissue the identical request after the `Retry-After` interval, or batch more rows per request to need fewer of them."
@@ -1129,6 +1145,7 @@
         "oneOf": [
           {
             "type": "object",
+            "title": "S3",
             "description": "Amazon S3 (or an S3-compatible store via `endpoint`).",
             "required": [
               "bucket",
@@ -1140,6 +1157,17 @@
               "bucket": {
                 "type": "string",
                 "description": "The customer's bucket."
+              },
+              "encryption": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/CustomerKey",
+                    "description": "The customer-managed encryption key (CMEK) the bucket is configured\nwith, if any. Omitted means a keyless binding. Its cloud must match\nthe provider ([`StorageBinding::validate`])."
+                  }
+                ]
               },
               "endpoint": {
                 "type": [
@@ -1177,6 +1205,7 @@
           },
           {
             "type": "object",
+            "title": "Gcs",
             "description": "Google Cloud Storage: the customer grants the platform's service\naccount an object role on the bucket.",
             "required": [
               "bucket",
@@ -1187,6 +1216,17 @@
               "bucket": {
                 "type": "string",
                 "description": "The customer's bucket."
+              },
+              "encryption": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/CustomerKey",
+                    "description": "The customer-managed encryption key (CMEK) the bucket is configured\nwith, if any. Omitted means a keyless binding. Its cloud must match\nthe provider ([`StorageBinding::validate`])."
+                  }
+                ]
               },
               "prefix": {
                 "type": [
@@ -1209,6 +1249,7 @@
           },
           {
             "type": "object",
+            "title": "Azure",
             "description": "Azure Blob Storage: the customer admin-consents the platform's Entra\napplication and grants it a data role on the storage account.",
             "required": [
               "container",
@@ -1220,6 +1261,17 @@
               "container": {
                 "type": "string",
                 "description": "The customer's container."
+              },
+              "encryption": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/CustomerKey",
+                    "description": "The customer-managed encryption key (CMEK) the storage account is\nconfigured with, if any. Omitted means a keyless binding. Its cloud\nmust match the provider ([`StorageBinding::validate`])."
+                  }
+                ]
               },
               "prefix": {
                 "type": [
@@ -1261,6 +1313,10 @@
           "table_name"
         ],
         "properties": {
+          "append_only": {
+            "type": "boolean",
+            "description": "Make the table append-only: rows can be appended, but no request can\ndelete or update them, drop the table, or delete its database or\naccount. Only an Infino administrator can take a table out of\nappend-only. Defaults to `false`."
+          },
           "indexes": {
             "oneOf": [
               {
@@ -1324,6 +1380,86 @@
             "description": "Whether the bind-time probe already passed. GCS and Azure try the\nprobe at create when the grant is already in place. AWS is always\n`false` here: the external id did not exist until this response, so\nthe customer cannot have written the trust policy yet — call\n`POST /v1/databases/{name}/storage/verify` (or the first query, which\nre-probes) once it is."
           }
         }
+      },
+      "CustomerKey": {
+        "oneOf": [
+          {
+            "type": "object",
+            "title": "AwsKms",
+            "description": "AWS KMS: the key the bucket's SSE-KMS default encryption names\n(`arn:aws:kms:<region>:<account>:key/<id>`). An alias ARN is refused —\nthe assume-role session policy is scoped to the key itself, which an\nalias can be repointed away from.",
+            "required": [
+              "key_arn",
+              "bucket_key",
+              "kind"
+            ],
+            "properties": {
+              "bucket_key": {
+                "type": "boolean",
+                "description": "Whether to use an S3 Bucket Key (object key-derivations collapse to\none per bucket, cutting KMS request cost). Honoured on every write, so\na customer whose key policy is pinned to object ARNs — where a bucket\nkey would be denied — can set it `false`."
+              },
+              "key_arn": {
+                "type": "string",
+                "description": "The KMS key ARN. Its region must equal the binding's region."
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "aws_kms"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "title": "GcpKms",
+            "description": "GCP Cloud KMS: the key the bucket's default encryption names\n(`projects/<p>/locations/<l>/keyRings/<r>/cryptoKeys/<k>`).",
+            "required": [
+              "key_name",
+              "kind"
+            ],
+            "properties": {
+              "key_name": {
+                "type": "string",
+                "description": "The Cloud KMS key resource name."
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "gcp_kms"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "title": "AzureVault",
+            "description": "Azure Key Vault: the key the storage account's encryption scope wraps\n(`https://<vault>.vault.azure.net/keys/<name>`). Validated end-to-end\nagainst a live Key Vault — key-identity verification and durable-key-fault\ndetection are at parity with AWS and GCP. (Azure's own key cache delays a\nrevocation taking effect by roughly 7–30 minutes; the condemn-then-reverify\nflow tolerates that latency on both edges.)",
+            "required": [
+              "key_id",
+              "kind"
+            ],
+            "properties": {
+              "encryption_scope": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "The storage-account encryption scope bound to the key, where one is\nused; `None` leaves the account's scope unnamed. Stored on the\nbinding; the serving path does not consult it."
+              },
+              "key_id": {
+                "type": "string",
+                "description": "The Key Vault key id (vault URL)."
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "azure_vault"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "The customer-managed encryption key (CMEK) a bound bucket's objects are\nwritten under, when the customer supplies one. The variant must match the\nbound backend (checked by [`StorageBinding::validate`]), and — like\n[`AccessGrant`] — **none of them carries key material**: the key lives in\nthe customer's own KMS / Key Vault, and the binding records only its public\nresource name, never a secret.\n\nTagged `{\"kind\": \"...\"}` like [`AccessGrant`], so a stored binding names its\nown key mechanism and a future variant deserializes cleanly. A keyless\nbinding carries [`None`] and omits the field entirely, exactly as every row\nwritten before the field."
       },
       "DatabaseSummary": {
         "type": "object",
@@ -1656,6 +1792,16 @@
             },
             "description": "FTS index declarations — a bare column name (engine defaults) or an\noptions object per column (see [`FtsColumn`])."
           },
+          "range": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/RangeIndex"
+            },
+            "description": "Range index declarations (see [`RangeIndex`])."
+          },
           "vector": {
             "type": [
               "array",
@@ -1701,6 +1847,19 @@
           "or",
           "and"
         ]
+      },
+      "RangeIndex": {
+        "type": "object",
+        "description": "One range index declaration under `indexes.range`: a numeric or temporal\ncolumn the engine keeps a sorted index of, so a range predicate, a count\nover a range, or a top-k ordered by it reads the index instead of scanning\nthe column. The shape is what the engine's hosted transport sends for\n`IndexSpec::range`. Which columns can carry one, and that a column carries\nno other index, is the engine's to check when the table is created.",
+        "required": [
+          "column"
+        ],
+        "properties": {
+          "column": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
       },
       "RowsEnvelope": {
         "type": "object",
@@ -2123,6 +2282,43 @@
         "properties": {
           "query": {
             "type": "string"
+          },
+          "validate": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SqlValidation",
+                "description": "Ask for the result to be checked against the question it is meant to\nanswer. Off when absent, and nothing about the query changes. When\npresent, a GROUP BY over a search function with a literal k under 300\nis refused before it runs, and the response is JSON whatever `Accept`\nsays: `{\"rows\": [...], \"validation\": {...}}`, the verdict beside the\nrows. The engine work the check spends is metered with the query."
+              }
+            ]
+          }
+        },
+        "additionalProperties": false
+      },
+      "SqlValidation": {
+        "type": "object",
+        "description": "What a `query_sql` result is checked against: the question, and the\nfull-text-indexed column the question's terms are looked up in when the\nresult does not answer it.",
+        "required": [
+          "table_name",
+          "field_name"
+        ],
+        "properties": {
+          "field_name": {
+            "type": "string",
+            "description": "The full-text-indexed column the statement searched."
+          },
+          "question": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The question the rows are meant to answer. Its distinctive terms\n(numbers, quoted spans, names, identifiers) are what the rows must\nmention. Without it, only an empty or all-zero result is refused."
+          },
+          "table_name": {
+            "type": "string",
+            "description": "The table the statement searched."
           }
         },
         "additionalProperties": false

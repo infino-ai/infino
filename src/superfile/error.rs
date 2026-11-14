@@ -196,9 +196,9 @@ pub enum ReadError {
     #[error("columnar read error: {0}")]
     Columnar(String),
 
-    /// A decode handed to the reader pool died before it answered; `0`
-    /// names the decode.
-    #[error("{0} task dropped its result")]
+    /// A decode handed to the reader pool panicked before it answered;
+    /// `0` names the decode.
+    #[error("{0} did not finish (it panicked)")]
     TaskDropped(&'static str),
 }
 
@@ -315,13 +315,10 @@ pub enum FtsError {
     )]
     PositionsUnavailable { column: String },
 
-    /// A dictionary walk handed to the reader pool dropped its result
-    /// channel without sending. The reader pool installs no panic handler,
-    /// so a panic inside the walk aborts the process before the awaiting
-    /// task can see this; the variant covers a sender lost any other way
-    /// (a pool torn down mid-query) and fails that one query, the FTS twin
-    /// of the vector path's variant.
-    #[error("dictionary walk dropped its result during {0}")]
+    /// A dictionary walk handed to the reader pool panicked before it
+    /// answered; `0` names the walk. Fails that one query; the FTS twin of
+    /// the vector path's variant.
+    #[error("{0} did not finish (it panicked)")]
     TaskDropped(&'static str),
 
     /// An exact substring answer was asked of a column this superfile
@@ -407,11 +404,10 @@ pub enum VectorError {
     #[error("{0}")]
     OverBudget(String),
 
-    /// A rayon-bridged compute task dropped its result channel without
-    /// sending — the worker panicked or was cancelled mid-query. Surfaced
-    /// as an error so a lost scan/rerank fails the one query instead of
-    /// panicking the process.
-    #[error("vector compute task dropped its result during {0}")]
+    /// A vector scan or rerank handed to the reader pool panicked before
+    /// it answered; `0` names the step. Surfaced as an error so the one
+    /// query fails instead of the process.
+    #[error("vector {0} did not finish (it panicked)")]
     TaskDropped(&'static str),
 
     /// The warmed cluster-block span map is missing a cluster that the

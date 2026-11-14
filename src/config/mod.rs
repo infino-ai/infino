@@ -442,10 +442,13 @@ pub struct CompactionSettings {
     /// closes them out first — it is the backstop for a partition of unusually
     /// large superfiles, not a typical job's size.
     ///
-    /// It is also NOT a bound on the merge's resident set, which runs several
-    /// times higher once rows are decoded and the output encoded, and it does
-    /// not govern how many merges run at once: the runner admits them against
-    /// the host's free memory.
+    /// It is also not what bounds a merge's memory: a merge streams its rows
+    /// through a window of decoded bytes, writing a bounded number of
+    /// columns at a time, so what it holds does not grow with its input
+    /// (a merge that must rebuild an input's vector or full-text index from
+    /// its rows still holds them). Nor does it govern how many merges run
+    /// at once: the runner admits them against the host's free memory. It
+    /// is a file-size choice.
     ///
     /// The YAML key `max_memory_mb` is the deprecated name of this setting;
     /// the loader folds it into this field with a warning, as the one entry
@@ -662,6 +665,9 @@ const DEFAULT_VECTOR_GLOBAL_FINE_DRAIN_PLACEMENT: bool = true;
 /// 0.997 → 0.975) while adding ~50% storage and ~35% GETs/query. Grid+fine
 /// union routing carries boundary coverage instead.
 const DEFAULT_VECTOR_DRAIN_REPLICA_TARGET_FACTOR: f32 = 1.0;
+/// Default `vector.drain_max_rows`: no fixed limit, so a drain is held only to
+/// what its scratch disk can spill.
+const DEFAULT_VECTOR_DRAIN_MAX_ROWS: u64 = 0;
 /// Default cell count for the **user** table's grid — the grid trained at the
 /// first commit, used to cell-pack user superfiles and to route the pre-drain
 /// query. Finer cells make the default single-cell pre-drain probe both more
@@ -1067,6 +1073,10 @@ pub struct VectorSettings {
     /// extra copies of rows near a Voronoi boundary; `<= 1.0` disables
     /// replication.
     pub drain_replica_target_factor: f32,
+    /// Most user rows one hidden-index drain takes on; the rest wait for the
+    /// next drain. `0` sets no fixed limit. Either way a drain also takes no
+    /// more rows than its scratch disk can spill.
+    pub drain_max_rows: u64,
     /// Per-cell consolidation op the drain applies.
     pub drain_consolidate: DrainConsolidate,
     /// Route drain-side cell assignment through a centroid HNSW built once
@@ -1159,6 +1169,7 @@ impl Default for VectorSettings {
             user_centroids: CentroidAlignment::Local,
             drain_batch_superfiles: DEFAULT_VECTOR_DRAIN_BATCH_SUPERFILES,
             drain_replica_target_factor: DEFAULT_VECTOR_DRAIN_REPLICA_TARGET_FACTOR,
+            drain_max_rows: DEFAULT_VECTOR_DRAIN_MAX_ROWS,
             drain_consolidate: DrainConsolidate::Kmeans,
             drain_graph_assign: DEFAULT_VECTOR_DRAIN_GRAPH_ASSIGN,
             global_fine_drain_placement: DEFAULT_VECTOR_GLOBAL_FINE_DRAIN_PLACEMENT,
@@ -2314,6 +2325,7 @@ mod tests {
             "engine config must come from YAML only"
         );
         assert_eq!(cfg.vector.drain_replica_target_factor, 1.0);
+        assert_eq!(cfg.vector.drain_max_rows, 0);
         assert!(!cfg.diagnostics.io_timeline);
         unsafe {
             env::remove_var("INFINO_SUPERTABLE__COMMIT_THRESHOLD_SIZE_MB");

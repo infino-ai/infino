@@ -23,7 +23,7 @@
 
 use std::{error::Error, io};
 
-use datafusion::error::DataFusionError;
+use datafusion::{common::utils::datafusion_strsim::levenshtein, error::DataFusionError};
 use object_store::Error as ObjectStoreError;
 
 use crate::{
@@ -278,16 +278,30 @@ const TYPE_COERCION_RULE: &str = "type_coercion";
 /// queries on datatype: Duration(ms)").
 const UNRUNNABLE_WINDOW_ORDER: &str = "Cannot run range queries on datatype: ";
 
-/// Marker DataFusion writes before the full column list in a
-/// `No field named X. Valid fields are …` schema error.
-const VALID_FIELDS_MARKER: &str = ". Valid fields are ";
+/// Markers DataFusion writes before the full column list in a
+/// `No field named X` schema error: after a period on the same line, or on a
+/// line of its own, as DataFusion releases from 55 on write it.
+const VALID_FIELDS_MARKERS: [&str; 2] = [". Valid fields are ", "\nValid fields are "];
+
+/// Marker DataFusion writes before the missing field's name.
+const FIELD_NOT_FOUND_MARKER: &str = "No field named ";
+
+/// What a suggested name follows in a schema error. DataFusion writes the
+/// same words when it finds a close name itself, so a message that already
+/// has them gets no second suggestion.
+const DID_YOU_MEAN: &str = "Did you mean";
+
+/// A valid name is suggested for a missing one when the edits between them
+/// are at most the longer name's length divided by this: half, the bar
+/// DataFusion's own suggestion uses.
+const SUGGESTION_EDITS_DIVISOR: usize = 2;
 
 /// Most valid-field names to keep in a schema error before summarizing the
 /// rest as `… and N more`. A `No field named X. Valid fields are …` error
 /// enumerates every column of the schema; on a very wide table (thousands of
 /// columns) that list alone runs to hundreds of kilobytes, bloating logs and
-/// responses. A short, representative prefix keeps the useful part — the
-/// missing field and a sample of what is valid — at a bounded size.
+/// responses. The names kept are the ones closest to the missing field, so
+/// the one the caller meant is among them however far down the table it is.
 const MAX_LISTED_VALID_FIELDS: usize = 32;
 
 /// Hard upper bound, in bytes, on a propagated query-error message. A backstop
@@ -303,40 +317,100 @@ fn cap_error_message(msg: String) -> String {
     truncate_to_bytes(cap_valid_fields_list(msg), MAX_ERROR_MESSAGE_BYTES)
 }
 
-/// Join `names` with `, `, keeping the first [`MAX_LISTED_VALID_FIELDS`] and
-/// summarizing the rest as `… and N more`. A list already within the cap is
-/// joined whole. Any message that enumerates a table's columns inherits that
-/// table's width: on a very wide table (thousands of columns) the list alone
-/// runs to hundreds of kilobytes and bloats logs and responses, so a message
-/// that includes one bounds it here. Used both to bound a propagated
-/// DataFusion schema error (below) and the projection check's own list of
-/// selectable columns.
-pub(crate) fn capped_column_list(names: &[&str]) -> String {
+/// A column name as a caller writes it: without the table it is qualified
+/// by, as DataFusion lists valid fields (`posts.title`).
+fn unqualified(name: &str) -> &str {
+    name.rsplit('.').next().unwrap_or(name)
+}
+
+/// How many edits apart two column names are, ignoring case, quotes and any
+/// table qualifier. Comparing whole qualified names, as DataFusion 54 does,
+/// counts the qualifier as edits: `agentconversationid` is 5 edits from
+/// `conversationid` but 29 from `events.conversationid`.
+fn edits_between(a: &str, b: &str) -> usize {
+    let bare = |name: &str| unqualified(name).trim_matches('"').to_lowercase();
+    levenshtein(&bare(a), &bare(b))
+}
+
+/// The valid name closest to `missing`, unqualified, when one is close
+/// enough to suggest (see [`SUGGESTION_EDITS_DIVISOR`]); the earliest in
+/// `names` among equally close ones.
+pub(crate) fn closest_name<'a>(missing: &str, names: &[&'a str]) -> Option<&'a str> {
+    let longest = |name: &str| {
+        unqualified(missing)
+            .chars()
+            .count()
+            .max(unqualified(name).chars().count())
+    };
+    names
+        .iter()
+        .map(|name| (edits_between(missing, name), *name))
+        .filter(|(edits, name)| edits * SUGGESTION_EDITS_DIVISOR <= longest(name))
+        .min_by_key(|(edits, _)| *edits)
+        .map(|(_, name)| unqualified(name))
+}
+
+/// Join `names` with `, `, keeping the [`MAX_LISTED_VALID_FIELDS`] closest to
+/// `missing`, closest first, and summarizing the rest as `… and N more`. A
+/// list already within the cap is joined whole, in its own order. Any message
+/// that enumerates a table's columns inherits that table's width: on a very
+/// wide table (thousands of columns) the list alone runs to hundreds of
+/// kilobytes and bloats logs and responses, so a message that includes one
+/// bounds it here. Used both to bound a propagated DataFusion schema error
+/// (below) and the projection check's own list of selectable columns.
+pub(crate) fn capped_column_list(names: &[&str], missing: &str) -> String {
     if names.len() <= MAX_LISTED_VALID_FIELDS {
         return names.join(", ");
     }
-    let shown = names[..MAX_LISTED_VALID_FIELDS].join(", ");
+    let mut ranked = names.to_vec();
+    // A stable sort: equally close names keep the table's order.
+    ranked.sort_by_cached_key(|name| edits_between(missing, name));
+    let shown = ranked[..MAX_LISTED_VALID_FIELDS].join(", ");
     let more = names.len() - MAX_LISTED_VALID_FIELDS;
     format!("{shown}, … and {more} more")
 }
 
-/// Keep the `No field named X. Valid fields are …` prefix and the first
-/// [`MAX_LISTED_VALID_FIELDS`] names, replacing the rest with `… and N more`.
-/// A message without the valid-fields marker, or one already within the cap,
-/// is returned unchanged.
+/// In a `No field named X` error that lists the valid fields, suggest the
+/// closest one when DataFusion has not, and keep the
+/// [`MAX_LISTED_VALID_FIELDS`] closest names, replacing the rest with
+/// `… and N more`. A message without a valid-fields list, or one within the
+/// cap with nothing to suggest, is returned unchanged.
 fn cap_valid_fields_list(msg: String) -> String {
-    let Some(marker_at) = msg.find(VALID_FIELDS_MARKER) else {
+    let Some((marker_at, marker)) = VALID_FIELDS_MARKERS
+        .iter()
+        .find_map(|marker| msg.find(marker).map(|at| (at, *marker)))
+    else {
         return msg;
     };
-    let list_at = marker_at + VALID_FIELDS_MARKER.len();
-    let (head, list) = msg.split_at(list_at);
+    let (head, rest) = msg.split_at(marker_at);
     // DataFusion ends the message with a trailing period after the list.
+    let list = &rest[marker.len()..];
     let list = list.strip_suffix('.').unwrap_or(list);
     let names: Vec<&str> = list.split(", ").collect();
-    if names.len() <= MAX_LISTED_VALID_FIELDS {
+    let missing = head
+        .find(FIELD_NOT_FOUND_MARKER)
+        .map(|at| &head[at + FIELD_NOT_FOUND_MARKER.len()..])
+        .and_then(|name| name.split(". ").next())
+        .map(|name| name.trim_end_matches('.'))
+        .unwrap_or_default();
+    let suggestion = if head.contains(DID_YOU_MEAN) {
+        None
+    } else {
+        closest_name(missing, &names)
+    };
+    if names.len() <= MAX_LISTED_VALID_FIELDS && suggestion.is_none() {
         return msg;
     }
-    format!("{head}{}.", capped_column_list(&names))
+    let listed = capped_column_list(&names, missing);
+    match suggestion {
+        // `. Did you mean 'x'? Valid fields are …`, or the list on its own line.
+        Some(name) => format!(
+            "{}. {DID_YOU_MEAN} '{name}'?{}{listed}.",
+            head.trim_end_matches('.'),
+            marker.trim_start_matches('.')
+        ),
+        None => format!("{head}{marker}{listed}."),
+    }
 }
 
 /// Cut `msg` to at most `max` bytes on a UTF-8 boundary, appending a marker
@@ -1194,12 +1268,12 @@ mod tests {
     /// relies on.
     #[test]
     fn capped_column_list_bounds_a_wide_list() {
-        assert_eq!(capped_column_list(&["a", "b", "c"]), "a, b, c");
+        assert_eq!(capped_column_list(&["a", "b", "c"], "ghost"), "a, b, c");
 
         const COLUMNS: usize = 5_000;
         let names: Vec<String> = (0..COLUMNS).map(|i| format!("col{i}")).collect();
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-        let capped = capped_column_list(&refs);
+        let capped = capped_column_list(&refs, "ghost");
         assert!(capped.starts_with("col0, "), "keeps a sample: {capped}");
         assert!(
             capped.ends_with(&format!("and {} more", COLUMNS - MAX_LISTED_VALID_FIELDS)),
@@ -1216,8 +1290,113 @@ mod tests {
             .collect();
         let at_cap_refs: Vec<&str> = at_cap.iter().map(String::as_str).collect();
         assert!(
-            !capped_column_list(&at_cap_refs).contains("more"),
+            !capped_column_list(&at_cap_refs, "ghost").contains("more"),
             "at the cap, joins whole"
+        );
+    }
+
+    /// The shape of a wide event table: thousands of columns, the one the
+    /// caller meant far past the first [`MAX_LISTED_VALID_FIELDS`].
+    const WIDE_COLUMNS: usize = 1_919;
+    /// Where the meant column sits in [`WIDE_COLUMNS`].
+    const MEANT_AT: usize = 1_500;
+    /// A table name as long as event exports carry. DataFusion 54 compares
+    /// the qualified name, so behind a short one (`events.`) it suggests the
+    /// column itself; behind this one it does not.
+    const WIDE_TABLE: &str = "app_000001_assistant_events_hourly";
+
+    fn wide_event_columns() -> Vec<String> {
+        let mut names: Vec<String> = (0..WIDE_COLUMNS)
+            .map(|i| format!("segmentflag{i}"))
+            .collect();
+        names[1] = "agentid".into();
+        names[2] = "agentinputtokencount".into();
+        names[MEANT_AT] = "conversationid".into();
+        names
+    }
+
+    /// A name made up by analogy with its neighbours (`agentconversationid`
+    /// beside `agentid`) gets the column it meant suggested and listed first,
+    /// though it sits far down the table. DataFusion 54 compares the
+    /// qualified names and suggests nothing; the first 32 names would never
+    /// have reached it.
+    #[test]
+    fn a_wide_schema_field_error_suggests_the_closest_name() {
+        let valid_fields: Vec<Column> = wide_event_columns()
+            .into_iter()
+            .map(|name| Column::new(Some(WIDE_TABLE), name))
+            .collect();
+        let err = DataFusionError::SchemaError(
+            Box::new(DfSchemaError::FieldNotFound {
+                field: Box::new(Column::new_unqualified("agentconversationid")),
+                valid_fields,
+            }),
+            Box::new(None),
+        );
+        let InfinoError::Query(msg) = datafusion_error(&err) else {
+            panic!("a schema error is the caller's query");
+        };
+        assert!(
+            msg.contains(&format!(
+                "No field named agentconversationid. Did you mean 'conversationid'? Valid fields are {WIDE_TABLE}.conversationid, "
+            )),
+            "suggests the meant column and lists it first: {msg}"
+        );
+        assert!(
+            msg.ends_with(&format!(
+                "and {} more.",
+                WIDE_COLUMNS - MAX_LISTED_VALID_FIELDS
+            )),
+            "still bounded: {msg}"
+        );
+    }
+
+    /// Nothing close enough, nothing suggested: the list is bounded as before.
+    #[test]
+    fn a_name_like_no_column_gets_no_suggestion() {
+        let names = wide_event_columns();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        assert_eq!(closest_name("ghost", &refs), None);
+        assert_eq!(
+            closest_name("ConversationID", &refs),
+            Some("conversationid")
+        );
+        assert_eq!(
+            closest_name("events.conversatonid", &refs),
+            Some("conversationid")
+        );
+    }
+
+    /// DataFusion 55 writes the list on a line of its own and makes its own
+    /// suggestion: the list is still bounded, and no second suggestion is
+    /// added.
+    #[test]
+    fn the_list_on_its_own_line_is_bounded_too() {
+        let names = wide_event_columns();
+        let list = names.join(", ");
+        let own = format!(
+            "No field named agentconversationid. Did you mean 'conversationid'?\nValid fields are {list}."
+        );
+        let capped = cap_valid_fields_list(own);
+        assert_eq!(
+            capped.matches(DID_YOU_MEAN).count(),
+            1,
+            "one suggestion: {capped}"
+        );
+        assert!(
+            capped.contains("?\nValid fields are conversationid, "),
+            "closest first: {capped}"
+        );
+        assert!(capped.ends_with(&format!(
+            "and {} more.",
+            WIDE_COLUMNS - MAX_LISTED_VALID_FIELDS
+        )));
+        // Without DataFusion's suggestion, ours goes before the list.
+        let bare = format!("No field named agentconversationid.\nValid fields are {list}.");
+        let ours = cap_valid_fields_list(bare);
+        assert!(
+            ours.starts_with("No field named agentconversationid. Did you mean 'conversationid'?\nValid fields are conversationid, "),
+            "suggests before the list: {ours}"
         );
     }
 

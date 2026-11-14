@@ -67,7 +67,6 @@ use std::{
     mem,
     num::NonZeroUsize,
     ops::Range,
-    panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
     str::from_utf8,
     sync::{
@@ -90,6 +89,7 @@ use blake3::Hasher as Blake3Hasher;
 use bytes::Bytes;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use datafusion::prelude::Expr;
+use fs4::{available_space, total_space};
 use futures::{
     future::{BoxFuture, try_join_all},
     stream::{self, FuturesUnordered, StreamExt},
@@ -123,7 +123,7 @@ use crate::{
     config::{self, CentroidAlignment, DrainConsolidate, ThreadCount, scratch_root},
     dynamic::rows_to_batch,
     memory::{ConnectionMemoryBudget, Reservation},
-    runtime_bridge::{bridge_on_runtime, bridge_sync_to_async, run_on_pool},
+    runtime_bridge::{bridge_on_runtime, bridge_sync_to_async, catch_panic, run_on_pool},
     runtime_metrics::{
         ingest::visible_array_bytes,
         op_stats::{self, OpStatsCollector, timed_kernel},
@@ -171,7 +171,10 @@ use crate::{
             reader::{VectorColumnConfig, VectorReader},
             rerank_codec::RerankCodec,
             rotation::RandomRotation,
-            spill::{MaterializedRowSpillState, MaterializedRowSpillWriter, SpilledCellRows},
+            spill::{
+                MaterializedRowSpillState, MaterializedRowSpillWriter, SpilledCellRows,
+                record_bytes,
+            },
         },
     },
     supertable::{
@@ -237,7 +240,7 @@ use crate::{
     },
     utils::{
         join::run_spawned,
-        nulls::{concat_sharing_nulls, populated_columns, take_sharing_nulls},
+        nulls::{concat_sharing_nulls, populated_columns, set_cell_bytes, take_sharing_nulls},
         trace::{self, detail_span, record},
     },
 };
@@ -829,32 +832,42 @@ fn split_target_bytes(options: &SupertableOptions) -> usize {
 }
 
 /// How many superfiles a commit of `buffer` becomes: [`superfiles_per_commit`]'s
-/// count from the buffered bytes, capped by the writer pool. The bytes are the
-/// Arrow footprint of every scalar and vector column the buffer holds (Arrow
-/// reports capacity, not logical bytes — fine for a fanout heuristic that is
-/// clamped to the pool anyway). The one count for a commit cut by rows
+/// count from the buffered bytes, capped by the writer pool. The bytes are
+/// what every scalar and vector column the buffer holds takes ([`visible_array_bytes`]),
+/// less the slots its null cells keep ([`set_cell_bytes`]). A wide, sparse batch's footprint is almost all such
+/// slots, and each superfile of a commit stores, describes and summarises
+/// every column its rows set, so cut by its footprint it would pay that
+/// per-column cost once per piece for pieces its values do not need. The
+/// one count for a commit cut by rows
 /// ([`commit_piece_bounds`]) and for a vector commit cut by cells
 /// ([`commit_shards_via_drain`]), so a small commit stays one superfile
 /// whichever path builds it.
 fn commit_superfile_count(buffer: &[BufferedBatch], options: &SupertableOptions) -> usize {
     let total_rows: usize = buffer.iter().map(|b| b.scalar.num_rows()).sum();
-    let buffered_bytes: usize = buffer
-        .iter()
-        .map(|b| {
-            b.scalar.get_array_memory_size()
-                + b.vectors
-                    .iter()
-                    .map(|v| v.get_array_memory_size())
-                    .sum::<usize>()
-        })
-        .sum();
     let n_threads = options.writer_pool.current_num_threads().max(1);
     superfiles_per_commit(
         total_rows,
-        buffered_bytes,
+        commit_buffered_bytes(buffer),
         n_threads,
         split_target_bytes(options),
     )
+}
+
+/// The bytes [`commit_superfile_count`] sizes a commit of `buffer` by. Each
+/// column is sized by the rows it holds, not by its buffers: every column of
+/// an IPC-decoded batch points into the one message buffer, so Arrow's
+/// buffer-based size counts that whole buffer once per column.
+fn commit_buffered_bytes(buffer: &[BufferedBatch]) -> usize {
+    buffer
+        .iter()
+        .map(|b| {
+            set_cell_bytes(&b.scalar)
+                + b.vectors
+                    .iter()
+                    .map(|v| usize::try_from(visible_array_bytes(v.as_ref())).unwrap_or(usize::MAX))
+                    .sum::<usize>()
+        })
+        .sum()
 }
 
 /// Where a commit of `buffer` is cut into superfiles: `bounds[i]..bounds[i + 1]`
@@ -2784,8 +2797,8 @@ impl SupertableWriter {
         // side by side, their dictionaries merged into the pieces' order,
         // then every piece built from its rows of them.
         let pool = &options.writer_pool;
-        fn seal_task_lost() -> BuildError {
-            BuildError::Store("a seal task ended without a result".into())
+        fn seal_task_lost(what: &'static str) -> BuildError {
+            BuildError::Store(format!("{what} did not finish (it panicked)"))
         }
         // What the budget granted the lanes past their thresholds is held
         // with the rest of their reservations, through the seal: the
@@ -2799,6 +2812,7 @@ impl SupertableWriter {
         let freeze_stats = stats.clone();
         let frozen: Vec<FrozenLane> = run_spawned(
             pool,
+            "lane freeze",
             lanes,
             move |_, lane| {
                 let _span = detail_span!(
@@ -2844,6 +2858,7 @@ impl SupertableWriter {
         let piece_stem = stem.map(str::to_owned);
         let sealed_pieces = run_spawned(
             pool,
+            "piece build",
             (0..n_pieces).collect(),
             move |i, _| {
                 let _span = detail_span!("piece.build", parent: &parent, piece = i).entered();
@@ -4016,7 +4031,7 @@ impl LiveLanes {
                 // A panic is caught here and reported as the lane's error: a
                 // pool with no panic handler aborts the process on a spawned
                 // job's panic.
-                let fed = catch_unwind(AssertUnwindSafe(|| {
+                let fed = catch_panic("live lane feed", || {
                     timed_kernel(&stats, || {
                         lane.builder.set_spill_threshold_bytes(threshold);
                         let mut base = first_row;
@@ -4048,8 +4063,8 @@ impl LiveLanes {
                         Ok::<(), BuildError>(())
                     })
                     .map(|()| lane)
-                }))
-                .unwrap_or_else(|_| Err(BuildError::Store("a live lane's feed panicked".into())));
+                })
+                .unwrap_or_else(|| Err(BuildError::Store("a live lane's feed panicked".into())));
                 // The receiver is gone only if the writer was dropped
                 // mid-feed; there is nobody left to tell.
                 let _ = tx.send((i, fed));
@@ -5023,12 +5038,16 @@ pub(super) fn prepare_superfile(
 pub(super) fn prepare_superfile_named(
     inner: &SupertableInner,
     manifest: &ManifestSnapshot,
-    shard: ShardOutput,
+    mut shard: ShardOutput,
     stem: Option<&str>,
 ) -> Result<Option<PreparedSuperfile>, BuildError> {
     if shard.n_docs == 0 {
         return Ok(None);
     }
+    // A merge folds its statistics batch by batch, and the tables grow as
+    // they fold: hold the superfile's tables to their budget, as a build
+    // from rows does as it counts them.
+    ScalarStatsAgg::fit_value_tables(&mut shard.scalar_stats);
 
     let uri = SuperfileUri::new_v4();
 
@@ -5806,8 +5825,109 @@ fn drain_epoch_id(
     hasher.finalize().to_hex().to_string()
 }
 
-fn drain_scratch_dir(epoch_id: &str) -> PathBuf {
-    scratch_root().join("infino-drain").join(epoch_id)
+/// Directory, under a table's scratch directory, of its drains' spills: one
+/// subdirectory per drain epoch.
+const DRAIN_SCRATCH_SUBDIR: &str = "infino-drain";
+
+/// Share of the scratch disk a drain leaves free, in divisor form
+/// (`total / this`): a batch whose spill would eat into it is not started.
+const DRAIN_SCRATCH_RESERVE_DIVISOR: u64 = 20;
+
+/// Where `options`' table keeps its drain epochs: beside its disk cache when
+/// it has one, else under the process scratch root.
+fn drain_scratch_parent(options: &SupertableOptions) -> PathBuf {
+    options.scratch_dir().join(DRAIN_SCRATCH_SUBDIR)
+}
+
+fn drain_scratch_dir(options: &SupertableOptions, epoch_id: &str) -> PathBuf {
+    drain_scratch_parent(options).join(epoch_id)
+}
+
+/// Where a drain epoch's spill lived before drains kept it with their table.
+fn legacy_drain_scratch_dir(epoch_id: &str) -> PathBuf {
+    scratch_root().join(DRAIN_SCRATCH_SUBDIR).join(epoch_id)
+}
+
+/// Make `scratch` the epoch's spill directory, created if absent. An epoch
+/// whose spill is still at the process scratch root, where drains kept it
+/// before, is moved here, so a drain stopped before an upgrade resumes
+/// instead of spilling its batches again. Then, when the table has a scratch
+/// directory of its own, every other epoch in it is removed: a table's
+/// checkpoint names only one epoch, so the rest can never resume. Under the
+/// shared process scratch root the other epochs may be other tables', so
+/// they are left alone.
+fn prepare_drain_scratch(
+    options: &SupertableOptions,
+    epoch_id: &str,
+    scratch: &Path,
+) -> Result<(), BuildError> {
+    let legacy = legacy_drain_scratch_dir(epoch_id);
+    if legacy != scratch && !scratch.exists() && legacy.exists() {
+        if let Some(parent) = scratch.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|error| BuildError::Store(format!("drain scratch create: {error}")))?;
+        }
+        match fs::rename(&legacy, scratch) {
+            Ok(()) => info!(
+                from = %legacy.display(),
+                to = %scratch.display(),
+                "[supertable drain] moved this drain's spill beside its table"
+            ),
+            Err(error) => warn!(
+                from = %legacy.display(),
+                %error,
+                "[supertable drain] could not move this drain's spill; its batches are spilled again"
+            ),
+        }
+    }
+    fs::create_dir_all(scratch)
+        .map_err(|error| BuildError::Store(format!("drain scratch create: {error}")))?;
+    if options.disk_cache.is_none() {
+        return Ok(());
+    }
+    let Ok(listing) = fs::read_dir(drain_scratch_parent(options)) else {
+        return Ok(());
+    };
+    for entry in listing.flatten() {
+        if entry.file_name() == epoch_id || !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        let path = entry.path();
+        match fs::remove_dir_all(&path) {
+            Ok(()) => info!(
+                path = %path.display(),
+                "[supertable drain] removed the spill of an earlier drain that cannot resume"
+            ),
+            Err(error) => {
+                warn!(path = %path.display(), %error, "[supertable drain] could not remove an earlier drain's spill")
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The free and total bytes of the filesystem holding `path`, read at its
+/// nearest existing ancestor. `None` when neither can be read.
+fn scratch_space(path: &Path) -> Option<(u64, u64)> {
+    let existing = path.ancestors().find(|dir| dir.exists())?;
+    Some((available_space(existing).ok()?, total_space(existing).ok()?))
+}
+
+/// Whether a batch spilling `needed` bytes fits on a scratch disk with `free`
+/// of `total` bytes free, leaving `total / DRAIN_SCRATCH_RESERVE_DIVISOR`
+/// free after it.
+fn drain_batch_fits(free: u64, total: u64, needed: u64) -> bool {
+    needed.saturating_add(total / DRAIN_SCRATCH_RESERVE_DIVISOR) <= free
+}
+
+/// Bytes one spilled row of `column` takes in a drain's spill, or `None` when
+/// `options` has no such vector column.
+fn drain_spill_row_bytes(options: &SupertableOptions, column: &str) -> Option<u64> {
+    let vc = options
+        .vector_columns
+        .iter()
+        .find(|vc| vc.column == column)?;
+    Some(record_bytes(vc.dim, vc.dim.div_ceil(u8::BITS as usize), vc.rerank_codec) as u64)
 }
 
 fn drain_local_checkpoint_path(scratch: &Path) -> PathBuf {
@@ -5866,6 +5986,31 @@ fn save_drain_local_checkpoint(
         .and_then(|directory| directory.sync_all())
         .map_err(|error| BuildError::Store(format!("drain checkpoint dir fsync: {error}")))?;
     Ok(())
+}
+
+/// The user superfiles the drain in progress on `hidden` reads, by id; empty
+/// when no drain is in progress. Compaction keeps them out of merges with
+/// any other superfile until that drain finishes (see
+/// `split_stats_by_drain_state`).
+pub(in crate::supertable) async fn pending_drain_sources(
+    hidden: &SupertableInner,
+) -> Result<HashSet<Uuid>, BuildError> {
+    let Some(state) = load_drain_remote_checkpoint(hidden).await? else {
+        return Ok(HashSet::new());
+    };
+    state
+        .checkpoint
+        .sources
+        .iter()
+        .map(|source| {
+            Uuid::parse_str(&source.superfile_id).map_err(|e| {
+                BuildError::Store(format!(
+                    "drain checkpoint names superfile {:?}: {e}",
+                    source.superfile_id
+                ))
+            })
+        })
+        .collect()
 }
 
 async fn load_drain_remote_checkpoint(
@@ -5969,6 +6114,122 @@ async fn create_drain_remote_checkpoint(
     };
     save_drain_remote_checkpoint(inner, &mut state).await?;
     Ok(state)
+}
+
+/// Share of the scratch disk's free space one drain may fill with its spill:
+/// the spill takes half, and the cell build writes each cell's output beside
+/// its spill until the cell is done, which the other half holds.
+const DRAIN_SPILL_FREE_SPACE_DIVISOR: u64 = 2;
+
+/// What held a drain to fewer rows than were waiting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DrainRowLimit {
+    /// `vector.drain_max_rows`.
+    Configured,
+    /// What the free space on the scratch disk can spill.
+    ScratchDisk,
+}
+
+impl DrainRowLimit {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Configured => "vector.drain_max_rows",
+            Self::ScratchDisk => "scratch disk free space",
+        }
+    }
+}
+
+/// The most rows a new drain takes on: `configured` when it is set (`0` is
+/// unset), or what `free_bytes / DRAIN_SPILL_FREE_SPACE_DIVISOR` holds at
+/// `spill_row_bytes` per spilled row, whichever is less. `free_bytes` is
+/// `None` when the scratch disk cannot be read, which leaves only the
+/// configured limit. `None` when nothing limits the drain.
+fn drain_row_limit(
+    configured: u64,
+    free_bytes: Option<u64>,
+    spill_row_bytes: u64,
+) -> Option<(u64, DrainRowLimit)> {
+    let disk = free_bytes.map(|free| {
+        (
+            free / DRAIN_SPILL_FREE_SPACE_DIVISOR / spill_row_bytes.max(1),
+            DrainRowLimit::ScratchDisk,
+        )
+    });
+    let configured = (configured > 0).then_some((configured, DrainRowLimit::Configured));
+    match (configured, disk) {
+        (Some(c), Some(d)) => Some(if c.0 <= d.0 { c } else { d }),
+        (one, other) => one.or(other),
+    }
+}
+
+/// The oldest of `sources` (sorted by `birth_version`) a drain of at most
+/// `limit` rows takes, counting `copies_per_row` spilled copies of each row.
+/// Whole commit versions only: commit A marks every version up to the
+/// drain's newest as drained, so a version split across two drains would be
+/// marked drained with part of its rows left out. The first version is
+/// always taken, however many rows it has, so every drain makes progress.
+/// Returns the taken sources and the rows they hold.
+fn take_drain_sources(
+    sources: Vec<Arc<SuperfileEntry>>,
+    limit: u64,
+    copies_per_row: f32,
+) -> (Vec<Arc<SuperfileEntry>>, u64) {
+    debug_assert!(
+        sources
+            .windows(2)
+            .all(|w| w[0].birth_version <= w[1].birth_version)
+    );
+    let spilled = |rows: u64| (rows as f64 * f64::from(copies_per_row.max(1.0))) as u64;
+    let mut taken: Vec<Arc<SuperfileEntry>> = Vec::with_capacity(sources.len());
+    let mut rows = 0u64;
+    let mut sources = sources.into_iter().peekable();
+    while let Some(first) = sources.peek() {
+        let version = first.birth_version;
+        let mut group = Vec::new();
+        while let Some(source) = sources.next_if(|s| s.birth_version == version) {
+            group.push(source);
+        }
+        let group_rows: u64 = group.iter().map(|s| s.n_docs).sum();
+        if !taken.is_empty() && spilled(rows.saturating_add(group_rows)) > limit {
+            break;
+        }
+        rows = rows.saturating_add(group_rows);
+        taken.extend(group);
+    }
+    (taken, rows)
+}
+
+/// The sources a new drain epoch of `column` takes from `undrained` (sorted
+/// by `birth_version`): the oldest commits up to the row limit of
+/// [`drain_row_limit`], read from `options` and the scratch disk.
+fn new_drain_epoch_sources(
+    options: &SupertableOptions,
+    column: &str,
+    undrained: Vec<Arc<SuperfileEntry>>,
+) -> Vec<Arc<SuperfileEntry>> {
+    let Some(spill_row_bytes) = drain_spill_row_bytes(options, column) else {
+        return undrained;
+    };
+    let free_bytes = scratch_space(&drain_scratch_parent(options)).map(|(free, _)| free);
+    let Some((limit, why)) = drain_row_limit(options.drain_max_rows, free_bytes, spill_row_bytes)
+    else {
+        return undrained;
+    };
+    let waiting_superfiles = undrained.len();
+    let waiting_rows: u64 = undrained.iter().map(|s| s.n_docs).sum();
+    let (taken, taken_rows) = take_drain_sources(undrained, limit, drain_replica_target_factor());
+    if taken.len() < waiting_superfiles {
+        info!(
+            taken_superfiles = taken.len(),
+            waiting_superfiles,
+            taken_rows,
+            waiting_rows,
+            limit_rows = limit,
+            limit = why.label(),
+            "[supertable drain] taking the oldest commits up to the row limit; the rest wait for the next drain"
+        );
+    }
+    taken
 }
 
 fn make_drain_batches(
@@ -6275,7 +6536,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             .filter(|source| drained.contains(source.birth_version))
             .count();
         if n_drained == remote_state.checkpoint.sources.len() {
-            let scratch = drain_scratch_dir(&remote_state.checkpoint.epoch_id);
+            let scratch = drain_scratch_dir(&user_inner.options, &remote_state.checkpoint.epoch_id);
             if let Err(error) = fs::remove_dir_all(&scratch)
                 && error.kind() != io::ErrorKind::NotFound
             {
@@ -6347,6 +6608,10 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                 .cmp(&right.birth_version)
                 .then_with(|| left.superfile_id.cmp(&right.superfile_id))
         });
+        // A new epoch takes the oldest commits up to the row limit; the rest
+        // wait for the next drain. A resumed epoch above follows its
+        // checkpoint, so the limit only ever applies here.
+        let selected = new_drain_epoch_sources(&user_inner.options, &column, selected);
         let source_refs: Vec<DrainCheckpointSource> = selected
             .iter()
             .map(|entry| drain_checkpoint_source(entry))
@@ -6410,9 +6675,13 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
     // The batch budget bounds source materialization. Kmeans rows accumulate
     // in per-cell disk spills; complete cell IVFs and final worker shards are
     // built only after every source batch is durable.
-    let drain_scratch = drain_scratch_dir(&remote_state.checkpoint.epoch_id);
-    fs::create_dir_all(&drain_scratch)
-        .map_err(|error| BuildError::Store(format!("drain scratch create: {error}")))?;
+    let drain_scratch = drain_scratch_dir(&user_inner.options, &remote_state.checkpoint.epoch_id);
+    prepare_drain_scratch(
+        &user_inner.options,
+        &remote_state.checkpoint.epoch_id,
+        &drain_scratch,
+    )?;
+    let spill_row_bytes = drain_spill_row_bytes(&user_inner.options, &column);
     let mut local_checkpoint =
         load_drain_local_checkpoint(&drain_scratch, &remote_state.checkpoint.epoch_id)?
             .unwrap_or_else(|| DrainLocalCheckpoint::new(remote_state.checkpoint.epoch_id.clone()));
@@ -6638,6 +6907,26 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
     for (batch_idx, (_, batch_sources)) in batches.iter().enumerate() {
         if batch_idx < local_checkpoint.batches_done {
             continue;
+        }
+        // Stop at the last checkpoint rather than fill the disk: everything
+        // else on it (the caches, other tables' work) fails once it is full.
+        // The drain resumes here once there is room.
+        if let (Some(row_bytes), Some((free, total))) =
+            (spill_row_bytes, scratch_space(&drain_scratch))
+        {
+            let batch_rows: u64 = batch_sources.iter().map(|s| s.n_docs).sum();
+            let needed = (batch_rows as f64
+                * f64::from(drain_replica_target_factor())
+                * row_bytes as f64) as u64;
+            if !drain_batch_fits(free, total, needed) {
+                return Err(BuildError::Store(format!(
+                    "drain stopped before batch {} of {n_batches}: its spill needs {needed} bytes and \
+                     the scratch disk has {free} of {total} free, with {} kept in reserve; it \
+                     resumes from this batch once there is room",
+                    batch_idx + 1,
+                    total / DRAIN_SCRATCH_RESERVE_DIVISOR,
+                )));
+            }
         }
         let batch_t0 = std::time::Instant::now();
         // Timeline diagnostic only: snapshot GETs for this batch without
@@ -7276,7 +7565,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                     (cal, clusters_for_freeze)
                 })
                 .await
-                .map_err(|e| BuildError::Store(format!("width-law freeze: {e}")))?;
+                .map_err(|e| BuildError::Store(e.to_string()))?;
             width_law = Some(frozen);
             running_clusters = clusters_back;
         }
@@ -7313,6 +7602,12 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                                 cell = *cell_id,
                                 rows = spill.n_rows(),
                                 score_ms = tracing::field::Empty,
+                                score_pool_queries = tracing::field::Empty,
+                                score_read_ms = tracing::field::Empty,
+                                score_estimate_ms = tracing::field::Empty,
+                                score_exact_ms = tracing::field::Empty,
+                                score_trim_ms = tracing::field::Empty,
+                                score_merge_ms = tracing::field::Empty,
                                 sample_ms = tracing::field::Empty,
                                 train_ms = tracing::field::Empty,
                                 n_cent = tracing::field::Empty,
@@ -7327,8 +7622,14 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                             // about to read anyway (before remove_files).
                             if let Some(cal) = width_law_ref {
                                 let score_t0 = time::Instant::now();
-                                cal.score_cell(*cell_id, spill)?;
+                                let profile = cal.score_cell(*cell_id, spill)?;
                                 record("score_ms", score_t0.elapsed().as_millis() as u64);
+                                record("score_pool_queries", profile.pool_queries as u64);
+                                record("score_read_ms", profile.read.as_millis() as u64);
+                                record("score_estimate_ms", profile.estimate.as_millis() as u64);
+                                record("score_exact_ms", profile.exact.as_millis() as u64);
+                                record("score_trim_ms", profile.trim.as_millis() as u64);
+                                record("score_merge_ms", profile.merge.as_millis() as u64);
                             }
                             let cell = build_spilled_packed_cell_from_rows(
                                 scratch,
@@ -10001,7 +10302,7 @@ pub(in crate::supertable) async fn split_overflow_cell_batch(
         move || plan_split_wave(plan_inputs, &plan_clusters, metric, modality_d),
     )
     .await
-    .map_err(|e| BuildError::Store(format!("cell split batch planning: {e}")))?;
+    .map_err(|e| BuildError::Store(e.to_string()))?;
     let mut planned: Vec<PlannedCellSplit> = Vec::new();
     for item in planned_or_noop {
         match item {
@@ -10079,7 +10380,7 @@ pub(in crate::supertable) async fn split_overflow_cell_batch(
         },
     )
     .await
-    .map_err(|e| BuildError::Store(format!("cell split batch child builds: {e}")))??;
+    .map_err(|e| BuildError::Store(e.to_string()))??;
     if built.iter().all(|b| b.prepared.is_empty()) {
         noop_cells.extend(built.iter().map(|b| b.cell));
         return Ok(SplitBatchOutcome::no_op_cells(noop_cells));
@@ -10493,7 +10794,7 @@ pub(in crate::supertable) async fn split_repack_bulk(
             })
             .instrument(plan_span)
             .await
-            .map_err(|e| BuildError::Store(format!("repack wave planning: {e}")))?;
+            .map_err(|e| BuildError::Store(e.to_string()))?;
         let mut planned: Vec<PlannedCellSplit> = Vec::new();
         for item in planned_or_noop {
             match item {
@@ -10620,7 +10921,7 @@ pub(in crate::supertable) async fn split_repack_bulk(
             })
             .instrument(pack_span)
             .await
-            .map_err(|e| BuildError::Store(format!("repack wave child packs: {e}")))??;
+            .map_err(|e| BuildError::Store(e.to_string()))??;
 
         for split in repacked {
             for parent in &split.parent_ids {
@@ -10694,7 +10995,7 @@ pub(in crate::supertable) async fn split_repack_bulk(
         })
         .instrument(assemble_span)
         .await
-        .map_err(|e| BuildError::Store(format!("repack shard assembly: {e}")))??;
+        .map_err(|e| BuildError::Store(e.to_string()))??;
     let mut new_entries_by_cell: Vec<(u32, Arc<SuperfileEntry>)> = Vec::new();
     for (shard, prepared_shard) in &prepared {
         if let Some(cells) = bucket_cells.get(shard) {
@@ -11353,7 +11654,7 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
     })
     .instrument(detail_span!("recalibrate.freeze"))
     .await
-    .map_err(|e| BuildError::Store(format!("recalibration freeze: {e}")))?;
+    .map_err(|e| BuildError::Store(e.to_string()))?;
     // Centroid-router fanout calibration rides the SAME scan: build the router
     // over the settled fine centroids (byte-identical to the settle-published
     // one — same superfile × flat node order, `HnswParams::default`) and select
@@ -11527,7 +11828,7 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
             })
             .instrument(shortlist_span.clone())
             .await
-            .map_err(|e| BuildError::Store(format!("recalibration shortlist: {e}")))?;
+            .map_err(|e| BuildError::Store(e.to_string()))?;
             pool_ms += pool_t0.elapsed().as_millis() as u64;
         }
     }
@@ -11608,7 +11909,7 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
                 })
                 .instrument(rescore_span.clone())
                 .await
-                .map_err(|e| BuildError::Store(format!("recalibration rescore: {e}")))?;
+                .map_err(|e| BuildError::Store(e.to_string()))?;
                 pool_ms += pool_t0.elapsed().as_millis() as u64;
             }
         }
@@ -11648,7 +11949,7 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
             })
             .instrument(rescore_span.clone())
             .await
-            .map_err(|e| BuildError::Store(format!("recalibration depth observation: {e}")))?;
+            .map_err(|e| BuildError::Store(e.to_string()))?;
         }
         depth_ms += depth_t0.elapsed().as_millis() as u64;
     }
@@ -11670,7 +11971,7 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
         cal.finish(&clusters, fanout_ctx)
     })
     .await
-    .map_err(|e| BuildError::Store(format!("recalibration finish: {e}")))?
+    .map_err(|e| BuildError::Store(e.to_string()))?
     else {
         return Ok(false);
     };
@@ -12572,6 +12873,8 @@ pub(in crate::supertable) async fn stamp_term_index(
     let reuse_path = reuse.path().to_path_buf();
     // Local bytes per slice byte the call's folds have measured, in thousandths.
     let disk_per_slice = Arc::new(AtomicU64::new(0));
+    // Tier object lengths the call's folds stored, for its streamed folds.
+    let tier_lens = Arc::new(Mutex::new(HashMap::new()));
     // The next fold's inputs, fetched while this one merges and uploads.
     let prefetch = Prefetch::default();
     // One renumbering fold per call. Commits that land while it runs are
@@ -12597,6 +12900,7 @@ pub(in crate::supertable) async fn stamp_term_index(
                 &prefetch,
                 &disk_per_slice,
             );
+            let tier_lens = &tier_lens;
             let (kept_batch, kept_fold, renumbered) = (&kept_batch, &kept_fold, &renumbered);
             async move {
                 published.store(false, Ordering::Relaxed);
@@ -12695,8 +12999,8 @@ pub(in crate::supertable) async fn stamp_term_index(
                         ) && term_index::fold_disk_bound(reuse_path, disk_per_slice, 0)
                             .is_some_and(|bound| bound >= fold_bytes.saturating_mul(2));
                         let downloaded = Arc::new(Notify::new());
-                        if fold_budget.prefetches() {
-                            let next = term_index::layers_after(
+                        let next = match fold_budget.prefetches() {
+                            true => term_index::layers_after(
                                 &root,
                                 &fold,
                                 &live,
@@ -12704,7 +13008,20 @@ pub(in crate::supertable) async fn stamp_term_index(
                                 fold_budget,
                                 renumber,
                                 before_tiers,
-                            );
+                            ),
+                            false => Vec::new(),
+                        };
+                        // A fold that will stream reads nothing from local disk.
+                        let local_milli = disk_per_slice.load(Ordering::Relaxed);
+                        if !next.is_empty()
+                            && !fold_budget.streams(
+                                &next,
+                                fold.ranges(),
+                                fold.ranges() * term_index::FOLD_RANGES_PER_THREAD,
+                                local_milli,
+                                policy.one_mark_slices_per_range,
+                            )
+                        {
                             *prefetch.0.lock().expect("prefetch") =
                                 Some(spawn(term_index::prefetch_layers(
                                     Arc::clone(storage),
@@ -12724,6 +13041,8 @@ pub(in crate::supertable) async fn stamp_term_index(
                             keep_uploads: keep,
                             disk_per_slice_milli: Some(Arc::clone(disk_per_slice)),
                             downloaded: Some(Arc::clone(&downloaded)),
+                            stream: Some(fold_budget),
+                            tier_lens: Arc::clone(tier_lens),
                         };
                         let renumbers = fold.renumbers();
                         info!(
@@ -12733,6 +13052,10 @@ pub(in crate::supertable) async fn stamp_term_index(
                             ranges = fold.ranges(),
                             renumbers,
                             budget_mib = fold_budget.memory_bytes >> 20,
+                            cache_mib = fold_budget.cache_bytes >> 20,
+                            input_mib = fold_bytes >> 20,
+                            slices = root.layers[fold.run()].iter().map(|layer| layer.slices.len()).sum::<usize>(),
+                            local_milli,
                             "term index fold plan"
                         );
                         let output_at = fold.run().start;
@@ -13072,14 +13395,23 @@ pub(in crate::supertable) async fn stamp_slow_vector_state(
     // rebuilt for the new membership. The inner `Option` is absent when the
     // router is off or a step failed.
     let centroid_graph_ref: Mutex<Option<(String, Option<RoutingRef>)>> = Mutex::new(None);
+    // What the last attempt published. Other writers move the pointer without
+    // changing what this stamp writes (a mutation records deleted ids in the
+    // hidden table), so a retry often builds the same bytes and need not
+    // upload them again.
+    let published_before: Mutex<Option<slow_vector_state::PublishedState>> = Mutex::new(None);
     stamp_within(
         inner,
         &storage,
         "slow vector-state",
         CommitRetryBudget::of_table(inner),
         |old| {
-            let (storage, pending_drain, centroid_graph_ref) =
-                (&storage, &pending_drain, &centroid_graph_ref);
+            let (storage, pending_drain, centroid_graph_ref, published_before) = (
+                &storage,
+                &pending_drain,
+                &centroid_graph_ref,
+                &published_before,
+            );
             async move {
                 let entries = old.get_all_superfiles();
                 if entries.is_empty() && pending_drain.is_none() {
@@ -13093,28 +13425,21 @@ pub(in crate::supertable) async fn stamp_slow_vector_state(
                 // generation's section.
                 let previous_section =
                     previous_centroid_section(&inner.options, storage.as_ref(), &old).await;
-                let published = match pending_drain.as_ref() {
-                    Some(pending) => {
-                        slow_vector_state::write_state_with_pending_drain(
-                            storage.as_ref(),
-                            inner.options.metadata_disk_cache.as_ref(),
-                            entries,
-                            pending,
-                            previous_section.as_deref(),
-                        )
-                        .await
-                    }
-                    None => {
-                        slow_vector_state::write_state(
-                            storage.as_ref(),
-                            inner.options.metadata_disk_cache.as_ref(),
-                            entries,
-                            previous_section.as_deref(),
-                        )
-                        .await
-                    }
-                }
+                let before = published_before
+                    .lock()
+                    .expect("published state cache")
+                    .clone();
+                let published = slow_vector_state::write_state_for_stamp(
+                    storage.as_ref(),
+                    inner.options.metadata_disk_cache.as_ref(),
+                    entries,
+                    pending_drain.as_ref(),
+                    previous_section.as_deref(),
+                    before.as_ref(),
+                )
+                .await
                 .map_err(|e| BuildError::Store(e.to_string()))?;
+                *published_before.lock().expect("published state cache") = Some(published.clone());
                 // The `hnsw` graph is built and stamped ONLY in the membership
                 // commit (Commit A), atomically with `drained_ranges`. This
                 // settle carries the prior ref forward untouched and NEVER
@@ -14676,6 +15001,7 @@ mod tests {
     use std::{
         fs,
         future::pending,
+        panic::{AssertUnwindSafe, catch_unwind},
         sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
@@ -14686,8 +15012,8 @@ mod tests {
 
     use arrow::{compute::concat_batches, ipc::reader::StreamReader};
     use arrow_array::{
-        Array, Decimal128Array, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch,
-        StringArray, StructArray,
+        Array, ArrayRef, Decimal128Array, FixedSizeListArray, Float32Array, Float64Array,
+        Int32Array, LargeStringArray, RecordBatch, StringArray, StructArray,
     };
     use arrow_schema::{DataType, Field, Fields, Schema};
     use datafusion::prelude::{col, lit};
@@ -16079,9 +16405,12 @@ mod tests {
         )
         .await;
         assert!(first.is_err(), "first drain must stop at the failpoint");
-        let local = load_drain_local_checkpoint(&drain_scratch_dir(&epoch_id), &epoch_id)
-            .expect("load local checkpoint")
-            .expect("local checkpoint");
+        let local = load_drain_local_checkpoint(
+            &drain_scratch_dir(&table.inner().options, &epoch_id),
+            &epoch_id,
+        )
+        .expect("load local checkpoint")
+        .expect("local checkpoint");
         assert_eq!(local.batches_done, 1);
 
         drain_user_superfiles_to_hidden_cells(
@@ -16091,7 +16420,7 @@ mod tests {
         .await
         .expect("resume drain");
         assert!(
-            !drain_scratch_dir(&epoch_id).exists(),
+            !drain_scratch_dir(&table.inner().options, &epoch_id).exists(),
             "successful final CAS removes local checkpoint scratch"
         );
         assert!(
@@ -16101,6 +16430,348 @@ mod tests {
                 .is_none(),
             "settled slow-CAS state contains no pending drain"
         );
+    }
+
+    /// A source with `rows` rows committed at `birth_version`.
+    fn drain_source(id: u128, birth_version: u64, rows: u64) -> Arc<SuperfileEntry> {
+        let mut entry = (*fp_entry(id)).clone();
+        entry.birth_version = birth_version;
+        entry.n_docs = rows;
+        Arc::new(entry)
+    }
+
+    #[test]
+    fn a_drain_row_limit_is_the_smaller_of_config_and_disk() {
+        // 1,000 bytes free holds 500 at the spill's half share: 5 rows of 100.
+        assert_eq!(
+            drain_row_limit(0, Some(1_000), 100),
+            Some((5, DrainRowLimit::ScratchDisk))
+        );
+        assert_eq!(
+            drain_row_limit(3, Some(1_000), 100),
+            Some((3, DrainRowLimit::Configured))
+        );
+        assert_eq!(
+            drain_row_limit(9, Some(1_000), 100),
+            Some((5, DrainRowLimit::ScratchDisk))
+        );
+        assert_eq!(
+            drain_row_limit(7, None, 100),
+            Some((7, DrainRowLimit::Configured))
+        );
+        assert_eq!(drain_row_limit(0, None, 100), None, "nothing limits it");
+        assert_eq!(
+            drain_row_limit(0, Some(0), 100),
+            Some((0, DrainRowLimit::ScratchDisk)),
+            "a full disk limits it to the first commit"
+        );
+    }
+
+    #[test]
+    fn a_drain_takes_whole_commits_oldest_first_up_to_its_row_limit() {
+        let ids = |taken: &[Arc<SuperfileEntry>]| -> Vec<u128> {
+            taken.iter().map(|s| s.superfile_id.as_u128()).collect()
+        };
+        // Version 3 is one commit of two superfiles.
+        let sources = || {
+            vec![
+                drain_source(1, 2, 10),
+                drain_source(2, 3, 10),
+                drain_source(3, 3, 10),
+                drain_source(4, 5, 10),
+            ]
+        };
+        let (taken, rows) = take_drain_sources(sources(), 30, 1.0);
+        assert_eq!((ids(&taken), rows), (vec![1, 2, 3], 30));
+        // 25 rows would split version 3, so the drain stops before it.
+        let (taken, rows) = take_drain_sources(sources(), 25, 1.0);
+        assert_eq!((ids(&taken), rows), (vec![1], 10));
+        // The first commit is taken even when it alone passes the limit.
+        let (taken, rows) = take_drain_sources(sources(), 0, 1.0);
+        assert_eq!((ids(&taken), rows), (vec![1], 10));
+        // Everything fits: every source, in order.
+        let (taken, rows) = take_drain_sources(sources(), u64::MAX, 1.0);
+        assert_eq!((ids(&taken), rows), (vec![1, 2, 3, 4], 40));
+        // Replicas spill extra copies: 1.5 copies per row turn 30 rows into
+        // 45 spilled, past a limit of 40.
+        let (taken, rows) = take_drain_sources(sources(), 40, 1.5);
+        assert_eq!((ids(&taken), rows), (vec![1], 10));
+        let (taken, _) = take_drain_sources(Vec::new(), 10, 1.0);
+        assert!(taken.is_empty());
+    }
+
+    /// A drain held to one commit's rows drains one commit per run, oldest
+    /// first, and the drained ranges grow by exactly that commit each time,
+    /// until every row is in the hidden index.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_row_limited_drain_finishes_over_several_runs() {
+        const COMMITS: usize = 3;
+        let directory = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(directory.path()).expect("provider"));
+        let table = Supertable::create(
+            options_title_emb_serial(COMMIT_AS_DRAIN_TEST_DIM)
+                .with_storage(Arc::clone(&storage))
+                .with_drain_max_rows(COMMIT_AS_DRAIN_TEST_ROWS as u64),
+        )
+        .expect("create");
+        for _ in 0..COMMITS {
+            let mut writer = table.writer().expect("writer");
+            writer
+                .append(&build_axis_vector_batch(
+                    COMMIT_AS_DRAIN_TEST_ROWS,
+                    COMMIT_AS_DRAIN_TEST_DIM,
+                ))
+                .expect("append");
+            writer.commit().expect("commit");
+        }
+        let hidden = table
+            .inner()
+            .vector_index_table
+            .as_ref()
+            .expect("hidden table")
+            .clone();
+        let mut versions: Vec<u64> = table
+            .inner()
+            .manifest
+            .load_full()
+            .get_all_superfiles_loaded()
+            .await
+            .expect("user sources")
+            .iter()
+            .map(|s| s.birth_version)
+            .collect();
+        versions.sort_unstable();
+        versions.dedup();
+        assert_eq!(versions.len(), COMMITS);
+
+        for run in 1..=COMMITS {
+            drain_user_superfiles_to_hidden_cells(
+                Arc::clone(table.inner()),
+                Arc::clone(hidden.inner()),
+            )
+            .await
+            .expect("drain");
+            let drained = hidden.inner().manifest.load_full().get_drained_ranges();
+            for (i, version) in versions.iter().enumerate() {
+                assert_eq!(
+                    drained.contains(*version),
+                    i < run,
+                    "run {run}: commit {i} (version {version})"
+                );
+            }
+        }
+        let hidden_rows: u64 = hidden
+            .inner()
+            .manifest
+            .load_full()
+            .get_all_superfiles_loaded()
+            .await
+            .expect("hidden superfiles")
+            .iter()
+            .map(|s| s.n_docs)
+            .sum();
+        assert_eq!(hidden_rows, (COMMITS * COMMIT_AS_DRAIN_TEST_ROWS) as u64);
+    }
+
+    /// Compaction that runs while a row-limited drain is stopped partway must
+    /// leave that drain's sources alone. Merged with a later commit, a source
+    /// would hand the merged file a version the drain then marks drained, and
+    /// the later rows would never reach the hidden index; merged with another
+    /// of its sources, it would leave the manifest, and the resumed drain,
+    /// which looks its sources up there, would fail on every attempt. The
+    /// drain here has two sources, so both can happen. Every row lands.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn compaction_during_a_stopped_drain_keeps_every_row() {
+        const COMMITS: usize = 5;
+        let directory = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(directory.path()).expect("provider"));
+        // Two commits per drain, one superfile per batch.
+        let table = Supertable::create(
+            options_title_emb_serial(COMMIT_AS_DRAIN_TEST_DIM)
+                .with_storage(Arc::clone(&storage))
+                .with_drain_batch_superfiles(1)
+                .with_drain_max_rows(2 * COMMIT_AS_DRAIN_TEST_ROWS as u64),
+        )
+        .expect("create");
+        for _ in 0..COMMITS {
+            let mut writer = table.writer().expect("writer");
+            writer
+                .append(&build_axis_vector_batch(
+                    COMMIT_AS_DRAIN_TEST_ROWS,
+                    COMMIT_AS_DRAIN_TEST_DIM,
+                ))
+                .expect("append");
+            writer.commit().expect("commit");
+        }
+        let hidden = table
+            .inner()
+            .vector_index_table
+            .as_ref()
+            .expect("hidden table")
+            .clone();
+
+        // Stop the first drain after its batch, before it commits: its epoch
+        // stays pending.
+        let (_, epoch_id) = current_drain_epoch(&table).await;
+        inject_drain_test_failure(epoch_id, DrainTestFailurePhase::AfterBatch, 1);
+        drain_user_superfiles_to_hidden_cells(
+            Arc::clone(table.inner()),
+            Arc::clone(hidden.inner()),
+        )
+        .await
+        .expect_err("the drain stops at the failpoint");
+        let pending = pending_drain_sources(hidden.inner())
+            .await
+            .expect("pending");
+        assert_eq!(pending.len(), 2, "the drain took the two oldest commits");
+
+        // Compact everything that may be merged while the drain is stopped.
+        table
+            .compact_async(&CompactionSettings {
+                min_fill_percent: 100,
+                min_superfiles_for_merge: 2,
+                ..CompactionSettings::default()
+            })
+            .await
+            .expect("compact");
+        let after = table
+            .inner()
+            .manifest
+            .load_full()
+            .get_all_superfiles_loaded()
+            .await
+            .expect("user superfiles");
+        for id in &pending {
+            assert!(
+                after.iter().any(|s| s.superfile_id == *id),
+                "the stopped drain's source must not be merged away"
+            );
+        }
+        assert!(
+            after.len() < COMMITS,
+            "the later commits do merge with each other"
+        );
+
+        // Resume, then drain whatever is left.
+        for _ in 0..COMMITS {
+            drain_user_superfiles_to_hidden_cells(
+                Arc::clone(table.inner()),
+                Arc::clone(hidden.inner()),
+            )
+            .await
+            .expect("drain");
+        }
+        let drained = hidden.inner().manifest.load_full().get_drained_ranges();
+        assert!(
+            after.iter().all(|s| drained.contains(s.birth_version)),
+            "every user superfile is drained"
+        );
+        let hidden_rows: u64 = hidden
+            .inner()
+            .manifest
+            .load_full()
+            .get_all_superfiles_loaded()
+            .await
+            .expect("hidden superfiles")
+            .iter()
+            .map(|s| s.n_docs)
+            .sum();
+        assert_eq!(hidden_rows, (COMMITS * COMMIT_AS_DRAIN_TEST_ROWS) as u64);
+    }
+
+    #[test]
+    fn a_drain_batch_fits_only_with_the_reserve_left_free() {
+        // A 1,000-byte disk keeps 50 in reserve.
+        assert!(drain_batch_fits(500, 1_000, 450));
+        assert!(!drain_batch_fits(500, 1_000, 451));
+        assert!(drain_batch_fits(50, 1_000, 0));
+        assert!(!drain_batch_fits(49, 1_000, 0));
+    }
+
+    /// A table with a disk cache keeps its drain spill beside it. A drain
+    /// moves in an epoch's spill from where drains used to keep it, resumes
+    /// from it, and removes the spills of earlier epochs that cannot resume.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_drain_keeps_its_spill_with_its_table() {
+        const COMMITS: usize = 3;
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path().join("store")).expect("provider"));
+        let cache = DiskCacheStore::new_unpinned(
+            Arc::clone(&storage),
+            DiskCacheConfig {
+                cache_root: dir.path().join("cache"),
+                ..Default::default()
+            },
+        )
+        .expect("cache store");
+        let table = Supertable::create(
+            options_title_emb_serial(COMMIT_AS_DRAIN_TEST_DIM)
+                .with_storage(Arc::clone(&storage))
+                .with_disk_cache(cache)
+                .with_drain_batch_superfiles(1),
+        )
+        .expect("create");
+        for _ in 0..COMMITS {
+            let mut writer = table.writer().expect("writer");
+            writer
+                .append(&build_axis_vector_batch(
+                    COMMIT_AS_DRAIN_TEST_ROWS,
+                    COMMIT_AS_DRAIN_TEST_DIM,
+                ))
+                .expect("append");
+            writer.commit().expect("commit");
+        }
+        let options = &table.inner().options;
+        assert!(
+            drain_scratch_parent(options).starts_with(dir.path().join("cache")),
+            "the spill lives beside the table's cache"
+        );
+        let (hidden, epoch_id) = current_drain_epoch(&table).await;
+
+        // Stop after one batch, then put that spill where drains used to
+        // keep it, as a process from before the move would have left it.
+        inject_drain_test_failure(epoch_id.clone(), DrainTestFailurePhase::AfterBatch, 1);
+        drain_user_superfiles_to_hidden_cells(
+            Arc::clone(table.inner()),
+            Arc::clone(hidden.inner()),
+        )
+        .await
+        .expect_err("the drain stops at the failpoint");
+        let here = drain_scratch_dir(options, &epoch_id);
+        let legacy = legacy_drain_scratch_dir(&epoch_id);
+        fs::create_dir_all(legacy.parent().expect("parent")).expect("legacy parent");
+        fs::rename(&here, &legacy).expect("move the spill to the old place");
+        // And an earlier epoch's spill that can never resume.
+        let stale = drain_scratch_parent(options).join("an-earlier-epoch");
+        fs::create_dir_all(&stale).expect("stale epoch");
+        fs::write(stale.join("cell-0.rows"), b"rows").expect("stale spill");
+
+        drain_user_superfiles_to_hidden_cells(
+            Arc::clone(table.inner()),
+            Arc::clone(hidden.inner()),
+        )
+        .await
+        .expect("resume");
+        assert!(
+            !legacy.exists(),
+            "the old spill was moved in, not left behind"
+        );
+        assert!(!stale.exists(), "the earlier epoch's spill is removed");
+        assert!(!here.exists(), "a finished drain removes its own spill");
+        let hidden_rows: u64 = hidden
+            .inner()
+            .manifest
+            .load_full()
+            .get_all_superfiles_loaded()
+            .await
+            .expect("hidden superfiles")
+            .iter()
+            .map(|s| s.n_docs)
+            .sum();
+        assert_eq!(hidden_rows, (COMMITS * COMMIT_AS_DRAIN_TEST_ROWS) as u64);
     }
 
     #[test]
@@ -16256,10 +16927,13 @@ mod tests {
             .await
             .expect("restore recorded layout");
         assert_eq!(
-            load_drain_local_checkpoint(&drain_scratch_dir(&epoch_id), &epoch_id)
-                .expect("load local checkpoint")
-                .expect("local checkpoint")
-                .batches_done,
+            load_drain_local_checkpoint(
+                &drain_scratch_dir(&table.inner().options, &epoch_id),
+                &epoch_id
+            )
+            .expect("load local checkpoint")
+            .expect("local checkpoint")
+            .batches_done,
             1,
             "the refused resume must not touch the finished batch"
         );
@@ -16271,7 +16945,7 @@ mod tests {
         .await
         .expect("resume under a different batch size");
         assert!(
-            !drain_scratch_dir(&epoch_id).exists(),
+            !drain_scratch_dir(&table.inner().options, &epoch_id).exists(),
             "the recorded epoch is the one that completed"
         );
         assert!(
@@ -16398,7 +17072,7 @@ mod tests {
         .await
         .expect("resume on another pool width");
         assert!(
-            !drain_scratch_dir(&epoch_id).exists(),
+            !drain_scratch_dir(&table.inner().options, &epoch_id).exists(),
             "the recorded epoch is the one that completed"
         );
         assert!(
@@ -16480,7 +17154,8 @@ mod tests {
             .expect("checkpointed shard remains live through GC");
 
         // Simulate replacement on a node without the local spill/cell files.
-        fs::remove_dir_all(drain_scratch_dir(&epoch_id)).expect("drop local scratch");
+        fs::remove_dir_all(drain_scratch_dir(&table.inner().options, &epoch_id))
+            .expect("drop local scratch");
         drain_user_superfiles_to_hidden_cells(
             Arc::clone(table.inner()),
             Arc::clone(hidden.inner()),
@@ -16844,6 +17519,11 @@ mod tests {
                 .cmp(&right.birth_version)
                 .then_with(|| left.superfile_id.cmp(&right.superfile_id))
         });
+        let column = user_manifest
+            .get_global_vector_index()
+            .expect("global vector index")
+            .column;
+        let sources = new_drain_epoch_sources(&table.inner().options, &column, sources);
         let batch_cfg = drain_batch_superfiles(&table.inner().options);
         let budget = if batch_cfg < 0 {
             usize::MAX
@@ -18024,6 +18704,149 @@ mod tests {
     }
 
     // ---- rayon-shard parallelism -------------------------------------
+
+    /// Rows in the IPC-decoded commit-sizing test: a typical append's shape,
+    /// scaled down.
+    const IPC_SIZED_ROWS: usize = 2048;
+    /// Vector width in the IPC-decoded commit-sizing tests.
+    const IPC_SIZED_DIM: i32 = 768;
+    /// Writer pool width in the IPC-decoded append test, wider than the
+    /// superfile count its batch splits into.
+    const IPC_APPEND_POOL: usize = 16;
+    /// Split target, in MiB, in the IPC-decoded append test: small enough
+    /// that its batch spans several superfiles.
+    const IPC_APPEND_SPLIT_MB: u64 = 1;
+
+    #[test]
+    fn an_ipc_decoded_commit_is_sized_by_its_own_bytes() {
+        // An append arrives as one Arrow IPC message, and every column decodes
+        // as a slice of that one message buffer. The commit must be sized by
+        // the bytes the batch holds, not by the shared buffer once per column.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("url", DataType::Utf8, false),
+            Field::new("dump", DataType::Utf8, false),
+            Field::new("score", DataType::Float64, false),
+            Field::new("tokens", DataType::Int32, false),
+            Field::new(
+                "embedding",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float32, false)),
+                    IPC_SIZED_DIM,
+                ),
+                false,
+            ),
+        ]));
+        let text = |prefix: &str| -> ArrayRef {
+            Arc::new(StringArray::from_iter_values(
+                (0..IPC_SIZED_ROWS).map(|i| format!("{prefix}-{i:08}")),
+            ))
+        };
+        let values = Float32Array::from_iter_values(
+            (0..IPC_SIZED_ROWS * IPC_SIZED_DIM as usize).map(|i| i as f32),
+        );
+        let embedding = FixedSizeListArray::new(
+            Arc::new(Field::new("item", DataType::Float32, false)),
+            IPC_SIZED_DIM,
+            Arc::new(values),
+            None,
+        );
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                text("id"),
+                text("https://example.com/page"),
+                text("CC-MAIN"),
+                Arc::new(Float64Array::from_iter_values(
+                    (0..IPC_SIZED_ROWS).map(|i| i as f64),
+                )),
+                Arc::new(Int32Array::from_iter_values(
+                    (0..IPC_SIZED_ROWS).map(|i| i as i32),
+                )),
+                Arc::new(embedding),
+            ],
+        )
+        .expect("batch");
+
+        let decoded = ipc_round_trip(&batch);
+
+        let vector_index = decoded.schema().index_of("embedding").expect("embedding");
+        let vectors = Arc::new(
+            decoded
+                .column(vector_index)
+                .as_any()
+                .downcast_ref::<FixedSizeListArray>()
+                .expect("fixed-size list")
+                .values()
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .expect("f32 values")
+                .clone(),
+        );
+        let mut scalar = decoded.clone();
+        scalar.remove_column(vector_index);
+        let buffered = [BufferedBatch {
+            scalar,
+            vectors: vec![vectors],
+        }];
+
+        // What the batch holds: its own bytes, before any IPC round trip.
+        let own_bytes: usize = batch
+            .columns()
+            .iter()
+            .map(|c| c.to_data().get_slice_memory_size().expect("slice size"))
+            .sum();
+        let measured = commit_buffered_bytes(&buffered);
+        assert_eq!(
+            measured, own_bytes,
+            "commit sized by bytes the batch does not hold"
+        );
+    }
+
+    #[test]
+    fn an_ipc_decoded_append_commits_as_many_superfiles_as_the_batch_itself() {
+        // The same rows appended as built and as decoded from one IPC message
+        // must commit to the same number of superfiles, through the whole
+        // append path: resolving the batch, minting `_id`, and moving the
+        // vectors out of the scalar batch.
+        let dim = IPC_SIZED_DIM as usize;
+        let schema = schema_id_title_emb(dim);
+        let titles = LargeStringArray::from_iter_values(
+            (0..IPC_SIZED_ROWS).map(|i| format!("https://example.com/page-{i:08}")),
+        );
+        let values =
+            Float32Array::from_iter_values((0..IPC_SIZED_ROWS * dim).map(|i| (i % 97) as f32));
+        let DataType::FixedSizeList(item, _) = fixed_list_f32(dim) else {
+            unreachable!("fixed_list_f32 builds a fixed-size list");
+        };
+        let embedding = FixedSizeListArray::new(item, IPC_SIZED_DIM, Arc::new(values), None);
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(titles), Arc::new(embedding)],
+        )
+        .expect("batch");
+
+        let superfiles_after_append = |batch: &RecordBatch| -> usize {
+            let options = options_with_vector(dim)
+                .with_writer_pool(writer_pool_with(IPC_APPEND_POOL))
+                .with_superfile_buffer_split_mb(IPC_APPEND_SPLIT_MB);
+            let table = Supertable::create(options).expect("create");
+            let mut writer = table.writer().expect("writer");
+            writer.append(batch).expect("append");
+            writer.commit().expect("commit");
+            table.reader().expect("reader").n_superfiles()
+        };
+        let built = superfiles_after_append(&batch);
+        let decoded = superfiles_after_append(&ipc_round_trip(&batch));
+        assert!(
+            built > 1,
+            "the batch must span several superfiles for the count to mean anything, got {built}"
+        );
+        assert_eq!(
+            decoded, built,
+            "an IPC-decoded append committed to {decoded} superfiles, the batch itself to {built}"
+        );
+    }
 
     #[test]
     fn commit_superfile_count_follows_bytes_not_pool_size() {

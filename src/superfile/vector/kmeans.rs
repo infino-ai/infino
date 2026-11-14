@@ -30,8 +30,8 @@ use rand::{RngExt, SeedableRng, rngs::StdRng};
 use rayon::prelude::*;
 
 use crate::superfile::vector::distance::{
-    Metric, add_f32_to_f64_acc, f64_acc_mean_into_f32, nearest_centroid_transposed,
-    transpose_centroids_cluster_major,
+    CENTROID_ASSIGN_ROWS_PER_TASK, Metric, add_f32_to_f64_acc, f64_acc_mean_into_f32,
+    nearest_centroid_transposed_rows, transpose_centroids_cluster_major,
 };
 
 /// Offset added to a column's `rot_seed` to seed k-means. Keeps the
@@ -227,16 +227,8 @@ fn lloyd_refine(
         // kernel (one transpose per iteration; at small k the transpose is
         // proportionally tiny). Single scan owner, no scalar branch; argmin
         // tie-breaking matches the naive loop (lowest index wins).
-        assignments = {
-            let transposed = transpose_centroids_cluster_major(&centroids, k, dim);
-            (0..n)
-                .into_par_iter()
-                .map(|d| {
-                    let v = &vectors[d * dim..(d + 1) * dim];
-                    nearest_centroid_transposed(Metric::L2Sq, v, &transposed, k, dim).0
-                })
-                .collect()
-        };
+        let transposed = transpose_centroids_cluster_major(&centroids, k, dim);
+        assign_to_transposed_centroids(vectors, &transposed, dim, k, &mut assignments);
 
         // Update — per-thread (sums, counts) accumulators reduced
         // pairwise. Sums in f64 for numeric stability; counts in u64
@@ -337,12 +329,35 @@ pub(crate) fn assign_to_centroids(
         return;
     }
     let transposed = transpose_centroids_cluster_major(centroids, k, dim);
+    assign_to_transposed_centroids(vectors, &transposed, dim, k, assignments);
+}
+
+/// [`assign_to_centroids`] over a table already built by
+/// [`transpose_centroids_cluster_major`]. Callers that assign many chunks
+/// against the same centroids transpose once and call this per chunk.
+///
+/// # Panics
+///
+/// - `assignments.len() != vectors.len() / dim`
+pub(crate) fn assign_to_transposed_centroids(
+    vectors: &[f32],
+    transposed: &[f32],
+    dim: usize,
+    k: usize,
+    assignments: &mut [u32],
+) {
+    assert_eq!(
+        assignments.len(),
+        vectors.len() / dim,
+        "assign_to_transposed_centroids: one assignment per row"
+    );
     assignments
-        .par_iter_mut()
+        .par_chunks_mut(CENTROID_ASSIGN_ROWS_PER_TASK)
         .enumerate()
-        .for_each(|(d, slot)| {
-            let v = &vectors[d * dim..(d + 1) * dim];
-            *slot = nearest_centroid_transposed(Metric::L2Sq, v, &transposed, k, dim).0;
+        .for_each(|(task, slots)| {
+            let start = task * CENTROID_ASSIGN_ROWS_PER_TASK;
+            let rows = &vectors[start * dim..(start + slots.len()) * dim];
+            nearest_centroid_transposed_rows(Metric::L2Sq, rows, transposed, k, dim, slots);
         });
 }
 
@@ -483,5 +498,43 @@ mod tests {
     #[should_panic(expected = "not multiple of dim")]
     fn panics_on_unaligned_input() {
         kmeans(&[1.0; 7], 8, 1, 5, 0);
+    }
+
+    /// Chunked assignment against one shared transposed table gives the
+    /// same result as assigning all rows at once. k is not a multiple of
+    /// the 16-centroid block, and a duplicate centroid plants exact ties.
+    #[test]
+    fn chunked_transposed_assignment_matches_whole() {
+        const DIM: usize = 12;
+        const K: usize = 37;
+        const N: usize = 1_000;
+        const CHUNK_ROWS: usize = 96;
+        const SEED: u64 = 11;
+        let mut rng = StdRng::seed_from_u64(SEED);
+        let vectors: Vec<f32> = (0..N * DIM).map(|_| rng.random_range(-1.0..1.0)).collect();
+        let mut centroids: Vec<f32> = (0..K * DIM).map(|_| rng.random_range(-1.0..1.0)).collect();
+        // Centroid K-1 copies centroid 3: rows nearest to it must keep 3.
+        centroids.copy_within(3 * DIM..4 * DIM, (K - 1) * DIM);
+        // Rows equal to centroid 3 hit the tie exactly.
+        let mut vectors = vectors;
+        vectors[..DIM].copy_from_slice(&centroids[3 * DIM..4 * DIM]);
+
+        let mut whole = vec![0u32; N];
+        assign_to_centroids(&vectors, &centroids, DIM, K, &mut whole);
+
+        let transposed = transpose_centroids_cluster_major(&centroids, K, DIM);
+        let mut chunked = vec![0u32; N];
+        for (rows, out) in vectors
+            .chunks(CHUNK_ROWS * DIM)
+            .zip(chunked.chunks_mut(CHUNK_ROWS))
+        {
+            assign_to_transposed_centroids(rows, &transposed, DIM, K, out);
+        }
+        assert_eq!(chunked, whole);
+        assert_eq!(whole[0], 3, "a tie keeps the lowest index");
+        assert!(
+            !whole.contains(&((K - 1) as u32)),
+            "the duplicate centroid never wins"
+        );
     }
 }

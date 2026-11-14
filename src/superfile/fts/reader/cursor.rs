@@ -10,7 +10,7 @@ use std::{
     collections::HashMap,
     ops::Range,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, PoisonError,
         atomic::{AtomicUsize, Ordering as AtomicOrdering},
     },
 };
@@ -307,6 +307,10 @@ impl TermMeta {
 /// bound scale its slots were decoded at; only terms of at least
 /// [`BLOCK_TABLE_CACHE_MIN_BLOCKS`] blocks are kept, up to
 /// [`BLOCK_TABLE_CACHE_MAX_BLOCKS`] in all.
+///
+/// A poisoned lock is read through: each change is one map insert, so a
+/// panic elsewhere while it was held leaves the map whole, and failing every
+/// later query on this reader would be worse.
 #[derive(Debug, Default)]
 pub(crate) struct BlockTableCache {
     tables: Mutex<HashMap<(u64, u32), (Arc<[BlockMeta]>, f32)>>,
@@ -330,7 +334,7 @@ impl BlockTableCache {
     fn get(&self, key: (u64, u32)) -> Option<(Arc<[BlockMeta]>, f32)> {
         self.tables
             .lock()
-            .expect("block table cache lock")
+            .unwrap_or_else(PoisonError::into_inner)
             .get(&key)
             .cloned()
     }
@@ -342,7 +346,7 @@ impl BlockTableCache {
         {
             return;
         }
-        let mut tables = self.tables.lock().expect("block table cache lock");
+        let mut tables = self.tables.lock().unwrap_or_else(PoisonError::into_inner);
         if tables.insert(key, (Arc::clone(table), term_max)).is_none() {
             self.blocks.fetch_add(n, AtomicOrdering::Relaxed);
         }
@@ -2037,6 +2041,8 @@ impl TermCursor {
 
 #[cfg(test)]
 mod tests {
+    use std::thread;
+
     use bytes::Bytes;
     use rand::{RngExt, SeedableRng, rngs::StdRng};
     use rand_distr::{Distribution, LogNormal};
@@ -2051,6 +2057,34 @@ mod tests {
             reader::{FtsReader, QueryIdf},
         },
     };
+
+    #[test]
+    fn a_poisoned_block_table_cache_still_serves() {
+        // A cache whose lock a panicking thread held, then a table put in
+        // and read back.
+        // - The table goes in and comes back out.
+        // This test pins that one panic does not fail every later query on
+        // the reader that owns the cache.
+        let cache = BlockTableCache::default();
+        let poisoner = thread::scope(|s| {
+            s.spawn(|| {
+                let _held = cache.tables.lock();
+                panic!("poison the lock");
+            })
+            .join()
+        });
+        assert!(poisoner.is_err() && cache.tables.is_poisoned());
+        let block = BlockMeta {
+            last_doc_id: 0,
+            block_byte_offset: 0,
+            block_byte_end: 0,
+            block_max_bm25: 1.0,
+        };
+        let table: Arc<[BlockMeta]> = vec![block; BLOCK_TABLE_CACHE_MIN_BLOCKS].into();
+        cache.put((0, 1), &table, 1.0);
+        let (got, _) = cache.get((0, 1)).expect("the table was cached");
+        assert!(Arc::ptr_eq(&got, &table));
+    }
 
     #[test]
     fn seek_sorted_lands_where_a_partition_point_does() {

@@ -71,7 +71,7 @@ use crate::{
             SuperfileHit,
             dispatch::apply_tombstone_filter,
             exec::common::{
-                arg_to_string, arg_to_usize, output_schema_with_score, resolve_hits,
+                Arity, arg_to_string, arg_to_usize, output_schema_with_score, resolve_hits,
                 top_k_statistics, traced_tvf,
             },
             vector::{MissingRow, place_for_scalar_resolve},
@@ -84,9 +84,12 @@ use crate::{
 pub(crate) const GRAPH_WALK_UDTF: &str = "graph_walk";
 /// SQL name of the ranked walk.
 pub(crate) const GRAPH_RANK_UDTF: &str = "graph_rank";
-/// Argument count after the catalog adapter has taken the table name:
-/// `(seed_table, seed_ids, hops, k)`.
-const GRAPH_ARG_COUNT: usize = 4;
+/// The arguments after the catalog adapter has taken the table name.
+const GRAPH_ARITY: Arity = Arity {
+    min: 4,
+    max: 4,
+    arguments: "seed_table, seed_ids, hops, k",
+};
 /// Most hops a walk may take from its seeds. The walk reaches every node
 /// within the hops before its rows are filtered to the target table, so the
 /// hops bound how much of a connected graph one statement touches; past
@@ -155,11 +158,11 @@ impl TableFunctionImpl for GraphFunc {
     fn call_with_args(&self, args: TableFunctionArgs) -> DfResult<Arc<dyn TableProvider>> {
         let name = self.traversal.name();
         let args = args.exprs();
-        if args.len() != GRAPH_ARG_COUNT {
-            return Err(DataFusionError::Plan(format!(
-                "{name} expects {} arguments (table, seed_table, seed_ids, hops, k), got {}",
-                GRAPH_ARG_COUNT + 1,
-                args.len() + 1
+        if !GRAPH_ARITY.takes(args.len()) {
+            return Err(DataFusionError::Plan(GRAPH_ARITY.expects(
+                name,
+                args.len(),
+                &["table"],
             )));
         }
         let seed_table = arg_to_string(&args[0], &format!("{name} seed_table"))?;

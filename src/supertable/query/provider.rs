@@ -115,7 +115,6 @@ use crate::{
             reader::{BoolMode, ContainsRows, MatchWork},
             tokenize::{Tokenizer, unique_tokens},
         },
-        range::KeyKind,
     },
     supertable::{
         SuperfileEntry, SupertableReader,
@@ -126,17 +125,19 @@ use crate::{
         },
         query::{
             candidate::{
-                CandidatePlan, ExactFilter, exact_filter, like_prune_leaves, single_range,
+                CandidatePlan, ExactFilter, PoolFile, Resolved, SelectionGate, exact_filter,
+                like_prune_leaves, single_range,
             },
+            deleted_stats::DeletedStatsCache,
             df_object_store::SuperfileObjectStore,
             exec::{
                 cached_scan_exec::{
                     CachedFile, CachedScanExec, RowGroupFilter, has_columns, projected_schema,
                 },
-                common::{BoundPredicate, PushedPredicate, take_rows, unqualified},
+                common::{BoundPredicate, PushedPredicate, take_file_columns, unqualified},
                 metered_exec::MeteredExec,
             },
-            fts::{IndexedSuperfile, memos_from_plan_locations, plan_locations_for},
+            fts::plan_locations_for,
             nan_bounds::without_nan_blind_bounds,
             prune::{PruneLeaf, select_superfiles},
             range_counts::{RangeBucket, RangeCounts},
@@ -343,6 +344,11 @@ const PUSHDOWN_MIN_ROWS: u64 = 4096;
 /// plain scan.
 const PUSHDOWN_MAX_DENSITY: f64 = 0.5;
 
+/// Most rows an index may select: [`PUSHDOWN_MAX_FRACTION`] of all, at least [`PUSHDOWN_MIN_ROWS`].
+fn pushdown_rows(n_docs: u64) -> u64 {
+    ((n_docs as f64 * PUSHDOWN_MAX_FRACTION) as u64).max(PUSHDOWN_MIN_ROWS)
+}
+
 /// Gate for a `LIKE` token that needs a superfile's whole dictionary
 /// walked (a suffix or infix, or an `ILIKE` token that may be spelled
 /// with `ſ`): the walk is taken only when the column holds at least this
@@ -402,6 +408,10 @@ pub(crate) struct SupertableProvider {
     /// rewrite's idempotency guard: a restricted provider is never
     /// rewritten again.
     segment_filter: Option<HashSet<Uuid>>,
+    /// What the scan of a restricted provider stands for, shown on its node
+    /// in `EXPLAIN`: how many superfiles statistics answered and why the
+    /// scanned ones were not. Set only by the covered/residual rewrite.
+    scan_note: Option<Arc<str>>,
     /// Query-independent scan setup, filled lazily per superfile. Residual
     /// providers share this cache with their parent because both pin the same
     /// manifest and immutable files.
@@ -430,15 +440,21 @@ pub(crate) struct SupertableProvider {
     /// range holds, counted from the range index rather than read
     /// ([`Self::range_count_exec`]).
     count_range: Option<CountedRange>,
+    /// Set by [`Self::reading_rows`]: the scan reads only these rows of
+    /// this one superfile, deleted or not.
+    read_rows: Option<(Arc<SuperfileEntry>, Arc<RoaringBitmap>)>,
+    /// The statistics of superfiles' deleted rows, kept for the table (see
+    /// [`DeletedStatsCache`]).
+    deleted_stats: Arc<DeletedStatsCache>,
 }
 
 /// What [`SupertableProvider::count_range`] carries: the column, its id
-/// and key kind, and the interval of keys the `WHERE` holds, exactly.
+/// and type, and the interval of keys the `WHERE` holds, exactly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CountedRange {
     pub(crate) column: String,
     pub(crate) field: FieldId,
-    pub(crate) kind: KeyKind,
+    pub(crate) data_type: DataType,
     pub(crate) lo: u64,
     pub(crate) hi: u64,
 }
@@ -515,6 +531,7 @@ impl SupertableProvider {
             tombstones_read: None,
             store_url: unique_store_url(),
             segment_filter: None,
+            scan_note: None,
             prepared_scan_files: Arc::new(DashMap::new()),
             scan_store: Arc::new(SuperfileObjectStore::new()),
             scan_footers: Arc::new(DashMap::new()),
@@ -522,6 +539,8 @@ impl SupertableProvider {
             value_count_carry: Arc::default(),
             top_k: None,
             count_range: None,
+            read_rows: None,
+            deleted_stats: Arc::default(),
         }
     }
 
@@ -530,6 +549,36 @@ impl SupertableProvider {
     pub(crate) fn with_value_count_carry(mut self, carry: Arc<ValueCountCarry>) -> Self {
         self.value_count_carry = carry;
         self
+    }
+
+    /// This provider keeping deleted rows' statistics in the table's
+    /// `cache`, so a statement reads only the rows deleted since one before.
+    pub(crate) fn with_deleted_stats(mut self, cache: Arc<DeletedStatsCache>) -> Self {
+        self.deleted_stats = cache;
+        self
+    }
+
+    /// The statistics of superfiles' deleted rows kept for the table.
+    pub(crate) fn deleted_stats(&self) -> &DeletedStatsCache {
+        &self.deleted_stats
+    }
+
+    /// Clone of this provider whose scan reads `rows` of superfile `entry`
+    /// and nothing else, deleted or not: the deleted rows whose statistics
+    /// correct the superfile's own. Shares the parent's snapshot, prepared
+    /// files and scan store, as [`Self::restricted_to`] does.
+    pub(crate) fn reading_rows(
+        &self,
+        entry: Arc<SuperfileEntry>,
+        rows: Arc<RoaringBitmap>,
+    ) -> Self {
+        Self {
+            segment_filter: Some([entry.superfile_id].into_iter().collect()),
+            top_k: None,
+            count_range: None,
+            read_rows: Some((entry, rows)),
+            ..self.sibling()
+        }
     }
 
     /// Clone of this provider restricted to `segments` — used by the
@@ -545,6 +594,13 @@ impl SupertableProvider {
             count_range: None,
             ..self.sibling()
         }
+    }
+
+    /// This provider with `note` shown on its scan's node in `EXPLAIN` (see
+    /// [`Self::scan_note`]).
+    pub(crate) fn with_scan_note(mut self, note: String) -> Self {
+        self.scan_note = Some(Arc::from(note));
+        self
     }
 
     /// Clone of this provider for a scan that feeds `ORDER BY hint.column
@@ -587,7 +643,7 @@ impl SupertableProvider {
     /// The rows of superfile `superfile_id` deleted as of `now`, empty with
     /// no tombstone overlay; under [`Self::reading_tombstones_once`], the
     /// rows its first read found.
-    fn deleted_rows(
+    pub(crate) fn deleted_rows(
         &self,
         superfile_id: Uuid,
         now: Instant,
@@ -625,11 +681,11 @@ impl SupertableProvider {
         let conjuncts: Vec<Expr> = split_conjunction(predicate).into_iter().cloned().collect();
         let column = predicate.column_refs().into_iter().next()?.name.clone();
         let range_cols = self.manifest.table_schema().range_column_types();
-        let (field, kind, lo, hi) = single_range(&conjuncts, &column, &range_cols)?;
+        let (field, data_type, lo, hi) = single_range(&conjuncts, &column, &range_cols)?;
         Some(CountedRange {
             column,
             field,
-            kind,
+            data_type,
             lo,
             hi,
         })
@@ -649,6 +705,7 @@ impl SupertableProvider {
             tombstones_read: self.tombstones_read.clone(),
             store_url: unique_store_url(),
             segment_filter: self.segment_filter.clone(),
+            scan_note: self.scan_note.clone(),
             prepared_scan_files: Arc::clone(&self.prepared_scan_files),
             scan_store: Arc::clone(&self.scan_store),
             scan_footers: Arc::clone(&self.scan_footers),
@@ -656,7 +713,15 @@ impl SupertableProvider {
             value_count_carry: Arc::clone(&self.value_count_carry),
             top_k: self.top_k.clone(),
             count_range: self.count_range.clone(),
+            read_rows: self.read_rows.clone(),
+            deleted_stats: Arc::clone(&self.deleted_stats),
         }
+    }
+
+    /// A clone sharing this provider's snapshot, caches and reads of deleted
+    /// rows: one to read through later, as this provider would.
+    pub(crate) fn share(&self) -> Self {
+        self.sibling()
     }
 
     /// `true` when this provider is a covered/residual residual scan —
@@ -668,19 +733,6 @@ impl SupertableProvider {
     /// The pinned manifest snapshot (covered/residual rewrite input).
     pub(crate) fn manifest(&self) -> &Arc<ManifestSnapshot> {
         &self.manifest
-    }
-
-    /// Whether `entry` currently has a clean (empty, resolvable from
-    /// cache) tombstone view — the precondition for answering any part
-    /// of an aggregate from its manifest statistics.
-    pub(crate) fn entry_is_clean(&self, entry: &SuperfileEntry) -> bool {
-        match self.tombstone_cache.as_ref() {
-            None => true,
-            Some(cache) => cache
-                .bitmap_for(entry.superfile_id, Instant::now())
-                .map(|bitmap| bitmap.is_empty())
-                .unwrap_or(false),
-        }
     }
 
     /// Exact table-wide frequencies for one low-cardinality column, empty
@@ -794,7 +846,7 @@ impl SupertableProvider {
         if let Some(bound) = bound.filter(|bound| bound.len() <= gate) {
             let checked = bound - tombstones;
             let verified = check
-                .rows_holding(&prepared.reader, &checked, pool, batch_size)
+                .rows_holding(&self.manifest, &prepared.reader, &checked, batch_size)
                 .await?;
             self.count_rows_checked(checked.len(), verified.len());
             return Ok((verified, work));
@@ -810,9 +862,14 @@ impl SupertableProvider {
         let budget = &self.manifest.options.connection_memory_budget;
         let mut leaf_rows: HashMap<(&str, &str), ContainsRows> = HashMap::new();
         for (column, needles) in by_column {
+            // A superfile written before a rename keys its dictionary by
+            // the column's old name.
+            let file_column = prepared
+                .reader
+                .column_alias(self.manifest.field_id(column), column);
             let (rows, column_work) = prepared
                 .reader
-                .contains_rows(column, &needles, Some(pool), Some(budget))
+                .contains_rows(file_column, &needles, Some(pool), Some(budget))
                 .await
                 .map_err(QueryError::from)?;
             // One result per needle, or the zip below would pair needles
@@ -852,7 +909,7 @@ impl SupertableProvider {
         }
         rows.doubtful -= tombstones;
         let verified = check
-            .rows_holding(&prepared.reader, &rows.doubtful, pool, batch_size)
+            .rows_holding(&self.manifest, &prepared.reader, &rows.doubtful, batch_size)
             .await?;
         self.count_rows_checked(rows.doubtful.len(), verified.len());
         Ok((rows.proven | verified, work))
@@ -971,6 +1028,43 @@ impl SupertableProvider {
         RangeCounts::new(self.sibling(), buckets)
     }
 
+    /// Load every part of a manifest whose resident view is incomplete, and
+    /// warm the delete views of all its superfiles, so a covered aggregate
+    /// finds the whole table in memory when the plan is optimized.
+    pub(crate) async fn load_every_part(&self) -> Result<(), QueryError> {
+        if self.manifest.complete_flat_superfiles().is_some() {
+            return Ok(());
+        }
+        let entries = self
+            .manifest
+            .get_all_superfiles_loaded()
+            .await
+            .map_err(QueryError::ManifestLoad)?;
+        self.prefetch_tombstones(&entries, Instant::now()).await;
+        Ok(())
+    }
+
+    /// Whether any listed superfile may have deleted rows, from the
+    /// tombstone sequence view alone: no sidecar is read.
+    pub(crate) fn may_have_deletes(&self) -> bool {
+        let Some(cache) = self.tombstone_cache.as_ref() else {
+            return false;
+        };
+        self.manifest.resident_superfiles().is_none_or(|listed| {
+            listed
+                .iter()
+                .any(|entry| cache.may_have_tombstones(entry.superfile_id))
+        })
+    }
+
+    /// Read every listed superfile's deleted rows into the tombstone cache,
+    /// so the statistics rewrite's lookups of them are cache reads.
+    pub(crate) async fn prefetch_listed_tombstones(&self) {
+        if let Some(listed) = self.manifest.resident_superfiles() {
+            self.prefetch_tombstones(&listed, Instant::now()).await;
+        }
+    }
+
     /// Warm every one of `survivors`' tombstone bitmaps in one batched fetch,
     /// mirroring the bm25 / vector fan-out (see `SidecarCache::prefetch`), so
     /// each later `bitmap_for` resolves from cache.
@@ -1000,11 +1094,12 @@ impl SupertableProvider {
                     let prepared = prepared.await?;
                     let reader = &prepared.reader;
                     let tombstones = self.deleted_rows(entry.superfile_id, now)?;
-                    let (field, kind, lo, hi) = (range.field, range.kind, range.lo, range.hi);
+                    let (field, data_type, lo, hi) =
+                        (range.field, &range.data_type, range.lo, range.hi);
                     let count = match tombstones.is_empty() {
-                        true => reader.range_count(field, kind, lo, hi).await,
+                        true => reader.range_count(field, data_type, lo, hi).await,
                         false => reader
-                            .range_rows(field, kind, lo, hi, Some(pool))
+                            .range_rows(field, data_type, lo, hi, Some(pool))
                             .await
                             .map(|rows| rows.map(|rows| (rows - tombstones.as_ref()).len())),
                     };
@@ -1082,9 +1177,11 @@ impl SupertableProvider {
             return Ok(None);
         };
         let range_cols = self.manifest.table_schema().range_column_types();
-        let Some((field, kind, lo, hi)) = single_range(filters, &hint.column, &range_cols) else {
+        let Some((field, data_type, lo, hi)) = single_range(filters, &hint.column, &range_cols)
+        else {
             return Ok(None);
         };
+        let data_type = &data_type;
         let in_flight = self.manifest.options.superfiles_in_flight;
         let ends = try_join_bounded(
             survivors.iter().cloned().map(|entry| {
@@ -1094,7 +1191,14 @@ impl SupertableProvider {
                     let tombstones = self.deleted_rows(entry.superfile_id, now)?;
                     let ends = prepared
                         .reader
-                        .range_ends(field, kind, (lo, hi), hint.k, hint.descending, &tombstones)
+                        .range_ends(
+                            field,
+                            data_type,
+                            (lo, hi),
+                            hint.k,
+                            hint.descending,
+                            &tombstones,
+                        )
                         .await
                         .map_err(QueryError::from)?;
                     Ok::<_, DataFusionError>(ends.map(|ends| (entry.superfile_id, ends)))
@@ -1139,7 +1243,7 @@ impl SupertableProvider {
                 true => (cut, hi),
             };
             return self
-                .range_rows_live(survivors, field, kind, through, now)
+                .range_rows_live(survivors, field, data_type, through, now)
                 .await
                 .map(Some);
         }
@@ -1172,7 +1276,7 @@ impl SupertableProvider {
         &self,
         survivors: &[Arc<SuperfileEntry>],
         field: FieldId,
-        kind: KeyKind,
+        data_type: &DataType,
         (lo, hi): (u64, u64),
         now: Instant,
     ) -> DfResult<HashMap<Uuid, RoaringBitmap>> {
@@ -1186,7 +1290,7 @@ impl SupertableProvider {
                     let tombstones = self.deleted_rows(entry.superfile_id, now)?;
                     let rows = prepared
                         .reader
-                        .range_rows(field, kind, lo, hi, Some(pool))
+                        .range_rows(field, data_type, lo, hi, Some(pool))
                         .await
                         .map_err(QueryError::from)?
                         .ok_or_else(|| {
@@ -1356,14 +1460,16 @@ impl SupertableProvider {
         let total_rows: u64 = entries.iter().map(|e| e.n_docs).sum();
         let now = Instant::now();
 
-        // Tombstone view: resolved-from-cache only (this path must be
-        // sync and I/O-free). A missing/stale view degrades to
-        // Inexact, never blocks.
+        // Tombstone view: the deleted rows this provider reads (see
+        // [`Self::deleted_rows`]), so a statement reading each superfile's
+        // once counts the rows its own scan and statistics leave out, not
+        // a newer delete's. The scan prefetched them, so these are cache
+        // reads. A view that can't be read degrades to Inexact.
         let mut deleted: u64 = 0;
         let mut views_resolved = true;
-        if let Some(cache) = self.tombstone_cache.as_ref() {
+        if self.tombstone_cache.is_some() {
             for entry in entries {
-                match cache.bitmap_for(entry.superfile_id, now) {
+                match self.deleted_rows(entry.superfile_id, now) {
                     Ok(bitmap) => deleted += bitmap.len(),
                     Err(_) => {
                         views_resolved = false;
@@ -1616,6 +1722,9 @@ struct ExactCheck {
     predicate: BoundPredicate,
     /// Those columns' names, in the bound schema's order.
     columns: Vec<String>,
+    /// The bound schema: the table's types for those columns, which a
+    /// superfile's rows are adapted to before the check.
+    schema: SchemaRef,
 }
 
 impl ExactCheck {
@@ -1650,18 +1759,20 @@ impl ExactCheck {
             filter: ExactFilter::And(conjuncts),
             predicate,
             columns,
+            schema: bound_schema,
         }))
     }
 
     /// Of `rows` in `reader`'s superfile, the ones the conjunction holds
     /// for, read from their stored text `batch_size` rows at a time. The
     /// ids are drawn from `rows` one batch at a time, never copied out
-    /// whole.
+    /// whole. Each column is read by its field id, so a superfile written
+    /// before a rename gives the column the name now refers to.
     async fn rows_holding(
         &self,
+        manifest: &ManifestSnapshot,
         reader: &Arc<SuperfileReader>,
         rows: &RoaringBitmap,
-        pool: &ThreadPool,
         batch_size: usize,
     ) -> DfResult<RoaringBitmap> {
         let names: Vec<&str> = self.columns.iter().map(String::as_str).collect();
@@ -1672,8 +1783,9 @@ impl ExactCheck {
             if chunk.is_empty() {
                 break;
             }
-            let chunk = chunk.as_slice();
-            let batch = take_rows(reader, chunk, &names, pool).await?;
+            let batch =
+                take_file_columns(manifest, reader, chunk.clone(), &names, &self.schema, &None)
+                    .await?;
             if batch.num_rows() != chunk.len() {
                 return Err(DataFusionError::Internal(format!(
                     "read {} rows to check {} against their text",
@@ -1836,10 +1948,14 @@ impl TableProvider for SupertableProvider {
             survivors = tracing::field::Empty,
         );
 
-        let survivor_entries = self
-            .select_survivors(filters)
-            .instrument(select_span.clone())
-            .await?;
+        let survivor_entries = match &self.read_rows {
+            Some((entry, _)) => vec![Arc::clone(entry)],
+            None => {
+                self.select_survivors(filters)
+                    .instrument(select_span.clone())
+                    .await?
+            }
+        };
 
         select_span.record("survivors", survivor_entries.len());
         trace::end(select_span);
@@ -1924,17 +2040,20 @@ impl TableProvider for SupertableProvider {
         // the superfile). See `crate::supertable::query::candidate`.
         let manifest = &self.manifest;
         let range_cols = manifest.table_schema().range_column_types();
-        let candidate_plan =
-            CandidatePlan::from_filters(&bounded_filters, &fts_cols, &range_cols, &|col| {
-                manifest.try_fts_tokenizer_for(col)
-            });
+        let candidate_plan = Arc::new(CandidatePlan::from_filters(
+            &bounded_filters,
+            &fts_cols,
+            &range_cols,
+            &|col| manifest.try_fts_tokenizer_for(col),
+            &|col| manifest.field_id(col),
+        ));
         // A `LIKE` leaf is bound to each superfile's dictionary once, up
         // front, so the estimate and the evaluation below share one walk.
         let needs_expansion = candidate_plan.has_like();
         // The term index's locations for the predicate's terms: each
         // superfile then resolves them from its postings, not its dictionary.
         let plan_locations =
-            plan_locations_for(&self.manifest, &candidate_plan, &survivor_entries).await?;
+            Arc::new(plan_locations_for(&self.manifest, &candidate_plan, &survivor_entries).await?);
         let plan_locations = &plan_locations;
 
         // Open every survivor, at most `superfiles_in_flight` at once, so a
@@ -1981,27 +2100,28 @@ impl TableProvider for SupertableProvider {
             /// posting walks on this superfile.
             predicate_work: MatchWork,
         }
-        // The plan's dictionary walks (a `LIKE` leaf's expansion) are CPU
-        // work and run on the reader pool behind a oneshot; only their FST
-        // fetches stay on this runtime.
+        // The plan's CPU work runs on the reader pool behind a oneshot: a
+        // `LIKE` leaf's expansion, and a resident superfile's whole match. A
+        // lazy superfile's match stays on this task, where its reads wait on
+        // the store and overlap.
         let reader_pool: &ThreadPool = &self.manifest.options.reader_pool;
+        // Superfiles matching on the reader pool at once. More than its
+        // threads would only queue there, ahead of other queries' work, and
+        // each holds its postings and bitmaps, which the connection budget
+        // does not see. A match holds its slot only while on the pool, never
+        // across a read that waits.
+        let match_slots = Semaphore::new(reader_pool.current_num_threads());
+        let match_slots = &match_slots;
         // Superfiles answering exact conjuncts at once. Their walks and
         // unions run on the reader pool, so more in flight than it has
         // threads only queue there, each holding its fetched postings and
         // bitsets; what they do hold is charged to the connection budget.
+        // Kept apart from `match_slots`: an exact check holds its slot across
+        // its reads, so sharing would park resident matches behind cold
+        // fetches.
         let exact_slots = Semaphore::new(reader_pool.current_num_threads());
         let exact_slots = &exact_slots;
 
-        // Pass 1 (per superfile), fanned out: every survivor resolves its
-        // candidate rows in its own future and `try_join_bounded` drives up
-        // to `superfiles_in_flight` of them together, so one superfile's
-        // dictionary fetch overlaps another's walk on the reader pool and a
-        // third's posting reads, instead of each superfile waiting for the
-        // one before it. The futures share this task rather than being
-        // spawned — the CPU is on the pool and the I/O is awaited, so the
-        // task only polls, and nothing here is `'static`. Results come back
-        // in survivor order, so the file list below stays deterministic in
-        // manifest order, and the first error (in time) ends the scan.
         // The columns the scan decodes, whose pages a selection may skip.
         let read_columns: Vec<&str> = match projection {
             Some(indices) => indices
@@ -2016,6 +2136,53 @@ impl TableProvider for SupertableProvider {
                 .map(|field| field.name().as_str())
                 .collect(),
         };
+        // When each superfile's index is worth using. A range pays only by the pages it skips, so
+        // it is also capped at the read columns' page count, with no floor.
+        let selection_gate = |plan: &CandidatePlan, prepared: &PreparedScanFile| {
+            let n_docs = prepared.reader.n_docs();
+            let index = match plan.only_ranges() {
+                true => {
+                    let fraction = (n_docs as f64 * PUSHDOWN_MAX_FRACTION) as u64;
+                    prepared
+                        .pages_per_column(&read_columns)
+                        .map_or(fraction, |pages| pages.min(fraction))
+                }
+                false => pushdown_rows(n_docs),
+            };
+            let density_cap = (n_docs as f64 * PUSHDOWN_MAX_DENSITY) as u64;
+            SelectionGate { index, density_cap }
+        };
+        let selection_gate = &selection_gate;
+        // Both passes below are the scan's predicate work. Opening files is in `scan.open_files`.
+        let predicates_span = detail_span!("scan.index_predicates", files = survivor_entries.len());
+
+        // Pass 1: each superfile's candidate rows. Resident ones go to the pool first, as a local
+        // read never waits and here they'd run one by one. The rest resolve below. Results keep
+        // survivor order, and the first error ends the scan.
+        let resident: Vec<Option<Resolved>> = match top_k_rows {
+            Some(_) => survivor_entries.iter().map(|_| None).collect(),
+            None => {
+                let files = survivor_entries
+                    .iter()
+                    .zip(&prepared_files)
+                    .map(|(entry, prepared)| PoolFile {
+                        reader: Arc::clone(&prepared.reader),
+                        superfile: entry.superfile_id,
+                        gate: selection_gate(&candidate_plan, prepared),
+                    })
+                    .collect();
+                Arc::clone(&candidate_plan)
+                    .resolve_resident_on_pool(
+                        files,
+                        Arc::clone(plan_locations),
+                        reader_pool,
+                        match_slots,
+                    )
+                    .instrument(predicates_span.clone())
+                    .await
+                    .map_err(QueryError::from)?
+            }
+        };
         let superfiles: Vec<SuperfileScan> = try_join_bounded(
             // Owned entries: a closure over borrowed ones, held across an
             // await in this `async_trait` method, trips rustc's "`FnOnce` is
@@ -2024,27 +2191,23 @@ impl TableProvider for SupertableProvider {
                 .iter()
                 .cloned()
                 .zip(prepared_files)
-                .map(|(entry, prepared)| {
+                .zip(resident)
+                .map(|((entry, prepared), resolved)| {
                     let candidate_plan = &candidate_plan;
-                    let read_columns = &read_columns;
                     async move {
+                        // Only the rows asked for, deleted or not: no index
+                        // narrows them and no delete overlay drops any.
+                        if let Some((_, rows)) = &self.read_rows {
+                            return Ok(SuperfileScan {
+                                prepared,
+                                candidates: Some(rows.as_ref().clone()),
+                                tombstones: Arc::new(RoaringBitmap::new()),
+                                predicate_work: MatchWork::default(),
+                            });
+                        }
                         // Resolve candidate rows from the index. `None` => no
                         // usable bound, scan the superfile.
-                        //
-                        // Selectivity gate: estimate the match count from
-                        // per-term `df` first (from the term index, or a
-                        // posting-header read when the index doesn't list the
-                        // term). If a predicate would match more than
-                        // `PUSHDOWN_MAX_FRACTION` of this superfile, skip the
-                        // index path and let DataFusion scan: at that match
-                        // density the rows saturate the data pages, so an index
-                        // `RowSelection` can't skip any page and only adds
-                        // posting-walk + selection overhead. The floor keeps
-                        // the pushdown active on small superfiles; the density
-                        // cap binds even under the floor so an all-matching
-                        // predicate never takes the index path.
                         let mut predicate_work = MatchWork::default();
-                        let expanded;
                         let plan = if needs_expansion {
                             // A whole-dictionary walk pays only when the
                             // column's stored text is large next to its
@@ -2076,76 +2239,31 @@ impl TableProvider for SupertableProvider {
                                 .await
                                 .map_err(QueryError::from)?;
                             predicate_work.merge(expand_work);
-                            expanded = plan;
-                            &expanded
+                            Arc::new(plan)
                         } else {
-                            candidate_plan
+                            Arc::clone(candidate_plan)
                         };
-                        let gate = ((prepared.reader.n_docs() as f64 * PUSHDOWN_MAX_FRACTION)
-                            as u64)
-                            .max(PUSHDOWN_MIN_ROWS);
-                        let density_cap =
-                            (prepared.reader.n_docs() as f64 * PUSHDOWN_MAX_DENSITY) as u64;
-                        // The floor keeps text predicates on the index over
-                        // small superfiles, where each row a selection spares
-                        // is text not decoded and checked. A range selects
-                        // numbers, cheap to decode and check: its selection
-                        // pays only by the pages it skips, so only with fewer
-                        // rows than the columns read have pages. With more,
-                        // nearly every page holds a selected row and the
-                        // selection decodes them all, slower than the scan.
-                        // A file with no page index keeps the fraction.
-                        let index_gate = match plan.only_ranges() {
-                            true => {
-                                let fraction = (prepared.reader.n_docs() as f64
-                                    * PUSHDOWN_MAX_FRACTION)
-                                    as u64;
-                                prepared
-                                    .pages_per_column(read_columns)
-                                    .map_or(fraction, |pages| pages.min(fraction))
-                            }
-                            false => gate,
-                        };
-                        let top_k = top_k_rows.as_ref();
-                        let est = match top_k {
-                            Some(_) => 0,
-                            None => {
-                                let located = IndexedSuperfile {
-                                    locations: plan_locations,
-                                    superfile: entry.superfile_id,
-                                };
-                                let (est, est_work) = plan
-                                    .estimate(
-                                        prepared.reader.as_ref(),
-                                        Some(reader_pool),
-                                        Some(located),
-                                    )
-                                    .await
-                                    .map_err(QueryError::from)?;
-                                predicate_work.merge(est_work);
-                                est
-                            }
-                        };
-                        let candidates = if let Some(rows) = top_k {
+                        let candidates = if let Some(rows) = top_k_rows.as_ref() {
                             // A top-k scan reads only the rows the range
                             // index put first; a superfile none of them is in
                             // reads nothing.
                             Some(rows.get(&entry.superfile_id).cloned().unwrap_or_default())
-                        } else if est > index_gate || est >= density_cap {
-                            None
                         } else {
-                            let memos = memos_from_plan_locations(
-                                prepared.reader.as_ref(),
-                                plan_locations,
-                                entry.superfile_id,
-                            )
-                            .await;
-                            let (bitmap, eval_work) = plan
-                                .evaluate(prepared.reader.as_ref(), Some(reader_pool), &memos)
-                                .await
-                                .map_err(QueryError::from)?;
-                            predicate_work.merge(eval_work);
-                            bitmap
+                            let resolved = match resolved {
+                                Some(resolved) => resolved,
+                                None => Arc::clone(&plan)
+                                    .resolve(
+                                        Arc::clone(&prepared.reader),
+                                        entry.superfile_id,
+                                        plan_locations,
+                                        selection_gate(&plan, &prepared),
+                                        Some((reader_pool, match_slots)),
+                                    )
+                                    .await
+                                    .map_err(QueryError::from)?,
+                            };
+                            predicate_work.merge(resolved.work);
+                            resolved.rows
                         };
 
                         // This superfile's tombstoned rows (empty when no
@@ -2170,7 +2288,7 @@ impl TableProvider for SupertableProvider {
                                         &prepared,
                                         check,
                                         candidates.as_ref(),
-                                        gate,
+                                        pushdown_rows(prepared.reader.n_docs()),
                                         &tombstones,
                                         batch_size,
                                     )
@@ -2191,13 +2309,7 @@ impl TableProvider for SupertableProvider {
                 }),
             in_flight,
         )
-        // The per-superfile predicate work above: index candidate plans,
-        // their evaluation, and the tombstone overlay. Distinct from opening
-        // the files, which was paid for in `scan.open_files`.
-        .instrument(detail_span!(
-            "scan.index_predicates",
-            files = survivor_entries.len()
-        ))
+        .instrument(predicates_span)
         .await?;
 
         // The pushdown predicates' df probes, dictionary walks and posting
@@ -2316,7 +2428,7 @@ impl TableProvider for SupertableProvider {
             });
             let wanted = |name: &str| projected.as_ref().is_none_or(|set| set.contains(name));
             let stats = self.statistics_for(&survivor_entries, &wanted);
-            if filters.is_empty() {
+            if filters.is_empty() && self.read_rows.is_none() {
                 stats
             } else {
                 stats.to_inexact()
@@ -2381,11 +2493,12 @@ impl TableProvider for SupertableProvider {
         let scan = DataSourceExec::from_data_source(config);
         let meter = |scan: Arc<dyn ExecutionPlan>| {
             let op_stats = self.scan_store.op_stats();
-            if filters.is_empty() {
+            let meter = if filters.is_empty() {
                 MeteredExec::new(scan, op_stats)
             } else {
                 MeteredExec::without_limit_pushdown(scan, op_stats)
-            }
+            };
+            meter.with_note(self.scan_note.clone())
         };
         let parquet: Arc<dyn ExecutionPlan> = Arc::new(
             meter(scan)
@@ -4035,6 +4148,48 @@ mod tests {
         assert_eq!(provider.surviving_superfile_count(&after).await, 0);
     }
 
+    /// A scan's statistics count the deleted rows of the call's own read:
+    /// a delete committed after a statement read a superfile's deletes is
+    /// left out of the row count its residual scan reports as exact, as it
+    /// is left out of the statistics the statement answered from.
+    #[test]
+    fn statistics_count_the_deleted_rows_the_call_read() {
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let st =
+            Supertable::create(default_supertable_options().with_storage(storage)).expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&build_title_batch(&["alpha", "bravo", "charlie"]))
+            .expect("append");
+        w.commit().expect("commit");
+
+        let provider = provider_of(&st);
+        let entries = provider.manifest().superfiles.clone();
+        let once = provider.reading_tombstones_once();
+        let residual = once.restricted_to(HashSet::new());
+        assert!(
+            once.deleted_rows(entries[0].superfile_id, Instant::now())
+                .expect("deleted rows")
+                .is_empty(),
+            "the statement reads the superfile clean"
+        );
+
+        w.delete(col("title").eq(lit("bravo"))).expect("delete");
+        w.commit().expect("commit the delete");
+        let all = |_: &str| true;
+        assert_eq!(
+            provider.statistics_for(&entries, &all).num_rows,
+            Precision::Exact(2),
+            "a fresh read sees the delete"
+        );
+        assert_eq!(
+            residual.statistics_for(&entries, &all).num_rows,
+            Precision::Exact(3),
+            "the statement's own scan counts what the statement read"
+        );
+    }
+
     /// Under [`SupertableProvider::reading_tombstones_once`] a superfile's
     /// deleted rows are those its first read found, for every provider
     /// derived from it: a delete committed later in the call is not seen, so
@@ -4251,12 +4406,13 @@ mod tests {
     }
 
     #[test]
-    fn entry_is_clean_true_without_tombstone_overlay() {
+    fn no_rows_deleted_without_tombstone_overlay() {
         let (provider, _rt) = provider_over_two_superfiles();
         // In-memory tables carry no tombstone overlay, so every entry is
         // trivially clean.
         for entry in provider.manifest().superfiles.iter() {
-            assert!(provider.entry_is_clean(entry));
+            let deleted = provider.deleted_rows(entry.superfile_id, Instant::now());
+            assert!(deleted.expect("deleted rows").is_empty());
         }
     }
 

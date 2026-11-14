@@ -101,10 +101,10 @@ use crate::{
             dispatch::attach_stable_ids_to_hits,
             exec::{
                 common::{
-                    PushedPredicate, arg_to_string, arg_to_usize, candidate_plan_for_filters,
-                    exact_scope, fill_ceiling, fill_top_k_within, live_reader,
-                    output_schema_with_score, resolve_hits_named, scope_to_call, top_k_statistics,
-                    traced_tvf, widening_ended_short,
+                    Arity, PushedPredicate, arg_to_string, arg_to_usize,
+                    candidate_plan_for_filters, exact_scope, fill_ceiling, fill_top_k_within,
+                    live_reader, output_schema_with_score, resolve_hits_named, scope_to_call,
+                    top_k_statistics, traced_tvf, widening_ended_short,
                 },
                 vector_exec::arg_to_query_vector,
             },
@@ -121,9 +121,12 @@ use crate::{
 /// SQL name the TVF is registered under.
 pub(crate) const HYBRID_SEARCH_UDTF: &str = "hybrid_search";
 
-/// Argument count for
-/// `hybrid_search(text_col, q_text, vec_col, q_vec, k)`.
-const HYBRID_SEARCH_ARG_COUNT: usize = 5;
+/// Arguments of `hybrid_search(text_col, q_text, vec_col, q_vec, k)`.
+pub(crate) const HYBRID_SEARCH_ARITY: Arity = Arity {
+    min: 5,
+    max: 5,
+    arguments: "text_col, q_text, vec_col, q_vec, k",
+};
 
 /// RRF rank-bias constant. `60` is the value from the original
 /// Cormack et al. reciprocal-rank-fusion paper and the de-facto
@@ -443,13 +446,7 @@ impl HybridSearchFunc {
 impl TableFunctionImpl for HybridSearchFunc {
     fn call_with_args(&self, args: TableFunctionArgs) -> DfResult<Arc<dyn TableProvider>> {
         let args = args.exprs();
-        if args.len() != HYBRID_SEARCH_ARG_COUNT {
-            return Err(DataFusionError::Plan(format!(
-                "hybrid_search expects {HYBRID_SEARCH_ARG_COUNT} arguments \
-                 (text_col, q_text, vec_col, q_vec, k), got {}",
-                args.len()
-            )));
-        }
+        HYBRID_SEARCH_ARITY.check(HYBRID_SEARCH_UDTF, args.len())?;
         let text_col = arg_to_string(&args[0], "hybrid_search text_col")?;
         let q_text = arg_to_string(&args[1], "hybrid_search q_text")?;
         let vec_col = arg_to_string(&args[2], "hybrid_search vec_col")?;

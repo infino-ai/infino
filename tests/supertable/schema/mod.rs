@@ -10,3 +10,6 @@ pub mod property;
 pub mod rows;
 pub mod sparse;
 pub mod types;
+// Reads the process's memory through mimalloc.
+#[cfg(feature = "mimalloc")]
+pub mod wide_commit;

@@ -33,8 +33,10 @@
 
 use std::sync::Arc;
 
-use arrow_array::{LargeStringArray, RecordBatch};
+use arrow::util::pretty::pretty_format_batches;
+use arrow_array::{Float64Array, Int64Array, LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
+use datafusion::prelude::{col, lit};
 use infino::{
     Bm25SearchOptions,
     superfile::{builder::FtsConfig, fts::reader::BoolMode},
@@ -309,6 +311,270 @@ fn sql_loads_all_parts_returns_correct_count() {
         n_loaded, HIERARCHICAL_PART_COUNT,
         "SQL loads all parts (list-pushdown deferred); got {n_loaded}/5"
     );
+}
+
+/// An unfiltered `COUNT(*)` on a freshly opened lazy handle, with no part
+/// loaded yet, is answered from the manifest's statistics: the plan holds no
+/// table scan, and the count is exact.
+#[test]
+fn sql_unfiltered_count_on_a_lazy_handle_is_answered_from_stats() {
+    let dir = TempDir::new().expect("tempdir");
+    build_5_parts_with_distinct_terms(dir.path());
+    let cache_dir = TempDir::new().expect("cache");
+    let count = "SELECT COUNT(*) AS n FROM supertable";
+
+    let consumer = open_lazy_consumer(dir.path(), cache_dir.path());
+    assert_eq!(parts_loaded(&consumer), (0, HIERARCHICAL_PART_COUNT));
+    let explained = consumer
+        .reader()
+        .expect("reader")
+        .query_sql(&format!("EXPLAIN {count}"))
+        .expect("explain");
+    let plan = pretty_format_batches(&explained)
+        .expect("format plan")
+        .to_string();
+    assert!(
+        !plan.contains("TableScan"),
+        "answered from manifest stats, no scan:\n{plan}"
+    );
+
+    let consumer = open_lazy_consumer(dir.path(), cache_dir.path());
+    let batches = consumer
+        .reader()
+        .expect("reader")
+        .query_sql(count)
+        .expect("query");
+    let n = batches[0]
+        .column_by_name("n")
+        .expect("n column")
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("Int64")
+        .value(0);
+    assert_eq!(n, HIERARCHICAL_PART_COUNT as i64 * ROWS_PER_PART);
+}
+
+/// Fares of the fare fixture, one commit (and so one part) per pair.
+const FARES: [[i64; 2]; 5] = [[1, 2], [3, 4], [5, 6], [7, 8], [9, 10]];
+/// The fare the delete case removes; its superfile is the only one with
+/// deleted rows.
+const DELETED_FARE: i64 = 5;
+/// The aggregates the fare tests run, answered from statistics on a clean
+/// table.
+const FARE_AGGREGATES: &str = "SELECT COUNT(*) AS n, SUM(fare) AS total, MIN(fare) AS lo, \
+     MAX(fare) AS hi, AVG(fare) AS mean FROM supertable";
+
+fn fare_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("title", DataType::LargeUtf8, false),
+        Field::new("fare", DataType::Int64, false),
+    ]))
+}
+
+fn fare_options() -> SupertableOptions {
+    let pool = Arc::new(
+        ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("rayon pool"),
+    );
+    SupertableOptions::new(fare_schema(), vec![FtsConfig::new("title")], vec![])
+        .expect("fare options")
+        .with_writer_pool(pool)
+}
+
+/// One part per [`FARES`] pair, titled `t<commit>`; with `delete`, the row
+/// holding [`DELETED_FARE`] is then deleted.
+fn build_fare_parts(storage_dir: &std::path::Path, delete: bool) {
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(storage_dir).expect("provider"));
+    let producer = Supertable::create(
+        fare_options()
+            .with_storage(Arc::clone(&storage))
+            .with_target_superfiles_per_part(TARGET_SUPERFILES_PER_PART),
+    )
+    .expect("create");
+    for (i, fares) in FARES.iter().enumerate() {
+        let title = format!("t{i}");
+        let batch = RecordBatch::try_new(
+            fare_schema(),
+            vec![
+                Arc::new(LargeStringArray::from(vec![title.as_str(); fares.len()])),
+                Arc::new(Int64Array::from(fares.to_vec())),
+            ],
+        )
+        .expect("fare batch");
+        let mut w = producer.writer().expect("writer");
+        w.append(&batch).expect("append");
+        w.commit().expect("commit");
+    }
+    if delete {
+        let mut w = producer.writer().expect("writer");
+        w.delete(col("fare").eq(lit(DELETED_FARE))).expect("delete");
+        w.commit().expect("commit delete");
+    }
+}
+
+fn open_lazy_fare_consumer(
+    storage_dir: &std::path::Path,
+    cache_dir: &std::path::Path,
+) -> Supertable {
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(storage_dir).expect("provider"));
+    let cache = default_disk_cache(Arc::clone(&storage), cache_dir);
+    Supertable::open(
+        fare_options()
+            .with_storage(Arc::clone(&storage))
+            .with_eager_load_threshold(EAGER_LOAD_THRESHOLD_FORCE_LAZY)
+            .with_disk_cache(Arc::clone(&cache)),
+    )
+    .expect("open")
+}
+
+/// `EXPLAIN sql` on `consumer`, formatted.
+fn explain(consumer: &Supertable, sql: &str) -> String {
+    let explained = consumer
+        .reader()
+        .expect("reader")
+        .query_sql(&format!("EXPLAIN {sql}"))
+        .expect("explain");
+    pretty_format_batches(&explained)
+        .expect("format plan")
+        .to_string()
+}
+
+/// [`FARE_AGGREGATES`] on `consumer`: count, sum, min, max and mean.
+fn fare_aggregates(consumer: &Supertable) -> (i64, i64, i64, i64, f64) {
+    let batches = consumer
+        .reader()
+        .expect("reader")
+        .query_sql(FARE_AGGREGATES)
+        .expect("query");
+    let int = |name: &str| {
+        batches[0]
+            .column_by_name(name)
+            .expect("column")
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("Int64")
+            .value(0)
+    };
+    let mean = batches[0]
+        .column_by_name("mean")
+        .expect("mean column")
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .expect("Float64")
+        .value(0);
+    (int("n"), int("total"), int("lo"), int("hi"), mean)
+}
+
+/// `SUM`, `MIN`, `MAX` and `AVG` beside `COUNT(*)` on a lazy handle are
+/// answered from statistics too, and exactly.
+#[test]
+fn sql_unfiltered_aggregates_on_a_lazy_handle_are_answered_from_stats() {
+    let dir = TempDir::new().expect("tempdir");
+    build_fare_parts(dir.path(), false);
+    let cache_dir = TempDir::new().expect("cache");
+
+    let consumer = open_lazy_fare_consumer(dir.path(), cache_dir.path());
+    assert_eq!(parts_loaded(&consumer), (0, FARES.len()));
+    let plan = explain(&consumer, FARE_AGGREGATES);
+    assert!(
+        !plan.contains("TableScan"),
+        "answered from manifest stats, no scan:\n{plan}"
+    );
+
+    let consumer = open_lazy_fare_consumer(dir.path(), cache_dir.path());
+    let fares: Vec<i64> = FARES.iter().flatten().copied().collect();
+    let total: i64 = fares.iter().sum();
+    assert_eq!(
+        fare_aggregates(&consumer),
+        (
+            fares.len() as i64,
+            total,
+            fares[0],
+            fares[fares.len() - 1],
+            total as f64 / fares.len() as f64
+        )
+    );
+}
+
+/// With rows deleted from one superfile, a lazy handle answers every
+/// superfile from statistics, that one corrected for its deleted rows, with
+/// no scan; the result leaves the deleted row out.
+#[test]
+fn sql_unfiltered_aggregates_on_a_lazy_handle_see_deletes() {
+    let dir = TempDir::new().expect("tempdir");
+    build_fare_parts(dir.path(), true);
+    let cache_dir = TempDir::new().expect("cache");
+
+    let consumer = open_lazy_fare_consumer(dir.path(), cache_dir.path());
+    let plan = explain(&consumer, FARE_AGGREGATES);
+    assert!(
+        !plan.contains("TableScan"),
+        "answered from statistics past the deleted rows:\n{plan}"
+    );
+
+    let consumer = open_lazy_fare_consumer(dir.path(), cache_dir.path());
+    let fares: Vec<i64> = FARES
+        .iter()
+        .flatten()
+        .copied()
+        .filter(|fare| *fare != DELETED_FARE)
+        .collect();
+    let total: i64 = fares.iter().sum();
+    assert_eq!(
+        fare_aggregates(&consumer),
+        (
+            fares.len() as i64,
+            total,
+            fares[0],
+            fares[fares.len() - 1],
+            total as f64 / fares.len() as f64
+        )
+    );
+}
+
+/// An unfiltered aggregate inside a scalar subquery is answered from
+/// statistics on a lazy handle too.
+#[test]
+fn sql_unfiltered_aggregate_in_a_subquery_on_a_lazy_handle_is_answered_from_stats() {
+    let dir = TempDir::new().expect("tempdir");
+    build_fare_parts(dir.path(), false);
+    let cache_dir = TempDir::new().expect("cache");
+
+    let consumer = open_lazy_fare_consumer(dir.path(), cache_dir.path());
+    let plan = explain(
+        &consumer,
+        "SELECT (SELECT SUM(fare) FROM supertable) AS total",
+    );
+    assert!(
+        !plan.contains("TableScan"),
+        "answered from manifest stats, no scan:\n{plan}"
+    );
+}
+
+/// A filtered or grouped aggregate does not load the parts up front: a
+/// filter on one title still loads only the part that holds it.
+#[test]
+fn sql_filtered_aggregates_on_a_lazy_handle_load_only_matching_parts() {
+    let dir = TempDir::new().expect("tempdir");
+    build_fare_parts(dir.path(), false);
+    let cache_dir = TempDir::new().expect("cache");
+
+    for sql in [
+        "SELECT COUNT(*) FROM supertable WHERE title = 't1'",
+        "SELECT title, COUNT(*) FROM supertable WHERE title = 't1' GROUP BY title",
+    ] {
+        let consumer = open_lazy_fare_consumer(dir.path(), cache_dir.path());
+        consumer
+            .reader()
+            .expect("reader")
+            .query_sql(sql)
+            .expect("query");
+        assert_eq!(parts_loaded(&consumer), (1, FARES.len()), "{sql}");
+    }
 }
 
 /// Build a manifest with `target_superfiles_per_part = 2`: each commit

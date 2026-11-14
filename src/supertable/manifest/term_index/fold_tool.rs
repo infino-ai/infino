@@ -36,7 +36,7 @@ use rayon::ThreadPoolBuilder;
 use tracing_subscriber::{EnvFilter, fmt};
 
 use super::{
-    build::{BuildPolicy, BuiltBytes, SliceFile, merge_layers, tier_path},
+    build::{BuildPolicy, BuiltBytes, SliceFile, SliceSource, merge_layers, tier_path},
     download_layers,
     format::Layer,
     slice_files, write_slices, write_tiers,
@@ -87,7 +87,7 @@ fn present_sources(dir: &Path, layers: &[Layer]) -> Option<Vec<Vec<SliceFile>>> 
     let files = slice_files(dir, layers);
     let complete = layers.iter().zip(&files).all(|(layer, files)| {
         layer.slices.iter().zip(files).all(|(slice, file)| {
-            file.path.is_file()
+            matches!(&file.source, SliceSource::Local(path) if path.is_file())
                 && (slice.tier.is_none() || tier_path(dir, &slice.content_hash).is_file())
         })
     });
@@ -178,38 +178,6 @@ fn fold_timing() {
         );
     }
 
-    let t_fetch = Instant::now();
-    let sources = match present_sources(&scratch, &root.layers) {
-        Some(sources) => {
-            eprintln!("FOLD sources present in {}", scratch.display());
-            sources
-        }
-        None => {
-            let sources = st
-                .block_on_query(download_layers(&storage, &root.layers, &scratch, None))
-                .expect("download layers");
-            eprintln!(
-                "FOLD download {:.1}s ({} objects)",
-                t_fetch.elapsed().as_secs_f64(),
-                root.layers
-                    .iter()
-                    .flat_map(|s| &s.slices)
-                    .map(|s| 1 + usize::from(s.tier.is_some()))
-                    .sum::<usize>()
-            );
-            sources
-        }
-    };
-    let local_bytes: u64 = root
-        .layers
-        .iter()
-        .zip(&sources)
-        .flat_map(|(layer, files)| layer.slices.iter().zip(files))
-        .map(|(slice, file)| {
-            file_len(&file.path) + file_len(&tier_path(&scratch, &slice.content_hash))
-        })
-        .sum();
-
     // Exactly the merge optimize's rebuild runs: ordinals keep their
     // place for a superfile still live, and are dropped otherwise.
     let live: HashMap<_, u32> = manifest
@@ -235,6 +203,68 @@ fn fold_timing() {
         .pool
         .as_deref()
         .map_or(rayon::current_num_threads(), |p| p.current_num_threads());
+    // FOLD_STREAM=1 times the fold optimize runs (download or stream, merge,
+    // upload into the table's own storage) instead of the local merge below.
+    if env::var("FOLD_STREAM").is_ok() {
+        let policy = BuildPolicy {
+            merge_ranges_max: Some(pool_threads),
+            ..policy
+        };
+        let io = super::FoldIo {
+            stream: Some(super::FoldBudget::for_host(pool_threads)),
+            ..super::FoldIo::default()
+        };
+        let t = Instant::now();
+        let layer = st
+            .block_on_query(super::fold_layers(
+                &storage,
+                &root.layers,
+                &ordinals,
+                &policy,
+                &io,
+                None,
+            ))
+            .expect("fold");
+        eprintln!(
+            "FOLD stream {:.1}s slices={} rss_peak={:.0}MiB",
+            t.elapsed().as_secs_f64(),
+            layer.slices.len(),
+            mib(status_field_bytes("VmHWM:").unwrap_or(0)),
+        );
+        return;
+    }
+    let t_fetch = Instant::now();
+    let sources = match present_sources(&scratch, &root.layers) {
+        Some(sources) => {
+            eprintln!("FOLD sources present in {}", scratch.display());
+            sources
+        }
+        None => {
+            let sources = st
+                .block_on_query(download_layers(&storage, &root.layers, &scratch, None))
+                .expect("download layers");
+            eprintln!(
+                "FOLD download {:.1}s ({} objects)",
+                t_fetch.elapsed().as_secs_f64(),
+                root.layers
+                    .iter()
+                    .flat_map(|s| &s.slices)
+                    .map(|s| 1 + usize::from(s.tier.is_some()))
+                    .sum::<usize>()
+            );
+            sources
+        }
+    };
+    let local_bytes: u64 = root
+        .layers
+        .iter()
+        .flat_map(|layer| &layer.slices)
+        .map(|slice| {
+            file_len(&super::slice_file_path(&scratch, &slice.content_hash))
+                + file_len(&tier_path(&scratch, &slice.content_hash))
+        })
+        .sum();
+
     eprintln!(
         "FOLD inputs local_bytes={:.1}MiB ordinals={} dropped={dropped} pool_threads={pool_threads} ranges={n_ranges:?} avail_mem={:.1}GiB",
         mib(local_bytes),

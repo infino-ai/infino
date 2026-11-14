@@ -90,6 +90,9 @@ pub(crate) struct MeteredExec {
     /// provider wraps around a scan that carries filters — see
     /// [`Self::without_limit_pushdown`].
     limit_pushdown: bool,
+    /// What the wrapped scan stands for, shown after the node's name in
+    /// `EXPLAIN`.
+    note: Option<Arc<str>>,
 }
 
 impl MeteredExec {
@@ -107,6 +110,7 @@ impl MeteredExec {
             footers: None,
             read_ahead: None,
             limit_pushdown: true,
+            note: None,
         }
     }
 
@@ -131,6 +135,7 @@ impl MeteredExec {
             footers: None,
             read_ahead: None,
             limit_pushdown: false,
+            note: None,
         }
     }
 
@@ -143,6 +148,12 @@ impl MeteredExec {
     /// This meter, with read-ahead for the table scan it wraps.
     pub(crate) fn with_read_ahead(mut self, read_ahead: Arc<ScanReadAhead>) -> Self {
         self.read_ahead = Some(read_ahead);
+        self
+    }
+
+    /// This meter, showing `note` after its name in `EXPLAIN`.
+    pub(crate) fn with_note(mut self, note: Option<Arc<str>>) -> Self {
+        self.note = note;
         self
     }
 
@@ -169,13 +180,17 @@ impl MeteredExec {
             footers: self.footers.clone(),
             read_ahead: self.read_ahead.clone(),
             limit_pushdown: self.limit_pushdown,
+            note: self.note.clone(),
         })
     }
 }
 
 impl DisplayAs for MeteredExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "MeteredExec")
+        match &self.note {
+            Some(note) => write!(f, "MeteredExec: {note}"),
+            None => write!(f, "MeteredExec"),
+        }
     }
 }
 

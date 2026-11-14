@@ -73,6 +73,9 @@
 
 use std::{
     cell::{Cell, RefCell},
+    future::{Future, poll_fn},
+    mem,
+    pin::pin,
     sync::{
         Arc,
         atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -476,11 +479,11 @@ impl OpStatsCollector {
 }
 
 thread_local! {
-    /// The collector queries minted on this thread attach to. Set only inside
-    /// [`with_op_stats`]; the sync search entry points run on the caller's
-    /// thread up to reader mint, which is where [`current`] is read — from
-    /// there the collector travels as an explicit `Arc` through the fan-out,
-    /// so spawned tasks and pool closures never consult this slot.
+    /// The collector queries minted on this thread attach to. Set by [`with_op_stats`]; the sync
+    /// search entry points run on the caller's thread up to reader mint, which is where [`current`]
+    /// is read — from there the collector travels as an explicit `Arc` through the fan-out. A
+    /// spawned task or pool closure sees it here only where the query installs it ([`attached`],
+    /// [`attached_to_future`]).
     static CURRENT: RefCell<Option<Arc<OpStatsCollector>>> = const { RefCell::new(None) };
 }
 
@@ -675,9 +678,47 @@ pub(crate) fn attached<T>(collector: Option<Arc<OpStatsCollector>>, f: impl FnOn
     f()
 }
 
+/// [`attached`] for a future: each poll of `work` runs with `collector` on the polling thread, and
+/// the thread gets its own collector back after the poll. Use it for work a query moves onto a task
+/// of its own, so what reads [`current`] there (the prune's counts) still bills the query.
+pub(crate) async fn attached_to_future<F: Future>(
+    mut collector: Option<Arc<OpStatsCollector>>,
+    work: F,
+) -> F::Output {
+    let mut work = pin!(work);
+    poll_fn(|cx| {
+        let _installed = InstalledForPoll::swap_in(&mut collector);
+        work.as_mut().poll(cx)
+    })
+    .await
+}
+
+/// Puts a collector in this thread's slot for one poll, and swaps it back out on drop, a panicking
+/// poll included. Swapping moves the collector instead of cloning it on every poll.
+struct InstalledForPoll<'a> {
+    /// The slot's own collector while the poll runs, the polled future's after it.
+    swapped: &'a mut Option<Arc<OpStatsCollector>>,
+}
+
+impl<'a> InstalledForPoll<'a> {
+    fn swap_in(collector: &'a mut Option<Arc<OpStatsCollector>>) -> Self {
+        CURRENT.with(|slot| mem::swap(&mut *slot.borrow_mut(), collector));
+        Self { swapped: collector }
+    }
+}
+
+impl Drop for InstalledForPoll<'_> {
+    fn drop(&mut self) {
+        CURRENT.with(|slot| mem::swap(&mut *slot.borrow_mut(), self.swapped));
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::panic::catch_unwind;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    use futures::FutureExt;
+    use tokio::{runtime::Builder, task::yield_now};
 
     use super::*;
 
@@ -787,5 +828,44 @@ mod tests {
                 .add_fts_postings_bytes(5);
         });
         assert_eq!(outer.fts_postings_bytes, 5);
+    }
+
+    #[test]
+    fn an_attached_future_bills_its_collector_on_the_thread_that_polls_it() {
+        // One worker thread polls an attached task twice (it yields once).
+        //  - both polls see the collector.
+        //  - a later task on the same worker does not.
+        let runtime = Builder::new_multi_thread()
+            .worker_threads(1)
+            .build()
+            .expect("runtime");
+        let collector = Arc::new(OpStatsCollector::default());
+        let attached = attached_to_future(Some(Arc::clone(&collector)), async {
+            current()
+                .expect("attached on the first poll")
+                .add_fts_postings_bytes(1);
+            yield_now().await;
+            current()
+                .expect("attached on a later poll")
+                .add_fts_postings_bytes(2);
+        });
+        runtime
+            .block_on(runtime.spawn(attached))
+            .expect("the attached task");
+        assert_eq!(collector.snapshot().fts_postings_bytes, 3);
+        let after = runtime
+            .block_on(runtime.spawn(async { current() }))
+            .expect("a later task");
+        assert!(after.is_none(), "the worker's own collector is back");
+    }
+
+    #[test]
+    fn a_panicking_poll_still_gives_the_thread_its_collector_back() {
+        let collector = Arc::new(OpStatsCollector::default());
+        let polled = catch_unwind(AssertUnwindSafe(|| {
+            attached_to_future(Some(collector), async { panic!("kernel failure") }).now_or_never()
+        }));
+        assert!(polled.is_err());
+        assert!(current().is_none(), "the thread's own collector is back");
     }
 }

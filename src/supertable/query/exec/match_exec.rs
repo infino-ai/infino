@@ -36,7 +36,7 @@ use datafusion::{
     catalog::{Session, TableFunctionArgs, TableFunctionImpl, TableProvider},
     error::{DataFusionError, Result as DfResult},
     execution::{TaskContext, context::SessionContext},
-    logical_expr::{Expr, TableType},
+    logical_expr::{Expr, TableProviderFilterPushDown, TableType},
     physical_expr::EquivalenceProperties,
     physical_plan::{
         DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
@@ -54,8 +54,8 @@ use crate::{
         handle::{SupertableReader, WeakReader},
         query::exec::{
             common::{
-                arg_to_string, live_reader, output_schema_with_score, resolve_hits, scope_to_call,
-                traced_tvf, traced_tvf_rows,
+                Arity, arg_to_string, live_reader, output_schema_with_score, resolve_hits,
+                scope_to_call, traced_tvf, traced_tvf_rows,
             },
             fts_exec::arg_to_bool_mode,
         },
@@ -67,6 +67,19 @@ use crate::{
 pub(crate) const TOKEN_MATCH_UDTF: &str = "token_match";
 /// SQL name for the unranked exact-match TVF.
 pub(crate) const EXACT_MATCH_UDTF: &str = "exact_match";
+/// Arguments of `token_match(column, query)`; the optional `mode` makes it
+/// `token_match(column, query, mode)`.
+pub(crate) const TOKEN_MATCH_ARITY: Arity = Arity {
+    min: 2,
+    max: 3,
+    arguments: "column, query[, mode]",
+};
+/// Arguments of `exact_match(column, value)`.
+pub(crate) const EXACT_MATCH_ARITY: Arity = Arity {
+    min: 2,
+    max: 2,
+    arguments: "column, value",
+};
 
 /// Register `token_match` + `exact_match` on `ctx`, bound to the
 /// query's pinned `reader` + scalar `schema`. Called from
@@ -120,12 +133,7 @@ impl TokenMatchFunc {
 impl TableFunctionImpl for TokenMatchFunc {
     fn call_with_args(&self, args: TableFunctionArgs) -> DfResult<Arc<dyn TableProvider>> {
         let args = args.exprs();
-        if args.len() != 2 && args.len() != 3 {
-            return Err(DataFusionError::Plan(format!(
-                "token_match expects 2 or 3 arguments (column, query[, mode]), got {}",
-                args.len()
-            )));
-        }
+        TOKEN_MATCH_ARITY.check(TOKEN_MATCH_UDTF, args.len())?;
         let column = arg_to_string(&args[0], "token_match column")?;
         let query = arg_to_string(&args[1], "token_match query")?;
         let mode = match args.get(2) {
@@ -168,12 +176,7 @@ impl ExactMatchFunc {
 impl TableFunctionImpl for ExactMatchFunc {
     fn call_with_args(&self, args: TableFunctionArgs) -> DfResult<Arc<dyn TableProvider>> {
         let args = args.exprs();
-        if args.len() != 2 {
-            return Err(DataFusionError::Plan(format!(
-                "exact_match expects 2 arguments (column, value), got {}",
-                args.len()
-            )));
-        }
+        EXACT_MATCH_ARITY.check(EXACT_MATCH_UDTF, args.len())?;
         let column = arg_to_string(&args[0], "exact_match column")?;
         let value = arg_to_string(&args[1], "exact_match value")?;
         let reader = live_reader(&self.reader, "exact_match")?;
@@ -223,7 +226,7 @@ impl TableProvider for MatchTable {
         &self,
         _state: &dyn Session,
         projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
+        filters: &[Expr],
         _limit: Option<usize>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
         let exec = MatchExec::try_new(
@@ -233,8 +236,19 @@ impl TableProvider for MatchTable {
             Arc::clone(&self.scalar_schema),
             Arc::clone(&self.output_schema),
             projection.cloned(),
-        )?;
+        )?
+        .with_filters(filters.to_vec());
         Ok(Arc::new(exec))
+    }
+
+    /// Every `WHERE` filter is `Inexact`, as on `bm25_search`: the scan
+    /// uses it to skip superfiles that cannot pass, and
+    /// DataFusion keeps a `FilterExec` above that applies it exactly.
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> DfResult<Vec<TableProviderFilterPushDown>> {
+        Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
     }
 }
 
@@ -249,6 +263,8 @@ struct MatchExec {
     output_schema: SchemaRef,
     projection: Option<Vec<usize>>,
     projected_schema: SchemaRef,
+    /// The pushed-down `WHERE`, used only to read less.
+    filters: Vec<Expr>,
     cache: Arc<PlanProperties>,
 }
 
@@ -283,12 +299,18 @@ impl MatchExec {
             output_schema,
             projection,
             projected_schema,
+            filters: Vec::new(),
             cache,
         })
     }
 
+    fn with_filters(mut self, filters: Vec<Expr>) -> Self {
+        self.filters = filters;
+        self
+    }
+
     fn describe(&self) -> String {
-        match &self.query {
+        let text = match &self.query {
             MatchQuery::Token { mode, .. } => {
                 format!(
                     "MatchExec: kind=token, column={}, mode={:?}",
@@ -298,6 +320,11 @@ impl MatchExec {
             MatchQuery::Exact { .. } => {
                 format!("MatchExec: kind=exact, column={}", self.column)
             }
+        };
+        if self.filters.is_empty() {
+            text
+        } else {
+            format!("{text}, filters={}", self.filters.len())
         }
     }
 }
@@ -351,6 +378,7 @@ impl ExecutionPlan for MatchExec {
         let output_schema = Arc::clone(&self.output_schema);
         let projection = self.projection.clone();
         let projected_schema = Arc::clone(&self.projected_schema);
+        let filters = self.filters.clone();
 
         // What the consumer reads decides how much of a hit to build. A
         // projection of no columns at all is `COUNT(*)`: the count
@@ -365,7 +393,9 @@ impl ExecutionPlan for MatchExec {
             (Some(indices), Some(id_idx)) => indices.contains(&id_idx),
             (Some(_), None) => false,
         };
-        let counts_only = matches!(&projection, Some(indices) if indices.is_empty());
+        // A count with a filter takes the hit walk below, which prunes by it.
+        let counts_only =
+            filters.is_empty() && matches!(&projection, Some(indices) if indices.is_empty());
         let score_idx = scalar_schema.fields().len();
         let needs_score = match &projection {
             None => true,
@@ -402,7 +432,7 @@ impl ExecutionPlan for MatchExec {
                     }
                 }
                 let per_file = reader
-                    .token_match_columns_async(&column, &query, mode, &names)
+                    .token_match_columns_async(&column, &query, mode, &names, &filters)
                     .await?;
                 let mut out = Vec::with_capacity(per_file.len());
                 for batch in per_file {
@@ -457,10 +487,12 @@ impl ExecutionPlan for MatchExec {
             let hits = match &query {
                 MatchQuery::Token { query, mode } => {
                     reader
-                        .token_match_hits_async(&column, query, *mode, needs_ids)
+                        .token_match_hits_async(&column, query, *mode, needs_ids, &filters)
                         .await
                 }
-                MatchQuery::Exact { value } => reader.exact_match_async(&column, value).await,
+                MatchQuery::Exact { value } => {
+                    reader.exact_match_async(&column, value, &filters).await
+                }
             }?;
             resolve_hits(
                 &reader,
@@ -484,8 +516,9 @@ impl ExecutionPlan for MatchExec {
 mod tests {
     use std::{fmt, sync::Arc};
 
-    use arrow_array::{Array, Int64Array, LargeStringArray, RecordBatch, StringArray};
-    use arrow_schema::{DataType, Field, Schema};
+    use arrow::util::display::array_value_to_string;
+    use arrow_array::{Array, Date32Array, Int64Array, LargeStringArray, RecordBatch, StringArray};
+    use arrow_schema::{DataType, Field, Schema, TimeUnit};
     use datafusion::{
         error::DataFusionError,
         execution::TaskContext,
@@ -496,8 +529,10 @@ mod tests {
     use tempfile::TempDir;
     use tokio::runtime::Runtime;
 
-    use super::{ExactMatchFunc, MatchExec, MatchQuery, TokenMatchFunc};
+    use super::{EXACT_MATCH_UDTF, ExactMatchFunc, MatchExec, MatchQuery, TokenMatchFunc};
     use crate::{
+        Connection, FieldPatch, IndexSpec, SchemaPatch, connect,
+        runtime_metrics::op_stats::with_op_stats,
         storage::{LocalFsStorageProvider, StorageProvider},
         superfile::{builder::FtsConfig, fts::reader::BoolMode},
         supertable::{
@@ -691,7 +726,7 @@ mod tests {
     fn column_batch_rows(st: &Supertable, query: &str, mode: BoolMode) -> Vec<usize> {
         let reader = st.reader().expect("reader");
         reader
-            .block_on(reader.token_match_columns_async("title", query, mode, &["title"]))
+            .block_on(reader.token_match_columns_async("title", query, mode, &["title"], &[]))
             .expect("columns over the match")
             .iter()
             .map(RecordBatch::num_rows)
@@ -754,6 +789,327 @@ mod tests {
             .expect("delete");
         assert_the_match_is_sliced(&st);
         assert_aggregates_equal_the_rows(&st);
+    }
+
+    /// Two superfiles, one per `bucket`: bucket 0 then bucket 1. Every
+    /// title holds `rust`, and each bucket has one title that is exactly
+    /// `rust`.
+    fn two_bucket_superfiles() -> Supertable {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new("bucket", DataType::Int64, false),
+        ]));
+        let pool = Arc::new(
+            ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        let options =
+            SupertableOptions::new(Arc::clone(&schema), vec![FtsConfig::new("title")], vec![])
+                .expect("valid options")
+                .with_writer_pool(pool);
+        let st = Supertable::create(options).expect("create");
+        for (bucket, titles) in [(0_i64, ["rust", "rust zero"]), (1, ["rust", "rust one"])] {
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(LargeStringArray::from(titles.to_vec())),
+                    Arc::new(Int64Array::from(vec![bucket; titles.len()])),
+                ],
+            )
+            .expect("batch");
+            let mut w = st.writer().expect("writer");
+            w.append(&batch).expect("append");
+            w.commit().expect("commit");
+        }
+        st
+    }
+
+    /// A `WHERE` on the match functions reaches the scan, and the rows
+    /// stay what the filter keeps.
+    #[test]
+    fn where_on_match_functions_is_pushed_to_the_scan() {
+        let st = two_bucket_superfiles();
+        let cases = [
+            ("SELECT title, bucket FROM token_match('title', 'rust')", 2),
+            (
+                "SELECT _id, title, bucket FROM token_match('title', 'rust')",
+                2,
+            ),
+            ("SELECT title, bucket FROM exact_match('title', 'rust')", 1),
+        ];
+        for (sql, rows_in_bucket) in cases {
+            assert_eq!(
+                sql_row_count(&st, sql),
+                2 * rows_in_bucket,
+                "premise: {sql}"
+            );
+            let filtered = format!("{sql} WHERE bucket = 1");
+            assert_eq!(sql_row_count(&st, &filtered), rows_in_bucket, "{filtered}");
+            let plan = explain(&st, &filtered);
+            assert!(plan.contains("filters=1"), "filter not pushed: {plan}");
+            assert_eq!(sql_row_count(&st, &format!("{sql} WHERE bucket = 7")), 0);
+        }
+    }
+
+    /// Given the `WHERE`, every match kernel opens only the superfiles whose
+    /// statistics can pass it: the hit walk, the column take and the exact
+    /// match.
+    #[test]
+    fn match_kernels_open_only_the_superfiles_the_where_admits() {
+        let st = two_bucket_superfiles();
+        let rt = Runtime::new().expect("runtime");
+        // Rows out and superfiles opened by each kernel, under `filter`.
+        let run = |filter: Option<i64>| {
+            let (rows, stats) = with_op_stats(|| {
+                let reader = st.reader().expect("reader");
+                rt.block_on(async {
+                    let filters: Vec<_> = filter
+                        .map(|bucket| col("bucket").eq(lit(bucket)))
+                        .into_iter()
+                        .collect();
+                    let hits = reader
+                        .token_match_hits_async("title", "rust", BoolMode::Or, true, &filters)
+                        .await
+                        .expect("hits");
+                    let batches = reader
+                        .token_match_columns_async(
+                            "title",
+                            "rust",
+                            BoolMode::Or,
+                            &["title"],
+                            &filters,
+                        )
+                        .await
+                        .expect("columns");
+                    let exact = reader
+                        .exact_match_async("title", "rust", &filters)
+                        .await
+                        .expect("exact");
+                    let taken: usize = batches.iter().map(RecordBatch::num_rows).sum();
+                    (hits.len(), taken, exact.len())
+                })
+            });
+            (rows, stats.score_pruning_survived)
+        };
+        assert_eq!(run(None), ((4, 4, 2), 6), "premise: each kernel opens both");
+        assert_eq!(run(Some(1)), ((2, 2, 1), 3), "each kernel opens one");
+        assert_eq!(run(Some(7)), ((0, 0, 0), 0), "no superfile holds bucket 7");
+    }
+
+    /// Name of the table the metered SQL fixtures register.
+    const METERED_TABLE: &str = "docs";
+
+    /// A `memory://` connection holding [`METERED_TABLE`] with `spec`, and
+    /// one superfile per batch of `commits`. Its `query_sql` meters the
+    /// work a match function does; `Supertable::query_sql` does not.
+    fn metered_table(schema: &Arc<Schema>, spec: IndexSpec, commits: &[RecordBatch]) -> Connection {
+        let conn = connect("memory://").expect("connect");
+        let table = conn
+            .create_table(METERED_TABLE, Arc::clone(schema), spec)
+            .expect("create");
+        for batch in commits {
+            table.append(batch).expect("append");
+        }
+        conn
+    }
+
+    /// The SQL of each match path a `WHERE` reaches: the column take, the
+    /// hit walk (`_id`) and the exact match, each over `term` on `title`.
+    fn match_path_sqls(term: &str) -> [String; 3] {
+        [
+            format!("SELECT title FROM token_match('{METERED_TABLE}', 'title', '{term}')"),
+            format!("SELECT _id FROM token_match('{METERED_TABLE}', 'title', '{term}')"),
+            format!("SELECT _id FROM exact_match('{METERED_TABLE}', 'title', '{term}')"),
+        ]
+    }
+
+    /// Rows `sql` returns and the superfiles it opened.
+    fn metered_rows(conn: &Connection, sql: &str) -> (usize, u64) {
+        let (rows, stats) = with_op_stats(|| {
+            conn.query_sql(sql)
+                .expect("query_sql")
+                .iter()
+                .map(RecordBatch::num_rows)
+                .sum()
+        });
+        (rows, stats.score_pruning_survived)
+    }
+
+    /// One batch of `title` and a second column `other`.
+    fn titled_batch(schema: &Arc<Schema>, titles: &[&str], other: Arc<dyn Array>) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::clone(schema),
+            vec![Arc::new(LargeStringArray::from(titles.to_vec())), other],
+        )
+        .expect("batch")
+    }
+
+    /// A `WHERE` on a match function in SQL reaches the scan: every match
+    /// path opens only the superfile whose statistics can pass it, and
+    /// none when no superfile can.
+    #[test]
+    fn sql_where_on_match_functions_opens_only_the_superfiles_it_admits() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new("bucket", DataType::Int64, false),
+        ]));
+        let commits: Vec<_> = [(0_i64, ["rust", "rust zero"]), (1, ["rust", "rust one"])]
+            .into_iter()
+            .map(|(bucket, titles)| {
+                titled_batch(
+                    &schema,
+                    &titles,
+                    Arc::new(Int64Array::from(vec![bucket; 2])),
+                )
+            })
+            .collect();
+        let conn = metered_table(&schema, IndexSpec::new().fts("title"), &commits);
+        for sql in match_path_sqls("rust") {
+            let per_bucket = if sql.contains(EXACT_MATCH_UDTF) { 1 } else { 2 };
+            assert_eq!(
+                metered_rows(&conn, &sql),
+                (2 * per_bucket, 2),
+                "premise: {sql}"
+            );
+            let one = format!("{sql} WHERE bucket = 1");
+            assert_eq!(metered_rows(&conn, &one), (per_bucket, 1), "{one}");
+            let none = format!("{sql} WHERE bucket = 7");
+            assert_eq!(metered_rows(&conn, &none), (0, 0), "{none}");
+        }
+    }
+
+    /// A `WHERE` on an indexed column opens no superfile beyond what the
+    /// match's own terms keep: no index is read to build the scope.
+    #[test]
+    fn sql_where_on_an_indexed_column_opens_no_extra_superfile() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new("tag", DataType::LargeUtf8, false),
+        ]));
+        // Both superfiles are tagged `common`; only the first holds `rare`.
+        let commits: Vec<_> = [["rare", "plain"], ["plain", "other"]]
+            .iter()
+            .map(|titles| {
+                titled_batch(
+                    &schema,
+                    titles,
+                    Arc::new(LargeStringArray::from(vec!["common"; 2])),
+                )
+            })
+            .collect();
+        let conn = metered_table(&schema, IndexSpec::new().fts("title").fts("tag"), &commits);
+        for sql in match_path_sqls("rare") {
+            let filtered = format!("{sql} WHERE tag = 'common'");
+            assert_eq!(metered_rows(&conn, &filtered), (1, 1), "{filtered}");
+        }
+        for sql in match_path_sqls("zyzzyva") {
+            let filtered = format!("{sql} WHERE tag = 'common'");
+            assert_eq!(metered_rows(&conn, &filtered), (0, 0), "{filtered}");
+        }
+    }
+
+    /// `WHERE` shapes that reach statistics pruning on the match paths keep
+    /// exactly the rows they should: the synthetic `score`, `_id`, `OR`
+    /// branches, and a column added after the superfiles were written.
+    #[test]
+    fn sql_where_shapes_keep_their_rows() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new("bucket", DataType::Int64, false),
+        ]));
+        let commits: Vec<_> = [(0_i64, ["rust", "rust zero"]), (1, ["rust", "rust one"])]
+            .into_iter()
+            .map(|(bucket, titles)| {
+                titled_batch(
+                    &schema,
+                    &titles,
+                    Arc::new(Int64Array::from(vec![bucket; 2])),
+                )
+            })
+            .collect();
+        let conn = metered_table(&schema, IndexSpec::new().fts("title"), &commits);
+        conn.apply_schema(
+            METERED_TABLE,
+            &SchemaPatch::new(vec![FieldPatch::named("added").with_type(DataType::Int64)]),
+            None,
+        )
+        .expect("add a column");
+        let id_batches = conn
+            .query_sql(&format!(
+                "SELECT _id FROM {METERED_TABLE} WHERE bucket = 1 AND title = 'rust'"
+            ))
+            .expect("id");
+        let id = array_value_to_string(id_batches[0].column(0), 0).expect("id text");
+        // `rust` is in all four titles, and is exactly one title per bucket.
+        // Each case: projection, `WHERE`, rows for token_match, exact_match.
+        let cases = [
+            ("_id", "score >= 0".to_owned(), 4, 2),
+            ("_id", "score < 0".to_owned(), 0, 0),
+            ("_id", format!("_id = {id}"), 1, 1),
+            ("title", format!("_id = {id}"), 1, 1),
+            ("title", "bucket = 0 OR bucket = 1".to_owned(), 4, 2),
+            ("title", "bucket = 7 OR title = 'rust one'".to_owned(), 1, 0),
+            ("title", "added IS NULL".to_owned(), 4, 2),
+            ("_id", "added IS NULL AND bucket = 1".to_owned(), 2, 1),
+            ("title", "added = 3".to_owned(), 0, 0),
+        ];
+        for (projection, filter, token_rows, exact_rows) in cases {
+            for (func, rows) in [("token_match", token_rows), ("exact_match", exact_rows)] {
+                let sql = format!(
+                    "SELECT {projection} FROM {func}('{METERED_TABLE}', 'title', 'rust') \
+                     WHERE {filter}"
+                );
+                assert_eq!(metered_rows(&conn, &sql).0, rows, "{sql}");
+            }
+        }
+    }
+
+    /// A `WHERE` on a range-indexed column retyped after its superfile was
+    /// written still finds the row it keeps, on every match path.
+    #[test]
+    fn sql_where_on_a_retyped_range_column_keeps_its_rows() {
+        let cases: [(Arc<dyn Array>, DataType, &str, &str); 2] = [
+            (
+                Arc::new(Int64Array::from(vec![1_i64, 2])),
+                DataType::Float64,
+                "1.0",
+                "7.0",
+            ),
+            (
+                Arc::new(Date32Array::from(vec![1, 2])),
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                "TIMESTAMP '1970-01-02 00:00:00'",
+                "TIMESTAMP '1970-01-08 00:00:00'",
+            ),
+        ];
+        for (values, new_type, kept, absent) in cases {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("title", DataType::LargeUtf8, false),
+                Field::new("bucket", values.data_type().clone(), false),
+            ]));
+            let batch = titled_batch(&schema, &["rust", "rust one"], values);
+            let conn = metered_table(
+                &schema,
+                IndexSpec::new().fts("title").range("bucket"),
+                &[batch],
+            );
+            conn.apply_schema(
+                METERED_TABLE,
+                &SchemaPatch::new(vec![
+                    FieldPatch::named("bucket").with_type(new_type.clone()),
+                ]),
+                None,
+            )
+            .expect("retype");
+            for sql in match_path_sqls("rust") {
+                let one = format!("{sql} WHERE bucket = {kept}");
+                assert_eq!(metered_rows(&conn, &one).0, 1, "{new_type}: {one}");
+                let none = format!("{sql} WHERE bucket = {absent}");
+                assert_eq!(metered_rows(&conn, &none).0, 0, "{new_type}: {none}");
+            }
+        }
     }
 
     #[test]

@@ -33,7 +33,10 @@ use std::{
         Mutex, PoisonError,
         atomic::{AtomicU32, Ordering as AtomicOrdering},
     },
+    time::{Duration, Instant},
 };
+
+use rayon::prelude::*;
 
 // Re-exported for the drain caller (`writer.rs`), which owns the coarse
 // router across the batch loop and so must name these types.
@@ -1054,6 +1057,13 @@ const RERANK_LAW_EST_BINS: usize = 4096;
 const WIDTH_LAW_SAMPLE_SEED: u64 = 0x51ED_CA1B;
 /// Rows decoded per chunk while scoring a spilled cell.
 const WIDTH_LAW_SCORE_CHUNK: usize = 1024;
+/// Length past which a query's exact top-k accumulator is compacted (dedup by
+/// stable id, truncate to [`WIDTH_LAW_MAX_K`]). Merging appends a cell's
+/// candidates and compacts only here, so a compaction always admits at least
+/// `WIDTH_LAW_MAX_K` new candidates: amortized O(log) per candidate, where
+/// compacting on every cell re-sorted each query's whole top-k once per cell
+/// (cells x queries sorts of ~`WIDTH_LAW_MAX_K` rows, all under one lock).
+const WIDTH_LAW_TOPS_HIGH_WATER: usize = 2 * WIDTH_LAW_MAX_K;
 /// Per-query survivor cap for the 1-bit-gated width sweep's pass-1 shortlist.
 /// Pass 1 keeps the top-CAP rows by 1-bit estimate per query; pass 2 exact-
 /// rescores only those. The cap must comfortably exceed each query's exact
@@ -1153,14 +1163,16 @@ pub(crate) struct WidthLawCalibration {
     query_cands: std::collections::BinaryHeap<QueryCand>,
     dequant_scratch: Vec<f32>,
     frozen: Option<WidthLawQueries>,
-    /// Per-query `(score, cell, stable id)` candidates, truncated to the
-    /// largest law `k` as cells merge in. The stable id lets [`Self::finish`]
-    /// deduplicate boundary replicas (drain replica factor > 1.0) to their
-    /// best-scored copy, so one neighbor can never occupy several top-k
-    /// slots and narrow the law. Lock poisoning is recovered, not
-    /// propagated: each merge is an atomic append+truncate, so a panicked
-    /// pack worker leaves the held data usable.
-    tops: Mutex<Vec<Vec<(f32, u32, i128, f32)>>>,
+    /// Per-query `(score, cell, stable id)` candidates. Cells append; each
+    /// accumulator is compacted to the largest law `k` (see
+    /// [`compact_candidates`]) past [`WIDTH_LAW_TOPS_HIGH_WATER`], and once
+    /// more by [`Self::finish`] before the law walks. The stable id lets the
+    /// compaction deduplicate boundary replicas (drain replica factor > 1.0)
+    /// to their best-scored copy, so one neighbor can never occupy several
+    /// top-k slots and narrow the law. Lock poisoning is recovered, not
+    /// propagated: each merge is an append plus an optional compaction, and
+    /// either leaves the held data usable if a pack worker panics.
+    tops: Mutex<Vec<QueryTops>>,
     /// 1-bit-gated width sweep, pass-1 shortlist: per query, the top
     /// `WIDTH_LAW_SHORTLIST_CAP` `(estimate, cell, stable id)` candidates by
     /// 1-bit estimate. Pass 2 ([`Self::score_survivors`]) exact-rescores only
@@ -1806,6 +1818,39 @@ pub(crate) struct FanoutScoreCtx<'a> {
     pub(crate) prefix_cap: usize,
 }
 
+/// Where [`WidthLawCalibration::score_cell`] spent its time, for the drain's
+/// trace. Clocks are read only in builds with the `detailed-tracing` feature;
+/// in other builds every time stays zero and costs nothing.
+#[derive(Default)]
+pub(crate) struct ScoreProfile {
+    /// Queries whose rerank pool holds this cell. Each row gets one 1-bit
+    /// estimate per such query, on top of one exact distance per query.
+    pub(crate) pool_queries: usize,
+    /// Reading and decoding the cell's spill.
+    pub(crate) read: Duration,
+    /// 1-bit estimates and histogram updates for the pool queries.
+    pub(crate) estimate: Duration,
+    /// Dequantize plus one exact distance per query, per row.
+    pub(crate) exact: Duration,
+    /// Cutting each chunk's per-query candidates back to the largest law `k`.
+    pub(crate) trim: Duration,
+    /// The final merge into the shared accumulators, lock waits included.
+    pub(crate) merge: Duration,
+}
+
+/// A clock read for [`ScoreProfile`]; `None` unless detailed tracing is
+/// built in.
+fn profile_clock() -> Option<Instant> {
+    cfg!(feature = "detailed-tracing").then(Instant::now)
+}
+
+/// Add the time since `start` to `total`, when a clock was read.
+fn add_elapsed(total: &mut Duration, start: Option<Instant>) {
+    if let Some(start) = start {
+        *total += start.elapsed();
+    }
+}
+
 /// The mutable per-cell accumulators [`WidthLawCalibration::score_slice`]
 /// appends into: the width/rerank candidate partials, the estimate-histogram
 /// deltas, and (only when the fanout is being calibrated) the prefix-pool
@@ -1815,6 +1860,7 @@ struct ScoreSink<'a> {
     hist_local: &'a mut HashMap<usize, Vec<u64>>,
     /// Empty when the fanout is not being calibrated.
     prefix_partial: &'a mut [Vec<PrefixCand>],
+    profile: &'a mut ScoreProfile,
 }
 
 impl WidthLawCalibration {
@@ -1919,7 +1965,8 @@ impl WidthLawCalibration {
             ids.push(c.id);
         }
         let n_queries = ids.len();
-        *self.tops.lock().unwrap_or_else(PoisonError::into_inner) = vec![Vec::new(); n_queries];
+        *self.tops.lock().unwrap_or_else(PoisonError::into_inner) =
+            (0..n_queries).map(|_| QueryTops::default()).collect();
         *self.est_tops.lock().unwrap_or_else(PoisonError::into_inner) =
             (0..n_queries).map(|_| BinaryHeap::new()).collect();
         *self
@@ -1972,19 +2019,26 @@ impl WidthLawCalibration {
 
     /// Score every row of one spilled cell against the frozen queries and
     /// merge into the per-query candidate lists. Safe to call from the
-    /// pack fan-out workers; the merge takes one lock per cell.
-    pub(crate) fn score_cell(&self, cell: u32, spill: &SpilledCellRows) -> Result<(), BuildError> {
+    /// pack fan-out workers; the merge takes one lock per cell. Returns
+    /// where the time went, for the caller's trace.
+    pub(crate) fn score_cell(
+        &self,
+        cell: u32,
+        spill: &SpilledCellRows,
+    ) -> Result<ScoreProfile, BuildError> {
         let Some(frozen) = self.frozen.as_ref() else {
             return Err(BuildError::Store(
                 "width-law score_cell before freeze".into(),
             ));
         };
+        let mut profile = ScoreProfile::default();
         let n_queries = frozen.ids.len();
         if n_queries == 0 {
-            return Ok(());
+            return Ok(profile);
         }
         let mut partial: Vec<Vec<(f32, u32, i128, f32)>> = vec![Vec::new(); n_queries];
         let members = self.pool_members(cell);
+        profile.pool_queries = members.len();
         let mut hist_local: HashMap<usize, Vec<u64>> = HashMap::new();
         // The drain never calibrates the router fanout (no `FanoutScoreCtx`),
         // so the prefix partials stay empty here.
@@ -1993,12 +2047,15 @@ impl WidthLawCalibration {
         let mut remaining = spill.n_rows();
         let mut scratch = vec![0f32; self.dim];
         while remaining > 0 {
+            let read_t0 = profile_clock();
             let chunk = reader.next_chunk(WIDTH_LAW_SCORE_CHUNK.min(remaining))?;
+            add_elapsed(&mut profile.read, read_t0);
             remaining -= chunk.len();
             let mut sink = ScoreSink {
                 partial: &mut partial,
                 hist_local: &mut hist_local,
                 prefix_partial: &mut prefix_partial,
+                profile: &mut profile,
             };
             self.score_slice(
                 frozen,
@@ -2010,8 +2067,10 @@ impl WidthLawCalibration {
                 None,
             );
         }
+        let merge_t0 = profile_clock();
         self.merge_partial(partial, hist_local, None);
-        Ok(())
+        add_elapsed(&mut profile.merge, merge_t0);
+        Ok(profile)
     }
 
     /// [`Self::score_cell`] for already-materialized rows: an exhaustive fp32
@@ -2046,11 +2105,13 @@ impl WidthLawCalibration {
             Vec::new()
         };
         let mut scratch = vec![0f32; self.dim];
+        let mut profile = ScoreProfile::default();
         for chunk in rows.chunks(WIDTH_LAW_SCORE_CHUNK) {
             let mut sink = ScoreSink {
                 partial: &mut partial,
                 hist_local: &mut hist_local,
                 prefix_partial: &mut prefix_partial,
+                profile: &mut profile,
             };
             self.score_slice(
                 frozen,
@@ -2306,7 +2367,7 @@ impl WidthLawCalibration {
     /// exhaustive-quality exact distances over a candidate set the cheap
     /// estimate pass pre-narrowed. `survivors` is the entry for this cell from
     /// [`Self::survivors_by_cell`]. Scores each surviving row exactly against
-    /// only the queries that shortlisted it; the shared [`merge_candidates`]
+    /// only the queries that shortlisted it; the shared [`compact_candidates`]
     /// then dedups boundary replicas by stable id to their best exact copy,
     /// identical to the exhaustive path's merge.
     pub(crate) fn score_survivors(
@@ -2407,10 +2468,9 @@ impl WidthLawCalibration {
         hist_local: HashMap<usize, Vec<u64>>,
         prefix: Option<(Vec<Vec<PrefixCand>>, usize)>,
     ) {
-        let k_max = WIDTH_LAW_MAX_K;
         let mut tops = self.tops.lock().unwrap_or_else(PoisonError::into_inner);
-        for (qi, cand) in partial.into_iter().enumerate() {
-            merge_candidates(&mut tops[qi], cand, k_max);
+        for (acc, cand) in tops.iter_mut().zip(partial) {
+            acc.merge(cand);
         }
         drop(tops);
         if let Some((prefix_partial, prefix_cap)) = prefix {
@@ -2475,10 +2535,16 @@ impl WidthLawCalibration {
         let k_max = WIDTH_LAW_MAX_K;
         let rl = self.rerank.as_ref();
         let mut est_of = vec![f32::NEG_INFINITY; frozen.ids.len()];
+        // Exact time is the loop's time minus the estimate time, so a row
+        // reads the clock only when it has pool queries to estimate.
+        let loop_t0 = profile_clock();
+        let mut estimate = Duration::ZERO;
         for row in rows {
             if let Some(rl) = rl
                 && row.rabitq_code.len() == rl.quant.code_bytes()
+                && !members.is_empty()
             {
+                let est_t0 = profile_clock();
                 for &qi in members {
                     // Self-hit: the sampled query's own row is not a
                     // distractor. `finish` already excludes it from the
@@ -2509,6 +2575,7 @@ impl WidthLawCalibration {
                         bins[bin] = bins[bin].saturating_add(1);
                     }
                 }
+                add_elapsed(&mut estimate, est_t0);
             }
             dequantize_row_into(&row.encoded, scratch);
             if self.metric == Metric::Cosine {
@@ -2553,10 +2620,16 @@ impl WidthLawCalibration {
                 }
             }
         }
+        if let Some(loop_t0) = loop_t0 {
+            sink.profile.exact += loop_t0.elapsed().saturating_sub(estimate);
+        }
+        sink.profile.estimate += estimate;
         // Bound the per-cell partials the same way the merge does.
+        let trim_t0 = profile_clock();
         for cand in sink.partial.iter_mut() {
             truncate_ascending(cand, k_max);
         }
+        add_elapsed(&mut sink.profile.trim, trim_t0);
         if let Some(ctx) = fanout {
             for cand in sink.prefix_partial.iter_mut() {
                 truncate_prefix_ascending(cand, ctx.prefix_cap);
@@ -2577,37 +2650,48 @@ impl WidthLawCalibration {
         if frozen.ids.is_empty() {
             return;
         }
-        // Candidates per cell, gathered once — observation touches only
-        // rows that currently matter to some query's top-k.
+        // Candidates in this shard's cells, gathered once — observation
+        // touches only rows that currently matter to some query's top-k.
+        // Only the shard's own cells are collected: the top-k spans every
+        // cell, and the drain observes each shard as it packs. The
+        // accumulator is read as it stands, without compacting it: every
+        // row that ends in a query's final top-k is in it already (a row in
+        // the top-k of all candidates is in the top-k of any subset holding
+        // it), and a rank recorded for a row the final top-k drops is never
+        // looked up, so compacting here would only re-sort every query's
+        // accumulator once per shard. Rows already past the query's bound
+        // are skipped: they cannot reach the final top-k.
+        let shard_cells: HashSet<u32> = views.iter().filter_map(|view| view.cell_id).collect();
         let per_cell: HashMap<u32, Vec<(u32, i128)>> = {
             let tops = self.tops.lock().unwrap_or_else(PoisonError::into_inner);
             let mut map: HashMap<u32, Vec<(u32, i128)>> = HashMap::new();
-            for (qi, cands) in tops.iter().enumerate() {
-                for &(_, cell, id, _) in cands {
-                    map.entry(cell).or_default().push((qi as u32, id));
+            for (qi, acc) in tops.iter().enumerate() {
+                for &(dist, cell, id, _) in &acc.cands {
+                    if shard_cells.contains(&cell) && acc.may_survive(dist) {
+                        map.entry(cell).or_default().push((qi as u32, id));
+                    }
                 }
             }
             map
         };
-        for view in views {
+        // Cells rank independently: each fans out on the pool this runs on
+        // and records under one short `fine_ranks` lock.
+        views.par_iter().for_each(|view| {
             let Some(cell_id) = view.cell_id else {
-                continue;
+                return;
             };
             let Some(cands) = per_cell.get(&cell_id) else {
-                continue;
+                return;
             };
             if view.n_fine == 0 || view.dim != self.dim {
-                continue;
+                return;
             }
             self.max_fine
                 .fetch_max(view.n_fine as u32, AtomicOrdering::Relaxed);
             // Per-query fine ranking, computed once per query that has
             // candidates in this cell.
             let mut rank_cache: HashMap<u32, Vec<u32>> = HashMap::new();
-            let mut ranks = self
-                .fine_ranks
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
+            let mut observed: Vec<((u32, i128, u32), u32)> = Vec::with_capacity(cands.len());
             for &(qi, id) in cands {
                 let Some(&cluster) = view.cluster_of_stable.get(&id) else {
                     continue;
@@ -2632,10 +2716,14 @@ impl WidthLawCalibration {
                     rank_of
                 });
                 if let Some(&r) = rank_of.get(cluster as usize) {
-                    ranks.insert((qi, id, cell_id), r);
+                    observed.push(((qi, id, cell_id), r));
                 }
             }
-        }
+            self.fine_ranks
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .extend(observed);
+        });
     }
 
     /// Extract the width law: cells (in the grid's routing order) needed
@@ -2661,10 +2749,16 @@ impl WidthLawCalibration {
             return None;
         }
         let n_cells = grid.n_cent as usize;
-        let tops = self
+        let tops: Vec<Vec<(f32, u32, i128, f32)>> = self
             .tops
             .into_inner()
-            .unwrap_or_else(PoisonError::into_inner);
+            .unwrap_or_else(PoisonError::into_inner)
+            .into_iter()
+            .map(|mut acc| {
+                compact_candidates(&mut acc.cands, WIDTH_LAW_MAX_K);
+                acc.cands
+            })
+            .collect();
         // Superseded or empty cells inflate ranks slightly (routing skips
         // them, this count does not) — an over-probe, never an under-probe;
         // fresh drains, the normal calibration moment, have neither.
@@ -2721,7 +2815,7 @@ impl WidthLawCalibration {
                     *slot = rank as u32;
                 }
             }
-            // [`merge_candidates`] keeps one entry per stable id, so the
+            // [`compact_candidates`] keeps one entry per stable id, so the
             // accumulator only needs ranking by score for the prefix walk.
             let mut sorted = cand.clone();
             sorted.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
@@ -2950,22 +3044,92 @@ fn router_fanout_law(
     fanout_knee_from_recalls(&recall_ladder, ctx.register_floor, ctx.parity_gap)
 }
 
-/// Merge one cell's candidates into a query's accumulator: collapse to the
-/// best-scored copy per stable id FIRST (boundary replicas of one row are
-/// one neighbor), then keep the ascending-best `cap`. The dedup must
-/// precede the truncate — replicated copies of near rows filling raw slots
-/// would evict distinct farther neighbors and stamp a narrower law than a
-/// real query experiences. Equal-distance copies (the NORMAL case for a
-/// boundary replica — same vector, same exact distance) tie-break toward
-/// a rankable candidate: a copy scored outside the rerank pool carries
-/// `NEG_INFINITY` est, and keeping that one starves the rerank histogram
-/// of the row's rank, under-measuring the budget.
-fn merge_candidates(
-    acc: &mut Vec<(f32, u32, i128, f32)>,
-    mut cand: Vec<(f32, u32, i128, f32)>,
-    cap: usize,
-) {
-    acc.append(&mut cand);
+/// One query's exact top-k accumulator in [`WidthLawCalibration::tops`]:
+/// candidates appended cell by cell, compacted (see [`compact_candidates`])
+/// once they pass [`WIDTH_LAW_TOPS_HIGH_WATER`].
+#[derive(Default)]
+struct QueryTops {
+    cands: Vec<(f32, u32, i128, f32)>,
+    /// The `k`-th distance ([`WIDTH_LAW_MAX_K`]) at the last compaction that
+    /// kept a full `k`; `None` until one has. A candidate strictly farther
+    /// than it can never enter the top-k — `k` distinct ids are already at
+    /// or nearer — so [`Self::merge`] drops it rather than buffering it.
+    /// Compactions only ever lower it.
+    bound: Option<f32>,
+    /// Compactions [`Self::merge`] has run, for the test that pins them to
+    /// one per `k` admitted candidates rather than one per cell.
+    #[cfg(test)]
+    compactions: usize,
+}
+
+impl QueryTops {
+    /// Append one cell's candidates, skipping those past [`Self::bound`],
+    /// and compact once the buffer passes [`WIDTH_LAW_TOPS_HIGH_WATER`] (or
+    /// [`WIDTH_LAW_MAX_K`], while there is no bound yet).
+    fn merge(&mut self, cand: Vec<(f32, u32, i128, f32)>) {
+        let k = WIDTH_LAW_MAX_K;
+        let bound = self.bound;
+        self.cands
+            .extend(cand.into_iter().filter(|c| within_bound(bound, c.0)));
+        // Until a compaction has kept a full `k` there is no bound to filter
+        // by, so the first compaction comes as soon as `k` could be full.
+        let high_water = if self.bound.is_some() {
+            WIDTH_LAW_TOPS_HIGH_WATER
+        } else {
+            k
+        };
+        if self.cands.len() > high_water {
+            compact_candidates(&mut self.cands, k);
+            #[cfg(test)]
+            {
+                self.compactions += 1;
+            }
+            if self.cands.len() >= k {
+                self.bound = self.cands.iter().map(|c| c.0).max_by(f32::total_cmp);
+            }
+        }
+    }
+
+    /// Whether a candidate at `dist` can still reach the final top-k: not
+    /// strictly past [`Self::bound`].
+    fn may_survive(&self, dist: f32) -> bool {
+        within_bound(self.bound, dist)
+    }
+
+    /// An accumulator holding exactly `cands`, for tests that plant a top-k.
+    #[cfg(test)]
+    fn planted(cands: Vec<(f32, u32, i128, f32)>) -> Self {
+        Self {
+            cands,
+            ..Self::default()
+        }
+    }
+}
+
+/// `dist` is not strictly past `bound` (an absent bound admits everything).
+fn within_bound(bound: Option<f32>, dist: f32) -> bool {
+    bound.is_none_or(|bound| dist.total_cmp(&bound) != Ordering::Greater)
+}
+
+/// Settle a query's exact top-k accumulator: collapse to the best-scored copy
+/// per stable id FIRST (boundary replicas of one row are one neighbor), then
+/// keep the ascending-best `cap`. The dedup must precede the truncate —
+/// replicated copies of near rows filling raw slots would evict distinct
+/// farther neighbors and stamp a narrower law than a real query experiences.
+/// Equal-distance copies (the NORMAL case for a boundary replica — same
+/// vector, same exact distance) tie-break toward a rankable candidate: a copy
+/// scored outside the rerank pool carries `NEG_INFINITY` est, and keeping
+/// that one starves the rerank histogram of the row's rank, under-measuring
+/// the budget.
+///
+/// The result over a set of candidates does not depend on how the set was
+/// split across earlier compactions: a copy a compaction drops had `cap`
+/// distinct ids ranked ahead of it (by distance, then id), and every one of
+/// them stays ahead however many candidates arrive later. So
+/// [`WidthLawCalibration::merge_partial`] appends and compacts only past
+/// [`WIDTH_LAW_TOPS_HIGH_WATER`], and [`WidthLawCalibration::finish`]
+/// compacts once more before reading.
+fn compact_candidates(acc: &mut Vec<(f32, u32, i128, f32)>, cap: usize) {
     acc.sort_unstable_by(|a, b| {
         a.2.cmp(&b.2)
             .then_with(|| a.0.total_cmp(&b.0))
@@ -2981,10 +3145,24 @@ fn merge_candidates(
     truncate_ascending(acc, cap);
 }
 
-/// Keep the ascending-best `cap` candidates in place.
+/// Append `cand` to `acc` and settle it — the one-shot form the planted-law
+/// tests use to build an accumulator.
+#[cfg(test)]
+fn merge_candidates(
+    acc: &mut Vec<(f32, u32, i128, f32)>,
+    mut cand: Vec<(f32, u32, i128, f32)>,
+    cap: usize,
+) {
+    acc.append(&mut cand);
+    compact_candidates(acc, cap);
+}
+
+/// Keep the ascending-best `cap` candidates in place. Equal distances order
+/// by stable id, so which of several equidistant rows keeps the last slot is
+/// fixed by the candidates alone, never by the order cells merged in.
 fn truncate_ascending(cand: &mut Vec<(f32, u32, i128, f32)>, cap: usize) {
     if cand.len() > cap {
-        cand.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+        cand.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.2.cmp(&b.2)));
         cand.truncate(cap);
     }
 }
@@ -3182,8 +3360,10 @@ mod tests {
     use std::sync::Arc;
 
     use bytes::Bytes;
+    use tempfile::tempdir;
 
     use super::*;
+    use crate::superfile::vector::spill::MaterializedRowSpillWriter;
 
     /// Every stage crosses at the target itself — no padded per-stage
     /// variant, no derived second constant. Pins that the shipped
@@ -3279,7 +3459,7 @@ mod tests {
         // there, BEFORE the truncate, so replicas can never occupy slots.
         let mut acc = Vec::new();
         merge_candidates(&mut acc, cands, WIDTH_LAW_MAX_K);
-        *cal.tops.lock().unwrap_or_else(PoisonError::into_inner) = vec![acc];
+        *cal.tops.lock().unwrap_or_else(PoisonError::into_inner) = vec![QueryTops::planted(acc)];
 
         let law = cal
             .finish(&grid, None)
@@ -3322,7 +3502,7 @@ mod tests {
             .collect();
         let mut acc = Vec::new();
         merge_candidates(&mut acc, cands, WIDTH_LAW_MAX_K);
-        *cal.tops.lock().unwrap_or_else(PoisonError::into_inner) = vec![acc];
+        *cal.tops.lock().unwrap_or_else(PoisonError::into_inner) = vec![QueryTops::planted(acc)];
 
         // Unit fine centroids ranked 0, 1, 2 against the e0 query.
         let mut cluster_of_stable = HashMap::new();
@@ -3478,6 +3658,29 @@ mod tests {
                 laws_a.fine_for_k, laws_b.fine_for_k,
                 "fine law diverged under the gate ({metric:?})"
             );
+
+            // Spilled path (the drain's `score_cell`): same laws as the
+            // in-memory path, and its profile reports the cell's pool.
+            let cal_c = build();
+            let directory = tempdir().expect("tempdir");
+            let mut pooled_cells = 0;
+            for (cell, rows) in &per_cell {
+                let mut writer =
+                    MaterializedRowSpillWriter::create(directory.path(), *cell, DIM, DIM / 8)
+                        .expect("spill writer");
+                for row in rows {
+                    writer.append(row).expect("spill row");
+                }
+                let spill = writer.finish().expect("finish spill");
+                let profile = cal_c.score_cell(*cell, &spill).expect("score_cell");
+                assert_eq!(profile.pool_queries, cal_c.pool_members(*cell).len());
+                pooled_cells += usize::from(profile.pool_queries > 0);
+            }
+            assert!(pooled_cells > 0, "the 1-bit estimate branch must run");
+            let laws_c = cal_c.finish(&grid, None).expect("spilled laws");
+            assert_eq!(laws_a.width_for_k, laws_c.width_for_k, "{metric:?}");
+            assert_eq!(laws_a.rerank_for_k, laws_c.rerank_for_k, "{metric:?}");
+            assert_eq!(laws_a.fine_for_k, laws_c.fine_for_k, "{metric:?}");
         }
     }
 
@@ -3607,7 +3810,7 @@ mod tests {
             .collect();
         let mut acc = Vec::new();
         merge_candidates(&mut acc, cands, WIDTH_LAW_MAX_K);
-        *cal.tops.lock().unwrap_or_else(PoisonError::into_inner) = vec![acc];
+        *cal.tops.lock().unwrap_or_else(PoisonError::into_inner) = vec![QueryTops::planted(acc)];
 
         let laws = cal
             .finish(&grid, None)
@@ -3647,7 +3850,7 @@ mod tests {
             .collect();
         let mut acc = Vec::new();
         merge_candidates(&mut acc, cands, WIDTH_LAW_MAX_K);
-        *cal.tops.lock().unwrap_or_else(PoisonError::into_inner) = vec![acc];
+        *cal.tops.lock().unwrap_or_else(PoisonError::into_inner) = vec![QueryTops::planted(acc)];
 
         // id 10 is missing from the view: its rank is unobservable.
         let mut cluster_of_stable = HashMap::new();
@@ -3726,7 +3929,8 @@ mod tests {
         let (mut acc_a, mut acc_b) = (Vec::new(), Vec::new());
         merge_candidates(&mut acc_a, a, k_max);
         merge_candidates(&mut acc_b, b, k_max);
-        *cal.tops.lock().unwrap_or_else(PoisonError::into_inner) = vec![acc_a, acc_b];
+        *cal.tops.lock().unwrap_or_else(PoisonError::into_inner) =
+            vec![QueryTops::planted(acc_a), QueryTops::planted(acc_b)];
 
         let law = cal
             .finish(&grid, None)
@@ -3774,7 +3978,7 @@ mod tests {
             vec![(0.01, 7, 1, f32::NEG_INFINITY)],
             WIDTH_LAW_MAX_K,
         );
-        *cal.tops.lock().unwrap_or_else(PoisonError::into_inner) = vec![acc];
+        *cal.tops.lock().unwrap_or_else(PoisonError::into_inner) = vec![QueryTops::planted(acc)];
         assert!(
             cal.finish(&grid, None).is_none(),
             "inconsistent calibration input must abandon the law, not panic"
@@ -4777,5 +4981,106 @@ mod tests {
                 prev = ef;
             }
         }
+    }
+    /// Rows per cell in the accumulator tests: small, like the cells a
+    /// table of a few thousand rows drains into.
+    const TOPS_TEST_CELL_ROWS: usize = 23;
+    /// Cells in the accumulator tests: enough candidates for several
+    /// compactions at `WIDTH_LAW_MAX_K`.
+    const TOPS_TEST_CELLS: usize = 300;
+    /// One row in this many is also planted, as a boundary replica, in the
+    /// next cell.
+    const TOPS_TEST_REPLICA_EVERY: usize = 5;
+    /// Distances take this many distinct values, so rows tie at the k-th
+    /// slot.
+    const TOPS_TEST_DISTANCES: u64 = 97;
+    /// Multiplier spreading row ids over the distance values.
+    const TOPS_TEST_HASH: u64 = 0x9E37_79B9_7F4A_7C15;
+
+    /// One query's candidates, cell by cell: each row has a hashed distance
+    /// and a rankable or unrankable estimate, and every
+    /// `TOPS_TEST_REPLICA_EVERY`-th row reappears in the next cell at the
+    /// same distance, unrankable.
+    fn planted_cells() -> Vec<Vec<(f32, u32, i128, f32)>> {
+        let mut cells: Vec<Vec<(f32, u32, i128, f32)>> = vec![Vec::new(); TOPS_TEST_CELLS];
+        let mut id = 0i128;
+        for cell in 0..TOPS_TEST_CELLS {
+            for row in 0..TOPS_TEST_CELL_ROWS {
+                id += 1;
+                let hash = (id as u64).wrapping_mul(TOPS_TEST_HASH);
+                let dist = (hash % TOPS_TEST_DISTANCES) as f32 / TOPS_TEST_DISTANCES as f32;
+                let est = if hash.is_multiple_of(2) {
+                    dist
+                } else {
+                    f32::NEG_INFINITY
+                };
+                cells[cell].push((dist, cell as u32, id, est));
+                if row % TOPS_TEST_REPLICA_EVERY == 0 && cell + 1 < TOPS_TEST_CELLS {
+                    cells[cell + 1].push((dist, cell as u32 + 1, id, f32::NEG_INFINITY));
+                }
+            }
+        }
+        cells
+    }
+
+    /// Merging cell by cell, in any order, keeps exactly what one compaction
+    /// of every candidate keeps — the same rows, the same surviving replica
+    /// copy — including which of several equidistant rows take the last
+    /// slots.
+    #[test]
+    fn query_tops_merge_in_any_order_matches_one_compaction() {
+        let cells = planted_cells();
+        let mut expected = Vec::new();
+        merge_candidates(&mut expected, cells.concat(), WIDTH_LAW_MAX_K);
+        assert_eq!(expected.len(), WIDTH_LAW_MAX_K);
+        expected.sort_by_key(|c| c.2);
+
+        // The fixture must exercise the tie: more distinct rows sit at the
+        // k-th distance than the top-k keeps.
+        let kth = expected
+            .iter()
+            .map(|c| c.0)
+            .max_by(f32::total_cmp)
+            .expect("full top-k");
+        let mut all = Vec::new();
+        merge_candidates(&mut all, cells.concat(), usize::MAX);
+        let tied = |set: &[(f32, u32, i128, f32)]| set.iter().filter(|c| c.0 == kth).count();
+        assert!(tied(&all) > tied(&expected), "fixture has no tie at k");
+
+        let forward: Vec<usize> = (0..TOPS_TEST_CELLS).collect();
+        let reverse: Vec<usize> = (0..TOPS_TEST_CELLS).rev().collect();
+        let interleaved: Vec<usize> = (0..TOPS_TEST_CELLS)
+            .step_by(2)
+            .chain((1..TOPS_TEST_CELLS).step_by(2))
+            .collect();
+        for order in [forward, reverse, interleaved] {
+            let mut acc = QueryTops::default();
+            for &cell in &order {
+                acc.merge(cells[cell].clone());
+            }
+            compact_candidates(&mut acc.cands, WIDTH_LAW_MAX_K);
+            acc.cands.sort_by_key(|c| c.2);
+            assert_eq!(acc.cands, expected);
+        }
+    }
+
+    /// A small cell's candidates are appended, not merged by re-sorting the
+    /// whole top-k: compactions track the candidates admitted, at most one
+    /// per `WIDTH_LAW_MAX_K` of them, however many cells deliver them.
+    #[test]
+    fn query_tops_compacts_per_k_candidates_not_per_cell() {
+        let cells = planted_cells();
+        let candidates: usize = cells.iter().map(Vec::len).sum();
+        let mut acc = QueryTops::default();
+        for cell in cells {
+            acc.merge(cell);
+        }
+        assert!(acc.compactions >= 1, "the fixture overflows the top-k");
+        assert!(
+            acc.compactions <= candidates / WIDTH_LAW_MAX_K + 1,
+            "{} compactions for {candidates} candidates over {TOPS_TEST_CELLS} cells",
+            acc.compactions
+        );
+        assert!(acc.cands.len() <= WIDTH_LAW_TOPS_HIGH_WATER + TOPS_TEST_CELL_ROWS * 2);
     }
 }

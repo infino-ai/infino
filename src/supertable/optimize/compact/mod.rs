@@ -77,9 +77,9 @@ use crate::{
         writer::{
             CommitFence, CommitListMetadata, NewEntryBirthVersions, PreparedSuperfile, ShardOutput,
             backoff_delay, finalize_compaction_commit, maint_pool, orphaned_id_floor,
-            persist_list_metadata_async, prepare_superfile_named, recalibrate_probe_laws,
-            refresh_slow_vector_state, split_overflow_cells, term_head_sink_for,
-            try_commit_attempt, write_superfile_list,
+            pending_drain_sources, persist_list_metadata_async, prepare_superfile_named,
+            recalibrate_probe_laws, refresh_slow_vector_state, split_overflow_cells,
+            term_head_sink_for, try_commit_attempt, write_superfile_list,
         },
     },
     utils::{
@@ -483,7 +483,7 @@ pub(crate) mod plan;
 #[cfg(test)]
 pub(crate) use plan::select;
 pub(crate) use plan::{CompactionJob, SuperfileStats, max_merge_input_bytes};
-use plan::{MIB, MergeMemory, select_within, split_stats_at_drain_watermark};
+use plan::{MIB, MergeMemory, select_within, split_stats_by_drain_state};
 
 /// Cap on compaction input opens in flight, counted across the whole process
 /// rather than per merge. Several merges run at once, and it is their combined
@@ -729,16 +729,28 @@ impl Supertable {
                 );
             }
 
-            // A user table with a hidden vector index selects jobs per side of
-            // the drain watermark, never across it (see
-            // [`split_stats_at_drain_watermark`] for why a mixed merge loses
-            // vectors). Tables without a hidden sibling select over everything.
+            // A user table with a hidden vector index selects jobs within the
+            // drained group and within the undrained one, never across them,
+            // and leaves the sources of a drain in progress out of both (see
+            // [`split_stats_by_drain_state`] for why either would lose
+            // vectors). Tables without a hidden sibling select over
+            // everything. When the drain in progress cannot be read, only the
+            // drained group is merged: an undrained merge might take its
+            // sources.
             let stat_groups: Vec<Vec<SuperfileStats>> = match inner.vector_index_table.as_ref() {
                 Some(hidden) => {
                     let drained = hidden.inner().manifest.load_full().get_drained_ranges();
-                    let (drained_stats, undrained_stats) =
-                        split_stats_at_drain_watermark(stats, &drained);
-                    vec![drained_stats, undrained_stats]
+                    match pending_drain_sources(hidden.inner()).await {
+                        Ok(pending) => split_stats_by_drain_state(stats, &drained, &pending).into(),
+                        Err(error) => {
+                            warn!(
+                                "compaction: the drain in progress could not be read ({error}); merging only drained superfiles this pass"
+                            );
+                            let [drained_stats, _] =
+                                split_stats_by_drain_state(stats, &drained, &HashSet::new());
+                            vec![drained_stats]
+                        }
+                    }
                 }
                 None => vec![stats],
             };
@@ -914,9 +926,9 @@ impl Supertable {
         let disk_cache = manifest.options.disk_cache.clone();
         let storage = manifest.options.storage.clone();
 
-        // This reserves budget for the whole input size since merge still
-        // loads it all at once. Real fix is streaming the merge and pooling
-        // buffers instead of a flat reservation; picking that up later.
+        // A merge maps its inputs and streams its rows through a window
+        // bounded by bytes (see `MergeMemory`), and nothing here reserves
+        // memory for it.
         // Deliberately not reserved from `connection_memory_budget`: that budget
         // bounds what search and ingest may hold on behalf of a connection, and
         // a merge is neither. Charging it here made the optimizer's footprint a
@@ -1759,9 +1771,12 @@ impl Supertable {
     /// ([`MERGE_MEMORY_RESERVE_PERCENT`]). `None` sets no limit.
     fn merge_memory(&self, host: Option<(u64, u64)>) -> MergeMemory {
         let manifest = self.inner().manifest.load();
+        let scalar_schema = manifest.scalar_schema();
         MergeMemory {
-            row_bytes: null_row_bytes(&manifest.scalar_schema()),
+            row_bytes: null_row_bytes(&scalar_schema),
+            fields: scalar_schema.fields().len() as u64,
             indexed: !manifest.fts_configs().is_empty() || !manifest.vector_configs().is_empty(),
+            gathered: !manifest.vector_configs().is_empty(),
             limit: host.map(|(available, _)| {
                 available.saturating_mul(100 - MERGE_MEMORY_RESERVE_PERCENT) / 100
             }),
@@ -2146,12 +2161,18 @@ const MERGE_ADMIT_SETTLE: Duration = Duration::from_millis(250);
 
 /// What the merge of `job` is expected to hold once it is running, from
 /// what the plan knows about it (see [`MergeMemory::footprint`]): its
-/// inputs, its output, an indexed table's per-row bookkeeping and the
-/// window of decoded rows its table's width makes. The host reading, not
-/// this, is what finally bounds the width: this only stands in for a
-/// merge's allocation between its admission and the reading that shows it.
+/// inputs, its output, an indexed table's per-row bookkeeping, the window
+/// of decoded rows its table's width makes, the columns it writes at once,
+/// and its inputs' footers. The host reading, not this, is what finally
+/// bounds the width: this only stands in for a merge's allocation between
+/// its admission and the reading that shows it.
 fn expected_merge_footprint(job: &CompactionJob, memory: &MergeMemory) -> u64 {
-    memory.footprint(job.input_bytes, job.estimated_output_bytes, job.live_docs)
+    memory.footprint(
+        job.input_bytes,
+        job.estimated_output_bytes,
+        job.live_docs,
+        job.inputs.len(),
+    )
 }
 
 /// How many of `jobs` the host's memory lets run at once, as the width the
@@ -3096,9 +3117,9 @@ async fn clear_completed_conversions(inner: &SupertableInner) -> Result<(), Comp
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::HashSet,
+        collections::{BTreeSet, HashSet},
         env, fs,
-        io::Error as IoError,
+        io::{self, Error as IoError},
         mem,
         ops::Range,
         str,
@@ -3124,7 +3145,8 @@ mod tests {
 
     use super::{
         plan::{
-            INDEXED_MERGE_ROW_BYTES,
+            GATHERED_MERGE_ROW_BYTES, INDEXED_MERGE_ROW_BYTES, INPUT_FOOTER_BYTES_PER_COLUMN,
+            OFFSET_INDEXED_CHUNK_BYTES,
             tests::{default_cfg, seg},
         },
         *,
@@ -3140,7 +3162,10 @@ mod tests {
         memory::ConnectionMemoryBudget,
         storage::{ObjectMeta, StorageError},
         superfile::{
-            builder::{FtsConfig, MERGE_DECODED_WINDOW_BYTES, VectorConfig},
+            builder::{
+                DEFAULT_ROW_GROUP_ROWS, FtsConfig, MERGE_COLUMN_BYTES, MERGE_DECODED_WINDOW_BYTES,
+                MERGE_GATHERED_READ_BYTES, PASS_FIELDS, VectorConfig,
+            },
             fts::{bm25::Bm25Params, reader::Bm25SearchOptions},
             reader::SuperfileReader,
             vector::{distance::Metric, layout::VectorLayout, rerank_codec::RerankCodec},
@@ -3177,15 +3202,19 @@ mod tests {
     /// The memory of an indexed table's merges, its width aside.
     const INDEXED: MergeMemory = MergeMemory {
         row_bytes: 0,
+        fields: 0,
         indexed: true,
+        gathered: false,
         limit: None,
     };
 
-    /// A decoded row of a narrow table: an id and a title.
+    /// A decoded row of a narrow table, and its columns: an id and a title.
     const NARROW_ROW_BYTES: u64 = 24;
+    const NARROW_FIELDS: u64 = 2;
 
-    /// A decoded row of a table thousands of columns wide.
+    /// A decoded row of a table thousands of columns wide, and its columns.
     const WIDE_ROW_BYTES: u64 = 20_000;
+    const WIDE_FIELDS: u64 = 2_900;
 
     /// How long compaction's background warm of its output may take to land
     /// in the disk cache before a test counts it as never warmed: the warm
@@ -3312,6 +3341,106 @@ mod tests {
         fn preserves_tombstones(&self) -> bool {
             true
         }
+    }
+
+    /// Counts the bytes the production merge writes, so a test can tell an
+    /// empty output from one the runner never built.
+    struct CountsOutputBytes {
+        written: Arc<AtomicUsize>,
+    }
+
+    /// A writer that forwards to the merge's output and counts what passes.
+    struct CountingWriter<'a> {
+        inner: &'a mut dyn Write,
+        written: &'a AtomicUsize,
+    }
+
+    impl Write for CountingWriter<'_> {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            let n = self.inner.write(buf)?;
+            self.written.fetch_add(n, Ordering::SeqCst);
+            Ok(n)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.inner.flush()
+        }
+    }
+
+    impl SuperfileMerge for CountsOutputBytes {
+        fn build(
+            &self,
+            inputs: MergeInputs<'_>,
+            output: &mut dyn Write,
+        ) -> Result<BuiltSuperfileStats, BuildError> {
+            let mut counting = CountingWriter {
+                inner: output,
+                written: &self.written,
+            };
+            CompactionMerge.build(inputs, &mut counting)
+        }
+
+        fn preserves_tombstones(&self) -> bool {
+            CompactionMerge.preserves_tombstones()
+        }
+    }
+
+    /// Compacting inputs whose every row is deleted reclaims them: the job
+    /// commits, the inputs leave the manifest, and nothing replaces them.
+    ///
+    /// The merge streams its output to a temp file and maps it back before
+    /// it looks at the row count. With no live rows the builder writes
+    /// nothing, so the runner maps a zero-length file; that must read as
+    /// empty bytes and end in the no-docs reclaim, not fail the job.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compacting_fully_deleted_inputs_reclaims_them() {
+        let dir = TempDir::new().expect("tempdir");
+        let st = make_st(&dir);
+        commit_titles(&st, &["alpha first", "alpha second"]);
+        commit_titles(&st, &["bravo first", "bravo second"]);
+        commit_titles(&st, &["charlie first", "charlie second"]);
+        let ids = listed_ids(&st);
+        assert_eq!(ids.len(), 3, "fixture");
+        let (doomed, survivor) = (&ids[..2], ids[2]);
+
+        let stats = st
+            .delete(
+                col("title")
+                    .like(lit("alpha%"))
+                    .or(col("title").like(lit("bravo%"))),
+            )
+            .expect("delete");
+        assert_eq!(stats.n_tombstoned(), 4, "every row of both inputs");
+
+        let written = Arc::new(AtomicUsize::new(0));
+        let outcome = st
+            .run_compaction_job_with(
+                CompactionJob {
+                    partition_key: Vec::new(),
+                    inputs: doomed.to_vec(),
+                    ..CompactionJob::default()
+                },
+                DEFAULT_STALE_SEAL_TIMEOUT,
+                Arc::new(CountsOutputBytes {
+                    written: Arc::clone(&written),
+                }),
+            )
+            .await
+            .expect("a fully deleted merge must reclaim, not fail");
+
+        assert!(matches!(outcome, JobOutcome::Committed), "{outcome:?}");
+        assert_eq!(
+            written.load(Ordering::SeqCst),
+            0,
+            "the merge must have built an empty output for the runner to map"
+        );
+        assert_eq!(
+            listed_ids(&st),
+            vec![survivor],
+            "the dead inputs leave with no replacement"
+        );
+        let reader = st.reader().expect("reader");
+        assert_eq!(reader.n_docs_total(), 2, "only the survivor's rows remain");
     }
 
     /// A delete that lands while a job is building must not be dropped by
@@ -5677,6 +5806,76 @@ mod tests {
         }
     }
 
+    /// A merge of a multi-cell table writes its rows in its cells' order:
+    /// after it, a vector search still finds exactly the rows whose vector
+    /// is nearest, by their text, and a text search the rows holding the
+    /// token, as before it.
+    #[test]
+    fn a_multi_cell_merge_keeps_its_vector_and_text_results() {
+        let dir = TempDir::new().expect("tempdir");
+        let st = make_multi_cell_st(&dir);
+        commit_multi_cell_superfiles(&st, 0);
+        commit_multi_cell_superfiles(&st, MULTI_CELL_COMMITS);
+        st.block_on_query(assert_merges_are_multi_cell(&st));
+        let commits = 2 * MULTI_CELL_COMMITS;
+        // Row `row` of commit `commit` is one-hot at the dimension below.
+        let hot = |commit: usize, row: usize| (commit * MULTI_CELL_ROWS + row) % MULTI_CELL_DIM;
+        let per_dim = commits * MULTI_CELL_ROWS / MULTI_CELL_DIM;
+        let results = |st: &Supertable| {
+            let vector: Vec<BTreeSet<String>> = (0..MULTI_CELL_DIM)
+                .map(|dim| {
+                    let mut query = vec![0.0f32; MULTI_CELL_DIM];
+                    query[dim] = 1.0;
+                    let batches = st
+                        .vector_search(
+                            "emb",
+                            &query,
+                            per_dim,
+                            VectorSearchOptions::new(),
+                            None,
+                            Some(&["title"]),
+                        )
+                        .expect("vector search");
+                    titles_of(&batches).into_iter().collect()
+                })
+                .collect();
+            let text: Vec<BTreeSet<String>> = (0..commits)
+                .map(|n| {
+                    let batches = st
+                        .bm25_search(
+                            "title",
+                            &n.to_string(),
+                            commits * MULTI_CELL_ROWS,
+                            Bm25SearchOptions::new().with_mode(BoolMode::Or),
+                            Some(&["title"]),
+                        )
+                        .expect("text search");
+                    titles_of(&batches).into_iter().collect()
+                })
+                .collect();
+            (vector, text)
+        };
+        let before = results(&st);
+        for (dim, titles) in before.0.iter().enumerate() {
+            let want: BTreeSet<String> = (0..commits)
+                .flat_map(|c| (0..MULTI_CELL_ROWS).map(move |r| (c, r)))
+                .filter(|&(c, r)| hot(c, r) == dim)
+                .map(|(c, r)| format!("commit {c} row {r}"))
+                .collect();
+            assert_eq!(titles, &want, "guard: dimension {dim}'s rows");
+        }
+        let files = st.reader().expect("reader").n_superfiles();
+
+        st.optimize(&OptimizeOptions::compact(multi_cell_compact_cfg()))
+            .expect("optimize");
+
+        assert!(
+            st.reader().expect("reader").n_superfiles() < files,
+            "guard: the table merged"
+        );
+        assert_eq!(results(&st), before);
+    }
+
     #[test]
     fn optimize_repairs_a_multi_cell_superfile_listed_twice() {
         // The production case: an append committed twice left one multi-cell
@@ -7486,19 +7685,115 @@ mod tests {
         );
     }
 
+    /// A merge is charged a writer and a decoder for each column it writes
+    /// at once: every column of a narrow table, a pass's of a wide one
+    /// however wide. A merge with no rows writes none.
+    #[test]
+    fn a_merge_is_charged_the_columns_it_writes_at_once() {
+        let job = |live_docs| CompactionJob {
+            estimated_output_bytes: 5,
+            input_bytes: 7,
+            live_docs,
+            ..CompactionJob::default()
+        };
+        let narrow = MergeMemory {
+            fields: NARROW_FIELDS,
+            ..MergeMemory::default()
+        };
+        assert_eq!(
+            expected_merge_footprint(&job(1_000), &narrow),
+            12 + NARROW_FIELDS * MERGE_COLUMN_BYTES
+        );
+        let wide = MergeMemory {
+            fields: WIDE_FIELDS,
+            ..MergeMemory::default()
+        };
+        let wider = MergeMemory {
+            fields: 10 * WIDE_FIELDS,
+            ..MergeMemory::default()
+        };
+        assert_eq!(
+            expected_merge_footprint(&job(1_000), &wide),
+            12 + PASS_FIELDS as u64 * MERGE_COLUMN_BYTES
+        );
+        assert_eq!(
+            expected_merge_footprint(&job(1_000), &wider),
+            expected_merge_footprint(&job(1_000), &wide),
+            "past a pass, the width does not change what a merge holds"
+        );
+        assert_eq!(expected_merge_footprint(&job(0), &wide), 12);
+    }
+
+    /// A merge is charged its inputs' footers, which it holds open from its
+    /// start to its end: a column of each input's.
+    #[test]
+    fn a_merge_is_charged_its_inputs_footers() {
+        let wide = MergeMemory {
+            fields: WIDE_FIELDS,
+            ..MergeMemory::default()
+        };
+        let job = |inputs: u128| CompactionJob {
+            inputs: (0..inputs).map(Uuid::from_u128).collect(),
+            ..CompactionJob::default()
+        };
+        assert_eq!(expected_merge_footprint(&job(0), &wide), 0);
+        assert_eq!(
+            expected_merge_footprint(&job(300), &wide),
+            300 * WIDE_FIELDS * INPUT_FOOTER_BYTES_PER_COLUMN
+        );
+        assert_eq!(
+            expected_merge_footprint(&job(300), &MergeMemory::default()),
+            0,
+            "a table of no columns holds no footers"
+        );
+    }
+
+    /// A merge writing its rows in an order of its own is charged the input
+    /// rows a pass reads before ordering them, the order and each row's
+    /// place, and a column chunk of offset index for each column of each
+    /// input row group. A merge with no rows is charged none of it.
+    #[test]
+    fn a_gathered_merge_is_charged_its_order_reads_and_offset_index() {
+        let job = |live_docs, inputs: u128| CompactionJob {
+            inputs: (0..inputs).map(Uuid::from_u128).collect(),
+            live_docs,
+            ..CompactionJob::default()
+        };
+        let plain = MergeMemory {
+            fields: NARROW_FIELDS,
+            ..MergeMemory::default()
+        };
+        let gathered = MergeMemory {
+            gathered: true,
+            ..plain
+        };
+        let extra = |live_docs, inputs| {
+            expected_merge_footprint(&job(live_docs, inputs), &gathered)
+                - expected_merge_footprint(&job(live_docs, inputs), &plain)
+        };
+        assert_eq!(extra(0, 3), 0, "a merge with no rows reads none");
+        let live_docs = 3 * DEFAULT_ROW_GROUP_ROWS as u64 + 1;
+        assert_eq!(
+            extra(live_docs, 3),
+            live_docs * GATHERED_MERGE_ROW_BYTES
+                + MERGE_GATHERED_READ_BYTES
+                + (4 + 3) * NARROW_FIELDS * OFFSET_INDEXED_CHUNK_BYTES
+        );
+    }
+
     /// A table's merges are charged its width: the scalar schema's decoded
-    /// row, and whether it carries an index.
+    /// row and its columns, and whether it carries an index.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_tables_merges_are_charged_its_width() {
         let dir = TempDir::new().expect("tempdir");
         let st = make_st(&dir);
         let memory = st.merge_memory(None);
-        assert_eq!(
-            memory.row_bytes,
-            null_row_bytes(&st.inner().manifest.load().scalar_schema())
-        );
+        let scalar_schema = st.inner().manifest.load().scalar_schema();
+        assert_eq!(memory.row_bytes, null_row_bytes(&scalar_schema));
         assert!(memory.row_bytes > 0);
+        assert_eq!(memory.fields, scalar_schema.fields().len() as u64);
         assert!(memory.indexed, "the default table indexes its title");
+        assert!(!memory.gathered, "the default table has no vector index");
         assert_eq!(memory.limit, None, "an unread host sets no limit");
         let gib = 1u64 << 30;
         assert_eq!(

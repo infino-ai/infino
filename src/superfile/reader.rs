@@ -27,7 +27,7 @@ use std::{
     ops::{Deref, Range},
     str,
     sync::{
-        Arc, OnceLock, RwLock,
+        Arc, OnceLock, PoisonError, RwLock,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -38,7 +38,7 @@ use arrow_array::{
     Array, ArrayRef, Decimal128Array, LargeStringArray, RecordBatch, RecordBatchOptions,
     RecordBatchReader, UInt32Array,
 };
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
 use bytes::Bytes;
 use futures::{
     FutureExt,
@@ -81,7 +81,7 @@ use crate::{
         },
         id_space::{FtsDocId, RowId},
         ids::{self, PackedIds},
-        range::{KeyKind, RangeDirectory},
+        range::{KeyKind, RangeDirectory, same_keys},
         vector::{
             layout::VectorLayout,
             reader::{self as vector_reader, ProbeTally, ScanCandidate, ScanOutcome, VectorReader},
@@ -89,7 +89,7 @@ use crate::{
     },
     supertable::{
         query::{df_object_store::merged_within, provider::tombstone_access_plan},
-        schema::FieldId,
+        schema::{FieldId, field_id_of},
     },
     utils::terms::DictEntry,
 };
@@ -549,13 +549,176 @@ fn page_index_from_bytes(
     footer: &ParquetMetaData,
     bytes: &Bytes,
 ) -> Result<Arc<ParquetMetaData>, ReadError> {
-    let mut loader = page_index_loader(footer);
+    read_page_index_from_bytes(page_index_loader(footer), bytes)
+}
+
+/// `footer` with only its offset index read out of the file's resident
+/// `bytes`: what a row selection skips pages by, without the column index,
+/// every page's bounds, which on a wide file is far larger.
+fn offset_index_from_bytes(
+    footer: &ParquetMetaData,
+    bytes: &Bytes,
+) -> Result<Arc<ParquetMetaData>, ReadError> {
+    let loader = page_index_loader(footer).with_column_index_policy(PageIndexPolicy::Skip);
+    read_page_index_from_bytes(loader, bytes)
+}
+
+/// The footer `loader` holds with the page index it is set to read, read
+/// out of the file's resident `bytes`.
+fn read_page_index_from_bytes(
+    mut loader: ParquetMetaDataReader,
+    bytes: &Bytes,
+) -> Result<Arc<ParquetMetaData>, ReadError> {
     loader
         .read_page_indexes(bytes)
         .map_err(footer::FooterError::from)?;
     Ok(Arc::new(
         loader.finish().map_err(footer::FooterError::from)?,
     ))
+}
+
+/// The rows of a file a merge keeps, every row but its deleted ones, as
+/// runs of consecutive file rows: what numbers the kept rows, the merge's
+/// survivors, from 0, and maps a run of them back to the file's rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct KeptRows {
+    /// Runs of kept file rows, ascending.
+    runs: Vec<Range<u64>>,
+    /// Kept rows before each run.
+    before: Vec<u64>,
+    /// Kept rows in all.
+    len: u64,
+}
+
+impl KeptRows {
+    /// The rows of a file of `rows` rows but those in `deleted`.
+    pub(crate) fn new(rows: u64, deleted: Option<&RoaringBitmap>) -> Self {
+        let mut runs = Vec::new();
+        let mut at = 0u64;
+        for row in deleted.into_iter().flatten().map(u64::from) {
+            if row >= rows {
+                break;
+            }
+            if row > at {
+                runs.push(at..row);
+            }
+            at = row + 1;
+        }
+        if rows > at {
+            runs.push(at..rows);
+        }
+        let mut before = Vec::with_capacity(runs.len());
+        let mut len = 0;
+        for run in &runs {
+            before.push(len);
+            len += run.end - run.start;
+        }
+        Self { runs, before, len }
+    }
+
+    /// How many rows are kept.
+    pub(crate) fn len(&self) -> u64 {
+        self.len
+    }
+
+    /// The file rows of kept rows `survivors`, as ascending runs.
+    pub(crate) fn file_runs(&self, survivors: Range<u64>) -> Vec<Range<u64>> {
+        let end = survivors.end.min(self.len);
+        if survivors.start >= end {
+            return Vec::new();
+        }
+        // The run holding the first survivor: the last starting at or
+        // before it.
+        let first = self.before.partition_point(|&b| b <= survivors.start) - 1;
+        let mut out = Vec::new();
+        for (run, &before) in self.runs[first..].iter().zip(&self.before[first..]) {
+            if before >= end {
+                break;
+            }
+            let from = run.start + survivors.start.saturating_sub(before);
+            let to = run.start + (end - before).min(run.end - run.start);
+            out.push(from..to);
+        }
+        out
+    }
+}
+
+/// What a read of some of a file's kept rows reads: the row groups holding
+/// them and the selection of those rows within those groups, built once
+/// and shared by every read of the same rows (see
+/// [`SuperfileReader::kept_record_batches`]).
+#[derive(Debug, Clone)]
+pub(crate) struct KeptRead {
+    row_groups: Vec<usize>,
+    selection: RowSelection,
+}
+
+impl KeptRows {
+    /// The read of kept rows `survivors` of the file `metadata` describes,
+    /// or `None` when there are none.
+    pub(crate) fn read(
+        &self,
+        metadata: &ParquetMetaData,
+        survivors: Range<u64>,
+    ) -> Option<KeptRead> {
+        KeptRead::of_runs(metadata, &self.file_runs(survivors))
+    }
+}
+
+impl KeptRead {
+    /// The read of file rows `rows`, ascending and distinct, of the file
+    /// `metadata` describes, or `None` when there are none.
+    pub(crate) fn of_rows(metadata: &ParquetMetaData, rows: &[u64]) -> Option<KeptRead> {
+        let mut runs: Vec<Range<u64>> = Vec::new();
+        for &row in rows {
+            match runs.last_mut() {
+                Some(run) if run.end == row => run.end += 1,
+                _ => runs.push(row..row + 1),
+            }
+        }
+        Self::of_runs(metadata, &runs)
+    }
+
+    /// The read of the file rows in `runs`, ascending and disjoint.
+    fn of_runs(metadata: &ParquetMetaData, runs: &[Range<u64>]) -> Option<KeptRead> {
+        let (first, last) = (runs.first()?.start, runs.last()?.end);
+        // The row groups holding rows `first..last`, and the file row the
+        // first of them starts at.
+        let mut row_groups = Vec::new();
+        let mut base = None;
+        let mut end = 0u64;
+        let mut start = 0u64;
+        for (index, group) in metadata.row_groups().iter().enumerate() {
+            let rows = u64::try_from(group.num_rows()).unwrap_or(0);
+            if start < last && start + rows > first {
+                row_groups.push(index);
+                base.get_or_insert(start);
+                end = start + rows;
+            }
+            start += rows;
+        }
+        let mut at = base.unwrap_or(0);
+        let mut selectors = Vec::with_capacity(2 * runs.len() + 1);
+        for run in runs {
+            if run.start > at {
+                selectors.push(RowSelector::skip(row_count(run.start - at)));
+            }
+            selectors.push(RowSelector::select(row_count(run.end - run.start)));
+            at = run.end;
+        }
+        if end > at {
+            selectors.push(RowSelector::skip(row_count(end - at)));
+        }
+        Some(KeptRead {
+            row_groups,
+            selection: RowSelection::from(selectors),
+        })
+    }
+}
+
+/// `rows` as the row count a [`RowSelector`] takes.
+fn row_count(rows: u64) -> usize {
+    usize::try_from(rows).unwrap_or(usize::MAX)
 }
 
 /// `parquet` with its Arrow schema resolved as the eager open resolves it
@@ -1284,6 +1447,16 @@ impl SuperfileReader {
         &self,
         deleted_docs_bitmap: Option<Arc<RoaringBitmap>>,
     ) -> Result<ParquetRecordBatchReader, ReadError> {
+        self.record_batches_of(deleted_docs_bitmap, None)
+    }
+
+    /// [`Self::record_batches`], `batch_rows` rows to a batch, or the
+    /// Parquet reader's default when `None`.
+    pub(crate) fn record_batches_of(
+        &self,
+        deleted_docs_bitmap: Option<Arc<RoaringBitmap>>,
+        batch_rows: Option<usize>,
+    ) -> Result<ParquetRecordBatchReader, ReadError> {
         let bytes = self
             .bytes
             .as_ref()
@@ -1298,6 +1471,9 @@ impl SuperfileReader {
 
         let mut builder =
             ParquetRecordBatchReaderBuilder::new_with_metadata(bytes.clone(), arrow_meta);
+        if let Some(rows) = batch_rows {
+            builder = builder.with_batch_size(rows.max(1));
+        }
         if let Some(plan) = plan {
             let row_groups = plan.row_group_indexes();
             let selection = plan
@@ -1310,6 +1486,58 @@ impl SuperfileReader {
             }
         }
         builder
+            .build()
+            .map_err(|e| ReadError::Columnar(e.to_string()))
+    }
+
+    /// This reader's Arrow metadata for the synchronous decodes, with the
+    /// offset index they skip whole pages through when `offset_index`: the
+    /// resident footer when it carries what is asked, else one parsed for
+    /// the caller out of the resident bytes and not kept, so a reader
+    /// shared with queries is left as it is. Only the offset index is
+    /// parsed: a row selection skips by page locations, and a wide file's
+    /// column index, every page's bounds, is far larger.
+    pub(crate) fn arrow_metadata(
+        &self,
+        offset_index: bool,
+    ) -> Result<ArrowReaderMetadata, ReadError> {
+        // A loaded page index stays loaded, so the footer read after this
+        // check carries it too.
+        if !offset_index || self.loaded_parquet_metadata_with_page_index().is_some() {
+            return self.resident_arrow_metadata();
+        }
+        let resident = self.resident_arrow_metadata()?;
+        let bytes = self
+            .bytes
+            .as_ref()
+            .ok_or(ReadError::LazyReaderUnsupported)?;
+        resolve_arrow(offset_index_from_bytes(resident.metadata(), bytes)?)
+    }
+
+    /// The rows `read` names (see [`KeptRows::read`]), the top-level columns
+    /// `columns` of them in file order, `batch_rows` rows to a batch,
+    /// decoded through `metadata` ([`Self::arrow_metadata`]). Only the row
+    /// groups holding them are read, and within those a footer with the
+    /// offset index skips the pages before and after them.
+    pub(crate) fn kept_record_batches(
+        &self,
+        metadata: &ArrowReaderMetadata,
+        read: &KeptRead,
+        columns: &[usize],
+        batch_rows: usize,
+    ) -> Result<ParquetRecordBatchReader, ReadError> {
+        let bytes = self
+            .bytes
+            .as_ref()
+            .ok_or(ReadError::LazyReaderUnsupported)?;
+        ParquetRecordBatchReaderBuilder::new_with_metadata(bytes.clone(), metadata.clone())
+            .with_row_groups(read.row_groups.clone())
+            .with_row_selection(read.selection.clone())
+            .with_projection(ProjectionMask::roots(
+                metadata.parquet_schema(),
+                columns.iter().copied(),
+            ))
+            .with_batch_size(batch_rows.max(1))
             .build()
             .map_err(|e| ReadError::Columnar(e.to_string()))
     }
@@ -1385,21 +1613,35 @@ impl SuperfileReader {
     }
 
     /// The range index's directory and the column's id in it, when the
-    /// superfile range-indexes the column with table id `field` with keys of
-    /// `kind`. The column is found by its id, not its name, so a file written
-    /// before a rename still serves it, and one written before the name was
-    /// dropped and reused does not. `None` otherwise — no region, the column
-    /// not in it, or keyed another way (a file written before the column's
-    /// type changed) — and the caller scans the column. The directory is
-    /// fetched once per reader.
+    /// superfile range-indexes the column with table id `field` with keys
+    /// that mean what keys of `data_type`, the column's type now, do. The
+    /// column is found by its id, not its name, so a file written before a
+    /// rename still serves it, and one written before the name was dropped
+    /// and reused does not. `None` otherwise — no region, the column not in
+    /// it, or keyed another way (a file written before the column's type
+    /// changed, e.g. days before a change to nanoseconds) — and the caller
+    /// scans the column. The directory is fetched once per reader.
     async fn range_column(
         &self,
         field: FieldId,
-        kind: KeyKind,
+        data_type: &DataType,
     ) -> Result<Option<(Arc<RangeDirectory>, u32)>, ReadError> {
         let Some(loc) = self.range_region else {
             return Ok(None);
         };
+        let Some(kind) = KeyKind::of(data_type) else {
+            return Ok(None);
+        };
+        // The type this file wrote the column with, which its keys follow.
+        let written_with = self
+            .schema()
+            .fields()
+            .iter()
+            .find(|f| field_id_of(f) == Some(field))
+            .map(|f| f.data_type());
+        if !written_with.is_some_and(|t| same_keys(t, data_type)) {
+            return Ok(None);
+        }
         let directory = self
             .range_directory
             .get_or_try_init(|| async {
@@ -1444,15 +1686,15 @@ impl SuperfileReader {
 
     /// An estimate of the rows whose key lies in `lo..=hi`, from the range
     /// index's directory alone (see `RangeColumn::estimate`); `None` when
-    /// the superfile does not range-index the column with keys of `kind`.
+    /// the superfile does not range-index the column with keys of `data_type`.
     pub(crate) async fn range_estimate(
         &self,
         field: FieldId,
-        kind: KeyKind,
+        data_type: &DataType,
         lo: u64,
         hi: u64,
     ) -> Result<Option<u64>, ReadError> {
-        let Some((directory, field_id)) = self.range_column(field, kind).await? else {
+        let Some((directory, field_id)) = self.range_column(field, data_type).await? else {
             return Ok(None);
         };
         Ok(directory.column(field_id).map(|c| c.estimate(lo, hi)))
@@ -1461,16 +1703,16 @@ impl SuperfileReader {
     /// The rows whose key lies in `lo..=hi`, read from the range
     /// index: one read of the blocks the range reaches, decoded on `pool`.
     /// `None` when the superfile does not range-index the column with keys of
-    /// `kind`; the caller scans the column.
+    /// `data_type`; the caller scans the column.
     pub(crate) async fn range_rows(
         &self,
         field: FieldId,
-        kind: KeyKind,
+        data_type: &DataType,
         lo: u64,
         hi: u64,
         pool: Option<&ThreadPool>,
     ) -> Result<Option<RoaringBitmap>, ReadError> {
-        let Some((directory, field_id)) = self.range_column(field, kind).await? else {
+        let Some((directory, field_id)) = self.range_column(field, data_type).await? else {
             return Ok(None);
         };
         let Some(loc) = self.range_region else {
@@ -1508,17 +1750,17 @@ impl SuperfileReader {
     /// are read from its near end, one at a time, until `k` rows are found,
     /// so the read is a block or two however wide the interval. Fewer than
     /// `k` when the interval holds fewer. `None` when the superfile does
-    /// not range-index the column with keys of `kind`.
+    /// not range-index the column with keys of `data_type`.
     pub(crate) async fn range_ends(
         &self,
         field: FieldId,
-        kind: KeyKind,
+        data_type: &DataType,
         (lo, hi): (u64, u64),
         k: usize,
         descending: bool,
         skip: &RoaringBitmap,
     ) -> Result<Option<RangeEnds>, ReadError> {
-        let Some((directory, field_id)) = self.range_column(field, kind).await? else {
+        let Some((directory, field_id)) = self.range_column(field, data_type).await? else {
             return Ok(None);
         };
         let Some(loc) = self.range_region else {
@@ -1588,15 +1830,15 @@ impl SuperfileReader {
     /// How many rows' keys lie in `lo..=hi`, from the range index:
     /// the blocks wholly inside the range count from the directory, and only
     /// the blocks it cuts — at most two — are read. `None` when the
-    /// superfile does not range-index the column with keys of `kind`.
+    /// superfile does not range-index the column with keys of `data_type`.
     pub(crate) async fn range_count(
         &self,
         field: FieldId,
-        kind: KeyKind,
+        data_type: &DataType,
         lo: u64,
         hi: u64,
     ) -> Result<Option<u64>, ReadError> {
-        let Some((directory, field_id)) = self.range_column(field, kind).await? else {
+        let Some((directory, field_id)) = self.range_column(field, data_type).await? else {
             return Ok(None);
         };
         let Some(loc) = self.range_region else {
@@ -2776,7 +3018,14 @@ impl SuperfileReader {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
-        if let Some((cached, view)) = self.scored_fts.read().expect("scored fts memo").as_ref()
+        // A poisoned memo is read through: it holds one pair, replaced
+        // whole, so a panic while it was held leaves it a valid pair, and
+        // failing every later search on this reader would be worse.
+        if let Some((cached, view)) = self
+            .scored_fts
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
             && cached.matches(scoring)
         {
             return Ok(ScoredFts::Derived(Arc::clone(view)));
@@ -2788,7 +3037,10 @@ impl SuperfileReader {
         // Last writer wins. Two queries racing here derive the same view
         // from the same inputs — `with_scoring` is deterministic — so which
         // one lands is immaterial.
-        *self.scored_fts.write().expect("scored fts memo") =
+        *self
+            .scored_fts
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) =
             Some((ScoringKey::of(scoring), Arc::clone(&view)));
         Ok(ScoredFts::Derived(view))
     }
@@ -3440,21 +3692,45 @@ fn gather_rows(
             Ok((batch, row - starts[batch]))
         })
         .collect::<Result<Vec<_>, _>>()?;
+    interleave_rows(schema, batches, &at).map_err(|e| ReadError::Columnar(e.to_string()))
+}
+
+/// One batch of `schema` holding the rows `at` names, in its order: each
+/// entry is a batch of `batches` and a row of that batch. Only the batches
+/// `at` names are handed to the interleave, so a short run of rows drawn
+/// from a few of many batches costs in proportion to those few.
+pub(crate) fn interleave_rows(
+    schema: &SchemaRef,
+    batches: &[RecordBatch],
+    at: &[(usize, usize)],
+) -> Result<RecordBatch, ArrowError> {
+    // Each named batch's slot among the ones handed over, in first-use order.
+    let mut slot = vec![usize::MAX; batches.len()];
+    let mut used = Vec::new();
+    let at: Vec<(usize, usize)> = at
+        .iter()
+        .map(|&(batch, row)| {
+            if slot[batch] == usize::MAX {
+                slot[batch] = used.len();
+                used.push(batch);
+            }
+            (slot[batch], row)
+        })
+        .collect();
     let columns = (0..schema.fields().len())
         .map(|column| {
-            let arrays: Vec<&dyn Array> = batches
+            let arrays: Vec<&dyn Array> = used
                 .iter()
-                .map(|batch| batch.column(column).as_ref())
+                .map(|&batch| batches[batch].column(column).as_ref())
                 .collect();
-            interleave(&arrays, &at).map_err(|e| ReadError::Columnar(e.to_string()))
+            interleave(&arrays, &at)
         })
         .collect::<Result<Vec<_>, _>>()?;
     RecordBatch::try_new_with_options(
         Arc::clone(schema),
         columns,
-        &RecordBatchOptions::new().with_row_count(Some(ids.len())),
+        &RecordBatchOptions::new().with_row_count(Some(at.len())),
     )
-    .map_err(|e| ReadError::Columnar(e.to_string()))
 }
 
 /// Rank-back `take` indices restoring the caller's id order (duplicates
@@ -3568,7 +3844,7 @@ fn fts_reader_error_to_read(e: FtsError) -> ReadError {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::{collections::HashSet, thread};
 
     use arrow::compute::cast;
     use arrow_array::{Decimal128Array, Int64Array, LargeStringArray, RecordBatch};
@@ -4137,6 +4413,45 @@ mod tests {
         assert_eq!(got, vec![2, 1, 2, 0]);
     }
 
+    /// Only the batches the rows name reach the interleave: a batch none
+    /// of them names is left alone even when it could not be interleaved
+    /// with the rest, and the rows come back in the order given.
+    #[test]
+    fn interleave_rows_hands_over_only_the_batches_it_names() {
+        let schema: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
+        let ints = |rows: std::ops::Range<i64>| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int64Array::from_iter_values(rows)) as ArrayRef],
+            )
+            .expect("batch")
+        };
+        // The middle batch's column is a different type, so interleaving it
+        // with the others fails.
+        let odd = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "n",
+                DataType::LargeUtf8,
+                false,
+            )])),
+            vec![Arc::new(LargeStringArray::from(vec!["x"])) as ArrayRef],
+        )
+        .expect("batch");
+        let batches = vec![ints(0..3), odd, ints(10..14)];
+        let gathered =
+            interleave_rows(&schema, &batches, &[(2, 3), (0, 1), (2, 0)]).expect("interleave");
+        let got = gathered
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("Int64")
+            .values()
+            .to_vec();
+        assert_eq!(got, vec![13, 1, 10]);
+        assert!(interleave_rows(&schema, &batches, &[(1, 0), (0, 0)]).is_err());
+    }
+
     /// The whole-column gather takes rows from across the decoded batches,
     /// in the caller's order, repeats and the rows either side of a batch
     /// boundary included, and refuses a row past the file.
@@ -4453,6 +4768,35 @@ mod tests {
     }
 
     // ── Additional coverage ───────────────────────────────────────────
+
+    #[test]
+    fn a_poisoned_scored_view_memo_still_serves() {
+        // A reader whose scored-view memo a panicking thread held, then two
+        // searches under one parameter pair.
+        // - The first derives a view, the second reuses it.
+        // This test pins that one panic does not fail every later search on
+        // the reader.
+        let r = SuperfileReader::open(build_simple_fts_only_superfile()).expect("open");
+        let poisoner = thread::scope(|s| {
+            s.spawn(|| {
+                let _held = r.scored_fts.write();
+                panic!("poison the memo");
+            })
+            .join()
+        });
+        assert!(poisoner.is_err() && r.scored_fts.is_poisoned());
+        let at = ScoringView {
+            params: Some(Bm25Params::new(1.4, 0.6)),
+            avgdl: None,
+        };
+        let derived = |out: Result<ScoredFts<'_>, ReadError>| match out.expect("search") {
+            ScoredFts::Derived(v) => v,
+            ScoredFts::Baked(_) => panic!("an override must derive a view"),
+        };
+        let first = derived(r.fts_scored(&at));
+        let again = derived(r.fts_scored(&at));
+        assert!(Arc::ptr_eq(&first, &again), "the memo still reuses a view");
+    }
 
     #[test]
     fn a_scored_view_is_memoized_per_parameter_pair() {
