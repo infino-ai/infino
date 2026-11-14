@@ -118,7 +118,7 @@ use crate::{
                 EncodedPart, PointerFile, frame_content_size, part_uri, read_pointer,
                 translate_contention, write_manifest, write_object_bytes, write_pointer,
             },
-            disk_cache::MetadataDiskCache,
+            disk_cache::{KeptWhole, MetadataDiskCache},
             encoding::SummaryWireMode,
             list::{
                 FORMAT_VERSION as LIST_FORMAT_VERSION, Manifest, ManifestPartEntry,
@@ -180,10 +180,6 @@ pub(crate) const DEFAULT_VECTOR_INDEX_PREFIX: &str = "_vector_index";
 /// attempt that wrote them, so what this bounds is how much stays alive
 /// between attempts. A part past it is rebuilt on each attempt, as before.
 const REBUILT_PARTS_MAX_BYTES: usize = 256 * 1024 * 1024;
-/// Headroom over a list's part bytes when sizing the manifest disk cache, in
-/// divisor form (`bytes + bytes / this`), for the term-index slices and
-/// routing siblings that share the cache.
-const MANIFEST_CACHE_HEADROOM_DIVISOR: u64 = 10;
 
 /// One immutable point-in-time view of the supertable.
 ///
@@ -3562,12 +3558,12 @@ impl ManifestPartLoader {
                 },
             );
         }
-        // Holds every part of the list, so a full load reuses the cache
-        // instead of evicting parts before the next load reads them.
+        // Keeps every part of the list, so a full load reuses the cache
+        // instead of evicting parts before the next load reads them. The
+        // latest loader sets the size, whichever list it loads; one for an
+        // older list costs refetches until the next load corrects it.
         if let Some(cache) = &metadata_disk_cache {
-            cache.raise_budget(
-                part_bytes.saturating_add(part_bytes / MANIFEST_CACHE_HEADROOM_DIVISOR),
-            );
+            cache.keep_whole(KeptWhole::Manifest, part_bytes);
         }
         Self {
             storage,
@@ -8058,6 +8054,54 @@ mod tests {
                 parts.len(),
                 "the second load is served from the cache"
             );
+
+            let _ = std::fs::remove_dir_all(&cache_root);
+        }
+
+        #[tokio::test]
+        async fn a_smaller_list_evicts_the_parts_only_the_old_list_read() {
+            // A list of four parts, then its successor of one new part: the
+            // cache shrinks to the new list, and caching the new part makes
+            // room by evicting the old list's parts.
+            let old: Vec<ManifestPart> = (41..45).map(make_test_part).collect();
+            let new = make_test_part(45);
+            let (mut objects, old_entries) = encode_and_index(&old);
+            let (new_objects, new_entries) = encode_and_index(from_ref(&new));
+            objects.extend(new_objects);
+            let storage = Arc::new(CountingMockStorage::new(objects)) as Arc<dyn StorageProvider>;
+            let old_hashes: Vec<ContentHash> =
+                old_entries.iter().map(|entry| entry.content_hash).collect();
+            let new_hash = new_entries[0].content_hash;
+            let cache_root =
+                std::env::temp_dir().join("infino-manifest-cache-loader-test-smaller_list_evicts");
+            let _ = std::fs::remove_dir_all(&cache_root);
+            let cache = MetadataDiskCache::new(cache_root.clone(), 0).expect("cache");
+
+            let old_list = fresh_list(old_entries);
+            let loader = ManifestPartLoader::new_with_cache(
+                Arc::clone(&storage),
+                &old_list,
+                Some(Arc::clone(&cache)),
+            );
+            for part in &old {
+                loader.load(part.part_id).await.expect("load old");
+            }
+            for hash in &old_hashes {
+                assert!(cache.contains(hash), "the old list is cached whole");
+            }
+
+            let new_list = fresh_list(new_entries);
+            let loader = ManifestPartLoader::new_with_cache(
+                Arc::clone(&storage),
+                &new_list,
+                Some(Arc::clone(&cache)),
+            );
+            loader.load(new.part_id).await.expect("load new");
+            assert!(cache.contains(&new_hash), "the new part is cached");
+            for hash in &old_hashes {
+                assert!(!cache.contains(hash), "an old part made room");
+            }
+            assert!(cache.stats().current_bytes <= cache.budget_bytes());
 
             let _ = std::fs::remove_dir_all(&cache_root);
         }
