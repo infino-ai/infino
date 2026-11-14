@@ -2716,13 +2716,12 @@ impl SuperfileReader {
         &self,
         column: &str,
         terms: &[&str],
-        pool: Option<&ThreadPool>,
-        budget: Option<&Arc<ConnectionMemoryBudget>>,
+        prefetched: Option<&FetchedTermMemo>,
     ) -> Result<(Vec<ContainsRows>, MatchWork), ReadError> {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
-        Ok(fts.term_rows(column, terms, pool, budget).await?)
+        Ok(fts.term_rows(column, terms, prefetched).await?)
     }
 
     /// Unranked token-match **count**: the number of `local_doc_id`s

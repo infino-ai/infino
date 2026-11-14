@@ -126,8 +126,8 @@ use crate::{
         },
         query::{
             candidate::{
-                CandidatePlan, ExactFilter, exact_filter, exact_range, like_prune_leaves,
-                single_range,
+                CandidatePlan, ExactFilter, TermMemos, exact_filter, exact_range,
+                like_prune_leaves, single_range,
             },
             deleted_stats::DeletedStatsCache,
             df_object_store::SuperfileObjectStore,
@@ -138,7 +138,10 @@ use crate::{
                 common::{BoundPredicate, PushedPredicate, take_file_columns, unqualified},
                 metered_exec::MeteredExec,
             },
-            fts::{IndexedSuperfile, memos_from_plan_locations, plan_locations_for},
+            fts::{
+                IndexedSuperfile, PlanLocations, index_locations_for, memos_from_plan_locations,
+                plan_locations_for,
+            },
             nan_bounds::without_nan_blind_bounds,
             prune::{PruneLeaf, select_superfiles},
             range_counts::{RangeBucket, RangeCounts},
@@ -856,10 +859,12 @@ impl SupertableProvider {
         &self,
         prepared: &PreparedScanFile,
         check: &ExactCheck,
+        memos: &TermMemos,
         bound: Option<&RoaringBitmap>,
         gate: u64,
         tombstones: &RoaringBitmap,
         batch_size: usize,
+        limit: Option<u64>,
     ) -> DfResult<(RoaringBitmap, MatchWork)> {
         let pool: &ThreadPool = &self.manifest.options.reader_pool;
         let mut work = MatchWork::default();
@@ -870,6 +875,56 @@ impl SupertableProvider {
                 .await?;
             self.count_rows_checked(checked.len(), verified.len());
             return Ok((verified, work));
+        }
+        // Under a LIMIT, any `limit` live rows of the selection answer it
+        // (see `exact_limit`). When the selection is one `OR` of whole terms
+        // and nothing else narrows it, each term's rows are all rows the
+        // selection keeps, so the terms are read one at a time until their
+        // union holds that many: a common term ends the read, and the rarer
+        // terms after it cost nothing.
+        if let Some(limit) = limit
+            && bound.is_none()
+            && check.ranges.is_empty()
+            && let Some(leaves) = check.whole_or_leaves()
+        {
+            let mut rows = RoaringBitmap::new();
+            let mut every_leaf_read = true;
+            for leaf in leaves {
+                let file_column = prepared
+                    .reader
+                    .column_alias(self.manifest.field_id(&leaf.column), &leaf.column);
+                let read = prepared
+                    .reader
+                    .term_rows(
+                        file_column,
+                        &[leaf.needle.as_str()],
+                        memos.get(&leaf.column).map(Arc::as_ref),
+                    )
+                    .await;
+                match read {
+                    Ok((mut leaf_rows, leaf_work)) => {
+                        work.merge(leaf_work);
+                        if let Some(leaf_rows) = leaf_rows.pop() {
+                            rows |= leaf_rows.proven;
+                        }
+                    }
+                    // No postings for the term's column here: the general
+                    // path below checks this superfile's rows by their text.
+                    Err(e) if holds_no_postings(&e) => {
+                        every_leaf_read = false;
+                        break;
+                    }
+                    Err(e) => return Err(QueryError::from(e).into()),
+                }
+                if rows.len().saturating_sub(rows.intersection_len(tombstones)) >= limit {
+                    return Ok((rows, work));
+                }
+            }
+            // Every term read and still short of the limit: the union is the
+            // whole selection.
+            if every_leaf_read {
+                return Ok((rows, work));
+            }
         }
         // Each column's distinct needles, in first-seen order: those an
         // indexed term must contain (`ILIKE`), and those that must be an
@@ -894,7 +949,7 @@ impl SupertableProvider {
             let read = if whole {
                 prepared
                     .reader
-                    .term_rows(file_column, &needles, Some(pool), Some(budget))
+                    .term_rows(file_column, &needles, memos.get(column).map(Arc::as_ref))
                     .await
             } else {
                 prepared
@@ -1871,6 +1926,45 @@ impl ExactCheck {
         }))
     }
 
+    /// The whole-term leaves of a conjunction that is one `OR` of them (or
+    /// a single one), in order; `None` for any other shape.
+    fn whole_or_leaves(&self) -> Option<Vec<&crate::supertable::query::candidate::ExactContains>> {
+        let ExactFilter::And(conjuncts) = &self.filter else {
+            return None;
+        };
+        let [only] = conjuncts.as_slice() else {
+            return None;
+        };
+        let leaves = match only {
+            ExactFilter::Contains(leaf) => vec![leaf],
+            ExactFilter::Or(children) => children
+                .iter()
+                .map(|child| match child {
+                    ExactFilter::Contains(leaf) => Some(leaf),
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>()?,
+            ExactFilter::And(_) => return None,
+        };
+        leaves.iter().all(|leaf| leaf.whole).then_some(leaves)
+    }
+
+    /// Each column's distinct whole-term needles (a `text_match`'s tokens),
+    /// for the term index to locate before the scan.
+    fn whole_terms(&self) -> Vec<(String, Vec<String>)> {
+        let mut out: Vec<(String, Vec<String>)> = Vec::new();
+        for leaf in self.filter.leaves().into_iter().filter(|leaf| leaf.whole) {
+            match out.iter_mut().find(|(column, _)| *column == leaf.column) {
+                Some((_, terms)) if !terms.contains(&leaf.needle) => {
+                    terms.push(leaf.needle.clone())
+                }
+                Some(_) => {}
+                None => out.push((leaf.column.clone(), vec![leaf.needle.clone()])),
+            }
+        }
+        out
+    }
+
     /// Of `rows` in `reader`'s superfile, the ones the conjunction holds
     /// for, read from their stored text `batch_size` rows at a time. The
     /// ids are drawn from `rows` one batch at a time, never copied out
@@ -2189,6 +2283,19 @@ impl TableProvider for SupertableProvider {
         let plan_locations =
             plan_locations_for(&self.manifest, &candidate_plan, &survivor_entries).await?;
         let plan_locations = &plan_locations;
+        // The same for the exact conjuncts' whole terms (`text_match`): each
+        // superfile then reads a term's postings from where the index says
+        // they are, rather than through its dictionary.
+        let mut exact_locations = PlanLocations::new();
+        if let Some(check) = exact_check {
+            for (column, terms) in check.whole_terms() {
+                let refs: Vec<&str> = terms.iter().map(String::as_str).collect();
+                let located =
+                    index_locations_for(&self.manifest, &column, &refs, &survivor_entries).await?;
+                exact_locations.insert(column, located);
+            }
+        }
+        let exact_locations = &exact_locations;
 
         // Open every survivor, at most `superfiles_in_flight` at once, so a
         // scan over thousands of files does not hold thousands of opens'
@@ -2446,14 +2553,22 @@ impl TableProvider for SupertableProvider {
                                 let _slot = exact_slots.acquire().await.map_err(|e| {
                                     DataFusionError::Internal(format!("exact rows slot: {e}"))
                                 })?;
+                                let memos = memos_from_plan_locations(
+                                    prepared.reader.as_ref(),
+                                    exact_locations,
+                                    entry.superfile_id,
+                                )
+                                .await;
                                 let (rows, exact_work) = self
                                     .exact_rows(
                                         &prepared,
                                         check,
+                                        &memos,
                                         candidates.as_ref(),
                                         gate,
                                         &tombstones,
                                         batch_size,
+                                        exact_limit,
                                     )
                                     .await?;
                                 predicate_work.merge(exact_work);
