@@ -5102,6 +5102,81 @@ mod tests {
         assert_eq!(one_count(&conn, "SELECT COUNT(*) FROM picks"), 3);
     }
 
+    /// The plan `conn` keeps for `sql`, bound by [`StatementPlans::bind`] in a
+    /// fresh session holding the catalog tables `tables`, with that session.
+    fn bind_kept(
+        conn: &Connection,
+        sql: &str,
+        tables: &[&str],
+    ) -> (SessionContext, Option<LogicalPlan>) {
+        let ctx = sql_session_context(&conn.inner.connection_memory_budget).expect("session");
+        for name in tables {
+            conn.open_and_register(&ctx, name)
+                .expect("register")
+                .expect("a catalog table");
+        }
+        let (_, plan) = conn.inner.statement_plans.get(sql).expect("kept");
+        let bound = bridge_on_runtime(StatementPlans::bind(plan, &ctx), &shared_io_runtime())
+            .expect("bind");
+        (ctx, bound)
+    }
+
+    /// A statement over catalog tables is kept, and its plan binds to the
+    /// tables a later run registers and reads their rows committed since. A
+    /// table not registered, or whose schema has changed since, sends the
+    /// statement back to parsing; a search function's statement is not kept.
+    #[test]
+    fn a_kept_statement_binds_only_to_its_unchanged_tables() {
+        let conn = connect("memory://").expect("connect");
+        let field = Field::new("tag", DataType::LargeUtf8, true);
+        let tags = one_column_table(&conn, "tags", field, distinct_strings("a", 3));
+        let every = "SELECT tag FROM tags";
+        assert_eq!(n_rows(&conn.query_sql(every).expect("sql")), 3);
+        let (tables, _) = conn.inner.statement_plans.get(every).expect("kept");
+        assert_eq!(tables, ["tags"]);
+
+        tags.append(
+            &RecordBatch::try_new(tags.schema(), vec![distinct_strings("c", 4)]).expect("batch"),
+        )
+        .expect("append");
+        let (ctx, bound) = bind_kept(&conn, every, &["tags"]);
+        let bound = bound.expect("an unchanged table binds");
+        let rows = bridge_on_runtime(
+            async { ctx.execute_logical_plan(bound).await?.collect().await },
+            &shared_io_runtime(),
+        )
+        .expect("execute");
+        assert_eq!(n_rows(&rows), 7, "the rows committed since");
+
+        assert!(
+            bind_kept(&conn, every, &[]).1.is_none(),
+            "a table not registered"
+        );
+        conn.apply_schema(
+            "tags",
+            &SchemaPatch::new(vec![
+                FieldPatch::named("note").with_type(DataType::LargeUtf8),
+            ]),
+            None,
+        )
+        .expect("add a column");
+        assert!(
+            bind_kept(&conn, every, &["tags"]).1.is_none(),
+            "a schema changed since"
+        );
+
+        conn.create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create docs")
+            .append(&build_title_batch(&["the quick brown fox", "a lazy dog"]))
+            .expect("append");
+        let search = "SELECT _id FROM bm25_search('docs', 'title', 'fox', 10)";
+        assert_eq!(n_rows(&conn.query_sql(search).expect("search")), 1);
+        assert!(
+            conn.inner.statement_plans.get(search).is_none(),
+            "a search function's statement"
+        );
+    }
+
     /// A table's value counts are its `GROUP BY` counts, merged across superfiles.
     #[test]
     fn value_counts_match_the_grouped_count() {
