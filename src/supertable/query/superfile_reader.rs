@@ -36,11 +36,10 @@
 //! object-store retries fire correctly.
 
 use std::{
-    collections::HashMap,
     error::Error,
     io,
     sync::{
-        Arc, LazyLock, Mutex,
+        Arc, LazyLock,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -56,12 +55,17 @@ use crate::{
     supertable::{
         lazy_source::StorageRangeSource,
         manifest::{SubsectionOffsets, SuperfileUri},
+        query::scalar_cache::ByteLru,
         reader_cache::{
             DiskCacheStore, OpenTier, ReadIntent, ReaderCacheError, SuperfileReaderCache,
             disk::{DiskCacheError, open_batch_overlay},
         },
     },
 };
+
+/// Most lazy readers [`LAZY_READERS`] keeps; past it the least recently
+/// used one is dropped (a caller holding it keeps it alive).
+const LAZY_READERS_MAX: usize = 256;
 
 /// Look up `uri`'s `SuperfileReader`, preferring the in-
 /// memory tier and falling back to the disk cache when
@@ -136,7 +140,7 @@ pub async fn superfile_reader_tiered(
 
     // 3. Storage-only fallback, for handles configured with durable storage
     // but no disk cache. A reader this tier opened before is reused: its
-    // footer and page indexes were parsed once (see `LazyReaders`).
+    // footer and page indexes were parsed once (see `LAZY_READERS`).
     if storage.is_some()
         && let Some(reader) = LAZY_READERS.get(uri)
     {
@@ -202,16 +206,12 @@ pub async fn superfile_reader_tiered(
         let reader = SuperfileReader::open_lazy_with(source, OpenOptions { verify_crc: false })
             .await
             .map_err(|source| ReaderCacheError::OpenFailed { source })?;
-        let reader = LAZY_READERS.insert(*uri, Arc::new(reader));
+        let reader = LAZY_READERS.get_or_insert(*uri, Arc::new(reader), 1);
         return Ok((reader, OpenTier::Lazy));
     }
 
     Err(ReaderCacheError::NotFound { uri: *uri })
 }
-
-/// Most lazy readers [`LAZY_READERS`] keeps; past it the least recently
-/// used one is dropped (a caller holding it keeps it alive).
-const LAZY_READERS_MAX: usize = 256;
 
 /// The lazy readers the storage-only tier opened, by superfile, for the
 /// process.
@@ -225,59 +225,9 @@ const LAZY_READERS_MAX: usize = 256;
 /// parsed, is good for every later query. A lazy reader holds its parsed
 /// metadata and the open's tail bytes, not the file, so the count bound
 /// keeps the cache small.
-static LAZY_READERS: LazyLock<LazyReaders<SuperfileReader>> =
-    LazyLock::new(|| LazyReaders::new(LAZY_READERS_MAX));
-
-/// Readers by superfile, at most `max` of them, the least recently handed
-/// out dropped first.
-struct LazyReaders<R> {
-    max: usize,
-    /// Each reader, with the tick it was last handed out at, and the tick.
-    readers: Mutex<(HashMap<SuperfileUri, (Arc<R>, u64)>, u64)>,
-}
-
-impl<R> LazyReaders<R> {
-    fn new(max: usize) -> Self {
-        Self {
-            max: max.max(1),
-            readers: Mutex::new((HashMap::new(), 0)),
-        }
-    }
-
-    fn get(&self, uri: &SuperfileUri) -> Option<Arc<R>> {
-        let mut guard = self.readers.lock().unwrap_or_else(|e| e.into_inner());
-        let (readers, tick) = &mut *guard;
-        *tick += 1;
-        let now = *tick;
-        readers.get_mut(uri).map(|(reader, used)| {
-            *used = now;
-            Arc::clone(reader)
-        })
-    }
-
-    /// Keep `reader` for `uri`, or hand back the one a concurrent open kept
-    /// first, so every caller shares one reader and its parsed metadata.
-    fn insert(&self, uri: SuperfileUri, reader: Arc<R>) -> Arc<R> {
-        let mut guard = self.readers.lock().unwrap_or_else(|e| e.into_inner());
-        let (readers, tick) = &mut *guard;
-        *tick += 1;
-        let now = *tick;
-        if let Some((kept, used)) = readers.get_mut(&uri) {
-            *used = now;
-            return Arc::clone(kept);
-        }
-        if readers.len() >= self.max
-            && let Some(oldest) = readers
-                .iter()
-                .min_by_key(|(_, (_, used))| *used)
-                .map(|(uri, _)| *uri)
-        {
-            readers.remove(&oldest);
-        }
-        readers.insert(uri, (Arc::clone(&reader), now));
-        reader
-    }
-}
+/// Each reader weighs one, so the byte bound is a count bound.
+static LAZY_READERS: LazyLock<ByteLru<SuperfileUri, Arc<SuperfileReader>>> =
+    LazyLock::new(|| ByteLru::new(LAZY_READERS_MAX));
 
 /// The in-memory tiers of [`superfile_reader_tiered`] alone, with nothing to
 /// await: `uri`'s reader when this process already holds it, from the reader
@@ -919,29 +869,5 @@ mod tests {
             QueryError::Unsupported(m) => assert!(m.contains("reindex"), "{m}"),
             other => panic!("expected Unsupported, got {other:?}"),
         }
-    }
-
-    /// The storage-only tier's reader cache: one reader per superfile for
-    /// every caller, the first kept when two opens race, and the least
-    /// recently used dropped past the bound.
-    #[test]
-    fn lazy_readers_share_one_reader_and_drop_the_least_recently_used() {
-        use uuid::Uuid;
-
-        let uri = |n: u128| SuperfileUri(Uuid::from_u128(n));
-        let cache: LazyReaders<u32> = LazyReaders::new(2);
-        assert!(cache.get(&uri(1)).is_none());
-        let first = cache.insert(uri(1), Arc::new(10));
-        // A racing open's reader is not kept: every caller gets the first.
-        let raced = cache.insert(uri(1), Arc::new(11));
-        assert!(Arc::ptr_eq(&first, &raced));
-        assert!(Arc::ptr_eq(&first, &cache.get(&uri(1)).expect("kept")));
-        cache.insert(uri(2), Arc::new(20));
-        // 1 was handed out last, so 2 is the least recently used.
-        assert_eq!(cache.get(&uri(1)).as_deref(), Some(&10));
-        cache.insert(uri(3), Arc::new(30));
-        assert!(cache.get(&uri(2)).is_none(), "the least recently used goes");
-        assert_eq!(cache.get(&uri(1)).as_deref(), Some(&10));
-        assert_eq!(cache.get(&uri(3)).as_deref(), Some(&30));
     }
 }
