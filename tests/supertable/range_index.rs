@@ -86,6 +86,9 @@ const QUERIES: &[&str] = &[
     BUCKETED_DAY,
     BUCKETED_WITH_TOTAL,
     "SELECT count(*) FILTER (WHERE price < 250) AS a, count(*) FILTER (WHERE price >= 250 AND price < 750.5) AS b, count(*) FILTER (WHERE price >= 750.5) AS c FROM {t}",
+    // A histogram: buckets sharing their bounds, counted in one pass.
+    "SELECT count(*) FILTER (WHERE qty >= -250 AND qty < -200) AS q0, count(*) FILTER (WHERE qty >= -200 AND qty < -150) AS q1, count(*) FILTER (WHERE qty >= -150 AND qty < -100) AS q2, count(*) FILTER (WHERE qty >= -100 AND qty < -50) AS q3, count(*) FILTER (WHERE qty >= -50 AND qty < 0) AS q4, count(*) FILTER (WHERE qty >= 0 AND qty < 50) AS q5, count(*) FILTER (WHERE qty >= 50 AND qty < 100) AS q6, count(*) FILTER (WHERE qty >= 100 AND qty < 150) AS q7, count(*) FILTER (WHERE qty >= 150 AND qty < 200) AS q8, count(*) FILTER (WHERE qty >= 200 AND qty < 250) AS q9 FROM {t}",
+    "SELECT count(*) FILTER (WHERE day >= DATE '2022-06-01' AND day < DATE '2022-06-02') AS d1, count(*) FILTER (WHERE day >= DATE '2022-06-02' AND day < DATE '2022-06-03') AS d2, count(*) FILTER (WHERE day >= DATE '2022-06-03' AND day < DATE '2022-06-04') AS d3, count(*) FILTER (WHERE day >= DATE '2022-06-04' AND day < DATE '2022-06-05') AS d4, count(*) FILTER (WHERE day >= DATE '2022-06-05' AND day < DATE '2022-06-06') AS d5 FROM {t}",
     "SELECT count(*) FILTER (WHERE qty > 0) AS a, count(*) FILTER (WHERE price > 500) AS b FROM {t} WHERE seq < 6000",
     "SELECT count(*) FILTER (WHERE qty > 0) AS a, count(*) FILTER (WHERE qty > 100 OR qty < -100) AS b FROM {t}",
     TIE_BROKEN_TOP_K,

@@ -1357,6 +1357,83 @@ impl SupertableProvider {
         Ok((total, unindexed))
     }
 
+    /// Every bucket's [`Self::counted_rows`] in one pass over the table, when
+    /// each bucket is one interval on the same range-indexed column: each
+    /// superfile's range index is read once for all the buckets, where a
+    /// count per bucket opens every superfile once per bucket. Every
+    /// superfile is counted, which [`Self::counted_rows`]'s pruning only
+    /// skips the empty ones of. `None` when a bucket is not such an interval,
+    /// there are fewer than two, or a superfile has no range index over the
+    /// column: the buckets are then counted one at a time.
+    pub(crate) async fn batched_range_counts(
+        &self,
+        buckets: &[RangeBucket],
+    ) -> DfResult<Option<Vec<u64>>> {
+        if buckets.len() < 2 {
+            return Ok(None);
+        }
+        let Some(first) = buckets[0].range.as_ref() else {
+            return Ok(None);
+        };
+        let mut ranges = Vec::with_capacity(buckets.len());
+        for bucket in buckets {
+            let Some(range) = bucket.range.as_ref() else {
+                return Ok(None);
+            };
+            if range.field != first.field || range.data_type != first.data_type {
+                return Ok(None);
+            }
+            ranges.push((range.lo, range.hi));
+        }
+        let survivors = self.select_survivors(&[]).await?;
+        let now = Instant::now();
+        self.prefetch_tombstones(&survivors, now).await;
+        let in_flight = self.manifest.options.superfiles_in_flight;
+        let pool: &ThreadPool = &self.manifest.options.reader_pool;
+        let ranges = &ranges;
+        let per_file = try_join_bounded(
+            survivors.iter().cloned().map(|entry| {
+                let prepared = self.prepared_scan_file(Arc::clone(&entry));
+                async move {
+                    let prepared = prepared.await?;
+                    let reader = &prepared.reader;
+                    let tombstones = self.deleted_rows(entry.superfile_id, now)?;
+                    let (field, data_type) = (first.field, &first.data_type);
+                    if tombstones.is_empty() {
+                        return reader
+                            .range_counts(field, data_type, ranges)
+                            .await
+                            .map_err(|e| DataFusionError::from(QueryError::from(e)));
+                    }
+                    let mut counts = Vec::with_capacity(ranges.len());
+                    for &(lo, hi) in ranges {
+                        let rows = reader
+                            .range_rows(field, data_type, lo, hi, Some(pool))
+                            .await
+                            .map_err(QueryError::from)?;
+                        let Some(rows) = rows else {
+                            return Ok(None);
+                        };
+                        counts.push((rows - tombstones.as_ref()).len());
+                    }
+                    Ok::<_, DataFusionError>(Some(counts))
+                }
+            }),
+            in_flight,
+        )
+        .await?;
+        let mut totals = vec![0u64; ranges.len()];
+        for counts in per_file {
+            let Some(counts) = counts else {
+                return Ok(None);
+            };
+            for (total, n) in totals.iter_mut().zip(counts) {
+                *total += n;
+            }
+        }
+        Ok(Some(totals))
+    }
+
     /// The rows of the `unindexed` superfiles `filters` hold, as rows with no
     /// columns: those superfiles scanned for `range`'s column, with `filters`
     /// applied above the scan.
