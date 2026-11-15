@@ -973,7 +973,7 @@ pub fn infino::StagedAppend::is_empty(&self) -> bool
 pub fn infino::StagedAppend::rows(&self) -> u64
 impl core::fmt::Debug for infino::StagedAppend
 pub fn infino::StagedAppend::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl core::marker::Freeze for infino::StagedAppend
+impl !core::marker::Freeze for infino::StagedAppend
 impl core::marker::Send for infino::StagedAppend
 impl core::marker::Sync for infino::StagedAppend
 impl core::marker::Unpin for infino::StagedAppend
