@@ -126,7 +126,8 @@ Patches diverge between coordinated minors; a minor bump realigns everything on
 
 - **Rust publish automation: done.** The `Publish crate` workflow
   (`.github/workflows/crate-publish.yml`) publishes the engine to crates.io on a
-  `v<version>` tag; Node and Python still publish via their own manual workflows.
+  `v<version>` tag; Node and Python publishes are dispatched by Release on merge
+  when their version changes (manual dispatch remains for rehearsals).
   Still worth naming a clear owner for the engine's version bumps so the crate
   doesn't fall behind the bindings on the shared release line.
 - **Drift guard: done.** `make version-sync` (part of `make check`, so it runs
