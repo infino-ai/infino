@@ -90,6 +90,15 @@ impl SuperfileStats {
         self.id_max = self.id_max.max(other.id_max);
         ScalarStatsAgg::merge(&mut self.scalar_stats, &other.scalar_stats);
     }
+
+    /// Hold these stats' exact value tables to one superfile's budget, once
+    /// every batch is folded in. Each batch keeps its tables within the
+    /// budget among the columns it holds, so a merge that writes a few
+    /// columns at a time keeps a table that one writing them all at once
+    /// sketched; fitting the folded tables makes the two agree.
+    pub(crate) fn fit_value_tables(&mut self) {
+        ScalarStatsAgg::fit_value_tables(&mut self.scalar_stats);
+    }
 }
 
 #[cfg(test)]
