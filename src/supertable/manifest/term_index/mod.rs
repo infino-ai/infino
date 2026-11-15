@@ -91,7 +91,10 @@ use crate::{
     runtime_bridge::run_on_pool,
     runtime_metrics::rss::available_memory_bytes,
     storage::{StorageError, StorageProvider, permission_denied_in_chain},
-    superfile::{FtsError, fts::reader::BoolMode},
+    superfile::{
+        FtsError,
+        fts::{bm25::BOUND_ROUNDING_SLACK, reader::BoolMode},
+    },
     supertable::{
         error::QueryError,
         manifest::{
@@ -128,7 +131,7 @@ const TIER_READ_MAX_BYTES: u64 = 16 * 1024 * 1024;
 /// below a real score would skip the superfile holding it; widening by
 /// this factor keeps every ceiling an upper bound and prunes no less in
 /// practice.
-const CEILING_SLACK: f32 = 1.0 + 8.0 * f32::EPSILON;
+const CEILING_SLACK: f32 = 1.0 + BOUND_ROUNDING_SLACK;
 
 /// Decoded posting runs kept per loaded index, keyed by `column \x1F term`.
 /// A ranked query asks for the same term's postings several times — to
