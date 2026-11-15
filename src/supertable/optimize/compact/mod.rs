@@ -518,6 +518,21 @@ impl Supertable {
     ) -> Result<(), CompactionError> {
         let phase_timers = global().diagnostics.optimize_phase_timers;
         let calibrate_fanout = !matches!(cfg.steps.recalibrate, RecalibratePolicy::Skip);
+        // A graft knows a replica's superfiles by id; one compacted away would be grafted again,
+        // whether the compaction runs on the replica or on the table it loads into.
+        if self.inner().options.term_index_replica {
+            info!("compaction skipped: this table is a replica of another");
+            return Ok(());
+        }
+        if let Some(storage) = self.inner().options.storage.as_ref()
+            && !crate::storage::attached_replicas(storage.as_ref())
+                .await
+                .map_err(|e| CompactionError::Refresh(e.to_string()))?
+                .is_empty()
+        {
+            info!("compaction skipped: replicas are attached");
+            return Ok(());
+        }
         Self::compact_one_table(self, cfg).await?;
         if matches!(
             self.inner().manifest.load().get_partition_strategy(),
@@ -1537,6 +1552,7 @@ impl Supertable {
                 Some(&mut reserved_run),
                 Some(&mut rebuilt_parts),
                 Some(&mut fence),
+                None,
             )
             .instrument(detail_span!(
                 "compaction_commit_attempt",

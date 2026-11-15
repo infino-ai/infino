@@ -1720,7 +1720,53 @@ fn bootstrap_centroids_from_batch(
     ))
 }
 
+/// The grids a table's first vector commit trains from `buffer`; `None` without a vector column
+/// or rows.
+fn bootstrap_global_vector_index(
+    options: &SupertableOptions,
+    manifest: &ManifestSnapshot,
+    buffer: &[BufferedBatch],
+) -> Option<GlobalVectorIndex> {
+    let vc = manifest.vector_configs().into_iter().next()?;
+    let hidden_cells = hidden_vector_cell_count(options);
+    let grid = bootstrap_centroids_from_batch(buffer, vc.dim, hidden_cells)?;
+    let user_cells = user_vector_cell_count(options);
+    let user_grid = (user_cells != hidden_cells)
+        .then(|| bootstrap_centroids_from_batch(buffer, vc.dim, user_cells))
+        .flatten();
+    Some(GlobalVectorIndex {
+        column: vc.column,
+        grid,
+        user_grid,
+    })
+}
+
+/// The grids a first commit of `batch` would train, for a caller that stamps them before it.
+pub(in crate::supertable) fn train_global_vector_index(
+    options: &SupertableOptions,
+    manifest: &ManifestSnapshot,
+    batch: &RecordBatch,
+) -> Result<Option<GlobalVectorIndex>, BuildError> {
+    let buffer = [BufferedBatch {
+        scalar: batch.clone(),
+        vectors: owned_vector_arrays(batch, manifest)?,
+    }];
+    Ok(bootstrap_global_vector_index(options, manifest, &buffer))
+}
+
 impl SupertableWriter {
+    /// Whether a change to the rows or the schema must wait: an import has replicas attached to
+    /// the table, or this table is an import's replica.
+    fn is_import_open(&self) -> Result<bool, StorageError> {
+        if self.inner.options.term_index_replica {
+            return Ok(true);
+        }
+        bridge_on_runtime(
+            super::import::is_import_open(&self.inner.options),
+            &self.inner.query_runtime(),
+        )
+    }
+
     /// Number of buffered batches not yet committed. Useful for
     /// tests + diagnostics; not part of the production hot path.
     pub fn buffered_batches(&self) -> usize {
@@ -1942,6 +1988,9 @@ impl SupertableWriter {
     ///
     /// [`commit`]: SupertableWriter::commit
     pub fn delete(&mut self, predicate: Expr) -> Result<PendingDelete, MutationError> {
+        if self.is_import_open()? {
+            return Err(MutationError::ImportOpen);
+        }
         // Pre-flight: storage must be attached for the WAL
         // pipeline to drive this op at commit time.
         let _ = self
@@ -2015,6 +2064,9 @@ impl SupertableWriter {
         predicate: Expr,
         new_rows: RecordBatch,
     ) -> Result<PendingUpdate, MutationError> {
+        if self.is_import_open()? {
+            return Err(MutationError::ImportOpen);
+        }
         // Pre-flight: storage attached.
         let _ = self
             .inner
@@ -3002,6 +3054,12 @@ impl SupertableWriter {
         patch: &SchemaPatch,
         expected: Option<u32>,
     ) -> Result<Arc<TableSchema>, BuildError> {
+        if self
+            .is_import_open()
+            .map_err(|e| BuildError::Store(e.to_string()))?
+        {
+            return Err(BuildError::ImportOpen);
+        }
         // Buffered rows were resolved against the schema as it stands, and
         // the change is about to move it out from under them: a retype
         // leaves them unable to commit at all (every later commit is
@@ -3090,6 +3148,13 @@ impl SupertableWriter {
             &self.inner.options.id_column,
         )?
         .map(Arc::new);
+        if schema_change.is_some()
+            && self
+                .is_import_open()
+                .map_err(|e| BuildError::Store(e.to_string()))?
+        {
+            return Err(BuildError::ImportOpen);
+        }
         let manifest = match &schema_change {
             Some(schema) => Arc::new(base.with_schema(Arc::clone(schema))),
             None => base,
@@ -3159,27 +3224,12 @@ impl SupertableWriter {
         // into pending OCC metadata (not a bare ArcSwap.store). The pack path
         // below reads the same local `pending_gvi` / existing manifest grid;
         // the stamp lands with the membership commit (S10).
-        let pending_gvi: Option<GlobalVectorIndex> = if manifest.get_global_vector_index().is_none()
-            && !buffer.is_empty()
-            && let Some(vc) = manifest.vector_configs().first()
-            && let Some(grid) = bootstrap_centroids_from_batch(
-                buffer,
-                vc.dim,
-                hidden_vector_cell_count(&self.inner.options),
-            ) {
-            let hidden_cells = hidden_vector_cell_count(&self.inner.options);
-            let user_cells = user_vector_cell_count(&self.inner.options);
-            let user_grid = (user_cells != hidden_cells)
-                .then(|| bootstrap_centroids_from_batch(buffer, vc.dim, user_cells))
-                .flatten();
-            Some(GlobalVectorIndex {
-                column: vc.column.clone(),
-                grid,
-                user_grid,
-            })
-        } else {
-            None
-        };
+        let pending_gvi: Option<GlobalVectorIndex> =
+            if manifest.get_global_vector_index().is_none() && !buffer.is_empty() {
+                bootstrap_global_vector_index(&self.inner.options, &manifest, buffer)
+            } else {
+                None
+            };
 
         let total_rows: usize = buffer.iter().map(|b| b.scalar.num_rows()).sum();
         if total_rows == 0 {
@@ -5640,6 +5690,7 @@ pub(super) async fn persist_superfile_publish_batch_async(
             list_metadata,
             batch.term_contributions,
             reserved_layers,
+            None,
         )
         .await
         .map_err(BuildError::from)?;
@@ -12152,6 +12203,7 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
             None,
             None,
             None,
+            None,
         )
         .await
         {
@@ -12887,7 +12939,8 @@ struct KeptFold {
 /// - With none left to index, layers fold one run per publish, as
 ///   [`term_index::plan_fold_at_optimize`] picks them, of at most
 ///   what the scratch disk holds together ([`term_index::fold_disk_bound`],
-///   or `unmeasured_fold_max_bytes` when the disk cannot be read), and as
+///   or `unmeasured_fold_max_bytes` when the disk cannot be read; zero runs
+///   no folds), and as
 ///   many layers as the host's free
 ///   memory and open-file limit hold. A fold that loses its publish to commits
 ///   has their layers stacked on it ([`term_index::rebase`]), so a retry
@@ -13022,8 +13075,10 @@ pub(in crate::supertable) async fn stamp_term_index(
                     };
                     let mut fold_max_bytes = term_index::fold_disk_bound(reuse_path, disk_per_slice, held)
                         .unwrap_or(unmeasured_fold_max_bytes);
-                    let mut planned = plan(fold_max_bytes);
-                    if planned.is_none() && held > 0 && plan(u64::MAX).is_some() {
+                    // A zero cap runs no folds: a graft leaves its stacked layers to the next optimize.
+                    let folds = unmeasured_fold_max_bytes > 0;
+                    let mut planned = if folds { plan(fold_max_bytes) } else { None };
+                    if folds && planned.is_none() && held > 0 && plan(u64::MAX).is_some() {
                         let evict_dir = reuse_path.clone();
                         let freed = tokio::task::spawn_blocking(move || term_index::evict_kept(&evict_dir))
                             .await
@@ -13282,7 +13337,7 @@ pub(in crate::supertable) fn scoring_by_ordinal(
 /// Each superfile's scoring facts per full-text column, by superfile id:
 /// what [`scoring_by_ordinal`] lays out by a root's ordinals, and what a
 /// commit hands the fold that may follow it, before its ordinals exist.
-fn scoring_by_superfile(
+pub(in crate::supertable) fn scoring_by_superfile(
     manifest: &ManifestSnapshot,
 ) -> HashMap<Uuid, BTreeMap<FieldId, term_index::ColumnScoring>> {
     let columns: Vec<(FieldId, Bm25Params)> = manifest
@@ -13759,6 +13814,19 @@ impl CommitListMetadata {
                 return Err(SupertableCommitError::SchemaMoved { expected, current });
             }
         }
+        // A grid trained by this commit is only valid while the table has none: an import (or
+        // another first commit) that stamped one first means rebuilding on that one.
+        if let Some(ours) = &self.global_vector_index
+            && base
+                .get_global_vector_index()
+                .is_some_and(|theirs| &theirs != ours)
+        {
+            let current = base.table_schema().schema_id();
+            return Err(SupertableCommitError::SchemaMoved {
+                expected: current,
+                current,
+            });
+        }
         if let Some(next) = &self.schema
             && !base.get_all_superfiles().is_empty()
             && let Some(column) = column_that_starts_requiring_a_value(&base.table_schema(), next)
@@ -13824,6 +13892,30 @@ pub(in crate::supertable) async fn persist_commit_async(
         list_metadata,
         term_contributions,
         None,
+        None,
+    )
+    .await
+}
+
+/// Commits another table's superfiles with their term-index layers stacked
+/// by `splice` in the same manifest (see `merge::graft`).
+pub(in crate::supertable) async fn persist_graft_async(
+    inner: &SupertableInner,
+    storage: Arc<dyn StorageProvider>,
+    new_entries: Vec<Arc<SuperfileEntry>>,
+    splice: TermIndexSplice<'_>,
+) -> Result<Arc<ManifestSnapshot>, SupertableCommitError> {
+    persist_commit_with_layer_async(
+        inner,
+        storage,
+        new_entries,
+        &[],
+        vec![],
+        vec![],
+        CommitListMetadata::empty(),
+        vec![],
+        None,
+        Some(splice),
     )
     .await
 }
@@ -13840,6 +13932,7 @@ async fn persist_commit_with_layer_async(
     list_metadata: CommitListMetadata,
     term_contributions: Vec<TermContribution>,
     mut reserved_layers: Option<&mut [ReservedSegment]>,
+    splice: Option<TermIndexSplice<'_>>,
 ) -> Result<Arc<ManifestSnapshot>, SupertableCommitError> {
     let storage_async = Arc::clone(&storage);
     let opts = Arc::clone(&inner.options);
@@ -13886,6 +13979,7 @@ async fn persist_commit_with_layer_async(
                 reserved_layers.as_deref_mut(),
                 None,
                 None,
+                splice,
             )
             .await
             {
@@ -14291,6 +14385,11 @@ pub(crate) trait CommitFence: Send {
     fn check(&mut self) -> BoxFuture<'_, Result<(), SupertableCommitError>>;
 }
 
+/// Given the current root, the root a graft commit publishes with another table's layers on it, or `None` when it
+/// adds nothing (see `merge::graft`).
+pub(crate) type TermIndexSplice<'a> =
+    &'a (dyn Fn(&term_index::Root) -> Option<term_index::Root> + Send + Sync);
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn try_commit_attempt(
     storage: Arc<dyn StorageProvider>,
@@ -14313,6 +14412,9 @@ pub(crate) async fn try_commit_attempt(
     mut rebuilt_parts: Option<&mut RebuiltParts>,
     // Checked immediately before the pointer PUT; see [`CommitFence`].
     fence: Option<&mut dyn CommitFence>,
+    // Set by a graft: the commit's superfiles carry no contributions, their
+    // postings are layers this stacks on the current root.
+    splice: Option<TermIndexSplice<'_>>,
 ) -> Result<ManifestSnapshot, SupertableCommitError> {
     // 1. Write each new superfile's bytes to storage in parallel.
     write_superfile_list(
@@ -14474,7 +14576,59 @@ pub(crate) async fn try_commit_attempt(
         }
         _ => None,
     };
-    if let Some(reference) = unreadable_prior {
+    let spliced = match splice.filter(|_| term_contributions.is_empty()) {
+        None => None,
+        Some(splice) => {
+            // Two grafts that read the table at once carry the same superfiles, or the same batch
+            // from two replicas: the one that publishes second must not add it again.
+            let current = current_manifest
+                .get_all_superfiles_loaded()
+                .await
+                .map_err(|e| BuildError::Store(e.to_string()))?;
+            let live: HashSet<Uuid> = current.iter().map(|e| e.superfile_id).collect();
+            let live_batches: HashSet<&str> = current
+                .iter()
+                .filter_map(|e| crate::supertable::merge::batch_of(e))
+                .collect();
+            if let Some(e) = new_entries.iter().find(|e| {
+                live.contains(&e.superfile_id)
+                    || crate::supertable::merge::batch_of(e)
+                        .is_some_and(|b| live_batches.contains(b))
+            }) {
+                return Err(BuildError::Store(format!(
+                    "graft: superfile {} is already in the table",
+                    e.superfile_id
+                ))
+                .into());
+            }
+            let current = match current_manifest.term_index_ref() {
+                // Unreadable for now: fail the attempt and retry rather than publish superfiles the index cannot
+                // list.
+                Some(reference) => term_index::load_root(storage.as_ref(), reference)
+                    .await
+                    .map_err(|e| BuildError::Store(e.to_string()))?,
+                None => term_index::Root::default(),
+            };
+            match splice(&current) {
+                None => None,
+                Some(root) => {
+                    let listed: HashSet<Uuid> = root.superfiles.iter().copied().collect();
+                    let complete = (current_manifest.term_index_complete()
+                        || current_manifest.holds_no_superfiles())
+                        && new_entries.iter().all(|e| listed.contains(&e.superfile_id));
+                    // No fold here: a fold across replicas would leave a layer that neither replica's fold can
+                    // replace.
+                    let reference = term_index::write_root(storage.as_ref(), &root)
+                        .await
+                        .map_err(|e| BuildError::Store(e.to_string()))?;
+                    Some((reference, complete))
+                }
+            }
+        }
+    };
+    if let Some((reference, complete)) = spliced {
+        new_manifest = new_manifest.with_term_index_ref(reference, complete);
+    } else if let Some(reference) = unreadable_prior {
         new_manifest = new_manifest.with_term_index_ref(reference, false);
     } else if !term_contributions.is_empty() {
         // A delta on top of a complete index stays complete; the first
@@ -22266,6 +22420,7 @@ mod lost_write_span_tests {
                 None,
                 None,
                 fence,
+                None,
             )
             .instrument(attempt_span()),
         );

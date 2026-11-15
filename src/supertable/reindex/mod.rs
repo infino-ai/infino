@@ -634,8 +634,24 @@ impl Supertable {
         let ReindexTarget::Superfile(SuperfileIndex::Fts) = opts.target;
 
         let manifest = self.inner().manifest.load_full();
-        if manifest.options.storage.is_none() {
+        let Some(storage) = manifest.options.storage.clone() else {
             return Err(ReindexError::NoStorage);
+        };
+        // A rewritten superfile gets a new id, which a graft would take for one it has not seen.
+        if self.inner().options.term_index_replica {
+            return Err(ReindexError::Unsupported(
+                "a replica is never rewritten; reindex the table it loads into once it detaches"
+                    .into(),
+            ));
+        }
+        if !crate::storage::attached_replicas(storage.as_ref())
+            .await
+            .map_err(|e| ReindexError::Assess(e.to_string()))?
+            .is_empty()
+        {
+            return Err(ReindexError::Unsupported(
+                "replicas are loading into this table; reindex once they detach".into(),
+            ));
         }
         // Unset means the table's own compaction setting: the seal is the
         // same guard, so a table that tuned it meant it for this too.

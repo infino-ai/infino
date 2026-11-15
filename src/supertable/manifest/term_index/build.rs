@@ -135,6 +135,9 @@ pub(crate) struct BuildPolicy {
     /// map and the root it folds. Empty, a fold keys at
     /// [`ColumnScoring::default`] like any merge without the table.
     pub(crate) scoring_by_superfile: Arc<HashMap<Uuid, BTreeMap<FieldId, ColumnScoring>>>,
+    /// A replica's folds: any size, each layer's postings relative to its
+    /// own range (see `SupertableOptions::term_index_replica`).
+    pub(crate) replica_folds: bool,
     /// Bytes a merge cursor reads from a tier object at a time; see
     /// [`TIER_READ_WINDOW_BYTES`].
     pub(crate) tier_read_window_bytes: u64,
@@ -256,6 +259,7 @@ impl Default for BuildPolicy {
             merge_ranges: None,
             scoring_by_ordinal: Arc::new(Vec::new()),
             scoring_by_superfile: Arc::new(HashMap::new()),
+            replica_folds: false,
             tier_read_window_bytes: TIER_READ_WINDOW_BYTES,
             merge_marks_per_range: MARKS_PER_RANGE,
             one_mark_slices_per_range: ONE_MARK_SLICES_PER_RANGE,
