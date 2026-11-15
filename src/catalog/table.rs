@@ -341,14 +341,16 @@ impl Supertable {
 
     /// Publish staged batches in one commit: every one's rows join the
     /// table together, or none do. Losing the commit to a concurrent writer
-    /// is retried without rebuilding anything, and a staged batch lands at
-    /// most once however many calls commit it at the same time.
+    /// is retried without rebuilding anything.
     ///
-    /// A commit that fails leaves every batch in `staged` free to commit
-    /// again. One refused with [`InfinoError::Unsupported`] cannot land as
-    /// staged - a batch in it was committed already, was staged on another
-    /// table, had its superfiles collected, or was staged before the
-    /// table's schema moved - and those rows need staging again.
+    /// A staged batch lands once: one committed already is passed over, and
+    /// one another call is committing at the same time fails this call with
+    /// [`InfinoError::Conflict`], to be retried. A commit that fails leaves
+    /// every batch in `staged` free to commit again. One refused with
+    /// [`InfinoError::Unsupported`] cannot land as staged - a batch in it
+    /// was staged on another table, had its superfiles collected, or was
+    /// staged before the table's schema moved - and those rows need staging
+    /// again.
     pub fn commit_staged(&self, staged: &[StagedAppend]) -> Result<(), InfinoError> {
         self.inner.commit_staged(staged)
     }

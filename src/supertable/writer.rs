@@ -71,7 +71,7 @@ use std::{
     str::from_utf8,
     sync::{
         Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
         mpsc::{Receiver as StdReceiver, sync_channel as std_sync_channel},
     },
     thread::available_parallelism,
@@ -1205,13 +1205,15 @@ impl Supertable {
             .map_err(|e| InfinoError::from(e).with_context("stage", None))
     }
 
-    /// Publish staged appends in one commit; see [`Self::stage`]. A commit
-    /// that fails leaves `staged` as it was, to be committed again. One that
-    /// is refused as [`InfinoError::Unsupported`] cannot land however often
-    /// it is retried - a staged append committed already, staged on another
-    /// table, built under a schema the table has moved past, or with
-    /// superfiles reclaimed meanwhile - and nothing in it was published:
-    /// stage those rows again.
+    /// Publish staged appends in one commit; see [`Self::stage`]. A staged
+    /// append lands once: one committed already is passed over, and one
+    /// another call is committing at the same time fails this call as an
+    /// [`InfinoError::Conflict`], to be retried. A commit that fails leaves
+    /// the rest of `staged` free to commit again. One refused as
+    /// [`InfinoError::Unsupported`] cannot land however often it is retried -
+    /// a staged append staged on another table, built under a schema the
+    /// table has moved past, or with superfiles reclaimed meanwhile - and
+    /// nothing in it was published: stage those rows again.
     pub fn commit_staged(&self, staged: &[StagedAppend]) -> Result<(), InfinoError> {
         let mut w = self
             .acquire_writer(true)
@@ -3582,8 +3584,9 @@ impl SupertableWriter {
     /// a commit of its own, however large the batch.
     pub(crate) fn stage_batch(&mut self, batch: &RecordBatch) -> Result<StagedAppend, BuildError> {
         self.live_disabled = true;
-        // Refused before the rows are buffered, so no ids are reserved for
-        // them.
+        // A table that cannot stage at all is refused before the rows are
+        // buffered; a batch that adds a column is refused once buffered,
+        // against the schema the build sees.
         check_stageable(&self.inner)?;
         self.buffer_labelled(batch, SourceLabel::Unnamed)?;
         self.stage()
@@ -3611,7 +3614,7 @@ impl SupertableWriter {
                 built_against,
                 payload_bytes: buffered_payload_bytes(&taken.batches),
                 ingest: taken.ingest,
-                claimed: AtomicBool::new(false),
+                state: AtomicU8::new(STAGED_FREE),
             }),
             Err(error) => {
                 self.pending_stem = stem;
@@ -3679,14 +3682,15 @@ impl SupertableWriter {
     /// Publish staged appends in one commit: their superfiles join the
     /// table together, or none do. Losing the commit race to another writer
     /// is retried as any append's publish is, without building or writing
-    /// anything again; a commit that fails leaves `staged` as it was, to be
-    /// committed again.
+    /// anything again; a commit that fails leaves `staged` free to commit
+    /// again. A staged append committed already is passed over, and one
+    /// another call is committing fails this one as write contention.
     ///
-    /// Refused, with nothing published, when a staged append is committed
-    /// already or by another call at the same time, was staged on another
-    /// table, has superfiles that are no longer in the table's storage
-    /// (reclaimed as orphans meanwhile), or was built under a schema other
-    /// than the table's now. Those rows are staged again.
+    /// Refused as [`BuildError::Unsupported`], with nothing published, when
+    /// a staged append was staged on another table, has superfiles that are
+    /// no longer in the table's storage (reclaimed as orphans meanwhile), or
+    /// was built under a schema other than the table's now. Those rows are
+    /// staged again.
     pub(crate) fn commit_staged(&mut self, staged: &[StagedAppend]) -> Result<(), BuildError> {
         let staged: Vec<&StagedAppend> = staged.iter().filter(|one| !one.is_empty()).collect();
         if staged.is_empty() {
@@ -3694,9 +3698,13 @@ impl SupertableWriter {
         }
         let storage = check_stageable(&self.inner)?;
         // Claimed for this call before anything else, so the same staged
-        // append in two commits - two calls at once, or twice in one slice
-        // - lands in at most one; released unless the commit lands.
+        // append in two commits lands in at most one; released unless the
+        // commit lands.
         let claim = StagedClaim::take(&staged)?;
+        let staged = claim.held.clone();
+        if staged.is_empty() {
+            return Ok(());
+        }
         let current = self.inner.manifest.load().table_schema().schema_id();
         if let Some(stale) = staged.iter().find(|one| one.built_against != current) {
             return Err(BuildError::Unsupported(format!(
@@ -3715,7 +3723,14 @@ impl SupertableWriter {
             ..CommitListMetadata::default()
         };
         let output_stats = self.op_stats.as_ref().map(|_| commit_output_stats(&batch));
-        self.publish_appended(batch, list_metadata)?;
+        self.publish_appended(batch, list_metadata)
+            .map_err(|error| match error {
+                BuildError::SchemaMoved { expected, current } => BuildError::Unsupported(format!(
+                    "the table's schema moved from {expected} to {current} while the staged \
+                     appends were committed; stage their rows again"
+                )),
+                error => error,
+            })?;
         claim.keep();
         if let Some(stats) = &self.op_stats {
             for one in &staged {
@@ -3732,9 +3747,13 @@ impl SupertableWriter {
             if let Some((n_superfiles, bytes, fts_terms)) = output_stats {
                 stats.add_commit_outputs(n_superfiles, bytes, fts_terms);
             }
-            // Priced as one append of every staged row would be.
-            let payload_bytes = staged.iter().map(|one| one.payload_bytes).sum();
-            stats.add_planned_commit_requests(planned_data_objects(payload_bytes));
+            // Each staged append wrote its own superfiles, priced as its own
+            // append's would be.
+            let planned = staged
+                .iter()
+                .map(|one| planned_data_objects(one.payload_bytes))
+                .sum();
+            stats.add_planned_commit_requests(planned);
         }
         schedule_background_storage_reclaim(Arc::clone(&self.inner));
         Ok(())
@@ -5474,6 +5493,10 @@ pub(super) struct SuperfilePublishBatch {
 /// on the table meanwhile gives it a safety gap longer than any batch waits
 /// between its stage and its commit (`optimize` uses a day). A commit finds
 /// any superfile that went missing meanwhile and refuses the batch.
+///
+/// A staged append holds its superfiles' term-index contributions, spilled
+/// to local scratch for a large batch, until it is dropped: drop each once
+/// it is committed.
 pub struct StagedAppend {
     batch: SuperfilePublishBatch,
     /// The schema the superfiles were built under; the commit is refused if
@@ -5483,10 +5506,18 @@ pub struct StagedAppend {
     /// append's are (see [`planned_data_objects`]).
     payload_bytes: u64,
     ingest: IngestTally,
-    /// Held by the commit publishing this batch, and kept once it lands, so
-    /// the batch's superfiles are listed once.
-    claimed: AtomicBool,
+    /// [`STAGED_FREE`], [`STAGED_COMMITTING`] while a commit holds it, or
+    /// [`STAGED_COMMITTED`] once that commit lands, so the batch's
+    /// superfiles are listed once.
+    state: AtomicU8,
 }
+
+/// A staged append no commit holds.
+const STAGED_FREE: u8 = 0;
+/// A staged append a commit holds while it publishes.
+const STAGED_COMMITTING: u8 = 1;
+/// A staged append whose commit landed.
+const STAGED_COMMITTED: u8 = 2;
 
 impl StagedAppend {
     /// Rows the staged superfiles hold.
@@ -5506,7 +5537,14 @@ impl fmt::Debug for StagedAppend {
             .field("superfiles", &self.batch.new_entries.len())
             .field("rows", &self.ingest.rows)
             .field("built_against", &self.built_against)
-            .field("committed", &self.claimed.load(Ordering::Acquire))
+            .field(
+                "state",
+                &match self.state.load(Ordering::Acquire) {
+                    STAGED_FREE => "staged",
+                    STAGED_COMMITTING => "committing",
+                    _ => "committed",
+                },
+            )
             .finish()
     }
 }
@@ -5514,44 +5552,45 @@ impl fmt::Debug for StagedAppend {
 /// The staged appends one [`SupertableWriter::commit_staged`] call holds:
 /// released when it is dropped, unless [`Self::keep`] says they landed.
 struct StagedClaim<'a> {
+    /// The appends this call publishes.
     held: Vec<&'a StagedAppend>,
 }
 
 impl<'a> StagedClaim<'a> {
-    /// Claim every one of `staged`, or none: refused when one is committed
-    /// already or claimed by another commit.
+    /// Claim every one of `staged` not committed already, or none: refused
+    /// as write contention when another commit holds one.
     fn take(staged: &[&'a StagedAppend]) -> Result<Self, BuildError> {
         let mut claim = StagedClaim {
             held: Vec::with_capacity(staged.len()),
         };
         for &one in staged {
-            if one
-                .claimed
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-            {
+            match one.state.compare_exchange(
+                STAGED_FREE,
+                STAGED_COMMITTING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => claim.held.push(one),
+                Err(STAGED_COMMITTED) => {}
                 // `claim` drops here, releasing the ones this call took.
-                return Err(BuildError::Unsupported(
-                    "a staged append is committed already, or is being committed by another \
-                     call; each is committed once"
-                        .into(),
-                ));
+                Err(_) => return Err(BuildError::WriteContention),
             }
-            claim.held.push(one);
         }
         Ok(claim)
     }
 
-    /// The commit landed: the appends stay claimed.
+    /// The commit landed: the appends are committed.
     fn keep(mut self) {
-        self.held.clear();
+        for one in self.held.drain(..) {
+            one.state.store(STAGED_COMMITTED, Ordering::Release);
+        }
     }
 }
 
 impl Drop for StagedClaim<'_> {
     fn drop(&mut self) {
         for one in &self.held {
-            one.claimed.store(false, Ordering::Release);
+            one.state.store(STAGED_FREE, Ordering::Release);
         }
     }
 }

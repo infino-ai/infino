@@ -180,19 +180,27 @@ fn staged_and_appended_rows_mix_in_one_table() {
     assert_eq!(count(&db), 2 * BATCH_ROWS);
 }
 
+/// A staged batch lands once: committed again, alone or beside a fresh
+/// batch, it is passed over.
 #[test]
-fn committing_the_same_staged_batch_twice_is_refused() {
+fn a_staged_batch_committed_again_is_passed_over() {
     let dir = TempDir::new().expect("tempdir");
     let db = open_db(&dir);
     let table = create(&db);
 
-    let staged = [table.stage(&batch(0)).expect("stage")];
-    table.commit_staged(&staged).expect("first commit_staged");
-    assert_unsupported(
-        table.commit_staged(&staged),
-        "its superfiles are listed already",
-    );
+    let landed = table.stage(&batch(0)).expect("stage");
+    let once = std::slice::from_ref(&landed);
+    table.commit_staged(once).expect("first commit_staged");
+    table.commit_staged(once).expect("committed again");
     assert_eq!(count(&db), BATCH_ROWS);
+
+    let fresh = table.stage(&batch(1)).expect("stage");
+    table
+        .commit_staged(&[fresh, landed])
+        .expect("the fresh batch lands beside the committed one");
+    assert_eq!(count(&db), 2 * BATCH_ROWS);
+
+    assert_eq!(hits(&table, "batch0"), BATCH_ROWS as usize);
 }
 
 /// A commit refused for one staged batch publishes none of them and leaves
@@ -202,29 +210,27 @@ fn a_refused_commit_releases_the_batches_it_held() {
     let dir = TempDir::new().expect("tempdir");
     let db = open_db(&dir);
     let table = create(&db);
+    let other = db
+        .create_table("other", user_schema(), IndexSpec::new().fts("body"))
+        .expect("create_table");
 
-    let landed = table.stage(&batch(0)).expect("stage");
-    table
-        .commit_staged(std::slice::from_ref(&landed))
-        .expect("commit_staged");
-    let fresh = table.stage(&batch(1)).expect("stage");
-    let both = [fresh, landed];
+    let fresh = table.stage(&batch(0)).expect("stage");
+    let foreign = other.stage(&batch(1)).expect("stage on the other table");
+    let both = [fresh, foreign];
     assert_unsupported(
         table.commit_staged(&both),
-        "one of the batches is committed already",
+        "one of the batches was staged on another table",
     );
-    assert_eq!(
-        count(&db),
-        BATCH_ROWS,
-        "nothing of the refused commit landed"
-    );
+    assert_eq!(count(&db), 0, "nothing of the refused commit landed");
     table
         .commit_staged(&both[..1])
         .expect("the fresh batch commits on its own");
-    assert_eq!(count(&db), 2 * BATCH_ROWS);
+    assert_eq!(count(&db), BATCH_ROWS);
 }
 
-/// Threads committing the same staged batch at once land it once.
+/// Threads committing the same staged batch at once land it once; a thread
+/// that finds another committing it is told to retry, and its retry finds
+/// the batch landed.
 #[test]
 fn one_staged_batch_committed_from_several_threads_lands_once() {
     let dir = TempDir::new().expect("tempdir");
@@ -233,22 +239,24 @@ fn one_staged_batch_committed_from_several_threads_lands_once() {
     let staged = [table.stage(&batch(0)).expect("stage")];
 
     let barrier = Barrier::new(RACERS);
-    let landed = thread::scope(|s| {
+    thread::scope(|s| {
         let racers: Vec<_> = (0..RACERS)
             .map(|_| {
                 s.spawn(|| {
                     barrier.wait();
-                    table.commit_staged(&staged)
+                    loop {
+                        match table.commit_staged(&staged) {
+                            Err(InfinoError::Conflict(_)) => thread::yield_now(),
+                            done => break done,
+                        }
+                    }
                 })
             })
             .collect();
-        racers
-            .into_iter()
-            .map(|racer| racer.join().expect("racer"))
-            .filter(Result::is_ok)
-            .count()
+        for racer in racers {
+            racer.join().expect("racer").expect("commit_staged");
+        }
     });
-    assert_eq!(landed, 1, "exactly one commit lands the batch");
     assert_eq!(count(&db), BATCH_ROWS);
     assert_eq!(hits(&table, "batch0"), BATCH_ROWS as usize);
 }
