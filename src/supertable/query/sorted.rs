@@ -17,7 +17,7 @@
 //! value (a missing value sorts last and is in no index). Otherwise the
 //! same sort runs as SQL, which answers alike, only slower.
 
-use std::{cmp::Ordering, sync::Arc, time::Instant};
+use std::{cmp::Ordering, slice::from_ref, sync::Arc, time::Instant};
 
 use arrow::{
     array::{Array, AsArray},
@@ -43,6 +43,8 @@ use tracing::{Instrument, debug};
 
 use crate::{
     InfinoError,
+    runtime_bridge::run_on_pool,
+    runtime_metrics::op_stats::timed_section,
     superfile::{SuperfileReader, range::KeyKind},
     supertable::{
         error::QueryError,
@@ -278,11 +280,13 @@ impl SupertableReader {
         column: Option<&str>,
         filter: &Expr,
     ) -> Result<Option<SortedFilter>, QueryError> {
-        let schema = DFSchema::try_from(self.sql_schemas().scan().as_ref().clone())
-            .map_err(QueryError::DataFusion)?;
+        let schema = Arc::new(
+            DFSchema::try_from(self.sql_schemas().scan().as_ref().clone())
+                .map_err(QueryError::DataFusion)?,
+        );
         let simplifier = ExprSimplifier::new(
             SimplifyContext::builder()
-                .with_schema(Arc::new(schema))
+                .with_schema(Arc::clone(&schema))
                 .build(),
         );
         let filter = simplifier
@@ -303,11 +307,28 @@ impl SupertableReader {
         if !range_cols.contains_key(&column) {
             return Ok(None);
         }
-        let (bounds, rest): (Vec<Expr>, Vec<Expr>) = split_conjunction(&filter)
-            .into_iter()
-            .filter(|&c| !matches!(c, Expr::Literal(ScalarValue::Boolean(Some(true)), _)))
-            .cloned()
-            .partition(|c| single_range(std::slice::from_ref(c), &column, &range_cols).is_some());
+        // A bound is read with its literal cast as a statement casts it to
+        // compare with the column: `f = 16777217` on a `Float32` column
+        // compares with the float `16777216`, not the integer. A condition
+        // that is no bound once cast stays as written, to check row by row.
+        let mut bounds = Vec::new();
+        let mut rest = Vec::new();
+        for conjunct in split_conjunction(&filter) {
+            if matches!(conjunct, Expr::Literal(ScalarValue::Boolean(Some(true)), _)) {
+                continue;
+            }
+            let coerced = conjunct
+                .clone()
+                .rewrite(&mut TypeCoercionRewriter::new(&schema))
+                .map(|t| t.data)
+                .and_then(|c| simplifier.simplify(c));
+            match coerced {
+                Ok(bound) if single_range(from_ref(&bound), &column, &range_cols).is_some() => {
+                    bounds.push(bound);
+                }
+                _ => rest.push(conjunct.clone()),
+            }
+        }
         let Some((_, _, lo, hi)) = single_range(&bounds, &column, &range_cols) else {
             return Ok(None);
         };
@@ -476,23 +497,35 @@ impl SupertableReader {
         let Ok(predicate) = create_physical_expr(&coerced, &schema, &ExecutionProps::new()) else {
             return Ok(None);
         };
-        let Some(kept) = predicate
-            .evaluate(&rows)
-            .and_then(|v| v.into_array(rows.num_rows()))
-            .ok()
-        else {
-            return Ok(None);
-        };
-        let Some(kept) = kept.as_boolean_opt() else {
-            return Ok(None);
-        };
-        // A condition a row's nulls leave unknown does not keep it, as in a
-        // statement's WHERE.
-        Ok(Some(
-            (0..kept.len())
-                .map(|i| kept.is_valid(i) && kept.value(i))
-                .collect(),
-        ))
+        // The condition runs over up to a window of rows: compute, so the
+        // reader pool takes it, and its time is the query's as a
+        // statement's predicate is.
+        let (kept, ns) = run_on_pool(
+            Some(&self.manifest().options.reader_pool),
+            "sorted search condition",
+            move || {
+                timed_section(|| {
+                    let kept = predicate
+                        .evaluate(&rows)
+                        .and_then(|v| v.into_array(rows.num_rows()))
+                        .ok()?;
+                    let kept = kept.as_boolean_opt()?;
+                    // A condition a row's nulls leave unknown does not keep
+                    // it, as in a statement's WHERE.
+                    Some(
+                        (0..kept.len())
+                            .map(|i| kept.is_valid(i) && kept.value(i))
+                            .collect::<Vec<bool>>(),
+                    )
+                })
+            },
+        )
+        .await
+        .map_err(QueryError::internal)?;
+        if let Some(stats) = &self.op_stats {
+            stats.add_kernel_cpu_ns(ns);
+        }
+        Ok(kept)
     }
 
     /// The first `k` rows `filter` keeps in its column's order, as hits in
@@ -740,7 +773,7 @@ fn quote(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{cmp::Ordering, sync::Arc};
+    use std::{cmp::Ordering, iter::repeat_n, sync::Arc};
 
     use arrow::compute::cast;
     use arrow_array::{
@@ -754,6 +787,7 @@ mod tests {
     use super::*;
     use crate::{
         config::OptimizeOptions,
+        runtime_metrics::op_stats::with_op_stats,
         storage::{LocalFsStorageProvider, StorageProvider},
         supertable::{
             SupertableOptions,
@@ -1155,6 +1189,138 @@ mod tests {
         )
         .expect("convert tag");
         assert_page_matches_sql(&st, &col("tag").eq(lit(3_i64)), "tag = 3");
+    }
+
+    /// Additions in the condition [`a_condition_checked_on_rows_reports_its_cpu`]
+    /// evaluates, so its time dwarfs reading the rows it runs over.
+    const COSTLY_ADDITIONS: usize = 200;
+    /// Times that test evaluates the condition: the per-thread CPU clock
+    /// advances at scheduler events, so one short run can read zero.
+    const CPU_RUNS: usize = 50;
+    /// Rows the condition is evaluated over in each run.
+    const CPU_ROWS: usize = 2000;
+    /// The least share of the condition's own CPU the checks must report:
+    /// the clock's granularity may lose some, never most.
+    const CPU_SHARE_FLOOR: u64 = 2;
+
+    /// A condition checked on the rows a walk reads bills its CPU to the
+    /// query, as a statement's predicate does: the checks report at least
+    /// [`CPU_SHARE_FLOOR`] of what evaluating the condition alone, over the
+    /// same rows, costs on this thread.
+    #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "per-thread CPU clock is Linux procfs (schedstat); off Linux kernel_cpu_ns is always 0"
+    )]
+    fn a_condition_checked_on_rows_reports_its_cpu() {
+        let dir = TempDir::new().expect("tempdir");
+        let st = table(&dir);
+        let costly = (0..COSTLY_ADDITIONS)
+            .fold(col("seq"), |sum, _| sum + lit(1_i64))
+            .gt(lit(0_i64));
+        let hits = st
+            .reader()
+            .expect("reader")
+            .sorted_hits("key", false, CPU_ROWS)
+            .expect("hits")
+            .expect("answered");
+        let reader = st.reader().expect("reader");
+        let rows = reader
+            .block_on(resolve_hits_named(&reader, &hits, Some(&["seq"])))
+            .expect("rows");
+        let schema = DFSchema::try_from(rows.schema().as_ref().clone()).expect("schema");
+        let predicate =
+            create_physical_expr(&costly, &schema, &ExecutionProps::new()).expect("predicate");
+        let (((), alone), _) = with_op_stats(|| {
+            timed_section(|| {
+                for _ in 0..CPU_RUNS {
+                    predicate.evaluate(&rows).expect("evaluate");
+                }
+            })
+        });
+        let mut reported = 0;
+        for _ in 0..CPU_RUNS {
+            let (kept, stats) = with_op_stats(|| {
+                let reader = st.reader().expect("reader");
+                reader
+                    .block_on(reader.kept_by(&hits, &costly))
+                    .expect("kept_by")
+            });
+            assert!(kept.expect("evaluated").iter().all(|kept| *kept));
+            reported += stats.kernel_cpu_ns;
+        }
+        assert!(alone > 0, "{CPU_RUNS} evaluations take no CPU");
+        assert!(
+            reported >= alone / CPU_SHARE_FLOOR,
+            "checks report {reported} ns of a condition taking {alone} ns"
+        );
+    }
+
+    /// The first integer a `Float32` cannot hold is one past this: the
+    /// floats around it are two apart.
+    const FLOAT32_EXACT: i64 = 1 << 24;
+    /// Rows of each value in [`float32_table`].
+    const FLOAT32_ROWS_EACH: usize = 3;
+
+    /// A table of one range-indexed `Float32` column `f` holding the floats
+    /// from four below [`FLOAT32_EXACT`] to four above it, two apart.
+    fn float32_table(dir: &TempDir) -> Supertable {
+        let schema = Arc::new(Schema::new(vec![Field::new("f", DataType::Float32, false)]));
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let options = SupertableOptions::new(Arc::clone(&schema), vec![], vec![])
+            .expect("options")
+            .with_storage(storage)
+            .with_range_indexes(&["f".to_string()]);
+        let st = Supertable::create(options).expect("create");
+        let floats: Vec<f32> = (-2..=2_i64)
+            .flat_map(|step| repeat_n((FLOAT32_EXACT + 2 * step) as f32, FLOAT32_ROWS_EACH))
+            .collect();
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(Float32Array::from(floats))])
+            .expect("batch");
+        let mut writer = st.writer().expect("writer");
+        writer.append(&batch).expect("append");
+        writer.commit().expect("commit");
+        st
+    }
+
+    /// A bound's integer literal is cast to the column's `Float32` as a
+    /// statement casts it: `f = 2^24 + 1` keeps the rows at `2^24`, which the
+    /// literal rounds to, and `f < 2^24 + 1` keeps none of them. Literals a
+    /// `Float32` holds exactly read as they did.
+    #[test]
+    fn a_bound_compares_with_its_literal_cast_to_the_column() {
+        let dir = TempDir::new().expect("tempdir");
+        let st = float32_table(&dir);
+        let reader = st.reader().expect("reader");
+        let inexact = FLOAT32_EXACT + 1;
+        let cases = [
+            (col("f").eq(lit(inexact)), format!("f = {inexact}")),
+            (col("f").lt(lit(inexact)), format!("f < {inexact}")),
+            (col("f").lt_eq(lit(inexact)), format!("f <= {inexact}")),
+            (col("f").gt(lit(inexact)), format!("f > {inexact}")),
+            (
+                col("f").eq(lit(FLOAT32_EXACT)),
+                format!("f = {FLOAT32_EXACT}"),
+            ),
+            (
+                col("f").lt(lit(FLOAT32_EXACT)),
+                format!("f < {FLOAT32_EXACT}"),
+            ),
+        ];
+        for (filter, sql) in cases {
+            let got = st
+                .sorted_search_where(Some("f"), &filter, false, 10, Some(&["_id"]))
+                .expect("sorted_search_where")
+                .unwrap_or_else(|| panic!("{sql}: answered"));
+            let want = reader
+                .query_sql(&format!(
+                    "SELECT _id FROM supertable WHERE {sql} ORDER BY f ASC, _id ASC LIMIT 10"
+                ))
+                .expect("sql");
+            assert!(!ids(&want).is_empty(), "{sql}: SQL keeps rows");
+            assert_eq!(ids(&got), ids(&want), "{sql}");
+        }
     }
 
     /// A filter the index cannot be read for is left to the caller's
