@@ -2468,7 +2468,15 @@ impl TableProvider for SupertableProvider {
                         footer: Arc::clone(&seg.prepared.footer),
                         row_counts: Arc::clone(&seg.prepared.row_counts),
                         tombstones: Arc::clone(&seg.tombstones),
-                        selected: selects_rows.then(|| seg.candidates.clone()).flatten(),
+                        // The live candidates only: a row group holding
+                        // none of them reads nothing.
+                        selected: selects_rows
+                            .then(|| {
+                                seg.candidates
+                                    .as_ref()
+                                    .map(|keep| keep - seg.tombstones.as_ref())
+                            })
+                            .flatten(),
                     })
                     .collect::<Vec<_>>()
             });
