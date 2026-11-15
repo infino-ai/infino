@@ -480,6 +480,15 @@ impl<'a> PackedIds<'a> {
         resolved
     }
 
+    /// Each block's lowest and highest possible `_id` ([`IdBlock::bounds`]),
+    /// in block order, read from the block headers alone; `None` when a
+    /// header is bad.
+    pub(crate) fn block_bounds(&self) -> Option<Vec<(i128, i128)>> {
+        (0..self.n_blocks)
+            .map(|b| self.block(b).map(|blk| blk.bounds()))
+            .collect()
+    }
+
     /// Resolve ascending `docs`, calling `sink(index_in_docs, id)` for each.
     /// A block's docs are served from one parsed header: unpacked wholesale
     /// once the run asks for at least `1 / BULK_DENSITY` of the block, lane
@@ -523,6 +532,32 @@ struct IdBlock {
 }
 
 impl IdBlock {
+    /// The lowest and highest id the block can hold, from its header: each
+    /// half lies between its base and its base plus the largest offset its
+    /// width packs. Every id of the block lies between the two. The whole
+    /// `i128` range when a half could pass `u64::MAX`, or the high halves
+    /// could straddle the sign bit, where [`Self::id`]'s cast orders the ids
+    /// differently from their halves.
+    fn bounds(&self) -> (i128, i128) {
+        let widest = |width: u8| match width {
+            0 => 0,
+            w if u32::from(w) >= u64::BITS => u64::MAX,
+            w => (1u64 << w) - 1,
+        };
+        let (Some(hi_max), Some(lo_max)) = (
+            self.hi_base.checked_add(widest(self.hi_width)),
+            self.lo_base.checked_add(widest(self.lo_width)),
+        ) else {
+            return (i128::MIN, i128::MAX);
+        };
+        let sign = 1u64 << (u64::BITS - 1);
+        if self.hi_base & sign != hi_max & sign {
+            return (i128::MIN, i128::MAX);
+        }
+        let id = |hi: u64, lo: u64| (((hi as u128) << 64) | lo as u128) as i128;
+        (id(self.hi_base, self.lo_base), id(hi_max, lo_max))
+    }
+
     /// The id whose halves are `hi` and `lo` above the block's bases.
     #[inline]
     fn id(&self, hi: u64, lo: u64) -> i128 {
@@ -653,6 +688,51 @@ mod tests {
         }
         assert_eq!(p.get(ids.len() as u32), None);
         packed
+    }
+
+    /// Each block's bounds hold every id of the block, and a block of one
+    /// writer's sequential ids is bounded tightly.
+    #[test]
+    fn block_bounds_hold_every_id_of_their_block() {
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let arbitrary: Vec<i128> = (0..3_000)
+            .map(|_| (((next() as u128) << 64) | (next() as u128)) as i128)
+            .collect();
+        let positive: Vec<i128> = arbitrary.iter().map(|id| id & i128::MAX).collect();
+        for ids in [arbitrary, positive, two_writer_ids(5_000)] {
+            let packed = encode_packed(&raw(&ids));
+            let bounds = PackedIds::open(&packed, ids.len())
+                .expect("valid")
+                .block_bounds()
+                .expect("headers");
+            assert_eq!(bounds.len(), ids.len().div_ceil(BLOCK_DOCS));
+            for (block, &(lo, hi)) in ids.chunks(BLOCK_DOCS).zip(&bounds) {
+                assert!(lo <= hi);
+                for &id in block {
+                    assert!(lo <= id && id <= hi, "{id} outside {lo}..={hi}");
+                }
+            }
+        }
+        let worker: u64 = 0x1234 << 24;
+        let sequential: Vec<i128> = (0..2 * BLOCK_DOCS as u64)
+            .map(|i| (((1_700_000_000_000u128) << 64) | (worker | i) as u128) as i128)
+            .collect();
+        let packed = encode_packed(&raw(&sequential));
+        let bounds = PackedIds::open(&packed, sequential.len())
+            .expect("valid")
+            .block_bounds()
+            .expect("headers");
+        for (block, &(lo, hi)) in sequential.chunks(BLOCK_DOCS).zip(&bounds) {
+            assert_eq!(lo, block[0]);
+            // A width packs offsets up to the next power of two.
+            assert!(hi >= block[BLOCK_DOCS - 1] && hi - lo < 2 * BLOCK_DOCS as i128);
+        }
     }
 
     #[test]

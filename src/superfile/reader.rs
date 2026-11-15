@@ -307,6 +307,10 @@ pub struct SuperfileReader {
     /// reads take `_id` from Parquet, so the sidecar is not retried or warned
     /// about again.
     id_sidecar_broken: AtomicBool,
+    /// Each sidecar block's `_id` bounds, read from its header on the first
+    /// read in `_id` order and kept for the reader's life
+    /// ([`id_block_bounds`](Self::id_block_bounds)): 32 bytes a block.
+    id_block_bounds: OnceCell<Arc<[(i128, i128)]>>,
     /// Where the range index region sits, when the superfile carries one
     /// (`superfile::range`): absent on a table with no range-indexed column
     /// and on superfiles written before the region existed.
@@ -960,6 +964,7 @@ impl SuperfileReader {
             // one fetches the sidecar through `fetch_id_sidecar`.
             id_sidecar,
             id_sidecar_broken: AtomicBool::new(false),
+            id_block_bounds: OnceCell::new(),
             range_region,
             range_directory: OnceCell::new(),
             resident_hole: None,
@@ -1103,6 +1108,7 @@ impl SuperfileReader {
             vec,
             id_sidecar,
             id_sidecar_broken: AtomicBool::new(false),
+            id_block_bounds: OnceCell::new(),
             range_region,
             range_directory: OnceCell::new(),
             resident_hole: None,
@@ -1599,6 +1605,46 @@ impl SuperfileReader {
             && id_column == self.id_column
             && self.id_sidecar_is_packed()
             && covers_row_share(local_doc_ids, self.n_docs)
+    }
+
+    /// The lowest and highest `_id` each block of [`ids::BLOCK_DOCS`] rows
+    /// can hold, in row order, from the packed stable-id sidecar's block
+    /// headers: the order a read sorted on `_id` takes the rows in. Read on
+    /// the first call, from the resident bytes or one fetch of the sidecar,
+    /// and kept. `None` when the superfile has no packed sidecar, the sidecar
+    /// was found broken, or the read fails; the caller then reads in another
+    /// order. A header that does not parse marks the sidecar broken, as a
+    /// block that does not decode does.
+    pub(crate) async fn id_block_bounds(&self) -> Option<Arc<[(i128, i128)]>> {
+        let loc = self.id_sidecar?;
+        if !loc.packed || self.id_sidecar_broken.load(Ordering::Relaxed) {
+            return None;
+        }
+        self.id_block_bounds
+            .get_or_try_init(|| async {
+                let sidecar = match self.resident_id_sidecar() {
+                    Some(sidecar) => sidecar,
+                    None => self.fetch_id_sidecar().await?.ok_or_else(|| {
+                        ReadError::MalformedKv("the stable-id sidecar is gone".into())
+                    })?,
+                };
+                let bounds =
+                    PackedIds::open(&sidecar.bytes, self.n_docs as usize).and_then(|packed| {
+                        packed.block_bounds().ok_or_else(|| {
+                            "a block header of the stable-id sidecar is malformed".to_owned()
+                        })
+                    });
+                match bounds {
+                    Ok(bounds) => Ok(Arc::from(bounds)),
+                    Err(what) => {
+                        self.mark_id_sidecar_broken();
+                        Err(ReadError::MalformedKv(what))
+                    }
+                }
+            })
+            .await
+            .ok()
+            .cloned()
     }
 
     /// Record that this superfile's sidecar does not decode, so later reads

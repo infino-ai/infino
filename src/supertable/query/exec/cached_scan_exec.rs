@@ -21,6 +21,16 @@
 //! first, and skips each row group the bound rules out by its statistics just
 //! before reading it, so the top-k settles early and the rest go unread.
 //!
+//! A sort on `_id` reads finer than row groups. Ids are minted in order by
+//! each writer, so a file's run of [`BLOCK_DOCS`] rows spans a narrow band of
+//! ids even where its row groups, mixing writers, span nearly all of them.
+//! The stable-id sidecar records each block's bounds in its header
+//! ([`SuperfileReader::id_block_bounds`]); the scan reads the blocks in order
+//! of those bounds, skips each block the top-k's bound rules out, and stops
+//! once it rules out every block still to come. A page of `ORDER BY _id`
+//! under a filter that keeps a sizeable share of the rows reads a block or
+//! two instead of every row the filter keeps.
+//!
 //! It answers what the Parquet scan would: the same columns, typed as the scan
 //! schema types them, each file's rows in file order, without the rows a
 //! tombstone deletes. A `WHERE` stays above it in a `FilterExec`, as above the
@@ -38,15 +48,19 @@
 //!   in for, whose row filter decodes those columns only for the rows that
 //!   pass.
 
-use std::{fmt, ops::Range, sync::Arc};
+use std::{cmp::Reverse, collections::HashSet, fmt, ops::Range, sync::Arc};
 
 use arrow_array::{
-    ArrayRef, BooleanArray, RecordBatch, RecordBatchOptions, builder::BooleanBufferBuilder,
+    ArrayRef, BooleanArray, Decimal128Array, RecordBatch, RecordBatchOptions, UInt64Array,
+    builder::BooleanBufferBuilder,
 };
-use arrow_schema::{Schema, SchemaRef};
+use arrow_schema::{DataType, Schema, SchemaRef};
 use datafusion::{
     arrow::compute::{can_cast_types, cast_with_options, filter_record_batch},
-    common::{ScalarValue, Statistics, config::ConfigOptions},
+    common::{
+        Column as StatsColumn, ScalarValue, Statistics, config::ConfigOptions,
+        pruning::PruningStatistics,
+    },
     datasource::physical_plan::parquet::ParquetAccessPlan,
     error::{DataFusionError, Result as DfResult},
     execution::TaskContext,
@@ -55,7 +69,8 @@ use datafusion::{
         expressions::{Column, DynamicFilterPhysicalExpr, Literal},
     },
     physical_expr_adapter::PhysicalExprAdapterFactory,
-    physical_expr_common::physical_expr::snapshot_physical_expr,
+    physical_expr_common::physical_expr::{snapshot_generation, snapshot_physical_expr},
+    physical_optimizer::pruning::PruningPredicate,
     physical_plan::{
         DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
         SendableRecordBatchStream,
@@ -73,12 +88,12 @@ use parquet::{
     file::metadata::ParquetMetaData,
 };
 use roaring::RoaringBitmap;
-use tokio::spawn;
+use tokio::{spawn, sync::OnceCell};
 use tracing::Instrument;
 
 use crate::{
     runtime_metrics::op_stats::OpStatsCollector,
-    superfile::SuperfileReader,
+    superfile::{SuperfileReader, ids::BLOCK_DOCS},
     supertable::{
         error::QueryError,
         manifest::{ManifestSnapshot, SuperfileUri},
@@ -145,13 +160,19 @@ impl RowGroupFilter {
     }
 }
 
-/// One row group of one file: the unit a partition reads.
+/// One row group of one file, or one id block of it: the unit a partition
+/// reads.
 #[derive(Debug, Clone)]
 struct RowGroupUnit {
     file: Arc<CachedFile>,
     row_group: usize,
-    /// The row group's rows, by position in the file.
+    /// The rows to read, by position in the file: the row group's, or one
+    /// id block's.
     rows: Range<u32>,
+    /// The row group's rows, by position in the file.
+    group: Range<u32>,
+    /// The lowest and highest `_id` the rows can hold, for an id block.
+    id_bounds: Option<(i128, i128)>,
 }
 
 /// What every partition reads with.
@@ -185,6 +206,186 @@ pub(crate) struct CachedScanExec {
     /// Filters a parent pushed down that tighten while the statement runs
     /// ([`LiveFilters`]); `None` without any.
     live: Option<Arc<LiveFilters>>,
+    /// Set when a sort on `_id` was pushed down: the rows are read by id
+    /// block ([`IdOrder`]).
+    id_order: Option<IdOrder>,
+}
+
+/// A read in `_id` order: the scan's row groups cut into id blocks, ordered
+/// by their lowest id (their highest, descending). Built once per execution,
+/// by the first partition to start, and shared by the rest, which take every
+/// `partitions`-th block of it.
+#[derive(Debug, Clone)]
+struct IdOrder {
+    descending: bool,
+    blocks: Arc<OnceCell<Arc<[RowGroupUnit]>>>,
+}
+
+/// `units` cut into the id blocks of their files, ordered by each block's
+/// lowest id, or its highest when `descending`. A block holding no row to
+/// read (every one deleted, or none the index chose) is left out. `None`
+/// when a file has no sidecar bounds to order by, or fewer blocks than rows.
+async fn id_blocks(units: &[RowGroupUnit], descending: bool) -> Option<Vec<RowGroupUnit>> {
+    let block_rows = u32::try_from(BLOCK_DOCS).ok()?;
+    let mut files: Vec<(Arc<CachedFile>, Arc<[(i128, i128)]>)> = Vec::new();
+    let mut blocks = Vec::new();
+    for unit in units {
+        let bounds = match files.iter().find(|(file, _)| Arc::ptr_eq(file, &unit.file)) {
+            Some((_, bounds)) => Arc::clone(bounds),
+            None => {
+                let bounds = unit.file.reader.id_block_bounds().await?;
+                files.push((Arc::clone(&unit.file), Arc::clone(&bounds)));
+                bounds
+            }
+        };
+        let mut at = unit.rows.start;
+        while at < unit.rows.end {
+            let block = at / block_rows;
+            let end = block
+                .saturating_add(1)
+                .saturating_mul(block_rows)
+                .min(unit.rows.end);
+            let rows = at..end;
+            at = end;
+            let &bounds = bounds.get(block as usize)?;
+            let chosen = unit
+                .file
+                .selected
+                .as_ref()
+                .is_none_or(|selected| selected.range_cardinality(rows.clone()) > 0);
+            let deleted = unit.file.tombstones.range_cardinality(rows.clone());
+            if chosen && deleted < u64::from(rows.end - rows.start) {
+                blocks.push(RowGroupUnit {
+                    rows,
+                    id_bounds: Some(bounds),
+                    ..unit.clone()
+                });
+            }
+        }
+    }
+    match descending {
+        false => blocks.sort_by_key(|unit| unit.id_bounds.map(|(lo, _)| lo)),
+        true => blocks.sort_by_key(|unit| Reverse(unit.id_bounds.map(|(_, hi)| hi))),
+    }
+    Some(blocks)
+}
+
+/// One span of ids as the statistics of a single container, for pruning:
+/// the `_id` column lies between its two ends and holds no null; nothing is
+/// known of any other column.
+struct IdSpan<'a> {
+    column: &'a str,
+    data_type: &'a DataType,
+    lo: i128,
+    hi: i128,
+    rows: u64,
+}
+
+impl IdSpan<'_> {
+    fn bound(&self, value: i128) -> Option<ArrayRef> {
+        let DataType::Decimal128(precision, scale) = *self.data_type else {
+            return None;
+        };
+        Decimal128Array::from(vec![value])
+            .with_precision_and_scale(precision, scale)
+            .ok()
+            .map(|array| Arc::new(array) as ArrayRef)
+    }
+}
+
+impl PruningStatistics for IdSpan<'_> {
+    fn min_values(&self, column: &StatsColumn) -> Option<ArrayRef> {
+        (column.name == self.column)
+            .then(|| self.bound(self.lo))
+            .flatten()
+    }
+
+    fn max_values(&self, column: &StatsColumn) -> Option<ArrayRef> {
+        (column.name == self.column)
+            .then(|| self.bound(self.hi))
+            .flatten()
+    }
+
+    fn num_containers(&self) -> usize {
+        1
+    }
+
+    fn null_counts(&self, column: &StatsColumn) -> Option<ArrayRef> {
+        (column.name == self.column).then(|| Arc::new(UInt64Array::from(vec![0])) as ArrayRef)
+    }
+
+    fn row_counts(&self) -> Option<ArrayRef> {
+        Some(Arc::new(UInt64Array::from(vec![self.rows])))
+    }
+
+    fn contained(
+        &self,
+        _column: &StatsColumn,
+        _values: &HashSet<ScalarValue>,
+    ) -> Option<BooleanArray> {
+        None
+    }
+}
+
+/// [`LiveFilters`] checked against spans of `_id`, for a read by id block:
+/// each filter's pruning is rebuilt only when the filter has changed since
+/// the last check.
+struct IdGate {
+    live: Arc<LiveFilters>,
+    schema: SchemaRef,
+    column: String,
+    data_type: DataType,
+    /// Each filter's generation when its pruning was built, and the pruning:
+    /// `None` for a filter that rules nothing out (a top-k's before its
+    /// first `k` rows) or doesn't convert.
+    built: Vec<(u64, Option<PruningPredicate>)>,
+}
+
+impl IdGate {
+    /// A gate over `live` for the scan output `schema`'s `_id` column
+    /// `column`; `None` when the scan doesn't output it as a decimal.
+    fn new(live: Arc<LiveFilters>, schema: SchemaRef, column: &str) -> Option<Self> {
+        let data_type = schema.field_with_name(column).ok()?.data_type().clone();
+        matches!(data_type, DataType::Decimal128(..)).then(|| Self {
+            built: Vec::new(),
+            live,
+            schema,
+            column: column.to_owned(),
+            data_type,
+        })
+    }
+
+    /// Whether the filters as they stand rule out every row whose `_id` lies
+    /// between `lo` and `hi`.
+    fn rules_out(&mut self, lo: i128, hi: i128, rows: u64) -> bool {
+        if self.built.len() != self.live.filters.len() {
+            self.built = self.live.filters.iter().map(|_| (0, None)).collect();
+        }
+        let span = IdSpan {
+            column: &self.column,
+            data_type: &self.data_type,
+            lo,
+            hi,
+            rows,
+        };
+        let schema = &self.schema;
+        self.live.filters.iter().zip(self.built.iter_mut()).any(
+            |(filter, (generation, pruning))| {
+                let now = snapshot_generation(filter);
+                if *generation != now {
+                    *generation = now;
+                    *pruning = snapshot_physical_expr(Arc::clone(filter))
+                        .ok()
+                        .and_then(|expr| PruningPredicate::try_new(expr, Arc::clone(schema)).ok())
+                        .filter(|pruning| !pruning.always_true());
+                }
+                pruning
+                    .as_ref()
+                    .and_then(|pruning| pruning.prune(&span).ok())
+                    .is_some_and(|keep| keep.first() == Some(&false))
+            },
+        )
+    }
 }
 
 /// Filters pushed down from above that tighten as the statement runs, such
@@ -302,7 +503,9 @@ impl CachedScanExec {
                     units.push(RowGroupUnit {
                         file: Arc::clone(&file),
                         row_group,
+                        group: rows.clone(),
                         rows,
+                        id_bounds: None,
                     });
                 }
             }
@@ -329,6 +532,7 @@ impl CachedScanExec {
             properties,
             parquet,
             live: None,
+            id_order: None,
         })
     }
 
@@ -336,6 +540,26 @@ impl CachedScanExec {
     /// builds it.
     pub(crate) fn parquet(&self) -> &Arc<dyn ExecutionPlan> {
         &self.parquet
+    }
+
+    /// This scan reading by id block ([`IdOrder`]) for a sort on its output
+    /// column `column`, descending or not; `None` when that column isn't the
+    /// table's `_id`.
+    pub(crate) fn in_id_order(
+        &self,
+        column: usize,
+        descending: bool,
+    ) -> Option<Arc<dyn ExecutionPlan>> {
+        let field = self.context.schema.fields().get(column)?;
+        (field.name() == &self.context.manifest.options.id_column).then(|| {
+            Arc::new(Self {
+                id_order: Some(IdOrder {
+                    descending,
+                    blocks: Arc::default(),
+                }),
+                ..self.clone()
+            }) as Arc<dyn ExecutionPlan>
+        })
     }
 }
 
@@ -518,8 +742,9 @@ impl ScanContext {
         Ok(decoded)
     }
 
-    /// `unit`'s row group, every projected column, without its deleted rows
-    /// and, when the index chose the file's rows, without the rows it didn't.
+    /// `unit`'s rows, every projected column, without its deleted rows and,
+    /// when the index chose the file's rows, without the rows it didn't. The
+    /// columns are read and kept for the whole row group.
     async fn read(self: &Arc<Self>, unit: &RowGroupUnit) -> DfResult<RecordBatch> {
         let fields = self.schema.fields();
         let mut columns: Vec<Option<ArrayRef>> = fields
@@ -549,13 +774,17 @@ impl ScanContext {
             .into_iter()
             .map(|c| c.ok_or_else(|| DataFusionError::Internal("a column was not read".into())))
             .collect::<DfResult<Vec<_>>>()?;
-        let n = unit.rows.len();
         let batch = RecordBatch::try_new_with_options(
             Arc::clone(&self.schema),
             columns,
-            &RecordBatchOptions::new().with_row_count(Some(n)),
+            &RecordBatchOptions::new().with_row_count(Some(unit.group.len())),
         )?;
+        let n = unit.rows.len();
         let start = unit.rows.start;
+        let batch = match unit.rows == unit.group {
+            true => batch,
+            false => batch.slice((start - unit.group.start) as usize, n),
+        };
         let keep = match &unit.file.selected {
             Some(selected) => {
                 let mut mask = BooleanBufferBuilder::new(n);
@@ -606,6 +835,10 @@ impl DisplayAs for CachedScanExec {
         )?;
         if let Some(fetch) = self.fetch {
             write!(f, ", fetch={fetch}")?;
+        }
+        if let Some(order) = &self.id_order {
+            let direction = if order.descending { "desc" } else { "asc" };
+            write!(f, ", id_blocks={direction}")?;
         }
         Ok(())
     }
@@ -683,8 +916,11 @@ impl ExecutionPlan for CachedScanExec {
 
     /// For a sort on one of the scan's columns, reads the row groups that
     /// statistics say start best first, so a top-k above settles its bound
-    /// early and [`LiveFilters`] skip the rest. The order is only a reading
-    /// order: the sort stays.
+    /// early and [`LiveFilters`] skip the rest; for a sort on `_id`, reads by
+    /// id block ([`IdOrder`]). The order is only a reading order: the sort
+    /// stays. DataFusion asks only through nodes that pass a sort on, which a
+    /// `FilterExec` doesn't; under one, `IdOrderUnderTopK` asks for the id
+    /// order instead.
     fn try_pushdown_sort(
         &self,
         order: &[PhysicalSortExpr],
@@ -695,12 +931,20 @@ impl ExecutionPlan for CachedScanExec {
         let Some(column) = first.expr.downcast_ref::<Column>() else {
             return Ok(SortOrderPushdownResult::Unsupported);
         };
-        let Some(units) = best_first(&self.units, column.name(), first.options.descending) else {
+        let descending = first.options.descending;
+        let id_order =
+            (column.name() == self.context.manifest.options.id_column).then(|| IdOrder {
+                descending,
+                blocks: Arc::default(),
+            });
+        let units = best_first(&self.units, column.name(), descending);
+        if units.is_none() && id_order.is_none() {
             return Ok(SortOrderPushdownResult::Unsupported);
-        };
+        }
         Ok(SortOrderPushdownResult::Inexact {
             inner: Arc::new(Self {
-                units: units.into(),
+                units: units.map_or_else(|| Arc::clone(&self.units), Into::into),
+                id_order,
                 ..self.clone()
             }),
         })
@@ -717,28 +961,86 @@ impl ExecutionPlan for CachedScanExec {
                 self.partitions
             )));
         }
-        let units: Vec<RowGroupUnit> = self
-            .units
-            .iter()
-            .skip(partition)
-            .step_by(self.partitions)
-            .cloned()
-            .collect();
+        let partitions = self.partitions;
+        let all = Arc::clone(&self.units);
+        // By id block only under a filter that tightens: without one, no
+        // block is skipped, and the row groups read in fewer, larger batches.
+        let id_order = self.id_order.clone().filter(|_| self.live.is_some());
+        let descending = id_order.as_ref().is_some_and(|order| order.descending);
+        let units = stream::once(async move {
+            let units = match &id_order {
+                Some(order) => Arc::clone(
+                    order
+                        .blocks
+                        .get_or_init(|| async {
+                            match id_blocks(&all, order.descending).await {
+                                Some(blocks) => blocks.into(),
+                                None => Arc::clone(&all),
+                            }
+                        })
+                        .await,
+                ),
+                None => all,
+            };
+            let mine: Vec<RowGroupUnit> = units
+                .iter()
+                .skip(partition)
+                .step_by(partitions)
+                .cloned()
+                .collect();
+            stream::iter(mine)
+        })
+        .flatten();
         let context = Arc::clone(&self.context);
         let live = self.live.clone();
         let kept = self.live.clone();
         let context_schema = Arc::clone(&self.context.schema);
+        let gate = self.live.clone().and_then(|live| {
+            IdGate::new(
+                live,
+                Arc::clone(&self.context.schema),
+                &self.context.manifest.options.id_column,
+            )
+        });
         // A row group goes out in batch-size slices, as the Parquet scan's
         // rows do: the filter above then works a batch at a time, and a
         // `LIMIT` met in the first slice leaves the rest of the row group.
         let batch_size = task.session_config().batch_size();
-        let batches = stream::iter(units)
+        let batches = units
+            // An id block is checked against the filters' bounds as it comes
+            // up. Blocks come in order of their lowest id (highest,
+            // descending), so the ids of every block still to come lie at or
+            // above this one's lowest: once the filters rule out all of those,
+            // the partition is done.
+            .scan(gate, move |gate, unit| {
+                let next = match (gate.as_mut(), unit.id_bounds) {
+                    (Some(gate), Some((lo, hi))) => {
+                        let rows = u64::from(unit.rows.end - unit.rows.start);
+                        let rest = match descending {
+                            false => (lo, i128::MAX),
+                            true => (i128::MIN, hi),
+                        };
+                        if gate.rules_out(rest.0, rest.1, u64::MAX) {
+                            None
+                        } else if gate.rules_out(lo, hi, rows) {
+                            Some(None)
+                        } else {
+                            Some(Some(unit))
+                        }
+                    }
+                    _ => Some(Some(unit)),
+                };
+                future::ready(next)
+            })
+            .filter_map(future::ready)
             .filter(move |unit| {
                 // Checked as each row group comes up, so a bound tightened by
-                // the rows read so far skips it.
-                let skip = live
-                    .as_ref()
-                    .is_some_and(|live| live.skip(unit, &context_schema));
+                // the rows read so far skips it. An id block was checked by
+                // its own bounds above.
+                let skip = unit.id_bounds.is_none()
+                    && live
+                        .as_ref()
+                        .is_some_and(|live| live.skip(unit, &context_schema));
                 future::ready(!skip)
             })
             .then(move |unit| {

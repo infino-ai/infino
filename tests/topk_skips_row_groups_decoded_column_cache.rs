@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 //! A top-k over a scan of kept decoded columns reads row groups best first
-//! and skips the ones its tightening bound rules out by their statistics,
-//! and answers as a full sort would: on the id, with a key on a column no
-//! row holds a value in before it and without, and on another column,
+//! (on the id, id blocks in order of their bounds) and skips the ones its
+//! tightening bound rules out by their statistics, and answers as a full
+//! sort would: on the id, with a key on a column no row holds a value in
+//! before it and without, and on another column,
 //! ascending and descending, under a filter no index answers, deleted rows
 //! left out. Its own binary, because the host configuration (and with it the
 //! process's decoded-column cache) is read once per process.
@@ -27,8 +28,8 @@ const KEPT_BYTES: u64 = 64 * 1024 * 1024;
 /// Rows in each of the table's commits.
 const ROWS: i64 = 3_000;
 
-/// Commits, each a superfile.
-const COMMITS: i64 = 3;
+/// Fewest commits, each a superfile of one row group.
+const MIN_COMMITS: i64 = 3;
 
 /// The `_id` column across `batches`, in order.
 fn ids(batches: &[RecordBatch]) -> Vec<i128> {
@@ -97,7 +98,15 @@ fn a_top_k_over_kept_columns_answers_as_a_full_sort() {
     let t = conn
         .create_table("t", Arc::clone(&schema), IndexSpec::new())
         .expect("create t");
-    for commit in 0..COMMITS {
+    // A row group per partition at least, as a table of any size has: with
+    // fewer, a repartition between the scan and the sort keeps the sort from
+    // reaching the scan.
+    let commits = std::thread::available_parallelism()
+        .map_or(MIN_COMMITS, |n| {
+            i64::try_from(n.get()).unwrap_or(MIN_COMMITS)
+        })
+        .max(MIN_COMMITS);
+    for commit in 0..commits {
         let seq: Vec<i64> = (commit * ROWS..(commit + 1) * ROWS).collect();
         let note: Vec<Option<&str>> = seq.iter().map(|_| None).collect();
         t.append(
@@ -121,21 +130,37 @@ fn a_top_k_over_kept_columns_answers_as_a_full_sort() {
         all.sort_unstable();
         all
     };
-    for k in [1_usize, 10, 500, 5_000] {
-        let mut want = every.clone();
-        want.truncate(k);
-        for keys in ["_id ASC", "note ASC NULLS LAST, _id ASC"] {
-            let sql = format!(
-                "SELECT seq, \"_id\" AS \"_id\" FROM t WHERE seq % 7 = 0 ORDER BY {keys} LIMIT {k}"
-            );
-            for run in ["decoding", "from kept columns"] {
-                let got = ids(&conn
-                    .query_sql(&sql)
-                    .unwrap_or_else(|e| panic!("{run}: {e}")));
-                assert_eq!(got, want, "{run}: {sql}");
+    // On the id, the scan reads by id block (ids in blocks of 1024 rows,
+    // three a commit) under the filter no index answers: `k` within one
+    // block, across several, and past every row the filter keeps.
+    for (order, descending) in [("ASC", false), ("DESC", true)] {
+        for k in [1_usize, 10, 500, 1_500, 1_000_000] {
+            let mut want = every.clone();
+            if descending {
+                want.reverse();
             }
-            let plan = physical_plan(&conn, &sql);
-            assert!(plan.contains("CachedScanExec"), "{plan}");
+            want.truncate(k);
+            for keys in [
+                format!("_id {order}"),
+                format!("note ASC NULLS LAST, _id {order}"),
+            ] {
+                let sql = format!(
+                    "SELECT seq, \"_id\" AS \"_id\" FROM t WHERE seq % 7 = 0 ORDER BY {keys} LIMIT {k}"
+                );
+                for run in ["decoding", "from kept columns"] {
+                    let got = ids(&conn
+                        .query_sql(&sql)
+                        .unwrap_or_else(|e| panic!("{run}: {e}")));
+                    assert_eq!(got, want, "{run}: {sql}");
+                }
+                let plan = physical_plan(&conn, &sql);
+                assert!(plan.contains("CachedScanExec"), "{plan}");
+                // A sort whose first key is the id reads by id block.
+                if keys.starts_with("_id") {
+                    let direction = if descending { "desc" } else { "asc" };
+                    assert!(plan.contains(&format!("id_blocks={direction}")), "{plan}");
+                }
+            }
         }
     }
 
@@ -154,7 +179,7 @@ fn a_top_k_over_kept_columns_answers_as_a_full_sort() {
             })
             .collect()
     };
-    let mut kept: Vec<i64> = (30..COMMITS * ROWS).filter(|s| s % 7 == 0).collect();
+    let mut kept: Vec<i64> = (30..commits * ROWS).filter(|s| s % 7 == 0).collect();
     for (order, descending) in [("ASC", false), ("DESC", true)] {
         if descending {
             kept.reverse();
