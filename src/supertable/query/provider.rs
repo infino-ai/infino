@@ -54,6 +54,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fmt,
     future::Future,
+    ops::Deref,
     slice,
     sync::{Arc, atomic},
     time::Instant,
@@ -326,6 +327,27 @@ fn leaf_bytes(meta: &ParquetMetaData) -> Arc<[u64]> {
     bytes.into()
 }
 
+/// Count, once, what `entry`'s cached reader keeps decoded against its cache's budget: the parsed
+/// footer, and the scan footer when the reader keeps its own copy (one derived for this provider
+/// alone goes with the statement and is not counted).
+fn charge_footer(
+    disk_cache: Option<&Arc<DiskCacheStore>>,
+    entry: &SuperfileEntry,
+    prepared: &PreparedScanFile,
+) {
+    // Once per reader: a warm statement pays one load per file, not a cache lookup.
+    if let Some(cache) = disk_cache.filter(|_| prepared.reader.first_charge()) {
+        cache.charge_heap_once(&entry.uri, || {
+            let parsed = prepared.reader.parquet_metadata();
+            let mut bytes = parsed.memory_size();
+            if !entry.scalar_stats.is_unavailable() && !Arc::ptr_eq(&parsed, &prepared.footer) {
+                bytes += prepared.footer.memory_size();
+            }
+            bytes as u64
+        });
+    }
+}
+
 /// Where a superfile's row groups end, when it is handed to DataFusion as
 /// that byte range rather than whole. DataFusion sizes a scan and splits it
 /// into byte ranges across partitions by its files' ranges, and a split
@@ -352,6 +374,30 @@ fn rows_end(reader: &SuperfileReader, parquet_meta: &ParquetMetaData) -> Option<
 
 /// Concurrent first-open coalescing for one immutable superfile.
 type PreparedScanCell = Arc<OnceCell<Arc<PreparedScanFile>>>;
+
+/// The files a statement's providers prepared. When the last provider sharing them goes, the
+/// statement holds none of their readers, so the cache drops what is over its metadata budget.
+struct PreparedFiles {
+    files: DashMap<Uuid, PreparedScanCell>,
+    disk_cache: Option<Arc<DiskCacheStore>>,
+}
+
+impl Deref for PreparedFiles {
+    type Target = DashMap<Uuid, PreparedScanCell>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.files
+    }
+}
+
+impl Drop for PreparedFiles {
+    fn drop(&mut self) {
+        self.files.clear();
+        if let Some(cache) = &self.disk_cache {
+            cache.heap_budget().release_over_budget();
+        }
+    }
+}
 
 /// Selectivity gate for the FTS `WHERE` pushdown: only push an index
 /// candidate set into the scan when the estimated match count is at
@@ -445,7 +491,7 @@ pub(crate) struct SupertableProvider {
     /// Query-independent scan setup, filled lazily per superfile. Residual
     /// providers share this cache with their parent because both pin the same
     /// manifest and immutable files.
-    prepared_scan_files: Arc<DashMap<Uuid, PreparedScanCell>>,
+    prepared_scan_files: Arc<PreparedFiles>,
     /// Stable DataFusion object-store registry for this pinned manifest.
     /// Prepared files populate it once; scans reuse it rather than rebuilding
     /// a path→source map for every SQL statement.
@@ -562,7 +608,10 @@ impl SupertableProvider {
             store_url: unique_store_url(),
             segment_filter: None,
             scan_note: None,
-            prepared_scan_files: Arc::new(DashMap::new()),
+            prepared_scan_files: Arc::new(PreparedFiles {
+                files: DashMap::new(),
+                disk_cache: options.disk_cache.clone(),
+            }),
             scan_store: Arc::new(SuperfileObjectStore::new()),
             scan_footers: Arc::new(DashMap::new()),
             scalar_value_counts: Arc::new(DashMap::new()),
@@ -1553,6 +1602,7 @@ impl SupertableProvider {
                             parquet_meta,
                             statistics,
                         )
+                        .inspect(|prepared| charge_footer(disk_cache.as_ref(), &entry, prepared))
                     })
                     .await?;
                 return Ok(Arc::clone(prepared));
@@ -1595,6 +1645,7 @@ impl SupertableProvider {
                             parquet_meta,
                             statistics,
                         )
+                        .inspect(|prepared| charge_footer(disk_cache.as_ref(), &entry, prepared))
                     })
                     .await?;
                 Ok(Arc::clone(prepared))
@@ -3567,6 +3618,7 @@ mod tests {
                 read_ahead::{PAGE_READ_THROUGH_BYTES, file_pruning, fixture, statistics_pruned},
                 sql::sql_session_context,
             },
+            reader_cache::disk::HeapBudget,
         },
         test_helpers::{
             build_title_batch, default_supertable_options, default_tokenizer,
@@ -6309,5 +6361,123 @@ mod tests {
         for (sql, expected) in &queries {
             assert_eq!(count_of(&st, sql).await, *expected, "after: {sql}");
         }
+    }
+
+    /// Files in the tables the metadata-budget tests read.
+    const BUDGET_TEST_FILES: usize = 3;
+
+    /// A table of [`BUDGET_TEST_FILES`] one-row files behind a lazy disk cache whose files
+    /// count against its own `budget`.
+    fn table_charged_to(
+        budget: &'static HeapBudget,
+    ) -> (
+        TempDir,
+        TempDir,
+        Arc<DiskCacheStore>,
+        Supertable,
+        Arc<dyn StorageProvider>,
+    ) {
+        let storage_dir = TempDir::new().expect("storage tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(storage_dir.path()).expect("provider"));
+        let options = || default_supertable_options().with_storage(Arc::clone(&storage));
+        {
+            let table = Supertable::create(options()).expect("create");
+            for file in 0..BUDGET_TEST_FILES {
+                let mut writer = table.writer().expect("writer");
+                writer
+                    .append(&build_title_batch(&[&format!("file {file}")]))
+                    .expect("append");
+                writer.commit().expect("commit");
+            }
+        }
+        let cache_dir = TempDir::new().expect("cache tempdir");
+        let cache = lazy_foreground_disk_cache(Arc::clone(&storage), cache_dir.path());
+        cache.use_heap_budget(budget);
+        let table = Supertable::open(options().with_disk_cache(Arc::clone(&cache))).expect("open");
+        (storage_dir, cache_dir, cache, table, storage)
+    }
+
+    /// A SQL session over `reader` with a provider of its own, as one catalog statement has.
+    fn statement_over(table: &Supertable, reader: &SupertableReader) -> SessionContext {
+        let provider = SupertableProvider::new(reader.sql_schemas().scan().clone(), reader);
+        let ctx = sql_session_context(&table.options().connection_memory_budget).expect("ctx");
+        ctx.register_table(TABLE_NAME, Arc::new(provider) as Arc<dyn TableProvider>)
+            .expect("register");
+        ctx
+    }
+
+    /// Run a scan of every file in `ctx`, and hand the session back.
+    async fn scan_all(ctx: SessionContext) -> SessionContext {
+        ctx.sql(&format!("SELECT title FROM {TABLE_NAME}"))
+            .await
+            .expect("plan")
+            .collect()
+            .await
+            .expect("run");
+        ctx
+    }
+
+    /// The memory a statement's files keep goes back to the budget when the last statement holding
+    /// them ends, not before.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_statement_end_drops_metadata_over_budget_once_no_statement_holds_it() {
+        // Three files, a cache with a budget of 0, and two statements that scan them all.
+        //  - while either statement holds the files, every entry stays, counted;
+        //  - when the first ends, the second still holds them: nothing goes;
+        //  - when the second ends, every entry goes and its count with it.
+        // This test pins the end-of-statement pass and that it never drops what a statement holds.
+        let budget = HeapBudget::with_budget(Some(0));
+        let (_storage, _cache_dir, cache, table, _) = table_charged_to(budget);
+        let reader = table.reader().expect("reader");
+        let first = scan_all(statement_over(&table, &reader)).await;
+        let second = scan_all(statement_over(&table, &reader)).await;
+        let charged = budget.charged();
+        assert!(charged > 0, "every opened file is charged");
+        let cached = cache.stats().n_entries;
+
+        drop(first);
+        assert_eq!(
+            cache.stats().n_entries,
+            cached,
+            "the second still holds them"
+        );
+        assert_eq!(budget.charged(), charged);
+
+        drop(second);
+        let left = cached - BUDGET_TEST_FILES as u64;
+        assert_eq!(
+            cache.stats().n_entries,
+            left,
+            "no statement holds them: over budget, they go"
+        );
+        assert_eq!(budget.charged(), 0);
+    }
+
+    /// A file whose page index another path loaded first is counted at its first SQL scan.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_file_whose_page_index_a_search_loaded_is_charged_at_its_first_scan() {
+        // Three files whole in memory whose readers load their page index before any SQL, as a
+        // search's row fetch does, then one scan, which finds them resident.
+        // This test pins that such files still count against the budget.
+        let budget = HeapBudget::with_budget(None);
+        let (_storage, _cache_dir, cache, table, storage) = table_charged_to(budget);
+        let reader = table.reader().expect("reader");
+        for entry in &reader.manifest().superfiles {
+            let file = cache
+                .reader_synchronous_with_storage(
+                    &entry.uri,
+                    &entry.storage_path(),
+                    Arc::clone(&storage),
+                )
+                .await
+                .expect("load whole");
+            file.parquet_metadata_with_page_index()
+                .await
+                .expect("page index");
+        }
+        assert_eq!(budget.charged(), 0, "nothing charged before SQL");
+        let _done = scan_all(statement_over(&table, &reader)).await;
+        assert!(budget.charged() > 0, "charged at the first scan");
     }
 }

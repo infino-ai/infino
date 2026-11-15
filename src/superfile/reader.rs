@@ -268,6 +268,8 @@ pub struct SuperfileReader {
     /// What a table scan reads off this file's footer on every statement, worked out by the first
     /// scan that asks ([`Self::scan_shape`]) and kept while the reader stays cached.
     scan_shape: OnceLock<Arc<ScanShape>>,
+    /// Whether a cache has been told what this reader keeps decoded (see [`Self::first_charge`]).
+    charged: AtomicBool,
     /// The lazy byte source the reader was opened over, retained only
     /// on the [`open_lazy`] path. `None` on the eager [`open`] path
     /// (resident bytes already cover every range). Lets
@@ -968,6 +970,7 @@ impl SuperfileReader {
             page_index_loaded: OnceCell::new(),
             scan_footer: OnceLock::new(),
             scan_shape: OnceLock::new(),
+            charged: AtomicBool::new(false),
             source: Some(source),
             schema,
             id_column,
@@ -1115,6 +1118,7 @@ impl SuperfileReader {
             page_index_loaded: OnceCell::new(),
             scan_footer: OnceLock::new(),
             scan_shape: OnceLock::new(),
+            charged: AtomicBool::new(false),
             source: None,
             schema,
             id_column,
@@ -1213,6 +1217,12 @@ impl SuperfileReader {
     /// and a superfile's entry never changes, so every caller passes the
     /// same `derive`. Concurrent first callers may each derive one; the
     /// first stored is kept and returned to all of them.
+    /// True for the first caller only: the one that should count what this reader keeps decoded
+    /// against a cache's budget. Later callers pay one load.
+    pub(crate) fn first_charge(&self) -> bool {
+        !self.charged.load(Ordering::Acquire) && !self.charged.swap(true, Ordering::AcqRel)
+    }
+
     pub(crate) fn scan_footer<E>(
         &self,
         indexed: Arc<ParquetMetaData>,
