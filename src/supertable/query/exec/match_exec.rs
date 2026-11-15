@@ -1299,7 +1299,7 @@ mod tests {
         let rt = Runtime::new().expect("runtime");
         rt.block_on(async {
             let hits = reader
-                .token_match_hits_async("title", term, BoolMode::Or, true, filters)
+                .token_match_hits_async("title", term, BoolMode::Or, true, filters, None)
                 .await
                 .expect("hits");
             let batches = reader
@@ -1307,7 +1307,7 @@ mod tests {
                 .await
                 .expect("columns");
             let exact = reader
-                .exact_match_async("title", term, filters)
+                .exact_match_async("title", term, filters, None)
                 .await
                 .expect("exact");
             let taken: usize = batches.iter().map(RecordBatch::num_rows).sum();
