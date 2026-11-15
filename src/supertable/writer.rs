@@ -71,7 +71,7 @@ use std::{
     str::from_utf8,
     sync::{
         Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
         mpsc::{Receiver as StdReceiver, sync_channel as std_sync_channel},
     },
     thread::available_parallelism,
@@ -1181,6 +1181,47 @@ impl Supertable {
         Ok(())
     }
 
+    /// Build a batch's superfiles and write them to the table's storage
+    /// without adding them to the table: the first half of [`Self::append`].
+    /// The returned [`StagedAppend`] is published by [`Self::commit_staged`],
+    /// together with any others, in one commit; until then the rows are not
+    /// in the table.
+    ///
+    /// For a load that writes many batches into one table, from one process
+    /// or several threads of it, so the batches cost one commit between
+    /// them rather than one each. Refused for a table with vector columns,
+    /// one with no storage, and a batch that adds a column (append it).
+    ///
+    /// Until it is committed, a staged batch is a commit in flight to
+    /// [`Self::gc`]: its `safety_gap` must be longer than the batch waits.
+    pub fn stage(&self, batch: &RecordBatch) -> Result<StagedAppend, InfinoError> {
+        // Shared even for a batch that adds a column or a table without its
+        // vector grid: staging refuses both, and an exclusive slot taken
+        // only to refuse would turn concurrent appends away meanwhile.
+        let mut w = self
+            .acquire_writer(true)
+            .map_err(|e| InfinoError::from(e).with_context("stage", None))?;
+        w.stage_batch(batch)
+            .map_err(|e| InfinoError::from(e).with_context("stage", None))
+    }
+
+    /// Publish staged appends in one commit; see [`Self::stage`]. A staged
+    /// append lands once: one committed already is passed over, and one
+    /// another call is committing at the same time fails this call as an
+    /// [`InfinoError::Conflict`], to be retried. A commit that fails leaves
+    /// the rest of `staged` free to commit again. One refused as
+    /// [`InfinoError::Unsupported`] cannot land however often it is retried -
+    /// a staged append staged on another table, built under a schema the
+    /// table has moved past, or with superfiles reclaimed meanwhile - and
+    /// nothing in it was published: stage those rows again.
+    pub fn commit_staged(&self, staged: &[StagedAppend]) -> Result<(), InfinoError> {
+        let mut w = self
+            .acquire_writer(true)
+            .map_err(|e| InfinoError::from(e).with_context("commit_staged", None))?;
+        w.commit_staged(staged)
+            .map_err(|e| InfinoError::from(e).with_context("commit_staged", None))
+    }
+
     /// [`Self::append`], naming the source the rows came from.
     ///
     /// Every superfile this commit writes is keyed
@@ -1831,6 +1872,37 @@ impl SupertableWriter {
         batch: &RecordBatch,
         label: SourceLabel<'_>,
     ) -> Result<(), BuildError> {
+        self.buffer_labelled(batch, label)?;
+
+        // Auto-flush on held bytes (scalar + vector); the FTS weighting is a
+        // reserve-time concern, not held memory.
+        let threshold = (self.inner.options.commit_threshold_size_mb as usize)
+            .saturating_mul(1024)
+            .saturating_mul(1024);
+        if threshold > 0 && self.buffered_bytes() >= threshold {
+            // The threshold flush is a commit of the rows buffered so far, so
+            // it takes the label the way `commit` does — and puts it back on a
+            // failed flush, for the same reason `commit` does: the buffer is
+            // kept, so dropping the label would publish those same rows
+            // unnamed on the retry.
+            let stem = self.pending_stem.take();
+            if let Err(flush) = self.commit_appends_internal(stem.as_deref()) {
+                self.pending_stem = stem;
+                return Err(flush);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Buffer `batch` as [`Self::append_labelled`] does, without the flush
+    /// past the commit threshold: the rows wait in the buffer for whatever
+    /// takes them next.
+    fn buffer_labelled(
+        &mut self,
+        batch: &RecordBatch,
+        label: SourceLabel<'_>,
+    ) -> Result<(), BuildError> {
         let options = &self.inner.options;
         let manifest = self.inner.manifest.load();
 
@@ -1948,25 +2020,6 @@ impl SupertableWriter {
         // next one; a commit that finds the lanes current seals its pieces
         // from them instead of rebuilding.
         self.feed_live(&manifest, scalar_bytes_u64, fts_bytes_u64);
-
-        // Auto-flush on held bytes (scalar + vector); the FTS weighting is a
-        // reserve-time concern, not held memory.
-        let threshold = (self.inner.options.commit_threshold_size_mb as usize)
-            .saturating_mul(1024)
-            .saturating_mul(1024);
-        if threshold > 0 && self.buffered_bytes() >= threshold {
-            // The threshold flush is a commit of the rows buffered so far, so
-            // it takes the label the way `commit` does — and puts it back on a
-            // failed flush, for the same reason `commit` does: the buffer is
-            // kept, so dropping the label would publish those same rows
-            // unnamed on the retry.
-            let stem = self.pending_stem.take();
-            if let Err(flush) = self.commit_appends_internal(stem.as_deref()) {
-                self.pending_stem = stem;
-                return Err(flush);
-            }
-        }
-
         Ok(())
     }
 
@@ -2603,53 +2656,58 @@ impl SupertableWriter {
         // its scratch where it decides to (see
         // `commit_appends_with_taken_buffer`).
         let live = self.live.take();
-        let scratch = BuildScratchInputs {
-            scalar_bytes: self.buffer_visible_scalar_bytes,
-            vector_bytes: self.buffer_vector_bytes,
-            fts_bytes: self.buffer_fts_bytes,
-        };
-
         // Take the buffer so a concurrent append can't observe a half-drained
         // state, but keep the batches for restore on any later failure (S9).
-        let saved_scalar = self.buffer_scalar_bytes;
-        let saved_visible_scalar = self.buffer_visible_scalar_bytes;
-        let saved_vector = self.buffer_vector_bytes;
-        let saved_fts = self.buffer_fts_bytes;
-        let saved_ingest = mem::take(&mut self.pending_ingest);
-        let buffer = mem::take(&mut self.buffer);
-        self.buffer_scalar_bytes = 0;
-        self.buffer_visible_scalar_bytes = 0;
-        self.buffer_vector_bytes = 0;
-        self.buffer_fts_bytes = 0;
+        let taken = self.take_buffer();
 
-        match self.commit_appends_rebuilding(&buffer, stem, live, scratch) {
+        match self.commit_appends_rebuilding(&taken.batches, stem, live, taken.scratch()) {
             Ok(()) => {
                 self.live_disabled = false;
                 // Durable now, so the ingested work is real work. An
                 // all-empty-batch commit publishes nothing and reports
                 // nothing.
-                if let (Some(stats), true) = (&self.op_stats, saved_ingest.rows > 0) {
+                let ingest = taken.ingest;
+                if let (Some(stats), true) = (&self.op_stats, ingest.rows > 0) {
                     stats.add_ingested_write(
-                        saved_ingest.rows,
-                        saved_ingest.scalar_bytes,
-                        saved_ingest.vector_bytes,
-                        saved_ingest.fts_text_bytes,
+                        ingest.rows,
+                        ingest.scalar_bytes,
+                        ingest.vector_bytes,
+                        ingest.fts_text_bytes,
                     );
                 }
                 Ok(())
             }
             Err(e) => {
-                self.buffer = buffer;
-                self.buffer_scalar_bytes = saved_scalar;
-                self.buffer_visible_scalar_bytes = saved_visible_scalar;
-                self.buffer_vector_bytes = saved_vector;
-                self.buffer_fts_bytes = saved_fts;
-                self.pending_ingest = saved_ingest;
+                self.restore_buffer(taken);
                 // The restored buffer is rebuilt in full on the retry.
                 self.live_disabled = true;
                 Err(e)
             }
         }
+    }
+
+    /// Empty the buffer into a [`TakenBuffer`], its byte counts and ingest
+    /// tally with it, for a commit or a stage to build from.
+    fn take_buffer(&mut self) -> TakenBuffer {
+        TakenBuffer {
+            batches: mem::take(&mut self.buffer),
+            scalar_bytes: mem::take(&mut self.buffer_scalar_bytes),
+            visible_scalar_bytes: mem::take(&mut self.buffer_visible_scalar_bytes),
+            vector_bytes: mem::take(&mut self.buffer_vector_bytes),
+            fts_bytes: mem::take(&mut self.buffer_fts_bytes),
+            ingest: mem::take(&mut self.pending_ingest),
+        }
+    }
+
+    /// Put a [`TakenBuffer`] back after the commit or stage built from it
+    /// failed.
+    fn restore_buffer(&mut self, taken: TakenBuffer) {
+        self.buffer = taken.batches;
+        self.buffer_scalar_bytes = taken.scalar_bytes;
+        self.buffer_visible_scalar_bytes = taken.visible_scalar_bytes;
+        self.buffer_vector_bytes = taken.vector_bytes;
+        self.buffer_fts_bytes = taken.fts_bytes;
+        self.pending_ingest = taken.ingest;
     }
 
     /// Hand the batch just buffered to the live lanes, opening them when
@@ -3160,28 +3218,11 @@ impl SupertableWriter {
             None => base,
         };
         let scalar_schema = manifest.scalar_schema();
-        let buffer: Cow<'_, [BufferedBatch]> = if buffer
-            .iter()
-            .all(|b| b.scalar.schema().fields() == scalar_schema.fields())
-        {
-            Cow::Borrowed(buffer)
-        } else {
-            // A column the schema tightened after these rows were resolved
-            // refuses the whole commit here rather than building a batch
-            // Arrow rejects; the buffer is restored to the writer by the
-            // caller, as for any other failed commit.
-            Cow::Owned(
-                buffer
-                    .iter()
-                    .map(|b| {
-                        Ok(BufferedBatch {
-                            scalar: try_conform(&b.scalar, &scalar_schema)?,
-                            vectors: b.vectors.clone(),
-                        })
-                    })
-                    .collect::<Result<Vec<BufferedBatch>, SchemaError>>()?,
-            )
-        };
+        // A column the schema tightened after these rows were resolved
+        // refuses the whole commit here rather than building a batch Arrow
+        // rejects; the buffer is restored to the writer by the caller, as
+        // for any other failed commit.
+        let buffer = conform_buffer(buffer, &scalar_schema)?;
         let buffer: &[BufferedBatch] = &buffer;
 
         // Lanes fed every buffered row under the schema this commit builds
@@ -3453,6 +3494,39 @@ impl SupertableWriter {
             return Ok(());
         }
 
+        let user_batch =
+            self.build_scalar_superfiles(buffer, &manifest, pending_gvi.as_ref(), stem)?;
+        let superfiles = user_batch.new_entries.len();
+        // Same pre-move / post-Ok discipline as the vector arm above.
+        let output_stats = self
+            .op_stats
+            .as_ref()
+            .map(|_| commit_output_stats(&user_batch));
+        self.publish_appended(user_batch, list_metadata)?;
+        if let (Some(stats), Some((n_superfiles, bytes, fts_terms))) =
+            (&self.op_stats, output_stats)
+        {
+            stats.add_commit_outputs(n_superfiles, bytes, fts_terms);
+            stats.add_planned_commit_requests(planned_data_objects(payload_bytes));
+        }
+        if self.inner.options.storage.is_some() {
+            schedule_background_storage_reclaim(Arc::clone(&self.inner));
+        }
+        debug!(superfiles, "published appended superfiles");
+
+        Ok(())
+    }
+
+    /// Build the buffered rows of a table without vector columns into
+    /// superfiles under `manifest`, their uploads started: the build half of
+    /// an append commit, shared by [`Self::commit`] and [`Self::stage`].
+    fn build_scalar_superfiles(
+        &self,
+        buffer: &[BufferedBatch],
+        manifest: &Arc<ManifestSnapshot>,
+        pending_gvi: Option<&GlobalVectorIndex>,
+        stem: Option<&str>,
+    ) -> Result<SuperfilePublishBatch, BuildError> {
         let writer_pool = Arc::clone(&self.inner.options.writer_pool);
 
         // `scalar` is the whole buffer here: vector tables took the drain branch above, and text
@@ -3529,7 +3603,6 @@ impl SupertableWriter {
         let user_global_centroids: Option<std::sync::Arc<[f32]>> =
             if config::global().vector.user_centroids == CentroidAlignment::Global {
                 pending_gvi
-                    .as_ref()
                     .cloned()
                     .or_else(|| manifest.get_global_vector_index())
                     .filter(|g| g.grid.n_cent > 0 && g.grid.dim > 0)
@@ -3547,31 +3620,192 @@ impl SupertableWriter {
             build_piece(
                 PieceRows::Buffered(slice.as_slice()),
                 &user_options,
-                &manifest,
+                manifest,
                 user_options.vector_layout,
                 user_global_centroids.clone(),
             )
         })?;
-        let superfiles = outputs.len();
-        let user_batch =
-            prepare_user_superfile_batch(&self.inner, &manifest, outputs, cell_hints, stem)?;
-        // Same pre-move / post-Ok discipline as the vector arm above.
-        let output_stats = self
-            .op_stats
-            .as_ref()
-            .map(|_| commit_output_stats(&user_batch));
-        self.publish_appended(user_batch, list_metadata)?;
-        if let (Some(stats), Some((n_superfiles, bytes, fts_terms))) =
-            (&self.op_stats, output_stats)
-        {
-            stats.add_commit_outputs(n_superfiles, bytes, fts_terms);
-            stats.add_planned_commit_requests(planned_data_objects(payload_bytes));
-        }
-        if self.inner.options.storage.is_some() {
-            schedule_background_storage_reclaim(Arc::clone(&self.inner));
-        }
-        debug!(superfiles, "published appended superfiles");
+        prepare_user_superfile_batch(&self.inner, manifest, outputs, cell_hints, stem)
+    }
 
+    /// Stage `batch` alone: buffer it as an append does, then [`Self::stage`]
+    /// it. The writer serves this one batch, so it builds no live lanes for
+    /// it (staging builds from the buffer) and never flushes the buffer into
+    /// a commit of its own, however large the batch.
+    pub(crate) fn stage_batch(&mut self, batch: &RecordBatch) -> Result<StagedAppend, BuildError> {
+        self.live_disabled = true;
+        // A table that cannot stage at all is refused before the rows are
+        // buffered; a batch that adds a column is refused once buffered,
+        // against the schema the build sees.
+        check_stageable(&self.inner)?;
+        self.buffer_labelled(batch, SourceLabel::Unnamed)?;
+        self.stage()
+    }
+
+    /// Build and write the buffered rows' superfiles without publishing
+    /// them: the first half of an append commit, the second being
+    /// [`Self::commit_staged`]. The buffer is emptied as by a commit, and
+    /// restored on a failure.
+    ///
+    /// Refused for a table with vector columns (their commit trains and
+    /// stamps the table's cell grid, which a staged batch cannot carry), for
+    /// one with no storage (there is nowhere to put the superfiles meanwhile),
+    /// and for rows that would add a column to the schema: a schema change
+    /// rides in the commit that publishes it, so those rows are appended.
+    pub(crate) fn stage(&mut self) -> Result<StagedAppend, BuildError> {
+        let stem = self.pending_stem.take();
+        // Live lanes serve a commit of this buffer; staging builds from the
+        // buffer itself.
+        drop(self.live.take());
+        let taken = self.take_buffer();
+        match self.stage_buffer(&taken.batches, stem.as_deref(), taken.scratch()) {
+            Ok((batch, built_against)) => Ok(StagedAppend {
+                batch,
+                built_against,
+                payload_bytes: buffered_payload_bytes(&taken.batches),
+                ingest: taken.ingest,
+                state: AtomicU8::new(STAGED_FREE),
+            }),
+            Err(error) => {
+                self.pending_stem = stem;
+                self.restore_buffer(taken);
+                Err(error)
+            }
+        }
+    }
+
+    fn stage_buffer(
+        &self,
+        buffer: &[BufferedBatch],
+        stem: Option<&str>,
+        scratch: BuildScratchInputs,
+    ) -> Result<(SuperfilePublishBatch, u32), BuildError> {
+        let storage = check_stageable(&self.inner)?;
+        let manifest = self.inner.manifest.load_full();
+        let built_against = manifest.table_schema().schema_id();
+        if union_schema(
+            &manifest.table_schema(),
+            buffer.iter().map(|b| &b.scalar),
+            &self.inner.options.id_column,
+        )?
+        .is_some()
+        {
+            return Err(BuildError::Unsupported(
+                "staged rows would add a column to the table's schema; append them instead".into(),
+            ));
+        }
+        let buffer = conform_buffer(buffer, &manifest.scalar_schema())?;
+        if buffer.iter().all(|b| b.scalar.num_rows() == 0) {
+            return Ok((SuperfilePublishBatch::default(), built_against));
+        }
+        let _build_guard = reserve_build_scratch(
+            &self.inner.options.connection_memory_budget,
+            scratch.scalar_bytes,
+            scratch.vector_bytes,
+            scratch.fts_bytes,
+        )?;
+        let mut batch = self.build_scalar_superfiles(&buffer, &manifest, None, stem)?;
+        // Held until the commit, the superfiles' bytes would keep a whole
+        // load in memory: the reads after it fetch them from storage.
+        batch.skip_memory_fill();
+        batch.pending_cache_inserts.clear();
+        // Every superfile is written here, whether the build started its
+        // upload or left its bytes for the publish to write: the staged
+        // batch keeps none of them.
+        let uploads = mem::take(&mut batch.uploads);
+        let pending = &mut batch.pending_storage_writes;
+        let mut replaces = Vec::new();
+        bridge_on_runtime(
+            async {
+                let (written, uploaded) = tokio::join!(
+                    write_superfile_list(storage, &self.inner.options, pending, &mut replaces),
+                    await_uploads(uploads),
+                );
+                written.and(uploaded)
+            },
+            &self.inner.query_runtime(),
+        )?;
+        debug_assert!(batch.pending_storage_writes.is_empty());
+        Ok((batch, built_against))
+    }
+
+    /// Publish staged appends in one commit: their superfiles join the
+    /// table together, or none do. Losing the commit race to another writer
+    /// is retried as any append's publish is, without building or writing
+    /// anything again; a commit that fails leaves `staged` free to commit
+    /// again. A staged append committed already is passed over, and one
+    /// another call is committing fails this one as write contention.
+    ///
+    /// Refused as [`BuildError::Unsupported`], with nothing published, when
+    /// a staged append was staged on another table, has superfiles that are
+    /// no longer in the table's storage (reclaimed as orphans meanwhile), or
+    /// was built under a schema other than the table's now. Those rows are
+    /// staged again.
+    pub(crate) fn commit_staged(&mut self, staged: &[StagedAppend]) -> Result<(), BuildError> {
+        let staged: Vec<&StagedAppend> = staged.iter().filter(|one| !one.is_empty()).collect();
+        if staged.is_empty() {
+            return Ok(());
+        }
+        let storage = check_stageable(&self.inner)?;
+        // Claimed for this call before anything else, so the same staged
+        // append in two commits lands in at most one; released unless the
+        // commit lands.
+        let claim = StagedClaim::take(&staged)?;
+        let staged = claim.held.clone();
+        if staged.is_empty() {
+            return Ok(());
+        }
+        let current = self.inner.manifest.load().table_schema().schema_id();
+        if let Some(stale) = staged.iter().find(|one| one.built_against != current) {
+            return Err(BuildError::Unsupported(format!(
+                "a staged append was built under schema {}, and the table's is {current} now; \
+                 stage its rows again",
+                stale.built_against
+            )));
+        }
+        check_staged_superfiles_exist(storage, &staged, &self.inner.query_runtime())?;
+        let mut batch = SuperfilePublishBatch::default();
+        for one in &staged {
+            batch.absorb(one.batch.landed_copy());
+        }
+        let list_metadata = CommitListMetadata {
+            expected_schema_id: Some(current),
+            ..CommitListMetadata::default()
+        };
+        let output_stats = self.op_stats.as_ref().map(|_| commit_output_stats(&batch));
+        self.publish_appended(batch, list_metadata)
+            .map_err(|error| match error {
+                BuildError::SchemaMoved { expected, current } => BuildError::Unsupported(format!(
+                    "the table's schema moved from {expected} to {current} while the staged \
+                     appends were committed; stage their rows again"
+                )),
+                error => error,
+            })?;
+        claim.keep();
+        if let Some(stats) = &self.op_stats {
+            for one in &staged {
+                let ingest = one.ingest;
+                if ingest.rows > 0 {
+                    stats.add_ingested_write(
+                        ingest.rows,
+                        ingest.scalar_bytes,
+                        ingest.vector_bytes,
+                        ingest.fts_text_bytes,
+                    );
+                }
+            }
+            if let Some((n_superfiles, bytes, fts_terms)) = output_stats {
+                stats.add_commit_outputs(n_superfiles, bytes, fts_terms);
+            }
+            // Each staged append wrote its own superfiles, priced as its own
+            // append's would be.
+            let planned = staged
+                .iter()
+                .map(|one| planned_data_objects(one.payload_bytes))
+                .sum();
+            stats.add_planned_commit_requests(planned);
+        }
+        schedule_background_storage_reclaim(Arc::clone(&self.inner));
         Ok(())
     }
 
@@ -3784,11 +4018,27 @@ impl ShardOutput {
     }
 }
 
-/// Reserve the build's estimated transient heap:
-///
-/// estimate = (2.5*scalar_raw_bytes + 6.5*vector_raw_bytes + 1.5*fts_text_raw_bytes)
-///
-/// returns `OverBudget` when a bounded budget can't fit it.
+/// A writer's buffer, taken out of it for one commit or stage.
+struct TakenBuffer {
+    batches: Vec<BufferedBatch>,
+    scalar_bytes: usize,
+    visible_scalar_bytes: usize,
+    vector_bytes: usize,
+    fts_bytes: usize,
+    ingest: IngestTally,
+}
+
+impl TakenBuffer {
+    /// What building these batches holds in memory, to reserve.
+    fn scratch(&self) -> BuildScratchInputs {
+        BuildScratchInputs {
+            scalar_bytes: self.visible_scalar_bytes,
+            vector_bytes: self.vector_bytes,
+            fts_bytes: self.fts_bytes,
+        }
+    }
+}
+
 /// The buffered bytes a commit-time build reserves its scratch for, by
 /// input class, as [`reserve_build_scratch`] weights them.
 #[derive(Clone, Copy)]
@@ -3798,6 +4048,11 @@ struct BuildScratchInputs {
     fts_bytes: usize,
 }
 
+/// Reserve the build's estimated transient heap:
+///
+/// estimate = (2.5*scalar_raw_bytes + 6.5*vector_raw_bytes + 1.5*fts_text_raw_bytes)
+///
+/// returns `OverBudget` when a bounded budget can't fit it.
 fn reserve_build_scratch(
     budget: &Arc<ConnectionMemoryBudget>,
     scalar_bytes: usize,
@@ -5231,7 +5486,33 @@ fn finish_superfile_entry(
     Ok(Arc::new(staged))
 }
 
+/// The buffered batches at `scalar_schema`: borrowed when every one is
+/// already at it, conformed copies otherwise, refused when a batch cannot be
+/// brought to it.
+fn conform_buffer<'a>(
+    buffer: &'a [BufferedBatch],
+    scalar_schema: &Arc<Schema>,
+) -> Result<Cow<'a, [BufferedBatch]>, SchemaError> {
+    if buffer
+        .iter()
+        .all(|b| b.scalar.schema().fields() == scalar_schema.fields())
+    {
+        return Ok(Cow::Borrowed(buffer));
+    }
+    buffer
+        .iter()
+        .map(|b| {
+            Ok(BufferedBatch {
+                scalar: try_conform(&b.scalar, scalar_schema)?,
+                vectors: b.vectors.clone(),
+            })
+        })
+        .collect::<Result<Vec<BufferedBatch>, SchemaError>>()
+        .map(Cow::Owned)
+}
+
 /// Collected superfile entries + pending storage/cache writes for one publish.
+#[derive(Default)]
 pub(super) struct SuperfilePublishBatch {
     new_entries: Vec<Arc<SuperfileEntry>>,
     to_remove: Vec<Arc<SuperfileEntry>>,
@@ -5247,6 +5528,187 @@ pub(super) struct SuperfilePublishBatch {
     /// Superfile uploads already under way, started as each superfile was
     /// sealed; every one must land before the publish lists them.
     uploads: Vec<SuperfileUpload>,
+}
+
+/// An append's superfiles, built and written but not yet in the table: what
+/// [`crate::Supertable::stage`] returns and
+/// [`crate::Supertable::commit_staged`] publishes.
+///
+/// Staging is the build half of an append commit and committing the publish
+/// half, split so that many batches - staged one after another, or on
+/// several threads - land in the table in one commit instead of one commit
+/// each. A staged batch is a commit in flight for as long as it waits: its
+/// superfiles are in the table's storage and no manifest lists them, which is
+/// how a garbage-collection sweep tells an orphan, so a caller running `gc`
+/// on the table meanwhile gives it a safety gap longer than any batch waits
+/// between its stage and its commit (`optimize` uses a day). A commit finds
+/// any superfile that went missing meanwhile and refuses the batch.
+///
+/// A staged append holds its superfiles' term-index contributions, spilled
+/// to local scratch for a large batch, until it is dropped: drop each once
+/// it is committed.
+pub struct StagedAppend {
+    batch: SuperfilePublishBatch,
+    /// The schema the superfiles were built under; the commit is refused if
+    /// the table's has moved since.
+    built_against: u32,
+    /// The staged rows' payload, which prices the commit's writes as an
+    /// append's are (see [`planned_data_objects`]).
+    payload_bytes: u64,
+    ingest: IngestTally,
+    /// [`STAGED_FREE`], [`STAGED_COMMITTING`] while a commit holds it, or
+    /// [`STAGED_COMMITTED`] once that commit lands, so the batch's
+    /// superfiles are listed once.
+    state: AtomicU8,
+}
+
+/// A staged append no commit holds.
+const STAGED_FREE: u8 = 0;
+/// A staged append a commit holds while it publishes.
+const STAGED_COMMITTING: u8 = 1;
+/// A staged append whose commit landed.
+const STAGED_COMMITTED: u8 = 2;
+
+impl StagedAppend {
+    /// Rows the staged superfiles hold.
+    pub fn rows(&self) -> u64 {
+        self.ingest.rows
+    }
+
+    /// Whether nothing was staged (the batch had no rows).
+    pub fn is_empty(&self) -> bool {
+        self.batch.new_entries.is_empty()
+    }
+}
+
+impl fmt::Debug for StagedAppend {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StagedAppend")
+            .field("superfiles", &self.batch.new_entries.len())
+            .field("rows", &self.ingest.rows)
+            .field("built_against", &self.built_against)
+            .field(
+                "state",
+                &match self.state.load(Ordering::Acquire) {
+                    STAGED_FREE => "staged",
+                    STAGED_COMMITTING => "committing",
+                    _ => "committed",
+                },
+            )
+            .finish()
+    }
+}
+
+/// The staged appends one [`SupertableWriter::commit_staged`] call holds:
+/// released when it is dropped, unless [`Self::keep`] says they landed.
+struct StagedClaim<'a> {
+    /// The appends this call publishes.
+    held: Vec<&'a StagedAppend>,
+}
+
+impl<'a> StagedClaim<'a> {
+    /// Claim every one of `staged` not committed already, or none: refused
+    /// as write contention when another commit holds one.
+    fn take(staged: &[&'a StagedAppend]) -> Result<Self, BuildError> {
+        let mut claim = StagedClaim {
+            held: Vec::with_capacity(staged.len()),
+        };
+        for &one in staged {
+            match one.state.compare_exchange(
+                STAGED_FREE,
+                STAGED_COMMITTING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => claim.held.push(one),
+                Err(STAGED_COMMITTED) => {}
+                // `claim` drops here, releasing the ones this call took.
+                Err(_) => return Err(BuildError::WriteContention),
+            }
+        }
+        Ok(claim)
+    }
+
+    /// The commit landed: the appends are committed.
+    fn keep(mut self) {
+        for one in self.held.drain(..) {
+            one.state.store(STAGED_COMMITTED, Ordering::Release);
+        }
+    }
+}
+
+impl Drop for StagedClaim<'_> {
+    fn drop(&mut self) {
+        for one in &self.held {
+            one.state.store(STAGED_FREE, Ordering::Release);
+        }
+    }
+}
+
+/// The table's storage, when the table can stage an append: it has storage
+/// to hold the superfiles until the commit, and no vector columns (their
+/// commit trains and stamps the cell grid, which a staged batch cannot
+/// carry).
+fn check_stageable(inner: &SupertableInner) -> Result<&Arc<dyn StorageProvider>, BuildError> {
+    let Some(storage) = &inner.options.storage else {
+        return Err(BuildError::Unsupported(
+            "staging an append needs a storage-backed table".into(),
+        ));
+    };
+    if !inner.manifest.load().vector_configs().is_empty() {
+        return Err(BuildError::Unsupported(
+            "staging an append is not available on a table with vector columns".into(),
+        ));
+    }
+    Ok(storage)
+}
+
+/// Refuse `staged` unless every superfile it would list is in `storage`: a
+/// batch staged on another table names keys this table's storage does not
+/// hold, and one that waited past a `gc` sweep's safety gap had its
+/// superfiles deleted as orphans. Either published would list superfiles no
+/// read can open.
+fn check_staged_superfiles_exist(
+    storage: &Arc<dyn StorageProvider>,
+    staged: &[&StagedAppend],
+    runtime: &Runtime,
+) -> Result<(), BuildError> {
+    let keys: Vec<String> = staged
+        .iter()
+        .flat_map(|one| one.batch.new_entries.iter())
+        .map(|entry| entry.storage_path())
+        .collect();
+    let heads = keys.into_iter().map(|key| {
+        let storage = Arc::clone(storage);
+        async move {
+            storage
+                .head(&key)
+                .await
+                .map(drop)
+                .map_err(|error| (key, error))
+        }
+    });
+    let missing = bridge_on_runtime(
+        async {
+            stream::iter(heads)
+                .buffer_unordered(commit_write_concurrency().get())
+                .filter_map(|head| async move { head.err() })
+                .collect::<Vec<_>>()
+                .await
+        },
+        runtime,
+    );
+    let Some((key, error)) = missing.into_iter().next() else {
+        return Ok(());
+    };
+    Err(match error {
+        StorageError::NotFound { .. } => BuildError::Unsupported(format!(
+            "staged superfile {key} is not in this table's storage: the batch was staged on \
+             another table, or waited past a garbage-collection sweep that reclaimed it; stage \
+             its rows again"
+        )),
+        error => SupertableCommitError::from(error).into(),
+    })
 }
 
 /// A superfile upload running on the IO runtime.
@@ -5283,6 +5745,27 @@ impl SuperfilePublishBatch {
             .extend(other.pending_store_inserts);
         self.term_contributions.extend(other.term_contributions);
         self.uploads.extend(other.uploads);
+    }
+
+    /// A copy for a publish of superfiles already written, so a staged
+    /// batch can be committed again after a failed commit. Carries no bytes
+    /// and no cache fills: a staged batch keeps none (see
+    /// [`SupertableWriter::stage`]).
+    fn landed_copy(&self) -> SuperfilePublishBatch {
+        debug_assert!(self.uploads.is_empty(), "a staged batch holds no uploads");
+        debug_assert!(
+            self.pending_storage_writes.is_empty(),
+            "a staged batch's superfiles are written when it is staged"
+        );
+        SuperfilePublishBatch {
+            new_entries: self.new_entries.clone(),
+            to_remove: self.to_remove.clone(),
+            pending_storage_writes: Vec::new(),
+            pending_cache_inserts: Vec::new(),
+            pending_store_inserts: Vec::new(),
+            term_contributions: self.term_contributions.clone(),
+            uploads: Vec::new(),
+        }
     }
 
     /// Skip the in-memory reader-cache fill. Only for a storage-backed table,
