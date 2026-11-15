@@ -267,6 +267,9 @@ pub struct SuperfileReader {
     scan_footer: OnceLock<Arc<ParquetMetaData>>,
     /// Whether a cache has been told what this reader keeps decoded (see [`Self::first_charge`]).
     charged: AtomicBool,
+    /// What a table scan reads off this file's footer on every statement, worked out by the first
+    /// scan that asks ([`Self::scan_shape`]) and kept while the reader stays cached.
+    scan_shape: OnceLock<Arc<ScanShape>>,
     /// The lazy byte source the reader was opened over, retained only
     /// on the [`open_lazy`] path. `None` on the eager [`open`] path
     /// (resident bytes already cover every range). Lets
@@ -792,6 +795,22 @@ impl fmt::Debug for SuperfileReader {
     }
 }
 
+/// What a table scan needs from a superfile's footer, beyond the footer itself. It depends only
+/// on the file, so one copy serves every statement that scans the file.
+#[derive(Debug, PartialEq)]
+pub(crate) struct ScanShape {
+    /// Rows in each row group.
+    pub(crate) row_counts: Arc<[u32]>,
+    /// The byte where the last row group ends, for a file that keeps a range index after its row
+    /// groups; `None` for any other file.
+    pub(crate) rows_end: Option<u64>,
+    /// Data pages of each column across the row groups, by name; empty without a page index.
+    pub(crate) pages: HashMap<String, u64>,
+    /// Bytes of each column before compression. A list or struct column is stored as several
+    /// parts; bytes are kept per part, in the file's order.
+    pub(crate) leaf_bytes: Arc<[u64]>,
+}
+
 impl SuperfileReader {
     /// Open from a complete superfile byte buffer (i.e. the bytes
     /// returned by `SuperfileBuilder::finish`, or read from disk / S3
@@ -982,6 +1001,7 @@ impl SuperfileReader {
             page_index_loaded: OnceCell::new(),
             scan_footer: OnceLock::new(),
             charged: AtomicBool::new(false),
+            scan_shape: OnceLock::new(),
             source: Some(source),
             schema,
             id_column,
@@ -1130,6 +1150,7 @@ impl SuperfileReader {
             page_index_loaded: OnceCell::new(),
             scan_footer: OnceLock::new(),
             charged: AtomicBool::new(false),
+            scan_shape: OnceLock::new(),
             source: None,
             schema,
             id_column,
@@ -1245,6 +1266,18 @@ impl SuperfileReader {
         }
         let derived = derive(indexed)?;
         Ok(Arc::clone(self.scan_footer.get_or_init(|| derived)))
+    }
+
+    /// This file's scan shape: `build` on the first call, the same one on every later call. A
+    /// table builds a provider per statement, so without this each statement walked every footer.
+    /// Concurrent first callers may each build one; the first stored is kept, as in
+    /// [`Self::scan_footer`], so no caller waits on another's walk.
+    pub(crate) fn scan_shape(&self, build: impl FnOnce() -> ScanShape) -> Arc<ScanShape> {
+        if let Some(shape) = self.scan_shape.get() {
+            return Arc::clone(shape);
+        }
+        let built = Arc::new(build());
+        Arc::clone(self.scan_shape.get_or_init(|| built))
     }
 
     /// The Arrow metadata the synchronous decodes read through, or

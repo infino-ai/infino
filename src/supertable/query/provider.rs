@@ -117,6 +117,7 @@ use crate::{
             reader::{BoolMode, ContainsRows, MatchWork},
             tokenize::{Tokenizer, unique_tokens},
         },
+        reader::ScanShape,
     },
     supertable::{
         SuperfileEntry, SupertableReader,
@@ -210,13 +211,9 @@ struct PreparedScanFile {
     reader: Arc<SuperfileReader>,
     path: ObjPath,
     size: u64,
-    /// Where the row groups end, when the scan is handed only them (see
-    /// [`rows_end`]); `None` hands it the whole file.
-    rows_end: Option<u64>,
-    row_counts: Arc<[u32]>,
-    /// Each column's data pages across the row groups, by name, from the
-    /// page index; empty when the file carries none.
-    pages: HashMap<String, u64>,
+    /// Rows per row group, where the row groups end and pages per column: one copy per file,
+    /// shared through its reader ([`SuperfileReader::scan_shape`]).
+    shape: Arc<ScanShape>,
     /// The footer row-group and page pruning read: the file's own, without
     /// the bounds that leave out a float column's NaNs
     /// ([`without_nan_blind_bounds`]), one copy per superfile shared through
@@ -234,7 +231,7 @@ impl PreparedScanFile {
     fn pages_per_column(&self, columns: &[&str]) -> Option<u64> {
         let pages: Vec<u64> = columns
             .iter()
-            .filter_map(|column| self.pages.get(*column).copied())
+            .filter_map(|column| self.shape.pages.get(*column).copied())
             .collect();
         (!pages.is_empty()).then(|| pages.iter().sum::<u64>() / pages.len() as u64)
     }
@@ -255,24 +252,7 @@ fn prepare_scan_file(
     let path = ObjPath::from(entry.storage_path());
     let source = reader.byte_source();
     let size = source.size();
-    let row_counts: Arc<[u32]> = parquet_meta
-        .row_groups()
-        .iter()
-        .map(|row_group| row_group.num_rows() as u32)
-        .collect::<Vec<_>>()
-        .into();
-    let rows_end = rows_end(&reader, &parquet_meta);
-    let mut pages: HashMap<String, u64> = HashMap::new();
-    if let Some(offsets) = parquet_meta.offset_index() {
-        let leaves = parquet_meta.file_metadata().schema_descr();
-        for row_group in offsets {
-            for (leaf, chunk) in row_group.iter().enumerate() {
-                if let Some(name) = leaves.column(leaf).path().parts().first() {
-                    *pages.entry(name.clone()).or_default() += chunk.page_locations().len() as u64;
-                }
-            }
-        }
-    }
+    let shape = reader.scan_shape(|| scan_shape(&reader, &parquet_meta));
     // Derived once per superfile and kept on its reader: it depends only on
     // the footer and this superfile's own manifest bounds, which never
     // change, so the provider every query builds shares the first one. A
@@ -292,14 +272,18 @@ fn prepare_scan_file(
         })?
     };
     scan_store.insert_source(path.clone(), source);
-    scan_footers.insert(path.clone(), Arc::new(ScanFooter::new(Arc::clone(&footer))));
+    scan_footers.insert(
+        path.clone(),
+        Arc::new(ScanFooter::new(
+            Arc::clone(&footer),
+            Arc::clone(&shape.leaf_bytes),
+        )),
+    );
     Ok(Arc::new(PreparedScanFile {
         reader,
         path,
         size,
-        rows_end,
-        row_counts,
-        pages,
+        shape,
         footer,
         tier,
     }))
@@ -324,6 +308,44 @@ fn charge_footer(
             bytes as u64
         });
     }
+}
+
+/// Work out what a scan needs from `parquet_meta`, the page-indexed footer of `reader`'s file:
+/// rows per row group, where the row groups end, data pages per column and bytes per column part.
+fn scan_shape(reader: &SuperfileReader, parquet_meta: &ParquetMetaData) -> ScanShape {
+    let row_counts = parquet_meta
+        .row_groups()
+        .iter()
+        .map(|row_group| row_group.num_rows() as u32)
+        .collect();
+    let mut pages: HashMap<String, u64> = HashMap::new();
+    if let Some(offsets) = parquet_meta.offset_index() {
+        let leaves = parquet_meta.file_metadata().schema_descr();
+        for row_group in offsets {
+            for (leaf, chunk) in row_group.iter().enumerate() {
+                if let Some(name) = leaves.column(leaf).path().parts().first() {
+                    *pages.entry(name.clone()).or_default() += chunk.page_locations().len() as u64;
+                }
+            }
+        }
+    }
+    ScanShape {
+        row_counts,
+        rows_end: rows_end(reader, parquet_meta),
+        pages,
+        leaf_bytes: leaf_bytes(parquet_meta),
+    }
+}
+
+/// Bytes of each column part of `meta` before compression, summed over its row groups.
+fn leaf_bytes(meta: &ParquetMetaData) -> Arc<[u64]> {
+    let mut bytes = vec![0; meta.file_metadata().schema_descr().num_columns()];
+    for row_group in meta.row_groups() {
+        for (total, chunk) in bytes.iter_mut().zip(row_group.columns()) {
+            *total += chunk.uncompressed_size().max(0) as u64;
+        }
+    }
+    bytes.into()
 }
 
 /// Where a superfile's row groups end, when it is handed to DataFusion as
@@ -1039,7 +1061,12 @@ impl SupertableProvider {
                 // or under another analyzer): every live row is doubtful,
                 // so each is checked against its text below.
                 Err(e) if whole && holds_no_postings(&e) => {
-                    let total: u64 = prepared.row_counts.iter().map(|&n| u64::from(n)).sum();
+                    let total: u64 = prepared
+                        .shape
+                        .row_counts
+                        .iter()
+                        .map(|&n| u64::from(n))
+                        .sum();
                     let mut every = RoaringBitmap::new();
                     every.insert_range(0..u32::try_from(total).unwrap_or(u32::MAX));
                     every -= tombstones;
@@ -1647,7 +1674,7 @@ impl SupertableProvider {
                         let mut checks: Vec<(Vec<(u64, u32)>, RecordBatch)> = Vec::new();
                         let taken = match cache {
                             Some(cache) => {
-                                let row_counts = &prepared.row_counts;
+                                let row_counts = &prepared.shape.row_counts;
                                 let (kept, rest) = kept_filter_columns(
                                     cache,
                                     uri,
@@ -2544,23 +2571,14 @@ pub(crate) type ScanFooters = DashMap<ObjPath, Arc<ScanFooter>>;
 #[derive(Debug)]
 pub(crate) struct ScanFooter {
     meta: Arc<ParquetMetaData>,
-    /// Bytes per column before compression. Added up once when the file is
-    /// opened, so planning a query doesn't have to.
-    leaf_bytes: Box<[u64]>,
+    /// Bytes per column before compression. Added up once per file and kept on
+    /// its reader, so planning a query doesn't have to.
+    leaf_bytes: Arc<[u64]>,
 }
 
 impl ScanFooter {
-    fn new(meta: Arc<ParquetMetaData>) -> Self {
-        let mut leaf_bytes = vec![0; meta.file_metadata().schema_descr().num_columns()];
-        for row_group in meta.row_groups() {
-            for (bytes, chunk) in leaf_bytes.iter_mut().zip(row_group.columns()) {
-                *bytes += chunk.uncompressed_size().max(0) as u64;
-            }
-        }
-        Self {
-            meta,
-            leaf_bytes: leaf_bytes.into(),
-        }
+    fn new(meta: Arc<ParquetMetaData>, leaf_bytes: Arc<[u64]>) -> Self {
+        Self { meta, leaf_bytes }
     }
 
     /// `(column name, bytes)` for each column in the file. A list or struct
@@ -2569,7 +2587,7 @@ impl ScanFooter {
         let leaves = self.meta.file_metadata().schema_descr().columns();
         leaves
             .iter()
-            .zip(&self.leaf_bytes)
+            .zip(self.leaf_bytes.iter())
             .filter_map(|(leaf, &bytes)| Some((leaf.path().parts().first()?.as_str(), bytes)))
     }
 
@@ -3114,7 +3132,7 @@ impl TableProvider for SupertableProvider {
         for seg in &superfiles {
             let access_plan = if seg.candidates.is_some() || !seg.tombstones.is_empty() {
                 build_access_plan(
-                    seg.prepared.row_counts.as_ref(),
+                    seg.prepared.shape.row_counts.as_ref(),
                     &seg.candidates,
                     &seg.tombstones,
                 )
@@ -3124,7 +3142,7 @@ impl TableProvider for SupertableProvider {
             // A range-indexed superfile's range is its row groups (see
             // `rows_end`); any other is handed whole.
             let path = seg.prepared.path.to_string();
-            let mut file = match seg.prepared.rows_end {
+            let mut file = match seg.prepared.shape.rows_end {
                 Some(end) => {
                     PartitionedFile::new_with_range(path, seg.prepared.size, 0, end as i64)
                 }
@@ -3243,7 +3261,7 @@ impl TableProvider for SupertableProvider {
                         uri: entry.uri,
                         reader: Arc::clone(&seg.prepared.reader),
                         footer: Arc::clone(&seg.prepared.footer),
-                        row_counts: Arc::clone(&seg.prepared.row_counts),
+                        row_counts: Arc::clone(&seg.prepared.shape.row_counts),
                         tombstones: Arc::clone(&seg.tombstones),
                         // The live candidates only: a row group holding
                         // none of them reads nothing.
@@ -5239,7 +5257,7 @@ mod tests {
             .expect("prepare parent scan file");
         assert_eq!(provider.prepared_scan_files.len(), 1);
         assert_eq!(
-            prepared.row_counts.iter().copied().sum::<u32>() as u64,
+            prepared.shape.row_counts.iter().copied().sum::<u32>() as u64,
             entry.n_docs
         );
 
@@ -5253,6 +5271,55 @@ mod tests {
             &provider.prepared_scan_files,
             &restricted.prepared_scan_files
         ));
+    }
+
+    #[test]
+    fn statements_share_a_file_scan_shape_across_commits() {
+        // Two statements on one table, each with its own provider as a connection builds them,
+        // then a commit and a third statement.
+        //  - Both providers prepare the first file from the same cached reader.
+        //  - Each gets its own prepared file, but both share the reader's one scan shape, and that
+        //    shape equals one built fresh from the page-indexed footer.
+        //  - After the commit, the third statement sees the new file and reuses the old shape.
+        // This test pins that a statement doesn't walk the footer of a file an earlier statement
+        // already walked, and still sees every commit.
+        let st = Supertable::create(cat_title_opts()).expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&cat_title_batch(&["a", "a"], &["alpha beta", "gamma"]))
+            .expect("a1");
+        w.commit().expect("c1");
+        let rt = query_runtime();
+        let (first, second) = (provider_of(&st), provider_of(&st));
+        let entry = Arc::clone(&first.manifest().superfiles[0]);
+        let a = rt
+            .block_on(first.prepared_scan_file(Arc::clone(&entry)))
+            .expect("first statement");
+        let b = rt
+            .block_on(second.prepared_scan_file(Arc::clone(&entry)))
+            .expect("second statement");
+        assert!(Arc::ptr_eq(&a.reader, &b.reader), "the reader stays cached");
+        assert!(
+            !Arc::ptr_eq(&a, &b),
+            "each statement prepares the file itself"
+        );
+        assert!(Arc::ptr_eq(&a.shape, &b.shape));
+        let indexed = rt
+            .block_on(a.reader.parquet_metadata_with_page_index())
+            .expect("page index");
+        assert_eq!(*a.shape, scan_shape(&a.reader, &indexed));
+        assert!(
+            !a.shape.pages.is_empty(),
+            "the shape counts pages from the page index"
+        );
+
+        w.append(&cat_title_batch(&["b"], &["delta"])).expect("a2");
+        w.commit().expect("c2");
+        let third = provider_of(&st);
+        assert_eq!(rt.block_on(third.surviving_superfile_count(&[])), 2);
+        let c = rt
+            .block_on(third.prepared_scan_file(entry))
+            .expect("third statement");
+        assert!(Arc::ptr_eq(&a.shape, &c.shape));
     }
 
     // ---- Doc-id map on a cold SQL scan ---------------------------------
@@ -5781,7 +5848,10 @@ mod tests {
         });
         store.insert_source(path.clone(), source);
         let footers: Arc<ScanFooters> = Arc::new(DashMap::new());
-        footers.insert(path.clone(), Arc::new(ScanFooter::new(Arc::clone(&meta))));
+        footers.insert(
+            path.clone(),
+            Arc::new(ScanFooter::new(Arc::clone(&meta), leaf_bytes(&meta))),
+        );
         let schema = fixture::schema();
         let budget = ConnectionMemoryBudget::measured();
         let read_ahead_state = Arc::new(ScanReadAhead::new(
@@ -6450,7 +6520,7 @@ mod tests {
         let pruning = file_pruning(&predicate, &adapter, &provider.schema, &prepared.footer)
             .expect("pruning");
         statistics_pruned(
-            ParquetAccessPlan::new_all(prepared.row_counts.len()),
+            ParquetAccessPlan::new_all(prepared.shape.row_counts.len()),
             &prepared.footer,
             &pruning,
             prepared.path.as_ref(),
