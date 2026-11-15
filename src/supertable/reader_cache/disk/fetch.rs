@@ -714,6 +714,14 @@ impl DiskCacheStore {
                         tracing::debug!(target: "infino::cache", uri = %uri_owned.0, "fill: memory budget share under one chunk");
                         exit.failed();
                     }
+                    // The file is gone from storage: deleted under the download, as when its
+                    // table is dropped or its prefix removed. Still a failure, so the next read
+                    // does not download it again, but nothing is wrong with the cache, so no
+                    // warning.
+                    Err(DiskCacheError::Storage(StorageError::NotFound { .. })) => {
+                        tracing::debug!(target: "infino::cache", uri = %uri_owned.0, "fill: the file is gone from storage");
+                        exit.failed();
+                    }
                     // The entry still serves reads. A read after `FAILED_FILL_RETRY_AFTER` tries
                     // again.
                     Err(error) => {
@@ -1983,6 +1991,7 @@ mod tests {
         task::yield_now,
         time::{sleep, timeout},
     };
+    use tracing::Level;
 
     use crate::{
         memory::{ConnectionMemoryBudget, Reservation},
@@ -2006,7 +2015,10 @@ mod tests {
                 },
             },
         },
-        test_helpers::fault_storage::{FaultOp, FaultStorage},
+        test_helpers::{
+            capture_logs,
+            fault_storage::{FaultOp, FaultStorage},
+        },
     };
 
     /// Fills parked behind one held reader in the polling test.
@@ -2776,6 +2788,39 @@ mod tests {
         let retry_after_us = FAILED_FILL_RETRY_AFTER.as_micros() as u64;
         assert!(!fill.may_retry(failed_at_us + retry_after_us - 1));
         assert!(fill.may_retry(failed_at_us + retry_after_us));
+    }
+
+    /// A download whose file is deleted from storage under it (its table dropped, its prefix
+    /// removed) is still a failure, so the next read does not download it again, but it logs no
+    /// warning: nothing is wrong with the cache.
+    ///
+    /// Setup: the download waits for its slot, and the file is deleted from storage meanwhile.
+    /// The runtime runs on this thread, so the captured logs hold the download's own.
+    #[test]
+    fn a_download_whose_file_is_gone_from_storage_logs_no_warning() {
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let (fill, logs) = capture_logs(Level::WARN, || {
+            runtime.block_on(async {
+                let (_dir, store, recording) = recording_store(None);
+                let (uri, _) = put_tiny_superfile(&recording).await;
+                let permit = hold_fill_slot(&store).await;
+                warm_open(&store, &uri).await;
+                let fill = fill_of(&store, &uri);
+                recording.delete(&uri.storage_path()).await.expect("delete");
+                drop(permit);
+                store
+                    .wait_until_fills_settled(PROMOTE_TIMEOUT)
+                    .await
+                    .expect("the download ends");
+                fill
+            })
+        });
+
+        assert!(fill.failed_at_us.get().is_some(), "still a failure");
+        assert!(!logs.contains("download failed"), "no warning, got: {logs}");
     }
 
     /// A download whose cache directory is removed under it (a dropped store's, say) ends like a
