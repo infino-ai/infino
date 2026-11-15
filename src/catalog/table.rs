@@ -76,6 +76,14 @@ pub(crate) trait Table: Send + Sync {
         k: usize,
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, InfinoError>;
+    fn sorted_search_where(
+        &self,
+        column: Option<&str>,
+        filter: &Expr,
+        descending: bool,
+        k: usize,
+        projection: Option<&[&str]>,
+    ) -> Result<Option<Vec<RecordBatch>>, InfinoError>;
     fn count(&self, column: &str, query: &str, mode: BoolMode) -> Result<u64, InfinoError>;
     fn count_where(&self, predicates: &[Expr]) -> Result<Vec<u64>, InfinoError>;
     fn value_counts(&self, column: &str) -> Result<RecordBatch, InfinoError>;
@@ -195,6 +203,16 @@ impl Table for SupertableHandle {
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, InfinoError> {
         SupertableHandle::sorted_search(self, column, descending, k, projection)
+    }
+    fn sorted_search_where(
+        &self,
+        column: Option<&str>,
+        filter: &Expr,
+        descending: bool,
+        k: usize,
+        projection: Option<&[&str]>,
+    ) -> Result<Option<Vec<RecordBatch>>, InfinoError> {
+        SupertableHandle::sorted_search_where(self, column, filter, descending, k, projection)
     }
     fn count(&self, column: &str, query: &str, mode: BoolMode) -> Result<u64, InfinoError> {
         SupertableHandle::count(self, column, query, mode)
@@ -463,6 +481,31 @@ impl Supertable {
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, InfinoError> {
         self.inner.sorted_search(column, descending, k, projection)
+    }
+
+    /// The first `k` rows `filter` keeps by a range-indexed column (`column`,
+    /// or with `None` the one column `filter` names), read from its range
+    /// index without planning a statement: the filter's comparisons on the
+    /// column pick the stretch of the index to read, and its other
+    /// conditions are checked on the rows read, a window at a time. `None`,
+    /// for the caller to plan the statement, when the column has no range
+    /// index, when the other conditions need a statement to evaluate, or
+    /// when they keep too few of the rows read to fill the page within a
+    /// few thousand. When the superfiles' exact value tables show that no row
+    /// holds a value the filter requires, the page is empty without a row
+    /// read. Ties come in `_id` order. A hosted table always answers
+    /// `None`. `projection` follows [`Supertable::sorted_search`]'s rules.
+    pub fn sorted_search_where(
+        &self,
+        column: Option<&str>,
+        filter: &Expr,
+        descending: bool,
+        k: usize,
+        projection: Option<&[&str]>,
+    ) -> Result<Option<Vec<RecordBatch>>, InfinoError> {
+        ensure_expr_within_connective_cap(filter)?;
+        self.inner
+            .sorted_search_where(column, filter, descending, k, projection)
     }
 
     /// Count rows matching a token query over one FTS column.

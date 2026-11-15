@@ -7408,6 +7408,37 @@ mod tests {
     }
 
     #[test]
+    fn sorted_search_where_refuses_a_filter_over_the_connective_cap() {
+        // One connective past the cap, refused before the filter is simplified.
+        let conn = conn_with_docs();
+        let docs = conn.open_table("docs").expect("open docs");
+        let filter = (0..MAX_PREDICATE_CONNECTIVES + 2)
+            .map(|i| col("title").eq(lit(format!("t{i}"))))
+            .reduce(|acc, term| acc.or(term))
+            .expect("nonempty chain");
+        let err = docs.sorted_search_where(None, &filter, false, 10, None);
+        assert!(
+            matches!(&err, Err(InfinoError::Query(msg)) if msg.contains("connectives")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn sorted_search_where_allows_a_filter_at_the_connective_cap() {
+        // Exactly the cap is read; `title` has no range index, so it is left to a statement.
+        let conn = conn_with_docs();
+        let docs = conn.open_table("docs").expect("open docs");
+        let filter = (0..MAX_PREDICATE_CONNECTIVES + 1)
+            .map(|i| col("title").eq(lit(format!("t{i}"))))
+            .reduce(|acc, term| acc.or(term))
+            .expect("nonempty chain");
+        let page = docs
+            .sorted_search_where(None, &filter, false, 10, None)
+            .expect("at-cap filter is read");
+        assert!(page.is_none());
+    }
+
+    #[test]
     fn drop_missing_is_idempotent_no_op() {
         // Dropping a table that was never registered is a no-op success, not an
         // error: drop is idempotent so a retried drop is retry-safe (matches the
