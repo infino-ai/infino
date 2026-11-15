@@ -319,17 +319,18 @@ impl Supertable {
         self.inner.append(batch)
     }
 
-    /// Build and upload a batch's superfiles without adding them to the
+    /// Build and write a batch's superfiles without adding them to the
     /// table yet. [`Self::commit_staged`] publishes any number of staged batches in
     /// one commit, so a load of many batches into one table - from one
     /// process, or several threads of it - pays one commit between them
     /// rather than one each, and writers loading the same table contend for
     /// the table's commit once per call to it rather than once per batch.
     ///
-    /// The rows are not in the table until committed, and a staged batch is
-    /// committed within a few minutes of staging or refused: until then its
+    /// The rows are not in the table until committed: until then its
     /// superfiles are objects the table does not list, which a
-    /// [`Self::gc`] removes once they are older than its safety gap.
+    /// [`Self::gc`] removes once they are older than its safety gap. Commit
+    /// staged batches well within the safety gap the table is collected
+    /// with; one whose superfiles were collected is refused.
     ///
     /// Refused for a table with vector columns, for one with no storage
     /// (`memory://`), and for a batch that would add a column to the
@@ -340,10 +341,14 @@ impl Supertable {
 
     /// Publish staged batches in one commit: every one's rows join the
     /// table together, or none do. Losing the commit to a concurrent writer
-    /// is retried without rebuilding anything. A refused commit leaves
-    /// `staged` as it was, to be committed again; one refused because a
-    /// staged batch is too old, or the table's schema moved since it was
-    /// staged, needs those rows staged again.
+    /// is retried without rebuilding anything, and a staged batch lands at
+    /// most once however many calls commit it at the same time.
+    ///
+    /// A commit that fails leaves every batch in `staged` free to commit
+    /// again. One refused with [`InfinoError::Unsupported`] cannot land as
+    /// staged - a batch in it was committed already, was staged on another
+    /// table, had its superfiles collected, or was staged before the
+    /// table's schema moved - and those rows need staging again.
     pub fn commit_staged(&self, staged: &[StagedAppend]) -> Result<(), InfinoError> {
         self.inner.commit_staged(staged)
     }

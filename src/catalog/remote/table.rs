@@ -239,10 +239,6 @@ impl Table for RemoteTable {
         Ok(())
     }
 
-    /// The wire carries `?table=` and nothing else per append, so a source
-    /// name has nowhere to travel. Refused rather than silently dropped: a
-    /// caller asking for named superfiles and getting unnamed ones would have
-    /// no way to tell.
     /// Staging writes superfiles to the table's storage, which the hosted
     /// side owns: a hosted table appends.
     fn stage(&self, _batch: &RecordBatch) -> Result<StagedAppend, InfinoError> {
@@ -257,6 +253,10 @@ impl Table for RemoteTable {
         ))
     }
 
+    /// The wire carries `?table=` and nothing else per append, so a source
+    /// name has nowhere to travel. Refused rather than silently dropped: a
+    /// caller asking for named superfiles and getting unnamed ones would have
+    /// no way to tell.
     fn append_named(&self, _batch: &RecordBatch, source_name: &str) -> Result<(), InfinoError> {
         Err(InfinoError::Backend(format!(
             "append_named({source_name:?}) is not available on a hosted table: the append wire \
