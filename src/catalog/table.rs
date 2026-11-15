@@ -479,7 +479,9 @@ impl Supertable {
     /// for the caller to plan the statement, when the column has no range
     /// index, when the other conditions need a statement to evaluate, or
     /// when they keep too few of the rows read to fill the page within a
-    /// few thousand. Ties come in `_id` order. A hosted table always answers
+    /// few thousand. When the superfiles' exact value tables show that no row
+    /// holds a value the filter requires, the page is empty without a row
+    /// read. Ties come in `_id` order. A hosted table always answers
     /// `None`. `projection` follows [`Supertable::sorted_search`]'s rules.
     pub fn sorted_search_where(
         &self,

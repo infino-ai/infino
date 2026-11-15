@@ -93,6 +93,60 @@ struct SortedFilter {
     rest: Option<Expr>,
 }
 
+/// The share of a table's rows a condition is expected to keep
+/// ([`SupertableReader::expected_share`]), and whether the statistics prove
+/// it keeps none.
+struct Share {
+    share: f64,
+    none: bool,
+}
+
+/// `expr` as equalities of one column to literals, `OR`ed: the column and
+/// the literals, or `None` for any other shape.
+fn equalities_on_one_column(expr: &Expr) -> Option<(&str, Vec<&ScalarValue>)> {
+    match expr {
+        Expr::BinaryExpr(be) if be.op == datafusion::logical_expr::Operator::Or => {
+            let (left, mut values) = equalities_on_one_column(&be.left)?;
+            let (right, more) = equalities_on_one_column(&be.right)?;
+            (left == right).then(|| {
+                values.extend(more);
+                (left, values)
+            })
+        }
+        Expr::BinaryExpr(be) if be.op == datafusion::logical_expr::Operator::Eq => {
+            match (be.left.as_ref(), be.right.as_ref()) {
+                (Expr::Column(c), Expr::Literal(v, _)) | (Expr::Literal(v, _), Expr::Column(c)) => {
+                    Some((c.name.as_str(), vec![v]))
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The rows an exact value table's `entries` count for `literals` together,
+/// each literal compared as the table's values are typed; `None` when a
+/// literal does not take that type.
+fn literal_counts(entries: &[(ScalarValue, u64)], literals: &[&ScalarValue]) -> Option<u64> {
+    let Some((first, _)) = entries.first() else {
+        return Some(0);
+    };
+    let data_type = first.data_type();
+    let mut held = 0u64;
+    for literal in literals {
+        let literal = literal.cast_to(&data_type).ok()?;
+        held = held.saturating_add(
+            entries
+                .iter()
+                .filter(|(value, _)| *value == literal)
+                .map(|(_, count)| *count)
+                .sum(),
+        );
+    }
+    Some(held)
+}
+
 impl SupertableReader {
     /// The first `k` rows by `column` (descending with `descending`), ties
     /// by `_id` ascending, as hits in that order, read from the superfiles'
@@ -277,61 +331,109 @@ impl SupertableReader {
     /// its sides. Any other condition, or a column a superfile keeps no
     /// statistic of, counts as keeping every row: the walk then learns the
     /// share from the rows it reads.
-    fn expected_share(&self, condition: &Expr) -> f64 {
-        split_conjunction(condition)
-            .into_iter()
-            .map(|c| self.conjunct_share(c))
-            .product::<f64>()
-            .clamp(0.0, 1.0)
+    fn expected_share(&self, condition: &Expr) -> Share {
+        let mut share = 1.0;
+        let mut none = false;
+        for conjunct in split_conjunction(condition) {
+            let one = self.conjunct_share(conjunct);
+            share *= one.share;
+            none |= one.none;
+        }
+        Share {
+            share: share.clamp(0.0, 1.0),
+            none,
+        }
     }
 
-    /// [`Self::expected_share`] of one conjunct.
-    fn conjunct_share(&self, conjunct: &Expr) -> f64 {
-        let (column, values) = match conjunct {
+    /// [`Self::expected_share`] of one conjunct. Where a superfile keeps an
+    /// exact value table for the column, the literals' own counts in it are
+    /// read rather than one row per distinct value. A table counts every row
+    /// the superfile holds, deleted ones included, so a literal it lacks is
+    /// held by no live row there either.
+    fn conjunct_share(&self, conjunct: &Expr) -> Share {
+        let unknown = Share {
+            share: 1.0,
+            none: false,
+        };
+        let (column, literals): (&str, Vec<&ScalarValue>) = match conjunct {
             Expr::BinaryExpr(be) if be.op == datafusion::logical_expr::Operator::Eq => {
                 match (be.left.as_ref(), be.right.as_ref()) {
-                    (Expr::Column(c), Expr::Literal(..)) | (Expr::Literal(..), Expr::Column(c)) => {
-                        (c.name.as_str(), 1.0)
-                    }
-                    _ => return 1.0,
+                    (Expr::Column(c), Expr::Literal(v, _))
+                    | (Expr::Literal(v, _), Expr::Column(c)) => (c.name.as_str(), vec![v]),
+                    _ => return unknown,
                 }
             }
+            // The simplifier turns a short `IN` list into equalities `OR`ed.
+            Expr::BinaryExpr(be) if be.op == datafusion::logical_expr::Operator::Or => {
+                let Some((column, values)) = equalities_on_one_column(conjunct) else {
+                    return unknown;
+                };
+                (column, values)
+            }
             Expr::InList(list) if !list.negated => match list.expr.as_ref() {
-                Expr::Column(c) if list.list.iter().all(|v| matches!(v, Expr::Literal(..))) => {
-                    (c.name.as_str(), list.list.len() as f64)
+                Expr::Column(c) => {
+                    let mut values = Vec::with_capacity(list.list.len());
+                    for v in &list.list {
+                        let Expr::Literal(v, _) = v else {
+                            return unknown;
+                        };
+                        values.push(v);
+                    }
+                    (c.name.as_str(), values)
                 }
-                _ => return 1.0,
+                _ => return unknown,
             },
-            _ => return 1.0,
+            _ => return unknown,
         };
+        if literals.iter().any(|v| v.is_null()) {
+            return unknown;
+        }
         let manifest = self.manifest();
         let Some(field) = manifest.table_schema().id_of(column) else {
-            return 1.0;
+            return unknown;
         };
-        // Rows expected to hold each value, summed over the superfiles.
+        // Rows expected to hold the literals, summed over the superfiles, and
+        // whether every superfile's part of that is a count, not an estimate.
         let mut expected = 0.0;
         let mut rows = 0.0;
+        let mut counted = true;
         for entry in manifest.superfiles.iter() {
             rows += entry.n_docs as f64;
             let Some(stats) = entry.scalar_stats.column(field) else {
-                return 1.0;
+                return unknown;
             };
             if stats.all_null() {
                 continue;
             }
-            let distinct = match stats.value_counts() {
-                Some(table) => table.entries().len() as f64,
-                None => match stats.sketch().and_then(HllSketch::from_bytes) {
-                    Some(sketch) => sketch.estimate(),
-                    None => return 1.0,
-                },
-            };
             let present = entry.n_docs.saturating_sub(stats.null_count().unwrap_or(0)) as f64;
+            if let Some(table) = stats.value_counts() {
+                if let Some(held) = literal_counts(table.entries(), &literals) {
+                    expected += held as f64;
+                    continue;
+                }
+                counted = false;
+                let distinct = table.entries().len() as f64;
+                if distinct >= 1.0 {
+                    expected += present * (literals.len() as f64 / distinct).min(1.0);
+                }
+                continue;
+            }
+            counted = false;
+            let Some(sketch) = stats.sketch().and_then(HllSketch::from_bytes) else {
+                return unknown;
+            };
+            let distinct = sketch.estimate();
             if distinct >= 1.0 {
-                expected += present * (values / distinct).min(1.0);
+                expected += present * (literals.len() as f64 / distinct).min(1.0);
             }
         }
-        if rows == 0.0 { 1.0 } else { expected / rows }
+        if rows == 0.0 {
+            return unknown;
+        }
+        Share {
+            share: expected / rows,
+            none: counted && expected == 0.0,
+        }
     }
 
     /// Which of `hits` `condition` keeps, read from the hits' own rows: the
@@ -421,7 +523,12 @@ impl SupertableReader {
         let window_for = |share: f64| {
             ((needed(share) * WINDOW_MARGIN).ceil() as usize).clamp(k, MAX_WALKED_ROWS)
         };
-        let share = self.expected_share(rest);
+        let Share { share, none } = self.expected_share(rest);
+        if none {
+            // The statistics count every value a condition names, and no row
+            // holds one: the filter keeps nothing.
+            return Ok(Some(Vec::new()));
+        }
         if share <= 0.0 || needed(share) > MAX_WALKED_ROWS as f64 {
             return Ok(None);
         }
@@ -502,7 +609,10 @@ impl Supertable {
     /// when the column has no range index, when no column is named and the
     /// filter names several, when the other conditions need a statement
     /// to evaluate (a subquery, say), or when they keep too few of the rows
-    /// read in order to find `k` within a few thousand.
+    /// read in order to find `k` within a few thousand. When the superfiles'
+    /// exact value tables show that no row holds a value the conditions
+    /// require (an equality or `IN` on a column they count), the page is
+    /// empty without a row read.
     pub fn sorted_search_where(
         &self,
         column: Option<&str>,
@@ -873,6 +983,64 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A condition on a column the superfiles keep exact value tables for
+    /// reads its literals' counts: one no table holds, alone or in an `IN`
+    /// of such literals, keeps no row, and the page is empty without a row
+    /// read; a literal a table holds is walked and answers as the SQL sort.
+    #[test]
+    fn a_value_no_value_table_holds_keeps_no_row() {
+        let dir = TempDir::new().expect("tempdir");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("seq", DataType::Int64, false),
+            Field::new("tag", DataType::Utf8, false),
+        ]));
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let options = SupertableOptions::new(Arc::clone(&schema), vec![], vec![])
+            .expect("options")
+            .with_storage(storage)
+            .with_range_indexes(&["seq".to_string()]);
+        let st = Supertable::create(options).expect("create");
+        for file in 0..2_i64 {
+            let seqs: Vec<i64> = (file * 1000..(file + 1) * 1000).collect();
+            let tags: Vec<String> = seqs.iter().map(|s| format!("t{}", s % 7)).collect();
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(seqs)),
+                    Arc::new(arrow_array::StringArray::from(tags)),
+                ],
+            )
+            .expect("batch");
+            let mut writer = st.writer().expect("writer");
+            writer.append(&batch).expect("append");
+            writer.commit().expect("commit");
+        }
+        let page = |filter: &Expr| {
+            st.sorted_search_where(Some("seq"), filter, true, 10, Some(&["_id", "seq"]))
+                .expect("sorted_search_where")
+        };
+        for filter in [
+            col("tag").eq(lit("absent")),
+            col("tag").in_list(vec![lit("absent"), lit("missing")], false),
+        ] {
+            let got = page(&filter).unwrap_or_else(|| panic!("{filter}: answered"));
+            assert_eq!(
+                got.iter().map(RecordBatch::num_rows).sum::<usize>(),
+                0,
+                "{filter}"
+            );
+        }
+        let held = page(&col("tag").eq(lit("t3"))).expect("a held value is walked");
+        let reader = st.reader().expect("reader");
+        let want = reader
+            .query_sql(
+                "SELECT _id, seq FROM supertable WHERE tag = 't3' ORDER BY seq DESC NULLS LAST, _id ASC LIMIT 10",
+            )
+            .expect("sql");
+        assert_eq!(ints(&held, "seq"), ints(&want, "seq"));
     }
 
     /// A filter the index cannot be read for is left to the caller's
