@@ -147,10 +147,17 @@ impl TableResolver {
             scalar_schema: sql_schema(reader.manifest().stored_schema()),
             reader: Arc::new(reader),
         };
-        self.cache
+        let first = self
+            .cache
             .lock()
             .expect("resolver cache poisoned")
-            .insert(name.to_string(), resolved.clone());
+            .insert(name.to_string(), resolved.clone())
+            .is_none();
+        // Once per table per query: a second resolve of the same name
+        // (a race on the cache miss above) reads the same table.
+        if first && let Some(stats) = &self.op_stats {
+            stats.add_table_read();
+        }
         Ok(resolved)
     }
 
