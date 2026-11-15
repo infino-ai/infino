@@ -53,7 +53,12 @@
 //! output and never reaches a caller — a `SELECT`, `GROUP BY` key, or
 //! `MIN`/`MAX` over a string column always comes back `LargeUtf8`.
 
-use std::{collections::HashSet, future::Future, sync::Arc, time::Instant};
+use std::{
+    collections::HashSet,
+    future::Future,
+    sync::{Arc, Mutex, OnceLock, PoisonError},
+    time::Instant,
+};
 
 use arrow::{
     compute::{cast, concat_batches},
@@ -62,11 +67,17 @@ use arrow::{
 use arrow_array::{Array, Decimal128Array, Int64Array, new_empty_array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::{
+    catalog::{CatalogProviderList, MemoryCatalogProviderList},
     common::{Column, DFSchema, ScalarValue, runtime::SpawnedTask, tree_node::TreeNode},
     dataframe::DataFrame,
     datasource::DefaultTableSource,
     error::DataFusionError,
-    execution::{TaskContext, context::SessionContext},
+    execution::{
+        SessionStateDefaults, TaskContext,
+        context::{SessionContext, SessionState},
+        object_store::ObjectStoreUrl,
+        runtime_env::RuntimeEnv,
+    },
     functions_aggregate::{count::count_all, expr_fn::count},
     logical_expr::{
         Expr, ExprFunctionExt, LogicalPlan, lit, simplify::SimplifyContext,
@@ -248,6 +259,86 @@ pub(crate) fn sql_session_context(
     ctx.add_optimizer_rule(Arc::new(RangeTopK));
     ctx.add_optimizer_rule(Arc::new(MatchTopK));
     Ok(ctx)
+}
+
+/// [`sql_session_context`] built once and handed out as a copy per
+/// statement: its configuration, its optimizer rules and DataFusion's
+/// function library are the same for every statement on a connection, so
+/// copying them skips rebuilding that setup for each statement. Each copy
+/// gets a catalog list of its own, so the tables and table functions one
+/// statement registers are never seen by another.
+#[derive(Default)]
+pub(crate) struct SessionTemplate(OnceLock<SessionState>);
+
+impl SessionTemplate {
+    /// A context for one statement, as [`sql_session_context`] builds it,
+    /// with an empty catalog of its own.
+    pub(crate) fn context(
+        &self,
+        budget: &Arc<ConnectionMemoryBudget>,
+    ) -> Result<SessionContext, DataFusionError> {
+        let template = match self.0.get() {
+            Some(template) => template,
+            None => {
+                let built = sql_session_context(budget)?.state();
+                self.0.get_or_init(|| built)
+            }
+        };
+        // A copy of the template shares its catalog list: a fresh list, with
+        // the default catalog and schema the template was built with.
+        let mut state = template.clone();
+        let catalogs = MemoryCatalogProviderList::new();
+        let default_catalog = SessionStateDefaults::default_catalog(
+            state.config(),
+            state.table_factories(),
+            state.runtime_env(),
+        );
+        catalogs.register_catalog(
+            state.config().options().catalog.default_catalog.clone(),
+            Arc::new(default_catalog),
+        );
+        state.register_catalog_list(Arc::new(catalogs));
+        // It shares the template's runtime too, whose object-store registry
+        // keeps what a scan registers until it is removed.
+        let stores = StatementStores {
+            runtime: Arc::clone(state.runtime_env()),
+            urls: Mutex::default(),
+        };
+        state.config_mut().set_extension(Arc::new(stores));
+        Ok(SessionContext::new_with_state(state))
+    }
+}
+
+/// The object stores one statement's scans registered in the runtime it
+/// shares with every other statement on its connection (see
+/// [`SessionTemplate`]), removed from it when the statement's last session
+/// handle is dropped: when it returns, fails or is cancelled, and after a
+/// planning task it abandoned has stopped. Scans register under URLs unique
+/// to their provider, so removing them touches no other statement's.
+pub(crate) struct StatementStores {
+    runtime: Arc<RuntimeEnv>,
+    urls: Mutex<HashSet<ObjectStoreUrl>>,
+}
+
+impl StatementStores {
+    /// Note that a scan of this statement registered `url`.
+    pub(crate) fn record(&self, url: &ObjectStoreUrl) {
+        self.urls
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(url.clone());
+    }
+}
+
+impl Drop for StatementStores {
+    fn drop(&mut self) {
+        let urls = self.urls.get_mut().unwrap_or_else(PoisonError::into_inner);
+        for url in urls.drain() {
+            // Every recorded URL was registered and only this removes it, so
+            // the store is always there to remove; the store is what drops.
+            drop(self.runtime.deregister_object_store(url.as_ref()));
+        }
+    }
 }
 
 impl SupertableReader {
