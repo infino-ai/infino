@@ -3,7 +3,8 @@
 //! A scan whose index narrows some superfiles and reads the others whole
 //! takes their rows from kept decoded columns, as a scan the index narrows
 //! nowhere does, and answers the same: on the run that decodes the columns
-//! and on the runs that read them kept, deleted rows left out. Its own
+//! and on the runs that read them kept, deleted rows left out, metering the
+//! rows it hands on and decoding none of its row groups again. Its own
 //! binary, because the host configuration (and with it the process's
 //! decoded-column cache) is read once per process.
 #![deny(clippy::unwrap_used)]
@@ -16,6 +17,7 @@ use infino::{
     arrow_array::{Array, Int64Array, LargeStringArray, RecordBatch, StringArray},
     arrow_schema::{DataType, Field, Schema},
     connect,
+    runtime_metrics::op_stats::with_op_stats,
 };
 use tempfile::TempDir;
 
@@ -44,6 +46,11 @@ const DELETED_REMAINDER: i64 = 3;
 /// The statement: every live `x` row, in `seq` order.
 const SELECT_X: &str = "SELECT seq FROM t WHERE k = 'x' ORDER BY seq";
 
+/// A statement over the same rows that reads `k` alone: run first, it
+/// decodes and keeps `k` of both row groups, and leaves `seq` to
+/// [`SELECT_X`]'s first run.
+const SELECT_K: &str = "SELECT k FROM t WHERE k = 'x'";
+
 /// Where an analyzed plan names the filter, and how it counts the rows it
 /// kept out of those it was handed: `selectivity=60.78% (2.79 K/4.59 K)`.
 const FILTER_OPERATOR: &str = "FilterExec";
@@ -56,6 +63,10 @@ const READS_BOTH_ROW_GROUPS: &str = "CachedScanExec: row_groups=2,";
 /// The same once every `x` row of the first superfile is deleted: its row
 /// group holds no live row the index selected, so it is not read.
 const READS_ONE_ROW_GROUP: &str = "CachedScanExec: row_groups=1,";
+
+/// How an analyzed plan counts the row groups the scan of kept decoded
+/// columns decoded, because the cache lacked one of their columns.
+const ROW_GROUPS_DECODED: &str = "row_groups_decoded=";
 
 /// Rows a count DataFusion prints with a `K` suffix may be off by: it keeps
 /// two decimals of thousands.
@@ -110,6 +121,19 @@ fn filter_input_rows(plan: &str) -> f64 {
     number.parse::<f64>().expect("a row count") * scale
 }
 
+/// The row groups the scan of an analyzed plan decoded.
+fn row_groups_decoded(plan: &str) -> usize {
+    let at = plan
+        .find(ROW_GROUPS_DECODED)
+        .unwrap_or_else(|| panic!("the scan counts its decodes: {plan}"))
+        + ROW_GROUPS_DECODED.len();
+    let count = &plan[at..];
+    let end = count
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(count.len());
+    count[..end].parse().expect("a row group count")
+}
+
 /// The `seq` column across `batches`, in order.
 fn seqs(batches: &[RecordBatch]) -> Vec<i64> {
     batches
@@ -125,10 +149,10 @@ fn seqs(batches: &[RecordBatch]) -> Vec<i64> {
         .collect()
 }
 
-/// The plan `explain` (`EXPLAIN` or `EXPLAIN ANALYZE`) prints for
-/// [`SELECT_X`], as text.
-fn explain(conn: &Connection, explain: &str) -> String {
-    conn.query_sql(&format!("{explain} {SELECT_X}"))
+/// The plan `explain` (`EXPLAIN` or `EXPLAIN ANALYZE`) prints for `sql`,
+/// as text.
+fn explain(conn: &Connection, explain: &str, sql: &str) -> String {
+    conn.query_sql(&format!("{explain} {sql}"))
         .unwrap_or_else(|error| panic!("{explain}: {error}"))
         .iter()
         .flat_map(|b| {
@@ -194,17 +218,24 @@ fn a_scan_the_index_narrows_in_some_superfiles_reads_kept_decoded_columns() {
     t.delete((col("seq") % lit(DELETED_EVERY)).eq(lit(DELETED_REMAINDER)))
         .expect("delete");
 
-    let plan = explain(&conn, "EXPLAIN");
+    let plan = explain(&conn, "EXPLAIN", SELECT_X);
     assert!(plan.contains(READS_BOTH_ROW_GROUPS), "{plan}");
+    // A column the cache lacks is decoded, in the narrowed row group too.
+    let cold = explain(&conn, "EXPLAIN ANALYZE", SELECT_K);
+    assert_eq!(row_groups_decoded(&cold), 2, "{cold}");
+    // Every row the scan hands the filter is metered as materialized, on
+    // the run that decodes `seq` and on the ones that read it kept.
     for run in ["decoding", "from kept columns", "from kept columns again"] {
-        let batches = conn
-            .query_sql(SELECT_X)
-            .unwrap_or_else(|error| panic!("{run}: {error}"));
+        let (batches, stats) = with_op_stats(|| conn.query_sql(SELECT_X));
+        let batches = batches.unwrap_or_else(|error| panic!("{run}: {error}"));
         assert_eq!(seqs(&batches), expected(), "{run}");
+        assert_eq!(stats.rows_materialized, expected_scanned() as u64, "{run}");
     }
     // Only the selected rows of the narrowed superfile reach the filter;
-    // reading it whole too would hand over every live row of both.
-    let analyzed = explain(&conn, "EXPLAIN ANALYZE");
+    // reading it whole too would hand over every live row of both. Every
+    // column is kept by now, so neither row group is decoded again.
+    let analyzed = explain(&conn, "EXPLAIN ANALYZE", SELECT_X);
+    assert_eq!(row_groups_decoded(&analyzed), 0, "{analyzed}");
     let handed = filter_input_rows(&analyzed);
     assert!(
         (handed - expected_scanned() as f64).abs() <= PRINTED_THOUSANDS_ROUNDING,
@@ -216,7 +247,7 @@ fn a_scan_the_index_narrows_in_some_superfiles_reads_kept_decoded_columns() {
     // selects them, but none is live, so its row group is not read.
     t.delete(col("k").eq(lit("x")).and(col("seq").lt(lit(ROWS))))
         .expect("delete the sparse rows");
-    let plan = explain(&conn, "EXPLAIN");
+    let plan = explain(&conn, "EXPLAIN", SELECT_X);
     assert!(plan.contains(READS_ONE_ROW_GROUP), "{plan}");
     let batches = conn.query_sql(SELECT_X).expect("after the second delete");
     let rest: Vec<i64> = expected().into_iter().filter(|seq| *seq >= ROWS).collect();
