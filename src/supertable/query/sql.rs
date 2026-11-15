@@ -214,33 +214,34 @@ pub(crate) fn conform_value_counts(
 /// Maximum distinct scalar SQL statements cached per manifest snapshot.
 const SQL_LOGICAL_PLAN_CACHE_ENTRIES: usize = 64;
 
-/// Cache only plans whose table scans all use [`SupertableProvider`].
+/// Cache only plans that scan at least one table and whose table scans,
+/// subqueries' included, all use [`SupertableProvider`].
 ///
 /// Search TVF providers hold a live reader in their logical plan. Caching
 /// those plans on `SupertableInner` would create a reference cycle; scalar
 /// providers own only the pinned manifest and storage/cache handles.
 fn cacheable_scalar_plan(plan: &LogicalPlan) -> bool {
-    fn visit(plan: &LogicalPlan, found_scan: &mut bool) -> bool {
-        if let LogicalPlan::TableScan(scan) = plan {
-            let Some(source) = scan.source.downcast_ref::<DefaultTableSource>() else {
-                return false;
-            };
-            if source
-                .table_provider
-                .downcast_ref::<SupertableProvider>()
-                .is_none()
-            {
-                return false;
-            }
-            *found_scan = true;
-        }
-        plan.inputs()
-            .into_iter()
-            .all(|input| visit(input, found_scan))
-    }
-
+    let mut catalog_tables_only = true;
     let mut found_scan = false;
-    visit(plan, &mut found_scan) && found_scan
+    let walked = plan.apply_with_subqueries(|node| {
+        if let LogicalPlan::TableScan(scan) = node {
+            found_scan = true;
+            let catalog_table = scan
+                .source
+                .downcast_ref::<DefaultTableSource>()
+                .is_some_and(|s| {
+                    s.table_provider
+                        .downcast_ref::<SupertableProvider>()
+                        .is_some()
+                });
+            if !catalog_table {
+                catalog_tables_only = false;
+                return Ok(TreeNodeRecursion::Stop);
+            }
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    walked.is_ok() && catalog_tables_only && found_scan
 }
 
 /// Most statements a connection keeps the parsed plans of; past it the
@@ -270,27 +271,7 @@ impl StatementPlans {
     /// Keep `plan`, what `sql` parses to, with the catalog `tables` it names,
     /// when every table it scans is a catalog table.
     pub(crate) fn keep(&self, sql: &str, tables: Vec<String>, plan: &LogicalPlan) {
-        let mut catalog_tables_only = true;
-        let mut scans = 0usize;
-        let walked = plan.apply_with_subqueries(|node| {
-            if let LogicalPlan::TableScan(scan) = node {
-                scans += 1;
-                let catalog_table = scan
-                    .source
-                    .downcast_ref::<DefaultTableSource>()
-                    .is_some_and(|s| {
-                        s.table_provider
-                            .downcast_ref::<SupertableProvider>()
-                            .is_some()
-                    });
-                if !catalog_table {
-                    catalog_tables_only = false;
-                    return Ok(TreeNodeRecursion::Stop);
-                }
-            }
-            Ok(TreeNodeRecursion::Continue)
-        });
-        if walked.is_err() || !catalog_tables_only || scans == 0 {
+        if !cacheable_scalar_plan(plan) {
             return;
         }
         let Ok(stripped) = plan
@@ -1618,6 +1599,12 @@ mod tests {
         reader
             .query_sql("SELECT _id FROM bm25_search('title', 'searchable', 10)")
             .expect("search TVF query");
+        reader
+            .query_sql(
+                "SELECT COUNT(*) FROM supertable \
+                 WHERE _id IN (SELECT _id FROM bm25_search('title', 'searchable', 10))",
+            )
+            .expect("search TVF subquery");
         let guard = reader
             .sql_logical_plan_cache()
             .lock()
@@ -1626,7 +1613,7 @@ mod tests {
         assert_eq!(
             plans.len(),
             1,
-            "search TVF plans hold readers and must not enter the inner cache"
+            "search TVF plans, in a subquery too, hold readers and must not enter the inner cache"
         );
     }
 
