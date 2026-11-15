@@ -156,7 +156,7 @@ use crate::{
         query::{
             covered_agg::prepare_aggregate_inputs,
             exec::common::{collect_plan_metered, run_within_process_limit},
-            sql::SessionTemplate,
+            sql::{SessionTemplate, StatementPlans},
         },
         reader_cache::{DiskCacheConfig, DiskCacheError, DiskCacheStore},
         schema::{ColumnIndex, TableSchema, change::SchemaPatch, error::SchemaError},
@@ -258,6 +258,7 @@ pub fn connect_with(
             store,
             connection_memory_budget,
             sql_session_template: SessionTemplate::default(),
+            statement_plans: StatementPlans::default(),
             usage_meter,
             gcs_credential,
             #[cfg(feature = "graph-index")]
@@ -293,6 +294,7 @@ fn connect_remote(backend: Backend, options: ConnectOptions) -> Result<Connectio
             store: CatalogStore::Remote(Arc::new(remote)),
             connection_memory_budget,
             sql_session_template: SessionTemplate::default(),
+            statement_plans: StatementPlans::default(),
             usage_meter: UsageMeter::new(),
             gcs_credential: None,
             #[cfg(feature = "graph-index")]
@@ -328,6 +330,9 @@ struct ConnectionInner {
     /// The session every statement on this connection plans in, built once
     /// and copied per statement (see [`SessionTemplate`]).
     sql_session_template: SessionTemplate,
+    /// The parsed plans of statements run on this connection, by their text
+    /// (see [`StatementPlans`]).
+    statement_plans: StatementPlans,
     /// Sole object-store usage ledger for this connection (shared into every
     /// table provider). Benches and billing snapshot this meter.
     usage_meter: Arc<UsageMeter>,
@@ -1330,22 +1335,34 @@ impl Connection {
         // One snapshot of the session for parsing and table lookup; planning
         // takes a fresh one later, after the tables are registered.
         let state = ctx.state();
-        let statement =
-            read_only_statement(&state, sql).map_err(|e| e.with_context("query_sql", None))?;
-
-        // Resolve the relations the query names and register each that is a
-        // catalog table. Unknown names (CTEs, search TVFs, aliases) are
-        // skipped — the planner resolves those by other means or errors.
-        let refs = state
-            .resolve_table_references(&statement)
-            .map_err(|e| datafusion_planning_error(&e).with_context("query_sql", None))?;
+        // A statement this connection planned before is not parsed again: its
+        // kept plan names the catalog tables to register (see `StatementPlans`).
+        let kept = self.inner.statement_plans.get(sql);
+        let (statement, refs) = match &kept {
+            Some(_) => (None, Vec::new()),
+            None => {
+                let statement = read_only_statement(&state, sql)
+                    .map_err(|e| e.with_context("query_sql", None))?;
+                // Resolve the relations the query names and register each that
+                // is a catalog table. Unknown names (CTEs, search TVFs, aliases)
+                // are skipped — the planner resolves those by other means or errors.
+                let refs = state
+                    .resolve_table_references(&statement)
+                    .map_err(|e| datafusion_planning_error(&e).with_context("query_sql", None))?;
+                (Some(statement), refs)
+            }
+        };
+        let names: Vec<String> = match &kept {
+            Some((tables, _)) => tables.clone(),
+            None => refs.iter().map(|r| r.table().to_string()).collect(),
+        };
 
         let mut seen = HashSet::new();
         let mut handles: Vec<SupertableHandle> = Vec::new();
         // Read on the caller's thread, where the scope installed it.
         let read_stats = op_stats::current();
-        for r in &refs {
-            let name = r.table().to_string();
+        let mut registered: Vec<String> = Vec::new();
+        for name in names {
             if !seen.insert(name.clone()) {
                 continue;
             }
@@ -1360,6 +1377,7 @@ impl Connection {
                     stats.add_table_read();
                 }
                 handles.push(table);
+                registered.push(name);
             }
         }
 
@@ -1426,6 +1444,9 @@ impl Connection {
             || Some(Arc::clone(&self.inner.usage_meter)),
         );
         let collector = op_stats.clone();
+        let connection = self.clone();
+        let statement_text = sql.to_owned();
+        let kept_plan = kept.map(|(_, plan)| plan);
         let statement = async move {
             // Plan on this runtime's 16 MiB workers, not the calling thread `block_on` polls on:
             // planner recursion depth must not hang on a stack the engine does not own. A panic
@@ -1444,15 +1465,39 @@ impl Connection {
                 // execution. It runs on the planned tree and catches what the statement does
                 // not show: `SELECT ... INTO` reads like a query and plans to a CREATE TABLE.
                 // Planning has no side effects; a refused statement has touched nothing.
-                let plan = planner_ctx
-                    .state()
-                    .statement_to_plan(statement)
-                    .await
-                    .map_err(|e| datafusion_planning_error(&e))?;
+                let bound = match kept_plan {
+                    Some(plan) => StatementPlans::bind(plan, &planner_ctx)
+                        .await
+                        .map_err(|e| datafusion_planning_error(&e))?,
+                    None => None,
+                };
+                let parsed = bound.is_none();
+                let plan = match bound {
+                    Some(plan) => plan,
+                    None => {
+                        // Not kept, or kept against a table that has changed
+                        // since: parsed from its text.
+                        let statement = match statement {
+                            Some(statement) => statement,
+                            None => read_only_statement(&planner_ctx.state(), &statement_text)?,
+                        };
+                        planner_ctx
+                            .state()
+                            .statement_to_plan(statement)
+                            .await
+                            .map_err(|e| datafusion_planning_error(&e))?
+                    }
+                };
 
                 read_only_sql_options()
                     .verify_plan(&plan)
                     .map_err(|e| InfinoError::Query(format!("{READ_ONLY_REFUSAL} ({e})")))?;
+                if parsed {
+                    connection
+                        .inner
+                        .statement_plans
+                        .keep(&statement_text, registered, &plan);
+                }
 
                 // An aggregate's inputs are read before optimization (parts,
                 // deleted rows), so the rewrite can answer it from manifest
@@ -5079,6 +5124,148 @@ mod tests {
                 "a statement that {outcome} left its scan's store registered"
             );
         }
+    }
+
+    /// One `Int64` cell, the first column of the first row `sql` returns.
+    fn one_count(conn: &Connection, sql: &str) -> i64 {
+        let batches = conn.query_sql(sql).expect("sql");
+        batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("count")
+            .value(0)
+    }
+
+    /// A statement run again plans from its kept parse, and answers as a
+    /// fresh parse would: on the rows committed since, through a subquery's
+    /// table too, with a column added since (`*` read again against the new
+    /// schema), and with an error once its table is dropped.
+    #[test]
+    fn a_statement_run_again_answers_as_parsed_afresh() {
+        let conn = connect("memory://").expect("connect");
+        let field = Field::new("tag", DataType::LargeUtf8, true);
+        let tags = one_column_table(&conn, "tags", field.clone(), distinct_strings("a", 3));
+        let picks = one_column_table(&conn, "picks", field, distinct_strings("a", 1));
+        let count = "SELECT COUNT(*) FROM tags";
+        let picked = "SELECT COUNT(*) FROM tags WHERE tag IN (SELECT tag FROM picks)";
+        assert_eq!(one_count(&conn, count), 3);
+        assert_eq!(one_count(&conn, picked), 1);
+        tags.append(
+            &RecordBatch::try_new(tags.schema(), vec![distinct_strings("c", 4)]).expect("batch"),
+        )
+        .expect("append");
+        picks
+            .append(
+                &RecordBatch::try_new(picks.schema(), vec![distinct_strings("c", 2)])
+                    .expect("batch"),
+            )
+            .expect("append");
+        assert_eq!(one_count(&conn, count), 7, "rows committed since");
+        assert_eq!(
+            one_count(&conn, picked),
+            3,
+            "the subquery's rows committed since"
+        );
+
+        let every = "SELECT * FROM tags";
+        let columns = conn.query_sql(every).expect("sql")[0].num_columns();
+        conn.apply_schema(
+            "tags",
+            &SchemaPatch::new(vec![
+                FieldPatch::named("note").with_type(DataType::LargeUtf8),
+            ]),
+            None,
+        )
+        .expect("add a column");
+        assert_eq!(
+            conn.query_sql(every).expect("sql")[0].num_columns(),
+            columns + 1,
+            "a column added since"
+        );
+
+        conn.drop_table("tags", false).expect("drop");
+        assert!(conn.query_sql(count).is_err(), "a dropped table");
+        assert_eq!(one_count(&conn, "SELECT COUNT(*) FROM picks"), 3);
+    }
+
+    /// The plan `conn` keeps for `sql`, bound by [`StatementPlans::bind`] in a
+    /// fresh session holding the catalog tables `tables`, with that session.
+    fn bind_kept(
+        conn: &Connection,
+        sql: &str,
+        tables: &[&str],
+    ) -> (SessionContext, Option<LogicalPlan>) {
+        let ctx = conn
+            .inner
+            .sql_session_template
+            .context(&conn.inner.connection_memory_budget)
+            .expect("session");
+        for name in tables {
+            conn.open_and_register(&ctx, name)
+                .expect("register")
+                .expect("a catalog table");
+        }
+        let (_, plan) = conn.inner.statement_plans.get(sql).expect("kept");
+        let bound = bridge_on_runtime(StatementPlans::bind(plan, &ctx), &shared_io_runtime())
+            .expect("bind");
+        (ctx, bound)
+    }
+
+    /// A statement over catalog tables is kept, and its plan binds to the
+    /// tables a later run registers and reads their rows committed since. A
+    /// table not registered, or whose schema has changed since, sends the
+    /// statement back to parsing; a search function's statement is not kept.
+    #[test]
+    fn a_kept_statement_binds_only_to_its_unchanged_tables() {
+        let conn = connect("memory://").expect("connect");
+        let field = Field::new("tag", DataType::LargeUtf8, true);
+        let tags = one_column_table(&conn, "tags", field, distinct_strings("a", 3));
+        let every = "SELECT tag FROM tags";
+        assert_eq!(n_rows(&conn.query_sql(every).expect("sql")), 3);
+        let (tables, _) = conn.inner.statement_plans.get(every).expect("kept");
+        assert_eq!(tables, ["tags"]);
+
+        tags.append(
+            &RecordBatch::try_new(tags.schema(), vec![distinct_strings("c", 4)]).expect("batch"),
+        )
+        .expect("append");
+        let (ctx, bound) = bind_kept(&conn, every, &["tags"]);
+        let bound = bound.expect("an unchanged table binds");
+        let rows = bridge_on_runtime(
+            async { ctx.execute_logical_plan(bound).await?.collect().await },
+            &shared_io_runtime(),
+        )
+        .expect("execute");
+        assert_eq!(n_rows(&rows), 7, "the rows committed since");
+
+        assert!(
+            bind_kept(&conn, every, &[]).1.is_none(),
+            "a table not registered"
+        );
+        conn.apply_schema(
+            "tags",
+            &SchemaPatch::new(vec![
+                FieldPatch::named("note").with_type(DataType::LargeUtf8),
+            ]),
+            None,
+        )
+        .expect("add a column");
+        assert!(
+            bind_kept(&conn, every, &["tags"]).1.is_none(),
+            "a schema changed since"
+        );
+
+        conn.create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create docs")
+            .append(&build_title_batch(&["the quick brown fox", "a lazy dog"]))
+            .expect("append");
+        let search = "SELECT _id FROM bm25_search('docs', 'title', 'fox', 10)";
+        assert_eq!(n_rows(&conn.query_sql(search).expect("search")), 1);
+        assert!(
+            conn.inner.statement_plans.get(search).is_none(),
+            "a search function's statement"
+        );
     }
 
     /// A table's value counts are its `GROUP BY` counts, merged across superfiles.

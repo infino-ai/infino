@@ -2020,7 +2020,7 @@ mod tests {
         },
         test_helpers::{
             capture_logs,
-            fault_storage::{FaultOp, FaultStorage},
+            fault_storage::{FaultKind, FaultOp, FaultStorage},
         },
     };
 
@@ -2239,7 +2239,18 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let local: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("localfs"));
-        let recording = RecordingStorage::over(local);
+        recording_store_over(dir, local, budget, tweak)
+    }
+
+    /// [`recording_store_with`], recording `storage` (rooted in `dir`) instead of a plain local
+    /// store, so a test can put a fault-injecting store under it.
+    fn recording_store_over(
+        dir: TempDir,
+        storage: Arc<dyn StorageProvider>,
+        budget: Option<u64>,
+        tweak: impl FnOnce(&mut DiskCacheConfig),
+    ) -> (TempDir, Arc<DiskCacheStore>, Arc<RecordingStorage>) {
+        let recording = RecordingStorage::over(storage);
         let defaults = DiskCacheConfig::default();
         let mut cfg = DiskCacheConfig {
             cache_root: dir.path().join("cache"),
@@ -2824,6 +2835,54 @@ mod tests {
 
         assert!(fill.failed_at_us.get().is_some(), "still a failure");
         assert!(!logs.contains("download failed"), "no warning, got: {logs}");
+    }
+
+    /// A download that fails for any other storage error still logs a warning: only a file gone
+    /// from storage is quiet.
+    ///
+    /// Setup: as above, but every read of the file fails with `kind` instead of finding it gone.
+    #[test]
+    fn a_download_failing_for_another_storage_error_logs_a_warning() {
+        for kind in [FaultKind::Transient, FaultKind::PermissionDenied] {
+            let runtime = Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            let (fill, logs) = capture_logs(Level::WARN, || {
+                runtime.block_on(async {
+                    let dir = TempDir::new().expect("tempdir");
+                    let local: Arc<dyn StorageProvider> =
+                        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("localfs"));
+                    let faults = FaultStorage::wrap(local);
+                    let (_dir, store, recording) = recording_store_over(
+                        dir,
+                        Arc::clone(&faults) as Arc<dyn StorageProvider>,
+                        None,
+                        |_| {},
+                    );
+                    let (uri, _) = put_tiny_superfile(&recording).await;
+                    let permit = hold_fill_slot(&store).await;
+                    warm_open(&store, &uri).await;
+                    let fill = fill_of(&store, &uri);
+                    for op in [FaultOp::Get, FaultOp::GetRange] {
+                        faults.fail_with(kind, op, &uri.0.to_string(), usize::MAX);
+                    }
+                    drop(permit);
+                    store
+                        .wait_until_fills_settled(PROMOTE_TIMEOUT)
+                        .await
+                        .expect("the download ends");
+                    assert!(faults.fired() > 0, "{kind:?}: the download hit the fault");
+                    fill
+                })
+            });
+
+            assert!(fill.failed_at_us.get().is_some(), "{kind:?}: a failure");
+            assert!(
+                logs.contains("fill: download failed"),
+                "{kind:?}: a warning, got: {logs}"
+            );
+        }
     }
 
     /// A download whose cache directory is removed under it (a dropped store's, say) ends like a
