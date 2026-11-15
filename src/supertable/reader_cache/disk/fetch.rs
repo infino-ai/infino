@@ -662,10 +662,12 @@ impl DiskCacheStore {
         // Built before the task is spawned, so the download is unregistered even if the task never
         // runs.
         let exit = FillExit::new(self, *uri, fill);
-        // The file may have been evicted since `entry` was looked up. Eviction cancels under the
-        // entry's lock (see [`Self::remove_entry_cancelling_fill`]): either it cancelled this
-        // download, or the entry is gone here.
-        if !self.cached.contains_key(uri) {
+        // Checked after the download is registered, so a download racing an eviction or a dead
+        // mark is either cancelled by it (see [`Self::remove_entry_cancelling_fill`]) or sees it
+        // here:
+        // - the file may have been evicted since `entry` was looked up;
+        // - no new query reads a dead file, so its whole copy would never be read.
+        if !self.cached.contains_key(uri) || self.is_dead(uri) {
             return;
         }
         // A Stream-opened (SourceOwned) entry charges only its filled blocks, so `size_bytes` is
@@ -3040,6 +3042,20 @@ mod tests {
 
         store.maybe_spawn_background_fill(&uri, &uri.storage_path(), &entry, None);
         assert!(store.fills.is_empty(), "no second download");
+    }
+
+    /// A dead file's lazy entry, opened by a query on an older snapshot, starts no download: no new
+    /// query reads the file, so its whole copy would never be read.
+    #[tokio::test]
+    async fn a_dead_file_is_not_downloaded() {
+        let (_dir, store) = test_store();
+        let uri = SuperfileUri::new_v4();
+        store.install_block_entry_for_test(uri, dummy_block_source(&store, uri));
+        let entry = Arc::clone(&store.cached.get(&uri).expect("the lazy entry"));
+        store.mark_dead(&[uri]);
+
+        store.maybe_spawn_background_fill(&uri, &uri.storage_path(), &entry, None);
+        assert!(store.fills.is_empty(), "no download");
     }
 
     /// Eviction for a download never takes the file the download is for: not its entry, not a copy

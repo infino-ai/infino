@@ -296,9 +296,11 @@ impl DiskCacheStore {
         }
         self.block_files.insert(
             *uri,
-            UnindexedFile {
+            BlockFileRecord {
                 size_bytes: filled,
-                mtime_us: file_mtime_us(&meta),
+                read: BlockFileRead::NotSinceStart {
+                    mtime_us: file_mtime_us(&meta),
+                },
             },
         );
         tracing::info!(target: "infino::cache", uri = %uri.0, filled, "cache build: adopted .blocks on scan");
@@ -444,7 +446,7 @@ impl DiskCacheStore {
         &self,
         uri: &SuperfileUri,
         source: &BlockCachedSource,
-        now_us: u64,
+        last_read_us: u64,
     ) {
         let filled = source.filled_bytes_handle().load(Ordering::Acquire);
         if filled == 0 || !source.path_names_its_file() {
@@ -456,9 +458,9 @@ impl DiskCacheStore {
         if !source.hand_over_accounting() {
             self.current_bytes.fetch_add(filled, Ordering::Release);
         }
-        let file = UnindexedFile {
+        let file = BlockFileRecord {
             size_bytes: filled,
-            mtime_us: now_us,
+            read: BlockFileRead::At { us: last_read_us },
         };
         if let Some(prior) = self.block_files.insert(*uri, file) {
             self.current_bytes
@@ -526,6 +528,8 @@ impl DiskCacheStore {
             .cached
             .get(uri)
             .is_some_and(|entry| entry.block_source().is_some());
+        // Ranked as read now, as the open that adopted the file just asked for it: the source was
+        // dropped before any read, so it has no read time of its own.
         if !lazy_entry_owns_path {
             self.retain_block_file(uri, source, self.now_us());
         }
@@ -547,6 +551,74 @@ impl DiskCacheStore {
         self.release_scanned_block_file(uri);
         self.current_bytes.fetch_add(bytes, Ordering::Release);
         self.trim_cold_to_budget();
+    }
+
+    /// Mark `uris` dead: the table's newest manifest no longer lists them, so no new query reads
+    /// them. Nothing is deleted, since a query on an older snapshot may still read them, but
+    /// eviction takes them first unless a query holds them, and their downloads are cancelled.
+    /// Without this, a file GC deletes in another process would age out like a live one.
+    ///
+    /// ```text
+    ///   compaction committed here  ──┐
+    ///   (note_superseded)            ├─►  superfiles the new  ─►  mark_dead
+    ///   newer manifest loaded      ──┘    manifest dropped           │
+    ///   (install_manifest)                                           ├─► join the dead set
+    ///                                                                ├─► downloads cancelled
+    ///                                                                └─► evicted first, unless
+    ///                                                                    a query holds them
+    /// ```
+    pub(crate) fn mark_dead(&self, uris: &[SuperfileUri]) {
+        // Kept even when not on disk right now: a file moving between two maps is in neither for a
+        // moment, and a dead file must stay dead when it lands. A prune forgets the rest later.
+        for uri in uris {
+            if self.dead.insert(*uri) && self.holds_file(uri) {
+                self.n_dead_marked.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        self.prune_dead_if_doubled();
+        // After the set changes: a download registered before this cancel is cancelled, and one
+        // registered after it finds the file dead (see [`Self::maybe_spawn_background_fill`]).
+        for uri in uris {
+            self.remove_entry_cancelling_fill(uri, |_| false);
+        }
+    }
+
+    /// Forget dead files no longer on disk, once the set has doubled since the last prune. So a
+    /// mark costs only its own files, amortized, and the set stays within twice what the last
+    /// prune kept, plus [`DEAD_PRUNE_MIN`]. Files that leave disk between marks stay listed until
+    /// the next prune; eviction never sees them, since it walks only files on disk.
+    fn prune_dead_if_doubled(&self) {
+        let prune_at = self.dead_prune_at.load(Ordering::Relaxed);
+        if self.dead.len() < prune_at
+            || self
+                .dead_prune_at
+                .compare_exchange(prune_at, usize::MAX, Ordering::AcqRel, Ordering::Relaxed)
+                .is_err()
+        {
+            return;
+        }
+        // Listed first, then checked with no dead-set guard held: the maps are never read inside
+        // one.
+        let listed: Vec<SuperfileUri> = self.dead.iter().map(|uri| *uri).collect();
+        for uri in listed {
+            if !self.holds_file(&uri) {
+                self.dead.remove(&uri);
+            }
+        }
+        self.dead_prune_at
+            .store((self.dead.len() * 2).max(DEAD_PRUNE_MIN), Ordering::Relaxed);
+    }
+
+    /// Whether `uri` is dead ([`Self::mark_dead`]).
+    pub(crate) fn is_dead(&self, uri: &SuperfileUri) -> bool {
+        self.dead.contains(uri)
+    }
+
+    /// Whether any form of `uri` is on disk here: an entry, a block file, or a never-opened copy.
+    fn holds_file(&self, uri: &SuperfileUri) -> bool {
+        self.cached.contains_key(uri)
+            || self.block_files.contains_key(uri)
+            || self.unindexed.contains_key(uri)
     }
 
     /// Erase every local trace of a superfile: its in-memory index entry, the promoted file, the

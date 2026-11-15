@@ -336,7 +336,7 @@ impl DiskCacheStore {
         };
         if slot.get().mmap().is_none() {
             drop(slot);
-            return self.release_lazy_entry(uri, self.now_us());
+            return self.release_lazy_entry(uri);
         }
         if !self.heap_reclaimable(uri, slot.get()) {
             return None;
@@ -582,7 +582,7 @@ mod tests {
         let uri = charged_entry(&store, 1);
         store.charge_heap_once(&uri, || unreachable!("charged already: nothing measured"));
         assert_eq!(budget.charged(), ENTRY_BYTES);
-        store.release_lazy_entry(&uri, store.now_us());
+        store.release_lazy_entry(&uri);
         assert!(!store.is_cached(&uri));
         assert_eq!(budget.charged(), 0);
     }
