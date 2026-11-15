@@ -180,6 +180,13 @@ pub enum MutationError {
     #[error("supertable has no storage attached; delete / update requires durable storage")]
     NoStorageAttached,
 
+    /// An import has replicas attached to the table (or the table is a replica): rows not yet
+    /// grafted would miss the change.
+    #[error(
+        "the table has an open import; updates and deletes wait until it finishes or is aborted"
+    )]
+    ImportOpen,
+
     /// Underlying storage error from a sidecar PUT or state-doc
     /// write.
     #[error("storage error: {0}")]

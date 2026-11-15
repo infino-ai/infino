@@ -73,7 +73,7 @@ use manifest::{
     TableEntry, VectorEntry, commit_catalog, read_catalog, schema_from_ipc, schema_to_ipc,
 };
 pub use options::{ColdFetchMode, ConnectOptions};
-pub use table::Supertable;
+pub use table::{ImportCoordinator, Supertable};
 use tokio::{
     runtime::Runtime,
     sync::{Semaphore, SemaphorePermit},
