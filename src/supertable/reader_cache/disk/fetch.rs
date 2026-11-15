@@ -218,6 +218,7 @@ impl DiskCacheStore {
         vector_source: Option<Arc<BlockCachedSource>>,
     ) -> Arc<CachedEntry> {
         Arc::new(CachedEntry {
+            heap: OnceLock::new(),
             reader,
             residency: Residency::Mapped {
                 mmap,
@@ -504,6 +505,7 @@ impl DiskCacheStore {
         //    by a mmap-backed reader; from that point on,
         //    cache hits serve the mmap reader instead.
         let entry = Arc::new(CachedEntry {
+            heap: OnceLock::new(),
             reader: Arc::clone(&foreground_reader),
             // Hybrid foreground: the whole file is in a heap buffer; the finalizer mmaps it later.
             residency: Residency::Buffered,
@@ -895,6 +897,7 @@ impl DiskCacheStore {
             )
         };
         let entry = Arc::new(CachedEntry {
+            heap: OnceLock::new(),
             reader: Arc::clone(&lazy_reader),
             residency: Residency::Paged {
                 block_source: Arc::clone(&block_source),
@@ -3052,6 +3055,7 @@ mod tests {
         store.cached.insert(
             uri,
             Arc::new(CachedEntry {
+                heap: OnceLock::new(),
                 reader: Arc::new(reader),
                 residency: Residency::Paged {
                     block_source: dummy_block_source(store, uri),
