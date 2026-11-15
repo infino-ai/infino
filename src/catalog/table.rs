@@ -491,6 +491,7 @@ impl Supertable {
         k: usize,
         projection: Option<&[&str]>,
     ) -> Result<Option<Vec<RecordBatch>>, InfinoError> {
+        ensure_expr_within_connective_cap(filter)?;
         self.inner
             .sorted_search_where(column, filter, descending, k, projection)
     }

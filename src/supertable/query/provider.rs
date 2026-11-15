@@ -3049,7 +3049,7 @@ fn emit_value_set_leaves(
 /// Returns None unless *every* branch is `column = literal` on one shared
 /// column: a partial match like `a = 1 OR a > 5` isn't a closed value set,
 /// so pruning on the equalities alone would wrongly drop the `> 5` rows.
-fn flatten_or_eq(expr: &Expr, schema: &SchemaRef) -> Option<(String, Vec<ScalarValue>)> {
+pub(crate) fn flatten_or_eq(expr: &Expr, schema: &SchemaRef) -> Option<(String, Vec<ScalarValue>)> {
     let mut column = None;
     let mut values = Vec::new();
     collect_or_eq(expr, schema, &mut column, &mut values).then_some(())?;

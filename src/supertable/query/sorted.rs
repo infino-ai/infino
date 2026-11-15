@@ -17,10 +17,11 @@
 //! value (a missing value sorts last and is in no index). Otherwise the
 //! same sort runs as SQL, which answers alike, only slower.
 
-use std::{sync::Arc, time::Instant};
+use std::{cmp::Ordering, sync::Arc, time::Instant};
 
 use arrow::{
     array::{Array, AsArray},
+    datatypes::DataType,
     record_batch::RecordBatch,
 };
 use datafusion::{
@@ -29,6 +30,7 @@ use datafusion::{
     logical_expr::{
         Expr,
         simplify::SimplifyContext,
+        type_coercion::binary::comparison_coercion,
         utils::{conjunction, split_conjunction},
     },
     optimizer::{
@@ -51,6 +53,8 @@ use crate::{
             candidate::single_range,
             dispatch::{self, tag_hits, tombstone_deny_set},
             exec::common::resolve_hits_named,
+            provider::flatten_or_eq,
+            skip::ColumnTypeGuard,
         },
         reader_cache::disk::ForegroundQueryGuard,
         tombstones::SidecarCache,
@@ -101,48 +105,40 @@ struct Share {
     none: bool,
 }
 
-/// `expr` as equalities of one column to literals, `OR`ed: the column and
-/// the literals, or `None` for any other shape.
-fn equalities_on_one_column(expr: &Expr) -> Option<(&str, Vec<&ScalarValue>)> {
-    match expr {
-        Expr::BinaryExpr(be) if be.op == datafusion::logical_expr::Operator::Or => {
-            let (left, mut values) = equalities_on_one_column(&be.left)?;
-            let (right, more) = equalities_on_one_column(&be.right)?;
-            (left == right).then(|| {
-                values.extend(more);
-                (left, values)
-            })
-        }
-        Expr::BinaryExpr(be) if be.op == datafusion::logical_expr::Operator::Eq => {
-            match (be.left.as_ref(), be.right.as_ref()) {
-                (Expr::Column(c), Expr::Literal(v, _)) | (Expr::Literal(v, _), Expr::Column(c)) => {
-                    Some((c.name.as_str(), vec![v]))
-                }
-                _ => None,
-            }
-        }
-        _ => None,
-    }
-}
-
 /// The rows an exact value table's `entries` count for `literals` together,
-/// each literal compared as the table's values are typed; `None` when a
-/// literal does not take that type.
-fn literal_counts(entries: &[(ScalarValue, u64)], literals: &[&ScalarValue]) -> Option<u64> {
+/// each literal compared with the column as a statement compares them:
+/// `None` when a statement would cast the column (`column_type`) to compare
+/// it with a literal, as a string column against a number is, when the
+/// table's values are not of `column_type`, or when a literal does not
+/// take it. The entries are sorted, so each literal is a binary search.
+fn literal_counts(
+    entries: &[(ScalarValue, u64)],
+    literals: &[ScalarValue],
+    column_type: &DataType,
+) -> Option<u64> {
     let Some((first, _)) = entries.first() else {
         return Some(0);
     };
-    let data_type = first.data_type();
+    if first.data_type() != *column_type {
+        return None;
+    }
     let mut held = 0u64;
     for literal in literals {
-        let literal = literal.cast_to(&data_type).ok()?;
-        held = held.saturating_add(
-            entries
-                .iter()
-                .filter(|(value, _)| *value == literal)
-                .map(|(_, count)| *count)
-                .sum(),
-        );
+        if comparison_coercion(column_type, &literal.data_type()).as_ref() != Some(column_type) {
+            return None;
+        }
+        let literal = literal.cast_to(column_type).ok()?;
+        // Values that do not order map to `Equal`, so they land on the
+        // equality check below rather than on a miss.
+        match entries
+            .binary_search_by(|(value, _)| value.partial_cmp(&literal).unwrap_or(Ordering::Equal))
+        {
+            Ok(at) if entries[at].0 == literal => {
+                held = held.saturating_add(entries[at].1);
+            }
+            Ok(_) => return None,
+            Err(_) => {}
+        }
     }
     Some(held)
 }
@@ -355,21 +351,14 @@ impl SupertableReader {
             share: 1.0,
             none: false,
         };
-        let (column, literals): (&str, Vec<&ScalarValue>) = match conjunct {
-            Expr::BinaryExpr(be) if be.op == datafusion::logical_expr::Operator::Eq => {
-                match (be.left.as_ref(), be.right.as_ref()) {
-                    (Expr::Column(c), Expr::Literal(v, _))
-                    | (Expr::Literal(v, _), Expr::Column(c)) => (c.name.as_str(), vec![v]),
-                    _ => return unknown,
-                }
-            }
-            // The simplifier turns a short `IN` list into equalities `OR`ed.
-            Expr::BinaryExpr(be) if be.op == datafusion::logical_expr::Operator::Or => {
-                let Some((column, values)) = equalities_on_one_column(conjunct) else {
-                    return unknown;
-                };
-                (column, values)
-            }
+        let schemas = self.sql_schemas();
+        let (column, literals): (String, Vec<ScalarValue>) = match conjunct {
+            // An equality, or the equalities `OR`ed the simplifier turns a
+            // short `IN` list into.
+            Expr::BinaryExpr(_) => match flatten_or_eq(conjunct, schemas.scalar()) {
+                Some(found) => found,
+                None => return unknown,
+            },
             Expr::InList(list) if !list.negated => match list.expr.as_ref() {
                 Expr::Column(c) => {
                     let mut values = Vec::with_capacity(list.list.len());
@@ -377,9 +366,9 @@ impl SupertableReader {
                         let Expr::Literal(v, _) = v else {
                             return unknown;
                         };
-                        values.push(v);
+                        values.push(v.clone());
                     }
-                    (c.name.as_str(), values)
+                    (c.name.clone(), values)
                 }
                 _ => return unknown,
             },
@@ -388,10 +377,22 @@ impl SupertableReader {
         if literals.iter().any(|v| v.is_null()) {
             return unknown;
         }
-        let manifest = self.manifest();
-        let Some(field) = manifest.table_schema().id_of(column) else {
+        // The column in its stored type: the scan views a string column as
+        // `Utf8View`, which compares as the stored string does.
+        let Ok(column_type) = schemas
+            .scalar()
+            .field_with_name(&column)
+            .map(|f| f.data_type())
+        else {
             return unknown;
         };
+        let manifest = self.manifest();
+        let Some(field) = manifest.table_schema().id_of(&column) else {
+            return unknown;
+        };
+        // Statistics in a type the column has since left describe values
+        // the statement no longer compares as they are stored.
+        let guard = ColumnTypeGuard::new(manifest, field);
         // Rows expected to hold the literals, summed over the superfiles, and
         // whether every superfile's part of that is a count, not an estimate.
         let mut expected = 0.0;
@@ -399,6 +400,9 @@ impl SupertableReader {
         let mut counted = true;
         for entry in manifest.superfiles.iter() {
             rows += entry.n_docs as f64;
+            if guard.stats_are_stale(entry) {
+                return unknown;
+            }
             let Some(stats) = entry.scalar_stats.column(field) else {
                 return unknown;
             };
@@ -407,7 +411,7 @@ impl SupertableReader {
             }
             let present = entry.n_docs.saturating_sub(stats.null_count().unwrap_or(0)) as f64;
             if let Some(table) = stats.value_counts() {
-                if let Some(held) = literal_counts(table.entries(), &literals) {
+                if let Some(held) = literal_counts(table.entries(), &literals, column_type) {
                     expected += held as f64;
                     continue;
                 }
@@ -740,7 +744,8 @@ mod tests {
 
     use arrow::compute::cast;
     use arrow_array::{
-        Array, Decimal128Array, Float32Array, Float64Array, Int64Array, TimestampMillisecondArray,
+        Array, Decimal128Array, Float32Array, Float64Array, Int64Array, StringArray,
+        TimestampMillisecondArray,
     };
     use arrow_schema::{DataType, Field, Schema, TimeUnit};
     use datafusion::prelude::{col, lit};
@@ -750,7 +755,10 @@ mod tests {
     use crate::{
         config::OptimizeOptions,
         storage::{LocalFsStorageProvider, StorageProvider},
-        supertable::SupertableOptions,
+        supertable::{
+            SupertableOptions,
+            schema::change::{FieldPatch, SchemaPatch},
+        },
     };
 
     /// Superfiles the table is written as, one commit each.
@@ -1041,6 +1049,112 @@ mod tests {
             )
             .expect("sql");
         assert_eq!(ints(&held, "seq"), ints(&want, "seq"));
+    }
+
+    /// Distinct `tag` values of the numeric-tag table, each written with a
+    /// leading zero (`"00"` to `"06"`).
+    const NUMERIC_TAGS: i64 = 7;
+    /// The one value of the numeric-tag table's `n`: past 2^53, so it reads
+    /// as `2^53` when cast to `Float64`.
+    const BIG: i64 = (1 << 53) + 1;
+
+    /// A table of a range-indexed `seq`, a `tag` string that holds numbers
+    /// with a leading zero, and an `n` that is [`BIG`] on every row, in two
+    /// commits, so each superfile keeps exact value tables for `tag` and `n`.
+    fn numeric_tag_table(dir: &TempDir) -> Supertable {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("seq", DataType::Int64, false),
+            Field::new("tag", DataType::Utf8, false),
+            Field::new("n", DataType::Int64, false),
+        ]));
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let options = SupertableOptions::new(Arc::clone(&schema), vec![], vec![])
+            .expect("options")
+            .with_storage(storage)
+            .with_range_indexes(&["seq".to_string()]);
+        let st = Supertable::create(options).expect("create");
+        for file in 0..2_i64 {
+            let seqs: Vec<i64> = (file * 1000..(file + 1) * 1000).collect();
+            let tags: Vec<String> = seqs
+                .iter()
+                .map(|s| format!("{:02}", s % NUMERIC_TAGS))
+                .collect();
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(seqs)),
+                    Arc::new(StringArray::from(tags)),
+                    Arc::new(Int64Array::from(vec![BIG; 1000])),
+                ],
+            )
+            .expect("batch");
+            let mut writer = st.writer().expect("writer");
+            writer.append(&batch).expect("append");
+            writer.commit().expect("commit");
+        }
+        st
+    }
+
+    /// `sorted_search_where(seq DESC, 10)` of `filter` and the SQL sort of
+    /// `sql`, as `seq` values: the page must be answered, and match.
+    fn assert_page_matches_sql(st: &Supertable, filter: &Expr, sql: &str) {
+        let got = st
+            .sorted_search_where(Some("seq"), filter, true, 10, Some(&["_id", "seq"]))
+            .expect("sorted_search_where")
+            .unwrap_or_else(|| panic!("{sql}: answered"));
+        let want = st
+            .reader()
+            .expect("reader")
+            .query_sql(&format!(
+                "SELECT _id, seq FROM supertable WHERE {sql} ORDER BY seq DESC NULLS LAST, _id ASC LIMIT 10"
+            ))
+            .expect("sql");
+        assert!(!ints(&want, "seq").is_empty(), "{sql}: SQL keeps rows");
+        assert_eq!(ints(&got, "seq"), ints(&want, "seq"), "{sql}");
+    }
+
+    /// A literal a statement compares by casting the column is not looked
+    /// up in the column's value tables: `tag = 3` casts the string `"03"`
+    /// to `3`, and `n = 2^53` casts [`BIG`] to the float `2^53`, so both
+    /// keep rows the tables hold under another value. A literal of the
+    /// column's own type is still counted: `tag = '09'` keeps no row.
+    #[test]
+    fn a_literal_the_column_is_cast_for_is_not_counted() {
+        let dir = TempDir::new().expect("tempdir");
+        let st = numeric_tag_table(&dir);
+        assert_page_matches_sql(&st, &col("tag").eq(lit(3_i64)), "tag = 3");
+        assert_page_matches_sql(
+            &st,
+            &col("n").eq(lit((1_i64 << 53) as f64)),
+            "n = 9007199254740992.0",
+        );
+        let absent = st
+            .sorted_search_where(
+                Some("seq"),
+                &col("tag").eq(lit("09")),
+                true,
+                10,
+                Some(&["_id", "seq"]),
+            )
+            .expect("sorted_search_where")
+            .expect("a value no table holds is answered");
+        assert_eq!(absent.iter().map(RecordBatch::num_rows).sum::<usize>(), 0);
+    }
+
+    /// After `tag` is converted from strings to `Int64`, the superfiles'
+    /// value tables still count the strings: `tag = 3` reads `"03"` as `3`
+    /// and keeps its rows rather than finding no `3` in the tables.
+    #[test]
+    fn value_tables_in_a_type_the_column_left_are_not_counted() {
+        let dir = TempDir::new().expect("tempdir");
+        let st = numeric_tag_table(&dir);
+        st.apply_schema(
+            &SchemaPatch::new(vec![FieldPatch::named("tag").with_type(DataType::Int64)]),
+            None,
+        )
+        .expect("convert tag");
+        assert_page_matches_sql(&st, &col("tag").eq(lit(3_i64)), "tag = 3");
     }
 
     /// A filter the index cannot be read for is left to the caller's
