@@ -977,6 +977,37 @@ mod tests {
         store.block_writes_settled().await;
     }
 
+    /// A Stream lazy entry with one block filled, released while its reader is still alive, as
+    /// one waiting on the freeing thread is.
+    ///  - the block file is counted once, by its record, while the reader lives;
+    ///  - freeing the reader later gives back nothing more.
+    #[tokio::test]
+    async fn a_released_reader_freed_later_leaves_its_block_file_counted_once() {
+        let (_dir, store) = test_store_with(|cfg| {
+            cfg.cold_fetch_mode = ColdFetchMode::LazyForegroundWithBackgroundFill;
+            cfg.promotion_defer_timeout = Duration::MAX;
+        });
+        let uri = SuperfileUri::new_v4();
+        put_superfile(&store, &uri, tiny_superfile_bytes()).await;
+        open_and_fill_a_block(&store, &uri).await;
+        let filled = store
+            .cached
+            .get(&uri)
+            .and_then(|entry| entry.block_source().map(|s| s.filled_bytes_handle()))
+            .expect("a lazy entry")
+            .load(Ordering::Acquire);
+        assert!(filled > 0, "a block is filled");
+
+        let queued = store.release_lazy_entry(&uri, store.now_us());
+        assert!(queued.is_some(), "the entry is released");
+        store.assert_budget_consistent();
+        assert_eq!(store.stats().current_bytes, filled, "counted once");
+
+        drop(queued);
+        store.assert_budget_consistent();
+        assert_eq!(store.stats().current_bytes, filled, "still counted once");
+    }
+
     /// A lazy entry with a block write still queued.
     ///  - the sweep keeps it: its block file would be counted before the write's bytes are.
     ///  - once the write is done, the sweep drops it and counts the whole file.
