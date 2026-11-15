@@ -611,6 +611,21 @@ mod tests {
             )
             .is_none()
         );
+        let err = superfile_reader_tiered(
+            &empty_store(),
+            None,
+            None,
+            &uri,
+            &uri.storage_path(),
+            None,
+            ReadIntent::Warm,
+        )
+        .await
+        .expect_err("without storage the cached reader is not served");
+        assert!(
+            matches!(err, ReaderCacheError::NotFound { .. }),
+            "expected NotFound, got {err:?}"
+        );
     }
 
     // ---- tier 1: non-NotFound error short-circuits ---------------------

@@ -333,6 +333,13 @@ mod tests {
     const VALUE_BYTES: usize = 10;
     /// Values the recency tests' budget holds.
     const KEPT_VALUES: usize = 3;
+    /// Weight of each value in the `get_or_insert` test, so its budget
+    /// bounds a count, as the lazy reader cache's does.
+    const UNIT_WEIGHT: usize = 1;
+    /// Values the `get_or_insert` test's budget holds before evicting.
+    const COUNTED_VALUES: usize = 2;
+    /// A weight one past the `get_or_insert` test's whole budget.
+    const OVERSIZED_WEIGHT: usize = COUNTED_VALUES + 1;
 
     /// A lookup makes a value the newest, so the next eviction takes the
     /// value used longest ago instead; replacing a key frees its old bytes;
@@ -374,24 +381,24 @@ mod tests {
     /// past the bound, as the lazy reader cache relies on with unit weights.
     #[test]
     fn get_or_insert_keeps_the_first_value_and_drops_the_least_recently_used() {
-        let lru: ByteLru<u32, Arc<u32>> = ByteLru::new(2);
+        let lru: ByteLru<u32, Arc<u32>> = ByteLru::new(UNIT_WEIGHT * COUNTED_VALUES);
         assert!(lru.get(&1).is_none());
-        let first = lru.get_or_insert(1, Arc::new(10), 1);
+        let first = lru.get_or_insert(1, Arc::new(10), UNIT_WEIGHT);
         // A racing fill's value is not kept: every caller gets the first.
-        let raced = lru.get_or_insert(1, Arc::new(11), 1);
+        let raced = lru.get_or_insert(1, Arc::new(11), UNIT_WEIGHT);
         assert!(Arc::ptr_eq(&first, &raced));
         assert!(Arc::ptr_eq(&first, &lru.get(&1).expect("kept")));
-        lru.get_or_insert(2, Arc::new(20), 1);
+        lru.get_or_insert(2, Arc::new(20), UNIT_WEIGHT);
         // The racing fill above made 1 the newest, so 2 goes next.
-        lru.get_or_insert(1, Arc::new(12), 1);
-        lru.get_or_insert(3, Arc::new(30), 1);
+        lru.get_or_insert(1, Arc::new(12), UNIT_WEIGHT);
+        lru.get_or_insert(3, Arc::new(30), UNIT_WEIGHT);
         assert!(lru.get(&2).is_none(), "the least recently used goes");
         assert_eq!(lru.get(&1).as_deref(), Some(&10));
         assert_eq!(lru.get(&3).as_deref(), Some(&30));
         // A value larger than the whole budget is handed back but not kept.
-        assert_eq!(*lru.get_or_insert(4, Arc::new(40), 3), 40);
+        assert_eq!(*lru.get_or_insert(4, Arc::new(40), OVERSIZED_WEIGHT), 40);
         assert!(lru.get(&4).is_none());
-        assert_eq!(lru.len(), 2);
+        assert_eq!(lru.len(), COUNTED_VALUES);
     }
 
     #[test]
