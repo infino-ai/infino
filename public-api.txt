@@ -967,6 +967,19 @@ impl core::marker::Unpin for infino::SchemaPatch
 impl core::marker::UnsafeUnpin for infino::SchemaPatch
 impl core::panic::unwind_safe::RefUnwindSafe for infino::SchemaPatch
 impl core::panic::unwind_safe::UnwindSafe for infino::SchemaPatch
+pub struct infino::StagedAppend
+impl infino::StagedAppend
+pub fn infino::StagedAppend::is_empty(&self) -> bool
+pub fn infino::StagedAppend::rows(&self) -> u64
+impl core::fmt::Debug for infino::StagedAppend
+pub fn infino::StagedAppend::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for infino::StagedAppend
+impl core::marker::Send for infino::StagedAppend
+impl core::marker::Sync for infino::StagedAppend
+impl core::marker::Unpin for infino::StagedAppend
+impl core::marker::UnsafeUnpin for infino::StagedAppend
+impl !core::panic::unwind_safe::RefUnwindSafe for infino::StagedAppend
+impl !core::panic::unwind_safe::UnwindSafe for infino::StagedAppend
 #[non_exhaustive] pub struct infino::StalenessReport
 pub infino::StalenessReport::awaiting_reanalysis: usize
 pub infino::StalenessReport::bytes_to_rewrite: u64
@@ -1001,6 +1014,7 @@ pub fn infino::Supertable::append_rows(&self, &[serde_json::value::Value]) -> co
 pub fn infino::Supertable::append_rows_named(&self, &[serde_json::value::Value], &str) -> core::result::Result<(), infino::InfinoError>
 pub fn infino::Supertable::apply_schema(&self, &infino::SchemaPatch, core::option::Option<u32>) -> core::result::Result<infino::TableSchema, infino::InfinoError>
 pub fn infino::Supertable::bm25_search(&self, &str, &str, usize, infino::Bm25SearchOptions, core::option::Option<&[&str]>) -> core::result::Result<alloc::vec::Vec<arrow_array::record_batch::RecordBatch>, infino::InfinoError>
+pub fn infino::Supertable::commit_staged(&self, &[infino::StagedAppend]) -> core::result::Result<(), infino::InfinoError>
 pub fn infino::Supertable::companion(&self, &str) -> core::result::Result<core::option::Option<infino::Supertable>, infino::InfinoError>
 pub fn infino::Supertable::count(&self, &str, &str, infino::BoolMode) -> core::result::Result<u64, infino::InfinoError>
 pub fn infino::Supertable::count_where(&self, &[datafusion_expr::expr::Expr]) -> core::result::Result<alloc::vec::Vec<u64>, infino::InfinoError>
@@ -1015,6 +1029,7 @@ pub fn infino::Supertable::reindex(&self, &infino::ReindexOptions) -> core::resu
 pub fn infino::Supertable::reindex_plan(&self, &infino::ReindexOptions) -> core::result::Result<alloc::vec::Vec<infino::PlannedRepair>, infino::ReindexError>
 pub fn infino::Supertable::schema(&self) -> arrow_schema::schema::SchemaRef
 pub fn infino::Supertable::sorted_search(&self, &str, bool, usize, core::option::Option<&[&str]>) -> core::result::Result<alloc::vec::Vec<arrow_array::record_batch::RecordBatch>, infino::InfinoError>
+pub fn infino::Supertable::stage(&self, &arrow_array::record_batch::RecordBatch) -> core::result::Result<infino::StagedAppend, infino::InfinoError>
 pub fn infino::Supertable::token_match(&self, &str, &str, infino::BoolMode, core::option::Option<&[&str]>) -> core::result::Result<alloc::vec::Vec<arrow_array::record_batch::RecordBatch>, infino::InfinoError>
 pub fn infino::Supertable::tokenize(&self, &str, &str) -> core::result::Result<alloc::vec::Vec<alloc::string::String>, infino::InfinoError>
 pub fn infino::Supertable::update(&self, datafusion_expr::expr::Expr, &arrow_array::record_batch::RecordBatch) -> core::result::Result<infino::MutationStats, infino::InfinoError>
