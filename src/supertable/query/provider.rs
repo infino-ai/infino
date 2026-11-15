@@ -3554,7 +3554,7 @@ mod tests {
         supertable::{
             Supertable, SupertableOptions,
             hydrate::hydrate_from_reader,
-            manifest::{ScalarStatsAgg, SuperfileUri, column_hll},
+            manifest::{ScalarStats, ScalarStatsAgg, SuperfileUri, column_hll},
             query::{
                 read_ahead::{PAGE_READ_THROUGH_BYTES, file_pruning, fixture, statistics_pruned},
                 sql::sql_session_context,
@@ -5892,15 +5892,10 @@ mod tests {
     /// `[-1.0, -1.0]`, leaving out the NaNs total order puts first ascending
     /// (`lo`) and first descending (`hi`).
     fn nan_table(dir: &TempDir) -> Supertable {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("lo", DataType::Float64, false),
-            Field::new("hi", DataType::Float32, true),
-        ]));
         let storage: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
-        let options = SupertableOptions::new(Arc::clone(&schema), vec![], vec![])
-            .expect("options")
-            .with_storage(storage);
+        let options = nan_table_options(storage);
+        let schema = Arc::clone(&options.schema);
         let st = Supertable::create(options).expect("create");
         for file in 0..NAN_TABLE_FILES {
             let last = file + 1 == NAN_TABLE_FILES;
@@ -5930,6 +5925,17 @@ mod tests {
             writer.commit().expect("commit");
         }
         st
+    }
+
+    /// The options of the NaN table ([`nan_table`]) in `storage`.
+    fn nan_table_options(storage: Arc<dyn StorageProvider>) -> SupertableOptions {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("lo", DataType::Float64, false),
+            Field::new("hi", DataType::Float32, true),
+        ]));
+        SupertableOptions::new(schema, vec![], vec![])
+            .expect("options")
+            .with_storage(storage)
     }
 
     /// Whether the footer `provider` registers for `entry`'s superfile leaves
@@ -6171,11 +6177,39 @@ mod tests {
                 writer.commit().expect("commit");
             }
         }
-        let cache_dir = TempDir::new().expect("cache tempdir");
-        let cache = lazy_foreground_disk_cache(Arc::clone(&storage), cache_dir.path());
-        cache.use_heap_budget(budget);
-        let table = Supertable::open(options().with_disk_cache(Arc::clone(&cache))).expect("open");
+        let (cache_dir, cache, table) = opened_charged_to(options(), budget);
         (storage_dir, cache_dir, cache, table, storage)
+    }
+
+    /// The table `options` name, opened behind a lazy disk cache of its own whose files count
+    /// against `budget`.
+    fn opened_charged_to(
+        options: SupertableOptions,
+        budget: &'static HeapBudget,
+    ) -> (TempDir, Arc<DiskCacheStore>, Supertable) {
+        let cache_dir = TempDir::new().expect("cache tempdir");
+        let storage = options.storage.clone().expect("the options name a storage");
+        let cache = lazy_foreground_disk_cache(storage, cache_dir.path());
+        cache.use_heap_budget(budget);
+        let table = Supertable::open(options.with_disk_cache(Arc::clone(&cache))).expect("open");
+        (cache_dir, cache, table)
+    }
+
+    /// Prepare `entry` for a scan through `provider`, and return it with what that charged to
+    /// `budget`.
+    async fn charged_preparing(
+        provider: &SupertableProvider,
+        budget: &HeapBudget,
+        entry: Arc<SuperfileEntry>,
+    ) -> (Arc<PreparedScanFile>, u64) {
+        let before = budget.charged();
+        let prepared = provider.prepared_scan_file(entry).await.expect("prepare");
+        (prepared, budget.charged() - before)
+    }
+
+    /// The bytes of the footer `prepared`'s reader parsed.
+    fn parsed_bytes(prepared: &PreparedScanFile) -> u64 {
+        prepared.reader.parquet_metadata().memory_size() as u64
     }
 
     /// A SQL session over `reader` with a provider of its own, as one catalog statement has.
@@ -6202,18 +6236,31 @@ mod tests {
     /// them ends, not before.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_statement_end_drops_metadata_over_budget_once_no_statement_holds_it() {
-        // Three files, a cache with a budget of 0, and two statements that scan them all.
-        //  - while either statement holds the files, every entry stays, counted;
+        // Three files, a cache whose budget is one byte under their parsed footers, and two
+        // statements that scan them all.
+        //  - while either statement holds the files, every entry stays, counted at its footer;
         //  - when the first ends, the second still holds them: nothing goes;
-        //  - when the second ends, every entry goes and its count with it.
+        //  - when the second ends, one entry goes and its count with it.
         // This test pins the end-of-statement pass and that it never drops what a statement holds.
-        let budget = HeapBudget::with_budget(Some(0));
-        let (_storage, _cache_dir, cache, table, _) = table_charged_to(budget);
+        let (_storage, _measure_dir, _measure_cache, measured, storage) =
+            table_charged_to(HeapBudget::with_budget(None));
+        let provider = provider_of(&measured);
+        let mut footers = 0;
+        for entry in &provider.manifest().superfiles {
+            let prepared = provider
+                .prepared_scan_file(Arc::clone(entry))
+                .await
+                .expect("prepare");
+            footers += parsed_bytes(&prepared);
+        }
+        let budget = HeapBudget::with_budget(Some(footers - 1));
+        let options = default_supertable_options().with_storage(storage);
+        let (_cache_dir, cache, table) = opened_charged_to(options, budget);
         let reader = table.reader().expect("reader");
         let first = scan_all(statement_over(&table, &reader)).await;
         let second = scan_all(statement_over(&table, &reader)).await;
         let charged = budget.charged();
-        assert!(charged > 0, "every opened file is charged");
+        assert_eq!(charged, footers, "every opened file is charged its footer");
         let cached = cache.stats().n_entries;
 
         drop(first);
@@ -6225,13 +6272,65 @@ mod tests {
         assert_eq!(budget.charged(), charged);
 
         drop(second);
-        let left = cached - BUDGET_TEST_FILES as u64;
         assert_eq!(
             cache.stats().n_entries,
-            left,
-            "no statement holds them: over budget, they go"
+            cached - 1,
+            "no statement holds them: one byte over budget, one goes"
         );
-        assert_eq!(budget.charged(), 0);
+        let left = budget.charged();
+        assert!(
+            left < charged && left > 0,
+            "its count goes with it: {left} of {charged}"
+        );
+    }
+
+    /// What a reader keeps decoded is charged exactly: its parsed footer, plus the scan footer
+    /// when it keeps a derived one of its own; a scan footer derived for one statement alone goes
+    /// with that statement and is not charged.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_reader_is_charged_its_footer_and_the_scan_footer_it_keeps() {
+        // The NaN table behind a cache: its NaN-free files share the parsed footer with the scan,
+        // and its NaN file's reader keeps a derived one. Then a fresh cache over the same table,
+        // and the NaN file's entry with its statistics unreadable: its scan footer is derived for
+        // the statement alone.
+        let dir = TempDir::new().expect("tempdir");
+        drop(nan_table(&dir));
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let budget = HeapBudget::with_budget(Some(u64::MAX));
+        let (_cache_dir, _cache, table) =
+            opened_charged_to(nan_table_options(Arc::clone(&storage)), budget);
+        let provider = provider_of(&table);
+        for entry in &provider.manifest().superfiles {
+            let (prepared, charged) = charged_preparing(&provider, budget, Arc::clone(entry)).await;
+            let parsed = prepared.reader.parquet_metadata();
+            if entry.n_docs == NAN_FILE_ROWS as u64 {
+                assert!(!Arc::ptr_eq(&prepared.footer, &parsed), "kept, derived");
+                let kept = (parsed.memory_size() + prepared.footer.memory_size()) as u64;
+                assert_eq!(charged, kept, "parsed and kept footers");
+            } else {
+                assert!(Arc::ptr_eq(&prepared.footer, &parsed), "shared");
+                assert_eq!(charged, parsed_bytes(&prepared), "the shared footer once");
+            }
+        }
+
+        let budget = HeapBudget::with_budget(Some(u64::MAX));
+        let (_cache_dir, _cache, table) = opened_charged_to(nan_table_options(storage), budget);
+        let provider = provider_of(&table);
+        let mut entry = provider
+            .manifest()
+            .superfiles
+            .iter()
+            .find(|entry| entry.n_docs == NAN_FILE_ROWS as u64)
+            .map(|entry| SuperfileEntry::clone(entry))
+            .expect("the NaN superfile");
+        entry.scalar_stats = ScalarStats::Unavailable;
+        let (prepared, charged) = charged_preparing(&provider, budget, Arc::new(entry)).await;
+        assert!(
+            !Arc::ptr_eq(&prepared.footer, &prepared.reader.parquet_metadata()),
+            "derived for the statement"
+        );
+        assert_eq!(charged, parsed_bytes(&prepared), "the parsed footer alone");
     }
 
     /// A file whose page index another path loaded first is counted at its first SQL scan.
@@ -6243,6 +6342,7 @@ mod tests {
         let budget = HeapBudget::with_budget(None);
         let (_storage, _cache_dir, cache, table, storage) = table_charged_to(budget);
         let reader = table.reader().expect("reader");
+        let mut footers = 0;
         for entry in &reader.manifest().superfiles {
             let file = cache
                 .reader_synchronous_with_storage(
@@ -6252,12 +6352,18 @@ mod tests {
                 )
                 .await
                 .expect("load whole");
-            file.parquet_metadata_with_page_index()
+            footers += file
+                .parquet_metadata_with_page_index()
                 .await
-                .expect("page index");
+                .expect("page index")
+                .memory_size() as u64;
         }
         assert_eq!(budget.charged(), 0, "nothing charged before SQL");
         let _done = scan_all(statement_over(&table, &reader)).await;
-        assert!(budget.charged() > 0, "charged at the first scan");
+        assert_eq!(
+            budget.charged(),
+            footers,
+            "charged its footers at the first scan"
+        );
     }
 }
