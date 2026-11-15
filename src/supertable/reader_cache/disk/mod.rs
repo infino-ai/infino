@@ -34,7 +34,10 @@ use crate::{
         reader_cache::{
             block_source::BlockCachedSource,
             config::{ColdFetchMode, DiskCacheConfig},
-            disk::fill_wait::FillWaiters,
+            disk::{
+                fill_wait::FillWaiters,
+                scratch::{RunScratch, scratch_root},
+            },
         },
     },
 };
@@ -410,6 +413,9 @@ struct UnindexedFile {
 pub struct DiskCacheStore {
     storage: Arc<dyn StorageProvider>,
     config: DiskCacheConfig,
+    /// This store's folder of temporary files, see
+    /// [`Self::run_scratch_dir`].
+    run_scratch: RunScratch,
     started_at: Instant,
     cached: DashMap<SuperfileUri, Arc<CachedEntry>>,
     /// One in-flight walk per URI (tiers 2 to 4). The first caller to miss creates the cell and
@@ -512,6 +518,7 @@ mod fetch;
 mod fill_wait;
 mod heap;
 mod read;
+mod scratch;
 mod sources;
 mod store_files;
 
@@ -525,10 +532,22 @@ pub(crate) use sources::{
 };
 
 impl DiskCacheStore {
-    /// Where a build may spill its scratch: beside the cache, on the disk
-    /// sized for the table, rather than in the system temporary directory.
+    /// Where the table keeps work a later process resumes (a drain's
+    /// spill): beside the cache, on the disk sized for the table. Made on
+    /// each call, so it is there after the cache folder was cleared under an
+    /// open table.
     pub(crate) fn scratch_root(&self) -> PathBuf {
-        self.config.cache_root.join("scratch")
+        let dir = scratch_root(&self.config.cache_root);
+        let _ = fs::create_dir_all(&dir);
+        dir
+    }
+
+    /// Where this store's builds keep the temporary files that are of no
+    /// use once the process exits: its own folder under
+    /// [`Self::scratch_root`], which the next store to open removes if this
+    /// process dies with it.
+    pub(crate) fn run_scratch_dir(&self) -> PathBuf {
+        self.run_scratch.dir()
     }
 
     /// Whether this cache's checksum policy verifies a superfile a merge
@@ -556,6 +575,7 @@ impl DiskCacheStore {
             ));
         }
         fs::create_dir_all(&config.cache_root)?;
+        let run_scratch = RunScratch::open(&scratch_root(&config.cache_root))?;
         let threshold_secs = config.mmap_cold_threshold_secs;
         let interval_secs = config.mmap_sweep_interval_secs.max(1);
         let configured_budget = config.disk_budget_bytes;
@@ -563,6 +583,7 @@ impl DiskCacheStore {
         let store = Arc::new(Self {
             storage,
             config,
+            run_scratch,
             started_at: Instant::now(),
             cached: DashMap::new(),
             coordinators: DashMap::new(),
