@@ -152,6 +152,13 @@ pub enum BuildError {
     #[error("superfile store: {0}")]
     Store(String),
 
+    /// The build's temp files have no room: the disk is too full for them,
+    /// or the table's disk budget has none left for temp files. Nothing is
+    /// wrong with the table, so maintenance skips the step for now rather
+    /// than failing; the message says what stopped and what it needed.
+    #[error("{0}")]
+    ScratchFull(String),
+
     /// A superfile the build reads is in a format this engine does not read
     /// (see [`QueryError::Unsupported`]). Carried as its own variant rather
     /// than folded into [`Self::Store`] so the public mapping reports
@@ -724,7 +731,7 @@ impl From<CompactionError> for OptimizeError {
                 OptimizeError::Seal(format!("seal retries exhausted for {superfile_id}"))
             }
             CompactionError::Seal(s) => OptimizeError::Seal(s),
-            CompactionError::Build(s) => OptimizeError::Build(s),
+            CompactionError::Build(s) | CompactionError::ScratchFull(s) => OptimizeError::Build(s),
             CompactionError::Unsupported(s) => OptimizeError::Unsupported(s),
             CompactionError::Commit(s) | CompactionError::BatchDropped(s) => {
                 OptimizeError::Commit(s)
@@ -806,6 +813,12 @@ pub(crate) enum CompactionError {
     #[error("compaction batch dropped: {0}")]
     BatchDropped(String),
 
+    /// The merge's temp files have no room in the table's disk budget right
+    /// now (see [`BuildError::ScratchFull`]). The job is skipped for this
+    /// pass; it is not a failed merge.
+    #[error("{0}")]
+    ScratchFull(String),
+
     /// Refreshing the in-memory manifest after a successful commit failed.
     #[error("post-commit manifest refresh failed: {0}")]
     Refresh(String),
@@ -816,12 +829,14 @@ pub(crate) enum CompactionError {
 }
 
 /// A compaction input that failed to build: [`CompactionError::Unsupported`]
-/// for a superfile this engine does not read, otherwise
+/// for a superfile this engine does not read, [`CompactionError::ScratchFull`]
+/// for a merge with no room for its temp files, otherwise
 /// [`CompactionError::Build`] carrying the message.
 impl From<BuildError> for CompactionError {
     fn from(e: BuildError) -> Self {
         match e {
             BuildError::Unsupported(m) => CompactionError::Unsupported(m),
+            BuildError::ScratchFull(m) => CompactionError::ScratchFull(m),
             other => CompactionError::Build(other.to_string()),
         }
     }

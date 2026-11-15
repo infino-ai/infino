@@ -68,7 +68,10 @@ use crate::{
         },
         opann::rerank_pool_hint,
         query::{dispatch::open_whole_superfile, vector},
-        reader_cache::{SuperfileReaderCache, disk::mmap_temp_file_bytes},
+        reader_cache::{
+            SuperfileReaderCache,
+            disk::{ScratchCharge, mmap_temp_file_bytes},
+        },
         schema::{FieldId, PhysicalSchema, TableSchema, map::FileSchemaMap},
         wal::{
             Etag, SealRecord, TombstonesSidecar, WalStore, WalStoreError,
@@ -99,6 +102,14 @@ const MAX_CONCURRENT_SEAL_WRITES: usize = 256;
 /// between, after which a pass stops starting merges. One failure is usually
 /// that job's own; several in a row point at the table or the store.
 const MAX_FAILURES_IN_A_ROW: usize = 3;
+
+/// Temp-file bytes a merge is charged on its table's disk budget before it
+/// writes, per byte of its estimated output. The build keeps every region
+/// of the output (the encoded body, the index blobs, the id sidecar) in
+/// files of its own until the last one is done, then copies them into the
+/// output file, so at the peak the scratch folder holds the output twice.
+/// Once the output is written the charge shrinks to the output's size.
+const MERGE_TEMP_FILES_PER_OUTPUT_BYTE: u64 = 2;
 
 /// How long a compaction commit keeps retrying lost races after
 /// `max_commit_retries` is used up. Its merged superfiles are already
@@ -911,6 +922,7 @@ impl Supertable {
             Arc::new(CompactionMerge),
             None,
             None,
+            None,
         )
         .await
     }
@@ -921,6 +933,11 @@ impl Supertable {
     /// the table-wide length totals, streaming to a temp file and mapping
     /// it back — is the same work whatever produces the bytes, and is not
     /// worth a second copy. Only the build differs.
+    ///
+    /// `temp_files` is the charge the merge's temp files take on the table's
+    /// disk budget and the bytes to grow it by before anything is written.
+    /// It comes back holding the output's size, or fails the merge with
+    /// [`BuildError::ScratchFull`] when the budget has no room right now.
     pub(crate) async fn merge_superfiles_with(
         &self,
         superfiles: &[Arc<SuperfileEntry>],
@@ -928,6 +945,7 @@ impl Supertable {
         merge: Arc<dyn SuperfileMerge>,
         merge_input_mb: Option<u64>,
         merge_threads: Option<usize>,
+        mut temp_files: Option<(&mut ScratchCharge, u64)>,
     ) -> Result<PreparedSuperfile, BuildError> {
         debug_assert!(
             tombstones.is_empty()
@@ -1023,6 +1041,13 @@ impl Supertable {
             });
         }
 
+        // Charged with the inputs already open: they are the cache's most
+        // recently used files, so the room made for the merge's temp files
+        // comes from files it does not read.
+        if let Some((charge, bytes)) = temp_files.as_mut() {
+            charge_merge_temp_files(charge, *bytes).await?;
+        }
+
         // The merged file replaces its inputs, so it bakes the table-wide
         // average document length over everything else in the table plus
         // its own documents — the same statistic a fresh append bakes, and
@@ -1107,6 +1132,10 @@ impl Supertable {
         };
         let (merged_bytes, superfile_stats) =
             built.map_err(|e| BuildError::Store(e.to_string()))??;
+        // The build's own files are gone; only the output is left.
+        if let Some((charge, _)) = temp_files.as_mut() {
+            charge.shrink_to(merged_bytes.len() as u64);
+        }
 
         let mut shard = ShardOutput::new_with_params(
             merged_bytes,
@@ -1212,6 +1241,23 @@ impl Supertable {
         let opts = Arc::clone(&inner.options);
         let max_retries = opts.max_commit_retries.max(1);
 
+        // A merge the table's disk budget has no room for stops here, before
+        // its inputs are sealed, so it leaves nothing to undo.
+        let temp_bytes = job
+            .estimated_output_bytes
+            .saturating_mul(MERGE_TEMP_FILES_PER_OUTPUT_BYTE);
+        let mut scratch = opts.disk_cache.as_ref().map(|cache| cache.scratch_charge());
+        if let (Some(cache), Some(charge)) = (opts.disk_cache.as_ref(), scratch.as_ref())
+            && charge.could_hold(temp_bytes)
+            && cache.scratch_room() < temp_bytes
+        {
+            return Err(CompactionError::ScratchFull(format!(
+                "the table's disk budget has room for {} of the {temp_bytes} bytes of temp \
+                 files this merge needs",
+                cache.scratch_room()
+            )));
+        }
+
         // Seal every input sidecar so no writer can land a tombstone
         // on a file that's about to disappear, and so another
         // compactor doesn't pick up the same inputs. If we die
@@ -1243,6 +1289,7 @@ impl Supertable {
                 Arc::clone(&merge),
                 job.merge_input_mb,
                 merge_threads,
+                scratch.as_mut().map(|charge| (charge, temp_bytes)),
             )
             .await
         {
@@ -1251,7 +1298,10 @@ impl Supertable {
             // superseded by an in-place cell split. There is nothing live to
             // write, so commit the inputs' removal with no replacement entry:
             // a pure reclaim of the dead superfiles.
-            Err(BuildError::NoDocsToBuild) => None,
+            Err(BuildError::NoDocsToBuild) => {
+                scratch = None;
+                None
+            }
             Err(e) => {
                 unseal_all(&wal_store, sealed).await;
                 return Err(CompactionError::from(e));
@@ -1341,6 +1391,7 @@ impl Supertable {
             bytes_for_cache,
             merged_superfile_id,
             term_contributions,
+            scratch,
         })
     }
 
@@ -1626,9 +1677,11 @@ impl Supertable {
                     // Disk-cache warm + background storage reclaim ride the
                     // shared post-commit finalizer (the same path writer
                     // commits use), so the two paths can't drift.
+                    // Each output goes with its temp-file charge, which the
+                    // warm gives back as the cache takes the output over.
                     let pending_cache_inserts: Vec<_> = batch
-                        .iter()
-                        .filter_map(|p| p.bytes_for_cache.clone())
+                        .iter_mut()
+                        .filter_map(|p| Some((p.bytes_for_cache.clone()?, p.scratch.take())))
                         .collect();
                     finalize_compaction_commit(
                         Arc::clone(inner),
@@ -2515,6 +2568,15 @@ fn collect_merge(
             dropped.record_held(&e);
             return false;
         }
+        // The table's disk budget had no room for this merge's temp files.
+        // The job is dropped for this pass with nothing written and no seal
+        // left behind, and a later pass plans it again. Neither a failure
+        // streak nor the pass's result: the table is not sick, and the rest
+        // of the plan may still fit.
+        Ok((_, Err(e @ CompactionError::ScratchFull(_)))) => {
+            dropped.record_no_room(&e);
+            return false;
+        }
         Ok((_, Err(e))) => e,
         Err(e) => CompactionError::Build(format!("merge task failed: {e}")),
     };
@@ -2548,6 +2610,13 @@ impl DroppedJobs {
         warn!(error = %e, "compaction job left its input to another compactor");
         self.jobs += 1;
     }
+
+    /// A job with no room for its temp files: counted with the dropped
+    /// jobs but, like [`Self::record_held`], never `last`.
+    fn record_no_room(&mut self, e: &CompactionError) {
+        warn!(error = %e, "compaction job skipped for this pass: no room for its temp files");
+        self.jobs += 1;
+    }
 }
 
 /// One merge that has run and is waiting for its manifest commit.
@@ -2574,6 +2643,37 @@ pub(crate) struct PreparedJob {
     bytes_for_cache: Option<(SuperfileUri, Bytes)>,
     merged_superfile_id: Uuid,
     term_contributions: Vec<TermContribution>,
+    /// What the output's temp file is charged on the table's disk budget.
+    /// The commit hands it to the cache warm, which gives it back as the
+    /// cache takes the output over. An output the cache does not take keeps
+    /// it until the job is dropped: the last field, so it goes after the
+    /// bytes that hold the temp file.
+    scratch: Option<ScratchCharge>,
+}
+
+/// Grow `charge` by the `bytes` of temp files a merge is about to write,
+/// evicting cache files to make room. Without room right now the merge
+/// fails with [`BuildError::ScratchFull`]. When the budget could not hold
+/// the merge's temp files even with no others charged, waiting cannot help:
+/// the merge goes on uncharged with a warning, within the disk's free space
+/// alone, so a table whose budget is smaller than a merge still compacts.
+async fn charge_merge_temp_files(charge: &mut ScratchCharge, bytes: u64) -> Result<(), BuildError> {
+    let Err(error) = charge.grow(bytes).await else {
+        return Ok(());
+    };
+    if charge.could_hold(bytes) {
+        return Err(BuildError::ScratchFull(format!(
+            "the table's disk budget has no room for the {bytes} bytes of temp files this \
+             merge needs: {error}"
+        )));
+    }
+    warn!(
+        needed_bytes = bytes,
+        %error,
+        "compact: the table's disk budget is too small for this merge's temp files; they are \
+         not counted against it"
+    );
+    Ok(())
 }
 
 /// Re-stamps a batch's seals once the uploads are behind it.
@@ -5106,6 +5206,101 @@ mod tests {
             assert!(Instant::now() < deadline, "a file is left behind");
             time::sleep(WARM_POLL).await;
         }
+    }
+
+    /// A merge's temp files are charged to its table's disk budget before
+    /// it writes, and the charge follows the output: its size once the
+    /// output is written, and nothing once the cache has taken the output
+    /// over, which then counts it once.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_merge_charges_its_temp_files_until_the_cache_takes_its_output() {
+        let dir = TempDir::new().expect("tempdir");
+        let (st, _storage, cache) = table_with_disk_cache(&dir);
+        commit_ten_small_files(&st);
+        let inputs = st.inner().manifest.load().get_all_superfiles().to_vec();
+        let input_bytes: u64 = inputs
+            .iter()
+            .filter_map(|entry| entry.subsection_offsets.as_ref())
+            .map(|offsets| offsets.total_size)
+            .sum();
+        assert_eq!(cache.stats().scratch_bytes, 0);
+
+        let prepared = st
+            .prepare_compaction_job(
+                CompactionJob {
+                    inputs: inputs.iter().map(|entry| entry.superfile_id).collect(),
+                    estimated_output_bytes: input_bytes,
+                    ..CompactionJob::default()
+                },
+                DEFAULT_STALE_SEAL_TIMEOUT,
+            )
+            .await
+            .expect("prepare");
+        let (uri, output_bytes) = prepared
+            .bytes_for_cache
+            .as_ref()
+            .map(|(uri, bytes)| (*uri, bytes.len() as u64))
+            .expect("an output for the cache");
+        assert_eq!(
+            cache.stats().scratch_bytes,
+            output_bytes,
+            "a merged output waiting for its commit is charged at its size"
+        );
+        cache.assert_budget_consistent();
+
+        // The rest of the budget is taken, so the output fits the cache
+        // without an eviction only in the room its own charge gives back.
+        let before = cache.stats();
+        let rest = cache
+            .reserve(before.budget_bytes - before.current_bytes)
+            .await
+            .expect("the rest of the budget");
+        st.commit_compaction_batch(vec![prepared])
+            .await
+            .expect("commit");
+        wait_until_cached(&cache, &uri).await;
+        let after = cache.stats();
+        assert_eq!(after.n_evictions, before.n_evictions, "counted once");
+        assert_eq!(after.scratch_bytes, 0, "the charge was given back");
+        drop(rest);
+        assert_eq!(cache.stats().current_bytes, before.current_bytes);
+        cache.assert_budget_consistent();
+    }
+
+    /// A merge with no room for its temp files in the table's disk budget
+    /// is skipped for the pass: the pass succeeds, the inputs stay listed
+    /// and unsealed, and a later pass with room merges them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_merge_with_no_room_for_its_temp_files_waits_for_a_later_pass() {
+        let dir = TempDir::new().expect("tempdir");
+        let (st, storage, cache) = table_with_disk_cache(&dir);
+        commit_ten_small_files(&st);
+        let before = listed_ids(&st);
+
+        // Other temp files hold the whole share of the budget.
+        let mut others = cache.scratch_charge();
+        others
+            .grow(cache.scratch_room())
+            .await
+            .expect("the whole share");
+        let evictions = cache.stats().n_evictions;
+        st.compact_async(&small_compact_cfg())
+            .await
+            .expect("a pass with no room is not a failed pass");
+        assert_eq!(listed_ids(&st), before, "nothing was merged");
+        let wal_store = WalStore::new(storage);
+        for id in &before {
+            assert!(!is_sealed(&wal_store, *id).await, "{id} must be unsealed");
+        }
+        let stats = cache.stats();
+        assert_eq!(stats.scratch_bytes, others.bytes(), "nothing was charged");
+        assert_eq!(stats.n_evictions, evictions, "nothing was evicted");
+
+        drop(others);
+        st.compact_async(&small_compact_cfg())
+            .await
+            .expect("compact");
+        assert!(superfile_count(&st) < before.len(), "the later pass merged");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -8844,6 +9039,30 @@ mod tests {
         assert!(ready.is_empty());
     }
 
+    /// A job with no room for its temp files is counted with the dropped
+    /// jobs, and like a held input it neither joins a failure streak nor
+    /// fails the pass.
+    #[test]
+    fn a_job_with_no_room_for_its_temp_files_does_not_fail_the_pass() {
+        let mut ready = Vec::new();
+        let mut first_error = None;
+        let mut dropped = DroppedJobs::default();
+        let counts = collect_merge(
+            Ok((0, Err(CompactionError::ScratchFull("no room".into())))),
+            &mut ready,
+            &mut first_error,
+            &mut dropped,
+        );
+        assert!(!counts, "no room is not part of a failure streak");
+        assert_eq!(dropped.jobs, 1, "the job is counted as dropped");
+        assert!(
+            dropped.last.is_none(),
+            "it is not a reason to fail the pass"
+        );
+        assert!(first_error.is_none());
+        assert!(ready.is_empty());
+    }
+
     /// A sidecar re-stamp keeps its storage error's kind on the way to the
     /// commit, so a transient one at the fence drops only the batch.
     #[test]
@@ -9400,6 +9619,7 @@ mod tests {
             bytes_for_cache: None,
             merged_superfile_id: Uuid::new_v4(),
             term_contributions: Vec::new(),
+            scratch: None,
         }
     }
 

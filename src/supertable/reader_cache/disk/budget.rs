@@ -8,6 +8,7 @@
 use std::time::Duration;
 use std::{
     fs, mem,
+    path::Path,
     sync::{Arc, atomic::Ordering},
 };
 
@@ -38,6 +39,18 @@ use crate::{
 /// How long a test waits for queued block writes to finish, before failing instead of hanging.
 #[cfg(test)]
 const BLOCK_WRITES_SETTLE_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Cached files the budget of a temp-file charge test holds exactly.
+#[cfg(test)]
+const SCRATCH_TEST_BUDGET_FILES: u64 = 4;
+
+/// Bytes the parked temp-file charge test charges.
+#[cfg(test)]
+const SCRATCH_TEST_PARKED_BYTES: u64 = 1024;
+
+/// Share of the disk budget a table's temp files beside the cache may be charged, in divisor
+/// form (`budget / this`): the cache keeps at least the other half.
+const SCRATCH_SHARE_DIVISOR: u64 = 2;
 
 /// Room [`DiskCacheStore::try_reserve_ahead`] reserved for a download ahead of reads, given back
 /// on drop once the download ends.
@@ -445,6 +458,37 @@ impl DiskCacheStore {
         }
     }
 
+    /// The most bytes this cache's budget lets its table's temp files be charged.
+    fn scratch_cap(&self) -> u64 {
+        self.disk_budget_bytes() / SCRATCH_SHARE_DIVISOR
+    }
+
+    /// Bytes temp files may still be charged before they hold their whole share of the budget.
+    pub(crate) fn scratch_room(&self) -> u64 {
+        self.scratch_cap()
+            .saturating_sub(self.scratch_bytes.load(Ordering::Acquire))
+    }
+
+    /// An empty charge on this cache's budget, for temp files beside it to grow into.
+    pub(crate) fn scratch_charge(self: &Arc<Self>) -> ScratchCharge {
+        ScratchCharge {
+            store: Arc::clone(self),
+            bytes: 0,
+        }
+    }
+
+    /// The charge parked for the temp files in `folder` (see [`ScratchCharge::park`]); empty
+    /// when none is.
+    pub(crate) fn take_parked_scratch(self: &Arc<Self>, folder: &Path) -> ScratchCharge {
+        ScratchCharge {
+            store: Arc::clone(self),
+            bytes: self
+                .parked_scratch
+                .remove(folder)
+                .map_or(0, |(_, bytes)| bytes),
+        }
+    }
+
     /// Reserve a whole file of `bytes` for a Warm open's background download. `None` when the open
     /// allows no download, or when the budget cannot hold the file: eviction ran out of victims,
     /// the one error it raises (`BudgetExceeded`). Without it the open stays lazy and charges only
@@ -732,7 +776,8 @@ impl DiskCacheStore {
     }
 
     /// The budget ledger at rest: every charged byte is backed by a live entry, a scanned cache
-    /// file, a scanned block file or a background fill's reservation, and nothing else. Holds only
+    /// file, a scanned block file, a background fill's reservation or a temp-file charge, and
+    /// nothing else. Holds only
     /// with no fetch or fill running (see `wait_until_fills_settled`).
     #[cfg(test)]
     pub(crate) fn assert_budget_consistent(&self) {
@@ -744,11 +789,18 @@ impl DiskCacheStore {
             .iter()
             .map(|f| f.value().reserved.load(Ordering::Acquire))
             .sum();
+        let scratch = self.scratch_bytes.load(Ordering::Acquire);
         assert_eq!(
             self.current_bytes.load(Ordering::Acquire),
-            entries + unindexed + block_files + fills,
+            entries + unindexed + block_files + fills + scratch,
             "budget ledger drifted from what the cache holds (entries {entries}, \
-             unindexed {unindexed}, block files {block_files}, fills {fills})"
+             unindexed {unindexed}, block files {block_files}, fills {fills}, \
+             temp files {scratch})"
+        );
+        let parked: u64 = self.parked_scratch.iter().map(|p| *p.value()).sum();
+        assert!(
+            parked <= scratch,
+            "parked temp-file bytes {parked} exceed the {scratch} charged"
         );
     }
 
@@ -790,6 +842,90 @@ impl Drop for BlockWriteTicket {
         if self.0.block_writes.fetch_sub(1, Ordering::AcqRel) == 1 {
             self.0.block_writes_idle.notify_waiters();
         }
+    }
+}
+
+/// Bytes charged to a cache's budget for temp files beside it. Drop gives them back.
+///
+/// The charge is part of the one budget the cache keeps to: growing it evicts cache files,
+/// least recently used first. All of a cache's charges together stay within
+/// `budget / SCRATCH_SHARE_DIVISOR`.
+pub(crate) struct ScratchCharge {
+    store: Arc<DiskCacheStore>,
+    bytes: u64,
+}
+
+impl ScratchCharge {
+    /// Charge `more` bytes, evicting cache files to make room. Fails with
+    /// [`DiskCacheError::ScratchFull`], evicting nothing, when temp files would pass their share
+    /// of the budget, and with [`DiskCacheError::BudgetExceeded`] when eviction cannot free the
+    /// room. A failed call leaves the charge as it was.
+    pub(crate) async fn grow(&mut self, more: u64) -> Result<(), DiskCacheError> {
+        let store = &self.store;
+        let cap = store.scratch_cap();
+        let full = |charged| DiskCacheError::ScratchFull {
+            needed: more,
+            charged,
+            cap,
+        };
+        let charged = store.scratch_bytes.load(Ordering::Acquire);
+        if charged.saturating_add(more) > cap {
+            return Err(full(charged));
+        }
+        store.reserve_manual(more).await?;
+        // Checked again as it is counted: another charge may have grown while this one evicted.
+        let counted =
+            store
+                .scratch_bytes
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |charged| {
+                    charged.checked_add(more).filter(|&next| next <= cap)
+                });
+        if let Err(charged) = counted {
+            store.current_bytes.fetch_sub(more, Ordering::Release);
+            return Err(full(charged));
+        }
+        self.bytes += more;
+        Ok(())
+    }
+
+    /// Give back whatever is charged past `bytes`.
+    pub(crate) fn shrink_to(&mut self, bytes: u64) {
+        let Some(less) = self.bytes.checked_sub(bytes) else {
+            return;
+        };
+        self.store.scratch_bytes.fetch_sub(less, Ordering::AcqRel);
+        self.store.current_bytes.fetch_sub(less, Ordering::Release);
+        self.bytes -= less;
+    }
+
+    /// The bytes charged now.
+    pub(crate) fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    /// Whether the budget could hold this charge grown by `more` with no other temp files
+    /// charged. When it could not, waiting for room never helps.
+    pub(crate) fn could_hold(&self, more: u64) -> bool {
+        self.bytes.saturating_add(more) <= self.store.scratch_cap()
+    }
+
+    /// Leave the bytes charged for temp files that stay in `folder` with nothing running that
+    /// owns them, until [`DiskCacheStore::take_parked_scratch`] takes them over.
+    pub(crate) fn park(mut self, folder: &Path) {
+        let bytes = mem::take(&mut self.bytes);
+        if bytes > 0 {
+            *self
+                .store
+                .parked_scratch
+                .entry(folder.to_path_buf())
+                .or_default() += bytes;
+        }
+    }
+}
+
+impl Drop for ScratchCharge {
+    fn drop(&mut self) {
+        self.shrink_to(0);
     }
 }
 
@@ -1130,6 +1266,111 @@ mod tests {
         );
         store.assert_budget_consistent();
         assert_eq!(store.stats().current_bytes, 0);
+    }
+
+    /// Caches `n` tiny superfiles in `store` and returns their URIs, oldest first.
+    async fn cache_tiny_superfiles(store: &Arc<DiskCacheStore>, n: usize) -> Vec<SuperfileUri> {
+        let mut uris = Vec::with_capacity(n);
+        for _ in 0..n {
+            let uri = SuperfileUri::new_v4();
+            store
+                .insert_warm(&uri, tiny_superfile_bytes())
+                .await
+                .expect("cached");
+            uris.push(uri);
+        }
+        uris
+    }
+
+    #[tokio::test]
+    async fn temp_files_take_their_room_from_the_cache_within_one_budget() {
+        let file = tiny_superfile_bytes().len() as u64;
+        // Room for exactly four cached files, so temp files may take two files' worth.
+        let (_dir, store) =
+            test_store_with(|cfg| cfg.disk_budget_bytes = SCRATCH_TEST_BUDGET_FILES * file);
+        let uris = cache_tiny_superfiles(&store, SCRATCH_TEST_BUDGET_FILES as usize).await;
+        assert_eq!(
+            store.stats().current_bytes,
+            SCRATCH_TEST_BUDGET_FILES * file
+        );
+
+        // One file's worth of temp files evicts the least recently used cached file.
+        let mut charge = store.scratch_charge();
+        charge.grow(file).await.expect("room made");
+        let stats = store.stats();
+        assert_eq!(stats.scratch_bytes, file);
+        assert_eq!(stats.current_bytes, stats.budget_bytes, "one budget");
+        assert_eq!(stats.n_evictions, 1);
+        assert!(!store.is_cached(&uris[0]), "the oldest file went");
+        assert!(store.is_cached(&uris[1]));
+        store.assert_budget_consistent();
+
+        // Dropping the charge gives its room back.
+        drop(charge);
+        let stats = store.stats();
+        assert_eq!(stats.scratch_bytes, 0);
+        assert_eq!(stats.current_bytes, stats.budget_bytes - file);
+        store.assert_budget_consistent();
+    }
+
+    #[tokio::test]
+    async fn a_temp_file_charge_past_its_share_fails_and_evicts_nothing() {
+        let file = tiny_superfile_bytes().len() as u64;
+        let (_dir, store) =
+            test_store_with(|cfg| cfg.disk_budget_bytes = SCRATCH_TEST_BUDGET_FILES * file);
+        let uris = cache_tiny_superfiles(&store, SCRATCH_TEST_BUDGET_FILES as usize).await;
+        let cap = store.stats().budget_bytes / SCRATCH_SHARE_DIVISOR;
+
+        // More than the share in one step: refused before anything is evicted.
+        let mut charge = store.scratch_charge();
+        let err = charge.grow(cap + 1).await.expect_err("past the share");
+        assert!(matches!(err, DiskCacheError::ScratchFull { .. }), "{err}");
+        assert_eq!(charge.bytes(), 0);
+        assert_eq!(store.stats().n_evictions, 0);
+        assert!(uris.iter().all(|uri| store.is_cached(uri)));
+        store.assert_budget_consistent();
+
+        // The share is counted across charges: a second one cannot take what the first holds.
+        charge.grow(cap).await.expect("the whole share");
+        let evictions = store.stats().n_evictions;
+        let mut second = store.scratch_charge();
+        let err = second.grow(1).await.expect_err("the share is taken");
+        assert!(matches!(err, DiskCacheError::ScratchFull { .. }), "{err}");
+        assert_eq!(store.stats().n_evictions, evictions, "nothing more evicted");
+        assert_eq!(store.stats().scratch_bytes, cap);
+        store.assert_budget_consistent();
+
+        drop(second);
+        drop(charge);
+        assert_eq!(store.stats().scratch_bytes, 0);
+        store.assert_budget_consistent();
+    }
+
+    #[tokio::test]
+    async fn a_parked_temp_file_charge_stays_counted_until_it_is_taken_over() {
+        let (dir, store) = test_store_with(|_| {});
+        let folder = dir.path().join("spill");
+        let mut charge = store.scratch_charge();
+        charge.grow(SCRATCH_TEST_PARKED_BYTES).await.expect("room");
+
+        // Parked, the bytes stay charged with no guard holding them.
+        charge.park(&folder);
+        assert_eq!(store.stats().scratch_bytes, SCRATCH_TEST_PARKED_BYTES);
+        store.assert_budget_consistent();
+
+        // Taken over, they are one charge again; a second take finds nothing.
+        let mut taken = store.take_parked_scratch(&folder);
+        assert_eq!(taken.bytes(), SCRATCH_TEST_PARKED_BYTES);
+        assert_eq!(store.take_parked_scratch(&folder).bytes(), 0);
+        assert_eq!(store.stats().scratch_bytes, SCRATCH_TEST_PARKED_BYTES);
+
+        // Shrinking gives back the difference, dropping the rest.
+        taken.shrink_to(1);
+        assert_eq!(store.stats().scratch_bytes, 1);
+        store.assert_budget_consistent();
+        drop(taken);
+        assert_eq!(store.stats().current_bytes, 0);
+        store.assert_budget_consistent();
     }
 
     #[tokio::test]
