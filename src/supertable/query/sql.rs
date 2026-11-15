@@ -98,6 +98,7 @@ use crate::{
                 match_exec::{MatchTopK, register_match},
                 vector_exec::register_vector_search,
             },
+            empty_sort_keys::EmptySortKeys,
             provider::{SupertableProvider, TABLE_NAME, view_string_schema},
             range_top_k::RangeTopK,
         },
@@ -247,6 +248,7 @@ pub(crate) fn sql_session_context(
     ctx.add_optimizer_rule(Arc::new(CoveredAggregateRewrite::default()));
     ctx.add_optimizer_rule(Arc::new(RangeTopK));
     ctx.add_optimizer_rule(Arc::new(MatchTopK));
+    ctx.add_optimizer_rule(Arc::new(EmptySortKeys));
     Ok(ctx)
 }
 

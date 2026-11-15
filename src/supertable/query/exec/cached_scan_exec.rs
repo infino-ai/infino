@@ -15,6 +15,12 @@
 //! index chose a file's rows (an `ORDER BY ... LIMIT` over a range), only
 //! those rows come out, and a row group holding none of them is not read.
 //!
+//! A top-k above it hands down its running bound (the k-th best sort value
+//! so far) as a filter that tightens as rows arrive. Asked for a sort on one
+//! of its columns, the scan reads the row groups whose statistics start best
+//! first, and skips each row group the bound rules out by its statistics just
+//! before reading it, so the top-k settles early and the rest go unread.
+//!
 //! It answers what the Parquet scan would: the same columns, typed as the scan
 //! schema types them, each file's rows in file order, without the rows a
 //! tombstone deletes. A `WHERE` stays above it in a `FilterExec`, as above the
@@ -44,17 +50,29 @@ use datafusion::{
     datasource::physical_plan::parquet::ParquetAccessPlan,
     error::{DataFusionError, Result as DfResult},
     execution::TaskContext,
-    physical_expr::{EquivalenceProperties, PhysicalExpr},
+    common::{ScalarValue, config::ConfigOptions},
+    physical_expr::{
+        EquivalenceProperties, PhysicalExpr, PhysicalSortExpr,
+        expressions::{Column, DynamicFilterPhysicalExpr},
+    },
     physical_expr_adapter::PhysicalExprAdapterFactory,
+    physical_expr_common::physical_expr::snapshot_physical_expr,
     physical_plan::{
         DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
         SendableRecordBatchStream,
         execution_plan::{Boundedness, EmissionType},
+        filter_pushdown::{
+            ChildPushdownResult, FilterPushdownPhase, FilterPushdownPropagation, PushedDown,
+        },
+        sort_pushdown::SortOrderPushdownResult,
         stream::RecordBatchStreamAdapter,
     },
 };
 use futures::{StreamExt, TryStreamExt, future, stream};
-use parquet::file::metadata::ParquetMetaData;
+use parquet::{
+    arrow::{arrow_reader::statistics::StatisticsConverter, parquet_to_arrow_schema},
+    file::metadata::ParquetMetaData,
+};
 use roaring::RoaringBitmap;
 use tokio::spawn;
 use tracing::Instrument;
@@ -69,6 +87,7 @@ use crate::{
             column_cache::{ColumnKey, DecodedColumnCache},
             exec::common::{hit_output_schema, read_file_row_group},
             read_ahead::{file_pruning, statistics_pruned},
+            schema_adapter::TableExprAdapterFactory,
         },
         schema::cast::CAST_OPTIONS,
     },
@@ -149,7 +168,7 @@ struct ScanContext {
 }
 
 /// A table scan served from the decoded-column cache; see the module docs.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct CachedScanExec {
     context: Arc<ScanContext>,
     units: Arc<[RowGroupUnit]>,
@@ -164,6 +183,39 @@ pub(crate) struct CachedScanExec {
     /// `ORDER BY ... LIMIT` whose row filter decodes the wide columns only
     /// for the rows that pass, takes it back ([`Self::parquet`]).
     parquet: Arc<dyn ExecutionPlan>,
+    /// Filters a parent pushed down that tighten while the statement runs
+    /// ([`LiveFilters`]); `None` without any.
+    live: Option<Arc<LiveFilters>>,
+}
+
+/// Filters pushed down from above that tighten as the statement runs, such
+/// as a top-k's bound on its sort key (the k-th best value so far). Each is
+/// checked against a row group's statistics just before the row group is
+/// read, and a row group that can no longer reach the result is skipped.
+/// The scan only skips by them; the rows it reads are still checked above.
+#[derive(Debug)]
+struct LiveFilters {
+    filters: Vec<Arc<dyn PhysicalExpr>>,
+    /// Maps a filter onto each file's own schema, as the scan's `WHERE` is.
+    adapter: Arc<dyn PhysicalExprAdapterFactory>,
+}
+
+impl LiveFilters {
+    /// Whether the filters as they stand rule `unit` out by its statistics.
+    fn skip(&self, unit: &RowGroupUnit, table: &SchemaRef) -> bool {
+        self.filters.iter().any(|filter| {
+            let Ok(now) = snapshot_physical_expr(Arc::clone(filter)) else {
+                return false;
+            };
+            RowGroupFilter {
+                predicate: now,
+                table: Arc::clone(table),
+                adapter: Arc::clone(&self.adapter),
+            }
+            .plan(&unit.file)
+            .is_some_and(|plan| !plan.should_scan(unit.row_group))
+        })
+    }
 }
 
 impl CachedScanExec {
@@ -250,6 +302,7 @@ impl CachedScanExec {
             statistics: Arc::new(statistics),
             properties,
             parquet,
+            live: None,
         })
     }
 
@@ -308,6 +361,62 @@ fn decoded_bytes(units: &[RowGroupUnit], schema: &Schema) -> usize {
                 .sum::<usize>()
         })
         .sum()
+}
+
+/// `units` ordered by the row-group statistics of `column`, smallest minimum
+/// first (largest maximum first when `descending`), row groups without
+/// statistics last; `None` when no file has statistics for it.
+fn best_first(units: &[RowGroupUnit], column: &str, descending: bool) -> Option<Vec<RowGroupUnit>> {
+    let mut keyed: Vec<(Option<ScalarValue>, RowGroupUnit)> = Vec::with_capacity(units.len());
+    let mut any = false;
+    // Each file's bounds, read from its footer once.
+    let mut bounds: Vec<(Arc<CachedFile>, Option<ArrayRef>)> = Vec::new();
+    for unit in units {
+        let array = match bounds.iter().find(|(file, _)| Arc::ptr_eq(file, &unit.file)) {
+            Some((_, array)) => array.clone(),
+            None => {
+                let array = row_group_bounds(&unit.file.footer, column, descending);
+                bounds.push((Arc::clone(&unit.file), array.clone()));
+                array
+            }
+        };
+        let key = array
+            .as_ref()
+            .and_then(|array| ScalarValue::try_from_array(array, unit.row_group).ok())
+            .filter(|value| !value.is_null());
+        any |= key.is_some();
+        keyed.push((key, unit.clone()));
+    }
+    if !any {
+        return None;
+    }
+    keyed.sort_by(|(a, _), (b, _)| match (a, b) {
+        (Some(a), Some(b)) => {
+            let order = a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal);
+            if descending { order.reverse() } else { order }
+        }
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    });
+    Some(keyed.into_iter().map(|(_, unit)| unit).collect())
+}
+
+/// Each row group's minimum (maximum when `descending`) of `column` in a
+/// file with `footer`; `None` when the file does not hold it or records no
+/// statistics a converter reads.
+fn row_group_bounds(
+    footer: &ParquetMetaData,
+    column: &str,
+    descending: bool,
+) -> Option<ArrayRef> {
+    let file = footer.file_metadata();
+    let schema = parquet_to_arrow_schema(file.schema_descr(), file.key_value_metadata()).ok()?;
+    let converter = StatisticsConverter::try_new(column, &schema, file.schema_descr()).ok()?;
+    match descending {
+        false => converter.row_group_mins(footer.row_groups().iter()).ok(),
+        true => converter.row_group_maxes(footer.row_groups().iter()).ok(),
+    }
 }
 
 /// The plan properties of a scan of `schema` read as `partitions` partitions.
@@ -510,15 +619,66 @@ impl ExecutionPlan for CachedScanExec {
 
     fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
         Some(Arc::new(Self {
-            context: Arc::clone(&self.context),
-            units: Arc::clone(&self.units),
-            pruned: self.pruned,
-            parquet: Arc::clone(&self.parquet),
-            partitions: self.partitions,
             fetch: limit,
-            statistics: Arc::clone(&self.statistics),
-            properties: Arc::clone(&self.properties),
+            ..self.clone()
         }))
+    }
+
+    /// Keeps the filters a parent pushed down that tighten as the statement
+    /// runs ([`LiveFilters`]), to skip row groups by; every filter stays
+    /// checked above.
+    fn handle_child_pushdown_result(
+        &self,
+        phase: FilterPushdownPhase,
+        child_pushdown_result: ChildPushdownResult,
+        _config: &ConfigOptions,
+    ) -> DfResult<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
+        let filters: Vec<Arc<dyn PhysicalExpr>> = child_pushdown_result
+            .parent_filters
+            .iter()
+            .map(|result| Arc::clone(&result.filter))
+            .collect();
+        let none = vec![PushedDown::No; filters.len()];
+        let live: Vec<Arc<dyn PhysicalExpr>> = filters
+            .into_iter()
+            .filter(|filter| filter.downcast_ref::<DynamicFilterPhysicalExpr>().is_some())
+            .collect();
+        let propagation = FilterPushdownPropagation::with_parent_pushdown_result(none);
+        if phase != FilterPushdownPhase::Post || live.is_empty() {
+            return Ok(propagation);
+        }
+        Ok(propagation.with_updated_node(Arc::new(Self {
+            live: Some(Arc::new(LiveFilters {
+                filters: live,
+                adapter: Arc::new(TableExprAdapterFactory::new(&self.context.manifest)),
+            })),
+            ..self.clone()
+        })))
+    }
+
+    /// For a sort on one of the scan's columns, reads the row groups that
+    /// statistics say start best first, so a top-k above settles its bound
+    /// early and [`LiveFilters`] skip the rest. The order is only a reading
+    /// order: the sort stays.
+    fn try_pushdown_sort(
+        &self,
+        order: &[PhysicalSortExpr],
+    ) -> DfResult<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>> {
+        let Some(first) = order.first() else {
+            return Ok(SortOrderPushdownResult::Unsupported);
+        };
+        let Some(column) = first.expr.downcast_ref::<Column>() else {
+            return Ok(SortOrderPushdownResult::Unsupported);
+        };
+        let Some(units) = best_first(&self.units, column.name(), first.options.descending) else {
+            return Ok(SortOrderPushdownResult::Unsupported);
+        };
+        Ok(SortOrderPushdownResult::Inexact {
+            inner: Arc::new(Self {
+                units: units.into(),
+                ..self.clone()
+            }),
+        })
     }
 
     fn execute(
@@ -540,11 +700,21 @@ impl ExecutionPlan for CachedScanExec {
             .cloned()
             .collect();
         let context = Arc::clone(&self.context);
+        let live = self.live.clone();
+        let context_schema = Arc::clone(&self.context.schema);
         // A row group goes out in batch-size slices, as the Parquet scan's
         // rows do: the filter above then works a batch at a time, and a
         // `LIMIT` met in the first slice leaves the rest of the row group.
         let batch_size = task.session_config().batch_size();
         let batches = stream::iter(units)
+            .filter(move |unit| {
+                // Checked as each row group comes up, so a bound tightened by
+                // the rows read so far skips it.
+                let skip = live
+                    .as_ref()
+                    .is_some_and(|live| live.skip(unit, &context_schema));
+                future::ready(!skip)
+            })
             .then(move |unit| {
                 let context = Arc::clone(&context);
                 async move { context.read(&unit).await }

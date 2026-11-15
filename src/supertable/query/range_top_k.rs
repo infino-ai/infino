@@ -195,7 +195,7 @@ pub(crate) fn sort_over_scan(plan: &LogicalPlan) -> Option<SortOverScan<'_>> {
 }
 
 /// Our provider behind `scan`, when it is ours.
-fn provider_of(scan: &TableScan) -> Option<&SupertableProvider> {
+pub(crate) fn provider_of(scan: &TableScan) -> Option<&SupertableProvider> {
     let source = scan.source.downcast_ref::<DefaultTableSource>()?;
     source.table_provider.downcast_ref::<SupertableProvider>()
 }

@@ -38,6 +38,7 @@ pub(crate) mod nan_bounds;
 pub mod provider;
 pub mod prune;
 pub(crate) mod range_counts;
+pub(crate) mod empty_sort_keys;
 pub(crate) mod range_top_k;
 pub(crate) mod read_ahead;
 pub(crate) mod read_ahead_rule;
