@@ -610,6 +610,7 @@ impl From<SupertableBuildError> for InfinoError {
             // Ours: a store, scratch file, thread pool or cache directory
             // failing while the write ran, none of it the caller's to fix.
             SupertableBuildError::Store(_)
+            | SupertableBuildError::ScratchFull(_)
             | SupertableBuildError::ThreadPoolCreation(_)
             | SupertableBuildError::ReadAfterCommit(_)
             | SupertableBuildError::StorageConstruction(_)
