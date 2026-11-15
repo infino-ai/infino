@@ -50,6 +50,7 @@ use datafusion::{
         DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
         SendableRecordBatchStream,
         execution_plan::{Boundedness, EmissionType},
+        metrics::{Count, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet},
         stream::RecordBatchStreamAdapter,
     },
 };
@@ -78,6 +79,11 @@ use crate::{
 /// view, as the scan reads non-indexed strings, and the most any of Arrow's
 /// variable-width layouts takes.
 const VIEW_BYTES_PER_ROW: usize = 16;
+
+/// Metric counting the row groups a scan decoded because the cache lacked
+/// one of their projected columns, as `EXPLAIN ANALYZE` lists it. A run over
+/// columns the cache keeps decodes none.
+const ROW_GROUPS_DECODED: &str = "row_groups_decoded";
 
 /// One file of the scan: what its row groups are read from.
 #[derive(Debug)]
@@ -164,6 +170,10 @@ pub(crate) struct CachedScanExec {
     /// `ORDER BY ... LIMIT` whose row filter decodes the wide columns only
     /// for the rows that pass, takes it back ([`Self::parquet`]).
     parquet: Arc<dyn ExecutionPlan>,
+    /// The rows each partition hands on, which the per-query counters take
+    /// as the rows the scan materialized, as they take a Parquet scan's; and
+    /// the row groups it decoded ([`ROW_GROUPS_DECODED`]).
+    metrics: ExecutionPlanMetricsSet,
 }
 
 impl CachedScanExec {
@@ -250,6 +260,7 @@ impl CachedScanExec {
             statistics: Arc::new(statistics),
             properties,
             parquet,
+            metrics: ExecutionPlanMetricsSet::new(),
         })
     }
 
@@ -386,7 +397,8 @@ impl ScanContext {
 
     /// `unit`'s row group, every projected column, without its deleted rows
     /// and, when the index chose the file's rows, without the rows it didn't.
-    async fn read(self: &Arc<Self>, unit: &RowGroupUnit) -> DfResult<RecordBatch> {
+    /// A decode of the columns the cache lacks counts in `decoded`.
+    async fn read(self: &Arc<Self>, unit: &RowGroupUnit, decoded: &Count) -> DfResult<RecordBatch> {
         let fields = self.schema.fields();
         let mut columns: Vec<Option<ArrayRef>> = fields
             .iter()
@@ -396,6 +408,7 @@ impl ScanContext {
             .filter(|&i| columns[i].is_none())
             .collect();
         if !missing.is_empty() {
+            decoded.add(1);
             // The decode runs as its own task: a `LIMIT` above drops this
             // partition's stream once it has its rows, and a decode dropped
             // halfway would have spent its CPU without keeping the columns.
@@ -518,7 +531,12 @@ impl ExecutionPlan for CachedScanExec {
             fetch: limit,
             statistics: Arc::clone(&self.statistics),
             properties: Arc::clone(&self.properties),
+            metrics: ExecutionPlanMetricsSet::new(),
         }))
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
     }
 
     fn execute(
@@ -540,6 +558,8 @@ impl ExecutionPlan for CachedScanExec {
             .cloned()
             .collect();
         let context = Arc::clone(&self.context);
+        let output_rows = MetricBuilder::new(&self.metrics).output_rows(partition);
+        let decoded = MetricBuilder::new(&self.metrics).counter(ROW_GROUPS_DECODED, partition);
         // A row group goes out in batch-size slices, as the Parquet scan's
         // rows do: the filter above then works a batch at a time, and a
         // `LIMIT` met in the first slice leaves the rest of the row group.
@@ -547,7 +567,8 @@ impl ExecutionPlan for CachedScanExec {
         let batches = stream::iter(units)
             .then(move |unit| {
                 let context = Arc::clone(&context);
-                async move { context.read(&unit).await }
+                let decoded = decoded.clone();
+                async move { context.read(&unit, &decoded).await }
             })
             .map_ok(move |batch| stream::iter(sliced(batch, batch_size).into_iter().map(Ok)))
             .try_flatten()
@@ -564,7 +585,8 @@ impl ExecutionPlan for CachedScanExec {
                         Some(Ok(batch.slice(0, rows)))
                     }
                 })
-            });
+            })
+            .inspect_ok(move |batch| output_rows.add(batch.num_rows()));
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             Arc::clone(&self.context.schema),
             batches,
