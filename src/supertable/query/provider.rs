@@ -110,7 +110,8 @@ use uuid::Uuid;
 
 use crate::{
     superfile::{
-        SuperfileReader,
+        ReadError, SuperfileReader,
+        error::FtsError,
         fts::{
             reader::{BoolMode, ContainsRows, MatchWork},
             tokenize::{Tokenizer, unique_tokens},
@@ -125,8 +126,8 @@ use crate::{
         },
         query::{
             candidate::{
-                CandidatePlan, ExactFilter, PoolFile, Resolved, SelectionGate, exact_filter,
-                like_prune_leaves, single_range,
+                CandidatePlan, ExactFilter, PoolFile, Resolved, SelectionGate, TermMemos,
+                exact_filter, exact_range, like_prune_leaves, single_range,
             },
             deleted_stats::DeletedStatsCache,
             df_object_store::SuperfileObjectStore,
@@ -137,7 +138,9 @@ use crate::{
                 common::{BoundPredicate, PushedPredicate, take_file_columns, unqualified},
                 metered_exec::MeteredExec,
             },
-            fts::plan_locations_for,
+            fts::{
+                PlanLocations, index_locations_for, memos_from_plan_locations, plan_locations_for,
+            },
             nan_bounds::without_nan_blind_bounds,
             prune::{PruneLeaf, select_superfiles},
             range_counts::{RangeBucket, RangeCounts},
@@ -818,6 +821,30 @@ impl SupertableProvider {
             .any(|filter| self.exact_filter(filter, &fts_cols).is_some())
     }
 
+    /// Each of `filters` as an exact interval on a range-indexed column
+    /// ([`exact_range`]), or `None`. Only beside a conjunct the dictionary
+    /// answers exactly (`with_text`): the scan then intersects the range
+    /// index's rows with the dictionary's, and with every conjunct exact
+    /// DataFusion hands the scan its `LIMIT`. Alone, a range stays a bound
+    /// that a `FilterExec` verifies, which the covered-aggregate rewrite and
+    /// the counting scan rely on. [`supports_filters_pushdown`] and
+    /// [`scan`] decide the same way over the same conjuncts.
+    fn exact_ranges<'e>(
+        &self,
+        filters: impl IntoIterator<Item = &'e Expr>,
+        with_text: bool,
+    ) -> Vec<Option<(FieldId, DataType, u64, u64)>> {
+        let range_cols = self.manifest.table_schema().range_column_types();
+        filters
+            .into_iter()
+            .map(|filter| {
+                with_text
+                    .then(|| exact_range(filter, &range_cols))
+                    .flatten()
+            })
+            .collect()
+    }
+
     /// The rows of one superfile its exact conjuncts hold for, within
     /// `bound` (the other conjuncts' candidate rows, when the index bounded
     /// them). Every leaf's rows come from the dictionary
@@ -836,10 +863,12 @@ impl SupertableProvider {
         &self,
         prepared: &PreparedScanFile,
         check: &ExactCheck,
+        memos: &TermMemos,
         bound: Option<&RoaringBitmap>,
         gate: u64,
         tombstones: &RoaringBitmap,
         batch_size: usize,
+        limit: Option<u64>,
     ) -> DfResult<(RoaringBitmap, MatchWork)> {
         let pool: &ThreadPool = &self.manifest.options.reader_pool;
         let mut work = MatchWork::default();
@@ -851,27 +880,106 @@ impl SupertableProvider {
             self.count_rows_checked(checked.len(), verified.len());
             return Ok((verified, work));
         }
-        // Each column's distinct needles, in first-seen order.
-        let mut by_column: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+        // Under a LIMIT, any `limit` live rows of the selection answer it
+        // (see `exact_limit`). When the selection is one `OR` of whole terms
+        // and nothing else narrows it, each term's rows are all rows the
+        // selection keeps, so the terms are read one at a time until their
+        // union holds that many: a common term ends the read, and the rarer
+        // terms after it cost nothing.
+        if let Some(limit) = limit
+            && bound.is_none()
+            && check.ranges.is_empty()
+            && let Some(leaves) = check.whole_or_leaves()
+        {
+            let mut rows = RoaringBitmap::new();
+            let mut every_leaf_read = true;
+            for leaf in leaves {
+                let file_column = prepared
+                    .reader
+                    .column_alias(self.manifest.field_id(&leaf.column), &leaf.column);
+                let read = prepared
+                    .reader
+                    .term_rows(
+                        file_column,
+                        &[leaf.needle.as_str()],
+                        memos.get(&leaf.column).map(Arc::as_ref),
+                    )
+                    .await;
+                match read {
+                    Ok((mut leaf_rows, leaf_work)) => {
+                        work.merge(leaf_work);
+                        if let Some(leaf_rows) = leaf_rows.pop() {
+                            rows |= leaf_rows.proven;
+                        }
+                    }
+                    // No postings for the term's column here: the general
+                    // path below checks this superfile's rows by their text.
+                    Err(e) if holds_no_postings(&e) => {
+                        every_leaf_read = false;
+                        break;
+                    }
+                    Err(e) => return Err(QueryError::from(e).into()),
+                }
+                if rows.len().saturating_sub(rows.intersection_len(tombstones)) >= limit {
+                    return Ok((rows, work));
+                }
+            }
+            // Every term read and still short of the limit: the union is the
+            // whole selection.
+            if every_leaf_read {
+                return Ok((rows, work));
+            }
+        }
+        // Each column's distinct needles, in first-seen order: those an
+        // indexed term must contain (`ILIKE`), and those that must be an
+        // indexed term (`text_match`).
+        let mut by_column: BTreeMap<(&str, bool), Vec<&str>> = BTreeMap::new();
         for leaf in check.filter.leaves() {
-            let needles = by_column.entry(leaf.column.as_str()).or_default();
+            let needles = by_column
+                .entry((leaf.column.as_str(), leaf.whole))
+                .or_default();
             if !needles.contains(&leaf.needle.as_str()) {
                 needles.push(&leaf.needle);
             }
         }
         let budget = &self.manifest.options.connection_memory_budget;
-        let mut leaf_rows: HashMap<(&str, &str), ContainsRows> = HashMap::new();
-        for (column, needles) in by_column {
+        let mut leaf_rows: HashMap<(&str, &str, bool), ContainsRows> = HashMap::new();
+        for ((column, whole), needles) in by_column {
             // A superfile written before a rename keys its dictionary by
             // the column's old name.
             let file_column = prepared
                 .reader
                 .column_alias(self.manifest.field_id(column), column);
-            let (rows, column_work) = prepared
-                .reader
-                .contains_rows(file_column, &needles, Some(pool), Some(budget))
-                .await
-                .map_err(QueryError::from)?;
+            let read = if whole {
+                prepared
+                    .reader
+                    .term_rows(file_column, &needles, memos.get(column).map(Arc::as_ref))
+                    .await
+            } else {
+                prepared
+                    .reader
+                    .contains_rows(file_column, &needles, Some(pool), Some(budget))
+                    .await
+            };
+            let (rows, column_work) = match read {
+                Ok(read) => read,
+                // A `text_match` column this superfile holds no `standard`
+                // postings for (it was written before the column's index,
+                // or under another analyzer): every live row is doubtful,
+                // so each is checked against its text below.
+                Err(e) if whole && holds_no_postings(&e) => {
+                    let total: u64 = prepared.row_counts.iter().map(|&n| u64::from(n)).sum();
+                    let mut every = RoaringBitmap::new();
+                    every.insert_range(0..u32::try_from(total).unwrap_or(u32::MAX));
+                    every -= tombstones;
+                    let doubtful = ContainsRows {
+                        proven: RoaringBitmap::new(),
+                        doubtful: every,
+                    };
+                    (vec![doubtful; needles.len()], MatchWork::default())
+                }
+                Err(e) => return Err(QueryError::from(e).into()),
+            };
             // One result per needle, or the zip below would pair needles
             // with another needle's rows.
             if rows.len() != needles.len() {
@@ -882,16 +990,18 @@ impl SupertableProvider {
                 )));
             }
             work.merge(column_work);
-            leaf_rows.extend(needles.into_iter().map(|needle| (column, needle)).zip(rows));
+            leaf_rows.extend(
+                needles
+                    .into_iter()
+                    .map(|needle| (column, needle, whole))
+                    .zip(rows),
+            );
         }
         // Every leaf the tree reads has its rows; checked up front so the
         // lookup below cannot miss.
-        if let Some(leaf) = check
-            .filter
-            .leaves()
-            .into_iter()
-            .find(|leaf| !leaf_rows.contains_key(&(leaf.column.as_str(), leaf.needle.as_str())))
-        {
+        if let Some(leaf) = check.filter.leaves().into_iter().find(|leaf| {
+            !leaf_rows.contains_key(&(leaf.column.as_str(), leaf.needle.as_str(), leaf.whole))
+        }) {
             return Err(DataFusionError::Internal(format!(
                 "exact rows of column {:?}: no result for needle {:?}",
                 leaf.column, leaf.needle
@@ -899,10 +1009,36 @@ impl SupertableProvider {
         }
         let mut rows = check.filter.rows(&|leaf| {
             leaf_rows
-                .get(&(leaf.column.as_str(), leaf.needle.as_str()))
+                .get(&(leaf.column.as_str(), leaf.needle.as_str(), leaf.whole))
                 .cloned()
                 .unwrap_or_default()
         });
+        // The range conjuncts, from the range index: its rows are exactly
+        // the interval's. A superfile without the index has its rows
+        // checked against their values instead, with the rest below.
+        for (field, data_type, lo, hi) in &check.ranges {
+            if lo > hi {
+                // An empty interval holds no row.
+                rows.proven = RoaringBitmap::new();
+                rows.doubtful = RoaringBitmap::new();
+                continue;
+            }
+            match prepared
+                .reader
+                .range_rows(*field, data_type, *lo, *hi, Some(pool))
+                .await
+                .map_err(QueryError::from)?
+            {
+                Some(in_range) => {
+                    rows.proven &= &in_range;
+                    rows.doubtful &= &in_range;
+                }
+                None => {
+                    rows.doubtful |= &rows.proven;
+                    rows.proven = RoaringBitmap::new();
+                }
+            }
+        }
         if let Some(bound) = bound {
             rows.proven &= bound;
             rows.doubtful &= bound;
@@ -1712,12 +1848,29 @@ fn spans_full_domain(min: &ScalarValue, max: &ScalarValue) -> bool {
         && max.distance(min).map(|d| d as u64) == Some(FULL_DOMAIN_ENDPOINT_DISTANCE)
 }
 
+/// Whether `e` says a superfile has no `standard` postings for a column:
+/// no FTS section at all, no index on the column, or one under another
+/// analyzer.
+fn holds_no_postings(e: &ReadError) -> bool {
+    match e {
+        ReadError::MissingKv(_) => true,
+        ReadError::Fts(f) => matches!(
+            f.as_ref(),
+            FtsError::UnknownColumn(_) | FtsError::ExactNeedsStandard { .. }
+        ),
+        _ => false,
+    }
+}
+
 /// A scan's exact conjuncts ([`SupertableProvider::exact_filter`]),
 /// compiled once per scan together with the check their doubtful rows get.
 struct ExactCheck {
     /// The conjunction as the dictionary answers it: an `AND` of the
     /// conjuncts.
     filter: ExactFilter,
+    /// The conjuncts the range index answers, beside the dictionary's:
+    /// each an interval of keys on a range-indexed column.
+    ranges: Vec<(FieldId, DataType, u64, u64)>,
     /// The conjunction, bound to the columns it reads.
     predicate: BoundPredicate,
     /// Those columns' names, in the bound schema's order.
@@ -1733,6 +1886,7 @@ impl ExactCheck {
     fn compile(
         filters: &[Expr],
         conjuncts: Vec<ExactFilter>,
+        ranges: Vec<(FieldId, DataType, u64, u64)>,
         schema: &SchemaRef,
     ) -> DfResult<Option<Self>> {
         if conjuncts.is_empty() {
@@ -1755,12 +1909,64 @@ impl ExactCheck {
             .iter()
             .map(|field| field.name().clone())
             .collect();
+        // Conjuncts on one column are one interval (`ts >= a AND ts < b`):
+        // each alone is half the key space, read whole from the index.
+        let mut merged: Vec<(FieldId, DataType, u64, u64)> = Vec::new();
+        for (field, data_type, lo, hi) in ranges {
+            match merged.iter_mut().find(|(f, _, _, _)| *f == field) {
+                Some((_, _, l, h)) => {
+                    *l = (*l).max(lo);
+                    *h = (*h).min(hi);
+                }
+                None => merged.push((field, data_type, lo, hi)),
+            }
+        }
         Ok(Some(Self {
             filter: ExactFilter::And(conjuncts),
+            ranges: merged,
             predicate,
             columns,
             schema: bound_schema,
         }))
+    }
+
+    /// The whole-term leaves of a conjunction that is one `OR` of them (or
+    /// a single one), in order; `None` for any other shape.
+    fn whole_or_leaves(&self) -> Option<Vec<&crate::supertable::query::candidate::ExactContains>> {
+        let ExactFilter::And(conjuncts) = &self.filter else {
+            return None;
+        };
+        let [only] = conjuncts.as_slice() else {
+            return None;
+        };
+        let leaves = match only {
+            ExactFilter::Contains(leaf) => vec![leaf],
+            ExactFilter::Or(children) => children
+                .iter()
+                .map(|child| match child {
+                    ExactFilter::Contains(leaf) => Some(leaf),
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>()?,
+            ExactFilter::And(_) => return None,
+        };
+        leaves.iter().all(|leaf| leaf.whole).then_some(leaves)
+    }
+
+    /// Each column's distinct whole-term needles (a `text_match`'s tokens),
+    /// for the term index to locate before the scan.
+    fn whole_terms(&self) -> Vec<(String, Vec<String>)> {
+        let mut out: Vec<(String, Vec<String>)> = Vec::new();
+        for leaf in self.filter.leaves().into_iter().filter(|leaf| leaf.whole) {
+            match out.iter_mut().find(|(column, _)| *column == leaf.column) {
+                Some((_, terms)) if !terms.contains(&leaf.needle) => {
+                    terms.push(leaf.needle.clone())
+                }
+                Some(_) => {}
+                None => out.push((leaf.column.clone(), vec![leaf.needle.clone()])),
+            }
+        }
+        out
     }
 
     /// Of `rows` in `reader`'s superfile, the ones the conjunction holds
@@ -1905,11 +2111,17 @@ impl TableProvider for SupertableProvider {
             return Ok(vec![TableProviderFilterPushDown::Exact; filters.len()]);
         }
         let fts_cols = self.fts_cols_set();
-        Ok(filters
+        let text: Vec<bool> = filters
             .iter()
-            .map(|filter| match self.exact_filter(filter, &fts_cols) {
-                Some(_) => TableProviderFilterPushDown::Exact,
-                None => TableProviderFilterPushDown::Inexact,
+            .map(|filter| self.exact_filter(filter, &fts_cols).is_some())
+            .collect();
+        let ranges = self.exact_ranges(filters.iter().copied(), text.contains(&true));
+        Ok(text
+            .iter()
+            .zip(ranges)
+            .map(|(&text, range)| match text || range.is_some() {
+                true => TableProviderFilterPushDown::Exact,
+                false => TableProviderFilterPushDown::Inexact,
             })
             .collect())
     }
@@ -2020,17 +2232,37 @@ impl TableProvider for SupertableProvider {
         let mut exact_filters: Vec<Expr> = Vec::new();
         let mut exact_conjuncts: Vec<ExactFilter> = Vec::new();
         let mut bounded_filters: Vec<Expr> = Vec::new();
-        for filter in filters {
-            match self.exact_filter(filter, &fts_cols) {
-                Some(exact) => {
+        let text: Vec<Option<ExactFilter>> = filters
+            .iter()
+            .map(|filter| self.exact_filter(filter, &fts_cols))
+            .collect();
+        let ranges = self.exact_ranges(filters.iter(), text.iter().any(Option::is_some));
+        let mut exact_ranges = Vec::new();
+        for ((filter, text), range) in filters.iter().zip(text).zip(ranges) {
+            match (text, range) {
+                (Some(exact), _) => {
                     exact_filters.push(filter.clone());
                     exact_conjuncts.push(exact);
                 }
-                None => bounded_filters.push(filter.clone()),
+                (None, Some(range)) => {
+                    exact_filters.push(filter.clone());
+                    exact_ranges.push(range);
+                }
+                (None, None) => bounded_filters.push(filter.clone()),
             }
         }
-        let exact_check = ExactCheck::compile(&exact_filters, exact_conjuncts, &self.schema)?;
+        let exact_check =
+            ExactCheck::compile(&exact_filters, exact_conjuncts, exact_ranges, &self.schema)?;
         let exact_check = exact_check.as_ref();
+        // With every conjunct answered exactly, DataFusion keeps no filter
+        // above the scan, so its LIMIT is the scan's: any `limit` live rows
+        // of the selection answer it. Each superfile then selects at most
+        // that many, and a wide column is decoded for those rows alone
+        // rather than for every row the conjuncts keep.
+        let exact_limit = match (exact_check, limit) {
+            (Some(_), Some(limit)) if bounded_filters.is_empty() => Some(limit as u64),
+            _ => None,
+        };
         let batch_size = state.config().batch_size();
 
         // Pass 1 — build the index candidate plan once for this scan. It
@@ -2055,6 +2287,19 @@ impl TableProvider for SupertableProvider {
         let plan_locations =
             Arc::new(plan_locations_for(&self.manifest, &candidate_plan, &survivor_entries).await?);
         let plan_locations = &plan_locations;
+        // The same for the exact conjuncts' whole terms (`text_match`): each
+        // superfile then reads a term's postings from where the index says
+        // they are, rather than through its dictionary.
+        let mut exact_locations = PlanLocations::new();
+        if let Some(check) = exact_check {
+            for (column, terms) in check.whole_terms() {
+                let refs: Vec<&str> = terms.iter().map(String::as_str).collect();
+                let located =
+                    index_locations_for(&self.manifest, &column, &refs, &survivor_entries).await?;
+                exact_locations.insert(column, located);
+            }
+        }
+        let exact_locations = &exact_locations;
 
         // Open every survivor, at most `superfiles_in_flight` at once, so a
         // scan over thousands of files does not hold thousands of opens'
@@ -2283,18 +2528,32 @@ impl TableProvider for SupertableProvider {
                                 let _slot = exact_slots.acquire().await.map_err(|e| {
                                     DataFusionError::Internal(format!("exact rows slot: {e}"))
                                 })?;
+                                let memos = memos_from_plan_locations(
+                                    prepared.reader.as_ref(),
+                                    exact_locations,
+                                    entry.superfile_id,
+                                )
+                                .await;
                                 let (rows, exact_work) = self
                                     .exact_rows(
                                         &prepared,
                                         check,
+                                        &memos,
                                         candidates.as_ref(),
                                         pushdown_rows(prepared.reader.n_docs()),
                                         &tombstones,
                                         batch_size,
+                                        exact_limit,
                                     )
                                     .await?;
                                 predicate_work.merge(exact_work);
-                                Some(rows)
+                                Some(match exact_limit {
+                                    Some(limit) => {
+                                        let live = rows - tombstones.as_ref();
+                                        live.iter().take(limit as usize).collect()
+                                    }
+                                    None => rows,
+                                })
                             }
                             None => candidates,
                         };

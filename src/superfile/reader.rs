@@ -2709,6 +2709,21 @@ impl SuperfileReader {
         Ok(fts.contains_rows(column, needles, pool, budget).await?)
     }
 
+    /// For each of `terms`, the rows of `column` that hold the term as one
+    /// of their tokens, from the postings alone: every row proven, none
+    /// doubtful. Delegates to [`FtsReader::term_rows`].
+    pub(crate) async fn term_rows(
+        &self,
+        column: &str,
+        terms: &[&str],
+        prefetched: Option<&FetchedTermMemo>,
+    ) -> Result<(Vec<ContainsRows>, MatchWork), ReadError> {
+        let fts = self
+            .fts()
+            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
+        Ok(fts.term_rows(column, terms, prefetched).await?)
+    }
+
     /// Unranked token-match **count**: the number of `local_doc_id`s
     /// [`token_match`](Self::token_match) would return under `mode`,
     /// without materializing the id `Vec`. Delegates to

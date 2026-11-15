@@ -257,6 +257,9 @@ enum IndexedColumns {
 /// Register the catalog search TVFs (table-name-first form) on `ctx`,
 /// resolving tables through `conn`.
 pub(crate) fn register_search_tvfs(ctx: &SessionContext, conn: Connection) {
+    // `text_match`, the token match as a WHERE predicate, beside the
+    // table functions it stands in for.
+    crate::supertable::query::text_match::register_text_match(ctx);
     let resolver = Arc::new(TableResolver::new(conn));
     ctx.register_udtf(
         BM25_SEARCH_UDTF,
