@@ -46,6 +46,7 @@ use datafusion::{
 use crate::{
     memory::ConnectionMemoryBudget,
     supertable::query::{
+        id_order::IdOrderUnderTopK,
         join_build_size::RightSizeJoinBuild,
         limit_stage::StageLimitGathers,
         read_ahead_rule::ReadAheadOff,
@@ -169,6 +170,9 @@ pub(crate) fn budgeted_session_context(
     // DataFusion's rules, with ours at both ends:
     //  - `RowFilterUnderTopK` first, so DataFusion's filter pushdown sees the
     //    marked scans and drops their `FilterExec`.
+    //  - `IdOrderUnderTopK` next, on the scans `RowFilterUnderTopK` left as
+    //    scans of kept columns, so the filter pushdown that hands a top-k's
+    //    bound to the scan finds it already reading in id order.
     //  - `OrderUnderScalarSubquery` before DataFusion's `OutputRequirements`,
     //    which on DataFusion 54 loses the `ORDER BY` of a query under a
     //    `ScalarSubqueryExec` root.
@@ -189,7 +193,8 @@ pub(crate) fn budgeted_session_context(
     //    read-ahead off for scans a `LIMIT` can stop early.
     let mut rules = PhysicalOptimizer::new().rules;
     rules.insert(0, Arc::new(RowFilterUnderTopK));
-    rules.insert(1, Arc::new(OrderUnderScalarSubquery));
+    rules.insert(1, Arc::new(IdOrderUnderTopK));
+    rules.insert(2, Arc::new(OrderUnderScalarSubquery));
     rules.push(Arc::new(RightSizeJoinBuild));
     rules.push(Arc::new(KeepSortedRoot));
     rules.push(Arc::new(StageLimitGathers));
