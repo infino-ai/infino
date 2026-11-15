@@ -2037,9 +2037,13 @@ impl OrCursorSet {
     }
 
     /// The summed document counts of the set's terms: an upper bound on
-    /// the rows the union matches.
+    /// the rows the union matches. The sum saturates: a count comes from
+    /// the index's stored entry, and a corrupt one must not wrap the bound.
     pub(crate) fn df_sum(&self) -> u64 {
-        self.cursors.iter().map(|c| c.df).sum()
+        self.cursors
+            .iter()
+            .map(|c| c.df)
+            .fold(0u64, u64::saturating_add)
     }
 }
 
