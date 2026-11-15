@@ -52,7 +52,7 @@ use datafusion::{
     execution::TaskContext,
     physical_expr::{
         EquivalenceProperties, PhysicalExpr, PhysicalSortExpr,
-        expressions::{Column, DynamicFilterPhysicalExpr},
+        expressions::{Column, DynamicFilterPhysicalExpr, Literal},
     },
     physical_expr_adapter::PhysicalExprAdapterFactory,
     physical_expr_common::physical_expr::snapshot_physical_expr,
@@ -190,8 +190,11 @@ pub(crate) struct CachedScanExec {
 /// Filters pushed down from above that tighten as the statement runs, such
 /// as a top-k's bound on its sort key (the k-th best value so far). Each is
 /// checked against a row group's statistics just before the row group is
-/// read, and a row group that can no longer reach the result is skipped.
-/// The scan only skips by them; the rows it reads are still checked above.
+/// read, and a row group that can no longer reach the result is skipped;
+/// then against each batch the scan hands over, and the rows it rules out
+/// are dropped before the filter above checks them. A row a top-k's bound
+/// rules out can't reach its result, so dropping it changes no answer; the
+/// rows that pass are still checked above.
 #[derive(Debug)]
 struct LiveFilters {
     filters: Vec<Arc<dyn PhysicalExpr>>,
@@ -200,6 +203,30 @@ struct LiveFilters {
 }
 
 impl LiveFilters {
+    /// `batch` without the rows the filters as they stand rule out. A filter
+    /// that rules nothing out yet (a top-k's before its first `k` rows) is
+    /// not evaluated.
+    fn keep(&self, mut batch: RecordBatch) -> DfResult<RecordBatch> {
+        for filter in &self.filters {
+            let now = snapshot_physical_expr(Arc::clone(filter))?;
+            if now
+                .downcast_ref::<Literal>()
+                .is_some_and(|literal| literal.value() == &ScalarValue::Boolean(Some(true)))
+            {
+                continue;
+            }
+            let mask = now.evaluate(&batch)?.into_array(batch.num_rows())?;
+            let mask = mask
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| {
+                    DataFusionError::Internal("a live filter is not boolean".to_owned())
+                })?;
+            batch = filter_record_batch(&batch, mask)?;
+        }
+        Ok(batch)
+    }
+
     /// Whether the filters as they stand rule `unit` out by its statistics.
     fn skip(&self, unit: &RowGroupUnit, table: &SchemaRef) -> bool {
         self.filters.iter().any(|filter| {
@@ -699,6 +726,7 @@ impl ExecutionPlan for CachedScanExec {
             .collect();
         let context = Arc::clone(&self.context);
         let live = self.live.clone();
+        let kept = self.live.clone();
         let context_schema = Arc::clone(&self.context.schema);
         // A row group goes out in batch-size slices, as the Parquet scan's
         // rows do: the filter above then works a batch at a time, and a
@@ -719,6 +747,14 @@ impl ExecutionPlan for CachedScanExec {
             })
             .map_ok(move |batch| stream::iter(sliced(batch, batch_size).into_iter().map(Ok)))
             .try_flatten()
+            // Each slice as it goes out, so a bound the rows before it
+            // tightened drops what can no longer reach the result.
+            .and_then(move |batch| {
+                future::ready(match &kept {
+                    Some(live) => live.keep(batch),
+                    None => Ok(batch),
+                })
+            })
             .try_filter(|batch| future::ready(batch.num_rows() > 0))
             // A partition stops once it has the scan's fetch: the limit above
             // takes at most that many rows from any one of them.
