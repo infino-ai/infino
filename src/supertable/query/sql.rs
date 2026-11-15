@@ -102,6 +102,7 @@ use crate::{
             covered_agg::{
                 CoveredAggregateRewrite, prepare_aggregate_inputs, value_counts_from_statistics,
             },
+            empty_sort_keys::EmptySortKeys,
             exec::{
                 common::{collect_plan_metered, run_within_process_limit},
                 fts_exec::register_bm25,
@@ -258,6 +259,7 @@ pub(crate) fn sql_session_context(
     ctx.add_optimizer_rule(Arc::new(CoveredAggregateRewrite::default()));
     ctx.add_optimizer_rule(Arc::new(RangeTopK));
     ctx.add_optimizer_rule(Arc::new(MatchTopK));
+    ctx.add_optimizer_rule(Arc::new(EmptySortKeys));
     Ok(ctx)
 }
 

@@ -25,6 +25,7 @@ pub mod covered_agg;
 pub(crate) mod deleted_stats;
 pub mod df_object_store;
 pub mod dispatch;
+pub(crate) mod empty_sort_keys;
 pub mod exec;
 pub(crate) mod fine_graph_cache;
 pub mod fts;
