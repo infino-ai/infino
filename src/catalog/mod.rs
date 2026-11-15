@@ -1342,6 +1342,8 @@ impl Connection {
 
         let mut seen = HashSet::new();
         let mut handles: Vec<SupertableHandle> = Vec::new();
+        // Read on the caller's thread, where the scope installed it.
+        let read_stats = op_stats::current();
         for r in &refs {
             let name = r.table().to_string();
             if !seen.insert(name.clone()) {
@@ -1351,6 +1353,12 @@ impl Connection {
                 .open_and_register_cancellable(&ctx, &name, cancel)
                 .map_err(|e| e.with_context("query_sql", None))?
             {
+                // A relation the statement names and the catalog holds:
+                // a table it reads. The introspection registration below
+                // only describes the catalog, so it is not counted.
+                if let Some(stats) = &read_stats {
+                    stats.add_table_read();
+                }
                 handles.push(table);
             }
         }

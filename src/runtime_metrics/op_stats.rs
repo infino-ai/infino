@@ -198,6 +198,15 @@ pub struct OpStats {
     /// remap/tombstone-internal id reads count planned ranges only, never
     /// rows.
     pub rows_materialized: u64,
+    /// Catalog tables a SQL statement opened to read from: each table it
+    /// names as a relation, plus each table a search or graph function in
+    /// it resolves. Zero means the statement read no table (`SELECT 1`,
+    /// or a name that is not a table), and catalog introspection does not
+    /// count: the tables `information_schema` or `SHOW TABLES` registers to
+    /// describe the catalog are not read. A table named both as a relation
+    /// and inside a function counts once per path. Search entry points
+    /// outside SQL always read their one table and do not report it here.
+    pub tables_read: u64,
     /// Nanoseconds of the query's bracketed synchronous kernel sections.
     /// One clock everywhere: the thread-CPU clock (schedstat). Engine
     /// kernels bracket their own sections; SQL scans are bracketed per
@@ -305,6 +314,7 @@ pub(crate) struct OpStatsCollector {
     presence_pruning_survived: AtomicU64,
     sql_page_bytes: AtomicU64,
     rows_materialized: AtomicU64,
+    tables_read: AtomicU64,
     kernel_cpu_ns: AtomicU64,
     rows_written: AtomicU64,
     scalar_bytes_written: AtomicU64,
@@ -383,6 +393,11 @@ impl OpStatsCollector {
     /// Flush one resolve wave's decoded row count.
     pub(crate) fn add_rows_materialized(&self, rows: u64) {
         self.rows_materialized.fetch_add(rows, Ordering::Relaxed);
+    }
+
+    /// Count one catalog table a SQL statement opened to read from.
+    pub(crate) fn add_table_read(&self) {
+        self.tables_read.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Flush one bracketed kernel section's on-CPU nanoseconds.
@@ -464,6 +479,7 @@ impl OpStatsCollector {
             score_pruning_survived: self.score_pruning_survived.load(Ordering::Relaxed),
             sql_page_bytes: self.sql_page_bytes.load(Ordering::Relaxed),
             rows_materialized: self.rows_materialized.load(Ordering::Relaxed),
+            tables_read: self.tables_read.load(Ordering::Relaxed),
             kernel_cpu_ns: self.kernel_cpu_ns.load(Ordering::Relaxed),
             rows_written: self.rows_written.load(Ordering::Relaxed),
             scalar_bytes_written: self.scalar_bytes_written.load(Ordering::Relaxed),

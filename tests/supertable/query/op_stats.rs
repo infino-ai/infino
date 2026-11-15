@@ -1894,3 +1894,83 @@ fn ids_and_titles(batches: &[RecordBatch]) -> (Vec<i128>, Vec<String>) {
     }
     (ids, titles)
 }
+
+// ---- SQL: the tables a statement read ----
+
+/// One scoped SQL statement's `tables_read`, whether or not it returns rows.
+fn tables_read(db: &Connection, sql: &str) -> u64 {
+    let (_, stats) = with_op_stats(|| db.query_sql(sql).expect("query_sql"));
+    stats.tables_read
+}
+
+#[test]
+fn a_statement_that_names_no_table_reads_none() {
+    let dir = TempDir::new().expect("tempdir");
+    let db = sql_fixture(&dir);
+    assert_eq!(tables_read(&db, "SELECT 1"), 0);
+    assert_eq!(
+        tables_read(&db, "WITH t AS (SELECT 1 AS x) SELECT x FROM t"),
+        0,
+        "a CTE is not a catalog table"
+    );
+}
+
+#[test]
+fn describing_the_catalog_reads_no_table() {
+    let dir = TempDir::new().expect("tempdir");
+    let db = sql_fixture(&dir);
+    assert_eq!(
+        tables_read(&db, "SELECT table_name FROM information_schema.tables"),
+        0,
+        "introspection registers every table but reads none"
+    );
+    assert_eq!(tables_read(&db, "SHOW TABLES"), 0);
+}
+
+#[test]
+fn a_relation_counts_once_per_table() {
+    let dir = TempDir::new().expect("tempdir");
+    let db = sql_fixture(&dir);
+    assert_eq!(tables_read(&db, "SELECT title FROM docs"), 1);
+    assert_eq!(
+        tables_read(
+            &db,
+            "SELECT a.title FROM docs a JOIN docs b ON a.rating = b.rating"
+        ),
+        1,
+        "a self-join reads one table"
+    );
+}
+
+#[test]
+fn a_join_counts_each_table() {
+    let dir = TempDir::new().expect("tempdir");
+    let db = sql_fixture(&dir);
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "rating",
+        DataType::Int64,
+        false,
+    )]));
+    db.create_table("ratings", schema, IndexSpec::new())
+        .expect("create_table");
+    assert_eq!(
+        tables_read(
+            &db,
+            "SELECT d.title FROM docs d JOIN ratings r ON d.rating = r.rating"
+        ),
+        2
+    );
+}
+
+#[test]
+fn a_search_function_counts_its_table() {
+    let dir = TempDir::new().expect("tempdir");
+    let db = sql_fixture(&dir);
+    assert_eq!(
+        tables_read(
+            &db,
+            "SELECT _id, score FROM bm25_search('docs', 'title', 'rust', 10)"
+        ),
+        1
+    );
+}
