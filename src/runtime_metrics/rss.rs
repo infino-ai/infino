@@ -470,10 +470,18 @@ pub fn fmt_bytes(b: u64) -> String {
 #[cfg(test)]
 mod tests {
     use std::hint::black_box;
+    #[cfg(all(not(miri), feature = "mimalloc"))]
+    use std::ptr;
 
+    #[cfg(all(not(miri), feature = "mimalloc"))]
+    use libmimalloc_sys::mi_reserve_os_memory_ex;
     use tempfile::TempDir;
 
     use super::*;
+
+    /// The arena size mimalloc asks for once the heap passes about 120 GiB.
+    #[cfg(all(not(miri), feature = "mimalloc"))]
+    const LARGEST_ARENA_BYTES: usize = 16 << 30;
 
     const TEST_SAMPLER_INTERVAL_MS: u64 = 1_000;
     const TEST_ALLOC_SIZE_BYTES: usize = 32 * 1024 * 1024;
@@ -690,5 +698,20 @@ mod tests {
         let slice = root.join("system.slice");
         let levels: Vec<&Path> = cgroup_levels(root, &leaf).collect();
         assert_eq!(levels, [leaf.as_path(), slice.as_path(), root]);
+    }
+
+    #[cfg(all(not(miri), feature = "mimalloc"))]
+    #[test]
+    fn the_allocator_takes_a_16_gib_arena() {
+        // Reserve address space for one 16 GiB arena of its own, nothing committed:
+        //  - unpatched mimalloc 3.3.2 refuses it, and past 120 GiB of heap falls back to one
+        //    mapping per 64 KiB until the process aborts at the kernel's mapping limit
+        //  - the patched crate that `[patch.crates-io]` in `Cargo.toml` builds takes it
+        // This test pins that the build links the patched crate, not the crates.io one.
+        let mut arena = ptr::null_mut();
+        // SAFETY: mimalloc reserves fresh address space and writes the new arena's id to `arena`.
+        let status =
+            unsafe { mi_reserve_os_memory_ex(LARGEST_ARENA_BYTES, false, false, true, &mut arena) };
+        assert_eq!(status, 0);
     }
 }
