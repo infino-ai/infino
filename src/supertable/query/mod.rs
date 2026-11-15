@@ -30,6 +30,7 @@ pub(crate) mod fine_graph_cache;
 pub mod fts;
 #[cfg(feature = "graph-index")]
 pub mod graph;
+pub(crate) mod head;
 pub mod hierarchical_iter;
 pub(crate) mod join_build_size;
 pub(crate) mod limit_stage;
