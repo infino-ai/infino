@@ -140,7 +140,8 @@ bytemuck = { version = "1", features = ["min_const_generics"] }
 mimalloc = { version = "0.1", default-features = false, optional = true }
 # Exposes `mi_collect` so RSS sampling can purge retained arenas. Only
 # linked when the mimalloc feature (and thus the global allocator) is on.
-libmimalloc-sys = { version = "0.1", features = ["extended"], optional = true }
+# `arena` exposes `mi_reserve_os_memory_ex`, which a test uses to check the 16 GiB arena fix.
+libmimalloc-sys = { version = "0.1", features = ["extended", "arena"], optional = true }
 bumpalo = { version = "3", features = ["collections"] }
 rustc-hash = "2"
 # Safe `clock_gettime` wrapper, for the per-thread CPU clock the per-op
@@ -492,3 +493,8 @@ required-features = ["test-helpers"]
 [[example]]
 name = "locomo-recall"
 path = "examples/locomo-recall/main.rs"
+
+# `libmimalloc-sys` 0.1.49 bundles mimalloc 3.3.2, which aborts a process past 120 GiB of heap. This
+# is the same crate plus mimalloc's own fix; drop it once a release bundles mimalloc 3.4.0 or later.
+[patch.crates-io]
+libmimalloc-sys = { git = "https://github.com/infino-ai/libmimalloc-sys", rev = "25a9fc5de321105cd48501374bfc6021a4ddc100" }
