@@ -49,10 +49,11 @@ export type SchemaDescriptor = Record<string, string | { vector: number }>;
 /** Accepted shapes for `Table.append`. */
 export type AppendData = RowRecord[] | arrow.Table | arrow.RecordBatch | Buffer | Uint8Array;
 
-/** A column's index in the schema document: full-text or vector. */
+/** A column's index in the schema document: full-text, vector, or range. */
 export type ColumnIndex =
   | { kind: "fts"; analyzer: string; stopwords?: string; stemmer?: string; positions: boolean; stored: boolean; k1: number; b: number }
-  | { kind: "vector"; metric: Metric; rot_seed: string; rerank_codec: string };
+  | { kind: "vector"; metric: Metric; rot_seed: string; rerank_codec: string }
+  | { kind: "range" };
 /** One field of the schema document. `type` is the document's type vocabulary (`"i64"`, `"large_utf8"`, …); a vector column carries `dim`. */
 export interface SchemaField {
   id: number;
