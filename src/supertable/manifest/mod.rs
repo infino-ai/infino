@@ -1026,25 +1026,19 @@ impl ManifestSnapshot {
         let (list, other_list) = (self.list.as_ref()?, other.list.as_ref()?);
         let other_parts: FxHashSet<PartId> =
             other_list.parts.iter().map(|entry| entry.part_id).collect();
-        // Only a flat view as long as the parts it stands in for: one hydrated from a blob is
-        // taken complete without that check.
-        let total: u64 = list.parts.iter().map(|entry| entry.n_superfiles).sum();
-        let flat = self
-            .complete_flat_superfiles()
-            .filter(|flat| flat.len() as u64 == total);
+        // Only built if a dropped part is not in memory.
+        let mut runs = None;
         let mut uris = Vec::new();
-        let mut end: usize = 0;
-        for entry in &list.parts {
-            let start = end;
-            end = end.checked_add(usize::try_from(entry.n_superfiles).ok()?)?;
+        for (i, entry) in list.parts.iter().enumerate() {
             if other_parts.contains(&entry.part_id) {
                 continue;
             }
-            // The flat view keeps part order (see `parts_holding`), so a part's superfiles are its
-            // slice of it.
             match self.get_cached_part_by_id(&entry.part_id) {
                 Some(part) => uris.extend(part.superfiles.iter().map(|s| s.uri)),
-                None => uris.extend(flat?.get(start..end)?.iter().map(|s| s.uri)),
+                None => {
+                    let runs = runs.get_or_insert_with(|| self.flat_runs()).as_ref()?;
+                    uris.extend(runs.get(i)?.1.iter().map(|s| s.uri));
+                }
             }
         }
         Some(uris)
@@ -2575,24 +2569,32 @@ impl ManifestSnapshot {
             .find(|id| ids.contains(id))
     }
 
-    /// The parts that hold any of `ids`, found without loading a part. A
-    /// complete flat view lists every part's superfiles in list order, so
-    /// each run of `n_superfiles` entries is one part. `None` when the flat
-    /// view is incomplete, as on a lazily loaded manifest.
+    /// The parts that hold any of `ids`, found without loading a part. `None` when the flat view
+    /// is incomplete, as on a lazily loaded manifest.
     fn parts_holding(&self, ids: &HashSet<Uuid>) -> Option<HashSet<PartId>> {
+        Some(
+            self.flat_runs()?
+                .into_iter()
+                .filter(|(_, run)| run.iter().any(|entry| ids.contains(&entry.superfile_id)))
+                .map(|(part, _)| part.part_id)
+                .collect(),
+        )
+    }
+
+    /// Each part of the list, in list order, with its superfiles read from the complete flat view:
+    /// the flat view keeps part order, so each run of `n_superfiles` entries is one part. `None`
+    /// when the flat view is incomplete or not exactly as long as the parts (one hydrated from a
+    /// blob is taken as complete without that check).
+    fn flat_runs(&self) -> Option<Vec<(&ManifestPartEntry, &[Arc<SuperfileEntry>])>> {
         let mut rest = self.complete_flat_superfiles()?;
-        let mut holding = HashSet::new();
-        for part in self.get_all_list_entries() {
-            let (in_part, after) = rest.split_at_checked(part.n_superfiles as usize)?;
-            if in_part
-                .iter()
-                .any(|entry| ids.contains(&entry.superfile_id))
-            {
-                holding.insert(part.part_id);
-            }
+        let parts = self.get_all_list_entries();
+        let mut runs = Vec::with_capacity(parts.len());
+        for part in parts {
+            let (run, after) = rest.split_at_checked(usize::try_from(part.n_superfiles).ok()?)?;
+            runs.push((part, run));
             rest = after;
         }
-        Some(holding)
+        rest.is_empty().then_some(runs)
     }
 
     async fn update_inner(
@@ -12985,6 +12987,29 @@ mod tests {
             newer.superfiles_dropped_since(&older),
             vec![SuperfileUri(compacted)]
         );
+    }
+
+    #[test]
+    fn a_flat_view_longer_than_the_parts_marks_no_live_file_dead() {
+        // An older snapshot whose flat view, hydrated from a blob, holds one more superfile than
+        // its parts, with no part in memory:
+        //  - cut into runs by part length, part 2 would read `kept` and `carried`;
+        //  - `kept` is still live in the newer snapshot, so it would be reported dropped.
+        // This test pins that such a flat view places no part, so nothing is reported dropped.
+        let [extra, kept, carried, compacted, output] = [(); 5].map(|()| Uuid::new_v4());
+        let mut older =
+            snapshot_of_parts(&[(1, &[kept], false), (2, &[carried, compacted], false)]);
+        older.superfile_list.superfiles = [extra, kept, carried, compacted]
+            .iter()
+            .map(|uuid| seg_entry(*uuid, 4))
+            .collect();
+        older
+            .list
+            .as_mut()
+            .expect("a part list")
+            .slow_vector_state_uri = Some("state.bin".into());
+        let newer = snapshot_of_parts(&[(1, &[kept], true), (3, &[carried, output], true)]);
+        assert!(newer.superfiles_dropped_since(&older).is_empty());
     }
 
     /// `ManifestSnapshot::new` with no storage/list takes the in-process-only

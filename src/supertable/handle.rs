@@ -9736,9 +9736,8 @@ mod tests {
             .optimize(&OptimizeOptions::compact(compaction_test_settings()))
             .expect("compact every superfile into one");
         assert!(bridge_sync_to_async(consumer.refresh()).expect("refresh"));
-        let dead = cache.dead_files();
         assert!(
-            replaced.iter().all(|uri| dead.contains(uri)),
+            replaced.iter().all(|uri| cache.is_dead(uri)),
             "each cached superfile the compaction replaced"
         );
     }

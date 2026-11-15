@@ -20,7 +20,7 @@ use std::{
     time::{Duration, Instant, UNIX_EPOCH},
 };
 
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use memmap2::Mmap;
 use thiserror::Error;
 use tokio::sync::{Notify, OnceCell, Semaphore};
@@ -87,6 +87,9 @@ const TMP_RECLAIM_AGE: Duration = Duration::from_secs(15 * 60);
 /// file whose download keeps failing (its GETs fail, its bytes fail the check, the budget cannot
 /// hold it) is downloaded again, whole, by every read.
 const FAILED_FILL_RETRY_AFTER: Duration = Duration::from_secs(60);
+
+/// Dead-set size below which a mark never prunes it ([`DiskCacheStore::mark_dead`]).
+pub(super) const DEAD_PRUNE_MIN: usize = 1024;
 
 /// Numbers each download's tempfile across every store in this process, see
 /// [`DiskCacheStore::tmp_path`].
@@ -516,9 +519,11 @@ pub struct DiskCacheStore {
     block_files: DashMap<SuperfileUri, BlockFileRecord>,
     /// Files on disk here that the table's newest manifest no longer lists ([`Self::mark_dead`]).
     /// Kept by URI, so a file stays dead whatever form it takes next (entry, block file, copy).
-    /// A leaf lock: never taken while a guard of one of the maps above is held, and no map is read
-    /// while it is held, so it takes no part in a lock cycle with them.
-    dead: Mutex<Arc<HashSet<SuperfileUri>>>,
+    /// No map is read while one of its guards is held, so it joins no lock cycle with the maps.
+    dead: DashSet<SuperfileUri>,
+    /// Dead-set size past which the next mark forgets the files no longer on disk; see
+    /// [`Self::mark_dead`].
+    dead_prune_at: AtomicUsize,
     current_bytes: AtomicU64,
     /// Bytes of fetched runs handed to the block-file writers and not written yet. Past
     /// [`WRITE_BEHIND_CAP_BYTES`] a read's run is not cached, so a slow disk limits memory, not
@@ -668,7 +673,8 @@ impl DiskCacheStore {
             coordinators: DashMap::new(),
             unindexed: DashMap::new(),
             block_files: DashMap::new(),
-            dead: Mutex::new(Arc::default()),
+            dead: DashSet::new(),
+            dead_prune_at: AtomicUsize::new(DEAD_PRUNE_MIN),
             current_bytes: AtomicU64::new(0),
             write_behind_bytes: AtomicU64::new(0),
             ahead_bytes: AtomicU64::new(0),

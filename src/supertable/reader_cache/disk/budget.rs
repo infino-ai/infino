@@ -329,13 +329,13 @@ impl DiskCacheStore {
         }
 
         // Dead copies first, then oldest first. Keyed once per file, not once per comparison.
-        let dead = self.dead_files();
+        let any_dead = !self.dead.is_empty();
         let mut candidates: Vec<((bool, u64), SuperfileUri, u64)> = self
             .unindexed
             .iter()
             .filter(|e| Some(e.key()) != keep)
             .map(|e| {
-                let key = (!dead.contains(e.key()), e.value().mtime_us);
+                let key = (!(any_dead && self.is_dead(e.key())), e.value().mtime_us);
                 (key, *e.key(), e.value().size_bytes)
             })
             .collect();
@@ -389,7 +389,7 @@ impl DiskCacheStore {
         // Dead files first; then files not read since startup before those read since, each
         // oldest first. mtimes and store-clock times are never compared with each other. Keyed
         // once per file, not once per comparison.
-        let dead = self.dead_files();
+        let any_dead = !self.dead.is_empty();
         let mut candidates: Vec<((bool, bool, u64), SuperfileUri)> = self
             .block_files
             .iter()
@@ -399,7 +399,10 @@ impl DiskCacheStore {
                     BlockFileRead::NotSinceStart { mtime_us } => (false, mtime_us),
                     BlockFileRead::At { us } => (true, us),
                 };
-                ((!dead.contains(e.key()), read_since_start, at), *e.key())
+                (
+                    (!(any_dead && self.is_dead(e.key())), read_since_start, at),
+                    *e.key(),
+                )
             })
             .collect();
         candidates.sort_unstable_by_key(|(key, _)| *key);
@@ -737,9 +740,9 @@ impl DiskCacheStore {
 
         // Then everything else, by last read: live entries, and block files read since startup
         // whose entry was dropped. A dead file ranks first, unless a query still holds it.
-        let dead = self.dead_files();
+        let any_dead = !self.dead.is_empty();
         let rank = |uri: &SuperfileUri, last_read_us: u64, held: bool| {
-            if !held && dead.contains(uri) {
+            if any_dead && !held && self.is_dead(uri) {
                 DEAD_RANK_US
             } else {
                 last_read_us
@@ -943,7 +946,7 @@ impl<'a> Drop for Reservation<'a> {
 mod tests {
     use std::{
         collections::HashSet,
-        sync::{Arc, atomic::Ordering},
+        sync::{Arc, Barrier, atomic::Ordering},
         thread,
         time::{Duration, Instant},
     };
@@ -1133,87 +1136,128 @@ mod tests {
         assert!(store.fills.is_empty(), "unregistered");
     }
 
-    /// How long a test gives a thread to reach the lock it should block on.
-    const LOCK_REACH: Duration = Duration::from_millis(200);
+    /// Threads marking files dead at once, each marking its own files one at a time.
+    const RACING_MARKERS: usize = 8;
 
-    /// How long a test waits for a thread to reach a state it polls for.
-    const LOCK_WAIT: Duration = Duration::from_secs(5);
+    /// Files each racing thread marks dead: together past [`DEAD_PRUNE_MIN`], so prunes race the
+    /// marks too.
+    const MARKS_PER_MARKER: usize = 256;
 
-    /// Marking a file dead checks which dead files are still on disk holding no lock on the
-    /// dead-file set. A download start reads the set after taking the download map, which an
-    /// eviction takes under an entry's lock, so waiting on a map under the set's lock could close
-    /// a deadlock.
+    /// Dead files on disk in the large case of [`a_mark_costs_its_own_files`].
+    const MANY_DEAD: u64 = 49_000;
+
+    /// Dead files on disk in the small case of [`a_mark_costs_its_own_files`].
+    const FEW_DEAD: u64 = 189;
+
+    /// Single-file marks timed per case; the median is compared.
+    const TIMED_MARKS: usize = 21;
+
+    /// How many times slower a mark may be beside many dead files than beside few. A mark that
+    /// walks the whole set, as before this change, is about 2,900 times slower at 49,000.
+    const MARK_SLOWDOWN_LIMIT: u32 = 20;
+
     #[tokio::test]
-    async fn marking_dead_reads_the_maps_holding_no_dead_set_lock() {
-        let (_dir, store, live, _, _) = live_and_retained(1, 2).await;
-        let copy = SuperfileUri::new_v4();
-        let file = UnindexedFile {
-            size_bytes: 1,
-            mtime_us: 1,
-        };
-        store.unindexed.insert(copy, file);
-        store.current_bytes.fetch_add(1, Ordering::Release);
-        store.mark_dead(&[copy]);
+    async fn concurrent_marks_all_keep_their_files() {
+        // 8 threads mark 256 copies each, one at a time, all copies on disk:
+        //  - together they pass the prune threshold, so prunes run while others mark;
+        //  - a prune forgets only files no longer on disk.
+        // This test pins that no mark is lost to another mark or to a prune.
+        let (_dir, store, _, _, _) = live_and_retained(1, 2).await;
+        let copies: Vec<Vec<SuperfileUri>> = (0..RACING_MARKERS)
+            .map(|_| {
+                (0..MARKS_PER_MARKER)
+                    .map(|_| SuperfileUri::new_v4())
+                    .collect()
+            })
+            .collect();
+        for copy in copies.iter().flatten() {
+            let file = UnindexedFile {
+                size_bytes: 1,
+                mtime_us: 1,
+            };
+            store.unindexed.insert(*copy, file);
+            store.current_bytes.fetch_add(1, Ordering::Release);
+        }
+        let start = Arc::new(Barrier::new(RACING_MARKERS));
+        let marks: Vec<_> = copies
+            .iter()
+            .cloned()
+            .map(|mine| {
+                let (store, start) = (Arc::clone(&store), Arc::clone(&start));
+                thread::spawn(move || {
+                    start.wait();
+                    for copy in mine {
+                        store.mark_dead(&[copy]);
+                    }
+                })
+            })
+            .collect();
+        for mark in marks {
+            mark.join().expect("mark");
+        }
 
-        // Marking `live` checks that `copy` is still on disk, in the map this guard locks.
-        let slot = store.unindexed.get_mut(&copy).expect("the copy");
-        let mark = {
-            let store = Arc::clone(&store);
-            thread::spawn(move || store.mark_dead(&[live]))
-        };
-        thread::sleep(LOCK_REACH);
-        assert!(
-            store.dead.try_lock().is_ok(),
-            "the dead-file set is free while the mark waits on a map"
-        );
-        drop(slot);
-        mark.join().expect("mark");
-        assert!(store.dead_files().contains(&live));
-        assert!(
-            store.dead_files().contains(&copy),
-            "still on disk, still dead"
-        );
+        let lost = copies
+            .iter()
+            .flatten()
+            .filter(|copy| !store.is_dead(copy))
+            .count();
+        assert_eq!(lost, 0, "no mark lost to another");
     }
 
-    /// A mark that built its set while another mark changed it builds again from the new set, so
-    /// neither mark is lost.
     #[tokio::test]
-    async fn concurrent_marks_both_keep_their_files() {
-        let (_dir, store, live, retained, _) = live_and_retained(1, 2).await;
-        let copy = SuperfileUri::new_v4();
-        let file = UnindexedFile {
+    async fn a_file_between_two_maps_when_marked_stays_dead() {
+        // A file is marked dead while it moves between two of the cache's maps, so it is in
+        // neither:
+        //  - the mark keeps it;
+        //  - it then lands as a block file.
+        // This test pins that it is still dead when it lands.
+        let (_dir, store) = test_store();
+        let uri = SuperfileUri::new_v4();
+        store.mark_dead(&[uri]);
+        let record = BlockFileRecord {
             size_bytes: 1,
-            mtime_us: 1,
+            read: BlockFileRead::At { us: 0 },
         };
-        store.unindexed.insert(copy, file);
-        store.current_bytes.fetch_add(1, Ordering::Release);
-        store.mark_dead(&[copy]);
+        store.block_files.insert(uri, record);
+        assert!(store.is_dead(&uri));
+    }
 
-        // The mark of `live` takes its copy of the set, then waits on this guard while it checks
-        // that `copy` is still on disk.
-        let slot = store.unindexed.get_mut(&copy).expect("the copy");
-        let mark = {
-            let store = Arc::clone(&store);
-            thread::spawn(move || store.mark_dead(&[live]))
+    #[tokio::test]
+    async fn a_mark_costs_its_own_files() {
+        // Two stores, one with 189 dead block files and one with 49,000:
+        //  - each then marks 21 more files dead, one at a time;
+        //  - the median mark is compared between the two.
+        // This test pins that a mark costs the files it marks, not the dead files already on disk.
+        fn held_block_file(store: &DiskCacheStore) -> SuperfileUri {
+            let uri = SuperfileUri::new_v4();
+            let record = BlockFileRecord {
+                size_bytes: 1,
+                read: BlockFileRead::At { us: 0 },
+            };
+            store.block_files.insert(uri, record);
+            store.current_bytes.fetch_add(1, Ordering::Release);
+            uri
+        }
+        let median_mark = |n_dead: u64| {
+            let (_dir, store) = test_store();
+            let dead: Vec<SuperfileUri> = (0..n_dead).map(|_| held_block_file(&store)).collect();
+            store.mark_dead(&dead);
+            let mut times: Vec<Duration> = (0..TIMED_MARKS)
+                .map(|_| {
+                    let uri = held_block_file(&store);
+                    let start = Instant::now();
+                    store.mark_dead(&[uri]);
+                    start.elapsed()
+                })
+                .collect();
+            times.sort();
+            times[TIMED_MARKS / 2]
         };
-        let deadline = Instant::now() + LOCK_WAIT;
-        while Arc::strong_count(&store.dead.lock().expect("dead-file set")) < 2 {
-            assert!(Instant::now() < deadline, "the mark never took the set");
-            thread::yield_now();
-        }
-        // Meanwhile another mark lands: `retained` joins the set.
-        {
-            let mut dead = store.dead.lock().expect("dead-file set");
-            let mut next = HashSet::clone(&dead);
-            next.insert(retained);
-            *dead = Arc::new(next);
-        }
-        drop(slot);
-        mark.join().expect("mark");
-
-        let dead = store.dead_files();
-        assert!(dead.contains(&live), "this mark's file");
-        assert!(dead.contains(&retained), "the other mark's file");
+        let (few, many) = (median_mark(FEW_DEAD), median_mark(MANY_DEAD));
+        assert!(
+            many < few * MARK_SLOWDOWN_LIMIT,
+            "a mark beside {MANY_DEAD} dead files took {many:?}, beside {FEW_DEAD} {few:?}"
+        );
     }
 
     /// A block file beside a whole copy of the same file serves no read, so it goes before any

@@ -5,7 +5,6 @@
 //! sitting there, the per-URI path helpers, and drop a superfile's local copy.
 
 use std::{
-    collections::HashSet,
     fs,
     os::unix::fs::MetadataExt,
     path::Path,
@@ -563,34 +562,14 @@ impl DiskCacheStore {
     ///                                                                    a query holds them
     /// ```
     pub(crate) fn mark_dead(&self, uris: &[SuperfileUri]) {
-        let held: Vec<SuperfileUri> = uris
-            .iter()
-            .copied()
-            .filter(|uri| self.holds_file(uri))
-            .collect();
-        // Rebuilt rather than changed in place, so an eviction pass that took the old set keeps
-        // reading it. Files the cache no longer holds are forgotten, so the set stays as small as
-        // what is on disk. Built outside the set's lock, since no map is read under it, and swapped
-        // in only if no other mark changed the set meanwhile.
-        while !held.is_empty() {
-            let current = self.dead_files();
-            let mut next: HashSet<SuperfileUri> = current
-                .iter()
-                .copied()
-                .filter(|uri| self.holds_file(uri))
-                .collect();
-            let before = next.len();
-            next.extend(held.iter().copied());
-            let mut dead = self.dead.lock().expect("dead-file set poisoned");
-            if Arc::ptr_eq(&dead, &current) {
-                // Only files not already dead: two handles over one table each mark what a commit
-                // dropped.
-                self.n_dead_marked
-                    .fetch_add((next.len() - before) as u64, Ordering::Relaxed);
-                *dead = Arc::new(next);
-                break;
+        // Kept even when not on disk right now: a file moving between two maps is in neither for a
+        // moment, and a dead file must stay dead when it lands. A prune forgets the rest later.
+        for uri in uris {
+            if self.dead.insert(*uri) && self.holds_file(uri) {
+                self.n_dead_marked.fetch_add(1, Ordering::Relaxed);
             }
         }
+        self.prune_dead_if_doubled();
         // After the set changes: a download registered before this cancel is cancelled, and one
         // registered after it finds the file dead (see [`Self::maybe_spawn_background_fill`]).
         for uri in uris {
@@ -598,10 +577,35 @@ impl DiskCacheStore {
         }
     }
 
-    /// The dead files ([`Self::mark_dead`]), shared so the caller holds no lock while it walks the
-    /// cache's maps.
-    pub(crate) fn dead_files(&self) -> Arc<HashSet<SuperfileUri>> {
-        Arc::clone(&self.dead.lock().expect("dead-file set poisoned"))
+    /// Forget dead files no longer on disk, once the set has doubled since the last prune. So a
+    /// mark costs only its own files, amortized, and the set stays within twice what the last
+    /// prune kept, plus [`DEAD_PRUNE_MIN`]. Files that leave disk between marks stay listed until
+    /// the next prune; eviction never sees them, since it walks only files on disk.
+    fn prune_dead_if_doubled(&self) {
+        let prune_at = self.dead_prune_at.load(Ordering::Relaxed);
+        if self.dead.len() < prune_at
+            || self
+                .dead_prune_at
+                .compare_exchange(prune_at, usize::MAX, Ordering::AcqRel, Ordering::Relaxed)
+                .is_err()
+        {
+            return;
+        }
+        // Listed first, then checked with no dead-set guard held: the maps are never read inside
+        // one.
+        let listed: Vec<SuperfileUri> = self.dead.iter().map(|uri| *uri).collect();
+        for uri in listed {
+            if !self.holds_file(&uri) {
+                self.dead.remove(&uri);
+            }
+        }
+        self.dead_prune_at
+            .store((self.dead.len() * 2).max(DEAD_PRUNE_MIN), Ordering::Relaxed);
+    }
+
+    /// Whether `uri` is dead ([`Self::mark_dead`]).
+    pub(crate) fn is_dead(&self, uri: &SuperfileUri) -> bool {
+        self.dead.contains(uri)
     }
 
     /// Whether any form of `uri` is on disk here: an entry, a block file, or a never-opened copy.
