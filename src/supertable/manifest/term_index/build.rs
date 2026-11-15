@@ -49,8 +49,9 @@ use super::{
     FOLD_CURSOR_BYTES, REMOTE_TIER_WINDOW_BYTES, REMOTE_TIER_WINDOW_MAX_BYTES, RemoteSlice,
     TermIndexError,
     format::{
-        Layer, Location, Posting, Root, Run, SLICE_HEADER_LEN, Slice, SliceDictionary, SliceRef,
-        TierRef, encode_run, encode_slice, legacy_bound_as_key, push_posting, read_posting,
+        Layer, Location, Posting, RANGED_HEADER_LEN, Root, Run, Slice, SliceDictionary,
+        SliceFormat, SliceRef, TierRef, encode_run, encode_slice, legacy_bound_as_key,
+        push_posting, read_posting,
     },
     tier::{
         BLOCK_ENTRIES, ColumnScoring, EncodedChunk, HeadGroup, SplicedBlock, TierChunk,
@@ -91,6 +92,8 @@ pub(crate) const TIER_INLINE_MAX: usize = 8;
 pub(crate) const HEAD_DEPTH: usize = 512;
 /// Most documents a superfile keeps per term, whatever the caller asks.
 pub(crate) const HEAD_DEPTH_MAX: usize = 4096;
+/// Layout new slices are written in.
+const SLICE_WRITE_FORMAT: SliceFormat = SliceFormat::Ranged;
 
 /// Knobs the build takes from its caller.
 #[derive(Debug, Clone)]
@@ -152,6 +155,8 @@ pub(crate) struct BuildPolicy {
     /// [`REMOTE_TIER_WINDOW_BYTES`] and [`REMOTE_TIER_WINDOW_MAX_BYTES`].
     pub(crate) remote_tier_window_bytes: u64,
     pub(crate) remote_tier_window_max_bytes: u64,
+    /// See [`SLICE_WRITE_FORMAT`].
+    pub(crate) slice_format: SliceFormat,
     /// Whether a merge carries tier blocks over from its sources' chunks
     /// (see `splice_term`); off, every term takes the decoding path. Tests
     /// compare the two paths byte for byte.
@@ -266,6 +271,7 @@ impl Default for BuildPolicy {
             remote_tier_window_bytes: REMOTE_TIER_WINDOW_BYTES,
             remote_tier_window_max_bytes: REMOTE_TIER_WINDOW_MAX_BYTES,
             merge_ranges_max: None,
+            slice_format: SLICE_WRITE_FORMAT,
             #[cfg(test)]
             splice_tiers: true,
             #[cfg(test)]
@@ -1248,6 +1254,7 @@ impl Ord for MergeHead {
 
 /// The slice under construction.
 struct SliceBuilder {
+    format: SliceFormat,
     /// Keys arrive in order from the merge, so the dictionary streams into
     /// its final bytes and its size is known exactly as it grows.
     dict: TermBlockWriter<Vec<u8>>,
@@ -1258,8 +1265,9 @@ struct SliceBuilder {
 }
 
 impl SliceBuilder {
-    fn new() -> Self {
+    fn new(format: SliceFormat) -> Self {
         Self {
+            format,
             dict: TermBlockWriter::new(Vec::new()),
             postings: Vec::new(),
             first_key: None,
@@ -1279,7 +1287,7 @@ impl SliceBuilder {
                 },
             )
             .expect("Vec sink cannot fail");
-        self.postings.extend_from_slice(run);
+        self.format.push_run(&mut self.postings, run);
         if self.first_key.is_none() {
             self.first_key = Some(key.to_vec());
         }
@@ -1293,14 +1301,14 @@ impl SliceBuilder {
     /// column, and a column of random keys shares almost no prefix, so a
     /// fixed guess undercounted those slices to about twice the target.
     fn encoded_bytes(&self) -> usize {
-        self.postings.len() + self.dict.encoded_len()
+        self.postings.len() + self.dict.encoded_len() + self.format.table_len(self.n_terms)
     }
 
     /// The slice and its tier object, when its terms wrote any tier chunks.
     fn finish(self, tier: Option<ContentHash>) -> Option<(SliceRef, Vec<u8>)> {
         let first_key = self.first_key?;
         let dict = self.dict.finish().expect("Vec sink cannot fail");
-        let bytes = encode_slice(&dict, &self.postings);
+        let bytes = encode_slice(self.format, &dict, &self.postings);
         let content_hash = ContentHash::of(&bytes);
         Some((
             SliceRef {
@@ -1337,6 +1345,8 @@ struct LayerWriter {
     /// Where cut slices and tier objects are spilled, when they are.
     spill: Option<Arc<TempDir>>,
     target_bytes: usize,
+    /// The layout slices are written in.
+    slice_format: SliceFormat,
     tier_entries_per_term: u64,
     /// Entries a superfile keeps per term.
     head_depth: usize,
@@ -1388,7 +1398,7 @@ impl LayerWriter {
             false => None,
         };
         Ok(Self {
-            current: SliceBuilder::new(),
+            current: SliceBuilder::new(policy.slice_format),
             current_tier: Vec::new(),
             slices: Vec::new(),
             slice_bytes: Vec::new(),
@@ -1397,6 +1407,7 @@ impl LayerWriter {
             keeps_sent: true,
             spill,
             target_bytes: policy.slice_target_bytes,
+            slice_format: policy.slice_format,
             tier_entries_per_term: policy.tier_entries_per_term,
             head_depth: policy.head_depth_per_superfile.min(HEAD_DEPTH_MAX),
             scoring,
@@ -1582,7 +1593,7 @@ impl LayerWriter {
         let tier_bytes = (!self.current_tier.is_empty()).then(|| mem::take(&mut self.current_tier));
         let tier = tier_bytes.as_ref().map(|bytes| ContentHash::of(bytes));
         if let Some((reference, bytes)) =
-            mem::replace(&mut self.current, SliceBuilder::new()).finish(tier)
+            mem::replace(&mut self.current, SliceBuilder::new(self.slice_format)).finish(tier)
         {
             let stem = reference.content_hash.to_hex();
             if let (Some(hash), Some(bytes)) = (tier, tier_bytes) {
@@ -2730,10 +2741,16 @@ pub(crate) fn key_ranges(
             handle.read_exact_at(&mut bytes, offset)?;
             Ok(bytes)
         };
-        let header = read_at(0, SLICE_HEADER_LEN)?;
-        let dict_len = SliceDictionary::dict_len(&header)?;
-        let bytes = read_at(0, SLICE_HEADER_LEN + dict_len as usize)?;
-        let dictionary = SliceDictionary::open(&bytes)?;
+        // The longest header any slice layout has; every slice is longer,
+        // its dictionary's footer alone being wider than the difference.
+        let header_len = (RANGED_HEADER_LEN as u64).min(handle.metadata()?.len());
+        let header = read_at(0, header_len as usize)?;
+        let dict_range = SliceDictionary::dict_range(&header)?;
+        let dict = read_at(
+            dict_range.start,
+            (dict_range.end - dict_range.start) as usize,
+        )?;
+        let dictionary = SliceDictionary::from_parts(&header, &dict)?;
         let starts = dictionary.block_starts()?;
         let (_, tier_len) = file.lens()?;
         let group = starts.len().div_ceil(per_slice).max(1);

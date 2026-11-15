@@ -82,7 +82,8 @@ mydb/                                     database root (the connect() path)
 │   │   │       │          df, the key of the term's best document there, the key
 │   │   │       │          past its head, postings location) and the term's tier
 │   │   │       │          reference — a few entries inline, else its chunks in
-│   │   │       │          the slice's tier object
+│   │   │       │          the slice's tier object; version 3 adds a CRC per
+│   │   │       │          block and per run, so it can be read by range
 │   │   │       └ used   : exact term routing, part selection, ceiling-ordered
 │   │   │                  opening, and cursor build without the superfile dictionary
 │   │   └── tier-<blake3>.bin             binary, immutable, content-addressed, one

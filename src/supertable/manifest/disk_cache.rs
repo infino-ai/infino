@@ -95,14 +95,14 @@ pub(crate) enum KeptWhole {
     CentroidSection,
 }
 
-/// What a `get` found on disk for an indexed hash.
-enum CachedRead {
+/// What a `get` found on disk for an indexed key.
+enum CachedRead<T> {
     /// The file is gone.
     Missing,
-    /// The bytes do not hash to the key; the file has been removed.
+    /// The bytes fail their check; the file has been removed.
     Corrupt,
-    /// The bytes, verified against the key.
-    Verified(Vec<u8>),
+    /// The bytes, verified and decoded.
+    Verified(T, u64),
 }
 
 /// Per-entry bookkeeping for the in-memory accounting index. The bytes
@@ -246,8 +246,19 @@ impl MetadataDiskCache {
     /// requested `hash`; a mismatch (disk corruption) is treated as a
     /// miss and the bad file is removed, so the loader transparently
     /// falls back to storage.
-    // A hit is not free: it reads the file and re-hashes it end to end, so
-    // on a large part this is real I/O plus a blake3 pass. `outcome`
+    pub async fn get(&self, hash: &ContentHash) -> Option<Vec<u8>> {
+        let expected = *hash;
+        self.get_decoded(hash, move |bytes| {
+            (ContentHash::of(&bytes) == expected).then_some(bytes)
+        })
+        .await
+    }
+
+    /// Read the bytes cached under `key` through `decode`, which verifies
+    /// and parses them. `None` from it counts as corruption: the file is
+    /// removed and the lookup misses. For bytes not keyed by their own hash.
+    // A hit is not free: it reads the file and verifies it end to end, so
+    // on a large part this is real I/O plus a hash pass. `outcome`
     // separates the cheap index miss from the expensive verified hit.
     #[cfg_attr(
         feature = "detailed-tracing",
@@ -257,7 +268,11 @@ impl MetadataDiskCache {
             fields(outcome = tracing::field::Empty, bytes = tracing::field::Empty)
         )
     )]
-    pub async fn get(&self, hash: &ContentHash) -> Option<Vec<u8>> {
+    pub(crate) async fn get_decoded<T: Send + 'static>(
+        &self,
+        hash: &ContentHash,
+        decode: impl FnOnce(Vec<u8>) -> Option<T> + Send + 'static,
+    ) -> Option<T> {
         // Fast negative: not in the accounting index ⇒ not cached.
         if !self.entries.contains_key(hash) {
             record("outcome", "miss");
@@ -265,21 +280,25 @@ impl MetadataDiskCache {
             return None;
         }
         let path = self.cache_path(hash);
-        let expected = *hash;
-        // The read and the hash run as one blocking task: a cached object can
-        // be hundreds of MB, too much to hash on a runtime worker.
+        // The read and the check run as one blocking task: a cached object
+        // can be hundreds of MB, too much to hash on a runtime worker.
         let read = spawn_blocking(move || match fs::read(&path) {
             Err(_) => CachedRead::Missing,
-            Ok(bytes) if ContentHash::of(&bytes) != expected => {
-                let _ = fs::remove_file(&path);
-                CachedRead::Corrupt
+            Ok(bytes) => {
+                let len = bytes.len() as u64;
+                match decode(bytes) {
+                    Some(decoded) => CachedRead::Verified(decoded, len),
+                    None => {
+                        let _ = fs::remove_file(&path);
+                        CachedRead::Corrupt
+                    }
+                }
             }
-            Ok(bytes) => CachedRead::Verified(bytes),
         })
         .await
         .unwrap_or(CachedRead::Missing);
-        let bytes = match read {
-            CachedRead::Verified(bytes) => bytes,
+        let (decoded, len) = match read {
+            CachedRead::Verified(decoded, len) => (decoded, len),
             CachedRead::Missing => {
                 // File vanished out from under the index (manual
                 // delete, external eviction). Drop the stale entry.
@@ -289,8 +308,9 @@ impl MetadataDiskCache {
                 return None;
             }
             CachedRead::Corrupt => {
-                // Content-addressing guarantee: the bytes must hash to the
-                // key. A mismatch means on-disk corruption, already removed.
+                // The bytes failed their check (for a content-addressed
+                // object, they do not hash to the key): on-disk corruption,
+                // already removed.
                 record("outcome", "corrupt");
                 self.drop_entry(hash);
                 self.n_misses.fetch_add(1, Ordering::AcqRel);
@@ -301,9 +321,9 @@ impl MetadataDiskCache {
             entry.last_access_us.store(self.now_us(), Ordering::Release);
         }
         record("outcome", "hit");
-        record("bytes", bytes.len() as u64);
+        record("bytes", len);
         self.n_hits.fetch_add(1, Ordering::AcqRel);
-        Some(bytes)
+        Some(decoded)
     }
 
     /// Insert a part's compressed bytes under its content hash.
@@ -311,9 +331,9 @@ impl MetadataDiskCache {
     /// Best-effort: the cache is a pure optimization, so any failure
     /// (budget exhausted with no evictable victims, I/O error) is
     /// swallowed — the caller already holds the bytes and can proceed.
-    /// Idempotent: an already-cached hash is a no-op. `hash` must be
-    /// the blake3 of `bytes`; the caller (the loader) has already
-    /// verified this.
+    /// Idempotent: an already-cached hash is a no-op. For bytes read back
+    /// with [`Self::get`], `hash` must be their blake3, which the caller
+    /// has already verified.
     ///
     /// The write, the rename and the index insert run as one blocking task,
     /// which settles the budget on every outcome. A caller dropped while it
@@ -673,8 +693,7 @@ impl MetadataDiskCache {
         }
     }
 
-    /// Whether `hash` is in the cache.
-    #[cfg(test)]
+    /// Whether `hash` is in the cache, without reading it.
     pub(crate) fn contains(&self, hash: &ContentHash) -> bool {
         self.entries.contains_key(hash)
     }

@@ -40,12 +40,27 @@
 //! commit can append a delta (its own slice list, appending to the
 //! superfile list) without rewriting the base.
 //!
-//! **Slice** — one contiguous key range, fetched whole:
+//! **Slice** — one contiguous key range. Two layouts are read:
 //!
 //! ```text
+//! versions 1 and 2, read whole:
 //! magic "INFTSLC1" | version u32 | dict_len u64 | postings_len u64
 //! | dictionary (front-coded term blocks, `utils::terms`) | postings region
+//!
+//! version 3, read whole or by range:
+//! magic "INFTSLC1" | 3 u32 | dict_len u64 | table_len u64 | postings_len u64
+//! | postings region: per term, run | run CRC32C
+//! | dictionary (front-coded term blocks, `utils::terms`)
+//! | block table: CRC32C per dictionary block | head CRC32C
 //! ```
+//!
+//! Version 3's runs are version 2's; version 1's are the runs before tiers
+//! (see [`LEGACY_SLICE_FORMAT_VERSION`]).
+//!
+//! A whole slice is checked against its content hash. Version 3 adds CRCs so
+//! a reader can fetch just the *head* (the header plus everything from the
+//! dictionary's block index to the end), then one block and one run. The
+//! head sits at the end so one read of the slice's tail usually gets it.
 //!
 //! The dictionary's value for a term is a byte range into the postings
 //! region, which holds that term's *run*:
@@ -93,10 +108,14 @@ use super::{
     tier::{TierChunkRef, TierEntry, push_chunk_refs, read_chunk_refs},
 };
 use crate::{
+    superfile::format::{
+        CRC_BYTES,
+        checksum::{crc32c, crc32c_append},
+    },
     supertable::manifest::{part::ContentHash, term_range::prefix_upper_bound},
     utils::{
         bytes::{u32_le_at, u64_le_at},
-        terms::{DictEntry, TermBlocks},
+        terms::{DictEntry, TERM_BLOCK_SIZE, TERM_BLOCKS_FOOTER_BYTES, TermBlockIndex, TermBlocks},
         varint::{
             push_doc_facts, push_u64_varint, push_varint, read_doc_facts, read_u64_varint,
             read_varint,
@@ -127,16 +146,26 @@ pub(crate) const UNSIZED_ROOT_FORMAT_VERSION: u32 = 4;
 /// The root version before tiers: slices named with their byte length and
 /// no tier object.
 pub(crate) const LEGACY_ROOT_FORMAT_VERSION: u32 = 3;
-/// Layout version of a slice. `2` adds the per-posting tail and the run's
-/// tier reference (a small tier in the run itself, a larger one in the
-/// slice's tier object, laid out per superfile in regions of one block
+/// Slice layout read by range as well as whole: the runs of
+/// [`WHOLE_SLICE_FORMAT_VERSION`], each followed by its CRC, then the
+/// dictionary, then a CRC per dictionary block and one over the head.
+pub(crate) const RANGED_SLICE_FORMAT_VERSION: u32 = 3;
+/// Slice layout read whole only. `2` adds the per-posting tail and the
+/// run's tier reference (a small tier in the run itself, a larger one in
+/// the slice's tier object, laid out per superfile in regions of one block
 /// per superfile, each block with its own CRC), and stores a posting's
 /// bound as a key rather than a score.
-pub(crate) const SLICE_FORMAT_VERSION: u32 = 2;
-/// The slice version before tiers: a run is its postings alone, each a
-/// superfile, a document frequency, a bound that is a BM25 score at the
-/// superfile's own idf, and a location.
+pub(crate) const WHOLE_SLICE_FORMAT_VERSION: u32 = 2;
+/// The slice version before tiers, read whole: a run is its postings
+/// alone, each a superfile, a document frequency, a bound that is a BM25
+/// score at the superfile's own idf, and a location.
 pub(crate) const LEGACY_SLICE_FORMAT_VERSION: u32 = 1;
+/// Every slice version read, the newest first.
+const SLICE_FORMAT_VERSIONS: [u32; 3] = [
+    RANGED_SLICE_FORMAT_VERSION,
+    WHOLE_SLICE_FORMAT_VERSION,
+    LEGACY_SLICE_FORMAT_VERSION,
+];
 /// Run header tag: the term has no tier.
 const TIER_ABSENT: u8 = 0;
 /// Run header tag: a tier reference follows.
@@ -156,8 +185,12 @@ const HASH_LEN: usize = 32;
 const F32_LEN: usize = 4;
 /// Root fixed header: magic, version, superfile count.
 const ROOT_HEADER_LEN: usize = MAGIC_LEN + U32_LEN + U32_LEN;
-/// Slice fixed header: magic, version, dictionary length, postings length.
+/// Whole-read slice header (versions 1 and 2): magic, version, dictionary
+/// and postings lengths.
 pub(crate) const SLICE_HEADER_LEN: usize = MAGIC_LEN + U32_LEN + U64_LEN + U64_LEN;
+/// Ranged slice header (version 3): magic, version, dictionary,
+/// block-table and postings lengths. The longest slice header.
+pub(crate) const RANGED_HEADER_LEN: usize = MAGIC_LEN + U32_LEN + 3 * U64_LEN;
 
 /// Location tags, one byte each in a posting.
 const LOC_NONE: u8 = 0;
@@ -424,12 +457,7 @@ pub(crate) fn slice_is_before_tiers(prefix: &[u8]) -> Result<bool, TermIndexErro
         bytes: prefix,
         at: 0,
     };
-    let version = check_magic_version(
-        &mut c,
-        SLICE_MAGIC,
-        &[SLICE_FORMAT_VERSION, LEGACY_SLICE_FORMAT_VERSION],
-        "slice",
-    )?;
+    let version = check_magic_version(&mut c, SLICE_MAGIC, &SLICE_FORMAT_VERSIONS, "slice")?;
     Ok(version == LEGACY_SLICE_FORMAT_VERSION)
 }
 
@@ -981,16 +1009,302 @@ pub(crate) fn encode_legacy_slice(terms: &[(Vec<u8>, Vec<(u32, u64, f32, Locatio
     out
 }
 
-/// Assemble a slice from an encoded block dictionary and its postings
-/// region.
-pub(crate) fn encode_slice(dict: &[u8], postings: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(SLICE_HEADER_LEN + dict.len() + postings.len());
-    out.extend_from_slice(SLICE_MAGIC);
-    out.extend_from_slice(&SLICE_FORMAT_VERSION.to_le_bytes());
-    out.extend_from_slice(&(dict.len() as u64).to_le_bytes());
-    out.extend_from_slice(&(postings.len() as u64).to_le_bytes());
-    out.extend_from_slice(dict);
-    out.extend_from_slice(postings);
+/// A slice layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SliceFormat {
+    /// Version 2: read whole.
+    Whole,
+    /// Version 3: read whole or by range.
+    Ranged,
+}
+
+impl SliceFormat {
+    fn version(self) -> u32 {
+        match self {
+            Self::Whole => WHOLE_SLICE_FORMAT_VERSION,
+            Self::Ranged => RANGED_SLICE_FORMAT_VERSION,
+        }
+    }
+
+    fn header_len(self) -> usize {
+        match self {
+            Self::Whole => SLICE_HEADER_LEN,
+            Self::Ranged => RANGED_HEADER_LEN,
+        }
+    }
+
+    /// Append one encoded run to a postings region.
+    pub(crate) fn push_run(self, postings: &mut Vec<u8>, run: &[u8]) {
+        postings.extend_from_slice(run);
+        if self == Self::Ranged {
+            postings.extend_from_slice(&crc32c(run).to_le_bytes());
+        }
+    }
+
+    /// Block-table bytes for a slice of `n_terms` terms.
+    pub(crate) fn table_len(self, n_terms: usize) -> usize {
+        match self {
+            Self::Whole => 0,
+            Self::Ranged => (n_terms.div_ceil(TERM_BLOCK_SIZE) + 1) * CRC_BYTES,
+        }
+    }
+}
+
+/// A slice's fixed header.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SliceHeader {
+    format: SliceFormat,
+    /// Whether the runs are of the layout before tiers (see
+    /// [`Run::legacy_bound`]); only a whole-read slice can be.
+    legacy: bool,
+    dict_len: u64,
+    table_len: u64,
+    postings_len: u64,
+}
+
+impl SliceHeader {
+    /// Parse a slice's leading bytes; an unknown magic or version is an
+    /// error.
+    pub(crate) fn decode(bytes: &[u8]) -> Result<Self, TermIndexError> {
+        let mut c = Cursor { bytes, at: 0 };
+        let version = check_magic_version(&mut c, SLICE_MAGIC, &SLICE_FORMAT_VERSIONS, "slice")?;
+        match version {
+            RANGED_SLICE_FORMAT_VERSION => Ok(Self {
+                format: SliceFormat::Ranged,
+                legacy: false,
+                dict_len: c.u64("slice dict length")?,
+                table_len: c.u64("slice table length")?,
+                postings_len: c.u64("slice postings length")?,
+            }),
+            _ => Ok(Self {
+                format: SliceFormat::Whole,
+                legacy: version == LEGACY_SLICE_FORMAT_VERSION,
+                dict_len: c.u64("slice dict length")?,
+                table_len: 0,
+                postings_len: c.u64("slice postings length")?,
+            }),
+        }
+    }
+
+    fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.format.header_len());
+        out.extend_from_slice(SLICE_MAGIC);
+        out.extend_from_slice(&self.format.version().to_le_bytes());
+        out.extend_from_slice(&self.dict_len.to_le_bytes());
+        if self.format == SliceFormat::Ranged {
+            out.extend_from_slice(&self.table_len.to_le_bytes());
+        }
+        out.extend_from_slice(&self.postings_len.to_le_bytes());
+        out
+    }
+
+    pub(crate) fn format(&self) -> SliceFormat {
+        self.format
+    }
+
+    fn header_len(&self) -> u64 {
+        self.format.header_len() as u64
+    }
+
+    fn postings_start(&self) -> u64 {
+        match self.format {
+            SliceFormat::Whole => self.header_len() + self.dict_len,
+            SliceFormat::Ranged => self.header_len(),
+        }
+    }
+
+    fn dict_start(&self) -> u64 {
+        match self.format {
+            SliceFormat::Whole => self.header_len(),
+            SliceFormat::Ranged => self.header_len() + self.postings_len,
+        }
+    }
+
+    fn table_start(&self) -> u64 {
+        self.dict_start() + self.dict_len
+    }
+
+    /// The slice length the header implies. Saturates, so a corrupt header
+    /// never matches the real length.
+    pub(crate) fn total_len(&self) -> u64 {
+        self.header_len()
+            .saturating_add(self.dict_len)
+            .saturating_add(self.table_len)
+            .saturating_add(self.postings_len)
+    }
+
+    /// Where the dictionary's footer sits in the slice.
+    pub(crate) fn dict_footer_range(&self) -> Range<u64> {
+        let end = self.table_start();
+        end.saturating_sub(TERM_BLOCKS_FOOTER_BYTES as u64)..end
+    }
+
+    /// Where the head's dictionary part starts in the slice, read from the
+    /// dictionary's footer.
+    pub(crate) fn head_tail_start(&self, footer: &[u8]) -> Result<u64, TermIndexError> {
+        TermBlockIndex::tail_start(footer)
+            .filter(|at| *at as u64 <= self.dict_len)
+            .map(|at| self.dict_start() + at as u64)
+            .ok_or_else(|| malformed("slice dictionary footer"))
+    }
+}
+
+/// A verified version 3 (ranged) slice head: finds the block that can hold a key,
+/// and checks that block and its run.
+pub(crate) struct SliceHead {
+    header: SliceHeader,
+    /// Header, then the slice from the dictionary's block index to the end.
+    bytes: Vec<u8>,
+}
+
+impl SliceHead {
+    /// Parse and verify the head of a slice `slice_len` bytes long.
+    pub(crate) fn decode(bytes: Vec<u8>, slice_len: u64) -> Result<Self, TermIndexError> {
+        let header = SliceHeader::decode(&bytes)?;
+        if header.format != SliceFormat::Ranged || header.total_len() != slice_len {
+            return Err(malformed("slice head: header does not match the slice"));
+        }
+        let rest_len = bytes.len() - RANGED_HEADER_LEN;
+        let tail_len = (rest_len as u64)
+            .checked_sub(header.table_len)
+            .filter(|len| *len <= header.dict_len && header.table_len >= CRC_BYTES as u64)
+            .ok_or_else(|| malformed("slice head: length"))? as usize;
+        let (covered, stored) = bytes.split_at(bytes.len() - CRC_BYTES);
+        if u32_le_at(stored, 0) != Some(crc32c(covered)) {
+            return Err(malformed("slice head: CRC mismatch"));
+        }
+        let tail_offset = header.dict_len as usize - tail_len;
+        let head = Self { header, bytes };
+        let index = head.index()?;
+        if index.tail_offset() != tail_offset
+            || header.table_len as usize != (index.n_blocks() + 1) * CRC_BYTES
+        {
+            return Err(malformed(
+                "slice head: block table does not match the dictionary",
+            ));
+        }
+        Ok(head)
+    }
+
+    /// The bytes [`Self::decode`] took.
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// The dictionary's block index.
+    pub(crate) fn index(&self) -> Result<TermBlockIndex<'_>, TermIndexError> {
+        let tail_end = self.bytes.len() - self.header.table_len as usize;
+        TermBlockIndex::open(
+            &self.bytes[RANGED_HEADER_LEN..tail_end],
+            self.header.dict_len as usize,
+        )
+        .map_err(|e| TermIndexError::Malformed(format!("slice dictionary: {e}")))
+    }
+
+    /// Where block `b` sits in the slice.
+    pub(crate) fn block_range(
+        &self,
+        index: &TermBlockIndex<'_>,
+        b: usize,
+    ) -> Result<Range<u64>, TermIndexError> {
+        let range = index
+            .block_range(b)
+            .ok_or_else(|| malformed("slice block past the index"))?;
+        let start = self.header.dict_start();
+        Ok(start + range.start as u64..start + range.end as u64)
+    }
+
+    /// Check block `b`'s bytes against its CRC.
+    pub(crate) fn check_block(&self, b: usize, block: &[u8]) -> Result<(), TermIndexError> {
+        let table_start = self.bytes.len() - self.header.table_len as usize;
+        let at = table_start + b * CRC_BYTES;
+        // The last table entry is the head CRC, not a block's.
+        match u32_le_at(&self.bytes[..self.bytes.len() - CRC_BYTES], at) {
+            Some(crc) if crc == crc32c(block) => Ok(()),
+            Some(_) => Err(malformed("slice block: CRC mismatch")),
+            None => Err(malformed("slice block: past the block table")),
+        }
+    }
+
+    /// Where an entry's run and its CRC sit in the slice.
+    pub(crate) fn run_range(&self, value: DictEntry) -> Result<Range<u64>, TermIndexError> {
+        let run = run_range(value)?;
+        let end = run.end as u64 + CRC_BYTES as u64;
+        if end > self.header.postings_len {
+            return Err(malformed("slice entry range past postings region"));
+        }
+        let start = self.header.postings_start();
+        Ok(start + run.start as u64..start + end)
+    }
+}
+
+/// Decode a ranged slice's run followed by its CRC; a mismatch is an error.
+pub(crate) fn decode_checked_run(bytes: &[u8]) -> Result<Run, TermIndexError> {
+    let run_len = bytes
+        .len()
+        .checked_sub(CRC_BYTES)
+        .ok_or_else(|| malformed("run: shorter than its CRC"))?;
+    let (run, stored) = bytes.split_at(run_len);
+    if u32_le_at(stored, 0) != Some(crc32c(run)) {
+        return Err(malformed("run: CRC mismatch"));
+    }
+    decode_run_with_tier(run)
+}
+
+/// An entry's run within the postings region, without its CRC.
+fn run_range(value: DictEntry) -> Result<Range<usize>, TermIndexError> {
+    let DictEntry::Pfor {
+        metadata_offset,
+        postings_length: len,
+        ..
+    } = value
+    else {
+        return Err(malformed("slice entry is not a postings range"));
+    };
+    let start = metadata_offset as usize;
+    let end = start
+        .checked_add(len as usize)
+        .ok_or_else(|| malformed("slice entry range"))?;
+    Ok(start..end)
+}
+
+/// Assemble a slice from a block dictionary and a postings region built
+/// with [`SliceFormat::push_run`].
+pub(crate) fn encode_slice(format: SliceFormat, dict: &[u8], postings: &[u8]) -> Vec<u8> {
+    let index = TermBlockIndex::open(dict, dict.len()).expect("a dictionary this build encoded");
+    let header = SliceHeader {
+        format,
+        legacy: false,
+        dict_len: dict.len() as u64,
+        table_len: match format {
+            SliceFormat::Whole => 0,
+            SliceFormat::Ranged => ((index.n_blocks() + 1) * CRC_BYTES) as u64,
+        },
+        postings_len: postings.len() as u64,
+    };
+    let mut out = header.encode();
+    out.reserve(header.total_len() as usize - out.len());
+    match format {
+        SliceFormat::Whole => {
+            out.extend_from_slice(dict);
+            out.extend_from_slice(postings);
+        }
+        SliceFormat::Ranged => {
+            out.extend_from_slice(postings);
+            out.extend_from_slice(dict);
+            for b in 0..index.n_blocks() {
+                let range = index.block_range(b).expect("a block this build encoded");
+                out.extend_from_slice(&crc32c(&dict[range]).to_le_bytes());
+            }
+            let tail = &dict[index.tail_offset()..];
+            let table = &out[out.len() - index.n_blocks() * CRC_BYTES..];
+            let head_crc = crc32c_append(
+                crc32c_append(crc32c(&out[..RANGED_HEADER_LEN]), tail),
+                table,
+            );
+            out.extend_from_slice(&head_crc.to_le_bytes());
+        }
+    }
     out
 }
 
@@ -1007,49 +1321,40 @@ pub(crate) struct BlockStart {
 /// cut the key space into ranges.
 pub(crate) struct SliceDictionary<'a> {
     dict: TermBlocks<'a>,
-    dict_len: u64,
-    postings_len: u64,
-    legacy: bool,
+    header: SliceHeader,
 }
 
 impl<'a> SliceDictionary<'a> {
-    /// The dictionary length a slice's first [`SLICE_HEADER_LEN`] bytes name.
-    pub(crate) fn dict_len(header: &[u8]) -> Result<u64, TermIndexError> {
-        let mut c = Cursor {
-            bytes: header,
-            at: 0,
-        };
-        check_magic_version(
-            &mut c,
-            SLICE_MAGIC,
-            &[SLICE_FORMAT_VERSION, LEGACY_SLICE_FORMAT_VERSION],
-            "slice",
-        )?;
-        c.u64("slice dict length")
+    /// Where the dictionary sits in a slice whose leading bytes are
+    /// `header`: at least [`RANGED_HEADER_LEN`] of them, or the whole slice.
+    pub(crate) fn dict_range(header: &[u8]) -> Result<Range<u64>, TermIndexError> {
+        let header = SliceHeader::decode(header)?;
+        Ok(header.dict_start()..header.table_start())
     }
 
-    /// Parse a slice's header and dictionary, its first
-    /// [`SLICE_HEADER_LEN`] bytes and the dictionary length they name;
-    /// bytes past the dictionary are ignored.
-    pub(crate) fn open(bytes: &'a [u8]) -> Result<Self, TermIndexError> {
-        let mut c = Cursor { bytes, at: 0 };
-        let version = check_magic_version(
-            &mut c,
-            SLICE_MAGIC,
-            &[SLICE_FORMAT_VERSION, LEGACY_SLICE_FORMAT_VERSION],
-            "slice",
-        )?;
-        let dict_len = c.u64("slice dict length")?;
-        let postings_len = c.u64("slice postings length")?;
-        let dict_bytes = c.take(dict_len as usize, "slice dictionary")?;
-        let dict = TermBlocks::open(dict_bytes)
+    /// Parse a slice's dictionary from the slice's leading bytes `header`
+    /// and `dict`, the bytes [`Self::dict_range`] names.
+    pub(crate) fn from_parts(header: &[u8], dict: &'a [u8]) -> Result<Self, TermIndexError> {
+        let header = SliceHeader::decode(header)?;
+        if dict.len() as u64 != header.dict_len {
+            return Err(malformed(
+                "slice dictionary: length does not match the header",
+            ));
+        }
+        let dict = TermBlocks::open(dict)
             .map_err(|e| TermIndexError::Malformed(format!("slice dictionary: {e}")))?;
-        Ok(Self {
-            dict,
-            dict_len,
-            postings_len,
-            legacy: version == LEGACY_SLICE_FORMAT_VERSION,
-        })
+        Ok(Self { dict, header })
+    }
+
+    /// Parse the dictionary of a slice whose bytes start `bytes` and reach
+    /// at least its dictionary's end; bytes past the dictionary are ignored.
+    #[cfg(test)]
+    pub(crate) fn open(bytes: &'a [u8]) -> Result<Self, TermIndexError> {
+        let range = Self::dict_range(bytes)?;
+        let dict = bytes
+            .get(range.start as usize..range.end as usize)
+            .ok_or_else(|| malformed("slice dictionary: past the bytes given"))?;
+        Self::from_parts(bytes, dict)
     }
 
     /// Where each dictionary block starts, in key order.
@@ -1075,18 +1380,18 @@ impl<'a> SliceDictionary<'a> {
 
     /// Where the postings region starts in the slice's bytes.
     pub(crate) fn postings_start(&self) -> u64 {
-        SLICE_HEADER_LEN as u64 + self.dict_len
+        self.header.postings_start()
     }
 
     /// Bytes in the postings region.
     pub(crate) fn postings_len(&self) -> u64 {
-        self.postings_len
+        self.header.postings_len
     }
 
     /// The offset of the first tier chunk of `run`, the bytes of one run a
     /// [`BlockStart`] names, when it has chunks.
     pub(crate) fn tier_at(&self, run: &[u8]) -> Result<Option<u64>, TermIndexError> {
-        let run = match self.legacy {
+        let run = match self.header.legacy {
             true => decode_legacy_run(run)?,
             false => decode_run_with_tier(run)?,
         };
@@ -1106,49 +1411,29 @@ pub(crate) struct Slice<'a> {
 }
 
 impl<'a> Slice<'a> {
-    /// Parse a slice, refusing an unknown magic or a version no longer
-    /// read; a slice of the layout before tiers is read with its runs'
-    /// bounds marked as the scores they are.
+    /// Parse a slice of any layout read, refusing an unknown magic or a
+    /// version no longer read; a slice of the layout before tiers is read
+    /// with its runs' bounds marked as the scores they are. CRCs are
+    /// skipped: a whole slice is checked by its content hash.
     pub(crate) fn open(bytes: &'a [u8]) -> Result<Self, TermIndexError> {
-        let mut c = Cursor { bytes, at: 0 };
-        let version = check_magic_version(
-            &mut c,
-            SLICE_MAGIC,
-            &[SLICE_FORMAT_VERSION, LEGACY_SLICE_FORMAT_VERSION],
-            "slice",
-        )?;
-        let dict_len = c.u64("slice dict length")? as usize;
-        let postings_len = c.u64("slice postings length")? as usize;
-        let dict_bytes = c.take(dict_len, "slice dictionary")?;
-        let postings = c.take(postings_len, "slice postings")?;
-        if c.at != bytes.len() {
-            return Err(malformed("slice: trailing bytes"));
+        let header = SliceHeader::decode(bytes)?;
+        if header.total_len() != bytes.len() as u64 {
+            return Err(malformed("slice: trailing or missing bytes"));
         }
-        let dict = TermBlocks::open(dict_bytes)
+        let region = |start: u64, len: u64| &bytes[start as usize..(start + len) as usize];
+        let dict = TermBlocks::open(region(header.dict_start(), header.dict_len))
             .map_err(|e| TermIndexError::Malformed(format!("slice dictionary: {e}")))?;
         Ok(Self {
             dict,
-            postings,
-            legacy: version == LEGACY_SLICE_FORMAT_VERSION,
+            postings: region(header.postings_start(), header.postings_len),
+            legacy: header.legacy,
         })
     }
 
     fn run_at(&self, value: DictEntry) -> Result<Run, TermIndexError> {
-        let DictEntry::Pfor {
-            metadata_offset,
-            postings_length: len,
-            ..
-        } = value
-        else {
-            return Err(malformed("slice entry is not a postings range"));
-        };
-        let start = metadata_offset as usize;
-        let end = start
-            .checked_add(len as usize)
-            .ok_or_else(|| malformed("slice entry range"))?;
         let run = self
             .postings
-            .get(start..end)
+            .get(run_range(value)?)
             .ok_or_else(|| malformed("slice entry range past postings region"))?;
         if self.legacy {
             decode_legacy_run(run)
@@ -1266,7 +1551,7 @@ impl<'a> Slice<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utils::terms::{TermDictBuilder, make_key};
+    use crate::utils::terms::{TermDictBuilder, lookup_in_block, make_key};
 
     #[test]
     fn hash_width_matches_content_hash() {
@@ -1683,7 +1968,7 @@ mod tests {
         assert!(hits.is_empty());
     }
 
-    fn build_slice(entries: &[(&str, &str, Vec<Posting>)]) -> Vec<u8> {
+    fn build_slice(format: SliceFormat, entries: &[(&str, &str, Vec<Posting>)]) -> Vec<u8> {
         let mut dict = TermDictBuilder::new();
         let mut postings = Vec::new();
         for (col, term, run) in entries {
@@ -1696,28 +1981,38 @@ mod tests {
                     short: false,
                 },
             );
-            postings.extend_from_slice(&bytes);
+            format.push_run(&mut postings, &bytes);
         }
-        encode_slice(&dict.finish(), &postings)
+        encode_slice(format, &dict.finish(), &postings)
+    }
+
+    fn one(sf: u32) -> Vec<Posting> {
+        vec![Posting {
+            superfile: sf,
+            df: 3,
+            bound: 1.0,
+            tail: 1.0,
+            location: Location::None,
+        }]
     }
 
     #[test]
-    fn slice_looks_up_terms_and_scans_prefixes() {
-        let one = |sf: u32| {
-            vec![Posting {
-                superfile: sf,
-                df: 3,
-                bound: 1.0,
-                tail: 1.0,
-                location: Location::None,
-            }]
-        };
-        let bytes = build_slice(&[
-            ("body", "alpha", one(1)),
-            ("body", "alphabet", one(2)),
-            ("body", "beta", one(3)),
-            ("title", "alpha", one(4)),
-        ]);
+    fn slice_looks_up_terms_and_scans_prefixes_in_both_layouts() {
+        for format in [SliceFormat::Whole, SliceFormat::Ranged] {
+            slice_looks_up_terms_and_scans_prefixes(format);
+        }
+    }
+
+    fn slice_looks_up_terms_and_scans_prefixes(format: SliceFormat) {
+        let bytes = build_slice(
+            format,
+            &[
+                ("body", "alpha", one(1)),
+                ("body", "alphabet", one(2)),
+                ("body", "beta", one(3)),
+                ("title", "alpha", one(4)),
+            ],
+        );
         let slice = Slice::open(&bytes).expect("open");
         assert_eq!(
             slice.postings(&make_key("body", "alpha")).expect("ok"),
@@ -1849,7 +2144,7 @@ mod tests {
             "with no document count the bound is unknown"
         );
         // The current layout's runs are not marked.
-        let current = build_slice(&[("body", "alpha", vec![])]);
+        let current = build_slice(SliceFormat::Whole, &[("body", "alpha", vec![])]);
         let run = Slice::open(&current)
             .expect("open")
             .run(&key)
@@ -1860,15 +2155,121 @@ mod tests {
 
     #[test]
     fn slice_rejects_unknown_version_loudly_not_as_absent() {
-        let mut bytes = build_slice(&[("body", "alpha", vec![])]);
+        let mut bytes = build_slice(SliceFormat::Ranged, &[("body", "alpha", vec![])]);
         bytes[MAGIC_LEN] = 9;
         assert!(matches!(
             Slice::open(&bytes),
             Err(TermIndexError::UnsupportedVersion {
                 what: "slice",
                 found: 9,
-                expected: SLICE_FORMAT_VERSION
+                expected: RANGED_SLICE_FORMAT_VERSION
             })
         ));
+    }
+
+    /// Enough terms for several dictionary blocks.
+    const HEAD_TEST_TERMS: u32 = 5 * TERM_BLOCK_SIZE as u32 + 7;
+
+    /// A version 3 slice of [`HEAD_TEST_TERMS`] terms, and its keys.
+    fn ranged_slice() -> (Vec<u8>, Vec<Vec<u8>>) {
+        let terms: Vec<String> = (0..HEAD_TEST_TERMS).map(|i| format!("t{i:05}")).collect();
+        let entries: Vec<(&str, &str, Vec<Posting>)> = terms
+            .iter()
+            .zip(0..)
+            .map(|(t, i)| ("body", t.as_str(), one(i)))
+            .collect();
+        let keys = terms.iter().map(|t| make_key("body", t)).collect();
+        (build_slice(SliceFormat::Ranged, &entries), keys)
+    }
+
+    /// The head of `bytes`, as a range reader assembles it.
+    fn head_bytes(bytes: &[u8]) -> Vec<u8> {
+        let header = SliceHeader::decode(bytes).expect("header");
+        let footer = header.dict_footer_range();
+        let from = header
+            .head_tail_start(&bytes[footer.start as usize..footer.end as usize])
+            .expect("tail start") as usize;
+        [&bytes[..RANGED_HEADER_LEN], &bytes[from..]].concat()
+    }
+
+    /// Head, block and run reads answer what the whole slice does.
+    #[test]
+    fn head_block_and_run_reads_match_the_whole_slice() {
+        let (bytes, keys) = ranged_slice();
+        let slice = Slice::open(&bytes).expect("open");
+        let head = SliceHead::decode(head_bytes(&bytes), bytes.len() as u64).expect("head");
+        let index = head.index().expect("index");
+        assert!(index.n_blocks() > 1, "test spans several blocks");
+        let absent = [make_key("body", "t00000a"), make_key("body", "zzz")];
+        for key in keys.iter().chain(&absent) {
+            let by_range = index.block_for(key).and_then(|b| {
+                let range = head.block_range(&index, b).expect("block range");
+                let block = &bytes[range.start as usize..range.end as usize];
+                head.check_block(b, block).expect("block CRC");
+                lookup_in_block(block, key).map(|value| {
+                    let run = head.run_range(value).expect("run range");
+                    decode_checked_run(&bytes[run.start as usize..run.end as usize])
+                        .expect("run")
+                        .postings
+                })
+            });
+            assert_eq!(by_range, slice.postings(key).expect("whole"));
+        }
+        assert!(
+            index.block_for(&make_key("a", "")).is_none(),
+            "below every key"
+        );
+    }
+
+    /// A flipped byte in a head, block or run is an error.
+    #[test]
+    fn head_block_and_run_corruption_is_refused() {
+        let (bytes, keys) = ranged_slice();
+        let len = bytes.len() as u64;
+        let head = head_bytes(&bytes);
+        for at in [0, MAGIC_LEN + U32_LEN, RANGED_HEADER_LEN, head.len() - 1] {
+            let mut bad = head.clone();
+            bad[at] ^= 0xFF;
+            assert!(SliceHead::decode(bad, len).is_err(), "head byte {at}");
+        }
+        assert!(
+            SliceHead::decode(head.clone(), len + 1).is_err(),
+            "wrong length"
+        );
+        let head = SliceHead::decode(head, len).expect("head");
+        let index = head.index().expect("index");
+        let key = &keys[keys.len() / 2];
+        let b = index.block_for(key).expect("block");
+        let range = head.block_range(&index, b).expect("block range");
+        let mut block = bytes[range.start as usize..range.end as usize].to_vec();
+        let value = lookup_in_block(&block, key).expect("present");
+        block[0] ^= 0xFF;
+        assert!(head.check_block(b, &block).is_err(), "corrupt block");
+        assert!(
+            head.check_block(index.n_blocks(), &block).is_err(),
+            "past the table"
+        );
+        let run = head.run_range(value).expect("run range");
+        let mut run = bytes[run.start as usize..run.end as usize].to_vec();
+        run[0] ^= 0x01;
+        assert!(
+            matches!(decode_checked_run(&run), Err(TermIndexError::Malformed(m)) if m.contains("CRC")),
+            "corrupt run"
+        );
+    }
+
+    /// A whole-read slice (version 2, or version 1 from before tiers) has
+    /// no head to read by range.
+    #[test]
+    fn a_version_1_slice_has_no_head() {
+        let legacy = encode_legacy_slice(&[(make_key("body", "alpha"), vec![])]);
+        for bytes in [
+            build_slice(SliceFormat::Whole, &[("body", "alpha", one(1))]),
+            legacy,
+        ] {
+            let header = SliceHeader::decode(&bytes).expect("header");
+            assert_eq!(header.format(), SliceFormat::Whole);
+            assert!(SliceHead::decode(bytes.clone(), bytes.len() as u64).is_err());
+        }
     }
 }
