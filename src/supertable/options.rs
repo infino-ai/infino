@@ -1147,10 +1147,20 @@ impl SupertableOptions {
         self.term_index && self.storage.is_some()
     }
 
-    /// Where this table's large scratch files go: beside the disk cache when
-    /// one is attached, on the disk sized for the table, else
-    /// `storage.scratch_root`.
+    /// Where this table's builds keep their temporary files, which are of
+    /// no use once the process exits: this process's own folder beside the
+    /// disk cache when one is attached, on the disk sized for the table,
+    /// else `storage.scratch_root`.
     pub(crate) fn scratch_dir(&self) -> PathBuf {
+        self.disk_cache
+            .as_ref()
+            .map_or_else(scratch_root, |cache| cache.run_scratch_dir())
+    }
+
+    /// Where this table keeps work a later process resumes (a drain's
+    /// spill): beside the disk cache when one is attached, else
+    /// `storage.scratch_root`.
+    pub(crate) fn resumable_scratch_dir(&self) -> PathBuf {
         self.disk_cache
             .as_ref()
             .map_or_else(scratch_root, |cache| cache.scratch_root())
@@ -1169,7 +1179,7 @@ impl SupertableOptions {
                 .clamp(1, HEAD_DEPTH_MAX),
             pool: Some(Arc::clone(&self.writer_pool)),
             spill_to_disk: true,
-            scratch_root: self.disk_cache.as_ref().map(|c| c.scratch_root()),
+            scratch_root: self.disk_cache.as_ref().map(|c| c.run_scratch_dir()),
             ..BuildPolicy::default()
         }
     }

@@ -5843,7 +5843,7 @@ const DRAIN_SCRATCH_RESERVE_DIVISOR: u64 = 20;
 /// Where `options`' table keeps its drain epochs: beside its disk cache when
 /// it has one, else under the process scratch root.
 fn drain_scratch_parent(options: &SupertableOptions) -> PathBuf {
-    options.scratch_dir().join(DRAIN_SCRATCH_SUBDIR)
+    options.resumable_scratch_dir().join(DRAIN_SCRATCH_SUBDIR)
 }
 
 fn drain_scratch_dir(options: &SupertableOptions, epoch_id: &str) -> PathBuf {
