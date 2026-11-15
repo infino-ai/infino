@@ -5042,6 +5042,37 @@ mod tests {
         assert_eq!(count("SELECT COUNT(*) FROM other"), 2);
     }
 
+    /// A statement's scans register their object stores in the runtime every
+    /// statement shares; each is gone once its statement is, whether it
+    /// returned rows or failed. A store left registered would keep its
+    /// superfiles' bytes and its statement's collector alive for as long as
+    /// the connection.
+    #[test]
+    fn a_finished_statement_releases_its_object_stores() {
+        let conn = connect("memory://").expect("connect");
+        let field = Field::new("tag", DataType::LargeUtf8, true);
+        one_column_table(&conn, "tags", field, distinct_strings("a", 3));
+        let collector_of = |run: &dyn Fn()| {
+            let (collector, _) = with_op_stats(|| {
+                run();
+                Arc::downgrade(&op_stats::current().expect("a work stats scope"))
+            });
+            collector
+        };
+        let returned = collector_of(&|| {
+            conn.query_sql("SELECT tag FROM tags").expect("sql");
+        });
+        let failed = collector_of(&|| {
+            assert!(conn.query_sql("SELECT CAST(tag AS INT) FROM tags").is_err());
+        });
+        for (outcome, collector) in [("returned", returned), ("failed", failed)] {
+            assert!(
+                collector.upgrade().is_none(),
+                "a statement that {outcome} left its scan's store registered"
+            );
+        }
+    }
+
     /// A table's value counts are its `GROUP BY` counts, merged across superfiles.
     #[test]
     fn value_counts_match_the_grouped_count() {

@@ -56,7 +56,7 @@
 use std::{
     collections::HashSet,
     future::Future,
-    sync::{Arc, OnceLock},
+    sync::{Arc, Mutex, OnceLock, PoisonError},
     time::Instant,
 };
 
@@ -75,6 +75,8 @@ use datafusion::{
     execution::{
         SessionStateDefaults, TaskContext,
         context::{SessionContext, SessionState},
+        object_store::ObjectStoreUrl,
+        runtime_env::RuntimeEnv,
     },
     functions_aggregate::{count::count_all, expr_fn::count},
     logical_expr::{
@@ -296,7 +298,46 @@ impl SessionTemplate {
             Arc::new(default_catalog),
         );
         state.register_catalog_list(Arc::new(catalogs));
+        // It shares the template's runtime too, whose object-store registry
+        // keeps what a scan registers until it is removed.
+        let stores = StatementStores {
+            runtime: Arc::clone(state.runtime_env()),
+            urls: Mutex::default(),
+        };
+        state.config_mut().set_extension(Arc::new(stores));
         Ok(SessionContext::new_with_state(state))
+    }
+}
+
+/// The object stores one statement's scans registered in the runtime it
+/// shares with every other statement on its connection (see
+/// [`SessionTemplate`]), removed from it when the statement's last session
+/// handle is dropped: when it returns, fails or is cancelled, and after a
+/// planning task it abandoned has stopped. Scans register under URLs unique
+/// to their provider, so removing them touches no other statement's.
+pub(crate) struct StatementStores {
+    runtime: Arc<RuntimeEnv>,
+    urls: Mutex<HashSet<ObjectStoreUrl>>,
+}
+
+impl StatementStores {
+    /// Note that a scan of this statement registered `url`.
+    pub(crate) fn record(&self, url: &ObjectStoreUrl) {
+        self.urls
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(url.clone());
+    }
+}
+
+impl Drop for StatementStores {
+    fn drop(&mut self) {
+        let urls = self.urls.get_mut().unwrap_or_else(PoisonError::into_inner);
+        for url in urls.drain() {
+            // Every recorded URL was registered and only this removes it, so
+            // the store is always there to remove; the store is what drops.
+            drop(self.runtime.deregister_object_store(url.as_ref()));
+        }
     }
 }
 
