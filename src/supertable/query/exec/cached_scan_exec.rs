@@ -201,11 +201,14 @@ struct ScanContext {
     op_stats: Option<Arc<OpStatsCollector>>,
     cache: Arc<DecodedColumnCache>,
     schema_id: u32,
-    /// One lock for each row group a read has decoded, held while it
-    /// decodes: reads of one row group's id blocks that miss the cache
-    /// together decode it once, the first keeping the columns the rest
-    /// then find kept.
-    decoding: Mutex<HashMap<(SuperfileUri, usize), Arc<AsyncMutex<()>>>>,
+    /// For each row group reads are decoding, a lock held while one decodes
+    /// over the columns decoded so far, by their place in `schema`: reads of
+    /// one row group's id blocks that miss the cache together decode it
+    /// once, the rest taking the first's columns from here. The last read
+    /// out removes the entry, unless the cache refused a column (larger than
+    /// the whole cache): the row group's later blocks then take it from here
+    /// instead of decoding the row group again each.
+    decoding: Mutex<HashMap<(SuperfileUri, usize), Arc<AsyncMutex<Vec<Option<ArrayRef>>>>>>,
 }
 
 /// A table scan served from the decoded-column cache; see the module docs.
@@ -283,13 +286,12 @@ impl IdBlockQueue {
     /// has no sidecar bounds to order by, or fewer blocks than its rows
     /// fill.
     async fn new(units: Arc<[RowGroupUnit]>, descending: bool) -> Option<Self> {
-        let mut files: Vec<(Arc<CachedFile>, FileBlocks)> = Vec::new();
+        let mut files: Vec<FileBlocks> = Vec::new();
+        // Each file's place in `files`, by its URI.
+        let mut placed: HashMap<SuperfileUri, usize> = HashMap::new();
         for (at, unit) in units.iter().enumerate() {
-            let file = match files
-                .iter()
-                .position(|(file, _)| Arc::ptr_eq(file, &unit.file))
-            {
-                Some(file) => file,
+            let file = match placed.get(&unit.file.uri) {
+                Some(&file) => file,
                 None => {
                     let blocks = unit.file.reader.id_blocks().await?;
                     let mut starts = Vec::with_capacity(unit.file.row_counts.len() + 1);
@@ -304,23 +306,21 @@ impl IdBlockQueue {
                         return None;
                     }
                     let groups = unit.file.row_counts.len();
-                    files.push((
-                        Arc::clone(&unit.file),
-                        FileBlocks {
-                            blocks,
-                            units: vec![None; groups],
-                            starts,
-                            taken: 0,
-                        },
-                    ));
+                    files.push(FileBlocks {
+                        blocks,
+                        units: vec![None; groups],
+                        starts,
+                        taken: 0,
+                    });
+                    placed.insert(unit.file.uri, files.len() - 1);
                     files.len() - 1
                 }
             };
-            *files[file].1.units.get_mut(unit.row_group)? = Some(at);
+            *files[file].units.get_mut(unit.row_group)? = Some(at);
         }
         let mut queue = Self {
             units,
-            files: files.into_iter().map(|(_, file)| file).collect(),
+            files,
             descending,
             next: BinaryHeap::new(),
             pending: VecDeque::new(),
@@ -839,25 +839,57 @@ impl ScanContext {
     /// The `missing` projected columns of `unit`'s row group, decoded, typed
     /// as the scan schema types them, and kept in the cache. A read of the
     /// same row group decoding already is waited for, and the columns it
-    /// kept are taken from the cache.
+    /// decoded are taken from it.
     async fn decode_and_keep(
         self: Arc<Self>,
         unit: RowGroupUnit,
         missing: Vec<usize>,
         decoded_groups: Count,
     ) -> DfResult<Vec<ArrayRef>> {
-        let lock = Arc::clone(
+        let group = (unit.file.uri, unit.row_group);
+        let shared = Arc::clone(
             self.decoding
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .entry((unit.file.uri, unit.row_group))
-                .or_default(),
+                .entry(group)
+                .or_insert_with(|| {
+                    Arc::new(AsyncMutex::new(vec![None; self.schema.fields().len()]))
+                }),
         );
-        let _decoding = lock.lock().await;
+        let read = self
+            .decode_shared(&unit, &missing, &shared, decoded_groups)
+            .await;
+        // When only this read and the map hold the entry, no read waits on
+        // it, and a later one finds the columns kept: the entry goes, unless
+        // it holds a column the cache refused.
+        let mut decoding = self.decoding.lock().unwrap_or_else(PoisonError::into_inner);
+        let refused = read.as_ref().is_ok_and(|(_, refused)| *refused);
+        if !refused && Arc::strong_count(&shared) == 2 {
+            decoding.remove(&group);
+        }
+        read.map(|(columns, _)| columns)
+    }
+
+    /// The `missing` projected columns of `unit`'s row group from `shared`,
+    /// the columns reads of it decoded, else from the cache, else decoded,
+    /// kept, and left in `shared` for the reads waiting on it; and whether
+    /// `shared` holds a column the cache refused.
+    async fn decode_shared(
+        &self,
+        unit: &RowGroupUnit,
+        missing: &[usize],
+        shared: &AsyncMutex<Vec<Option<ArrayRef>>>,
+        decoded_groups: Count,
+    ) -> DfResult<(Vec<ArrayRef>, bool)> {
+        let mut decoded = shared.lock().await;
         let fields = self.schema.fields();
         let mut columns: Vec<Option<ArrayRef>> = missing
             .iter()
-            .map(|&i| self.cache.get(&self.key(&unit, fields[i].name())))
+            .map(|&i| {
+                decoded[i]
+                    .clone()
+                    .or_else(|| self.cache.get(&self.key(unit, fields[i].name())))
+            })
             .collect();
         let at: Vec<usize> = (0..missing.len())
             .filter(|&k| columns[k].is_none())
@@ -865,14 +897,21 @@ impl ScanContext {
         if !at.is_empty() {
             let still: Vec<usize> = at.iter().map(|&k| missing[k]).collect();
             decoded_groups.add(1);
-            for (k, array) in at.into_iter().zip(self.decode(&unit, &still).await?) {
+            for (k, array) in at.into_iter().zip(self.decode(unit, &still).await?) {
+                decoded[missing[k]] = Some(Arc::clone(&array));
                 columns[k] = Some(array);
             }
         }
-        columns
+        // The cache refuses an array larger than all of it.
+        let refused = decoded
+            .iter()
+            .flatten()
+            .any(|array| array.get_array_memory_size() > self.cache.max_bytes());
+        let columns = columns
             .into_iter()
             .map(|c| c.ok_or_else(|| DataFusionError::Internal("a column was not read".into())))
-            .collect()
+            .collect::<DfResult<_>>()?;
+        Ok((columns, refused))
     }
 
     /// The `missing` projected columns of `unit`'s row group, decoded, typed
@@ -1035,6 +1074,19 @@ impl ExecutionPlan for CachedScanExec {
         _children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
         Ok(self)
+    }
+
+    /// A fresh id block queue, so a plan run again (a recursive query's
+    /// term, once per step) reads every block again instead of what the
+    /// last run left in the queue.
+    fn reset_state(self: Arc<Self>) -> DfResult<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::new(Self {
+            id_order: self.id_order.as_ref().map(|order| IdOrder {
+                descending: order.descending,
+                queue: Arc::default(),
+            }),
+            ..(*self).clone()
+        }))
     }
 
     fn partition_statistics(&self, partition: Option<usize>) -> DfResult<Arc<Statistics>> {

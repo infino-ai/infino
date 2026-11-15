@@ -239,6 +239,27 @@ fn a_top_k_over_kept_columns_answers_as_a_full_sort() {
         }
     }
 
+    // A recursive query runs its recursive term once per step, each run a
+    // fresh read of the same scan: every step finds the id the top-k gives.
+    let steps = "WITH RECURSIVE r AS (SELECT 0 AS n UNION ALL SELECT n + 1 FROM r \
+                 CROSS JOIN (SELECT _id FROM t WHERE seq % 7 = 0 ORDER BY _id LIMIT 1) \
+                 WHERE n < 3) SELECT n FROM r ORDER BY n";
+    let got: Vec<i64> = conn
+        .query_sql(steps)
+        .expect("recursive")
+        .iter()
+        .flat_map(|b| {
+            let n = b
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("n")
+                .clone();
+            (0..n.len()).map(move |i| n.value(i))
+        })
+        .collect();
+    assert_eq!(got, vec![0, 1, 2, 3], "{steps}");
+
     // A top-k on another column reads row groups best first and skips the
     // ones its bound rules out as it tightens: the same rows as a full sort.
     let seqs = |batches: &[RecordBatch]| -> Vec<i64> {
