@@ -91,6 +91,7 @@ use crate::{
             covered_agg::{
                 CoveredAggregateRewrite, prepare_aggregate_inputs, value_counts_from_statistics,
             },
+            empty_sort_keys::EmptySortKeys,
             exec::{
                 common::{collect_plan_metered, run_within_process_limit},
                 fts_exec::register_bm25,
@@ -98,7 +99,6 @@ use crate::{
                 match_exec::{MatchTopK, register_match},
                 vector_exec::register_vector_search,
             },
-            empty_sort_keys::EmptySortKeys,
             provider::{SupertableProvider, TABLE_NAME, view_string_schema},
             range_top_k::RangeTopK,
         },

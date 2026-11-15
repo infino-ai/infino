@@ -46,11 +46,10 @@ use arrow_array::{
 use arrow_schema::{Schema, SchemaRef};
 use datafusion::{
     arrow::compute::{can_cast_types, cast_with_options, filter_record_batch},
-    common::Statistics,
+    common::{ScalarValue, Statistics, config::ConfigOptions},
     datasource::physical_plan::parquet::ParquetAccessPlan,
     error::{DataFusionError, Result as DfResult},
     execution::TaskContext,
-    common::{ScalarValue, config::ConfigOptions},
     physical_expr::{
         EquivalenceProperties, PhysicalExpr, PhysicalSortExpr,
         expressions::{Column, DynamicFilterPhysicalExpr},
@@ -372,7 +371,10 @@ fn best_first(units: &[RowGroupUnit], column: &str, descending: bool) -> Option<
     // Each file's bounds, read from its footer once.
     let mut bounds: Vec<(Arc<CachedFile>, Option<ArrayRef>)> = Vec::new();
     for unit in units {
-        let array = match bounds.iter().find(|(file, _)| Arc::ptr_eq(file, &unit.file)) {
+        let array = match bounds
+            .iter()
+            .find(|(file, _)| Arc::ptr_eq(file, &unit.file))
+        {
             Some((_, array)) => array.clone(),
             None => {
                 let array = row_group_bounds(&unit.file.footer, column, descending);
@@ -405,11 +407,7 @@ fn best_first(units: &[RowGroupUnit], column: &str, descending: bool) -> Option<
 /// Each row group's minimum (maximum when `descending`) of `column` in a
 /// file with `footer`; `None` when the file does not hold it or records no
 /// statistics a converter reads.
-fn row_group_bounds(
-    footer: &ParquetMetaData,
-    column: &str,
-    descending: bool,
-) -> Option<ArrayRef> {
+fn row_group_bounds(footer: &ParquetMetaData, column: &str, descending: bool) -> Option<ArrayRef> {
     let file = footer.file_metadata();
     let schema = parquet_to_arrow_schema(file.schema_descr(), file.key_value_metadata()).ok()?;
     let converter = StatisticsConverter::try_new(column, &schema, file.schema_descr()).ok()?;

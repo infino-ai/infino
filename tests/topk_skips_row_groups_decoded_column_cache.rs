@@ -125,9 +125,13 @@ fn a_top_k_over_kept_columns_answers_as_a_full_sort() {
         let mut want = every.clone();
         want.truncate(k);
         for keys in ["_id ASC", "note ASC NULLS LAST, _id ASC"] {
-            let sql = format!("SELECT seq, \"_id\" AS \"_id\" FROM t WHERE seq % 7 = 0 ORDER BY {keys} LIMIT {k}");
+            let sql = format!(
+                "SELECT seq, \"_id\" AS \"_id\" FROM t WHERE seq % 7 = 0 ORDER BY {keys} LIMIT {k}"
+            );
             for run in ["decoding", "from kept columns"] {
-                let got = ids(&conn.query_sql(&sql).unwrap_or_else(|e| panic!("{run}: {e}")));
+                let got = ids(&conn
+                    .query_sql(&sql)
+                    .unwrap_or_else(|e| panic!("{run}: {e}")));
                 assert_eq!(got, want, "{run}: {sql}");
             }
             let plan = physical_plan(&conn, &sql);
@@ -158,7 +162,11 @@ fn a_top_k_over_kept_columns_answers_as_a_full_sort() {
         for k in [1_usize, 10, 500, 5_000] {
             let sql = format!("SELECT seq FROM t WHERE seq % 7 = 0 ORDER BY seq {order} LIMIT {k}");
             for run in ["first", "again"] {
-                let got = seqs(&conn.query_sql(&sql).unwrap_or_else(|e| panic!("{run}: {e}")));
+                let got = seqs(
+                    &conn
+                        .query_sql(&sql)
+                        .unwrap_or_else(|e| panic!("{run}: {e}")),
+                );
                 assert_eq!(got, kept[..k.min(kept.len())], "{run}: {sql}");
             }
         }
