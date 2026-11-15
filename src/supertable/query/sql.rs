@@ -263,8 +263,8 @@ pub(crate) fn sql_session_context(
 
 /// [`sql_session_context`] built once and handed out as a copy per
 /// statement: its configuration, its optimizer rules and DataFusion's
-/// function library are the same for every statement on a connection, and
-/// building them again took a seventh of a small statement's time. Each copy
+/// function library are the same for every statement on a connection, so
+/// copying them skips rebuilding that setup for each statement. Each copy
 /// gets a catalog list of its own, so the tables and table functions one
 /// statement registers are never seen by another.
 #[derive(Default)]
