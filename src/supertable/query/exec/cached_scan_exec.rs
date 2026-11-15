@@ -50,7 +50,7 @@
 
 use std::{
     cmp::Reverse,
-    collections::{BinaryHeap, HashSet, VecDeque},
+    collections::{BinaryHeap, HashMap, HashSet, VecDeque},
     fmt,
     ops::Range,
     sync::{Arc, Mutex, PoisonError},
@@ -84,6 +84,7 @@ use datafusion::{
         filter_pushdown::{
             ChildPushdownResult, FilterPushdownPhase, FilterPushdownPropagation, PushedDown,
         },
+        metrics::{Count, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet},
         sort_pushdown::SortOrderPushdownResult,
         stream::RecordBatchStreamAdapter,
     },
@@ -94,7 +95,10 @@ use parquet::{
     file::metadata::ParquetMetaData,
 };
 use roaring::RoaringBitmap;
-use tokio::{spawn, sync::OnceCell};
+use tokio::{
+    spawn,
+    sync::{Mutex as AsyncMutex, OnceCell},
+};
 use tracing::Instrument;
 
 use crate::{
@@ -117,6 +121,12 @@ use crate::{
 /// view, as the scan reads non-indexed strings, and the most any of Arrow's
 /// variable-width layouts takes.
 const VIEW_BYTES_PER_ROW: usize = 16;
+
+/// How `EXPLAIN ANALYZE` names the rows of the units a scan read.
+const ROWS_READ: &str = "rows_read";
+
+/// How `EXPLAIN ANALYZE` names the row groups a scan decoded.
+const ROW_GROUPS_DECODED: &str = "row_groups_decoded";
 
 /// One file of the scan: what its row groups are read from.
 #[derive(Debug)]
@@ -191,6 +201,11 @@ struct ScanContext {
     op_stats: Option<Arc<OpStatsCollector>>,
     cache: Arc<DecodedColumnCache>,
     schema_id: u32,
+    /// One lock for each row group a read has decoded, held while it
+    /// decodes: reads of one row group's id blocks that miss the cache
+    /// together decode it once, the first keeping the columns the rest
+    /// then find kept.
+    decoding: Mutex<HashMap<(SuperfileUri, usize), Arc<AsyncMutex<()>>>>,
 }
 
 /// A table scan served from the decoded-column cache; see the module docs.
@@ -215,6 +230,9 @@ pub(crate) struct CachedScanExec {
     /// Set when a sort on `_id` was pushed down: the rows are read by id
     /// block ([`IdOrder`]).
     id_order: Option<IdOrder>,
+    /// The rows of the units read ([`ROWS_READ`]) and the row groups decoded
+    /// ([`ROW_GROUPS_DECODED`]), for `EXPLAIN ANALYZE`.
+    metrics: ExecutionPlanMetricsSet,
 }
 
 /// A read in `_id` order: the scan's row groups cut into id blocks, taken
@@ -640,6 +658,7 @@ impl CachedScanExec {
                 op_stats,
                 cache,
                 schema_id,
+                decoding: Mutex::default(),
             }),
             units: units.into(),
             pruned,
@@ -650,6 +669,7 @@ impl CachedScanExec {
             parquet,
             live: None,
             id_order: None,
+            metrics: ExecutionPlanMetricsSet::new(),
         })
     }
 
@@ -817,21 +837,52 @@ impl ScanContext {
     }
 
     /// The `missing` projected columns of `unit`'s row group, decoded, typed
-    /// as the scan schema types them, and kept in the cache.
+    /// as the scan schema types them, and kept in the cache. A read of the
+    /// same row group decoding already is waited for, and the columns it
+    /// kept are taken from the cache.
     async fn decode_and_keep(
         self: Arc<Self>,
         unit: RowGroupUnit,
         missing: Vec<usize>,
+        decoded_groups: Count,
     ) -> DfResult<Vec<ArrayRef>> {
+        let lock = Arc::clone(
+            self.decoding
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .entry((unit.file.uri, unit.row_group))
+                .or_default(),
+        );
+        let _decoding = lock.lock().await;
+        let fields = self.schema.fields();
+        let mut columns: Vec<Option<ArrayRef>> = missing
+            .iter()
+            .map(|&i| self.cache.get(&self.key(&unit, fields[i].name())))
+            .collect();
+        let at: Vec<usize> = (0..missing.len())
+            .filter(|&k| columns[k].is_none())
+            .collect();
+        if !at.is_empty() {
+            let still: Vec<usize> = at.iter().map(|&k| missing[k]).collect();
+            decoded_groups.add(1);
+            for (k, array) in at.into_iter().zip(self.decode(&unit, &still).await?) {
+                columns[k] = Some(array);
+            }
+        }
+        columns
+            .into_iter()
+            .map(|c| c.ok_or_else(|| DataFusionError::Internal("a column was not read".into())))
+            .collect()
+    }
+
+    /// The `missing` projected columns of `unit`'s row group, decoded, typed
+    /// as the scan schema types them, and kept in the cache.
+    async fn decode(&self, unit: &RowGroupUnit, missing: &[usize]) -> DfResult<Vec<ArrayRef>> {
         let fields = self.schema.fields();
         let names: Vec<&str> = missing.iter().map(|&i| fields[i].name().as_str()).collect();
         // Read as the scan types them, so a string the scan works on as a
         // view decodes into one directly.
-        let typed = Arc::new(
-            self.schema
-                .project(&missing)
-                .map_err(QueryError::internal)?,
-        );
+        let typed = Arc::new(self.schema.project(missing).map_err(QueryError::internal)?);
         let read = read_file_row_group(
             &self.manifest,
             &unit.file.reader,
@@ -850,7 +901,7 @@ impl ScanContext {
                 cast_with_options(array, target, &CAST_OPTIONS)?
             };
             self.cache.insert(
-                self.key(&unit, fields[i].name()),
+                self.key(unit, fields[i].name()),
                 Arc::clone(&array),
                 array.get_array_memory_size(),
             );
@@ -861,8 +912,13 @@ impl ScanContext {
 
     /// `unit`'s rows, every projected column, without its deleted rows and,
     /// when the index chose the file's rows, without the rows it didn't. The
-    /// columns are read and kept for the whole row group.
-    async fn read(self: &Arc<Self>, unit: &RowGroupUnit) -> DfResult<RecordBatch> {
+    /// columns are read and kept for the whole row group; a row group this
+    /// decodes counts in `decoded_groups`.
+    async fn read(
+        self: &Arc<Self>,
+        unit: &RowGroupUnit,
+        decoded_groups: Count,
+    ) -> DfResult<RecordBatch> {
         let fields = self.schema.fields();
         let mut columns: Vec<Option<ArrayRef>> = fields
             .iter()
@@ -878,7 +934,7 @@ impl ScanContext {
             // Run to the end, it keeps them for the next statement.
             let decoded = spawn(
                 Arc::clone(self)
-                    .decode_and_keep(unit.clone(), missing.clone())
+                    .decode_and_keep(unit.clone(), missing.clone(), decoded_groups)
                     .in_current_span(),
             )
             .await
@@ -986,6 +1042,10 @@ impl ExecutionPlan for CachedScanExec {
             None => Arc::clone(&self.statistics),
             Some(_) => Arc::new(Statistics::new_unknown(&self.context.schema)),
         })
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
     }
 
     fn fetch(&self) -> Option<usize> {
@@ -1116,6 +1176,9 @@ impl ExecutionPlan for CachedScanExec {
         })
         .flatten();
         let context = Arc::clone(&self.context);
+        let rows_read = MetricBuilder::new(&self.metrics).counter(ROWS_READ, partition);
+        let decoded_groups =
+            MetricBuilder::new(&self.metrics).counter(ROW_GROUPS_DECODED, partition);
         let live = self.live.clone();
         let kept = self.live.clone();
         let context_schema = Arc::clone(&self.context.schema);
@@ -1169,7 +1232,9 @@ impl ExecutionPlan for CachedScanExec {
             })
             .then(move |unit| {
                 let context = Arc::clone(&context);
-                async move { context.read(&unit).await }
+                rows_read.add(unit.rows.len());
+                let decoded_groups = decoded_groups.clone();
+                async move { context.read(&unit, decoded_groups).await }
             })
             .map_ok(move |batch| stream::iter(sliced(batch, batch_size).into_iter().map(Ok)))
             .try_flatten()

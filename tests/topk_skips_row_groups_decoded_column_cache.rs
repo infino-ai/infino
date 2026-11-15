@@ -31,6 +31,19 @@ const ROWS: i64 = 3_000;
 /// Fewest commits, each a superfile of one row group.
 const MIN_COMMITS: i64 = 3;
 
+/// The `LIMIT`s small enough that a top-k on the id settles within the
+/// first id block each partition reads.
+const SMALL_K: [usize; 2] = [1, 10];
+
+/// How `EXPLAIN ANALYZE` names the rows of the units the scan read.
+const ROWS_READ: &str = "rows_read";
+
+/// How `EXPLAIN ANALYZE` names the row groups the scan decoded.
+const ROW_GROUPS_DECODED: &str = "row_groups_decoded";
+
+/// The scale of each suffix `EXPLAIN ANALYZE` prints a count with.
+const COUNT_SUFFIXES: [(&str, f64); 3] = [(" K", 1e3), (" M", 1e6), (" B", 1e9)];
+
 /// The `_id` column across `batches`, in order.
 fn ids(batches: &[RecordBatch]) -> Vec<i128> {
     batches
@@ -70,6 +83,48 @@ fn physical_plan(conn: &infino::Connection, sql: &str) -> String {
                 .collect::<Vec<_>>()
         })
         .collect()
+}
+
+/// The scan's metric `name` as `EXPLAIN ANALYZE` prints it running `sql`,
+/// read back from its rounded form (`3.07 K`).
+fn scan_metric(conn: &infino::Connection, sql: &str, name: &str) -> f64 {
+    let lines: Vec<String> = conn
+        .query_sql(&format!("EXPLAIN ANALYZE {sql}"))
+        .expect("explain analyze")
+        .iter()
+        .flat_map(|b| {
+            let plans = b
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("plan column")
+                .clone();
+            (0..plans.len())
+                .filter(|i| plans.is_valid(*i))
+                .flat_map(|i| {
+                    plans
+                        .value(i)
+                        .lines()
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let line = lines
+        .iter()
+        .find(|line| line.contains("CachedScanExec"))
+        .unwrap_or_else(|| panic!("no CachedScanExec in {lines:#?}"));
+    let value = line
+        .split(&format!("{name}="))
+        .nth(1)
+        .and_then(|rest| rest.split([',', ']']).next())
+        .unwrap_or_else(|| panic!("no {name} in {line}"));
+    let (number, scale) = COUNT_SUFFIXES
+        .iter()
+        .find_map(|&(suffix, scale)| value.strip_suffix(suffix).map(|n| (n, scale)))
+        .unwrap_or((value, 1.0));
+    number.parse::<f64>().expect("a count") * scale
 }
 
 #[test]
@@ -121,6 +176,17 @@ fn a_top_k_over_kept_columns_answers_as_a_full_sort() {
         )
         .expect("append");
     }
+
+    // Read cold past every row the filter keeps, the scan takes every id
+    // block, a row group's blocks going to whichever partitions are free:
+    // the blocks of a row group read side by side decode it once.
+    let every_block = "SELECT seq, \"_id\" AS \"_id\" FROM t WHERE seq % 7 = 0 \
+                       ORDER BY _id ASC LIMIT 1000000";
+    assert_eq!(
+        scan_metric(&conn, every_block, ROW_GROUPS_DECODED),
+        commits as f64,
+        "{every_block}"
+    );
     t.delete(col("seq").lt(lit(30_i64))).expect("delete");
 
     let every = {
@@ -159,6 +225,15 @@ fn a_top_k_over_kept_columns_answers_as_a_full_sort() {
                 if keys.starts_with("_id") {
                     let direction = if descending { "desc" } else { "asc" };
                     assert!(plan.contains(&format!("id_blocks={direction}")), "{plan}");
+                    // A small top-k stops after the first block or so each
+                    // partition reads. Read by row group, every partition
+                    // reads a whole one of 3 blocks before the bound settles,
+                    // and the scan reads at least two thirds of the rows.
+                    if SMALL_K.contains(&k) {
+                        let read = scan_metric(&conn, &sql, ROWS_READ);
+                        let rows = (commits * ROWS) as f64;
+                        assert!(read * 2.0 < rows, "read {read} of {rows} rows: {sql}");
+                    }
                 }
             }
         }

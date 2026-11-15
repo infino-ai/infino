@@ -342,7 +342,11 @@ pub(crate) fn ids_in_block(
 /// in `bytes`, or `None` if the header is bad or the block runs past the
 /// bytes. `expected` is how many docs the block must hold.
 fn parse_block(bytes: &[u8], off: usize, expected: usize) -> Option<IdBlock> {
-    let header = bytes.get(off..off + BLOCK_HEADER_BYTES)?;
+    // A corrupt directory entry can name any offset up to `u64::MAX`, so the
+    // header's end is checked before it is used; past it, every sum is
+    // bounded by the bytes the header check just proved are there.
+    let hi_start = off.checked_add(BLOCK_HEADER_BYTES)?;
+    let header = bytes.get(off..hi_start)?;
     let hi_width = header[HI_WIDTH_AT];
     let lo_width = header[LO_WIDTH_AT];
     let n_in_block =
@@ -350,7 +354,6 @@ fn parse_block(bytes: &[u8], off: usize, expected: usize) -> Option<IdBlock> {
     if hi_width > MAX_WIDTH || lo_width > MAX_WIDTH || n_in_block != expected {
         return None;
     }
-    let hi_start = off + BLOCK_HEADER_BYTES;
     let lo_start = hi_start + payload_bytes(n_in_block, hi_width);
     let lo_end = lo_start + payload_bytes(n_in_block, lo_width);
     bytes.get(hi_start..lo_end)?;
@@ -949,16 +952,19 @@ mod tests {
             edit(&mut bytes);
             bytes
         };
-        let cases: [(&str, Vec<u8>); 4] = [
+        let dir_entry = |off: u64| {
+            damage(&move |b| {
+                let dir = HEADER_BYTES + last_block * DIR_ENTRY_BYTES;
+                b[dir..dir + DIR_ENTRY_BYTES].copy_from_slice(&off.to_le_bytes());
+            })
+        };
+        let cases: [(&str, Vec<u8>); 5] = [
             ("block cut short", packed[..packed.len() - 1].to_vec()),
             (
                 "directory entry past the sidecar",
-                damage(&|b| {
-                    let dir = HEADER_BYTES + last_block * DIR_ENTRY_BYTES;
-                    let past_end = b.len() as u64;
-                    b[dir..dir + 8].copy_from_slice(&past_end.to_le_bytes());
-                }),
+                dir_entry(packed.len() as u64),
             ),
+            ("directory entry at the top of u64", dir_entry(u64::MAX)),
             ("width past 64", damage(&|b| damage_block(b, last_block))),
             (
                 "doc count",
@@ -972,6 +978,7 @@ mod tests {
         for (what, bytes) in &cases {
             let p = PackedIds::open(bytes, n).expect("header intact");
             assert_eq!(p.get(bad_doc), None, "{what}");
+            assert_eq!(p.block_bounds(), None, "{what}: no bounds from a bad block");
             assert_eq!(
                 p.check_blocks(),
                 Err(format!("packed id sidecar block {last_block} is malformed")),
