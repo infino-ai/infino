@@ -184,6 +184,9 @@ pub(crate) struct CachedEntry {
     /// Who releases `size_bytes` when the entry drops.
     accounting: EntryAccounting,
     last_access_us: AtomicU64,
+    /// The footer and page index the reader keeps decoded, counted against the process budget
+    /// (see [`heap`]) until the entry goes.
+    heap: OnceLock<HeapReservation>,
 }
 
 /// Which tier of the cache's walk served an open. Returned beside the reader so a scan can say
@@ -484,6 +487,9 @@ pub struct DiskCacheStore {
     /// Download tasks still running, cancelled ones included; what `wait_until_fills_settled`
     /// waits for.
     fills_running: AtomicUsize,
+    /// A test's own budget for decoded metadata, in place of the process's.
+    #[cfg(test)]
+    heap_budget: OnceLock<&'static HeapBudget>,
 }
 
 impl fmt::Debug for DiskCacheStore {
@@ -504,12 +510,16 @@ impl fmt::Debug for DiskCacheStore {
 mod budget;
 mod fetch;
 mod fill_wait;
+mod heap;
 mod read;
 mod sources;
 mod store_files;
 
 pub(crate) use budget::Reservation;
 pub(crate) use fetch::{open_batch_overlay, skip_background_fill};
+#[cfg(test)]
+pub(crate) use heap::HeapBudget;
+pub(crate) use heap::HeapReservation;
 pub(crate) use sources::{
     ArcMmapOwner, mmap_readonly_bytes, mmap_temp_file_bytes, release_temp_file, temp_file_behind,
 };
@@ -581,6 +591,8 @@ impl DiskCacheStore {
             fill_waiters: FillWaiters::default(),
             fills: DashMap::new(),
             fills_running: AtomicUsize::new(0),
+            #[cfg(test)]
+            heap_budget: OnceLock::new(),
         });
 
         // Record what is already on disk so the budget is correct from the start. Files are opened
@@ -619,6 +631,7 @@ impl DiskCacheStore {
             // required for correctness.
         }
 
+        store.register_heap();
         Ok(store)
     }
 

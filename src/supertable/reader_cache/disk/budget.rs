@@ -17,15 +17,21 @@ use tokio::sync::OwnedSemaphorePermit;
 #[cfg(test)]
 use tokio::time::timeout;
 
-use crate::supertable::{
-    manifest::SuperfileUri,
-    reader_cache::{config::EvictionCandidate, disk::*},
-};
 #[cfg(test)]
 use crate::{
     memory::ConnectionMemoryBudget,
     supertable::reader_cache::{
         block_source::BlockCachedSource, disk::test_support::tiny_superfile_bytes,
+    },
+};
+use crate::{
+    superfile::SuperfileReader,
+    supertable::{
+        manifest::SuperfileUri,
+        reader_cache::{
+            config::EvictionCandidate,
+            disk::{heap::free_elsewhere, *},
+        },
     },
 };
 
@@ -57,7 +63,7 @@ impl DiskCacheStore {
     /// kept too (see `BlockCachedSource::has_unfinished_writes`), and so is one
     /// whose file is downloading: its Warm reservation covers the download. That
     /// keeps at most one extra entry per download slot.
-    fn reclaimable_lazy_entry(&self, uri: &SuperfileUri, entry: &CachedEntry) -> bool {
+    pub(super) fn reclaimable_lazy_entry(&self, uri: &SuperfileUri, entry: &CachedEntry) -> bool {
         entry.mmap().is_none()
             && !entry.held_by_query()
             && entry
@@ -199,14 +205,24 @@ impl DiskCacheStore {
         };
         unheld.sort_unstable();
         let now_us = self.now_us();
-        for (_, uri) in unheld.into_iter().take(over) {
-            self.release_lazy_entry(&uri, now_us);
-        }
+        let released = unheld
+            .into_iter()
+            .take(over)
+            .filter_map(|(_, uri)| self.release_lazy_entry(&uri, now_us))
+            .collect();
+        // Freeing thousands of footers and page indexes takes seconds: the open that crossed the
+        // cap does not wait for it.
+        free_elsewhere(released);
     }
 
     /// Remove `uri`'s entry if it is still a lazy one only the cache holds,
-    /// releasing its budget and keeping its block file.
-    fn release_lazy_entry(&self, uri: &SuperfileUri, now_us: u64) {
+    /// releasing its budget and keeping its block file. Returns its reader, for
+    /// the caller to free where it chooses.
+    pub(super) fn release_lazy_entry(
+        &self,
+        uri: &SuperfileUri,
+        now_us: u64,
+    ) -> Option<Arc<SuperfileReader>> {
         // Re-check under the shard guard: a query may have taken a
         // reference since the snapshot, in which case dropping the
         // entry would free nothing and cost that query a re-open.
@@ -218,7 +234,9 @@ impl DiskCacheStore {
             if let Some(source) = removed.block_source() {
                 self.retain_block_file(uri, source, now_us);
             }
+            return Some(Arc::clone(&removed.reader));
         }
+        None
     }
 
     /// Sum of mmap virtual sizes across all cached entries
@@ -745,6 +763,7 @@ impl DiskCacheStore {
         self.cached.insert(
             uri,
             Arc::new(CachedEntry {
+                heap: OnceLock::new(),
                 reader: Arc::new(reader),
                 residency: Residency::Paged { block_source },
                 size_bytes,
