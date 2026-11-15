@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
-//! Integration coverage for [`Supertable::stage`] and [`Supertable::attach`]:
-//! staged rows stay out of the table until attached, land together in one
+//! Integration coverage for [`Supertable::stage`] and [`Supertable::commit_staged`]:
+//! staged rows stay out of the table until committed, land together in one
 //! commit, search like appended rows, and survive writers on other
-//! connections attaching to the same table at the same time.
+//! connections committing to the same table at the same time.
 
 #![deny(clippy::unwrap_used)]
 
@@ -79,7 +79,7 @@ fn hits(table: &Supertable, term: &str) -> usize {
 }
 
 #[test]
-fn staged_rows_join_the_table_only_when_attached() {
+fn staged_rows_join_the_table_only_when_committed() {
     let dir = TempDir::new().expect("tempdir");
     let db = open_db(&dir);
     let table = create(&db);
@@ -91,7 +91,7 @@ fn staged_rows_join_the_table_only_when_attached() {
     assert_eq!(count(&db), 0, "staged rows are not in the table");
     assert_eq!(hits(&table, "common"), 0);
 
-    table.attach(&staged).expect("attach");
+    table.commit_staged(&staged).expect("commit_staged");
     assert_eq!(count(&db), BATCHES * BATCH_ROWS);
     for b in 0..BATCHES {
         assert_eq!(
@@ -102,7 +102,7 @@ fn staged_rows_join_the_table_only_when_attached() {
     }
     assert_eq!(hits(&table, "common"), (BATCHES * BATCH_ROWS) as usize);
 
-    // Reopened, the table lists the attached superfiles.
+    // Reopened, the table lists the committed superfiles.
     let reopened = open_db(&dir);
     assert_eq!(count(&reopened), BATCHES * BATCH_ROWS);
 }
@@ -120,20 +120,20 @@ fn staged_and_appended_rows_mix_in_one_table() {
         BATCH_ROWS,
         "the append landed, the staged batch not yet"
     );
-    table.attach(&[staged]).expect("attach");
+    table.commit_staged(&[staged]).expect("commit_staged");
     assert_eq!(count(&db), 2 * BATCH_ROWS);
 }
 
 #[test]
-fn attaching_the_same_staged_batch_twice_is_refused() {
+fn committing_the_same_staged_batch_twice_is_refused() {
     let dir = TempDir::new().expect("tempdir");
     let db = open_db(&dir);
     let table = create(&db);
 
     let staged = [table.stage(&batch(0)).expect("stage")];
-    table.attach(&staged).expect("first attach");
+    table.commit_staged(&staged).expect("first commit_staged");
     assert!(
-        table.attach(&staged).is_err(),
+        table.commit_staged(&staged).is_err(),
         "its superfiles are listed already"
     );
     assert_eq!(count(&db), BATCH_ROWS);
@@ -173,7 +173,7 @@ fn a_table_with_no_storage_refuses_staging() {
 }
 
 #[test]
-fn writers_on_several_connections_attach_to_one_table() {
+fn writers_on_several_connections_commit_to_one_table() {
     let dir = TempDir::new().expect("tempdir");
     create(&open_db(&dir));
 
@@ -186,7 +186,7 @@ fn writers_on_several_connections_attach_to_one_table() {
                 let staged: Vec<StagedAppend> = (0..BATCHES)
                     .map(|b| table.stage(&batch(w * BATCHES + b)).expect("stage"))
                     .collect();
-                table.attach(&staged).expect("attach");
+                table.commit_staged(&staged).expect("commit_staged");
             });
         }
     });

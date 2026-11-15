@@ -43,7 +43,7 @@ pub(crate) trait Table: Send + Sync {
     fn append(&self, batch: &RecordBatch) -> Result<(), InfinoError>;
     fn append_named(&self, batch: &RecordBatch, source_name: &str) -> Result<(), InfinoError>;
     fn stage(&self, batch: &RecordBatch) -> Result<StagedAppend, InfinoError>;
-    fn attach(&self, staged: &[StagedAppend]) -> Result<(), InfinoError>;
+    fn commit_staged(&self, staged: &[StagedAppend]) -> Result<(), InfinoError>;
     fn append_rows(&self, rows: &[Value]) -> Result<(), InfinoError>;
     fn append_rows_named(&self, rows: &[Value], source_name: &str) -> Result<(), InfinoError>;
     fn update(&self, predicate: Expr, batch: &RecordBatch) -> Result<MutationStats, InfinoError>;
@@ -143,8 +143,8 @@ impl Table for SupertableHandle {
     fn stage(&self, batch: &RecordBatch) -> Result<StagedAppend, InfinoError> {
         SupertableHandle::stage(self, batch)
     }
-    fn attach(&self, staged: &[StagedAppend]) -> Result<(), InfinoError> {
-        SupertableHandle::attach(self, staged)
+    fn commit_staged(&self, staged: &[StagedAppend]) -> Result<(), InfinoError> {
+        SupertableHandle::commit_staged(self, staged)
     }
     fn append_rows(&self, rows: &[Value]) -> Result<(), InfinoError> {
         SupertableHandle::append_rows(self, rows)
@@ -320,14 +320,14 @@ impl Supertable {
     }
 
     /// Build and upload a batch's superfiles without adding them to the
-    /// table yet. [`Self::attach`] publishes any number of staged batches in
+    /// table yet. [`Self::commit_staged`] publishes any number of staged batches in
     /// one commit, so a load of many batches into one table - from one
     /// process, or several threads of it - pays one commit between them
     /// rather than one each, and writers loading the same table contend for
-    /// the table's commit once per attach rather than once per batch.
+    /// the table's commit once per call to it rather than once per batch.
     ///
-    /// The rows are not in the table until attached, and a staged batch is
-    /// attached within a few minutes of staging or refused: until then its
+    /// The rows are not in the table until committed, and a staged batch is
+    /// committed within a few minutes of staging or refused: until then its
     /// superfiles are objects the table does not list, which a
     /// [`Self::gc`] removes once they are older than its safety gap.
     ///
@@ -340,12 +340,12 @@ impl Supertable {
 
     /// Publish staged batches in one commit: every one's rows join the
     /// table together, or none do. Losing the commit to a concurrent writer
-    /// is retried without rebuilding anything. A refused attach leaves
-    /// `staged` as it was, to be attached again; one refused because a
+    /// is retried without rebuilding anything. A refused commit leaves
+    /// `staged` as it was, to be committed again; one refused because a
     /// staged batch is too old, or the table's schema moved since it was
     /// staged, needs those rows staged again.
-    pub fn attach(&self, staged: &[StagedAppend]) -> Result<(), InfinoError> {
-        self.inner.attach(staged)
+    pub fn commit_staged(&self, staged: &[StagedAppend]) -> Result<(), InfinoError> {
+        self.inner.commit_staged(staged)
     }
 
     /// Append a batch of rows, naming the source they came from.

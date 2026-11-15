@@ -264,7 +264,7 @@ pub(in crate::supertable) const DRAIN_CHECKPOINT_SCHEMA: u32 = 1;
 /// Local checkpoint filename inside one epoch scratch directory.
 const DRAIN_LOCAL_CHECKPOINT_FILE: &str = "checkpoint.json";
 
-/// The oldest a staged append may be when it is attached. Its superfiles are
+/// The oldest a staged append may be when it is committed. Its superfiles are
 /// objects no manifest lists until then, so it must land well inside the
 /// safety gap of any garbage-collection sweep of the table; the deferred
 /// reclaim's grace is the shortest gap the engine itself uses.
@@ -1190,7 +1190,7 @@ impl Supertable {
 
     /// Build and upload a batch's superfiles without adding them to the
     /// table: the first half of [`Self::append`]. The returned
-    /// [`StagedAppend`] is published by [`Self::attach`], together with any
+    /// [`StagedAppend`] is published by [`Self::commit_staged`], together with any
     /// others, in one commit; until then the rows are not in the table.
     ///
     /// For a load that writes many batches into one table, from one process
@@ -1208,14 +1208,14 @@ impl Supertable {
     }
 
     /// Publish staged appends in one commit; see [`Self::stage`]. A refused
-    /// attach leaves `staged` as it was: attach it again, or, when it was
+    /// commit leaves `staged` as it was: commit it again, or, when it was
     /// refused for its age or a schema change, stage its rows again.
-    pub fn attach(&self, staged: &[StagedAppend]) -> Result<(), InfinoError> {
+    pub fn commit_staged(&self, staged: &[StagedAppend]) -> Result<(), InfinoError> {
         let mut w = self
             .acquire_writer(true)
-            .map_err(|e| InfinoError::from(e).with_context("attach", None))?;
-        w.attach(staged)
-            .map_err(|e| InfinoError::from(e).with_context("attach", None))
+            .map_err(|e| InfinoError::from(e).with_context("commit_staged", None))?;
+        w.commit_staged(staged)
+            .map_err(|e| InfinoError::from(e).with_context("commit_staged", None))
     }
 
     /// [`Self::append`], naming the source the rows came from.
@@ -3564,7 +3564,7 @@ impl SupertableWriter {
 
     /// Build and upload the buffered rows' superfiles without publishing
     /// them: the first half of an append commit, the second being
-    /// [`Self::attach`]. The buffer is emptied as by a commit, and restored
+    /// [`Self::commit_staged`]. The buffer is emptied as by a commit, and restored
     /// on a failure.
     ///
     /// Refused for a table with vector columns (their commit trains and
@@ -3633,7 +3633,7 @@ impl SupertableWriter {
             scratch.fts_bytes,
         )?;
         let mut batch = self.build_scalar_superfiles(&buffer, &manifest, None, stem)?;
-        // Held until the attach, the superfiles' bytes would keep a whole
+        // Held until the commit, the superfiles' bytes would keep a whole
         // load in memory: the reads after it fetch them from storage.
         batch.skip_memory_fill();
         batch.pending_cache_inserts.clear();
@@ -3645,13 +3645,13 @@ impl SupertableWriter {
     /// Publish staged appends in one commit: their superfiles join the
     /// table together, or none do. Losing the commit race to another writer
     /// is retried as any append's publish is, without building or uploading
-    /// anything again; a refused attach leaves `staged` as it was, to be
-    /// attached again.
+    /// anything again; a refused commit leaves `staged` as it was, to be
+    /// committed again.
     ///
     /// Refused when a staged append is older than [`MAX_STAGED_AGE`], or
     /// was built under a schema other than the table's now; those rows are
     /// staged again.
-    pub(crate) fn attach(&mut self, staged: &[StagedAppend]) -> Result<(), BuildError> {
+    pub(crate) fn commit_staged(&mut self, staged: &[StagedAppend]) -> Result<(), BuildError> {
         let mut batch = SuperfilePublishBatch::default();
         let mut built_against = None;
         for one in staged.iter().filter(|one| !one.is_empty()) {
@@ -5425,19 +5425,19 @@ pub(super) struct SuperfilePublishBatch {
 }
 
 /// An append's superfiles, built and uploaded but not yet in the table: what
-/// [`Supertable::stage`] returns and [`Supertable::attach`] publishes.
+/// [`Supertable::stage`] returns and [`Supertable::commit_staged`] publishes.
 ///
-/// Staging is the build half of an append commit and attaching the publish
+/// Staging is the build half of an append commit and committing the publish
 /// half, split so that many batches - staged one after another, or on
 /// several threads - land in the table in one commit instead of one commit
-/// each. Until it is attached a staged batch's superfiles are objects no
+/// each. Until it is committed a staged batch's superfiles are objects no
 /// manifest lists, which is what a garbage-collection sweep deletes once
-/// they are older than its safety gap; so a staged batch is attached within
+/// they are older than its safety gap; so a staged batch is committed within
 /// [`MAX_STAGED_AGE`] or refused, and a caller running `gc` on the table
 /// meanwhile must give it a safety gap longer than that.
 pub struct StagedAppend {
     batch: SuperfilePublishBatch,
-    /// The schema the superfiles were built under; the attach is refused if
+    /// The schema the superfiles were built under; the commit is refused if
     /// the table's has moved since.
     built_against: u32,
     staged_at: Instant,
@@ -5503,7 +5503,7 @@ impl SuperfilePublishBatch {
     }
 
     /// A copy for a publish of superfiles already uploaded, so a staged
-    /// batch can be attached again after a refused attach. Carries no cache
+    /// batch can be committed again after a refused commit. Carries no cache
     /// fills: a staged batch keeps none (see [`SupertableWriter::stage`]).
     fn landed_copy(&self) -> SuperfilePublishBatch {
         debug_assert!(self.uploads.is_empty(), "a staged batch holds no uploads");

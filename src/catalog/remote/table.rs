@@ -251,9 +251,9 @@ impl Table for RemoteTable {
         ))
     }
 
-    fn attach(&self, _staged: &[StagedAppend]) -> Result<(), InfinoError> {
+    fn commit_staged(&self, _staged: &[StagedAppend]) -> Result<(), InfinoError> {
         Err(InfinoError::Unsupported(
-            "attach is not available on a hosted table; use append".into(),
+            "commit_staged is not available on a hosted table; use append".into(),
         ))
     }
 
