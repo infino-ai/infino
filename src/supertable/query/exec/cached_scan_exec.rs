@@ -25,7 +25,7 @@
 //! each writer, so a file's run of [`BLOCK_DOCS`] rows spans a narrow band of
 //! ids even where its row groups, mixing writers, span nearly all of them.
 //! The stable-id sidecar records each block's bounds in its header
-//! ([`SuperfileReader::id_block_bounds`]); the scan reads the blocks in order
+//! ([`SuperfileReader::id_blocks`]); the scan reads the blocks in order
 //! of those bounds, skips each block the top-k's bound rules out, and stops
 //! once it rules out every block still to come. A page of `ORDER BY _id`
 //! under a filter that keeps a sizeable share of the rows reads a block or
@@ -48,7 +48,13 @@
 //!   in for, whose row filter decodes those columns only for the rows that
 //!   pass.
 
-use std::{cmp::Reverse, collections::HashSet, fmt, ops::Range, sync::Arc};
+use std::{
+    cmp::Reverse,
+    collections::{BinaryHeap, HashSet, VecDeque},
+    fmt,
+    ops::Range,
+    sync::{Arc, Mutex, PoisonError},
+};
 
 use arrow_array::{
     ArrayRef, BooleanArray, Decimal128Array, RecordBatch, RecordBatchOptions, UInt64Array,
@@ -93,7 +99,7 @@ use tracing::Instrument;
 
 use crate::{
     runtime_metrics::op_stats::OpStatsCollector,
-    superfile::{SuperfileReader, ids::BLOCK_DOCS},
+    superfile::{SuperfileReader, ids::BLOCK_DOCS, reader::IdBlocks},
     supertable::{
         error::QueryError,
         manifest::{ManifestSnapshot, SuperfileUri},
@@ -211,63 +217,174 @@ pub(crate) struct CachedScanExec {
     id_order: Option<IdOrder>,
 }
 
-/// A read in `_id` order: the scan's row groups cut into id blocks, ordered
-/// by their lowest id (their highest, descending). Built once per execution,
-/// by the first partition to start, and shared by the rest, which take every
-/// `partitions`-th block of it.
+/// A read in `_id` order: the scan's row groups cut into id blocks, taken
+/// in order of their lowest id (their highest, descending) from a queue
+/// built by the first partition to start and shared by the rest, each taking
+/// the next block as it is ready for one. `None` in the queue's cell when a
+/// file has no sidecar bounds to order by; the row groups are read as they
+/// are then.
 #[derive(Debug, Clone)]
 struct IdOrder {
     descending: bool,
-    blocks: Arc<OnceCell<Arc<[RowGroupUnit]>>>,
+    queue: Arc<OnceCell<Option<Arc<Mutex<IdBlockQueue>>>>>,
 }
 
-/// `units` cut into the id blocks of their files, ordered by each block's
-/// lowest id, or its highest when `descending`. A block holding no row to
-/// read (every one deleted, or none the index chose) is left out. `None`
-/// when a file has no sidecar bounds to order by, or fewer blocks than rows.
-async fn id_blocks(units: &[RowGroupUnit], descending: bool) -> Option<Vec<RowGroupUnit>> {
-    let block_rows = u32::try_from(BLOCK_DOCS).ok()?;
-    let mut files: Vec<(Arc<CachedFile>, Arc<[(i128, i128)]>)> = Vec::new();
-    let mut blocks = Vec::new();
-    for unit in units {
-        let bounds = match files.iter().find(|(file, _)| Arc::ptr_eq(file, &unit.file)) {
-            Some((_, bounds)) => Arc::clone(bounds),
-            None => {
-                let bounds = unit.file.reader.id_block_bounds().await?;
-                files.push((Arc::clone(&unit.file), Arc::clone(&bounds)));
-                bounds
-            }
+/// One file's part of an [`IdBlockQueue`].
+#[derive(Debug)]
+struct FileBlocks {
+    /// The file's blocks, their bounds and orders, as its reader keeps them.
+    blocks: Arc<IdBlocks>,
+    /// For each of the file's row groups, its unit among the queue's units;
+    /// `None` for a row group the scan doesn't read.
+    units: Vec<Option<usize>>,
+    /// Each row group's first row, and the file's row count last.
+    starts: Vec<u32>,
+    /// How many of the file's blocks, in order, have been taken.
+    taken: usize,
+}
+
+/// The scan's id blocks in order, taken one at a time: the files' block
+/// orders, sorted once per reader ([`SuperfileReader::id_blocks`]), merged as
+/// blocks are taken, so a read that stops after a few blocks orders only
+/// those.
+#[derive(Debug)]
+struct IdBlockQueue {
+    units: Arc<[RowGroupUnit]>,
+    files: Vec<FileBlocks>,
+    descending: bool,
+    /// Each file's next block, by its place in the order: the smallest
+    /// first.
+    next: BinaryHeap<Reverse<(u128, usize)>>,
+    /// Pieces of a taken block not yet handed out: a block that spans two
+    /// row groups is read as one piece of each.
+    pending: VecDeque<RowGroupUnit>,
+}
+
+impl IdBlockQueue {
+    /// The queue over `units`, row groups of the scan; `None` when a file
+    /// has no sidecar bounds to order by, or fewer blocks than its rows
+    /// fill.
+    async fn new(units: Arc<[RowGroupUnit]>, descending: bool) -> Option<Self> {
+        let mut files: Vec<(Arc<CachedFile>, FileBlocks)> = Vec::new();
+        for (at, unit) in units.iter().enumerate() {
+            let file = match files
+                .iter()
+                .position(|(file, _)| Arc::ptr_eq(file, &unit.file))
+            {
+                Some(file) => file,
+                None => {
+                    let blocks = unit.file.reader.id_blocks().await?;
+                    let mut starts = Vec::with_capacity(unit.file.row_counts.len() + 1);
+                    let mut first = 0u32;
+                    for &n in unit.file.row_counts.iter() {
+                        starts.push(first);
+                        first = first.checked_add(n)?;
+                    }
+                    starts.push(first);
+                    let needed = u64::from(first).div_ceil(BLOCK_DOCS as u64);
+                    if (blocks.bounds.len() as u64) < needed {
+                        return None;
+                    }
+                    let groups = unit.file.row_counts.len();
+                    files.push((
+                        Arc::clone(&unit.file),
+                        FileBlocks {
+                            blocks,
+                            units: vec![None; groups],
+                            starts,
+                            taken: 0,
+                        },
+                    ));
+                    files.len() - 1
+                }
+            };
+            *files[file].1.units.get_mut(unit.row_group)? = Some(at);
+        }
+        let mut queue = Self {
+            units,
+            files: files.into_iter().map(|(_, file)| file).collect(),
+            descending,
+            next: BinaryHeap::new(),
+            pending: VecDeque::new(),
         };
-        let mut at = unit.rows.start;
-        while at < unit.rows.end {
-            let block = at / block_rows;
-            let end = block
-                .saturating_add(1)
-                .saturating_mul(block_rows)
-                .min(unit.rows.end);
-            let rows = at..end;
-            at = end;
-            let &bounds = bounds.get(block as usize)?;
-            let chosen = unit
-                .file
-                .selected
-                .as_ref()
-                .is_none_or(|selected| selected.range_cardinality(rows.clone()) > 0);
-            let deleted = unit.file.tombstones.range_cardinality(rows.clone());
-            if chosen && deleted < u64::from(rows.end - rows.start) {
-                blocks.push(RowGroupUnit {
-                    rows,
-                    id_bounds: Some(bounds),
-                    ..unit.clone()
-                });
+        for file in 0..queue.files.len() {
+            queue.push_next(file);
+        }
+        Some(queue)
+    }
+
+    /// `file`'s blocks in the order of the read.
+    fn order(&self, file: usize) -> &[u32] {
+        let blocks = &self.files[file].blocks;
+        match self.descending {
+            false => &blocks.by_lowest,
+            true => &blocks.by_highest,
+        }
+    }
+
+    /// Queues `file`'s next block, if it has one, by its place in the
+    /// order: its lowest id ascending, or its highest descending, as an
+    /// unsigned key that sorts the same way smallest first.
+    fn push_next(&mut self, file: usize) {
+        let taken = self.files[file].taken;
+        let Some(&block) = self.order(file).get(taken) else {
+            return;
+        };
+        let (lo, hi) = self.files[file].blocks.bounds[block as usize];
+        let sign = 1u128 << 127;
+        let key = match self.descending {
+            false => (lo as u128) ^ sign,
+            true => !((hi as u128) ^ sign),
+        };
+        self.next.push(Reverse((key, file)));
+    }
+
+    /// The next block to read, as a unit of the rows it holds of one row
+    /// group; `None` once every block is taken. A block holding no row to
+    /// read (in a row group the scan doesn't read, every row deleted, or
+    /// none the index chose) is passed over.
+    fn take(&mut self) -> Option<RowGroupUnit> {
+        loop {
+            if let Some(unit) = self.pending.pop_front() {
+                return Some(unit);
+            }
+            let Reverse((_, file)) = self.next.pop()?;
+            let block = self.order(file)[self.files[file].taken];
+            self.files[file].taken += 1;
+            self.push_next(file);
+            let blocks = &self.files[file];
+            let bounds = blocks.blocks.bounds[block as usize];
+            let Some(end_of_file) = blocks.starts.last().copied() else {
+                continue;
+            };
+            let start = block.saturating_mul(BLOCK_DOCS as u32);
+            let end = start.saturating_add(BLOCK_DOCS as u32).min(end_of_file);
+            // The row groups the block's rows fall in.
+            let mut group = blocks
+                .starts
+                .partition_point(|&first| first <= start)
+                .saturating_sub(1);
+            while group + 1 < blocks.starts.len() && blocks.starts[group] < end {
+                let rows = start.max(blocks.starts[group])..end.min(blocks.starts[group + 1]);
+                if let Some(unit) = blocks.units[group].map(|at| &self.units[at]) {
+                    let chosen = unit
+                        .file
+                        .selected
+                        .as_ref()
+                        .is_none_or(|selected| selected.range_cardinality(rows.clone()) > 0);
+                    let deleted = unit.file.tombstones.range_cardinality(rows.clone());
+                    if !rows.is_empty() && chosen && deleted < u64::from(rows.end - rows.start) {
+                        self.pending.push_back(RowGroupUnit {
+                            rows,
+                            id_bounds: Some(bounds),
+                            ..unit.clone()
+                        });
+                    }
+                }
+                group += 1;
             }
         }
     }
-    match descending {
-        false => blocks.sort_by_key(|unit| unit.id_bounds.map(|(lo, _)| lo)),
-        true => blocks.sort_by_key(|unit| Reverse(unit.id_bounds.map(|(_, hi)| hi))),
-    }
-    Some(blocks)
 }
 
 /// One span of ids as the statistics of a single container, for pruning:
@@ -555,7 +672,7 @@ impl CachedScanExec {
             Arc::new(Self {
                 id_order: Some(IdOrder {
                     descending,
-                    blocks: Arc::default(),
+                    queue: Arc::default(),
                 }),
                 ..self.clone()
             }) as Arc<dyn ExecutionPlan>
@@ -935,7 +1052,7 @@ impl ExecutionPlan for CachedScanExec {
         let id_order =
             (column.name() == self.context.manifest.options.id_column).then(|| IdOrder {
                 descending,
-                blocks: Arc::default(),
+                queue: Arc::default(),
             });
         let units = best_first(&self.units, column.name(), descending);
         if units.is_none() && id_order.is_none() {
@@ -968,27 +1085,34 @@ impl ExecutionPlan for CachedScanExec {
         let id_order = self.id_order.clone().filter(|_| self.live.is_some());
         let descending = id_order.as_ref().is_some_and(|order| order.descending);
         let units = stream::once(async move {
-            let units = match &id_order {
-                Some(order) => Arc::clone(
-                    order
-                        .blocks
-                        .get_or_init(|| async {
-                            match id_blocks(&all, order.descending).await {
-                                Some(blocks) => blocks.into(),
-                                None => Arc::clone(&all),
-                            }
-                        })
-                        .await,
-                ),
-                None => all,
+            let queue = match &id_order {
+                Some(order) => order
+                    .queue
+                    .get_or_init(|| async {
+                        IdBlockQueue::new(Arc::clone(&all), order.descending)
+                            .await
+                            .map(|queue| Arc::new(Mutex::new(queue)))
+                    })
+                    .await
+                    .clone(),
+                None => None,
             };
-            let mine: Vec<RowGroupUnit> = units
-                .iter()
-                .skip(partition)
-                .step_by(partitions)
-                .cloned()
-                .collect();
-            stream::iter(mine)
+            match queue {
+                Some(queue) => stream::unfold(queue, |queue| {
+                    let next = queue.lock().unwrap_or_else(PoisonError::into_inner).take();
+                    future::ready(next.map(|unit| (unit, queue)))
+                })
+                .boxed(),
+                None => {
+                    let mine: Vec<RowGroupUnit> = all
+                        .iter()
+                        .skip(partition)
+                        .step_by(partitions)
+                        .cloned()
+                        .collect();
+                    stream::iter(mine).boxed()
+                }
+            }
         })
         .flatten();
         let context = Arc::clone(&self.context);

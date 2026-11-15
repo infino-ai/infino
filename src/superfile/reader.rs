@@ -307,10 +307,10 @@ pub struct SuperfileReader {
     /// reads take `_id` from Parquet, so the sidecar is not retried or warned
     /// about again.
     id_sidecar_broken: AtomicBool,
-    /// Each sidecar block's `_id` bounds, read from its header on the first
-    /// read in `_id` order and kept for the reader's life
-    /// ([`id_block_bounds`](Self::id_block_bounds)): 32 bytes a block.
-    id_block_bounds: OnceCell<Arc<[(i128, i128)]>>,
+    /// Each sidecar block's `_id` bounds and the blocks' orders by them,
+    /// read from the headers on the first read in `_id` order and kept for
+    /// the reader's life ([`id_blocks`](Self::id_blocks)): 40 bytes a block.
+    id_blocks: OnceCell<Arc<IdBlocks>>,
     /// Where the range index region sits, when the superfile carries one
     /// (`superfile::range`): absent on a table with no range-indexed column
     /// and on superfiles written before the region existed.
@@ -334,6 +334,33 @@ pub struct SuperfileReader {
 pub(crate) struct RangeEnds {
     pub(crate) pairs: Vec<(u64, u32)>,
     pub(crate) ties_in_id_order: bool,
+}
+
+/// Each block of [`ids::BLOCK_DOCS`] rows of a superfile, by the `_id`
+/// bounds its sidecar header records ([`SuperfileReader::id_blocks`]).
+#[derive(Debug)]
+pub(crate) struct IdBlocks {
+    /// Each block's lowest and highest possible `_id`, in row order.
+    pub(crate) bounds: Box<[(i128, i128)]>,
+    /// The blocks, by lowest bound ascending; ties in row order.
+    pub(crate) by_lowest: Box<[u32]>,
+    /// The blocks, by highest bound descending; ties in row order.
+    pub(crate) by_highest: Box<[u32]>,
+}
+
+impl IdBlocks {
+    fn new(bounds: Vec<(i128, i128)>) -> Self {
+        let blocks = || (0..bounds.len() as u32).collect::<Vec<u32>>();
+        let mut by_lowest = blocks();
+        by_lowest.sort_by_key(|&b| bounds[b as usize].0);
+        let mut by_highest = blocks();
+        by_highest.sort_by_key(|&b| std::cmp::Reverse(bounds[b as usize].1));
+        Self {
+            bounds: bounds.into(),
+            by_lowest: by_lowest.into(),
+            by_highest: by_highest.into(),
+        }
+    }
 }
 
 /// Where a superfile's stable-id sidecar lives and how it is laid out, from
@@ -964,7 +991,7 @@ impl SuperfileReader {
             // one fetches the sidecar through `fetch_id_sidecar`.
             id_sidecar,
             id_sidecar_broken: AtomicBool::new(false),
-            id_block_bounds: OnceCell::new(),
+            id_blocks: OnceCell::new(),
             range_region,
             range_directory: OnceCell::new(),
             resident_hole: None,
@@ -1108,7 +1135,7 @@ impl SuperfileReader {
             vec,
             id_sidecar,
             id_sidecar_broken: AtomicBool::new(false),
-            id_block_bounds: OnceCell::new(),
+            id_blocks: OnceCell::new(),
             range_region,
             range_directory: OnceCell::new(),
             resident_hole: None,
@@ -1608,19 +1635,20 @@ impl SuperfileReader {
     }
 
     /// The lowest and highest `_id` each block of [`ids::BLOCK_DOCS`] rows
-    /// can hold, in row order, from the packed stable-id sidecar's block
-    /// headers: the order a read sorted on `_id` takes the rows in. Read on
-    /// the first call, from the resident bytes or one fetch of the sidecar,
-    /// and kept. `None` when the superfile has no packed sidecar, the sidecar
-    /// was found broken, or the read fails; the caller then reads in another
-    /// order. A header that does not parse marks the sidecar broken, as a
-    /// block that does not decode does.
-    pub(crate) async fn id_block_bounds(&self) -> Option<Arc<[(i128, i128)]>> {
+    /// can hold, from the packed stable-id sidecar's block headers, and the
+    /// blocks ordered by them ([`IdBlocks`]): the order a read sorted on
+    /// `_id` takes the rows in. Read on the first call, from the resident
+    /// bytes or one fetch of the sidecar, and kept. `None` when the
+    /// superfile has no packed sidecar, the sidecar was found broken, or the
+    /// read fails; the caller then reads in another order. A header that
+    /// does not parse marks the sidecar broken, as a block that does not
+    /// decode does.
+    pub(crate) async fn id_blocks(&self) -> Option<Arc<IdBlocks>> {
         let loc = self.id_sidecar?;
         if !loc.packed || self.id_sidecar_broken.load(Ordering::Relaxed) {
             return None;
         }
-        self.id_block_bounds
+        self.id_blocks
             .get_or_try_init(|| async {
                 let sidecar = match self.resident_id_sidecar() {
                     Some(sidecar) => sidecar,
@@ -1635,7 +1663,7 @@ impl SuperfileReader {
                         })
                     });
                 match bounds {
-                    Ok(bounds) => Ok(Arc::from(bounds)),
+                    Ok(bounds) => Ok(Arc::new(IdBlocks::new(bounds))),
                     Err(what) => {
                         self.mark_id_sidecar_broken();
                         Err(ReadError::MalformedKv(what))
