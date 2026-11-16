@@ -889,20 +889,60 @@ impl RangeColumn<'_> {
         hi: u64,
         boundary: &[(usize, &[u8])],
     ) -> Result<u64, String> {
-        let mut n = 0u64;
-        for b in self.blocks_in(lo, hi) {
-            if self.covered(b, lo, hi) {
-                n += u64::from(self.directory.blocks[b].n);
-                continue;
-            }
-            let bytes = boundary
-                .iter()
-                .find(|(at, _)| *at == b)
-                .map(|(_, bytes)| *bytes)
-                .ok_or("range index: a boundary block was not fetched")?;
-            self.for_each_in_block(b, bytes, lo, hi, |_| n += 1)?;
+        Ok(self.count_many(&[(lo, hi)], boundary)?[0])
+    }
+
+    /// [`Self::count`] of each of `ranges` (`lo..=hi` pairs), each block the
+    /// ranges cut decoded once, and its keys alone: a histogram's buckets
+    /// share their boundaries, and a count needs no row. `boundary` holds
+    /// the bytes of every block [`Self::boundary_blocks`] names for any of
+    /// the ranges, keyed by its index.
+    pub(crate) fn count_many(
+        &self,
+        ranges: &[(u64, u64)],
+        boundary: &[(usize, &[u8])],
+    ) -> Result<Vec<u64>, String> {
+        let mut decoded: Vec<(usize, Vec<u64>)> = Vec::with_capacity(boundary.len());
+        for &(b, bytes) in boundary {
+            decoded.push((b, self.block_keys(b, bytes)?));
         }
-        Ok(n)
+        decoded.sort_unstable_by_key(|(b, _)| *b);
+        ranges
+            .iter()
+            .map(|&(lo, hi)| {
+                let mut n = 0u64;
+                for b in self.blocks_in(lo, hi) {
+                    if self.covered(b, lo, hi) {
+                        n += u64::from(self.directory.blocks[b].n);
+                        continue;
+                    }
+                    let at = decoded
+                        .binary_search_by_key(&b, |(at, _)| *at)
+                        .map_err(|_| "range index: a boundary block was not fetched")?;
+                    // A block holds its keys in order.
+                    let keys = &decoded[at].1;
+                    let from = keys.partition_point(|key| *key < lo);
+                    let to = keys.partition_point(|key| *key <= hi);
+                    n += (to - from) as u64;
+                }
+                Ok(n)
+            })
+            .collect()
+    }
+
+    /// The keys of block `b` (its `bytes`), in order, its CRC checked.
+    fn block_keys(&self, b: usize, bytes: &[u8]) -> Result<Vec<u64>, String> {
+        let block = &self.directory.blocks[b];
+        if crc32c(bytes) != block.crc {
+            return Err("range index: block CRC mismatch".into());
+        }
+        let n = usize::from(block.n);
+        let mut keys = Vec::with_capacity(n);
+        for_each_lane(bytes, 0, n, block.key_width, |delta| {
+            keys.push(block.first_key + delta)
+        })
+        .ok_or_else(|| "range index: block shorter than its payload".to_string())?;
+        Ok(keys)
     }
 
     /// Every row holding a value in `lo..=hi`, from `span`, the bytes of
