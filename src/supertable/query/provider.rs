@@ -137,10 +137,7 @@ use crate::{
                 cached_scan_exec::{
                     CachedFile, CachedScanExec, RowGroupFilter, has_columns, projected_schema,
                 },
-                common::{
-                    BoundPredicate, PushedPredicate, read_file_row_group, take_file_columns,
-                    unqualified,
-                },
+                common::{BoundPredicate, PushedPredicate, take_file_columns, unqualified},
                 metered_exec::MeteredExec,
             },
             fts::{
@@ -1460,14 +1457,21 @@ impl SupertableProvider {
     /// [`Self::top_k_rows`] when some filters are not a range on the sort
     /// column.
     ///
-    /// Reads each superfile's rows in index order, in growing rounds, and
-    /// checks the filters on rows it has not seen yet. A superfile that
-    /// returned a full round can still hold rows as good as its last key, so
-    /// the best of those last keys is the frontier: every row before it has
-    /// been checked. Once `k` passing rows lie before the frontier, the
-    /// `k`-th is the cutoff, and every passing row up to it, ties included,
-    /// is returned, so later sort keys such as `_id` see the same rows a full
-    /// scan would.
+    /// Reads each superfile's keys in index order, in growing rounds, and
+    /// checks the filters on the rows in one order across all superfiles, a
+    /// batch at a time. A superfile that returned a full round can still hold
+    /// rows as good as its last key, so the best of those last keys is the
+    /// frontier: every row before it is known. Rows before the frontier are
+    /// checked best first, so once `k` of them pass, the `k`-th is the cutoff
+    /// and every row up to it, ties included, has been checked. Every passing
+    /// row up to the cutoff is returned, so later sort keys such as `_id` see
+    /// the same rows a full scan would. Each batch is sized from the share of
+    /// rows the checks so far passed.
+    ///
+    /// A row is checked from its row group's filter columns where the
+    /// decoded-column cache holds them, and read alone otherwise: a top-k
+    /// checks a few rows of many row groups, and decoding each whole would
+    /// cost more than the rows it reads.
     ///
     /// `None`, to fall back to the full scan, when a filter cannot be checked
     /// here, a superfile has no range index on the column, nulls could be in
@@ -1526,9 +1530,11 @@ impl SupertableProvider {
             uri: SuperfileUri,
             prepared: Arc<PreparedScanFile>,
             tombstones: Arc<RoaringBitmap>,
-            /// Rows checked against the filters, in any round.
-            checked: RoaringBitmap,
-            /// Those that passed, with their keys.
+            /// Rows the index has given, in any round.
+            seen: RoaringBitmap,
+            /// Of those, the ones not checked yet, with their keys.
+            unchecked: Vec<(u64, u32)>,
+            /// Those that passed the filters, with their keys.
             passing: Vec<(u64, u32)>,
             /// The worst key the last round gave.
             worst: Option<u64>,
@@ -1544,7 +1550,8 @@ impl SupertableProvider {
                         uri: entry.uri,
                         prepared: prepared.await?,
                         tombstones: self.deleted_rows(entry.superfile_id, now)?,
-                        checked: RoaringBitmap::new(),
+                        seen: RoaringBitmap::new(),
+                        unchecked: Vec::new(),
                         passing: Vec::new(),
                         worst: None,
                         exhausted: false,
@@ -1559,204 +1566,225 @@ impl SupertableProvider {
             .saturating_mul(FILTERED_TOP_K_MAX_K_MULTIPLE)
             .max(FILTERED_TOP_K_MIN_ROWS);
         let mut want = hint.k.saturating_mul(FILTERED_TOP_K_GROWTH);
+        let mut batch = want;
+        let mut checked: usize = 0;
+        let mut passed: usize = 0;
         loop {
-            // Owned inputs: futures over borrowed ones, held across an await
-            // in the scan's `async_trait` method, trip rustc's "not general
-            // enough" (see `try_join_bounded`).
-            #[allow(clippy::type_complexity)]
-            let open: Vec<(
-                usize,
-                SuperfileUri,
-                Arc<PreparedScanFile>,
-                Arc<RoaringBitmap>,
-                RoaringBitmap,
-            )> = reads
+            // Each open superfile's first `want` keys in the range: index
+            // blocks only, no row read.
+            let open: Vec<(usize, Arc<PreparedScanFile>, Arc<RoaringBitmap>)> = reads
                 .iter()
                 .enumerate()
                 .filter(|(_, read)| !read.exhausted)
-                .map(|(i, read)| {
-                    (
-                        i,
-                        read.uri,
-                        Arc::clone(&read.prepared),
-                        Arc::clone(&read.tombstones),
-                        read.checked.clone(),
-                    )
-                })
+                .map(|(i, read)| (i, Arc::clone(&read.prepared), Arc::clone(&read.tombstones)))
                 .collect();
             let rounds = try_join_bounded(
                 open.into_iter()
-                    .map(|(i, uri, prepared, tombstones, checked)| async move {
-                        let Some(ends) = prepared
+                    .map(|(i, prepared, tombstones)| async move {
+                        let ends = prepared
                             .reader
                             .range_ends(field, data_type, (lo, hi), want, descending, &tombstones)
                             .await
-                            .map_err(QueryError::from)?
-                        else {
-                            return Ok(None);
-                        };
-                        let exhausted = ends.pairs.len() < want;
-                        let worst = ends
-                            .pairs
-                            .iter()
-                            .map(|(key, _)| *key)
-                            .reduce(|a, b| if better(a, b) { b } else { a });
-                        let mut fresh: Vec<(u64, u32)> = ends
-                            .pairs
-                            .into_iter()
-                            .filter(|(_, row)| !checked.contains(*row))
-                            .collect();
-                        fresh.sort_unstable_by_key(|(_, row)| *row);
-                        let ids: Vec<u32> = fresh.iter().map(|(_, row)| *row).collect();
-                        // With a decoded-column cache, check rows from kept
-                        // columns, decoding and keeping any row group the
-                        // cache lacks, as a scan does. Without one, read just
-                        // these rows.
-                        let mut checks: Vec<(Vec<(u64, u32)>, RecordBatch)> = Vec::new();
-                        let taken = match cache {
-                            Some(cache) => {
-                                let row_counts = &prepared.row_counts;
-                                let (kept, rest) = kept_filter_columns(
-                                    cache,
-                                    uri,
-                                    schema_id,
-                                    row_counts,
-                                    &fresh,
-                                    bound_schema,
-                                )?;
-                                checks.extend(kept);
-                                for row_group in row_groups_of(row_counts, &rest) {
-                                    let read = read_file_row_group(
-                                        &self.manifest,
-                                        &prepared.reader,
-                                        row_group,
-                                        names,
-                                        bound_schema,
-                                        op_stats,
-                                    )
-                                    .await?;
-                                    for (column, field) in
-                                        read.columns().iter().zip(bound_schema.fields())
-                                    {
-                                        let column =
-                                            arrow::compute::cast(column, field.data_type())?;
-                                        let bytes = column.get_array_memory_size();
-                                        cache.insert(
-                                            ColumnKey {
-                                                uri,
-                                                schema_id,
-                                                column: field.name().clone(),
-                                                row_group,
-                                            },
-                                            column,
-                                            bytes,
-                                        );
-                                    }
-                                }
-                                let (kept, rest) = kept_filter_columns(
-                                    cache,
-                                    uri,
-                                    schema_id,
-                                    row_counts,
-                                    &rest,
-                                    bound_schema,
-                                )?;
-                                checks.extend(kept);
-                                rest
-                            }
-                            None => fresh,
-                        };
-                        if !taken.is_empty() {
-                            let rows: Vec<u32> = taken.iter().map(|(_, row)| *row).collect();
-                            let batch = take_file_columns(
-                                &self.manifest,
-                                &prepared.reader,
-                                rows.clone(),
-                                names,
-                                bound_schema,
-                                op_stats,
-                            )
-                            .await?;
-                            if batch.num_rows() != rows.len() {
-                                return Err(DataFusionError::Internal(format!(
-                                    "read {} rows to check {} for a filtered top-k",
-                                    batch.num_rows(),
-                                    rows.len()
-                                )));
-                            }
-                            // Taken columns have the stored types; the
-                            // filters expect the scan's (a view type for a
-                            // string, say).
-                            let columns = batch
-                                .columns()
-                                .iter()
-                                .zip(bound_schema.fields())
-                                .map(|(column, field)| {
-                                    arrow::compute::cast(column, field.data_type())
-                                })
-                                .collect::<Result<Vec<_>, _>>()?;
-                            checks.push((
-                                taken,
-                                RecordBatch::try_new(Arc::clone(bound_schema), columns)?,
-                            ));
-                        }
-                        let mut passing = Vec::new();
-                        for (pairs, batch) in checks {
-                            let mask = predicate.mask(&batch)?;
-                            passing.extend(
-                                pairs
-                                    .iter()
-                                    .zip(mask.iter())
-                                    .filter(|(_, holds)| *holds == Some(true))
-                                    .map(|(pair, _)| *pair),
-                            );
-                        }
-                        Ok::<_, DataFusionError>(Some((i, exhausted, worst, ids, passing)))
+                            .map_err(QueryError::from)?;
+                        Ok::<_, DataFusionError>(ends.map(|ends| (i, ends.pairs)))
                     }),
                 in_flight,
             )
             .await?;
             for round in rounds {
-                let Some((i, exhausted, worst, ids, passing)) = round else {
+                let Some((i, pairs)) = round else {
                     return Ok(None);
                 };
                 let read = &mut reads[i];
-                read.exhausted = exhausted;
-                read.worst = worst;
-                read.checked.extend(ids);
-                read.passing.extend(passing);
+                read.exhausted = pairs.len() < want;
+                read.worst = pairs
+                    .iter()
+                    .map(|(key, _)| *key)
+                    .reduce(|a, b| if better(a, b) { b } else { a });
+                for (key, row) in pairs {
+                    if read.seen.insert(row) {
+                        read.unchecked.push((key, row));
+                    }
+                }
             }
+            // Every row before the frontier is known; past it a superfile
+            // may hold rows its rounds have not given yet.
             let frontier = reads
                 .iter()
                 .filter(|read| !read.exhausted)
                 .filter_map(|read| read.worst)
                 .reduce(|a, b| if better(a, b) { a } else { b });
-            let mut keys: Vec<u64> = reads
-                .iter()
-                .flat_map(|read| read.passing.iter().map(|(key, _)| *key))
-                .filter(|key| frontier.is_none_or(|edge| better(*key, edge)))
-                .collect();
-            if keys.len() >= hint.k {
-                let cut = *keys
-                    .select_nth_unstable_by(hint.k - 1, |a, b| match descending {
-                        false => a.cmp(b),
-                        true => b.cmp(a),
+            loop {
+                // The known rows before the frontier, best first.
+                let mut candidates: Vec<(u64, usize, u32)> = reads
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(i, read)| {
+                        read.unchecked.iter().map(move |(key, row)| (*key, i, *row))
                     })
-                    .1;
-                return Ok(Some(
-                    reads
-                        .into_iter()
-                        .map(|read| {
-                            let rows: RoaringBitmap = read
-                                .passing
-                                .into_iter()
-                                .filter(|(key, _)| !better(cut, *key))
-                                .map(|(_, row)| row)
-                                .collect();
-                            (read.id, rows)
+                    .filter(|(key, _, _)| frontier.is_none_or(|edge| better(*key, edge)))
+                    .collect();
+                if candidates.is_empty() {
+                    break;
+                }
+                candidates.sort_unstable_by(|a, b| match descending {
+                    false => a.cmp(b),
+                    true => b.0.cmp(&a.0).then((a.1, a.2).cmp(&(b.1, b.2))),
+                });
+                // A batch ends after every row tied with its last key, so
+                // each key is checked whole.
+                let mut end = batch.min(candidates.len());
+                while end < candidates.len() && candidates[end].0 == candidates[end - 1].0 {
+                    end += 1;
+                }
+                candidates.truncate(end);
+                let mut by_read: Vec<Vec<(u64, u32)>> = vec![Vec::new(); reads.len()];
+                for (key, i, row) in &candidates {
+                    by_read[*i].push((*key, *row));
+                }
+                for (read, taken) in reads.iter_mut().zip(&by_read) {
+                    if !taken.is_empty() {
+                        let rows: RoaringBitmap = taken.iter().map(|(_, row)| *row).collect();
+                        read.unchecked.retain(|(_, row)| !rows.contains(*row));
+                    }
+                }
+                // Owned inputs: futures over borrowed ones, held across an
+                // await in the scan's `async_trait` method, trip rustc's "not
+                // general enough" (see `try_join_bounded`).
+                #[allow(clippy::type_complexity)]
+                let work: Vec<(
+                    usize,
+                    SuperfileUri,
+                    Arc<PreparedScanFile>,
+                    Vec<(u64, u32)>,
+                )> = by_read
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(_, pairs)| !pairs.is_empty())
+                    .map(|(i, mut pairs)| {
+                        pairs.sort_unstable_by_key(|(_, row)| *row);
+                        (i, reads[i].uri, Arc::clone(&reads[i].prepared), pairs)
+                    })
+                    .collect();
+                let checks = try_join_bounded(
+                    work.into_iter()
+                        .map(|(i, uri, prepared, pairs)| async move {
+                            let mut batches: Vec<(Vec<(u64, u32)>, RecordBatch)> = Vec::new();
+                            let read_alone = match cache {
+                                Some(cache) => {
+                                    let (kept, rest) = kept_filter_columns(
+                                        cache,
+                                        uri,
+                                        schema_id,
+                                        &prepared.shape.row_counts,
+                                        &pairs,
+                                        bound_schema,
+                                    )?;
+                                    batches.extend(kept);
+                                    rest
+                                }
+                                None => pairs,
+                            };
+                            if !read_alone.is_empty() {
+                                let rows: Vec<u32> =
+                                    read_alone.iter().map(|(_, row)| *row).collect();
+                                let batch = take_file_columns(
+                                    &self.manifest,
+                                    &prepared.reader,
+                                    rows.clone(),
+                                    names,
+                                    bound_schema,
+                                    op_stats,
+                                )
+                                .await?;
+                                if batch.num_rows() != rows.len() {
+                                    return Err(DataFusionError::Internal(format!(
+                                        "read {} rows to check {} for a filtered top-k",
+                                        batch.num_rows(),
+                                        rows.len()
+                                    )));
+                                }
+                                // Taken columns hold the stored types; the
+                                // filters were planned over the scan's (a view
+                                // type for a string, say).
+                                let columns = batch
+                                    .columns()
+                                    .iter()
+                                    .zip(bound_schema.fields())
+                                    .map(|(column, field)| {
+                                        arrow::compute::cast(column, field.data_type())
+                                    })
+                                    .collect::<Result<Vec<_>, _>>()?;
+                                batches.push((
+                                    read_alone,
+                                    RecordBatch::try_new(Arc::clone(bound_schema), columns)?,
+                                ));
+                            }
+                            let mut passing = Vec::new();
+                            for (pairs, batch) in batches {
+                                let mask = predicate.mask(&batch)?;
+                                passing.extend(
+                                    pairs
+                                        .iter()
+                                        .zip(mask.iter())
+                                        .filter(|(_, holds)| *holds == Some(true))
+                                        .map(|(pair, _)| *pair),
+                                );
+                            }
+                            Ok::<_, DataFusionError>((i, passing))
+                        }),
+                    in_flight,
+                )
+                .await?;
+                checked += candidates.len();
+                for (i, passing) in checks {
+                    passed += passing.len();
+                    reads[i].passing.extend(passing);
+                }
+                // Every row up to the last key checked has been checked, and
+                // every passing row is one of them: past `k` of them, the
+                // `k`-th is the cutoff.
+                if passed >= hint.k {
+                    let mut keys: Vec<u64> = reads
+                        .iter()
+                        .flat_map(|read| read.passing.iter().map(|(key, _)| *key))
+                        .collect();
+                    let cut = *keys
+                        .select_nth_unstable_by(hint.k - 1, |a, b| match descending {
+                            false => a.cmp(b),
+                            true => b.cmp(a),
                         })
-                        .collect(),
-                ));
+                        .1;
+                    return Ok(Some(
+                        reads
+                            .into_iter()
+                            .map(|read| {
+                                let rows: RoaringBitmap = read
+                                    .passing
+                                    .into_iter()
+                                    .filter(|(key, _)| !better(cut, *key))
+                                    .map(|(_, row)| row)
+                                    .collect();
+                                (read.id, rows)
+                            })
+                            .collect(),
+                    ));
+                }
+                // Give up once the rows checked, or the rows the pass rate so
+                // far says are still needed, pass the limit.
+                let short = hint.k - passed;
+                let needed = checked.saturating_add(short.saturating_mul(checked) / passed.max(1));
+                if checked >= ceiling || needed > ceiling {
+                    return Ok(None);
+                }
+                // The next batch holds the rows the pass rate says the rest
+                // of the page needs, twice over; with none passed yet, it
+                // grows by the round's factor.
+                batch = match passed {
+                    0 => batch.saturating_mul(FILTERED_TOP_K_GROWTH),
+                    _ => short.saturating_mul(checked).saturating_mul(2) / passed,
+                }
+                .clamp(hint.k, ceiling);
             }
             if frontier.is_none() {
                 // Every row in the range was read. With no range on the
@@ -1776,13 +1804,7 @@ impl SupertableProvider {
                         .collect(),
                 ));
             }
-            // Give up once the rows checked, or the rows the pass rate so far
-            // says are still needed, pass the limit.
-            let checked: u64 = reads.iter().map(|read| read.checked.len()).sum();
-            let passed = reads.iter().map(|read| read.passing.len()).sum::<usize>() as u64;
-            let short = (hint.k as u64).saturating_sub(passed);
-            let needed = checked.saturating_add(short.saturating_mul(checked) / passed.max(1));
-            if checked >= ceiling as u64 || needed > ceiling as u64 {
+            if want >= ceiling {
                 return Ok(None);
             }
             want = want.saturating_mul(FILTERED_TOP_K_GROWTH).min(ceiling);
@@ -2476,28 +2498,6 @@ fn kept_filter_columns(
         .collect::<Result<Vec<_>, _>>()?;
     let batch = RecordBatch::try_new(Arc::clone(schema), columns)?;
     Ok((Some((kept_pairs, batch)), rest))
-}
-
-/// The row groups that `rows` (sorted by row) fall in, ascending.
-fn row_groups_of(row_counts: &[u32], rows: &[(u64, u32)]) -> Vec<usize> {
-    let mut groups = Vec::new();
-    let mut start: u32 = 0;
-    let mut at = 0;
-    for (row_group, &count) in row_counts.iter().enumerate() {
-        let end = start.saturating_add(count);
-        let from = at;
-        while at < rows.len() && rows[at].1 < end {
-            at += 1;
-        }
-        if at > from {
-            groups.push(row_group);
-        }
-        if at == rows.len() {
-            break;
-        }
-        start = end;
-    }
-    groups
 }
 
 /// Footers of the files this table's scans have opened, by path.
