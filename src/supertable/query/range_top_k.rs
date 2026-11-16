@@ -560,7 +560,8 @@ mod tests {
     }
 
     /// A top-k filtered on another column returns the same rows as a full
-    /// sort: common, single-row and no-row filters, with and without a range
+    /// sort: common, single-row (a comparison and a `text_match`) and no-row
+    /// filters, with and without a range
     /// on the sort column, ties by `seq` and by `_id`, deleted rows, read and
     /// kept columns, before and after an optimize.
     #[test]
@@ -641,6 +642,14 @@ mod tests {
                 "SELECT seq, key FROM supertable WHERE seq = 5000 AND key > 1 ORDER BY key DESC NULLS LAST, seq ASC NULLS LAST LIMIT 10",
                 one,
                 Some(1),
+                true,
+                false,
+                10,
+            ),
+            (
+                "SELECT seq, key FROM supertable WHERE text_match(pad, '000000000000000000000000000000000000000000005000') ORDER BY key DESC NULLS LAST, seq ASC NULLS LAST LIMIT 10",
+                one,
+                None,
                 true,
                 false,
                 10,
