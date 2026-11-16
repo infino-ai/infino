@@ -2026,10 +2026,8 @@ impl SuperfileReader {
             .iter()
             .map(|(b, bytes)| (*b, bytes.as_ref()))
             .collect();
-        ranges
-            .iter()
-            .map(|&(lo, hi)| indexed.count(lo, hi, &boundary))
-            .collect::<Result<Vec<u64>, String>>()
+        indexed
+            .count_many(ranges, &boundary)
             .map(Some)
             .map_err(ReadError::Malformed)
     }

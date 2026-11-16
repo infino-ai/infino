@@ -117,6 +117,7 @@ use crate::{
                 vector_exec::register_vector_search,
             },
             provider::{SupertableProvider, TABLE_NAME, view_string_schema},
+            range_counts::RangeBucket,
             range_top_k::RangeTopK,
         },
         reader_cache::disk::ForegroundQueryGuard,
@@ -859,6 +860,25 @@ impl SupertableReader {
             counted.push((Some(range), filters));
         }
         let provider = &provider;
+        // Intervals on one column, a histogram's buckets, count in one pass
+        // over each superfile's range index rather than a pass per bucket.
+        let buckets: Option<Vec<RangeBucket>> = counted
+            .iter()
+            .map(|(range, filters)| {
+                range.as_ref().map(|range| RangeBucket {
+                    name: String::new(),
+                    range: Some(range.clone()),
+                    filters: filters.clone(),
+                })
+            })
+            .collect();
+        if let Some(buckets) = buckets
+            && let Some(counts) = self
+                .block_on(provider.batched_range_counts(&buckets))
+                .map_err(QueryError::DataFusion)?
+        {
+            return Ok(Some(counts));
+        }
         let counts = self
             .block_on(try_join_all(counted.iter().map(|(range, filters)| {
                 provider.indexed_rows(range.as_ref(), filters)

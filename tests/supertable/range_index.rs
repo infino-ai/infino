@@ -325,6 +325,31 @@ fn assert_same_counts(db: &Connection, when: &str) {
         assert_eq!(counts, expected, "{when}: count_where on {table}");
     }
 
+    // A histogram's buckets, sharing their bounds: the range-indexed table
+    // counts them in one pass over each superfile, and agrees with the
+    // plain table's aggregate.
+    let buckets: Vec<_> = (-5..5)
+        .map(|i| {
+            col("qty")
+                .gt_eq(lit(i * 50))
+                .and(col("qty").lt(lit((i + 1) * 50)))
+        })
+        .collect();
+    let counted: Vec<Vec<u64>> = ["ranged", "plain"]
+        .iter()
+        .map(|table| {
+            db.open_table(table)
+                .expect("open")
+                .count_where(&buckets)
+                .unwrap_or_else(|e| panic!("{when}: bucket counts on {table}: {e}"))
+        })
+        .collect();
+    assert_eq!(counted[0], counted[1], "{when}: bucket counts");
+    assert!(
+        counted[0].iter().any(|n| *n > 0),
+        "{when}: buckets hold rows"
+    );
+
     // A predicate that reads another relation, which no FILTER clause can
     // hold, beside one the index counts.
     // A subquery's plan ends in the projection of its one column, as SQL
