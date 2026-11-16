@@ -6645,6 +6645,17 @@ mod tests {
     use tokio::time::sleep;
 
     use super::*;
+    use crate::{
+        runtime_metrics::rss::purge_allocator,
+        superfile::vector::{
+            builder::{
+                VectorBuilder, VectorConfig, build_merged_subsection_from_materialized,
+                finish_multi_cell_blob,
+            },
+            cell_posting::{EncodedCellRow, MaterializedIvfRow},
+            distance::{encode_sq16_row, sq16_decoded_norm_sq},
+        },
+    };
 
     /// `checked_dir_bounds` computes `dir_end = offset + count*entry_size + CRC`
     /// and rejects untrusted-header values that would wrap `usize` (a crafted
@@ -6663,17 +6674,6 @@ mod tests {
             "offset+size+CRC overflow must error, not wrap",
         );
     }
-    use crate::{
-        runtime_metrics::rss::purge_allocator,
-        superfile::vector::{
-            builder::{
-                VectorBuilder, VectorConfig, build_merged_subsection_from_materialized,
-                finish_multi_cell_blob,
-            },
-            cell_posting::{EncodedCellRow, MaterializedIvfRow},
-            distance::{encode_sq16_row, sq16_decoded_norm_sq},
-        },
-    };
 
     fn build_blob(n_docs: u32, dim: usize, n_cent: usize, metric: Metric) -> (Bytes, String) {
         let mut b = VectorBuilder::new();

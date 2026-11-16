@@ -10112,9 +10112,14 @@ mod tests {
                     break;
                 }
             }
-            st.commit_compaction_batch(vec![prepared])
-                .await
-                .expect("the batch commits");
+            let committed = st.commit_compaction_batch(vec![prepared]).await;
+            if committed.is_err() {
+                // Free the parked delete first: a panic with it still held
+                // leaves its blocking task waiting, and the runtime never
+                // shuts down.
+                storage.release();
+            }
+            committed.expect("the batch commits");
             storage.resume.add_permits(1);
         }
         storage.release();
