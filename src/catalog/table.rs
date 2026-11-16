@@ -116,6 +116,11 @@ pub(crate) trait Table: Send + Sync {
         expected: Option<u32>,
     ) -> Result<TableSchema, InfinoError>;
 
+    /// The local engine table behind this handle; `None` for a hosted table.
+    fn local_engine(&self) -> Option<&SupertableHandle> {
+        None
+    }
+
     /// Test-only: expose the concrete handle behind the trait object so tests
     /// can reach engine internals (`options`, `stats`, `reader`, …) through the
     /// public [`Supertable`]. Not part of any shipped surface.
@@ -267,6 +272,9 @@ impl Table for SupertableHandle {
         expected: Option<u32>,
     ) -> Result<TableSchema, InfinoError> {
         Ok((*SupertableHandle::apply_schema(self, patch, expected)?).clone())
+    }
+    fn local_engine(&self) -> Option<&SupertableHandle> {
+        Some(self)
     }
     #[cfg(any(test, feature = "test-helpers"))]
     fn as_any(&self) -> &dyn Any {
@@ -811,8 +819,7 @@ impl Supertable {
 
     fn local_engine(&self) -> Result<&SupertableHandle, InfinoError> {
         self.inner
-            .as_any()
-            .downcast_ref::<SupertableHandle>()
+            .local_engine()
             .ok_or_else(|| InfinoError::Unsupported("merge_tables needs local tables".into()))
     }
 
