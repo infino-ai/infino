@@ -20,7 +20,8 @@
 use std::{cmp::Ordering, slice::from_ref, sync::Arc, time::Instant};
 
 use arrow::{
-    array::{Array, AsArray},
+    array::{Array, AsArray, Scalar, StructArray, UInt64Array},
+    compute::kernels::cmp::eq,
     datatypes::DataType,
     record_batch::RecordBatch,
 };
@@ -49,7 +50,7 @@ use crate::{
     supertable::{
         error::QueryError,
         handle::{Supertable, SupertableReader},
-        manifest::{SuperfileEntry, hll::HllSketch},
+        manifest::{SuperfileEntry, hll::HllSketch, summaries::ValueTable},
         query::{
             SuperfileHit,
             candidate::single_range,
@@ -140,6 +141,40 @@ fn literal_counts(
             }
             Ok(_) => return None,
             Err(_) => {}
+        }
+    }
+    Some(held)
+}
+
+/// [`literal_counts`] over a value table as a section stores it (its values
+/// and their counts as arrays), each literal compared with the values by
+/// the compare kernel, without building the table. The same `None`s: a
+/// statement would cast the column to compare it, the values are not of
+/// `column_type`, or a literal does not take it.
+fn stored_literal_counts(
+    table: &StructArray,
+    literals: &[ScalarValue],
+    column_type: &DataType,
+) -> Option<u64> {
+    let values = table.column(0);
+    let counts = table.column(1).as_any().downcast_ref::<UInt64Array>()?;
+    if values.is_empty() {
+        return Some(0);
+    }
+    if values.data_type() != column_type {
+        return None;
+    }
+    let mut held = 0u64;
+    for literal in literals {
+        if comparison_coercion(column_type, &literal.data_type()).as_ref() != Some(column_type) {
+            return None;
+        }
+        let literal = literal.cast_to(column_type).ok()?.to_array().ok()?;
+        let found = eq(values, &Scalar::new(literal)).ok()?;
+        for (hit, count) in found.iter().zip(counts.values()) {
+            if hit == Some(true) {
+                held = held.saturating_add(*count);
+            }
         }
     }
     Some(held)
@@ -431,13 +466,29 @@ impl SupertableReader {
                 continue;
             }
             let present = entry.n_docs.saturating_sub(stats.null_count().unwrap_or(0)) as f64;
-            if let Some(table) = stats.value_counts() {
-                if let Some(held) = literal_counts(table.entries(), &literals, column_type) {
+            if let Some(table) = stats.value_table() {
+                let (held, distinct) = match &table {
+                    ValueTable::Built(table) => (
+                        literal_counts(table.entries(), &literals, column_type),
+                        table.entries().len(),
+                    ),
+                    ValueTable::Stored(table) => (
+                        match column_type.is_floating() {
+                            // A float compares as `ScalarValue` compares it.
+                            true => stats.value_counts().and_then(|table| {
+                                literal_counts(table.entries(), &literals, column_type)
+                            }),
+                            false => stored_literal_counts(table, &literals, column_type),
+                        },
+                        table.len(),
+                    ),
+                };
+                if let Some(held) = held {
                     expected += held as f64;
                     continue;
                 }
                 counted = false;
-                let distinct = table.entries().len() as f64;
+                let distinct = distinct as f64;
                 if distinct >= 1.0 {
                     expected += present * (literals.len() as f64 / distinct).min(1.0);
                 }

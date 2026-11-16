@@ -302,6 +302,15 @@ impl ColumnRow<'_> {
     }
 }
 
+/// An exact value table as a superfile keeps it ([`ColumnStats::value_table`]).
+pub(crate) enum ValueTable<'a> {
+    /// A decoded table, its entries sorted by value.
+    Built(&'a ScalarValueCounts),
+    /// A section's table: a struct array of the values and their counts
+    /// (`UInt64`), neither holding a null.
+    Stored(StructArray),
+}
+
 /// One column's statistics for one superfile, wherever they live, read
 /// one statistic at a time. Decoded statistics are borrowed; a section's
 /// are read from the decoded group's arrays. Only [`Self::value_counts`]
@@ -429,6 +438,26 @@ impl ColumnStats<'_> {
         match self {
             Self::Inline(agg) => agg.value_counts.clone(),
             Self::Section(row) => row.value_counts(),
+        }
+    }
+
+    /// The exact value table as the superfile keeps it, without building
+    /// it: a decoded table as it is, a section's as its struct array of
+    /// values and counts. A caller looking up a few values across every
+    /// superfile reads them from the arrays rather than building and
+    /// sorting each whole table, as [`Self::value_counts`] does. `None`
+    /// when the superfile carries no table, or a section's holds a null
+    /// (which [`Self::value_counts`] reads as no table either).
+    pub(crate) fn value_table(&self) -> Option<ValueTable<'_>> {
+        match self {
+            Self::Inline(agg) => agg.value_counts.as_ref().map(ValueTable::Built),
+            Self::Section(row) => {
+                let item = row.value_table_array()?;
+                let table = item.as_any().downcast_ref::<StructArray>()?.clone();
+                let counts = table.column(1).as_any().downcast_ref::<UInt64Array>()?;
+                (table.column(0).null_count() == 0 && counts.null_count() == 0)
+                    .then_some(ValueTable::Stored(table))
+            }
         }
     }
 
