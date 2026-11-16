@@ -104,8 +104,10 @@ use parquet::{
 };
 use rayon::ThreadPool;
 use roaring::RoaringBitmap;
+#[cfg(test)]
+use tokio::sync::Mutex;
 use tokio::sync::{OnceCell, Semaphore};
-use tracing::Instrument;
+use tracing::{Instrument, debug};
 use uuid::Uuid;
 
 use crate::{
@@ -188,6 +190,15 @@ const SUPERFILE_STORE_URL_PREFIX: &str = "superfile://supertable-";
 /// Monotonic source of per-provider object-store authorities.
 static STORE_URL_SEQ: atomic::AtomicU64 = atomic::AtomicU64::new(0);
 
+/// Filtered scans that found their table opened without statistics and read them first: each one
+/// a statement the catalog's check let through. Tests read it.
+pub(crate) static STATISTICS_READ_BY_SCAN: atomic::AtomicU64 = atomic::AtomicU64::new(0);
+
+/// Held by a test across the statements whose [`STATISTICS_READ_BY_SCAN`] count it checks, so
+/// another test's scans do not move the counter meanwhile.
+#[cfg(test)]
+pub(crate) static STATISTICS_READ_BY_SCAN_HELD: Mutex<()> = Mutex::const_new(());
+
 /// An object-store registry key no other provider holds.
 fn unique_store_url() -> ObjectStoreUrl {
     let seq = STORE_URL_SEQ.fetch_add(1, atomic::Ordering::Relaxed);
@@ -242,6 +253,7 @@ fn prepare_scan_file(
     reader: Arc<SuperfileReader>,
     tier: OpenTier,
     parquet_meta: Arc<ParquetMetaData>,
+    statistics: bool,
 ) -> DfResult<Arc<PreparedScanFile>> {
     let path = ObjPath::from(entry.storage_path());
     let source = reader.byte_source();
@@ -251,14 +263,18 @@ fn prepare_scan_file(
     // the footer and this superfile's own manifest bounds, which never
     // change, so the provider every query builds shares the first one. A
     // handle that could not read the bounds sees none, and derives a copy
-    // of its own rather than keep that one for handles that can.
+    // of its own rather than keep that one for handles that can. A snapshot
+    // without `statistics` keeps the file's own footer and copies nothing: it
+    // serves only scans with no filter (`scan` reads them before any other).
     let bounds = |column| {
         entry
             .scalar_stats
             .column(column)
             .and_then(|stats| stats.min_max_values())
     };
-    let footer = if entry.scalar_stats.is_unavailable() {
+    let footer = if !statistics {
+        parquet_meta
+    } else if entry.scalar_stats.is_unavailable() {
         without_nan_blind_bounds(parquet_meta, bounds)?
     } else {
         reader.scan_footer(parquet_meta, |indexed| {
@@ -740,6 +756,18 @@ impl SupertableProvider {
             count_range: self.count_range.clone(),
             read_rows: self.read_rows.clone(),
             deleted_stats: Arc::clone(&self.deleted_stats),
+        }
+    }
+
+    /// This provider over `manifest`, its snapshot with the statistics read, with prepared files of
+    /// its own: those of a snapshot without statistics keep each file's raw footer.
+    fn with_manifest(&self, manifest: Arc<ManifestSnapshot>) -> Self {
+        Self {
+            manifest,
+            prepared_scan_files: Arc::default(),
+            scan_store: Arc::new(SuperfileObjectStore::new()),
+            scan_footers: Arc::default(),
+            ..self.sibling()
         }
     }
 
@@ -1504,6 +1532,7 @@ impl SupertableProvider {
         let storage = self.manifest.options.storage.clone();
         let scan_store = Arc::clone(&self.scan_store);
         let scan_footers = Arc::clone(&self.scan_footers);
+        let statistics = self.manifest.statistics_loaded();
         async move {
             if let Some(prepared) = cell.get() {
                 return Ok(Arc::clone(prepared));
@@ -1533,6 +1562,7 @@ impl SupertableProvider {
                             Arc::clone(reader),
                             OpenTier::Memory,
                             parquet_meta,
+                            statistics,
                         )
                     })
                     .await?;
@@ -1574,6 +1604,7 @@ impl SupertableProvider {
                             reader,
                             tier,
                             parquet_meta,
+                            statistics,
                         )
                     })
                     .await?;
@@ -2168,6 +2199,26 @@ impl TableProvider for SupertableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        // The catalog opens a table without statistics only for a statement it finds uses none
+        // (`uses_statistics`). A filter it missed reads them here first: slower, never wrong.
+        if !filters.is_empty() && !self.manifest.statistics_loaded() {
+            STATISTICS_READ_BY_SCAN.fetch_add(1, atomic::Ordering::Relaxed);
+            debug!("a filtered scan read the statistics its table was opened without");
+            let manifest = self
+                .manifest
+                .with_statistics()
+                .await
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            if !manifest.statistics_loaded() {
+                return Err(DataFusionError::Internal(
+                    "reading a table's statistics left it without them".to_owned(),
+                ));
+            }
+            return self
+                .with_manifest(manifest)
+                .scan(state, projection, filters, limit)
+                .await;
+        }
         // Superfile selection via the shared two-tier prune (the same
         // path FTS search uses); see `select_survivors`. Survivors go to
         // DataFusion. The span carries both counts, so a trace shows how
@@ -2186,7 +2237,6 @@ impl TableProvider for SupertableProvider {
                     .await?
             }
         };
-
         select_span.record("survivors", survivor_entries.len());
         trace::end(select_span);
 
@@ -3478,6 +3528,7 @@ mod tests {
         hash::{DefaultHasher, Hash, Hasher},
         ops::Range,
         slice::from_ref,
+        thread,
         time::Duration,
     };
 
@@ -3521,15 +3572,18 @@ mod tests {
         supertable::{
             Supertable, SupertableOptions,
             hydrate::hydrate_from_reader,
-            manifest::{ScalarStatsAgg, SuperfileUri, column_hll},
+            manifest::{
+                ScalarStatsAgg, SuperfileUri, column_hll, summaries::MANIFEST_SUMMARIES_DIR,
+            },
             query::{
                 read_ahead::{PAGE_READ_THROUGH_BYTES, file_pruning, fixture, statistics_pruned},
                 sql::sql_session_context,
             },
         },
         test_helpers::{
-            build_title_batch, default_supertable_options, default_tokenizer, fid,
-            lazy_foreground_disk_cache,
+            build_title_batch, default_supertable_options, default_tokenizer,
+            fault_storage::{FaultOp, FaultStorage},
+            fid, lazy_foreground_disk_cache,
         },
     };
 
@@ -5915,44 +5969,58 @@ mod tests {
     /// `[-1.0, -1.0]`, leaving out the NaNs total order puts first ascending
     /// (`lo`) and first descending (`hi`).
     fn nan_table(dir: &TempDir) -> Supertable {
+        let st = Supertable::create(nan_table_options(dir)).expect("create");
+        for file in 0..NAN_TABLE_FILES {
+            commit_nan_file(&st, file + 1 == NAN_TABLE_FILES);
+        }
+        st
+    }
+
+    /// Commit one superfile of the NaN table ([`nan_table`]) to `st`: the one holding the NaNs
+    /// when `last`, else one without.
+    fn commit_nan_file(st: &Supertable, last: bool) {
+        let rows = if last {
+            NAN_FILE_ROWS
+        } else {
+            NAN_FREE_FILE_ROWS
+        };
+        let (lo, hi): (Vec<f64>, Vec<Option<f32>>) = (0..rows)
+            .map(|row| match (last, row) {
+                (false, _) => (-1.0, Some(1.0)),
+                (true, row) if row < NAN_ROWS => (-f64::NAN, Some(f32::NAN)),
+                (true, row) if row < NAN_ROWS + NULL_ROWS => (1.0, None),
+                (true, _) => (1.0, Some(-1.0)),
+            })
+            .unzip();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&st.options().schema),
+            vec![
+                Arc::new(Float64Array::from(lo)) as ArrayRef,
+                Arc::new(Float32Array::from(hi)),
+            ],
+        )
+        .expect("batch");
+        let mut writer = st.writer().expect("writer");
+        writer.append(&batch).expect("append");
+        writer.commit().expect("commit");
+    }
+
+    /// The options of the NaN table ([`nan_table`]) in `dir`.
+    fn nan_table_options(dir: &TempDir) -> SupertableOptions {
+        nan_options(Arc::new(
+            LocalFsStorageProvider::new(dir.path()).expect("provider"),
+        ))
+    }
+
+    /// The options of the NaN table ([`nan_table`]) over `storage`.
+    fn nan_options(storage: Arc<dyn StorageProvider>) -> SupertableOptions {
         let schema = Arc::new(Schema::new(vec![
             Field::new("lo", DataType::Float64, false),
             Field::new("hi", DataType::Float32, true),
         ]));
-        let storage: Arc<dyn StorageProvider> =
-            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
-        let options = SupertableOptions::new(Arc::clone(&schema), vec![], vec![])
+        SupertableOptions::new(schema, vec![], vec![])
             .expect("options")
-            .with_storage(storage);
-        let st = Supertable::create(options).expect("create");
-        for file in 0..NAN_TABLE_FILES {
-            let last = file + 1 == NAN_TABLE_FILES;
-            let rows = if last {
-                NAN_FILE_ROWS
-            } else {
-                NAN_FREE_FILE_ROWS
-            };
-            let (lo, hi): (Vec<f64>, Vec<Option<f32>>) = (0..rows)
-                .map(|row| match (last, row) {
-                    (false, _) => (-1.0, Some(1.0)),
-                    (true, row) if row < NAN_ROWS => (-f64::NAN, Some(f32::NAN)),
-                    (true, row) if row < NAN_ROWS + NULL_ROWS => (1.0, None),
-                    (true, _) => (1.0, Some(-1.0)),
-                })
-                .unzip();
-            let batch = RecordBatch::try_new(
-                Arc::clone(&schema),
-                vec![
-                    Arc::new(Float64Array::from(lo)) as ArrayRef,
-                    Arc::new(Float32Array::from(hi)),
-                ],
-            )
-            .expect("batch");
-            let mut writer = st.writer().expect("writer");
-            writer.append(&batch).expect("append");
-            writer.commit().expect("commit");
-        }
-        st
+            .with_storage(storage)
     }
 
     /// Whether the footer `provider` registers for `entry`'s superfile leaves
@@ -6074,6 +6142,79 @@ mod tests {
             "the NaN superfile's footer is adjusted"
         );
         assert!(Arc::ptr_eq(&first.footer, &second.footer));
+    }
+
+    /// A handle opened without statistics scans each superfile by its own footer and copies none:
+    /// nothing failed, so it is told apart from a handle whose read of them did.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_handle_without_statistics_keeps_each_footer() {
+        let dir = TempDir::new().expect("tempdir");
+        drop(nan_table(&dir));
+        let st = Supertable::open(nan_table_options(&dir).without_statistics()).expect("open");
+        let provider = provider_of(&st);
+        assert!(!provider.manifest().statistics_loaded());
+        let entry = provider
+            .manifest()
+            .superfiles
+            .iter()
+            .find(|entry| entry.n_docs == NAN_FILE_ROWS as u64)
+            .cloned()
+            .expect("the NaN superfile");
+        assert!(
+            entry.scalar_stats.is_unavailable(),
+            "no commit writes them anew"
+        );
+        let prepared = provider.prepared_scan_file(entry).await.expect("prepare");
+        let footer = prepared
+            .reader
+            .parquet_metadata_with_page_index()
+            .await
+            .expect("footer");
+        assert!(Arc::ptr_eq(&prepared.footer, &footer));
+    }
+
+    /// A filter the catalog's check let through to a handle without statistics reads them in the
+    /// scan first, and counts every NaN row its superfile's own footer would prune.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_filter_on_a_handle_without_statistics_reads_them_in_the_scan() {
+        let dir = TempDir::new().expect("tempdir");
+        drop(nan_table(&dir));
+        let st = Supertable::open(nan_table_options(&dir).without_statistics()).expect("open");
+        let _held = STATISTICS_READ_BY_SCAN_HELD.lock().await;
+        let before = STATISTICS_READ_BY_SCAN.load(atomic::Ordering::Relaxed);
+        let filtered = format!("SELECT count(*) FROM {TABLE_NAME} WHERE lo < -1.0");
+        assert_eq!(count_of(&st, &filtered).await, NAN_ROWS as i64);
+        assert!(STATISTICS_READ_BY_SCAN.load(atomic::Ordering::Relaxed) > before);
+    }
+
+    /// A refresh that swaps in a newer snapshot while a handle reads its statistics in place keeps
+    /// both: the read retries over the refreshed snapshot rather than store over it.
+    #[test]
+    fn reading_statistics_keeps_a_refresh_that_races_it() {
+        let dir = TempDir::new().expect("tempdir");
+        drop(nan_table(&dir));
+        let local: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let faults = FaultStorage::wrap(Arc::clone(&local));
+        let st = Supertable::open(nan_options(faults.clone()).without_statistics()).expect("open");
+        let peer = Supertable::open(nan_options(local)).expect("peer");
+        let committed = Arc::new(atomic::AtomicU64::new(0));
+        let (racing, seen) = (st.clone(), Arc::clone(&committed));
+        faults.before(FaultOp::Get, MANIFEST_SUMMARIES_DIR, move || {
+            thread::spawn(move || {
+                commit_nan_file(&peer, false);
+                seen.store(peer.manifest_id(), atomic::Ordering::Relaxed);
+                runtime::Runtime::new()
+                    .expect("runtime")
+                    .block_on(racing.refresh())
+                    .expect("refresh");
+            })
+            .join()
+            .expect("the racing refresh");
+        });
+        st.load_statistics().expect("read the statistics");
+        assert!(st.statistics_loaded());
+        assert_eq!(st.manifest_id(), committed.load(atomic::Ordering::Relaxed));
     }
 
     /// The single count `sql` answers over `st`, run the way the catalog
