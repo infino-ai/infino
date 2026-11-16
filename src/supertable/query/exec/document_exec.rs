@@ -392,8 +392,14 @@ impl ExecutionPlan for DocumentExec {
         }))
     }
 
+    /// `false`, although rows leave in the order they arrive: DataFusion
+    /// moves a sort below a node that keeps its input's order by column
+    /// position, and a document's position in the input holds another
+    /// column (its skeleton), so `ORDER BY source LIMIT 2` would sort by
+    /// the skeleton. The orderings this node does keep are in its
+    /// properties ([`output_properties`]).
     fn maintains_input_order(&self) -> Vec<bool> {
-        vec![true]
+        vec![false]
     }
 
     fn cardinality_effect(&self) -> CardinalityEffect {
@@ -660,11 +666,13 @@ impl LateDocumentExec {
 
 impl DisplayAs for LateDocumentExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let documents: Vec<&str> = self
-            .documents
-            .iter()
-            .map(|(_, document)| document.name.as_str())
-            .collect();
+        // Each document once, as it is read once however often projected.
+        let mut documents: Vec<&str> = Vec::new();
+        for (_, document) in self.documents.iter() {
+            if !documents.contains(&document.name.as_str()) {
+                documents.push(document.name.as_str());
+            }
+        }
         write!(f, "LateDocumentExec: rebuild=[{}]", documents.join(", "))
     }
 }
@@ -701,6 +709,9 @@ impl ExecutionPlan for LateDocumentExec {
         }))
     }
 
+    /// Rows leave in the order they arrive. A sort moved below this node by
+    /// column position would read the placeholder where a document goes,
+    /// but no rule that moves sorts runs after `LateDocuments` places it.
     fn maintains_input_order(&self) -> Vec<bool> {
         vec![true]
     }

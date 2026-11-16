@@ -385,10 +385,10 @@ fn phase_one(rebuild: &DocumentExec, config: &ConfigOptions) -> DfResult<Option<
             alias: field.name().clone(),
         });
     }
-    let name = row_id_name(late);
+    // The scan's `_id`, renamed here to the name phase 1 carries it under.
     exprs.push(ProjectionExpr {
-        expr: Arc::new(Column::new(&name, row_id_at)),
-        alias: name,
+        expr: Arc::new(Column::new(late.row_id(), row_id_at)),
+        alias: row_id_name(late),
     });
     let placeholder = ProjectionExec::try_new(exprs, narrowed)?;
     Ok(Some(Threaded {
