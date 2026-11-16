@@ -10859,6 +10859,65 @@ fn pending_metadata_schema(metadata: &[u8]) -> Option<u32> {
         .map(|probe| probe.schema)
 }
 
+/// Bytes of temp files a bulk repack writes per byte of rows it spills: each
+/// child cell is packed from its spill, which is then removed, and every
+/// packed cell stays on disk until it is packed once more into its shard.
+const REPACK_TEMP_FILES_PER_SPILL_BYTE: u64 = 2;
+
+/// The temp files of one bulk repack pass, counted against the disk budget
+/// of the table's disk cache.
+struct RepackTempFiles {
+    charge: ScratchCharge,
+    /// Cleared when the budget could never hold the pass's first wave: the
+    /// pass then runs uncounted, within the scratch disk's free space.
+    counted: bool,
+}
+
+impl RepackTempFiles {
+    /// Charge `needed` bytes of temp files a wave is about to write in
+    /// `scratch`, evicting cache files to make room, and check that the
+    /// disk holds them. `false` when the budget has no room for the wave
+    /// right now: the pass stops taking waves and a later pass splits the
+    /// rest. A first wave the budget could never hold goes on uncounted
+    /// with a warning, so a table whose budget is smaller than one wave
+    /// still repacks. A scratch disk too full for the wave fails the pass.
+    async fn take_wave(&mut self, scratch: &Path, needed: u64) -> Result<bool, BuildError> {
+        if self.counted {
+            match self.charge.try_grow(needed).await {
+                ScratchRoom::Charged => {}
+                ScratchRoom::NeverFits(error) if self.charge.bytes() == 0 => {
+                    warn!(
+                        needed_bytes = needed,
+                        %error,
+                        "repack: the table's disk budget is too small for this pass's temp \
+                         files; they are not counted against it and only the disk's free \
+                         space limits them"
+                    );
+                    self.counted = false;
+                }
+                ScratchRoom::NoRoom(error) | ScratchRoom::NeverFits(error) => {
+                    warn!(
+                        needed_bytes = needed,
+                        %error,
+                        "repack: the table's disk budget has no room for the next wave's \
+                         temp files; the cells left wait for a later pass"
+                    );
+                    return Ok(false);
+                }
+            }
+        }
+        if let Some((free, total)) = scratch_space(scratch)
+            && !scratch_disk_fits(free, total, needed)
+        {
+            return Err(BuildError::Store(format!(
+                "repack stopped before a wave: its temp files need {needed} bytes and the \
+                 scratch disk has {free} of {total} free"
+            )));
+        }
+        Ok(true)
+    }
+}
+
 /// Pass-scoped scratch for the bulk repack's row spills and packed cell
 /// subsections, under the table's scratch folder. Removed on success; an
 /// aborted pass leaves local-disk garbage only.
@@ -11635,6 +11694,17 @@ pub(in crate::supertable) async fn split_repack_bulk(
             let _ = fs::remove_dir_all(&self.path);
         }
     }
+    // Declared before the guard, so the charge is given back after the
+    // guard has removed the files it covers.
+    let mut temp_files = inner
+        .options
+        .disk_cache
+        .as_ref()
+        .map(|cache| RepackTempFiles {
+            charge: cache.scratch_charge(),
+            counted: true,
+        });
+    let spill_row_bytes = drain_spill_row_bytes(&inner.options, &column);
     let scratch = repack_scratch_dir(&inner.options);
     fs::create_dir_all(&scratch)
         .map_err(|error| BuildError::Store(format!("repack scratch create: {error}")))?;
@@ -11675,6 +11745,24 @@ pub(in crate::supertable) async fn split_repack_bulk(
         queue = deferred;
         if wave_cells.is_empty() {
             continue;
+        }
+        // On a table with a disk cache the wave's temp files are charged
+        // to its disk budget before anything is written. Without room the
+        // pass ends here with the waves already packed, and the cells left
+        // are not split in this pass.
+        if let (Some(temp_files), Some(row_bytes)) = (temp_files.as_mut(), spill_row_bytes) {
+            let wave_rows: u64 = wave_cells
+                .iter()
+                .map(|cell| cell_bytes.get(cell).copied().unwrap_or(0))
+                .sum();
+            let needed = wave_rows
+                .saturating_mul(row_bytes)
+                .saturating_mul(REPACK_TEMP_FILES_PER_SPILL_BYTE);
+            if !temp_files.take_wave(&scratch, needed).await? {
+                noop_cells.extend(wave_cells);
+                noop_cells.extend(queue.drain(..).map(|(cell, _)| cell));
+                break;
+            }
         }
         // Same refuse-and-shrink gate as the batched loop: reserve the wave
         // against the connection budget; on denial shrink to the largest
@@ -18101,6 +18189,118 @@ mod tests {
             hidden_index_rows(&hidden).await,
             (COMMITS * COMMIT_AS_DRAIN_TEST_ROWS) as u64
         );
+    }
+
+    /// A repack wave's temp files are charged to the table's disk budget
+    /// and given back with the pass. A wave past what is left of the temp
+    /// files' share is refused and charges nothing. A first wave the budget
+    /// could never hold is taken uncounted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_repack_wave_is_charged_to_the_disk_budget_or_waits() {
+        const WAVE_BYTES: u64 = 1024;
+        let dir = TempDir::new().expect("tempdir");
+        let (_table, cache) = drain_table_with_disk_cache(&dir, roomy_disk_budget());
+        let share = cache.scratch_room();
+        let mut temp_files = RepackTempFiles {
+            charge: cache.scratch_charge(),
+            counted: true,
+        };
+        assert!(
+            temp_files
+                .take_wave(dir.path(), WAVE_BYTES)
+                .await
+                .expect("a wave with room")
+        );
+        assert_eq!(cache.stats().scratch_bytes, WAVE_BYTES);
+        assert!(
+            !temp_files
+                .take_wave(dir.path(), share)
+                .await
+                .expect("a wave past the share"),
+            "the wave waits for a later pass"
+        );
+        assert_eq!(cache.stats().scratch_bytes, WAVE_BYTES);
+        assert!(temp_files.counted);
+        cache.assert_budget_consistent();
+        drop(temp_files);
+        assert_eq!(cache.stats().scratch_bytes, 0);
+
+        let tiny_dir = TempDir::new().expect("tempdir");
+        let (_table, tiny) = drain_table_with_disk_cache(&tiny_dir, TINY_DISK_BUDGET_BYTES);
+        let mut temp_files = RepackTempFiles {
+            charge: tiny.scratch_charge(),
+            counted: true,
+        };
+        assert!(
+            temp_files
+                .take_wave(tiny_dir.path(), TINY_DISK_BUDGET_BYTES)
+                .await
+                .expect("a first wave the budget cannot hold"),
+            "the pass still repacks"
+        );
+        assert!(!temp_files.counted);
+        assert_eq!(tiny.stats().scratch_bytes, 0);
+        tiny.assert_budget_consistent();
+    }
+
+    /// A bulk repack on a table whose disk budget has no room for temp
+    /// files splits nothing and leaves every cell for a later pass. With
+    /// room it runs, and gives back everything it charged.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_repack_with_no_room_in_the_disk_budget_leaves_its_cells_for_later() {
+        const COMMITS: usize = 3;
+        let dir = TempDir::new().expect("tempdir");
+        let (table, cache) = drain_table_with_disk_cache(&dir, roomy_disk_budget());
+        for _ in 0..COMMITS {
+            commit_axis_vectors(&table, COMMIT_AS_DRAIN_TEST_ROWS);
+        }
+        drain_once(&table).await.expect("drain");
+        let hidden = table
+            .inner()
+            .vector_index_table
+            .as_ref()
+            .expect("hidden table")
+            .clone();
+        let inner = Arc::clone(hidden.inner());
+        let manifest = inner.manifest.load_full();
+        let (counts, parents_by_cell) = scan_cell_parents(&inner, &manifest, None)
+            .await
+            .expect("cell scan");
+        let mut candidates: Vec<(u32, u64)> = counts
+            .iter()
+            .filter(|&(_, &rows)| rows > 0)
+            .map(|(&cell, &rows)| (cell, rows))
+            .collect();
+        candidates.sort_unstable();
+        assert!(!candidates.is_empty());
+
+        // Other temp files hold the whole share.
+        let mut others = cache.scratch_charge();
+        others.grow(cache.scratch_room()).await.expect("the share");
+        let outcome =
+            split_repack_bulk(&inner, &manifest, candidates.clone(), 0.0, &parents_by_cell)
+                .await
+                .expect("a repack with no room is not an error");
+        assert_eq!(outcome.per_cell.len(), candidates.len());
+        assert!(outcome.per_cell.iter().all(|(_, split)| split.is_none()));
+        assert_eq!(
+            inner.manifest.load_full().manifest_id,
+            manifest.manifest_id,
+            "nothing is committed"
+        );
+        assert_eq!(cache.stats().scratch_bytes, others.bytes());
+        cache.assert_budget_consistent();
+
+        drop(others);
+        split_repack_bulk(&inner, &manifest, candidates, 0.0, &parents_by_cell)
+            .await
+            .expect("repack");
+        assert_eq!(
+            cache.stats().scratch_bytes,
+            0,
+            "the pass gives its bytes back"
+        );
+        cache.assert_budget_consistent();
     }
 
     /// A drain that finds no room for its next step in the disk budget
