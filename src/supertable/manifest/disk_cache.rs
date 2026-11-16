@@ -32,8 +32,10 @@
 //! ## What this does NOT cache
 //!
 //! Superfile *byte content* is cached one layer over, by
-//! [`DiskCacheStore`](crate::supertable::reader_cache::DiskCacheStore).
-//! The two caches are independent and use separate byte budgets.
+//! [`DiskCacheStore`]. Each keeps to a limit of its own, and a metadata
+//! cache opened beside a table's disk cache also charges what it holds to
+//! that cache's budget ([`MetadataDiskCache::new_charged_to`]), so the one
+//! budget covers everything the table keeps on the disk.
 //!
 //! ## Objects read in place
 //!
@@ -60,7 +62,10 @@ use bytes::Bytes;
 use dashmap::{DashMap, Entry};
 use tokio::task::spawn_blocking;
 
-use crate::{supertable::manifest::part::ContentHash, utils::trace::record};
+use crate::{
+    supertable::{manifest::part::ContentHash, reader_cache::DiskCacheStore},
+    utils::trace::record,
+};
 
 /// File-name prefix for a cached manifest part. The blake3 hex of the
 /// part's compressed bytes follows; the `.avro.zst` suffix mirrors the
@@ -154,6 +159,10 @@ pub struct MetadataDiskCache {
     /// `entries`, so a pin outlives its entry being removed and put again.
     pins: DashMap<ContentHash, usize>,
     current_bytes: AtomicU64,
+    /// The table's disk cache, whose budget what this cache holds is charged
+    /// to: growing evicts cache files there, least recently used first.
+    /// `None` for a cache with no disk cache beside it.
+    table_cache: Option<Arc<DiskCacheStore>>,
     n_hits: AtomicU64,
     n_misses: AtomicU64,
     n_evictions: AtomicU64,
@@ -173,6 +182,25 @@ impl MetadataDiskCache {
     /// accounting index from them, so a freshly-opened process reuses
     /// the parts a prior run cached (restart survival).
     pub fn new(cache_root: PathBuf, budget_bytes: u64) -> io::Result<Arc<Self>> {
+        Self::open(cache_root, budget_bytes, None)
+    }
+
+    /// [`Self::new`], charging what the cache holds to the budget of
+    /// `table_cache`, the disk cache of the same table. What is on disk
+    /// already is charged at once.
+    pub(crate) fn new_charged_to(
+        cache_root: PathBuf,
+        budget_bytes: u64,
+        table_cache: Arc<DiskCacheStore>,
+    ) -> io::Result<Arc<Self>> {
+        Self::open(cache_root, budget_bytes, Some(table_cache))
+    }
+
+    fn open(
+        cache_root: PathBuf,
+        budget_bytes: u64,
+        table_cache: Option<Arc<DiskCacheStore>>,
+    ) -> io::Result<Arc<Self>> {
         fs::create_dir_all(&cache_root)?;
         let cache = Self {
             cache_root,
@@ -184,23 +212,28 @@ impl MetadataDiskCache {
             entries: DashMap::new(),
             pins: DashMap::new(),
             current_bytes: AtomicU64::new(0),
+            table_cache,
             n_hits: AtomicU64::new(0),
             n_misses: AtomicU64::new(0),
             n_evictions: AtomicU64::new(0),
         };
         cache.scan_existing();
+        if let Some(table_cache) = &cache.table_cache {
+            table_cache.adopt_metadata(cache.current_bytes.load(Ordering::Acquire));
+        }
         Ok(Arc::new(cache))
     }
 
     /// The cache for this table's hidden vector index: its own directory,
     /// [`HIDDEN_INDEX_CACHE_SUBDIR`], beside this one, opened with the same
-    /// configured budget. What this table holds is not carried over; the
-    /// hidden index holds its own objects.
+    /// configured budget and charged to the same disk cache. What this table
+    /// holds is not carried over; the hidden index holds its own objects.
     pub(crate) fn for_hidden_index(&self) -> io::Result<Arc<Self>> {
         let parent = self.cache_root.parent().unwrap_or(&self.cache_root);
-        Self::new(
+        Self::open(
             parent.join(HIDDEN_INDEX_CACHE_SUBDIR),
             self.configured_bytes,
+            self.table_cache.clone(),
         )
     }
 
@@ -334,14 +367,40 @@ impl MetadataDiskCache {
         if size > self.budget_bytes() {
             return false;
         }
+        // The table's disk budget has to hold it too, which evicts cache
+        // files to make room. When it cannot, the object is not cached, as
+        // when this cache's own budget is full.
+        if let Some(table_cache) = &self.table_cache
+            && table_cache.charge_metadata(size).await.is_err()
+        {
+            return false;
+        }
         let cache = Arc::clone(self);
         // Reserving can evict many files at once (the budget drops when the
         // table's manifest shrinks), so it runs in the blocking task too.
         // A join error is a panic or a runtime shutting down. The cache is
         // best-effort either way, so the caller carries on.
-        spawn_blocking(move || cache.reserve(size) && cache.write_reserved(hash, &bytes))
-            .await
-            .unwrap_or(false)
+        spawn_blocking(move || {
+            if cache.reserve(size) {
+                return cache.write_reserved(hash, &bytes);
+            }
+            // Nothing was reserved here, so only the table's charge goes back.
+            if let Some(table_cache) = &cache.table_cache {
+                table_cache.release_metadata(size);
+            }
+            false
+        })
+        .await
+        .unwrap_or(false)
+    }
+
+    /// Take `bytes` that left the disk, or were reserved and not written,
+    /// off this cache's count and off the table's disk budget.
+    fn give_back(&self, bytes: u64) {
+        self.current_bytes.fetch_sub(bytes, Ordering::Release);
+        if let Some(table_cache) = &self.table_cache {
+            table_cache.release_metadata(bytes);
+        }
     }
 
     /// Write `bytes` under `hash` and index it, with `bytes.len()` already
@@ -357,7 +416,7 @@ impl MetadataDiskCache {
             .is_err()
         {
             // Roll back the reservation; leave no partial tmp behind.
-            self.current_bytes.fetch_sub(size, Ordering::Release);
+            self.give_back(size);
             let _ = fs::remove_file(&tmp_path);
             return false;
         }
@@ -373,7 +432,7 @@ impl MetadataDiskCache {
                 });
             }
             Entry::Occupied(_) => {
-                self.current_bytes.fetch_sub(size, Ordering::Release);
+                self.give_back(size);
             }
         }
         true
@@ -655,7 +714,7 @@ impl MetadataDiskCache {
                 .is_some()
             {
                 let _ = fs::remove_file(self.cache_path(&hash));
-                self.current_bytes.fetch_sub(size, Ordering::Release);
+                self.give_back(size);
                 self.n_evictions.fetch_add(1, Ordering::AcqRel);
                 freed = freed.saturating_add(size);
             }
@@ -668,8 +727,7 @@ impl MetadataDiskCache {
     pub(crate) fn remove(&self, hash: &ContentHash) {
         if let Some((_, entry)) = self.entries.remove(hash) {
             let _ = fs::remove_file(self.cache_path(hash));
-            self.current_bytes
-                .fetch_sub(entry.size_bytes, Ordering::Release);
+            self.give_back(entry.size_bytes);
         }
     }
 
@@ -683,8 +741,7 @@ impl MetadataDiskCache {
     /// reserved bytes. The on-disk file is left to the caller.
     fn drop_entry(&self, hash: &ContentHash) {
         if let Some((_, entry)) = self.entries.remove(hash) {
-            self.current_bytes
-                .fetch_sub(entry.size_bytes, Ordering::Release);
+            self.give_back(entry.size_bytes);
         }
     }
 
@@ -746,6 +803,16 @@ impl MetadataDiskCache {
             cache_filename(hash),
             process::id()
         ))
+    }
+}
+
+impl Drop for MetadataDiskCache {
+    /// The files stay on disk for the next open, which charges them again;
+    /// this cache's charge on the table's disk budget ends with it.
+    fn drop(&mut self) {
+        if let Some(table_cache) = &self.table_cache {
+            table_cache.release_metadata(self.current_bytes.load(Ordering::Acquire));
+        }
     }
 }
 

@@ -460,8 +460,9 @@ pub struct SupertableOptions {
     /// reads a part's bytes from local disk on a hit instead of
     /// round-tripping to object storage. Parts are content-addressed,
     /// so cached files are never stale and the cache survives process
-    /// restarts. Independent of `disk_cache` (which caches superfile
-    /// content) and uses its own byte budget. `None` disables it.
+    /// restarts. It keeps to a byte limit of its own, and what it holds
+    /// is charged to the budget of `disk_cache` (which caches superfile
+    /// content) when it is opened beside one. `None` disables it.
     pub metadata_disk_cache: Option<Arc<MetadataDiskCache>>,
     /// Superfiles a ranked query opens concurrently when it orders them by
     /// score ceiling. Below this many candidates every superfile opens at
@@ -1562,16 +1563,17 @@ impl SupertableOptions {
             };
             let cache = DiskCacheStore::new_unpinned(Arc::clone(&storage), disk_cfg)
                 .map_err(|e| BuildError::Store(format!("disk cache construction: {e}")))?;
-            self.disk_cache = Some(cache);
-
             // Manifest-part bytes get their own content-addressed cache
-            // under a sibling subdirectory, with an independent budget.
+            // under a sibling subdirectory, with a limit of its own, charged
+            // to the disk cache's budget.
             let manifest_cache_root = cache_root.join(MANIFEST_CACHE_SUBDIR);
-            let manifest_cache =
-                MetadataDiskCache::new(manifest_cache_root, cfg.storage.manifest_disk_budget_bytes)
-                    .map_err(|e| {
-                        BuildError::Store(format!("manifest disk cache construction: {e}"))
-                    })?;
+            let manifest_cache = MetadataDiskCache::new_charged_to(
+                manifest_cache_root,
+                cfg.storage.manifest_disk_budget_bytes,
+                Arc::clone(&cache),
+            )
+            .map_err(|e| BuildError::Store(format!("manifest disk cache construction: {e}")))?;
+            self.disk_cache = Some(cache);
             self.metadata_disk_cache = Some(manifest_cache);
         }
 

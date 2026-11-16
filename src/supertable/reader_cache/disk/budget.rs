@@ -46,6 +46,11 @@ const SCRATCH_TEST_BUDGET_FILES: u64 = 4;
 #[cfg(test)]
 const SCRATCH_TEST_PARKED_BYTES: u64 = 1024;
 
+/// The metadata cache's own limit in the test of its charge on the disk budget: large, so
+/// only the disk budget decides what it holds.
+#[cfg(test)]
+const METADATA_TEST_BUDGET_BYTES: u64 = 1 << 30;
+
 /// Share of the disk budget a table's temp files beside the cache may be charged, in divisor
 /// form (`budget / this`): the cache keeps at least the other half.
 const SCRATCH_SHARE_DIVISOR: u64 = 2;
@@ -454,6 +459,29 @@ impl DiskCacheStore {
         }
     }
 
+    /// Charge `bytes` the table's metadata cache is about to write beside this cache, evicting
+    /// cache files to make room. Metadata is never evicted to make room for cache files: every
+    /// query reads it. Fails, charging nothing, when eviction cannot free the room.
+    pub(crate) async fn charge_metadata(&self, bytes: u64) -> Result<(), DiskCacheError> {
+        self.reserve_manual(bytes).await?;
+        self.metadata_bytes.fetch_add(bytes, Ordering::AcqRel);
+        Ok(())
+    }
+
+    /// Charge `bytes` of metadata already on disk when the table opens, without evicting: they
+    /// take the disk either way, like the cache files found at startup, and the next
+    /// reservation evicts back under the budget.
+    pub(crate) fn adopt_metadata(&self, bytes: u64) {
+        self.current_bytes.fetch_add(bytes, Ordering::Release);
+        self.metadata_bytes.fetch_add(bytes, Ordering::AcqRel);
+    }
+
+    /// Give back `bytes` charged for metadata that left the disk.
+    pub(crate) fn release_metadata(&self, bytes: u64) {
+        self.metadata_bytes.fetch_sub(bytes, Ordering::AcqRel);
+        self.current_bytes.fetch_sub(bytes, Ordering::Release);
+    }
+
     /// The most bytes this cache's budget lets its table's temp files be charged.
     pub(crate) fn scratch_cap(&self) -> u64 {
         self.disk_budget_bytes() / SCRATCH_SHARE_DIVISOR
@@ -793,12 +821,13 @@ impl DiskCacheStore {
             .map(|f| f.value().reserved.load(Ordering::Acquire))
             .sum();
         let scratch = self.scratch_bytes.load(Ordering::Acquire);
+        let metadata = self.metadata_bytes.load(Ordering::Acquire);
         assert_eq!(
             self.current_bytes.load(Ordering::Acquire),
-            entries + unindexed + block_files + fills + scratch,
+            entries + unindexed + block_files + fills + scratch + metadata,
             "budget ledger drifted from what the cache holds (entries {entries}, \
              unindexed {unindexed}, block files {block_files}, fills {fills}, \
-             temp files {scratch})"
+             temp files {scratch}, metadata {metadata})"
         );
         let parked: u64 = self.parked_scratch.iter().map(|p| *p.value()).sum();
         assert!(
@@ -985,10 +1014,12 @@ impl<'a> Drop for Reservation<'a> {
 mod tests {
     use std::{sync::Arc, time::Duration};
 
+    use bytes::Bytes;
+
     use crate::{
         superfile::LazyByteSource,
         supertable::{
-            manifest::SuperfileUri,
+            manifest::{SuperfileUri, disk_cache::MetadataDiskCache, part::ContentHash},
             reader_cache::{
                 block_source::CACHE_BLOCK_BYTES,
                 config::ColdFetchMode,
@@ -1440,6 +1471,63 @@ mod tests {
         store.release_block_bytes(budget);
         assert!(matches!(charge.try_grow(cap).await, ScratchRoom::Charged));
         assert_eq!(store.stats().scratch_bytes, cap);
+        store.assert_budget_consistent();
+    }
+
+    /// A table's metadata cache charges what it holds to the disk cache's budget: a write
+    /// evicts cache files to make room, a cache file admitted later evicts other cache files
+    /// and never the metadata, and what leaves the metadata cache is given back.
+    #[tokio::test]
+    async fn a_table_s_metadata_counts_against_its_disk_budget() {
+        let file = tiny_superfile_bytes().len() as u64;
+        let (dir, store) =
+            test_store_with(|cfg| cfg.disk_budget_bytes = SCRATCH_TEST_BUDGET_FILES * file);
+        let uris = cache_tiny_superfiles(&store, SCRATCH_TEST_BUDGET_FILES as usize).await;
+        let metadata_root = dir.path().join("metadata");
+        let open = || {
+            MetadataDiskCache::new_charged_to(
+                metadata_root.clone(),
+                METADATA_TEST_BUDGET_BYTES,
+                Arc::clone(&store),
+            )
+            .expect("metadata cache")
+        };
+        let metadata = open();
+        let object = tiny_superfile_bytes();
+        let hash = ContentHash::of(&object);
+
+        // The budget is full of cache files: the metadata takes one's room.
+        assert!(metadata.put(hash, object.clone()).await);
+        assert_eq!(store.stats().metadata_bytes, file);
+        assert_eq!(store.stats().n_evictions, 1);
+        store.assert_budget_consistent();
+
+        // A cache file admitted again takes another cache file's room.
+        let evicted = uris
+            .iter()
+            .find(|uri| !store.is_cached(uri))
+            .expect("one cache file made room");
+        store
+            .insert_warm(evicted, tiny_superfile_bytes())
+            .await
+            .expect("cached again");
+        assert!(metadata.contains(&hash), "the metadata stays");
+        assert_eq!(store.stats().metadata_bytes, file);
+        store.assert_budget_consistent();
+
+        // An object the disk budget cannot hold is not cached.
+        let too_big = Bytes::from(vec![0u8; (SCRATCH_TEST_BUDGET_FILES * file) as usize]);
+        assert!(!metadata.put(ContentHash::of(&too_big), too_big).await);
+        assert_eq!(store.stats().metadata_bytes, file);
+        store.assert_budget_consistent();
+
+        // A cache opened over the same folder charges what is on disk.
+        drop(metadata);
+        assert_eq!(store.stats().metadata_bytes, 0);
+        let metadata = open();
+        assert_eq!(store.stats().metadata_bytes, file);
+        metadata.remove(&hash);
+        assert_eq!(store.stats().metadata_bytes, 0);
         store.assert_budget_consistent();
     }
 
