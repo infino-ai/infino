@@ -4760,6 +4760,11 @@ mod tests {
             "each statement prepares the file itself"
         );
         assert!(Arc::ptr_eq(&a.shape, &b.shape));
+        // A cached shape must come back without walking the footer again.
+        let cached = a
+            .reader
+            .scan_shape(|| panic!("a cached scan shape is built again"));
+        assert!(Arc::ptr_eq(&a.shape, &cached));
         let indexed = rt
             .block_on(a.reader.parquet_metadata_with_page_index())
             .expect("page index");
