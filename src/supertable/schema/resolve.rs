@@ -72,9 +72,10 @@ fn check_identity(field: &Field, held: Option<&String>) -> Result<(), SchemaErro
     Ok(())
 }
 
-/// Refuse a batch that writes a document column of `schema` itself, or only
-/// one of the two stored columns it is rebuilt from. Both or neither: a row
-/// with no document has a null skeleton.
+/// Refuse a batch that writes a document column of `schema` itself, or its
+/// residuals without its skeletons. A batch may leave the residual column
+/// out when no document needed one; a row with no document has a null
+/// skeleton.
 fn check_documents(input: &Schema, schema: &TableSchema) -> Result<(), SchemaError> {
     for document in schema.document_columns() {
         let refuse = |reason: String| {
@@ -89,15 +90,14 @@ fn check_documents(input: &Schema, schema: &TableSchema) -> Result<(), SchemaErr
                 document.skeleton, document.residual
             ));
         }
-        let skeleton = input.index_of(&document.skeleton).is_ok();
-        let residual = input.index_of(&document.residual).is_ok();
-        if skeleton != residual {
-            let (has, lacks) = match skeleton {
-                true => (&document.skeleton, &document.residual),
-                false => (&document.residual, &document.skeleton),
-            };
+        // Skeletons without residuals are documents that needed none: the
+        // residual column reads null for them. Residuals without the
+        // skeletons that name their entries are nothing to rebuild.
+        if input.index_of(&document.residual).is_ok() && input.index_of(&document.skeleton).is_err()
+        {
             return refuse(format!(
-                "the batch carries `{has}` but not `{lacks}`; append both or neither"
+                "the batch carries `{}` but not `{}`, whose slots name its entries",
+                document.residual, document.skeleton
             ));
         }
     }

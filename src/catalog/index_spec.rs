@@ -340,9 +340,9 @@ impl IndexSpec {
     /// it has them they must have those types and be nullable. `name` then
     /// appears in the table's schema, in SQL and in a search projection like
     /// any column, and is rebuilt wherever it is read: a filter or sort on
-    /// it is evaluated over the rebuilt text. An append carries the two
-    /// stored columns (or neither, for rows with no document) and never
-    /// `name` itself.
+    /// it is evaluated over the rebuilt text. An append carries the
+    /// skeletons (or none, for rows with no document), the residuals where
+    /// any document needed one, and never `name` itself.
     ///
     /// Reading it decodes the skeleton, the residual and the columns the
     /// documents draw on, so it costs more per row than a stored text

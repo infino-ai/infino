@@ -645,12 +645,25 @@ fn an_append_writes_the_stored_columns_and_never_the_document() {
     let err = table.append(&with_source).expect_err("source refused");
     assert!(err.to_string().contains("rebuilt on read"), "{err}");
 
-    // So is one stored column without the other.
-    let without_residual = batch
-        .project(&(0..batch.num_columns() - 1).collect::<Vec<_>>())
+    // So are residuals without the skeletons that name their entries.
+    let skeleton_at = batch
+        .schema()
+        .index_of(&skeleton_column(SOURCE))
+        .expect("skeleton");
+    let without_skeleton = batch
+        .project(
+            &(0..batch.num_columns())
+                .filter(|&i| i != skeleton_at)
+                .collect::<Vec<_>>(),
+        )
         .expect("project");
-    let err = table.append(&without_residual).expect_err("half refused");
-    assert!(err.to_string().contains("append both or neither"), "{err}");
+    let err = table
+        .append(&without_skeleton)
+        .expect_err("residual alone refused");
+    assert!(
+        err.to_string().contains("whose slots name its entries"),
+        "{err}"
+    );
 
     // Neither is a row with no document.
     let typed = typed_batch(&rows()[..1]);
