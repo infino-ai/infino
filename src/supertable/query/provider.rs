@@ -137,7 +137,10 @@ use crate::{
                 cached_scan_exec::{
                     CachedFile, CachedScanExec, RowGroupFilter, has_columns, projected_schema,
                 },
-                common::{BoundPredicate, PushedPredicate, take_file_columns, unqualified},
+                common::{
+                    BoundPredicate, PushedPredicate, read_file_row_group, take_file_columns,
+                    unqualified,
+                },
                 metered_exec::MeteredExec,
             },
             fts::{
@@ -518,6 +521,13 @@ const FILTERED_TOP_K_GROWTH: usize = 4;
 const FILTERED_TOP_K_MIN_ROWS: usize = 2048;
 /// See [`FILTERED_TOP_K_MIN_ROWS`].
 const FILTERED_TOP_K_MAX_K_MULTIPLE: usize = 64;
+
+/// A filtered top-k decodes whole, and keeps, a row group whose filter
+/// columns take at most this many bytes a row before compression: a short
+/// keyword decodes whole for little more than a few pages cost, and every
+/// later check of the row group reads it from the cache, where reading rows
+/// alone decompresses a page for each.
+const NARROW_BYTES_PER_ROW: u64 = 32;
 
 /// Manual `Debug` (required by `TableProvider`): the cache /
 /// disk-cache fields are trait objects without a `Debug` bound, so
@@ -1469,8 +1479,10 @@ impl SupertableProvider {
     /// rows the checks so far passed.
     ///
     /// A row is checked from its row group's filter columns where the
-    /// decoded-column cache holds them, and read alone otherwise: a top-k
-    /// checks a few rows of many row groups, and decoding each whole would
+    /// decoded-column cache holds them. Where it does not, a row group whose
+    /// filter columns are narrow ([`NARROW_BYTES_PER_ROW`]) is decoded whole
+    /// and kept; the rows of a wider one are read alone: a top-k checks a
+    /// few rows of many row groups, and decoding a text column's whole would
     /// cost more than the rows it reads.
     ///
     /// `None`, to fall back to the full scan, when a filter cannot be checked
@@ -1681,7 +1693,62 @@ impl SupertableProvider {
                                         bound_schema,
                                     )?;
                                     batches.extend(kept);
-                                    rest
+                                    // A row group whose filter columns are
+                                    // narrow decodes whole, cheaply, and is
+                                    // kept for the next check and statement;
+                                    // a wide one (a text column) would decode
+                                    // millions of values to check a few, so
+                                    // its rows are read alone.
+                                    let narrow = narrow_row_groups(
+                                        &prepared.footer,
+                                        &prepared.shape.row_counts,
+                                        names,
+                                        &rest,
+                                    );
+                                    if narrow.is_empty() {
+                                        rest
+                                    } else {
+                                        for row_group in narrow {
+                                            let read = read_file_row_group(
+                                                &self.manifest,
+                                                &prepared.reader,
+                                                row_group,
+                                                names,
+                                                bound_schema,
+                                                op_stats,
+                                            )
+                                            .await?;
+                                            for (column, field) in
+                                                read.columns().iter().zip(bound_schema.fields())
+                                            {
+                                                let column = arrow::compute::cast(
+                                                    column,
+                                                    field.data_type(),
+                                                )?;
+                                                let bytes = column.get_array_memory_size();
+                                                cache.insert(
+                                                    ColumnKey {
+                                                        uri,
+                                                        schema_id,
+                                                        column: field.name().clone(),
+                                                        row_group,
+                                                    },
+                                                    column,
+                                                    bytes,
+                                                );
+                                            }
+                                        }
+                                        let (kept, rest) = kept_filter_columns(
+                                            cache,
+                                            uri,
+                                            schema_id,
+                                            &prepared.shape.row_counts,
+                                            &rest,
+                                            bound_schema,
+                                        )?;
+                                        batches.extend(kept);
+                                        rest
+                                    }
                                 }
                                 None => pairs,
                             };
@@ -2498,6 +2565,54 @@ fn kept_filter_columns(
         .collect::<Result<Vec<_>, _>>()?;
     let batch = RecordBatch::try_new(Arc::clone(schema), columns)?;
     Ok((Some((kept_pairs, batch)), rest))
+}
+
+/// The row groups holding any of `rows` (sorted by row) whose `columns`
+/// take at most [`NARROW_BYTES_PER_ROW`] bytes a row before compression, by
+/// the footer: those a filtered top-k decodes whole rather than read its rows
+/// alone. A footer without the sizes names none.
+fn narrow_row_groups(
+    footer: &ParquetMetaData,
+    row_counts: &[u32],
+    columns: &[&str],
+    rows: &[(u64, u32)],
+) -> Vec<usize> {
+    let mut groups = Vec::new();
+    let mut start: u32 = 0;
+    let mut at = 0;
+    for (row_group, &count) in row_counts.iter().enumerate() {
+        if at == rows.len() {
+            break;
+        }
+        let end = start.saturating_add(count);
+        let from = at;
+        while at < rows.len() && rows[at].1 < end {
+            at += 1;
+        }
+        start = end;
+        if at == from || row_group >= footer.num_row_groups() {
+            continue;
+        }
+        let bytes: i64 = footer
+            .row_group(row_group)
+            .columns()
+            .iter()
+            .filter(|chunk| {
+                chunk
+                    .column_descr()
+                    .path()
+                    .parts()
+                    .first()
+                    .is_some_and(|name| columns.contains(&name.as_str()))
+            })
+            .map(|chunk| chunk.uncompressed_size())
+            .sum();
+        let per_row = u64::try_from(bytes).unwrap_or(u64::MAX) / u64::from(count.max(1));
+        if bytes > 0 && per_row <= NARROW_BYTES_PER_ROW {
+            groups.push(row_group);
+        }
+    }
+    groups
 }
 
 /// Footers of the files this table's scans have opened, by path.
