@@ -178,12 +178,14 @@ impl TableResolver {
         // is invisible; hand it the collector captured at registration.
         reader.op_stats = self.op_stats.clone();
         let resolved = ResolvedTable {
-            // Stored shape: search TVF output columns resolve against
+            // Readable shape: search TVF output columns resolve against
             // what Parquet actually holds (index-only FTS columns are
-            // not projectable). Built from this reader's own snapshot, so a
-            // schema change landing after `reader()` cannot name columns the
-            // reader lacks, and with field ids kept out of the plan.
-            scalar_schema: sql_schema(reader.manifest().stored_schema()),
+            // not projectable), and a document column, which is not stored
+            // but rebuilt for each hit as it is resolved. Built from this
+            // reader's own snapshot, so a schema change landing after
+            // `reader()` cannot name columns the reader lacks, and with
+            // field ids kept out of the plan.
+            scalar_schema: sql_schema(reader.manifest().readable_schema()),
             reader: Arc::new(reader),
         };
         self.cache

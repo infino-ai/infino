@@ -570,6 +570,19 @@ fn assert_rebuilt(db: &Connection, expected: &[(String, Option<String>)], label:
         pick(expected, &["d7", "d6", "d5"]),
         "{label}: sorted_search"
     );
+    // The search table functions resolve it for their hits too.
+    let got = sql(&format!(
+        "SELECT doc_id, source FROM bm25_search('{TABLE}', 'doc_id', 'd4', 10)"
+    ));
+    assert_eq!(pairs(&got), pick(expected, &["d4"]), "{label}: bm25_search");
+    let got = sql(&format!(
+        "SELECT doc_id, source FROM token_match('{TABLE}', 'doc_id', 'd6', 'or')"
+    ));
+    assert_eq!(
+        pairs(&got),
+        pick(expected, &["d6"]),
+        "{label}: token_match()"
+    );
     // The document alone, with no other column beside it.
     let alone = table
         .exact_match("doc_id", "d0", Some(&[SOURCE]))
