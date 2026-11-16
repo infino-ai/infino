@@ -27,6 +27,7 @@ pub mod df_object_store;
 pub mod dispatch;
 pub(crate) mod empty_sort_keys;
 pub mod exec;
+pub(crate) mod filter_in_scan;
 pub(crate) mod fine_graph_cache;
 pub mod fts;
 #[cfg(feature = "graph-index")]

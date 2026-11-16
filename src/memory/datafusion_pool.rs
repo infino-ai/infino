@@ -46,6 +46,7 @@ use datafusion::{
 use crate::{
     memory::ConnectionMemoryBudget,
     supertable::query::{
+        filter_in_scan::FilterIntoCachedScan,
         id_order::IdOrderUnderTopK,
         join_build_size::RightSizeJoinBuild,
         late_documents::LateDocuments,
@@ -187,6 +188,9 @@ pub(crate) fn budgeted_session_context(
     //  - `LateDocuments` after DataFusion's rules, once limits and top-ks are
     //    placed, to read a document column after the limit that keeps its
     //    rows; before ours below, which then see its plain nodes.
+    //  - `FilterIntoCachedScan` after DataFusion's rules, once filters sit
+    //    over the scans they read, to check a `WHERE` in a scan of kept
+    //    columns on the columns as kept.
     //  - `KeepSortedRoot` after DataFusion's rules, to remove the round-robin
     //    repartition that `EnforceDistribution` adds above a sorted result,
     //    which would return an `ORDER BY` out of order.
@@ -201,6 +205,7 @@ pub(crate) fn budgeted_session_context(
     rules.insert(2, Arc::new(OrderUnderScalarSubquery));
     rules.push(Arc::new(RightSizeJoinBuild));
     rules.push(Arc::new(LateDocuments));
+    rules.push(Arc::new(FilterIntoCachedScan));
     rules.push(Arc::new(KeepSortedRoot));
     rules.push(Arc::new(StageLimitGathers));
     rules.push(Arc::new(ReadAheadOff));
