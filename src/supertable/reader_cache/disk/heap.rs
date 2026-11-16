@@ -143,6 +143,8 @@ pub(crate) trait CachedSessions: Send + Sync {
 pub(crate) struct HeapReservation {
     budget: &'static HeapBudget,
     bytes: AtomicU64,
+    /// A doc-id map's, also counted in the budget's maps total.
+    map: bool,
 }
 
 impl HeapReservation {
@@ -159,6 +161,9 @@ impl HeapReservation {
     /// Count `more` bytes in this reservation, kept until it drops.
     pub(crate) fn add(&self, more: u64) {
         self.budget.charged.fetch_add(more, Ordering::AcqRel);
+        if self.map {
+            self.budget.maps.fetch_add(more, Ordering::AcqRel);
+        }
         self.bytes.fetch_add(more, Ordering::AcqRel);
     }
 }
@@ -172,6 +177,14 @@ impl Drop for HeapReservation {
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |charged| {
                 Some(charged.saturating_sub(self.bytes.load(Ordering::Acquire)))
             });
+        if self.map {
+            let _ = self
+                .budget
+                .maps
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |maps| {
+                    Some(maps.saturating_sub(self.bytes.load(Ordering::Acquire)))
+                });
+        }
     }
 }
 
@@ -180,6 +193,9 @@ impl Drop for HeapReservation {
 pub(crate) struct HeapBudget {
     /// Bytes all live reservations hold.
     charged: AtomicU64,
+    /// The part of `charged` that is full-text doc-id maps. Counted apart because SQL metadata may
+    /// sit above the budget while memory is to spare, so the shared total can't bound map keeps.
+    maps: AtomicU64,
     /// The caches whose files this budget may drop; dead ones are pruned when the list is touched.
     caches: Mutex<Vec<Weak<DiskCacheStore>>>,
     /// The tables whose cached sessions hold files between statements; pruned like `caches`.
@@ -199,6 +215,7 @@ impl HeapBudget {
     const fn new() -> Self {
         Self {
             charged: AtomicU64::new(0),
+            maps: AtomicU64::new(0),
             caches: Mutex::new(Vec::new()),
             sessions: Mutex::new(Vec::new()),
             pass: Mutex::new(()),
@@ -264,6 +281,40 @@ impl HeapBudget {
         HeapReservation {
             budget: self,
             bytes: AtomicU64::new(bytes),
+            map: false,
+        }
+    }
+
+    /// Reserve `bytes` for a doc-id map a query can do without: `None` while the process is short
+    /// of memory, or when kept maps would pass the budget. Refusing is one compare-and-swap; it
+    /// drops nothing.
+    pub(crate) fn try_reserve_map(&'static self, bytes: u64) -> Option<HeapReservation> {
+        if self.short_of_memory() {
+            return None;
+        }
+        let budget = self.budget().unwrap_or(u64::MAX);
+        self.maps
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |maps| {
+                maps.checked_add(bytes).filter(|&total| total <= budget)
+            })
+            .ok()?;
+        self.charged.fetch_add(bytes, Ordering::AcqRel);
+        Some(HeapReservation {
+            budget: self,
+            bytes: AtomicU64::new(bytes),
+            map: true,
+        })
+    }
+
+    /// Reserve `bytes` for a doc-id map kept whatever the budget says. It still counts in the maps
+    /// total, so it leaves less room for maps a query can do without.
+    pub(crate) fn reserve_map(&'static self, bytes: u64) -> HeapReservation {
+        self.maps.fetch_add(bytes, Ordering::AcqRel);
+        self.charged.fetch_add(bytes, Ordering::AcqRel);
+        HeapReservation {
+            budget: self,
+            bytes: AtomicU64::new(bytes),
+            map: true,
         }
     }
 
@@ -444,8 +495,8 @@ mod tests {
     use std::{
         mem,
         sync::{
-            Arc, Mutex,
-            atomic::AtomicU64,
+            Arc, Barrier, Mutex,
+            atomic::{AtomicU64, Ordering},
             mpsc::{Receiver, Sender, channel},
         },
         thread,
@@ -461,8 +512,8 @@ mod tests {
             reader_cache::disk::{
                 DiskCacheStore, EntryAccounting, Residency,
                 heap::{
-                    CachedSessions, FREE_THREAD_NAME, FreeQueue, HeapBudget, UNHELD_FLOOR_DIVISOR,
-                    leaves_too_little_room,
+                    CachedSessions, FREE_THREAD_NAME, FreeQueue, HeapBudget, HeapReservation,
+                    UNHELD_FLOOR_DIVISOR, leaves_too_little_room,
                 },
                 test_support::*,
             },
@@ -471,6 +522,10 @@ mod tests {
 
     /// Bytes each test entry counts against the budget.
     const ENTRY_BYTES: u64 = 100;
+    /// Map keeps issued at once in the burst test.
+    const BURST_KEEPS: u64 = 200;
+    /// Map keeps the burst test's budget has room for.
+    const BURST_ROOM: u64 = 80;
 
     /// How long a test waits for a pass that should return at once before it fails.
     const PASS_DEADLINE: Duration = Duration::from_secs(10);
@@ -534,6 +589,58 @@ mod tests {
         let (dir, store) = test_store();
         store.use_heap_budget(HeapBudget::with_budget(budget));
         (dir, store)
+    }
+
+    #[test]
+    fn a_burst_of_map_keeps_gets_exactly_the_room_there_is() {
+        // A budget with room for 80 maps of 100 bytes, not short of memory, and 200 threads asking
+        // for a map at the same moment.
+        //  - exactly 80 get one; the maps total and the overall total are 80 maps' worth;
+        //  - dropping them gives both totals back.
+        // This test pins that a fan-out of keeps can't pass the budget between its checks.
+        let budget = HeapBudget::with_budget(Some(BURST_ROOM * ENTRY_BYTES));
+        budget.set_short_of_memory(false);
+        let start = Arc::new(Barrier::new(BURST_KEEPS as usize));
+        let keeps: Vec<_> = (0..BURST_KEEPS)
+            .map(|_| {
+                let start = Arc::clone(&start);
+                thread::spawn(move || {
+                    start.wait();
+                    budget.try_reserve_map(ENTRY_BYTES)
+                })
+            })
+            .collect();
+        let kept: Vec<HeapReservation> = keeps
+            .into_iter()
+            .filter_map(|keep| keep.join().expect("keep thread"))
+            .collect();
+        assert_eq!(kept.len() as u64, BURST_ROOM);
+        assert_eq!(
+            budget.maps.load(Ordering::Acquire),
+            BURST_ROOM * ENTRY_BYTES
+        );
+        assert_eq!(budget.charged(), BURST_ROOM * ENTRY_BYTES);
+        drop(kept);
+        assert_eq!(budget.maps.load(Ordering::Acquire), 0);
+        assert_eq!(budget.charged(), 0);
+    }
+
+    #[test]
+    fn short_of_memory_refuses_a_map_with_room_to_spare() {
+        // A budget with no maps kept, first with memory to spare, then short of it.
+        //  - with memory to spare a map is kept;
+        //  - short of memory the next is refused, though the maps total is far under the budget;
+        //  - a map kept regardless still counts, refused or not.
+        // This test pins that the process's memory, not only the maps total, decides a keep.
+        let budget = HeapBudget::with_budget(Some(BURST_ROOM * ENTRY_BYTES));
+        budget.set_short_of_memory(false);
+        let first = budget.try_reserve_map(ENTRY_BYTES).expect("room to spare");
+        budget.set_short_of_memory(true);
+        assert!(budget.try_reserve_map(ENTRY_BYTES).is_none());
+        let regardless = budget.reserve_map(ENTRY_BYTES);
+        assert_eq!(budget.maps.load(Ordering::Acquire), 2 * ENTRY_BYTES);
+        drop((first, regardless));
+        assert_eq!(budget.maps.load(Ordering::Acquire), 0);
     }
 
     #[test]

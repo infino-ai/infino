@@ -15,6 +15,8 @@
 //! is constructed per call (cheap; opening it reads only its footer, and
 //! then it's a borrowed view).
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{
     cmp::Reverse,
     collections::{BinaryHeap, HashMap},
@@ -66,7 +68,9 @@ use crate::{
         load_watch::{LoadListener, LoadWatch},
     },
     supertable::{
-        query::read_ahead::BUDGET_SHARE_PERCENT as READ_AHEAD_SHARE_PERCENT, schema::FieldId,
+        query::read_ahead::BUDGET_SHARE_PERCENT as READ_AHEAD_SHARE_PERCENT,
+        reader_cache::disk::{HeapBudget, HeapReservation},
+        schema::FieldId,
     },
     utils::terms::{DictEntry, TermBlocks, make_key},
 };
@@ -681,23 +685,25 @@ pub struct FtsReader {
     /// translated once here. That is what lets the writer group
     /// documents by the terms they share without a Parquet row moving.
     ///
-    /// Set at open when the blob is in memory or keeps row order, or when
-    /// the bytes the open read already hold it. Otherwise a query reads it
-    /// whole before it translates a doc id ([`Self::ensure_doc_map`]): at 4
-    /// bytes a document it is hundreds of megabytes on a large file, which an
-    /// open, and so a SQL scan that matches no text, should not pay for.
-    /// Shared by every view cloned from this reader ([`Self::with_scoring`]),
-    /// so one read serves them all.
+    /// Set at open when the blob is in memory or keeps row order. Otherwise it stays empty until a
+    /// query keeps it (4 bytes a document, hundreds of megabytes on a large file); a translation
+    /// that can't keep it reads only the pages it needs. Shared by every view cloned from this
+    /// reader.
     pub(super) doc_map: Arc<OnceCell<DocMap>>,
     /// Where the map's body lies, with its CRC right after it; `None` on a
     /// blob in row order.
     pub(super) doc_map_region: Option<Range<usize>>,
     /// Whether a read after open checks its CRC, as the open's reads did.
-    verify_crc: bool,
+    pub(super) verify_crc: bool,
     /// Told when a read loads the doc-id map, a column's norms or a block
     /// table. Shared with `block_tables` and with every view cloned from
     /// this reader.
     loads: LoadWatch,
+    /// The heap budget a kept doc-id map is charged to: the process one, or a test's own.
+    pub(super) heap_budget: &'static HeapBudget,
+    /// Page reads of the map from the source, shared with this reader's views.
+    #[cfg(test)]
+    doc_map_reads: Arc<AtomicUsize>,
 }
 
 /// The error for a short-form term body the decoder refuses.
@@ -1246,8 +1252,14 @@ impl FtsReader {
                 }
                 let region = mo..body_end;
                 let span = doc_map_span(&region, opts.verify_crc);
-                if let Some(bytes) = source.try_get_range_sync(span) {
-                    let _ = doc_map.set(read_doc_map(&source, &region, bytes, opts.verify_crc)?);
+                // From memory the map is a slice of the blob and costs nothing to keep. A lazy
+                // reader keeps nothing at open, even with the bytes local: the first query that
+                // needs the map asks the heap budget.
+                if let Source::InMemory(_) = source
+                    && let Some(bytes) = source.try_get_range_sync(span)
+                {
+                    let body = checked_doc_map_body(&region, bytes, opts.verify_crc)?;
+                    let _ = doc_map.set(DocMap::permuted(body));
                 }
                 Some(region)
             }
@@ -1269,6 +1281,9 @@ impl FtsReader {
             doc_map_region,
             verify_crc: opts.verify_crc,
             loads,
+            heap_budget: HeapBudget::process(),
+            #[cfg(test)]
+            doc_map_reads: Arc::default(),
         })
     }
 
@@ -1278,12 +1293,10 @@ impl FtsReader {
         self.loads.watch(listener);
     }
 
-    /// The doc-id map, read on the caller's runtime if no query has read it
-    /// yet. Concurrent first callers share one read, and a failed read is not
-    /// kept: the error goes to this query and the next one reads again.
+    /// The whole doc-id map, read once and kept for the reader's life. Concurrent first callers
+    /// share the read; a failed read isn't kept, so the next call tries again.
     ///
-    /// Every query path awaits this before it translates a doc id, so the
-    /// read never goes through [`Self::doc_map`]'s blocking one.
+    /// Charged to the heap budget even without room, since its callers can't work from pages.
     pub(super) async fn ensure_doc_map(&self) -> Result<&DocMap, FtsError> {
         if let Some(map) = self.doc_map.get() {
             return Ok(map);
@@ -1291,23 +1304,38 @@ impl FtsReader {
         let map = self
             .doc_map
             .get_or_try_init(|| async {
-                let region = self
-                    .doc_map_region
-                    .as_ref()
-                    .expect("invariant: a blob without a map has it set at open");
-                let bytes = self
-                    .source
-                    .range_async(doc_map_span(region, self.verify_crc))
-                    .await
-                    .map_err(|e| FtsError::RangeFetch {
-                        what: "fts/doc-map",
-                        source: e,
-                    })?;
-                read_doc_map(&self.source, region, bytes, self.verify_crc)
+                let reservation = self.heap_budget.reserve_map(self.map_region().len() as u64);
+                self.read_whole_doc_map(reservation).await
             })
             .await?;
         self.loads.loaded();
         Ok(map)
+    }
+
+    /// The whole doc-id map, read and kept only if the process has memory to spare and kept maps
+    /// stay within the heap budget; `None` means the caller reads pages instead.
+    pub(super) async fn kept_doc_map_within_budget(&self) -> Result<Option<&DocMap>, FtsError> {
+        if let Some(map) = self.doc_map.get() {
+            return Ok(Some(map));
+        }
+        let bytes = self.map_region().len() as u64;
+        // Only the query that does the read reserves, so queries racing for one map charge it once.
+        // `Err(None)` means no room.
+        let kept = self
+            .doc_map
+            .get_or_try_init(|| async {
+                let reservation = self
+                    .heap_budget
+                    .try_reserve_map(bytes)
+                    .ok_or(None::<FtsError>)?;
+                self.read_whole_doc_map(reservation).await.map_err(Some)
+            })
+            .await;
+        match kept {
+            Ok(map) => Ok(Some(map)),
+            Err(None) => Ok(None),
+            Err(Some(e)) => Err(e),
+        }
     }
 
     /// The length buckets scoring `column` reads besides the postings,
@@ -1318,6 +1346,37 @@ impl FtsReader {
         // Not the doc-id map: a ranked search translates only its top hits,
         // reading the map pages they fall in ([`Self::hits_to_rows_async`]).
         self.ensure_norms(column_id).await
+    }
+
+    /// One read of the whole doc-id map, kept with `reservation` paying for its bytes.
+    async fn read_whole_doc_map(&self, reservation: HeapReservation) -> Result<DocMap, FtsError> {
+        let region = self.map_region();
+        let bytes = self
+            .source
+            .range_async(doc_map_span(region, self.verify_crc))
+            .await
+            .map_err(|e| FtsError::RangeFetch {
+                what: "fts/doc-map",
+                source: e,
+            })?;
+        self.doc_map_from(bytes, reservation)
+    }
+
+    /// The map as this reader keeps it, from `bytes` read at [`doc_map_span`]: a slice of an
+    /// in-memory blob (no heap, so `reservation` goes back), or a heap copy holding `reservation`.
+    fn doc_map_from(&self, bytes: Bytes, reservation: HeapReservation) -> Result<DocMap, FtsError> {
+        let body = checked_doc_map_body(self.map_region(), bytes, self.verify_crc)?;
+        Ok(match self.source {
+            Source::InMemory(_) => DocMap::permuted(body),
+            Source::Lazy(_) => kept_copy(&body, reservation),
+        })
+    }
+
+    /// Where the doc-id map's body lies. Only called on a blob that has one.
+    pub(super) fn map_region(&self) -> &Range<usize> {
+        self.doc_map_region
+            .as_ref()
+            .expect("a blob in row order never reads its doc-id map")
     }
 
     /// The doc-id map, for a translation that runs off the async path.
@@ -1331,17 +1390,38 @@ impl FtsReader {
         if let Some(map) = self.doc_map.get() {
             return Ok(map.clone());
         }
-        let region = self
-            .doc_map_region
-            .as_ref()
-            .expect("invariant: a blob without a map has it set at open");
-        let span = doc_map_span(region, self.verify_crc);
-        let bytes = fetch_source_range(&self.source, span, "fts/doc-map")?;
-        let map = read_doc_map(&self.source, region, bytes, self.verify_crc)?;
+        let region = self.map_region();
+        let reservation = self.heap_budget.reserve_map(region.len() as u64);
+        let bytes = fetch_source_range(
+            &self.source,
+            doc_map_span(region, self.verify_crc),
+            "fts/doc-map",
+        )?;
+        let map = self.doc_map_from(bytes, reservation)?;
         // A concurrent first read may have set it meanwhile; both are the
         // same map.
         let _ = self.doc_map.set(map.clone());
         Ok(map)
+    }
+
+    /// Counts a read of the doc-id map from the source in pages, for the tests that assert how a
+    /// translation reads it.
+    #[cfg(test)]
+    pub(super) fn count_doc_map_read(&self) {
+        self.doc_map_reads.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Page reads of the doc-id map from the source so far, by this reader and its views.
+    #[cfg(test)]
+    pub(crate) fn doc_map_reads(&self) -> usize {
+        self.doc_map_reads.load(Ordering::Relaxed)
+    }
+
+    /// This reader with kept doc-id maps charged to `budget` instead of the process's.
+    #[cfg(test)]
+    pub(crate) fn with_heap_budget(mut self, budget: &'static HeapBudget) -> Self {
+        self.heap_budget = budget;
+        self
     }
 
     /// Whether a query has read the doc-id map yet.
@@ -2282,42 +2362,60 @@ fn doc_map_span(region: &Range<usize>, verify_crc: bool) -> Range<usize> {
     }
 }
 
-/// The doc-id map from `bytes`, read at [`doc_map_span`]: checked against its
-/// CRC when `verify_crc`, and owned as the reader keeps it.
-///
-/// From memory the body is a slice of the blob, so the map costs no heap and
-/// its pages stay evictable. A lazy source may answer a read this large with
-/// a window onto a bigger fetch, and keeping the window would keep that whole
-/// fetch alive; the map is the one read the reader holds on to, so over such
-/// a source it takes a copy of the body alone.
-fn read_doc_map(
-    source: &Source,
+/// The map's body from `bytes` read at [`doc_map_span`], after checking it is all there and, with
+/// `verify_crc`, that it matches its CRC.
+fn checked_doc_map_body(
     region: &Range<usize>,
     bytes: Bytes,
     verify_crc: bool,
-) -> Result<DocMap, FtsError> {
+) -> Result<Bytes, FtsError> {
     if bytes.len() < region.len() {
-        return Err(FtsError::Read(ReadError::Malformed(format!(
-            "fts doc-map read {} of its {} bytes",
-            bytes.len(),
-            region.len()
-        ))));
+        return Err(doc_map_short_read(bytes.len(), region.len()));
     }
     let body = bytes.slice(..region.len());
     if verify_crc {
         let crc = &bytes[region.len()..];
         if crc.len() < format::CRC_BYTES || read_u32_le(crc) != crc32c(&body) {
-            return Err(FtsError::Read(ReadError::ChecksumMismatch {
-                section: "fts/doc-map",
-                column: String::new(),
-            }));
+            return Err(doc_map_crc_mismatch());
         }
     }
-    let body = match source {
-        Source::InMemory(_) => body,
-        Source::Lazy(_) => Bytes::copy_from_slice(&body),
-    };
-    Ok(DocMap::permuted(body))
+    Ok(body)
+}
+
+/// A doc-id map read that came back with `got` of the `want` bytes asked for.
+pub(super) fn doc_map_short_read(got: usize, want: usize) -> FtsError {
+    FtsError::Read(ReadError::Malformed(format!(
+        "fts doc-map read {got} of its {want} bytes"
+    )))
+}
+
+/// A doc-id map whose bytes don't match its CRC.
+pub(super) fn doc_map_crc_mismatch() -> FtsError {
+    FtsError::Read(ReadError::ChecksumMismatch {
+        section: "fts/doc-map",
+        column: String::new(),
+    })
+}
+
+/// A lazy reader's map, holding `reservation` until the last copy drops. A copy, because a lazy
+/// source may hand back a window onto a bigger fetch, and keeping the window keeps all of it.
+fn kept_copy(body: &Bytes, reservation: HeapReservation) -> DocMap {
+    DocMap::permuted(Bytes::from_owner(KeptMap {
+        body: body.to_vec(),
+        _reservation: reservation,
+    }))
+}
+
+/// A kept doc-id map's bytes and their heap reservation, given back when it drops.
+struct KeptMap {
+    body: Vec<u8>,
+    _reservation: HeapReservation,
+}
+
+impl AsRef<[u8]> for KeptMap {
+    fn as_ref(&self) -> &[u8] {
+        &self.body
+    }
 }
 
 pub(super) fn fetch_source_range(

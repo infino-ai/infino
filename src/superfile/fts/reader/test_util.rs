@@ -4,8 +4,11 @@
 //! Shared test fixtures for the `reader/` submodule tests: blob builders that
 //! plant small, known corpora so each test asserts against a fixed layout.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use async_trait::async_trait;
 use bytes::Bytes;
+use tokio::sync::RwLock;
 
 use crate::superfile::{
     fts::builder::FtsBuilder,
@@ -147,5 +150,36 @@ impl LazyByteSource for AsyncOnlySource {
 
     fn try_get_range_sync(&self, _start: u64, _len: u64) -> Option<Bytes> {
         None
+    }
+}
+
+/// [`AsyncOnlySource`] whose reads wait while a test holds `gate` for writing: a query can be
+/// held mid-read, then let go or dropped. `started` counts the reads begun.
+pub(super) struct GatedSource {
+    pub(super) blob: Bytes,
+    pub(super) gate: RwLock<()>,
+    pub(super) started: AtomicUsize,
+}
+
+impl GatedSource {
+    pub(super) fn new(blob: Bytes) -> Self {
+        Self {
+            blob,
+            gate: RwLock::new(()),
+            started: AtomicUsize::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl LazyByteSource for GatedSource {
+    fn size(&self) -> u64 {
+        self.blob.len() as u64
+    }
+
+    async fn range(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
+        self.started.fetch_add(1, Ordering::Relaxed);
+        let _open = self.gate.read().await;
+        AsyncOnlySource(self.blob.clone()).range(start, len).await
     }
 }

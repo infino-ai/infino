@@ -7,7 +7,10 @@
 //! BlockMaxWAND fast path, and the atom (phrase-aware) scored walk.
 //! Its own `impl FtsReader` block, split from the reader `core`.
 
-use std::collections::{BinaryHeap, HashMap};
+use std::{
+    collections::{BinaryHeap, HashMap},
+    ops::Range,
+};
 
 use bytes::Bytes;
 use futures::future::try_join_all;
@@ -36,14 +39,13 @@ use crate::{
         ReadError,
         bits::{EXPAND_SLACK, expand_bitset, expand_bitset_scalar},
         error::FtsError,
-        format,
+        format::{self, checksum::crc32c_append},
         fts::{
             bm25,
             posting::{BLOCK_LEN, BlockHeader, decode_block},
             short::{decode_short, short_df},
         },
         id_space::{DocMap, FtsDocId, RowId, RowSet},
-        lazy_source::Source,
     },
     utils::terms::{DictEntry, make_key},
 };
@@ -53,9 +55,15 @@ const DOC_MAP_ENTRY_BYTES: usize = 4;
 /// Bytes of the doc-id map a sparse translation reads at a time. Small
 /// under test, so a fixture of a thousand documents spans many pages.
 const DOC_MAP_PAGE_BYTES: usize = if cfg!(test) { 64 } else { 64 * 1024 };
-/// A translation reads map pages instead of the whole map while the pages
-/// come to at most one this-many-th of it.
+/// A translation that would read more than 1/8 of a map keeps the whole map instead, if the heap
+/// budget has room, so the next query on the file reads none of it.
 const DOC_MAP_SPARSE_SHARE: usize = 8;
+/// Pages a translation reads through to join two reads into one: one more request costs about as
+/// much as this many more pages.
+const DOC_MAP_MERGE_GAP_PAGES: usize = 2;
+/// Most pages one read of a map covers (4 MiB), and what a translation that can't keep the map has
+/// in flight. Small under test, so a fixture spans several reads.
+const DOC_MAP_READ_MAX_PAGES: usize = if cfg!(test) { 8 } else { 64 };
 
 /// An unranked match holding at least one row in this many of its blob's
 /// rows is put back in row order through a bitset of the blob's rows
@@ -187,6 +195,47 @@ fn into_row_order(mut rows: Vec<RowId>, n_rows: usize) -> Vec<RowId> {
     }
     rows.sort_unstable();
     rows
+}
+
+/// The reads that cover the map entries at `entries` (ascending byte offsets): their pages, runs at
+/// most [`DOC_MAP_MERGE_GAP_PAGES`] apart joined, each read at most [`DOC_MAP_READ_MAX_PAGES`].
+fn map_reads(entries: impl Iterator<Item = usize>, map_len: usize) -> Vec<Range<usize>> {
+    let mut pages: Vec<(usize, usize)> = Vec::new();
+    for page in entries.map(|at| at / DOC_MAP_PAGE_BYTES) {
+        match pages.last_mut() {
+            Some((first, last))
+                if page <= *last + DOC_MAP_MERGE_GAP_PAGES + 1
+                    && page < *first + DOC_MAP_READ_MAX_PAGES =>
+            {
+                *last = page
+            }
+            _ => pages.push((page, page)),
+        }
+    }
+    pages
+        .into_iter()
+        .map(|(first, last)| {
+            first * DOC_MAP_PAGE_BYTES..((last + 1) * DOC_MAP_PAGE_BYTES).min(map_len)
+        })
+        .collect()
+}
+
+/// `reads` in order, in groups of at most `cap` bytes. A group is fetched at once, so `cap` is what
+/// a translation holds.
+fn in_flight_batches(reads: &[Range<usize>], cap: usize) -> Vec<&[Range<usize>]> {
+    let mut batches = Vec::new();
+    let (mut first, mut bytes) = (0, 0);
+    for (i, read) in reads.iter().enumerate() {
+        if i > first && bytes + read.len() > cap {
+            batches.push(&reads[first..i]);
+            (first, bytes) = (i, 0);
+        }
+        bytes += read.len();
+    }
+    if first < reads.len() {
+        batches.push(&reads[first..]);
+    }
+    batches
 }
 
 /// Returns `rows` in ascending order, read back from a bitset of the
@@ -968,10 +1017,8 @@ impl FtsReader {
     /// cursors it fetched. No I/O, so it can run on the reader pool.
     /// Translate a ranked kernel's doc ids into Parquet rows.
     ///
-    /// The kernels work in the blob's own id space from end to end, so
-    /// anything handing hits to a caller passes them through here, once.
-    /// A no-op on any blob without a doc-id map, which is every blob
-    /// through `V7`.
+    /// [`Self::hits_to_rows_async`] without a runtime, through the whole map, for the tests that
+    /// drive kernels directly. A no-op on a blob without a doc-id map (every blob through `V7`).
     ///
     /// Order is left alone: a ranked result is ordered by score, and
     /// translating ids does not disturb that. The unranked siblings
@@ -979,6 +1026,7 @@ impl FtsReader {
     /// so they use [`Self::ids_to_rows`].
     ///
     /// No hits read no map.
+    #[cfg(test)]
     pub(super) fn hits_to_rows(
         &self,
         hits: Vec<(FtsDocId, f32)>,
@@ -1017,89 +1065,137 @@ impl FtsReader {
         Ok(into_row_order(rows.collect(), self.n_docs() as usize))
     }
 
-    /// [`Self::ids_to_rows`] on the caller's runtime, reading only the map
-    /// pages the ids fall in when the map is not in memory yet and they are
-    /// few (see [`Self::rows_from_map_pages`]); otherwise the whole map, once,
-    /// as before.
+    /// [`Self::ids_to_rows`] on the caller's runtime, translated by [`Self::rows_of_ids`]. No ids
+    /// read no map.
     pub(super) async fn ids_to_rows_async(
         &self,
         ids: Vec<FtsDocId>,
     ) -> Result<Vec<RowId>, FtsError> {
-        if ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        if let Some(rows) = self.rows_from_map_pages(&ids).await? {
-            return Ok(into_row_order(rows, self.n_docs() as usize));
-        }
-        self.ensure_doc_map().await?;
-        self.ids_to_rows(ids)
+        let rows = self.rows_of_ids(&ids).await?;
+        Ok(match self.has_doc_map() {
+            true => into_row_order(rows, self.n_docs() as usize),
+            false => rows,
+        })
     }
 
-    /// The rows `ids` stand for, read from just the doc-id map pages they
-    /// fall in, or `None` when the whole map is the better read: it is in
-    /// memory already, the blob keeps row order or is in memory, or the
-    /// pages would add up to more than [`DOC_MAP_SPARSE_SHARE`] of it.
+    /// The rows `ids` stand for, in the order given:
     ///
-    /// A match of a few rows in each of thousands of reordered superfiles
-    /// would otherwise read every superfile's whole map, four bytes a
-    /// document, to translate a handful of ids: hundreds of megabytes a
-    /// superfile, held at once across the fan-out. The pages are not kept
-    /// and, unlike the whole-map read, not checked against the map's CRC,
-    /// which covers the whole body.
-    async fn rows_from_map_pages(&self, ids: &[FtsDocId]) -> Result<Option<Vec<RowId>>, FtsError> {
-        if self.doc_map.get().is_some() || !matches!(self.source, Source::Lazy(_)) {
-            return Ok(None);
+    /// ```text
+    /// map already kept                             -> translate in memory
+    /// reads > 1/8 of the map, heap budget has room -> read it whole, keep it, translate in memory
+    /// otherwise                                    -> read only the pages the ids fall in
+    /// ```
+    ///
+    /// Keeping every file's whole map is what runs a query over hundreds of large files out of
+    /// memory, so a map is kept only while the budget has room.
+    pub(super) async fn rows_of_ids(&self, ids: &[FtsDocId]) -> Result<Vec<RowId>, FtsError> {
+        if let Some(id) = ids.iter().find(|id| id.get() >= self.n_docs()) {
+            return Err(FtsError::Read(ReadError::Malformed(format!(
+                "fts doc-map has no entry for blob doc id {}",
+                id.get()
+            ))));
         }
-        let Some(region) = self.doc_map_region.clone() else {
-            return Ok(None);
-        };
-        let page_of = |id: FtsDocId| id.get() as usize * DOC_MAP_ENTRY_BYTES / DOC_MAP_PAGE_BYTES;
-        let mut pages: Vec<usize> = ids.iter().map(|&id| page_of(id)).collect();
-        pages.sort_unstable();
-        pages.dedup();
-        if pages.len() * DOC_MAP_PAGE_BYTES * DOC_MAP_SPARSE_SHARE > region.len() {
-            return Ok(None);
+        let through =
+            |map: &DocMap| -> Vec<RowId> { ids.iter().map(|&id| map.row_of(id)).collect() };
+        if let Some(map) = self.doc_map.get() {
+            return Ok(through(map));
         }
-        // One read per run of adjacent pages, `(first, last)` inclusive.
-        let mut runs: Vec<(usize, usize)> = Vec::new();
-        for page in pages {
-            match runs.last_mut() {
-                Some((_, last)) if *last + 1 == page => *last = page,
-                _ => runs.push((page, page)),
-            }
-        }
-        let reads = runs.iter().map(|&(first, last)| {
-            let start = region.start + first * DOC_MAP_PAGE_BYTES;
-            let end = (region.start + (last + 1) * DOC_MAP_PAGE_BYTES).min(region.end);
-            async move {
-                self.source
-                    .range_async(start..end)
-                    .await
-                    .map_err(|e| FtsError::RangeFetch {
-                        what: "fts/doc-map page",
-                        source: e,
-                    })
-            }
+        // Ranked hits come in score order and need sorting by id; unranked ids are already sorted.
+        let by_entry: Option<Vec<u32>> = (!ids.is_sorted()).then(|| {
+            let mut order: Vec<u32> = (0..ids.len() as u32).collect();
+            order.sort_unstable_by_key(|&i| ids[i as usize]);
+            order
         });
-        let bytes = try_join_all(reads).await?;
-        ids.iter()
-            .map(|&id| {
-                let at = id.get() as usize * DOC_MAP_ENTRY_BYTES;
-                let run = runs.partition_point(|&(_, last)| last < at / DOC_MAP_PAGE_BYTES);
-                let off = at - runs[run].0 * DOC_MAP_PAGE_BYTES;
-                bytes[run]
-                    .get(off..off + DOC_MAP_ENTRY_BYTES)
-                    .and_then(|b| b.try_into().ok())
-                    .map(|b| RowId::new(u32::from_le_bytes(b)))
-                    .ok_or_else(|| {
-                        FtsError::Read(ReadError::Malformed(format!(
-                            "fts doc-map has no entry for blob doc id {}",
-                            id.get()
-                        )))
-                    })
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .map(Some)
+        let index = |k: usize| by_entry.as_ref().map_or(k, |order| order[k] as usize);
+        let entry_at = |id: FtsDocId| id.get() as usize * DOC_MAP_ENTRY_BYTES;
+        let reads = map_reads(
+            (0..ids.len()).map(|k| entry_at(ids[index(k)])),
+            self.doc_map_len(),
+        );
+        let read_bytes: usize = reads.iter().map(Range::len).sum();
+        let dense = read_bytes * DOC_MAP_SPARSE_SHARE > self.doc_map_len();
+        if dense && let Some(map) = self.kept_doc_map_within_budget().await? {
+            return Ok(through(map));
+        }
+        // Sparse reads are few, so they go out at once. A dense pass goes one read cap at a time,
+        // and reads every page when the reader checks CRCs, so the map's CRC is still checked.
+        let cap = DOC_MAP_READ_MAX_PAGES * DOC_MAP_PAGE_BYTES;
+        let (reads, in_flight) = match dense {
+            false => (reads, read_bytes),
+            true if self.verify_crc => {
+                let every_page = (0..self.doc_map_len()).step_by(DOC_MAP_PAGE_BYTES);
+                (map_reads(every_page, self.doc_map_len()), cap)
+            }
+            true => (reads, cap),
+        };
+        let mut rows = vec![RowId::new(0); ids.len()];
+        let mut next = 0;
+        self.map_pass(&reads, in_flight, |first, entries| {
+            let end = first as usize + entries.len() / DOC_MAP_ENTRY_BYTES;
+            while next < ids.len() && (ids[index(next)].get() as usize) < end {
+                let i = index(next);
+                let at = (ids[i].get() - first) as usize * DOC_MAP_ENTRY_BYTES;
+                rows[i] = RowId::new(read_u32_le(&entries[at..at + DOC_MAP_ENTRY_BYTES]));
+                next += 1;
+            }
+        })
+        .await?;
+        Ok(rows)
+    }
+
+    /// Bytes of this blob's doc-id map body; zero when it keeps row order.
+    fn doc_map_len(&self) -> usize {
+        self.doc_map_region.as_ref().map_or(0, Range::len)
+    }
+
+    /// Fetches `reads` (from [`map_reads`]) in groups of at most `in_flight` bytes and hands each
+    /// to `each` with the first document it covers. Checks the map's CRC when the reads cover it.
+    async fn map_pass(
+        &self,
+        reads: &[Range<usize>],
+        in_flight: usize,
+        mut each: impl FnMut(u32, &[u8]),
+    ) -> Result<(), FtsError> {
+        let region = self.map_region().clone();
+        let check_crc = self.verify_crc
+            && reads.first().is_some_and(|r| r.start == 0)
+            && reads.last().is_some_and(|r| r.end == region.len())
+            && reads.windows(2).all(|w| w[0].end == w[1].start);
+        let mut crc = 0;
+        for batch in in_flight_batches(reads, in_flight) {
+            let fetched = try_join_all(batch.iter().map(|read| {
+                // The last read also takes the CRC stored right after the map.
+                let with_crc = check_crc && read.end == region.len();
+                let crc_len = if with_crc { format::CRC_BYTES } else { 0 };
+                let span = region.start + read.start..region.start + read.end + crc_len;
+                #[cfg(test)]
+                self.count_doc_map_read();
+                async move {
+                    let bytes = self.source.range_async(span.clone()).await.map_err(|e| {
+                        FtsError::RangeFetch {
+                            what: "fts/doc-map",
+                            source: e,
+                        }
+                    })?;
+                    match bytes.len() >= span.len() {
+                        true => Ok(bytes),
+                        false => Err(doc_map_short_read(bytes.len(), span.len())),
+                    }
+                }
+            }))
+            .await?;
+            for (read, bytes) in batch.iter().zip(fetched) {
+                let body = &bytes[..read.len()];
+                if check_crc {
+                    crc = crc32c_append(crc, body);
+                    if read.end == region.len() && read_u32_le(&bytes[read.len()..]) != crc {
+                        return Err(doc_map_crc_mismatch());
+                    }
+                }
+                each((read.start / DOC_MAP_ENTRY_BYTES) as u32, body);
+            }
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -1213,26 +1309,19 @@ impl FtsReader {
         self.run_prepared_with_count_blob(prep)
     }
 
-    /// [`Self::hits_to_rows`] on the caller's runtime, reading only the map
-    /// pages the hits fall in when the map is not in memory yet (see
-    /// [`Self::rows_from_map_pages`]).
+    /// [`Self::hits_to_rows`] on the caller's runtime, order kept, reading only the map pages the
+    /// hits fall in ([`Self::rows_of_ids`]).
     pub(crate) async fn hits_to_rows_async(
         &self,
         hits: Vec<(FtsDocId, f32)>,
     ) -> Result<Vec<(RowId, f32)>, FtsError> {
-        if hits.is_empty() {
-            return Ok(Vec::new());
-        }
         let ids: Vec<FtsDocId> = hits.iter().map(|&(doc, _)| doc).collect();
-        if let Some(rows) = self.rows_from_map_pages(&ids).await? {
-            return Ok(rows
-                .into_iter()
-                .zip(hits)
-                .map(|(row, (_, score))| (row, score))
-                .collect());
-        }
-        self.ensure_doc_map().await?;
-        self.hits_to_rows(hits)
+        let rows = self.rows_of_ids(&ids).await?;
+        Ok(rows
+            .into_iter()
+            .zip(hits)
+            .map(|(row, (_, score))| (row, score))
+            .collect())
     }
 
     /// [`Self::run_prepared`] without the translation.
@@ -2226,14 +2315,25 @@ impl SingleTermWalk<'_> {
 mod tests {
     use std::{
         collections::{HashMap, HashSet},
-        sync::Arc,
+        sync::{Arc, atomic::Ordering},
     };
 
     use bytes::Bytes;
+    use futures::poll;
     use roaring::RoaringBitmap;
+    use tokio::{join, task::spawn_blocking};
 
-    use super::{super::test_util::*, *};
-    use crate::superfile::fts::{builder::FtsBuilder, tokenize::Phrase};
+    use super::{
+        super::{metadata::OpenOptions, test_util::*},
+        *,
+    };
+    use crate::{
+        superfile::{
+            fts::{builder::FtsBuilder, tokenize::Phrase},
+            lazy_source::{BytesLazyByteSource, LazyByteSource, Source},
+        },
+        supertable::reader_cache::disk::HeapBudget,
+    };
 
     /// A `k` above the fixture's match count.
     const TABLE_IDF_K: usize = 10;
@@ -3796,16 +3896,13 @@ mod tests {
         assert!(hits.is_empty(), "floor above all scores prunes everything");
     }
 
-    /// Ids translated through doc-id map pages on a lazily read, reordered
-    /// blob give the rows the whole map gives: ids in one page, in adjacent
-    /// pages, in a lone page and in the map's last page, which is shorter
-    /// than the rest. Enough pages to pass the sparse share fall back to the
-    /// whole map, with the same rows.
     #[tokio::test]
     async fn map_pages_translate_ids_like_the_whole_map() {
-        use super::super::metadata::OpenOptions;
-        use crate::superfile::lazy_source::LazyByteSource;
-
+        // Setup: a lazily read blob of 1000 documents in shuffled order.
+        //  - Ids in one page, adjacent pages, a lone page and the short last page: read in pages,
+        //    nothing kept, same rows as the whole map.
+        //  - Ids past the sparse share, with room in the budget: the whole map read once and kept.
+        // This test pins that both ways name the same rows.
         const N_DOCS: u32 = 1000;
         let docs: Vec<String> = (0..N_DOCS).map(|row| format!("alpha r{row}")).collect();
         let refs: Vec<&str> = docs.iter().map(String::as_str).collect();
@@ -3817,7 +3914,7 @@ mod tests {
         let (blob, json) = build_standard_blob_with(&refs, Some(&order));
         let open = || async {
             let src: Arc<dyn LazyByteSource> = Arc::new(AsyncOnlySource(blob.clone()));
-            FtsReader::open_lazy(src, &json, OpenOptions { verify_crc: false })
+            FtsReader::open_lazy(src, &json, OpenOptions { verify_crc: true })
                 .await
                 .expect("open_lazy")
         };
@@ -3859,13 +3956,11 @@ mod tests {
         let mut want: Vec<RowId> = ids.iter().map(|&id| row(id)).collect();
         want.sort_unstable();
         assert_eq!(got, want);
-        assert!(
-            r.doc_map.get().is_none(),
-            "the pages served the translation, not the whole map"
-        );
+        assert!(r.doc_map.get().is_none(), "a lazy reader keeps no map");
 
-        // One id in every page: past the sparse share, so the whole map.
-        let r = open().await;
+        // One id in every page: past the sparse share, so the reader keeps the whole map when the
+        // heap budget has room, as it always did.
+        let r = open().await.with_heap_budget(roomy(None));
         let every_page: Vec<u32> = (0..=last_page).map(|p| p * per_page).collect();
         let hits: Vec<(FtsDocId, f32)> = every_page
             .iter()
@@ -3877,6 +3972,471 @@ mod tests {
             .expect("hits_to_rows_async");
         let want: Vec<(RowId, f32)> = every_page.iter().map(|&id| (row(id), 1.0)).collect();
         assert_eq!(got, want);
-        assert!(r.doc_map.get().is_some(), "the whole map was read");
+        assert_eq!(r.doc_map_reads(), 0, "one whole read, no page reads");
+        assert!(r.doc_map.get().is_some(), "the reader kept the map");
+    }
+
+    #[test]
+    #[expect(
+        clippy::single_range_in_vec_init,
+        reason = "a read plan of one range is the expected value"
+    )]
+    fn map_reads_join_close_pages_and_batches_stay_within_one_cap() {
+        // Setup: page lists turned into reads, then reads grouped for flight.
+        //  - Pages within the merge gap join; a run splits at the read cap; the last read ends with
+        //    the map; scattered pages stay one read each.
+        //  - Groups in flight add up to at most one cap.
+        // This test pins the read plan a translation sends to the store.
+        let page = DOC_MAP_PAGE_BYTES;
+        let cap = DOC_MAP_READ_MAX_PAGES;
+        let far = DOC_MAP_MERGE_GAP_PAGES + 2;
+        let map_len = 100 * page - 1;
+        let pages = |ps: &[usize]| map_reads(ps.iter().map(|p| p * page), map_len);
+        assert_eq!(pages(&[0, 0, 1]), [0..2 * page], "one run");
+        assert_eq!(
+            pages(&[0, 1 + DOC_MAP_MERGE_GAP_PAGES]),
+            [0..(2 + DOC_MAP_MERGE_GAP_PAGES) * page],
+            "a gap of the merge gap is read through"
+        );
+        assert_eq!(
+            pages(&[0, far]),
+            [0..page, far * page..(far + 1) * page],
+            "a wider gap splits"
+        );
+        let every: Vec<usize> = (0..2 * cap).collect();
+        assert_eq!(
+            pages(&every),
+            [0..cap * page, cap * page..2 * cap * page],
+            "split at the cap"
+        );
+        assert_eq!(
+            pages(&[99]),
+            [99 * page..map_len],
+            "the last page ends with the map"
+        );
+
+        let spread: Vec<usize> = (0..100).step_by(far).collect();
+        assert_eq!(
+            pages(&spread).len(),
+            spread.len(),
+            "scattered pages stay one read each"
+        );
+
+        let scattered: Vec<usize> = (0..cap).map(|i| i * far).collect();
+        let reads = pages(&scattered);
+        assert_eq!(
+            in_flight_batches(&reads, cap * page),
+            [&reads[..]],
+            "pages adding up to a cap go together"
+        );
+        let reads = pages(&every);
+        assert_eq!(
+            in_flight_batches(&reads, cap * page),
+            [&reads[..1], &reads[1..]],
+            "one cap at a time"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_translation_refuses_an_id_past_the_map() {
+        // Setup: a reordered blob of 100 documents and an id one past its last.
+        //  - Only a damaged posting names such an id; reading it as row 0 would answer wrong rows.
+        // This test pins that the translation refuses it as malformed.
+        const N_DOCS: u32 = 100;
+        let docs: Vec<String> = (0..N_DOCS).map(|row| format!("alpha r{row}")).collect();
+        let refs: Vec<&str> = docs.iter().map(String::as_str).collect();
+        let order: Vec<u32> = (0..N_DOCS).rev().collect();
+        let (blob, json) = build_standard_blob_with(&refs, Some(&order));
+        let src: Arc<dyn LazyByteSource> = Arc::new(AsyncOnlySource(blob));
+        let r = FtsReader::open_lazy(src, &json, OpenOptions { verify_crc: false })
+            .await
+            .expect("open_lazy");
+        assert!(matches!(
+            r.ids_to_rows_async(vec![FtsDocId::new(0), FtsDocId::new(N_DOCS)])
+                .await,
+            Err(FtsError::Read(ReadError::Malformed(_)))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_translation_covering_the_whole_map_refuses_a_damaged_one() {
+        // Setup: a blob whose doc-id map has one flipped byte, and readers that check CRCs.
+        //  - Every id, read in pages (no room in the heap budget) or whole to keep the map.
+        //  - Ids every fourth page, dense but with gaps, read in pages.
+        // This test pins that each way refuses the damaged map rather than naming wrong rows.
+        const N_DOCS: u32 = 1000;
+        let docs: Vec<String> = (0..N_DOCS).map(|row| format!("alpha r{row}")).collect();
+        let refs: Vec<&str> = docs.iter().map(String::as_str).collect();
+        let order: Vec<u32> = (0..N_DOCS).rev().collect();
+        let (blob, json) = build_standard_blob_with(&refs, Some(&order));
+        let open = |blob: Bytes| {
+            let json = json.clone();
+            async move {
+                let src: Arc<dyn LazyByteSource> = Arc::new(AsyncOnlySource(blob));
+                FtsReader::open_lazy(src, &json, OpenOptions { verify_crc: true })
+                    .await
+                    .expect("open_lazy")
+            }
+        };
+        let region = open(blob.clone())
+            .await
+            .doc_map_region
+            .clone()
+            .expect("a reordered blob has a map");
+        let mut damaged = blob.to_vec();
+        damaged[region.start + region.len() / 2] ^= u8::MAX;
+        let damaged = Bytes::from(damaged);
+        let every_id: Vec<FtsDocId> = (0..N_DOCS).map(FtsDocId::new).collect();
+        for (budget, in_pages) in [(Some(0), true), (None, false)] {
+            let r = open(damaged.clone()).await.with_heap_budget(roomy(budget));
+            assert!(
+                matches!(
+                    r.ids_to_rows_async(every_id.clone()).await,
+                    Err(FtsError::Read(ReadError::ChecksumMismatch {
+                        section: "fts/doc-map",
+                        ..
+                    }))
+                ),
+                "budget {budget:?}"
+            );
+            assert_eq!(r.doc_map_reads() > 0, in_pages, "budget {budget:?}");
+        }
+        // Hits in every fourth page are dense but leave gaps; without room for the map the pass
+        // still reads every page, so the damage is caught.
+        let per_page = (DOC_MAP_PAGE_BYTES / DOC_MAP_ENTRY_BYTES) as u32;
+        let gapped: Vec<FtsDocId> = (0..N_DOCS)
+            .step_by(4 * per_page as usize)
+            .map(FtsDocId::new)
+            .collect();
+        let r = open(damaged).await.with_heap_budget(roomy(Some(0)));
+        assert!(matches!(
+            r.ids_to_rows_async(gapped).await,
+            Err(FtsError::Read(ReadError::ChecksumMismatch {
+                section: "fts/doc-map",
+                ..
+            }))
+        ));
+    }
+
+    /// A heap budget of `budget` bytes (`None`: no limit) in a process with memory to spare, so
+    /// only the budget decides what is kept.
+    fn roomy(budget: Option<u64>) -> &'static HeapBudget {
+        let heap = HeapBudget::with_budget(budget);
+        heap.set_short_of_memory(false);
+        heap
+    }
+
+    /// A reordered blob of 1000 documents, the row each doc id stands for, and one hit in every
+    /// page of its doc-id map, in descending id order like ranked hits.
+    fn dense_translation() -> (Bytes, String, Vec<u32>, Vec<(FtsDocId, f32)>) {
+        const N_DOCS: u32 = 1000;
+        let docs: Vec<String> = (0..N_DOCS).map(|row| format!("alpha r{row}")).collect();
+        let refs: Vec<&str> = docs.iter().map(String::as_str).collect();
+        let order: Vec<u32> = (0..N_DOCS).rev().collect();
+        let (blob, json) = build_standard_blob_with(&refs, Some(&order));
+        let per_page = DOC_MAP_PAGE_BYTES / DOC_MAP_ENTRY_BYTES;
+        let hits = (0..N_DOCS)
+            .step_by(per_page)
+            .rev()
+            .map(|id| (FtsDocId::new(id), id as f32))
+            .collect();
+        (blob, json, order, hits)
+    }
+
+    /// `blob` opened lazily, its kept doc-id map charged to `budget`.
+    async fn open_charged(blob: Bytes, json: &str, budget: &'static HeapBudget) -> FtsReader {
+        let src: Arc<dyn LazyByteSource> = Arc::new(AsyncOnlySource(blob));
+        FtsReader::open_lazy(src, json, OpenOptions { verify_crc: true })
+            .await
+            .expect("open_lazy")
+            .with_heap_budget(budget)
+    }
+
+    #[tokio::test]
+    async fn without_room_a_dense_translation_reads_pages_and_keeps_nothing() {
+        // Setup: hits in every page of the map, unsorted, and a heap budget with no room.
+        //  - The hits are past the sparse share, so the reader asks to keep the whole map.
+        //  - The budget says no, so it reads the pages in several batches and keeps nothing.
+        // This test pins that a refused keep still answers the same rows and charges nothing.
+        let (blob, json, order, hits) = dense_translation();
+        let budget = roomy(Some(0));
+        let r = open_charged(blob, &json, budget).await;
+        let want: Vec<(RowId, f32)> = hits
+            .iter()
+            .map(|&(id, score)| (RowId::new(order[id.get() as usize]), score))
+            .collect();
+        let got = r.hits_to_rows_async(hits).await.expect("translate");
+        assert_eq!(got, want);
+        assert!(r.doc_map_reads() > 1, "read in pages");
+        assert!(!r.doc_map_is_read(), "nothing kept");
+        assert_eq!(budget.charged(), 0);
+    }
+
+    #[tokio::test]
+    async fn without_room_a_dense_pass_holds_one_read_cap_at_a_time() {
+        // Setup: hits in every page of the map, a budget with no room, the reads held at the
+        // source.
+        //  - The pass reads the map in pieces of one read cap, and starts the next piece only
+        //    once the last one is back.
+        // This test pins what one translation holds while it reads a map it can't keep.
+        let (blob, json, _, hits) = dense_translation();
+        let src = Arc::new(GatedSource::new(blob));
+        let r = FtsReader::open_lazy(
+            Arc::clone(&src) as Arc<dyn LazyByteSource>,
+            &json,
+            OpenOptions { verify_crc: true },
+        )
+        .await
+        .expect("open_lazy")
+        .with_heap_budget(roomy(Some(0)));
+        let opened = src.started.load(Ordering::Relaxed);
+        let held = src.gate.write().await;
+        let mut query = Box::pin(r.hits_to_rows_async(hits));
+        assert!(poll!(query.as_mut()).is_pending());
+        assert_eq!(
+            src.started.load(Ordering::Relaxed) - opened,
+            1,
+            "one read cap in flight"
+        );
+        drop(held);
+        query.await.expect("translate");
+        assert!(r.doc_map_reads() > 1);
+    }
+
+    #[tokio::test]
+    async fn short_of_memory_a_dense_translation_keeps_nothing() {
+        // Setup: hits in every page of the map, a budget with room for any map, and a process
+        // short of memory.
+        //  - The hits are past the sparse share, so the reader asks to keep the whole map.
+        //  - Short of memory, the answer is no: it reads pages, keeps nothing, charges nothing.
+        // This test pins that memory pressure, not only the budget, stops a keep.
+        let (blob, json, order, hits) = dense_translation();
+        let budget = roomy(None);
+        budget.set_short_of_memory(true);
+        let r = open_charged(blob, &json, budget).await;
+        let want: Vec<(RowId, f32)> = hits
+            .iter()
+            .map(|&(id, score)| (RowId::new(order[id.get() as usize]), score))
+            .collect();
+        assert_eq!(r.hits_to_rows_async(hits).await.expect("translate"), want);
+        assert!(!r.doc_map_is_read(), "nothing kept");
+        assert_eq!(budget.charged(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_kept_map_is_charged_until_its_last_holder_drops() {
+        // Setup: a dense translation on a reader with no budget limit, then a view of it.
+        //  - The reader keeps the map in one read and is charged its length.
+        //  - Dropping the reader leaves the charge, since the view still holds the map.
+        //  - Dropping the view gives it back.
+        // This test pins that a kept map's bytes stay charged exactly as long as the map lives.
+        let (blob, json, _, hits) = dense_translation();
+        let budget = roomy(None);
+        let r = open_charged(blob, &json, budget).await;
+        let map_len = r.doc_map_len() as u64;
+        r.hits_to_rows_async(hits).await.expect("translate");
+        assert_eq!(r.doc_map_reads(), 0, "one whole read");
+        assert!(r.doc_map_is_read(), "kept");
+        assert_eq!(budget.charged(), map_len);
+        let view = r.clone();
+        drop(r);
+        assert_eq!(budget.charged(), map_len, "the view still holds it");
+        drop(view);
+        assert_eq!(budget.charged(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_budget_with_room_for_one_map_keeps_one() {
+        // Setup: two readers of the same blob, sharing a budget with room for exactly one map.
+        //  - The first dense translation keeps its map.
+        //  - The second finds no room, reads pages and keeps nothing.
+        // This test pins that the budget, not the hit count alone, decides what is kept.
+        let (blob, json, order, hits) = dense_translation();
+        let map_len = (order.len() * DOC_MAP_ENTRY_BYTES) as u64;
+        let budget = roomy(Some(map_len));
+        let first = open_charged(blob.clone(), &json, budget).await;
+        let second = open_charged(blob, &json, budget).await;
+        let a = first.hits_to_rows_async(hits.clone()).await.expect("first");
+        let b = second.hits_to_rows_async(hits).await.expect("second");
+        assert_eq!(a, b);
+        assert!(first.doc_map_is_read() && !second.doc_map_is_read());
+        assert!(second.doc_map_reads() > 0, "the second read pages");
+        assert_eq!(budget.charged(), map_len);
+    }
+
+    #[tokio::test]
+    async fn racing_queries_keep_one_map_and_charge_it_once() {
+        // Setup: two dense translations on one reader, both held while the map is being read.
+        //  - The first reserves the map's bytes and starts the read.
+        //  - The second waits for that read and reserves nothing.
+        //  - Once the read is let go, both answer from the one kept map.
+        // This test pins that queries racing to keep a map charge it once, not once each.
+        let (blob, json, _, hits) = dense_translation();
+        let budget = roomy(None);
+        let src = Arc::new(GatedSource::new(blob));
+        let r = FtsReader::open_lazy(
+            Arc::clone(&src) as Arc<dyn LazyByteSource>,
+            &json,
+            OpenOptions { verify_crc: true },
+        )
+        .await
+        .expect("open_lazy")
+        .with_heap_budget(budget);
+        let map_len = r.doc_map_len() as u64;
+        let held = src.gate.write().await;
+        let mut first = Box::pin(r.hits_to_rows_async(hits.clone()));
+        let mut second = Box::pin(r.hits_to_rows_async(hits));
+        assert!(poll!(first.as_mut()).is_pending());
+        assert!(poll!(second.as_mut()).is_pending());
+        assert_eq!(budget.charged(), map_len, "one reservation while both wait");
+        drop(held);
+        let (a, b) = join!(first, second);
+        assert_eq!(a.expect("first"), b.expect("second"));
+        assert_eq!(r.doc_map_reads(), 0, "one whole read");
+        assert_eq!(budget.charged(), map_len);
+    }
+
+    #[tokio::test]
+    async fn a_map_kept_regardless_of_room_is_still_charged() {
+        // Setup: a budget with no room, and the two reads that keep the map whatever it says.
+        //  - A filter's read ([`FtsReader::ensure_doc_map`]) keeps the map and is charged for it.
+        //  - The blocking read ([`FtsReader::doc_map`]) on a second reader does the same.
+        // This test pins that a map kept regardless still counts, leaving less room for others.
+        let (blob, json, order, _) = dense_translation();
+        let map_len = (order.len() * DOC_MAP_ENTRY_BYTES) as u64;
+        let budget = roomy(Some(0));
+        let r = open_charged(blob.clone(), &json, budget).await;
+        r.ensure_doc_map().await.expect("ensure_doc_map");
+        assert_eq!(budget.charged(), map_len);
+        let blocking = open_charged(blob, &json, budget).await;
+        let blocking = spawn_blocking(move || blocking.doc_map().map(|_| blocking))
+            .await
+            .expect("join")
+            .expect("doc_map");
+        assert_eq!(budget.charged(), 2 * map_len);
+        drop((r, blocking));
+        assert_eq!(budget.charged(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_map_on_a_file_held_whole_in_memory_is_not_charged() {
+        // Setup: a reordered blob opened from memory, as a file mapped whole from local disk is,
+        // and a dense translation that would keep the map.
+        //  - The map is a slice of the blob, taken at open, so it costs no heap.
+        //  - Nothing is reserved or charged, before or after the translation.
+        // This test pins that only maps of files that can leave the cache count in the budget.
+        let (blob, json, order, hits) = dense_translation();
+        let budget = roomy(None);
+        let r = FtsReader::open_with(blob, &json, OpenOptions { verify_crc: true })
+            .expect("open")
+            .with_heap_budget(budget);
+        assert!(r.doc_map_is_read(), "taken at open");
+        let want: Vec<(RowId, f32)> = hits
+            .iter()
+            .map(|&(id, score)| (RowId::new(order[id.get() as usize]), score))
+            .collect();
+        assert_eq!(r.hits_to_rows_async(hits).await.expect("translate"), want);
+        assert_eq!(budget.charged(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_lazy_open_keeps_no_map_even_with_its_bytes_at_hand() {
+        // Setup: a lazy source whose bytes are all local, as after a file's text section was
+        // fetched in bulk.
+        //  - The open could copy the map from them, and main did, outside any budget.
+        //  - Now it keeps nothing; the first query that needs the map asks the budget.
+        // This test pins that reopening many cached files can't keep their maps past the budget.
+        let (blob, json, _, hits) = dense_translation();
+        let budget = roomy(Some(0));
+        let src = Source::Lazy(Arc::new(BytesLazyByteSource::new(blob)));
+        let r = FtsReader::open_with_source(src, &json, OpenOptions { verify_crc: true })
+            .expect("open")
+            .with_heap_budget(budget);
+        assert!(!r.doc_map_is_read(), "nothing kept at open");
+        r.hits_to_rows_async(hits).await.expect("translate");
+        assert!(!r.doc_map_is_read(), "the budget had no room");
+        assert_eq!(budget.charged(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_sparse_translation_sends_its_page_reads_at_once() {
+        // Setup: a map of 10,000 documents and one hit every fourth page, too far apart to join:
+        // 40 reads, more than one read cap, under the sparse share.
+        //  - Held at the source, the translation has started every read before any comes back.
+        // This test pins that a sparse translation takes one round trip, as main's did.
+        const N_DOCS: u32 = 10_000;
+        /// Reads the hits fall in, each its own page.
+        const READS: u32 = 40;
+        /// Pages from one hit to the next: past the merge gap, so no two reads join.
+        const STRIDE_PAGES: u32 = 4;
+        let docs: Vec<String> = (0..N_DOCS).map(|row| format!("alpha r{row}")).collect();
+        let refs: Vec<&str> = docs.iter().map(String::as_str).collect();
+        let order: Vec<u32> = (0..N_DOCS).rev().collect();
+        let (blob, json) = build_standard_blob_with(&refs, Some(&order));
+        let per_page = (DOC_MAP_PAGE_BYTES / DOC_MAP_ENTRY_BYTES) as u32;
+        let ids: Vec<FtsDocId> = (0..READS)
+            .map(|i| FtsDocId::new(i * STRIDE_PAGES * per_page))
+            .collect();
+        let read_bytes = READS as usize * DOC_MAP_PAGE_BYTES;
+        let src = Arc::new(GatedSource::new(blob));
+        let r = FtsReader::open_lazy(
+            Arc::clone(&src) as Arc<dyn LazyByteSource>,
+            &json,
+            OpenOptions { verify_crc: true },
+        )
+        .await
+        .expect("open_lazy")
+        .with_heap_budget(roomy(None));
+        assert!(
+            read_bytes > DOC_MAP_READ_MAX_PAGES * DOC_MAP_PAGE_BYTES,
+            "more than one cap"
+        );
+        assert!(
+            read_bytes * DOC_MAP_SPARSE_SHARE <= r.doc_map_len(),
+            "sparse"
+        );
+        let opened = src.started.load(Ordering::Relaxed);
+        let held = src.gate.write().await;
+        let mut query = Box::pin(r.ids_to_rows_async(ids));
+        assert!(poll!(query.as_mut()).is_pending());
+        assert_eq!(
+            src.started.load(Ordering::Relaxed) - opened,
+            40,
+            "all reads in flight"
+        );
+        drop(held);
+        let rows = query.await.expect("translate");
+        assert_eq!(rows.len(), READS as usize);
+    }
+
+    #[tokio::test]
+    async fn a_query_cancelled_mid_read_gives_its_reservation_back() {
+        // Setup: a dense translation held while it reads the whole map, then dropped.
+        //  - While held it has reserved the map's bytes.
+        //  - Dropping it gives them back and leaves the map unread for the next query.
+        // This test pins that a cancelled query can't leave the budget charged for a map nobody
+        // holds.
+        let (blob, json, _, hits) = dense_translation();
+        let budget = roomy(None);
+        let src = Arc::new(GatedSource::new(blob));
+        let r = FtsReader::open_lazy(
+            Arc::clone(&src) as Arc<dyn LazyByteSource>,
+            &json,
+            OpenOptions { verify_crc: true },
+        )
+        .await
+        .expect("open_lazy")
+        .with_heap_budget(budget);
+        let _held = src.gate.write().await;
+        let mut query = Box::pin(r.hits_to_rows_async(hits));
+        assert!(poll!(query.as_mut()).is_pending());
+        assert_eq!(
+            budget.charged(),
+            r.doc_map_len() as u64,
+            "reserved mid-read"
+        );
+        drop(query);
+        assert_eq!(budget.charged(), 0);
+        assert!(!r.doc_map_is_read());
     }
 }
