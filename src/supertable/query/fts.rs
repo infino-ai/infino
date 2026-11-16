@@ -150,7 +150,7 @@ use crate::{
                 take_file_columns, take_rows_byte_source,
             },
             match_order::MatchOrder,
-            provider::prune_leaves_for_filters,
+            provider::{holds_no_postings, prune_leaves_for_filters},
             prune::{PruneLeaf, select_superfiles},
             tier,
         },
@@ -309,12 +309,14 @@ struct MatchKernel {
 impl MatchKernel {
     /// `docs` of superfile `suid` without the rows the `WHERE` rules out,
     /// when [`RowFilter::rows`] finds them; `hits` bounds how many rows the
-    /// match keeps there.
+    /// match keeps there, and `shared` keeps the rows for the file's other
+    /// slices.
     async fn keep_filtered(
         &self,
         r: &Arc<SuperfileReader>,
         suid: Uuid,
         hits: u64,
+        shared: bool,
         mut docs: Vec<RowId>,
     ) -> Result<Vec<RowId>, QueryError> {
         let Some(filter) = &self.row_filter else {
@@ -323,7 +325,7 @@ impl MatchKernel {
         if docs.is_empty() {
             return Ok(docs);
         }
-        if let Some(rows) = filter.rows(r, suid, hits).await? {
+        if let Some(rows) = filter.rows(r, suid, hits, shared).await? {
             docs.retain(|d| rows.contains(d.get()));
         }
         Ok(docs)
@@ -390,7 +392,7 @@ impl MatchKernel {
         // One flush per superfile: positive + negation walks.
         self.flush(&work);
         let hits = docs.len() as u64;
-        self.keep_filtered(r, suid, hits, docs).await
+        self.keep_filtered(r, suid, hits, false, docs).await
     }
 
     /// Whether one superfile's walk may be cut into doc-id slices: a plain
@@ -437,6 +439,11 @@ impl MatchKernel {
 /// decoded-column cache an unnarrowed repeat would hit.
 const ROW_FILTER_MIN_HITS_RATIO: u64 = 2;
 
+/// Fewest rows a match must keep in a superfile before the row filter is
+/// tried there. Below it, taking the extra rows costs less than the
+/// filter's estimate, which may read the superfile's dictionary.
+pub(crate) const ROW_FILTER_MIN_HITS: u64 = 1024;
+
 /// The rows a pushed-down `WHERE` keeps in each superfile, read from its
 /// indexes on the reader the match already opened, so a match takes no
 /// column for a row the filter rules out. A row set is a superset of the
@@ -450,7 +457,7 @@ struct RowFilter {
     /// Bounds how many filter walks this query puts on `pool` at once.
     slots: Semaphore,
     op_stats: Option<Arc<op_stats::OpStatsCollector>>,
-    /// Each superfile's rows, found once and shared by its slices.
+    /// A sliced superfile's rows, found once and shared by its slices.
     found: SuperfileCells<Option<Arc<RoaringBitmap>>>,
 }
 
@@ -485,39 +492,58 @@ impl RowFilter {
 
     /// The rows of superfile `suid` the filter can keep, or `None` when it
     /// does not narrow them. `hits` bounds the rows the match keeps there:
-    /// the filter's postings are walked only when its estimate is well
-    /// below that (see [`ROW_FILTER_MIN_HITS_RATIO`]).
+    /// the filter is tried only from [`ROW_FILTER_MIN_HITS`], and its
+    /// postings are walked only when its estimate is well below `hits`
+    /// (see [`ROW_FILTER_MIN_HITS_RATIO`]). With `shared`, the rows are
+    /// found once and kept for the file's other slices.
     async fn rows(
         &self,
         r: &Arc<SuperfileReader>,
         suid: Uuid,
         hits: u64,
+        shared: bool,
     ) -> Result<Option<Arc<RoaringBitmap>>, QueryError> {
+        if hits < ROW_FILTER_MIN_HITS {
+            return Ok(None);
+        }
+        if !shared {
+            return self.find(r, suid, hits).await;
+        }
         let cell = cell_for(&self.found, suid);
-        let rows = cell
-            .get_or_try_init(|| async {
-                let located = IndexedSuperfile {
-                    locations: &self.locations,
-                    superfile: suid,
-                };
-                let (estimate, work) = self
-                    .plan
-                    .estimate(r, Some(&self.pool), Some(located))
-                    .await?;
-                self.flush(&work);
-                if estimate.saturating_mul(ROW_FILTER_MIN_HITS_RATIO) > hits {
-                    return Ok::<_, QueryError>(None);
-                }
-                // The walk is CPU work: on the pool, not on a runtime worker.
-                let memos = memos_from_plan_locations(r, &self.locations, suid).await;
-                let (rows, work) = Arc::clone(&self.plan)
-                    .evaluate_on_pool(Arc::clone(r), suid, &self.pool, &self.slots, memos)
-                    .await?;
-                self.flush(&work);
-                Ok(rows.map(Arc::new))
-            })
-            .await?;
+        let rows = cell.get_or_try_init(|| self.find(r, suid, hits)).await?;
         Ok(rows.clone())
+    }
+
+    /// [`Self::rows`] without the cache.
+    async fn find(
+        &self,
+        r: &Arc<SuperfileReader>,
+        suid: Uuid,
+        hits: u64,
+    ) -> Result<Option<Arc<RoaringBitmap>>, QueryError> {
+        let located = IndexedSuperfile {
+            locations: &self.locations,
+            superfile: suid,
+        };
+        let estimated = self.plan.estimate(r, Some(&self.pool), Some(located)).await;
+        let (estimate, work) = match estimated {
+            Ok(estimated) => estimated,
+            // A superfile written before a filter column was indexed holds
+            // no postings for it: its rows are left to the `FilterExec`.
+            Err(e) if holds_no_postings(&e) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        self.flush(&work);
+        if estimate.saturating_mul(ROW_FILTER_MIN_HITS_RATIO) > hits {
+            return Ok(None);
+        }
+        // The walk is CPU work: on the pool, not on a runtime worker.
+        let memos = memos_from_plan_locations(r, &self.locations, suid).await;
+        let (rows, work) = Arc::clone(&self.plan)
+            .evaluate_on_pool(Arc::clone(r), suid, &self.pool, &self.slots, memos)
+            .await?;
+        self.flush(&work);
+        Ok(rows.map(Arc::new))
     }
 
     /// Adds the filter's index work to the statement's statistics.
@@ -3087,13 +3113,13 @@ impl SupertableReader {
                                 Ok::<_, QueryError>(Arc::new(kernel.cursor_set(&r, suid).await?))
                             })
                             .await?;
+                        // The whole file's match keeps at most its terms'
+                        // summed counts, whichever slice asks.
+                        let hits = set.df_sum().min(r.n_docs());
                         // A slice's walk is a sync scan of a share of the
                         // file: a rayon job on the reader pool, so the
                         // slices run side by side and no runtime worker
                         // blocks under one.
-                        // The whole file's match keeps at most its terms'
-                        // summed counts, whichever slice asks.
-                        let hits = set.df_sum().min(r.n_docs());
                         let (set, slice_reader, slice_kernel) =
                             (Arc::clone(set), Arc::clone(&r), Arc::clone(&kernel));
                         let docs = run_on_pool_unless_blocking(
@@ -3103,7 +3129,7 @@ impl SupertableReader {
                         )
                         .await
                         .map_err(|e| QueryError::Internal(e.to_string()))??;
-                        kernel.keep_filtered(&r, suid, hits, docs).await?
+                        kernel.keep_filtered(&r, suid, hits, true, docs).await?
                     }
                 };
                 let mut locals: Vec<u32> = docs.into_iter().map(RowId::get).collect();
@@ -3670,7 +3696,7 @@ impl SupertableReader {
                     && !candidates.is_empty()
                 {
                     let hits = candidates.len() as u64;
-                    if let Some(rows) = filter.rows(&r, entry.superfile_id, hits).await? {
+                    if let Some(rows) = filter.rows(&r, entry.superfile_id, hits, false).await? {
                         candidates.retain(|d| rows.contains(*d));
                     }
                 }

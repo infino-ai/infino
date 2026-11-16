@@ -1965,7 +1965,7 @@ fn spans_full_domain(min: &ScalarValue, max: &ScalarValue) -> bool {
 /// Whether `e` says a superfile has no `standard` postings for a column:
 /// no FTS section at all, no index on the column, or one under another
 /// analyzer.
-fn holds_no_postings(e: &ReadError) -> bool {
+pub(crate) fn holds_no_postings(e: &ReadError) -> bool {
     match e {
         ReadError::MissingKv(_) => true,
         ReadError::Fts(f) => matches!(
