@@ -216,7 +216,10 @@ use crate::{
         },
         reader_cache::{
             DiskCacheStore, ReadIntent,
-            disk::{ScratchCharge, ScratchRoom, mmap_temp_file_bytes, temp_file_behind},
+            disk::{
+                ScratchCharge, ScratchRoom, mmap_charged_temp_file_bytes, mmap_temp_file_bytes,
+                temp_file_behind,
+            },
         },
         schema::{
             DECIMAL128_PRECISION, DECIMAL128_SCALE, FieldId, LegacyNames, PhysicalSchema,
@@ -4490,6 +4493,33 @@ fn id_bounds<'a>(
     Ok((id_min, id_max, n_docs))
 }
 
+/// Map a build's finished `output` as zero-copy `Bytes` backed by the file
+/// ([`mmap_temp_file_bytes`]). On a table with a disk cache the file is
+/// charged to the table's disk budget for as long as it is the bytes' own:
+/// until the cache takes it over as a cache file, or the bytes drop. The
+/// charge never waits and never refuses the build: a file past the temp
+/// files' share of the budget is left uncounted.
+fn seal_build_output(options: &SupertableOptions, output: NamedTempFile) -> io::Result<Bytes> {
+    let charge = match options.disk_cache.as_ref() {
+        Some(cache) => {
+            let bytes = output.as_file().metadata()?.len();
+            let mut charge = cache.scratch_charge();
+            if charge.adopt(bytes) {
+                Some(charge)
+            } else {
+                debug!(
+                    bytes,
+                    "build output not counted against the disk budget: temp files hold their \
+                     share of it"
+                );
+                None
+            }
+        }
+        None => None,
+    };
+    mmap_charged_temp_file_bytes(output, charge)
+}
+
 /// Finish a fed shard builder into its superfile bytes and gather what the
 /// publish needs from it.
 ///
@@ -4506,10 +4536,10 @@ fn seal_shard(
     head_sink: Option<(term_index::HeadSink, usize)>,
     id_bounds: (i128, i128, u64),
     scalar_stats: HashMap<FieldId, ScalarStatsAgg>,
-    scratch: &Path,
+    options: &SupertableOptions,
 ) -> Result<ShardOutput, BuildError> {
     let (id_min, id_max, n_docs) = id_bounds;
-    let mut output = NamedTempFile::new_in(scratch)
+    let mut output = NamedTempFile::new_in(options.scratch_dir())
         .map_err(|error| BuildError::Store(format!("shard temp create: {error}")))?;
     {
         let mut writer = BufWriter::new(output.as_file_mut());
@@ -4520,7 +4550,7 @@ fn seal_shard(
     }
     // The file stays behind the bytes: a publish to local-filesystem
     // storage links it into place instead of writing the superfile again.
-    let bytes = mmap_temp_file_bytes(output)
+    let bytes = seal_build_output(options, output)
         .map_err(|error| BuildError::Store(format!("shard mmap: {error}")))?;
     let term_contribution = head_sink
         .map(|(sink, _)| sink.into_contribution(superfile_id, id_min))
@@ -4626,7 +4656,7 @@ fn build_piece(
         head_sink,
         bounds,
         scalar_stats,
-        &options.scratch_dir(),
+        options,
     )
 }
 
@@ -9963,7 +9993,7 @@ fn build_one_shard_from_packed_cells(
     }
     // The file stays behind the bytes, so a publish to local-filesystem
     // storage links it into place instead of writing the shard again.
-    let bytes = mmap_temp_file_bytes(output)
+    let bytes = seal_build_output(&inner.options, output)
         .map_err(|error| BuildError::Store(format!("compacted shard mmap: {error}")))?;
 
     Ok(ShardOutput {
@@ -10555,7 +10585,7 @@ fn build_one_packed_shard_via_drain(
     }
     // The file stays behind the bytes, so a publish to local-filesystem
     // storage links it into place instead of writing the shard again.
-    let bytes = mmap_temp_file_bytes(output)
+    let bytes = seal_build_output(&inner.options, output)
         .map_err(|error| BuildError::Store(format!("compacted shard mmap: {error}")))?;
 
     Ok(Some(ShardOutput {
@@ -16090,7 +16120,10 @@ mod tests {
                 commit::{MANIFEST_DIR, POINTER_PATH, manifest_uri},
             },
             query::vector::assemble_hnsw_incremental,
-            reader_cache::{config::DiskCacheConfig, disk::DiskCacheStore},
+            reader_cache::{
+                config::DiskCacheConfig,
+                disk::{DiskCacheStore, give_back_temp_file_charge},
+            },
             schema::change::SchemaChange,
             slow_vector_state::STORAGE_PREFIX as SLOW_VECTOR_STATE_STORAGE_PREFIX,
             storage::{LocalFsStorageProvider, ObjectMeta},
@@ -19067,6 +19100,75 @@ mod tests {
         )
         .expect("valid options")
         .with_writer_pool(writer_pool_with(1))
+    }
+
+    /// A build's output file is charged to the table's disk budget from the
+    /// moment it is sealed. The charge is given back when a disk cache takes
+    /// the file over, and otherwise when the bytes drop. An output past the
+    /// temp files' share of the budget is sealed uncounted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_build_output_is_charged_to_the_disk_budget_until_it_is_taken_over() {
+        const OUTPUT_BYTES: usize = 4096;
+        let dir = TempDir::new().expect("tempdir");
+        let (table, cache) = drain_table_with_disk_cache(&dir, roomy_disk_budget());
+        let options = &table.inner().options;
+        let sealed = |bytes: usize| {
+            let mut output = NamedTempFile::new_in(options.scratch_dir()).expect("temp file");
+            output.write_all(&vec![0u8; bytes]).expect("write");
+            output.flush().expect("flush");
+            seal_build_output(options, output).expect("seal")
+        };
+
+        let output = sealed(OUTPUT_BYTES);
+        assert_eq!(cache.stats().scratch_bytes, OUTPUT_BYTES as u64);
+        cache.assert_budget_consistent();
+        drop(output);
+        assert_eq!(cache.stats().scratch_bytes, 0, "given back with the bytes");
+
+        let output = sealed(OUTPUT_BYTES);
+        give_back_temp_file_charge(&output);
+        assert_eq!(cache.stats().scratch_bytes, 0, "given back at the takeover");
+        drop(output);
+        assert_eq!(cache.stats().scratch_bytes, 0, "and not a second time");
+        cache.assert_budget_consistent();
+
+        let tiny_dir = TempDir::new().expect("tempdir");
+        let (tiny_table, tiny) = drain_table_with_disk_cache(&tiny_dir, TINY_DISK_BUDGET_BYTES);
+        let options = &tiny_table.inner().options;
+        let mut output = NamedTempFile::new_in(options.scratch_dir()).expect("temp file");
+        output.write_all(&[0u8; OUTPUT_BYTES]).expect("write");
+        output.flush().expect("flush");
+        let output = seal_build_output(options, output).expect("a build is never refused");
+        assert_eq!(output.len(), OUTPUT_BYTES);
+        assert_eq!(tiny.stats().scratch_bytes, 0, "left uncounted");
+        tiny.assert_budget_consistent();
+    }
+
+    /// A commit on a table with a disk cache leaves nothing charged for its
+    /// temp files once its outputs are in the cache, so they are counted
+    /// once. A commit on a table whose disk budget has no room for them
+    /// still commits every row.
+    #[test]
+    fn a_commit_charges_nothing_once_the_cache_holds_its_outputs() {
+        const COMMITS: usize = 2;
+        for budget in [roomy_disk_budget(), TINY_DISK_BUDGET_BYTES] {
+            let dir = TempDir::new().expect("tempdir");
+            let (table, cache) = drain_table_with_disk_cache(&dir, budget);
+            for _ in 0..COMMITS {
+                commit_axis_vectors(&table, COMMIT_AS_DRAIN_TEST_ROWS);
+            }
+            let rows: u64 = table
+                .inner()
+                .manifest
+                .load_full()
+                .get_all_superfiles()
+                .iter()
+                .map(|superfile| superfile.n_docs)
+                .sum();
+            assert_eq!(rows, (COMMITS * COMMIT_AS_DRAIN_TEST_ROWS) as u64);
+            assert_eq!(cache.stats().scratch_bytes, 0);
+            cache.assert_budget_consistent();
+        }
     }
 
     fn build_axis_vector_batch(n: usize, dim: usize) -> RecordBatch {

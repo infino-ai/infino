@@ -16,6 +16,8 @@ use memmap2::Mmap;
 use tempfile::{NamedTempFile, TempPath};
 use tracing::debug;
 
+use crate::supertable::reader_cache::disk::ScratchCharge;
+
 /// Newtype around `Arc<Mmap>` that delegates `AsRef<[u8]>`
 /// to the underlying `Mmap`. Lets the cache's `mmap: Arc<Mmap>`
 /// field and the reader's `Bytes::from_owner(...)` share the
@@ -77,14 +79,24 @@ pub(crate) fn mmap_readonly_with_handle(path: &Path) -> io::Result<(Arc<Mmap>, B
 /// to link into place instead of copying the bytes out again. An entry lives
 /// exactly as long as the bytes do; its name goes earlier when
 /// [`release_temp_file`] lets it go.
-static TEMP_BACKED: OnceLock<Mutex<HashMap<usize, (usize, SealedName)>>> = OnceLock::new();
+static TEMP_BACKED: OnceLock<Mutex<HashMap<usize, SealedFile>>> = OnceLock::new();
+
+/// What [`TEMP_BACKED`] keeps of one sealed file: the mapping's length, the
+/// file's name, and what the file is charged on a disk budget.
+type SealedFile = (usize, SealedName, SealedCharge);
 
 /// The name of a sealed file, shared by its bytes' owner and the
 /// [`TEMP_BACKED`] entry. Emptying it unlinks the file; the mapping stays
 /// valid, since an unlinked inode lives until its last mapping drops.
 type SealedName = Arc<Mutex<Option<TempPath>>>;
 
-fn temp_backed() -> &'static Mutex<HashMap<usize, (usize, SealedName)>> {
+/// What a sealed file is charged on its table's disk budget, shared by its
+/// bytes' owner and the [`TEMP_BACKED`] entry. Emptied when a disk cache
+/// takes the file over ([`give_back_temp_file_charge`]); otherwise the
+/// charge is given back when the last clone of the bytes drops.
+type SealedCharge = Arc<Mutex<Option<ScratchCharge>>>;
+
+fn temp_backed() -> &'static Mutex<HashMap<usize, SealedFile>> {
     TEMP_BACKED.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -94,6 +106,9 @@ fn temp_backed() -> &'static Mutex<HashMap<usize, (usize, SealedName)>> {
 struct TempBackedOwner {
     mmap: Arc<Mmap>,
     name: SealedName,
+    /// Declared last, so the charge is given back after the file is
+    /// unlinked and unmapped.
+    _charge: SealedCharge,
 }
 
 impl AsRef<[u8]> for TempBackedOwner {
@@ -119,21 +134,55 @@ impl Drop for TempBackedOwner {
 /// into place ([`temp_file_behind`]) rather than write its bytes a second
 /// time. The ordinary [`mmap_readonly_bytes`] drops the file at once.
 pub(crate) fn mmap_temp_file_bytes(file: NamedTempFile) -> io::Result<Bytes> {
+    mmap_charged_temp_file_bytes(file, None)
+}
+
+/// [`mmap_temp_file_bytes`], keeping `charge`, what the file is charged on
+/// its table's disk budget, for as long as the file is the bytes' own.
+pub(crate) fn mmap_charged_temp_file_bytes(
+    file: NamedTempFile,
+    charge: Option<ScratchCharge>,
+) -> io::Result<Bytes> {
     let mmap = Arc::new(open_readonly_mmap(file.path())?);
     let name: SealedName = Arc::new(Mutex::new(Some(file.into_temp_path())));
+    let charge: SealedCharge = Arc::new(Mutex::new(charge));
     if let Ok(mut map) = temp_backed().lock() {
-        map.insert(mmap.as_ptr() as usize, (mmap.len(), Arc::clone(&name)));
+        map.insert(
+            mmap.as_ptr() as usize,
+            (mmap.len(), Arc::clone(&name), Arc::clone(&charge)),
+        );
     }
-    Ok(Bytes::from_owner(TempBackedOwner { mmap, name }))
+    Ok(Bytes::from_owner(TempBackedOwner {
+        mmap,
+        name,
+        _charge: charge,
+    }))
 }
 
 /// The entry for the whole (unsliced) temp-backed `bytes`; `None` for any
 /// other bytes, a slice of the mapping included: a prefix starts at the
 /// same address, so the length is checked too.
 fn sealed_name_of(bytes: &Bytes) -> Option<SealedName> {
+    sealed_file_of(bytes).map(|(name, _)| name)
+}
+
+/// The name and charge of the sealed file behind the whole `bytes`.
+fn sealed_file_of(bytes: &Bytes) -> Option<(SealedName, SealedCharge)> {
     let map = temp_backed().lock().ok()?;
-    let (len, name) = map.get(&(bytes.as_ptr() as usize))?;
-    (*len == bytes.len()).then(|| Arc::clone(name))
+    let (len, name, charge) = map.get(&(bytes.as_ptr() as usize))?;
+    (*len == bytes.len()).then(|| (Arc::clone(name), Arc::clone(charge)))
+}
+
+/// Give back what the temp file behind `bytes` is charged on its table's
+/// disk budget. A disk cache calls this as it takes the file over and
+/// charges it as its own, so the file is never counted twice. A no-op for
+/// any other bytes.
+pub(crate) fn give_back_temp_file_charge(bytes: &Bytes) {
+    if let Some((_, charge)) = sealed_file_of(bytes)
+        && let Ok(mut charge) = charge.lock()
+    {
+        drop(charge.take());
+    }
 }
 
 /// The still-present temp file `bytes` were mapped from by

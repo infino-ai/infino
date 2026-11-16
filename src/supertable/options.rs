@@ -75,7 +75,7 @@ use crate::{
         Config, CrcVerification, DrainConsolidate, StorageBackend, StorageColdFetchMode,
         ThreadCount, scratch_root,
     },
-    memory::ConnectionMemoryBudget,
+    memory::{ConnectionMemoryBudget, SqlSpill},
     runtime_metrics::rss::total_memory_bytes,
     storage::{
         AzureStorageProvider, GcsStorageProvider, LocalFsStorageProvider, S3StorageProvider,
@@ -463,6 +463,9 @@ pub struct SupertableOptions {
     /// restarts. Independent of `disk_cache` (which caches superfile
     /// content) and uses its own byte budget. `None` disables it.
     pub metadata_disk_cache: Option<Arc<MetadataDiskCache>>,
+    /// Where the table's SQL spills, shared with the connection that opened
+    /// it. `None` leaves DataFusion's default, the OS temp directory.
+    pub(crate) sql_spill: Option<Arc<SqlSpill>>,
     /// Superfiles a ranked query opens concurrently when it orders them by
     /// score ceiling. Below this many candidates every superfile opens at
     /// once, exactly as the unordered fan-out does, so ordering costs no
@@ -949,6 +952,7 @@ impl SupertableOptions {
             storage: None,
             disk_cache: None,
             metadata_disk_cache: None,
+            sql_spill: None,
             bound_ordered_open_window: DEFAULT_BOUND_ORDERED_OPEN_WINDOW,
             term_tier_entries_per_term: None,
             term_head_depth: None,
@@ -1220,6 +1224,13 @@ impl SupertableOptions {
     /// resulting `Arc` here.
     pub fn with_metadata_disk_cache(mut self, cache: Arc<MetadataDiskCache>) -> Self {
         self.metadata_disk_cache = Some(cache);
+        self
+    }
+
+    /// Spill the table's SQL through `spill`, the SQL spill of the
+    /// connection that opens it.
+    pub(crate) fn with_sql_spill(mut self, spill: Arc<SqlSpill>) -> Self {
+        self.sql_spill = Some(spill);
         self
     }
 

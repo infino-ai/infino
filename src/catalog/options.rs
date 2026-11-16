@@ -136,7 +136,9 @@ impl ConnectOptions {
 
     /// Enable a local disk cache rooted at `dir` (off by default). Cold
     /// superfile reads are cached to NVMe; per table, under
-    /// `<dir>/<table>`. No effect on `memory://` catalogs.
+    /// `<dir>/<table>`. SQL that spills to disk spills under `dir` too,
+    /// within a tenth of the disk's size, instead of the OS temp directory.
+    /// No effect on `memory://` catalogs.
     pub fn with_cache_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.cache_dir = Some(dir.into());
         self

@@ -87,6 +87,13 @@ impl DiskCacheStore {
 
         let size = bytes.len() as u64;
 
+        // A build's sealed file is linked in below and counted as the
+        // cache's from here, so what the build charged for it goes back
+        // first: the file is never counted twice.
+        if temp_file_behind(&bytes).is_some() {
+            give_back_temp_file_charge(&bytes);
+        }
+
         // Reserve budget (CAS-loop with eviction on miss).
         // Use `reserve_manual` so a panic between this and
         // the DashMap insert doesn't double-decrement on
