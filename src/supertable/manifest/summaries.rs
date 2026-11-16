@@ -433,6 +433,28 @@ impl ColumnStats<'_> {
         (fields.len() == 2 && fields[0].data_type() == data_type).then_some(item)
     }
 
+    /// The values of the exact value table as one array, without their
+    /// counts, when the superfile carries a table: a section's row read in
+    /// place, a decoded table built into one. Every non-null value the
+    /// column holds in the superfile is in it, once.
+    pub(crate) fn exact_values(&self) -> Option<ArrayRef> {
+        match self {
+            Self::Inline(agg) => ScalarValue::iter_to_array(
+                agg.value_counts
+                    .as_ref()?
+                    .entries()
+                    .iter()
+                    .map(|(value, _)| value.clone()),
+            )
+            .ok(),
+            Self::Section(row) => {
+                let item = row.value_table_array()?;
+                let item = item.as_any().downcast_ref::<StructArray>()?;
+                (item.num_columns() == 2).then(|| Arc::clone(item.column(0)))
+            }
+        }
+    }
+
     /// The exact value table, when the superfile carries one.
     pub(crate) fn value_counts(&self) -> Option<ScalarValueCounts> {
         match self {

@@ -381,6 +381,15 @@ impl Table for RemoteTable {
         // runs the statement, which the endpoint answers as any other.
         Ok(None)
     }
+    fn head_where(
+        &self,
+        _filter: &Expr,
+        _k: usize,
+        _projection: Option<&[&str]>,
+    ) -> Result<Option<Vec<RecordBatch>>, InfinoError> {
+        // As for `head`: no call on the wire; the caller runs the statement.
+        Ok(None)
+    }
     fn sorted_search(
         &self,
         column: &str,

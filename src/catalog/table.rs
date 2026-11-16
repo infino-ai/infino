@@ -92,6 +92,12 @@ pub(crate) trait Table: Send + Sync {
         k: usize,
         projection: Option<&[&str]>,
     ) -> Result<Option<Vec<RecordBatch>>, InfinoError>;
+    fn head_where(
+        &self,
+        filter: &Expr,
+        k: usize,
+        projection: Option<&[&str]>,
+    ) -> Result<Option<Vec<RecordBatch>>, InfinoError>;
     fn count(&self, column: &str, query: &str, mode: BoolMode) -> Result<u64, InfinoError>;
     fn count_where(&self, predicates: &[Expr]) -> Result<Vec<u64>, InfinoError>;
     fn value_counts(&self, column: &str) -> Result<RecordBatch, InfinoError>;
@@ -234,6 +240,14 @@ impl Table for SupertableHandle {
         projection: Option<&[&str]>,
     ) -> Result<Option<Vec<RecordBatch>>, InfinoError> {
         SupertableHandle::head(self, k, projection).map(Some)
+    }
+    fn head_where(
+        &self,
+        filter: &Expr,
+        k: usize,
+        projection: Option<&[&str]>,
+    ) -> Result<Option<Vec<RecordBatch>>, InfinoError> {
+        SupertableHandle::head_where(self, filter, k, projection)
     }
     fn count(&self, column: &str, query: &str, mode: BoolMode) -> Result<u64, InfinoError> {
         SupertableHandle::count(self, column, query, mode)
@@ -536,6 +550,46 @@ impl Supertable {
         projection: Option<&[&str]>,
     ) -> Result<Option<Vec<RecordBatch>>, InfinoError> {
         self.inner.head(k, projection)
+    }
+
+    /// The first `k` live rows `filter` keeps, in storage order, read
+    /// without planning a statement: rows a `SELECT … WHERE filter LIMIT k`
+    /// with no `ORDER BY` could return, fewer when fewer pass. The filter is
+    /// checked a row group at a time over the columns it names, which stay
+    /// decoded across calls; a superfile whose exact value table shows that
+    /// none of its values passes a condition on one column is not read.
+    /// `None`, for the caller to run the statement, when the filter names a
+    /// column the table does not store, needs a statement to evaluate, or
+    /// keeps too few of the rows read to fill the page within some dozens
+    /// of row groups; a hosted table always answers `None`. Rows carry
+    /// `score` fixed at `0.0`; `projection` follows `bm25_search`'s rules.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use infino::arrow_array::{Int64Array, RecordBatch};
+    /// # use infino::arrow_schema::{DataType, Field, Schema};
+    /// # use infino::{connect, IndexSpec};
+    /// # use datafusion::prelude::{col, lit};
+    /// # let db = connect("memory://")?;
+    /// # let schema = Arc::new(Schema::new(vec![Field::new("size", DataType::Int64, false)]));
+    /// # let logs = db.create_table("logs", schema.clone(), IndexSpec::new())?;
+    /// # logs.append(&RecordBatch::try_new(
+    /// #     schema, vec![Arc::new(Int64Array::from(vec![30, 10, 20]))])?)?;
+    /// let page = logs
+    ///     .head_where(&col("size").gt(lit(15_i64)), 5, Some(&["size"]))?
+    ///     .expect("a local table answers");
+    /// let sizes = page[0].column(0).as_any().downcast_ref::<Int64Array>().expect("size");
+    /// assert_eq!(sizes.values(), &[30, 20]);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn head_where(
+        &self,
+        filter: &Expr,
+        k: usize,
+        projection: Option<&[&str]>,
+    ) -> Result<Option<Vec<RecordBatch>>, InfinoError> {
+        ensure_expr_within_connective_cap(filter)?;
+        self.inner.head_where(filter, k, projection)
     }
 
     /// The first `k` rows by one range-indexed column, ascending or (with
