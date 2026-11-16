@@ -7,8 +7,9 @@
 //! budget does not count that memory. So:
 //! - whatever keeps decoded bytes holds a [`HeapReservation`], which gives them back when it drops;
 //! - past the budget, and only while the rest of the process leaves the metadata less room than the
-//!   budget, the files no query holds leave the cache, oldest first. A file whole on local disk
-//!   keeps its bytes there, so its next open maps it again with no download.
+//!   budget, the lazily read files no query holds leave the cache, oldest first, keeping their
+//!   downloaded blocks on disk. A file mapped whole from local disk is not counted and stays, as
+//!   before.
 
 #[cfg(test)]
 use std::sync::atomic::AtomicBool;
@@ -21,20 +22,15 @@ use std::{
         mpsc::{SyncSender, sync_channel},
     },
     thread,
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    time::Instant,
 };
 
-use dashmap::mapref::entry::Entry;
 use tracing::debug;
 
 use crate::{
     memory::{SAMPLE_EVERY, process_limit},
     runtime_metrics::rss::{status_anon_rss_bytes, total_memory_bytes},
-    superfile::SuperfileReader,
-    supertable::{
-        manifest::SuperfileUri,
-        reader_cache::disk::{CachedEntry, DiskCacheStore, EntryAccounting, UnindexedFile},
-    },
+    supertable::{manifest::SuperfileUri, reader_cache::disk::DiskCacheStore},
 };
 
 /// Share of the process memory limit (else of the machine's memory) the cache may keep as decoded
@@ -121,7 +117,15 @@ fn anon_resident() -> Option<u64> {
 #[must_use = "the bytes go back as soon as the reservation drops"]
 pub(crate) struct HeapReservation {
     budget: &'static HeapBudget,
-    bytes: u64,
+    bytes: AtomicU64,
+}
+
+impl HeapReservation {
+    /// Count `more` bytes in this reservation, kept until it drops.
+    pub(crate) fn add(&self, more: u64) {
+        self.budget.charged.fetch_add(more, Ordering::AcqRel);
+        self.bytes.fetch_add(more, Ordering::AcqRel);
+    }
 }
 
 impl Drop for HeapReservation {
@@ -131,7 +135,7 @@ impl Drop for HeapReservation {
             .budget
             .charged
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |charged| {
-                Some(charged.saturating_sub(self.bytes))
+                Some(charged.saturating_sub(self.bytes.load(Ordering::Acquire)))
             });
     }
 }
@@ -211,7 +215,7 @@ impl HeapBudget {
         self.charged.fetch_add(bytes, Ordering::AcqRel);
         HeapReservation {
             budget: self,
-            bytes,
+            bytes: AtomicU64::new(bytes),
         }
     }
 
@@ -236,7 +240,7 @@ impl HeapBudget {
             let now_us = cache.now_us();
             for entry in cache.cached.iter() {
                 if entry.value().heap.get().is_some()
-                    && cache.heap_reclaimable(entry.key(), entry.value())
+                    && cache.reclaimable_lazy_entry(entry.key(), entry.value())
                 {
                     let last = entry.value().last_access_us.load(Ordering::Acquire);
                     oldest.push((Reverse(now_us.saturating_sub(last)), at, *entry.key()));
@@ -249,7 +253,7 @@ impl HeapBudget {
             if self.charged.load(Ordering::Acquire) <= budget {
                 break;
             }
-            released.extend(caches[at].release_for_heap(&uri));
+            released.extend(caches[at].release_lazy_entry(&uri, caches[at].now_us()));
         }
         // The lazy files past the cap would otherwise go at the next query's first open, which
         // would pay for freeing them.
@@ -298,60 +302,20 @@ impl DiskCacheStore {
         budget.register(self);
     }
 
-    /// Count the footer and page index `uri`'s reader keeps against the budget, once, so a warm
-    /// open measures nothing. The count goes back when the file leaves the cache.
-    pub(crate) fn charge_heap_once(&self, uri: &SuperfileUri, bytes: impl FnOnce() -> u64) {
+    /// Count `bytes` more of what `uri`'s reader keeps decoded against the budget, until the file
+    /// leaves the cache. The budget bounds the metadata of files that can leave: a file mapped whole
+    /// from local disk never leaves, so it is not counted.
+    pub(crate) fn charge_heap(&self, uri: &SuperfileUri, bytes: u64) {
         let Some(entry) = self.cached.get(uri).map(|entry| Arc::clone(entry.value())) else {
             return;
         };
+        if entry.mmap().is_some() {
+            return;
+        }
         entry
             .heap
-            .get_or_init(|| self.heap_budget().reserve(bytes()));
-    }
-
-    /// Whether `entry` may leave for the budget: no query holds it, and nothing is still writing or
-    /// downloading it. A mapped copy missing its vector blob stays: its blob is still filling in.
-    fn heap_reclaimable(&self, uri: &SuperfileUri, entry: &CachedEntry) -> bool {
-        match entry.mmap() {
-            None => self.reclaimable_lazy_entry(uri, entry),
-            Some(_) => {
-                !entry.held_by_query()
-                    && entry.accounting == EntryAccounting::Eager
-                    && entry.block_source().is_none()
-                    && !self
-                        .fills
-                        .get(uri)
-                        .is_some_and(|fill| fill.downloading.load(Ordering::Acquire))
-            }
-        }
-    }
-
-    /// Drop `uri` from the cache for the budget. A lazy file goes as it does past the lazy cap. A
-    /// mapped file keeps its bytes on disk, counted in the disk budget and recorded as a restart
-    /// would find it, so the next open maps it again.
-    fn release_for_heap(&self, uri: &SuperfileUri) -> Option<Arc<SuperfileReader>> {
-        let slot = self.cached.entry(*uri);
-        let Entry::Occupied(slot) = slot else {
-            return None;
-        };
-        if slot.get().mmap().is_none() {
-            drop(slot);
-            return self.release_lazy_entry(uri, self.now_us());
-        }
-        if !self.heap_reclaimable(uri, slot.get()) {
-            return None;
-        }
-        // Recorded under the entry's lock, as a landed download is, so an open cannot find the
-        // file on disk with neither an entry nor a record and count it twice. Stamped now, in the
-        // records' clock: it was used more recently than a file a restart found.
-        let file = UnindexedFile {
-            size_bytes: slot.get().size_bytes.load(Ordering::Acquire),
-            mtime_us: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |since| since.as_micros() as u64),
-        };
-        self.unindexed.insert(*uri, file);
-        Some(Arc::clone(&slot.remove().reader))
+            .get_or_init(|| self.heap_budget().reserve(0))
+            .add(bytes);
     }
 }
 
@@ -360,24 +324,21 @@ mod tests {
     use std::{
         sync::{
             Arc, OnceLock,
-            atomic::{AtomicU64, Ordering},
+            atomic::AtomicU64,
             mpsc::{Receiver, Sender, channel},
         },
         thread,
-        time::{Duration, SystemTime, UNIX_EPOCH},
+        time::Duration,
     };
 
     use crate::{
         superfile::SuperfileReader,
         supertable::{
             manifest::SuperfileUri,
-            reader_cache::{
-                ColdFetchMode, ReadIntent,
-                disk::{
-                    CachedEntry, DiskCacheStore, EntryAccounting, Residency,
-                    heap::{FREE_THREAD_NAME, HeapBudget, free_elsewhere},
-                    test_support::*,
-                },
+            reader_cache::disk::{
+                CachedEntry, DiskCacheStore, EntryAccounting, Residency,
+                heap::{FREE_THREAD_NAME, HeapBudget, free_elsewhere},
+                test_support::*,
             },
         },
     };
@@ -423,7 +384,7 @@ mod tests {
                 last_access_us: AtomicU64::new(last_access_us),
             }),
         );
-        store.charge_heap_once(&uri, || ENTRY_BYTES);
+        store.charge_heap(&uri, ENTRY_BYTES);
         uri
     }
 
@@ -573,92 +534,42 @@ mod tests {
     }
 
     #[test]
-    fn a_file_is_charged_once_and_its_charge_goes_with_it() {
-        // One file counted twice, then dropped by a path that knows nothing of the budget (the
-        // lazy cap's release).
-        // This test pins that a warm open never counts twice and every way out refunds.
+    fn a_files_count_goes_with_it_whichever_way_it_leaves() {
+        // One file counted in two parts, then dropped by a path that knows nothing of the budget
+        // (the lazy cap's release).
+        // This test pins that a count grows with what the reader keeps and every way out refunds.
         let (_dir, store) = store_with_budget(None);
         let budget = store.heap_budget();
         let uri = charged_entry(&store, 1);
-        store.charge_heap_once(&uri, || unreachable!("charged already: nothing measured"));
-        assert_eq!(budget.charged(), ENTRY_BYTES);
+        store.charge_heap(&uri, ENTRY_BYTES);
+        assert_eq!(budget.charged(), 2 * ENTRY_BYTES);
         store.release_lazy_entry(&uri, store.now_us());
         assert!(!store.is_cached(&uri));
         assert_eq!(budget.charged(), 0);
     }
 
     #[tokio::test]
-    async fn a_mapped_file_keeps_its_file_and_disk_charge_when_it_leaves() {
-        // A whole file mapped from local disk, counted, over a budget of 0.
-        //  - the pass drops it from the cache with its count, and keeps its file on disk, still
-        //    counted in the disk budget;
-        //  - its disk record is stamped in the records' clock (time since the unix epoch);
-        //  - the next open maps it again from disk, with no download.
-        // This test pins that dropping metadata never costs a download or skews disk eviction.
+    async fn a_mapped_file_is_not_counted_and_never_leaves() {
+        // A whole file mapped from local disk, over a budget of 0, the process short of memory.
+        //  - counting it counts nothing;
+        //  - the pass keeps it, and the disk budget still matches what is on disk.
+        // This test pins that the budget covers only files that can leave.
         let (_dir, store) = store_with_budget(Some(0));
         let uri = SuperfileUri::new_v4();
         put_superfile(&store, &uri, tiny_superfile_bytes()).await;
         let (key, storage) = (uri.storage_path(), Arc::clone(&store.storage));
-        let load = || store.reader_synchronous_with_storage(&uri, &key, Arc::clone(&storage));
-        load().await.expect("load");
-        store.charge_heap_once(&uri, || ENTRY_BYTES);
-        let disk_bytes = store.current_bytes.load(Ordering::Acquire);
-        let before = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock");
-        store.heap_budget().release_over_budget();
-        assert!(!store.is_cached(&uri), "the file leaves the cache");
-        assert_eq!(store.heap_budget().charged(), 0);
-        assert!(store.cache_path(&uri).exists(), "its bytes stay on disk");
-        assert_eq!(store.current_bytes.load(Ordering::Acquire), disk_bytes);
-        let stamped = store.unindexed.get(&uri).expect("recorded").mtime_us;
-        assert!(
-            stamped >= before.as_micros() as u64,
-            "stamped in the records' clock"
-        );
-        store.assert_budget_consistent();
-        let fetches = store.stats().n_cold_fetches;
-        load().await.expect("reopen");
-        assert_eq!(
-            store.stats().n_cold_fetches,
-            fetches,
-            "mapped again, no download"
-        );
-        store.assert_budget_consistent();
-    }
-
-    #[tokio::test]
-    async fn a_mapped_copy_missing_its_vector_blob_never_leaves() {
-        // A vector file promoted to a mapped copy that leaves its vector blob on the block cache,
-        // counted, over a budget of 0.
-        // This test pins that the pass keeps it: its blob is still filling in, and its disk
-        // record could not describe the copy.
-        let (_dir, store) = test_store_with(|cfg| {
-            cfg.cold_fetch_mode = ColdFetchMode::LazyForegroundWithBackgroundFill;
-        });
-        store.use_heap_budget(HeapBudget::with_budget(Some(0)));
-        let uri = SuperfileUri::new_v4();
-        put_superfile(&store, &uri, tiny_vector_superfile_bytes()).await;
-        for intent in [ReadIntent::Stream, ReadIntent::Warm] {
-            store
-                .open_for_query(&uri, &uri.storage_path(), None, None, intent)
-                .await
-                .expect("open");
-        }
         store
-            .wait_until_mmap_promoted(&uri, PROMOTE_TIMEOUT)
+            .reader_synchronous_with_storage(&uri, &key, storage)
             .await
-            .expect("promote");
+            .expect("load");
         assert!(
-            store
-                .cached
-                .get(&uri)
-                .is_some_and(|e| e.block_source().is_some())
+            store.cached.get(&uri).is_some_and(|e| e.mmap().is_some()),
+            "mapped"
         );
-        store.charge_heap_once(&uri, || ENTRY_BYTES);
+        store.charge_heap(&uri, ENTRY_BYTES);
+        assert_eq!(store.heap_budget().charged(), 0, "not counted");
         store.heap_budget().release_over_budget();
-        assert!(
-            store.is_cached(&uri),
-            "a copy missing its vector blob stays"
-        );
-        assert_eq!(store.heap_budget().charged(), ENTRY_BYTES);
+        assert!(store.is_cached(&uri), "never leaves");
+        store.assert_budget_consistent();
     }
 }

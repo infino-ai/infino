@@ -858,8 +858,8 @@ pub(crate) mod test_support {
         ops::Range,
         os::unix::fs::MetadataExt,
         sync::{
-            Arc, Mutex,
-            atomic::{AtomicBool, Ordering},
+            Arc, Mutex, OnceLock,
+            atomic::{AtomicBool, AtomicU64, Ordering},
         },
         time::{Duration, Instant},
     };
@@ -879,7 +879,7 @@ pub(crate) mod test_support {
     use crate::{
         storage::{LocalFsStorageProvider, ObjectMeta, StorageError, StorageProvider},
         superfile::{
-            BytesLazyByteSource, LazyByteSource,
+            BytesLazyByteSource, LazyByteSource, SuperfileReader,
             builder::{BuilderOptions, SuperfileBuilder},
         },
         supertable::{
@@ -1018,6 +1018,26 @@ pub(crate) mod test_support {
             store.blocks_path(&uri),
             SourceLayout::default(),
         )
+    }
+
+    /// Cache `reader` for `uri` as a file held whole in memory, as a hybrid fill's first copy is
+    /// before it is written to disk and mapped.
+    pub(crate) fn cache_buffered(
+        store: &DiskCacheStore,
+        uri: SuperfileUri,
+        reader: Arc<SuperfileReader>,
+    ) {
+        store.cached.insert(
+            uri,
+            Arc::new(CachedEntry {
+                heap: OnceLock::new(),
+                reader,
+                residency: Residency::Buffered,
+                size_bytes: Arc::new(AtomicU64::new(0)),
+                accounting: EntryAccounting::Eager,
+                last_access_us: AtomicU64::new(store.now_us()),
+            }),
+        );
     }
 
     /// Block sizes older builds wrote at the head of their block indexes, which carry no magic

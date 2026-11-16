@@ -327,24 +327,25 @@ fn leaf_bytes(meta: &ParquetMetaData) -> Arc<[u64]> {
     bytes.into()
 }
 
-/// Count, once, what `entry`'s cached reader keeps decoded against its cache's budget: the parsed
-/// footer, and the scan footer when the reader keeps its own copy (one derived for this provider
-/// alone goes with the statement and is not counted).
+/// Count what `entry`'s cached reader keeps decoded against its cache's budget, each part once: the
+/// parsed footer, and the scan footer when the reader keeps its own copy, whichever statement first
+/// derives it (one derived for this statement alone goes with it and is not counted).
 fn charge_footer(
     disk_cache: Option<&Arc<DiskCacheStore>>,
     entry: &SuperfileEntry,
     prepared: &PreparedScanFile,
 ) {
-    // Once per reader: a warm statement pays one load per file, not a cache lookup.
-    if let Some(cache) = disk_cache.filter(|_| prepared.reader.first_charge()) {
-        cache.charge_heap_once(&entry.uri, || {
-            let parsed = prepared.reader.parquet_metadata();
-            let mut bytes = parsed.memory_size();
-            if !entry.scalar_stats.is_unavailable() && !Arc::ptr_eq(&parsed, &prepared.footer) {
-                bytes += prepared.footer.memory_size();
-            }
-            bytes as u64
-        });
+    let Some(cache) = disk_cache else { return };
+    let reader = &prepared.reader;
+    // Once per reader: a warm statement pays a load per file, not a cache lookup.
+    if reader.first_charge() {
+        cache.charge_heap(&entry.uri, reader.parquet_metadata().memory_size() as u64);
+    }
+    if !entry.scalar_stats.is_unavailable()
+        && reader.keeps_scan_footer(&prepared.footer)
+        && reader.first_scan_footer_charge()
+    {
+        cache.charge_heap(&entry.uri, prepared.footer.memory_size() as u64);
     }
 }
 
@@ -3619,7 +3620,7 @@ mod tests {
                 read_ahead::{PAGE_READ_THROUGH_BYTES, file_pruning, fixture, statistics_pruned},
                 sql::sql_session_context,
             },
-            reader_cache::disk::HeapBudget,
+            reader_cache::disk::{HeapBudget, test_support::cache_buffered},
         },
         test_helpers::{
             build_title_batch, default_supertable_options, default_tokenizer,
@@ -6548,18 +6549,16 @@ mod tests {
         assert_eq!(charged, parsed_bytes(&prepared), "the parsed footer alone");
     }
 
-    /// A file whose page index another path loaded first is counted at its first SQL scan.
+    /// A file mapped whole from local disk is not counted at its scan: it never leaves the cache.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_file_whose_page_index_a_search_loaded_is_charged_at_its_first_scan() {
-        // Three files whole in memory whose readers load their page index before any SQL, as a
-        // search's row fetch does, then one scan, which finds them resident.
-        // This test pins that such files still count against the budget.
+    async fn a_file_mapped_whole_is_not_counted_at_its_scan() {
+        // Three files loaded whole, so mapped from local disk, then one scan that finds them.
+        // This test pins that only files that can leave count against the budget.
         let budget = HeapBudget::with_budget(None);
         let (_storage, _cache_dir, cache, table, storage) = table_charged_to(budget);
         let reader = table.reader().expect("reader");
-        let mut footers = 0;
         for entry in &reader.manifest().superfiles {
-            let file = cache
+            cache
                 .reader_synchronous_with_storage(
                     &entry.uri,
                     &entry.storage_path(),
@@ -6567,18 +6566,76 @@ mod tests {
                 )
                 .await
                 .expect("load whole");
-            footers += file
-                .parquet_metadata_with_page_index()
-                .await
-                .expect("page index")
-                .memory_size() as u64;
         }
-        assert_eq!(budget.charged(), 0, "nothing charged before SQL");
         let _done = scan_all(statement_over(&table, &reader)).await;
+        assert_eq!(budget.charged(), 0, "nothing counted");
+    }
+
+    /// A file held whole in memory, found resident by its first scan, is counted then: it can leave.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_file_held_whole_in_memory_is_counted_at_its_first_scan() {
+        // Three files cached whole in memory (as a hybrid fill's first copy is, before it is
+        // mapped) whose readers load their page index before any SQL, as a search's row fetch
+        // does, then one scan, which finds them resident.
+        // This test pins that the resident files that can leave count against the budget.
+        let budget = HeapBudget::with_budget(None);
+        let (_storage, _cache_dir, cache, table, storage) = table_charged_to(budget);
+        let reader = table.reader().expect("reader");
+        let mut files = Vec::new();
+        for entry in &reader.manifest().superfiles {
+            let (bytes, _) = storage.get(&entry.storage_path()).await.expect("get");
+            let file = Arc::new(SuperfileReader::open(bytes).expect("open"));
+            file.parquet_metadata_with_page_index()
+                .await
+                .expect("page index");
+            cache_buffered(&cache, entry.uri, Arc::clone(&file));
+            files.push(file);
+        }
+        assert_eq!(budget.charged(), 0, "nothing counted before SQL");
+        let _done = scan_all(statement_over(&table, &reader)).await;
+        let footers: u64 = files
+            .iter()
+            .map(|file| file.parquet_metadata().memory_size() as u64)
+            .sum();
+        assert_eq!(budget.charged(), footers, "counted at the first scan");
+    }
+
+    /// A scan footer a reader keeps is counted when a statement first derives it, even after an
+    /// earlier statement counted the parsed footer without it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_scan_footer_kept_after_the_first_scan_is_counted_when_derived() {
+        // The NaN table's NaN file behind one cache: first prepared with its statistics unreadable
+        // (the parsed footer alone is counted), then by a second statement that reads them and
+        // keeps a derived scan footer on the same reader.
+        // This test pins that a footer kept later is counted, not left out by the first count.
+        let dir = TempDir::new().expect("tempdir");
+        drop(nan_table(&dir));
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let budget = HeapBudget::with_budget(Some(u64::MAX));
+        let (_cache_dir, _cache, table) = opened_charged_to(nan_table_options(storage), budget);
+        let first = provider_of(&table);
+        let nan = first
+            .manifest()
+            .superfiles
+            .iter()
+            .find(|entry| entry.n_docs == NAN_FILE_ROWS as u64)
+            .map(|entry| SuperfileEntry::clone(entry))
+            .expect("the NaN superfile");
+        let mut blind = nan.clone();
+        blind.scalar_stats = ScalarStats::Unavailable;
+        let (prepared, parsed) = charged_preparing(&first, budget, Arc::new(blind)).await;
+        assert_eq!(parsed, parsed_bytes(&prepared), "the parsed footer alone");
+        let second = provider_of(&table);
+        let (kept, more) = charged_preparing(&second, budget, Arc::new(nan)).await;
+        assert!(
+            !Arc::ptr_eq(&kept.footer, &kept.reader.parquet_metadata()),
+            "kept, derived"
+        );
         assert_eq!(
-            budget.charged(),
-            footers,
-            "charged its footers at the first scan"
+            more,
+            kept.footer.memory_size() as u64,
+            "the kept footer, when derived"
         );
     }
 }

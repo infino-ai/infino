@@ -270,6 +270,9 @@ pub struct SuperfileReader {
     scan_shape: OnceLock<Arc<ScanShape>>,
     /// Whether a cache has been told what this reader keeps decoded (see [`Self::first_charge`]).
     charged: AtomicBool,
+    /// Whether a cache has been told about the scan footer this reader keeps (see
+    /// [`Self::first_scan_footer_charge`]).
+    scan_footer_charged: AtomicBool,
     /// The lazy byte source the reader was opened over, retained only
     /// on the [`open_lazy`] path. `None` on the eager [`open`] path
     /// (resident bytes already cover every range). Lets
@@ -971,6 +974,7 @@ impl SuperfileReader {
             scan_footer: OnceLock::new(),
             scan_shape: OnceLock::new(),
             charged: AtomicBool::new(false),
+            scan_footer_charged: AtomicBool::new(false),
             source: Some(source),
             schema,
             id_column,
@@ -1119,6 +1123,7 @@ impl SuperfileReader {
             scan_footer: OnceLock::new(),
             scan_shape: OnceLock::new(),
             charged: AtomicBool::new(false),
+            scan_footer_charged: AtomicBool::new(false),
             source: None,
             schema,
             id_column,
@@ -1221,6 +1226,18 @@ impl SuperfileReader {
     /// against a cache's budget. Later callers pay one load.
     pub(crate) fn first_charge(&self) -> bool {
         !self.charged.load(Ordering::Acquire) && !self.charged.swap(true, Ordering::AcqRel)
+    }
+
+    /// [`Self::first_charge`] for the scan footer this reader keeps, which a later statement may
+    /// derive after the first one counted the parsed footer.
+    pub(crate) fn first_scan_footer_charge(&self) -> bool {
+        !self.scan_footer_charged.load(Ordering::Acquire)
+            && !self.scan_footer_charged.swap(true, Ordering::AcqRel)
+    }
+
+    /// Whether `footer` is a scan footer this reader keeps apart from its parsed one.
+    pub(crate) fn keeps_scan_footer(&self, footer: &Arc<ParquetMetaData>) -> bool {
+        !Arc::ptr_eq(self.footer.load().parquet(), footer)
     }
 
     pub(crate) fn scan_footer<E>(
