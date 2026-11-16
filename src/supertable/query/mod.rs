@@ -36,6 +36,7 @@ pub mod hierarchical_iter;
 pub(crate) mod id_order;
 pub(crate) mod join_build_size;
 pub(crate) mod json_functions;
+pub(crate) mod late_documents;
 pub(crate) mod limit_stage;
 pub(crate) mod match_order;
 pub(crate) mod nan_bounds;
