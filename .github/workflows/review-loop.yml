@@ -112,7 +112,7 @@ jobs:
           refuse() { echo "go=false" >> "$GITHUB_OUTPUT"; echo "::notice::$1 has no write access; nothing to do"; exit 0; }
           if [ "$EVENT" = "issue_comment" ]; then
             # The command is the comment's first non-blank line, so leading blank lines do not hide it.
-            command=$(printf '%s\n' "$COMMENT" | awk 'NF { print $1; exit }')
+            command=$(printf '%s\n' "$COMMENT" | tr -d '\r' | awk 'NF { print $1; exit }')
             case "$command" in
               /autofix) mode=autofix;;
               *) echo "go=false" >> "$GITHUB_OUTPUT"; echo "not a loop command"; exit 0;;
