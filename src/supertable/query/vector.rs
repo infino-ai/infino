@@ -2198,6 +2198,44 @@ async fn lookup_user_placements_in(
     op_stats: &Option<Arc<OpStatsCollector>>,
     searched: impl Fn(&SuperfileEntry) -> bool,
 ) -> Result<Vec<Option<(Arc<SuperfileEntry>, u32)>>, QueryError> {
+    lookup_placements_where(manifest, user_row_ids, op_stats, searched, |_, _| true).await
+}
+
+/// Each of `user_row_ids` placed at the row a scan read it from: a superfile
+/// of `scanned`, at a row that superfile's bitmap there does not delete.
+/// An updated row's id is in two superfiles, the old copy deleted, so the
+/// deletes the scan skipped pick the copy it returned. `None` for an id no
+/// such row holds.
+pub(crate) async fn lookup_scanned_placements(
+    manifest: &ManifestSnapshot,
+    user_row_ids: &[i128],
+    op_stats: &Option<Arc<OpStatsCollector>>,
+    scanned: &HashMap<SuperfileUri, Arc<RoaringBitmap>>,
+) -> Result<Vec<Option<(Arc<SuperfileEntry>, u32)>>, QueryError> {
+    lookup_placements_where(
+        manifest,
+        user_row_ids,
+        op_stats,
+        |entry| scanned.contains_key(&entry.uri),
+        |entry, local| {
+            scanned
+                .get(&entry.uri)
+                .is_some_and(|deleted| !deleted.contains(local))
+        },
+    )
+    .await
+}
+
+/// [`lookup_user_placements_in`], placing an id only at a row `live`
+/// accepts; an id whose row in one superfile it refuses is looked for in
+/// the next.
+async fn lookup_placements_where(
+    manifest: &ManifestSnapshot,
+    user_row_ids: &[i128],
+    op_stats: &Option<Arc<OpStatsCollector>>,
+    searched: impl Fn(&SuperfileEntry) -> bool,
+    live: impl Fn(&SuperfileEntry, u32) -> bool,
+) -> Result<Vec<Option<(Arc<SuperfileEntry>, u32)>>, QueryError> {
     if user_row_ids.is_empty() {
         return Ok(Vec::new());
     }
@@ -2244,7 +2282,9 @@ async fn lookup_user_placements_in(
                         user_row_ids[index]
                     ))
                 })?;
-                placements[index] = Some((Arc::clone(&entry), local));
+                if live(&entry, local) {
+                    placements[index] = Some((Arc::clone(&entry), local));
+                }
             }
         } else {
             gapped.push(entry);
@@ -2324,6 +2364,7 @@ async fn lookup_user_placements_in(
             for &i in in_span(entry) {
                 if placements[i].is_none()
                     && let Some(local) = index.local_for(user_row_ids[i])
+                    && live(entry, local)
                 {
                     placements[i] = Some((Arc::clone(entry), local));
                 }

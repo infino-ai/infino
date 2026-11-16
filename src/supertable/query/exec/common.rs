@@ -28,9 +28,11 @@ use std::{
     time::Instant,
 };
 
-use arrow::compute::{concat_batches, filter_record_batch, interleave_record_batch, take};
+use arrow::compute::{
+    concat_batches, filter_record_batch, interleave, interleave_record_batch, take,
+};
 use arrow_array::{
-    ArrayRef, BooleanArray, Decimal128Array, Float32Array, RecordBatch, RecordBatchOptions,
+    Array, ArrayRef, BooleanArray, Decimal128Array, Float32Array, RecordBatch, RecordBatchOptions,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
@@ -1314,6 +1316,71 @@ async fn with_document_leaves(
         Arc::new(Schema::new(fields)),
         columns,
     )?)
+}
+
+/// `documents` rebuilt at `hits`, one array per document in hit order.
+///
+/// The hits are grouped by superfile. Each superfile reads its rows'
+/// skeletons and residuals, then only the columns those skeletons name
+/// ([`with_document_leaves`]), each column's pages decoded once for all of
+/// that superfile's rows ([`resolve_columns`]); the superfiles are read side
+/// by side, at most `superfiles_in_flight` at once.
+pub(crate) async fn resolve_documents(
+    reader: &SupertableReader,
+    hits: &[SuperfileHit],
+    documents: &[DocumentColumn],
+) -> DfResult<Vec<ArrayRef>> {
+    let mut groups: Vec<Vec<SuperfileHit>> = Vec::new();
+    let mut group_of: HashMap<SuperfileUri, usize> = HashMap::new();
+    let mut placement: Vec<(usize, usize)> = Vec::with_capacity(hits.len());
+    for hit in hits {
+        let group = *group_of.entry(hit.superfile).or_insert_with(|| {
+            groups.push(Vec::new());
+            groups.len() - 1
+        });
+        placement.push((group, groups[group].len()));
+        groups[group].push(*hit);
+    }
+    let table = reader.manifest().table_schema();
+    let mut stored: Vec<&str> = Vec::new();
+    for document in documents {
+        for name in [document.skeleton.as_str(), document.residual.as_str()] {
+            if !stored.contains(&name) {
+                stored.push(name);
+            }
+        }
+    }
+    let projected: Vec<&DocumentColumn> = documents.iter().collect();
+    let (table, stored, projected) = (&table, &stored, &projected);
+    // Collected before the join, as `resolve_columns` does its units.
+    let units: Vec<_> = groups
+        .iter()
+        .map(|hits| async move {
+            let resolved = resolve_columns(reader, hits, stored).await?;
+            let resolved = with_document_leaves(reader, hits, table, projected, resolved).await?;
+            projected
+                .iter()
+                .map(|document| {
+                    DocumentBinding::bind(table, document, &resolved.schema())
+                        .ok_or_else(|| {
+                            DataFusionError::from(QueryError::Internal(format!(
+                                "document column `{}`: its stored columns were not resolved",
+                                document.name
+                            )))
+                        })?
+                        .rebuild(&resolved)
+                })
+                .collect::<DfResult<Vec<ArrayRef>>>()
+        })
+        .collect();
+    let in_flight = reader.manifest().options.superfiles_in_flight;
+    let per_group = try_join_bounded(units, in_flight).await?;
+    (0..documents.len())
+        .map(|at| {
+            let arrays: Vec<&dyn Array> = per_group.iter().map(|g| g[at].as_ref()).collect();
+            Ok(interleave(&arrays, &placement)?)
+        })
+        .collect()
 }
 
 /// Hit → stable-`_id` translation by manifest arithmetic — the

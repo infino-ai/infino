@@ -19,13 +19,15 @@
 //! The scan cannot know which columns a row's skeleton names before it has
 //! read the skeleton, so it reads every column a document can draw on
 //! ([`TableSchema::document_leaf_columns`]). The search paths resolve a
-//! handful of rows and read only the columns their skeletons name.
+//! handful of rows and read only the columns their skeletons name, and so
+//! does [`LateDocumentExec`], which reads a document column after a plan's
+//! limit for the rows it keeps (`LateDocuments` moves the rebuild there).
 
 use std::{collections::HashMap, fmt, sync::Arc};
 
-use arrow::compute::cast;
+use arrow::compute::{cast, concat_batches};
 use arrow_array::{
-    Array, ArrayRef, LargeStringArray, RecordBatch, RecordBatchOptions,
+    Array, ArrayRef, Decimal128Array, LargeStringArray, RecordBatch, RecordBatchOptions,
     builder::LargeStringBuilder, cast::AsArray,
 };
 use arrow_schema::{DataType, Schema, SchemaRef};
@@ -37,25 +39,35 @@ use datafusion::{
     physical_plan::{
         DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, Partitioning,
         PlanProperties, SendableRecordBatchStream,
-        execution_plan::CardinalityEffect,
+        execution_plan::{CardinalityEffect, EmissionType},
         filter_pushdown::{
             ChildPushdownResult, FilterDescription, FilterPushdownPhase, FilterPushdownPropagation,
         },
         stream::RecordBatchStreamAdapter,
     },
 };
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt, future, stream};
+use roaring::RoaringBitmap;
 
 use crate::{
     document::{rebuild, render_value, slots},
-    supertable::schema::{DocumentColumn, FieldId, TableSchema},
+    supertable::{
+        handle::WeakReader,
+        manifest::SuperfileUri,
+        query::{
+            SuperfileHit,
+            exec::common::{live_reader, resolve_documents},
+            vector::lookup_scanned_placements,
+        },
+        schema::{DocumentColumn, FieldId, TableSchema},
+    },
 };
 
 /// Where the columns a document column draws on sit in a batch.
 #[derive(Debug, Clone)]
 pub(crate) struct DocumentBinding {
-    /// The document column's name, for errors.
-    name: String,
+    /// The document column.
+    document: DocumentColumn,
     /// The skeleton column's position.
     skeleton: usize,
     /// The residual column's position.
@@ -80,7 +92,7 @@ impl DocumentBinding {
             .filter(|(id, _)| *id != document.skeleton_id && *id != document.residual_id)
             .collect();
         Some(Self {
-            name: document.name.clone(),
+            document: document.clone(),
             skeleton: schema.index_of(&document.skeleton).ok()?,
             residual: schema.index_of(&document.residual).ok()?,
             leaves,
@@ -104,11 +116,16 @@ impl DocumentBinding {
                 render_value(batch.column(at).as_ref(), row, element)
             };
             let document = rebuild(skeletons.value(row), residual, value_of).map_err(|e| {
-                DataFusionError::Execution(format!("document column `{}`: {e}", self.name))
+                DataFusionError::Execution(format!("document column `{}`: {e}", self.document.name))
             })?;
             out.append_value(document);
         }
         Ok(Arc::new(out.finish()))
+    }
+
+    /// The document column this binding rebuilds.
+    pub(crate) fn document(&self) -> &DocumentColumn {
+        &self.document
     }
 }
 
@@ -177,7 +194,7 @@ pub(crate) fn stored_inputs<'a>(
 
 /// What one output column of a [`DocumentExec`] is.
 #[derive(Debug, Clone)]
-enum Output {
+pub(crate) enum Output {
     /// The input column at this position, passed through.
     Input(usize),
     /// A document column rebuilt from the input.
@@ -192,6 +209,10 @@ pub(crate) struct DocumentExec {
     schema: SchemaRef,
     outputs: Arc<Vec<Output>>,
     properties: Arc<PlanProperties>,
+    /// How the documents can be read after the rest of the plan instead
+    /// ([`LateDocumentExec`]); `None` when this scan's rows cannot be found
+    /// again by their `_id`.
+    late: Option<Arc<LateRows>>,
 }
 
 impl fmt::Debug for DocumentExec {
@@ -235,7 +256,30 @@ impl DocumentExec {
             schema,
             outputs: Arc::new(outputs),
             properties,
+            late: None,
         })
+    }
+
+    /// This rebuild, which the plan may move after its limit: `late` finds
+    /// the input's rows again by its `_id` column.
+    pub(crate) fn with_late(mut self, late: Arc<LateRows>) -> Self {
+        self.late = Some(late);
+        self
+    }
+
+    /// The scan the documents are rebuilt over.
+    pub(crate) fn input(&self) -> &Arc<dyn ExecutionPlan> {
+        &self.input
+    }
+
+    /// What each output column is.
+    pub(crate) fn outputs(&self) -> &[Output] {
+        &self.outputs
+    }
+
+    /// How the documents can be read late, if they can.
+    pub(crate) fn late(&self) -> Option<&Arc<LateRows>> {
+        self.late.as_ref()
     }
 }
 
@@ -306,7 +350,7 @@ impl DisplayAs for DocumentExec {
             .outputs
             .iter()
             .filter_map(|output| match output {
-                Output::Document(binding) => Some(binding.name.as_str()),
+                Output::Document(binding) => Some(binding.document.name.as_str()),
                 Output::Input(_) => None,
             })
             .collect();
@@ -344,6 +388,7 @@ impl ExecutionPlan for DocumentExec {
             schema: Arc::clone(&self.schema),
             outputs: Arc::clone(&self.outputs),
             properties,
+            late: self.late.clone(),
         }))
     }
 
@@ -418,6 +463,295 @@ impl ExecutionPlan for DocumentExec {
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             stream_schema,
             rebuilt,
+        )))
+    }
+}
+
+/// What reading a scan's documents after the rest of the plan needs: the
+/// table to read them from, and each row's place, found again from its
+/// `_id` among the superfiles the scan read, at a row the scan did not skip
+/// as deleted.
+pub(crate) struct LateRows {
+    /// The table, at the snapshot the scan read.
+    reader: WeakReader,
+    /// Each superfile the scan read, with the rows it skipped as deleted.
+    scanned: HashMap<SuperfileUri, Arc<RoaringBitmap>>,
+    /// The table's `_id` column, which the scan reads beside the rest.
+    row_id: String,
+}
+
+impl fmt::Debug for LateRows {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LateRows")
+            .field("superfiles", &self.scanned.len())
+            .field("row_id", &self.row_id)
+            .finish()
+    }
+}
+
+impl LateRows {
+    pub(crate) fn new(
+        reader: WeakReader,
+        scanned: HashMap<SuperfileUri, Arc<RoaringBitmap>>,
+        row_id: String,
+    ) -> Self {
+        Self {
+            reader,
+            scanned,
+            row_id,
+        }
+    }
+
+    /// The `_id` column the scan reads, by which each row is found again.
+    pub(crate) fn row_id(&self) -> &str {
+        &self.row_id
+    }
+
+    /// `batch` (`schema`'s columns, a placeholder at each of `documents`,
+    /// then each row's `_id`) under `schema`, each of `documents` rebuilt at
+    /// its row and the `_id` dropped.
+    async fn rebuild(
+        &self,
+        batch: &RecordBatch,
+        documents: &[(usize, DocumentColumn)],
+        schema: &SchemaRef,
+    ) -> DfResult<RecordBatch> {
+        let rows = batch.num_rows();
+        let ids = batch
+            .column(batch.num_columns() - 1)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .filter(|ids| ids.null_count() == 0)
+            .ok_or_else(|| {
+                DataFusionError::Internal(format!(
+                    "late documents: `{}` is not a non-null decimal column",
+                    self.row_id
+                ))
+            })?
+            .values()
+            .to_vec();
+        let reader = live_reader(&self.reader, "document column")?;
+        let placements =
+            lookup_scanned_placements(reader.manifest(), &ids, &reader.op_stats, &self.scanned)
+                .await?;
+        let hits = placements
+            .into_iter()
+            .zip(&ids)
+            .map(|(placement, &id)| {
+                let (entry, local) = placement.ok_or_else(|| {
+                    DataFusionError::Internal(format!(
+                        "late documents: no row the scan read has `{}` {id}",
+                        self.row_id
+                    ))
+                })?;
+                Ok(SuperfileHit {
+                    superfile: entry.uri,
+                    local_doc_id: local,
+                    score: 0.0,
+                    stable_id: Some(id),
+                })
+            })
+            .collect::<DfResult<Vec<_>>>()?;
+        // A document projected twice is read once.
+        let mut unique: Vec<DocumentColumn> = Vec::new();
+        for (_, document) in documents {
+            if !unique.iter().any(|d| d.name == document.name) {
+                unique.push(document.clone());
+            }
+        }
+        let rebuilt = resolve_documents(&reader, &hits, &unique).await?;
+        let columns = schema
+            .fields()
+            .iter()
+            .enumerate()
+            .map(
+                |(at, field)| match documents.iter().find(|(i, _)| *i == at) {
+                    Some((_, document)) => {
+                        let k = unique
+                            .iter()
+                            .position(|d| d.name == document.name)
+                            .expect("every document is in `unique`");
+                        Ok(cast(&rebuilt[k], field.data_type())?)
+                    }
+                    None => Ok(Arc::clone(batch.column(at))),
+                },
+            )
+            .collect::<DfResult<Vec<_>>>()?;
+        Ok(RecordBatch::try_new_with_options(
+            Arc::clone(schema),
+            columns,
+            &RecordBatchOptions::new().with_row_count(Some(rows)),
+        )?)
+    }
+}
+
+/// The second read of a document column: above the plan's last limit or
+/// top-k, its rows' documents rebuilt from just those rows.
+///
+/// ```text
+///   LateDocumentExec   source ← rebuilt at each row's `_id`
+///          │
+///   GlobalLimitExec / SortExec TopK ...   (the rows that survive)
+///          │
+///   FilterExec ...                        (never reads `source`)
+///          │
+///   ProjectionExec     source ← NULL, _id#row ← _id
+///          │
+///   table scan         the other columns and `_id` only
+/// ```
+///
+/// Its input carries the output's columns, a placeholder at each document,
+/// then each row's `_id`. It gathers the input's rows (at most the limit),
+/// places each at the superfile and row the scan read it from
+/// ([`LateRows`]), and reads the documents at those rows alone
+/// ([`resolve_documents`]). Rows leave in the order they arrived; every
+/// column but the documents passes through.
+pub(crate) struct LateDocumentExec {
+    input: Arc<dyn ExecutionPlan>,
+    schema: SchemaRef,
+    /// Each rebuilt output column's position and document.
+    documents: Arc<Vec<(usize, DocumentColumn)>>,
+    late: Arc<LateRows>,
+    properties: Arc<PlanProperties>,
+}
+
+impl fmt::Debug for LateDocumentExec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LateDocumentExec")
+            .field("schema", &self.schema)
+            .finish()
+    }
+}
+
+impl LateDocumentExec {
+    /// `replaced`'s output over `input`, which carries `replaced`'s columns,
+    /// a placeholder at each of `documents`, and then each row's `_id`.
+    pub(crate) fn try_new(
+        input: Arc<dyn ExecutionPlan>,
+        replaced: &Arc<dyn ExecutionPlan>,
+        documents: Vec<(usize, DocumentColumn)>,
+        late: Arc<LateRows>,
+    ) -> DfResult<Self> {
+        let schema = replaced.schema();
+        let input_schema = input.schema();
+        if input_schema.fields().len() != schema.fields().len() + 1 {
+            return Err(DataFusionError::Internal(format!(
+                "LateDocumentExec: input has {} columns for {} out",
+                input_schema.fields().len(),
+                schema.fields().len()
+            )));
+        }
+        // Gathers its input before it emits.
+        let properties = Arc::new(PlanProperties::new(
+            replaced.equivalence_properties().clone(),
+            input.output_partitioning().clone(),
+            EmissionType::Final,
+            replaced.boundedness(),
+        ));
+        Ok(Self {
+            input,
+            schema,
+            documents: Arc::new(documents),
+            late,
+            properties,
+        })
+    }
+}
+
+impl DisplayAs for LateDocumentExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let documents: Vec<&str> = self
+            .documents
+            .iter()
+            .map(|(_, document)| document.name.as_str())
+            .collect();
+        write!(f, "LateDocumentExec: rebuild=[{}]", documents.join(", "))
+    }
+}
+
+impl ExecutionPlan for LateDocumentExec {
+    fn name(&self) -> &'static str {
+        "LateDocumentExec"
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        mut children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        if children.len() != 1 {
+            return Err(DataFusionError::Internal(format!(
+                "LateDocumentExec requires exactly one child; got {}",
+                children.len()
+            )));
+        }
+        Ok(Arc::new(Self {
+            input: children.swap_remove(0),
+            schema: Arc::clone(&self.schema),
+            documents: Arc::clone(&self.documents),
+            late: Arc::clone(&self.late),
+            properties: Arc::clone(&self.properties),
+        }))
+    }
+
+    fn maintains_input_order(&self) -> Vec<bool> {
+        vec![true]
+    }
+
+    fn cardinality_effect(&self) -> CardinalityEffect {
+        CardinalityEffect::Equal
+    }
+
+    /// The input's row count and the passed-through columns' statistics;
+    /// nothing for a rebuilt document column.
+    fn partition_statistics(&self, partition: Option<usize>) -> DfResult<Arc<Statistics>> {
+        let input = self.input.partition_statistics(partition)?;
+        let column_statistics = (0..self.schema.fields().len())
+            .map(|at| match self.documents.iter().any(|(i, _)| *i == at) {
+                true => ColumnStatistics::new_unknown(),
+                false => input
+                    .column_statistics
+                    .get(at)
+                    .cloned()
+                    .unwrap_or_else(ColumnStatistics::new_unknown),
+            })
+            .collect();
+        Ok(Arc::new(Statistics {
+            num_rows: input.num_rows,
+            total_byte_size: input.total_byte_size,
+            column_statistics,
+        }))
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> DfResult<SendableRecordBatchStream> {
+        let input = self.input.execute(partition, context)?;
+        let input_schema = self.input.schema();
+        let schema = Arc::clone(&self.schema);
+        let documents = Arc::clone(&self.documents);
+        let late = Arc::clone(&self.late);
+        let rebuilt = async move {
+            let batches: Vec<RecordBatch> = input.try_collect().await?;
+            let batch = concat_batches(&input_schema, &batches)?;
+            if batch.num_rows() == 0 {
+                return Ok(None);
+            }
+            late.rebuild(&batch, &documents, &schema).await.map(Some)
+        };
+        let batches = stream::once(rebuilt).filter_map(|batch| future::ready(batch.transpose()));
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(&self.schema),
+            batches,
         )))
     }
 }

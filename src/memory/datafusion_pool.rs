@@ -48,6 +48,7 @@ use crate::{
     supertable::query::{
         id_order::IdOrderUnderTopK,
         join_build_size::RightSizeJoinBuild,
+        late_documents::LateDocuments,
         limit_stage::StageLimitGathers,
         read_ahead_rule::ReadAheadOff,
         sorted_root::{KeepSortedRoot, OrderUnderScalarSubquery},
@@ -183,6 +184,9 @@ pub(crate) fn budgeted_session_context(
     //    earlier onto the probe side. It copies build columns whose buffers
     //    are much larger than their rows, so the join is charged for the rows
     //    it keeps.
+    //  - `LateDocuments` after DataFusion's rules, once limits and top-ks are
+    //    placed, to read a document column after the limit that keeps its
+    //    rows; before ours below, which then see its plain nodes.
     //  - `KeepSortedRoot` after DataFusion's rules, to remove the round-robin
     //    repartition that `EnforceDistribution` adds above a sorted result,
     //    which would return an `ORDER BY` out of order.
@@ -196,6 +200,7 @@ pub(crate) fn budgeted_session_context(
     rules.insert(1, Arc::new(IdOrderUnderTopK));
     rules.insert(2, Arc::new(OrderUnderScalarSubquery));
     rules.push(Arc::new(RightSizeJoinBuild));
+    rules.push(Arc::new(LateDocuments));
     rules.push(Arc::new(KeepSortedRoot));
     rules.push(Arc::new(StageLimitGathers));
     rules.push(Arc::new(ReadAheadOff));

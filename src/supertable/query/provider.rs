@@ -122,6 +122,7 @@ use crate::{
     supertable::{
         SuperfileEntry, SupertableReader,
         error::QueryError,
+        handle::WeakReader,
         manifest::{
             ColumnStats, ManifestSnapshot, SuperfileUri, add_sum_arrays, hll::HllSketch,
             list::ScalarValueCounts, load_section_groups, load_section_groups_blocking,
@@ -142,7 +143,7 @@ use crate::{
                     BoundPredicate, PushedPredicate, read_file_row_group, take_file_columns,
                     unqualified,
                 },
-                document_exec::{DocumentExec, stored_inputs},
+                document_exec::{DocumentExec, LateRows, stored_inputs},
                 metered_exec::MeteredExec,
             },
             fts::{
@@ -523,6 +524,10 @@ pub(crate) struct SupertableProvider {
     /// The statistics of superfiles' deleted rows, kept for the table (see
     /// [`DeletedStatsCache`]).
     deleted_stats: Arc<DeletedStatsCache>,
+    /// The table, for reading a document column after the rest of a plan
+    /// ([`LateRows`]). Weak: the provider lives in a session the table
+    /// caches.
+    reader: WeakReader,
 }
 
 /// What [`SupertableProvider::count_range`] carries: the column, its id
@@ -640,6 +645,7 @@ impl SupertableProvider {
             count_range: None,
             read_rows: None,
             deleted_stats: Arc::default(),
+            reader: WeakReader::from_reader(reader),
         }
     }
 
@@ -814,6 +820,7 @@ impl SupertableProvider {
             count_range: self.count_range.clone(),
             read_rows: self.read_rows.clone(),
             deleted_stats: Arc::clone(&self.deleted_stats),
+            reader: self.reader.clone(),
         }
     }
 
@@ -2787,6 +2794,13 @@ impl TableProvider for SupertableProvider {
     /// any other goes straight to [`Self::scan_stored`]. A filter on a
     /// document column never reaches here (`supports_filters_pushdown`), so
     /// it runs above the rebuild.
+    ///
+    /// The scan also reads `_id`, and the rebuild carries what finds each
+    /// row again from it ([`LateRows`]): the superfiles the scan read and
+    /// the rows it skipped as deleted. A plan that only filters, sorts and
+    /// limits on other columns then reads the documents after its limit
+    /// instead (`LateDocuments`). A scan of chosen rows, deleted ones
+    /// included (`reading_rows`), keeps the rebuild here.
     async fn scan(
         &self,
         state: &dyn Session,
@@ -2802,17 +2816,37 @@ impl TableProvider for SupertableProvider {
         let output = projected_schema(&self.schema, projection)?;
         let wanted: Vec<&str> = output.fields().iter().map(|f| f.name().as_str()).collect();
         let leaves = table.document_leaf_columns();
-        let Some(inputs) = stored_inputs(&wanted, &documents, &leaves) else {
+        let Some(mut inputs) = stored_inputs(&wanted, &documents, &leaves) else {
             return self.scan_stored(state, projection, filters, limit).await;
         };
+        let late = self.read_rows.is_none();
+        let row_id = self.manifest.options.id_column.as_str();
+        if late && !inputs.contains(&row_id) {
+            inputs.push(row_id);
+        }
         let inner = inputs
             .iter()
             .map(|name| self.schema.index_of(name))
             .collect::<Result<Vec<_>, _>>()?;
+        let mut scanned = Vec::new();
         let scan = self
-            .scan_stored(state, Some(&inner), filters, limit)
+            .scan_stored_into(
+                state,
+                Some(&inner),
+                filters,
+                limit,
+                late.then_some(&mut scanned),
+            )
             .await?;
-        Ok(Arc::new(DocumentExec::try_new(scan, output, &table)?))
+        let rebuild = DocumentExec::try_new(scan, output, &table)?;
+        Ok(Arc::new(match late {
+            true => rebuild.with_late(Arc::new(LateRows::new(
+                self.reader.clone(),
+                scanned.into_iter().collect(),
+                row_id.to_owned(),
+            ))),
+            false => rebuild,
+        }))
     }
 }
 
@@ -2825,6 +2859,20 @@ impl SupertableProvider {
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
+    ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        self.scan_stored_into(state, projection, filters, limit, None)
+            .await
+    }
+
+    /// [`Self::scan_stored`], adding to `scanned` each superfile the scan
+    /// reads with the rows it skips there as deleted.
+    async fn scan_stored_into(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+        scanned: Option<&mut Vec<(SuperfileUri, Arc<RoaringBitmap>)>>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
         // Superfile selection via the shared two-tier prune (the same
         // path FTS search uses); see `select_survivors`. Survivors go to
@@ -3246,6 +3294,15 @@ impl SupertableProvider {
         )
         .instrument(predicates_span)
         .await?;
+
+        if let Some(scanned) = scanned {
+            scanned.extend(
+                survivor_entries
+                    .iter()
+                    .zip(&superfiles)
+                    .map(|(entry, seg)| (entry.uri, Arc::clone(&seg.tombstones))),
+            );
+        }
 
         // The pushdown predicates' df probes, dictionary walks and posting
         // walks, flushed through the same collector that meters this

@@ -9,6 +9,13 @@
 //! `token_match`, `sorted_search`), after compaction, after a rename of a
 //! column the documents draw on, and after the connection is reopened.
 //!
+//! A statement whose plan only filters, sorts and limits on other columns
+//! reads the document after its limit, for the rows the limit keeps
+//! (`LateDocumentExec`); one that reads the document below its limit, or
+//! has none, rebuilds it over the scan (`DocumentExec`). Both give the same
+//! documents, and the late read finds an updated row's new copy, never a
+//! deleted one, through compaction.
+//!
 //! The test is its own writer: it builds each skeleton by the rule
 //! [`infino::document`] gives a writer — a value becomes a slot when
 //! `render_value` of what the column holds equals the token as written,
@@ -16,13 +23,14 @@
 
 use std::sync::Arc;
 
-use arrow::compute::cast;
+use arrow::{compute::cast, util::pretty::pretty_format_batches};
 use arrow_array::{
     Array, ArrayRef, BooleanArray, Float64Array, Int64Array, LargeStringArray, RecordBatch,
     StringArray, TimestampMillisecondArray, builder::Int64Builder, builder::ListBuilder,
     builder::StringBuilder,
 };
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
+use datafusion::prelude::{col, lit};
 use infino::{
     BoolMode, Connection, FieldPatch, IndexSpec, OptimizeOptions, SchemaPatch, TableSchema,
     connect,
@@ -498,6 +506,196 @@ fn pick(expected: &[(String, Option<String>)], ids: &[&str]) -> Vec<(String, Opt
         .collect()
 }
 
+/// How a statement's plan rebuilds the document column.
+#[derive(Debug, PartialEq, Eq)]
+enum Rebuild {
+    /// After the limit, for the rows it keeps (`LateDocumentExec`), over a
+    /// scan that reads none of the document's stored columns.
+    Late,
+    /// Over the scan, for every row it reads (`DocumentExec`).
+    OverScan,
+}
+
+/// How `db` plans `query`'s rebuild of `source`.
+fn rebuild_of(db: &Connection, query: &str) -> Rebuild {
+    let batches = db
+        .query_sql(&format!("EXPLAIN {query}"))
+        .unwrap_or_else(|e| panic!("EXPLAIN {query}: {e}"));
+    let plan = pretty_format_batches(&batches).expect("format").to_string();
+    let late = plan.contains("LateDocumentExec: rebuild=[source]");
+    let over_scan = plan.contains(" DocumentExec: rebuild=[source]");
+    match (late, over_scan) {
+        (true, false) => {
+            assert!(
+                !plan.contains(&skeleton_column(SOURCE)),
+                "{query}: the late plan's scan reads no skeleton:\n{plan}"
+            );
+            Rebuild::Late
+        }
+        (false, true) => Rebuild::OverScan,
+        _ => panic!("{query}: one rebuild of source:\n{plan}"),
+    }
+}
+
+/// `query`'s `(doc_id, source)` rows, which `db` plans with a `rebuild`.
+fn rows_of(
+    db: &Connection,
+    query: &str,
+    rebuild: Rebuild,
+    label: &str,
+) -> Vec<(String, Option<String>)> {
+    assert_eq!(rebuild_of(db, query), rebuild, "{label}: {query}");
+    pairs(
+        &db.query_sql(query)
+            .unwrap_or_else(|e| panic!("{label}: {query}: {e}")),
+    )
+}
+
+/// The statements that read `source` after their limit, and the ones that
+/// must not, each giving exactly the documents of `expected`.
+fn assert_late(db: &Connection, expected: &[(String, Option<String>)], label: &str) {
+    let mut by_ts: Vec<(i64, &str)> = rows()
+        .iter()
+        .filter(|r| expected.iter().any(|(id, _)| id == r.doc_id))
+        .map(|r| (r.ts, r.doc_id))
+        .collect();
+    by_ts.sort();
+    let oldest: Vec<&str> = by_ts.iter().take(4).map(|(_, id)| *id).collect();
+    let newest: Vec<&str> = by_ts.iter().rev().take(PAGE).map(|(_, id)| *id).collect();
+
+    // A filtered `LIMIT`: any rows the filter keeps, each with its document.
+    let got = rows_of(
+        db,
+        &format!("SELECT doc_id, source FROM {TABLE} WHERE bytes >= 0 LIMIT {PAGE}"),
+        Rebuild::Late,
+        label,
+    );
+    assert_eq!(got.len(), PAGE, "{label}: filtered LIMIT");
+    for (id, doc) in &got {
+        assert_eq!(
+            Some(doc),
+            expected.iter().find(|(e, _)| e == id).map(|(_, d)| d),
+            "{label}: filtered LIMIT, {id}"
+        );
+    }
+
+    // `ORDER BY` another column with a `LIMIT`: a top-k.
+    let got = rows_of(
+        db,
+        &format!("SELECT doc_id, source FROM {TABLE} ORDER BY ts DESC LIMIT {PAGE}"),
+        Rebuild::Late,
+        label,
+    );
+    assert_eq!(got, pick(expected, &newest), "{label}: top-k");
+
+    // The document renamed and repeated by the projection, with an offset.
+    let got = rows_of(
+        db,
+        &format!(
+            "SELECT doc_id, source AS doc, source FROM {TABLE} \
+             ORDER BY ts LIMIT 2 OFFSET 1"
+        ),
+        Rebuild::Late,
+        label,
+    );
+    assert_eq!(
+        got,
+        pick(expected, &oldest[1..3]),
+        "{label}: renamed, offset"
+    );
+    let batches = db
+        .query_sql(&format!(
+            "SELECT doc_id, source AS doc, source FROM {TABLE} ORDER BY ts LIMIT 2 OFFSET 1"
+        ))
+        .expect("renamed");
+    assert_eq!(
+        strings(&batches, "doc"),
+        strings(&batches, SOURCE),
+        "{label}: a document projected twice"
+    );
+
+    // A subquery with the limit, sorted again outside it.
+    let mut inner: Vec<&str> = oldest.clone();
+    inner.sort();
+    let got = rows_of(
+        db,
+        &format!(
+            "SELECT doc_id, source FROM \
+             (SELECT doc_id, source FROM {TABLE} ORDER BY ts LIMIT 4) s ORDER BY doc_id"
+        ),
+        Rebuild::Late,
+        label,
+    );
+    assert_eq!(
+        got,
+        pick(expected, &inner),
+        "{label}: subquery with a limit"
+    );
+
+    // A filter on the document above the subquery's limit: the documents
+    // are read after the limit, below the filter, which sees them rebuilt.
+    let solo: Vec<&str> = inner
+        .iter()
+        .copied()
+        .filter(|id| {
+            expected
+                .iter()
+                .any(|(e, d)| e == id && d.as_ref().is_some_and(|d| d.contains("\"solo\"")))
+        })
+        .collect();
+    let got = rows_of(
+        db,
+        &format!(
+            "SELECT doc_id, source FROM \
+             (SELECT doc_id, source FROM {TABLE} ORDER BY ts LIMIT 4) s \
+             WHERE source LIKE '%\"solo\"%' ORDER BY doc_id"
+        ),
+        Rebuild::Late,
+        label,
+    );
+    assert_eq!(
+        got,
+        pick(expected, &solo),
+        "{label}: filter above the limit"
+    );
+
+    // A filter or a sort on the document below the limit reads it rebuilt.
+    let all_solo: Vec<&str> = expected
+        .iter()
+        .filter(|(_, d)| d.as_ref().is_some_and(|d| d.contains("\"solo\"")))
+        .map(|(id, _)| id.as_str())
+        .collect();
+    let got = rows_of(
+        db,
+        &format!(
+            "SELECT doc_id, source FROM {TABLE} WHERE source LIKE '%\"solo\"%' \
+             ORDER BY doc_id LIMIT 5"
+        ),
+        Rebuild::OverScan,
+        label,
+    );
+    assert_eq!(got, pick(expected, &all_solo), "{label}: filter on source");
+    let mut by_source: Vec<&(String, Option<String>)> = expected.iter().collect();
+    by_source.sort_by(|a, b| (a.1.is_none(), &a.1).cmp(&(b.1.is_none(), &b.1)));
+    let got = rows_of(
+        db,
+        &format!("SELECT doc_id, source FROM {TABLE} ORDER BY source LIMIT 2"),
+        Rebuild::OverScan,
+        label,
+    );
+    let first: Vec<(String, Option<String>)> = by_source.into_iter().take(2).cloned().collect();
+    assert_eq!(got, first, "{label}: sort on source");
+
+    // No limit: every scanned row is returned, rebuilt over the scan.
+    let got = rows_of(
+        db,
+        &format!("SELECT doc_id, source FROM {TABLE} ORDER BY doc_id"),
+        Rebuild::OverScan,
+        label,
+    );
+    assert_eq!(got, expected, "{label}: no limit");
+}
+
 /// Every read path gives back each original document exactly.
 fn assert_rebuilt(db: &Connection, expected: &[(String, Option<String>)], label: &str) {
     let sql = |q: &str| {
@@ -592,6 +790,8 @@ fn assert_rebuilt(db: &Connection, expected: &[(String, Option<String>)], label:
         vec![pick(expected, &["d0"])[0].1.clone()],
         "{label}: source alone"
     );
+
+    assert_late(db, expected, label);
 }
 
 #[test]
@@ -626,6 +826,22 @@ fn a_document_column_rebuilds_every_document_exactly_through_compaction_rename_a
         .query_sql(&format!("SELECT * FROM {TABLE} ORDER BY doc_id"))
         .expect("select after rename");
     assert_eq!(pairs(&all), expected, "after a rename");
+    let mut sized: Vec<(i64, &str)> = rows()
+        .iter()
+        .filter(|r| r.bytes.is_some_and(|b| b >= 0))
+        .map(|r| (r.ts, r.doc_id))
+        .collect();
+    sized.sort_by(|a, b| b.cmp(a));
+    let sized: Vec<&str> = sized.iter().take(PAGE).map(|(_, id)| *id).collect();
+    let got = rows_of(
+        &db,
+        &format!(
+            "SELECT doc_id, source FROM {TABLE} WHERE size >= 0 ORDER BY ts DESC LIMIT {PAGE}"
+        ),
+        Rebuild::Late,
+        "after a rename",
+    );
+    assert_eq!(got, pick(&expected, &sized), "after a rename: late page");
     let back = FieldPatch::named("bytes").with_id(ids.id_of("bytes").expect("bytes id"));
     db.apply_schema(TABLE, &SchemaPatch::new(vec![back]), None)
         .expect("rename back");
@@ -633,6 +849,57 @@ fn a_document_column_rebuilds_every_document_exactly_through_compaction_rename_a
     drop(db);
     let reopened = connect(path).expect("reconnect");
     assert_rebuilt(&reopened, &expected, "after a reopen");
+}
+
+/// `d1` as an update writes it: other values, the same id.
+fn updated_d1() -> Row {
+    use J::*;
+    Row {
+        path: Some("/var/log/b2.log"),
+        bytes: Some(7),
+        doc: Some(Obj(vec![
+            ("doc_id", Col("doc_id", r#""d1""#)),
+            ("@timestamp", Col("ts", r#""2023-01-01T10:00:00.000Z""#)),
+            ("bytes", Col("bytes", "7")),
+            ("path", Col("log.file.path", r#""/var/log/b2.log""#)),
+            ("updated", Lit("true")),
+        ])),
+        ..Row::new("d1", JAN_1 + 10 * HOUR)
+    }
+}
+
+#[test]
+fn a_late_read_finds_the_live_copy_of_an_updated_row_and_skips_a_deleted_one() {
+    let dir = TempDir::new().expect("tempdir");
+    let db = connect(dir.path().to_str().expect("utf-8 path")).expect("connect");
+    let mut expected = create(&db);
+    let ids = db.schema(TABLE).expect("schema");
+    let table = db.open_table(TABLE).expect("open");
+
+    // `d1` is rewritten into a superfile of its own, its old copy deleted
+    // where it was; `d4` is deleted.
+    let (batch, originals) = append_batch(&[updated_d1()], &ids);
+    table
+        .update(col("doc_id").eq(lit("d1")), &batch)
+        .expect("update d1");
+    table
+        .delete(col("doc_id").eq(lit("d4")))
+        .expect("delete d4");
+    let d1 = expected.iter_mut().find(|(id, _)| id == "d1").expect("d1");
+    d1.1 = originals[0].clone();
+    assert!(
+        d1.1.as_ref().is_some_and(|d| d.contains("updated")),
+        "the update changes the document"
+    );
+    expected.retain(|(id, _)| id != "d4");
+
+    assert_late(&db, &expected, "after an update and a delete");
+    // Compaction drops the deleted rows, so the merged superfile's ids have
+    // gaps and each row is found by its id in the superfile's `_id` column.
+    table
+        .optimize(&OptimizeOptions::default())
+        .expect("optimize");
+    assert_late(&db, &expected, "after an update, a delete and compaction");
 }
 
 #[test]
