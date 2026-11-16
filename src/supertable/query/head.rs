@@ -494,7 +494,7 @@ impl SupertableReader {
                 let guards: Vec<ColumnTypeGuard> = filter
                     .conditions
                     .iter()
-                    .map(|c| ColumnTypeGuard::new(&manifest, c.field))
+                    .map(|c| ColumnTypeGuard::new(manifest, c.field))
                     .collect();
                 manifest
                     .superfiles
@@ -569,18 +569,18 @@ impl SupertableReader {
         let mut fields: Vec<FieldId> = filter.conditions.iter().map(|c| c.field).collect();
         fields.sort_unstable();
         fields.dedup();
-        let entries: Vec<Arc<SuperfileEntry>> = manifest.superfiles.iter().cloned().collect();
+        let entries: Vec<Arc<SuperfileEntry>> = manifest.superfiles.to_vec();
         load_section_groups(&entries, &fields).await;
         let guards: Vec<ColumnTypeGuard> = filter
             .conditions
             .iter()
-            .map(|c| ColumnTypeGuard::new(&manifest, c.field))
+            .map(|c| ColumnTypeGuard::new(manifest, c.field))
             .collect();
         let mut candidates = entries
             .into_iter()
             .filter(|entry| !Self::holds_none(entry, filter, &guards));
         let context = Arc::new(WalkContext {
-            manifest: Arc::clone(&manifest),
+            manifest: Arc::clone(manifest),
             op_stats: self.op_stats.clone(),
             cache: process_decoded_column_cache(),
             schema_id: manifest.table_schema().schema_id(),
@@ -987,7 +987,7 @@ mod tests {
             let guards: Vec<_> = filter
                 .conditions
                 .iter()
-                .map(|c| ColumnTypeGuard::new(&manifest, c.field))
+                .map(|c| ColumnTypeGuard::new(manifest, c.field))
                 .collect();
             manifest
                 .superfiles
