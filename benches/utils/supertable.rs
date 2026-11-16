@@ -2575,13 +2575,19 @@ pub mod vector {
     // at 20 queries.
     const N_CORRECTNESS_QUERIES: usize = 100;
     const N_CALIBRATION_QUERIES: usize = 100;
-    /// Steady-state cache-budget multiple of the user index for the shared
-    /// vector consumer. The hidden per-cell IVF index is a second on-storage
-    /// copy of the vector payload, written by the drain *after* this consumer
-    /// opens — sizing from the user index alone leaves the cache ~2× under
-    /// budget post-drain, and the resulting evictions re-fetch on every query
-    /// (measured 62 GET/query on a supposedly warm consumer at 100K).
-    const SHARED_CONSUMER_CACHE_INDEX_FACTOR: u64 = 2;
+    /// Cache-budget multiple of the user index for the shared vector
+    /// consumer, which also drains. The budget holds the user index and the
+    /// hidden per-cell IVF index, a second on-storage copy of the vector
+    /// payload written by the drain *after* this consumer opens, and a
+    /// drain's temp files count against it too: they may take half of it,
+    /// and a drain needs its spill and as much again for the cells it
+    /// builds. With that room the whole table drains as one drain, so each
+    /// cell lands in one file and a cold probe of a cell is one GET. A
+    /// smaller budget drains in several, each leaving a file per cell until
+    /// compaction merges them, and one sized from the user index alone
+    /// evicts and re-fetches on every query (measured 62 GET/query on a
+    /// supposedly warm consumer at 100K).
+    const SHARED_CONSUMER_CACHE_INDEX_FACTOR: u64 = 6;
     // The default rows never override engine settings: they run
     // `VectorSearchOptions::default()` via the `ENGINE_DEFAULT` sentinel, so
     // the recorded numbers always measure shipped routing defaults.
