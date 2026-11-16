@@ -14,6 +14,7 @@
 use std::sync::atomic::AtomicBool;
 use std::{
     any::Any,
+    cmp::Reverse,
     sync::{
         Arc, Mutex, OnceLock, PoisonError, Weak,
         atomic::{AtomicU64, Ordering},
@@ -228,14 +229,17 @@ impl HeapBudget {
             list.retain(|cache| cache.strong_count() > 0);
             list.iter().filter_map(Weak::upgrade).collect()
         };
-        let mut oldest: Vec<(u64, usize, SuperfileUri)> = Vec::new();
+        // Each cache stamps accesses on its own clock, started when it was, so files are ranked by
+        // how long each has been idle, not by their stamps.
+        let mut oldest: Vec<(Reverse<u64>, usize, SuperfileUri)> = Vec::new();
         for (at, cache) in caches.iter().enumerate() {
+            let now_us = cache.now_us();
             for entry in cache.cached.iter() {
                 if entry.value().heap.get().is_some()
                     && cache.heap_reclaimable(entry.key(), entry.value())
                 {
                     let last = entry.value().last_access_us.load(Ordering::Acquire);
-                    oldest.push((last, at, *entry.key()));
+                    oldest.push((Reverse(now_us.saturating_sub(last)), at, *entry.key()));
                 }
             }
         }
@@ -384,6 +388,9 @@ mod tests {
     /// How long a test waits for the freeing thread before it fails.
     const FREE_DEADLINE: Duration = Duration::from_secs(10);
 
+    /// How far apart a test starts two caches' clocks and stamps their files.
+    const CLOCK_STEP: Duration = Duration::from_millis(10);
+
     /// A value whose drop reports the thread it ran on, once `go` lets it finish.
     struct Freed {
         go: Receiver<()>,
@@ -501,6 +508,27 @@ mod tests {
         budget.set_short_of_memory(true);
         budget.release_over_budget();
         assert!(!store.is_cached(&uri), "short of memory: dropped");
+    }
+
+    #[test]
+    fn files_of_two_caches_go_by_idle_time_not_by_their_caches_clocks() {
+        // Two caches over one budget of one file. The older cache's file was last used one step
+        // ago; the newer cache, started later, stamps its file now with a smaller number.
+        //  - the pass drops the older cache's file, idle longer, and keeps the one just used.
+        // This test pins that caches started at different times are ranked on one scale.
+        let budget = HeapBudget::with_budget(Some(ENTRY_BYTES));
+        let (_older_dir, older) = test_store();
+        older.use_heap_budget(budget);
+        thread::sleep(2 * CLOCK_STEP);
+        let idle = charged_entry(&older, older.now_us());
+        let (_newer_dir, newer) = test_store();
+        newer.use_heap_budget(budget);
+        thread::sleep(CLOCK_STEP);
+        let hot = charged_entry(&newer, newer.now_us());
+        budget.release_over_budget();
+        assert!(!older.is_cached(&idle), "the file idle longer goes");
+        assert!(newer.is_cached(&hot), "the file just used stays");
+        assert_eq!(budget.charged(), ENTRY_BYTES);
     }
 
     #[test]
