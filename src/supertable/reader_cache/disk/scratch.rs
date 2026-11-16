@@ -16,9 +16,13 @@
 //! leaves both behind with the lock free, which is how the next store to
 //! open tells the folder is no one's and removes it. A folder whose lock is
 //! held belongs to a live store, in this process or another, and is kept.
+//!
+//! On a filesystem without file locks a store keeps no lock file, so its
+//! folder is never taken for an exited process's; it is removed when the
+//! store is dropped and stays behind if the process dies first.
 
 use std::{
-    fs::{self, File},
+    fs::{self, File, TryLockError},
     io,
     path::{Path, PathBuf},
     process,
@@ -40,6 +44,10 @@ const LOCK_SUFFIX: &str = ".lock";
 /// its `run-` name, so a sweep never sees an unlocked lock of a live store.
 const NEW_LOCK_PREFIX: &str = ".new-";
 
+/// How many times a store tries to make its lock file. A sweep in another
+/// process can hold or remove the file for a moment while it is being made.
+const LOCK_ATTEMPTS: usize = 3;
+
 /// Numbers the `run-` folders of the stores this process opens.
 static NEXT_RUN: AtomicU64 = AtomicU64::new(0);
 
@@ -53,8 +61,9 @@ pub(super) fn scratch_root(cache_root: &Path) -> PathBuf {
 pub(super) struct RunScratch {
     dir: PathBuf,
     lock_path: PathBuf,
-    /// Holds the lock that marks the folder as a live store's.
-    _lock: File,
+    /// Holds the lock that marks the folder as a live store's. `None` on a
+    /// filesystem without file locks.
+    _lock: Option<File>,
 }
 
 impl RunScratch {
@@ -69,10 +78,7 @@ impl RunScratch {
             NEXT_RUN.fetch_add(1, Ordering::Relaxed)
         );
         let lock_path = scratch.join(format!("{name}{LOCK_SUFFIX}"));
-        let new_lock_path = scratch.join(format!("{NEW_LOCK_PREFIX}{name}{LOCK_SUFFIX}"));
-        let lock = File::create(&new_lock_path)?;
-        lock.try_lock().map_err(io::Error::from)?;
-        fs::rename(&new_lock_path, &lock_path)?;
+        let lock = create_lock(scratch, &name, &lock_path)?;
         let dir = scratch.join(name);
         fs::create_dir_all(&dir)?;
         Ok(Self {
@@ -98,23 +104,59 @@ impl Drop for RunScratch {
     }
 }
 
+/// Make the lock file at `lock_path` and return it locked, or `None` when
+/// the filesystem has no file locks. The file is locked under a `.new-` name
+/// and then renamed, so a sweep never sees it unlocked under its `run-`
+/// name.
+fn create_lock(scratch: &Path, name: &str, lock_path: &Path) -> io::Result<Option<File>> {
+    let new_lock_path = scratch.join(format!("{NEW_LOCK_PREFIX}{name}{LOCK_SUFFIX}"));
+    for _ in 0..LOCK_ATTEMPTS {
+        let lock = File::create(&new_lock_path)?;
+        match lock.try_lock() {
+            Ok(()) => {}
+            // A sweep is looking at the file and may remove it.
+            Err(TryLockError::WouldBlock) => continue,
+            Err(TryLockError::Error(error)) => {
+                tracing::debug!(
+                    path = %scratch.display(),
+                    %error,
+                    "no file locks here; temporary files left by a crash will not be removed"
+                );
+                let _ = fs::remove_file(&new_lock_path);
+                return Ok(None);
+            }
+        }
+        match fs::rename(&new_lock_path, lock_path) {
+            Ok(()) => return Ok(Some(lock)),
+            // A sweep removed the file before it was locked.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    let _ = fs::remove_file(&new_lock_path);
+    Ok(None)
+}
+
 /// Delete every `run-` folder under `scratch` whose lock is free, meaning
-/// the process that made it is gone. Best-effort: a lock that cannot be
-/// opened or taken, and a folder that cannot be removed, are left for a
-/// later call.
+/// the process that made it is gone, and every lock file such a process
+/// left half-made. Best-effort: a lock that cannot be opened or taken, and
+/// a folder that cannot be removed, are left for a later call.
 fn remove_orphaned_runs(scratch: &Path) {
     let Ok(listing) = fs::read_dir(scratch) else {
         return;
     };
     for entry in listing.flatten() {
         let file_name = entry.file_name();
-        let Some(run) = file_name
+        let Some(locked_name) = file_name
             .to_str()
-            .filter(|name| name.starts_with(RUN_PREFIX))
             .and_then(|name| name.strip_suffix(LOCK_SUFFIX))
         else {
             continue;
         };
+        let half_made = locked_name.starts_with(NEW_LOCK_PREFIX);
+        if !half_made && !locked_name.starts_with(RUN_PREFIX) {
+            continue;
+        }
         let lock_path = entry.path();
         let Ok(lock) = File::open(&lock_path) else {
             continue;
@@ -122,6 +164,11 @@ fn remove_orphaned_runs(scratch: &Path) {
         if lock.try_lock().is_err() {
             continue;
         }
+        if half_made {
+            let _ = fs::remove_file(&lock_path);
+            continue;
+        }
+        let run = locked_name;
         let dir = scratch.join(run);
         match fs::remove_dir_all(&dir) {
             Ok(()) => tracing::info!(
@@ -185,6 +232,10 @@ mod tests {
         fs::write(orphan.join("half-written"), b"bytes").expect("orphan file");
         let orphan_lock = scratch.join(format!("{RUN_PREFIX}orphan{LOCK_SUFFIX}"));
         fs::write(&orphan_lock, b"").expect("orphan lock");
+        // A process killed while making its lock leaves the half-made file.
+        let half_made_lock =
+            scratch.join(format!("{NEW_LOCK_PREFIX}{RUN_PREFIX}orphan{LOCK_SUFFIX}"));
+        fs::write(&half_made_lock, b"").expect("half-made lock");
         // Work a later process resumes lives beside the `run-` folders.
         let resumable = scratch.join("resumable");
         fs::create_dir_all(&resumable).expect("resumable folder");
@@ -196,6 +247,7 @@ mod tests {
 
         assert!(!orphan.exists(), "an exited process's folder is removed");
         assert!(!orphan_lock.exists(), "and its lock file");
+        assert!(!half_made_lock.exists(), "and a half-made lock file");
         assert!(live_dir.join("in-use").exists(), "a live store's is kept");
         assert!(resumable.exists(), "other folders are kept");
         assert_ne!(second.dir(), live_dir, "each store has its own folder");

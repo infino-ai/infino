@@ -1583,7 +1583,9 @@ pub struct StorageSettings {
     pub backend: StorageBackend,
     /// Local filesystem root when `backend: local_fs`.
     pub local_root: Option<PathBuf>,
-    /// Configurable root directory for temporary scratch files.
+    /// Root directory for temporary scratch files. A table with a disk
+    /// cache keeps its temporary files in the cache's folder instead, where
+    /// they share the disk sized for the table.
     pub scratch_root: Option<PathBuf>,
     /// Object-store bucket name (used by the `s3` backend).
     pub bucket: Option<String>,
