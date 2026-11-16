@@ -54,7 +54,7 @@
 //! `MIN`/`MAX` over a string column always comes back `LargeUtf8`.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     future::Future,
     sync::{Arc, Mutex, OnceLock, PoisonError},
     time::Instant,
@@ -84,8 +84,10 @@ use datafusion::{
     },
     functions_aggregate::{count::count_all, expr_fn::count},
     logical_expr::{
-        Expr, ExprFunctionExt, LogicalPlan, LogicalTableSource, TableScan, lit,
-        simplify::SimplifyContext, utils::split_conjunction,
+        BinaryExpr, Expr, ExprFunctionExt, LogicalPlan, LogicalTableSource, Operator, TableScan,
+        lit,
+        simplify::SimplifyContext,
+        utils::{conjunction, split_conjunction},
     },
     optimizer::simplify_expressions::ExprSimplifier,
 };
@@ -698,12 +700,14 @@ impl SupertableReader {
         if let Some(counts) = self.count_where_from_index(&predicates)? {
             return Ok(counts);
         }
-        // A predicate the statistics prove keeps no row (`x IS NOT NULL` on a
-        // column no superfile holds a value in, say) counts 0: when every one
-        // does, no statement is planned.
+        // A predicate the range index and the statistics prove keeps no row
+        // counts 0 (`x IS NOT NULL` on a column no superfile holds a value
+        // in, or an interval no row lies in `AND`ed to anything): when every
+        // one does, no statement is planned.
+        let provider = op_stats::suppressed(|| self.sql_provider()).reading_tombstones_once();
         let mut none = true;
         for predicate in &predicates {
-            if !self.keeps_no_row(predicate)? {
+            if !self.proven_empty(&provider, predicate)? {
                 none = false;
                 break;
             }
@@ -733,6 +737,77 @@ impl SupertableReader {
         let n = predicates.len();
         let aggregates = count_where_exprs(predicates).map_err(QueryError::DataFusion)?;
         count_where_row(&self.count_where_aggregate(None, aggregates)?, n)
+    }
+
+    /// Whether `predicate` keeps no row, by the range index and the
+    /// statistics alone: an `OR` when each side does, an `AND` when one of
+    /// its conditions does, or when its conditions on one range-indexed
+    /// column are an interval the index holds no row in. Any predicate the
+    /// statistics prove keeps no row ([`Self::keeps_no_row`]) does too.
+    /// `false` when nothing proves it.
+    fn proven_empty(
+        &self,
+        provider: &SupertableProvider,
+        predicate: &Expr,
+    ) -> Result<bool, QueryError> {
+        if let Expr::BinaryExpr(BinaryExpr {
+            left,
+            op: Operator::Or,
+            right,
+        }) = predicate
+        {
+            return Ok(self.proven_empty(provider, left)? && self.proven_empty(provider, right)?);
+        }
+        if self.keeps_no_row(predicate)? {
+            return Ok(true);
+        }
+        let conjuncts = split_conjunction(predicate);
+        // A column's conditions together: `ts >= a AND ts < b` is one
+        // interval, each half alone nearly the whole key space.
+        let mut by_column: BTreeMap<String, Vec<Expr>> = BTreeMap::new();
+        for condition in &conjuncts {
+            let refs = condition.column_refs();
+            let mut refs = refs.iter();
+            if let (Some(only), None) = (refs.next(), refs.next()) {
+                by_column
+                    .entry(only.name.clone())
+                    .or_default()
+                    .push((*condition).clone());
+            }
+        }
+        for conditions in by_column.into_values() {
+            let Some(interval) = conjunction(conditions) else {
+                continue;
+            };
+            let Some(range) = provider.counted_range(&interval) else {
+                continue;
+            };
+            let filters = split_conjunction(&interval)
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>();
+            let counted = self
+                .block_on(provider.indexed_rows(Some(&range), &filters))
+                .map_err(QueryError::DataFusion)?;
+            if counted == Some(0) {
+                return Ok(true);
+            }
+        }
+        if conjuncts.len() > 1 {
+            for condition in conjuncts {
+                if matches!(
+                    condition,
+                    Expr::BinaryExpr(BinaryExpr {
+                        op: Operator::Or,
+                        ..
+                    })
+                ) && self.proven_empty(provider, condition)?
+                {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
     }
 
     /// `aggregates` over the table's live rows, over those `filter` holds

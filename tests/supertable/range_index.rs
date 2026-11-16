@@ -280,6 +280,21 @@ fn assert_same_counts(db: &Connection, when: &str) {
             col("qty").gt(lit(0)).and(col("price").gt(lit(500.0))),
             "qty > 0 AND price > 500.0",
         ),
+        // An interval no row lies in, beside another condition and in each
+        // side of an `OR`: the range index proves the count 0.
+        (
+            col("qty")
+                .gt_eq(lit(1000))
+                .and(col("qty").lt(lit(2000)))
+                .and(col("price").gt(lit(0.0))),
+            "qty >= 1000 AND qty < 2000 AND price > 0.0",
+        ),
+        (
+            col("qty")
+                .lt(lit(-1000))
+                .or(col("qty").gt(lit(1000)).and(col("seq").lt(lit(5i64)))),
+            "qty < -1000 OR (qty > 1000 AND seq < 5)",
+        ),
     ];
     let exprs: Vec<_> = predicates.iter().map(|(expr, _)| expr.clone()).collect();
     let sql = format!(
