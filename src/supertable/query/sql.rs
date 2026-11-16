@@ -494,6 +494,19 @@ impl SupertableReader {
         if let Some(counts) = self.count_where_from_index(&predicates)? {
             return Ok(counts);
         }
+        // A predicate the statistics prove keeps no row (`x IS NOT NULL` on a
+        // column no superfile holds a value in, say) counts 0: when every one
+        // does, no statement is planned.
+        let mut none = true;
+        for predicate in &predicates {
+            if !self.keeps_no_row(predicate)? {
+                none = false;
+                break;
+            }
+        }
+        if none {
+            return Ok(vec![0; predicates.len()]);
+        }
         // A FILTER clause cannot hold a subquery: a predicate that reads
         // another relation is counted under its own WHERE.
         if predicates.iter().any(holds_subquery) {
