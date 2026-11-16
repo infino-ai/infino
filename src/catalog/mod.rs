@@ -2369,11 +2369,7 @@ mod tests {
     use std::{
         fs,
         path::{Path, PathBuf},
-        sync::{
-            Arc, Mutex, MutexGuard, PoisonError,
-            atomic::{AtomicBool, Ordering},
-            mpsc,
-        },
+        sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc},
         thread,
         time::{Duration, Instant},
     };
@@ -7740,18 +7736,23 @@ mod tests {
     #[derive(Default)]
     struct SlowStores {
         stores: Mutex<Vec<Arc<SlowStorage>>>,
-        /// Whether stores built from now on start with their reads held.
-        hold_new: AtomicBool,
+        /// Reads that stores built from now on start holding: those of an object whose path
+        /// contains this fragment, every read for `""`; none for `None`.
+        hold_new: Mutex<Option<String>>,
     }
 
     impl SlowStores {
         fn wrap(&self, inner: Arc<dyn StorageProvider>) -> Arc<dyn StorageProvider> {
             let slow = SlowStorage::wrap(inner, SLOW_READ);
-            if self.hold_new.load(Ordering::SeqCst) {
-                slow.hold_reads();
+            if let Some(fragment) = self.held_on_new().as_deref() {
+                slow.hold_reads_of(fragment);
             }
             self.lock().push(Arc::clone(&slow));
             slow
+        }
+
+        fn held_on_new(&self) -> MutexGuard<'_, Option<String>> {
+            self.hold_new.lock().unwrap_or_else(PoisonError::into_inner)
         }
 
         fn lock(&self) -> MutexGuard<'_, Vec<Arc<SlowStorage>>> {
@@ -7761,7 +7762,14 @@ mod tests {
         /// Hold the reads of every store built from now on, until
         /// [`Self::release_reads`].
         fn hold_new_stores(&self) {
-            self.hold_new.store(true, Ordering::SeqCst);
+            *self.held_on_new() = Some(String::new());
+        }
+
+        /// Hold the reads of objects whose path contains `fragment`, on every store built so far
+        /// and from now on, until [`Self::release_reads`].
+        fn hold_reads_of(&self, fragment: &str) {
+            *self.held_on_new() = Some(fragment.to_owned());
+            self.lock().iter().for_each(|s| s.hold_reads_of(fragment));
         }
 
         /// Hold the reads of every store built so far, until
@@ -7771,7 +7779,7 @@ mod tests {
         }
 
         fn release_reads(&self) {
-            self.hold_new.store(false, Ordering::SeqCst);
+            *self.held_on_new() = None;
             self.lock().iter().for_each(|s| s.release_reads());
         }
 
@@ -8018,6 +8026,10 @@ mod tests {
         let (conn, stores) = slow_cold_conn(dir.path(), cache.path());
         let cancel = QueryCancel::new();
 
+        // A sidecar is cached once read, so the first query's sidecar reads stay held until the
+        // second query has started its own: otherwise a busy runner can let the first finish them
+        // all before the second plans, and the second then reads none.
+        stores.hold_reads_of(SIDECAR);
         let cancelled = query_in_background(&conn, READ_EVERY_FILE, &cancel);
         wait_until("the first query reads a sidecar", || {
             stores.reads_of(SIDECAR) > 0
@@ -8028,6 +8040,7 @@ mod tests {
             stores.reads_of(SIDECAR) > sidecar_reads
         });
         cancel_and_expect_cancelled(&cancel, &cancelled);
+        stores.release_reads();
 
         let (result, _) = whole
             .recv_timeout(QUERY_DEADLINE)
