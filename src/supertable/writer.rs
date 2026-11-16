@@ -6953,29 +6953,34 @@ fn take_drain_sources(
     (taken, rows)
 }
 
-/// The sources a new drain epoch of `column` takes from `undrained` (sorted
-/// by `birth_version`): the oldest commits up to the row limit of
-/// [`drain_row_limit`], read from `options`, the scratch disk and, when the
-/// table has a disk cache, the room its budget has left for temp files.
-fn new_drain_epoch_sources(
-    options: &SupertableOptions,
-    column: &str,
-    undrained: Vec<Arc<SuperfileEntry>>,
-) -> Vec<Arc<SuperfileEntry>> {
-    let Some(spill_row_bytes) = drain_spill_row_bytes(options, column) else {
-        return undrained;
-    };
+/// The row limit of [`drain_row_limit`] for a drain of `column` starting
+/// now, read from `options`, the scratch disk and, when the table has a disk
+/// cache, the room its budget has left for temp files. `None` when nothing
+/// limits the drain.
+fn drain_row_limit_now(options: &SupertableOptions, column: &str) -> Option<(u64, DrainRowLimit)> {
+    let spill_row_bytes = drain_spill_row_bytes(options, column)?;
     let free_bytes = scratch_space(&drain_scratch_parent(options)).map(|(free, _)| free);
     let budget_room = options
         .disk_cache
         .as_ref()
         .map(|cache| cache.scratch_room());
-    let Some((limit, why)) = drain_row_limit(
+    drain_row_limit(
         options.drain_max_rows,
         free_bytes,
         budget_room,
         spill_row_bytes,
-    ) else {
+    )
+}
+
+/// The sources a new drain epoch of `column` takes from `undrained` (sorted
+/// by `birth_version`): the oldest commits up to the row limit of
+/// [`drain_row_limit_now`].
+fn new_drain_epoch_sources(
+    options: &SupertableOptions,
+    column: &str,
+    undrained: Vec<Arc<SuperfileEntry>>,
+) -> Vec<Arc<SuperfileEntry>> {
+    let Some((limit, why)) = drain_row_limit_now(options, column) else {
         return undrained;
     };
     let waiting_superfiles = undrained.len();
@@ -6993,6 +6998,54 @@ fn new_drain_epoch_sources(
         );
     }
     taken
+}
+
+/// Whether a recorded drain epoch over `recorded` (sorted by
+/// `birth_version`) is started over as a smaller one: it has finished
+/// nothing, and a drain starting now would take fewer commits. An epoch
+/// recorded when there was more room, or before drains were held to a row
+/// limit, could otherwise never finish, with every later commit waiting
+/// behind it. An epoch that uploaded a shard or spilled a batch is resumed
+/// as recorded.
+fn recorded_drain_starts_over(
+    options: &SupertableOptions,
+    column: &str,
+    checkpoint: &DrainRemoteCheckpoint,
+    recorded: &[Arc<SuperfileEntry>],
+) -> Result<bool, BuildError> {
+    if !checkpoint.completed_shards.is_empty() {
+        return Ok(false);
+    }
+    let Some((limit, why)) = drain_row_limit_now(options, column) else {
+        return Ok(false);
+    };
+    let mut oldest_first = recorded.to_vec();
+    oldest_first.sort_by_key(|source| source.birth_version);
+    let (fitting, fitting_rows) =
+        take_drain_sources(oldest_first, limit, drain_replica_target_factor());
+    if fitting.len() == recorded.len() {
+        return Ok(false);
+    }
+    // Read last: the common case, an epoch that fits, never needs it.
+    for scratch in [
+        drain_scratch_dir(options, &checkpoint.epoch_id),
+        legacy_drain_scratch_dir(&checkpoint.epoch_id),
+    ] {
+        if load_drain_local_checkpoint(&scratch, &checkpoint.epoch_id)?
+            .is_some_and(|local| local.batches_done > 0)
+        {
+            return Ok(false);
+        }
+    }
+    info!(
+        recorded_superfiles = recorded.len(),
+        fitting_superfiles = fitting.len(),
+        fitting_rows,
+        limit_rows = limit,
+        limit = why.label(),
+        "[supertable drain] the recorded drain has finished nothing and no longer fits the row limit; starting a smaller one"
+    );
+    Ok(true)
 }
 
 fn make_drain_batches(
@@ -7273,9 +7326,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
     let user_strategy = user_manifest.get_partition_strategy();
     let current_options_hash =
         options_hash::compute_options_hash(user_inner.options.as_ref(), &user_strategy).to_hex();
-    let (batches, mut remote_state) = if let Some(remote_state) =
-        load_drain_remote_checkpoint(&hidden_inner).await?
-    {
+    let resumed = if let Some(remote_state) = load_drain_remote_checkpoint(&hidden_inner).await? {
         // The recorded shard count, not this process's writer pool width,
         // decides the shards: the width follows the machine, and a drain
         // started on one machine is resumed by whichever one opens the table
@@ -7332,23 +7383,38 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             }
             selected.push(Arc::clone(entry));
         }
-        // The recorded layout, not the current `drain_batch_superfiles`,
-        // decides the batches: batch size is a tuning knob outside the options
-        // hash, and the epoch already committed to these batches.
-        let batches = drain_batches_from_layout(selected, &remote_state.checkpoint.batch_layout)?;
-        let epoch_id = drain_epoch_id(
-            &current_options_hash,
-            &remote_state.checkpoint.sources,
-            &remote_state.checkpoint.batch_layout,
-            remote_state.checkpoint.shard_count,
-            consolidate,
-        );
-        if epoch_id != remote_state.checkpoint.epoch_id {
-            return Err(BuildError::Store(
-                "drain checkpoint epoch hash is invalid".into(),
-            ));
+        if recorded_drain_starts_over(
+            &user_inner.options,
+            &column,
+            &remote_state.checkpoint,
+            &selected,
+        )? {
+            None
+        } else {
+            // The recorded layout, not the current `drain_batch_superfiles`,
+            // decides the batches: batch size is a tuning knob outside the
+            // options hash, and the epoch already committed to these batches.
+            let batches =
+                drain_batches_from_layout(selected, &remote_state.checkpoint.batch_layout)?;
+            let epoch_id = drain_epoch_id(
+                &current_options_hash,
+                &remote_state.checkpoint.sources,
+                &remote_state.checkpoint.batch_layout,
+                remote_state.checkpoint.shard_count,
+                consolidate,
+            );
+            if epoch_id != remote_state.checkpoint.epoch_id {
+                return Err(BuildError::Store(
+                    "drain checkpoint epoch hash is invalid".into(),
+                ));
+            }
+            Some((batches, remote_state))
         }
-        (batches, remote_state)
+    } else {
+        None
+    };
+    let (batches, mut remote_state) = if let Some(resumed) = resumed {
+        resumed
     } else {
         let mut selected: Vec<Arc<SuperfileEntry>> = sources
             .iter()
@@ -17480,6 +17546,117 @@ mod tests {
             .map(|s| s.n_docs)
             .sum();
         assert_eq!(hidden_rows, (COMMITS * COMMIT_AS_DRAIN_TEST_ROWS) as u64);
+    }
+
+    /// A drain recorded over more commits than a drain starting now would
+    /// take (recorded when there was more room, or with no row limit) and
+    /// with nothing finished is started over as a smaller one, so it cannot
+    /// wait for room it will never get. Once it has uploaded a shard or
+    /// spilled a batch it is resumed as recorded.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_recorded_drain_that_no_longer_fits_starts_over_smaller() {
+        const COMMITS: usize = 3;
+        let directory = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(directory.path()).expect("provider"));
+        let table = Supertable::create(
+            options_title_emb_serial(COMMIT_AS_DRAIN_TEST_DIM)
+                .with_storage(Arc::clone(&storage))
+                .with_drain_max_rows(COMMIT_AS_DRAIN_TEST_ROWS as u64),
+        )
+        .expect("create");
+        for _ in 0..COMMITS {
+            let mut writer = table.writer().expect("writer");
+            writer
+                .append(&build_axis_vector_batch(
+                    COMMIT_AS_DRAIN_TEST_ROWS,
+                    COMMIT_AS_DRAIN_TEST_DIM,
+                ))
+                .expect("append");
+            writer.commit().expect("commit");
+        }
+        let hidden = table
+            .inner()
+            .vector_index_table
+            .as_ref()
+            .expect("hidden table")
+            .clone();
+        let user_manifest = table.inner().manifest.load_full();
+        let mut sources = user_manifest
+            .get_all_superfiles_loaded()
+            .await
+            .expect("user sources");
+        sources.sort_by_key(|source| (source.birth_version, source.superfile_id));
+        let versions: Vec<u64> = sources.iter().map(|s| s.birth_version).collect();
+        assert_eq!(versions.len(), COMMITS);
+
+        // The record a drain with no row limit leaves: every commit, one batch.
+        let options = &table.inner().options;
+        let options_hash = options_hash::compute_options_hash(
+            options.as_ref(),
+            &user_manifest.get_partition_strategy(),
+        )
+        .to_hex();
+        let source_refs: Vec<DrainCheckpointSource> = sources
+            .iter()
+            .map(|entry| drain_checkpoint_source(entry))
+            .collect();
+        let batch_layout = drain_batch_layout(&make_drain_batches(sources.clone(), usize::MAX));
+        let shard_count = packed_cell_shard_count(&hidden.inner().options);
+        let checkpoint = DrainRemoteCheckpoint {
+            schema: DRAIN_CHECKPOINT_SCHEMA,
+            epoch_id: drain_epoch_id(
+                &options_hash,
+                &source_refs,
+                &batch_layout,
+                shard_count,
+                options.drain_consolidate,
+            ),
+            options_hash,
+            sources: source_refs,
+            batch_layout,
+            shard_count,
+            completed_shards: Vec::new(),
+        };
+        create_drain_remote_checkpoint(hidden.inner(), checkpoint.clone())
+            .await
+            .expect("record the drain");
+        let column = vector_index_column(table.inner()).expect("vector column");
+        let starts_over = |checkpoint: &DrainRemoteCheckpoint| {
+            recorded_drain_starts_over(options, &column, checkpoint, &sources).expect("decide")
+        };
+
+        // A shard already uploaded, or a batch already spilled, is kept.
+        let mut uploaded = checkpoint.clone();
+        uploaded.completed_shards.push(DrainRemoteShard {
+            shard_id: 0,
+            superfile_id: "uploaded".into(),
+            cell_counts: Vec::new(),
+        });
+        assert!(!starts_over(&uploaded));
+        let scratch = drain_scratch_dir(options, &checkpoint.epoch_id);
+        fs::create_dir_all(&scratch).expect("scratch");
+        let mut spilled = DrainLocalCheckpoint::new(checkpoint.epoch_id.clone());
+        spilled.batches_done = 1;
+        save_drain_local_checkpoint(&scratch, &spilled).expect("local checkpoint");
+        assert!(!starts_over(&checkpoint));
+        fs::remove_dir_all(&scratch).expect("remove scratch");
+        assert!(starts_over(&checkpoint));
+
+        drain_user_superfiles_to_hidden_cells(
+            Arc::clone(table.inner()),
+            Arc::clone(hidden.inner()),
+        )
+        .await
+        .expect("drain");
+        let drained = hidden.inner().manifest.load_full().get_drained_ranges();
+        for (i, version) in versions.iter().enumerate() {
+            assert_eq!(
+                drained.contains(*version),
+                i == 0,
+                "commit {i} (version {version})"
+            );
+        }
     }
 
     /// Compaction that runs while a row-limited drain is stopped partway must
