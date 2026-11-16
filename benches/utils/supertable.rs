@@ -4665,8 +4665,8 @@ pub mod vector {
                 // an undersized or unwarmed cache turns "warm p50" into
                 // silent object-store round-trips (measured: 196-330
                 // ms/query on the old second-table shape, whose cache was
-                // auto-sized before the drain added the hidden index it
-                // then queried). This window cannot promise 0 in total:
+                // sized before the drain added the hidden index it then
+                // queried). This window cannot promise 0 in total:
                 // it deliberately includes the per-query predicate
                 // resolution a caller pays, and the engine serves that
                 // with per-query posting reads today (the measured

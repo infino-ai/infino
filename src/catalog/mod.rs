@@ -2042,15 +2042,15 @@ fn build_disk_cache(
     };
     let table_root = cache_root.join(name);
     claim_table_cache(&table_root, location)?;
-    let mut cfg = DiskCacheConfig {
+    let cfg = DiskCacheConfig {
         cache_root: table_root.clone(),
+        disk_budget_bytes: options
+            .cache_budget_bytes
+            .unwrap_or_else(|| default_cache_budget(&table_root)),
         cold_fetch_mode: options.cold_fetch_mode.to_internal(),
         fill_memory_budget: Some(Arc::clone(memory_budget)),
         ..Default::default()
     };
-    cfg.disk_budget_bytes = options
-        .cache_budget_bytes
-        .unwrap_or_else(|| default_cache_budget(&table_root, cfg.disk_budget_bytes));
     let cache = DiskCacheStore::new_unpinned(Arc::clone(storage), cfg).map_err(|e| {
         if let DiskCacheError::Config(msg) = e {
             InfinoError::Config(msg)
@@ -2068,11 +2068,13 @@ fn build_disk_cache(
 
 /// The budget of a disk cache at `cache_root` whose connection set none:
 /// [`DEFAULT_CACHE_DISK_SHARE_PERCENT`] of the total size of the disk
-/// holding it, or `fallback` when the disk's size cannot be read.
-fn default_cache_budget(cache_root: &Path, fallback: u64) -> u64 {
+/// holding it, or the fixed default of [`DiskCacheConfig`] when the disk's
+/// size cannot be read.
+fn default_cache_budget(cache_root: &Path) -> u64 {
     match disk_space(cache_root) {
         Some((_, total)) if total > 0 => total / 100 * DEFAULT_CACHE_DISK_SHARE_PERCENT,
         _ => {
+            let fallback = DiskCacheConfig::default().disk_budget_bytes;
             warn!(
                 cache_root = %cache_root.display(),
                 budget_bytes = fallback,
