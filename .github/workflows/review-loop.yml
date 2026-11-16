@@ -111,10 +111,13 @@ jobs:
           }
           refuse() { echo "go=false" >> "$GITHUB_OUTPUT"; echo "::notice::$1 has no write access; nothing to do"; exit 0; }
           if [ "$EVENT" = "issue_comment" ]; then
-            # The command is a line whose first word is /autofix, in any case: on its own, with a note
-            # after it, or below one. GitHub's comment box ends lines with \r\n, and awk keeps the \r
-            # in the word, so it is dropped first. A quoted line ("> /autofix") or a mention inside a
-            # sentence does not start with the command, so neither starts a run.
+            # A run starts when a line of the comment begins with /autofix, in any case:
+            #   "/autofix"                        runs
+            #   "/Autofix please, it's flaky"     runs
+            #   "LGTM" then "/autofix" below it   runs
+            #   "> /autofix" (a quoted reply)     does not
+            #   "let's not /autofix this yet"     does not
+            # GitHub's comment box ends lines with \r\n and awk keeps the \r in a word, so it goes first.
             if [ -z "$(printf '%s\n' "$COMMENT" | tr -d '\r' | awk 'tolower($1) == "/autofix" { print; exit }')" ]; then
               echo "go=false" >> "$GITHUB_OUTPUT"; echo "not a loop command"; exit 0
             fi
