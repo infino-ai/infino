@@ -531,6 +531,15 @@ impl ColumnStats<'_> {
         Some(held)
     }
 
+    /// How many values the exact value table holds, read without building
+    /// it; `None` when the superfile carries no table.
+    pub(crate) fn value_table_len(&self) -> Option<usize> {
+        match self {
+            Self::Inline(agg) => agg.value_counts.as_ref().map(|t| t.entries().len()),
+            Self::Section(row) => row.value_table_array().map(|table| table.len()),
+        }
+    }
+
     /// Every statistic, in the decoded shape.
     pub fn stats(&self) -> ScalarStatsAgg {
         match self {

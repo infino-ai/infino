@@ -32,12 +32,17 @@
 //!   in for, whose row filter decodes those columns only for the rows that
 //!   pass.
 
-use std::{fmt, ops::Range, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+    ops::Range,
+    sync::Arc,
+};
 
 use arrow_array::{
     ArrayRef, BooleanArray, RecordBatch, RecordBatchOptions, builder::BooleanBufferBuilder,
 };
-use arrow_schema::{Schema, SchemaRef};
+use arrow_schema::{DataType, Schema, SchemaRef};
 use datafusion::{
     arrow::compute::{can_cast_types, cast_with_options, filter_record_batch},
     common::Statistics,
@@ -64,13 +69,13 @@ use crate::{
     superfile::SuperfileReader,
     supertable::{
         error::QueryError,
-        manifest::{ManifestSnapshot, SuperfileUri},
+        manifest::{ManifestSnapshot, SuperfileUri, hll::HllSketch},
         query::{
             column_cache::{ColumnKey, DecodedColumnCache},
             exec::common::{hit_output_schema, read_file_row_group},
             read_ahead::{file_pruning, statistics_pruned},
         },
-        schema::cast::CAST_OPTIONS,
+        schema::{FieldId, cast::CAST_OPTIONS},
     },
 };
 
@@ -78,6 +83,15 @@ use crate::{
 /// view, as the scan reads non-indexed strings, and the most any of Arrow's
 /// variable-width layouts takes.
 const VIEW_BYTES_PER_ROW: usize = 16;
+
+/// Bytes per row a string column kept as a dictionary takes: its `Int16` key.
+const DICTIONARY_KEY_BYTES_PER_ROW: usize = 2;
+
+/// A superfile's string column is kept as a dictionary when it holds at most
+/// one value for this many rows ([`dictionary_columns`]): its keys then take
+/// 2 bytes a row where views take 16, and its values a small share of the
+/// rows' bytes.
+const DICTIONARY_ROWS_PER_VALUE: usize = 16;
 
 /// One file of the scan: what its row groups are read from.
 #[derive(Debug)]
@@ -146,6 +160,9 @@ struct ScanContext {
     op_stats: Option<Arc<OpStatsCollector>>,
     cache: Arc<DecodedColumnCache>,
     schema_id: u32,
+    /// For each file, which of `schema`'s columns are kept as dictionaries
+    /// ([`dictionary_columns`]).
+    dictionaries: HashMap<SuperfileUri, Arc<[bool]>>,
 }
 
 /// A table scan served from the decoded-column cache; see the module docs.
@@ -229,7 +246,8 @@ impl CachedScanExec {
                 }
             }
         }
-        if decoded_bytes(&units, &schema) > cache.max_bytes() {
+        let dictionaries = dictionary_columns(&manifest, &schema, &units);
+        if decoded_bytes(&units, &schema, &dictionaries) > cache.max_bytes() {
             return None;
         }
         let partitions = target_partitions.clamp(1, units.len().max(1));
@@ -242,6 +260,7 @@ impl CachedScanExec {
                 op_stats,
                 cache,
                 schema_id,
+                dictionaries,
             }),
             units: units.into(),
             pruned,
@@ -271,10 +290,15 @@ impl CachedScanExec {
 /// A column a file holds under another name, after a rename, isn't found by
 /// this name and counts as nothing; the estimate decides only which scan
 /// serves the statement, never what it returns.
-fn decoded_bytes(units: &[RowGroupUnit], schema: &Schema) -> usize {
+fn decoded_bytes(
+    units: &[RowGroupUnit],
+    schema: &Schema,
+    dictionaries: &HashMap<SuperfileUri, Arc<[bool]>>,
+) -> usize {
     units
         .iter()
         .map(|unit| {
+            let dictionary = dictionaries.get(&unit.file.uri);
             let meta = unit.file.reader.parquet_metadata();
             let Some(row_group) = meta.row_groups().get(unit.row_group) else {
                 return 0;
@@ -283,7 +307,8 @@ fn decoded_bytes(units: &[RowGroupUnit], schema: &Schema) -> usize {
             schema
                 .fields()
                 .iter()
-                .map(|field| {
+                .enumerate()
+                .map(|(i, field)| {
                     let Some(chunk) = row_group.columns().iter().find(|chunk| {
                         chunk
                             .column_descr()
@@ -294,6 +319,18 @@ fn decoded_bytes(units: &[RowGroupUnit], schema: &Schema) -> usize {
                     }) else {
                         return 0;
                     };
+                    if dictionary.is_some_and(|kept| kept[i]) {
+                        // The keys, and at most one value in
+                        // `DICTIONARY_ROWS_PER_VALUE` rows.
+                        let values = chunk
+                            .unencoded_byte_array_data_bytes()
+                            .unwrap_or_else(|| chunk.uncompressed_size());
+                        return rows
+                            .saturating_mul(DICTIONARY_KEY_BYTES_PER_ROW)
+                            .saturating_add(
+                                usize::try_from(values).unwrap_or(0) / DICTIONARY_ROWS_PER_VALUE,
+                            );
+                    }
                     match field.data_type().primitive_width() {
                         Some(width) => rows.saturating_mul(width),
                         None => {
@@ -308,6 +345,83 @@ fn decoded_bytes(units: &[RowGroupUnit], schema: &Schema) -> usize {
                 .sum::<usize>()
         })
         .sum()
+}
+
+/// For each file `units` read, which of `schema`'s columns the cache keeps as
+/// dictionaries: the string columns whose superfile statistics count at most
+/// one value per [`DICTIONARY_ROWS_PER_VALUE`] rows, and no more values than
+/// `Int16` keys reach. The superfile's exact value table counts them where
+/// it keeps one, and its distinct sketch estimates them otherwise; a column
+/// with neither is kept as the scan reads it. The superfiles are written
+/// without Parquet dictionaries, so the dictionary is built once, when the
+/// row group is first decoded, and every later statement reads it kept.
+fn dictionary_columns(
+    manifest: &ManifestSnapshot,
+    schema: &Schema,
+    units: &[RowGroupUnit],
+) -> HashMap<SuperfileUri, Arc<[bool]>> {
+    let table = manifest.table_schema();
+    let fields: Vec<Option<FieldId>> = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            matches!(
+                field.data_type(),
+                DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+            )
+            .then(|| table.id_of(field.name()))
+            .flatten()
+        })
+        .collect();
+    if fields.iter().all(Option::is_none) {
+        return HashMap::new();
+    }
+    let read: HashSet<SuperfileUri> = units.iter().map(|unit| unit.file.uri).collect();
+    manifest
+        .superfiles
+        .iter()
+        .filter(|entry| read.contains(&entry.uri))
+        .map(|entry| {
+            let rows = usize::try_from(entry.n_docs).unwrap_or(usize::MAX);
+            let kept: Arc<[bool]> = fields
+                .iter()
+                .map(|field| {
+                    let Some(stats) = field.and_then(|id| entry.scalar_stats.column(id)) else {
+                        return false;
+                    };
+                    let distinct = stats.value_table_len().or_else(|| {
+                        stats
+                            .sketch()
+                            .and_then(HllSketch::from_bytes)
+                            .map(|sketch| sketch.estimate().ceil() as usize)
+                    });
+                    distinct.is_some_and(|distinct| {
+                        distinct <= i16::MAX as usize
+                            && distinct.saturating_mul(DICTIONARY_ROWS_PER_VALUE) <= rows
+                    })
+                })
+                .collect();
+            (entry.uri, kept)
+        })
+        .collect()
+}
+
+/// `array` as the cache keeps a column of few values: a dictionary of
+/// `Int16` keys over its strings. `None` when it does not take that type.
+fn as_dictionary(array: &ArrayRef) -> Option<ArrayRef> {
+    let keep = DataType::Dictionary(Box::new(DataType::Int16), Box::new(DataType::Utf8));
+    cast_with_options(array, &keep, &CAST_OPTIONS).ok()
+}
+
+/// A kept column as the scan types it: a kept dictionary as the scan's
+/// strings, every other column as it is.
+fn as_scanned(kept: ArrayRef, scanned: &DataType) -> DfResult<ArrayRef> {
+    match kept.data_type() {
+        DataType::Dictionary(..) if kept.data_type() != scanned => {
+            Ok(cast_with_options(&kept, scanned, &CAST_OPTIONS)?)
+        }
+        _ => Ok(kept),
+    }
 }
 
 /// The plan properties of a scan of `schema` read as `partitions` partitions.
@@ -367,6 +481,7 @@ impl ScanContext {
         )
         .await?;
         let mut decoded = Vec::with_capacity(missing.len());
+        let dictionary = self.dictionaries.get(&unit.file.uri);
         for (&i, array) in missing.iter().zip(read.columns()) {
             let target = fields[i].data_type();
             let array = if array.data_type() == target {
@@ -374,10 +489,16 @@ impl ScanContext {
             } else {
                 cast_with_options(array, target, &CAST_OPTIONS)?
             };
+            // A column of few values is kept as a dictionary; this statement
+            // reads the strings it decoded.
+            let kept = match dictionary.is_some_and(|kept| kept[i]) {
+                true => as_dictionary(&array).unwrap_or_else(|| Arc::clone(&array)),
+                false => Arc::clone(&array),
+            };
             self.cache.insert(
                 self.key(&unit, fields[i].name()),
-                Arc::clone(&array),
-                array.get_array_memory_size(),
+                Arc::clone(&kept),
+                kept.get_array_memory_size(),
             );
             decoded.push(array);
         }
@@ -390,8 +511,13 @@ impl ScanContext {
         let fields = self.schema.fields();
         let mut columns: Vec<Option<ArrayRef>> = fields
             .iter()
-            .map(|f| self.cache.get(&self.key(unit, f.name())))
-            .collect();
+            .map(|f| {
+                self.cache
+                    .get(&self.key(unit, f.name()))
+                    .map(|kept| as_scanned(kept, f.data_type()))
+                    .transpose()
+            })
+            .collect::<DfResult<_>>()?;
         let missing: Vec<usize> = (0..columns.len())
             .filter(|&i| columns[i].is_none())
             .collect();
@@ -591,10 +717,128 @@ pub(crate) fn has_columns(schema: &Schema) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use arrow_array::{Array, Int64Array};
+    use arrow::util::pretty::pretty_format_batches;
+    use arrow_array::{Array, Int64Array, StringArray};
     use arrow_schema::{DataType, Field};
+    use datafusion::prelude::{col, lit};
+    use tempfile::TempDir;
 
     use super::*;
+    use crate::{
+        storage::{LocalFsStorageProvider, StorageProvider},
+        supertable::{Supertable, SupertableOptions, query::scalar_cache::ByteLru},
+    };
+
+    /// Superfiles the dictionary test's table is written as.
+    const FILES: i64 = 3;
+    /// Rows in each.
+    const ROWS_PER_FILE: i64 = 2000;
+    /// Rows per row group, so each file has several.
+    const ROW_GROUP_ROWS: usize = 500;
+    /// The few values `region` takes.
+    const REGIONS: [&str; 5] = ["af", "ap", "eu", "sa", "us"];
+    /// Rows the delete removes: those with `seq` below this.
+    const DELETED_BELOW: i64 = 300;
+    /// Kept bytes: room for every column of every row group.
+    const KEPT_BYTES: usize = 64 << 20;
+    /// Statements over `region` (few values), `msg` (one per row) and `seq`.
+    const STATEMENTS: &[&str] = &[
+        "SELECT region, count(*) AS n FROM supertable WHERE seq < 4500 GROUP BY region ORDER BY region",
+        "SELECT region, msg FROM supertable WHERE region = 'eu' ORDER BY seq LIMIT 5",
+        "SELECT count(*) AS n FROM supertable WHERE region IN ('af', 'us') AND seq > 1000",
+        "SELECT region, min(seq) AS lo, max(seq) AS hi FROM supertable GROUP BY region ORDER BY region DESC",
+    ];
+
+    fn region_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("seq", DataType::Int64, false),
+            Field::new("region", DataType::Utf8, false),
+            Field::new("msg", DataType::Utf8, false),
+        ]))
+    }
+
+    /// The table, keeping decoded columns in `kept` (none with `None`), its
+    /// rows below [`DELETED_BELOW`] deleted.
+    fn region_table(dir: &TempDir, kept: Option<Arc<DecodedColumnCache>>) -> Supertable {
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let mut options = SupertableOptions::new(region_schema(), vec![], vec![])
+            .expect("options")
+            .with_storage(storage);
+        options.decoded_columns = kept;
+        options.row_group_size = Some(ROW_GROUP_ROWS);
+        let st = Supertable::create(options).expect("create");
+        for file in 0..FILES {
+            let seqs: Vec<i64> = (file * ROWS_PER_FILE..(file + 1) * ROWS_PER_FILE).collect();
+            let regions: Vec<&str> = seqs
+                .iter()
+                .map(|s| REGIONS[(*s as usize * 7) % REGIONS.len()])
+                .collect();
+            let msgs: Vec<String> = seqs.iter().map(|s| format!("message {s}")).collect();
+            let batch = RecordBatch::try_new(
+                region_schema(),
+                vec![
+                    Arc::new(Int64Array::from(seqs)),
+                    Arc::new(StringArray::from(regions)),
+                    Arc::new(StringArray::from(msgs)),
+                ],
+            )
+            .expect("batch");
+            let mut writer = st.writer().expect("writer");
+            writer.append(&batch).expect("append");
+            writer.commit().expect("commit");
+        }
+        st.delete(col("seq").lt(lit(DELETED_BELOW)))
+            .expect("delete");
+        st
+    }
+
+    fn answer(st: &Supertable, sql: &str) -> String {
+        let batches = st.reader().expect("reader").query_sql(sql).expect(sql);
+        pretty_format_batches(&batches).expect("format").to_string()
+    }
+
+    /// A string column of few values is kept as a dictionary of `Int16`
+    /// keys, and statements over it answer as without a cache: on the run
+    /// that decodes and keeps it, and on the ones that read it kept.
+    #[test]
+    fn a_column_of_few_strings_is_kept_as_a_dictionary_and_answers_the_same() {
+        let plain_dir = TempDir::new().expect("tempdir");
+        let plain = region_table(&plain_dir, None);
+        let kept_dir = TempDir::new().expect("tempdir");
+        let cache = Arc::new(ByteLru::new(KEPT_BYTES));
+        let kept = region_table(&kept_dir, Some(Arc::clone(&cache)));
+        for pass in ["decoded", "kept", "kept again"] {
+            for sql in STATEMENTS {
+                assert_eq!(answer(&kept, sql), answer(&plain, sql), "{pass}: {sql}");
+            }
+        }
+        let reader = kept.reader().expect("reader");
+        let manifest = reader.manifest();
+        let schema_id = manifest.table_schema().schema_id();
+        let dictionary = DataType::Dictionary(Box::new(DataType::Int16), Box::new(DataType::Utf8));
+        for entry in manifest.superfiles.iter() {
+            let region = cache
+                .get(&ColumnKey {
+                    uri: entry.uri,
+                    schema_id,
+                    column: "region".to_string(),
+                    row_group: 0,
+                })
+                .expect("region kept");
+            assert_eq!(region.data_type(), &dictionary, "{:?}", entry.uri);
+            // A column of one value per row is kept as the scan reads it.
+            let msg = cache
+                .get(&ColumnKey {
+                    uri: entry.uri,
+                    schema_id,
+                    column: "msg".to_string(),
+                    row_group: 0,
+                })
+                .expect("msg kept");
+            assert_eq!(msg.data_type(), &DataType::Utf8View, "{:?}", entry.uri);
+        }
+    }
 
     /// Rows in the batch the slicing test cuts.
     const ROWS: i64 = 10;
