@@ -557,6 +557,18 @@ impl ExecutionPlan for MatchExec {
             None => true,
             Some(indices) => indices.contains(&score_idx),
         };
+        // A document column is rebuilt as each hit is resolved, from the
+        // columns its skeleton names: the column take below reads stored
+        // columns only, so a projection naming one takes the hit walk.
+        let projects_document = projection.as_ref().is_some_and(|indices| {
+            let table = reader.manifest().table_schema();
+            indices.iter().any(|&p| {
+                p < score_idx
+                    && table
+                        .document_named(scalar_schema.field(p).name())
+                        .is_some()
+            })
+        });
         let span = match &self.query {
             MatchQuery::Token { .. } => {
                 detail_span!("tvf.token_match", rows_out = tracing::field::Empty)
@@ -575,6 +587,7 @@ impl ExecutionPlan for MatchExec {
         if !counts_only
             && !needs_ids
             && !needs_score
+            && !projects_document
             && order.is_none()
             && let (Some(indices), MatchQuery::Token { query, mode }) =
                 (projection.clone(), query.clone())
