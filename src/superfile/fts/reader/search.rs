@@ -2242,6 +2242,15 @@ mod tests {
     /// Score slack between the ranked and the exact-count walks: they add
     /// a doc's term scores in different orders.
     const SUM_ORDER_EPS: f32 = 1e-4;
+    /// Documents in the tie-at-the-floor fixture: enough for a long-form
+    /// posting list of many blocks.
+    const TIE_FLOOR_DOCS: u32 = 6_000;
+    /// Table-wide idfs tried on each side of the term's own.
+    const TIE_FLOOR_IDF_STEPS: i32 = 2_048;
+    /// The relative step between them: a few `f32` steps of the idf ratio,
+    /// so the rescale of the stored bounds rounds every way across the
+    /// sweep.
+    const TIE_FLOOR_IDF_STEP: f32 = 1.0 / 65_536.0;
     /// Rows in the reordered fixture: a whole number of bitset words, and a
     /// count that leaves the last word part full.
     const ORDER_FIXTURE_ROWS: [u32; 2] = [4096, 4101];
@@ -2890,6 +2899,56 @@ mod tests {
             want.truncate(k);
             assert!(want.iter().all(|&(d, _)| answer.contains(&d)), "k {k}");
             assert_eq!(got, want, "k {k}");
+        }
+    }
+
+    /// A floor at exactly the k-th score keeps the documents tied with it,
+    /// at whatever table-wide idf the query scores with. The fan-out sets
+    /// such a floor whenever the term index proves the k-th score before a
+    /// superfile opens; the walk then skips a block only if its bound is
+    /// below the floor, so a bound rescaled to the table's idf that rounds
+    /// under its block's best score drops a document the top-k needs.
+    /// Every top document here ties (same frequency, same length), so each
+    /// block's best is the k-th score itself.
+    #[tokio::test]
+    async fn a_floor_at_the_kth_score_keeps_its_ties_at_any_table_idf() {
+        let mut b = FtsBuilder::new();
+        b.register_column("body".into(), false).expect("register");
+        for i in 0..TIE_FLOOR_DOCS {
+            let mut text = match i.is_multiple_of(2) {
+                true => "w ".repeat(1 + (i % 3) as usize),
+                false => String::new(),
+            };
+            text.push_str(&"pad ".repeat(1 + (i % 29) as usize));
+            b.add_doc(0, i, text.trim()).expect("add doc");
+        }
+        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
+        let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
+        let local = bm25::idf(
+            u64::from(TIE_FLOOR_DOCS),
+            u64::from(TIE_FLOOR_DOCS.div_ceil(2)),
+        );
+        for step in (-TIE_FLOOR_IDF_STEPS..=TIE_FLOOR_IDF_STEPS).filter(|s| *s != 0) {
+            let idf = local * (1.0 + step as f32 * TIE_FLOOR_IDF_STEP);
+            let table = GlobalTermIdf::from([("w".to_owned(), idf)]);
+            let search = |floor: f32| {
+                let table = &table;
+                let r = &r;
+                async move {
+                    let clauses = ClauseLists {
+                        shoulds: &["w"],
+                        idf: QueryIdf::Table(table),
+                        ..ClauseLists::default()
+                    };
+                    r.search_excluding("body", clauses, TABLE_IDF_K, floor)
+                        .await
+                        .expect("search")
+                }
+            };
+            let unfloored = search(f32::NEG_INFINITY).await;
+            assert_eq!(unfloored.len(), TABLE_IDF_K);
+            let kth = unfloored[TABLE_IDF_K - 1].1;
+            assert_eq!(search(kth).await, unfloored, "idf {idf} (local {local})");
         }
     }
 
