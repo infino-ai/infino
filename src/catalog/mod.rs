@@ -161,8 +161,16 @@ use crate::{
         reader_cache::{DiskCacheConfig, DiskCacheError, DiskCacheStore},
         schema::{ColumnIndex, TableSchema, change::SchemaPatch, error::SchemaError},
     },
-    utils::trace::{self, CloseOut, detail_span},
+    utils::{
+        disk::disk_space,
+        trace::{self, CloseOut, detail_span},
+    },
 };
+
+/// Share of the disk holding the cache directory that a table's disk cache
+/// may fill when the connection sets no budget, in percent of the disk's
+/// total size.
+const DEFAULT_CACHE_DISK_SHARE_PERCENT: u64 = 90;
 
 /// Subdirectory under a tables cache root holding the manifest-part cache.
 const MANIFEST_CACHE_SUBDIR: &str = "manifest-parts";
@@ -2017,12 +2025,11 @@ fn backend_to_provider(
 /// so tables don't share cache files; the byte budget applies per table.
 ///
 /// Budget semantics: an explicit `cache_budget_bytes` is respected
-/// verbatim (the engine warns once if the table's footprint outgrows it).
-/// With no explicit budget the cache is marked engine-managed, and the
-/// supertable raises the budget to the table's real on-storage footprint
-/// — user superfiles plus the hidden vector index — at open and after
-/// maintenance, so vector tables don't silently churn a default-sized
-/// cache once the drain doubles their working set.
+/// verbatim. With no explicit budget the cache may fill
+/// [`DEFAULT_CACHE_DISK_SHARE_PERCENT`] of the disk holding the cache
+/// directory, so a table that fits the disk is cached whole and one that
+/// does not is held to the disk (see [`default_cache_budget`]). Either way
+/// the engine warns once if the table's footprint outgrows the budget.
 fn build_disk_cache(
     options: &ConnectOptions,
     memory_budget: &Arc<ConnectionMemoryBudget>,
@@ -2041,9 +2048,9 @@ fn build_disk_cache(
         fill_memory_budget: Some(Arc::clone(memory_budget)),
         ..Default::default()
     };
-    if let Some(budget) = options.cache_budget_bytes {
-        cfg.disk_budget_bytes = budget;
-    }
+    cfg.disk_budget_bytes = options
+        .cache_budget_bytes
+        .unwrap_or_else(|| default_cache_budget(&table_root, cfg.disk_budget_bytes));
     let cache = DiskCacheStore::new_unpinned(Arc::clone(storage), cfg).map_err(|e| {
         if let DiskCacheError::Config(msg) = e {
             InfinoError::Config(msg)
@@ -2051,15 +2058,30 @@ fn build_disk_cache(
             InfinoError::Io(e.to_string())
         }
     })?;
-    if options.cache_budget_bytes.is_none() {
-        cache.mark_budget_auto_sized();
-    }
     let manifest_cache = MetadataDiskCache::new(
         table_root.join(MANIFEST_CACHE_SUBDIR),
         MANIFEST_CACHE_BUDGET_BYTES,
     )
     .map_err(|e| InfinoError::Io(e.to_string()))?;
     Ok(Some((cache, manifest_cache)))
+}
+
+/// The budget of a disk cache at `cache_root` whose connection set none:
+/// [`DEFAULT_CACHE_DISK_SHARE_PERCENT`] of the total size of the disk
+/// holding it, or `fallback` when the disk's size cannot be read.
+fn default_cache_budget(cache_root: &Path, fallback: u64) -> u64 {
+    match disk_space(cache_root) {
+        Some((_, total)) if total > 0 => total / 100 * DEFAULT_CACHE_DISK_SHARE_PERCENT,
+        _ => {
+            warn!(
+                cache_root = %cache_root.display(),
+                budget_bytes = fallback,
+                "could not read the size of the disk holding the cache directory; \
+                 using the fixed default disk cache budget"
+            );
+            fallback
+        }
+    }
 }
 
 /// Make `table_root` the disk cache of the table generation stored at
@@ -6650,6 +6672,40 @@ mod tests {
         assert!(
             hybrid_rows >= 1,
             "hybrid_search should fuse and return hits"
+        );
+    }
+
+    /// A connection with a cache directory and no budget gives each table's
+    /// disk cache [`DEFAULT_CACHE_DISK_SHARE_PERCENT`] of the disk holding
+    /// the directory; a budget the connection sets is used as given.
+    #[test]
+    fn a_cache_with_no_budget_takes_its_share_of_the_disk() {
+        const EXPLICIT_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
+        let budget_of = |options: ConnectOptions| {
+            let root = tempfile::tempdir().expect("tempdir");
+            let conn = connect_with(root.path().to_str().expect("utf8"), options).expect("connect");
+            conn.create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+                .expect("create");
+            let table = conn.open_table_handle("docs").expect("open");
+            let cache = table.options().disk_cache.clone().expect("disk cache");
+            cache.disk_budget_bytes()
+        };
+
+        let cache = tempfile::tempdir().expect("cache tempdir");
+        let (_, disk_bytes) = disk_space(cache.path()).expect("cache disk size");
+        assert_eq!(
+            budget_of(ConnectOptions::new().with_cache_dir(cache.path())),
+            disk_bytes / 100 * DEFAULT_CACHE_DISK_SHARE_PERCENT
+        );
+
+        let cache = tempfile::tempdir().expect("cache tempdir");
+        assert_eq!(
+            budget_of(
+                ConnectOptions::new()
+                    .with_cache_dir(cache.path())
+                    .with_cache_budget_bytes(EXPLICIT_BUDGET_BYTES)
+            ),
+            EXPLICIT_BUDGET_BYTES
         );
     }
 

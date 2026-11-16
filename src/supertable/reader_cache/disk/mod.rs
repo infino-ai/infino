@@ -446,17 +446,8 @@ pub struct DiskCacheStore {
     block_writes: AtomicUsize,
     #[cfg(test)]
     block_writes_idle: Notify,
-    /// Live disk budget in bytes, seeded from `config.disk_budget_bytes`.
-    /// An engine-managed (auto-sized) budget is raised — never lowered —
-    /// by [`Self::reconcile_budget_floor`] as the table's on-storage
-    /// footprint grows (the hidden vector index roughly doubles a vector
-    /// table's working set after the drain). An explicitly configured
-    /// budget never changes.
+    /// Disk budget in bytes, from `config.disk_budget_bytes`.
     budget_bytes: AtomicU64,
-    /// Whether the budget is engine-managed (the user configured a cache
-    /// directory but no byte budget). Set via
-    /// [`Self::mark_budget_auto_sized`] at construction time.
-    budget_auto_sized: AtomicBool,
     /// Lazy entries no query holds kept past a cold open; see
     /// [`Self::release_unheld_lazy_entries_over_cap`]. The table's
     /// `superfiles_in_flight`, set through [`Self::set_lazy_entry_cap`].
@@ -603,7 +594,6 @@ impl DiskCacheStore {
             #[cfg(test)]
             block_writes_idle: Notify::new(),
             budget_bytes: AtomicU64::new(configured_budget),
-            budget_auto_sized: AtomicBool::new(false),
             lazy_entry_cap: AtomicUsize::new(default_superfiles_in_flight()),
             budget_warned: AtomicBool::new(false),
             scratch_bytes: AtomicU64::new(0),
@@ -695,57 +685,22 @@ impl DiskCacheStore {
         }
     }
 
-    /// Current disk budget in bytes — the live value, not the
-    /// construction-time config (see [`Self::reconcile_budget_floor`]).
+    /// The disk budget in bytes.
     pub fn disk_budget_bytes(&self) -> u64 {
         self.budget_bytes.load(Ordering::Acquire)
     }
 
-    /// Mark this cache's budget as engine-managed: the user configured a
-    /// cache directory but no explicit byte budget, so the engine may
-    /// raise (never lower) the budget as the table's on-storage footprint
-    /// grows. Without this, a vector table silently outgrows any fixed
-    /// default the moment the drain writes the hidden index — a second
-    /// on-storage copy of the vector payload the user cannot be expected
-    /// to size for.
-    pub fn mark_budget_auto_sized(&self) {
-        self.budget_auto_sized.store(true, Ordering::Release);
-    }
-
-    /// Reconcile the budget against the table's current on-storage
-    /// footprint. `floor_bytes` is the caller-computed budget floor
-    /// (footprint + headroom); `footprint_bytes` is the raw footprint,
-    /// used for the undersized-budget warning.
-    ///
-    /// - **Auto-sized budget** ([`Self::mark_budget_auto_sized`]): raised
-    ///   to `floor_bytes` when larger. Never lowered — shrinking under
-    ///   live readers would force an eviction storm for no benefit.
-    /// - **Explicit budget**: respected verbatim. If the footprint
-    ///   exceeds it, warn once that steady-state reads will evict and
-    ///   re-fetch instead of staying cache-resident.
-    pub fn reconcile_budget_floor(&self, floor_bytes: u64, footprint_bytes: u64) {
-        if self.budget_auto_sized.load(Ordering::Acquire) {
-            let mut current = self.budget_bytes.load(Ordering::Acquire);
-            while floor_bytes > current {
-                match self.budget_bytes.compare_exchange_weak(
-                    current,
-                    floor_bytes,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                ) {
-                    Ok(_) => break,
-                    Err(next) => current = next,
-                }
-            }
-            return;
-        }
+    /// Warn, once per cache, when the table's on-storage footprint
+    /// (`footprint_bytes`) is larger than the budget: steady-state reads
+    /// then evict and re-fetch instead of staying on disk.
+    pub fn warn_if_budget_below(&self, footprint_bytes: u64) {
         let budget = self.disk_budget_bytes();
         if footprint_bytes > budget && !self.budget_warned.swap(true, Ordering::AcqRel) {
             tracing::warn!(
                 "disk cache budget ({budget} B) is below the table's on-storage footprint \
                  ({footprint_bytes} B, hidden vector index included): steady-state queries \
                  will evict and re-fetch. Raise ConnectOptions::with_cache_budget_bytes (or \
-                 storage.disk_budget_bytes), or omit the budget to let the engine size it."
+                 storage.disk_budget_bytes) if the disk has the room."
             );
         }
     }
@@ -1100,11 +1055,10 @@ pub(crate) mod test_support {
     /// Large enough that one-byte sequential range reads cannot finish before
     /// the preemption test enters its foreground guard.
     pub(crate) const PREEMPT_TEST_BYTES: usize = 1 << 20;
-    /// Tiny explicit budget used to prove reconciliation raises (or refuses to raise) it; smaller
-    /// than any real superfile.
+    /// Tiny budget, smaller than any real superfile.
     pub(crate) const TEST_TINY_BUDGET_BYTES: u64 = 4;
-    /// A comfortably large budget floor for the raise paths.
-    pub(crate) const TEST_RAISED_FLOOR_BYTES: u64 = 1 << 20;
+    /// A table footprint far over [`TEST_TINY_BUDGET_BYTES`].
+    pub(crate) const TEST_LARGE_FOOTPRINT_BYTES: u64 = 1 << 20;
     /// Attempts per interleaving-sensitive test; enough to surface a torn drop-vs-fill without
     /// making the suite slow.
     pub(crate) const RACE_ITERATIONS: usize = 200;

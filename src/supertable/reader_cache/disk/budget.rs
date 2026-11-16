@@ -1385,41 +1385,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auto_budget_is_raised_and_admits_previously_oversized_entry() {
+    async fn a_footprint_over_the_budget_leaves_the_budget_as_set() {
         let (_dir, store) = test_store_with(|cfg| {
             cfg.disk_budget_bytes = TEST_TINY_BUDGET_BYTES;
         });
-        store.mark_budget_auto_sized();
-        // Undersized: the tiny superfile cannot be admitted.
-        let uri = SuperfileUri::new_v4();
-        let err = store
-            .insert_warm(&uri, tiny_superfile_bytes())
-            .await
-            .expect_err("undersized budget must reject");
-        assert!(matches!(err, DiskCacheError::BudgetExceeded));
-
-        // Reconcile raises the auto-sized budget; the same insert succeeds.
-        store.reconcile_budget_floor(TEST_RAISED_FLOOR_BYTES, TEST_RAISED_FLOOR_BYTES);
-        assert_eq!(store.disk_budget_bytes(), TEST_RAISED_FLOOR_BYTES);
-        store
-            .insert_warm(&uri, tiny_superfile_bytes())
-            .await
-            .expect("raised budget admits the entry");
-
-        // Raise-only: a smaller floor later never lowers the budget.
-        store.reconcile_budget_floor(TEST_TINY_BUDGET_BYTES, TEST_TINY_BUDGET_BYTES);
-        assert_eq!(store.disk_budget_bytes(), TEST_RAISED_FLOOR_BYTES);
-    }
-
-    #[tokio::test]
-    async fn explicit_budget_is_never_changed_by_reconcile() {
-        let (_dir, store) = test_store_with(|cfg| {
-            cfg.disk_budget_bytes = TEST_TINY_BUDGET_BYTES;
-        });
-        // No mark_budget_auto_sized(): the budget is explicit. Reconcile
-        // must warn (once) but leave the budget verbatim.
-        store.reconcile_budget_floor(TEST_RAISED_FLOOR_BYTES, TEST_RAISED_FLOOR_BYTES);
-        store.reconcile_budget_floor(TEST_RAISED_FLOOR_BYTES, TEST_RAISED_FLOOR_BYTES);
+        // Warned about (once), never changed.
+        store.warn_if_budget_below(TEST_LARGE_FOOTPRINT_BYTES);
+        store.warn_if_budget_below(TEST_LARGE_FOOTPRINT_BYTES);
         assert_eq!(store.disk_budget_bytes(), TEST_TINY_BUDGET_BYTES);
         assert_eq!(store.stats().budget_bytes, TEST_TINY_BUDGET_BYTES);
     }

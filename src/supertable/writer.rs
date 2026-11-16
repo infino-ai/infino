@@ -89,7 +89,6 @@ use blake3::Hasher as Blake3Hasher;
 use bytes::Bytes;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use datafusion::prelude::Expr;
-use fs4::{available_space, total_space};
 use futures::{
     future::{BoxFuture, try_join_all},
     stream::{self, FuturesUnordered, StreamExt},
@@ -240,6 +239,7 @@ use crate::{
         },
     },
     utils::{
+        disk::disk_space,
         join::run_spawned,
         nulls::{concat_sharing_nulls, populated_columns, set_cell_bytes, take_sharing_nulls},
         trace::{self, detail_span, record},
@@ -6529,13 +6529,6 @@ fn prepare_drain_scratch(
     Ok(())
 }
 
-/// The free and total bytes of the filesystem holding `path`, read at its
-/// nearest existing ancestor. `None` when neither can be read.
-pub(in crate::supertable) fn scratch_space(path: &Path) -> Option<(u64, u64)> {
-    let existing = path.ancestors().find(|dir| dir.exists())?;
-    Some((available_space(existing).ok()?, total_space(existing).ok()?))
-}
-
 /// Whether `needed` bytes of temp files fit on a scratch disk with `free`
 /// of `total` bytes free, leaving `total / SCRATCH_DISK_RESERVE_DIVISOR`
 /// free after them.
@@ -6997,7 +6990,7 @@ fn take_drain_sources(
 /// limits the drain.
 fn drain_row_limit_now(options: &SupertableOptions, column: &str) -> Option<(u64, DrainRowLimit)> {
     let spill_row_bytes = drain_spill_row_bytes(options, column)?;
-    let disk_room = scratch_space(&drain_scratch_parent(options))
+    let disk_room = disk_space(&drain_scratch_parent(options))
         .map(|(free, total)| scratch_disk_room(free, total));
     let cache = options.disk_cache.as_ref();
     drain_row_limit(
@@ -7799,7 +7792,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                     &format!("before batch {} of {n_batches}", batch_idx + 1),
                 )
                 .await?;
-            if let Some((free, total)) = scratch_space(&drain_folder)
+            if let Some((free, total)) = disk_space(&drain_folder)
                 && !scratch_disk_fits(free, total, needed)
             {
                 return Err(BuildError::Store(format!(

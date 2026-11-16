@@ -82,11 +82,12 @@ use crate::{
             CommitFence, CommitListMetadata, NewEntryBirthVersions, PreparedSuperfile, ShardOutput,
             backoff_delay, finalize_compaction_commit, maint_pool, orphaned_id_floor,
             pending_drain_sources, persist_list_metadata_async, prepare_superfile_named,
-            recalibrate_probe_laws, refresh_slow_vector_state, scratch_disk_fits, scratch_space,
+            recalibrate_probe_laws, refresh_slow_vector_state, scratch_disk_fits,
             split_overflow_cells, term_head_sink_for, try_commit_attempt, write_superfile_list,
         },
     },
     utils::{
+        disk::disk_space,
         nulls::null_row_bytes,
         trace::{RegionUsage, detail_span, record},
     },
@@ -2662,7 +2663,7 @@ async fn charge_merge_temp_files(charge: &mut ScratchCharge, bytes: u64) -> Resu
 /// disk holding it would be left with less than its reserve: everything
 /// else on the disk (the caches, other tables' work) fails once it is full.
 fn check_scratch_disk_holds(scratch: &Path, bytes: u64) -> Result<(), BuildError> {
-    match scratch_space(scratch) {
+    match disk_space(scratch) {
         Some((free, total)) if !scratch_disk_fits(free, total, bytes) => {
             Err(BuildError::Store(format!(
                 "merge stopped before writing: its temp files need {bytes} bytes and the \
@@ -5211,7 +5212,7 @@ mod tests {
     #[test]
     fn a_merge_the_scratch_disk_cannot_hold_is_a_store_error() {
         let dir = TempDir::new().expect("tempdir");
-        let (free, total) = scratch_space(dir.path()).expect("disk space");
+        let (free, total) = disk_space(dir.path()).expect("disk space");
         let err = check_scratch_disk_holds(dir.path(), free).expect_err("the whole free disk");
         assert!(matches!(err, BuildError::Store(_)), "{err}");
         assert_eq!(

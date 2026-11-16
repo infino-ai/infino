@@ -65,8 +65,8 @@ pub struct ConnectOptions {
     /// straight to object storage. Set → a local NVMe tier under this
     /// directory, per table (`<cache_dir>/<table>`).
     pub(crate) cache_dir: Option<PathBuf>,
-    /// Disk-cache byte budget. `None` → the cache's built-in default.
-    /// Applies per table.
+    /// Disk-cache byte budget. `None` → 90% of the total size of the disk
+    /// holding `cache_dir`. Applies per table.
     pub(crate) cache_budget_bytes: Option<u64>,
     /// Cold-fetch strategy when the disk cache is enabled.
     pub(crate) cold_fetch_mode: ColdFetchMode,
@@ -140,8 +140,9 @@ impl ConnectOptions {
         self
     }
 
-    /// Set the disk-cache byte budget (per table). Defaults to the
-    /// cache's built-in budget when unset. Only meaningful with
+    /// Set the disk-cache byte budget (per table). When unset, each table's
+    /// cache may fill 90% of the total size of the disk holding the cache
+    /// directory. Only meaningful with
     /// [`with_cache_dir`](Self::with_cache_dir).
     pub fn with_cache_budget_bytes(mut self, bytes: u64) -> Self {
         self.cache_budget_bytes = Some(bytes);
