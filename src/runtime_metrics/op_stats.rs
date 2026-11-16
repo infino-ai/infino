@@ -198,13 +198,12 @@ pub struct OpStats {
     /// remap/tombstone-internal id reads count planned ranges only, never
     /// rows.
     pub rows_materialized: u64,
-    /// Catalog tables a SQL statement opened to read from: each table it
-    /// names as a relation, plus each table a search or graph function in
-    /// it resolves. Zero means the statement read no table (`SELECT 1`,
-    /// or a name that is not a table), and catalog introspection does not
-    /// count: the tables `information_schema` or `SHOW TABLES` registers to
-    /// describe the catalog are not read. A table named both as a relation
-    /// and inside a function counts once per path. Search entry points
+    /// Catalog tables a SQL statement read: each table it names as a
+    /// relation or a search or graph function resolves, counted once per
+    /// table however many times the statement names it. Only a query, or
+    /// `EXPLAIN ANALYZE` of one, reads tables; `DESCRIBE`, a plain `EXPLAIN`
+    /// and every `SHOW` form count zero, and so does a query that names no
+    /// table (`SELECT 1`) or only `information_schema`. Search entry points
     /// outside SQL always read their one table and do not report it here.
     pub tables_read: u64,
     /// Nanoseconds of the query's bracketed synchronous kernel sections.

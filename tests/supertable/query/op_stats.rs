@@ -1974,3 +1974,64 @@ fn a_search_function_counts_its_table() {
         1
     );
 }
+
+#[test]
+fn a_table_named_like_an_introspection_view_is_not_read_by_describing_the_catalog() {
+    let dir = TempDir::new().expect("tempdir");
+    let db = sql_fixture(&dir);
+    let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
+    db.create_table("columns", schema, IndexSpec::new())
+        .expect("create_table");
+    assert_eq!(tables_read(&db, "SHOW TABLES"), 0);
+    assert_eq!(
+        tables_read(&db, "SELECT column_name FROM information_schema.columns"),
+        0,
+        "the view, not the user table that shares its name"
+    );
+    assert_eq!(
+        tables_read(&db, "SELECT x FROM columns"),
+        1,
+        "named on its own, the user table is read"
+    );
+}
+
+#[test]
+fn describing_or_explaining_a_table_reads_none() {
+    let dir = TempDir::new().expect("tempdir");
+    let db = sql_fixture(&dir);
+    assert_eq!(tables_read(&db, "DESCRIBE docs"), 0);
+    assert_eq!(tables_read(&db, "EXPLAIN SELECT title FROM docs"), 0);
+    assert_eq!(
+        tables_read(&db, "EXPLAIN ANALYZE SELECT title FROM docs"),
+        1,
+        "EXPLAIN ANALYZE runs the query"
+    );
+}
+
+#[test]
+fn a_table_named_as_a_relation_and_in_a_search_function_counts_once() {
+    let dir = TempDir::new().expect("tempdir");
+    let db = sql_fixture(&dir);
+    assert_eq!(
+        tables_read(
+            &db,
+            "SELECT d.title FROM docs d \
+             JOIN bm25_search('docs', 'title', 'rust', 10) s ON d._id = s._id"
+        ),
+        1
+    );
+}
+
+#[test]
+fn two_search_functions_over_one_table_count_it_once() {
+    let dir = TempDir::new().expect("tempdir");
+    let db = sql_fixture(&dir);
+    assert_eq!(
+        tables_read(
+            &db,
+            "SELECT _id FROM bm25_search('docs', 'title', 'rust', 10) \
+             UNION ALL SELECT _id FROM bm25_search('docs', 'title', 'filler1', 10)"
+        ),
+        1
+    );
+}

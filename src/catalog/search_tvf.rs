@@ -19,9 +19,9 @@
 //! compose on its output.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fmt,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, PoisonError},
 };
 
 use arrow_schema::SchemaRef;
@@ -85,6 +85,41 @@ struct ResolvedTable {
     scalar_schema: SchemaRef,
 }
 
+/// The catalog tables one SQL statement reads, each counted once into its
+/// op's `tables_read`. One set serves the statement's relations and every
+/// search and graph function in it, so a table named in both places counts
+/// once. A table is keyed by its connection as well as its name, because an
+/// attached graph's edge table lives in another catalog and may share a name
+/// with a table of this one.
+pub(crate) struct TableReads {
+    stats: Arc<OpStatsCollector>,
+    seen: Mutex<HashSet<(usize, String)>>,
+}
+
+impl TableReads {
+    pub(crate) fn new(stats: Arc<OpStatsCollector>) -> Self {
+        Self {
+            stats,
+            seen: Mutex::new(HashSet::new()),
+        }
+    }
+
+    /// Record that the statement read `name` of `conn`.
+    pub(crate) fn record(&self, conn: &Connection, name: &str) {
+        // The connection's shared state identifies its catalog: clones of
+        // one connection share it, and it outlives the statement.
+        let key = (Arc::as_ptr(&conn.inner) as usize, name.to_string());
+        let first = self
+            .seen
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(key);
+        if first {
+            self.stats.add_table_read();
+        }
+    }
+}
+
 /// Opens catalog tables by name (once per query) for the search TVFs.
 /// Shared across the four TVF adapters registered for one query.
 struct TableResolver {
@@ -95,6 +130,9 @@ struct TableResolver {
     /// `query_sql`, while resolution runs later on runtime threads where
     /// the scope's thread-local is invisible.
     op_stats: Option<Arc<OpStatsCollector>>,
+    /// Where the statement counts the tables it reads; `None` when it
+    /// counts none (no scope, or a statement that only describes tables).
+    reads: Option<Arc<TableReads>>,
 }
 
 impl fmt::Debug for TableResolver {
@@ -104,11 +142,12 @@ impl fmt::Debug for TableResolver {
 }
 
 impl TableResolver {
-    fn new(conn: Connection) -> Self {
+    fn new(conn: Connection, reads: Option<Arc<TableReads>>) -> Self {
         Self {
             conn,
             cache: Mutex::new(HashMap::new()),
             op_stats: op_stats::current(),
+            reads,
         }
     }
 
@@ -147,16 +186,13 @@ impl TableResolver {
             scalar_schema: sql_schema(reader.manifest().stored_schema()),
             reader: Arc::new(reader),
         };
-        let first = self
-            .cache
+        self.cache
             .lock()
             .expect("resolver cache poisoned")
-            .insert(name.to_string(), resolved.clone())
-            .is_none();
-        // Once per table per query: a second resolve of the same name
-        // (a race on the cache miss above) reads the same table.
-        if first && let Some(stats) = &self.op_stats {
-            stats.add_table_read();
+            .insert(name.to_string(), resolved.clone());
+        // Count each table once per query.
+        if let Some(reads) = &self.reads {
+            reads.record(&self.conn, name);
         }
         Ok(resolved)
     }
@@ -262,12 +298,16 @@ enum IndexedColumns {
 }
 
 /// Register the catalog search TVFs (table-name-first form) on `ctx`,
-/// resolving tables through `conn`.
-pub(crate) fn register_search_tvfs(ctx: &SessionContext, conn: Connection) {
+/// resolving tables through `conn` and counting each into `reads`.
+pub(crate) fn register_search_tvfs(
+    ctx: &SessionContext,
+    conn: Connection,
+    reads: Option<Arc<TableReads>>,
+) {
     // `text_match`, the token match as a WHERE predicate, beside the
     // table functions it stands in for.
     crate::supertable::query::text_match::register_text_match(ctx);
-    let resolver = Arc::new(TableResolver::new(conn));
+    let resolver = Arc::new(TableResolver::new(conn, reads));
     ctx.register_udtf(
         BM25_SEARCH_UDTF,
         Arc::new(Bm25SearchCatalogFunc {
@@ -313,16 +353,17 @@ pub(crate) fn register_search_tvfs(ctx: &SessionContext, conn: Connection) {
 /// form a graph attached from another catalog is served in
 /// (`Connection::attach_graph`), where the edge table is not one the
 /// statement could name. Under one catalog `graph` and `tables` are the
-/// same connection.
+/// same connection. Each table a walk opens is counted into `reads`.
 #[cfg(feature = "graph-index")]
 pub(crate) fn register_graph_tvfs(
     ctx: &SessionContext,
     graph: Connection,
     tables: Connection,
     edge_table: Option<String>,
+    reads: Option<Arc<TableReads>>,
 ) {
-    let graph = Arc::new(TableResolver::new(graph));
-    let tables = Arc::new(TableResolver::new(tables));
+    let graph = Arc::new(TableResolver::new(graph, reads.clone()));
+    let tables = Arc::new(TableResolver::new(tables, reads));
     for traversal in [Traversal::Walk, Traversal::Rank] {
         ctx.register_udtf(
             traversal.name(),
