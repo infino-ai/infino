@@ -92,6 +92,9 @@ const QUERIES: &[&str] = &[
     "SELECT count(*) FILTER (WHERE qty > 0) AS a, count(*) FILTER (WHERE price > 500) AS b FROM {t} WHERE seq < 6000",
     "SELECT count(*) FILTER (WHERE qty > 0) AS a, count(*) FILTER (WHERE qty > 100 OR qty < -100) AS b FROM {t}",
     TIE_BROKEN_TOP_K,
+    ONE_FILTERED_COUNT,
+    "SELECT count(*) FILTER (WHERE seq % 7 = 0) AS n FROM {t} WHERE qty > 0",
+    "SELECT count(*) FILTER (WHERE qty > 100) AS n FROM {t} WHERE seq % 7 = 0",
     "SELECT seq, qty FROM {t} WHERE qty < -200 ORDER BY qty DESC, seq DESC LIMIT 7",
     "SELECT seq, price AS price FROM {t} WHERE price > 900 ORDER BY price ASC NULLS LAST, seq ASC NULLS LAST LIMIT 10",
     "SELECT seq, qty FROM {t} WHERE qty BETWEEN 240 AND 249 ORDER BY qty DESC, seq LIMIT 30",
@@ -119,6 +122,11 @@ const BUCKETED_DAY: &str = "SELECT count(*) FILTER (WHERE day < DATE '2022-04-01
 /// Buckets beside the whole table's count, under a `WHERE` that holds every
 /// row: a search request's range aggregation and its hit total together.
 const BUCKETED_WITH_TOTAL: &str = "SELECT count(*) AS total, count(*) FILTER (WHERE price < 250) AS a, count(*) FILTER (WHERE price >= 250 AND price < 500) AS b, count(*) FILTER (WHERE price >= 500) AS c FROM {t} WHERE 1=1";
+/// How a physical plan shows a count that checks no filter of its own (the
+/// output keeps the name the filtered count gave it).
+const UNFILTERED_COUNT: &str = "aggr=[count(1) as ";
+/// One count with a filter on no range-indexed column: a search's hit total.
+const ONE_FILTERED_COUNT: &str = "SELECT count(*) FILTER (WHERE seq % 7 = 0) AS n FROM {t}";
 /// How a plan shows an aggregate that checks its own filter on each row; a
 /// bucketed count the range index answers has none.
 const BUCKET_FILTER: &str = "FILTER (WHERE";
@@ -386,6 +394,29 @@ fn a_range_indexed_table_answers_as_a_scan_does_through_deletes_compaction_and_r
             !ranged.contains(BUCKET_FILTER) && !ranged.contains(FILTER_OPERATOR),
             "{query}: {ranged}"
         );
+    }
+    // A lone filtered count is a count over a filter the scan takes, on
+    // either table: the aggregate checks no filter of its own on each row.
+    // It counts what the same filter in the `WHERE` counts.
+    for table in ["plain", "ranged"] {
+        let plan = answer(&db, &format!("EXPLAIN {ONE_FILTERED_COUNT}"), table);
+        assert!(plan.contains(UNFILTERED_COUNT), "{table}: {plan}");
+        for (filtered, plain) in [
+            (
+                ONE_FILTERED_COUNT,
+                "SELECT count(*) AS n FROM {t} WHERE seq % 7 = 0",
+            ),
+            (
+                "SELECT count(*) FILTER (WHERE seq % 7 = 0) AS n FROM {t} WHERE qty > 0",
+                "SELECT count(*) AS n FROM {t} WHERE qty > 0 AND seq % 7 = 0",
+            ),
+        ] {
+            assert_eq!(
+                answer(&db, filtered, table),
+                answer(&db, plain, table),
+                "{table}: {filtered}"
+            );
+        }
     }
     // A top-k broken by a later key reads the rows up to the cutoff from the
     // range index, ties included, not every row of the range.

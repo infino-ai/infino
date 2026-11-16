@@ -409,6 +409,9 @@ fn try_rewrite_wanting(
     if let Some(rewritten) = rewrite_bucketed_range_counts(agg)? {
         return Ok(Some(rewritten));
     }
+    if let Some(rewritten) = rewrite_one_filtered_count(agg)? {
+        return Ok(Some(rewritten));
+    }
     let Some(kinds) = parse_aggregates(&agg.aggr_expr) else {
         return Ok(None);
     };
@@ -1804,6 +1807,31 @@ fn rewrite_bucketed_range_counts(agg: &Aggregate) -> DfResult<Option<LogicalPlan
         .enumerate()
         .map(|(i, field)| ident(bucket_name(i)).alias(field.name().clone()));
     Ok(Some(joined.project(names)?.build()?))
+}
+
+/// A lone `COUNT(*) FILTER (WHERE p)`, ungrouped, as `COUNT(*)` over the rows
+/// `p` keeps, under the aggregate's own name. The two count the same rows,
+/// and the second is a filter the scan can take: the index and the
+/// statistics then answer it as they answer `COUNT(*) WHERE p`, where an
+/// aggregate's own filter is checked on every row the scan reads. A count
+/// the range index answers bucket by bucket is
+/// [`rewrite_bucketed_range_counts`]'s, which runs first.
+///
+/// Declines unless the aggregate has exactly one output, a `COUNT(*)` with
+/// a filter.
+fn rewrite_one_filtered_count(agg: &Aggregate) -> DfResult<Option<LogicalPlan>> {
+    let Some(mut buckets) = bucket_counts(&agg.aggr_expr) else {
+        return Ok(None);
+    };
+    let (Some((count, Some(filter))), true) = (buckets.pop(), buckets.is_empty()) else {
+        return Ok(None);
+    };
+    let name = agg.schema.field(0).name().clone();
+    let plan = LogicalPlanBuilder::from(agg.input.as_ref().clone())
+        .filter(filter)?
+        .aggregate(Vec::<Expr>::new(), vec![count.alias(name)])?
+        .build()?;
+    Ok(Some(plan))
 }
 
 /// The name a bucket's count carries until the bucketed rewrite's final
