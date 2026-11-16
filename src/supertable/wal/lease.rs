@@ -169,7 +169,7 @@ pub async fn try_acquire(
     // Reject only when the lease is held AND un-expired. The "None"
     // and "expired" cases both flow into the CAS path below.
     if let Some(existing) = &doc.lease
-        && existing.expires_at > now
+        && existing.is_live(now)
         && existing.owner != owner
     {
         return Err(LeaseError::Conflict {

@@ -30,7 +30,7 @@ use arrow_schema::SchemaRef;
 use chrono::Utc;
 use datafusion::{execution::context::SessionContext, logical_expr::LogicalPlan};
 use futures::future::join_all;
-use tokio::runtime::Runtime;
+use tokio::{runtime::Runtime, sync::Mutex as AsyncMutex};
 use tracing::{Instrument, debug, warn};
 
 use super::{
@@ -136,6 +136,9 @@ pub(super) struct SupertableInner {
     /// readers do ArcSwap::load_full at construction to pin a
     /// snapshot for the duration of their queries.
     pub(super) manifest: ArcSwap<ManifestSnapshot>,
+    /// Held while one caller reads the statistics into a handle opened without them, so callers
+    /// arriving together fetch them once (`load_statistics`).
+    pub(super) statistics_loading: AsyncMutex<()>,
     /// Held by one exclusive writer, or shared by same-schema appends.
     pub(super) writer_slot: WriterSlot,
     /// Orders the publishes of shared append writers.
@@ -445,33 +448,42 @@ impl SupertableInner {
         // say because a manifest is not yet visible to this process, and the next conditional probe
         // would then answer `NotModified` and never retry. That pins the handle to the pre-commit
         // manifest and serves its rows as empty, for good.
-        let current = self.manifest.load_full();
-        let manifest = match ManifestSnapshot::load_with_pointer(
-            Some(current),
-            storage,
-            None,
-            pointer,
-        )
-        .await
-        {
-            Ok(manifest) => manifest,
-            // The pointer moved but the in-memory state already covers that version, which is what
-            // this process's own commit leaves behind. Nothing newer to load, so record the etag
-            // and let the next probe be a cheap 304.
-            Err(ManifestLoadError::AlreadyLoaded) => {
-                record("outcome", "already_loaded");
-                *self
-                    .last_pointer_etag
-                    .lock()
-                    .expect("last_pointer_etag mutex poisoned") = meta.etag.clone();
-                return Ok(false);
+        //
+        // Swapped in only over the snapshot it was loaded from: if a statistics read swapped in
+        // another meanwhile (`load_statistics`), the load runs again from that one, keeping them.
+        loop {
+            let current = self.manifest.load_full();
+            let manifest = match ManifestSnapshot::load_with_pointer(
+                Some(Arc::clone(&current)),
+                Arc::clone(&storage),
+                None,
+                pointer.clone(),
+            )
+            .await
+            {
+                Ok(manifest) => manifest,
+                // The pointer moved but the in-memory state already covers that version, which is
+                // what this process's own commit leaves behind. Nothing newer to load, so record
+                // the etag and let the next probe be a cheap 304.
+                Err(ManifestLoadError::AlreadyLoaded) => {
+                    record("outcome", "already_loaded");
+                    *self
+                        .last_pointer_etag
+                        .lock()
+                        .expect("last_pointer_etag mutex poisoned") = meta.etag.clone();
+                    return Ok(false);
+                }
+                // Leaving the etag unchanged on a failed load is what makes the next probe read the
+                // pointer again and retry, instead of short-circuiting to a 304.
+                Err(err) => return Err(err),
+            };
+            if Arc::ptr_eq(
+                &self.manifest.compare_and_swap(&current, manifest),
+                &current,
+            ) {
+                break;
             }
-            // Leaving the etag unchanged on a failed load is what makes the next probe read the
-            // pointer again and retry, instead of short-circuiting to a 304.
-            Err(err) => return Err(err),
-        };
-
-        self.manifest.store(manifest);
+        }
 
         self.reconcile_tombstone_seqs();
 
@@ -1166,6 +1178,60 @@ impl Supertable {
         bridge_on_runtime(fut, &self.query_runtime())
     }
 
+    /// Whether this handle's current manifest carries the per-column statistics.
+    pub(crate) fn statistics_loaded(&self) -> bool {
+        self.inner.manifest.load().statistics_loaded()
+    }
+
+    /// Read the per-column statistics into this handle in place, once for callers arriving
+    /// together, then finish what its open left to them. A no-op once they are loaded.
+    ///
+    /// The read-consistency policy applies first ([`Self::ensure_fresh`]), so the statistics are
+    /// read for the snapshot the caller's reader then pins, not for one a refresh replaces.
+    pub(crate) fn load_statistics(&self) -> Result<(), ManifestLoadError> {
+        if self.statistics_loaded() {
+            return Ok(());
+        }
+        self.ensure_fresh()?;
+        if self.pointer_vanished() {
+            return Err(ManifestLoadError::PointerVanished);
+        }
+        self.block_on_query(self.read_statistics_and_recover())
+    }
+
+    /// Read the statistics into the snapshot this handle holds now, once for callers arriving
+    /// together, then finish the updates its open left to them.
+    async fn read_statistics_and_recover(&self) -> Result<(), ManifestLoadError> {
+        {
+            let _loading = self.inner.statistics_loading.lock().await;
+            // A refresh may swap in another snapshot meanwhile: the statistics are read into
+            // whatever is current, and the swap retried.
+            loop {
+                let current = self.inner.manifest.load_full();
+                if current.statistics_loaded() {
+                    return Ok(());
+                }
+                let loaded = current.with_statistics().await?;
+                if Arc::ptr_eq(
+                    &self.inner.manifest.compare_and_swap(&current, loaded),
+                    &current,
+                ) {
+                    break;
+                }
+            }
+        }
+        self.recover_unfinished().await;
+        Ok(())
+    }
+
+    /// Finish the updates a crashed writer left, best-effort: a failure leaves them to the next
+    /// sweep.
+    async fn recover_unfinished(&self) {
+        if let Err(e) = self.run_recovery_sweep_once().await {
+            warn!(error = %e, "recovery sweep failed (best-effort)");
+        }
+    }
+
     /// Index the superfiles the table-level term index does not list and
     /// fold its layers in runs its scratch disk holds, or of at most
     /// `unmeasured_fold_max_bytes` when the disk cannot be read (see
@@ -1522,8 +1588,9 @@ impl Supertable {
     /// Returns `Ok(report)` with the per-outcome counts on
     /// success; `Err(NoStorageAttached)` for in-memory-only
     /// supertables (no WALs can exist there).
-    /// Not public API: WAL recovery is engine-driven — it runs
-    /// automatically on [`Supertable::open`]. This manual hook is a
+    /// Not public API: WAL recovery is engine-driven. It runs on [`Supertable::open`] (for a handle
+    /// opened without statistics, only when the open's GC finds a log to take or cannot list the
+    /// logs) and on [`Self::load_statistics`]. This manual hook is a
     /// crate internal used only by in-crate unit tests that pre-seed
     /// half-finished WALs and assert the sweep completes them.
     pub(crate) async fn run_recovery_sweep_once(&self) -> Result<RecoveryReport, RecoveryError> {
@@ -2288,17 +2355,26 @@ async fn build_handle(
         sql_schemas: ArcSwapOption::empty(),
         term_index_objects_seen: Mutex::default(),
         retired_scratch: RetiredScratch::default(),
+        statistics_loading: AsyncMutex::new(()),
     });
     install_disk_cache_pinning(&inner);
     let st = Supertable { inner };
     if st.inner.options.storage.is_some() {
-        // Best-effort: a sweep failure here doesn't fail handle
-        // construction; the next sweep gets another shot.
-        if let Err(e) = st.run_recovery_sweep_once().await {
-            warn!(error = %e, "open-time recovery sweep failed (best-effort)");
+        // Recovery needs the statistics: finishing an update without them writes it into a part
+        // of its own. An open without them reads them first only when GC, which reads every log,
+        // finds one recovery would take, or cannot list the logs at all.
+        if st.inner.options.load_statistics {
+            st.recover_unfinished().await;
         }
-        if let Err(e) = st.run_gc_sweep_once().await {
-            warn!(error = %e, "open-time gc sweep failed (best-effort)");
+        let left_for_recovery = match st.run_gc_sweep_once().await {
+            Ok(report) => report.n_left_for_recovery > 0,
+            Err(e) => {
+                warn!(error = %e, "open-time gc sweep failed (best-effort)");
+                true
+            }
+        };
+        if left_for_recovery && !st.statistics_loaded() {
+            st.read_statistics_and_recover().await?;
         }
     }
     Ok(st)

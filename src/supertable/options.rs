@@ -794,6 +794,9 @@ pub struct SupertableOptions {
     /// encode path asserts against that. Grid (routing) centroids and
     /// summary `counts` stay resident regardless. Default `false`.
     pub summary_centroids_from_superfiles: bool,
+    /// Whether the open reads the per-column statistics (summaries sections and rollups): `false`
+    /// for a handle opened for a statement that uses none, like `COUNT(*)`. Default `true`.
+    pub(crate) load_statistics: bool,
     /// Per-table override for the **user** grid's cell count (trained at
     /// the first commit and stamped into the manifest; changing it later
     /// affects new tables only). `None` → `vector.user_cell_count` from
@@ -986,6 +989,7 @@ impl SupertableOptions {
             crc_verification: CrcVerification::default(),
             read_consistency: Consistency::default(),
             summary_centroids_from_superfiles: false,
+            load_statistics: true,
             user_cell_count: None,
             hidden_cell_count: None,
             companions: Vec::new(),
@@ -1050,6 +1054,12 @@ impl SupertableOptions {
     /// Default: [`Consistency::BoundedStaleness`] with a 1s window.
     pub fn with_read_consistency(mut self, consistency: Consistency) -> Self {
         self.read_consistency = consistency;
+        self
+    }
+
+    /// Open without the per-column statistics ([`Self::load_statistics`]).
+    pub(crate) fn without_statistics(mut self) -> Self {
+        self.load_statistics = false;
         self
     }
 

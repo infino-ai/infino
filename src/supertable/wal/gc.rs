@@ -79,6 +79,9 @@ pub struct GcReport {
     /// objects stay durable on storage and a subsequent sweep
     /// re-attempts.
     pub n_delete_errors: usize,
+    /// State docs a recovery sweep would take now: not `Complete` and not held by a live lease,
+    /// as a crashed writer leaves them, or unreadable for a reason other than being gone.
+    pub n_left_for_recovery: usize,
 }
 
 /// Typed sweep failures. Per-object errors are tallied into the
@@ -137,6 +140,11 @@ pub async fn run_sweep(
         report.n_state_docs_scanned += 1;
         match wal_store.read(*wal_id).await {
             Ok((doc, _etag)) => {
+                if doc.state != WalState::Complete
+                    && !doc.lease.as_ref().is_some_and(|lease| lease.is_live(now))
+                {
+                    report.n_left_for_recovery += 1;
+                }
                 if doc.state == WalState::Complete && now - doc.created_at > wal_grace_chrono {
                     // Best-effort delete of the state doc.
                     let state_ok = wal_store.delete_state(*wal_id).await.is_ok();
@@ -155,8 +163,17 @@ pub async fn run_sweep(
                     }
                 }
             }
-            Err(_) => {
+            Err(e) => {
                 report.n_read_errors += 1;
+                if !matches!(
+                    e,
+                    WalStoreError::Storage {
+                        source: StorageError::NotFound { .. },
+                        ..
+                    }
+                ) {
+                    report.n_left_for_recovery += 1;
+                }
             }
         }
     }
