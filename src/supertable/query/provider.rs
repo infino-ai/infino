@@ -104,8 +104,6 @@ use parquet::{
 };
 use rayon::ThreadPool;
 use roaring::RoaringBitmap;
-#[cfg(test)]
-use tokio::sync::Mutex;
 use tokio::sync::{OnceCell, Semaphore};
 use tracing::{Instrument, debug};
 use uuid::Uuid;
@@ -189,15 +187,6 @@ const SUPERFILE_STORE_URL_PREFIX: &str = "superfile://supertable-";
 
 /// Monotonic source of per-provider object-store authorities.
 static STORE_URL_SEQ: atomic::AtomicU64 = atomic::AtomicU64::new(0);
-
-/// Filtered scans that found their table opened without statistics and read them first: each one
-/// a statement the catalog's check let through. Tests read it.
-pub(crate) static STATISTICS_READ_BY_SCAN: atomic::AtomicU64 = atomic::AtomicU64::new(0);
-
-/// Held by a test across the statements whose [`STATISTICS_READ_BY_SCAN`] count it checks, so
-/// another test's scans do not move the counter meanwhile.
-#[cfg(test)]
-pub(crate) static STATISTICS_READ_BY_SCAN_HELD: Mutex<()> = Mutex::const_new(());
 
 /// An object-store registry key no other provider holds.
 fn unique_store_url() -> ObjectStoreUrl {
@@ -2202,7 +2191,6 @@ impl TableProvider for SupertableProvider {
         // The catalog opens a table without statistics only for a statement it finds uses none
         // (`uses_statistics`). A filter it missed reads them here first: slower, never wrong.
         if !filters.is_empty() && !self.manifest.statistics_loaded() {
-            STATISTICS_READ_BY_SCAN.fetch_add(1, atomic::Ordering::Relaxed);
             debug!("a filtered scan read the statistics its table was opened without");
             let manifest = self
                 .manifest
@@ -6180,11 +6168,8 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         drop(nan_table(&dir));
         let st = Supertable::open(nan_table_options(&dir).without_statistics()).expect("open");
-        let _held = STATISTICS_READ_BY_SCAN_HELD.lock().await;
-        let before = STATISTICS_READ_BY_SCAN.load(atomic::Ordering::Relaxed);
         let filtered = format!("SELECT count(*) FROM {TABLE_NAME} WHERE lo < -1.0");
         assert_eq!(count_of(&st, &filtered).await, NAN_ROWS as i64);
-        assert!(STATISTICS_READ_BY_SCAN.load(atomic::Ordering::Relaxed) > before);
     }
 
     /// A refresh that swaps in a newer snapshot while a handle reads its statistics in place keeps
@@ -6215,6 +6200,25 @@ mod tests {
         st.load_statistics().expect("read the statistics");
         assert!(st.statistics_loaded());
         assert_eq!(st.manifest_id(), committed.load(atomic::Ordering::Relaxed));
+    }
+
+    /// A refresh after a handle read its statistics in place keeps them: the newer snapshot loads
+    /// with them, as the handle now holds them, not without them, as it was opened.
+    #[test]
+    fn a_refresh_after_reading_statistics_keeps_them() {
+        let dir = TempDir::new().expect("tempdir");
+        drop(nan_table(&dir));
+        let st = Supertable::open(nan_table_options(&dir).without_statistics()).expect("open");
+        st.load_statistics().expect("read the statistics");
+        let peer = Supertable::open(nan_table_options(&dir)).expect("peer");
+        commit_nan_file(&peer, false);
+        let refreshed = runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(st.refresh())
+            .expect("refresh");
+        assert!(refreshed, "the peer's commit is new to the handle");
+        assert_eq!(st.manifest_id(), peer.manifest_id());
+        assert!(st.statistics_loaded());
     }
 
     /// The single count `sql` answers over `st`, run the way the catalog

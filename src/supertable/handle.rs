@@ -1196,28 +1196,32 @@ impl Supertable {
         if self.pointer_vanished() {
             return Err(ManifestLoadError::PointerVanished);
         }
-        self.block_on_query(async {
-            {
-                let _loading = self.inner.statistics_loading.lock().await;
-                // A refresh may swap in another snapshot meanwhile: the statistics are read into
-                // whatever is current, and the swap retried.
-                loop {
-                    let current = self.inner.manifest.load_full();
-                    if current.statistics_loaded() {
-                        return Ok(());
-                    }
-                    let loaded = current.with_statistics().await?;
-                    if Arc::ptr_eq(
-                        &self.inner.manifest.compare_and_swap(&current, loaded),
-                        &current,
-                    ) {
-                        break;
-                    }
+        self.block_on_query(self.read_statistics_and_recover())
+    }
+
+    /// Read the statistics into the snapshot this handle holds now, once for callers arriving
+    /// together, then finish the updates its open left to them.
+    async fn read_statistics_and_recover(&self) -> Result<(), ManifestLoadError> {
+        {
+            let _loading = self.inner.statistics_loading.lock().await;
+            // A refresh may swap in another snapshot meanwhile: the statistics are read into
+            // whatever is current, and the swap retried.
+            loop {
+                let current = self.inner.manifest.load_full();
+                if current.statistics_loaded() {
+                    return Ok(());
+                }
+                let loaded = current.with_statistics().await?;
+                if Arc::ptr_eq(
+                    &self.inner.manifest.compare_and_swap(&current, loaded),
+                    &current,
+                ) {
+                    break;
                 }
             }
-            self.recover_unfinished().await;
-            Ok(())
-        })
+        }
+        self.recover_unfinished().await;
+        Ok(())
     }
 
     /// Finish the updates a crashed writer left, best-effort: a failure leaves them to the next
@@ -1584,8 +1588,9 @@ impl Supertable {
     /// Returns `Ok(report)` with the per-outcome counts on
     /// success; `Err(NoStorageAttached)` for in-memory-only
     /// supertables (no WALs can exist there).
-    /// Not public API: WAL recovery is engine-driven. It runs on [`Supertable::open`], or on
-    /// [`Self::load_statistics`] for a handle opened without statistics. This manual hook is a
+    /// Not public API: WAL recovery is engine-driven. It runs on [`Supertable::open`] (for a handle
+    /// opened without statistics, only when the open's GC finds a log to take or cannot list the
+    /// logs) and on [`Self::load_statistics`]. This manual hook is a
     /// crate internal used only by in-crate unit tests that pre-seed
     /// half-finished WALs and assert the sweep completes them.
     pub(crate) async fn run_recovery_sweep_once(&self) -> Result<RecoveryReport, RecoveryError> {
@@ -2355,14 +2360,21 @@ async fn build_handle(
     install_disk_cache_pinning(&inner);
     let st = Supertable { inner };
     if st.inner.options.storage.is_some() {
-        // Best-effort: a sweep failure here doesn't fail handle construction; the next sweep gets
-        // another shot. Recovery waits for the statistics (`load_statistics`): finishing an update
-        // without them would write it into a part of its own. GC needs none.
+        // Recovery needs the statistics: finishing an update without them writes it into a part
+        // of its own. An open without them reads them first only when GC, which reads every log,
+        // finds one recovery would take, or cannot list the logs at all.
         if st.inner.options.load_statistics {
             st.recover_unfinished().await;
         }
-        if let Err(e) = st.run_gc_sweep_once().await {
-            warn!(error = %e, "open-time gc sweep failed (best-effort)");
+        let left_for_recovery = match st.run_gc_sweep_once().await {
+            Ok(report) => report.n_left_for_recovery > 0,
+            Err(e) => {
+                warn!(error = %e, "open-time gc sweep failed (best-effort)");
+                true
+            }
+        };
+        if left_for_recovery && !st.statistics_loaded() {
+            st.read_statistics_and_recover().await?;
         }
     }
     Ok(st)

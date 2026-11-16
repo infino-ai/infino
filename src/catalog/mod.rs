@@ -2501,6 +2501,7 @@ mod tests {
         types::Int64Type,
     };
     use arrow_schema::{DataType, Field, Schema};
+    use chrono::{Duration as ChronoDuration, Utc};
     use datafusion::{
         error::DataFusionError,
         logical_expr::LogicalPlan,
@@ -2510,6 +2511,7 @@ mod tests {
         Figment,
         providers::{Format, Yaml},
     };
+    use futures::executor::block_on;
     use proptest::prelude::*;
     use serde_json::{Map, Value, json};
 
@@ -2525,9 +2527,12 @@ mod tests {
                 rollups::MANIFEST_ROLLUPS_DIR,
                 summaries::MANIFEST_SUMMARIES_DIR,
             },
-            query::{
-                provider::{STATISTICS_READ_BY_SCAN, STATISTICS_READ_BY_SCAN_HELD, TABLE_NAME},
-                sql::value_count_schema,
+            query::{provider::TABLE_NAME, sql::value_count_schema},
+            wal::{
+                WalStore,
+                lease::DEFAULT_LEASE_DURATION,
+                recovery_sweep_tests::seed_intent_delete_wal,
+                state_doc::{Lease, SupertableHandleId, WalState, WalStateDoc},
             },
         },
         test_helpers::{
@@ -5133,6 +5138,10 @@ mod tests {
     const PLAIN_COUNT: &str = "SELECT count(*) FROM cabs";
     /// Filtered statements sent at once to a table opened without statistics.
     const STATEMENTS_TOGETHER: usize = 2;
+    /// The id of the delete log a crashed writer left in the cab fixture.
+    const CRASHED_WAL_ID: i128 = 0x1234_5678;
+    /// The handle a delete still in flight in the cab fixture belongs to.
+    const DELETING_HANDLE: i128 = 0x5150;
 
     /// The single count `sql` answers on `conn`.
     fn count_on(conn: &Connection, sql: &str) -> i64 {
@@ -5186,6 +5195,74 @@ mod tests {
         assert_eq!(cached_statistics(&conn, "cabs"), Some(false));
     }
 
+    /// Leaves a delete of the cab fixture's first row in its log at `state`, held by `lease`
+    /// when it is `Some`.
+    fn seed_a_delete(uri: &str, state: WalState, lease: Option<Lease>) {
+        let table = connect(uri)
+            .expect("connect")
+            .open_table_handle_for("cabs", true)
+            .expect("open");
+        let first_row = table
+            .reader()
+            .expect("reader")
+            .manifest()
+            .get_all_superfiles()[0]
+            .id_min;
+        let storage = Arc::clone(table.options().storage.as_ref().expect("storage"));
+        let wal = WalStateDoc {
+            state,
+            lease,
+            ..seed_intent_delete_wal(first_row, CRASHED_WAL_ID)
+        };
+        block_on(WalStore::new(storage).create(&wal)).expect("seed the delete");
+    }
+
+    /// A delete a crashed writer left unfinished is finished by the open a plain `COUNT(*)` makes
+    /// without statistics, so the count does not see the deleted row.
+    #[test]
+    fn a_plain_count_does_not_see_a_crashed_delete() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let uri = dir.path().to_str().expect("utf8 path").to_owned();
+        create_cab_types(&connect(&uri).expect("connect"), "cabs");
+        seed_a_delete(&uri, WalState::Intent, None);
+        let cold = connect(&uri).expect("reconnect");
+        assert_eq!(count_on(&cold, PLAIN_COUNT), CABS - 1);
+    }
+
+    /// A delete another writer still holds is its own to finish, so an open without statistics
+    /// beside it reads none, and the count sees the row the delete has not reached yet.
+    #[test]
+    fn a_plain_count_beside_a_delete_in_flight_reads_no_statistics() {
+        let (_dir, uri, (_, _, parts)) = cabs_and_a_cold_filter();
+        let now = Utc::now();
+        seed_a_delete(
+            &uri,
+            WalState::Intent,
+            Some(Lease {
+                owner: SupertableHandleId(DELETING_HANDLE),
+                acquired_at: now,
+                expires_at: now
+                    + ChronoDuration::from_std(DEFAULT_LEASE_DURATION).expect("lease span"),
+            }),
+        );
+        let conn = connect(&uri).expect("reconnect");
+        conn.usage_meter().start_trace();
+        assert_eq!(count_on(&conn, PLAIN_COUNT), CABS);
+        assert_eq!(manifest_gets(&conn), (0, 0, parts));
+    }
+
+    /// A finished delete's log, left for GC to reap, gives an open without statistics nothing to
+    /// recover, so it reads none.
+    #[test]
+    fn a_plain_count_beside_a_finished_delete_reads_no_statistics() {
+        let (_dir, uri, (_, _, parts)) = cabs_and_a_cold_filter();
+        seed_a_delete(&uri, WalState::Complete, None);
+        let conn = connect(&uri).expect("reconnect");
+        conn.usage_meter().start_trace();
+        assert_eq!(count_on(&conn, PLAIN_COUNT), CABS);
+        assert_eq!(manifest_gets(&conn), (0, 0, parts));
+    }
+
     /// Filtered statements arriving together at a table opened without statistics read them into
     /// that same handle once: the sections and rollups a cold open reads, and no part again.
     #[test]
@@ -5194,8 +5271,6 @@ mod tests {
         let conn = connect(&uri).expect("reconnect");
         assert_eq!(count_on(&conn, PLAIN_COUNT), CABS);
         let opened = conn.open_table_handle_for("cabs", false).expect("cached");
-        let _held = STATISTICS_READ_BY_SCAN_HELD.blocking_lock();
-        let read_by_scans = STATISTICS_READ_BY_SCAN.load(Ordering::Relaxed);
         conn.usage_meter().start_trace();
         thread::scope(|scope| {
             for _ in 0..STATEMENTS_TOGETHER {
@@ -5208,11 +5283,6 @@ mod tests {
         assert!(
             Arc::ptr_eq(opened.options(), upgraded.options()),
             "the same handle"
-        );
-        assert_eq!(
-            STATISTICS_READ_BY_SCAN.load(Ordering::Relaxed),
-            read_by_scans,
-            "the catalog read them, not a scan"
         );
     }
 

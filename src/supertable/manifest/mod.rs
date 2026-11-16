@@ -85,7 +85,7 @@ pub use summaries::ColumnStats;
 use tokio::{
     join,
     runtime::{Handle, RuntimeFlavor},
-    sync::OnceCell,
+    sync::{Mutex, OnceCell},
     task::{JoinError, block_in_place, spawn, spawn_blocking},
 };
 use tracing::{Instrument, warn};
@@ -3612,7 +3612,7 @@ pub struct ManifestPartLoader {
     /// the same reference reuses it; a commit that published a delta has a
     /// new root and loads that instead. A root that can never load is kept
     /// as its failure.
-    term_index: Arc<tokio::sync::Mutex<Option<TermIndexSlot>>>,
+    term_index: Arc<Mutex<Option<TermIndexSlot>>>,
     /// The tier chunks read so far, shared by every root this loader goes
     /// through: a delta commit replaces the root, not the tiers.
     tier_chunks: term_index::TierChunkCache,
@@ -3799,6 +3799,12 @@ impl ManifestPartLoader {
         // part's instead of following its decode.
         let (parsed, section) = join!(self.load_part_bytes(expected_hash, uri), self.section(refs));
         let mut part = parsed?;
+        if part.part_id != part_id {
+            return Err(ManifestLoadError::PartIdMismatch {
+                listed: part_id,
+                decoded: part.part_id,
+            });
+        }
         if !self.statistics && refs.summaries.is_some() {
             mark_statistics_unavailable(&mut part);
             return Ok(Arc::new(part));
@@ -4362,6 +4368,10 @@ pub enum ManifestLoadError {
     /// missing an entry.
     #[error("part_id not in manifest list: {part_id}")]
     PartNotInList { part_id: PartId },
+    /// The part the list names `listed` decodes as part `decoded`: a corrupt list that names one
+    /// part under two ids. Its hash checks pass, as the bytes are the part's own.
+    #[error("manifest list names part {decoded} as {listed}")]
+    PartIdMismatch { listed: PartId, decoded: PartId },
     /// Storage backend returned an error.
     #[error("storage error during part load: {0}")]
     Storage(#[source] StorageError),
@@ -8126,6 +8136,30 @@ mod tests {
                 err2,
                 ManifestLoadError::ContentHashMismatch { .. }
             ));
+        }
+
+        /// A list that names one part under a second id fails the load of that id, rather than
+        /// file the part under an id it does not carry.
+        #[tokio::test]
+        async fn a_part_listed_under_another_id_fails_its_load() {
+            let part = make_test_part(23);
+            let (objects, mut entries) = encode_and_index(&[part]);
+            let mut alias = entries[0].clone();
+            alias.part_id = PartId(Uuid::from_bytes([24; 16]));
+            entries.push(alias.clone());
+            let storage = Arc::new(CountingMockStorage::new(objects));
+            let manifest = build_manifest_with_loader(
+                fresh_list(entries),
+                Arc::clone(&storage) as Arc<dyn StorageProvider>,
+            );
+            let err = manifest
+                .get_part_by_id(alias.part_id)
+                .await
+                .expect_err("must reject");
+            assert!(
+                matches!(err, ManifestLoadError::PartIdMismatch { .. }),
+                "expected PartIdMismatch, got {err:?}"
+            );
         }
 
         #[tokio::test]
