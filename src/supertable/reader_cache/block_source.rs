@@ -268,9 +268,11 @@ pub(crate) struct BlockCachedSource {
     path: PathBuf,
     /// Distinguishes this source from a replacement entry for the same URI.
     entry_token: Arc<()>,
-    /// Whether this source reserves and releases touched-block bytes itself. Cleared when a
-    /// record takes over the charge ([`Self::hand_over_accounting`]).
-    owns_accounting: AtomicBool,
+    /// Whether this source reserves and releases touched-block bytes itself.
+    owns_accounting: bool,
+    /// Filled bytes whose charge a record took over ([`Self::hand_over_accounting`]); the source
+    /// gives back only what it filled beyond them.
+    handed_over: AtomicU64,
     /// Where this file's FTS hole and aligned region lie.
     layout: SourceLayout,
     /// Where the last [`READ_ENDS`] reads ended, `u64::MAX` in unused slots,
@@ -775,7 +777,8 @@ impl BlockCachedSource {
             uri,
             path,
             entry_token: Arc::new(()),
-            owns_accounting: AtomicBool::new(owns_accounting),
+            owns_accounting,
+            handed_over: AtomicU64::new(0),
             // An empty section is no section: nothing can be read in it.
             layout: SourceLayout {
                 fts_hole: layout.fts_hole.filter(|&(_, len)| len > 0),
@@ -906,13 +909,17 @@ impl BlockCachedSource {
     /// Whether this source charges the budget for the blocks it fills, rather than riding on its
     /// owning entry's reservation.
     pub(crate) fn owns_accounting(&self) -> bool {
-        self.owns_accounting.load(Ordering::Acquire)
+        self.owns_accounting
     }
 
-    /// Stop charging the budget for this source's blocks, leaving their charge to whoever keeps
-    /// the file. True when this source held that charge, so the caller need not add it again.
-    pub(crate) fn hand_over_accounting(&self) -> bool {
-        self.owns_accounting.swap(false, Ordering::AcqRel)
+    /// Hand the charge for `filled` of this source's bytes to whoever keeps the file; a run that
+    /// lands later is still given back when the source drops. True when this source held that
+    /// charge, so the caller need not add it again.
+    pub(crate) fn hand_over_accounting(&self, filled: u64) -> bool {
+        if self.owns_accounting {
+            self.handed_over.fetch_add(filled, Ordering::AcqRel);
+        }
+        self.owns_accounting
     }
 
     /// Shared filled-bytes counter, installed as the cache entry's
@@ -1004,7 +1011,7 @@ impl BlockCachedSource {
         let idx_bytes = fs::read(self.idx_path()).ok()?;
         let (bitmap, adopted_bytes) = indexed_filled_bytes(size, &idx_bytes, meta.ino())?;
         if let Some(store) = self.store.upgrade() {
-            if self.owns_accounting() {
+            if self.owns_accounting {
                 store.account_adopted_bytes(&self.uri, adopted_bytes);
             } else {
                 store.release_scanned_block_file(&self.uri);
@@ -1893,7 +1900,7 @@ impl BlockCachedSource {
         };
         let (run_start, run_len) = Self::run_bytes(bf.size, first, last);
 
-        let reservation = if self.owns_accounting() {
+        let reservation = if self.owns_accounting {
             let reserved = match fill {
                 Fill::Read => store.reserve(run_len).await.ok(),
                 Fill::Prefetch => store.try_reserve(run_len),
@@ -2225,10 +2232,13 @@ impl Drop for BlockCachedSource {
         // only retries a failed fsync.
         self.flush_index();
         // Release accounted bytes only; the file and index persist for adoption.
-        if self.owns_accounting()
+        if self.owns_accounting
             && let Some(store) = self.store.upgrade()
         {
-            let filled = self.filled_bytes.load(Ordering::Acquire);
+            let filled = self
+                .filled_bytes
+                .load(Ordering::Acquire)
+                .saturating_sub(self.handed_over.load(Ordering::Acquire));
             if filled > 0 {
                 store.release_block_bytes(filled);
             }

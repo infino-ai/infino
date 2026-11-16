@@ -329,7 +329,7 @@ fn leaf_bytes(meta: &ParquetMetaData) -> Arc<[u64]> {
 
 /// Count what `entry`'s cached reader keeps decoded against its cache's budget, each part once: the
 /// parsed footer, and the scan footer when the reader keeps its own copy, whichever statement first
-/// derives it (one derived for this statement alone goes with it and is not counted).
+/// derives it. A scan footer made for one statement alone goes with it, so it is not counted.
 fn charge_footer(
     disk_cache: Option<&Arc<DiskCacheStore>>,
     entry: &SuperfileEntry,
@@ -340,13 +340,17 @@ fn charge_footer(
     // The scan shape the reader keeps beside them is a few fields per column, so it is left out.
     // Once per reader: a warm statement pays a load per file, not a cache lookup.
     if reader.first_charge() {
-        cache.charge_heap(&entry.uri, reader.parquet_metadata().memory_size() as u64);
+        cache.charge_heap(
+            &entry.uri,
+            reader,
+            reader.parquet_metadata().memory_size() as u64,
+        );
     }
     if !entry.scalar_stats.is_unavailable()
         && reader.keeps_scan_footer(&prepared.footer)
         && reader.first_scan_footer_charge()
     {
-        cache.charge_heap(&entry.uri, prepared.footer.memory_size() as u64);
+        cache.charge_heap(&entry.uri, reader, prepared.footer.memory_size() as u64);
     }
 }
 
@@ -380,7 +384,9 @@ type PreparedScanCell = Arc<OnceCell<Arc<PreparedScanFile>>>;
 /// The files a statement's providers prepared. When the last provider sharing them goes, the
 /// statement holds none of their readers, so the cache drops what is over its metadata budget.
 struct PreparedFiles {
+    /// The statement's prepared files, by superfile.
     files: DashMap<Uuid, PreparedScanCell>,
+    /// The cache whose budget the statement end checks; `None` without a disk cache.
     disk_cache: Option<Arc<DiskCacheStore>>,
 }
 
@@ -6550,7 +6556,7 @@ mod tests {
         assert_eq!(charged, parsed_bytes(&prepared), "the parsed footer alone");
     }
 
-    /// A file mapped whole from local disk is not counted at its scan: it never leaves the cache.
+    /// A file mapped whole from local disk is not counted at its scan: this budget never drops it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_file_mapped_whole_is_not_counted_at_its_scan() {
         // Three files loaded whole, so mapped from local disk, then one scan that finds them.

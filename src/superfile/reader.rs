@@ -1222,6 +1222,18 @@ impl SuperfileReader {
     /// and a superfile's entry never changes, so every caller passes the
     /// same `derive`. Concurrent first callers may each derive one; the
     /// first stored is kept and returned to all of them.
+    pub(crate) fn scan_footer<E>(
+        &self,
+        indexed: Arc<ParquetMetaData>,
+        derive: impl FnOnce(Arc<ParquetMetaData>) -> Result<Arc<ParquetMetaData>, E>,
+    ) -> Result<Arc<ParquetMetaData>, E> {
+        if let Some(footer) = self.scan_footer.get() {
+            return Ok(Arc::clone(footer));
+        }
+        let derived = derive(indexed)?;
+        Ok(Arc::clone(self.scan_footer.get_or_init(|| derived)))
+    }
+
     /// True for the first caller only: the one that should count what this reader keeps decoded
     /// against a cache's budget. Later callers pay one load.
     pub(crate) fn first_charge(&self) -> bool {
@@ -1238,18 +1250,6 @@ impl SuperfileReader {
     /// Whether `footer` is a scan footer this reader keeps apart from its parsed one.
     pub(crate) fn keeps_scan_footer(&self, footer: &Arc<ParquetMetaData>) -> bool {
         !Arc::ptr_eq(self.footer.load().parquet(), footer)
-    }
-
-    pub(crate) fn scan_footer<E>(
-        &self,
-        indexed: Arc<ParquetMetaData>,
-        derive: impl FnOnce(Arc<ParquetMetaData>) -> Result<Arc<ParquetMetaData>, E>,
-    ) -> Result<Arc<ParquetMetaData>, E> {
-        if let Some(footer) = self.scan_footer.get() {
-            return Ok(Arc::clone(footer));
-        }
-        let derived = derive(indexed)?;
-        Ok(Arc::clone(self.scan_footer.get_or_init(|| derived)))
     }
 
     /// This file's scan shape: `build` on the first call, the same one on every later call. A

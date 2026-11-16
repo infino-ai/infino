@@ -1174,6 +1174,45 @@ mod tests {
         assert_eq!(store.stats().current_bytes, filled, "still counted once");
     }
 
+    /// A Stream lazy entry with one block filled, released while its source lives, and a run that
+    /// lands on that source after the release (a read-ahead GET that finished as its statement
+    /// ended), leaving its bytes reserved in the store and filled in the source.
+    ///  - the record counts the blocks filled at release;
+    ///  - dropping the source gives the late run back, so the cache counts only the record.
+    #[tokio::test]
+    async fn a_run_landing_after_release_is_given_back_when_its_source_drops() {
+        /// Bytes the late run lands.
+        const LATE_BYTES: u64 = 4096;
+        let (_dir, store) = test_store_with(|cfg| {
+            cfg.cold_fetch_mode = ColdFetchMode::LazyForegroundWithBackgroundFill;
+            cfg.promotion_defer_timeout = Duration::MAX;
+        });
+        let uri = SuperfileUri::new_v4();
+        put_superfile(&store, &uri, tiny_superfile_bytes()).await;
+        open_and_fill_a_block(&store, &uri).await;
+        let source = store
+            .cached
+            .get(&uri)
+            .and_then(|entry| entry.block_source().cloned())
+            .expect("a lazy entry");
+        let filled = source.filled_bytes_handle().load(Ordering::Acquire);
+
+        let queued = store.release_lazy_entry(&uri, store.now_us());
+        assert!(queued.is_some(), "the entry is released");
+        store.current_bytes.fetch_add(LATE_BYTES, Ordering::Release);
+        source
+            .filled_bytes_handle()
+            .fetch_add(LATE_BYTES, Ordering::AcqRel);
+
+        drop(queued);
+        drop(source);
+        assert_eq!(
+            store.stats().current_bytes,
+            filled,
+            "only the record stays counted"
+        );
+    }
+
     /// A lazy entry with a block write still queued.
     ///  - the sweep keeps it: its block file would be counted before the write's bytes are.
     ///  - once the write is done, the sweep drops it and counts the whole file.

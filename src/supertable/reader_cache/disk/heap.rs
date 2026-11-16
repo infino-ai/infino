@@ -5,11 +5,11 @@
 //!
 //! A cached file's reader keeps its decoded footer and page index after a query ends, and the disk
 //! budget does not count that memory. So:
-//! - whatever keeps decoded bytes holds a [`HeapReservation`], which gives them back when it drops;
+//! - each counted cache entry holds a [`HeapReservation`], which gives its bytes back when it drops;
 //! - past the budget, and only while the rest of the process leaves the metadata less room than the
-//!   budget, the lazily read files no query holds leave the cache, oldest first, keeping their
-//!   downloaded blocks on disk. A file mapped whole from local disk is not counted and stays, as
-//!   before.
+//!   budget, the files read lazily or held whole in memory that no query holds leave the cache,
+//!   oldest first, keeping their downloaded blocks on disk. A file mapped whole from local disk is
+//!   not counted, and this budget never drops it.
 
 #[cfg(test)]
 use std::sync::atomic::AtomicBool;
@@ -22,14 +22,14 @@ use std::{
         mpsc::{SyncSender, sync_channel},
     },
     thread,
-    time::Instant,
 };
 
 use tracing::debug;
 
 use crate::{
-    memory::{SAMPLE_EVERY, process_limit},
+    memory::process_limit,
     runtime_metrics::rss::{status_anon_rss_bytes, total_memory_bytes},
+    superfile::SuperfileReader,
     supertable::{manifest::SuperfileUri, reader_cache::disk::DiskCacheStore},
 };
 
@@ -67,9 +67,6 @@ pub(crate) fn free_elsewhere<T: Any + Send>(released: Vec<T>) {
     }
 }
 
-/// [`anon_resident`]'s mark for a reading not taken yet.
-const NEVER_READ: u64 = u64::MAX;
-
 /// The process's budget. Each test builds its own, so tests never share a total.
 static PROCESS: HeapBudget = HeapBudget::new();
 
@@ -86,29 +83,9 @@ fn memory_limit() -> Option<u64> {
 }
 
 /// Whether the rest of the process leaves cached metadata less room than its `budget`: anonymous
-/// resident memory above the limit minus the budget. A reading that cannot be taken counts as yes.
-fn short_of_memory(budget: u64) -> bool {
-    let Some(limit) = memory_limit() else {
-        return true;
-    };
-    anon_resident().is_none_or(|anon| anon > limit.saturating_sub(budget))
-}
-
-/// The process's anonymous resident bytes, read again at most once per [`SAMPLE_EVERY`], so a
-/// caller asking per file costs two atomic loads, and the answer is as fresh as the limit check's.
-fn anon_resident() -> Option<u64> {
-    static START: OnceLock<Instant> = OnceLock::new();
-    static READ_AT_US: AtomicU64 = AtomicU64::new(NEVER_READ);
-    static ANON: AtomicU64 = AtomicU64::new(0);
-    let now = START.get_or_init(Instant::now).elapsed().as_micros() as u64;
-    let read_at = READ_AT_US.load(Ordering::Acquire);
-    if read_at != NEVER_READ && now.saturating_sub(read_at) < SAMPLE_EVERY.as_micros() as u64 {
-        return Some(ANON.load(Ordering::Acquire));
-    }
-    let anon = status_anon_rss_bytes()?;
-    ANON.store(anon, Ordering::Release);
-    READ_AT_US.store(now, Ordering::Release);
-    Some(anon)
+/// resident memory above `limit` minus the budget. A reading that cannot be taken counts as yes.
+fn short_of_memory(limit: u64, budget: u64) -> bool {
+    status_anon_rss_bytes().is_none_or(|anon| anon > limit.saturating_sub(budget))
 }
 
 /// Decoded bytes counted in a budget until this drops. Kept next to what it pays for, so the bytes
@@ -143,7 +120,9 @@ impl Drop for HeapReservation {
 /// A total of reserved bytes, and the caches whose files may leave to keep it under budget.
 #[derive(Debug)]
 pub(crate) struct HeapBudget {
+    /// Bytes all live reservations hold.
     charged: AtomicU64,
+    /// The caches whose files this budget may drop; dead ones are pruned when the list is touched.
     caches: Mutex<Vec<Weak<DiskCacheStore>>>,
     /// A test's own budget, in place of the process's.
     #[cfg(test)]
@@ -200,7 +179,9 @@ impl HeapBudget {
         if self.fixed.is_some() {
             return self.short.load(Ordering::Acquire);
         }
-        self.budget().is_some_and(short_of_memory)
+        memory_limit()
+            .zip(self.budget())
+            .is_some_and(|(limit, budget)| short_of_memory(limit, budget))
     }
 
     /// The bytes reserved now.
@@ -209,7 +190,7 @@ impl HeapBudget {
         self.charged.load(Ordering::Acquire)
     }
 
-    /// Reserve `bytes` for a part kept anyway. Drops nothing now: the next
+    /// Count `bytes` of decoded metadata until the reservation drops. Drops no file now: the next
     /// [`Self::release_over_budget`] does, once queries let go of their files.
     pub(crate) fn reserve(&'static self, bytes: u64) -> HeapReservation {
         self.charged.fetch_add(bytes, Ordering::AcqRel);
@@ -219,9 +200,9 @@ impl HeapBudget {
         }
     }
 
-    /// Drop the oldest cached files no query holds until the total is back under budget. Does
-    /// nothing under it, with no budget, or while the process has room to spare: then the cache
-    /// keeps what it holds, as before.
+    /// Drop the oldest counted files no query holds until the total is back under budget, then each
+    /// cache's unheld lazy files past its cap. Does nothing under budget, with no budget, or while
+    /// the process has room to spare: then the cache keeps what it holds, as before.
     pub(crate) fn release_over_budget(&self) {
         let Some(budget) = self.budget() else { return };
         let charged = self.charged.load(Ordering::Acquire);
@@ -302,14 +283,20 @@ impl DiskCacheStore {
         budget.register(self);
     }
 
-    /// Count `bytes` more of what `uri`'s reader keeps decoded against the budget, until the file
-    /// leaves the cache. The budget bounds the metadata of files that can leave: a file mapped whole
-    /// from local disk never leaves, so it is not counted.
-    pub(crate) fn charge_heap(&self, uri: &SuperfileUri, bytes: u64) {
+    /// Count `bytes` more of what `reader` keeps decoded against the budget, until `uri`'s file
+    /// leaves the cache. Counted only while the cache still holds that reader for `uri`, so an
+    /// evicted file's reader never counts against its replacement. A file mapped whole from local
+    /// disk is not counted: this budget never drops it.
+    pub(crate) fn charge_heap(
+        &self,
+        uri: &SuperfileUri,
+        reader: &Arc<SuperfileReader>,
+        bytes: u64,
+    ) {
         let Some(entry) = self.cached.get(uri).map(|entry| Arc::clone(entry.value())) else {
             return;
         };
-        if entry.mmap().is_some() {
+        if entry.mmap().is_some() || !Arc::ptr_eq(&entry.reader, reader) {
             return;
         }
         entry
@@ -370,12 +357,13 @@ mod tests {
     /// Cache a lazy entry for a new file, last used at `last_access_us`, counting [`ENTRY_BYTES`].
     fn charged_entry(store: &Arc<DiskCacheStore>, last_access_us: u64) -> SuperfileUri {
         let uri = SuperfileUri::new_v4();
-        let reader = SuperfileReader::open(tiny_superfile_bytes()).expect("tiny superfile opens");
+        let reader =
+            Arc::new(SuperfileReader::open(tiny_superfile_bytes()).expect("tiny superfile opens"));
         store.cached.insert(
             uri,
             Arc::new(CachedEntry {
                 heap: OnceLock::new(),
-                reader: Arc::new(reader),
+                reader: Arc::clone(&reader),
                 residency: Residency::Paged {
                     block_source: dummy_block_source(store, uri),
                 },
@@ -384,8 +372,17 @@ mod tests {
                 last_access_us: AtomicU64::new(last_access_us),
             }),
         );
-        store.charge_heap(&uri, ENTRY_BYTES);
+        store.charge_heap(&uri, &reader, ENTRY_BYTES);
         uri
+    }
+
+    /// The reader the cache holds for `uri`.
+    fn cached_reader(store: &DiskCacheStore, uri: &SuperfileUri) -> Arc<SuperfileReader> {
+        store
+            .cached
+            .get(uri)
+            .map(|entry| Arc::clone(&entry.reader))
+            .expect("cached")
     }
 
     /// A cache with a budget of its own.
@@ -541,15 +538,28 @@ mod tests {
         let (_dir, store) = store_with_budget(None);
         let budget = store.heap_budget();
         let uri = charged_entry(&store, 1);
-        store.charge_heap(&uri, ENTRY_BYTES);
+        store.charge_heap(&uri, &cached_reader(&store, &uri), ENTRY_BYTES);
         assert_eq!(budget.charged(), 2 * ENTRY_BYTES);
         store.release_lazy_entry(&uri, store.now_us());
         assert!(!store.is_cached(&uri));
         assert_eq!(budget.charged(), 0);
     }
 
+    #[test]
+    fn a_reader_the_cache_no_longer_holds_is_not_counted() {
+        // A file counted once by its cached reader, then counted again through another reader of
+        // the same file, as a statement that opened it before an eviction and a reopen would.
+        // This test pins that only the reader the cache holds counts, so the file counts once.
+        let (_dir, store) = store_with_budget(None);
+        let uri = charged_entry(&store, 1);
+        let evicted =
+            Arc::new(SuperfileReader::open(tiny_superfile_bytes()).expect("tiny superfile opens"));
+        store.charge_heap(&uri, &evicted, ENTRY_BYTES);
+        assert_eq!(store.heap_budget().charged(), ENTRY_BYTES, "counted once");
+    }
+
     #[tokio::test]
-    async fn a_mapped_file_is_not_counted_and_never_leaves() {
+    async fn a_mapped_file_is_not_counted_or_dropped() {
         // A whole file mapped from local disk, over a budget of 0, the process short of memory.
         //  - counting it counts nothing;
         //  - the pass keeps it, and the disk budget still matches what is on disk.
@@ -566,10 +576,10 @@ mod tests {
             store.cached.get(&uri).is_some_and(|e| e.mmap().is_some()),
             "mapped"
         );
-        store.charge_heap(&uri, ENTRY_BYTES);
+        store.charge_heap(&uri, &cached_reader(&store, &uri), ENTRY_BYTES);
         assert_eq!(store.heap_budget().charged(), 0, "not counted");
         store.heap_budget().release_over_budget();
-        assert!(store.is_cached(&uri), "never leaves");
+        assert!(store.is_cached(&uri), "kept");
         store.assert_budget_consistent();
     }
 }

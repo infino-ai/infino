@@ -453,7 +453,7 @@ impl DiskCacheStore {
         // A source that charged its blocks hands that charge to the record, so the bytes count
         // once however long the source outlives its entry (a released reader may wait its turn
         // on the freeing thread).
-        if !source.hand_over_accounting() {
+        if !source.hand_over_accounting(filled) {
             self.current_bytes.fetch_add(filled, Ordering::Release);
         }
         let file = UnindexedFile {

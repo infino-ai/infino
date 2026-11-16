@@ -44,7 +44,7 @@ use crate::{
 /// How often the sampler reads the process's anonymous memory while a
 /// statement is watching. Growth that lasts longer than this is seen; a
 /// shorter spike may not be.
-pub(crate) const SAMPLE_EVERY: Duration = Duration::from_millis(100);
+const SAMPLE_EVERY: Duration = Duration::from_millis(100);
 
 /// The sampler thread's name, as a stack dump shows it.
 const SAMPLER_THREAD_NAME: &str = "infino-rss-sampler";

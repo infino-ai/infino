@@ -128,7 +128,7 @@ mod resident;
 
 pub(crate) use datafusion_pool::budgeted_session_context;
 pub(crate) use resident::{
-    SAMPLE_EVERY, over_process_limit, process_limit, process_limit_exceeded, process_over_limit,
+    over_process_limit, process_limit, process_limit_exceeded, process_over_limit,
 };
 
 test_visible! {
