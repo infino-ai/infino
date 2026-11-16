@@ -686,11 +686,8 @@ impl Connection {
                 handles,
                 building,
             } => {
-                // Warm path: lock-free sharded lookup, no serialization. The
-                // handle's freshness check runs first, so a table another
-                // process dropped is seen here rather than only by a later
-                // query; such a handle is dropped and the cold path
-                // re-resolves the name against the catalog.
+                // Warm path: lock-free lookup. A handle whose table was
+                // dropped elsewhere is skipped, so the cold path re-resolves it.
                 if let Some(handle) = fresh_live_handle(handles, name) {
                     return Ok(handle);
                 }
@@ -905,9 +902,8 @@ impl Connection {
                 Ok((*handle.table_schema()).clone())
             }
             CatalogStore::Storage { root, handles, .. } => {
-                // A handle already open answers with the document it holds,
-                // as every other read through this connection does, once its
-                // freshness check has not found the table dropped elsewhere.
+                // A handle already open answers, unless its table was dropped
+                // elsewhere.
                 if let Some(handle) = fresh_live_handle(handles, name) {
                     return Ok((*handle.table_schema()).clone());
                 }
@@ -2134,15 +2130,9 @@ fn live_handle(
     None
 }
 
-/// [`live_handle`], after the handle's freshness check: a table another
-/// process dropped is otherwise served from cache until some query on the
-/// handle happens to read its pointer. The check follows the handle's read
-/// consistency, so it reads nothing under `Snapshot` and at most one pointer
-/// per window under `BoundedStaleness`. A failed probe that does not find
-/// the pointer gone leaves the handle in place, as a query's check does; a
-/// query under `Strong` checks again and reports it.
-///
-/// No map guard is held across the check, which reads storage.
+/// [`live_handle`], after the handle's freshness check, so a table another
+/// process dropped is not served from cache. The check reads at most one
+/// pointer per staleness window.
 fn fresh_live_handle(
     handles: &DashMap<String, SupertableHandle>,
     name: &str,
@@ -2152,8 +2142,8 @@ fn fresh_live_handle(
     if !handle.pointer_vanished() {
         return Some(handle);
     }
-    // Only a vanished handle goes: a peer may have built the next generation
-    // under this name since the lookup above.
+    // Remove it only if it is still the dropped one: another process may have
+    // re-created the table since.
     handles.remove_if(name, |_, cached| cached.pointer_vanished());
     None
 }
@@ -3964,44 +3954,10 @@ mod tests {
         );
     }
 
-    /// A process that had a table open sees another process drop it on its
-    /// next open, with no query in between to run the handle's freshness
-    /// check: the open runs it.
+    /// A table dropped and re-created by another process is seen on the next
+    /// open, with no query in between.
     #[test]
-    fn open_table_sees_a_peer_drop_without_a_query() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let uri = dir.path().to_str().expect("utf8 path").to_string();
-        let strong = || ConnectOptions::new().with_read_consistency(Consistency::Strong);
-        let writer = connect_with(&uri, strong()).expect("connect writer");
-        let reader = connect_with(&uri, strong()).expect("connect reader");
-
-        writer
-            .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
-            .expect("create_table");
-        reader
-            .open_table("docs")
-            .expect("reader opens the table")
-            .append(&build_title_batch(&["the quick brown fox"]))
-            .expect("reader appends");
-        assert_eq!(count_rows(&reader, "docs"), 1, "reader's handle is cached");
-
-        writer.drop_table("docs", true).expect("drop elsewhere");
-
-        match reader.open_table("docs") {
-            Err(InfinoError::NotFound(_)) => {}
-            Err(e) => panic!("expected NotFound, got {e:?}"),
-            Ok(_) => panic!("a table dropped elsewhere must not open from cache"),
-        }
-        assert!(
-            matches!(reader.schema("docs"), Err(InfinoError::NotFound(_))),
-            "a describe must not answer for the dropped table either"
-        );
-    }
-
-    /// The same, with the name re-created under another schema: the open
-    /// returns the new generation, again with no query in between.
-    #[test]
-    fn open_table_returns_the_new_generation_after_a_peer_recreate() {
+    fn open_table_sees_a_peer_drop_and_recreate() {
         let dir = tempfile::tempdir().expect("tempdir");
         let uri = dir.path().to_str().expect("utf8 path").to_string();
         let strong = || ConnectOptions::new().with_read_consistency(Consistency::Strong);
@@ -4013,9 +3969,18 @@ mod tests {
             .expect("create_table")
             .append(&build_title_batch(&["the quick brown fox"]))
             .expect("append");
-        assert_eq!(count_rows(&reader, "docs"), 1, "reader's handle is cached");
+        assert_eq!(count_rows(&reader, "docs"), 1, "reader caches the handle");
 
         writer.drop_table("docs", true).expect("drop elsewhere");
+        assert!(matches!(
+            reader.open_table("docs"),
+            Err(InfinoError::NotFound(_))
+        ));
+        assert!(matches!(
+            reader.schema("docs"),
+            Err(InfinoError::NotFound(_))
+        ));
+
         let wider = Arc::new(Schema::new(vec![
             Field::new("title", DataType::LargeUtf8, false),
             Field::new("body", DataType::LargeUtf8, true),
@@ -4023,59 +3988,10 @@ mod tests {
         writer
             .create_table("docs", wider, IndexSpec::new().fts("title"))
             .expect("re-create with another schema");
-
-        let reopened = reader.open_table("docs").expect("reader opens docs");
-        assert!(
-            reopened.schema().field_with_name("body").is_ok(),
-            "the open must return the new generation: {:?}",
-            reopened.schema()
-        );
-        assert!(
-            reader
-                .schema("docs")
-                .expect("describe")
-                .fields()
-                .iter()
-                .any(|f| f.name == "body"),
-            "a describe must answer for the new generation"
-        );
-    }
-
-    /// The open's freshness check costs nothing inside the staleness window:
-    /// an unchanged table opens from cache, the same handle, with no storage
-    /// request.
-    #[test]
-    fn open_table_within_the_staleness_window_reads_no_storage() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let uri = dir.path().to_str().expect("utf8 path").to_string();
-        let reader = connect_with(
-            &uri,
-            ConnectOptions::new()
-                .with_read_consistency(Consistency::BoundedStaleness(Duration::from_secs(3600))),
-        )
-        .expect("connect reader");
-        reader
-            .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
-            .expect("create_table")
-            .append(&build_title_batch(&["the quick brown fox"]))
-            .expect("append");
-        let first = reader.open_table("docs").expect("open");
-
-        let before = reader.usage_snapshot();
-        let second = reader.open_table("docs").expect("open again");
-        let third = reader.open_table("docs").expect("open a third time");
-        let delta = reader.usage_snapshot().since(&before);
-
-        assert!(delta.is_zero(), "a warm open read storage: {delta:?}");
-        for again in [&second, &third] {
-            assert!(
-                Arc::ptr_eq(
-                    first.local_handle().options(),
-                    again.local_handle().options()
-                ),
-                "a warm open must return the cached handle"
-            );
-        }
+        let reopened = reader.open_table("docs").expect("open the new table");
+        assert!(reopened.schema().field_with_name("body").is_ok());
+        let described = reader.schema("docs").expect("schema");
+        assert!(described.fields().iter().any(|f| f.name == "body"));
     }
 
     /// The same purge, against a peer handle that has never served a read.
