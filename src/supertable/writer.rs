@@ -14317,6 +14317,11 @@ pub(crate) async fn try_commit_attempt(
     // Checked immediately before the pointer PUT; see [`CommitFence`].
     fence: Option<&mut dyn CommitFence>,
 ) -> Result<ManifestSnapshot, SupertableCommitError> {
+    // A merge listed this table's superfiles; adding or rewriting any would let a later merge
+    // copy rows it already has.
+    if current_manifest.is_frozen() && (!new_entries.is_empty() || !entries_to_remove.is_empty()) {
+        return Err(BuildError::TableFrozen.into());
+    }
     // 1. Write each new superfile's bytes to storage in parallel.
     write_superfile_list(
         &storage,

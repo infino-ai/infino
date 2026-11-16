@@ -636,6 +636,7 @@ impl ManifestSnapshot {
             partition_strategy: strategy,
             vector_index_storage_prefix,
             companions,
+            frozen: false,
             global_vector_index: None,
             drained_ranges: Default::default(),
             deleted_user_ids_inline: None,
@@ -920,6 +921,16 @@ impl ManifestSnapshot {
     /// transposed centroid cache stays resident across warm queries.
     pub fn get_global_vector_index(&self) -> Option<list::GlobalVectorIndex> {
         self.global_vector_index().cloned()
+    }
+
+    /// Whether the table was frozen for a merge and takes no more writes.
+    pub(crate) fn is_frozen(&self) -> bool {
+        self.list.as_ref().is_some_and(|l| l.frozen)
+    }
+
+    /// Successor manifest (bumped id) frozen for a merge.
+    pub(crate) fn with_frozen(&self) -> Self {
+        self.with_list_edited(true, |list| list.frozen = true)
     }
 
     /// Borrow the global vector cell-index (no clone — keeps the transposed
@@ -2958,6 +2969,7 @@ impl ManifestSnapshot {
 
         let opts_hash = options_hash::compute_options_hash(opts.as_ref(), &strategy);
         let new_list = Manifest {
+            frozen: self.is_frozen(),
             // Carry/advance the hidden drain watermark via the stamp (the drain
             // sets it with `with_drained_ranges` in the same commit). Empty on
             // the user manifest.
@@ -7263,6 +7275,7 @@ mod tests {
 
         fn fresh_list(entries: Vec<ManifestPartEntry>) -> Manifest {
             Manifest {
+                frozen: false,
                 drained_ranges: Default::default(),
                 global_vector_index: None,
                 tombstone_seqs: Default::default(),
@@ -8193,6 +8206,7 @@ mod tests {
         use list::{Manifest, PartitionStrategy};
         let entry = part::PartId::new_v4();
         let list = Manifest {
+            frozen: false,
             drained_ranges: Default::default(),
             global_vector_index: None,
             tombstone_seqs: Default::default(),
@@ -8383,6 +8397,7 @@ mod tests {
         Arc::new(ManifestSnapshot {
             superfile_list: SuperfileList::empty(opts.clone()),
             list: Some(Manifest {
+                frozen: false,
                 drained_ranges: Default::default(),
                 global_vector_index: None,
                 tombstone_seqs: Default::default(),
@@ -8530,6 +8545,7 @@ mod tests {
         };
 
         let list = Manifest {
+            frozen: false,
             drained_ranges: Default::default(),
             global_vector_index: None,
             tombstone_seqs: Default::default(),
@@ -8612,6 +8628,7 @@ mod tests {
             make_superfile_entry(50, hash_bucket_0_pk()),
         ];
         let list = Manifest {
+            frozen: false,
             drained_ranges: Default::default(),
             global_vector_index: None,
             tombstone_seqs: Default::default(),
@@ -9220,6 +9237,7 @@ mod tests {
             None => (None, None),
         };
         let list = Manifest {
+            frozen: false,
             drained_ranges: Default::default(),
             global_vector_index: None,
             tombstone_seqs: Default::default(),
@@ -9437,6 +9455,7 @@ mod tests {
             .await
             .expect("put routing part");
         let list = Manifest {
+            frozen: false,
             drained_ranges: Default::default(),
             global_vector_index: None,
             tombstone_seqs: Default::default(),
@@ -10239,6 +10258,7 @@ mod tests {
         let opts = Arc::new(base_opts);
 
         let list = Manifest {
+            frozen: false,
             drained_ranges: Default::default(),
             global_vector_index: None,
             tombstone_seqs: Default::default(),
@@ -10420,6 +10440,7 @@ mod tests {
             .expect("write part");
 
         let list = Manifest {
+            frozen: false,
             drained_ranges: Default::default(),
             global_vector_index: None,
             tombstone_seqs: Default::default(),
@@ -10586,6 +10607,7 @@ mod tests {
         // (rewrite candidate under option-B); part_0 and part_1 are
         // frozen earlier parts.
         let list = Manifest {
+            frozen: false,
             drained_ranges: Default::default(),
             global_vector_index: None,
             tombstone_seqs: Default::default(),
@@ -10804,6 +10826,7 @@ mod tests {
             .expect("write part");
 
         let list = Manifest {
+            frozen: false,
             drained_ranges: Default::default(),
             global_vector_index: None,
             tombstone_seqs: Default::default(),
@@ -10917,6 +10940,7 @@ mod tests {
             .expect("write part");
 
         let list = Manifest {
+            frozen: false,
             drained_ranges: Default::default(),
             global_vector_index: None,
             tombstone_seqs: Default::default(),
@@ -11057,6 +11081,7 @@ mod tests {
             .expect("write part");
 
         let list = Manifest {
+            frozen: false,
             drained_ranges: Default::default(),
             global_vector_index: None,
             tombstone_seqs: Default::default(),
@@ -11187,6 +11212,7 @@ mod tests {
         // Old manifest with TWO entries for same partition (result of prior split)
         // Second one is the "latest" for that partition
         let list = Manifest {
+            frozen: false,
             drained_ranges: Default::default(),
             global_vector_index: None,
             tombstone_seqs: Default::default(),
@@ -11336,6 +11362,7 @@ mod tests {
             .expect("write part_b");
 
         let list = Manifest {
+            frozen: false,
             drained_ranges: Default::default(),
             global_vector_index: None,
             tombstone_seqs: Default::default(),
@@ -11495,6 +11522,7 @@ mod tests {
             .expect("write part_b");
 
         let list = Manifest {
+            frozen: false,
             drained_ranges: Default::default(),
             global_vector_index: None,
             tombstone_seqs: Default::default(),
@@ -11668,6 +11696,7 @@ mod tests {
 
         // List order: [a_old, a_latest, b_old, b_latest]
         let list = Manifest {
+            frozen: false,
             drained_ranges: Default::default(),
             global_vector_index: None,
             tombstone_seqs: Default::default(),
@@ -11909,6 +11938,7 @@ mod tests {
             .expect("write part");
 
         let list = Manifest {
+            frozen: false,
             drained_ranges: Default::default(),
             global_vector_index: None,
             tombstone_seqs: Default::default(),
@@ -12019,6 +12049,7 @@ mod tests {
             .expect("write part");
 
         let list = Manifest {
+            frozen: false,
             drained_ranges: Default::default(),
             global_vector_index: None,
             tombstone_seqs: Default::default(),
@@ -12145,6 +12176,7 @@ mod tests {
             .expect("write part_b");
 
         let list = Manifest {
+            frozen: false,
             drained_ranges: Default::default(),
             global_vector_index: None,
             tombstone_seqs: Default::default(),
@@ -12297,6 +12329,7 @@ mod tests {
             .expect("write part_a_latest");
 
         let list = Manifest {
+            frozen: false,
             drained_ranges: Default::default(),
             global_vector_index: None,
             tombstone_seqs: Default::default(),
@@ -12446,6 +12479,7 @@ mod tests {
             .expect("write part");
 
         let list = Manifest {
+            frozen: false,
             drained_ranges: Default::default(),
             global_vector_index: None,
             tombstone_seqs: Default::default(),
@@ -12546,6 +12580,7 @@ mod tests {
             .expect("write part");
 
         let list = Manifest {
+            frozen: false,
             drained_ranges: Default::default(),
             global_vector_index: None,
             tombstone_seqs: Default::default(),
@@ -12665,6 +12700,7 @@ mod tests {
             .expect("write part_a_latest");
 
         let list = Manifest {
+            frozen: false,
             drained_ranges: Default::default(),
             global_vector_index: None,
             tombstone_seqs: Default::default(),
@@ -12813,6 +12849,7 @@ mod tests {
             })
             .collect();
         Manifest {
+            frozen: false,
             drained_ranges: Default::default(),
             global_vector_index: None,
             tombstone_seqs: Default::default(),

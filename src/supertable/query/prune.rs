@@ -646,6 +646,7 @@ mod tests {
 
     fn list_with(parts: Vec<ManifestPartEntry>) -> Manifest {
         Manifest {
+            frozen: false,
             drained_ranges: Default::default(),
             global_vector_index: None,
             tombstone_seqs: Default::default(),

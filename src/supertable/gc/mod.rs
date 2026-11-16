@@ -825,6 +825,7 @@ mod tests {
             Vec::new(),
             Some(storage),
             Some(Manifest {
+                frozen: false,
                 tombstone_seqs: Default::default(),
                 superseded_cells: Default::default(),
                 split_checks: Default::default(),
@@ -981,6 +982,7 @@ mod tests {
             Vec::new(),
             Some(storage),
             Some(Manifest {
+                frozen: false,
                 tombstone_seqs: Default::default(),
                 superseded_cells: Default::default(),
                 split_checks: Default::default(),
@@ -1092,6 +1094,7 @@ mod tests {
             Vec::new(),
             Some(storage),
             Some(Manifest {
+                frozen: false,
                 tombstone_seqs: Default::default(),
                 superseded_cells: Default::default(),
                 split_checks: Default::default(),

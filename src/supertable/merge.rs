@@ -403,6 +403,25 @@ async fn splice_term_index(
     Ok(spliced.load(Ordering::Relaxed))
 }
 
+/// Freezes `table` for a merge: no more rows and no compaction from here on, in any process, so
+/// a rerun never meets its rows under new superfile ids. Safe to repeat.
+fn freeze(table: &Supertable) -> Result<(), QueryError> {
+    let inner = table.inner();
+    let storage = storage_of_table(table)?;
+    table.block_on_query(async {
+        inner.refresh().await.map_err(internal)?;
+        if inner.manifest.load().is_frozen() {
+            return Ok(());
+        }
+        stamp_with_retries(inner, &storage, "merge freeze", |old| async move {
+            Ok((!old.is_frozen()).then(|| old.with_frozen()))
+        })
+        .await
+        .map_err(internal)?;
+        inner.refresh().await.map_err(internal).map(drop)
+    })
+}
+
 fn storage_of_table(table: &Supertable) -> Result<Arc<dyn StorageProvider>, QueryError> {
     table
         .inner()
@@ -424,6 +443,7 @@ pub fn merge_tables(
     let storage = storage_of_table(table)?;
     let mut report = MergeReport::default();
     for source in sources {
+        freeze(source)?;
         let reader = source.reader().map_err(internal)?;
         let mut objects = objects_to_copy(table, &reader, true)?;
         let spliced = objects.spliceable;

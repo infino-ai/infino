@@ -105,3 +105,34 @@ fn two_merges_into_one_table_at_once_add_each_row_once() {
     let n = t.count("title", "row", BoolMode::Or).expect("count");
     assert_eq!(n, 400);
 }
+
+/// A merge freezes its sources: they take no more rows and no compaction, so a rerun never
+/// meets merged rows under new superfile ids and copies them again.
+#[test]
+fn a_merged_source_is_frozen_so_a_rerun_adds_nothing() {
+    use infino::{CompactionSettings, InfinoError, OptimizeOptions};
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = connect(dir.path().to_str().expect("utf-8")).expect("connect");
+    let spec = || IndexSpec::new().fts("title");
+    let t = db.create_table("t", schema(), spec()).expect("target");
+    let a = db.create_table("a", schema(), spec()).expect("source");
+    for _ in 0..4 {
+        a.append(&batch("a", 10)).expect("append");
+    }
+    t.merge_tables(&[&a]).expect("first merge");
+    assert!(matches!(
+        a.append(&batch("a", 10)),
+        Err(InfinoError::Unsupported(_))
+    ));
+    let settings = CompactionSettings {
+        min_superfiles_for_merge: 2,
+        ..CompactionSettings::default()
+    };
+    a.optimize(&OptimizeOptions::compact(settings))
+        .expect("an optimize of a frozen table does nothing");
+    let again = t.merge_tables(&[&a]).expect("rerun");
+    assert_eq!((again.merged, again.copied), (0, 0));
+    let count =
+        |table: &infino::Supertable| table.count("title", "row", BoolMode::Or).expect("count");
+    assert_eq!((count(&t), count(&a)), (40, 40));
+}
