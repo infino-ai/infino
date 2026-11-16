@@ -68,3 +68,40 @@ fn tables_loaded_apart_merge_into_one_and_outlive_their_sources() {
     );
     assert_eq!(count("before"), 5);
 }
+
+/// Two processes merging the same sources into one table, as when the job moves to another
+/// worker mid-merge, add every row once.
+#[test]
+fn two_merges_into_one_table_at_once_add_each_row_once() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().to_str().expect("utf-8").to_owned();
+    let db = connect(&root).expect("connect");
+    let spec = || IndexSpec::new().fts("title");
+    db.create_table("t", schema(), spec()).expect("target");
+    for name in ["a", "b", "c", "d"] {
+        let s = db.create_table(name, schema(), spec()).expect("source");
+        for _ in 0..4 {
+            s.append(&batch(name, 25)).expect("append");
+        }
+    }
+    let run = || {
+        let root = root.clone();
+        std::thread::spawn(move || {
+            let db = connect(&root).expect("connect");
+            let t = db.open_table("t").expect("t");
+            let sources: Vec<_> = ["a", "b", "c", "d"]
+                .iter()
+                .map(|n| db.open_table(n).expect("source"))
+                .collect();
+            let refs: Vec<_> = sources.iter().collect();
+            t.merge_tables(&refs).map(|r| r.merged)
+        })
+    };
+    let (x, y) = (run(), run());
+    let (x, y) = (x.join().expect("join"), y.join().expect("join"));
+    x.expect("first merge");
+    y.expect("second merge");
+    let t = connect(&root).expect("connect").open_table("t").expect("t");
+    let n = t.count("title", "row", BoolMode::Or).expect("count");
+    assert_eq!(n, 400);
+}
