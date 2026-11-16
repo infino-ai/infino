@@ -62,9 +62,10 @@ impl Supertable {
         if opts.steps.drain_hidden_cells {
             match self.drain_hidden_vector_cells_sync() {
                 Ok(()) => {}
-                // A drain with no room for its temp files keeps what it has
-                // spilled and goes on in a later pass. The steps below do
-                // not need it, and compaction can free the room it lacks.
+                // A drain whose table's disk budget has no room for its temp
+                // files keeps what it has spilled and goes on in a later
+                // pass. The steps below do not need it. A drain stopped by a
+                // full disk is an error, like any other.
                 Err(BuildError::ScratchFull(reason)) => {
                     tracing::warn!("{reason}; optimize goes on without this drain");
                 }

@@ -152,10 +152,11 @@ pub enum BuildError {
     #[error("superfile store: {0}")]
     Store(String),
 
-    /// The build's temp files have no room: the disk is too full for them,
-    /// or the table's disk budget has none left for temp files. Nothing is
-    /// wrong with the table, so maintenance skips the step for now rather
-    /// than failing; the message says what stopped and what it needed.
+    /// The build's temp files have no room right now in the table's disk
+    /// budget. Nothing is wrong with the table, so maintenance skips the
+    /// step for now rather than failing; the message says what stopped and
+    /// what it needed. A full disk is not this: it is a [`Self::Store`]
+    /// error.
     #[error("{0}")]
     ScratchFull(String),
 

@@ -14,6 +14,7 @@ use std::{
     io::{BufWriter, Write},
     mem,
     panic::{self, AssertUnwindSafe},
+    path::Path,
     pin::pin,
     sync::{
         Arc, Mutex, OnceLock,
@@ -70,7 +71,7 @@ use crate::{
         query::{dispatch::open_whole_superfile, vector},
         reader_cache::{
             SuperfileReaderCache,
-            disk::{ScratchCharge, mmap_temp_file_bytes},
+            disk::{ScratchCharge, ScratchRoom, mmap_temp_file_bytes},
         },
         schema::{FieldId, PhysicalSchema, TableSchema, map::FileSchemaMap},
         wal::{
@@ -81,8 +82,8 @@ use crate::{
             CommitFence, CommitListMetadata, NewEntryBirthVersions, PreparedSuperfile, ShardOutput,
             backoff_delay, finalize_compaction_commit, maint_pool, orphaned_id_floor,
             pending_drain_sources, persist_list_metadata_async, prepare_superfile_named,
-            recalibrate_probe_laws, refresh_slow_vector_state, split_overflow_cells,
-            term_head_sink_for, try_commit_attempt, write_superfile_list,
+            recalibrate_probe_laws, refresh_slow_vector_state, scratch_disk_fits, scratch_space,
+            split_overflow_cells, term_head_sink_for, try_commit_attempt, write_superfile_list,
         },
     },
     utils::{
@@ -1028,9 +1029,11 @@ impl Supertable {
 
         // Charged with the inputs already open: they are the cache's most
         // recently used files, so the room made for the merge's temp files
-        // comes from files it does not read.
+        // comes from files it does not read. The disk is checked after, once
+        // that room is made.
         if let Some((charge, bytes)) = temp_files.as_mut() {
             charge_merge_temp_files(charge, *bytes).await?;
+            check_scratch_disk_holds(&manifest.options.scratch_dir(), *bytes)?;
         }
 
         // The merged file replaces its inputs, so it bakes the table-wide
@@ -1232,14 +1235,14 @@ impl Supertable {
             .estimated_output_bytes
             .saturating_mul(MERGE_TEMP_FILES_PER_OUTPUT_BYTE);
         let mut scratch = opts.disk_cache.as_ref().map(|cache| cache.scratch_charge());
-        if let (Some(cache), Some(charge)) = (opts.disk_cache.as_ref(), scratch.as_ref())
+        if let Some(charge) = scratch.as_ref()
             && charge.could_hold(temp_bytes)
-            && cache.scratch_room() < temp_bytes
+            && charge.room() < temp_bytes
         {
             return Err(CompactionError::ScratchFull(format!(
                 "the table's disk budget has room for {} of the {temp_bytes} bytes of temp \
                  files this merge needs",
-                cache.scratch_room()
+                charge.room()
             )));
         }
 
@@ -2549,7 +2552,7 @@ fn collect_merge(
         // streak nor the pass's result: the table is not sick, and the
         // holder's pass is doing this job's work.
         Ok((_, Err(e @ CompactionError::SidecarConflict { .. }))) => {
-            dropped.record_held(&e);
+            dropped.record_skipped(&e, "left its input to another compactor");
             return false;
         }
         // The table's disk budget had no room for this merge's temp files.
@@ -2558,7 +2561,7 @@ fn collect_merge(
         // streak nor the pass's result: the table is not sick, and the rest
         // of the plan may still fit.
         Ok((_, Err(e @ CompactionError::ScratchFull(_)))) => {
-            dropped.record_no_room(&e);
+            dropped.record_skipped(&e, "had no room for its temp files");
             return false;
         }
         Ok((_, Err(e))) => e,
@@ -2587,18 +2590,13 @@ impl DroppedJobs {
         self.last = Some(e);
     }
 
-    /// A job that left its input to another compactor: counted with the
-    /// dropped jobs, but not a reason for the pass to fail, so it never
-    /// becomes `last`, which a pass that stopped admitting surfaces.
-    fn record_held(&mut self, e: &CompactionError) {
-        warn!(error = %e, "compaction job left its input to another compactor");
-        self.jobs += 1;
-    }
-
-    /// A job with no room for its temp files: counted with the dropped
-    /// jobs but, like [`Self::record_held`], never `last`.
-    fn record_no_room(&mut self, e: &CompactionError) {
-        warn!(error = %e, "compaction job skipped for this pass: no room for its temp files");
+    /// A job skipped for this pass for `reason`, with nothing wrong with
+    /// the table (its input is another compactor's, or its temp files have
+    /// no room): counted with the dropped jobs, but not a reason for the
+    /// pass to fail, so it never becomes `last`, which a pass that stopped
+    /// admitting surfaces.
+    fn record_skipped(&mut self, e: &CompactionError, reason: &str) {
+        warn!(error = %e, "compaction job skipped for this pass: it {reason}");
         self.jobs += 1;
     }
 }
@@ -2639,25 +2637,40 @@ pub(crate) struct PreparedJob {
 /// evicting cache files to make room. Without room right now the merge
 /// fails with [`BuildError::ScratchFull`]. When the budget could not hold
 /// the merge's temp files even with no others charged, waiting cannot help:
-/// the merge goes on uncharged with a warning, within the disk's free space
-/// alone, so a table whose budget is smaller than a merge still compacts.
+/// the merge goes on uncharged with a warning, so a table whose budget is
+/// smaller than a merge still compacts.
 async fn charge_merge_temp_files(charge: &mut ScratchCharge, bytes: u64) -> Result<(), BuildError> {
-    let Err(error) = charge.grow(bytes).await else {
-        return Ok(());
-    };
-    if charge.could_hold(bytes) {
-        return Err(BuildError::ScratchFull(format!(
+    match charge.try_grow(bytes).await {
+        ScratchRoom::Charged => Ok(()),
+        ScratchRoom::NoRoom(error) => Err(BuildError::ScratchFull(format!(
             "the table's disk budget has no room for the {bytes} bytes of temp files this \
              merge needs: {error}"
-        )));
+        ))),
+        ScratchRoom::NeverFits(error) => {
+            warn!(
+                needed_bytes = bytes,
+                %error,
+                "compact: the table's disk budget is too small for this merge's temp files; \
+                 they are not counted against it and only the disk's free space limits them"
+            );
+            Ok(())
+        }
     }
-    warn!(
-        needed_bytes = bytes,
-        %error,
-        "compact: the table's disk budget is too small for this merge's temp files; they are \
-         not counted against it"
-    );
-    Ok(())
+}
+
+/// Fail a merge about to write `bytes` of temp files in `scratch` when the
+/// disk holding it would be left with less than its reserve: everything
+/// else on the disk (the caches, other tables' work) fails once it is full.
+fn check_scratch_disk_holds(scratch: &Path, bytes: u64) -> Result<(), BuildError> {
+    match scratch_space(scratch) {
+        Some((free, total)) if !scratch_disk_fits(free, total, bytes) => {
+            Err(BuildError::Store(format!(
+                "merge stopped before writing: its temp files need {bytes} bytes and the \
+                 scratch disk has {free} of {total} free"
+            )))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Re-stamps a batch's seals once the uploads are behind it.
@@ -5190,6 +5203,21 @@ mod tests {
             assert!(Instant::now() < deadline, "a file is left behind");
             time::sleep(WARM_POLL).await;
         }
+    }
+
+    /// A merge whose temp files would leave the scratch disk short of its
+    /// reserve fails as a store error, which stops the pass, and is not
+    /// reported as a merge with no room in the disk budget.
+    #[test]
+    fn a_merge_the_scratch_disk_cannot_hold_is_a_store_error() {
+        let dir = TempDir::new().expect("tempdir");
+        let (free, total) = scratch_space(dir.path()).expect("disk space");
+        let err = check_scratch_disk_holds(dir.path(), free).expect_err("the whole free disk");
+        assert!(matches!(err, BuildError::Store(_)), "{err}");
+        assert_eq!(
+            check_scratch_disk_holds(dir.path(), 0).is_ok(),
+            scratch_disk_fits(free, total, 0)
+        );
     }
 
     /// A merge's temp files are charged to its table's disk budget before

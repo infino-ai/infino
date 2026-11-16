@@ -451,6 +451,13 @@ impl DiskCacheStore {
             .saturating_sub(self.scratch_bytes.load(Ordering::Acquire))
     }
 
+    /// Bytes of the budget nothing is charged for: what can still be written beside the cache
+    /// before a reservation has to evict.
+    pub(crate) fn unused_budget_bytes(&self) -> u64 {
+        self.disk_budget_bytes()
+            .saturating_sub(self.current_bytes.load(Ordering::Acquire))
+    }
+
     /// An empty charge on this cache's budget, for temp files beside it to grow into.
     pub(crate) fn scratch_charge(self: &Arc<Self>) -> ScratchCharge {
         ScratchCharge {
@@ -826,6 +833,18 @@ impl Drop for BlockWriteTicket {
     }
 }
 
+/// How [`ScratchCharge::try_grow`] went.
+pub(crate) enum ScratchRoom {
+    /// The bytes are charged.
+    Charged,
+    /// No room right now: other temp files hold the share, or eviction could not free enough.
+    /// A later call may succeed.
+    NoRoom(DiskCacheError),
+    /// The budget could not hold the charge even with no other temp files charged, so waiting
+    /// never helps.
+    NeverFits(DiskCacheError),
+}
+
 /// Bytes charged to a cache's budget for temp files beside it. Drop gives them back.
 ///
 /// The charge is part of the one budget the cache keeps to: growing it evicts cache files,
@@ -844,29 +863,40 @@ impl ScratchCharge {
     pub(crate) async fn grow(&mut self, more: u64) -> Result<(), DiskCacheError> {
         let store = &self.store;
         let cap = store.scratch_cap();
-        let full = |charged| DiskCacheError::ScratchFull {
-            needed: more,
-            charged,
-            cap,
-        };
-        let charged = store.scratch_bytes.load(Ordering::Acquire);
-        if charged.saturating_add(more) > cap {
-            return Err(full(charged));
-        }
-        store.reserve_manual(more).await?;
-        // Checked again as it is counted: another charge may have grown while this one evicted.
-        let counted =
-            store
-                .scratch_bytes
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |charged| {
-                    charged.checked_add(more).filter(|&next| next <= cap)
-                });
-        if let Err(charged) = counted {
-            store.current_bytes.fetch_sub(more, Ordering::Release);
-            return Err(full(charged));
+        // The share is claimed before anything is evicted, so of two charges that would pass it
+        // together only one evicts.
+        store
+            .scratch_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |charged| {
+                charged.checked_add(more).filter(|&next| next <= cap)
+            })
+            .map_err(|charged| DiskCacheError::ScratchFull {
+                needed: more,
+                charged,
+                cap,
+            })?;
+        if let Err(error) = store.reserve_manual(more).await {
+            store.scratch_bytes.fetch_sub(more, Ordering::AcqRel);
+            return Err(error);
         }
         self.bytes += more;
         Ok(())
+    }
+
+    /// [`Self::grow`], telling a charge with no room right now from one the budget could never
+    /// hold. Either way the charge is left as it was.
+    pub(crate) async fn try_grow(&mut self, more: u64) -> ScratchRoom {
+        match self.grow(more).await {
+            Ok(()) => ScratchRoom::Charged,
+            Err(error) if self.could_hold(more) => ScratchRoom::NoRoom(error),
+            Err(error) => ScratchRoom::NeverFits(error),
+        }
+    }
+
+    /// Bytes the cache's temp files may still be charged before they hold their whole share
+    /// of the budget.
+    pub(crate) fn room(&self) -> u64 {
+        self.store.scratch_room()
     }
 
     /// Give back whatever is charged past `bytes`.
@@ -885,7 +915,7 @@ impl ScratchCharge {
     }
 
     /// Whether the budget could hold this charge grown by `more` with no other temp files
-    /// charged. When it could not, waiting for room never helps.
+    /// charged.
     pub(crate) fn could_hold(&self, more: u64) -> bool {
         self.bytes.saturating_add(more) <= self.store.scratch_cap()
     }
@@ -1293,6 +1323,37 @@ mod tests {
         drop(second);
         drop(charge);
         assert_eq!(store.stats().scratch_bytes, 0);
+        store.assert_budget_consistent();
+    }
+
+    /// A charge within its share that the budget cannot make room for gives the share back, so
+    /// the next charge finds it free, and tells "no room now" from "can never fit".
+    #[tokio::test]
+    async fn a_temp_file_charge_the_budget_cannot_hold_gives_its_share_back() {
+        let (_dir, store) = test_store_with(|_| {});
+        let budget = store.stats().budget_bytes;
+        let cap = budget / SCRATCH_SHARE_DIVISOR;
+        // The whole budget is reserved with nothing to evict.
+        store.reserve_manual(budget).await.expect("an empty cache");
+
+        let mut charge = store.scratch_charge();
+        let err = charge.grow(1).await.expect_err("nothing to evict");
+        assert!(matches!(err, DiskCacheError::BudgetExceeded), "{err}");
+        assert_eq!(charge.bytes(), 0);
+        assert_eq!(
+            store.stats().scratch_bytes,
+            0,
+            "the claimed share is given back"
+        );
+        assert!(matches!(charge.try_grow(1).await, ScratchRoom::NoRoom(_)));
+        assert!(matches!(
+            charge.try_grow(cap + 1).await,
+            ScratchRoom::NeverFits(_)
+        ));
+
+        store.release_block_bytes(budget);
+        assert!(matches!(charge.try_grow(cap).await, ScratchRoom::Charged));
+        assert_eq!(store.stats().scratch_bytes, cap);
         store.assert_budget_consistent();
     }
 

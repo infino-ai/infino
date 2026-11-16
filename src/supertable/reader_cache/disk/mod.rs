@@ -530,7 +530,7 @@ mod scratch;
 mod sources;
 mod store_files;
 
-pub(crate) use budget::{Reservation, ScratchCharge};
+pub(crate) use budget::{Reservation, ScratchCharge, ScratchRoom};
 pub(crate) use fetch::{open_batch_overlay, skip_background_fill};
 pub(crate) use sources::{
     ArcMmapOwner, mmap_readonly_bytes, mmap_temp_file_bytes, release_temp_file, temp_file_behind,
