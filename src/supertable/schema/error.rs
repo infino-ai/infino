@@ -264,6 +264,17 @@ pub enum SchemaError {
         /// The table's name.
         name: String,
     },
+    /// A batch or a schema write that would break a document column: a
+    /// batch carrying the document itself, or only one of the two stored
+    /// columns it is rebuilt from; a write dropping one of those, or
+    /// changing the type or nullability of any of the three.
+    #[error("document column `{column}`: {reason}")]
+    DocumentColumn {
+        /// The document column's name.
+        column: String,
+        /// What was refused, and what to do instead.
+        reason: String,
+    },
 }
 
 impl SchemaError {
@@ -312,6 +323,7 @@ impl SchemaError {
             SchemaError::InvalidIndex { .. } => "InvalidIndex",
             SchemaError::InvalidRow { .. } => "InvalidRow",
             SchemaError::TableExists { .. } => "TableExists",
+            SchemaError::DocumentColumn { .. } => "DocumentColumn",
         }
     }
 }
@@ -403,6 +415,10 @@ mod tests {
                 reason: "r".into(),
             },
             SchemaError::TableExists { name: column() },
+            SchemaError::DocumentColumn {
+                column: column(),
+                reason: "r".into(),
+            },
         ]
     }
 
@@ -438,7 +454,8 @@ mod tests {
             | SchemaError::SchemaConflict { .. }
             | SchemaError::InvalidIndex { .. }
             | SchemaError::InvalidRow { .. }
-            | SchemaError::TableExists { .. } => {}
+            | SchemaError::TableExists { .. }
+            | SchemaError::DocumentColumn { .. } => {}
         }
     }
 

@@ -599,6 +599,11 @@ struct StatsColumn {
 
 impl StatsColumn {
     fn new(manifest: &ManifestSnapshot, name: &str) -> Option<Self> {
+        // A document column is rebuilt on read; no superfile keeps
+        // statistics of it, so an aggregate over it is always scanned.
+        if manifest.table_schema().document_named(name).is_some() {
+            return None;
+        }
         let id = manifest.field_id(name)?;
         let data_type = manifest
             .stored_schema()

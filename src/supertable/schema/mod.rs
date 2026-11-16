@@ -41,6 +41,7 @@ use types::{data_type_from_keys, type_keys};
 
 use crate::{
     catalog::DEFAULT_ROT_SEED,
+    document::{residual_column, skeleton_column},
     superfile::{
         builder::FtsConfig,
         format::fts::REPAIR_RELEASE,
@@ -178,6 +179,37 @@ pub enum ColumnIndex {
     /// equality predicate on the column reads only the rows it matches,
     /// however the values are spread across the table.
     Range,
+    /// A document column: a `LargeUtf8` column that is never stored, rebuilt
+    /// on read from the two stored columns named here by id and from the
+    /// table's other columns (see [`crate::document`]). Declared with
+    /// [`IndexSpec::document`](crate::IndexSpec::document) when the table is
+    /// created.
+    Document {
+        /// The stored column holding each row's skeleton: the document's
+        /// compact JSON text with its values replaced by slots.
+        skeleton: FieldId,
+        /// The stored column holding each row's residual: the values no
+        /// column holds as written, as a JSON array.
+        residual: FieldId,
+    },
+}
+
+/// A document column of a table, with the current names of the column and
+/// of the two stored columns it is rebuilt from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DocumentColumn {
+    /// The document column's id.
+    pub(crate) id: FieldId,
+    /// The document column's name.
+    pub(crate) name: String,
+    /// The skeleton column's id.
+    pub(crate) skeleton_id: FieldId,
+    /// The skeleton column's name.
+    pub(crate) skeleton: String,
+    /// The residual column's id.
+    pub(crate) residual_id: FieldId,
+    /// The residual column's name.
+    pub(crate) residual: String,
 }
 
 /// One live user column: its identity, label, physical type and index.
@@ -321,6 +353,79 @@ impl TableSchema {
         self
     }
 
+    /// This schema with each of `columns` a document column, rebuilt from
+    /// the columns named by [`skeleton_column`] and [`residual_column`] of
+    /// its name. The caller has checked the three columns exist with the
+    /// types a document needs and carry no index
+    /// (`IndexSpec::check_documents`); a name whose columns the schema lacks
+    /// is passed over.
+    pub(crate) fn with_document_columns(mut self, columns: &[String]) -> Self {
+        for column in columns {
+            let (Some(skeleton), Some(residual)) = (
+                self.id_of(&skeleton_column(column)),
+                self.id_of(&residual_column(column)),
+            ) else {
+                continue;
+            };
+            if let Some(field) = self.fields.iter_mut().find(|f| &f.name == column) {
+                field.index = Some(ColumnIndex::Document { skeleton, residual });
+            }
+        }
+        self
+    }
+
+    /// The table's document columns, in declared order, each with the
+    /// current names of the columns it is rebuilt from. A document whose
+    /// stored columns are gone (which a schema write refuses) is passed
+    /// over.
+    pub(crate) fn document_columns(&self) -> Vec<DocumentColumn> {
+        self.fields
+            .iter()
+            .filter_map(|f| match f.index {
+                Some(ColumnIndex::Document { skeleton, residual }) => Some(DocumentColumn {
+                    id: f.id,
+                    name: f.name.clone(),
+                    skeleton_id: skeleton,
+                    skeleton: self.name_of(skeleton)?.to_owned(),
+                    residual_id: residual,
+                    residual: self.name_of(residual)?.to_owned(),
+                }),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The document column named `name`, if it is one.
+    pub(crate) fn document_named(&self, name: &str) -> Option<DocumentColumn> {
+        let field = self.field_named(name)?;
+        if !matches!(field.index, Some(ColumnIndex::Document { .. })) {
+            return None;
+        }
+        self.document_columns()
+            .into_iter()
+            .find(|d| d.id == field.id)
+    }
+
+    /// The stored columns a document can draw values from: every column of
+    /// the Parquet body but the id column and the documents' own skeleton
+    /// and residual columns, by name, in declared order.
+    pub(crate) fn document_leaf_columns(&self) -> Vec<String> {
+        let parts: Vec<FieldId> = self
+            .fields
+            .iter()
+            .filter_map(|f| match f.index {
+                Some(ColumnIndex::Document { skeleton, residual }) => Some([skeleton, residual]),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        self.fields
+            .iter()
+            .filter(|f| is_stored(f) && !parts.contains(&f.id))
+            .map(|f| f.name.clone())
+            .collect()
+    }
+
     /// The user schema: every live column in declared order, unstamped.
     /// What [`Supertable::schema`](crate::Supertable::schema) answers for
     /// an open table, from the document alone, so a caller that has the
@@ -360,20 +465,28 @@ impl TableSchema {
 
     /// The id column followed by every live column the Parquet body may
     /// hold, stamped with ids. A vector-indexed column lives in the vector
-    /// blob, never in Parquet.
+    /// blob, never in Parquet, and a document column is never stored.
     pub(crate) fn scalar_schema(&self, id_column: &str) -> Arc<Schema> {
         self.stored_fields(id_column, |f| {
-            !matches!(f.index, Some(ColumnIndex::Vector { .. }))
+            !matches!(
+                f.index,
+                Some(ColumnIndex::Vector { .. } | ColumnIndex::Document { .. })
+            )
         })
     }
 
     /// [`Self::scalar_schema`] without the index-only full-text columns:
     /// exactly the columns a superfile's Parquet body holds.
     pub(crate) fn stored_schema(&self, id_column: &str) -> Arc<Schema> {
-        self.stored_fields(id_column, |f| match &f.index {
-            Some(ColumnIndex::Vector { .. }) => false,
-            Some(ColumnIndex::Fts { stored, .. }) => *stored,
-            Some(ColumnIndex::Range) | None => true,
+        self.stored_fields(id_column, is_stored)
+    }
+
+    /// [`Self::stored_schema`] with the document columns in their declared
+    /// places: every column a read can name. A document column is not
+    /// stored; a read that names it rebuilds it from stored columns.
+    pub(crate) fn readable_schema(&self, id_column: &str) -> Arc<Schema> {
+        self.stored_fields(id_column, |f| {
+            is_stored(f) || matches!(f.index, Some(ColumnIndex::Document { .. }))
         })
     }
 
@@ -642,6 +755,17 @@ impl TableSchema {
     }
 }
 
+/// Whether a superfile's Parquet body holds `field`: not a vector column
+/// (the vector blob holds it), not an index-only full-text column, and not
+/// a document column.
+fn is_stored(field: &FieldDef) -> bool {
+    match &field.index {
+        Some(ColumnIndex::Vector { .. } | ColumnIndex::Document { .. }) => false,
+        Some(ColumnIndex::Fts { stored, .. }) => *stored,
+        Some(ColumnIndex::Range) | None => true,
+    }
+}
+
 /// The index `fts` or `vectors` configure for the column named `name`.
 fn column_index(name: &str, fts: &[FtsConfig], vectors: &[VectorConfig]) -> Option<ColumnIndex> {
     if let Some(fc) = fts.iter().find(|fc| fc.column == name) {
@@ -709,6 +833,11 @@ pub(crate) fn index_to_json(index: &ColumnIndex) -> Value {
         }
         ColumnIndex::Range => {
             out.insert("kind".into(), Value::from("range"));
+        }
+        ColumnIndex::Document { skeleton, residual } => {
+            out.insert("kind".into(), Value::from("document"));
+            out.insert("skeleton".into(), Value::from(skeleton.0));
+            out.insert("residual".into(), Value::from(residual.0));
         }
     }
     Value::Object(out)
@@ -799,6 +928,19 @@ pub(crate) fn index_from_json(json: &Value) -> Result<ColumnIndex, String> {
                 .unwrap_or_default(),
         }),
         "range" => Ok(ColumnIndex::Range),
+        "document" => {
+            let id_of = |key: &str| -> Result<FieldId, String> {
+                obj.get(key)
+                    .and_then(Value::as_u64)
+                    .and_then(|id| u32::try_from(id).ok())
+                    .map(FieldId)
+                    .ok_or_else(|| format!("index has no {key} field id"))
+            };
+            Ok(ColumnIndex::Document {
+                skeleton: id_of("skeleton")?,
+                residual: id_of("residual")?,
+            })
+        }
         other => Err(format!("unknown index kind '{other}'")),
     }
 }

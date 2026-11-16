@@ -1595,6 +1595,18 @@ impl SupertableOptions {
         self
     }
 
+    /// Make each of `columns` a document column in the schema the table is
+    /// created with, which the table's first manifest records as its schema
+    /// document. The schema already has each document's three columns
+    /// (`IndexSpec::with_document_fields`).
+    pub(crate) fn with_document_columns(mut self, columns: &[String]) -> Self {
+        if !columns.is_empty() {
+            self.table_schema =
+                Arc::new((*self.table_schema).clone().with_document_columns(columns));
+        }
+        self
+    }
+
     /// Range-index `columns` in the schema the table is created with, which
     /// the table's first manifest records as its schema document.
     pub(crate) fn with_range_indexes(mut self, columns: &[String]) -> Self {
@@ -1637,7 +1649,14 @@ pub(crate) fn builder_options_for(
     .with_vector_layout(options.vector_layout)
     .with_schema_id(schema.schema_id())
     .with_field_ids_outside_schema(outside_schema)
-    .with_range_columns(schema.range_columns());
+    .with_range_columns(schema.range_columns())
+    .with_dictionary_columns(
+        schema
+            .document_columns()
+            .into_iter()
+            .map(|d| d.skeleton)
+            .collect(),
+    );
     // A table with a disk cache keeps its build's temporary files beside it.
     let builder = match &options.disk_cache {
         Some(_) => builder.with_scratch(options.scratch_dir()),

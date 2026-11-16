@@ -722,6 +722,13 @@ impl ManifestSnapshot {
             .stored_schema(&self.superfile_list.options.id_column)
     }
 
+    /// Every column a read can name: the stored columns with the document
+    /// columns in their declared places.
+    pub(crate) fn readable_schema(&self) -> Arc<Schema> {
+        self.table_schema()
+            .readable_schema(&self.superfile_list.options.id_column)
+    }
+
     /// The full-text index configs of this snapshot's schema.
     pub(crate) fn fts_configs(&self) -> Vec<FtsConfig> {
         self.table_schema().fts_configs()

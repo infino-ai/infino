@@ -47,6 +47,7 @@ mod commit;
 mod compact_gc;
 mod damaged_id_sidecar;
 mod disk_cache;
+mod document;
 mod drain_tombstones;
 mod gc_stale_snapshot;
 mod manifest;

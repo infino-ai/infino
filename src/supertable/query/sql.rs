@@ -127,8 +127,10 @@ use crate::{
 /// handle instead of recomputed per query. Cheap to clone (fields are `Arc`s).
 ///
 /// - `scalar`: id + scalar + FTS columns, no vectors. What the search TVFs bind to.
-/// - `scan`: `scalar` with non-FTS strings viewed as `Utf8View`
-///   (`view_string_schema`). What the provider plans against.
+/// - `scan`: `scalar` with the document columns in their places and non-FTS
+///   strings viewed as `Utf8View` (`view_string_schema`). What the provider
+///   plans against. A document column keeps `LargeUtf8`: the scan rebuilds
+///   it, it is never decoded.
 #[derive(Clone)]
 pub(crate) struct SqlSchemas {
     scalar: SchemaRef,
@@ -157,8 +159,13 @@ pub(crate) fn build_sql_schemas(manifest: &ManifestSnapshot) -> SqlSchemas {
     // against (`sql_schema`).
     let scalar = sql_schema(manifest.stored_schema());
     let fts_configs = manifest.fts_configs();
-    let fts: HashSet<&str> = fts_configs.iter().map(|c| c.column.as_str()).collect();
-    let scan = view_string_schema(&scalar, &fts);
+    let documents = manifest.table_schema().document_columns();
+    let unviewed: HashSet<&str> = fts_configs
+        .iter()
+        .map(|c| c.column.as_str())
+        .chain(documents.iter().map(|d| d.name.as_str()))
+        .collect();
+    let scan = view_string_schema(&sql_schema(manifest.readable_schema()), &unviewed);
     SqlSchemas { scalar, scan }
 }
 
