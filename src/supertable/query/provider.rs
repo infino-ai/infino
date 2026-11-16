@@ -337,6 +337,7 @@ fn charge_footer(
 ) {
     let Some(cache) = disk_cache else { return };
     let reader = &prepared.reader;
+    // The scan shape the reader keeps beside them is a few fields per column, so it is left out.
     // Once per reader: a warm statement pays a load per file, not a cache lookup.
     if reader.first_charge() {
         cache.charge_heap(&entry.uri, reader.parquet_metadata().memory_size() as u64);
