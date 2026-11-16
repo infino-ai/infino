@@ -330,7 +330,12 @@ impl Supertable {
     /// superfiles are objects the table does not list, which a
     /// [`Self::gc`] removes once they are older than its safety gap. Commit
     /// staged batches well within the safety gap the table is collected
-    /// with; one whose superfiles were collected is refused.
+    /// with. A commit refuses a batch whose superfiles were collected, but
+    /// only on a best-effort check: one collected while the commit runs is
+    /// listed anyway, and reads of it fail.
+    ///
+    /// Commit a staged batch through the table it was staged on: another
+    /// table, or another open of this one, refuses it.
     ///
     /// Refused for a table with vector columns, for one with no storage
     /// (`memory://`), and for a batch that would add a column to the
@@ -346,9 +351,12 @@ impl Supertable {
     /// A staged batch lands once: one committed already is passed over, and
     /// one another call is committing at the same time fails this call with
     /// [`InfinoError::Conflict`], to be retried. A commit that fails leaves
-    /// every batch in `staged` free to commit again. One refused with
-    /// [`InfinoError::Unsupported`] cannot land as staged - a batch in it
-    /// was staged on another table, had its superfiles collected, or was
+    /// every batch in `staged` free to commit again, and one whose failure
+    /// came after its write landed is found published by the retry and
+    /// passed over, provided the retry comes before an optimize merges that
+    /// batch's superfiles into others. One refused with [`InfinoError::Unsupported`] cannot
+    /// land as staged - a batch in it was staged through another table or
+    /// another open of this one, had its superfiles collected, or was
     /// staged before the table's schema moved - and those rows need staging
     /// again.
     pub fn commit_staged(&self, staged: &[StagedAppend]) -> Result<(), InfinoError> {

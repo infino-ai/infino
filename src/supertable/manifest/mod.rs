@@ -2522,6 +2522,34 @@ impl ManifestSnapshot {
             .find(|id| ids.contains(id))
     }
 
+    /// Which of `ids` this manifest lists. Reads the resident superfiles when
+    /// they are the whole table, and loads the list's parts otherwise: a
+    /// lazily loaded manifest holds only the parts read so far, and an id in
+    /// a part not yet read is listed all the same. One pass, stopping once
+    /// every id is found.
+    pub(crate) async fn listed_of(
+        &self,
+        mut ids: FxHashSet<Uuid>,
+    ) -> Result<FxHashSet<Uuid>, ManifestLoadError> {
+        let mut listed = FxHashSet::default();
+        if ids.is_empty() {
+            return Ok(listed);
+        }
+        let all = match self.resident_superfiles() {
+            Some(all) => all,
+            None => Cow::Owned(self.get_all_superfiles_loaded().await?),
+        };
+        for entry in all.iter() {
+            if ids.remove(&entry.superfile_id) {
+                listed.insert(entry.superfile_id);
+                if ids.is_empty() {
+                    break;
+                }
+            }
+        }
+        Ok(listed)
+    }
+
     /// The parts that hold any of `ids`, found without loading a part. A
     /// complete flat view lists every part's superfiles in list order, so
     /// each run of `n_superfiles` entries is one part. `None` when the flat

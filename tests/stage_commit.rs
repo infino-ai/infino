@@ -210,16 +210,17 @@ fn a_refused_commit_releases_the_batches_it_held() {
     let dir = TempDir::new().expect("tempdir");
     let db = open_db(&dir);
     let table = create(&db);
-    let other = db
-        .create_table("other", user_schema(), IndexSpec::new().fts("body"))
-        .expect("create_table");
 
     let fresh = table.stage(&batch(0)).expect("stage");
-    let foreign = other.stage(&batch(1)).expect("stage on the other table");
-    let both = [fresh, foreign];
+    let before = files_under(dir.path());
+    let doomed = table.stage(&batch(1)).expect("stage");
+    for path in files_under(dir.path()).difference(&before) {
+        fs::remove_file(path).expect("remove a staged superfile");
+    }
+    let both = [fresh, doomed];
     assert_unsupported(
         table.commit_staged(&both),
-        "one of the batches was staged on another table",
+        "one of the batches lost its superfiles",
     );
     assert_eq!(count(&db), 0, "nothing of the refused commit landed");
     table
@@ -261,7 +262,9 @@ fn one_staged_batch_committed_from_several_threads_lands_once() {
     assert_eq!(hits(&table, "batch0"), BATCH_ROWS as usize);
 }
 
-/// A batch staged on one table is refused by another, which stays empty.
+/// A batch staged on one table is refused by another, which stays empty,
+/// both before and after its own table commits it: a commit elsewhere is
+/// not reported as one that landed.
 #[test]
 fn a_batch_staged_on_another_table_is_refused() {
     let dir = TempDir::new().expect("tempdir");
@@ -274,13 +277,40 @@ fn a_batch_staged_on_another_table_is_refused() {
     let staged = [table.stage(&batch(0)).expect("stage")];
     assert_unsupported(
         other.commit_staged(&staged),
-        "its superfiles are in the first table's storage",
+        "it was staged on the first table",
     );
     assert_eq!(hits(&other, "common"), 0);
     table
         .commit_staged(&staged)
         .expect("its own table still commits it");
     assert_eq!(count(&db), BATCH_ROWS);
+    assert_unsupported(
+        other.commit_staged(&staged),
+        "committed on the first table, it is still not the other's",
+    );
+    assert_eq!(hits(&other, "common"), 0);
+}
+
+/// Another open of the same table refuses a batch staged through the first:
+/// only the handle that staged it knows whether its commit landed. A clone
+/// of that handle commits it.
+#[test]
+fn a_batch_staged_through_another_open_of_the_table_is_refused() {
+    let dir = TempDir::new().expect("tempdir");
+    let table = create(&open_db(&dir));
+    let elsewhere = open_db(&dir).open_table(TABLE).expect("open_table");
+
+    let staged = [table.stage(&batch(0)).expect("stage")];
+    assert_unsupported(
+        elsewhere.commit_staged(&staged),
+        "it was staged through the other open",
+    );
+    assert_eq!(count(&open_db(&dir)), 0);
+    table
+        .clone()
+        .commit_staged(&staged)
+        .expect("a clone of the staging handle commits it");
+    assert_eq!(count(&open_db(&dir)), BATCH_ROWS);
 }
 
 /// A staged batch whose superfiles were deleted meanwhile - as a

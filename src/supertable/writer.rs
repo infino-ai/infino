@@ -98,6 +98,7 @@ use object_store::{MultipartUpload, PutPayload, UploadPart};
 #[cfg(test)]
 use piece_fault::injected_piece_failure;
 use rayon::{ThreadPool, ThreadPoolBuilder, prelude::*};
+use rustc_hash::FxHashSet;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tempfile::{NamedTempFile, TempDir};
@@ -1194,6 +1195,10 @@ impl Supertable {
     ///
     /// Until it is committed, a staged batch is a commit in flight to
     /// [`Self::gc`]: its `safety_gap` must be longer than the batch waits.
+    /// The commit's check that the superfiles are still there is best
+    /// effort, not a substitute for that gap (see [`StagedAppend`]).
+    ///
+    /// Only this handle, or a clone of it, commits the staged batch.
     pub fn stage(&self, batch: &RecordBatch) -> Result<StagedAppend, InfinoError> {
         // Shared even for a batch that adds a column or a table without its
         // vector grid: staging refuses both, and an exclusive slot taken
@@ -1209,11 +1214,13 @@ impl Supertable {
     /// append lands once: one committed already is passed over, and one
     /// another call is committing at the same time fails this call as an
     /// [`InfinoError::Conflict`], to be retried. A commit that fails leaves
-    /// the rest of `staged` free to commit again. One refused as
-    /// [`InfinoError::Unsupported`] cannot land however often it is retried -
-    /// a staged append staged on another table, built under a schema the
-    /// table has moved past, or with superfiles reclaimed meanwhile - and
-    /// nothing in it was published: stage those rows again.
+    /// the rest of `staged` free to commit again; one whose failure came
+    /// after its write landed is found published by the retry and passed
+    /// over. One refused as [`InfinoError::Unsupported`] cannot land however
+    /// often it is retried - a staged append staged through another handle,
+    /// built under a schema the table has moved past, or with superfiles
+    /// reclaimed meanwhile - and nothing in it was published: stage those
+    /// rows again.
     pub fn commit_staged(&self, staged: &[StagedAppend]) -> Result<(), InfinoError> {
         let mut w = self
             .acquire_writer(true)
@@ -3614,6 +3621,7 @@ impl SupertableWriter {
                 built_against,
                 payload_bytes: buffered_payload_bytes(&taken.batches),
                 ingest: taken.ingest,
+                staged_on: self.inner.handle_id,
                 state: AtomicU8::new(STAGED_FREE),
             }),
             Err(error) => {
@@ -3686,21 +3694,67 @@ impl SupertableWriter {
     /// again. A staged append committed already is passed over, and one
     /// another call is committing fails this one as write contention.
     ///
+    /// A commit that fails once its publish began may still have landed:
+    /// the pointer write went through and only its answer was lost. The
+    /// next commit of any of those appends reads the pointer first and
+    /// passes over each append the table lists already. The listing is what
+    /// shows it, so a merge that folds those superfiles into others before
+    /// the retry leaves nothing to find, and the retry lists the rows again.
+    ///
     /// Refused as [`BuildError::Unsupported`], with nothing published, when
-    /// a staged append was staged on another table, has superfiles that are
-    /// no longer in the table's storage (reclaimed as orphans meanwhile), or
-    /// was built under a schema other than the table's now. Those rows are
-    /// staged again.
+    /// a staged append was staged through another handle (another table,
+    /// or another open of this one), has superfiles that are no longer in
+    /// the table's storage (reclaimed as orphans meanwhile), or was built
+    /// under a schema other than the table's now. Those rows are staged
+    /// again.
     pub(crate) fn commit_staged(&mut self, staged: &[StagedAppend]) -> Result<(), BuildError> {
         let staged: Vec<&StagedAppend> = staged.iter().filter(|one| !one.is_empty()).collect();
         if staged.is_empty() {
             return Ok(());
         }
+        // A handle's manifest is what tells whether an append landed, so only
+        // the handle that staged an append, or a clone of it, commits it.
+        if staged
+            .iter()
+            .any(|one| one.staged_on != self.inner.handle_id)
+        {
+            return Err(BuildError::Unsupported(
+                "a staged append was staged through another table handle; commit it through the \
+                 handle that staged it, or stage its rows again"
+                    .into(),
+            ));
+        }
         let storage = check_stageable(&self.inner)?;
         // Claimed for this call before anything else, so the same staged
         // append in two commits lands in at most one; released unless the
         // commit lands.
-        let claim = StagedClaim::take(&staged)?;
+        let mut claim = StagedClaim::take(&staged)?;
+        if claim.uncertain {
+            // With the claim held no other call is publishing these appends,
+            // so what the pointer names now settles whether a failed commit
+            // published them.
+            let inner = &self.inner;
+            let held = claim
+                .held
+                .iter()
+                .flat_map(|one| one.batch.new_entries.iter().map(|e| e.superfile_id))
+                .collect();
+            let listed = bridge_on_runtime(
+                async move {
+                    inner.refresh().await?;
+                    inner.manifest.load_full().listed_of(held).await
+                },
+                &inner.query_runtime(),
+            )
+            .map_err(|error| match error {
+                ManifestLoadError::PointerVanished => BuildError::TableGone,
+                error => {
+                    SupertableCommitError::ManifestError(ManifestError::ManifestLoadError(error))
+                        .into()
+                }
+            })?;
+            claim.pass_over_listed(&listed);
+        }
         let staged = claim.held.clone();
         if staged.is_empty() {
             return Ok(());
@@ -3723,6 +3777,7 @@ impl SupertableWriter {
             ..CommitListMetadata::default()
         };
         let output_stats = self.op_stats.as_ref().map(|_| commit_output_stats(&batch));
+        claim.publishing();
         self.publish_appended(batch, list_metadata)
             .map_err(|error| match error {
                 BuildError::SchemaMoved { expected, current } => BuildError::Unsupported(format!(
@@ -5491,8 +5546,15 @@ pub(super) struct SuperfilePublishBatch {
 /// superfiles are in the table's storage and no manifest lists them, which is
 /// how a garbage-collection sweep tells an orphan, so a caller running `gc`
 /// on the table meanwhile gives it a safety gap longer than any batch waits
-/// between its stage and its commit (`optimize` uses a day). A commit finds
-/// any superfile that went missing meanwhile and refuses the batch.
+/// between its stage and its commit (`optimize` uses a day). That gap is the
+/// guarantee: a commit checks that the superfiles are still in storage, which
+/// catches a batch that waited past a sweep, but a sweep can still delete one
+/// between that check and the publish, and the table then lists a superfile
+/// its reads fail on.
+///
+/// Only the handle that staged it, or a clone of that handle, commits a
+/// staged append: its manifest is the one that tells whether the append
+/// landed already.
 ///
 /// A staged append holds its superfiles' term-index contributions, spilled
 /// to local scratch for a large batch, until it is dropped: drop each once
@@ -5506,9 +5568,12 @@ pub struct StagedAppend {
     /// append's are (see [`planned_data_objects`]).
     payload_bytes: u64,
     ingest: IngestTally,
-    /// [`STAGED_FREE`], [`STAGED_COMMITTING`] while a commit holds it, or
-    /// [`STAGED_COMMITTED`] once that commit lands, so the batch's
-    /// superfiles are listed once.
+    /// The handle that staged it; another one refuses to commit it.
+    staged_on: SupertableHandleId,
+    /// [`STAGED_FREE`], [`STAGED_COMMITTING`] while a commit holds it,
+    /// [`STAGED_COMMITTED`] once that commit lands, or [`STAGED_UNCERTAIN`]
+    /// after a commit that may have landed, so the batch's superfiles are
+    /// listed once.
     state: AtomicU8,
 }
 
@@ -5518,6 +5583,10 @@ const STAGED_FREE: u8 = 0;
 const STAGED_COMMITTING: u8 = 1;
 /// A staged append whose commit landed.
 const STAGED_COMMITTED: u8 = 2;
+/// A staged append no commit holds, whose last commit failed once its
+/// publish began: the pointer write may have landed with only its answer
+/// lost, so the next commit reads the pointer before publishing it again.
+const STAGED_UNCERTAIN: u8 = 3;
 
 impl StagedAppend {
     /// Rows the staged superfiles hold.
@@ -5542,6 +5611,7 @@ impl fmt::Debug for StagedAppend {
                 &match self.state.load(Ordering::Acquire) {
                     STAGED_FREE => "staged",
                     STAGED_COMMITTING => "committing",
+                    STAGED_UNCERTAIN => "uncertain",
                     _ => "committed",
                 },
             )
@@ -5554,6 +5624,11 @@ impl fmt::Debug for StagedAppend {
 struct StagedClaim<'a> {
     /// The appends this call publishes.
     held: Vec<&'a StagedAppend>,
+    /// Whether any held append was [`STAGED_UNCERTAIN`] when taken, until a
+    /// pointer read settles which of them landed.
+    uncertain: bool,
+    /// Whether the publish began, after which a failure may have landed.
+    publishing: bool,
 }
 
 impl<'a> StagedClaim<'a> {
@@ -5562,21 +5637,63 @@ impl<'a> StagedClaim<'a> {
     fn take(staged: &[&'a StagedAppend]) -> Result<Self, BuildError> {
         let mut claim = StagedClaim {
             held: Vec::with_capacity(staged.len()),
+            uncertain: false,
+            publishing: false,
         };
         for &one in staged {
-            match one.state.compare_exchange(
-                STAGED_FREE,
-                STAGED_COMMITTING,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => claim.held.push(one),
-                Err(STAGED_COMMITTED) => {}
-                // `claim` drops here, releasing the ones this call took.
-                Err(_) => return Err(BuildError::WriteContention),
+            let mut expected = STAGED_FREE;
+            loop {
+                match one.state.compare_exchange(
+                    expected,
+                    STAGED_COMMITTING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => {
+                        claim.uncertain |= expected == STAGED_UNCERTAIN;
+                        claim.held.push(one);
+                        break;
+                    }
+                    Err(STAGED_COMMITTED) => break,
+                    Err(now @ (STAGED_FREE | STAGED_UNCERTAIN)) => expected = now,
+                    // `claim` drops here, releasing the ones this call took.
+                    Err(_) => return Err(BuildError::WriteContention),
+                }
             }
         }
         Ok(claim)
+    }
+
+    /// Pass over each held append whose superfiles are among `listed`, the
+    /// ids the table lists now: a commit that failed published it anyway. It
+    /// is committed, and this call publishes the rest. An append's
+    /// superfiles are listed by one commit, so any one of them listed means
+    /// all were. The rest are settled as not published, so a failure before
+    /// this call's own publish releases them free.
+    fn pass_over_listed(&mut self, listed: &FxHashSet<Uuid>) {
+        self.held.retain(|one| {
+            let Some(superfile_id) = one
+                .batch
+                .new_entries
+                .iter()
+                .map(|e| e.superfile_id)
+                .find(|id| listed.contains(id))
+            else {
+                return true;
+            };
+            warn!(
+                %superfile_id,
+                "staged append already published by a commit that failed; not committing it again"
+            );
+            one.state.store(STAGED_COMMITTED, Ordering::Release);
+            false
+        });
+        self.uncertain = false;
+    }
+
+    /// The publish begins: from here a failure may have landed.
+    fn publishing(&mut self) {
+        self.publishing = true;
     }
 
     /// The commit landed: the appends are committed.
@@ -5589,8 +5706,16 @@ impl<'a> StagedClaim<'a> {
 
 impl Drop for StagedClaim<'_> {
     fn drop(&mut self) {
+        // An append taken uncertain stays so until a commit settles it. The
+        // others share the flag only when the pointer read that settles it
+        // failed, which costs their next commit one pointer read.
+        let released = if self.uncertain || self.publishing {
+            STAGED_UNCERTAIN
+        } else {
+            STAGED_FREE
+        };
         for one in &self.held {
-            one.state.store(STAGED_FREE, Ordering::Release);
+            one.state.store(released, Ordering::Release);
         }
     }
 }
@@ -5613,11 +5738,12 @@ fn check_stageable(inner: &SupertableInner) -> Result<&Arc<dyn StorageProvider>,
     Ok(storage)
 }
 
-/// Refuse `staged` unless every superfile it would list is in `storage`: a
-/// batch staged on another table names keys this table's storage does not
-/// hold, and one that waited past a `gc` sweep's safety gap had its
-/// superfiles deleted as orphans. Either published would list superfiles no
-/// read can open.
+/// Refuse `staged` unless every superfile it would list is in `storage`: one
+/// that waited past a `gc` sweep's safety gap had its superfiles deleted as
+/// orphans, and published would list superfiles no read can open. Best
+/// effort: the check is not atomic with the publish, so a sweep that runs
+/// between them still deletes a superfile the commit then lists. Committing
+/// well within the safety gap is what keeps them.
 fn check_staged_superfiles_exist(
     storage: &Arc<dyn StorageProvider>,
     staged: &[&StagedAppend],
@@ -5653,9 +5779,8 @@ fn check_staged_superfiles_exist(
     };
     Err(match error {
         StorageError::NotFound { .. } => BuildError::Unsupported(format!(
-            "staged superfile {key} is not in this table's storage: the batch was staged on \
-             another table, or waited past a garbage-collection sweep that reclaimed it; stage \
-             its rows again"
+            "staged superfile {key} is not in this table's storage: the batch waited past a \
+             garbage-collection sweep that reclaimed it; stage its rows again"
         )),
         error => SupertableCommitError::from(error).into(),
     })
@@ -14393,8 +14518,13 @@ async fn persist_commit_with_layer_async(
                     // Nothing is recorded for the deferred sweep here: the attempt that landed was
                     // an earlier one, whose base this loop no longer holds, and `published` may be
                     // several commits past it. What that commit replaced is left to the listing sweep.
-                    if let Some(published) = published_by_earlier_attempt(inner, &new_entries) {
-                        return Ok(published);
+                    match published_by_earlier_attempt(inner, &new_entries).await {
+                        Ok(Some(published)) => return Ok(published),
+                        Ok(None) => {}
+                        Err(e) => {
+                            inner.note_commit_error(&e);
+                            return Err(e);
+                        }
                     }
                     if !last_attempt {
                         sleep(backoff_delay(attempt)).await;
@@ -14419,10 +14549,13 @@ async fn persist_commit_with_layer_async(
     drive.await
 }
 
-/// The refreshed manifest, when it already lists any of `new_entries`. Call
-/// it after a contention refresh: a hit means the attempt that reported the
-/// lost race published, and committing again would list its superfiles twice.
-/// Superfile ids are minted per build, so no other commit lists them.
+/// The refreshed manifest, when it already lists every one of `new_entries`.
+/// Call it after a contention refresh: a hit means the attempt that reported
+/// the lost race published, and committing again would list its superfiles
+/// twice. Superfile ids are minted per build, and one commit lists them all,
+/// so a manifest listing only some of them is refused as
+/// [`ManifestError::SuperfileAlreadyListed`]: neither committing them nor
+/// reporting them committed would be right.
 ///
 /// How a published attempt reports a lost race:
 ///  - the pointer PUT lands, but its response is a 500 or a timeout.
@@ -14431,18 +14564,39 @@ async fn persist_commit_with_layer_async(
 ///  - the commit sees `WriteContentionExhausted`, as for a real lost race.
 ///
 /// Always `None` for a commit that adds no superfiles.
-fn published_by_earlier_attempt(
+async fn published_by_earlier_attempt(
     inner: &SupertableInner,
     new_entries: &[Arc<SuperfileEntry>],
-) -> Option<Arc<ManifestSnapshot>> {
+) -> Result<Option<Arc<ManifestSnapshot>>, SupertableCommitError> {
     let refreshed = inner.manifest.load_full();
-    let superfile_id = refreshed.first_listed(new_entries)?;
+    let listed = refreshed
+        .listed_of(new_entries.iter().map(|e| e.superfile_id).collect())
+        .await
+        .map_err(|e| SupertableCommitError::ManifestError(ManifestError::ManifestLoadError(e)))?;
+    let (listed_ids, unlisted_ids): (Vec<Uuid>, Vec<Uuid>) = new_entries
+        .iter()
+        .map(|e| e.superfile_id)
+        .partition(|id| listed.contains(id));
+    let Some(&superfile_id) = listed_ids.first() else {
+        return Ok(None);
+    };
+    if let Some(&unlisted) = unlisted_ids.first() {
+        warn!(
+            %superfile_id,
+            %unlisted,
+            manifest_id = refreshed.get_manifest_id(),
+            "the manifest lists only some of a commit's superfiles; refusing it"
+        );
+        return Err(SupertableCommitError::ManifestError(
+            ManifestError::SuperfileAlreadyListed { superfile_id },
+        ));
+    }
     warn!(
         %superfile_id,
         manifest_id = refreshed.get_manifest_id(),
         "commit already published by an earlier attempt; not committing it again"
     );
-    Some(refreshed)
+    Ok(Some(refreshed))
 }
 
 pub(in crate::supertable) fn persist_commit(
@@ -18503,6 +18657,244 @@ mod tests {
             manifest.n_docs_total(),
             LOST_RESPONSE_ROWS as u64,
             "{name}: every row is listed once"
+        );
+    }
+
+    /// Every superfile `handle` lists is listed once, and they hold `rows`.
+    fn assert_lists_superfiles_once_holding(handle: &Supertable, rows: usize, name: &str) {
+        let manifest = handle.inner().manifest.load_full();
+        let listed: Vec<Uuid> = manifest
+            .get_all_superfiles()
+            .iter()
+            .map(|e| e.superfile_id)
+            .collect();
+        let distinct: HashSet<Uuid> = listed.iter().copied().collect();
+        assert_eq!(
+            distinct.len(),
+            listed.len(),
+            "{name}: a superfile is listed twice: {listed:?}"
+        );
+        assert_eq!(manifest.n_docs_total(), rows as u64, "{name}: rows listed");
+    }
+
+    #[test]
+    fn a_staged_commit_that_landed_but_failed_is_passed_over_by_the_retry() {
+        // The pointer PUT of a staged commit lands, but the caller gets an
+        // error: the commit reports failing with its rows in the table. A
+        // retry that adds a second staged append lists the first one's
+        // superfiles once and publishes the second, whether or not the
+        // handle refreshed in between (it then holds the manifest that lists
+        // the first, and publishing it again would be refused).
+        for refresh_between in [false, true] {
+            let directory = TempDir::new().expect("tempdir");
+            let local: Arc<dyn StorageProvider> =
+                Arc::new(LocalFsStorageProvider::new(directory.path()).expect("provider"));
+            let faults = FaultStorage::wrap(Arc::clone(&local));
+            let storage: Arc<dyn StorageProvider> = Arc::<FaultStorage>::clone(&faults);
+            let st = Supertable::create(options_id_title_serial().with_storage(storage))
+                .expect("create");
+            let first = st
+                .stage(&build_simple_batch(0, LOST_RESPONSE_ROWS))
+                .expect("stage");
+            let second = st
+                .stage(&build_simple_batch(0, LOST_RESPONSE_ROWS))
+                .expect("stage");
+            let staged = [first, second];
+
+            faults.fail_with(
+                FaultKind::LandedThenFailed,
+                FaultOp::PutIfMatch,
+                POINTER_PATH,
+                1,
+            );
+            assert!(
+                st.commit_staged(&staged[..1]).is_err(),
+                "refresh {refresh_between}: the failed pointer write is reported"
+            );
+            assert_eq!(
+                faults.fired(),
+                1,
+                "the pointer write failed after landing once"
+            );
+            assert!(
+                format!("{:?}", staged[0]).contains("uncertain"),
+                "refresh {refresh_between}: {:?}",
+                staged[0]
+            );
+            if refresh_between {
+                let advanced =
+                    bridge_on_runtime(st.refresh(), &st.inner().query_runtime()).expect("refresh");
+                assert!(advanced, "the failed commit moved the pointer");
+            }
+
+            st.commit_staged(&staged)
+                .unwrap_or_else(|e| panic!("refresh {refresh_between}: retry: {e:?}"));
+            st.commit_staged(&staged)
+                .expect("committing both again passes over both");
+            let reopened =
+                Supertable::open(options_id_title_serial().with_storage(local)).expect("reopen");
+            for (handle, name) in [(&st, "staging handle"), (&reopened, "reopened handle")] {
+                assert_lists_superfiles_once_holding(
+                    handle,
+                    2 * LOST_RESPONSE_ROWS,
+                    &format!("refresh {refresh_between}: {name}"),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_pointer_read_settles_which_uncertain_appends_landed() {
+        // After a commit fails past its publish, the next commit reads the
+        // pointer: an append it lists is committed, and one it does not is
+        // known unpublished, so a refusal before that commit's own publish
+        // leaves it free rather than uncertain.
+        let directory = TempDir::new().expect("tempdir");
+        let local: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(directory.path()).expect("provider"));
+        let faults = FaultStorage::wrap(Arc::clone(&local));
+        let storage: Arc<dyn StorageProvider> = Arc::<FaultStorage>::clone(&faults);
+        let st =
+            Supertable::create(options_id_title_serial().with_storage(storage)).expect("create");
+        let staged: Vec<StagedAppend> = (0..3)
+            .map(|_| {
+                st.stage(&build_simple_batch(0, LOST_RESPONSE_ROWS))
+                    .expect("stage")
+            })
+            .collect();
+        let state = |one: &StagedAppend| format!("{one:?}");
+
+        // The first lands but reports failing; the second fails before its
+        // pointer write, so it did not land.
+        faults.fail_with(
+            FaultKind::LandedThenFailed,
+            FaultOp::PutIfMatch,
+            POINTER_PATH,
+            1,
+        );
+        assert!(st.commit_staged(&staged[..1]).is_err());
+        faults.fail_with(FaultKind::Transient, FaultOp::PutIfMatch, POINTER_PATH, 1);
+        assert!(st.commit_staged(&staged[1..2]).is_err());
+        for one in &staged[..2] {
+            assert!(state(one).contains("\"uncertain\""), "{one:?}");
+        }
+
+        // The third's superfiles are gone, so this commit is refused after
+        // the pointer read and before its publish.
+        for entry in &staged[2].batch.new_entries {
+            fs::remove_file(directory.path().join(entry.storage_path()))
+                .expect("remove a staged superfile");
+        }
+        assert!(matches!(
+            st.commit_staged(&staged),
+            Err(InfinoError::Unsupported(_))
+        ));
+        assert!(
+            state(&staged[0]).contains("\"committed\""),
+            "{:?}",
+            staged[0]
+        );
+        assert!(state(&staged[1]).contains("\"staged\""), "{:?}", staged[1]);
+        assert!(state(&staged[2]).contains("\"staged\""), "{:?}", staged[2]);
+
+        st.commit_staged(&staged[..2])
+            .expect("the unpublished one commits");
+        assert_lists_superfiles_once_holding(&st, 2 * LOST_RESPONSE_ROWS, "settled");
+    }
+
+    #[test]
+    fn a_staged_commit_that_failed_before_publishing_stays_free() {
+        // A commit refused before its publish began cannot have landed, so
+        // its appends need no pointer read on the next commit.
+        let directory = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(directory.path()).expect("provider"));
+        let st =
+            Supertable::create(options_id_title_serial().with_storage(storage)).expect("create");
+        let staged = [st
+            .stage(&build_simple_batch(0, LOST_RESPONSE_ROWS))
+            .expect("stage")];
+        for entry in &staged[0].batch.new_entries {
+            fs::remove_file(directory.path().join(entry.storage_path()))
+                .expect("remove a staged superfile");
+        }
+        assert!(matches!(
+            st.commit_staged(&staged),
+            Err(InfinoError::Unsupported(_))
+        ));
+        assert!(
+            format!("{:?}", staged[0]).contains("staged"),
+            "{:?}",
+            staged[0]
+        );
+    }
+
+    #[test]
+    fn an_earlier_attempt_counts_as_published_only_when_it_lists_every_superfile() {
+        // One commit lists all of its superfiles, so a manifest listing some
+        // of them is neither this commit landing nor a clean base to publish
+        // onto: it is refused.
+        let directory = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(directory.path()).expect("provider"));
+        let st =
+            Supertable::create(options_id_title_serial().with_storage(storage)).expect("create");
+        st.append(&build_simple_batch(0, LOST_RESPONSE_ROWS))
+            .expect("append");
+        let listed = st.inner().manifest.load().get_all_superfiles()[0].clone();
+        let mut unlisted_entry = (*listed).clone();
+        unlisted_entry.superfile_id = Uuid::new_v4();
+        let unlisted = Arc::new(unlisted_entry);
+
+        let attempt = |entries: &[Arc<SuperfileEntry>]| {
+            bridge_on_runtime(
+                published_by_earlier_attempt(st.inner(), entries),
+                &st.inner().query_runtime(),
+            )
+        };
+        let published = attempt(&[Arc::clone(&listed)]).expect("all listed");
+        assert!(published.is_some(), "every superfile listed: published");
+        let published = attempt(&[Arc::clone(&unlisted)]).expect("none listed");
+        assert!(published.is_none(), "no superfile listed: not published");
+        match attempt(&[listed, unlisted]) {
+            Err(SupertableCommitError::ManifestError(ManifestError::SuperfileAlreadyListed {
+                ..
+            })) => {}
+            other => panic!("some listed: expected SuperfileAlreadyListed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_earlier_attempt_is_found_in_a_part_not_yet_loaded() {
+        // A lazily opened table reads its parts only when a read needs them;
+        // a superfile listed in a part not yet read is listed all the same.
+        let directory = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(directory.path()).expect("provider"));
+        let st = Supertable::create(options_id_title_serial().with_storage(Arc::clone(&storage)))
+            .expect("create");
+        st.append(&build_simple_batch(0, LOST_RESPONSE_ROWS))
+            .expect("append");
+        let listed = st.inner().manifest.load().get_all_superfiles()[0].clone();
+
+        let lazy = Supertable::open(
+            options_id_title_serial()
+                .with_storage(storage)
+                .with_eager_load_threshold(0),
+        )
+        .expect("open lazily");
+        assert!(
+            lazy.inner().manifest.load().resident_superfiles().is_none(),
+            "no part is read yet"
+        );
+        let published = bridge_on_runtime(
+            published_by_earlier_attempt(lazy.inner(), &[listed]),
+            &lazy.inner().query_runtime(),
+        )
+        .expect("the parts load");
+        assert!(
+            published.is_some(),
+            "listed in a part not yet read: published"
         );
     }
 
