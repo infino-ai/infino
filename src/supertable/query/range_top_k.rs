@@ -23,15 +23,13 @@
 //!
 //! The rule only marks the scan, with a provider carrying the hint; the
 //! provider does the reading (`SupertableProvider::top_k_rows`), since that
-//! needs the superfiles. When every filter under the sort is a range on the
-//! sort column, the index's first rows are the answer's. A filter on another
-//! column could reject those rows, so then the hint carries every filter,
-//! and the scan reads rows in the index's order in growing batches and
-//! checks them, until `k` pass with a key no unread row can beat; a filter
-//! few rows pass gives up after a bounded read, and the scan reads every
-//! row the filters admit, as it would without the hint. A sort with nulls
-//! first and no range on the column is left alone, as nulls are in no
-//! range index and would come first. The
+//! needs the superfiles. When every filter is a range on the sort column,
+//! the index's first rows are the answer. A filter on another column could
+//! reject them, so the hint then carries every filter, and the scan reads
+//! rows in index order and checks them until `k` pass; a rare filter gives
+//! up after a bounded read and the scan reads every row as before. A
+//! nulls-first sort with no range on the column is left alone, since nulls
+//! are not in the range index. The
 //! sort may order by more keys after the column (`ORDER BY price, id`, the
 //! tie-break a paged search adds): those order only the rows tied on the
 //! column, so the scan then reads every row tied with the cutoff too. The
@@ -502,13 +500,10 @@ mod tests {
         rows.into_iter().take(limit).map(|(_, s)| s).collect()
     }
 
-    /// A top-k with a filter on another column than the sort's answers as a
-    /// full sort of the rows the filter keeps does: filters many rows pass,
-    /// with and without a range on the sort column, one too narrow to hold
-    /// `k` of them, either way, with ties
-    /// broken by `seq` or by `_id`; a filter one row passes and one none
-    /// does; deleted rows left out; checked from read columns and from kept
-    /// ones; before and after an optimize.
+    /// A top-k filtered on another column returns the same rows as a full
+    /// sort: common, single-row and no-row filters, with and without a range
+    /// on the sort column, ties by `seq` and by `_id`, deleted rows, read and
+    /// kept columns, before and after an optimize.
     #[test]
     fn a_top_k_filtered_on_another_column_answers_as_a_full_sort() {
         let dir = TempDir::new().expect("tempdir");
