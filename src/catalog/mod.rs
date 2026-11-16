@@ -1276,6 +1276,7 @@ impl Connection {
             sql_page_bytes = tracing::field::Empty,
             planned_read_ranges = tracing::field::Empty,
             rows_materialized = tracing::field::Empty,
+            tables_read = tracing::field::Empty,
             kernel_cpu_ns = tracing::field::Empty,
             fts_postings_bytes = tracing::field::Empty,
             vector_cells_scanned = tracing::field::Empty,
@@ -1332,9 +1333,27 @@ impl Connection {
             .resolve_table_references(&statement)
             .map_err(|e| datafusion_planning_error(&e).with_context("query_sql", None))?;
 
+        // Caller-thread pickup, same as reader mint: the drive future may
+        // poll on runtime threads where the scope's slot is invisible.
+        let op_stats = op_stats::current();
+        // The tables the statement reads, counted once each across its
+        // relations and its search and graph functions. A statement that
+        // only describes tables counts none.
+        let table_reads = op_stats
+            .as_ref()
+            .filter(|_| reads_table_data(&statement))
+            .map(|stats| Arc::new(search_tvf::TableReads::new(Arc::clone(stats))));
+
         let mut seen = HashSet::new();
         let mut handles: Vec<SupertableHandle> = Vec::new();
         for r in &refs {
+            // An introspection view is no catalog table. Opening its bare
+            // name would open (and count) a user table that shares it, such
+            // as one named `columns`; the block below registers what the
+            // views describe.
+            if r.schema() == Some(INFORMATION_SCHEMA) {
+                continue;
+            }
             let name = r.table().to_string();
             if !seen.insert(name.clone()) {
                 continue;
@@ -1343,6 +1362,12 @@ impl Connection {
                 .open_and_register_cancellable(&ctx, &name, cancel)
                 .map_err(|e| e.with_context("query_sql", None))?
             {
+                // A relation the statement names and the catalog holds:
+                // a table it reads. The introspection registration below
+                // only describes the catalog, so it is not counted.
+                if let Some(reads) = &table_reads {
+                    reads.record(self, &name);
+                }
                 handles.push(table);
             }
         }
@@ -1371,7 +1396,7 @@ impl Connection {
         // Search TVFs resolve their leading table-name argument through
         // the catalog at call time (so a table named only inside a TVF —
         // not as a `FROM` relation — still resolves).
-        search_tvf::register_search_tvfs(&ctx, self.clone());
+        search_tvf::register_search_tvfs(&ctx, self.clone(), table_reads.clone());
         // The graph functions walk an edge table of this catalog by name, or
         // the one attached from another catalog with no name.
         #[cfg(feature = "graph-index")]
@@ -1394,16 +1419,25 @@ impl Connection {
                                     .to_string(),
                             )
                         })?;
-                    search_tvf::register_graph_tvfs(&ctx, graph, self.clone(), Some(table));
+                    search_tvf::register_graph_tvfs(
+                        &ctx,
+                        graph,
+                        self.clone(),
+                        Some(table),
+                        table_reads,
+                    );
                 }
-                None => search_tvf::register_graph_tvfs(&ctx, self.clone(), self.clone(), None),
+                None => search_tvf::register_graph_tvfs(
+                    &ctx,
+                    self.clone(),
+                    self.clone(),
+                    None,
+                    table_reads,
+                ),
             }
         }
         trace::follow_spans_into_datafusion_tasks();
 
-        // Caller-thread pickup, same as reader mint: the drive future may
-        // poll on runtime threads where the scope's slot is invisible.
-        let op_stats = op_stats::current();
         // What the span records when the query is done; see `CloseOut`.
         let close_out = CloseOut::begin(
             || op_stats.clone(),
@@ -1859,6 +1893,23 @@ const INFORMATION_SCHEMA: &str = "information_schema";
 /// query is introspecting the catalog and wants every table registered.
 fn references_information_schema(refs: &[TableReference]) -> bool {
     refs.iter().any(|r| r.schema() == Some(INFORMATION_SCHEMA))
+}
+
+/// Whether running `statement` reads table data: a query does, and so does
+/// `EXPLAIN ANALYZE`, which runs the query it explains. `DESCRIBE`, a plain
+/// `EXPLAIN` and every `SHOW` form only describe tables.
+fn reads_table_data(statement: &DFStatement) -> bool {
+    match statement {
+        DFStatement::Statement(statement) => match statement.as_ref() {
+            SqlStatement::Query(_) => true,
+            SqlStatement::Explain {
+                analyze, statement, ..
+            } => *analyze && matches!(statement.as_ref(), SqlStatement::Query(_)),
+            _ => false,
+        },
+        DFStatement::Explain(explain) => explain.analyze && reads_table_data(&explain.statement),
+        _ => false,
+    }
 }
 
 fn connective_cap_error(surface: &str) -> InfinoError {
