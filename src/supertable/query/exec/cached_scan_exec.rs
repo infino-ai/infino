@@ -40,16 +40,23 @@ use std::{
 };
 
 use arrow_array::{
-    ArrayRef, BooleanArray, RecordBatch, RecordBatchOptions, builder::BooleanBufferBuilder,
+    Array, ArrayRef, BooleanArray, RecordBatch, RecordBatchOptions, builder::BooleanBufferBuilder,
+    cast::AsArray, new_null_array,
 };
-use arrow_schema::{DataType, Schema, SchemaRef};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::{
-    arrow::compute::{can_cast_types, cast_with_options, filter_record_batch},
+    arrow::compute::{
+        and_kleene, can_cast_types, cast_with_options, filter, is_null, or_kleene,
+        prep_null_mask_filter, take,
+    },
     common::Statistics,
     datasource::physical_plan::parquet::ParquetAccessPlan,
     error::{DataFusionError, Result as DfResult},
     execution::TaskContext,
-    physical_expr::{EquivalenceProperties, PhysicalExpr},
+    physical_expr::{
+        EquivalenceProperties, PhysicalExpr,
+        utils::{collect_columns, reassign_expr_columns, split_conjunction},
+    },
     physical_expr_adapter::PhysicalExprAdapterFactory,
     physical_plan::{
         DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
@@ -163,6 +170,10 @@ struct ScanContext {
     /// For each file, which of `schema`'s columns are kept as dictionaries
     /// ([`dictionary_columns`]).
     dictionaries: HashMap<SuperfileUri, Arc<[bool]>>,
+    /// The `WHERE` the scan checks before it hands rows on
+    /// ([`CachedScanExec::with_predicate`]): over the kept dictionaries
+    /// themselves, so only the rows that pass are made strings.
+    predicate: Option<Arc<dyn PhysicalExpr>>,
 }
 
 /// A table scan served from the decoded-column cache; see the module docs.
@@ -261,6 +272,7 @@ impl CachedScanExec {
                 cache,
                 schema_id,
                 dictionaries,
+                predicate: None,
             }),
             units: units.into(),
             pruned,
@@ -509,15 +521,12 @@ impl ScanContext {
     /// and, when the index chose the file's rows, without the rows it didn't.
     async fn read(self: &Arc<Self>, unit: &RowGroupUnit) -> DfResult<RecordBatch> {
         let fields = self.schema.fields();
+        // As kept: a column kept as a dictionary stays one until the rows
+        // the predicate keeps are known.
         let mut columns: Vec<Option<ArrayRef>> = fields
             .iter()
-            .map(|f| {
-                self.cache
-                    .get(&self.key(unit, f.name()))
-                    .map(|kept| as_scanned(kept, f.data_type()))
-                    .transpose()
-            })
-            .collect::<DfResult<_>>()?;
+            .map(|f| self.cache.get(&self.key(unit, f.name())))
+            .collect();
         let missing: Vec<usize> = (0..columns.len())
             .filter(|&i| columns[i].is_none())
             .collect();
@@ -542,11 +551,6 @@ impl ScanContext {
             .map(|c| c.ok_or_else(|| DataFusionError::Internal("a column was not read".into())))
             .collect::<DfResult<Vec<_>>>()?;
         let n = unit.rows.len();
-        let batch = RecordBatch::try_new_with_options(
-            Arc::clone(&self.schema),
-            columns,
-            &RecordBatchOptions::new().with_row_count(Some(n)),
-        )?;
         let start = unit.rows.start;
         let keep = match &unit.file.selected {
             Some(selected) => {
@@ -572,10 +576,169 @@ impl ScanContext {
                 keep
             }
         };
-        Ok(match keep {
-            Some(mut mask) => filter_record_batch(&batch, &BooleanArray::new(mask.finish(), None))?,
-            None => batch,
-        })
+        let mut keep = keep.map(|mut mask| BooleanArray::new(mask.finish(), None));
+        if let Some(predicate) = &self.predicate {
+            let passed = predicate_mask(predicate, &self.schema, &columns, n)?;
+            keep = Some(match keep {
+                Some(live) => and_kleene(&live, &passed)?,
+                None => passed,
+            });
+        }
+        // A null passes no filter.
+        let keep = keep.map(|mask| match mask.null_count() {
+            0 => mask,
+            _ => prep_null_mask_filter(&mask),
+        });
+        let rows = keep.as_ref().map_or(n, BooleanArray::true_count);
+        let columns = match &keep {
+            Some(mask) => columns
+                .iter()
+                .map(|column| filter(column.as_ref(), mask))
+                .collect::<Result<Vec<_>, _>>()?,
+            None => columns,
+        };
+        let columns = columns
+            .into_iter()
+            .zip(fields)
+            .map(|(column, field)| as_scanned(column, field.data_type()))
+            .collect::<DfResult<Vec<_>>>()?;
+        Ok(RecordBatch::try_new_with_options(
+            Arc::clone(&self.schema),
+            columns,
+            &RecordBatchOptions::new().with_row_count(Some(rows)),
+        )?)
+    }
+}
+
+/// Which of a row group's `rows` rows `predicate` keeps, over `columns` as
+/// kept: a column kept as a dictionary is a dictionary here, any other is
+/// typed as `schema` types it. Each conjunct is checked on its own: one that
+/// reads a single dictionary column is checked once per dictionary value
+/// ([`dictionary_conjunct`]), and any other on its columns, a dictionary
+/// among them cast first. A null is `None`, as the filter above reads it.
+fn predicate_mask(
+    predicate: &Arc<dyn PhysicalExpr>,
+    schema: &SchemaRef,
+    columns: &[ArrayRef],
+    rows: usize,
+) -> DfResult<BooleanArray> {
+    let mut mask: Option<BooleanArray> = None;
+    for conjunct in split_conjunction(predicate) {
+        let mut used: Vec<usize> = collect_columns(conjunct)
+            .iter()
+            .map(|column| column.index())
+            .collect();
+        used.sort_unstable();
+        used.dedup();
+        let kept = |i: usize| columns[i].data_type() != schema.field(i).data_type();
+        let part = match used.as_slice() {
+            [only] if kept(*only) => {
+                dictionary_conjunct(conjunct, schema.field(*only), &columns[*only])?
+            }
+            _ => {
+                let projected = Arc::new(Schema::new(
+                    used.iter()
+                        .map(|&i| schema.field(i).clone())
+                        .collect::<Vec<_>>(),
+                ));
+                let arrays = used
+                    .iter()
+                    .map(|&i| as_scanned(Arc::clone(&columns[i]), schema.field(i).data_type()))
+                    .collect::<DfResult<Vec<_>>>()?;
+                let batch = RecordBatch::try_new_with_options(
+                    Arc::clone(&projected),
+                    arrays,
+                    &RecordBatchOptions::new().with_row_count(Some(rows)),
+                )?;
+                let expr = reassign_expr_columns(Arc::clone(conjunct), &projected)?;
+                boolean(expr.evaluate(&batch)?.into_array(rows)?)?
+            }
+        };
+        mask = Some(match mask {
+            Some(mask) => and_kleene(&mask, &part)?,
+            None => part,
+        });
+    }
+    Ok(mask.unwrap_or_else(|| BooleanArray::from(vec![true; rows])))
+}
+
+/// `conjunct`, reading only the column `field` kept as the dictionary
+/// `kept`, over each row: checked once on each of the dictionary's values
+/// (cast as the scan types the column) and once on a null, then taken for
+/// each row by its key, a row without a value taking the null's answer.
+fn dictionary_conjunct(
+    conjunct: &Arc<dyn PhysicalExpr>,
+    field: &Field,
+    kept: &ArrayRef,
+) -> DfResult<BooleanArray> {
+    let Some(dictionary) = kept.as_any_dictionary_opt() else {
+        return Err(DataFusionError::Internal(format!(
+            "column {} is kept as {}, not a dictionary",
+            field.name(),
+            kept.data_type()
+        )));
+    };
+    let one = Arc::new(Schema::new(vec![field.clone().with_nullable(true)]));
+    let expr = reassign_expr_columns(Arc::clone(conjunct), &one)?;
+    let check = |values: ArrayRef| -> DfResult<BooleanArray> {
+        let n = values.len();
+        let batch = RecordBatch::try_new(Arc::clone(&one), vec![values])?;
+        boolean(expr.evaluate(&batch)?.into_array(n)?)
+    };
+    let values = cast_with_options(dictionary.values(), field.data_type(), &CAST_OPTIONS)?;
+    let on_values = check(values)?;
+    let on_null = check(new_null_array(field.data_type(), 1))?;
+    let taken = take(&on_values, dictionary.keys(), None)?;
+    let taken = boolean(taken)?;
+    match on_null.is_valid(0) && on_null.value(0) {
+        // A row without a value passes as a null does: where the key is null.
+        true => Ok(or_kleene(&taken, &is_null(dictionary.keys())?)?),
+        false => Ok(taken),
+    }
+}
+
+/// `array` as the booleans a predicate gives.
+fn boolean(array: ArrayRef) -> DfResult<BooleanArray> {
+    array
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .cloned()
+        .ok_or_else(|| DataFusionError::Internal(format!("a predicate gave {}", array.data_type())))
+}
+
+impl CachedScanExec {
+    /// This scan, checking `predicate` (a `WHERE` over its output, as the
+    /// filter above it checks it) on each row group before handing its rows
+    /// on. A condition on one column kept as a dictionary is checked once
+    /// per value of the dictionary rather than once per row, and only the
+    /// rows that pass are cast to the strings the scan returns; the filter
+    /// above still checks every row it gets, so the answer is the one it
+    /// gives.
+    pub(crate) fn with_predicate(&self, predicate: Arc<dyn PhysicalExpr>) -> Self {
+        let context = &self.context;
+        Self {
+            context: Arc::new(ScanContext {
+                schema: Arc::clone(&context.schema),
+                manifest: Arc::clone(&context.manifest),
+                op_stats: context.op_stats.clone(),
+                cache: Arc::clone(&context.cache),
+                schema_id: context.schema_id,
+                dictionaries: context.dictionaries.clone(),
+                predicate: Some(predicate),
+            }),
+            units: Arc::clone(&self.units),
+            pruned: self.pruned,
+            parquet: Arc::clone(&self.parquet),
+            partitions: self.partitions,
+            fetch: self.fetch,
+            statistics: Arc::clone(&self.statistics),
+            properties: Arc::clone(&self.properties),
+        }
+    }
+
+    /// Whether the scan checks a `WHERE` itself ([`Self::with_predicate`]).
+    pub(crate) fn has_predicate(&self) -> bool {
+        self.context.predicate.is_some()
     }
 }
 
@@ -596,6 +759,9 @@ impl DisplayAs for CachedScanExec {
             self.partitions,
             columns.join(", ")
         )?;
+        if let Some(predicate) = &self.context.predicate {
+            write!(f, ", predicate={predicate}")?;
+        }
         if let Some(fetch) = self.fetch {
             write!(f, ", fetch={fetch}")?;
         }
