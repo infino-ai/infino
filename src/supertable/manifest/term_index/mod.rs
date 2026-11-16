@@ -2976,17 +2976,18 @@ impl TermIndex {
         // A layer of the layout before tiers stores a bound as a score
         // at the superfile's own idf: each superfile's scored document
         // count turns it into the key the current layout stores.
-        let scored_docs = |id: Uuid| -> u64 {
-            entries
-                .iter()
-                .find(|e| e.superfile_id == id)
-                .map_or(0, |e| {
-                    e.fts_summary
-                        .get(&column_id)
-                        .and_then(|s| s.length_stats.as_ref().map(|l| l.n_scored_docs))
-                        .unwrap_or(e.n_docs)
-                })
-        };
+        let scored: HashMap<Uuid, u64> = entries
+            .iter()
+            .map(|e| {
+                let n = e
+                    .fts_summary
+                    .get(&column_id)
+                    .and_then(|s| s.length_stats.as_ref().map(|l| l.n_scored_docs))
+                    .unwrap_or(e.n_docs);
+                (e.superfile_id, n)
+            })
+            .collect();
+        let scored_docs = |id: Uuid| -> u64 { scored.get(&id).copied().unwrap_or(0) };
         // Per term: superfile → the key of its best document there.
         let mut per_term: HashMap<&str, HashMap<Uuid, f32>> = HashMap::new();
         let mut all_terms: Vec<&str> = terms.to_vec();
@@ -3010,6 +3011,19 @@ impl TermIndex {
             }
             per_term.insert(term, by_sf);
         }
+        // Each superfile's ceiling adds its terms' bounds in query order, the
+        // order a walk over the terms would use, so it rounds the same; the
+        // work is one pass over the terms' postings.
+        let mut ceilings: HashMap<Uuid, f32> = HashMap::with_capacity(entries.len());
+        for term in terms {
+            let Some(by_sf) = per_term.get(term) else {
+                continue;
+            };
+            let idf = idf_used(term);
+            for (id, bound) in by_sf {
+                *ceilings.entry(*id).or_insert(0.0) += bound * idf;
+            }
+        }
         let mut out: HashMap<Uuid, f32> = HashMap::with_capacity(entries.len());
         for e in entries {
             let id = e.superfile_id;
@@ -3017,12 +3031,7 @@ impl TermIndex {
                 out.insert(id, f32::INFINITY);
                 continue;
             }
-            let mut ceiling = 0.0f32;
-            for term in terms {
-                if let Some(bound) = per_term.get(term).and_then(|m| m.get(&id)) {
-                    ceiling += bound * idf_used(term);
-                }
-            }
+            let mut ceiling = ceilings.get(&id).copied().unwrap_or(0.0);
             for phrase in phrases {
                 let mut idf_sum = 0.0f32;
                 let mut min_scaled = f32::INFINITY;
