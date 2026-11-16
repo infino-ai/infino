@@ -18,7 +18,7 @@ use arrow_schema::DataType;
 use serde_json::{Map, Value};
 
 use super::{
-    ColumnIndex, FieldDef, FieldId, MAX_MAX_DEPTH, MAX_MAX_FIELDS, TableSchema,
+    ColumnIndex, DocumentColumn, FieldDef, FieldId, MAX_MAX_DEPTH, MAX_MAX_FIELDS, TableSchema,
     error::SchemaError,
     types::{data_type_from_keys, type_keys},
 };
@@ -375,6 +375,24 @@ pub fn merge(
         .map(|f| (f.id, f.name.clone()))
         .collect();
     let mut new_names: Vec<String> = Vec::new();
+    // The document columns, and the columns this patch drops: a stored
+    // column a document is rebuilt from goes only with the document.
+    let documents = current.document_columns();
+    let dropped: Vec<FieldId> = patch
+        .fields
+        .iter()
+        .filter(|f| f.dropped)
+        .filter_map(|f| match f.id {
+            Some(id) => Some(id),
+            None => current.id_of(&f.name),
+        })
+        .collect();
+    // The document `live` is, or is one of the stored columns of.
+    let document_of = |live: &FieldDef| {
+        documents
+            .iter()
+            .find(|d| [d.id, d.skeleton_id, d.residual_id].contains(&live.id))
+    };
 
     for field in &patch.fields {
         if field.name == ctx.id_column {
@@ -425,7 +443,26 @@ pub fn merge(
             continue;
         };
 
+        let refuse_document = |document: &DocumentColumn, reason: String| {
+            Err(SchemaError::DocumentColumn {
+                column: document.name.clone(),
+                reason,
+            })
+        };
         if field.dropped {
+            if let Some(document) = document_of(live)
+                && document.id != live.id
+                && !dropped.contains(&document.id)
+            {
+                return refuse_document(
+                    document,
+                    format!(
+                        "it is rebuilt from `{}`, which cannot be dropped while it is; \
+                         drop the document column with it",
+                        live.name
+                    ),
+                );
+            }
             if ctx.vector_index_column == Some(live.name.as_str()) {
                 return Err(SchemaError::BacksGlobalVectorIndex {
                     column: live.name.clone(),
@@ -459,6 +496,23 @@ pub fn merge(
             return Err(SchemaError::IdentityChange {
                 attribute: format!("index of column `{}`", live.name),
             });
+        }
+        if let Some(document) = document_of(live) {
+            let retyped = field
+                .data_type
+                .as_ref()
+                .is_some_and(|to| *to != live.data_type);
+            let tightened = field.nullable == Some(false);
+            if retyped || tightened {
+                return refuse_document(
+                    document,
+                    format!(
+                        "`{}` keeps its type and stays nullable while the document column \
+                         is rebuilt from it",
+                        live.name
+                    ),
+                );
+            }
         }
         if let Some(to) = &field.data_type
             && *to != live.data_type
@@ -735,6 +789,10 @@ fn check_index_fits(
             ),
         }),
         ColumnIndex::Range => Ok(()),
+        ColumnIndex::Document { .. } => Err(SchemaError::InvalidIndex {
+            column: column.to_owned(),
+            reason: "a document column is declared when the table is created".to_owned(),
+        }),
     }
 }
 

@@ -1,4 +1,72 @@
 pub mod infino
+pub mod infino::document
+#[non_exhaustive] pub enum infino::document::DocumentError
+pub infino::document::DocumentError::BadResidual
+pub infino::document::DocumentError::BadResidual::reason: alloc::string::String
+pub infino::document::DocumentError::BadSlot
+pub infino::document::DocumentError::BadSlot::slot: alloc::string::String
+pub infino::document::DocumentError::MissingResidual
+pub infino::document::DocumentError::MissingResidual::index: usize
+pub infino::document::DocumentError::MissingResidual::len: usize
+pub infino::document::DocumentError::MissingValue
+pub infino::document::DocumentError::MissingValue::slot: infino::document::Slot
+pub infino::document::DocumentError::UnterminatedString
+impl core::clone::Clone for infino::document::DocumentError
+pub fn infino::document::DocumentError::clone(&self) -> infino::document::DocumentError
+impl core::cmp::Eq for infino::document::DocumentError
+impl core::cmp::PartialEq for infino::document::DocumentError
+pub fn infino::document::DocumentError::eq(&self, &infino::document::DocumentError) -> bool
+impl core::error::Error for infino::document::DocumentError
+impl core::fmt::Debug for infino::document::DocumentError
+pub fn infino::document::DocumentError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for infino::document::DocumentError
+pub fn infino::document::DocumentError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for infino::document::DocumentError
+impl core::marker::Freeze for infino::document::DocumentError
+impl core::marker::Send for infino::document::DocumentError
+impl core::marker::Sync for infino::document::DocumentError
+impl core::marker::Unpin for infino::document::DocumentError
+impl core::marker::UnsafeUnpin for infino::document::DocumentError
+impl core::panic::unwind_safe::RefUnwindSafe for infino::document::DocumentError
+impl core::panic::unwind_safe::UnwindSafe for infino::document::DocumentError
+pub enum infino::document::Slot
+pub infino::document::Slot::Element(infino::FieldId, usize)
+pub infino::document::Slot::Residual(usize)
+pub infino::document::Slot::Value(infino::FieldId)
+impl infino::document::Slot
+pub fn infino::document::Slot::field(&self) -> core::option::Option<infino::FieldId>
+impl core::clone::Clone for infino::document::Slot
+pub fn infino::document::Slot::clone(&self) -> infino::document::Slot
+impl core::cmp::Eq for infino::document::Slot
+impl core::cmp::PartialEq for infino::document::Slot
+pub fn infino::document::Slot::eq(&self, &infino::document::Slot) -> bool
+impl core::fmt::Debug for infino::document::Slot
+pub fn infino::document::Slot::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for infino::document::Slot
+pub fn infino::document::Slot::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::hash::Hash for infino::document::Slot
+pub fn infino::document::Slot::hash<__H: core::hash::Hasher>(&self, &mut __H)
+impl core::marker::Copy for infino::document::Slot
+impl core::marker::StructuralPartialEq for infino::document::Slot
+impl core::str::traits::FromStr for infino::document::Slot
+pub type infino::document::Slot::Err = infino::document::DocumentError
+pub fn infino::document::Slot::from_str(&str) -> core::result::Result<Self, Self::Err>
+impl core::marker::Freeze for infino::document::Slot
+impl core::marker::Send for infino::document::Slot
+impl core::marker::Sync for infino::document::Slot
+impl core::marker::Unpin for infino::document::Slot
+impl core::marker::UnsafeUnpin for infino::document::Slot
+impl core::panic::unwind_safe::RefUnwindSafe for infino::document::Slot
+impl core::panic::unwind_safe::UnwindSafe for infino::document::Slot
+pub const infino::document::RESIDUAL_SUFFIX: &str
+pub const infino::document::SKELETON_SUFFIX: &str
+pub fn infino::document::rebuild(&str, core::option::Option<&str>, impl core::ops::function::Fn(infino::FieldId, core::option::Option<usize>) -> core::option::Option<alloc::string::String>) -> core::result::Result<alloc::string::String, infino::document::DocumentError>
+pub fn infino::document::render_value(&dyn arrow_array::array::Array, usize, core::option::Option<usize>) -> core::option::Option<alloc::string::String>
+pub fn infino::document::residual<'a>(impl core::iter::traits::collect::IntoIterator<Item = &'a str>) -> alloc::string::String
+pub fn infino::document::residual_column(&str) -> alloc::string::String
+pub fn infino::document::residual_values(&str) -> core::result::Result<alloc::vec::Vec<&str>, infino::document::DocumentError>
+pub fn infino::document::skeleton_column(&str) -> alloc::string::String
+pub fn infino::document::slots(&str) -> core::result::Result<alloc::vec::Vec<infino::document::Slot>, infino::document::DocumentError>
 pub use infino::arrow_array
 pub use infino::arrow_schema
 pub use infino::serde_json
@@ -48,6 +116,9 @@ impl core::marker::UnsafeUnpin for infino::ColdFetchMode
 impl core::panic::unwind_safe::RefUnwindSafe for infino::ColdFetchMode
 impl core::panic::unwind_safe::UnwindSafe for infino::ColdFetchMode
 #[non_exhaustive] pub enum infino::ColumnIndex
+pub infino::ColumnIndex::Document
+pub infino::ColumnIndex::Document::residual: infino::FieldId
+pub infino::ColumnIndex::Document::skeleton: infino::FieldId
 pub infino::ColumnIndex::Fts
 pub infino::ColumnIndex::Fts::bm25: infino::Bm25Params
 pub infino::ColumnIndex::Fts::positions: bool
@@ -328,6 +399,9 @@ pub infino::SchemaError::ConversionInProgress::column: alloc::string::String
 pub infino::SchemaError::DepthExceeded
 pub infino::SchemaError::DepthExceeded::cap: u32
 pub infino::SchemaError::DepthExceeded::path: alloc::string::String
+pub infino::SchemaError::DocumentColumn
+pub infino::SchemaError::DocumentColumn::column: alloc::string::String
+pub infino::SchemaError::DocumentColumn::reason: alloc::string::String
 pub infino::SchemaError::DuplicateColumn
 pub infino::SchemaError::DuplicateColumn::name: alloc::string::String
 pub infino::SchemaError::FieldCapExceeded
@@ -768,6 +842,7 @@ impl core::panic::unwind_safe::UnwindSafe for infino::GcSettings
 pub struct infino::IndexSpec
 impl infino::IndexSpec
 pub fn infino::IndexSpec::companion(self, impl core::convert::Into<alloc::string::String>, arrow_schema::schema::SchemaRef, infino::IndexSpec) -> Self
+pub fn infino::IndexSpec::document(self, impl core::convert::Into<alloc::string::String>) -> Self
 pub fn infino::IndexSpec::fts(self, impl core::convert::Into<infino::FtsField>) -> Self
 pub fn infino::IndexSpec::new() -> Self
 pub fn infino::IndexSpec::range(self, impl core::convert::Into<alloc::string::String>) -> Self

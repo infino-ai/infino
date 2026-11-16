@@ -154,6 +154,12 @@ pub use roaring;
 // The catalog layer (`Connection` + `connect`). Internal module; its
 // public items are re-exported at the crate root below.
 mod catalog;
+/// Document columns: the slot grammar of a skeleton, the canonical JSON
+/// rendering of a column value, and the rebuild of a document from its
+/// skeleton, its residual and the row's columns. Shared by the engine,
+/// which rebuilds a document column on read, and by a writer, which builds
+/// the skeletons and residuals it appends.
+pub mod document;
 mod error;
 mod runtime_bridge;
 // Process CPU / RSS samplers: benches use `test-helpers`; platform

@@ -1243,6 +1243,11 @@ pub struct BuilderOptions {
     /// range index region over them (`superfile::range`), built from the
     /// rows as the Parquet body stores them. May be empty.
     pub(crate) range_columns: Vec<String>,
+    /// Columns always written with a dictionary, by name: a document's
+    /// skeleton column, whose few distinct shapes repeat on every row, so
+    /// the body never trades its dictionary for a plain encoding that a
+    /// sample happened to measure smaller. May be empty.
+    pub(crate) dictionary_columns: Vec<String>,
     /// Finish on the calling thread alone: no join or parallel encode
     /// inside the pool. Set for a build that is itself one of many pool
     /// tasks running side by side, such as a piece of an append, where a
@@ -1450,6 +1455,7 @@ impl BuilderOptions {
             field_ids_outside_schema: HashMap::new(),
             merge_input_mb: None,
             range_columns: Vec::new(),
+            dictionary_columns: Vec::new(),
             finish_serial: false,
             scratch: None,
         }
@@ -1465,6 +1471,13 @@ impl BuilderOptions {
     /// The directory the build's temporary files are created in.
     pub(crate) fn scratch_dir(&self) -> PathBuf {
         self.scratch.clone().unwrap_or_else(scratch_root)
+    }
+
+    /// Always write `columns` with a dictionary (see
+    /// [`BuilderOptions::dictionary_columns`]).
+    pub(crate) fn with_dictionary_columns(mut self, columns: Vec<String>) -> Self {
+        self.dictionary_columns = columns;
+        self
     }
 
     /// Range-index `columns` (see [`BuilderOptions::range_columns`]).
@@ -1510,7 +1523,7 @@ impl BuilderOptions {
         let dictionary_candidates = schema
             .fields()
             .iter()
-            .filter(|f| !f.data_type().is_nested())
+            .filter(|f| !f.data_type().is_nested() && !self.dictionary_columns.contains(f.name()))
             .map(|f| f.name().clone())
             .collect();
         BodyPlan {

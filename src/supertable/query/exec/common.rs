@@ -100,12 +100,18 @@ use crate::{
             candidate::{CandidatePlan, CandidateScope},
             df_object_store::{EXACT_MERGE_GAP_BYTES, merged_within},
             dispatch::{ReplanFuture, fanout_with_ordered, tombstone_deny_set},
-            exec::metered_exec::MeteredExec,
+            exec::{
+                document_exec::{DocumentBinding, referenced_fields},
+                metered_exec::MeteredExec,
+            },
             read_ahead::BUDGET_SHARE_PERCENT,
             superfile_reader::superfile_reader,
             vector::row_id_from_manifest_entry,
         },
-        schema::{DECIMAL128_PRECISION, DECIMAL128_SCALE, PhysicalSchema, map::FileSchemaMap},
+        schema::{
+            DECIMAL128_PRECISION, DECIMAL128_SCALE, DocumentColumn, PhysicalSchema, TableSchema,
+            map::FileSchemaMap,
+        },
         tombstones::SidecarCache,
     },
     utils::{join::try_join_bounded, trace::record},
@@ -447,9 +453,10 @@ pub(crate) async fn resolve_hits_named(
     hits: &[SuperfileHit],
     projection: Option<&[&str]>,
 ) -> Result<RecordBatch, QueryError> {
-    // Stored shape: an index-only FTS column has no Parquet data to
-    // project, so its name is rejected up front like any unknown column.
-    let scalar_schema = reader.manifest().stored_schema();
+    // Readable shape: an index-only FTS column has no Parquet data to
+    // project, so its name is rejected up front like any unknown column; a
+    // document column is not stored either, but is rebuilt on resolve.
+    let scalar_schema = reader.manifest().readable_schema();
     let output_schema = output_schema_with_score(&scalar_schema);
     // `None` is the engine-native result: `_id` + `score` only.
     // `_id` decodes from its own dedicated id pages (cheap by
@@ -536,7 +543,7 @@ impl SupertableReader {
     /// is the same one [`resolve_hits_named`] checks at output materialization,
     /// so the two share one source of truth and the error message is identical.
     pub(crate) fn check_projection(&self, projection: Option<&[&str]>) -> Result<(), QueryError> {
-        let output_schema = output_schema_with_score(&self.manifest().stored_schema());
+        let output_schema = output_schema_with_score(&self.manifest().readable_schema());
         validate_projection(
             projection,
             self.options().id_column.as_str(),
@@ -1145,13 +1152,27 @@ pub(crate) async fn resolve_hits(
     };
 
     // Distinct scalar columns the projection selects, in first-seen
-    // order — the only columns we decode.
+    // order — the only columns we decode. A document column is not stored:
+    // its skeleton and residual are decoded in its place, and the columns
+    // its skeletons name once those are read (`with_document_leaves`).
+    let table = reader.manifest().table_schema();
+    let documents = table.document_columns();
     let mut needed: Vec<&str> = Vec::new();
+    let mut projected_documents: Vec<&DocumentColumn> = Vec::new();
     for &p in &requested {
         if p != score_idx {
             let name = scalar_schema.field(p).name().as_str();
-            if !needed.contains(&name) {
-                needed.push(name);
+            let inputs = match documents.iter().find(|d| d.name == name) {
+                Some(document) => {
+                    projected_documents.push(document);
+                    vec![document.skeleton.as_str(), document.residual.as_str()]
+                }
+                None => vec![name],
+            };
+            for input in inputs {
+                if !needed.contains(&input) {
+                    needed.push(input);
+                }
             }
         }
     }
@@ -1203,6 +1224,12 @@ pub(crate) async fn resolve_hits(
     } else {
         Some(resolve_columns(reader, hits, &needed).await?)
     };
+    let resolved = match resolved {
+        Some(batch) if !projected_documents.is_empty() => {
+            Some(with_document_leaves(reader, hits, &table, &projected_documents, batch).await?)
+        }
+        resolved => resolved,
+    };
 
     // Assemble output columns in the projection's emit order, each
     // drawn from the decoded scalar batch or the synthesized score. The
@@ -1221,8 +1248,21 @@ pub(crate) async fn resolve_hits(
             let rb = resolved
                 .as_ref()
                 .expect("a scalar column is projected => columns resolved");
-            let idx = rb.schema().index_of(name).map_err(QueryError::internal)?;
-            columns.push(Arc::clone(rb.column(idx)));
+            match projected_documents.iter().find(|d| &d.name == name) {
+                Some(document) => {
+                    let binding = DocumentBinding::bind(&table, document, &rb.schema())
+                        .ok_or_else(|| {
+                            QueryError::Internal(format!(
+                                "document column `{name}`: its stored columns were not resolved"
+                            ))
+                        })?;
+                    columns.push(binding.rebuild(rb)?);
+                }
+                None => {
+                    let idx = rb.schema().index_of(name).map_err(QueryError::internal)?;
+                    columns.push(Arc::clone(rb.column(idx)));
+                }
+            }
         }
     }
 
@@ -1235,6 +1275,45 @@ pub(crate) async fn resolve_hits(
         &RecordBatchOptions::new().with_row_count(Some(hits.len())),
     )
     .map_err(|e| QueryError::internal(e).into())
+}
+
+/// `resolved` (the hits' rows, in rank order, carrying each projected
+/// document's skeleton and residual) with the columns those skeletons name
+/// appended, read at the same hits. Only the columns some row's skeleton
+/// names are read, so a page of documents decodes what its documents hold,
+/// not every column of a wide table.
+async fn with_document_leaves(
+    reader: &SupertableReader,
+    hits: &[SuperfileHit],
+    table: &TableSchema,
+    documents: &[&DocumentColumn],
+    resolved: RecordBatch,
+) -> DfResult<RecordBatch> {
+    let schema = resolved.schema();
+    let mut extra: Vec<&str> = Vec::new();
+    for document in documents {
+        let skeletons = resolved.column(schema.index_of(&document.skeleton)?);
+        for field in referenced_fields(skeletons)? {
+            if let Some(name) = table.name_of(field)
+                && schema.index_of(name).is_err()
+                && !extra.contains(&name)
+            {
+                extra.push(name);
+            }
+        }
+    }
+    if extra.is_empty() {
+        return Ok(resolved);
+    }
+    let leaves = resolve_columns(reader, hits, &extra).await?;
+    let mut fields: Vec<Arc<Field>> = schema.fields().iter().cloned().collect();
+    fields.extend(leaves.schema().fields().iter().cloned());
+    let mut columns = resolved.columns().to_vec();
+    columns.extend(leaves.columns().iter().cloned());
+    Ok(RecordBatch::try_new(
+        Arc::new(Schema::new(fields)),
+        columns,
+    )?)
 }
 
 /// Hit → stable-`_id` translation by manifest arithmetic — the

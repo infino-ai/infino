@@ -139,6 +139,7 @@ use crate::{
                     CachedFile, CachedScanExec, RowGroupFilter, has_columns, projected_schema,
                 },
                 common::{BoundPredicate, PushedPredicate, take_file_columns, unqualified},
+                document_exec::{DocumentExec, stored_inputs},
                 metered_exec::MeteredExec,
             },
             fts::{
@@ -588,7 +589,9 @@ impl fmt::Debug for SupertableProvider {
 ///   `budgeted_session_context`) coerces the views back to `LargeUtf8` at the
 ///   plan output, so the view stays internal and SQL results expose no view.
 /// - FTS columns keep their stored type: pruning resolves them by it, so
-///   viewing one would silently disable its pruning.
+///   viewing one would silently disable its pruning. The caller passes
+///   them in `fts_columns`, with the document columns, which the scan
+///   rebuilds as `LargeUtf8` rather than decodes.
 pub(crate) fn view_string_schema(schema: &Schema, fts_columns: &HashSet<&str>) -> SchemaRef {
     let fields = schema
         .fields()
@@ -2472,18 +2475,40 @@ impl TableProvider for SupertableProvider {
         if self.count_range.is_some() {
             return Ok(vec![TableProviderFilterPushDown::Exact; filters.len()]);
         }
+        // A filter reading a document column is evaluated over the rebuilt
+        // text, above the scan: nothing in the files can bound it.
+        let documents = self.manifest.table_schema().document_columns();
+        let on_document = |filter: &Expr| {
+            filter
+                .column_refs()
+                .iter()
+                .any(|column| documents.iter().any(|d| d.name == column.name))
+        };
+        let pushed: Vec<&Expr> = filters
+            .iter()
+            .copied()
+            .filter(|f| !on_document(f))
+            .collect();
         let fts_cols = self.fts_cols_set();
-        let text: Vec<bool> = filters
+        let text: Vec<bool> = pushed
             .iter()
             .map(|filter| self.exact_filter(filter, &fts_cols).is_some())
             .collect();
-        let ranges = self.exact_ranges(filters.iter().copied(), text.contains(&true));
-        Ok(text
+        let ranges = self.exact_ranges(pushed.iter().copied(), text.contains(&true));
+        let mut answers =
+            text.iter()
+                .zip(ranges)
+                .map(|(&text, range)| match text || range.is_some() {
+                    true => TableProviderFilterPushDown::Exact,
+                    false => TableProviderFilterPushDown::Inexact,
+                });
+        Ok(filters
             .iter()
-            .zip(ranges)
-            .map(|(&text, range)| match text || range.is_some() {
-                true => TableProviderFilterPushDown::Exact,
-                false => TableProviderFilterPushDown::Inexact,
+            .map(|filter| match on_document(filter) {
+                true => TableProviderFilterPushDown::Unsupported,
+                false => answers
+                    .next()
+                    .expect("one answer per filter not on a document column"),
             })
             .collect())
     }
@@ -2505,7 +2530,45 @@ impl TableProvider for SupertableProvider {
             .map(|entries| self.statistics_for(entries, &|name| name == id_column))
     }
 
+    /// A scan of the projected columns. A projection naming a document
+    /// column scans the stored columns it is rebuilt from instead (see
+    /// [`stored_inputs`]) and rebuilds it above the scan ([`DocumentExec`]);
+    /// any other goes straight to [`Self::scan_stored`]. A filter on a
+    /// document column never reaches here (`supports_filters_pushdown`), so
+    /// it runs above the rebuild.
     async fn scan(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        let table = self.manifest.table_schema();
+        let documents = table.document_columns();
+        if documents.is_empty() {
+            return self.scan_stored(state, projection, filters, limit).await;
+        }
+        let output = projected_schema(&self.schema, projection)?;
+        let wanted: Vec<&str> = output.fields().iter().map(|f| f.name().as_str()).collect();
+        let leaves = table.document_leaf_columns();
+        let Some(inputs) = stored_inputs(&wanted, &documents, &leaves) else {
+            return self.scan_stored(state, projection, filters, limit).await;
+        };
+        let inner = inputs
+            .iter()
+            .map(|name| self.schema.index_of(name))
+            .collect::<Result<Vec<_>, _>>()?;
+        let scan = self
+            .scan_stored(state, Some(&inner), filters, limit)
+            .await?;
+        Ok(Arc::new(DocumentExec::try_new(scan, output, &table)?))
+    }
+}
+
+impl SupertableProvider {
+    /// The scan of stored columns behind [`TableProvider::scan`]: every
+    /// column `projection` names is one the Parquet body holds.
+    async fn scan_stored(
         &self,
         state: &dyn Session,
         projection: Option<&Vec<usize>>,
@@ -2527,7 +2590,7 @@ impl TableProvider for SupertableProvider {
                 store_url: self.store_url.clone(),
                 ..self.sibling()
             };
-            return once.scan(state, projection, filters, limit).await;
+            return once.scan_stored(state, projection, filters, limit).await;
         }
         // The catalog opens a table without statistics only for a statement it finds uses none
         // (`uses_statistics`). A filter it missed reads them here first: slower, never wrong.
@@ -2545,7 +2608,7 @@ impl TableProvider for SupertableProvider {
             }
             return self
                 .with_manifest(manifest)
-                .scan(state, projection, filters, limit)
+                .scan_stored(state, projection, filters, limit)
                 .await;
         }
         // Superfile selection via the shared two-tier prune (the same

@@ -8,11 +8,12 @@
 
 use std::{collections::HashSet, sync::Arc};
 
-use arrow_schema::{Schema, SchemaRef};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 
 use crate::{
     InfinoError,
     catalog::validate_schema,
+    document::{residual_column, skeleton_column},
     superfile::{
         builder::FtsConfig,
         fts::{
@@ -236,6 +237,7 @@ pub struct IndexSpec {
     fts: Vec<FtsField>,
     vectors: Vec<VectorIndex>,
     ranges: Vec<String>,
+    documents: Vec<String>,
     companions: Vec<Companion>,
 }
 
@@ -314,6 +316,112 @@ impl IndexSpec {
     /// The range-indexed columns, in declaration order.
     pub(crate) fn range_columns(&self) -> &[String] {
         &self.ranges
+    }
+
+    /// Declare `name` a document column: a `LargeUtf8` column that is
+    /// never stored, rebuilt on every read from two stored columns the
+    /// caller writes and from the table's other columns.
+    ///
+    /// A table that keeps each row's original JSON beside the typed columns
+    /// parsed out of it stores every value twice. A document column stores
+    /// the document's shape once per row instead, and reads the values back
+    /// from the columns:
+    ///
+    /// - `<name>#skeleton` (`Utf8`, written dictionary-encoded): the
+    ///   document's compact JSON with each value replaced by a slot naming
+    ///   the column, list element or residual entry it comes from.
+    /// - `<name>#residual` (`LargeUtf8`, nullable): a JSON array of the
+    ///   values no column renders exactly as written.
+    ///
+    /// See [`crate::document`] for the grammar, and for the rendering a
+    /// writer compares against to decide which values become slots.
+    ///
+    /// The three columns are added to the schema where it lacks them; where
+    /// it has them they must have those types and be nullable. `name` then
+    /// appears in the table's schema, in SQL and in a search projection like
+    /// any column, and is rebuilt wherever it is read: a filter or sort on
+    /// it is evaluated over the rebuilt text. An append carries the two
+    /// stored columns (or neither, for rows with no document) and never
+    /// `name` itself.
+    ///
+    /// Reading it decodes the skeleton, the residual and the columns the
+    /// documents draw on, so it costs more per row than a stored text
+    /// column of the same documents, and stores far less.
+    ///
+    /// ```
+    /// use infino::IndexSpec;
+    /// let spec = IndexSpec::new().fts("message").document("source");
+    /// # let _ = spec;
+    /// ```
+    pub fn document(mut self, name: impl Into<String>) -> Self {
+        self.documents.push(name.into());
+        self
+    }
+
+    /// The document columns, in declaration order.
+    pub(crate) fn document_columns(&self) -> &[String] {
+        &self.documents
+    }
+
+    /// Refuses a document column the table cannot carry: one declared
+    /// twice, one whose column or stored columns `schema` has in the wrong
+    /// type or not nullable, or one whose columns carry an index.
+    pub(crate) fn check_documents(&self, schema: &Schema) -> Result<(), InfinoError> {
+        let mut seen = HashSet::new();
+        for name in &self.documents {
+            let refuse = |reason: String| {
+                Err(InfinoError::Config(format!(
+                    "document column {name:?}: {reason}"
+                )))
+            };
+            if name.is_empty() {
+                return refuse("the name is empty".into());
+            }
+            if !seen.insert(name.as_str()) {
+                return refuse("declared twice".into());
+            }
+            for (column, data_type) in document_fields(name) {
+                if let Ok(field) = schema.field_with_name(&column)
+                    && (field.data_type() != &data_type || !field.is_nullable())
+                {
+                    return refuse(format!(
+                        "the schema has {column:?} as `{}`{}; it must be nullable `{data_type}`",
+                        field.data_type(),
+                        if field.is_nullable() {
+                            ""
+                        } else {
+                            ", not nullable"
+                        },
+                    ));
+                }
+                if self.fts.iter().any(|f| f.column == column)
+                    || self.vectors.iter().any(|v| v.column == column)
+                    || self.ranges.contains(&column)
+                {
+                    return refuse(format!("{column:?} carries an index"));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// `schema` with the columns each declared document needs that it
+    /// lacks appended, in declaration order: the document column, then its
+    /// skeleton and residual columns.
+    pub(crate) fn with_document_fields(&self, schema: SchemaRef) -> SchemaRef {
+        let missing: Vec<Field> = self
+            .documents
+            .iter()
+            .flat_map(|name| document_fields(name))
+            .filter(|(column, _)| schema.field_with_name(column).is_err())
+            .map(|(column, data_type)| Field::new(column, data_type, true))
+            .collect();
+        if missing.is_empty() {
+            return schema;
+        }
+        let mut fields: Vec<Field> = schema.fields().iter().map(|f| f.as_ref().clone()).collect();
+        fields.extend(missing);
+        Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()))
     }
 
     /// Refuses a range index the table cannot carry: a column `schema`
@@ -441,6 +549,13 @@ impl IndexSpec {
             if companion.indexes.has_companions() {
                 return Err(InfinoError::Config(format!(
                     "companion {:?} declares companions of its own; a companion cannot have any",
+                    companion.purpose
+                )));
+            }
+            if !companion.indexes.documents.is_empty() {
+                return Err(InfinoError::Config(format!(
+                    "companion {:?} declares a document column; a companion takes full-text and \
+                     vector indexes only",
                     companion.purpose
                 )));
             }
@@ -582,6 +697,16 @@ impl IndexSpec {
             .collect();
         (fts, vectors)
     }
+}
+
+/// The three columns of the document column `name`, with the types each
+/// must have: the document itself, its skeleton and its residual.
+fn document_fields(name: &str) -> [(String, DataType); 3] {
+    [
+        (name.to_owned(), DataType::LargeUtf8),
+        (skeleton_column(name), DataType::Utf8),
+        (residual_column(name), DataType::LargeUtf8),
+    ]
 }
 
 #[cfg(test)]

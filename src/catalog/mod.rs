@@ -526,6 +526,13 @@ impl Connection {
         indexes
             .check_ranges(&schema)
             .map_err(|e| e.with_context("create_table", Some(name)))?;
+        indexes
+            .check_documents(&schema)
+            .map_err(|e| e.with_context("create_table", Some(name)))?;
+        // A document column and the two stored columns it is rebuilt from
+        // are columns of the table like any other; the ones the caller left
+        // out of the schema are added here.
+        let schema = indexes.with_document_fields(schema);
         let (fts_cfg, vec_cfg) = indexes.to_configs();
         // A companion is a table on storage beside this one; a catalog with
         // no storage, or one forwarding to a hosted service, has nowhere to
@@ -548,7 +555,8 @@ impl Connection {
                     config::global(),
                 )
                 .map_err(|e| e.with_context("create_table", Some(name)))?
-                .with_range_indexes(indexes.range_columns());
+                .with_range_indexes(indexes.range_columns())
+                .with_document_columns(indexes.document_columns());
                 let handle = SupertableHandle::create(opts)
                     .map_err(|e| InfinoError::from(e).with_context("create_table", Some(name)))?;
                 let mut map = map.lock().expect("catalog mutex poisoned");
@@ -653,7 +661,8 @@ impl Connection {
                     config::global(),
                 )
                 .map_err(|e| e.with_context("create_table", Some(name)))?
-                .with_range_indexes(indexes.range_columns());
+                .with_range_indexes(indexes.range_columns())
+                .with_document_columns(indexes.document_columns());
                 if let Some((cache, manifest_cache)) = disk_cache {
                     opts = opts
                         .with_disk_cache(cache)
@@ -700,6 +709,15 @@ impl Connection {
 
                 info!(table = name, location = %location, "created table");
                 Ok(Supertable::from_local(handle))
+            }
+            // The hosted transport has no spelling for a document column, so
+            // forwarding the spec would create a table without one.
+            #[cfg(feature = "remote")]
+            CatalogStore::Remote(_) if !indexes.document_columns().is_empty() => {
+                Err(InfinoError::Unsupported(
+                    "document columns need a local or storage-backed connection".to_string(),
+                )
+                .with_context("create_table", Some(name)))
             }
             #[cfg(feature = "remote")]
             CatalogStore::Remote(c) => c.create_table(name, schema, indexes),
@@ -2517,6 +2535,9 @@ fn seed_from_patch(patch: &SchemaPatch) -> Result<(SchemaRef, IndexSpec), Infino
             }
             Some(ColumnIndex::Range) => {
                 indexes = indexes.range(field.name.clone());
+            }
+            Some(ColumnIndex::Document { .. }) => {
+                indexes = indexes.document(field.name.clone());
             }
             None => {}
         }

@@ -72,6 +72,38 @@ fn check_identity(field: &Field, held: Option<&String>) -> Result<(), SchemaErro
     Ok(())
 }
 
+/// Refuse a batch that writes a document column of `schema` itself, or only
+/// one of the two stored columns it is rebuilt from. Both or neither: a row
+/// with no document has a null skeleton.
+fn check_documents(input: &Schema, schema: &TableSchema) -> Result<(), SchemaError> {
+    for document in schema.document_columns() {
+        let refuse = |reason: String| {
+            Err(SchemaError::DocumentColumn {
+                column: document.name.clone(),
+                reason,
+            })
+        };
+        if input.index_of(&document.name).is_ok() {
+            return refuse(format!(
+                "it is rebuilt on read and never written; append `{}` and `{}` instead",
+                document.skeleton, document.residual
+            ));
+        }
+        let skeleton = input.index_of(&document.skeleton).is_ok();
+        let residual = input.index_of(&document.residual).is_ok();
+        if skeleton != residual {
+            let (has, lacks) = match skeleton {
+                true => (&document.skeleton, &document.residual),
+                false => (&document.residual, &document.skeleton),
+            };
+            return refuse(format!(
+                "the batch carries `{has}` but not `{lacks}`; append both or neither"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// A batch brought to the table's shape.
 #[derive(Debug)]
 pub struct ResolvedBatch {
@@ -94,12 +126,18 @@ pub fn resolve_batch(
             name: id_column.to_owned(),
         });
     }
+    check_documents(&input, schema)?;
     // A nullable column the batch lacks is filled with the one null array
     // of its type, as [`try_conform`] fills them.
     let mut nulls = SharedNulls::new(batch.num_rows());
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
     let mut fields: Vec<Field> = Vec::with_capacity(schema.fields().len());
     for field in schema.fields() {
+        // A document column is never stored: the batch carries the two
+        // columns it is rebuilt from (checked above), never the document.
+        if matches!(field.index, Some(ColumnIndex::Document { .. })) {
+            continue;
+        }
         match input.index_of(&field.name) {
             Ok(i) => {
                 let array = batch.column(i);
