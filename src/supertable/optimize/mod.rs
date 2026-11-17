@@ -21,7 +21,7 @@ use crate::{
     config::OptimizeOptions,
     supertable::{
         Supertable,
-        error::{GcError, OptimizeError},
+        error::{BuildError, GcError, OptimizeError},
         wal::gc::GcError as WalGcError,
     },
 };
@@ -60,8 +60,17 @@ impl Supertable {
         }
 
         if opts.steps.drain_hidden_cells {
-            self.drain_hidden_vector_cells_sync()
-                .map_err(OptimizeError::from)?;
+            match self.drain_hidden_vector_cells_sync() {
+                Ok(()) => {}
+                // A drain whose table's disk budget has no room for its temp
+                // files keeps what it has spilled and goes on in a later
+                // pass. The steps below do not need it. A drain stopped by a
+                // full disk is an error, like any other.
+                Err(BuildError::ScratchFull(reason)) => {
+                    tracing::warn!("{reason}; optimize goes on without this drain");
+                }
+                Err(e) => return Err(OptimizeError::from(e)),
+            }
             if phase_timers {
                 tracing::info!(secs = __t.elapsed().as_secs_f64(), "[optphase] drain");
                 __t = Instant::now();

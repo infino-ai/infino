@@ -77,6 +77,23 @@ const CACHE_TMP_SUFFIX: &str = ".tmp";
 pub(crate) const HIDDEN_INDEX_CACHE_SUBDIR: &str = "hidden-index-metadata";
 /// How much of a cached object [`MetadataDiskCache::verify`] reads at a time.
 const VERIFY_CHUNK_BYTES: usize = 1 << 20;
+/// Headroom over an object a cache holds whole ([`MetadataDiskCache::keep_whole`]),
+/// in divisor form (`bytes + bytes / this`), for the smaller objects that
+/// share the cache with it (term-index slices, routing siblings).
+const KEPT_WHOLE_HEADROOM_DIVISOR: u64 = 10;
+
+/// An object a table's metadata cache keeps whole, whatever its configured
+/// budget: a load reads all of it, so a budget smaller than it would evict
+/// each piece before the next load read it back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KeptWhole {
+    /// Every part, summaries section and rollup of the table's manifest.
+    Manifest,
+    /// A hidden vector index's state blob.
+    VectorStateBlob,
+    /// A hidden vector index's centroid section.
+    CentroidSection,
+}
 
 /// What a `get` found on disk for an indexed hash.
 enum CachedRead {
@@ -116,7 +133,17 @@ pub struct MetadataCacheStats {
 /// blocking task. A `get` verifies the bytes (blake3) in that same task.
 pub struct MetadataDiskCache {
     cache_root: PathBuf,
-    budget_bytes: AtomicU64,
+    /// The budget the cache was opened with: working room for the objects
+    /// fetched a piece at a time (the term index's slices), on top of what
+    /// it holds whole.
+    configured_bytes: u64,
+    /// Room for the manifest kept whole ([`KeptWhole::Manifest`]), set to
+    /// its latest size, so the budget follows it as it grows and shrinks.
+    manifest_whole: AtomicU64,
+    /// Room for [`KeptWhole::VectorStateBlob`], likewise.
+    state_blob_whole: AtomicU64,
+    /// Room for [`KeptWhole::CentroidSection`], likewise.
+    centroid_section_whole: AtomicU64,
     started_at: Instant,
     /// Accounting index: content hash → size + last-access. The bytes
     /// are on disk under [`Self::cache_path`]; this map exists only so
@@ -149,7 +176,10 @@ impl MetadataDiskCache {
         fs::create_dir_all(&cache_root)?;
         let cache = Self {
             cache_root,
-            budget_bytes: AtomicU64::new(budget_bytes),
+            configured_bytes: budget_bytes,
+            manifest_whole: AtomicU64::new(0),
+            state_blob_whole: AtomicU64::new(0),
+            centroid_section_whole: AtomicU64::new(0),
             started_at: Instant::now(),
             entries: DashMap::new(),
             pins: DashMap::new(),
@@ -163,10 +193,15 @@ impl MetadataDiskCache {
     }
 
     /// The cache for this table's hidden vector index: its own directory,
-    /// [`HIDDEN_INDEX_CACHE_SUBDIR`], beside this one, with the same budget.
+    /// [`HIDDEN_INDEX_CACHE_SUBDIR`], beside this one, opened with the same
+    /// configured budget. What this table holds is not carried over; the
+    /// hidden index holds its own objects.
     pub(crate) fn for_hidden_index(&self) -> io::Result<Arc<Self>> {
         let parent = self.cache_root.parent().unwrap_or(&self.cache_root);
-        Self::new(parent.join(HIDDEN_INDEX_CACHE_SUBDIR), self.budget_bytes())
+        Self::new(
+            parent.join(HIDDEN_INDEX_CACHE_SUBDIR),
+            self.configured_bytes,
+        )
     }
 
     /// Walk the cache directory and register every well-formed cache
@@ -299,13 +334,12 @@ impl MetadataDiskCache {
         if size > self.budget_bytes() {
             return false;
         }
-        if !self.reserve(size) {
-            return false;
-        }
         let cache = Arc::clone(self);
+        // Reserving can evict many files at once (the budget drops when the
+        // table's manifest shrinks), so it runs in the blocking task too.
         // A join error is a panic or a runtime shutting down. The cache is
         // best-effort either way, so the caller carries on.
-        spawn_blocking(move || cache.write_reserved(hash, &bytes))
+        spawn_blocking(move || cache.reserve(size) && cache.write_reserved(hash, &bytes))
             .await
             .unwrap_or(false)
     }
@@ -654,14 +688,33 @@ impl MetadataDiskCache {
         }
     }
 
-    /// The current byte budget.
+    /// The current byte budget: what the held objects need ([`Self::keep_whole`])
+    /// plus the configured budget, which stays free for objects fetched a
+    /// piece at a time however large the held ones are.
     pub fn budget_bytes(&self) -> u64 {
-        self.budget_bytes.load(Ordering::Acquire)
+        [
+            &self.manifest_whole,
+            &self.state_blob_whole,
+            &self.centroid_section_whole,
+        ]
+        .iter()
+        .map(|room| room.load(Ordering::Acquire))
+        .fold(self.configured_bytes, u64::saturating_add)
     }
 
-    /// Raise the budget to `floor_bytes` when it is lower. Never lowers it.
-    pub fn raise_budget(&self, floor_bytes: u64) {
-        self.budget_bytes.fetch_max(floor_bytes, Ordering::AcqRel);
+    /// Keep `what`, now `bytes` long, whole: the budget covers it plus
+    /// headroom. Replaces what was held for `what` before, so when the
+    /// object shrinks the budget shrinks with it, and the next write evicts
+    /// what is no longer read, least recently used first (the parts and
+    /// sections of older versions, which no load touches any more).
+    pub(crate) fn keep_whole(&self, what: KeptWhole, bytes: u64) {
+        let with_headroom = bytes.saturating_add(bytes / KEPT_WHOLE_HEADROOM_DIVISOR);
+        let room = match what {
+            KeptWhole::Manifest => &self.manifest_whole,
+            KeptWhole::VectorStateBlob => &self.state_blob_whole,
+            KeptWhole::CentroidSection => &self.centroid_section_whole,
+        };
+        room.store(with_headroom, Ordering::Release);
     }
 
     /// Snapshot of the cache's load. Cheap: reads atomics + a
@@ -818,15 +871,65 @@ mod tests {
     }
 
     #[test]
-    fn raise_budget_never_lowers_it() {
-        let root = tmp_root("raise-budget");
+    fn the_budget_follows_what_the_cache_keeps_whole() {
+        let root = tmp_root("kept-whole-budget");
         let _ = fs::remove_dir_all(&root);
         let cache = MetadataDiskCache::new(root.clone(), 100).expect("cache");
-        cache.raise_budget(50);
         assert_eq!(cache.budget_bytes(), 100);
-        cache.raise_budget(500);
-        assert_eq!(cache.budget_bytes(), 500);
+        // What is held comes on top of the configured budget, each hold with
+        // a tenth of headroom.
+        cache.keep_whole(KeptWhole::Manifest, 1_000);
+        assert_eq!(cache.budget_bytes(), 1_200);
+        cache.keep_whole(KeptWhole::CentroidSection, 2_000);
+        assert_eq!(cache.budget_bytes(), 3_400);
+        // A smaller manifest lowers the budget again.
+        cache.keep_whole(KeptWhole::Manifest, 0);
+        assert_eq!(cache.budget_bytes(), 2_300);
+        cache.keep_whole(KeptWhole::CentroidSection, 0);
+        assert_eq!(cache.budget_bytes(), 100);
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_smaller_manifest_evicts_what_no_load_reads_any_more() {
+        let root = tmp_root("kept-whole-shrinks");
+        let _ = fs::remove_dir_all(&root);
+        let cache = MetadataDiskCache::new(root.clone(), 0).expect("cache");
+        let part = |tag: u8| Bytes::from(vec![tag; 100]);
+        // An old manifest of four 100-byte parts.
+        cache.keep_whole(KeptWhole::Manifest, 400);
+        for tag in [1, 2, 3, 4] {
+            assert!(cache.put(hash_of(&part(tag)), part(tag)).await);
+        }
+        // Its successor is smaller: parts 3 and 4 survive and part 5 is new.
+        cache.keep_whole(KeptWhole::Manifest, 300);
+        assert!(cache.get(&hash_of(&part(3))).await.is_some());
+        assert!(cache.get(&hash_of(&part(4))).await.is_some());
+        assert!(cache.put(hash_of(&part(5)), part(5)).await);
+        // Parts 1 and 2, which no load reads any more, made room.
+        for tag in [1, 2] {
+            assert!(!cache.contains(&hash_of(&part(tag))), "part {tag} evicted");
+        }
+        for tag in [3, 4, 5] {
+            assert!(cache.contains(&hash_of(&part(tag))), "part {tag} kept");
+        }
+        assert!(cache.stats().current_bytes <= cache.budget_bytes());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_hidden_index_cache_starts_from_the_configured_budget() {
+        let parent = tmp_root("hidden-budget");
+        let _ = fs::remove_dir_all(&parent);
+        let user = MetadataDiskCache::new(parent.join("manifest-parts"), 100).expect("cache");
+        user.keep_whole(KeptWhole::Manifest, 10_000);
+        let hidden = user.for_hidden_index().expect("hidden cache");
+        assert_eq!(
+            hidden.budget_bytes(),
+            100,
+            "the user manifest is not the hidden index's"
+        );
+        let _ = fs::remove_dir_all(&parent);
     }
 
     #[tokio::test]
