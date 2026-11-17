@@ -1,7 +1,7 @@
 name: Bench janitor
 
 # Reclaims ephemeral bench VMs (and their networking/disks) that outlive
-# their TTL, on Azure (dataset benches) and GCP (PR benches). The bench
+# their TTL, on Azure and GCP. The bench
 # workflows tear down on exit, but that is skipped on force-cancel or a lost
 # runner; this sweep is the independent backstop.
 
