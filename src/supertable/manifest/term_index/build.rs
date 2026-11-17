@@ -106,6 +106,9 @@ pub(crate) struct BuildPolicy {
     /// superfiles' heads together exceed it, every head is cut to the
     /// same shallower depth. `0` keeps no tiers.
     pub(crate) tier_entries_per_term: u64,
+    /// Whether the build keeps a level head per term and layer; off, the
+    /// ranked path opens by its ceilings alone (or a tier the build keeps).
+    pub(crate) level_heads: bool,
     /// Entries a superfile keeps per term in its head; see [`HEAD_DEPTH`].
     pub(crate) head_depth_per_superfile: usize,
     /// Where the build encodes tiers in parallel; the process-wide pool
@@ -257,6 +260,7 @@ impl Default for BuildPolicy {
         Self {
             slice_target_bytes: SLICE_TARGET_BYTES,
             tier_entries_per_term: u64::MAX,
+            level_heads: true,
             head_depth_per_superfile: HEAD_DEPTH_MAX,
             pool: None,
             spill_to_disk: false,
@@ -710,14 +714,12 @@ fn encode_term(
     mut term: TermInput,
     budget: u64,
     depth: usize,
+    heads: bool,
     ordinals: &[Option<u32>],
     scoring_of: &dyn Fn(u32) -> ColumnScoring,
     splice: bool,
 ) -> Result<EncodedTerm, TermIndexError> {
     let df: u64 = term.postings.iter().map(|p| p.df).sum();
-    // A build told to keep no tiers keeps no level heads either: the
-    // ranked path then opens by its ceilings alone.
-    let heads = budget > 0 && depth > 0;
     // A source without a level head lends the head its tier entries, which
     // the splice leaves undecoded.
     if splice
@@ -1827,6 +1829,8 @@ struct LayerWriter {
     spill: Option<Arc<TempDir>>,
     target_bytes: usize,
     tier_entries_per_term: u64,
+    /// Whether terms keep level heads.
+    level_heads: bool,
     /// Entries a superfile keeps per term.
     head_depth: usize,
     /// The scoring an entry is keyed at, by superfile ordinal and column.
@@ -1887,6 +1891,7 @@ impl LayerWriter {
             spill,
             target_bytes: policy.slice_target_bytes,
             tier_entries_per_term: policy.tier_entries_per_term,
+            level_heads: policy.level_heads,
             head_depth: policy.head_depth_per_superfile.min(HEAD_DEPTH_MAX),
             scoring,
             pending: Vec::new(),
@@ -2001,6 +2006,7 @@ impl LayerWriter {
         self.pending_entries = 0;
         let budget = self.tier_entries_per_term;
         let depth = self.head_depth;
+        let heads = self.keeps_heads();
         let splice = self.splice;
         let ordinals = Arc::clone(&self.ordinals);
         let scoring = Arc::clone(&self.scoring);
@@ -2010,6 +2016,7 @@ impl LayerWriter {
                 term,
                 budget,
                 depth,
+                heads,
                 &ordinals,
                 &|ordinal| scoring(ordinal, column),
                 splice,
@@ -2098,6 +2105,7 @@ impl LayerWriter {
             term,
             self.tier_entries_per_term,
             self.head_depth,
+            self.keeps_heads(),
             &self.ordinals,
             &|ordinal| (self.scoring)(ordinal, column),
             self.splice,
@@ -2106,7 +2114,7 @@ impl LayerWriter {
 
     /// Whether this writer keeps level heads at all (see `encode_term`).
     fn keeps_heads(&self) -> bool {
-        self.tier_entries_per_term > 0 && self.head_depth > 0
+        self.level_heads
     }
 
     /// Write a term whose level head is folded a block at a time: `next`

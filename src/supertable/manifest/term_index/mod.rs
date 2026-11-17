@@ -6979,10 +6979,10 @@ mod tests {
         named
     }
 
-    /// Every commit writes its layer's tier chunks and names them from the
-    /// root; optimize, with nothing to index or fold, keeps them as they
-    /// are; a sweep past the gap keeps what the current root names and
-    /// nothing a replaced root named.
+    /// Every commit writes its layer's slice objects — the level heads'
+    /// levels — and names them from the root; optimize, with nothing to
+    /// index or fold, keeps them as they are; a sweep past the gap keeps
+    /// what the current root names and nothing a replaced root named.
     #[test]
     fn commits_write_tiers_optimize_keeps_and_the_sweep_respects() {
         let (dir, storage, st) = fresh_table();
@@ -7005,7 +7005,7 @@ mod tests {
             root.layers
                 .iter()
                 .all(|s| s.slices.iter().any(|slice| slice.tier.is_some())),
-            "each delta has a tier object"
+            "each delta has a slice object"
         );
         let after_commits = tier_objects(&dir);
         let named = objects_named_by(&root);
@@ -7030,21 +7030,19 @@ mod tests {
             tier_object, run, ..
         } in runs.iter()
         {
-            let tier = run.tier.as_ref().expect("a term in every title has a tier");
-            let object = tier_object.unwrap_or_else(|| ContentHash::of(b""));
-            held += rt
-                .block_on(index.tier_entries(&object, tier))
-                .expect("tier entries")
-                .len() as u64;
+            assert!(run.tier.is_none(), "commits keep no tiers");
+            let head = run.head.as_ref().expect("a term in every title has a head");
             assert!(
-                run.postings.iter().all(|p| p.tail == 0.0),
-                "complete heads leave no tail"
+                tier_object.is_some(),
+                "its levels sit in the slice's object"
             );
+            assert_eq!(head.floor, 0.0, "a whole list leaves nothing out");
+            held += head.n_entries();
         }
         assert_eq!(
             held,
             2 * DOCS_PER_LAYER as u64,
-            "the deltas' tiers cover every document"
+            "the deltas' heads cover every document"
         );
 
         st.optimize(&maintenance_only_options()).expect("optimize");
