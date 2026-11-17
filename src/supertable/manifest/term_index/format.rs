@@ -90,6 +90,7 @@ use uuid::Uuid;
 
 use super::{
     TermIndexError,
+    level_head::HeadRef,
     tier::{TierChunkRef, TierEntry, push_chunk_refs, read_chunk_refs},
 };
 use crate::{
@@ -132,11 +133,26 @@ pub(crate) const LEGACY_ROOT_FORMAT_VERSION: u32 = 3;
 /// slice's tier object, laid out per superfile in regions of one block
 /// per superfile, each block with its own CRC), and stores a posting's
 /// bound as a key rather than a score.
-pub(crate) const SLICE_FORMAT_VERSION: u32 = 2;
+/// `3` adds the term's level head after the tier reference (see
+/// `level_head.rs`): one head per term and layer, its levels in the
+/// slice's head object beside the tier chunks.
+pub(crate) const SLICE_FORMAT_VERSION: u32 = 3;
+/// The slice version with tiers and no level heads.
+pub(crate) const TIERED_SLICE_FORMAT_VERSION: u32 = 2;
 /// The slice version before tiers: a run is its postings alone, each a
 /// superfile, a document frequency, a bound that is a BM25 score at the
 /// superfile's own idf, and a location.
 pub(crate) const LEGACY_SLICE_FORMAT_VERSION: u32 = 1;
+/// Run tag after the tier reference: the term has no level head.
+const HEAD_ABSENT: u8 = 0;
+/// Run tag after the tier reference: a level head follows.
+const HEAD_PRESENT: u8 = 1;
+/// Every slice version a reader accepts, the current one first.
+const SLICE_VERSIONS: [u32; 3] = [
+    SLICE_FORMAT_VERSION,
+    TIERED_SLICE_FORMAT_VERSION,
+    LEGACY_SLICE_FORMAT_VERSION,
+];
 /// Run header tag: the term has no tier.
 const TIER_ABSENT: u8 = 0;
 /// Run header tag: a tier reference follows.
@@ -281,6 +297,9 @@ pub(crate) struct TierRef {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub(crate) struct Run {
     pub(crate) tier: Option<TierRef>,
+    /// The term's level head in this layer; `None` in a slice from before
+    /// level heads, or for a term the build kept no head for.
+    pub(crate) head: Option<HeadRef>,
     pub(crate) postings: Vec<Posting>,
     /// Whether the run came from a slice of the layout before tiers:
     /// its postings' bounds are BM25 scores at each superfile's own idf
@@ -424,12 +443,7 @@ pub(crate) fn slice_is_before_tiers(prefix: &[u8]) -> Result<bool, TermIndexErro
         bytes: prefix,
         at: 0,
     };
-    let version = check_magic_version(
-        &mut c,
-        SLICE_MAGIC,
-        &[SLICE_FORMAT_VERSION, LEGACY_SLICE_FORMAT_VERSION],
-        "slice",
-    )?;
+    let version = check_magic_version(&mut c, SLICE_MAGIC, &SLICE_VERSIONS, "slice")?;
     Ok(version == LEGACY_SLICE_FORMAT_VERSION)
 }
 
@@ -669,9 +683,13 @@ pub(crate) fn push_posting(out: &mut Vec<u8>, p: &Posting) {
     }
 }
 
-/// Encode a term's run: count, the tier reference, then its postings in
-/// ascending superfile ordinal.
-pub(crate) fn encode_run(tier: Option<&TierRef>, postings: &[Posting]) -> Vec<u8> {
+/// Encode a term's run: count, the tier reference, the level head, then
+/// its postings in ascending superfile ordinal.
+pub(crate) fn encode_run(
+    tier: Option<&TierRef>,
+    head: Option<&HeadRef>,
+    postings: &[Posting],
+) -> Vec<u8> {
     let mut out = Vec::with_capacity(postings.len() * (1 + 2 + 2 * F32_LEN + 1 + 8));
     push_varint(&mut out, postings.len() as u32);
     match tier {
@@ -687,6 +705,13 @@ pub(crate) fn encode_run(tier: Option<&TierRef>, postings: &[Posting]) -> Vec<u8
         Some(t) => {
             out.push(TIER_PRESENT);
             push_chunk_refs(&mut out, &t.chunks);
+        }
+    }
+    match head {
+        None => out.push(HEAD_ABSENT),
+        Some(h) => {
+            out.push(HEAD_PRESENT);
+            h.encode(&mut out);
         }
     }
     for p in postings {
@@ -765,8 +790,16 @@ pub(crate) fn decode_run(bytes: &[u8]) -> Result<Vec<Posting>, TermIndexError> {
     decode_run_with_tier(bytes).map(|r| r.postings)
 }
 
-/// Decode a term's run: its tier reference and its postings.
+/// Decode a term's run of the current layout: its tier reference, its
+/// level head and its postings.
+#[cfg(test)]
 pub(crate) fn decode_run_with_tier(bytes: &[u8]) -> Result<Run, TermIndexError> {
+    decode_tiered_run(bytes, true)
+}
+
+/// Decode a run of a slice with tiers; `with_head` when the slice's
+/// version carries level heads.
+fn decode_tiered_run(bytes: &[u8], with_head: bool) -> Result<Run, TermIndexError> {
     let mut at = 0usize;
     let n = read_varint(bytes, &mut at).ok_or_else(|| malformed("run count"))? as usize;
     let tag = *bytes.get(at).ok_or_else(|| malformed("run tier tag"))?;
@@ -807,6 +840,22 @@ pub(crate) fn decode_run_with_tier(bytes: &[u8]) -> Result<Run, TermIndexError> 
             )));
         }
     };
+    let head = match with_head {
+        false => None,
+        true => {
+            let tag = *bytes.get(at).ok_or_else(|| malformed("run head tag"))?;
+            at += 1;
+            match tag {
+                HEAD_ABSENT => None,
+                HEAD_PRESENT => Some(HeadRef::decode(bytes, &mut at)?),
+                other => {
+                    return Err(TermIndexError::Malformed(format!(
+                        "run: unknown head tag {other}"
+                    )));
+                }
+            }
+        }
+    };
     let mut postings = Vec::with_capacity(n);
     for _ in 0..n {
         postings.push(read_posting(bytes, &mut at)?);
@@ -816,9 +865,19 @@ pub(crate) fn decode_run_with_tier(bytes: &[u8]) -> Result<Run, TermIndexError> 
     }
     Ok(Run {
         tier,
+        head,
         postings,
         legacy_bound: false,
     })
+}
+
+/// Decode a run of a slice at `version`, one [`SLICE_VERSIONS`] holds.
+fn decode_run_of(version: u32, run: &[u8]) -> Result<Run, TermIndexError> {
+    match version {
+        LEGACY_SLICE_FORMAT_VERSION => decode_legacy_run(run),
+        TIERED_SLICE_FORMAT_VERSION => decode_tiered_run(run, false),
+        _ => decode_tiered_run(run, true),
+    }
 }
 
 /// Decode a run of the layout before tiers: a count, then postings of a
@@ -854,6 +913,7 @@ fn decode_legacy_run(bytes: &[u8]) -> Result<Run, TermIndexError> {
     }
     Ok(Run {
         tier: None,
+        head: None,
         postings,
         legacy_bound: true,
     })
@@ -1009,7 +1069,8 @@ pub(crate) struct SliceDictionary<'a> {
     dict: TermBlocks<'a>,
     dict_len: u64,
     postings_len: u64,
-    legacy: bool,
+    /// The slice's layout version, which says how its runs decode.
+    version: u32,
 }
 
 impl<'a> SliceDictionary<'a> {
@@ -1019,12 +1080,7 @@ impl<'a> SliceDictionary<'a> {
             bytes: header,
             at: 0,
         };
-        check_magic_version(
-            &mut c,
-            SLICE_MAGIC,
-            &[SLICE_FORMAT_VERSION, LEGACY_SLICE_FORMAT_VERSION],
-            "slice",
-        )?;
+        check_magic_version(&mut c, SLICE_MAGIC, &SLICE_VERSIONS, "slice")?;
         c.u64("slice dict length")
     }
 
@@ -1033,12 +1089,7 @@ impl<'a> SliceDictionary<'a> {
     /// bytes past the dictionary are ignored.
     pub(crate) fn open(bytes: &'a [u8]) -> Result<Self, TermIndexError> {
         let mut c = Cursor { bytes, at: 0 };
-        let version = check_magic_version(
-            &mut c,
-            SLICE_MAGIC,
-            &[SLICE_FORMAT_VERSION, LEGACY_SLICE_FORMAT_VERSION],
-            "slice",
-        )?;
+        let version = check_magic_version(&mut c, SLICE_MAGIC, &SLICE_VERSIONS, "slice")?;
         let dict_len = c.u64("slice dict length")?;
         let postings_len = c.u64("slice postings length")?;
         let dict_bytes = c.take(dict_len as usize, "slice dictionary")?;
@@ -1048,7 +1099,7 @@ impl<'a> SliceDictionary<'a> {
             dict,
             dict_len,
             postings_len,
-            legacy: version == LEGACY_SLICE_FORMAT_VERSION,
+            version,
         })
     }
 
@@ -1083,16 +1134,20 @@ impl<'a> SliceDictionary<'a> {
         self.postings_len
     }
 
-    /// The offset of the first tier chunk of `run`, the bytes of one run a
-    /// [`BlockStart`] names, when it has chunks.
+    /// The offset in the slice's object of the first tier chunk or head
+    /// level of `run`, the bytes of one run a [`BlockStart`] names, when it
+    /// has either.
     pub(crate) fn tier_at(&self, run: &[u8]) -> Result<Option<u64>, TermIndexError> {
-        let run = match self.legacy {
-            true => decode_legacy_run(run)?,
-            false => decode_run_with_tier(run)?,
-        };
-        Ok(run
+        let run = decode_run_of(self.version, run)?;
+        let chunks = run
             .tier
-            .and_then(|tier| tier.chunks.iter().map(|chunk| chunk.offset).min()))
+            .iter()
+            .flat_map(|t| t.chunks.iter().map(|c| c.offset));
+        let levels = run
+            .head
+            .iter()
+            .flat_map(|h| h.levels.iter().map(|l| l.offset));
+        Ok(chunks.chain(levels).min())
     }
 }
 
@@ -1100,9 +1155,9 @@ impl<'a> SliceDictionary<'a> {
 pub(crate) struct Slice<'a> {
     dict: TermBlocks<'a>,
     postings: &'a [u8],
-    /// Whether the slice is of the layout before tiers (see
-    /// [`Run::legacy_bound`]).
-    legacy: bool,
+    /// The slice's layout version, which says how its runs decode (a run
+    /// of the layout before tiers is marked [`Run::legacy_bound`]).
+    version: u32,
 }
 
 impl<'a> Slice<'a> {
@@ -1111,12 +1166,7 @@ impl<'a> Slice<'a> {
     /// bounds marked as the scores they are.
     pub(crate) fn open(bytes: &'a [u8]) -> Result<Self, TermIndexError> {
         let mut c = Cursor { bytes, at: 0 };
-        let version = check_magic_version(
-            &mut c,
-            SLICE_MAGIC,
-            &[SLICE_FORMAT_VERSION, LEGACY_SLICE_FORMAT_VERSION],
-            "slice",
-        )?;
+        let version = check_magic_version(&mut c, SLICE_MAGIC, &SLICE_VERSIONS, "slice")?;
         let dict_len = c.u64("slice dict length")? as usize;
         let postings_len = c.u64("slice postings length")? as usize;
         let dict_bytes = c.take(dict_len, "slice dictionary")?;
@@ -1129,7 +1179,7 @@ impl<'a> Slice<'a> {
         Ok(Self {
             dict,
             postings,
-            legacy: version == LEGACY_SLICE_FORMAT_VERSION,
+            version,
         })
     }
 
@@ -1150,11 +1200,7 @@ impl<'a> Slice<'a> {
             .postings
             .get(start..end)
             .ok_or_else(|| malformed("slice entry range past postings region"))?;
-        if self.legacy {
-            decode_legacy_run(run)
-        } else {
-            decode_run_with_tier(run)
-        }
+        decode_run_of(self.version, run)
     }
 
     /// The postings for `key`, `None` when the slice holds no such term.
@@ -1355,12 +1401,12 @@ mod tests {
     #[test]
     fn run_round_trips_its_tier_reference() {
         let postings = sample_postings();
-        let bytes = encode_run(Some(&sample_tier()), &postings);
+        let bytes = encode_run(Some(&sample_tier()), None, &postings);
         let run = decode_run_with_tier(&bytes).expect("decode");
         assert_eq!(run.tier, Some(sample_tier()));
         assert_eq!(run.postings, postings);
         assert_eq!(decode_run(&bytes).expect("postings only"), postings);
-        let inline = encode_run(Some(&sample_inline_tier()), &postings);
+        let inline = encode_run(Some(&sample_inline_tier()), None, &postings);
         let run = decode_run_with_tier(&inline).expect("decode");
         assert_eq!(run.tier, Some(sample_inline_tier()));
         assert_eq!(run.postings, postings);
@@ -1369,7 +1415,7 @@ mod tests {
             decode_run_with_tier(&inline[..inline.len() - 1]).is_err(),
             "a truncated inline tier is refused"
         );
-        let without = encode_run(None, &postings);
+        let without = encode_run(None, None, &postings);
         assert_eq!(decode_run_with_tier(&without).expect("decode").tier, None);
         let mut bad = without.clone();
         bad[1] = 7;
@@ -1381,15 +1427,15 @@ mod tests {
     #[test]
     fn run_round_trips_every_location_kind() {
         let postings = sample_postings();
-        let bytes = encode_run(None, &postings);
+        let bytes = encode_run(None, None, &postings);
         assert_eq!(decode_run(&bytes).expect("decode"), postings);
     }
 
     #[test]
     fn run_rejects_truncation_and_unknown_tag() {
-        let bytes = encode_run(None, &sample_postings());
+        let bytes = encode_run(None, None, &sample_postings());
         assert!(decode_run(&bytes[..bytes.len() - 1]).is_err(), "truncated");
-        let mut bad = encode_run(None, &sample_postings()[3..]);
+        let mut bad = encode_run(None, None, &sample_postings()[3..]);
         // The last byte of a `None` posting is its tag.
         *bad.last_mut().expect("tag") = 200;
         assert!(
@@ -1687,7 +1733,7 @@ mod tests {
         let mut dict = TermDictBuilder::new();
         let mut postings = Vec::new();
         for (col, term, run) in entries {
-            let bytes = encode_run(None, run);
+            let bytes = encode_run(None, None, run);
             dict.insert(
                 &make_key(col, term),
                 DictEntry::Pfor {

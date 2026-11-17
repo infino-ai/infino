@@ -35,6 +35,8 @@ pub(crate) mod build;
 mod fold_tool;
 pub(crate) mod format;
 pub(crate) mod level_head;
+#[cfg(test)]
+mod level_head_build_tests;
 pub(crate) mod tier;
 
 use std::{
@@ -3684,13 +3686,18 @@ mod tests {
             tier_entries_of(&built.root.layers[0], &built.tiers, &beta_tier).len(),
             1
         );
-        // Both tiers are a few entries: they ride in their runs, and the
-        // slice has no tier object.
+        // Both tiers are a few entries: they ride in their runs. The slice's
+        // object holds alpha's level head alone — nine entries, past what
+        // rides inline — and beta's one-entry head rides in its run.
         assert!(tier.chunks.is_empty() && beta_tier.chunks.is_empty());
+        let alpha_head = alpha.head.expect("alpha has a head");
+        assert_eq!((alpha_head.levels.len(), alpha_head.n_entries()), (1, 9));
+        let beta_head = beta.head.expect("beta has a head");
+        assert_eq!((beta_head.inline.len(), beta_head.levels.len()), (1, 0));
         let layer = &built.root.layers[0];
         assert_eq!(layer.slices.len(), 1);
-        assert!(layer.slices[0].tier.is_none(), "nothing to chunk");
-        assert!(built.tiers.is_empty());
+        assert!(layer.slices[0].tier.is_some(), "alpha's head is in the object");
+        assert_eq!(built.tiers.len(), 1);
     }
 
     /// Six hundred terms in one contribution, docs scored off `id`: with
@@ -10972,7 +10979,7 @@ mod tests {
     fn range_cuts_fall_by_weight_not_by_slice() {
         let dir = TempDir::new().expect("tempdir");
         let policy = BuildPolicy {
-            slice_target_bytes: 1 << 20,
+            slice_target_bytes: 8 << 10,
             tier_entries_per_term: 100_000,
             merge_ranges: Some(4),
             ..BuildPolicy::default()
@@ -10993,7 +11000,17 @@ mod tests {
                 .collect();
             contribution_with_heads(&dir, id, &entries, 1000)
         };
-        let built = build(&[hot(1), hot(2), hot(3)], &policy).expect("build");
+        // The build runs as one range, so its slices are cut by size alone:
+        // a build in ranges weighs its contributions, which carry the heads
+        // a merge weighs, and would cut its slices where the merge cuts.
+        let built = build(
+            &[hot(1), hot(2), hot(3)],
+            &BuildPolicy {
+                merge_ranges: Some(1),
+                ..policy.clone()
+            },
+        )
+        .expect("build");
         spill_tiers(dir.path(), &built.root.layers[0].slices, built.tiers).expect("spill tiers");
         let sources = vec![
             spill_slices(dir.path(), &built.root.layers[0], built.slices).expect("spill slices"),

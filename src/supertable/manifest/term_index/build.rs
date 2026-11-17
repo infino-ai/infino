@@ -52,6 +52,10 @@ use super::{
         Layer, Location, Posting, Root, Run, SLICE_HEADER_LEN, Slice, SliceDictionary, SliceRef,
         TierRef, encode_run, encode_slice, legacy_bound_as_key, push_posting, read_posting,
     },
+    level_head::{
+        BucketMaxTf, HeadRef, KeyedEntry, LevelBlock, LevelRef, cut_head, decode_segment,
+        encode_segment, head_depth, level_ranges,
+    },
     tier::{
         BLOCK_ENTRIES, ColumnScoring, EncodedChunk, HeadGroup, SplicedBlock, TierChunk,
         TierChunkRef, TierEntry, encode_block, encode_spliced_chunk, encode_tier,
@@ -298,6 +302,78 @@ struct TermInput {
     /// Tiers still to decode and renumber (a merge's sources), so the
     /// decoding runs in the parallel batch rather than on the merge thread.
     sources: Vec<TierSource>,
+    /// What the term's level head is cut from.
+    head: HeadInput,
+}
+
+/// What a term's level head is cut from: the level heads of the sources
+/// that have one, and for every source without, its tier entries (or a
+/// build's superfile heads) bounded by its postings' tails.
+#[derive(Default)]
+struct HeadInput {
+    /// Entries of sources' inline heads, renumbered.
+    inline: Vec<TierEntry>,
+    /// Sources' head levels still to decode and renumber.
+    sources: Vec<HeadSource>,
+    /// The largest floor of a source with a head: no document of its left
+    /// out of its head keys above it.
+    floor: f32,
+    /// Whether some source has no head, so the term's tier entries (a
+    /// build's superfile heads) are candidates too, and `tail` bounds what
+    /// they leave out.
+    headless: bool,
+    /// The largest posting tail of a source without a head.
+    tail: f32,
+    /// The sources' per-bucket maxima; `None` once one source lacks them.
+    buckets: Option<BucketMaxTf>,
+    /// Whether any source was seen yet (the first sets `buckets`).
+    seen: bool,
+}
+
+impl HeadInput {
+    /// Fold in a source without a head, whose postings' tails are `tails`
+    /// and whose per-bucket maxima are `buckets`.
+    fn add_headless(&mut self, tails: impl Iterator<Item = f32>, buckets: Option<&BucketMaxTf>) {
+        self.headless = true;
+        self.tail = tails.fold(self.tail, f32::max);
+        self.add_buckets(buckets);
+    }
+
+    /// Fold in a source's per-bucket maxima.
+    fn add_buckets(&mut self, buckets: Option<&BucketMaxTf>) {
+        self.buckets = match (self.seen, self.buckets.take(), buckets) {
+            (false, _, b) => b.cloned(),
+            (true, Some(mut a), Some(b)) => {
+                a.merge(b);
+                Some(a)
+            }
+            _ => None,
+        };
+        self.seen = true;
+    }
+
+    /// Entries this input holds or names, for batch accounting.
+    fn n_entries(&self) -> usize {
+        self.inline.len()
+            + self
+                .sources
+                .iter()
+                .flat_map(|s| s.levels.iter())
+                .map(|l| l.n_entries as usize)
+                .sum::<usize>()
+    }
+}
+
+/// One source's level head in a merge: its levels, and a window of its
+/// slice's head object they lie in.
+struct HeadSource {
+    bytes: Bytes,
+    /// Offset of the window in the head object.
+    base: u64,
+    levels: Vec<LevelRef>,
+    /// What the ordinals in the levels are relative to: the source
+    /// layer's base.
+    ordinal_base: u32,
 }
 
 /// A scratch directory for a build, removed when dropped: under `root`
@@ -345,6 +421,98 @@ struct EncodedTerm {
     key: Vec<u8>,
     postings: Vec<Posting>,
     tier: Option<EncodedTier>,
+    head: Option<EncodedHead>,
+}
+
+/// A term's level head, cut and encoded, before it is placed: one segment
+/// per level, or the entries inline when few.
+struct EncodedHead {
+    floor: f32,
+    buckets: Option<BucketMaxTf>,
+    /// Each level's segment and entry count.
+    segments: Vec<(Vec<u8>, u32)>,
+    inline: Vec<TierEntry>,
+}
+
+/// Cut and encode a term's level head from `input`, plus `tier_entries`
+/// when some source has no head (a build's superfile heads, or a layer
+/// from before level heads). Entries are keyed at their superfile's
+/// scoring; the depth follows the term's document count in the layer.
+/// `None` when nothing is a candidate.
+fn encode_head(
+    input: &HeadInput,
+    tier_entries: &[TierEntry],
+    df: u64,
+    ordinals: &[Option<u32>],
+    scoring_of: &dyn Fn(u32) -> ColumnScoring,
+) -> Result<Option<EncodedHead>, TermIndexError> {
+    let mut entries: Vec<TierEntry> = input.inline.clone();
+    if input.headless {
+        entries.extend_from_slice(tier_entries);
+    }
+    let mut blocks: Vec<LevelBlock> = Vec::new();
+    for source in &input.sources {
+        for level in &source.levels {
+            let bytes = span_bytes(&source.bytes, source.base, level.offset, level.len)?;
+            decode_segment(bytes, &mut blocks)?;
+            for block in &blocks {
+                entries.extend(block.entries.iter().filter_map(|e| {
+                    Some(TierEntry {
+                        superfile: renumber(ordinals, source.ordinal_base + e.superfile)?,
+                        ..*e
+                    })
+                }));
+            }
+        }
+    }
+    if entries.is_empty() {
+        return Ok(None);
+    }
+    // A document a tier and a head both hold is one candidate.
+    entries.sort_unstable_by_key(|e| (e.superfile, e.doc_id));
+    entries.dedup_by_key(|e| (e.superfile, e.doc_id));
+    let mut candidates = Vec::with_capacity(entries.len());
+    for g in entries.chunk_by(|a, b| a.superfile == b.superfile) {
+        let scoring = scoring_of(g[0].superfile);
+        candidates.extend(g.iter().map(|e| KeyedEntry {
+            entry: *e,
+            key: scoring.key(e.tf, e.len),
+        }));
+    }
+    let outside = match input.headless {
+        true => input.floor.max(input.tail),
+        false => input.floor,
+    };
+    let cut = cut_head(candidates, outside, head_depth(df) as usize);
+    let (segments, inline) = match cut.entries.len() <= TIER_INLINE_MAX {
+        true => (Vec::new(), cut.entries.iter().map(|k| k.entry).collect()),
+        false => (
+            level_ranges(cut.entries.len())
+                .into_iter()
+                .map(|r| (encode_segment(&cut.entries[r.clone()]), r.len() as u32))
+                .collect(),
+            Vec::new(),
+        ),
+    };
+    Ok(Some(EncodedHead {
+        floor: cut.floor,
+        buckets: input.buckets.clone(),
+        segments,
+        inline,
+    }))
+}
+
+/// The bytes at `offset..offset + len` of an object, out of a window of it
+/// starting at `base`.
+fn span_bytes(object: &[u8], base: u64, offset: u64, len: u64) -> Result<&[u8], TermIndexError> {
+    let start = offset
+        .checked_sub(base)
+        .ok_or_else(|| TermIndexError::Malformed("tier chunk before its span".into()))?;
+    let end = start
+        .checked_add(len)
+        .filter(|end| *end <= object.len() as u64)
+        .ok_or_else(|| TermIndexError::Malformed("tier chunk past its object".into()))?;
+    Ok(&object[start as usize..end as usize])
 }
 
 /// Group, cut and encode one term's tier: each superfile keeps its best
@@ -360,12 +528,17 @@ fn encode_term(
     scoring_of: &dyn Fn(u32) -> ColumnScoring,
     splice: bool,
 ) -> Result<EncodedTerm, TermIndexError> {
+    let df: u64 = term.postings.iter().map(|p| p.df).sum();
+    // A source without a level head lends the head its tier entries, which
+    // the splice leaves undecoded.
     if splice
         && budget > 0
         && depth > 0
         && !term.sources.is_empty()
-        && let Some(spliced) = splice_term(&mut term, budget, depth, ordinals)?
+        && !term.head.headless
+        && let Some(mut spliced) = splice_term(&mut term, budget, depth, ordinals)?
     {
+        spliced.head = encode_head(&term.head, &[], df, ordinals, scoring_of)?;
         return Ok(spliced);
     }
     for source in &term.sources {
@@ -378,6 +551,7 @@ fn encode_term(
             &mut term.entries,
         )?;
     }
+    let head = encode_head(&term.head, &term.entries, df, ordinals, scoring_of)?;
     if budget == 0 || depth == 0 || term.entries.is_empty() {
         // No tier: the postings stand on their bounds. A contribution
         // writes a tail of zero when its head held every document, and
@@ -390,6 +564,7 @@ fn encode_term(
             key: term.key,
             postings: term.postings,
             tier: None,
+            head,
         });
     }
     // One group per superfile, each keyed at that superfile's scoring and
@@ -467,6 +642,7 @@ fn encode_term(
         key: term.key,
         postings: term.postings,
         tier: Some(EncodedTier { chunks, inline }),
+        head,
     })
 }
 
@@ -649,6 +825,7 @@ fn splice_term(
             chunks,
             inline: Vec::new(),
         }),
+        head: None,
     }))
 }
 
@@ -765,7 +942,8 @@ impl ContributionWriter {
         let mut encoded = mem::take(&mut self.head);
         encoded.clear();
         push_head(&mut encoded, head.iter().copied());
-        let pushed = self.push_encoded(key, df, bound, location, tail, &encoded);
+        // A head read back from a superfile carries no per-bucket maxima.
+        let pushed = self.push_encoded(key, df, bound, location, tail, &encoded, None);
         self.head = encoded;
         pushed
     }
@@ -780,6 +958,7 @@ impl ContributionWriter {
         location: Location,
         tail: f32,
         head: &[u8],
+        buckets: Option<&[(u8, u32)]>,
     ) -> Result<(), TermIndexError> {
         if self.n_terms > 0 && key <= self.prev_key.as_slice() {
             return Err(TermIndexError::Build(format!(
@@ -801,6 +980,13 @@ impl ContributionWriter {
             },
         );
         self.record.extend_from_slice(head);
+        match buckets {
+            None => self.record.push(RECORD_BUCKETS_ABSENT),
+            Some(pairs) => {
+                self.record.push(RECORD_BUCKETS_PRESENT);
+                BucketMaxTf::encode_pairs(pairs, &mut self.record);
+            }
+        }
         self.frame.clear();
         push_varint(&mut self.frame, self.record.len() as u32);
         if self
@@ -996,6 +1182,7 @@ impl TermHeadSink for HeadSink {
                 Location::from_dict_value(facts.entry),
                 facts.tail,
                 facts.head,
+                Some(facts.buckets),
             )
             .map_err(|e| BuildError::Io(io::Error::other(e.to_string())))
     }
@@ -1103,7 +1290,14 @@ struct Record {
     key: Vec<u8>,
     posting: Posting,
     head: Vec<(u32, u32, u8)>,
+    /// `None` when the contribution did not record them.
+    buckets: Option<BucketMaxTf>,
 }
+
+/// A contribution record's flag before its per-bucket maxima: absent.
+const RECORD_BUCKETS_ABSENT: u8 = 0;
+/// The record's per-bucket maxima follow.
+const RECORD_BUCKETS_PRESENT: u8 = 1;
 
 /// Largest byte length one encoded `u64` can occupy (10 × 7 bits).
 const MAX_U64_VARINT_BYTES: usize = 10;
@@ -1191,10 +1385,25 @@ impl ContributionReader {
             let posting = read_posting(&self.buf, &mut at)?;
             let head =
                 read_head(&self.buf, &mut at).ok_or_else(|| malformed("head count or entry"))?;
+            let flag = *self
+                .buf
+                .get(at)
+                .ok_or_else(|| malformed("bucket maxima flag"))?;
+            at += 1;
+            let buckets = match flag {
+                RECORD_BUCKETS_ABSENT => None,
+                RECORD_BUCKETS_PRESENT => Some(BucketMaxTf::decode(&self.buf, &mut at)?),
+                _ => return Err(malformed("bucket maxima flag")),
+            };
             if at != self.buf.len() {
                 return Err(malformed("record: trailing bytes"));
             }
-            return Ok(Some(Record { key, posting, head }));
+            return Ok(Some(Record {
+                key,
+                posting,
+                head,
+                buckets,
+            }));
         }
     }
 }
@@ -1433,16 +1642,6 @@ impl LayerWriter {
         }
     }
 
-    /// Append one term, first cutting the slice when the run would push it
-    /// past the target.
-    fn add(&mut self, key: &[u8], run: &[u8]) -> Result<(), TermIndexError> {
-        if self.cuts_before(run.len()) {
-            self.cut()?;
-        }
-        self.current.add(key, run);
-        Ok(())
-    }
-
     /// Whether a run of `run_len` bytes starts a new slice.
     fn cuts_before(&self, run_len: usize) -> bool {
         self.current.n_terms > 0 && self.current.encoded_bytes() + run_len > self.target_bytes
@@ -1483,9 +1682,10 @@ impl LayerWriter {
         postings: Vec<Posting>,
         entries: Vec<TierEntry>,
         sources: Vec<TierSource>,
+        head: HeadInput,
     ) -> Result<(), TermIndexError> {
         self.stats.terms += 1;
-        self.pending_entries += entries.len();
+        self.pending_entries += entries.len() + head.n_entries();
         for source in &sources {
             self.pending_entries += source
                 .chunks
@@ -1498,6 +1698,7 @@ impl LayerWriter {
             postings,
             entries,
             sources,
+            head,
         });
         if self.pending_entries >= ENCODE_BATCH_ENTRIES || self.pending.len() >= ENCODE_BATCH_TERMS
         {
@@ -1549,25 +1750,60 @@ impl LayerWriter {
         Ok(())
     }
 
-    /// Write one encoded term: its chunks go in the tier object of the slice
-    /// the term lands in, so a cut moves them to the fresh slice's object.
+    /// Write one encoded term: its tier chunks, then its head's level
+    /// segments, go in the object of the slice the term lands in, so a cut
+    /// moves them to the fresh slice's object.
     fn add_encoded(&mut self, term: EncodedTerm) -> Result<(), TermIndexError> {
-        let Some(encoded) = term.tier else {
-            return self.add(&term.key, &encode_run(None, &term.postings));
-        };
-        let mut tier = TierRef {
-            chunks: self.refs_at(&encoded.chunks),
-            inline: encoded.inline,
-        };
-        let mut run = encode_run(Some(&tier), &term.postings);
+        let mut run = self.encode_placed(&term);
         if self.cuts_before(run.len()) {
             self.cut()?;
-            tier.chunks = self.refs_at(&encoded.chunks);
-            run = encode_run(Some(&tier), &term.postings);
+            run = self.encode_placed(&term);
         }
-        self.place_chunks(&encoded.chunks);
+        if let Some(tier) = &term.tier {
+            self.place_chunks(&tier.chunks);
+        }
+        if let Some(head) = &term.head {
+            for (segment, _) in &head.segments {
+                self.current_tier.extend_from_slice(segment);
+            }
+        }
         self.current.add(&term.key, &run);
         Ok(())
+    }
+
+    /// `term`'s run with its tier chunks and head levels named where they
+    /// would land at the end of the open slice's object.
+    fn encode_placed(&self, term: &EncodedTerm) -> Vec<u8> {
+        let tier = term.tier.as_ref().map(|t| TierRef {
+            chunks: self.refs_at(&t.chunks),
+            inline: t.inline.clone(),
+        });
+        let head = term.head.as_ref().map(|h| {
+            let mut at = self.current_tier.len() as u64
+                + term
+                    .tier
+                    .as_ref()
+                    .map_or(0, |t| t.chunks.iter().map(|c| c.bytes.len() as u64).sum());
+            HeadRef {
+                floor: h.floor,
+                buckets: h.buckets.clone(),
+                levels: h
+                    .segments
+                    .iter()
+                    .map(|(bytes, n_entries)| {
+                        let level = LevelRef {
+                            offset: at,
+                            len: bytes.len() as u64,
+                            n_entries: *n_entries,
+                        };
+                        at += level.len;
+                        level
+                    })
+                    .collect(),
+                inline: h.inline.clone(),
+            }
+        });
+        encode_run(tier.as_ref(), head.as_ref(), &term.postings)
     }
 
     /// Cut the open slice, and its tier object when it has one. A spilled
@@ -1809,8 +2045,7 @@ fn build_range(
 ) -> Result<MergedLayer, TermIndexError> {
     let mut readers = Vec::with_capacity(contributions.len());
     let mut heap: BinaryHeap<Reverse<MergeHead>> = BinaryHeap::new();
-    let mut pending: Vec<Option<(Posting, Vec<(u32, u32, u8)>)>> =
-        Vec::with_capacity(contributions.len());
+    let mut pending: Vec<Option<PendingRecord>> = Vec::with_capacity(contributions.len());
     for (ordinal, c) in contributions.iter().enumerate() {
         let reaches = c
             .marks
@@ -1832,7 +2067,7 @@ fn build_range(
         match rd.next_in(start, end)? {
             Some(rec) => {
                 heap.push(Reverse(MergeHead::new(rec.key, ordinal as u32)));
-                pending.push(Some((rec.posting, rec.head)));
+                pending.push(Some((rec.posting, rec.head, rec.buckets)));
             }
             None => pending.push(None),
         }
@@ -1843,6 +2078,7 @@ fn build_range(
     writer.sink = sink.cloned();
     let mut run: Vec<Posting> = Vec::new();
     let mut entries: Vec<TierEntry> = Vec::new();
+    let mut head_input = HeadInput::default();
     let (mut n_terms, mut n_postings) = (0u64, 0u64);
 
     while let Some(Reverse(head)) = heap.pop() {
@@ -1852,14 +2088,18 @@ fn build_range(
         n_terms += 1;
         let mut take = |ordinal: u32,
                         run: &mut Vec<Posting>,
-                        pending: &mut Vec<Option<(Posting, Vec<(u32, u32, u8)>)>>,
+                        head_input: &mut HeadInput,
+                        pending: &mut Vec<Option<PendingRecord>>,
                         readers: &mut Vec<Option<ContributionReader>>,
                         heap: &mut BinaryHeap<Reverse<MergeHead>>|
          -> Result<(), TermIndexError> {
-            let (mut p, h) = pending[ordinal as usize]
+            let (mut p, h, buckets) = pending[ordinal as usize]
                 .take()
                 .expect("pending posting for heap head");
             p.superfile = ordinal;
+            // A superfile's head is a candidate for the layer's; its tail
+            // bounds what it left out.
+            head_input.add_headless([p.tail].into_iter(), buckets.as_ref());
             entries.extend(h.iter().map(|&(doc_id, tf, len)| TierEntry {
                 superfile: p.superfile,
                 doc_id,
@@ -1873,13 +2113,14 @@ fn build_range(
                 .next_in(None, end)?
             {
                 heap.push(Reverse(MergeHead::new(next.key, ordinal)));
-                pending[ordinal as usize] = Some((next.posting, next.head));
+                pending[ordinal as usize] = Some((next.posting, next.head, next.buckets));
             }
             Ok(())
         };
         take(
             head.ordinal,
             &mut run,
+            &mut head_input,
             &mut pending,
             &mut readers,
             &mut heap,
@@ -1892,6 +2133,7 @@ fn build_range(
             take(
                 next.ordinal,
                 &mut run,
+                &mut head_input,
                 &mut pending,
                 &mut readers,
                 &mut heap,
@@ -1909,6 +2151,7 @@ fn build_range(
             mem::take(&mut run),
             mem::take(&mut entries),
             Vec::new(),
+            mem::take(&mut head_input),
         )?;
     }
     let (layer, slices, tiers, _) = writer.finish()?;
@@ -1920,6 +2163,10 @@ fn build_range(
         tiers,
     })
 }
+
+/// A contribution record waiting on the merge heap: its posting, its
+/// superfile head and its per-bucket maxima.
+type PendingRecord = (Posting, Vec<(u32, u32, u8)>, Option<BucketMaxTf>);
 
 /// Terms a merge cursor decodes from a slice at a time, so a cursor holds
 /// one slice's bytes and a batch of decoded runs rather than the whole
@@ -2316,6 +2563,11 @@ pub(crate) fn rebase_run(run: &mut Run, base: u32) {
             e.superfile += base;
         }
     }
+    if let Some(head) = &mut run.head {
+        for e in &mut head.inline {
+            e.superfile += base;
+        }
+    }
 }
 
 /// The per-ordinal scoring of a build's contributions, ordinals counted
@@ -2337,15 +2589,7 @@ fn chunk_bytes<'a>(
     base: u64,
     chunk: &TierChunkRef,
 ) -> Result<&'a [u8], TermIndexError> {
-    let start = chunk
-        .offset
-        .checked_sub(base)
-        .ok_or_else(|| TermIndexError::Malformed("tier chunk before its span".into()))?;
-    let end = start
-        .checked_add(chunk.len)
-        .filter(|end| *end <= object.len() as u64)
-        .ok_or_else(|| TermIndexError::Malformed("tier chunk past its object".into()))?;
-    Ok(&object[start as usize..end as usize])
+    span_bytes(object, base, chunk.offset, chunk.len)
 }
 
 /// Every entry of `chunks` in `object`, renumbered through `ordinals`;
@@ -2815,6 +3059,7 @@ fn merge_range(
     let mut run: Vec<Posting> = Vec::new();
     let mut sources: Vec<TierSource> = Vec::new();
     let mut entries: Vec<TierEntry> = Vec::new();
+    let mut head_input = HeadInput::default();
     let started = Instant::now();
     let mut tier_bytes = 0u64;
     while let Some(Reverse(head)) = heap.pop() {
@@ -2824,9 +3069,44 @@ fn merge_range(
         entries.clear();
         let mut next = Some(head.ordinal);
         while let Some(source) = next {
-            let source_run = pending[source as usize]
+            let mut source_run = pending[source as usize]
                 .take()
                 .expect("pending run for heap head");
+            match source_run.head.take() {
+                Some(head) => {
+                    head_input.floor = head_input.floor.max(head.floor);
+                    head_input.add_buckets(head.buckets.as_ref());
+                    head_input.inline.extend(head.inline.iter().filter_map(|e| {
+                        Some(TierEntry {
+                            superfile: renumber(ordinals, e.superfile)?,
+                            ..*e
+                        })
+                    }));
+                    if !head.levels.is_empty() {
+                        let cursor = &mut cursors[source as usize];
+                        let spans: Vec<TierChunkRef> = head
+                            .levels
+                            .iter()
+                            .map(|l| TierChunkRef {
+                                offset: l.offset,
+                                len: l.len,
+                                n_blocks: 0,
+                            })
+                            .collect();
+                        let (bytes, base) = cursor.read_tier_span(&spans)?;
+                        tier_bytes += spans.iter().map(|c| c.len).sum::<u64>();
+                        head_input.sources.push(HeadSource {
+                            bytes,
+                            base,
+                            levels: head.levels,
+                            ordinal_base: cursor.base,
+                        });
+                    }
+                }
+                // A layer from before level heads lends its tier entries,
+                // bounded by its postings' tails.
+                None => head_input.add_headless(source_run.postings.iter().map(|p| p.tail), None),
+            }
             // A run without a tier contributes no entries; its postings
             // stand on their bounds in the merged term (see `encode_term`).
             if let Some(tier) = source_run.tier {
@@ -2882,6 +3162,7 @@ fn merge_range(
             mem::take(&mut run),
             mem::take(&mut entries),
             mem::take(&mut sources),
+            mem::take(&mut head_input),
         )?;
     }
     let (layer, slices, tiers, stats) = writer.finish()?;
@@ -2979,6 +3260,7 @@ mod contribution_mark_tests {
                         tail: 0.1,
                         avgdl: 4.0,
                         params: Bm25Params::default(),
+                        buckets: &[],
                     },
                 )
                 .expect("term");
@@ -3027,7 +3309,15 @@ mod contribution_mark_tests {
                     true => {
                         facts.clear();
                         push_head(&mut facts, head.iter().copied());
-                        w.push_encoded(key.as_bytes(), 1 + t as u64, 0.5, location, 0.1, &facts)
+                        w.push_encoded(
+                            key.as_bytes(),
+                            1 + t as u64,
+                            0.5,
+                            location,
+                            0.1,
+                            &facts,
+                            None,
+                        )
                     }
                     false => w.push(key.as_bytes(), 1 + t as u64, 0.5, location, 0.1, head),
                 };

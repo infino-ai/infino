@@ -151,7 +151,43 @@ pub(in crate::superfile::fts) fn finish_head<I: Ord + Copy>(
     let complete = heap.len() <= depth;
     kept.clear();
     kept.extend(heap.drain().map(|TopKEntry(s, d)| (d, s)));
-    kept.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    finish_kept(kept, complete, key)
+}
+
+/// [`finish_head`] for a head deep enough that a heap costs more than a
+/// partition: every `(document, score)` of the term, the best `depth`
+/// kept by selection. The same documents, order, bound and tail.
+pub(in crate::superfile::fts) fn select_head<I: Ord + Copy>(
+    items: impl Iterator<Item = (I, f32)>,
+    depth: usize,
+    kept: &mut Vec<(I, f32)>,
+    key: impl Fn(I) -> f32,
+) -> (f32, f32) {
+    kept.clear();
+    kept.extend(items);
+    let complete = kept.len() <= depth;
+    if !complete {
+        // The first left out is kept too: it is the tail.
+        kept.select_nth_unstable_by(depth, head_cmp);
+        kept.truncate(depth + 1);
+    }
+    finish_kept(kept, complete, key)
+}
+
+/// A head's order: score descending, then document ascending.
+fn head_cmp<I: Ord>(a: &(I, f32), b: &(I, f32)) -> Ordering {
+    b.1.total_cmp(&a.1).then(a.0.cmp(&b.0))
+}
+
+/// Sort a head's candidates — the kept documents, plus the first left out
+/// unless `complete` — and split off the tail: the head's bound (its best
+/// key) and the key of the best document it leaves out, `0.0` when none.
+fn finish_kept<I: Ord + Copy>(
+    kept: &mut Vec<(I, f32)>,
+    complete: bool,
+    key: impl Fn(I) -> f32,
+) -> (f32, f32) {
+    kept.sort_unstable_by(head_cmp);
     let bound = kept.iter().map(|&(d, _)| key(d)).fold(0.0f32, f32::max);
     let tail = if complete {
         0.0
@@ -713,7 +749,41 @@ impl Collector for TopKBuffer {
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
+
+    proptest! {
+        /// A head cut by partition keeps the documents, order, bound and
+        /// tail a heap of the same depth keeps, ties included.
+        #[test]
+        fn a_selected_head_equals_the_heap_head(
+            scores in prop::collection::vec(0u8..6, 0..300),
+            depth in 0usize..320,
+        ) {
+            let items: Vec<(u32, f32)> = scores
+                .iter()
+                .enumerate()
+                .map(|(d, &s)| (d as u32, f32::from(s)))
+                .collect();
+            let key = |d: u32| f32::from(scores[d as usize]) / 8.0;
+            let mut heap = BinaryHeap::new();
+            for &(d, s) in &items {
+                if heap.len() <= depth {
+                    heap.push(TopKEntry(s, d));
+                } else if let Some(mut worst) = heap.peek_mut()
+                    && s > worst.0
+                {
+                    *worst = TopKEntry(s, d);
+                }
+            }
+            let (mut by_heap, mut by_select) = (Vec::new(), Vec::new());
+            let heap_facts = finish_head(&mut heap, depth, &mut by_heap, key);
+            let select_facts = select_head(items.into_iter(), depth, &mut by_select, key);
+            prop_assert_eq!(by_heap, by_select);
+            prop_assert_eq!(heap_facts, select_facts);
+        }
+    }
 
     #[test]
     fn rank_keys_round_trip_and_order_as_the_entries_do() {

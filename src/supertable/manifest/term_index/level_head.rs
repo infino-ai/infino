@@ -63,7 +63,10 @@ use crate::{
     },
     utils::{
         bytes::u32_le_at,
-        varint::{push_u64_varint, push_varint, read_u64_varint, read_varint},
+        varint::{
+            push_doc_facts, push_u64_varint, push_varint, read_doc_facts, read_u64_varint,
+            read_varint,
+        },
     },
 };
 
@@ -181,6 +184,7 @@ impl BucketMaxTf {
 
     /// The largest term frequency in bucket `len`; `None` when the term
     /// has no document of that length.
+    #[cfg(test)]
     pub(crate) fn get(&self, len: u8) -> Option<u32> {
         self.0
             .binary_search_by_key(&len, |p| p.0)
@@ -189,15 +193,22 @@ impl BucketMaxTf {
     }
 
     /// The `(bucket, max tf)` pairs, ascending by bucket.
+    #[cfg(test)]
     pub(crate) fn pairs(&self) -> &[(u8, u32)] {
         &self.0
     }
 
     /// Append as `n varint | per pair: bucket delta varint | max tf varint`.
     pub(crate) fn encode(&self, out: &mut Vec<u8>) {
-        push_u64_varint(out, self.0.len() as u64);
+        Self::encode_pairs(&self.0, out);
+    }
+
+    /// [`Self::encode`] of `pairs`, ascending by bucket, one per bucket.
+    pub(crate) fn encode_pairs(pairs: &[(u8, u32)], out: &mut Vec<u8>) {
+        debug_assert!(pairs.windows(2).all(|w| w[0].0 < w[1].0));
+        push_u64_varint(out, pairs.len() as u64);
         let mut prev = 0u8;
-        for &(len, tf) in &self.0 {
+        for &(len, tf) in pairs {
             push_varint(out, u32::from(len - prev));
             push_varint(out, tf);
             prev = len;
@@ -220,6 +231,124 @@ impl BucketMaxTf {
             prev = len;
         }
         Ok(Self(pairs))
+    }
+}
+
+/// Where one level of a term's head sits in its slice's head object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LevelRef {
+    /// Byte offset of the level's segment in the head object.
+    pub(crate) offset: u64,
+    /// The segment's byte length.
+    pub(crate) len: u64,
+    /// Entries the level holds.
+    pub(crate) n_entries: u32,
+}
+
+/// A term's level head, as its run names it: the floor, the per-bucket
+/// maxima, and either the levels' places in the slice's head object or,
+/// for a head of a few entries, the entries themselves in head order.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub(crate) struct HeadRef {
+    /// See the module docs; `f32::INFINITY` when what the head leaves out
+    /// is not bounded (a source that kept no head).
+    pub(crate) floor: f32,
+    /// `None` when a source did not record them, which leaves the
+    /// length-coherent bound to the frontier and the length budget alone.
+    pub(crate) buckets: Option<BucketMaxTf>,
+    pub(crate) levels: Vec<LevelRef>,
+    pub(crate) inline: Vec<TierEntry>,
+}
+
+/// Bucket maxima flag in a head reference: absent or present.
+const BUCKETS_ABSENT: u8 = 0;
+const BUCKETS_PRESENT: u8 = 1;
+
+impl HeadRef {
+    /// Entries the head holds.
+    #[cfg(test)]
+    pub(crate) fn n_entries(&self) -> u64 {
+        self.inline.len() as u64
+            + self
+                .levels
+                .iter()
+                .map(|l| u64::from(l.n_entries))
+                .sum::<u64>()
+    }
+
+    /// Append as `floor f32 | buckets flag u8 [| buckets] | n_inline varint
+    /// | per inline entry: ordinal varint, doc facts | n_levels varint | per
+    /// level: offset varint, length varint, entries varint`.
+    pub(crate) fn encode(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.floor.to_le_bytes());
+        match &self.buckets {
+            None => out.push(BUCKETS_ABSENT),
+            Some(b) => {
+                out.push(BUCKETS_PRESENT);
+                b.encode(out);
+            }
+        }
+        push_u64_varint(out, self.inline.len() as u64);
+        for e in &self.inline {
+            push_varint(out, e.superfile);
+            push_doc_facts(out, e.doc_id, e.tf, e.len);
+        }
+        push_u64_varint(out, self.levels.len() as u64);
+        for l in &self.levels {
+            push_u64_varint(out, l.offset);
+            push_u64_varint(out, l.len);
+            push_varint(out, l.n_entries);
+        }
+    }
+
+    /// Read what [`Self::encode`] wrote at `*at`, advancing it.
+    pub(crate) fn decode(bytes: &[u8], at: &mut usize) -> Result<Self, TermIndexError> {
+        let floor = bytes
+            .get(*at..*at + KEY_LEN)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .ok_or_else(|| malformed("head floor"))?;
+        *at += KEY_LEN;
+        let flag = *bytes
+            .get(*at)
+            .ok_or_else(|| malformed("head buckets flag"))?;
+        *at += 1;
+        let buckets = match flag {
+            BUCKETS_ABSENT => None,
+            BUCKETS_PRESENT => Some(BucketMaxTf::decode(bytes, at)?),
+            _ => return Err(malformed("head buckets flag")),
+        };
+        let n_inline = read_u64_varint(bytes, at).ok_or_else(|| malformed("head inline count"))?;
+        let mut inline = Vec::new();
+        for _ in 0..n_inline {
+            let superfile =
+                read_varint(bytes, at).ok_or_else(|| malformed("head inline ordinal"))?;
+            let (doc_id, tf, len) =
+                read_doc_facts(bytes, at).ok_or_else(|| malformed("head inline entry"))?;
+            inline.push(TierEntry {
+                superfile,
+                doc_id,
+                tf,
+                len,
+            });
+        }
+        let n_levels = read_u64_varint(bytes, at).ok_or_else(|| malformed("head level count"))?;
+        let mut levels = Vec::new();
+        for _ in 0..n_levels {
+            let offset = read_u64_varint(bytes, at).ok_or_else(|| malformed("level offset"))?;
+            let len = read_u64_varint(bytes, at).ok_or_else(|| malformed("level length"))?;
+            let n_entries = read_varint(bytes, at).ok_or_else(|| malformed("level entries"))?;
+            levels.push(LevelRef {
+                offset,
+                len,
+                n_entries,
+            });
+        }
+        Ok(Self {
+            floor,
+            buckets,
+            levels,
+            inline,
+        })
     }
 }
 
@@ -304,8 +433,10 @@ pub(crate) fn decode_segment(
         return Err(malformed("segment truncated"));
     }
     let stored = u32_le_at(bytes, 0).ok_or_else(|| malformed("segment truncated"))?;
+    // Altered bytes are what a hash mismatch reports elsewhere in the
+    // index: the call for a rebuild, not a parse failure.
     if crc32c(&bytes[CRC_LEN..]) != stored {
-        return Err(malformed("segment CRC mismatch"));
+        return Err(TermIndexError::HashMismatch);
     }
     let mut at = CRC_LEN;
     let n_blocks = read_u64_varint(bytes, &mut at).ok_or_else(|| malformed("block count"))?;
@@ -538,6 +669,56 @@ mod tests {
         // A repeated bucket is refused.
         let bad = [2u8, 4, 1, 0, 1];
         assert!(BucketMaxTf::decode(&bad, &mut 0).is_err());
+    }
+
+    #[test]
+    fn a_head_reference_round_trips() {
+        let mut buckets = BucketMaxTf::default();
+        buckets.observe(3, 9);
+        let heads = [
+            HeadRef::default(),
+            HeadRef {
+                floor: f32::INFINITY,
+                buckets: Some(buckets),
+                levels: vec![
+                    LevelRef {
+                        offset: 0,
+                        len: 300,
+                        n_entries: 64,
+                    },
+                    LevelRef {
+                        offset: 300,
+                        len: 2000,
+                        n_entries: 512,
+                    },
+                ],
+                inline: Vec::new(),
+            },
+            HeadRef {
+                floor: 0.25,
+                buckets: None,
+                levels: Vec::new(),
+                inline: vec![TierEntry {
+                    superfile: 4,
+                    doc_id: 77,
+                    tf: 2,
+                    len: 5,
+                }],
+            },
+        ];
+        for head in heads {
+            let mut bytes = Vec::new();
+            head.encode(&mut bytes);
+            let mut at = 0;
+            assert_eq!(HeadRef::decode(&bytes, &mut at).expect("decode"), head);
+            assert_eq!(at, bytes.len());
+            for cut in 0..bytes.len() {
+                assert!(
+                    HeadRef::decode(&bytes[..cut], &mut 0).is_err(),
+                    "cut at {cut}"
+                );
+            }
+        }
     }
 
     proptest! {
