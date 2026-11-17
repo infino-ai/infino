@@ -33,7 +33,7 @@ use crate::{
         query::{
             SuperfileHit,
             dispatch::{self, tag_hits, tombstone_deny_set},
-            exec::common::resolve_hits_named,
+            hits_page::Page,
         },
         reader_cache::disk::ForegroundQueryGuard,
         tombstones::SidecarCache,
@@ -151,12 +151,6 @@ impl SupertableReader {
         Ok(Some(order.into_iter().take(k).map(|i| hits[i]).collect()))
     }
 
-    /// The rows this snapshot's superfiles hold, deleted ones included: no
-    /// sort can return more.
-    fn rows_held(&self) -> u64 {
-        self.manifest().superfiles.iter().map(|e| e.n_docs).sum()
-    }
-
     /// Sync [`Self::sorted_hits_async`] through the sync→async bridge.
     pub(crate) fn sorted_hits(
         &self,
@@ -186,34 +180,23 @@ impl Supertable {
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, InfinoError> {
         debug!(column, descending, k, "sorted_search");
-        let close_out = self.close_out();
-        let reader = self.reader()?;
-        let context = |e: QueryError| InfinoError::from(e).with_context("sorted_search", None);
-        reader.check_projection(projection).map_err(context)?;
-        // A page past every row is every row: the statement's limit stays
-        // within what the table holds, whatever `k` the caller passed.
-        let k = k.min(usize::try_from(reader.rows_held()).unwrap_or(usize::MAX));
-        let batches = match reader.sorted_hits(column, descending, k).map_err(context)? {
-            Some(hits) => vec![
-                self.block_on_query(
-                    resolve_hits_named(&reader, &hits, projection)
-                        .instrument(detail_span!("search.resolve", hits = hits.len())),
-                )
-                .map_err(context)?,
-            ],
-            None => reader
-                .run_sql(&sorted_statement(
-                    SQL_TABLE,
-                    column,
-                    descending,
-                    k,
-                    projection,
-                    &reader.options().id_column,
-                ))
-                .map_err(context)?,
-        };
-        close_out.finish_batches(&batches);
-        Ok(batches)
+        // A page past every row is every row: `hits_page` holds `k`, and so
+        // the statement's limit, within what the table holds.
+        self.hits_page("sorted_search", k, projection, |reader, k| {
+            match reader.block_on(reader.sorted_hits_async(column, descending, k))? {
+                Some(hits) => Ok(Page::Hits(hits)),
+                None => reader
+                    .run_sql(&sorted_statement(
+                        SQL_TABLE,
+                        column,
+                        descending,
+                        k,
+                        projection,
+                        &reader.options().id_column,
+                    ))
+                    .map(Page::Rows),
+            }
+        })
     }
 }
 

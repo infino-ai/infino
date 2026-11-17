@@ -32,6 +32,7 @@ pub mod fts;
 pub mod graph;
 pub(crate) mod head;
 pub mod hierarchical_iter;
+pub(crate) mod hits_page;
 pub(crate) mod join_build_size;
 pub(crate) mod limit_stage;
 pub(crate) mod match_order;

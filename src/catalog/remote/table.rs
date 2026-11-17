@@ -358,15 +358,6 @@ impl Table for RemoteTable {
     /// index, so unlike a local table it does not refuse a column without
     /// one: the statement sorts any column, and returns the same rows a local
     /// table returns for a column it does index.
-    fn head(
-        &self,
-        _k: usize,
-        _projection: Option<&[&str]>,
-    ) -> Result<Option<Vec<RecordBatch>>, InfinoError> {
-        // The transport has no call for a table's first rows; the caller
-        // runs the statement, which the endpoint answers as any other.
-        Ok(None)
-    }
     fn sorted_search(
         &self,
         column: &str,
@@ -382,6 +373,16 @@ impl Table for RemoteTable {
             projection,
             &default_id_column(),
         ))
+    }
+
+    /// The transport has no call for a table's first rows; the caller runs
+    /// the statement, which the endpoint answers as any other.
+    fn head(
+        &self,
+        _k: usize,
+        _projection: Option<&[&str]>,
+    ) -> Result<Option<Vec<RecordBatch>>, InfinoError> {
+        Ok(None)
     }
 
     /// The wire has no value-count call, so the grouped count it stands for

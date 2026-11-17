@@ -26,9 +26,8 @@ use crate::{
         query::{
             SuperfileHit,
             dispatch::{self, tag_hits, tombstone_deny_set},
-            exec::common::resolve_hits_named,
+            hits_page::Page,
         },
-        reader_cache::disk::ForegroundQueryGuard,
         tombstones::SidecarCache,
     },
     utils::trace::detail_span,
@@ -39,9 +38,11 @@ impl SupertableReader {
     /// the manifest's order, each one's rows in its own order, deleted rows
     /// skipped. Superfiles are read a group at a time, each group holding
     /// enough rows for the rest of the page were none of them deleted, so a
-    /// page of a large table reads the first superfile or two.
+    /// page of a large table reads the first superfile or two. Room for the
+    /// hits is reserved only as rows are found, so a `k` past the rows the
+    /// table holds reserves nothing for them.
     pub(crate) async fn head_hits_async(&self, k: usize) -> Result<Vec<SuperfileHit>, QueryError> {
-        let mut hits: Vec<SuperfileHit> = Vec::with_capacity(k);
+        let mut hits: Vec<SuperfileHit> = Vec::new();
         let manifest = self.manifest();
         let mut entries = manifest.superfiles.iter().cloned();
         while hits.len() < k {
@@ -98,25 +99,9 @@ impl Supertable {
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, InfinoError> {
         debug!(k, "head");
-        let close_out = self.close_out();
-        let reader = self.reader()?;
-        let context = |e: QueryError| InfinoError::from(e).with_context("head", None);
-        reader.check_projection(projection).map_err(context)?;
-        let hits = {
-            let _foreground = ForegroundQueryGuard::enter();
-            reader
-                .block_on(reader.head_hits_async(k))
-                .map_err(context)?
-        };
-        let batches = vec![
-            self.block_on_query(
-                resolve_hits_named(&reader, &hits, projection)
-                    .instrument(detail_span!("search.resolve", hits = hits.len())),
-            )
-            .map_err(context)?,
-        ];
-        close_out.finish_batches(&batches);
-        Ok(batches)
+        self.hits_page("head", k, projection, |reader, k| {
+            reader.block_on(reader.head_hits_async(k)).map(Page::Hits)
+        })
     }
 }
 
@@ -149,13 +134,17 @@ mod tests {
         Arc::new(Schema::new(vec![Field::new("seq", DataType::Int64, false)]))
     }
 
-    fn table(dir: &TempDir) -> Supertable {
+    fn empty_table(dir: &TempDir) -> Supertable {
         let storage: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
         let options = SupertableOptions::new(schema(), vec![], vec![])
             .expect("options")
             .with_storage(storage);
-        let st = Supertable::create(options).expect("create");
+        Supertable::create(options).expect("create")
+    }
+
+    fn table(dir: &TempDir) -> Supertable {
+        let st = empty_table(dir);
         for file in 0..FILES {
             let seqs: Vec<i64> = (file * ROWS_PER_FILE..(file + 1) * ROWS_PER_FILE).collect();
             let batch = RecordBatch::try_new(schema(), vec![Arc::new(Int64Array::from(seqs))])
@@ -197,12 +186,35 @@ mod tests {
             .collect()
     }
 
-    /// Every page is distinct live rows, as many as asked or as the table
-    /// holds, before and after an optimize: deleted rows never come back, a
-    /// page past the first superfile's live rows reads on into the next,
-    /// and a page past every row is every live row.
+    /// Page sizes asked for: none, a few, the first superfile's live rows
+    /// and one more, every live row and past it, and sizes no table here
+    /// holds, which must not reserve room for that many rows.
+    fn page_sizes(live: usize) -> [usize; 11] {
+        [
+            0,
+            1,
+            10,
+            66,
+            67,
+            500,
+            live,
+            live + 10,
+            100_000_000,
+            usize::MAX / 2,
+            usize::MAX,
+        ]
+    }
+
+    /// Every page is the first `k` live rows in storage order, or every live
+    /// row when the table holds fewer. Written in `seq` order, one superfile
+    /// per commit, the table's storage order is `seq` order, so each page is
+    /// the `k` lowest live `seq` values in ascending order: deleted rows
+    /// never come back, and a page past the first superfile's live rows
+    /// reads on into the next. An optimize rewrites superfiles in an order
+    /// of its own, so there each page is the first `k` rows of the page of
+    /// every live row, which holds each live row once.
     #[test]
-    fn head_returns_distinct_live_rows_up_to_k() {
+    fn head_returns_the_first_live_rows_in_storage_order() {
         let dir = TempDir::new().expect("tempdir");
         let st = table(&dir);
         for pass in ["appended", "optimized"] {
@@ -210,21 +222,33 @@ mod tests {
                 st.optimize(&OptimizeOptions::default()).expect("optimize");
             }
             let live = live(&st);
-            for k in [0, 1, 10, 66, 67, 500, live.len(), live.len() + 10] {
-                let got = seqs(&st.head(k, Some(&["seq"])).expect("head"));
-                let what = format!("{pass}, k {k}");
-                assert_eq!(
-                    got.len(),
-                    k.min(live.len()),
-                    "{what}: as many as asked or held"
-                );
-                let distinct: BTreeSet<i64> = got.iter().copied().collect();
-                assert_eq!(distinct.len(), got.len(), "{what}: no row twice");
-                assert!(distinct.is_subset(&live), "{what}: only live rows");
-                if k >= live.len() {
-                    assert_eq!(distinct, live, "{what}: every live row");
-                }
+            let all = seqs(&st.head(usize::MAX, Some(&["seq"])).expect("head"));
+            let distinct: BTreeSet<i64> = all.iter().copied().collect();
+            assert_eq!(distinct, live, "{pass}: every live row");
+            assert_eq!(all.len(), live.len(), "{pass}: each live row once");
+            if pass == "appended" {
+                let ascending: Vec<i64> = live.iter().copied().collect();
+                assert_eq!(all, ascending, "{pass}: storage order is seq order");
             }
+            for k in page_sizes(live.len()) {
+                let got = seqs(&st.head(k, Some(&["seq"])).expect("head"));
+                assert_eq!(
+                    got,
+                    all[..k.min(all.len())],
+                    "{pass}, k {k}: the first k live rows in storage order"
+                );
+            }
+        }
+    }
+
+    /// A table with no rows answers every page size with no rows.
+    #[test]
+    fn an_empty_table_heads_to_no_rows() {
+        let dir = TempDir::new().expect("tempdir");
+        let st = empty_table(&dir);
+        for k in page_sizes(0) {
+            let got = seqs(&st.head(k, Some(&["seq"])).expect("head"));
+            assert!(got.is_empty(), "k {k}: no rows");
         }
     }
 
