@@ -83,7 +83,7 @@ use crate::{
         ManifestSnapshot,
         error::{BuildError, CommitError as ManifestCommitError},
         handle::{Supertable, SupertableInner},
-        manifest::{ScalarStatsAgg, SuperfileEntry, SuperfileUri},
+        manifest::{ManifestLoadError, ScalarStatsAgg, SuperfileEntry, SuperfileUri},
         query::superfile_reader::superfile_reader,
         reader_cache::ReadIntent,
         schema::{
@@ -150,6 +150,11 @@ pub enum AppendPhaseError {
     /// storage — there's no in-process fallback.
     #[error("supertable has no storage attached; append phase requires durable storage")]
     NoStorageAttached,
+
+    /// Reading the manifest's parts, to find whether the WAL's superfile
+    /// is already listed, failed.
+    #[error("manifest part load failed: {0}")]
+    ManifestLoad(#[source] ManifestLoadError),
 
     /// IPC sidecar's blake3 doesn't match the WAL state doc's
     /// `new_row_content_hash`. The bytes are corrupt or a peer
@@ -231,6 +236,7 @@ impl AppendPhaseError {
             AppendPhaseError::ManifestCommit(e) => e.is_permission_denied(),
             AppendPhaseError::Storage(e) => e.is_permission_denied(),
             AppendPhaseError::WalStore(e) => e.is_permission_denied(),
+            AppendPhaseError::ManifestLoad(e) => e.is_permission_denied(),
             _ => false,
         }
     }
@@ -292,7 +298,10 @@ pub(crate) async fn run_append_phase(
     // we just need to make sure the WAL state itself shows
     // Appended.
     let manifest_snapshot = inner.manifest.load_full();
-    if manifest_contains(&manifest_snapshot, preallocated_superfile_id) {
+    if manifest_contains(&manifest_snapshot, preallocated_superfile_id)
+        .await
+        .map_err(AppendPhaseError::ManifestLoad)?
+    {
         let (new_wal, new_etag) =
             advance_to_appended_if_needed(wal_store, wal_doc, wal_etag).await?;
         return Ok((AppendPhaseOutcome::AlreadyApplied, new_wal, new_etag));
@@ -314,15 +323,16 @@ pub(crate) async fn run_append_phase(
     Ok((AppendPhaseOutcome::Applied, new_wal, new_etag))
 }
 
-/// Step 1 helper: scan the manifest's superfile list for a
-/// matching `superfile_id`. O(N) in the number of live
-/// superfiles; called once per append-phase invocation, so the
-/// linear scan is fine at the supertable sizes we target.
-fn manifest_contains(manifest: &ManifestSnapshot, superfile_id: Uuid) -> bool {
-    manifest
-        .get_all_superfiles()
-        .iter()
-        .any(|s| s.uri.0 == superfile_id)
+/// Step 1 helper: whether the manifest lists `superfile_id`. O(N)
+/// in the number of live superfiles; called once per append-phase
+/// invocation. On a lazily loaded manifest the parts not loaded are
+/// read and dropped, not kept on the handle.
+async fn manifest_contains(
+    manifest: &ManifestSnapshot,
+    superfile_id: Uuid,
+) -> Result<bool, ManifestLoadError> {
+    let ids = std::iter::once(superfile_id).collect();
+    Ok(!manifest.listed_of(ids, None).await?.is_empty())
 }
 
 /// If the WAL is already in `Appended`, return its current doc +
@@ -852,6 +862,11 @@ pub enum TombstonePhaseError {
     #[error("failed to scan _id column for {targets}: {message}")]
     IdLookupFailed { targets: String, message: String },
 
+    /// Reading the manifest's parts, to find the superfiles that hold the
+    /// targets or to list the table's superfiles, failed.
+    #[error("manifest part load failed: {0}")]
+    ManifestLoad(#[source] ManifestLoadError),
+
     /// The post-sidecar manifest stamp (tombstone seqs) failed. Only ever
     /// the cause of a [`Self::RetiredButUnfinished`] or of a
     /// [`TombstonePhaseOutcome::CompletionDeferred`]: the stamp runs after
@@ -934,6 +949,7 @@ impl TombstonePhaseError {
             TombstonePhaseError::RetiredButUnfinished { source, .. } => {
                 source.is_permission_denied()
             }
+            TombstonePhaseError::ManifestLoad(e) => e.is_permission_denied(),
             _ => false,
         }
     }
@@ -1102,14 +1118,14 @@ fn refunds_sealed_budget(
 }
 
 /// The superfile ids a manifest lists, for the refund comparison above.
-fn listed_superfile_ids(inner: &SupertableInner) -> HashSet<Uuid> {
-    inner
-        .manifest
-        .load()
-        .get_all_superfiles()
-        .iter()
-        .map(|e| e.superfile_id)
-        .collect()
+async fn listed_superfile_ids(
+    inner: &SupertableInner,
+) -> Result<HashSet<Uuid>, TombstonePhaseError> {
+    let manifest = inner.manifest.load_full();
+    manifest
+        .listed_superfile_ids()
+        .await
+        .map_err(TombstonePhaseError::ManifestLoad)
 }
 
 /// Backoff floor between sealed-sidecar retries. Doubles per
@@ -1343,16 +1359,17 @@ async fn do_tombstone_apply(
     let stale_seal_timeout = tombstones_admin::writer_steal_timeout();
     warn_if_budget_cannot_outlast_seal(max_sealed_retries, stale_seal_timeout);
     // What the manifest listed at the last sealed attempt, so a superfile
-    // disappearing can refund the budget below. Seeded with the current
-    // listing: a compaction that committed before this loop even started is
-    // not evidence of progress during it.
-    let mut listed_at_last_attempt = listed_superfile_ids(inner);
+    // disappearing can refund the budget below. Taken at the first sealed
+    // attempt rather than up front: listing reads every manifest part, which a
+    // delete that never meets a seal has no reason to pay for. Nothing is lost
+    // by starting late, as the first sealed attempt finds the budget unspent.
+    let mut listed_at_last_attempt: Option<HashSet<Uuid>> = None;
     while !pending.is_empty() {
         let pending_ids: Vec<RowId> = pending.iter().map(|(_, target_id)| *target_id).collect();
 
         // One manifest sweep for the whole pending set, instead of a
         // manifest walk plus a full `_id`-column scan per target.
-        let resolved = resolve_all(inner, &pending_ids)?;
+        let resolved = resolve_all(inner, &pending_ids).await?;
 
         let mut doc_ids_in_superfile_map = HashMap::<Uuid, Vec<(u32, usize)>>::new();
         for &(idx, target_id) in &pending {
@@ -1413,11 +1430,15 @@ async fn do_tombstone_apply(
         // a batch whose targets sit entirely inside that set lands nothing
         // until the pass commits. A superfile leaving the manifest is that
         // pass publishing: it is working through its merges and will reach ours.
-        let listed_now = listed_superfile_ids(inner);
-        if refunds_sealed_budget(landed_any, &listed_at_last_attempt, &listed_now) {
+        let listed_now = listed_superfile_ids(inner).await?;
+        let refunded = match &listed_at_last_attempt {
+            Some(listed_before) => refunds_sealed_budget(landed_any, listed_before, &listed_now),
+            None => landed_any,
+        };
+        if refunded {
             sealed_attempts = 0;
         }
-        listed_at_last_attempt = listed_now;
+        listed_at_last_attempt = Some(listed_now);
         sealed_attempts += 1;
         if sealed_attempts > max_sealed_retries {
             return Err(TombstonePhaseError::SealedSidecarRetryExhausted {
@@ -1559,12 +1580,28 @@ async fn finish_retired(
 /// against the same view of the table (the per-target predecessor
 /// re-loaded the manifest for each id and could straddle a
 /// concurrent commit mid-batch).
-fn resolve_all(
+///
+/// On a lazily loaded manifest only the parts whose id range covers a
+/// target are read, and they are not kept on the handle.
+async fn resolve_all(
     inner: &Arc<SupertableInner>,
     target_ids: &[RowId],
 ) -> Result<HashMap<RowId, (Uuid, u32)>, TombstonePhaseError> {
+    // Sorted + deduped once: `id_lookup_many` requires it, and it
+    // turns "which of my targets could this superfile own?" into a
+    // pair of binary searches per manifest entry.
+    let mut pending: Vec<i128> = target_ids.iter().map(|t| t.0).collect();
+    pending.sort_unstable();
+    pending.dedup();
+    if pending.is_empty() {
+        return Ok(HashMap::new());
+    }
     let manifest = inner.manifest.load_full();
-    resolve_targets_in_manifest(inner, &manifest, target_ids)
+    let superfiles = manifest
+        .superfiles_covering_ids(&pending)
+        .await
+        .map_err(TombstonePhaseError::ManifestLoad)?;
+    resolve_targets_in_superfiles(inner, &superfiles, pending)
 }
 
 /// Outcome of one sidecar CAS-PUT attempt.
@@ -1658,8 +1695,9 @@ async fn cas_tombstone_bits(
     })
 }
 
-/// Resolve a batch of target `_id`s to the `(superfile_id, local
-/// doc_id)` pair that owns each, in a single sweep over the manifest.
+/// Resolve a batch of target `_id`s, `pending` sorted and deduplicated,
+/// to the `(superfile_id, local doc_id)` pair that owns each, in a
+/// single sweep over `superfiles` in manifest order.
 ///
 /// Resolving one target at a time costs a manifest walk plus a full
 /// `_id`-column scan per target: deleting T rows from a table of S
@@ -1681,24 +1719,13 @@ async fn cas_tombstone_bits(
 /// Only resolved targets appear in the returned map; a target that
 /// is absent from it is claimed by no superfile — the caller's
 /// `NotFound` outcome.
-fn resolve_targets_in_manifest(
+fn resolve_targets_in_superfiles(
     inner: &Arc<SupertableInner>,
-    manifest: &ManifestSnapshot,
-    targets: &[RowId],
+    superfiles: &[Arc<SuperfileEntry>],
+    mut pending: Vec<i128>,
 ) -> Result<HashMap<RowId, (Uuid, u32)>, TombstonePhaseError> {
-    // Sorted + deduped once: `id_lookup_many` requires it, and it
-    // turns "which of my targets could this superfile own?" into a
-    // pair of binary searches per manifest entry.
-    let mut pending: Vec<i128> = targets.iter().map(|t| t.0).collect();
-    pending.sort_unstable();
-    pending.dedup();
-
     let mut resolved: HashMap<RowId, (Uuid, u32)> = HashMap::with_capacity(pending.len());
-    if pending.is_empty() {
-        return Ok(resolved);
-    }
-
-    for entry in manifest.get_all_superfiles().iter() {
+    for entry in superfiles {
         // `pending` is sorted, so the targets this entry's
         // `[id_min, id_max]` could claim are one contiguous window.
         let lo = pending.partition_point(|&t| t < entry.id_min);
@@ -2111,7 +2138,11 @@ mod tests {
         let (_dir, _st, _ws, _wal, _etag) = fixture().await;
         let opts = Arc::new(default_supertable_options());
         let empty = ManifestSnapshot::empty(Arc::clone(&opts));
-        assert!(!manifest_contains(&empty, Uuid::nil()));
+        assert!(
+            !manifest_contains(&empty, Uuid::nil())
+                .await
+                .expect("parts load")
+        );
     }
 
     /// The storage-fallback fetch surfaces a typed "no storage" string when
@@ -2270,7 +2301,9 @@ mod tests {
         // ManifestSnapshot now contains the preallocated superfile.
         let manifest = st.inner().manifest.load_full();
         assert!(
-            manifest_contains(&manifest, pre_uuid),
+            manifest_contains(&manifest, pre_uuid)
+                .await
+                .expect("parts load"),
             "manifest must reference the new superfile"
         );
 
@@ -2356,7 +2389,9 @@ mod tests {
         assert_eq!(recovered.state, WalState::Appended);
         assert_ne!(recovered_etag, intent_etag);
         assert!(
-            manifest_contains(&st.inner().manifest.load_full(), pre_uuid),
+            manifest_contains(&st.inner().manifest.load_full(), pre_uuid)
+                .await
+                .expect("parts load"),
             "manifest still references the superfile we appended in the seed"
         );
     }
@@ -3258,7 +3293,9 @@ mod tests {
             absent,
             RowId(FIRST_IDS),
         ];
-        let resolved = resolve_all(st.inner(), &targets).expect("batched resolve");
+        let resolved = resolve_all(st.inner(), &targets)
+            .await
+            .expect("batched resolve");
 
         assert_eq!(resolved.len(), 3, "only the present targets resolve");
         assert_eq!(resolved.get(&RowId(FIRST_IDS)), Some(&(sf_a, 0u32)));
@@ -3302,7 +3339,9 @@ mod tests {
 
         let before = meter.snapshot();
         let target = RowId(FIRST_IDS + 1);
-        let resolved = resolve_all(fresh.inner(), &[target]).expect("resolve");
+        let resolved = resolve_all(fresh.inner(), &[target])
+            .await
+            .expect("resolve");
         assert_eq!(resolved.get(&target), Some(&(sf, 1u32)));
         let data = meter.snapshot().since(&before).class_io(UriClass::UserData);
         assert_eq!(data.get_count, 1, "one GET of the superfile");
@@ -3334,9 +3373,13 @@ mod tests {
             RowId(SECOND_IDS),
             RowId(SECOND_IDS + 1),
         ];
-        let batched = resolve_all(st.inner(), &targets).expect("batched resolve");
+        let batched = resolve_all(st.inner(), &targets)
+            .await
+            .expect("batched resolve");
         for target in targets {
-            let single = resolve_all(st.inner(), &[target]).expect("single resolve");
+            let single = resolve_all(st.inner(), &[target])
+                .await
+                .expect("single resolve");
             assert_eq!(
                 batched.get(&target),
                 single.get(&target),
@@ -3354,7 +3397,9 @@ mod tests {
             published_superfile_fixture(&["aa", "bb"], FIRST_IDS).await;
 
         let target = RowId(FIRST_IDS + 1);
-        let resolved = resolve_all(st.inner(), &[target, target, target]).expect("batched resolve");
+        let resolved = resolve_all(st.inner(), &[target, target, target])
+            .await
+            .expect("batched resolve");
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved.get(&target), Some(&(sf_a, 1u32)));
     }

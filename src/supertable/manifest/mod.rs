@@ -2600,6 +2600,11 @@ impl ManifestSnapshot {
     /// lists, if any. One pass over the listed superfiles; none when
     /// `entries` is empty.
     ///
+    /// Reads no part. On a lazily loaded manifest it sees the flat view and
+    /// the parts already loaded, not the whole table: a commit that retries
+    /// settles whether an earlier attempt landed through [`Self::listed_of`]
+    /// before it publishes again, and that check reads the parts.
+    ///
     /// Runs on every commit, so the ids go in an Fx set: its hash is several
     /// times cheaper per lookup than the default SipHash, and SipHash's
     /// protection against crafted keys buys nothing for engine-minted ids.
@@ -2608,38 +2613,158 @@ impl ManifestSnapshot {
             return None;
         }
         let ids: FxHashSet<Uuid> = entries.iter().map(|e| e.superfile_id).collect();
-        self.get_all_superfiles()
-            .iter()
-            .map(|e| e.superfile_id)
-            .find(|id| ids.contains(id))
+        let first_in = |listed: &[Arc<SuperfileEntry>]| {
+            listed
+                .iter()
+                .map(|e| e.superfile_id)
+                .find(|id| ids.contains(id))
+        };
+        if let Some(all) = self.complete_flat_superfiles() {
+            return first_in(all);
+        }
+        first_in(self.get_all_superfiles()).or_else(|| {
+            self.get_all_list_entries()
+                .iter()
+                .filter_map(|entry| self.get_cached_part_by_id(&entry.part_id))
+                .find_map(|part| first_in(&part.superfiles))
+        })
     }
 
-    /// Which of `ids` this manifest lists. Reads the resident superfiles when
-    /// they are the whole table, and loads the list's parts otherwise: a
-    /// lazily loaded manifest holds only the parts read so far, and an id in
-    /// a part not yet read is listed all the same. One pass, stopping once
-    /// every id is found.
+    /// Which of `ids` this manifest lists.
+    ///
+    /// `published_after` is the id of a manifest read before any of `ids` was
+    /// published: a commit stamps its superfiles with a birth version past
+    /// its base's id, and a part's list entry records the newest birth
+    /// version among its superfiles, so a part whose newest is at or below
+    /// `published_after` holds none of `ids` and is not read. On a lazily
+    /// loaded manifest the check then loads only the parts written since —
+    /// on a large table a few, not the whole list. A part whose entry records
+    /// no birth versions is read.
+    ///
+    /// With `None` every part is read, since an id in a part not yet read is
+    /// listed all the same. Resident superfiles that are the whole table are
+    /// scanned in memory either way. Parts are read newest first, as an
+    /// earlier attempt of a commit lands in the newest, without being kept
+    /// (see [`Self::visit_parts_unkept`]). Stops once every id is found.
     pub(crate) async fn listed_of(
         &self,
         mut ids: FxHashSet<Uuid>,
+        published_after: Option<u64>,
     ) -> Result<FxHashSet<Uuid>, ManifestLoadError> {
         let mut listed = FxHashSet::default();
         if ids.is_empty() {
             return Ok(listed);
         }
-        let all = match self.resident_superfiles() {
-            Some(all) => all,
-            None => Cow::Owned(self.get_all_superfiles_loaded().await?),
-        };
-        for entry in all.iter() {
-            if ids.remove(&entry.superfile_id) {
-                listed.insert(entry.superfile_id);
-                if ids.is_empty() {
-                    break;
+        let mut take = |entries: &[Arc<SuperfileEntry>]| {
+            for entry in entries {
+                if ids.remove(&entry.superfile_id) {
+                    listed.insert(entry.superfile_id);
+                    if ids.is_empty() {
+                        return true;
+                    }
                 }
             }
+            false
+        };
+        // A resident whole table is scanned in memory, with no part read.
+        if let Some(all) = self.complete_flat_superfiles() {
+            take(all);
+            return Ok(listed);
         }
+        let written_since = |part: &ManifestPartEntry| {
+            !published_after.is_some_and(|after| {
+                part.birth_version_range()
+                    .is_some_and(|(_, newest)| newest <= after)
+            })
+        };
+        self.visit_parts_unkept(written_since, take).await?;
         Ok(listed)
+    }
+
+    /// The id of every superfile the table lists. Parts not resident are
+    /// read without being kept (see [`Self::visit_parts_unkept`]).
+    pub(crate) async fn listed_superfile_ids(&self) -> Result<HashSet<Uuid>, ManifestLoadError> {
+        if let Some(all) = self.complete_flat_superfiles() {
+            return Ok(all.iter().map(|e| e.superfile_id).collect());
+        }
+        let mut ids = HashSet::new();
+        self.visit_parts_unkept(
+            |_| true,
+            |entries| {
+                ids.extend(entries.iter().map(|e| e.superfile_id));
+                false
+            },
+        )
+        .await?;
+        Ok(ids)
+    }
+
+    /// The superfiles that can hold a row whose id is one of `sorted_ids`,
+    /// in manifest order: every superfile when the table is resident,
+    /// otherwise those of the parts whose id range covers one of the ids,
+    /// read without being kept (see [`Self::visit_parts_unkept`]).
+    pub(crate) async fn superfiles_covering_ids(
+        &self,
+        sorted_ids: &[i128],
+    ) -> Result<Cow<'_, [Arc<SuperfileEntry>]>, ManifestLoadError> {
+        if let Some(all) = self.resident_superfiles() {
+            return Ok(all);
+        }
+        let covering: HashSet<PartId> =
+            parts_covering(self.get_all_list_entries(), sorted_ids).collect();
+        let mut newest_first = Vec::new();
+        self.visit_parts_unkept(
+            |part| covering.contains(&part.part_id),
+            |entries| {
+                newest_first.push(entries.to_vec());
+                false
+            },
+        )
+        .await?;
+        Ok(Cow::Owned(
+            newest_first.into_iter().rev().flatten().collect(),
+        ))
+    }
+
+    /// Hands the superfiles of each part `select` keeps to `visit`, newest
+    /// part first, until `visit` returns `true`. A resident part is read from
+    /// its cell; any other is fetched through the loader and dropped once
+    /// visited, so a lazily loaded handle keeps no extra part resident
+    /// however many parts this reads. Fetches up to
+    /// [`MANIFEST_PART_LOAD_CONCURRENCY`] parts at once.
+    async fn visit_parts_unkept(
+        &self,
+        select: impl Fn(&ManifestPartEntry) -> bool,
+        mut visit: impl FnMut(&[Arc<SuperfileEntry>]) -> bool,
+    ) -> Result<(), ManifestLoadError> {
+        // Pick the parts up front so the fetch futures own their inputs and
+        // borrow neither `select` nor the list entries.
+        let selected: Vec<(PartId, Option<Arc<ManifestPart>>)> = self
+            .get_all_list_entries()
+            .iter()
+            .rev()
+            .filter(|entry| select(entry))
+            .map(|entry| (entry.part_id, self.get_cached_part_by_id(&entry.part_id)))
+            .collect();
+        let loader = self.loader.clone();
+        let mut parts = stream::iter(selected)
+            .map(move |(part_id, resident)| {
+                let loader = loader.clone();
+                async move {
+                    match (resident, loader) {
+                        (Some(part), _) => Ok(part),
+                        (None, Some(loader)) => loader.load(part_id).await,
+                        (None, None) => Err(ManifestLoadError::NoLoaderAttached),
+                    }
+                }
+            })
+            .buffered(MANIFEST_PART_LOAD_CONCURRENCY);
+        while let Some(part) = parts.next().await {
+            if visit(&part?.superfiles) {
+                break;
+            }
+        }
+        Ok(())
     }
 
     /// The parts that hold any of `ids`, found without loading a part. A
