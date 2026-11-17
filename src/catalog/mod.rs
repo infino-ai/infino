@@ -2353,8 +2353,11 @@ mod tests {
         catalog::manifest::CATALOG_PATH,
         runtime_metrics::{io::UriClass, op_stats::with_op_stats},
         supertable::{
-            manifest::{commit::POINTER_PATH, list::MAX_EXACT_VALUE_COUNTS},
-            query::{provider::TABLE_NAME, sql::value_count_schema},
+            manifest::{commit::POINTER_PATH, list::VALUE_TABLES_BUDGET_BYTES},
+            query::{
+                provider::TABLE_NAME, sql::value_count_schema,
+                value_count_carry::MAX_TABLE_VALUE_COUNTS,
+            },
         },
         test_helpers::{
             build_title_batch,
@@ -4897,12 +4900,13 @@ mod tests {
         assert!(!scans(&plan), "answered from manifest stats, no scan");
     }
 
-    /// Distinct values one append of the past-the-cap fixture holds: more than a superfile
-    /// records counts for.
-    const PAST_THE_FILE_CAP: usize = MAX_EXACT_VALUE_COUNTS * 5 / 4;
-    /// Distinct values in each of two appends of the past-the-cap fixture: fewer than a
-    /// superfile's cap, more than it between them.
-    const UNDER_THE_FILE_CAP: usize = MAX_EXACT_VALUE_COUNTS * 3 / 4;
+    /// Distinct values one append of the past-the-limits fixture holds: a table past what a
+    /// superfile keeps, since each entry takes at least its 8-byte count.
+    const PAST_THE_FILE_BUDGET: usize = VALUE_TABLES_BUDGET_BYTES / size_of::<u64>() + 1;
+    /// Distinct values in each of two appends of the past-the-limits fixture: fewer than the
+    /// table-wide limit, more than it between them, and each file's table well within its
+    /// budget.
+    const UNDER_THE_TABLE_LIMIT: usize = MAX_TABLE_VALUE_COUNTS * 3 / 4;
     /// Superfiles that trigger a merge in the value-count fixture's compaction, whatever
     /// their size: as few as merging takes.
     const MERGE_AT_SUPERFILES: u64 = 2;
@@ -5138,17 +5142,17 @@ mod tests {
         assert_value_counts(&conn, "prices", "price", Answered::FromStats);
     }
 
-    /// Past the cap of distinct values, in one superfile or across two, the statistics hold no
-    /// exact answer and the grouped count runs.
+    /// Past what one superfile keeps, or past the table-wide limit of distinct values across
+    /// two, the statistics hold no exact answer and the grouped count runs.
     #[test]
-    fn value_counts_past_the_cap_run_the_grouped_count() {
+    fn value_counts_past_the_limits_run_the_grouped_count() {
         let conn = connect("memory://").expect("connect");
         let field = Field::new("tag", DataType::LargeUtf8, true);
         one_column_table(
             &conn,
             "wide",
             field.clone(),
-            distinct_strings("w", PAST_THE_FILE_CAP),
+            distinct_strings("w", PAST_THE_FILE_BUDGET),
         );
         assert_value_counts(&conn, "wide", "tag", Answered::ByGroupBy);
 
@@ -5156,14 +5160,14 @@ mod tests {
             &conn,
             "split",
             field,
-            distinct_strings("a", UNDER_THE_FILE_CAP),
+            distinct_strings("a", UNDER_THE_TABLE_LIMIT),
         );
         assert_value_counts(&conn, "split", "tag", Answered::FromStats);
         table
             .append(
                 &RecordBatch::try_new(
                     table.schema(),
-                    vec![distinct_strings("b", UNDER_THE_FILE_CAP)],
+                    vec![distinct_strings("b", UNDER_THE_TABLE_LIMIT)],
                 )
                 .expect("batch"),
             )

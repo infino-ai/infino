@@ -697,6 +697,10 @@ mod tests {
 
     /// Distinct values in the low-cardinality columns of the stats test.
     const LOW_CARDINALITY: i64 = 5;
+    /// Rows of the stats test: enough that `n`, one value per row, is past what a value
+    /// table holds within its budget once the superfiles are folded together, while each
+    /// superfile's own `n` table fits.
+    const STATS_ROWS: i64 = 10_000;
 
     /// `k` (`Int16`, few values, some null), `n` (`Int64`, one value per row)
     /// and `s` (`Utf8`, few values, some null).
@@ -736,14 +740,15 @@ mod tests {
     /// The same rows go into two tables, one through `append` and one through
     /// `hydrate`:
     ///   - two low-cardinality columns with nulls, so exact value counts are in
-    ///     play, and one column with a value per row, past the counts cap;
+    ///     play, and one column with a value per row, past a value table's budget
+    ///     once folded;
     ///   - stats compared after folding each table's superfiles together, since
     ///     the two paths cut superfiles differently.
     /// This test pins that hydrate's stats, built alongside the encode and split
     /// over columns, are the same as append's.
     #[test]
     fn hydrate_stats_match_append_stats() {
-        let batches: Vec<RecordBatch> = (0..N_ROWS / BATCH_ROWS)
+        let batches: Vec<RecordBatch> = (0..STATS_ROWS / BATCH_ROWS)
             .map(|i| mixed_batch(i * BATCH_ROWS + 1, (i + 1) * BATCH_ROWS))
             .collect();
 
@@ -761,7 +766,7 @@ mod tests {
                 .filter(|stats| stats.value_counts.is_some())
                 .count(),
             2,
-            "`k` and `s` carry exact value counts, `n` is past the cap"
+            "`k` and `s` carry exact value counts, `n` is past the budget"
         );
         assert_eq!(table_stats(&hydrated), want);
     }

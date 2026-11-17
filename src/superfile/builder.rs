@@ -4284,9 +4284,9 @@ impl SuperfileBuilder {
         let finish_span =
             detail_span!("merge_finish", rows = superfile_builder.next_local_doc_id).entered();
 
-        // The stats were folded batch by batch, each batch's value tables
-        // budgeted only among the columns it held: budget the whole, so the
-        // stats are the same however many columns a pass wrote.
+        // The stats were folded batch by batch, their value tables not yet
+        // budgeted: budget the whole, so the merge keeps the tables a fresh
+        // build of its rows keeps, however its batches and passes were cut.
         out.stats.fit_value_tables();
 
         // Every input fully tombstoned → no rows: match `finish_to`'s
@@ -6118,6 +6118,7 @@ mod tests {
                 rerank_codec::{RerankCodec, SQ8_FIXED_OFFSET, SQ8_FIXED_SCALE},
             },
         },
+        supertable::manifest::ScalarStatsAgg,
         test_helpers::{decimal128_ids, default_vector_config},
         utils::terms::DictEntry,
     };
@@ -8938,6 +8939,136 @@ mod tests {
             });
             let wide = fts_merge(&inputs, Some(base.clone()), WINDOW_ROW_GROUP_ROWS[1]);
             assert_same_merge(narrow, wide, &format!("{pass_fields} fields at a time"));
+        }
+    }
+
+    /// Integer columns of the value-table merge test.
+    const VALUE_TABLE_COLUMNS: usize = 12;
+    /// Rows of each of that test's two inputs.
+    const VALUE_TABLE_INPUT_ROWS: u32 = 1_200;
+
+    /// `doc_id`, a full-text `title`, and [`VALUE_TABLE_COLUMNS`] integer
+    /// columns.
+    fn value_table_schema() -> Arc<Schema> {
+        let mut fields = vec![
+            Field::new("doc_id", DataType::Decimal128(38, 0), false),
+            Field::new("title", DataType::LargeUtf8, false),
+        ];
+        fields.extend(
+            (0..VALUE_TABLE_COLUMNS)
+                .map(|c| Field::new(format!("n{c:02}"), DataType::Int64, false)),
+        );
+        Arc::new(Schema::new(fields))
+    }
+
+    /// One input of the value-table merge test, ids from `first_id`. Integer
+    /// column `c` cycles through `1_000 + 40 * c` values over the ids, so the
+    /// merged tables are about 16,000 bytes and up, differ in size, and pass
+    /// a superfile's budget together.
+    fn value_table_input(opts: &BuilderOptions, first_id: u32) -> Arc<SuperfileReader> {
+        let rows = first_id..first_id + VALUE_TABLE_INPUT_ROWS;
+        let mut columns: Vec<ArrayRef> = vec![
+            Arc::new(decimal128_ids(rows.clone().map(u64::from))),
+            Arc::new(LargeStringArray::from_iter_values(
+                rows.clone().map(|r| format!("doc {}", r % 17)),
+            )),
+        ];
+        columns.extend((0..VALUE_TABLE_COLUMNS).map(|c| {
+            let distinct = 1_000 + 40 * c as i64;
+            Arc::new(Int64Array::from_iter_values(
+                rows.clone()
+                    .map(|r| i64::from(r) % distinct + 10_000 * c as i64),
+            )) as ArrayRef
+        }));
+        let batch = RecordBatch::try_new(opts.schema.clone(), columns).expect("batch");
+        let mut b = SuperfileBuilder::new(opts.clone()).expect("new SuperfileBuilder");
+        b.add_batch(&batch, &[]).expect("add_batch");
+        let bytes = b.finish().expect("finish input");
+        Arc::new(SuperfileReader::open(Bytes::from(bytes)).expect("open input"))
+    }
+
+    /// A merge that writes its columns in passes, each pass's stats holding
+    /// only its own columns' value tables, ends with the value tables a merge
+    /// writing every column at once ends with, and the ones a fresh build of
+    /// the merged rows counts: the tables past the superfile's budget,
+    /// together, carry the sketch of their values instead, whichever way the
+    /// columns were written.
+    ///
+    /// Setup: twelve integer columns of 1,000 to 1,440 distinct values, about
+    /// 16 to 23 KB a table, about 235 KB together, past the 128 KB budget;
+    /// merged a field at a time, and with too few held bytes for two fields
+    /// in one pass.
+    #[test]
+    fn a_merge_written_in_passes_keeps_the_value_tables_a_fresh_build_keeps() {
+        let opts = BuilderOptions::new(
+            value_table_schema(),
+            "doc_id",
+            vec![FtsConfig::new("title")],
+            vec![],
+        );
+        let inputs = vec![
+            (value_table_input(&opts, 0), tombstones(&[3, 500])),
+            (
+                value_table_input(&opts, VALUE_TABLE_INPUT_ROWS),
+                tombstones(&[0]),
+            ),
+        ];
+        let group = WINDOW_ROW_GROUP_ROWS[2];
+        let a_field_at_a_time = DecodeWindow {
+            pass_fields: 1,
+            ..DecodeWindow::current()
+        };
+        let little_held = DecodeWindow {
+            held_group_bytes: 1,
+            ..DecodeWindow::current()
+        };
+        for (label, window) in [
+            ("a field at a time", a_field_at_a_time),
+            ("too few held bytes for two fields", little_held),
+        ] {
+            let narrow = with_decode_window(window, || fts_merge(&inputs, None, group));
+            let wide = fts_merge(&inputs, None, group);
+            let wide_stats = wide.1.scalar_stats.clone();
+            let merged = assert_same_merge(narrow, wide, label).expect("rows survive");
+
+            let fresh = SuperfileStats::try_compute_from_record_batch(
+                &merged.get_record_batch(None).expect("merged rows"),
+            )
+            .expect("fresh stats")
+            .scalar_stats;
+            let kept = |stats: &HashMap<FieldId, ScalarStatsAgg>| -> Vec<FieldId> {
+                let mut kept: Vec<FieldId> = stats
+                    .iter()
+                    .filter(|(_, agg)| agg.value_counts.is_some())
+                    .map(|(id, _)| *id)
+                    .collect();
+                kept.sort_unstable();
+                kept
+            };
+            let sketched = fresh
+                .values()
+                .filter(|agg| agg.value_counts.is_none() && agg.hll.is_some())
+                .count();
+            assert!(
+                sketched > 0 && sketched < VALUE_TABLE_COLUMNS,
+                "{label}: guard: the budget keeps some tables and not others, \
+                 {sketched} sketched"
+            );
+            assert_eq!(
+                kept(&wide_stats),
+                kept(&fresh),
+                "{label}: the same tables kept"
+            );
+            for (id, want) in &fresh {
+                let got = wide_stats
+                    .get(id)
+                    .expect("the merge has the column's stats");
+                assert_eq!(
+                    got.value_counts, want.value_counts,
+                    "{label}: column {id:?}"
+                );
+                assert_eq!(got.hll, want.hll, "{label}: column {id:?}");
+            }
         }
     }
 

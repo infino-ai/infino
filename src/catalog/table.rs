@@ -504,9 +504,10 @@ impl Supertable {
     /// counted. Rows come in no particular order.
     ///
     /// Read from the table's statistics, with no query planned, when they
-    /// count every live row exactly: no file with deletes, at most 1024
-    /// distinct values across the table and in each file, and the column not
-    /// in the middle of a type change. A file whose column holds only nulls
+    /// count every live row exactly: no file with deletes, every file holding
+    /// the column's value table (a file keeps its value tables while they fit
+    /// 128 KiB together), at most 1024 distinct values across the table, and
+    /// the column not in the middle of a type change. A file whose column holds only nulls
     /// counts as its nulls. Otherwise the grouped count runs. An unknown
     /// column is an error, as is a column itself named `count(*)`.
     pub fn value_counts(&self, column: &str) -> Result<RecordBatch, InfinoError> {
