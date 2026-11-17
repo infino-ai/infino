@@ -694,10 +694,9 @@ impl Supertable {
         if let Some(err) = hidden_index_broken {
             let _ = handle.inner.hidden_index_open_error.set(err);
         }
-        // The manifests are loaded now, so the attached disk cache can be
-        // sized against the real footprint (user + hidden index) instead
-        // of whatever fixed default it was constructed with.
-        handle.reconcile_cache_budget();
+        // The manifests are loaded now, so the attached disk cache's budget
+        // can be checked against the real footprint (user + hidden index).
+        handle.warn_if_cache_budget_below_footprint();
         debug!(
             manifest_id = handle.inner.manifest.load().manifest_id,
             "opened supertable"
@@ -1289,8 +1288,8 @@ impl Supertable {
             &self.query_runtime(),
         )?;
         // The drain writes the hidden per-cell index — roughly a second
-        // copy of the vector payload — so the cache budget floor moves.
-        self.reconcile_cache_budget();
+        // copy of the vector payload — so the footprint grows.
+        self.warn_if_cache_budget_below_footprint();
         Ok(())
     }
 
@@ -1405,24 +1404,16 @@ impl Supertable {
         user.saturating_add(hidden)
     }
 
-    /// Reconcile the attached disk cache's budget with the table's current
-    /// on-storage footprint (user + hidden index + headroom). Called after
-    /// open — once the manifests are loaded — and again after the drain
-    /// grows the hidden index. Raise-only for engine-managed (auto-sized)
-    /// budgets; an explicit budget is never changed, but gets a one-shot
-    /// warning when the footprint exceeds it (steady-state reads would
-    /// churn the cache).
+    /// Warn when the attached disk cache's budget is smaller than the
+    /// table's current on-storage footprint (user + hidden index). Called
+    /// after open, once the manifests are loaded, and again after the drain
+    /// grows the hidden index. The budget itself is never changed.
     #[cfg_attr(feature = "detailed-tracing", tracing::instrument(skip_all))]
-    pub(crate) fn reconcile_cache_budget(&self) {
+    pub(crate) fn warn_if_cache_budget_below_footprint(&self) {
         let Some(cache) = self.inner.options.disk_cache.as_ref() else {
             return;
         };
-        let footprint = self.on_storage_footprint_bytes();
-        if footprint == 0 {
-            return;
-        }
-        let floor = footprint.saturating_add(footprint / CACHE_BUDGET_HEADROOM_DIVISOR);
-        cache.reconcile_budget_floor(floor, footprint);
+        cache.warn_if_budget_below(self.on_storage_footprint_bytes());
     }
 
     #[cfg(any(test, feature = "test-helpers"))]
@@ -1928,12 +1919,6 @@ pub(crate) const GLOBAL_VECTOR_KMEANS_ITERS: usize = 8;
 
 /// Fixed PRNG seed for global centroid training.
 pub(crate) const GLOBAL_VECTOR_KMEANS_SEED: u64 = 0x51ED_2A11;
-
-/// Headroom an engine-managed (auto-sized) cache budget keeps over the
-/// table's on-storage footprint, in divisor form (`footprint +
-/// footprint / this`). Slack for in-flight cold-fetch reservations while
-/// the full working set stays resident.
-const CACHE_BUDGET_HEADROOM_DIVISOR: u64 = 10;
 
 /// Aggressive compaction profile for the hidden vector-index table: keep
 /// ~one compact packed shard object per partition key instead of many
@@ -4399,11 +4384,11 @@ mod tests {
             .expect("disk cache warms without timing out");
     }
 
-    /// An engine-managed (auto-sized) cache budget must be raised at open
-    /// to the table's real on-storage footprint — user superfiles plus the
-    /// hidden vector index — while an explicit budget is never changed.
+    /// Opening a table whose on-storage footprint (user superfiles plus the
+    /// hidden vector index) is over its cache's budget leaves the budget as
+    /// set.
     #[test]
-    fn open_reconciles_auto_sized_cache_budget_with_footprint() {
+    fn open_leaves_a_cache_budget_below_the_footprint_as_set() {
         use arrow_array::{Array, FixedSizeListArray, Float32Array};
 
         use crate::{
@@ -4414,8 +4399,7 @@ mod tests {
             supertable::reader_cache::{DiskCacheConfig, DiskCacheStore},
         };
 
-        /// Deliberately smaller than any committed superfile, so an
-        /// unreconciled budget is distinguishable from a raised one.
+        /// Smaller than any committed superfile.
         const TINY_BUDGET_BYTES: u64 = 4;
 
         let dim = 16usize;
@@ -4473,51 +4457,28 @@ mod tests {
             producer.drain_vectors_to_cells_sync().expect("drain");
         }
 
-        // Auto-sized consumer: a tiny engine-managed budget must be raised
-        // to at least the footprint by the open-time reconcile.
-        let auto_cache_dir = TempDir::new().expect("cache tempdir");
-        let auto_cache = DiskCacheStore::new_unpinned(
+        let cache_dir = TempDir::new().expect("cache tempdir");
+        let cache = DiskCacheStore::new_unpinned(
             Arc::clone(&storage),
             DiskCacheConfig {
-                cache_root: auto_cache_dir.path().to_path_buf(),
+                cache_root: cache_dir.path().to_path_buf(),
                 disk_budget_bytes: TINY_BUDGET_BYTES,
                 mmap_cold_threshold_secs: 0,
                 mmap_sweep_interval_secs: 0,
                 ..Default::default()
             },
         )
-        .expect("auto cache");
-        auto_cache.mark_budget_auto_sized();
-        let st = Supertable::open(make_options().with_disk_cache(Arc::clone(&auto_cache)))
-            .expect("open with auto-sized cache");
-        let footprint = st.on_storage_footprint_bytes();
-        assert!(footprint > 0, "committed + drained table has a footprint");
+        .expect("cache");
+        let st = Supertable::open(make_options().with_disk_cache(Arc::clone(&cache)))
+            .expect("open with a cache");
         assert!(
-            auto_cache.disk_budget_bytes() >= footprint,
-            "auto-sized budget {} must cover the footprint {footprint}",
-            auto_cache.disk_budget_bytes(),
+            st.on_storage_footprint_bytes() > TINY_BUDGET_BYTES,
+            "the committed and drained table is larger than the budget"
         );
-        drop(st);
-
-        // Explicit-budget consumer: the same open leaves the budget alone.
-        let explicit_cache_dir = TempDir::new().expect("cache tempdir");
-        let explicit_cache = DiskCacheStore::new_unpinned(
-            Arc::clone(&storage),
-            DiskCacheConfig {
-                cache_root: explicit_cache_dir.path().to_path_buf(),
-                disk_budget_bytes: TINY_BUDGET_BYTES,
-                mmap_cold_threshold_secs: 0,
-                mmap_sweep_interval_secs: 0,
-                ..Default::default()
-            },
-        )
-        .expect("explicit cache");
-        let st = Supertable::open(make_options().with_disk_cache(Arc::clone(&explicit_cache)))
-            .expect("open with explicit cache");
         assert_eq!(
-            explicit_cache.disk_budget_bytes(),
+            cache.disk_budget_bytes(),
             TINY_BUDGET_BYTES,
-            "explicit budgets are warned about, never changed"
+            "a budget below the footprint is warned about, never changed"
         );
         drop(st);
     }

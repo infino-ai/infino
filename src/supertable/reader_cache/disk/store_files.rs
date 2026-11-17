@@ -1049,8 +1049,6 @@ mod tests {
         assert_eq!(store.stats().current_bytes, 0);
     }
 
-    // ----- engine-managed (auto-sized) budget reconciliation -----
-
     #[tokio::test]
     async fn erase_superfile_local_copy_removes_entry_file_and_accounting() {
         // GC drop-through: a dropped URI leaves no entry, no promoted file, no

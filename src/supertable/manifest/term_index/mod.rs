@@ -65,7 +65,6 @@ use bytes::Bytes;
 pub(crate) use format::TierRef;
 use format::{Layer, SliceRef};
 pub(crate) use format::{Location, Posting, Root, Run, Slice, legacy_bound_as_key};
-use fs4::{available_space, total_space};
 use futures::{StreamExt, TryStreamExt, stream};
 use rayon::{ThreadPool, ThreadPoolBuilder};
 use tempfile::TempDir;
@@ -105,7 +104,7 @@ use crate::{
         query::prune::PruneLeaf,
         schema::FieldId,
     },
-    utils::trace::detail_span,
+    utils::{disk::disk_space, trace::detail_span},
 };
 
 /// Object-store directory prefix for term-index objects, sibling to the
@@ -513,7 +512,7 @@ async fn write_objects(
 /// which a fold reads in place, count as room. `None` when the filesystem
 /// cannot be read.
 pub(crate) fn fold_disk_bound(dir: &Path, measured: &AtomicU64, held: u64) -> Option<u64> {
-    let (free, total) = (available_space(dir).ok()?, total_space(dir).ok()?);
+    let (free, total) = disk_space(dir)?;
     Some(disk_bound(
         free,
         total,
