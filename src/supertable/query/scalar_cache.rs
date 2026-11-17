@@ -112,14 +112,24 @@ impl<K: Eq + Hash, V: Clone> ByteLru<K, V> {
         if let Some(&at) = state.index.get(&key) {
             state.unlink(at);
             state.link_newest(at);
-            if let Some(slot) = state.slots[at].as_ref() {
-                return slot.value.clone();
-            }
+            return state.slots[at]
+                .as_ref()
+                .expect("an indexed key's slot holds its value")
+                .value
+                .clone();
         }
         if bytes <= self.max_bytes {
             state.push(key, value.clone(), bytes, self.max_bytes);
         }
         value
+    }
+
+    /// Drop the value under `key`, if one is kept.
+    pub(crate) fn remove(&self, key: &K) {
+        let mut state = self.state.lock().expect("decoded cache poisoned");
+        if let Some(&at) = state.index.get(key) {
+            state.remove(at);
+        }
     }
 
     /// How many values are kept.

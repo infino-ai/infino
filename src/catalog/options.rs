@@ -61,8 +61,11 @@ pub struct ConnectOptions {
     /// Credentials/tuning for the URI-selected backend, keyed by
     /// `object_store` config strings. Empty → ambient cloud identity.
     pub(crate) storage_options: HashMap<String, String>,
-    /// Disk-cache root. `None` (default) → caching off; cold reads go
-    /// straight to object storage. Set → a local NVMe tier under this
+    /// Disk-cache root. `None` (default) → no disk cache; cold reads go
+    /// straight to object storage, by range. Each open table still keeps
+    /// the lazy readers it opened (parsed footer and page indexes, the open's
+    /// tail bytes, and what later reads loaded into them), at most
+    /// 256 per table, for later queries. Set → a local NVMe tier under this
     /// directory, per table (`<cache_dir>/<table>`).
     pub(crate) cache_dir: Option<PathBuf>,
     /// Disk-cache byte budget. `None` → the cache's built-in default.
@@ -134,7 +137,10 @@ impl ConnectOptions {
 
     /// Enable a local disk cache rooted at `dir` (off by default). Cold
     /// superfile reads are cached to NVMe; per table, under
-    /// `<dir>/<table>`. No effect on `memory://` catalogs.
+    /// `<dir>/<table>`. No effect on `memory://` catalogs. Without it, each
+    /// open table reads superfiles from object storage by range and keeps
+    /// the readers it opened (their parsed metadata and what later reads
+    /// loaded into them), at most 256 per table, for later queries.
     pub fn with_cache_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.cache_dir = Some(dir.into());
         self

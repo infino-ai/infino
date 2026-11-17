@@ -34,7 +34,15 @@ use std::{
 use bytes::Bytes;
 
 use super::{ReaderCacheError, SuperfileReaderCache, disk::release_temp_file};
-use crate::{superfile::SuperfileReader, supertable::manifest::SuperfileUri};
+use crate::{
+    superfile::SuperfileReader,
+    supertable::{manifest::SuperfileUri, query::scalar_cache::ByteLru},
+};
+
+/// Most lazy readers one [`InMemoryReaderCache`] keeps;
+/// past it the least recently used one is dropped (a caller holding it
+/// keeps it alive).
+const LAZY_READERS_MAX: usize = 256;
 
 /// Per-URI entry. Holds the raw bytes alongside the parsed reader
 /// so `resident_bytes()` can attribute storage back to specific
@@ -53,6 +61,22 @@ struct Entry {
 /// construction and pass that around instead.
 pub struct InMemoryReaderCache {
     inner: RwLock<HashMap<SuperfileUri, Entry>>,
+    /// The lazy readers the storage-only open of `superfile_reader_tiered`
+    /// opened on this table, by superfile. A table with durable storage and
+    /// no disk cache (every connection without `cache_dir`, the default)
+    /// otherwise opened every superfile a query read anew: a footer read and
+    /// parse, then on its first scan the page indexes, read and parsed for
+    /// every column. A superfile never changes once written, so its reader,
+    /// with what it parsed, serves every later query on the table.
+    ///
+    /// Kept here, beside the table's own reader cache, rather than for the
+    /// process: each reader reads through the storage handle it was opened
+    /// with, and the store belongs to one table handle, opened by one
+    /// connection with that connection's storage. So a reader is only ever
+    /// reused by the handle that opened it, and is dropped with it.
+    ///
+    /// Each reader weighs one, so the byte bound is a count bound.
+    kept_lazy: ByteLru<SuperfileUri, Arc<SuperfileReader>>,
 }
 
 impl InMemoryReaderCache {
@@ -60,6 +84,7 @@ impl InMemoryReaderCache {
     pub fn new() -> Self {
         Self {
             inner: RwLock::new(HashMap::new()),
+            kept_lazy: ByteLru::new(LAZY_READERS_MAX),
         }
     }
 
@@ -141,6 +166,15 @@ impl SuperfileReaderCache for InMemoryReaderCache {
             .write()
             .expect("InMemoryReaderCache rwlock poisoned")
             .remove(uri);
+        self.kept_lazy.remove(uri);
+    }
+
+    fn lazy(&self, uri: &SuperfileUri) -> Option<Arc<SuperfileReader>> {
+        self.kept_lazy.get(uri)
+    }
+
+    fn keep_lazy(&self, uri: SuperfileUri, reader: Arc<SuperfileReader>) -> Arc<SuperfileReader> {
+        self.kept_lazy.get_or_insert(uri, reader, 1)
     }
 }
 

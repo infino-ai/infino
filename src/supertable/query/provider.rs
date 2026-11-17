@@ -1352,7 +1352,7 @@ impl SupertableProvider {
                 &entry.storage_path(),
                 open_intent,
             );
-            if let Some(reader) = &resident
+            if let Some((reader, tier)) = &resident
                 && let Some(parquet_meta) = reader.loaded_parquet_metadata_with_page_index()
             {
                 let prepared = cell
@@ -1362,7 +1362,7 @@ impl SupertableProvider {
                             &scan_footers,
                             &entry,
                             Arc::clone(reader),
-                            OpenTier::Memory,
+                            *tier,
                             parquet_meta,
                         )
                     })
@@ -1375,7 +1375,7 @@ impl SupertableProvider {
                         // A reader already in memory only lacks its page
                         // indexes; reuse it rather than walk the tiers again.
                         let (reader, tier) = match resident {
-                            Some(reader) => (reader, OpenTier::Memory),
+                            Some(resident) => resident,
                             None => superfile_reader_tiered(
                                 &store,
                                 disk_cache.as_ref(),

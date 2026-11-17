@@ -95,6 +95,22 @@ pub trait SuperfileReaderCache: Send + Sync {
     ///
     /// Default no-op — bounded caches (e.g. LRU) don't need this.
     fn remove(&self, _uri: &SuperfileUri) {}
+
+    /// The lazy reader [`Self::keep_lazy`] kept for `uri`, marking it used.
+    /// Default: none is kept.
+    fn lazy(&self, _uri: &SuperfileUri) -> Option<Arc<SuperfileReader>> {
+        None
+    }
+
+    /// Keep `reader`, a lazy reader over range reads of `uri` in durable
+    /// storage, for later opens of `uri` on this table, and return the
+    /// reader kept for it: the first one kept wins, so opens racing on one
+    /// superfile all share a reader. The reader reads through the storage
+    /// handle it was opened with, so only a reader opened with this table's
+    /// own storage belongs here. Default: keeps nothing and returns `reader`.
+    fn keep_lazy(&self, _uri: SuperfileUri, reader: Arc<SuperfileReader>) -> Arc<SuperfileReader> {
+        reader
+    }
 }
 
 /// Error type for [`SuperfileReaderCache`] operations.
