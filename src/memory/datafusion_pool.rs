@@ -49,7 +49,6 @@ use datafusion::{
     physical_optimizer::optimizer::PhysicalOptimizer,
     prelude::{SessionConfig, SessionContext},
 };
-use fs4::total_space;
 use tracing::warn;
 
 use crate::{
@@ -65,6 +64,7 @@ use crate::{
         },
         reader_cache::RunScratch,
     },
+    utils::disk::disk_space,
 };
 
 /// A DataFusion memory pool over a [`ConnectionMemoryBudget`]: measured never
@@ -160,9 +160,10 @@ impl SqlSpill {
     fn open(&self) -> DfResult<OpenSqlSpill> {
         let folder = RunScratch::open(&self.root)?;
         let limit = self.limit.unwrap_or_else(|| {
-            total_space(&self.root)
-                .map(|total| total / SQL_SPILL_DISK_SHARE_DIVISOR)
-                .unwrap_or(DEFAULT_MAX_TEMP_DIRECTORY_SIZE)
+            disk_space(&self.root)
+                .map_or(DEFAULT_MAX_TEMP_DIRECTORY_SIZE, |(_, total)| {
+                    total / SQL_SPILL_DISK_SHARE_DIVISOR
+                })
                 .min(DEFAULT_MAX_TEMP_DIRECTORY_SIZE)
         });
         let disk_manager = DiskManager::builder()
@@ -543,8 +544,8 @@ mod tests {
                 .iter()
                 .all(|path| path.starts_with(&folder))
         );
-        let disk_share =
-            total_space(cache.path()).expect("disk size") / SQL_SPILL_DISK_SHARE_DIVISOR;
+        let (_, disk_bytes) = disk_space(cache.path()).expect("disk size");
+        let disk_share = disk_bytes / SQL_SPILL_DISK_SHARE_DIVISOR;
         assert_eq!(
             disk_manager.max_temp_directory_size(),
             disk_share.min(DEFAULT_MAX_TEMP_DIRECTORY_SIZE)
