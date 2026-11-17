@@ -73,11 +73,6 @@ use crate::{
 /// Head bytes a query reads at most before it stops and opens what is
 /// still in play: a few seconds of reads on a cold store.
 pub(crate) const HEAD_READ_BUDGET_BYTES: u64 = 256 << 20;
-/// What is left of the heads a query still wants is read to the end when
-/// no more than this, even after a round that changed nothing: read whole,
-/// the heads answer for their superfiles, where ties at the threshold would
-/// otherwise open them.
-const HEAD_FINISH_BYTES: u64 = 4 << 20;
 /// Steps of the water-filling's search for its common marginal gain; each
 /// halves the interval, so the allocation it bounds with is within a
 /// negligible share of the budget it was given.
@@ -436,8 +431,14 @@ pub(crate) async fn select(
             }
         }
     }
+    // A scope that admits only some rows: the threshold over every row is
+    // no floor for the admitted ones, and an answer would hold rows the
+    // scope drops. Only the bounds stand.
+    if query.rows_scoped {
+        theta = f32::NEG_INFINITY;
+    }
     let theta_id_max = theta_id_max(&candidates, &slots, &weights, k, lb_slack, theta);
-    let resolved = match exact_scores {
+    let resolved = match exact_scores && !query.rows_scoped {
         true => resolve(&slots, &heads, &candidates, &weights, theta, theta_id_max),
         false => Vec::new(),
     };

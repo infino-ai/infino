@@ -1359,12 +1359,15 @@ impl SupertableReader {
         // order, and its kernel seeds its own floor from its own blocks; the
         // merge would only cost its reads and rounds on every query, and the
         // gate its samples learning so.
-        let tiers_serve = index_column.is_some()
+        // A scope that admits only some rows still lets the level heads bound
+        // each superfile; they then seed no threshold and answer for none.
+        let rows_scoped = scope.is_some_and(|s| s.bounds_rows(&kept));
+        let index_serves = index_column.is_some()
             && kept.len() > 1
-            && scope.is_none_or(|s| !s.bounds_rows(&kept))
             && all_terms.len() <= tier::MAX_TIER_TERMS
             && manifest.term_index_complete()
             && !config::global().diagnostics.disable_tier_selection;
+        let tiers_serve = index_serves && !rows_scoped;
         // Whether to merge at all is the table's learned call per class of
         // query; the search is timed from here so the call can be judged.
         let rarest_idf = all_terms
@@ -1393,14 +1396,14 @@ impl SupertableReader {
         // chooses the superfiles before any open, whatever the gate learned:
         // its reads are a level per term and layer, not a block per term
         // per superfile.
-        let heads_serve = match (tiers_serve, index_column) {
+        let heads_serve = match (index_serves, index_column) {
             (true, Some((index, column_id))) => heads::available(index, column_id, &all_terms)
                 .await
                 .unwrap_or(false),
             _ => false,
         };
-        let merge_now = tiers_serve
-            && (heads_serve || forced || !learned || self.tier_policy().merge(policy_class));
+        let merge_now = heads_serve
+            || (tiers_serve && (forced || !learned || self.tier_policy().merge(policy_class)));
         // The deny sets, resolved only for a merge: it reads past the
         // deleted rows, and the units then admit rows by the same sets, so
         // a delete committed between the two reads cannot leave the
@@ -1515,6 +1518,7 @@ impl SupertableReader {
                     merge_gate: manifest.options.tier_merge_gate,
                     forced,
                     budget: Arc::clone(&manifest.options.connection_memory_budget),
+                    rows_scoped,
                 });
             }
         }

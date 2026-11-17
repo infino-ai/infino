@@ -379,6 +379,11 @@ pub(crate) struct TierQuery<'a> {
     /// The connection's memory budget, which every round's reads are
     /// reserved against.
     pub(crate) budget: Arc<ConnectionMemoryBudget>,
+    /// Whether the query's scope admits only some rows of a superfile: the
+    /// k-th score over every row is then no floor for the admitted ones,
+    /// so a selection bounds superfiles but seeds no threshold and answers
+    /// for none. The tier merge does not serve such a query.
+    pub(crate) rows_scoped: bool,
 }
 
 /// The merge's outcome for one query.
@@ -698,7 +703,7 @@ pub(crate) async fn prepare_merge<'a>(
     let terms = query.terms;
     let nt = terms.len();
     let k = query.k;
-    if nt == 0 || nt > MAX_TIER_TERMS || k == 0 || kept.is_empty() {
+    if nt == 0 || nt > MAX_TIER_TERMS || k == 0 || kept.is_empty() || query.rows_scoped {
         return Ok(None);
     }
     // The gate: the merge's first round decodes a block per term per
