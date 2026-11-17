@@ -282,36 +282,28 @@ fn a_table_past_the_open_window_always_merges() {
     }
 }
 
-/// Within one window the learned gate still decides: it takes both its
-/// ways, one opening every tied superfile, the other merging and opening a
-/// handful. The table holds exactly one window of superfiles, so a merge
-/// forced at the window itself would leave only the second.
+/// Within one window the level heads choose on every run, whatever the
+/// learned gate would have decided for a tier merge: a single term tied in
+/// every superfile opens a handful each time, never the table.
 #[test]
-fn a_table_within_the_window_keeps_the_learned_gate() {
+fn a_table_within_the_window_is_served_by_the_heads_every_run() {
     let p = pair(Shape {
         tiers: true,
         depth: None,
         window: SUPERFILES,
         index: true,
     });
-    // The first run opens every superfile whatever the gate says: its
-    // merge runs beside opens a whole table wide.
-    opens_and_equal(&p, "python", 10);
-    let opens: Vec<u64> = (1..GATE_REPEATS)
-        .map(|_| opens_and_equal(&p, "python", 10))
-        .collect();
-    assert!(
-        opens.iter().any(|&n| n > TIED_TERM_OPENS),
-        "{opens:?}: the gate never took its way without the merge"
-    );
-    assert!(
-        opens.iter().any(|&n| n <= TIED_TERM_OPENS),
-        "{opens:?}: the gate never merged"
-    );
+    for run in 0..GATE_REPEATS {
+        let n = opens_and_equal(&p, "python", 10);
+        assert!(
+            n <= TIED_TERM_OPENS,
+            "run {run}: opened {n} of {SUPERFILES} superfiles"
+        );
+    }
 }
 
-/// Runs a test of the learned gate repeats: enough for it to have tried
-/// both its ways after the first.
+/// Runs a test of a table within one window repeats: enough for a learned
+/// gate to have tried both its ways after the first, were it deciding.
 const GATE_REPEATS: usize = 12;
 
 /// Superfiles of the lone-phrase test that hold the whole phrase.

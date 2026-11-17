@@ -56,6 +56,7 @@ use super::{
     },
 };
 use crate::{
+    config,
     superfile::fts::{
         bm25::{dequantize_len, quantize_len, score_with_dl_norm_k1, tf_factor},
         reader::{GlobalTermIdf, norm_table},
@@ -367,6 +368,12 @@ pub(crate) async fn select(
     let mut bounds;
     // What the last round left: its threshold and the slots it left in play.
     let mut last: Option<(f32, usize)> = None;
+    // The host may cap the rounds, for diagnosis; zero is no cap.
+    let max_rounds = match config::global().diagnostics.tier_rounds {
+        0 => usize::MAX,
+        n => n as usize,
+    };
+    let mut rounds = 0usize;
     loop {
         theta = kth_lower_bound(&candidates, &weights, k, lb_slack);
         bounds = slot_bounds(&slots, &heads, &candidates, &weights, lb_slack);
@@ -389,9 +396,10 @@ pub(crate) async fn select(
         // by the opens anyway: reading further for them buys nothing.
         let bar = competitive_floor(theta, query.score_tolerance);
         let wanted = heads_that_matter(&slots, &heads, &candidates, &bounds, bar);
-        if wanted.is_empty() {
+        if wanted.is_empty() || rounds == max_rounds {
             break;
         }
+        rounds += 1;
         let reads = wanted.iter().map(|&h| {
             let head = &heads[h];
             let level = head.levels[head.next];

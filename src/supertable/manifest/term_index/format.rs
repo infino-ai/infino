@@ -118,8 +118,13 @@ pub(crate) const SLICE_MAGIC: &[u8; 8] = b"INFTSLC1";
 /// at version `3` still decodes — its slices are at version 1 and serve
 /// ceilings until a fold rewrites them in the current layout; anything
 /// older does not, and the index is built again from the superfiles, not
-/// translated.
-pub(crate) const ROOT_FORMAT_VERSION: u32 = 6;
+/// translated. `6` adds each layer's ordinal range and base; `7` records
+/// each slice's largest term document count, so a prefix's most frequent
+/// completions are found by visiting slices best first.
+pub(crate) const ROOT_FORMAT_VERSION: u32 = 7;
+/// The root version with layer ranges and bases but no per-slice largest
+/// document count.
+pub(crate) const RANGED_ROOT_FORMAT_VERSION: u32 = 6;
 /// The root version with slice lengths but no ordinal range or base per
 /// layer: its layers' ordinals are absolute, which is base zero.
 pub(crate) const UNRANGED_ROOT_FORMAT_VERSION: u32 = 5;
@@ -347,7 +352,14 @@ pub(crate) struct SliceRef {
     /// The slice object's byte length, as the root records it; zero in a
     /// root written before lengths were recorded beside tiers.
     pub(crate) len: u64,
+    /// The largest document count, in its layer, of any term the slice
+    /// holds; [`UNKNOWN_MAX_DF`] in a root written before it was recorded.
+    pub(crate) max_df: u64,
 }
+
+/// A slice's largest document count when its root did not record one: no
+/// term's count exceeds it, so a walk by count never skips the slice.
+pub(crate) const UNKNOWN_MAX_DF: u64 = u64::MAX;
 
 /// One build's slice list. The base is layer 0; deltas append.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -498,6 +510,7 @@ impl Root {
                 let tier = s.tier.unwrap_or(ContentHash([0u8; HASH_LEN]));
                 out.extend_from_slice(&tier.0);
                 out.extend_from_slice(&s.len.to_le_bytes());
+                out.extend_from_slice(&s.max_df.to_le_bytes());
             }
         }
         out
@@ -513,6 +526,7 @@ impl Root {
             ROOT_MAGIC,
             &[
                 ROOT_FORMAT_VERSION,
+                RANGED_ROOT_FORMAT_VERSION,
                 UNRANGED_ROOT_FORMAT_VERSION,
                 UNSIZED_ROOT_FORMAT_VERSION,
                 LEGACY_ROOT_FORMAT_VERSION,
@@ -531,7 +545,7 @@ impl Root {
         let n_layers = c.u32("root layer count")? as usize;
         let mut layers = Vec::with_capacity(n_layers);
         for _ in 0..n_layers {
-            let ordinals = match version == ROOT_FORMAT_VERSION {
+            let ordinals = match version >= RANGED_ROOT_FORMAT_VERSION {
                 true => match c.take(1, "layer ordinal range flag")?[0] {
                     0 => None,
                     _ => {
@@ -547,7 +561,7 @@ impl Root {
                 },
                 false => None,
             };
-            let base = match version == ROOT_FORMAT_VERSION {
+            let base = match version >= RANGED_ROOT_FORMAT_VERSION {
                 true => c.u32("layer ordinal base")?,
                 false => 0,
             };
@@ -572,12 +586,17 @@ impl Root {
                     };
                     (tier, len)
                 };
+                let max_df = match version == ROOT_FORMAT_VERSION {
+                    true => c.u64("slice largest document count")?,
+                    false => UNKNOWN_MAX_DF,
+                };
                 slices.push(SliceRef {
                     first_key,
                     last_key,
                     content_hash,
                     tier,
                     len,
+                    max_df,
                 });
             }
             layers.push(Layer {
@@ -952,6 +971,10 @@ fn encode_root_as(root: &Root, version: u32, lens: &[u64]) -> Vec<u8> {
     out.extend_from_slice(&(root.layers.len() as u32).to_le_bytes());
     let mut lens = lens.iter();
     for seg in &root.layers {
+        if version == RANGED_ROOT_FORMAT_VERSION {
+            push_ordinal_range(&mut out, seg.ordinals.as_ref());
+            out.extend_from_slice(&seg.base.to_le_bytes());
+        }
         out.extend_from_slice(&(seg.slices.len() as u32).to_le_bytes());
         for s in &seg.slices {
             push_bytes_u32_len(&mut out, &s.first_key);
@@ -963,12 +986,18 @@ fn encode_root_as(root: &Root, version: u32, lens: &[u64]) -> Vec<u8> {
             }
             let tier = s.tier.unwrap_or(ContentHash([0u8; HASH_LEN]));
             out.extend_from_slice(&tier.0);
-            if version == UNRANGED_ROOT_FORMAT_VERSION {
+            if version >= UNRANGED_ROOT_FORMAT_VERSION {
                 out.extend_from_slice(&s.len.to_le_bytes());
             }
         }
     }
     out
+}
+
+/// A root as the layout before slices' largest counts wrote it.
+#[cfg(test)]
+pub(crate) fn encode_ranged_root(root: &Root) -> Vec<u8> {
+    encode_root_as(root, RANGED_ROOT_FORMAT_VERSION, &[])
 }
 
 #[cfg(test)]
@@ -1482,6 +1511,7 @@ mod tests {
                 .is_multiple_of(2)
                 .then_some(ContentHash([tag ^ 0xFF; HASH_LEN])),
             len: u64::from(tag) * 1000,
+            max_df: UNKNOWN_MAX_DF,
         }
     }
 
@@ -1513,6 +1543,31 @@ mod tests {
             "a root from before ranges reads with none, its ordinals absolute"
         );
         assert_eq!(unranged.layers[0].slices, root.layers[0].slices);
+    }
+
+    /// A root records each slice's largest document count; one of the
+    /// layout before (what earlier engines wrote) reads with every count
+    /// unknown, and the rest as written.
+    #[test]
+    fn a_root_records_each_slice_largest_count_and_an_earlier_root_reads_unknown() {
+        let mut root = Root {
+            superfiles: vec![Uuid::from_u128(1)],
+            id_mins: vec![7],
+            layers: vec![Layer {
+                base: 2,
+                ordinals: Some(2..3),
+                slices: vec![slice_ref("a", "b", 1), slice_ref("c", "d", 2)],
+            }],
+        };
+        root.layers[0].slices[0].max_df = 41;
+        root.layers[0].slices[1].max_df = 0;
+        assert_eq!(Root::decode(&root.encode()).expect("decodes"), root);
+        let earlier = Root::decode(&encode_ranged_root(&root)).expect("decodes");
+        let mut want = root.clone();
+        for slice in &mut want.layers[0].slices {
+            slice.max_df = UNKNOWN_MAX_DF;
+        }
+        assert_eq!(earlier, want);
     }
 
     #[test]
@@ -1626,6 +1681,7 @@ mod tests {
             content_hash: ContentHash([n; 32]),
             tier: None,
             len: 0,
+            max_df: UNKNOWN_MAX_DF,
         };
         let root = Root {
             superfiles: vec![],

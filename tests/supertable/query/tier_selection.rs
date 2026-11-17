@@ -142,14 +142,12 @@ fn a_resolved_superfile_respects_tombstones() {
     }
 }
 
-/// With every superfile's head cut to 64 documents, a common term's head
-/// is read a block at a time and the superfiles it cannot rule out are
-/// opened — and the answer is still hit for hit the ceiling path's, at
-/// every k, for every shape, with fewer opens over the whole matrix. (A
-/// single query can open one more: a head cut this short may not hold the
-/// best joint document, so the survivors' open order can differ from the
-/// ceilings'.) The heads of rare terms stay whole, so their conjunction is
-/// still answered in the index.
+/// With a shallow head depth asked for, each superfile still keeps a
+/// common term's proportional share, so the level heads cut from them
+/// read a level at a time and open what they cannot rule out — and the
+/// answer is still hit for hit the ceiling path's, at every k, for every
+/// shape, with fewer opens over the whole matrix. The heads of rare terms
+/// stay whole, so their conjunction is still answered in the index.
 #[test]
 fn heads_cut_to_a_depth_answer_the_same_and_resolve_the_rare() {
     const DEPTH: usize = 64;
@@ -184,13 +182,6 @@ fn heads_cut_to_a_depth_answer_the_same_and_resolve_the_rare() {
         opened(&stats),
         0,
         "the rare conjunction is still answered in the index"
-    );
-    let (_, stats, _) = run(&with, "the data", BoolMode::And, 10);
-    let held = (2 * SUPERFILES * DEPTH) as u64;
-    assert!(
-        stats.tier_entries <= held,
-        "a common pair reads at most the cut heads: {} entries",
-        stats.tier_entries
     );
 }
 
@@ -570,22 +561,15 @@ fn an_unreadable_tier_leaves_the_query_to_its_ceilings() {
     }
 }
 
-/// With the gate on, the table learns whether to merge by trying both
-/// ways: every try answers the same. The way without the merge is always
-/// among the tries; the merge is, unless the measured costs rule it out
-/// before it runs — which a loaded machine can do for some shapes.
+/// With the learned gate on, a table whose terms carry level heads is
+/// served by them on every ask: the gate weighs only the tier merge of
+/// layers built before level heads, so every ask reads the heads and
+/// answers the same.
 ///
-/// Each shape asks through a handle opened for it. The policy is learned
-/// per handle and per class of query, and shapes here share classes ("the
-/// data", "search index" and "quokka tensor" as conjunctions are all two
-/// terms of the commonest rarity bucket): through one handle a later shape
-/// meets a decision the earlier ones made, which tries the other way only
-/// one query in 64 once it is clear, and its asks can all go one way.
-///
-/// The handle opens every superfile in one window: past a window the merge
-/// runs for every query and the gate has nothing to decide.
+/// The handle opens every superfile in one window, where the gate would
+/// otherwise have had a choice to make.
 #[test]
-fn the_learned_gate_answers_the_same_whichever_way_it_goes() {
+fn the_learned_gate_leaves_the_level_heads_to_serve_every_ask() {
     let with_dir = TempDir::new().expect("tempdir");
     let without_dir = TempDir::new().expect("tempdir");
     let gated = Build {
@@ -595,7 +579,6 @@ fn the_learned_gate_answers_the_same_whichever_way_it_goes() {
     };
     drop(table_with(&with_dir, gated));
     let without = table(&without_dir, false);
-    let mut merged_any = false;
     for (query, mode) in [
         ("the data", BoolMode::Or),
         ("the data", BoolMode::And),
@@ -609,27 +592,19 @@ fn the_learned_gate_answers_the_same_whichever_way_it_goes() {
             )
             .expect("open");
             let (expected, _, _) = run(&without, query, mode, k);
-            let mut plain = false;
-            // Every ask observed: the policy alternates between asks.
             for _ in 0..20 {
                 let (a, stats, _) = run_once(&with, query, mode, k);
                 assert_eq!(
                     a, expected,
                     "{query:?} {mode:?} k={k}: same answer every time"
                 );
-                if stats.tier_entries > 0 {
-                    merged_any = true;
-                } else {
-                    plain = true;
-                }
+                assert!(
+                    stats.tier_entries > 0,
+                    "{query:?} {mode:?} k={k}: the heads served the ask"
+                );
             }
-            assert!(
-                plain,
-                "{query:?} {mode:?} k={k}: the way without the merge was tried"
-            );
         }
     }
-    assert!(merged_any, "the merge was tried for some shape");
 }
 
 /// Null bodies: the heads name rows, not the column's document ids, so a

@@ -64,7 +64,7 @@ pub(crate) use build::{
 pub(crate) use build::{Built, build, first_contribution_difference};
 use build::{BuiltLayer, MERGE_RANGE_MIN_BYTES, build_layer, merge_layers_into, rebase_run};
 use bytes::Bytes;
-use format::{Layer, SliceRef};
+use format::{Layer, SliceRef, UNKNOWN_MAX_DF};
 pub(crate) use format::{Location, Posting, Root, Run, Slice, legacy_bound_as_key};
 use futures::{StreamExt, TryStreamExt, stream};
 use level_head::decode_segment;
@@ -1455,6 +1455,7 @@ fn stand_in(hash: ContentHash, bytes: u64) -> Layer {
             content_hash: hash,
             tier: None,
             len: bytes,
+            max_df: UNKNOWN_MAX_DF,
         }],
         ordinals: None,
         base: 0,
@@ -2766,6 +2767,12 @@ impl<K: Eq + std::hash::Hash + Clone, V: Clone> Resident<K, V> {
         self.map.contains_key(key)
     }
 
+    /// How many values are held.
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.map.len()
+    }
+
     fn get(&mut self, key: &K) -> Option<V> {
         let (value, used) = self.map.get_mut(key)?;
         self.tick += 1;
@@ -3134,8 +3141,11 @@ impl TermIndex {
     /// over the `live` superfiles, most first (ties in byte order). Each
     /// layer's counts nominate candidates — a few per completion asked for,
     /// by the largest count one layer gives them — and the candidates are
-    /// then ranked by their count over every layer, so the walk keeps a
-    /// bounded heap however many completions the prefix has.
+    /// then ranked by their count over every layer. Slices are visited by
+    /// the largest count the root records for them, most first, and the
+    /// walk stops at the first that cannot beat a nomination: a prefix with
+    /// millions of completions reads the few slices its frequent ones are
+    /// in, and the heap stays bounded.
     pub(crate) async fn top_prefix_completions(
         &self,
         column: FieldId,
@@ -3145,31 +3155,51 @@ impl TermIndex {
     ) -> Result<Vec<String>, TermIndexError> {
         let head = column.term_key("").len();
         let nominate = n.saturating_mul(PREFIX_CANDIDATES_PER_COMPLETION);
+        let key_prefix = column.term_key(prefix);
+        // Slices by the largest count any term of theirs has, most first:
+        // once the nominations are full and a slice's largest cannot beat
+        // the least of them, neither can any slice after it.
+        let mut refs: Vec<(u32, SliceRef)> = self
+            .root
+            .based_slices_for_prefix(&key_prefix)
+            .map(|(base, r)| (base, r.clone()))
+            .collect();
+        refs.sort_by(|a, b| b.1.max_df.cmp(&a.1.max_df));
         // Min-heap of (layer count, term) over the best nominations so far.
         let mut best: BinaryHeap<Reverse<(u64, Vec<u8>)>> = BinaryHeap::new();
-        self.for_each_prefix(column, prefix, |key, run| {
-            let df: u64 = run
-                .iter()
-                .filter(|p| {
-                    self.superfile_id(p.superfile)
-                        .is_some_and(|id| live.contains(&id))
-                })
-                .map(|p| p.df)
-                .sum();
-            if df > 0
-                && let Some(term) = key.get(head..)
+        for (base, r) in refs {
+            if best.len() >= nominate
                 && best
                     .peek()
-                    .is_none_or(|Reverse((low, _))| best.len() < nominate || df > *low)
+                    .is_some_and(|Reverse((low, _))| r.max_df <= *low)
             {
-                best.push(Reverse((df, term.to_vec())));
-                if best.len() > nominate {
-                    best.pop();
-                }
+                break;
             }
-            true
-        })
-        .await?;
+            let bytes = self.slice_bytes(&r.content_hash).await?;
+            let slice = Slice::open(&bytes)?;
+            slice.for_each_prefix(&key_prefix, |key, run| {
+                let df: u64 = run
+                    .iter()
+                    .filter(|p| {
+                        self.superfile_id(p.superfile + base)
+                            .is_some_and(|id| live.contains(&id))
+                    })
+                    .map(|p| p.df)
+                    .sum();
+                if df > 0
+                    && let Some(term) = key.get(head..)
+                    && best
+                        .peek()
+                        .is_none_or(|Reverse((low, _))| best.len() < nominate || df > *low)
+                {
+                    best.push(Reverse((df, term.to_vec())));
+                    if best.len() > nominate {
+                        best.pop();
+                    }
+                }
+                true
+            })?;
+        }
         let mut candidates: Vec<String> = best
             .into_iter()
             .filter_map(|Reverse((_, term))| String::from_utf8(term).ok())
@@ -4903,6 +4933,7 @@ mod tests {
                     content_hash: hash,
                     tier: None,
                     len: 0,
+                    max_df: UNKNOWN_MAX_DF,
                 }],
             }],
         };
@@ -6239,12 +6270,16 @@ mod tests {
 
         maintenance_only_optimize(&st);
         let (_, mut root) = live_and_covered(&st, &storage, &rt);
-        // The planted root is from before ordinal ranges and bases and the
-        // rewrite keeps its layers as they are, so neither is compared.
+        // The planted root is from before ordinal ranges, bases and slices'
+        // largest counts, and the rewrite keeps its layers as they are, so
+        // none of them is compared.
         let mut sized = sized;
         for layer in root.layers.iter_mut().chain(&mut sized.layers) {
             layer.ordinals = None;
             layer.base = 0;
+            for slice in &mut layer.slices {
+                slice.max_df = UNKNOWN_MAX_DF;
+            }
         }
         assert_eq!(root, sized, "every length is filled in from storage");
     }
@@ -7718,6 +7753,64 @@ mod tests {
             prop_assert_eq!(top, want);
             prop_assert!(rt.block_on(index.route(fid("body"), &["nope"], BoolMode::Or)).expect("route").is_empty());
         });
+    }
+
+    /// A prefix's most frequent completions are found reading only the
+    /// slices that can hold them: hundreds of rare completions spread over
+    /// many slices, and the frequent ones in a few, are walked by each
+    /// slice's largest count, and the walk stops once no later slice can
+    /// beat what it holds.
+    #[test]
+    fn the_frequent_completions_are_found_without_reading_every_slice() {
+        /// Rare completions, one document each.
+        const RARE: usize = 600;
+        /// Frequent completions, and the document count of each.
+        const FREQUENT: [(&str, u64); 3] = [("pz1", 900), ("pz2", 800), ("pz3", 700)];
+        let dir = TempDir::new().expect("tempdir");
+        let mut w = ContributionWriter::create(dir.path(), Uuid::from_u128(1), 0).expect("create");
+        let mut terms: Vec<(String, u64)> = (0..RARE).map(|i| (format!("pa{i:04}"), 1)).collect();
+        terms.extend(FREQUENT.iter().map(|(t, df)| (t.to_string(), *df)));
+        terms.sort();
+        for (term, df) in &terms {
+            w.push(
+                &fid("body").term_key(term),
+                *df,
+                f32::INFINITY,
+                Location::None,
+                0.0,
+                &[],
+            )
+            .expect("push");
+        }
+        let contribution = w.finish().expect("finish");
+        let policy = BuildPolicy {
+            slice_target_bytes: 512,
+            ..BuildPolicy::default()
+        };
+        let built = build(&[contribution], &policy).expect("build");
+        let n_slices = built.root.layers[0].slices.len();
+        assert!(
+            n_slices > 10,
+            "the completions span many slices: {n_slices}"
+        );
+        let store = TempDir::new().expect("store");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(store.path()).expect("local fs"));
+        let rt = Runtime::new().expect("runtime");
+        let reference = rt.block_on(write_built(&storage, built)).expect("write");
+        let index = rt
+            .block_on(TermIndex::load(Arc::clone(&storage), None, &reference))
+            .expect("load");
+        let live: HashSet<Uuid> = [Uuid::from_u128(1)].into();
+        let top = rt
+            .block_on(index.top_prefix_completions(fid("body"), "p", &live, 2))
+            .expect("top");
+        assert_eq!(top, vec!["pz1".to_owned(), "pz2".to_owned()]);
+        let read = rt.block_on(index.slices.lock()).len();
+        assert!(
+            read * 4 < n_slices,
+            "read {read} of {n_slices} slices for the two most frequent"
+        );
     }
 
     /// Through the query path: superfile selection for a term is exactly
@@ -9418,6 +9511,7 @@ mod tests {
                 content_hash: ContentHash::of(&[tag]),
                 tier: None,
                 len: 0,
+                max_df: UNKNOWN_MAX_DF,
             }],
         }
     }
@@ -9433,6 +9527,7 @@ mod tests {
                 content_hash: ContentHash::of(&bytes.to_le_bytes()),
                 tier: None,
                 len: bytes,
+                max_df: UNKNOWN_MAX_DF,
             }],
         }
     }
@@ -11490,6 +11585,7 @@ mod tests {
                         content_hash: ContentHash::of(&key),
                         tier: Some(ContentHash::of(&[key.as_slice(), b"tier"].concat())),
                         len: 1,
+                        max_df: UNKNOWN_MAX_DF,
                     }
                 })
                 .collect(),
@@ -11745,6 +11841,7 @@ mod tests {
                         content_hash: ContentHash::of(format!("{i}/{j}").as_bytes()),
                         tier: None,
                         len: 1 << 20,
+                        max_df: UNKNOWN_MAX_DF,
                     })
                     .collect(),
                 ordinals: None,
