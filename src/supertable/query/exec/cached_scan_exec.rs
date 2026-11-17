@@ -372,7 +372,7 @@ fn selected_mask(selected: &RoaringBitmap, rows: &Range<u32>) -> BooleanArray {
 }
 
 /// `array` typed as `target`, the scan schema's type for its column.
-fn typed(array: &ArrayRef, target: &DataType) -> DfResult<ArrayRef> {
+fn as_scan_type(array: &ArrayRef, target: &DataType) -> DfResult<ArrayRef> {
     Ok(if array.data_type() == target {
         Arc::clone(array)
     } else {
@@ -437,7 +437,7 @@ impl ScanContext {
         .await?;
         let mut decoded = Vec::with_capacity(missing.len());
         for (&i, array) in missing.iter().zip(read.columns()) {
-            let array = typed(array, fields[i].data_type())?;
+            let array = as_scan_type(array, fields[i].data_type())?;
             self.cache.insert(
                 self.key(&unit, fields[i].name()),
                 Arc::clone(&array),
@@ -571,7 +571,7 @@ impl ScanContext {
                     let array = taken
                         .next()
                         .ok_or_else(|| DataFusionError::Internal("a column was not read".into()))?;
-                    typed(array, field.data_type())
+                    as_scan_type(array, field.data_type())
                 }
             })
             .collect::<DfResult<Vec<_>>>()?;
