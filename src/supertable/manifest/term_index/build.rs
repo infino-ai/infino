@@ -529,6 +529,9 @@ fn encode_term(
     splice: bool,
 ) -> Result<EncodedTerm, TermIndexError> {
     let df: u64 = term.postings.iter().map(|p| p.df).sum();
+    // A build told to keep no tiers keeps no level heads either: the
+    // ranked path then opens by its ceilings alone.
+    let heads = budget > 0 && depth > 0;
     // A source without a level head lends the head its tier entries, which
     // the splice leaves undecoded.
     if splice
@@ -538,7 +541,7 @@ fn encode_term(
         && !term.head.headless
         && let Some(mut spliced) = splice_term(&mut term, budget, depth, ordinals)?
     {
-        spliced.head = encode_head(&term.head, &[], df, ordinals, scoring_of)?;
+        spliced.head = encode_head(&term.head, &[], df, ordinals, scoring_of)?.filter(|_| heads);
         return Ok(spliced);
     }
     for source in &term.sources {
@@ -551,7 +554,10 @@ fn encode_term(
             &mut term.entries,
         )?;
     }
-    let head = encode_head(&term.head, &term.entries, df, ordinals, scoring_of)?;
+    let head = match heads {
+        true => encode_head(&term.head, &term.entries, df, ordinals, scoring_of)?,
+        false => None,
+    };
     if budget == 0 || depth == 0 || term.entries.is_empty() {
         // No tier: the postings stand on their bounds. A contribution
         // writes a tail of zero when its head held every document, and

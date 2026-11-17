@@ -15,9 +15,9 @@
 //! score ties the frontier reads through the tie band and resolves `_id`
 //! for that band alone.
 //!
-//! **Depth.** [`head_depth`]: a term with at most [`WHOLE_LIST_MAX_DF`]
-//! documents in the layer keeps them all; a larger one keeps the top
-//! `1 / DEPTH_DIVISOR` of them, never fewer than [`WHOLE_LIST_MAX_DF`].
+//! **Depth.** [`head_depth`]: a term with at most 2048 documents in the
+//! layer keeps them all; a larger one keeps the top eighth of them, never
+//! fewer than 2048.
 //!
 //! **Floor.** The largest key of a document of the term in the layer that
 //! the head leaves out, `0.0` when it holds them all: what an unread
@@ -60,6 +60,7 @@ use crate::{
     superfile::{
         bits::{for_each_lane, payload_bytes, width_of},
         format::checksum::crc32c,
+        fts::builder::proportional_head_depth,
     },
     utils::{
         bytes::u32_le_at,
@@ -70,14 +71,6 @@ use crate::{
     },
 };
 
-/// A term with at most this many documents in a layer keeps all of them in
-/// its head: rare terms are listed whole, so a rare term in a conjunction
-/// bounds the query by its own list and nothing it lacks is probed.
-pub(crate) const WHOLE_LIST_MAX_DF: u64 = 2048;
-/// A term with more documents keeps the top `1 / DEPTH_DIVISOR` of them:
-/// deep enough that a two-term union of common terms settles inside the
-/// heads (the shallowest that did on the trillion-row table was 1/19).
-pub(crate) const DEPTH_DIVISOR: u64 = 8;
 /// Entries in level 0: one block, enough for every single-term top-10.
 pub(crate) const LEVEL0_ENTRIES: usize = BLOCK_ENTRIES;
 /// Each level holds this many times the entries of the one before.
@@ -92,13 +85,11 @@ const MAX_U32_BITS: u8 = u32::BITS as u8;
 /// Widest a length-bucket stream may be.
 const MAX_LEN_BITS: u8 = u8::BITS as u8;
 
-/// How deep a term's head is in a layer where it has `df` documents.
+/// How deep a term's head is in a layer where it has `df` documents: the
+/// rule a superfile's own head follows, so a layer's cut finds the
+/// documents it keeps in its superfiles' heads.
 pub(crate) fn head_depth(df: u64) -> u64 {
-    if df <= WHOLE_LIST_MAX_DF {
-        df
-    } else {
-        df.div_ceil(DEPTH_DIVISOR).max(WHOLE_LIST_MAX_DF)
-    }
+    proportional_head_depth(df)
 }
 
 /// The entry ranges of a head of `depth` entries' levels, in order.
@@ -184,7 +175,6 @@ impl BucketMaxTf {
 
     /// The largest term frequency in bucket `len`; `None` when the term
     /// has no document of that length.
-    #[cfg(test)]
     pub(crate) fn get(&self, len: u8) -> Option<u32> {
         self.0
             .binary_search_by_key(&len, |p| p.0)
@@ -527,6 +517,7 @@ mod tests {
     use proptest::prelude::*;
 
     use super::*;
+    use crate::superfile::fts::builder::WHOLE_HEAD_MAX_DF;
 
     /// Proptest cases per property.
     const CASES: u32 = 128;
@@ -573,11 +564,11 @@ mod tests {
     fn depth_keeps_rare_terms_whole_and_an_eighth_of_common_ones() {
         assert_eq!(head_depth(0), 0);
         assert_eq!(head_depth(1), 1);
-        assert_eq!(head_depth(WHOLE_LIST_MAX_DF), WHOLE_LIST_MAX_DF);
+        assert_eq!(head_depth(WHOLE_HEAD_MAX_DF), WHOLE_HEAD_MAX_DF);
         // Just past the whole-list size the floor of the cut is the same size.
-        assert_eq!(head_depth(WHOLE_LIST_MAX_DF + 1), WHOLE_LIST_MAX_DF);
-        assert_eq!(head_depth(8 * WHOLE_LIST_MAX_DF), WHOLE_LIST_MAX_DF);
-        assert_eq!(head_depth(8 * WHOLE_LIST_MAX_DF + 1), WHOLE_LIST_MAX_DF + 1);
+        assert_eq!(head_depth(WHOLE_HEAD_MAX_DF + 1), WHOLE_HEAD_MAX_DF);
+        assert_eq!(head_depth(8 * WHOLE_HEAD_MAX_DF), WHOLE_HEAD_MAX_DF);
+        assert_eq!(head_depth(8 * WHOLE_HEAD_MAX_DF + 1), WHOLE_HEAD_MAX_DF + 1);
         assert_eq!(head_depth(4_600_000_000), 575_000_000);
     }
 

@@ -72,6 +72,8 @@ use futures::{StreamExt, TryStreamExt, stream};
 use rayon::{ThreadPool, ThreadPoolBuilder};
 use tempfile::TempDir;
 use thiserror::Error;
+pub(crate) use level_head::{BucketMaxTf, LevelBlock, LevelRef};
+use level_head::decode_segment;
 pub(crate) use tier::{BLOCK_ENTRIES, ColumnScoring, TierChunkRef, TierDirectory, TierEntry};
 use tokio::{
     fs as async_fs,
@@ -411,6 +413,16 @@ pub(crate) type TierChunkCache = Arc<tokio::sync::Mutex<TierChunks>>;
 pub(crate) struct TierChunks {
     resident: Resident<(ContentHash, u64), Arc<TierChunkData>>,
     in_flight: HashSet<(ContentHash, u64)>,
+    /// Decoded head levels, keyed by object and the level's offset in it.
+    head_levels: Resident<(ContentHash, u64), Arc<Vec<LevelBlock>>>,
+}
+
+/// Bytes a decoded head level holds resident.
+fn head_level_weight(blocks: &Arc<Vec<LevelBlock>>) -> usize {
+    blocks
+        .iter()
+        .map(|b| size_of::<LevelBlock>() + b.entries.len() * size_of::<TierEntry>())
+        .sum()
 }
 
 /// A tier chunk cache of the resident byte budget.
@@ -418,6 +430,7 @@ pub(crate) fn new_tier_chunk_cache() -> TierChunkCache {
     Arc::new(tokio::sync::Mutex::new(TierChunks {
         resident: Resident::new(RESIDENT_SLICE_BUDGET_BYTES, TierChunkData::weight),
         in_flight: HashSet::new(),
+        head_levels: Resident::new(RESIDENT_SLICE_BUDGET_BYTES, head_level_weight),
     }))
 }
 
@@ -3406,6 +3419,46 @@ impl TermIndex {
             }
         }
         Ok((out.into_iter().flatten().collect(), fetched))
+    }
+
+    /// One level of a term's head, decoded: its blocks in head order, each
+    /// block's entries in `(ordinal, row)` order with ordinals as the layer
+    /// stores them. Read with one ranged read of the slice's object and its
+    /// CRC verified; resident afterwards. With the bytes the call fetched.
+    pub(crate) async fn head_level(
+        &self,
+        object: &ContentHash,
+        level: &LevelRef,
+    ) -> Result<(Arc<Vec<LevelBlock>>, u64), TermIndexError> {
+        let key = (*object, level.offset);
+        if let Some(blocks) = self.tier_chunks.lock().await.head_levels.get(&key) {
+            return Ok((blocks, 0));
+        }
+        let end = level
+            .offset
+            .checked_add(level.len)
+            .ok_or_else(|| TermIndexError::Malformed("head level past its object".into()))?;
+        let bytes = self
+            .storage
+            .get_range(&tier_uri(object), level.offset..end)
+            .await?;
+        if bytes.len() as u64 != level.len {
+            return Err(TermIndexError::Malformed("short head level read".into()));
+        }
+        let fetched = bytes.len() as u64;
+        let blocks = run_on_pool(None, "head level decode", move || {
+            let mut blocks = Vec::new();
+            decode_segment(&bytes, &mut blocks).map(|()| blocks)
+        })
+        .await
+        .map_err(|e| TermIndexError::Open(QueryError::Internal(e.to_string())))??;
+        let blocks = Arc::new(blocks);
+        self.tier_chunks
+            .lock()
+            .await
+            .head_levels
+            .insert(key, Arc::clone(&blocks));
+        Ok((blocks, fetched))
     }
 
     /// Visit every term in `column` with `prefix`, with its postings, until

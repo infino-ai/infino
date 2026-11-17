@@ -147,6 +147,7 @@ use crate::{
             exec::common::{
                 hit_output_schema, resolve_hits_named, take_file_columns, take_rows_byte_source,
             },
+            heads,
             match_order::MatchOrder,
             provider::prune_leaves_for_filters,
             prune::{PruneLeaf, select_superfiles},
@@ -1388,8 +1389,18 @@ impl SupertableReader {
         // decide how deep it reads. Within a window the table's learned
         // call stands.
         let forced = tiers_serve && kept.len() > manifest.options.ordered_open_window();
-        let merge_now =
-            tiers_serve && (forced || !learned || self.tier_policy().merge(policy_class));
+        // A term index with level heads for every term the query scores
+        // chooses the superfiles before any open, whatever the gate learned:
+        // its reads are a level per term and layer, not a block per term
+        // per superfile.
+        let heads_serve = match (tiers_serve, index_column) {
+            (true, Some((index, column_id))) => heads::available(index, column_id, &all_terms)
+                .await
+                .unwrap_or(false),
+            _ => false,
+        };
+        let merge_now = tiers_serve
+            && (heads_serve || forced || !learned || self.tier_policy().merge(policy_class));
         // The deny sets, resolved only for a merge: it reads past the
         // deleted rows, and the units then admit rows by the same sets, so
         // a delete committed between the two reads cannot leave the
@@ -2168,50 +2179,67 @@ impl SupertableReader {
             let unreadable = |e: term_index::TermIndexError| {
                 warn!(error = %e, "term-index tier unreadable; the query keeps its ceilings");
             };
-            let prepared = tier::prepare_merge(index, &query, &merge_kept, &global_idf, pool)
-                .await
-                .unwrap_or_else(|e| {
-                    unreadable(e);
-                    None
-                });
-            if prepared.is_none() {
-                declined.store(true, AtomicOrdering::Relaxed);
-            }
-            let window = manifest.options.ordered_open_window();
-            match prepared {
-                Some(prepared) if prepared.resident => {
-                    let selection = prepared.run(live_floor).await.unwrap_or_else(|e| {
+            // The level heads choose first, before any open; a query they
+            // cannot serve takes the tier merge.
+            let by_heads = match heads_serve {
+                true => heads::select(index, &query, &merge_kept, &global_idf)
+                    .await
+                    .unwrap_or_else(|e| {
+                        unreadable(e);
+                        None
+                    }),
+                false => None,
+            };
+            if let Some(selection) = by_heads {
+                let (keep, settled) = make_plan(selection)(units);
+                units = keep;
+                settled_before = settled;
+            } else {
+                let prepared = tier::prepare_merge(index, &query, &merge_kept, &global_idf, pool)
+                    .await
+                    .unwrap_or_else(|e| {
                         unreadable(e);
                         None
                     });
-                    if let Some(selection) = selection {
-                        let (keep, settled) = make_plan(selection)(units);
-                        units = keep;
-                        settled_before = settled;
-                    }
+                if prepared.is_none() {
+                    declined.store(true, AtomicOrdering::Relaxed);
                 }
-                // On a table whose kept units all issue at once, a merge that
-                // must read its tiers would report after every open is under
-                // way and change none; its reads would only compete with the
-                // opens, and the gate would spend samples on a plan that
-                // cannot act. Its first wave is read without waiting, for the
-                // next query of these terms, and nothing is reported.
-                Some(prepared) if units.len() <= window => {
-                    prepared.prefetch(Arc::clone(index));
-                }
-                Some(prepared) => {
-                    replan = Some(Box::pin(async move {
-                        match prepared.run(live_floor).await {
-                            Ok(Some(selection)) => Some(make_plan(selection)),
-                            Ok(None) => None,
-                            Err(e) => {
-                                unreadable(e);
-                                None
-                            }
+                let window = manifest.options.ordered_open_window();
+                match prepared {
+                    Some(prepared) if prepared.resident => {
+                        let selection = prepared.run(live_floor).await.unwrap_or_else(|e| {
+                            unreadable(e);
+                            None
+                        });
+                        if let Some(selection) = selection {
+                            let (keep, settled) = make_plan(selection)(units);
+                            units = keep;
+                            settled_before = settled;
                         }
-                    }));
+                    }
+                    // On a table whose kept units all issue at once, a merge that
+                    // must read its tiers would report after every open is under
+                    // way and change none; its reads would only compete with the
+                    // opens, and the gate would spend samples on a plan that
+                    // cannot act. Its first wave is read without waiting, for the
+                    // next query of these terms, and nothing is reported.
+                    Some(prepared) if units.len() <= window => {
+                        prepared.prefetch(Arc::clone(index));
+                    }
+                    Some(prepared) => {
+                        replan = Some(Box::pin(async move {
+                            match prepared.run(live_floor).await {
+                                Ok(Some(selection)) => Some(make_plan(selection)),
+                                Ok(None) => None,
+                                Err(e) => {
+                                    unreadable(e);
+                                    None
+                                }
+                            }
+                        }));
+                    }
+                    None => {}
                 }
-                None => {}
             }
         }
         let per_unit = match !exact_count && ceilings.is_some() {

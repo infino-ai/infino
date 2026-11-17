@@ -94,11 +94,11 @@ use crate::{
 /// Terms up to which a candidate's summed contributions equal the kernel's
 /// score bit for bit: one term is one product, two commute, three or more
 /// depend on the order the kernel adds them in.
-const EXACT_SUM_TERMS: usize = 2;
+pub(crate) const EXACT_SUM_TERMS: usize = 2;
 /// Widening applied to a bound taken from a stored key — a tail or a
 /// ceiling — which is rounded once more than the kernel rounds a score.
 /// Mirrors the term index's ceiling slack.
-const BOUND_SLACK: f32 = 1.0 + 8.0 * f32::EPSILON;
+pub(crate) const BOUND_SLACK: f32 = 1.0 + 8.0 * f32::EPSILON;
 /// A term's tier up to this size is read whole in the merge's first wave: it
 /// costs what its first block costs, one ranged read, and the rounds after
 /// the first then need no storage round trip. A larger tier — a common
