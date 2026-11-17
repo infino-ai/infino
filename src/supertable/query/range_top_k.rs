@@ -42,11 +42,11 @@ use std::sync::Arc;
 
 use datafusion::{
     catalog::TableProvider,
-    common::tree_node::Transformed,
+    common::{Column, tree_node::Transformed},
     datasource::{DefaultTableSource, provider_as_source},
     error::Result as DfResult,
     logical_expr::{
-        Expr, Filter, LogicalPlan, Sort, TableScan, TableSource, utils::split_conjunction,
+        Expr, Filter, LogicalPlan, Sort, SortExpr, TableScan, TableSource, utils::split_conjunction,
     },
     optimizer::{OptimizerConfig, OptimizerRule, optimizer::ApplyOrder},
 };
@@ -89,24 +89,81 @@ impl OptimizerRule for RangeTopK {
 /// The sort with its scan's provider swapped for one carrying the hint, or
 /// `None` when the plan is not the shape the hint is sound for.
 fn try_rewrite(plan: &LogicalPlan) -> DfResult<Option<LogicalPlan>> {
-    let LogicalPlan::Sort(Sort {
-        expr,
-        input,
-        fetch: Some(k),
-    }) = plan
+    let Some(SortOverScan {
+        first: sort_expr,
+        column,
+        later,
+        fetch: k,
+        scan,
+        mut predicates,
+    }) = sort_over_scan(plan)
     else {
         return Ok(None);
     };
+    let Some(provider) = provider_of(scan) else {
+        return Ok(None);
+    };
+    if provider.has_top_k() {
+        return Ok(None);
+    }
+    predicates.extend(scan.filters.iter().flat_map(split_conjunction).cloned());
+    let range_cols = provider.manifest().table_schema().range_column_types();
+    let id_column = provider.manifest().options.id_column.as_str();
     // Later sort keys (an id that breaks ties, say) order only rows the
     // first key ties; the hint then keeps every row tied with its cutoff.
-    let Some((sort_expr, later)) = expr.split_first() else {
+    let ties_by_id = matches!(
+        later,
+        [only] if only.asc && matches!(&only.expr, Expr::Column(c) if c.name == id_column)
+    );
+    if single_range(&predicates, &column.name, &range_cols).is_none() {
         return Ok(None);
-    };
-    let Expr::Column(column) = &sort_expr.expr else {
+    }
+    if predicates.is_empty() && sort_expr.nulls_first {
         return Ok(None);
+    }
+    let hinted = Arc::new(provider.with_top_k(TopKHint {
+        column: column.name.clone(),
+        descending: !sort_expr.asc,
+        k,
+        ties: !later.is_empty(),
+        ties_by_id,
+    }));
+    let source = provider_as_source(hinted as Arc<dyn TableProvider>);
+    Ok(Some(with_scan_source(plan, &source)?))
+}
+
+/// A sort with a fetch whose first key is a plain column, over filters,
+/// plain column projections and aliases down to a scan: the shape a rule
+/// that hands the scan the sort's order and limit fires on.
+pub(crate) struct SortOverScan<'a> {
+    /// The sort's first key.
+    pub(crate) first: &'a SortExpr,
+    /// The column the first key sorts by.
+    pub(crate) column: &'a Column,
+    /// The sort's other keys, which order only rows the first one ties.
+    pub(crate) later: &'a [SortExpr],
+    /// The rows the sort keeps.
+    pub(crate) fetch: usize,
+    /// The scan at the bottom.
+    pub(crate) scan: &'a TableScan,
+    /// The conjuncts of every filter between the sort and the scan.
+    pub(crate) predicates: Vec<Expr>,
+}
+
+/// `plan` as a [`SortOverScan`], or `None` when it is not one.
+pub(crate) fn sort_over_scan(plan: &LogicalPlan) -> Option<SortOverScan<'_>> {
+    let LogicalPlan::Sort(Sort {
+        expr,
+        input,
+        fetch: Some(fetch),
+    }) = plan
+    else {
+        return None;
     };
-    // Walk to the scan through filters and plain column projections that
-    // keep the sort column, collecting the filters' predicates.
+    let (first, later) = expr.split_first()?;
+    let Expr::Column(column) = &first.expr else {
+        return None;
+    };
     let mut predicates: Vec<Expr> = Vec::new();
     let mut node = input.as_ref();
     let scan = loop {
@@ -122,38 +179,19 @@ fn try_rewrite(plan: &LogicalPlan) -> DfResult<Option<LogicalPlan>> {
                 predicates.extend(split_conjunction(predicate).into_iter().cloned());
                 node = input.as_ref();
             }
+            LogicalPlan::SubqueryAlias(alias) => node = alias.input.as_ref(),
             LogicalPlan::TableScan(scan) => break scan,
-            _ => return Ok(None),
+            _ => return None,
         }
     };
-    let Some(provider) = provider_of(scan) else {
-        return Ok(None);
-    };
-    if provider.has_top_k() {
-        return Ok(None);
-    }
-    predicates.extend(scan.filters.iter().flat_map(split_conjunction).cloned());
-    let range_cols = provider.manifest().table_schema().range_column_types();
-    let id_column = provider.manifest().options.id_column.as_str();
-    let ties_by_id = matches!(
+    Some(SortOverScan {
+        first,
+        column,
         later,
-        [only] if only.asc && matches!(&only.expr, Expr::Column(c) if c.name == id_column)
-    );
-    if single_range(&predicates, &column.name, &range_cols).is_none() {
-        return Ok(None);
-    }
-    if predicates.is_empty() && sort_expr.nulls_first {
-        return Ok(None);
-    }
-    let hinted = Arc::new(provider.with_top_k(TopKHint {
-        column: column.name.clone(),
-        descending: !sort_expr.asc,
-        k: *k,
-        ties: !later.is_empty(),
-        ties_by_id,
-    }));
-    let source = provider_as_source(hinted as Arc<dyn TableProvider>);
-    Ok(Some(with_scan_source(plan, &source)?))
+        fetch: *fetch,
+        scan,
+        predicates,
+    })
 }
 
 /// Our provider behind `scan`, when it is ours.
@@ -164,7 +202,10 @@ fn provider_of(scan: &TableScan) -> Option<&SupertableProvider> {
 
 /// `plan` with the scan at the bottom of its single-input chain reading
 /// from `source`.
-fn with_scan_source(plan: &LogicalPlan, source: &Arc<dyn TableSource>) -> DfResult<LogicalPlan> {
+pub(crate) fn with_scan_source(
+    plan: &LogicalPlan,
+    source: &Arc<dyn TableSource>,
+) -> DfResult<LogicalPlan> {
     if let LogicalPlan::TableScan(scan) = plan {
         return Ok(LogicalPlan::TableScan(TableScan {
             source: Arc::clone(source),
@@ -448,5 +489,23 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A top-k over an aliased table answers as over the table itself.
+    #[test]
+    fn a_top_k_through_a_table_alias_answers_exactly() {
+        let dir = TempDir::new().expect("tempdir");
+        let st = table(&dir);
+        let reader = st.reader().expect("reader");
+        let (_, above, descending, limit) = TOP_K[0];
+        let sql = format!(
+            "SELECT s.seq, s.key FROM supertable AS s WHERE s.key > {above} \
+             ORDER BY s.key, s.seq LIMIT {limit}"
+        );
+        assert_eq!(
+            seqs(&reader.query_sql(&sql).expect("sql")),
+            expected(above, descending, limit),
+            "{sql}"
+        );
     }
 }

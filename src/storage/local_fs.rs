@@ -29,7 +29,7 @@ use object_store::{
 };
 
 use super::{ObjectMeta, StorageError, StorageProvider, child_prefix_names, counting};
-use crate::{runtime_bridge::carry_span, runtime_metrics::io::UsageMeter};
+use crate::{runtime_bridge::carry_span, runtime_metrics::io::UsageMeter, utils::trace::record};
 
 #[derive(Debug)]
 pub struct LocalFsStorageProvider {
@@ -183,6 +183,10 @@ impl StorageProvider for LocalFsStorageProvider {
         })
     }
 
+    #[cfg_attr(
+        feature = "detailed-tracing",
+        tracing::instrument(skip_all, fields(uri = uri, len = tracing::field::Empty))
+    )]
     async fn get(&self, uri: &str) -> Result<(Bytes, ObjectMeta), StorageError> {
         let path = Self::path(uri)?;
         let result = self.store.get(&path).await.map_err(|e| translate(uri, e))?;
@@ -193,6 +197,7 @@ impl StorageProvider for LocalFsStorageProvider {
         let last_modified = result.meta.last_modified.into();
         let bytes = result.bytes().await.map_err(|e| translate(uri, e))?;
         self.meter.record_get(uri, None, bytes.len() as u64);
+        record("len", bytes.len() as u64);
         // Small objects report a content-derived etag (the body is already in
         // hand, so this is just a hash) so conditional reads can't be fooled by
         // a colliding metadata etag; see `CONTENT_ETAG_MAX_BYTES`.
@@ -1073,5 +1078,130 @@ mod tests {
         // returns `None` (the `?`-via-`.ok()?` arm).
         let (_dir, p) = provider();
         assert!(p.object_store_handle("data/bad\0path").is_none());
+    }
+
+    /// A whole-object read shows in a trace: under `detailed-tracing`, `get` opens a span naming
+    /// the object, and records its length once the bytes are in hand.
+    #[cfg(feature = "detailed-tracing")]
+    mod get_span {
+        use std::{
+            fmt,
+            sync::{Arc, Mutex},
+        };
+
+        use tokio::runtime::Builder;
+        use tracing::{
+            Subscriber,
+            callsite::rebuild_interest_cache,
+            field::{Field, Visit},
+            span,
+            subscriber::{set_global_default, with_default},
+        };
+        use tracing_subscriber::{Layer, layer::Context, prelude::*, registry::LookupSpan};
+
+        use super::*;
+
+        /// The object the test reads whole.
+        const URI: &str = "term-index/slice-0.bin";
+        /// Its contents.
+        const PAYLOAD: &[u8] = b"a whole object read in one get";
+
+        /// What a span recorded: its name, `uri` and `len`.
+        #[derive(Clone, Debug, Default, PartialEq)]
+        struct Seen {
+            name: &'static str,
+            uri: Option<String>,
+            len: Option<u64>,
+        }
+
+        impl Visit for Seen {
+            fn record_str(&mut self, field: &Field, value: &str) {
+                if field.name() == "uri" {
+                    self.uri = Some(value.to_owned());
+                }
+            }
+            fn record_u64(&mut self, field: &Field, value: u64) {
+                if field.name() == "len" {
+                    self.len = Some(value);
+                }
+            }
+            fn record_debug(&mut self, _field: &Field, _value: &dyn fmt::Debug) {}
+        }
+
+        /// Every closed span, in close order.
+        #[derive(Clone, Default)]
+        struct Closed(Arc<Mutex<Vec<Seen>>>);
+
+        impl<S: Subscriber + for<'a> LookupSpan<'a>> Layer<S> for Closed {
+            fn on_new_span(
+                &self,
+                attrs: &span::Attributes<'_>,
+                id: &span::Id,
+                ctx: Context<'_, S>,
+            ) {
+                let mut seen = Seen {
+                    name: attrs.metadata().name(),
+                    ..Seen::default()
+                };
+                attrs.record(&mut seen);
+                if let Some(span) = ctx.span(id) {
+                    span.extensions_mut().insert(seen);
+                }
+            }
+            fn on_record(&self, id: &span::Id, values: &span::Record<'_>, ctx: Context<'_, S>) {
+                if let Some(span) = ctx.span(id)
+                    && let Some(seen) = span.extensions_mut().get_mut::<Seen>()
+                {
+                    values.record(seen);
+                }
+            }
+            fn on_close(&self, id: span::Id, ctx: Context<'_, S>) {
+                if let Some(span) = ctx.span(&id)
+                    && let Some(seen) = span.extensions().get::<Seen>()
+                {
+                    self.0.lock().expect("closed spans lock").push(seen.clone());
+                }
+            }
+        }
+
+        #[test]
+        fn get_opens_a_span_with_the_uri_and_length() {
+            // A process-wide registry keeps the span enabled whichever test thread meets it
+            // first; another test may have installed it already.
+            let _ = set_global_default(tracing_subscriber::registry());
+            let closed = Closed::default();
+            with_default(tracing_subscriber::registry().with(closed.clone()), || {
+                rebuild_interest_cache();
+                let rt = Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("runtime");
+                let (_dir, p) = provider();
+                rt.block_on(async {
+                    p.put_atomic(URI, Bytes::from_static(PAYLOAD))
+                        .await
+                        .expect("put");
+                    let (got, _) = p.get(URI).await.expect("get");
+                    assert_eq!(got.as_ref(), PAYLOAD);
+                });
+            });
+            let gets: Vec<Seen> = closed
+                .0
+                .lock()
+                .expect("closed spans lock")
+                .iter()
+                .filter(|s| s.name == "get")
+                .cloned()
+                .collect();
+            assert_eq!(
+                gets,
+                vec![Seen {
+                    name: "get",
+                    uri: Some(URI.to_owned()),
+                    len: Some(PAYLOAD.len() as u64),
+                }],
+                "one whole-object read, one span, naming the object and its length"
+            );
+        }
     }
 }

@@ -6645,6 +6645,17 @@ mod tests {
     use tokio::time::sleep;
 
     use super::*;
+    use crate::{
+        runtime_metrics::rss::purge_allocator,
+        superfile::vector::{
+            builder::{
+                VectorBuilder, VectorConfig, build_merged_subsection_from_materialized,
+                finish_multi_cell_blob,
+            },
+            cell_posting::{EncodedCellRow, MaterializedIvfRow},
+            distance::{encode_sq16_row, sq16_decoded_norm_sq},
+        },
+    };
 
     /// `checked_dir_bounds` computes `dir_end = offset + count*entry_size + CRC`
     /// and rejects untrusted-header values that would wrap `usize` (a crafted
@@ -6663,14 +6674,6 @@ mod tests {
             "offset+size+CRC overflow must error, not wrap",
         );
     }
-    use crate::superfile::vector::{
-        builder::{
-            VectorBuilder, VectorConfig, build_merged_subsection_from_materialized,
-            finish_multi_cell_blob,
-        },
-        cell_posting::{EncodedCellRow, MaterializedIvfRow},
-        distance::{encode_sq16_row, sq16_decoded_norm_sq},
-    };
 
     fn build_blob(n_docs: u32, dim: usize, n_cent: usize, metric: Metric) -> (Bytes, String) {
         let mut b = VectorBuilder::new();
@@ -9805,6 +9808,10 @@ mod tests {
             lazies.push((mmap_arc, lazy));
         }
 
+        // Return pages freed by earlier opens to the OS, so an open that
+        // allocates per document cannot reuse a previous trial's retained
+        // heap and read as a zero delta.
+        purge_allocator();
         let before = memory_stats().expect("memory_stats supported").physical_mem;
 
         let mut readers: Vec<VectorReader> = Vec::with_capacity(n_superfiles);
@@ -9851,6 +9858,8 @@ mod tests {
     /// total) so every PR validates the supertable-shape bound.
     #[test]
     fn mem_ceiling_lazy_multi_superfile_open_smoke() {
+        /// Opens measured, each over fresh mappings; the smallest delta is kept.
+        const RSS_MEASUREMENTS: usize = 5;
         const N_SUPERFILES: usize = 4;
         const N_DOCS_PER_SEG: u32 = 50_000;
         const DIM: usize = 64;
@@ -9867,8 +9876,12 @@ mod tests {
             tmps.push(tmp); // keep the tempfile alive until end
         }
 
-        let (delta_bytes, n_cols_total, n_superfiles) =
-            measure_lazy_multi_superfile_open_rss_delta(&paths, &jsons);
+        // The reading is the whole process's, which other tests running alongside raise far more
+        // often than they lower, so the smallest of several opens is the one that counts.
+        let (delta_bytes, n_cols_total, n_superfiles) = (0..RSS_MEASUREMENTS)
+            .map(|_| measure_lazy_multi_superfile_open_rss_delta(&paths, &jsons))
+            .min_by_key(|(delta, _, _)| *delta)
+            .expect("at least one measurement");
         let delta_mib = delta_bytes as f64 / (1024.0 * 1024.0);
         let per_seg_mib = delta_mib / n_superfiles as f64;
 

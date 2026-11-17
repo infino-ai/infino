@@ -11,6 +11,7 @@
 use std::{collections::HashSet, path::Path, sync::Arc};
 
 use chrono::Utc;
+use datafusion::prelude::{col, lit};
 use tempfile::TempDir;
 
 use crate::{
@@ -18,6 +19,7 @@ use crate::{
     superfile::fts::reader::{Bm25SearchOptions, BoolMode},
     supertable::{
         Supertable,
+        query::exec::common::test_support::sql_row_count,
         reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore},
         wal::{
             WalStore,
@@ -27,8 +29,21 @@ use crate::{
             },
         },
     },
-    test_helpers::{build_title_batch, default_supertable_options},
+    test_helpers::{
+        build_title_batch, default_supertable_options,
+        fault_storage::{FaultKind, FaultOp, FaultStorage},
+    },
 };
+
+/// Suffix of the per-superfile tombstone sidecars a mutation CAS-writes: faulting it fails a
+/// mutation's tombstone phase and nothing before it.
+const TOMBSTONES_SUFFIX: &str = ".tombstones";
+/// Sidecar faults to arm: above the tombstone phase's own retry budget, so it gives up.
+const SIDECAR_FAULTS: usize = 64;
+/// Titles the crashed-update fixture appends; it then updates the first.
+const SEEDED_TITLES: [&str; 2] = ["alpha", "beta"];
+/// Every row of the table, as a read that finds each row once counts them.
+const ALL_ROWS: &str = "SELECT title FROM supertable";
 
 fn make_disk_cache(storage: Arc<dyn StorageProvider>, cache_root: &Path) -> Arc<DiskCacheStore> {
     let cfg = DiskCacheConfig {
@@ -48,7 +63,7 @@ fn make_disk_cache(storage: Arc<dyn StorageProvider>, cache_root: &Path) -> Arc<
     DiskCacheStore::new(storage, cfg, pinned).expect("cache")
 }
 
-fn seed_intent_delete_wal(target_id: i128, wal_id_v: i128) -> WalStateDoc {
+pub(crate) fn seed_intent_delete_wal(target_id: i128, wal_id_v: i128) -> WalStateDoc {
     WalStateDoc {
         wal_id: WalId(wal_id_v),
         schema_version: SCHEMA_VERSION,
@@ -291,4 +306,64 @@ async fn sweep_preempts_expired_lease_and_completes_wal() {
     for hit in &hits {
         assert_ne!(hit.local_doc_id, 0);
     }
+}
+
+/// An update that crashed after appending its new row, before tombstoning the old one, is
+/// finished by an open without statistics, so a plain count right after it sees one version of
+/// the row, not both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_open_without_statistics_finishes_a_crashed_update() {
+    let dir = TempDir::new().expect("tempdir");
+    let local: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+    let faults = FaultStorage::wrap(local);
+    let storage: Arc<dyn StorageProvider> = Arc::<FaultStorage>::clone(&faults);
+    {
+        let st =
+            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+                .expect("create");
+        let mut writer = st.writer().expect("writer");
+        writer
+            .append(&build_title_batch(&SEEDED_TITLES))
+            .expect("append");
+        writer.commit().expect("commit appends");
+        writer
+            .update(
+                col("title").eq(lit(SEEDED_TITLES[0])),
+                build_title_batch(&["gamma"]),
+            )
+            .expect("buffer update");
+        faults.fail_with(
+            FaultKind::Precondition,
+            FaultOp::PutIfMatch,
+            TOMBSTONES_SUFFIX,
+            SIDECAR_FAULTS,
+        );
+        writer
+            .commit()
+            .expect_err("a tombstone that never lands fails the update after its append");
+        faults.clear();
+        assert_eq!(
+            sql_row_count(&st, ALL_ROWS),
+            SEEDED_TITLES.len() + 1,
+            "the crashed update shows both versions"
+        );
+    }
+
+    let st = Supertable::open(
+        default_supertable_options()
+            .with_storage(Arc::clone(&storage))
+            .without_statistics(),
+    )
+    .expect("open");
+    assert_eq!(
+        sql_row_count(&st, ALL_ROWS),
+        SEEDED_TITLES.len(),
+        "one version of the updated row"
+    );
+    let ws = WalStore::new(storage);
+    let wal_ids = ws.list_wal_ids().await.expect("list");
+    assert_eq!(wal_ids.len(), 1);
+    let (doc, _) = ws.read(wal_ids[0]).await.expect("read wal");
+    assert_eq!(doc.state, WalState::Complete);
 }

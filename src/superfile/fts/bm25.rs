@@ -41,6 +41,16 @@ pub const K1: f32 = 1.2;
 /// Standard BM25 default `b` — length-normalization parameter.
 pub const B: f32 = 0.75;
 
+/// The relative slack a score upper bound carries when it reaches a query
+/// through roundings the score it bounds does not go through: an idf ratio,
+/// a length-norm factor, their products. Each is one `f32` rounding of up
+/// to `u = 2^-24` relative, and a few of them can leave an exact bound a
+/// step or two below the score, which is enough for a floor equal to that
+/// score to skip it. This is `16u`, which covers every such chain the
+/// readers build (the block-bound decoder counts its own) and loosens a
+/// bound by about a millionth.
+pub(crate) const BOUND_ROUNDING_SLACK: f32 = 8.0 * f32::EPSILON;
+
 /// A column's BM25 similarity parameters.
 ///
 /// [`Default`] is the standard pair (`k1 = 1.2`, `b = 0.75`), the values a

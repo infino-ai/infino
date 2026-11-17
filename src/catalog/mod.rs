@@ -56,9 +56,9 @@ use datafusion::{
         parser::{DFParserBuilder, Statement as DFStatement},
         sqlparser::{
             ast::{
-                CastKind, DataType as SqlDataType, ExactNumberInfo, Expr as SqlExpr,
-                Statement as SqlStatement, Value as SqlValue, visit_expressions_mut,
-                visit_statements,
+                CastKind, DataType as SqlDataType, ExactNumberInfo, Expr as SqlExpr, GroupByExpr,
+                SelectItem, SetExpr, Statement as SqlStatement, TableFactor, Value as SqlValue,
+                visit_expressions, visit_expressions_mut, visit_statements,
             },
             dialect::GenericDialect,
             keywords::Keyword,
@@ -112,6 +112,10 @@ const READ_ONLY_REFUSAL: &str =
 /// it: opens waiting on one table's build can never take every thread and stall the build they
 /// wait on. Past it, an open runs on the calling thread, as it did before a cancel could reach it.
 const MAX_CANCELLABLE_OPENS: usize = 64;
+
+/// The aggregates a statement may select and still read no statistics: a table's row count, which
+/// the manifest holds. Matched against a call's printed text, upper-cased.
+const ROW_COUNTS: [&str; 2] = ["COUNT(*)", "COUNT(1)"];
 
 /// Most catalog tables one `information_schema` query opens at once. Such a query registers every
 /// table, and a cold open loads the table's whole manifest, so opening them one by one made the
@@ -668,9 +672,20 @@ impl Connection {
     /// Open the concrete engine handle for `name`, building and memoizing it on
     /// first use. Internal: callers needing engine-only methods (`register_into`
     /// for SQL, `reader` for the search TVFs) go through this; the public
-    /// [`open_table`](Self::open_table) wraps the result.
+    /// [`open_table`](Self::open_table) wraps the result. It always has the per-column statistics,
+    /// so nothing written through it commits without them.
     pub(crate) fn open_table_handle(&self, name: &str) -> Result<SupertableHandle, InfinoError> {
-        debug!(table = name, "opening table");
+        self.open_table_handle_for(name, true)
+    }
+
+    /// [`Self::open_table_handle`], opening a table without its per-column statistics unless
+    /// `statistics`; with it, a cached handle without them reads them in place first.
+    fn open_table_handle_for(
+        &self,
+        name: &str,
+        statistics: bool,
+    ) -> Result<SupertableHandle, InfinoError> {
+        debug!(table = name, statistics, "opening table");
         match &self.inner.store {
             CatalogStore::Memory(map) => map
                 .lock()
@@ -690,7 +705,7 @@ impl Connection {
                 // handle purged elsewhere is dropped here, so the cold path
                 // re-resolves it against the catalog.
                 if let Some(handle) = live_handle(handles, name) {
-                    return Ok(handle);
+                    return ensure_statistics(handle, statistics, name);
                 }
 
                 // Cold path: build once under the gate. Blocks here if a
@@ -699,9 +714,11 @@ impl Connection {
                 let gate = single_flight_gate(building, name);
                 let _built = lock_gate(&gate);
 
-                // A peer may have built it while we waited on the gate.
+                // A peer may have built it while we waited on the gate. Reading statistics into it
+                // waits on its own lock, not on the gate other opens of this name wait on.
                 if let Some(handle) = live_handle(handles, name) {
-                    return Ok(handle);
+                    drop(_built);
+                    return ensure_statistics(handle, statistics, name);
                 }
 
                 let ResolvedTable {
@@ -729,6 +746,9 @@ impl Connection {
                 // BoundedStaleness(1s): the per-query pointer re-check is
                 // amortized across the window rather than paid on every query.
                 options = options.with_read_consistency(self.inner.options.read_consistency);
+                if !statistics {
+                    options = options.without_statistics();
+                }
                 let handle = SupertableHandle::open(options)
                     .map_err(|e| InfinoError::from(e).with_context("open_table", Some(name)))?;
                 handles.insert(name.to_string(), handle.clone());
@@ -1276,6 +1296,7 @@ impl Connection {
             sql_page_bytes = tracing::field::Empty,
             planned_read_ranges = tracing::field::Empty,
             rows_materialized = tracing::field::Empty,
+            tables_read = tracing::field::Empty,
             kernel_cpu_ns = tracing::field::Empty,
             fts_postings_bytes = tracing::field::Empty,
             vector_cells_scanned = tracing::field::Empty,
@@ -1332,17 +1353,42 @@ impl Connection {
             .resolve_table_references(&statement)
             .map_err(|e| datafusion_planning_error(&e).with_context("query_sql", None))?;
 
+        // Caller-thread pickup, same as reader mint: the drive future may
+        // poll on runtime threads where the scope's slot is invisible.
+        let op_stats = op_stats::current();
+        // The tables the statement reads, counted once each across its
+        // relations and its search and graph functions. A statement that
+        // only describes tables counts none.
+        let table_reads = op_stats
+            .as_ref()
+            .filter(|_| reads_table_data(&statement))
+            .map(|stats| Arc::new(search_tvf::TableReads::new(Arc::clone(stats))));
+
+        let statistics = uses_statistics(&statement);
         let mut seen = HashSet::new();
         let mut handles: Vec<SupertableHandle> = Vec::new();
         for r in &refs {
+            // An introspection view is no catalog table. Opening its bare
+            // name would open (and count) a user table that shares it, such
+            // as one named `columns`; the block below registers what the
+            // views describe.
+            if r.schema() == Some(INFORMATION_SCHEMA) {
+                continue;
+            }
             let name = r.table().to_string();
             if !seen.insert(name.clone()) {
                 continue;
             }
             if let Some(table) = self
-                .open_and_register_cancellable(&ctx, &name, cancel)
+                .open_and_register_cancellable(&ctx, &name, cancel, statistics)
                 .map_err(|e| e.with_context("query_sql", None))?
             {
+                // A relation the statement names and the catalog holds:
+                // a table it reads. The introspection registration below
+                // only describes the catalog, so it is not counted.
+                if let Some(reads) = &table_reads {
+                    reads.record(self, &name);
+                }
                 handles.push(table);
             }
         }
@@ -1363,7 +1409,7 @@ impl Connection {
                 .filter(|name| seen.insert(name.clone()))
                 .collect();
             handles.extend(
-                self.open_and_register_all(&ctx, &names, cancel)
+                self.open_and_register_all(&ctx, &names, cancel, statistics)
                     .map_err(|e| e.with_context("query_sql", None))?,
             );
         }
@@ -1371,7 +1417,7 @@ impl Connection {
         // Search TVFs resolve their leading table-name argument through
         // the catalog at call time (so a table named only inside a TVF —
         // not as a `FROM` relation — still resolves).
-        search_tvf::register_search_tvfs(&ctx, self.clone());
+        search_tvf::register_search_tvfs(&ctx, self.clone(), table_reads.clone());
         // The graph functions walk an edge table of this catalog by name, or
         // the one attached from another catalog with no name.
         #[cfg(feature = "graph-index")]
@@ -1394,16 +1440,25 @@ impl Connection {
                                     .to_string(),
                             )
                         })?;
-                    search_tvf::register_graph_tvfs(&ctx, graph, self.clone(), Some(table));
+                    search_tvf::register_graph_tvfs(
+                        &ctx,
+                        graph,
+                        self.clone(),
+                        Some(table),
+                        table_reads,
+                    );
                 }
-                None => search_tvf::register_graph_tvfs(&ctx, self.clone(), self.clone(), None),
+                None => search_tvf::register_graph_tvfs(
+                    &ctx,
+                    self.clone(),
+                    self.clone(),
+                    None,
+                    table_reads,
+                ),
             }
         }
         trace::follow_spans_into_datafusion_tasks();
 
-        // Caller-thread pickup, same as reader mint: the drive future may
-        // poll on runtime threads where the scope's slot is invisible.
-        let op_stats = op_stats::current();
         // What the span records when the query is done; see `CloseOut`.
         let close_out = CloseOut::begin(
             || op_stats.clone(),
@@ -1548,22 +1603,23 @@ impl Connection {
         ctx: &SessionContext,
         name: &str,
         cancel: &QueryCancel,
+        statistics: bool,
     ) -> Result<Option<SupertableHandle>, InfinoError> {
         cancel.check()?;
         // A memory catalog opens without reading storage, and a hosted one
         // never opens tables here.
         let CatalogStore::Storage { handles, .. } = &self.inner.store else {
-            return self.open_and_register(ctx, name);
+            return self.open_and_register(ctx, name, statistics);
         };
-        if let Some(table) = live_handle(handles, name).filter(|t| !t.pointer_refresh_pending()) {
+        if let Some(table) = live_handle(handles, name).filter(|t| ready(t, statistics)) {
             return register(table, ctx, name);
         }
         let Ok(slot) = CANCELLABLE_OPENS.try_acquire() else {
-            return self.open_and_register(ctx, name);
+            return self.open_and_register(ctx, name, statistics);
         };
         // The SQL provider takes the query's work counters from the thread
         // that registers it (`op_stats::current`), so they move with the open.
-        let opened = self.open_on_pool(ctx, name, slot, op_stats::current());
+        let opened = self.open_on_pool(ctx, name, slot, op_stats::current(), statistics);
         bridge_on_runtime(cancel.unless_cancelled(opened), &shared_io_runtime())
     }
 
@@ -1576,13 +1632,16 @@ impl Connection {
         name: &str,
         slot: SemaphorePermit<'static>,
         collector: Option<Arc<OpStatsCollector>>,
+        statistics: bool,
     ) -> impl Future<Output = Result<Option<SupertableHandle>, InfinoError>> + use<> {
         let conn = self.clone();
         let session = ctx.clone();
         let table = name.to_owned();
         let opening = shared_io_runtime().spawn_blocking(carry_span(move || {
             let _slot = slot;
-            op_stats::attached(collector, || conn.open_and_register(&session, &table))
+            op_stats::attached(collector, || {
+                conn.open_and_register(&session, &table, statistics)
+            })
         }));
         async {
             match opening.await {
@@ -1606,13 +1665,14 @@ impl Connection {
         ctx: &SessionContext,
         names: &[String],
         cancel: &QueryCancel,
+        statistics: bool,
     ) -> Result<Vec<SupertableHandle>, InfinoError> {
         cancel.check()?;
         let CatalogStore::Storage { handles, .. } = &self.inner.store else {
             // These opens read no storage, so one by one costs nothing.
             let mut tables = Vec::new();
             for name in names {
-                tables.extend(self.open_and_register(ctx, name)?);
+                tables.extend(self.open_and_register(ctx, name, statistics)?);
             }
             return Ok(tables);
         };
@@ -1621,7 +1681,7 @@ impl Connection {
             .map(|(index, name)| {
                 let collector = collector.clone();
                 async move {
-                    let warm = live_handle(handles, name).filter(|t| !t.pointer_refresh_pending());
+                    let warm = live_handle(handles, name).filter(|t| ready(t, statistics));
                     let opened = match warm {
                         Some(table) => register(table, ctx, name)?,
                         None => {
@@ -1629,7 +1689,8 @@ impl Connection {
                                 .acquire()
                                 .await
                                 .expect("invariant: the open slots are never closed");
-                            self.open_on_pool(ctx, name, slot, collector).await?
+                            self.open_on_pool(ctx, name, slot, collector, statistics)
+                                .await?
                         }
                     };
                     Ok::<_, InfinoError>((index, opened))
@@ -1651,8 +1712,9 @@ impl Connection {
         &self,
         ctx: &SessionContext,
         name: &str,
+        statistics: bool,
     ) -> Result<Option<SupertableHandle>, InfinoError> {
-        match self.open_table_handle(name) {
+        match self.open_table_handle_for(name, statistics) {
             Ok(table) => register(table, ctx, name),
             Err(InfinoError::NotFound(_)) => Ok(None),
             Err(e) => Err(e),
@@ -1859,6 +1921,23 @@ const INFORMATION_SCHEMA: &str = "information_schema";
 /// query is introspecting the catalog and wants every table registered.
 fn references_information_schema(refs: &[TableReference]) -> bool {
     refs.iter().any(|r| r.schema() == Some(INFORMATION_SCHEMA))
+}
+
+/// Whether running `statement` reads table data: a query does, and so does
+/// `EXPLAIN ANALYZE`, which runs the query it explains. `DESCRIBE`, a plain
+/// `EXPLAIN` and every `SHOW` form only describe tables.
+fn reads_table_data(statement: &DFStatement) -> bool {
+    match statement {
+        DFStatement::Statement(statement) => match statement.as_ref() {
+            SqlStatement::Query(_) => true,
+            SqlStatement::Explain {
+                analyze, statement, ..
+            } => *analyze && matches!(statement.as_ref(), SqlStatement::Query(_)),
+            _ => false,
+        },
+        DFStatement::Explain(explain) => explain.analyze && reads_table_data(&explain.statement),
+        _ => false,
+    }
 }
 
 fn connective_cap_error(surface: &str) -> InfinoError {
@@ -2131,6 +2210,94 @@ fn live_handle(
     None
 }
 
+/// Whether `handle` can serve a statement as it stands, with no pointer check due and, for one that
+/// reads them (`statistics`), its per-column statistics loaded.
+fn ready(handle: &SupertableHandle, statistics: bool) -> bool {
+    !handle.pointer_refresh_pending() && (!statistics || handle.statistics_loaded())
+}
+
+/// `handle` for a caller that does (`statistics`) or does not need the per-column statistics,
+/// reading them into it first when it was opened without them.
+fn ensure_statistics(
+    handle: SupertableHandle,
+    statistics: bool,
+    name: &str,
+) -> Result<SupertableHandle, InfinoError> {
+    if statistics {
+        handle
+            .load_statistics()
+            .map_err(|e| InfinoError::from(e).with_context("open_table", Some(name)))?;
+    }
+    Ok(handle)
+}
+
+/// Whether `statement` can use the per-column statistics: "no" only for a plain read of one table
+/// (no filter, grouping, ordering, join or subquery, no aggregate but a row count), "yes" if unsure.
+fn uses_statistics(statement: &DFStatement) -> bool {
+    let DFStatement::Statement(statement) = statement else {
+        return true;
+    };
+    // A subquery anywhere, a `LIMIT` one included, reads a table of its own.
+    let nested = visit_expressions(statement.as_ref(), |expr| match expr {
+        SqlExpr::Subquery(_) | SqlExpr::InSubquery { .. } | SqlExpr::Exists { .. } => {
+            ControlFlow::Break(())
+        }
+        _ => ControlFlow::Continue(()),
+    });
+    if nested.is_break() {
+        return true;
+    }
+    let SqlStatement::Query(query) = statement.as_ref() else {
+        return true;
+    };
+    if query.with.is_some()
+        || query.order_by.is_some()
+        || query.fetch.is_some()
+        || !query.pipe_operators.is_empty()
+    {
+        return true;
+    }
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return true;
+    };
+    let [from] = select.from.as_slice() else {
+        return true;
+    };
+    let one_table =
+        from.joins.is_empty() && matches!(&from.relation, TableFactor::Table { args: None, .. });
+    let plain = select.selection.is_none()
+        && select.prewhere.is_none()
+        && select.having.is_none()
+        && select.qualify.is_none()
+        && select.distinct.is_none()
+        && select.top.is_none()
+        && select.into.is_none()
+        && select.sort_by.is_empty()
+        && select.lateral_views.is_empty()
+        && select.connect_by.is_empty()
+        && matches!(&select.group_by, GroupByExpr::Expressions(by, _) if by.is_empty());
+    !(one_table && plain && select.projection.iter().all(plain_item))
+}
+
+/// Whether a select item reads no statistics: a column, a wildcard, or one of [`ROW_COUNTS`].
+fn plain_item(item: &SelectItem) -> bool {
+    let expr = match item {
+        // `REPLACE` holds expressions, which may hold a subquery.
+        SelectItem::Wildcard(options) | SelectItem::QualifiedWildcard(_, options) => {
+            return options.opt_replace.is_none();
+        }
+        SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => expr,
+        _ => return false,
+    };
+    match expr {
+        SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_) => true,
+        SqlExpr::Function(_) => {
+            ROW_COUNTS.contains(&expr.to_string().to_ascii_uppercase().as_str())
+        }
+        _ => false,
+    }
+}
+
 /// The per-name single-flight gate, created on first use. Returned as an owned
 /// `Arc` (not a `DashMap` reference) so the caller locks it *after* the map
 /// access returns, never holding a shard across the build's blocking I/O.
@@ -2318,11 +2485,7 @@ mod tests {
     use std::{
         fs,
         path::{Path, PathBuf},
-        sync::{
-            Arc, Mutex, MutexGuard, PoisonError,
-            atomic::{AtomicBool, Ordering},
-            mpsc,
-        },
+        sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc},
         thread,
         time::{Duration, Instant},
     };
@@ -2334,6 +2497,7 @@ mod tests {
         types::Int64Type,
     };
     use arrow_schema::{DataType, Field, Schema};
+    use chrono::{Duration as ChronoDuration, Utc};
     use datafusion::{
         error::DataFusionError,
         logical_expr::LogicalPlan,
@@ -2343,6 +2507,7 @@ mod tests {
         Figment,
         providers::{Format, Yaml},
     };
+    use futures::executor::block_on;
     use proptest::prelude::*;
     use serde_json::{Map, Value, json};
 
@@ -2353,10 +2518,21 @@ mod tests {
         catalog::manifest::CATALOG_PATH,
         runtime_metrics::{io::UriClass, op_stats::with_op_stats},
         supertable::{
-            manifest::{commit::POINTER_PATH, list::VALUE_TABLES_BUDGET_BYTES},
+            manifest::{
+                commit::{MANIFEST_PARTS_DIR, POINTER_PATH},
+                list::VALUE_TABLES_BUDGET_BYTES,
+                rollups::MANIFEST_ROLLUPS_DIR,
+                summaries::MANIFEST_SUMMARIES_DIR,
+            },
             query::{
                 provider::TABLE_NAME, sql::value_count_schema,
                 value_count_carry::MAX_TABLE_VALUE_COUNTS,
+            },
+            wal::{
+                WalStore,
+                lease::DEFAULT_LEASE_DURATION,
+                recovery_sweep_tests::seed_intent_delete_wal,
+                state_doc::{Lease, SupertableHandleId, WalState, WalStateDoc},
             },
         },
         test_helpers::{
@@ -4907,6 +5083,267 @@ mod tests {
     /// table-wide limit, more than it between them, and each file's table well within its
     /// budget.
     const UNDER_THE_TABLE_LIMIT: usize = MAX_TABLE_VALUE_COUNTS * 3 / 4;
+
+    /// Statements that read a table and none of its statistics.
+    const READS_WITHOUT_STATISTICS: &[&str] = &[
+        "SELECT count(*) FROM t",
+        "SELECT COUNT(1) FROM t",
+        "SELECT Count( * ) AS n FROM t",
+        "SELECT * FROM t",
+        "SELECT t.* FROM t",
+        "SELECT title, _id AS id FROM t",
+        "SELECT title FROM t LIMIT 3",
+    ];
+
+    /// Statements that may read the statistics: one for each reader of them (superfile pruning,
+    /// value counts, bounds, null counts, top-k, join filters), and a shape of each kind the
+    /// check does not look into, which must count as reading them.
+    const READS_WITH_STATISTICS: &[&str] = &[
+        "SELECT count(*) FROM t WHERE title = 'a'",
+        "SELECT count(*) FROM t JOIN u ON t.title = u.title",
+        "SELECT count(*) FROM (SELECT * FROM t WHERE title = 'a')",
+        "SELECT title, count(*) FROM t GROUP BY title",
+        "SELECT min(title), max(title) FROM t",
+        "SELECT count(title) FROM t",
+        "SELECT title FROM t ORDER BY title LIMIT 3",
+        "SELECT * FROM t JOIN u ON t.title = u.title",
+        "SELECT DISTINCT title FROM t",
+        "SELECT count(DISTINCT title) FROM t",
+        "SELECT count(*) FILTER (WHERE title = 'a') FROM t",
+        "SELECT count(*) FROM t HAVING count(*) > 1",
+        "SELECT title = 'a' FROM t",
+        "SELECT * FROM (SELECT * FROM t)",
+        "WITH s AS (SELECT * FROM t) SELECT * FROM s",
+        "SELECT * FROM t UNION ALL SELECT * FROM t",
+        "SELECT * FROM t, u",
+        "SELECT * FROM bm25_search('t', 'title', 'a', 10)",
+        "SELECT * FROM t LIMIT (SELECT count(*) FROM t WHERE title = 'a')",
+        "SELECT * REPLACE ((SELECT count(*) FROM u WHERE title = 'a') AS title) FROM t",
+        "EXPLAIN SELECT count(*) FROM t",
+    ];
+
+    /// Only a plain read of one table is opened without statistics; anything else, or anything
+    /// the check does not look into, reads them.
+    #[test]
+    fn only_plain_reads_skip_statistics() {
+        let state = SessionContext::new().state();
+        let uses = |sql: &str| uses_statistics(&read_only_statement(&state, sql).expect(sql));
+        for sql in READS_WITHOUT_STATISTICS {
+            assert!(!uses(sql), "{sql}");
+        }
+        for sql in READS_WITH_STATISTICS {
+            assert!(uses(sql), "{sql}");
+        }
+    }
+
+    /// Rows of the cab fixture ([`create_cab_types`]).
+    const CABS: i64 = 5;
+    /// Rows of the cab fixture whose title is `yellow`.
+    const YELLOW_CABS: i64 = 3;
+    /// A filtered count of the cab fixture: it reads the per-column statistics.
+    const YELLOW_COUNT: &str = "SELECT count(*) FROM cabs WHERE title = 'yellow'";
+    /// A plain count of the cab fixture: it reads none.
+    const PLAIN_COUNT: &str = "SELECT count(*) FROM cabs";
+    /// Filtered statements sent at once to a table opened without statistics.
+    const STATEMENTS_TOGETHER: usize = 2;
+    /// The id of the delete log a crashed writer left in the cab fixture.
+    const CRASHED_WAL_ID: i128 = 0x1234_5678;
+    /// The handle a delete still in flight in the cab fixture belongs to.
+    const DELETING_HANDLE: i128 = 0x5150;
+
+    /// The single count `sql` answers on `conn`.
+    fn count_on(conn: &Connection, sql: &str) -> i64 {
+        conn.query_sql(sql).expect(sql)[0]
+            .column(0)
+            .as_primitive::<Int64Type>()
+            .value(0)
+    }
+
+    /// GETs of the trace started on `conn`, by what they read: summaries sections, rollups and
+    /// parts.
+    fn manifest_gets(conn: &Connection) -> (usize, usize, usize) {
+        let trace = conn.usage_meter().take_trace();
+        let of = |dir: &str| trace.iter().filter(|get| get.uri.contains(dir)).count();
+        (
+            of(MANIFEST_SUMMARIES_DIR),
+            of(MANIFEST_ROLLUPS_DIR),
+            of(MANIFEST_PARTS_DIR),
+        )
+    }
+
+    /// Whether the handle `conn` holds for `name` has its per-column statistics; `None` when it
+    /// holds none.
+    fn cached_statistics(conn: &Connection, name: &str) -> Option<bool> {
+        let CatalogStore::Storage { handles, .. } = &conn.inner.store else {
+            panic!("a storage catalog");
+        };
+        Some(handles.get(name)?.statistics_loaded())
+    }
+
+    /// The cab fixture in a fresh directory, and the manifest GETs a cold filtered count makes.
+    fn cabs_and_a_cold_filter() -> (tempfile::TempDir, String, (usize, usize, usize)) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let uri = dir.path().to_str().expect("utf8 path").to_owned();
+        create_cab_types(&connect(&uri).expect("connect"), "cabs");
+        let cold = connect(&uri).expect("reconnect");
+        cold.usage_meter().start_trace();
+        assert_eq!(count_on(&cold, YELLOW_COUNT), YELLOW_CABS);
+        (dir, uri, manifest_gets(&cold))
+    }
+
+    /// A cold plain `COUNT(*)` opens its table without statistics and downloads none: only the
+    /// parts a cold filter reads too.
+    #[test]
+    fn a_plain_count_opens_its_table_without_statistics() {
+        let (_dir, uri, (_, _, parts)) = cabs_and_a_cold_filter();
+        let conn = connect(&uri).expect("reconnect");
+        conn.usage_meter().start_trace();
+        assert_eq!(count_on(&conn, PLAIN_COUNT), CABS);
+        assert_eq!(manifest_gets(&conn), (0, 0, parts));
+        assert_eq!(cached_statistics(&conn, "cabs"), Some(false));
+    }
+
+    /// Leaves a delete of the cab fixture's first row in its log at `state`, held by `lease`
+    /// when it is `Some`.
+    fn seed_a_delete(uri: &str, state: WalState, lease: Option<Lease>) {
+        let table = connect(uri)
+            .expect("connect")
+            .open_table_handle_for("cabs", true)
+            .expect("open");
+        let first_row = table
+            .reader()
+            .expect("reader")
+            .manifest()
+            .get_all_superfiles()[0]
+            .id_min;
+        let storage = Arc::clone(table.options().storage.as_ref().expect("storage"));
+        let wal = WalStateDoc {
+            state,
+            lease,
+            ..seed_intent_delete_wal(first_row, CRASHED_WAL_ID)
+        };
+        block_on(WalStore::new(storage).create(&wal)).expect("seed the delete");
+    }
+
+    /// A delete a crashed writer left unfinished is finished by the open a plain `COUNT(*)` makes
+    /// without statistics, so the count does not see the deleted row.
+    #[test]
+    fn a_plain_count_does_not_see_a_crashed_delete() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let uri = dir.path().to_str().expect("utf8 path").to_owned();
+        create_cab_types(&connect(&uri).expect("connect"), "cabs");
+        seed_a_delete(&uri, WalState::Intent, None);
+        let cold = connect(&uri).expect("reconnect");
+        assert_eq!(count_on(&cold, PLAIN_COUNT), CABS - 1);
+    }
+
+    /// A delete another writer still holds is its own to finish, so an open without statistics
+    /// beside it reads none, and the count sees the row the delete has not reached yet.
+    #[test]
+    fn a_plain_count_beside_a_delete_in_flight_reads_no_statistics() {
+        let (_dir, uri, (_, _, parts)) = cabs_and_a_cold_filter();
+        let now = Utc::now();
+        seed_a_delete(
+            &uri,
+            WalState::Intent,
+            Some(Lease {
+                owner: SupertableHandleId(DELETING_HANDLE),
+                acquired_at: now,
+                expires_at: now
+                    + ChronoDuration::from_std(DEFAULT_LEASE_DURATION).expect("lease span"),
+            }),
+        );
+        let conn = connect(&uri).expect("reconnect");
+        conn.usage_meter().start_trace();
+        assert_eq!(count_on(&conn, PLAIN_COUNT), CABS);
+        assert_eq!(manifest_gets(&conn), (0, 0, parts));
+    }
+
+    /// A finished delete's log, left for GC to reap, gives an open without statistics nothing to
+    /// recover, so it reads none.
+    #[test]
+    fn a_plain_count_beside_a_finished_delete_reads_no_statistics() {
+        let (_dir, uri, (_, _, parts)) = cabs_and_a_cold_filter();
+        seed_a_delete(&uri, WalState::Complete, None);
+        let conn = connect(&uri).expect("reconnect");
+        conn.usage_meter().start_trace();
+        assert_eq!(count_on(&conn, PLAIN_COUNT), CABS);
+        assert_eq!(manifest_gets(&conn), (0, 0, parts));
+    }
+
+    /// Filtered statements arriving together at a table opened without statistics read them into
+    /// that same handle once: the sections and rollups a cold open reads, and no part again.
+    #[test]
+    fn statements_arriving_together_read_statistics_into_the_handle_once() {
+        let (_dir, uri, (sections, rollups, _)) = cabs_and_a_cold_filter();
+        let conn = connect(&uri).expect("reconnect");
+        assert_eq!(count_on(&conn, PLAIN_COUNT), CABS);
+        let opened = conn.open_table_handle_for("cabs", false).expect("cached");
+        conn.usage_meter().start_trace();
+        thread::scope(|scope| {
+            for _ in 0..STATEMENTS_TOGETHER {
+                scope.spawn(|| assert_eq!(count_on(&conn, YELLOW_COUNT), YELLOW_CABS));
+            }
+        });
+        assert_eq!(manifest_gets(&conn), (sections, rollups, 0));
+        assert_eq!(cached_statistics(&conn, "cabs"), Some(true));
+        let upgraded = conn.open_table_handle_for("cabs", false).expect("cached");
+        assert!(
+            Arc::ptr_eq(opened.options(), upgraded.options()),
+            "the same handle"
+        );
+    }
+
+    /// A `Strong` connection, which checks the pointer before every statement.
+    fn connect_strong(uri: &str) -> Connection {
+        connect_with(
+            uri,
+            ConnectOptions::new().with_read_consistency(Consistency::Strong),
+        )
+        .expect("connect")
+    }
+
+    /// A filtered statement at a table opened without statistics refreshes it before reading
+    /// them: after a peer's commit it reads the sections of the table as it now is, as a cold
+    /// filter does, and none of the snapshot the refresh replaces.
+    #[test]
+    fn reading_statistics_refreshes_the_table_first() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let uri = dir.path().to_str().expect("utf8 path").to_owned();
+        create_cab_types(&connect(&uri).expect("connect"), "cabs");
+        let conn = connect_strong(&uri);
+        assert_eq!(count_on(&conn, PLAIN_COUNT), CABS);
+        connect(&uri)
+            .expect("peer")
+            .open_table("cabs")
+            .expect("open for writing")
+            .append(&build_title_batch(&["yellow"]))
+            .expect("append");
+        let cold = connect_strong(&uri);
+        cold.usage_meter().start_trace();
+        assert_eq!(count_on(&cold, YELLOW_COUNT), YELLOW_CABS + 1);
+        let (sections, _, _) = manifest_gets(&cold);
+        conn.usage_meter().start_trace();
+        assert_eq!(count_on(&conn, YELLOW_COUNT), YELLOW_CABS + 1);
+        assert_eq!(manifest_gets(&conn).0, sections);
+    }
+
+    /// An open for writing reads the statistics into a table opened without them, and what it
+    /// commits keeps them.
+    #[test]
+    fn an_open_for_writing_reads_statistics_and_its_commits_keep_them() {
+        let (_dir, uri, _) = cabs_and_a_cold_filter();
+        let conn = connect(&uri).expect("reconnect");
+        assert_eq!(count_on(&conn, PLAIN_COUNT), CABS);
+        let table = conn.open_table("cabs").expect("open for writing");
+        assert!(table.local_handle().statistics_loaded());
+        table
+            .append(&build_title_batch(&["yellow"]))
+            .expect("append");
+        assert!(table.local_handle().statistics_loaded());
+        assert_eq!(count_on(&conn, YELLOW_COUNT), YELLOW_CABS + 1);
+    }
+
     /// Superfiles that trigger a merge in the value-count fixture's compaction, whatever
     /// their size: as few as merging takes.
     const MERGE_AT_SUPERFILES: u64 = 2;
@@ -7693,18 +8130,23 @@ mod tests {
     #[derive(Default)]
     struct SlowStores {
         stores: Mutex<Vec<Arc<SlowStorage>>>,
-        /// Whether stores built from now on start with their reads held.
-        hold_new: AtomicBool,
+        /// Reads that stores built from now on start holding: those of an object whose path
+        /// contains this fragment, every read for `""`; none for `None`.
+        hold_new: Mutex<Option<String>>,
     }
 
     impl SlowStores {
         fn wrap(&self, inner: Arc<dyn StorageProvider>) -> Arc<dyn StorageProvider> {
             let slow = SlowStorage::wrap(inner, SLOW_READ);
-            if self.hold_new.load(Ordering::SeqCst) {
-                slow.hold_reads();
+            if let Some(fragment) = self.held_on_new().as_deref() {
+                slow.hold_reads_of(fragment);
             }
             self.lock().push(Arc::clone(&slow));
             slow
+        }
+
+        fn held_on_new(&self) -> MutexGuard<'_, Option<String>> {
+            self.hold_new.lock().unwrap_or_else(PoisonError::into_inner)
         }
 
         fn lock(&self) -> MutexGuard<'_, Vec<Arc<SlowStorage>>> {
@@ -7714,7 +8156,14 @@ mod tests {
         /// Hold the reads of every store built from now on, until
         /// [`Self::release_reads`].
         fn hold_new_stores(&self) {
-            self.hold_new.store(true, Ordering::SeqCst);
+            *self.held_on_new() = Some(String::new());
+        }
+
+        /// Hold the reads of objects whose path contains `fragment`, on every store built so far
+        /// and from now on, until [`Self::release_reads`].
+        fn hold_reads_of(&self, fragment: &str) {
+            *self.held_on_new() = Some(fragment.to_owned());
+            self.lock().iter().for_each(|s| s.hold_reads_of(fragment));
         }
 
         /// Hold the reads of every store built so far, until
@@ -7724,7 +8173,7 @@ mod tests {
         }
 
         fn release_reads(&self) {
-            self.hold_new.store(false, Ordering::SeqCst);
+            *self.held_on_new() = None;
             self.lock().iter().for_each(|s| s.release_reads());
         }
 
@@ -7971,6 +8420,10 @@ mod tests {
         let (conn, stores) = slow_cold_conn(dir.path(), cache.path());
         let cancel = QueryCancel::new();
 
+        // A sidecar is cached once read, so the first query's sidecar reads stay held until the
+        // second query has started its own: otherwise a busy runner can let the first finish them
+        // all before the second plans, and the second then reads none.
+        stores.hold_reads_of(SIDECAR);
         let cancelled = query_in_background(&conn, READ_EVERY_FILE, &cancel);
         wait_until("the first query reads a sidecar", || {
             stores.reads_of(SIDECAR) > 0
@@ -7981,6 +8434,7 @@ mod tests {
             stores.reads_of(SIDECAR) > sidecar_reads
         });
         cancel_and_expect_cancelled(&cancel, &cancelled);
+        stores.release_reads();
 
         let (result, _) = whole
             .recv_timeout(QUERY_DEADLINE)

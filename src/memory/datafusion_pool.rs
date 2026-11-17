@@ -229,6 +229,9 @@ mod tests {
     const BATCH_ROWS: usize = 8 * 1024;
     /// Partitions the partitioned hash join test runs on.
     const JOIN_PARTITIONS: usize = 4;
+    /// DataFusion's hash join metric for the bytes its build side charged to
+    /// the memory pool, summed over its partitions.
+    const BUILD_MEM_USED: &str = "build_mem_used";
 
     #[test]
     fn measured_pool_never_refuses() {
@@ -622,13 +625,14 @@ mod tests {
     /// Runs `sql` over tables `a` (`small`) and `b` (`large`) with its hash
     /// join in `mode`: one partition for `CollectLeft`, or `JOIN_PARTITIONS`
     /// partitions with every build too big to collect for `Partitioned`.
-    /// Returns the result and the plan's total `RIGHT_SIZED_BATCHES`.
+    /// Returns the result, the plan's total `RIGHT_SIZED_BATCHES`, and the
+    /// bytes its join builds charged.
     async fn run_join(
         ctx: SessionContext,
         tables: &[(&str, Arc<MemTable>)],
         mode: &str,
         sql: &str,
-    ) -> DfResult<(Vec<RecordBatch>, usize)> {
+    ) -> DfResult<(Vec<RecordBatch>, usize, usize)> {
         let partitions = if mode == "Partitioned" {
             JOIN_PARTITIONS
         } else {
@@ -654,10 +658,12 @@ mod tests {
         let shape = displayable(plan.as_ref()).indent(true).to_string();
         assert!(shape.contains(&format!("mode={mode}")), "{shape}");
         let out = collect(Arc::clone(&plan), ctx.task_ctx()).await?;
-        let right_sized = total_metric(plan.as_ref(), &|m| {
-            m.sum_by_name(RIGHT_SIZED_BATCHES).map(|v| v.as_usize())
-        });
-        Ok((out, right_sized))
+        let sum = |name: &str| {
+            total_metric(plan.as_ref(), &|m| {
+                m.sum_by_name(name).map(|v| v.as_usize())
+            })
+        };
+        Ok((out, sum(RIGHT_SIZED_BATCHES), sum(BUILD_MEM_USED)))
     }
 
     /// An aggregate's result feeding a hash join's build side fits a 64 MiB
@@ -672,11 +678,15 @@ mod tests {
     ///   build, real       ~5 MB
     ///   gate              57.6 MiB (90% of 64 MiB configured)
     ///
-    /// The second session is plain DataFusion on the same budgeted runtime, so
-    /// it has none of our rules or settings; it shows the budget is too small
-    /// for the uncopied build. On DataFusion 55, which counts a
-    /// buffer shared by several batches once, it fits too and this half fails;
-    /// revisit the rule then (see its module docs).
+    /// The second session is plain DataFusion, with none of our rules or
+    /// settings, on a budget that only measures: its build charges more than
+    /// the gate, so the budget is too small for the uncopied build. It measures
+    /// rather than refuses because a refusal makes the aggregates give memory
+    /// back, and then whether the partitioned build crosses the gate, by about
+    /// a megabyte, turns on what else is held at that instant. On DataFusion
+    /// 55, which counts a buffer shared by several batches once, the charge
+    /// falls under the gate and this half fails; revisit the rule then (see
+    /// its module docs).
     #[test]
     fn an_aggregate_feeding_a_join_build_fits_once_its_slices_are_copied() {
         const GROUPS: usize = 300_000;
@@ -719,7 +729,7 @@ mod tests {
             for mode in ["CollectLeft", "Partitioned"] {
                 let budget = ConnectionMemoryBudget::with_limit(CONFIGURED);
                 let with_rule = budgeted_session_context(&budget).expect("session");
-                let (out, right_sized) = run_join(with_rule, &tables, mode, SQL)
+                let (out, right_sized, _) = run_join(with_rule, &tables, mode, SQL)
                     .await
                     .unwrap_or_else(|e| panic!("{mode}: fits with the rule: {e}"));
                 let column = |i: usize| out[0].column(i).as_primitive::<Int64Type>().value(0);
@@ -727,17 +737,17 @@ mod tests {
                 assert_eq!(column(1), expected_sum, "{mode}");
                 assert!(right_sized > 0, "{mode}: the build's slices were copied");
 
-                let budget = ConnectionMemoryBudget::with_limit(CONFIGURED);
+                let gate = budget.limit().expect("a bounded budget");
                 let without_rule = SessionContext::new_with_config_rt(
                     SessionConfig::new(),
-                    budgeted_runtime(&budget).expect("runtime"),
+                    budgeted_runtime(&ConnectionMemoryBudget::measured()).expect("runtime"),
                 );
-                let err = run_join(without_rule, &tables, mode, SQL)
+                let (_, _, charged) = run_join(without_rule, &tables, mode, SQL)
                     .await
-                    .expect_err("the same build overruns the budget without the rule");
+                    .unwrap_or_else(|e| panic!("{mode}: a measured budget refuses nothing: {e}"));
                 assert!(
-                    matches!(err.find_root(), DataFusionError::ResourcesExhausted(_)),
-                    "{mode}: {err}"
+                    charged > gate,
+                    "{mode}: without the rule the build charges {charged} B, over the {gate} B gate"
                 );
             }
         });

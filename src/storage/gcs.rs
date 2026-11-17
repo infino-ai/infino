@@ -30,7 +30,7 @@ use super::{
     ObjectMeta, StorageError, StorageOptions, StorageProvider, child_prefix_names, counting,
     hedged_multipart::HedgedUpload, io_counters, logical_list_key, options::apply, retry,
 };
-use crate::runtime_metrics::io::UsageMeter;
+use crate::{runtime_metrics::io::UsageMeter, utils::trace::record};
 
 /// Warm idle connections per host, so a wide range-GET fan-out reuses TLS
 /// sessions instead of re-handshaking on the cold tail.
@@ -301,6 +301,10 @@ impl StorageProvider for GcsStorageProvider {
         })
     }
 
+    #[cfg_attr(
+        feature = "detailed-tracing",
+        tracing::instrument(skip_all, fields(uri = uri, len = tracing::field::Empty))
+    )]
     async fn get(&self, uri: &str) -> Result<(Bytes, ObjectMeta), StorageError> {
         let path = self.path(uri)?;
         let tl = io_counters::timeline_start();
@@ -317,6 +321,7 @@ impl StorageProvider for GcsStorageProvider {
         .await;
         if let Ok((b, _)) = &out {
             self.meter.record_get(uri, None, b.len() as u64);
+            record("len", b.len() as u64);
             io_counters::timeline_record("get", uri, 0, b.len() as u64, tl);
         }
         out
