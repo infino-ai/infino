@@ -880,6 +880,10 @@ pub(crate) fn ceiling_can_compete(ceiling: f32, floor: f32) -> bool {
 /// could do is lower the bar and open superfiles that need not be opened,
 /// which is slow and still correct, but defining it away is cheaper than
 /// reasoning about it at every call site.
+/// Completions of a prefix a ranked prefix search scores, at most: the
+/// most frequent ones across the table.
+const PREFIX_COMPLETIONS: usize = 64;
+
 pub(crate) fn competitive_floor(floor: f32, tolerance: f32) -> f32 {
     match tolerance.is_finite() && tolerance > 0.0 {
         true => floor * (1.0 + tolerance),
@@ -2603,6 +2607,15 @@ impl SupertableReader {
                     .into_iter()
                     .partition(|entry| index.is_indexed(&entry.superfile_id));
                 let live: HashSet<Uuid> = covered.iter().map(|e| e.superfile_id).collect();
+                // With every superfile covered, the search scores the
+                // prefix's most frequent completions: a short prefix has
+                // millions, and the frequent ones hold the best documents.
+                if rest.is_empty() && !live.is_empty() {
+                    return index
+                        .top_prefix_completions(field, text, &live, PREFIX_COMPLETIONS)
+                        .await
+                        .map_err(QueryError::from);
+                }
                 if !live.is_empty() {
                     terms = index
                         .prefix_terms(field, text, &live)

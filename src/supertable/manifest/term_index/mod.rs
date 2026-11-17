@@ -41,7 +41,7 @@ pub(crate) mod tier;
 
 use std::{
     cmp::Reverse,
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeSet, BinaryHeap, HashMap, HashSet},
     fmt, fs,
     future::Future,
     io,
@@ -383,6 +383,11 @@ fn object_uri(kind: &str, hash: &ContentHash) -> String {
 pub(crate) fn slice_uri(hash: &ContentHash) -> String {
     object_uri("slice", hash)
 }
+
+/// Candidates each layer nominates per completion a prefix search asks
+/// for, before the table-wide counts rank them: a completion common in the
+/// table is common in some layer.
+const PREFIX_CANDIDATES_PER_COMPLETION: usize = 4;
 
 /// Storage URI of a slice's tier object with this content hash.
 /// One chunk of a tier as a merge reads it: its directory and every
@@ -3125,6 +3130,72 @@ impl TermIndex {
         })
         .await?;
         Ok(out)
+    }
+
+    /// The `n` completions of `prefix` in `column` with the most documents
+    /// over the `live` superfiles, most first (ties in byte order). Each
+    /// layer's counts nominate candidates — a few per completion asked for,
+    /// by the largest count one layer gives them — and the candidates are
+    /// then ranked by their count over every layer, so the walk keeps a
+    /// bounded heap however many completions the prefix has.
+    pub(crate) async fn top_prefix_completions(
+        &self,
+        column: FieldId,
+        prefix: &str,
+        live: &HashSet<Uuid>,
+        n: usize,
+    ) -> Result<Vec<String>, TermIndexError> {
+        let head = column.term_key("").len();
+        let nominate = n.saturating_mul(PREFIX_CANDIDATES_PER_COMPLETION);
+        // Min-heap of (layer count, term) over the best nominations so far.
+        let mut best: BinaryHeap<Reverse<(u64, Vec<u8>)>> = BinaryHeap::new();
+        self.for_each_prefix(column, prefix, |key, run| {
+            let df: u64 = run
+                .iter()
+                .filter(|p| {
+                    self.superfile_id(p.superfile)
+                        .is_some_and(|id| live.contains(&id))
+                })
+                .map(|p| p.df)
+                .sum();
+            if df > 0
+                && let Some(term) = key.get(head..)
+                && best
+                    .peek()
+                    .is_none_or(|Reverse((low, _))| best.len() < nominate || df > *low)
+            {
+                best.push(Reverse((df, term.to_vec())));
+                if best.len() > nominate {
+                    best.pop();
+                }
+            }
+            true
+        })
+        .await?;
+        let mut candidates: Vec<String> = best
+            .into_iter()
+            .filter_map(|Reverse((_, term))| String::from_utf8(term).ok())
+            .collect();
+        candidates.sort_unstable();
+        candidates.dedup();
+        let refs: Vec<&str> = candidates.iter().map(String::as_str).collect();
+        let runs = self.runs_many(column, &refs).await?;
+        let mut ranked: Vec<(u64, String)> = candidates
+            .iter()
+            .zip(runs.iter())
+            .map(|(term, runs)| {
+                let df = postings_of(runs)
+                    .filter(|p| {
+                        self.superfile_id(p.superfile)
+                            .is_some_and(|id| live.contains(&id))
+                    })
+                    .map(|p| p.df)
+                    .sum();
+                (df, term.clone())
+            })
+            .collect();
+        ranked.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        Ok(ranked.into_iter().take(n).map(|(_, term)| term).collect())
     }
 
     /// The superfiles holding any term with `prefix` in `column`.
@@ -7657,6 +7728,19 @@ mod tests {
                 .map(|t| alphabet[t].as_bytes().to_vec())
                 .collect();
             prop_assert_eq!(terms, expect);
+            // The most frequent completions over the live superfiles, most
+            // first, ties in byte order.
+            let top = rt.block_on(index.top_prefix_completions(fid("body"), "t0", &live, 3)).expect("top");
+            let mut by_df: Vec<(u64, String)> = (0..10)
+                .map(|t| {
+                    let df = holders(t).iter().filter(|id| live.contains(id)).count() as u64 * (1 + t as u64);
+                    (df, alphabet[t].clone())
+                })
+                .filter(|(df, _)| *df > 0)
+                .collect();
+            by_df.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+            let want: Vec<String> = by_df.into_iter().take(3).map(|(_, t)| t).collect();
+            prop_assert_eq!(top, want);
             prop_assert!(rt.block_on(index.route(fid("body"), &["nope"], BoolMode::Or)).expect("route").is_empty());
         });
     }
