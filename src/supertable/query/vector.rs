@@ -7235,6 +7235,7 @@ impl SupertableReader {
         tokens: &[String],
         mode: BoolMode,
     ) -> Result<HashMap<SuperfileUri, Arc<RoaringBitmap>>, QueryError> {
+        let filter_field = self.manifest().field_id(filter_col);
         let filter_col_arc = Arc::new(filter_col.to_owned());
         let tokens_arc: Arc<Vec<String>> = Arc::new(tokens.to_vec());
         // The term index's locations let each superfile resolve the filter
@@ -7253,7 +7254,12 @@ impl SupertableReader {
                 let memo = memo_from_locations(&r, &locations, entry.superfile_id).await;
                 let refs: Vec<&str> = tokens_arc.iter().map(String::as_str).collect();
                 let (docs, work) = r
-                    .token_match_prefetched(&filter_col_arc, &refs, mode, memo.as_deref())
+                    .token_match_prefetched(
+                        r.column_alias(filter_field, &filter_col_arc),
+                        &refs,
+                        mode,
+                        memo.as_deref(),
+                    )
                     .await
                     .map_err(QueryError::from)?;
                 // The predicate-resolution leg of filtered vector search
