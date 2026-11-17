@@ -2667,6 +2667,14 @@ impl WeakReader {
             self.op_stats.clone(),
         )))
     }
+
+    /// This handle over `manifest`, another snapshot of the same table.
+    pub(crate) fn over(&self, manifest: Arc<ManifestSnapshot>) -> Self {
+        Self {
+            manifest,
+            ..self.clone()
+        }
+    }
 }
 
 impl SupertableReader {
