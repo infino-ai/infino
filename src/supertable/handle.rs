@@ -9199,6 +9199,7 @@ mod tests {
         let cache = MetadataDiskCache::new(
             cache_dir.join("manifest-parts"),
             VECTOR_STATE_TEST_CACHE_BUDGET_BYTES,
+            None,
         )
         .expect("metadata cache");
         SupertableOptions::new(

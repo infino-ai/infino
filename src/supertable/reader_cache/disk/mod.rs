@@ -404,6 +404,8 @@ pub struct CacheStats {
     pub n_gc_drops: u64,
     /// Bytes of `current_bytes` charged for the table's temp files beside the cache.
     pub scratch_bytes: u64,
+    /// Bytes charged for the table's metadata caches beside the cache.
+    pub metadata_bytes: u64,
 }
 
 /// A cache file found on disk at open but not opened yet. Its bytes already count against the budget.
@@ -458,6 +460,9 @@ pub struct DiskCacheStore {
     /// One-shot latch so an explicit budget smaller than the table
     /// footprint warns once, not on every reconcile.
     budget_warned: AtomicBool,
+    /// Bytes charged to the budget for the table's metadata caches beside the cache (see
+    /// [`Self::charge_metadata`]). Counted in `current_bytes`.
+    metadata_bytes: AtomicU64,
     /// Bytes charged to the budget for the table's temp files beside the cache (see
     /// [`ScratchCharge`]), parked ones included. Counted in `current_bytes`.
     scratch_bytes: AtomicU64,
@@ -606,6 +611,7 @@ impl DiskCacheStore {
             budget_bytes: AtomicU64::new(configured_budget),
             lazy_entry_cap: AtomicUsize::new(default_superfiles_in_flight()),
             budget_warned: AtomicBool::new(false),
+            metadata_bytes: AtomicU64::new(0),
             scratch_bytes: AtomicU64::new(0),
             parked_scratch: DashMap::new(),
             n_cold_fetches: AtomicU64::new(0),
@@ -695,6 +701,7 @@ impl DiskCacheStore {
             n_madvise_calls: self.n_madvise_calls.load(Ordering::Acquire),
             n_gc_drops: self.n_gc_drops.load(Ordering::Acquire),
             scratch_bytes: self.scratch_bytes.load(Ordering::Acquire),
+            metadata_bytes: self.metadata_bytes.load(Ordering::Acquire),
         }
     }
 

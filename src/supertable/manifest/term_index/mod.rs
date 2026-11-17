@@ -6770,7 +6770,8 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().expect("runtime");
         let (_, root) = live_and_covered(&st, &storage, &rt);
         let cache_dir = TempDir::new().expect("cache dir");
-        let cache = MetadataDiskCache::new(cache_dir.path().to_path_buf(), 1 << 30).expect("cache");
+        let cache =
+            MetadataDiskCache::new(cache_dir.path().to_path_buf(), 1 << 30, None).expect("cache");
         let warm = TermIndex::new(
             root.clone(),
             String::new(),

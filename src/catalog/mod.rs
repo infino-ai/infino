@@ -2140,6 +2140,7 @@ fn build_disk_cache(
     let manifest_cache = MetadataDiskCache::new(
         table_root.join(MANIFEST_CACHE_SUBDIR),
         MANIFEST_CACHE_BUDGET_BYTES,
+        Some(Arc::clone(&cache)),
     )
     .map_err(|e| InfinoError::Io(e.to_string()))?;
     Ok(Some((cache, manifest_cache)))
