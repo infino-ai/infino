@@ -7115,7 +7115,7 @@ async fn recorded_drain_starts_over(
         })
         .await
         .map_err(|error| BuildError::Store(format!("drain scratch size: {error}")))?;
-        let space = scratch_space(&drain_scratch_parent(options));
+        let space = disk_space(&drain_scratch_parent(options));
         spilled_drain_row_limit(options, column, space, on_disk)
     } else {
         drain_row_limit_now(options, column)
