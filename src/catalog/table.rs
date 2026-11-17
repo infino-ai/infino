@@ -524,18 +524,38 @@ impl Supertable {
         self.inner.sorted_search(column, descending, k, projection)
     }
 
-    /// The first `k` rows `filter` keeps by a range-indexed column (`column`,
-    /// or with `None` the one column `filter` names), read from its range
-    /// index without planning a statement: the filter's comparisons on the
-    /// column pick the stretch of the index to read, and its other
-    /// conditions are checked on the rows read, a window at a time. `None`,
-    /// for the caller to plan the statement, when the column has no range
-    /// index, when the other conditions need a statement to evaluate, or
-    /// when they keep too few of the rows read to fill the page within a
-    /// few thousand. When the superfiles' exact value tables show that no row
-    /// holds a value the filter requires, the page is empty without a row
-    /// read. Ties come in `_id` order. A hosted table always answers
-    /// `None`. `projection` follows [`Supertable::sorted_search`]'s rules.
+    /// The first `k` rows `filter` keeps, ordered by a range-indexed column
+    /// (`column`, or with `None` the one column `filter` names), ascending or
+    /// (with `descending`) descending, rows sharing a value in `_id` order and
+    /// rows without a value last: what `SELECT … WHERE filter ORDER BY column
+    /// [DESC] NULLS LAST, _id ASC LIMIT k` answers, read from the column's
+    /// range index without planning a statement. A caller that plans the
+    /// statement instead writes `NULLS LAST` too: SQL puts nulls first in a
+    /// descending sort unless told otherwise, and would return other rows.
+    ///
+    /// The filter's comparisons and `BETWEEN`s on the column against
+    /// literals, `AND`ed, pick the interval of the index to read; a row
+    /// without a value is in no interval, so fewer than `k` rows come back
+    /// when fewer are in it. Its other conditions, `AND`ed to those, are
+    /// checked on the rows the index gives, a window at a time, each window
+    /// starting where the last one ended, until `k` pass. When the
+    /// superfiles' exact value tables show that no row holds a value the
+    /// conditions require (an equality or `IN` on a column they count), the
+    /// page is empty without a row read.
+    ///
+    /// `None`, for the caller to plan the statement:
+    /// - the column has no range index, or a superfile lacks it or keeps
+    ///   its ties out of `_id` order;
+    /// - no column is named and the filter names several;
+    /// - the other conditions need a statement to evaluate (a subquery, say);
+    /// - they keep too few of the rows read in order to find `k` within a few
+    ///   thousand;
+    /// - with no condition bounding the column, the rows with a value run out
+    ///   before `k` pass, since the rows without one sort after them unread.
+    ///
+    /// A hosted table always answers `None`. An error when the rows a window
+    /// checks do not fit the connection's memory budget. `projection` follows
+    /// [`Supertable::sorted_search`]'s rules.
     pub fn sorted_search_where(
         &self,
         column: Option<&str>,

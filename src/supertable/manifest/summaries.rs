@@ -61,16 +61,16 @@ use std::{
 
 use arrow::{
     buffer::{NullBuffer, OffsetBuffer},
-    compute::concat,
+    compute::{concat, kernels::cmp::eq},
     ipc::{reader::StreamReader, writer::StreamWriter},
 };
 use arrow_array::{
-    Array, ArrayRef, BinaryArray, ListArray, RecordBatch, StructArray, UInt32Array, UInt64Array,
-    new_null_array,
+    Array, ArrayRef, BinaryArray, ListArray, RecordBatch, Scalar, StructArray, UInt32Array,
+    UInt64Array, new_null_array,
 };
 use arrow_schema::{DataType, Field, Fields, Schema};
 use bytes::Bytes;
-use datafusion::scalar::ScalarValue;
+use datafusion::{logical_expr::type_coercion::binary::comparison_coercion, scalar::ScalarValue};
 use thiserror::Error;
 use tracing::warn;
 use uuid::Uuid;
@@ -311,6 +311,74 @@ pub(crate) enum ValueTable<'a> {
     Stored(StructArray),
 }
 
+/// [`ColumnStats::literal_count`] over a decoded table's `entries`, sorted
+/// by value, so each literal is a binary search.
+fn literal_counts(
+    entries: &[(ScalarValue, u64)],
+    literals: &[ScalarValue],
+    column_type: &DataType,
+) -> Option<u64> {
+    let Some((first, _)) = entries.first() else {
+        return Some(0);
+    };
+    if first.data_type() != *column_type {
+        return None;
+    }
+    let mut held = 0u64;
+    for literal in literals {
+        if comparison_coercion(column_type, &literal.data_type()).as_ref() != Some(column_type) {
+            return None;
+        }
+        let literal = literal.cast_to(column_type).ok()?;
+        // Values that do not order map to `Equal`, so they land on the
+        // equality check below rather than on a miss.
+        match entries.binary_search_by(|(value, _)| {
+            value
+                .partial_cmp(&literal)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }) {
+            Ok(at) if entries[at].0 == literal => {
+                held = held.saturating_add(entries[at].1);
+            }
+            Ok(_) => return None,
+            Err(_) => {}
+        }
+    }
+    Some(held)
+}
+
+/// [`ColumnStats::literal_count`] over a section's table (its values and
+/// their counts as arrays), each literal compared with the values by the
+/// compare kernel, without building the table.
+fn stored_literal_counts(
+    table: &StructArray,
+    literals: &[ScalarValue],
+    column_type: &DataType,
+) -> Option<u64> {
+    let values = table.column(0);
+    let counts = table.column(1).as_any().downcast_ref::<UInt64Array>()?;
+    if values.is_empty() {
+        return Some(0);
+    }
+    if values.data_type() != column_type {
+        return None;
+    }
+    let mut held = 0u64;
+    for literal in literals {
+        if comparison_coercion(column_type, &literal.data_type()).as_ref() != Some(column_type) {
+            return None;
+        }
+        let literal = literal.cast_to(column_type).ok()?.to_array().ok()?;
+        let found = eq(values, &Scalar::new(literal)).ok()?;
+        for (hit, count) in found.iter().zip(counts.values()) {
+            if hit == Some(true) {
+                held = held.saturating_add(*count);
+            }
+        }
+    }
+    Some(held)
+}
+
 /// One column's statistics for one superfile, wherever they live, read
 /// one statistic at a time. Decoded statistics are borrowed; a section's
 /// are read from the decoded group's arrays. Only [`Self::value_counts`]
@@ -458,6 +526,29 @@ impl ColumnStats<'_> {
                 (table.column(0).null_count() == 0 && counts.null_count() == 0)
                     .then_some(ValueTable::Stored(table))
             }
+        }
+    }
+
+    /// The rows the exact value table counts for `literals` together, each
+    /// literal compared with the column as a statement compares them, read
+    /// from the table as the superfile keeps it ([`Self::value_table`]).
+    /// `None` when the superfile carries no table, when a statement would
+    /// cast the column (`column_type`) to compare it with a literal, as a
+    /// string column against a number is, when the table's values are not
+    /// of `column_type`, or when a literal does not take it.
+    pub(crate) fn literal_count(
+        &self,
+        literals: &[ScalarValue],
+        column_type: &DataType,
+    ) -> Option<u64> {
+        match self.value_table()? {
+            ValueTable::Built(table) => literal_counts(table.entries(), literals, column_type),
+            // A float compares as `ScalarValue` compares it, so a float table
+            // is built to be searched.
+            ValueTable::Stored(_) if column_type.is_floating() => {
+                literal_counts(self.value_counts()?.entries(), literals, column_type)
+            }
+            ValueTable::Stored(table) => stored_literal_counts(&table, literals, column_type),
         }
     }
 

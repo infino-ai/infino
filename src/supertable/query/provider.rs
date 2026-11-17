@@ -1771,7 +1771,10 @@ fn id_min_max(entries: &[Arc<SuperfileEntry>]) -> Option<(ScalarValue, ScalarVal
 /// what the folds below share, so a column costs one read per superfile
 /// however many statistics the planner asks for. `None` where a
 /// superfile carries nothing for the column.
-fn read_column(entries: &[Arc<SuperfileEntry>], column: FieldId) -> Vec<Option<ColumnStats<'_>>> {
+pub(crate) fn read_column(
+    entries: &[Arc<SuperfileEntry>],
+    column: FieldId,
+) -> Vec<Option<ColumnStats<'_>>> {
     entries
         .iter()
         .map(|entry| entry.scalar_stats.column(column))
@@ -1807,7 +1810,7 @@ fn scalar_sum(reads: &[Option<ColumnStats<'_>>]) -> Option<ScalarValue> {
 /// Sketch unions are exact, so the merged estimate has single-sketch
 /// accuracy. A column null throughout every superfile has no distinct
 /// value: zero, not unknown.
-fn scalar_distinct(reads: &[Option<ColumnStats<'_>>]) -> Option<usize> {
+pub(crate) fn scalar_distinct(reads: &[Option<ColumnStats<'_>>]) -> Option<usize> {
     let mut merged: Option<HllSketch> = None;
     let mut null_throughout = false;
     for stats in reads {
