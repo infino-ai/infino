@@ -4,7 +4,9 @@
 //! takes their rows from kept decoded columns, as a scan the index narrows
 //! nowhere does, and answers the same: on the run that decodes the columns
 //! and on the runs that read them kept, deleted rows left out, metering the
-//! rows it hands on and decoding none of its row groups again. Its own
+//! rows it hands on and decoding none of its row groups again. The narrowed
+//! superfile's few rows are read from its pages the first time, keeping
+//! nothing, and its row group is decoded and kept on its second read. Its own
 //! binary, because the host configuration (and with it the process's
 //! decoded-column cache) is read once per process.
 #![deny(clippy::unwrap_used)]
@@ -47,8 +49,9 @@ const DELETED_REMAINDER: i64 = 3;
 const SELECT_X: &str = "SELECT seq FROM t WHERE k = 'x' ORDER BY seq";
 
 /// A statement over the same rows that reads `k` alone: run first, it
-/// decodes and keeps `k` of both row groups, and leaves `seq` to
-/// [`SELECT_X`]'s first run.
+/// decodes and keeps `k` of the row group read whole, reads the narrowed
+/// one's selected rows from its pages, and leaves `seq` to [`SELECT_X`]'s
+/// first run.
 const SELECT_K: &str = "SELECT k FROM t WHERE k = 'x'";
 
 /// Where an analyzed plan names the filter, and how it counts the rows it
@@ -67,6 +70,10 @@ const READS_ONE_ROW_GROUP: &str = "CachedScanExec: row_groups=1,";
 /// How an analyzed plan counts the row groups the scan of kept decoded
 /// columns decoded, because the cache lacked one of their columns.
 const ROW_GROUPS_DECODED: &str = "row_groups_decoded=";
+
+/// How an analyzed plan counts the row groups whose selected rows the scan
+/// read from their pages, keeping nothing.
+const ROW_GROUPS_READ_IN_PART: &str = "row_groups_read_in_part=";
 
 /// Rows a count DataFusion prints with a `K` suffix may be off by: it keeps
 /// two decimals of thousands.
@@ -121,12 +128,12 @@ fn filter_input_rows(plan: &str) -> f64 {
     number.parse::<f64>().expect("a row count") * scale
 }
 
-/// The row groups the scan of an analyzed plan decoded.
-fn row_groups_decoded(plan: &str) -> usize {
+/// The row groups an analyzed plan's scan counts under `metric`.
+fn row_groups(plan: &str, metric: &str) -> usize {
     let at = plan
-        .find(ROW_GROUPS_DECODED)
-        .unwrap_or_else(|| panic!("the scan counts its decodes: {plan}"))
-        + ROW_GROUPS_DECODED.len();
+        .find(metric)
+        .unwrap_or_else(|| panic!("the scan counts {metric}: {plan}"))
+        + metric.len();
     let count = &plan[at..];
     let end = count
         .find(|c: char| !c.is_ascii_digit())
@@ -220,9 +227,11 @@ fn a_scan_the_index_narrows_in_some_superfiles_reads_kept_decoded_columns() {
 
     let plan = explain(&conn, "EXPLAIN", SELECT_X);
     assert!(plan.contains(READS_BOTH_ROW_GROUPS), "{plan}");
-    // A column the cache lacks is decoded, in the narrowed row group too.
+    // A column the cache lacks is decoded in the row group read whole; the
+    // narrowed one's selected rows are read from its pages, keeping nothing.
     let cold = explain(&conn, "EXPLAIN ANALYZE", SELECT_K);
-    assert_eq!(row_groups_decoded(&cold), 2, "{cold}");
+    assert_eq!(row_groups(&cold, ROW_GROUPS_DECODED), 1, "{cold}");
+    assert_eq!(row_groups(&cold, ROW_GROUPS_READ_IN_PART), 1, "{cold}");
     // Every row the scan hands the filter is metered as materialized, on
     // the run that decodes `seq` and on the ones that read it kept.
     for run in ["decoding", "from kept columns", "from kept columns again"] {
@@ -232,10 +241,16 @@ fn a_scan_the_index_narrows_in_some_superfiles_reads_kept_decoded_columns() {
         assert_eq!(stats.rows_materialized, expected_scanned() as u64, "{run}");
     }
     // Only the selected rows of the narrowed superfile reach the filter;
-    // reading it whole too would hand over every live row of both. Every
-    // column is kept by now, so neither row group is decoded again.
+    // reading it whole too would hand over every live row of both. The
+    // narrowed row group was decoded and kept on its second read, so every
+    // column is kept by now and neither row group is read again.
     let analyzed = explain(&conn, "EXPLAIN ANALYZE", SELECT_X);
-    assert_eq!(row_groups_decoded(&analyzed), 0, "{analyzed}");
+    assert_eq!(row_groups(&analyzed, ROW_GROUPS_DECODED), 0, "{analyzed}");
+    assert_eq!(
+        row_groups(&analyzed, ROW_GROUPS_READ_IN_PART),
+        0,
+        "{analyzed}"
+    );
     let handed = filter_input_rows(&analyzed);
     assert!(
         (handed - expected_scanned() as f64).abs() <= PRINTED_THOUSANDS_ROUNDING,

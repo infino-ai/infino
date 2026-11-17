@@ -3009,8 +3009,11 @@ impl TableProvider for SupertableProvider {
         // - a scan the index narrowed in some superfiles only: the others are
         //   read whole, which kept columns serve, and the Parquet scan the
         //   narrowed ones would keep it on would decode every superfile again
-        //   on every statement. The narrowed ones hand over their rows from
-        //   the same kept columns.
+        //   on every statement. A narrowed row group hands over its rows from
+        //   kept columns when they are kept, and otherwise reads just those
+        //   rows from its pages without keeping them, as the Parquet scan
+        //   would, unless the scan uses most of it or read it before
+        //   (`CachedScanExec`).
         let output = projected_schema(&self.schema, projection)?;
         let narrowed = superfiles
             .iter()
@@ -3032,7 +3035,8 @@ impl TableProvider for SupertableProvider {
                         row_counts: Arc::clone(&seg.prepared.shape.row_counts),
                         tombstones: Arc::clone(&seg.tombstones),
                         // The live candidates only: a row group holding
-                        // none of them reads nothing.
+                        // none of them reads nothing, and the scan checks
+                        // them against no tombstone again.
                         selected: selects_rows
                             .then(|| {
                                 seg.candidates
