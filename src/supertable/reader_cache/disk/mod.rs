@@ -1029,6 +1029,15 @@ pub(crate) mod test_support {
     /// and no inode.
     pub(crate) const OLDER_BUILD_BLOCK_BYTES: [u64; 2] = [CACHE_BLOCK_BYTES, 512 * 1024];
 
+    /// Entries `store` holds lazily read, not mapped whole: the ones the metadata budget counts.
+    pub(crate) fn lazy_entries(store: &DiskCacheStore) -> usize {
+        store
+            .cached
+            .iter()
+            .filter(|entry| entry.value().mmap().is_none())
+            .count()
+    }
+
     /// How long [`wait_until`] waits before it fails.
     pub(crate) const WAIT_UNTIL_DEADLINE: Duration = Duration::from_secs(10);
 
