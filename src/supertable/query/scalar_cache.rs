@@ -141,6 +141,12 @@ impl<K: Eq + Hash, V: Clone> ByteLru<K, V> {
         state.bytes = 0;
     }
 
+    /// The bytes the kept values hold together.
+    #[cfg(test)]
+    pub(crate) fn bytes(&self) -> usize {
+        self.state.lock().expect("decoded cache poisoned").bytes
+    }
+
     /// How many values are kept.
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {

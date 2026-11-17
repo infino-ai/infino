@@ -8716,12 +8716,16 @@ mod tests {
         let budget = Arc::clone(&conn.inner.connection_memory_budget);
         let cancel = QueryCancel::new();
 
+        // The statement's parsed plan, kept by the connection, holds bytes
+        // of the budget too; the query's own memory is what is past them.
+        let kept = || conn.inner.statement_plans.bytes();
+
         let running = query_in_background(&conn, SORT_EVERY_FILE, &cancel);
         wait_until("execution reads data and holds sort memory", || {
-            stores.reads_of(SUPERFILE) > 0 && budget.used() > 0
+            stores.reads_of(SUPERFILE) > 0 && budget.used() > kept()
         });
         cancel_and_expect_cancelled(&cancel, &running);
-        wait_until("the sort memory comes back", || budget.used() == 0);
+        wait_until("the sort memory comes back", || budget.used() == kept());
         assert_cache_ledger_settles(&conn, &stores);
     }
 

@@ -377,6 +377,12 @@ impl StatementPlans {
         self.plans.len()
     }
 
+    /// The bytes the kept statements hold against the budget.
+    #[cfg(test)]
+    pub(crate) fn bytes(&self) -> usize {
+        self.plans.bytes()
+    }
+
     /// `plan`, a kept one, scanning the tables registered in `ctx` in place of
     /// its placeholders, or `None` when a table is missing from `ctx` or its
     /// schema is no longer the one the plan was parsed against: the
