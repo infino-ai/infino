@@ -598,6 +598,77 @@ mod tests {
         assert_eq!((rows, sorted, spills), (ROWS, true, 0));
     }
 
+    /// A connection's queries share one spill limit: what one query has
+    /// spilled counts against the next, which fails alone with the
+    /// resources error, and runs once the first has let its spill go.
+    #[test]
+    fn a_connections_queries_share_the_spill_limit() {
+        const ROWS: usize = 512 * 1024;
+        const RESERVATION: usize = 20 * 1024 * 1024;
+        const TIGHT_BUDGET_BYTES: u64 = 32 * 1024 * 1024;
+        /// More than the sort spills.
+        const SPILL_LIMIT_BYTES: u64 = 256 * 1024 * 1024;
+        let cache = tempfile::tempdir().expect("cache folder");
+        let (schema, batches) = descending_key_batches(ROWS);
+        let runtime = Runtime::new().expect("tokio runtime");
+        let spill = SqlSpill::under_with_limit(cache.path(), SPILL_LIMIT_BYTES);
+        let sort = || {
+            runtime.block_on(sort_through(
+                &schema,
+                &batches,
+                TIGHT_BUDGET_BYTES,
+                RESERVATION,
+                Some(&spill),
+            ))
+        };
+
+        // What another query of the connection holds on disk mid-sort.
+        let disk_manager = spill.disk_manager().expect("spill folder");
+        let mut held = disk_manager
+            .create_tmp_file("another query's spill")
+            .expect("spill file");
+        std::fs::write(held.path(), vec![0u8; SPILL_LIMIT_BYTES as usize]).expect("fill");
+        held.update_disk_usage().expect("count the spill");
+
+        let error = sort().expect_err("the limit is already spilled");
+        assert!(
+            matches!(error.find_root(), DataFusionError::ResourcesExhausted(_)),
+            "{error}"
+        );
+        drop(held);
+        let (rows, sorted, spills) = sort().expect("room once the other spill is gone");
+        assert_eq!((rows, sorted), (ROWS, true));
+        assert!(spills > 0);
+    }
+
+    /// A connection whose spill folder cannot be made still runs its SQL:
+    /// its queries spill to the OS temp directory, as without a disk cache.
+    #[test]
+    fn sql_still_spills_when_its_folder_cannot_be_made() {
+        const ROWS: usize = 512 * 1024;
+        const RESERVATION: usize = 20 * 1024 * 1024;
+        const TIGHT_BUDGET_BYTES: u64 = 32 * 1024 * 1024;
+        let cache = tempfile::tempdir().expect("cache folder");
+        // A file where the folder would go.
+        std::fs::write(cache.path().join(SQL_SPILL_SUBDIR), b"").expect("blocking file");
+        let (schema, batches) = descending_key_batches(ROWS);
+        let spill = SqlSpill::under(cache.path());
+        assert!(spill.disk_manager().is_none());
+
+        let (rows, sorted, spills) = Runtime::new()
+            .expect("tokio runtime")
+            .block_on(sort_through(
+                &schema,
+                &batches,
+                TIGHT_BUDGET_BYTES,
+                RESERVATION,
+                Some(&spill),
+            ))
+            .expect("the sort spills elsewhere");
+        assert_eq!((rows, sorted), (ROWS, true));
+        assert!(spills > 0);
+    }
+
     #[test]
     fn bounded_pool_spills_a_large_sort_and_returns_correct_results() {
         // Spill, don't refuse. 32 MiB of data through an 8.8 MiB buffer can only

@@ -90,9 +90,7 @@ impl DiskCacheStore {
         // A build's sealed file is linked in below and counted as the
         // cache's from here, so what the build charged for it goes back
         // first: the file is never counted twice.
-        if temp_file_behind(&bytes).is_some() {
-            give_back_temp_file_charge(&bytes);
-        }
+        let was_charged = temp_file_behind(&bytes).is_some() && give_back_temp_file_charge(&bytes);
 
         // Reserve budget (CAS-loop with eviction on miss).
         // Use `reserve_manual` so a panic between this and
@@ -100,7 +98,18 @@ impl DiskCacheStore {
         // unwind — `reserve_manual` keeps the bytes
         // reserved; we manually roll back on the rare error
         // path below.
-        self.reserve_manual(size).await?;
+        if let Err(error) = self.reserve_manual(size).await {
+            // The cache did not take the file over, so it is its build's
+            // again and is charged as before, where the temp files' share
+            // still has the room.
+            if was_charged {
+                let mut charge = self.scratch_charge();
+                if charge.adopt(size) {
+                    restore_temp_file_charge(&bytes, charge);
+                }
+            }
+            return Err(error);
+        }
 
         // Roll back the reservation on any error past this
         // point. Wrap the rest in a closure-shape so `?`

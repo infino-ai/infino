@@ -174,14 +174,27 @@ fn sealed_file_of(bytes: &Bytes) -> Option<(SealedName, SealedCharge)> {
 }
 
 /// Give back what the temp file behind `bytes` is charged on its table's
-/// disk budget. A disk cache calls this as it takes the file over and
-/// charges it as its own, so the file is never counted twice. A no-op for
-/// any other bytes.
-pub(crate) fn give_back_temp_file_charge(bytes: &Bytes) {
-    if let Some((_, charge)) = sealed_file_of(bytes)
-        && let Ok(mut charge) = charge.lock()
+/// disk budget, and say whether it was charged. A disk cache calls this as
+/// it takes the file over and charges it as its own, so the file is never
+/// counted twice. A no-op for any other bytes.
+pub(crate) fn give_back_temp_file_charge(bytes: &Bytes) -> bool {
+    let Some((_, charge)) = sealed_file_of(bytes) else {
+        return false;
+    };
+    let Ok(mut charge) = charge.lock() else {
+        return false;
+    };
+    charge.take().is_some()
+}
+
+/// Charge the temp file behind `bytes` to `charge` again, for a disk cache
+/// that gave the charge back and then could not take the file over: the file
+/// is still on disk and still its build's. A no-op for any other bytes.
+pub(crate) fn restore_temp_file_charge(bytes: &Bytes, charge: ScratchCharge) {
+    if let Some((_, slot)) = sealed_file_of(bytes)
+        && let Ok(mut slot) = slot.lock()
     {
-        drop(charge.take());
+        *slot = Some(charge);
     }
 }
 

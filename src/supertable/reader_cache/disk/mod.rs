@@ -533,7 +533,7 @@ pub(crate) use heap::{CachedSessions, HeapReservation};
 pub(crate) use scratch::RunScratch;
 pub(crate) use sources::{
     ArcMmapOwner, give_back_temp_file_charge, mmap_charged_temp_file_bytes, mmap_readonly_bytes,
-    mmap_temp_file_bytes, release_temp_file, temp_file_behind,
+    mmap_temp_file_bytes, release_temp_file, restore_temp_file_charge, temp_file_behind,
 };
 
 impl DiskCacheStore {
