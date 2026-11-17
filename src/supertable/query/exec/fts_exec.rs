@@ -77,9 +77,9 @@ use crate::{
             SuperfileHit,
             candidate::CandidateScope,
             exec::common::{
-                Arity, PushedPredicate, arg_to_string, arg_to_usize, candidate_plan_for_filters,
-                exact_scope, fill_ceiling, fill_top_k_within, live_reader,
-                output_schema_with_score, scope_to_call, top_k_statistics, traced_tvf,
+                Arity, PushedPredicate, RowCheck, arg_to_string, arg_to_usize,
+                candidate_plan_for_filters, exact_scope, fill_ceiling, fill_top_k_within,
+                live_reader, output_schema_with_score, scope_to_call, top_k_statistics, traced_tvf,
                 widening_ended_short,
             },
         },
@@ -440,11 +440,18 @@ impl ExecutionPlan for Bm25Exec {
                 Bm25Query::Terms { .. } | Bm25Query::Prefix { .. } => None,
             };
             let predicate = PushedPredicate::compile(&filters, &output_schema);
+            // The predicate as a row check, which the level heads apply to
+            // their best candidates so their threshold is over admitted rows.
+            let check = match &predicate {
+                Some(predicate) => RowCheck::new(&reader, predicate, &output_schema)?.map(Arc::new),
+                None => None,
+            };
             let call = RankedCall {
                 reader: &reader,
                 column: &column,
                 query: &query,
                 k,
+                check,
                 predicate: predicate.as_ref(),
                 scalar_schema: &scalar_schema,
                 output_schema: &output_schema,
@@ -506,6 +513,8 @@ struct RankedCall<'a> {
     column: &'a str,
     query: &'a Bm25Query,
     k: usize,
+    /// The predicate as a row check, when its columns are stored.
+    check: Option<Arc<RowCheck>>,
     predicate: Option<&'a PushedPredicate>,
     scalar_schema: &'a SchemaRef,
     output_schema: &'a SchemaRef,
@@ -529,6 +538,7 @@ impl RankedCall<'_> {
                         want,
                         Bm25SearchOptions::new().with_mode(*mode),
                         scope,
+                        self.check.clone(),
                     )
                     .await
             }

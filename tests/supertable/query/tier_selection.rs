@@ -1078,3 +1078,72 @@ fn probes_settle_candidates_the_heads_leave_open() {
         }
     }
 }
+
+/// A phrase of two common words whose occurrences sit in a few late
+/// documents of each superfile: the heads bound the rest, the candidates'
+/// occurrences are probed from the members' covering blocks and position
+/// groups, and the answer is the ceiling path's with no superfile opened.
+#[test]
+fn phrase_probes_settle_a_phrase_of_common_words() {
+    /// Superfiles, one commit each.
+    const PHRASE_SUPERFILES: usize = 3;
+    /// Documents per superfile: past the whole-list size.
+    const PHRASE_DOCS: usize = 5_000;
+    /// The documents, late in each superfile, holding the phrase.
+    const HOT: std::ops::Range<usize> = 4_500..4_520;
+    let build = |dir: &TempDir, heads: bool| {
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let mut fts = FtsConfig::new("body");
+        fts.positions = true;
+        let mut options = SupertableOptions::new(schema(), vec![fts], vec![])
+            .expect("options")
+            .with_storage(storage)
+            .with_bound_ordered_open_window(1);
+        if !heads {
+            options = options.with_term_tier_entries_per_term(0);
+        }
+        let st = Supertable::create(options).expect("create");
+        for s in 0..PHRASE_SUPERFILES {
+            let docs: Vec<String> = (0..PHRASE_DOCS)
+                .map(|i| match HOT.contains(&i) {
+                    // The phrase once or more, tied nowhere across superfiles.
+                    true => {
+                        let mut words = Vec::new();
+                        for _ in 0..(1 + (i - HOT.start + s) % 4) {
+                            words.extend(["alpha", "beta"]);
+                        }
+                        words.resize(40, "filler");
+                        words.join(" ")
+                    }
+                    // Both words, never adjacent in order.
+                    false => {
+                        let mut words = vec!["beta", "filler", "alpha"];
+                        words.resize(40, "filler");
+                        words.join(" ")
+                    }
+                })
+                .collect();
+            let col: ArrayRef = Arc::new(LargeStringArray::from(
+                docs.iter().map(String::as_str).collect::<Vec<_>>(),
+            ));
+            let mut w = st.writer().expect("writer");
+            w.append(&RecordBatch::try_new(schema(), vec![col]).expect("batch"))
+                .expect("append");
+            w.commit().expect("commit");
+        }
+        st
+    };
+    let (with_dir, without_dir) = (
+        TempDir::new().expect("tempdir"),
+        TempDir::new().expect("tempdir"),
+    );
+    let (with, without) = (build(&with_dir, true), build(&without_dir, false));
+    for k in [1usize, 10] {
+        let (a, stats, _) = run(&with, "\"alpha beta\"", BoolMode::Or, k);
+        let (b, _, _) = run(&without, "\"alpha beta\"", BoolMode::Or, k);
+        assert!(!a.is_empty(), "k={k}: the phrase matches");
+        assert_eq!(a, b, "k={k}: the probed answer is the ceilings'");
+        assert_eq!(opened(&stats), 0, "k={k}: phrase probes settle it unopened");
+    }
+}

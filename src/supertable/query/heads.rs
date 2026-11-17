@@ -50,6 +50,7 @@ use roaring::RoaringBitmap;
 
 use super::{
     dispatch,
+    exec::common::RowCheck,
     fts::{baked_avgdl, competitive_floor},
     tier::{
         BOUND_SLACK, EXACT_SUM_TERMS, MAX_TIER_TERMS, SuperfileBounds, TermMask, TierQuery,
@@ -156,11 +157,16 @@ struct Candidate {
     tf: Vec<u32>,
     /// Per bare term, its contribution once known; zero otherwise.
     contrib: Vec<f32>,
+    /// Per phrase, its contribution once a probe has read it.
+    phrases: Vec<Option<f32>>,
+    /// Whether the query's row predicate was checked on the document's row
+    /// and admits it; a document it rejects leaves the candidates.
+    admitted: bool,
 }
 
 impl Candidate {
     fn sum(&self) -> f32 {
-        self.contrib.iter().sum()
+        self.contrib.iter().sum::<f32>() + self.phrases.iter().flatten().sum::<f32>()
     }
 }
 
@@ -184,6 +190,8 @@ struct Slot {
 /// carry it.
 struct Phrase {
     members: Vec<usize>,
+    /// Each member's offset from the first.
+    offsets: Vec<u32>,
     idf: f32,
     required: bool,
 }
@@ -199,6 +207,9 @@ struct Weights {
     /// must-phrase.
     required: TermMask,
     phrases: Vec<Phrase>,
+    /// Whether the query has a row predicate: only a candidate it was
+    /// checked to admit is known to match.
+    filtered: bool,
 }
 
 impl Weights {
@@ -210,12 +221,18 @@ impl Weights {
 
     /// Whether a candidate is known to match, so its known sum is a lower
     /// bound on a match's score: it carries every required term and a bare
-    /// term at least, and the query requires no phrase, whose presence only
-    /// positions can show.
+    /// term or a phrase at least, and every required phrase a probe has
+    /// found in it.
     fn counts(&self, c: &Candidate) -> bool {
-        c.known & self.required == self.required
-            && c.known & self.scoring != 0
-            && self.phrases.iter().all(|p| !p.required)
+        let found = |v: &Option<f32>| matches!(v, Some(v) if *v > 0.0);
+        (!self.filtered || c.admitted)
+            && c.known & self.required == self.required
+            && (c.known & self.scoring != 0 || c.phrases.iter().any(found))
+            && self
+                .phrases
+                .iter()
+                .zip(&c.phrases)
+                .all(|(p, v)| !p.required || found(v))
     }
 }
 
@@ -261,9 +278,11 @@ pub(crate) async fn select(
     let phrases = query
         .phrases
         .iter()
-        .map(|(members, required)| Phrase {
+        .zip(&query.phrase_offsets)
+        .map(|((members, required), offsets)| Phrase {
             idf: members.iter().map(|&m| idf[m]).sum(),
             members: members.clone(),
+            offsets: offsets.clone(),
             required: *required,
         })
         .collect();
@@ -273,6 +292,7 @@ pub(crate) async fn select(
         scoring: query.scoring,
         required: query.required,
         phrases,
+        filtered: query.check.is_some(),
     };
     let slot_of: HashMap<_, usize> = kept
         .iter()
@@ -361,9 +381,10 @@ pub(crate) async fn select(
         }
     }
     let k = query.k;
-    // Scores are the kernel's bit for bit up to two bare terms; a phrase's
-    // takes positions the heads do not hold.
-    let exact_scores = nt <= EXACT_SUM_TERMS && weights.phrases.is_empty();
+    // Scores are the kernel's bit for bit up to two scored parts, bare
+    // terms and phrases, a phrase's once a probe has read its positions.
+    let exact_scores =
+        weights.scoring.count_ones() as usize + weights.phrases.len() <= EXACT_SUM_TERMS;
     // Past two terms a candidate's sum may round differently from the
     // kernel's, which adds in its own order.
     let lb_slack = match exact_scores {
@@ -445,10 +466,26 @@ pub(crate) async fn select(
     // covering posting blocks only; their exact scores raise the threshold,
     // under which the heads bound the unseen documents, and a superfile so
     // settled is answered or ruled out without an open.
-    if theta.is_finite() && !query.rows_scoped && weights.phrases.is_empty() {
+    if let Some(check) = &query.check {
+        check_candidates(
+            manifest,
+            kept,
+            &slots,
+            &heads,
+            &weights,
+            &mut candidates,
+            check,
+            theta,
+        )
+        .await?;
+        theta = kth_lower_bound(&candidates, &slots, &weights, k, lb_slack);
+        bounds = slot_bounds(&slots, &heads, &candidates, &weights, lb_slack);
+    }
+    if !query.rows_scoped || query.check.is_some() {
         let plan = probe_plan(&slots, &heads, &candidates, &weights, &postings, theta);
         if !plan.is_empty() {
-            let reads = plan.iter().map(|(&s, terms)| {
+            let weights = &weights;
+            let reads = plan.into_iter().map(|(s, probes)| {
                 let entry = &kept[s];
                 async move {
                     let reader = open_reader_of(manifest, entry).await?;
@@ -457,43 +494,67 @@ pub(crate) async fn select(
                             "a superfile the heads name has no full-text index".into(),
                         ))
                     })?;
-                    let mut out = Vec::with_capacity(terms.len());
-                    for (t, entry, df, docs) in terms {
-                        let tfs = fts
-                            .probe_tfs(column, *entry, *df, docs)
-                            .await
-                            .map_err(|e| TermIndexError::Open(QueryError::from(e)))?;
-                        out.push((*t, docs.clone(), tfs));
+                    let mut out = Vec::with_capacity(probes.len());
+                    for (kind, members, docs) in probes {
+                        let read = match kind {
+                            ProbeKind::Term(_) => {
+                                let (entry, df) = members[0];
+                                fts.probe_tfs(column, entry, df, &docs).await
+                            }
+                            ProbeKind::Phrase(ph) => {
+                                fts.probe_phrase_tfs(
+                                    column,
+                                    &members,
+                                    &weights.phrases[ph].offsets,
+                                    &docs,
+                                )
+                                .await
+                            }
+                        };
+                        let tfs = read.map_err(|e| TermIndexError::Open(QueryError::from(e)))?;
+                        out.push((kind, docs, tfs));
                     }
                     Ok::<_, TermIndexError>((s, out))
                 }
             });
             for (s, probed) in try_join_all(reads).await? {
                 probes += probed.len() as u64;
-                for (t, docs, tfs) in probed {
+                for (kind, docs, tfs) in probed {
                     for (doc, tf) in docs.into_iter().zip(tfs) {
-                        if let Some(c) = candidates.get_mut(&(s as u32, doc)) {
-                            c.known |= 1 << t;
-                            c.tf[t] = tf;
-                            if tf > 0 && weights.scoring & (1 << t) != 0 {
-                                c.contrib[t] = weights.contribution(t, tf, c.len);
+                        let Some(c) = candidates.get_mut(&(s as u32, doc)) else {
+                            continue;
+                        };
+                        match kind {
+                            ProbeKind::Term(t) => {
+                                c.known |= 1 << t;
+                                c.tf[t] = tf;
+                                if tf > 0 && weights.scoring & (1 << t) != 0 {
+                                    c.contrib[t] = weights.contribution(t, tf, c.len);
+                                }
+                            }
+                            ProbeKind::Phrase(ph) => {
+                                let norm = weights.norm[usize::from(c.len)];
+                                c.phrases[ph] = Some(match tf {
+                                    0 => 0.0,
+                                    tf => score_with_dl_norm_k1(weights.phrases[ph].idf, tf, norm),
+                                });
                             }
                         }
                     }
                 }
             }
-            theta = kth_lower_bound(&candidates, &slots, &weights, k, lb_slack);
-            bounds = slot_bounds(&slots, &heads, &candidates, &weights, lb_slack);
+            theta = kth_lower_bound(&candidates, &slots, weights, k, lb_slack);
+            bounds = slot_bounds(&slots, &heads, &candidates, weights, lb_slack);
         }
     }
     // A scope that admits only some rows: the threshold over every row is
     // no floor for the admitted ones, and an answer would hold rows the
     // scope drops. Only the bounds stand.
-    if query.rows_scoped {
+    if query.rows_scoped && query.check.is_none() {
         theta = f32::NEG_INFINITY;
     }
     let theta_id_max = theta_id_max(&candidates, &slots, &weights, k, lb_slack, theta);
-    let mut resolved = match exact_scores && !query.rows_scoped {
+    let mut resolved = match exact_scores && (!query.rows_scoped || query.check.is_some()) {
         true => resolve(&slots, &heads, &candidates, &weights, theta, theta_id_max),
         false => Vec::new(),
     };
@@ -544,13 +605,25 @@ pub(crate) async fn select(
     }))
 }
 
-/// Per superfile to probe, per term, the candidates to read it for: the
-/// candidates whose bound still reaches above `theta` while a bare term is
-/// missing for them, best bound first — their exact scores raise the
-/// threshold, under which the heads then bound the unseen documents — up
-/// to [`PROBE_MAX_CANDIDATES`] of them, each with the missing terms its
-/// superfile holds postings of.
-#[allow(clippy::type_complexity)]
+/// What one probe reads in one superfile.
+#[derive(Debug, Clone, Copy)]
+enum ProbeKind {
+    /// A bare term's frequency.
+    Term(usize),
+    /// A phrase's occurrences.
+    Phrase(usize),
+}
+
+/// One superfile's probe: what it reads, the members' dictionary values
+/// and document counts there, and the candidates it reads them for.
+type Probe = (ProbeKind, Vec<(DictEntry, u64)>, Vec<u32>);
+
+/// Per superfile to probe, its probes: the candidates whose bounds still
+/// reach above `theta` while a bare term or a phrase is unknown for them,
+/// best bound first — their exact scores raise the threshold, under which
+/// the heads then bound the unseen documents — up to
+/// [`PROBE_MAX_CANDIDATES`] of them, each for the unknowns its superfile
+/// holds postings of.
 fn probe_plan(
     slots: &[Slot],
     heads: &[Head],
@@ -558,42 +631,142 @@ fn probe_plan(
     weights: &Weights,
     postings: &HashMap<(usize, usize), (DictEntry, u64)>,
     theta: f32,
-) -> BTreeMap<usize, Vec<(usize, DictEntry, u64, Vec<u32>)>> {
-    let mut open: Vec<(f32, usize, u32, TermMask)> = candidates
+) -> BTreeMap<usize, Vec<Probe>> {
+    let held = |s: usize, t: usize| postings.contains_key(&(s, t));
+    let mut open: Vec<(f32, usize, u32, Vec<ProbeKind>)> = candidates
         .iter()
         .filter_map(|(&(s, doc), c)| {
             let slot = &slots[s as usize];
-            if slot.deny.is_some() {
+            if slot.deny.is_some() || (weights.filtered && !c.admitted) {
                 return None;
             }
-            let missing = (0..slot.heads.len())
+            let s = s as usize;
+            let mut kinds: Vec<ProbeKind> = (0..slot.heads.len())
                 .filter(|&t| {
-                    c.known & (1 << t) == 0
-                        && weights.scoring & (1 << t) != 0
-                        && postings.contains_key(&(s as usize, t))
+                    c.known & (1 << t) == 0 && weights.scoring & (1 << t) != 0 && held(s, t)
                 })
-                .fold(0, |m, t| m | (1 << t));
+                .map(ProbeKind::Term)
+                .collect();
+            kinds.extend(
+                weights
+                    .phrases
+                    .iter()
+                    .enumerate()
+                    .filter(|(ph, p)| {
+                        c.phrases[*ph].is_none() && p.members.iter().all(|&m| held(s, m))
+                    })
+                    .map(|(ph, _)| ProbeKind::Phrase(ph)),
+            );
             let ub = candidate_bound(slot, heads, weights, c);
-            (missing != 0 && ub > theta).then_some((ub, s as usize, doc, missing))
+            (!kinds.is_empty() && ub > theta).then_some((ub, s, doc, kinds))
         })
         .collect();
     open.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
     open.truncate(PROBE_MAX_CANDIDATES);
-    let mut docs: BTreeMap<(usize, usize), Vec<u32>> = BTreeMap::new();
-    for (_, s, doc, missing) in open {
-        for t in 0..slots[s].heads.len() {
-            if missing & (1 << t) != 0 {
-                docs.entry((s, t)).or_default().push(doc);
+    let mut docs: BTreeMap<(usize, usize, bool), Vec<u32>> = BTreeMap::new();
+    for (_, s, doc, kinds) in open {
+        for kind in kinds {
+            let key = match kind {
+                ProbeKind::Term(t) => (s, t, false),
+                ProbeKind::Phrase(ph) => (s, ph, true),
+            };
+            docs.entry(key).or_default().push(doc);
+        }
+    }
+    let mut plan: BTreeMap<usize, Vec<Probe>> = BTreeMap::new();
+    for ((s, i, phrase), mut list) in docs {
+        list.sort_unstable();
+        let (kind, members) = match phrase {
+            false => (ProbeKind::Term(i), vec![postings[&(s, i)]]),
+            true => (
+                ProbeKind::Phrase(i),
+                weights.phrases[i]
+                    .members
+                    .iter()
+                    .map(|&m| postings[&(s, m)])
+                    .collect(),
+            ),
+        };
+        plan.entry(s).or_default().push((kind, members, list));
+    }
+    plan
+}
+
+/// Check the query's row predicate on its best candidates' rows — those
+/// whose bounds reach above `theta`, best first, up to
+/// [`PROBE_MAX_CANDIDATES`] — reading only the pages that hold them: a
+/// candidate the predicate admits is marked so, one it rejects is dropped.
+#[allow(clippy::too_many_arguments)]
+async fn check_candidates(
+    manifest: &ManifestSnapshot,
+    kept: &[Arc<SuperfileEntry>],
+    slots: &[Slot],
+    heads: &[Head],
+    weights: &Weights,
+    candidates: &mut HashMap<(u32, u32), Candidate>,
+    check: &RowCheck,
+    theta: f32,
+) -> Result<(), TermIndexError> {
+    let mut open: Vec<(f32, u32, u32)> = candidates
+        .iter()
+        .filter(|((s, _), c)| slots[*s as usize].deny.is_none() && !c.admitted)
+        .map(|(&(s, doc), c)| {
+            (
+                candidate_bound(&slots[s as usize], heads, weights, c),
+                s,
+                doc,
+            )
+        })
+        .filter(|(ub, _, _)| *ub > theta)
+        .collect();
+    open.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
+    open.truncate(PROBE_MAX_CANDIDATES);
+    let mut by_slot: BTreeMap<usize, Vec<u32>> = BTreeMap::new();
+    for (_, s, doc) in open {
+        by_slot.entry(s as usize).or_default().push(doc);
+    }
+    let checks = by_slot.into_iter().map(|(s, mut docs)| {
+        docs.sort_unstable();
+        let entry = &kept[s];
+        async move {
+            let reader = open_reader_of(manifest, entry).await?;
+            let fts = reader.fts().ok_or_else(|| {
+                TermIndexError::Open(QueryError::Internal(
+                    "a superfile the heads name has no full-text index".into(),
+                ))
+            })?;
+            let rows = fts
+                .hits_to_rows_async(docs.iter().map(|&d| (FtsDocId::new(d), 0.0)).collect())
+                .await
+                .map_err(|e| TermIndexError::Open(QueryError::from(e)))?;
+            let asked: RoaringBitmap = rows.iter().map(|(row, _)| row.get()).collect();
+            let admitted = check
+                .keep(&reader, &asked)
+                .await
+                .map_err(TermIndexError::Open)?;
+            let verdicts: Vec<(u32, bool)> = docs
+                .iter()
+                .zip(&rows)
+                .map(|(&doc, (row, _))| (doc, admitted.contains(row.get())))
+                .collect();
+            Ok::<_, TermIndexError>((s, verdicts))
+        }
+    });
+    for (s, verdicts) in try_join_all(checks).await? {
+        for (doc, admits) in verdicts {
+            match admits {
+                true => {
+                    if let Some(c) = candidates.get_mut(&(s as u32, doc)) {
+                        c.admitted = true;
+                    }
+                }
+                false => {
+                    candidates.remove(&(s as u32, doc));
+                }
             }
         }
     }
-    let mut plan: BTreeMap<usize, Vec<(usize, DictEntry, u64, Vec<u32>)>> = BTreeMap::new();
-    for ((s, t), mut list) in docs {
-        list.sort_unstable();
-        let (entry, df) = postings[&(s, t)];
-        plan.entry(s).or_default().push((t, entry, df, list));
-    }
-    plan
+    Ok(())
 }
 
 /// Open `entry`'s reader through the reader cache.
@@ -635,6 +808,8 @@ fn absorb(
             known: 0,
             tf: vec![0; nt],
             contrib: vec![0.0; nt],
+            phrases: vec![None; weights.phrases.len()],
+            admitted: false,
         });
     if c.known & (1 << t) == 0 {
         c.known |= 1 << t;
@@ -797,11 +972,11 @@ fn may_hold(slot: &Slot, heads: &[Head], t: usize, len: u8) -> bool {
 /// per phrase its cap. `NEG_INFINITY` when the candidate can no longer
 /// carry a required term or phrase.
 fn candidate_bound(slot: &Slot, heads: &[Head], weights: &Weights, c: &Candidate) -> f32 {
-    // Every bare term seen and no phrase: the known sum is the score, the
-    // kernel's own bit for bit up to two terms.
-    if weights.phrases.is_empty()
-        && c.known & weights.scoring == weights.scoring
-        && weights.scoring.count_ones() as usize <= EXACT_SUM_TERMS
+    // Every bare term seen and every phrase probed: the known sum is the
+    // score, the kernel's own bit for bit up to two scored parts.
+    if c.known & weights.scoring == weights.scoring
+        && c.phrases.iter().all(Option::is_some)
+        && weights.scoring.count_ones() as usize + weights.phrases.len() <= EXACT_SUM_TERMS
     {
         return c.sum();
     }
@@ -817,12 +992,18 @@ fn candidate_bound(slot: &Slot, heads: &[Head], weights: &Weights, c: &Candidate
             ub += h.map_or(0.0, |h| term_cap(&heads[h], slot.scale_up, weights, c.len));
         }
     }
-    for phrase in &weights.phrases {
-        let cap = phrase_cap(phrase, slot, heads, weights, c.len, Some(c));
+    for (phrase, known) in weights.phrases.iter().zip(&c.phrases) {
+        // A probed phrase is in the sum already.
+        let cap = match known {
+            Some(v) => *v,
+            None => phrase_cap(phrase, slot, heads, weights, c.len, Some(c)),
+        };
         if cap <= 0.0 && phrase.required {
             return f32::NEG_INFINITY;
         }
-        ub += cap;
+        if known.is_none() {
+            ub += cap;
+        }
     }
     ub
 }
@@ -1062,13 +1243,25 @@ fn resolve(
         .collect();
     for (&(s, _), c) in candidates {
         let slot = &slots[s as usize];
+        // A candidate bounded under the threshold cannot place, known or not.
+        if !whole[s as usize] || candidate_bound(slot, heads, weights, c) < theta {
+            continue;
+        }
         let missing = slot.heads.iter().enumerate().any(|(t, h)| {
             // A term whose head is read whole is absent where unseen.
             h.is_some_and(|h| !heads[h].whole())
                 && weights.scoring & (1 << t) != 0
                 && c.known & (1 << t) == 0
         });
-        if missing {
+        // A phrase not probed is unknown where its members may both occur.
+        let phrase_open = weights
+            .phrases
+            .iter()
+            .zip(&c.phrases)
+            .any(|(p, v)| v.is_none() && p.members.iter().all(|&m| slot.heads[m].is_some()));
+        // A row the predicate was not checked on may or may not be admitted.
+        let unchecked = weights.filtered && !c.admitted;
+        if missing || phrase_open || unchecked {
             whole[s as usize] = false;
         }
     }

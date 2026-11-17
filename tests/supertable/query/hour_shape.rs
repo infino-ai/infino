@@ -366,8 +366,10 @@ fn a_lone_phrase_rules_out_superfiles_holding_one_of_its_words() {
     opens_and_equal(&p, "\"barack obama\"", 10);
     for run in 1..REPEATS {
         let n = opens_and_equal(&p, "\"barack obama\"", 10);
-        assert_eq!(
-            n, PHRASE_HOLDERS as u64,
+        // The holders open, or are answered from the index once their
+        // phrase is probed; nothing else opens.
+        assert!(
+            n <= PHRASE_HOLDERS as u64,
             "run {run}: opened {n}, but only {PHRASE_HOLDERS} superfiles hold the phrase"
         );
     }

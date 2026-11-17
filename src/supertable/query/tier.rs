@@ -69,7 +69,7 @@ use roaring::RoaringBitmap;
 use tokio::task;
 use uuid::Uuid;
 
-use super::fts::baked_avgdl;
+use super::{exec::common::RowCheck, fts::baked_avgdl};
 use crate::{
     memory::{ConnectionMemoryBudget, Reservation},
     runtime_bridge::run_on_pool,
@@ -344,6 +344,9 @@ pub(crate) struct TierQuery<'a> {
     /// counted, as the kernel weights it — times the smallest member key
     /// of the document, the bound the ceiling path uses.
     pub(crate) phrases: Vec<(Vec<usize>, bool)>,
+    /// Each phrase's members' offsets from its first member, parallel to
+    /// `phrases`: a stopword dropped from the phrase leaves a gap.
+    pub(crate) phrase_offsets: Vec<Vec<u32>>,
     /// Whether the query negates terms or phrases: a document the heads
     /// show cannot then be taken as a match, so the merge bounds and
     /// orders but seeds no threshold and answers for nothing.
@@ -384,6 +387,10 @@ pub(crate) struct TierQuery<'a> {
     /// so a selection bounds superfiles but seeds no threshold and answers
     /// for none. The tier merge does not serve such a query.
     pub(crate) rows_scoped: bool,
+    /// The query's exact row predicate, when a SQL `WHERE` pushed one: the
+    /// level heads check their best candidates' rows against it, so a
+    /// threshold over the rows it admits can be seeded.
+    pub(crate) check: Option<Arc<RowCheck>>,
     /// The query's score tolerance: a document may be missed when it
     /// scores at most this share above the returned k-th, so a superfile
     /// bounded under the threshold widened by it need not be read for.

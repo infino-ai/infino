@@ -145,7 +145,8 @@ use crate::{
             candidate::{CandidatePlan, CandidateScope, TermMemos},
             dispatch,
             exec::common::{
-                hit_output_schema, resolve_hits_named, take_file_columns, take_rows_byte_source,
+                RowCheck, hit_output_schema, resolve_hits_named, take_file_columns,
+                take_rows_byte_source,
             },
             heads,
             match_order::MatchOrder,
@@ -1084,7 +1085,7 @@ impl SupertableReader {
         k: usize,
         opts: Bm25SearchOptions,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
-        self.bm25_search_scoped_async(column, query, k, opts, None)
+        self.bm25_search_scoped_async(column, query, k, opts, None, None)
             .await
     }
 
@@ -1102,9 +1103,10 @@ impl SupertableReader {
         k: usize,
         opts: Bm25SearchOptions,
         scope: Option<&CandidateScope>,
+        check: Option<Arc<RowCheck>>,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
         let (hits, _) = self
-            .bm25_scored_async(column, query, k, opts, scope, false)
+            .bm25_scored_async(column, query, k, opts, scope, check, false)
             .await?;
         Ok(hits)
     }
@@ -1119,6 +1121,7 @@ impl SupertableReader {
         k: usize,
         opts: Bm25SearchOptions,
         scope: Option<&CandidateScope>,
+        check: Option<Arc<RowCheck>>,
         exact_count: bool,
     ) -> Result<(Vec<SuperfileHit>, u64), QueryError> {
         if k == 0 {
@@ -1214,6 +1217,7 @@ impl SupertableReader {
             bm25_params,
             score_tolerance,
             scope,
+            check,
             exact_count,
         )
         .await
@@ -1268,6 +1272,7 @@ impl SupertableReader {
         bm25_params: Option<Bm25Params>,
         score_tolerance: f32,
         scope: Option<&CandidateScope>,
+        check: Option<Arc<RowCheck>>,
         exact_count: bool,
     ) -> Result<(Vec<SuperfileHit>, u64), QueryError> {
         let ScoredClauses {
@@ -1423,7 +1428,9 @@ impl SupertableReader {
         // gate its samples learning so.
         // A scope that admits only some rows still lets the level heads bound
         // each superfile; they then seed no threshold and answer for none.
-        let rows_scoped = scope.is_some_and(|s| s.bounds_rows(&kept));
+        // An exact predicate checked on each superfile's rows admits only
+        // some of them too, whatever the scope's sets bound.
+        let rows_scoped = scope.is_some_and(|s| s.bounds_rows(&kept)) || check.is_some();
         let index_serves = index_column.is_some()
             && kept.len() > 1
             && all_terms.len() <= tier::MAX_TIER_TERMS
@@ -1568,6 +1575,11 @@ impl SupertableReader {
                     required,
                     scoring,
                     phrases: tier_phrases,
+                    phrase_offsets: must_phrases
+                        .iter()
+                        .chain(should_phrases.iter())
+                        .map(|p| p.offsets.clone())
+                        .collect(),
                     // A negated phrase excludes as a negated term does: the
                     // heads cannot see the adjacency that unmakes a match.
                     negated: !negatives.is_empty() || !negative_phrases.is_empty(),
@@ -1581,6 +1593,7 @@ impl SupertableReader {
                     forced,
                     budget: Arc::clone(&manifest.options.connection_memory_budget),
                     rows_scoped,
+                    check: check.clone(),
                     score_tolerance,
                 });
             }
@@ -2645,7 +2658,7 @@ impl SupertableReader {
         // Prefix search takes no search options, so columns score with the
         // parameters they declared.
         let (hits, _) = self
-            .bm25_search_clauses(column, clauses, kept, k, None, 0.0, None, false)
+            .bm25_search_clauses(column, clauses, kept, k, None, 0.0, None, None, false)
             .await?;
         Ok(hits)
     }
@@ -2668,7 +2681,17 @@ impl SupertableReader {
                 shoulds: vec![term],
                 ..ScoredClauses::default()
             };
-            self.bm25_search_clauses(column, clauses, kept.clone(), k, None, 0.0, None, false)
+            self.bm25_search_clauses(
+                column,
+                clauses,
+                kept.clone(),
+                k,
+                None,
+                0.0,
+                None,
+                None,
+                false,
+            )
         });
         let mut best: HashMap<(SuperfileUri, u32), SuperfileHit> = HashMap::new();
         for (hits, _) in try_join_all(searches).await? {
@@ -3879,7 +3902,7 @@ impl SupertableReader {
                 .await?;
             return Ok((Vec::new(), count));
         }
-        self.bm25_scored_async(column, query, k, opts, None, true)
+        self.bm25_scored_async(column, query, k, opts, None, None, true)
             .await
     }
 
