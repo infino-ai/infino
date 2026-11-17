@@ -3636,7 +3636,10 @@ mod tests {
                 read_ahead::{PAGE_READ_THROUGH_BYTES, file_pruning, fixture, statistics_pruned},
                 sql::sql_session_context,
             },
-            reader_cache::disk::{HeapBudget, test_support::cache_buffered},
+            reader_cache::disk::{
+                HeapBudget,
+                test_support::{cache_buffered, lazy_entries},
+            },
         },
         test_helpers::{
             build_title_batch, default_supertable_options, default_tokenizer,
@@ -6861,7 +6864,8 @@ mod tests {
         assert!(budget.charged() > 0, "and counted");
 
         drop(ctx);
-        assert_eq!(cache.stats().n_entries, 0, "its end lets them go");
+        // A background fill that finished first leaves its file mapped whole, which is not counted.
+        assert_eq!(lazy_entries(&cache), 0, "its end lets them go");
         assert_eq!(budget.charged(), 0, "each once");
     }
 }
