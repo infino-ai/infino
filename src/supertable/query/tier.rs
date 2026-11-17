@@ -384,6 +384,10 @@ pub(crate) struct TierQuery<'a> {
     /// so a selection bounds superfiles but seeds no threshold and answers
     /// for none. The tier merge does not serve such a query.
     pub(crate) rows_scoped: bool,
+    /// The query's score tolerance: a document may be missed when it
+    /// scores at most this share above the returned k-th, so a superfile
+    /// bounded under the threshold widened by it need not be read for.
+    pub(crate) score_tolerance: f32,
 }
 
 /// The merge's outcome for one query.

@@ -49,7 +49,7 @@ use futures::future::try_join_all;
 use roaring::RoaringBitmap;
 
 use super::{
-    fts::baked_avgdl,
+    fts::{baked_avgdl, competitive_floor},
     tier::{
         BOUND_SLACK, EXACT_SUM_TERMS, MAX_TIER_TERMS, SuperfileBounds, TermMask, TierQuery,
         TierSelection,
@@ -385,7 +385,10 @@ pub(crate) async fn select(
             break;
         }
         last = Some((theta, in_play));
-        let wanted = heads_that_matter(&slots, &heads, &candidates, &bounds, theta);
+        // Bounds under the threshold widened by the tolerance are skipped
+        // by the opens anyway: reading further for them buys nothing.
+        let bar = competitive_floor(theta, query.score_tolerance);
+        let wanted = heads_that_matter(&slots, &heads, &candidates, &bounds, bar);
         if wanted.is_empty() {
             break;
         }

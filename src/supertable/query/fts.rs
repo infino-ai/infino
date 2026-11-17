@@ -1519,6 +1519,7 @@ impl SupertableReader {
                     forced,
                     budget: Arc::clone(&manifest.options.connection_memory_budget),
                     rows_scoped,
+                    score_tolerance,
                 });
             }
         }
