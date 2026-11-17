@@ -9132,11 +9132,15 @@ mod tests {
             let wide_stats = wide.1.scalar_stats.clone();
             let merged = assert_same_merge(narrow, wide, label).expect("rows survive");
 
-            let fresh = SuperfileStats::try_compute_from_record_batch(
-                &merged.get_record_batch(None).expect("merged rows"),
+            // The merged rows as a fresh build counts them, keyed by the field
+            // ids the builder stamps by position.
+            let rows = merged.get_record_batch(None).expect("merged rows");
+            let rows = RecordBatch::try_new(
+                stamp_ids_by_position(&rows.schema()),
+                rows.columns().to_vec(),
             )
-            .expect("fresh stats")
-            .scalar_stats;
+            .expect("stamped rows");
+            let fresh = ScalarStatsAgg::from_batches(&rows.schema(), &[&rows]);
             let kept = |stats: &HashMap<FieldId, ScalarStatsAgg>| -> Vec<FieldId> {
                 let mut kept: Vec<FieldId> = stats
                     .iter()
