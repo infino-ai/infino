@@ -434,11 +434,12 @@ impl DiskCacheStore {
         let _ = fs::remove_file(self.blocks_idx_path(uri));
     }
 
-    /// Keep charging the `.blocks` file of a dropped lazy entry's `source`. The source releases its
-    /// own bytes on drop but leaves the file for a later open to adopt; untracked, the file would
-    /// sit on disk outside the budget, where eviction cannot reach it. Skipped when the path no
-    /// longer names the source's file: a newer generation replaced it, and a record left for the
-    /// old file would later be evicted and unlink the newer one.
+    /// Keep counting the `.blocks` file of a dropped lazy entry's `source` in the disk budget, so
+    /// eviction can still reach it: the record takes the file and its bytes, and a later open can
+    /// adopt it. Skipped when the path no longer names the source's file (a newer generation
+    /// replaced it, and a record for the old one would later unlink the newer); the source then
+    /// gives its bytes back when it drops. A released source may wait on the freeing thread with
+    /// the file open, so if the record is evicted meanwhile, its disk space comes back only then.
     pub(crate) fn retain_block_file(
         &self,
         uri: &SuperfileUri,
@@ -449,7 +450,11 @@ impl DiskCacheStore {
         if filled == 0 || !source.path_names_its_file() {
             return;
         }
-        self.current_bytes.fetch_add(filled, Ordering::Release);
+        // From here the record counts the bytes and the source no longer writes the index, so both
+        // happen once however long the source outlives its entry on the freeing thread.
+        if !source.retire(filled) {
+            self.current_bytes.fetch_add(filled, Ordering::Release);
+        }
         let file = UnindexedFile {
             size_bytes: filled,
             mtime_us: now_us,

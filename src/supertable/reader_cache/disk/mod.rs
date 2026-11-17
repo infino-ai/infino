@@ -194,6 +194,9 @@ pub(crate) struct CachedEntry {
     /// Who releases `size_bytes` when the entry drops.
     accounting: EntryAccounting,
     last_access_us: AtomicU64,
+    /// The footer and page index the reader keeps decoded, counted against the process budget
+    /// (see [`heap`]) until the entry goes.
+    heap: OnceLock<HeapReservation>,
 }
 
 /// Which tier of the cache's walk served an open. Returned beside the reader so a scan can say
@@ -505,6 +508,9 @@ pub struct DiskCacheStore {
     /// Download tasks still running, cancelled ones included; what `wait_until_fills_settled`
     /// waits for.
     fills_running: AtomicUsize,
+    /// A test's own budget for decoded metadata, in place of the process's.
+    #[cfg(test)]
+    heap_budget: OnceLock<&'static HeapBudget>,
 }
 
 impl fmt::Debug for DiskCacheStore {
@@ -525,6 +531,7 @@ impl fmt::Debug for DiskCacheStore {
 mod budget;
 mod fetch;
 mod fill_wait;
+mod heap;
 mod read;
 mod scratch;
 mod sources;
@@ -532,6 +539,9 @@ mod store_files;
 
 pub(crate) use budget::{Reservation, ScratchCharge, ScratchRoom};
 pub(crate) use fetch::{open_batch_overlay, skip_background_fill};
+#[cfg(test)]
+pub(crate) use heap::HeapBudget;
+pub(crate) use heap::{CachedSessions, HeapReservation};
 pub(crate) use sources::{
     ArcMmapOwner, mmap_readonly_bytes, mmap_temp_file_bytes, release_temp_file, temp_file_behind,
 };
@@ -619,6 +629,8 @@ impl DiskCacheStore {
             fill_waiters: FillWaiters::default(),
             fills: DashMap::new(),
             fills_running: AtomicUsize::new(0),
+            #[cfg(test)]
+            heap_budget: OnceLock::new(),
         });
 
         // Record what is already on disk so the budget is correct from the start. Files are opened
@@ -657,6 +669,7 @@ impl DiskCacheStore {
             // required for correctness.
         }
 
+        store.register_heap();
         Ok(store)
     }
 
@@ -845,8 +858,8 @@ pub(crate) mod test_support {
         ops::Range,
         os::unix::fs::MetadataExt,
         sync::{
-            Arc, Mutex,
-            atomic::{AtomicBool, Ordering},
+            Arc, Mutex, OnceLock,
+            atomic::{AtomicBool, AtomicU64, Ordering},
         },
         time::{Duration, Instant},
     };
@@ -866,7 +879,7 @@ pub(crate) mod test_support {
     use crate::{
         storage::{LocalFsStorageProvider, ObjectMeta, StorageError, StorageProvider},
         superfile::{
-            BytesLazyByteSource, LazyByteSource,
+            BytesLazyByteSource, LazyByteSource, SuperfileReader,
             builder::{BuilderOptions, SuperfileBuilder},
         },
         supertable::{
@@ -1005,6 +1018,50 @@ pub(crate) mod test_support {
             store.blocks_path(&uri),
             SourceLayout::default(),
         )
+    }
+
+    /// Cache `reader` for `uri` with `residency`, `size_bytes` of the disk budget released as
+    /// `accounting` says, last used at `last_access_us`.
+    pub(super) fn cache_entry(
+        store: &DiskCacheStore,
+        uri: SuperfileUri,
+        reader: Arc<SuperfileReader>,
+        residency: Residency,
+        size_bytes: Arc<AtomicU64>,
+        accounting: EntryAccounting,
+        last_access_us: u64,
+    ) {
+        store.cached.insert(
+            uri,
+            Arc::new(CachedEntry {
+                heap: OnceLock::new(),
+                reader,
+                residency,
+                size_bytes,
+                accounting,
+                last_access_us: AtomicU64::new(last_access_us),
+            }),
+        );
+    }
+
+    /// Cache `reader` for `uri` as a file held whole in memory, as a hybrid fill's first copy is
+    /// before it is written to disk and mapped.
+    pub(crate) fn cache_buffered(
+        store: &DiskCacheStore,
+        uri: SuperfileUri,
+        reader: Arc<SuperfileReader>,
+    ) {
+        let size_bytes = Arc::new(AtomicU64::new(0));
+        let accounting = EntryAccounting::Eager;
+        cache_entry(
+            store,
+            uri,
+            reader,
+            Residency::Buffered,
+            size_bytes,
+            accounting,
+            store.now_us(),
+        );
     }
 
     /// Block sizes older builds wrote at the head of their block indexes, which carry no magic

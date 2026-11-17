@@ -268,6 +268,11 @@ pub struct SuperfileReader {
     /// What a table scan reads off this file's footer on every statement, worked out by the first
     /// scan that asks ([`Self::scan_shape`]) and kept while the reader stays cached.
     scan_shape: OnceLock<Arc<ScanShape>>,
+    /// Whether a cache has counted what this reader keeps decoded ([`Self::first_heap_count`]).
+    heap_counted: AtomicBool,
+    /// Whether a cache has counted the scan footer this reader keeps
+    /// ([`Self::first_scan_footer_heap_count`]).
+    scan_footer_heap_counted: AtomicBool,
     /// The lazy byte source the reader was opened over, retained only
     /// on the [`open_lazy`] path. `None` on the eager [`open`] path
     /// (resident bytes already cover every range). Lets
@@ -968,6 +973,8 @@ impl SuperfileReader {
             page_index_loaded: OnceCell::new(),
             scan_footer: OnceLock::new(),
             scan_shape: OnceLock::new(),
+            heap_counted: AtomicBool::new(false),
+            scan_footer_heap_counted: AtomicBool::new(false),
             source: Some(source),
             schema,
             id_column,
@@ -1115,6 +1122,8 @@ impl SuperfileReader {
             page_index_loaded: OnceCell::new(),
             scan_footer: OnceLock::new(),
             scan_shape: OnceLock::new(),
+            heap_counted: AtomicBool::new(false),
+            scan_footer_heap_counted: AtomicBool::new(false),
             source: None,
             schema,
             id_column,
@@ -1223,6 +1232,25 @@ impl SuperfileReader {
         }
         let derived = derive(indexed)?;
         Ok(Arc::clone(self.scan_footer.get_or_init(|| derived)))
+    }
+
+    /// True for the first caller only: the one that should count what this reader keeps decoded
+    /// against a cache's budget. Later callers pay one load.
+    pub(crate) fn first_heap_count(&self) -> bool {
+        !self.heap_counted.load(Ordering::Acquire)
+            && !self.heap_counted.swap(true, Ordering::AcqRel)
+    }
+
+    /// [`Self::first_heap_count`] for the scan footer this reader keeps, which a later statement
+    /// may derive after the first one counted the parsed footer.
+    pub(crate) fn first_scan_footer_heap_count(&self) -> bool {
+        !self.scan_footer_heap_counted.load(Ordering::Acquire)
+            && !self.scan_footer_heap_counted.swap(true, Ordering::AcqRel)
+    }
+
+    /// Whether `footer` is a scan footer this reader keeps apart from its parsed one.
+    pub(crate) fn keeps_scan_footer(&self, footer: &Arc<ParquetMetaData>) -> bool {
+        !Arc::ptr_eq(self.footer.load().parquet(), footer)
     }
 
     /// This file's scan shape: `build` on the first call, the same one on every later call. A

@@ -18,15 +18,19 @@ use tokio::sync::OwnedSemaphorePermit;
 #[cfg(test)]
 use tokio::time::timeout;
 
-use crate::supertable::{
-    manifest::SuperfileUri,
-    reader_cache::{config::EvictionCandidate, disk::*},
-};
 #[cfg(test)]
 use crate::{
     memory::ConnectionMemoryBudget,
     supertable::reader_cache::{
-        block_source::BlockCachedSource, disk::test_support::tiny_superfile_bytes,
+        block_source::BlockCachedSource,
+        disk::test_support::{cache_entry, tiny_superfile_bytes},
+    },
+};
+use crate::{
+    superfile::SuperfileReader,
+    supertable::{
+        manifest::SuperfileUri,
+        reader_cache::{config::EvictionCandidate, disk::*},
     },
 };
 
@@ -70,7 +74,7 @@ impl DiskCacheStore {
     /// kept too (see `BlockCachedSource::has_unfinished_writes`), and so is one
     /// whose file is downloading: its Warm reservation covers the download. That
     /// keeps at most one extra entry per download slot.
-    fn reclaimable_lazy_entry(&self, uri: &SuperfileUri, entry: &CachedEntry) -> bool {
+    pub(super) fn reclaimable_lazy_entry(&self, uri: &SuperfileUri, entry: &CachedEntry) -> bool {
         entry.mmap().is_none()
             && !entry.held_by_query()
             && entry
@@ -195,11 +199,12 @@ impl DiskCacheStore {
     /// each, and each finished one stays in the map until the next sweep
     /// tick: its parsed footer and page index, several MB of heap on a large
     /// file, times every superfile the query read. Capping the unheld ones
-    /// bounds that by the cap rather than by the table.
-    pub(crate) fn release_unheld_lazy_entries_over_cap(&self) {
+    /// bounds that by the cap rather than by the table. Returns the released readers, for the
+    /// caller to free where it chooses.
+    pub(crate) fn release_unheld_lazy_entries_over_cap(&self) -> Vec<Arc<SuperfileReader>> {
         let cap = self.lazy_entry_cap.load(Ordering::Relaxed);
         if self.cached.len() <= cap {
-            return;
+            return Vec::new();
         }
         let mut unheld: Vec<(u64, SuperfileUri)> = self
             .cached
@@ -208,18 +213,25 @@ impl DiskCacheStore {
             .map(|e| (e.value().last_access_us.load(Ordering::Acquire), *e.key()))
             .collect();
         let Some(over) = unheld.len().checked_sub(cap) else {
-            return;
+            return Vec::new();
         };
         unheld.sort_unstable();
         let now_us = self.now_us();
-        for (_, uri) in unheld.into_iter().take(over) {
-            self.release_lazy_entry(&uri, now_us);
-        }
+        unheld
+            .into_iter()
+            .take(over)
+            .filter_map(|(_, uri)| self.release_lazy_entry(&uri, now_us))
+            .collect()
     }
 
     /// Remove `uri`'s entry if it is still a lazy one only the cache holds,
-    /// releasing its budget and keeping its block file.
-    fn release_lazy_entry(&self, uri: &SuperfileUri, now_us: u64) {
+    /// releasing its budget and keeping its block file. Returns its reader, for
+    /// the caller to free where it chooses.
+    pub(super) fn release_lazy_entry(
+        &self,
+        uri: &SuperfileUri,
+        now_us: u64,
+    ) -> Option<Arc<SuperfileReader>> {
         // Re-check under the shard guard: a query may have taken a
         // reference since the snapshot, in which case dropping the
         // entry would free nothing and cost that query a re-open.
@@ -231,7 +243,9 @@ impl DiskCacheStore {
             if let Some(source) = removed.block_source() {
                 self.retain_block_file(uri, source, now_us);
             }
+            return Some(Arc::clone(&removed.reader));
         }
+        None
     }
 
     /// Sum of mmap virtual sizes across all cached entries
@@ -801,15 +815,17 @@ impl DiskCacheStore {
     ) {
         let reader = SuperfileReader::open(tiny_superfile_bytes()).expect("tiny superfile opens");
         let size_bytes = block_source.filled_bytes_handle();
-        self.cached.insert(
+        let residency = Residency::Paged { block_source };
+        let accounting = EntryAccounting::SourceOwned;
+        let now_us = self.now_us();
+        cache_entry(
+            self,
             uri,
-            Arc::new(CachedEntry {
-                reader: Arc::new(reader),
-                residency: Residency::Paged { block_source },
-                size_bytes,
-                accounting: EntryAccounting::SourceOwned,
-                last_access_us: AtomicU64::new(self.now_us()),
-            }),
+            Arc::new(reader),
+            residency,
+            size_bytes,
+            accounting,
+            now_us,
         );
     }
 
@@ -1122,6 +1138,76 @@ mod tests {
         let source = open_lazily(store, uri).await;
         source.range(0, 1).await.expect("block read");
         store.block_writes_settled().await;
+    }
+
+    /// A Stream lazy entry with one block filled, released while its reader is still alive, as
+    /// one waiting on the freeing thread is.
+    ///  - the block file is counted once, by its record, while the reader lives;
+    ///  - freeing the reader later gives back nothing more.
+    #[tokio::test]
+    async fn a_released_reader_freed_later_leaves_its_block_file_counted_once() {
+        let (_dir, store) = test_store_with(|cfg| {
+            cfg.cold_fetch_mode = ColdFetchMode::LazyForegroundWithBackgroundFill;
+            cfg.promotion_defer_timeout = Duration::MAX;
+        });
+        let uri = SuperfileUri::new_v4();
+        put_superfile(&store, &uri, tiny_superfile_bytes()).await;
+        open_and_fill_a_block(&store, &uri).await;
+        let filled = store
+            .cached
+            .get(&uri)
+            .and_then(|entry| entry.block_source().map(|s| s.filled_bytes_handle()))
+            .expect("a lazy entry")
+            .load(Ordering::Acquire);
+        assert!(filled > 0, "a block is filled");
+
+        let queued = store.release_lazy_entry(&uri, store.now_us());
+        assert!(queued.is_some(), "the entry is released");
+        store.assert_budget_consistent();
+        assert_eq!(store.stats().current_bytes, filled, "counted once");
+
+        drop(queued);
+        store.assert_budget_consistent();
+        assert_eq!(store.stats().current_bytes, filled, "still counted once");
+    }
+
+    /// A Stream lazy entry with one block filled, released while its source lives, and a run that
+    /// lands on that source after the release (a read-ahead GET that finished as its statement
+    /// ended), leaving its bytes reserved in the store and filled in the source.
+    ///  - the record counts the blocks filled at release;
+    ///  - dropping the source gives the late run back, so the cache counts only the record.
+    #[tokio::test]
+    async fn a_run_landing_after_release_is_given_back_when_its_source_drops() {
+        /// Bytes the late run lands.
+        const LATE_BYTES: u64 = 4096;
+        let (_dir, store) = test_store_with(|cfg| {
+            cfg.cold_fetch_mode = ColdFetchMode::LazyForegroundWithBackgroundFill;
+            cfg.promotion_defer_timeout = Duration::MAX;
+        });
+        let uri = SuperfileUri::new_v4();
+        put_superfile(&store, &uri, tiny_superfile_bytes()).await;
+        open_and_fill_a_block(&store, &uri).await;
+        let source = store
+            .cached
+            .get(&uri)
+            .and_then(|entry| entry.block_source().cloned())
+            .expect("a lazy entry");
+        let filled = source.filled_bytes_handle().load(Ordering::Acquire);
+
+        let queued = store.release_lazy_entry(&uri, store.now_us());
+        assert!(queued.is_some(), "the entry is released");
+        store.current_bytes.fetch_add(LATE_BYTES, Ordering::Release);
+        source
+            .filled_bytes_handle()
+            .fetch_add(LATE_BYTES, Ordering::AcqRel);
+
+        drop(queued);
+        drop(source);
+        assert_eq!(
+            store.stats().current_bytes,
+            filled,
+            "only the record stays counted"
+        );
     }
 
     /// A lazy entry with a block write still queued.
