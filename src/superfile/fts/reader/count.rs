@@ -437,6 +437,9 @@ impl FtsReader {
             .into_iter()
             .flatten()
             .collect();
+        // The cursors are built; a dictionary `dict` did not keep is not held
+        // through the walk and the row-map read below.
+        drop(dict_bytes);
         // Tallied before the mode branch: the cursors that DID build cost
         // their bytes even when a missing AND token empties the result.
         // +1 for the dictionary fetch, when this call made it.
@@ -1021,15 +1024,97 @@ pub struct TermLayout {
 #[cfg(test)]
 mod tests {
 
-    use std::ops::Range;
+    use std::{
+        ops::Range,
+        sync::{
+            Arc, Mutex, OnceLock,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
 
+    use async_trait::async_trait;
     use bytes::Bytes;
 
-    use super::{super::test_util::*, *};
-    use crate::superfile::fts::{
-        builder::FtsBuilder,
-        posting::{self, BLOCK_LEN, ENCODING_BITSET, ENCODING_PACKED, ENCODING_PATCHED},
+    use super::{
+        super::{metadata::OpenOptions, test_util::*},
+        *,
     };
+    use crate::{
+        memory::ConnectionMemoryBudget,
+        superfile::{
+            fts::{
+                builder::FtsBuilder,
+                posting::{self, BLOCK_LEN, ENCODING_BITSET, ENCODING_PACKED, ENCODING_PATCHED},
+            },
+            lazy_source::{LazyByteSource, LazyByteSourceError},
+        },
+    };
+
+    /// Documents in the reordered blob the dictionary-lifetime test matches.
+    const DICT_LIFETIME_DOCS: u32 = 64;
+
+    /// A dictionary buffer handed out by [`DictWatchSource`]; it counts
+    /// itself live until the last slice of it drops.
+    struct WatchedDict {
+        bytes: Bytes,
+        live: Arc<AtomicUsize>,
+    }
+
+    impl AsRef<[u8]> for WatchedDict {
+        fn as_ref(&self) -> &[u8] {
+            &self.bytes
+        }
+    }
+
+    impl Drop for WatchedDict {
+        fn drop(&mut self) {
+            self.live.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    /// A download-only source that hands out the dictionary as a
+    /// [`WatchedDict`] and notes how many dictionary buffers are live at
+    /// each read of the doc-id map.
+    struct DictWatchSource {
+        blob: Bytes,
+        /// The dictionary and doc-id map regions, set once the reader is open.
+        regions: OnceLock<(Range<usize>, Range<usize>)>,
+        live: Arc<AtomicUsize>,
+        live_at_map_reads: Mutex<Vec<usize>>,
+    }
+
+    #[async_trait]
+    impl LazyByteSource for DictWatchSource {
+        fn size(&self) -> u64 {
+            self.blob.len() as u64
+        }
+
+        async fn range(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
+            let range = start as usize..(start + len) as usize;
+            let bytes = self.blob.slice(range.clone());
+            let Some((dict, map)) = self.regions.get() else {
+                return Ok(bytes);
+            };
+            if range.start < map.end && range.end > map.start {
+                self.live_at_map_reads
+                    .lock()
+                    .expect("map reads")
+                    .push(self.live.load(Ordering::SeqCst));
+            }
+            if range == *dict {
+                self.live.fetch_add(1, Ordering::SeqCst);
+                return Ok(Bytes::from_owner(WatchedDict {
+                    bytes,
+                    live: Arc::clone(&self.live),
+                }));
+            }
+            Ok(bytes)
+        }
+
+        fn try_get_range_sync(&self, _start: u64, _len: u64) -> Option<Bytes> {
+            None
+        }
+    }
 
     #[tokio::test]
     async fn token_match_or_unions_and_intersects_unranked() {
@@ -1086,6 +1171,66 @@ mod tests {
                 .0
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn token_match_releases_a_dictionary_it_does_not_keep_before_the_row_map_read() {
+        // A reordered blob read from a download-only source, matched through
+        // a `QueryDict` that keeps nothing (no budget, or a budget too small)
+        // and one with room.
+        //  - without a kept dictionary, no dictionary buffer is live when the
+        //    doc-id map is read;
+        //  - with room, the `QueryDict` holds it there;
+        //  - the rows are the same either way.
+        // This test pins the downloaded dictionary going before the row-map read.
+        let docs: Vec<String> = (0..DICT_LIFETIME_DOCS)
+            .map(|row| format!("alpha r{row}"))
+            .collect();
+        let refs: Vec<&str> = docs.iter().map(String::as_str).collect();
+        let order: Vec<u32> = (0..DICT_LIFETIME_DOCS).rev().collect();
+        let (blob, json) = build_standard_blob_with(&refs, Some(&order));
+        let probe = FtsReader::open(blob.clone(), &json).expect("open");
+        let dict = probe.dict_range.clone();
+        // The share is half of 90% of this, so the dictionary cannot fit in it.
+        let refused = ConnectionMemoryBudget::with_limit(dict.len() as u64);
+        let roomy = ConnectionMemoryBudget::measured();
+        let cases = [
+            (QueryDict::default(), 0, "no budget"),
+            (QueryDict::with_budget(&refused), 0, "no room"),
+            (QueryDict::with_budget(&roomy), 1, "room"),
+        ];
+        for (query_dict, live_at_map_read, label) in cases {
+            let source = Arc::new(DictWatchSource {
+                blob: blob.clone(),
+                regions: OnceLock::new(),
+                live: Arc::new(AtomicUsize::new(0)),
+                live_at_map_reads: Mutex::new(Vec::new()),
+            });
+            let src: Arc<dyn LazyByteSource> = source.clone();
+            let r = FtsReader::open_lazy(src, &json, OpenOptions::for_object_store())
+                .await
+                .expect("open_lazy");
+            let map = r.doc_map_region.clone().expect("the fixture is reordered");
+            source
+                .regions
+                .set((r.dict_range.clone(), map))
+                .expect("regions set once");
+            let (rows, _) = r
+                .token_match_prefetched("body", &["alpha"], BoolMode::Or, None, &query_dict)
+                .await
+                .expect("token_match");
+            assert_eq!(
+                rows,
+                (0..DICT_LIFETIME_DOCS).collect::<Vec<_>>(),
+                "{label}: every row matches"
+            );
+            let seen = source.live_at_map_reads.lock().expect("map reads").clone();
+            assert!(!seen.is_empty(), "{label}: the match reads the doc-id map");
+            assert!(
+                seen.iter().all(|&live| live == live_at_map_read),
+                "{label}: dictionary buffers live at the map read: {seen:?}"
+            );
+        }
     }
 
     #[tokio::test]

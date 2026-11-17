@@ -652,6 +652,14 @@ mod tests {
     /// Words per row that no other row has, which set the dictionary's size.
     const DICT_TEST_WORDS_PER_ROW: usize = 30;
 
+    /// Distinct `rust…` words across those rows: the vocabulary the test's `LIKE 'rust…%'`s expand
+    /// over.
+    const DICT_TEST_RUST_WORDS: usize = 500;
+
+    /// Distinct `tokio…` words across those rows: a vocabulary no `LIKE` matches, so the
+    /// dictionary holds more than the expansions read.
+    const DICT_TEST_TOKIO_WORDS: usize = 300;
+
     /// A limit whose half share cannot hold that dictionary but leaves the vector search room.
     const NO_ROOM_FOR_A_DICTIONARY: u64 = 4 * 1024 * 1024;
 
@@ -1237,7 +1245,12 @@ mod tests {
                 let words: Vec<String> = (0..DICT_TEST_WORDS_PER_ROW)
                     .map(|w| format!("u{n}x{w}"))
                     .collect();
-                format!("rust{} tokio{} {}", n % 500, n % 300, words.join(" "))
+                format!(
+                    "rust{} tokio{} {}",
+                    n % DICT_TEST_RUST_WORDS,
+                    n % DICT_TEST_TOKIO_WORDS,
+                    words.join(" ")
+                )
             })
             .collect();
         let dir = TempDir::new().expect("dir");
