@@ -1422,15 +1422,21 @@ fn order_centroids_geometrically(centroids: &mut [f32], dim: usize, n_cent: usiz
 /// In-RAM encoded rebuild (maintenance / compaction): thin adapter over the
 /// shared cell-pack core. Rows are packed in `local_doc_id` order; callers
 /// pass dense `0..n` ids (the streamed core renumbers rows positionally, so
-/// sorted-dense input keeps ids stable).
+/// sorted-dense input keeps ids stable). The build's files go under
+/// `scratch`.
 fn build_subsection_from_materialized(
     cfg: VectorConfig,
     requested_n_cent: usize,
     mut rows: Vec<MaterializedIvfRow>,
+    scratch: &Path,
 ) -> Result<SubsectionBytes, BuildError> {
     rows.sort_by_key(|r| r.local_doc_id);
-    let merged =
-        build_cell_subsection_in_memory(cfg, requested_n_cent, CellPackSource::Rows(rows))?;
+    let merged = build_cell_subsection_in_memory(
+        cfg,
+        requested_n_cent,
+        CellPackSource::Rows(rows),
+        scratch,
+    )?;
     Ok(SubsectionBytes {
         bytes: merged.bytes,
         n_cent: merged.n_cent,
@@ -1440,16 +1446,29 @@ fn build_subsection_from_materialized(
     })
 }
 
-/// Build one complete cell-IVF subsection from materialized Sq8 rows,
-/// returned as a [`MergedIvfSubsection`] ready for multi-cell packing.
+/// [`build_merged_subsection_from_materialized_in`] with the build's files
+/// under `storage.scratch_root`.
+#[cfg(test)]
 pub(crate) fn build_merged_subsection_from_materialized(
     cfg: VectorConfig,
     requested_n_cent: usize,
     rows: Vec<MaterializedIvfRow>,
 ) -> Result<MergedIvfSubsection, BuildError> {
+    build_merged_subsection_from_materialized_in(cfg, requested_n_cent, rows, &scratch_root())
+}
+
+/// Build one complete cell-IVF subsection from materialized Sq8 rows,
+/// returned as a [`MergedIvfSubsection`] ready for multi-cell packing. The
+/// build's files go under `scratch`.
+pub(crate) fn build_merged_subsection_from_materialized_in(
+    cfg: VectorConfig,
+    requested_n_cent: usize,
+    rows: Vec<MaterializedIvfRow>,
+    scratch: &Path,
+) -> Result<MergedIvfSubsection, BuildError> {
     let n_docs = rows.len() as u32;
     let rerank_codec = cfg.rerank_codec;
-    let sub = build_subsection_from_materialized(cfg, requested_n_cent, rows)?;
+    let sub = build_subsection_from_materialized(cfg, requested_n_cent, rows, scratch)?;
     Ok(MergedIvfSubsection {
         bytes: sub.bytes,
         n_cent: sub.n_cent,
@@ -2162,6 +2181,27 @@ fn sample_fp32_rows(vectors: &[f32], sample_size: usize, dim: usize, seed: u64) 
     sample
 }
 
+/// The most memory a [`build_cell_subsection_from_source`] over `n_docs`
+/// rows of `row_bytes` each holds at once, page cache included: its fp32
+/// training sample, a bucket writer and an Sq8 ruler per cluster, and the
+/// bytes it writes. Each row is written twice, to its cluster's bucket file
+/// and to the finished subsection, and written bytes sit in the page cache,
+/// charged to the process's memory, until they reach disk. A caller running
+/// many cell builds at once sizes them by this.
+pub(crate) fn cell_build_peak_bytes(
+    dim: usize,
+    requested_n_cent: usize,
+    n_docs: usize,
+    row_bytes: usize,
+) -> u64 {
+    let n_cent = effective_cell_n_cent(requested_n_cent, n_docs);
+    let sample_rows = partition_kmeans_sample_size(n_cent, n_docs).min(n_docs);
+    let sample = sample_rows * dim * size_of::<f32>();
+    let per_cluster = n_cent * (BUCKET_BUF_SIZE + 2 * dim * size_of::<f32>());
+    let written = 2 * n_docs * row_bytes;
+    (sample + per_cluster + written) as u64
+}
+
 /// Shared cell-pack core: build one complete cell-IVF subsection from any
 /// [`CellPackSource`], writing the subsection and stable-id stream directly
 /// to disk. The single builder behind the drain (spilled rows), the
@@ -2496,17 +2536,18 @@ pub(crate) fn build_merged_subsection_from_spilled_materialized(
     )
 }
 
-/// Run the shared cell-pack core into a scratch tempdir and read the
+/// Run the shared cell-pack core into a tempdir under `scratch` and read the
 /// finished subsection back as in-memory bytes — the shape the commit-time
 /// superfile assembly and the maintenance merge paths consume.
 fn build_cell_subsection_in_memory(
     cfg: VectorConfig,
     requested_n_cent: usize,
     source: CellPackSource<'_>,
+    scratch: &Path,
 ) -> Result<MergedIvfSubsection, BuildError> {
     let scratch_dir = tempfile::Builder::new()
         .prefix("cell-")
-        .tempdir_in(scratch_root())?;
+        .tempdir_in(scratch)?;
     let subsection_path = scratch_dir.path().join("cell.ivf");
     let stable_ids_path = scratch_dir.path().join("cell.ids");
     let built = build_cell_subsection_from_source(
@@ -2541,7 +2582,8 @@ fn build_cell_subsection_in_memory(
 /// (the same trainer, assigner, bucket scatter, and assembly the drain's
 /// cross-commit spill feeder runs), so commit and drain pack cells through
 /// literally one builder. `stable_ids` adds the inline identity region
-/// needed by packed cells and boundary stubs.
+/// needed by packed cells and boundary stubs. The build's files go under
+/// `scratch`.
 ///
 /// `vectors` is row-major (`n_docs × dim`); length must be a multiple of `cfg.dim`.
 pub(crate) fn build_merged_subsection_from_fp32(
@@ -2549,6 +2591,7 @@ pub(crate) fn build_merged_subsection_from_fp32(
     requested_n_cent: usize,
     vectors: Arc<Vec<f32>>,
     stable_ids: &[i128],
+    scratch: &Path,
 ) -> Result<MergedIvfSubsection, BuildError> {
     build_cell_subsection_in_memory(
         cfg,
@@ -2557,6 +2600,7 @@ pub(crate) fn build_merged_subsection_from_fp32(
             vectors: &vectors,
             stable_ids,
         },
+        scratch,
     )
 }
 
@@ -2585,7 +2629,7 @@ fn build_subsection_streaming(
         // maintenance rebuild sizes its IVF to the rows it is fed.
         let rows_len = rows.len();
         let requested_n_cent = n_cent_row_count_cap(rows_len).min(rows_len).max(1);
-        return build_subsection_from_materialized(cfg, requested_n_cent, rows);
+        return build_subsection_from_materialized(cfg, requested_n_cent, rows, scratch);
     }
 
     let dim = cfg.dim;
@@ -3474,6 +3518,24 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[test]
+    fn a_cell_build_counts_its_sample_and_what_it_writes() {
+        // A drain cell of 2.8M rows at 768 dimensions, Sq16 spill rows: the
+        // writes (each row twice) dominate the training sample.
+        const ROWS: usize = 2_800_000;
+        const ROW_BYTES: usize = 1_661;
+        let peak = cell_build_peak_bytes(768, 2_200, ROWS, ROW_BYTES);
+        let written = (2 * ROWS * ROW_BYTES) as u64;
+        assert!(peak > written, "the writes alone are {written}, got {peak}");
+        assert!(
+            (10_000_000_000..12_500_000_000).contains(&peak),
+            "about 11 GB for this cell, got {peak}"
+        );
+        // Twice the rows, about twice the memory.
+        let bigger = cell_build_peak_bytes(768, 4_400, 2 * ROWS, ROW_BYTES);
+        assert!(bigger > 2 * written && bigger < 2 * peak + peak / 4);
+    }
     use crate::superfile::vector::{
         cell_posting::EncodedCellRow, reader::VectorReader, spill::MaterializedRowSpillWriter,
     };
@@ -4165,8 +4227,14 @@ mod tests {
             provided_centroids: None,
         };
         let ids: Vec<i128> = (0..n as i128).map(|i| 9_000 + i).collect();
-        let sub = build_merged_subsection_from_fp32(cfg.clone(), 64, Arc::new(corpus), &ids)
-            .expect("fp32 build");
+        let sub = build_merged_subsection_from_fp32(
+            cfg.clone(),
+            64,
+            Arc::new(corpus),
+            &ids,
+            &scratch_root(),
+        )
+        .expect("fp32 build");
         assert_eq!(sub.n_docs, n as u32);
         assert!(sub.n_cent >= 1);
         assert!(!sub.bytes.is_empty());

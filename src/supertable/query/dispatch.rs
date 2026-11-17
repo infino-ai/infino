@@ -767,9 +767,10 @@ where
 }
 
 /// [`fanout_with`] for units the caller has ordered by how much they can
-/// still contribute: at most `window` units are in flight, units start in
-/// the given order, and `skip_before_open` is asked about each unit just
-/// before its superfile would be opened — so a unit that can no longer
+/// still contribute: at most `window(answered)` units are in flight once
+/// `answered` of them have answered, units start in the given order, and
+/// `skip_before_open` is asked about each unit just before its superfile
+/// would be opened — so a unit that can no longer
 /// change the outcome (its score ceiling is below the running k-th score)
 /// is never opened at all. Results come back in completion order, which
 /// the callers here merge order-independently.
@@ -826,10 +827,10 @@ pub(crate) type ReplanFuture<'a, P, R> =
 /// `replan` resolves the units not yet issued are handed to it and replaced
 /// by what it returns. A plan still unresolved when the last open finishes
 /// is dropped unawaited.
-pub(crate) async fn fanout_with_ordered<'a, P, R, B, Fut, S>(
+pub(crate) async fn fanout_with_ordered<'a, P, R, B, Fut, S, W>(
     reader: &SupertableReader,
     units: Vec<(Arc<SuperfileEntry>, P)>,
-    window: usize,
+    window: W,
     skip_before_open: S,
     body: B,
     mut on_result: impl FnMut(&R),
@@ -839,12 +840,14 @@ where
     P: Send + 'static,
     R: Send + 'static,
     S: Fn(&P) -> bool,
+    W: Fn(usize) -> usize,
     B: Fn(Arc<SuperfileReader>, Arc<SuperfileEntry>, Option<Arc<SidecarCache>>, Instant, P) -> Fut
         + Clone
         + Send
         + 'static,
     Fut: Future<Output = Result<R, QueryError>> + Send + 'static,
 {
+    let window = |answered: usize| window(answered).max(1);
     let tiers = OpenTierCounts::for_current_span();
     // Nothing to open — the index answered for every superfile, or the
     // floor ruled them all out — is still an outcome the phase reports.
@@ -856,7 +859,8 @@ where
     }
     trace!(
         units = units.len(),
-        window, "fanning query out across superfiles in ceiling order"
+        window = window(0),
+        "fanning query out across superfiles in ceiling order"
     );
     let ctx = FanoutContext::new(reader, &units, true, reader.open_intent(), tiers.clone()).await;
     let started = Instant::now();
@@ -882,9 +886,9 @@ where
     let mut opened = 0u64;
     let mut pending: VecDeque<(Arc<SuperfileEntry>, P)> = units.into();
     let mut replan = replan;
-    let window = window.max(1);
-    let cap_ahead_of_plan = pending.len() > PENDING_PLAN_MIN_WINDOWS * window;
+    let cap_ahead_of_plan = pending.len() > PENDING_PLAN_MIN_WINDOWS * window(0);
     loop {
+        let window = window(out.len());
         let issue = match (
             replan.is_some() && cap_ahead_of_plan,
             out.len() < FLOOR_WINDOW,
@@ -998,7 +1002,7 @@ where
     fanout_with_ordered(
         reader,
         units,
-        window,
+        |_| window,
         skip_before_open,
         local_hits_body(kernel),
         on_result,
@@ -1009,7 +1013,7 @@ where
 
 /// The per-unit body of the local-hits fan-outs: run the kernel, tag its
 /// hits with the superfile, and drop the tombstoned ones.
-fn local_hits_body<P, K, Fut>(
+pub(crate) fn local_hits_body<P, K, Fut>(
     kernel: K,
 ) -> impl Fn(
     Arc<SuperfileReader>,
@@ -1337,7 +1341,7 @@ mod fanout_tier_tests {
         let out = fanout_with_ordered(
             &reader,
             units,
-            WIDE_WINDOW,
+            |_| WIDE_WINDOW,
             |_: &()| false,
             body,
             |_: &()| {},

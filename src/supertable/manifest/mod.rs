@@ -85,7 +85,7 @@ pub use summaries::ColumnStats;
 use tokio::{
     join,
     runtime::{Handle, RuntimeFlavor},
-    sync::OnceCell,
+    sync::{Mutex, OnceCell},
     task::{JoinError, block_in_place, spawn, spawn_blocking},
 };
 use tracing::{Instrument, warn};
@@ -118,7 +118,7 @@ use crate::{
                 EncodedPart, PointerFile, frame_content_size, part_uri, read_pointer,
                 translate_contention, write_manifest, write_object_bytes, write_pointer,
             },
-            disk_cache::MetadataDiskCache,
+            disk_cache::{KeptWhole, MetadataDiskCache},
             encoding::SummaryWireMode,
             list::{
                 FORMAT_VERSION as LIST_FORMAT_VERSION, Manifest, ManifestPartEntry,
@@ -180,10 +180,6 @@ pub(crate) const DEFAULT_VECTOR_INDEX_PREFIX: &str = "_vector_index";
 /// attempt that wrote them, so what this bounds is how much stays alive
 /// between attempts. A part past it is rebuilt on each attempt, as before.
 const REBUILT_PARTS_MAX_BYTES: usize = 256 * 1024 * 1024;
-/// Headroom over a list's part bytes when sizing the manifest disk cache, in
-/// divisor form (`bytes + bytes / this`), for the term-index slices and
-/// routing siblings that share the cache.
-const MANIFEST_CACHE_HEADROOM_DIVISOR: u64 = 10;
 
 /// One immutable point-in-time view of the supertable.
 ///
@@ -1184,24 +1180,37 @@ impl ManifestSnapshot {
         //    loads each part's routing sibling (counts + 1-bit slab, no
         //    fp32) when the list stamps one — the user table's centroid
         //    payload stays in storage, mirroring the slow-blob sibling.
-        let loader = Arc::new(ManifestPartLoader::new_with_legacy_names(
+        let mut loader = ManifestPartLoader::new_with_legacy_names(
             Arc::clone(&storage),
             &list,
             options.metadata_disk_cache.clone(),
             options.summary_centroids_from_superfiles,
             options.legacy_names(),
-        ));
-        // The rollups the list names but does not carry, read before any
-        // reader or commit sees the entries.
-        fill_rollups(
-            &mut list,
-            current_manifest
-                .as_ref()
-                .and_then(|current| current.list.as_ref()),
-            &storage,
-            options.metadata_disk_cache.as_ref(),
-        )
-        .await?;
+        );
+        // A load keeps the snapshot it loads over as it is, with or without statistics (a statistics
+        // read swaps the handle's snapshot in place, `with_statistics`); a first load follows the
+        // open. Without them it reads no rollups and no summaries section.
+        let statistics = current_manifest
+            .as_ref()
+            .map_or(options.load_statistics, |current| {
+                current.statistics_loaded()
+            });
+        if statistics {
+            // The rollups the list names but does not carry, read before any
+            // reader or commit sees the entries.
+            fill_rollups(
+                &mut list,
+                current_manifest
+                    .as_ref()
+                    .and_then(|current| current.list.as_ref()),
+                &storage,
+                options.metadata_disk_cache.as_ref(),
+            )
+            .await?;
+        } else {
+            loader = loader.without_statistics();
+        }
+        let loader = Arc::new(loader);
         let parts: DashMap<_, _> = DashMap::new();
         let mut all_superfiles: Vec<Arc<SuperfileEntry>> = Vec::new();
 
@@ -1457,6 +1466,85 @@ impl ManifestSnapshot {
             new_manifest.superfile_list.superfiles.len() as u64,
         );
         Ok(Arc::new(new_manifest))
+    }
+
+    /// Whether this snapshot's superfiles carry their per-column statistics: `false` only for one
+    /// loaded without them (`SupertableOptions::load_statistics`).
+    pub(crate) fn statistics_loaded(&self) -> bool {
+        self.loader.as_ref().is_none_or(|loader| loader.statistics)
+    }
+
+    /// This snapshot with the statistics its load skipped: the rollups and each loaded part's
+    /// summaries section, and nothing else. Decoded parts are kept; a part not loaded yet loads
+    /// with its section. Itself when it has them.
+    pub(crate) async fn with_statistics(self: &Arc<Self>) -> Result<Arc<Self>, ManifestLoadError> {
+        let (Some(list), Some(loader)) = (&self.list, &self.loader) else {
+            return Ok(Arc::clone(self));
+        };
+        if loader.statistics {
+            return Ok(Arc::clone(self));
+        }
+        let options = &self.superfile_list.options;
+        let mut list = list.clone();
+        let loader = Arc::new(loader.reading_statistics());
+        let loaded: Vec<Arc<ManifestPart>> = self
+            .parts
+            .iter()
+            .filter_map(|cell| cell.value().get().cloned())
+            .collect();
+        let sections = load_parts_bounded(
+            loaded
+                .iter()
+                .map(|part| loader.with_section(part))
+                .collect(),
+        );
+        let rollups = fill_rollups(
+            &mut list,
+            None,
+            &loader.storage,
+            options.metadata_disk_cache.as_ref(),
+        );
+        let (rollups, sectioned) = join!(rollups, sections);
+        rollups?;
+        let parts: DashMap<_, _> = list
+            .parts
+            .iter()
+            .map(|entry| (entry.part_id, Arc::new(OnceCell::new())))
+            .collect();
+        let mut entries = HashMap::new();
+        for part in sectioned {
+            let part = part?;
+            for entry in &part.superfiles {
+                entries.insert(entry.superfile_id, Arc::clone(entry));
+            }
+            if let Some(cell) = parts.get(&part.part_id) {
+                cell.set(part).expect("fresh cell");
+            }
+        }
+        let superfile_list = SuperfileList {
+            superfiles: self
+                .superfile_list
+                .superfiles
+                .iter()
+                .map(|entry| Arc::clone(entries.get(&entry.superfile_id).unwrap_or(entry)))
+                .collect(),
+            options: Arc::clone(options),
+            manifest_id: self.superfile_list.manifest_id,
+            vector_index_storage_prefix: self.superfile_list.vector_index_storage_prefix.clone(),
+            next_manifest_id_floor: self.superfile_list.next_manifest_id_floor,
+        };
+        Ok(Arc::new(ManifestSnapshot {
+            superfile_list,
+            list: Some(list),
+            parts,
+            loader: Some(loader),
+            stamped_partition_strategy: self.stamped_partition_strategy.clone(),
+            stamped_global_vector_index: self.stamped_global_vector_index.clone(),
+            stamped_drained_ranges: self.stamped_drained_ranges.clone(),
+            stamped_schema: self.stamped_schema.clone(),
+            derived_length_totals: Arc::clone(&self.derived_length_totals),
+            inline_rollups_fit: Arc::clone(&self.inline_rollups_fit),
+        }))
     }
 
     /// Commit a new manifest version.
@@ -2526,6 +2614,34 @@ impl ManifestSnapshot {
             .find(|id| ids.contains(id))
     }
 
+    /// Which of `ids` this manifest lists. Reads the resident superfiles when
+    /// they are the whole table, and loads the list's parts otherwise: a
+    /// lazily loaded manifest holds only the parts read so far, and an id in
+    /// a part not yet read is listed all the same. One pass, stopping once
+    /// every id is found.
+    pub(crate) async fn listed_of(
+        &self,
+        mut ids: FxHashSet<Uuid>,
+    ) -> Result<FxHashSet<Uuid>, ManifestLoadError> {
+        let mut listed = FxHashSet::default();
+        if ids.is_empty() {
+            return Ok(listed);
+        }
+        let all = match self.resident_superfiles() {
+            Some(all) => all,
+            None => Cow::Owned(self.get_all_superfiles_loaded().await?),
+        };
+        for entry in all.iter() {
+            if ids.remove(&entry.superfile_id) {
+                listed.insert(entry.superfile_id);
+                if ids.is_empty() {
+                    break;
+                }
+            }
+        }
+        Ok(listed)
+    }
+
     /// The parts that hold any of `ids`, found without loading a part. A
     /// complete flat view lists every part's superfiles in list order, so
     /// each run of `n_superfiles` entries is one part. `None` when the flat
@@ -3464,6 +3580,7 @@ enum TermIndexSlot {
 
 /// What the list says about one part: where its objects are and what
 /// they must hash to.
+#[derive(Clone)]
 struct PartRefs {
     content_hash: ContentHash,
     uri: String,
@@ -3471,6 +3588,7 @@ struct PartRefs {
     summaries: Option<SummariesRef>,
 }
 
+#[derive(Clone)]
 pub struct ManifestPartLoader {
     storage: Arc<dyn StorageProvider>,
     /// Each part's objects, read off the manifest list at construction;
@@ -3494,13 +3612,16 @@ pub struct ManifestPartLoader {
     /// the same reference reuses it; a commit that published a delta has a
     /// new root and loads that instead. A root that can never load is kept
     /// as its failure.
-    term_index: tokio::sync::Mutex<Option<TermIndexSlot>>,
+    term_index: Arc<Mutex<Option<TermIndexSlot>>>,
     /// The tier chunks read so far, shared by every root this loader goes
     /// through: a delta commit replaces the root, not the tiers.
     tier_chunks: term_index::TierChunkCache,
     /// Resolves the column names a part written before field ids used as
     /// summary keys.
     legacy: Arc<LegacyNames>,
+    /// Whether a part load also reads its summaries section; `false` on a handle opened without
+    /// statistics ([`SupertableOptions::load_statistics`]).
+    statistics: bool,
 }
 
 impl ManifestPartLoader {
@@ -3562,12 +3683,12 @@ impl ManifestPartLoader {
                 },
             );
         }
-        // Holds every part of the list, so a full load reuses the cache
-        // instead of evicting parts before the next load reads them.
+        // Keeps every part of the list, so a full load reuses the cache
+        // instead of evicting parts before the next load reads them. The
+        // latest loader sets the size, whichever list it loads; one for an
+        // older list costs refetches until the next load corrects it.
         if let Some(cache) = &metadata_disk_cache {
-            cache.raise_budget(
-                part_bytes.saturating_add(part_bytes / MANIFEST_CACHE_HEADROOM_DIVISOR),
-            );
+            cache.keep_whole(KeptWhole::Manifest, part_bytes);
         }
         Self {
             storage,
@@ -3575,9 +3696,10 @@ impl ManifestPartLoader {
             metadata_disk_cache,
             prefer_routing,
             open_blob_budget: Arc::new(OpenBlobBudget::new(DEFAULT_OPEN_BLOB_BUDGET_BYTES)),
-            term_index: tokio::sync::Mutex::new(None),
+            term_index: Arc::default(),
             tier_chunks: term_index::new_tier_chunk_cache(),
             legacy: Arc::new(legacy),
+            statistics: true,
         }
     }
 
@@ -3622,6 +3744,12 @@ impl ManifestPartLoader {
         }
     }
 
+    /// This loader reading no summaries sections: every part's superfiles read as unavailable.
+    fn without_statistics(mut self) -> Self {
+        self.statistics = false;
+        self
+    }
+
     /// Fetch + verify + decode one part. Returns the parsed
     /// `Arc<ManifestPart>`.
     ///
@@ -3658,10 +3786,7 @@ impl ManifestPartLoader {
         part_id: PartId,
         prefer_routing: bool,
     ) -> Result<Arc<ManifestPart>, ManifestLoadError> {
-        let refs = self
-            .parts_index
-            .get(&part_id)
-            .ok_or(ManifestLoadError::PartNotInList { part_id })?;
+        let refs = self.refs(part_id)?;
         // Routing decode lands in the stripped in-memory shape; both forms
         // are content-addressed, so the disk cache can never mix them.
         let (expected_hash, uri) = match (prefer_routing, &refs.routing) {
@@ -3672,15 +3797,65 @@ impl ManifestPartLoader {
         // The part and its summaries section are fetched together: the
         // list entry names both, so the section's round trip overlaps the
         // part's instead of following its decode.
-        let section = async {
-            match refs.summaries.as_ref() {
-                Some(reference) => self.load_summaries(reference).await.map(Some),
-                None => Ok(None),
-            }
-        };
-        let (parsed, section) = join!(self.load_part_bytes(expected_hash, uri), section);
+        let (parsed, section) = join!(self.load_part_bytes(expected_hash, uri), self.section(refs));
+        let mut part = parsed?;
+        if part.part_id != part_id {
+            return Err(ManifestLoadError::PartIdMismatch {
+                listed: part_id,
+                decoded: part.part_id,
+            });
+        }
+        if !self.statistics && refs.summaries.is_some() {
+            mark_statistics_unavailable(&mut part);
+            return Ok(Arc::new(part));
+        }
         Ok(Arc::new(attach_summaries(
-            parsed?,
+            part,
+            refs.summaries.as_ref(),
+            section,
+        )?))
+    }
+
+    /// What the list says about part `part_id`.
+    fn refs(&self, part_id: PartId) -> Result<&PartRefs, ManifestLoadError> {
+        self.parts_index
+            .get(&part_id)
+            .ok_or(ManifestLoadError::PartNotInList { part_id })
+    }
+
+    /// The summaries section `refs` names, when this loader reads statistics and the part has one.
+    async fn section(
+        &self,
+        refs: &PartRefs,
+    ) -> Result<Option<Arc<SummariesSection>>, ManifestLoadError> {
+        match refs.summaries.as_ref().filter(|_| self.statistics) {
+            Some(reference) => self.load_summaries(reference).await.map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// A copy of this loader that also reads the summaries sections, sharing the term index and
+    /// tier chunks already read.
+    fn reading_statistics(&self) -> Self {
+        Self {
+            statistics: true,
+            ..self.clone()
+        }
+    }
+
+    /// `part`, loaded without its statistics, with its summaries section attached; `part` itself
+    /// when it has none.
+    async fn with_section(
+        &self,
+        part: &Arc<ManifestPart>,
+    ) -> Result<Arc<ManifestPart>, ManifestLoadError> {
+        let refs = self.refs(part.part_id)?;
+        if refs.summaries.is_none() {
+            return Ok(Arc::clone(part));
+        }
+        let section = self.section(refs).await;
+        Ok(Arc::new(attach_summaries(
+            (**part).clone(),
             refs.summaries.as_ref(),
             section,
         )?))
@@ -4193,6 +4368,10 @@ pub enum ManifestLoadError {
     /// missing an entry.
     #[error("part_id not in manifest list: {part_id}")]
     PartNotInList { part_id: PartId },
+    /// The part the list names `listed` decodes as part `decoded`: a corrupt list that names one
+    /// part under two ids. Its hash checks pass, as the bytes are the part's own.
+    #[error("manifest list names part {decoded} as {listed}")]
+    PartIdMismatch { listed: PartId, decoded: PartId },
     /// Storage backend returned an error.
     #[error("storage error during part load: {0}")]
     Storage(#[source] StorageError),
@@ -4286,7 +4465,8 @@ pub enum ScalarStats {
     /// beside its part rather than into it, so a failure to read the
     /// statistics never becomes their loss; a fresh handle reads the
     /// section again. A [`Self::Section`] row whose group cannot be read
-    /// back from the cache is treated the same way ([`Self::readable`]).
+    /// back from the cache is treated the same way ([`Self::readable`]), and so is every row of a
+    /// handle opened without statistics ([`ManifestSnapshot::statistics_loaded`]).
     Unavailable,
 }
 
@@ -4357,8 +4537,8 @@ impl ScalarStats {
         }
     }
 
-    /// Whether the statistics live in a section this handle could not
-    /// read, or has so far failed to read a group of, so that no commit may
+    /// Whether the statistics live in a section this handle did not or could
+    /// not read, or has so far failed to read a group of, so that no commit may
     /// write them anew from what it sees. Cheap: it reads nothing. A writer
     /// asks [`Self::readable`], which reads everything first.
     pub fn is_unavailable(&self) -> bool {
@@ -6178,7 +6358,7 @@ mod tests {
     use super::*;
     use crate::{
         IndexSpec, connect,
-        runtime_metrics::rss::purge_allocator,
+        runtime_metrics::{io::UsageMeter, rss::purge_allocator},
         storage::LocalFsStorageProvider,
         superfile::{builder::FtsConfig, vector::distance::distance},
         supertable::{
@@ -7958,6 +8138,30 @@ mod tests {
             ));
         }
 
+        /// A list that names one part under a second id fails the load of that id, rather than
+        /// file the part under an id it does not carry.
+        #[tokio::test]
+        async fn a_part_listed_under_another_id_fails_its_load() {
+            let part = make_test_part(23);
+            let (objects, mut entries) = encode_and_index(&[part]);
+            let mut alias = entries[0].clone();
+            alias.part_id = PartId(Uuid::from_bytes([24; 16]));
+            entries.push(alias.clone());
+            let storage = Arc::new(CountingMockStorage::new(objects));
+            let manifest = build_manifest_with_loader(
+                fresh_list(entries),
+                Arc::clone(&storage) as Arc<dyn StorageProvider>,
+            );
+            let err = manifest
+                .get_part_by_id(alias.part_id)
+                .await
+                .expect_err("must reject");
+            assert!(
+                matches!(err, ManifestLoadError::PartIdMismatch { .. }),
+                "expected PartIdMismatch, got {err:?}"
+            );
+        }
+
         #[tokio::test]
         async fn part_id_not_in_list_surfaces_typed_error() {
             let part = make_test_part(19);
@@ -8058,6 +8262,54 @@ mod tests {
                 parts.len(),
                 "the second load is served from the cache"
             );
+
+            let _ = std::fs::remove_dir_all(&cache_root);
+        }
+
+        #[tokio::test]
+        async fn a_smaller_list_evicts_the_parts_only_the_old_list_read() {
+            // A list of four parts, then its successor of one new part: the
+            // cache shrinks to the new list, and caching the new part makes
+            // room by evicting the old list's parts.
+            let old: Vec<ManifestPart> = (41..45).map(make_test_part).collect();
+            let new = make_test_part(45);
+            let (mut objects, old_entries) = encode_and_index(&old);
+            let (new_objects, new_entries) = encode_and_index(from_ref(&new));
+            objects.extend(new_objects);
+            let storage = Arc::new(CountingMockStorage::new(objects)) as Arc<dyn StorageProvider>;
+            let old_hashes: Vec<ContentHash> =
+                old_entries.iter().map(|entry| entry.content_hash).collect();
+            let new_hash = new_entries[0].content_hash;
+            let cache_root =
+                std::env::temp_dir().join("infino-manifest-cache-loader-test-smaller_list_evicts");
+            let _ = std::fs::remove_dir_all(&cache_root);
+            let cache = MetadataDiskCache::new(cache_root.clone(), 0).expect("cache");
+
+            let old_list = fresh_list(old_entries);
+            let loader = ManifestPartLoader::new_with_cache(
+                Arc::clone(&storage),
+                &old_list,
+                Some(Arc::clone(&cache)),
+            );
+            for part in &old {
+                loader.load(part.part_id).await.expect("load old");
+            }
+            for hash in &old_hashes {
+                assert!(cache.contains(hash), "the old list is cached whole");
+            }
+
+            let new_list = fresh_list(new_entries);
+            let loader = ManifestPartLoader::new_with_cache(
+                Arc::clone(&storage),
+                &new_list,
+                Some(Arc::clone(&cache)),
+            );
+            loader.load(new.part_id).await.expect("load new");
+            assert!(cache.contains(&new_hash), "the new part is cached");
+            for hash in &old_hashes {
+                assert!(!cache.contains(hash), "an old part made room");
+            }
+            assert!(cache.stats().current_bytes <= cache.budget_bytes());
 
             let _ = std::fs::remove_dir_all(&cache_root);
         }
@@ -10025,6 +10277,85 @@ mod tests {
                 .get_all_superfiles()
                 .iter()
                 .all(|entry| entry.scalar_stats.get(amount).is_none())
+        );
+    }
+
+    /// The sectioned table's options for a handle opened without statistics, whose parts load
+    /// lazily, one by one, when `lazy`.
+    fn statistics_free_opts(lazy: bool) -> Arc<SupertableOptions> {
+        let mut opts = SupertableOptions::new(simple_schema(), vec![], vec![])
+            .expect("valid options")
+            .without_statistics();
+        if lazy {
+            opts.eager_load_threshold_parts = 0;
+        }
+        Arc::new(opts)
+    }
+
+    /// A snapshot loaded without statistics reads them in place: every part's entries get their
+    /// section rows, whether its parts were loaded at open or are loaded after.
+    #[tokio::test]
+    async fn a_snapshot_without_statistics_reads_them_in_place_eager_or_lazy() {
+        let (_dir, storage, _, _) = published_sectioned_table().await;
+        let amount = fid("amount");
+        for lazy in [false, true] {
+            let loaded = ManifestSnapshot::load(
+                None,
+                Arc::clone(&storage),
+                Some(statistics_free_opts(lazy)),
+            )
+            .await
+            .expect("load");
+            assert!(!loaded.statistics_loaded());
+            let upgraded = loaded.with_statistics().await.expect("read the statistics");
+            assert!(upgraded.statistics_loaded());
+            let part_id = upgraded.get_all_list_entries()[0].part_id;
+            let part = upgraded.get_part_by_id(part_id).await.expect("part");
+            assert!(
+                part.superfiles
+                    .iter()
+                    .all(|entry| entry.scalar_stats.get(amount).is_some()),
+                "lazy: {lazy}"
+            );
+            // An eager snapshot's flat entries are what SQL pruning and aggregates read, so they
+            // carry the statistics too, not only the part cache.
+            if !lazy {
+                let flat = upgraded.get_all_superfiles();
+                assert_eq!(flat.len(), part.superfiles.len());
+                assert!(
+                    flat.iter()
+                        .all(|entry| entry.scalar_stats.get(amount).is_some())
+                );
+            }
+        }
+    }
+
+    /// A section that cannot be read when a snapshot reads its statistics in place leaves its part
+    /// without them, as a load with them would, and does not fail the read.
+    #[tokio::test]
+    async fn a_section_that_cannot_be_read_in_place_leaves_its_part_without_statistics() {
+        let (_dir, storage, _, reference) = published_sectioned_table().await;
+        let loaded = ManifestSnapshot::load(
+            None,
+            Arc::clone(&storage),
+            Some(statistics_free_opts(false)),
+        )
+        .await
+        .expect("load");
+        storage
+            .put_overwrite(&reference.uri, Bytes::from_static(b"not a section"))
+            .await
+            .expect("corrupt the section");
+        let upgraded = loaded
+            .with_statistics()
+            .await
+            .expect("a corrupt section does not fail the read");
+        assert!(upgraded.statistics_loaded());
+        assert!(
+            upgraded
+                .get_all_superfiles()
+                .iter()
+                .all(|entry| entry.scalar_stats.is_unavailable())
         );
     }
 
@@ -13097,6 +13428,64 @@ mod tests {
         assert_eq!(read.get_all_list_entries().len(), entries.len());
         for (back, entry) in read.get_all_list_entries().iter().zip(entries) {
             assert_eq!(back.rollups, entry.rollups);
+            assert_eq!(back.scalar_stats_agg, entry.scalar_stats_agg);
+        }
+    }
+
+    /// A wide table opened without statistics reads none of its rollups
+    /// objects; reading the statistics in place reads each once, and fills
+    /// every part's rollups as the commits folded them.
+    #[test]
+    fn a_wide_table_without_statistics_reads_each_rollups_object_once_in_place() {
+        let (dir, _, st) = wide_rollups_table();
+        let rt = Runtime::new().expect("runtime");
+        let written = st.inner().manifest.load_full();
+        let stored: HashSet<String> = written
+            .get_all_list_entries()
+            .iter()
+            .map(|entry| {
+                entry
+                    .rollups
+                    .reference()
+                    .expect("stored rollups")
+                    .uri
+                    .clone()
+            })
+            .collect();
+        assert!(stored.len() > 1, "the fixture spans several parts");
+        // A meter of its own: the process-wide one counts every other test's reads too.
+        let meter = UsageMeter::new();
+        let traced: Arc<dyn StorageProvider> = Arc::new(
+            LocalFsStorageProvider::new_with_meter(dir.path(), Arc::clone(&meter))
+                .expect("provider"),
+        );
+        let rollups_gets = || {
+            meter
+                .take_trace()
+                .into_iter()
+                .filter(|get| get.uri.contains(MANIFEST_ROLLUPS_DIR))
+                .map(|get| get.uri)
+                .collect::<Vec<_>>()
+        };
+
+        meter.start_trace();
+        let fresh =
+            Supertable::open(rollups_wide_options(&traced).without_statistics()).expect("open");
+        assert_eq!(rollups_gets(), Vec::<String>::new(), "no rollups at open");
+
+        let loaded = fresh.inner().manifest.load_full();
+        meter.start_trace();
+        let upgraded = rt
+            .block_on(loaded.with_statistics())
+            .expect("read the statistics");
+        let read = rollups_gets();
+        assert_eq!(read.len(), stored.len(), "one read per object: {read:?}");
+        assert_eq!(read.into_iter().collect::<HashSet<_>>(), stored);
+        for (back, entry) in upgraded
+            .get_all_list_entries()
+            .iter()
+            .zip(written.get_all_list_entries())
+        {
             assert_eq!(back.scalar_stats_agg, entry.scalar_stats_agg);
         }
     }
