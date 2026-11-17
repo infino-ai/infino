@@ -34,6 +34,7 @@ pub(crate) mod build;
 #[cfg(test)]
 mod fold_tool;
 pub(crate) mod format;
+pub(crate) mod level_head;
 pub(crate) mod tier;
 
 use std::{

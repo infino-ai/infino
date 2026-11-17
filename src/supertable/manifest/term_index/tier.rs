@@ -319,7 +319,7 @@ pub(crate) fn encode_block(block: &[TierEntry], out: &mut Vec<u8>) {
 
 /// Append `values` at `bits` each, least significant bit first, no padding
 /// between values; the stream ends on a byte boundary.
-fn pack_stream(out: &mut Vec<u8>, bits: u8, values: impl ExactSizeIterator<Item = u64>) {
+pub(crate) fn pack_stream(out: &mut Vec<u8>, bits: u8, values: impl ExactSizeIterator<Item = u64>) {
     let start = out.len();
     out.resize(start + payload_bytes(values.len(), bits), 0);
     for (i, v) in values.enumerate() {
