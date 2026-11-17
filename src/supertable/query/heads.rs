@@ -57,7 +57,7 @@ use super::{
 };
 use crate::{
     superfile::fts::{
-        bm25::{dequantize_len, quantize_len, score_with_dl_norm_k1},
+        bm25::{dequantize_len, quantize_len, score_with_dl_norm_k1, tf_factor},
         reader::{GlobalTermIdf, norm_table},
     },
     supertable::{
@@ -73,12 +73,20 @@ use crate::{
 /// Head bytes a query reads at most before it stops and opens what is
 /// still in play: a few seconds of reads on a cold store.
 pub(crate) const HEAD_READ_BUDGET_BYTES: u64 = 256 << 20;
+/// What is left of the heads a query still wants is read to the end when
+/// no more than this, even after a round that changed nothing: read whole,
+/// the heads answer for their superfiles, where ties at the threshold would
+/// otherwise open them.
+const HEAD_FINISH_BYTES: u64 = 4 << 20;
 /// Steps of the water-filling's search for its common marginal gain; each
 /// halves the interval, so the allocation it bounds with is within a
 /// negligible share of the budget it was given.
 const WATER_FILL_STEPS: usize = 64;
 /// Length buckets: the one-byte codes the length quantizer gives.
 const LEN_BUCKETS: usize = 1 << u8::BITS;
+/// The largest term frequency a bound searches when a term's per-bucket
+/// maxima are unknown: past any tf a document of a length bucket holds.
+const TF_SEARCH_MAX: u32 = u32::MAX >> 1;
 
 /// The longest length each bucket holds: the quantizer keeps a length's
 /// top bits, so a bucket spans up to the next code's first length. A code
@@ -138,6 +146,9 @@ impl Head {
 struct Candidate {
     len: u8,
     known: TermMask,
+    /// Per term, its frequency here once known.
+    tf: Vec<u32>,
+    /// Per bare term, its contribution once known; zero otherwise.
     contrib: Vec<f32>,
 }
 
@@ -154,13 +165,34 @@ struct Slot {
     heads: Vec<Option<usize>>,
     scale_up: f32,
     deny: Option<Arc<RoaringBitmap>>,
+    id_min: i128,
     id_max: i128,
+    /// Whether the superfile was built at exactly the table's average, so
+    /// its stored keys are the kernel's own `tf / (tf + norm)`.
+    same_norms: bool,
 }
 
-/// The query's terms' weights and the kernel's length norms.
+/// One phrase of the query: its members (term indices in order, a
+/// repeated word repeated), its weight — the members' idfs summed, every
+/// occurrence counted, as the kernel weights it — and whether a match must
+/// carry it.
+struct Phrase {
+    members: Vec<usize>,
+    idf: f32,
+    required: bool,
+}
+
+/// The query's terms' weights, its shape and the kernel's length norms.
 struct Weights {
     idf: Vec<f32>,
     norm: Arc<[f32; LEN_BUCKETS]>,
+    /// A bit per term that scores on its own; a phrase member that is not
+    /// also a bare term scores only through its phrase.
+    scoring: TermMask,
+    /// A bit per term a match must carry: the musts and every member of a
+    /// must-phrase.
+    required: TermMask,
+    phrases: Vec<Phrase>,
 }
 
 impl Weights {
@@ -168,6 +200,16 @@ impl Weights {
     /// bucket `len`: the kernel's own arithmetic.
     fn contribution(&self, t: usize, tf: u32, len: u8) -> f32 {
         score_with_dl_norm_k1(self.idf[t], tf, self.norm[usize::from(len)])
+    }
+
+    /// Whether a candidate is known to match, so its known sum is a lower
+    /// bound on a match's score: it carries every required term and a bare
+    /// term at least, and the query requires no phrase, whose presence only
+    /// positions can show.
+    fn counts(&self, c: &Candidate) -> bool {
+        c.known & self.required == self.required
+            && c.known & self.scoring != 0
+            && self.phrases.iter().all(|p| !p.required)
     }
 }
 
@@ -198,13 +240,7 @@ pub(crate) async fn select(
     let started = Instant::now();
     let terms = query.terms;
     let nt = terms.len();
-    if nt == 0
-        || nt > MAX_TIER_TERMS
-        || query.k == 0
-        || kept.is_empty()
-        || !query.phrases.is_empty()
-        || query.negated
-    {
+    if nt == 0 || nt > MAX_TIER_TERMS || query.k == 0 || kept.is_empty() || query.negated {
         return Ok(None);
     }
     let mut idf = Vec::with_capacity(nt);
@@ -214,9 +250,21 @@ pub(crate) async fn select(
         };
         idf.push(w);
     }
+    let phrases = query
+        .phrases
+        .iter()
+        .map(|(members, required)| Phrase {
+            idf: members.iter().map(|&m| idf[m]).sum(),
+            members: members.clone(),
+            required: *required,
+        })
+        .collect();
     let weights = Weights {
         idf,
         norm: norm_table(query.table_avgdl, query.params),
+        scoring: query.scoring,
+        required: query.required,
+        phrases,
     };
     let slot_of: HashMap<_, usize> = kept
         .iter()
@@ -241,7 +289,9 @@ pub(crate) async fn select(
             heads: vec![None; nt],
             scale_up,
             deny: query.deny.get(i).cloned().flatten(),
+            id_min: e.id_min,
             id_max: e.id_max,
+            same_norms: baked == query.table_avgdl,
         });
     }
     let slot_for = |ordinal: u32| {
@@ -307,9 +357,10 @@ pub(crate) async fn select(
             });
         }
     }
-    let required = query.required;
     let k = query.k;
-    let exact_scores = nt <= EXACT_SUM_TERMS;
+    // Scores are the kernel's bit for bit up to two bare terms; a phrase's
+    // takes positions the heads do not hold.
+    let exact_scores = nt <= EXACT_SUM_TERMS && weights.phrases.is_empty();
     // Past two terms a candidate's sum may round differently from the
     // kernel's, which adds in its own order.
     let lb_slack = match exact_scores {
@@ -322,21 +373,24 @@ pub(crate) async fn select(
     // What the last round left: its threshold and the slots it left in play.
     let mut last: Option<(f32, usize)> = None;
     loop {
-        theta = kth_lower_bound(&candidates, required, k, lb_slack);
-        bounds = slot_bounds(&slots, &heads, &candidates, &weights, required, lb_slack);
+        theta = kth_lower_bound(&candidates, &weights, k, lb_slack);
+        bounds = slot_bounds(&slots, &heads, &candidates, &weights, lb_slack);
         if fetched >= HEAD_READ_BUDGET_BYTES {
             break;
         }
         // A round that neither raised the threshold nor ruled a slot out
         // ends the reading: on documents that tie across the table the
         // bounds sit at the threshold however deep the heads are read, and
-        // the opens settle the ties by `_id` instead.
+        // the opens settle the ties by `_id` instead; a query of required
+        // phrases finds no threshold in the heads, which hold no
+        // positions, and its opens, in bound order, find it.
         let in_play = bounds.iter().filter(|(_, ub)| *ub > theta).count();
-        if theta.is_finite() && last == Some((theta, in_play)) {
+        let no_threshold_here = weights.phrases.iter().any(|p| p.required);
+        if (theta.is_finite() || no_threshold_here) && last == Some((theta, in_play)) {
             break;
         }
         last = Some((theta, in_play));
-        let wanted = heads_that_matter(&slots, &heads, &candidates, &weights, &bounds, theta);
+        let wanted = heads_that_matter(&slots, &heads, &candidates, &bounds, theta);
         if wanted.is_empty() {
             break;
         }
@@ -382,11 +436,11 @@ pub(crate) async fn select(
             }
         }
     }
+    let theta_id_max = theta_id_max(&candidates, &slots, &weights, k, lb_slack, theta);
     let resolved = match exact_scores {
-        true => resolve(&slots, &heads, &candidates, required),
+        true => resolve(&slots, &heads, &candidates, &weights, theta, theta_id_max),
         false => Vec::new(),
     };
-    let theta_id_max = theta_id_max(&candidates, &slots, required, k, lb_slack, theta);
     Ok(Some(TierSelection {
         bounds: bounds
             .into_iter()
@@ -423,11 +477,15 @@ fn absorb(
         .or_insert_with(|| Candidate {
             len,
             known: 0,
+            tf: vec![0; nt],
             contrib: vec![0.0; nt],
         });
     if c.known & (1 << t) == 0 {
         c.known |= 1 << t;
-        c.contrib[t] = weights.contribution(t, tf, len);
+        c.tf[t] = tf;
+        if weights.scoring & (1 << t) != 0 {
+            c.contrib[t] = weights.contribution(t, tf, len);
+        }
     }
 }
 
@@ -435,13 +493,13 @@ fn absorb(
 /// term; `NEG_INFINITY` when fewer than `k` do.
 fn kth_lower_bound(
     candidates: &HashMap<(u32, u32), Candidate>,
-    required: TermMask,
+    weights: &Weights,
     k: usize,
     lb_slack: f32,
 ) -> f32 {
     let mut lbs: Vec<f32> = candidates
         .values()
-        .filter(|c| c.known & required == required)
+        .filter(|c| weights.counts(c))
         .map(|c| c.sum() * lb_slack)
         .collect();
     if lbs.len() < k {
@@ -475,7 +533,6 @@ fn slot_bounds(
     heads: &[Head],
     candidates: &HashMap<(u32, u32), Candidate>,
     weights: &Weights,
-    required: TermMask,
     lb_slack: f32,
 ) -> Vec<(f32, f32)> {
     // Slots of one layer read the same heads at the same scale: their
@@ -486,38 +543,125 @@ fn slot_bounds(
         .map(|slot| {
             let unseen = *by_shape
                 .entry((&slot.heads, slot.scale_up.to_bits()))
-                .or_insert_with(|| unseen_bound(slot, heads, weights, required));
+                .or_insert_with(|| unseen_bound(slot, heads, weights));
             (f32::NEG_INFINITY, unseen)
         })
         .collect();
     for (&(s, _), c) in candidates {
         let slot = &slots[s as usize];
         let (lb, ub) = &mut out[s as usize];
-        if c.known & required == required {
+        if weights.counts(c) {
             *lb = lb.max(c.sum() * lb_slack);
         }
-        *ub = ub.max(candidate_bound(slot, heads, weights, required, c));
+        *ub = ub.max(candidate_bound(slot, heads, weights, c));
     }
     out
 }
 
-/// A bound on a candidate's score: its known contributions, and per term
-/// not yet seen for it what the term's unread entries can still add.
-/// `NEG_INFINITY` when a required term can no longer be seen for it.
-fn candidate_bound(
+/// What a head's unread entries can be in bucket `len` at a slot's scale:
+/// a bound on their key, and the largest tf the term has there when known.
+/// `None` when the term has no document of that length.
+fn unread_facts(head: &Head, scale_up: f32, len: u8) -> Option<(f32, Option<u32>)> {
+    let key = head.unread() * scale_up * BOUND_SLACK;
+    match &head.buckets {
+        None => Some((key, None)),
+        Some(buckets) => buckets.get(len).map(|tf| (key, Some(tf))),
+    }
+}
+
+/// A bound on what `phrase` adds to a document of bucket `len` in `slot`:
+/// its weight times its occurrences' key, which is at most every member's
+/// key, with occurrences no more than any member's tf and the length over
+/// the member count. A candidate's known members give their tfs; the rest
+/// bound by their heads. Zero when the document cannot hold the phrase.
+fn phrase_cap(
+    phrase: &Phrase,
     slot: &Slot,
     heads: &[Head],
     weights: &Weights,
-    required: TermMask,
-    c: &Candidate,
+    len: u8,
+    seen: Option<&Candidate>,
 ) -> f32 {
+    let norm = weights.norm[usize::from(len)];
+    let mut key = f32::INFINITY;
+    let mut tf = BUCKET_MAX_LEN[usize::from(len)] / phrase.members.len().max(1) as u32;
+    for &m in &phrase.members {
+        if let Some(c) = seen
+            && c.known & (1 << m) != 0
+        {
+            tf = tf.min(c.tf[m]);
+            continue;
+        }
+        let Some(h) = slot.heads[m] else {
+            return 0.0;
+        };
+        let head = &heads[h];
+        let max_tf = match &head.buckets {
+            None => TF_SEARCH_MAX,
+            Some(buckets) => match buckets.get(len) {
+                None => return 0.0,
+                Some(max_tf) => max_tf,
+            },
+        };
+        match slot.same_norms {
+            // Stored keys are the kernel's: the member's unread documents
+            // hold at most the largest tf keying under its bound.
+            true => tf = tf.min(max_tf_under(head.unread(), norm, max_tf)),
+            false => {
+                key = key.min(head.unread() * slot.scale_up * BOUND_SLACK);
+                tf = tf.min(max_tf);
+            }
+        }
+    }
+    if tf == 0 || key <= 0.0 {
+        return 0.0;
+    }
+    // At most that many occurrences, scored as the kernel scores them, bit
+    // for bit: a superfile whose phrase only ties the floor is settled by
+    // `_id` order unopened.
+    let by_tf = score_with_dl_norm_k1(phrase.idf, tf, norm);
+    match key.is_finite() {
+        false => by_tf,
+        true => (by_tf * BOUND_SLACK).min(phrase.idf * key),
+    }
+}
+
+/// Whether term `t` can still be found for a document of bucket `len` in
+/// `slot` that no read entry of it named.
+fn may_hold(slot: &Slot, heads: &[Head], t: usize, len: u8) -> bool {
+    slot.heads[t]
+        .and_then(|h| unread_facts(&heads[h], slot.scale_up, len))
+        .is_some_and(|(key, _)| key > 0.0)
+}
+
+/// A bound on a candidate's score: its known contributions, per bare term
+/// not yet seen for it what the term's unread entries can still add, and
+/// per phrase its cap. `NEG_INFINITY` when the candidate can no longer
+/// carry a required term or phrase.
+fn candidate_bound(slot: &Slot, heads: &[Head], weights: &Weights, c: &Candidate) -> f32 {
+    // Every bare term seen and no phrase: the known sum is the score, the
+    // kernel's own bit for bit up to two terms.
+    if weights.phrases.is_empty()
+        && c.known & weights.scoring == weights.scoring
+        && weights.scoring.count_ones() as usize <= EXACT_SUM_TERMS
+    {
+        return c.sum();
+    }
     let mut ub = c.sum() * BOUND_SLACK;
     for (t, h) in slot.heads.iter().enumerate() {
         if c.known & (1 << t) != 0 {
             continue;
         }
-        let cap = h.map_or(0.0, |h| term_cap(&heads[h], slot.scale_up, weights, c.len));
-        if cap <= 0.0 && required & (1 << t) != 0 {
+        if weights.required & (1 << t) != 0 && !may_hold(slot, heads, t, c.len) {
+            return f32::NEG_INFINITY;
+        }
+        if weights.scoring & (1 << t) != 0 {
+            ub += h.map_or(0.0, |h| term_cap(&heads[h], slot.scale_up, weights, c.len));
+        }
+    }
+    for phrase in &weights.phrases {
+        let cap = phrase_cap(phrase, slot, heads, weights, c.len, Some(c));
+        if cap <= 0.0 && phrase.required {
             return f32::NEG_INFINITY;
         }
         ub += cap;
@@ -528,42 +672,108 @@ fn candidate_bound(
 /// A bound on any document of `slot` that no head has named yet;
 /// `NEG_INFINITY` when none can match: a required term the slot lacks, or
 /// one whose head was read whole.
-fn unseen_bound(slot: &Slot, heads: &[Head], weights: &Weights, required: TermMask) -> f32 {
-    let present: Vec<usize> = slot.heads.iter().flatten().copied().collect();
+fn unseen_bound(slot: &Slot, heads: &[Head], weights: &Weights) -> f32 {
     for (t, h) in slot.heads.iter().enumerate() {
-        if required & (1 << t) != 0 && h.is_none_or(|h| heads[h].whole()) {
+        if weights.required & (1 << t) != 0 && h.is_none_or(|h| heads[h].whole()) {
             return f32::NEG_INFINITY;
         }
     }
-    if present.is_empty() {
+    let bare: Vec<usize> = slot
+        .heads
+        .iter()
+        .enumerate()
+        .filter(|(t, _)| weights.scoring & (1 << t) != 0)
+        .filter_map(|(_, h)| *h)
+        .collect();
+    if bare.is_empty() && weights.phrases.is_empty() {
         return f32::NEG_INFINITY;
     }
+    if let [h] = bare[..]
+        && weights.phrases.is_empty()
+        && slot.same_norms
+    {
+        return single_term_bound(&heads[h], weights);
+    }
     let mut best = f32::NEG_INFINITY;
-    let mut caps = Vec::with_capacity(present.len());
-    let mut idfs = Vec::with_capacity(present.len());
-    for len in 0..LEN_BUCKETS {
+    let mut caps = Vec::with_capacity(bare.len());
+    let mut idfs = Vec::with_capacity(bare.len());
+    'bucket: for len in 0..LEN_BUCKETS {
         let len = len as u8;
+        let mut phrases = 0.0f32;
+        for phrase in &weights.phrases {
+            let cap = phrase_cap(phrase, slot, heads, weights, len, None);
+            if cap <= 0.0 && phrase.required {
+                continue 'bucket;
+            }
+            phrases += cap;
+        }
         caps.clear();
         idfs.clear();
-        for &h in &present {
+        for &h in &bare {
             let cap = term_cap(&heads[h], slot.scale_up, weights, len);
             if cap > 0.0 {
                 caps.push(cap);
                 idfs.push(weights.idf[heads[h].term]);
             }
         }
-        if caps.is_empty() {
+        if caps.is_empty() && phrases <= 0.0 {
             continue;
         }
-        let bound = water_fill(
-            &idfs,
-            &caps,
-            weights.norm[usize::from(len)],
-            BUCKET_MAX_LEN[usize::from(len)],
-        );
-        best = best.max(bound * BOUND_SLACK);
+        let terms = match caps.is_empty() {
+            true => 0.0,
+            false => water_fill(
+                &idfs,
+                &caps,
+                weights.norm[usize::from(len)],
+                BUCKET_MAX_LEN[usize::from(len)],
+            ),
+        };
+        best = best.max((terms + phrases) * BOUND_SLACK);
     }
     best
+}
+
+/// The exact bound on an unread document of one term in a superfile whose
+/// stored keys are the kernel's own: per length bucket, the largest tf
+/// whose key stays under the head's unread bound, scored as the kernel
+/// scores it. A document that only ties the threshold then bounds at it
+/// bit for bit, and is settled by `_id` order unopened.
+fn single_term_bound(head: &Head, weights: &Weights) -> f32 {
+    let cap = head.unread();
+    let mut best = f32::NEG_INFINITY;
+    for len in 0..LEN_BUCKETS {
+        let len = len as u8;
+        let max_tf = match &head.buckets {
+            None => TF_SEARCH_MAX,
+            Some(buckets) => match buckets.get(len) {
+                None => continue,
+                Some(tf) => tf,
+            },
+        };
+        let tf = max_tf_under(cap, weights.norm[usize::from(len)], max_tf);
+        if tf > 0 {
+            best = best.max(weights.contribution(head.term, tf, len));
+        }
+    }
+    best
+}
+
+/// The largest tf up to `max_tf` whose key `tf / (tf + norm)` stays at or
+/// under `cap`; zero when even one occurrence keys above it. The key
+/// rises with tf.
+fn max_tf_under(cap: f32, norm: f32, max_tf: u32) -> u32 {
+    if max_tf == 0 || tf_factor(1, norm) > cap {
+        return 0;
+    }
+    let (mut lo, mut hi) = (1u32, max_tf);
+    while lo < hi {
+        let mid = lo + (hi - lo).div_ceil(2);
+        match tf_factor(mid, norm) <= cap {
+            true => lo = mid,
+            false => hi = mid - 1,
+        }
+    }
+    lo
 }
 
 /// The largest `Σ_t min(idf_t · x_t / (x_t + norm), cap_t)` over real
@@ -636,7 +846,6 @@ fn heads_that_matter(
     slots: &[Slot],
     heads: &[Head],
     candidates: &HashMap<(u32, u32), Candidate>,
-    weights: &Weights,
     bounds: &[(f32, f32)],
     theta: f32,
 ) -> Vec<usize> {
@@ -657,7 +866,7 @@ fn heads_that_matter(
         for (t, h) in slot.heads.iter().enumerate() {
             if let Some(h) = *h
                 && c.known & (1 << t) == 0
-                && term_cap(&heads[h], slot.scale_up, weights, c.len) > 0.0
+                && may_hold(slot, heads, t, c.len)
             {
                 wanted[h] = true;
             }
@@ -677,7 +886,9 @@ fn resolve(
     slots: &[Slot],
     heads: &[Head],
     candidates: &HashMap<(u32, u32), Candidate>,
-    required: TermMask,
+    weights: &Weights,
+    theta: f32,
+    theta_id_max: i128,
 ) -> Vec<(usize, Vec<(u32, f32)>)> {
     let whole: Vec<bool> = slots
         .iter()
@@ -693,10 +904,16 @@ fn resolve(
         }
     }
     for (&(s, row), c) in candidates {
+        // Only what can still place: a document below the threshold cannot,
+        // nor one that only ties it in a superfile whose `_id`s all lie past
+        // the threshold's documents', which rank ahead of it.
+        let score = c.sum();
+        let places = score > theta || (score == theta && slots[s as usize].id_min <= theta_id_max);
         if let Some(hits) = out.get_mut(&(s as usize))
-            && c.known & required == required
+            && weights.counts(c)
+            && places
         {
-            hits.push((row, c.sum()));
+            hits.push((row, score));
         }
     }
     let mut out: Vec<(usize, Vec<(u32, f32)>)> = out.into_iter().collect();
@@ -710,7 +927,7 @@ fn resolve(
 fn theta_id_max(
     candidates: &HashMap<(u32, u32), Candidate>,
     slots: &[Slot],
-    required: TermMask,
+    weights: &Weights,
     k: usize,
     lb_slack: f32,
     theta: f32,
@@ -720,7 +937,7 @@ fn theta_id_max(
     }
     let mut top: Vec<(f32, i128)> = candidates
         .iter()
-        .filter(|(_, c)| c.known & required == required)
+        .filter(|(_, c)| weights.counts(c))
         .map(|(&(s, _), c)| (c.sum() * lb_slack, slots[s as usize].id_max))
         .filter(|(lb, _)| *lb >= theta)
         .collect();
