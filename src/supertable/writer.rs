@@ -5311,13 +5311,14 @@ async fn write_superfile_terms(
                 // A term the dictionary lists but no cursor could describe
                 // keeps its presence and is given the ceiling that prunes
                 // nothing rather than one that could be wrong.
-                let (df, bound, location, tail, head) = match fact {
+                let (df, bound, location, tail, head, buckets) = match fact {
                     Some(f) => (
                         f.df,
                         f.bound,
                         term_index::Location::from_dict_value(f.entry),
                         f.head.tail,
                         f.head.docs,
+                        Some(f.head.buckets),
                     ),
                     None => (
                         0,
@@ -5325,9 +5326,18 @@ async fn write_superfile_terms(
                         term_index::Location::None,
                         f32::INFINITY,
                         Vec::new(),
+                        None,
                     ),
                 };
-                writer.push(&column_id.term_key(term), df, bound, location, tail, &head)?;
+                writer.push_with_buckets(
+                    &column_id.term_key(term),
+                    df,
+                    bound,
+                    location,
+                    tail,
+                    &head,
+                    buckets.as_deref(),
+                )?;
             }
             let done = n_in_chunk < TERM_INDEX_BATCH_TERMS;
             after = last_term;

@@ -1122,6 +1122,7 @@ impl ContributionWriter {
     /// Append one term with its head — `(row, term frequency, length
     /// bucket)` in descending key — and the tail the head leaves. Keys must
     /// arrive in strictly ascending order.
+    #[cfg(test)]
     pub(crate) fn push(
         &mut self,
         key: &[u8],
@@ -1131,11 +1132,25 @@ impl ContributionWriter {
         tail: f32,
         head: &[(u32, u32, u8)],
     ) -> Result<(), TermIndexError> {
+        self.push_with_buckets(key, df, bound, location, tail, head, None)
+    }
+
+    /// [`Self::push`] with the term's per-bucket maxima, when known.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn push_with_buckets(
+        &mut self,
+        key: &[u8],
+        df: u64,
+        bound: f32,
+        location: Location,
+        tail: f32,
+        head: &[(u32, u32, u8)],
+        buckets: Option<&[(u8, u32)]>,
+    ) -> Result<(), TermIndexError> {
         let mut encoded = mem::take(&mut self.head);
         encoded.clear();
         push_head(&mut encoded, head.iter().copied());
-        // A head read back from a superfile carries no per-bucket maxima.
-        let pushed = self.push_encoded(key, df, bound, location, tail, &encoded, None);
+        let pushed = self.push_encoded(key, df, bound, location, tail, &encoded, buckets);
         self.head = encoded;
         pushed
     }
