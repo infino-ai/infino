@@ -35,7 +35,6 @@ use crate::{
             dispatch::{self, tag_hits, tombstone_deny_set},
             hits_page::Page,
         },
-        reader_cache::disk::ForegroundQueryGuard,
         tombstones::SidecarCache,
     },
     utils::trace::detail_span,
@@ -151,14 +150,16 @@ impl SupertableReader {
         Ok(Some(order.into_iter().take(k).map(|i| hits[i]).collect()))
     }
 
-    /// Sync [`Self::sorted_hits_async`] through the sync→async bridge.
+    /// Sync [`Self::sorted_hits_async`] through the sync→async bridge, for
+    /// tests: `sorted_search` runs it through `Supertable::hits_page`.
+    #[cfg(test)]
     pub(crate) fn sorted_hits(
         &self,
         column: &str,
         descending: bool,
         k: usize,
     ) -> Result<Option<Vec<SuperfileHit>>, QueryError> {
-        let _foreground = ForegroundQueryGuard::enter();
+        let _foreground = crate::supertable::reader_cache::disk::ForegroundQueryGuard::enter();
         self.block_on(self.sorted_hits_async(column, descending, k))
     }
 }
