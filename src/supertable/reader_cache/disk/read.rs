@@ -21,7 +21,7 @@ use crate::{
     supertable::{
         StorageRangeSource,
         manifest::{SubsectionOffsets, SuperfileUri},
-        reader_cache::disk::*,
+        reader_cache::disk::{heap::free_elsewhere, *},
     },
 };
 
@@ -319,7 +319,9 @@ impl DiskCacheStore {
         let entry = self
             .fetch_from_source(uri, storage_key, intent, offsets, storage)
             .await?;
-        self.release_unheld_lazy_entries_over_cap();
+        // Freeing thousands of footers and page indexes takes seconds: the open that crossed the
+        // cap does not wait for it.
+        free_elsewhere(self.release_unheld_lazy_entries_over_cap());
         Ok((entry, OpenTier::Source))
     }
 

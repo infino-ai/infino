@@ -19,7 +19,7 @@ use std::{
     fmt,
     future::Future,
     sync::{
-        Arc, Mutex, MutexGuard, OnceLock, Weak,
+        Arc, Mutex, MutexGuard, OnceLock, TryLockError, Weak,
         atomic::{AtomicBool, AtomicU64},
     },
     time::{Duration, Instant},
@@ -71,7 +71,7 @@ use crate::{
         },
         reader_cache::{
             ReadIntent,
-            disk::{DiskCacheError, skip_background_fill},
+            disk::{CachedSessions, DiskCacheError, skip_background_fill},
         },
         stats::process_rss_bytes,
         tombstones::{SidecarCache, TombstoneSeqView, cache::DEFAULT_SEAL_TTL},
@@ -2532,6 +2532,29 @@ fn install_disk_cache_pinning(inner: &Arc<SupertableInner>) {
     };
     let pinned_fn: Arc<dyn Fn() -> HashSet<SuperfileUri> + Send + Sync> = Arc::new(HashSet::new);
     cache.set_pinned_fn(pinned_fn);
+    // Short of memory with held files filling the budget, the cache drops this table's cached
+    // sessions so the files they prepared can leave.
+    let sessions: Weak<dyn CachedSessions> = Arc::downgrade(inner) as Weak<dyn CachedSessions>;
+    cache.heap_budget().register_sessions(sessions);
+}
+
+impl CachedSessions for SupertableInner {
+    fn drop_cached_sessions(&self) {
+        // Taken out under each lock and dropped after it, as a commit's replacement is.
+        let session = take_unless_busy(&self.sql_session_cache);
+        let plans = take_unless_busy(&self.sql_logical_plan_cache);
+        drop((session, plans));
+    }
+}
+
+/// What `cache` holds, taken out, unless its lock is in use (a statement building this table's
+/// session): then it stays, as the pass never waits on a table.
+fn take_unless_busy<T>(cache: &Mutex<Option<T>>) -> Option<T> {
+    match cache.try_lock() {
+        Ok(mut held) => held.take(),
+        Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner().take(),
+        Err(TryLockError::WouldBlock) => None,
+    }
 }
 
 /// Build the tombstone-sidecar cache when storage is attached.

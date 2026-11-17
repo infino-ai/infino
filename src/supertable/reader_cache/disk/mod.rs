@@ -541,7 +541,7 @@ pub(crate) use budget::{Reservation, ScratchCharge, ScratchRoom};
 pub(crate) use fetch::{open_batch_overlay, skip_background_fill};
 #[cfg(test)]
 pub(crate) use heap::HeapBudget;
-pub(crate) use heap::HeapReservation;
+pub(crate) use heap::{CachedSessions, HeapReservation};
 pub(crate) use sources::{
     ArcMmapOwner, mmap_readonly_bytes, mmap_temp_file_bytes, release_temp_file, temp_file_behind,
 };
@@ -1020,6 +1020,30 @@ pub(crate) mod test_support {
         )
     }
 
+    /// Cache `reader` for `uri` with `residency`, `size_bytes` of the disk budget released as
+    /// `accounting` says, last used at `last_access_us`.
+    pub(super) fn cache_entry(
+        store: &DiskCacheStore,
+        uri: SuperfileUri,
+        reader: Arc<SuperfileReader>,
+        residency: Residency,
+        size_bytes: Arc<AtomicU64>,
+        accounting: EntryAccounting,
+        last_access_us: u64,
+    ) {
+        store.cached.insert(
+            uri,
+            Arc::new(CachedEntry {
+                heap: OnceLock::new(),
+                reader,
+                residency,
+                size_bytes,
+                accounting,
+                last_access_us: AtomicU64::new(last_access_us),
+            }),
+        );
+    }
+
     /// Cache `reader` for `uri` as a file held whole in memory, as a hybrid fill's first copy is
     /// before it is written to disk and mapped.
     pub(crate) fn cache_buffered(
@@ -1027,16 +1051,16 @@ pub(crate) mod test_support {
         uri: SuperfileUri,
         reader: Arc<SuperfileReader>,
     ) {
-        store.cached.insert(
+        let size_bytes = Arc::new(AtomicU64::new(0));
+        let accounting = EntryAccounting::Eager;
+        cache_entry(
+            store,
             uri,
-            Arc::new(CachedEntry {
-                heap: OnceLock::new(),
-                reader,
-                residency: Residency::Buffered,
-                size_bytes: Arc::new(AtomicU64::new(0)),
-                accounting: EntryAccounting::Eager,
-                last_access_us: AtomicU64::new(store.now_us()),
-            }),
+            reader,
+            Residency::Buffered,
+            size_bytes,
+            accounting,
+            store.now_us(),
         );
     }
 

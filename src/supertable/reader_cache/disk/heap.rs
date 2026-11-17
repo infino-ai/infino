@@ -8,16 +8,18 @@
 //! - each counted cache entry holds a [`HeapReservation`], which gives its bytes back when it drops;
 //! - past the budget, and only while the rest of the process leaves the metadata less room than the
 //!   budget, the files read lazily or held whole in memory that no query holds leave the cache,
-//!   oldest first, keeping their downloaded blocks on disk. A file mapped whole from local disk is
-//!   not counted, and this budget never drops it.
+//!   oldest first, until they fit what queries leave of the budget (never under a quarter of it),
+//!   keeping their downloaded blocks on disk; when held files fill it, tables' cached SQL sessions
+//!   go too. A file mapped whole from local disk is not counted, and this budget never drops it.
 
 #[cfg(test)]
 use std::sync::atomic::AtomicBool;
 use std::{
     any::Any,
     cmp::Reverse,
+    ptr,
     sync::{
-        Arc, Mutex, OnceLock, PoisonError, Weak,
+        Arc, Mutex, OnceLock, PoisonError, TryLockError, Weak,
         atomic::{AtomicU64, Ordering},
         mpsc::{SyncSender, sync_channel},
     },
@@ -37,6 +39,10 @@ use crate::{
 /// metadata. The rest is for the queries themselves.
 const HEAP_BUDGET_PERCENT: u64 = 25;
 
+/// When held files fill the budget, the unheld files kept are a quarter of it: the files small
+/// statements just used stay, rather than leave and reopen at every statement end.
+const UNHELD_FLOOR_DIVISOR: u64 = 4;
+
 /// Batches of released readers waiting to be freed: past this many, the caller frees its own, so
 /// a burst of statements cannot pile up memory that is gone from the cache but not yet freed.
 const FREE_QUEUE_BATCHES: usize = 2;
@@ -44,27 +50,49 @@ const FREE_QUEUE_BATCHES: usize = 2;
 /// The freeing thread's name, as a stack dump shows it.
 const FREE_THREAD_NAME: &str = "infino-cache-free";
 
-/// Free `released` on one long-lived thread rather than the caller's: dropping thousands of
-/// decoded footers and page indexes takes seconds, and no query should wait on another's. The
-/// cache has already let them go and given back their count. Freed here when the thread cannot
-/// start or its queue is full; whatever is queued at exit is left to the process's end.
+/// Batches of released readers, freed on one long-lived thread rather than the caller's: dropping
+/// thousands of decoded footers and page indexes takes seconds, and no query should wait on
+/// another's. The cache has already let them go and given back their count.
+struct FreeQueue {
+    /// The thread's end of the queue, started on first use; `None` if the thread could not start.
+    sender: OnceLock<Option<SyncSender<Box<dyn Any + Send>>>>,
+}
+
+impl FreeQueue {
+    const fn new() -> Self {
+        Self {
+            sender: OnceLock::new(),
+        }
+    }
+
+    /// Free `released` on the queue's thread. When the thread cannot start, or
+    /// [`FREE_QUEUE_BATCHES`] batches are already waiting, they are freed here and the caller waits
+    /// for it. Whatever is queued at exit is left to the process's end.
+    fn free<T: Any + Send>(&self, released: Vec<T>) {
+        if released.is_empty() {
+            return;
+        }
+        let sender = self.sender.get_or_init(|| {
+            let (sender, batches) = sync_channel::<Box<dyn Any + Send>>(FREE_QUEUE_BATCHES);
+            thread::Builder::new()
+                .name(FREE_THREAD_NAME.into())
+                .spawn(move || batches.iter().for_each(drop))
+                .ok()
+                .map(|_| sender)
+        });
+        if let Some(sender) = sender {
+            // Full or gone: the batch comes back and is freed below.
+            let _ = sender.try_send(Box::new(released));
+        }
+    }
+}
+
+/// The process's freeing thread.
+static FREE: FreeQueue = FreeQueue::new();
+
+/// Free `released` on the process's freeing thread (see [`FreeQueue::free`]).
 pub(crate) fn free_elsewhere<T: Any + Send>(released: Vec<T>) {
-    static QUEUE: OnceLock<Option<SyncSender<Box<dyn Any + Send>>>> = OnceLock::new();
-    if released.is_empty() {
-        return;
-    }
-    let queue = QUEUE.get_or_init(|| {
-        let (queue, batches) = sync_channel::<Box<dyn Any + Send>>(FREE_QUEUE_BATCHES);
-        thread::Builder::new()
-            .name(FREE_THREAD_NAME.into())
-            .spawn(move || batches.iter().for_each(drop))
-            .ok()
-            .map(|_| queue)
-    });
-    if let Some(queue) = queue {
-        // Full or gone: the batch comes back and is freed below.
-        let _ = queue.try_send(Box::new(released));
-    }
+    FREE.free(released);
 }
 
 /// The process's budget. Each test builds its own, so tests never share a total.
@@ -82,10 +110,30 @@ fn memory_limit() -> Option<u64> {
     process_limit().or_else(|| *HOST.get_or_init(total_memory_bytes))
 }
 
-/// Whether the rest of the process leaves cached metadata less room than its `budget`: anonymous
-/// resident memory above `limit` minus the budget. A reading that cannot be taken counts as yes.
-fn short_of_memory(limit: u64, budget: u64) -> bool {
-    status_anon_rss_bytes().is_none_or(|anon| anon > limit.saturating_sub(budget))
+/// Whether `anon` resident bytes leave cached metadata less room than its `budget`: above `limit`
+/// minus the budget. A reading that cannot be taken counts as no, as for the SQL memory limit.
+fn leaves_too_little_room(anon: Option<u64>, limit: u64, budget: u64) -> bool {
+    anon.is_some_and(|anon| anon > limit.saturating_sub(budget))
+}
+
+/// The bytes of unheld files to keep when running statements hold `held` bytes of `share`: what is
+/// left of it, but never less than 1/[`UNHELD_FLOOR_DIVISOR`] of it.
+fn unheld_target(share: u64, held: u64) -> u64 {
+    (share / UNHELD_FLOOR_DIVISOR).max(share.saturating_sub(held))
+}
+
+/// What one walk over the caches found: the unheld files counted against a budget, oldest first
+/// (idle time, cache, file, bytes), and the bytes held and unheld.
+struct Scan {
+    oldest: Vec<(Reverse<u64>, usize, SuperfileUri, u64)>,
+    unheld: u64,
+    held: u64,
+}
+
+/// What keeps files between statements and can let them go: a table's cached SQL session.
+pub(crate) trait CachedSessions: Send + Sync {
+    /// Drop the cached sessions, outside any lock, so the files they prepared can leave.
+    fn drop_cached_sessions(&self);
 }
 
 /// Decoded bytes counted in a budget until this drops. Kept next to what it pays for, so the bytes
@@ -98,6 +146,16 @@ pub(crate) struct HeapReservation {
 }
 
 impl HeapReservation {
+    /// The bytes counted now.
+    fn bytes(&self) -> u64 {
+        self.bytes.load(Ordering::Acquire)
+    }
+
+    /// Whether these bytes count against `budget`.
+    fn counts_against(&self, budget: &HeapBudget) -> bool {
+        ptr::eq(self.budget, budget)
+    }
+
     /// Count `more` bytes in this reservation, kept until it drops.
     pub(crate) fn add(&self, more: u64) {
         self.budget.charged.fetch_add(more, Ordering::AcqRel);
@@ -124,6 +182,11 @@ pub(crate) struct HeapBudget {
     charged: AtomicU64,
     /// The caches whose files this budget may drop; dead ones are pruned when the list is touched.
     caches: Mutex<Vec<Weak<DiskCacheStore>>>,
+    /// The tables whose cached sessions hold files between statements; pruned like `caches`.
+    sessions: Mutex<Vec<Weak<dyn CachedSessions>>>,
+    /// Held by the running pass: one at a time, so two statements ending together do not both drop
+    /// files for the same excess.
+    pass: Mutex<()>,
     /// A test's own budget, in place of the process's.
     #[cfg(test)]
     fixed: Option<Option<u64>>,
@@ -137,6 +200,8 @@ impl HeapBudget {
         Self {
             charged: AtomicU64::new(0),
             caches: Mutex::new(Vec::new()),
+            sessions: Mutex::new(Vec::new()),
+            pass: Mutex::new(()),
             #[cfg(test)]
             fixed: None,
             #[cfg(test)]
@@ -181,7 +246,9 @@ impl HeapBudget {
         }
         memory_limit()
             .zip(self.budget())
-            .is_some_and(|(limit, budget)| short_of_memory(limit, budget))
+            .is_some_and(|(limit, budget)| {
+                leaves_too_little_room(status_anon_rss_bytes(), limit, budget)
+            })
     }
 
     /// The bytes reserved now.
@@ -200,47 +267,25 @@ impl HeapBudget {
         }
     }
 
-    /// Drop the oldest counted files no query holds until the total is back under budget, then each
-    /// cache's unheld lazy files past its cap. Does nothing under budget, with no budget, or while
-    /// the process has room to spare: then the cache keeps what it holds, as before.
+    /// Drop the oldest unheld files counted here until they are back under their target (see
+    /// [`unheld_target`]), then each cache's unheld lazy files past its cap. When held files alone
+    /// fill the budget, the tables' cached sessions are dropped first so theirs can leave too. Does
+    /// nothing under budget, with no budget, while the process has room to spare, or while another
+    /// pass runs: then the cache keeps what it holds, as before.
     pub(crate) fn release_over_budget(&self) {
         let Some(budget) = self.budget() else { return };
         let charged = self.charged.load(Ordering::Acquire);
         if charged <= budget || !self.short_of_memory() {
             return;
         }
-        let caches: Vec<Arc<DiskCacheStore>> = {
-            let mut list = self.caches.lock().unwrap_or_else(PoisonError::into_inner);
-            list.retain(|cache| cache.strong_count() > 0);
-            list.iter().filter_map(Weak::upgrade).collect()
+        // One pass at a time. A statement that ends while one runs leaves its files to the next
+        // statement end, so with no later statement they stay until the idle sweep.
+        let _pass = match self.pass.try_lock() {
+            Ok(pass) => pass,
+            Err(TryLockError::Poisoned(pass)) => pass.into_inner(),
+            Err(TryLockError::WouldBlock) => return,
         };
-        // Each cache stamps accesses on its own clock, started when it was, so files are ranked by
-        // how long each has been idle, not by their stamps.
-        let mut oldest: Vec<(Reverse<u64>, usize, SuperfileUri)> = Vec::new();
-        for (at, cache) in caches.iter().enumerate() {
-            let now_us = cache.now_us();
-            for entry in cache.cached.iter() {
-                if entry.value().heap.get().is_some()
-                    && cache.reclaimable_lazy_entry(entry.key(), entry.value())
-                {
-                    let last = entry.value().last_access_us.load(Ordering::Acquire);
-                    oldest.push((Reverse(now_us.saturating_sub(last)), at, *entry.key()));
-                }
-            }
-        }
-        oldest.sort_unstable();
-        let mut released = Vec::new();
-        for (_, at, uri) in oldest {
-            if self.charged.load(Ordering::Acquire) <= budget {
-                break;
-            }
-            released.extend(caches[at].release_lazy_entry(&uri, caches[at].now_us()));
-        }
-        // The lazy files past the cap would otherwise go at the next query's first open, which
-        // would pay for freeing them.
-        for cache in &caches {
-            cache.release_unheld_lazy_entries_over_cap();
-        }
+        let released = self.drop_unheld_over_target(budget);
         free_elsewhere(released);
         debug!(
             target: "infino::cache",
@@ -249,6 +294,94 @@ impl HeapBudget {
             after = self.charged.load(Ordering::Acquire),
             "decoded metadata over budget: dropped the oldest unheld files"
         );
+    }
+
+    /// One pass of [`Self::release_over_budget`]: the readers it let go, for the caller to free.
+    fn drop_unheld_over_target(&self, budget: u64) -> Vec<Arc<SuperfileReader>> {
+        let caches: Vec<Arc<DiskCacheStore>> = {
+            let mut list = self.caches.lock().unwrap_or_else(PoisonError::into_inner);
+            list.retain(|cache| cache.strong_count() > 0);
+            list.iter().filter_map(Weak::upgrade).collect()
+        };
+        let mut scan = self.scan(&caches);
+        // Held files fill the budget: drop the tables' cached sessions, rebuilt on their next
+        // statement, and look again.
+        if scan.held > budget {
+            drop(scan);
+            self.drop_cached_sessions();
+            scan = self.scan(&caches);
+        }
+        let target = unheld_target(budget, scan.held);
+        let mut unheld = scan.unheld;
+        let mut released = Vec::new();
+        for (_, at, uri, bytes) in scan.oldest {
+            if unheld <= target {
+                break;
+            }
+            if let Some(reader) = caches[at].release_lazy_entry(&uri, caches[at].now_us()) {
+                released.push(reader);
+                unheld -= bytes;
+            }
+        }
+        // The lazy files past the cap would otherwise go at the next query's first open, which
+        // would pay for freeing them.
+        for cache in &caches {
+            released.extend(cache.release_unheld_lazy_entries_over_cap());
+        }
+        released
+    }
+
+    /// The unheld files counted here, oldest first, with the bytes held and unheld.
+    fn scan(&self, caches: &[Arc<DiskCacheStore>]) -> Scan {
+        // Each cache stamps accesses on its own clock, started when it was, so files are ranked by
+        // how long each has been idle, not by their stamps.
+        let mut oldest = Vec::new();
+        let mut unheld = 0;
+        for (at, cache) in caches.iter().enumerate() {
+            let now_us = cache.now_us();
+            for entry in cache.cached.iter() {
+                let Some(heap) = entry
+                    .value()
+                    .heap
+                    .get()
+                    .filter(|heap| heap.counts_against(self))
+                else {
+                    continue;
+                };
+                if cache.reclaimable_lazy_entry(entry.key(), entry.value()) {
+                    let last = entry.value().last_access_us.load(Ordering::Acquire);
+                    let idle = Reverse(now_us.saturating_sub(last));
+                    oldest.push((idle, at, *entry.key(), heap.bytes()));
+                    unheld += heap.bytes();
+                }
+            }
+        }
+        oldest.sort_unstable();
+        let held = self.charged.load(Ordering::Acquire).saturating_sub(unheld);
+        Scan {
+            oldest,
+            unheld,
+            held,
+        }
+    }
+
+    /// Let every registered table drop its cached sessions.
+    fn drop_cached_sessions(&self) {
+        let sessions: Vec<Arc<dyn CachedSessions>> = {
+            let mut list = self.sessions.lock().unwrap_or_else(PoisonError::into_inner);
+            list.retain(|sessions| sessions.strong_count() > 0);
+            list.iter().filter_map(Weak::upgrade).collect()
+        };
+        for table in sessions {
+            table.drop_cached_sessions();
+        }
+    }
+
+    /// Let this budget drop `sessions`' cached sessions when held files fill it.
+    pub(crate) fn register_sessions(&self, sessions: Weak<dyn CachedSessions>) {
+        let mut list = self.sessions.lock().unwrap_or_else(PoisonError::into_inner);
+        list.retain(|sessions| sessions.strong_count() > 0);
+        list.push(sessions);
     }
 
     /// Let this budget drop `cache`'s files.
@@ -309,8 +442,9 @@ impl DiskCacheStore {
 #[cfg(test)]
 mod tests {
     use std::{
+        mem,
         sync::{
-            Arc, OnceLock,
+            Arc, Mutex,
             atomic::AtomicU64,
             mpsc::{Receiver, Sender, channel},
         },
@@ -318,13 +452,18 @@ mod tests {
         time::Duration,
     };
 
+    use tempfile::TempDir;
+
     use crate::{
         superfile::SuperfileReader,
         supertable::{
             manifest::SuperfileUri,
             reader_cache::disk::{
-                CachedEntry, DiskCacheStore, EntryAccounting, Residency,
-                heap::{FREE_THREAD_NAME, HeapBudget, free_elsewhere},
+                DiskCacheStore, EntryAccounting, Residency,
+                heap::{
+                    CachedSessions, FREE_THREAD_NAME, FreeQueue, HeapBudget, UNHELD_FLOOR_DIVISOR,
+                    leaves_too_little_room,
+                },
                 test_support::*,
             },
         },
@@ -332,6 +471,9 @@ mod tests {
 
     /// Bytes each test entry counts against the budget.
     const ENTRY_BYTES: u64 = 100;
+
+    /// How long a test waits for a pass that should return at once before it fails.
+    const PASS_DEADLINE: Duration = Duration::from_secs(10);
 
     /// How long a test waits for the freeing thread before it fails.
     const FREE_DEADLINE: Duration = Duration::from_secs(10);
@@ -359,18 +501,20 @@ mod tests {
         let uri = SuperfileUri::new_v4();
         let reader =
             Arc::new(SuperfileReader::open(tiny_superfile_bytes()).expect("tiny superfile opens"));
-        store.cached.insert(
+        let residency = Residency::Paged {
+            block_source: dummy_block_source(store, uri),
+        };
+        let size_bytes = Arc::new(AtomicU64::new(0));
+        let accounting = EntryAccounting::SourceOwned;
+        let held = Arc::clone(&reader);
+        cache_entry(
+            store,
             uri,
-            Arc::new(CachedEntry {
-                heap: OnceLock::new(),
-                reader: Arc::clone(&reader),
-                residency: Residency::Paged {
-                    block_source: dummy_block_source(store, uri),
-                },
-                size_bytes: Arc::new(AtomicU64::new(0)),
-                accounting: EntryAccounting::SourceOwned,
-                last_access_us: AtomicU64::new(last_access_us),
-            }),
+            held,
+            residency,
+            size_bytes,
+            accounting,
+            last_access_us,
         );
         store.charge_heap(&uri, &reader, ENTRY_BYTES);
         uri
@@ -386,7 +530,7 @@ mod tests {
     }
 
     /// A cache with a budget of its own.
-    fn store_with_budget(budget: Option<u64>) -> (tempfile::TempDir, Arc<DiskCacheStore>) {
+    fn store_with_budget(budget: Option<u64>) -> (TempDir, Arc<DiskCacheStore>) {
         let (dir, store) = test_store();
         store.use_heap_budget(HeapBudget::with_budget(budget));
         (dir, store)
@@ -494,10 +638,12 @@ mod tests {
         // A released value whose drop blocks until the test lets it go.
         //  - handing it over returns at once, while its drop still waits;
         //  - the drop then runs on the freeing thread.
-        // This test pins that no query waits for freeing what the cache let go.
+        // This test pins that no query waits for freeing what the cache let go. Its own queue, so
+        // other tests' batches cannot fill it and make the caller free this one.
+        static QUEUE: FreeQueue = FreeQueue::new();
         let (go, wait) = channel();
         let (ran_on, report) = channel();
-        free_elsewhere(vec![Freed { go: wait, ran_on }]);
+        QUEUE.free(vec![Freed { go: wait, ran_on }]);
         assert!(
             report.try_recv().is_err(),
             "the caller did not run the drop"
@@ -581,5 +727,194 @@ mod tests {
         store.heap_budget().release_over_budget();
         assert!(store.is_cached(&uri), "kept");
         store.assert_budget_consistent();
+    }
+
+    /// Budget, in entries, for the cases below: a small stand-in for a large table's budget.
+    const CASE_BUDGET_ENTRIES: u64 = 8;
+
+    /// A cache of its own counting against `budget_entries` entries' bytes, short of memory.
+    fn store_of(budget_entries: u64) -> (TempDir, Arc<DiskCacheStore>) {
+        store_with_budget(Some(budget_entries * ENTRY_BYTES))
+    }
+
+    /// `n` counted files in `store`, the first last used earliest.
+    fn entries(store: &Arc<DiskCacheStore>, n: u64, first_stamp: u64) -> Vec<SuperfileUri> {
+        (0..n)
+            .map(|at| charged_entry(store, first_stamp + at))
+            .collect()
+    }
+
+    /// Readers held for `uris`, as a running query holds them.
+    fn hold(store: &DiskCacheStore, uris: &[SuperfileUri]) -> Vec<Arc<SuperfileReader>> {
+        uris.iter().map(|uri| cached_reader(store, uri)).collect()
+    }
+
+    /// How many of `uris` are still cached.
+    fn cached(store: &DiskCacheStore, uris: &[SuperfileUri]) -> usize {
+        uris.iter().filter(|uri| store.is_cached(uri)).count()
+    }
+
+    #[test]
+    fn an_unreadable_memory_reading_counts_as_room_to_spare() {
+        // Readings of none, above and below the limit minus the budget.
+        // This test pins that a reading that cannot be taken counts as room to spare, as the SQL
+        // memory limit is off then too, and that the others count as short and not short.
+        assert!(
+            !leaves_too_little_room(None, 100, 25),
+            "unreadable: room to spare"
+        );
+        assert!(
+            leaves_too_little_room(Some(80), 100, 25),
+            "above limit minus budget"
+        );
+        assert!(!leaves_too_little_room(Some(70), 100, 25), "below it");
+    }
+
+    #[test]
+    fn with_nothing_held_the_pass_drops_the_oldest_down_to_the_budget() {
+        // A big scan has ended: 30 unheld files over a budget of 8, none held.
+        //  - what stays counted is the budget, the files used last.
+        // This test pins that with nothing held the target is the whole budget.
+        let (_dir, store) = store_of(CASE_BUDGET_ENTRIES);
+        let uris = entries(&store, 30, 1);
+        store.heap_budget().release_over_budget();
+        assert_eq!(
+            store.heap_budget().charged(),
+            CASE_BUDGET_ENTRIES * ENTRY_BYTES
+        );
+        assert_eq!(cached(&store, &uris[22..]), 8, "the 8 used last stay");
+    }
+
+    #[test]
+    fn with_held_files_over_the_budget_the_files_just_used_stay() {
+        // A long scan holding 3x the budget while small statements end: 24 held and 6 unheld over a
+        // budget of 8.
+        //  - the unheld files kept are a quarter of the budget, the ones used last;
+        //  - the held ones all stay.
+        // This test pins the floor: neither every unheld file leaves, nor none does.
+        let (_dir, store) = store_of(CASE_BUDGET_ENTRIES);
+        let held_uris = entries(&store, 24, 1);
+        let _scan = hold(&store, &held_uris);
+        let unheld = entries(&store, 6, 100);
+        store.heap_budget().release_over_budget();
+        let floor = (CASE_BUDGET_ENTRIES / UNHELD_FLOOR_DIVISOR) as usize;
+        assert_eq!(
+            cached(&store, &unheld),
+            floor,
+            "a quarter of the budget stays"
+        );
+        assert!(
+            unheld[6 - floor..].iter().all(|uri| store.is_cached(uri)),
+            "the newest stay"
+        );
+        assert_eq!(cached(&store, &held_uris), 24, "held files stay");
+    }
+
+    /// A table's cached session holding readers, as a cached SQL context holds its files.
+    struct HeldSession(Mutex<Vec<Arc<SuperfileReader>>>);
+
+    impl CachedSessions for HeldSession {
+        fn drop_cached_sessions(&self) {
+            let readers = mem::take(&mut *self.0.lock().expect("session"));
+            drop(readers);
+        }
+    }
+
+    #[test]
+    fn a_cached_session_holding_the_budget_is_dropped_and_its_files_go() {
+        // A table's cached context holding 2x the budget on a table with no new commits: 16 files
+        // held only by a registered session, over a budget of 8.
+        //  - the pass drops the session;
+        //  - then its files are unheld and go down to the budget, the ones used last staying.
+        // This test pins that memory held between statements by a cached session can come back.
+        let (_dir, store) = store_of(CASE_BUDGET_ENTRIES);
+        let uris = entries(&store, 16, 1);
+        let session: Arc<dyn CachedSessions> =
+            Arc::new(HeldSession(Mutex::new(hold(&store, &uris))));
+        store
+            .heap_budget()
+            .register_sessions(Arc::downgrade(&session));
+        store.heap_budget().release_over_budget();
+        assert_eq!(cached(&store, &uris), 8, "down to the budget");
+        assert_eq!(cached(&store, &uris[8..]), 8, "the newest stay");
+    }
+
+    #[test]
+    fn files_of_many_small_caches_go_oldest_first_down_to_the_budget() {
+        // Many small tables each under budget: 4 caches of 3 files over a budget of 8, none held.
+        //  - what stays counted is the budget, 8 of the 12 files.
+        // This test pins that the pass works across every cache counted against one budget.
+        let budget = HeapBudget::with_budget(Some(CASE_BUDGET_ENTRIES * ENTRY_BYTES));
+        let mut stores = Vec::new();
+        let mut uris = Vec::new();
+        for _ in 0..4 {
+            let (dir, store) = test_store();
+            store.use_heap_budget(budget);
+            uris.extend(entries(&store, 3, 1));
+            stores.push((dir, store));
+        }
+        budget.release_over_budget();
+        assert_eq!(budget.charged(), CASE_BUDGET_ENTRIES * ENTRY_BYTES);
+        let left: usize = stores.iter().map(|(_, store)| cached(store, &uris)).sum();
+        assert_eq!(left, 8);
+    }
+
+    #[test]
+    fn a_pass_already_running_makes_another_return_at_once() {
+        // Five unheld files over a budget of one, while a pass is running and then after it ends.
+        //  - while it runs, another statement end drops nothing;
+        //  - after it, a pass drops files down to the budget.
+        // This test pins that two statements ending together do not both drop files for the same
+        // excess. Its deadline bounds the second pass returning, which only try-locks, so load
+        // cannot slow it.
+        let (_dir, store) = store_of(1);
+        let uris = entries(&store, 5, 1);
+        let budget = store.heap_budget();
+        let running = budget.pass.lock().expect("pass");
+        let (done, returned) = channel();
+        thread::spawn(move || {
+            budget.release_over_budget();
+            let _ = done.send(());
+        });
+        assert!(
+            returned.recv_timeout(PASS_DEADLINE).is_ok(),
+            "another pass returns at once, not after the running one"
+        );
+        assert_eq!(cached(&store, &uris), 5, "the running pass decides");
+        drop(running);
+        budget.release_over_budget();
+        assert_eq!(cached(&store, &uris), 1);
+    }
+
+    #[test]
+    fn a_pass_counts_only_the_files_counted_against_its_own_budget() {
+        // A cache whose files count against one budget, also registered with a second budget that
+        // is over its own total.
+        // This test pins that a budget never drops files another budget counts.
+        let (_dir, store) = store_of(100);
+        let uris = entries(&store, 3, 1);
+        let other = HeapBudget::with_budget(Some(0));
+        other.register(&store);
+        let _over = other.reserve(ENTRY_BYTES);
+        other.release_over_budget();
+        assert_eq!(cached(&store, &uris), 3, "not this budget's files");
+    }
+
+    #[test]
+    fn a_pass_frees_the_files_past_the_cap_with_its_own() {
+        // Three unheld files under budget and a lazy cap of one.
+        // This test pins that the cap's releases join the pass's one batch, so a busy freeing
+        // thread sees one batch per pass, not one per cache.
+        let (_dir, store) = store_of(100);
+        let _uris = entries(&store, 3, 1);
+        store.set_lazy_entry_cap(1);
+        let released = store
+            .heap_budget()
+            .drop_unheld_over_target(100 * ENTRY_BYTES);
+        assert_eq!(
+            released.len(),
+            2,
+            "the two past the cap come back to the pass"
+        );
     }
 }

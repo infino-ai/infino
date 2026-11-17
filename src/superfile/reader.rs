@@ -268,11 +268,11 @@ pub struct SuperfileReader {
     /// What a table scan reads off this file's footer on every statement, worked out by the first
     /// scan that asks ([`Self::scan_shape`]) and kept while the reader stays cached.
     scan_shape: OnceLock<Arc<ScanShape>>,
-    /// Whether a cache has been told what this reader keeps decoded (see [`Self::first_charge`]).
-    charged: AtomicBool,
-    /// Whether a cache has been told about the scan footer this reader keeps (see
-    /// [`Self::first_scan_footer_charge`]).
-    scan_footer_charged: AtomicBool,
+    /// Whether a cache has counted what this reader keeps decoded ([`Self::first_heap_count`]).
+    heap_counted: AtomicBool,
+    /// Whether a cache has counted the scan footer this reader keeps
+    /// ([`Self::first_scan_footer_heap_count`]).
+    scan_footer_heap_counted: AtomicBool,
     /// The lazy byte source the reader was opened over, retained only
     /// on the [`open_lazy`] path. `None` on the eager [`open`] path
     /// (resident bytes already cover every range). Lets
@@ -973,8 +973,8 @@ impl SuperfileReader {
             page_index_loaded: OnceCell::new(),
             scan_footer: OnceLock::new(),
             scan_shape: OnceLock::new(),
-            charged: AtomicBool::new(false),
-            scan_footer_charged: AtomicBool::new(false),
+            heap_counted: AtomicBool::new(false),
+            scan_footer_heap_counted: AtomicBool::new(false),
             source: Some(source),
             schema,
             id_column,
@@ -1122,8 +1122,8 @@ impl SuperfileReader {
             page_index_loaded: OnceCell::new(),
             scan_footer: OnceLock::new(),
             scan_shape: OnceLock::new(),
-            charged: AtomicBool::new(false),
-            scan_footer_charged: AtomicBool::new(false),
+            heap_counted: AtomicBool::new(false),
+            scan_footer_heap_counted: AtomicBool::new(false),
             source: None,
             schema,
             id_column,
@@ -1236,15 +1236,16 @@ impl SuperfileReader {
 
     /// True for the first caller only: the one that should count what this reader keeps decoded
     /// against a cache's budget. Later callers pay one load.
-    pub(crate) fn first_charge(&self) -> bool {
-        !self.charged.load(Ordering::Acquire) && !self.charged.swap(true, Ordering::AcqRel)
+    pub(crate) fn first_heap_count(&self) -> bool {
+        !self.heap_counted.load(Ordering::Acquire)
+            && !self.heap_counted.swap(true, Ordering::AcqRel)
     }
 
-    /// [`Self::first_charge`] for the scan footer this reader keeps, which a later statement may
-    /// derive after the first one counted the parsed footer.
-    pub(crate) fn first_scan_footer_charge(&self) -> bool {
-        !self.scan_footer_charged.load(Ordering::Acquire)
-            && !self.scan_footer_charged.swap(true, Ordering::AcqRel)
+    /// [`Self::first_heap_count`] for the scan footer this reader keeps, which a later statement
+    /// may derive after the first one counted the parsed footer.
+    pub(crate) fn first_scan_footer_heap_count(&self) -> bool {
+        !self.scan_footer_heap_counted.load(Ordering::Acquire)
+            && !self.scan_footer_heap_counted.swap(true, Ordering::AcqRel)
     }
 
     /// Whether `footer` is a scan footer this reader keeps apart from its parsed one.

@@ -22,17 +22,15 @@ use tokio::time::timeout;
 use crate::{
     memory::ConnectionMemoryBudget,
     supertable::reader_cache::{
-        block_source::BlockCachedSource, disk::test_support::tiny_superfile_bytes,
+        block_source::BlockCachedSource,
+        disk::test_support::{cache_entry, tiny_superfile_bytes},
     },
 };
 use crate::{
     superfile::SuperfileReader,
     supertable::{
         manifest::SuperfileUri,
-        reader_cache::{
-            config::EvictionCandidate,
-            disk::{heap::free_elsewhere, *},
-        },
+        reader_cache::{config::EvictionCandidate, disk::*},
     },
 };
 
@@ -201,11 +199,12 @@ impl DiskCacheStore {
     /// each, and each finished one stays in the map until the next sweep
     /// tick: its parsed footer and page index, several MB of heap on a large
     /// file, times every superfile the query read. Capping the unheld ones
-    /// bounds that by the cap rather than by the table.
-    pub(crate) fn release_unheld_lazy_entries_over_cap(&self) {
+    /// bounds that by the cap rather than by the table. Returns the released readers, for the
+    /// caller to free where it chooses.
+    pub(crate) fn release_unheld_lazy_entries_over_cap(&self) -> Vec<Arc<SuperfileReader>> {
         let cap = self.lazy_entry_cap.load(Ordering::Relaxed);
         if self.cached.len() <= cap {
-            return;
+            return Vec::new();
         }
         let mut unheld: Vec<(u64, SuperfileUri)> = self
             .cached
@@ -214,18 +213,15 @@ impl DiskCacheStore {
             .map(|e| (e.value().last_access_us.load(Ordering::Acquire), *e.key()))
             .collect();
         let Some(over) = unheld.len().checked_sub(cap) else {
-            return;
+            return Vec::new();
         };
         unheld.sort_unstable();
         let now_us = self.now_us();
-        let released = unheld
+        unheld
             .into_iter()
             .take(over)
             .filter_map(|(_, uri)| self.release_lazy_entry(&uri, now_us))
-            .collect();
-        // Freeing thousands of footers and page indexes takes seconds: the open that crossed the
-        // cap does not wait for it.
-        free_elsewhere(released);
+            .collect()
     }
 
     /// Remove `uri`'s entry if it is still a lazy one only the cache holds,
@@ -819,16 +815,17 @@ impl DiskCacheStore {
     ) {
         let reader = SuperfileReader::open(tiny_superfile_bytes()).expect("tiny superfile opens");
         let size_bytes = block_source.filled_bytes_handle();
-        self.cached.insert(
+        let residency = Residency::Paged { block_source };
+        let accounting = EntryAccounting::SourceOwned;
+        let now_us = self.now_us();
+        cache_entry(
+            self,
             uri,
-            Arc::new(CachedEntry {
-                heap: OnceLock::new(),
-                reader: Arc::new(reader),
-                residency: Residency::Paged { block_source },
-                size_bytes,
-                accounting: EntryAccounting::SourceOwned,
-                last_access_us: AtomicU64::new(self.now_us()),
-            }),
+            Arc::new(reader),
+            residency,
+            size_bytes,
+            accounting,
+            now_us,
         );
     }
 

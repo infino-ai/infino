@@ -2279,7 +2279,7 @@ mod tests {
         let other = SuperfileUri::new_v4();
         store.install_block_entry_for_test(other, dummy_block_source(store, other));
         store.set_lazy_entry_cap(1);
-        store.release_unheld_lazy_entries_over_cap();
+        drop(store.release_unheld_lazy_entries_over_cap());
         other
     }
 
@@ -2723,7 +2723,7 @@ mod tests {
         for _ in 0..2 {
             for uri in &uris {
                 warm_open(&store, uri).await;
-                store.release_unheld_lazy_entries_over_cap();
+                drop(store.release_unheld_lazy_entries_over_cap());
             }
         }
         assert_eq!(store.fills.len(), FILES, "one download per file");
@@ -3007,18 +3007,19 @@ mod tests {
     fn insert_lazy_entry(store: &Arc<DiskCacheStore>, uri: SuperfileUri, bytes: u64) {
         let reader = SuperfileReader::open(tiny_superfile_bytes()).expect("tiny superfile opens");
         assert!(store.try_reserve_without_evicting(bytes));
-        store.cached.insert(
+        let residency = Residency::Paged {
+            block_source: dummy_block_source(store, uri),
+        };
+        let size_bytes = Arc::new(AtomicU64::new(bytes));
+        let accounting = EntryAccounting::Eager;
+        cache_entry(
+            store,
             uri,
-            Arc::new(CachedEntry {
-                heap: OnceLock::new(),
-                reader: Arc::new(reader),
-                residency: Residency::Paged {
-                    block_source: dummy_block_source(store, uri),
-                },
-                size_bytes: Arc::new(AtomicU64::new(bytes)),
-                accounting: EntryAccounting::Eager,
-                last_access_us: AtomicU64::new(0),
-            }),
+            Arc::new(reader),
+            residency,
+            size_bytes,
+            accounting,
+            0,
         );
     }
 
