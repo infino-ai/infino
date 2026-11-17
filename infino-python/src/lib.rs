@@ -352,6 +352,8 @@ fn stemmer_from_name(name: &str) -> PyResult<Stemmer> {
 /// Declares which columns are full-text (BM25) and which are vector
 /// (IVF kNN) indexed. Built fluently:
 /// `IndexSpec().fts("body").vector("emb", 384, "cosine")`.
+/// Each table currently supports only a single vector column, but multiple
+/// text columns can have full-text (FTS) indexes.
 #[pyclass(name = "IndexSpec", skip_from_py_object)]
 #[derive(Clone, Default)]
 struct IndexSpec {

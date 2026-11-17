@@ -38,6 +38,9 @@ the boundary (passing in `Table`s, or `{ arrow: true }` results).
 
 ## Quickstart
 
+Each table currently supports only a single vector column. Multiple text columns
+can have full-text (FTS) indexes.
+
 ```javascript
 import { connect, IndexSpec } from "@infino-ai/infino";
 

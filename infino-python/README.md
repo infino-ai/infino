@@ -37,6 +37,9 @@ Requires Python 3.9 or newer. `pyarrow` is installed as a dependency;
 
 ## Quickstart
 
+Each table currently supports only a single vector column. Multiple text columns
+can have full-text (FTS) indexes.
+
 ```python
 import infino
 import pyarrow as pa

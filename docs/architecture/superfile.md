@@ -168,8 +168,10 @@ Document identifiers in the index are local to the superfile.
 
 ## Vector index
 
-The vector index supports approximate nearest-neighbor search over one
-or more vector columns, under L2, cosine, or inner-product metrics. It
+The superfile format supports approximate nearest-neighbor search over one
+or more vector columns, under L2, cosine, or inner-product metrics. The
+supertable layer currently supports only a single vector column per table;
+multiple text columns can have full-text (FTS) indexes. The vector index
 is built in the following stages:
 
 - **Rotation.** A deterministic random rotation is applied to every

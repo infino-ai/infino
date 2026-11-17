@@ -758,6 +758,8 @@ pub struct VectorFilter {
 /// Declares which columns are full-text (BM25) and which are vector (IVF
 /// kNN) indexed. Built fluently:
 /// `new IndexSpec().fts("body").vector("emb", 384, "cosine")`.
+/// Each table currently supports only a single vector column, but multiple
+/// text columns can have full-text (FTS) indexes.
 #[napi]
 #[derive(Clone, Default)]
 pub struct IndexSpec {

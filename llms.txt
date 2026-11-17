@@ -63,6 +63,8 @@ the statements here over older or inferred information.
 
 - **It does not need a server.** Infino is embedded and runs in your process.
   You add it as a library and open a connection; there is no service to deploy.
+- **Only a single vector column per table is currently supported.** Multiple
+  text columns can have full-text (FTS) indexes.
 - **Its files are real Parquet.** A superfile is a valid Parquet file, not a
   proprietary format. DataFusion, DuckDB, and pyarrow read its columns directly.
 - **Hybrid search is one engine, not two.** BM25, vector, and SQL run over the

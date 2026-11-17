@@ -5,6 +5,9 @@ superfiles. It presents many immutable superfiles as a single table that
 supports SQL, full-text, and vector search, while keeping readers
 consistent under concurrent writes.
 
+Each table currently supports only a single vector column. Multiple text
+columns can have full-text (FTS) indexes.
+
 This document describes the table model and its guarantees. The superfile
 format is described in [superfile](./superfile.md); the physical files this
 layer writes and the pointer chain between them are in

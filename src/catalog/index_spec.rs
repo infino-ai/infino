@@ -224,6 +224,9 @@ impl From<String> for FtsField {
 /// Arrow schema. Columns with no index are still stored and queryable
 /// via SQL — they just have no BM25 / vector index.
 ///
+/// Each table currently supports only a single vector column, but multiple
+/// text columns can have full-text (FTS) indexes.
+///
 /// ```
 /// use infino::{IndexSpec, Metric};
 /// let spec = IndexSpec::new()

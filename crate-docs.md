@@ -31,6 +31,9 @@ allocator, turn it off to avoid a second one:
 
 ## Quickstart
 
+Each table currently supports only a single vector column. Multiple text columns
+can have full-text (FTS) indexes.
+
 ```rust
 use std::sync::Arc;
 

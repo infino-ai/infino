@@ -415,6 +415,8 @@ ORDER BY hits DESC;
 
 ## Limitations
 
+- Each table currently supports only a single vector column. Multiple text columns can
+  have full-text (FTS) indexes.
 - Tables are append-only and time-ordered. Updates are delete plus insert via tombstones, and
   there are no cross-table transactions. This is not an OLTP store.
 - Writes go through a single writer slot, so there is one writer per table at a time. Readers

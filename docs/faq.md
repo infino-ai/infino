@@ -30,6 +30,10 @@ Hybrid search runs BM25 and vector retrieval and fuses them into one ranked resu
 
 Yes. You supply the vectors; Infino indexes and searches them. It does not tie you to a specific embedding model. See the [embeddings guide](https://infino.ai/docs/guides/embeddings).
 
+## Can a table have multiple vector columns?
+
+No. Each table currently supports only a single vector column. Multiple text columns can have full-text (FTS) indexes.
+
 ## Is Infino a good fit for agent memory?
 
 Yes. An agent's long-term memory is a retrieval problem over text and vectors on cheap, durable storage, which is exactly what Infino does: hybrid recall over Parquet in object storage, reachable directly or through MCP. See the [agent memory guide](https://infino.ai/docs/use-cases/agent-memory) and the [MCP integration](https://infino.ai/docs/integrations/mcp).
