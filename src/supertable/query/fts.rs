@@ -2263,7 +2263,7 @@ impl SupertableReader {
             // The level heads choose first, before any open; a query they
             // cannot serve takes the tier merge.
             let by_heads = match heads_serve {
-                true => heads::select(index, manifest, &query, &merge_kept, &global_idf)
+                true => heads::select(index, manifest, column, &query, &merge_kept, &global_idf)
                     .await
                     .unwrap_or_else(|e| {
                         unreadable(e);

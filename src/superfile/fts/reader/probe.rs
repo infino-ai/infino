@@ -12,6 +12,8 @@
 //! covers the documents asked for, and decodes those. A short term is one
 //! small body read whole; an inline one is in its dictionary value.
 
+use std::slice::from_ref;
+
 use super::{core::*, cursor::TermMeta};
 use crate::{
     superfile::{
@@ -100,9 +102,10 @@ impl FtsReader {
         }
         let read = |len: usize| {
             let len = len.min(postings_length);
+            let range = base..base + len;
             async move {
                 self.source
-                    .get_ranges_parallel_async(&[base..base + len])
+                    .get_ranges_parallel_async(from_ref(&range))
                     .await
                     .map_err(|e| FtsError::RangeFetch {
                         what: "fts/postings term probe head",

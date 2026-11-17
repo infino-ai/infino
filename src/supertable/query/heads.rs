@@ -40,7 +40,7 @@
 //! as the ceilings are.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     sync::{Arc, LazyLock},
     time::Instant,
 };
@@ -73,11 +73,17 @@ use crate::{
         reader_cache::disk::ReadIntent,
         schema::FieldId,
     },
+    utils::terms::DictEntry,
 };
 
 /// Head bytes a query reads at most before it stops and opens what is
 /// still in play: a few seconds of reads on a cold store.
 pub(crate) const HEAD_READ_BUDGET_BYTES: u64 = 256 << 20;
+/// Most candidates a query probes: each costs, per missing term, a share of
+/// its superfile's reads of that term — the header and skip table once,
+/// then the blocks covering the candidates — so this bounds a query's
+/// probe reads near the read budget of a cold store.
+const PROBE_MAX_CANDIDATES: usize = 4_096;
 /// Steps of the water-filling's search for its common marginal gain; each
 /// halves the interval, so the allocation it bounds with is within a
 /// negligible share of the budget it was given.
@@ -234,6 +240,7 @@ pub(crate) async fn available(
 pub(crate) async fn select(
     index: &TermIndex,
     manifest: &ManifestSnapshot,
+    column: &str,
     query: &TierQuery<'_>,
     kept: &[Arc<SuperfileEntry>],
     global_idf: &GlobalTermIdf,
@@ -302,6 +309,8 @@ pub(crate) async fn select(
     };
     let runs_per_term = index.runs_many(query.column, terms).await?;
     let mut heads: Vec<Head> = Vec::new();
+    // Where each kept superfile's postings of each term sit, for probes.
+    let mut postings: HashMap<(usize, usize), (DictEntry, u64)> = HashMap::new();
     let mut candidates: HashMap<(u32, u32), Candidate> = HashMap::new();
     let mut entries_read = 0u64;
     for (t, runs) in runs_per_term.iter().enumerate() {
@@ -321,6 +330,9 @@ pub(crate) async fn select(
             for p in &run.postings {
                 if let Some(s) = slot_for(p.superfile) {
                     slots[s].heads[t] = Some(h);
+                    if let Some(entry) = p.location.to_dict_value() {
+                        postings.insert((s, t), (entry, p.df));
+                    }
                 }
             }
             // Before a level is read, the best key a posting records bounds
@@ -359,6 +371,7 @@ pub(crate) async fn select(
         false => 1.0 - nt as f32 * 2.0 * f32::EPSILON,
     };
     let mut fetched = 0u64;
+    let mut probes = 0u64;
     let mut theta;
     let mut bounds;
     // What the last round left: its threshold and the slots it left in play.
@@ -427,6 +440,52 @@ pub(crate) async fn select(
             }
         }
     }
+    // Probes: candidates whose bounds still reach above the threshold for a
+    // term not yet seen for them have that term's frequency read from the
+    // covering posting blocks only; their exact scores raise the threshold,
+    // under which the heads bound the unseen documents, and a superfile so
+    // settled is answered or ruled out without an open.
+    if theta.is_finite() && !query.rows_scoped && weights.phrases.is_empty() {
+        let plan = probe_plan(&slots, &heads, &candidates, &weights, &postings, theta);
+        if !plan.is_empty() {
+            let reads = plan.iter().map(|(&s, terms)| {
+                let entry = &kept[s];
+                async move {
+                    let reader = open_reader_of(manifest, entry).await?;
+                    let fts = reader.fts().ok_or_else(|| {
+                        TermIndexError::Open(QueryError::Internal(
+                            "a superfile the heads name has no full-text index".into(),
+                        ))
+                    })?;
+                    let mut out = Vec::with_capacity(terms.len());
+                    for (t, entry, df, docs) in terms {
+                        let tfs = fts
+                            .probe_tfs(column, *entry, *df, docs)
+                            .await
+                            .map_err(|e| TermIndexError::Open(QueryError::from(e)))?;
+                        out.push((*t, docs.clone(), tfs));
+                    }
+                    Ok::<_, TermIndexError>((s, out))
+                }
+            });
+            for (s, probed) in try_join_all(reads).await? {
+                probes += probed.len() as u64;
+                for (t, docs, tfs) in probed {
+                    for (doc, tf) in docs.into_iter().zip(tfs) {
+                        if let Some(c) = candidates.get_mut(&(s as u32, doc)) {
+                            c.known |= 1 << t;
+                            c.tf[t] = tf;
+                            if tf > 0 && weights.scoring & (1 << t) != 0 {
+                                c.contrib[t] = weights.contribution(t, tf, c.len);
+                            }
+                        }
+                    }
+                }
+            }
+            theta = kth_lower_bound(&candidates, &slots, &weights, k, lb_slack);
+            bounds = slot_bounds(&slots, &heads, &candidates, &weights, lb_slack);
+        }
+    }
     // A scope that admits only some rows: the threshold over every row is
     // no floor for the admitted ones, and an answer would hold rows the
     // scope drops. Only the bounds stand.
@@ -480,9 +539,61 @@ pub(crate) async fn select(
         theta_id_max,
         resolved,
         tier_bytes: fetched,
-        entries_read,
+        entries_read: entries_read + probes,
         merge_ns: started.elapsed().as_nanos() as u64,
     }))
+}
+
+/// Per superfile to probe, per term, the candidates to read it for: the
+/// candidates whose bound still reaches above `theta` while a bare term is
+/// missing for them, best bound first — their exact scores raise the
+/// threshold, under which the heads then bound the unseen documents — up
+/// to [`PROBE_MAX_CANDIDATES`] of them, each with the missing terms its
+/// superfile holds postings of.
+#[allow(clippy::type_complexity)]
+fn probe_plan(
+    slots: &[Slot],
+    heads: &[Head],
+    candidates: &HashMap<(u32, u32), Candidate>,
+    weights: &Weights,
+    postings: &HashMap<(usize, usize), (DictEntry, u64)>,
+    theta: f32,
+) -> BTreeMap<usize, Vec<(usize, DictEntry, u64, Vec<u32>)>> {
+    let mut open: Vec<(f32, usize, u32, TermMask)> = candidates
+        .iter()
+        .filter_map(|(&(s, doc), c)| {
+            let slot = &slots[s as usize];
+            if slot.deny.is_some() {
+                return None;
+            }
+            let missing = (0..slot.heads.len())
+                .filter(|&t| {
+                    c.known & (1 << t) == 0
+                        && weights.scoring & (1 << t) != 0
+                        && postings.contains_key(&(s as usize, t))
+                })
+                .fold(0, |m, t| m | (1 << t));
+            let ub = candidate_bound(slot, heads, weights, c);
+            (missing != 0 && ub > theta).then_some((ub, s as usize, doc, missing))
+        })
+        .collect();
+    open.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
+    open.truncate(PROBE_MAX_CANDIDATES);
+    let mut docs: BTreeMap<(usize, usize), Vec<u32>> = BTreeMap::new();
+    for (_, s, doc, missing) in open {
+        for t in 0..slots[s].heads.len() {
+            if missing & (1 << t) != 0 {
+                docs.entry((s, t)).or_default().push(doc);
+            }
+        }
+    }
+    let mut plan: BTreeMap<usize, Vec<(usize, DictEntry, u64, Vec<u32>)>> = BTreeMap::new();
+    for ((s, t), mut list) in docs {
+        list.sort_unstable();
+        let (entry, df) = postings[&(s, t)];
+        plan.entry(s).or_default().push((t, entry, df, list));
+    }
+    plan
 }
 
 /// Open `entry`'s reader through the reader cache.
@@ -937,14 +1048,30 @@ fn resolve(
     theta: f32,
     theta_id_max: i128,
 ) -> Vec<(usize, Vec<(u32, f32)>)> {
-    let whole: Vec<bool> = slots
+    // A slot is answered whole when every head lists it whole, or when its
+    // unseen documents bound strictly under the threshold and probes have
+    // filled in every candidate's terms.
+    let mut whole: Vec<bool> = slots
         .iter()
         .map(|slot| {
             slot.deny.is_none()
                 && slot.heads.iter().flatten().next().is_some()
-                && slot.heads.iter().flatten().all(|&h| heads[h].whole())
+                && (slot.heads.iter().flatten().all(|&h| heads[h].whole())
+                    || unseen_bound(slot, heads, weights) < theta)
         })
         .collect();
+    for (&(s, _), c) in candidates {
+        let slot = &slots[s as usize];
+        let missing = slot.heads.iter().enumerate().any(|(t, h)| {
+            // A term whose head is read whole is absent where unseen.
+            h.is_some_and(|h| !heads[h].whole())
+                && weights.scoring & (1 << t) != 0
+                && c.known & (1 << t) == 0
+        });
+        if missing {
+            whole[s as usize] = false;
+        }
+    }
     let mut out: HashMap<usize, Vec<(u32, f32)>> = HashMap::new();
     for (s, w) in whole.iter().enumerate() {
         if *w {

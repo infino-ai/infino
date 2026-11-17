@@ -1009,3 +1009,72 @@ fn a_prefix_scores_each_document_by_its_best_completion() {
         }
     }
 }
+
+/// A pair of common terms whose best documents for one term sit past the
+/// other term's head: the heads bound every unread document under the
+/// threshold, and the candidates' missing frequencies are probed from the
+/// covering posting blocks, so the answer is the ceiling path's with no
+/// superfile opened.
+#[test]
+fn probes_settle_candidates_the_heads_leave_open() {
+    /// Superfiles, one commit each.
+    const PROBE_SUPERFILES: usize = 3;
+    /// Documents per superfile: past the whole-list size, so heads are cut.
+    const PROBE_DOCS: usize = 5_000;
+    /// The documents, late in each superfile, where `alpha` is frequent.
+    const HOT: std::ops::Range<usize> = 4_500..4_520;
+    /// Tokens per document, so every document has the same length.
+    const LEN: usize = 60;
+    let build = |dir: &TempDir, heads: bool| {
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let mut options = SupertableOptions::new(schema(), vec![FtsConfig::new("body")], vec![])
+            .expect("options")
+            .with_storage(storage)
+            .with_bound_ordered_open_window(1);
+        if !heads {
+            options = options.with_term_tier_entries_per_term(0);
+        }
+        let st = Supertable::create(options).expect("create");
+        for s in 0..PROBE_SUPERFILES {
+            let docs: Vec<String> = (0..PROBE_DOCS)
+                .map(|i| {
+                    let alpha = 1 + if HOT.contains(&i) {
+                        5 + i - HOT.start + 20 * s
+                    } else {
+                        0
+                    };
+                    let mut words = vec!["alpha"; alpha];
+                    words.push("beta");
+                    words.resize(LEN, "filler");
+                    words.join(" ")
+                })
+                .collect();
+            let col: ArrayRef = Arc::new(LargeStringArray::from(
+                docs.iter().map(String::as_str).collect::<Vec<_>>(),
+            ));
+            let mut w = st.writer().expect("writer");
+            w.append(&RecordBatch::try_new(schema(), vec![col]).expect("batch"))
+                .expect("append");
+            w.commit().expect("commit");
+        }
+        st
+    };
+    let (with_dir, without_dir) = (
+        TempDir::new().expect("tempdir"),
+        TempDir::new().expect("tempdir"),
+    );
+    let (with, without) = (build(&with_dir, true), build(&without_dir, false));
+    for mode in [BoolMode::Or, BoolMode::And] {
+        for k in [1usize, 10] {
+            let (a, stats, _) = run(&with, "alpha beta", mode, k);
+            let (b, _, _) = run(&without, "alpha beta", mode, k);
+            assert_eq!(a, b, "{mode:?} k={k}: the probed answer is the ceilings'");
+            assert_eq!(
+                opened(&stats),
+                0,
+                "{mode:?} k={k}: probes settle it unopened"
+            );
+        }
+    }
+}
