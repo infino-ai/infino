@@ -2824,6 +2824,20 @@ impl GraphChange {
         self.checksum
     }
 
+    /// The nodes the change removes, ascending.
+    pub(crate) fn removed(&self) -> &[u32] {
+        &self.removed
+    }
+
+    /// How many of the nodes the change appends are already holes: added and
+    /// removed again within the one generation.
+    pub(crate) fn appended_holes(&self) -> usize {
+        self.appended
+            .iter()
+            .filter(|lists| lists.is_empty())
+            .count()
+    }
+
     /// Nodes the change removes, rewrites a list of, and appends, for
     /// telemetry and for deciding when to rebuild instead.
     pub(crate) fn counts(&self) -> (usize, usize, usize) {
