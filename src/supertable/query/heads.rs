@@ -598,7 +598,10 @@ fn water_fill(idfs: &[f32], caps: &[f32], norm: f32, tokens: u32) -> f32 {
             .map(|(&idf, &need)| ((f64::from(idf) * n / lambda).sqrt() - n).clamp(0.0, need))
             .collect()
     };
-    let (mut lo, mut hi) = (0.0f64, idfs.iter().map(|&i| f64::from(i)).fold(0.0, f64::max) / n.max(f64::MIN_POSITIVE));
+    let (mut lo, mut hi) = (
+        0.0f64,
+        idfs.iter().map(|&i| f64::from(i)).fold(0.0, f64::max) / n.max(f64::MIN_POSITIVE),
+    );
     for _ in 0..WATER_FILL_STEPS {
         let mid = 0.5 * (lo + hi);
         if mid <= lo || mid >= hi {

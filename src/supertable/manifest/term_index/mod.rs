@@ -69,11 +69,11 @@ pub(crate) use format::TierRef;
 use format::{Layer, SliceRef};
 pub(crate) use format::{Location, Posting, Root, Run, Slice, legacy_bound_as_key};
 use futures::{StreamExt, TryStreamExt, stream};
+use level_head::decode_segment;
+pub(crate) use level_head::{BucketMaxTf, LevelBlock, LevelRef};
 use rayon::{ThreadPool, ThreadPoolBuilder};
 use tempfile::TempDir;
 use thiserror::Error;
-pub(crate) use level_head::{BucketMaxTf, LevelBlock, LevelRef};
-use level_head::decode_segment;
 pub(crate) use tier::{BLOCK_ENTRIES, ColumnScoring, TierChunkRef, TierDirectory, TierEntry};
 use tokio::{
     fs as async_fs,
@@ -3749,7 +3749,10 @@ mod tests {
         assert_eq!((beta_head.inline.len(), beta_head.levels.len()), (1, 0));
         let layer = &built.root.layers[0];
         assert_eq!(layer.slices.len(), 1);
-        assert!(layer.slices[0].tier.is_some(), "alpha's head is in the object");
+        assert!(
+            layer.slices[0].tier.is_some(),
+            "alpha's head is in the object"
+        );
         assert_eq!(built.tiers.len(), 1);
     }
 

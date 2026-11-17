@@ -314,6 +314,24 @@ proptest! {
         let ordinals: Vec<Option<u32>> = (0..superfiles.len() as u32).map(Some).collect();
         let merged = merge_layers(&sources, &ordinals, &policy()).expect("merge");
         let all: Vec<Doc> = superfiles.iter().flat_map(|(d, _)| d.iter().copied()).collect();
-        check_head(head_of(&merged.layer, &merged.slices, &merged.tiers), &all, candidates);
+        let whole = head_of(&merged.layer, &merged.slices, &merged.tiers);
+        // Folded a block at a time, the head is the same, byte for byte in
+        // its entries, levels and floor.
+        let streamed = merge_layers(
+            &sources,
+            &ordinals,
+            &BuildPolicy {
+                head_stream_min_entries: 0,
+                ..policy()
+            },
+        )
+        .expect("streamed merge");
+        let by_stream = head_of(&streamed.layer, &streamed.slices, &streamed.tiers);
+        prop_assert_eq!(by_stream.0, whole.0);
+        prop_assert_eq!(&by_stream.1, &whole.1);
+        prop_assert_eq!(&by_stream.2, &whole.2);
+        prop_assert_eq!(&by_stream.3, &whole.3);
+        prop_assert_eq!(by_stream.4, whole.4);
+        check_head(whole, &all, candidates);
     }
 }

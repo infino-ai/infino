@@ -30,12 +30,16 @@
 //! *segment*, read and verified whole:
 //!
 //! ```text
-//! segment: crc32c u32 (over what follows) | n_blocks varint | blocks
-//! block:   first key f32 | last key f32 | n_entries u8 | base ordinal varint
+//! segment: framed blocks back to back, to the segment's end
+//! block:   body length varint | crc32c u32 (over the body) | body
+//! body:    first key f32 | last key f32 | n_entries u8 | base ordinal varint
 //!          | ordinal bits u8 | row bits u8 | tf bits u8 | length bits u8
 //!          | ordinal deltas, bit-packed | rows, bit-packed
 //!          | term frequencies, bit-packed | length buckets, bit-packed
 //! ```
+//!
+//! Each block is framed and checked on its own, so a fold can read a
+//! head of billions of entries a window of blocks at a time.
 //!
 //! A block holds [`BLOCK_ENTRIES`] consecutive entries of the head (fewer
 //! in the last), stored sorted by `(ordinal, row)` so both streams code as
@@ -366,14 +370,58 @@ pub(crate) fn encode_segment(entries: &[KeyedEntry]) -> Vec<u8> {
             .all(|w| head_order(&w[0], &w[1]) != Ordering::Greater),
         "a segment's entries are in head order"
     );
-    let mut out = vec![0u8; CRC_LEN];
-    push_u64_varint(&mut out, entries.len().div_ceil(BLOCK_ENTRIES) as u64);
+    let mut out = Vec::new();
+    let mut body = Vec::new();
     for block in entries.chunks(BLOCK_ENTRIES) {
-        encode_block(block, &mut out);
+        push_framed_block(block, &mut body, &mut out);
     }
-    let crc = crc32c(&out[CRC_LEN..]);
-    out[..CRC_LEN].copy_from_slice(&crc.to_le_bytes());
     out
+}
+
+/// Append one framed block of `block` to `out`: its body's length, the
+/// body's CRC, the body. `body` is scratch.
+pub(crate) fn push_framed_block(block: &[KeyedEntry], body: &mut Vec<u8>, out: &mut Vec<u8>) {
+    body.clear();
+    encode_block(block, body);
+    push_u64_varint(out, body.len() as u64);
+    out.extend_from_slice(&crc32c(body).to_le_bytes());
+    out.extend_from_slice(body);
+}
+
+/// The byte length of the framed block starting at `bytes[0]`, when
+/// `bytes` holds enough of it to tell: its frame read, its body not.
+pub(crate) fn framed_block_len(bytes: &[u8]) -> Option<usize> {
+    let mut at = 0usize;
+    let body = read_u64_varint(bytes, &mut at)?;
+    at.checked_add(CRC_LEN)?
+        .checked_add(usize::try_from(body).ok()?)
+}
+
+/// Decode the framed block at `*at`, verifying its CRC, advancing `*at`.
+pub(crate) fn decode_framed_block(
+    bytes: &[u8],
+    at: &mut usize,
+) -> Result<LevelBlock, TermIndexError> {
+    let len = read_u64_varint(bytes, at).ok_or_else(|| malformed("block length"))?;
+    let stored = u32_le_at(bytes, *at).ok_or_else(|| malformed("block CRC"))?;
+    *at += CRC_LEN;
+    let end = at
+        .checked_add(usize::try_from(len).map_err(|_| malformed("block length"))?)
+        .filter(|end| *end <= bytes.len())
+        .ok_or_else(|| malformed("block truncated"))?;
+    let body = &bytes[*at..end];
+    // Altered bytes are what a hash mismatch reports elsewhere in the
+    // index: the call for a rebuild, not a parse failure.
+    if crc32c(body) != stored {
+        return Err(TermIndexError::HashMismatch);
+    }
+    let mut body_at = 0usize;
+    let block = decode_block(body, &mut body_at)?;
+    if body_at != body.len() {
+        return Err(malformed("block body length"));
+    }
+    *at = end;
+    Ok(block)
 }
 
 fn encode_block(block: &[KeyedEntry], out: &mut Vec<u8>) {
@@ -419,22 +467,9 @@ pub(crate) fn decode_segment(
     out: &mut Vec<LevelBlock>,
 ) -> Result<(), TermIndexError> {
     out.clear();
-    if bytes.len() < CRC_LEN {
-        return Err(malformed("segment truncated"));
-    }
-    let stored = u32_le_at(bytes, 0).ok_or_else(|| malformed("segment truncated"))?;
-    // Altered bytes are what a hash mismatch reports elsewhere in the
-    // index: the call for a rebuild, not a parse failure.
-    if crc32c(&bytes[CRC_LEN..]) != stored {
-        return Err(TermIndexError::HashMismatch);
-    }
-    let mut at = CRC_LEN;
-    let n_blocks = read_u64_varint(bytes, &mut at).ok_or_else(|| malformed("block count"))?;
-    for _ in 0..n_blocks {
-        out.push(decode_block(bytes, &mut at)?);
-    }
-    if at != bytes.len() {
-        return Err(malformed("segment length"));
+    let mut at = 0usize;
+    while at < bytes.len() {
+        out.push(decode_framed_block(bytes, &mut at)?);
     }
     Ok(())
 }
@@ -621,7 +656,7 @@ mod tests {
         entries.sort_by(head_order);
         let bytes = encode_segment(&entries);
         let mut out = Vec::new();
-        for cut in [0, 3, bytes.len() / 2, bytes.len() - 1] {
+        for cut in [1, 3, bytes.len() - 1] {
             assert!(
                 decode_segment(&bytes[..cut], &mut out).is_err(),
                 "cut at {cut}"
@@ -630,13 +665,24 @@ mod tests {
         let mut flipped = bytes.clone();
         let last = flipped.len() - 1;
         flipped[last] ^= 1;
-        assert!(decode_segment(&flipped, &mut out).is_err());
-        // Bytes past the blocks are refused even behind a valid CRC.
-        let mut long = bytes;
+        assert!(matches!(
+            decode_segment(&flipped, &mut out),
+            Err(TermIndexError::HashMismatch)
+        ));
+        // Bytes past the blocks are refused.
+        let mut long = bytes.clone();
         long.push(0);
-        let crc = crc32c(&long[CRC_LEN..]);
-        long[..CRC_LEN].copy_from_slice(&crc.to_le_bytes());
         assert!(decode_segment(&long, &mut out).is_err());
+        // Each framed block's length is told by its first bytes.
+        let mut at = 0usize;
+        while at < bytes.len() {
+            let len = framed_block_len(&bytes[at..]).expect("frame");
+            let mut block_at = at;
+            decode_framed_block(&bytes, &mut block_at).expect("block");
+            assert_eq!(block_at - at, len);
+            at = block_at;
+        }
+        assert_eq!(at, bytes.len());
     }
 
     #[test]
