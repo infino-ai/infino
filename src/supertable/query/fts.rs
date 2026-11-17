@@ -2604,7 +2604,7 @@ impl SupertableReader {
                 best.entry((hit.superfile, hit.local_doc_id))
                     .and_modify(|b| {
                         if hit.score > b.score {
-                            *b = hit.clone();
+                            *b = hit;
                         }
                     })
                     .or_insert(hit);
