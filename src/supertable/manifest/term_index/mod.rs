@@ -1249,10 +1249,7 @@ fn cursor_limit() -> Option<usize> {
 /// shrink. When `renumber` allows it and at least half of the list is dead
 /// (padding, superfiles `live` does not hold, a superfile's later
 /// listings), every layer folds into one even if their sizes differ, once
-/// the budget holds them all. When some layer holds a slice of the layout
-/// before tiers (`before_tiers`) and the budget holds every layer, every
-/// layer folds into one, so the old layout's postings are written in the
-/// current one. A fold that does not renumber drops its run's dead
+/// the budget holds them all. A fold that does not renumber drops its run's dead
 /// postings but keeps their ordinals, so no layer outside the run is
 /// rewritten.
 pub(crate) fn plan_fold_at_optimize(
@@ -1261,7 +1258,6 @@ pub(crate) fn plan_fold_at_optimize(
     max_bytes: u64,
     budget: FoldBudget,
     renumber: bool,
-    before_tiers: bool,
 ) -> Option<OptimizeFold> {
     let (max_layers, ranges) = budget.shape();
     let mut claimed: HashSet<Uuid> = HashSet::new();
@@ -1293,11 +1289,11 @@ pub(crate) fn plan_fold_at_optimize(
     let n = root.layers.len();
     let whole = FoldCost::sum(&costs);
     // A fold of every layer is held to the budget alone, not to
-    // `FOLD_LAYERS_MAX`: renumbering or leaving the old layout takes every
-    // layer in one fold, slower per byte than runs but done once.
+    // `FOLD_LAYERS_MAX`: renumbering takes every layer in one fold, slower
+    // per byte than runs but done once.
     let whole_fits = n > 0 && whole.0 <= max_layers && whole.1 <= max_bytes;
     let mostly_dead = dead > 0 && 2 * dead >= kept.len();
-    let run = match (whole_fits && ((renumber && mostly_dead) || before_tiers), n) {
+    let run = match (whole_fits && renumber && mostly_dead, n) {
         (true, _) => 0..n,
         (false, 0..=1) => return None,
         (false, _) => fold_window(&costs, max_layers.min(FOLD_LAYERS_MAX), max_bytes)?,
@@ -1321,8 +1317,8 @@ pub(crate) fn plan_fold_at_optimize(
         }
         return Some(fold);
     }
-    // A lone layer folds only to renumber or to leave the old layout.
-    if run.len() < 2 && !before_tiers {
+    // A lone layer folds only to renumber.
+    if run.len() < 2 {
         return None;
     }
     Some(OptimizeFold {
@@ -1414,7 +1410,6 @@ pub(crate) fn layers_after(
     max_bytes: u64,
     budget: FoldBudget,
     renumber: bool,
-    before_tiers: bool,
 ) -> Vec<Layer> {
     if fold.renumbers {
         return Vec::new();
@@ -1423,9 +1418,7 @@ pub(crate) fn layers_after(
     let output = stand_in(ContentHash::of(b""), run_bytes(root, fold));
     let at = fold.run.start;
     predicted.layers.splice(fold.run.clone(), [output]);
-    let Some(next) =
-        plan_fold_at_optimize(&predicted, live, max_bytes, budget, renumber, before_tiers)
-    else {
+    let Some(next) = plan_fold_at_optimize(&predicted, live, max_bytes, budget, renumber) else {
         return Vec::new();
     };
     next.run
@@ -1473,7 +1466,6 @@ pub(crate) fn output_reread(
     max_bytes: u64,
     budget: FoldBudget,
     renumber: bool,
-    before_tiers: bool,
 ) -> bool {
     if fold.renumbers || fold.run == (0..root.layers.len()) {
         return false;
@@ -1485,8 +1477,7 @@ pub(crate) fn output_reread(
         .layers
         .splice(fold.run.clone(), [stand_in(ours, run_bytes(root, fold))]);
     for _ in 0..REREAD_LOOKAHEAD_FOLDS {
-        let Some(next) =
-            plan_fold_at_optimize(&predicted, live, max_bytes, budget, renumber, before_tiers)
+        let Some(next) = plan_fold_at_optimize(&predicted, live, max_bytes, budget, renumber)
         else {
             return false;
         };
@@ -1995,9 +1986,8 @@ fn fold_run(layers: &[Layer], bound: u64) -> Option<Range<usize>> {
 pub(crate) enum RootObjects {
     /// Every slice and tier object is on storage. `sized` when a slice's
     /// length, which a root written before lengths were recorded lacks, was
-    /// filled in from storage; `before_tiers` when some slice is of the
-    /// layout before tiers.
-    Present { sized: bool, before_tiers: bool },
+    /// filled in from storage.
+    Present { sized: bool },
     /// Some slice or tier object will never load.
     Missing,
 }
@@ -2112,7 +2102,6 @@ async fn check_objects_listing_past(
     // fold cannot turn into the superfiles' own ids: the index is built
     // again from the superfiles, once, and serves through the tiers until
     // then.
-    let legacy: HashSet<ContentHash> = HashSet::new();
     while let Some((_, layout)) = prefixes.next().await {
         match layout {
             Ok(true) => return Ok(RootObjects::Missing),
@@ -2121,12 +2110,9 @@ async fn check_objects_listing_past(
             Err(e) => return Err(e),
         }
     }
-    seen.lock().expect("term-index objects seen").extend(
-        objects
-            .values()
-            .filter(|hash| !legacy.contains(hash))
-            .copied(),
-    );
+    seen.lock()
+        .expect("term-index objects seen")
+        .extend(objects.values().copied());
     let mut sized = false;
     for slice in root
         .layers
@@ -2139,10 +2125,7 @@ async fn check_objects_listing_past(
             sized = true;
         }
     }
-    Ok(RootObjects::Present {
-        sized,
-        before_tiers: !legacy.is_empty(),
-    })
+    Ok(RootObjects::Present { sized })
 }
 
 /// Every object under the index's prefix, by storage URI, with its size.
@@ -9248,19 +9231,11 @@ mod tests {
             .filter(|id| *id != removed)
             .collect();
         assert!(
-            plan_fold_at_optimize(&root, &live, 1, budget_for(FOLD_FAN_OUT), false, false)
-                .is_none(),
+            plan_fold_at_optimize(&root, &live, 1, budget_for(FOLD_FAN_OUT), false).is_none(),
             "a run past the byte bound waits"
         );
-        let fold = plan_fold_at_optimize(
-            &root,
-            &live,
-            run_bytes,
-            budget_for(FOLD_FAN_OUT),
-            false,
-            false,
-        )
-        .expect("a fold is due");
+        let fold = plan_fold_at_optimize(&root, &live, run_bytes, budget_for(FOLD_FAN_OUT), false)
+            .expect("a fold is due");
         let listed = root.superfiles.clone();
 
         let root = fold_at_optimize(&local, &root, fold, &policy, &FoldIo::default(), None)
@@ -9269,15 +9244,8 @@ mod tests {
 
         assert_eq!(root.layers.len(), 1, "the run folds into one layer");
         assert!(
-            plan_fold_at_optimize(
-                &root,
-                &live,
-                run_bytes,
-                budget_for(FOLD_FAN_OUT),
-                false,
-                false
-            )
-            .is_none()
+            plan_fold_at_optimize(&root, &live, run_bytes, budget_for(FOLD_FAN_OUT), false)
+                .is_none()
         );
         assert_eq!(root.superfiles, listed, "ordinals are untouched");
         let expected: Vec<Uuid> = (1..=commits)
@@ -9329,31 +9297,17 @@ mod tests {
         let kept: Vec<Uuid> = (1..=LIVE_AFTER_REMOVALS).map(Uuid::from_u128).collect();
         let live: HashSet<Uuid> = kept.iter().copied().collect();
         assert!(
-            plan_fold_at_optimize(&root, &live, 1, budget_for(FOLD_FAN_OUT), true, false).is_none(),
+            plan_fold_at_optimize(&root, &live, 1, budget_for(FOLD_FAN_OUT), true).is_none(),
             "an index past the byte bound is neither renumbered nor folded"
         );
-        let run = plan_fold_at_optimize(
-            &root,
-            &live,
-            index_bytes,
-            budget_for(FOLD_FAN_OUT),
-            false,
-            false,
-        )
-        .expect("a run is due");
+        let run = plan_fold_at_optimize(&root, &live, index_bytes, budget_for(FOLD_FAN_OUT), false)
+            .expect("a run is due");
         assert!(
             !run.renumbers(),
             "without leave to renumber, the run folds alone"
         );
-        let fold = plan_fold_at_optimize(
-            &root,
-            &live,
-            index_bytes,
-            budget_for(FOLD_FAN_OUT),
-            true,
-            false,
-        )
-        .expect("a fold is due");
+        let fold = plan_fold_at_optimize(&root, &live, index_bytes, budget_for(FOLD_FAN_OUT), true)
+            .expect("a fold is due");
         assert!(fold.renumbers());
         assert_eq!(
             fold.superfiles(),
@@ -9371,15 +9325,8 @@ mod tests {
             "the list holds the live superfiles alone"
         );
         assert!(
-            plan_fold_at_optimize(
-                &root,
-                &live,
-                index_bytes,
-                budget_for(FOLD_FAN_OUT),
-                true,
-                false
-            )
-            .is_none()
+            plan_fold_at_optimize(&root, &live, index_bytes, budget_for(FOLD_FAN_OUT), true)
+                .is_none()
         );
         assert_eq!(posted_superfiles(&root, &local, "shared").await, kept);
         for id in 2..=commits {
@@ -9418,10 +9365,7 @@ mod tests {
             check_all_objects(&local, &mut unsized_root, &seen)
                 .await
                 .expect("check"),
-            RootObjects::Present {
-                sized: true,
-                before_tiers: false
-            }
+            RootObjects::Present { sized: true }
         );
         assert_eq!(unsized_root, root, "each length is the slice's on storage");
         let mut sized_root = root.clone();
@@ -9429,10 +9373,7 @@ mod tests {
             check_all_objects(&local, &mut sized_root, &seen)
                 .await
                 .expect("check"),
-            RootObjects::Present {
-                sized: false,
-                before_tiers: false
-            }
+            RootObjects::Present { sized: false }
         );
 
         let slice = &root.layers[0].slices[0];
@@ -9839,21 +9780,14 @@ mod tests {
         }
     }
 
-    /// A fold of every layer renumbers once any superfile is dead, and a
-    /// lone layer of the layout before tiers is still rewritten.
+    /// A fold of every layer renumbers once any superfile is dead; a lone
+    /// layer with every superfile live is left as it is.
     #[test]
     fn optimize_renumbers_a_whole_fold_and_rewrites_a_lone_old_layer() {
         let root = bare_root(FOLD_FAN_OUT, 8);
         let live: HashSet<Uuid> = (2..=8).map(Uuid::from_u128).collect();
-        let fold = plan_fold_at_optimize(
-            &root,
-            &live,
-            u64::MAX,
-            budget_for(FOLD_FAN_OUT),
-            true,
-            false,
-        )
-        .expect("a fold is due");
+        let fold = plan_fold_at_optimize(&root, &live, u64::MAX, budget_for(FOLD_FAN_OUT), true)
+            .expect("a fold is due");
         assert_eq!(fold.run(), 0..FOLD_FAN_OUT);
         assert!(
             fold.renumbers(),
@@ -9862,12 +9796,7 @@ mod tests {
 
         let lone = bare_root(1, 2);
         let all: HashSet<Uuid> = lone.superfiles.iter().copied().collect();
-        assert!(
-            plan_fold_at_optimize(&lone, &all, u64::MAX, budget_for(2), false, false).is_none()
-        );
-        let fold = plan_fold_at_optimize(&lone, &all, u64::MAX, budget_for(2), false, true)
-            .expect("the old layout is rewritten");
-        assert_eq!(fold.run(), 0..1);
+        assert!(plan_fold_at_optimize(&lone, &all, u64::MAX, budget_for(2), false).is_none());
     }
 
     /// A root listing `ids` (each its own `id_min`; `0` is padding) over
@@ -11750,8 +11679,8 @@ mod tests {
             cursors: usize::MAX,
             cache_bytes: u64::MAX,
         };
-        let fold = plan_fold_at_optimize(&root, &live, u64::MAX, wide, false, false)
-            .expect("a fold is due");
+        let fold =
+            plan_fold_at_optimize(&root, &live, u64::MAX, wide, false).expect("a fold is due");
         assert!(fold.ranges() > 1, "the budget allows more than one range");
         let root = fold_at_optimize(&local, &root, fold, &policy, &FoldIo::default(), None)
             .await
@@ -11960,16 +11889,16 @@ mod tests {
         };
         let live = HashSet::new();
         let narrow = budget_for(FOLD_FAN_OUT);
-        let fold = plan_fold_at_optimize(&root, &live, u64::MAX, narrow, false, false)
-            .expect("a fold is due");
+        let fold =
+            plan_fold_at_optimize(&root, &live, u64::MAX, narrow, false).expect("a fold is due");
         assert_eq!(
-            layers_after(&root, &fold, &live, u64::MAX, narrow, false, false),
+            layers_after(&root, &fold, &live, u64::MAX, narrow, false),
             root.layers[FOLD_FAN_OUT..].to_vec()
         );
         let wide = budget_for(root.layers.len());
-        let whole = plan_fold_at_optimize(&root, &live, u64::MAX, wide, false, false)
-            .expect("a fold is due");
-        assert!(layers_after(&root, &whole, &live, u64::MAX, wide, false, false).is_empty());
+        let whole =
+            plan_fold_at_optimize(&root, &live, u64::MAX, wide, false).expect("a fold is due");
+        assert!(layers_after(&root, &whole, &live, u64::MAX, wide, false).is_empty());
     }
 
     /// A prefetch fetches its layers into the reuse directory once the fold
@@ -12018,31 +11947,15 @@ mod tests {
         };
         let live = HashSet::new();
         let narrow = budget_for(FOLD_FAN_OUT);
-        let fold = plan_fold_at_optimize(&root, &live, u64::MAX, narrow, false, false)
-            .expect("a fold is due");
+        let fold =
+            plan_fold_at_optimize(&root, &live, u64::MAX, narrow, false).expect("a fold is due");
         assert_eq!(fold.run(), 0..FOLD_FAN_OUT);
-        assert!(output_reread(
-            &root,
-            &fold,
-            &live,
-            u64::MAX,
-            narrow,
-            false,
-            false
-        ));
+        assert!(output_reread(&root, &fold, &live, u64::MAX, narrow, false));
         let wide = budget_for(root.layers.len());
-        let whole = plan_fold_at_optimize(&root, &live, u64::MAX, wide, false, false)
-            .expect("a fold is due");
+        let whole =
+            plan_fold_at_optimize(&root, &live, u64::MAX, wide, false).expect("a fold is due");
         assert_eq!(whole.run(), 0..root.layers.len());
-        assert!(!output_reread(
-            &root,
-            &whole,
-            &live,
-            u64::MAX,
-            wide,
-            false,
-            false
-        ));
+        assert!(!output_reread(&root, &whole, &live, u64::MAX, wide, false));
 
         let dir = TempDir::new().expect("dir");
         let named = root.layers[0].slices[0].content_hash.to_hex();

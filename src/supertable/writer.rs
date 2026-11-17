@@ -14015,24 +14015,19 @@ pub(in crate::supertable) async fn stamp_term_index(
                     ..old.options.term_index_build_policy()
                 };
                 let live: HashSet<Uuid> = entries.iter().map(|e| e.superfile_id).collect();
-                let (mut root, mut repaired, sized, before_tiers) = match referenced_root(&old)
-                    .await?
-                {
+                let (mut root, mut repaired, sized) = match referenced_root(&old).await? {
                     Some(mut root) => {
                         match term_index::check_objects(storage, &mut root, seen, &live).await? {
-                            RootObjects::Present {
-                                sized,
-                                before_tiers,
-                            } => (root, false, sized, before_tiers),
+                            RootObjects::Present { sized } => (root, false, sized),
                             RootObjects::Missing => {
                                 warn!(
-                                    "term index: an object the root names will not load; indexing every superfile again"
+                                    "term index: an object the root names will not load, or a layer predates level heads; indexing every superfile again"
                                 );
-                                (Root::default(), true, false, false)
+                                (Root::default(), true, false)
                             }
                         }
                     }
-                    None => (Root::default(), true, false, false),
+                    None => (Root::default(), true, false),
                 };
                 let pool = Some(&*old.options.reader_pool);
                 let mut missing = unlisted(&root, &entries);
@@ -14065,7 +14060,6 @@ pub(in crate::supertable) async fn stamp_term_index(
                             max_bytes,
                             fold_budget,
                             renumber,
-                            before_tiers,
                         )
                     };
                     let mut fold_max_bytes = term_index::fold_disk_bound(reuse_path, disk_per_slice, held)
@@ -14097,7 +14091,6 @@ pub(in crate::supertable) async fn stamp_term_index(
                             fold_max_bytes,
                             fold_budget,
                             renumber,
-                            before_tiers,
                         ) && term_index::fold_disk_bound(reuse_path, disk_per_slice, 0)
                             .is_some_and(|bound| bound >= fold_bytes.saturating_mul(2));
                         let downloaded = Arc::new(Notify::new());
@@ -14109,7 +14102,6 @@ pub(in crate::supertable) async fn stamp_term_index(
                                 fold_max_bytes,
                                 fold_budget,
                                 renumber,
-                                before_tiers,
                             ),
                             false => Vec::new(),
                         };
