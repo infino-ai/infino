@@ -7301,7 +7301,14 @@ pub(in crate::supertable) async fn drain_waiting_user_superfiles(
             .iter()
             .filter(|version| !drained.contains(**version))
             .count();
-        if still_waiting == 0 || still_waiting == left {
+        if still_waiting == 0 {
+            return Ok(());
+        }
+        if still_waiting == left {
+            info!(
+                waiting_superfiles = still_waiting,
+                "[supertable drain] a drain took nothing on; the commits left wait for a later optimize"
+            );
             return Ok(());
         }
         left = still_waiting;
@@ -16285,6 +16292,9 @@ mod tests {
         expect_stamped(&loaded);
     }
 
+    /// Disk budget per byte of it that temp files may take.
+    const SCRATCH_SHARE_OF_BUDGET: u64 = 2;
+
     /// Bytes of each file a process killed mid-drain leaves in its folder.
     const CRASH_LEFTOVER_BYTES: usize = 4096;
     const COMMIT_AS_DRAIN_TEST_DIM: usize = 16;
@@ -17854,6 +17864,56 @@ mod tests {
             .map(|s| s.n_docs)
             .sum();
         assert_eq!(hidden_rows, (COMMITS * COMMIT_AS_DRAIN_TEST_ROWS) as u64);
+    }
+
+    /// On a table whose disk budget has room for one commit's temp files at
+    /// a time, one `optimize` still drains every commit, a drain at a time,
+    /// and its compaction leaves the hidden index in as few files as on a
+    /// table with room for the whole drain at once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn optimize_on_a_tight_disk_budget_drains_every_commit_and_merges_what_it_drained() {
+        const COMMITS: usize = 3;
+        let optimized = async |disk_budget_bytes: u64| {
+            let dir = TempDir::new().expect("tempdir");
+            let (table, cache) = drain_table_with_disk_cache(&dir, disk_budget_bytes);
+            for _ in 0..COMMITS {
+                commit_axis_vectors(&table, COMMIT_AS_DRAIN_TEST_ROWS);
+            }
+            let (hidden, _) = current_drain_epoch(&table).await;
+            table
+                .optimize(&OptimizeOptions::compact(CompactionSettings {
+                    min_fill_percent: 100,
+                    min_superfiles_for_merge: 2,
+                    ..CompactionSettings::default()
+                }))
+                .expect("optimize");
+            let hidden_files = hidden
+                .inner()
+                .manifest
+                .load_full()
+                .get_all_superfiles_loaded()
+                .await
+                .expect("hidden superfiles")
+                .len();
+            cache.assert_budget_consistent();
+            (hidden_index_rows(&hidden).await, hidden_files)
+        };
+        // A budget whose share for temp files holds one commit's spill and
+        // cells.
+        let one_commit = {
+            let dir = TempDir::new().expect("tempdir");
+            let (table, _) = drain_table_with_disk_cache(&dir, roomy_disk_budget());
+            let row_bytes =
+                drain_spill_row_bytes(&table.inner().options, "emb").expect("vector column");
+            COMMIT_AS_DRAIN_TEST_ROWS as u64 * row_bytes * DRAIN_SPILL_ROOM_DIVISOR
+        };
+
+        let (roomy_rows, roomy_files) = optimized(roomy_disk_budget()).await;
+        let (tight_rows, tight_files) = optimized(one_commit * SCRATCH_SHARE_OF_BUDGET).await;
+        let all_rows = (COMMITS * COMMIT_AS_DRAIN_TEST_ROWS) as u64;
+        assert_eq!(roomy_rows, all_rows);
+        assert_eq!(tight_rows, all_rows, "every commit is drained");
+        assert_eq!(tight_files, roomy_files, "and merged into as few files");
     }
 
     /// Compaction that runs while a row-limited drain is stopped partway must

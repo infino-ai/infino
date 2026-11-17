@@ -441,7 +441,7 @@ impl DiskCacheStore {
     }
 
     /// The most bytes this cache's budget lets its table's temp files be charged.
-    fn scratch_cap(&self) -> u64 {
+    pub(crate) fn scratch_cap(&self) -> u64 {
         self.disk_budget_bytes() / SCRATCH_SHARE_DIVISOR
     }
 
