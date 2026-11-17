@@ -5561,7 +5561,7 @@ mod tests {
     ) -> (SessionContext, Option<LogicalPlan>) {
         let ctx = sql_session_context(&conn.inner.connection_memory_budget).expect("session");
         for name in tables {
-            conn.open_and_register(&ctx, name)
+            conn.open_and_register(&ctx, name, true)
                 .expect("register")
                 .expect("a catalog table");
         }
@@ -5672,7 +5672,7 @@ mod tests {
     fn parsed(conn: &Connection, sql: &str, tables: &[&str]) -> LogicalPlan {
         let ctx = sql_session_context(&conn.inner.connection_memory_budget).expect("session");
         for name in tables {
-            conn.open_and_register(&ctx, name)
+            conn.open_and_register(&ctx, name, true)
                 .expect("register")
                 .expect("a catalog table");
         }
