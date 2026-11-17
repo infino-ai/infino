@@ -714,14 +714,6 @@ impl DiskCacheStore {
                         tracing::debug!(target: "infino::cache", uri = %uri_owned.0, "fill: memory budget share under one chunk");
                         exit.failed();
                     }
-                    // The file is gone from storage: deleted under the download, as when its
-                    // table is dropped or its prefix removed. Still a failure, so the next read
-                    // does not download it again, but nothing is wrong with the cache, so no
-                    // warning.
-                    Err(DiskCacheError::Storage(StorageError::NotFound { .. })) => {
-                        tracing::debug!(target: "infino::cache", uri = %uri_owned.0, "fill: the file is gone from storage");
-                        exit.failed();
-                    }
                     // The entry still serves reads. A read after `FAILED_FILL_RETRY_AFTER` tries
                     // again.
                     Err(error) => {
@@ -1991,7 +1983,6 @@ mod tests {
         task::yield_now,
         time::{sleep, timeout},
     };
-    use tracing::Level;
 
     use crate::{
         memory::{ConnectionMemoryBudget, Reservation},
@@ -2015,10 +2006,7 @@ mod tests {
                 },
             },
         },
-        test_helpers::{
-            capture_logs,
-            fault_storage::{FaultKind, FaultOp, FaultStorage},
-        },
+        test_helpers::fault_storage::{FaultOp, FaultStorage},
     };
 
     /// Fills parked behind one held reader in the polling test.
@@ -2236,18 +2224,7 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let local: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("localfs"));
-        recording_store_over(dir, local, budget, tweak)
-    }
-
-    /// [`recording_store_with`], recording `storage` (rooted in `dir`) instead of a plain local
-    /// store, so a test can put a fault-injecting store under it.
-    fn recording_store_over(
-        dir: TempDir,
-        storage: Arc<dyn StorageProvider>,
-        budget: Option<u64>,
-        tweak: impl FnOnce(&mut DiskCacheConfig),
-    ) -> (TempDir, Arc<DiskCacheStore>, Arc<RecordingStorage>) {
-        let recording = RecordingStorage::over(storage);
+        let recording = RecordingStorage::over(local);
         let defaults = DiskCacheConfig::default();
         let mut cfg = DiskCacheConfig {
             cache_root: dir.path().join("cache"),
@@ -2799,87 +2776,6 @@ mod tests {
         let retry_after_us = FAILED_FILL_RETRY_AFTER.as_micros() as u64;
         assert!(!fill.may_retry(failed_at_us + retry_after_us - 1));
         assert!(fill.may_retry(failed_at_us + retry_after_us));
-    }
-
-    /// A download whose file is deleted from storage under it (its table dropped, its prefix
-    /// removed) is still a failure, so the next read does not download it again, but it logs no
-    /// warning: nothing is wrong with the cache.
-    ///
-    /// Setup: the download waits for its slot, and the file is deleted from storage meanwhile.
-    /// The runtime runs on this thread, so the captured logs hold the download's own.
-    #[test]
-    fn a_download_whose_file_is_gone_from_storage_logs_no_warning() {
-        let runtime = Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
-        let (fill, logs) = capture_logs(Level::WARN, || {
-            runtime.block_on(async {
-                let (_dir, store, recording) = recording_store(None);
-                let (uri, _) = put_tiny_superfile(&recording).await;
-                let permit = hold_fill_slot(&store).await;
-                warm_open(&store, &uri).await;
-                let fill = fill_of(&store, &uri);
-                recording.delete(&uri.storage_path()).await.expect("delete");
-                drop(permit);
-                store
-                    .wait_until_fills_settled(PROMOTE_TIMEOUT)
-                    .await
-                    .expect("the download ends");
-                fill
-            })
-        });
-
-        assert!(fill.failed_at_us.get().is_some(), "still a failure");
-        assert!(!logs.contains("download failed"), "no warning, got: {logs}");
-    }
-
-    /// A download that fails for any other storage error still logs a warning: only a file gone
-    /// from storage is quiet.
-    ///
-    /// Setup: as above, but every read of the file fails with `kind` instead of finding it gone.
-    #[test]
-    fn a_download_failing_for_another_storage_error_logs_a_warning() {
-        for kind in [FaultKind::Transient, FaultKind::PermissionDenied] {
-            let runtime = Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("runtime");
-            let (fill, logs) = capture_logs(Level::WARN, || {
-                runtime.block_on(async {
-                    let dir = TempDir::new().expect("tempdir");
-                    let local: Arc<dyn StorageProvider> =
-                        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("localfs"));
-                    let faults = FaultStorage::wrap(local);
-                    let (_dir, store, recording) = recording_store_over(
-                        dir,
-                        Arc::clone(&faults) as Arc<dyn StorageProvider>,
-                        None,
-                        |_| {},
-                    );
-                    let (uri, _) = put_tiny_superfile(&recording).await;
-                    let permit = hold_fill_slot(&store).await;
-                    warm_open(&store, &uri).await;
-                    let fill = fill_of(&store, &uri);
-                    for op in [FaultOp::Get, FaultOp::GetRange] {
-                        faults.fail_with(kind, op, &uri.0.to_string(), usize::MAX);
-                    }
-                    drop(permit);
-                    store
-                        .wait_until_fills_settled(PROMOTE_TIMEOUT)
-                        .await
-                        .expect("the download ends");
-                    assert!(faults.fired() > 0, "{kind:?}: the download hit the fault");
-                    fill
-                })
-            });
-
-            assert!(fill.failed_at_us.get().is_some(), "{kind:?}: a failure");
-            assert!(
-                logs.contains("fill: download failed"),
-                "{kind:?}: a warning, got: {logs}"
-            );
-        }
     }
 
     /// A download whose cache directory is removed under it (a dropped store's, say) ends like a
