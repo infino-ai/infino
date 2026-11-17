@@ -12824,7 +12824,7 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
             dim,
             metric,
         ) {
-            Ok(router) if !router.node_map.is_empty() => {
+            Ok(router) if router.live_nodes > 0 => {
                 let queries = cal.frozen_queries().unwrap_or(&[]);
                 let (selection, max_fanout, register_floor, parity_gap) =
                     crate::supertable::query::vector::build_router_fanout_selection(
@@ -12845,7 +12845,7 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
                     .max(calib_k)
                     .max(1);
                 let ctx = opann::FanoutCalibCtx {
-                    total_fine: router.node_map.len().min(u32::MAX as usize) as u32,
+                    total_fine: router.live_nodes.min(u32::MAX as usize) as u32,
                     max_fanout,
                     register_floor,
                     parity_gap,

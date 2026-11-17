@@ -1245,15 +1245,20 @@ pub(crate) struct CentroidRouterGraph {
     scorer: crate::superfile::vector::hnsw::Fp32Scorer,
     graph: crate::superfile::vector::hnsw::Hnsw,
     /// `node_map[i] = (superfile index, per-superfile flat cluster)` for graph
-    /// node `i`. Read by the recalibration to size the fanout ladder (node
-    /// count = total selectable fine clusters) and resolve each selected node
-    /// to its superfile + flat cluster.
+    /// node `i`, or [`HOLE_NODE`] for a hole (a node no search returns).
+    /// Resolves each selected node to its superfile + flat cluster.
     pub(crate) node_map: Vec<(usize, u32)>,
+    /// Graph nodes that are not holes: the total selectable fine clusters,
+    /// which sizes the fanout ladder and caps a query's fanout.
+    pub(crate) live_nodes: usize,
     /// The column metric the scorer ranks by — set at build and reproduced on
     /// load. The query is transformed into the same space before the walk
     /// ([`gfc_prepare_for_metric`]), so build-time and query-time scoring agree.
     metric: Metric,
 }
+
+/// The [`CentroidRouterGraph::node_map`] entry of a hole.
+const HOLE_NODE: (usize, u32) = (usize::MAX, u32::MAX);
 
 /// A [`CentroidRouterGraph`] stamped with the `(generation, column)` its nodes
 /// were built for: the hidden manifest generation (`manifest_id`) and the
@@ -1316,7 +1321,7 @@ impl FineAssignRouter {
         gfc_prepare_for_metric(graph.metric, &mut q);
         // Over-fetch graph nodes so the primary + replica CELLS survive the
         // dedup when several fine centroids share a cell.
-        let n_place = ((REPLICA_CLOSURE_MAX_REPLICAS + 1) * 8).min(graph.node_map.len().max(1));
+        let n_place = ((REPLICA_CLOSURE_MAX_REPLICAS + 1) * 8).min(graph.live_nodes.max(1));
         let ef = n_place.saturating_mul(2).max(n_place);
         let hits = graph.graph.search(&graph.scorer, &q, n_place, ef);
         let n_cent = clusters.n_cent as usize;
@@ -1506,7 +1511,7 @@ fn resolve_ivf_router(
 /// no I/O.
 ///
 /// This must be the SAME quantity the fanout was calibrated against, i.e.
-/// `router.node_map.len()`, not the nominal `n_cent` sum. The router's node walk
+/// `router.live_nodes`, not the nominal `n_cent` sum. The router's node walk
 /// ([`VectorReader::global_fine_cluster_vectors`]) skips cells with no indexed
 /// docs (`n_docs == 0 || n_cent == 0`), so a cell that summarizes to a nominal
 /// `n_cent` while holding no live rows contributes zero router nodes. Summing
@@ -1664,7 +1669,7 @@ fn build_centroid_router(
         |order| {
             let ordered: Vec<Vec<f32>> = order
                 .iter()
-                .map(|&i| mem::take(&mut vecs[walk_index[i]]))
+                .map(|i| i.map_or_else(|| vec![0.0; dim], |i| mem::take(&mut vecs[walk_index[i]])))
                 .collect();
             Fp32Scorer::from_vectors(&ordered, dim, metric)
         },
@@ -1675,11 +1680,15 @@ fn build_centroid_router(
         nodes = order.len(),
         "centroid router graph"
     );
-    let node_map = order.iter().map(|&i| walk_map[walk_index[i]]).collect();
+    let node_map = order
+        .iter()
+        .map(|i| i.map_or(HOLE_NODE, |i| walk_map[walk_index[i]]))
+        .collect();
     Ok(CentroidRouterGraph {
         scorer,
         graph,
         node_map,
+        live_nodes: keys.len(),
         metric,
     })
 }
@@ -1703,12 +1712,16 @@ fn encode_centroid_router_section(
     superfiles: &[Arc<SuperfileEntry>],
     dim: usize,
 ) -> Vec<u8> {
-    let topology = router.graph.to_bytes();
-    let mut out = Vec::with_capacity(8 + 4 + 8 + router.node_map.len() * 20 + 8 + topology.len());
+    // The section holds live nodes only: a hole has no centroid to name, and
+    // no list names a hole, so dropping them renumbers the graph unchanged.
+    let (graph, kept) = router.graph.without_holes();
+    let topology = graph.to_bytes();
+    let mut out = Vec::with_capacity(8 + 4 + 8 + kept.len() * 20 + 8 + topology.len());
     out.extend_from_slice(CENTROID_ROUTER_SECTION_MAGIC);
     out.extend_from_slice(&(dim as u32).to_le_bytes());
-    out.extend_from_slice(&(router.node_map.len() as u64).to_le_bytes());
-    for &(si, flat) in &router.node_map {
+    out.extend_from_slice(&(kept.len() as u64).to_le_bytes());
+    for &node in &kept {
+        let (si, flat) = router.node_map[node as usize];
         out.extend_from_slice(superfiles[si].superfile_id.as_bytes());
         out.extend_from_slice(&flat.to_le_bytes());
     }
@@ -1815,10 +1828,12 @@ fn decode_centroid_router_section(
         node_map.push((si, *flat));
     }
     let scorer = Fp32Scorer::from_vectors(&vecs, dim, metric);
+    let live_nodes = graph.live_len();
     Some(CentroidRouterGraph {
         scorer,
         graph,
         node_map,
+        live_nodes,
         metric,
     })
 }
@@ -1909,10 +1924,12 @@ pub(crate) fn build_centroid_router_from_cluster_vectors(
     }
     let scorer = Fp32Scorer::from_vectors(&vecs, dim, metric);
     let graph = Hnsw::build(&scorer, HnswParams::default());
+    let live_nodes = node_map.len();
     Ok(CentroidRouterGraph {
         scorer,
         graph,
         node_map,
+        live_nodes,
         metric,
     })
 }
@@ -1966,7 +1983,7 @@ pub(crate) fn build_router_fanout_selection(
     metric: Metric,
 ) -> (Vec<Vec<HashMap<u32, u32>>>, usize, f64, f64) {
     let vcfg = &config::global().vector;
-    let total_fine = router.node_map.len();
+    let total_fine = router.live_nodes;
     let max_fanout = vcfg.centroid_graph_max_fanout.max(1).min(total_fine.max(1));
     let nq = queries_raw.len().checked_div(dim).unwrap_or(0);
     // Search width: the configured graph ef, floored to cover the fanout, or
@@ -5146,7 +5163,7 @@ impl SupertableReader {
             let router = &stamped.graph;
             let mut q = query.to_vec();
             gfc_prepare_for_metric(router.metric, &mut q);
-            let fc = fanout.clamp(1, router.node_map.len().max(1));
+            let fc = fanout.clamp(1, router.live_nodes.max(1));
             // `ef` governs graph-vs-exact parity; `global_fine_graph_ef = 0`
             // auto-selects `fanout * 2`.
             let ef_cfg = config::global().vector.global_fine_graph_ef;
@@ -5589,8 +5606,10 @@ impl SupertableReader {
             &keys,
             false,
             |order| {
-                let ordered: Vec<Vec<f32>> =
-                    order.iter().map(|&i| mem::take(&mut vecs[i])).collect();
+                let ordered: Vec<Vec<f32>> = order
+                    .iter()
+                    .map(|i| i.map_or_else(|| vec![0.0; dim], |i| mem::take(&mut vecs[i])))
+                    .collect();
                 Fp32Scorer::from_vectors(&ordered, dim, metric)
             },
         );
@@ -5600,9 +5619,12 @@ impl SupertableReader {
         // `u32::MAX` sentinel and skipped at assign time, so a row is never
         // placed into a superseded parent (which every query path filters out);
         // it falls back to a live cell instead.
+        // A hole has no cell and is never returned by a search; it takes the
+        // same sentinel.
         let node_to_cell: Vec<u32> = order
             .iter()
-            .map(|&i| {
+            .map(|i| {
+                let Some(i) = *i else { return u32::MAX };
                 let (superfile_id, cell_id, _) = keys[i];
                 match cell_id {
                     Some(c)
@@ -5628,6 +5650,7 @@ impl SupertableReader {
                 scorer,
                 graph,
                 node_map,
+                live_nodes: keys.len(),
                 metric,
             },
         });
