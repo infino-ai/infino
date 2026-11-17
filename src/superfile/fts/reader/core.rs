@@ -1281,7 +1281,7 @@ impl FtsReader {
             doc_map_region,
             verify_crc: opts.verify_crc,
             loads,
-            heap_budget: HeapBudget::process(),
+            heap_budget: default_heap_budget(),
             #[cfg(test)]
             doc_map_reads: Arc::default(),
         })
@@ -1379,13 +1379,9 @@ impl FtsReader {
             .expect("a blob in row order never reads its doc-id map")
     }
 
-    /// The doc-id map, for a translation that runs off the async path.
-    ///
-    /// A query has read it by then ([`Self::ensure_doc_map`]), and a
-    /// compaction input holds its whole file from open, so this reads only
-    /// when neither did, through the source's blocking read. A failed read
-    /// is an error: taking blob ids as rows would silently answer with the
-    /// wrong rows.
+    /// The whole doc-id map, for a caller off the async path: the kept one, or read through the
+    /// source's blocking read and kept, charged to the heap budget even without room. A failed read
+    /// is an error: taking blob ids as rows would silently answer with the wrong rows.
     pub(crate) fn doc_map(&self) -> Result<DocMap, FtsError> {
         if let Some(map) = self.doc_map.get() {
             return Ok(map.clone());
@@ -2370,7 +2366,7 @@ fn checked_doc_map_body(
     verify_crc: bool,
 ) -> Result<Bytes, FtsError> {
     if bytes.len() < region.len() {
-        return Err(doc_map_short_read(bytes.len(), region.len()));
+        return Err(doc_map_short_read("fts doc-map", bytes.len(), region.len()));
     }
     let body = bytes.slice(..region.len());
     if verify_crc {
@@ -2382,10 +2378,11 @@ fn checked_doc_map_body(
     Ok(body)
 }
 
-/// A doc-id map read that came back with `got` of the `want` bytes asked for.
-pub(super) fn doc_map_short_read(got: usize, want: usize) -> FtsError {
+/// A read of `what` (the whole doc-id map, or one run of its pages) that came back with `got` of
+/// the `want` bytes asked for.
+pub(super) fn doc_map_short_read(what: &str, got: usize, want: usize) -> FtsError {
     FtsError::Read(ReadError::Malformed(format!(
-        "fts doc-map read {got} of its {want} bytes"
+        "{what} read {got} of its {want} bytes"
     )))
 }
 
@@ -2394,6 +2391,24 @@ pub(super) fn doc_map_crc_mismatch() -> FtsError {
     FtsError::Read(ReadError::ChecksumMismatch {
         section: "fts/doc-map",
         column: String::new(),
+    })
+}
+
+/// The budget a reader charges kept doc-id maps to: the process's.
+#[cfg(not(test))]
+fn default_heap_budget() -> &'static HeapBudget {
+    HeapBudget::process()
+}
+
+/// Under test, one with room and no limit, so a test's translations don't depend on the host's
+/// memory; a test of the budget sets its own with [`FtsReader::with_heap_budget`].
+#[cfg(test)]
+fn default_heap_budget() -> &'static HeapBudget {
+    static ROOMY: OnceLock<&'static HeapBudget> = OnceLock::new();
+    ROOMY.get_or_init(|| {
+        let budget = HeapBudget::with_budget(None);
+        budget.set_short_of_memory(false);
+        budget
     })
 }
 

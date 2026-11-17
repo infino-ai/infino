@@ -43,6 +43,15 @@ const HEAP_BUDGET_PERCENT: u64 = 25;
 /// statements just used stay, rather than leave and reopen at every statement end.
 const UNHELD_FLOOR_DIVISOR: u64 = 4;
 
+/// Share of the budget doc-id maps a query can do without may take. Half, so maps can't starve SQL
+/// scans of their file metadata and SQL metadata can't starve ranked search of its maps.
+const MAP_SHARE_PERCENT: u64 = 50;
+
+/// The part of `budget` doc-id maps a query can do without may take.
+fn map_share(budget: u64) -> u64 {
+    (u128::from(budget) * u128::from(MAP_SHARE_PERCENT) / 100) as u64
+}
+
 /// Batches of released readers waiting to be freed: past this many, the caller frees its own, so
 /// a burst of statements cannot pile up memory that is gone from the cache but not yet freed.
 const FREE_QUEUE_BATCHES: usize = 2;
@@ -143,7 +152,7 @@ pub(crate) trait CachedSessions: Send + Sync {
 pub(crate) struct HeapReservation {
     budget: &'static HeapBudget,
     bytes: AtomicU64,
-    /// A doc-id map's, also counted in the budget's maps total.
+    /// Whether it pays for a doc-id map, and so is also counted in the budget's maps total.
     map: bool,
 }
 
@@ -158,12 +167,10 @@ impl HeapReservation {
         ptr::eq(self.budget, budget)
     }
 
-    /// Count `more` bytes in this reservation, kept until it drops.
+    /// Count `more` bytes in this reservation, kept until it drops. A doc-id map's is never grown.
     pub(crate) fn add(&self, more: u64) {
+        debug_assert!(!self.map, "a doc-id map's reservation is sized once");
         self.budget.charged.fetch_add(more, Ordering::AcqRel);
-        if self.map {
-            self.budget.maps.fetch_add(more, Ordering::AcqRel);
-        }
         self.bytes.fetch_add(more, Ordering::AcqRel);
     }
 }
@@ -286,16 +293,16 @@ impl HeapBudget {
     }
 
     /// Reserve `bytes` for a doc-id map a query can do without: `None` while the process is short
-    /// of memory, or when kept maps would pass the budget. Refusing is one compare-and-swap; it
-    /// drops nothing.
+    /// of memory, or when kept maps would pass their share of the budget. Refusing drops nothing:
+    /// it is a sampled memory check and one compare-and-swap.
     pub(crate) fn try_reserve_map(&'static self, bytes: u64) -> Option<HeapReservation> {
         if self.short_of_memory() {
             return None;
         }
-        let budget = self.budget().unwrap_or(u64::MAX);
+        let share = self.budget().map_or(u64::MAX, map_share);
         self.maps
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |maps| {
-                maps.checked_add(bytes).filter(|&total| total <= budget)
+                maps.checked_add(bytes).filter(|&total| total <= share)
             })
             .ok()?;
         self.charged.fetch_add(bytes, Ordering::AcqRel);
@@ -318,15 +325,16 @@ impl HeapBudget {
         }
     }
 
-    /// Drop the oldest unheld files counted here until they are back under their target (see
-    /// [`unheld_target`]), then each cache's unheld lazy files past its cap. When held files alone
-    /// fill the budget, the tables' cached sessions are dropped first so theirs can leave too. Does
-    /// nothing under budget, with no budget, while the process has room to spare, or while another
-    /// pass runs: then the cache keeps what it holds, as before.
+    /// Drop the oldest unheld files counted here until file metadata's unheld bytes are back under
+    /// their target ([`unheld_target`] of [`Self::sql_share`]), then each cache's unheld lazy files
+    /// past its cap. Kept doc-id maps can't be dropped here, so the total may stay over. When held
+    /// files alone fill that share, the tables' cached sessions are dropped first so theirs can
+    /// leave too. Does nothing under the share, with no budget, while the process has room to
+    /// spare, or while another pass runs: then the cache keeps what it holds, as before.
     pub(crate) fn release_over_budget(&self) {
         let Some(budget) = self.budget() else { return };
         let charged = self.charged.load(Ordering::Acquire);
-        if charged <= budget || !self.short_of_memory() {
+        if self.sql_bytes() <= self.sql_share(budget) || !self.short_of_memory() {
             return;
         }
         // One pass at a time. A statement that ends while one runs leaves its files to the next
@@ -354,15 +362,17 @@ impl HeapBudget {
             list.retain(|cache| cache.strong_count() > 0);
             list.iter().filter_map(Weak::upgrade).collect()
         };
+        // File metadata's share: kept doc-id maps can't be dropped here, so they are not aimed at.
+        let share = self.sql_share(budget);
         let mut scan = self.scan(&caches);
-        // Held files fill the budget: drop the tables' cached sessions, rebuilt on their next
+        // Held files fill the share: drop the tables' cached sessions, rebuilt on their next
         // statement, and look again.
-        if scan.held > budget {
+        if scan.held > share {
             drop(scan);
             self.drop_cached_sessions();
             scan = self.scan(&caches);
         }
-        let target = unheld_target(budget, scan.held);
+        let target = unheld_target(share, scan.held);
         let mut unheld = scan.unheld;
         let mut released = Vec::new();
         for (_, at, uri, bytes) in scan.oldest {
@@ -408,7 +418,8 @@ impl HeapBudget {
             }
         }
         oldest.sort_unstable();
-        let held = self.charged.load(Ordering::Acquire).saturating_sub(unheld);
+        // Held file metadata: what is charged, less doc-id maps and the unheld files found here.
+        let held = self.sql_bytes().saturating_sub(unheld);
         Scan {
             oldest,
             unheld,
@@ -433,6 +444,19 @@ impl HeapBudget {
         let mut list = self.sessions.lock().unwrap_or_else(PoisonError::into_inner);
         list.retain(|sessions| sessions.strong_count() > 0);
         list.push(sessions);
+    }
+
+    /// Bytes charged for file metadata: everything but doc-id maps, which the pass can't drop.
+    fn sql_bytes(&self) -> u64 {
+        let maps = self.maps.load(Ordering::Acquire);
+        self.charged.load(Ordering::Acquire).saturating_sub(maps)
+    }
+
+    /// The part of `budget` file metadata keeps: what kept maps leave of it, and never less than
+    /// what is left past the maps' share, however many maps are kept regardless.
+    fn sql_share(&self, budget: u64) -> u64 {
+        let maps = self.maps.load(Ordering::Acquire);
+        budget - maps.min(map_share(budget))
     }
 
     /// Let this budget drop `cache`'s files.
@@ -592,13 +616,79 @@ mod tests {
     }
 
     #[test]
+    fn file_metadata_keeps_its_share_when_maps_fill_theirs() {
+        // A budget of four entries, short of memory: maps fill their half, then a keep that can't be
+        // refused takes them past it; two file entries sit within the half left to them.
+        //  - the pass drops neither file, though the total stays over budget.
+        // This test pins that maps, which the pass can't drop, never cost file metadata its share.
+        let (_dir, store) = store_with_budget(Some(4 * ENTRY_BYTES));
+        let budget = store.heap_budget();
+        budget.set_short_of_memory(false);
+        let kept = budget
+            .try_reserve_map(2 * ENTRY_BYTES)
+            .expect("the maps' share");
+        let regardless = budget.reserve_map(2 * ENTRY_BYTES);
+        budget.set_short_of_memory(true);
+        let files = [charged_entry(&store, 1), charged_entry(&store, 2)];
+        budget.release_over_budget();
+        assert!(
+            files.iter().all(|uri| store.is_cached(uri)),
+            "file metadata kept its share"
+        );
+        assert_eq!(budget.charged(), 6 * ENTRY_BYTES);
+        drop((kept, regardless));
+    }
+
+    #[test]
+    fn file_metadata_past_its_share_goes_oldest_first() {
+        // A budget of four entries, short of memory, maps at their half, and three file entries
+        // used at times 1, 2 and 3.
+        //  - the pass drops the one used first and keeps the other two, within their half.
+        // This test pins that the pass still frees file metadata down to its share, oldest first.
+        let (_dir, store) = store_with_budget(Some(4 * ENTRY_BYTES));
+        let budget = store.heap_budget();
+        budget.set_short_of_memory(false);
+        let kept = budget
+            .try_reserve_map(2 * ENTRY_BYTES)
+            .expect("the maps' share");
+        budget.set_short_of_memory(true);
+        let [oldest, newer, newest] =
+            [1, 2, 3].map(|last_access_us| charged_entry(&store, last_access_us));
+        budget.release_over_budget();
+        assert!(!store.is_cached(&oldest), "the oldest file goes");
+        assert!(store.is_cached(&newer) && store.is_cached(&newest));
+        assert_eq!(budget.charged(), 4 * ENTRY_BYTES);
+        drop(kept);
+    }
+
+    #[test]
+    fn a_map_keep_is_allowed_up_to_its_share_with_file_metadata_full() {
+        // A budget of four entries already charged with four file entries, memory to spare.
+        //  - a map of half the budget is kept;
+        //  - one more map, past the maps' half, is refused.
+        // This test pins that maps have a share of their own, whatever file metadata holds.
+        let (_dir, store) = store_with_budget(Some(4 * ENTRY_BYTES));
+        let budget = store.heap_budget();
+        let _files = [1, 2, 3, 4].map(|last_access_us| charged_entry(&store, last_access_us));
+        budget.set_short_of_memory(false);
+        let kept = budget
+            .try_reserve_map(2 * ENTRY_BYTES)
+            .expect("the maps' share");
+        assert!(
+            budget.try_reserve_map(ENTRY_BYTES).is_none(),
+            "past the maps' share"
+        );
+        drop(kept);
+    }
+
+    #[test]
     fn a_burst_of_map_keeps_gets_exactly_the_room_there_is() {
-        // A budget with room for 80 maps of 100 bytes, not short of memory, and 200 threads asking
-        // for a map at the same moment.
+        // A budget whose maps' share has room for 80 maps of 100 bytes, not short of memory, and 200
+        // threads asking for a map at the same moment.
         //  - exactly 80 get one; the maps total and the overall total are 80 maps' worth;
         //  - dropping them gives both totals back.
         // This test pins that a fan-out of keeps can't pass the budget between its checks.
-        let budget = HeapBudget::with_budget(Some(BURST_ROOM * ENTRY_BYTES));
+        let budget = HeapBudget::with_budget(Some(2 * BURST_ROOM * ENTRY_BYTES));
         budget.set_short_of_memory(false);
         let start = Arc::new(Barrier::new(BURST_KEEPS as usize));
         let keeps: Vec<_> = (0..BURST_KEEPS)
