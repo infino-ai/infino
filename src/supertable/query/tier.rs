@@ -1875,7 +1875,13 @@ fn unseen_bound_at(
         let idf_sum: f32 = members.iter().map(|&t| scoring.idf[t]).sum();
         ub += score_at_most(idf_sum, tf, norm);
     }
-    ub
+    // Past two atoms the kernel adds them in its own order, which can round
+    // above the sum taken here.
+    let atoms = shape.scoring.count_ones() as usize + shape.phrases.len();
+    match atoms > EXACT_SUM_TERMS {
+        true => ub * (1.0 + (8 + atoms) as f32 * f32::EPSILON),
+        false => ub,
+    }
 }
 
 /// The sum of a document's bare-term contributions.
