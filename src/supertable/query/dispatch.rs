@@ -1272,9 +1272,9 @@ mod fanout_tier_tests {
         );
     }
 
-    /// Superfiles in the plan fixture: more than four windows of them, so the
-    /// cap ahead of a plan applies, and more than the cap lets through.
-    const PLANNED_COMMITS: usize = 40;
+    /// Superfiles in the plan fixture: one window more than the fan-out needs
+    /// for the cap ahead of a plan to apply.
+    const PLANNED_COMMITS: usize = (PENDING_PLAN_MIN_WINDOWS + 1) * WIDE_WINDOW;
     /// How long the fixture's plan waits, once the window's opens have all
     /// started, before it arrives: time for an open the window should have
     /// held back to start too.
@@ -1283,15 +1283,15 @@ mod fanout_tier_tests {
     /// past what a loaded machine takes, and bounded so that a fan-out that
     /// starts fewer fails the assertion rather than hanging the test.
     const WINDOW_START_WAIT: Duration = Duration::from_secs(30);
-    /// A window the fixture exceeds four times over, no narrower than the
-    /// cap, so the cap is what holds.
-    const WIDE_WINDOW: usize = PENDING_PLAN_WINDOW;
+    /// Twice the cap, so the cap and not the window is what holds the opens
+    /// ahead of the plan: without it as many as this would start.
+    const WIDE_WINDOW: usize = 2 * PENDING_PLAN_WINDOW;
 
     /// While a plan is still to come only a few opens run ahead of it, and
     /// the fan-out waits for the plan rather than ending when those finish:
     /// every unit the plan keeps is answered. The opens hold until the plan
     /// is in, as a cold open outlasts the plan's round trip, so what ran
-    /// ahead of the plan is exactly what the window let through.
+    /// ahead of the plan is exactly what the cap let through.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_pending_plan_holds_the_fanout_to_a_few_opens_until_it_arrives() {
         let dir = TempDir::new().expect("tempdir");
