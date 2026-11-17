@@ -2652,9 +2652,11 @@ pub(crate) struct GraphChange {
     entry: u32,
     /// Base nodes that are holes after the change, ascending.
     removed: Vec<u32>,
-    /// Lists of surviving base nodes that changed, as `(node, level, list)`,
-    /// in node then level order.
-    rewritten: Vec<(u32, u32, Vec<u32>)>,
+    /// Lists of surviving base nodes that changed, as `(node, level, edit)`,
+    /// in node then level order. An edit holds only what differs from the
+    /// old list: adding a node touches the lists of its neighbors, a few
+    /// ids each, and whole lists would make a change many times larger.
+    rewritten: Vec<(u32, u32, ListEdit)>,
     /// Nodes past `base_len`, in id order: each node's lists by level, or no
     /// lists for a node that is already a hole.
     appended: Vec<Vec<Vec<u32>>>,
@@ -2716,7 +2718,11 @@ impl Hnsw {
                     }
                     for (level, (old, new)) in before.iter().zip(after).enumerate() {
                         if old != new {
-                            rewritten.push((node as u32, level as u32, new.clone()));
+                            rewritten.push((
+                                node as u32,
+                                level as u32,
+                                ListEdit::between(old, new),
+                            ));
                         }
                     }
                 }
@@ -2763,15 +2769,21 @@ impl Hnsw {
             list.iter()
                 .all(|&id| (id as usize) < len && !hole[id as usize])
         };
-        for (node, level, list) in &change.rewritten {
+        // Each edited list, worked out against the graph as it is, so
+        // nothing is changed until every list is known to be good.
+        let mut edited: Vec<(usize, usize, Vec<u32>)> = Vec::with_capacity(change.rewritten.len());
+        for (node, level, edit) in &change.rewritten {
             let (node, level) = (*node as usize, *level as usize);
-            if node >= self.len
-                || hole[node]
-                || level >= self.neighbors[node].len()
-                || !names_live(list)
-            {
+            if node >= self.len || hole[node] || level >= self.neighbors[node].len() {
                 return Err(GraphChangeError::Invalid);
             }
+            let list = edit
+                .apply(&self.neighbors[node][level])
+                .ok_or(GraphChangeError::Invalid)?;
+            if !names_live(&list) {
+                return Err(GraphChangeError::Invalid);
+            }
+            edited.push((node, level, list));
         }
         if !change
             .appended
@@ -2790,8 +2802,8 @@ impl Hnsw {
             self.neighbors[node as usize] = Vec::new();
             self.node_level[node as usize] = 0;
         }
-        for (node, level, list) in &change.rewritten {
-            self.neighbors[*node as usize][*level as usize] = list.clone();
+        for (node, level, list) in edited {
+            self.neighbors[node][level] = list;
         }
         for lists in &change.appended {
             self.node_level.push(lists.len().saturating_sub(1) as u32);
@@ -2834,10 +2846,10 @@ impl GraphChange {
         out.extend_from_slice(&self.entry.to_le_bytes());
         put_u32s(&mut out, &self.removed);
         out.extend_from_slice(&(self.rewritten.len() as u64).to_le_bytes());
-        for (node, level, list) in &self.rewritten {
+        for (node, level, edit) in &self.rewritten {
             out.extend_from_slice(&node.to_le_bytes());
             out.extend_from_slice(&level.to_le_bytes());
-            put_u32s(&mut out, list);
+            edit.write(&mut out);
         }
         out.extend_from_slice(&(self.appended.len() as u64).to_le_bytes());
         for lists in &self.appended {
@@ -2863,13 +2875,13 @@ impl GraphChange {
         let base_len = c.u32()?;
         let entry = c.u32()?;
         let removed = take_u32s(&mut c)?;
-        // A rewritten record is at least node, level and a list count.
-        let rewritten_count = bounded_count(&mut c, 16)?;
+        // A rewritten record is at least node, level and an empty edit.
+        let rewritten_count = bounded_count(&mut c, 8 + LIST_EDIT_MIN_BYTES)?;
         let mut rewritten = Vec::with_capacity(rewritten_count);
         for _ in 0..rewritten_count {
             let node = c.u32()?;
             let level = c.u32()?;
-            rewritten.push((node, level, take_u32s(&mut c)?));
+            rewritten.push((node, level, ListEdit::read(&mut c)?));
         }
         // An appended record is at least its list count.
         let appended_count = bounded_count(&mut c, 4)?;
@@ -2897,6 +2909,103 @@ impl GraphChange {
             appended,
             checksum,
         })
+    }
+}
+
+/// Bytes of the smallest encoded [`ListEdit`]: its two counts.
+const LIST_EDIT_MIN_BYTES: usize = 4;
+
+/// What turns one neighbor list into another: the positions in the old list
+/// that go, and the ids that come in with their positions in the new list.
+/// Ids the two lists share in the same order are not written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ListEdit {
+    /// Positions in the old list of the ids dropped, ascending.
+    dropped: Vec<u16>,
+    /// `(position in the new list, id)` of the ids added, ascending.
+    added: Vec<(u16, u32)>,
+}
+
+impl ListEdit {
+    /// The edit that turns `old` into `new`, keeping a longest run of ids
+    /// the two share in order.
+    fn between(old: &[u32], new: &[u32]) -> Self {
+        // `kept[i][j]` is how many ids `old[i..]` and `new[j..]` share in
+        // order. Lists hold a few dozen ids, so the table is small.
+        let (n, m) = (old.len(), new.len());
+        let mut kept = vec![0u16; (n + 1) * (m + 1)];
+        let at = |i: usize, j: usize| i * (m + 1) + j;
+        for i in (0..n).rev() {
+            for j in (0..m).rev() {
+                kept[at(i, j)] = if old[i] == new[j] {
+                    kept[at(i + 1, j + 1)] + 1
+                } else {
+                    kept[at(i + 1, j)].max(kept[at(i, j + 1)])
+                };
+            }
+        }
+        let (mut dropped, mut added) = (Vec::new(), Vec::new());
+        let (mut i, mut j) = (0, 0);
+        while i < n || j < m {
+            if i < n && j < m && old[i] == new[j] {
+                i += 1;
+                j += 1;
+            } else if j < m && (i == n || kept[at(i, j + 1)] >= kept[at(i + 1, j)]) {
+                added.push((j as u16, new[j]));
+                j += 1;
+            } else {
+                dropped.push(i as u16);
+                i += 1;
+            }
+        }
+        Self { dropped, added }
+    }
+
+    /// The list this edit makes of `old`; `None` when a position does not
+    /// fit it.
+    fn apply(&self, old: &[u32]) -> Option<Vec<u32>> {
+        let mut list = Vec::with_capacity(old.len() + self.added.len());
+        let mut dropped = self.dropped.iter().peekable();
+        for (position, &id) in old.iter().enumerate() {
+            if dropped.next_if(|&&at| at as usize == position).is_none() {
+                list.push(id);
+            }
+        }
+        if dropped.next().is_some() {
+            return None;
+        }
+        for &(position, id) in &self.added {
+            if position as usize > list.len() {
+                return None;
+            }
+            list.insert(position as usize, id);
+        }
+        Some(list)
+    }
+
+    /// Append the edit: the dropped positions, then the added positions and
+    /// ids, each count-prefixed.
+    fn write(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&(self.dropped.len() as u16).to_le_bytes());
+        for position in &self.dropped {
+            out.extend_from_slice(&position.to_le_bytes());
+        }
+        out.extend_from_slice(&(self.added.len() as u16).to_le_bytes());
+        for (position, id) in &self.added {
+            out.extend_from_slice(&position.to_le_bytes());
+            out.extend_from_slice(&id.to_le_bytes());
+        }
+    }
+
+    /// Read what [`write`](Self::write) wrote.
+    fn read(c: &mut Cursor<'_>) -> Option<Self> {
+        let dropped = (0..c.u16()?)
+            .map(|_| c.u16())
+            .collect::<Option<Vec<u16>>>()?;
+        let added = (0..c.u16()?)
+            .map(|_| Some((c.u16()?, c.u32()?)))
+            .collect::<Option<Vec<(u16, u32)>>>()?;
+        Some(Self { dropped, added })
     }
 }
 
@@ -5482,6 +5591,36 @@ mod tests {
         assert_eq!(applied.checksum(), next.checksum());
         assert!(applied.is_hole(n as u32 + 5) && applied.is_hole(n as u32 + 6));
         assert_eq!(applied.live_len(), n + added - 2);
+    }
+
+    /// A list edit carries only what differs, turns the old list into the
+    /// new one exactly, and refuses a list it was not made for.
+    #[test]
+    fn a_list_edit_holds_only_what_differs() {
+        let old = [5u32, 9, 2, 7, 11];
+        for new in [
+            vec![5, 9, 2, 7, 11],
+            vec![5, 9, 4, 2, 7, 11],
+            vec![5, 2, 7, 11],
+            vec![5, 4, 9, 2, 7],
+            vec![11, 7, 2, 9, 5],
+            vec![],
+            vec![1, 2, 3],
+        ] {
+            let edit = ListEdit::between(&old, &new);
+            assert_eq!(edit.apply(&old).as_deref(), Some(new.as_slice()), "{new:?}");
+            let mut bytes = Vec::new();
+            edit.write(&mut bytes);
+            assert_eq!(ListEdit::read(&mut Cursor::new(&bytes)), Some(edit));
+        }
+        // One id added to a list: one position and one id, nothing dropped.
+        let one_added = ListEdit::between(&old, &[5, 9, 4, 2, 7, 11]);
+        assert_eq!((one_added.dropped.len(), one_added.added.len()), (0, 1));
+        // An edit made for a longer list does not fit a shorter one.
+        let drops_last = ListEdit::between(&old, &old[..4]);
+        assert_eq!(drops_last.apply(&old[..2]), None);
+        let adds_at_end = ListEdit::between(&old, &[5, 9, 2, 7, 11, 3]);
+        assert_eq!(adds_at_end.apply(&old[..2]), None);
     }
 
     #[test]
