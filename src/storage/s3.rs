@@ -38,7 +38,7 @@ use super::{
     ObjectMeta, StorageError, StorageOptions, StorageProvider, child_prefix_names, counting,
     io_counters, logical_list_key, options::apply, retry,
 };
-use crate::runtime_metrics::io::UsageMeter;
+use crate::{runtime_metrics::io::UsageMeter, utils::trace::record};
 
 /// Whether `opts` names a custom S3 endpoint, under any object_store alias
 /// (`aws_endpoint`, `endpoint`, `aws_endpoint_url`, …). A custom endpoint
@@ -463,6 +463,10 @@ impl StorageProvider for S3StorageProvider {
         })
     }
 
+    #[cfg_attr(
+        feature = "detailed-tracing",
+        tracing::instrument(skip_all, fields(uri = uri, len = tracing::field::Empty))
+    )]
     async fn get(&self, uri: &str) -> Result<(Bytes, ObjectMeta), StorageError> {
         let path = self.path(uri)?;
         let tl = io_counters::timeline_start();
@@ -481,11 +485,16 @@ impl StorageProvider for S3StorageProvider {
         .await;
         if let Ok((b, _)) = &out {
             self.meter.record_get(uri, None, b.len() as u64);
+            record("len", b.len() as u64);
             io_counters::timeline_record("get", uri, 0, b.len() as u64, tl);
         }
         out
     }
 
+    #[cfg_attr(
+        feature = "detailed-tracing",
+        tracing::instrument(skip_all, fields(uri = uri, len = tracing::field::Empty))
+    )]
     async fn get_if_none_match(
         &self,
         uri: &str,
@@ -515,8 +524,14 @@ impl StorageProvider for S3StorageProvider {
         })
         .await;
         match &out {
-            Ok(Some((b, _))) => self.meter.record_get(uri, None, b.len() as u64),
-            Ok(None) => self.meter.record_get(uri, None, 0),
+            Ok(Some((b, _))) => {
+                self.meter.record_get(uri, None, b.len() as u64);
+                record("len", b.len() as u64);
+            }
+            Ok(None) => {
+                self.meter.record_get(uri, None, 0);
+                record("len", 0);
+            }
             Err(_) => {}
         }
         out

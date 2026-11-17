@@ -203,9 +203,11 @@ test-remote:
 	cargo test --features remote --test remote
 
 # Tracing lane. `detailed-tracing` is off in the default gates, which only
-# compile it, so the spans a search exports are tested here.
+# compile it, so the spans a search exports and the span on a whole-object
+# storage read are tested here.
 test-tracing:
 	cargo test --features test-helpers,graph-index,metering,detailed-tracing --test search_spans
+	cargo test --features test-helpers,graph-index,metering,detailed-tracing --lib storage::local_fs::tests::get_span::
 
 # Feature-off lane. The shipped library has no `graph-index`, and every
 # test lane above turns it on, so the build a user gets only got linted.

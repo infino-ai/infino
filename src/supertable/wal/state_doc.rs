@@ -220,6 +220,13 @@ pub struct Lease {
     pub expires_at: DateTime<Utc>,
 }
 
+impl Lease {
+    /// Whether the lease still holds at `now`: recovery leaves a log so held to its owner.
+    pub(crate) fn is_live(&self, now: DateTime<Utc>) -> bool {
+        self.expires_at > now
+    }
+}
+
 /// One row's tombstone-phase progress. Each `target_id` from the
 /// resolved predicate starts at `Pending`, flips to `Tombstoned`
 /// (sidecar bit landed) or `NotFound` (no superfile claims this
