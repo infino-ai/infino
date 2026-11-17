@@ -1102,7 +1102,7 @@ mod tests {
             .create_table(METERED_TABLE, Arc::clone(schema), spec)
             .expect("create");
         for batch in commits {
-            table.append(batch).expect("append");
+            table.append(batch, None).expect("append");
         }
         conn
     }
@@ -2378,7 +2378,10 @@ mod tests {
         for day in DAYS_AFTER_RETYPE {
             let at = TimestampNanosecondArray::from(vec![day * NANOS_PER_DAY; 2]);
             table
-                .append(&titled_batch(&retyped, &["Zyzzyva", "page"], Arc::new(at)))
+                .append(
+                    &titled_batch(&retyped, &["Zyzzyva", "page"], Arc::new(at)),
+                    None,
+                )
                 .expect("append");
         }
         let got = walked(&conn, "zyzzyva", "", "day DESC", "LIMIT 1", "day");

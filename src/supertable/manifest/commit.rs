@@ -872,6 +872,7 @@ mod tests {
             tombstone_seqs: Default::default(),
             superseded_cells: Default::default(),
             split_checks: Default::default(),
+            idempotency: Default::default(),
             format_version: LIST_FORMAT_VERSION.into(),
             manifest_id: 1,
             options_hash: ContentHash([0u8; 32]),

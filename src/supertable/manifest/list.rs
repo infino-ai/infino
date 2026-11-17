@@ -45,6 +45,7 @@ use uuid::Uuid;
 use crate::{
     superfile::fts::reader::ColumnLengthStats,
     supertable::{
+        idempotency::Idempotency,
         manifest::{
             HEAD_BYTES, add_sum_arrays,
             bloom::Bloom,
@@ -92,7 +93,23 @@ use crate::{
 /// folds the latest part's rollups from its own appends alone and rewrites
 /// the list without the rollups references: the list-level pruner then
 /// drops parts that match. So a major 3 engine must refuse the list too.
+///
+/// A list holding idempotency tokens is written at
+/// [`FORMAT_VERSION_TOKENS`] instead; one holding none is written at this
+/// version, unchanged.
 pub const FORMAT_VERSION: &str = "4.0";
+
+/// Wire format version for a list that holds idempotency tokens
+/// ([`Manifest::idempotency`]).
+///
+/// A reader of major 4 decodes such a list and ignores the field it does not
+/// know, but writing, it rewrites the list without it. A retry of a write
+/// that had committed then finds no token and commits the rows a second
+/// time. So a major 4 engine must refuse a list holding tokens, which this
+/// major makes it do. A list stays at major 4 while it holds none, so a
+/// table whose writers never pass a token stays readable by engines without
+/// them; one whose tokens have all expired returns to major 4.
+pub const FORMAT_VERSION_TOKENS: &str = "5.0";
 
 /// The major before rollups objects: every part's rollups inline in the
 /// list. Read, never written.
@@ -269,6 +286,10 @@ pub struct Manifest {
     /// contents are unchanged. Self-invalidating: a cell's fingerprint moves
     /// when its superfiles change, and an unknown cell is simply re-checked.
     pub split_checks: BTreeMap<u32, CellSplitCheck>,
+    /// The idempotency tokens committed to this table and not yet expired.
+    /// Carried to every later list; recorded by the commit that carries the
+    /// token, in the same list as its rows.
+    pub idempotency: Idempotency,
 }
 
 impl Manifest {
@@ -1789,6 +1810,8 @@ struct ManifestDto {
     superseded_cells: BTreeMap<String, Vec<u32>>, // UUID keys
     #[serde(default)]
     split_checks: BTreeMap<u32, CellSplitCheck>,
+    #[serde(default, skip_serializing_if = "Idempotency::is_empty")]
+    idempotency: Idempotency,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -2434,7 +2457,12 @@ fn list_to_dto(l: &Manifest) -> Result<ManifestDto, ListEncodeError> {
         // forward would label new content with the old major, and the next
         // decode would resolve id keys as column names and silently drop
         // every aggregate. Mirrors `part::encode_with_mode`.
-        format_version: FORMAT_VERSION.to_owned(),
+        format_version: if l.idempotency.holds_tokens() {
+            FORMAT_VERSION_TOKENS
+        } else {
+            FORMAT_VERSION
+        }
+        .to_owned(),
         manifest_id: l.manifest_id,
         options_hash: encode_hash(&l.options_hash),
         schema: l.schema.as_ref().map_or(Value::Null, |s| s.to_json()),
@@ -2494,6 +2522,7 @@ fn list_to_dto(l: &Manifest) -> Result<ManifestDto, ListEncodeError> {
             .map(|(id, cells)| (id.to_string(), cells.iter().copied().collect()))
             .collect(),
         split_checks: l.split_checks.clone(),
+        idempotency: l.idempotency.clone(),
     })
 }
 
@@ -2641,6 +2670,7 @@ fn list_from_dto(d: ManifestDto, legacy: &LegacyNames) -> Result<Manifest, ListP
             })
             .collect::<Result<BTreeMap<_, _>, _>>()?,
         split_checks: d.split_checks,
+        idempotency: d.idempotency,
     })
 }
 
@@ -2691,8 +2721,13 @@ fn check_major(fv: &str) -> Result<(), ListParseError> {
         .split('.')
         .next()
         .expect("constant has a dot");
+    let tokens_major = FORMAT_VERSION_TOKENS
+        .split('.')
+        .next()
+        .expect("constant has a dot");
     let got_major = fv.split('.').next().unwrap_or("");
     if got_major != supported_major
+        && got_major != tokens_major
         && got_major != FORMAT_MAJOR_SECTIONS
         && got_major != FORMAT_MAJOR_INLINE
         && got_major != FORMAT_MAJOR_NAMED
@@ -3581,6 +3616,7 @@ mod tests {
             tombstone_seqs: Default::default(),
             superseded_cells: Default::default(),
             split_checks: Default::default(),
+            idempotency: Default::default(),
             format_version: FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -4714,12 +4750,84 @@ mod tests {
 
     #[test]
     fn incompatible_major_version_rejected() {
-        let bytes = restamped(&empty_list(), "5.0");
-        let err = decode(&bytes, &LegacyNames::none()).expect_err("major 5 must reject");
+        let bytes = restamped(&empty_list(), "6.0");
+        let err = decode(&bytes, &LegacyNames::none()).expect_err("major 6 must reject");
         assert!(
             matches!(err, ListParseError::IncompatibleMajorVersion { .. }),
             "expected IncompatibleMajorVersion, got {err:?}"
         );
+    }
+
+    fn with_tokens(mut list: Manifest) -> Manifest {
+        list.idempotency.record(
+            crate::supertable::idempotency::IdempotencyToken::Key("k"),
+            3,
+            1_000,
+        );
+        list.idempotency.record(
+            crate::supertable::idempotency::IdempotencyToken::Sequence { scope: "w", seq: 7 },
+            3,
+            1_000,
+        );
+        list
+    }
+
+    /// A list holding tokens is written at the tokens major, which an engine
+    /// that knows only the majors before it refuses rather than rewriting
+    /// the list without them; it decodes back with every token.
+    #[test]
+    fn a_list_holding_tokens_is_written_at_the_tokens_major() {
+        let list = with_tokens(empty_list());
+        let bytes = encode(&list).expect("encode");
+        let decoded = decode(&bytes, &LegacyNames::none()).expect("decode");
+        assert_eq!(decoded.format_version, FORMAT_VERSION_TOKENS);
+        assert_ne!(
+            FORMAT_VERSION_TOKENS.split('.').next(),
+            FORMAT_VERSION.split('.').next(),
+            "the tokens major is one an engine without tokens does not accept"
+        );
+        assert_eq!(decoded.idempotency, list.idempotency);
+        assert!(decoded.idempotency.holds_tokens());
+    }
+
+    /// A list with no tokens is encoded as it was before tokens existed: the
+    /// current major, and no `idempotency` field for any reader to see.
+    #[test]
+    fn a_list_without_tokens_stays_at_the_current_major_with_no_token_field() {
+        let bytes = encode(&empty_list()).expect("encode");
+        let text = std::str::from_utf8(&bytes).expect("utf8");
+        assert!(!text.contains("idempotency"), "no token field: {text}");
+        let decoded = decode(&bytes, &LegacyNames::none()).expect("decode");
+        assert_eq!(decoded.format_version, FORMAT_VERSION);
+        assert!(decoded.idempotency.is_empty());
+    }
+
+    /// Once retention empties the map, the list returns to the current major,
+    /// keeping only the watermark that lets a status call report `Expired`.
+    #[test]
+    fn an_emptied_token_map_returns_the_list_to_the_current_major() {
+        let mut list = with_tokens(empty_list());
+        list.idempotency.expire(
+            1_000 + 8 * 24 * 60 * 60 * 1000,
+            std::time::Duration::from_secs(7 * 24 * 60 * 60),
+            crate::supertable::idempotency::MAX_KEY_ENTRIES,
+            4,
+        );
+        assert!(!list.idempotency.holds_tokens());
+        let decoded =
+            decode(&encode(&list).expect("encode"), &LegacyNames::none()).expect("decode");
+        assert_eq!(decoded.format_version, FORMAT_VERSION);
+        assert_eq!(decoded.idempotency.expired_through_ms, Some(1_000));
+    }
+
+    /// A list of a major before tokens decodes to an empty map.
+    #[test]
+    fn a_list_of_a_major_before_tokens_decodes_to_an_empty_map() {
+        for version in ["4.0", "3.0", "1.0"] {
+            let decoded =
+                decode(&restamped(&empty_list(), version), &LegacyNames::none()).expect("decode");
+            assert!(decoded.idempotency.is_empty(), "{version}");
+        }
     }
 
     /// An entry's rollups in the per-column map the majors before the one
@@ -5054,8 +5162,8 @@ mod tests {
             "a list without a document has none to read"
         );
 
-        let bytes = restamped(&list, "5.0");
-        let err = decode_schema(&bytes).expect_err("major 5 must reject");
+        let bytes = restamped(&list, "6.0");
+        let err = decode_schema(&bytes).expect_err("major 6 must reject");
         assert!(
             matches!(err, ListParseError::IncompatibleMajorVersion { .. }),
             "expected IncompatibleMajorVersion, got {err:?}"

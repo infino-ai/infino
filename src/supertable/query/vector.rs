@@ -9006,7 +9006,7 @@ impl Supertable {
     /// # let vecs = db.create_table("vecs", schema.clone(), IndexSpec::new().vector("emb", 16, Metric::Cosine))?;
     /// # let mut data = vec![0.0f32; 16]; data[0] = 1.0;
     /// # let col = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(vec![Some(data.iter().copied().map(Some).collect::<Vec<_>>())], 16);
-    /// # vecs.append(&RecordBatch::try_new(schema, vec![Arc::new(col)])?)?;
+    /// # vecs.append(&RecordBatch::try_new(schema, vec![Arc::new(col)])?, None)?;
     /// # let mut query = vec![0.0f32; 16]; query[0] = 1.0;
     /// // Bare call → `_id` + `score`, no scalar decode:
     /// let hits = vecs.vector_search("emb", &query, 10, None, None)?;

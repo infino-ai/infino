@@ -22,6 +22,8 @@ ColdFetchMode: TypeAlias = Literal[
 # type information. For a statically-typed path, convert with
 # `pyarrow.Table.from_pandas(df)`.
 RowData: TypeAlias = RecordBatch | ArrowTable | Sequence[Mapping[str, Any]]
+# A `str` key, or a `(scope, seq)` tuple for the `seq`th commit of writer `scope`.
+IdempotencyToken: TypeAlias = str | tuple[str, int]
 
 def connect(
     uri: str,
@@ -148,10 +150,25 @@ class IndexSpec:
     def vector(self, column: str, dim: int, metric: Metric) -> IndexSpec: ...
 
 class Table:
-    def append(self, data: RowData) -> None: ...
+    # With `idempotency_token`, an append the table already holds returns
+    # without appending again.
+    def append(
+        self, data: RowData, *, idempotency_token: IdempotencyToken | None = None
+    ) -> None: ...
     # `append`, naming the source the rows came from; the name becomes part of
     # the superfile's object key. Not available on a hosted table.
-    def append_named(self, data: RowData, source_name: str) -> None: ...
+    def append_named(
+        self,
+        data: RowData,
+        source_name: str,
+        *,
+        idempotency_token: IdempotencyToken | None = None,
+    ) -> None: ...
+    # `{"status": "committed", "manifest_id", "committed_ms", "seq"}`,
+    # `{"status": "absent"}`, or `{"status": "expired"}`.
+    def idempotency_token_status(
+        self, token: IdempotencyToken, since_ms: int = 0
+    ) -> dict[str, Any]: ...
     # `k1` / `b` override the columns' declared parameters for this search
     # only; pass both or neither. Results stay exact — only pruning power is
     # traded — and nothing is rebuilt.

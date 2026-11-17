@@ -658,7 +658,7 @@ mod tests {
             .create_table("ingested", user_schema(), IndexSpec::new())
             .expect("create_table (ingest)");
         for batch in &batches {
-            ingested.append(batch).expect("append");
+            ingested.append(batch, None).expect("append");
         }
         ingested
             .optimize(&OptimizeOptions::default())
@@ -883,8 +883,8 @@ mod tests {
         let ingested = db
             .create_table("ingested", Arc::clone(&schema), IndexSpec::new())
             .expect("create_table");
-        ingested.append(&batch(1, 1_500)).expect("append");
-        ingested.append(&batch(1_501, 3_000)).expect("append");
+        ingested.append(&batch(1, 1_500), None).expect("append");
+        ingested.append(&batch(1_501, 3_000), None).expect("append");
         ingested
             .optimize(&OptimizeOptions::default())
             .expect("optimize");

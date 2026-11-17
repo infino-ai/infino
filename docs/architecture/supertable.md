@@ -249,6 +249,20 @@ index's sibling, writes the list at that major, and an engine of an
 older one refuses it rather than fold a part's rollups from its own
 appends alone. So a deployment that has committed cannot be rolled back
 past the major it wrote; an older engine reads nothing of that table.
+
+A list that records an idempotency token is written at major 5. A
+write may carry a token, an opaque key or a writer's scope with a
+rising sequence number; the commit records it in the list it publishes,
+so the pointer swap publishes the rows and the token together, and a
+write whose token the list already records publishes nothing and
+succeeds. Every later commit carries the tokens forward until they
+expire (seven days by default, and at most ten thousand keys), and
+keeps the time of the newest one dropped, so a caller asking about a
+token from before that time is told the answer is unknown rather than
+that the token was never there. A table whose writes carry no token
+never records one: its list stays at major 4, byte for byte, and older
+engines keep reading it. Once retention has dropped every token, the
+list returns to major 4.
 - **Full-text summary.** Per text column, the lexicographic range of
 its terms and the length statistics BM25 scores with. Which superfiles
 hold a given term is not recorded here: that is the table-level term

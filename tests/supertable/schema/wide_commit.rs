@@ -240,13 +240,15 @@ fn run_child(shape: Shape) {
     // Start the pools and the runtime with a commit of one row, so the
     // first measured commit pays for none of it.
     let (first, _) = shape.batch(0);
-    table.append(&first.slice(0, 1)).expect("warm-up append");
+    table
+        .append(&first.slice(0, 1), None)
+        .expect("warm-up append");
     drop(first);
     for commit in 0..shape.commits() {
         let (batch, value_bytes) = shape.batch(commit + 1);
         purge_allocator();
         let (current, peak, _) = process_memory();
-        table.append(&batch).expect("append");
+        table.append(&batch, None).expect("append");
         let (_, peak_after, _) = process_memory();
         drop(batch);
         purge_allocator();

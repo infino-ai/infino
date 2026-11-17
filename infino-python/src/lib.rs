@@ -28,19 +28,18 @@ use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::Expr;
 use numpy::{IntoPyArray, PyArrayMethods};
 use pyo3::create_exception;
-use pyo3::sync::PyOnceLock;
 use pyo3::exceptions::{
     PyException, PyKeyError, PyNotImplementedError, PyRuntimeError, PyValueError,
 };
 use pyo3::prelude::*;
+use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyDict, PyList, PyModule};
 
 use infino::{
     Bm25SearchOptions, BoolMode, ColdFetchMode, CompactionSettings, ConnectOptions, GcError,
-    InfinoError as CoreError, Metric, OptimizeError, OptimizeOptions, RecalibratePolicy,
-    ReindexError, ReindexMode, ReindexOptions as CoreReindexOptions,
-    SchemaError as SchemaCause, SchemaPatch, Stemmer,
-    Stopwords, VectorFilter,
+    IdempotencyToken, InfinoError as CoreError, Metric, OptimizeError, OptimizeOptions,
+    RecalibratePolicy, ReindexError, ReindexMode, ReindexOptions as CoreReindexOptions,
+    SchemaError as SchemaCause, SchemaPatch, Stemmer, Stopwords, TokenStatus, VectorFilter,
 };
 // Vector tuning knobs are a diagnostic-wheel-only surface; the type is off
 // the engine's public API and reachable only under `infino/test-helpers`.
@@ -890,6 +889,23 @@ impl PlannedRepair {
     }
 }
 
+/// An idempotency token as Python passes it: a `str` key, or a
+/// `(scope, seq)` tuple.
+#[derive(FromPyObject)]
+enum PyToken {
+    Key(String),
+    Sequence(String, u64),
+}
+
+impl PyToken {
+    fn as_token(&self) -> IdempotencyToken<'_> {
+        match self {
+            PyToken::Key(key) => IdempotencyToken::Key(key),
+            PyToken::Sequence(scope, seq) => IdempotencyToken::Sequence { scope, seq: *seq },
+        }
+    }
+}
+
 /// A single-table handle.
 #[pyclass]
 struct Table {
@@ -905,13 +921,30 @@ impl Table {
     /// values, and a value whose type disagrees with the column's is
     /// refused. Durable when this returns — one `append` == one commit ==
     /// one sealed superfile, so batch rows per call.
-    fn append(&self, py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<()> {
+    ///
+    /// `idempotency_token` makes a retry safe: a `str` key, or a
+    /// `(scope, seq)` tuple for the `seq`th commit of the writer `scope`.
+    /// When the table already holds the token, the call returns without
+    /// appending again. Empty input records nothing. Refused for a table
+    /// with no storage (`memory://`).
+    #[pyo3(signature = (data, *, idempotency_token=None))]
+    fn append(
+        &self,
+        py: Python<'_>,
+        data: &Bound<'_, PyAny>,
+        idempotency_token: Option<PyToken>,
+    ) -> PyResult<()> {
+        let token = idempotency_token.as_ref().map(PyToken::as_token);
         match append_input(py, data, &self.schema(py)?)? {
             // Append commits a superfile to storage — release the GIL. The
             // engine brings the batch to the table's shape: a column it does
             // not have joins the schema, an absent nullable one is null-filled.
-            AppendInput::Batch(batch) => py.detach(|| self.inner.append(&batch)).map_err(py_err),
-            AppendInput::Rows(rows) => py.detach(|| self.inner.append_rows(&rows)).map_err(py_err),
+            AppendInput::Batch(batch) => py
+                .detach(|| self.inner.append(&batch, token))
+                .map_err(py_err),
+            AppendInput::Rows(rows) => py
+                .detach(|| self.inner.append_rows(&rows, token))
+                .map_err(py_err),
             // Empty input — nothing to append (no empty commit).
             AppendInput::Empty => Ok(()),
         }
@@ -921,23 +954,65 @@ impl Table {
     /// commit writes are keyed `data/<stem>-<uuid>.sf.parquet`, with the stem
     /// the key-safe form of `source_name` (lowercase `[a-z0-9_]`), so a
     /// bucket listing shows where each came from. The table behaves exactly
-    /// as after `append`; the name is a label on the object key. Not
-    /// available on a hosted table.
+    /// as after `append`, `idempotency_token` included; the name is a label
+    /// on the object key. Not available on a hosted table.
+    #[pyo3(signature = (data, source_name, *, idempotency_token=None))]
     fn append_named(
         &self,
         py: Python<'_>,
         data: &Bound<'_, PyAny>,
         source_name: &str,
+        idempotency_token: Option<PyToken>,
     ) -> PyResult<()> {
+        let token = idempotency_token.as_ref().map(PyToken::as_token);
         match append_input(py, data, &self.schema(py)?)? {
             AppendInput::Batch(batch) => py
-                .detach(|| self.inner.append_named(&batch, source_name))
+                .detach(|| self.inner.append_named(&batch, source_name, token))
                 .map_err(py_err),
             AppendInput::Rows(rows) => py
-                .detach(|| self.inner.append_rows_named(&rows, source_name))
+                .detach(|| self.inner.append_rows_named(&rows, source_name, token))
                 .map_err(py_err),
             AppendInput::Empty => Ok(()),
         }
+    }
+
+    /// Whether the write that carried `token` committed, as the table holds
+    /// it now. Returns a dict whose `"status"` is `"committed"` (with
+    /// `manifest_id`, `committed_ms`, and for a `(scope, seq)` token `seq`,
+    /// the scope's latest committed number), `"absent"` (the table never
+    /// held it, or held it before `since_ms`), or `"expired"` (retention
+    /// may have dropped it after `since_ms`, so whether it committed is
+    /// unknown). Pass as `since_ms` a time, in milliseconds since the Unix
+    /// epoch, before the write was first tried.
+    #[pyo3(signature = (token, since_ms=0))]
+    fn idempotency_token_status<'py>(
+        &self,
+        py: Python<'py>,
+        token: PyToken,
+        since_ms: u64,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let status = py
+            .detach(|| {
+                self.inner
+                    .idempotency_token_status(token.as_token(), since_ms)
+            })
+            .map_err(py_err)?;
+        let out = PyDict::new(py);
+        match status {
+            TokenStatus::Committed {
+                manifest_id,
+                committed_ms,
+                seq,
+            } => {
+                out.set_item("status", "committed")?;
+                out.set_item("manifest_id", manifest_id)?;
+                out.set_item("committed_ms", committed_ms)?;
+                out.set_item("seq", seq)?;
+            }
+            TokenStatus::Absent => out.set_item("status", "absent")?,
+            TokenStatus::Expired => out.set_item("status", "expired")?,
+        }
+        Ok(out)
     }
 
     /// BM25 search over one FTS column. Returns a pyarrow `Table`.
@@ -1707,7 +1782,8 @@ def nulled(value):
         .unbind())
     })?;
     let cleaned = nulled.bind(py).call1((records,))?;
-    json.call_method("dumps", (cleaned,), Some(strict))?.extract()
+    json.call_method("dumps", (cleaned,), Some(strict))?
+        .extract()
 }
 
 /// Rows carrying values JSON cannot spell, as one batch typed by the table's

@@ -203,8 +203,8 @@ fn create(db: &Connection) {
         .expect("create ranged");
     for file in 0..FILES {
         let batch = rows(file * ROWS_PER_FILE);
-        plain.append(&batch).expect("append plain");
-        ranged.append(&batch).expect("append ranged");
+        plain.append(&batch, None).expect("append plain");
+        ranged.append(&batch, None).expect("append ranged");
     }
 }
 
@@ -459,7 +459,7 @@ fn a_range_index_follows_its_column_through_a_rename_and_not_into_a_reused_name(
     for table in ["plain", "ranged"] {
         db.open_table(table)
             .expect("open")
-            .append(&batch)
+            .append(&batch, None)
             .expect("append");
     }
     assert_same_answers(&db, RENAMED_QUERIES, "after a rename and a reused name");
@@ -522,7 +522,7 @@ fn a_range_index_written_before_a_retype_answers_only_where_its_keys_still_hold(
     for table in ["plain", "ranged"] {
         db.open_table(table)
             .expect("open")
-            .append(&batch)
+            .append(&batch, None)
             .expect("append");
     }
     assert_same_answers(&db, RETYPED_QUERIES, "after a retype and an append");
@@ -566,7 +566,7 @@ fn a_search_where_on_a_retyped_range_column_answers_as_without_the_index() {
     ] {
         db.create_table(table, Arc::clone(&schema), spec)
             .expect("create")
-            .append(&batch)
+            .append(&batch, None)
             .expect("append");
         db.apply_schema(
             table,
@@ -616,8 +616,8 @@ fn one_row_superfiles_answer_as_a_scan_does() {
     let batch = rows(0);
     for row in 0..ONE_ROW_FILES {
         let one = batch.slice(row, 1);
-        plain.append(&one).expect("append plain");
-        ranged.append(&one).expect("append ranged");
+        plain.append(&one, None).expect("append plain");
+        ranged.append(&one, None).expect("append ranged");
     }
     assert_same_answers(&db, QUERIES, "over one-row superfiles");
 }
@@ -699,7 +699,8 @@ fn a_range_beside_an_exact_text_filter_answers_as_a_scan_does() {
             .create_table(table, Arc::clone(&schema), spec)
             .expect("create");
         for file in 0..FILES {
-            t.append(&batch(file * ROWS_PER_FILE)).expect("append");
+            t.append(&batch(file * ROWS_PER_FILE), None)
+                .expect("append");
         }
         t.delete(col("seq").lt(lit(DELETED_BELOW))).expect("delete");
     }

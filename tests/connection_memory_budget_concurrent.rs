@@ -102,7 +102,7 @@ fn concurrent_ingest_and_query_stay_within_one_connection_budget() {
                 s.spawn(move || {
                     let mut committed = 0usize;
                     for _ in 0..APPENDS_PER_TABLE {
-                        match t.append(batch) {
+                        match t.append(batch, None) {
                             Ok(()) => committed += 1,
                             Err(InfinoError::OverBudget(_)) => {}
                             Err(other) => panic!("append: non-budget error {other:?}"),
@@ -176,7 +176,7 @@ fn measured_budget_admits_the_same_concurrent_load() {
             let batch = &batch;
             s.spawn(move || {
                 for _ in 0..APPENDS_PER_TABLE {
-                    t.append(batch)
+                    t.append(batch, None)
                         .expect("measured budget never refuses an append");
                     t.bm25_search("title", "budget", TOP_K, Bm25SearchOptions::new(), None)
                         .expect("measured budget never refuses a query");
@@ -214,11 +214,11 @@ fn budget_gate_is_shared_across_tables_on_one_connection() {
     let batch = big_title_batch();
 
     assert!(
-        matches!(a.append(&batch), Err(InfinoError::OverBudget(_))),
+        matches!(a.append(&batch, None), Err(InfinoError::OverBudget(_))),
         "first table's append must be refused over budget",
     );
     assert!(
-        matches!(b.append(&batch), Err(InfinoError::OverBudget(_))),
+        matches!(b.append(&batch, None), Err(InfinoError::OverBudget(_))),
         "second table's append must be refused over budget",
     );
 

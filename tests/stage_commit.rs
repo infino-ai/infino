@@ -147,7 +147,7 @@ fn staged_rows_join_the_table_only_when_committed() {
     assert_eq!(count(&db), 0, "staged rows are not in the table");
     assert_eq!(hits(&table, "common"), 0);
 
-    table.commit_staged(&staged).expect("commit_staged");
+    table.commit_staged(&staged, None).expect("commit_staged");
     assert_eq!(count(&db), BATCHES * BATCH_ROWS);
     for b in 0..BATCHES {
         assert_eq!(
@@ -170,13 +170,13 @@ fn staged_and_appended_rows_mix_in_one_table() {
     let table = create(&db);
 
     let staged = table.stage(&batch(0)).expect("stage");
-    table.append(&batch(1)).expect("append");
+    table.append(&batch(1), None).expect("append");
     assert_eq!(
         count(&db),
         BATCH_ROWS,
         "the append landed, the staged batch not yet"
     );
-    table.commit_staged(&[staged]).expect("commit_staged");
+    table.commit_staged(&[staged], None).expect("commit_staged");
     assert_eq!(count(&db), 2 * BATCH_ROWS);
 }
 
@@ -190,13 +190,15 @@ fn a_staged_batch_committed_again_is_passed_over() {
 
     let landed = table.stage(&batch(0)).expect("stage");
     let once = std::slice::from_ref(&landed);
-    table.commit_staged(once).expect("first commit_staged");
-    table.commit_staged(once).expect("committed again");
+    table
+        .commit_staged(once, None)
+        .expect("first commit_staged");
+    table.commit_staged(once, None).expect("committed again");
     assert_eq!(count(&db), BATCH_ROWS);
 
     let fresh = table.stage(&batch(1)).expect("stage");
     table
-        .commit_staged(&[fresh, landed])
+        .commit_staged(&[fresh, landed], None)
         .expect("the fresh batch lands beside the committed one");
     assert_eq!(count(&db), 2 * BATCH_ROWS);
 
@@ -219,12 +221,12 @@ fn a_refused_commit_releases_the_batches_it_held() {
     }
     let both = [fresh, doomed];
     assert_unsupported(
-        table.commit_staged(&both),
+        table.commit_staged(&both, None),
         "one of the batches lost its superfiles",
     );
     assert_eq!(count(&db), 0, "nothing of the refused commit landed");
     table
-        .commit_staged(&both[..1])
+        .commit_staged(&both[..1], None)
         .expect("the fresh batch commits on its own");
     assert_eq!(count(&db), BATCH_ROWS);
 }
@@ -246,7 +248,7 @@ fn one_staged_batch_committed_from_several_threads_lands_once() {
                 s.spawn(|| {
                     barrier.wait();
                     loop {
-                        match table.commit_staged(&staged) {
+                        match table.commit_staged(&staged, None) {
                             Err(InfinoError::Conflict(_)) => thread::yield_now(),
                             done => break done,
                         }
@@ -276,16 +278,16 @@ fn a_batch_staged_on_another_table_is_refused() {
 
     let staged = [table.stage(&batch(0)).expect("stage")];
     assert_unsupported(
-        other.commit_staged(&staged),
+        other.commit_staged(&staged, None),
         "it was staged on the first table",
     );
     assert_eq!(hits(&other, "common"), 0);
     table
-        .commit_staged(&staged)
+        .commit_staged(&staged, None)
         .expect("its own table still commits it");
     assert_eq!(count(&db), BATCH_ROWS);
     assert_unsupported(
-        other.commit_staged(&staged),
+        other.commit_staged(&staged, None),
         "committed on the first table, it is still not the other's",
     );
     assert_eq!(hits(&other, "common"), 0);
@@ -302,13 +304,13 @@ fn a_batch_staged_through_another_open_of_the_table_is_refused() {
 
     let staged = [table.stage(&batch(0)).expect("stage")];
     assert_unsupported(
-        elsewhere.commit_staged(&staged),
+        elsewhere.commit_staged(&staged, None),
         "it was staged through the other open",
     );
     assert_eq!(count(&open_db(&dir)), 0);
     table
         .clone()
-        .commit_staged(&staged)
+        .commit_staged(&staged, None)
         .expect("a clone of the staging handle commits it");
     assert_eq!(count(&open_db(&dir)), BATCH_ROWS);
 }
@@ -334,12 +336,12 @@ fn a_batch_whose_superfiles_were_reclaimed_is_refused() {
     }
 
     assert_unsupported(
-        table.commit_staged(&staged),
+        table.commit_staged(&staged, None),
         "the staged superfiles are gone",
     );
     assert_eq!(count(&db), 0);
     let again = [table.stage(&batch(0)).expect("stage the rows again")];
-    table.commit_staged(&again).expect("commit_staged");
+    table.commit_staged(&again, None).expect("commit_staged");
     assert_eq!(count(&db), BATCH_ROWS);
 }
 
@@ -352,14 +354,16 @@ fn a_batch_staged_before_the_schema_moved_is_refused() {
     let table = create(&db);
 
     let staged = [table.stage(&batch(0)).expect("stage")];
-    table.append(&wider_batch()).expect("append adds a column");
+    table
+        .append(&wider_batch(), None)
+        .expect("append adds a column");
     assert_unsupported(
-        table.commit_staged(&staged),
+        table.commit_staged(&staged, None),
         "the table's schema moved since staging",
     );
     assert_eq!(count(&db), 1);
     let again = [table.stage(&batch(0)).expect("stage the rows again")];
-    table.commit_staged(&again).expect("commit_staged");
+    table.commit_staged(&again, None).expect("commit_staged");
     assert_eq!(count(&db), 1 + BATCH_ROWS);
 }
 
@@ -369,7 +373,9 @@ fn committing_nothing_is_a_no_op() {
     let dir = TempDir::new().expect("tempdir");
     let db = open_db(&dir);
     let table = create(&db);
-    table.commit_staged(&[]).expect("an empty commit_staged");
+    table
+        .commit_staged(&[], None)
+        .expect("an empty commit_staged");
     assert_eq!(count(&db), 0);
 }
 
@@ -418,7 +424,7 @@ fn a_batch_that_adds_a_column_is_refused_and_appends() {
         Err(InfinoError::Unsupported(_)) => {}
         other => panic!("expected Unsupported, got {other:?}"),
     }
-    table.append(&rows).expect("append adds the column");
+    table.append(&rows, None).expect("append adds the column");
     assert_eq!(count(&db), 1);
 }
 
@@ -447,7 +453,7 @@ fn writers_on_several_connections_commit_to_one_table() {
                 let staged: Vec<StagedAppend> = (0..BATCHES)
                     .map(|b| table.stage(&batch(w * BATCHES + b)).expect("stage"))
                     .collect();
-                table.commit_staged(&staged).expect("commit_staged");
+                table.commit_staged(&staged, None).expect("commit_staged");
             });
         }
     });
