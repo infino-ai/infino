@@ -81,7 +81,7 @@ use uuid::Uuid;
 use crate::utils::trace::OpOrigin;
 use crate::{
     InfinoError,
-    memory::{ConnectionMemoryBudget, budgeted_session_context},
+    memory::{ConnectionMemoryBudget, SqlSpill, budgeted_session_context},
     runtime_metrics::op_stats::{self, OpStatsCollector},
     supertable::{
         error::QueryError,
@@ -237,11 +237,13 @@ fn cacheable_scalar_plan(plan: &LogicalPlan) -> bool {
 /// The SQL context every entry point plans in: DataFusion's memory gated on `budget`, plus the
 /// covered-aggregate rewrite, which answers covered aggregates from manifest statistics and scans
 /// only the boundary segments. One constructor, so a query plans the same way whichever API
-/// (`Connection::query_sql` or a reader's) it arrives through.
+/// (`Connection::query_sql` or a reader's) it arrives through. Its operators spill through
+/// `spill` when the connection has a disk cache folder.
 pub(crate) fn sql_session_context(
     budget: &Arc<ConnectionMemoryBudget>,
+    spill: Option<&SqlSpill>,
 ) -> Result<SessionContext, DataFusionError> {
-    let ctx = budgeted_session_context(budget)?;
+    let ctx = budgeted_session_context(budget, spill)?;
     // Appended after the built-in rules, so they see pushed-down, normalized
     // plans: a `LIMIT` already folded into its sort as the fetch.
     ctx.add_optimizer_rule(Arc::new(CoveredAggregateRewrite::default()));
@@ -670,8 +672,12 @@ impl SupertableReader {
         // Gate SQL heap on the connection budget (shared across contexts, so
         // this reader's SQL counts against the same ceiling as the rest).
         // A session built from our own budget config failing is ours.
-        let ctx = sql_session_context(&self.options().connection_memory_budget)
-            .map_err(QueryError::internal)?;
+        let options = self.options();
+        let ctx = sql_session_context(
+            &options.connection_memory_budget,
+            options.sql_spill.as_deref(),
+        )
+        .map_err(QueryError::internal)?;
         // Registering the table we just built is ours to get right.
         ctx.register_table(TABLE_NAME, Arc::new(provider))
             .map_err(QueryError::internal)?;

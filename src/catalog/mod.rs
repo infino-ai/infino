@@ -132,7 +132,7 @@ use crate::{
     InfinoError,
     config::{self, Config, DEFAULT_CONNECTION_BUDGET_BYTES},
     error::{datafusion_error, datafusion_planning_error},
-    memory::ConnectionMemoryBudget,
+    memory::{ConnectionMemoryBudget, SqlSpill},
     runtime_bridge::{bridge_on_runtime, bridge_sync_to_async, carry_span, shared_io_runtime},
     runtime_metrics::{
         io::{UsageMeter, UsageSnapshot},
@@ -262,6 +262,14 @@ pub fn connect_with(
             .unwrap_or(DEFAULT_CONNECTION_BUDGET_BYTES),
     );
 
+    // An in-memory catalog has no disk cache, so its SQL spills where it
+    // always did.
+    let sql_spill = options
+        .cache_dir
+        .as_deref()
+        .filter(|_| !matches!(backend, Backend::Memory))
+        .map(SqlSpill::under);
+
     debug!(backend = ?backend, validate = options.validate, "catalog connected");
     Ok(Connection {
         inner: Arc::new(ConnectionInner {
@@ -269,6 +277,7 @@ pub fn connect_with(
             options,
             store,
             connection_memory_budget,
+            sql_spill,
             usage_meter,
             gcs_credential,
             #[cfg(feature = "graph-index")]
@@ -303,6 +312,7 @@ fn connect_remote(backend: Backend, options: ConnectOptions) -> Result<Connectio
             options,
             store: CatalogStore::Remote(Arc::new(remote)),
             connection_memory_budget,
+            sql_spill: None,
             usage_meter: UsageMeter::new(),
             gcs_credential: None,
             #[cfg(feature = "graph-index")]
@@ -335,6 +345,9 @@ struct ConnectionInner {
     /// (cloned `Arc`) into every table's `SupertableOptions`. See
     /// [`crate::memory`].
     connection_memory_budget: Arc<ConnectionMemoryBudget>,
+    /// Where the connection's SQL spills when it has a disk cache folder,
+    /// shared into every table's `SupertableOptions`.
+    sql_spill: Option<Arc<SqlSpill>>,
     /// Sole object-store usage ledger for this connection (shared into every
     /// table provider). Benches and billing snapshot this meter.
     usage_meter: Arc<UsageMeter>,
@@ -633,6 +646,9 @@ impl Connection {
                         .with_disk_cache(cache)
                         .with_metadata_disk_cache(manifest_cache);
                 }
+                if let Some(spill) = &self.inner.sql_spill {
+                    opts = opts.with_sql_spill(Arc::clone(spill));
+                }
 
                 // Honor the connection's read-consistency policy (default
                 // BoundedStaleness); `open_table` applies the same.
@@ -749,6 +765,9 @@ impl Connection {
                     options = options
                         .with_disk_cache(cache)
                         .with_metadata_disk_cache(manifest_cache);
+                }
+                if let Some(spill) = &self.inner.sql_spill {
+                    options = options.with_sql_spill(Arc::clone(spill));
                 }
                 // Honor the connection's read-consistency policy. Default is
                 // BoundedStaleness(1s): the per-query pointer re-check is
@@ -1345,8 +1364,11 @@ impl Connection {
         // same constructor as a table reader's, so covered aggregates are
         // answered from manifest statistics here too. A session built from
         // our own budget config failing is ours, not the query's.
-        let ctx = sql_session_context(&self.inner.connection_memory_budget)
-            .map_err(|e| InfinoError::Backend(e.to_string()).with_context("query_sql", None))?;
+        let ctx = sql_session_context(
+            &self.inner.connection_memory_budget,
+            self.inner.sql_spill.as_deref(),
+        )
+        .map_err(|e| InfinoError::Backend(e.to_string()).with_context("query_sql", None))?;
 
         // One snapshot of the session for parsing and table lookup; planning
         // takes a fresh one later, after the tables are registered.

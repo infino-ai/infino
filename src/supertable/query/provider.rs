@@ -4963,7 +4963,8 @@ mod tests {
             reader.sql_schemas().scan().clone(),
             &reader,
         ));
-        let ctx = sql_session_context(&table.options().connection_memory_budget).expect("ctx");
+        let ctx =
+            sql_session_context(&table.options().connection_memory_budget, None).expect("ctx");
         ctx.register_table(TABLE_NAME, Arc::clone(&provider) as Arc<dyn TableProvider>)
             .expect("register");
         (provider, ctx, storage_dir, cache_dir)
@@ -6298,7 +6299,7 @@ mod tests {
     async fn count_of(st: &Supertable, sql: &str) -> i64 {
         let reader = st.reader().expect("reader");
         let provider = SupertableProvider::new(reader.sql_schemas().scan().clone(), &reader);
-        let ctx = sql_session_context(&st.options().connection_memory_budget).expect("ctx");
+        let ctx = sql_session_context(&st.options().connection_memory_budget, None).expect("ctx");
         ctx.register_table(TABLE_NAME, Arc::new(provider) as Arc<dyn TableProvider>)
             .expect("register");
         let batches = ctx
@@ -6448,7 +6449,8 @@ mod tests {
     /// A SQL session over `reader` with a provider of its own, as one catalog statement has.
     fn statement_over(table: &Supertable, reader: &SupertableReader) -> SessionContext {
         let provider = SupertableProvider::new(reader.sql_schemas().scan().clone(), reader);
-        let ctx = sql_session_context(&table.options().connection_memory_budget).expect("ctx");
+        let ctx =
+            sql_session_context(&table.options().connection_memory_budget, None).expect("ctx");
         ctx.register_table(TABLE_NAME, Arc::new(provider) as Arc<dyn TableProvider>)
             .expect("register");
         ctx

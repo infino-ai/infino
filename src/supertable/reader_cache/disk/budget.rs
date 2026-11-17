@@ -966,6 +966,29 @@ impl ScratchCharge {
         }
     }
 
+    /// Charge `bytes` of a temp file already written, without evicting and without waiting:
+    /// for a commit's build output, which must not be held up. The bytes take the disk either
+    /// way, so they are counted at once and the next reservation evicts cache files back
+    /// under the budget; files no read has opened go now. `false`, charging nothing, when temp
+    /// files would pass their share of the budget.
+    pub(crate) fn adopt(&mut self, bytes: u64) -> bool {
+        let store = &self.store;
+        let cap = store.scratch_cap();
+        let counted =
+            store
+                .scratch_bytes
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |charged| {
+                    charged.checked_add(bytes).filter(|&next| next <= cap)
+                });
+        if counted.is_err() {
+            return false;
+        }
+        store.current_bytes.fetch_add(bytes, Ordering::Release);
+        self.bytes += bytes;
+        store.trim_cold_to_budget();
+        true
+    }
+
     /// Bytes the cache's temp files may still be charged before they hold their whole share
     /// of the budget.
     pub(crate) fn room(&self) -> u64 {
