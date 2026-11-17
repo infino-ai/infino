@@ -130,6 +130,17 @@ impl<K: Eq + Hash, V: Clone> ByteLru<K, V> {
         state.bytes = state.bytes.saturating_add(bytes);
     }
 
+    /// Drop every value.
+    pub(crate) fn clear(&self) {
+        let mut state = self.state.lock().expect("decoded cache poisoned");
+        state.index.clear();
+        state.slots.clear();
+        state.free.clear();
+        state.newest = None;
+        state.oldest = None;
+        state.bytes = 0;
+    }
+
     /// How many values are kept.
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {

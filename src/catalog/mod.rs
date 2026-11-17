@@ -250,6 +250,8 @@ pub fn connect_with(
             .unwrap_or(DEFAULT_CONNECTION_BUDGET_BYTES),
     );
 
+    let statement_plans = StatementPlans::new(&connection_memory_budget);
+
     debug!(backend = ?backend, validate = options.validate, "catalog connected");
     Ok(Connection {
         inner: Arc::new(ConnectionInner {
@@ -257,7 +259,7 @@ pub fn connect_with(
             options,
             store,
             connection_memory_budget,
-            statement_plans: StatementPlans::default(),
+            statement_plans,
             usage_meter,
             gcs_credential,
             #[cfg(feature = "graph-index")]
@@ -285,6 +287,7 @@ fn connect_remote(backend: Backend, options: ConnectOptions) -> Result<Connectio
             .connection_memory_budget_bytes
             .unwrap_or(DEFAULT_CONNECTION_BUDGET_BYTES),
     );
+    let statement_plans = StatementPlans::new(&connection_memory_budget);
     debug!(backend = ?backend, "catalog connected (remote)");
     Ok(Connection {
         inner: Arc::new(ConnectionInner {
@@ -292,7 +295,7 @@ fn connect_remote(backend: Backend, options: ConnectOptions) -> Result<Connectio
             options,
             store: CatalogStore::Remote(Arc::new(remote)),
             connection_memory_budget,
-            statement_plans: StatementPlans::default(),
+            statement_plans,
             usage_meter: UsageMeter::new(),
             gcs_credential: None,
             #[cfg(feature = "graph-index")]
@@ -325,9 +328,9 @@ struct ConnectionInner {
     /// (cloned `Arc`) into every table's `SupertableOptions`. See
     /// [`crate::memory`].
     connection_memory_budget: Arc<ConnectionMemoryBudget>,
-    /// The parsed plans of statements run on this connection, by their text
-    /// (see [`StatementPlans`]).
-    statement_plans: StatementPlans,
+    /// The parsed plans of statements run on this connection, by their text,
+    /// held against `connection_memory_budget` (see [`StatementPlans`]).
+    statement_plans: Arc<StatementPlans>,
     /// Sole object-store usage ledger for this connection (shared into every
     /// table provider). Benches and billing snapshot this meter.
     usage_meter: Arc<UsageMeter>,
@@ -2399,7 +2402,10 @@ mod tests {
         runtime_metrics::{io::UriClass, op_stats::with_op_stats},
         supertable::{
             manifest::commit::POINTER_PATH,
-            query::{provider::TABLE_NAME, sql::value_count_schema},
+            query::{
+                provider::TABLE_NAME,
+                sql::{STATEMENT_PLAN_MAX_BYTES, statement_bytes, value_count_schema},
+            },
         },
         test_helpers::{
             build_title_batch,
@@ -5174,6 +5180,142 @@ mod tests {
         assert!(
             conn.inner.statement_plans.get(search).is_none(),
             "a search function's statement"
+        );
+    }
+
+    /// A kept statement whose column has changed type since is parsed again:
+    /// its kept plan does not bind, and the statement answers in the new type.
+    #[test]
+    fn a_statement_over_a_retyped_column_is_parsed_again() {
+        let (conn, _dir) = storage_conn();
+        let digits = LargeStringArray::from(vec![Some("1"), Some("2"), Some("3")]);
+        one_column_table(
+            &conn,
+            "codes",
+            Field::new("code", DataType::LargeUtf8, true),
+            Arc::new(digits),
+        );
+        let every = "SELECT code FROM codes";
+        let before = conn.query_sql(every).expect("sql");
+        assert_eq!(
+            before[0].schema().field(0).data_type(),
+            &DataType::LargeUtf8
+        );
+        assert!(conn.inner.statement_plans.get(every).is_some(), "kept");
+
+        conn.apply_schema(
+            "codes",
+            &SchemaPatch::new(vec![FieldPatch::named("code").with_type(DataType::Int64)]),
+            None,
+        )
+        .expect("retype");
+        assert!(
+            bind_kept(&conn, every, &["codes"]).1.is_none(),
+            "a column retyped since"
+        );
+        let after = conn.query_sql(every).expect("sql");
+        assert_eq!(
+            after[0].schema().field(0).data_type(),
+            &DataType::Int64,
+            "the column's new type"
+        );
+        assert_eq!(n_rows(&after), 3);
+    }
+
+    /// The plan `sql` parses to over the catalog tables `tables`, before any
+    /// optimization, as `query_sql` parses it before keeping it.
+    fn parsed(conn: &Connection, sql: &str, tables: &[&str]) -> LogicalPlan {
+        let ctx = sql_session_context(&conn.inner.connection_memory_budget).expect("session");
+        for name in tables {
+            conn.open_and_register(&ctx, name)
+                .expect("register")
+                .expect("a catalog table");
+        }
+        bridge_on_runtime(
+            async { ctx.state().create_logical_plan(sql).await },
+            &shared_io_runtime(),
+        )
+        .expect("parse")
+    }
+
+    /// Kept statements are bounded by bytes. Past the bound the least
+    /// recently run one goes; each one's bytes are held against the
+    /// connection's budget and given back when it goes; a budget that needs
+    /// the room takes every one back; none is kept past the budget's share;
+    /// and a statement past the most one may hold is not kept.
+    #[test]
+    fn kept_statements_are_bounded_by_bytes_and_held_against_the_budget() {
+        let conn = connect("memory://").expect("connect");
+        one_column_table(
+            &conn,
+            "tags",
+            Field::new("tag", DataType::LargeUtf8, true),
+            distinct_strings("a", 3),
+        );
+        let sqls: Vec<String> = (0..3)
+            .map(|i| format!("SELECT tag FROM tags WHERE tag = 'a{i}'"))
+            .collect();
+        let plans: Vec<LogicalPlan> = sqls
+            .iter()
+            .map(|sql| parsed(&conn, sql, &["tags"]))
+            .collect();
+        let tables = vec!["tags".to_string()];
+        let bytes: Vec<usize> = sqls
+            .iter()
+            .zip(&plans)
+            .map(|(sql, plan)| statement_bytes(sql, &tables, plan))
+            .collect();
+        assert!(
+            bytes.iter().all(|b| *b == bytes[0]),
+            "statements of one shape hold the same bytes: {bytes:?}"
+        );
+        let one = bytes[0];
+
+        // Room for two: the third pushes out the least recently run.
+        let budget = ConnectionMemoryBudget::measured();
+        let kept = StatementPlans::with_max_bytes(&budget, 2 * one + one / 2);
+        kept.keep(&sqls[0], tables.clone(), &plans[0]);
+        kept.keep(&sqls[1], tables.clone(), &plans[1]);
+        assert_eq!(budget.used(), 2 * one, "each kept statement's bytes held");
+        assert!(
+            kept.get(&sqls[0]).is_some(),
+            "run again, so the most recent"
+        );
+        kept.keep(&sqls[2], tables.clone(), &plans[2]);
+        assert!(kept.get(&sqls[0]).is_some(), "the recently run one stays");
+        assert!(kept.get(&sqls[1]).is_none(), "the least recently run goes");
+        assert!(kept.get(&sqls[2]).is_some(), "the new one is kept");
+        assert_eq!(budget.used(), 2 * one, "the dropped one's bytes given back");
+
+        // A reservation the budget has no room for takes the kept ones back.
+        let budget = ConnectionMemoryBudget::with_limit(u64::try_from(100 * one).expect("u64"));
+        let limit = budget.remaining().expect("bounded");
+        let kept = StatementPlans::with_max_bytes(&budget, usize::MAX);
+        kept.keep(&sqls[0], tables.clone(), &plans[0]);
+        assert_eq!(kept.len(), 1);
+        let _query = budget
+            .try_reserve(limit - one / 2)
+            .expect("the kept statement gives its room back");
+        assert_eq!(kept.len(), 0, "every kept statement given back");
+
+        // A tenth of this budget is less than one statement: none is kept.
+        let budget = ConnectionMemoryBudget::with_limit(u64::try_from(5 * one).expect("u64"));
+        let kept = StatementPlans::with_max_bytes(&budget, usize::MAX);
+        kept.keep(&sqls[0], tables.clone(), &plans[0]);
+        assert_eq!(kept.len(), 0, "past the budget's share");
+        assert_eq!(budget.used(), 0);
+
+        // A long `IN` list is parsed each time it runs.
+        let values: Vec<String> = (0..20_000).map(|i| format!("'v{i}'")).collect();
+        let long = format!("SELECT tag FROM tags WHERE tag IN ({})", values.join(", "));
+        assert!(
+            statement_bytes(&long, &tables, &parsed(&conn, &long, &["tags"]))
+                > STATEMENT_PLAN_MAX_BYTES
+        );
+        assert_eq!(n_rows(&conn.query_sql(&long).expect("sql")), 0);
+        assert!(
+            conn.inner.statement_plans.get(&long).is_none(),
+            "past the most one statement may hold"
         );
     }
 

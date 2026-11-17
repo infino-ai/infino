@@ -56,7 +56,7 @@
 use std::{
     collections::{HashMap, HashSet},
     future::Future,
-    sync::{Arc, Mutex},
+    sync::{Arc, Weak},
     time::Instant,
 };
 
@@ -90,7 +90,7 @@ use uuid::Uuid;
 use crate::utils::trace::OpOrigin;
 use crate::{
     InfinoError,
-    memory::{ConnectionMemoryBudget, budgeted_session_context},
+    memory::{ConnectionMemoryBudget, Reclaim, Reservation, budgeted_session_context},
     runtime_metrics::op_stats::{self, OpStatsCollector},
     supertable::{
         error::QueryError,
@@ -109,6 +109,7 @@ use crate::{
             },
             provider::{SupertableProvider, TABLE_NAME, view_string_schema},
             range_top_k::RangeTopK,
+            scalar_cache::ByteLru,
         },
         reader_cache::disk::ForegroundQueryGuard,
         schema::sql_schema,
@@ -244,9 +245,27 @@ fn cacheable_scalar_plan(plan: &LogicalPlan) -> bool {
     walked.is_ok() && catalog_tables_only && found_scan
 }
 
-/// Most statements a connection keeps the parsed plans of; past it the
-/// kept plans are dropped and the next statements start the cache over.
-const STATEMENT_PLANS: usize = 256;
+/// Most bytes a connection's kept statements hold together, when its memory
+/// budget has room for them; past it the least recently run go first.
+const STATEMENT_PLANS_BYTES: usize = 16 * 1024 * 1024;
+
+/// Most bytes one kept statement may hold: a statement past it, a long `IN`
+/// list say, is parsed again each time it runs rather than kept.
+pub(crate) const STATEMENT_PLAN_MAX_BYTES: usize = 1024 * 1024;
+
+/// The share of the connection's memory budget, in percent, past which no
+/// statement is kept: a kept plan only saves parsing, so it never takes the
+/// room a query needs.
+const STATEMENT_PLANS_BUDGET_SHARE_PERCENT: usize = 10;
+
+/// A kept statement: the catalog tables it names, its parsed plan, and the
+/// bytes it holds against the connection's budget, given back when it is
+/// dropped.
+struct KeptStatement {
+    tables: Vec<String>,
+    plan: LogicalPlan,
+    _reservation: Reservation,
+}
 
 /// A connection's parsed statements, by their text: the logical plan a
 /// statement parses to, before any optimization, and the catalog tables it
@@ -259,19 +278,55 @@ const STATEMENT_PLANS: usize = 256;
 /// relation holds a live reader. A kept plan scans a placeholder carrying
 /// only the table's schema, so it pins no snapshot; [`Self::bind`] puts the
 /// statement's own tables back.
-#[derive(Default)]
-pub(crate) struct StatementPlans(Mutex<HashMap<String, (Vec<String>, LogicalPlan)>>);
+///
+/// Bounded by bytes ([`statement_bytes`]): at most
+/// [`STATEMENT_PLANS_BYTES`] together, the least recently run statement
+/// dropped first to make room, and no statement past
+/// [`STATEMENT_PLAN_MAX_BYTES`]. Each kept statement's bytes are reserved
+/// against the connection's memory budget, within
+/// [`STATEMENT_PLANS_BUDGET_SHARE_PERCENT`] of it, and every kept statement
+/// is given back when the budget needs room for something else.
+pub(crate) struct StatementPlans {
+    budget: Arc<ConnectionMemoryBudget>,
+    plans: ByteLru<String, Arc<KeptStatement>>,
+}
 
 impl StatementPlans {
+    /// An empty cache charging `budget`, registered to give its plans back
+    /// when the budget needs the room.
+    pub(crate) fn new(budget: &Arc<ConnectionMemoryBudget>) -> Arc<Self> {
+        Self::with_max_bytes(budget, STATEMENT_PLANS_BYTES)
+    }
+
+    /// [`Self::new`], holding at most `max_bytes` of statements together.
+    pub(crate) fn with_max_bytes(
+        budget: &Arc<ConnectionMemoryBudget>,
+        max_bytes: usize,
+    ) -> Arc<Self> {
+        let plans = Arc::new(Self {
+            budget: Arc::clone(budget),
+            plans: ByteLru::new(max_bytes),
+        });
+        let holder: Weak<Self> = Arc::downgrade(&plans);
+        budget.register_reclaim(holder);
+        plans
+    }
+
     /// The catalog tables `sql` names and its parsed plan, when kept.
     pub(crate) fn get(&self, sql: &str) -> Option<(Vec<String>, LogicalPlan)> {
-        self.0.lock().ok()?.get(sql).cloned()
+        let kept = self.plans.get(&sql.to_owned())?;
+        Some((kept.tables.clone(), kept.plan.clone()))
     }
 
     /// Keep `plan`, what `sql` parses to, with the catalog `tables` it names,
-    /// when every table it scans is a catalog table.
+    /// when every table it scans is a catalog table, it holds no more than
+    /// [`STATEMENT_PLAN_MAX_BYTES`], and the connection's budget has room.
     pub(crate) fn keep(&self, sql: &str, tables: Vec<String>, plan: &LogicalPlan) {
         if !cacheable_scalar_plan(plan) {
+            return;
+        }
+        let bytes = statement_bytes(sql, &tables, plan);
+        if bytes > STATEMENT_PLAN_MAX_BYTES {
             return;
         }
         let Ok(stripped) = plan
@@ -289,13 +344,24 @@ impl StatementPlans {
         else {
             return;
         };
-        let Ok(mut plans) = self.0.lock() else {
+        let Some(reservation) = self
+            .budget
+            .try_reserve_within_share(bytes, STATEMENT_PLANS_BUDGET_SHARE_PERCENT)
+        else {
             return;
         };
-        if plans.len() >= STATEMENT_PLANS && !plans.contains_key(sql) {
-            plans.clear();
-        }
-        plans.insert(sql.to_owned(), (tables, stripped.data));
+        let kept = KeptStatement {
+            tables,
+            plan: stripped.data,
+            _reservation: reservation,
+        };
+        self.plans.insert(sql.to_owned(), Arc::new(kept), bytes);
+    }
+
+    /// How many statements are kept.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.plans.len()
     }
 
     /// `plan`, a kept one, scanning the tables registered in `ctx` in place of
@@ -341,6 +407,45 @@ impl StatementPlans {
         })?;
         Ok((!stale).then_some(bound.data))
     }
+}
+
+impl Reclaim for StatementPlans {
+    /// Drop every kept statement: each is parsed again the next time it runs.
+    fn reclaim(&self) {
+        self.plans.clear();
+    }
+}
+
+/// About the heap a kept statement holds: its text and table names, and for
+/// each node of its plan, subqueries' included, the node, its output
+/// schema's fields and its expressions, a literal with its own heap (a long
+/// string, a list). A schema a node shares with its input is counted again,
+/// so this errs high.
+pub(crate) fn statement_bytes(sql: &str, tables: &[String], plan: &LogicalPlan) -> usize {
+    let mut bytes = sql.len()
+        + tables
+            .iter()
+            .map(|t| size_of::<String>() + t.len())
+            .sum::<usize>();
+    let _ = plan.apply_with_subqueries(|node| {
+        bytes += size_of::<LogicalPlan>();
+        bytes += node
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| size_of::<Field>() + f.name().len())
+            .sum::<usize>();
+        node.apply_expressions(|expr| {
+            expr.apply(|e| {
+                bytes += size_of::<Expr>();
+                if let Expr::Literal(value, _) = e {
+                    bytes += value.size().saturating_sub(size_of::<ScalarValue>());
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })
+        })
+    });
+    bytes
 }
 
 /// The SQL context every entry point plans in: DataFusion's memory gated on `budget`, plus the
