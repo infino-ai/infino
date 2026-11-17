@@ -115,9 +115,12 @@ fn a_rare_conjunction_opens_only_its_holders() {
     );
 }
 
-/// A document deleted after the index was built is in the tiers but not
-/// in the table: a superfile the index answers for leaves it out, as an
-/// opened one would.
+/// A document deleted after the index was built is in the heads but not
+/// in the table. The heads name documents by the superfile's own id, which
+/// its deleted rows are not keyed by, so the superfile holding the delete
+/// is opened, where it can still place, rather than answered from the
+/// index — and leaves it out; the others are still answered from the
+/// index.
 #[test]
 fn a_resolved_superfile_respects_tombstones() {
     let with_dir = TempDir::new().expect("tempdir");
@@ -138,7 +141,11 @@ fn a_resolved_superfile_respects_tombstones() {
             a.iter().all(|&(sf, row, _)| !(sf == 0 && row == 97)),
             "k={k}: the deleted document is not returned"
         );
-        assert_eq!(opened(&stats), 0, "k={k}: still answered from the index");
+        assert!(
+            opened(&stats) <= 1,
+            "k={k}: at most the superfile with the delete is opened: {}",
+            opened(&stats)
+        );
     }
 }
 

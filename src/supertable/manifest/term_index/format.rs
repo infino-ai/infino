@@ -448,15 +448,16 @@ impl<'a> Cursor<'a> {
 pub(crate) const SLICE_VERSION_PREFIX_LEN: u64 = (MAGIC_LEN + U32_LEN) as u64;
 
 /// Whether a slice whose first [`SLICE_VERSION_PREFIX_LEN`] bytes are
-/// `prefix` is of the layout before tiers, refusing a magic or version
-/// [`Slice::open`] would refuse.
-pub(crate) fn slice_is_before_tiers(prefix: &[u8]) -> Result<bool, TermIndexError> {
+/// `prefix` is of a layout before level heads, refusing a magic or version
+/// [`Slice::open`] would refuse. Such a layer names documents by row, so
+/// its terms get level heads only from a rebuild from the superfiles.
+pub(crate) fn slice_predates_heads(prefix: &[u8]) -> Result<bool, TermIndexError> {
     let mut c = Cursor {
         bytes: prefix,
         at: 0,
     };
     let version = check_magic_version(&mut c, SLICE_MAGIC, &SLICE_VERSIONS, "slice")?;
-    Ok(version == LEGACY_SLICE_FORMAT_VERSION)
+    Ok(version < SLICE_FORMAT_VERSION)
 }
 
 /// Check the magic and read the version, which must be the current one

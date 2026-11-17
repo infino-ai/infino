@@ -1903,9 +1903,9 @@ pub(crate) struct TermHeadFacts<'a> {
     pub(crate) bound: f32,
     /// The dictionary entry written for the term.
     pub(crate) entry: DictEntry,
-    /// The best documents by impact as `(row, term frequency, length
-    /// bucket)`, in descending impact then ascending blob document id, at
-    /// most the sink's depth, encoded by [`push_head`].
+    /// The best documents by impact as `(blob document id, term frequency,
+    /// length bucket)`, in descending impact then ascending id, at most the
+    /// sink's depth, encoded by [`push_head`].
     pub(crate) head: &'a [u8],
     /// The length-normalized term frequency — `tf / (tf + norm)` at this
     /// blob's average length and parameters, the factor a score multiplies
@@ -1926,7 +1926,8 @@ pub(crate) struct TermHeadFacts<'a> {
 #[derive(Default, Clone)]
 struct HeadOut {
     df: u64,
-    /// The head's documents as `(row, term frequency, length bucket)`,
+    /// The head's documents as `(blob document id, term frequency, length
+    /// bucket)`,
     /// encoded by [`push_head`] where the term is encoded, so the thread
     /// that writes terms in order only copies them.
     facts: Vec<u8>,
@@ -2022,10 +2023,10 @@ fn term_head(
     out.facts.clear();
     push_head(
         &mut out.facts,
-        kept.iter().map(|&((doc, tf), _)| {
-            let row = enc.rows.map_or(doc, |rows| rows[doc as usize]);
-            (row, tf, bm25::quantize_len(enc.doc_lengths[doc as usize]))
-        }),
+        // Documents by the blob's own id, which its postings use: a probe
+        // finds one in them without the row map.
+        kept.iter()
+            .map(|&((doc, tf), _)| (doc, tf, bm25::quantize_len(enc.doc_lengths[doc as usize]))),
     );
     out.avgdl = enc.avgdl;
     out.params = enc.params;
@@ -3223,7 +3224,6 @@ impl FtsBuilder {
                 n_scored_docs: n_scored,
                 heads: head_sink.is_some(),
                 head_depth,
-                rows: doc_map.as_deref(),
             };
 
             // In-RAM path invariant: the dispatcher checked that no column
@@ -3424,7 +3424,6 @@ impl FtsBuilder {
                 n_scored_docs: n_scored,
                 heads: head_sink.is_some(),
                 head_depth,
-                rows: doc_map.as_deref(),
             };
 
             let mut sink = TermSink {
@@ -4793,8 +4792,6 @@ struct TermEncoding<'a> {
     /// Whether a head is gathered for each term, and how deep.
     heads: bool,
     head_depth: usize,
-    /// The row each blob document id stands for, when they differ.
-    rows: Option<&'a [u32]>,
 }
 
 /// A term encoded on a worker thread, its bytes taken out of that
@@ -6824,14 +6821,14 @@ mod tests {
         assert_eq!(shared_body, BLOCK_LEN as u64 + 9);
     }
 
-    /// A term's head names each document it keeps by the row it stands
-    /// for, with the document's own term frequency and its own length,
-    /// quantized: in a blob whose documents are renumbered, the length is
-    /// looked up by document, not by row. It keeps the best-scoring
+    /// A term's head names each document it keeps by the blob's own id —
+    /// what its postings use, so a probe finds it there — with the
+    /// document's own term frequency and its own length, quantized. It
+    /// keeps the best-scoring
     /// documents, as many as the depth: the configured one, or the term's
     /// proportional share when that is deeper.
     #[test]
-    fn a_head_names_its_documents_by_row_with_their_own_lengths() {
+    fn a_head_names_its_documents_by_blob_id_with_their_own_lengths() {
         /// Documents holding the term: past the whole-list size, so the
         /// head is cut.
         const DOCS: u32 = 3 * WHOLE_HEAD_MAX_DF as u32;
@@ -6850,8 +6847,6 @@ mod tests {
         // so they outscore every other document whatever its length.
         let doc_lengths: Vec<u32> = (0..DOCS).map(|d| 1 + (d % LEN_CYCLE) * LEN_STEP).collect();
         let avgdl = doc_lengths.iter().sum::<u32>() as f32 / DOCS as f32;
-        // Blob document d stands for row DOCS - 1 - d.
-        let rows: Vec<u32> = (0..DOCS).rev().collect();
         let pairs: Vec<(u32, u32)> = (0..DOCS)
             .map(|d| (d, if (d as usize) < DEPTH { HIGH_TF } else { 1 }))
             .collect();
@@ -6863,7 +6858,6 @@ mod tests {
             n_scored_docs: DOCS,
             heads: true,
             head_depth: MIN_DEPTH,
-            rows: Some(&rows),
         };
         assert_eq!(proportional_head_depth(u64::from(DOCS)) as usize, DEPTH);
         let idf = bm25::idf(u64::from(DOCS), pairs.len() as u64);
@@ -6898,13 +6892,12 @@ mod tests {
         assert_eq!(head.len(), DEPTH);
         let mut kept: Vec<u32> = head
             .iter()
-            .map(|&(row, tf, len)| {
-                let doc = DOCS - 1 - row;
-                assert_eq!(tf, pairs[doc as usize].1, "row {row}'s own tf");
+            .map(|&(doc, tf, len)| {
+                assert_eq!(tf, pairs[doc as usize].1, "document {doc}'s own tf");
                 assert_eq!(
                     len,
                     bm25::quantize_len(doc_lengths[doc as usize]),
-                    "row {row}'s own length"
+                    "document {doc}'s own length"
                 );
                 doc
             })

@@ -16,6 +16,7 @@ mod options;
 #[cfg(test)]
 mod oracle_scale;
 mod phrase;
+mod probe;
 mod scorers;
 mod search;
 mod sink;

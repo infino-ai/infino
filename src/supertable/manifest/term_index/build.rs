@@ -335,6 +335,10 @@ struct HeadInput {
     tail: f32,
     /// The sources' per-bucket maxima; `None` once one source lacks them.
     buckets: Option<BucketMaxTf>,
+    /// Whether a source holds the term in a layer from before level heads:
+    /// its tier names documents by row where a head names them by the
+    /// superfile's own id, so the term keeps no head until a rebuild.
+    blocked: bool,
     /// Whether any source was seen yet (the first sets `buckets`).
     seen: bool,
 }
@@ -636,6 +640,9 @@ fn encode_head(
     ordinals: &[Option<u32>],
     scoring_of: &dyn Fn(u32) -> ColumnScoring,
 ) -> Result<Option<EncodedHead>, TermIndexError> {
+    if input.blocked {
+        return Ok(None);
+    }
     let mut entries: Vec<TierEntry> = input.inline.clone();
     if input.headless {
         entries.extend_from_slice(tier_entries);
@@ -3568,9 +3575,10 @@ fn merge_range(
                         });
                     }
                 }
-                // A layer from before level heads lends its tier entries,
-                // bounded by its postings' tails.
-                None => head_input.add_headless(source_run.postings.iter().map(|p| p.tail), None),
+                // A layer from before level heads names documents by row:
+                // the term keeps no head until the index is rebuilt.
+                None if !source_run.postings.is_empty() => head_input.blocked = true,
+                None => {}
             }
             // A run without a tier contributes no entries; its postings
             // stand on their bounds in the merged term (see `encode_term`).
@@ -3622,7 +3630,11 @@ fn merge_range(
             continue;
         }
         run.sort_unstable_by_key(|p| p.superfile);
-        if !streamed.is_empty() && !head_input.headless && writer.keeps_heads() {
+        if !streamed.is_empty()
+            && !head_input.headless
+            && !head_input.blocked
+            && writer.keeps_heads()
+        {
             let input = mem::take(&mut head_input);
             let df: u64 = run.iter().map(|p| p.df).sum();
             let term = writer.encode_now(TermInput {

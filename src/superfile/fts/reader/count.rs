@@ -41,7 +41,7 @@ use crate::{
             short::short_df,
             tokenize::Phrase,
         },
-        id_space::{DocMap, FtsDocId, RowId},
+        id_space::{FtsDocId, RowId},
     },
     utils::terms::{DictEntry, make_key},
 };
@@ -624,12 +624,6 @@ impl FtsReader {
                 Some(dict_bytes),
             )
             .await?;
-        // A head names its documents by row, so a term with postings here
-        // needs the doc-id map; terms this file lacks read none of it.
-        let doc_map = match cursors.iter().any(Option::is_some) {
-            true => Some(self.ensure_doc_map().await?),
-            false => None,
-        };
         let norms = col_meta.dl_norm_k1();
         Ok(entries
             .into_iter()
@@ -638,7 +632,7 @@ impl FtsReader {
                 let mut cursor = cursor?;
                 // A depth of zero is read as one: an empty head would read
                 // as a term no document carries.
-                let (head, bound) = self.head_of(&mut cursor, norms, doc_map?, head_depth.max(1));
+                let (head, bound) = self.head_of(&mut cursor, norms, head_depth.max(1));
                 Some(TermIndexFact {
                     df: cursor.df,
                     bound,
@@ -654,13 +648,7 @@ impl FtsReader {
     /// the term's bound here. Blocks whose maximum cannot beat the running
     /// `depth`-th impact are skipped undecoded, as the single-term search
     /// skips them; the cursor is consumed.
-    fn head_of(
-        &self,
-        cursor: &mut TermCursor,
-        norms: &NormTable,
-        doc_map: &DocMap,
-        depth: usize,
-    ) -> (TermHead, f32) {
+    fn head_of(&self, cursor: &mut TermCursor, norms: &NormTable, depth: usize) -> (TermHead, f32) {
         // A common term keeps its proportional share, as a build's head
         // does, so a table rebuilt from its superfiles gets the heads a
         // fresh build would.
@@ -695,7 +683,7 @@ impl FtsReader {
         let (bound, tail) = finish_head(&mut heap, depth, &mut hits, key);
         let docs = hits
             .into_iter()
-            .map(|((id, tf), _)| (doc_map.row_of(id).get(), tf, buckets[id.get() as usize]))
+            .map(|((id, tf), _)| (id.get(), tf, buckets[id.get() as usize]))
             .collect();
         let buckets = bucket_max
             .iter()
@@ -741,8 +729,6 @@ impl FtsReader {
         }
         entries.truncate(limit);
         self.ensure_norms(column_id).await?;
-        // Every term walked here has a document, and a head names it by row.
-        let doc_map = self.ensure_doc_map().await?;
         let col_meta = &self.columns[column_id as usize];
         let mut out = Vec::with_capacity(entries.len());
         let mut with_postings: Vec<usize> = Vec::new();
@@ -756,7 +742,7 @@ impl FtsReader {
                     let bound = bm25::tf_factor(tf, col_meta.dl_norm_k1().get(doc_id));
                     let bucket = col_meta.dl_norm_k1().buckets()[doc_id as usize];
                     let head = TermHead {
-                        docs: vec![(doc_map.row_of(FtsDocId::new(doc_id)).get(), tf, bucket)],
+                        docs: vec![(doc_id, tf, bucket)],
                         tail: 0.0,
                         buckets: vec![(bucket, tf)],
                     };

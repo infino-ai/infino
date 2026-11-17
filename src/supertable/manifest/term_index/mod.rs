@@ -2104,17 +2104,18 @@ async fn check_objects_listing_past(
                 .get_range(&slice_uri(&hash), 0..format::SLICE_VERSION_PREFIX_LEN)
                 .await
                 .map_err(TermIndexError::Storage)
-                .and_then(|prefix| format::slice_is_before_tiers(&prefix));
+                .and_then(|prefix| format::slice_predates_heads(&prefix));
             (hash, layout)
         })
         .buffer_unordered(LAYER_FETCH_CONCURRENCY);
-    // Asked again on the next pass, until a fold rewrites the layer.
-    let mut legacy: HashSet<ContentHash> = HashSet::new();
-    while let Some((hash, layout)) = prefixes.next().await {
+    // A live layer from before level heads names documents by row, which a
+    // fold cannot turn into the superfiles' own ids: the index is built
+    // again from the superfiles, once, and serves through the tiers until
+    // then.
+    let legacy: HashSet<ContentHash> = HashSet::new();
+    while let Some((_, layout)) = prefixes.next().await {
         match layout {
-            Ok(true) => {
-                legacy.insert(hash);
-            }
+            Ok(true) => return Ok(RootObjects::Missing),
             Ok(false) => {}
             Err(e) if e.calls_for_rebuild() => return Ok(RootObjects::Missing),
             Err(e) => return Err(e),

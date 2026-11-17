@@ -49,6 +49,7 @@ use futures::future::try_join_all;
 use roaring::RoaringBitmap;
 
 use super::{
+    dispatch,
     fts::{baked_avgdl, competitive_floor},
     tier::{
         BOUND_SLACK, EXACT_SUM_TERMS, MAX_TIER_TERMS, SuperfileBounds, TermMask, TierQuery,
@@ -61,12 +62,15 @@ use crate::{
         bm25::{dequantize_len, quantize_len, score_with_dl_norm_k1, tf_factor},
         reader::{GlobalTermIdf, norm_table},
     },
+    superfile::{SuperfileReader, id_space::FtsDocId},
     supertable::{
+        error::QueryError,
         manifest::{
-            SuperfileEntry,
+            ManifestSnapshot, SuperfileEntry,
             part::ContentHash,
             term_index::{BucketMaxTf, LevelRef, SliceRun, TermIndex, TermIndexError},
         },
+        reader_cache::disk::ReadIntent,
         schema::FieldId,
     },
 };
@@ -229,6 +233,7 @@ pub(crate) async fn available(
 /// does not list or whose average length is unknown.
 pub(crate) async fn select(
     index: &TermIndex,
+    manifest: &ManifestSnapshot,
     query: &TierQuery<'_>,
     kept: &[Arc<SuperfileEntry>],
     global_idf: &GlobalTermIdf,
@@ -327,17 +332,7 @@ pub(crate) async fn select(
                 .fold(head.floor, f32::max);
             for e in &head.inline {
                 if let Some(s) = slot_for(e.superfile) {
-                    absorb(
-                        &mut candidates,
-                        &slots,
-                        &weights,
-                        nt,
-                        t,
-                        s,
-                        e.doc_id,
-                        e.tf,
-                        e.len,
-                    );
+                    absorb(&mut candidates, &weights, nt, t, s, e.doc_id, e.tf, e.len);
                     entries_read += 1;
                 }
             }
@@ -375,7 +370,7 @@ pub(crate) async fn select(
     };
     let mut rounds = 0usize;
     loop {
-        theta = kth_lower_bound(&candidates, &weights, k, lb_slack);
+        theta = kth_lower_bound(&candidates, &slots, &weights, k, lb_slack);
         bounds = slot_bounds(&slots, &heads, &candidates, &weights, lb_slack);
         if fetched >= HEAD_READ_BUDGET_BYTES {
             break;
@@ -421,17 +416,7 @@ pub(crate) async fn select(
                 for e in &block.entries {
                     entries_read += 1;
                     if let Some(s) = slot_for(base + e.superfile) {
-                        absorb(
-                            &mut candidates,
-                            &slots,
-                            &weights,
-                            nt,
-                            t,
-                            s,
-                            e.doc_id,
-                            e.tf,
-                            e.len,
-                        );
+                        absorb(&mut candidates, &weights, nt, t, s, e.doc_id, e.tf, e.len);
                     }
                 }
             }
@@ -449,10 +434,43 @@ pub(crate) async fn select(
         theta = f32::NEG_INFINITY;
     }
     let theta_id_max = theta_id_max(&candidates, &slots, &weights, k, lb_slack, theta);
-    let resolved = match exact_scores && !query.rows_scoped {
+    let mut resolved = match exact_scores && !query.rows_scoped {
         true => resolve(&slots, &heads, &candidates, &weights, theta, theta_id_max),
         false => Vec::new(),
     };
+    // The heads name documents by each superfile's own id; its answers are
+    // its rows, read from the map pages the few documents fall in.
+    let mapped = resolved.iter().map(|(s, hits)| {
+        let entry = &kept[*s];
+        async move {
+            if hits.is_empty() {
+                return Ok(Vec::new());
+            }
+            let reader = open_reader_of(manifest, entry).await?;
+            let fts = reader.fts().ok_or_else(|| {
+                TermIndexError::Open(QueryError::Internal(
+                    "a superfile the heads name has no full-text index".into(),
+                ))
+            })?;
+            let docs = hits
+                .iter()
+                .map(|&(doc, score)| (FtsDocId::new(doc), score))
+                .collect();
+            let rows = fts
+                .hits_to_rows_async(docs)
+                .await
+                .map_err(|e| TermIndexError::Open(QueryError::from(e)))?;
+            Ok::<_, TermIndexError>(
+                rows.into_iter()
+                    .map(|(row, score)| (row.get(), score))
+                    .collect(),
+            )
+        }
+    });
+    let rows = try_join_all(mapped).await?;
+    for ((_, hits), rows) in resolved.iter_mut().zip(rows) {
+        *hits = rows;
+    }
     Ok(Some(TierSelection {
         bounds: bounds
             .into_iter()
@@ -467,25 +485,40 @@ pub(crate) async fn select(
     }))
 }
 
-/// Add term `t`'s entry for row `row` of slot `s` to the candidates,
-/// unless the row is deleted.
+/// Open `entry`'s reader through the reader cache.
+async fn open_reader_of(
+    manifest: &ManifestSnapshot,
+    entry: &SuperfileEntry,
+) -> Result<Arc<SuperfileReader>, TermIndexError> {
+    let store = Arc::clone(&manifest.options.store);
+    dispatch::open_reader(
+        &store,
+        manifest.options.disk_cache.as_ref(),
+        manifest.options.storage.as_ref(),
+        entry,
+        ReadIntent::Stream,
+    )
+    .await
+    .map_err(TermIndexError::Open)
+}
+
+/// Add term `t`'s entry for document `doc` of slot `s` to the
+/// candidates. A head names documents by the superfile's own id, which a
+/// slot's deleted rows are not keyed by: a slot with deletions is bounded
+/// by its candidates but sets no threshold and is answered by its open.
 #[allow(clippy::too_many_arguments)]
 fn absorb(
     candidates: &mut HashMap<(u32, u32), Candidate>,
-    slots: &[Slot],
     weights: &Weights,
     nt: usize,
     t: usize,
     s: usize,
-    row: u32,
+    doc: u32,
     tf: u32,
     len: u8,
 ) {
-    if slots[s].deny.as_ref().is_some_and(|d| d.contains(row)) {
-        return;
-    }
     let c = candidates
-        .entry((s as u32, row))
+        .entry((s as u32, doc))
         .or_insert_with(|| Candidate {
             len,
             known: 0,
@@ -505,13 +538,15 @@ fn absorb(
 /// term; `NEG_INFINITY` when fewer than `k` do.
 fn kth_lower_bound(
     candidates: &HashMap<(u32, u32), Candidate>,
+    slots: &[Slot],
     weights: &Weights,
     k: usize,
     lb_slack: f32,
 ) -> f32 {
     let mut lbs: Vec<f32> = candidates
-        .values()
-        .filter(|c| weights.counts(c))
+        .iter()
+        .filter(|((s, _), c)| slots[*s as usize].deny.is_none() && weights.counts(c))
+        .map(|(_, c)| c)
         .map(|c| c.sum() * lb_slack)
         .collect();
     if lbs.len() < k {
@@ -562,7 +597,7 @@ fn slot_bounds(
     for (&(s, _), c) in candidates {
         let slot = &slots[s as usize];
         let (lb, ub) = &mut out[s as usize];
-        if weights.counts(c) {
+        if slot.deny.is_none() && weights.counts(c) {
             *lb = lb.max(c.sum() * lb_slack);
         }
         *ub = ub.max(candidate_bound(slot, heads, weights, c));
@@ -905,7 +940,8 @@ fn resolve(
     let whole: Vec<bool> = slots
         .iter()
         .map(|slot| {
-            slot.heads.iter().flatten().next().is_some()
+            slot.deny.is_none()
+                && slot.heads.iter().flatten().next().is_some()
                 && slot.heads.iter().flatten().all(|&h| heads[h].whole())
         })
         .collect();
@@ -949,7 +985,7 @@ fn theta_id_max(
     }
     let mut top: Vec<(f32, i128)> = candidates
         .iter()
-        .filter(|(_, c)| weights.counts(c))
+        .filter(|((s, _), c)| slots[*s as usize].deny.is_none() && weights.counts(c))
         .map(|(&(s, _), c)| (c.sum() * lb_slack, slots[s as usize].id_max))
         .filter(|(lb, _)| *lb >= theta)
         .collect();

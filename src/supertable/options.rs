@@ -482,11 +482,10 @@ pub struct SupertableOptions {
     /// ranked multi-term query opens the superfiles that hold its top k
     /// rather than every one its terms appear in. The cap on a term's
     /// entries across all superfiles: when the superfiles' heads together
-    /// exceed it, every head is cut to the same shallower depth. `None`
-    /// keeps no tiers: the index's level heads — one per term and layer —
-    /// choose the superfiles instead. `Some(0)` keeps neither, and the
-    /// ranked path opens by score ceiling alone, as it did before tiers
-    /// existed.
+    /// exceed it. Tables no longer keep tiers: the index's level heads —
+    /// one per term and layer — choose the superfiles instead, and this
+    /// option only turns them off: `Some(0)` keeps no heads, and the ranked
+    /// path opens by score ceiling alone, as it did before tiers existed.
     pub term_tier_entries_per_term: Option<u64>,
     /// Documents each superfile keeps per term in its head (see
     /// `term_tier_entries_per_term`), clamped to `1..=4096`. `None` is the
@@ -1187,11 +1186,11 @@ impl SupertableOptions {
         // Every superfile keeps its head to the same depth, at least one
         // document and at most what the index holds; the cap on a term's
         // entries binds only when the caller sets one.
-        // Level heads replace tiers: a table keeps none unless the caller
-        // caps a term's tier entries, and keeps no heads either when the
-        // cap is zero, so the ranked path opens by its ceilings alone.
+        // Level heads replace tiers: a table keeps none, and keeps no heads
+        // either when the caller caps a term's tier entries at zero, so the
+        // ranked path opens by its ceilings alone.
         BuildPolicy {
-            tier_entries_per_term: self.term_tier_entries_per_term.unwrap_or(0),
+            tier_entries_per_term: 0,
             level_heads: self.term_tier_entries_per_term != Some(0),
             head_depth_per_superfile: self
                 .term_head_depth

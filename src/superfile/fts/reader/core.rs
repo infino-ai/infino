@@ -5282,7 +5282,16 @@ mod tests {
                         .await
                         .expect("term facts");
                     let fact = facts[0].as_ref().expect("the term is in the file");
-                    sorted(fact.head.docs.iter().map(|&(row, _, _)| row))
+                    // The head names documents by blob id; its rows are
+                    // read from the map as a query's answer is.
+                    let docs = fact
+                        .head
+                        .docs
+                        .iter()
+                        .map(|&(doc, _, _)| (FtsDocId::new(doc), 0.0))
+                        .collect();
+                    let rows = r.hits_to_rows_async(docs).await.expect("translate");
+                    sorted(rows.into_iter().map(|(row, _)| row.get()))
                 }
                 other => unreachable!("no case {other}"),
             };
