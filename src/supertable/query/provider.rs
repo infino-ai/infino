@@ -1261,7 +1261,7 @@ impl SupertableProvider {
         }
         let mut live = 0u64;
         for entry in &survivors {
-            live += entry.n_docs - self.deleted_rows(entry.superfile_id, now)?.len();
+            live += self.live_rows(entry, now)?;
         }
         Ok((live, HashSet::new()))
     }
@@ -1510,6 +1510,50 @@ impl SupertableProvider {
                 })
                 .collect(),
         ))
+    }
+
+    /// The rows of `entry` not deleted as of `now`.
+    fn live_rows(&self, entry: &SuperfileEntry, now: Instant) -> Result<u64, QueryError> {
+        let deleted = self.deleted_rows(entry.superfile_id, now)?.len();
+        Ok(entry.n_docs.saturating_sub(deleted))
+    }
+
+    /// The first of `survivors`, in order, whose live rows reach `limit`. Deletes are read a group
+    /// of files at a time, each at least twice the last, so mostly deleted files take few rounds.
+    async fn first_holding(
+        &self,
+        mut survivors: Vec<Arc<SuperfileEntry>>,
+        limit: usize,
+        now: Instant,
+    ) -> DfResult<Vec<Arc<SuperfileEntry>>> {
+        let want = limit as u64;
+        let mut live = 0u64;
+        let mut kept = 0;
+        let mut group_files = 1;
+        while live < want && kept < survivors.len() {
+            let start = kept;
+            let mut end = start;
+            let mut held = 0u64;
+            // Take files until their rows, deletes ignored, cover the rows still missing, and at
+            // least `group_files` of them.
+            while end < survivors.len()
+                && (live.saturating_add(held) < want || end - start < group_files)
+            {
+                held = held.saturating_add(survivors[end].n_docs);
+                end += 1;
+            }
+            group_files = group_files.saturating_mul(2);
+            self.prefetch_tombstones(&survivors[start..end], now).await;
+            for entry in &survivors[start..end] {
+                live = live.saturating_add(self.live_rows(entry, now)?);
+                kept += 1;
+                if live >= want {
+                    break;
+                }
+            }
+        }
+        survivors.truncate(kept);
+        Ok(survivors)
     }
 
     /// Each survivor's live rows whose key lies in `lo..=hi`, from its range
@@ -2255,6 +2299,22 @@ impl TableProvider for SupertableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        // A plain `LIMIT k` (no filter, sort or count) reads only the first files holding `k` live
+        // rows, with deletes read once so the rows it counts live are the rows the scan returns.
+        let bare_limit = limit.is_some()
+            && filters.is_empty()
+            && self.top_k.is_none()
+            && self.count_range.is_none()
+            && self.read_rows.is_none();
+        if bare_limit && self.tombstones_read.is_none() {
+            // The same provider with deletes read once, keeping this scan's store registration.
+            let once = Self {
+                tombstones_read: Some(Arc::default()),
+                store_url: self.store_url.clone(),
+                ..self.sibling()
+            };
+            return once.scan(state, projection, filters, limit).await;
+        }
         // The catalog opens a table without statistics only for a statement it finds uses none
         // (`uses_statistics`). A filter it missed reads them here first: slower, never wrong.
         if !filters.is_empty() && !self.manifest.statistics_loaded() {
@@ -2295,6 +2355,16 @@ impl TableProvider for SupertableProvider {
         select_span.record("survivors", survivor_entries.len());
         trace::end(select_span);
 
+        // One `Instant::now()` for the whole scan so every per-superfile
+        // tombstone lookup shares the same `SidecarCache` TTL
+        // reference.
+        let now = Instant::now();
+
+        let survivor_entries = match limit {
+            Some(limit) if bare_limit => self.first_holding(survivor_entries, limit, now).await?,
+            _ => survivor_entries,
+        };
+
         // Nothing survived (empty table, or every superfile pruned):
         // a schema-correct empty scan. EmptyExec yields one
         // partition / zero rows, so `COUNT(*)` is 0 and `SELECT *`
@@ -2312,11 +2382,6 @@ impl TableProvider for SupertableProvider {
             };
             return Ok(Arc::new(EmptyExec::new(projected)));
         }
-
-        // One `Instant::now()` for the whole scan so every per-superfile
-        // tombstone lookup shares the same `SidecarCache` TTL
-        // reference.
-        let now = Instant::now();
 
         // Every surviving superfile's tombstones, before the per-superfile
         // sweep below.
@@ -3590,8 +3655,8 @@ mod tests {
 
     use arrow::util::display::{ArrayFormatter, FormatOptions};
     use arrow_array::{
-        Float32Array, Float64Array, Int64Array, LargeStringArray, RecordBatch, RecordBatchIterator,
-        TimestampSecondArray,
+        Array, Float32Array, Float64Array, Int64Array, LargeStringArray, RecordBatch,
+        RecordBatchIterator, StringArray, TimestampSecondArray,
     };
     use arrow_schema::{DataType, Field, Schema, TimeUnit};
     use datafusion::{
@@ -6863,5 +6928,130 @@ mod tests {
         drop(ctx);
         assert_eq!(cache.stats().n_entries, 0, "its end lets them go");
         assert_eq!(budget.charged(), 0, "each once");
+    }
+
+    fn planned_files(reader: &SupertableReader, sql: &str) -> usize {
+        let plan: String = reader
+            .query_sql(&format!("EXPLAIN {sql}"))
+            .expect("explain")
+            .iter()
+            .flat_map(|b| {
+                let plans = b
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("plan column")
+                    .clone();
+                (0..plans.len()).map(move |i| plans.value(i).to_owned())
+            })
+            .collect();
+        // Each file the scan reads shows in the plan as `seg-<36-character id>`.
+        let mut files: Vec<&str> = plan
+            .split("seg-")
+            .skip(1)
+            .filter_map(|rest| rest.get(..36))
+            .collect();
+        files.sort_unstable();
+        files.dedup();
+        files.len()
+    }
+
+    #[test]
+    fn a_plain_limit_reads_only_the_superfiles_that_hold_its_rows() {
+        // 4 files of 2,000 rows, before and after optimize. Deletes keep 300 rows of the oldest
+        // file, which a scan reads first, and drop every 11th row.
+        //  - Every `LIMIT` returns that many distinct live rows, or all of them when it is larger.
+        //  - `LIMIT 10`, and a page of exactly the oldest file's live rows, read one file.
+        //  - One row more reads two files, and a page of every live row reads all of them.
+        // This test pins that a plain `LIMIT` opens only the files that hold its live rows.
+        const LIMIT_FILES: i64 = 4;
+        const LIMIT_ROWS_PER_FILE: i64 = 2000;
+        const LIMIT_OLDEST_KEPT: i64 = 300;
+        const LIMIT_DELETED_EVERY: i64 = 11;
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let schema = Arc::new(Schema::new(vec![Field::new("seq", DataType::Int64, false)]));
+        let options = SupertableOptions::new(Arc::clone(&schema), vec![], vec![])
+            .expect("options")
+            .with_storage(storage);
+        let st = Supertable::create(options).expect("create");
+        for file in 0..LIMIT_FILES {
+            let seqs: Vec<i64> =
+                (file * LIMIT_ROWS_PER_FILE..(file + 1) * LIMIT_ROWS_PER_FILE).collect();
+            let batch =
+                RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(Int64Array::from(seqs))])
+                    .expect("batch");
+            let mut writer = st.writer().expect("writer");
+            writer.append(&batch).expect("append");
+            writer.commit().expect("commit");
+        }
+        st.delete(
+            col("seq")
+                .gt_eq(lit(LIMIT_OLDEST_KEPT))
+                .and(col("seq").lt(lit(LIMIT_ROWS_PER_FILE)))
+                .or((col("seq") % lit(LIMIT_DELETED_EVERY)).eq(lit(0_i64))),
+        )
+        .expect("delete");
+        let live: Vec<i64> = (0..LIMIT_FILES * LIMIT_ROWS_PER_FILE)
+            .filter(|s| {
+                (*s < LIMIT_OLDEST_KEPT || *s >= LIMIT_ROWS_PER_FILE)
+                    && s % LIMIT_DELETED_EVERY != 0
+            })
+            .collect();
+        let first_live = live.iter().filter(|s| **s < LIMIT_ROWS_PER_FILE).count();
+        for pass in ["appended", "optimized"] {
+            if pass == "optimized" {
+                st.optimize(&OptimizeOptions::default()).expect("optimize");
+            }
+            let reader = st.reader().expect("reader");
+            let files = reader.manifest().superfiles.len();
+            for limit in [
+                0,
+                1,
+                10,
+                first_live,
+                first_live + 1,
+                live.len(),
+                live.len() + 1,
+            ] {
+                let sql = format!("SELECT seq FROM supertable LIMIT {limit}");
+                let batches = reader.query_sql(&sql).expect("sql");
+                let mut got: Vec<i64> = batches
+                    .iter()
+                    .flat_map(|b| {
+                        let seqs = b
+                            .column(0)
+                            .as_any()
+                            .downcast_ref::<Int64Array>()
+                            .expect("seq")
+                            .clone();
+                        (0..seqs.len()).map(move |i| seqs.value(i))
+                    })
+                    .collect();
+                assert_eq!(got.len(), limit.min(live.len()), "{pass}: {sql}");
+                got.sort_unstable();
+                got.dedup();
+                assert_eq!(
+                    got.len(),
+                    limit.min(live.len()),
+                    "{pass}: {sql}: repeated rows"
+                );
+                assert!(
+                    got.iter().all(|s| live.binary_search(s).is_ok()),
+                    "{pass}: {sql}: a deleted row"
+                );
+            }
+            let small = "SELECT seq FROM supertable LIMIT 10";
+            assert_eq!(planned_files(&reader, small), 1, "{pass}: {small}");
+            if pass == "appended" {
+                let first = format!("SELECT seq FROM supertable LIMIT {first_live}");
+                assert_eq!(planned_files(&reader, &first), 1, "{pass}: {first}");
+                let more = format!("SELECT seq FROM supertable LIMIT {}", first_live + 1);
+                assert_eq!(planned_files(&reader, &more), 2, "{pass}: {more}");
+            }
+            let every = format!("SELECT seq FROM supertable LIMIT {}", live.len());
+            assert_eq!(planned_files(&reader, &every), files, "{pass}: {every}");
+        }
     }
 }
