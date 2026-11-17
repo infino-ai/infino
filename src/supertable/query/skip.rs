@@ -1752,11 +1752,9 @@ mod tests {
     mod exact_values_through_sql {
         use arrow_array::{Array, Int64Array, LargeStringArray, RecordBatch};
         use datafusion::prelude::{col, lit};
-
         use tempfile::TempDir;
 
         use super::*;
-
         use crate::{
             IndexSpec,
             catalog::{Connection, connect},
