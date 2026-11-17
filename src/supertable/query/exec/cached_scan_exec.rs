@@ -901,6 +901,30 @@ mod tests {
             .collect()
     }
 
+    /// How many of `reader`'s superfiles have `column` of their first row
+    /// group, the only one each holds, kept in `kept`.
+    fn superfiles_keeping(
+        reader: &SupertableReader,
+        kept: &DecodedColumnCache,
+        column: &str,
+    ) -> usize {
+        let manifest = reader.manifest();
+        let schema_id = manifest.table_schema().schema_id();
+        manifest
+            .superfiles
+            .iter()
+            .filter(|entry| {
+                kept.get(&ColumnKey {
+                    uri: entry.uri,
+                    schema_id,
+                    column: column.to_owned(),
+                    row_group: 0,
+                })
+                .is_some()
+            })
+            .count()
+    }
+
     /// A scan the index narrows in some superfiles only reads them through
     /// kept columns, and answers as the same table keeping no columns does:
     /// the plain scan and `ORDER BY ... LIMIT` both ways (the path that can
@@ -926,15 +950,20 @@ mod tests {
         let plan = explained(&without, PARTLY_NARROWED);
         assert!(!plan.contains("CachedScanExec"), "{plan}");
 
-        // First read: only the whole superfile's columns are kept.
+        // First read: `k` is kept for the superfile read whole only. (The
+        // delete that built the table may have kept `seq` already.)
+        assert_eq!(superfiles_keeping(&with, &kept, "k"), 0);
         assert_eq!(seqs_of(&with, PARTLY_NARROWED), live_x());
-        let whole_only = kept.len();
-        assert!(whole_only > 0, "the superfile read whole keeps its columns");
+        assert_eq!(
+            superfiles_keeping(&with, &kept, "k"),
+            1,
+            "the narrowed row group's first read keeps nothing"
+        );
         // Second read of the narrowed row group: its columns are kept too.
         assert_eq!(seqs_of(&with, PARTLY_NARROWED), live_x());
         assert_eq!(
-            kept.len(),
-            2 * whole_only,
+            superfiles_keeping(&with, &kept, "k"),
+            2,
             "the second read keeps the narrowed row group"
         );
 
@@ -983,17 +1012,22 @@ mod tests {
         // A scan narrowed nowhere keeps `seq` of both row groups.
         let every = "SELECT seq FROM supertable ORDER BY seq";
         assert_eq!(seqs_of(&with, every), seqs_of(&without, every));
-        assert_eq!(kept.len(), 2, "seq of both row groups");
+        assert_eq!(superfiles_keeping(&with, &kept, "seq"), 2);
+        assert_eq!(superfiles_keeping(&with, &kept, "k"), 0);
         // `k` is kept for the row group read whole only; the narrowed one's
         // `seq` comes from the kept column, its `k` from its pages.
         let got = seqs_of(&with, PARTLY_NARROWED);
         assert_eq!(got, seqs_of(&without, PARTLY_NARROWED));
         assert_eq!(got, live_x());
-        assert_eq!(kept.len(), 3, "k of the row group read whole");
+        assert_eq!(
+            superfiles_keeping(&with, &kept, "k"),
+            1,
+            "k of the row group read whole only"
+        );
     }
 
     /// A scan the index narrows in every superfile reads their selected
-    /// pages through the Parquet scan, never kept columns, and answers as
+    /// pages through the Parquet scan, keeping none of its columns, and answers as
     /// the table keeping no columns does.
     #[test]
     fn a_scan_narrowed_in_every_superfile_reads_the_files() {
@@ -1016,6 +1050,6 @@ mod tests {
             assert_eq!(got, seqs_of(&without, FULLY_NARROWED), "{pass}");
             assert_eq!(got, vec![200, 8200], "{pass}");
         }
-        assert_eq!(kept.len(), 0, "no column is kept");
+        assert_eq!(superfiles_keeping(&with, &kept, "k"), 0, "k is not kept");
     }
 }
