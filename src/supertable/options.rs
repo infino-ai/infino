@@ -1567,10 +1567,10 @@ impl SupertableOptions {
             // under a sibling subdirectory, with a limit of its own, charged
             // to the disk cache's budget.
             let manifest_cache_root = cache_root.join(MANIFEST_CACHE_SUBDIR);
-            let manifest_cache = MetadataDiskCache::new_charged_to(
+            let manifest_cache = MetadataDiskCache::new(
                 manifest_cache_root,
                 cfg.storage.manifest_disk_budget_bytes,
-                Arc::clone(&cache),
+                Some(Arc::clone(&cache)),
             )
             .map_err(|e| BuildError::Store(format!("manifest disk cache construction: {e}")))?;
             self.disk_cache = Some(cache);

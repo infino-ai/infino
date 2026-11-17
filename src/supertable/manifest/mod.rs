@@ -8202,7 +8202,7 @@ mod tests {
             let cache_root = std::env::temp_dir()
                 .join("infino-manifest-cache-loader-test-disk_cache_hit_second_loader");
             let _ = std::fs::remove_dir_all(&cache_root);
-            let cache = MetadataDiskCache::new(cache_root.clone(), 1 << 20).expect("cache");
+            let cache = MetadataDiskCache::new(cache_root.clone(), 1 << 20, None).expect("cache");
 
             // Loader A: cold — one storage GET, cache populated.
             let loader_a = ManifestPartLoader::new_with_cache(
@@ -8245,7 +8245,7 @@ mod tests {
             let cache_root = std::env::temp_dir()
                 .join("infino-manifest-cache-loader-test-grows_to_hold_every_part");
             let _ = std::fs::remove_dir_all(&cache_root);
-            let cache = MetadataDiskCache::new(cache_root.clone(), 1).expect("cache");
+            let cache = MetadataDiskCache::new(cache_root.clone(), 1, None).expect("cache");
 
             for _ in 0..2 {
                 let loader = ManifestPartLoader::new_with_cache(
@@ -8283,7 +8283,7 @@ mod tests {
             let cache_root =
                 std::env::temp_dir().join("infino-manifest-cache-loader-test-smaller_list_evicts");
             let _ = std::fs::remove_dir_all(&cache_root);
-            let cache = MetadataDiskCache::new(cache_root.clone(), 0).expect("cache");
+            let cache = MetadataDiskCache::new(cache_root.clone(), 0, None).expect("cache");
 
             let old_list = fresh_list(old_entries);
             let loader = ManifestPartLoader::new_with_cache(
@@ -9978,6 +9978,7 @@ mod tests {
         let cache = MetadataDiskCache::new(
             dir.path().join("metadata-cache"),
             SECTION_TEST_CACHE_BUDGET_BYTES,
+            None,
         )
         .expect("cache");
         let opts = SupertableOptions::new(simple_schema(), vec![], vec![])

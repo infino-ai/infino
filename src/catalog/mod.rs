@@ -2137,10 +2137,10 @@ fn build_disk_cache(
             InfinoError::Io(e.to_string())
         }
     })?;
-    let manifest_cache = MetadataDiskCache::new_charged_to(
+    let manifest_cache = MetadataDiskCache::new(
         table_root.join(MANIFEST_CACHE_SUBDIR),
         MANIFEST_CACHE_BUDGET_BYTES,
-        Arc::clone(&cache),
+        Some(Arc::clone(&cache)),
     )
     .map_err(|e| InfinoError::Io(e.to_string()))?;
     Ok(Some((cache, manifest_cache)))

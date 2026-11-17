@@ -34,7 +34,7 @@
 //! Superfile *byte content* is cached one layer over, by
 //! [`DiskCacheStore`]. Each keeps to a limit of its own, and a metadata
 //! cache opened beside a table's disk cache also charges what it holds to
-//! that cache's budget ([`MetadataDiskCache::new_charged_to`]), so the one
+//! that cache's budget ([`MetadataDiskCache::new`]), so the one
 //! budget covers everything the table keeps on the disk.
 //!
 //! ## Objects read in place
@@ -181,22 +181,12 @@ impl MetadataDiskCache {
     /// pre-existing `part-<hex>.avro.zst` files and seeds the
     /// accounting index from them, so a freshly-opened process reuses
     /// the parts a prior run cached (restart survival).
-    pub fn new(cache_root: PathBuf, budget_bytes: u64) -> io::Result<Arc<Self>> {
-        Self::open(cache_root, budget_bytes, None)
-    }
-
-    /// [`Self::new`], charging what the cache holds to the budget of
-    /// `table_cache`, the disk cache of the same table. What is on disk
-    /// already is charged at once.
-    pub(crate) fn new_charged_to(
-        cache_root: PathBuf,
-        budget_bytes: u64,
-        table_cache: Arc<DiskCacheStore>,
-    ) -> io::Result<Arc<Self>> {
-        Self::open(cache_root, budget_bytes, Some(table_cache))
-    }
-
-    fn open(
+    ///
+    /// With `table_cache`, the disk cache of the same table, what this
+    /// cache holds is charged to that cache's budget, and what is on disk
+    /// already is charged at once. `None` for a cache with no disk cache
+    /// beside it.
+    pub fn new(
         cache_root: PathBuf,
         budget_bytes: u64,
         table_cache: Option<Arc<DiskCacheStore>>,
@@ -229,8 +219,11 @@ impl MetadataDiskCache {
     /// configured budget and charged to the same disk cache. What this table
     /// holds is not carried over; the hidden index holds its own objects.
     pub(crate) fn for_hidden_index(&self) -> io::Result<Arc<Self>> {
+        // A table that lost the race to create its hidden index opens this
+        // folder a second time while the first cache over it is still
+        // alive. Both then charge the files in it until the first drops.
         let parent = self.cache_root.parent().unwrap_or(&self.cache_root);
-        Self::open(
+        Self::new(
             parent.join(HIDDEN_INDEX_CACHE_SUBDIR),
             self.configured_bytes,
             self.table_cache.clone(),
@@ -367,31 +360,46 @@ impl MetadataDiskCache {
         if size > self.budget_bytes() {
             return false;
         }
+        // One task for the whole insert, so a caller dropped midway (a
+        // cancelled query) leaves the cache as if it had waited. A join
+        // error is a panic or a runtime shutting down. The cache is
+        // best-effort either way, so the caller carries on.
+        let cache = Arc::clone(self);
+        tokio::spawn(async move { cache.insert(hash, bytes).await })
+            .await
+            .unwrap_or(false)
+    }
+
+    /// Reserve room for `bytes`, charge the table's disk budget, and write
+    /// them under `hash`. Returns whether they are indexed afterwards.
+    async fn insert(self: Arc<Self>, hash: ContentHash, bytes: Bytes) -> bool {
+        let size = bytes.len() as u64;
+        // This cache's own room first. Reserving can evict many files at
+        // once (the budget drops when the table's manifest shrinks), so it
+        // runs as a blocking task, and what it evicts is given back to the
+        // table's disk budget before that is charged: a cache that is full
+        // swaps old metadata for new and costs the table's cache files
+        // nothing.
+        let cache = Arc::clone(&self);
+        if !spawn_blocking(move || cache.reserve(size))
+            .await
+            .unwrap_or(false)
+        {
+            return false;
+        }
         // The table's disk budget has to hold it too, which evicts cache
         // files to make room. When it cannot, the object is not cached, as
         // when this cache's own budget is full.
         if let Some(table_cache) = &self.table_cache
             && table_cache.charge_metadata(size).await.is_err()
         {
+            // Reserved here and never charged there.
+            self.current_bytes.fetch_sub(size, Ordering::Release);
             return false;
         }
-        let cache = Arc::clone(self);
-        // Reserving can evict many files at once (the budget drops when the
-        // table's manifest shrinks), so it runs in the blocking task too.
-        // A join error is a panic or a runtime shutting down. The cache is
-        // best-effort either way, so the caller carries on.
-        spawn_blocking(move || {
-            if cache.reserve(size) {
-                return cache.write_reserved(hash, &bytes);
-            }
-            // Nothing was reserved here, so only the table's charge goes back.
-            if let Some(table_cache) = &cache.table_cache {
-                table_cache.release_metadata(size);
-            }
-            false
-        })
-        .await
-        .unwrap_or(false)
+        spawn_blocking(move || self.write_reserved(hash, &bytes))
+            .await
+            .unwrap_or(false)
     }
 
     /// Take `bytes` that left the disk, or were reserved and not written,
@@ -911,7 +919,7 @@ mod tests {
     async fn put_then_get_roundtrips() {
         let root = tmp_root("roundtrip");
         let _ = fs::remove_dir_all(&root);
-        let cache = MetadataDiskCache::new(root.clone(), 1 << 20).expect("cache");
+        let cache = MetadataDiskCache::new(root.clone(), 1 << 20, None).expect("cache");
 
         let bytes = b"compressed-part-bytes".to_vec();
         let h = hash_of(&bytes);
@@ -930,7 +938,7 @@ mod tests {
     async fn miss_on_unknown_hash() {
         let root = tmp_root("miss");
         let _ = fs::remove_dir_all(&root);
-        let cache = MetadataDiskCache::new(root.clone(), 1 << 20).expect("cache");
+        let cache = MetadataDiskCache::new(root.clone(), 1 << 20, None).expect("cache");
         let h = hash_of(b"never-inserted");
         assert!(cache.get(&h).await.is_none());
         assert_eq!(cache.stats().n_misses, 1);
@@ -941,7 +949,7 @@ mod tests {
     fn the_budget_follows_what_the_cache_keeps_whole() {
         let root = tmp_root("kept-whole-budget");
         let _ = fs::remove_dir_all(&root);
-        let cache = MetadataDiskCache::new(root.clone(), 100).expect("cache");
+        let cache = MetadataDiskCache::new(root.clone(), 100, None).expect("cache");
         assert_eq!(cache.budget_bytes(), 100);
         // What is held comes on top of the configured budget, each hold with
         // a tenth of headroom.
@@ -961,7 +969,7 @@ mod tests {
     async fn a_smaller_manifest_evicts_what_no_load_reads_any_more() {
         let root = tmp_root("kept-whole-shrinks");
         let _ = fs::remove_dir_all(&root);
-        let cache = MetadataDiskCache::new(root.clone(), 0).expect("cache");
+        let cache = MetadataDiskCache::new(root.clone(), 0, None).expect("cache");
         let part = |tag: u8| Bytes::from(vec![tag; 100]);
         // An old manifest of four 100-byte parts.
         cache.keep_whole(KeptWhole::Manifest, 400);
@@ -988,7 +996,7 @@ mod tests {
     fn a_hidden_index_cache_starts_from_the_configured_budget() {
         let parent = tmp_root("hidden-budget");
         let _ = fs::remove_dir_all(&parent);
-        let user = MetadataDiskCache::new(parent.join("manifest-parts"), 100).expect("cache");
+        let user = MetadataDiskCache::new(parent.join("manifest-parts"), 100, None).expect("cache");
         user.keep_whole(KeptWhole::Manifest, 10_000);
         let hidden = user.for_hidden_index().expect("hidden cache");
         assert_eq!(
@@ -1003,7 +1011,7 @@ mod tests {
     async fn a_hidden_index_cache_keeps_its_own_entries() {
         let parent = tmp_root("hidden-index");
         let _ = fs::remove_dir_all(&parent);
-        let cache = MetadataDiskCache::new(parent.join("parts"), 1 << 20).expect("cache");
+        let cache = MetadataDiskCache::new(parent.join("parts"), 1 << 20, None).expect("cache");
         let hidden = cache.for_hidden_index().expect("hidden index cache");
         assert_eq!(hidden.budget_bytes(), cache.budget_bytes());
 
@@ -1024,7 +1032,7 @@ mod tests {
     async fn put_is_idempotent() {
         let root = tmp_root("idempotent");
         let _ = fs::remove_dir_all(&root);
-        let cache = MetadataDiskCache::new(root.clone(), 1 << 20).expect("cache");
+        let cache = MetadataDiskCache::new(root.clone(), 1 << 20, None).expect("cache");
         let bytes = b"abc".to_vec();
         let h = hash_of(&bytes);
         cache.put(h, Bytes::copy_from_slice(&bytes)).await;
@@ -1038,7 +1046,7 @@ mod tests {
     async fn oversized_part_is_not_cached() {
         let root = tmp_root("oversized");
         let _ = fs::remove_dir_all(&root);
-        let cache = MetadataDiskCache::new(root.clone(), 4).expect("cache");
+        let cache = MetadataDiskCache::new(root.clone(), 4, None).expect("cache");
         let bytes = b"way too big for a 4 byte budget".to_vec();
         let h = hash_of(&bytes);
         cache.put(h, Bytes::copy_from_slice(&bytes)).await;
@@ -1052,7 +1060,7 @@ mod tests {
         let root = tmp_root("lru");
         let _ = fs::remove_dir_all(&root);
         // Budget fits two 10-byte parts but not three.
-        let cache = MetadataDiskCache::new(root.clone(), 25).expect("cache");
+        let cache = MetadataDiskCache::new(root.clone(), 25, None).expect("cache");
         let a = vec![1u8; 10];
         let b = vec![2u8; 10];
         let c = vec![3u8; 10];
@@ -1074,7 +1082,7 @@ mod tests {
     async fn a_removed_entry_leaves_the_disk_and_the_budget() {
         let root = tmp_root("remove");
         let _ = fs::remove_dir_all(&root);
-        let cache = MetadataDiskCache::new(root.clone(), 1 << 20).expect("cache");
+        let cache = MetadataDiskCache::new(root.clone(), 1 << 20, None).expect("cache");
         let bytes = b"superseded-bytes".to_vec();
         let h = hash_of(&bytes);
         cache.put(h, Bytes::copy_from_slice(&bytes)).await;
@@ -1094,7 +1102,7 @@ mod tests {
     async fn corrupt_file_is_treated_as_miss() {
         let root = tmp_root("corrupt");
         let _ = fs::remove_dir_all(&root);
-        let cache = MetadataDiskCache::new(root.clone(), 1 << 20).expect("cache");
+        let cache = MetadataDiskCache::new(root.clone(), 1 << 20, None).expect("cache");
         let bytes = b"genuine-bytes".to_vec();
         let h = hash_of(&bytes);
         cache.put(h, Bytes::copy_from_slice(&bytes)).await;
@@ -1117,11 +1125,11 @@ mod tests {
         let bytes = b"survives-restart".to_vec();
         let h = hash_of(&bytes);
         {
-            let cache = MetadataDiskCache::new(root.clone(), 1 << 20).expect("cache");
+            let cache = MetadataDiskCache::new(root.clone(), 1 << 20, None).expect("cache");
             cache.put(h, Bytes::copy_from_slice(&bytes)).await;
         }
         // New cache over the same root: index rebuilt from disk.
-        let reopened = MetadataDiskCache::new(root.clone(), 1 << 20).expect("reopen");
+        let reopened = MetadataDiskCache::new(root.clone(), 1 << 20, None).expect("reopen");
         assert_eq!(reopened.stats().n_entries, 1);
         assert_eq!(reopened.stats().current_bytes, bytes.len() as u64);
         assert_eq!(reopened.get(&h).await.expect("hit after restart"), bytes);
@@ -1148,8 +1156,8 @@ mod tests {
     fn writes_of_one_part_use_distinct_temp_files() {
         let root = tmp_root("distinct-tmp");
         let _ = fs::remove_dir_all(&root);
-        let cache = MetadataDiskCache::new(root.clone(), 1 << 20).expect("cache");
-        let other = MetadataDiskCache::new(root.clone(), 1 << 20).expect("other cache");
+        let cache = MetadataDiskCache::new(root.clone(), 1 << 20, None).expect("cache");
+        let other = MetadataDiskCache::new(root.clone(), 1 << 20, None).expect("other cache");
         let h = hash_of(b"part");
         assert_ne!(cache.tmp_path(&h), cache.tmp_path(&h));
         assert_ne!(cache.tmp_path(&h), other.tmp_path(&h));
@@ -1169,7 +1177,7 @@ mod tests {
     async fn a_put_dropped_midway_still_lands_indexed_and_charged() {
         let root = tmp_root("dropped-put");
         let _ = fs::remove_dir_all(&root);
-        let cache = MetadataDiskCache::new(root.clone(), 1 << 20).expect("cache");
+        let cache = MetadataDiskCache::new(root.clone(), 1 << 20, None).expect("cache");
         let bytes = b"compressed-part-bytes".to_vec();
         let h = hash_of(&bytes);
 
