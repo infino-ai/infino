@@ -47,7 +47,7 @@ use crate::{
     supertable::{
         error::QueryError,
         handle::{Supertable, SupertableReader},
-        manifest::{SuperfileEntry, SuperfileUri},
+        manifest::{SuperfileEntry, SuperfileUri, summaries::ExactLiterals},
         query::{
             SuperfileHit,
             candidate::single_range,
@@ -463,6 +463,9 @@ impl SupertableReader {
         let guard = ColumnTypeGuard::new(manifest, field);
         // The walk's files, not the snapshot's list, which a lazily opened table holds in part.
         let entries = files;
+        // `None` when a statement would cast the column to compare it with a literal (a string
+        // column against a number): then no table counts the literals and each file falls back.
+        let exact = ExactLiterals::new(&literals, column_type);
         if entries.iter().any(|entry| guard.stats_are_stale(entry)) {
             return unknown;
         }
@@ -479,7 +482,7 @@ impl SupertableReader {
             if stats.all_null() {
                 continue;
             }
-            match stats.literal_count(&literals, column_type) {
+            match exact.as_ref().and_then(|exact| stats.literal_count(exact)) {
                 Some(held) => counted += held as f64,
                 None => {
                     uncounted +=
