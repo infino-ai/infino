@@ -880,6 +880,64 @@ pub(crate) fn ceiling_can_compete(ceiling: f32, floor: f32) -> bool {
 /// could do is lower the bar and open superfiles that need not be opened,
 /// which is slow and still correct, but defining it away is cheaper than
 /// reasoning about it at every call site.
+/// Wall a ranked query's opens may take before it answers approximately:
+/// past it, a query whose bounds leave too many superfiles in play keeps
+/// only those that can matter most.
+const APPROXIMATE_BUDGET_NS: u64 = 60_000_000_000;
+/// The score tolerance an over-budget query first takes: superfiles
+/// bounded within it of the threshold are left unopened.
+const APPROXIMATE_TOLERANCE: f32 = 0.05;
+/// What one open is taken to cost before the table has measured it: a
+/// cold read of a superfile's dictionary and postings from object storage.
+const UNMEASURED_OPEN_COST_NS: u64 = 50_000_000;
+/// Parts per million, the unit an approximate answer's gap is noted in.
+const PPM: f32 = 1_000_000.0;
+
+/// How many of a ranked query's superfiles to open, in descending bound
+/// order, and the gap that leaves.
+#[derive(Debug, PartialEq)]
+struct ApproximateCut {
+    keep: usize,
+    gap_ppm: u64,
+}
+
+/// Where to cut a ranked query's superfiles, `ceilings` in descending
+/// order, given its threshold `theta` and what an open costs. All of them
+/// while their opens fit [`APPROXIMATE_BUDGET_NS`] — the answer is exact.
+/// Past it, first those bounded more than [`APPROXIMATE_TOLERANCE`] above
+/// the threshold; still past it, as many of those as fit, best first. The
+/// gap is the largest bound left unopened over the threshold, less one: no
+/// missed document scores further above the returned k-th score, which is
+/// at least the threshold. Without a threshold no gap is known.
+fn approximate_cut(ceilings: &[f32], theta: f32, open_cost_ns: u64) -> ApproximateCut {
+    let per_open = match open_cost_ns {
+        0 => UNMEASURED_OPEN_COST_NS,
+        ns => ns,
+    };
+    let fit = (APPROXIMATE_BUDGET_NS / per_open).max(1) as usize;
+    let in_play = ceilings.iter().filter(|c| **c > theta).count();
+    if in_play <= fit {
+        return ApproximateCut {
+            keep: ceilings.len(),
+            gap_ppm: 0,
+        };
+    }
+    let past_tolerance = match theta.is_finite() && theta > 0.0 {
+        true => ceilings
+            .iter()
+            .filter(|c| **c > theta * (1.0 + APPROXIMATE_TOLERANCE))
+            .count(),
+        false => ceilings.len(),
+    };
+    let keep = past_tolerance.min(fit);
+    let gap_ppm = match ceilings.get(keep) {
+        None => 0,
+        Some(_) if !(theta.is_finite() && theta > 0.0) => u64::MAX,
+        Some(&next) => (((next / theta) - 1.0).max(0.0) * PPM).ceil() as u64,
+    };
+    ApproximateCut { keep, gap_ppm }
+}
+
 /// Completions of a prefix a ranked prefix search scores, at most: the
 /// most frequent ones across the table.
 const PREFIX_COMPLETIONS: usize = 64;
@@ -2053,6 +2111,7 @@ impl SupertableReader {
                 units = units.len(),
                 resolved = tracing::field::Empty,
                 ruled_out = tracing::field::Empty,
+                approximate_skipped = tracing::field::Empty,
             )
         });
         let fanout_records = fanout_span.clone();
@@ -2091,6 +2150,7 @@ impl SupertableReader {
                     m
                 });
             let reader = self;
+            let open_cost_ns = self.open_cost_ns();
             let selected = &selected;
             let pruned = &pruned;
             // What a selection does to the units it is handed: the
@@ -2159,6 +2219,18 @@ impl SupertableReader {
                             .then(yl.total_cmp(xl))
                             .then(a.id_min.cmp(&b.id_min))
                     });
+                    // Exact unless opening what is still in play would run
+                    // past the budget; then approximate, with the gap noted.
+                    let ceilings: Vec<f32> = keep.iter().map(|(_, p, _)| p.ceiling).collect();
+                    let cut = approximate_cut(&ceilings, selection.theta_lb, open_cost_ns);
+                    if cut.keep < keep.len() {
+                        let skipped = (keep.len() - cut.keep) as u64;
+                        keep.truncate(cut.keep);
+                        if let Some(stats) = &reader.op_stats {
+                            stats.add_approximate(skipped, cut.gap_ppm);
+                        }
+                        span.record("approximate_skipped", skipped);
+                    }
                     // The tiers' lower bound on the k-th score is a floor
                     // every kernel may prune against; the real scores that
                     // replace these placeholders only raise it. They stand
@@ -4464,7 +4536,45 @@ mod tests {
         time::Instant,
     };
 
+    use super::{APPROXIMATE_BUDGET_NS, ApproximateCut, UNMEASURED_OPEN_COST_NS, approximate_cut};
     use crate::supertable::manifest::ScalarStats;
+
+    /// Within the budget every superfile opens; past it, first those over
+    /// the tolerance, then as many as fit, and the gap bounds what is left.
+    #[test]
+    fn an_over_budget_query_keeps_what_can_matter_most() {
+        let per_open = APPROXIMATE_BUDGET_NS / 4;
+        // Four fit: every one opens, exactly.
+        let few = [3.0, 2.5, 2.0, 1.5];
+        assert_eq!(
+            approximate_cut(&few, 1.0, per_open),
+            ApproximateCut {
+                keep: 4,
+                gap_ppm: 0
+            }
+        );
+        // Bounds at or under the threshold never count against the budget.
+        let tied = [3.0, 2.0, 1.5, 1.2, 1.0, 1.0, 0.5];
+        assert_eq!(approximate_cut(&tied, 1.0, per_open).keep, 7);
+        // Six in play: the tolerance leaves those within 5% of the
+        // threshold, and the gap is the largest of them.
+        let near = [3.0, 2.0, 1.5, 1.2, 1.04, 1.02];
+        let cut = approximate_cut(&near, 1.0, per_open);
+        assert_eq!(cut.keep, 4);
+        assert!((cut.gap_ppm as f32 - 40_000.0).abs() < 2.0, "{cut:?}");
+        // Still past it: the four best open, the gap is the fifth's bound.
+        let many = [5.0, 4.0, 3.0, 2.5, 2.0, 1.5];
+        let cut = approximate_cut(&many, 1.0, per_open);
+        assert_eq!(cut.keep, 4);
+        assert_eq!(cut.gap_ppm, 1_000_000);
+        // Without a threshold the gap is unknown.
+        let cut = approximate_cut(&many, f32::NEG_INFINITY, per_open);
+        assert_eq!((cut.keep, cut.gap_ppm), (4, u64::MAX));
+        // Unmeasured opens are priced as cold reads.
+        let wide: Vec<f32> = (0..2000).map(|i| 3.0 - i as f32 * 1e-3).collect();
+        let fit = (APPROXIMATE_BUDGET_NS / UNMEASURED_OPEN_COST_NS) as usize;
+        assert_eq!(approximate_cut(&wide, 1.0, 0).keep, fit);
+    }
 
     /// A phrase's members are conjunctive, so a quoted phrase on its own
     /// prunes on all of them.

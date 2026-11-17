@@ -64,8 +64,6 @@ pub(crate) use build::{
 pub(crate) use build::{Built, build, first_contribution_difference};
 use build::{BuiltLayer, MERGE_RANGE_MIN_BYTES, build_layer, merge_layers_into, rebase_run};
 use bytes::Bytes;
-#[cfg(test)]
-pub(crate) use format::TierRef;
 use format::{Layer, SliceRef};
 pub(crate) use format::{Location, Posting, Root, Run, Slice, legacy_bound_as_key};
 use futures::{StreamExt, TryStreamExt, stream};
@@ -3351,27 +3349,6 @@ impl TermIndex {
             .into_iter()
             .map(|run| run.expect("every term resolved above"))
             .collect())
-    }
-
-    /// Every entry of a tier, block by block, in tier order (descending
-    /// impact by block). A query reads a prefix instead; this is the whole
-    /// thing, for tests.
-    #[cfg(test)]
-    pub(crate) async fn tier_entries(
-        &self,
-        object: &ContentHash,
-        tier: &TierRef,
-    ) -> Result<Vec<TierEntry>, TermIndexError> {
-        let mut out = tier.inline.clone();
-        let mut block = Vec::new();
-        let (chunks, _) = self.tier_chunks(object, &tier.chunks).await?;
-        for chunk in &chunks {
-            for (i, body) in chunk.bodies.iter().enumerate() {
-                chunk.dir.decode_block(i, body, &mut block)?;
-                out.extend_from_slice(&block);
-            }
-        }
-        Ok(out)
     }
 
     /// The chunks of one term's tier — each its parsed directory and every
