@@ -156,7 +156,7 @@ impl WalStoreError {
 }
 
 /// Storage prefix for WAL state-doc + sidecar objects.
-const WAL_DIR: &str = "wal/mutations";
+pub(crate) const WAL_DIR: &str = "wal/mutations";
 
 /// File extension for the state-doc JSON.
 const STATE_EXT: &str = "json";

@@ -1119,7 +1119,7 @@ mod fanout_tier_tests {
     use tempfile::TempDir;
     use tokio::{
         sync::Semaphore,
-        time::{Instant, sleep},
+        time::{Instant, sleep, timeout},
     };
 
     use super::*;
@@ -1272,21 +1272,26 @@ mod fanout_tier_tests {
         );
     }
 
-    /// Superfiles in the plan fixture: more than four windows of them, so the
-    /// cap ahead of a plan applies, and more than the cap lets through.
-    const PLANNED_COMMITS: usize = 40;
-    /// How long the fixture's plan takes to arrive: long after the opens
-    /// issued ahead of it, which do nothing, have finished.
+    /// Superfiles in the plan fixture: one window more than the fan-out needs
+    /// for the cap ahead of a plan to apply.
+    const PLANNED_COMMITS: usize = (PENDING_PLAN_MIN_WINDOWS + 1) * WIDE_WINDOW;
+    /// How long the fixture's plan waits, once the window's opens have all
+    /// started, before it arrives: time for an open the window should have
+    /// held back to start too.
     const PLAN_DELAY: Duration = Duration::from_millis(100);
-    /// A window the fixture exceeds four times over, no narrower than the
-    /// cap, so the cap is what holds.
-    const WIDE_WINDOW: usize = PENDING_PLAN_WINDOW;
+    /// How long the fixture's plan waits for the window's opens to start: far
+    /// past what a loaded machine takes, and bounded so that a fan-out that
+    /// starts fewer fails the assertion rather than hanging the test.
+    const WINDOW_START_WAIT: Duration = Duration::from_secs(30);
+    /// Twice the cap, so the cap and not the window is what holds the opens
+    /// ahead of the plan: without it as many as this would start.
+    const WIDE_WINDOW: usize = 2 * PENDING_PLAN_WINDOW;
 
     /// While a plan is still to come only a few opens run ahead of it, and
     /// the fan-out waits for the plan rather than ending when those finish:
     /// every unit the plan keeps is answered. The opens hold until the plan
     /// is in, as a cold open outlasts the plan's round trip, so what ran
-    /// ahead of the plan is exactly what the window let through.
+    /// ahead of the plan is exactly what the cap let through.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_pending_plan_holds_the_fanout_to_a_few_opens_until_it_arrives() {
         let dir = TempDir::new().expect("tempdir");
@@ -1314,12 +1319,18 @@ mod fanout_tier_tests {
         // Opens wait on this until the plan is in; the plan then lets every
         // unit through.
         let gate = Arc::new(Semaphore::new(0));
+        // A permit per open started, so the plan waits for the window's opens
+        // rather than for a time that a loaded machine can outrun.
+        let started = Arc::new(Semaphore::new(0));
         let plan: ReplanFuture<'_, (), ()> = {
             let opened = Arc::clone(&opened);
             let opened_before_plan = Arc::clone(&opened_before_plan);
             let gate = Arc::clone(&gate);
+            let started = Arc::clone(&started);
             Box::pin(async move {
-                tokio::time::sleep(PLAN_DELAY).await;
+                let window_started = started.acquire_many(PENDING_PLAN_WINDOW as u32);
+                let _ = timeout(WINDOW_START_WAIT, window_started).await;
+                sleep(PLAN_DELAY).await;
                 opened_before_plan.store(opened.load(Ordering::Acquire), Ordering::Release);
                 gate.add_permits(PLANNED_COMMITS);
                 let keep_all: Replan<'_, (), ()> = Box::new(|units| (units, Vec::new()));
@@ -1329,8 +1340,10 @@ mod fanout_tier_tests {
         let body = {
             let opened = Arc::clone(&opened);
             let gate = Arc::clone(&gate);
+            let started = Arc::clone(&started);
             move |_, _, _, _, ()| {
                 opened.fetch_add(1, Ordering::AcqRel);
+                started.add_permits(1);
                 let gate = Arc::clone(&gate);
                 async move {
                     gate.acquire().await.expect("gate open").forget();

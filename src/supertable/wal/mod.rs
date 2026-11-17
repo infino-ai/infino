@@ -64,7 +64,7 @@ pub(crate) mod unfinished;
 #[cfg(test)]
 mod record_after_tombstones_tests;
 #[cfg(test)]
-mod recovery_sweep_tests;
+pub(crate) mod recovery_sweep_tests;
 
 pub use persistence::{Etag, WalStore, WalStoreError};
 pub use state_doc::{

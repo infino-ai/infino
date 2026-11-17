@@ -34,7 +34,10 @@ use crate::{
         reader_cache::{
             block_source::BlockCachedSource,
             config::{ColdFetchMode, DiskCacheConfig},
-            disk::fill_wait::FillWaiters,
+            disk::{
+                fill_wait::FillWaiters,
+                scratch::{RunScratch, scratch_root},
+            },
         },
     },
 };
@@ -159,6 +162,13 @@ pub enum DiskCacheError {
     /// A lazy open never raises it: past the budget it stays a lazy entry.
     #[error("disk cache budget exceeded with no eligible victims")]
     BudgetExceeded,
+    /// The table's temp files beside the cache would take more than their share of the disk
+    /// budget. Nothing is evicted for a charge that fails this way.
+    #[error(
+        "no room for {needed} more bytes of temp files: they hold {charged} of the {cap} bytes \
+         the disk budget allows them"
+    )]
+    ScratchFull { needed: u64, charged: u64, cap: u64 },
     /// The memory budget is too small for a background download's first chunk, so the download
     /// stops before its first GET. If the chunk fits but queries hold the memory, it waits instead.
     #[error("memory budget share is too small for a background download's first chunk")]
@@ -389,6 +399,8 @@ pub struct CacheStats {
     pub n_madvise_calls: u64,
     /// Total count of entries dropped because GC deleted from objectstore.
     pub n_gc_drops: u64,
+    /// Bytes of `current_bytes` charged for the table's temp files beside the cache.
+    pub scratch_bytes: u64,
 }
 
 /// A cache file found on disk at open but not opened yet. Its bytes already count against the budget.
@@ -407,6 +419,9 @@ struct UnindexedFile {
 pub struct DiskCacheStore {
     storage: Arc<dyn StorageProvider>,
     config: DiskCacheConfig,
+    /// This store's folder of temporary files, see
+    /// [`Self::run_scratch_dir`].
+    run_scratch: RunScratch,
     started_at: Instant,
     cached: DashMap<SuperfileUri, Arc<CachedEntry>>,
     /// One in-flight walk per URI (tiers 2 to 4). The first caller to miss creates the cell and
@@ -449,6 +464,12 @@ pub struct DiskCacheStore {
     /// One-shot latch so an explicit budget smaller than the table
     /// footprint warns once, not on every reconcile.
     budget_warned: AtomicBool,
+    /// Bytes charged to the budget for the table's temp files beside the cache (see
+    /// [`ScratchCharge`]), parked ones included. Counted in `current_bytes`.
+    scratch_bytes: AtomicU64,
+    /// Charged bytes of temp files left on disk with nothing running that owns them, by the
+    /// folder holding them; see [`ScratchCharge::park`].
+    parked_scratch: DashMap<PathBuf, u64>,
     n_cold_fetches: AtomicU64,
     n_disk_reuses: AtomicU64,
     n_evictions: AtomicU64,
@@ -505,20 +526,33 @@ mod budget;
 mod fetch;
 mod fill_wait;
 mod read;
+mod scratch;
 mod sources;
 mod store_files;
 
-pub(crate) use budget::Reservation;
+pub(crate) use budget::{Reservation, ScratchCharge, ScratchRoom};
 pub(crate) use fetch::{open_batch_overlay, skip_background_fill};
 pub(crate) use sources::{
     ArcMmapOwner, mmap_readonly_bytes, mmap_temp_file_bytes, release_temp_file, temp_file_behind,
 };
 
 impl DiskCacheStore {
-    /// Where a build may spill its scratch: beside the cache, on the disk
-    /// sized for the table, rather than in the system temporary directory.
+    /// Where the table keeps work a later process resumes (a drain's
+    /// spill): beside the cache, on the disk sized for the table. Made on
+    /// each call, so it is there after the cache folder was cleared under an
+    /// open table.
     pub(crate) fn scratch_root(&self) -> PathBuf {
-        self.config.cache_root.join("scratch")
+        let dir = scratch_root(&self.config.cache_root);
+        let _ = fs::create_dir_all(&dir);
+        dir
+    }
+
+    /// Where this store's builds keep the temporary files that are of no
+    /// use once the process exits: its own folder under
+    /// [`Self::scratch_root`], which the next store to open removes if this
+    /// process dies with it.
+    pub(crate) fn run_scratch_dir(&self) -> PathBuf {
+        self.run_scratch.dir()
     }
 
     /// Whether this cache's checksum policy verifies a superfile a merge
@@ -546,6 +580,7 @@ impl DiskCacheStore {
             ));
         }
         fs::create_dir_all(&config.cache_root)?;
+        let run_scratch = RunScratch::open(&scratch_root(&config.cache_root))?;
         let threshold_secs = config.mmap_cold_threshold_secs;
         let interval_secs = config.mmap_sweep_interval_secs.max(1);
         let configured_budget = config.disk_budget_bytes;
@@ -553,6 +588,7 @@ impl DiskCacheStore {
         let store = Arc::new(Self {
             storage,
             config,
+            run_scratch,
             started_at: Instant::now(),
             cached: DashMap::new(),
             coordinators: DashMap::new(),
@@ -570,6 +606,8 @@ impl DiskCacheStore {
             budget_auto_sized: AtomicBool::new(false),
             lazy_entry_cap: AtomicUsize::new(default_superfiles_in_flight()),
             budget_warned: AtomicBool::new(false),
+            scratch_bytes: AtomicU64::new(0),
+            parked_scratch: DashMap::new(),
             n_cold_fetches: AtomicU64::new(0),
             n_disk_reuses: AtomicU64::new(0),
             n_evictions: AtomicU64::new(0),
@@ -653,6 +691,7 @@ impl DiskCacheStore {
             n_evictions: self.n_evictions.load(Ordering::Acquire),
             n_madvise_calls: self.n_madvise_calls.load(Ordering::Acquire),
             n_gc_drops: self.n_gc_drops.load(Ordering::Acquire),
+            scratch_bytes: self.scratch_bytes.load(Ordering::Acquire),
         }
     }
 
@@ -1325,6 +1364,11 @@ mod tests {
         let variants = [
             DiskCacheError::SuperfileOpen("x".into()),
             DiskCacheError::BudgetExceeded,
+            DiskCacheError::ScratchFull {
+                needed: 1,
+                charged: 0,
+                cap: 0,
+            },
             DiskCacheError::Io(IoError::other("boom")),
         ];
         for v in variants {
