@@ -3164,7 +3164,7 @@ impl TermIndex {
             .based_slices_for_prefix(&key_prefix)
             .map(|(base, r)| (base, r.clone()))
             .collect();
-        refs.sort_by(|a, b| b.1.max_df.cmp(&a.1.max_df));
+        refs.sort_by_key(|(_, r)| Reverse(r.max_df));
         // Min-heap of (layer count, term) over the best nominations so far.
         let mut best: BinaryHeap<Reverse<(u64, Vec<u8>)>> = BinaryHeap::new();
         for (base, r) in refs {
