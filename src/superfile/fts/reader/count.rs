@@ -8,6 +8,8 @@
 
 use std::{cmp::Reverse, collections::BinaryHeap, str::from_utf8};
 
+use bytes::Bytes;
+
 #[cfg(any(test, feature = "test-helpers"))]
 use super::cursor::TermMeta;
 use super::{
@@ -392,7 +394,7 @@ impl FtsReader {
         tokens: &[&str],
         mode: BoolMode,
     ) -> Result<(Vec<RowId>, MatchWork), FtsError> {
-        self.token_match_prefetched(column, tokens, mode, None)
+        self.token_match_prefetched(column, tokens, mode, None, &QueryDict::default())
             .await
     }
 
@@ -407,26 +409,39 @@ impl FtsReader {
         tokens: &[&str],
         mode: BoolMode,
         prefetched: Option<&FetchedTermMemo>,
+        dict: &QueryDict,
     ) -> Result<(Vec<RowId>, MatchWork), FtsError> {
         let column_id = self.resolve_column_id(column)?;
         if tokens.is_empty() {
             return Ok((Vec::new(), MatchWork::default()));
         }
-        let cursors = self
-            .build_term_cursors(
+        // The dictionary only for tokens the memo lacks, read through `dict`.
+        let (dict_bytes, fetched) = match prefetched.is_some_and(|m| m.covers(tokens)) {
+            true => (None, false),
+            false => {
+                let (bytes, fetched) = self.query_dict(dict).await?;
+                (Some(bytes), fetched)
+            }
+        };
+        let cursors: Vec<TermCursor> = self
+            .build_term_cursors_opt(
                 column_id,
                 tokens,
                 QueryIdf::ThisFile,
                 CursorUse::Count,
                 None,
                 prefetched,
+                dict_bytes.as_ref().map(Bytes::as_ref),
             )
-            .await?;
+            .await?
+            .into_iter()
+            .flatten()
+            .collect();
         // Tallied before the mode branch: the cursors that DID build cost
         // their bytes even when a missing AND token empties the result.
-        // +1 for the dictionary fetch, when the build had to make one.
+        // +1 for the dictionary fetch, when this call made it.
         let mut work = MatchWork::for_cursors(&cursors);
-        work.planned_ranges += dictionary_fetches(tokens, prefetched);
+        work.planned_ranges += u64::from(fetched);
         let (docs, walk_ns) = timed_section(|| match mode {
             BoolMode::And => {
                 // AND needs every token present; a missing token ⇒ empty
@@ -780,17 +795,22 @@ impl FtsReader {
     /// a minimal set of parallel GETs). This matters on the global-statistics
     /// path, where a superfile is probed for every scored term of a query at
     /// once.
-    pub async fn term_dfs(
+    ///
+    /// The dictionary is read through `dict`, so a query reads it once per file.
+    pub(crate) async fn term_dfs(
         &self,
         column: &str,
         tokens: &[&str],
+        dict: &QueryDict,
     ) -> Result<(Vec<u64>, MatchWork), FtsError> {
         self.resolve_column_id(column)?;
         if tokens.is_empty() {
             return Ok((Vec::new(), MatchWork::default()));
         }
-        let dict_bytes = self.dict_bytes_async().await?;
-        self.term_dfs_with(&dict_bytes, column, tokens).await
+        let (dict_bytes, fetched) = self.query_dict(dict).await?;
+        let (dfs, mut work) = self.term_dfs_with(&dict_bytes, column, tokens).await?;
+        work.planned_ranges += u64::from(fetched);
+        Ok((dfs, work))
     }
 
     /// [`Self::term_dfs`] over `dict_bytes`, this reader's dictionary already
@@ -844,10 +864,10 @@ impl FtsReader {
         // One coalesced fetch for every PFOR header; `df` is its first 4
         // bytes. Each header is one planned range (pre-coalesce), and its
         // bytes count as indexed work — the walk read them.
-        // +1: the dictionary fetch that resolved the slots.
+        // The caller counts the dictionary fetch.
         let mut work = MatchWork {
             postings_bytes: 0,
-            planned_ranges: 1,
+            planned_ranges: 0,
             kernel_cpu_ns: 0,
         };
         if !header_ranges.is_empty() {
@@ -893,7 +913,9 @@ impl FtsReader {
     /// so a predicate matching a large fraction of the superfile can
     /// fall back to a plain scan instead of a (losing) index pushdown.
     pub async fn term_df(&self, column: &str, token: &str) -> Result<(u64, MatchWork), FtsError> {
-        let (mut dfs, work) = self.term_dfs(column, &[token]).await?;
+        let (mut dfs, work) = self
+            .term_dfs(column, &[token], &QueryDict::default())
+            .await?;
         Ok((dfs.pop().unwrap_or(0), work))
     }
 
@@ -1694,7 +1716,11 @@ mod tests {
         // path (which fetches only the PFOR headers, then scatters the
         // results back) would surface as a mismatch here.
         let tokens = ["rust", "missing", "uniqzero", "common", "absent2"];
-        let batched = r.term_dfs("body", &tokens).await.expect("term_dfs").0;
+        let batched = r
+            .term_dfs("body", &tokens, &QueryDict::default())
+            .await
+            .expect("term_dfs")
+            .0;
         // Element-wise identical to resolving each token on its own.
         let mut per_term = Vec::with_capacity(tokens.len());
         for t in tokens {
@@ -1708,7 +1734,13 @@ mod tests {
         // uniqzero=1 inline, absent tokens=0).
         assert_eq!(batched, vec![2, 0, 1, 3, 0], "planted document frequencies");
         // Empty input short-circuits to empty output (no dict open, no fetch).
-        assert!(r.term_dfs("body", &[]).await.expect("empty").0.is_empty());
+        assert!(
+            r.term_dfs("body", &[], &QueryDict::default())
+                .await
+                .expect("empty")
+                .0
+                .is_empty()
+        );
     }
 
     /// A column no row in this superfile filled is walked without

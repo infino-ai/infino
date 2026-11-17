@@ -113,7 +113,7 @@ use crate::{
         ReadError, SuperfileReader,
         error::FtsError,
         fts::{
-            reader::{BoolMode, ContainsRows, MatchWork},
+            reader::{BoolMode, ContainsRows, MatchWork, QueryDict},
             tokenize::{Tokenizer, unique_tokens},
         },
         reader::ScanShape,
@@ -1000,6 +1000,9 @@ impl SupertableProvider {
             self.count_rows_checked(checked.len(), verified.len());
             return Ok((verified, work));
         }
+        // text_match looks its terms up one at a time; they share one dictionary read while the
+        // budget has room.
+        let dict = QueryDict::with_budget(&self.manifest.options.connection_memory_budget);
         // Under a LIMIT, any `limit` live rows of the selection answer it
         // (see `exact_limit`). When the selection is one `OR` of whole terms
         // and nothing else narrows it, each term's rows are all rows the
@@ -1023,6 +1026,7 @@ impl SupertableProvider {
                         file_column,
                         &[leaf.needle.as_str()],
                         memos.get(&leaf.column).map(Arc::as_ref),
+                        &dict,
                     )
                     .await;
                 match read {
@@ -1064,6 +1068,11 @@ impl SupertableProvider {
         }
         let budget = &self.manifest.options.connection_memory_budget;
         let mut leaf_rows: HashMap<(&str, &str, bool), ContainsRows> = HashMap::new();
+        // `text_match` columns first, so their shared dictionary is let go before an `ILIKE` walk
+        // reserves from the same budget.
+        let mut by_column: Vec<((&str, bool), Vec<&str>)> = by_column.into_iter().collect();
+        by_column.sort_by_key(|&((_, whole), _)| !whole);
+        let mut dict = Some(dict);
         for ((column, whole), needles) in by_column {
             // A superfile written before a rename keys its dictionary by
             // the column's old name.
@@ -1073,9 +1082,15 @@ impl SupertableProvider {
             let read = if whole {
                 prepared
                     .reader
-                    .term_rows(file_column, &needles, memos.get(column).map(Arc::as_ref))
+                    .term_rows(
+                        file_column,
+                        &needles,
+                        memos.get(column).map(Arc::as_ref),
+                        dict.get_or_insert_with(QueryDict::default),
+                    )
                     .await
             } else {
+                dict = None;
                 prepared
                     .reader
                     .contains_rows(file_column, &needles, Some(pool), Some(budget))
@@ -1122,6 +1137,7 @@ impl SupertableProvider {
                     .zip(rows),
             );
         }
+        drop(dict);
         // Every leaf the tree reads has its rows; checked up front so the
         // lookup below cannot miss.
         if let Some(leaf) = check.filter.leaves().into_iter().find(|leaf| {
@@ -2757,6 +2773,11 @@ impl TableProvider for SupertableProvider {
                         // Resolve candidate rows from the index. `None` => no
                         // usable bound, scan the superfile.
                         let mut predicate_work = MatchWork::default();
+                        // Kept for expansion, the estimate and the match while the budget has
+                        // room; dropped once the candidate rows are known.
+                        let dict = Arc::new(QueryDict::with_budget(
+                            &self.manifest.options.connection_memory_budget,
+                        ));
                         let plan = if needs_expansion {
                             // A whole-dictionary walk pays only when the
                             // column's stored text is large next to its
@@ -2784,6 +2805,7 @@ impl TableProvider for SupertableProvider {
                                     prepared.reader.as_ref(),
                                     &full_walk_pays,
                                     Some(reader_pool),
+                                    &dict,
                                 )
                                 .await
                                 .map_err(QueryError::from)?;
@@ -2807,6 +2829,7 @@ impl TableProvider for SupertableProvider {
                                         plan_locations,
                                         selection_gate(&plan, &prepared),
                                         Some((reader_pool, match_slots)),
+                                        Arc::clone(&dict),
                                     )
                                     .await
                                     .map_err(QueryError::from)?,
@@ -2814,6 +2837,8 @@ impl TableProvider for SupertableProvider {
                             predicate_work.merge(resolved.work);
                             resolved.rows
                         };
+                        // Let go before the exact check, which reserves from the same budget.
+                        drop(dict);
 
                         // This superfile's tombstoned rows (empty when no
                         // overlay); the batch prefetch above already resolved

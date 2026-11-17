@@ -117,6 +117,7 @@ pub use crate::superfile::fts::reader::BoolMode;
 use crate::utils::trace::OpOrigin;
 use crate::{
     InfinoError, config,
+    memory::ConnectionMemoryBudget,
     runtime_bridge::run_on_pool_unless_blocking,
     runtime_metrics::op_stats,
     superfile::{
@@ -127,8 +128,8 @@ use crate::{
             bm25::Bm25Params,
             reader::{
                 Bm25SearchOptions, ClauseLists, ColumnLengthStats, FetchedTermMemo, GlobalTermIdf,
-                LiveFloor, MatchWork, OR_WINDOW_MIN_TERMS, OrCursorSet, PreparedClauses, QueryIdf,
-                ScoringView,
+                LiveFloor, MatchWork, OR_WINDOW_MIN_TERMS, OrCursorSet, PreparedClauses, QueryDict,
+                QueryIdf, ScoringView,
             },
             tokenize::Phrase,
         },
@@ -304,6 +305,23 @@ struct MatchKernel {
     /// The pushed-down `WHERE`'s rows, when its indexes can bound them.
     row_filter: Option<RowFilter>,
     op_stats: Option<Arc<op_stats::OpStatsCollector>>,
+    /// The budget a file's kept dictionary is reserved from.
+    budget: Arc<ConnectionMemoryBudget>,
+}
+
+/// The dictionary copy a file's match walks share: kept only when a positive walk the memo does not
+/// answer and a negated walk both read the dictionary; otherwise it keeps nothing.
+fn walk_dict(
+    phrase_involved: bool,
+    has_negatives: bool,
+    memo: Option<&FetchedTermMemo>,
+    positive: &[&str],
+    budget: &Arc<ConnectionMemoryBudget>,
+) -> QueryDict {
+    match !phrase_involved && has_negatives && !memo.is_some_and(|m| m.covers(positive)) {
+        true => QueryDict::with_budget(budget),
+        false => QueryDict::default(),
+    }
 }
 
 impl MatchKernel {
@@ -354,6 +372,13 @@ impl MatchKernel {
     /// keeps: the positive walk minus any row a negated atom reaches.
     async fn docs(&self, r: &Arc<SuperfileReader>, suid: Uuid) -> Result<Vec<RowId>, QueryError> {
         let (column, memo, refs) = self.file_inputs(r, suid).await;
+        let dict = walk_dict(
+            self.phrase_involved,
+            self.has_negatives,
+            memo.as_deref(),
+            &refs,
+            &self.budget,
+        );
         // Any phrase atom (match or negated) takes the phrase-aware walk;
         // plain-token queries keep the optimized token_match path.
         let (docs, mut work) = match self.phrase_involved {
@@ -362,7 +387,7 @@ impl MatchKernel {
                     .await?
             }
             false => {
-                r.token_match_prefetched(&column, &refs, self.mode, memo.as_deref())
+                r.token_match_prefetched(&column, &refs, self.mode, memo.as_deref(), &dict)
                     .await?
             }
         };
@@ -373,8 +398,14 @@ impl MatchKernel {
             let neg_refs: Vec<&str> = self.negatives.iter().map(String::as_str).collect();
             let (neg_docs, neg_work) = match self.negative_phrases.is_empty() {
                 true => {
-                    r.token_match_prefetched(&column, &neg_refs, BoolMode::Or, memo.as_deref())
-                        .await?
+                    r.token_match_prefetched(
+                        &column,
+                        &neg_refs,
+                        BoolMode::Or,
+                        memo.as_deref(),
+                        &dict,
+                    )
+                    .await?
                 }
                 false => {
                     r.atoms_match_ids(&column, &neg_refs, &self.negative_phrases, BoolMode::Or)
@@ -525,7 +556,10 @@ impl RowFilter {
             locations: &self.locations,
             superfile: suid,
         };
-        let estimated = self.plan.estimate(r, Some(&self.pool), Some(located)).await;
+        let estimated = self
+            .plan
+            .estimate(r, Some(&self.pool), Some(located), &QueryDict::default())
+            .await;
         let (estimate, work) = match estimated {
             Ok(estimated) => estimated,
             // A superfile written before a filter column was indexed holds
@@ -540,7 +574,14 @@ impl RowFilter {
         // The walk is CPU work: on the pool, not on a runtime worker.
         let memos = memos_from_plan_locations(r, &self.locations, suid).await;
         let (rows, work) = Arc::clone(&self.plan)
-            .evaluate_on_pool(Arc::clone(r), suid, &self.pool, &self.slots, memos)
+            .evaluate_on_pool(
+                Arc::clone(r),
+                suid,
+                &self.pool,
+                &self.slots,
+                memos,
+                Arc::default(),
+            )
             .await?;
         self.flush(&work);
         Ok(rows.map(Arc::new))
@@ -2599,7 +2640,9 @@ impl SupertableReader {
                         // Residual superfile (contains a scored term, pruned
                         // from scoring): df only, from the dictionary value
                         // + header hint — no postings body.
-                        let (dfs, work) = r.term_dfs(&column_arc, &refs).await?;
+                        let (dfs, work) = r
+                            .term_dfs(&column_arc, &refs, &QueryDict::default())
+                            .await?;
                         add_match_work(&op_stats, &work);
                         Ok((suid, dfs, None))
                     }
@@ -3301,6 +3344,7 @@ impl SupertableReader {
             locations,
             row_filter,
             op_stats: self.op_stats.clone(),
+            budget: Arc::clone(&self.manifest().options.connection_memory_budget),
         };
         Ok(Some((units, Arc::new(kernel))))
     }
@@ -3433,6 +3477,7 @@ impl SupertableReader {
         // on the first error. The per-superfile body returns this
         // superfile's match count; the totals are summed.
         let op_stats = self.op_stats.clone();
+        let budget = Arc::clone(&self.manifest().options.connection_memory_budget);
         let per_superfile = dispatch::fanout_with(
             self,
             units,
@@ -3440,6 +3485,7 @@ impl SupertableReader {
             self.open_intent(),
             move |r, entry, tombstone_cache, now, _params: ()| {
                 let op_stats = op_stats.clone();
+                let budget = Arc::clone(&budget);
                 let column_arc = Arc::clone(&column_arc);
                 let term_arc = Arc::clone(&term_arc);
                 let phrase_arc = Arc::clone(&phrase_arc);
@@ -3472,6 +3518,13 @@ impl SupertableReader {
                     // negatives) or a tombstone. Negation *without* deletes
                     // takes the skip-based counting path below instead.
                     if tomb.is_some() {
+                        let dict = walk_dict(
+                            phrase_involved,
+                            has_negatives,
+                            memo.as_deref(),
+                            &refs,
+                            &budget,
+                        );
                         let (docs, mut work) = match phrase_involved {
                             true => {
                                 r.atoms_match_ids(&column_arc, &refs, &phrase_arc, match_mode)
@@ -3483,6 +3536,7 @@ impl SupertableReader {
                                     &refs,
                                     match_mode,
                                     memo.as_deref(),
+                                    &dict,
                                 )
                                 .await?
                             }
@@ -3496,6 +3550,7 @@ impl SupertableReader {
                                         &neg_refs,
                                         BoolMode::Or,
                                         memo.as_deref(),
+                                        &dict,
                                     )
                                     .await?
                                 }
@@ -3678,7 +3733,13 @@ impl SupertableReader {
                     let memo = memo_from_locations(&r, &locations, entry.superfile_id).await;
                     let refs: Vec<&str> = tokens_arc.iter().map(String::as_str).collect();
                     let (docs, work) = r
-                        .token_match_prefetched(&column_arc, &refs, BoolMode::And, memo.as_deref())
+                        .token_match_prefetched(
+                            &column_arc,
+                            &refs,
+                            BoolMode::And,
+                            memo.as_deref(),
+                            &QueryDict::default(),
+                        )
                         .await?;
                     // The prune pass's posting walk. The verify pass's own
                     // decode is folded into `rows_materialized` below; its
@@ -4861,7 +4922,7 @@ mod tests {
             fts::{
                 bm25,
                 posting::BLOCK_LEN,
-                reader::{Bm25SearchOptions, ColumnLengthStats, top_k_initial_capacity},
+                reader::{Bm25SearchOptions, ColumnLengthStats, QueryDict, top_k_initial_capacity},
             },
             vector::layout::VectorLayout,
         },
@@ -8124,7 +8185,9 @@ mod tests {
         for e in &entries {
             let bytes = std::fs::read(dir.path().join(e.uri.storage_path())).expect("bytes");
             let sf = SuperfileReader::open(Bytes::from(bytes)).expect("open");
-            let (dfs, _) = rt.block_on(sf.term_dfs("title", &terms)).expect("dfs");
+            let (dfs, _) = rt
+                .block_on(sf.term_dfs("title", &terms, &QueryDict::default()))
+                .expect("dfs");
             for (i, d) in dfs.into_iter().enumerate() {
                 expected_df[i] += d;
             }

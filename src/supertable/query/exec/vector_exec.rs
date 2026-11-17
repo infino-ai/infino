@@ -627,6 +627,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        memory::ConnectionMemoryBudget,
         storage::{LocalFsStorageProvider, StorageProvider},
         superfile::{
             builder::{FtsConfig, VectorConfig},
@@ -636,11 +637,23 @@ mod tests {
             Supertable, SupertableOptions,
             manifest::ManifestSnapshot,
             query::{candidate::LIKE_MAX_TERMS, exec::common::OVER_FETCH_MIN_CEILING},
+            reader_cache::disk::test_support::RecordingStorage,
         },
+        test_helpers::lazy_disk_cache_without_promotion,
     };
 
     /// Moves manifest id ranges away from every real generated id.
     const INVALID_ID_RANGE_OFFSET: i128 = 1_i128 << 100;
+
+    /// Rows in the filtered vector search test's table; with [`DICT_TEST_WORDS_PER_ROW`] they make
+    /// a dictionary of a few MiB.
+    const DICT_TEST_ROWS: usize = 20_000;
+
+    /// Words per row that no other row has, which set the dictionary's size.
+    const DICT_TEST_WORDS_PER_ROW: usize = 30;
+
+    /// A limit whose half share cannot hold that dictionary but leaves the vector search room.
+    const NO_ROOM_FOR_A_DICTIONARY: u64 = 4 * 1024 * 1024;
 
     // ---- vector-column test harness (mirrors query::vector tests) ----
 
@@ -1209,6 +1222,67 @@ mod tests {
                     .collect::<Vec<_>>()
             })
             .collect()
+    }
+
+    #[test]
+    fn vector_search_where_two_likes_reads_the_dictionary_once_when_it_is_kept() {
+        // A vector search filtered by two `LIKE`s, on a table read lazily from its store.
+        //  - with room, the dictionary is read once for both expansions and the match;
+        //  - with no room, it is read at each step;
+        //  - the rows are the same.
+        // This test pins the filtered vector search reading the dictionary once.
+        let dim = 16;
+        let titles: Vec<String> = (0..DICT_TEST_ROWS)
+            .map(|n| {
+                let words: Vec<String> = (0..DICT_TEST_WORDS_PER_ROW)
+                    .map(|w| format!("u{n}x{w}"))
+                    .collect();
+                format!("rust{} tokio{} {}", n % 500, n % 300, words.join(" "))
+            })
+            .collect();
+        let dir = TempDir::new().expect("dir");
+        let local: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("local"));
+        let written = options_one_superfile_per_commit(dim).with_storage(Arc::clone(&local));
+        drop(supertable_ranked_by_index_with(written, dim, &titles));
+        let q = csv_one_hot(dim, 0);
+        let sql = format!(
+            "SELECT title FROM vector_search('emb', '{q}', 50) \
+             WHERE title LIKE 'rust12%' AND title LIKE 'rust1%'"
+        );
+        // The rows and the bytes read from the files' full-text sections, on a fresh cache.
+        let run = |budget: Arc<ConnectionMemoryBudget>| {
+            let cache_dir = TempDir::new().expect("cache dir");
+            let recording = RecordingStorage::over(Arc::clone(&local));
+            let storage = Arc::clone(&recording) as Arc<dyn StorageProvider>;
+            let cache = lazy_disk_cache_without_promotion(Arc::clone(&storage), cache_dir.path());
+            let mut options = options_one_superfile_per_commit(dim);
+            options.connection_memory_budget = budget;
+            let st = Supertable::open(options.with_storage(storage).with_disk_cache(cache))
+                .expect("open lazily");
+            let reader = st.reader().expect("reader");
+            let fts: Vec<(u64, u64)> = (reader.manifest().superfiles.iter())
+                .filter_map(|e| e.subsection_offsets.as_ref().and_then(|o| o.fts))
+                .collect();
+            let before = recording.n_ranges();
+            let rows = titles_of(&reader.query_sql(&sql).expect("filtered vector search"));
+            let fts_bytes: u64 = (recording.ranges_since(before).iter())
+                .filter(|r| {
+                    fts.iter()
+                        .any(|&(at, len)| r.start >= at && r.end <= at + len)
+                })
+                .map(|r| r.end - r.start)
+                .sum();
+            (rows, fts_bytes)
+        };
+        let (kept_rows, kept) = run(ConnectionMemoryBudget::measured());
+        let (plain_rows, plain) = run(ConnectionMemoryBudget::with_limit(NO_ROOM_FOR_A_DICTIONARY));
+        assert!(!kept_rows.is_empty(), "the filter matches rows");
+        assert_eq!(kept_rows, plain_rows, "the same rows either way");
+        assert!(
+            kept * 2 < plain,
+            "a kept dictionary is read once ({kept} bytes), not at each step ({plain} bytes)"
+        );
     }
 
     #[test]
