@@ -437,8 +437,8 @@ impl FtsReader {
             .into_iter()
             .flatten()
             .collect();
-        // The cursors are built; a dictionary `dict` did not keep is not held
-        // through the walk and the row-map read below.
+        // The cursors are built; a dictionary `dict` did not keep is not held through the walk and
+        // the row-map read below.
         drop(dict_bytes);
         // Tallied before the mode branch: the cursors that DID build cost
         // their bytes even when a missing AND token empties the result.
@@ -1053,8 +1053,8 @@ mod tests {
     /// Documents in the reordered blob the dictionary-lifetime test matches.
     const DICT_LIFETIME_DOCS: u32 = 64;
 
-    /// A dictionary buffer handed out by [`DictWatchSource`]; it counts
-    /// itself live until the last slice of it drops.
+    /// A dictionary buffer handed out by [`DictWatchSource`]; it counts itself live until the last
+    /// slice of it drops.
     struct WatchedDict {
         bytes: Bytes,
         live: Arc<AtomicUsize>,
@@ -1072,9 +1072,8 @@ mod tests {
         }
     }
 
-    /// A download-only source that hands out the dictionary as a
-    /// [`WatchedDict`] and notes how many dictionary buffers are live at
-    /// each read of the doc-id map.
+    /// A download-only source that hands out the dictionary as a [`WatchedDict`] and notes how many
+    /// dictionary buffers are live at each read of the doc-id map.
     struct DictWatchSource {
         blob: Bytes,
         /// The dictionary and doc-id map regions, set once the reader is open.
@@ -1175,11 +1174,9 @@ mod tests {
 
     #[tokio::test]
     async fn token_match_releases_a_dictionary_it_does_not_keep_before_the_row_map_read() {
-        // A reordered blob read from a download-only source, matched through
-        // a `QueryDict` that keeps nothing (no budget, or a budget too small)
-        // and one with room.
-        //  - without a kept dictionary, no dictionary buffer is live when the
-        //    doc-id map is read;
+        // A reordered blob read from a download-only source, matched through a `QueryDict` that
+        // keeps nothing (no budget, or a budget too small) and one with room.
+        //  - without a kept dictionary, no dictionary buffer is live when the doc-id map is read;
         //  - with room, the `QueryDict` holds it there;
         //  - the rows are the same either way.
         // This test pins the downloaded dictionary going before the row-map read.

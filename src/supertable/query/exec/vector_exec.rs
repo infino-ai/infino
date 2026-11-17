@@ -656,8 +656,7 @@ mod tests {
     /// over.
     const DICT_TEST_RUST_WORDS: usize = 500;
 
-    /// Distinct `tokio…` words across those rows: a vocabulary no `LIKE` matches, so the
-    /// dictionary holds more than the expansions read.
+    /// Distinct `tokio…` words across those rows; no `LIKE` in the test matches them.
     const DICT_TEST_TOKIO_WORDS: usize = 300;
 
     /// A limit whose half share cannot hold that dictionary but leaves the vector search room.
