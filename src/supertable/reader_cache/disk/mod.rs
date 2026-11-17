@@ -389,6 +389,10 @@ pub struct CacheStats {
     pub n_madvise_calls: u64,
     /// Total count of entries dropped because GC deleted from objectstore.
     pub n_gc_drops: u64,
+    /// Background downloads that failed because their file was gone from storage. A dropped
+    /// table or a removed prefix does this, and logs no warning, so this count is where a file
+    /// missing while its table still lists it shows up.
+    pub n_fills_gone_from_storage: u64,
 }
 
 /// A cache file found on disk at open but not opened yet. Its bytes already count against the budget.
@@ -453,6 +457,8 @@ pub struct DiskCacheStore {
     n_disk_reuses: AtomicU64,
     n_evictions: AtomicU64,
     n_gc_drops: AtomicU64,
+    /// See [`CacheStats::n_fills_gone_from_storage`].
+    n_fills_gone_from_storage: AtomicU64,
     n_madvise_calls: AtomicU64,
     /// Number of callers explicitly waiting for lazy background
     /// promotion. A waiter means promotion is now latency-critical,
@@ -574,6 +580,7 @@ impl DiskCacheStore {
             n_disk_reuses: AtomicU64::new(0),
             n_evictions: AtomicU64::new(0),
             n_gc_drops: AtomicU64::new(0),
+            n_fills_gone_from_storage: AtomicU64::new(0),
             n_madvise_calls: AtomicU64::new(0),
             n_promotion_waiters: AtomicU64::new(0),
             pinned_fn: std::sync::Mutex::new(pinned_fn),
@@ -653,6 +660,7 @@ impl DiskCacheStore {
             n_evictions: self.n_evictions.load(Ordering::Acquire),
             n_madvise_calls: self.n_madvise_calls.load(Ordering::Acquire),
             n_gc_drops: self.n_gc_drops.load(Ordering::Acquire),
+            n_fills_gone_from_storage: self.n_fills_gone_from_storage.load(Ordering::Acquire),
         }
     }
 

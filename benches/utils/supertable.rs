@@ -2388,12 +2388,12 @@ pub mod fts {
                     meter.provider(),
                     cache,
                 );
-                let consumer = tiers::open_consumer(opts);
-                // Consumer first: it must shut down before the cache dir's
-                // removal starts — see `RetryingTempDir`.
-                (consumer, tiers::RetryingTempDir::from(cache_dir))
+                SettledColdConsumer {
+                    consumer: tiers::open_consumer(opts),
+                    _cache_dir: tiers::RetryingTempDir::from(cache_dir),
+                }
             },
-            |(consumer, _cache)| {
+            |SettledColdConsumer { consumer, .. }| {
                 let terms = query.terms.join(" ");
                 let mode = exec_fts::to_infino_mode(query.mode);
                 let _ = consumer
@@ -2408,7 +2408,7 @@ pub mod fts {
                     )
                     .expect("metered cold bm25_search");
             },
-            |(consumer, _cache), i| {
+            |SettledColdConsumer { consumer, .. }, i| {
                 let q = steady[i % steady.len()];
                 let terms = q.terms.join(" ");
                 let mode = exec_fts::to_infino_mode(q.mode);
@@ -2425,7 +2425,7 @@ pub mod fts {
                     .expect("metered steady cold bm25_search");
             },
             steady.len().min(STEADY_COLD_SAMPLES),
-            |(consumer, _cache)| {
+            |SettledColdConsumer { consumer, .. }| {
                 let terms = query.terms.join(" ");
                 let mode = exec_fts::to_infino_mode(query.mode);
                 let _ = consumer
@@ -2443,6 +2443,28 @@ pub mod fts {
         );
         log_cold_split("supertable_fts", &measured.split);
         Some(measured)
+    }
+
+    /// The metered cold consumer. Its reads leave background downloads running, and the run
+    /// deletes the table's prefix soon after this measurement ends, so dropping it first waits
+    /// for those downloads: otherwise they find their files deleted under them. The wait runs
+    /// after the measurement's last meter snapshot, so it changes no measured number.
+    struct SettledColdConsumer {
+        // Declared before the cache dir so the consumer (and its disk
+        // cache) shuts down before removal starts — see `RetryingTempDir`.
+        consumer: Supertable,
+        _cache_dir: tiers::RetryingTempDir,
+    }
+
+    impl Drop for SettledColdConsumer {
+        fn drop(&mut self) {
+            if std::thread::panicking() {
+                return;
+            }
+            self.consumer
+                .wait_until_warm(super::ROUTING_SETTLE_TIMEOUT)
+                .expect("metered cold consumer: background downloads settle");
+        }
     }
 
     /// Cold-tier guard: fresh disk cache + consumer only. Same open

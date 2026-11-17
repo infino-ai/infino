@@ -717,10 +717,11 @@ impl DiskCacheStore {
                     // The file is gone from storage: deleted under the download, as when its
                     // table is dropped or its prefix removed. Still a failure, so the next read
                     // does not download it again, but nothing is wrong with the cache, so no
-                    // warning.
+                    // warning. It is counted instead (`n_fills_gone_from_storage`), so a file
+                    // missing while its table still lists it stays visible.
                     Err(DiskCacheError::Storage(StorageError::NotFound { .. })) => {
                         tracing::debug!(target: "infino::cache", uri = %uri_owned.0, "fill: the file is gone from storage");
-                        exit.failed();
+                        exit.gone_from_storage();
                     }
                     // The entry still serves reads. A read after `FAILED_FILL_RETRY_AFTER` tries
                     // again.
@@ -1577,6 +1578,17 @@ impl FillExit {
             let _ = self.fill.failed_at_us.set(store.now_us());
         }
     }
+
+    /// Mark the download failed because its file is gone from storage, and count it in
+    /// [`CacheStats::n_fills_gone_from_storage`](super::CacheStats::n_fills_gone_from_storage).
+    fn gone_from_storage(&self) {
+        if let Some(store) = self.store.upgrade() {
+            let _ = self.fill.failed_at_us.set(store.now_us());
+            store
+                .n_fills_gone_from_storage
+                .fetch_add(1, Ordering::AcqRel);
+        }
+    }
 }
 
 impl Drop for FillExit {
@@ -2017,7 +2029,7 @@ mod tests {
         },
         test_helpers::{
             capture_logs,
-            fault_storage::{FaultOp, FaultStorage},
+            fault_storage::{FaultKind, FaultOp, FaultStorage},
         },
     };
 
@@ -2236,7 +2248,18 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let local: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("localfs"));
-        let recording = RecordingStorage::over(local);
+        recording_store_over(dir, local, budget, tweak)
+    }
+
+    /// [`recording_store_with`], recording `storage` (rooted in `dir`) instead of a plain local
+    /// store, so a test can put a fault-injecting store under it.
+    fn recording_store_over(
+        dir: TempDir,
+        storage: Arc<dyn StorageProvider>,
+        budget: Option<u64>,
+        tweak: impl FnOnce(&mut DiskCacheConfig),
+    ) -> (TempDir, Arc<DiskCacheStore>, Arc<RecordingStorage>) {
+        let recording = RecordingStorage::over(storage);
         let defaults = DiskCacheConfig::default();
         let mut cfg = DiskCacheConfig {
             cache_root: dir.path().join("cache"),
@@ -2792,7 +2815,7 @@ mod tests {
 
     /// A download whose file is deleted from storage under it (its table dropped, its prefix
     /// removed) is still a failure, so the next read does not download it again, but it logs no
-    /// warning: nothing is wrong with the cache.
+    /// warning: nothing is wrong with the cache. It is counted instead.
     ///
     /// Setup: the download waits for its slot, and the file is deleted from storage meanwhile.
     /// The runtime runs on this thread, so the captured logs hold the download's own.
@@ -2802,7 +2825,7 @@ mod tests {
             .enable_all()
             .build()
             .expect("runtime");
-        let (fill, logs) = capture_logs(Level::WARN, || {
+        let ((fill, gone), logs) = capture_logs(Level::WARN, || {
             runtime.block_on(async {
                 let (_dir, store, recording) = recording_store(None);
                 let (uri, _) = put_tiny_superfile(&recording).await;
@@ -2815,12 +2838,62 @@ mod tests {
                     .wait_until_fills_settled(PROMOTE_TIMEOUT)
                     .await
                     .expect("the download ends");
-                fill
+                (fill, store.stats().n_fills_gone_from_storage)
             })
         });
 
         assert!(fill.failed_at_us.get().is_some(), "still a failure");
-        assert!(!logs.contains("download failed"), "no warning, got: {logs}");
+        assert!(logs.is_empty(), "no warning, got: {logs}");
+        assert_eq!(gone, 1, "counted as gone from storage");
+    }
+
+    /// A download that fails for any other storage error still logs a warning, and is not counted
+    /// as gone from storage: only a file gone from storage is quiet.
+    ///
+    /// Setup: as above, but every read of the file fails with `kind` instead of finding it gone.
+    #[test]
+    fn a_download_failing_for_another_storage_error_logs_a_warning() {
+        for kind in [FaultKind::Transient, FaultKind::PermissionDenied] {
+            let runtime = Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            let ((fill, gone), logs) = capture_logs(Level::WARN, || {
+                runtime.block_on(async {
+                    let dir = TempDir::new().expect("tempdir");
+                    let local: Arc<dyn StorageProvider> =
+                        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("localfs"));
+                    let faults = FaultStorage::wrap(local);
+                    let (_dir, store, recording) = recording_store_over(
+                        dir,
+                        Arc::clone(&faults) as Arc<dyn StorageProvider>,
+                        None,
+                        |_| {},
+                    );
+                    let (uri, _) = put_tiny_superfile(&recording).await;
+                    let permit = hold_fill_slot(&store).await;
+                    warm_open(&store, &uri).await;
+                    let fill = fill_of(&store, &uri);
+                    for op in [FaultOp::Get, FaultOp::GetRange] {
+                        faults.fail_with(kind, op, &uri.0.to_string(), usize::MAX);
+                    }
+                    drop(permit);
+                    store
+                        .wait_until_fills_settled(PROMOTE_TIMEOUT)
+                        .await
+                        .expect("the download ends");
+                    assert!(faults.fired() > 0, "{kind:?}: the download hit the fault");
+                    (fill, store.stats().n_fills_gone_from_storage)
+                })
+            });
+
+            assert!(fill.failed_at_us.get().is_some(), "{kind:?}: a failure");
+            assert!(
+                logs.contains("fill: download failed"),
+                "{kind:?}: a warning, got: {logs}"
+            );
+            assert_eq!(gone, 0, "{kind:?}: not counted as gone from storage");
+        }
     }
 
     /// A download whose cache directory is removed under it (a dropped store's, say) ends like a
