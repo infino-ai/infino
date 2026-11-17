@@ -7031,6 +7031,33 @@ fn drain_row_limit_now(options: &SupertableOptions, column: &str) -> Option<(u64
     )
 }
 
+/// The most rows a scratch disk with `space` (free and total bytes; `None`
+/// when unreadable) could hold of a drain of `column` that already has
+/// `on_disk` bytes of spill there, which count as room it has. Only the
+/// disk is asked: a drain the table's disk budget has no room for waits or
+/// goes on uncounted, and `vector.drain_max_rows` is not a reason to spill
+/// its batches again. `None` when the disk does not limit it.
+fn spilled_drain_row_limit(
+    options: &SupertableOptions,
+    column: &str,
+    space: Option<(u64, u64)>,
+    on_disk: u64,
+) -> Option<(u64, DrainRowLimit)> {
+    let spill_row_bytes = drain_spill_row_bytes(options, column)?;
+    let disk_room =
+        space.map(|(free, total)| scratch_disk_room(free, total).saturating_add(on_disk));
+    let unused_budget = options
+        .disk_cache
+        .as_ref()
+        .map(|cache| cache.unused_budget_bytes());
+    drain_row_limit(
+        0,
+        drain_disk_room(disk_room, unused_budget),
+        None,
+        spill_row_bytes,
+    )
+}
+
 /// The scratch disk's room as a limit on a drain's temp files: `disk_room`,
 /// or no limit when the table has a disk cache whose `unused_budget` the
 /// disk can hold. Temp files past the unused budget evict as many bytes of
@@ -7071,14 +7098,30 @@ fn new_drain_epoch_sources(
     taken
 }
 
+/// The folders a drain epoch's spill can be in: beside its table, and where
+/// drains kept their spill before, when that is another folder.
+fn drain_spill_folders(options: &SupertableOptions, epoch_id: &str) -> Vec<PathBuf> {
+    let here = drain_scratch_dir(options, epoch_id);
+    let legacy = legacy_drain_scratch_dir(epoch_id);
+    if legacy == here {
+        vec![here]
+    } else {
+        vec![here, legacy]
+    }
+}
+
 /// Whether a recorded drain epoch over `recorded` (sorted by
-/// `birth_version`) is started over as a smaller one: it has finished
-/// nothing, and a drain starting now would take fewer commits. An epoch
+/// `birth_version`) is started over as a smaller one: it has uploaded no
+/// shard, and a drain starting now would take fewer commits. An epoch
 /// recorded when there was more room, or before drains were held to a row
 /// limit, could otherwise never finish, with every later commit waiting
-/// behind it. An epoch that uploaded a shard or spilled a batch is resumed
-/// as recorded.
-fn recorded_drain_starts_over(
+/// behind it.
+///
+/// An epoch that has spilled a batch starts over only when the scratch disk
+/// could not hold it even with its own spill counted as room (see
+/// [`spilled_drain_row_limit`]), since starting over spills its batches
+/// again. An epoch that uploaded a shard is resumed as recorded.
+async fn recorded_drain_starts_over(
     options: &SupertableOptions,
     column: &str,
     checkpoint: &DrainRemoteCheckpoint,
@@ -7087,7 +7130,27 @@ fn recorded_drain_starts_over(
     if !checkpoint.completed_shards.is_empty() {
         return Ok(false);
     }
-    let Some((limit, why)) = drain_row_limit_now(options, column) else {
+    let folders = drain_spill_folders(options, &checkpoint.epoch_id);
+    let mut spilled = false;
+    for folder in &folders {
+        spilled |= load_drain_local_checkpoint(folder, &checkpoint.epoch_id)?
+            .is_some_and(|local| local.batches_done > 0);
+    }
+    let limit = if spilled {
+        let on_disk = spawn_blocking(move || {
+            folders
+                .iter()
+                .map(|folder| dir_bytes(folder).unwrap_or(0))
+                .sum()
+        })
+        .await
+        .map_err(|error| BuildError::Store(format!("drain scratch size: {error}")))?;
+        let space = disk_space(&drain_scratch_parent(options));
+        spilled_drain_row_limit(options, column, space, on_disk)
+    } else {
+        drain_row_limit_now(options, column)
+    };
+    let Some((limit, why)) = limit else {
         return Ok(false);
     };
     let mut oldest_first = recorded.to_vec();
@@ -7097,24 +7160,14 @@ fn recorded_drain_starts_over(
     if fitting.len() == recorded.len() {
         return Ok(false);
     }
-    // Read last: the common case, an epoch that fits, never needs it.
-    for scratch in [
-        drain_scratch_dir(options, &checkpoint.epoch_id),
-        legacy_drain_scratch_dir(&checkpoint.epoch_id),
-    ] {
-        if load_drain_local_checkpoint(&scratch, &checkpoint.epoch_id)?
-            .is_some_and(|local| local.batches_done > 0)
-        {
-            return Ok(false);
-        }
-    }
     info!(
         recorded_superfiles = recorded.len(),
         fitting_superfiles = fitting.len(),
         fitting_rows,
         limit_rows = limit,
         limit = why.label(),
-        "[supertable drain] the recorded drain has finished nothing and no longer fits the row limit; starting a smaller one"
+        spilled,
+        "[supertable drain] the recorded drain has uploaded nothing and no longer fits the row limit; starting a smaller one"
     );
     Ok(true)
 }
@@ -7507,7 +7560,16 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             &column,
             &remote_state.checkpoint,
             &selected,
-        )? {
+        )
+        .await?
+        {
+            // What the epoch spilled goes with it: nothing resumes from it,
+            // and the disk it holds is what the smaller drain needs.
+            for folder in
+                drain_spill_folders(&user_inner.options, &remote_state.checkpoint.epoch_id)
+            {
+                DrainScratch::remove_folder(&user_inner.options, folder);
+            }
             None
         } else {
             // The recorded layout, not the current `drain_batch_superfiles`,
@@ -16321,6 +16383,11 @@ mod tests {
     /// Disk budget per byte of it that temp files may take.
     const SCRATCH_SHARE_OF_BUDGET: u64 = 2;
 
+    /// Rows of room a spilled drain's own spill is checked to add.
+    const SPILLED_ROWS_ROOM: u64 = 1_000;
+    /// Free and total bytes of the scratch disk that check is made on.
+    const SPILLED_TEST_DISK: (u64, u64) = (1 << 30, 1 << 34);
+
     /// Bytes of each file a process killed mid-drain leaves in its folder.
     const CRASH_LEFTOVER_BYTES: usize = 4096;
     const COMMIT_AS_DRAIN_TEST_DIM: usize = 16;
@@ -17792,26 +17859,50 @@ mod tests {
             .await
             .expect("record the drain");
         let column = vector_index_column(table.inner()).expect("vector column");
-        let starts_over = |checkpoint: &DrainRemoteCheckpoint| {
-            recorded_drain_starts_over(options, &column, checkpoint, &sources).expect("decide")
+        let starts_over = async |checkpoint: &DrainRemoteCheckpoint| {
+            recorded_drain_starts_over(options, &column, checkpoint, &sources)
+                .await
+                .expect("decide")
         };
 
-        // A shard already uploaded, or a batch already spilled, is kept.
+        // A shard already uploaded is kept. So is a batch already spilled
+        // when only `vector.drain_max_rows` says the drain is too large:
+        // the disk holds it, and starting over would spill it again.
         let mut uploaded = checkpoint.clone();
         uploaded.completed_shards.push(DrainRemoteShard {
             shard_id: 0,
             superfile_id: "uploaded".into(),
             cell_counts: Vec::new(),
         });
-        assert!(!starts_over(&uploaded));
+        assert!(!starts_over(&uploaded).await);
         let scratch = drain_scratch_dir(options, &checkpoint.epoch_id);
         fs::create_dir_all(&scratch).expect("scratch");
         let mut spilled = DrainLocalCheckpoint::new(checkpoint.epoch_id.clone());
         spilled.batches_done = 1;
         save_drain_local_checkpoint(&scratch, &spilled).expect("local checkpoint");
-        assert!(!starts_over(&checkpoint));
-        fs::remove_dir_all(&scratch).expect("remove scratch");
-        assert!(starts_over(&checkpoint));
+        assert!(!starts_over(&checkpoint).await);
+        // A spilled drain is measured against the disk alone, with what it
+        // has spilled counted as room: each byte of spill is room for half
+        // a byte more, the other half being its cells.
+        let row_bytes = drain_spill_row_bytes(options, &column).expect("vector column");
+        let rows_with = |on_disk: u64| {
+            spilled_drain_row_limit(options, &column, Some(SPILLED_TEST_DISK), on_disk)
+                .expect("the disk limits it")
+        };
+        let (rows, why) = rows_with(0);
+        assert_eq!(why, DrainRowLimit::ScratchDisk);
+        let held = SPILLED_ROWS_ROOM * row_bytes * DRAIN_SPILL_ROOM_DIVISOR;
+        assert_eq!(rows_with(held).0, rows + SPILLED_ROWS_ROOM);
+        assert_eq!(
+            spilled_drain_row_limit(options, &column, None, held),
+            None,
+            "an unreadable disk limits nothing"
+        );
+
+        // What it wrote before its first batch finished goes with it.
+        spilled.batches_done = 0;
+        save_drain_local_checkpoint(&scratch, &spilled).expect("local checkpoint");
+        assert!(starts_over(&checkpoint).await);
 
         drain_user_superfiles_to_hidden_cells(
             Arc::clone(table.inner()),
@@ -17819,6 +17910,7 @@ mod tests {
         )
         .await
         .expect("drain");
+        assert!(!scratch.exists(), "the dropped drain's folder is removed");
         let drained = hidden.inner().manifest.load_full().get_drained_ranges();
         for (i, version) in versions.iter().enumerate() {
             assert_eq!(
