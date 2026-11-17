@@ -7267,6 +7267,54 @@ async fn materialized_user_rows_for_drain(
     materialized_ivf_rows_in_doc_order(vec_reader, column, stable_ids, tombstones).await
 }
 
+/// Drain every user commit waiting now into the hidden per-cell index.
+///
+/// One drain takes as many of the oldest waiting commits as it has room for
+/// on the scratch disk and in the table's disk budget (see
+/// [`drain_row_limit`]), so this runs drains until the commits that were
+/// waiting when it started are all in the hidden index. Commits that land
+/// meanwhile wait for the next call, so a table under load still reaches
+/// the steps after its drain. It stops early when a drain takes nothing on
+/// (another drain holds the table, or draining is turned off), and with a
+/// drain's error.
+pub(in crate::supertable) async fn drain_waiting_user_superfiles(
+    user_inner: Arc<SupertableInner>,
+    hidden_inner: Arc<SupertableInner>,
+) -> Result<(), BuildError> {
+    let drained = hidden_inner.manifest.load_full().get_drained_ranges();
+    let waiting: Vec<u64> = user_inner
+        .manifest
+        .load_full()
+        .get_all_superfiles_loaded()
+        .await
+        .map_err(|e| BuildError::Store(e.to_string()))?
+        .iter()
+        .map(|source| source.birth_version)
+        .filter(|version| !drained.contains(*version))
+        .collect();
+    let mut left = waiting.len();
+    loop {
+        drain_user_superfiles_to_hidden_cells(Arc::clone(&user_inner), Arc::clone(&hidden_inner))
+            .await?;
+        let drained = hidden_inner.manifest.load_full().get_drained_ranges();
+        let still_waiting = waiting
+            .iter()
+            .filter(|version| !drained.contains(**version))
+            .count();
+        if still_waiting == 0 {
+            return Ok(());
+        }
+        if still_waiting == left {
+            info!(
+                waiting_superfiles = still_waiting,
+                "[supertable drain] a drain took nothing on; the commits left wait for a later optimize"
+            );
+            return Ok(());
+        }
+        left = still_waiting;
+    }
+}
+
 /// Drain user superfiles into the hidden cell index.
 ///
 /// A drain lands in TWO manifest commits:
@@ -16244,6 +16292,9 @@ mod tests {
         expect_stamped(&loaded);
     }
 
+    /// Disk budget per byte of it that temp files may take.
+    const SCRATCH_SHARE_OF_BUDGET: u64 = 2;
+
     /// Bytes of each file a process killed mid-drain leaves in its folder.
     const CRASH_LEFTOVER_BYTES: usize = 4096;
     const COMMIT_AS_DRAIN_TEST_DIM: usize = 16;
@@ -17750,6 +17801,119 @@ mod tests {
                 "commit {i} (version {version})"
             );
         }
+    }
+
+    /// Draining a table through its handle, as `optimize` does, leaves no
+    /// commit waiting, however few commits one drain has room for.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_row_limited_table_is_drained_in_one_call() {
+        const COMMITS: usize = 3;
+        let directory = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(directory.path()).expect("provider"));
+        let table = Supertable::create(
+            options_title_emb_serial(COMMIT_AS_DRAIN_TEST_DIM)
+                .with_storage(Arc::clone(&storage))
+                .with_drain_max_rows(COMMIT_AS_DRAIN_TEST_ROWS as u64),
+        )
+        .expect("create");
+        for _ in 0..COMMITS {
+            let mut writer = table.writer().expect("writer");
+            writer
+                .append(&build_axis_vector_batch(
+                    COMMIT_AS_DRAIN_TEST_ROWS,
+                    COMMIT_AS_DRAIN_TEST_DIM,
+                ))
+                .expect("append");
+            writer.commit().expect("commit");
+        }
+        let hidden = table
+            .inner()
+            .vector_index_table
+            .as_ref()
+            .expect("hidden table")
+            .clone();
+
+        drain_waiting_user_superfiles(Arc::clone(table.inner()), Arc::clone(hidden.inner()))
+            .await
+            .expect("drain");
+
+        let drained = hidden.inner().manifest.load_full().get_drained_ranges();
+        let sources = table
+            .inner()
+            .manifest
+            .load_full()
+            .get_all_superfiles_loaded()
+            .await
+            .expect("user sources");
+        assert_eq!(sources.len(), COMMITS);
+        assert!(
+            sources
+                .iter()
+                .all(|source| drained.contains(source.birth_version)),
+            "every commit is drained"
+        );
+        let hidden_rows: u64 = hidden
+            .inner()
+            .manifest
+            .load_full()
+            .get_all_superfiles_loaded()
+            .await
+            .expect("hidden superfiles")
+            .iter()
+            .map(|s| s.n_docs)
+            .sum();
+        assert_eq!(hidden_rows, (COMMITS * COMMIT_AS_DRAIN_TEST_ROWS) as u64);
+    }
+
+    /// On a table whose disk budget has room for one commit's temp files at
+    /// a time, one `optimize` still drains every commit, a drain at a time,
+    /// and its compaction leaves the hidden index in as few files as on a
+    /// table with room for the whole drain at once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn optimize_on_a_tight_disk_budget_drains_every_commit_and_merges_what_it_drained() {
+        const COMMITS: usize = 3;
+        let optimized = async |disk_budget_bytes: u64| {
+            let dir = TempDir::new().expect("tempdir");
+            let (table, cache) = drain_table_with_disk_cache(&dir, disk_budget_bytes);
+            for _ in 0..COMMITS {
+                commit_axis_vectors(&table, COMMIT_AS_DRAIN_TEST_ROWS);
+            }
+            let (hidden, _) = current_drain_epoch(&table).await;
+            table
+                .optimize(&OptimizeOptions::compact(CompactionSettings {
+                    min_fill_percent: 100,
+                    min_superfiles_for_merge: 2,
+                    ..CompactionSettings::default()
+                }))
+                .expect("optimize");
+            let hidden_files = hidden
+                .inner()
+                .manifest
+                .load_full()
+                .get_all_superfiles_loaded()
+                .await
+                .expect("hidden superfiles")
+                .len();
+            cache.assert_budget_consistent();
+            (hidden_index_rows(&hidden).await, hidden_files)
+        };
+        // A budget whose share for temp files holds one commit's spill and
+        // cells.
+        let one_commit = {
+            let dir = TempDir::new().expect("tempdir");
+            let (table, _) = drain_table_with_disk_cache(&dir, roomy_disk_budget());
+            let row_bytes =
+                drain_spill_row_bytes(&table.inner().options, "emb").expect("vector column");
+            COMMIT_AS_DRAIN_TEST_ROWS as u64 * row_bytes * DRAIN_SPILL_ROOM_DIVISOR
+        };
+
+        let (roomy_rows, roomy_files) = optimized(roomy_disk_budget()).await;
+        let (tight_rows, tight_files) = optimized(one_commit * SCRATCH_SHARE_OF_BUDGET).await;
+        let all_rows = (COMMITS * COMMIT_AS_DRAIN_TEST_ROWS) as u64;
+        assert_eq!(roomy_rows, all_rows);
+        assert_eq!(tight_rows, all_rows, "every commit is drained");
+        assert_eq!(tight_files, roomy_files, "and merged into as few files");
     }
 
     /// Compaction that runs while a row-limited drain is stopped partway must

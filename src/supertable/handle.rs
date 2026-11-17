@@ -1282,7 +1282,7 @@ impl Supertable {
             return Ok(());
         };
         bridge_on_runtime(
-            super::writer::drain_user_superfiles_to_hidden_cells(
+            super::writer::drain_waiting_user_superfiles(
                 Arc::clone(&self.inner),
                 Arc::clone(&hidden.inner),
             ),
