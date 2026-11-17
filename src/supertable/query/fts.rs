@@ -87,7 +87,7 @@ use std::{
 use arrow::record_batch::RecordBatch;
 use arrow_array::{Array, LargeStringArray};
 use datafusion::logical_expr::Expr;
-use futures::future::join;
+use futures::future::{join, try_join_all};
 use roaring::RoaringBitmap;
 use tokio::sync::OnceCell;
 use tracing::{Instrument, debug, warn};
@@ -2557,11 +2557,14 @@ impl SupertableReader {
             prefix: prefix.to_ascii_lowercase().into_bytes(),
         };
         let kept = self.select_scored(column, &prune_leaf, None).await?;
-        let shoulds = self
+        let (shoulds, ranked) = self
             .expand_prefix(column, &prune_leaf, kept.clone())
             .await?;
         if shoulds.is_empty() {
             return Ok(Vec::new());
+        }
+        if ranked {
+            return self.best_completion_search(column, shoulds, kept, k).await;
         }
         let clauses = ScoredClauses {
             shoulds,
@@ -2575,16 +2578,55 @@ impl SupertableReader {
         Ok(hits)
     }
 
-    /// Every term in `column` starting with `prefix_leaf`'s prefix, across
-    /// the superfiles in `kept`, deduplicated and in byte order: from the
-    /// term index for the superfiles it covers, from the dictionaries of
-    /// the rest.
+    /// The top `k` documents by their best completion: a document scores
+    /// as its highest-scoring term among `completions`. Each completion is
+    /// searched on its own and the lists merged by the best score: a
+    /// document in the top `k` by its best completion is in that
+    /// completion's own top `k`, or `k` documents would beat it there and
+    /// so by their best.
+    async fn best_completion_search(
+        &self,
+        column: &str,
+        completions: Vec<String>,
+        kept: Vec<Arc<SuperfileEntry>>,
+        k: usize,
+    ) -> Result<Vec<SuperfileHit>, QueryError> {
+        let searches = completions.into_iter().map(|term| {
+            let clauses = ScoredClauses {
+                shoulds: vec![term],
+                ..ScoredClauses::default()
+            };
+            self.bm25_search_clauses(column, clauses, kept.clone(), k, None, 0.0, None, false)
+        });
+        let mut best: HashMap<(SuperfileUri, u32), SuperfileHit> = HashMap::new();
+        for (hits, _) in try_join_all(searches).await? {
+            for hit in hits {
+                best.entry((hit.superfile, hit.local_doc_id))
+                    .and_modify(|b| {
+                        if hit.score > b.score {
+                            *b = hit.clone();
+                        }
+                    })
+                    .or_insert(hit);
+            }
+        }
+        let id_mins: HashMap<SuperfileUri, i128> = kept.iter().map(|e| (e.uri, e.id_min)).collect();
+        select_top_k_stable(self, vec![best.into_values().collect()], k, &id_mins).await
+    }
+
+    /// The terms in `column` starting with `prefix_leaf`'s prefix a search
+    /// scores, and whether they are the prefix's most frequent completions
+    /// (scored by the best one) rather than every completion (scored as a
+    /// disjunction): where the term index covers every superfile in `kept`,
+    /// its most frequent completions; else every completion, across the
+    /// superfiles, deduplicated and in byte order, from the term index for
+    /// the superfiles it covers and from the dictionaries of the rest.
     async fn expand_prefix(
         &self,
         column: &str,
         prefix_leaf: &PruneLeaf,
         kept: Vec<Arc<SuperfileEntry>>,
-    ) -> Result<Vec<String>, QueryError> {
+    ) -> Result<(Vec<String>, bool), QueryError> {
         let PruneLeaf::Prefix { prefix, .. } = prefix_leaf else {
             return Err(QueryError::Internal(
                 "prefix expansion without a prefix".into(),
@@ -2614,6 +2656,7 @@ impl SupertableReader {
                     return index
                         .top_prefix_completions(field, text, &live, PREFIX_COMPLETIONS)
                         .await
+                        .map(|terms| (terms, true))
                         .map_err(QueryError::from);
                 }
                 if !live.is_empty() {
@@ -2656,10 +2699,13 @@ impl SupertableReader {
         terms.extend(per_superfile.into_iter().flatten());
         // Dictionary keys are valid UTF-8 by construction: a tokenizer emits
         // `&str` terms.
-        Ok(terms
-            .into_iter()
-            .filter_map(|t| String::from_utf8(t).ok())
-            .collect())
+        Ok((
+            terms
+                .into_iter()
+                .filter_map(|t| String::from_utf8(t).ok())
+                .collect(),
+            false,
+        ))
     }
 
     /// Parse `query` into positive and negated tokens, then select the

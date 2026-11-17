@@ -10,7 +10,7 @@
 //! documents that carry both terms before any superfile is read.
 #![deny(clippy::unwrap_used)]
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use arrow_array::{ArrayRef, LargeStringArray, RecordBatch};
 use datafusion::prelude::{col, lit};
@@ -984,4 +984,46 @@ fn a_table_indexed_by_the_layout_before_tiers_serves_as_before_and_rebuilds() {
         served |= stats.tier_entries > 0 || stats.superfiles_resolved > 0;
     }
     assert!(served, "after the rebuild the tiers serve");
+}
+
+/// A prefix over a table the term index covers scores each document by its
+/// best completion — its highest-scoring term among the prefix's
+/// completions — not their sum: "t" completes to "the" and "tensor", and a
+/// document holding both scores as the better of the two.
+#[test]
+fn a_prefix_scores_each_document_by_its_best_completion() {
+    let dir = TempDir::new().expect("tempdir");
+    let st = table(&dir, true);
+    let reader = st.reader().expect("reader");
+    let all = SUPERFILES * DOCS_PER_SUPERFILE;
+    let mut best: HashMap<(String, u32), f32> = HashMap::new();
+    for term in ["the", "tensor"] {
+        for h in reader
+            .bm25_hits("body", term, all, Bm25SearchOptions::new())
+            .expect("hits")
+        {
+            let score = best
+                .entry((format!("{:?}", h.superfile), h.local_doc_id))
+                .or_insert(h.score);
+            *score = score.max(h.score);
+        }
+    }
+    let mut want: Vec<f32> = best.values().copied().collect();
+    want.sort_by(|a, b| b.total_cmp(a));
+    for k in [1usize, 10, 100, all] {
+        let got = reader.bm25_search_prefix("body", "t", k).expect("prefix");
+        let got_scores: Vec<f32> = got.iter().map(|h| h.score).collect();
+        assert_eq!(
+            got_scores,
+            want[..k.min(want.len())],
+            "k={k}: scores by best completion"
+        );
+        for h in &got {
+            assert_eq!(
+                best[&(format!("{:?}", h.superfile), h.local_doc_id)],
+                h.score,
+                "k={k}: a document scores as its best completion"
+            );
+        }
+    }
 }
