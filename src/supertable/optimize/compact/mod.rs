@@ -3300,6 +3300,7 @@ mod tests {
                 change::{FieldPatch, SchemaPatch},
             },
             storage::{LocalFsStorageProvider, StorageProvider},
+            wal::persistence::WAL_DIR,
             writer::{persist_commit_async, stamp_term_index},
         },
         test_helpers::{
@@ -9929,14 +9930,110 @@ mod tests {
         );
     }
 
+    /// Storage for `a_delete_survives_a_pass_whose_merges_commit_one_by_one`.
+    /// Once the delete has read a target's sidecar, its next write to its
+    /// own log waits for the test, so each merge commits while the delete sits
+    /// between two attempts, however slowly either of them runs.
+    #[derive(Debug)]
+    struct ParkedDeleteStorage {
+        inner: LocalFsStorageProvider,
+        /// The sidecars of the last merge's inputs, one of which holds the row
+        /// to delete; none until the fixture is built.
+        target_sidecars: Mutex<Vec<String>>,
+        /// Set by a read of a target sidecar, taken by the log write it holds.
+        read_target: AtomicBool,
+        /// A permit per log write held.
+        parked: Semaphore,
+        /// A permit per held write the test lets go; closed once it lets them
+        /// all go.
+        resume: Semaphore,
+    }
+
+    impl ParkedDeleteStorage {
+        fn new(dir: &TempDir) -> Arc<Self> {
+            Arc::new(Self {
+                inner: LocalFsStorageProvider::new(dir.path()).expect("provider"),
+                target_sidecars: Mutex::new(Vec::new()),
+                read_target: AtomicBool::new(false),
+                parked: Semaphore::new(0),
+                resume: Semaphore::new(0),
+            })
+        }
+
+        fn hold_after_reads_of(&self, superfile_ids: &[Uuid]) {
+            *self.target_sidecars.lock().expect("targets lock") = superfile_ids
+                .iter()
+                .map(|&id| WalStore::tombstones_path(id))
+                .collect();
+        }
+
+        /// Lets the held write go, and every later one through.
+        fn release(&self) {
+            self.resume.close();
+        }
+    }
+
+    #[async_trait]
+    impl StorageProvider for ParkedDeleteStorage {
+        async fn head(&self, uri: &str) -> Result<ObjectMeta, StorageError> {
+            self.inner.head(uri).await
+        }
+        async fn get(&self, uri: &str) -> Result<(Bytes, ObjectMeta), StorageError> {
+            if self
+                .target_sidecars
+                .lock()
+                .expect("targets lock")
+                .iter()
+                .any(|target| target == uri)
+            {
+                self.read_target.store(true, Ordering::Release);
+            }
+            self.inner.get(uri).await
+        }
+        async fn get_range(&self, uri: &str, range: Range<u64>) -> Result<Bytes, StorageError> {
+            self.inner.get_range(uri, range).await
+        }
+        async fn put_atomic(
+            &self,
+            uri: &str,
+            bytes: Bytes,
+        ) -> Result<Option<String>, StorageError> {
+            self.inner.put_atomic(uri, bytes).await
+        }
+        async fn put_overwrite(&self, uri: &str, bytes: Bytes) -> Result<(), StorageError> {
+            self.inner.put_overwrite(uri, bytes).await
+        }
+        async fn put_if_match(
+            &self,
+            uri: &str,
+            bytes: Bytes,
+            expected_etag: Option<&str>,
+        ) -> Result<Option<String>, StorageError> {
+            if uri.starts_with(WAL_DIR) && self.read_target.swap(false, Ordering::AcqRel) {
+                self.parked.add_permits(1);
+                if let Ok(permit) = self.resume.acquire().await {
+                    permit.forget();
+                }
+            }
+            self.inner.put_if_match(uri, bytes, expected_etag).await
+        }
+        async fn put_multipart(&self, uri: &str) -> Result<Box<dyn MultipartUpload>, StorageError> {
+            self.inner.put_multipart(uri).await
+        }
+        async fn delete(&self, uri: &str) -> Result<(), StorageError> {
+            self.inner.delete(uri).await
+        }
+    }
+
     /// The refund is what keeps a delete alive across a pass of several merges.
     ///
     /// The delete's targets sit in the LAST merge's inputs, so nothing it does
     /// lands until that merge commits. Each earlier commit removes superfiles
     /// from the manifest, which is the compactor's progress, and that is what
-    /// refunds the budget. Lowered to three retries, an unrefunded delete
-    /// exhausts after roughly 700 ms of backoff, well before the last merge
-    /// publishes at ~1.2 s.
+    /// refunds the budget. Each merge commits while the delete is held between
+    /// two attempts, so the delete makes one attempt per merge: three or four
+    /// against a budget of two, which only the refund survives, on a slow
+    /// runner as on a fast one.
     ///
     /// Every superfile in the table is sealed before the delete starts, so
     /// this also covers the case where a blocked delete has nowhere unsealed
@@ -9948,18 +10045,15 @@ mod tests {
     /// `an_append_does_not_refund_the_sealed_budget`.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_delete_survives_a_pass_whose_merges_commit_one_by_one() {
-        /// Small enough that an unrefunded delete exhausts inside the test.
-        const SEALED_RETRY_BUDGET: u32 = 3;
-        /// Gap between commits, comfortably under the ~700 ms an
-        /// unrefunded delete survives and over nothing else.
-        const COMMIT_GAP: Duration = Duration::from_millis(300);
+        /// Fewer attempts than the merges the delete waits through, so only the
+        /// refund keeps it alive.
+        const SEALED_RETRY_BUDGET: u32 = 2;
 
         let dir = TempDir::new().expect("tempdir");
-        let storage: Arc<dyn StorageProvider> =
-            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let storage = ParkedDeleteStorage::new(&dir);
         let st = Supertable::create(
             default_supertable_options()
-                .with_storage(storage)
+                .with_storage(Arc::clone(&storage) as Arc<dyn StorageProvider>)
                 .with_max_sealed_retries(SEALED_RETRY_BUDGET),
         )
         .expect("create supertable");
@@ -9997,24 +10091,44 @@ mod tests {
             );
         }
 
+        storage.hold_after_reads_of(&[live[6], live[7]]);
         let deleting = st.clone();
         let title = doomed.to_string();
-        let delete = task::spawn_blocking(move || {
+        let mut delete = task::spawn_blocking(move || {
             deleting
                 .delete(col("title").eq(lit(title)))
                 .map(|s| (s.matched(), s.n_tombstoned()))
         });
 
-        // Publish the merges one at a time. Only the last frees the target.
+        // Publish the merges one at a time, each while the delete is held
+        // between attempts. Only the last frees the target. A delete that runs
+        // out of attempts ends the wait.
+        let mut finished = None;
         for prepared in prepared_jobs {
-            tokio::time::sleep(COMMIT_GAP).await;
-            st.commit_compaction_batch(vec![prepared])
-                .await
-                .expect("the batch commits");
+            tokio::select! {
+                parked = storage.parked.acquire() => parked.expect("parked never closes").forget(),
+                out = &mut delete => {
+                    finished = Some(out);
+                    break;
+                }
+            }
+            let committed = st.commit_compaction_batch(vec![prepared]).await;
+            if committed.is_err() {
+                // Free the parked delete first: a panic with it still held
+                // leaves its blocking task waiting, and the runtime never
+                // shuts down.
+                storage.release();
+            }
+            committed.expect("the batch commits");
+            storage.resume.add_permits(1);
         }
+        storage.release();
 
-        let (matched, tombstoned) = delete
-            .await
+        let out = match finished {
+            Some(out) => out,
+            None => delete.await,
+        };
+        let (matched, tombstoned) = out
             .expect("delete task")
             .expect("earlier merges committing must refund the budget");
         assert_eq!(matched, 1, "the predicate must have resolved its row");
