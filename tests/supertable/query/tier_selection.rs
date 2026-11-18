@@ -10,7 +10,7 @@
 //! documents that carry both terms before any superfile is read.
 #![deny(clippy::unwrap_used)]
 
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use arrow_array::{ArrayRef, LargeStringArray, RecordBatch};
 use datafusion::prelude::{col, lit};
