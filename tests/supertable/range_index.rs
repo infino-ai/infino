@@ -89,6 +89,9 @@ const QUERIES: &[&str] = &[
     "SELECT count(*) FILTER (WHERE qty > 0) AS a, count(*) FILTER (WHERE price > 500) AS b FROM {t} WHERE seq < 6000",
     "SELECT count(*) FILTER (WHERE qty > 0) AS a, count(*) FILTER (WHERE qty > 100 OR qty < -100) AS b FROM {t}",
     TIE_BROKEN_TOP_K,
+    ONE_FILTERED_COUNT,
+    "SELECT count(*) FILTER (WHERE seq % 7 = 0) AS n FROM {t} WHERE qty > 0",
+    "SELECT count(*) FILTER (WHERE qty > 100) AS n FROM {t} WHERE seq % 7 = 0",
     "SELECT seq, qty FROM {t} WHERE qty < -200 ORDER BY qty DESC, seq DESC LIMIT 7",
     "SELECT seq, price AS price FROM {t} WHERE price > 900 ORDER BY price ASC NULLS LAST, seq ASC NULLS LAST LIMIT 10",
     "SELECT seq, qty FROM {t} WHERE qty BETWEEN 240 AND 249 ORDER BY qty DESC, seq LIMIT 30",
@@ -116,6 +119,20 @@ const BUCKETED_DAY: &str = "SELECT count(*) FILTER (WHERE day < DATE '2022-04-01
 /// Buckets beside the whole table's count, under a `WHERE` that holds every
 /// row: a search request's range aggregation and its hit total together.
 const BUCKETED_WITH_TOTAL: &str = "SELECT count(*) AS total, count(*) FILTER (WHERE price < 250) AS a, count(*) FILTER (WHERE price >= 250 AND price < 500) AS b, count(*) FILTER (WHERE price >= 500) AS c FROM {t} WHERE 1=1";
+/// How a physical plan shows a count that checks no filter of its own (the
+/// output keeps the name the filtered count gave it).
+const UNFILTERED_COUNT: &str = "aggr=[count(1) as ";
+/// One count with a filter on no range-indexed column: a search's hit total.
+const ONE_FILTERED_COUNT: &str = "SELECT count(*) FILTER (WHERE seq % 7 = 0) AS n FROM {t}";
+/// The `qty` a lone filtered count over the nullable column compares
+/// against: a range the index answers.
+const NULLABLE_QTY_BOUND: i32 = 100;
+/// The divisor of a lone filtered count's predicate over the nullable
+/// column that no index answers, so its plan shows the rewrite.
+const NULLABLE_QTY_DIVISOR: i32 = 7;
+/// A `WHERE` no row passes (`seq` is never negative): a count over empty
+/// input.
+const NO_ROWS: &str = "WHERE seq < 0";
 /// How a plan shows an aggregate that checks its own filter on each row; a
 /// bucketed count the range index answers has none.
 const BUCKET_FILTER: &str = "FILTER (WHERE";
@@ -156,15 +173,21 @@ fn schema() -> Arc<Schema> {
     ]))
 }
 
+/// A predicate over `qty` in SQL, beside whether it holds for a row's `qty`.
+type QtyPredicate = (String, fn(Option<i32>) -> bool);
+
+/// Row `seq`'s `qty`: spread over `-250..250`, null every
+/// [`QTY_NULL_EVERY`] rows.
+fn qty_of(seq: i64) -> Option<i32> {
+    (seq % QTY_NULL_EVERY != 0).then(|| ((seq * 37) % 500 - 250) as i32)
+}
+
 /// Rows `first..first + ROWS_PER_FILE`: `qty` spread over `-250..250` with
 /// nulls, `price` over `0..1000`, `day` over a year — none of them in the
 /// order the rows arrive.
 fn rows(first: i64) -> RecordBatch {
     let seq: Vec<i64> = (first..first + ROWS_PER_FILE).collect();
-    let qty: Vec<Option<i32>> = seq
-        .iter()
-        .map(|i| (i % QTY_NULL_EVERY != 0).then(|| ((i * 37) % 500 - 250) as i32))
-        .collect();
+    let qty: Vec<Option<i32>> = seq.iter().map(|i| qty_of(*i)).collect();
     let price: Vec<f64> = seq
         .iter()
         .map(|i| ((i * 7919) % 10_000) as f64 / 10.0)
@@ -214,6 +237,25 @@ fn answer(db: &Connection, query: &str, table: &str) -> String {
         .query_sql(&query.replace("{t}", table))
         .unwrap_or_else(|e| panic!("{query} on {table}: {e}"));
     pretty_format_batches(&batches).expect("format").to_string()
+}
+
+/// The counts `query` on `table` returns, one per row it keeps.
+fn counts(db: &Connection, query: &str, table: &str) -> Vec<i64> {
+    let batches = db
+        .query_sql(&query.replace("{t}", table))
+        .unwrap_or_else(|e| panic!("{query} on {table}: {e}"));
+    batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("an Int64 count")
+                .values()
+                .to_vec()
+        })
+        .collect()
 }
 
 /// The rows the scan of an analyzed plan read (its `output_rows`, which
@@ -384,6 +426,29 @@ fn a_range_indexed_table_answers_as_a_scan_does_through_deletes_compaction_and_r
             "{query}: {ranged}"
         );
     }
+    // A lone filtered count is a count over a filter the scan takes, on
+    // either table: the aggregate checks no filter of its own on each row.
+    // It counts what the same filter in the `WHERE` counts.
+    for table in ["plain", "ranged"] {
+        let plan = answer(&db, &format!("EXPLAIN {ONE_FILTERED_COUNT}"), table);
+        assert!(plan.contains(UNFILTERED_COUNT), "{table}: {plan}");
+        for (filtered, plain) in [
+            (
+                ONE_FILTERED_COUNT,
+                "SELECT count(*) AS n FROM {t} WHERE seq % 7 = 0",
+            ),
+            (
+                "SELECT count(*) FILTER (WHERE seq % 7 = 0) AS n FROM {t} WHERE qty > 0",
+                "SELECT count(*) AS n FROM {t} WHERE qty > 0 AND seq % 7 = 0",
+            ),
+        ] {
+            assert_eq!(
+                answer(&db, filtered, table),
+                answer(&db, plain, table),
+                "{table}: {filtered}"
+            );
+        }
+    }
     // A top-k broken by a later key reads the rows up to the cutoff from the
     // range index, ties included, not every row of the range.
     let query = format!("EXPLAIN ANALYZE {TIE_BROKEN_TOP_K}");
@@ -417,6 +482,59 @@ fn a_range_indexed_table_answers_as_a_scan_does_through_deletes_compaction_and_r
     drop(db);
     let reopened = connect(path).expect("reconnect");
     assert_same_answers(&reopened, QUERIES, "after a reopen");
+}
+
+/// A lone filtered count over a nullable column, under a `HAVING` over the
+/// count, counts the rows its predicate holds for — a null `qty` in none of
+/// them, unless the predicate asks for nulls — whether the count is a range
+/// the index answers or a filter the scan checks, and over empty input
+/// counts zero: the `HAVING` keeps the one row at its count and drops it
+/// above.
+#[test]
+fn a_lone_filtered_count_over_a_nullable_column_under_a_having_counts_the_rows_it_holds_for() {
+    let dir = TempDir::new().expect("tempdir");
+    let db = connect(dir.path().to_str().expect("utf-8 path")).expect("connect");
+    create(&db);
+    let predicates: [QtyPredicate; 4] = [
+        (format!("qty > {NULLABLE_QTY_BOUND}"), |qty| {
+            qty.is_some_and(|value| value > NULLABLE_QTY_BOUND)
+        }),
+        (format!("NOT (qty > {NULLABLE_QTY_BOUND})"), |qty| {
+            qty.is_some_and(|value| value <= NULLABLE_QTY_BOUND)
+        }),
+        (format!("qty % {NULLABLE_QTY_DIVISOR} = 0"), |qty| {
+            qty.is_some_and(|value| value % NULLABLE_QTY_DIVISOR == 0)
+        }),
+        ("qty IS NULL".to_string(), |qty| qty.is_none()),
+    ];
+    for (predicate, holds) in &predicates {
+        let held = (0..FILES * ROWS_PER_FILE)
+            .filter(|seq| holds(qty_of(*seq)))
+            .count();
+        let held = i64::try_from(held).expect("a count");
+        assert!(held > 0, "{predicate} holds for no row");
+        let count = format!("count(*) FILTER (WHERE {predicate})");
+        for table in ["plain", "ranged"] {
+            for (input, expected) in [("", held), (NO_ROWS, 0)] {
+                let select = format!("SELECT {count} AS n FROM {{t}} {input}");
+                let kept = format!("{select} HAVING {count} >= {expected}");
+                assert_eq!(counts(&db, &kept, table), [expected], "{table}: {kept}");
+                let dropped = format!("{select} HAVING {count} > {expected}");
+                assert!(
+                    counts(&db, &dropped, table).is_empty(),
+                    "{table}: {dropped}"
+                );
+            }
+        }
+    }
+    // The `HAVING` leaves the count for the rewrite: under it, a predicate
+    // no index answers is a filter the scan takes, not the aggregate's own.
+    let count = format!("count(*) FILTER (WHERE qty % {NULLABLE_QTY_DIVISOR} = 0)");
+    let query = format!("EXPLAIN SELECT {count} AS n FROM {{t}} HAVING {count} > 0");
+    for table in ["plain", "ranged"] {
+        let plan = answer(&db, &query, table);
+        assert!(plan.contains(UNFILTERED_COUNT), "{table}: {plan}");
+    }
 }
 
 #[test]
