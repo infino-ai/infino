@@ -111,12 +111,13 @@ jobs:
           }
           refuse() { echo "go=false" >> "$GITHUB_OUTPUT"; echo "::notice::$1 has no write access; nothing to do"; exit 0; }
           if [ "$EVENT" = "issue_comment" ]; then
-            # The command is the comment's first non-blank line, so leading blank lines do not hide it.
-            command=$(printf '%s\n' "$COMMENT" | awk 'NF { print $1; exit }')
-            case "$command" in
-              /autofix) mode=autofix;;
-              *) echo "go=false" >> "$GITHUB_OUTPUT"; echo "not a loop command"; exit 0;;
-            esac
+            # A run starts only when a line of the comment begins with /autofix, in any case. This is
+            # intended: /autofix anywhere else in a line is talk about the command, not the command.
+            # GitHub's comment box ends lines with \r\n and awk keeps the \r in a word, so it goes first.
+            if [ -z "$(printf '%s\n' "$COMMENT" | tr -d '\r' | awk 'tolower($1) == "/autofix" { print; exit }')" ]; then
+              echo "go=false" >> "$GITHUB_OUTPUT"; echo "not a loop command"; exit 0
+            fi
+            mode=autofix
             allowed "$COMMENTER" || refuse "$COMMENTER"
             # 👀 on the command: it was seen and a run is starting. A reaction that fails starts the run anyway.
             gh api -X POST "repos/$REPO/issues/comments/$COMMENT_ID/reactions" -f content=eyes --silent || true
