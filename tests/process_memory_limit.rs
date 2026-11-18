@@ -141,7 +141,7 @@ fn load_docs(dir: &TempDir) -> Connection {
     let db = connect(dir.path().to_str().expect("utf8 tempdir path")).expect("connect");
     db.create_table("docs", schema, IndexSpec::new().fts("body"))
         .expect("create docs")
-        .append(&batch)
+        .append(&batch, None)
         .expect("append docs");
     db
 }

@@ -1519,7 +1519,7 @@ mod tests {
             IndexSpec::new().fts("title").fts("tag"),
         )
         .expect("create")
-        .append(&batch)
+        .append(&batch, None)
         .expect("append");
         conn.open_table(METERED_TABLE)
             .expect("open")
@@ -1677,7 +1677,7 @@ mod tests {
         )
         .expect("batch");
         let table = conn.open_table(METERED_TABLE).expect("open");
-        table.append(&later).expect("append with the column");
+        table.append(&later, None).expect("append with the column");
         for sql in match_path_sqls("rust") {
             let filtered = format!("{sql} WHERE body = 'v' OR tag = 'y'");
             assert_eq!(metered_rows(&conn, &filtered).0, 2, "{filtered}");

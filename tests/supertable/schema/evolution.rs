@@ -737,12 +737,15 @@ fn vector_filter_after_name_swap(drain: bool) {
     let b: Vec<&str> = (0..ROWS)
         .map(|i| if i == 0 { "match shared" } else { "other" })
         .collect();
-    docs.append(&batch(vec![
-        ("title", Arc::new(LargeStringArray::from(names))),
-        ("a", titles(&a)),
-        ("b", titles(&b)),
-        ("emb", Arc::new(vectors)),
-    ]))
+    docs.append(
+        &batch(vec![
+            ("title", Arc::new(LargeStringArray::from(names))),
+            ("a", titles(&a)),
+            ("b", titles(&b)),
+            ("emb", Arc::new(vectors)),
+        ]),
+        None,
+    )
     .expect("append old names");
     if drain {
         docs.local_handle()
@@ -766,12 +769,15 @@ fn vector_filter_after_name_swap(drain: bool) {
         None,
     )
     .expect("new vector");
-    docs.append(&batch(vec![
-        ("title", titles(&["new"])),
-        ("a", titles(&["match shared"])),
-        ("b", titles(&["wrong"])),
-        ("emb", Arc::new(new_vector)),
-    ]))
+    docs.append(
+        &batch(vec![
+            ("title", titles(&["new"])),
+            ("a", titles(&["match shared"])),
+            ("b", titles(&["wrong"])),
+            ("emb", Arc::new(new_vector)),
+        ]),
+        None,
+    )
     .expect("append current names");
     for (column, expected) in [("a", vec!["new", "row0"]), ("b", vec!["row1"])] {
         for mode in [BoolMode::Or, BoolMode::And] {
