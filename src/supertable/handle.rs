@@ -2313,6 +2313,11 @@ async fn build_handle(
     companions: BTreeMap<String, CompanionSlot>,
     role: TableRole,
 ) -> Result<Supertable, OpenError> {
+    // The readers the table keeps between queries are charged to its
+    // connection's budget, which can take them back.
+    options
+        .store
+        .attach_memory_budget(&options.connection_memory_budget);
     let tombstone_cache = build_tombstone_cache(&options, &manifest);
     let id_generator = crate::supertable::utils::idgen::IdGenerator::new();
     let handle_id = crate::supertable::wal::state_doc::SupertableHandleId(id_generator.next_id());
