@@ -133,7 +133,7 @@ use crate::{
             },
             tokenize::Phrase,
         },
-        id_space::RowId,
+        id_space::{FtsDocId, RowId},
     },
     supertable::{
         error::QueryError,
@@ -447,24 +447,36 @@ impl MatchKernel {
         Ok(set)
     }
 
-    /// The rows in doc-id slice `[start, end)` of a superfile that `set`,
-    /// its [`Self::cursor_set`], matches. A [`Self::slices`] kernel only.
+    /// What doc-id slice `[start, end)` of a superfile matches against `set`, its
+    /// [`Self::cursor_set`]: its rows when the file holds its doc-id map, else its blob ids for
+    /// the page read. A [`Self::slices`] kernel only.
     fn slice(
         &self,
         r: &SuperfileReader,
         set: &OrCursorSet,
         start: u32,
         end: u32,
-    ) -> Result<Vec<RowId>, QueryError> {
-        let (rows, work) = r.token_match_range_prebuilt(set, start, end)?;
+    ) -> Result<SliceMatch, QueryError> {
+        let (ids, work) = r.token_match_range_in_blob_ids(set, start, end)?;
         self.flush(&work);
-        Ok(rows)
+        Ok(match r.held_ids_to_rows(&ids)? {
+            Some(rows) => SliceMatch::Rows(rows),
+            None => SliceMatch::Unmapped(ids),
+        })
     }
 
     /// Adds a walk's work to the statement's statistics.
     fn flush(&self, work: &MatchWork) {
         add_match_work(&self.op_stats, work);
     }
+}
+
+/// What one slice of a sliced match found.
+enum SliceMatch {
+    /// Its rows, translated through the doc-id map the file holds.
+    Rows(Vec<RowId>),
+    /// Its blob ids, when the file keeps no map, for a read of the map's pages.
+    Unmapped(Vec<FtsDocId>),
 }
 
 /// The row filter walks a superfile's postings only when the match keeps at
@@ -3166,15 +3178,20 @@ impl SupertableReader {
                         // file: a rayon job on the reader pool, so the
                         // slices run side by side and no runtime worker
                         // blocks under one.
-                        let (set, slice_reader, slice_kernel) =
+                        let (slice_set, slice_reader, slice_kernel) =
                             (Arc::clone(set), Arc::clone(&r), Arc::clone(&kernel));
-                        let docs = run_on_pool_unless_blocking(
+                        let found = run_on_pool_unless_blocking(
                             Some(&reader_pool),
                             "match slice",
-                            move || slice_kernel.slice(&slice_reader, &set, start, end),
+                            move || slice_kernel.slice(&slice_reader, &slice_set, start, end),
                         )
                         .await
                         .map_err(|e| QueryError::Internal(e.to_string()))??;
+                        let docs = match found {
+                            SliceMatch::Rows(rows) => rows,
+                            // The file keeps no map: read only this slice's pages of it.
+                            SliceMatch::Unmapped(ids) => r.ids_to_rows_in_pages(ids, set).await?,
+                        };
                         kernel.keep_filtered(&r, suid, hits, true, docs).await?
                     }
                 };

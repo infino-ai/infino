@@ -466,9 +466,10 @@ impl FtsReader {
 
     /// The cursors an `Or` [`Self::token_match_prefetched`] walks over
     /// `tokens`, built once (the postings fetch and skip-table parse) for
-    /// [`Self::token_match_range_prebuilt`] to walk one doc-id slice at a
+    /// [`Self::token_match_range_in_blob_ids`] to walk one doc-id slice at a
     /// time, with what the build read. Slices of one superfile share the
-    /// set; each walks a clone of its cursors.
+    /// set; each walks a clone of its cursors. Decides here, once for the file, whether its
+    /// slices translate through a kept map or read pages ([`Self::kept_doc_map_within_budget`]).
     pub(crate) async fn match_cursor_set(
         &self,
         column: &str,
@@ -484,6 +485,10 @@ impl FtsReader {
                 prefetched,
             )
             .await?;
+        // With no map kept, the slices read only their own pages, so the map's CRC is checked here.
+        if set.df_sum() > 0 && self.kept_doc_map_within_budget().await?.is_none() {
+            self.check_map_crc_for(set.df_sum()).await?;
+        }
         let work = MatchWork {
             postings_bytes: set.postings_bytes(),
             planned_ranges: set.planned_ranges() + dictionary_fetches(tokens, prefetched),
@@ -492,19 +497,16 @@ impl FtsReader {
         Ok((set, work))
     }
 
-    /// The rows whose doc ids in `[start, end)` hold any of `set`'s terms,
-    /// ascending: one slice of an `Or` [`Self::token_match_prefetched`].
-    /// The slices of a superfile's doc-id space together match exactly
-    /// what the whole walk matches; the range is a cut of the blob's ids
-    /// and carries no row meaning, so each slice's rows are put in order
-    /// on their own. The work holds the walk's time alone; the set's build
-    /// counted its bytes.
-    pub(crate) fn token_match_range_prebuilt(
+    /// The doc ids in `[start, end)` that hold any of `set`'s terms, in blob order: one slice of
+    /// an `Or` [`Self::token_match_prefetched`], for [`Self::held_ids_to_rows`] or
+    /// [`Self::ids_to_rows_in_pages`] to turn into rows. The slices together match what the whole
+    /// walk matches. The work holds the walk's time alone; the set's build counted its bytes.
+    pub(crate) fn token_match_range_in_blob_ids(
         &self,
         set: &OrCursorSet,
         start: u32,
         end: u32,
-    ) -> Result<(Vec<RowId>, MatchWork), FtsError> {
+    ) -> Result<(Vec<FtsDocId>, MatchWork), FtsError> {
         let mut work = MatchWork::default();
         if set.cursors.is_empty() || start >= end {
             return Ok((Vec::new(), work));
@@ -516,7 +518,7 @@ impl FtsReader {
                 .collect::<Vec<_>>()
         });
         work.kernel_cpu_ns = walk_ns;
-        Ok((self.ids_to_rows(docs)?, work))
+        Ok((docs, work))
     }
 
     /// Unranked token-match **count** — the cardinality

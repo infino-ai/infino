@@ -64,6 +64,8 @@ use tracing::warn;
 
 #[cfg(test)]
 use crate::superfile::fts::reader::TermIndexFact;
+#[cfg(test)]
+use crate::supertable::reader_cache::disk::HeapBudget;
 use crate::{
     memory::ConnectionMemoryBudget,
     runtime_bridge::run_on_pool_unless_blocking,
@@ -1410,6 +1412,13 @@ impl SuperfileReader {
             Some(r) => r.fts_columns().collect(),
             None => Vec::new(),
         }
+    }
+
+    /// This reader with its text index's kept doc-id map charged to `budget`, for a test of one.
+    #[cfg(test)]
+    pub(crate) fn with_fts_heap_budget(mut self, budget: &'static HeapBudget) -> Self {
+        self.fts = self.fts.map(|fts| fts.with_heap_budget(budget));
+        self
     }
 
     /// Underlying FTS reader. `None` if this superfile has no FTS index.
@@ -2858,18 +2867,43 @@ impl SuperfileReader {
     }
 
     /// One doc-id slice of an `Or` match against cursors
-    /// [`Self::match_cursor_set`] built. Delegates to
-    /// [`FtsReader::token_match_range_prebuilt`].
-    pub(crate) fn token_match_range_prebuilt(
+    /// [`Self::match_cursor_set`] built, in blob ids. Delegates to
+    /// [`FtsReader::token_match_range_in_blob_ids`].
+    pub(crate) fn token_match_range_in_blob_ids(
         &self,
         set: &OrCursorSet,
         start: u32,
         end: u32,
-    ) -> Result<(Vec<RowId>, MatchWork), ReadError> {
+    ) -> Result<(Vec<FtsDocId>, MatchWork), ReadError> {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
-        Ok(fts.token_match_range_prebuilt(set, start, end)?)
+        Ok(fts.token_match_range_in_blob_ids(set, start, end)?)
+    }
+
+    /// Unranked blob ids of this superfile's FTS index as ascending rows through the held doc-id
+    /// map; `None` while none is held. Delegates to [`FtsReader::held_ids_to_rows`].
+    pub(crate) fn held_ids_to_rows(
+        &self,
+        ids: &[FtsDocId],
+    ) -> Result<Option<Vec<RowId>>, ReadError> {
+        let fts = self
+            .fts()
+            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
+        Ok(fts.held_ids_to_rows(ids)?)
+    }
+
+    /// Unranked blob ids as ascending rows through the doc-id map's pages, keeping nothing.
+    /// Delegates to [`FtsReader::ids_to_rows_in_pages`].
+    pub(crate) async fn ids_to_rows_in_pages(
+        &self,
+        ids: Vec<FtsDocId>,
+        set: &OrCursorSet,
+    ) -> Result<Vec<RowId>, ReadError> {
+        let fts = self
+            .fts()
+            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
+        Ok(fts.ids_to_rows_in_pages(ids, set).await?)
     }
 
     /// Widen the tokens of one `LIKE` leaf to the indexed terms of

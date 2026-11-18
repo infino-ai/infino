@@ -6066,6 +6066,13 @@ fn escape_json(s: &str) -> String {
     out
 }
 
+/// A superfile whose text index stores its documents in an order of its own, so its readers keep a
+/// doc-id map: two inputs merged with a chosen order. For tests of what that map costs.
+#[cfg(test)]
+pub(crate) fn reordered_test_superfile() -> Vec<u8> {
+    tests::reordered_superfile_bytes()
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -8431,6 +8438,31 @@ mod tests {
                 assert!((sw - sg).abs() < 1e-5, "{terms:?} row {dw}: {sw} vs {sg}");
             }
         }
+    }
+
+    /// Documents in each input of [`reordered_superfile_bytes`]: enough for the merge to choose an
+    /// order.
+    const REORDERED_PER_INPUT: u64 = 2_600;
+
+    /// See [`super::reordered_test_superfile`].
+    pub(super) fn reordered_superfile_bytes() -> Vec<u8> {
+        let opts = BuilderOptions::new(
+            schema_with_fts(),
+            "doc_id",
+            vec![FtsConfig::new("title").positions(true)],
+            vec![],
+        );
+        let schema = opts.schema.clone();
+        let input = |lo, hi| {
+            let bytes = reorder_corpus_input(&opts, &schema, lo, hi);
+            Arc::new(SuperfileReader::open(Bytes::from(bytes)).expect("open an input"))
+        };
+        let inputs = [
+            (input(0, REORDERED_PER_INPUT), None),
+            (input(REORDERED_PER_INPUT, 2 * REORDERED_PER_INPUT), None),
+        ];
+        let (bytes, _) = SuperfileBuilder::build_from_readers_fts_merge(&inputs).expect("merge");
+        bytes
     }
 
     /// One superfile of that corpus, ids `lo..hi`.
