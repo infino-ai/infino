@@ -181,6 +181,10 @@ impl ConnectOptions {
     /// what this connection's work may hold. Shared across all of the
     /// connection's tables.
     ///
+    /// With a budget set, a full-text `LIKE` or `text_match` keeps each file's term dictionary
+    /// across its steps while the budget is at most a quarter full, so it reads it once rather than
+    /// at each step. Unset, it reads it at each step.
+    ///
     /// Covers search and ingest. It does **not** cover compaction: a merge is
     /// not work done on behalf of a connection, and sizing it from a budget set
     /// for queries meant a pass could be refused on a machine with the memory

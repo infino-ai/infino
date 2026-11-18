@@ -17,6 +17,7 @@ use super::{
     core::*,
     cursor::{CursorUse, TermCursor},
     metadata::ColumnMeta,
+    options::BoolMode,
     work::MatchWork,
 };
 use crate::{
@@ -439,8 +440,8 @@ impl FtsReader {
     /// Under `fold` (`ILIKE`) terms are compared with `ſ` and `K` folded to `s`
     /// and `k`, and an exact or prefix token holding an `s` joins the shared
     /// walk (its `ſ` spelling sorts elsewhere). The term dictionary is fetched
-    /// once when any pattern needs it (one planned range, like a match's
-    /// build).
+    /// through `dict` when any pattern needs it, so a later step of the
+    /// same query reads the same bytes.
     ///
     /// The dictionary fetch is I/O and stays on the calling runtime; the walk
     /// itself is CPU — up to the column's whole vocabulary — and runs on
@@ -457,6 +458,7 @@ impl FtsReader {
         max_terms: usize,
         allow_full_walk: bool,
         pool: Option<&ThreadPool>,
+        dict: &QueryDict,
     ) -> Result<(Vec<Option<Vec<String>>>, MatchWork), FtsError> {
         self.resolve_column_id(column)?;
         let walks: Vec<Walk> = patterns.iter().map(|p| p.walk(fold)).collect();
@@ -465,8 +467,8 @@ impl FtsReader {
             .iter()
             .any(|w| *w == Walk::Subtree || (*w == Walk::Full && allow_full_walk));
         let collected = if needs_dict {
-            let dict_bytes = self.dict_bytes_async().await?;
-            work.planned_ranges += 1;
+            let (dict_bytes, fetched) = self.query_dict(dict).await?;
+            work.planned_ranges += u64::from(fetched);
             let column = column.to_owned();
             let owned: Vec<OwnedPattern> = patterns.iter().map(|p| p.into_owned()).collect();
             let walks = walks.clone();
@@ -624,7 +626,8 @@ impl FtsReader {
     /// are by definition the rows that have it as a token, and the caller
     /// (the table layer's `text_match`) asks for the tokens `standard` gives
     /// a value, so each term is looked up as `standard` wrote it. One result
-    /// per term, in order; a term the column never indexed has no rows.
+    /// per term, in order; a term the column never indexed has no rows. The
+    /// dictionary, for terms the memo lacks, is read through `dict`.
     ///
     /// Errors as [`Self::contains_rows`] does: `FtsError::UnknownColumn`
     /// when `column` is not FTS-indexed here, `FtsError::ExactNeedsStandard`
@@ -634,6 +637,7 @@ impl FtsReader {
         column: &str,
         terms: &[&str],
         prefetched: Option<&crate::superfile::fts::reader::FetchedTermMemo>,
+        dict: &QueryDict,
     ) -> Result<(Vec<ContainsRows>, MatchWork), FtsError> {
         let column_id = self.resolve_column_id(column)?;
         let analyzer = self.columns[column_id as usize].tokenizer.name();
@@ -647,7 +651,7 @@ impl FtsReader {
         let mut out = Vec::with_capacity(terms.len());
         for term in terms {
             let (rows, term_work) = self
-                .token_match_prefetched(column, &[term], crate::BoolMode::Or, prefetched)
+                .token_match_prefetched(column, &[term], BoolMode::Or, prefetched, dict)
                 .await?;
             work.merge(term_work);
             out.push(ContainsRows {
@@ -948,8 +952,16 @@ mod tests {
         max_terms: usize,
     ) -> (Vec<Option<Vec<String>>>, MatchWork) {
         let rt = Runtime::new().expect("runtime");
-        rt.block_on(r.expand_terms("body", patterns, fold, max_terms, true, None))
-            .expect("expand_terms")
+        rt.block_on(r.expand_terms(
+            "body",
+            patterns,
+            fold,
+            max_terms,
+            true,
+            None,
+            &QueryDict::default(),
+        ))
+        .expect("expand_terms")
     }
 
     fn expand(r: &FtsReader, pattern: TermPattern<'_>, max_terms: usize) -> Option<Vec<String>> {
@@ -1048,6 +1060,7 @@ mod tests {
                 MAX_TERMS,
                 false,
                 None,
+                &QueryDict::default(),
             ))
             .expect("expand_terms");
         assert_eq!(out, vec![None, None, owned(&["java"]), owned(&["rust"])]);
@@ -1061,6 +1074,7 @@ mod tests {
                 MAX_TERMS,
                 false,
                 None,
+                &QueryDict::default(),
             ))
             .expect("expand_terms");
         assert_eq!(out, vec![None]);
@@ -1588,6 +1602,7 @@ mod tests {
                 MAX_TERMS,
                 true,
                 None,
+                &QueryDict::default(),
             ))
             .expect_err("unknown column");
         assert!(matches!(err, FtsError::UnknownColumn(_)));

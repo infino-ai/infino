@@ -124,7 +124,7 @@ pub(super) fn xorshift(mut x: u64) -> impl FnMut() -> u64 {
 /// the omission never shows. This one refuses, which is what turns
 /// "the prefetch is missing a region the open needs" into a failure
 /// rather than a slower path.
-pub(super) struct AsyncOnlySource(pub(super) Bytes);
+pub(crate) struct AsyncOnlySource(pub(crate) Bytes);
 
 #[async_trait]
 impl LazyByteSource for AsyncOnlySource {

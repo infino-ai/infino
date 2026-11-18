@@ -75,7 +75,8 @@ use crate::{
             bm25::Bm25Params,
             reader::{
                 self as fts_reader, BoolMode, ClauseLists, ContainsRows, FetchedTermMemo,
-                FtsReader, MatchWork, OrCursorSet, PreparedClauses, ScoringView, TermPattern,
+                FtsReader, MatchWork, OrCursorSet, PreparedClauses, QueryDict, ScoringView,
+                TermPattern,
             },
             tokenize::{Phrase, Tokenizer},
         },
@@ -2831,12 +2832,13 @@ impl SuperfileReader {
         tokens: &[&str],
         mode: BoolMode,
         prefetched: Option<&FetchedTermMemo>,
+        dict: &QueryDict,
     ) -> Result<(Vec<RowId>, MatchWork), ReadError> {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
         Ok(fts
-            .token_match_prefetched(column, tokens, mode, prefetched)
+            .token_match_prefetched(column, tokens, mode, prefetched, dict)
             .await?)
     }
 
@@ -2883,12 +2885,21 @@ impl SuperfileReader {
         max_terms: usize,
         allow_full_walk: bool,
         pool: Option<&ThreadPool>,
+        dict: &QueryDict,
     ) -> Result<(Vec<Option<Vec<String>>>, MatchWork), ReadError> {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
         Ok(fts
-            .expand_terms(column, patterns, fold, max_terms, allow_full_walk, pool)
+            .expand_terms(
+                column,
+                patterns,
+                fold,
+                max_terms,
+                allow_full_walk,
+                pool,
+                dict,
+            )
             .await?)
     }
 
@@ -2918,11 +2929,12 @@ impl SuperfileReader {
         column: &str,
         terms: &[&str],
         prefetched: Option<&FetchedTermMemo>,
+        dict: &QueryDict,
     ) -> Result<(Vec<ContainsRows>, MatchWork), ReadError> {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
-        Ok(fts.term_rows(column, terms, prefetched).await?)
+        Ok(fts.term_rows(column, terms, prefetched, dict).await?)
     }
 
     /// Unranked token-match **count**: the number of `local_doc_id`s
@@ -3041,15 +3053,16 @@ impl SuperfileReader {
     /// for any absent token). Batched sibling of [`Self::term_df`]: resolves
     /// the whole set with one dictionary parse and one coalesced header fetch.
     /// Delegates to [`FtsReader::term_dfs`].
-    pub async fn term_dfs(
+    pub(crate) async fn term_dfs(
         &self,
         column: &str,
         tokens: &[&str],
+        dict: &QueryDict,
     ) -> Result<(Vec<u64>, MatchWork), ReadError> {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
-        Ok(fts.term_dfs(column, tokens).await?)
+        Ok(fts.term_dfs(column, tokens, dict).await?)
     }
 
     /// Open-wave fetch of `terms`' dictionary slots + postings ranges
