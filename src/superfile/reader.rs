@@ -2022,6 +2022,54 @@ impl SuperfileReader {
             .map_err(ReadError::Malformed)
     }
 
+    /// [`Self::range_count`] of each of `ranges` (`lo..=hi` pairs) over one
+    /// column, with each block the ranges cut read once: a histogram's
+    /// buckets share their boundaries, and one pass over this superfile
+    /// counts them all. `None` when the superfile does not range-index the
+    /// column with keys of `data_type`.
+    pub(crate) async fn range_counts(
+        &self,
+        field: FieldId,
+        data_type: &DataType,
+        ranges: &[(u64, u64)],
+    ) -> Result<Option<Vec<u64>>, ReadError> {
+        let Some((directory, field_id)) = self.range_column(field, data_type).await? else {
+            return Ok(None);
+        };
+        let Some(loc) = self.range_region else {
+            return Ok(None);
+        };
+        let Some(indexed) = directory.column(field_id) else {
+            return Ok(None);
+        };
+        let mut wanted: Vec<usize> = ranges
+            .iter()
+            .flat_map(|&(lo, hi)| indexed.boundary_blocks(lo, hi))
+            .collect();
+        wanted.sort_unstable();
+        wanted.dedup();
+        let fetched = try_join_all(wanted.into_iter().map(|b| {
+            let span = indexed.block_span(b);
+            async move {
+                let bytes = self
+                    .range_region_bytes(loc, span, "range index boundary block")
+                    .await?;
+                Ok::<_, ReadError>((b, bytes))
+            }
+        }))
+        .await?;
+        let boundary: Vec<(usize, &[u8])> = fetched
+            .iter()
+            .map(|(b, bytes)| (*b, bytes.as_ref()))
+            .collect();
+        ranges
+            .iter()
+            .map(|&(lo, hi)| indexed.count(lo, hi, &boundary))
+            .collect::<Result<Vec<u64>, String>>()
+            .map(Some)
+            .map_err(ReadError::Malformed)
+    }
+
     /// A [`LazyByteSource`] over the **entire** superfile, regardless of
     /// how the reader was opened. The single byte-access handle the
     /// SQL/DataFusion path reads through -- callers never branch on
