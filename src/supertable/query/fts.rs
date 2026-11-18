@@ -1612,8 +1612,13 @@ impl SupertableReader {
         // A term index with level heads for every term the query scores
         // chooses the superfiles before any open, whatever the gate learned:
         // its reads are a level per term and layer, not a block per term
-        // per superfile.
-        let heads_serve = match (index_serves, index_column) {
+        // per superfile. A query over only some rows keeps the ceilings'
+        // path: the heads would check the predicate on each candidate's row,
+        // and measured on a 10B-row table those checks read more than the
+        // opens they save. A negated query is bounded by its positive terms
+        // only, and takes the same path.
+        let every_row = !rows_scoped && negatives.is_empty() && negative_phrases.is_empty();
+        let heads_serve = match (index_serves && every_row, index_column) {
             (true, Some((index, column_id))) => heads::available(index, column_id, &all_terms)
                 .await
                 .unwrap_or(false),

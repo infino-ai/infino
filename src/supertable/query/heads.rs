@@ -598,6 +598,20 @@ pub(crate) async fn select(
     for ((_, hits), rows) in resolved.iter_mut().zip(rows) {
         *hits = rows;
     }
+    // How far above the threshold the slots' bounds sit, as ratios: which of
+    // them a tie rule could still skip, and which bound drives each.
+    let mut over: Vec<f32> = bounds
+        .iter()
+        .map(|&(_, ub)| ub / theta)
+        .filter(|r| r.is_finite())
+        .collect();
+    over.sort_unstable_by(f32::total_cmp);
+    let pick = |q: usize| over.get(over.len().saturating_sub(1) * q / 100).copied();
+    let unseen_led = slots
+        .iter()
+        .zip(&bounds)
+        .filter(|(slot, (_, ub))| unseen_bound(slot, &heads, &weights) >= *ub)
+        .count();
     let (mut below, mut tied, mut above) = (0usize, 0usize, 0usize);
     for &(_, ub) in &bounds {
         match ub.total_cmp(&theta) {
@@ -613,6 +627,10 @@ pub(crate) async fn select(
         tied,
         above,
         theta,
+        ub_over_theta_min = pick(0),
+        ub_over_theta_p50 = pick(50),
+        ub_over_theta_max = pick(100),
+        unseen_led,
         resolved = resolved.len(),
         candidates = candidates.len(),
         entries_read,
