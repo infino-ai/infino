@@ -52,7 +52,6 @@ use tracing::debug;
 
 use super::{
     dispatch,
-    exec::common::RowCheck,
     fts::{baked_avgdl, competitive_floor},
     tier::{
         BOUND_SLACK, EXACT_SUM_TERMS, MAX_TIER_TERMS, SuperfileBounds, TermMask, TierQuery,
@@ -170,9 +169,6 @@ struct Candidate {
     contrib: Vec<f32>,
     /// Per phrase, its contribution once a probe has read it.
     phrases: Vec<Option<f32>>,
-    /// Whether the query's row predicate was checked on the document's row
-    /// and admits it; a document it rejects leaves the candidates.
-    admitted: bool,
 }
 
 impl Candidate {
@@ -228,9 +224,6 @@ struct Weights {
     /// must-phrase.
     required: TermMask,
     phrases: Vec<Phrase>,
-    /// Whether the query has a row predicate: only a candidate it was
-    /// checked to admit is known to match.
-    filtered: bool,
 }
 
 impl Weights {
@@ -247,8 +240,7 @@ impl Weights {
     fn counts(&self, c: &Candidate) -> bool {
         let found = |v: &Option<f32>| matches!(v, Some(v) if *v > 0.0);
         let present = c.present();
-        (!self.filtered || c.admitted)
-            && present & self.required == self.required
+        present & self.required == self.required
             && (present & self.scoring != 0 || c.phrases.iter().any(found))
             && self
                 .phrases
@@ -314,7 +306,6 @@ pub(crate) async fn select(
         scoring: query.scoring,
         required: query.required,
         phrases,
-        filtered: query.check.is_some(),
     };
     let slot_of: HashMap<_, usize> = kept
         .iter()
@@ -517,24 +508,6 @@ pub(crate) async fn select(
             }
         }
     }
-    // A row predicate is checked on the best candidates first: only rows it
-    // admits set the threshold.
-    let check_started = Instant::now();
-    if let Some(check) = &query.check {
-        check_candidates(
-            manifest,
-            kept,
-            &slots,
-            &heads,
-            &weights,
-            &mut candidates,
-            check,
-            theta,
-        )
-        .await?;
-        (theta, bounds) = settle(&slots, &heads, &candidates, &weights, k, lb_slack);
-    }
-    let check_ns = check_started.elapsed().as_nanos() as u64;
     let probe_started = Instant::now();
     let mut probed_superfiles = 0usize;
     // Probes: candidates whose bounds still reach above the threshold for a
@@ -542,10 +515,17 @@ pub(crate) async fn select(
     // posting blocks only; their exact scores raise the threshold, under
     // which the heads bound the unseen documents, and a superfile so
     // settled is answered or ruled out without an open.
-    if (!query.rows_scoped || query.check.is_some())
-        && probes_can_rule_out(&slots, &heads, &candidates, &weights, &bounds, theta, k)
-    {
-        let plan = probe_plan(&slots, &heads, &candidates, &weights, &postings, theta);
+    if !query.rows_scoped {
+        let rulable = rulable_by_probes(&slots, &heads, &candidates, &weights, &bounds, theta, k);
+        let mut plan = probe_plan(&slots, &heads, &candidates, &weights, &postings, theta);
+        // Probing a superfile is a few range reads before any open; it pays
+        // only where it can save at least as many opens as it probes
+        // superfiles. Measured on a 10B-row table, probes that could rule
+        // out none of the superfiles in play added thousands of reads to
+        // phrases and unions of common words, and every superfile opened.
+        if rulable.is_some_and(|n| n < plan.len()) {
+            plan.clear();
+        }
         probed_superfiles = plan.len();
         if !plan.is_empty() {
             let weights = &weights;
@@ -610,11 +590,11 @@ pub(crate) async fn select(
     // A scope that admits only some rows: the threshold over every row is
     // no floor for the admitted ones, and an answer would hold rows the
     // scope drops. Only the bounds stand.
-    if query.rows_scoped && query.check.is_none() {
+    if query.rows_scoped {
         theta = f32::NEG_INFINITY;
     }
     let theta_id_max = theta_id_max(&candidates, &slots, &weights, k, lb_slack, theta);
-    let mut resolved = match exact_scores && (!query.rows_scoped || query.check.is_some()) {
+    let mut resolved = match exact_scores && !query.rows_scoped {
         true => resolve(&slots, &heads, &candidates, &weights, theta, theta_id_max),
         false => Vec::new(),
     };
@@ -714,7 +694,6 @@ pub(crate) async fn select(
         probes,
         runs_ms = runs_ns / NANOS_PER_MS,
         levels_ms = levels_ns / NANOS_PER_MS,
-        check_ms = check_ns / NANOS_PER_MS,
         probe_ms = probe_ns / NANOS_PER_MS,
         rows_ms = rows_started.elapsed().as_millis() as u64,
         total_ms = started.elapsed().as_millis() as u64,
@@ -770,12 +749,12 @@ impl RoundPrice {
     }
 }
 
-/// Whether probing can rule any superfile still in play out. A probe
-/// learns a candidate's missing terms, which only raises the threshold to
-/// at most the `k`-th best candidate bound; a superfile whose unread
-/// documents bound above that stays in play whatever the probes find. With
-/// no threshold yet, probes are what find one.
-fn probes_can_rule_out(
+/// How many superfiles still in play probing could rule out; `None` when
+/// there is no threshold yet, which probes are what find. A probe learns a
+/// candidate's missing terms, which only raises the threshold to at most
+/// the `k`-th best candidate bound; a superfile whose unread documents
+/// bound above that stays in play whatever the probes find.
+fn rulable_by_probes(
     slots: &[Slot],
     heads: &[Head],
     candidates: &HashMap<(u32, u32), Candidate>,
@@ -783,9 +762,9 @@ fn probes_can_rule_out(
     bounds: &[(f32, f32)],
     theta: f32,
     k: usize,
-) -> bool {
+) -> Option<usize> {
     if !theta.is_finite() {
-        return true;
+        return None;
     }
     let mut best: Vec<f32> = candidates
         .iter()
@@ -793,14 +772,19 @@ fn probes_can_rule_out(
         .filter(|b| b.is_finite())
         .collect();
     if best.len() < k {
-        return true;
+        return None;
     }
     let (_, kth, _) = best.select_nth_unstable_by(k - 1, |a, b| b.total_cmp(a));
     let reachable = *kth;
-    slots
-        .iter()
-        .zip(bounds)
-        .any(|(slot, &(_, ub))| ub > theta && unseen_bound(slot, heads, weights) <= reachable)
+    Some(
+        slots
+            .iter()
+            .zip(bounds)
+            .filter(|(slot, (_, ub))| {
+                *ub > theta && unseen_bound(slot, heads, weights) <= reachable
+            })
+            .count(),
+    )
 }
 
 /// What one probe reads in one superfile.
@@ -843,7 +827,7 @@ fn probe_plan(
         terms.chain(phrases).collect()
     };
     let open = best_open(slots, heads, candidates, weights, theta, |s, c| {
-        (!weights.filtered || c.admitted) && !unknowns(s, c).is_empty()
+        !unknowns(s, c).is_empty()
     });
     let mut docs: BTreeMap<(usize, usize, bool), Vec<u32>> = BTreeMap::new();
     for (_, s, doc) in open {
@@ -872,60 +856,6 @@ fn probe_plan(
         plan.entry(s).or_default().push((kind, members, list));
     }
     plan
-}
-
-/// Check the query's row predicate on its best open candidates' rows (see
-/// [`best_open`]), reading only the pages that hold them: a
-/// candidate the predicate admits is marked so, one it rejects is dropped.
-#[allow(clippy::too_many_arguments)]
-async fn check_candidates(
-    manifest: &ManifestSnapshot,
-    kept: &[Arc<SuperfileEntry>],
-    slots: &[Slot],
-    heads: &[Head],
-    weights: &Weights,
-    candidates: &mut HashMap<(u32, u32), Candidate>,
-    check: &RowCheck,
-    theta: f32,
-) -> Result<(), TermIndexError> {
-    let mut by_slot: BTreeMap<usize, Vec<u32>> = BTreeMap::new();
-    for (_, s, doc) in best_open(slots, heads, candidates, weights, theta, |_, c| !c.admitted) {
-        by_slot.entry(s).or_default().push(doc);
-    }
-    let checks = by_slot.into_iter().map(|(s, mut docs)| {
-        docs.sort_unstable();
-        let entry = &kept[s];
-        async move {
-            let reader = open_fts(manifest, entry).await?;
-            let rows = to_rows(fts_of(&reader), docs.iter().map(|&d| (d, 0.0))).await?;
-            let asked: RoaringBitmap = rows.iter().map(|&(row, _)| row).collect();
-            let admitted = check
-                .keep(&reader, &asked)
-                .await
-                .map_err(TermIndexError::Open)?;
-            let verdicts: Vec<(u32, bool)> = docs
-                .iter()
-                .zip(&rows)
-                .map(|(&doc, &(row, _))| (doc, admitted.contains(row)))
-                .collect();
-            Ok::<_, TermIndexError>((s, verdicts))
-        }
-    });
-    for (s, verdicts) in try_join_all(checks).await? {
-        for (doc, admits) in verdicts {
-            match admits {
-                true => {
-                    if let Some(c) = candidates.get_mut(&(s as u32, doc)) {
-                        c.admitted = true;
-                    }
-                }
-                false => {
-                    candidates.remove(&(s as u32, doc));
-                }
-            }
-        }
-    }
-    Ok(())
 }
 
 /// `entry`'s reader, opened through the reader cache, for its full-text
@@ -1026,7 +956,6 @@ fn absorb(
             tf: vec![0; nt],
             contrib: vec![0.0; nt],
             phrases: vec![None; weights.phrases.len()],
-            admitted: false,
         });
     if c.known & (1 << t) == 0 {
         c.known |= 1 << t;
@@ -1496,9 +1425,7 @@ fn resolve(
             .iter()
             .zip(&c.phrases)
             .any(|(p, v)| v.is_none() && p.members.iter().all(|&m| slot.heads[m].is_some()));
-        // A row the predicate was not checked on may or may not be admitted.
-        let unchecked = weights.filtered && !c.admitted;
-        if missing || phrase_open || unchecked {
+        if missing || phrase_open {
             whole[s as usize] = false;
         }
     }
@@ -1604,7 +1531,6 @@ mod tests {
             scoring: 1,
             required: 0,
             phrases: Vec::new(),
-            filtered: false,
         };
         let head = Head {
             term: 0,

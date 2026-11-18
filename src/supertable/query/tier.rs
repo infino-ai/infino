@@ -69,7 +69,7 @@ use roaring::RoaringBitmap;
 use tokio::task;
 use uuid::Uuid;
 
-use super::{exec::common::RowCheck, fts::baked_avgdl};
+use super::fts::baked_avgdl;
 use crate::{
     memory::{ConnectionMemoryBudget, Reservation},
     runtime_bridge::run_on_pool,
@@ -387,10 +387,6 @@ pub(crate) struct TierQuery<'a> {
     /// so a selection bounds superfiles but seeds no threshold and answers
     /// for none. The tier merge does not serve such a query.
     pub(crate) rows_scoped: bool,
-    /// The query's exact row predicate, when a SQL `WHERE` pushed one: the
-    /// level heads check their best candidates' rows against it, so a
-    /// threshold over the rows it admits can be seeded.
-    pub(crate) check: Option<Arc<RowCheck>>,
     /// The query's score tolerance: a document may be missed when it
     /// scores at most this share above the returned k-th, so a superfile
     /// bounded under the threshold widened by it need not be read for.

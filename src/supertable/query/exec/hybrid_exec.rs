@@ -292,7 +292,6 @@ impl SupertableReader {
                 k,
                 Bm25SearchOptions::new().with_mode(mode),
                 scope.candidates(),
-                None,
             )
             .instrument(trace::phase(phases, || detail_span!("hybrid.bm25")));
         let vector_leg =
