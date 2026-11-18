@@ -46,6 +46,16 @@
 //! skipped; on one whose values spread across every row group, the bound
 //! skips none, and each row group and batch is checked for nothing.
 //!
+//! A sort on `_id` reads finer than row groups. Ids are minted in order by
+//! each writer, so a file's run of [`BLOCK_DOCS`] rows spans a narrow band of
+//! ids even where its row groups, mixing writers, span nearly all of them.
+//! The stable-id sidecar records each block's bounds in its header
+//! ([`SuperfileReader::id_blocks`]); the scan reads the blocks in order
+//! of those bounds, skips each block the top-k's bound rules out, and stops
+//! once it rules out every block still to come. A page of `ORDER BY _id`
+//! under a filter that keeps a sizeable share of the rows reads a block or
+//! two instead of every row the filter keeps.
+//!
 //! It answers what the Parquet scan would: the same columns, typed as the scan
 //! schema types them, each file's rows in file order, without the rows a
 //! tombstone deletes. A `WHERE` stays above it in a `FilterExec`, as above the
@@ -64,16 +74,17 @@
 //!   pass.
 
 use std::{
-    collections::{HashMap, HashSet},
+    cmp::Reverse,
+    collections::{BinaryHeap, HashMap, HashSet, VecDeque},
     fmt,
     ops::Range,
     option::IntoIter,
-    sync::Arc,
+    sync::{Arc, Mutex, PoisonError},
 };
 
 use arrow_array::{
-    Array, ArrayRef, BooleanArray, RecordBatch, RecordBatchOptions, UInt32Array, UInt64Array,
-    builder::BooleanBufferBuilder, cast::AsArray, new_null_array, types::Int16Type,
+    Array, ArrayRef, BooleanArray, Decimal128Array, RecordBatch, RecordBatchOptions, UInt32Array,
+    UInt64Array, builder::BooleanBufferBuilder, cast::AsArray, new_null_array, types::Int16Type,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef, SortOptions};
 use datafusion::{
@@ -114,12 +125,15 @@ use parquet::{
     file::metadata::{ParquetMetaData, RowGroupMetaData},
 };
 use roaring::RoaringBitmap;
-use tokio::spawn;
+use tokio::{
+    spawn,
+    sync::{Mutex as AsyncMutex, OnceCell},
+};
 use tracing::Instrument;
 
 use crate::{
     runtime_metrics::op_stats::OpStatsCollector,
-    superfile::SuperfileReader,
+    superfile::{SuperfileReader, ids::BLOCK_DOCS, reader::IdBlocks},
     supertable::{
         error::QueryError,
         manifest::{ManifestSnapshot, SuperfileUri, hll::HllSketch},
@@ -223,18 +237,24 @@ impl RowGroupFilter {
     }
 }
 
-/// One row group of one file: the unit a partition reads.
+/// One row group of one file, or one id block of it: the unit a partition
+/// reads.
 #[derive(Debug, Clone)]
 struct RowGroupUnit {
     file: Arc<CachedFile>,
     row_group: usize,
-    /// The row group's rows, by position in the file.
+    /// The rows to read, by position in the file: the row group's, or one
+    /// id block's.
     rows: Range<u32>,
     /// Whether a read that lacks a column decodes the row group whole and
     /// keeps its columns: it is read whole, the scan chose at least half its
     /// live rows, or a scan read some of its rows before. Otherwise such a
     /// read takes the chosen rows from the pages and keeps nothing.
     keep: bool,
+    /// The row group's rows, by position in the file.
+    group: Range<u32>,
+    /// The lowest and highest `_id` the rows can hold, for an id block.
+    id_bounds: Option<(i128, i128)>,
 }
 
 /// What every partition reads with.
@@ -254,6 +274,15 @@ struct ScanContext {
     /// ([`CachedScanExec::with_predicate`]): over the kept dictionaries
     /// themselves, so only the rows that pass are made strings.
     predicate: Option<Arc<dyn PhysicalExpr>>,
+    /// For each row group reads are decoding, a lock held while one decodes
+    /// over the columns decoded so far, by their place in `schema`: reads of
+    /// one row group that miss the cache together decode it once, the rest
+    /// taking the first's columns from here. A row group read whole leaves
+    /// its entry once no read waits on it. A row group read by id block keeps
+    /// its entry until its last block is read or skipped, so its blocks share
+    /// one decode even when the cache can't hold its columns; the bytes those
+    /// entries hold across the scan are bounded ([`BlockDecoding`]).
+    decoding: Mutex<HashMap<(SuperfileUri, usize), Arc<AsyncMutex<Vec<Option<ArrayRef>>>>>>,
 }
 
 /// A table scan served from the decoded-column cache; see the module docs.
@@ -286,7 +315,495 @@ pub(crate) struct CachedScanExec {
     /// ([`ROW_GROUPS_READ_IN_PART`]), the rows of the units read
     /// ([`ROWS_READ`]), the row groups skipped ([`ROW_GROUPS_SKIPPED`]) and
     /// the rows dropped ([`ROWS_DROPPED`]).
+    /// Set when a sort on `_id` was pushed down: the rows are read by id
+    /// block ([`IdOrder`]).
+    id_order: Option<IdOrder>,
+    /// The rows of the units read ([`ROWS_READ`]), the row groups decoded
+    /// ([`ROW_GROUPS_DECODED`]), the row groups skipped
+    /// ([`ROW_GROUPS_SKIPPED`]) and the rows dropped ([`ROWS_DROPPED`]), for
+    /// `EXPLAIN ANALYZE`.
     metrics: ExecutionPlanMetricsSet,
+}
+
+/// A read in `_id` order: the scan's row groups cut into id blocks, taken
+/// in order of their lowest id (their highest, descending) from a queue
+/// built by the first partition to start and shared by the rest, each taking
+/// the next block as it is ready for one. `None` in the queue's cell when a
+/// file has no sidecar bounds to order by; the row groups are read as they
+/// are then.
+#[derive(Debug, Clone)]
+struct IdOrder {
+    descending: bool,
+    queue: Arc<OnceCell<Option<Arc<IdRead>>>>,
+}
+
+/// One file's part of an [`IdBlockQueue`].
+#[derive(Debug)]
+struct FileBlocks {
+    /// The file's blocks, their bounds and orders, as its reader keeps them.
+    blocks: Arc<IdBlocks>,
+    /// For each of the file's row groups, its unit among the queue's units;
+    /// `None` for a row group the scan doesn't read.
+    units: Vec<Option<usize>>,
+    /// Each row group's first row, and the file's row count last.
+    starts: Vec<u32>,
+    /// How many of the file's blocks, in order, have been taken.
+    taken: usize,
+}
+
+/// The scan's id blocks in order, taken one at a time: the files' block
+/// orders, sorted once per reader ([`SuperfileReader::id_blocks`]), merged as
+/// blocks are taken, so a read that stops after a few blocks orders only
+/// those.
+#[derive(Debug)]
+struct IdBlockQueue {
+    units: Arc<[RowGroupUnit]>,
+    files: Vec<FileBlocks>,
+    descending: bool,
+    /// Each file's next block, by its place in the order: the smallest
+    /// first.
+    next: BinaryHeap<Reverse<(u128, usize)>>,
+    /// Pieces of a taken block not yet handed out: a block that spans two
+    /// row groups is read as one piece of each.
+    pending: VecDeque<RowGroupUnit>,
+}
+
+impl IdBlockQueue {
+    /// The queue over `units`, row groups of the scan; `None` when a file
+    /// has no sidecar bounds to order by, or fewer blocks than its rows
+    /// fill.
+    async fn new(units: Arc<[RowGroupUnit]>, descending: bool, in_flight: usize) -> Option<Self> {
+        // The scan's distinct files, in the order they first appear among the
+        // units; a file's place here is its place in `files`.
+        let mut order: Vec<&Arc<CachedFile>> = Vec::new();
+        let mut placed: HashMap<SuperfileUri, usize> = HashMap::new();
+        for unit in units.iter() {
+            placed.entry(unit.file.uri).or_insert_with(|| {
+                order.push(&unit.file);
+                order.len() - 1
+            });
+        }
+        // Read the files' id blocks concurrently rather than awaiting each in
+        // turn, so a first read over many files pays one fetch latency and not
+        // one per file — but no more than `in_flight` at once, the cap the
+        // other per-file I/O waves keep, so a table of thousands of files does
+        // not open every sidecar at the same time. `buffered` preserves input
+        // order, so `fetched` still lines up with `order`.
+        let reads: Vec<_> = order
+            .iter()
+            .map(|file| {
+                let file = Arc::clone(file);
+                async move { file.reader.id_blocks().await }
+            })
+            .collect();
+        let fetched: Vec<_> = stream::iter(reads)
+            .buffered(in_flight.max(1))
+            .collect()
+            .await;
+        let mut files: Vec<FileBlocks> = Vec::with_capacity(order.len());
+        for (file, blocks) in order.iter().zip(fetched) {
+            let blocks = blocks?;
+            let mut starts = Vec::with_capacity(file.row_counts.len() + 1);
+            let mut first = 0u32;
+            for &n in file.row_counts.iter() {
+                starts.push(first);
+                first = first.checked_add(n)?;
+            }
+            starts.push(first);
+            let needed = u64::from(first).div_ceil(BLOCK_DOCS as u64);
+            if (blocks.bounds.len() as u64) < needed {
+                return None;
+            }
+            let groups = file.row_counts.len();
+            files.push(FileBlocks {
+                blocks,
+                units: vec![None; groups],
+                starts,
+                taken: 0,
+            });
+        }
+        for (at, unit) in units.iter().enumerate() {
+            let file = *placed.get(&unit.file.uri)?;
+            *files[file].units.get_mut(unit.row_group)? = Some(at);
+        }
+        let mut queue = Self {
+            units,
+            files,
+            descending,
+            next: BinaryHeap::new(),
+            pending: VecDeque::new(),
+        };
+        for file in 0..queue.files.len() {
+            queue.push_next(file);
+        }
+        Some(queue)
+    }
+
+    /// `file`'s blocks in the order of the read.
+    fn order(&self, file: usize) -> &[u32] {
+        let blocks = &self.files[file].blocks;
+        match self.descending {
+            false => &blocks.by_lowest,
+            true => &blocks.by_highest,
+        }
+    }
+
+    /// Queues `file`'s next block, if it has one, by its place in the
+    /// order: its lowest id ascending, or its highest descending, as an
+    /// unsigned key that sorts the same way smallest first.
+    fn push_next(&mut self, file: usize) {
+        let taken = self.files[file].taken;
+        let Some(&block) = self.order(file).get(taken) else {
+            return;
+        };
+        let (lo, hi) = self.files[file].blocks.bounds[block as usize];
+        let sign = 1u128 << 127;
+        let key = match self.descending {
+            false => (lo as u128) ^ sign,
+            true => !((hi as u128) ^ sign),
+        };
+        self.next.push(Reverse((key, file)));
+    }
+
+    /// The next block to read, as a unit of the rows it holds of one row
+    /// group; `None` once every block is taken. A block holding no row to
+    /// read (in a row group the scan doesn't read, every row deleted, or
+    /// none the index chose) is passed over. A block passed over in a row
+    /// group the scan reads counts against that row group's block tally, as
+    /// one read of it would, so the tally still reaches zero.
+    fn take(&mut self, decoding: &BlockDecoding) -> Option<RowGroupUnit> {
+        loop {
+            if let Some(unit) = self.pending.pop_front() {
+                return Some(unit);
+            }
+            let Reverse((_, file)) = self.next.pop()?;
+            let block = self.order(file)[self.files[file].taken];
+            self.files[file].taken += 1;
+            self.push_next(file);
+            let blocks = &self.files[file];
+            let bounds = blocks.blocks.bounds[block as usize];
+            let Some(end_of_file) = blocks.starts.last().copied() else {
+                continue;
+            };
+            let start = block.saturating_mul(BLOCK_DOCS as u32);
+            let end = start.saturating_add(BLOCK_DOCS as u32).min(end_of_file);
+            // The row groups the block's rows fall in.
+            let mut group = blocks
+                .starts
+                .partition_point(|&first| first <= start)
+                .saturating_sub(1);
+            while group + 1 < blocks.starts.len() && blocks.starts[group] < end {
+                let rows = start.max(blocks.starts[group])..end.min(blocks.starts[group + 1]);
+                if let Some(unit) = blocks.units[group].map(|at| &self.units[at]) {
+                    let chosen = unit
+                        .file
+                        .selected
+                        .as_ref()
+                        .is_none_or(|selected| selected.range_cardinality(rows.clone()) > 0);
+                    let deleted = unit.file.tombstones.range_cardinality(rows.clone());
+                    if !rows.is_empty() && chosen && deleted < u64::from(rows.end - rows.start) {
+                        self.pending.push_back(RowGroupUnit {
+                            rows,
+                            id_bounds: Some(bounds),
+                            ..unit.clone()
+                        });
+                    } else {
+                        decoding.done((unit.file.uri, unit.row_group));
+                    }
+                }
+                group += 1;
+            }
+        }
+    }
+}
+
+/// How many id blocks overlap `group`, a row group's rows by position in its
+/// file: the blocks that read any of its rows. Blocks are [`BLOCK_DOCS`] rows
+/// from the file's start, so this is a count over `group`'s ends, not a walk.
+fn blocks_overlapping(group: &Range<u32>) -> usize {
+    if group.is_empty() {
+        return 0;
+    }
+    let block = BLOCK_DOCS as u32;
+    let first = group.start / block;
+    let last = (group.end - 1) / block;
+    (last - first) as usize + 1
+}
+
+/// A read by id block: the queue the partitions take blocks from, and the
+/// bookkeeping ([`BlockDecoding`]) that keeps each row group's shared decode
+/// alive until its last block is read and bounds the bytes those decodes
+/// hold. Built once by the first partition to start and shared by the rest.
+#[derive(Debug)]
+struct IdRead {
+    queue: Mutex<IdBlockQueue>,
+    decoding: BlockDecoding,
+}
+
+impl IdRead {
+    /// The id-block read over `units`, descending or not; `None` when no file
+    /// has the sidecar bounds to order by, as [`IdBlockQueue::new`] gives.
+    async fn new(
+        units: Arc<[RowGroupUnit]>,
+        descending: bool,
+        context: Arc<ScanContext>,
+    ) -> Option<Self> {
+        let in_flight = context.manifest.options.superfiles_in_flight;
+        let queue = IdBlockQueue::new(Arc::clone(&units), descending, in_flight).await?;
+        // Each row group the scan reads, by how many of its blocks are still
+        // to come: read or skipped, each takes one off, and the shared decode
+        // leaves once none remain.
+        let remaining = units
+            .iter()
+            .map(|unit| {
+                (
+                    (unit.file.uri, unit.row_group),
+                    RowGroupDecode {
+                        blocks_left: blocks_overlapping(&unit.group),
+                        bytes: 0,
+                    },
+                )
+            })
+            .collect();
+        let cap = context.cache.max_bytes();
+        Some(Self {
+            queue: Mutex::new(queue),
+            decoding: BlockDecoding {
+                context,
+                cap,
+                inner: Mutex::new(BlockDecodingInner { remaining, held: 0 }),
+            },
+        })
+    }
+}
+
+/// One row group's place in a [`BlockDecoding`].
+#[derive(Debug)]
+struct RowGroupDecode {
+    /// Blocks of the row group the scan has still to read or skip; its shared
+    /// decode is kept until this reaches zero.
+    blocks_left: usize,
+    /// Bytes the row group's kept decoded columns hold, counted in `held`;
+    /// zero when its decode isn't kept.
+    bytes: usize,
+}
+
+/// The id-block decodes a scan keeps: for each row group read by block, how
+/// many of its blocks are left and how many bytes its kept columns hold.
+#[derive(Debug)]
+struct BlockDecodingInner {
+    remaining: HashMap<(SuperfileUri, usize), RowGroupDecode>,
+    /// Bytes the kept row-group decodes hold in sum.
+    held: usize,
+}
+
+/// Keeps each row group's shared decode in [`ScanContext::decoding`] alive
+/// until its last block is read or skipped, and bounds the bytes the kept
+/// decodes hold across the scan at the decoded-column cache's own budget. A
+/// row group whose columns the cache won't hold is still decoded once for its
+/// blocks; past the budget a further row group's decode isn't kept, and its
+/// later blocks decode it again.
+#[derive(Debug)]
+struct BlockDecoding {
+    context: Arc<ScanContext>,
+    /// The most bytes the kept decodes may hold in sum.
+    cap: usize,
+    inner: Mutex<BlockDecodingInner>,
+}
+
+impl BlockDecoding {
+    /// Accounts a block's decode of `group`, `fresh` bytes of newly decoded
+    /// columns: keeps the row group's decode for its other blocks while the
+    /// kept decodes fit the cap, and always while it is the only one kept.
+    /// Returns whether the decode isn't kept, when its entry is to be removed.
+    fn account(&self, group: (SuperfileUri, usize), fresh: usize) -> bool {
+        let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        let inner = &mut *inner;
+        let Some(rg) = inner.remaining.get_mut(&group) else {
+            // Its last block is already accounted for; nothing reads the
+            // entry again, so this decode isn't kept.
+            return true;
+        };
+        rg.bytes = rg.bytes.saturating_add(fresh);
+        inner.held = inner.held.saturating_add(fresh);
+        let others = inner.held - rg.bytes;
+        if inner.held > self.cap && others > 0 {
+            inner.held -= rg.bytes;
+            rg.bytes = 0;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// One block of `group` read or skipped: removes the row group's shared
+    /// decode once its last block is done.
+    fn done(&self, group: (SuperfileUri, usize)) {
+        let drop_entry = {
+            let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+            let inner = &mut *inner;
+            match inner.remaining.get_mut(&group) {
+                Some(rg) => {
+                    rg.blocks_left = rg.blocks_left.saturating_sub(1);
+                    if rg.blocks_left == 0 {
+                        inner.held = inner.held.saturating_sub(rg.bytes);
+                        inner.remaining.remove(&group);
+                        true
+                    } else {
+                        false
+                    }
+                }
+                None => false,
+            }
+        };
+        if drop_entry {
+            self.context
+                .decoding
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&group);
+        }
+    }
+}
+
+impl Drop for BlockDecoding {
+    /// A read that stops early leaves blocks unread; their row groups' decodes
+    /// never count down to zero, so the entries they may still hold leave with
+    /// the scan.
+    fn drop(&mut self) {
+        let inner = self.inner.get_mut().unwrap_or_else(PoisonError::into_inner);
+        if inner.remaining.is_empty() {
+            return;
+        }
+        let mut decoding = self
+            .context
+            .decoding
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        for group in inner.remaining.keys() {
+            decoding.remove(group);
+        }
+    }
+}
+
+/// One span of ids as the statistics of a single container, for pruning:
+/// the `_id` column lies between its two ends and holds no null; nothing is
+/// known of any other column.
+struct IdSpan<'a> {
+    column: &'a str,
+    data_type: &'a DataType,
+    lo: i128,
+    hi: i128,
+    rows: u64,
+}
+
+impl IdSpan<'_> {
+    fn bound(&self, value: i128) -> Option<ArrayRef> {
+        let DataType::Decimal128(precision, scale) = *self.data_type else {
+            return None;
+        };
+        Decimal128Array::from(vec![value])
+            .with_precision_and_scale(precision, scale)
+            .ok()
+            .map(|array| Arc::new(array) as ArrayRef)
+    }
+}
+
+impl PruningStatistics for IdSpan<'_> {
+    fn min_values(&self, column: &StatsColumn) -> Option<ArrayRef> {
+        (column.name == self.column)
+            .then(|| self.bound(self.lo))
+            .flatten()
+    }
+
+    fn max_values(&self, column: &StatsColumn) -> Option<ArrayRef> {
+        (column.name == self.column)
+            .then(|| self.bound(self.hi))
+            .flatten()
+    }
+
+    fn num_containers(&self) -> usize {
+        1
+    }
+
+    fn null_counts(&self, column: &StatsColumn) -> Option<ArrayRef> {
+        (column.name == self.column).then(|| Arc::new(UInt64Array::from(vec![0])) as ArrayRef)
+    }
+
+    fn row_counts(&self) -> Option<ArrayRef> {
+        Some(Arc::new(UInt64Array::from(vec![self.rows])))
+    }
+
+    fn contained(
+        &self,
+        _column: &StatsColumn,
+        _values: &HashSet<ScalarValue>,
+    ) -> Option<BooleanArray> {
+        None
+    }
+}
+
+/// [`LiveFilters`] checked against spans of `_id`, for a read by id block:
+/// each filter's pruning is rebuilt only when the filter has changed since
+/// the last check.
+struct IdGate {
+    live: Arc<LiveFilters>,
+    schema: SchemaRef,
+    column: String,
+    data_type: DataType,
+    /// Each filter's generation when its pruning was built, and the pruning.
+    /// The generation is `None` until the pruning is first built, so a filter
+    /// whose generation reads 0 still builds; the pruning is `None` for a
+    /// filter that rules nothing out (a top-k's before its first `k` rows) or
+    /// doesn't convert.
+    built: Vec<(Option<u64>, Option<PruningPredicate>)>,
+}
+
+impl IdGate {
+    /// A gate over `live` for the scan output `schema`'s `_id` column
+    /// `column`; `None` when the scan doesn't output it as a decimal.
+    fn new(live: Arc<LiveFilters>, schema: SchemaRef, column: &str) -> Option<Self> {
+        let data_type = schema.field_with_name(column).ok()?.data_type().clone();
+        matches!(data_type, DataType::Decimal128(..)).then(|| Self {
+            built: Vec::new(),
+            live,
+            schema,
+            column: column.to_owned(),
+            data_type,
+        })
+    }
+
+    /// Whether the filters as they stand rule out every row whose `_id` lies
+    /// between `lo` and `hi`.
+    fn rules_out(&mut self, lo: i128, hi: i128, rows: u64) -> bool {
+        if self.built.len() != self.live.filters.len() {
+            self.built = self.live.filters.iter().map(|_| (None, None)).collect();
+        }
+        let span = IdSpan {
+            column: &self.column,
+            data_type: &self.data_type,
+            lo,
+            hi,
+            rows,
+        };
+        let schema = &self.schema;
+        self.live.filters.iter().zip(self.built.iter_mut()).any(
+            |(filter, (generation, pruning))| {
+                let now = snapshot_generation(filter);
+                if *generation != Some(now) {
+                    *generation = Some(now);
+                    *pruning = snapshot_physical_expr(Arc::clone(filter))
+                        .ok()
+                        .and_then(|expr| PruningPredicate::try_new(expr, Arc::clone(schema)).ok())
+                        .filter(|pruning| !pruning.always_true());
+                }
+                pruning
+                    .as_ref()
+                    .and_then(|pruning| pruning.prune(&span).ok())
+                    .is_some_and(|keep| keep.first() == Some(&false))
+            },
+        )
+    }
 }
 
 /// Filters pushed down from above that tighten as the statement runs: a
@@ -538,8 +1055,10 @@ impl CachedScanExec {
                 units.push(RowGroupUnit {
                     file: Arc::clone(&file),
                     row_group,
+                    group: rows.clone(),
                     rows,
                     keep,
+                    id_bounds: None,
                 });
             }
         }
@@ -563,6 +1082,7 @@ impl CachedScanExec {
                 schema_id,
                 dictionaries,
                 predicate: None,
+                decoding: Mutex::default(),
             }),
             units: units.into(),
             pruned,
@@ -573,6 +1093,7 @@ impl CachedScanExec {
             parquet,
             live: None,
             reads_best_first: false,
+            id_order: None,
             metrics: ExecutionPlanMetricsSet::new(),
         })
     }
@@ -581,6 +1102,26 @@ impl CachedScanExec {
     /// builds it.
     pub(crate) fn parquet(&self) -> &Arc<dyn ExecutionPlan> {
         &self.parquet
+    }
+
+    /// This scan reading by id block ([`IdOrder`]) for a sort on its output
+    /// column `column`, descending or not; `None` when that column isn't the
+    /// table's `_id`.
+    pub(crate) fn in_id_order(
+        &self,
+        column: usize,
+        descending: bool,
+    ) -> Option<Arc<dyn ExecutionPlan>> {
+        let field = self.context.schema.fields().get(column)?;
+        (field.name() == &self.context.manifest.options.id_column).then(|| {
+            Arc::new(Self {
+                id_order: Some(IdOrder {
+                    descending,
+                    queue: Arc::default(),
+                }),
+                ..self.clone()
+            }) as Arc<dyn ExecutionPlan>
+        })
     }
 }
 
@@ -873,21 +1414,117 @@ impl ScanContext {
     }
 
     /// The `missing` projected columns of `unit`'s row group, decoded, typed
-    /// as the scan schema types them, and kept in the cache.
+    /// as the scan schema types them, and kept in the cache. A read of the
+    /// same row group decoding already is waited for, and the columns it
+    /// decoded are taken from it.
     async fn decode_and_keep(
         self: Arc<Self>,
         unit: RowGroupUnit,
         missing: Vec<usize>,
+        decoded_groups: Count,
+        id_read: Option<Arc<IdRead>>,
     ) -> DfResult<Vec<ArrayRef>> {
+        let group = (unit.file.uri, unit.row_group);
+        let shared = Arc::clone(
+            self.decoding
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .entry(group)
+                .or_insert_with(|| {
+                    Arc::new(AsyncMutex::new(vec![None; self.schema.fields().len()]))
+                }),
+        );
+        let read = self
+            .decode_shared(&unit, &missing, &shared, decoded_groups)
+            .await;
+        match &id_read {
+            // Read by id block: the entry stays for the row group's other
+            // blocks, removed when its last block is read or skipped
+            // ([`BlockDecoding::done`]). Past the budget this decode isn't
+            // kept, and the entry goes now so the bytes aren't held.
+            Some(id_read) => {
+                if read
+                    .as_ref()
+                    .is_ok_and(|(_, fresh)| id_read.decoding.account(group, *fresh))
+                {
+                    self.decoding
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .remove(&group);
+                }
+            }
+            // Read whole: the entry leaves once no read waits on it, and a
+            // later read of the row group finds the columns kept until then. A
+            // whole row group is read once a scan, so its entry then goes.
+            // Dropping this read's clone before the count is taken, and taking
+            // it under the map's lock, leaves the map the sole holder exactly
+            // when no read waits on the entry: two reads finishing at once
+            // can't each count the other's clone and both keep it, and no read
+            // holding the entry can be dropped from under.
+            None => {
+                drop(shared);
+                let mut decoding = self.decoding.lock().unwrap_or_else(PoisonError::into_inner);
+                let alone = decoding
+                    .get(&group)
+                    .is_some_and(|entry| Arc::strong_count(entry) == 1);
+                if alone {
+                    decoding.remove(&group);
+                }
+            }
+        }
+        read.map(|(columns, _)| columns)
+    }
+
+    /// The `missing` projected columns of `unit`'s row group from `shared`,
+    /// the columns reads of it decoded, else from the cache, else decoded,
+    /// kept, and left in `shared` for the reads waiting on it; and the bytes
+    /// of the columns this read decoded afresh, which it alone added to
+    /// `shared`.
+    async fn decode_shared(
+        &self,
+        unit: &RowGroupUnit,
+        missing: &[usize],
+        shared: &AsyncMutex<Vec<Option<ArrayRef>>>,
+        decoded_groups: Count,
+    ) -> DfResult<(Vec<ArrayRef>, usize)> {
+        let mut decoded = shared.lock().await;
+        let fields = self.schema.fields();
+        let mut columns: Vec<Option<ArrayRef>> = missing
+            .iter()
+            .map(|&i| {
+                decoded[i]
+                    .clone()
+                    .or_else(|| self.cache.get(&self.key(unit, fields[i].name())))
+            })
+            .collect();
+        let at: Vec<usize> = (0..missing.len())
+            .filter(|&k| columns[k].is_none())
+            .collect();
+        let mut fresh = 0usize;
+        if !at.is_empty() {
+            let still: Vec<usize> = at.iter().map(|&k| missing[k]).collect();
+            decoded_groups.add(1);
+            for (k, array) in at.into_iter().zip(self.decode(unit, &still).await?) {
+                fresh = fresh.saturating_add(array.get_array_memory_size());
+                decoded[missing[k]] = Some(Arc::clone(&array));
+                columns[k] = Some(array);
+            }
+        }
+        let columns = columns
+            .into_iter()
+            .map(|c| c.ok_or_else(|| DataFusionError::Internal("a column was not read".into())))
+            .collect::<DfResult<_>>()?;
+        Ok((columns, fresh))
+    }
+
+    /// The `missing` projected columns of `unit`'s row group, decoded, typed
+    /// as the scan schema types them, and kept in the cache.
+    async fn decode(&self, unit: &RowGroupUnit, missing: &[usize]) -> DfResult<Vec<ArrayRef>> {
         let fields = self.schema.fields();
         let names: Vec<&str> = missing.iter().map(|&i| fields[i].name().as_str()).collect();
         // Read as the scan types them, so a string the scan works on as a
         // view decodes into one directly.
-        let typed = Arc::new(
-            self.schema
-                .project(&missing)
-                .map_err(QueryError::internal)?,
-        );
+        let typed = Arc::new(self.schema.project(missing).map_err(QueryError::internal)?);
         let read = read_file_row_group(
             &self.manifest,
             &unit.file.reader,
@@ -908,7 +1545,7 @@ impl ScanContext {
                 false => Arc::clone(&array),
             };
             self.cache.insert(
-                self.key(&unit, fields[i].name()),
+                self.key(unit, fields[i].name()),
                 Arc::clone(&kept),
                 kept.get_array_memory_size(),
             );
@@ -917,15 +1554,18 @@ impl ScanContext {
         Ok(decoded)
     }
 
-    /// `unit`'s row group, every projected column, without its deleted rows
-    /// and, when the index chose the file's rows, without the rows it didn't.
-    /// A decode of the columns the cache lacks counts in `decoded`; a read of
-    /// just the chosen rows from the pages, keeping nothing, in `read_in_part`.
+    /// `unit`'s rows, every projected column, without its deleted rows and,
+    /// when the index chose the file's rows, without the rows it didn't. For a
+    /// whole row group the columns are decoded and kept, counted in
+    /// `decoded_groups`; when the index chose few rows and the group isn't
+    /// kept, just those rows are read from the pages, counted in
+    /// `read_in_part`.
     async fn read(
         self: &Arc<Self>,
         unit: &RowGroupUnit,
-        decoded: &Count,
+        decoded_groups: Count,
         read_in_part: &Count,
+        id_read: Option<Arc<IdRead>>,
     ) -> DfResult<RecordBatch> {
         let fields = self.schema.fields();
         // As kept: a column kept as a dictionary stays one until the rows
@@ -939,6 +1579,7 @@ impl ScanContext {
             .collect();
         if !missing.is_empty()
             && !unit.keep
+            && id_read.is_none()
             && let Some(selected) = &unit.file.selected
         {
             read_in_part.add(1);
@@ -947,14 +1588,13 @@ impl ScanContext {
                 .await;
         }
         if !missing.is_empty() {
-            decoded.add(1);
             // The decode runs as its own task: a `LIMIT` above drops this
             // partition's stream once it has its rows, and a decode dropped
             // halfway would have spent its CPU without keeping the columns.
             // Run to the end, it keeps them for the next statement.
             let decoded = spawn(
                 Arc::clone(self)
-                    .decode_and_keep(unit.clone(), missing.clone())
+                    .decode_and_keep(unit.clone(), missing.clone(), decoded_groups, id_read)
                     .in_current_span(),
             )
             .await
@@ -969,8 +1609,16 @@ impl ScanContext {
             .collect::<DfResult<Vec<_>>>()?;
         let n = unit.rows.len();
         let start = unit.rows.start;
-        // The chosen rows are live, so they need no check against the
-        // tombstones.
+        // An id-block unit reads a contiguous slice of a row group; the decoded
+        // columns span the whole group, so cut them to the unit's rows before
+        // the masks, which are sized to the unit.
+        let columns: Vec<ArrayRef> = match unit.rows == unit.group {
+            true => columns,
+            false => columns
+                .iter()
+                .map(|column| column.slice((start - unit.group.start) as usize, n))
+                .collect(),
+        };
         let keep = match &unit.file.selected {
             Some(selected) => Some(selected_mask(selected, &unit.rows)),
             None => {
@@ -1294,6 +1942,7 @@ impl CachedScanExec {
                 schema_id: context.schema_id,
                 dictionaries: context.dictionaries.clone(),
                 predicate: Some(predicate),
+                decoding: Mutex::default(),
             }),
             metrics: ExecutionPlanMetricsSet::new(),
             ..self.clone()
@@ -1329,6 +1978,10 @@ impl DisplayAs for CachedScanExec {
         if let Some(fetch) = self.fetch {
             write!(f, ", fetch={fetch}")?;
         }
+        if let Some(order) = &self.id_order {
+            let direction = if order.descending { "desc" } else { "asc" };
+            write!(f, ", id_blocks={direction}")?;
+        }
         Ok(())
     }
 }
@@ -1351,6 +2004,19 @@ impl ExecutionPlan for CachedScanExec {
         _children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
         Ok(self)
+    }
+
+    /// A fresh id block queue, so a plan run again (a recursive query's
+    /// term, once per step) reads every block again instead of what the
+    /// last run left in the queue.
+    fn reset_state(self: Arc<Self>) -> DfResult<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::new(Self {
+            id_order: self.id_order.as_ref().map(|order| IdOrder {
+                descending: order.descending,
+                queue: Arc::default(),
+            }),
+            ..(*self).clone()
+        }))
     }
 
     fn partition_statistics(&self, partition: Option<usize>) -> DfResult<Arc<Statistics>> {
@@ -1411,8 +2077,11 @@ impl ExecutionPlan for CachedScanExec {
 
     /// For a sort on one of the scan's columns, reads the row groups that
     /// statistics say start best first, so a top-k above settles its bound
-    /// early and [`LiveFilters`] skip the rest. The order is only a reading
-    /// order: the sort stays.
+    /// early and [`LiveFilters`] skip the rest; for a sort on `_id`, reads by
+    /// id block ([`IdOrder`]). The order is only a reading order: the sort
+    /// stays. DataFusion asks only through nodes that pass a sort on, which a
+    /// `FilterExec` doesn't; under one, `IdOrderUnderTopK` asks for the id
+    /// order instead.
     fn try_pushdown_sort(
         &self,
         order: &[PhysicalSortExpr],
@@ -1423,22 +2092,34 @@ impl ExecutionPlan for CachedScanExec {
         let Some(column) = first.expr.downcast_ref::<Column>() else {
             return Ok(SortOrderPushdownResult::Unsupported);
         };
-        let Ok(field) = self.context.schema.field_with_name(column.name()) else {
+        let descending = first.options.descending;
+        let id_order =
+            (column.name() == self.context.manifest.options.id_column).then(|| IdOrder {
+                descending,
+                queue: Arc::default(),
+            });
+        let units = self
+            .context
+            .schema
+            .field_with_name(column.name())
+            .ok()
+            .and_then(|field| {
+                best_first(
+                    &self.units,
+                    column.name(),
+                    field.data_type(),
+                    descending,
+                    first.options.nulls_first,
+                )
+            });
+        if units.is_none() && id_order.is_none() {
             return Ok(SortOrderPushdownResult::Unsupported);
-        };
-        let Some(units) = best_first(
-            &self.units,
-            column.name(),
-            field.data_type(),
-            first.options.descending,
-            first.options.nulls_first,
-        ) else {
-            return Ok(SortOrderPushdownResult::Unsupported);
-        };
+        }
         Ok(SortOrderPushdownResult::Inexact {
             inner: Arc::new(Self {
-                units: units.into(),
+                units: units.map_or_else(|| Arc::clone(&self.units), Into::into),
                 reads_best_first: true,
+                id_order,
                 ..self.clone()
             }),
         })
@@ -1455,41 +2136,135 @@ impl ExecutionPlan for CachedScanExec {
                 self.partitions
             )));
         }
-        let units: Vec<RowGroupUnit> = self
-            .units
-            .iter()
-            .skip(partition)
-            .step_by(self.partitions)
-            .cloned()
-            .collect();
+        let partitions = self.partitions;
+        let all = Arc::clone(&self.units);
+        // By id block only under a filter that tightens: without one, no
+        // block is skipped, and the row groups read in fewer, larger batches.
+        let id_order = self.id_order.clone().filter(|_| self.live.is_some());
+        let descending = id_order.as_ref().is_some_and(|order| order.descending);
+        // The id-block read, built by the first partition to start and shared
+        // by the rest through the queue's cell: the blocks it hands out, and
+        // the bookkeeping that keeps each row group's shared decode alive until
+        // its last block is read and bounds the bytes those decodes hold.
+        let context_for_queue = Arc::clone(&self.context);
+        let id_read_cell = id_order.as_ref().map(|order| Arc::clone(&order.queue));
+        let units = stream::once(async move {
+            let id_read = match &id_order {
+                Some(order) => order
+                    .queue
+                    .get_or_init(|| async {
+                        IdRead::new(
+                            Arc::clone(&all),
+                            order.descending,
+                            Arc::clone(&context_for_queue),
+                        )
+                        .await
+                        .map(Arc::new)
+                    })
+                    .await
+                    .clone(),
+                None => None,
+            };
+            match id_read {
+                Some(id_read) => stream::unfold(id_read, |id_read| {
+                    let next = id_read
+                        .queue
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .take(&id_read.decoding);
+                    future::ready(next.map(|unit| (unit, id_read)))
+                })
+                .boxed(),
+                None => {
+                    let mine: Vec<RowGroupUnit> = all
+                        .iter()
+                        .skip(partition)
+                        .step_by(partitions)
+                        .cloned()
+                        .collect();
+                    stream::iter(mine).boxed()
+                }
+            }
+        })
+        .flatten();
         let context = Arc::clone(&self.context);
-        let mut gate = self
-            .live
-            .clone()
-            .map(|live| RowGroupGate::new(live, Arc::clone(&self.context.schema)));
-        // Rows are dropped per batch only when the scan reads best first for
-        // a sort above it, which a top-k asks for and a hash join or an
-        // aggregate does not; it matches the Parquet scan, which filters rows
-        // only under `ORDER BY ... LIMIT`. Their filters still skip whole row
-        // groups above, but dropping their rows here, where most pass, is
-        // work for nothing.
-        let kept = self.reads_best_first.then(|| self.live.clone()).flatten();
         let output_rows = MetricBuilder::new(&self.metrics).output_rows(partition);
-        let decoded = MetricBuilder::new(&self.metrics).counter(ROW_GROUPS_DECODED, partition);
         let read_in_part =
             MetricBuilder::new(&self.metrics).counter(ROW_GROUPS_READ_IN_PART, partition);
         let rows_read = MetricBuilder::new(&self.metrics).counter(ROWS_READ, partition);
+        let decoded_groups =
+            MetricBuilder::new(&self.metrics).counter(ROW_GROUPS_DECODED, partition);
         let skipped = MetricBuilder::new(&self.metrics).counter(ROW_GROUPS_SKIPPED, partition);
         let dropped = MetricBuilder::new(&self.metrics).counter(ROWS_DROPPED, partition);
+        // Rows are dropped per batch only when the scan reads best first for
+        // a sort above it, which a top-k asks for and a hash join or an
+        // aggregate does not; their filters still skip whole row groups but
+        // dropping their rows here, where most pass, is work for nothing.
+        let kept = self.reads_best_first.then(|| self.live.clone()).flatten();
+        let mut row_gate = self
+            .live
+            .clone()
+            .map(|live| RowGroupGate::new(live, Arc::clone(&self.context.schema)));
+        let id_gate = self.live.clone().and_then(|live| {
+            IdGate::new(
+                live,
+                Arc::clone(&self.context.schema),
+                &self.context.manifest.options.id_column,
+            )
+        });
         // A row group goes out in batch-size slices, as the Parquet scan's
         // rows do: the filter above then works a batch at a time, and a
         // `LIMIT` met in the first slice leaves the rest of the row group.
         let batch_size = task.session_config().batch_size();
-        let batches = stream::iter(units)
+        // The shared id-block read, for the stages that count a block done:
+        // the id gate when a block is ruled out, and the read when it is read.
+        // Resolved from the cell the first partition filled.
+        let gate_cell = id_read_cell.clone();
+        let then_cell = id_read_cell;
+        let batches = units
+            // An id block is checked against the filters' bounds as it comes
+            // up. Blocks come in order of their lowest id (highest,
+            // descending), so the ids of every block still to come lie at or
+            // above this one's lowest: once the filters rule out all of those,
+            // the partition is done. A block ruled out here is read no further,
+            // so it counts against its row group's block tally as a read would.
+            .scan(id_gate, move |gate, unit| {
+                let id_read = gate_cell
+                    .as_ref()
+                    .and_then(|cell| cell.get().cloned().flatten());
+                let next = match (gate.as_mut(), unit.id_bounds) {
+                    (Some(gate), Some((lo, hi))) => {
+                        let group = (unit.file.uri, unit.row_group);
+                        let rows = u64::from(unit.rows.end - unit.rows.start);
+                        let rest = match descending {
+                            false => (lo, i128::MAX),
+                            true => (i128::MIN, hi),
+                        };
+                        if gate.rules_out(rest.0, rest.1, u64::MAX) {
+                            if let Some(id_read) = &id_read {
+                                id_read.decoding.done(group);
+                            }
+                            None
+                        } else if gate.rules_out(lo, hi, rows) {
+                            if let Some(id_read) = &id_read {
+                                id_read.decoding.done(group);
+                            }
+                            Some(None)
+                        } else {
+                            Some(Some(unit))
+                        }
+                    }
+                    _ => Some(Some(unit)),
+                };
+                future::ready(next)
+            })
+            .filter_map(future::ready)
             .filter(move |unit| {
                 // Checked as each row group comes up, so a bound tightened by
-                // the rows read so far skips it.
-                let skip = gate.as_mut().is_some_and(|gate| gate.skip(unit));
+                // the rows read so far skips it. An id block was checked by
+                // its own bounds above.
+                let skip = unit.id_bounds.is_none()
+                    && row_gate.as_mut().is_some_and(|gate| gate.skip(unit));
                 if skip {
                     skipped.add(1);
                 }
@@ -1497,10 +2272,26 @@ impl ExecutionPlan for CachedScanExec {
             })
             .then(move |unit| {
                 let context = Arc::clone(&context);
-                let decoded = decoded.clone();
                 let read_in_part = read_in_part.clone();
                 rows_read.add(unit.rows.len());
-                async move { context.read(&unit, &decoded, &read_in_part).await }
+                let decoded_groups = decoded_groups.clone();
+                let id_read = then_cell
+                    .as_ref()
+                    .and_then(|cell| cell.get().cloned().flatten());
+                async move {
+                    let group = (unit.file.uri, unit.row_group);
+                    let block = unit.id_bounds.is_some();
+                    let batch = context
+                        .read(&unit, decoded_groups, &read_in_part, id_read.clone())
+                        .await;
+                    // The block is read: count it against its row group's tally
+                    // once its decode has had its chance to be kept, so the
+                    // shared entry leaves after the last block, not before.
+                    if block && let Some(id_read) = &id_read {
+                        id_read.decoding.done(group);
+                    }
+                    batch
+                }
             })
             .map_ok(move |batch| stream::iter(sliced(batch, batch_size).into_iter().map(Ok)))
             .try_flatten()
@@ -1557,16 +2348,19 @@ pub(crate) fn has_columns(schema: &Schema) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use arrow::util::pretty::pretty_format_batches;
-    use arrow_array::{Array, Int64Array, LargeStringArray, StringArray};
+    use arrow_array::{Array, Decimal128Array, Int64Array, LargeStringArray, StringArray};
     use arrow_schema::{DataType, Field};
+    use bytes::Bytes;
     use datafusion::prelude::{col, lit};
     use tempfile::TempDir;
 
     use super::*;
     use crate::{
         storage::{LocalFsStorageProvider, StorageProvider},
-        superfile::builder::FtsConfig,
+        superfile::builder::{FtsConfig, with_raw_id_sidecar_from_self},
         supertable::{Supertable, SupertableOptions, SupertableReader},
     };
 
@@ -1960,6 +2754,23 @@ mod tests {
             .collect()
     }
 
+    /// The `_id` column of `sql`'s rows, in order.
+    fn ids_of(reader: &SupertableReader, sql: &str) -> Vec<i128> {
+        reader
+            .query_sql(sql)
+            .unwrap_or_else(|error| panic!("{sql}: {error}"))
+            .iter()
+            .flat_map(|b| {
+                let ids = b
+                    .column_by_name("_id")
+                    .and_then(|c| c.as_any().downcast_ref::<Decimal128Array>())
+                    .expect("_id")
+                    .clone();
+                (0..ids.len()).map(move |i| ids.value(i))
+            })
+            .collect()
+    }
+
     /// The `EXPLAIN` of `sql` on `reader`, every plan line joined.
     fn explained(reader: &SupertableReader, sql: &str) -> String {
         reader
@@ -2129,5 +2940,172 @@ mod tests {
             assert_eq!(got, vec![200, 8200], "{pass}");
         }
         assert_eq!(superfiles_keeping(&with, &kept, "k"), 0, "k is not kept");
+    }
+
+    /// The `id_blocks=asc` the rule prints is a reading order the scan asks
+    /// its files for, not a promise every file can give it. A superfile a
+    /// writer left before the packed layout carries its ids raw, with no
+    /// blocks to read in order, so the scan falls back to reading it whole
+    /// and sorting. This rewrites the table's superfiles to that older raw
+    /// form and checks the plan still engages the rule (`id_blocks=asc`)
+    /// while an `ORDER BY _id ... LIMIT` answers exactly as the full sort
+    /// truncated — the fallback is correct, not merely reachable.
+    #[test]
+    fn a_scan_without_packed_id_blocks_answers_as_a_full_sort() {
+        let kept = Arc::new(DecodedColumnCache::new(NARROWED_KEPT_BYTES));
+        let dir = TempDir::new().expect("tempdir");
+        let st = narrowed_table(&dir, Some(kept));
+        let reader = st.reader().expect("reader");
+        let store = Arc::clone(&reader.manifest().options.store);
+
+        // Replace every superfile's resident bytes with its raw-sidecar form,
+        // the layout with no id blocks. The on-disk bytes carry a manifest
+        // layout hint the storage fallback would read a stale footer through,
+        // so the swap stays in the in-memory tier the live handle serves
+        // from. `insert` keeps the first bytes for a uri, so remove first.
+        let mut rewritten = 0;
+        for entry in &reader.manifest().superfiles {
+            let packed = Bytes::from(
+                std::fs::read(dir.path().join(entry.uri.storage_path())).expect("read superfile"),
+            );
+            if !SuperfileReader::open(packed.clone())
+                .expect("open superfile")
+                .id_sidecar_is_packed()
+            {
+                continue;
+            }
+            let raw = with_raw_id_sidecar_from_self(&packed);
+            assert!(
+                !SuperfileReader::open(raw.clone())
+                    .expect("open rewritten superfile")
+                    .id_sidecar_is_packed(),
+                "the rewrite must drop the packed layout",
+            );
+            store.remove(&entry.uri);
+            store.insert(entry.uri, raw).expect("insert raw superfile");
+            rewritten += 1;
+        }
+        assert!(rewritten >= 1, "at least one packed superfile to rewrite");
+
+        for (keyword, label) in [("ASC", "asc"), ("DESC", "desc")] {
+            let sorted =
+                format!("SELECT _id FROM supertable WHERE seq % 7 = 0 ORDER BY _id {keyword}");
+            let topk = format!("{sorted} LIMIT {TOP_ROWS}");
+            let plan = explained(&reader, &topk);
+            assert!(plan.contains("CachedScanExec"), "{keyword}: {plan}");
+            assert!(
+                plan.contains(&format!("id_blocks={label}")),
+                "{keyword}: {plan}"
+            );
+            let full = ids_of(&reader, &sorted);
+            assert!(full.len() > TOP_ROWS, "{keyword}: {} rows", full.len());
+            let want: Vec<i128> = full.into_iter().take(TOP_ROWS).collect();
+            for pass in ["first", "again"] {
+                assert_eq!(ids_of(&reader, &topk), want, "{pass} {keyword}: {topk}");
+            }
+        }
+    }
+
+    /// A top-k on `_id` reads its files by id block in that order and the
+    /// answer is the full sort truncated — on packed files that read by id
+    /// block, not the raw-sidecar fallback. Descending reads by its own block
+    /// order, merge key and stop range, so it is checked beside ascending
+    /// rather than assumed from it: a `k` of 1, 10 and 500, and a `k` past
+    /// every matching row so every block is read and the merge runs the whole
+    /// way down, not only at the top.
+    #[test]
+    fn a_top_k_on_id_reads_by_id_block_and_answers_as_the_full_sort() {
+        let kept = Arc::new(DecodedColumnCache::new(NARROWED_KEPT_BYTES));
+        let dir = TempDir::new().expect("tempdir");
+        let st = narrowed_table(&dir, Some(kept));
+        let reader = st.reader().expect("reader");
+
+        for (keyword, label) in [("ASC", "asc"), ("DESC", "desc")] {
+            let sorted =
+                format!("SELECT _id FROM supertable WHERE seq % 7 = 0 ORDER BY _id {keyword}");
+            let full = ids_of(&reader, &sorted);
+            assert!(full.len() > 500, "{keyword}: {} rows", full.len());
+            for &k in &[1usize, 10, 500, full.len() + 50] {
+                let topk = format!("{sorted} LIMIT {k}");
+                let plan = explained(&reader, &topk);
+                assert!(plan.contains("CachedScanExec"), "{keyword} k={k}: {plan}");
+                assert!(
+                    plan.contains(&format!("id_blocks={label}")),
+                    "{keyword} k={k}: {plan}"
+                );
+                let want: Vec<i128> = full.iter().copied().take(k).collect();
+                for pass in ["first", "again"] {
+                    assert_eq!(
+                        ids_of(&reader, &topk),
+                        want,
+                        "{pass} {keyword} k={k}: {topk}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A recursive query runs its term once per step, so the id-block read
+    /// runs again each step and each run needs a fresh queue: a run reading
+    /// from the one the last step left drained would return nothing and the
+    /// step would drop out. This runs the read twice — the anchor, then the
+    /// recursive term joined to the ids the anchor found — and checks both
+    /// steps return that same top-k, so a queue that was not reset fails here.
+    #[test]
+    fn a_recursive_query_reads_by_id_block_fresh_each_step() {
+        let kept = Arc::new(DecodedColumnCache::new(NARROWED_KEPT_BYTES));
+        let dir = TempDir::new().expect("tempdir");
+        let st = narrowed_table(&dir, Some(kept));
+        let reader = st.reader().expect("reader");
+
+        let top = format!(
+            "SELECT _id AS id FROM supertable WHERE seq % 7 = 0 ORDER BY _id LIMIT {TOP_ROWS}"
+        );
+        let sql = format!(
+            "WITH RECURSIVE r AS ( \
+                 SELECT 1 AS step, a.id FROM ({top}) a \
+                 UNION ALL \
+                 SELECT r.step + 1, s.id FROM r JOIN ({top}) s ON r.id = s.id \
+                  WHERE r.step < 2) \
+             SELECT step, id FROM r ORDER BY step, id"
+        );
+        let rows = reader.query_sql(&sql).expect("recursive CTE");
+
+        let mut want: Vec<i128> = ids_of(
+            &reader,
+            &format!("SELECT _id FROM supertable WHERE seq % 7 = 0 ORDER BY _id LIMIT {TOP_ROWS}"),
+        );
+        want.sort_unstable();
+        assert_eq!(
+            want.len(),
+            TOP_ROWS,
+            "the id-block top-k has {TOP_ROWS} rows"
+        );
+
+        let mut by_step: BTreeMap<i64, Vec<i128>> = BTreeMap::new();
+        for batch in &rows {
+            let steps = batch
+                .column_by_name("step")
+                .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+                .expect("step");
+            let ids = batch
+                .column_by_name("id")
+                .and_then(|c| c.as_any().downcast_ref::<Decimal128Array>())
+                .expect("id");
+            for i in 0..steps.len() {
+                by_step
+                    .entry(steps.value(i))
+                    .or_default()
+                    .push(ids.value(i));
+            }
+        }
+        for step in [1i64, 2] {
+            let mut got = by_step.get(&step).cloned().unwrap_or_default();
+            got.sort_unstable();
+            assert_eq!(
+                got, want,
+                "step {step} must read the same id-block top-k afresh"
+            );
+        }
     }
 }
