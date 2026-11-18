@@ -270,6 +270,12 @@ pub(crate) struct BlockCachedSource {
     entry_token: Arc<()>,
     /// Whether this source reserves and releases touched-block bytes itself.
     owns_accounting: bool,
+    /// Filled bytes a record counts instead of this source ([`Self::retire`]); the source gives
+    /// back only what it filled beyond them.
+    handed_over: AtomicU64,
+    /// Set once a record keeps this source's file ([`Self::retire`]): the source no longer writes
+    /// the file's index, which a newer source may have adopted and rewritten.
+    retired: AtomicBool,
     /// Where this file's FTS hole and aligned region lie.
     layout: SourceLayout,
     /// Where the last [`READ_ENDS`] reads ended, `u64::MAX` in unused slots,
@@ -775,6 +781,8 @@ impl BlockCachedSource {
             path,
             entry_token: Arc::new(()),
             owns_accounting,
+            handed_over: AtomicU64::new(0),
+            retired: AtomicBool::new(false),
             // An empty section is no section: nothing can be read in it.
             layout: SourceLayout {
                 fts_hole: layout.fts_hole.filter(|&(_, len)| len > 0),
@@ -905,6 +913,18 @@ impl BlockCachedSource {
     /// Whether this source charges the budget for the blocks it fills, rather than riding on its
     /// owning entry's reservation.
     pub(crate) fn owns_accounting(&self) -> bool {
+        self.owns_accounting
+    }
+
+    /// Hand this source's file and the count of `filled` of its bytes to whoever keeps it: the
+    /// source stops writing the file's index, and a run landing later is given back when it drops
+    /// but never indexed, so a later open fetches it again. True when this source counted those
+    /// bytes itself.
+    pub(crate) fn retire(&self, filled: u64) -> bool {
+        self.retired.store(true, Ordering::Release);
+        if self.owns_accounting {
+            self.handed_over.fetch_add(filled, Ordering::AcqRel);
+        }
         self.owns_accounting
     }
 
@@ -1392,6 +1412,9 @@ impl BlockCachedSource {
         let Some(bf) = self.created_block_file() else {
             return;
         };
+        if self.retired.load(Ordering::Acquire) {
+            return;
+        }
 
         while self.dirty.load(Ordering::SeqCst) {
             if self.flushing.swap(true, Ordering::SeqCst) {
@@ -2221,7 +2244,10 @@ impl Drop for BlockCachedSource {
         if self.owns_accounting
             && let Some(store) = self.store.upgrade()
         {
-            let filled = self.filled_bytes.load(Ordering::Acquire);
+            let filled = self
+                .filled_bytes
+                .load(Ordering::Acquire)
+                .saturating_sub(self.handed_over.load(Ordering::Acquire));
             if filled > 0 {
                 store.release_block_bytes(filled);
             }
@@ -2998,6 +3024,40 @@ mod tests {
             d_read, want,
             "D must serve real bytes, not zeros from a successor inode's hole \
              claimed by a dropped generation's stale bitmap"
+        );
+    }
+
+    /// A source whose file a record took over, still owing an index write (an earlier fsync
+    /// failed), dropped after a newer source adopted the file and wrote its own index.
+    /// This test pins that a retired source leaves the newer index in place.
+    #[tokio::test]
+    async fn a_retired_source_leaves_the_index_alone_when_it_drops() {
+        const OBJ: usize = 4 * CACHE_BLOCK_BYTES as usize + 1000;
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let uri = SuperfileUri::new_v4();
+        let inner = Arc::new(CountingSource::new(OBJ));
+        let old = BlockCachedSource::new(
+            Arc::clone(&inner) as Arc<dyn LazyByteSource>,
+            Arc::downgrade(&store),
+            uri,
+            dir.path().join("retired.blocks"),
+        );
+        store.install_block_entry_for_test(uri, Arc::clone(&old));
+        let _ = old.range(100, 50).await.expect("fill");
+        store.block_writes_settled().await;
+        let idx_path = old.idx_path();
+        wait_until(|| idx_path.exists(), "the index is written").await;
+        store.remove_block_entry_for_test(&uri);
+
+        let _ = old.retire(old.filled_bytes_handle().load(Ordering::Acquire));
+        fs::write(&idx_path, b"newer").expect("a newer source's index");
+        old.dirty.store(true, Ordering::SeqCst);
+        drop(old);
+        assert_eq!(
+            fs::read(&idx_path).expect("index"),
+            b"newer",
+            "left in place"
         );
     }
 

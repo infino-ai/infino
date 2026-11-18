@@ -19,7 +19,7 @@ use std::{
     fmt,
     future::Future,
     sync::{
-        Arc, Mutex, MutexGuard, OnceLock, Weak,
+        Arc, Mutex, MutexGuard, OnceLock, TryLockError, Weak,
         atomic::{AtomicBool, AtomicU64},
     },
     time::{Duration, Instant},
@@ -30,7 +30,7 @@ use arrow_schema::SchemaRef;
 use chrono::Utc;
 use datafusion::{execution::context::SessionContext, logical_expr::LogicalPlan};
 use futures::future::join_all;
-use tokio::runtime::Runtime;
+use tokio::{runtime::Runtime, sync::Mutex as AsyncMutex};
 use tracing::{Instrument, debug, warn};
 
 use super::{
@@ -66,12 +66,12 @@ use crate::{
             deleted_stats::DeletedStatsCache,
             fts::GlobalIdfCache,
             scalar_cache::DecodedScalarCache,
-            sql::{SqlSchemas, build_sql_schemas},
+            sql::{SessionTemplate, SqlSchemas, build_sql_schemas},
             value_count_carry::ValueCountCarry,
         },
         reader_cache::{
             ReadIntent,
-            disk::{DiskCacheError, skip_background_fill},
+            disk::{CachedSessions, DiskCacheError, skip_background_fill},
         },
         stats::process_rss_bytes,
         tombstones::{SidecarCache, TombstoneSeqView, cache::DEFAULT_SEAL_TTL},
@@ -136,6 +136,9 @@ pub(super) struct SupertableInner {
     /// readers do ArcSwap::load_full at construction to pin a
     /// snapshot for the duration of their queries.
     pub(super) manifest: ArcSwap<ManifestSnapshot>,
+    /// Held while one caller reads the statistics into a handle opened without them, so callers
+    /// arriving together fetch them once (`load_statistics`).
+    pub(super) statistics_loading: AsyncMutex<()>,
     /// Held by one exclusive writer, or shared by same-schema appends.
     pub(super) writer_slot: WriterSlot,
     /// Orders the publishes of shared append writers.
@@ -181,6 +184,10 @@ pub(super) struct SupertableInner {
     /// `query_sql` the `Arc::ptr_eq` check fails and the cache
     /// is rebuilt against the fresh snapshot.
     pub(super) sql_session_cache: Mutex<Option<(Arc<ManifestSnapshot>, SessionContext)>>,
+    /// The session every SQL context of this table's readers starts from,
+    /// built once and copied per context: the same [`SessionTemplate`] a
+    /// catalog connection plans its statements in.
+    pub(super) sql_session_template: SessionTemplate,
     /// Deterministic scalar SQL logical plans keyed by statement text and
     /// manifest identity. Physical plans are intentionally rebuilt so fresh
     /// tombstone overlays and query-stable functions retain their semantics.
@@ -339,14 +346,18 @@ impl SupertableInner {
     /// The table's cached SQL schemas, built once from the immutable options.
     /// Cheap `Arc` clone on every call after the first.
     pub(super) fn sql_schemas(&self) -> Arc<SqlSchemas> {
-        let manifest = self.manifest.load();
+        self.sql_schemas_of(&self.manifest.load())
+    }
+
+    /// The SQL schemas of `manifest`, a snapshot of this table, cached by its schema id.
+    pub(super) fn sql_schemas_of(&self, manifest: &ManifestSnapshot) -> Arc<SqlSchemas> {
         let schema_id = manifest.table_schema().schema_id();
         if let Some(cached) = self.sql_schemas.load().as_ref()
             && cached.0 == schema_id
         {
             return Arc::clone(&cached.1);
         }
-        let built = Arc::new(build_sql_schemas(&manifest));
+        let built = Arc::new(build_sql_schemas(manifest));
         self.sql_schemas
             .store(Some(Arc::new((schema_id, Arc::clone(&built)))));
         built
@@ -445,33 +456,42 @@ impl SupertableInner {
         // say because a manifest is not yet visible to this process, and the next conditional probe
         // would then answer `NotModified` and never retry. That pins the handle to the pre-commit
         // manifest and serves its rows as empty, for good.
-        let current = self.manifest.load_full();
-        let manifest = match ManifestSnapshot::load_with_pointer(
-            Some(current),
-            storage,
-            None,
-            pointer,
-        )
-        .await
-        {
-            Ok(manifest) => manifest,
-            // The pointer moved but the in-memory state already covers that version, which is what
-            // this process's own commit leaves behind. Nothing newer to load, so record the etag
-            // and let the next probe be a cheap 304.
-            Err(ManifestLoadError::AlreadyLoaded) => {
-                record("outcome", "already_loaded");
-                *self
-                    .last_pointer_etag
-                    .lock()
-                    .expect("last_pointer_etag mutex poisoned") = meta.etag.clone();
-                return Ok(false);
+        //
+        // Swapped in only over the snapshot it was loaded from: if a statistics read swapped in
+        // another meanwhile (`load_statistics`), the load runs again from that one, keeping them.
+        loop {
+            let current = self.manifest.load_full();
+            let manifest = match ManifestSnapshot::load_with_pointer(
+                Some(Arc::clone(&current)),
+                Arc::clone(&storage),
+                None,
+                pointer.clone(),
+            )
+            .await
+            {
+                Ok(manifest) => manifest,
+                // The pointer moved but the in-memory state already covers that version, which is
+                // what this process's own commit leaves behind. Nothing newer to load, so record
+                // the etag and let the next probe be a cheap 304.
+                Err(ManifestLoadError::AlreadyLoaded) => {
+                    record("outcome", "already_loaded");
+                    *self
+                        .last_pointer_etag
+                        .lock()
+                        .expect("last_pointer_etag mutex poisoned") = meta.etag.clone();
+                    return Ok(false);
+                }
+                // Leaving the etag unchanged on a failed load is what makes the next probe read the
+                // pointer again and retry, instead of short-circuiting to a 304.
+                Err(err) => return Err(err),
+            };
+            if Arc::ptr_eq(
+                &self.manifest.compare_and_swap(&current, manifest),
+                &current,
+            ) {
+                break;
             }
-            // Leaving the etag unchanged on a failed load is what makes the next probe read the
-            // pointer again and retry, instead of short-circuiting to a 304.
-            Err(err) => return Err(err),
-        };
-
-        self.manifest.store(manifest);
+        }
 
         self.reconcile_tombstone_seqs();
 
@@ -682,10 +702,9 @@ impl Supertable {
         if let Some(err) = hidden_index_broken {
             let _ = handle.inner.hidden_index_open_error.set(err);
         }
-        // The manifests are loaded now, so the attached disk cache can be
-        // sized against the real footprint (user + hidden index) instead
-        // of whatever fixed default it was constructed with.
-        handle.reconcile_cache_budget();
+        // The manifests are loaded now, so the attached disk cache's budget
+        // can be checked against the real footprint (user + hidden index).
+        handle.warn_if_cache_budget_below_footprint();
         debug!(
             manifest_id = handle.inner.manifest.load().manifest_id,
             "opened supertable"
@@ -1166,6 +1185,60 @@ impl Supertable {
         bridge_on_runtime(fut, &self.query_runtime())
     }
 
+    /// Whether this handle's current manifest carries the per-column statistics.
+    pub(crate) fn statistics_loaded(&self) -> bool {
+        self.inner.manifest.load().statistics_loaded()
+    }
+
+    /// Read the per-column statistics into this handle in place, once for callers arriving
+    /// together, then finish what its open left to them. A no-op once they are loaded.
+    ///
+    /// The read-consistency policy applies first ([`Self::ensure_fresh`]), so the statistics are
+    /// read for the snapshot the caller's reader then pins, not for one a refresh replaces.
+    pub(crate) fn load_statistics(&self) -> Result<(), ManifestLoadError> {
+        if self.statistics_loaded() {
+            return Ok(());
+        }
+        self.ensure_fresh()?;
+        if self.pointer_vanished() {
+            return Err(ManifestLoadError::PointerVanished);
+        }
+        self.block_on_query(self.read_statistics_and_recover())
+    }
+
+    /// Read the statistics into the snapshot this handle holds now, once for callers arriving
+    /// together, then finish the updates its open left to them.
+    async fn read_statistics_and_recover(&self) -> Result<(), ManifestLoadError> {
+        {
+            let _loading = self.inner.statistics_loading.lock().await;
+            // A refresh may swap in another snapshot meanwhile: the statistics are read into
+            // whatever is current, and the swap retried.
+            loop {
+                let current = self.inner.manifest.load_full();
+                if current.statistics_loaded() {
+                    return Ok(());
+                }
+                let loaded = current.with_statistics().await?;
+                if Arc::ptr_eq(
+                    &self.inner.manifest.compare_and_swap(&current, loaded),
+                    &current,
+                ) {
+                    break;
+                }
+            }
+        }
+        self.recover_unfinished().await;
+        Ok(())
+    }
+
+    /// Finish the updates a crashed writer left, best-effort: a failure leaves them to the next
+    /// sweep.
+    async fn recover_unfinished(&self) {
+        if let Err(e) = self.run_recovery_sweep_once().await {
+            warn!(error = %e, "recovery sweep failed (best-effort)");
+        }
+    }
+
     /// Index the superfiles the table-level term index does not list and
     /// fold its layers in runs its scratch disk holds, or of at most
     /// `unmeasured_fold_max_bytes` when the disk cannot be read (see
@@ -1216,15 +1289,15 @@ impl Supertable {
             return Ok(());
         };
         bridge_on_runtime(
-            super::writer::drain_user_superfiles_to_hidden_cells(
+            super::writer::drain_waiting_user_superfiles(
                 Arc::clone(&self.inner),
                 Arc::clone(&hidden.inner),
             ),
             &self.query_runtime(),
         )?;
         // The drain writes the hidden per-cell index — roughly a second
-        // copy of the vector payload — so the cache budget floor moves.
-        self.reconcile_cache_budget();
+        // copy of the vector payload — so the footprint grows.
+        self.warn_if_cache_budget_below_footprint();
         Ok(())
     }
 
@@ -1339,24 +1412,16 @@ impl Supertable {
         user.saturating_add(hidden)
     }
 
-    /// Reconcile the attached disk cache's budget with the table's current
-    /// on-storage footprint (user + hidden index + headroom). Called after
-    /// open — once the manifests are loaded — and again after the drain
-    /// grows the hidden index. Raise-only for engine-managed (auto-sized)
-    /// budgets; an explicit budget is never changed, but gets a one-shot
-    /// warning when the footprint exceeds it (steady-state reads would
-    /// churn the cache).
+    /// Warn when the attached disk cache's budget is smaller than the
+    /// table's current on-storage footprint (user + hidden index). Called
+    /// after open, once the manifests are loaded, and again after the drain
+    /// grows the hidden index. The budget itself is never changed.
     #[cfg_attr(feature = "detailed-tracing", tracing::instrument(skip_all))]
-    pub(crate) fn reconcile_cache_budget(&self) {
+    pub(crate) fn warn_if_cache_budget_below_footprint(&self) {
         let Some(cache) = self.inner.options.disk_cache.as_ref() else {
             return;
         };
-        let footprint = self.on_storage_footprint_bytes();
-        if footprint == 0 {
-            return;
-        }
-        let floor = footprint.saturating_add(footprint / CACHE_BUDGET_HEADROOM_DIVISOR);
-        cache.reconcile_budget_floor(floor, footprint);
+        cache.warn_if_budget_below(self.on_storage_footprint_bytes());
     }
 
     #[cfg(any(test, feature = "test-helpers"))]
@@ -1522,8 +1587,9 @@ impl Supertable {
     /// Returns `Ok(report)` with the per-outcome counts on
     /// success; `Err(NoStorageAttached)` for in-memory-only
     /// supertables (no WALs can exist there).
-    /// Not public API: WAL recovery is engine-driven — it runs
-    /// automatically on [`Supertable::open`]. This manual hook is a
+    /// Not public API: WAL recovery is engine-driven. It runs on [`Supertable::open`] (for a handle
+    /// opened without statistics, only when the open's GC finds a log to take or cannot list the
+    /// logs) and on [`Self::load_statistics`]. This manual hook is a
     /// crate internal used only by in-crate unit tests that pre-seed
     /// half-finished WALs and assert the sweep completes them.
     pub(crate) async fn run_recovery_sweep_once(&self) -> Result<RecoveryReport, RecoveryError> {
@@ -1861,12 +1927,6 @@ pub(crate) const GLOBAL_VECTOR_KMEANS_ITERS: usize = 8;
 
 /// Fixed PRNG seed for global centroid training.
 pub(crate) const GLOBAL_VECTOR_KMEANS_SEED: u64 = 0x51ED_2A11;
-
-/// Headroom an engine-managed (auto-sized) cache budget keeps over the
-/// table's on-storage footprint, in divisor form (`footprint +
-/// footprint / this`). Slack for in-flight cold-fetch reservations while
-/// the full working set stays resident.
-const CACHE_BUDGET_HEADROOM_DIVISOR: u64 = 10;
 
 /// Aggressive compaction profile for the hidden vector-index table: keep
 /// ~one compact packed shard object per partition key instead of many
@@ -2268,6 +2328,7 @@ async fn build_handle(
         tier_policy: crate::supertable::query::tier::TierPolicy::new(),
         id_generator: Mutex::new(id_generator),
         sql_session_cache: Mutex::new(None),
+        sql_session_template: SessionTemplate::default(),
         sql_logical_plan_cache: Mutex::new(None),
         decoded_scalar_cache: DecodedScalarCache::default(),
         value_count_carry: Arc::default(),
@@ -2288,17 +2349,26 @@ async fn build_handle(
         sql_schemas: ArcSwapOption::empty(),
         term_index_objects_seen: Mutex::default(),
         retired_scratch: RetiredScratch::default(),
+        statistics_loading: AsyncMutex::new(()),
     });
     install_disk_cache_pinning(&inner);
     let st = Supertable { inner };
     if st.inner.options.storage.is_some() {
-        // Best-effort: a sweep failure here doesn't fail handle
-        // construction; the next sweep gets another shot.
-        if let Err(e) = st.run_recovery_sweep_once().await {
-            warn!(error = %e, "open-time recovery sweep failed (best-effort)");
+        // Recovery needs the statistics: finishing an update without them writes it into a part
+        // of its own. An open without them reads them first only when GC, which reads every log,
+        // finds one recovery would take, or cannot list the logs at all.
+        if st.inner.options.load_statistics {
+            st.recover_unfinished().await;
         }
-        if let Err(e) = st.run_gc_sweep_once().await {
-            warn!(error = %e, "open-time gc sweep failed (best-effort)");
+        let left_for_recovery = match st.run_gc_sweep_once().await {
+            Ok(report) => report.n_left_for_recovery > 0,
+            Err(e) => {
+                warn!(error = %e, "open-time gc sweep failed (best-effort)");
+                true
+            }
+        };
+        if left_for_recovery && !st.statistics_loaded() {
+            st.read_statistics_and_recover().await?;
         }
     }
     Ok(st)
@@ -2456,6 +2526,29 @@ fn install_disk_cache_pinning(inner: &Arc<SupertableInner>) {
     };
     let pinned_fn: Arc<dyn Fn() -> HashSet<SuperfileUri> + Send + Sync> = Arc::new(HashSet::new);
     cache.set_pinned_fn(pinned_fn);
+    // Short of memory with held files filling the budget, the cache drops this table's cached
+    // sessions so the files they prepared can leave.
+    let sessions: Weak<dyn CachedSessions> = Arc::downgrade(inner) as Weak<dyn CachedSessions>;
+    cache.heap_budget().register_sessions(sessions);
+}
+
+impl CachedSessions for SupertableInner {
+    fn drop_cached_sessions(&self) {
+        // Taken out under each lock and dropped after it, as a commit's replacement is.
+        let session = take_unless_busy(&self.sql_session_cache);
+        let plans = take_unless_busy(&self.sql_logical_plan_cache);
+        drop((session, plans));
+    }
+}
+
+/// What `cache` holds, taken out, unless its lock is in use (a statement building this table's
+/// session): then it stays, as the pass never waits on a table.
+fn take_unless_busy<T>(cache: &Mutex<Option<T>>) -> Option<T> {
+    match cache.try_lock() {
+        Ok(mut held) => held.take(),
+        Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner().take(),
+        Err(TryLockError::WouldBlock) => None,
+    }
 }
 
 /// Build the tombstone-sidecar cache when storage is attached.
@@ -2582,6 +2675,14 @@ impl WeakReader {
             self.tombstone_cache.clone(),
             self.op_stats.clone(),
         )))
+    }
+
+    /// This handle over `manifest`, another snapshot of the same table.
+    pub(crate) fn over(&self, manifest: Arc<ManifestSnapshot>) -> Self {
+        Self {
+            manifest,
+            ..self.clone()
+        }
     }
 }
 
@@ -2803,6 +2904,12 @@ impl SupertableReader {
         self.inner.sql_schemas()
     }
 
+    /// The SQL schemas of this reader's pinned snapshot, which a later schema change leaves as
+    /// they were.
+    pub(crate) fn snapshot_sql_schemas(&self) -> Arc<SqlSchemas> {
+        self.inner.sql_schemas_of(&self.manifest)
+    }
+
     /// The table's value counts carried across snapshots, shared by every
     /// provider built over this table.
     pub(crate) fn value_count_carry(&self) -> Arc<ValueCountCarry> {
@@ -2821,6 +2928,12 @@ impl SupertableReader {
         &self,
     ) -> &Mutex<Option<(Arc<ManifestSnapshot>, SessionContext)>> {
         &self.inner.sql_session_cache
+    }
+
+    /// The session this reader's SQL contexts are copied from, shared by
+    /// every reader of the table.
+    pub(crate) fn sql_session_template(&self) -> &SessionTemplate {
+        &self.inner.sql_session_template
     }
 
     /// Cached deterministic scalar SQL plans for this reader's manifest.
@@ -4300,11 +4413,11 @@ mod tests {
             .expect("disk cache warms without timing out");
     }
 
-    /// An engine-managed (auto-sized) cache budget must be raised at open
-    /// to the table's real on-storage footprint — user superfiles plus the
-    /// hidden vector index — while an explicit budget is never changed.
+    /// Opening a table whose on-storage footprint (user superfiles plus the
+    /// hidden vector index) is over its cache's budget leaves the budget as
+    /// set.
     #[test]
-    fn open_reconciles_auto_sized_cache_budget_with_footprint() {
+    fn open_leaves_a_cache_budget_below_the_footprint_as_set() {
         use arrow_array::{Array, FixedSizeListArray, Float32Array};
 
         use crate::{
@@ -4315,8 +4428,7 @@ mod tests {
             supertable::reader_cache::{DiskCacheConfig, DiskCacheStore},
         };
 
-        /// Deliberately smaller than any committed superfile, so an
-        /// unreconciled budget is distinguishable from a raised one.
+        /// Smaller than any committed superfile.
         const TINY_BUDGET_BYTES: u64 = 4;
 
         let dim = 16usize;
@@ -4374,51 +4486,28 @@ mod tests {
             producer.drain_vectors_to_cells_sync().expect("drain");
         }
 
-        // Auto-sized consumer: a tiny engine-managed budget must be raised
-        // to at least the footprint by the open-time reconcile.
-        let auto_cache_dir = TempDir::new().expect("cache tempdir");
-        let auto_cache = DiskCacheStore::new_unpinned(
+        let cache_dir = TempDir::new().expect("cache tempdir");
+        let cache = DiskCacheStore::new_unpinned(
             Arc::clone(&storage),
             DiskCacheConfig {
-                cache_root: auto_cache_dir.path().to_path_buf(),
+                cache_root: cache_dir.path().to_path_buf(),
                 disk_budget_bytes: TINY_BUDGET_BYTES,
                 mmap_cold_threshold_secs: 0,
                 mmap_sweep_interval_secs: 0,
                 ..Default::default()
             },
         )
-        .expect("auto cache");
-        auto_cache.mark_budget_auto_sized();
-        let st = Supertable::open(make_options().with_disk_cache(Arc::clone(&auto_cache)))
-            .expect("open with auto-sized cache");
-        let footprint = st.on_storage_footprint_bytes();
-        assert!(footprint > 0, "committed + drained table has a footprint");
+        .expect("cache");
+        let st = Supertable::open(make_options().with_disk_cache(Arc::clone(&cache)))
+            .expect("open with a cache");
         assert!(
-            auto_cache.disk_budget_bytes() >= footprint,
-            "auto-sized budget {} must cover the footprint {footprint}",
-            auto_cache.disk_budget_bytes(),
+            st.on_storage_footprint_bytes() > TINY_BUDGET_BYTES,
+            "the committed and drained table is larger than the budget"
         );
-        drop(st);
-
-        // Explicit-budget consumer: the same open leaves the budget alone.
-        let explicit_cache_dir = TempDir::new().expect("cache tempdir");
-        let explicit_cache = DiskCacheStore::new_unpinned(
-            Arc::clone(&storage),
-            DiskCacheConfig {
-                cache_root: explicit_cache_dir.path().to_path_buf(),
-                disk_budget_bytes: TINY_BUDGET_BYTES,
-                mmap_cold_threshold_secs: 0,
-                mmap_sweep_interval_secs: 0,
-                ..Default::default()
-            },
-        )
-        .expect("explicit cache");
-        let st = Supertable::open(make_options().with_disk_cache(Arc::clone(&explicit_cache)))
-            .expect("open with explicit cache");
         assert_eq!(
-            explicit_cache.disk_budget_bytes(),
+            cache.disk_budget_bytes(),
             TINY_BUDGET_BYTES,
-            "explicit budgets are warned about, never changed"
+            "a budget below the footprint is warned about, never changed"
         );
         drop(st);
     }
@@ -9139,6 +9228,7 @@ mod tests {
         let cache = MetadataDiskCache::new(
             cache_dir.join("manifest-parts"),
             VECTOR_STATE_TEST_CACHE_BUDGET_BYTES,
+            None,
         )
         .expect("metadata cache");
         SupertableOptions::new(

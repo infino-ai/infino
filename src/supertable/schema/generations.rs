@@ -42,8 +42,7 @@ use crate::{
         vector::{builder::VectorConfig, distance::Metric},
     },
     supertable::{
-        Supertable, SupertableOptions, SupertableReader,
-        query::{column_cache::DecodedColumnCache, scalar_cache::ByteLru},
+        Supertable, SupertableOptions, SupertableReader, query::column_cache::DecodedColumnCache,
         writer::commit_built_superfile,
     },
     test_helpers::{decimal128_id_field, decimal128_ids},
@@ -520,7 +519,7 @@ fn sql_reads_every_generation_from_kept_columns() {
     // the kept columns, which still hold the deleted rows: the scan must
     // leave them out.
     let dir = TempDir::new().expect("tempdir");
-    let kept = Arc::new(ByteLru::new(KEPT_COLUMN_BYTES));
+    let kept = Arc::new(DecodedColumnCache::new(KEPT_COLUMN_BYTES));
     let (st, all) = mixed_table_with(&dir, Some(Arc::clone(&kept)));
     let scans: [(&str, Box<dyn Fn(&Row) -> bool>); 3] = [
         (
@@ -579,7 +578,7 @@ fn a_plain_limit_gathers_kept_columns_in_stages() {
     // and the others start only if its first batch falls short. Every row
     // returned passes the filter.
     let dir = TempDir::new().expect("tempdir");
-    let kept = Arc::new(ByteLru::new(KEPT_COLUMN_BYTES));
+    let kept = Arc::new(DecodedColumnCache::new(KEPT_COLUMN_BYTES));
     let (st, expected) = mixed_table_with(&dir, Some(kept));
     let reader = st.reader().expect("reader");
     let sql = format!(
@@ -675,7 +674,7 @@ fn sorted_table(dir: &TempDir, kept_bytes: usize) -> Supertable {
     let mut options = SupertableOptions::new(table_schema(), vec![], vec![])
         .expect("options")
         .with_storage(storage);
-    options.decoded_columns = Some(Arc::new(ByteLru::new(kept_bytes)));
+    options.decoded_columns = Some(Arc::new(DecodedColumnCache::new(kept_bytes)));
     options.row_group_size = Some(SORTED_ROW_GROUP_ROWS);
     let st = Supertable::create(options).expect("create");
     let scores: Vec<i64> = (0..SORTED_ROWS).collect();
@@ -761,7 +760,7 @@ fn a_read_dropped_halfway_still_keeps_its_columns() {
     // row group's decode still in flight. That decode must run to the end and
     // keep its columns, or every such statement decodes them again.
     let dir = TempDir::new().expect("tempdir");
-    let kept = Arc::new(ByteLru::new(KEPT_COLUMN_BYTES));
+    let kept = Arc::new(DecodedColumnCache::new(KEPT_COLUMN_BYTES));
     let (st, _) = mixed_table_with(&dir, Some(Arc::clone(&kept)));
     let reader = st.reader().expect("reader");
     let ctx = reader.sql_session_context().expect("session");

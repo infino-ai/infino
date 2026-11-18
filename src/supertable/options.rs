@@ -75,7 +75,7 @@ use crate::{
         Config, CrcVerification, DrainConsolidate, StorageBackend, StorageColdFetchMode,
         ThreadCount, scratch_root,
     },
-    memory::ConnectionMemoryBudget,
+    memory::{ConnectionMemoryBudget, SqlSpill},
     runtime_metrics::rss::total_memory_bytes,
     storage::{
         AzureStorageProvider, GcsStorageProvider, LocalFsStorageProvider, S3StorageProvider,
@@ -460,9 +460,13 @@ pub struct SupertableOptions {
     /// reads a part's bytes from local disk on a hit instead of
     /// round-tripping to object storage. Parts are content-addressed,
     /// so cached files are never stale and the cache survives process
-    /// restarts. Independent of `disk_cache` (which caches superfile
-    /// content) and uses its own byte budget. `None` disables it.
+    /// restarts. It keeps to a byte limit of its own, and what it holds
+    /// is charged to the budget of `disk_cache` (which caches superfile
+    /// content) when it is opened beside one. `None` disables it.
     pub metadata_disk_cache: Option<Arc<MetadataDiskCache>>,
+    /// Where the table's SQL spills, shared with the connection that opened
+    /// it. `None` leaves DataFusion's default, the OS temp directory.
+    pub(crate) sql_spill: Option<Arc<SqlSpill>>,
     /// Superfiles a ranked query opens concurrently when it orders them by
     /// score ceiling. Below this many candidates every superfile opens at
     /// once, exactly as the unordered fan-out does, so ordering costs no
@@ -794,6 +798,9 @@ pub struct SupertableOptions {
     /// encode path asserts against that. Grid (routing) centroids and
     /// summary `counts` stay resident regardless. Default `false`.
     pub summary_centroids_from_superfiles: bool,
+    /// Whether the open reads the per-column statistics (summaries sections and rollups): `false`
+    /// for a handle opened for a statement that uses none, like `COUNT(*)`. Default `true`.
+    pub(crate) load_statistics: bool,
     /// Per-table override for the **user** grid's cell count (trained at
     /// the first commit and stamped into the manifest; changing it later
     /// affects new tables only). `None` → `vector.user_cell_count` from
@@ -946,6 +953,7 @@ impl SupertableOptions {
             storage: None,
             disk_cache: None,
             metadata_disk_cache: None,
+            sql_spill: None,
             bound_ordered_open_window: DEFAULT_BOUND_ORDERED_OPEN_WINDOW,
             term_tier_entries_per_term: None,
             term_head_depth: None,
@@ -986,6 +994,7 @@ impl SupertableOptions {
             crc_verification: CrcVerification::default(),
             read_consistency: Consistency::default(),
             summary_centroids_from_superfiles: false,
+            load_statistics: true,
             user_cell_count: None,
             hidden_cell_count: None,
             companions: Vec::new(),
@@ -1050,6 +1059,12 @@ impl SupertableOptions {
     /// Default: [`Consistency::BoundedStaleness`] with a 1s window.
     pub fn with_read_consistency(mut self, consistency: Consistency) -> Self {
         self.read_consistency = consistency;
+        self
+    }
+
+    /// Open without the per-column statistics ([`Self::load_statistics`]).
+    pub(crate) fn without_statistics(mut self) -> Self {
+        self.load_statistics = false;
         self
     }
 
@@ -1147,10 +1162,20 @@ impl SupertableOptions {
         self.term_index && self.storage.is_some()
     }
 
-    /// Where this table's large scratch files go: beside the disk cache when
-    /// one is attached, on the disk sized for the table, else
-    /// `storage.scratch_root`.
+    /// Where this table's builds keep their temporary files, which are of
+    /// no use once the process exits: this process's own folder beside the
+    /// disk cache when one is attached, on the disk sized for the table,
+    /// else `storage.scratch_root`.
     pub(crate) fn scratch_dir(&self) -> PathBuf {
+        self.disk_cache
+            .as_ref()
+            .map_or_else(scratch_root, |cache| cache.run_scratch_dir())
+    }
+
+    /// Where this table keeps work a later process resumes (a drain's
+    /// spill): beside the disk cache when one is attached, else
+    /// `storage.scratch_root`.
+    pub(crate) fn resumable_scratch_dir(&self) -> PathBuf {
         self.disk_cache
             .as_ref()
             .map_or_else(scratch_root, |cache| cache.scratch_root())
@@ -1169,7 +1194,7 @@ impl SupertableOptions {
                 .clamp(1, HEAD_DEPTH_MAX),
             pool: Some(Arc::clone(&self.writer_pool)),
             spill_to_disk: true,
-            scratch_root: self.disk_cache.as_ref().map(|c| c.scratch_root()),
+            scratch_root: self.disk_cache.as_ref().map(|c| c.run_scratch_dir()),
             ..BuildPolicy::default()
         }
     }
@@ -1200,6 +1225,13 @@ impl SupertableOptions {
     /// resulting `Arc` here.
     pub fn with_metadata_disk_cache(mut self, cache: Arc<MetadataDiskCache>) -> Self {
         self.metadata_disk_cache = Some(cache);
+        self
+    }
+
+    /// Spill the table's SQL through `spill`, the SQL spill of the
+    /// connection that opens it.
+    pub(crate) fn with_sql_spill(mut self, spill: Arc<SqlSpill>) -> Self {
+        self.sql_spill = Some(spill);
         self
     }
 
@@ -1542,16 +1574,17 @@ impl SupertableOptions {
             };
             let cache = DiskCacheStore::new_unpinned(Arc::clone(&storage), disk_cfg)
                 .map_err(|e| BuildError::Store(format!("disk cache construction: {e}")))?;
-            self.disk_cache = Some(cache);
-
             // Manifest-part bytes get their own content-addressed cache
-            // under a sibling subdirectory, with an independent budget.
+            // under a sibling subdirectory, with a limit of its own, charged
+            // to the disk cache's budget.
             let manifest_cache_root = cache_root.join(MANIFEST_CACHE_SUBDIR);
-            let manifest_cache =
-                MetadataDiskCache::new(manifest_cache_root, cfg.storage.manifest_disk_budget_bytes)
-                    .map_err(|e| {
-                        BuildError::Store(format!("manifest disk cache construction: {e}"))
-                    })?;
+            let manifest_cache = MetadataDiskCache::new(
+                manifest_cache_root,
+                cfg.storage.manifest_disk_budget_bytes,
+                Some(Arc::clone(&cache)),
+            )
+            .map_err(|e| BuildError::Store(format!("manifest disk cache construction: {e}")))?;
+            self.disk_cache = Some(cache);
             self.metadata_disk_cache = Some(manifest_cache);
         }
 
@@ -1608,6 +1641,11 @@ pub(crate) fn builder_options_for(
     .with_schema_id(schema.schema_id())
     .with_field_ids_outside_schema(outside_schema)
     .with_range_columns(schema.range_columns());
+    // A table with a disk cache keeps its build's temporary files beside it.
+    let builder = match &options.disk_cache {
+        Some(_) => builder.with_scratch(options.scratch_dir()),
+        None => builder,
+    };
     #[cfg(test)]
     let builder = BuilderOptions {
         row_group_size: options.row_group_size.unwrap_or(builder.row_group_size),
@@ -1658,6 +1696,7 @@ mod tests {
     use std::{env, fs, sync::Arc};
 
     use arrow_schema::{DataType, Field};
+    use tempfile::TempDir;
     use uuid::Uuid;
 
     use super::*;
@@ -2409,6 +2448,37 @@ supertable:
         assert!(opts.disk_cache.is_some());
         assert!(opts.storage.is_some());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A build for a table with a disk cache is given the cache's scratch
+    /// folder, which exists; a table without one names no folder.
+    #[test]
+    fn builder_options_name_the_scratch_folder_of_a_table_with_a_disk_cache() {
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path().join("store")).expect("provider"));
+        let cache = DiskCacheStore::new_unpinned(
+            Arc::clone(&storage),
+            DiskCacheConfig {
+                cache_root: dir.path().join("cache"),
+                ..Default::default()
+            },
+        )
+        .expect("disk cache");
+
+        let without = plain_opts().with_storage(storage);
+        assert_eq!(
+            builder_options_for(&without.table_schema, &without).scratch,
+            None
+        );
+
+        let with = without.with_disk_cache(cache);
+        let scratch = builder_options_for(&with.table_schema, &with)
+            .scratch
+            .expect("a scratch folder");
+        assert_eq!(scratch, with.scratch_dir());
+        assert!(scratch.starts_with(dir.path().join("cache")));
+        assert!(scratch.is_dir(), "the folder exists before a build uses it");
     }
 
     #[test]

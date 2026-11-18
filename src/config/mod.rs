@@ -1583,7 +1583,9 @@ pub struct StorageSettings {
     pub backend: StorageBackend,
     /// Local filesystem root when `backend: local_fs`.
     pub local_root: Option<PathBuf>,
-    /// Configurable root directory for temporary scratch files.
+    /// Root directory for temporary scratch files. A table with a disk
+    /// cache keeps its temporary files in the cache's folder instead, where
+    /// they share the disk sized for the table.
     pub scratch_root: Option<PathBuf>,
     /// Object-store bucket name (used by the `s3` backend).
     pub bucket: Option<String>,
@@ -1604,8 +1606,9 @@ pub struct StorageSettings {
     /// Byte budget for the content-addressed manifest-part cache, kept
     /// in a `manifest-parts/` subdirectory of `disk_cache_root`. The
     /// loader reads part bytes from local disk on a hit instead of
-    /// fetching from object storage. Independent of `disk_budget_bytes`
-    /// (which sizes the superfile-content cache). Default 2 GiB. This is
+    /// fetching from object storage. A limit of its own, and what the
+    /// cache holds also counts against `disk_budget_bytes`, the budget of
+    /// the superfile-content cache. Default 2 GiB. This is
     /// the working room for objects fetched a piece at a time (the term
     /// index's slices); on top of it the cache holds the table's current
     /// manifest whole (a hidden vector index's cache, its state and

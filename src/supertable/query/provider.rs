@@ -106,7 +106,7 @@ use parquet::{
 use rayon::ThreadPool;
 use roaring::RoaringBitmap;
 use tokio::sync::{OnceCell, Semaphore};
-use tracing::Instrument;
+use tracing::{Instrument, debug};
 use uuid::Uuid;
 
 use crate::{
@@ -117,10 +117,12 @@ use crate::{
             reader::{BoolMode, ContainsRows, MatchWork},
             tokenize::{Tokenizer, unique_tokens},
         },
+        reader::ScanShape,
     },
     supertable::{
         SuperfileEntry, SupertableReader,
         error::QueryError,
+        handle::WeakReader,
         manifest::{
             ColumnStats, ManifestSnapshot, add_sum_arrays, hll::HllSketch, list::ScalarValueCounts,
             load_section_groups, load_section_groups_blocking,
@@ -148,6 +150,7 @@ use crate::{
             read_ahead::ScanReadAhead,
             schema_adapter::TableExprAdapterFactory,
             skip::{ColumnTypeGuard, ScalarOp, ScalarPredicate},
+            sql::StatementStores,
             superfile_reader::{
                 OpenTierCounts, superfile_reader_in_memory, superfile_reader_tiered,
             },
@@ -205,13 +208,9 @@ struct PreparedScanFile {
     reader: Arc<SuperfileReader>,
     path: ObjPath,
     size: u64,
-    /// Where the row groups end, when the scan is handed only them (see
-    /// [`rows_end`]); `None` hands it the whole file.
-    rows_end: Option<u64>,
-    row_counts: Arc<[u32]>,
-    /// Each column's data pages across the row groups, by name, from the
-    /// page index; empty when the file carries none.
-    pages: HashMap<String, u64>,
+    /// Rows per row group, where the row groups end and pages per column: one copy per file,
+    /// shared through its reader ([`SuperfileReader::scan_shape`]).
+    shape: Arc<ScanShape>,
     /// The footer row-group and page pruning read: the file's own, without
     /// the bounds that leave out a float column's NaNs
     /// ([`without_nan_blind_bounds`]), one copy per superfile shared through
@@ -229,7 +228,7 @@ impl PreparedScanFile {
     fn pages_per_column(&self, columns: &[&str]) -> Option<u64> {
         let pages: Vec<u64> = columns
             .iter()
-            .filter_map(|column| self.pages.get(*column).copied())
+            .filter_map(|column| self.shape.pages.get(*column).copied())
             .collect();
         (!pages.is_empty()).then(|| pages.iter().sum::<u64>() / pages.len() as u64)
     }
@@ -246,17 +245,60 @@ fn prepare_scan_file(
     reader: Arc<SuperfileReader>,
     tier: OpenTier,
     parquet_meta: Arc<ParquetMetaData>,
+    statistics: bool,
 ) -> DfResult<Arc<PreparedScanFile>> {
     let path = ObjPath::from(entry.storage_path());
     let source = reader.byte_source();
     let size = source.size();
-    let row_counts: Arc<[u32]> = parquet_meta
+    let shape = reader.scan_shape(|| scan_shape(&reader, &parquet_meta));
+    // Derived once per superfile and kept on its reader: it depends only on
+    // the footer and this superfile's own manifest bounds, which never
+    // change, so the provider every query builds shares the first one. A
+    // handle that could not read the bounds sees none, and derives a copy
+    // of its own rather than keep that one for handles that can. A snapshot
+    // without `statistics` keeps the file's own footer and copies nothing: it
+    // serves only scans with no filter (`scan` reads them before any other).
+    let bounds = |column| {
+        entry
+            .scalar_stats
+            .column(column)
+            .and_then(|stats| stats.min_max_values())
+    };
+    let footer = if !statistics {
+        parquet_meta
+    } else if entry.scalar_stats.is_unavailable() {
+        without_nan_blind_bounds(parquet_meta, bounds)?
+    } else {
+        reader.scan_footer(parquet_meta, |indexed| {
+            without_nan_blind_bounds(indexed, bounds)
+        })?
+    };
+    scan_store.insert_source(path.clone(), source);
+    scan_footers.insert(
+        path.clone(),
+        Arc::new(ScanFooter::new(
+            Arc::clone(&footer),
+            Arc::clone(&shape.leaf_bytes),
+        )),
+    );
+    Ok(Arc::new(PreparedScanFile {
+        reader,
+        path,
+        size,
+        shape,
+        footer,
+        tier,
+    }))
+}
+
+/// Work out what a scan needs from `parquet_meta`, the page-indexed footer of `reader`'s file:
+/// rows per row group, where the row groups end, data pages per column and bytes per column part.
+fn scan_shape(reader: &SuperfileReader, parquet_meta: &ParquetMetaData) -> ScanShape {
+    let row_counts = parquet_meta
         .row_groups()
         .iter()
         .map(|row_group| row_group.num_rows() as u32)
-        .collect::<Vec<_>>()
-        .into();
-    let rows_end = rows_end(&reader, &parquet_meta);
+        .collect();
     let mut pages: HashMap<String, u64> = HashMap::new();
     if let Some(offsets) = parquet_meta.offset_index() {
         let leaves = parquet_meta.file_metadata().schema_descr();
@@ -268,36 +310,51 @@ fn prepare_scan_file(
             }
         }
     }
-    // Derived once per superfile and kept on its reader: it depends only on
-    // the footer and this superfile's own manifest bounds, which never
-    // change, so the provider every query builds shares the first one. A
-    // handle that could not read the bounds sees none, and derives a copy
-    // of its own rather than keep that one for handles that can.
-    let bounds = |column| {
-        entry
-            .scalar_stats
-            .column(column)
-            .and_then(|stats| stats.min_max_values())
-    };
-    let footer = if entry.scalar_stats.is_unavailable() {
-        without_nan_blind_bounds(parquet_meta, bounds)?
-    } else {
-        reader.scan_footer(parquet_meta, |indexed| {
-            without_nan_blind_bounds(indexed, bounds)
-        })?
-    };
-    scan_store.insert_source(path.clone(), source);
-    scan_footers.insert(path.clone(), Arc::new(ScanFooter::new(Arc::clone(&footer))));
-    Ok(Arc::new(PreparedScanFile {
-        reader,
-        path,
-        size,
-        rows_end,
+    ScanShape {
         row_counts,
+        rows_end: rows_end(reader, parquet_meta),
         pages,
-        footer,
-        tier,
-    }))
+        leaf_bytes: leaf_bytes(parquet_meta),
+    }
+}
+
+/// Bytes of each column part of `meta` before compression, summed over its row groups.
+fn leaf_bytes(meta: &ParquetMetaData) -> Arc<[u64]> {
+    let mut bytes = vec![0; meta.file_metadata().schema_descr().num_columns()];
+    for row_group in meta.row_groups() {
+        for (total, chunk) in bytes.iter_mut().zip(row_group.columns()) {
+            *total += chunk.uncompressed_size().max(0) as u64;
+        }
+    }
+    bytes.into()
+}
+
+/// Count what `entry`'s cached reader keeps decoded against its cache's budget, each part once: the
+/// parsed footer, and the scan footer when the reader keeps its own copy, whichever statement first
+/// derives it. A scan footer made for one statement alone goes with it, so it is not counted.
+fn charge_footer(
+    disk_cache: Option<&Arc<DiskCacheStore>>,
+    entry: &SuperfileEntry,
+    prepared: &PreparedScanFile,
+) {
+    let Some(cache) = disk_cache else { return };
+    let reader = &prepared.reader;
+    // The scan shape the reader keeps beside them (a few fields and a name per column) is left out,
+    // so this undercounts it.
+    // Once per reader: a warm statement pays a load per file, not a cache lookup.
+    if reader.first_heap_count() {
+        cache.charge_heap(
+            &entry.uri,
+            reader,
+            reader.parquet_metadata().memory_size() as u64,
+        );
+    }
+    if !entry.scalar_stats.is_unavailable()
+        && reader.keeps_scan_footer(&prepared.footer)
+        && reader.first_scan_footer_heap_count()
+    {
+        cache.charge_heap(&entry.uri, reader, prepared.footer.memory_size() as u64);
+    }
 }
 
 /// Where a superfile's row groups end, when it is handed to DataFusion as
@@ -326,6 +383,30 @@ fn rows_end(reader: &SuperfileReader, parquet_meta: &ParquetMetaData) -> Option<
 
 /// Concurrent first-open coalescing for one immutable superfile.
 type PreparedScanCell = Arc<OnceCell<Arc<PreparedScanFile>>>;
+
+/// The files a statement's providers prepared. When the last provider sharing them goes, the
+/// statement holds none of their readers, so the cache drops what is over its metadata budget.
+struct PreparedFiles {
+    /// The statement's prepared files, by superfile.
+    files: DashMap<Uuid, PreparedScanCell>,
+    /// Set when a filtered scan prepared its files in a provider of its own (see `with_manifest`).
+    /// That provider goes at planning, while the plan still holds them, so this one checks them.
+    fallback_prepared: atomic::AtomicBool,
+    /// The cache whose budget the statement end checks; `None` without a disk cache.
+    disk_cache: Option<Arc<DiskCacheStore>>,
+}
+
+impl Drop for PreparedFiles {
+    fn drop(&mut self) {
+        // A provider that prepared no file held none, so nothing can have become free: no pass.
+        // That also keeps one built and dropped under a table's session lock from starting one.
+        let held_files = !self.files.is_empty() || *self.fallback_prepared.get_mut();
+        self.files.clear();
+        if held_files && let Some(cache) = &self.disk_cache {
+            cache.heap_budget().release_over_budget();
+        }
+    }
+}
 
 /// Selectivity gate for the FTS `WHERE` pushdown: only push an index
 /// candidate set into the scan when the estimated match count is at
@@ -419,7 +500,7 @@ pub(crate) struct SupertableProvider {
     /// Query-independent scan setup, filled lazily per superfile. Residual
     /// providers share this cache with their parent because both pin the same
     /// manifest and immutable files.
-    prepared_scan_files: Arc<DashMap<Uuid, PreparedScanCell>>,
+    prepared_scan_files: Arc<PreparedFiles>,
     /// Stable DataFusion object-store registry for this pinned manifest.
     /// Prepared files populate it once; scans reuse it rather than rebuilding
     /// a path→source map for every SQL statement.
@@ -433,11 +514,12 @@ pub(crate) struct SupertableProvider {
     /// above brings to this snapshot. A provider built without the table's
     /// carries its own, and merges every superfile.
     value_count_carry: Arc<ValueCountCarry>,
-    /// Set by the range top-k rule (`range_top_k`) on a scan that feeds
-    /// `ORDER BY column LIMIT k` and is filtered only on `column`: the scan
-    /// then reads only the rows the range index puts first
-    /// ([`Self::top_k_rows`]).
+    /// Set by the range top-k rule (`range_top_k`) on a scan that feeds `ORDER BY column LIMIT k`
+    /// on a range-indexed `column`: the scan then reads only the rows the index puts first, or the
+    /// rows its walk finds ([`Self::top_k_rows`]).
     top_k: Option<TopKHint>,
+    /// The reader the top-k walk reads through, held weakly as a cached session holds the provider.
+    walk_reader: WeakReader,
     /// Set by the covered-aggregate rewrite (`covered_agg`) on the scan
     /// under a `COUNT(*)` whose `WHERE` is one range on a range-indexed
     /// column: the scan then emits a row with no columns for each row the
@@ -476,6 +558,11 @@ pub(crate) struct TopKHint {
     pub(crate) k: usize,
     pub(crate) ties: bool,
     pub(crate) ties_by_id: bool,
+    /// The filters the walk checks, when they are more than one range on `column` (see
+    /// [`SupertableProvider::walked_rows`]).
+    pub(crate) walk: Option<Vec<Expr>>,
+    /// Whether rows with no value sort first: the walk answers only if a filter keeps them out.
+    pub(crate) nulls_first: bool,
 }
 
 /// Manual `Debug` (required by `TableProvider`): the cache /
@@ -488,7 +575,7 @@ impl fmt::Debug for SupertableProvider {
             .field("n_superfiles", &self.manifest.superfiles.len())
             .field("has_disk_cache", &self.disk_cache.is_some())
             .field("has_tombstone_cache", &self.tombstone_cache.is_some())
-            .field("prepared_scan_files", &self.prepared_scan_files.len())
+            .field("prepared_scan_files", &self.prepared_scan_files.files.len())
             .finish()
     }
 }
@@ -536,12 +623,17 @@ impl SupertableProvider {
             store_url: unique_store_url(),
             segment_filter: None,
             scan_note: None,
-            prepared_scan_files: Arc::new(DashMap::new()),
+            prepared_scan_files: Arc::new(PreparedFiles {
+                files: DashMap::new(),
+                fallback_prepared: atomic::AtomicBool::new(false),
+                disk_cache: options.disk_cache.clone(),
+            }),
             scan_store: Arc::new(SuperfileObjectStore::new()),
             scan_footers: Arc::new(DashMap::new()),
             scalar_value_counts: Arc::new(DashMap::new()),
             value_count_carry: Arc::default(),
             top_k: None,
+            walk_reader: WeakReader::from_reader(reader),
             count_range: None,
             read_rows: None,
             deleted_stats: Arc::default(),
@@ -621,6 +713,12 @@ impl SupertableProvider {
     /// idempotency guard.
     pub(crate) fn has_top_k(&self) -> bool {
         self.top_k.is_some()
+    }
+
+    /// The top-k hint this provider carries, for tests of the rule.
+    #[cfg(test)]
+    pub(crate) fn top_k_hint(&self) -> Option<&TopKHint> {
+        self.top_k.as_ref()
     }
 
     /// Clone of this provider for the scan under a `COUNT(*)` of `range`
@@ -716,9 +814,31 @@ impl SupertableProvider {
             scalar_value_counts: Arc::clone(&self.scalar_value_counts),
             value_count_carry: Arc::clone(&self.value_count_carry),
             top_k: self.top_k.clone(),
+            walk_reader: self.walk_reader.clone(),
             count_range: self.count_range.clone(),
             read_rows: self.read_rows.clone(),
             deleted_stats: Arc::clone(&self.deleted_stats),
+        }
+    }
+
+    /// This provider over `manifest`, its snapshot with the statistics read, with prepared files of
+    /// its own: those of a snapshot without statistics keep each file's raw footer.
+    fn with_manifest(&self, manifest: Arc<ManifestSnapshot>) -> Self {
+        // The statement's files outlive the provider built here: this one checks them at its end.
+        self.prepared_scan_files
+            .fallback_prepared
+            .store(true, atomic::Ordering::Release);
+        Self {
+            walk_reader: self.walk_reader.over(Arc::clone(&manifest)),
+            manifest,
+            prepared_scan_files: Arc::new(PreparedFiles {
+                files: DashMap::new(),
+                fallback_prepared: atomic::AtomicBool::new(false),
+                disk_cache: None,
+            }),
+            scan_store: Arc::new(SuperfileObjectStore::new()),
+            scan_footers: Arc::default(),
+            ..self.sibling()
         }
     }
 
@@ -969,7 +1089,12 @@ impl SupertableProvider {
                 // or under another analyzer): every live row is doubtful,
                 // so each is checked against its text below.
                 Err(e) if whole && holds_no_postings(&e) => {
-                    let total: u64 = prepared.row_counts.iter().map(|&n| u64::from(n)).sum();
+                    let total: u64 = prepared
+                        .shape
+                        .row_counts
+                        .iter()
+                        .map(|&n| u64::from(n))
+                        .sum();
                     let mut every = RoaringBitmap::new();
                     every.insert_range(0..u32::try_from(total).unwrap_or(u32::MAX));
                     every -= tombstones;
@@ -1154,7 +1279,7 @@ impl SupertableProvider {
         }
         let mut live = 0u64;
         for entry in &survivors {
-            live += entry.n_docs - self.deleted_rows(entry.superfile_id, now)?.len();
+            live += self.live_rows(entry, now)?;
         }
         Ok((live, HashSet::new()))
     }
@@ -1416,9 +1541,10 @@ impl SupertableProvider {
     /// own `k`-th key is past the cutoff too). Ties broken by the id ascending
     /// are settled the same way when every survivor's range index keeps its
     /// tied rows in id order: each one's first rows by the key are then its
-    /// first by the key and the id. `None` when there is no hint,
-    /// the filters are not that one range, or a survivor has no range index
-    /// over the column: the scan then reads every row the filters admit.
+    /// first by the key and the id. A hint carrying other filters goes
+    /// to the walk instead ([`Self::walked_rows`]). `None` when there is no
+    /// hint, the filters are not that one range, or a survivor has no range
+    /// index over the column: the scan then reads every row the filters admit.
     async fn top_k_rows(
         &self,
         survivors: &[Arc<SuperfileEntry>],
@@ -1520,6 +1646,113 @@ impl SupertableProvider {
         ))
     }
 
+    /// The rows of `entry` not deleted as of `now`.
+    fn live_rows(&self, entry: &SuperfileEntry, now: Instant) -> Result<u64, QueryError> {
+        let deleted = self.deleted_rows(entry.superfile_id, now)?.len();
+        Ok(entry.n_docs.saturating_sub(deleted))
+    }
+
+    /// The first of `survivors`, in order, whose live rows reach `limit`. Deletes are read a group
+    /// of files at a time, each at least twice the last, so mostly deleted files take few rounds.
+    async fn first_holding(
+        &self,
+        mut survivors: Vec<Arc<SuperfileEntry>>,
+        limit: usize,
+        now: Instant,
+    ) -> DfResult<Vec<Arc<SuperfileEntry>>> {
+        let want = limit as u64;
+        let mut live = 0u64;
+        let mut kept = 0;
+        let mut group_files = 1;
+        while live < want && kept < survivors.len() {
+            let start = kept;
+            let mut end = start;
+            let mut held = 0u64;
+            // Take files until their rows, deletes ignored, cover the rows still missing, and at
+            // least `group_files` of them.
+            while end < survivors.len()
+                && (live.saturating_add(held) < want || end - start < group_files)
+            {
+                held = held.saturating_add(survivors[end].n_docs);
+                end += 1;
+            }
+            group_files = group_files.saturating_mul(2);
+            self.prefetch_tombstones(&survivors[start..end], now).await;
+            for entry in &survivors[start..end] {
+                live = live.saturating_add(self.live_rows(entry, now)?);
+                kept += 1;
+                if live >= want {
+                    break;
+                }
+            }
+        }
+        survivors.truncate(kept);
+        Ok(survivors)
+    }
+
+    /// The first rows `predicates` keep in the hint's order, by file, from the range index walk
+    /// ([`SupertableReader::sorted_hits_for_scan`]). The reason it falls back, and the scan reads
+    /// every row, when:
+    ///  - the walk cannot answer, fails, or the table's reader is gone.
+    ///  - a delete the walk did not see removed a row it found (the scan's deletes decide).
+    async fn walked_rows(
+        &self,
+        survivors: &[Arc<SuperfileEntry>],
+        predicates: &[Expr],
+        hint: &TopKHint,
+        now: Instant,
+    ) -> DfResult<Result<HashMap<Uuid, RoaringBitmap>, WalkFallback>> {
+        #[cfg(test)]
+        walk_probe::walk_started(&self.manifest.superfiles);
+        let Some(reader) = self.walk_reader.upgrade() else {
+            return Ok(walk_fell_back(survivors, WalkFallback::CannotAnswer));
+        };
+        let walked = reader
+            .sorted_hits_for_scan(
+                &hint.column,
+                predicates,
+                hint.descending,
+                hint.nulls_first,
+                hint.k,
+                survivors,
+            )
+            .await;
+        #[cfg(test)]
+        let walked = walk_probe::inject(survivors, walked);
+        let hits = match walked {
+            Ok(Some(hits)) => hits,
+            Ok(None) => return Ok(walk_fell_back(survivors, WalkFallback::CannotAnswer)),
+            Err(error) => {
+                let cause = match error {
+                    QueryError::OverBudget(_) => WalkFallback::OverBudget,
+                    _ => WalkFallback::Failed,
+                };
+                debug!(%error, "the top-k walk failed");
+                return Ok(walk_fell_back(survivors, cause));
+            }
+        };
+        let ids: HashMap<_, _> = survivors
+            .iter()
+            .map(|entry| (entry.uri, entry.superfile_id))
+            .collect();
+        #[cfg(test)]
+        walk_probe::after_walk(survivors);
+        let mut rows: HashMap<Uuid, RoaringBitmap> = HashMap::new();
+        for hit in hits {
+            let Some(id) = ids.get(&hit.superfile) else {
+                return Ok(walk_fell_back(survivors, WalkFallback::Failed));
+            };
+            rows.entry(*id).or_default().insert(hit.local_doc_id);
+        }
+        for (id, found) in &rows {
+            let deleted = self.deleted_rows(*id, now)?;
+            if !found.is_disjoint(&deleted) {
+                return Ok(walk_fell_back(survivors, WalkFallback::RowDeleted));
+            }
+        }
+        Ok(Ok(rows))
+    }
+
     /// Each survivor's live rows whose key lies in `lo..=hi`, from its range
     /// index. The caller has already found every survivor indexed over the
     /// column (`range_ends` answered for each), so one that is not now is an
@@ -1584,6 +1817,7 @@ impl SupertableProvider {
     ) -> impl Future<Output = DfResult<Arc<PreparedScanFile>>> + Send + 'static {
         let cell = self
             .prepared_scan_files
+            .files
             .entry(entry.superfile_id)
             .or_insert_with(|| Arc::new(OnceCell::new()))
             .clone();
@@ -1593,6 +1827,7 @@ impl SupertableProvider {
         let storage = self.manifest.options.storage.clone();
         let scan_store = Arc::clone(&self.scan_store);
         let scan_footers = Arc::clone(&self.scan_footers);
+        let statistics = self.manifest.statistics_loaded();
         async move {
             if let Some(prepared) = cell.get() {
                 return Ok(Arc::clone(prepared));
@@ -1622,7 +1857,9 @@ impl SupertableProvider {
                             Arc::clone(reader),
                             OpenTier::Memory,
                             parquet_meta,
+                            statistics,
                         )
+                        .inspect(|prepared| charge_footer(disk_cache.as_ref(), &entry, prepared))
                     })
                     .await?;
                 return Ok(Arc::clone(prepared));
@@ -1663,7 +1900,9 @@ impl SupertableProvider {
                             reader,
                             tier,
                             parquet_meta,
+                            statistics,
                         )
+                        .inspect(|prepared| charge_footer(disk_cache.as_ref(), &entry, prepared))
                     })
                     .await?;
                 Ok(Arc::clone(prepared))
@@ -1840,7 +2079,10 @@ fn id_min_max(entries: &[Arc<SuperfileEntry>]) -> Option<(ScalarValue, ScalarVal
 /// what the folds below share, so a column costs one read per superfile
 /// however many statistics the planner asks for. `None` where a
 /// superfile carries nothing for the column.
-fn read_column(entries: &[Arc<SuperfileEntry>], column: FieldId) -> Vec<Option<ColumnStats<'_>>> {
+pub(crate) fn read_column(
+    entries: &[Arc<SuperfileEntry>],
+    column: FieldId,
+) -> Vec<Option<ColumnStats<'_>>> {
     entries
         .iter()
         .map(|entry| entry.scalar_stats.column(column))
@@ -1876,7 +2118,7 @@ fn scalar_sum(reads: &[Option<ColumnStats<'_>>]) -> Option<ScalarValue> {
 /// Sketch unions are exact, so the merged estimate has single-sketch
 /// accuracy. A column null throughout every superfile has no distinct
 /// value: zero, not unknown.
-fn scalar_distinct(reads: &[Option<ColumnStats<'_>>]) -> Option<usize> {
+pub(crate) fn scalar_distinct(reads: &[Option<ColumnStats<'_>>]) -> Option<usize> {
     let mut merged: Option<HllSketch> = None;
     let mut null_throughout = false;
     for stats in reads {
@@ -1967,7 +2209,7 @@ fn spans_full_domain(min: &ScalarValue, max: &ScalarValue) -> bool {
 /// Whether `e` says a superfile has no `standard` postings for a column:
 /// no FTS section at all, no index on the column, or one under another
 /// analyzer.
-fn holds_no_postings(e: &ReadError) -> bool {
+pub(crate) fn holds_no_postings(e: &ReadError) -> bool {
     match e {
         ReadError::MissingKv(_) => true,
         ReadError::Fts(f) => matches!(
@@ -2142,23 +2384,14 @@ pub(crate) type ScanFooters = DashMap<ObjPath, Arc<ScanFooter>>;
 #[derive(Debug)]
 pub(crate) struct ScanFooter {
     meta: Arc<ParquetMetaData>,
-    /// Bytes per column before compression. Added up once when the file is
-    /// opened, so planning a query doesn't have to.
-    leaf_bytes: Box<[u64]>,
+    /// Bytes per column before compression. Added up once per file and kept on
+    /// its reader, so planning a query doesn't have to.
+    leaf_bytes: Arc<[u64]>,
 }
 
 impl ScanFooter {
-    fn new(meta: Arc<ParquetMetaData>) -> Self {
-        let mut leaf_bytes = vec![0; meta.file_metadata().schema_descr().num_columns()];
-        for row_group in meta.row_groups() {
-            for (bytes, chunk) in leaf_bytes.iter_mut().zip(row_group.columns()) {
-                *bytes += chunk.uncompressed_size().max(0) as u64;
-            }
-        }
-        Self {
-            meta,
-            leaf_bytes: leaf_bytes.into(),
-        }
+    fn new(meta: Arc<ParquetMetaData>, leaf_bytes: Arc<[u64]>) -> Self {
+        Self { meta, leaf_bytes }
     }
 
     /// `(column name, bytes)` for each column in the file. A list or struct
@@ -2167,7 +2400,7 @@ impl ScanFooter {
         let leaves = self.meta.file_metadata().schema_descr().columns();
         leaves
             .iter()
-            .zip(&self.leaf_bytes)
+            .zip(self.leaf_bytes.iter())
             .filter_map(|(leaf, &bytes)| Some((leaf.path().parts().first()?.as_str(), bytes)))
     }
 
@@ -2266,6 +2499,42 @@ impl TableProvider for SupertableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        // A plain `LIMIT k` (no filter, sort or count) reads only the first files holding `k` live
+        // rows, with deletes read once so the rows it counts live are the rows the scan returns.
+        let bare_limit = limit.is_some()
+            && filters.is_empty()
+            && self.top_k.is_none()
+            && self.count_range.is_none()
+            && self.read_rows.is_none();
+        // A top-k scan reads its deletes once too, so the rows it walked are checked against them.
+        if (bare_limit || self.top_k.is_some()) && self.tombstones_read.is_none() {
+            // The same provider with deletes read once, keeping this scan's store registration.
+            let once = Self {
+                tombstones_read: Some(Arc::default()),
+                store_url: self.store_url.clone(),
+                ..self.sibling()
+            };
+            return once.scan(state, projection, filters, limit).await;
+        }
+        // The catalog opens a table without statistics only for a statement it finds uses none
+        // (`uses_statistics`). A filter it missed reads them here first: slower, never wrong.
+        if !filters.is_empty() && !self.manifest.statistics_loaded() {
+            debug!("a filtered scan read the statistics its table was opened without");
+            let manifest = self
+                .manifest
+                .with_statistics()
+                .await
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            if !manifest.statistics_loaded() {
+                return Err(DataFusionError::Internal(
+                    "reading a table's statistics left it without them".to_owned(),
+                ));
+            }
+            return self
+                .with_manifest(manifest)
+                .scan(state, projection, filters, limit)
+                .await;
+        }
         // Superfile selection via the shared two-tier prune (the same
         // path FTS search uses); see `select_survivors`. Survivors go to
         // DataFusion. The span carries both counts, so a trace shows how
@@ -2284,9 +2553,52 @@ impl TableProvider for SupertableProvider {
                     .await?
             }
         };
-
         select_span.record("survivors", survivor_entries.len());
         trace::end(select_span);
+
+        // One `Instant::now()` for the whole scan so every per-superfile
+        // tombstone lookup shares the same `SidecarCache` TTL
+        // reference.
+        let now = Instant::now();
+
+        let survivor_entries = match limit {
+            Some(limit) if bare_limit => self.first_holding(survivor_entries, limit, now).await?,
+            _ => survivor_entries,
+        };
+
+        // A scan feeding `ORDER BY column LIMIT k` opens only the files holding the rows each range
+        // index puts first, or the rows the walk finds (see `top_k_rows`). No file, no walk.
+        let (top_k_rows, walk_note) = match &self.top_k {
+            Some(hint) if !survivor_entries.is_empty() => {
+                self.prefetch_tombstones(&survivor_entries, now).await;
+                match &hint.walk {
+                    Some(predicates) => {
+                        match self
+                            .walked_rows(&survivor_entries, predicates, hint, now)
+                            .await?
+                        {
+                            Ok(rows) => (Some(rows), Some(Arc::from("top-k walk: answered"))),
+                            Err(cause) => {
+                                let note = format!("top-k walk: fell back, {}", cause.reason());
+                                (None, Some(Arc::<str>::from(note)))
+                            }
+                        }
+                    }
+                    None => (
+                        self.top_k_rows(&survivor_entries, filters, now).await?,
+                        None,
+                    ),
+                }
+            }
+            _ => (None, None),
+        };
+        let survivor_entries = match &top_k_rows {
+            Some(rows) => survivor_entries
+                .into_iter()
+                .filter(|entry| rows.get(&entry.superfile_id).is_some_and(|r| !r.is_empty()))
+                .collect(),
+            None => survivor_entries,
+        };
 
         // Nothing survived (empty table, or every superfile pruned):
         // a schema-correct empty scan. EmptyExec yields one
@@ -2305,11 +2617,6 @@ impl TableProvider for SupertableProvider {
             };
             return Ok(Arc::new(EmptyExec::new(projected)));
         }
-
-        // One `Instant::now()` for the whole scan so every per-superfile
-        // tombstone lookup shares the same `SidecarCache` TTL
-        // reference.
-        let now = Instant::now();
 
         // Every surviving superfile's tombstones, before the per-superfile
         // sweep below.
@@ -2445,9 +2752,6 @@ impl TableProvider for SupertableProvider {
         }
         trace::end(open_span);
 
-        // A scan feeding `ORDER BY column LIMIT k` reads only the rows each
-        // superfile's range index puts first (see `top_k_rows`).
-        let top_k_rows = self.top_k_rows(&survivor_entries, filters, now).await?;
         let top_k_rows = &top_k_rows;
 
         // Per-superfile scan inputs, resolved into PartitionedFiles once the
@@ -2712,7 +3016,7 @@ impl TableProvider for SupertableProvider {
         for seg in &superfiles {
             let access_plan = if seg.candidates.is_some() || !seg.tombstones.is_empty() {
                 build_access_plan(
-                    seg.prepared.row_counts.as_ref(),
+                    seg.prepared.shape.row_counts.as_ref(),
                     &seg.candidates,
                     &seg.tombstones,
                 )
@@ -2722,7 +3026,7 @@ impl TableProvider for SupertableProvider {
             // A range-indexed superfile's range is its row groups (see
             // `rows_end`); any other is handed whole.
             let path = seg.prepared.path.to_string();
-            let mut file = match seg.prepared.rows_end {
+            let mut file = match seg.prepared.shape.rows_end {
                 Some(end) => {
                     PartitionedFile::new_with_range(path, seg.prepared.size, 0, end as i64)
                 }
@@ -2803,7 +3107,8 @@ impl TableProvider for SupertableProvider {
             });
             let wanted = |name: &str| projected.as_ref().is_none_or(|set| set.contains(name));
             let stats = self.statistics_for(&survivor_entries, &wanted);
-            if filters.is_empty() && self.read_rows.is_none() {
+            // A top-k scan emits only the rows it was handed.
+            if filters.is_empty() && self.read_rows.is_none() && self.top_k.is_none() {
                 stats
             } else {
                 stats.to_inexact()
@@ -2812,30 +3117,53 @@ impl TableProvider for SupertableProvider {
 
         // The files a scan of kept decoded columns would read (built below,
         // once the Parquet scan it stands in for is). Not for a scan the index
-        // narrowed to a few rows (the Parquet scan decodes just their pages),
-        // nor for a scan of no column — except the rows a top-k reads from
-        // the range index: up to the cutoff, ties included, they are spread
-        // over the file, so the Parquet scan decodes a page of every wide
-        // column for each, where kept columns hand them over decoded.
+        // narrowed to a few rows in every superfile (the Parquet scan decodes
+        // just their pages), nor for a scan of no column — except:
+        // - the rows a top-k reads from the range index: up to the cutoff,
+        //   ties included, they are spread over the file, so the Parquet scan
+        //   decodes a page of every wide column for each, where kept columns
+        //   hand them over decoded;
+        // - a scan the index narrowed in some superfiles only: the others are
+        //   read whole, which kept columns serve, and the Parquet scan the
+        //   narrowed ones would keep it on would decode every superfile again
+        //   on every statement. A narrowed row group hands over its rows from
+        //   kept columns when they are kept, and otherwise reads just those
+        //   rows from its pages without keeping them, as the Parquet scan
+        //   would, unless the scan uses most of it or read it before
+        //   (`CachedScanExec`).
         let output = projected_schema(&self.schema, projection)?;
-        let top_k_selected = top_k_rows.is_some();
+        let narrowed = superfiles
+            .iter()
+            .filter(|seg| seg.candidates.is_some())
+            .count();
+        let partly_narrowed = narrowed > 0 && narrowed < superfiles.len();
+        let selects_rows = top_k_rows.is_some() || partly_narrowed;
         let cached_files = (self.manifest.options.decoded_columns.is_some()
             && has_columns(&output)
-            && (top_k_selected || superfiles.iter().all(|seg| seg.candidates.is_none())))
-        .then(|| {
-            superfiles
-                .iter()
-                .zip(&survivor_entries)
-                .map(|(seg, entry)| CachedFile {
-                    uri: entry.uri,
-                    reader: Arc::clone(&seg.prepared.reader),
-                    footer: Arc::clone(&seg.prepared.footer),
-                    row_counts: Arc::clone(&seg.prepared.row_counts),
-                    tombstones: Arc::clone(&seg.tombstones),
-                    selected: top_k_selected.then(|| seg.candidates.clone()).flatten(),
-                })
-                .collect::<Vec<_>>()
-        });
+            && (selects_rows || narrowed == 0))
+            .then(|| {
+                superfiles
+                    .iter()
+                    .zip(&survivor_entries)
+                    .map(|(seg, entry)| CachedFile {
+                        uri: entry.uri,
+                        reader: Arc::clone(&seg.prepared.reader),
+                        footer: Arc::clone(&seg.prepared.footer),
+                        row_counts: Arc::clone(&seg.prepared.shape.row_counts),
+                        tombstones: Arc::clone(&seg.tombstones),
+                        // The live candidates only: a row group holding
+                        // none of them reads nothing, and the scan checks
+                        // them against no tombstone again.
+                        selected: selects_rows
+                            .then(|| {
+                                seg.candidates
+                                    .as_ref()
+                                    .map(|keep| keep - seg.tombstones.as_ref())
+                            })
+                            .flatten(),
+                    })
+                    .collect::<Vec<_>>()
+            });
         let cached_stats = cached_files
             .is_some()
             .then(|| scan_stats.clone().project(projection));
@@ -2844,6 +3172,11 @@ impl TableProvider for SupertableProvider {
         state
             .runtime_env()
             .register_object_store(url.as_ref(), store);
+        // A connection's statements share one runtime: the statement removes
+        // the registration once it is done.
+        if let Some(stores) = state.config().get_extension::<StatementStores>() {
+            stores.record(&url);
+        }
         let mut builder = FileScanConfigBuilder::new(url, Arc::new(source))
             .with_expr_adapter(Some(Arc::new(TableExprAdapterFactory::new(&self.manifest))));
         for file in files {
@@ -2873,7 +3206,7 @@ impl TableProvider for SupertableProvider {
             } else {
                 MeteredExec::without_limit_pushdown(scan, op_stats)
             };
-            meter.with_note(self.scan_note.clone())
+            meter.with_note(walk_note.clone().or_else(|| self.scan_note.clone()))
         };
         let parquet: Arc<dyn ExecutionPlan> = Arc::new(
             meter(scan)
@@ -3424,7 +3757,7 @@ fn emit_value_set_leaves(
 /// Returns None unless *every* branch is `column = literal` on one shared
 /// column: a partial match like `a = 1 OR a > 5` isn't a closed value set,
 /// so pruning on the equalities alone would wrongly drop the `> 5` rows.
-fn flatten_or_eq(expr: &Expr, schema: &SchemaRef) -> Option<(String, Vec<ScalarValue>)> {
+pub(crate) fn flatten_or_eq(expr: &Expr, schema: &SchemaRef) -> Option<(String, Vec<ScalarValue>)> {
     let mut column = None;
     let mut values = Vec::new();
     collect_or_eq(expr, schema, &mut column, &mut values).then_some(())?;
@@ -3569,20 +3902,179 @@ fn flip_op(op: ScalarOp) -> ScalarOp {
     }
 }
 
+/// Why a top-k walk left its rows to the scan, shown on the scan in `EXPLAIN`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WalkFallback {
+    /// The index cannot answer exactly, or the walk read its limit of rows.
+    CannotAnswer,
+    /// A window of rows did not fit the connection's memory budget.
+    OverBudget,
+    /// A delete the walk did not see removed a row it found.
+    RowDeleted,
+    /// Any other error.
+    Failed,
+}
+
+impl WalkFallback {
+    fn reason(self) -> &'static str {
+        match self {
+            Self::CannotAnswer => "it cannot answer exactly",
+            Self::OverBudget => "a window over the memory limit",
+            Self::RowDeleted => "a row it found was deleted",
+            Self::Failed => "it failed",
+        }
+    }
+}
+
+/// Logs why the walk left its rows to the scan, which then reads every row.
+fn walk_fell_back(
+    survivors: &[Arc<SuperfileEntry>],
+    cause: WalkFallback,
+) -> Result<HashMap<Uuid, RoaringBitmap>, WalkFallback> {
+    debug!(
+        ?cause,
+        files = survivors.len(),
+        "the top-k walk left its rows to the scan"
+    );
+    #[cfg(test)]
+    walk_probe::count(survivors, cause);
+    Err(cause)
+}
+
+/// Test hooks into the top-k walk over one table, named by one of its files: run an action between
+/// the walk and its deletes check, make the walk fail, and count walks and why they fell back.
 #[cfg(test)]
-mod tests {
+pub(crate) mod walk_probe {
+    use std::{
+        collections::HashMap,
+        sync::{Arc, Mutex},
+    };
+
+    use uuid::Uuid;
+
+    use crate::supertable::{
+        SuperfileEntry,
+        error::QueryError,
+        query::{SuperfileHit, provider::WalkFallback},
+    };
+
+    /// What a test armed for the table holding a superfile.
+    #[derive(Default)]
+    struct Armed {
+        after_walk: Option<Box<dyn FnOnce() + Send>>,
+        fail_with: Option<QueryError>,
+        fallbacks: Vec<WalkFallback>,
+        walks: usize,
+        windows: usize,
+        walked: usize,
+    }
+
+    static ARMED: Mutex<Option<HashMap<Uuid, Armed>>> = Mutex::new(None);
+
+    fn with<T>(survivors: &[Arc<SuperfileEntry>], f: impl FnOnce(&mut Armed) -> T) -> Option<T> {
+        let mut armed = ARMED.lock().expect("probe lock");
+        let armed = armed.as_mut()?;
+        let id = survivors
+            .iter()
+            .map(|e| e.superfile_id)
+            .find(|id| armed.contains_key(id))?;
+        armed.get_mut(&id).map(f)
+    }
+
+    fn watched<T>(superfile: Uuid, f: impl FnOnce(&mut Armed) -> T) -> Option<T> {
+        ARMED
+            .lock()
+            .expect("probe lock")
+            .as_mut()?
+            .get_mut(&superfile)
+            .map(f)
+    }
+
+    /// Watch walks over the table holding `superfile`.
+    pub(crate) fn watch(superfile: Uuid) {
+        ARMED
+            .lock()
+            .expect("probe lock")
+            .get_or_insert_with(HashMap::new)
+            .insert(superfile, Armed::default());
+    }
+
+    /// Run `action` once, after the next walk over the watched table.
+    pub(crate) fn after_next_walk(superfile: Uuid, action: Box<dyn FnOnce() + Send>) {
+        watched(superfile, |a| a.after_walk = Some(action));
+    }
+
+    /// Make the next walk over the watched table fail with `error`.
+    pub(crate) fn fail_next_walk(superfile: Uuid, error: QueryError) {
+        watched(superfile, |a| a.fail_with = Some(error));
+    }
+
+    /// Walks started over the watched table.
+    pub(crate) fn walks(superfile: Uuid) -> usize {
+        watched(superfile, |a| a.walks).unwrap_or(0)
+    }
+
+    /// Windows read, and rows walked in them, by walks over the watched table.
+    pub(crate) fn windows(superfile: Uuid) -> (usize, usize) {
+        watched(superfile, |a| (a.windows, a.walked)).unwrap_or_default()
+    }
+
+    /// A walk over the table of `files` read a window of `rows` rows.
+    pub(crate) fn window_read(files: &[Arc<SuperfileEntry>], rows: usize) {
+        with(files, |a| {
+            a.windows += 1;
+            a.walked += rows;
+        });
+    }
+
+    /// A walk started over the table of `files`, the table's own list as a walk can read none.
+    pub(super) fn walk_started(files: &[Arc<SuperfileEntry>]) {
+        with(files, |a| a.walks += 1);
+    }
+
+    /// Why walks over the watched table fell back, in order.
+    pub(crate) fn fallbacks(superfile: Uuid) -> Vec<WalkFallback> {
+        watched(superfile, |a| a.fallbacks.clone()).unwrap_or_default()
+    }
+
+    pub(super) fn inject(
+        survivors: &[Arc<SuperfileEntry>],
+        walked: Result<Option<Vec<SuperfileHit>>, QueryError>,
+    ) -> Result<Option<Vec<SuperfileHit>>, QueryError> {
+        match with(survivors, |a| a.fail_with.take()).flatten() {
+            Some(error) => Err(error),
+            None => walked,
+        }
+    }
+
+    pub(super) fn after_walk(survivors: &[Arc<SuperfileEntry>]) {
+        // Run outside the lock: the action may walk again.
+        if let Some(action) = with(survivors, |a| a.after_walk.take()).flatten() {
+            action();
+        }
+    }
+
+    pub(super) fn count(survivors: &[Arc<SuperfileEntry>], cause: WalkFallback) {
+        with(survivors, |a| a.fallbacks.push(cause));
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
     use std::{
         collections::HashMap,
         hash::{DefaultHasher, Hash, Hasher},
         ops::Range,
         slice::from_ref,
+        sync::mpsc::channel,
+        thread,
         time::Duration,
     };
 
     use arrow::util::display::{ArrayFormatter, FormatOptions};
     use arrow_array::{
-        Date32Array, Float32Array, Float64Array, Int64Array, LargeStringArray, RecordBatch,
-        RecordBatchIterator, TimestampNanosecondArray, TimestampSecondArray,
+        Array, Date32Array, Float32Array, Float64Array, Int64Array, LargeStringArray, RecordBatch,
+        RecordBatchIterator, StringArray, TimestampNanosecondArray, TimestampSecondArray,
     };
     use arrow_schema::{DataType, Field, Schema, TimeUnit};
     use datafusion::{
@@ -3619,16 +4111,24 @@ mod tests {
         supertable::{
             Supertable, SupertableOptions,
             hydrate::hydrate_from_reader,
-            manifest::{ScalarStatsAgg, SuperfileUri, column_hll},
+            manifest::{
+                ScalarStats, ScalarStatsAgg, SuperfileUri, column_hll,
+                summaries::MANIFEST_SUMMARIES_DIR,
+            },
             query::{
                 read_ahead::{PAGE_READ_THROUGH_BYTES, file_pruning, fixture, statistics_pruned},
                 sql::sql_session_context,
             },
+            reader_cache::disk::{
+                HeapBudget,
+                test_support::{cache_buffered, lazy_entries},
+            },
             schema::change::{FieldPatch, SchemaPatch},
         },
         test_helpers::{
-            build_title_batch, default_supertable_options, default_tokenizer, fid,
-            lazy_foreground_disk_cache,
+            build_title_batch, default_supertable_options, default_tokenizer,
+            fault_storage::{FaultOp, FaultStorage},
+            fid, lazy_foreground_disk_cache,
         },
     };
 
@@ -4548,6 +5048,7 @@ mod tests {
     fn opened_superfiles(provider: &SupertableProvider) -> usize {
         provider
             .prepared_scan_files
+            .files
             .iter()
             .filter(|cell| cell.get().is_some())
             .count()
@@ -5013,9 +5514,9 @@ mod tests {
         let prepared = rt
             .block_on(provider.prepared_scan_file(Arc::clone(&entry)))
             .expect("prepare parent scan file");
-        assert_eq!(provider.prepared_scan_files.len(), 1);
+        assert_eq!(provider.prepared_scan_files.files.len(), 1);
         assert_eq!(
-            prepared.row_counts.iter().copied().sum::<u32>() as u64,
+            prepared.shape.row_counts.iter().copied().sum::<u32>() as u64,
             entry.n_docs
         );
 
@@ -5029,6 +5530,60 @@ mod tests {
             &provider.prepared_scan_files,
             &restricted.prepared_scan_files
         ));
+    }
+
+    #[test]
+    fn statements_share_a_file_scan_shape_across_commits() {
+        // Two statements on one table, each with its own provider as a connection builds them,
+        // then a commit and a third statement.
+        //  - Both providers prepare the first file from the same cached reader.
+        //  - Each gets its own prepared file, but both share the reader's one scan shape, and that
+        //    shape equals one built fresh from the page-indexed footer.
+        //  - After the commit, the third statement sees the new file and reuses the old shape.
+        // This test pins that a statement doesn't walk the footer of a file an earlier statement
+        // already walked, and still sees every commit.
+        let st = Supertable::create(cat_title_opts()).expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&cat_title_batch(&["a", "a"], &["alpha beta", "gamma"]))
+            .expect("a1");
+        w.commit().expect("c1");
+        let rt = query_runtime();
+        let (first, second) = (provider_of(&st), provider_of(&st));
+        let entry = Arc::clone(&first.manifest().superfiles[0]);
+        let a = rt
+            .block_on(first.prepared_scan_file(Arc::clone(&entry)))
+            .expect("first statement");
+        let b = rt
+            .block_on(second.prepared_scan_file(Arc::clone(&entry)))
+            .expect("second statement");
+        assert!(Arc::ptr_eq(&a.reader, &b.reader), "the reader stays cached");
+        assert!(
+            !Arc::ptr_eq(&a, &b),
+            "each statement prepares the file itself"
+        );
+        assert!(Arc::ptr_eq(&a.shape, &b.shape));
+        // A cached shape must come back without walking the footer again.
+        let cached = a
+            .reader
+            .scan_shape(|| panic!("a cached scan shape is built again"));
+        assert!(Arc::ptr_eq(&a.shape, &cached));
+        let indexed = rt
+            .block_on(a.reader.parquet_metadata_with_page_index())
+            .expect("page index");
+        assert_eq!(*a.shape, scan_shape(&a.reader, &indexed));
+        assert!(
+            !a.shape.pages.is_empty(),
+            "the shape counts pages from the page index"
+        );
+
+        w.append(&cat_title_batch(&["b"], &["delta"])).expect("a2");
+        w.commit().expect("c2");
+        let third = provider_of(&st);
+        assert_eq!(rt.block_on(third.surviving_superfile_count(&[])), 2);
+        let c = rt
+            .block_on(third.prepared_scan_file(entry))
+            .expect("third statement");
+        assert!(Arc::ptr_eq(&a.shape, &c.shape));
     }
 
     // ---- Doc-id map on a cold SQL scan ---------------------------------
@@ -5098,7 +5653,8 @@ mod tests {
             reader.sql_schemas().scan().clone(),
             &reader,
         ));
-        let ctx = sql_session_context(&table.options().connection_memory_budget).expect("ctx");
+        let ctx =
+            sql_session_context(&table.options().connection_memory_budget, None).expect("ctx");
         ctx.register_table(TABLE_NAME, Arc::clone(&provider) as Arc<dyn TableProvider>)
             .expect("register");
         (provider, ctx, storage_dir, cache_dir)
@@ -5108,6 +5664,7 @@ mod tests {
     fn doc_maps_read(provider: &SupertableProvider) -> Vec<bool> {
         provider
             .prepared_scan_files
+            .files
             .iter()
             .map(|cell| {
                 let fts = cell
@@ -5557,7 +6114,10 @@ mod tests {
         });
         store.insert_source(path.clone(), source);
         let footers: Arc<ScanFooters> = Arc::new(DashMap::new());
-        footers.insert(path.clone(), Arc::new(ScanFooter::new(Arc::clone(&meta))));
+        footers.insert(
+            path.clone(),
+            Arc::new(ScanFooter::new(Arc::clone(&meta), leaf_bytes(&meta))),
+        );
         let schema = fixture::schema();
         let budget = ConnectionMemoryBudget::measured();
         let read_ahead_state = Arc::new(ScanReadAhead::new(
@@ -6159,44 +6719,58 @@ mod tests {
     /// `[-1.0, -1.0]`, leaving out the NaNs total order puts first ascending
     /// (`lo`) and first descending (`hi`).
     fn nan_table(dir: &TempDir) -> Supertable {
+        let st = Supertable::create(nan_table_options(dir)).expect("create");
+        for file in 0..NAN_TABLE_FILES {
+            commit_nan_file(&st, file + 1 == NAN_TABLE_FILES);
+        }
+        st
+    }
+
+    /// Commit one superfile of the NaN table ([`nan_table`]) to `st`: the one holding the NaNs
+    /// when `last`, else one without.
+    fn commit_nan_file(st: &Supertable, last: bool) {
+        let rows = if last {
+            NAN_FILE_ROWS
+        } else {
+            NAN_FREE_FILE_ROWS
+        };
+        let (lo, hi): (Vec<f64>, Vec<Option<f32>>) = (0..rows)
+            .map(|row| match (last, row) {
+                (false, _) => (-1.0, Some(1.0)),
+                (true, row) if row < NAN_ROWS => (-f64::NAN, Some(f32::NAN)),
+                (true, row) if row < NAN_ROWS + NULL_ROWS => (1.0, None),
+                (true, _) => (1.0, Some(-1.0)),
+            })
+            .unzip();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&st.options().schema),
+            vec![
+                Arc::new(Float64Array::from(lo)) as ArrayRef,
+                Arc::new(Float32Array::from(hi)),
+            ],
+        )
+        .expect("batch");
+        let mut writer = st.writer().expect("writer");
+        writer.append(&batch).expect("append");
+        writer.commit().expect("commit");
+    }
+
+    /// The options of the NaN table ([`nan_table`]) in `dir`.
+    fn nan_table_options(dir: &TempDir) -> SupertableOptions {
+        nan_options(Arc::new(
+            LocalFsStorageProvider::new(dir.path()).expect("provider"),
+        ))
+    }
+
+    /// The options of the NaN table ([`nan_table`]) over `storage`.
+    fn nan_options(storage: Arc<dyn StorageProvider>) -> SupertableOptions {
         let schema = Arc::new(Schema::new(vec![
             Field::new("lo", DataType::Float64, false),
             Field::new("hi", DataType::Float32, true),
         ]));
-        let storage: Arc<dyn StorageProvider> =
-            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
-        let options = SupertableOptions::new(Arc::clone(&schema), vec![], vec![])
+        SupertableOptions::new(schema, vec![], vec![])
             .expect("options")
-            .with_storage(storage);
-        let st = Supertable::create(options).expect("create");
-        for file in 0..NAN_TABLE_FILES {
-            let last = file + 1 == NAN_TABLE_FILES;
-            let rows = if last {
-                NAN_FILE_ROWS
-            } else {
-                NAN_FREE_FILE_ROWS
-            };
-            let (lo, hi): (Vec<f64>, Vec<Option<f32>>) = (0..rows)
-                .map(|row| match (last, row) {
-                    (false, _) => (-1.0, Some(1.0)),
-                    (true, row) if row < NAN_ROWS => (-f64::NAN, Some(f32::NAN)),
-                    (true, row) if row < NAN_ROWS + NULL_ROWS => (1.0, None),
-                    (true, _) => (1.0, Some(-1.0)),
-                })
-                .unzip();
-            let batch = RecordBatch::try_new(
-                Arc::clone(&schema),
-                vec![
-                    Arc::new(Float64Array::from(lo)) as ArrayRef,
-                    Arc::new(Float32Array::from(hi)),
-                ],
-            )
-            .expect("batch");
-            let mut writer = st.writer().expect("writer");
-            writer.append(&batch).expect("append");
-            writer.commit().expect("commit");
-        }
-        st
+            .with_storage(storage)
     }
 
     /// Whether the footer `provider` registers for `entry`'s superfile leaves
@@ -6220,7 +6794,7 @@ mod tests {
         let pruning = file_pruning(&predicate, &adapter, &provider.schema, &prepared.footer)
             .expect("pruning");
         statistics_pruned(
-            ParquetAccessPlan::new_all(prepared.row_counts.len()),
+            ParquetAccessPlan::new_all(prepared.shape.row_counts.len()),
             &prepared.footer,
             &pruning,
             prepared.path.as_ref(),
@@ -6320,13 +6894,102 @@ mod tests {
         assert!(Arc::ptr_eq(&first.footer, &second.footer));
     }
 
+    /// A handle opened without statistics scans each superfile by its own footer and copies none:
+    /// nothing failed, so it is told apart from a handle whose read of them did.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_handle_without_statistics_keeps_each_footer() {
+        let dir = TempDir::new().expect("tempdir");
+        drop(nan_table(&dir));
+        let st = Supertable::open(nan_table_options(&dir).without_statistics()).expect("open");
+        let provider = provider_of(&st);
+        assert!(!provider.manifest().statistics_loaded());
+        let entry = provider
+            .manifest()
+            .superfiles
+            .iter()
+            .find(|entry| entry.n_docs == NAN_FILE_ROWS as u64)
+            .cloned()
+            .expect("the NaN superfile");
+        assert!(
+            entry.scalar_stats.is_unavailable(),
+            "no commit writes them anew"
+        );
+        let prepared = provider.prepared_scan_file(entry).await.expect("prepare");
+        let footer = prepared
+            .reader
+            .parquet_metadata_with_page_index()
+            .await
+            .expect("footer");
+        assert!(Arc::ptr_eq(&prepared.footer, &footer));
+    }
+
+    /// A filter the catalog's check let through to a handle without statistics reads them in the
+    /// scan first, and counts every NaN row its superfile's own footer would prune.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_filter_on_a_handle_without_statistics_reads_them_in_the_scan() {
+        let dir = TempDir::new().expect("tempdir");
+        drop(nan_table(&dir));
+        let st = Supertable::open(nan_table_options(&dir).without_statistics()).expect("open");
+        let filtered = format!("SELECT count(*) FROM {TABLE_NAME} WHERE lo < -1.0");
+        assert_eq!(count_of(&st, &filtered).await, NAN_ROWS as i64);
+    }
+
+    /// A refresh that swaps in a newer snapshot while a handle reads its statistics in place keeps
+    /// both: the read retries over the refreshed snapshot rather than store over it.
+    #[test]
+    fn reading_statistics_keeps_a_refresh_that_races_it() {
+        let dir = TempDir::new().expect("tempdir");
+        drop(nan_table(&dir));
+        let local: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let faults = FaultStorage::wrap(Arc::clone(&local));
+        let st = Supertable::open(nan_options(faults.clone()).without_statistics()).expect("open");
+        let peer = Supertable::open(nan_options(local)).expect("peer");
+        let committed = Arc::new(atomic::AtomicU64::new(0));
+        let (racing, seen) = (st.clone(), Arc::clone(&committed));
+        faults.before(FaultOp::Get, MANIFEST_SUMMARIES_DIR, move || {
+            thread::spawn(move || {
+                commit_nan_file(&peer, false);
+                seen.store(peer.manifest_id(), atomic::Ordering::Relaxed);
+                runtime::Runtime::new()
+                    .expect("runtime")
+                    .block_on(racing.refresh())
+                    .expect("refresh");
+            })
+            .join()
+            .expect("the racing refresh");
+        });
+        st.load_statistics().expect("read the statistics");
+        assert!(st.statistics_loaded());
+        assert_eq!(st.manifest_id(), committed.load(atomic::Ordering::Relaxed));
+    }
+
+    /// A refresh after a handle read its statistics in place keeps them: the newer snapshot loads
+    /// with them, as the handle now holds them, not without them, as it was opened.
+    #[test]
+    fn a_refresh_after_reading_statistics_keeps_them() {
+        let dir = TempDir::new().expect("tempdir");
+        drop(nan_table(&dir));
+        let st = Supertable::open(nan_table_options(&dir).without_statistics()).expect("open");
+        st.load_statistics().expect("read the statistics");
+        let peer = Supertable::open(nan_table_options(&dir)).expect("peer");
+        commit_nan_file(&peer, false);
+        let refreshed = runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(st.refresh())
+            .expect("refresh");
+        assert!(refreshed, "the peer's commit is new to the handle");
+        assert_eq!(st.manifest_id(), peer.manifest_id());
+        assert!(st.statistics_loaded());
+    }
+
     /// The single count `sql` answers over `st`, run the way the catalog
     /// runs a statement: a provider over the table's current manifest, in a
     /// session of its own.
     async fn count_of(st: &Supertable, sql: &str) -> i64 {
         let reader = st.reader().expect("reader");
         let provider = SupertableProvider::new(reader.sql_schemas().scan().clone(), &reader);
-        let ctx = sql_session_context(&st.options().connection_memory_budget).expect("ctx");
+        let ctx = sql_session_context(&st.options().connection_memory_budget, None).expect("ctx");
         ctx.register_table(TABLE_NAME, Arc::new(provider) as Arc<dyn TableProvider>)
             .expect("register");
         let batches = ctx
@@ -6407,6 +7070,720 @@ mod tests {
         );
         for (sql, expected) in &queries {
             assert_eq!(count_of(&st, sql).await, *expected, "after: {sql}");
+        }
+    }
+
+    /// Files in the tables the metadata-budget tests read.
+    const BUDGET_TEST_FILES: usize = 3;
+
+    /// A table of [`BUDGET_TEST_FILES`] one-row files behind a lazy disk cache whose files
+    /// count against its own `budget`.
+    fn table_charged_to(
+        budget: &'static HeapBudget,
+    ) -> (
+        TempDir,
+        TempDir,
+        Arc<DiskCacheStore>,
+        Supertable,
+        Arc<dyn StorageProvider>,
+    ) {
+        let storage_dir = TempDir::new().expect("storage tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(storage_dir.path()).expect("provider"));
+        let options = || default_supertable_options().with_storage(Arc::clone(&storage));
+        {
+            let table = Supertable::create(options()).expect("create");
+            for file in 0..BUDGET_TEST_FILES {
+                let mut writer = table.writer().expect("writer");
+                writer
+                    .append(&build_title_batch(&[&format!("file {file}")]))
+                    .expect("append");
+                writer.commit().expect("commit");
+            }
+        }
+        let (cache_dir, cache, table) = opened_charged_to(options(), budget);
+        (storage_dir, cache_dir, cache, table, storage)
+    }
+
+    /// The table `options` name, opened behind a lazy disk cache of its own whose files count
+    /// against `budget`.
+    fn opened_charged_to(
+        options: SupertableOptions,
+        budget: &'static HeapBudget,
+    ) -> (TempDir, Arc<DiskCacheStore>, Supertable) {
+        let cache_dir = TempDir::new().expect("cache tempdir");
+        let storage = options.storage.clone().expect("the options name a storage");
+        let cache = lazy_foreground_disk_cache(storage, cache_dir.path());
+        cache.use_heap_budget(budget);
+        let table = Supertable::open(options.with_disk_cache(Arc::clone(&cache))).expect("open");
+        (cache_dir, cache, table)
+    }
+
+    /// Prepare `entry` for a scan through `provider`, and return it with what that charged to
+    /// `budget`.
+    async fn charged_preparing(
+        provider: &SupertableProvider,
+        budget: &HeapBudget,
+        entry: Arc<SuperfileEntry>,
+    ) -> (Arc<PreparedScanFile>, u64) {
+        let before = budget.charged();
+        let prepared = provider.prepared_scan_file(entry).await.expect("prepare");
+        (prepared, budget.charged() - before)
+    }
+
+    /// The bytes of the footer `prepared`'s reader parsed.
+    fn parsed_bytes(prepared: &PreparedScanFile) -> u64 {
+        prepared.reader.parquet_metadata().memory_size() as u64
+    }
+
+    /// A SQL session over `reader` with a provider of its own, as one catalog statement has.
+    fn statement_over(table: &Supertable, reader: &SupertableReader) -> SessionContext {
+        let provider = SupertableProvider::new(reader.sql_schemas().scan().clone(), reader);
+        let ctx =
+            sql_session_context(&table.options().connection_memory_budget, None).expect("ctx");
+        ctx.register_table(TABLE_NAME, Arc::new(provider) as Arc<dyn TableProvider>)
+            .expect("register");
+        ctx
+    }
+
+    /// Run a scan of every file in `ctx`, and hand the session back.
+    async fn scan_all(ctx: SessionContext) -> SessionContext {
+        ctx.sql(&format!("SELECT title FROM {TABLE_NAME}"))
+            .await
+            .expect("plan")
+            .collect()
+            .await
+            .expect("run");
+        ctx
+    }
+
+    /// The memory a statement's files keep goes back to the budget when the last statement holding
+    /// them ends, not before.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_statement_end_drops_metadata_over_budget_once_no_statement_holds_it() {
+        // Three files, a cache whose budget is one byte under their parsed footers, and two
+        // statements that scan them all.
+        //  - while either statement holds the files, every entry stays, counted at its footer;
+        //  - when the first ends, the second still holds them: nothing goes;
+        //  - when the second ends, one entry goes and its count with it.
+        // This test pins the end-of-statement pass and that it never drops what a statement holds.
+        let (_storage, _measure_dir, _measure_cache, measured, storage) =
+            table_charged_to(HeapBudget::with_budget(None));
+        let provider = provider_of(&measured);
+        let mut footers = 0;
+        for entry in &provider.manifest().superfiles {
+            let prepared = provider
+                .prepared_scan_file(Arc::clone(entry))
+                .await
+                .expect("prepare");
+            footers += parsed_bytes(&prepared);
+        }
+        let budget = HeapBudget::with_budget(Some(footers - 1));
+        let options = default_supertable_options().with_storage(storage);
+        let (_cache_dir, cache, table) = opened_charged_to(options, budget);
+        let reader = table.reader().expect("reader");
+        let first = scan_all(statement_over(&table, &reader)).await;
+        let second = scan_all(statement_over(&table, &reader)).await;
+        let charged = budget.charged();
+        assert_eq!(charged, footers, "every opened file is charged its footer");
+        let cached = cache.stats().n_entries;
+
+        drop(first);
+        assert_eq!(
+            cache.stats().n_entries,
+            cached,
+            "the second still holds them"
+        );
+        assert_eq!(budget.charged(), charged);
+
+        drop(second);
+        assert_eq!(
+            cache.stats().n_entries,
+            cached - 1,
+            "no statement holds them: one byte over budget, one goes"
+        );
+        let left = budget.charged();
+        assert!(
+            left < charged && left > 0,
+            "its count goes with it: {left} of {charged}"
+        );
+    }
+
+    /// What a reader keeps decoded is charged exactly: its parsed footer, plus the scan footer
+    /// when it keeps a derived one of its own; a scan footer derived for one statement alone goes
+    /// with that statement and is not charged.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_reader_is_charged_its_footer_and_the_scan_footer_it_keeps() {
+        // The NaN table behind a cache: its NaN-free files share the parsed footer with the scan,
+        // and its NaN file's reader keeps a derived one. Then a fresh cache over the same table,
+        // and the NaN file's entry with its statistics unreadable: its scan footer is derived for
+        // the statement alone.
+        let dir = TempDir::new().expect("tempdir");
+        drop(nan_table(&dir));
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let budget = HeapBudget::with_budget(Some(u64::MAX));
+        let (_cache_dir, _cache, table) =
+            opened_charged_to(nan_options(Arc::clone(&storage)), budget);
+        let provider = provider_of(&table);
+        for entry in &provider.manifest().superfiles {
+            let (prepared, charged) = charged_preparing(&provider, budget, Arc::clone(entry)).await;
+            let parsed = prepared.reader.parquet_metadata();
+            if entry.n_docs == NAN_FILE_ROWS as u64 {
+                assert!(!Arc::ptr_eq(&prepared.footer, &parsed), "kept, derived");
+                let kept = (parsed.memory_size() + prepared.footer.memory_size()) as u64;
+                assert_eq!(charged, kept, "parsed and kept footers");
+            } else {
+                assert!(Arc::ptr_eq(&prepared.footer, &parsed), "shared");
+                assert_eq!(charged, parsed_bytes(&prepared), "the shared footer once");
+            }
+        }
+
+        let budget = HeapBudget::with_budget(Some(u64::MAX));
+        let (_cache_dir, _cache, table) = opened_charged_to(nan_options(storage), budget);
+        let provider = provider_of(&table);
+        let mut entry = provider
+            .manifest()
+            .superfiles
+            .iter()
+            .find(|entry| entry.n_docs == NAN_FILE_ROWS as u64)
+            .map(|entry| SuperfileEntry::clone(entry))
+            .expect("the NaN superfile");
+        entry.scalar_stats = ScalarStats::Unavailable;
+        let (prepared, charged) = charged_preparing(&provider, budget, Arc::new(entry)).await;
+        assert!(
+            !Arc::ptr_eq(&prepared.footer, &prepared.reader.parquet_metadata()),
+            "derived for the statement"
+        );
+        assert_eq!(charged, parsed_bytes(&prepared), "the parsed footer alone");
+    }
+
+    /// A file mapped whole from local disk is not counted at its scan: this budget never drops it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_file_mapped_whole_is_not_counted_at_its_scan() {
+        // Three files loaded whole, so mapped from local disk, then one scan that finds them.
+        // This test pins that only files that can leave count against the budget.
+        let budget = HeapBudget::with_budget(None);
+        let (_storage, _cache_dir, cache, table, storage) = table_charged_to(budget);
+        let reader = table.reader().expect("reader");
+        for entry in &reader.manifest().superfiles {
+            cache
+                .reader_synchronous_with_storage(
+                    &entry.uri,
+                    &entry.storage_path(),
+                    Arc::clone(&storage),
+                )
+                .await
+                .expect("load whole");
+        }
+        let _done = scan_all(statement_over(&table, &reader)).await;
+        assert_eq!(budget.charged(), 0, "nothing counted");
+    }
+
+    /// A file held whole in memory, found resident by its first scan, is counted then: it can leave.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_file_held_whole_in_memory_is_counted_at_its_first_scan() {
+        // Three files cached whole in memory (as a hybrid fill's first copy is, before it is
+        // mapped) whose readers load their page index before any SQL, as a search's row fetch
+        // does, then one scan, which finds them resident.
+        // This test pins that the resident files that can leave count against the budget.
+        let budget = HeapBudget::with_budget(None);
+        let (_storage, _cache_dir, cache, table, storage) = table_charged_to(budget);
+        let reader = table.reader().expect("reader");
+        let mut files = Vec::new();
+        for entry in &reader.manifest().superfiles {
+            let (bytes, _) = storage.get(&entry.storage_path()).await.expect("get");
+            let file = Arc::new(SuperfileReader::open(bytes).expect("open"));
+            file.parquet_metadata_with_page_index()
+                .await
+                .expect("page index");
+            cache_buffered(&cache, entry.uri, Arc::clone(&file));
+            files.push(file);
+        }
+        assert_eq!(budget.charged(), 0, "nothing counted before SQL");
+        let _done = scan_all(statement_over(&table, &reader)).await;
+        let footers: u64 = files
+            .iter()
+            .map(|file| file.parquet_metadata().memory_size() as u64)
+            .sum();
+        assert_eq!(budget.charged(), footers, "counted at the first scan");
+    }
+
+    /// A scan footer a reader keeps is counted when a statement first derives it, even after an
+    /// earlier statement counted the parsed footer without it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_scan_footer_kept_after_the_first_scan_is_counted_when_derived() {
+        // The NaN table's NaN file behind one cache: first prepared with its statistics unreadable
+        // (the parsed footer alone is counted), then by a second statement that reads them and
+        // keeps a derived scan footer on the same reader.
+        // This test pins that a footer kept later is counted, not left out by the first count.
+        let dir = TempDir::new().expect("tempdir");
+        drop(nan_table(&dir));
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let budget = HeapBudget::with_budget(Some(u64::MAX));
+        let (_cache_dir, _cache, table) = opened_charged_to(nan_options(storage), budget);
+        let first = provider_of(&table);
+        let nan = first
+            .manifest()
+            .superfiles
+            .iter()
+            .find(|entry| entry.n_docs == NAN_FILE_ROWS as u64)
+            .map(|entry| SuperfileEntry::clone(entry))
+            .expect("the NaN superfile");
+        let mut blind = nan.clone();
+        blind.scalar_stats = ScalarStats::Unavailable;
+        let (prepared, parsed) = charged_preparing(&first, budget, Arc::new(blind)).await;
+        assert_eq!(parsed, parsed_bytes(&prepared), "the parsed footer alone");
+        let second = provider_of(&table);
+        let (kept, more) = charged_preparing(&second, budget, Arc::new(nan)).await;
+        assert!(
+            !Arc::ptr_eq(&kept.footer, &kept.reader.parquet_metadata()),
+            "kept, derived"
+        );
+        assert_eq!(
+            more,
+            kept.footer.memory_size() as u64,
+            "the kept footer, when derived"
+        );
+    }
+
+    /// How long a test waits for a statement before it counts as hung.
+    const STATEMENT_DEADLINE: Duration = Duration::from_secs(60);
+
+    /// A table's cached SQL context holds its files between statements. Short of memory with them
+    /// over budget, the pass drops the context; a statement still running on its own copy keeps its
+    /// files until it ends.
+    #[test]
+    fn a_cached_context_over_budget_is_dropped_but_a_running_statement_keeps_its_files() {
+        // Three files read through the table's cached context with room to spare, a budget of one
+        // byte; then, short of memory, a pass while a statement still runs on its own copy.
+        //  - the pass drops the cached context, and the running statement keeps every file;
+        //  - when that statement ends, its files go;
+        //  - the next statement still returns every row.
+        // This test pins that a cached context cannot hold memory past the budget, and that
+        // dropping it never takes files from a running statement.
+        let budget = HeapBudget::with_budget(Some(1));
+        let (_storage, _cache_dir, cache, table, _) = table_charged_to(budget);
+        let reader = table.reader().expect("reader");
+        budget.set_short_of_memory(false);
+        reader
+            .query_sql("SELECT title FROM supertable")
+            .expect("first statement");
+        let running = reader
+            .sql_session_context()
+            .expect("a running statement's context");
+        let files = cache.stats().n_entries;
+        assert_eq!(
+            files, BUDGET_TEST_FILES as u64,
+            "the cached context holds every file"
+        );
+
+        budget.set_short_of_memory(true);
+        budget.release_over_budget();
+        assert!(
+            reader
+                .sql_session_cache()
+                .lock()
+                .expect("session")
+                .is_none(),
+            "the cached context is dropped"
+        );
+        assert_eq!(
+            cache.stats().n_entries,
+            files,
+            "the running statement keeps its files"
+        );
+
+        drop(running);
+        assert_eq!(cache.stats().n_entries, 0, "its files go when it ends");
+        let rows: usize = reader
+            .query_sql("SELECT title FROM supertable")
+            .expect("next statement")
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum();
+        assert_eq!(rows, BUDGET_TEST_FILES, "on a new context");
+    }
+
+    /// A commit replaces a table's cached context and plans, and with held files over budget the
+    /// pass that follows drops every table's cached sessions, this one's included.
+    #[test]
+    fn replacing_a_cached_context_lets_the_pass_take_the_tables_locks() {
+        // Two handles on one table and cache, a budget of one byte. With room to spare, the first
+        // runs a statement and keeps its context (its files held, over budget) and the second reads
+        // and commits; then, short of memory, the second reads again.
+        // This test pins that the statement after the commit finishes: the pass it starts never
+        // waits on a lock its own table holds.
+        let budget = HeapBudget::with_budget(Some(1));
+        let (_storage, _cache_dir, cache, first, storage) = table_charged_to(budget);
+        budget.set_short_of_memory(false);
+        let first_reader = first.reader().expect("reader");
+        first_reader
+            .query_sql("SELECT title FROM supertable")
+            .expect("first");
+        let _held = first_reader.sql_session_context().expect("held context");
+        let options = default_supertable_options()
+            .with_storage(storage)
+            .with_disk_cache(Arc::clone(&cache));
+        let second = Supertable::open(options).expect("second handle");
+        second
+            .reader()
+            .expect("reader")
+            .query_sql("SELECT title FROM supertable")
+            .expect("before the commit");
+        let mut writer = second.writer().expect("writer");
+        writer
+            .append(&build_title_batch(&["after"]))
+            .expect("append");
+        writer.commit().expect("commit");
+
+        budget.set_short_of_memory(true);
+        let (done, finished) = channel();
+        let statement = thread::spawn(move || {
+            let result = second
+                .reader()
+                .expect("reader")
+                .query_sql("SELECT title FROM supertable")
+                .map(|batches| batches.iter().map(RecordBatch::num_rows).sum::<usize>());
+            let _ = done.send(result.is_ok());
+        });
+        assert_eq!(
+            finished.recv_timeout(STATEMENT_DEADLINE),
+            Ok(true),
+            "the statement after the commit finishes"
+        );
+        statement.join().expect("statement thread");
+    }
+
+    /// A statement on a table's cached context leaves its files held by that context; over budget
+    /// and short of memory, its end still lets them go.
+    #[test]
+    fn a_table_level_statement_over_budget_lets_its_files_go_when_it_ends() {
+        // Three files read through the table's own query_sql, a budget of one byte, short.
+        // This test pins that a table used only through its cached context still gets its memory
+        // back at each statement end.
+        let budget = HeapBudget::with_budget(Some(1));
+        let (_storage, _cache_dir, cache, table, _) = table_charged_to(budget);
+        let reader = table.reader().expect("reader");
+        reader
+            .query_sql("SELECT title FROM supertable")
+            .expect("statement");
+        assert_eq!(cache.stats().n_entries, 0, "its files go at its end");
+    }
+
+    /// A provider that prepared no file held none, so dropping it starts no pass.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_provider_that_prepared_no_file_starts_no_pass_when_it_drops() {
+        // A table's files prepared and let go with room to spare (counted, unheld, over a budget
+        // of one byte); then, short of memory, a provider over the table dropped unused.
+        // This test pins that every file stays cached: only a provider that prepared files starts
+        // a pass, so one built and dropped under a table's session lock starts none there.
+        let budget = HeapBudget::with_budget(Some(1));
+        let (_storage, _cache_dir, cache, table, _) = table_charged_to(budget);
+        budget.set_short_of_memory(false);
+        let provider = provider_of(&table);
+        for entry in &provider.manifest().superfiles {
+            provider
+                .prepared_scan_file(Arc::clone(entry))
+                .await
+                .expect("prepare");
+        }
+        drop(provider);
+        let files = cache.stats().n_entries;
+        assert_eq!(files, BUDGET_TEST_FILES as u64, "counted and unheld");
+
+        budget.set_short_of_memory(true);
+        drop(provider_of(&table));
+        assert_eq!(cache.stats().n_entries, files, "no pass ran");
+    }
+
+    /// A table-level statement that fails still runs the pass at its end.
+    #[test]
+    fn a_failed_table_level_statement_still_lets_its_files_go() {
+        // Three files read through the table's cached context with room to spare (held by it, over
+        // a budget of one byte); then, short of memory, a statement that fails.
+        // This test pins that the pass runs at a statement's end whether it succeeds or not, so a
+        // refused statement does not leave the cached context holding its files.
+        let budget = HeapBudget::with_budget(Some(1));
+        let (_storage, _cache_dir, cache, table, _) = table_charged_to(budget);
+        let reader = table.reader().expect("reader");
+        budget.set_short_of_memory(false);
+        reader
+            .query_sql("SELECT title FROM supertable")
+            .expect("statement");
+        assert_eq!(cache.stats().n_entries, BUDGET_TEST_FILES as u64, "held");
+
+        budget.set_short_of_memory(true);
+        let failed = reader.query_sql("SELECT no_such_column FROM supertable");
+        assert!(failed.is_err(), "the statement fails");
+        assert_eq!(cache.stats().n_entries, 0, "its end still lets them go");
+    }
+
+    /// A filtered statement on a handle opened without statistics prepares its files in a provider
+    /// built to read them, gone at planning; over budget and short of memory, its end still lets
+    /// them go, each once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_filtered_statement_without_statistics_lets_its_files_go_when_it_ends() {
+        // The NaN table opened without statistics behind a budget of one byte, short of memory,
+        // and one statement whose filter makes its scan read them first.
+        //  - after it runs, its files are still cached and counted;
+        //  - when it ends, every file goes and the count is back at zero, not past it.
+        // This test pins that the statement's own provider starts the pass at its end.
+        let dir = TempDir::new().expect("tempdir");
+        drop(nan_table(&dir));
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let budget = HeapBudget::with_budget(Some(1));
+        let (_cache_dir, cache, table) =
+            opened_charged_to(nan_options(storage).without_statistics(), budget);
+        let reader = table.reader().expect("reader");
+        assert!(!reader.manifest().statistics_loaded());
+        let ctx = statement_over(&table, &reader);
+        let filtered = format!("SELECT count(*) FROM {TABLE_NAME} WHERE lo < -1.0");
+        ctx.sql(&filtered)
+            .await
+            .expect("plan")
+            .collect()
+            .await
+            .expect("run");
+        assert!(cache.stats().n_entries > 0, "its files are cached");
+        assert!(budget.charged() > 0, "and counted");
+
+        drop(ctx);
+        // A background fill that finished first leaves its file mapped whole, which is not counted.
+        assert_eq!(lazy_entries(&cache), 0, "its end lets them go");
+        assert_eq!(budget.charged(), 0, "each once");
+    }
+
+    pub(crate) fn planned_files(reader: &SupertableReader, sql: &str) -> usize {
+        // The final physical plan from `EXPLAIN VERBOSE`: the plain display lists at most 5 files a
+        // group.
+        let plan: String = reader
+            .query_sql(&format!("EXPLAIN VERBOSE {sql}"))
+            .expect("explain")
+            .iter()
+            .flat_map(|b| {
+                let column = |i: usize| {
+                    b.column(i)
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .expect("plan column")
+                        .clone()
+                };
+                let (kinds, plans) = (column(0), column(1));
+                (0..plans.len())
+                    .filter(move |i| kinds.value(*i) == "physical_plan")
+                    .map(move |i| plans.value(i).to_owned())
+            })
+            .collect();
+        // Each file the scan reads shows in the plan as `seg-<36-character id>`.
+        let mut files: Vec<&str> = plan
+            .split("seg-")
+            .skip(1)
+            .filter_map(|rest| rest.get(..36))
+            .collect();
+        files.sort_unstable();
+        files.dedup();
+        files.len()
+    }
+
+    fn seq_table(dir: &TempDir, files: i64, rows: i64) -> Supertable {
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("seq", DataType::Int64, false),
+            Field::new("title", DataType::LargeUtf8, false),
+        ]));
+        let options =
+            SupertableOptions::new(Arc::clone(&schema), vec![FtsConfig::new("title")], vec![])
+                .expect("options")
+                .with_storage(storage);
+        let st = Supertable::create(options).expect("create");
+        // One commit per file, `seq` counting up across them, `title` "even" or "odd" by `seq`.
+        for file in 0..files {
+            let seqs: Vec<i64> = (file * rows..(file + 1) * rows).collect();
+            let titles: Vec<&str> = seqs
+                .iter()
+                .map(|s| if s % 2 == 0 { "even" } else { "odd" })
+                .collect();
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(seqs)),
+                    Arc::new(LargeStringArray::from(titles)),
+                ],
+            )
+            .expect("batch");
+            let mut writer = st.writer().expect("writer");
+            writer.append(&batch).expect("append");
+            writer.commit().expect("commit");
+        }
+        st
+    }
+
+    fn seqs(reader: &SupertableReader, sql: &str) -> Vec<i64> {
+        reader
+            .query_sql(sql)
+            .expect("sql")
+            .iter()
+            .flat_map(|b| {
+                let seqs = b
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("seq")
+                    .clone();
+                (0..seqs.len()).map(move |i| seqs.value(i))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_plain_limit_reads_only_the_superfiles_that_hold_its_rows() {
+        // 4 files of 2,000 rows, before and after optimize. Deletes keep 300 rows of the oldest
+        // file, which a scan reads first, and drop every 11th row.
+        //  - Every `LIMIT` returns that many distinct live rows, or all of them when it is larger.
+        //  - `LIMIT 10`, and a page of exactly the oldest file's live rows, read one file.
+        //  - One row more reads two files, and a page of every live row reads all of them.
+        // This test pins that a plain `LIMIT` opens only the files that hold its live rows.
+        const LIMIT_FILES: i64 = 4;
+        const LIMIT_ROWS_PER_FILE: i64 = 2000;
+        const LIMIT_OLDEST_KEPT: i64 = 300;
+        const LIMIT_DELETED_EVERY: i64 = 11;
+        let dir = TempDir::new().expect("tempdir");
+        let st = seq_table(&dir, LIMIT_FILES, LIMIT_ROWS_PER_FILE);
+        st.delete(
+            col("seq")
+                .gt_eq(lit(LIMIT_OLDEST_KEPT))
+                .and(col("seq").lt(lit(LIMIT_ROWS_PER_FILE)))
+                .or((col("seq") % lit(LIMIT_DELETED_EVERY)).eq(lit(0_i64))),
+        )
+        .expect("delete");
+        let live: Vec<i64> = (0..LIMIT_FILES * LIMIT_ROWS_PER_FILE)
+            .filter(|s| {
+                (*s < LIMIT_OLDEST_KEPT || *s >= LIMIT_ROWS_PER_FILE)
+                    && s % LIMIT_DELETED_EVERY != 0
+            })
+            .collect();
+        let first_live = live.iter().filter(|s| **s < LIMIT_ROWS_PER_FILE).count();
+        for pass in ["appended", "optimized"] {
+            if pass == "optimized" {
+                st.optimize(&OptimizeOptions::default()).expect("optimize");
+            }
+            let reader = st.reader().expect("reader");
+            let files = reader.manifest().superfiles.len();
+            for limit in [
+                0,
+                1,
+                10,
+                first_live,
+                first_live + 1,
+                live.len(),
+                live.len() + 1,
+            ] {
+                let sql = format!("SELECT seq FROM supertable LIMIT {limit}");
+                let mut got = seqs(&reader, &sql);
+                assert_eq!(got.len(), limit.min(live.len()), "{pass}: {sql}");
+                got.sort_unstable();
+                got.dedup();
+                assert_eq!(
+                    got.len(),
+                    limit.min(live.len()),
+                    "{pass}: {sql}: repeated rows"
+                );
+                assert!(
+                    got.iter().all(|s| live.binary_search(s).is_ok()),
+                    "{pass}: {sql}: a deleted row"
+                );
+            }
+            let small = "SELECT seq FROM supertable LIMIT 10";
+            assert_eq!(planned_files(&reader, small), 1, "{pass}: {small}");
+            if pass == "appended" {
+                let first = format!("SELECT seq FROM supertable LIMIT {first_live}");
+                assert_eq!(planned_files(&reader, &first), 1, "{pass}: {first}");
+                let more = format!("SELECT seq FROM supertable LIMIT {}", first_live + 1);
+                assert_eq!(planned_files(&reader, &more), 2, "{pass}: {more}");
+            }
+            let every = format!("SELECT seq FROM supertable LIMIT {}", live.len());
+            assert_eq!(planned_files(&reader, &every), files, "{pass}: {every}");
+        }
+    }
+
+    #[test]
+    fn a_limit_with_an_offset_reads_the_files_holding_both() {
+        // 4 files of 100 rows; DataFusion hands the scan `LIMIT k OFFSET o` as a limit of `k + o`.
+        //  - `LIMIT 10 OFFSET 85` needs 95 rows: one file.
+        //  - `LIMIT 10 OFFSET 95` needs 105 rows: two files.
+        // This test pins that the offset's rows count toward the files the scan opens.
+        let dir = TempDir::new().expect("tempdir");
+        let reader = seq_table(&dir, 4, 100).reader().expect("reader");
+        for (offset, files) in [(85, 1), (95, 2)] {
+            let sql = format!("SELECT seq FROM supertable LIMIT 10 OFFSET {offset}");
+            let mut got = seqs(&reader, &sql);
+            got.sort_unstable();
+            got.dedup();
+            assert_eq!(got.len(), 10, "{sql}");
+            assert_eq!(planned_files(&reader, &sql), files, "{sql}");
+        }
+    }
+
+    #[test]
+    fn an_empty_table_and_a_zero_limit_plan_no_file() {
+        // An empty table under `LIMIT 10`, and 4 files under `LIMIT 0`.
+        // This test pins that both answer no rows and plan no file.
+        let dir = TempDir::new().expect("tempdir");
+        let empty = seq_table(&dir, 0, 0).reader().expect("reader");
+        let sql = "SELECT seq FROM supertable LIMIT 10";
+        assert!(seqs(&empty, sql).is_empty());
+        assert_eq!(planned_files(&empty, sql), 0);
+        let other = TempDir::new().expect("tempdir");
+        let reader = seq_table(&other, 4, 100).reader().expect("reader");
+        let sql = "SELECT seq FROM supertable LIMIT 0";
+        assert!(seqs(&reader, sql).is_empty());
+        assert_eq!(planned_files(&reader, sql), 0);
+    }
+
+    #[test]
+    fn a_limit_past_deleted_leading_files_finds_the_first_live_rows() {
+        // 7 files of 100 rows with every row of the first 4 deleted, so deletes are read in groups
+        // of 1, 2 and 4 files before the count reaches live rows.
+        //  - `LIMIT 10` returns 10 live rows and plans the 4 deleted files and the first live one.
+        //  - `LIMIT 250` needs all 3 live files: 7 files, past the 5 a plain `EXPLAIN` lists.
+        // This test pins the doubling groups and the file count past 5.
+        let dir = TempDir::new().expect("tempdir");
+        let st = seq_table(&dir, 7, 100);
+        st.delete(col("seq").lt(lit(400_i64))).expect("delete");
+        let reader = st.reader().expect("reader");
+        for (limit, files) in [(10, 5), (250, 7)] {
+            let sql = format!("SELECT seq FROM supertable LIMIT {limit}");
+            let mut got = seqs(&reader, &sql);
+            got.sort_unstable();
+            got.dedup();
+            assert_eq!(got.len(), limit, "{sql}");
+            assert!(got.iter().all(|s| *s >= 400), "{sql}: a deleted row");
+            assert_eq!(planned_files(&reader, &sql), files, "{sql}");
+        }
+    }
+
+    #[test]
+    fn a_limit_under_a_filter_sort_or_group_plans_every_file() {
+        // 4 files of 100 rows and a `LIMIT` under `WHERE`, `ORDER BY` and `GROUP BY`.
+        //  - A `text_match` is pushed down exactly, so the scan gets the limit with it: the first
+        //    file holds 100 rows but only 50 pass `text_match(title, 'even')`.
+        // This test pins that none of them takes the plain-limit path: each plans all 4 files.
+        let dir = TempDir::new().expect("tempdir");
+        let reader = seq_table(&dir, 4, 100).reader().expect("reader");
+        for (sql, rows) in [
+            (
+                "SELECT seq FROM supertable WHERE text_match(title, 'even') LIMIT 100",
+                100,
+            ),
+            ("SELECT seq FROM supertable ORDER BY seq LIMIT 10", 10),
+            ("SELECT seq FROM supertable GROUP BY seq LIMIT 10", 10),
+        ] {
+            assert_eq!(seqs(&reader, sql).len(), rows, "{sql}");
+            assert_eq!(planned_files(&reader, sql), 4, "{sql}");
         }
     }
 }

@@ -73,6 +73,37 @@ pub enum FaultKind {
     /// or a timeout: a conditional write meets itself and fails its
     /// precondition.
     ResponseLost,
+    /// The call lands, but the caller gets
+    /// [`StorageError::TransientExhausted`]: a write that answered with a
+    /// 500 or a timeout which the storage client's own retries never got
+    /// past.
+    LandedThenFailed,
+}
+
+/// What an armed rule does to a call, as [`FaultStorage::check`] finds it.
+#[derive(Debug)]
+enum Injected {
+    /// No rule matched: the call goes through.
+    Nothing,
+    /// Issue the call once and drop its result, then issue it again.
+    Reissue,
+    /// Issue the call, then fail with this error.
+    FailAfterLanding(StorageError),
+}
+
+impl Injected {
+    /// Whether the call is issued once before the one whose result counts.
+    fn lands_first(&self) -> bool {
+        !matches!(self, Injected::Nothing)
+    }
+
+    /// The error the caller gets after the call landed, if any.
+    fn after_landing(self) -> Result<(), StorageError> {
+        match self {
+            Injected::FailAfterLanding(error) => Err(error),
+            Injected::Nothing | Injected::Reissue => Ok(()),
+        }
+    }
 }
 
 /// One armed fault: the next `remaining` calls of `op` whose URI
@@ -197,11 +228,9 @@ impl FaultStorage {
         self.most_deletes_in_flight.load(Ordering::SeqCst)
     }
 
-    /// `Err` for a rule that fails the call, `Ok(true)` for a
-    /// [`FaultKind::ResponseLost`] rule (the caller issues the call once and
-    /// drops its result before issuing it again), `Ok(false)` when no rule
-    /// matches.
-    fn check(&self, op: FaultOp, uri: &str) -> Result<bool, StorageError> {
+    /// `Err` for a rule that fails the call before it is issued, otherwise
+    /// what the caller does around issuing it (see [`Injected`]).
+    fn check(&self, op: FaultOp, uri: &str) -> Result<Injected, StorageError> {
         let hook = {
             let mut hooks = guard(&self.hooks);
             hooks
@@ -219,7 +248,13 @@ impl FaultStorage {
                 rule.remaining -= 1;
                 self.fired.fetch_add(1, Ordering::SeqCst);
                 return match rule.kind {
-                    FaultKind::ResponseLost => Ok(true),
+                    FaultKind::ResponseLost => Ok(Injected::Reissue),
+                    FaultKind::LandedThenFailed => Ok(Injected::FailAfterLanding(
+                        StorageError::TransientExhausted {
+                            uri: uri.to_string(),
+                            source: Box::new(IoError::other("injected fault after landing")),
+                        },
+                    )),
                     FaultKind::Transient => Err(StorageError::TransientExhausted {
                         uri: uri.to_string(),
                         source: Box::new(IoError::other("injected fault")),
@@ -233,7 +268,7 @@ impl FaultStorage {
                 };
             }
         }
-        Ok(false)
+        Ok(Injected::Nothing)
     }
 }
 
@@ -254,35 +289,45 @@ impl StorageProvider for FaultStorage {
     }
 
     async fn head(&self, uri: &str) -> Result<ObjectMeta, StorageError> {
-        if self.check(FaultOp::Head, uri)? {
+        let injected = self.check(FaultOp::Head, uri)?;
+        if injected.lands_first() {
             let _ = self.inner.head(uri).await;
         }
+        injected.after_landing()?;
         self.inner.head(uri).await
     }
     async fn get(&self, uri: &str) -> Result<(Bytes, ObjectMeta), StorageError> {
-        if self.check(FaultOp::Get, uri)? {
+        let injected = self.check(FaultOp::Get, uri)?;
+        if injected.lands_first() {
             let _ = self.inner.get(uri).await;
         }
+        injected.after_landing()?;
         self.inner.get(uri).await
     }
     async fn get_range(&self, uri: &str, range: Range<u64>) -> Result<Bytes, StorageError> {
-        if self.check(FaultOp::GetRange, uri)? {
+        let injected = self.check(FaultOp::GetRange, uri)?;
+        if injected.lands_first() {
             let _ = self.inner.get_range(uri, range.clone()).await;
         }
+        injected.after_landing()?;
         self.inner.get_range(uri, range).await
     }
     async fn put_atomic(&self, uri: &str, bytes: Bytes) -> Result<Option<String>, StorageError> {
-        if self.check(FaultOp::PutAtomic, uri)? {
+        let injected = self.check(FaultOp::PutAtomic, uri)?;
+        if injected.lands_first() {
             let _ = self.inner.put_atomic(uri, bytes.clone()).await;
         }
+        injected.after_landing()?;
         self.inner.put_atomic(uri, bytes).await
     }
     async fn put_overwrite(&self, uri: &str, bytes: Bytes) -> Result<(), StorageError> {
         // Shares `PutAtomic`'s fault point: both are "write these bytes at
         // this key", and a test injecting a write fault wants both.
-        if self.check(FaultOp::PutAtomic, uri)? {
+        let injected = self.check(FaultOp::PutAtomic, uri)?;
+        if injected.lands_first() {
             let _ = self.inner.put_overwrite(uri, bytes.clone()).await;
         }
+        injected.after_landing()?;
         self.inner.put_overwrite(uri, bytes).await
     }
     async fn put_if_match(
@@ -291,12 +336,14 @@ impl StorageProvider for FaultStorage {
         bytes: Bytes,
         expected_etag: Option<&str>,
     ) -> Result<Option<String>, StorageError> {
-        if self.check(FaultOp::PutIfMatch, uri)? {
+        let injected = self.check(FaultOp::PutIfMatch, uri)?;
+        if injected.lands_first() {
             let _ = self
                 .inner
                 .put_if_match(uri, bytes.clone(), expected_etag)
                 .await;
         }
+        injected.after_landing()?;
         self.inner.put_if_match(uri, bytes, expected_etag).await
     }
     async fn put_multipart(
@@ -313,9 +360,11 @@ impl StorageProvider for FaultStorage {
         // way here before any finishes, and the gauge counts them all.
         tokio::task::yield_now().await;
         let result = async {
-            if self.check(FaultOp::Delete, uri)? {
+            let injected = self.check(FaultOp::Delete, uri)?;
+            if injected.lands_first() {
                 let _ = self.inner.delete(uri).await;
             }
+            injected.after_landing()?;
             self.inner.delete(uri).await
         }
         .await;
@@ -323,9 +372,11 @@ impl StorageProvider for FaultStorage {
         result
     }
     async fn delete_once(&self, uri: &str) -> Result<(), StorageError> {
-        if self.check(FaultOp::DeleteOnce, uri)? {
+        let injected = self.check(FaultOp::DeleteOnce, uri)?;
+        if injected.lands_first() {
             let _ = self.inner.delete_once(uri).await;
         }
+        injected.after_landing()?;
         self.inner.delete_once(uri).await
     }
     async fn list_with_prefix_metadata(

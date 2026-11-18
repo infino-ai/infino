@@ -374,6 +374,7 @@ impl CloseOut {
             span.record("sql_page_bytes", stats.sql_page_bytes);
             span.record("planned_read_ranges", stats.planned_read_ranges);
             span.record("rows_materialized", stats.rows_materialized);
+            span.record("tables_read", stats.tables_read);
             span.record("kernel_cpu_ns", stats.kernel_cpu_ns);
             span.record("fts_postings_bytes", stats.fts_postings_bytes);
             span.record("tier_bytes", stats.tier_bytes);

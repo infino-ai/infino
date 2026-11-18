@@ -53,7 +53,13 @@
 //! output and never reaches a caller — a `SELECT`, `GROUP BY` key, or
 //! `MIN`/`MAX` over a string column always comes back `LargeUtf8`.
 
-use std::{collections::HashSet, future::Future, sync::Arc, time::Instant};
+use std::{
+    collections::{HashMap, HashSet},
+    future::Future,
+    mem,
+    sync::{Arc, Mutex, OnceLock, PoisonError, Weak},
+    time::Instant,
+};
 
 use arrow::{
     compute::{cast, concat_batches},
@@ -62,15 +68,25 @@ use arrow::{
 use arrow_array::{Array, Decimal128Array, Int64Array, new_empty_array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::{
-    common::{Column, DFSchema, ScalarValue, runtime::SpawnedTask, tree_node::TreeNode},
+    catalog::{CatalogProviderList, MemoryCatalogProviderList},
+    common::{
+        Column, DFSchema, ScalarValue,
+        runtime::SpawnedTask,
+        tree_node::{Transformed, TreeNode, TreeNodeRecursion},
+    },
     dataframe::DataFrame,
-    datasource::DefaultTableSource,
+    datasource::{DefaultTableSource, provider_as_source},
     error::DataFusionError,
-    execution::{TaskContext, context::SessionContext},
+    execution::{
+        SessionStateDefaults, TaskContext,
+        context::{SessionContext, SessionState},
+        object_store::ObjectStoreUrl,
+        runtime_env::RuntimeEnv,
+    },
     functions_aggregate::{count::count_all, expr_fn::count},
     logical_expr::{
-        Expr, ExprFunctionExt, LogicalPlan, lit, simplify::SimplifyContext,
-        utils::split_conjunction,
+        Expr, ExprFunctionExt, LogicalPlan, LogicalTableSource, TableScan, lit,
+        simplify::SimplifyContext, utils::split_conjunction,
     },
     optimizer::simplify_expressions::ExprSimplifier,
 };
@@ -81,7 +97,7 @@ use uuid::Uuid;
 use crate::utils::trace::OpOrigin;
 use crate::{
     InfinoError,
-    memory::{ConnectionMemoryBudget, budgeted_session_context},
+    memory::{ConnectionMemoryBudget, Reclaim, Reservation, SqlSpill, budgeted_session_context},
     runtime_metrics::op_stats::{self, OpStatsCollector},
     supertable::{
         error::QueryError,
@@ -100,6 +116,7 @@ use crate::{
             },
             provider::{SupertableProvider, TABLE_NAME, view_string_schema},
             range_top_k::RangeTopK,
+            scalar_cache::ByteLru,
         },
         reader_cache::disk::ForegroundQueryGuard,
         schema::sql_schema,
@@ -205,49 +222,369 @@ pub(crate) fn conform_value_counts(
 /// Maximum distinct scalar SQL statements cached per manifest snapshot.
 const SQL_LOGICAL_PLAN_CACHE_ENTRIES: usize = 64;
 
-/// Cache only plans whose table scans all use [`SupertableProvider`].
+/// Cache only plans that scan at least one table and whose table scans,
+/// subqueries' included, all use [`SupertableProvider`].
 ///
 /// Search TVF providers hold a live reader in their logical plan. Caching
 /// those plans on `SupertableInner` would create a reference cycle; scalar
 /// providers own only the pinned manifest and storage/cache handles.
 fn cacheable_scalar_plan(plan: &LogicalPlan) -> bool {
-    fn visit(plan: &LogicalPlan, found_scan: &mut bool) -> bool {
-        if let LogicalPlan::TableScan(scan) = plan {
-            let Some(source) = scan.source.downcast_ref::<DefaultTableSource>() else {
-                return false;
-            };
-            if source
-                .table_provider
-                .downcast_ref::<SupertableProvider>()
-                .is_none()
-            {
-                return false;
+    let mut catalog_tables_only = true;
+    let mut found_scan = false;
+    let walked = plan.apply_with_subqueries(|node| {
+        if let LogicalPlan::TableScan(scan) = node {
+            found_scan = true;
+            let catalog_table = scan
+                .source
+                .downcast_ref::<DefaultTableSource>()
+                .is_some_and(|s| {
+                    s.table_provider
+                        .downcast_ref::<SupertableProvider>()
+                        .is_some()
+                });
+            if !catalog_table {
+                catalog_tables_only = false;
+                return Ok(TreeNodeRecursion::Stop);
             }
-            *found_scan = true;
         }
-        plan.inputs()
-            .into_iter()
-            .all(|input| visit(input, found_scan))
+        Ok(TreeNodeRecursion::Continue)
+    });
+    walked.is_ok() && catalog_tables_only && found_scan
+}
+
+/// Most bytes a connection's kept statements hold together, when its memory
+/// budget has room for them; past it the least recently run go first.
+const STATEMENT_PLANS_BYTES: usize = 16 * 1024 * 1024;
+
+/// Most bytes one kept statement may hold: a statement past it, a long `IN`
+/// list say, is parsed again each time it runs rather than kept.
+pub(crate) const STATEMENT_PLAN_MAX_BYTES: usize = 1024 * 1024;
+
+/// The share of the connection's memory budget, in percent, past which no
+/// statement is kept: a kept plan only saves parsing, so it never takes the
+/// room a query needs.
+const STATEMENT_PLANS_BUDGET_SHARE_PERCENT: usize = 10;
+
+/// What a kept statement's parse found about its tables, for a later run to
+/// register them as the parse would have: the catalog tables it names,
+/// whether running it reads their data, and whether it can use their column
+/// statistics.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct KeptTables {
+    pub(crate) names: Vec<String>,
+    pub(crate) reads_data: bool,
+    pub(crate) statistics: bool,
+}
+
+/// A kept statement: what its parse found about its tables, its parsed
+/// plan, and the bytes it holds against the connection's budget, given back
+/// when it is dropped.
+struct KeptStatement {
+    tables: KeptTables,
+    plan: LogicalPlan,
+    _reservation: Reservation,
+}
+
+/// A connection's parsed statements, by their text: the logical plan a
+/// statement parses to, before any optimization, and the catalog tables it
+/// names. Parsing and building that plan is a fifth of a small statement's
+/// planning; the optimizer and the physical planner still run for every
+/// statement, on its own snapshot of each table.
+///
+/// A plan is kept only when every table it scans, its subqueries' included,
+/// is a catalog table ([`cacheable_scalar_plan`]'s rule): a search function's
+/// relation holds a live reader. A kept plan scans a placeholder carrying
+/// only the table's schema, so it pins no snapshot; [`Self::bind`] puts the
+/// statement's own tables back.
+///
+/// Bounded by bytes ([`statement_bytes`]): at most
+/// [`STATEMENT_PLANS_BYTES`] together, the least recently run statement
+/// dropped first to make room, and no statement past
+/// [`STATEMENT_PLAN_MAX_BYTES`]. Each kept statement's bytes are reserved
+/// against the connection's memory budget, within
+/// [`STATEMENT_PLANS_BUDGET_SHARE_PERCENT`] of it, and every kept statement
+/// is given back when the budget needs room for something else.
+pub(crate) struct StatementPlans {
+    budget: Arc<ConnectionMemoryBudget>,
+    plans: ByteLru<String, Arc<KeptStatement>>,
+}
+
+impl StatementPlans {
+    /// An empty cache charging `budget`, registered to give its plans back
+    /// when the budget needs the room.
+    pub(crate) fn new(budget: &Arc<ConnectionMemoryBudget>) -> Arc<Self> {
+        Self::with_max_bytes(budget, STATEMENT_PLANS_BYTES)
     }
 
-    let mut found_scan = false;
-    visit(plan, &mut found_scan) && found_scan
+    /// [`Self::new`], holding at most `max_bytes` of statements together.
+    pub(crate) fn with_max_bytes(
+        budget: &Arc<ConnectionMemoryBudget>,
+        max_bytes: usize,
+    ) -> Arc<Self> {
+        let plans = Arc::new(Self {
+            budget: Arc::clone(budget),
+            plans: ByteLru::new(max_bytes),
+        });
+        let holder: Weak<Self> = Arc::downgrade(&plans);
+        budget.register_reclaim(holder);
+        plans
+    }
+
+    /// What `sql`'s parse found about its tables, and its parsed plan, when
+    /// kept.
+    pub(crate) fn get(&self, sql: &str) -> Option<(KeptTables, LogicalPlan)> {
+        let kept = self.plans.get(&sql.to_owned())?;
+        Some((kept.tables.clone(), kept.plan.clone()))
+    }
+
+    /// Keep `plan`, what `sql` parses to, with what the parse found about
+    /// its `tables`, when every table it scans is a catalog table, it holds
+    /// no more than [`STATEMENT_PLAN_MAX_BYTES`], and the connection's budget
+    /// has room.
+    pub(crate) fn keep(&self, sql: &str, tables: KeptTables, plan: &LogicalPlan) {
+        if !cacheable_scalar_plan(plan) {
+            return;
+        }
+        let bytes = statement_bytes(sql, &tables.names, plan);
+        if bytes > STATEMENT_PLAN_MAX_BYTES {
+            return;
+        }
+        let Ok(stripped) = plan
+            .clone()
+            .transform_up_with_subqueries(|node| match node {
+                LogicalPlan::TableScan(scan) => {
+                    let source = Arc::new(LogicalTableSource::new(scan.source.schema()));
+                    Ok(Transformed::yes(LogicalPlan::TableScan(TableScan {
+                        source,
+                        ..scan
+                    })))
+                }
+                other => Ok(Transformed::no(other)),
+            })
+        else {
+            return;
+        };
+        let Some(reservation) = self
+            .budget
+            .try_reserve_within_share(bytes, STATEMENT_PLANS_BUDGET_SHARE_PERCENT)
+        else {
+            return;
+        };
+        let kept = KeptStatement {
+            tables,
+            plan: stripped.data,
+            _reservation: reservation,
+        };
+        self.plans.insert(sql.to_owned(), Arc::new(kept), bytes);
+    }
+
+    /// How many statements are kept.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.plans.len()
+    }
+
+    /// The bytes the kept statements hold against the budget.
+    #[cfg(test)]
+    pub(crate) fn bytes(&self) -> usize {
+        self.plans.bytes()
+    }
+
+    /// `plan`, a kept one, scanning the tables registered in `ctx` in place of
+    /// its placeholders, or `None` when a table is missing from `ctx` or its
+    /// schema is no longer the one the plan was parsed against: the
+    /// statement is then parsed again.
+    pub(crate) async fn bind(
+        plan: LogicalPlan,
+        ctx: &SessionContext,
+    ) -> Result<Option<LogicalPlan>, DataFusionError> {
+        let mut names = Vec::new();
+        plan.apply_with_subqueries(|node| {
+            if let LogicalPlan::TableScan(scan) = node {
+                names.push(scan.table_name.clone());
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+        let mut tables = HashMap::new();
+        for name in names {
+            if tables.contains_key(&name) {
+                continue;
+            }
+            let Ok(provider) = ctx.table_provider(name.clone()).await else {
+                return Ok(None);
+            };
+            tables.insert(name, provider);
+        }
+        let mut stale = false;
+        let bound = plan.transform_up_with_subqueries(|node| match node {
+            LogicalPlan::TableScan(scan) => {
+                let provider = &tables[&scan.table_name];
+                if provider.schema() != scan.source.schema() {
+                    stale = true;
+                    return Ok(Transformed::no(LogicalPlan::TableScan(scan)));
+                }
+                let source = provider_as_source(Arc::clone(provider));
+                Ok(Transformed::yes(LogicalPlan::TableScan(TableScan {
+                    source,
+                    ..scan
+                })))
+            }
+            other => Ok(Transformed::no(other)),
+        })?;
+        Ok((!stale).then_some(bound.data))
+    }
+}
+
+impl Reclaim for StatementPlans {
+    /// Drop every kept statement: each is parsed again the next time it runs.
+    fn reclaim(&self) {
+        self.plans.clear();
+    }
+}
+
+/// About the heap a kept statement holds: its text and table names, and for
+/// each node of its plan, subqueries' included, the node, its output
+/// schema's fields and its expressions, a literal with its own heap (a long
+/// string, a list). A schema a node shares with its input is counted again,
+/// so this errs high.
+pub(crate) fn statement_bytes(sql: &str, tables: &[String], plan: &LogicalPlan) -> usize {
+    let mut bytes = sql.len()
+        + tables
+            .iter()
+            .map(|t| size_of::<String>() + t.len())
+            .sum::<usize>();
+    let _ = plan.apply_with_subqueries(|node| {
+        bytes += size_of::<LogicalPlan>();
+        bytes += node
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| size_of::<Field>() + f.name().len())
+            .sum::<usize>();
+        node.apply_expressions(|expr| {
+            expr.apply(|e| {
+                bytes += size_of::<Expr>();
+                if let Expr::Literal(value, _) = e {
+                    bytes += value.size().saturating_sub(size_of::<ScalarValue>());
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })
+        })
+    });
+    bytes
 }
 
 /// The SQL context every entry point plans in: DataFusion's memory gated on `budget`, plus the
 /// covered-aggregate rewrite, which answers covered aggregates from manifest statistics and scans
 /// only the boundary segments. One constructor, so a query plans the same way whichever API
-/// (`Connection::query_sql` or a reader's) it arrives through.
+/// (`Connection::query_sql` or a reader's) it arrives through. Its operators spill through
+/// `spill` when the connection has a disk cache folder.
 pub(crate) fn sql_session_context(
     budget: &Arc<ConnectionMemoryBudget>,
+    spill: Option<&SqlSpill>,
 ) -> Result<SessionContext, DataFusionError> {
-    let ctx = budgeted_session_context(budget)?;
+    let ctx = budgeted_session_context(budget, spill)?;
     // Appended after the built-in rules, so they see pushed-down, normalized
     // plans: a `LIMIT` already folded into its sort as the fetch.
     ctx.add_optimizer_rule(Arc::new(CoveredAggregateRewrite::default()));
     ctx.add_optimizer_rule(Arc::new(RangeTopK));
     ctx.add_optimizer_rule(Arc::new(MatchTopK));
     Ok(ctx)
+}
+
+/// [`sql_session_context`] built once and handed out as a copy per
+/// context: its configuration, its optimizer rules and DataFusion's
+/// function library are the same for every statement on a connection, so
+/// copying them skips rebuilding that setup for each statement. Each copy
+/// gets a catalog list of its own, so the tables and table functions one
+/// context registers are never seen by another.
+///
+/// The one way a SQL session is set up: a connection keeps one for its
+/// statements, and a table handle one for its readers' contexts (see
+/// [`SupertableReader::sql_session_context`]).
+#[derive(Default)]
+pub(crate) struct SessionTemplate(OnceLock<SessionState>);
+
+impl SessionTemplate {
+    /// A context for one statement, as [`sql_session_context`] builds it,
+    /// with an empty catalog of its own. `budget` and `spill` are the same
+    /// on every call to one template (its connection's, or its table's), so
+    /// the first call's build serves them all.
+    pub(crate) fn context(
+        &self,
+        budget: &Arc<ConnectionMemoryBudget>,
+        spill: Option<&SqlSpill>,
+    ) -> Result<SessionContext, DataFusionError> {
+        let template = match self.0.get() {
+            Some(template) => template,
+            None => {
+                let built = sql_session_context(budget, spill)?.state();
+                self.0.get_or_init(|| built)
+            }
+        };
+        // A copy of the template shares its catalog list: a fresh list, with
+        // the default catalog and schema the template was built with.
+        let mut state = template.clone();
+        let catalogs = MemoryCatalogProviderList::new();
+        let default_catalog = SessionStateDefaults::default_catalog(
+            state.config(),
+            state.table_factories(),
+            state.runtime_env(),
+        );
+        catalogs.register_catalog(
+            state.config().options().catalog.default_catalog.clone(),
+            Arc::new(default_catalog),
+        );
+        state.register_catalog_list(Arc::new(catalogs));
+        // It shares the template's runtime too, whose object-store registry
+        // keeps what a scan registers until it is removed.
+        let stores = StatementStores {
+            runtime: Arc::clone(state.runtime_env()),
+            urls: Mutex::default(),
+        };
+        state.config_mut().set_extension(Arc::new(stores));
+        Ok(SessionContext::new_with_state(state))
+    }
+
+    /// The session this template has built, if a context has been asked of it.
+    #[cfg(test)]
+    pub(crate) fn built(&self) -> Option<&SessionState> {
+        self.0.get()
+    }
+}
+
+/// The object stores one context's scans registered in the runtime it shares
+/// with every other copy of its [`SessionTemplate`], removed from it when the
+/// context's last session handle is dropped. A connection's statement drops
+/// its context when it returns, fails or is cancelled, and after a planning
+/// task it abandoned has stopped; a reader's cached context is dropped once
+/// a newer snapshot replaces it and the statements using it are done. Scans
+/// register under URLs unique to their provider, so removing them touches no
+/// other context's.
+pub(crate) struct StatementStores {
+    runtime: Arc<RuntimeEnv>,
+    urls: Mutex<HashSet<ObjectStoreUrl>>,
+}
+
+impl StatementStores {
+    /// Note that a scan of this statement registered `url`.
+    pub(crate) fn record(&self, url: &ObjectStoreUrl) {
+        self.urls
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(url.clone());
+    }
+}
+
+impl Drop for StatementStores {
+    fn drop(&mut self) {
+        let urls = self.urls.get_mut().unwrap_or_else(PoisonError::into_inner);
+        for url in urls.drain() {
+            // Every recorded URL was registered and only this removes it, so
+            // the store is always there to remove; the store is what drops.
+            drop(self.runtime.deregister_object_store(url.as_ref()));
+        }
+    }
 }
 
 impl SupertableReader {
@@ -267,17 +604,23 @@ impl SupertableReader {
             .sql_logical_plan_cache()
             .lock()
             .expect("sql logical-plan cache mutex poisoned");
+        // Plans hold their table's provider, so replaced ones are dropped after the lock, as in
+        // `sql_session_context`.
+        let mut replaced = None;
         if guard
             .as_ref()
             .is_none_or(|(manifest, _)| !Arc::ptr_eq(manifest, self.manifest()))
         {
-            *guard = Some((Arc::clone(self.manifest()), Default::default()));
+            replaced = guard.replace((Arc::clone(self.manifest()), Default::default()));
         }
         let (_, plans) = guard.as_mut().expect("cache initialized above");
+        let mut cleared = None;
         if plans.len() >= SQL_LOGICAL_PLAN_CACHE_ENTRIES && !plans.contains_key(&sql) {
-            plans.clear();
+            cleared = Some(mem::take(plans));
         }
-        plans.insert(sql, plan);
+        let same_text = plans.insert(sql, plan);
+        drop(guard);
+        drop((replaced, cleared, same_text));
     }
 
     /// Run a SQL query against this reader's pinned snapshot.
@@ -623,7 +966,11 @@ impl SupertableReader {
         }
 
         let ctx = op_stats::suppressed(|| self.build_session_context(reader))?;
-        *guard = Some((Arc::clone(&manifest), ctx.clone()));
+        let replaced = guard.replace((Arc::clone(&manifest), ctx.clone()));
+        // Dropped after the lock: the last holder of the old session's files lets the cache drop
+        // them, which must not run under this table's session lock.
+        drop(guard);
+        drop(replaced);
         Ok(ctx)
     }
 
@@ -657,10 +1004,18 @@ impl SupertableReader {
         let schemas = self.sql_schemas();
         let provider = reader.sql_provider();
 
-        // Gate SQL heap on the connection budget (shared across contexts, so
-        // this reader's SQL counts against the same ceiling as the rest).
-        // A session built from our own budget config failing is ours.
-        let ctx = sql_session_context(&self.options().connection_memory_budget)
+        // A copy of the table's session template, which gates SQL heap on
+        // the connection budget (shared across contexts, so this reader's SQL
+        // counts against the same ceiling as the rest) and spills through the
+        // connection's spill folder when it has one. A session built from our
+        // own budget config failing is ours.
+        let options = self.options();
+        let ctx = self
+            .sql_session_template()
+            .context(
+                &options.connection_memory_budget,
+                options.sql_spill.as_deref(),
+            )
             .map_err(QueryError::internal)?;
         // Registering the table we just built is ours to get right.
         ctx.register_table(TABLE_NAME, Arc::new(provider))
@@ -687,8 +1042,13 @@ impl SupertableReader {
         collector: Option<Arc<OpStatsCollector>>,
         statement: impl Future<Output = Result<T, QueryError>> + Send + 'static,
     ) -> Result<T, QueryError> {
-        self.block_on(run_within_process_limit(collector, statement))
-            .map_err(QueryError::DataFusion)?
+        let result = self.block_on(run_within_process_limit(collector, statement));
+        // A statement on the table's cached context leaves its files held by that context, so no
+        // provider drops at its end to start the cache's pass: it starts here, refused or not.
+        if let Some(cache) = self.manifest().options.disk_cache.as_ref() {
+            cache.heap_budget().release_over_budget();
+        }
+        result.map_err(QueryError::DataFusion)?
     }
 
     /// Plan one DataFrame, then run it through the shared
@@ -1499,6 +1859,12 @@ mod tests {
         reader
             .query_sql("SELECT _id FROM bm25_search('title', 'searchable', 10)")
             .expect("search TVF query");
+        reader
+            .query_sql(
+                "SELECT COUNT(*) FROM supertable \
+                 WHERE _id IN (SELECT _id FROM bm25_search('title', 'searchable', 10))",
+            )
+            .expect("search TVF subquery");
         let guard = reader
             .sql_logical_plan_cache()
             .lock()
@@ -1507,7 +1873,7 @@ mod tests {
         assert_eq!(
             plans.len(),
             1,
-            "search TVF plans hold readers and must not enter the inner cache"
+            "search TVF plans, in a subquery too, hold readers and must not enter the inner cache"
         );
     }
 

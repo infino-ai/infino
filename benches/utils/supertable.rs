@@ -2388,12 +2388,12 @@ pub mod fts {
                     meter.provider(),
                     cache,
                 );
-                let consumer = tiers::open_consumer(opts);
-                // Consumer first: it must shut down before the cache dir's
-                // removal starts — see `RetryingTempDir`.
-                (consumer, tiers::RetryingTempDir::from(cache_dir))
+                SettledColdConsumer {
+                    consumer: tiers::open_consumer(opts),
+                    _cache_dir: tiers::RetryingTempDir::from(cache_dir),
+                }
             },
-            |(consumer, _cache)| {
+            |SettledColdConsumer { consumer, .. }| {
                 let terms = query.terms.join(" ");
                 let mode = exec_fts::to_infino_mode(query.mode);
                 let _ = consumer
@@ -2408,7 +2408,7 @@ pub mod fts {
                     )
                     .expect("metered cold bm25_search");
             },
-            |(consumer, _cache), i| {
+            |SettledColdConsumer { consumer, .. }, i| {
                 let q = steady[i % steady.len()];
                 let terms = q.terms.join(" ");
                 let mode = exec_fts::to_infino_mode(q.mode);
@@ -2425,7 +2425,7 @@ pub mod fts {
                     .expect("metered steady cold bm25_search");
             },
             steady.len().min(STEADY_COLD_SAMPLES),
-            |(consumer, _cache)| {
+            |SettledColdConsumer { consumer, .. }| {
                 let terms = query.terms.join(" ");
                 let mode = exec_fts::to_infino_mode(query.mode);
                 let _ = consumer
@@ -2443,6 +2443,28 @@ pub mod fts {
         );
         log_cold_split("supertable_fts", &measured.split);
         Some(measured)
+    }
+
+    /// The metered cold consumer. Its reads leave background downloads running, and the run
+    /// deletes the table's prefix soon after this measurement ends, so dropping it first waits
+    /// for those downloads: otherwise they find their files deleted under them. The wait runs
+    /// after the measurement's last meter snapshot, so it changes no measured number.
+    struct SettledColdConsumer {
+        // Declared before the cache dir so the consumer (and its disk
+        // cache) shuts down before removal starts — see `RetryingTempDir`.
+        consumer: Supertable,
+        _cache_dir: tiers::RetryingTempDir,
+    }
+
+    impl Drop for SettledColdConsumer {
+        fn drop(&mut self) {
+            if std::thread::panicking() {
+                return;
+            }
+            self.consumer
+                .wait_until_warm(super::ROUTING_SETTLE_TIMEOUT)
+                .expect("metered cold consumer: background downloads settle");
+        }
     }
 
     /// Cold-tier guard: fresh disk cache + consumer only. Same open
@@ -2575,13 +2597,19 @@ pub mod vector {
     // at 20 queries.
     const N_CORRECTNESS_QUERIES: usize = 100;
     const N_CALIBRATION_QUERIES: usize = 100;
-    /// Steady-state cache-budget multiple of the user index for the shared
-    /// vector consumer. The hidden per-cell IVF index is a second on-storage
-    /// copy of the vector payload, written by the drain *after* this consumer
-    /// opens — sizing from the user index alone leaves the cache ~2× under
-    /// budget post-drain, and the resulting evictions re-fetch on every query
-    /// (measured 62 GET/query on a supposedly warm consumer at 100K).
-    const SHARED_CONSUMER_CACHE_INDEX_FACTOR: u64 = 2;
+    /// Cache-budget multiple of the user index for the shared vector
+    /// consumer, which also drains. The budget holds the user index and the
+    /// hidden per-cell IVF index, a second on-storage copy of the vector
+    /// payload written by the drain *after* this consumer opens, and a
+    /// drain's temp files count against it too: they may take half of it,
+    /// and a drain needs its spill and as much again for the cells it
+    /// builds. With that room the whole table drains as one drain, so each
+    /// cell lands in one file and a cold probe of a cell is one GET. A
+    /// smaller budget drains in several, each leaving a file per cell until
+    /// compaction merges them, and one sized from the user index alone
+    /// evicts and re-fetches on every query (measured 62 GET/query on a
+    /// supposedly warm consumer at 100K).
+    const SHARED_CONSUMER_CACHE_INDEX_FACTOR: u64 = 6;
     // The default rows never override engine settings: they run
     // `VectorSearchOptions::default()` via the `ENGINE_DEFAULT` sentinel, so
     // the recorded numbers always measure shipped routing defaults.
@@ -4665,8 +4693,8 @@ pub mod vector {
                 // an undersized or unwarmed cache turns "warm p50" into
                 // silent object-store round-trips (measured: 196-330
                 // ms/query on the old second-table shape, whose cache was
-                // auto-sized before the drain added the hidden index it
-                // then queried). This window cannot promise 0 in total:
+                // sized before the drain added the hidden index it then
+                // queried). This window cannot promise 0 in total:
                 // it deliberately includes the per-query predicate
                 // resolution a caller pays, and the engine serves that
                 // with per-query posting reads today (the measured
