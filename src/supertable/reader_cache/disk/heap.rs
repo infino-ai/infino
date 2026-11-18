@@ -29,8 +29,8 @@ use std::{
 use tracing::debug;
 
 use crate::{
-    memory::process_limit,
-    runtime_metrics::rss::{status_anon_rss_bytes, total_memory_bytes},
+    memory::{process_limit, recent_anon_rss_bytes},
+    runtime_metrics::rss::total_memory_bytes,
     superfile::SuperfileReader,
     supertable::{manifest::SuperfileUri, reader_cache::disk::DiskCacheStore},
 };
@@ -262,7 +262,8 @@ impl HeapBudget {
     }
 
     /// Whether the process is short of memory for cached metadata: anonymous resident memory
-    /// above the limit minus the budget. With room to spare, keep what is decoded, as before.
+    /// ([`recent_anon_rss_bytes`]) above the limit minus the budget. With room to spare, what is
+    /// decoded stays.
     pub(crate) fn short_of_memory(&self) -> bool {
         #[cfg(test)]
         if self.fixed.is_some() {
@@ -271,7 +272,7 @@ impl HeapBudget {
         memory_limit()
             .zip(self.budget())
             .is_some_and(|(limit, budget)| {
-                leaves_too_little_room(status_anon_rss_bytes(), limit, budget)
+                leaves_too_little_room(recent_anon_rss_bytes(), limit, budget)
             })
     }
 
