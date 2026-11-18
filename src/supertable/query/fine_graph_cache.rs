@@ -9,10 +9,11 @@
 //! removes some, but most clusters survive from one drain to the next.
 //! Superfiles never change, so a fine centroid is fully named by its
 //! superfile, cell and position in the cell, and the centroid behind that key
-//! never moves. The cached graph is updated by dropping the nodes whose keys
-//! are gone ([`Hnsw::remove_nodes`]) and inserting the new keys in key order
-//! ([`Hnsw::extend_serial`]), so the work grows with what changed rather than
-//! with the table.
+//! never moves. The cached graph is updated by turning the nodes whose keys
+//! are gone into holes ([`Hnsw::unlink_nodes`]) and appending the new keys in
+//! key order ([`Hnsw::extend_serial`]), so the work grows with what changed
+//! rather than with the table, and a centroid keeps its node id from one
+//! generation to the next until the graph is rebuilt.
 //!
 //! The cache lives in the process rather than on a table handle because a
 //! long-running process may open a new connection for each drain. An entry is
@@ -68,12 +69,13 @@ struct CachedGraph {
     column: FieldId,
     dim: usize,
     metric: Metric,
-    /// `keys[node]` is the centroid behind graph node `node`.
-    keys: Vec<FineNodeKey>,
+    /// `keys[node]` is the centroid behind graph node `node`; `None` for a
+    /// hole.
+    keys: Vec<Option<FineNodeKey>>,
     superfiles: HashSet<Uuid>,
     graph: Hnsw,
-    /// Nodes removed plus nodes added over the updates since the last full
-    /// build.
+    /// Nodes removed (holes) plus nodes added over the updates since the
+    /// last full build.
     changed_since_build: usize,
 }
 
@@ -117,12 +119,13 @@ pub(crate) enum GraphSource {
 /// The `role` graph over `keys`, which must be sorted and distinct. A cached
 /// graph of the same role and table column is updated while few enough of its
 /// nodes have changed since its last full build; otherwise the graph is built
-/// over every key. Returns the
-/// graph, its scorer, `order` (`order[node]` is the index into `keys` of graph
-/// node `node`) and how the graph was produced. `make_scorer` receives `order`
-/// and must score the centroids of `keys` in that order. `parallel` inserts
-/// over the rayon pool; serial gives the same graph for the same inputs. The
-/// result is cached for the next call.
+/// over every key. Returns the graph, its scorer, `order` (`order[node]` is
+/// the index into `keys` of graph node `node`, or `None` for a hole) and how
+/// the graph was produced. `make_scorer` receives `order` and must score the
+/// centroids of `keys` in that order, with any vector of the right dimension
+/// in a hole's place (a hole is never scored). `parallel` inserts over the
+/// rayon pool; serial gives the same graph for the same inputs. The result is
+/// cached for the next call.
 pub(crate) fn cached_graph<S, F>(
     role: GraphRole,
     column: FieldId,
@@ -131,10 +134,10 @@ pub(crate) fn cached_graph<S, F>(
     keys: &[FineNodeKey],
     parallel: bool,
     make_scorer: F,
-) -> (Hnsw, S, Vec<usize>, GraphSource)
+) -> (Hnsw, S, Vec<Option<usize>>, GraphSource)
 where
     S: NodeScorer + Sync,
-    F: FnOnce(&[usize]) -> S,
+    F: FnOnce(&[Option<usize>]) -> S,
 {
     debug_assert!(
         keys.windows(2).all(|w| w[0] < w[1]),
@@ -144,10 +147,11 @@ where
     let (graph, scorer, order, source, changed_since_build) =
         match take_cached(role, column, dim, metric, keys) {
             Some(cached) => match update_plan(&cached.keys, cached.changed_since_build, keys) {
-                Some((keep, order, removed, added)) => {
+                Some((gone, order, added)) => {
                     let scorer = make_scorer(&order);
+                    let removed = gone.len();
                     let changed = cached.changed_since_build + removed + added;
-                    let kept = cached.graph.remove_nodes(&keep, &scorer);
+                    let kept = cached.graph.unlink_nodes(&gone, &scorer);
                     let graph = if parallel {
                         kept.extend(&scorer, params)
                     } else {
@@ -170,7 +174,7 @@ where
         column,
         dim,
         metric,
-        keys: order.iter().map(|&i| keys[i]).collect(),
+        keys: order.iter().map(|i| i.map(|i| keys[i])).collect(),
         superfiles: keys.iter().map(|k| k.0).collect(),
         graph: graph.clone(),
         changed_since_build,
@@ -183,12 +187,12 @@ fn build<S, F>(
     params: HnswParams,
     parallel: bool,
     make_scorer: F,
-) -> (Hnsw, S, Vec<usize>, GraphSource, usize)
+) -> (Hnsw, S, Vec<Option<usize>>, GraphSource, usize)
 where
     S: NodeScorer + Sync,
-    F: FnOnce(&[usize]) -> S,
+    F: FnOnce(&[Option<usize>]) -> S,
 {
-    let order: Vec<usize> = (0..keys.len()).collect();
+    let order: Vec<Option<usize>> = (0..keys.len()).map(Some).collect();
     let scorer = make_scorer(&order);
     let graph = if parallel {
         Hnsw::build(&scorer, params)
@@ -198,38 +202,42 @@ where
     (graph, scorer, order, GraphSource::Built, 0)
 }
 
-/// How to turn a graph over `cached` into one over `keys`: which cached nodes
-/// to keep, the new node order (survivors in their cached order, then the new
-/// keys in key order), and the removed and added counts. `None` when this
-/// update together with the `changed_before` nodes of earlier ones would
-/// change too much of the graph to update rather than rebuild.
+/// How to turn a graph over `cached` into one over `keys`: the cached nodes
+/// whose keys are gone (to become holes), the new node order (every cached
+/// slot where it was, holes included, then the new keys in key order), and
+/// the added count. `None` when this update together with the
+/// `changed_before` nodes of earlier ones would change too much of the graph
+/// to update rather than rebuild; a rebuild also clears the holes.
 fn update_plan(
-    cached: &[FineNodeKey],
+    cached: &[Option<FineNodeKey>],
     changed_before: usize,
     keys: &[FineNodeKey],
-) -> Option<(Vec<bool>, Vec<usize>, usize, usize)> {
+) -> Option<(Vec<u32>, Vec<Option<usize>>, usize)> {
     let mut present = vec![false; keys.len()];
-    let mut keep = Vec::with_capacity(cached.len());
-    let mut order = Vec::with_capacity(keys.len());
-    for key in cached {
-        match keys.binary_search(key) {
-            Ok(i) => {
+    let mut gone = Vec::new();
+    let mut order = Vec::with_capacity(cached.len() + keys.len());
+    for (node, key) in cached.iter().enumerate() {
+        match key.map(|key| keys.binary_search(&key)) {
+            Some(Ok(i)) => {
                 present[i] = true;
-                keep.push(true);
-                order.push(i);
+                order.push(Some(i));
             }
-            Err(_) => keep.push(false),
+            Some(Err(_)) => {
+                gone.push(node as u32);
+                order.push(None);
+            }
+            None => order.push(None),
         }
     }
-    let removed = cached.len() - order.len();
-    let survivors = order.len();
-    order.extend((0..keys.len()).filter(|&i| !present[i]));
-    let added = order.len() - survivors;
-    let changed = changed_before + removed + added;
-    if changed as f64 > MAX_CHANGED_SHARE * cached.len().max(keys.len()) as f64 {
+    let slots = order.len();
+    order.extend((0..keys.len()).filter(|&i| !present[i]).map(Some));
+    let added = order.len() - slots;
+    let changed = changed_before + gone.len() + added;
+    let live_before = cached.iter().filter(|key| key.is_some()).count();
+    if changed as f64 > MAX_CHANGED_SHARE * live_before.max(keys.len()) as f64 {
         return None;
     }
-    Some((keep, order, removed, added))
+    Some((gone, order, added))
 }
 
 /// Remove and return the cached `role` graph of this table column, if any.
@@ -303,7 +311,7 @@ mod tests {
     fn graph_over(
         column: FieldId,
         keys: &[FineNodeKey],
-    ) -> (Hnsw, Fp32Scorer, Vec<usize>, GraphSource) {
+    ) -> (Hnsw, Fp32Scorer, Vec<Option<usize>>, GraphSource) {
         cached_graph(
             GraphRole::Placement,
             column,
@@ -312,7 +320,10 @@ mod tests {
             keys,
             false,
             |order| {
-                let ordered: Vec<Vec<f32>> = order.iter().map(|&i| centroid(&keys[i])).collect();
+                let ordered: Vec<Vec<f32>> = order
+                    .iter()
+                    .map(|i| i.map_or_else(|| vec![0.0; DIM], |i| centroid(&keys[i])))
+                    .collect();
                 Fp32Scorer::from_vectors(&ordered, DIM, Metric::L2Sq)
             },
         )
@@ -342,11 +353,49 @@ mod tests {
                 added: 2 * PER_CELL as usize
             }
         );
-        assert_eq!(graph.len(), next.len());
+        // The removed cell's nodes are holes; every key has a live node.
+        assert_eq!(graph.len(), keys.len() + 2 * PER_CELL as usize);
+        assert_eq!(graph.live_len(), next.len());
         // Every node is reachable by its own centroid, the new ones included.
-        for node in (0..order.len()).step_by(17) {
-            let found = graph.search(&scorer, &centroid(&next[order[node]]), 1, 64);
+        for (node, key) in order.iter().enumerate().step_by(17) {
+            let Some(i) = key else {
+                assert!(graph.is_hole(node as u32), "keyless node {node} is live");
+                continue;
+            };
+            let found = graph.search(&scorer, &centroid(&next[*i]), 1, 64);
             assert_eq!(found[0].0, node as u32, "node {node} unreachable");
+        }
+    }
+
+    #[test]
+    fn a_surviving_centroid_keeps_its_node_id() {
+        // A superfile id range no other test uses.
+        let base = 0xF2_0000_0000u128;
+        let column = FieldId(8);
+        let mut keys: Vec<FineNodeKey> = (0..20).flat_map(|c| cell_keys(base, c)).collect();
+        keys.sort();
+        let (_, _, first, _) = graph_over(column, &keys);
+        let id_of = |order: &[Option<usize>], keys: &[FineNodeKey], key: FineNodeKey| {
+            order
+                .iter()
+                .position(|i| i.is_some_and(|i| keys[i] == key))
+                .expect("key has a node")
+        };
+        let mut next: Vec<FineNodeKey> = keys.iter().copied().filter(|k| k.1 != Some(5)).collect();
+        next.extend(cell_keys(base + 1, 0));
+        next.sort();
+        let (_, _, second, source) = graph_over(column, &next);
+        assert!(matches!(source, GraphSource::Updated { .. }));
+        for key in next
+            .iter()
+            .filter(|k| k.0 == Uuid::from_u128(base))
+            .step_by(13)
+        {
+            assert_eq!(
+                id_of(&first, &keys, *key),
+                id_of(&second, &next, *key),
+                "{key:?} moved"
+            );
         }
     }
 
@@ -372,17 +421,19 @@ mod tests {
             key(4, 0, 0),
         ];
         keys.sort();
-        let (keep, order, removed, added) = update_plan(&cached, 0, &keys).expect("small change");
-        assert_eq!(keep, vec![true; 5]);
-        assert_eq!((removed, added), (0, 1));
-        let node_keys: Vec<FineNodeKey> = order.iter().map(|&i| keys[i]).collect();
+        let cached: Vec<Option<FineNodeKey>> = cached.into_iter().map(Some).collect();
+        let (gone, order, added) = update_plan(&cached, 0, &keys).expect("small change");
+        assert!(gone.is_empty());
+        assert_eq!(added, 1);
+        let node_keys: Vec<Option<FineNodeKey>> =
+            order.iter().map(|i| i.map(|i| keys[i])).collect();
         assert_eq!(&node_keys[..5], &cached[..]);
-        assert_eq!(node_keys[5], key(4, 0, 0));
+        assert_eq!(node_keys[5], Some(key(4, 0, 0)));
     }
 
     #[test]
     fn a_graph_that_changed_too_much_since_its_build_is_rebuilt() {
-        let cached: Vec<FineNodeKey> = (0..10).map(|p| key(1, 0, p)).collect();
+        let cached: Vec<Option<FineNodeKey>> = (0..10).map(|p| Some(key(1, 0, p))).collect();
         // Seven of ten survive: 30% removed, over the limit.
         let fewer: Vec<FineNodeKey> = (0..7).map(|p| key(1, 0, p)).collect();
         assert!(update_plan(&cached, 0, &fewer).is_none());
@@ -391,9 +442,9 @@ mod tests {
         assert!(update_plan(&cached, 0, &more).is_none());
         // One removed: an update...
         let one_gone: Vec<FineNodeKey> = (0..9).map(|p| key(1, 0, p)).collect();
-        let (keep, _, removed, added) = update_plan(&cached, 0, &one_gone).expect("update");
-        assert_eq!((removed, added), (1, 0));
-        assert!(!keep[9]);
+        let (gone, order, added) = update_plan(&cached, 0, &one_gone).expect("update");
+        assert_eq!((gone, added), (vec![9], 0));
+        assert_eq!(order[9], None, "the removed key's slot stays, as a hole");
         // ...unless earlier updates already changed two nodes since the build.
         assert!(update_plan(&cached, 2, &one_gone).is_none());
     }

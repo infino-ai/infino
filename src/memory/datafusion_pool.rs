@@ -27,14 +27,21 @@
 //! reserving. Nothing they allocate is gated, however large; the process
 //! memory limit (see `resident`) is what bounds them.
 //!
-//! Spilling needs a disk manager; we use DataFusion's default (OS temp dir).
+//! Spilling needs a disk manager. A connection with a disk cache folder spills
+//! into that folder, within a share of the disk ([`SqlSpill`]); any other uses
+//! DataFusion's default (the OS temp dir).
 //!
 
-use std::{fmt, sync::Arc};
+use std::{
+    fmt,
+    path::{Path, PathBuf},
+    sync::{Arc, OnceLock},
+};
 
 use datafusion::{
     error::{DataFusionError, Result as DfResult},
     execution::{
+        disk_manager::{DEFAULT_MAX_TEMP_DIRECTORY_SIZE, DiskManager, DiskManagerMode},
         memory_pool::{MemoryLimit, MemoryPool, MemoryReservation},
         runtime_env::{RuntimeEnv, RuntimeEnvBuilder},
         session_state::SessionStateBuilder,
@@ -42,17 +49,22 @@ use datafusion::{
     physical_optimizer::optimizer::PhysicalOptimizer,
     prelude::{SessionConfig, SessionContext},
 };
+use tracing::warn;
 
 use crate::{
     memory::ConnectionMemoryBudget,
-    supertable::query::{
-        join_build_size::RightSizeJoinBuild,
-        limit_stage::StageLimitGathers,
-        read_ahead_rule::ReadAheadOff,
-        sorted_root::{KeepSortedRoot, OrderUnderScalarSubquery},
-        topk_row_filter::RowFilterUnderTopK,
-        values_subquery::ValuesSubqueryRewrite,
+    supertable::{
+        query::{
+            join_build_size::RightSizeJoinBuild,
+            limit_stage::StageLimitGathers,
+            read_ahead_rule::ReadAheadOff,
+            sorted_root::{KeepSortedRoot, OrderUnderScalarSubquery},
+            topk_row_filter::RowFilterUnderTopK,
+            values_subquery::ValuesSubqueryRewrite,
+        },
+        reader_cache::RunScratch,
     },
+    utils::disk::disk_space,
 };
 
 /// A DataFusion memory pool over a [`ConnectionMemoryBudget`]: measured never
@@ -74,6 +86,96 @@ const POOL_NAME: &str = "ConnectionBudgetPool";
 /// skipping it and letting the final aggregate hash once is faster. Low-
 /// cardinality groupings, which still dedup below this fraction, keep it.
 const PARTIAL_AGG_SKIP_PROBE_RATIO: f64 = 0.5;
+
+/// Folder, under a connection's disk cache folder, that its SQL spills into.
+/// A table name cannot start with `_`, so it never names a table's cache.
+const SQL_SPILL_SUBDIR: &str = "_sql-spill";
+
+/// Share of the disk holding the cache folder that a connection's SQL may
+/// spill to, in divisor form (`total / this`). The spill is never allowed
+/// more than DataFusion's own default.
+const SQL_SPILL_DISK_SHARE_DIVISOR: u64 = 10;
+
+/// Where a connection's SQL spills when it has a disk cache folder: a folder
+/// of this process's own under it, removed when the connection closes and,
+/// after a crash, by the next connection to open the cache folder. One disk
+/// manager serves every query of the connection, so together they spill at
+/// most [`SQL_SPILL_DISK_SHARE_DIVISOR`]'s share of the disk; a query that
+/// would pass it fails with DataFusion's resources error.
+///
+/// Opened on the first query: a connection that runs no SQL makes no folder.
+pub(crate) struct SqlSpill {
+    root: PathBuf,
+    /// The most bytes the connection's queries spill together; `None` takes
+    /// the disk's share.
+    limit: Option<u64>,
+    opened: OnceLock<Option<OpenSqlSpill>>,
+}
+
+struct OpenSqlSpill {
+    /// Declared first, so its files go before the folder they are in.
+    disk_manager: Arc<DiskManager>,
+    _folder: RunScratch,
+}
+
+impl SqlSpill {
+    /// The SQL spill of a connection whose disk cache folder is `cache_dir`.
+    pub(crate) fn under(cache_dir: &Path) -> Arc<Self> {
+        Arc::new(Self {
+            root: cache_dir.join(SQL_SPILL_SUBDIR),
+            limit: None,
+            opened: OnceLock::new(),
+        })
+    }
+
+    /// [`Self::under`], spilling at most `limit` bytes.
+    #[cfg(test)]
+    fn under_with_limit(cache_dir: &Path, limit: u64) -> Arc<Self> {
+        Arc::new(Self {
+            root: cache_dir.join(SQL_SPILL_SUBDIR),
+            limit: Some(limit),
+            opened: OnceLock::new(),
+        })
+    }
+
+    /// The disk manager queries spill through. `None` when the folder could
+    /// not be made, which leaves DataFusion's default.
+    fn disk_manager(&self) -> Option<Arc<DiskManager>> {
+        self.opened
+            .get_or_init(|| match self.open() {
+                Ok(opened) => Some(opened),
+                Err(error) => {
+                    warn!(
+                        path = %self.root.display(),
+                        %error,
+                        "SQL spill folder not opened; queries spill to the OS temp directory"
+                    );
+                    None
+                }
+            })
+            .as_ref()
+            .map(|opened| Arc::clone(&opened.disk_manager))
+    }
+
+    fn open(&self) -> DfResult<OpenSqlSpill> {
+        let folder = RunScratch::open(&self.root)?;
+        let limit = self.limit.unwrap_or_else(|| {
+            disk_space(&self.root)
+                .map_or(DEFAULT_MAX_TEMP_DIRECTORY_SIZE, |(_, total)| {
+                    total / SQL_SPILL_DISK_SHARE_DIVISOR
+                })
+                .min(DEFAULT_MAX_TEMP_DIRECTORY_SIZE)
+        });
+        let disk_manager = DiskManager::builder()
+            .with_mode(DiskManagerMode::Directories(vec![folder.dir()]))
+            .with_max_temp_directory_size(limit)
+            .build()?;
+        Ok(OpenSqlSpill {
+            disk_manager: Arc::new(disk_manager),
+            _folder: folder,
+        })
+    }
+}
 
 impl fmt::Display for ConnectionBudgetPool {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -118,19 +220,29 @@ impl MemoryPool for ConnectionBudgetPool {
     }
 }
 
-/// A `RuntimeEnv` whose memory pool is `budget`. The default disk manager (OS
-/// temp) gives spillable operators somewhere to spill.
-fn budgeted_runtime(budget: &Arc<ConnectionMemoryBudget>) -> DfResult<Arc<RuntimeEnv>> {
+/// A `RuntimeEnv` whose memory pool is `budget`. Spillable operators spill
+/// through `spill` when the connection has one, else through the default
+/// disk manager (OS temp).
+fn budgeted_runtime(
+    budget: &Arc<ConnectionMemoryBudget>,
+    spill: Option<&SqlSpill>,
+) -> DfResult<Arc<RuntimeEnv>> {
     let pool: Arc<dyn MemoryPool> = Arc::new(ConnectionBudgetPool {
         budget: Arc::clone(budget),
     });
 
-    RuntimeEnvBuilder::new().with_memory_pool(pool).build_arc()
+    let mut runtime = RuntimeEnvBuilder::new().with_memory_pool(pool).build()?;
+    if let Some(disk_manager) = spill.and_then(SqlSpill::disk_manager) {
+        runtime.disk_manager = disk_manager;
+    }
+    Ok(Arc::new(runtime))
 }
 
-/// A `SessionContext` whose SQL allocations are gated by `budget`.
+/// A `SessionContext` whose SQL allocations are gated by `budget` and whose
+/// operators spill through `spill` when the connection has one.
 pub(crate) fn budgeted_session_context(
     budget: &Arc<ConnectionMemoryBudget>,
+    spill: Option<&SqlSpill>,
 ) -> DfResult<SessionContext> {
     let mut config = SessionConfig::new();
     // We scan string columns as `Utf8View` for fast comparisons, but a SQL
@@ -196,7 +308,7 @@ pub(crate) fn budgeted_session_context(
     rules.push(Arc::new(ReadAheadOff));
     let mut builder = SessionStateBuilder::new()
         .with_config(config)
-        .with_runtime_env(budgeted_runtime(budget)?)
+        .with_runtime_env(budgeted_runtime(budget, spill)?)
         .with_default_features()
         // A scalar subquery in a `VALUES` cell would be evaluated while the
         // list is planned, before the subquery has run; this plans such a
@@ -346,12 +458,26 @@ mod tests {
         configured_bytes: u64,
         reservation_bytes: usize,
     ) -> (usize, bool, usize) {
+        sort_through(schema, batches, configured_bytes, reservation_bytes, None)
+            .await
+            .expect("collect")
+    }
+
+    /// [`run_sorted_query`], spilling through `spill`, with the query's
+    /// error handed back.
+    async fn sort_through(
+        schema: &Arc<Schema>,
+        batches: &[RecordBatch],
+        configured_bytes: u64,
+        reservation_bytes: usize,
+        spill: Option<&SqlSpill>,
+    ) -> DfResult<(usize, bool, usize)> {
         let budget = ConnectionMemoryBudget::with_limit(configured_bytes);
 
         // Build through the production runtime + pool wiring (`budgeted_runtime`);
         // only the SessionConfig is tuned here (that's DataFusion's, not our
         // wiring) so the sort spills deterministically.
-        let runtime = budgeted_runtime(&budget).expect("runtime env");
+        let runtime = budgeted_runtime(&budget, spill).expect("runtime env");
         let mut cfg = SessionConfig::new();
         cfg.options_mut().execution.sort_spill_reservation_bytes = reservation_bytes;
         // One partition = one sorter. The default (num_cpus) gives N sorters,
@@ -365,15 +491,183 @@ mod tests {
 
         let df = ctx.sql("SELECT s FROM t ORDER BY s").await.expect("plan");
         let plan = df.create_physical_plan().await.expect("physical plan");
-        let out = collect(Arc::clone(&plan), ctx.task_ctx())
-            .await
-            .expect("collect");
+        let out = collect(Arc::clone(&plan), ctx.task_ctx()).await?;
         let rows: usize = out.iter().map(|b| b.num_rows()).sum();
-        (
+        Ok((
             rows,
             is_sorted(&out),
             total_metric(plan.as_ref(), &MetricsSet::spill_count),
-        )
+        ))
+    }
+
+    /// `rows` rows of one 64-byte string column `s`: an 8-digit key counting
+    /// down, so `ORDER BY` reverses them all, and filler. In batches of
+    /// [`BATCH_ROWS`], so a sort can spill between them.
+    fn descending_key_batches(rows: usize) -> (Arc<Schema>, Vec<RecordBatch>) {
+        let filler = "x".repeat(56);
+        let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, false)]));
+        let batches = (0..rows)
+            .step_by(BATCH_ROWS)
+            .map(|start| {
+                let vals: Vec<String> = (start..(start + BATCH_ROWS).min(rows))
+                    .map(|i| format!("{:08}{filler}", rows - 1 - i))
+                    .collect();
+                RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(StringArray::from(vals))])
+                    .expect("batch")
+            })
+            .collect();
+        (schema, batches)
+    }
+
+    /// A connection with a disk cache folder spills its SQL into a folder
+    /// under it, within a share of the disk, through one disk manager. A
+    /// query that would spill past the limit fails alone, and the folder
+    /// goes with the connection.
+    #[test]
+    fn sql_spills_under_the_cache_folder_within_a_limit() {
+        const ROWS: usize = 512 * 1024;
+        const RESERVATION: usize = 20 * 1024 * 1024;
+        const TIGHT_BUDGET_BYTES: u64 = 32 * 1024 * 1024;
+        const ROOMY_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
+        /// Less than the sort spills.
+        const TINY_SPILL_LIMIT_BYTES: u64 = 1024 * 1024;
+        let cache = tempfile::tempdir().expect("cache folder");
+        let folder = cache.path().join(SQL_SPILL_SUBDIR);
+        let (schema, batches) = descending_key_batches(ROWS);
+        let runtime = Runtime::new().expect("tokio runtime");
+
+        let spill = SqlSpill::under(cache.path());
+        let disk_manager = spill.disk_manager().expect("spill folder");
+        assert!(
+            disk_manager
+                .temp_dir_paths()
+                .iter()
+                .all(|path| path.starts_with(&folder))
+        );
+        let (_, disk_bytes) = disk_space(cache.path()).expect("disk size");
+        let disk_share = disk_bytes / SQL_SPILL_DISK_SHARE_DIVISOR;
+        assert_eq!(
+            disk_manager.max_temp_directory_size(),
+            disk_share.min(DEFAULT_MAX_TEMP_DIRECTORY_SIZE)
+        );
+        assert!(Arc::ptr_eq(
+            &disk_manager,
+            &spill.disk_manager().expect("spill folder")
+        ));
+        let (rows, sorted, spills) = runtime
+            .block_on(sort_through(
+                &schema,
+                &batches,
+                TIGHT_BUDGET_BYTES,
+                RESERVATION,
+                Some(&spill),
+            ))
+            .expect("a sort that spills within the limit");
+        assert_eq!((rows, sorted), (ROWS, true));
+        assert!(spills > 0);
+        drop(disk_manager);
+        drop(spill);
+        assert_eq!(
+            std::fs::read_dir(&folder).expect("spill folder").count(),
+            0,
+            "the connection's folder goes with it"
+        );
+
+        let spill = SqlSpill::under_with_limit(cache.path(), TINY_SPILL_LIMIT_BYTES);
+        let error = runtime
+            .block_on(sort_through(
+                &schema,
+                &batches,
+                TIGHT_BUDGET_BYTES,
+                RESERVATION,
+                Some(&spill),
+            ))
+            .expect_err("a sort that spills past the limit");
+        assert!(
+            matches!(error.find_root(), DataFusionError::ResourcesExhausted(_)),
+            "{error}"
+        );
+        let (rows, sorted, spills) = runtime
+            .block_on(sort_through(
+                &schema,
+                &batches,
+                ROOMY_BUDGET_BYTES,
+                RESERVATION,
+                Some(&spill),
+            ))
+            .expect("the next query runs");
+        assert_eq!((rows, sorted, spills), (ROWS, true, 0));
+    }
+
+    /// A connection's queries share one spill limit: what one query has
+    /// spilled counts against the next, which fails alone with the
+    /// resources error, and runs once the first has let its spill go.
+    #[test]
+    fn a_connections_queries_share_the_spill_limit() {
+        const ROWS: usize = 512 * 1024;
+        const RESERVATION: usize = 20 * 1024 * 1024;
+        const TIGHT_BUDGET_BYTES: u64 = 32 * 1024 * 1024;
+        /// More than the sort spills.
+        const SPILL_LIMIT_BYTES: u64 = 256 * 1024 * 1024;
+        let cache = tempfile::tempdir().expect("cache folder");
+        let (schema, batches) = descending_key_batches(ROWS);
+        let runtime = Runtime::new().expect("tokio runtime");
+        let spill = SqlSpill::under_with_limit(cache.path(), SPILL_LIMIT_BYTES);
+        let sort = || {
+            runtime.block_on(sort_through(
+                &schema,
+                &batches,
+                TIGHT_BUDGET_BYTES,
+                RESERVATION,
+                Some(&spill),
+            ))
+        };
+
+        // What another query of the connection holds on disk mid-sort.
+        let disk_manager = spill.disk_manager().expect("spill folder");
+        let mut held = disk_manager
+            .create_tmp_file("another query's spill")
+            .expect("spill file");
+        std::fs::write(held.path(), vec![0u8; SPILL_LIMIT_BYTES as usize]).expect("fill");
+        held.update_disk_usage().expect("count the spill");
+
+        let error = sort().expect_err("the limit is already spilled");
+        assert!(
+            matches!(error.find_root(), DataFusionError::ResourcesExhausted(_)),
+            "{error}"
+        );
+        drop(held);
+        let (rows, sorted, spills) = sort().expect("room once the other spill is gone");
+        assert_eq!((rows, sorted), (ROWS, true));
+        assert!(spills > 0);
+    }
+
+    /// A connection whose spill folder cannot be made still runs its SQL:
+    /// its queries spill to the OS temp directory, as without a disk cache.
+    #[test]
+    fn sql_still_spills_when_its_folder_cannot_be_made() {
+        const ROWS: usize = 512 * 1024;
+        const RESERVATION: usize = 20 * 1024 * 1024;
+        const TIGHT_BUDGET_BYTES: u64 = 32 * 1024 * 1024;
+        let cache = tempfile::tempdir().expect("cache folder");
+        // A file where the folder would go.
+        std::fs::write(cache.path().join(SQL_SPILL_SUBDIR), b"").expect("blocking file");
+        let (schema, batches) = descending_key_batches(ROWS);
+        let spill = SqlSpill::under(cache.path());
+        assert!(spill.disk_manager().is_none());
+
+        let (rows, sorted, spills) = Runtime::new()
+            .expect("tokio runtime")
+            .block_on(sort_through(
+                &schema,
+                &batches,
+                TIGHT_BUDGET_BYTES,
+                RESERVATION,
+                Some(&spill),
+            ))
+            .expect("the sort spills elsewhere");
+        assert_eq!((rows, sorted), (ROWS, true));
+        assert!(spills > 0);
     }
 
     #[test]
@@ -395,19 +689,7 @@ mod tests {
         //   "00524287xxx..." ... "00000000xxx..."  ->  "00000000..." ... "00524287..."
         // Filler just pads to 64 B (so ~512k rows = ~32 MiB). Many small batches
         // so the sort can spill between them, not one un-splittable input.
-        let filler = "x".repeat(56);
-        let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, false)]));
-        let mut batches = Vec::new();
-        // BATCH_ROWS per batch -> 512 KiB, 64 batches.
-        for start in (0..ROWS).step_by(BATCH_ROWS) {
-            let vals: Vec<String> = (start..(start + BATCH_ROWS).min(ROWS))
-                .map(|i| format!("{:08}{filler}", ROWS - 1 - i))
-                .collect();
-            batches.push(
-                RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(StringArray::from(vals))])
-                    .expect("batch"),
-            );
-        }
+        let (schema, batches) = descending_key_batches(ROWS);
 
         let runtime = Runtime::new().expect("tokio runtime");
         runtime.block_on(async {
@@ -450,7 +732,7 @@ mod tests {
             let mut prev_peak = 0;
             for i in 0..3 {
                 // Fresh ctx per query, all sharing the one budget.
-                let rt = budgeted_runtime(&budget).expect("runtime env");
+                let rt = budgeted_runtime(&budget, None).expect("runtime env");
 
                 let mut cfg = SessionConfig::new();
                 cfg.options_mut().execution.target_partitions = 1;
@@ -527,7 +809,8 @@ mod tests {
                 ]
             })
             .collect();
-        let ctx = budgeted_session_context(&ConnectionMemoryBudget::measured()).expect("session");
+        let ctx =
+            budgeted_session_context(&ConnectionMemoryBudget::measured(), None).expect("session");
         ctx.sql(&format!(
             "SET datafusion.execution.target_partitions = {PARTITIONS}"
         ))
@@ -728,7 +1011,7 @@ mod tests {
         runtime.block_on(async {
             for mode in ["CollectLeft", "Partitioned"] {
                 let budget = ConnectionMemoryBudget::with_limit(CONFIGURED);
-                let with_rule = budgeted_session_context(&budget).expect("session");
+                let with_rule = budgeted_session_context(&budget, None).expect("session");
                 let (out, right_sized, _) = run_join(with_rule, &tables, mode, SQL)
                     .await
                     .unwrap_or_else(|e| panic!("{mode}: fits with the rule: {e}"));
@@ -740,7 +1023,7 @@ mod tests {
                 let gate = budget.limit().expect("a bounded budget");
                 let without_rule = SessionContext::new_with_config_rt(
                     SessionConfig::new(),
-                    budgeted_runtime(&ConnectionMemoryBudget::measured()).expect("runtime"),
+                    budgeted_runtime(&ConnectionMemoryBudget::measured(), None).expect("runtime"),
                 );
                 let (_, _, charged) = run_join(without_rule, &tables, mode, SQL)
                     .await

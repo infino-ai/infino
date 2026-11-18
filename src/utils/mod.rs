@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
 pub(crate) mod bytes;
+pub(crate) mod disk;
 pub(crate) mod join;
 pub(crate) mod nulls;
 pub(crate) mod terms;

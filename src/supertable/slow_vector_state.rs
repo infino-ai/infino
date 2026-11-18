@@ -1732,8 +1732,8 @@ mod tests {
     async fn published_state_is_read_back_from_the_cache() {
         let dir = tempdir().expect("tempdir");
         let storage = LocalFsStorageProvider::new(dir.path().join("store")).expect("storage");
-        let cache =
-            MetadataDiskCache::new(dir.path().join("cache"), CACHE_BUDGET_BYTES).expect("cache");
+        let cache = MetadataDiskCache::new(dir.path().join("cache"), CACHE_BUDGET_BYTES, None)
+            .expect("cache");
         let entries = vec![
             entry_with_summary(FIRST_N_DOCS, 1),
             entry_with_summary(SECOND_N_DOCS, 6),
@@ -1778,8 +1778,8 @@ mod tests {
     async fn fetched_state_is_kept_in_the_cache() {
         let dir = tempdir().expect("tempdir");
         let storage = LocalFsStorageProvider::new(dir.path().join("store")).expect("storage");
-        let cache =
-            MetadataDiskCache::new(dir.path().join("cache"), CACHE_BUDGET_BYTES).expect("cache");
+        let cache = MetadataDiskCache::new(dir.path().join("cache"), CACHE_BUDGET_BYTES, None)
+            .expect("cache");
         let entries = vec![entry_with_summary(FIRST_N_DOCS, 1)];
         let published = write_state(&storage, None, &entries, None)
             .await

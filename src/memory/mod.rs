@@ -126,7 +126,7 @@ use tokio::{
 mod datafusion_pool;
 mod resident;
 
-pub(crate) use datafusion_pool::budgeted_session_context;
+pub(crate) use datafusion_pool::{SqlSpill, budgeted_session_context};
 pub(crate) use resident::{
     over_process_limit, process_limit, process_limit_exceeded, process_over_limit,
 };

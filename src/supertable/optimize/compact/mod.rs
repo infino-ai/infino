@@ -82,11 +82,12 @@ use crate::{
             CommitFence, CommitListMetadata, NewEntryBirthVersions, PreparedSuperfile, ShardOutput,
             backoff_delay, finalize_compaction_commit, maint_pool, orphaned_id_floor,
             pending_drain_sources, persist_list_metadata_async, prepare_superfile_named,
-            recalibrate_probe_laws, refresh_slow_vector_state, scratch_disk_fits, scratch_space,
+            recalibrate_probe_laws, refresh_slow_vector_state, scratch_disk_fits,
             split_overflow_cells, term_head_sink_for, try_commit_attempt, write_superfile_list,
         },
     },
     utils::{
+        disk::disk_space,
         nulls::null_row_bytes,
         trace::{RegionUsage, detail_span, record},
     },
@@ -111,6 +112,20 @@ const MAX_FAILURES_IN_A_ROW: usize = 3;
 /// output file, so at the peak the scratch folder holds the output twice.
 /// Once the output is written the charge shrinks to the output's size.
 const MERGE_TEMP_FILES_PER_OUTPUT_BYTE: u64 = 2;
+
+/// How long a merge about to start waits for room for its temp files in
+/// the table's disk budget before it is skipped for the pass. A merge that
+/// has committed gives its room back as the cache takes its output over,
+/// which is a moment after the commit that lets the next merge start.
+#[cfg(not(test))]
+const MERGE_TEMP_ROOM_WAIT: Duration = Duration::from_secs(30);
+/// [`MERGE_TEMP_ROOM_WAIT`] under test, short so a test of a merge with no
+/// room does not sit out the full wait.
+#[cfg(test)]
+const MERGE_TEMP_ROOM_WAIT: Duration = Duration::from_millis(200);
+
+/// How often a merge waiting for temp-file room looks again.
+const MERGE_TEMP_ROOM_POLL: Duration = Duration::from_millis(20);
 
 /// How long a compaction commit keeps retrying lost races after
 /// `max_commit_retries` is used up. Its merged superfiles are already
@@ -1231,13 +1246,11 @@ impl Supertable {
 
         // A merge the table's disk budget has no room for stops here, before
         // its inputs are sealed, so it leaves nothing to undo.
-        let temp_bytes = job
-            .estimated_output_bytes
-            .saturating_mul(MERGE_TEMP_FILES_PER_OUTPUT_BYTE);
+        let temp_bytes = merge_temp_file_bytes(&job);
         let mut scratch = opts.disk_cache.as_ref().map(|cache| cache.scratch_charge());
         if let Some(charge) = scratch.as_ref()
             && charge.could_hold(temp_bytes)
-            && charge.room() < temp_bytes
+            && !temp_file_room_within(charge, temp_bytes, MERGE_TEMP_ROOM_WAIT).await
         {
             return Err(CompactionError::ScratchFull(format!(
                 "the table's disk budget has room for {} of the {temp_bytes} bytes of temp \
@@ -2008,7 +2021,17 @@ impl Supertable {
                     // so this merge always needs the host's room, judged with
                     // the merges admitted but not yet resident charged for.
                     let host_has_room = charges.room(host_memory());
+                    // On a table with a disk cache the merge's temp files
+                    // need room in its disk budget too, beside those of the
+                    // merges in flight.
+                    let budget_has_room = match (queued.front(), self.inner().options.disk_cache.as_ref()) {
+                        (Some((_, job)), Some(cache)) => {
+                            charges.temp_files_fit(job, cache.scratch_cap())
+                        }
+                        _ => true,
+                    };
                     if host_has_room
+                        && budget_has_room
                         && admits_another_merge(holding, concurrency, queued.len(), true)
                     {
                         self.admit_next_merge(&mut queued, &mut merging, &mut charges, &settings, &mut held_back);
@@ -2270,6 +2293,9 @@ struct MergeSettings {
 struct Charge {
     held: u64,
     output: u64,
+    /// Bytes of temp files the merge holds on the table's disk budget: what
+    /// it writes while it runs, its output alone once it has finished.
+    temp_files: u64,
 }
 
 /// What the merges of a pass are charged against the host while their
@@ -2316,6 +2342,7 @@ impl MergeCharges {
         let charge = Charge {
             held: expected_merge_footprint(job, &self.memory),
             output: job.estimated_output_bytes,
+            temp_files: merge_temp_file_bytes(job),
         };
         self.by_index.insert(plan_index, charge);
         self.by_task.insert(task, plan_index);
@@ -2337,6 +2364,7 @@ impl MergeCharges {
                     Ok(_) => {
                         if let Some(charge) = self.by_index.get_mut(&plan_index) {
                             charge.held = charge.output;
+                            charge.temp_files = charge.output;
                         }
                     }
                     Err(_) => {
@@ -2378,6 +2406,23 @@ impl MergeCharges {
     fn room(&self, reading: Option<(u64, u64)>) -> bool {
         room_with_charges(reading, self.baseline, self.total())
     }
+
+    /// Whether `job`'s temp files fit `share`, the most the table's disk
+    /// budget lets its temp files take, beside those of the merges in
+    /// flight. A merge that does not fit waits for one of them to commit
+    /// and give its room back, where starting it would only have it find no
+    /// room and drop out of the pass.
+    fn temp_files_fit(&self, job: &CompactionJob, share: u64) -> bool {
+        let in_flight: u64 = self.by_index.values().map(|c| c.temp_files).sum();
+        in_flight.saturating_add(merge_temp_file_bytes(job)) <= share
+    }
+}
+
+/// Bytes of temp files `job`'s merge writes: its build files and its
+/// output.
+fn merge_temp_file_bytes(job: &CompactionJob) -> u64 {
+    job.estimated_output_bytes
+        .saturating_mul(MERGE_TEMP_FILES_PER_OUTPUT_BYTE)
 }
 
 /// Whether the host has room for one more merge, with the merges already
@@ -2658,11 +2703,25 @@ async fn charge_merge_temp_files(charge: &mut ScratchCharge, bytes: u64) -> Resu
     }
 }
 
+/// Wait up to `wait` for the table's disk budget to have room for `bytes`
+/// more of temp files, looking every [`MERGE_TEMP_ROOM_POLL`]. Whether it
+/// has.
+async fn temp_file_room_within(charge: &ScratchCharge, bytes: u64, wait: Duration) -> bool {
+    let deadline = time::Instant::now() + wait;
+    while charge.room() < bytes {
+        if time::Instant::now() >= deadline {
+            return false;
+        }
+        time::sleep(MERGE_TEMP_ROOM_POLL).await;
+    }
+    true
+}
+
 /// Fail a merge about to write `bytes` of temp files in `scratch` when the
 /// disk holding it would be left with less than its reserve: everything
 /// else on the disk (the caches, other tables' work) fails once it is full.
 fn check_scratch_disk_holds(scratch: &Path, bytes: u64) -> Result<(), BuildError> {
-    match scratch_space(scratch) {
+    match disk_space(scratch) {
         Some((free, total)) if !scratch_disk_fits(free, total, bytes) => {
             Err(BuildError::Store(format!(
                 "merge stopped before writing: its temp files need {bytes} bytes and the \
@@ -5212,7 +5271,7 @@ mod tests {
     #[test]
     fn a_merge_the_scratch_disk_cannot_hold_is_a_store_error() {
         let dir = TempDir::new().expect("tempdir");
-        let (free, total) = scratch_space(dir.path()).expect("disk space");
+        let (free, total) = disk_space(dir.path()).expect("disk space");
         let err = check_scratch_disk_holds(dir.path(), free).expect_err("the whole free disk");
         assert!(matches!(err, BuildError::Store(_)), "{err}");
         assert_eq!(
@@ -7923,6 +7982,51 @@ mod tests {
     /// A merge of a wide table is charged the rows it decodes, up to the
     /// window a merge holds of them at once: a narrow table's rows in full,
     /// a wide one's capped at the window however many rows it has.
+    /// A merge is held back while its temp files would not fit the table's
+    /// share of the disk budget beside those of the merges in flight. A
+    /// merge that has finished holds its output alone, and one whose batch
+    /// has committed holds nothing.
+    #[tokio::test]
+    async fn a_merge_waits_for_temp_file_room_beside_the_merges_in_flight() {
+        const OUTPUT_BYTES: u64 = 100;
+        // Room for one merge's temp files and one finished output, not two
+        // merges at once.
+        const SHARE: u64 = OUTPUT_BYTES * MERGE_TEMP_FILES_PER_OUTPUT_BYTE + OUTPUT_BYTES;
+        let job = CompactionJob {
+            estimated_output_bytes: OUTPUT_BYTES,
+            ..CompactionJob::default()
+        };
+        let mut charges = MergeCharges::new(MergeMemory::default());
+        assert!(charges.temp_files_fit(&job, SHARE));
+
+        let mut merging = JoinSet::new();
+        let merged = PreparedJob {
+            input_ids: Vec::new(),
+            compaction_id: Uuid::new_v4(),
+            sealed_at: Utc::now(),
+            carried_sidecar: None,
+            sealed: Vec::new(),
+            new_entries: Vec::new(),
+            pending_storage_writes: Vec::new(),
+            bytes_for_store: None,
+            bytes_for_cache: None,
+            merged_superfile_id: Uuid::new_v4(),
+            term_contributions: Vec::new(),
+            scratch: None,
+        };
+        let task = merging.spawn(async move { (0usize, Ok(merged)) });
+        charges.admit(task.id(), 0, &job);
+        assert!(!charges.temp_files_fit(&job, SHARE), "one is running");
+
+        let joined = merging.join_next_with_id().await.expect("the merge");
+        charges.settle(joined).expect("joined").1.expect("merged");
+        assert!(charges.temp_files_fit(&job, SHARE), "it holds its output");
+
+        charges.batch_started([0].into_iter());
+        charges.batch_done();
+        assert!(charges.temp_files_fit(&job, OUTPUT_BYTES * MERGE_TEMP_FILES_PER_OUTPUT_BYTE));
+    }
+
     #[test]
     fn a_merge_is_charged_its_decoded_rows_up_to_the_window() {
         let job = |live_docs| CompactionJob {

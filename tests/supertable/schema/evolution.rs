@@ -16,9 +16,9 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema};
 use datafusion::prelude::{col, lit};
 use infino::{
-    Bm25Params, ColumnIndex, CompactionSettings, Connection, FieldId, FieldPatch, IndexSpec,
-    InfinoError, Metric, OptimizeOptions, SchemaError, SchemaPatch, Stemmer, Stopwords,
-    TableSchema, connect, serde_json,
+    Bm25Params, BoolMode, ColumnIndex, CompactionSettings, Connection, FieldId, FieldPatch,
+    IndexSpec, InfinoError, Metric, OptimizeOptions, SchemaError, SchemaPatch, Stemmer, Stopwords,
+    TableSchema, VectorFilter, connect, serde_json, test_helpers::distinct_unit_vectors,
 };
 use tempfile::TempDir;
 
@@ -653,6 +653,134 @@ fn a_where_on_full_text_columns_follows_a_name_swap() {
     ];
     for (sql, want) in cases {
         assert_eq!(rows(&db, sql), *want, "{sql}");
+    }
+}
+
+/// The filter must follow field IDs across the old and current file names.
+#[test]
+fn a_vector_filter_follows_a_name_swap() {
+    vector_filter_after_name_swap(false);
+}
+
+/// The same filter must select the right stable IDs for the hidden index.
+#[test]
+fn a_vector_filter_follows_a_name_swap_with_a_hidden_index() {
+    vector_filter_after_name_swap(true);
+}
+
+fn vector_filter_after_name_swap(drain: bool) {
+    /// The narrowest vector dimension supported by the index.
+    const DIM: usize = 16;
+    /// Enough rows to build a hidden index rather than an empty fixture.
+    const ROWS: usize = 64;
+    /// More than the two matching rows, so ranking cannot hide a match.
+    const K: usize = 10;
+    /// Fixed seed for non-degenerate vector training data.
+    const SEED: u64 = 42;
+    let dir = TempDir::new().expect("tempdir");
+    let uri = if drain {
+        dir.path().to_str().expect("utf8 path")
+    } else {
+        "memory://"
+    };
+    let db = connect(uri).expect("connect");
+    let item = Arc::new(Field::new("item", DataType::Float32, true));
+    let docs = db
+        .create_table(
+            TABLE,
+            Arc::new(Schema::new(vec![
+                Field::new("title", DataType::LargeUtf8, false),
+                Field::new("a", DataType::LargeUtf8, false),
+                Field::new("b", DataType::LargeUtf8, false),
+                Field::new(
+                    "emb",
+                    DataType::FixedSizeList(Arc::clone(&item), DIM as i32),
+                    false,
+                ),
+            ])),
+            IndexSpec::new()
+                .fts("title")
+                .fts("a")
+                .fts("b")
+                .vector("emb", DIM, Metric::L2Sq),
+        )
+        .expect("create");
+    let vectors = FixedSizeListArray::try_new(
+        Arc::clone(&item),
+        DIM as i32,
+        Arc::new(Float32Array::from(distinct_unit_vectors(ROWS, DIM, SEED))),
+        None,
+    )
+    .expect("vectors");
+    let names: Vec<String> = (0..ROWS).map(|i| format!("row{i}")).collect();
+    let a: Vec<&str> = (0..ROWS)
+        .map(|i| if i == 1 { "match shared" } else { "wrong" })
+        .collect();
+    let b: Vec<&str> = (0..ROWS)
+        .map(|i| if i == 0 { "match shared" } else { "other" })
+        .collect();
+    docs.append(&batch(vec![
+        ("title", Arc::new(LargeStringArray::from(names))),
+        ("a", titles(&a)),
+        ("b", titles(&b)),
+        ("emb", Arc::new(vectors)),
+    ]))
+    .expect("append old names");
+    if drain {
+        docs.local_handle()
+            .drain_vectors_to_cells_sync()
+            .expect("drain");
+        assert_eq!(
+            docs.local_handle()
+                .vector_index_table()
+                .expect("hidden index")
+                .reader()
+                .expect("reader")
+                .n_docs_total(),
+            ROWS as u64
+        );
+    }
+    swap_a_and_b(&db);
+    let new_vector = FixedSizeListArray::try_new(
+        item,
+        DIM as i32,
+        Arc::new(Float32Array::from(vec![1.0; DIM])),
+        None,
+    )
+    .expect("new vector");
+    docs.append(&batch(vec![
+        ("title", titles(&["new"])),
+        ("a", titles(&["match shared"])),
+        ("b", titles(&["wrong"])),
+        ("emb", Arc::new(new_vector)),
+    ]))
+    .expect("append current names");
+    for (column, expected) in [("a", vec!["new", "row0"]), ("b", vec!["row1"])] {
+        for mode in [BoolMode::Or, BoolMode::And] {
+            let filter = VectorFilter {
+                column,
+                query: "match shared",
+                mode,
+            };
+            let got = docs
+                .vector_search("emb", &[1.0; DIM], K, Some(filter), Some(&["title"]))
+                .expect("search");
+            let mut names = Vec::new();
+            for batch in &got {
+                let title = batch
+                    .column_by_name("title")
+                    .expect("title")
+                    .as_any()
+                    .downcast_ref::<LargeStringArray>()
+                    .expect("string titles");
+                names.extend(title.iter().map(|value| value.expect("title value")));
+            }
+            names.sort_unstable();
+            assert_eq!(
+                names, expected,
+                "column {column}, mode {mode:?}, hidden {drain}"
+            );
+        }
     }
 }
 

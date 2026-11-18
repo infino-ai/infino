@@ -34,10 +34,7 @@ use crate::{
         reader_cache::{
             block_source::BlockCachedSource,
             config::{ColdFetchMode, DiskCacheConfig},
-            disk::{
-                fill_wait::FillWaiters,
-                scratch::{RunScratch, scratch_root},
-            },
+            disk::{fill_wait::FillWaiters, scratch::scratch_root},
         },
     },
 };
@@ -194,6 +191,9 @@ pub(crate) struct CachedEntry {
     /// Who releases `size_bytes` when the entry drops.
     accounting: EntryAccounting,
     last_access_us: AtomicU64,
+    /// The footer and page index the reader keeps decoded, counted against the process budget
+    /// (see [`heap`]) until the entry goes.
+    heap: OnceLock<HeapReservation>,
 }
 
 /// Which tier of the cache's walk served an open. Returned beside the reader so a scan can say
@@ -401,6 +401,8 @@ pub struct CacheStats {
     pub n_gc_drops: u64,
     /// Bytes of `current_bytes` charged for the table's temp files beside the cache.
     pub scratch_bytes: u64,
+    /// Bytes charged for the table's metadata caches beside the cache.
+    pub metadata_bytes: u64,
 }
 
 /// A cache file found on disk at open but not opened yet. Its bytes already count against the budget.
@@ -446,17 +448,8 @@ pub struct DiskCacheStore {
     block_writes: AtomicUsize,
     #[cfg(test)]
     block_writes_idle: Notify,
-    /// Live disk budget in bytes, seeded from `config.disk_budget_bytes`.
-    /// An engine-managed (auto-sized) budget is raised — never lowered —
-    /// by [`Self::reconcile_budget_floor`] as the table's on-storage
-    /// footprint grows (the hidden vector index roughly doubles a vector
-    /// table's working set after the drain). An explicitly configured
-    /// budget never changes.
+    /// Disk budget in bytes, from `config.disk_budget_bytes`.
     budget_bytes: AtomicU64,
-    /// Whether the budget is engine-managed (the user configured a cache
-    /// directory but no byte budget). Set via
-    /// [`Self::mark_budget_auto_sized`] at construction time.
-    budget_auto_sized: AtomicBool,
     /// Lazy entries no query holds kept past a cold open; see
     /// [`Self::release_unheld_lazy_entries_over_cap`]. The table's
     /// `superfiles_in_flight`, set through [`Self::set_lazy_entry_cap`].
@@ -464,6 +457,9 @@ pub struct DiskCacheStore {
     /// One-shot latch so an explicit budget smaller than the table
     /// footprint warns once, not on every reconcile.
     budget_warned: AtomicBool,
+    /// Bytes charged to the budget for the table's metadata caches beside the cache (see
+    /// [`Self::charge_metadata`]). Counted in `current_bytes`.
+    metadata_bytes: AtomicU64,
     /// Bytes charged to the budget for the table's temp files beside the cache (see
     /// [`ScratchCharge`]), parked ones included. Counted in `current_bytes`.
     scratch_bytes: AtomicU64,
@@ -505,6 +501,9 @@ pub struct DiskCacheStore {
     /// Download tasks still running, cancelled ones included; what `wait_until_fills_settled`
     /// waits for.
     fills_running: AtomicUsize,
+    /// A test's own budget for decoded metadata, in place of the process's.
+    #[cfg(test)]
+    heap_budget: OnceLock<&'static HeapBudget>,
 }
 
 impl fmt::Debug for DiskCacheStore {
@@ -525,6 +524,7 @@ impl fmt::Debug for DiskCacheStore {
 mod budget;
 mod fetch;
 mod fill_wait;
+mod heap;
 mod read;
 mod scratch;
 mod sources;
@@ -532,8 +532,13 @@ mod store_files;
 
 pub(crate) use budget::{Reservation, ScratchCharge, ScratchRoom};
 pub(crate) use fetch::{open_batch_overlay, skip_background_fill};
+#[cfg(test)]
+pub(crate) use heap::HeapBudget;
+pub(crate) use heap::{CachedSessions, HeapReservation};
+pub(crate) use scratch::RunScratch;
 pub(crate) use sources::{
-    ArcMmapOwner, mmap_readonly_bytes, mmap_temp_file_bytes, release_temp_file, temp_file_behind,
+    ArcMmapOwner, give_back_temp_file_charge, mmap_charged_temp_file_bytes, mmap_readonly_bytes,
+    mmap_temp_file_bytes, release_temp_file, restore_temp_file_charge, temp_file_behind,
 };
 
 impl DiskCacheStore {
@@ -603,9 +608,9 @@ impl DiskCacheStore {
             #[cfg(test)]
             block_writes_idle: Notify::new(),
             budget_bytes: AtomicU64::new(configured_budget),
-            budget_auto_sized: AtomicBool::new(false),
             lazy_entry_cap: AtomicUsize::new(default_superfiles_in_flight()),
             budget_warned: AtomicBool::new(false),
+            metadata_bytes: AtomicU64::new(0),
             scratch_bytes: AtomicU64::new(0),
             parked_scratch: DashMap::new(),
             n_cold_fetches: AtomicU64::new(0),
@@ -619,6 +624,8 @@ impl DiskCacheStore {
             fill_waiters: FillWaiters::default(),
             fills: DashMap::new(),
             fills_running: AtomicUsize::new(0),
+            #[cfg(test)]
+            heap_budget: OnceLock::new(),
         });
 
         // Record what is already on disk so the budget is correct from the start. Files are opened
@@ -657,6 +664,7 @@ impl DiskCacheStore {
             // required for correctness.
         }
 
+        store.register_heap();
         Ok(store)
     }
 
@@ -692,60 +700,26 @@ impl DiskCacheStore {
             n_madvise_calls: self.n_madvise_calls.load(Ordering::Acquire),
             n_gc_drops: self.n_gc_drops.load(Ordering::Acquire),
             scratch_bytes: self.scratch_bytes.load(Ordering::Acquire),
+            metadata_bytes: self.metadata_bytes.load(Ordering::Acquire),
         }
     }
 
-    /// Current disk budget in bytes — the live value, not the
-    /// construction-time config (see [`Self::reconcile_budget_floor`]).
+    /// The disk budget in bytes.
     pub fn disk_budget_bytes(&self) -> u64 {
         self.budget_bytes.load(Ordering::Acquire)
     }
 
-    /// Mark this cache's budget as engine-managed: the user configured a
-    /// cache directory but no explicit byte budget, so the engine may
-    /// raise (never lower) the budget as the table's on-storage footprint
-    /// grows. Without this, a vector table silently outgrows any fixed
-    /// default the moment the drain writes the hidden index — a second
-    /// on-storage copy of the vector payload the user cannot be expected
-    /// to size for.
-    pub fn mark_budget_auto_sized(&self) {
-        self.budget_auto_sized.store(true, Ordering::Release);
-    }
-
-    /// Reconcile the budget against the table's current on-storage
-    /// footprint. `floor_bytes` is the caller-computed budget floor
-    /// (footprint + headroom); `footprint_bytes` is the raw footprint,
-    /// used for the undersized-budget warning.
-    ///
-    /// - **Auto-sized budget** ([`Self::mark_budget_auto_sized`]): raised
-    ///   to `floor_bytes` when larger. Never lowered — shrinking under
-    ///   live readers would force an eviction storm for no benefit.
-    /// - **Explicit budget**: respected verbatim. If the footprint
-    ///   exceeds it, warn once that steady-state reads will evict and
-    ///   re-fetch instead of staying cache-resident.
-    pub fn reconcile_budget_floor(&self, floor_bytes: u64, footprint_bytes: u64) {
-        if self.budget_auto_sized.load(Ordering::Acquire) {
-            let mut current = self.budget_bytes.load(Ordering::Acquire);
-            while floor_bytes > current {
-                match self.budget_bytes.compare_exchange_weak(
-                    current,
-                    floor_bytes,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                ) {
-                    Ok(_) => break,
-                    Err(next) => current = next,
-                }
-            }
-            return;
-        }
+    /// Warn, once per cache, when the table's on-storage footprint
+    /// (`footprint_bytes`) is larger than the budget: steady-state reads
+    /// then evict and re-fetch instead of staying on disk.
+    pub fn warn_if_budget_below(&self, footprint_bytes: u64) {
         let budget = self.disk_budget_bytes();
         if footprint_bytes > budget && !self.budget_warned.swap(true, Ordering::AcqRel) {
             tracing::warn!(
                 "disk cache budget ({budget} B) is below the table's on-storage footprint \
                  ({footprint_bytes} B, hidden vector index included): steady-state queries \
                  will evict and re-fetch. Raise ConnectOptions::with_cache_budget_bytes (or \
-                 storage.disk_budget_bytes), or omit the budget to let the engine size it."
+                 storage.disk_budget_bytes) if the disk has the room."
             );
         }
     }
@@ -845,8 +819,8 @@ pub(crate) mod test_support {
         ops::Range,
         os::unix::fs::MetadataExt,
         sync::{
-            Arc, Mutex,
-            atomic::{AtomicBool, Ordering},
+            Arc, Mutex, OnceLock,
+            atomic::{AtomicBool, AtomicU64, Ordering},
         },
         time::{Duration, Instant},
     };
@@ -866,7 +840,7 @@ pub(crate) mod test_support {
     use crate::{
         storage::{LocalFsStorageProvider, ObjectMeta, StorageError, StorageProvider},
         superfile::{
-            BytesLazyByteSource, LazyByteSource,
+            BytesLazyByteSource, LazyByteSource, SuperfileReader,
             builder::{BuilderOptions, SuperfileBuilder},
         },
         supertable::{
@@ -1007,9 +981,62 @@ pub(crate) mod test_support {
         )
     }
 
+    /// Cache `reader` for `uri` with `residency`, `size_bytes` of the disk budget released as
+    /// `accounting` says, last used at `last_access_us`.
+    pub(super) fn cache_entry(
+        store: &DiskCacheStore,
+        uri: SuperfileUri,
+        reader: Arc<SuperfileReader>,
+        residency: Residency,
+        size_bytes: Arc<AtomicU64>,
+        accounting: EntryAccounting,
+        last_access_us: u64,
+    ) {
+        store.cached.insert(
+            uri,
+            Arc::new(CachedEntry {
+                heap: OnceLock::new(),
+                reader,
+                residency,
+                size_bytes,
+                accounting,
+                last_access_us: AtomicU64::new(last_access_us),
+            }),
+        );
+    }
+
+    /// Cache `reader` for `uri` as a file held whole in memory, as a hybrid fill's first copy is
+    /// before it is written to disk and mapped.
+    pub(crate) fn cache_buffered(
+        store: &DiskCacheStore,
+        uri: SuperfileUri,
+        reader: Arc<SuperfileReader>,
+    ) {
+        let size_bytes = Arc::new(AtomicU64::new(0));
+        let accounting = EntryAccounting::Eager;
+        cache_entry(
+            store,
+            uri,
+            reader,
+            Residency::Buffered,
+            size_bytes,
+            accounting,
+            store.now_us(),
+        );
+    }
+
     /// Block sizes older builds wrote at the head of their block indexes, which carry no magic
     /// and no inode.
     pub(crate) const OLDER_BUILD_BLOCK_BYTES: [u64; 2] = [CACHE_BLOCK_BYTES, 512 * 1024];
+
+    /// Entries `store` holds lazily read, not mapped whole: the ones the metadata budget counts.
+    pub(crate) fn lazy_entries(store: &DiskCacheStore) -> usize {
+        store
+            .cached
+            .iter()
+            .filter(|entry| entry.value().mmap().is_none())
+            .count()
+    }
 
     /// How long [`wait_until`] waits before it fails.
     pub(crate) const WAIT_UNTIL_DEADLINE: Duration = Duration::from_secs(10);
@@ -1100,11 +1127,10 @@ pub(crate) mod test_support {
     /// Large enough that one-byte sequential range reads cannot finish before
     /// the preemption test enters its foreground guard.
     pub(crate) const PREEMPT_TEST_BYTES: usize = 1 << 20;
-    /// Tiny explicit budget used to prove reconciliation raises (or refuses to raise) it; smaller
-    /// than any real superfile.
+    /// Tiny budget, smaller than any real superfile.
     pub(crate) const TEST_TINY_BUDGET_BYTES: u64 = 4;
-    /// A comfortably large budget floor for the raise paths.
-    pub(crate) const TEST_RAISED_FLOOR_BYTES: u64 = 1 << 20;
+    /// A table footprint far over [`TEST_TINY_BUDGET_BYTES`].
+    pub(crate) const TEST_LARGE_FOOTPRINT_BYTES: u64 = 1 << 20;
     /// Attempts per interleaving-sensitive test; enough to surface a torn drop-vs-fill without
     /// making the suite slow.
     pub(crate) const RACE_ITERATIONS: usize = 200;
