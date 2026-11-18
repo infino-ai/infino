@@ -51,6 +51,7 @@ use crate::{
         lazy_source::{
             LazyByteSource, LazyByteSourceError, PrefetchedSource, RangeCoalescePlan, Source,
         },
+        load_watch::{LoadListener, LoadWatch},
         vector::{
             cell_posting::{EncodedCellRow, MaterializedIvfRow},
             distance::{
@@ -147,6 +148,8 @@ pub struct ColumnReader {
     /// family's. `None` for `Fp32` / `RabitqOnly`.
     pub(super) sq8_meta: Option<Sq8ColumnMeta>,
     lazy_sq8_parsed: OnceLock<Arc<Sq8ParsedMeta>>,
+    /// Told when a read parses `lazy_sq8_parsed`.
+    loads: LoadWatch,
     /// Byte range of this column's subsection within the outer blob.
     subsection_range: Range<usize>,
     /// Offsets relative to the subsection start.
@@ -373,9 +376,26 @@ pub struct VectorReader {
     /// warm (the region is already resident) and on any reader whose column
     /// has no inline region.
     cold_stable_id_region: std::sync::Mutex<Option<Bytes>>,
+    /// Told when a cold probe stashes the stable-id region.
+    loads: LoadWatch,
 }
 
 impl VectorReader {
+    /// Call `listener` after each read that loads a column's quantizer and
+    /// norms or stashes the stable-id region.
+    pub(crate) fn watch_loads(&self, listener: &LoadListener) {
+        self.loads.watch(listener);
+        for column in &self.columns {
+            column.loads.watch(listener);
+        }
+    }
+
+    /// Push the buffers this reader's source keeps: on a lazy open, the
+    /// header, directory and open-time metadata it read.
+    pub(crate) fn held_buffers(&self, out: &mut Vec<Bytes>) {
+        self.source.held_buffers(out);
+    }
+
     /// Heap bytes reads have loaded into this reader since open: each
     /// column's parsed quantizer and norms, and the stable-id region a cold
     /// probe stashed.
@@ -1278,6 +1298,7 @@ impl VectorReader {
                 rerank_codec,
                 sq8_meta,
                 lazy_sq8_parsed: OnceLock::new(),
+                loads: LoadWatch::default(),
                 subsection_range: subsection_off..sub_end,
                 summary_off,
                 centroids_off,
@@ -1299,6 +1320,7 @@ impl VectorReader {
             cell_ids: Vec::new(),
             flat_cluster_base: Vec::new(),
             cold_stable_id_region: std::sync::Mutex::new(None),
+            loads: LoadWatch::default(),
         })
     }
 
@@ -1493,6 +1515,7 @@ impl VectorReader {
             cell_ids,
             flat_cluster_base,
             cold_stable_id_region: std::sync::Mutex::new(None),
+            loads: LoadWatch::default(),
         })
     }
 
@@ -1866,6 +1889,7 @@ impl VectorReader {
             rerank_codec,
             sq8_meta,
             lazy_sq8_parsed: OnceLock::new(),
+            loads: LoadWatch::default(),
             subsection_range: subsection_off..sub_end,
             summary_off,
             centroids_off,
@@ -4369,6 +4393,9 @@ impl VectorReader {
                     && let Ok(mut slot) = self.cold_stable_id_region.lock()
                 {
                     *slot = Some(bytes);
+                    // Unlocked first: the listener weighs the stash.
+                    drop(slot);
+                    self.loads.loaded();
                 }
                 (blocks, meta, false)
             };
@@ -5944,7 +5971,9 @@ async fn rerank_candidates_from_blocks(
                                 norms_abs_off.is_some(),
                                 col.rerank_codec,
                             )?;
-                            let _ = col.lazy_sq8_parsed.set(Arc::new(parsed));
+                            if col.lazy_sq8_parsed.set(Arc::new(parsed)).is_ok() {
+                                col.loads.loaded();
+                            }
                         }
                         let parsed = Arc::clone(
                             col.lazy_sq8_parsed
@@ -6077,7 +6106,9 @@ async fn rerank_candidates_from_blocks(
                                 norms_abs_off.is_some(),
                                 col.rerank_codec,
                             )?;
-                            let _ = col.lazy_sq8_parsed.set(Arc::new(parsed));
+                            if col.lazy_sq8_parsed.set(Arc::new(parsed)).is_ok() {
+                                col.loads.loaded();
+                            }
                         }
                         let parsed = Arc::clone(
                             col.lazy_sq8_parsed

@@ -13,11 +13,13 @@
 //! ([`SuperfileReader::held_bytes`]), bounded by bytes, and charged to the
 //! connection's memory budget, which can take them all back.
 //!
-//! A reader is weighed when it is kept and again each time it is handed out,
-//! so what a query loads into it counts from the next open of its superfile.
-//! Past the bound, or when the budget refuses the charge, the least recently
-//! used readers are dropped; a caller holding one keeps it alive until it is
-//! done.
+//! A reader is weighed when it is kept, again after each read that loads
+//! something into it ([`SuperfileReader::watch_loads`]), and again each time
+//! it is handed out, so a query that loads a doc map into every superfile it
+//! reads is charged for each map as it lands. Past the bound, or when the
+//! budget refuses the charge, the least recently used readers are dropped; a
+//! caller holding one keeps it alive until it is done, and a load into a
+//! dropped reader does not keep it again.
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -119,7 +121,7 @@ impl KeptLazyReaders {
     /// A reader that does not fit the bound or the budget is handed back
     /// without being kept.
     pub(super) fn keep(
-        &self,
+        self: &Arc<Self>,
         uri: SuperfileUri,
         reader: Arc<SuperfileReader>,
     ) -> Arc<SuperfileReader> {
@@ -149,7 +151,33 @@ impl KeptLazyReaders {
             state.readers.get_mut(&uri).expect("kept above").charge = Some(charge);
         }
         state.reweigh(&uri, reader.held_bytes(), self.max_bytes);
+        if state.readers.contains_key(&uri) {
+            // Weak both ways: the reader must not keep its holder alive, nor
+            // the listener the reader.
+            let holder = Arc::downgrade(self);
+            let loaded_into = Arc::downgrade(&reader);
+            reader.watch_loads(Arc::new(move || {
+                if let Some(holder) = holder.upgrade() {
+                    holder.loaded(&uri, &loaded_into);
+                }
+            }));
+        }
         reader
+    }
+
+    /// Weigh `uri`'s reader again after a read loaded something into it,
+    /// without marking it used. A reader no longer kept for `uri` (dropped,
+    /// or replaced by a later open) is left alone.
+    fn loaded(&self, uri: &SuperfileUri, reader: &Weak<SuperfileReader>) {
+        let mut state = self.state();
+        let Some(kept) = state.readers.get(uri) else {
+            return;
+        };
+        if !std::ptr::eq(Arc::as_ptr(&kept.reader), reader.as_ptr()) {
+            return;
+        }
+        let bytes = kept.reader.held_bytes();
+        state.reweigh(uri, bytes, self.max_bytes);
     }
 
     /// Drop the reader kept for `uri`, if any.
