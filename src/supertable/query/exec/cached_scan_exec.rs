@@ -40,15 +40,12 @@ use std::{
 };
 
 use arrow_array::{
-    Array, ArrayRef, BooleanArray, RecordBatch, RecordBatchOptions, builder::BooleanBufferBuilder,
-    cast::AsArray, new_null_array,
+    Array, ArrayRef, BooleanArray, RecordBatch, RecordBatchOptions, UInt32Array,
+    builder::BooleanBufferBuilder, cast::AsArray, new_null_array, types::Int16Type,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::{
-    arrow::compute::{
-        and_kleene, can_cast_types, cast_with_options, filter, is_null, or_kleene,
-        prep_null_mask_filter, take,
-    },
+    arrow::compute::{can_cast_types, cast_with_options, filter, take},
     common::Statistics,
     datasource::physical_plan::parquet::ParquetAccessPlan,
     error::{DataFusionError, Result as DfResult},
@@ -99,6 +96,13 @@ const DICTIONARY_KEY_BYTES_PER_ROW: usize = 2;
 /// 2 bytes a row where views take 16, and its values a small share of the
 /// rows' bytes.
 const DICTIONARY_ROWS_PER_VALUE: usize = 16;
+
+/// How far under the most values `Int16` keys reach a distinct-sketch
+/// estimate must sit for its column to be kept as a dictionary: the sketch
+/// counts within about 3.25% (one standard error), so half the keys' reach
+/// leaves a row group whose values outrun its keys no real chance. An exact
+/// value table needs no margin.
+const SKETCH_KEY_MARGIN: usize = 2;
 
 /// One file of the scan: what its row groups are read from.
 #[derive(Debug)]
@@ -401,14 +405,18 @@ fn dictionary_columns(
                     let Some(stats) = field.and_then(|id| entry.scalar_stats.column(id)) else {
                         return false;
                     };
-                    let distinct = stats.value_table_len().or_else(|| {
-                        stats
+                    // The values, and what they must leave under the keys'
+                    // reach: an estimate keeps a margin, an exact count none.
+                    let distinct = match stats.value_table_len() {
+                        Some(exact) => Some((exact, exact)),
+                        None => stats
                             .sketch()
                             .and_then(HllSketch::from_bytes)
                             .map(|sketch| sketch.estimate().ceil() as usize)
-                    });
-                    distinct.is_some_and(|distinct| {
-                        distinct <= i16::MAX as usize
+                            .map(|estimate| (estimate, estimate.saturating_mul(SKETCH_KEY_MARGIN))),
+                    };
+                    distinct.is_some_and(|(distinct, reach)| {
+                        reach <= i16::MAX as usize
                             && distinct.saturating_mul(DICTIONARY_ROWS_PER_VALUE) <= rows
                     })
                 })
@@ -576,19 +584,11 @@ impl ScanContext {
                 keep
             }
         };
-        let mut keep = keep.map(|mut mask| BooleanArray::new(mask.finish(), None));
-        if let Some(predicate) = &self.predicate {
-            let passed = predicate_mask(predicate, &self.schema, &columns, n)?;
-            keep = Some(match keep {
-                Some(live) => and_kleene(&live, &passed)?,
-                None => passed,
-            });
-        }
-        // A null passes no filter.
-        let keep = keep.map(|mask| match mask.null_count() {
-            0 => mask,
-            _ => prep_null_mask_filter(&mask),
-        });
+        let live = keep.map(|mut mask| BooleanArray::new(mask.finish(), None));
+        let keep = match &self.predicate {
+            Some(predicate) => Some(passing_rows(predicate, &self.schema, &columns, live, n)),
+            None => live,
+        };
         let rows = keep.as_ref().map_or(n, BooleanArray::true_count);
         let columns = match &keep {
             Some(mask) => columns
@@ -610,19 +610,28 @@ impl ScanContext {
     }
 }
 
-/// Which of a row group's `rows` rows `predicate` keeps, over `columns` as
-/// kept: a column kept as a dictionary is a dictionary here, any other is
-/// typed as `schema` types it. Each conjunct is checked on its own: one that
-/// reads a single dictionary column is checked once per dictionary value
-/// ([`dictionary_conjunct`]), and any other on its columns, a dictionary
-/// among them cast first. A null is `None`, as the filter above reads it.
-fn predicate_mask(
+/// Which of a row group's `rows` rows the scan hands on: those `live` keeps
+/// (every row without it) that pass the conjuncts of `predicate` the scan
+/// checks, over `columns` as kept. Never null.
+///
+/// Checking here is only a saving: the filter above checks every row it
+/// gets, so a conjunct the scan leaves alone costs nothing but rows handed
+/// up, and the answer is the filter's either way. So the scan
+/// - checks only the conjuncts that read a column kept as a dictionary; the
+///   filter checks any other once, above;
+/// - checks each on the rows that passed the ones before it, as `AND`
+///   would, and never on a deleted or unselected row;
+/// - stops at a conjunct that fails to evaluate, and hands on the rows it
+///   has: the filter then checks them as it does with no scan below it, and
+///   fails only where that fails.
+fn passing_rows(
     predicate: &Arc<dyn PhysicalExpr>,
     schema: &SchemaRef,
     columns: &[ArrayRef],
+    live: Option<BooleanArray>,
     rows: usize,
-) -> DfResult<BooleanArray> {
-    let mut mask: Option<BooleanArray> = None;
+) -> BooleanArray {
+    let mut passing = live.unwrap_or_else(|| BooleanArray::from(vec![true; rows]));
     for conjunct in split_conjunction(predicate) {
         let mut used: Vec<usize> = collect_columns(conjunct)
             .iter()
@@ -630,54 +639,68 @@ fn predicate_mask(
             .collect();
         used.sort_unstable();
         used.dedup();
-        let kept = |i: usize| columns[i].data_type() != schema.field(i).data_type();
-        let part = match used.as_slice() {
-            [only] if kept(*only) => {
-                dictionary_conjunct(conjunct, schema.field(*only), &columns[*only])?
-            }
-            _ => {
-                let projected = Arc::new(Schema::new(
-                    used.iter()
-                        .map(|&i| schema.field(i).clone())
-                        .collect::<Vec<_>>(),
-                ));
-                let arrays = used
-                    .iter()
-                    .map(|&i| as_scanned(Arc::clone(&columns[i]), schema.field(i).data_type()))
-                    .collect::<DfResult<Vec<_>>>()?;
-                let batch = RecordBatch::try_new_with_options(
-                    Arc::clone(&projected),
-                    arrays,
-                    &RecordBatchOptions::new().with_row_count(Some(rows)),
-                )?;
-                let expr = reassign_expr_columns(Arc::clone(conjunct), &projected)?;
-                boolean(expr.evaluate(&batch)?.into_array(rows)?)?
-            }
+        if !used
+            .iter()
+            .any(|&i| kept_as_dictionary(&columns[i], schema.field(i)))
+        {
+            continue;
+        }
+        if passing.true_count() == 0 {
+            break;
+        }
+        let checked = match used.as_slice() {
+            [only] => dictionary_conjunct(conjunct, schema.field(*only), &columns[*only], &passing),
+            _ => conjunct_on_rows(conjunct, schema, columns, &used, &passing),
         };
-        mask = Some(match mask {
-            Some(mask) => and_kleene(&mask, &part)?,
-            None => part,
-        });
+        match checked {
+            Ok(next) => passing = next,
+            Err(_) => break,
+        }
     }
-    Ok(mask.unwrap_or_else(|| BooleanArray::from(vec![true; rows])))
+    passing
 }
 
-/// `conjunct`, reading only the column `field` kept as the dictionary
-/// `kept`, over each row: checked once on each of the dictionary's values
-/// (cast as the scan types the column) and once on a null, then taken for
-/// each row by its key, a row without a value taking the null's answer.
+/// Whether `column`, as kept, is a dictionary of a column the scan returns
+/// as something else.
+fn kept_as_dictionary(column: &ArrayRef, field: &Field) -> bool {
+    matches!(column.data_type(), DataType::Dictionary(..))
+        && !matches!(field.data_type(), DataType::Dictionary(..))
+}
+
+/// The rows of `passing` that pass `conjunct`, which reads only the column
+/// `field`, kept as the dictionary `kept`: the conjunct is checked once on
+/// each value the passing rows use (cast as the scan types the column), and
+/// once on a null when a passing row has none, then taken for each row by its
+/// key. Values only other rows use, deleted ones among them, are not checked.
 fn dictionary_conjunct(
     conjunct: &Arc<dyn PhysicalExpr>,
     field: &Field,
     kept: &ArrayRef,
+    passing: &BooleanArray,
 ) -> DfResult<BooleanArray> {
-    let Some(dictionary) = kept.as_any_dictionary_opt() else {
+    let Some(dictionary) = kept.as_dictionary_opt::<Int16Type>() else {
         return Err(DataFusionError::Internal(format!(
-            "column {} is kept as {}, not a dictionary",
+            "column {} is kept as {}, not a dictionary of Int16 keys",
             field.name(),
             kept.data_type()
         )));
     };
+    let keys = dictionary.keys();
+    // Each value a passing row uses, once, and where it sits among them.
+    let mut slot: Vec<Option<usize>> = vec![None; dictionary.values().len()];
+    let mut used: Vec<u32> = Vec::new();
+    let mut null_row = false;
+    for row in passing.values().set_indices() {
+        if keys.is_null(row) {
+            null_row = true;
+            continue;
+        }
+        let value = keys.value(row) as usize;
+        if slot[value].is_none() {
+            slot[value] = Some(used.len());
+            used.push(value as u32);
+        }
+    }
     let one = Arc::new(Schema::new(vec![field.clone().with_nullable(true)]));
     let expr = reassign_expr_columns(Arc::clone(conjunct), &one)?;
     let check = |values: ArrayRef| -> DfResult<BooleanArray> {
@@ -685,16 +708,74 @@ fn dictionary_conjunct(
         let batch = RecordBatch::try_new(Arc::clone(&one), vec![values])?;
         boolean(expr.evaluate(&batch)?.into_array(n)?)
     };
-    let values = cast_with_options(dictionary.values(), field.data_type(), &CAST_OPTIONS)?;
-    let on_values = check(values)?;
-    let on_null = check(new_null_array(field.data_type(), 1))?;
-    let taken = take(&on_values, dictionary.keys(), None)?;
-    let taken = boolean(taken)?;
-    match on_null.is_valid(0) && on_null.value(0) {
-        // A row without a value passes as a null does: where the key is null.
-        true => Ok(or_kleene(&taken, &is_null(dictionary.keys())?)?),
-        false => Ok(taken),
+    let values = take(dictionary.values().as_ref(), &UInt32Array::from(used), None)?;
+    let on_values = check(cast_with_options(
+        &values,
+        field.data_type(),
+        &CAST_OPTIONS,
+    )?)?;
+    let on_null = match null_row {
+        true => {
+            let on_null = check(new_null_array(field.data_type(), 1))?;
+            on_null.is_valid(0) && on_null.value(0)
+        }
+        false => false,
+    };
+    let mut next = BooleanBufferBuilder::new(passing.len());
+    next.append_n(passing.len(), false);
+    for row in passing.values().set_indices() {
+        let passes = match keys.is_null(row) {
+            true => on_null,
+            false => {
+                let at = slot[keys.value(row) as usize].expect("a passing row's value is checked");
+                on_values.is_valid(at) && on_values.value(at)
+            }
+        };
+        if passes {
+            next.set_bit(row, true);
+        }
     }
+    Ok(BooleanArray::new(next.finish(), None))
+}
+
+/// The rows of `passing` that pass `conjunct`, which reads the columns
+/// `used`, checked on those rows alone, a column kept as a dictionary among
+/// them cast to the scan's type first.
+fn conjunct_on_rows(
+    conjunct: &Arc<dyn PhysicalExpr>,
+    schema: &SchemaRef,
+    columns: &[ArrayRef],
+    used: &[usize],
+    passing: &BooleanArray,
+) -> DfResult<BooleanArray> {
+    let projected = Arc::new(Schema::new(
+        used.iter()
+            .map(|&i| schema.field(i).clone())
+            .collect::<Vec<_>>(),
+    ));
+    let arrays = used
+        .iter()
+        .map(|&i| {
+            let rows = filter(columns[i].as_ref(), passing)?;
+            as_scanned(rows, schema.field(i).data_type())
+        })
+        .collect::<DfResult<Vec<_>>>()?;
+    let n = passing.true_count();
+    let batch = RecordBatch::try_new_with_options(
+        Arc::clone(&projected),
+        arrays,
+        &RecordBatchOptions::new().with_row_count(Some(n)),
+    )?;
+    let expr = reassign_expr_columns(Arc::clone(conjunct), &projected)?;
+    let checked = boolean(expr.evaluate(&batch)?.into_array(n)?)?;
+    let mut next = BooleanBufferBuilder::new(passing.len());
+    next.append_n(passing.len(), false);
+    for (at, row) in passing.values().set_indices().enumerate() {
+        if checked.is_valid(at) && checked.value(at) {
+            next.set_bit(row, true);
+        }
+    }
+    Ok(BooleanArray::new(next.finish(), None))
 }
 
 /// `array` as the booleans a predicate gives.
@@ -709,11 +790,12 @@ fn boolean(array: ArrayRef) -> DfResult<BooleanArray> {
 impl CachedScanExec {
     /// This scan, checking `predicate` (a `WHERE` over its output, as the
     /// filter above it checks it) on each row group before handing its rows
-    /// on. A condition on one column kept as a dictionary is checked once
-    /// per value of the dictionary rather than once per row, and only the
-    /// rows that pass are cast to the strings the scan returns; the filter
-    /// above still checks every row it gets, so the answer is the one it
-    /// gives.
+    /// on: its conjuncts that read a column kept as a dictionary, on the live
+    /// rows, each on the rows the ones before it kept ([`passing_rows`]). A
+    /// conjunct on one such column is checked once per value the rows use
+    /// rather than once per row, and only the rows that pass are cast to the
+    /// strings the scan returns. The filter above still checks every row it
+    /// gets, so the answer is the one it gives.
     pub(crate) fn with_predicate(&self, predicate: Arc<dyn PhysicalExpr>) -> Self {
         let context = &self.context;
         Self {
@@ -907,6 +989,15 @@ mod tests {
     const DELETED_BELOW: i64 = 300;
     /// Kept bytes: room for every column of every row group.
     const KEPT_BYTES: usize = 64 << 20;
+    /// What `code` holds on a deleted row: no number, so a cast of it fails.
+    const NOT_A_NUMBER: &str = "x";
+    /// Every this many rows `code` is null.
+    const NULL_EVERY: i64 = 7;
+    /// The numbers `code` and `tag` take otherwise, as strings: few values.
+    const CODES: i64 = 5;
+    /// The region whose rows hold [`NOT_A_NUMBER`] in `tag`, live rows among
+    /// them, so a cast of `tag` fails unless a guard on `region` comes first.
+    const GUARDED_REGION: &str = "af";
     /// Statements over `region` (few values), `msg` (one per row) and `seq`.
     const STATEMENTS: &[&str] = &[
         "SELECT region, count(*) AS n FROM supertable WHERE seq < 4500 GROUP BY region ORDER BY region",
@@ -915,11 +1006,32 @@ mod tests {
         "SELECT region, min(seq) AS lo, max(seq) AS hi FROM supertable GROUP BY region ORDER BY region DESC",
     ];
 
+    /// A condition that fails on a deleted row's `code`, which holds no
+    /// number: a scan that checked it on deleted rows would fail.
+    const FAILS_ON_DELETED_ROWS: &str = "CAST(code AS INT) > 2";
+    /// Conditions over `code` and `tag`, each run grouped by `region` so the
+    /// statement reads the scan rather than the files' statistics.
+    const CONDITIONS: &[&str] = &[
+        "code != '2'",
+        "code NOT IN ('1', '3')",
+        "code IS NULL",
+        "code IS NOT NULL AND region LIKE 'a%'",
+        "region LIKE '%u%' AND seq > 2500",
+        "region NOT LIKE 'e%' AND code = '4'",
+        "code IN ('1', '5') OR code IS NULL",
+        FAILS_ON_DELETED_ROWS,
+        "100 / seq >= 0 AND region = 'eu'",
+        // A guard first: the cast must not see a row the guard drops.
+        "region <> 'af' AND CAST(tag AS INT) > 2",
+    ];
+
     fn region_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![
             Field::new("seq", DataType::Int64, false),
             Field::new("region", DataType::Utf8, false),
             Field::new("msg", DataType::Utf8, false),
+            Field::new("code", DataType::Utf8, true),
+            Field::new("tag", DataType::Utf8, false),
         ]))
     }
 
@@ -941,12 +1053,30 @@ mod tests {
                 .map(|s| REGIONS[(*s as usize * 7) % REGIONS.len()])
                 .collect();
             let msgs: Vec<String> = seqs.iter().map(|s| format!("message {s}")).collect();
+            let codes: Vec<Option<String>> = seqs
+                .iter()
+                .map(|&s| match s {
+                    s if s % NULL_EVERY == 0 => None,
+                    s if s < DELETED_BELOW => Some(NOT_A_NUMBER.to_string()),
+                    s => Some(((s * 3) % CODES + 1).to_string()),
+                })
+                .collect();
+            let tags: Vec<String> = seqs
+                .iter()
+                .zip(&regions)
+                .map(|(&s, &region)| match region == GUARDED_REGION {
+                    true => NOT_A_NUMBER.to_string(),
+                    false => (s % CODES + 1).to_string(),
+                })
+                .collect();
             let batch = RecordBatch::try_new(
                 region_schema(),
                 vec![
                     Arc::new(Int64Array::from(seqs)),
                     Arc::new(StringArray::from(regions)),
                     Arc::new(StringArray::from(msgs)),
+                    Arc::new(StringArray::from(codes)),
+                    Arc::new(StringArray::from(tags)),
                 ],
             )
             .expect("batch");
@@ -960,8 +1090,75 @@ mod tests {
     }
 
     fn answer(st: &Supertable, sql: &str) -> String {
-        let batches = st.reader().expect("reader").query_sql(sql).expect(sql);
-        pretty_format_batches(&batches).expect("format").to_string()
+        outcome(st, sql).expect(sql)
+    }
+
+    /// `sql`'s answer on `st`, or the error it fails with.
+    fn outcome(st: &Supertable, sql: &str) -> Result<String, String> {
+        let batches = st
+            .reader()
+            .expect("reader")
+            .query_sql(sql)
+            .map_err(|error| error.to_string())?;
+        Ok(pretty_format_batches(&batches).expect("format").to_string())
+    }
+
+    /// The `EXPLAIN` of `sql` on `st`, every plan line joined.
+    fn explained(st: &Supertable, sql: &str) -> String {
+        st.reader()
+            .expect("reader")
+            .query_sql(&format!("EXPLAIN {sql}"))
+            .expect("explain")
+            .iter()
+            .flat_map(|b| {
+                let plans = b.column(1).as_string::<i32>().clone();
+                (0..plans.len()).map(move |i| plans.value(i).to_owned())
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The scan checks a `WHERE` on a column it keeps as a dictionary, and a
+    /// statement over such columns answers as without a cache: with nulls,
+    /// `!=`, `NOT IN`, `IS NULL` and `LIKE`; with a condition that fails on a
+    /// deleted row, which the scan never checks; and with a guard ahead of a
+    /// condition that fails on the rows the guard drops. Where a statement
+    /// fails without a cache, the cached one is not held to its answer.
+    #[test]
+    fn a_where_checked_on_kept_dictionaries_answers_as_without_a_cache() {
+        let plain_dir = TempDir::new().expect("tempdir");
+        let plain = region_table(&plain_dir, None);
+        let kept_dir = TempDir::new().expect("tempdir");
+        let kept = region_table(&kept_dir, Some(Arc::new(ByteLru::new(KEPT_BYTES))));
+        let grouped = |condition: &str| {
+            format!(
+                "SELECT region, count(*) AS n FROM supertable WHERE {condition} \
+                 GROUP BY region ORDER BY region"
+            )
+        };
+        for pass in ["decoded", "kept", "kept again"] {
+            for condition in CONDITIONS {
+                let sql = grouped(condition);
+                if let Ok(expected) = outcome(&plain, &sql) {
+                    assert_eq!(outcome(&kept, &sql), Ok(expected), "{pass}: {sql}");
+                }
+            }
+        }
+        // The rows that condition fails on are deleted, none live: the
+        // statement answers without a cache, so the loop above held the
+        // cached one to that answer.
+        let deleted_only = grouped(FAILS_ON_DELETED_ROWS);
+        assert!(outcome(&plain, &deleted_only).is_ok(), "{deleted_only}");
+        // The filter above the scan hands its `WHERE` to the scan.
+        let plan = explained(
+            &kept,
+            "SELECT region, max(msg) AS m FROM supertable WHERE region = 'eu' GROUP BY region",
+        );
+        assert!(
+            plan.lines()
+                .any(|line| line.contains("CachedScanExec") && line.contains("predicate=")),
+            "the scan checks the WHERE:\n{plan}"
+        );
     }
 
     /// A string column of few values is kept as a dictionary of `Int16`
