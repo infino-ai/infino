@@ -171,6 +171,16 @@ impl Candidate {
     fn sum(&self) -> f32 {
         self.contrib.iter().sum::<f32>() + self.phrases.iter().flatten().sum::<f32>()
     }
+
+    /// The terms the document is known to carry: a probe can learn that a
+    /// term is absent, which makes it known but not present.
+    fn present(&self) -> TermMask {
+        self.tf
+            .iter()
+            .enumerate()
+            .filter(|&(t, &tf)| self.known & (1 << t) != 0 && tf > 0)
+            .fold(0, |mask, (t, _)| mask | (1 << t))
+    }
 }
 
 /// One kept superfile: per term, the head its documents of the term lie
@@ -228,9 +238,10 @@ impl Weights {
     /// found in it.
     fn counts(&self, c: &Candidate) -> bool {
         let found = |v: &Option<f32>| matches!(v, Some(v) if *v > 0.0);
+        let present = c.present();
         (!self.filtered || c.admitted)
-            && c.known & self.required == self.required
-            && (c.known & self.scoring != 0 || c.phrases.iter().any(found))
+            && present & self.required == self.required
+            && (present & self.scoring != 0 || c.phrases.iter().any(found))
             && self
                 .phrases
                 .iter()
@@ -987,6 +998,10 @@ fn may_hold(slot: &Slot, heads: &[Head], t: usize, len: u8) -> bool {
 /// per phrase its cap. `NEG_INFINITY` when the candidate can no longer
 /// carry a required term or phrase.
 fn candidate_bound(slot: &Slot, heads: &[Head], weights: &Weights, c: &Candidate) -> f32 {
+    // A required term a probe found absent: the document cannot match.
+    if c.known & weights.required & !c.present() != 0 {
+        return f32::NEG_INFINITY;
+    }
     // Every bare term seen and every phrase probed: the known sum is the
     // score, the kernel's own bit for bit up to two scored parts.
     if c.known & weights.scoring == weights.scoring
