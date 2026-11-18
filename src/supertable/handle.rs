@@ -66,7 +66,7 @@ use crate::{
             deleted_stats::DeletedStatsCache,
             fts::GlobalIdfCache,
             scalar_cache::DecodedScalarCache,
-            sql::{SqlSchemas, build_sql_schemas},
+            sql::{SessionTemplate, SqlSchemas, build_sql_schemas},
             value_count_carry::ValueCountCarry,
         },
         reader_cache::{
@@ -184,6 +184,10 @@ pub(super) struct SupertableInner {
     /// `query_sql` the `Arc::ptr_eq` check fails and the cache
     /// is rebuilt against the fresh snapshot.
     pub(super) sql_session_cache: Mutex<Option<(Arc<ManifestSnapshot>, SessionContext)>>,
+    /// The session every SQL context of this table's readers starts from,
+    /// built once and copied per context: the same [`SessionTemplate`] a
+    /// catalog connection plans its statements in.
+    pub(super) sql_session_template: SessionTemplate,
     /// Deterministic scalar SQL logical plans keyed by statement text and
     /// manifest identity. Physical plans are intentionally rebuilt so fresh
     /// tombstone overlays and query-stable functions retain their semantics.
@@ -2324,6 +2328,7 @@ async fn build_handle(
         tier_policy: crate::supertable::query::tier::TierPolicy::new(),
         id_generator: Mutex::new(id_generator),
         sql_session_cache: Mutex::new(None),
+        sql_session_template: SessionTemplate::default(),
         sql_logical_plan_cache: Mutex::new(None),
         decoded_scalar_cache: DecodedScalarCache::default(),
         value_count_carry: Arc::default(),
@@ -2923,6 +2928,12 @@ impl SupertableReader {
         &self,
     ) -> &Mutex<Option<(Arc<ManifestSnapshot>, SessionContext)>> {
         &self.inner.sql_session_cache
+    }
+
+    /// The session this reader's SQL contexts are copied from, shared by
+    /// every reader of the table.
+    pub(crate) fn sql_session_template(&self) -> &SessionTemplate {
+        &self.inner.sql_session_template
     }
 
     /// Cached deterministic scalar SQL plans for this reader's manifest.
