@@ -419,8 +419,9 @@ pub(crate) async fn select(
     let mut probes = 0u64;
     let mut theta;
     let mut bounds;
-    // What the last round left: its threshold and the slots it left in play.
-    let mut last: Option<(f32, usize)> = None;
+    // What the last round left: its threshold, the slots it left in play,
+    // and the largest of their bounds.
+    let mut last: Option<(f32, usize, f32)> = None;
     // The host may cap the rounds, for diagnosis; zero is no cap.
     let max_rounds = match config::global().diagnostics.tier_rounds {
         0 => usize::MAX,
@@ -429,18 +430,26 @@ pub(crate) async fn select(
     let mut rounds = 0usize;
     loop {
         (theta, bounds) = settle(&slots, &heads, &candidates, &weights, k, lb_slack);
-        // A round that neither raised the threshold nor ruled a slot out
-        // ends the reading: on documents that tie across the table the
-        // bounds sit at the threshold however deep the heads are read, and
-        // the opens settle the ties by `_id` instead; a query of required
-        // phrases finds no threshold in the heads, which hold no
-        // positions, and its opens, in bound order, find it.
+        // A round that neither raised the threshold, nor ruled a slot out,
+        // nor lowered the largest bound still in play ends the reading: on
+        // documents that tie across the table the bounds sit at the
+        // threshold however deep the heads are read, and the opens settle
+        // the ties by `_id` instead; a query of required phrases finds no
+        // threshold in the heads, which hold no positions, and its opens,
+        // in bound order, find it. A round that only lowered the bounds is
+        // progress: the next may take them under the threshold, and the
+        // price below decides whether it is worth reading.
         let in_play = bounds.iter().filter(|(_, ub)| *ub > theta).count();
+        let top = bounds
+            .iter()
+            .map(|&(_, ub)| ub)
+            .filter(|ub| *ub > theta)
+            .fold(f32::NEG_INFINITY, f32::max);
         let no_threshold_here = weights.phrases.iter().any(|p| p.required);
-        if (theta.is_finite() || no_threshold_here) && last == Some((theta, in_play)) {
+        if (theta.is_finite() || no_threshold_here) && last == Some((theta, in_play, top)) {
             break;
         }
-        last = Some((theta, in_play));
+        last = Some((theta, in_play, top));
         // Bounds under the threshold widened by the tolerance are skipped
         // by the opens anyway: reading further for them buys nothing.
         let bar = competitive_floor(theta, query.score_tolerance);
