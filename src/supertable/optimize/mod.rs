@@ -44,6 +44,10 @@ impl Supertable {
         )
     )]
     pub fn optimize(&self, opts: &OptimizeOptions) -> Result<(), OptimizeError> {
+        // A table frozen by a merge keeps its superfiles as the merge listed them.
+        if self.inner().manifest.load().is_frozen() {
+            return Ok(());
+        }
         // Optimize phase timers ([optphase]); gated, off by default. A measuring
         // stick for compaction scaling — see DiagnosticsSettings.
         let phase_timers = crate::config::global().diagnostics.optimize_phase_timers;

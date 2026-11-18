@@ -629,6 +629,7 @@ impl From<SupertableBuildError> for InfinoError {
             // A commit that found its table dropped and purged: the name no
             // longer resolves, the same answer the read path gives.
             SupertableBuildError::TableGone => InfinoError::NotFound(message),
+            SupertableBuildError::TableFrozen => InfinoError::Unsupported(message),
             // Decided by the checks above, named here for completeness.
             SupertableBuildError::OverBudget(_) => InfinoError::OverBudget(message),
             SupertableBuildError::PermissionDenied(_) => InfinoError::PermissionDenied(message),
@@ -723,6 +724,12 @@ impl From<MutationCommitError> for InfinoError {
             MutationCommitError::AppendFlush(SupertableBuildError::TableGone)
         ) {
             return InfinoError::NotFound(e.to_string());
+        }
+        if matches!(
+            &e,
+            MutationCommitError::AppendFlush(SupertableBuildError::TableFrozen)
+        ) {
+            return InfinoError::Unsupported(e.to_string());
         }
         // A buffer the table's schema refuses at commit (a peer froze a
         // column in another type first) classifies as the same batch would

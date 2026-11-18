@@ -286,6 +286,37 @@ fn translate(uri: &str, e: ObjError) -> StorageError {
 
 #[async_trait]
 impl StorageProvider for GcsStorageProvider {
+    fn server_side_key(&self, uri: &str) -> Option<(String, String)> {
+        Some((self.bucket.clone(), self.key(uri)))
+    }
+
+    async fn copy_in(
+        &self,
+        uri: &str,
+        from: &dyn StorageProvider,
+        from_uri: &str,
+    ) -> Result<bool, StorageError> {
+        let Some((_, key)) = from
+            .server_side_key(from_uri)
+            .filter(|(bucket, _)| *bucket == self.bucket)
+        else {
+            return super::copy_through(self, uri, from, from_uri).await;
+        };
+        let source = ObjPath::parse(&key).map_err(|e| StorageError::Permanent {
+            uri: from_uri.into(),
+            source: Box::new(e),
+        })?;
+        match self
+            .store
+            .copy_if_not_exists(&source, &self.path(uri)?)
+            .await
+        {
+            Ok(()) => Ok(true),
+            Err(ObjError::AlreadyExists { .. } | ObjError::Precondition { .. }) => Ok(false),
+            Err(e) => Err(translate(uri, e)),
+        }
+    }
+
     async fn head(&self, uri: &str) -> Result<ObjectMeta, StorageError> {
         let path = self.path(uri)?;
         let meta = self

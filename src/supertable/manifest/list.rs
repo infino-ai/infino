@@ -178,6 +178,9 @@ pub struct Manifest {
     /// every other table, and then absent from the wire, so a list without
     /// companions encodes exactly as before the field existed.
     pub companions: BTreeMap<String, String>,
+    /// Set when the table is merged into another: it takes no more writes and no compaction, so
+    /// a later merge of it can never see its rows rewritten under new superfile ids.
+    pub frozen: bool,
     /// Global vector cell-index coordination state, owned by THIS (the user)
     /// table. Source of truth for the immutable cell grids trained from the
     /// first committed batch: `grid` at `hidden_cell_count` cells (read
@@ -1755,6 +1758,8 @@ struct ManifestDto {
     vector_index_storage_prefix: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     companions: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    frozen: bool,
     #[serde(default)]
     deleted_user_ids_inline_b64: Option<String>, // base64 of encoded id set
     #[serde(default)]
@@ -2443,6 +2448,7 @@ fn list_to_dto(l: &Manifest) -> Result<ManifestDto, ListEncodeError> {
         partition_strategy: strategy_to_dto(&l.partition_strategy),
         vector_index_storage_prefix: l.vector_index_storage_prefix.clone(),
         companions: l.companions.clone(),
+        frozen: l.frozen,
         global_vector_index: l
             .global_vector_index
             .as_ref()
@@ -2528,6 +2534,7 @@ fn list_from_dto(d: ManifestDto, legacy: &LegacyNames) -> Result<Manifest, ListP
         partition_strategy: strategy_from_dto(d.partition_strategy)?,
         vector_index_storage_prefix: d.vector_index_storage_prefix,
         companions: d.companions,
+        frozen: d.frozen,
         global_vector_index: d
             .global_vector_index
             .map(|g| -> Result<GlobalVectorIndex, ListParseError> {
@@ -3576,6 +3583,7 @@ mod tests {
 
     fn empty_list() -> Manifest {
         Manifest {
+            frozen: false,
             drained_ranges: Default::default(),
             global_vector_index: None,
             tombstone_seqs: Default::default(),

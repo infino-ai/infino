@@ -20,8 +20,8 @@ use datafusion::prelude::Expr;
 use serde_json::Value;
 
 use crate::{
-    Bm25SearchOptions, BoolMode, GcError, GcReport, InfinoError, MutationStats, OptimizeError,
-    OptimizeOptions, ReindexError, ReindexOptions, VectorFilter,
+    Bm25SearchOptions, BoolMode, GcError, GcReport, InfinoError, MergeReport, MutationStats,
+    OptimizeError, OptimizeOptions, ReindexError, ReindexOptions, VectorFilter,
     catalog::ensure_expr_within_connective_cap,
     superfile::VectorSearchOptions,
     supertable::{
@@ -118,6 +118,11 @@ pub(crate) trait Table: Send + Sync {
         patch: &SchemaPatch,
         expected: Option<u32>,
     ) -> Result<TableSchema, InfinoError>;
+
+    /// The local engine table behind this handle; `None` for a hosted table.
+    fn local_engine(&self) -> Option<&SupertableHandle> {
+        None
+    }
 
     /// Test-only: expose the concrete handle behind the trait object so tests
     /// can reach engine internals (`options`, `stats`, `reader`, …) through the
@@ -276,6 +281,9 @@ impl Table for SupertableHandle {
         expected: Option<u32>,
     ) -> Result<TableSchema, InfinoError> {
         Ok((*SupertableHandle::apply_schema(self, patch, expected)?).clone())
+    }
+    fn local_engine(&self) -> Option<&SupertableHandle> {
+        Some(self)
     }
     #[cfg(any(test, feature = "test-helpers"))]
     fn as_any(&self) -> &dyn Any {
@@ -848,6 +856,24 @@ impl Supertable {
         expected: Option<u32>,
     ) -> Result<TableSchema, InfinoError> {
         self.inner.apply_schema(patch, expected)
+    }
+
+    /// Moves every row of `sources` into this table, copying their files into its storage and
+    /// committing them with their index; safe to run again after a failure. Drop the sources after.
+    /// Errors for a hosted table or source.
+    pub fn merge_tables(&self, sources: &[&Supertable]) -> Result<MergeReport, InfinoError> {
+        let sources = sources
+            .iter()
+            .map(|s| s.local_engine())
+            .collect::<Result<Vec<_>, _>>()?;
+        crate::supertable::merge::merge_tables(self.local_engine()?, &sources)
+            .map_err(InfinoError::from)
+    }
+
+    fn local_engine(&self) -> Result<&SupertableHandle, InfinoError> {
+        self.inner
+            .local_engine()
+            .ok_or_else(|| InfinoError::Unsupported("merge_tables needs local tables".into()))
     }
 
     /// Test-only: the underlying local engine handle. Panics for a hosted

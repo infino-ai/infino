@@ -183,6 +183,10 @@ pub enum BuildError {
     /// [`CommitError::PointerVanished`] and `From<BuildError> for InfinoError`.
     #[error("table was dropped and purged while this handle was open")]
     TableGone,
+    /// The table was frozen when it was merged into another, so it takes no more rows and no
+    /// rewrite of its superfiles.
+    #[error("the table was merged into another and takes no more writes")]
+    TableFrozen,
 
     /// A concurrent writer won the manifest CAS and the commit's retry
     /// budget ran out. Carried as its own variant rather than folded into
@@ -323,13 +327,14 @@ impl From<ReadError> for BuildError {
 
 impl From<CommitError> for BuildError {
     /// Commit failures reach the build path as `Store` carrying the message —
-    /// except a vanished pointer and a lost commit race, which keep their own
+    /// except a vanished pointer, a frozen table and a lost commit race, which keep their own
     /// variants so the public mapping can report a missing table or a
     /// retryable conflict. A stringified error cannot be matched on,
     /// and the append path converts here before any caller sees it.
     fn from(e: CommitError) -> Self {
         match e {
             CommitError::PointerVanished => BuildError::TableGone,
+            CommitError::Build(BuildError::TableFrozen) => BuildError::TableFrozen,
             CommitError::SchemaMoved { expected, current } => {
                 BuildError::SchemaMoved { expected, current }
             }

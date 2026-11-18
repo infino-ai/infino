@@ -785,6 +785,27 @@ impl core::marker::Unpin for infino::IndexSpec
 impl core::marker::UnsafeUnpin for infino::IndexSpec
 impl core::panic::unwind_safe::RefUnwindSafe for infino::IndexSpec
 impl core::panic::unwind_safe::UnwindSafe for infino::IndexSpec
+pub struct infino::MergeReport
+pub infino::MergeReport::copied: usize
+pub infino::MergeReport::merged: usize
+pub infino::MergeReport::present: usize
+pub infino::MergeReport::rows: u64
+pub infino::MergeReport::spliced: usize
+impl core::clone::Clone for infino::MergeReport
+pub fn infino::MergeReport::clone(&self) -> Self
+impl core::default::Default for infino::MergeReport
+pub fn infino::MergeReport::default() -> Self
+impl core::fmt::Debug for infino::MergeReport
+pub fn infino::MergeReport::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl serde_core::ser::Serialize for infino::MergeReport
+pub fn infino::MergeReport::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl core::marker::Freeze for infino::MergeReport
+impl core::marker::Send for infino::MergeReport
+impl core::marker::Sync for infino::MergeReport
+impl core::marker::Unpin for infino::MergeReport
+impl core::marker::UnsafeUnpin for infino::MergeReport
+impl core::panic::unwind_safe::RefUnwindSafe for infino::MergeReport
+impl core::panic::unwind_safe::UnwindSafe for infino::MergeReport
 #[non_exhaustive] pub struct infino::MutationStats
 impl infino::MutationStats
 pub fn infino::MutationStats::matched(&self) -> usize
@@ -1024,6 +1045,7 @@ pub fn infino::Supertable::gc(&self, core::time::Duration) -> core::result::Resu
 pub fn infino::Supertable::hybrid_search(&self, &str, &str, infino::BoolMode, &str, &[f32], usize, core::option::Option<&[&str]>) -> core::result::Result<alloc::vec::Vec<arrow_array::record_batch::RecordBatch>, infino::InfinoError>
 pub fn infino::Supertable::hydrate(&self, impl arrow_array::record_batch::RecordBatchReader, usize) -> core::result::Result<usize, infino::InfinoError>
 pub fn infino::Supertable::index_staleness(&self, &infino::ReindexOptions) -> core::result::Result<infino::StalenessReport, infino::ReindexError>
+pub fn infino::Supertable::merge_tables(&self, &[&infino::Supertable]) -> core::result::Result<infino::MergeReport, infino::InfinoError>
 pub fn infino::Supertable::optimize(&self, &infino::OptimizeOptions) -> core::result::Result<(), infino::OptimizeError>
 pub fn infino::Supertable::reindex(&self, &infino::ReindexOptions) -> core::result::Result<infino::ReindexReport, infino::ReindexError>
 pub fn infino::Supertable::reindex_plan(&self, &infino::ReindexOptions) -> core::result::Result<alloc::vec::Vec<infino::PlannedRepair>, infino::ReindexError>

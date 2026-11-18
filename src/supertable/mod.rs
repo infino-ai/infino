@@ -34,6 +34,7 @@ pub(crate) mod hidden_deleted;
 pub(crate) mod hydrate;
 pub mod lazy_source;
 pub mod manifest;
+pub(crate) mod merge;
 pub mod mutations;
 pub(crate) mod opann;
 pub(crate) mod optimize;

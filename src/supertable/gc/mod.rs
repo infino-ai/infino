@@ -154,7 +154,7 @@ fn list_refs(manifest: &ManifestSnapshot) -> impl Iterator<Item = &str> {
 /// The slices a term-index root names, which takes reading the root, one small object. A root
 /// that cannot be read is a permanent failure on that URI: slices a sweep could not enumerate are
 /// slices it must not decide about.
-async fn term_index_slices(
+pub(crate) async fn term_index_slices(
     storage: &dyn StorageProvider,
     root: &RoutingRef,
 ) -> Result<Vec<String>, GcError> {
@@ -825,6 +825,7 @@ mod tests {
             Vec::new(),
             Some(storage),
             Some(Manifest {
+                frozen: false,
                 tombstone_seqs: Default::default(),
                 superseded_cells: Default::default(),
                 split_checks: Default::default(),
@@ -981,6 +982,7 @@ mod tests {
             Vec::new(),
             Some(storage),
             Some(Manifest {
+                frozen: false,
                 tombstone_seqs: Default::default(),
                 superseded_cells: Default::default(),
                 split_checks: Default::default(),
@@ -1092,6 +1094,7 @@ mod tests {
             Vec::new(),
             Some(storage),
             Some(Manifest {
+                frozen: false,
                 tombstone_seqs: Default::default(),
                 superseded_cells: Default::default(),
                 split_checks: Default::default(),
