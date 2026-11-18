@@ -56,6 +56,7 @@
 use std::{
     collections::{HashMap, HashSet},
     future::Future,
+    mem,
     sync::{Arc, Weak},
     time::Instant,
 };
@@ -90,7 +91,7 @@ use uuid::Uuid;
 use crate::utils::trace::OpOrigin;
 use crate::{
     InfinoError,
-    memory::{ConnectionMemoryBudget, Reclaim, Reservation, budgeted_session_context},
+    memory::{ConnectionMemoryBudget, Reclaim, Reservation, SqlSpill, budgeted_session_context},
     runtime_metrics::op_stats::{self, OpStatsCollector},
     supertable::{
         error::QueryError,
@@ -470,11 +471,13 @@ pub(crate) fn statement_bytes(sql: &str, tables: &[String], plan: &LogicalPlan) 
 /// The SQL context every entry point plans in: DataFusion's memory gated on `budget`, plus the
 /// covered-aggregate rewrite, which answers covered aggregates from manifest statistics and scans
 /// only the boundary segments. One constructor, so a query plans the same way whichever API
-/// (`Connection::query_sql` or a reader's) it arrives through.
+/// (`Connection::query_sql` or a reader's) it arrives through. Its operators spill through
+/// `spill` when the connection has a disk cache folder.
 pub(crate) fn sql_session_context(
     budget: &Arc<ConnectionMemoryBudget>,
+    spill: Option<&SqlSpill>,
 ) -> Result<SessionContext, DataFusionError> {
-    let ctx = budgeted_session_context(budget)?;
+    let ctx = budgeted_session_context(budget, spill)?;
     // Appended after the built-in rules, so they see pushed-down, normalized
     // plans: a `LIMIT` already folded into its sort as the fetch.
     ctx.add_optimizer_rule(Arc::new(CoveredAggregateRewrite::default()));
@@ -500,17 +503,23 @@ impl SupertableReader {
             .sql_logical_plan_cache()
             .lock()
             .expect("sql logical-plan cache mutex poisoned");
+        // Plans hold their table's provider, so replaced ones are dropped after the lock, as in
+        // `sql_session_context`.
+        let mut replaced = None;
         if guard
             .as_ref()
             .is_none_or(|(manifest, _)| !Arc::ptr_eq(manifest, self.manifest()))
         {
-            *guard = Some((Arc::clone(self.manifest()), Default::default()));
+            replaced = guard.replace((Arc::clone(self.manifest()), Default::default()));
         }
         let (_, plans) = guard.as_mut().expect("cache initialized above");
+        let mut cleared = None;
         if plans.len() >= SQL_LOGICAL_PLAN_CACHE_ENTRIES && !plans.contains_key(&sql) {
-            plans.clear();
+            cleared = Some(mem::take(plans));
         }
-        plans.insert(sql, plan);
+        let same_text = plans.insert(sql, plan);
+        drop(guard);
+        drop((replaced, cleared, same_text));
     }
 
     /// Run a SQL query against this reader's pinned snapshot.
@@ -856,7 +865,11 @@ impl SupertableReader {
         }
 
         let ctx = op_stats::suppressed(|| self.build_session_context(reader))?;
-        *guard = Some((Arc::clone(&manifest), ctx.clone()));
+        let replaced = guard.replace((Arc::clone(&manifest), ctx.clone()));
+        // Dropped after the lock: the last holder of the old session's files lets the cache drop
+        // them, which must not run under this table's session lock.
+        drop(guard);
+        drop(replaced);
         Ok(ctx)
     }
 
@@ -893,8 +906,12 @@ impl SupertableReader {
         // Gate SQL heap on the connection budget (shared across contexts, so
         // this reader's SQL counts against the same ceiling as the rest).
         // A session built from our own budget config failing is ours.
-        let ctx = sql_session_context(&self.options().connection_memory_budget)
-            .map_err(QueryError::internal)?;
+        let options = self.options();
+        let ctx = sql_session_context(
+            &options.connection_memory_budget,
+            options.sql_spill.as_deref(),
+        )
+        .map_err(QueryError::internal)?;
         // Registering the table we just built is ours to get right.
         ctx.register_table(TABLE_NAME, Arc::new(provider))
             .map_err(QueryError::internal)?;
@@ -920,8 +937,13 @@ impl SupertableReader {
         collector: Option<Arc<OpStatsCollector>>,
         statement: impl Future<Output = Result<T, QueryError>> + Send + 'static,
     ) -> Result<T, QueryError> {
-        self.block_on(run_within_process_limit(collector, statement))
-            .map_err(QueryError::DataFusion)?
+        let result = self.block_on(run_within_process_limit(collector, statement));
+        // A statement on the table's cached context leaves its files held by that context, so no
+        // provider drops at its end to start the cache's pass: it starts here, refused or not.
+        if let Some(cache) = self.manifest().options.disk_cache.as_ref() {
+            cache.heap_budget().release_over_budget();
+        }
+        result.map_err(QueryError::DataFusion)?
     }
 
     /// Plan one DataFrame, then run it through the shared

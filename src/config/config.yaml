@@ -119,7 +119,8 @@ storage:
   # manifest-parts/ subdirectory of disk_cache_root. On a hit the part
   # loader reads bytes from local disk instead of object storage; parts
   # are content-addressed, so cached files are never stale and survive
-  # restarts. Independent of disk_budget_bytes. Default 2 GiB. This is the
+  # restarts. A limit of its own, and what the cache holds also counts
+  # against disk_budget_bytes. Default 2 GiB. This is the
   # working room for objects fetched a piece at a time (the full-text
   # term index's slices). On top of it the cache holds the table's
   # current manifest whole (a hidden vector index's cache, its state and

@@ -65,7 +65,6 @@ use bytes::Bytes;
 pub(crate) use format::TierRef;
 use format::{Layer, SliceRef};
 pub(crate) use format::{Location, Posting, Root, Run, Slice, legacy_bound_as_key};
-use fs4::{available_space, total_space};
 use futures::{StreamExt, TryStreamExt, stream};
 use rayon::{ThreadPool, ThreadPoolBuilder};
 use tempfile::TempDir;
@@ -105,7 +104,7 @@ use crate::{
         query::prune::PruneLeaf,
         schema::FieldId,
     },
-    utils::trace::detail_span,
+    utils::{disk::disk_space, trace::detail_span},
 };
 
 /// Object-store directory prefix for term-index objects, sibling to the
@@ -513,7 +512,7 @@ async fn write_objects(
 /// which a fold reads in place, count as room. `None` when the filesystem
 /// cannot be read.
 pub(crate) fn fold_disk_bound(dir: &Path, measured: &AtomicU64, held: u64) -> Option<u64> {
-    let (free, total) = (available_space(dir).ok()?, total_space(dir).ok()?);
+    let (free, total) = disk_space(dir)?;
     Some(disk_bound(
         free,
         total,
@@ -6771,7 +6770,8 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().expect("runtime");
         let (_, root) = live_and_covered(&st, &storage, &rt);
         let cache_dir = TempDir::new().expect("cache dir");
-        let cache = MetadataDiskCache::new(cache_dir.path().to_path_buf(), 1 << 30).expect("cache");
+        let cache =
+            MetadataDiskCache::new(cache_dir.path().to_path_buf(), 1 << 30, None).expect("cache");
         let warm = TermIndex::new(
             root.clone(),
             String::new(),

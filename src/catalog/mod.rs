@@ -132,7 +132,7 @@ use crate::{
     InfinoError,
     config::{self, Config, DEFAULT_CONNECTION_BUDGET_BYTES},
     error::{datafusion_error, datafusion_planning_error},
-    memory::ConnectionMemoryBudget,
+    memory::{ConnectionMemoryBudget, SqlSpill},
     runtime_bridge::{bridge_on_runtime, bridge_sync_to_async, carry_span, shared_io_runtime},
     runtime_metrics::{
         io::{UsageMeter, UsageSnapshot},
@@ -165,8 +165,16 @@ use crate::{
         reader_cache::{DiskCacheConfig, DiskCacheError, DiskCacheStore},
         schema::{ColumnIndex, TableSchema, change::SchemaPatch, error::SchemaError},
     },
-    utils::trace::{self, CloseOut, detail_span},
+    utils::{
+        disk::disk_space,
+        trace::{self, CloseOut, detail_span},
+    },
 };
+
+/// Share of the disk holding the cache directory that a table's disk cache
+/// may fill when the connection sets no budget, in percent of the disk's
+/// total size.
+const DEFAULT_CACHE_DISK_SHARE_PERCENT: u64 = 90;
 
 /// Subdirectory under a tables cache root holding the manifest-part cache.
 const MANIFEST_CACHE_SUBDIR: &str = "manifest-parts";
@@ -256,6 +264,14 @@ pub fn connect_with(
 
     let statement_plans = StatementPlans::new(&connection_memory_budget);
 
+    // An in-memory catalog has no disk cache, so its SQL spills where it
+    // always did.
+    let sql_spill = options
+        .cache_dir
+        .as_deref()
+        .filter(|_| !matches!(backend, Backend::Memory))
+        .map(SqlSpill::under);
+
     debug!(backend = ?backend, validate = options.validate, "catalog connected");
     Ok(Connection {
         inner: Arc::new(ConnectionInner {
@@ -264,6 +280,7 @@ pub fn connect_with(
             store,
             connection_memory_budget,
             statement_plans,
+            sql_spill,
             usage_meter,
             gcs_credential,
             #[cfg(feature = "graph-index")]
@@ -300,6 +317,7 @@ fn connect_remote(backend: Backend, options: ConnectOptions) -> Result<Connectio
             store: CatalogStore::Remote(Arc::new(remote)),
             connection_memory_budget,
             statement_plans,
+            sql_spill: None,
             usage_meter: UsageMeter::new(),
             gcs_credential: None,
             #[cfg(feature = "graph-index")]
@@ -335,6 +353,9 @@ struct ConnectionInner {
     /// The parsed plans of statements run on this connection, by their text,
     /// held against `connection_memory_budget` (see [`StatementPlans`]).
     statement_plans: Arc<StatementPlans>,
+    /// Where the connection's SQL spills when it has a disk cache folder,
+    /// shared into every table's `SupertableOptions`.
+    sql_spill: Option<Arc<SqlSpill>>,
     /// Sole object-store usage ledger for this connection (shared into every
     /// table provider). Benches and billing snapshot this meter.
     usage_meter: Arc<UsageMeter>,
@@ -633,6 +654,9 @@ impl Connection {
                         .with_disk_cache(cache)
                         .with_metadata_disk_cache(manifest_cache);
                 }
+                if let Some(spill) = &self.inner.sql_spill {
+                    opts = opts.with_sql_spill(Arc::clone(spill));
+                }
 
                 // Honor the connection's read-consistency policy (default
                 // BoundedStaleness); `open_table` applies the same.
@@ -749,6 +773,9 @@ impl Connection {
                     options = options
                         .with_disk_cache(cache)
                         .with_metadata_disk_cache(manifest_cache);
+                }
+                if let Some(spill) = &self.inner.sql_spill {
+                    options = options.with_sql_spill(Arc::clone(spill));
                 }
                 // Honor the connection's read-consistency policy. Default is
                 // BoundedStaleness(1s): the per-query pointer re-check is
@@ -1345,8 +1372,11 @@ impl Connection {
         // same constructor as a table reader's, so covered aggregates are
         // answered from manifest statistics here too. A session built from
         // our own budget config failing is ours, not the query's.
-        let ctx = sql_session_context(&self.inner.connection_memory_budget)
-            .map_err(|e| InfinoError::Backend(e.to_string()).with_context("query_sql", None))?;
+        let ctx = sql_session_context(
+            &self.inner.connection_memory_budget,
+            self.inner.sql_spill.as_deref(),
+        )
+        .map_err(|e| InfinoError::Backend(e.to_string()).with_context("query_sql", None))?;
 
         // One snapshot of the session for parsing and table lookup; planning
         // takes a fresh one later, after the tables are registered.
@@ -2153,12 +2183,11 @@ fn backend_to_provider(
 /// so tables don't share cache files; the byte budget applies per table.
 ///
 /// Budget semantics: an explicit `cache_budget_bytes` is respected
-/// verbatim (the engine warns once if the table's footprint outgrows it).
-/// With no explicit budget the cache is marked engine-managed, and the
-/// supertable raises the budget to the table's real on-storage footprint
-/// — user superfiles plus the hidden vector index — at open and after
-/// maintenance, so vector tables don't silently churn a default-sized
-/// cache once the drain doubles their working set.
+/// verbatim. With no explicit budget the cache may fill
+/// [`DEFAULT_CACHE_DISK_SHARE_PERCENT`] of the disk holding the cache
+/// directory, so a table that fits the disk is cached whole and one that
+/// does not is held to the disk (see [`default_cache_budget`]). Either way
+/// the engine warns once if the table's footprint outgrows the budget.
 fn build_disk_cache(
     options: &ConnectOptions,
     memory_budget: &Arc<ConnectionMemoryBudget>,
@@ -2171,15 +2200,15 @@ fn build_disk_cache(
     };
     let table_root = cache_root.join(name);
     claim_table_cache(&table_root, location)?;
-    let mut cfg = DiskCacheConfig {
+    let cfg = DiskCacheConfig {
         cache_root: table_root.clone(),
+        disk_budget_bytes: options
+            .cache_budget_bytes
+            .unwrap_or_else(|| default_cache_budget(&table_root)),
         cold_fetch_mode: options.cold_fetch_mode.to_internal(),
         fill_memory_budget: Some(Arc::clone(memory_budget)),
         ..Default::default()
     };
-    if let Some(budget) = options.cache_budget_bytes {
-        cfg.disk_budget_bytes = budget;
-    }
     let cache = DiskCacheStore::new_unpinned(Arc::clone(storage), cfg).map_err(|e| {
         if let DiskCacheError::Config(msg) = e {
             InfinoError::Config(msg)
@@ -2187,15 +2216,33 @@ fn build_disk_cache(
             InfinoError::Io(e.to_string())
         }
     })?;
-    if options.cache_budget_bytes.is_none() {
-        cache.mark_budget_auto_sized();
-    }
     let manifest_cache = MetadataDiskCache::new(
         table_root.join(MANIFEST_CACHE_SUBDIR),
         MANIFEST_CACHE_BUDGET_BYTES,
+        Some(Arc::clone(&cache)),
     )
     .map_err(|e| InfinoError::Io(e.to_string()))?;
     Ok(Some((cache, manifest_cache)))
+}
+
+/// The budget of a disk cache at `cache_root` whose connection set none:
+/// [`DEFAULT_CACHE_DISK_SHARE_PERCENT`] of the total size of the disk
+/// holding it, or the fixed default of [`DiskCacheConfig`] when the disk's
+/// size cannot be read.
+fn default_cache_budget(cache_root: &Path) -> u64 {
+    match disk_space(cache_root) {
+        Some((_, total)) if total > 0 => total / 100 * DEFAULT_CACHE_DISK_SHARE_PERCENT,
+        _ => {
+            let fallback = DiskCacheConfig::default().disk_budget_bytes;
+            warn!(
+                cache_root = %cache_root.display(),
+                budget_bytes = fallback,
+                "could not read the size of the disk holding the cache directory; \
+                 using the fixed default disk cache budget"
+            );
+            fallback
+        }
+    }
 }
 
 /// Make `table_root` the disk cache of the table generation stored at
@@ -5559,7 +5606,11 @@ mod tests {
         sql: &str,
         tables: &[&str],
     ) -> (SessionContext, Option<LogicalPlan>) {
-        let ctx = sql_session_context(&conn.inner.connection_memory_budget).expect("session");
+        let ctx = sql_session_context(
+            &conn.inner.connection_memory_budget,
+            conn.inner.sql_spill.as_deref(),
+        )
+        .expect("session");
         for name in tables {
             conn.open_and_register(&ctx, name, true)
                 .expect("register")
@@ -5670,7 +5721,11 @@ mod tests {
     /// The plan `sql` parses to over the catalog tables `tables`, before any
     /// optimization, as `query_sql` parses it before keeping it.
     fn parsed(conn: &Connection, sql: &str, tables: &[&str]) -> LogicalPlan {
-        let ctx = sql_session_context(&conn.inner.connection_memory_budget).expect("session");
+        let ctx = sql_session_context(
+            &conn.inner.connection_memory_budget,
+            conn.inner.sql_spill.as_deref(),
+        )
+        .expect("session");
         for name in tables {
             conn.open_and_register(&ctx, name, true)
                 .expect("register")
@@ -7424,6 +7479,40 @@ mod tests {
         assert!(
             hybrid_rows >= 1,
             "hybrid_search should fuse and return hits"
+        );
+    }
+
+    /// A connection with a cache directory and no budget gives each table's
+    /// disk cache [`DEFAULT_CACHE_DISK_SHARE_PERCENT`] of the disk holding
+    /// the directory; a budget the connection sets is used as given.
+    #[test]
+    fn a_cache_with_no_budget_takes_its_share_of_the_disk() {
+        const EXPLICIT_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
+        let budget_of = |options: ConnectOptions| {
+            let root = tempfile::tempdir().expect("tempdir");
+            let conn = connect_with(root.path().to_str().expect("utf8"), options).expect("connect");
+            conn.create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+                .expect("create");
+            let table = conn.open_table_handle("docs").expect("open");
+            let cache = table.options().disk_cache.clone().expect("disk cache");
+            cache.disk_budget_bytes()
+        };
+
+        let cache = tempfile::tempdir().expect("cache tempdir");
+        let (_, disk_bytes) = disk_space(cache.path()).expect("cache disk size");
+        assert_eq!(
+            budget_of(ConnectOptions::new().with_cache_dir(cache.path())),
+            disk_bytes / 100 * DEFAULT_CACHE_DISK_SHARE_PERCENT
+        );
+
+        let cache = tempfile::tempdir().expect("cache tempdir");
+        assert_eq!(
+            budget_of(
+                ConnectOptions::new()
+                    .with_cache_dir(cache.path())
+                    .with_cache_budget_bytes(EXPLICIT_BUDGET_BYTES)
+            ),
+            EXPLICIT_BUDGET_BYTES
         );
     }
 

@@ -89,7 +89,6 @@ use blake3::Hasher as Blake3Hasher;
 use bytes::Bytes;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use datafusion::prelude::Expr;
-use fs4::{available_space, total_space};
 use futures::{
     future::{BoxFuture, try_join_all},
     stream::{self, FuturesUnordered, StreamExt},
@@ -217,7 +216,10 @@ use crate::{
         },
         reader_cache::{
             DiskCacheStore, ReadIntent,
-            disk::{ScratchCharge, ScratchRoom, mmap_temp_file_bytes, temp_file_behind},
+            disk::{
+                ScratchCharge, ScratchRoom, mmap_charged_temp_file_bytes, mmap_temp_file_bytes,
+                temp_file_behind,
+            },
         },
         schema::{
             DECIMAL128_PRECISION, DECIMAL128_SCALE, FieldId, LegacyNames, PhysicalSchema,
@@ -240,6 +242,7 @@ use crate::{
         },
     },
     utils::{
+        disk::disk_space,
         join::run_spawned,
         nulls::{concat_sharing_nulls, populated_columns, set_cell_bytes, take_sharing_nulls},
         trace::{self, detail_span, record},
@@ -4490,6 +4493,33 @@ fn id_bounds<'a>(
     Ok((id_min, id_max, n_docs))
 }
 
+/// Map a build's finished `output` as zero-copy `Bytes` backed by the file
+/// ([`mmap_temp_file_bytes`]). On a table with a disk cache the file is
+/// charged to the table's disk budget for as long as it is the bytes' own:
+/// until the cache takes it over as a cache file, or the bytes drop. The
+/// charge never waits and never refuses the build: a file past the temp
+/// files' share of the budget is left uncounted.
+fn seal_build_output(options: &SupertableOptions, output: NamedTempFile) -> io::Result<Bytes> {
+    let charge = match options.disk_cache.as_ref() {
+        Some(cache) => {
+            let bytes = output.as_file().metadata()?.len();
+            let mut charge = cache.scratch_charge();
+            if charge.adopt(bytes) {
+                Some(charge)
+            } else {
+                debug!(
+                    bytes,
+                    "build output not counted against the disk budget: temp files hold their \
+                     share of it"
+                );
+                None
+            }
+        }
+        None => None,
+    };
+    mmap_charged_temp_file_bytes(output, charge)
+}
+
 /// Finish a fed shard builder into its superfile bytes and gather what the
 /// publish needs from it.
 ///
@@ -4506,10 +4536,10 @@ fn seal_shard(
     head_sink: Option<(term_index::HeadSink, usize)>,
     id_bounds: (i128, i128, u64),
     scalar_stats: HashMap<FieldId, ScalarStatsAgg>,
-    scratch: &Path,
+    options: &SupertableOptions,
 ) -> Result<ShardOutput, BuildError> {
     let (id_min, id_max, n_docs) = id_bounds;
-    let mut output = NamedTempFile::new_in(scratch)
+    let mut output = NamedTempFile::new_in(options.scratch_dir())
         .map_err(|error| BuildError::Store(format!("shard temp create: {error}")))?;
     {
         let mut writer = BufWriter::new(output.as_file_mut());
@@ -4520,7 +4550,7 @@ fn seal_shard(
     }
     // The file stays behind the bytes: a publish to local-filesystem
     // storage links it into place instead of writing the superfile again.
-    let bytes = mmap_temp_file_bytes(output)
+    let bytes = seal_build_output(options, output)
         .map_err(|error| BuildError::Store(format!("shard mmap: {error}")))?;
     let term_contribution = head_sink
         .map(|(sink, _)| sink.into_contribution(superfile_id, id_min))
@@ -4626,7 +4656,7 @@ fn build_piece(
         head_sink,
         bounds,
         scalar_stats,
-        &options.scratch_dir(),
+        options,
     )
 }
 
@@ -6529,13 +6559,6 @@ fn prepare_drain_scratch(
     Ok(())
 }
 
-/// The free and total bytes of the filesystem holding `path`, read at its
-/// nearest existing ancestor. `None` when neither can be read.
-pub(in crate::supertable) fn scratch_space(path: &Path) -> Option<(u64, u64)> {
-    let existing = path.ancestors().find(|dir| dir.exists())?;
-    Some((available_space(existing).ok()?, total_space(existing).ok()?))
-}
-
 /// Whether `needed` bytes of temp files fit on a scratch disk with `free`
 /// of `total` bytes free, leaving `total / SCRATCH_DISK_RESERVE_DIVISOR`
 /// free after them.
@@ -6997,13 +7020,40 @@ fn take_drain_sources(
 /// limits the drain.
 fn drain_row_limit_now(options: &SupertableOptions, column: &str) -> Option<(u64, DrainRowLimit)> {
     let spill_row_bytes = drain_spill_row_bytes(options, column)?;
-    let disk_room = scratch_space(&drain_scratch_parent(options))
+    let disk_room = disk_space(&drain_scratch_parent(options))
         .map(|(free, total)| scratch_disk_room(free, total));
     let cache = options.disk_cache.as_ref();
     drain_row_limit(
         options.drain_max_rows,
         drain_disk_room(disk_room, cache.map(|cache| cache.unused_budget_bytes())),
         cache.map(|cache| cache.scratch_room()),
+        spill_row_bytes,
+    )
+}
+
+/// The most rows a scratch disk with `space` (free and total bytes; `None`
+/// when unreadable) could hold of a drain of `column` that already has
+/// `on_disk` bytes of spill there, which count as room it has. Only the
+/// disk is asked: a drain the table's disk budget has no room for waits or
+/// goes on uncounted, and `vector.drain_max_rows` is not a reason to spill
+/// its batches again. `None` when the disk does not limit it.
+fn spilled_drain_row_limit(
+    options: &SupertableOptions,
+    column: &str,
+    space: Option<(u64, u64)>,
+    on_disk: u64,
+) -> Option<(u64, DrainRowLimit)> {
+    let spill_row_bytes = drain_spill_row_bytes(options, column)?;
+    let disk_room =
+        space.map(|(free, total)| scratch_disk_room(free, total).saturating_add(on_disk));
+    let unused_budget = options
+        .disk_cache
+        .as_ref()
+        .map(|cache| cache.unused_budget_bytes());
+    drain_row_limit(
+        0,
+        drain_disk_room(disk_room, unused_budget),
+        None,
         spill_row_bytes,
     )
 }
@@ -7048,14 +7098,30 @@ fn new_drain_epoch_sources(
     taken
 }
 
+/// The folders a drain epoch's spill can be in: beside its table, and where
+/// drains kept their spill before, when that is another folder.
+fn drain_spill_folders(options: &SupertableOptions, epoch_id: &str) -> Vec<PathBuf> {
+    let here = drain_scratch_dir(options, epoch_id);
+    let legacy = legacy_drain_scratch_dir(epoch_id);
+    if legacy == here {
+        vec![here]
+    } else {
+        vec![here, legacy]
+    }
+}
+
 /// Whether a recorded drain epoch over `recorded` (sorted by
-/// `birth_version`) is started over as a smaller one: it has finished
-/// nothing, and a drain starting now would take fewer commits. An epoch
+/// `birth_version`) is started over as a smaller one: it has uploaded no
+/// shard, and a drain starting now would take fewer commits. An epoch
 /// recorded when there was more room, or before drains were held to a row
 /// limit, could otherwise never finish, with every later commit waiting
-/// behind it. An epoch that uploaded a shard or spilled a batch is resumed
-/// as recorded.
-fn recorded_drain_starts_over(
+/// behind it.
+///
+/// An epoch that has spilled a batch starts over only when the scratch disk
+/// could not hold it even with its own spill counted as room (see
+/// [`spilled_drain_row_limit`]), since starting over spills its batches
+/// again. An epoch that uploaded a shard is resumed as recorded.
+async fn recorded_drain_starts_over(
     options: &SupertableOptions,
     column: &str,
     checkpoint: &DrainRemoteCheckpoint,
@@ -7064,7 +7130,27 @@ fn recorded_drain_starts_over(
     if !checkpoint.completed_shards.is_empty() {
         return Ok(false);
     }
-    let Some((limit, why)) = drain_row_limit_now(options, column) else {
+    let folders = drain_spill_folders(options, &checkpoint.epoch_id);
+    let mut spilled = false;
+    for folder in &folders {
+        spilled |= load_drain_local_checkpoint(folder, &checkpoint.epoch_id)?
+            .is_some_and(|local| local.batches_done > 0);
+    }
+    let limit = if spilled {
+        let on_disk = spawn_blocking(move || {
+            folders
+                .iter()
+                .map(|folder| dir_bytes(folder).unwrap_or(0))
+                .sum()
+        })
+        .await
+        .map_err(|error| BuildError::Store(format!("drain scratch size: {error}")))?;
+        let space = disk_space(&drain_scratch_parent(options));
+        spilled_drain_row_limit(options, column, space, on_disk)
+    } else {
+        drain_row_limit_now(options, column)
+    };
+    let Some((limit, why)) = limit else {
         return Ok(false);
     };
     let mut oldest_first = recorded.to_vec();
@@ -7074,24 +7160,14 @@ fn recorded_drain_starts_over(
     if fitting.len() == recorded.len() {
         return Ok(false);
     }
-    // Read last: the common case, an epoch that fits, never needs it.
-    for scratch in [
-        drain_scratch_dir(options, &checkpoint.epoch_id),
-        legacy_drain_scratch_dir(&checkpoint.epoch_id),
-    ] {
-        if load_drain_local_checkpoint(&scratch, &checkpoint.epoch_id)?
-            .is_some_and(|local| local.batches_done > 0)
-        {
-            return Ok(false);
-        }
-    }
     info!(
         recorded_superfiles = recorded.len(),
         fitting_superfiles = fitting.len(),
         fitting_rows,
         limit_rows = limit,
         limit = why.label(),
-        "[supertable drain] the recorded drain has finished nothing and no longer fits the row limit; starting a smaller one"
+        spilled,
+        "[supertable drain] the recorded drain has uploaded nothing and no longer fits the row limit; starting a smaller one"
     );
     Ok(true)
 }
@@ -7267,6 +7343,54 @@ async fn materialized_user_rows_for_drain(
     materialized_ivf_rows_in_doc_order(vec_reader, column, stable_ids, tombstones).await
 }
 
+/// Drain every user commit waiting now into the hidden per-cell index.
+///
+/// One drain takes as many of the oldest waiting commits as it has room for
+/// on the scratch disk and in the table's disk budget (see
+/// [`drain_row_limit`]), so this runs drains until the commits that were
+/// waiting when it started are all in the hidden index. Commits that land
+/// meanwhile wait for the next call, so a table under load still reaches
+/// the steps after its drain. It stops early when a drain takes nothing on
+/// (another drain holds the table, or draining is turned off), and with a
+/// drain's error.
+pub(in crate::supertable) async fn drain_waiting_user_superfiles(
+    user_inner: Arc<SupertableInner>,
+    hidden_inner: Arc<SupertableInner>,
+) -> Result<(), BuildError> {
+    let drained = hidden_inner.manifest.load_full().get_drained_ranges();
+    let waiting: Vec<u64> = user_inner
+        .manifest
+        .load_full()
+        .get_all_superfiles_loaded()
+        .await
+        .map_err(|e| BuildError::Store(e.to_string()))?
+        .iter()
+        .map(|source| source.birth_version)
+        .filter(|version| !drained.contains(*version))
+        .collect();
+    let mut left = waiting.len();
+    loop {
+        drain_user_superfiles_to_hidden_cells(Arc::clone(&user_inner), Arc::clone(&hidden_inner))
+            .await?;
+        let drained = hidden_inner.manifest.load_full().get_drained_ranges();
+        let still_waiting = waiting
+            .iter()
+            .filter(|version| !drained.contains(**version))
+            .count();
+        if still_waiting == 0 {
+            return Ok(());
+        }
+        if still_waiting == left {
+            info!(
+                waiting_superfiles = still_waiting,
+                "[supertable drain] a drain took nothing on; the commits left wait for a later optimize"
+            );
+            return Ok(());
+        }
+        left = still_waiting;
+    }
+}
+
 /// Drain user superfiles into the hidden cell index.
 ///
 /// A drain lands in TWO manifest commits:
@@ -7436,7 +7560,16 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             &column,
             &remote_state.checkpoint,
             &selected,
-        )? {
+        )
+        .await?
+        {
+            // What the epoch spilled goes with it: nothing resumes from it,
+            // and the disk it holds is what the smaller drain needs.
+            for folder in
+                drain_spill_folders(&user_inner.options, &remote_state.checkpoint.epoch_id)
+            {
+                DrainScratch::remove_folder(&user_inner.options, folder);
+            }
             None
         } else {
             // The recorded layout, not the current `drain_batch_superfiles`,
@@ -7799,7 +7932,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                     &format!("before batch {} of {n_batches}", batch_idx + 1),
                 )
                 .await?;
-            if let Some((free, total)) = scratch_space(&drain_folder)
+            if let Some((free, total)) = disk_space(&drain_folder)
                 && !scratch_disk_fits(free, total, needed)
             {
                 return Err(BuildError::Store(format!(
@@ -9922,7 +10055,7 @@ fn build_one_shard_from_packed_cells(
     }
     // The file stays behind the bytes, so a publish to local-filesystem
     // storage links it into place instead of writing the shard again.
-    let bytes = mmap_temp_file_bytes(output)
+    let bytes = seal_build_output(&inner.options, output)
         .map_err(|error| BuildError::Store(format!("compacted shard mmap: {error}")))?;
 
     Ok(ShardOutput {
@@ -10514,7 +10647,7 @@ fn build_one_packed_shard_via_drain(
     }
     // The file stays behind the bytes, so a publish to local-filesystem
     // storage links it into place instead of writing the shard again.
-    let bytes = mmap_temp_file_bytes(output)
+    let bytes = seal_build_output(&inner.options, output)
         .map_err(|error| BuildError::Store(format!("compacted shard mmap: {error}")))?;
 
     Ok(Some(ShardOutput {
@@ -12691,7 +12824,7 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
             dim,
             metric,
         ) {
-            Ok(router) if !router.node_map.is_empty() => {
+            Ok(router) if router.live_nodes > 0 => {
                 let queries = cal.frozen_queries().unwrap_or(&[]);
                 let (selection, max_fanout, register_floor, parity_gap) =
                     crate::supertable::query::vector::build_router_fanout_selection(
@@ -12712,7 +12845,7 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
                     .max(calib_k)
                     .max(1);
                 let ctx = opann::FanoutCalibCtx {
-                    total_fine: router.node_map.len().min(u32::MAX as usize) as u32,
+                    total_fine: router.live_nodes.min(u32::MAX as usize) as u32,
                     max_fanout,
                     register_floor,
                     parity_gap,
@@ -16049,7 +16182,10 @@ mod tests {
                 commit::{MANIFEST_DIR, POINTER_PATH, manifest_uri},
             },
             query::vector::assemble_hnsw_incremental,
-            reader_cache::{config::DiskCacheConfig, disk::DiskCacheStore},
+            reader_cache::{
+                config::DiskCacheConfig,
+                disk::{DiskCacheStore, give_back_temp_file_charge},
+            },
             schema::change::SchemaChange,
             slow_vector_state::STORAGE_PREFIX as SLOW_VECTOR_STATE_STORAGE_PREFIX,
             storage::{LocalFsStorageProvider, ObjectMeta},
@@ -16243,6 +16379,14 @@ mod tests {
             .expect("load parts");
         expect_stamped(&loaded);
     }
+
+    /// Disk budget per byte of it that temp files may take.
+    const SCRATCH_SHARE_OF_BUDGET: u64 = 2;
+
+    /// Rows of room a spilled drain's own spill is checked to add.
+    const SPILLED_ROWS_ROOM: u64 = 1_000;
+    /// Free and total bytes of the scratch disk that check is made on.
+    const SPILLED_TEST_DISK: (u64, u64) = (1 << 30, 1 << 34);
 
     /// Bytes of each file a process killed mid-drain leaves in its folder.
     const CRASH_LEFTOVER_BYTES: usize = 4096;
@@ -17715,26 +17859,50 @@ mod tests {
             .await
             .expect("record the drain");
         let column = vector_index_column(table.inner()).expect("vector column");
-        let starts_over = |checkpoint: &DrainRemoteCheckpoint| {
-            recorded_drain_starts_over(options, &column, checkpoint, &sources).expect("decide")
+        let starts_over = async |checkpoint: &DrainRemoteCheckpoint| {
+            recorded_drain_starts_over(options, &column, checkpoint, &sources)
+                .await
+                .expect("decide")
         };
 
-        // A shard already uploaded, or a batch already spilled, is kept.
+        // A shard already uploaded is kept. So is a batch already spilled
+        // when only `vector.drain_max_rows` says the drain is too large:
+        // the disk holds it, and starting over would spill it again.
         let mut uploaded = checkpoint.clone();
         uploaded.completed_shards.push(DrainRemoteShard {
             shard_id: 0,
             superfile_id: "uploaded".into(),
             cell_counts: Vec::new(),
         });
-        assert!(!starts_over(&uploaded));
+        assert!(!starts_over(&uploaded).await);
         let scratch = drain_scratch_dir(options, &checkpoint.epoch_id);
         fs::create_dir_all(&scratch).expect("scratch");
         let mut spilled = DrainLocalCheckpoint::new(checkpoint.epoch_id.clone());
         spilled.batches_done = 1;
         save_drain_local_checkpoint(&scratch, &spilled).expect("local checkpoint");
-        assert!(!starts_over(&checkpoint));
-        fs::remove_dir_all(&scratch).expect("remove scratch");
-        assert!(starts_over(&checkpoint));
+        assert!(!starts_over(&checkpoint).await);
+        // A spilled drain is measured against the disk alone, with what it
+        // has spilled counted as room: each byte of spill is room for half
+        // a byte more, the other half being its cells.
+        let row_bytes = drain_spill_row_bytes(options, &column).expect("vector column");
+        let rows_with = |on_disk: u64| {
+            spilled_drain_row_limit(options, &column, Some(SPILLED_TEST_DISK), on_disk)
+                .expect("the disk limits it")
+        };
+        let (rows, why) = rows_with(0);
+        assert_eq!(why, DrainRowLimit::ScratchDisk);
+        let held = SPILLED_ROWS_ROOM * row_bytes * DRAIN_SPILL_ROOM_DIVISOR;
+        assert_eq!(rows_with(held).0, rows + SPILLED_ROWS_ROOM);
+        assert_eq!(
+            spilled_drain_row_limit(options, &column, None, held),
+            None,
+            "an unreadable disk limits nothing"
+        );
+
+        // What it wrote before its first batch finished goes with it.
+        spilled.batches_done = 0;
+        save_drain_local_checkpoint(&scratch, &spilled).expect("local checkpoint");
+        assert!(starts_over(&checkpoint).await);
 
         drain_user_superfiles_to_hidden_cells(
             Arc::clone(table.inner()),
@@ -17742,6 +17910,7 @@ mod tests {
         )
         .await
         .expect("drain");
+        assert!(!scratch.exists(), "the dropped drain's folder is removed");
         let drained = hidden.inner().manifest.load_full().get_drained_ranges();
         for (i, version) in versions.iter().enumerate() {
             assert_eq!(
@@ -17750,6 +17919,119 @@ mod tests {
                 "commit {i} (version {version})"
             );
         }
+    }
+
+    /// Draining a table through its handle, as `optimize` does, leaves no
+    /// commit waiting, however few commits one drain has room for.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_row_limited_table_is_drained_in_one_call() {
+        const COMMITS: usize = 3;
+        let directory = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(directory.path()).expect("provider"));
+        let table = Supertable::create(
+            options_title_emb_serial(COMMIT_AS_DRAIN_TEST_DIM)
+                .with_storage(Arc::clone(&storage))
+                .with_drain_max_rows(COMMIT_AS_DRAIN_TEST_ROWS as u64),
+        )
+        .expect("create");
+        for _ in 0..COMMITS {
+            let mut writer = table.writer().expect("writer");
+            writer
+                .append(&build_axis_vector_batch(
+                    COMMIT_AS_DRAIN_TEST_ROWS,
+                    COMMIT_AS_DRAIN_TEST_DIM,
+                ))
+                .expect("append");
+            writer.commit().expect("commit");
+        }
+        let hidden = table
+            .inner()
+            .vector_index_table
+            .as_ref()
+            .expect("hidden table")
+            .clone();
+
+        drain_waiting_user_superfiles(Arc::clone(table.inner()), Arc::clone(hidden.inner()))
+            .await
+            .expect("drain");
+
+        let drained = hidden.inner().manifest.load_full().get_drained_ranges();
+        let sources = table
+            .inner()
+            .manifest
+            .load_full()
+            .get_all_superfiles_loaded()
+            .await
+            .expect("user sources");
+        assert_eq!(sources.len(), COMMITS);
+        assert!(
+            sources
+                .iter()
+                .all(|source| drained.contains(source.birth_version)),
+            "every commit is drained"
+        );
+        let hidden_rows: u64 = hidden
+            .inner()
+            .manifest
+            .load_full()
+            .get_all_superfiles_loaded()
+            .await
+            .expect("hidden superfiles")
+            .iter()
+            .map(|s| s.n_docs)
+            .sum();
+        assert_eq!(hidden_rows, (COMMITS * COMMIT_AS_DRAIN_TEST_ROWS) as u64);
+    }
+
+    /// On a table whose disk budget has room for one commit's temp files at
+    /// a time, one `optimize` still drains every commit, a drain at a time,
+    /// and its compaction leaves the hidden index in as few files as on a
+    /// table with room for the whole drain at once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn optimize_on_a_tight_disk_budget_drains_every_commit_and_merges_what_it_drained() {
+        const COMMITS: usize = 3;
+        let optimized = async |disk_budget_bytes: u64| {
+            let dir = TempDir::new().expect("tempdir");
+            let (table, cache) = drain_table_with_disk_cache(&dir, disk_budget_bytes);
+            for _ in 0..COMMITS {
+                commit_axis_vectors(&table, COMMIT_AS_DRAIN_TEST_ROWS);
+            }
+            let (hidden, _) = current_drain_epoch(&table).await;
+            table
+                .optimize(&OptimizeOptions::compact(CompactionSettings {
+                    min_fill_percent: 100,
+                    min_superfiles_for_merge: 2,
+                    ..CompactionSettings::default()
+                }))
+                .expect("optimize");
+            let hidden_files = hidden
+                .inner()
+                .manifest
+                .load_full()
+                .get_all_superfiles_loaded()
+                .await
+                .expect("hidden superfiles")
+                .len();
+            cache.assert_budget_consistent();
+            (hidden_index_rows(&hidden).await, hidden_files)
+        };
+        // A budget whose share for temp files holds one commit's spill and
+        // cells.
+        let one_commit = {
+            let dir = TempDir::new().expect("tempdir");
+            let (table, _) = drain_table_with_disk_cache(&dir, roomy_disk_budget());
+            let row_bytes =
+                drain_spill_row_bytes(&table.inner().options, "emb").expect("vector column");
+            COMMIT_AS_DRAIN_TEST_ROWS as u64 * row_bytes * DRAIN_SPILL_ROOM_DIVISOR
+        };
+
+        let (roomy_rows, roomy_files) = optimized(roomy_disk_budget()).await;
+        let (tight_rows, tight_files) = optimized(one_commit * SCRATCH_SHARE_OF_BUDGET).await;
+        let all_rows = (COMMITS * COMMIT_AS_DRAIN_TEST_ROWS) as u64;
+        assert_eq!(roomy_rows, all_rows);
+        assert_eq!(tight_rows, all_rows, "every commit is drained");
+        assert_eq!(tight_files, roomy_files, "and merged into as few files");
     }
 
     /// Compaction that runs while a row-limited drain is stopped partway must
@@ -18910,6 +19192,75 @@ mod tests {
         )
         .expect("valid options")
         .with_writer_pool(writer_pool_with(1))
+    }
+
+    /// A build's output file is charged to the table's disk budget from the
+    /// moment it is sealed. The charge is given back when a disk cache takes
+    /// the file over, and otherwise when the bytes drop. An output past the
+    /// temp files' share of the budget is sealed uncounted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_build_output_is_charged_to_the_disk_budget_until_it_is_taken_over() {
+        const OUTPUT_BYTES: usize = 4096;
+        let dir = TempDir::new().expect("tempdir");
+        let (table, cache) = drain_table_with_disk_cache(&dir, roomy_disk_budget());
+        let options = &table.inner().options;
+        let sealed = |bytes: usize| {
+            let mut output = NamedTempFile::new_in(options.scratch_dir()).expect("temp file");
+            output.write_all(&vec![0u8; bytes]).expect("write");
+            output.flush().expect("flush");
+            seal_build_output(options, output).expect("seal")
+        };
+
+        let output = sealed(OUTPUT_BYTES);
+        assert_eq!(cache.stats().scratch_bytes, OUTPUT_BYTES as u64);
+        cache.assert_budget_consistent();
+        drop(output);
+        assert_eq!(cache.stats().scratch_bytes, 0, "given back with the bytes");
+
+        let output = sealed(OUTPUT_BYTES);
+        give_back_temp_file_charge(&output);
+        assert_eq!(cache.stats().scratch_bytes, 0, "given back at the takeover");
+        drop(output);
+        assert_eq!(cache.stats().scratch_bytes, 0, "and not a second time");
+        cache.assert_budget_consistent();
+
+        let tiny_dir = TempDir::new().expect("tempdir");
+        let (tiny_table, tiny) = drain_table_with_disk_cache(&tiny_dir, TINY_DISK_BUDGET_BYTES);
+        let options = &tiny_table.inner().options;
+        let mut output = NamedTempFile::new_in(options.scratch_dir()).expect("temp file");
+        output.write_all(&[0u8; OUTPUT_BYTES]).expect("write");
+        output.flush().expect("flush");
+        let output = seal_build_output(options, output).expect("a build is never refused");
+        assert_eq!(output.len(), OUTPUT_BYTES);
+        assert_eq!(tiny.stats().scratch_bytes, 0, "left uncounted");
+        tiny.assert_budget_consistent();
+    }
+
+    /// A commit on a table with a disk cache leaves nothing charged for its
+    /// temp files once its outputs are in the cache, so they are counted
+    /// once. A commit on a table whose disk budget has no room for them
+    /// still commits every row.
+    #[test]
+    fn a_commit_charges_nothing_once_the_cache_holds_its_outputs() {
+        const COMMITS: usize = 2;
+        for budget in [roomy_disk_budget(), TINY_DISK_BUDGET_BYTES] {
+            let dir = TempDir::new().expect("tempdir");
+            let (table, cache) = drain_table_with_disk_cache(&dir, budget);
+            for _ in 0..COMMITS {
+                commit_axis_vectors(&table, COMMIT_AS_DRAIN_TEST_ROWS);
+            }
+            let rows: u64 = table
+                .inner()
+                .manifest
+                .load_full()
+                .get_all_superfiles()
+                .iter()
+                .map(|superfile| superfile.n_docs)
+                .sum();
+            assert_eq!(rows, (COMMITS * COMMIT_AS_DRAIN_TEST_ROWS) as u64);
+            assert_eq!(cache.stats().scratch_bytes, 0);
+            cache.assert_budget_consistent();
+        }
     }
 
     fn build_axis_vector_batch(n: usize, dim: usize) -> RecordBatch {

@@ -75,7 +75,7 @@ use crate::{
         Config, CrcVerification, DrainConsolidate, StorageBackend, StorageColdFetchMode,
         ThreadCount, scratch_root,
     },
-    memory::ConnectionMemoryBudget,
+    memory::{ConnectionMemoryBudget, SqlSpill},
     runtime_metrics::rss::total_memory_bytes,
     storage::{
         AzureStorageProvider, GcsStorageProvider, LocalFsStorageProvider, S3StorageProvider,
@@ -460,9 +460,13 @@ pub struct SupertableOptions {
     /// reads a part's bytes from local disk on a hit instead of
     /// round-tripping to object storage. Parts are content-addressed,
     /// so cached files are never stale and the cache survives process
-    /// restarts. Independent of `disk_cache` (which caches superfile
-    /// content) and uses its own byte budget. `None` disables it.
+    /// restarts. It keeps to a byte limit of its own, and what it holds
+    /// is charged to the budget of `disk_cache` (which caches superfile
+    /// content) when it is opened beside one. `None` disables it.
     pub metadata_disk_cache: Option<Arc<MetadataDiskCache>>,
+    /// Where the table's SQL spills, shared with the connection that opened
+    /// it. `None` leaves DataFusion's default, the OS temp directory.
+    pub(crate) sql_spill: Option<Arc<SqlSpill>>,
     /// Superfiles a ranked query opens concurrently when it orders them by
     /// score ceiling. Below this many candidates every superfile opens at
     /// once, exactly as the unordered fan-out does, so ordering costs no
@@ -949,6 +953,7 @@ impl SupertableOptions {
             storage: None,
             disk_cache: None,
             metadata_disk_cache: None,
+            sql_spill: None,
             bound_ordered_open_window: DEFAULT_BOUND_ORDERED_OPEN_WINDOW,
             term_tier_entries_per_term: None,
             term_head_depth: None,
@@ -1220,6 +1225,13 @@ impl SupertableOptions {
     /// resulting `Arc` here.
     pub fn with_metadata_disk_cache(mut self, cache: Arc<MetadataDiskCache>) -> Self {
         self.metadata_disk_cache = Some(cache);
+        self
+    }
+
+    /// Spill the table's SQL through `spill`, the SQL spill of the
+    /// connection that opens it.
+    pub(crate) fn with_sql_spill(mut self, spill: Arc<SqlSpill>) -> Self {
+        self.sql_spill = Some(spill);
         self
     }
 
@@ -1562,16 +1574,17 @@ impl SupertableOptions {
             };
             let cache = DiskCacheStore::new_unpinned(Arc::clone(&storage), disk_cfg)
                 .map_err(|e| BuildError::Store(format!("disk cache construction: {e}")))?;
-            self.disk_cache = Some(cache);
-
             // Manifest-part bytes get their own content-addressed cache
-            // under a sibling subdirectory, with an independent budget.
+            // under a sibling subdirectory, with a limit of its own, charged
+            // to the disk cache's budget.
             let manifest_cache_root = cache_root.join(MANIFEST_CACHE_SUBDIR);
-            let manifest_cache =
-                MetadataDiskCache::new(manifest_cache_root, cfg.storage.manifest_disk_budget_bytes)
-                    .map_err(|e| {
-                        BuildError::Store(format!("manifest disk cache construction: {e}"))
-                    })?;
+            let manifest_cache = MetadataDiskCache::new(
+                manifest_cache_root,
+                cfg.storage.manifest_disk_budget_bytes,
+                Some(Arc::clone(&cache)),
+            )
+            .map_err(|e| BuildError::Store(format!("manifest disk cache construction: {e}")))?;
+            self.disk_cache = Some(cache);
             self.metadata_disk_cache = Some(manifest_cache);
         }
 

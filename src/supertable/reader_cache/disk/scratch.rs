@@ -58,7 +58,7 @@ pub(super) fn scratch_root(cache_root: &Path) -> PathBuf {
 
 /// One open store's folder of temporary files, removed when the store is
 /// dropped.
-pub(super) struct RunScratch {
+pub(crate) struct RunScratch {
     dir: PathBuf,
     lock_path: PathBuf,
     /// Holds the lock that marks the folder as a live store's. `None` on a
@@ -69,7 +69,7 @@ pub(super) struct RunScratch {
 impl RunScratch {
     /// Remove the `run-` folders under `scratch` that exited processes left,
     /// then make this store's own.
-    pub(super) fn open(scratch: &Path) -> io::Result<Self> {
+    pub(crate) fn open(scratch: &Path) -> io::Result<Self> {
         fs::create_dir_all(scratch)?;
         remove_orphaned_runs(scratch);
         let name = format!(
@@ -91,7 +91,7 @@ impl RunScratch {
     /// The folder. Made on each call, so a build still has it after the
     /// cache folder was cleared under an open table. A failure shows up when
     /// the build creates its first file there.
-    pub(super) fn dir(&self) -> PathBuf {
+    pub(crate) fn dir(&self) -> PathBuf {
         let _ = fs::create_dir_all(&self.dir);
         self.dir.clone()
     }

@@ -292,7 +292,8 @@ mod tests {
 
     #[test]
     fn sessions_run_the_rule() {
-        let ctx = budgeted_session_context(&ConnectionMemoryBudget::measured()).expect("session");
+        let ctx =
+            budgeted_session_context(&ConnectionMemoryBudget::measured(), None).expect("session");
         assert!(
             ctx.state()
                 .physical_optimizers()

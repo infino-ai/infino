@@ -1606,8 +1606,9 @@ pub struct StorageSettings {
     /// Byte budget for the content-addressed manifest-part cache, kept
     /// in a `manifest-parts/` subdirectory of `disk_cache_root`. The
     /// loader reads part bytes from local disk on a hit instead of
-    /// fetching from object storage. Independent of `disk_budget_bytes`
-    /// (which sizes the superfile-content cache). Default 2 GiB. This is
+    /// fetching from object storage. A limit of its own, and what the
+    /// cache holds also counts against `disk_budget_bytes`, the budget of
+    /// the superfile-content cache. Default 2 GiB. This is
     /// the working room for objects fetched a piece at a time (the term
     /// index's slices); on top of it the cache holds the table's current
     /// manifest whole (a hidden vector index's cache, its state and
