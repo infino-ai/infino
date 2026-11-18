@@ -652,6 +652,25 @@ impl Reservation {
         Ok(())
     }
 
+    /// [`Self::try_grow`] for a [`Reclaim`] holder: it never asks the others
+    /// to give memory back, so one holder can't take another's (nor ask
+    /// itself while it is changing what it holds).
+    pub(crate) fn try_grow_without_reclaim(&mut self, extra: usize) -> Result<(), OverBudget> {
+        self.budget.grow_within_limit(extra).inspect_err(|_| {
+            self.budget.denials.fetch_add(1, Ordering::Relaxed);
+        })?;
+        self.size += extra;
+        Ok(())
+    }
+
+    /// Give `by` bytes of the reservation back to the budget, at most what
+    /// it holds.
+    pub(crate) fn shrink(&mut self, by: usize) {
+        let by = by.min(self.size);
+        self.size -= by;
+        self.budget.release(by);
+    }
+
     /// Bytes currently held.
     pub(crate) fn size(&self) -> usize {
         self.size

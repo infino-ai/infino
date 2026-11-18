@@ -33,8 +33,14 @@ use std::{
 
 use bytes::Bytes;
 
-use super::{ReaderCacheError, SuperfileReaderCache, disk::release_temp_file};
-use crate::{superfile::SuperfileReader, supertable::manifest::SuperfileUri};
+use super::{
+    ReaderCacheError, SuperfileReaderCache,
+    disk::release_temp_file,
+    kept_lazy::{KEPT_LAZY_MAX_BYTES, KeptLazyReaders},
+};
+use crate::{
+    memory::ConnectionMemoryBudget, superfile::SuperfileReader, supertable::manifest::SuperfileUri,
+};
 
 /// Per-URI entry. Holds the raw bytes alongside the parsed reader
 /// so `resident_bytes()` can attribute storage back to specific
@@ -53,6 +59,24 @@ struct Entry {
 /// construction and pass that around instead.
 pub struct InMemoryReaderCache {
     inner: RwLock<HashMap<SuperfileUri, Entry>>,
+    /// The lazy readers the storage-only open of `superfile_reader_tiered`
+    /// opened on this table, by superfile. A table with durable storage and
+    /// no disk cache (every connection without `cache_dir`, the default)
+    /// otherwise opened every superfile a query read anew: a footer read and
+    /// parse, then on its first scan the page indexes, read and parsed for
+    /// every column. A superfile never changes once written, so its reader,
+    /// with what it parsed, serves every later query on the table.
+    ///
+    /// Kept here, beside the table's own reader cache, rather than for the
+    /// process: each reader reads through the storage handle it was opened
+    /// with, and the store belongs to one table handle, opened by one
+    /// connection with that connection's storage. So a reader is only ever
+    /// reused by the handle that opened it, and is dropped with it.
+    ///
+    /// Each reader is weighed by what it holds, which grows as queries load
+    /// into it, and charged to the connection's memory budget once the
+    /// table attached it (see [`KeptLazyReaders`]).
+    kept_lazy: Arc<KeptLazyReaders>,
 }
 
 impl InMemoryReaderCache {
@@ -60,6 +84,7 @@ impl InMemoryReaderCache {
     pub fn new() -> Self {
         Self {
             inner: RwLock::new(HashMap::new()),
+            kept_lazy: Arc::new(KeptLazyReaders::new(KEPT_LAZY_MAX_BYTES)),
         }
     }
 
@@ -141,6 +166,19 @@ impl SuperfileReaderCache for InMemoryReaderCache {
             .write()
             .expect("InMemoryReaderCache rwlock poisoned")
             .remove(uri);
+        self.kept_lazy.remove(uri);
+    }
+
+    fn lazy(&self, uri: &SuperfileUri) -> Option<Arc<SuperfileReader>> {
+        self.kept_lazy.get(uri)
+    }
+
+    fn keep_lazy(&self, uri: SuperfileUri, reader: Arc<SuperfileReader>) -> Arc<SuperfileReader> {
+        self.kept_lazy.keep(uri, reader)
+    }
+
+    fn attach_memory_budget(&self, budget: &Arc<ConnectionMemoryBudget>) {
+        self.kept_lazy.attach(budget);
     }
 }
 
@@ -408,5 +446,198 @@ mod tests {
         let r1 = store.reader(&uri).expect("r1");
         let r2 = store.reader(&uri).expect("r2");
         assert!(Arc::ptr_eq(&r1, &r2));
+    }
+
+    // ---- kept lazy readers -------------------------------------------
+
+    /// A configured budget that holds several readers (the enforced
+    /// ceiling is 90% of it).
+    const ROOMY_BUDGET_BYTES: u64 = 64 << 20;
+
+    /// A configured budget too small for any reader's footer.
+    const TINY_BUDGET_BYTES: u64 = 16;
+
+    /// A reader over the minimal superfile, as the storage-only tier would
+    /// keep one.
+    fn reader() -> Arc<SuperfileReader> {
+        Arc::new(SuperfileReader::open(minimal_superfile_bytes()).expect("open"))
+    }
+
+    /// Kept readers are weighed by what they hold and bounded by bytes:
+    /// past the bound the least recently used goes, and a hit makes a
+    /// reader the newest. The first reader kept for a superfile wins.
+    #[test]
+    fn kept_readers_are_bounded_by_what_they_hold() {
+        let (a, b, c) = (reader(), reader(), reader());
+        let (ua, ub, uc) = (fresh_uri(), fresh_uri(), fresh_uri());
+        let weight = a.held_bytes();
+        assert!(weight > 0, "a reader holds at least its parsed footer");
+        // Room for two of these readers, not three.
+        let kept = Arc::new(KeptLazyReaders::new(weight * 2 + weight / 2));
+
+        assert!(Arc::ptr_eq(&kept.keep(ua, Arc::clone(&a)), &a));
+        // A racing open of the same superfile is handed the first reader.
+        assert!(Arc::ptr_eq(&kept.keep(ua, reader()), &a));
+        kept.keep(ub, Arc::clone(&b));
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept.bytes(), a.held_bytes() + b.held_bytes());
+
+        // `a` is used again, so `b` is the least recently used when `c`
+        // pushes the readers past the bound.
+        assert!(kept.get(&ua).is_some());
+        kept.keep(uc, Arc::clone(&c));
+        assert!(kept.get(&ub).is_none(), "the least recently used goes");
+        assert!(kept.get(&ua).is_some());
+        assert!(kept.get(&uc).is_some());
+        assert_eq!(kept.bytes(), a.held_bytes() + c.held_bytes());
+
+        // A reader heavier than the whole bound is handed back, not kept.
+        let small = Arc::new(KeptLazyReaders::new(weight / 2));
+        assert!(Arc::ptr_eq(&small.keep(ua, Arc::clone(&a)), &a));
+        assert_eq!(small.len(), 0);
+        assert_eq!(small.bytes(), 0);
+    }
+
+    /// The kept readers are charged to the connection's budget once the
+    /// table attaches it, are given back when they are dropped, and are all
+    /// taken back when a reservation on the connection does not fit.
+    #[test]
+    fn kept_readers_charge_the_connection_budget_which_can_take_them_back() {
+        let budget = ConnectionMemoryBudget::with_limit(ROOMY_BUDGET_BYTES);
+        let kept = Arc::new(KeptLazyReaders::new(KEPT_LAZY_MAX_BYTES));
+        let (ua, ub) = (fresh_uri(), fresh_uri());
+        kept.keep(ua, reader());
+        // Attaching moves what is already kept onto the budget.
+        kept.attach(&budget);
+        assert_eq!(budget.used(), kept.bytes());
+        kept.keep(ub, reader());
+        assert_eq!(kept.len(), 2);
+        assert_eq!(budget.used(), kept.bytes());
+
+        kept.remove(&ua);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(
+            budget.used(),
+            kept.bytes(),
+            "a dropped reader's charge comes back"
+        );
+
+        // A reservation that only fits once the readers are given back
+        // takes them back.
+        let limit = budget.limit().expect("bounded");
+        let wanted = limit - budget.used() + 1;
+        let held = budget
+            .try_reserve(wanted)
+            .expect("fits once the readers are reclaimed");
+        assert_eq!(kept.len(), 0);
+        assert_eq!(kept.bytes(), 0);
+        assert_eq!(budget.used(), wanted);
+        drop(held);
+        assert_eq!(budget.used(), 0);
+    }
+
+    /// Load into `reader` what a table scan keeps of it: a scan footer of
+    /// its own, as large as its parsed footer. Returns the bytes it adds.
+    fn load_a_scan_footer(reader: &SuperfileReader) -> usize {
+        let before = reader.held_bytes();
+        reader
+            .scan_footer(reader.parquet_metadata(), |footer| {
+                Ok::<_, ()>(Arc::new((*footer).clone()))
+            })
+            .expect("derived");
+        let added = reader.held_bytes() - before;
+        assert!(added > 0, "a scan footer of its own adds to what it holds");
+        added
+    }
+
+    /// What a query loads into a kept reader is weighed and charged as it
+    /// lands, not when the reader is next handed out: the readers' bytes and
+    /// the budget follow the load with no further open of the superfile.
+    #[test]
+    fn a_load_into_a_kept_reader_is_charged_as_it_lands() {
+        let budget = ConnectionMemoryBudget::with_limit(ROOMY_BUDGET_BYTES);
+        let kept = Arc::new(KeptLazyReaders::new(KEPT_LAZY_MAX_BYTES));
+        kept.attach(&budget);
+        let a = reader();
+        assert!(Arc::ptr_eq(&kept.keep(fresh_uri(), Arc::clone(&a)), &a));
+        let at_keep = kept.bytes();
+        assert_eq!(budget.used(), at_keep);
+
+        let added = load_a_scan_footer(&a);
+        assert_eq!(kept.bytes(), at_keep + added);
+        assert_eq!(kept.bytes(), a.held_bytes());
+        assert_eq!(budget.used(), kept.bytes());
+    }
+
+    /// A load that takes the kept readers past their bound drops the least
+    /// recently used as it lands.
+    #[test]
+    fn a_load_past_the_bound_drops_the_least_recently_used() {
+        let (a, b) = (reader(), reader());
+        let (ua, ub) = (fresh_uri(), fresh_uri());
+        let weight = a.held_bytes();
+        // Room for two of these readers as opened, not once one of them
+        // holds a scan footer as large as its parsed one.
+        let bound = weight * 2 + weight / 2;
+        let budget = ConnectionMemoryBudget::with_limit(ROOMY_BUDGET_BYTES);
+        let kept = Arc::new(KeptLazyReaders::new(bound));
+        kept.attach(&budget);
+        kept.keep(ua, Arc::clone(&a));
+        kept.keep(ub, Arc::clone(&b));
+        assert_eq!(kept.len(), 2);
+
+        load_a_scan_footer(&b);
+        assert!(a.held_bytes() + b.held_bytes() > bound);
+        assert!(b.held_bytes() <= bound);
+        assert_eq!(kept.len(), 1, "the load pushed the readers past the bound");
+        assert_eq!(kept.bytes(), b.held_bytes(), "`a` went, `b` stayed");
+        assert_eq!(budget.used(), kept.bytes());
+        assert!(kept.get(&ua).is_none());
+        assert!(Arc::ptr_eq(&kept.get(&ub).expect("kept"), &b));
+    }
+
+    /// A load into a reader no longer kept, because it was dropped or a
+    /// later open replaced it, leaves the kept readers as they are: a query
+    /// still holding a dropped reader does not bring it back.
+    #[test]
+    fn a_load_into_a_reader_no_longer_kept_is_not_charged() {
+        let budget = ConnectionMemoryBudget::with_limit(ROOMY_BUDGET_BYTES);
+        let kept = Arc::new(KeptLazyReaders::new(KEPT_LAZY_MAX_BYTES));
+        kept.attach(&budget);
+        let ua = fresh_uri();
+        let (dropped, replacement) = (reader(), reader());
+        kept.keep(ua, Arc::clone(&dropped));
+        kept.remove(&ua);
+        load_a_scan_footer(&dropped);
+        assert_eq!(kept.len(), 0, "a dropped reader is not kept again");
+        assert_eq!(kept.bytes(), 0);
+        assert_eq!(budget.used(), 0);
+
+        let replaced = reader();
+        kept.keep(ua, Arc::clone(&replaced));
+        kept.remove(&ua);
+        kept.keep(ua, Arc::clone(&replacement));
+        let weighed = kept.bytes();
+        load_a_scan_footer(&replaced);
+        assert_eq!(
+            kept.bytes(),
+            weighed,
+            "a load into the replaced reader is not charged to its successor"
+        );
+        assert_eq!(budget.used(), weighed);
+        assert!(Arc::ptr_eq(&kept.get(&ua).expect("kept"), &replacement));
+    }
+
+    /// A reader the budget has no room for is handed back without being
+    /// kept, so keeping never takes the connection past its budget.
+    #[test]
+    fn a_reader_the_budget_refuses_is_not_kept() {
+        let budget = ConnectionMemoryBudget::with_limit(TINY_BUDGET_BYTES);
+        let kept = Arc::new(KeptLazyReaders::new(KEPT_LAZY_MAX_BYTES));
+        kept.attach(&budget);
+        let a = reader();
+        assert!(Arc::ptr_eq(&kept.keep(fresh_uri(), Arc::clone(&a)), &a));
+        assert_eq!(kept.len(), 0);
+        assert_eq!(budget.used(), 0);
     }
 }

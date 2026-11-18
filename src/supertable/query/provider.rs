@@ -94,6 +94,7 @@ use datafusion::{
     },
     scalar::ScalarValue,
 };
+use futures::future::try_join_all;
 use object_store::ObjectStore as OsObjectStore;
 use parquet::{
     arrow::{
@@ -149,6 +150,7 @@ use crate::{
             read_ahead::ScanReadAhead,
             schema_adapter::TableExprAdapterFactory,
             skip::{ColumnTypeGuard, ScalarOp, ScalarPredicate},
+            sql::StatementStores,
             superfile_reader::{
                 OpenTierCounts, superfile_reader_in_memory, superfile_reader_tiered,
             },
@@ -1383,6 +1385,121 @@ impl SupertableProvider {
         Ok((total, unindexed))
     }
 
+    /// Every bucket's [`Self::counted_rows`] in one pass over the table, when
+    /// each bucket is one interval on the same range-indexed column: each
+    /// superfile's range index is read once for all the buckets, where a
+    /// count per bucket opens every superfile once per bucket.
+    ///
+    /// The superfiles read are those any bucket's filters keep, each read
+    /// once. One is counted for every bucket, those whose filters prune it
+    /// included: a bucket's interval holds exactly the rows its filters do,
+    /// and a superfile its filters prune holds none of them, so the range
+    /// index counts 0 there, the count of a bucket that skips the superfile.
+    ///
+    /// `None` when a bucket is not such an interval, there are fewer than
+    /// two, or a superfile read has no range index over the column: the
+    /// buckets are then counted one at a time. The first such superfile
+    /// found ends the pass, so that count follows only the superfiles
+    /// already in flight, not a whole pass.
+    pub(crate) async fn batched_range_counts(
+        &self,
+        buckets: &[RangeBucket],
+    ) -> DfResult<Option<Vec<u64>>> {
+        /// Why a pass ends before it reads every superfile.
+        enum Stop {
+            /// A superfile with no range index over the column.
+            Unindexed,
+            Failed(DataFusionError),
+        }
+
+        if buckets.len() < 2 {
+            return Ok(None);
+        }
+        let Some(first) = buckets[0].range.as_ref() else {
+            return Ok(None);
+        };
+        let mut ranges = Vec::with_capacity(buckets.len());
+        for bucket in buckets {
+            let Some(range) = bucket.range.as_ref() else {
+                return Ok(None);
+            };
+            if range.field != first.field || range.data_type != first.data_type {
+                return Ok(None);
+            }
+            ranges.push((range.lo, range.hi));
+        }
+        let kept = try_join_all(
+            buckets
+                .iter()
+                .map(|bucket| self.select_survivors(&bucket.filters)),
+        )
+        .await?;
+        let mut seen = HashSet::new();
+        let survivors: Vec<Arc<SuperfileEntry>> = kept
+            .into_iter()
+            .flatten()
+            .filter(|entry| seen.insert(entry.superfile_id))
+            .collect();
+        let now = Instant::now();
+        self.prefetch_tombstones(&survivors, now).await;
+        let in_flight = self.manifest.options.superfiles_in_flight;
+        let pool: &ThreadPool = &self.manifest.options.reader_pool;
+        let ranges = &ranges;
+        let per_file = try_join_bounded(
+            survivors.iter().cloned().map(|entry| {
+                let prepared = self.prepared_scan_file(Arc::clone(&entry));
+                async move {
+                    let counts = async {
+                        let prepared = prepared.await?;
+                        let reader = &prepared.reader;
+                        let tombstones = self.deleted_rows(entry.superfile_id, now)?;
+                        let (field, data_type) = (first.field, &first.data_type);
+                        if tombstones.is_empty() {
+                            return reader
+                                .range_counts(field, data_type, ranges)
+                                .await
+                                .map_err(|e| DataFusionError::from(QueryError::from(e)));
+                        }
+                        let mut counts = Vec::with_capacity(ranges.len());
+                        for &(lo, hi) in ranges {
+                            let rows = reader
+                                .range_rows(field, data_type, lo, hi, Some(pool))
+                                .await
+                                .map_err(QueryError::from)?;
+                            let Some(rows) = rows else {
+                                return Ok(None);
+                            };
+                            counts.push((rows - tombstones.as_ref()).len());
+                        }
+                        Ok::<_, DataFusionError>(Some(counts))
+                    }
+                    .await;
+                    // An error ends the join, so a superfile with no range
+                    // index stops the pass where it is found.
+                    match counts {
+                        Ok(Some(counts)) => Ok(counts),
+                        Ok(None) => Err(Stop::Unindexed),
+                        Err(e) => Err(Stop::Failed(e)),
+                    }
+                }
+            }),
+            in_flight,
+        )
+        .await;
+        let per_file = match per_file {
+            Ok(per_file) => per_file,
+            Err(Stop::Unindexed) => return Ok(None),
+            Err(Stop::Failed(e)) => return Err(e),
+        };
+        let mut totals = vec![0u64; ranges.len()];
+        for counts in per_file {
+            for (total, n) in totals.iter_mut().zip(counts) {
+                *total += n;
+            }
+        }
+        Ok(Some(totals))
+    }
+
     /// The rows of the `unindexed` superfiles `filters` hold, as rows with no
     /// columns: those superfiles scanned for `range`'s column, with `filters`
     /// applied above the scan.
@@ -1728,7 +1845,7 @@ impl SupertableProvider {
                 &entry.storage_path(),
                 open_intent,
             );
-            if let Some(reader) = &resident
+            if let Some((reader, tier)) = &resident
                 && let Some(parquet_meta) = reader.loaded_parquet_metadata_with_page_index()
             {
                 let prepared = cell
@@ -1738,7 +1855,7 @@ impl SupertableProvider {
                             &scan_footers,
                             &entry,
                             Arc::clone(reader),
-                            OpenTier::Memory,
+                            *tier,
                             parquet_meta,
                             statistics,
                         )
@@ -1753,7 +1870,7 @@ impl SupertableProvider {
                         // A reader already in memory only lacks its page
                         // indexes; reuse it rather than walk the tiers again.
                         let (reader, tier) = match resident {
-                            Some(reader) => (reader, OpenTier::Memory),
+                            Some(resident) => resident,
                             None => superfile_reader_tiered(
                                 &store,
                                 disk_cache.as_ref(),
@@ -3000,30 +3117,53 @@ impl TableProvider for SupertableProvider {
 
         // The files a scan of kept decoded columns would read (built below,
         // once the Parquet scan it stands in for is). Not for a scan the index
-        // narrowed to a few rows (the Parquet scan decodes just their pages),
-        // nor for a scan of no column — except the rows a top-k reads from
-        // the range index: up to the cutoff, ties included, they are spread
-        // over the file, so the Parquet scan decodes a page of every wide
-        // column for each, where kept columns hand them over decoded.
+        // narrowed to a few rows in every superfile (the Parquet scan decodes
+        // just their pages), nor for a scan of no column — except:
+        // - the rows a top-k reads from the range index: up to the cutoff,
+        //   ties included, they are spread over the file, so the Parquet scan
+        //   decodes a page of every wide column for each, where kept columns
+        //   hand them over decoded;
+        // - a scan the index narrowed in some superfiles only: the others are
+        //   read whole, which kept columns serve, and the Parquet scan the
+        //   narrowed ones would keep it on would decode every superfile again
+        //   on every statement. A narrowed row group hands over its rows from
+        //   kept columns when they are kept, and otherwise reads just those
+        //   rows from its pages without keeping them, as the Parquet scan
+        //   would, unless the scan uses most of it or read it before
+        //   (`CachedScanExec`).
         let output = projected_schema(&self.schema, projection)?;
-        let top_k_selected = top_k_rows.is_some();
+        let narrowed = superfiles
+            .iter()
+            .filter(|seg| seg.candidates.is_some())
+            .count();
+        let partly_narrowed = narrowed > 0 && narrowed < superfiles.len();
+        let selects_rows = top_k_rows.is_some() || partly_narrowed;
         let cached_files = (self.manifest.options.decoded_columns.is_some()
             && has_columns(&output)
-            && (top_k_selected || superfiles.iter().all(|seg| seg.candidates.is_none())))
-        .then(|| {
-            superfiles
-                .iter()
-                .zip(&survivor_entries)
-                .map(|(seg, entry)| CachedFile {
-                    uri: entry.uri,
-                    reader: Arc::clone(&seg.prepared.reader),
-                    footer: Arc::clone(&seg.prepared.footer),
-                    row_counts: Arc::clone(&seg.prepared.shape.row_counts),
-                    tombstones: Arc::clone(&seg.tombstones),
-                    selected: top_k_selected.then(|| seg.candidates.clone()).flatten(),
-                })
-                .collect::<Vec<_>>()
-        });
+            && (selects_rows || narrowed == 0))
+            .then(|| {
+                superfiles
+                    .iter()
+                    .zip(&survivor_entries)
+                    .map(|(seg, entry)| CachedFile {
+                        uri: entry.uri,
+                        reader: Arc::clone(&seg.prepared.reader),
+                        footer: Arc::clone(&seg.prepared.footer),
+                        row_counts: Arc::clone(&seg.prepared.shape.row_counts),
+                        tombstones: Arc::clone(&seg.tombstones),
+                        // The live candidates only: a row group holding
+                        // none of them reads nothing, and the scan checks
+                        // them against no tombstone again.
+                        selected: selects_rows
+                            .then(|| {
+                                seg.candidates
+                                    .as_ref()
+                                    .map(|keep| keep - seg.tombstones.as_ref())
+                            })
+                            .flatten(),
+                    })
+                    .collect::<Vec<_>>()
+            });
         let cached_stats = cached_files
             .is_some()
             .then(|| scan_stats.clone().project(projection));
@@ -3032,6 +3172,11 @@ impl TableProvider for SupertableProvider {
         state
             .runtime_env()
             .register_object_store(url.as_ref(), store);
+        // A connection's statements share one runtime: the statement removes
+        // the registration once it is done.
+        if let Some(stores) = state.config().get_extension::<StatementStores>() {
+            stores.record(&url);
+        }
         let mut builder = FileScanConfigBuilder::new(url, Arc::new(source))
             .with_expr_adapter(Some(Arc::new(TableExprAdapterFactory::new(&self.manifest))));
         for file in files {
@@ -3928,8 +4073,8 @@ pub(crate) mod tests {
 
     use arrow::util::display::{ArrayFormatter, FormatOptions};
     use arrow_array::{
-        Array, Float32Array, Float64Array, Int64Array, LargeStringArray, RecordBatch,
-        RecordBatchIterator, StringArray, TimestampSecondArray,
+        Array, Date32Array, Float32Array, Float64Array, Int64Array, LargeStringArray, RecordBatch,
+        RecordBatchIterator, StringArray, TimestampNanosecondArray, TimestampSecondArray,
     };
     use arrow_schema::{DataType, Field, Schema, TimeUnit};
     use datafusion::{
@@ -3978,6 +4123,7 @@ pub(crate) mod tests {
                 HeapBudget,
                 test_support::{cache_buffered, lazy_entries},
             },
+            schema::change::{FieldPatch, SchemaPatch},
         },
         test_helpers::{
             build_title_batch, default_supertable_options, default_tokenizer,
@@ -4876,6 +5022,209 @@ pub(crate) mod tests {
         assert_eq!(provider.surviving_superfile_count(&inside).await, 1);
         assert_eq!(provider.surviving_superfile_count(&before).await, 0);
         assert_eq!(provider.surviving_superfile_count(&after).await, 0);
+    }
+
+    /// One bucket of a histogram: `column` in `[lo, hi)`, as the
+    /// covered-aggregate rewrite plans it.
+    fn histogram_bucket(
+        provider: &SupertableProvider,
+        column: &str,
+        lo: Expr,
+        hi: Expr,
+    ) -> RangeBucket {
+        let predicate = col(column).gt_eq(lo).and(col(column).lt(hi));
+        RangeBucket {
+            name: format!("{predicate}"),
+            range: Some(
+                provider
+                    .counted_range(&predicate)
+                    .expect("a range on a range-indexed column"),
+            ),
+            filters: split_conjunction(&predicate).into_iter().cloned().collect(),
+        }
+    }
+
+    /// The superfiles `provider` has opened.
+    fn opened_superfiles(provider: &SupertableProvider) -> usize {
+        provider
+            .prepared_scan_files
+            .files
+            .iter()
+            .filter(|cell| cell.get().is_some())
+            .count()
+    }
+
+    /// A histogram over a time-partitioned table opens only the superfiles
+    /// its buckets' filters keep, and counts each bucket as the bucket
+    /// alone counts it, a superfile one bucket keeps and another prunes
+    /// included, and after a delete.
+    #[test]
+    fn a_histogram_opens_only_the_superfiles_its_buckets_keep() {
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let st = Supertable::create(
+            time_hits_opts()
+                .with_storage(storage)
+                .with_range_indexes(&["time".to_string()]),
+        )
+        .expect("create");
+        let mut w = st.writer().expect("writer");
+        for hours in [[0, 1], [2, 3], [4, 5]] {
+            w.append(&time_hits_batch(&hours)).expect("append");
+            w.commit().expect("commit");
+        }
+        drop(w);
+        assert_eq!(st.reader().expect("reader").n_superfiles(), 3);
+        let rt = query_runtime();
+        let hours = |provider: &SupertableProvider, spans: &[(i64, i64)]| -> Vec<RangeBucket> {
+            spans
+                .iter()
+                .map(|&(lo, hi)| histogram_bucket(provider, "time", at_hour(lo), at_hour(hi)))
+                .collect()
+        };
+        // Each bucket counted alone, from its own survivors.
+        let one_at_a_time = |provider: &SupertableProvider, buckets: &[RangeBucket]| -> Vec<u64> {
+            buckets
+                .iter()
+                .map(|bucket| {
+                    rt.block_on(provider.indexed_rows(bucket.range.as_ref(), &bucket.filters))
+                        .expect("count")
+                        .expect("every superfile is range-indexed")
+                })
+                .collect()
+        };
+
+        // Two hours of the middle superfile: only it is opened.
+        let provider = provider_of(&st);
+        let buckets = hours(&provider, &[(2, 3), (3, 4)]);
+        let counts = rt
+            .block_on(provider.batched_range_counts(&buckets))
+            .expect("count")
+            .expect("the buckets are counted in one pass");
+        assert_eq!(counts, vec![1, 1]);
+        assert_eq!(opened_superfiles(&provider), 1);
+
+        // The first superfile kept by one bucket, the second by another
+        // (which the first bucket prunes), and a bucket past the table.
+        let spans = [(1, 2), (2, 4), (10, 11)];
+        let provider = provider_of(&st);
+        let buckets = hours(&provider, &spans);
+        let counts = rt
+            .block_on(provider.batched_range_counts(&buckets))
+            .expect("count")
+            .expect("the buckets are counted in one pass");
+        assert_eq!(counts, vec![1, 2, 0]);
+        assert_eq!(opened_superfiles(&provider), 2);
+        assert_eq!(counts, one_at_a_time(&provider_of(&st), &buckets));
+
+        st.delete(col("time").eq(at_hour(3))).expect("delete");
+        let provider = provider_of(&st);
+        let buckets = hours(&provider, &spans);
+        let counts = rt
+            .block_on(provider.batched_range_counts(&buckets))
+            .expect("count")
+            .expect("the buckets are counted in one pass");
+        assert_eq!(counts, vec![1, 1, 0]);
+        assert_eq!(counts, one_at_a_time(&provider_of(&st), &buckets));
+    }
+
+    /// A histogram over superfiles of which some have no range index over
+    /// its column (written before the column's type changed) stops its pass
+    /// at the first such superfile it opens, rather than opening every
+    /// superfile before the buckets are counted one at a time.
+    #[test]
+    fn a_histogram_stops_at_the_first_superfile_with_no_range_index() {
+        let day_hits = |day: DataType| {
+            Arc::new(Schema::new(vec![
+                Field::new("day", day, false),
+                Field::new("hits", DataType::Int64, false),
+            ]))
+        };
+        let pool = Arc::new(
+            ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        let opts = SupertableOptions::new(day_hits(DataType::Date32), vec![], vec![])
+            .expect("opts")
+            .with_writer_pool(pool)
+            .with_range_indexes(&["day".to_string()])
+            .with_superfiles_in_flight(1);
+        let st = Supertable::create(opts).expect("create");
+        let mut w = st.writer().expect("writer");
+        for days in [[0, 1], [2, 3], [4, 5]] {
+            let batch = RecordBatch::try_new(
+                day_hits(DataType::Date32),
+                vec![
+                    Arc::new(Date32Array::from(days.to_vec())),
+                    Arc::new(Int64Array::from(vec![1i64; days.len()])),
+                ],
+            )
+            .expect("batch");
+            w.append(&batch).expect("append");
+            w.commit().expect("commit");
+        }
+        drop(w);
+        let nanos = DataType::Timestamp(TimeUnit::Nanosecond, None);
+        st.apply_schema(
+            &SchemaPatch::new(vec![FieldPatch::named("day").with_type(nanos.clone())]),
+            None,
+        )
+        .expect("retype");
+        const NANOS_PER_DAY: i64 = 86_400_000_000_000;
+        let batch = RecordBatch::try_new(
+            day_hits(nanos),
+            vec![
+                Arc::new(TimestampNanosecondArray::from(vec![
+                    6 * NANOS_PER_DAY,
+                    7 * NANOS_PER_DAY,
+                ])),
+                Arc::new(Int64Array::from(vec![1i64; 2])),
+            ],
+        )
+        .expect("batch");
+        let mut w = st.writer().expect("writer");
+        w.append(&batch).expect("append");
+        w.commit().expect("commit");
+        drop(w);
+        let superfiles = st.reader().expect("reader").n_superfiles();
+        assert_eq!(superfiles, 4);
+
+        let at_day = |day: i64| {
+            lit(ScalarValue::TimestampNanosecond(
+                Some(day * NANOS_PER_DAY),
+                None,
+            ))
+        };
+        let provider = provider_of(&st);
+        let buckets = [(0, 4), (4, 8)]
+            .map(|(lo, hi)| histogram_bucket(&provider, "day", at_day(lo), at_day(hi)));
+        let rt = query_runtime();
+        let kept: HashSet<Uuid> = buckets
+            .iter()
+            .flat_map(|bucket| {
+                rt.block_on(provider.select_survivors(&bucket.filters))
+                    .expect("survivors")
+            })
+            .map(|entry| entry.superfile_id)
+            .collect();
+        assert_eq!(kept.len(), superfiles, "the buckets keep every superfile");
+        let counts = rt
+            .block_on(provider.batched_range_counts(&buckets))
+            .expect("count");
+        assert_eq!(
+            counts, None,
+            "three superfiles have no range index over the column"
+        );
+        // One superfile at a time: the one indexed superfile at most, then
+        // the first with no index.
+        assert!(
+            opened_superfiles(&provider) <= 2,
+            "opened {} of {superfiles} superfiles",
+            opened_superfiles(&provider)
+        );
     }
 
     /// A scan's statistics count the deleted rows of the call's own read:

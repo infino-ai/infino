@@ -57,7 +57,7 @@ use std::{
     collections::{HashMap, HashSet},
     future::Future,
     mem,
-    sync::{Arc, Weak},
+    sync::{Arc, Mutex, OnceLock, PoisonError, Weak},
     time::Instant,
 };
 
@@ -68,6 +68,7 @@ use arrow::{
 use arrow_array::{Array, Decimal128Array, Int64Array, new_empty_array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::{
+    catalog::{CatalogProviderList, MemoryCatalogProviderList},
     common::{
         Column, DFSchema, ScalarValue,
         runtime::SpawnedTask,
@@ -76,7 +77,12 @@ use datafusion::{
     dataframe::DataFrame,
     datasource::{DefaultTableSource, provider_as_source},
     error::DataFusionError,
-    execution::{TaskContext, context::SessionContext},
+    execution::{
+        SessionStateDefaults, TaskContext,
+        context::{SessionContext, SessionState},
+        object_store::ObjectStoreUrl,
+        runtime_env::RuntimeEnv,
+    },
     functions_aggregate::{count::count_all, expr_fn::count},
     logical_expr::{
         Expr, ExprFunctionExt, LogicalPlan, LogicalTableSource, TableScan, lit,
@@ -484,6 +490,101 @@ pub(crate) fn sql_session_context(
     ctx.add_optimizer_rule(Arc::new(RangeTopK));
     ctx.add_optimizer_rule(Arc::new(MatchTopK));
     Ok(ctx)
+}
+
+/// [`sql_session_context`] built once and handed out as a copy per
+/// context: its configuration, its optimizer rules and DataFusion's
+/// function library are the same for every statement on a connection, so
+/// copying them skips rebuilding that setup for each statement. Each copy
+/// gets a catalog list of its own, so the tables and table functions one
+/// context registers are never seen by another.
+///
+/// The one way a SQL session is set up: a connection keeps one for its
+/// statements, and a table handle one for its readers' contexts (see
+/// [`SupertableReader::sql_session_context`]).
+#[derive(Default)]
+pub(crate) struct SessionTemplate(OnceLock<SessionState>);
+
+impl SessionTemplate {
+    /// A context for one statement, as [`sql_session_context`] builds it,
+    /// with an empty catalog of its own. `budget` and `spill` are the same
+    /// on every call to one template (its connection's, or its table's), so
+    /// the first call's build serves them all.
+    pub(crate) fn context(
+        &self,
+        budget: &Arc<ConnectionMemoryBudget>,
+        spill: Option<&SqlSpill>,
+    ) -> Result<SessionContext, DataFusionError> {
+        let template = match self.0.get() {
+            Some(template) => template,
+            None => {
+                let built = sql_session_context(budget, spill)?.state();
+                self.0.get_or_init(|| built)
+            }
+        };
+        // A copy of the template shares its catalog list: a fresh list, with
+        // the default catalog and schema the template was built with.
+        let mut state = template.clone();
+        let catalogs = MemoryCatalogProviderList::new();
+        let default_catalog = SessionStateDefaults::default_catalog(
+            state.config(),
+            state.table_factories(),
+            state.runtime_env(),
+        );
+        catalogs.register_catalog(
+            state.config().options().catalog.default_catalog.clone(),
+            Arc::new(default_catalog),
+        );
+        state.register_catalog_list(Arc::new(catalogs));
+        // It shares the template's runtime too, whose object-store registry
+        // keeps what a scan registers until it is removed.
+        let stores = StatementStores {
+            runtime: Arc::clone(state.runtime_env()),
+            urls: Mutex::default(),
+        };
+        state.config_mut().set_extension(Arc::new(stores));
+        Ok(SessionContext::new_with_state(state))
+    }
+
+    /// The session this template has built, if a context has been asked of it.
+    #[cfg(test)]
+    pub(crate) fn built(&self) -> Option<&SessionState> {
+        self.0.get()
+    }
+}
+
+/// The object stores one context's scans registered in the runtime it shares
+/// with every other copy of its [`SessionTemplate`], removed from it when the
+/// context's last session handle is dropped. A connection's statement drops
+/// its context when it returns, fails or is cancelled, and after a planning
+/// task it abandoned has stopped; a reader's cached context is dropped once
+/// a newer snapshot replaces it and the statements using it are done. Scans
+/// register under URLs unique to their provider, so removing them touches no
+/// other context's.
+pub(crate) struct StatementStores {
+    runtime: Arc<RuntimeEnv>,
+    urls: Mutex<HashSet<ObjectStoreUrl>>,
+}
+
+impl StatementStores {
+    /// Note that a scan of this statement registered `url`.
+    pub(crate) fn record(&self, url: &ObjectStoreUrl) {
+        self.urls
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(url.clone());
+    }
+}
+
+impl Drop for StatementStores {
+    fn drop(&mut self) {
+        let urls = self.urls.get_mut().unwrap_or_else(PoisonError::into_inner);
+        for url in urls.drain() {
+            // Every recorded URL was registered and only this removes it, so
+            // the store is always there to remove; the store is what drops.
+            drop(self.runtime.deregister_object_store(url.as_ref()));
+        }
+    }
 }
 
 impl SupertableReader {
@@ -903,15 +1004,19 @@ impl SupertableReader {
         let schemas = self.sql_schemas();
         let provider = reader.sql_provider();
 
-        // Gate SQL heap on the connection budget (shared across contexts, so
-        // this reader's SQL counts against the same ceiling as the rest).
-        // A session built from our own budget config failing is ours.
+        // A copy of the table's session template, which gates SQL heap on
+        // the connection budget (shared across contexts, so this reader's SQL
+        // counts against the same ceiling as the rest) and spills through the
+        // connection's spill folder when it has one. A session built from our
+        // own budget config failing is ours.
         let options = self.options();
-        let ctx = sql_session_context(
-            &options.connection_memory_budget,
-            options.sql_spill.as_deref(),
-        )
-        .map_err(QueryError::internal)?;
+        let ctx = self
+            .sql_session_template()
+            .context(
+                &options.connection_memory_budget,
+                options.sql_spill.as_deref(),
+            )
+            .map_err(QueryError::internal)?;
         // Registering the table we just built is ours to get right.
         ctx.register_table(TABLE_NAME, Arc::new(provider))
             .map_err(QueryError::internal)?;
