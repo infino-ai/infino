@@ -69,8 +69,9 @@ use crate::{
     utils::terms::{DictEntry, TermBlocks, make_key},
 };
 
-/// Most of the connection's memory budget, in percent, that kept dictionaries may bring it to.
-const QUERY_DICT_SHARE_PERCENT: usize = 50;
+/// Most of the connection's memory budget, in percent, that kept dictionaries may bring it to: half
+/// of what read-ahead and cache fills may, so those always keep room beside the dictionaries.
+pub(crate) const QUERY_DICT_SHARE_PERCENT: usize = 25;
 
 /// Largest gap worth overfetching when adjacent term postings share a request.
 const TERM_RANGE_COALESCE_MAX_GAP: usize = 64 * 1024;
@@ -567,10 +568,10 @@ impl QueryDict {
         self.budget.is_some()
     }
 
-    /// The kept dictionary, if one is kept.
-    fn kept(&self) -> Option<Bytes> {
+    /// The kept dictionary and the reader that kept it, if one is kept.
+    fn kept(&self) -> Option<(Bytes, usize)> {
         match &*self.kept.lock() {
-            Kept::Dict { bytes, .. } => Some(bytes.clone()),
+            Kept::Dict { bytes, reader, .. } => Some((bytes.clone(), *reader)),
             Kept::Nothing | Kept::GivenBack => None,
         }
     }
@@ -580,9 +581,9 @@ impl QueryDict {
         self.kept.reclaim();
     }
 
-    /// Keeps `bytes` if nothing was kept yet and the budget has room; never waits or asks others to
-    /// free memory.
-    fn keep(&self, bytes: &Bytes) {
+    /// Keeps `bytes`, `reader`'s dictionary, if nothing was kept yet and the budget has room; never
+    /// waits or asks others to free memory.
+    fn keep(&self, bytes: &Bytes, reader: usize) {
         let Some(budget) = &self.budget else {
             return;
         };
@@ -597,11 +598,15 @@ impl QueryDict {
         };
         *kept = Kept::Dict {
             bytes: bytes.clone(),
+            reader,
             _reservation: reservation,
         };
         drop(kept);
-        let holder: Weak<KeptDict> = Arc::downgrade(&self.kept);
-        budget.register_reclaim(holder);
+        // A budget with no limit never asks for memory back.
+        if budget.remaining().is_some() {
+            let holder: Weak<KeptDict> = Arc::downgrade(&self.kept);
+            budget.register_reclaim(holder);
+        }
     }
 }
 
@@ -610,9 +615,10 @@ impl QueryDict {
 enum Kept {
     #[default]
     Nothing,
-    /// The dictionary and its reservation, which go together.
+    /// The dictionary, the reader it belongs to ([`FtsReader::identity`]) and its reservation.
     Dict {
         bytes: Bytes,
+        reader: usize,
         _reservation: Reservation,
     },
     /// Given back to the budget; nothing more is kept.
@@ -1410,7 +1416,12 @@ impl FtsReader {
     /// This file's dictionary, from `dict` if a step kept it, else read and offered to `dict`. Only
     /// a downloaded dictionary is kept; the flag says whether this call read it.
     pub(crate) async fn query_dict(&self, dict: &QueryDict) -> Result<(Bytes, bool), FtsError> {
-        if let Some(bytes) = dict.kept() {
+        if let Some((bytes, reader)) = dict.kept() {
+            debug_assert_eq!(
+                reader,
+                self.identity(),
+                "a `QueryDict` kept another file's dictionary"
+            );
             return Ok((bytes, false));
         }
         let downloads = match (&dict.budget, &self.source) {
@@ -1422,9 +1433,15 @@ impl FtsReader {
         let bytes = self.dict_bytes_async().await?;
         self.debug_assert_own_dict(&bytes);
         if downloads {
-            dict.keep(&bytes);
+            dict.keep(&bytes, self.identity());
         }
         Ok((bytes, true))
+    }
+
+    /// The same for every clone of this reader and different for any other: what a kept
+    /// dictionary is checked against, so a `QueryDict` is never shared across files.
+    fn identity(&self) -> usize {
+        Arc::as_ptr(&self.block_tables).addr()
     }
 
     pub(crate) fn dict_bytes(&self) -> Result<Bytes, FtsError> {
@@ -4959,8 +4976,8 @@ mod tests {
         // This test pins one download per step when there is no room.
         let (r, recording) = recorded_lazy_reader().await;
         let dictionary = r.dict_range.clone();
-        // The dictionary fits the limit (90% of this) but not the share (half of that).
-        let budget = ConnectionMemoryBudget::with_limit(dictionary.len() as u64 * 3 / 2);
+        // The dictionary fits half the limit (90% of this) but not the share, a quarter of it.
+        let budget = ConnectionMemoryBudget::with_limit(dictionary.len() as u64 * 3);
         for dict in [QueryDict::with_budget(&budget), QueryDict::default()] {
             let opened = recording.0.len();
             let (first, fetched_first) = r.query_dict(&dict).await.expect("first step");
@@ -4987,7 +5004,8 @@ mod tests {
         // This test pins that a kept dictionary never makes another reservation fail.
         let (r, recording) = recorded_lazy_reader().await;
         let dictionary = r.dict_range.clone();
-        let budget = ConnectionMemoryBudget::with_limit(dictionary.len() as u64 * 4);
+        // The share (a quarter of 90% of this) holds the dictionary, with room past it.
+        let budget = ConnectionMemoryBudget::with_limit(dictionary.len() as u64 * 8);
         let dict = QueryDict::with_budget(&budget);
         r.query_dict(&dict).await.expect("first step");
         assert_eq!(budget.used(), dictionary.len(), "the dictionary is kept");
@@ -5006,6 +5024,23 @@ mod tests {
         let (_, fetched) = r.query_dict(&dict).await.expect("step with room again");
         assert!(fetched, "nothing more is kept, even with room");
         assert_eq!(budget.used(), 0);
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    #[should_panic(expected = "another file's dictionary")]
+    async fn a_query_dict_refuses_a_dictionary_another_reader_kept() {
+        // Two readers of identical files, so their dictionaries are the same size, and one
+        // `QueryDict` with room.
+        //  - the first reader keeps its dictionary in it;
+        //  - the second asking for it panics in a debug build instead of getting the first's.
+        // This test pins that a kept dictionary never crosses files.
+        let (first, _) = recorded_lazy_reader().await;
+        let (second, _) = recorded_lazy_reader().await;
+        let budget = ConnectionMemoryBudget::measured();
+        let dict = QueryDict::with_budget(&budget);
+        first.query_dict(&dict).await.expect("kept");
+        let _ = second.query_dict(&dict).await;
     }
 
     #[tokio::test]

@@ -631,6 +631,7 @@ mod tests {
         storage::{LocalFsStorageProvider, StorageProvider},
         superfile::{
             builder::{FtsConfig, VectorConfig},
+            fts::reader::QUERY_DICT_SHARE_PERCENT,
             vector::{distance::Metric, rerank_codec::RerankCodec},
         },
         supertable::{
@@ -659,7 +660,7 @@ mod tests {
     /// Distinct `tokio…` words across those rows; no `LIKE` in the test matches them.
     const DICT_TEST_TOKIO_WORDS: usize = 300;
 
-    /// A limit that dictionary fits under but its half share does not, leaving the query room.
+    /// A limit that dictionary fits under but its share does not, leaving the query room.
     const NO_ROOM_FOR_A_DICTIONARY: u64 = 8 * 1024 * 1024;
 
     // ---- vector-column test harness (mirrors query::vector tests) ----
@@ -1233,9 +1234,10 @@ mod tests {
 
     /// Runs `sql` over a table whose one file has a dictionary of a few MiB, read lazily from its
     /// store on a fresh cache: with room to keep the dictionary, then with
-    /// [`NO_ROOM_FOR_A_DICTIONARY`]. Returns each run's rows, sorted, and how many times it read
-    /// the dictionary.
-    fn dictionary_runs(dim: usize, sql: &str) -> [(Vec<String>, usize); 2] {
+    /// [`NO_ROOM_FOR_A_DICTIONARY`]. With `term_index` off, a term is looked up in the file's
+    /// dictionary rather than in the index. Returns each run's rows, sorted, and how many times it
+    /// read the dictionary.
+    fn dictionary_runs(dim: usize, term_index: bool, sql: &str) -> [(Vec<String>, usize); 2] {
         let titles: Vec<String> = (0..DICT_TEST_ROWS)
             .map(|n| {
                 let words: Vec<String> = (0..DICT_TEST_WORDS_PER_ROW)
@@ -1252,7 +1254,9 @@ mod tests {
         let dir = TempDir::new().expect("dir");
         let local: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("local"));
-        let written = options_one_superfile_per_commit(dim).with_storage(Arc::clone(&local));
+        let written = options_one_superfile_per_commit(dim)
+            .with_term_index(term_index)
+            .with_storage(Arc::clone(&local));
         drop(supertable_ranked_by_index_with(written, dim, &titles));
         // Each run's rows and the sizes of its reads from the files' full-text sections.
         let run = |budget: Arc<ConnectionMemoryBudget>| {
@@ -1260,7 +1264,7 @@ mod tests {
             let recording = RecordingStorage::over(Arc::clone(&local));
             let storage = Arc::clone(&recording) as Arc<dyn StorageProvider>;
             let cache = lazy_disk_cache_without_promotion(Arc::clone(&storage), cache_dir.path());
-            let mut options = options_one_superfile_per_commit(dim);
+            let mut options = options_one_superfile_per_commit(dim).with_term_index(term_index);
             options.connection_memory_budget = budget;
             let st = Supertable::open(options.with_storage(storage).with_disk_cache(cache))
                 .expect("open lazily");
@@ -1288,7 +1292,7 @@ mod tests {
         // not its share, so the share is what keeps it out.
         let dictionary = kept.iter().copied().max().expect("a full-text read");
         assert!(
-            limit / 2 < dictionary && dictionary < limit,
+            limit * QUERY_DICT_SHARE_PERCENT as u64 / 100 < dictionary && dictionary < limit,
             "the dictionary ({dictionary} bytes) fits the limit ({limit} bytes) but not its share"
         );
         let reads = |sizes: &[u64]| sizes.iter().filter(|&&n| n == dictionary).count();
@@ -1308,7 +1312,7 @@ mod tests {
             "SELECT title FROM vector_search('emb', '{q}', 50) \
              WHERE title LIKE 'rust12%' AND title LIKE 'rust1%'"
         );
-        let [(kept_rows, kept), (plain_rows, plain)] = dictionary_runs(dim, &sql);
+        let [(kept_rows, kept), (plain_rows, plain)] = dictionary_runs(dim, true, &sql);
         assert!(!kept_rows.is_empty(), "the filter matches rows");
         assert_eq!(kept_rows, plain_rows, "the same rows either way");
         assert_eq!((kept, plain), (1, 4), "dictionary reads, kept and not");
@@ -1323,11 +1327,30 @@ mod tests {
         // This test pins a SQL `LIKE` reading the dictionary once.
         let dim = 16;
         let sql = "SELECT title FROM supertable WHERE title LIKE 'rust12%' AND title LIKE 'rust1%'";
-        let [(kept_rows, kept), (plain_rows, plain)] = dictionary_runs(dim, sql);
+        let [(kept_rows, kept), (plain_rows, plain)] = dictionary_runs(dim, true, sql);
         assert!(!kept_rows.is_empty(), "the filter matches rows");
         assert_eq!(kept_rows, plain_rows, "the same rows either way");
         assert_eq!(kept, 1, "read once when kept");
         assert!(plain > 1, "read at each step without room ({plain} reads)");
+    }
+
+    #[test]
+    fn text_match_terms_share_the_dictionary_before_an_ilike_on_the_same_file() {
+        // A SQL query with a two-term `text_match` and an `ILIKE` on one file, on a table with no
+        // term index, so each term is looked up in the file's dictionary.
+        //  - with room, the two terms share one dictionary read before the `ILIKE` walk reads its
+        //    own;
+        //  - with no room, each term reads it;
+        //  - the rows are the same.
+        // This test pins the `text_match` columns going first, so they share the dictionary before
+        // the `ILIKE` walk lets it go.
+        let dim = 16;
+        let sql = "SELECT title FROM supertable \
+                   WHERE text_match(title, 'rust12 tokio12') AND title ILIKE '%u1%'";
+        let [(kept_rows, kept), (plain_rows, plain)] = dictionary_runs(dim, false, sql);
+        assert!(!kept_rows.is_empty(), "the filter matches rows");
+        assert_eq!(kept_rows, plain_rows, "the same rows either way");
+        assert_eq!((kept, plain), (2, 3), "dictionary reads, kept and not");
     }
 
     #[test]
