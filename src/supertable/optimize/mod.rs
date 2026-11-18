@@ -59,6 +59,9 @@ impl Supertable {
                 .map_err(OptimizeError::from)?;
         }
 
+        self.ensure_fresh_strong()
+            .map_err(|e| OptimizeError::Refresh(e.to_string()))?;
+
         if opts.steps.drain_hidden_cells {
             match self.drain_hidden_vector_cells_sync() {
                 Ok(()) => {}
