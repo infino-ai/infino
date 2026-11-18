@@ -101,7 +101,7 @@ impl KeptLazyReaders {
                 }
             }
         }
-        let holder: Weak<dyn Reclaim> = Arc::downgrade(self);
+        let holder: Weak<Self> = Arc::downgrade(self);
         budget.register_reclaim(holder);
     }
 
