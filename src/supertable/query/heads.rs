@@ -92,6 +92,13 @@ const HEAD_READ_BUDGET_ENTRIES: u64 = 256 << 10;
 /// then the blocks covering the candidates — so this bounds a query's
 /// probe reads near the read budget of a cold store.
 const PROBE_MAX_CANDIDATES: usize = 4_096;
+/// Candidates the first wave of probes reads per result asked for. The
+/// best-bounded candidates are the likeliest to hold the query, so a wave
+/// this deep finds the threshold when probes can find it at all; when it
+/// finds none, or one that can rule no superfile out, the rest are not
+/// probed. Measured on a 10B-row table, phrases of common words found no
+/// threshold in 4,096 probed candidates and ruled out nothing.
+const PROBE_FIRST_WAVE_PER_RESULT: usize = 16;
 /// Steps of the water-filling's search for its common marginal gain; each
 /// halves the interval, so the allocation it bounds with is within a
 /// negligible share of the budget it was given.
@@ -533,15 +540,19 @@ pub(crate) async fn select<'a>(
     let probes = match query.rows_scoped {
         true => None,
         false => {
-            let plan = probe_plan(
-                &state.slots,
-                &state.heads,
-                &state.candidates,
-                &state.weights,
-                &state.postings,
-                now.theta_lb,
-            );
-            (!plan.is_empty()).then_some(ProbeStage { state, plan })
+            let ubs: Vec<f32> = now.bounds.iter().map(|b| b.ub).collect();
+            let first = k
+                .saturating_mul(PROBE_FIRST_WAVE_PER_RESULT)
+                .min(PROBE_MAX_CANDIDATES);
+            let plan = match state.probes_can_pay(&ubs, now.theta_lb) {
+                true => state.probe_plan(now.theta_lb, first),
+                false => BTreeMap::new(),
+            };
+            (!plan.is_empty()).then_some(ProbeStage {
+                state,
+                plan,
+                left: PROBE_MAX_CANDIDATES - first,
+            })
         }
     };
     Ok(Some(Selected { now, probes }))
@@ -575,6 +586,47 @@ struct Selection<'a> {
 }
 
 impl Selection<'_> {
+    /// Whether probing can still change which superfiles open: with no
+    /// threshold yet, only probes find one; with one, only while some
+    /// superfile in play (bound `ubs` above `theta`) has unseen documents
+    /// bounded at or under what the candidates could raise it to, the
+    /// `k`-th best candidate bound. A superfile whose unread documents
+    /// bound above that stays in play whatever the probes find.
+    fn probes_can_pay(&self, ubs: &[f32], theta: f32) -> bool {
+        if !theta.is_finite() {
+            return true;
+        }
+        let (slots, heads, weights) = (&self.slots, &self.heads, &self.weights);
+        let mut best: Vec<f32> = self
+            .candidates
+            .iter()
+            .map(|(&(s, _), c)| candidate_bound(&slots[s as usize], heads, weights, c))
+            .filter(|b| b.is_finite())
+            .collect();
+        if best.len() < self.k {
+            return true;
+        }
+        let (_, kth, _) = best.select_nth_unstable_by(self.k - 1, |a, b| b.total_cmp(a));
+        let reachable = *kth;
+        slots
+            .iter()
+            .zip(ubs)
+            .any(|(slot, &ub)| ub > theta && unseen_bound(slot, heads, weights) <= reachable)
+    }
+
+    /// The probes of at most `cap` of the best open candidates.
+    fn probe_plan(&self, theta: f32, cap: usize) -> BTreeMap<usize, Vec<Probe>> {
+        probe_plan(
+            &self.slots,
+            &self.heads,
+            &self.candidates,
+            &self.weights,
+            &self.postings,
+            theta,
+            cap,
+        )
+    }
+
     /// The selection at `theta` and `bounds`: the superfiles the index
     /// answers for, their rows read from the map pages they fall in.
     async fn finish(
@@ -641,7 +693,10 @@ impl Selection<'_> {
 /// selection replaces the heads' for the superfiles not yet opened.
 pub(crate) struct ProbeStage<'a> {
     state: Selection<'a>,
+    /// The first wave's probes.
     plan: BTreeMap<usize, Vec<Probe>>,
+    /// Candidates a second wave may still probe.
+    left: usize,
 }
 
 impl ProbeStage<'_> {
@@ -649,16 +704,64 @@ impl ProbeStage<'_> {
     /// select again.
     pub(crate) async fn run(self) -> Result<TierSelection, TermIndexError> {
         let started = Instant::now();
-        let Self { mut state, plan } = self;
-        let (manifest, kept, column) = (state.manifest, state.kept, state.column);
-        let phrases = &state.weights.phrases;
+        let Self {
+            mut state,
+            plan,
+            left,
+        } = self;
+        let mut probes = state.probe_wave(plan).await?;
+        let (mut theta, mut bounds) = state.settle();
+        let mut waves = 1;
+        // The first wave read the best candidates. Where they held too few
+        // of the query's documents for a threshold, or one that rules no
+        // superfile out, the rest would cost their reads and change no open.
+        let ubs: Vec<f32> = bounds.iter().map(|&(_, ub)| ub).collect();
+        if theta.is_finite() && state.probes_can_pay(&ubs, theta) {
+            let plan = state.probe_plan(theta, left);
+            if !plan.is_empty() {
+                probes += state.probe_wave(plan).await?;
+                (theta, bounds) = state.settle();
+                waves += 1;
+            }
+        }
+        let mut selection = state
+            .finish(theta, bounds, 0, probes, started, waves)
+            .await?;
+        // Probes are not head entries: their count and time stay out of the
+        // table's measured cost of reading one, which prices the rounds.
+        selection.entries_read = 0;
+        selection.merge_ns = 0;
+        Ok(selection)
+    }
+}
+
+impl Selection<'_> {
+    /// The threshold and each slot's bounds from the candidates now.
+    fn settle(&self) -> (f32, Vec<(f32, f32)>) {
+        settle(
+            &self.slots,
+            &self.heads,
+            &self.candidates,
+            &self.weights,
+            self.k,
+            self.lb_slack,
+        )
+    }
+
+    /// Read one wave of probes, each superfile's beside the others', and
+    /// fold what they found into the candidates; the number of probes read.
+    async fn probe_wave(
+        &mut self,
+        plan: BTreeMap<usize, Vec<Probe>>,
+    ) -> Result<u64, TermIndexError> {
+        let (manifest, kept, column) = (self.manifest, self.kept, self.column);
+        let phrases = &self.weights.phrases;
         let reads = plan.into_iter().map(|(s, probes)| {
             let entry = &kept[s];
             async move {
                 let reader = open_fts(manifest, entry).await?;
                 let fts = fts_of(&reader);
-                let mut out = Vec::with_capacity(probes.len());
-                for (kind, members, docs) in probes {
+                let reads = probes.into_iter().map(|(kind, members, docs)| async move {
                     let read = match kind {
                         ProbeKind::Term(_) => {
                             let (entry, df) = members[0];
@@ -670,9 +773,9 @@ impl ProbeStage<'_> {
                         }
                     };
                     let tfs = read.map_err(|e| TermIndexError::Open(QueryError::from(e)))?;
-                    out.push((kind, docs, tfs));
-                }
-                Ok::<_, TermIndexError>((s, out))
+                    Ok::<_, TermIndexError>((kind, docs, tfs))
+                });
+                Ok::<_, TermIndexError>((s, try_join_all(reads).await?))
             }
         });
         let mut probes = 0u64;
@@ -680,10 +783,10 @@ impl ProbeStage<'_> {
             probes += probed.len() as u64;
             for (kind, docs, tfs) in probed {
                 for (doc, tf) in docs.into_iter().zip(tfs) {
-                    let Some(c) = state.candidates.get_mut(&(s as u32, doc)) else {
+                    let Some(c) = self.candidates.get_mut(&(s as u32, doc)) else {
                         continue;
                     };
-                    let weights = &state.weights;
+                    let weights = &self.weights;
                     match kind {
                         ProbeKind::Term(t) => {
                             c.known |= 1 << t;
@@ -703,15 +806,7 @@ impl ProbeStage<'_> {
                 }
             }
         }
-        let (theta, bounds) = settle(
-            &state.slots,
-            &state.heads,
-            &state.candidates,
-            &state.weights,
-            state.k,
-            state.lb_slack,
-        );
-        state.finish(theta, bounds, 0, probes, started, 0).await
+        Ok(probes)
     }
 }
 
@@ -775,6 +870,7 @@ fn probe_plan(
     weights: &Weights,
     postings: &HashMap<(usize, usize), (DictEntry, u64)>,
     theta: f32,
+    cap: usize,
 ) -> BTreeMap<usize, Vec<Probe>> {
     let held = |s: usize, t: usize| postings.contains_key(&(s, t));
     // What is unknown for a candidate that its superfile holds postings of.
@@ -790,7 +886,7 @@ fn probe_plan(
             .map(|(ph, _)| ProbeKind::Phrase(ph));
         terms.chain(phrases).collect()
     };
-    let open = best_open(slots, heads, candidates, weights, theta, |s, c| {
+    let open = best_open(slots, heads, candidates, weights, theta, cap, |s, c| {
         !unknowns(s, c).is_empty()
     });
     let mut docs: BTreeMap<(usize, usize, bool), Vec<u32>> = BTreeMap::new();
@@ -870,7 +966,7 @@ async fn to_rows(
 }
 
 /// The candidates `keep` accepts whose bounds still reach above `theta`,
-/// best bound first, at most [`PROBE_MAX_CANDIDATES`], as
+/// best bound first, at most `cap` of them, as
 /// `(bound, slot, document)`; never one of a slot with deletions.
 fn best_open(
     slots: &[Slot],
@@ -878,6 +974,7 @@ fn best_open(
     candidates: &HashMap<(u32, u32), Candidate>,
     weights: &Weights,
     theta: f32,
+    cap: usize,
     keep: impl Fn(usize, &Candidate) -> bool,
 ) -> Vec<(f32, usize, u32)> {
     let mut open: Vec<(f32, usize, u32)> = candidates
@@ -893,7 +990,7 @@ fn best_open(
         .filter(|(ub, _, _)| *ub > theta)
         .collect();
     open.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
-    open.truncate(PROBE_MAX_CANDIDATES);
+    open.truncate(cap);
     open
 }
 

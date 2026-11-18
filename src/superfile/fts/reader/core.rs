@@ -1687,8 +1687,21 @@ impl FtsReader {
             }
             ranges.push(base + m..base + m + postings_length);
         }
+        self.fetch_coalesced(&ranges, "fts/postings term body")
+            .await
+    }
+
+    /// Fetch `ranges` of the blob in input order, nearby ones sharing a
+    /// request under the same gap and overfetch limits as a term's
+    /// postings: a probe's covering blocks and position groups are many
+    /// small ranges of one term, which one request serves at little extra.
+    pub(super) async fn fetch_coalesced(
+        &self,
+        ranges: &[Range<usize>],
+        what: &'static str,
+    ) -> Result<Vec<Bytes>, FtsError> {
         let plan = RangeCoalescePlan::new(
-            &ranges,
+            ranges,
             TERM_RANGE_COALESCE_MAX_GAP,
             TERM_RANGE_COALESCE_MAX_OVERFETCH,
         );
@@ -1696,10 +1709,7 @@ impl FtsReader {
             .source
             .get_ranges_parallel_async(plan.fetch_ranges())
             .await
-            .map_err(|e| FtsError::RangeFetch {
-                what: "fts/postings term body",
-                source: e,
-            })?;
+            .map_err(|e| FtsError::RangeFetch { what, source: e })?;
         Ok(plan.restore(&fetched))
     }
 

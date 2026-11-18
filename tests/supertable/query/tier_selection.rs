@@ -1142,3 +1142,82 @@ fn phrase_probes_settle_a_phrase_of_common_words() {
         );
     }
 }
+
+/// A phrase whose members' best documents never hold it: the first wave of
+/// probes reads only the best-bounded candidates, finds no threshold among
+/// them, and leaves the rest to the opens, which answer as the ceilings do.
+/// Probing every candidate would find the few that hold the phrase, at a
+/// read per superfile per member for each wave.
+#[test]
+fn a_phrase_its_best_candidates_lack_is_left_to_the_opens() {
+    /// Superfiles, one commit each.
+    const SUPERFILES: usize = 3;
+    /// Documents per superfile: past the whole-list size.
+    const DOCS: usize = 5_000;
+    /// Documents with both members often, never adjacent: the best bounds.
+    const DECOYS: std::ops::Range<usize> = 4_000..4_040;
+    /// Documents with the phrase, each member less often than a decoy's.
+    const HOLDERS: std::ops::Range<usize> = 4_500..4_510;
+    /// Tokens per document, so every document has the same length.
+    const LEN: usize = 40;
+    /// How often a decoy holds each member.
+    const DECOY_TF: usize = 8;
+    /// How often a holder holds the phrase.
+    const HOLDER_TF: usize = 3;
+    let build = |dir: &TempDir, heads: bool| {
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let mut fts = FtsConfig::new("body");
+        fts.positions = true;
+        let mut options = SupertableOptions::new(schema(), vec![fts], vec![])
+            .expect("options")
+            .with_storage(storage)
+            .with_bound_ordered_open_window(OPEN_WINDOW);
+        if !heads {
+            options = options.with_term_tier_entries_per_term(0);
+        }
+        let st = Supertable::create(options).expect("create");
+        for _ in 0..SUPERFILES {
+            let docs: Vec<String> = (0..DOCS)
+                .map(|i| {
+                    let mut words = Vec::new();
+                    if DECOYS.contains(&i) {
+                        for _ in 0..DECOY_TF {
+                            words.extend(["alpha", "filler", "beta", "filler"]);
+                        }
+                    } else if HOLDERS.contains(&i) {
+                        for _ in 0..HOLDER_TF {
+                            words.extend(["alpha", "beta", "filler"]);
+                        }
+                    } else {
+                        words.extend(["beta", "filler", "alpha"]);
+                    }
+                    words.resize(LEN, "filler");
+                    words.join(" ")
+                })
+                .collect();
+            let col: ArrayRef = Arc::new(LargeStringArray::from(
+                docs.iter().map(String::as_str).collect::<Vec<_>>(),
+            ));
+            let mut w = st.writer().expect("writer");
+            w.append(&RecordBatch::try_new(schema(), vec![col]).expect("batch"))
+                .expect("append");
+            w.commit().expect("commit");
+        }
+        st
+    };
+    let (with_dir, without_dir) = (
+        TempDir::new().expect("tempdir"),
+        TempDir::new().expect("tempdir"),
+    );
+    let (with, without) = (build(&with_dir, true), build(&without_dir, false));
+    let (a, stats, _) = run(&with, "\"alpha beta\"", BoolMode::Or, 1);
+    let (b, _, _) = run(&without, "\"alpha beta\"", BoolMode::Or, 1);
+    assert!(!a.is_empty(), "the phrase matches");
+    assert_eq!(a, b, "the answer is the ceilings'");
+    assert_eq!(
+        opened(&stats),
+        SUPERFILES as u64,
+        "the first wave found no threshold, so the opens settle every superfile"
+    );
+}

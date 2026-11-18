@@ -15,6 +15,7 @@
 use std::slice::from_ref;
 
 use bytes::Bytes;
+use futures::future::try_join_all;
 
 use super::{ColumnMeta, core::*, cursor::TermMeta};
 use crate::{
@@ -215,14 +216,11 @@ impl FtsReader {
                 ranges.push(from..to);
             }
         }
+        // The blocks lie back to back, as do their groups: a few requests
+        // serve them all.
         let mut fetched = self
-            .source
-            .get_ranges_parallel_async(&ranges)
-            .await
-            .map_err(|e| FtsError::RangeFetch {
-                what: "fts/postings term probe blocks",
-                source: e,
-            })?;
+            .fetch_coalesced(&ranges, "fts/postings term probe blocks")
+            .await?;
         let groups: Vec<Bytes> = match with_positions {
             true => fetched.split_off(wanted.len()),
             false => Vec::new(),
@@ -265,10 +263,12 @@ impl FtsReader {
                 column: column.to_owned(),
             });
         }
-        let mut per_member: Vec<Vec<Vec<u32>>> = Vec::with_capacity(members.len());
-        for &(entry, df) in members {
-            per_member.push(self.member_positions(col, entry, df, docs).await?);
-        }
+        let per_member = try_join_all(
+            members
+                .iter()
+                .map(|&(entry, df)| self.member_positions(col, entry, df, docs)),
+        )
+        .await?;
         Ok((0..docs.len())
             .map(|d| {
                 let runs: Vec<&[u32]> = per_member.iter().map(|m| m[d].as_slice()).collect();
@@ -364,10 +364,19 @@ mod tests {
     use std::{
         collections::{BTreeSet, HashMap},
         iter::repeat_n,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
     };
 
+    use async_trait::async_trait;
+
     use super::*;
-    use crate::superfile::fts::builder::FtsBuilder;
+    use crate::superfile::{
+        fts::{builder::FtsBuilder, reader::OpenOptions, reader::test_util::AsyncOnlySource},
+        lazy_source::{LazyByteSource, LazyByteSourceError},
+    };
 
     /// Documents in the fixture blob: enough for a common term to span many
     /// posting blocks.
@@ -380,6 +389,33 @@ mod tests {
     const RARE: [u32; 2] = [70, 1900];
     /// The document holding `hapax`.
     const HAPAX: u32 = 1234;
+    /// Requests a probe of one long term may take: its header and skip
+    /// table, read again when the header names more blocks than its count
+    /// suggested, then its covering blocks and their position groups, which
+    /// lie back to back in two regions.
+    const PROBE_MAX_REQUESTS: usize = 4;
+
+    /// [`AsyncOnlySource`] counting the requests it serves.
+    struct CountingSource {
+        inner: AsyncOnlySource,
+        requests: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl LazyByteSource for CountingSource {
+        fn size(&self) -> u64 {
+            self.inner.size()
+        }
+
+        async fn range(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
+            self.requests.fetch_add(1, Ordering::Relaxed);
+            self.inner.range(start, len).await
+        }
+
+        fn try_get_range_sync(&self, _start: u64, _len: u64) -> Option<Bytes> {
+            None
+        }
+    }
 
     fn text(i: u32) -> String {
         let mut text = String::from("common");
@@ -539,5 +575,77 @@ mod tests {
                 .collect();
             assert_eq!(got, want, "{terms:?}");
         }
+    }
+
+    /// A probe of a long term over many blocks reads its covering blocks,
+    /// and their position groups, in a few requests rather than one per
+    /// block: on an object store each request is a round trip and a billed
+    /// operation, and a phrase of common words probes hundreds of
+    /// superfiles.
+    #[tokio::test]
+    async fn a_probe_reads_its_covering_blocks_in_a_few_requests() {
+        let mut b = FtsBuilder::new();
+        b.register_column("body".into(), true).expect("register");
+        for i in 0..N_DOCS {
+            b.add_doc(0, i, &phrase_tokens(i).join(" ")).expect("add");
+        }
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75,"positions":true}]"#;
+        let eager = FtsReader::open(blob.clone(), json).expect("open");
+        let dict_bytes = eager.dict_bytes_async().await.expect("dict");
+        let facts: HashMap<String, (DictEntry, u64)> = eager
+            .term_index_facts_after(&dict_bytes, "body", None, 64, 1)
+            .await
+            .expect("facts")
+            .into_iter()
+            .map(|(term, fact)| {
+                let fact = fact.expect("a fact");
+                (
+                    String::from_utf8(term).expect("utf8"),
+                    (fact.entry, fact.df),
+                )
+            })
+            .collect();
+        let source = Arc::new(CountingSource {
+            inner: AsyncOnlySource(blob),
+            requests: AtomicUsize::new(0),
+        });
+        let lazy = FtsReader::open_lazy(
+            Arc::clone(&source) as Arc<dyn LazyByteSource>,
+            json,
+            OpenOptions::for_object_store(),
+        )
+        .await
+        .expect("open_lazy");
+        // A stride through every block of a term every document holds.
+        let docs: Vec<u32> = (0..N_DOCS).step_by(97).collect();
+        let (entry, df) = facts["gamma"];
+        let blocks = df.div_ceil(BLOCK_LEN as u64) as usize;
+        assert!(
+            blocks > PROBE_MAX_REQUESTS * 2,
+            "the term spans many blocks"
+        );
+        let before = source.requests.load(Ordering::Relaxed);
+        let tfs = lazy
+            .probe_tfs("body", entry, df, &docs)
+            .await
+            .expect("probe");
+        assert!(tfs.iter().all(|&tf| tf > 0), "every document holds it");
+        let term = source.requests.load(Ordering::Relaxed) - before;
+        assert!(
+            term <= PROBE_MAX_REQUESTS,
+            "a term probe over {blocks} blocks took {term} requests"
+        );
+        let members = [facts["beta"], facts["alpha"]];
+        let before = source.requests.load(Ordering::Relaxed);
+        lazy.probe_phrase_tfs("body", &members, &[0, 1], &docs)
+            .await
+            .expect("phrase probe");
+        let phrase = source.requests.load(Ordering::Relaxed) - before;
+        assert!(
+            phrase <= members.len() * PROBE_MAX_REQUESTS,
+            "a phrase probe of {} members took {phrase} requests",
+            members.len()
+        );
     }
 }
