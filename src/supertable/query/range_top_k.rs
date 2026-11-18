@@ -637,11 +637,16 @@ mod tests {
 
     /// Range-indexed on `key` and `opt`, with deleted rows in every file.
     fn tagged_table(dir: &TempDir) -> Supertable {
-        tagged_table_with(dir, None)
+        tagged_table_with(dir, None, TAGGED_FILES, TAGGED_ROWS_PER_FILE)
     }
 
     /// [`tagged_table`] keeping decoded columns in `kept` when given.
-    fn tagged_table_with(dir: &TempDir, kept: Option<Arc<DecodedColumnCache>>) -> Supertable {
+    fn tagged_table_with(
+        dir: &TempDir,
+        kept: Option<Arc<DecodedColumnCache>>,
+        files: i64,
+        rows: i64,
+    ) -> Supertable {
         let storage: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
         let mut options = SupertableOptions::new(tagged_schema(), vec![], vec![])
@@ -651,9 +656,8 @@ mod tests {
         options.decoded_columns = kept;
         options.row_group_size = Some(ROW_GROUP_ROWS);
         let st = Supertable::create(options).expect("create");
-        for file in 0..TAGGED_FILES {
-            let seqs: Vec<i64> =
-                (file * TAGGED_ROWS_PER_FILE..(file + 1) * TAGGED_ROWS_PER_FILE).collect();
+        for file in 0..files {
+            let seqs: Vec<i64> = (file * rows..(file + 1) * rows).collect();
             let batch = RecordBatch::try_new(
                 tagged_schema(),
                 vec![
@@ -958,7 +962,8 @@ mod tests {
         //  - A walk that keeps no row answers empty and plans no file.
         // This test pins the walk through the kept-columns scan.
         let dir = TempDir::new().expect("tempdir");
-        let st = tagged_table_with(&dir, Some(Arc::new(ByteLru::new(KEPT_BYTES))));
+        let kept = Some(Arc::new(ByteLru::new(KEPT_BYTES)));
+        let st = tagged_table_with(&dir, kept, TAGGED_FILES, TAGGED_ROWS_PER_FILE);
         let reader = st.reader().expect("reader");
         let sql = |filter: &str, sort: &str| {
             format!(
@@ -1073,5 +1078,70 @@ mod tests {
         );
         assert!(explained(&reader, &sql).contains("EmptyExec"), "{sql}");
         assert_eq!(walk_probe::walks(superfile), 0, "the walk never started");
+    }
+
+    #[test]
+    fn a_filtered_top_k_over_many_files_answers_as_the_sort_without_the_walk() {
+        // 40 files of 100 rows, each key's rows in every file, with deletes and nulls.
+        //  - Each walked statement, both directions, matches the same sort with the walk out of
+        //    the plan (`col + 0`).
+        //  - The walk answers every one of them; none falls back.
+        // This test pins the walk's cursor across many files through SQL.
+        let dir = TempDir::new().expect("tempdir");
+        let st = tagged_table_with(&dir, None, 40, 100);
+        let reader = st.reader().expect("reader");
+        let superfile = reader.manifest().superfiles[0].superfile_id;
+        walk_probe::watch(superfile);
+        for filter in ["tag = 'kernel'", "tag IN ('kernel', 'b')"] {
+            for column in ["key", "opt"] {
+                for direction in ["ASC NULLS LAST", "DESC NULLS LAST"] {
+                    for limit in [1, 10, 100] {
+                        let sql = |sort: &str| {
+                            format!(
+                                "SELECT seq FROM supertable WHERE {filter} \
+                                 ORDER BY {sort} {direction}, _id ASC LIMIT {limit}"
+                            )
+                        };
+                        let got = seqs(&reader.query_sql(&sql(column)).expect("sql"));
+                        let without = sql(&format!("({column} + 0)"));
+                        let want = seqs(&reader.query_sql(&without).expect("sql"));
+                        assert_eq!(got.len(), limit, "{}", sql(column));
+                        assert_eq!(got, want, "{}", sql(column));
+                    }
+                }
+            }
+        }
+        assert_eq!(walk_probe::walks(superfile), 24, "every statement walked");
+        assert_eq!(walk_probe::fallbacks(superfile), vec![], "none fell back");
+    }
+
+    #[test]
+    fn explain_says_whether_the_walk_answered_or_why_it_fell_back() {
+        // A walked sort, then the same sort with its walk made to fail two ways.
+        //  - The scan's `EXPLAIN` line says the walk answered, or that it fell back and why.
+        // This test pins the walk's outcome in `EXPLAIN`.
+        let dir = TempDir::new().expect("tempdir");
+        let st = tagged_table(&dir);
+        let reader = st.reader().expect("reader");
+        let superfile = reader.manifest().superfiles[0].superfile_id;
+        walk_probe::watch(superfile);
+        let sql = "SELECT seq FROM supertable WHERE tag = 'kernel' \
+                   ORDER BY opt ASC NULLS LAST, _id ASC LIMIT 10";
+        let plan = explained(&reader, sql);
+        assert!(plan.contains("top-k walk: answered"), "{plan}");
+        for (error, note) in [
+            (
+                QueryError::OverBudget("injected".to_owned()),
+                "top-k walk: fell back, a window over the memory limit",
+            ),
+            (
+                QueryError::internal("injected"),
+                "top-k walk: fell back, it failed",
+            ),
+        ] {
+            walk_probe::fail_next_walk(superfile, error);
+            let plan = explained(&reader, sql);
+            assert!(plan.contains(note), "{plan}");
+        }
     }
 }
