@@ -173,6 +173,9 @@ fn schema() -> Arc<Schema> {
     ]))
 }
 
+/// A predicate over `qty` in SQL, beside whether it holds for a row's `qty`.
+type QtyPredicate = (String, fn(Option<i32>) -> bool);
+
 /// Row `seq`'s `qty`: spread over `-250..250`, null every
 /// [`QTY_NULL_EVERY`] rows.
 fn qty_of(seq: i64) -> Option<i32> {
@@ -488,8 +491,7 @@ fn a_lone_filtered_count_over_a_nullable_column_under_a_having_counts_the_rows_i
     let dir = TempDir::new().expect("tempdir");
     let db = connect(dir.path().to_str().expect("utf-8 path")).expect("connect");
     create(&db);
-    // Each predicate in SQL, beside whether it holds for a row's `qty`.
-    let predicates: [(String, fn(Option<i32>) -> bool); 4] = [
+    let predicates: [QtyPredicate; 4] = [
         (format!("qty > {NULLABLE_QTY_BOUND}"), |qty| {
             qty.is_some_and(|value| value > NULLABLE_QTY_BOUND)
         }),
