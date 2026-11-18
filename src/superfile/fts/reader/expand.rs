@@ -31,7 +31,7 @@ use crate::{
             posting::BLOCK_LEN,
             tokenize::{MAX_TOKEN_CHARS, STANDARD_TOKENIZER},
         },
-        id_space::{DocMap, FtsDocId},
+        id_space::{FtsDocId, RowId},
     },
     utils::terms::{make_key, value::DictEntry},
 };
@@ -655,10 +655,7 @@ impl FtsReader {
                 .await?;
             work.merge(term_work);
             out.push(ContainsRows {
-                proven: rows
-                    .into_iter()
-                    .map(crate::superfile::id_space::RowId::get)
-                    .collect(),
+                proven: rows.into_iter().map(RowId::get).collect(),
                 doubtful: RoaringBitmap::new(),
             });
         }
@@ -669,10 +666,11 @@ impl FtsReader {
     /// (df=1) values carry their document; the rest are fetched in waves
     /// of at most [`CONTAINS_FETCH_BATCH_BYTES`] on this runtime and ORed
     /// into one document bitset on `pool`, each wave's bytes released
-    /// before the next is fetched. The bitset becomes rows through the
-    /// blob's doc map last: a merged superfile numbers its documents in an
-    /// order of its own. The bitset, and each wave while it is held, are
-    /// charged to `budget`.
+    /// before the next is fetched. The documents become rows last: a merged superfile numbers
+    /// them in an order of its own. Through the doc map on `pool` when the file holds it or keeps
+    /// it within the heap budget, else in one pass over the map's pages
+    /// ([`Self::bitmap_rows_in_pages`]). A blob in row order needs neither. The bitset and each
+    /// postings wave are charged to `budget` while held.
     async fn union_rows(
         &self,
         col: &ColumnMeta,
@@ -758,16 +756,33 @@ impl FtsReader {
             work.kernel_cpu_ns += ns;
             bits = ored?;
         }
-        // Read here, after the postings: a superfile no value matched returned
-        // above and never reads it.
-        let doc_map = self.ensure_doc_map().await?.clone();
-        let (rows, ns) = run_on_pool(pool, "contains rows", move || {
-            timed_section(|| rows_of(bits, &inline, n_docs, &doc_map))
+        // Decided after the postings, so a superfile no value matched never reads the map.
+        let map = match self.has_doc_map() {
+            true => self.kept_doc_map_within_budget().await?.cloned(),
+            false => None,
+        };
+        let through_map = map.is_some() || !self.has_doc_map();
+        let (docs, ns) = run_on_pool(pool, "contains rows", move || {
+            timed_section(|| {
+                let docs = documents_of(bits, &inline, n_docs)?;
+                Ok::<_, FtsError>(match map {
+                    Some(map) => docs
+                        .iter()
+                        .map(|d| map.row_of(FtsDocId::new(d)).get())
+                        .collect(),
+                    None => docs,
+                })
+            })
         })
         .await
         .map_err(|_| FtsError::TaskDropped("contains rows"))?;
         work.kernel_cpu_ns += ns;
-        rows
+        let docs = docs?;
+        if through_map {
+            return Ok(docs);
+        }
+        // No map kept: the documents still name blob ids.
+        self.bitmap_rows_in_pages(&docs).await
     }
 }
 
@@ -778,13 +793,11 @@ fn posting_past_documents() -> FtsError {
     ))
 }
 
-/// The Parquet rows of the documents set in `bits` or listed in `inline`,
-/// through `doc_map`.
-fn rows_of(
+/// The documents set in `bits` or listed in `inline`.
+fn documents_of(
     mut bits: Vec<u64>,
     inline: &[u32],
     n_docs: u32,
-    doc_map: &DocMap,
 ) -> Result<RoaringBitmap, FtsError> {
     for &doc in inline {
         if doc >= n_docs {
@@ -792,7 +805,7 @@ fn rows_of(
         }
         bits[(doc / u64::BITS) as usize] |= 1u64 << (doc % u64::BITS);
     }
-    let mut rows = RoaringBitmap::new();
+    let mut docs = RoaringBitmap::new();
     for (index, &word) in bits.iter().enumerate() {
         let mut rest = word;
         while rest != 0 {
@@ -803,10 +816,10 @@ fn rows_of(
                 return Err(posting_past_documents());
             }
             rest &= rest - 1;
-            rows.insert(doc_map.row_of(FtsDocId::new(doc)).get());
+            docs.insert(doc);
         }
     }
-    Ok(rows)
+    Ok(docs)
 }
 
 /// Charge `admitted` values to `charge`, when the walk carries one. `false`,

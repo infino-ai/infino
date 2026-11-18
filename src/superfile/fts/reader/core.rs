@@ -30,7 +30,7 @@ use std::{
 use bytes::Bytes;
 use roaring::RoaringBitmap;
 use rustc_hash::FxHashMap;
-use tokio::sync::OnceCell;
+use tokio::sync::{OnceCell, Semaphore};
 
 use super::{
     cursor::{BlockTableCache, CursorUse, TermCursor, TermMeta},
@@ -2295,6 +2295,9 @@ pub(super) fn collect_terms_with_prefix(
 pub(crate) struct OrCursorSet {
     pub(super) column_id: u32,
     pub(super) cursors: Vec<TermCursor>,
+    /// Map page reads the set's slices may have in flight together, one permit a read cap: a
+    /// sliced file holds no more than an unsliced one while it reads pages.
+    pub(super) page_reads: Semaphore,
 }
 
 impl OrCursorSet {

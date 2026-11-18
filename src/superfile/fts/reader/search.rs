@@ -14,7 +14,9 @@ use std::{
 
 use bytes::Bytes;
 use futures::{StreamExt, future::try_join_all, stream};
+use roaring::RoaringBitmap;
 use rustc_hash::FxHashMap;
+use tokio::sync::{Semaphore, SemaphorePermit};
 
 use super::{
     bounds::BoundDecoder,
@@ -55,15 +57,18 @@ const DOC_MAP_ENTRY_BYTES: usize = 4;
 /// Bytes of the doc-id map a sparse translation reads at a time. Small
 /// under test, so a fixture of a thousand documents spans many pages.
 const DOC_MAP_PAGE_BYTES: usize = if cfg!(test) { 64 } else { 64 * 1024 };
-/// A translation that would read more than 1/8 of a map keeps the whole map instead, if the heap
-/// budget has room, so the next query on the file reads none of it.
+/// A ranked translation that would read more than 1/8 of a map keeps the whole map instead, if the
+/// heap budget has room; a pass that reads that much without keeping reads every page to check the
+/// map's CRC.
 const DOC_MAP_SPARSE_SHARE: usize = 8;
 /// Pages a translation reads through to join two reads into one: one more request costs about as
 /// much as this many more pages.
 const DOC_MAP_MERGE_GAP_PAGES: usize = 2;
-/// Most pages one read of a map covers (4 MiB), and one batch of a dense translation that can't
-/// keep the map. Small under test, so a fixture spans several reads.
+/// Most pages one read of a map covers (4 MiB), and one batch of a pass that reads pages. Small
+/// under test, so a fixture spans several reads.
 const DOC_MAP_READ_MAX_PAGES: usize = if cfg!(test) { 8 } else { 64 };
+/// Bytes of one read of a map: [`DOC_MAP_READ_MAX_PAGES`] pages.
+const DOC_MAP_READ_CAP_BYTES: usize = DOC_MAP_READ_MAX_PAGES * DOC_MAP_PAGE_BYTES;
 /// Batches a map pass has in flight at once: enough to hide a remote store's latency, while it
 /// holds at most this many batches of bytes.
 const DOC_MAP_BATCHES_IN_FLIGHT: usize = 4;
@@ -1024,7 +1029,7 @@ impl FtsReader {
     /// Order is left alone: a ranked result is ordered by score, and
     /// translating ids does not disturb that. The unranked siblings
     /// promise ascending ids instead, which translation *does* disturb,
-    /// so they use [`Self::ids_to_rows`].
+    /// so they use [`Self::ids_to_rows_async`].
     ///
     /// No hits read no map.
     #[cfg(test)]
@@ -1051,32 +1056,65 @@ impl FtsReader {
     /// pass decodes them in order. On a blob storing its documents in an
     /// order of its own those are different orders, so this re-orders
     /// ([`into_row_order`]). There is nothing to re-order when there is no
-    /// map.
+    /// map. Translated by [`Self::rows_of_ids`].
     ///
     /// No ids read no map.
-    pub(super) fn ids_to_rows(&self, ids: Vec<FtsDocId>) -> Result<Vec<RowId>, FtsError> {
-        if ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        let map = self.doc_map()?;
-        let rows = ids.iter().map(|&id| map.row_of(id));
-        if !self.has_doc_map() {
-            return Ok(rows.collect());
-        }
-        Ok(into_row_order(rows.collect(), self.n_docs() as usize))
-    }
-
-    /// [`Self::ids_to_rows`] on the caller's runtime, translated by [`Self::rows_of_ids`]. No ids
-    /// read no map.
-    pub(super) async fn ids_to_rows_async(
+    pub(crate) async fn ids_to_rows_async(
         &self,
         ids: Vec<FtsDocId>,
     ) -> Result<Vec<RowId>, FtsError> {
         let rows = self.rows_of_ids(&ids).await?;
-        Ok(match self.has_doc_map() {
+        Ok(self.in_row_order(rows))
+    }
+
+    /// [`Self::ids_to_rows_async`] through the held map, for a slice's pool job; `None` while no
+    /// map is held, and the slice reads pages with [`Self::ids_to_rows_in_pages`].
+    pub(crate) fn held_ids_to_rows(
+        &self,
+        ids: &[FtsDocId],
+    ) -> Result<Option<Vec<RowId>>, FtsError> {
+        let Some(map) = self.checked_held_map(ids.iter().copied())? else {
+            return Ok(None);
+        };
+        let rows = ids.iter().map(|&id| map.row_of(id)).collect();
+        Ok(Some(self.in_row_order(rows)))
+    }
+
+    /// [`Self::ids_to_rows_async`] through the map's pages only, never keeping it: one slice of a
+    /// match whose file could not keep its map ([`Self::kept_doc_map_within_budget`]).
+    pub(crate) async fn ids_to_rows_in_pages(
+        &self,
+        ids: Vec<FtsDocId>,
+        set: &OrCursorSet,
+    ) -> Result<Vec<RowId>, FtsError> {
+        let rows = self.rows_in_pages(&ids, &set.page_reads).await?;
+        Ok(self.in_row_order(rows))
+    }
+
+    /// `rows` put in row order when this blob numbers its documents in an order of its own.
+    fn in_row_order(&self, rows: Vec<RowId>) -> Vec<RowId> {
+        match self.has_doc_map() {
             true => into_row_order(rows, self.n_docs() as usize),
             false => rows,
-        })
+        }
+    }
+
+    /// The rows of `ids`, which must be ascending, through the pages they fall in, keeping nothing.
+    /// A slice's pages are a small share of the map, so they never check its CRC; the match checks
+    /// it once for the file ([`Self::check_map_crc_for`]).
+    pub(super) async fn rows_in_pages(
+        &self,
+        ids: &[FtsDocId],
+        permits: &Semaphore,
+    ) -> Result<Vec<RowId>, FtsError> {
+        self.check_ids_in_map(ids.iter().copied())?;
+        let reads = map_reads(
+            ids.iter().map(|id| id.get() as usize * DOC_MAP_ENTRY_BYTES),
+            self.doc_map_len(),
+        );
+        let cap = DOC_MAP_READ_CAP_BYTES;
+        self.rows_through_pages(ids, None, &reads, cap, Some(permits))
+            .await
     }
 
     /// The rows `ids` stand for, in the order given:
@@ -1109,25 +1147,93 @@ impl FtsReader {
             self.doc_map_len(),
         );
         let read_bytes: usize = reads.iter().map(Range::len).sum();
-        let dense = read_bytes * DOC_MAP_SPARSE_SHARE > self.doc_map_len();
+        let dense = self.reads_most_of_map(read_bytes);
         if dense && let Some(map) = self.kept_doc_map_within_budget().await? {
             return Ok(through(map));
         }
         // Sparse reads are few, so they go out at once. A dense pass goes one read cap per batch, a
         // few batches in flight, and reads every page when the reader checks CRCs, so the map's
         // CRC is still checked.
-        let cap = DOC_MAP_READ_MAX_PAGES * DOC_MAP_PAGE_BYTES;
+        let cap = DOC_MAP_READ_CAP_BYTES;
         let (reads, in_flight) = match dense {
             false => (reads, read_bytes),
-            true if self.verify_crc => {
-                let every_page = (0..self.doc_map_len()).step_by(DOC_MAP_PAGE_BYTES);
-                (map_reads(every_page, self.doc_map_len()), cap)
-            }
+            true if self.verify_crc => (self.every_page(), cap),
             true => (reads, cap),
         };
+        self.rows_through_pages(ids, by_entry.as_deref(), &reads, in_flight, None)
+            .await
+    }
+
+    /// Reads every page once to check the map's CRC when `matched` documents may touch most of it:
+    /// a sliced match's slices read only their own pages, which can't check it.
+    pub(super) async fn check_map_crc_for(&self, matched: u64) -> Result<(), FtsError> {
+        let pages = self.doc_map_len().div_ceil(DOC_MAP_PAGE_BYTES) as u64;
+        let touched = matched.min(pages) as usize * DOC_MAP_PAGE_BYTES;
+        if !self.verify_crc || !self.reads_most_of_map(touched) {
+            return Ok(());
+        }
+        self.map_pass(&self.every_page(), DOC_MAP_READ_CAP_BYTES, None, |_, _| {})
+            .await
+    }
+
+    /// Whether reading `bytes` of the map reads most of it: more than 1/[`DOC_MAP_SPARSE_SHARE`].
+    fn reads_most_of_map(&self, bytes: usize) -> bool {
+        bytes * DOC_MAP_SPARSE_SHARE > self.doc_map_len()
+    }
+
+    /// The rows of `docs` through the map's pages in one pass, keeping nothing, for a contains that
+    /// could not keep the map; like [`Self::rows_of_ids`], it checks the CRC when it reads most.
+    pub(super) async fn bitmap_rows_in_pages(
+        &self,
+        docs: &RoaringBitmap,
+    ) -> Result<RoaringBitmap, FtsError> {
+        let reads = map_reads(
+            docs.iter().map(|doc| doc as usize * DOC_MAP_ENTRY_BYTES),
+            self.doc_map_len(),
+        );
+        let read_bytes: usize = reads.iter().map(Range::len).sum();
+        let reads = match self.verify_crc && self.reads_most_of_map(read_bytes) {
+            true => self.every_page(),
+            false => reads,
+        };
+        let cap = DOC_MAP_READ_CAP_BYTES;
+        let mut rows = RoaringBitmap::new();
+        let mut next = docs.iter().peekable();
+        self.map_pass(&reads, cap, None, |first, entries| {
+            let end = first + (entries.len() / DOC_MAP_ENTRY_BYTES) as u32;
+            while let Some(&doc) = next.peek()
+                && doc < end
+            {
+                let at = (doc - first) as usize * DOC_MAP_ENTRY_BYTES;
+                rows.insert(read_u32_le(&entries[at..at + DOC_MAP_ENTRY_BYTES]));
+                next.next();
+            }
+        })
+        .await?;
+        Ok(rows)
+    }
+
+    /// Reads of every page of the map, in order, so a pass over them checks its CRC.
+    fn every_page(&self) -> Vec<Range<usize>> {
+        let every_page = (0..self.doc_map_len()).step_by(DOC_MAP_PAGE_BYTES);
+        map_reads(every_page, self.doc_map_len())
+    }
+
+    /// The rows `ids` stand for, in the order given, from `reads` of the map (which cover every
+    /// id) with at most `in_flight` bytes read at once. `by_entry` lists the ids' positions in
+    /// ascending id order when they are not already ascending.
+    async fn rows_through_pages(
+        &self,
+        ids: &[FtsDocId],
+        by_entry: Option<&[u32]>,
+        reads: &[Range<usize>],
+        in_flight: usize,
+        permits: Option<&Semaphore>,
+    ) -> Result<Vec<RowId>, FtsError> {
+        let index = |k: usize| by_entry.map_or(k, |order| order[k] as usize);
         let mut rows = vec![RowId::new(0); ids.len()];
         let mut next = 0;
-        self.map_pass(&reads, in_flight, |first, entries| {
+        self.map_pass(reads, in_flight, permits, |first, entries| {
             let end = first as usize + entries.len() / DOC_MAP_ENTRY_BYTES;
             while next < ids.len() && (ids[index(next)].get() as usize) < end {
                 let i = index(next);
@@ -1171,11 +1277,14 @@ impl FtsReader {
 
     /// Fetches `reads` (from [`map_reads`]) in batches of at most `in_flight` bytes, at most
     /// [`DOC_MAP_BATCHES_IN_FLIGHT`] batches at once, and hands each read to `each` in order with
-    /// the first document it covers. Checks the map's CRC when the reads cover it.
+    /// the first document it covers. Checks the map's CRC when the reads cover it. With `permits`,
+    /// each batch holds one from its fetch until it is handed on, so passes sharing them keep at
+    /// most that many batches between them.
     async fn map_pass(
         &self,
         reads: &[Range<usize>],
         in_flight: usize,
+        permits: Option<&Semaphore>,
         mut each: impl FnMut(u32, &[u8]),
     ) -> Result<(), FtsError> {
         let region = self.map_region().clone();
@@ -1189,12 +1298,12 @@ impl FtsReader {
         // `Send`.
         let fetches: Vec<_> = in_flight_batches(reads, in_flight)
             .into_iter()
-            .map(|batch| self.map_batch(batch, &region, check_crc))
+            .map(|batch| self.map_batch(batch, &region, check_crc, permits))
             .collect();
         let mut fetched = stream::iter(fetches).buffered(DOC_MAP_BATCHES_IN_FLIGHT);
         let mut crc = 0;
         while let Some(next) = fetched.next().await {
-            let (batch, bytes_of) = next?;
+            let (batch, bytes_of, _permit) = next?;
             for (read, bytes) in batch.iter().zip(bytes_of) {
                 let body = &bytes[..read.len()];
                 if check_crc {
@@ -1216,7 +1325,17 @@ impl FtsReader {
         batch: &'a [Range<usize>],
         region: &Range<usize>,
         check_crc: bool,
-    ) -> Result<(&'a [Range<usize>], Vec<Bytes>), FtsError> {
+        permits: Option<&'a Semaphore>,
+    ) -> Result<(&'a [Range<usize>], Vec<Bytes>, Option<SemaphorePermit<'a>>), FtsError> {
+        let permit = match permits {
+            Some(permits) => Some(
+                permits
+                    .acquire()
+                    .await
+                    .map_err(|_| FtsError::TaskDropped("doc-map page reads"))?,
+            ),
+            None => None,
+        };
         let bytes = try_join_all(batch.iter().map(|read| {
             let with_crc = check_crc && read.end == region.len();
             let crc_len = if with_crc { format::CRC_BYTES } else { 0 };
@@ -1241,7 +1360,7 @@ impl FtsReader {
             }
         }))
         .await?;
-        Ok((batch, bytes))
+        Ok((batch, bytes, permit))
     }
 
     #[cfg(test)]
@@ -1522,12 +1641,11 @@ impl FtsReader {
             self.build_term_cursors(column_id, terms, idf, purpose, None, prefetched)
                 .await?
         };
-        // An unranked slice translates its ids to rows off this runtime; a
-        // ranked one returns blob ids for its caller to translate.
-        if !cursors.is_empty() && purpose != CursorUse::Score {
-            self.ensure_doc_map().await?;
-        }
-        Ok(OrCursorSet { column_id, cursors })
+        Ok(OrCursorSet {
+            column_id,
+            cursors,
+            page_reads: Semaphore::new(DOC_MAP_BATCHES_IN_FLIGHT),
+        })
     }
 
     /// Multi-term OR over `[doc_id_start, doc_id_end)` against prebuilt
@@ -2372,7 +2490,7 @@ mod tests {
     };
 
     use bytes::Bytes;
-    use futures::poll;
+    use futures::{future::join_all, poll};
     use roaring::RoaringBitmap;
     use tokio::{join, task::spawn_blocking};
 
@@ -2381,6 +2499,7 @@ mod tests {
         *,
     };
     use crate::{
+        memory::ConnectionMemoryBudget,
         superfile::{
             fts::{builder::FtsBuilder, tokenize::Phrase},
             lazy_source::{BytesLazyByteSource, LazyByteSource, Source},
@@ -2404,6 +2523,15 @@ mod tests {
     /// so the rescale of the stored bounds rounds every way across the
     /// sweep.
     const TIE_FLOOR_IDF_STEP: f32 = 1.0 / 65_536.0;
+    /// Rows apart of the documents holding [`GAP_TERM`]: four pages of the test map.
+    const GAP_EVERY: u32 = 64;
+    /// A term on every [`GAP_EVERY`]th row only.
+    const GAP_TERM: &str = "gap";
+    /// Slices a sliced match cuts one file into in the tests below: more than a file's reads in
+    /// flight.
+    const MANY_SLICES: u32 = 16;
+    /// A term only the last document of [`dense_translation`]'s blob holds.
+    const LAST_DOC_TERM: &str = "r999";
     /// Rows in the reordered fixture: a whole number of bitset words, and a
     /// count that leaves the last word part full.
     const ORDER_FIXTURE_ROWS: [u32; 2] = [4096, 4101];
@@ -2519,9 +2647,10 @@ mod tests {
                 .expect("cursor set");
             let mut sliced: Vec<RowId> = Vec::new();
             for pair in bounds.windows(2) {
-                let (rows, _) = r
-                    .token_match_range_prebuilt(&set, pair[0], pair[1])
+                let (ids, _) = r
+                    .token_match_range_in_blob_ids(&set, pair[0], pair[1])
                     .expect("slice");
+                let rows = r.ids_to_rows_async(ids).await.expect("rows");
                 assert!(rows.is_sorted(), "{terms:?}: slice {pair:?} ascending");
                 sliced.extend(rows);
             }
@@ -4140,10 +4269,7 @@ mod tests {
         //  - Ids every fourth page, dense but with gaps, read in pages.
         // This test pins that each way refuses the damaged map rather than naming wrong rows.
         const N_DOCS: u32 = 1000;
-        let docs: Vec<String> = (0..N_DOCS).map(|row| format!("alpha r{row}")).collect();
-        let refs: Vec<&str> = docs.iter().map(String::as_str).collect();
-        let order: Vec<u32> = (0..N_DOCS).rev().collect();
-        let (blob, json) = build_standard_blob_with(&refs, Some(&order));
+        let (damaged, json) = damaged_dense_blob().await;
         let open = |blob: Bytes| {
             let json = json.clone();
             async move {
@@ -4153,14 +4279,6 @@ mod tests {
                     .expect("open_lazy")
             }
         };
-        let region = open(blob.clone())
-            .await
-            .doc_map_region
-            .clone()
-            .expect("a reordered blob has a map");
-        let mut damaged = blob.to_vec();
-        damaged[region.start + region.len() / 2] ^= u8::MAX;
-        let damaged = Bytes::from(damaged);
         let every_id: Vec<FtsDocId> = (0..N_DOCS).map(FtsDocId::new).collect();
         for (budget, in_pages) in [(Some(0), true), (None, false)] {
             let r = open(damaged.clone()).await.with_heap_budget(roomy(budget));
@@ -4317,6 +4435,305 @@ mod tests {
         assert_eq!(r.hits_to_rows_async(hits).await.expect("translate"), want);
         assert!(!r.doc_map_is_read(), "nothing kept");
         assert_eq!(budget.charged(), 0);
+    }
+
+    #[tokio::test]
+    async fn without_room_a_sliced_match_keeps_no_map() {
+        // Setup: a reordered blob where every document matches, cut into slices like a sliced
+        // `token_match`; a heap budget with no room.
+        //  - Building the slices' cursors keeps no map (it reads every page once, for the CRC).
+        //  - Each slice's ids turn into its rows through its own map pages, and nothing is kept.
+        // This test pins that an unranked match over many large files can't keep every file's map
+        // past the budget.
+        let (blob, json, order, _) = dense_translation();
+        let budget = roomy(Some(0));
+        let r = open_charged(blob, &json, budget).await;
+        let (set, _) = r
+            .match_cursor_set("body", &["alpha"], None)
+            .await
+            .expect("cursor set");
+        assert!(!r.doc_map_is_read(), "the cursors keep no map");
+        let checked = r.doc_map_reads();
+        let n_docs = order.len() as u32;
+        let mut rows = Vec::new();
+        for (start, end) in [(0, n_docs / 2), (n_docs / 2, n_docs)] {
+            let (ids, _) = r
+                .token_match_range_in_blob_ids(&set, start, end)
+                .expect("slice");
+            assert!(r.held_ids_to_rows(&ids).expect("held").is_none());
+            rows.extend(r.ids_to_rows_in_pages(ids, &set).await.expect("rows"));
+        }
+        rows.sort_unstable();
+        let every_row: Vec<RowId> = (0..n_docs).map(RowId::new).collect();
+        assert_eq!(rows, every_row);
+        assert!(
+            r.doc_map_reads() > checked,
+            "the slices read their own pages"
+        );
+        assert!(!r.doc_map_is_read(), "nothing kept");
+        assert_eq!(budget.charged(), 0);
+    }
+
+    #[tokio::test]
+    async fn without_room_a_contains_match_keeps_no_map() {
+        // Setup: a reordered blob where every document holds `alpha`; a heap budget with no room.
+        //  - An `ILIKE '%lph%'` answered from the dictionary turns its documents into rows through
+        //    map pages, and nothing is kept.
+        // This test pins that a text filter in a SQL `WHERE` can't keep every file's map past the
+        // budget.
+        let (blob, json, order, _) = dense_translation();
+        let budget = roomy(Some(0));
+        let r = open_charged(blob, &json, budget).await;
+        let (found, _) = r
+            .contains_rows("body", &["lph"], None, None)
+            .await
+            .expect("contains");
+        let every_row: RoaringBitmap = (0..order.len() as u32).collect();
+        assert_eq!(found[0].proven, every_row);
+        assert!(r.doc_map_reads() > 1, "read in pages");
+        assert!(!r.doc_map_is_read(), "nothing kept");
+        assert_eq!(budget.charged(), 0);
+    }
+
+    /// The rows a sliced match of `term` over `r` finds, `slices` slices of it, each through the
+    /// held map or its pages as the slice's file decided.
+    async fn sliced_rows_of(r: &FtsReader, term: &str, slices: u32) -> Vec<RowId> {
+        let (set, _) = r
+            .match_cursor_set("body", &[term], None)
+            .await
+            .expect("cursor set");
+        let n_docs = r.n_docs();
+        let mut rows = Vec::new();
+        for slice in 0..slices {
+            let (start, end) = (n_docs * slice / slices, n_docs * (slice + 1) / slices);
+            let (ids, _) = r
+                .token_match_range_in_blob_ids(&set, start, end)
+                .expect("slice");
+            match r.held_ids_to_rows(&ids).expect("held") {
+                Some(held) => rows.extend(held),
+                None => rows.extend(r.ids_to_rows_in_pages(ids, &set).await.expect("pages")),
+            }
+        }
+        rows.sort_unstable();
+        rows
+    }
+
+    #[tokio::test]
+    async fn with_room_a_sliced_match_keeps_its_map_once() {
+        // Setup: a reordered blob where every document matches, cut into many slices; a heap
+        // budget with room.
+        //  - The match keeps the whole map once, when it builds the cursors, and every slice
+        //    translates through it: no page reads.
+        // This test pins that the keep is decided for the file, not judged slice by slice.
+        let (blob, json, order, _) = dense_translation();
+        let budget = roomy(None);
+        let r = open_charged(blob, &json, budget).await;
+        let rows = sliced_rows_of(&r, "alpha", MANY_SLICES).await;
+        let every_row: Vec<RowId> = (0..order.len() as u32).map(RowId::new).collect();
+        assert_eq!(rows, every_row);
+        assert!(r.doc_map_is_read(), "the map is kept");
+        assert_eq!(r.doc_map_reads(), 0, "one whole read, no page reads");
+        assert!(budget.charged() > 0, "and charged");
+    }
+
+    #[tokio::test]
+    async fn without_room_a_files_slices_share_its_page_reads() {
+        // Setup: a reordered blob where every document matches, in two slices that each need more
+        // read caps than a file may have in flight; no room in the heap budget; the reads held at
+        // the source.
+        //  - Both slices start reading at once, and only a file's share of reads starts between
+        //    them; the rest wait until those are back.
+        // This test pins that a sliced file holds no more map pages in flight than an unsliced one.
+        let (blob, json, order, _) = dense_translation();
+        let src = Arc::new(GatedSource::new(blob));
+        let r = FtsReader::open_lazy(
+            Arc::clone(&src) as Arc<dyn LazyByteSource>,
+            &json,
+            OpenOptions { verify_crc: false },
+        )
+        .await
+        .expect("open_lazy")
+        .with_heap_budget(roomy(Some(0)));
+        let (set, _) = r
+            .match_cursor_set("body", &["alpha"], None)
+            .await
+            .expect("cursor set");
+        let n_docs = order.len() as u32;
+        let halves = [(0, n_docs / 2), (n_docs / 2, n_docs)].map(|(start, end)| {
+            r.token_match_range_in_blob_ids(&set, start, end)
+                .expect("slice")
+                .0
+        });
+        let opened = src.started.load(Ordering::Relaxed);
+        let held = src.gate.write().await;
+        let mut both = Box::pin(join_all(
+            halves.map(|ids| r.ids_to_rows_in_pages(ids, &set)),
+        ));
+        assert!(poll!(both.as_mut()).is_pending());
+        assert_eq!(
+            src.started.load(Ordering::Relaxed) - opened,
+            DOC_MAP_BATCHES_IN_FLIGHT,
+            "one file's reads in flight across its slices"
+        );
+        drop(held);
+        let rows: usize = both
+            .await
+            .into_iter()
+            .map(|rows| rows.expect("rows").len())
+            .sum();
+        assert_eq!(rows, order.len());
+    }
+
+    #[tokio::test]
+    async fn without_room_a_sliced_match_reads_its_pages_and_keeps_nothing() {
+        // Setup: the same match in many slices; a heap budget with no room.
+        //  - No slice tries to keep the map again: each reads its own pages.
+        // This test pins that a refused keep is decided once and the rows still all come back.
+        let (blob, json, order, _) = dense_translation();
+        let budget = roomy(Some(0));
+        let r = open_charged(blob, &json, budget).await;
+        let rows = sliced_rows_of(&r, "alpha", MANY_SLICES).await;
+        let every_row: Vec<RowId> = (0..order.len() as u32).map(RowId::new).collect();
+        assert_eq!(rows, every_row);
+        assert!(
+            r.doc_map_reads() >= MANY_SLICES as usize,
+            "every slice read pages"
+        );
+        assert!(!r.doc_map_is_read(), "nothing kept");
+        assert_eq!(budget.charged(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_broad_contains_holds_its_bitset_not_a_list() {
+        // Setup: a reordered blob where every document holds `alpha`; a heap budget with room.
+        //  - A contains matching every document holds about what one matching a single document
+        //    holds (both walk the whole dictionary): the bitset, never a list of the documents.
+        // This test pins that a broad contains holds about a bit a document, not 8 bytes.
+        let (blob, json, order, _) = dense_translation();
+        let r = open_charged(blob, &json, roomy(None)).await;
+        let held = |needle: &'static str| {
+            let r = &r;
+            async move {
+                let connection = ConnectionMemoryBudget::measured();
+                let (found, _) = r
+                    .contains_rows("body", &[needle], None, Some(&connection))
+                    .await
+                    .expect("contains");
+                (found[0].proven.len(), connection.peak())
+            }
+        };
+        let (one, narrow) = held(LAST_DOC_TERM).await;
+        let (every, broad) = held("lph").await;
+        let n_docs = order.len();
+        assert_eq!((one, every), (1, n_docs as u64));
+        assert!(r.doc_map_is_read(), "the map is kept");
+        assert!(
+            broad - narrow < n_docs * size_of::<u32>(),
+            "held {} bytes more for {n_docs} documents",
+            broad - narrow
+        );
+    }
+
+    #[tokio::test]
+    async fn with_room_a_one_document_sliced_match_keeps_its_map() {
+        // Setup: a reordered blob and a term only one document holds; a heap budget with room.
+        //  - The match keeps the whole map.
+        // This test pins that keeping is decided by room alone, not by how many documents match.
+        let (blob, json, _, _) = dense_translation();
+        let r = open_charged(blob, &json, roomy(None)).await;
+        assert_eq!(
+            sliced_rows_of(&r, LAST_DOC_TERM, MANY_SLICES).await.len(),
+            1
+        );
+        assert!(r.doc_map_is_read(), "the map is kept");
+    }
+
+    #[tokio::test]
+    async fn without_room_a_rare_contains_reads_only_its_page() {
+        // Setup: a reordered blob and a needle only its last document holds; no room in the heap
+        // budget.
+        //  - The contains reads the one map page that document falls in, keeps nothing, and names
+        //    its row.
+        // This test pins the contains page pass when it reads few pages, with gaps and no CRC.
+        let (blob, json, order, _) = dense_translation();
+        let r = open_charged(blob, &json, roomy(Some(0))).await;
+        let (found, _) = r
+            .contains_rows("body", &[LAST_DOC_TERM], None, None)
+            .await
+            .expect("contains");
+        let last_row = order.len() as u32 - 1;
+        assert_eq!(found[0].proven, RoaringBitmap::from_iter([last_row]));
+        assert_eq!(r.doc_map_reads(), 1, "one page");
+        assert!(!r.doc_map_is_read(), "nothing kept");
+    }
+
+    #[tokio::test]
+    async fn without_room_a_sliced_match_and_a_contains_still_check_the_map_crc() {
+        // Setup: a blob whose doc-id map has one flipped byte, a reader that checks CRCs, and no
+        // room in the heap budget, so nothing is kept.
+        //  - A sliced match over every document reads every page once and refuses the map.
+        //  - So does a contains over every document.
+        //  - So does a contains over documents in every fourth page, damaged in a page it doesn't
+        //    touch: dense with gaps, it reads every page to check the CRC.
+        // This test pins that reading pages instead of keeping the map still checks its CRC.
+        let (damaged, json) = damaged_dense_blob().await;
+        let refused = |result: Result<(), FtsError>| {
+            matches!(
+                result,
+                Err(FtsError::Read(ReadError::ChecksumMismatch {
+                    section: "fts/doc-map",
+                    ..
+                }))
+            )
+        };
+        let r = open_charged(damaged.clone(), &json, roomy(Some(0))).await;
+        let built = r.match_cursor_set("body", &["alpha"], None).await;
+        assert!(refused(built.map(drop)), "the sliced match");
+        let r = open_charged(damaged, &json, roomy(Some(0))).await;
+        let found = r.contains_rows("body", &["lph"], None, None).await;
+        assert!(refused(found.map(drop)), "the contains");
+        let (gapped, json) = damaged_gapped_blob().await;
+        let r = open_charged(gapped, &json, roomy(Some(0))).await;
+        let found = r.contains_rows("body", &[GAP_TERM], None, None).await;
+        assert!(refused(found.map(drop)), "the gapped contains");
+    }
+
+    /// A reordered blob of 1000 documents where every [`GAP_EVERY`]th row also holds [`GAP_TERM`],
+    /// so that term's documents fall in every fourth page of the map, with one byte of a page they
+    /// don't touch flipped.
+    async fn damaged_gapped_blob() -> (Bytes, String) {
+        const N_DOCS: u32 = 1000;
+        let docs: Vec<String> = (0..N_DOCS)
+            .map(|row| match row % GAP_EVERY {
+                0 => format!("alpha r{row} {GAP_TERM}"),
+                _ => format!("alpha r{row}"),
+            })
+            .collect();
+        let refs: Vec<&str> = docs.iter().map(String::as_str).collect();
+        let order: Vec<u32> = (0..N_DOCS).rev().collect();
+        let (blob, json) = build_standard_blob_with(&refs, Some(&order));
+        let region = open_charged(blob.clone(), &json, roomy(None))
+            .await
+            .doc_map_region
+            .clone()
+            .expect("a reordered blob has a map");
+        let untouched = region.start + region.len() / 2;
+        let mut damaged = blob.to_vec();
+        damaged[untouched] ^= u8::MAX;
+        (Bytes::from(damaged), json)
+    }
+
+    /// [`dense_translation`]'s blob with one byte of its doc-id map flipped.
+    async fn damaged_dense_blob() -> (Bytes, String) {
+        let (blob, json, _, _) = dense_translation();
+        let region = open_charged(blob.clone(), &json, roomy(None))
+            .await
+            .doc_map_region
+            .clone()
+            .expect("a reordered blob has a map");
+        let mut damaged = blob.to_vec();
+        damaged[region.start + region.len() / 2] ^= u8::MAX;
+        (Bytes::from(damaged), json)
     }
 
     #[tokio::test]
