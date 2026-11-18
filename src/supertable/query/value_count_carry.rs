@@ -23,13 +23,18 @@ use datafusion::common::ScalarValue;
 use uuid::Uuid;
 
 use crate::supertable::{
-    manifest::{
-        SuperfileEntry,
-        list::{MAX_EXACT_VALUE_COUNTS, ScalarValueCounts},
-    },
+    manifest::{SuperfileEntry, list::ScalarValueCounts},
     query::skip::file_lacks_column,
     schema::FieldId,
 };
+
+/// The most distinct values a column's table-wide counts hold. Past it the
+/// statistics hold no exact answer for the table, and the grouped count runs
+/// instead, giving the same rows. It bounds what the carry keeps for a column
+/// and what one answer from the statistics returns. It is its own setting:
+/// what one superfile keeps is bounded by bytes, by
+/// [`VALUE_TABLES_BUDGET_BYTES`](crate::supertable::manifest::list::VALUE_TABLES_BUDGET_BYTES).
+pub(crate) const MAX_TABLE_VALUE_COUNTS: usize = 1024;
 
 /// The carried sums of one table, one per column asked for. Shared by every
 /// reader of the table, whatever snapshot each pins: a reader on an older
@@ -53,9 +58,9 @@ struct CarriedColumn {
 #[derive(Debug)]
 enum Sum {
     /// Each value's count across the superfiles, at most
-    /// [`MAX_EXACT_VALUE_COUNTS`] values.
+    /// [`MAX_TABLE_VALUE_COUNTS`] values.
     Counts(HashMap<ScalarValue, u64>),
-    /// No exact answer: the values ran past the cap, or a superfile holding
+    /// No exact answer: the values ran past the limit, or a superfile holding
     /// values recorded no counts. More superfiles keep it so; one leaving
     /// starts the sum over, since nothing can be taken off an unknown sum.
     Unknown,
@@ -80,7 +85,7 @@ impl Sum {
                         }
                         None => false,
                     }
-                }) && sum.len() <= MAX_EXACT_VALUE_COUNTS
+                }) && sum.len() <= MAX_TABLE_VALUE_COUNTS
             }
         };
         if !known {
@@ -155,7 +160,7 @@ pub(crate) fn take_off<'a>(
 
 /// Column `column`'s counts over `files`, added up. `None` when one of them
 /// holds values it recorded no counts of, or they hold more than
-/// [`MAX_EXACT_VALUE_COUNTS`] distinct values together.
+/// [`MAX_TABLE_VALUE_COUNTS`] distinct values together.
 pub(crate) fn counts_of(
     files: &[Arc<SuperfileEntry>],
     column: FieldId,
@@ -176,7 +181,7 @@ impl ValueCountCarry {
     /// superfiles it lacks and taking off the ones `files` lacks. A
     /// superfile whose column holds only nulls adds nothing, so a column
     /// with no value at all has empty counts. `None` when there is no exact
-    /// answer: more than [`MAX_EXACT_VALUE_COUNTS`] values, or a superfile
+    /// answer: more than [`MAX_TABLE_VALUE_COUNTS`] values, or a superfile
     /// holding values that recorded no counts.
     pub(crate) fn sum(
         &self,
