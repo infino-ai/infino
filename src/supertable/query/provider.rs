@@ -6962,21 +6962,33 @@ mod tests {
         files.len()
     }
 
-    fn seq_table(dir: &TempDir, files: i64, rows: i64, range_indexes: &[String]) -> Supertable {
+    fn seq_table(dir: &TempDir, files: i64, rows: i64) -> Supertable {
         let storage: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
-        let schema = Arc::new(Schema::new(vec![Field::new("seq", DataType::Int64, false)]));
-        let options = SupertableOptions::new(Arc::clone(&schema), vec![], vec![])
-            .expect("options")
-            .with_storage(storage)
-            .with_range_indexes(range_indexes);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("seq", DataType::Int64, false),
+            Field::new("title", DataType::LargeUtf8, false),
+        ]));
+        let options =
+            SupertableOptions::new(Arc::clone(&schema), vec![FtsConfig::new("title")], vec![])
+                .expect("options")
+                .with_storage(storage);
         let st = Supertable::create(options).expect("create");
-        // One commit per file, `seq` counting up across them.
+        // One commit per file, `seq` counting up across them, `title` "even" or "odd" by `seq`.
         for file in 0..files {
             let seqs: Vec<i64> = (file * rows..(file + 1) * rows).collect();
-            let batch =
-                RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(Int64Array::from(seqs))])
-                    .expect("batch");
+            let titles: Vec<&str> = seqs
+                .iter()
+                .map(|s| if s % 2 == 0 { "even" } else { "odd" })
+                .collect();
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(seqs)),
+                    Arc::new(LargeStringArray::from(titles)),
+                ],
+            )
+            .expect("batch");
             let mut writer = st.writer().expect("writer");
             writer.append(&batch).expect("append");
             writer.commit().expect("commit");
@@ -7014,7 +7026,7 @@ mod tests {
         const LIMIT_OLDEST_KEPT: i64 = 300;
         const LIMIT_DELETED_EVERY: i64 = 11;
         let dir = TempDir::new().expect("tempdir");
-        let st = seq_table(&dir, LIMIT_FILES, LIMIT_ROWS_PER_FILE, &[]);
+        let st = seq_table(&dir, LIMIT_FILES, LIMIT_ROWS_PER_FILE);
         st.delete(
             col("seq")
                 .gt_eq(lit(LIMIT_OLDEST_KEPT))
@@ -7079,7 +7091,7 @@ mod tests {
         //  - `LIMIT 10 OFFSET 95` needs 105 rows: two files.
         // This test pins that the offset's rows count toward the files the scan opens.
         let dir = TempDir::new().expect("tempdir");
-        let reader = seq_table(&dir, 4, 100, &[]).reader().expect("reader");
+        let reader = seq_table(&dir, 4, 100).reader().expect("reader");
         for (offset, files) in [(85, 1), (95, 2)] {
             let sql = format!("SELECT seq FROM supertable LIMIT 10 OFFSET {offset}");
             let mut got = seqs(&reader, &sql);
@@ -7095,12 +7107,12 @@ mod tests {
         // An empty table under `LIMIT 10`, and 4 files under `LIMIT 0`.
         // This test pins that both answer no rows and plan no file.
         let dir = TempDir::new().expect("tempdir");
-        let empty = seq_table(&dir, 0, 0, &[]).reader().expect("reader");
+        let empty = seq_table(&dir, 0, 0).reader().expect("reader");
         let sql = "SELECT seq FROM supertable LIMIT 10";
         assert!(seqs(&empty, sql).is_empty());
         assert_eq!(planned_files(&empty, sql), 0);
         let other = TempDir::new().expect("tempdir");
-        let reader = seq_table(&other, 4, 100, &[]).reader().expect("reader");
+        let reader = seq_table(&other, 4, 100).reader().expect("reader");
         let sql = "SELECT seq FROM supertable LIMIT 0";
         assert!(seqs(&reader, sql).is_empty());
         assert_eq!(planned_files(&reader, sql), 0);
@@ -7114,7 +7126,7 @@ mod tests {
         //  - `LIMIT 250` needs all 3 live files: 7 files, past the 5 a plain `EXPLAIN` lists.
         // This test pins the doubling groups and the file count past 5.
         let dir = TempDir::new().expect("tempdir");
-        let st = seq_table(&dir, 7, 100, &[]);
+        let st = seq_table(&dir, 7, 100);
         st.delete(col("seq").lt(lit(400_i64))).expect("delete");
         let reader = st.reader().expect("reader");
         for (limit, files) in [(10, 5), (250, 7)] {
@@ -7131,34 +7143,21 @@ mod tests {
     #[test]
     fn a_limit_under_a_filter_sort_or_group_plans_every_file() {
         // 4 files of 100 rows and a `LIMIT` under `WHERE`, `ORDER BY` and `GROUP BY`.
-        //  - On a range-indexed `seq`, `WHERE seq >= 50` is pushed down exactly, so the scan gets
-        //    the limit with the filter; the first file holds 100 rows but only 50 pass it.
+        //  - A `text_match` is pushed down exactly, so the scan gets the limit with it: the first
+        //    file holds 100 rows but only 50 pass `text_match(title, 'even')`.
         // This test pins that none of them takes the plain-limit path: each plans all 4 files.
         let dir = TempDir::new().expect("tempdir");
-        let ranged = TempDir::new().expect("tempdir");
-        let plain = seq_table(&dir, 4, 100, &[]).reader().expect("reader");
-        let indexed = seq_table(&ranged, 4, 100, &["seq".to_string()])
-            .reader()
-            .expect("reader");
-        for (reader, sql, rows) in [
+        let reader = seq_table(&dir, 4, 100).reader().expect("reader");
+        for (sql, rows) in [
             (
-                &indexed,
-                "SELECT seq FROM supertable WHERE seq >= 50 LIMIT 100",
+                "SELECT seq FROM supertable WHERE text_match(title, 'even') LIMIT 100",
                 100,
             ),
-            (
-                &plain,
-                "SELECT seq FROM supertable ORDER BY seq LIMIT 10",
-                10,
-            ),
-            (
-                &plain,
-                "SELECT seq FROM supertable GROUP BY seq LIMIT 10",
-                10,
-            ),
+            ("SELECT seq FROM supertable ORDER BY seq LIMIT 10", 10),
+            ("SELECT seq FROM supertable GROUP BY seq LIMIT 10", 10),
         ] {
-            assert_eq!(seqs(reader, sql).len(), rows, "{sql}");
-            assert_eq!(planned_files(reader, sql), 4, "{sql}");
+            assert_eq!(seqs(&reader, sql).len(), rows, "{sql}");
+            assert_eq!(planned_files(&reader, sql), 4, "{sql}");
         }
     }
 }
