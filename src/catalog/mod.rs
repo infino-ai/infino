@@ -160,6 +160,7 @@ use crate::{
         query::{
             covered_agg::prepare_aggregate_inputs,
             exec::common::{collect_plan_metered, run_within_process_limit},
+            json_functions::register_json_functions,
             sql::sql_session_context,
         },
         reader_cache::{DiskCacheConfig, DiskCacheError, DiskCacheStore},
@@ -1448,6 +1449,9 @@ impl Connection {
         // the catalog at call time (so a table named only inside a TVF —
         // not as a `FROM` relation — still resolves).
         search_tvf::register_search_tvfs(&ctx, self.clone(), table_reads.clone());
+        // JSON accessors for text columns that hold a JSON document.
+        register_json_functions(&ctx)
+            .map_err(|e| InfinoError::Backend(e.to_string()).with_context("query_sql", None))?;
         // The graph functions walk an edge table of this catalog by name, or
         // the one attached from another catalog with no name.
         #[cfg(feature = "graph-index")]

@@ -98,6 +98,7 @@ use crate::{
                 match_exec::{MatchTopK, register_match},
                 vector_exec::register_vector_search,
             },
+            json_functions::register_json_functions,
             provider::{SupertableProvider, TABLE_NAME, view_string_schema},
             range_top_k::RangeTopK,
         },
@@ -691,6 +692,8 @@ impl SupertableReader {
         register_match(&ctx, Arc::clone(&reader), schemas.scalar().clone());
         // `text_match`, the token match as a WHERE predicate.
         crate::supertable::query::text_match::register_text_match(&ctx);
+        // JSON accessors for text columns that hold a JSON document.
+        register_json_functions(&ctx).map_err(QueryError::DataFusion)?;
         register_hybrid_search(&ctx, Arc::clone(&reader), schemas.scalar().clone());
 
         Ok(ctx)
