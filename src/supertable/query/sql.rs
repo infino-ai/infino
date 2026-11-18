@@ -53,7 +53,13 @@
 //! output and never reaches a caller — a `SELECT`, `GROUP BY` key, or
 //! `MIN`/`MAX` over a string column always comes back `LargeUtf8`.
 
-use std::{collections::HashSet, future::Future, mem, sync::Arc, time::Instant};
+use std::{
+    collections::{HashMap, HashSet},
+    future::Future,
+    mem,
+    sync::{Arc, Weak},
+    time::Instant,
+};
 
 use arrow::{
     compute::{cast, concat_batches},
@@ -62,15 +68,19 @@ use arrow::{
 use arrow_array::{Array, Decimal128Array, Int64Array, new_empty_array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::{
-    common::{Column, DFSchema, ScalarValue, runtime::SpawnedTask, tree_node::TreeNode},
+    common::{
+        Column, DFSchema, ScalarValue,
+        runtime::SpawnedTask,
+        tree_node::{Transformed, TreeNode, TreeNodeRecursion},
+    },
     dataframe::DataFrame,
-    datasource::DefaultTableSource,
+    datasource::{DefaultTableSource, provider_as_source},
     error::DataFusionError,
     execution::{TaskContext, context::SessionContext},
     functions_aggregate::{count::count_all, expr_fn::count},
     logical_expr::{
-        Expr, ExprFunctionExt, LogicalPlan, lit, simplify::SimplifyContext,
-        utils::split_conjunction,
+        Expr, ExprFunctionExt, LogicalPlan, LogicalTableSource, TableScan, lit,
+        simplify::SimplifyContext, utils::split_conjunction,
     },
     optimizer::simplify_expressions::ExprSimplifier,
 };
@@ -81,7 +91,7 @@ use uuid::Uuid;
 use crate::utils::trace::OpOrigin;
 use crate::{
     InfinoError,
-    memory::{ConnectionMemoryBudget, SqlSpill, budgeted_session_context},
+    memory::{ConnectionMemoryBudget, Reclaim, Reservation, SqlSpill, budgeted_session_context},
     runtime_metrics::op_stats::{self, OpStatsCollector},
     supertable::{
         error::QueryError,
@@ -100,6 +110,7 @@ use crate::{
             },
             provider::{SupertableProvider, TABLE_NAME, view_string_schema},
             range_top_k::RangeTopK,
+            scalar_cache::ByteLru,
         },
         reader_cache::disk::ForegroundQueryGuard,
         schema::sql_schema,
@@ -205,33 +216,256 @@ pub(crate) fn conform_value_counts(
 /// Maximum distinct scalar SQL statements cached per manifest snapshot.
 const SQL_LOGICAL_PLAN_CACHE_ENTRIES: usize = 64;
 
-/// Cache only plans whose table scans all use [`SupertableProvider`].
+/// Cache only plans that scan at least one table and whose table scans,
+/// subqueries' included, all use [`SupertableProvider`].
 ///
 /// Search TVF providers hold a live reader in their logical plan. Caching
 /// those plans on `SupertableInner` would create a reference cycle; scalar
 /// providers own only the pinned manifest and storage/cache handles.
 fn cacheable_scalar_plan(plan: &LogicalPlan) -> bool {
-    fn visit(plan: &LogicalPlan, found_scan: &mut bool) -> bool {
-        if let LogicalPlan::TableScan(scan) = plan {
-            let Some(source) = scan.source.downcast_ref::<DefaultTableSource>() else {
-                return false;
-            };
-            if source
-                .table_provider
-                .downcast_ref::<SupertableProvider>()
-                .is_none()
-            {
-                return false;
+    let mut catalog_tables_only = true;
+    let mut found_scan = false;
+    let walked = plan.apply_with_subqueries(|node| {
+        if let LogicalPlan::TableScan(scan) = node {
+            found_scan = true;
+            let catalog_table = scan
+                .source
+                .downcast_ref::<DefaultTableSource>()
+                .is_some_and(|s| {
+                    s.table_provider
+                        .downcast_ref::<SupertableProvider>()
+                        .is_some()
+                });
+            if !catalog_table {
+                catalog_tables_only = false;
+                return Ok(TreeNodeRecursion::Stop);
             }
-            *found_scan = true;
         }
-        plan.inputs()
-            .into_iter()
-            .all(|input| visit(input, found_scan))
+        Ok(TreeNodeRecursion::Continue)
+    });
+    walked.is_ok() && catalog_tables_only && found_scan
+}
+
+/// Most bytes a connection's kept statements hold together, when its memory
+/// budget has room for them; past it the least recently run go first.
+const STATEMENT_PLANS_BYTES: usize = 16 * 1024 * 1024;
+
+/// Most bytes one kept statement may hold: a statement past it, a long `IN`
+/// list say, is parsed again each time it runs rather than kept.
+pub(crate) const STATEMENT_PLAN_MAX_BYTES: usize = 1024 * 1024;
+
+/// The share of the connection's memory budget, in percent, past which no
+/// statement is kept: a kept plan only saves parsing, so it never takes the
+/// room a query needs.
+const STATEMENT_PLANS_BUDGET_SHARE_PERCENT: usize = 10;
+
+/// What a kept statement's parse found about its tables, for a later run to
+/// register them as the parse would have: the catalog tables it names,
+/// whether running it reads their data, and whether it can use their column
+/// statistics.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct KeptTables {
+    pub(crate) names: Vec<String>,
+    pub(crate) reads_data: bool,
+    pub(crate) statistics: bool,
+}
+
+/// A kept statement: what its parse found about its tables, its parsed
+/// plan, and the bytes it holds against the connection's budget, given back
+/// when it is dropped.
+struct KeptStatement {
+    tables: KeptTables,
+    plan: LogicalPlan,
+    _reservation: Reservation,
+}
+
+/// A connection's parsed statements, by their text: the logical plan a
+/// statement parses to, before any optimization, and the catalog tables it
+/// names. Parsing and building that plan is a fifth of a small statement's
+/// planning; the optimizer and the physical planner still run for every
+/// statement, on its own snapshot of each table.
+///
+/// A plan is kept only when every table it scans, its subqueries' included,
+/// is a catalog table ([`cacheable_scalar_plan`]'s rule): a search function's
+/// relation holds a live reader. A kept plan scans a placeholder carrying
+/// only the table's schema, so it pins no snapshot; [`Self::bind`] puts the
+/// statement's own tables back.
+///
+/// Bounded by bytes ([`statement_bytes`]): at most
+/// [`STATEMENT_PLANS_BYTES`] together, the least recently run statement
+/// dropped first to make room, and no statement past
+/// [`STATEMENT_PLAN_MAX_BYTES`]. Each kept statement's bytes are reserved
+/// against the connection's memory budget, within
+/// [`STATEMENT_PLANS_BUDGET_SHARE_PERCENT`] of it, and every kept statement
+/// is given back when the budget needs room for something else.
+pub(crate) struct StatementPlans {
+    budget: Arc<ConnectionMemoryBudget>,
+    plans: ByteLru<String, Arc<KeptStatement>>,
+}
+
+impl StatementPlans {
+    /// An empty cache charging `budget`, registered to give its plans back
+    /// when the budget needs the room.
+    pub(crate) fn new(budget: &Arc<ConnectionMemoryBudget>) -> Arc<Self> {
+        Self::with_max_bytes(budget, STATEMENT_PLANS_BYTES)
     }
 
-    let mut found_scan = false;
-    visit(plan, &mut found_scan) && found_scan
+    /// [`Self::new`], holding at most `max_bytes` of statements together.
+    pub(crate) fn with_max_bytes(
+        budget: &Arc<ConnectionMemoryBudget>,
+        max_bytes: usize,
+    ) -> Arc<Self> {
+        let plans = Arc::new(Self {
+            budget: Arc::clone(budget),
+            plans: ByteLru::new(max_bytes),
+        });
+        let holder: Weak<Self> = Arc::downgrade(&plans);
+        budget.register_reclaim(holder);
+        plans
+    }
+
+    /// What `sql`'s parse found about its tables, and its parsed plan, when
+    /// kept.
+    pub(crate) fn get(&self, sql: &str) -> Option<(KeptTables, LogicalPlan)> {
+        let kept = self.plans.get(&sql.to_owned())?;
+        Some((kept.tables.clone(), kept.plan.clone()))
+    }
+
+    /// Keep `plan`, what `sql` parses to, with what the parse found about
+    /// its `tables`, when every table it scans is a catalog table, it holds
+    /// no more than [`STATEMENT_PLAN_MAX_BYTES`], and the connection's budget
+    /// has room.
+    pub(crate) fn keep(&self, sql: &str, tables: KeptTables, plan: &LogicalPlan) {
+        if !cacheable_scalar_plan(plan) {
+            return;
+        }
+        let bytes = statement_bytes(sql, &tables.names, plan);
+        if bytes > STATEMENT_PLAN_MAX_BYTES {
+            return;
+        }
+        let Ok(stripped) = plan
+            .clone()
+            .transform_up_with_subqueries(|node| match node {
+                LogicalPlan::TableScan(scan) => {
+                    let source = Arc::new(LogicalTableSource::new(scan.source.schema()));
+                    Ok(Transformed::yes(LogicalPlan::TableScan(TableScan {
+                        source,
+                        ..scan
+                    })))
+                }
+                other => Ok(Transformed::no(other)),
+            })
+        else {
+            return;
+        };
+        let Some(reservation) = self
+            .budget
+            .try_reserve_within_share(bytes, STATEMENT_PLANS_BUDGET_SHARE_PERCENT)
+        else {
+            return;
+        };
+        let kept = KeptStatement {
+            tables,
+            plan: stripped.data,
+            _reservation: reservation,
+        };
+        self.plans.insert(sql.to_owned(), Arc::new(kept), bytes);
+    }
+
+    /// How many statements are kept.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.plans.len()
+    }
+
+    /// The bytes the kept statements hold against the budget.
+    #[cfg(test)]
+    pub(crate) fn bytes(&self) -> usize {
+        self.plans.bytes()
+    }
+
+    /// `plan`, a kept one, scanning the tables registered in `ctx` in place of
+    /// its placeholders, or `None` when a table is missing from `ctx` or its
+    /// schema is no longer the one the plan was parsed against: the
+    /// statement is then parsed again.
+    pub(crate) async fn bind(
+        plan: LogicalPlan,
+        ctx: &SessionContext,
+    ) -> Result<Option<LogicalPlan>, DataFusionError> {
+        let mut names = Vec::new();
+        plan.apply_with_subqueries(|node| {
+            if let LogicalPlan::TableScan(scan) = node {
+                names.push(scan.table_name.clone());
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+        let mut tables = HashMap::new();
+        for name in names {
+            if tables.contains_key(&name) {
+                continue;
+            }
+            let Ok(provider) = ctx.table_provider(name.clone()).await else {
+                return Ok(None);
+            };
+            tables.insert(name, provider);
+        }
+        let mut stale = false;
+        let bound = plan.transform_up_with_subqueries(|node| match node {
+            LogicalPlan::TableScan(scan) => {
+                let provider = &tables[&scan.table_name];
+                if provider.schema() != scan.source.schema() {
+                    stale = true;
+                    return Ok(Transformed::no(LogicalPlan::TableScan(scan)));
+                }
+                let source = provider_as_source(Arc::clone(provider));
+                Ok(Transformed::yes(LogicalPlan::TableScan(TableScan {
+                    source,
+                    ..scan
+                })))
+            }
+            other => Ok(Transformed::no(other)),
+        })?;
+        Ok((!stale).then_some(bound.data))
+    }
+}
+
+impl Reclaim for StatementPlans {
+    /// Drop every kept statement: each is parsed again the next time it runs.
+    fn reclaim(&self) {
+        self.plans.clear();
+    }
+}
+
+/// About the heap a kept statement holds: its text and table names, and for
+/// each node of its plan, subqueries' included, the node, its output
+/// schema's fields and its expressions, a literal with its own heap (a long
+/// string, a list). A schema a node shares with its input is counted again,
+/// so this errs high.
+pub(crate) fn statement_bytes(sql: &str, tables: &[String], plan: &LogicalPlan) -> usize {
+    let mut bytes = sql.len()
+        + tables
+            .iter()
+            .map(|t| size_of::<String>() + t.len())
+            .sum::<usize>();
+    let _ = plan.apply_with_subqueries(|node| {
+        bytes += size_of::<LogicalPlan>();
+        bytes += node
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| size_of::<Field>() + f.name().len())
+            .sum::<usize>();
+        node.apply_expressions(|expr| {
+            expr.apply(|e| {
+                bytes += size_of::<Expr>();
+                if let Expr::Literal(value, _) = e {
+                    bytes += value.size().saturating_sub(size_of::<ScalarValue>());
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })
+        })
+    });
+    bytes
 }
 
 /// The SQL context every entry point plans in: DataFusion's memory gated on `budget`, plus the
@@ -1520,6 +1754,12 @@ mod tests {
         reader
             .query_sql("SELECT _id FROM bm25_search('title', 'searchable', 10)")
             .expect("search TVF query");
+        reader
+            .query_sql(
+                "SELECT COUNT(*) FROM supertable \
+                 WHERE _id IN (SELECT _id FROM bm25_search('title', 'searchable', 10))",
+            )
+            .expect("search TVF subquery");
         let guard = reader
             .sql_logical_plan_cache()
             .lock()
@@ -1528,7 +1768,7 @@ mod tests {
         assert_eq!(
             plans.len(),
             1,
-            "search TVF plans hold readers and must not enter the inner cache"
+            "search TVF plans, in a subquery too, hold readers and must not enter the inner cache"
         );
     }
 
