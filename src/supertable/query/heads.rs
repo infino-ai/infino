@@ -633,6 +633,38 @@ pub(crate) async fn select(
         .zip(&bounds)
         .filter(|(slot, (_, ub))| unseen_bound(slot, &heads, &weights) >= *ub)
         .count();
+    // The slot with the largest bound, taken apart: its unseen bound, its
+    // best candidate's bound and known sum, and its head's frontier.
+    let top = bounds
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.1.total_cmp(&b.1.1))
+        .map(|(s, _)| s);
+    let (top_unseen, top_cand_bound, top_cand_sum, top_frontier, top_same_norms) = match top {
+        None => (f32::NAN, f32::NAN, f32::NAN, f32::NAN, false),
+        Some(s) => {
+            let slot = &slots[s];
+            let mine = candidates.iter().filter(|((cs, _), _)| *cs as usize == s);
+            let cand_bound = mine
+                .clone()
+                .map(|(_, c)| candidate_bound(slot, &heads, &weights, c))
+                .fold(f32::NEG_INFINITY, f32::max);
+            let cand_sum = mine.map(|(_, c)| c.sum()).fold(f32::NEG_INFINITY, f32::max);
+            let frontier = slot
+                .heads
+                .iter()
+                .flatten()
+                .map(|&h| heads[h].unread())
+                .fold(f32::NEG_INFINITY, f32::max);
+            (
+                unseen_bound(slot, &heads, &weights),
+                cand_bound,
+                cand_sum,
+                frontier,
+                slot.same_norms,
+            )
+        }
+    };
     let (mut below, mut tied, mut above) = (0usize, 0usize, 0usize);
     for &(_, ub) in &bounds {
         match ub.total_cmp(&theta) {
@@ -652,6 +684,11 @@ pub(crate) async fn select(
         ub_over_theta_p50 = pick(50),
         ub_over_theta_max = pick(100),
         unseen_led,
+        top_unseen,
+        top_cand_bound,
+        top_cand_sum,
+        top_frontier,
+        top_same_norms,
         resolved = resolved.len(),
         candidates = candidates.len(),
         entries_read,
