@@ -374,7 +374,10 @@ mod tests {
 
     use super::*;
     use crate::superfile::{
-        fts::{builder::FtsBuilder, reader::OpenOptions, reader::test_util::AsyncOnlySource},
+        fts::{
+            builder::FtsBuilder,
+            reader::{OpenOptions, test_util::AsyncOnlySource},
+        },
         lazy_source::{LazyByteSource, LazyByteSourceError},
     };
 
