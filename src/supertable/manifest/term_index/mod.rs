@@ -64,7 +64,7 @@ pub(crate) use build::{
 pub(crate) use build::{Built, build, first_contribution_difference};
 use build::{BuiltLayer, MERGE_RANGE_MIN_BYTES, build_layer, merge_layers_into, rebase_run};
 use bytes::Bytes;
-use format::{Layer, SliceRef, UNKNOWN_MAX_DF};
+use format::{Layer, SliceRef};
 pub(crate) use format::{Location, Posting, Root, Run, Slice, legacy_bound_as_key};
 use futures::{StreamExt, TryStreamExt, stream};
 use level_head::decode_segment;
@@ -1443,7 +1443,6 @@ fn stand_in(hash: ContentHash, bytes: u64) -> Layer {
             content_hash: hash,
             tier: None,
             len: bytes,
-            max_df: UNKNOWN_MAX_DF,
         }],
         ordinals: None,
         base: 0,
@@ -4817,7 +4816,6 @@ mod tests {
                     content_hash: hash,
                     tier: None,
                     len: 0,
-                    max_df: UNKNOWN_MAX_DF,
                 }],
             }],
         };
@@ -6154,16 +6152,12 @@ mod tests {
 
         maintenance_only_optimize(&st);
         let (_, mut root) = live_and_covered(&st, &storage, &rt);
-        // The planted root is from before ordinal ranges, bases and slices'
-        // largest counts, and the rewrite keeps its layers as they are, so
-        // none of them is compared.
+        // The planted root is from before ordinal ranges and bases and the
+        // rewrite keeps its layers as they are, so neither is compared.
         let mut sized = sized;
         for layer in root.layers.iter_mut().chain(&mut sized.layers) {
             layer.ordinals = None;
             layer.base = 0;
-            for slice in &mut layer.slices {
-                slice.max_df = UNKNOWN_MAX_DF;
-            }
         }
         assert_eq!(root, sized, "every length is filled in from storage");
     }
@@ -9282,7 +9276,6 @@ mod tests {
                 content_hash: ContentHash::of(&[tag]),
                 tier: None,
                 len: 0,
-                max_df: UNKNOWN_MAX_DF,
             }],
         }
     }
@@ -9298,7 +9291,6 @@ mod tests {
                 content_hash: ContentHash::of(&bytes.to_le_bytes()),
                 tier: None,
                 len: bytes,
-                max_df: UNKNOWN_MAX_DF,
             }],
         }
     }
@@ -11344,7 +11336,6 @@ mod tests {
                         content_hash: ContentHash::of(&key),
                         tier: Some(ContentHash::of(&[key.as_slice(), b"tier"].concat())),
                         len: 1,
-                        max_df: UNKNOWN_MAX_DF,
                     }
                 })
                 .collect(),
@@ -11600,7 +11591,6 @@ mod tests {
                         content_hash: ContentHash::of(format!("{i}/{j}").as_bytes()),
                         tier: None,
                         len: 1 << 20,
-                        max_df: UNKNOWN_MAX_DF,
                     })
                     .collect(),
                 ordinals: None,

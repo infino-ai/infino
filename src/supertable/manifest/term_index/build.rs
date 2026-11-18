@@ -1769,8 +1769,6 @@ struct SliceBuilder {
     first_key: Option<Vec<u8>>,
     last_key: Vec<u8>,
     n_terms: usize,
-    /// The largest document count of a term the slice holds.
-    max_df: u64,
 }
 
 impl SliceBuilder {
@@ -1781,12 +1779,10 @@ impl SliceBuilder {
             first_key: None,
             last_key: Vec::new(),
             n_terms: 0,
-            max_df: 0,
         }
     }
 
-    fn add(&mut self, key: &[u8], run: &[u8], df: u64) {
-        self.max_df = self.max_df.max(df);
+    fn add(&mut self, key: &[u8], run: &[u8]) {
         self.dict
             .insert_sorted(
                 key,
@@ -1827,7 +1823,6 @@ impl SliceBuilder {
                 content_hash,
                 tier,
                 len: bytes.len() as u64,
-                max_df: self.max_df,
             },
             bytes,
         ))
@@ -2088,8 +2083,7 @@ impl LayerWriter {
                 self.current_tier.write(segment, self.spill.as_deref())?;
             }
         }
-        self.current
-            .add(&term.key, &run, term.postings.iter().map(|p| p.df).sum());
+        self.current.add(&term.key, &run);
         Ok(())
     }
 
@@ -2184,8 +2178,7 @@ impl LayerWriter {
         // No candidate survived the renumbering: no head, as a batch has.
         if first.is_empty() {
             let run = encode_run(tier.as_ref(), None, &term.postings);
-            self.current
-                .add(&term.key, &run, term.postings.iter().map(|p| p.df).sum());
+            self.current.add(&term.key, &run);
             return Ok(());
         }
         let mut levels = Vec::new();
@@ -2254,8 +2247,7 @@ impl LayerWriter {
             inline,
         };
         let run = encode_run(tier.as_ref(), Some(&head), &term.postings);
-        self.current
-            .add(&term.key, &run, term.postings.iter().map(|p| p.df).sum());
+        self.current.add(&term.key, &run);
         Ok(())
     }
 
