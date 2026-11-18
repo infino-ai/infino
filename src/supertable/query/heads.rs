@@ -82,9 +82,13 @@ use crate::{
     utils::terms::DictEntry,
 };
 
-/// Head bytes a query reads at most before it stops and opens what is
-/// still in play: a few seconds of reads on a cold store.
-pub(crate) const HEAD_READ_BUDGET_BYTES: u64 = 256 << 20;
+/// Head entries a query reads at most before it stops and opens what is
+/// still in play. Every entry read becomes a candidate each later round
+/// bounds again, so this caps the selection's work whatever the heads hold:
+/// a phrase of common words, whose bound its members' keys hold above the
+/// threshold however deep they are read, stops here instead of reading
+/// hundreds of millions of entries to save no open.
+const HEAD_READ_BUDGET_ENTRIES: u64 = 256 << 10;
 /// Most candidates a query probes: each costs, per missing term, a share of
 /// its superfile's reads of that term — the header and skip table once,
 /// then the blocks covering the candidates — so this bounds a query's
@@ -425,9 +429,6 @@ pub(crate) async fn select(
     let mut rounds = 0usize;
     loop {
         (theta, bounds) = settle(&slots, &heads, &candidates, &weights, k, lb_slack);
-        if fetched >= HEAD_READ_BUDGET_BYTES {
-            break;
-        }
         // A round that neither raised the threshold nor ruled a slot out
         // ends the reading: on documents that tie across the table the
         // bounds sit at the threshold however deep the heads are read, and
@@ -445,6 +446,26 @@ pub(crate) async fn select(
         let bar = competitive_floor(theta, query.score_tolerance);
         let wanted = heads_that_matter(&slots, &heads, &candidates, &bounds, bar);
         if wanted.is_empty() || rounds == max_rounds {
+            break;
+        }
+        // The round's price: its entries, and the candidates every later
+        // round bounds again. Past the budget, or where it costs more than
+        // every open still in play at this table's measured costs, the
+        // opens settle the rest instead.
+        let round_entries: u64 = wanted
+            .iter()
+            .map(|&h| u64::from(heads[h].levels[heads[h].next].n_entries))
+            .sum();
+        let price = RoundPrice {
+            entries_read,
+            round_entries,
+            candidates: candidates.len() as u64,
+            in_play: in_play as u64,
+            first: rounds == 0,
+            open_cost_ns: query.open_cost_ns,
+            entry_cost_ns: query.entry_cost_ns,
+        };
+        if !price.worth_reading() {
             break;
         }
         rounds += 1;
@@ -658,6 +679,42 @@ pub(crate) async fn select(
         entries_read: entries_read + probes,
         merge_ns: started.elapsed().as_nanos() as u64,
     }))
+}
+
+/// What a round of head reads would cost and could save.
+struct RoundPrice {
+    /// Entries the query has read so far.
+    entries_read: u64,
+    /// Entries the round would read.
+    round_entries: u64,
+    /// Candidates every later round bounds again.
+    candidates: u64,
+    /// Superfiles still in play: the opens the round could save.
+    in_play: u64,
+    /// Whether no round has been read yet.
+    first: bool,
+    /// The table's measured cost of one open; zero when not yet known.
+    open_cost_ns: u64,
+    /// The table's measured cost of one entry; zero when not yet known.
+    entry_cost_ns: u64,
+}
+
+impl RoundPrice {
+    /// Whether the round is worth reading: never past
+    /// [`HEAD_READ_BUDGET_ENTRIES`]; the first round, a block per head,
+    /// always, since it finds the threshold and answers a rare term from
+    /// the index; after it, only while the round costs no more than every
+    /// open still in play at this table's measured costs.
+    fn worth_reading(&self) -> bool {
+        if self.entries_read + self.round_entries > HEAD_READ_BUDGET_ENTRIES {
+            return false;
+        }
+        if self.first || self.open_cost_ns == 0 || self.entry_cost_ns == 0 {
+            return true;
+        }
+        (self.round_entries + self.candidates).saturating_mul(self.entry_cost_ns)
+            <= self.in_play.saturating_mul(self.open_cost_ns)
+    }
 }
 
 /// What one probe reads in one superfile.
@@ -1414,6 +1471,50 @@ mod tests {
 
     /// Proptest cases per property.
     const CASES: u32 = 256;
+
+    /// A round priced at the given work and costs, after the first.
+    fn round(
+        round_entries: u64,
+        candidates: u64,
+        in_play: u64,
+        open: u64,
+        entry: u64,
+    ) -> RoundPrice {
+        RoundPrice {
+            entries_read: 0,
+            round_entries,
+            candidates,
+            in_play,
+            first: false,
+            open_cost_ns: open,
+            entry_cost_ns: entry,
+        }
+    }
+
+    #[test]
+    fn a_round_is_read_while_it_costs_less_than_the_opens_it_can_save() {
+        // 1,000 entries at 100 ns against 10 opens at 1 ms: read.
+        assert!(round(1_000, 0, 10, 1_000_000, 100).worth_reading());
+        // The candidates already held are bounded again: priced in.
+        assert!(!round(1_000, 200_000, 10, 1_000_000, 100).worth_reading());
+        // Warm opens of microseconds: a large round is not worth them.
+        assert!(!round(100_000, 0, 200, 5_000, 100).worth_reading());
+        // Costs not yet measured: read.
+        assert!(round(100_000, 0, 1, 0, 100).worth_reading());
+        assert!(round(100_000, 0, 1, 1_000, 0).worth_reading());
+    }
+
+    #[test]
+    fn the_first_round_is_always_read_and_no_round_past_the_budget() {
+        let mut first = round(4_096, 0, 0, 1_000, 1_000_000);
+        first.first = true;
+        assert!(first.worth_reading(), "the first round finds the threshold");
+        let mut past = round(2, 0, 1_000, u64::MAX, 1);
+        past.entries_read = HEAD_READ_BUDGET_ENTRIES - 1;
+        assert!(!past.worth_reading(), "past the budget nothing is read");
+        past.round_entries = 1;
+        assert!(past.worth_reading(), "up to the budget it is");
+    }
 
     /// The integer optimum by brute force: every split of up to `tokens`
     /// tokens over the terms.
