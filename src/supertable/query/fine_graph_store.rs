@@ -21,10 +21,6 @@
 //! grown large beside the base ([`GraphHead::fold_due`]) the writer builds a
 //! fresh base, which also clears the holes removed nodes leave.
 
-// Nothing writes or reads the stored form yet: the writer that publishes a
-// step with each generation is its first caller.
-#![allow(dead_code)]
-
 use std::{fmt, sync::Arc};
 
 use uuid::Uuid;
@@ -89,6 +85,7 @@ pub(crate) enum GraphStoreError {
     /// A base holds a hole. Only a fresh build is written as a base.
     HoleInBase,
     /// The graph put together is not the one the head describes.
+    #[cfg(test)]
     HeadMismatch,
 }
 
@@ -113,10 +110,14 @@ pub(crate) struct KeyedGraph {
 
 impl KeyedGraph {
     pub(crate) fn new(keys: Vec<Option<FineNodeKey>>, graph: Hnsw) -> Self {
+        Self::shared(keys, Arc::new(graph))
+    }
+
+    pub(crate) fn shared(keys: Vec<Option<FineNodeKey>>, graph: Arc<Hnsw>) -> Self {
         let node_digest = graph.node_digest();
         Self {
             keys,
-            graph: Arc::new(graph),
+            graph,
             node_digest,
         }
     }
@@ -296,6 +297,14 @@ pub(crate) struct GraphHead {
 }
 
 impl GraphHead {
+    /// How many leading bytes [`is_head`](Self::is_head) needs.
+    pub(crate) const MAGIC_BYTES: usize = HEAD_MAGIC.len();
+
+    /// Whether an object starting with `prefix` is a head.
+    pub(crate) fn is_head(prefix: &[u8]) -> bool {
+        prefix.starts_with(HEAD_MAGIC)
+    }
+
     /// The head of a graph that is its base `base`, stored as `bytes` bytes
     /// under `hash`, with no step yet.
     pub(crate) fn of_base(
@@ -356,6 +365,7 @@ impl GraphHead {
 
     /// Put the current generation together from the decoded `base` and
     /// `steps`, which must be this head's, in its order.
+    #[cfg(test)]
     pub(crate) fn replay(
         &self,
         base: GraphBase,
