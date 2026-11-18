@@ -509,18 +509,23 @@ impl ColumnStats<'_> {
         let table = self.value_table_array(&literals.column_type)?;
         let table = table.as_struct_opt()?;
         let counts = table.column(1).as_primitive_opt::<UInt64Type>()?;
-        // A file's own table is never empty and holds no null; any other table keeps the file.
-        if table.is_empty() || table.column(0).null_count() > 0 || counts.null_count() > 0 {
+        // A file's own table is never empty and has no null or zero count; else keep the file.
+        if table.is_empty()
+            || table.column(0).null_count() > 0
+            || counts.null_count() > 0
+            || counts.values().contains(&0)
+        {
             return None;
         }
         let values = Arc::clone(table.column(0));
         let batch = RecordBatch::try_new(Arc::clone(&literals.schema), vec![values]).ok()?;
         let hits = literals.in_set.evaluate(&batch).ok()?;
         let hits = hits.into_array(batch.num_rows()).ok()?;
-        let mut held = 0;
+        let mut held: u64 = 0;
         for (hit, rows) in hits.as_boolean_opt()?.iter().zip(counts.values()) {
             if hit == Some(true) {
-                held += rows;
+                // A sum past u64 is no real file's count, so the table settles nothing.
+                held = held.checked_add(*rows)?;
             }
         }
         Some(held)
@@ -2247,6 +2252,74 @@ mod tests {
         drop(section);
         assert!(cache.put(other_hash, Bytes::from(other)).await);
         assert!(!cache.contains(&hash), "evicted once no section reads it");
+    }
+
+    /// A section row of one `Int64` column whose value table holds `entries` as persisted,
+    /// without the checks a table built by the writer passes.
+    fn group_with_table(entries: &[(i64, u64)]) -> Group {
+        let values: ArrayRef = Arc::new(Int64Array::from_iter_values(
+            entries.iter().map(|(value, _)| *value),
+        ));
+        let counts: ArrayRef = Arc::new(UInt64Array::from_iter_values(
+            entries.iter().map(|(_, count)| *count),
+        ));
+        let item: ArrayRef = Arc::new(
+            StructArray::try_new(
+                value_table_fields(&DataType::Int64),
+                vec![values, counts],
+                None,
+            )
+            .expect("a value table item"),
+        );
+        let (_, list) =
+            value_table_list(&DataType::Int64, &[item], vec![entries.len()], vec![true])
+                .expect("a value table list");
+        let bound: ArrayRef = Arc::new(Int64Array::from(vec![0]));
+        Group {
+            superfile: UInt32Array::from(vec![0]),
+            min: Arc::clone(&bound),
+            max: bound,
+            null_count: UInt64Array::from(vec![0]),
+            sum: None,
+            hll: None,
+            value_counts: Some(list.as_list::<i32>().clone()),
+        }
+    }
+
+    /// The rows a section's table of `entries` counts for `IN (literals)`.
+    fn persisted_literal_count(entries: &[(i64, u64)], literals: &[i64]) -> Option<u64> {
+        let group = group_with_table(entries);
+        let stats = ColumnStats::Section(ColumnRow {
+            group: &group,
+            index: 0,
+        });
+        let literals: Vec<ScalarValue> = literals
+            .iter()
+            .map(|value| ScalarValue::Int64(Some(*value)))
+            .collect();
+        let literals = ExactLiterals::new(&literals, &DataType::Int64).expect("int literals");
+        stats.literal_count(&literals)
+    }
+
+    #[test]
+    fn a_persisted_table_no_file_can_hold_settles_no_literal() {
+        // A section's table as stored, without the writer's checks:
+        //  - a zero count could prove a value absent from a file that holds it.
+        //  - so could counts whose sum overflows, which wraps to 0.
+        //  - a sound table still counts, and so does a sum that fits.
+        // This test pins that the first two settle nothing.
+        assert_eq!(persisted_literal_count(&[(1, 2), (2, 3)], &[1, 2]), Some(5));
+        assert_eq!(persisted_literal_count(&[(1, 2), (2, 3)], &[7]), Some(0));
+        assert_eq!(persisted_literal_count(&[(1, 0), (2, 3)], &[1]), None);
+        assert_eq!(
+            persisted_literal_count(&[(1, u64::MAX), (2, 1)], &[1, 2]),
+            None
+        );
+        assert_eq!(
+            persisted_literal_count(&[(1, u64::MAX), (2, 1)], &[1]),
+            Some(u64::MAX),
+            "a sum that fits is still counted"
+        );
     }
 
     /// A section whose counts promise more tables than it holds is refused
