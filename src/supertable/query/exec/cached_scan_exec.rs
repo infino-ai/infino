@@ -586,7 +586,7 @@ impl ScanContext {
         };
         let live = keep.map(|mut mask| BooleanArray::new(mask.finish(), None));
         let keep = match &self.predicate {
-            Some(predicate) => Some(passing_rows(predicate, &self.schema, &columns, live, n)),
+            Some(predicate) => passing_rows(predicate, &self.schema, &columns, live, n),
             None => live,
         };
         let rows = keep.as_ref().map_or(n, BooleanArray::true_count);
@@ -614,50 +614,75 @@ impl ScanContext {
 /// (every row without it) that pass the conjuncts of `predicate` the scan
 /// checks, over `columns` as kept. Never null.
 ///
-/// Checking here is only a saving: the filter above checks every row it
-/// gets, so a conjunct the scan leaves alone costs nothing but rows handed
-/// up, and the answer is the filter's either way. So the scan
-/// - checks only the conjuncts that read a column kept as a dictionary; the
-///   filter checks any other once, above;
-/// - checks each on the rows that passed the ones before it, as `AND`
-///   would, and never on a deleted or unselected row;
-/// - stops at a conjunct that fails to evaluate, and hands on the rows it
-///   has: the filter then checks them as it does with no scan below it, and
-///   fails only where that fails.
+/// The filter above checks every row it gets, and DataFusion's `AND` checks
+/// its right side on every row of the batch, not only on the rows its left
+/// side keeps, once the left keeps more than a fifth of them. Handed fewer
+/// rows than the files hold, the filter can so check a conjunct on a row an
+/// earlier conjunct drops, where without a cache it wouldn't: a guard like
+/// `x <> 0 AND 10 / x > 1` would fail. So when a conjunct reads a column kept
+/// as a dictionary, the scan
+/// - checks every conjunct, in order, each on the rows that passed the ones
+///   before it, as `AND` would, and never on a deleted or unselected row. The
+///   rows it hands on pass all of them, so the filter checks each conjunct
+///   only on rows it has already been checked on;
+/// - leaves the last conjunct to the filter when it reads no kept
+///   dictionary: the filter checks it once, on rows that pass every conjunct
+///   before it;
+/// - checks a conjunct on one kept dictionary once per value the rows use,
+///   and any other on the rows themselves;
+/// - stops at a conjunct that fails to evaluate on the rows, and hands on the
+///   rows it has: the filter then checks that conjunct on the same rows, and
+///   fails as it does with no scan below it.
+///
+/// A row group whose dictionaries no conjunct reads is handed on as it is.
 fn passing_rows(
     predicate: &Arc<dyn PhysicalExpr>,
     schema: &SchemaRef,
     columns: &[ArrayRef],
     live: Option<BooleanArray>,
     rows: usize,
-) -> BooleanArray {
+) -> Option<BooleanArray> {
+    let conjuncts: Vec<(&Arc<dyn PhysicalExpr>, Vec<usize>, bool)> = split_conjunction(predicate)
+        .into_iter()
+        .map(|conjunct| {
+            let mut used: Vec<usize> = collect_columns(conjunct)
+                .iter()
+                .map(|column| column.index())
+                .collect();
+            used.sort_unstable();
+            used.dedup();
+            let on_dictionary = used
+                .iter()
+                .any(|&i| kept_as_dictionary(&columns[i], schema.field(i)));
+            (conjunct, used, on_dictionary)
+        })
+        .collect();
+    if !conjuncts.iter().any(|(_, _, on_dictionary)| *on_dictionary) {
+        return live;
+    }
+    let last = conjuncts.len() - 1;
     let mut passing = live.unwrap_or_else(|| BooleanArray::from(vec![true; rows]));
-    for conjunct in split_conjunction(predicate) {
-        let mut used: Vec<usize> = collect_columns(conjunct)
-            .iter()
-            .map(|column| column.index())
-            .collect();
-        used.sort_unstable();
-        used.dedup();
-        if !used
-            .iter()
-            .any(|&i| kept_as_dictionary(&columns[i], schema.field(i)))
-        {
-            continue;
+    for (at, (conjunct, used, on_dictionary)) in conjuncts.iter().enumerate() {
+        if at == last && !on_dictionary {
+            break;
         }
         if passing.true_count() == 0 {
             break;
         }
+        let on_rows = || conjunct_on_rows(conjunct, schema, columns, used, &passing);
         let checked = match used.as_slice() {
-            [only] => dictionary_conjunct(conjunct, schema.field(*only), &columns[*only], &passing),
-            _ => conjunct_on_rows(conjunct, schema, columns, &used, &passing),
+            [only] if *on_dictionary => {
+                dictionary_conjunct(conjunct, schema.field(*only), &columns[*only], &passing)
+                    .or_else(|_| on_rows())
+            }
+            _ => on_rows(),
         };
         match checked {
             Ok(next) => passing = next,
             Err(_) => break,
         }
     }
-    passing
+    Some(passing)
 }
 
 /// Whether `column`, as kept, is a dictionary of a column the scan returns
@@ -789,13 +814,14 @@ fn boolean(array: ArrayRef) -> DfResult<BooleanArray> {
 
 impl CachedScanExec {
     /// This scan, checking `predicate` (a `WHERE` over its output, as the
-    /// filter above it checks it) on each row group before handing its rows
-    /// on: its conjuncts that read a column kept as a dictionary, on the live
-    /// rows, each on the rows the ones before it kept ([`passing_rows`]). A
-    /// conjunct on one such column is checked once per value the rows use
-    /// rather than once per row, and only the rows that pass are cast to the
-    /// strings the scan returns. The filter above still checks every row it
-    /// gets, so the answer is the one it gives.
+    /// filter above it checks it) on each row group that keeps a column it
+    /// reads as a dictionary, before handing the row group's rows on: its
+    /// conjuncts in order, on the live rows, each on the rows the ones before
+    /// it kept ([`passing_rows`]). A conjunct on one kept dictionary is
+    /// checked once per value the rows use rather than once per row, and only
+    /// the rows that pass are cast to the strings the scan returns. The
+    /// filter above still checks every row it gets, so the answer is the one
+    /// it gives.
     pub(crate) fn with_predicate(&self, predicate: Arc<dyn PhysicalExpr>) -> Self {
         let context = &self.context;
         Self {
@@ -996,7 +1022,7 @@ mod tests {
     /// The numbers `code` and `tag` take otherwise, as strings: few values.
     const CODES: i64 = 5;
     /// The region whose rows hold [`NOT_A_NUMBER`] in `tag`, live rows among
-    /// them, so a cast of `tag` fails unless a guard on `region` comes first.
+    /// them, so a cast of `tag` on them fails.
     const GUARDED_REGION: &str = "af";
     /// Statements over `region` (few values), `msg` (one per row) and `seq`.
     const STATEMENTS: &[&str] = &[
@@ -1009,6 +1035,16 @@ mod tests {
     /// A condition that fails on a deleted row's `code`, which holds no
     /// number: a scan that checked it on deleted rows would fail.
     const FAILS_ON_DELETED_ROWS: &str = "CAST(code AS INT) > 2";
+    /// A guard ahead of a division by zero, after a condition on a kept
+    /// dictionary. Without a cache the division sees only the rows both
+    /// conditions before it keep; a scan that dropped the other regions'
+    /// rows and left the guard to the filter would hand it a batch where the
+    /// guard keeps more than a fifth of the rows, and the filter's `AND`
+    /// would then divide every row by its `seq % 4`, zeros included.
+    const GUARDS_A_DIVISION: &str = "region = 'eu' AND seq % 4 <> 0 AND 100 / (seq % 4) > 1";
+    /// A condition that fails on live rows, a cast of the guarded region's
+    /// `tag`, with or without a cache.
+    const FAILS_ON_LIVE_ROWS: &str = "region = 'af' AND CAST(tag AS INT) > 2";
     /// Conditions over `code` and `tag`, each run grouped by `region` so the
     /// statement reads the scan rather than the files' statistics.
     const CONDITIONS: &[&str] = &[
@@ -1021,8 +1057,9 @@ mod tests {
         "code IN ('1', '5') OR code IS NULL",
         FAILS_ON_DELETED_ROWS,
         "100 / seq >= 0 AND region = 'eu'",
-        // A guard first: the cast must not see a row the guard drops.
-        "region <> 'af' AND CAST(tag AS INT) > 2",
+        "region <> 'af' AND msg LIKE '%7'",
+        GUARDS_A_DIVISION,
+        FAILS_ON_LIVE_ROWS,
     ];
 
     fn region_schema() -> Arc<Schema> {
@@ -1103,6 +1140,18 @@ mod tests {
         Ok(pretty_format_batches(&batches).expect("format").to_string())
     }
 
+    /// Whether the table `answer` prints has a row of exactly `cells`.
+    fn has_row(answer: &str, cells: &[&str]) -> bool {
+        answer.lines().any(|line| {
+            let row: Vec<&str> = line
+                .split('|')
+                .map(str::trim)
+                .filter(|cell| !cell.is_empty())
+                .collect();
+            row == cells
+        })
+    }
+
     /// The `EXPLAIN` of `sql` on `st`, every plan line joined.
     fn explained(st: &Supertable, sql: &str) -> String {
         st.reader()
@@ -1122,8 +1171,8 @@ mod tests {
     /// statement over such columns answers as without a cache: with nulls,
     /// `!=`, `NOT IN`, `IS NULL` and `LIKE`; with a condition that fails on a
     /// deleted row, which the scan never checks; and with a guard ahead of a
-    /// condition that fails on the rows the guard drops. Where a statement
-    /// fails without a cache, the cached one is not held to its answer.
+    /// condition that fails on the rows the guard drops. A statement that
+    /// fails without a cache fails with one.
     #[test]
     fn a_where_checked_on_kept_dictionaries_answers_as_without_a_cache() {
         let plain_dir = TempDir::new().expect("tempdir");
@@ -1139,16 +1188,32 @@ mod tests {
         for pass in ["decoded", "kept", "kept again"] {
             for condition in CONDITIONS {
                 let sql = grouped(condition);
-                if let Ok(expected) = outcome(&plain, &sql) {
-                    assert_eq!(outcome(&kept, &sql), Ok(expected), "{pass}: {sql}");
+                match outcome(&plain, &sql) {
+                    Ok(expected) => {
+                        assert_eq!(outcome(&kept, &sql), Ok(expected), "{pass}: {sql}");
+                    }
+                    Err(error) => {
+                        assert_eq!(*condition, FAILS_ON_LIVE_ROWS, "{sql}: {error}");
+                        assert!(outcome(&kept, &sql).is_err(), "{pass}: {sql}");
+                    }
                 }
             }
+            // The guarded division keeps the live eu rows whose `seq % 4` is
+            // not 0 (100 divided by 1, 2 or 3 is over 1): three in four of
+            // the 1,140 live eu rows.
+            let guarded = answer(&kept, &grouped(GUARDS_A_DIVISION));
+            assert!(has_row(&guarded, &["eu", "855"]), "{pass}: {guarded}");
+            // `100 / seq` fails only on `seq = 0`, which is deleted: every
+            // live row passes, with or without a cache.
+            let all_live = "SELECT count(*) AS n FROM supertable WHERE 100 / seq >= 0";
+            let live = (FILES * ROWS_PER_FILE - DELETED_BELOW).to_string();
+            for st in [&plain, &kept] {
+                let counted = answer(st, all_live);
+                assert!(has_row(&counted, &[live.as_str()]), "{pass}: {counted}");
+            }
         }
-        // The rows that condition fails on are deleted, none live: the
-        // statement answers without a cache, so the loop above held the
-        // cached one to that answer.
-        let deleted_only = grouped(FAILS_ON_DELETED_ROWS);
-        assert!(outcome(&plain, &deleted_only).is_ok(), "{deleted_only}");
+        let fails = grouped(FAILS_ON_LIVE_ROWS);
+        assert!(outcome(&plain, &fails).is_err(), "{fails}");
         // The filter above the scan hands its `WHERE` to the scan.
         let plan = explained(
             &kept,

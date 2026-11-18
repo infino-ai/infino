@@ -19,8 +19,8 @@
 //!
 //! The filter stays above and checks every row it gets, so the answer is the
 //! one it gives; the scan only hands it fewer. The rule fires on a filter
-//! whose input is the scan, through the scan's meter, and leaves a scan that
-//! already checks a `WHERE` alone.
+//! whose input is the scan, through the scan's meter, and leaves alone a scan
+//! that already checks a `WHERE` or stops after a number of rows.
 
 use std::sync::Arc;
 
@@ -64,7 +64,10 @@ impl PhysicalOptimizerRule for FilterIntoCachedScan {
             let Some(cached) = scan.downcast_ref::<CachedScanExec>() else {
                 return Ok(Transformed::no(node));
             };
-            if cached.has_predicate() {
+            // A scan that stops at `fetch` rows hands on the matches among
+            // its first rows; checking the `WHERE` first would hand on the
+            // first matches instead.
+            if cached.has_predicate() || cached.fetch().is_some() {
                 return Ok(Transformed::no(node));
             }
             let checked: Arc<dyn ExecutionPlan> =
