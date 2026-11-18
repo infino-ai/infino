@@ -13,7 +13,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use futures::future::try_join_all;
+use futures::{StreamExt, future::try_join_all, stream};
 use rustc_hash::FxHashMap;
 
 use super::{
@@ -61,9 +61,12 @@ const DOC_MAP_SPARSE_SHARE: usize = 8;
 /// Pages a translation reads through to join two reads into one: one more request costs about as
 /// much as this many more pages.
 const DOC_MAP_MERGE_GAP_PAGES: usize = 2;
-/// Most pages one read of a map covers (4 MiB), and what a dense translation that can't keep the
-/// map has in flight. Small under test, so a fixture spans several reads.
+/// Most pages one read of a map covers (4 MiB), and one batch of a dense translation that can't
+/// keep the map. Small under test, so a fixture spans several reads.
 const DOC_MAP_READ_MAX_PAGES: usize = if cfg!(test) { 8 } else { 64 };
+/// Batches a map pass has in flight at once: enough to hide a remote store's latency, while it
+/// holds at most this many batches of bytes.
+const DOC_MAP_BATCHES_IN_FLIGHT: usize = 4;
 
 /// An unranked match holding at least one row in this many of its blob's
 /// rows is put back in row order through a bitset of the blob's rows
@@ -1110,8 +1113,9 @@ impl FtsReader {
         if dense && let Some(map) = self.kept_doc_map_within_budget().await? {
             return Ok(through(map));
         }
-        // Sparse reads are few, so they go out at once. A dense pass goes one read cap at a time,
-        // and reads every page when the reader checks CRCs, so the map's CRC is still checked.
+        // Sparse reads are few, so they go out at once. A dense pass goes one read cap per batch, a
+        // few batches in flight, and reads every page when the reader checks CRCs, so the map's
+        // CRC is still checked.
         let cap = DOC_MAP_READ_MAX_PAGES * DOC_MAP_PAGE_BYTES;
         let (reads, in_flight) = match dense {
             false => (reads, read_bytes),
@@ -1165,8 +1169,9 @@ impl FtsReader {
         self.doc_map_region.as_ref().map_or(0, Range::len)
     }
 
-    /// Fetches `reads` (from [`map_reads`]) in groups of at most `in_flight` bytes and hands each
-    /// to `each` with the first document it covers. Checks the map's CRC when the reads cover it.
+    /// Fetches `reads` (from [`map_reads`]) in batches of at most `in_flight` bytes, at most
+    /// [`DOC_MAP_BATCHES_IN_FLIGHT`] batches at once, and hands each read to `each` in order with
+    /// the first document it covers. Checks the map's CRC when the reads cover it.
     async fn map_pass(
         &self,
         reads: &[Range<usize>],
@@ -1178,34 +1183,19 @@ impl FtsReader {
             && reads.first().is_some_and(|r| r.start == 0)
             && reads.last().is_some_and(|r| r.end == region.len())
             && reads.windows(2).all(|w| w[0].end == w[1].start);
+        // A few batches are in flight at once and come back in read order, so the CRC is taken
+        // over the map in order. The fetches are built before the stream: a closure inside it
+        // would put a borrowed-argument closure in this future, which the fan-out can't prove
+        // `Send`.
+        let fetches: Vec<_> = in_flight_batches(reads, in_flight)
+            .into_iter()
+            .map(|batch| self.map_batch(batch, &region, check_crc))
+            .collect();
+        let mut fetched = stream::iter(fetches).buffered(DOC_MAP_BATCHES_IN_FLIGHT);
         let mut crc = 0;
-        for batch in in_flight_batches(reads, in_flight) {
-            let fetched = try_join_all(batch.iter().map(|read| {
-                // The last read also takes the CRC stored right after the map.
-                let with_crc = check_crc && read.end == region.len();
-                let crc_len = if with_crc { format::CRC_BYTES } else { 0 };
-                let span = region.start + read.start..region.start + read.end + crc_len;
-                #[cfg(test)]
-                self.count_doc_map_read();
-                async move {
-                    let bytes = self.source.range_async(span.clone()).await.map_err(|e| {
-                        FtsError::RangeFetch {
-                            what: "fts/doc-map pages",
-                            source: e,
-                        }
-                    })?;
-                    match bytes.len() >= span.len() {
-                        true => Ok(bytes),
-                        false => Err(doc_map_short_read(
-                            "fts doc-map pages",
-                            bytes.len(),
-                            span.len(),
-                        )),
-                    }
-                }
-            }))
-            .await?;
-            for (read, bytes) in batch.iter().zip(fetched) {
+        while let Some(next) = fetched.next().await {
+            let (batch, bytes_of) = next?;
+            for (read, bytes) in batch.iter().zip(bytes_of) {
                 let body = &bytes[..read.len()];
                 if check_crc {
                     crc = crc32c_append(crc, body);
@@ -1217,6 +1207,41 @@ impl FtsReader {
             }
         }
         Ok(())
+    }
+
+    /// One batch of [`Self::map_pass`]'s reads with their bytes, in order; the read that ends the
+    /// map also takes the CRC stored right after it when `check_crc`.
+    async fn map_batch<'a>(
+        &self,
+        batch: &'a [Range<usize>],
+        region: &Range<usize>,
+        check_crc: bool,
+    ) -> Result<(&'a [Range<usize>], Vec<Bytes>), FtsError> {
+        let bytes = try_join_all(batch.iter().map(|read| {
+            let with_crc = check_crc && read.end == region.len();
+            let crc_len = if with_crc { format::CRC_BYTES } else { 0 };
+            let span = region.start + read.start..region.start + read.end + crc_len;
+            #[cfg(test)]
+            self.count_doc_map_read();
+            async move {
+                let bytes = self.source.range_async(span.clone()).await.map_err(|e| {
+                    FtsError::RangeFetch {
+                        what: "fts/doc-map pages",
+                        source: e,
+                    }
+                })?;
+                match bytes.len() >= span.len() {
+                    true => Ok(bytes),
+                    false => Err(doc_map_short_read(
+                        "fts doc-map pages",
+                        bytes.len(),
+                        span.len(),
+                    )),
+                }
+            }
+        }))
+        .await?;
+        Ok((batch, bytes))
     }
 
     #[cfg(test)]
@@ -4223,11 +4248,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn without_room_a_dense_pass_holds_one_read_cap_at_a_time() {
-        // Setup: hits in every page of the map, a budget with no room, the reads held at the
-        // source.
-        //  - The pass reads the map in pieces of one read cap, and starts the next piece only
-        //    once the last one is back.
+    async fn without_room_a_dense_pass_holds_a_few_read_caps_at_a_time() {
+        // Setup: hits in every page of a map more read caps long than a pass has in flight, a
+        // budget with no room, the reads held at the source.
+        //  - The pass starts that many reads of one read cap each, and no more until one is back.
         // This test pins what one translation holds while it reads a map it can't keep.
         let (blob, json, _, hits) = dense_translation();
         let src = Arc::new(GatedSource::new(blob));
@@ -4245,12 +4269,35 @@ mod tests {
         assert!(poll!(query.as_mut()).is_pending());
         assert_eq!(
             src.started.load(Ordering::Relaxed) - opened,
-            1,
-            "one read cap in flight"
+            DOC_MAP_BATCHES_IN_FLIGHT,
+            "a few read caps in flight"
         );
         drop(held);
         query.await.expect("translate");
-        assert!(r.doc_map_reads() > 1);
+        assert!(r.doc_map_reads() > DOC_MAP_BATCHES_IN_FLIGHT);
+    }
+
+    #[tokio::test]
+    async fn a_dense_pass_checks_its_crc_in_map_order_when_reads_come_back_out_of_order() {
+        // Setup: hits in every page of the map, a budget with no room, and a source whose later
+        // reads come back first.
+        //  - The pass still answers every row and its CRC check still passes.
+        // This test pins that the reads in flight are taken in map order.
+        let (blob, json, order, hits) = dense_translation();
+        let src: Arc<dyn LazyByteSource> = Arc::new(LaterFirstSource(blob));
+        let r = FtsReader::open_lazy(src, &json, OpenOptions { verify_crc: true })
+            .await
+            .expect("open_lazy")
+            .with_heap_budget(roomy(Some(0)));
+        let want: Vec<(RowId, f32)> = hits
+            .iter()
+            .map(|&(id, score)| (RowId::new(order[id.get() as usize]), score))
+            .collect();
+        assert_eq!(r.hits_to_rows_async(hits).await.expect("translate"), want);
+        assert!(
+            r.doc_map_reads() > DOC_MAP_BATCHES_IN_FLIGHT,
+            "read in pages"
+        );
     }
 
     #[tokio::test]
