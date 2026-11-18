@@ -1245,7 +1245,7 @@ fn union_cell_selection(grid: &[u32], fine: &[u32]) -> Vec<u32> {
 /// downstream read is byte-identical.
 pub(crate) struct CentroidRouterGraph {
     scorer: crate::superfile::vector::hnsw::Fp32Scorer,
-    graph: crate::superfile::vector::hnsw::Hnsw,
+    graph: Arc<crate::superfile::vector::hnsw::Hnsw>,
     /// `node_map[i] = (superfile index, per-superfile flat cluster)` for graph
     /// node `i`, or [`HOLE_NODE`] for a hole (a node no search returns).
     /// Resolves each selected node to its superfile + flat cluster.
@@ -1688,7 +1688,7 @@ fn build_centroid_router(
         .collect();
     Ok(CentroidRouterGraph {
         scorer,
-        graph,
+        graph: Arc::new(graph),
         node_map,
         live_nodes: keys.len(),
         metric,
@@ -1787,13 +1787,20 @@ fn decode_centroid_router_section(
     let graph = Hnsw::from_bytes(topology)?;
     let nodes: Vec<Option<(Uuid, u32)>> = persisted.into_iter().map(Some).collect();
     assemble_centroid_router(
-        graph, &nodes, superfiles, readers, column, column_id, section, dim, metric,
+        Arc::new(graph),
+        &nodes,
+        superfiles,
+        readers,
+        column,
+        column_id,
+        section,
+        dim,
+        metric,
     )
 }
 
-/// The `(superfile_id, flat cluster)` behind each node of a stored router
-/// graph, or `None` when a key names a cell, which only a placement graph's
-/// keys do.
+/// The `(superfile_id, flat cluster)` of each node, `None` for a hole. Fails on
+/// a key with a cell, which a router graph never has.
 fn router_nodes(keys: &[Option<FineNodeKey>]) -> Option<Vec<Option<(Uuid, u32)>>> {
     keys.iter()
         .map(|key| match key {
@@ -1804,17 +1811,11 @@ fn router_nodes(keys: &[Option<FineNodeKey>]) -> Option<Vec<Option<(Uuid, u32)>>
         .collect()
 }
 
-/// Put a centroid router together from a stored graph and the centroid each
-/// of its nodes stands for: `nodes[i]` is the `(superfile_id, flat cluster)`
-/// behind graph node `i`, or `None` for a hole. The fp32 scorer is rebuilt
-/// from the resident centroids in node order, so scorer node `i` lines up
-/// with graph node `i` however the current superfile array is ordered; a
-/// hole, which no search scores, gets a zero vector. Returns `None` — so the
-/// caller falls back to a full in-memory build — when the node count
-/// disagrees with the graph, a node is a hole on one side only, or a
-/// `(superfile_id, flat)` is one the current membership no longer covers.
+/// Build the router from a stored graph and the cluster behind each node
+/// (`None` for a hole). `None` if the graph and `nodes` disagree or a cluster is
+/// not in the current superfiles.
 fn assemble_centroid_router(
-    graph: Hnsw,
+    graph: Arc<Hnsw>,
     nodes: &[Option<(Uuid, u32)>],
     superfiles: &[Arc<SuperfileEntry>],
     readers: &[Arc<SuperfileReader>],
@@ -1886,13 +1887,8 @@ fn assemble_centroid_router(
     })
 }
 
-/// Reconstruct a centroid router from the bytes the manifest's centroid-graph
-/// ref names. They are either the whole router as one section
-/// ([`encode_centroid_router_section`]) or the head of a graph stored as a
-/// full copy plus per-generation changes, which is followed from the
-/// generation this process last held ([`fine_graph_follow::follow`]). `None`
-/// — so the caller builds in memory — when neither form decodes, the head is
-/// for another column, or the graph does not fit the current membership.
+/// Load the router from stored bytes: either the whole router in one section,
+/// or the head of a graph stored as a base plus steps.
 async fn centroid_router_from_stored(
     bytes: &[u8],
     storage: &dyn StorageProvider,
@@ -1912,7 +1908,7 @@ async fn centroid_router_from_stored(
     if head.role != GraphRole::Router || head.column != column_id || head.dim as usize != dim {
         return None;
     }
-    let KeyedGraph { keys, graph, .. } = fine_graph_follow::follow(storage, &head).await?;
+    let KeyedGraph { keys, graph, .. } = fine_graph_follow::load(storage, &head).await?;
     let nodes = router_nodes(&keys)?;
     assemble_centroid_router(
         graph, &nodes, superfiles, readers, column, column_id, section, dim, metric,
@@ -2008,7 +2004,7 @@ pub(crate) fn build_centroid_router_from_cluster_vectors(
     let live_nodes = node_map.len();
     Ok(CentroidRouterGraph {
         scorer,
-        graph,
+        graph: Arc::new(graph),
         node_map,
         live_nodes,
         metric,
@@ -5731,7 +5727,7 @@ impl SupertableReader {
             column: column.to_string(),
             graph: CentroidRouterGraph {
                 scorer,
-                graph,
+                graph: Arc::new(graph),
                 node_map,
                 live_nodes: keys.len(),
                 metric,
@@ -12475,19 +12471,13 @@ mod tests {
         });
     }
 
-    /// Commits before the first drain of the stored-graph fixture.
+    /// Commits before the first drain.
     const STORED_GRAPH_FIRST_COMMITS: u64 = 20;
-    /// Commits between its first and second drain: few beside the first, so
-    /// the second generation is a small change to the first.
+    /// Commits before the second drain.
     const STORED_GRAPH_NEXT_COMMITS: u64 = 2;
-    /// Rows in each of its commits.
     const STORED_GRAPH_ROWS_PER_COMMIT: usize = 32;
 
-    /// A router graph stored as a full copy plus a change loads as the graph
-    /// the writer holds, both for a reader that held the generation before
-    /// and one starting from the base; a head naming an object that is not
-    /// stored loads as nothing, so the caller builds the graph itself; and
-    /// the router stored as one section still loads through the same path.
+    /// A graph stored as a base plus a step loads as the writer's graph.
     #[test]
     fn a_stored_router_graph_is_followed_across_generations() {
         let dim = 16usize;
@@ -12514,7 +12504,6 @@ mod tests {
             }
             st.drain_vectors_to_cells_sync().expect("drain");
         };
-        // What a query selects, by the centroid's stable name.
         let queries: Vec<Vec<f32>> = (0..dim)
             .map(|at| {
                 let mut q = vec![0.0f32; dim];
@@ -12526,8 +12515,6 @@ mod tests {
         let fanout = 3usize;
 
         block_on_mt(async {
-            // One generation as the writer holds it: the centroids' names in
-            // node order (`None` for a hole), their graph, and its scorer.
             struct Generation {
                 entries: Vec<Arc<SuperfileEntry>>,
                 readers: Vec<Arc<SuperfileReader>>,
@@ -12634,7 +12621,6 @@ mod tests {
                 }
             };
 
-            // The first generation, stored as a base.
             commit(0, STORED_GRAPH_FIRST_COMMITS);
             let first = generation().await;
             let mut first_keys: Vec<FineNodeKey> = first.centroids.keys().copied().collect();
@@ -12664,8 +12650,6 @@ mod tests {
                 selected(&first_graph, &first_scorer, &name_first),
             );
 
-            // The second generation: the first with the centroids that are
-            // gone as holes and the new ones after the last node.
             commit(STORED_GRAPH_FIRST_COMMITS, STORED_GRAPH_NEXT_COMMITS);
             let second = generation().await;
             let gone: Vec<u32> = first_keys
@@ -12711,7 +12695,7 @@ mod tests {
                 expected,
             );
 
-            // A reader that holds nothing starts from the base.
+            // With nothing kept, it loads from the base.
             fine_graph_follow::forget_all();
             assert_eq!(
                 load(second_head.to_bytes(), &second)
@@ -12720,12 +12704,12 @@ mod tests {
                 expected,
             );
 
-            // A head with a step that is not stored.
+            // A step that is not stored.
             let mut missing = second_head.clone();
             missing.steps.push((ContentHash::of(b"not stored"), 1));
             assert!(load(missing.to_bytes(), &second).await.is_none());
 
-            // The router stored as one section.
+            // The old single-section form.
             let built = build_centroid_router(
                 &second.entries,
                 &second.readers,
