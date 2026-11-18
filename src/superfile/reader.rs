@@ -64,6 +64,8 @@ use tracing::warn;
 
 #[cfg(test)]
 use crate::superfile::fts::reader::TermIndexFact;
+#[cfg(test)]
+use crate::supertable::reader_cache::disk::HeapBudget;
 use crate::{
     memory::ConnectionMemoryBudget,
     runtime_bridge::run_on_pool_unless_blocking,
@@ -1410,6 +1412,13 @@ impl SuperfileReader {
             Some(r) => r.fts_columns().collect(),
             None => Vec::new(),
         }
+    }
+
+    /// This reader with its text index's kept doc-id map charged to `budget`, for a test of one.
+    #[cfg(test)]
+    pub(crate) fn with_fts_heap_budget(mut self, budget: &'static HeapBudget) -> Self {
+        self.fts = self.fts.map(|fts| fts.with_heap_budget(budget));
+        self
     }
 
     /// Underlying FTS reader. `None` if this superfile has no FTS index.

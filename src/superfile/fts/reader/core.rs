@@ -23,6 +23,7 @@ use std::{
     mem,
     num::NonZeroUsize,
     ops::Range,
+    ptr,
     sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak},
     thread::available_parallelism,
 };
@@ -1366,9 +1367,10 @@ impl FtsReader {
     /// in-memory blob (no heap, so `reservation` goes back), or a heap copy holding `reservation`.
     fn doc_map_from(&self, bytes: Bytes, reservation: HeapReservation) -> Result<DocMap, FtsError> {
         let body = checked_doc_map_body(self.map_region(), bytes, self.verify_crc)?;
-        Ok(match self.source {
-            Source::InMemory(_) => DocMap::permuted(body),
-            Source::Lazy(_) => kept_copy(&body, reservation),
+        Ok(if self.keeps_map_on_heap() {
+            kept_copy(&body, reservation)
+        } else {
+            DocMap::permuted(body)
         })
     }
 
@@ -1430,6 +1432,25 @@ impl FtsReader {
     /// own rather than in row order.
     pub(crate) fn has_doc_map(&self) -> bool {
         self.doc_map_region.is_some()
+    }
+
+    /// Whether a doc-id map this reader keeps is a heap copy charged to its budget: a lazy source
+    /// may hand back a window onto a bigger fetch, so its map is copied; an in-memory one is not.
+    fn keeps_map_on_heap(&self) -> bool {
+        matches!(self.source, Source::Lazy(_))
+    }
+
+    /// Bytes of the doc-id map this reader keeps on the heap charged to `budget`: zero when it
+    /// keeps none, reads it in place from memory, or charges another budget.
+    pub(crate) fn kept_map_bytes(&self, budget: &HeapBudget) -> u64 {
+        match self.doc_map.get() {
+            Some(DocMap::Permuted(region))
+                if self.keeps_map_on_heap() && ptr::eq(self.heap_budget, budget) =>
+            {
+                region.len() as u64
+            }
+            _ => 0,
+        }
     }
 
     pub fn n_docs(&self) -> u32 {

@@ -10,7 +10,9 @@
 //!   budget, the files read lazily or held whole in memory that no query holds leave the cache,
 //!   oldest first, until they fit what queries leave of the budget (never under a quarter of it),
 //!   keeping their downloaded blocks on disk; when held files fill it, tables' cached SQL sessions
-//!   go too. A file mapped whole from local disk is not counted, and this budget never drops it.
+//!   go too. A file mapped whole from local disk is not counted, and this budget never drops it;
+//! - doc-id maps a query can do without take at most half of it; when a new one would not fit, the
+//!   files keeping the least recently used ones that no query holds leave the cache to make room.
 
 #[cfg(test)]
 use std::sync::atomic::AtomicBool;
@@ -19,11 +21,12 @@ use std::{
     cmp::Reverse,
     ptr,
     sync::{
-        Arc, Mutex, OnceLock, PoisonError, TryLockError, Weak,
+        Arc, Mutex, MutexGuard, OnceLock, PoisonError, TryLockError, Weak,
         atomic::{AtomicU64, Ordering},
         mpsc::{SyncSender, sync_channel},
     },
     thread,
+    time::{Duration, Instant},
 };
 
 use tracing::debug;
@@ -32,7 +35,10 @@ use crate::{
     memory::{process_limit, recent_anon_rss_bytes},
     runtime_metrics::rss::total_memory_bytes,
     superfile::SuperfileReader,
-    supertable::{manifest::SuperfileUri, reader_cache::disk::DiskCacheStore},
+    supertable::{
+        manifest::SuperfileUri,
+        reader_cache::disk::{CachedEntry, DiskCacheStore},
+    },
 };
 
 /// Share of the process memory limit (else of the machine's memory) the cache may keep as decoded
@@ -46,6 +52,13 @@ const UNHELD_FLOOR_DIVISOR: u64 = 4;
 /// Share of the budget doc-id maps a query can do without may take. Half, so maps can't starve SQL
 /// scans of their file metadata and SQL metadata can't starve ranked search of its maps.
 const MAP_SHARE_PERCENT: u64 = 50;
+
+/// How long after a walk for idle maps that found too little to free a refused keep of at least the
+/// same size skips the walk: a query over many large files asks once per file, and the maps queries
+/// hold don't free up that fast. A smaller keep walks, since idle maps may cover it.
+/// Longer under test, so a test's two asks in a row always fall inside it.
+const FUTILE_MAP_WALK_BACKOFF: Duration =
+    Duration::from_millis(if cfg!(test) { 1_000 } else { 100 });
 
 /// The part of `budget` doc-id maps a query can do without may take.
 fn map_share(budget: u64) -> u64 {
@@ -131,10 +144,58 @@ fn unheld_target(share: u64, held: u64) -> u64 {
     (share / UNHELD_FLOOR_DIVISOR).max(share.saturating_sub(held))
 }
 
-/// What one walk over the caches found: the unheld files counted against a budget, oldest first
-/// (idle time, cache, file, bytes), and the bytes held and unheld.
+/// Unheld files a pass may let go, longest idle first: (idle time, cache, file, bytes).
+type Oldest = Vec<(Reverse<u64>, usize, SuperfileUri, u64)>;
+
+/// The unheld files in `caches` for which `bytes_of` counts something, longest idle first. Each
+/// cache stamps accesses on its own clock, started when it was, so files are ranked by how long
+/// each has been idle, not by their stamps.
+fn oldest_unheld(caches: &[Arc<DiskCacheStore>], bytes_of: impl Fn(&CachedEntry) -> u64) -> Oldest {
+    let mut oldest = Vec::new();
+    for (at, cache) in caches.iter().enumerate() {
+        let now_us = cache.now_us();
+        for entry in cache.cached.iter() {
+            let bytes = bytes_of(entry.value());
+            if bytes > 0 && cache.reclaimable_lazy_entry(entry.key(), entry.value()) {
+                let last = entry.value().last_access_us.load(Ordering::Acquire);
+                oldest.push((
+                    Reverse(now_us.saturating_sub(last)),
+                    at,
+                    *entry.key(),
+                    bytes,
+                ));
+            }
+        }
+    }
+    oldest.sort_unstable();
+    oldest
+}
+
+/// Let go of `oldest` in order while `more(freed)` holds: the readers let go, for the caller to
+/// free, and the bytes they counted.
+fn release_oldest(
+    caches: &[Arc<DiskCacheStore>],
+    oldest: Oldest,
+    mut more: impl FnMut(u64) -> bool,
+) -> (Vec<Arc<SuperfileReader>>, u64) {
+    let mut freed = 0;
+    let mut released = Vec::new();
+    for (_, at, uri, bytes) in oldest {
+        if !more(freed) {
+            break;
+        }
+        if let Some(reader) = caches[at].release_lazy_entry(&uri, caches[at].now_us()) {
+            released.push(reader);
+            freed += bytes;
+        }
+    }
+    (released, freed)
+}
+
+/// What one walk over the caches found: the unheld files counted against a budget, oldest first,
+/// and the bytes held and unheld.
 struct Scan {
-    oldest: Vec<(Reverse<u64>, usize, SuperfileUri, u64)>,
+    oldest: Oldest,
     unheld: u64,
     held: u64,
 }
@@ -210,6 +271,9 @@ pub(crate) struct HeapBudget {
     /// Held by the running pass: one at a time, so two statements ending together do not both drop
     /// files for the same excess.
     pass: Mutex<()>,
+    /// When a walk for idle maps last found too little to free, and how much it needed; see
+    /// [`FUTILE_MAP_WALK_BACKOFF`].
+    futile_map_walk: Mutex<Option<(Instant, u64)>>,
     /// A test's own budget, in place of the process's.
     #[cfg(test)]
     fixed: Option<Option<u64>>,
@@ -226,6 +290,7 @@ impl HeapBudget {
             caches: Mutex::new(Vec::new()),
             sessions: Mutex::new(Vec::new()),
             pass: Mutex::new(()),
+            futile_map_walk: Mutex::new(None),
             #[cfg(test)]
             fixed: None,
             #[cfg(test)]
@@ -294,18 +359,36 @@ impl HeapBudget {
     }
 
     /// Reserve `bytes` for a doc-id map a query can do without: `None` while the process is short
-    /// of memory, or when kept maps would pass their share of the budget. Refusing drops nothing:
-    /// it is a sampled memory check and one compare-and-swap.
+    /// of memory, or when kept maps would pass their share of the budget. When they would, the
+    /// files keeping the least recently used maps no query holds leave the cache first (see
+    /// [`Self::drop_unheld_maps`]), so a file in use now keeps its map in place of an idle one.
     pub(crate) fn try_reserve_map(&'static self, bytes: u64) -> Option<HeapReservation> {
         if self.short_of_memory() {
             return None;
         }
         let share = self.budget().map_or(u64::MAX, map_share);
-        self.maps
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |maps| {
-                maps.checked_add(bytes).filter(|&total| total <= share)
-            })
-            .ok()?;
+        let claim = || {
+            self.maps
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |maps| {
+                    maps.checked_add(bytes).filter(|&total| total <= share)
+                })
+                .is_ok()
+        };
+        if !claim() {
+            // A map larger than the whole share never fits: let nothing go for it.
+            if bytes > share {
+                return None;
+            }
+            let over = self
+                .maps
+                .load(Ordering::Acquire)
+                .saturating_add(bytes)
+                .saturating_sub(share);
+            self.drop_unheld_maps(over);
+            if !claim() {
+                return None;
+            }
+        }
         self.charged.fetch_add(bytes, Ordering::AcqRel);
         Some(HeapReservation {
             budget: self,
@@ -340,11 +423,7 @@ impl HeapBudget {
         }
         // One pass at a time. A statement that ends while one runs leaves its files to the next
         // statement end, so with no later statement they stay until the idle sweep.
-        let _pass = match self.pass.try_lock() {
-            Ok(pass) => pass,
-            Err(TryLockError::Poisoned(pass)) => pass.into_inner(),
-            Err(TryLockError::WouldBlock) => return,
-        };
+        let Some(_pass) = self.try_pass() else { return };
         let released = self.drop_unheld_over_target(budget);
         free_elsewhere(released);
         debug!(
@@ -356,13 +435,79 @@ impl HeapBudget {
         );
     }
 
+    /// Let go of the files keeping the least recently used doc-id maps that no query holds, until
+    /// `need` bytes of maps are back. Nothing goes when those files together can't make `need`: the
+    /// claim would be refused anyway, and the files would only be opened again. The walk that
+    /// counts them takes no lock; letting go takes the pass lock, and is skipped while another pass
+    /// runs. What goes is freed here, not on the freeing thread, so its maps' bytes are back when
+    /// the caller asks again. When the files no query holds can't make `need`, the tables' cached
+    /// SQL sessions are dropped, so the files they hold (maps and all) can go too, and the walk
+    /// runs once more. After a walk that still found too little, refusals that need at least as
+    /// much skip it for a while.
+    fn drop_unheld_maps(&self, need: u64) {
+        // Locked only to read or stamp the time, never across the walk, so other refusals don't
+        // wait on it.
+        let futile = || {
+            self.futile_map_walk
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+        };
+        if futile().is_some_and(|(at, short_of)| {
+            need >= short_of && at.elapsed() < FUTILE_MAP_WALK_BACKOFF
+        }) {
+            return;
+        }
+        let caches = self.live_caches();
+        let idle_maps = || {
+            let oldest = oldest_unheld(&caches, |entry| {
+                entry.reader.fts().map_or(0, |fts| fts.kept_map_bytes(self))
+            });
+            let unheld: u64 = oldest.iter().map(|&(_, _, _, bytes)| bytes).sum();
+            (oldest, unheld)
+        };
+        let (mut oldest, mut unheld) = idle_maps();
+        if unheld < need {
+            // A table's cached session holds the files its statements prepared, maps and all,
+            // until it next commits: drop the sessions, rebuilt on their next statement, and look
+            // again.
+            drop(oldest);
+            self.drop_cached_sessions();
+            (oldest, unheld) = idle_maps();
+        }
+        if unheld < need {
+            *futile() = Some((Instant::now(), need));
+            return;
+        }
+        let Some(_pass) = self.try_pass() else { return };
+        let (released, freed) = release_oldest(&caches, oldest, |freed| freed < need);
+        drop(released);
+        debug!(
+            target: "infino::cache",
+            need,
+            freed,
+            "doc-id maps over their share: let go of the least recently used"
+        );
+    }
+
+    /// The pass lock, unless another pass holds it.
+    fn try_pass(&self) -> Option<MutexGuard<'_, ()>> {
+        match self.pass.try_lock() {
+            Ok(pass) => Some(pass),
+            Err(TryLockError::Poisoned(pass)) => Some(pass.into_inner()),
+            Err(TryLockError::WouldBlock) => None,
+        }
+    }
+
+    /// The live caches whose files this budget may drop.
+    fn live_caches(&self) -> Vec<Arc<DiskCacheStore>> {
+        let mut list = self.caches.lock().unwrap_or_else(PoisonError::into_inner);
+        list.retain(|cache| cache.strong_count() > 0);
+        list.iter().filter_map(Weak::upgrade).collect()
+    }
+
     /// One pass of [`Self::release_over_budget`]: the readers it let go, for the caller to free.
     fn drop_unheld_over_target(&self, budget: u64) -> Vec<Arc<SuperfileReader>> {
-        let caches: Vec<Arc<DiskCacheStore>> = {
-            let mut list = self.caches.lock().unwrap_or_else(PoisonError::into_inner);
-            list.retain(|cache| cache.strong_count() > 0);
-            list.iter().filter_map(Weak::upgrade).collect()
-        };
+        let caches = self.live_caches();
         // File metadata's share: kept doc-id maps can't be dropped here, so they are not aimed at.
         let share = self.sql_share(budget);
         let mut scan = self.scan(&caches);
@@ -374,17 +519,8 @@ impl HeapBudget {
             scan = self.scan(&caches);
         }
         let target = unheld_target(share, scan.held);
-        let mut unheld = scan.unheld;
-        let mut released = Vec::new();
-        for (_, at, uri, bytes) in scan.oldest {
-            if unheld <= target {
-                break;
-            }
-            if let Some(reader) = caches[at].release_lazy_entry(&uri, caches[at].now_us()) {
-                released.push(reader);
-                unheld -= bytes;
-            }
-        }
+        let (mut released, _) =
+            release_oldest(&caches, scan.oldest, |freed| scan.unheld - freed > target);
         // The lazy files past the cap would otherwise go at the next query's first open, which
         // would pay for freeing them.
         for cache in &caches {
@@ -395,30 +531,14 @@ impl HeapBudget {
 
     /// The unheld files counted here, oldest first, with the bytes held and unheld.
     fn scan(&self, caches: &[Arc<DiskCacheStore>]) -> Scan {
-        // Each cache stamps accesses on its own clock, started when it was, so files are ranked by
-        // how long each has been idle, not by their stamps.
-        let mut oldest = Vec::new();
-        let mut unheld = 0;
-        for (at, cache) in caches.iter().enumerate() {
-            let now_us = cache.now_us();
-            for entry in cache.cached.iter() {
-                let Some(heap) = entry
-                    .value()
-                    .heap
-                    .get()
-                    .filter(|heap| heap.counts_against(self))
-                else {
-                    continue;
-                };
-                if cache.reclaimable_lazy_entry(entry.key(), entry.value()) {
-                    let last = entry.value().last_access_us.load(Ordering::Acquire);
-                    let idle = Reverse(now_us.saturating_sub(last));
-                    oldest.push((idle, at, *entry.key(), heap.bytes()));
-                    unheld += heap.bytes();
-                }
-            }
-        }
-        oldest.sort_unstable();
+        let oldest = oldest_unheld(caches, |entry| {
+            entry
+                .heap
+                .get()
+                .filter(|heap| heap.counts_against(self))
+                .map_or(0, HeapReservation::bytes)
+        });
+        let unheld = oldest.iter().map(|&(_, _, _, bytes)| bytes).sum();
         // Held file metadata: what is charged, less doc-id maps and the unheld files found here.
         let held = self.sql_bytes().saturating_sub(unheld);
         Scan {
@@ -520,7 +640,7 @@ mod tests {
     use std::{
         mem,
         sync::{
-            Arc, Barrier, Mutex,
+            Arc, Barrier, Mutex, Weak,
             atomic::{AtomicU64, Ordering},
             mpsc::{Receiver, Sender, channel},
         },
@@ -528,17 +648,22 @@ mod tests {
         time::Duration,
     };
 
+    use bytes::Bytes;
     use tempfile::TempDir;
+    use tokio::time::sleep;
 
     use crate::{
-        superfile::SuperfileReader,
+        superfile::{
+            BytesLazyByteSource, LazyByteSource, SuperfileReader,
+            builder::reordered_test_superfile, id_space::FtsDocId, reader::OpenOptions,
+        },
         supertable::{
             manifest::SuperfileUri,
             reader_cache::disk::{
                 DiskCacheStore, EntryAccounting, Residency,
                 heap::{
-                    CachedSessions, FREE_THREAD_NAME, FreeQueue, HeapBudget, HeapReservation,
-                    UNHELD_FLOOR_DIVISOR, leaves_too_little_room,
+                    CachedSessions, FREE_THREAD_NAME, FUTILE_MAP_WALK_BACKOFF, FreeQueue,
+                    HeapBudget, HeapReservation, UNHELD_FLOOR_DIVISOR, leaves_too_little_room,
                 },
                 test_support::*,
             },
@@ -598,6 +723,211 @@ mod tests {
         );
         store.charge_heap(&uri, &reader, ENTRY_BYTES);
         uri
+    }
+
+    /// A file whose text index keeps a doc-id map, opened lazily and charged to `budget`, its map
+    /// kept by one translation of every document.
+    async fn reader_keeping_a_map(
+        superfile: &Bytes,
+        budget: &'static HeapBudget,
+    ) -> SuperfileReader {
+        let source: Arc<dyn LazyByteSource> = Arc::new(BytesLazyByteSource::new(superfile.clone()));
+        let reader = SuperfileReader::open_lazy_with(source, OpenOptions { verify_crc: false })
+            .await
+            .expect("open lazily")
+            .with_fts_heap_budget(budget);
+        let fts = reader.fts().expect("a text index");
+        let ids = (0..fts.n_docs()).map(FtsDocId::new).collect();
+        fts.ids_to_rows_async(ids)
+            .await
+            .expect("translate every document");
+        reader
+    }
+
+    /// Bytes of the doc-id map a reader of `superfile` keeps, measured on a budget of its own.
+    async fn map_bytes_of(superfile: &Bytes) -> u64 {
+        let budget = HeapBudget::with_budget(None);
+        budget.set_short_of_memory(false);
+        let reader = reader_keeping_a_map(superfile, budget).await;
+        let kept = budget.charged();
+        drop(reader);
+        kept
+    }
+
+    /// Cache a lazy entry for a new file of `superfile`, last used at `last_access_us`, whose
+    /// reader keeps its doc-id map against the cache's budget.
+    async fn entry_keeping_a_map(
+        store: &Arc<DiskCacheStore>,
+        superfile: &Bytes,
+        last_access_us: u64,
+    ) -> SuperfileUri {
+        let uri = SuperfileUri::new_v4();
+        let reader = reader_keeping_a_map(superfile, store.heap_budget()).await;
+        let residency = Residency::Paged {
+            block_source: dummy_block_source(store, uri),
+        };
+        cache_entry(
+            store,
+            uri,
+            Arc::new(reader),
+            residency,
+            Arc::new(AtomicU64::new(0)),
+            EntryAccounting::SourceOwned,
+            last_access_us,
+        );
+        uri
+    }
+
+    /// A reordered superfile, its map's bytes, and a cache whose budget gives maps room for
+    /// `maps` of them, in a process with memory to spare.
+    async fn store_with_room_for(maps: u64) -> (TempDir, Arc<DiskCacheStore>, Bytes, u64) {
+        let superfile = Bytes::from(reordered_test_superfile());
+        let map = map_bytes_of(&superfile).await;
+        assert!(map > 0, "the superfile's readers keep a map");
+        // Maps take half the budget.
+        let (dir, store) = store_with_budget(Some(2 * maps * map));
+        store.heap_budget().set_short_of_memory(false);
+        (dir, store, superfile, map)
+    }
+
+    #[tokio::test]
+    async fn a_map_that_does_not_fit_lets_go_of_the_least_recently_used() {
+        // Setup: two files no query holds keep a map each, filling the maps' share; the first was
+        // used earlier.
+        //  - A third map would not fit: the file keeping the least recently used map leaves the
+        //    cache, its map's bytes come back, and the third map is kept.
+        //  - The file used more recently keeps its map.
+        // This test pins that kept maps age out, so a file in use now keeps its map instead of
+        // reading pages on every query behind maps nobody uses.
+        let (_dir, store, superfile, map) = store_with_room_for(2).await;
+        let budget = store.heap_budget();
+        let idle = entry_keeping_a_map(&store, &superfile, 1).await;
+        let recent = entry_keeping_a_map(&store, &superfile, 2).await;
+        assert_eq!(budget.charged(), 2 * map, "both maps kept and charged");
+        let kept = budget.try_reserve_map(map);
+        assert!(kept.is_some(), "the idle file's map made room");
+        assert!(
+            !store.is_cached(&idle),
+            "the least recently used map's file left"
+        );
+        assert!(store.is_cached(&recent), "the more recent one stayed");
+        assert_eq!(budget.charged(), 2 * map, "the idle map's bytes came back");
+        drop(kept);
+    }
+
+    #[tokio::test]
+    async fn a_map_a_query_holds_is_never_let_go() {
+        // Setup: two files keep a map each, filling the maps' share, and a query holds both.
+        //  - A third map is refused, and both files stay cached with their maps.
+        // This test pins that making room never drops a map a query is reading through.
+        let (_dir, store, superfile, map) = store_with_room_for(2).await;
+        let budget = store.heap_budget();
+        let files = [
+            entry_keeping_a_map(&store, &superfile, 1).await,
+            entry_keeping_a_map(&store, &superfile, 2).await,
+        ];
+        let _held = files.map(|uri| cached_reader(&store, &uri));
+        assert!(budget.try_reserve_map(map).is_none(), "no room");
+        assert!(files.iter().all(|uri| store.is_cached(uri)), "both stay");
+        assert_eq!(budget.charged(), 2 * map);
+    }
+
+    #[tokio::test]
+    async fn nothing_goes_when_the_idle_maps_cannot_make_room() {
+        // Setup: the maps' share holds three maps, kept by three files; a query holds two of them,
+        // the third is idle.
+        //  - A map the size of two would need the held maps' room too: it is refused, and the
+        //    idle file stays cached, since letting it go would not make the room.
+        // This test pins that making room evicts nothing unless the evictions can make it.
+        let (_dir, store, superfile, map) = store_with_room_for(3).await;
+        let budget = store.heap_budget();
+        let held = [
+            entry_keeping_a_map(&store, &superfile, 1).await,
+            entry_keeping_a_map(&store, &superfile, 2).await,
+        ];
+        let _held = held.map(|uri| cached_reader(&store, &uri));
+        let idle = entry_keeping_a_map(&store, &superfile, 3).await;
+        assert!(budget.try_reserve_map(2 * map).is_none(), "no room to make");
+        assert!(store.is_cached(&idle), "the idle file stays");
+        assert_eq!(budget.charged(), 3 * map);
+    }
+
+    #[tokio::test]
+    async fn a_walk_that_found_too_little_holds_off_the_next() {
+        // Setup: the maps' share holds two maps; a query holds both.
+        //  - A third map is refused, and the walk finds nothing to let go.
+        //  - The query lets go of one, and right away the next refusal skips the walk: the idle
+        //    file stays.
+        //  - Past the backoff, the walk runs again and the idle file makes room.
+        // This test pins that a query over many files doesn't walk the cache once per file.
+        let (_dir, store, superfile, map) = store_with_room_for(2).await;
+        let budget = store.heap_budget();
+        let files = [
+            entry_keeping_a_map(&store, &superfile, 1).await,
+            entry_keeping_a_map(&store, &superfile, 2).await,
+        ];
+        let [held, idle] = files.map(|uri| cached_reader(&store, &uri));
+        assert!(budget.try_reserve_map(map).is_none(), "nothing to let go");
+        drop(idle);
+        assert!(
+            budget.try_reserve_map(map).is_none(),
+            "the walk is held off"
+        );
+        assert!(store.is_cached(&files[1]), "the idle file stays");
+        sleep(FUTILE_MAP_WALK_BACKOFF).await;
+        assert!(budget.try_reserve_map(map).is_some(), "the walk makes room");
+        assert!(!store.is_cached(&files[1]), "the idle file left");
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn a_map_held_only_by_a_cached_session_still_makes_room() {
+        // Setup: the maps' share holds two maps; a table's cached session holds the first file,
+        // idle since, and a query holds the second.
+        //  - A third map finds no file free: the cached sessions are dropped, the first file is
+        //    then free and leaves, its map's bytes come back, and the third map is kept.
+        // This test pins that a statement's cached session can't pin maps past their share until
+        // its table next commits.
+        let (_dir, store, superfile, map) = store_with_room_for(2).await;
+        let budget = store.heap_budget();
+        let idle = entry_keeping_a_map(&store, &superfile, 1).await;
+        let busy = entry_keeping_a_map(&store, &superfile, 2).await;
+        let session = Arc::new(HeldSession(Mutex::new(vec![cached_reader(&store, &idle)])));
+        budget.register_sessions(Arc::downgrade(&session) as Weak<dyn CachedSessions>);
+        let _query = cached_reader(&store, &busy);
+        let kept = budget.try_reserve_map(map);
+        assert!(kept.is_some(), "the session's file made room");
+        assert!(
+            !store.is_cached(&idle),
+            "it left once the session was dropped"
+        );
+        assert!(store.is_cached(&busy), "the query's file stayed");
+        assert_eq!(budget.charged(), 2 * map, "the idle map's bytes came back");
+        drop(kept);
+    }
+
+    #[tokio::test]
+    async fn a_smaller_keep_walks_inside_a_bigger_ones_backoff() {
+        // Setup: the maps' share holds two maps; the first file is idle, a query holds the second.
+        //  - A keep the size of two maps finds one idle map, too little: nothing goes, and the
+        //    backoff starts.
+        //  - Inside it, a keep of one map walks anyway, and the idle file makes room.
+        // This test pins that a futile walk for a big map doesn't hold off a small one that idle
+        // maps cover.
+        let (_dir, store, superfile, map) = store_with_room_for(2).await;
+        let budget = store.heap_budget();
+        let idle = entry_keeping_a_map(&store, &superfile, 1).await;
+        let busy = entry_keeping_a_map(&store, &superfile, 2).await;
+        let _query = cached_reader(&store, &busy);
+        assert!(
+            budget.try_reserve_map(2 * map).is_none(),
+            "one idle map can't make two"
+        );
+        assert!(store.is_cached(&idle), "so nothing went");
+        let kept = budget.try_reserve_map(map);
+        assert!(kept.is_some(), "the smaller keep walked and made room");
+        assert!(!store.is_cached(&idle), "the idle file left");
+        drop(kept);
     }
 
     /// The reader the cache holds for `uri`.
