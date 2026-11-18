@@ -15889,7 +15889,10 @@ async fn put_new_hedged(
 /// Persist `bytes` under the name `uri_for` derives from their content
 /// hash and return the reference a manifest records. Idempotent: an
 /// object that already exists under its hash name is the same bytes, so
-/// the store's `PreconditionFailed` is success.
+/// the store's `PreconditionFailed` is success. A store can refuse such a
+/// PUT before it has read the body and close the connection, which reaches
+/// here as a transport failure, so a failed PUT is also success when the
+/// object is stored.
 pub(in crate::supertable) async fn put_content_addressed(
     storage: &dyn StorageProvider,
     uri_for: impl FnOnce(&part_mod::ContentHash) -> String,
@@ -15897,17 +15900,14 @@ pub(in crate::supertable) async fn put_content_addressed(
 ) -> Result<RoutingRef, StorageError> {
     let content_hash = part_mod::ContentHash::of(&bytes);
     let uri = uri_for(&content_hash);
-    let span = detail_span!("put_content_addressed", len = bytes.len());
+    let len = bytes.len() as u64;
+    let span = detail_span!("put_content_addressed", len = len);
     let put = async {
-        match (bytes.len() as u64) >= CONTENT_ADDRESSED_MULTIPART_THRESHOLD_BYTES {
+        match len >= CONTENT_ADDRESSED_MULTIPART_THRESHOLD_BYTES {
             true => {
                 // A multipart upload overwrites unconditionally, so skip it when
                 // the hash-named object is already there.
-                if storage
-                    .head(&uri)
-                    .await
-                    .is_ok_and(|meta| meta.size == bytes.len() as u64)
-                {
+                if is_stored(storage, &uri, len).await {
                     return Ok(());
                 }
                 put_superfile_multipart(storage, &uri, bytes).await
@@ -15919,8 +15919,16 @@ pub(in crate::supertable) async fn put_content_addressed(
         Ok(()) | Err(StorageError::PreconditionFailed { .. }) => {
             Ok(RoutingRef { uri, content_hash })
         }
+        Err(StorageError::TransientExhausted { .. }) if is_stored(storage, &uri, len).await => {
+            Ok(RoutingRef { uri, content_hash })
+        }
         Err(e) => Err(e),
     }
+}
+
+/// Whether the object at `uri` is stored and `len` bytes long.
+async fn is_stored(storage: &dyn StorageProvider, uri: &str, len: u64) -> bool {
+    storage.head(uri).await.is_ok_and(|meta| meta.size == len)
 }
 
 async fn put_superfile_multipart(
@@ -17009,6 +17017,9 @@ mod tests {
     struct CountingMultipartStorage {
         inner: LocalFsStorageProvider,
         multiparts: AtomicUsize,
+        /// A PUT of an object that is already stored fails as a dropped
+        /// connection does, not as a refused precondition.
+        drops_puts_of_stored: bool,
     }
 
     #[async_trait::async_trait]
@@ -17027,6 +17038,12 @@ mod tests {
             uri: &str,
             bytes: Bytes,
         ) -> Result<Option<String>, StorageError> {
+            if self.drops_puts_of_stored && self.inner.head(uri).await.is_ok() {
+                return Err(StorageError::TransientExhausted {
+                    uri: uri.into(),
+                    source: "error sending request".into(),
+                });
+            }
             self.inner.put_atomic(uri, bytes).await
         }
         async fn put_overwrite(&self, uri: &str, bytes: Bytes) -> Result<(), StorageError> {
@@ -17057,6 +17074,7 @@ mod tests {
         let storage = CountingMultipartStorage {
             inner: LocalFsStorageProvider::new(dir.path()).expect("provider"),
             multiparts: AtomicUsize::new(0),
+            drops_puts_of_stored: false,
         };
         let bytes = Bytes::from(vec![
             7u8;
@@ -17070,6 +17088,42 @@ mod tests {
             .expect("second write");
         assert_eq!(first.uri, second.uri);
         assert_eq!(storage.multiparts.load(Ordering::SeqCst), 1);
+    }
+
+    /// Writing a content-addressed object that is already stored succeeds
+    /// when the store drops the connection instead of answering that the
+    /// object exists. A dropped PUT of an object that is not stored fails.
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_put_of_a_stored_content_addressed_object_succeeds() {
+        let dir = TempDir::new().expect("tempdir");
+        let storage = CountingMultipartStorage {
+            inner: LocalFsStorageProvider::new(dir.path()).expect("provider"),
+            multiparts: AtomicUsize::new(0),
+            drops_puts_of_stored: true,
+        };
+        let bytes = Bytes::from_static(b"bytes");
+        let first = put_content_addressed(&storage, |hash| format!("small/{hash}"), bytes.clone())
+            .await
+            .expect("first write");
+        let second = put_content_addressed(&storage, |hash| format!("small/{hash}"), bytes)
+            .await
+            .expect("second write");
+        assert_eq!(first.uri, second.uri);
+
+        // Another object's bytes sit under the name, so the object is not
+        // stored and the failure stands.
+        let other = Bytes::from_static(b"longer bytes");
+        let name = part_mod::ContentHash::of(&other);
+        storage
+            .inner
+            .put_overwrite(&format!("small/{name}"), Bytes::from_static(b"short"))
+            .await
+            .expect("other bytes");
+        let failed = put_content_addressed(&storage, |hash| format!("small/{hash}"), other).await;
+        assert!(matches!(
+            failed,
+            Err(StorageError::TransientExhausted { .. })
+        ));
     }
 
     #[test]

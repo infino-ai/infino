@@ -66,7 +66,7 @@ use crate::{
             deleted_stats::DeletedStatsCache,
             fts::GlobalIdfCache,
             scalar_cache::DecodedScalarCache,
-            sql::{SqlSchemas, build_sql_schemas},
+            sql::{SessionTemplate, SqlSchemas, build_sql_schemas},
             value_count_carry::ValueCountCarry,
         },
         reader_cache::{
@@ -184,6 +184,10 @@ pub(super) struct SupertableInner {
     /// `query_sql` the `Arc::ptr_eq` check fails and the cache
     /// is rebuilt against the fresh snapshot.
     pub(super) sql_session_cache: Mutex<Option<(Arc<ManifestSnapshot>, SessionContext)>>,
+    /// The session every SQL context of this table's readers starts from,
+    /// built once and copied per context: the same [`SessionTemplate`] a
+    /// catalog connection plans its statements in.
+    pub(super) sql_session_template: SessionTemplate,
     /// Deterministic scalar SQL logical plans keyed by statement text and
     /// manifest identity. Physical plans are intentionally rebuilt so fresh
     /// tombstone overlays and query-stable functions retain their semantics.
@@ -342,14 +346,18 @@ impl SupertableInner {
     /// The table's cached SQL schemas, built once from the immutable options.
     /// Cheap `Arc` clone on every call after the first.
     pub(super) fn sql_schemas(&self) -> Arc<SqlSchemas> {
-        let manifest = self.manifest.load();
+        self.sql_schemas_of(&self.manifest.load())
+    }
+
+    /// The SQL schemas of `manifest`, a snapshot of this table, cached by its schema id.
+    pub(super) fn sql_schemas_of(&self, manifest: &ManifestSnapshot) -> Arc<SqlSchemas> {
         let schema_id = manifest.table_schema().schema_id();
         if let Some(cached) = self.sql_schemas.load().as_ref()
             && cached.0 == schema_id
         {
             return Arc::clone(&cached.1);
         }
-        let built = Arc::new(build_sql_schemas(&manifest));
+        let built = Arc::new(build_sql_schemas(manifest));
         self.sql_schemas
             .store(Some(Arc::new((schema_id, Arc::clone(&built)))));
         built
@@ -2325,6 +2333,7 @@ async fn build_handle(
         tier_policy: crate::supertable::query::tier::TierPolicy::new(),
         id_generator: Mutex::new(id_generator),
         sql_session_cache: Mutex::new(None),
+        sql_session_template: SessionTemplate::default(),
         sql_logical_plan_cache: Mutex::new(None),
         decoded_scalar_cache: DecodedScalarCache::default(),
         value_count_carry: Arc::default(),
@@ -2672,6 +2681,14 @@ impl WeakReader {
             self.op_stats.clone(),
         )))
     }
+
+    /// This handle over `manifest`, another snapshot of the same table.
+    pub(crate) fn over(&self, manifest: Arc<ManifestSnapshot>) -> Self {
+        Self {
+            manifest,
+            ..self.clone()
+        }
+    }
 }
 
 impl SupertableReader {
@@ -2892,6 +2909,12 @@ impl SupertableReader {
         self.inner.sql_schemas()
     }
 
+    /// The SQL schemas of this reader's pinned snapshot, which a later schema change leaves as
+    /// they were.
+    pub(crate) fn snapshot_sql_schemas(&self) -> Arc<SqlSchemas> {
+        self.inner.sql_schemas_of(&self.manifest)
+    }
+
     /// The table's value counts carried across snapshots, shared by every
     /// provider built over this table.
     pub(crate) fn value_count_carry(&self) -> Arc<ValueCountCarry> {
@@ -2910,6 +2933,12 @@ impl SupertableReader {
         &self,
     ) -> &Mutex<Option<(Arc<ManifestSnapshot>, SessionContext)>> {
         &self.inner.sql_session_cache
+    }
+
+    /// The session this reader's SQL contexts are copied from, shared by
+    /// every reader of the table.
+    pub(crate) fn sql_session_template(&self) -> &SessionTemplate {
+        &self.inner.sql_session_template
     }
 
     /// Cached deterministic scalar SQL plans for this reader's manifest.

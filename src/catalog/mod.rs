@@ -160,7 +160,7 @@ use crate::{
         query::{
             covered_agg::prepare_aggregate_inputs,
             exec::common::{collect_plan_metered, run_within_process_limit},
-            sql::sql_session_context,
+            sql::{KeptTables, SessionTemplate, StatementPlans},
         },
         reader_cache::{DiskCacheConfig, DiskCacheError, DiskCacheStore},
         schema::{ColumnIndex, TableSchema, change::SchemaPatch, error::SchemaError},
@@ -262,6 +262,8 @@ pub fn connect_with(
             .unwrap_or(DEFAULT_CONNECTION_BUDGET_BYTES),
     );
 
+    let statement_plans = StatementPlans::new(&connection_memory_budget);
+
     // An in-memory catalog has no disk cache, so its SQL spills where it
     // always did.
     let sql_spill = options
@@ -277,6 +279,8 @@ pub fn connect_with(
             options,
             store,
             connection_memory_budget,
+            sql_session_template: SessionTemplate::default(),
+            statement_plans,
             sql_spill,
             usage_meter,
             gcs_credential,
@@ -305,6 +309,7 @@ fn connect_remote(backend: Backend, options: ConnectOptions) -> Result<Connectio
             .connection_memory_budget_bytes
             .unwrap_or(DEFAULT_CONNECTION_BUDGET_BYTES),
     );
+    let statement_plans = StatementPlans::new(&connection_memory_budget);
     debug!(backend = ?backend, "catalog connected (remote)");
     Ok(Connection {
         inner: Arc::new(ConnectionInner {
@@ -312,6 +317,8 @@ fn connect_remote(backend: Backend, options: ConnectOptions) -> Result<Connectio
             options,
             store: CatalogStore::Remote(Arc::new(remote)),
             connection_memory_budget,
+            sql_session_template: SessionTemplate::default(),
+            statement_plans,
             sql_spill: None,
             usage_meter: UsageMeter::new(),
             gcs_credential: None,
@@ -345,9 +352,15 @@ struct ConnectionInner {
     /// (cloned `Arc`) into every table's `SupertableOptions`. See
     /// [`crate::memory`].
     connection_memory_budget: Arc<ConnectionMemoryBudget>,
+    /// The parsed plans of statements run on this connection, by their text,
+    /// held against `connection_memory_budget` (see [`StatementPlans`]).
+    statement_plans: Arc<StatementPlans>,
     /// Where the connection's SQL spills when it has a disk cache folder,
     /// shared into every table's `SupertableOptions`.
     sql_spill: Option<Arc<SqlSpill>>,
+    /// The session every statement on this connection plans in, built once
+    /// and copied per statement (see [`SessionTemplate`]).
+    sql_session_template: SessionTemplate,
     /// Sole object-store usage ledger for this connection (shared into every
     /// table provider). Benches and billing snapshot this meter.
     usage_meter: Arc<UsageMeter>,
@@ -1364,24 +1377,50 @@ impl Connection {
         // same constructor as a table reader's, so covered aggregates are
         // answered from manifest statistics here too. A session built from
         // our own budget config failing is ours, not the query's.
-        let ctx = sql_session_context(
-            &self.inner.connection_memory_budget,
-            self.inner.sql_spill.as_deref(),
-        )
-        .map_err(|e| InfinoError::Backend(e.to_string()).with_context("query_sql", None))?;
+        let ctx = self
+            .inner
+            .sql_session_template
+            .context(
+                &self.inner.connection_memory_budget,
+                self.inner.sql_spill.as_deref(),
+            )
+            .map_err(|e| InfinoError::Backend(e.to_string()).with_context("query_sql", None))?;
 
         // One snapshot of the session for parsing and table lookup; planning
         // takes a fresh one later, after the tables are registered.
         let state = ctx.state();
-        let statement =
-            read_only_statement(&state, sql).map_err(|e| e.with_context("query_sql", None))?;
-
-        // Resolve the relations the query names and register each that is a
-        // catalog table. Unknown names (CTEs, search TVFs, aliases) are
-        // skipped — the planner resolves those by other means or errors.
-        let refs = state
-            .resolve_table_references(&statement)
-            .map_err(|e| datafusion_planning_error(&e).with_context("query_sql", None))?;
+        // A statement this connection planned before is not parsed again: its
+        // kept plan names the catalog tables to register, and what the parse
+        // found about them (see `StatementPlans`).
+        let kept = self.inner.statement_plans.get(sql);
+        let (statement, refs, tables) = match &kept {
+            Some((tables, _)) => (None, Vec::new(), tables.clone()),
+            None => {
+                let statement = read_only_statement(&state, sql)
+                    .map_err(|e| e.with_context("query_sql", None))?;
+                // Resolve the relations the query names and register each that
+                // is a catalog table. Unknown names (CTEs, search TVFs, aliases)
+                // are skipped — the planner resolves those by other means or errors.
+                let refs = state
+                    .resolve_table_references(&statement)
+                    .map_err(|e| datafusion_planning_error(&e).with_context("query_sql", None))?;
+                // An introspection view is no catalog table. Opening its bare
+                // name would open (and count) a user table that shares it, such
+                // as one named `columns`; the block below registers what the
+                // views describe.
+                let names = refs
+                    .iter()
+                    .filter(|r| r.schema() != Some(INFORMATION_SCHEMA))
+                    .map(|r| r.table().to_string())
+                    .collect();
+                let tables = KeptTables {
+                    names,
+                    reads_data: reads_table_data(&statement),
+                    statistics: uses_statistics(&statement),
+                };
+                (Some(statement), refs, tables)
+            }
+        };
 
         // Caller-thread pickup, same as reader mint: the drive future may
         // poll on runtime threads where the scope's slot is invisible.
@@ -1391,21 +1430,15 @@ impl Connection {
         // only describes tables counts none.
         let table_reads = op_stats
             .as_ref()
-            .filter(|_| reads_table_data(&statement))
+            .filter(|_| tables.reads_data)
             .map(|stats| Arc::new(search_tvf::TableReads::new(Arc::clone(stats))));
 
-        let statistics = uses_statistics(&statement);
+        let statistics = tables.statistics;
         let mut seen = HashSet::new();
         let mut handles: Vec<SupertableHandle> = Vec::new();
-        for r in &refs {
-            // An introspection view is no catalog table. Opening its bare
-            // name would open (and count) a user table that shares it, such
-            // as one named `columns`; the block below registers what the
-            // views describe.
-            if r.schema() == Some(INFORMATION_SCHEMA) {
-                continue;
-            }
-            let name = r.table().to_string();
+        let mut registered: Vec<String> = Vec::new();
+        for name in &tables.names {
+            let name = name.clone();
             if !seen.insert(name.clone()) {
                 continue;
             }
@@ -1420,6 +1453,7 @@ impl Connection {
                     reads.record(self, &name);
                 }
                 handles.push(table);
+                registered.push(name);
             }
         }
 
@@ -1495,6 +1529,13 @@ impl Connection {
             || Some(Arc::clone(&self.inner.usage_meter)),
         );
         let collector = op_stats.clone();
+        let connection = self.clone();
+        let statement_text = sql.to_owned();
+        let kept_plan = kept.map(|(_, plan)| plan);
+        let kept_tables = KeptTables {
+            names: registered,
+            ..tables
+        };
         let statement = async move {
             // Plan on this runtime's 16 MiB workers, not the calling thread `block_on` polls on:
             // planner recursion depth must not hang on a stack the engine does not own. A panic
@@ -1513,15 +1554,39 @@ impl Connection {
                 // execution. It runs on the planned tree and catches what the statement does
                 // not show: `SELECT ... INTO` reads like a query and plans to a CREATE TABLE.
                 // Planning has no side effects; a refused statement has touched nothing.
-                let plan = planner_ctx
-                    .state()
-                    .statement_to_plan(statement)
-                    .await
-                    .map_err(|e| datafusion_planning_error(&e))?;
+                let bound = match kept_plan {
+                    Some(plan) => StatementPlans::bind(plan, &planner_ctx)
+                        .await
+                        .map_err(|e| datafusion_planning_error(&e))?,
+                    None => None,
+                };
+                let parsed = bound.is_none();
+                let plan = match bound {
+                    Some(plan) => plan,
+                    None => {
+                        // Not kept, or kept against a table that has changed
+                        // since: parsed from its text.
+                        let statement = match statement {
+                            Some(statement) => statement,
+                            None => read_only_statement(&planner_ctx.state(), &statement_text)?,
+                        };
+                        planner_ctx
+                            .state()
+                            .statement_to_plan(statement)
+                            .await
+                            .map_err(|e| datafusion_planning_error(&e))?
+                    }
+                };
 
                 read_only_sql_options()
                     .verify_plan(&plan)
                     .map_err(|e| InfinoError::Query(format!("{READ_ONLY_REFUSAL} ({e})")))?;
+                if parsed {
+                    connection
+                        .inner
+                        .statement_plans
+                        .keep(&statement_text, kept_tables, &plan);
+                }
 
                 // An aggregate's inputs are read before optimization (parts,
                 // deleted rows), so the rewrite can answer it from manifest
@@ -2532,7 +2597,7 @@ mod tests {
     use std::{
         fs,
         path::{Path, PathBuf},
-        sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc},
+        sync::{Arc, Mutex, MutexGuard, PoisonError, Weak, mpsc},
         thread,
         time::{Duration, Instant},
     };
@@ -2570,7 +2635,13 @@ mod tests {
                 rollups::MANIFEST_ROLLUPS_DIR,
                 summaries::MANIFEST_SUMMARIES_DIR,
             },
-            query::{provider::TABLE_NAME, sql::value_count_schema},
+            query::{
+                provider::TABLE_NAME,
+                sql::{
+                    STATEMENT_PLAN_MAX_BYTES, sql_session_context, statement_bytes,
+                    value_count_schema,
+                },
+            },
             wal::{
                 WalStore,
                 lease::DEFAULT_LEASE_DURATION,
@@ -5476,6 +5547,427 @@ mod tests {
         ))
     }
 
+    /// Statements share the connection's session template but never each
+    /// other's catalog: a statement sees the rows committed before it, and a
+    /// table dropped after one statement read it is gone for the next, not
+    /// left registered from the earlier one.
+    #[test]
+    fn each_statement_plans_in_a_catalog_of_its_own() {
+        let conn = connect("memory://").expect("connect");
+        let field = Field::new("tag", DataType::LargeUtf8, true);
+        let table = one_column_table(&conn, "tags", field.clone(), distinct_strings("a", 3));
+        one_column_table(&conn, "other", field, distinct_strings("b", 2));
+        let count = |sql: &str| -> i64 {
+            let batches = conn.query_sql(sql).expect("sql");
+            batches[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("count")
+                .value(0)
+        };
+        assert_eq!(count("SELECT COUNT(*) FROM tags"), 3);
+        table
+            .append(
+                &RecordBatch::try_new(table.schema(), vec![distinct_strings("c", 4)])
+                    .expect("batch"),
+            )
+            .expect("append");
+        assert_eq!(
+            count("SELECT COUNT(*) FROM tags"),
+            7,
+            "rows committed since"
+        );
+        assert_eq!(count("SELECT COUNT(*) FROM other"), 2);
+        conn.drop_table("tags", false).expect("drop");
+        assert!(
+            conn.query_sql("SELECT COUNT(*) FROM tags").is_err(),
+            "a dropped table is not left registered by an earlier statement"
+        );
+        assert_eq!(count("SELECT COUNT(*) FROM other"), 2);
+    }
+
+    /// A statement's scans register their object stores in the runtime every
+    /// statement shares; each is gone once its statement is, whether it
+    /// returned rows or failed. A store left registered would keep its
+    /// superfiles' bytes and its statement's collector alive for as long as
+    /// the connection.
+    #[test]
+    fn a_finished_statement_releases_its_object_stores() {
+        let conn = connect("memory://").expect("connect");
+        let field = Field::new("tag", DataType::LargeUtf8, true);
+        one_column_table(&conn, "tags", field, distinct_strings("a", 3));
+        let collector_of = |run: &dyn Fn()| {
+            let (collector, _) = with_op_stats(|| {
+                run();
+                Arc::downgrade(&op_stats::current().expect("a work stats scope"))
+            });
+            collector
+        };
+        let returned = collector_of(&|| {
+            conn.query_sql("SELECT tag FROM tags").expect("sql");
+        });
+        let failed = collector_of(&|| {
+            assert!(conn.query_sql("SELECT CAST(tag AS INT) FROM tags").is_err());
+        });
+        for (outcome, collector) in [("returned", returned), ("failed", failed)] {
+            assert!(
+                collector.upgrade().is_none(),
+                "a statement that {outcome} left its scan's store registered"
+            );
+        }
+    }
+
+    /// A connection builds its SQL session for its first statement, and the
+    /// statements after it plan in copies of that one build. A copy shares the
+    /// build's runtime, where a build makes a runtime of its own, and plans
+    /// with the same rules a build has; each copy has a catalog of its own.
+    #[test]
+    fn a_connection_builds_its_session_once_and_copies_it_per_statement() {
+        let conn = connect("memory://").expect("connect");
+        let field = Field::new("tag", DataType::LargeUtf8, true);
+        one_column_table(&conn, "tags", field, distinct_strings("a", 3));
+        let template = &conn.inner.sql_session_template;
+        assert!(
+            template.built().is_none(),
+            "no session is built before the first statement"
+        );
+        conn.query_sql("SELECT COUNT(*) FROM tags")
+            .expect("first statement");
+        let runtime = Arc::clone(
+            template
+                .built()
+                .expect("the first statement builds the connection's session")
+                .runtime_env(),
+        );
+
+        let budget = &conn.inner.connection_memory_budget;
+        let spill = conn.inner.sql_spill.as_deref();
+        let statement = || template.context(budget, spill).expect("context").state();
+        let (first, second) = (statement(), statement());
+        let built = sql_session_context(budget, spill).expect("build").state();
+        assert!(
+            !Arc::ptr_eq(built.runtime_env(), &runtime),
+            "a build makes a runtime of its own"
+        );
+        let rules = |state: &SessionState| {
+            let logical: Vec<String> = state
+                .optimizer()
+                .rules
+                .iter()
+                .map(|rule| rule.name().to_owned())
+                .collect();
+            let physical: Vec<String> = state
+                .physical_optimizers()
+                .iter()
+                .map(|rule| rule.name().to_owned())
+                .collect();
+            (logical, physical)
+        };
+        for copy in [&first, &second] {
+            assert!(
+                Arc::ptr_eq(copy.runtime_env(), &runtime),
+                "a statement plans in a copy of the connection's session, not a build of its own"
+            );
+            assert_eq!(
+                rules(copy),
+                rules(&built),
+                "a copy plans with a build's rules"
+            );
+        }
+        assert!(
+            !Arc::ptr_eq(first.catalog_list(), second.catalog_list()),
+            "each statement has a catalog of its own"
+        );
+    }
+
+    /// One `Int64` cell, the first column of the first row `sql` returns.
+    fn one_count(conn: &Connection, sql: &str) -> i64 {
+        let batches = conn.query_sql(sql).expect("sql");
+        batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("count")
+            .value(0)
+    }
+
+    /// A statement run again plans from its kept parse, and answers as a
+    /// fresh parse would: on the rows committed since, through a subquery's
+    /// table too, with a column added since (`*` read again against the new
+    /// schema), and with an error once its table is dropped.
+    #[test]
+    fn a_statement_run_again_answers_as_parsed_afresh() {
+        let conn = connect("memory://").expect("connect");
+        let field = Field::new("tag", DataType::LargeUtf8, true);
+        let tags = one_column_table(&conn, "tags", field.clone(), distinct_strings("a", 3));
+        let picks = one_column_table(&conn, "picks", field, distinct_strings("a", 1));
+        let count = "SELECT COUNT(*) FROM tags";
+        let picked = "SELECT COUNT(*) FROM tags WHERE tag IN (SELECT tag FROM picks)";
+        assert_eq!(one_count(&conn, count), 3);
+        assert_eq!(one_count(&conn, picked), 1);
+        tags.append(
+            &RecordBatch::try_new(tags.schema(), vec![distinct_strings("c", 4)]).expect("batch"),
+        )
+        .expect("append");
+        picks
+            .append(
+                &RecordBatch::try_new(picks.schema(), vec![distinct_strings("c", 2)])
+                    .expect("batch"),
+            )
+            .expect("append");
+        assert_eq!(one_count(&conn, count), 7, "rows committed since");
+        assert_eq!(
+            one_count(&conn, picked),
+            3,
+            "the subquery's rows committed since"
+        );
+
+        let every = "SELECT * FROM tags";
+        let columns = conn.query_sql(every).expect("sql")[0].num_columns();
+        conn.apply_schema(
+            "tags",
+            &SchemaPatch::new(vec![
+                FieldPatch::named("note").with_type(DataType::LargeUtf8),
+            ]),
+            None,
+        )
+        .expect("add a column");
+        assert_eq!(
+            conn.query_sql(every).expect("sql")[0].num_columns(),
+            columns + 1,
+            "a column added since"
+        );
+
+        conn.drop_table("tags", false).expect("drop");
+        assert!(conn.query_sql(count).is_err(), "a dropped table");
+        assert_eq!(one_count(&conn, "SELECT COUNT(*) FROM picks"), 3);
+    }
+
+    /// The plan `conn` keeps for `sql`, bound by [`StatementPlans::bind`] in a
+    /// fresh session holding the catalog tables `tables`, with that session.
+    fn bind_kept(
+        conn: &Connection,
+        sql: &str,
+        tables: &[&str],
+    ) -> (SessionContext, Option<LogicalPlan>) {
+        let ctx = sql_session_context(
+            &conn.inner.connection_memory_budget,
+            conn.inner.sql_spill.as_deref(),
+        )
+        .expect("session");
+        for name in tables {
+            conn.open_and_register(&ctx, name, true)
+                .expect("register")
+                .expect("a catalog table");
+        }
+        let (_, plan) = conn.inner.statement_plans.get(sql).expect("kept");
+        let bound = bridge_on_runtime(StatementPlans::bind(plan, &ctx), &shared_io_runtime())
+            .expect("bind");
+        (ctx, bound)
+    }
+
+    /// A statement over catalog tables is kept, and its plan binds to the
+    /// tables a later run registers and reads their rows committed since. A
+    /// table not registered, or whose schema has changed since, sends the
+    /// statement back to parsing; a search function's statement is not kept.
+    #[test]
+    fn a_kept_statement_binds_only_to_its_unchanged_tables() {
+        let conn = connect("memory://").expect("connect");
+        let field = Field::new("tag", DataType::LargeUtf8, true);
+        let tags = one_column_table(&conn, "tags", field, distinct_strings("a", 3));
+        let every = "SELECT tag FROM tags";
+        assert_eq!(n_rows(&conn.query_sql(every).expect("sql")), 3);
+        let (tables, _) = conn.inner.statement_plans.get(every).expect("kept");
+        assert_eq!(tables.names, ["tags"]);
+        assert!(tables.reads_data, "a query reads its table's rows");
+
+        tags.append(
+            &RecordBatch::try_new(tags.schema(), vec![distinct_strings("c", 4)]).expect("batch"),
+        )
+        .expect("append");
+        let (ctx, bound) = bind_kept(&conn, every, &["tags"]);
+        let bound = bound.expect("an unchanged table binds");
+        let rows = bridge_on_runtime(
+            async { ctx.execute_logical_plan(bound).await?.collect().await },
+            &shared_io_runtime(),
+        )
+        .expect("execute");
+        assert_eq!(n_rows(&rows), 7, "the rows committed since");
+
+        assert!(
+            bind_kept(&conn, every, &[]).1.is_none(),
+            "a table not registered"
+        );
+        conn.apply_schema(
+            "tags",
+            &SchemaPatch::new(vec![
+                FieldPatch::named("note").with_type(DataType::LargeUtf8),
+            ]),
+            None,
+        )
+        .expect("add a column");
+        assert!(
+            bind_kept(&conn, every, &["tags"]).1.is_none(),
+            "a schema changed since"
+        );
+
+        conn.create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create docs")
+            .append(&build_title_batch(&["the quick brown fox", "a lazy dog"]))
+            .expect("append");
+        let search = "SELECT _id FROM bm25_search('docs', 'title', 'fox', 10)";
+        assert_eq!(n_rows(&conn.query_sql(search).expect("search")), 1);
+        assert!(
+            conn.inner.statement_plans.get(search).is_none(),
+            "a search function's statement"
+        );
+    }
+
+    /// A kept statement whose column has changed type since is parsed again:
+    /// its kept plan does not bind, and the statement answers in the new type.
+    #[test]
+    fn a_statement_over_a_retyped_column_is_parsed_again() {
+        let (conn, _dir) = storage_conn();
+        let digits = LargeStringArray::from(vec![Some("1"), Some("2"), Some("3")]);
+        one_column_table(
+            &conn,
+            "codes",
+            Field::new("code", DataType::LargeUtf8, true),
+            Arc::new(digits),
+        );
+        let every = "SELECT code FROM codes";
+        let before = conn.query_sql(every).expect("sql");
+        assert_eq!(
+            before[0].schema().field(0).data_type(),
+            &DataType::LargeUtf8
+        );
+        assert!(conn.inner.statement_plans.get(every).is_some(), "kept");
+
+        conn.apply_schema(
+            "codes",
+            &SchemaPatch::new(vec![FieldPatch::named("code").with_type(DataType::Int64)]),
+            None,
+        )
+        .expect("retype");
+        assert!(
+            bind_kept(&conn, every, &["codes"]).1.is_none(),
+            "a column retyped since"
+        );
+        let after = conn.query_sql(every).expect("sql");
+        assert_eq!(
+            after[0].schema().field(0).data_type(),
+            &DataType::Int64,
+            "the column's new type"
+        );
+        assert_eq!(n_rows(&after), 3);
+    }
+
+    /// The plan `sql` parses to over the catalog tables `tables`, before any
+    /// optimization, as `query_sql` parses it before keeping it.
+    fn parsed(conn: &Connection, sql: &str, tables: &[&str]) -> LogicalPlan {
+        let ctx = sql_session_context(
+            &conn.inner.connection_memory_budget,
+            conn.inner.sql_spill.as_deref(),
+        )
+        .expect("session");
+        for name in tables {
+            conn.open_and_register(&ctx, name, true)
+                .expect("register")
+                .expect("a catalog table");
+        }
+        bridge_on_runtime(
+            async { ctx.state().create_logical_plan(sql).await },
+            &shared_io_runtime(),
+        )
+        .expect("parse")
+    }
+
+    /// Kept statements are bounded by bytes. Past the bound the least
+    /// recently run one goes; each one's bytes are held against the
+    /// connection's budget and given back when it goes; a budget that needs
+    /// the room takes every one back; none is kept past the budget's share;
+    /// and a statement past the most one may hold is not kept.
+    #[test]
+    fn kept_statements_are_bounded_by_bytes_and_held_against_the_budget() {
+        let conn = connect("memory://").expect("connect");
+        one_column_table(
+            &conn,
+            "tags",
+            Field::new("tag", DataType::LargeUtf8, true),
+            distinct_strings("a", 3),
+        );
+        let sqls: Vec<String> = (0..3)
+            .map(|i| format!("SELECT tag FROM tags WHERE tag = 'a{i}'"))
+            .collect();
+        let plans: Vec<LogicalPlan> = sqls
+            .iter()
+            .map(|sql| parsed(&conn, sql, &["tags"]))
+            .collect();
+        let tables = KeptTables {
+            names: vec!["tags".to_string()],
+            reads_data: true,
+            statistics: true,
+        };
+        let bytes: Vec<usize> = sqls
+            .iter()
+            .zip(&plans)
+            .map(|(sql, plan)| statement_bytes(sql, &tables.names, plan))
+            .collect();
+        assert!(
+            bytes.iter().all(|b| *b == bytes[0]),
+            "statements of one shape hold the same bytes: {bytes:?}"
+        );
+        let one = bytes[0];
+
+        // Room for two: the third pushes out the least recently run.
+        let budget = ConnectionMemoryBudget::measured();
+        let kept = StatementPlans::with_max_bytes(&budget, 2 * one + one / 2);
+        kept.keep(&sqls[0], tables.clone(), &plans[0]);
+        kept.keep(&sqls[1], tables.clone(), &plans[1]);
+        assert_eq!(budget.used(), 2 * one, "each kept statement's bytes held");
+        assert!(
+            kept.get(&sqls[0]).is_some(),
+            "run again, so the most recent"
+        );
+        kept.keep(&sqls[2], tables.clone(), &plans[2]);
+        assert!(kept.get(&sqls[0]).is_some(), "the recently run one stays");
+        assert!(kept.get(&sqls[1]).is_none(), "the least recently run goes");
+        assert!(kept.get(&sqls[2]).is_some(), "the new one is kept");
+        assert_eq!(budget.used(), 2 * one, "the dropped one's bytes given back");
+
+        // A reservation the budget has no room for takes the kept ones back.
+        let budget = ConnectionMemoryBudget::with_limit(u64::try_from(100 * one).expect("u64"));
+        let limit = budget.remaining().expect("bounded");
+        let kept = StatementPlans::with_max_bytes(&budget, usize::MAX);
+        kept.keep(&sqls[0], tables.clone(), &plans[0]);
+        assert_eq!(kept.len(), 1);
+        let _query = budget
+            .try_reserve(limit - one / 2)
+            .expect("the kept statement gives its room back");
+        assert_eq!(kept.len(), 0, "every kept statement given back");
+
+        // A tenth of this budget is less than one statement: none is kept.
+        let budget = ConnectionMemoryBudget::with_limit(u64::try_from(5 * one).expect("u64"));
+        let kept = StatementPlans::with_max_bytes(&budget, usize::MAX);
+        kept.keep(&sqls[0], tables.clone(), &plans[0]);
+        assert_eq!(kept.len(), 0, "past the budget's share");
+        assert_eq!(budget.used(), 0);
+
+        // A long `IN` list is parsed each time it runs.
+        let values: Vec<String> = (0..20_000).map(|i| format!("'v{i}'")).collect();
+        let long = format!("SELECT tag FROM tags WHERE tag IN ({})", values.join(", "));
+        assert!(
+            statement_bytes(&long, &tables.names, &parsed(&conn, &long, &["tags"]))
+                > STATEMENT_PLAN_MAX_BYTES
+        );
+        assert_eq!(n_rows(&conn.query_sql(&long).expect("sql")), 0);
+        assert!(
+            conn.inner.statement_plans.get(&long).is_none(),
+            "past the most one statement may hold"
+        );
+    }
+
     /// A table's value counts are its `GROUP BY` counts, merged across superfiles.
     #[test]
     fn value_counts_match_the_grouped_count() {
@@ -8247,6 +8739,12 @@ mod tests {
             self.lock().iter().for_each(|s| s.hold_reads());
         }
 
+        /// Hold the reads of the tables' stores built so far (every store but
+        /// the catalog root's), until [`Self::release_reads`].
+        fn hold_table_reads(&self) {
+            self.lock().iter().skip(1).for_each(|s| s.hold_reads());
+        }
+
         fn release_reads(&self) {
             *self.held_on_new() = None;
             self.lock().iter().for_each(|s| s.release_reads());
@@ -8458,12 +8956,16 @@ mod tests {
         let budget = Arc::clone(&conn.inner.connection_memory_budget);
         let cancel = QueryCancel::new();
 
+        // The statement's parsed plan, kept by the connection, holds bytes
+        // of the budget too; the query's own memory is what is past them.
+        let kept = || conn.inner.statement_plans.bytes();
+
         let running = query_in_background(&conn, SORT_EVERY_FILE, &cancel);
         wait_until("execution reads data and holds sort memory", || {
-            stores.reads_of(SUPERFILE) > 0 && budget.used() > 0
+            stores.reads_of(SUPERFILE) > 0 && budget.used() > kept()
         });
         cancel_and_expect_cancelled(&cancel, &running);
-        wait_until("the sort memory comes back", || budget.used() == 0);
+        wait_until("the sort memory comes back", || budget.used() == kept());
         assert_cache_ledger_settles(&conn, &stores);
     }
 
@@ -8569,6 +9071,104 @@ mod tests {
             .expect("query after the cancel");
         assert_eq!(fox_count(&rows), 1);
         assert_eq!(stores.built(), 2, "the cancelled open built docs");
+    }
+
+    /// Run `sql` on its own thread under `cancel` and its own work-stats scope,
+    /// and hand back the result with a weak handle on the scope's collector. A
+    /// statement's scans register stores that hold its collector, so the
+    /// collector is freed only once those stores are removed.
+    fn query_in_background_with_collector(
+        conn: &Connection,
+        sql: &str,
+        cancel: &QueryCancel,
+    ) -> mpsc::Receiver<(
+        Result<Vec<RecordBatch>, InfinoError>,
+        Weak<OpStatsCollector>,
+    )> {
+        let (sent, received) = mpsc::channel();
+        let conn = conn.clone();
+        let cancel = cancel.clone();
+        let sql = sql.to_owned();
+        thread::spawn(move || {
+            let (sent_back, _) = with_op_stats(|| {
+                let collector = Arc::downgrade(&op_stats::current().expect("a work stats scope"));
+                (conn.query_sql_cancellable(&sql, &cancel), collector)
+            });
+            let _ = sent.send(sent_back);
+        });
+        received
+    }
+
+    /// Two statements on one connection at once, each reading its own table,
+    /// share the connection's session template: both answer in full, and
+    /// each one's object stores are gone once it is.
+    ///
+    /// Setup: both tables are open and their stores' reads are held, so each
+    /// statement stops at its first read of its table; the reads are let go
+    /// only once both have started one, so both are in flight together.
+    #[test]
+    fn two_statements_at_once_each_answer_and_release_their_stores() {
+        let (conn, dir) = storage_conn();
+        write_fox_table(&conn, "docs", 3, 1);
+        write_fox_table(&conn, "more", 5, 1);
+        let cache = tempfile::tempdir().expect("cache dir");
+        let (conn, stores) = slow_cold_conn(dir.path(), cache.path());
+        conn.open_table_handle("docs").expect("open docs");
+        conn.open_table_handle("more").expect("open more");
+        // Providers are built in order: the catalog root, `docs`, `more`.
+        assert_eq!(stores.built(), 3);
+        let (docs_reads, more_reads) = (stores.reads_on(1), stores.reads_on(2));
+
+        stores.hold_table_reads();
+        let docs = query_in_background_with_collector(
+            &conn,
+            "SELECT count(title) FROM docs WHERE title LIKE '%fox%'",
+            &QueryCancel::new(),
+        );
+        let more = query_in_background_with_collector(
+            &conn,
+            "SELECT count(title) FROM more WHERE title LIKE '%fox%'",
+            &QueryCancel::new(),
+        );
+        wait_until("both statements read their table", || {
+            stores.reads_on(1) > docs_reads && stores.reads_on(2) > more_reads
+        });
+        stores.release_reads();
+
+        for (name, running, files) in [("docs", docs, 3), ("more", more, 5)] {
+            let (result, collector) = running
+                .recv_timeout(QUERY_DEADLINE)
+                .expect("the statement returns");
+            assert_eq!(fox_count(&result.expect(name)), files, "{name}");
+            wait_until(&format!("{name}'s stores are removed"), || {
+                collector.upgrade().is_none()
+            });
+        }
+    }
+
+    /// A statement cancelled while it plans, with its planning reads still
+    /// under way, leaves no object store registered once it and its planning
+    /// have stopped.
+    #[test]
+    fn a_statement_cancelled_while_planning_releases_its_object_stores() {
+        let dir = many_file_table();
+        let cache = tempfile::tempdir().expect("cache dir");
+        let (conn, stores) = slow_cold_conn(dir.path(), cache.path());
+        let cancel = QueryCancel::new();
+
+        let running = query_in_background_with_collector(&conn, READ_EVERY_FILE, &cancel);
+        wait_until("planning reads a sidecar", || stores.reads_of(SIDECAR) > 0);
+        cancel.cancel();
+        let (result, collector) = running
+            .recv_timeout(CANCEL_RETURN_BOUND)
+            .expect("the cancelled statement returns");
+        assert!(
+            matches!(result, Err(InfinoError::Cancelled(_))),
+            "got {result:?}"
+        );
+        wait_until("the cancelled statement's stores are removed", || {
+            collector.upgrade().is_none()
+        });
     }
 
     /// The bounded-staleness window the freshness tests run under: short, so

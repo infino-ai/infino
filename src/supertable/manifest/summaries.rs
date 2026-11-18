@@ -66,11 +66,18 @@ use arrow::{
 };
 use arrow_array::{
     Array, ArrayRef, BinaryArray, ListArray, RecordBatch, StructArray, UInt32Array, UInt64Array,
-    new_null_array,
+    cast::AsArray, new_null_array, types::UInt64Type,
 };
-use arrow_schema::{DataType, Field, Fields, Schema};
+use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef};
 use bytes::Bytes;
-use datafusion::scalar::ScalarValue;
+use datafusion::{
+    logical_expr::type_coercion::binary::comparison_coercion,
+    physical_expr::{
+        PhysicalExpr,
+        expressions::{InListExpr, col},
+    },
+    scalar::ScalarValue,
+};
 use thiserror::Error;
 use tracing::warn;
 use uuid::Uuid;
@@ -302,6 +309,66 @@ impl ColumnRow<'_> {
     }
 }
 
+/// `=` and `IN` literals cast once to a column's type, as SQL's own `IN` set test: built per
+/// statement, read per file by [`ColumnStats::literal_count`].
+pub(crate) struct ExactLiterals {
+    in_set: InListExpr,
+    /// The one column `in_set` reads: a table's values.
+    schema: SchemaRef,
+    column_type: DataType,
+}
+
+impl ExactLiterals {
+    /// `None` when SQL would compare a literal by casting the column (a number against a string
+    /// column), or when no literal is left after dropping nulls, which `=` never matches.
+    pub(crate) fn new(literals: &[ScalarValue], column_type: &DataType) -> Option<Self> {
+        let mut values = Vec::with_capacity(literals.len());
+        for literal in literals {
+            if !compares_as_column(column_type, &literal.data_type()) {
+                return None;
+            }
+            let cast = literal.cast_to(column_type).ok()?;
+            if !cast.is_null() {
+                values.push(cast);
+            }
+        }
+        if values.is_empty() {
+            return None;
+        }
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            VALUE_FIELD,
+            column_type.clone(),
+            false,
+        )]));
+        let array = ScalarValue::iter_to_array(values).ok()?;
+        let in_set =
+            InListExpr::try_new_from_array(col(VALUE_FIELD, &schema).ok()?, array, false, &schema)
+                .ok()?;
+        Some(Self {
+            in_set,
+            schema,
+            column_type: column_type.clone(),
+        })
+    }
+}
+
+/// Whether SQL compares `literal_type` with a `column_type` column as the column's own value.
+/// String literals arrive as `Utf8View`, and every string type compares by its bytes.
+fn compares_as_column(column_type: &DataType, literal_type: &DataType) -> bool {
+    match comparison_coercion(column_type, literal_type) {
+        Some(common) if &common == column_type => true,
+        Some(common) => is_string(&common) && is_string(column_type),
+        None => false,
+    }
+}
+
+fn is_string(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+    )
+}
+
 /// One column's statistics for one superfile, wherever they live, read
 /// one statistic at a time. Decoded statistics are borrowed; a section's
 /// are read from the decoded group's arrays. Only [`Self::value_counts`]
@@ -430,6 +497,38 @@ impl ColumnStats<'_> {
             Self::Inline(agg) => agg.value_counts.clone(),
             Self::Section(row) => row.value_counts(),
         }
+    }
+
+    /// The rows the exact value table counts for `literals`; `None` when the file has no table or
+    /// its table is in another type.
+    pub(crate) fn literal_count(&self, literals: &ExactLiterals) -> Option<u64> {
+        // A float table, should one appear, settles nothing: `=` on floats is not value identity.
+        if literals.column_type.is_floating() {
+            return None;
+        }
+        let table = self.value_table_array(&literals.column_type)?;
+        let table = table.as_struct_opt()?;
+        let counts = table.column(1).as_primitive_opt::<UInt64Type>()?;
+        // A file's own table is never empty and has no null or zero count; else keep the file.
+        if table.is_empty()
+            || table.column(0).null_count() > 0
+            || counts.null_count() > 0
+            || counts.values().contains(&0)
+        {
+            return None;
+        }
+        let values = Arc::clone(table.column(0));
+        let batch = RecordBatch::try_new(Arc::clone(&literals.schema), vec![values]).ok()?;
+        let hits = literals.in_set.evaluate(&batch).ok()?;
+        let hits = hits.into_array(batch.num_rows()).ok()?;
+        let mut held: u64 = 0;
+        for (hit, rows) in hits.as_boolean_opt()?.iter().zip(counts.values()) {
+            if hit == Some(true) {
+                // A sum past u64 is no real file's count, so the table settles nothing.
+                held = held.checked_add(*rows)?;
+            }
+        }
+        Some(held)
     }
 
     /// Every statistic, in the decoded shape.
@@ -2153,6 +2252,74 @@ mod tests {
         drop(section);
         assert!(cache.put(other_hash, Bytes::from(other)).await);
         assert!(!cache.contains(&hash), "evicted once no section reads it");
+    }
+
+    /// A section row of one `Int64` column whose value table holds `entries` as persisted,
+    /// without the checks a table built by the writer passes.
+    fn group_with_table(entries: &[(i64, u64)]) -> Group {
+        let values: ArrayRef = Arc::new(Int64Array::from_iter_values(
+            entries.iter().map(|(value, _)| *value),
+        ));
+        let counts: ArrayRef = Arc::new(UInt64Array::from_iter_values(
+            entries.iter().map(|(_, count)| *count),
+        ));
+        let item: ArrayRef = Arc::new(
+            StructArray::try_new(
+                value_table_fields(&DataType::Int64),
+                vec![values, counts],
+                None,
+            )
+            .expect("a value table item"),
+        );
+        let (_, list) =
+            value_table_list(&DataType::Int64, &[item], vec![entries.len()], vec![true])
+                .expect("a value table list");
+        let bound: ArrayRef = Arc::new(Int64Array::from(vec![0]));
+        Group {
+            superfile: UInt32Array::from(vec![0]),
+            min: Arc::clone(&bound),
+            max: bound,
+            null_count: UInt64Array::from(vec![0]),
+            sum: None,
+            hll: None,
+            value_counts: Some(list.as_list::<i32>().clone()),
+        }
+    }
+
+    /// The rows a section's table of `entries` counts for `IN (literals)`.
+    fn persisted_literal_count(entries: &[(i64, u64)], literals: &[i64]) -> Option<u64> {
+        let group = group_with_table(entries);
+        let stats = ColumnStats::Section(ColumnRow {
+            group: &group,
+            index: 0,
+        });
+        let literals: Vec<ScalarValue> = literals
+            .iter()
+            .map(|value| ScalarValue::Int64(Some(*value)))
+            .collect();
+        let literals = ExactLiterals::new(&literals, &DataType::Int64).expect("int literals");
+        stats.literal_count(&literals)
+    }
+
+    #[test]
+    fn a_persisted_table_no_file_can_hold_settles_no_literal() {
+        // A section's table as stored, without the writer's checks:
+        //  - a zero count could prove a value absent from a file that holds it.
+        //  - so could counts whose sum overflows, which wraps to 0.
+        //  - a sound table still counts, and so does a sum that fits.
+        // This test pins that the first two settle nothing.
+        assert_eq!(persisted_literal_count(&[(1, 2), (2, 3)], &[1, 2]), Some(5));
+        assert_eq!(persisted_literal_count(&[(1, 2), (2, 3)], &[7]), Some(0));
+        assert_eq!(persisted_literal_count(&[(1, 0), (2, 3)], &[1]), None);
+        assert_eq!(
+            persisted_literal_count(&[(1, u64::MAX), (2, 1)], &[1, 2]),
+            None
+        );
+        assert_eq!(
+            persisted_literal_count(&[(1, u64::MAX), (2, 1)], &[1]),
+            Some(u64::MAX),
+            "a sum that fits is still counted"
+        );
     }
 
     /// A section whose counts promise more tables than it holds is refused
