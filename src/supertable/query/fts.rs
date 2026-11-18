@@ -2323,6 +2323,10 @@ impl SupertableReader {
                 if let Some(per_entry) = selection.merge_ns.checked_div(selection.entries_read) {
                     reader.note_tier_entry_cost(per_entry);
                 }
+                // A plan may be made twice, from the heads' reads and then
+                // from their probes, each from its own copies.
+                let (merged_ids, units_of, merger, span) =
+                    (merged_ids.clone(), units_of.clone(), Arc::clone(&merger), span.clone());
                 Box::new(move |remaining: dispatch::Units<UnitParams>| {
                     let bounds_of: HashMap<Uuid, tier::SuperfileBounds> =
                         merged_ids.iter().copied().zip(selection.bounds).collect();
@@ -2430,10 +2434,23 @@ impl SupertableReader {
                     }),
                 false => None,
             };
-            if let Some(selection) = by_heads {
-                let (keep, settled) = make_plan(selection)(units);
+            if let Some(chosen) = by_heads {
+                let (keep, settled) = make_plan(chosen.now)(units);
                 units = keep;
                 settled_before = settled;
+                // Probes run beside the opens, which go in bound order; what
+                // they settle replaces the plan for the units not yet opened.
+                if let Some(stage) = chosen.probes {
+                    replan = Some(Box::pin(async move {
+                        match stage.run().await {
+                            Ok(selection) => Some(make_plan(selection)),
+                            Err(e) => {
+                                unreadable(e);
+                                None
+                            }
+                        }
+                    }));
+                }
             } else {
                 let prepared = tier::prepare_merge(index, &query, &merge_kept, &global_idf, pool)
                     .await

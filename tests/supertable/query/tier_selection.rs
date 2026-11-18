@@ -1058,10 +1058,13 @@ fn probes_settle_candidates_the_heads_leave_open() {
             let (a, stats, _) = run(&with, "alpha beta", mode, k);
             let (b, _, _) = run(&without, "alpha beta", mode, k);
             assert_eq!(a, b, "{mode:?} k={k}: the probed answer is the ceilings'");
-            assert_eq!(
-                opened(&stats),
-                0,
-                "{mode:?} k={k}: probes settle it unopened"
+            // Probes run beside the opens: the first open window (one
+            // superfile here) is under way before they report, and they
+            // settle the rest unopened.
+            assert!(
+                opened(&stats) <= OPEN_WINDOW as u64,
+                "{mode:?} k={k}: probes settle all but the first window: {}",
+                opened(&stats)
             );
         }
     }
@@ -1132,6 +1135,10 @@ fn phrase_probes_settle_a_phrase_of_common_words() {
         let (b, _, _) = run(&without, "\"alpha beta\"", BoolMode::Or, k);
         assert!(!a.is_empty(), "k={k}: the phrase matches");
         assert_eq!(a, b, "k={k}: the probed answer is the ceilings'");
-        assert_eq!(opened(&stats), 0, "k={k}: phrase probes settle it unopened");
+        assert!(
+            opened(&stats) <= OPEN_WINDOW as u64,
+            "k={k}: phrase probes settle all but the first window: {}",
+            opened(&stats)
+        );
     }
 }

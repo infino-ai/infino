@@ -76,6 +76,9 @@ pub fn document(global: usize) -> String {
     text
 }
 
+/// Superfiles a test table opens at once, in bound order.
+pub const OPEN_WINDOW: usize = 1;
+
 pub fn table(dir: &TempDir, tiers: bool) -> Supertable {
     table_with(
         dir,
@@ -118,7 +121,7 @@ pub fn options_for(dir: &TempDir, build: Build) -> SupertableOptions {
     let mut options = SupertableOptions::new(schema(), vec![fts], vec![])
         .expect("options")
         .with_storage(storage)
-        .with_bound_ordered_open_window(1)
+        .with_bound_ordered_open_window(OPEN_WINDOW)
         .with_tier_merge_gate(build.gate);
     if !build.tiers {
         options = options.with_term_tier_entries_per_term(0);

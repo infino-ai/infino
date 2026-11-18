@@ -40,7 +40,6 @@
 //! as the ceilings are.
 
 use std::{
-    cmp::Ordering,
     collections::{BTreeMap, HashMap},
     sync::{Arc, LazyLock},
     time::Instant,
@@ -102,8 +101,6 @@ const LEN_BUCKETS: usize = 1 << u8::BITS;
 /// The largest term frequency a bound searches when a term's per-bucket
 /// maxima are unknown: past any tf a document of a length bucket holds.
 const TF_SEARCH_MAX: u32 = u32::MAX >> 1;
-/// Nanoseconds in a millisecond, for the selection's diagnostic timings.
-const NANOS_PER_MS: u64 = 1_000_000;
 
 /// The longest length each bucket holds: the quantizer keeps a length's
 /// top bits, so a bucket spans up to the next code's first length. A code
@@ -268,14 +265,14 @@ pub(crate) async fn available(
 /// when the heads cannot serve it: a phrase or a negation, a term with
 /// postings in a layer that has no level head, or a superfile the index
 /// does not list or whose average length is unknown.
-pub(crate) async fn select(
+pub(crate) async fn select<'a>(
     index: &TermIndex,
-    manifest: &ManifestSnapshot,
-    column: &str,
+    manifest: &'a ManifestSnapshot,
+    column: &'a str,
     query: &TierQuery<'_>,
-    kept: &[Arc<SuperfileEntry>],
+    kept: &'a [Arc<SuperfileEntry>],
     global_idf: &GlobalTermIdf,
-) -> Result<Option<TierSelection>, TermIndexError> {
+) -> Result<Option<Selected<'a>>, TermIndexError> {
     let started = Instant::now();
     let terms = query.terms;
     let nt = terms.len();
@@ -341,8 +338,6 @@ pub(crate) async fn select(
             .and_then(|id| slot_of.get(&id).copied())
     };
     let runs_per_term = index.runs_many(query.column, terms).await?;
-    let runs_ns = started.elapsed().as_nanos() as u64;
-    let mut levels_ns = 0u64;
     let mut heads: Vec<Head> = Vec::new();
     // Where each kept superfile's postings of each term sit, for probes.
     let mut postings: HashMap<(usize, usize), (DictEntry, u64)> = HashMap::new();
@@ -407,7 +402,6 @@ pub(crate) async fn select(
         false => 1.0 - nt as f32 * 2.0 * f32::EPSILON,
     };
     let mut fetched = 0u64;
-    let mut probes = 0u64;
     let mut theta;
     let mut bounds;
     // What the last round left: its threshold, the slots it left in play,
@@ -487,9 +481,7 @@ pub(crate) async fn select(
                 index.head_level(&object, &level).await
             }
         });
-        let levels_started = Instant::now();
         let levels = try_join_all(reads).await?;
-        levels_ns += levels_started.elapsed().as_nanos() as u64;
         for (&h, (blocks, bytes)) in wanted.iter().zip(levels) {
             fetched += bytes;
             let (t, base) = (heads[h].term, heads[h].base);
@@ -508,215 +500,219 @@ pub(crate) async fn select(
             }
         }
     }
-    let probe_started = Instant::now();
-    let mut probed_superfiles = 0usize;
-    let mut rulable_seen: Option<usize> = None;
-    let in_play_before_probes = bounds.iter().filter(|(_, ub)| *ub > theta).count();
-    // Probes: candidates whose bounds still reach above the threshold for a
-    // term or phrase not yet known for them have it read from the covering
-    // posting blocks only; their exact scores raise the threshold, under
-    // which the heads bound the unseen documents, and a superfile so
-    // settled is answered or ruled out without an open.
-    if !query.rows_scoped {
-        let rulable = rulable_by_probes(&slots, &heads, &candidates, &weights, &bounds, theta, k);
-        rulable_seen = rulable;
-        let mut plan = probe_plan(&slots, &heads, &candidates, &weights, &postings, theta);
-        // Probing a superfile is a few range reads before any open; it pays
-        // only where it can save at least as many opens as it probes
-        // superfiles. Measured on a 10B-row table, probes that could rule
-        // out none of the superfiles in play added thousands of reads to
-        // phrases and unions of common words, and every superfile opened.
-        if rulable.is_some_and(|n| n < plan.len()) {
-            plan.clear();
-        }
-        probed_superfiles = plan.len();
-        if !plan.is_empty() {
-            let weights = &weights;
-            let reads = plan.into_iter().map(|(s, probes)| {
-                let entry = &kept[s];
-                async move {
-                    let reader = open_fts(manifest, entry).await?;
-                    let fts = fts_of(&reader);
-                    let mut out = Vec::with_capacity(probes.len());
-                    for (kind, members, docs) in probes {
-                        let read = match kind {
-                            ProbeKind::Term(_) => {
-                                let (entry, df) = members[0];
-                                fts.probe_tfs(column, entry, df, &docs).await
-                            }
-                            ProbeKind::Phrase(ph) => {
-                                fts.probe_phrase_tfs(
-                                    column,
-                                    &members,
-                                    &weights.phrases[ph].offsets,
-                                    &docs,
-                                )
-                                .await
-                            }
-                        };
-                        let tfs = read.map_err(|e| TermIndexError::Open(QueryError::from(e)))?;
-                        out.push((kind, docs, tfs));
-                    }
-                    Ok::<_, TermIndexError>((s, out))
-                }
-            });
-            for (s, probed) in try_join_all(reads).await? {
-                probes += probed.len() as u64;
-                for (kind, docs, tfs) in probed {
-                    for (doc, tf) in docs.into_iter().zip(tfs) {
-                        let Some(c) = candidates.get_mut(&(s as u32, doc)) else {
-                            continue;
-                        };
-                        match kind {
-                            ProbeKind::Term(t) => {
-                                c.known |= 1 << t;
-                                c.tf[t] = tf;
-                                if tf > 0 && weights.scoring & (1 << t) != 0 {
-                                    c.contrib[t] = weights.contribution(t, tf, c.len);
-                                }
-                            }
-                            ProbeKind::Phrase(ph) => {
-                                let norm = weights.norm[usize::from(c.len)];
-                                c.phrases[ph] = Some(match tf {
-                                    0 => 0.0,
-                                    tf => score_with_dl_norm_k1(weights.phrases[ph].idf, tf, norm),
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-            (theta, bounds) = settle(&slots, &heads, &candidates, weights, k, lb_slack);
-        }
-    }
-    let probe_ns = probe_started.elapsed().as_nanos() as u64;
     // A scope that admits only some rows: the threshold over every row is
     // no floor for the admitted ones, and an answer would hold rows the
     // scope drops. Only the bounds stand.
     if query.rows_scoped {
         theta = f32::NEG_INFINITY;
     }
-    let theta_id_max = theta_id_max(&candidates, &slots, &weights, k, lb_slack, theta);
-    let mut resolved = match exact_scores && !query.rows_scoped {
-        true => resolve(&slots, &heads, &candidates, &weights, theta, theta_id_max),
-        false => Vec::new(),
+    let state = Selection {
+        manifest,
+        kept,
+        column,
+        slots,
+        heads,
+        candidates,
+        weights,
+        postings,
+        k,
+        lb_slack,
+        answers: exact_scores && !query.rows_scoped,
     };
-    // The heads name documents by each superfile's own id; its answers are
-    // its rows, read from the map pages the few documents fall in.
-    let mapped = resolved.iter().map(|(s, hits)| {
-        let entry = &kept[*s];
-        async move {
-            if hits.is_empty() {
-                return Ok(Vec::new());
+    let now = state
+        .finish(theta, bounds, fetched, entries_read, started, rounds)
+        .await?;
+    // Probes: candidates whose bounds still reach above the threshold for a
+    // term or phrase not yet known for them have it read from the covering
+    // posting blocks only; their exact scores raise the threshold, under
+    // which the heads bound the unseen documents, and a superfile so
+    // settled is answered or ruled out without an open. They run beside
+    // the opens, not before them: measured on a 10B-row table, probes of
+    // phrases and unions of common words ruled out nothing and, run first,
+    // added their reads to every such query.
+    let probes = match query.rows_scoped {
+        true => None,
+        false => {
+            let plan = probe_plan(
+                &state.slots,
+                &state.heads,
+                &state.candidates,
+                &state.weights,
+                &state.postings,
+                now.theta_lb,
+            );
+            (!plan.is_empty()).then_some(ProbeStage { state, plan })
+        }
+    };
+    Ok(Some(Selected { now, probes }))
+}
+
+/// What the level heads chose: the selection from their reads, and the
+/// probes that may tighten it, which the caller runs beside the opens.
+pub(crate) struct Selected<'a> {
+    /// The selection from the heads' reads alone.
+    pub(crate) now: TierSelection,
+    /// The candidates to probe, when any can still change the selection.
+    pub(crate) probes: Option<ProbeStage<'a>>,
+}
+
+/// A selection's state: what it read and what it was asked.
+struct Selection<'a> {
+    manifest: &'a ManifestSnapshot,
+    kept: &'a [Arc<SuperfileEntry>],
+    column: &'a str,
+    slots: Vec<Slot>,
+    heads: Vec<Head>,
+    candidates: HashMap<(u32, u32), Candidate>,
+    weights: Weights,
+    /// Where each kept superfile's postings of each term sit, for probes.
+    postings: HashMap<(usize, usize), (DictEntry, u64)>,
+    k: usize,
+    lb_slack: f32,
+    /// Whether the index may answer for a superfile: scores exact and
+    /// every row in scope.
+    answers: bool,
+}
+
+impl Selection<'_> {
+    /// The selection at `theta` and `bounds`: the superfiles the index
+    /// answers for, their rows read from the map pages they fall in.
+    async fn finish(
+        &self,
+        theta: f32,
+        bounds: Vec<(f32, f32)>,
+        tier_bytes: u64,
+        entries_read: u64,
+        started: Instant,
+        rounds: usize,
+    ) -> Result<TierSelection, TermIndexError> {
+        let (slots, heads, candidates, weights) =
+            (&self.slots, &self.heads, &self.candidates, &self.weights);
+        let theta_id_max = theta_id_max(candidates, slots, weights, self.k, self.lb_slack, theta);
+        let mut resolved = match self.answers {
+            true => resolve(slots, heads, candidates, weights, theta, theta_id_max),
+            false => Vec::new(),
+        };
+        // The heads name documents by each superfile's own id; its answers
+        // are its rows, read from the map pages the few documents fall in.
+        let mapped = resolved.iter().map(|(s, hits)| {
+            let entry = &self.kept[*s];
+            async move {
+                if hits.is_empty() {
+                    return Ok(Vec::new());
+                }
+                let reader = open_fts(self.manifest, entry).await?;
+                to_rows(fts_of(&reader), hits.iter().copied()).await
             }
-            let reader = open_fts(manifest, entry).await?;
-            to_rows(fts_of(&reader), hits.iter().copied()).await
+        });
+        let rows = try_join_all(mapped).await?;
+        for ((_, hits), rows) in resolved.iter_mut().zip(rows) {
+            *hits = rows;
         }
-    });
-    let rows_started = Instant::now();
-    let rows = try_join_all(mapped).await?;
-    for ((_, hits), rows) in resolved.iter_mut().zip(rows) {
-        *hits = rows;
+        let in_play = bounds.iter().filter(|(_, ub)| *ub > theta).count();
+        debug!(
+            slots = slots.len(),
+            in_play,
+            theta,
+            resolved = resolved.len(),
+            candidates = candidates.len(),
+            entries_read,
+            head_bytes = tier_bytes,
+            rounds,
+            total_ms = started.elapsed().as_millis() as u64,
+            "level heads selection"
+        );
+        Ok(TierSelection {
+            bounds: bounds
+                .into_iter()
+                .map(|(lb, ub)| SuperfileBounds { lb, ub })
+                .collect(),
+            theta_lb: theta,
+            theta_id_max,
+            resolved,
+            tier_bytes,
+            entries_read,
+            merge_ns: started.elapsed().as_nanos() as u64,
+        })
     }
-    // How far above the threshold the slots' bounds sit, as ratios: which of
-    // them a tie rule could still skip, and which bound drives each.
-    let mut over: Vec<f32> = bounds
-        .iter()
-        .map(|&(_, ub)| ub / theta)
-        .filter(|r| r.is_finite())
-        .collect();
-    over.sort_unstable_by(f32::total_cmp);
-    let pick = |q: usize| over.get(over.len().saturating_sub(1) * q / 100).copied();
-    let unseen_led = slots
-        .iter()
-        .zip(&bounds)
-        .filter(|(slot, (_, ub))| unseen_bound(slot, &heads, &weights) >= *ub)
-        .count();
-    // The slot with the largest bound, taken apart: its unseen bound, its
-    // best candidate's bound and known sum, and its head's frontier.
-    let top = bounds
-        .iter()
-        .enumerate()
-        .max_by(|a, b| a.1.1.total_cmp(&b.1.1))
-        .map(|(s, _)| s);
-    let (top_unseen, top_cand_bound, top_cand_sum, top_frontier, top_same_norms) = match top {
-        None => (f32::NAN, f32::NAN, f32::NAN, f32::NAN, false),
-        Some(s) => {
-            let slot = &slots[s];
-            let mine = candidates.iter().filter(|((cs, _), _)| *cs as usize == s);
-            let cand_bound = mine
-                .clone()
-                .map(|(_, c)| candidate_bound(slot, &heads, &weights, c))
-                .fold(f32::NEG_INFINITY, f32::max);
-            let cand_sum = mine.map(|(_, c)| c.sum()).fold(f32::NEG_INFINITY, f32::max);
-            let frontier = slot
-                .heads
-                .iter()
-                .flatten()
-                .map(|&h| heads[h].unread())
-                .fold(f32::NEG_INFINITY, f32::max);
-            (
-                unseen_bound(slot, &heads, &weights),
-                cand_bound,
-                cand_sum,
-                frontier,
-                slot.same_norms,
-            )
+}
+
+/// Probes of a selection's open candidates, run beside the opens: their
+/// selection replaces the heads' for the superfiles not yet opened.
+pub(crate) struct ProbeStage<'a> {
+    state: Selection<'a>,
+    plan: BTreeMap<usize, Vec<Probe>>,
+}
+
+impl ProbeStage<'_> {
+    /// Read the probes, fold what they found into the candidates, and
+    /// select again.
+    pub(crate) async fn run(self) -> Result<TierSelection, TermIndexError> {
+        let started = Instant::now();
+        let Self { mut state, plan } = self;
+        let (manifest, kept, column) = (state.manifest, state.kept, state.column);
+        let phrases = &state.weights.phrases;
+        let reads = plan.into_iter().map(|(s, probes)| {
+            let entry = &kept[s];
+            async move {
+                let reader = open_fts(manifest, entry).await?;
+                let fts = fts_of(&reader);
+                let mut out = Vec::with_capacity(probes.len());
+                for (kind, members, docs) in probes {
+                    let read = match kind {
+                        ProbeKind::Term(_) => {
+                            let (entry, df) = members[0];
+                            fts.probe_tfs(column, entry, df, &docs).await
+                        }
+                        ProbeKind::Phrase(ph) => {
+                            fts.probe_phrase_tfs(column, &members, &phrases[ph].offsets, &docs)
+                                .await
+                        }
+                    };
+                    let tfs = read.map_err(|e| TermIndexError::Open(QueryError::from(e)))?;
+                    out.push((kind, docs, tfs));
+                }
+                Ok::<_, TermIndexError>((s, out))
+            }
+        });
+        let mut probes = 0u64;
+        for (s, probed) in try_join_all(reads).await? {
+            probes += probed.len() as u64;
+            for (kind, docs, tfs) in probed {
+                for (doc, tf) in docs.into_iter().zip(tfs) {
+                    let Some(c) = state.candidates.get_mut(&(s as u32, doc)) else {
+                        continue;
+                    };
+                    let weights = &state.weights;
+                    match kind {
+                        ProbeKind::Term(t) => {
+                            c.known |= 1 << t;
+                            c.tf[t] = tf;
+                            if tf > 0 && weights.scoring & (1 << t) != 0 {
+                                c.contrib[t] = weights.contribution(t, tf, c.len);
+                            }
+                        }
+                        ProbeKind::Phrase(ph) => {
+                            let norm = weights.norm[usize::from(c.len)];
+                            c.phrases[ph] = Some(match tf {
+                                0 => 0.0,
+                                tf => score_with_dl_norm_k1(weights.phrases[ph].idf, tf, norm),
+                            });
+                        }
+                    }
+                }
+            }
         }
-    };
-    let (mut below, mut tied, mut above) = (0usize, 0usize, 0usize);
-    for &(_, ub) in &bounds {
-        match ub.total_cmp(&theta) {
-            Ordering::Less => below += 1,
-            Ordering::Equal => tied += 1,
-            Ordering::Greater => above += 1,
-        }
+        let (theta, bounds) = settle(
+            &state.slots,
+            &state.heads,
+            &state.candidates,
+            &state.weights,
+            state.k,
+            state.lb_slack,
+        );
+        state.finish(theta, bounds, 0, probes, started, 0).await
     }
-    debug!(
-        slots = slots.len(),
-        same_norms = slots.iter().filter(|s| s.same_norms).count(),
-        below,
-        tied,
-        above,
-        theta,
-        ub_over_theta_min = pick(0),
-        ub_over_theta_p50 = pick(50),
-        ub_over_theta_max = pick(100),
-        unseen_led,
-        top_unseen,
-        top_cand_bound,
-        top_cand_sum,
-        top_frontier,
-        top_same_norms,
-        resolved = resolved.len(),
-        candidates = candidates.len(),
-        entries_read,
-        head_bytes = fetched,
-        rounds,
-        probed_superfiles,
-        probes,
-        rulable = rulable_seen.map_or(-1, |n| n as i64),
-        in_play_before_probes,
-        in_play_after = above,
-        runs_ms = runs_ns / NANOS_PER_MS,
-        levels_ms = levels_ns / NANOS_PER_MS,
-        probe_ms = probe_ns / NANOS_PER_MS,
-        rows_ms = rows_started.elapsed().as_millis() as u64,
-        total_ms = started.elapsed().as_millis() as u64,
-        "level heads selection"
-    );
-    Ok(Some(TierSelection {
-        bounds: bounds
-            .into_iter()
-            .map(|(lb, ub)| SuperfileBounds { lb, ub })
-            .collect(),
-        theta_lb: theta,
-        theta_id_max,
-        resolved,
-        tier_bytes: fetched,
-        entries_read: entries_read + probes,
-        merge_ns: started.elapsed().as_nanos() as u64,
-    }))
 }
 
 /// What a round of head reads would cost and could save.
@@ -753,44 +749,6 @@ impl RoundPrice {
         (self.round_entries + self.candidates).saturating_mul(self.entry_cost_ns)
             <= self.in_play.saturating_mul(self.open_cost_ns)
     }
-}
-
-/// How many superfiles still in play probing could rule out; `None` when
-/// there is no threshold yet, which probes are what find. A probe learns a
-/// candidate's missing terms, which only raises the threshold to at most
-/// the `k`-th best candidate bound; a superfile whose unread documents
-/// bound above that stays in play whatever the probes find.
-fn rulable_by_probes(
-    slots: &[Slot],
-    heads: &[Head],
-    candidates: &HashMap<(u32, u32), Candidate>,
-    weights: &Weights,
-    bounds: &[(f32, f32)],
-    theta: f32,
-    k: usize,
-) -> Option<usize> {
-    if !theta.is_finite() {
-        return None;
-    }
-    let mut best: Vec<f32> = candidates
-        .iter()
-        .map(|(&(s, _), c)| candidate_bound(&slots[s as usize], heads, weights, c))
-        .filter(|b| b.is_finite())
-        .collect();
-    if best.len() < k {
-        return None;
-    }
-    let (_, kth, _) = best.select_nth_unstable_by(k - 1, |a, b| b.total_cmp(a));
-    let reachable = *kth;
-    Some(
-        slots
-            .iter()
-            .zip(bounds)
-            .filter(|(slot, (_, ub))| {
-                *ub > theta && unseen_bound(slot, heads, weights) <= reachable
-            })
-            .count(),
-    )
 }
 
 /// What one probe reads in one superfile.
