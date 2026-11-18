@@ -760,7 +760,7 @@ async fn metadata_disk_cache_serves_parts_without_azure_refetch() {
         // 2. Cold open: fresh manifest cache → part fetched from Azure.
         let cold_cache_dir = cache_dir.path().join("cold-superfiles");
         {
-            let manifest_cache = MetadataDiskCache::new(manifest_cache_root.clone(), 1 << 30)
+            let manifest_cache = MetadataDiskCache::new(manifest_cache_root.clone(), 1 << 30, None)
                 .map_err(|e| format!("cold manifest cache: {e}"))?;
             let disk_cache = default_disk_cache(Arc::clone(&counting_dyn), &cold_cache_dir);
             counting.reset();
@@ -800,7 +800,7 @@ async fn metadata_disk_cache_serves_parts_without_azure_refetch() {
         // 3. Warm open: NEW cache instance over the same dir (restart).
         let warm_cache_dir = cache_dir.path().join("warm-superfiles");
         {
-            let manifest_cache = MetadataDiskCache::new(manifest_cache_root.clone(), 1 << 30)
+            let manifest_cache = MetadataDiskCache::new(manifest_cache_root.clone(), 1 << 30, None)
                 .map_err(|e| format!("warm manifest cache: {e}"))?;
             // Restart survival: the index is rebuilt from the cold open's
             // files at construction, before any load.

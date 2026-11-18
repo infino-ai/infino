@@ -63,13 +63,18 @@ pub struct ConnectOptions {
     pub(crate) storage_options: HashMap<String, String>,
     /// Disk-cache root. `None` (default) → no disk cache; cold reads go
     /// straight to object storage, by range. Each open table still keeps
-    /// the lazy readers it opened (parsed footer and page indexes, the open's
-    /// tail bytes, and what later reads loaded into them), at most
-    /// 256 per table, for later queries. Set → a local NVMe tier under this
+    /// the lazy readers it opened for later queries, weighed by what they
+    /// hold (the parsed footer and page index, and what later reads loaded
+    /// into them: FTS doc maps and norms, vector norms, the range
+    /// directory), up to 256 MiB a table, charged to the connection's memory
+    /// budget, which takes them back when a query needs the room. Set → a
+    /// local NVMe tier under this
     /// directory, per table (`<cache_dir>/<table>`).
     pub(crate) cache_dir: Option<PathBuf>,
-    /// Disk-cache byte budget. `None` → the cache's built-in default.
-    /// Applies per table.
+    /// Disk-cache byte budget. `None` → a share of the total size of the
+    /// disk holding `cache_dir` (see
+    /// [`with_cache_budget_bytes`](Self::with_cache_budget_bytes)). Applies
+    /// per table.
     pub(crate) cache_budget_bytes: Option<u64>,
     /// Cold-fetch strategy when the disk cache is enabled.
     pub(crate) cold_fetch_mode: ColdFetchMode,
@@ -137,18 +142,27 @@ impl ConnectOptions {
 
     /// Enable a local disk cache rooted at `dir` (off by default). Cold
     /// superfile reads are cached to NVMe; per table, under
-    /// `<dir>/<table>`. No effect on `memory://` catalogs. Without it, each
-    /// open table reads superfiles from object storage by range and keeps
-    /// the readers it opened (their parsed metadata and what later reads
-    /// loaded into them), at most 256 per table, for later queries.
+    /// `<dir>/<table>`. SQL that spills to disk spills under `dir` too,
+    /// within a tenth of the disk's size, instead of the OS temp directory.
+    /// No effect on `memory://` catalogs. Without it, each open table reads
+    /// superfiles from object storage by range and keeps the readers it
+    /// opened for later queries, within a byte bound charged to the
+    /// connection's memory budget (see the `cache_dir` field).
     pub fn with_cache_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.cache_dir = Some(dir.into());
         self
     }
 
-    /// Set the disk-cache byte budget (per table). Defaults to the
-    /// cache's built-in budget when unset. Only meaningful with
+    /// Set the disk-cache byte budget (per table). When unset, each table's
+    /// cache may fill 90% of the total size of the disk holding the cache
+    /// directory. Only meaningful with
     /// [`with_cache_dir`](Self::with_cache_dir).
+    ///
+    /// The default assumes the disk is there for one table's cache. It does
+    /// not look at what else is on the disk, at a container's storage or
+    /// memory limit (a `tmpfs` directory counts against memory), or at
+    /// other tables and processes caching on the same disk, each of which
+    /// gets the same share. Set the budget in any of those cases.
     pub fn with_cache_budget_bytes(mut self, bytes: u64) -> Self {
         self.cache_budget_bytes = Some(bytes);
         self

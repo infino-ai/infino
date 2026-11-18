@@ -8,6 +8,7 @@
 use std::time::Duration;
 use std::{
     fs, mem,
+    path::Path,
     sync::{Arc, atomic::Ordering},
 };
 
@@ -17,21 +18,42 @@ use tokio::sync::OwnedSemaphorePermit;
 #[cfg(test)]
 use tokio::time::timeout;
 
-use crate::supertable::{
-    manifest::SuperfileUri,
-    reader_cache::{config::EvictionCandidate, disk::*},
-};
 #[cfg(test)]
 use crate::{
     memory::ConnectionMemoryBudget,
     supertable::reader_cache::{
-        block_source::BlockCachedSource, disk::test_support::tiny_superfile_bytes,
+        block_source::BlockCachedSource,
+        disk::test_support::{cache_entry, tiny_superfile_bytes},
+    },
+};
+use crate::{
+    superfile::SuperfileReader,
+    supertable::{
+        manifest::SuperfileUri,
+        reader_cache::{config::EvictionCandidate, disk::*},
     },
 };
 
 /// How long a test waits for queued block writes to finish, before failing instead of hanging.
 #[cfg(test)]
 const BLOCK_WRITES_SETTLE_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Cached files the budget of a temp-file charge test holds exactly.
+#[cfg(test)]
+const SCRATCH_TEST_BUDGET_FILES: u64 = 4;
+
+/// Bytes the parked temp-file charge test charges.
+#[cfg(test)]
+const SCRATCH_TEST_PARKED_BYTES: u64 = 1024;
+
+/// The metadata cache's own limit in the test of its charge on the disk budget: large, so
+/// only the disk budget decides what it holds.
+#[cfg(test)]
+const METADATA_TEST_BUDGET_BYTES: u64 = 1 << 30;
+
+/// Share of the disk budget a table's temp files beside the cache may be charged, in divisor
+/// form (`budget / this`): the cache keeps at least the other half.
+const SCRATCH_SHARE_DIVISOR: u64 = 2;
 
 /// Room [`DiskCacheStore::try_reserve_ahead`] reserved for a download ahead of reads, given back
 /// on drop once the download ends.
@@ -57,7 +79,7 @@ impl DiskCacheStore {
     /// kept too (see `BlockCachedSource::has_unfinished_writes`), and so is one
     /// whose file is downloading: its Warm reservation covers the download. That
     /// keeps at most one extra entry per download slot.
-    fn reclaimable_lazy_entry(&self, uri: &SuperfileUri, entry: &CachedEntry) -> bool {
+    pub(super) fn reclaimable_lazy_entry(&self, uri: &SuperfileUri, entry: &CachedEntry) -> bool {
         entry.mmap().is_none()
             && !entry.held_by_query()
             && entry
@@ -182,11 +204,12 @@ impl DiskCacheStore {
     /// each, and each finished one stays in the map until the next sweep
     /// tick: its parsed footer and page index, several MB of heap on a large
     /// file, times every superfile the query read. Capping the unheld ones
-    /// bounds that by the cap rather than by the table.
-    pub(crate) fn release_unheld_lazy_entries_over_cap(&self) {
+    /// bounds that by the cap rather than by the table. Returns the released readers, for the
+    /// caller to free where it chooses.
+    pub(crate) fn release_unheld_lazy_entries_over_cap(&self) -> Vec<Arc<SuperfileReader>> {
         let cap = self.lazy_entry_cap.load(Ordering::Relaxed);
         if self.cached.len() <= cap {
-            return;
+            return Vec::new();
         }
         let mut unheld: Vec<(u64, SuperfileUri)> = self
             .cached
@@ -195,18 +218,25 @@ impl DiskCacheStore {
             .map(|e| (e.value().last_access_us.load(Ordering::Acquire), *e.key()))
             .collect();
         let Some(over) = unheld.len().checked_sub(cap) else {
-            return;
+            return Vec::new();
         };
         unheld.sort_unstable();
         let now_us = self.now_us();
-        for (_, uri) in unheld.into_iter().take(over) {
-            self.release_lazy_entry(&uri, now_us);
-        }
+        unheld
+            .into_iter()
+            .take(over)
+            .filter_map(|(_, uri)| self.release_lazy_entry(&uri, now_us))
+            .collect()
     }
 
     /// Remove `uri`'s entry if it is still a lazy one only the cache holds,
-    /// releasing its budget and keeping its block file.
-    fn release_lazy_entry(&self, uri: &SuperfileUri, now_us: u64) {
+    /// releasing its budget and keeping its block file. Returns its reader, for
+    /// the caller to free where it chooses.
+    pub(super) fn release_lazy_entry(
+        &self,
+        uri: &SuperfileUri,
+        now_us: u64,
+    ) -> Option<Arc<SuperfileReader>> {
         // Re-check under the shard guard: a query may have taken a
         // reference since the snapshot, in which case dropping the
         // entry would free nothing and cost that query a re-open.
@@ -218,7 +248,9 @@ impl DiskCacheStore {
             if let Some(source) = removed.block_source() {
                 self.retain_block_file(uri, source, now_us);
             }
+            return Some(Arc::clone(&removed.reader));
         }
+        None
     }
 
     /// Sum of mmap virtual sizes across all cached entries
@@ -409,6 +441,20 @@ impl DiskCacheStore {
         bytes: u64,
         keep: Option<&SuperfileUri>,
     ) -> Result<(), DiskCacheError> {
+        self.reserve_evicting(bytes, keep, 0).await
+    }
+
+    /// Reserve `bytes`, evicting cache files as needed and never `keep`. `claimed` is how many
+    /// of the bytes are already counted among the charges eviction cannot free (a temp-file
+    /// charge claims its share before it reserves). Fails before evicting anything when those
+    /// charges, the table's metadata and temp files, leave no room for the bytes: evicting
+    /// every cache file would not make it.
+    async fn reserve_evicting(
+        &self,
+        bytes: u64,
+        keep: Option<&SuperfileUri>,
+        claimed: u64,
+    ) -> Result<(), DiskCacheError> {
         loop {
             let budget = self.disk_budget_bytes();
             let cur = self.current_bytes.load(Ordering::Acquire);
@@ -422,8 +468,83 @@ impl DiskCacheStore {
                 }
                 continue;
             }
+            let held = self.unevictable_bytes().saturating_sub(claimed);
+            if held.saturating_add(bytes) > budget {
+                return Err(DiskCacheError::BudgetExceeded);
+            }
             let needed = (cur + bytes).saturating_sub(budget);
             self.evict_except(needed, keep).await?;
+        }
+    }
+
+    /// Bytes charged to the budget that eviction cannot free: the table's metadata and its
+    /// temp files.
+    fn unevictable_bytes(&self) -> u64 {
+        self.metadata_bytes
+            .load(Ordering::Acquire)
+            .saturating_add(self.scratch_bytes.load(Ordering::Acquire))
+    }
+
+    /// Charge `bytes` the table's metadata cache is about to write beside this cache, evicting
+    /// cache files to make room. Metadata is never evicted to make room for cache files: every
+    /// query reads it. Fails, charging nothing, when eviction cannot free the room.
+    pub(crate) async fn charge_metadata(&self, bytes: u64) -> Result<(), DiskCacheError> {
+        self.reserve_manual(bytes).await?;
+        self.metadata_bytes.fetch_add(bytes, Ordering::AcqRel);
+        Ok(())
+    }
+
+    /// Charge `bytes` of metadata already on disk when the table opens. They take the disk
+    /// either way, like the cache files found at startup, so they are counted at once; cache
+    /// files no read has opened go now, and the next reservation evicts the rest back under
+    /// the budget.
+    pub(crate) fn adopt_metadata(&self, bytes: u64) {
+        self.current_bytes.fetch_add(bytes, Ordering::Release);
+        self.metadata_bytes.fetch_add(bytes, Ordering::AcqRel);
+        self.trim_cold_to_budget();
+    }
+
+    /// Give back `bytes` charged for metadata that left the disk.
+    pub(crate) fn release_metadata(&self, bytes: u64) {
+        self.metadata_bytes.fetch_sub(bytes, Ordering::AcqRel);
+        self.current_bytes.fetch_sub(bytes, Ordering::Release);
+    }
+
+    /// The most bytes this cache's budget lets its table's temp files be charged.
+    pub(crate) fn scratch_cap(&self) -> u64 {
+        self.disk_budget_bytes() / SCRATCH_SHARE_DIVISOR
+    }
+
+    /// Bytes temp files may still be charged before they hold their whole share of the budget.
+    pub(crate) fn scratch_room(&self) -> u64 {
+        self.scratch_cap()
+            .saturating_sub(self.scratch_bytes.load(Ordering::Acquire))
+    }
+
+    /// Bytes of the budget nothing is charged for: what can still be written beside the cache
+    /// before a reservation has to evict.
+    pub(crate) fn unused_budget_bytes(&self) -> u64 {
+        self.disk_budget_bytes()
+            .saturating_sub(self.current_bytes.load(Ordering::Acquire))
+    }
+
+    /// An empty charge on this cache's budget, for temp files beside it to grow into.
+    pub(crate) fn scratch_charge(self: &Arc<Self>) -> ScratchCharge {
+        ScratchCharge {
+            store: Arc::clone(self),
+            bytes: 0,
+        }
+    }
+
+    /// The charge parked for the temp files in `folder` (see [`ScratchCharge::park`]); empty
+    /// when none is.
+    pub(crate) fn take_parked_scratch(self: &Arc<Self>, folder: &Path) -> ScratchCharge {
+        ScratchCharge {
+            store: Arc::clone(self),
+            bytes: self
+                .parked_scratch
+                .remove(folder)
+                .map_or(0, |(_, bytes)| bytes),
         }
     }
 
@@ -714,8 +835,9 @@ impl DiskCacheStore {
     }
 
     /// The budget ledger at rest: every charged byte is backed by a live entry, a scanned cache
-    /// file, a scanned block file or a background fill's reservation, and nothing else. Holds only
-    /// with no fetch or fill running (see `wait_until_fills_settled`).
+    /// file, a scanned block file, a background fill's reservation, a temp-file charge or the
+    /// table's metadata, and nothing else. Holds only with no fetch or fill running (see
+    /// `wait_until_fills_settled`).
     #[cfg(test)]
     pub(crate) fn assert_budget_consistent(&self) {
         let entries: u64 = self.cached.iter().map(|e| e.value().charged_bytes()).sum();
@@ -726,11 +848,19 @@ impl DiskCacheStore {
             .iter()
             .map(|f| f.value().reserved.load(Ordering::Acquire))
             .sum();
+        let scratch = self.scratch_bytes.load(Ordering::Acquire);
+        let metadata = self.metadata_bytes.load(Ordering::Acquire);
         assert_eq!(
             self.current_bytes.load(Ordering::Acquire),
-            entries + unindexed + block_files + fills,
+            entries + unindexed + block_files + fills + scratch + metadata,
             "budget ledger drifted from what the cache holds (entries {entries}, \
-             unindexed {unindexed}, block files {block_files}, fills {fills})"
+             unindexed {unindexed}, block files {block_files}, fills {fills}, \
+             temp files {scratch}, metadata {metadata})"
+        );
+        let parked: u64 = self.parked_scratch.iter().map(|p| *p.value()).sum();
+        assert!(
+            parked <= scratch,
+            "parked temp-file bytes {parked} exceed the {scratch} charged"
         );
     }
 
@@ -742,15 +872,17 @@ impl DiskCacheStore {
     ) {
         let reader = SuperfileReader::open(tiny_superfile_bytes()).expect("tiny superfile opens");
         let size_bytes = block_source.filled_bytes_handle();
-        self.cached.insert(
+        let residency = Residency::Paged { block_source };
+        let accounting = EntryAccounting::SourceOwned;
+        let now_us = self.now_us();
+        cache_entry(
+            self,
             uri,
-            Arc::new(CachedEntry {
-                reader: Arc::new(reader),
-                residency: Residency::Paged { block_source },
-                size_bytes,
-                accounting: EntryAccounting::SourceOwned,
-                last_access_us: AtomicU64::new(self.now_us()),
-            }),
+            Arc::new(reader),
+            residency,
+            size_bytes,
+            accounting,
+            now_us,
         );
     }
 
@@ -771,6 +903,144 @@ impl Drop for BlockWriteTicket {
         if self.0.block_writes.fetch_sub(1, Ordering::AcqRel) == 1 {
             self.0.block_writes_idle.notify_waiters();
         }
+    }
+}
+
+/// How [`ScratchCharge::try_grow`] went.
+pub(crate) enum ScratchRoom {
+    /// The bytes are charged.
+    Charged,
+    /// No room right now: other temp files hold the share, or eviction could not free enough.
+    /// A later call may succeed.
+    NoRoom(DiskCacheError),
+    /// The budget could not hold the charge even with no other temp files charged, so waiting
+    /// never helps.
+    NeverFits(DiskCacheError),
+}
+
+/// Bytes charged to a cache's budget for temp files beside it. Drop gives them back.
+///
+/// The charge is part of the one budget the cache keeps to: growing it evicts cache files,
+/// least recently used first. All of a cache's charges together stay within
+/// `budget / SCRATCH_SHARE_DIVISOR`.
+pub(crate) struct ScratchCharge {
+    store: Arc<DiskCacheStore>,
+    bytes: u64,
+}
+
+impl ScratchCharge {
+    /// Charge `more` bytes, evicting cache files to make room. Fails with
+    /// [`DiskCacheError::ScratchFull`], evicting nothing, when temp files would pass their share
+    /// of the budget, and with [`DiskCacheError::BudgetExceeded`] when eviction cannot free the
+    /// room. A failed call leaves the charge as it was.
+    pub(crate) async fn grow(&mut self, more: u64) -> Result<(), DiskCacheError> {
+        let store = &self.store;
+        let cap = store.scratch_cap();
+        // The share is claimed before anything is evicted, so of two charges that would pass it
+        // together only one evicts.
+        store
+            .scratch_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |charged| {
+                charged.checked_add(more).filter(|&next| next <= cap)
+            })
+            .map_err(|charged| DiskCacheError::ScratchFull {
+                needed: more,
+                charged,
+                cap,
+            })?;
+        if let Err(error) = store.reserve_evicting(more, None, more).await {
+            store.scratch_bytes.fetch_sub(more, Ordering::AcqRel);
+            return Err(error);
+        }
+        self.bytes += more;
+        Ok(())
+    }
+
+    /// [`Self::grow`], telling a charge with no room right now from one the budget could never
+    /// hold. Either way the charge is left as it was.
+    pub(crate) async fn try_grow(&mut self, more: u64) -> ScratchRoom {
+        match self.grow(more).await {
+            Ok(()) => ScratchRoom::Charged,
+            Err(error) if self.could_hold(more) => ScratchRoom::NoRoom(error),
+            Err(error) => ScratchRoom::NeverFits(error),
+        }
+    }
+
+    /// Charge `bytes` of a temp file already written, without evicting and without waiting:
+    /// for a commit's build output, which must not be held up. The bytes take the disk either
+    /// way, so they are counted at once and the next reservation evicts cache files back
+    /// under the budget; files no read has opened go now. `false`, charging nothing, when temp
+    /// files would pass their share of the budget.
+    pub(crate) fn adopt(&mut self, bytes: u64) -> bool {
+        let store = &self.store;
+        let cap = store.scratch_cap();
+        let counted =
+            store
+                .scratch_bytes
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |charged| {
+                    charged.checked_add(bytes).filter(|&next| next <= cap)
+                });
+        if counted.is_err() {
+            return false;
+        }
+        store.current_bytes.fetch_add(bytes, Ordering::Release);
+        self.bytes += bytes;
+        store.trim_cold_to_budget();
+        true
+    }
+
+    /// Bytes the cache's temp files may still be charged before they hold their whole share
+    /// of the budget.
+    pub(crate) fn room(&self) -> u64 {
+        self.store.scratch_room()
+    }
+
+    /// Give back whatever is charged past `bytes`.
+    pub(crate) fn shrink_to(&mut self, bytes: u64) {
+        let Some(less) = self.bytes.checked_sub(bytes) else {
+            return;
+        };
+        self.store.scratch_bytes.fetch_sub(less, Ordering::AcqRel);
+        self.store.current_bytes.fetch_sub(less, Ordering::Release);
+        self.bytes -= less;
+    }
+
+    /// The bytes charged now.
+    pub(crate) fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    /// Whether the budget could hold this charge grown by `more` with no other temp files
+    /// charged: within the temp files' share, and beside the table's metadata, which
+    /// eviction cannot free.
+    pub(crate) fn could_hold(&self, more: u64) -> bool {
+        let store = &self.store;
+        let grown = self.bytes.saturating_add(more);
+        grown <= store.scratch_cap()
+            && store
+                .metadata_bytes
+                .load(Ordering::Acquire)
+                .saturating_add(grown)
+                <= store.disk_budget_bytes()
+    }
+
+    /// Leave the bytes charged for temp files that stay in `folder` with nothing running that
+    /// owns them, until [`DiskCacheStore::take_parked_scratch`] takes them over.
+    pub(crate) fn park(mut self, folder: &Path) {
+        let bytes = mem::take(&mut self.bytes);
+        if bytes > 0 {
+            *self
+                .store
+                .parked_scratch
+                .entry(folder.to_path_buf())
+                .or_default() += bytes;
+        }
+    }
+}
+
+impl Drop for ScratchCharge {
+    fn drop(&mut self) {
+        self.shrink_to(0);
     }
 }
 
@@ -803,10 +1073,12 @@ impl<'a> Drop for Reservation<'a> {
 mod tests {
     use std::{sync::Arc, time::Duration};
 
+    use bytes::Bytes;
+
     use crate::{
         superfile::LazyByteSource,
         supertable::{
-            manifest::SuperfileUri,
+            manifest::{SuperfileUri, disk_cache::MetadataDiskCache, part::ContentHash},
             reader_cache::{
                 block_source::CACHE_BLOCK_BYTES,
                 config::ColdFetchMode,
@@ -958,6 +1230,76 @@ mod tests {
         store.block_writes_settled().await;
     }
 
+    /// A Stream lazy entry with one block filled, released while its reader is still alive, as
+    /// one waiting on the freeing thread is.
+    ///  - the block file is counted once, by its record, while the reader lives;
+    ///  - freeing the reader later gives back nothing more.
+    #[tokio::test]
+    async fn a_released_reader_freed_later_leaves_its_block_file_counted_once() {
+        let (_dir, store) = test_store_with(|cfg| {
+            cfg.cold_fetch_mode = ColdFetchMode::LazyForegroundWithBackgroundFill;
+            cfg.promotion_defer_timeout = Duration::MAX;
+        });
+        let uri = SuperfileUri::new_v4();
+        put_superfile(&store, &uri, tiny_superfile_bytes()).await;
+        open_and_fill_a_block(&store, &uri).await;
+        let filled = store
+            .cached
+            .get(&uri)
+            .and_then(|entry| entry.block_source().map(|s| s.filled_bytes_handle()))
+            .expect("a lazy entry")
+            .load(Ordering::Acquire);
+        assert!(filled > 0, "a block is filled");
+
+        let queued = store.release_lazy_entry(&uri, store.now_us());
+        assert!(queued.is_some(), "the entry is released");
+        store.assert_budget_consistent();
+        assert_eq!(store.stats().current_bytes, filled, "counted once");
+
+        drop(queued);
+        store.assert_budget_consistent();
+        assert_eq!(store.stats().current_bytes, filled, "still counted once");
+    }
+
+    /// A Stream lazy entry with one block filled, released while its source lives, and a run that
+    /// lands on that source after the release (a read-ahead GET that finished as its statement
+    /// ended), leaving its bytes reserved in the store and filled in the source.
+    ///  - the record counts the blocks filled at release;
+    ///  - dropping the source gives the late run back, so the cache counts only the record.
+    #[tokio::test]
+    async fn a_run_landing_after_release_is_given_back_when_its_source_drops() {
+        /// Bytes the late run lands.
+        const LATE_BYTES: u64 = 4096;
+        let (_dir, store) = test_store_with(|cfg| {
+            cfg.cold_fetch_mode = ColdFetchMode::LazyForegroundWithBackgroundFill;
+            cfg.promotion_defer_timeout = Duration::MAX;
+        });
+        let uri = SuperfileUri::new_v4();
+        put_superfile(&store, &uri, tiny_superfile_bytes()).await;
+        open_and_fill_a_block(&store, &uri).await;
+        let source = store
+            .cached
+            .get(&uri)
+            .and_then(|entry| entry.block_source().cloned())
+            .expect("a lazy entry");
+        let filled = source.filled_bytes_handle().load(Ordering::Acquire);
+
+        let queued = store.release_lazy_entry(&uri, store.now_us());
+        assert!(queued.is_some(), "the entry is released");
+        store.current_bytes.fetch_add(LATE_BYTES, Ordering::Release);
+        source
+            .filled_bytes_handle()
+            .fetch_add(LATE_BYTES, Ordering::AcqRel);
+
+        drop(queued);
+        drop(source);
+        assert_eq!(
+            store.stats().current_bytes,
+            filled,
+            "only the record stays counted"
+        );
+    }
+
     /// A lazy entry with a block write still queued.
     ///  - the sweep keeps it: its block file would be counted before the write's bytes are.
     ///  - once the write is done, the sweep drops it and counts the whole file.
@@ -1082,42 +1424,288 @@ mod tests {
         assert_eq!(store.stats().current_bytes, 0);
     }
 
-    #[tokio::test]
-    async fn auto_budget_is_raised_and_admits_previously_oversized_entry() {
-        let (_dir, store) = test_store_with(|cfg| {
-            cfg.disk_budget_bytes = TEST_TINY_BUDGET_BYTES;
-        });
-        store.mark_budget_auto_sized();
-        // Undersized: the tiny superfile cannot be admitted.
-        let uri = SuperfileUri::new_v4();
-        let err = store
-            .insert_warm(&uri, tiny_superfile_bytes())
-            .await
-            .expect_err("undersized budget must reject");
-        assert!(matches!(err, DiskCacheError::BudgetExceeded));
-
-        // Reconcile raises the auto-sized budget; the same insert succeeds.
-        store.reconcile_budget_floor(TEST_RAISED_FLOOR_BYTES, TEST_RAISED_FLOOR_BYTES);
-        assert_eq!(store.disk_budget_bytes(), TEST_RAISED_FLOOR_BYTES);
-        store
-            .insert_warm(&uri, tiny_superfile_bytes())
-            .await
-            .expect("raised budget admits the entry");
-
-        // Raise-only: a smaller floor later never lowers the budget.
-        store.reconcile_budget_floor(TEST_TINY_BUDGET_BYTES, TEST_TINY_BUDGET_BYTES);
-        assert_eq!(store.disk_budget_bytes(), TEST_RAISED_FLOOR_BYTES);
+    /// Caches `n` tiny superfiles in `store` and returns their URIs, oldest first.
+    async fn cache_tiny_superfiles(store: &Arc<DiskCacheStore>, n: usize) -> Vec<SuperfileUri> {
+        let mut uris = Vec::with_capacity(n);
+        for _ in 0..n {
+            let uri = SuperfileUri::new_v4();
+            store
+                .insert_warm(&uri, tiny_superfile_bytes())
+                .await
+                .expect("cached");
+            uris.push(uri);
+        }
+        uris
     }
 
     #[tokio::test]
-    async fn explicit_budget_is_never_changed_by_reconcile() {
+    async fn temp_files_take_their_room_from_the_cache_within_one_budget() {
+        let file = tiny_superfile_bytes().len() as u64;
+        // Room for exactly four cached files, so temp files may take two files' worth.
+        let (_dir, store) =
+            test_store_with(|cfg| cfg.disk_budget_bytes = SCRATCH_TEST_BUDGET_FILES * file);
+        let uris = cache_tiny_superfiles(&store, SCRATCH_TEST_BUDGET_FILES as usize).await;
+        assert_eq!(
+            store.stats().current_bytes,
+            SCRATCH_TEST_BUDGET_FILES * file
+        );
+
+        // One file's worth of temp files evicts the least recently used cached file.
+        let mut charge = store.scratch_charge();
+        charge.grow(file).await.expect("room made");
+        let stats = store.stats();
+        assert_eq!(stats.scratch_bytes, file);
+        assert_eq!(stats.current_bytes, stats.budget_bytes, "one budget");
+        assert_eq!(stats.n_evictions, 1);
+        assert!(!store.is_cached(&uris[0]), "the oldest file went");
+        assert!(store.is_cached(&uris[1]));
+        store.assert_budget_consistent();
+
+        // Dropping the charge gives its room back.
+        drop(charge);
+        let stats = store.stats();
+        assert_eq!(stats.scratch_bytes, 0);
+        assert_eq!(stats.current_bytes, stats.budget_bytes - file);
+        store.assert_budget_consistent();
+    }
+
+    #[tokio::test]
+    async fn a_temp_file_charge_past_its_share_fails_and_evicts_nothing() {
+        let file = tiny_superfile_bytes().len() as u64;
+        let (_dir, store) =
+            test_store_with(|cfg| cfg.disk_budget_bytes = SCRATCH_TEST_BUDGET_FILES * file);
+        let uris = cache_tiny_superfiles(&store, SCRATCH_TEST_BUDGET_FILES as usize).await;
+        let cap = store.stats().budget_bytes / SCRATCH_SHARE_DIVISOR;
+
+        // More than the share in one step: refused before anything is evicted.
+        let mut charge = store.scratch_charge();
+        let err = charge.grow(cap + 1).await.expect_err("past the share");
+        assert!(matches!(err, DiskCacheError::ScratchFull { .. }), "{err}");
+        assert_eq!(charge.bytes(), 0);
+        assert_eq!(store.stats().n_evictions, 0);
+        assert!(uris.iter().all(|uri| store.is_cached(uri)));
+        store.assert_budget_consistent();
+
+        // The share is counted across charges: a second one cannot take what the first holds.
+        charge.grow(cap).await.expect("the whole share");
+        let evictions = store.stats().n_evictions;
+        let mut second = store.scratch_charge();
+        let err = second.grow(1).await.expect_err("the share is taken");
+        assert!(matches!(err, DiskCacheError::ScratchFull { .. }), "{err}");
+        assert_eq!(store.stats().n_evictions, evictions, "nothing more evicted");
+        assert_eq!(store.stats().scratch_bytes, cap);
+        store.assert_budget_consistent();
+
+        drop(second);
+        drop(charge);
+        assert_eq!(store.stats().scratch_bytes, 0);
+        store.assert_budget_consistent();
+    }
+
+    /// A charge within its share that the budget cannot make room for gives the share back, so
+    /// the next charge finds it free, and tells "no room now" from "can never fit".
+    #[tokio::test]
+    async fn a_temp_file_charge_the_budget_cannot_hold_gives_its_share_back() {
+        let (_dir, store) = test_store_with(|_| {});
+        let budget = store.stats().budget_bytes;
+        let cap = budget / SCRATCH_SHARE_DIVISOR;
+        // The whole budget is reserved with nothing to evict.
+        store.reserve_manual(budget).await.expect("an empty cache");
+
+        let mut charge = store.scratch_charge();
+        let err = charge.grow(1).await.expect_err("nothing to evict");
+        assert!(matches!(err, DiskCacheError::BudgetExceeded), "{err}");
+        assert_eq!(charge.bytes(), 0);
+        assert_eq!(
+            store.stats().scratch_bytes,
+            0,
+            "the claimed share is given back"
+        );
+        assert!(matches!(charge.try_grow(1).await, ScratchRoom::NoRoom(_)));
+        assert!(matches!(
+            charge.try_grow(cap + 1).await,
+            ScratchRoom::NeverFits(_)
+        ));
+
+        store.release_block_bytes(budget);
+        assert!(matches!(charge.try_grow(cap).await, ScratchRoom::Charged));
+        assert_eq!(store.stats().scratch_bytes, cap);
+        store.assert_budget_consistent();
+    }
+
+    /// A table's metadata cache charges what it holds to the disk cache's budget: a write
+    /// evicts cache files to make room, a cache file admitted later evicts other cache files
+    /// and never the metadata, and what leaves the metadata cache is given back.
+    #[tokio::test]
+    async fn a_table_s_metadata_counts_against_its_disk_budget() {
+        let file = tiny_superfile_bytes().len() as u64;
+        let (dir, store) =
+            test_store_with(|cfg| cfg.disk_budget_bytes = SCRATCH_TEST_BUDGET_FILES * file);
+        let uris = cache_tiny_superfiles(&store, SCRATCH_TEST_BUDGET_FILES as usize).await;
+        let metadata_root = dir.path().join("metadata");
+        let open = || {
+            MetadataDiskCache::new(
+                metadata_root.clone(),
+                METADATA_TEST_BUDGET_BYTES,
+                Some(Arc::clone(&store)),
+            )
+            .expect("metadata cache")
+        };
+        let metadata = open();
+        let object = tiny_superfile_bytes();
+        let hash = ContentHash::of(&object);
+
+        // The budget is full of cache files: the metadata takes one's room.
+        assert!(metadata.put(hash, object.clone()).await);
+        assert_eq!(store.stats().metadata_bytes, file);
+        assert_eq!(store.stats().n_evictions, 1);
+        store.assert_budget_consistent();
+
+        // A cache file admitted again takes another cache file's room.
+        let evicted = uris
+            .iter()
+            .find(|uri| !store.is_cached(uri))
+            .expect("one cache file made room");
+        store
+            .insert_warm(evicted, tiny_superfile_bytes())
+            .await
+            .expect("cached again");
+        assert!(metadata.contains(&hash), "the metadata stays");
+        assert_eq!(store.stats().metadata_bytes, file);
+        store.assert_budget_consistent();
+
+        // An object the disk budget cannot hold beside the metadata is not cached, and
+        // nothing is evicted for it: no eviction could make the room.
+        let evictions = store.stats().n_evictions;
+        let too_big = Bytes::from(vec![0u8; (SCRATCH_TEST_BUDGET_FILES * file) as usize]);
+        assert!(!metadata.put(ContentHash::of(&too_big), too_big).await);
+        assert_eq!(store.stats().metadata_bytes, file);
+        assert_eq!(store.stats().n_evictions, evictions);
+        store.assert_budget_consistent();
+
+        // The hidden index's metadata cache charges the same budget.
+        let hidden = metadata.for_hidden_index().expect("hidden index cache");
+        let hidden_object = Bytes::from(vec![1u8; file as usize]);
+        assert!(
+            hidden
+                .put(ContentHash::of(&hidden_object), hidden_object)
+                .await
+        );
+        assert_eq!(store.stats().metadata_bytes, 2 * file);
+        drop(hidden);
+        assert_eq!(store.stats().metadata_bytes, file);
+
+        // A cache opened over the same folder charges what is on disk.
+        drop(metadata);
+        assert_eq!(store.stats().metadata_bytes, 0);
+        let metadata = open();
+        assert_eq!(store.stats().metadata_bytes, file);
+        metadata.remove(&hash);
+        assert_eq!(store.stats().metadata_bytes, 0);
+        store.assert_budget_consistent();
+    }
+
+    /// A metadata cache that is full swaps an old object for the new one within its own
+    /// limit, and the table's cache files are left alone.
+    #[tokio::test]
+    async fn a_full_metadata_cache_makes_its_own_room() {
+        let file = tiny_superfile_bytes().len() as u64;
+        let (dir, store) =
+            test_store_with(|cfg| cfg.disk_budget_bytes = SCRATCH_TEST_BUDGET_FILES * file);
+        // A metadata cache with room for one object, holding one.
+        let metadata =
+            MetadataDiskCache::new(dir.path().join("metadata"), file, Some(Arc::clone(&store)))
+                .expect("metadata cache");
+        let first = tiny_superfile_bytes();
+        assert!(metadata.put(ContentHash::of(&first), first.clone()).await);
+        // Cache files fill the rest of the budget.
+        let uris = cache_tiny_superfiles(&store, SCRATCH_TEST_BUDGET_FILES as usize - 1).await;
+        let evictions = store.stats().n_evictions;
+
+        let second = Bytes::from(vec![2u8; file as usize]);
+        let second_hash = ContentHash::of(&second);
+        assert!(metadata.put(second_hash, second).await);
+        assert!(metadata.contains(&second_hash));
+        assert!(
+            !metadata.contains(&ContentHash::of(&first)),
+            "the old one went"
+        );
+        assert_eq!(store.stats().metadata_bytes, file);
+        assert_eq!(
+            store.stats().n_evictions,
+            evictions,
+            "no cache file was evicted"
+        );
+        assert!(uris.iter().all(|uri| store.is_cached(uri)));
+        store.assert_budget_consistent();
+    }
+
+    /// Temp files cannot push metadata out, so a temp-file charge that only fits by doing so
+    /// can never fit, and is told apart from one with no room right now.
+    #[tokio::test]
+    async fn a_temp_file_charge_counts_the_metadata_it_cannot_evict() {
+        let file = tiny_superfile_bytes().len() as u64;
+        let (dir, store) =
+            test_store_with(|cfg| cfg.disk_budget_bytes = SCRATCH_TEST_BUDGET_FILES * file);
+        let metadata = MetadataDiskCache::new(
+            dir.path().join("metadata"),
+            METADATA_TEST_BUDGET_BYTES,
+            Some(Arc::clone(&store)),
+        )
+        .expect("metadata cache");
+        // Metadata holds three quarters of the budget.
+        for fill in 0..SCRATCH_TEST_BUDGET_FILES - 1 {
+            let object = Bytes::from(vec![fill as u8; file as usize]);
+            assert!(metadata.put(ContentHash::of(&object), object).await);
+        }
+        let mut charge = store.scratch_charge();
+        // Within the temp files' share, but not beside the metadata.
+        let share = store.stats().budget_bytes / SCRATCH_SHARE_DIVISOR;
+        assert!(!charge.could_hold(share));
+        assert!(matches!(
+            charge.try_grow(share).await,
+            ScratchRoom::NeverFits(_)
+        ));
+        assert!(matches!(charge.try_grow(file).await, ScratchRoom::Charged));
+        assert_eq!(store.stats().scratch_bytes, file);
+        store.assert_budget_consistent();
+    }
+
+    #[tokio::test]
+    async fn a_parked_temp_file_charge_stays_counted_until_it_is_taken_over() {
+        let (dir, store) = test_store_with(|_| {});
+        let folder = dir.path().join("spill");
+        let mut charge = store.scratch_charge();
+        charge.grow(SCRATCH_TEST_PARKED_BYTES).await.expect("room");
+
+        // Parked, the bytes stay charged with no guard holding them.
+        charge.park(&folder);
+        assert_eq!(store.stats().scratch_bytes, SCRATCH_TEST_PARKED_BYTES);
+        store.assert_budget_consistent();
+
+        // Taken over, they are one charge again; a second take finds nothing.
+        let mut taken = store.take_parked_scratch(&folder);
+        assert_eq!(taken.bytes(), SCRATCH_TEST_PARKED_BYTES);
+        assert_eq!(store.take_parked_scratch(&folder).bytes(), 0);
+        assert_eq!(store.stats().scratch_bytes, SCRATCH_TEST_PARKED_BYTES);
+
+        // Shrinking gives back the difference, dropping the rest.
+        taken.shrink_to(1);
+        assert_eq!(store.stats().scratch_bytes, 1);
+        store.assert_budget_consistent();
+        drop(taken);
+        assert_eq!(store.stats().current_bytes, 0);
+        store.assert_budget_consistent();
+    }
+
+    #[tokio::test]
+    async fn a_footprint_over_the_budget_leaves_the_budget_as_set() {
         let (_dir, store) = test_store_with(|cfg| {
             cfg.disk_budget_bytes = TEST_TINY_BUDGET_BYTES;
         });
-        // No mark_budget_auto_sized(): the budget is explicit. Reconcile
-        // must warn (once) but leave the budget verbatim.
-        store.reconcile_budget_floor(TEST_RAISED_FLOOR_BYTES, TEST_RAISED_FLOOR_BYTES);
-        store.reconcile_budget_floor(TEST_RAISED_FLOOR_BYTES, TEST_RAISED_FLOOR_BYTES);
+        // Warned about (once), never changed.
+        store.warn_if_budget_below(TEST_LARGE_FOOTPRINT_BYTES);
+        store.warn_if_budget_below(TEST_LARGE_FOOTPRINT_BYTES);
         assert_eq!(store.disk_budget_bytes(), TEST_TINY_BUDGET_BYTES);
         assert_eq!(store.stats().budget_bytes, TEST_TINY_BUDGET_BYTES);
     }

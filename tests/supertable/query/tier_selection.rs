@@ -581,6 +581,9 @@ fn an_unreadable_tier_leaves_the_query_to_its_ceilings() {
 /// terms of the commonest rarity bucket): through one handle a later shape
 /// meets a decision the earlier ones made, which tries the other way only
 /// one query in 64 once it is clear, and its asks can all go one way.
+///
+/// The handle opens every superfile in one window: past a window the merge
+/// runs for every query and the gate has nothing to decide.
 #[test]
 fn the_learned_gate_answers_the_same_whichever_way_it_goes() {
     let with_dir = TempDir::new().expect("tempdir");
@@ -601,7 +604,10 @@ fn the_learned_gate_answers_the_same_whichever_way_it_goes() {
         ("quokka tensor", BoolMode::And),
     ] {
         for k in [10usize, 100] {
-            let with = Supertable::open(options_for(&with_dir, gated)).expect("open");
+            let with = Supertable::open(
+                options_for(&with_dir, gated).with_bound_ordered_open_window(SUPERFILES),
+            )
+            .expect("open");
             let (expected, _, _) = run(&without, query, mode, k);
             let mut plain = false;
             // Every ask observed: the policy alternates between asks.

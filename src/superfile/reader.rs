@@ -265,6 +265,14 @@ pub struct SuperfileReader {
     /// by, derived once by the first scan that asks
     /// ([`Self::scan_footer`]) and shared by every later one.
     scan_footer: OnceLock<Arc<ParquetMetaData>>,
+    /// What a table scan reads off this file's footer on every statement, worked out by the first
+    /// scan that asks ([`Self::scan_shape`]) and kept while the reader stays cached.
+    scan_shape: OnceLock<Arc<ScanShape>>,
+    /// Whether a cache has counted what this reader keeps decoded ([`Self::first_heap_count`]).
+    heap_counted: AtomicBool,
+    /// Whether a cache has counted the scan footer this reader keeps
+    /// ([`Self::first_scan_footer_heap_count`]).
+    scan_footer_heap_counted: AtomicBool,
     /// The lazy byte source the reader was opened over, retained only
     /// on the [`open_lazy`] path. `None` on the eager [`open`] path
     /// (resident bytes already cover every range). Lets
@@ -759,6 +767,22 @@ impl fmt::Debug for SuperfileReader {
     }
 }
 
+/// What a table scan needs from a superfile's footer, beyond the footer itself. It depends only
+/// on the file, so one copy serves every statement that scans the file.
+#[derive(Debug, PartialEq)]
+pub(crate) struct ScanShape {
+    /// Rows in each row group.
+    pub(crate) row_counts: Arc<[u32]>,
+    /// The byte where the last row group ends, for a file that keeps a range index after its row
+    /// groups; `None` for any other file.
+    pub(crate) rows_end: Option<u64>,
+    /// Data pages of each column across the row groups, by name; empty without a page index.
+    pub(crate) pages: HashMap<String, u64>,
+    /// Bytes of each column before compression. A list or struct column is stored as several
+    /// parts; bytes are kept per part, in the file's order.
+    pub(crate) leaf_bytes: Arc<[u64]>,
+}
+
 impl SuperfileReader {
     /// Open from a complete superfile byte buffer (i.e. the bytes
     /// returned by `SuperfileBuilder::finish`, or read from disk / S3
@@ -948,6 +972,9 @@ impl SuperfileReader {
             footer: ArcSwap::from_pointee(Footer::Lazy(parquet_meta)),
             page_index_loaded: OnceCell::new(),
             scan_footer: OnceLock::new(),
+            scan_shape: OnceLock::new(),
+            heap_counted: AtomicBool::new(false),
+            scan_footer_heap_counted: AtomicBool::new(false),
             source: Some(source),
             schema,
             id_column,
@@ -1094,6 +1121,9 @@ impl SuperfileReader {
             // Set by `parquet_metadata_with_page_index` on first use.
             page_index_loaded: OnceCell::new(),
             scan_footer: OnceLock::new(),
+            scan_shape: OnceLock::new(),
+            heap_counted: AtomicBool::new(false),
+            scan_footer_heap_counted: AtomicBool::new(false),
             source: None,
             schema,
             id_column,
@@ -1202,6 +1232,37 @@ impl SuperfileReader {
         }
         let derived = derive(indexed)?;
         Ok(Arc::clone(self.scan_footer.get_or_init(|| derived)))
+    }
+
+    /// True for the first caller only: the one that should count what this reader keeps decoded
+    /// against a cache's budget. Later callers pay one load.
+    pub(crate) fn first_heap_count(&self) -> bool {
+        !self.heap_counted.load(Ordering::Acquire)
+            && !self.heap_counted.swap(true, Ordering::AcqRel)
+    }
+
+    /// [`Self::first_heap_count`] for the scan footer this reader keeps, which a later statement
+    /// may derive after the first one counted the parsed footer.
+    pub(crate) fn first_scan_footer_heap_count(&self) -> bool {
+        !self.scan_footer_heap_counted.load(Ordering::Acquire)
+            && !self.scan_footer_heap_counted.swap(true, Ordering::AcqRel)
+    }
+
+    /// Whether `footer` is a scan footer this reader keeps apart from its parsed one.
+    pub(crate) fn keeps_scan_footer(&self, footer: &Arc<ParquetMetaData>) -> bool {
+        !Arc::ptr_eq(self.footer.load().parquet(), footer)
+    }
+
+    /// This file's scan shape: `build` on the first call, the same one on every later call. A
+    /// table builds a provider per statement, so without this each statement walked every footer.
+    /// Concurrent first callers may each build one; the first stored is kept, as in
+    /// [`Self::scan_footer`], so no caller waits on another's walk.
+    pub(crate) fn scan_shape(&self, build: impl FnOnce() -> ScanShape) -> Arc<ScanShape> {
+        if let Some(shape) = self.scan_shape.get() {
+            return Arc::clone(shape);
+        }
+        let built = Arc::new(build());
+        Arc::clone(self.scan_shape.get_or_init(|| built))
     }
 
     /// The Arrow metadata the synchronous decodes read through, or
@@ -2707,6 +2768,21 @@ impl SuperfileReader {
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
         Ok(fts.contains_rows(column, needles, pool, budget).await?)
+    }
+
+    /// For each of `terms`, the rows of `column` that hold the term as one
+    /// of their tokens, from the postings alone: every row proven, none
+    /// doubtful. Delegates to [`FtsReader::term_rows`].
+    pub(crate) async fn term_rows(
+        &self,
+        column: &str,
+        terms: &[&str],
+        prefetched: Option<&FetchedTermMemo>,
+    ) -> Result<(Vec<ContainsRows>, MatchWork), ReadError> {
+        let fts = self
+            .fts()
+            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
+        Ok(fts.term_rows(column, terms, prefetched).await?)
     }
 
     /// Unranked token-match **count**: the number of `local_doc_id`s

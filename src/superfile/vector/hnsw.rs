@@ -51,6 +51,7 @@ use std::{
 
 use bytes::Bytes;
 use rayon::prelude::*;
+use xxhash_rust::xxh3::Xxh3;
 
 use crate::superfile::vector::{
     distance::{
@@ -1204,7 +1205,12 @@ impl Hnsw {
         if total <= prior {
             return self;
         }
-        let prior_entry = self.entry;
+        // Every prior node is a hole only when the entry is: the first new
+        // node then seeds the entry the way node 0 seeds a fresh build, and
+        // inserting starts after it.
+        let all_holes = self.is_hole(self.entry);
+        let prior_entry = if all_holes { prior as u32 } else { self.entry };
+        let first_insert = if all_holes { prior + 1 } else { prior };
         let ml = 1.0 / (params.m.max(2) as f64).ln();
 
         // Prior levels kept; new nodes get their seeded levels.
@@ -1237,13 +1243,15 @@ impl Hnsw {
         };
 
         if parallel {
-            (prior as u32..total as u32).into_par_iter().for_each_init(
-                || VisitedSet::new(total),
-                |visited, node| builder.insert(scorer, node, visited),
-            );
+            (first_insert as u32..total as u32)
+                .into_par_iter()
+                .for_each_init(
+                    || VisitedSet::new(total),
+                    |visited, node| builder.insert(scorer, node, visited),
+                );
         } else {
             let mut visited = VisitedSet::new(total);
-            for node in prior as u32..total as u32 {
+            for node in first_insert as u32..total as u32 {
                 builder.insert(scorer, node, &mut visited);
             }
         }
@@ -1297,48 +1305,16 @@ impl Hnsw {
         let survivors = next as usize;
         assert!(scorer.len() >= survivors, "scorer must hold every survivor");
 
+        let dropped = |node: u32| !keep[node as usize];
         let mut neighbors = Vec::with_capacity(survivors);
         let mut node_level = Vec::with_capacity(survivors);
         for old in (0..self.len).filter(|&old| keep[old]) {
-            let lists = &self.neighbors[old];
-            let mut kept_lists = Vec::with_capacity(lists.len());
-            for (level, list) in lists.iter().enumerate() {
-                // Live neighbors stay as they are; only the slots of dropped
-                // ones are refilled, from those dropped nodes' own neighbors.
-                let mut kept: Vec<u32> = list
-                    .iter()
-                    .filter(|&&nb| keep[nb as usize])
-                    .map(|&nb| remap[nb as usize])
-                    .collect();
-                let vacated = list.len() - kept.len();
-                if vacated > 0 {
-                    let mut through: Vec<u32> = list
-                        .iter()
-                        .filter(|&&nb| !keep[nb as usize])
-                        .filter_map(|&nb| self.neighbors[nb as usize].get(level))
-                        .flatten()
-                        .filter(|&&x| x as usize != old && keep[x as usize])
-                        .map(|&x| remap[x as usize])
-                        .filter(|x| !kept.contains(x))
-                        .collect();
-                    through.sort_unstable();
-                    through.dedup();
-                    let prep = scorer.prepare_node(remap[old]);
-                    let mut scored: Vec<Scored> = through
-                        .into_iter()
-                        .map(|node| Scored {
-                            node,
-                            dist: scorer.score(&prep, node),
-                        })
-                        .collect();
-                    scored.sort_unstable();
-                    let cap = if level == 0 { self.m0 } else { self.m };
-                    let slots = vacated.min(cap.saturating_sub(kept.len()));
-                    kept.extend(fill_vacated(scorer, &kept, scored, slots));
-                }
-                kept_lists.push(kept);
-            }
-            neighbors.push(kept_lists);
+            neighbors.push(self.repaired_lists(
+                old as u32,
+                dropped,
+                |node| remap[node as usize],
+                scorer,
+            ));
             node_level.push(self.node_level[old]);
         }
 
@@ -1346,14 +1322,10 @@ impl Hnsw {
         // (lowest id on a tie) takes over, so descent still starts at the top.
         let entry = if survivors == 0 {
             0
-        } else if keep[self.entry as usize] {
+        } else if keep[self.entry as usize] && !self.is_hole(self.entry) {
             remap[self.entry as usize]
         } else {
-            let top = node_level.iter().copied().max().unwrap_or(0);
-            node_level
-                .iter()
-                .position(|&level| level == top)
-                .unwrap_or(0) as u32
+            tallest_live(&neighbors, &node_level).unwrap_or(0)
         };
         Hnsw {
             neighbors,
@@ -1366,6 +1338,169 @@ impl Hnsw {
             #[cfg(feature = "graph-index")]
             compact_base: false,
         }
+    }
+
+    /// Remove the nodes in `removed` without renumbering the rest: each one
+    /// becomes a hole, a slot with no neighbor lists that no list names, so
+    /// no search reaches it and every other node keeps its id. The live nodes
+    /// that linked to a removed node have those slots refilled the way
+    /// [`remove_nodes`](Self::remove_nodes) refills them. If the entry point
+    /// is removed, the tallest live node (lowest id on a tie) takes over.
+    ///
+    /// Ids already holes, and repeated ids, are ignored. `scorer` is indexed
+    /// by the graph's own ids; a hole's row is never read. Holes are filled
+    /// only by building a new graph; [`extend`](Self::extend) appends after
+    /// them.
+    pub(crate) fn unlink_nodes<S: NodeScorer>(mut self, removed: &[u32], scorer: &S) -> Hnsw {
+        let mut gone = vec![false; self.len];
+        let mut any = false;
+        for &node in removed {
+            assert!(
+                (node as usize) < self.len,
+                "removed node {node} is past the graph"
+            );
+            if !self.is_hole(node) {
+                gone[node as usize] = true;
+                any = true;
+            }
+        }
+        if !any {
+            return self;
+        }
+        let dropped = |node: u32| gone[node as usize];
+        let repaired: Vec<(usize, Vec<Vec<u32>>)> = (0..self.len)
+            .filter(|&node| !gone[node] && !self.is_hole(node as u32))
+            .filter(|&node| {
+                self.neighbors[node]
+                    .iter()
+                    .flatten()
+                    .any(|&nb| gone[nb as usize])
+            })
+            .map(|node| {
+                let lists = self.repaired_lists(node as u32, dropped, |id| id, scorer);
+                (node, lists)
+            })
+            .collect();
+        for (node, lists) in repaired {
+            self.neighbors[node] = lists;
+        }
+        for (node, _) in gone.iter().enumerate().filter(|(_, g)| **g) {
+            self.neighbors[node] = Vec::new();
+            self.node_level[node] = 0;
+        }
+        if gone[self.entry as usize] {
+            self.entry = tallest_live(&self.neighbors, &self.node_level).unwrap_or(0);
+        }
+        self
+    }
+
+    /// The graph with its holes dropped and the live nodes renumbered from 0
+    /// in their old order, and `kept[new] = old` for each of them. No list
+    /// names a hole, so nothing needs repair: every list is only renumbered.
+    pub(crate) fn without_holes(&self) -> (Hnsw, Vec<u32>) {
+        let kept: Vec<u32> = (0..self.len as u32).filter(|&n| !self.is_hole(n)).collect();
+        let mut remap = vec![u32::MAX; self.len];
+        for (new, &old) in kept.iter().enumerate() {
+            remap[old as usize] = new as u32;
+        }
+        let neighbors = kept
+            .iter()
+            .map(|&old| {
+                self.neighbors[old as usize]
+                    .iter()
+                    .map(|list| list.iter().map(|&nb| remap[nb as usize]).collect())
+                    .collect()
+            })
+            .collect();
+        let node_level = kept
+            .iter()
+            .map(|&old| self.node_level[old as usize])
+            .collect();
+        let entry = if kept.is_empty() {
+            0
+        } else {
+            remap[self.entry as usize]
+        };
+        let graph = Hnsw {
+            neighbors,
+            node_level,
+            entry,
+            m: self.m,
+            m0: self.m0,
+            ef_construction: self.ef_construction,
+            len: kept.len(),
+            #[cfg(feature = "graph-index")]
+            compact_base: false,
+        };
+        (graph, kept)
+    }
+
+    /// Whether `node` is a hole left by [`unlink_nodes`](Self::unlink_nodes).
+    /// A live node always has at least its level-0 list, even when empty.
+    #[inline]
+    pub(crate) fn is_hole(&self, node: u32) -> bool {
+        self.neighbors[node as usize].is_empty()
+    }
+
+    /// Live nodes: every slot that is not a hole.
+    pub(crate) fn live_len(&self) -> usize {
+        self.neighbors
+            .iter()
+            .filter(|lists| !lists.is_empty())
+            .count()
+    }
+
+    /// `node`'s neighbor lists with the neighbors `dropped` says are gone
+    /// taken out and their slots refilled from those neighbors' own lists at
+    /// the same level, renumbered through `map`. Live neighbors stay in
+    /// place. The refill candidates are scored from `map(node)` with
+    /// `scorer`, which is indexed by mapped ids, and picked by
+    /// [`fill_vacated`]; a list comes back shorter only when the dropped
+    /// neighbors have too few live neighbors to fill it.
+    fn repaired_lists<S: NodeScorer>(
+        &self,
+        node: u32,
+        dropped: impl Fn(u32) -> bool,
+        map: impl Fn(u32) -> u32,
+        scorer: &S,
+    ) -> Vec<Vec<u32>> {
+        let lists = &self.neighbors[node as usize];
+        let mut out = Vec::with_capacity(lists.len());
+        for (level, list) in lists.iter().enumerate() {
+            let mut kept: Vec<u32> = list
+                .iter()
+                .filter(|&&nb| !dropped(nb))
+                .map(|&nb| map(nb))
+                .collect();
+            let vacated = list.len() - kept.len();
+            if vacated > 0 {
+                let mut through: Vec<u32> = list
+                    .iter()
+                    .filter(|&&nb| dropped(nb))
+                    .filter_map(|&nb| self.neighbors[nb as usize].get(level))
+                    .flatten()
+                    .filter(|&&x| x != node && !dropped(x))
+                    .map(|&x| map(x))
+                    .filter(|x| !kept.contains(x))
+                    .collect();
+                through.sort_unstable();
+                through.dedup();
+                let prep = scorer.prepare_node(map(node));
+                let mut scored: Vec<Scored> = through
+                    .into_iter()
+                    .map(|nb| Scored {
+                        node: nb,
+                        dist: scorer.score(&prep, nb),
+                    })
+                    .collect();
+                scored.sort_unstable();
+                let cap = if level == 0 { self.m0 } else { self.m };
+                let slots = vacated.min(cap.saturating_sub(kept.len()));
+                kept.extend(fill_vacated(scorer, &kept, scored, slots));
+            }
+            out.push(kept);
+        }
+        out
     }
 
     /// Walk greedily downhill at `level` from `entry`, hopping to the
@@ -1493,7 +1628,8 @@ impl Hnsw {
         ef: usize,
         visited: &mut VisitedSet,
     ) -> Vec<(u32, f32)> {
-        if self.len == 0 || k == 0 {
+        // The entry is a hole only when every node is one.
+        if self.len == 0 || k == 0 || self.is_hole(self.entry) {
             return Vec::new();
         }
         let prepared = scorer.prepare(query);
@@ -1554,7 +1690,9 @@ impl Hnsw {
     /// Node `node`'s base-layer neighbours.
     #[cfg(feature = "graph-index")]
     pub(crate) fn base_neighbors(&self, node: u32) -> &[u32] {
-        &self.neighbors[node as usize][0]
+        self.neighbors[node as usize]
+            .first()
+            .map_or(&[][..], Vec::as_slice)
     }
 
     /// Heap the decoded adjacency occupies, for a residency log line.
@@ -2241,7 +2379,8 @@ impl Hnsw {
     fn write_strided_base(&self, out: &mut Vec<u8>) {
         let m0 = self.m0.max(1);
         for levels in &self.neighbors {
-            let l0 = &levels[0];
+            // A hole has no lists and is written as a node with no edges.
+            let l0 = levels.first().map_or(&[][..], Vec::as_slice);
             for slot in 0..m0 {
                 let id = l0.get(slot).copied().unwrap_or(ADJ_SENTINEL);
                 out.extend_from_slice(&id.to_le_bytes());
@@ -2255,11 +2394,11 @@ impl Hnsw {
         let mut offset = 0u64;
         out.extend_from_slice(&offset.to_le_bytes());
         for levels in &self.neighbors {
-            offset += levels[0].len() as u64;
+            offset += levels.first().map_or(0, Vec::len) as u64;
             out.extend_from_slice(&offset.to_le_bytes());
         }
-        for levels in &self.neighbors {
-            for &id in &levels[0] {
+        for levels in self.neighbors.iter().filter_map(|levels| levels.first()) {
+            for &id in levels {
                 out.extend_from_slice(&id.to_le_bytes());
             }
         }
@@ -2476,6 +2615,426 @@ impl Hnsw {
             compact_base: compact,
         })
     }
+}
+
+/// Magic of an encoded [`GraphChange`].
+const GRAPH_CHANGE_MAGIC: &[u8; 8] = b"INFCGC01";
+
+/// Why a [`GraphChange`] could not be made or applied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GraphChangeError {
+    /// The graph it applies to is not the one it was made from.
+    WrongBase,
+    /// The two graphs are not one generation of the other: the newer is
+    /// shorter, its parameters differ, a hole came back, or a surviving
+    /// node's tower changed height.
+    NotASuccessor,
+    /// A list names a node past the graph or a hole, a removed node was not
+    /// live, or the entry point is not a live node.
+    Invalid,
+    /// The applied graph does not hash to the checksum the change carries.
+    ChecksumMismatch,
+}
+
+/// The difference between two generations of one graph whose node ids are
+/// stable ([`Hnsw::unlink_nodes`] and [`Hnsw::extend`] keep them): which live
+/// nodes became holes, which surviving nodes' lists changed, the nodes added
+/// past the old end, and the new entry point. Applying it to the older graph
+/// gives the newer one exactly, which both sides check by checksum, so a
+/// reader can follow a writer by fetching only what changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GraphChange {
+    /// Slots in the graph the change applies to.
+    base_len: u32,
+    /// [`Hnsw::checksum`] of the graph the change applies to.
+    base_checksum: u64,
+    /// Entry point after the change.
+    entry: u32,
+    /// Base nodes that are holes after the change, ascending.
+    removed: Vec<u32>,
+    /// Lists of surviving base nodes that changed, as `(node, level, edit)`,
+    /// in node then level order. An edit holds only what differs from the
+    /// old list: adding a node touches the lists of its neighbors, a few
+    /// ids each, and whole lists would make a change many times larger.
+    rewritten: Vec<(u32, u32, ListEdit)>,
+    /// Nodes past `base_len`, in id order: each node's lists by level, or no
+    /// lists for a node that is already a hole.
+    appended: Vec<Vec<Vec<u32>>>,
+    /// [`Hnsw::checksum`] of the graph after the change.
+    checksum: u64,
+}
+
+impl Hnsw {
+    /// A hash of everything a search reads: the parameters, the entry point,
+    /// and every node's tower and neighbor lists, holes included. Two graphs
+    /// with the same checksum search the same way.
+    pub(crate) fn checksum(&self) -> u64 {
+        let mut h = Xxh3::new();
+        for word in [
+            self.len as u64,
+            self.m as u64,
+            self.m0 as u64,
+            self.ef_construction as u64,
+            self.entry as u64,
+        ] {
+            h.update(&word.to_le_bytes());
+        }
+        for (lists, &level) in self.neighbors.iter().zip(&self.node_level) {
+            h.update(&(lists.len() as u32).to_le_bytes());
+            h.update(&level.to_le_bytes());
+            for list in lists {
+                h.update(&(list.len() as u32).to_le_bytes());
+                for id in list {
+                    h.update(&id.to_le_bytes());
+                }
+            }
+        }
+        h.digest()
+    }
+
+    /// The change that turns `self` into `next`. `next` must be a later
+    /// generation of `self`: at least as long, with the same parameters, no
+    /// hole of `self` live again, and every surviving node at its old height.
+    pub(crate) fn diff(&self, next: &Hnsw) -> Result<GraphChange, GraphChangeError> {
+        if next.len < self.len
+            || next.m != self.m
+            || next.m0 != self.m0
+            || next.ef_construction != self.ef_construction
+        {
+            return Err(GraphChangeError::NotASuccessor);
+        }
+        let mut removed = Vec::new();
+        let mut rewritten = Vec::new();
+        for node in 0..self.len {
+            let (before, after) = (&self.neighbors[node], &next.neighbors[node]);
+            match (before.is_empty(), after.is_empty()) {
+                (true, true) => {}
+                (true, false) => return Err(GraphChangeError::NotASuccessor),
+                (false, true) => removed.push(node as u32),
+                (false, false) => {
+                    if before.len() != after.len() || self.node_level[node] != next.node_level[node]
+                    {
+                        return Err(GraphChangeError::NotASuccessor);
+                    }
+                    for (level, (old, new)) in before.iter().zip(after).enumerate() {
+                        if old != new {
+                            rewritten.push((
+                                node as u32,
+                                level as u32,
+                                ListEdit::between(old, new),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(GraphChange {
+            base_len: self.len as u32,
+            base_checksum: self.checksum(),
+            entry: next.entry,
+            removed,
+            rewritten,
+            appended: next.neighbors[self.len..].to_vec(),
+            checksum: next.checksum(),
+        })
+    }
+
+    /// Apply `change` to this graph, which must be the graph it was made
+    /// from. Every id the change carries is checked before the graph is
+    /// touched, and the result must hash to the change's checksum, so a
+    /// change that does not fit comes back as an error rather than a graph
+    /// that searches differently from the writer's.
+    pub(crate) fn apply_change(mut self, change: &GraphChange) -> Result<Hnsw, GraphChangeError> {
+        if self.len != change.base_len as usize || self.checksum() != change.base_checksum {
+            return Err(GraphChangeError::WrongBase);
+        }
+        let len = self.len + change.appended.len();
+        let mut hole = vec![false; len];
+        for (node, lists) in self.neighbors.iter().enumerate() {
+            hole[node] = lists.is_empty();
+        }
+        for &node in &change.removed {
+            if node as usize >= self.len || hole[node as usize] {
+                return Err(GraphChangeError::Invalid);
+            }
+            hole[node as usize] = true;
+        }
+        for (offset, lists) in change.appended.iter().enumerate() {
+            if lists.len() > MAX_LEVEL as usize + 1 {
+                return Err(GraphChangeError::Invalid);
+            }
+            hole[self.len + offset] = lists.is_empty();
+        }
+        let names_live = |list: &[u32]| {
+            list.iter()
+                .all(|&id| (id as usize) < len && !hole[id as usize])
+        };
+        // Each edited list, worked out against the graph as it is, so
+        // nothing is changed until every list is known to be good.
+        let mut edited: Vec<(usize, usize, Vec<u32>)> = Vec::with_capacity(change.rewritten.len());
+        for (node, level, edit) in &change.rewritten {
+            let (node, level) = (*node as usize, *level as usize);
+            if node >= self.len || hole[node] || level >= self.neighbors[node].len() {
+                return Err(GraphChangeError::Invalid);
+            }
+            let list = edit
+                .apply(&self.neighbors[node][level])
+                .ok_or(GraphChangeError::Invalid)?;
+            if !names_live(&list) {
+                return Err(GraphChangeError::Invalid);
+            }
+            edited.push((node, level, list));
+        }
+        if !change
+            .appended
+            .iter()
+            .flatten()
+            .all(|list| names_live(list))
+        {
+            return Err(GraphChangeError::Invalid);
+        }
+        let any_live = hole.iter().any(|h| !h);
+        if (change.entry as usize) >= len || (any_live && hole[change.entry as usize]) {
+            return Err(GraphChangeError::Invalid);
+        }
+
+        for &node in &change.removed {
+            self.neighbors[node as usize] = Vec::new();
+            self.node_level[node as usize] = 0;
+        }
+        for (node, level, list) in edited {
+            self.neighbors[node][level] = list;
+        }
+        for lists in &change.appended {
+            self.node_level.push(lists.len().saturating_sub(1) as u32);
+            self.neighbors.push(lists.clone());
+        }
+        self.len = len;
+        self.entry = change.entry;
+        if self.checksum() != change.checksum {
+            return Err(GraphChangeError::ChecksumMismatch);
+        }
+        Ok(self)
+    }
+}
+
+impl GraphChange {
+    /// Checksum of the graph after the change.
+    pub(crate) fn checksum(&self) -> u64 {
+        self.checksum
+    }
+
+    /// Nodes the change removes, rewrites a list of, and appends, for
+    /// telemetry and for deciding when to rebuild instead.
+    pub(crate) fn counts(&self) -> (usize, usize, usize) {
+        (
+            self.removed.len(),
+            self.rewritten.len(),
+            self.appended.len(),
+        )
+    }
+
+    /// The change as bytes: magic, the two checksums, base length and entry,
+    /// then the removed ids, the rewritten lists and the appended towers,
+    /// each count-prefixed. Paired with [`from_bytes`](Self::from_bytes).
+    pub(crate) fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(GRAPH_CHANGE_MAGIC);
+        out.extend_from_slice(&self.base_checksum.to_le_bytes());
+        out.extend_from_slice(&self.checksum.to_le_bytes());
+        out.extend_from_slice(&self.base_len.to_le_bytes());
+        out.extend_from_slice(&self.entry.to_le_bytes());
+        put_u32s(&mut out, &self.removed);
+        out.extend_from_slice(&(self.rewritten.len() as u64).to_le_bytes());
+        for (node, level, edit) in &self.rewritten {
+            out.extend_from_slice(&node.to_le_bytes());
+            out.extend_from_slice(&level.to_le_bytes());
+            edit.write(&mut out);
+        }
+        out.extend_from_slice(&(self.appended.len() as u64).to_le_bytes());
+        for lists in &self.appended {
+            out.extend_from_slice(&(lists.len() as u32).to_le_bytes());
+            for list in lists {
+                put_u32s(&mut out, list);
+            }
+        }
+        out
+    }
+
+    /// Decode [`to_bytes`](Self::to_bytes). `None` on a bad magic, a
+    /// truncation or trailing bytes; every count is checked against the bytes
+    /// left before anything is reserved. Ids are checked when the change is
+    /// applied, against the graph it applies to.
+    pub(crate) fn from_bytes(bytes: &[u8]) -> Option<GraphChange> {
+        let mut c = Cursor::new(bytes);
+        if c.take(GRAPH_CHANGE_MAGIC.len())? != GRAPH_CHANGE_MAGIC {
+            return None;
+        }
+        let base_checksum = c.u64()?;
+        let checksum = c.u64()?;
+        let base_len = c.u32()?;
+        let entry = c.u32()?;
+        let removed = take_u32s(&mut c)?;
+        // A rewritten record is at least node, level and an empty edit.
+        let rewritten_count = bounded_count(&mut c, 8 + LIST_EDIT_MIN_BYTES)?;
+        let mut rewritten = Vec::with_capacity(rewritten_count);
+        for _ in 0..rewritten_count {
+            let node = c.u32()?;
+            let level = c.u32()?;
+            rewritten.push((node, level, ListEdit::read(&mut c)?));
+        }
+        // An appended record is at least its list count.
+        let appended_count = bounded_count(&mut c, 4)?;
+        let mut appended = Vec::with_capacity(appended_count);
+        for _ in 0..appended_count {
+            let levels = c.u32()?;
+            if levels > MAX_LEVEL + 1 {
+                return None;
+            }
+            let mut lists = Vec::with_capacity(levels as usize);
+            for _ in 0..levels {
+                lists.push(take_u32s(&mut c)?);
+            }
+            appended.push(lists);
+        }
+        if c.remaining() != 0 {
+            return None;
+        }
+        Some(GraphChange {
+            base_len,
+            base_checksum,
+            entry,
+            removed,
+            rewritten,
+            appended,
+            checksum,
+        })
+    }
+}
+
+/// Bytes of the smallest encoded [`ListEdit`]: its two counts.
+const LIST_EDIT_MIN_BYTES: usize = 4;
+
+/// What turns one neighbor list into another: the positions in the old list
+/// that go, and the ids that come in with their positions in the new list.
+/// Ids the two lists share in the same order are not written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ListEdit {
+    /// Positions in the old list of the ids dropped, ascending.
+    dropped: Vec<u16>,
+    /// `(position in the new list, id)` of the ids added, ascending.
+    added: Vec<(u16, u32)>,
+}
+
+impl ListEdit {
+    /// The edit that turns `old` into `new`, keeping a longest run of ids
+    /// the two share in order.
+    fn between(old: &[u32], new: &[u32]) -> Self {
+        // `kept[i][j]` is how many ids `old[i..]` and `new[j..]` share in
+        // order. Lists hold a few dozen ids, so the table is small.
+        let (n, m) = (old.len(), new.len());
+        let mut kept = vec![0u16; (n + 1) * (m + 1)];
+        let at = |i: usize, j: usize| i * (m + 1) + j;
+        for i in (0..n).rev() {
+            for j in (0..m).rev() {
+                kept[at(i, j)] = if old[i] == new[j] {
+                    kept[at(i + 1, j + 1)] + 1
+                } else {
+                    kept[at(i + 1, j)].max(kept[at(i, j + 1)])
+                };
+            }
+        }
+        let (mut dropped, mut added) = (Vec::new(), Vec::new());
+        let (mut i, mut j) = (0, 0);
+        while i < n || j < m {
+            if i < n && j < m && old[i] == new[j] {
+                i += 1;
+                j += 1;
+            } else if j < m && (i == n || kept[at(i, j + 1)] >= kept[at(i + 1, j)]) {
+                added.push((j as u16, new[j]));
+                j += 1;
+            } else {
+                dropped.push(i as u16);
+                i += 1;
+            }
+        }
+        Self { dropped, added }
+    }
+
+    /// The list this edit makes of `old`; `None` when a position does not
+    /// fit it.
+    fn apply(&self, old: &[u32]) -> Option<Vec<u32>> {
+        let mut list = Vec::with_capacity(old.len() + self.added.len());
+        let mut dropped = self.dropped.iter().peekable();
+        for (position, &id) in old.iter().enumerate() {
+            if dropped.next_if(|&&at| at as usize == position).is_none() {
+                list.push(id);
+            }
+        }
+        if dropped.next().is_some() {
+            return None;
+        }
+        for &(position, id) in &self.added {
+            if position as usize > list.len() {
+                return None;
+            }
+            list.insert(position as usize, id);
+        }
+        Some(list)
+    }
+
+    /// Append the edit: the dropped positions, then the added positions and
+    /// ids, each count-prefixed.
+    fn write(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&(self.dropped.len() as u16).to_le_bytes());
+        for position in &self.dropped {
+            out.extend_from_slice(&position.to_le_bytes());
+        }
+        out.extend_from_slice(&(self.added.len() as u16).to_le_bytes());
+        for (position, id) in &self.added {
+            out.extend_from_slice(&position.to_le_bytes());
+            out.extend_from_slice(&id.to_le_bytes());
+        }
+    }
+
+    /// Read what [`write`](Self::write) wrote.
+    fn read(c: &mut Cursor<'_>) -> Option<Self> {
+        let dropped = (0..c.u16()?)
+            .map(|_| c.u16())
+            .collect::<Option<Vec<u16>>>()?;
+        let added = (0..c.u16()?)
+            .map(|_| Some((c.u16()?, c.u32()?)))
+            .collect::<Option<Vec<(u16, u32)>>>()?;
+        Some(Self { dropped, added })
+    }
+}
+
+/// Append `ids` as a `u64` count then the ids.
+fn put_u32s(out: &mut Vec<u8>, ids: &[u32]) {
+    out.extend_from_slice(&(ids.len() as u64).to_le_bytes());
+    for id in ids {
+        out.extend_from_slice(&id.to_le_bytes());
+    }
+}
+
+/// Read a `u64` count of records at least `min_record_bytes` long each,
+/// rejecting one the bytes left could not hold.
+fn bounded_count(c: &mut Cursor<'_>, min_record_bytes: usize) -> Option<usize> {
+    let count = usize::try_from(c.u64()?).ok()?;
+    if count.checked_mul(min_record_bytes)? > c.remaining() {
+        return None;
+    }
+    Some(count)
+}
+
+/// Read what [`put_u32s`] wrote.
+fn take_u32s(c: &mut Cursor<'_>) -> Option<Vec<u32>> {
+    let count = bounded_count(c, 4)?;
+    let mut ids = Vec::with_capacity(count);
+    for _ in 0..count {
+        ids.push(c.u32()?);
+    }
+    Some(ids)
 }
 
 /// On-disk magic for a persisted `hnsw` data bundle (graph + node→doc-id map +
@@ -3763,6 +4322,22 @@ fn select_neighbors_heuristic<S: NodeScorer>(
     selected
 }
 
+/// The tallest live node (lowest id on a tie), the entry point a graph falls
+/// back to when its own is removed; `None` when every slot is a hole. A hole
+/// is a node with no neighbor lists.
+fn tallest_live(neighbors: &[Vec<Vec<u32>>], node_level: &[u32]) -> Option<u32> {
+    let mut best: Option<(u32, u32)> = None;
+    for (node, (lists, &level)) in neighbors.iter().zip(node_level).enumerate() {
+        if lists.is_empty() {
+            continue;
+        }
+        if best.is_none_or(|(_, top)| level > top) {
+            best = Some((node as u32, level));
+        }
+    }
+    best.map(|(node, _)| node)
+}
+
 /// Pick up to `slots` of `candidates` (sorted nearest-first) to join `kept`.
 /// The diversity rule of [`select_neighbors_heuristic`] picks first, judged
 /// against `kept` too, so a refilled list spreads like a built one; any slots
@@ -4553,6 +5128,516 @@ mod tests {
                 "round {round}: updated {updated_recall:.3}, rebuild {rebuilt_recall:.3}"
             );
         }
+    }
+
+    /// Exhaustive nearest-`k` live node ids: brute force that skips holes.
+    fn brute_force_live<S: NodeScorer>(
+        graph: &Hnsw,
+        scorer: &S,
+        query: &[f32],
+        k: usize,
+    ) -> Vec<u32> {
+        let prepared = scorer.prepare(query);
+        let mut all: Vec<Scored> = (0..graph.len() as u32)
+            .filter(|&n| !graph.is_hole(n))
+            .map(|n| Scored {
+                node: n,
+                dist: scorer.score(&prepared, n),
+            })
+            .collect();
+        all.sort_unstable();
+        all.into_iter().take(k).map(|s| s.node).collect()
+    }
+
+    /// Recall@`CHURN_K` of `graph` against brute force over its live nodes.
+    fn live_recall<S: NodeScorer>(graph: &Hnsw, scorer: &S, queries: &[Vec<f32>]) -> f64 {
+        let mut hit = 0usize;
+        for q in queries {
+            let truth: HashSet<u32> = brute_force_live(graph, scorer, q, CHURN_K)
+                .into_iter()
+                .collect();
+            hit += graph
+                .search(scorer, q, CHURN_K, CHURN_EF)
+                .into_iter()
+                .filter(|(node, _)| truth.contains(node))
+                .count();
+        }
+        hit as f64 / (queries.len() * CHURN_K) as f64
+    }
+
+    /// Asserts the hole invariants: no list names a hole, the entry is live
+    /// unless every node is a hole, and every live node is reachable from the
+    /// entry over layer 0.
+    fn assert_holes_unreachable(graph: &Hnsw) {
+        for (node, lists) in graph.neighbors.iter().enumerate() {
+            for &nb in lists.iter().flatten() {
+                assert!(!graph.is_hole(nb), "node {node} links to hole {nb}");
+            }
+        }
+        if graph.live_len() == 0 {
+            return;
+        }
+        assert!(!graph.is_hole(graph.entry), "entry is a hole");
+        let mut seen = vec![false; graph.len()];
+        let mut stack = vec![graph.entry];
+        seen[graph.entry as usize] = true;
+        while let Some(node) = stack.pop() {
+            for &nb in &graph.neighbors[node as usize][0] {
+                if !seen[nb as usize] {
+                    seen[nb as usize] = true;
+                    stack.push(nb);
+                }
+            }
+        }
+        let unreached = (0..graph.len() as u32)
+            .filter(|&n| !graph.is_hole(n) && !seen[n as usize])
+            .count();
+        assert_eq!(
+            unreached, 0,
+            "{unreached} live nodes unreachable from the entry"
+        );
+    }
+
+    #[test]
+    fn unlinking_keeps_ids_and_recall_close_to_a_rebuild() {
+        let n = 2000usize;
+        let vectors = random_unit_vectors(n, CHURN_DIM, 0xDE1E7E);
+        let scorer = Sq16Scorer::from_unit_vectors(&vectors, CHURN_DIM);
+        let graph = Hnsw::build_serial(&scorer, HnswParams::default());
+        let entry = graph.entry;
+
+        // Drop every fifth node, the entry point among them.
+        let mut removed: Vec<u32> = (0..n as u32).filter(|i| i % 5 == 0).collect();
+        removed.push(entry);
+        let unlinked = graph.unlink_nodes(&removed, &scorer);
+
+        assert_eq!(unlinked.len(), n, "slots are kept");
+        let holes: HashSet<u32> = removed.iter().copied().collect();
+        assert_eq!(unlinked.live_len(), n - holes.len());
+        for &hole in &holes {
+            assert!(unlinked.is_hole(hole));
+        }
+        assert_holes_unreachable(&unlinked);
+
+        // Recall over the live nodes stays close to a rebuild of them.
+        let live: Vec<u32> = (0..n as u32).filter(|i| !holes.contains(i)).collect();
+        let live_vectors: Vec<Vec<f32>> =
+            live.iter().map(|&i| vectors[i as usize].clone()).collect();
+        let live_scorer = Sq16Scorer::from_unit_vectors(&live_vectors, CHURN_DIM);
+        let rebuilt = Hnsw::build_serial(&live_scorer, HnswParams::default());
+        let queries = random_unit_vectors(60, CHURN_DIM, 0xC0FFEE3);
+        let unlinked_recall = live_recall(&unlinked, &scorer, &queries);
+        let rebuilt_recall = recall_against_truth(&rebuilt, &live_scorer, &queries);
+        assert!(
+            unlinked_recall >= rebuilt_recall - CHURN_RECALL_SLACK,
+            "after unlink {unlinked_recall:.3}, rebuild {rebuilt_recall:.3}"
+        );
+        // A live node is found by its own vector under its original id.
+        for &node in live.iter().step_by(37) {
+            let found = unlinked.search(&scorer, &vectors[node as usize], 1, CHURN_EF);
+            assert_eq!(found[0].0, node, "live node {node} lost its id");
+        }
+        // No search returns a hole.
+        for q in &queries {
+            for (node, _) in unlinked.search(&scorer, q, CHURN_K, CHURN_EF) {
+                assert!(!unlinked.is_hole(node), "search returned hole {node}");
+            }
+        }
+    }
+
+    #[test]
+    fn unlinking_holes_repeats_or_nothing_changes_nothing() {
+        let n = 600usize;
+        let vectors = random_unit_vectors(n, CHURN_DIM, 0xA11CE);
+        let scorer = Sq16Scorer::from_unit_vectors(&vectors, CHURN_DIM);
+        let graph = Hnsw::build_serial(&scorer, HnswParams::default());
+        let before = graph.to_bytes();
+        let graph = graph.unlink_nodes(&[], &scorer);
+        assert_eq!(graph.to_bytes(), before, "an empty unlink is a no-op");
+
+        let once = graph.unlink_nodes(&[7, 7, 19], &scorer);
+        let once_bytes = once.to_bytes();
+        let again = once.unlink_nodes(&[7, 19], &scorer);
+        assert_eq!(
+            again.to_bytes(),
+            once_bytes,
+            "unlinking holes again is a no-op"
+        );
+        assert_eq!(again.live_len(), n - 2);
+    }
+
+    #[test]
+    fn unlinking_is_deterministic() {
+        let n = 1200usize;
+        let vectors = random_unit_vectors(n, CHURN_DIM, 0xB0B);
+        let scorer = Sq16Scorer::from_unit_vectors(&vectors, CHURN_DIM);
+        let removed: Vec<u32> = (0..n as u32).filter(|i| i % 3 == 1).collect();
+        let run = || {
+            Hnsw::build_serial(&scorer, HnswParams::default())
+                .unlink_nodes(&removed, &scorer)
+                .to_bytes()
+        };
+        assert_eq!(run(), run());
+    }
+
+    #[test]
+    fn unlinking_every_node_then_appending_serves_only_new_nodes() {
+        let (n0, added) = (300usize, 200usize);
+        let vectors = random_unit_vectors(n0 + added, CHURN_DIM, 0xE4E4);
+        let prior = Sq16Scorer::from_unit_vectors(&vectors[..n0], CHURN_DIM);
+        let all: Vec<u32> = (0..n0 as u32).collect();
+        let empty = Hnsw::build_serial(&prior, HnswParams::default()).unlink_nodes(&all, &prior);
+        assert_eq!(empty.live_len(), 0);
+        assert!(
+            empty
+                .search(&prior, &vectors[0], CHURN_K, CHURN_EF)
+                .is_empty(),
+            "a graph of holes returns nothing"
+        );
+
+        let scorer = Sq16Scorer::from_unit_vectors(&vectors, CHURN_DIM);
+        let grown = empty.extend_serial(&scorer, HnswParams::default());
+        assert_eq!(grown.len(), n0 + added);
+        assert_eq!(grown.live_len(), added);
+        assert_holes_unreachable(&grown);
+        for node in (n0..n0 + added).step_by(17) {
+            let found = grown.search(&scorer, &vectors[node], 1, CHURN_EF);
+            assert_eq!(found[0].0, node as u32, "appended node {node} unreachable");
+        }
+    }
+
+    #[test]
+    fn repeated_unlink_and_extend_tracks_a_rebuild() {
+        let (start, rounds, churn) = (1500usize, 8usize, 300usize);
+        let pool = random_unit_vectors(start + rounds * churn, CHURN_DIM, 0xC4A3);
+        // `slots` holds every vector ever given a node id, holes included, so
+        // the scorer stays indexed by the graph's own ids.
+        let mut slots: Vec<Vec<f32>> = pool[..start].to_vec();
+        let mut graph = Hnsw::build_serial(
+            &Sq16Scorer::from_unit_vectors(&slots, CHURN_DIM),
+            HnswParams::default(),
+        );
+        let queries = random_unit_vectors(60, CHURN_DIM, 0xC0FFEE4);
+        for round in 0..rounds {
+            let scorer = Sq16Scorer::from_unit_vectors(&slots, CHURN_DIM);
+            let live: Vec<u32> = (0..graph.len() as u32)
+                .filter(|&n| !graph.is_hole(n))
+                .collect();
+            let removed: Vec<u32> = live
+                .iter()
+                .copied()
+                .filter(|n| (*n as usize + round).is_multiple_of(live.len() / churn))
+                .collect();
+            graph = graph.unlink_nodes(&removed, &scorer);
+            let fresh = start + round * churn;
+            slots.extend_from_slice(&pool[fresh..fresh + churn]);
+            let scorer = Sq16Scorer::from_unit_vectors(&slots, CHURN_DIM);
+            graph = graph.extend_serial(&scorer, HnswParams::default());
+            assert_eq!(graph.len(), slots.len());
+            assert_holes_unreachable(&graph);
+
+            let live_vectors: Vec<Vec<f32>> = (0..graph.len())
+                .filter(|&n| !graph.is_hole(n as u32))
+                .map(|n| slots[n].clone())
+                .collect();
+            let live_scorer = Sq16Scorer::from_unit_vectors(&live_vectors, CHURN_DIM);
+            let rebuilt = Hnsw::build_serial(&live_scorer, HnswParams::default());
+            let updated_recall = live_recall(&graph, &scorer, &queries);
+            let rebuilt_recall = recall_against_truth(&rebuilt, &live_scorer, &queries);
+            assert!(
+                updated_recall >= rebuilt_recall - CHURN_RECALL_SLACK,
+                "round {round}: updated {updated_recall:.3}, rebuild {rebuilt_recall:.3}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unlinked_graph_searches_the_same_after_a_round_trip() {
+        let n = 900usize;
+        let vectors = random_unit_vectors(n, CHURN_DIM, 0x7171);
+        let scorer = Sq16Scorer::from_unit_vectors(&vectors, CHURN_DIM);
+        let removed: Vec<u32> = (0..n as u32).filter(|i| i % 4 == 2).collect();
+        let graph =
+            Hnsw::build_serial(&scorer, HnswParams::default()).unlink_nodes(&removed, &scorer);
+        let decoded = Hnsw::from_bytes(&graph.to_bytes()).expect("decode");
+        let queries = random_unit_vectors(30, CHURN_DIM, 0x7272);
+        for q in &queries {
+            assert_eq!(
+                graph.search(&scorer, q, CHURN_K, CHURN_EF),
+                decoded.search(&scorer, q, CHURN_K, CHURN_EF)
+            );
+        }
+    }
+
+    #[test]
+    fn dropping_holes_keeps_every_search_result() {
+        let n = 900usize;
+        let vectors = random_unit_vectors(n, CHURN_DIM, 0xD7D7);
+        let scorer = Sq16Scorer::from_unit_vectors(&vectors, CHURN_DIM);
+        let mut removed: Vec<u32> = (0..n as u32).filter(|i| i % 5 == 3).collect();
+        let graph = Hnsw::build_serial(&scorer, HnswParams::default());
+        removed.push(graph.entry);
+        let graph = graph.unlink_nodes(&removed, &scorer);
+        let (compact, kept) = graph.without_holes();
+        assert_eq!(compact.len(), graph.live_len());
+        assert_holes_unreachable(&compact);
+        let kept_vectors: Vec<Vec<f32>> =
+            kept.iter().map(|&o| vectors[o as usize].clone()).collect();
+        let kept_scorer = Sq16Scorer::from_unit_vectors(&kept_vectors, CHURN_DIM);
+        for q in &random_unit_vectors(30, CHURN_DIM, 0xD8D8) {
+            let old: Vec<(u32, f32)> = graph.search(&scorer, q, CHURN_K, CHURN_EF);
+            let new: Vec<(u32, f32)> = compact
+                .search(&kept_scorer, q, CHURN_K, CHURN_EF)
+                .into_iter()
+                .map(|(node, d)| (kept[node as usize], d))
+                .collect();
+            assert_eq!(old, new);
+        }
+    }
+
+    #[test]
+    fn removing_nodes_from_an_unlinked_graph_drops_its_holes() {
+        let n = 800usize;
+        let vectors = random_unit_vectors(n, CHURN_DIM, 0x9A9A);
+        let scorer = Sq16Scorer::from_unit_vectors(&vectors, CHURN_DIM);
+        let removed: Vec<u32> = (0..n as u32).filter(|i| i % 6 == 0).collect();
+        let graph =
+            Hnsw::build_serial(&scorer, HnswParams::default()).unlink_nodes(&removed, &scorer);
+        let keep: Vec<bool> = (0..n as u32).map(|i| !graph.is_hole(i)).collect();
+        let survivors: Vec<Vec<f32>> = (0..n)
+            .filter(|&i| keep[i])
+            .map(|i| vectors[i].clone())
+            .collect();
+        let survivor_scorer = Sq16Scorer::from_unit_vectors(&survivors, CHURN_DIM);
+        let compacted = graph.remove_nodes(&keep, &survivor_scorer);
+        assert_eq!(compacted.len(), survivors.len());
+        assert_eq!(compacted.live_len(), survivors.len());
+        assert_holes_unreachable(&compacted);
+    }
+
+    /// One churn round on a graph with stable ids: unlink every
+    /// `stride`-th live node (offset by `round`), then append `added` fresh
+    /// vectors to `slots`. Returns the next generation.
+    fn churn_round(
+        graph: Hnsw,
+        slots: &mut Vec<Vec<f32>>,
+        fresh: &[Vec<f32>],
+        stride: usize,
+        round: usize,
+    ) -> Hnsw {
+        let scorer = Sq16Scorer::from_unit_vectors(slots, CHURN_DIM);
+        let removed: Vec<u32> = (0..graph.len() as u32)
+            .filter(|&n| !graph.is_hole(n) && (n as usize + round).is_multiple_of(stride))
+            .collect();
+        let graph = graph.unlink_nodes(&removed, &scorer);
+        slots.extend_from_slice(fresh);
+        let scorer = Sq16Scorer::from_unit_vectors(slots, CHURN_DIM);
+        graph.extend_serial(&scorer, HnswParams::default())
+    }
+
+    #[test]
+    fn a_reader_following_changes_matches_the_writer_exactly() {
+        let (start, rounds, added) = (1200usize, 10usize, 150usize);
+        let pool = random_unit_vectors(start + rounds * added, CHURN_DIM, 0xF0110);
+        let mut slots = pool[..start].to_vec();
+        let mut writer = Hnsw::build_serial(
+            &Sq16Scorer::from_unit_vectors(&slots, CHURN_DIM),
+            HnswParams::default(),
+        );
+        // The reader starts from the writer's base and only ever sees
+        // encoded changes.
+        let mut reader = writer.clone();
+        let queries = random_unit_vectors(20, CHURN_DIM, 0xF0111);
+        for round in 0..rounds {
+            let fresh = &pool[start + round * added..start + (round + 1) * added];
+            let next = churn_round(writer.clone(), &mut slots, fresh, 9, round);
+            let change = writer.diff(&next).expect("a successor");
+            let (removed, rewritten, appended) = change.counts();
+            assert!(removed > 0 && rewritten > 0 && appended == added);
+            let decoded = GraphChange::from_bytes(&change.to_bytes()).expect("decode");
+            assert_eq!(decoded, change);
+            reader = reader.apply_change(&decoded).expect("apply");
+            writer = next;
+            assert_eq!(reader.checksum(), writer.checksum(), "round {round}");
+            assert_eq!(reader.to_bytes(), writer.to_bytes(), "round {round}");
+            let scorer = Sq16Scorer::from_unit_vectors(&slots, CHURN_DIM);
+            for q in &queries {
+                assert_eq!(
+                    reader.search(&scorer, q, CHURN_K, CHURN_EF),
+                    writer.search(&scorer, q, CHURN_K, CHURN_EF)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_change_applies_only_to_its_own_base() {
+        let n = 500usize;
+        let pool = random_unit_vectors(n + 100, CHURN_DIM, 0xBA5E);
+        let mut slots = pool[..n].to_vec();
+        let base = Hnsw::build_serial(
+            &Sq16Scorer::from_unit_vectors(&slots, CHURN_DIM),
+            HnswParams::default(),
+        );
+        let next = churn_round(base.clone(), &mut slots, &pool[n..], 7, 0);
+        let change = base.diff(&next).expect("a successor");
+        // Applying twice: the second base is `next`, not `base`.
+        let once = base.clone().apply_change(&change).expect("apply");
+        assert_eq!(
+            once.apply_change(&change).err(),
+            Some(GraphChangeError::WrongBase)
+        );
+        // A different graph of the same length.
+        let other = Hnsw::build_serial(
+            &Sq16Scorer::from_unit_vectors(&pool[100..100 + n], CHURN_DIM),
+            HnswParams::default(),
+        );
+        assert_eq!(
+            other.apply_change(&change).err(),
+            Some(GraphChangeError::WrongBase)
+        );
+    }
+
+    #[test]
+    fn a_damaged_change_is_rejected_without_panicking() {
+        let n = 300usize;
+        let pool = random_unit_vectors(n + 40, CHURN_DIM, 0xDA3A);
+        let mut slots = pool[..n].to_vec();
+        let base = Hnsw::build_serial(
+            &Sq16Scorer::from_unit_vectors(&slots, CHURN_DIM),
+            HnswParams::default(),
+        );
+        let next = churn_round(base.clone(), &mut slots, &pool[n..], 11, 0);
+        let bytes = base.diff(&next).expect("a successor").to_bytes();
+        let expected = next.checksum();
+
+        for cut in 0..bytes.len() {
+            assert!(
+                GraphChange::from_bytes(&bytes[..cut]).is_none(),
+                "truncation at {cut} decoded"
+            );
+        }
+        let mut longer = bytes.clone();
+        longer.push(0);
+        assert!(
+            GraphChange::from_bytes(&longer).is_none(),
+            "trailing byte decoded"
+        );
+
+        // Flip one bit in every byte in turn: the change either fails to
+        // decode, fails to apply, or applies to exactly the writer's graph
+        // (a flip in a slot the checksum covers cannot go unnoticed).
+        for at in 0..bytes.len() {
+            let mut damaged = bytes.clone();
+            damaged[at] ^= 0x10;
+            if let Some(change) = GraphChange::from_bytes(&damaged)
+                && let Ok(graph) = base.clone().apply_change(&change)
+            {
+                assert_eq!(graph.checksum(), expected, "flip at {at} applied wrongly");
+                assert_eq!(graph.checksum(), change.checksum());
+            }
+        }
+    }
+
+    #[test]
+    fn diff_refuses_a_graph_that_is_not_a_successor() {
+        let n = 400usize;
+        let vectors = random_unit_vectors(n, CHURN_DIM, 0x5CC);
+        let scorer = Sq16Scorer::from_unit_vectors(&vectors, CHURN_DIM);
+        let graph = Hnsw::build_serial(&scorer, HnswParams::default());
+        let shorter = Hnsw::build_serial(
+            &Sq16Scorer::from_unit_vectors(&vectors[..n - 1], CHURN_DIM),
+            HnswParams::default(),
+        );
+        assert_eq!(
+            graph.diff(&shorter).expect_err("shorter"),
+            GraphChangeError::NotASuccessor
+        );
+
+        let holed = graph.clone().unlink_nodes(&[3, 4], &scorer);
+        // A hole that comes back is not a later generation.
+        assert_eq!(
+            holed.diff(&graph).expect_err("revived hole"),
+            GraphChangeError::NotASuccessor
+        );
+
+        let params = HnswParams {
+            m0: 24,
+            ..HnswParams::default()
+        };
+        let other_params = Hnsw::build_serial(&scorer, params);
+        assert_eq!(
+            graph.diff(&other_params).expect_err("other params"),
+            GraphChangeError::NotASuccessor
+        );
+    }
+
+    #[test]
+    fn nodes_added_and_removed_in_one_generation_arrive_as_holes() {
+        let (n, added) = (400usize, 60usize);
+        let pool = random_unit_vectors(n + added, CHURN_DIM, 0xADD0);
+        let base = Hnsw::build_serial(
+            &Sq16Scorer::from_unit_vectors(&pool[..n], CHURN_DIM),
+            HnswParams::default(),
+        );
+        let scorer = Sq16Scorer::from_unit_vectors(&pool, CHURN_DIM);
+        let grown = base.clone().extend_serial(&scorer, HnswParams::default());
+        // Two of the new nodes go again before the generation is published.
+        let next = grown.unlink_nodes(&[n as u32 + 5, n as u32 + 6], &scorer);
+        let change = base.diff(&next).expect("a successor");
+        let applied = base
+            .apply_change(&GraphChange::from_bytes(&change.to_bytes()).expect("decode"))
+            .expect("apply");
+        assert_eq!(applied.checksum(), next.checksum());
+        assert!(applied.is_hole(n as u32 + 5) && applied.is_hole(n as u32 + 6));
+        assert_eq!(applied.live_len(), n + added - 2);
+    }
+
+    /// A list edit carries only what differs, turns the old list into the
+    /// new one exactly, and refuses a list it was not made for.
+    #[test]
+    fn a_list_edit_holds_only_what_differs() {
+        let old = [5u32, 9, 2, 7, 11];
+        for new in [
+            vec![5, 9, 2, 7, 11],
+            vec![5, 9, 4, 2, 7, 11],
+            vec![5, 2, 7, 11],
+            vec![5, 4, 9, 2, 7],
+            vec![11, 7, 2, 9, 5],
+            vec![],
+            vec![1, 2, 3],
+        ] {
+            let edit = ListEdit::between(&old, &new);
+            assert_eq!(edit.apply(&old).as_deref(), Some(new.as_slice()), "{new:?}");
+            let mut bytes = Vec::new();
+            edit.write(&mut bytes);
+            assert_eq!(ListEdit::read(&mut Cursor::new(&bytes)), Some(edit));
+        }
+        // One id added to a list: one position and one id, nothing dropped.
+        let one_added = ListEdit::between(&old, &[5, 9, 4, 2, 7, 11]);
+        assert_eq!((one_added.dropped.len(), one_added.added.len()), (0, 1));
+        // An edit made for a longer list does not fit a shorter one.
+        let drops_last = ListEdit::between(&old, &old[..4]);
+        assert_eq!(drops_last.apply(&old[..2]), None);
+        let adds_at_end = ListEdit::between(&old, &[5, 9, 2, 7, 11, 3]);
+        assert_eq!(adds_at_end.apply(&old[..2]), None);
+    }
+
+    #[test]
+    fn an_empty_change_round_trips() {
+        let n = 200usize;
+        let vectors = random_unit_vectors(n, CHURN_DIM, 0xE3E3);
+        let graph = Hnsw::build_serial(
+            &Sq16Scorer::from_unit_vectors(&vectors, CHURN_DIM),
+            HnswParams::default(),
+        );
+        let change = graph.diff(&graph).expect("itself");
+        assert_eq!(change.counts(), (0, 0, 0));
+        let applied = graph
+            .clone()
+            .apply_change(&GraphChange::from_bytes(&change.to_bytes()).expect("decode"))
+            .expect("apply");
+        assert_eq!(applied.to_bytes(), graph.to_bytes());
     }
 
     /// A full `hnsw` bundle (graph + node→doc-id map + Sq16 plane)

@@ -72,8 +72,9 @@ const DRAIN_POLL: Duration = Duration::from_millis(100);
 const KIB: u64 = 1024;
 /// A statement that reads almost nothing.
 const SMALL_QUERY: &str = "SELECT name FROM docs WHERE name = 'doc 7'";
-/// A statement answered from the manifest: it opens the table and reads no superfile.
-const OPEN_QUERY: &str = "SELECT count(*) FROM docs";
+/// A statement answered from the manifest's statistics, so it opens the table with them and reads
+/// no superfile. A plain `count(*)` would not, and [`SCAN_QUERY`] would then read them while held.
+const OPEN_QUERY: &str = "SELECT count(name) FROM docs";
 /// A statement whose scan reads storage while it plans: its prune loads the table's term index
 /// before it opens a file. `name` has no term index of its own, so the prune keeps every file; the
 /// read is what holds planning.

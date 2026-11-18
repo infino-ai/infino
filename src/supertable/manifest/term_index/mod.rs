@@ -38,7 +38,7 @@ pub(crate) mod tier;
 
 use std::{
     cmp::Reverse,
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     fmt, fs,
     future::Future,
     io,
@@ -65,7 +65,6 @@ use bytes::Bytes;
 pub(crate) use format::TierRef;
 use format::{Layer, SliceRef};
 pub(crate) use format::{Location, Posting, Root, Run, Slice, legacy_bound_as_key};
-use fs4::{available_space, total_space};
 use futures::{StreamExt, TryStreamExt, stream};
 use rayon::{ThreadPool, ThreadPoolBuilder};
 use tempfile::TempDir;
@@ -91,7 +90,10 @@ use crate::{
     runtime_bridge::run_on_pool,
     runtime_metrics::rss::available_memory_bytes,
     storage::{StorageError, StorageProvider, permission_denied_in_chain},
-    superfile::{FtsError, fts::reader::BoolMode},
+    superfile::{
+        FtsError,
+        fts::{bm25::BOUND_ROUNDING_SLACK, reader::BoolMode},
+    },
     supertable::{
         error::QueryError,
         manifest::{
@@ -102,7 +104,7 @@ use crate::{
         query::prune::PruneLeaf,
         schema::FieldId,
     },
-    utils::trace::detail_span,
+    utils::{disk::disk_space, trace::detail_span},
 };
 
 /// Object-store directory prefix for term-index objects, sibling to the
@@ -128,7 +130,7 @@ const TIER_READ_MAX_BYTES: u64 = 16 * 1024 * 1024;
 /// below a real score would skip the superfile holding it; widening by
 /// this factor keeps every ceiling an upper bound and prunes no less in
 /// practice.
-const CEILING_SLACK: f32 = 1.0 + 8.0 * f32::EPSILON;
+const CEILING_SLACK: f32 = 1.0 + BOUND_ROUNDING_SLACK;
 
 /// Decoded posting runs kept per loaded index, keyed by `column \x1F term`.
 /// A ranked query asks for the same term's postings several times — to
@@ -510,7 +512,7 @@ async fn write_objects(
 /// which a fold reads in place, count as room. `None` when the filesystem
 /// cannot be read.
 pub(crate) fn fold_disk_bound(dir: &Path, measured: &AtomicU64, held: u64) -> Option<u64> {
-    let (free, total) = (available_space(dir).ok()?, total_space(dir).ok()?);
+    let (free, total) = disk_space(dir)?;
     Some(disk_bound(
         free,
         total,
@@ -3079,6 +3081,33 @@ impl TermIndex {
                 }
             }
         }
+        Ok(out)
+    }
+
+    /// Every term of `column` starting with `prefix` that one of `live`
+    /// holds, each once, in byte order: a prefix query's expansion read
+    /// from the index rather than from every superfile's dictionary. A
+    /// term only superfiles outside `live` hold — removed from the table,
+    /// their postings not yet folded away — is left out.
+    pub(crate) async fn prefix_terms(
+        &self,
+        column: FieldId,
+        prefix: &str,
+        live: &HashSet<Uuid>,
+    ) -> Result<BTreeSet<Vec<u8>>, TermIndexError> {
+        let head = column.term_key("").len();
+        let mut out = BTreeSet::new();
+        self.for_each_prefix(column, prefix, |key, run| {
+            let held = run.iter().any(|p| {
+                self.superfile_id(p.superfile)
+                    .is_some_and(|id| live.contains(&id))
+            });
+            if held && let Some(term) = key.get(head..) {
+                out.insert(term.to_vec());
+            }
+            true
+        })
+        .await?;
         Ok(out)
     }
 
@@ -6741,7 +6770,8 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().expect("runtime");
         let (_, root) = live_and_covered(&st, &storage, &rt);
         let cache_dir = TempDir::new().expect("cache dir");
-        let cache = MetadataDiskCache::new(cache_dir.path().to_path_buf(), 1 << 30).expect("cache");
+        let cache =
+            MetadataDiskCache::new(cache_dir.path().to_path_buf(), 1 << 30, None).expect("cache");
         let warm = TermIndex::new(
             root.clone(),
             String::new(),
@@ -7551,6 +7581,18 @@ mod tests {
             let prefixed = rt.block_on(index.route_prefix(fid("body"), "t0")).expect("prefix");
             let expect: HashSet<Uuid> = (0..10).flat_map(holders).collect();
             prop_assert_eq!(prefixed, expect);
+            // A prefix's terms, as only the even superfiles hold them: a
+            // term the others alone hold is no longer in the table.
+            let live: HashSet<Uuid> = (0..corpus.len())
+                .filter(|i| i % 2 == 0)
+                .map(|i| Uuid::from_u128(i as u128 + 1))
+                .collect();
+            let terms = rt.block_on(index.prefix_terms(fid("body"), "t0", &live)).expect("terms");
+            let expect: BTreeSet<Vec<u8>> = (0..10)
+                .filter(|&t| holders(t).iter().any(|id| live.contains(id)))
+                .map(|t| alphabet[t].as_bytes().to_vec())
+                .collect();
+            prop_assert_eq!(terms, expect);
             prop_assert!(rt.block_on(index.route(fid("body"), &["nope"], BoolMode::Or)).expect("route").is_empty());
         });
     }

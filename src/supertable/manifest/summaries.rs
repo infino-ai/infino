@@ -1869,7 +1869,7 @@ mod tests {
     /// their hash.
     async fn cache_holding(bytes: &[u8]) -> (TempDir, Arc<MetadataDiskCache>, ContentHash) {
         let dir = TempDir::new().expect("tempdir");
-        let cache = MetadataDiskCache::new(dir.path().join("cache"), TEST_CACHE_BUDGET_BYTES)
+        let cache = MetadataDiskCache::new(dir.path().join("cache"), TEST_CACHE_BUDGET_BYTES, None)
             .expect("cache");
         let hash = ContentHash::of(bytes);
         assert!(cache.put(hash, Bytes::copy_from_slice(bytes)).await);
@@ -2092,8 +2092,9 @@ mod tests {
         drop(cache);
         fs::write(the_cache_file(&dir), &impostor).expect("tear");
 
-        let restarted = MetadataDiskCache::new(dir.path().join("cache"), TEST_CACHE_BUDGET_BYTES)
-            .expect("cache");
+        let restarted =
+            MetadataDiskCache::new(dir.path().join("cache"), TEST_CACHE_BUDGET_BYTES, None)
+                .expect("cache");
         assert!(restarted.contains(&hash), "indexed on its name and length");
         assert!(
             SummariesSection::open_cached(&restarted, hash)
@@ -2126,6 +2127,7 @@ mod tests {
         let cache = MetadataDiskCache::new(
             dir.path().join("cache"),
             (bytes.len() + other.len() / 2) as u64,
+            None,
         )
         .expect("cache");
         let hash = ContentHash::of(&bytes);

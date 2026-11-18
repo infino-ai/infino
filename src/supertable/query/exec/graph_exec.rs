@@ -618,6 +618,7 @@ mod tests {
     use crate::{
         catalog::{Connection, IndexSpec, connect},
         config::{CompactionSettings, OptimizeOptions},
+        runtime_metrics::op_stats::with_op_stats,
         supertable::schema::{DECIMAL128_PRECISION, DECIMAL128_SCALE},
     };
 
@@ -907,6 +908,56 @@ mod tests {
         drop(graph);
         let gone = rows_db.query_sql(&walk).expect_err("the graph was dropped");
         assert!(gone.to_string().contains("dropped"), "{gone}");
+    }
+
+    /// One scoped statement's `tables_read`.
+    fn tables_read(db: &Connection, sql: &str) -> u64 {
+        let (_, stats) = with_op_stats(|| db.query_sql(sql).expect("query_sql"));
+        stats.tables_read
+    }
+
+    /// A walk reads its edge table and the table whose rows it returns, each
+    /// counted once however often the statement names it.
+    #[test]
+    fn a_walk_counts_each_table_it_reads_once() {
+        let dir = TempDir::new().expect("tempdir");
+        let db = connect(format!("file://{}", dir.path().display())).expect("connect");
+        let ids = things(&db);
+        edges(&db, &ids);
+
+        let join = format!(
+            "SELECT t.name FROM graph_walk('edges', 'things', 'things', [{}], 1, 1) g \
+             JOIN things t ON t._id = g._id",
+            ids[0]
+        );
+        assert_eq!(tables_read(&db, &join), 2, "edges, and things once");
+    }
+
+    /// An attached graph's edge table is a table of its own catalog: it
+    /// counts apart from a table of this catalog that shares its name.
+    #[test]
+    fn an_attached_edge_table_counts_apart_from_a_namesake() {
+        let dir = TempDir::new().expect("tempdir");
+        let rows_db = connect("memory://").expect("connect");
+        let ids = things(&rows_db);
+        let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, false)]));
+        rows_db
+            .create_table(EDGES, schema, IndexSpec::new())
+            .expect("create this catalog's edges");
+        let graph = connect(format!("file://{}", dir.path().display())).expect("connect");
+        edges(&graph, &ids);
+        rows_db.attach_graph(&graph, EDGES);
+
+        let sql = format!(
+            "SELECT e.name FROM edges e \
+             CROSS JOIN graph_walk('things', 'things', [{}], 1, 10) g",
+            ids[0]
+        );
+        assert_eq!(
+            tables_read(&rows_db, &sql),
+            3,
+            "this catalog's edges and things, and the graph's edges"
+        );
     }
 
     /// One id, an array literal and an unfolded `make_array` all read as
