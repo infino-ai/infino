@@ -337,9 +337,10 @@ impl SupertableReader {
     ) -> Result<Option<SortedFilter>, QueryError> {
         // Cast each literal as the statement does, then simplify (a literal that cannot cast
         // errors): on a `Float32` column, `f != 16777217 AND f = 16777216` keeps no row. Casts go
-        // to the stored types, as a statement's `Utf8View` compares as the stored string does.
+        // to the stored types of this reader's snapshot, as a statement's `Utf8View` compares as
+        // the stored string does and a later schema change does not move them.
         let schema = Arc::new(
-            DFSchema::try_from(self.sql_schemas().scalar().as_ref().clone())
+            DFSchema::try_from(self.snapshot_sql_schemas().scalar().as_ref().clone())
                 .map_err(QueryError::DataFusion)?,
         );
         let simplifier = ExprSimplifier::new(
@@ -399,11 +400,11 @@ impl SupertableReader {
     ///  - `IN`: one such share per value. `AND`: the product of its sides.
     ///  - anything else, or a column with no statistics: every row; the walk learns the share as it
     ///    reads.
-    fn expected_share(&self, condition: &Expr) -> Share {
+    fn expected_share(&self, condition: &Expr, files: &[Arc<SuperfileEntry>]) -> Share {
         let mut share = 1.0;
         let mut none = false;
         for conjunct in split_conjunction(condition) {
-            let one = self.conjunct_share(conjunct);
+            let one = self.conjunct_share(conjunct, files);
             share *= one.share;
             none |= one.none;
         }
@@ -413,14 +414,15 @@ impl SupertableReader {
         }
     }
 
-    /// [`Self::expected_share`] of one conjunct. A value table counts every row a file holds,
-    /// deleted ones too, so a literal missing from it is in no live row there.
-    fn conjunct_share(&self, conjunct: &Expr) -> Share {
+    /// [`Self::expected_share`] of one conjunct over `files`, the files the walk reads. A value
+    /// table counts every row a file holds, deleted ones too, so a literal missing from it is in no
+    /// live row there.
+    fn conjunct_share(&self, conjunct: &Expr, files: &[Arc<SuperfileEntry>]) -> Share {
         let unknown = Share {
             share: 1.0,
             none: false,
         };
-        let schemas = self.sql_schemas();
+        let schemas = self.snapshot_sql_schemas();
         let (column, literals): (String, Vec<ScalarValue>) = match conjunct {
             // An equality, or the `OR` of equalities the simplifier makes of a short `IN`.
             Expr::BinaryExpr(_) => match flatten_or_eq(conjunct, schemas.scalar()) {
@@ -459,7 +461,8 @@ impl SupertableReader {
         };
         // Statistics from a type the column has since left no longer compare as the statement does.
         let guard = ColumnTypeGuard::new(manifest, field);
-        let entries = &manifest.superfiles;
+        // The walk's files, not the snapshot's list, which a lazily opened table holds in part.
+        let entries = files;
         if entries.iter().any(|entry| guard.stats_are_stale(entry)) {
             return unknown;
         }
@@ -619,7 +622,7 @@ impl SupertableReader {
         let window_for = |share: f64, rows: usize| {
             ((needed(share, rows) * WINDOW_MARGIN).ceil() as usize).max(rows)
         };
-        let Share { share, none } = self.expected_share(rest);
+        let Share { share, none } = self.expected_share(rest, files);
         if none {
             // The statistics count every value the filter names, and no row holds one: it keeps
             // none.
@@ -1308,6 +1311,116 @@ mod tests {
         )
         .expect("convert tag");
         assert_page_matches_sql(&st, &col("tag").eq(lit(3_i64)), "tag = 3");
+    }
+
+    /// `seq` of the first row by `seq` that `filter` keeps, walked by `reader` over `files`.
+    fn first_walked_seq(
+        reader: &SupertableReader,
+        filter: Expr,
+        files: &[Arc<SuperfileEntry>],
+    ) -> Vec<Option<i64>> {
+        let predicates = vec![col("seq").gt_eq(lit(0_i64)), filter];
+        let walked = reader.sorted_hits_for_scan("seq", &predicates, false, false, 1, files);
+        let hits = reader
+            .block_on(walked)
+            .expect("walk")
+            .expect("answered by the walk");
+        let rows = reader
+            .block_on(resolve_hits_named(reader, &hits, Some(&["seq"])))
+            .expect("rows");
+        ints(&[rows], "seq")
+    }
+
+    #[test]
+    fn a_walk_casts_its_filter_in_its_snapshot_types() {
+        // `tag` is `Int64` in the snapshot a reader pins, then converted to `Float32`.
+        //  - In `Int64`, `tag != 2^24 + 1` keeps the row whose `tag` is 2^24.
+        //  - In `Float32` the literal would round to 2^24 and drop that row.
+        // This test pins that the pinned reader walks in its own snapshot's types.
+        let dir = TempDir::new().expect("tempdir");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("seq", DataType::Int64, false),
+            Field::new("tag", DataType::Int64, false),
+        ]));
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let options = SupertableOptions::new(Arc::clone(&schema), vec![], vec![])
+            .expect("options")
+            .with_storage(storage)
+            .with_range_indexes(&["seq".to_string()]);
+        let st = Supertable::create(options).expect("create");
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![0, 1])),
+                Arc::new(Int64Array::from(vec![FLOAT32_EXACT, 5])),
+            ],
+        )
+        .expect("batch");
+        let mut writer = st.writer().expect("writer");
+        writer.append(&batch).expect("append");
+        writer.commit().expect("commit");
+        drop(writer);
+        let reader = st.reader().expect("reader");
+        st.apply_schema(
+            &SchemaPatch::new(vec![FieldPatch::named("tag").with_type(DataType::Float32)]),
+            None,
+        )
+        .expect("convert tag");
+        let files = reader.manifest().superfiles.clone();
+        let filter = col("tag").not_eq(lit(FLOAT32_EXACT + 1));
+        assert_eq!(first_walked_seq(&reader, filter, &files), vec![Some(0)]);
+    }
+
+    #[test]
+    fn a_value_is_counted_over_the_files_walked_not_the_snapshot_list() {
+        // A table opened lazily, then appended to: its snapshot's list holds only the new file.
+        //  - The older file holds the one `r` row; the new file holds only `c`.
+        //  - `tag = 'r'` over both files finds that row; the new file's table alone lacks `r`.
+        // This test pins that the value tables of the files walked prove a value absent.
+        let dir = TempDir::new().expect("tempdir");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("seq", DataType::Int64, false),
+            Field::new("tag", DataType::Utf8, false),
+        ]));
+        let options = || {
+            let storage: Arc<dyn StorageProvider> =
+                Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+            SupertableOptions::new(Arc::clone(&schema), vec![], vec![])
+                .expect("options")
+                .with_storage(storage)
+                .with_range_indexes(&["seq".to_string()])
+        };
+        let append = |st: &Supertable, seq: i64, tag: &str| {
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(vec![seq])),
+                    Arc::new(StringArray::from(vec![tag])),
+                ],
+            )
+            .expect("batch");
+            let mut writer = st.writer().expect("writer");
+            writer.append(&batch).expect("append");
+            writer.commit().expect("commit");
+        };
+        let created = Supertable::create(options()).expect("create");
+        append(&created, 0, "r");
+        drop(created);
+        let st = Supertable::open(options().with_eager_load_threshold(0)).expect("open lazily");
+        append(&st, 1, "c");
+        let reader = st.reader().expect("reader");
+        assert_eq!(
+            reader.manifest().superfiles.len(),
+            1,
+            "the lazily opened snapshot lists only the appended file"
+        );
+        let got = reader
+            .query_sql(
+                "SELECT seq FROM supertable WHERE seq >= 0 AND tag = 'r' ORDER BY seq LIMIT 1",
+            )
+            .expect("sql");
+        assert_eq!(ints(&got, "seq"), vec![Some(0)]);
     }
 
     /// The CPU test's condition is 200 additions, so evaluating it dwarfs reading its rows.
