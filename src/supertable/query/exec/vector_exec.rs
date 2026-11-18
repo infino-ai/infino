@@ -659,8 +659,8 @@ mod tests {
     /// Distinct `tokio…` words across those rows; no `LIKE` in the test matches them.
     const DICT_TEST_TOKIO_WORDS: usize = 300;
 
-    /// A limit whose half share cannot hold that dictionary but leaves the vector search room.
-    const NO_ROOM_FOR_A_DICTIONARY: u64 = 4 * 1024 * 1024;
+    /// A limit that dictionary fits under but its half share does not, leaving the query room.
+    const NO_ROOM_FOR_A_DICTIONARY: u64 = 8 * 1024 * 1024;
 
     // ---- vector-column test harness (mirrors query::vector tests) ----
 
@@ -1231,14 +1231,11 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn vector_search_where_two_likes_reads_the_dictionary_once_when_it_is_kept() {
-        // A vector search filtered by two `LIKE`s, on a table read lazily from its store.
-        //  - with room, the dictionary is read once for both expansions and the match;
-        //  - with no room, it is read at each step;
-        //  - the rows are the same.
-        // This test pins the filtered vector search reading the dictionary once.
-        let dim = 16;
+    /// Runs `sql` over a table whose one file has a dictionary of a few MiB, read lazily from its
+    /// store on a fresh cache: with room to keep the dictionary, then with
+    /// [`NO_ROOM_FOR_A_DICTIONARY`]. Returns each run's rows, sorted, and how many times it read
+    /// the dictionary.
+    fn dictionary_runs(dim: usize, sql: &str) -> [(Vec<String>, usize); 2] {
         let titles: Vec<String> = (0..DICT_TEST_ROWS)
             .map(|n| {
                 let words: Vec<String> = (0..DICT_TEST_WORDS_PER_ROW)
@@ -1257,12 +1254,7 @@ mod tests {
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("local"));
         let written = options_one_superfile_per_commit(dim).with_storage(Arc::clone(&local));
         drop(supertable_ranked_by_index_with(written, dim, &titles));
-        let q = csv_one_hot(dim, 0);
-        let sql = format!(
-            "SELECT title FROM vector_search('emb', '{q}', 50) \
-             WHERE title LIKE 'rust12%' AND title LIKE 'rust1%'"
-        );
-        // The rows and the bytes read from the files' full-text sections, on a fresh cache.
+        // Each run's rows and the sizes of its reads from the files' full-text sections.
         let run = |budget: Arc<ConnectionMemoryBudget>| {
             let cache_dir = TempDir::new().expect("cache dir");
             let recording = RecordingStorage::over(Arc::clone(&local));
@@ -1277,24 +1269,65 @@ mod tests {
                 .filter_map(|e| e.subsection_offsets.as_ref().and_then(|o| o.fts))
                 .collect();
             let before = recording.n_ranges();
-            let rows = titles_of(&reader.query_sql(&sql).expect("filtered vector search"));
-            let fts_bytes: u64 = (recording.ranges_since(before).iter())
+            let mut rows = titles_of(&reader.query_sql(sql).expect("query"));
+            rows.sort_unstable();
+            let reads: Vec<u64> = (recording.ranges_since(before).iter())
                 .filter(|r| {
                     fts.iter()
                         .any(|&(at, len)| r.start >= at && r.end <= at + len)
                 })
                 .map(|r| r.end - r.start)
-                .sum();
-            (rows, fts_bytes)
+                .collect();
+            (rows, reads)
         };
+        let no_room = ConnectionMemoryBudget::with_limit(NO_ROOM_FOR_A_DICTIONARY);
+        let limit = no_room.remaining().expect("a set limit") as u64;
         let (kept_rows, kept) = run(ConnectionMemoryBudget::measured());
-        let (plain_rows, plain) = run(ConnectionMemoryBudget::with_limit(NO_ROOM_FOR_A_DICTIONARY));
+        let (plain_rows, plain) = run(no_room);
+        // The dictionary is the largest full-text read; the test needs it to fit the limit but
+        // not its share, so the share is what keeps it out.
+        let dictionary = kept.iter().copied().max().expect("a full-text read");
+        assert!(
+            limit / 2 < dictionary && dictionary < limit,
+            "the dictionary ({dictionary} bytes) fits the limit ({limit} bytes) but not its share"
+        );
+        let reads = |sizes: &[u64]| sizes.iter().filter(|&&n| n == dictionary).count();
+        [(kept_rows, reads(&kept)), (plain_rows, reads(&plain))]
+    }
+
+    #[test]
+    fn vector_search_where_two_likes_reads_the_dictionary_once_when_it_is_kept() {
+        // A vector search filtered by two `LIKE`s, on a table read lazily from its store.
+        //  - with room, the dictionary is read once for both expansions, the estimate and the match;
+        //  - with no room, it is read at each of those steps;
+        //  - the rows are the same.
+        // This test pins the filtered vector search reading the dictionary once.
+        let dim = 16;
+        let q = csv_one_hot(dim, 0);
+        let sql = format!(
+            "SELECT title FROM vector_search('emb', '{q}', 50) \
+             WHERE title LIKE 'rust12%' AND title LIKE 'rust1%'"
+        );
+        let [(kept_rows, kept), (plain_rows, plain)] = dictionary_runs(dim, &sql);
         assert!(!kept_rows.is_empty(), "the filter matches rows");
         assert_eq!(kept_rows, plain_rows, "the same rows either way");
-        assert!(
-            kept * 2 < plain,
-            "a kept dictionary is read once ({kept} bytes), not at each step ({plain} bytes)"
-        );
+        assert_eq!((kept, plain), (1, 4), "dictionary reads, kept and not");
+    }
+
+    #[test]
+    fn sql_where_two_likes_reads_the_dictionary_once_when_it_is_kept() {
+        // A SQL query filtered by two `LIKE`s, on a table read lazily from its store.
+        //  - with room, the dictionary is read once for both expansions, the estimate and the match;
+        //  - with no room, it is read at each of those steps;
+        //  - the rows are the same.
+        // This test pins a SQL `LIKE` reading the dictionary once.
+        let dim = 16;
+        let sql = "SELECT title FROM supertable WHERE title LIKE 'rust12%' AND title LIKE 'rust1%'";
+        let [(kept_rows, kept), (plain_rows, plain)] = dictionary_runs(dim, sql);
+        assert!(!kept_rows.is_empty(), "the filter matches rows");
+        assert_eq!(kept_rows, plain_rows, "the same rows either way");
+        assert_eq!(kept, 1, "read once when kept");
+        assert!(plain > 1, "read at each step without room ({plain} reads)");
     }
 
     #[test]

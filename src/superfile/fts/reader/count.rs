@@ -799,37 +799,19 @@ impl FtsReader {
     /// path, where a superfile is probed for every scored term of a query at
     /// once.
     ///
-    /// The dictionary is read through `dict`, so a query reads it once per file.
+    /// The dictionary is read through `dict`, which may already hold it.
     pub(crate) async fn term_dfs(
         &self,
         column: &str,
         tokens: &[&str],
         dict: &QueryDict,
     ) -> Result<(Vec<u64>, MatchWork), FtsError> {
-        self.resolve_column_id(column)?;
-        if tokens.is_empty() {
-            return Ok((Vec::new(), MatchWork::default()));
-        }
-        let (dict_bytes, fetched) = self.query_dict(dict).await?;
-        let (dfs, mut work) = self.term_dfs_with(&dict_bytes, column, tokens).await?;
-        work.planned_ranges += u64::from(fetched);
-        Ok((dfs, work))
-    }
-
-    /// [`Self::term_dfs`] over `dict_bytes`, this reader's dictionary already
-    /// fetched by the caller.
-    pub(crate) async fn term_dfs_with(
-        &self,
-        dict_bytes: &[u8],
-        column: &str,
-        tokens: &[&str],
-    ) -> Result<(Vec<u64>, MatchWork), FtsError> {
-        self.debug_assert_own_dict(dict_bytes);
         let column_id = self.resolve_column_id(column)?;
         if tokens.is_empty() {
             return Ok((Vec::new(), MatchWork::default()));
         }
-        let dict = Self::open_dict(dict_bytes)?;
+        let (dict_bytes, fetched) = self.query_dict(dict).await?;
+        let dict = Self::open_dict(&dict_bytes)?;
         let col_meta = &self.columns[column_id as usize];
 
         // First pass — pure in-memory dictionary lookups. Absent and inline
@@ -866,11 +848,11 @@ impl FtsReader {
 
         // One coalesced fetch for every PFOR header; `df` is its first 4
         // bytes. Each header is one planned range (pre-coalesce), and its
-        // bytes count as indexed work — the walk read them.
-        // The caller counts the dictionary fetch.
+        // bytes count as indexed work — the walk read them. The dictionary read counts once, when this
+        // call made it.
         let mut work = MatchWork {
             postings_bytes: 0,
-            planned_ranges: 0,
+            planned_ranges: u64::from(fetched),
             kernel_cpu_ns: 0,
         };
         if !header_ranges.is_empty() {
@@ -1188,8 +1170,8 @@ mod tests {
         let (blob, json) = build_standard_blob_with(&refs, Some(&order));
         let probe = FtsReader::open(blob.clone(), &json).expect("open");
         let dict = probe.dict_range.clone();
-        // The share is half of 90% of this, so the dictionary cannot fit in it.
-        let refused = ConnectionMemoryBudget::with_limit(dict.len() as u64);
+        // The dictionary fits the limit (90% of this) but not the share (half of that).
+        let refused = ConnectionMemoryBudget::with_limit(dict.len() as u64 * 3 / 2);
         let roomy = ConnectionMemoryBudget::measured();
         let cases = [
             (QueryDict::default(), 0, "no budget"),

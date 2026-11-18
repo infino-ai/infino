@@ -1054,13 +1054,13 @@ impl SupertableProvider {
                 return Ok((rows, work));
             }
         }
-        // Each column's distinct needles, in first-seen order: those an
-        // indexed term must contain (`ILIKE`), and those that must be an
-        // indexed term (`text_match`).
-        let mut by_column: BTreeMap<(&str, bool), Vec<&str>> = BTreeMap::new();
+        // Each column's distinct needles, in first-seen order: those that must be an indexed term
+        // (`text_match`, keyed `false` so they come first) and those an indexed term must contain
+        // (`ILIKE`).
+        let mut by_column: BTreeMap<(bool, &str), Vec<&str>> = BTreeMap::new();
         for leaf in check.filter.leaves() {
             let needles = by_column
-                .entry((leaf.column.as_str(), leaf.whole))
+                .entry((!leaf.whole, leaf.column.as_str()))
                 .or_default();
             if !needles.contains(&leaf.needle.as_str()) {
                 needles.push(&leaf.needle);
@@ -1068,12 +1068,8 @@ impl SupertableProvider {
         }
         let budget = &self.manifest.options.connection_memory_budget;
         let mut leaf_rows: HashMap<(&str, &str, bool), ContainsRows> = HashMap::new();
-        // `text_match` columns first, so their shared dictionary is let go before an `ILIKE` walk
-        // reserves from the same budget.
-        let mut by_column: Vec<((&str, bool), Vec<&str>)> = by_column.into_iter().collect();
-        by_column.sort_by_key(|&((_, whole), _)| !whole);
-        let mut dict = Some(dict);
-        for ((column, whole), needles) in by_column {
+        for ((ilike, column), needles) in by_column {
+            let whole = !ilike;
             // A superfile written before a rename keys its dictionary by
             // the column's old name.
             let file_column = prepared
@@ -1086,11 +1082,12 @@ impl SupertableProvider {
                         file_column,
                         &needles,
                         memos.get(column).map(Arc::as_ref),
-                        dict.get_or_insert_with(QueryDict::default),
+                        &dict,
                     )
                     .await
             } else {
-                dict = None;
+                // The `ILIKE` walk reads its own copy; the shared one is not held through it.
+                dict.give_back();
                 prepared
                     .reader
                     .contains_rows(file_column, &needles, Some(pool), Some(budget))

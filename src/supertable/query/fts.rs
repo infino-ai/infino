@@ -309,16 +309,17 @@ struct MatchKernel {
     budget: Arc<ConnectionMemoryBudget>,
 }
 
-/// The dictionary copy a file's match walks share: kept only when a positive walk the memo does not
-/// answer and a negated walk both read the dictionary; otherwise it keeps nothing.
+/// The dictionary copy a file's match walks share: kept only when the positive walk and the negated
+/// walk both read the dictionary, i.e. the memo answers neither; otherwise it keeps nothing.
 fn walk_dict(
     phrase_involved: bool,
-    has_negatives: bool,
     memo: Option<&FetchedTermMemo>,
     positive: &[&str],
+    negated: &[&str],
     budget: &Arc<ConnectionMemoryBudget>,
 ) -> QueryDict {
-    match !phrase_involved && has_negatives && !memo.is_some_and(|m| m.covers(positive)) {
+    let reads = |tokens: &[&str]| !memo.is_some_and(|m| m.covers(tokens));
+    match !phrase_involved && !negated.is_empty() && reads(positive) && reads(negated) {
         true => QueryDict::with_budget(budget),
         false => QueryDict::default(),
     }
@@ -372,11 +373,12 @@ impl MatchKernel {
     /// keeps: the positive walk minus any row a negated atom reaches.
     async fn docs(&self, r: &Arc<SuperfileReader>, suid: Uuid) -> Result<Vec<RowId>, QueryError> {
         let (column, memo, refs) = self.file_inputs(r, suid).await;
+        let neg_refs: Vec<&str> = self.negatives.iter().map(String::as_str).collect();
         let dict = walk_dict(
             self.phrase_involved,
-            self.has_negatives,
             memo.as_deref(),
             &refs,
+            &neg_refs,
             &self.budget,
         );
         // Any phrase atom (match or negated) takes the phrase-aware walk;
@@ -395,7 +397,6 @@ impl MatchKernel {
         // of the negatives). The df / count fast paths can't express
         // exclusion, so negation forces a materialized walk over both sets.
         let docs = if self.has_negatives {
-            let neg_refs: Vec<&str> = self.negatives.iter().map(String::as_str).collect();
             let (neg_docs, neg_work) = match self.negative_phrases.is_empty() {
                 true => {
                     r.token_match_prefetched(
@@ -420,6 +421,8 @@ impl MatchKernel {
         } else {
             docs
         };
+        // The row filter reads the dictionary on its own; the kept copy is not held through it.
+        drop(dict);
         // One flush per superfile: positive + negation walks.
         self.flush(&work);
         let hits = docs.len() as u64;
@@ -3518,13 +3521,9 @@ impl SupertableReader {
                     // negatives) or a tombstone. Negation *without* deletes
                     // takes the skip-based counting path below instead.
                     if tomb.is_some() {
-                        let dict = walk_dict(
-                            phrase_involved,
-                            has_negatives,
-                            memo.as_deref(),
-                            &refs,
-                            &budget,
-                        );
+                        let neg_refs: Vec<&str> = neg_arc.iter().map(|s| s.as_str()).collect();
+                        let dict =
+                            walk_dict(phrase_involved, memo.as_deref(), &refs, &neg_refs, &budget);
                         let (docs, mut work) = match phrase_involved {
                             true => {
                                 r.atoms_match_ids(&column_arc, &refs, &phrase_arc, match_mode)
@@ -3542,7 +3541,6 @@ impl SupertableReader {
                             }
                         };
                         let excluded: RoaringBitmap = if has_negatives {
-                            let neg_refs: Vec<&str> = neg_arc.iter().map(|s| s.as_str()).collect();
                             let (neg_docs, neg_work) = match neg_ph_arc.is_empty() {
                                 true => {
                                     r.token_match_prefetched(
@@ -4609,6 +4607,35 @@ mod tests {
 
     use crate::supertable::manifest::ScalarStats;
 
+    #[test]
+    fn match_walks_keep_the_dictionary_only_when_both_read_it() {
+        // A match with a positive and a negated walk, and a memo that answers some terms.
+        //  - both walks read the dictionary: it is kept;
+        //  - no negated term, a phrase, or a memo answering either walk: nothing is kept.
+        // This test pins a kept copy only where it saves a read.
+        let budget = ConnectionMemoryBudget::measured();
+        let memo = FetchedTermMemo::from_slots([(Box::from("known"), None)]);
+        let keeps =
+            |phrase: bool, memo: Option<&FetchedTermMemo>, positive: &[&str], negated: &[&str]| {
+                walk_dict(phrase, memo, positive, negated, &budget).keeps()
+            };
+        assert!(keeps(false, None, &["rust"], &["java"]));
+        assert!(keeps(false, Some(&memo), &["rust"], &["java"]));
+        assert!(!keeps(false, None, &["rust"], &[]), "no negated walk");
+        assert!(
+            !keeps(true, None, &["rust"], &["java"]),
+            "a phrase walk reads its own"
+        );
+        assert!(
+            !keeps(false, Some(&memo), &["known"], &["java"]),
+            "memo answers positives"
+        );
+        assert!(
+            !keeps(false, Some(&memo), &["rust"], &["known"]),
+            "memo answers negatives"
+        );
+    }
+
     /// A phrase's members are conjunctive, so a quoted phrase on its own
     /// prunes on all of them.
     ///
@@ -4911,10 +4938,11 @@ mod tests {
 
     use super::{
         BoolMode, FanOut, LocatedTerms, SharedTopK, SuperfileHit, SupertableReader,
-        build_work_units, ceilings_at_table_avgdl, fanout_for,
+        build_work_units, ceilings_at_table_avgdl, fanout_for, walk_dict,
     };
     use crate::{
         config::{CompactionSettings, OptimizeOptions},
+        memory::ConnectionMemoryBudget,
         storage::{LocalFsStorageProvider, ObjectMeta, StorageError, StorageProvider},
         superfile::{
             SuperfileReader,
@@ -4922,7 +4950,10 @@ mod tests {
             fts::{
                 bm25,
                 posting::BLOCK_LEN,
-                reader::{Bm25SearchOptions, ColumnLengthStats, QueryDict, top_k_initial_capacity},
+                reader::{
+                    Bm25SearchOptions, ColumnLengthStats, FetchedTermMemo, QueryDict,
+                    top_k_initial_capacity,
+                },
             },
             vector::layout::VectorLayout,
         },

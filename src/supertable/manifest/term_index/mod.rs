@@ -7364,19 +7364,13 @@ mod tests {
                 "an indexed superfile gets a memo"
             );
             let budget = ConnectionMemoryBudget::measured();
+            let dict = QueryDict::with_budget(&budget);
             let (plain, plain_work) = rt
-                .block_on(plan.evaluate(
-                    &sf,
-                    None,
-                    &TermMemos::new(),
-                    &QueryDict::with_budget(&budget),
-                ))
+                .block_on(plan.evaluate(&sf, None, &TermMemos::new(), &dict))
                 .expect("dictionary path");
-            assert_eq!(
-                budget.used(),
-                0,
-                "the kept dictionary's charge leaves with its cell"
-            );
+            assert!(budget.used() > 0, "the dictionary is kept");
+            drop(dict);
+            assert_eq!(budget.used(), 0, "and given back with its `QueryDict`");
             let (unkept, unkept_work) = rt
                 .block_on(plan.evaluate(&sf, None, &TermMemos::new(), &QueryDict::default()))
                 .expect("dictionary path, nothing kept");
