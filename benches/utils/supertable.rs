@@ -553,22 +553,24 @@ const COLD_TRACE_PRINT_MAX: usize = 12;
 /// Opt-in request-level cold trace; normal reports show only aggregate tables.
 const COLD_TRACE_ENV: &str = "INFINO_TRACE_VECTOR_COLD_FAN";
 
+/// Wait for every background fill a metered cold run started, so its fill row counts them all.
+/// The run deletes the table's prefix soon after the measurement, so this also keeps a fill from
+/// finding its file deleted under it.
+fn settle_cold_fills(consumer: &Supertable) {
+    // A cached SQL session holds the files its statements prepared, and a fill waits while its
+    // file is held (for the whole run, under the benches' long defer window). Let them go first.
+    consumer.drop_cached_sessions_for_test();
+    consumer
+        .wait_until_warm(FILL_SETTLE_TIMEOUT)
+        .expect("metered cold run: background fills settle");
+}
+
 /// Log one metered cold split (open / first query / repeat query), each
 /// window followed by its per-class GET attribution (user vs hidden table,
 /// data vs manifest namespace).
 fn log_cold_split(prefix: &str, split: &storage_meter::ColdStoreSplit) {
-    let fill_gets = split
-        .first_query
-        .bg_get_count
-        .saturating_add(split.second_query.bg_get_count)
-        .saturating_add(split.repeat_query.bg_get_count);
-    let fill_bytes = split
-        .first_query
-        .bg_get_bytes
-        .saturating_add(split.second_query.bg_get_bytes)
-        .saturating_add(split.repeat_query.bg_get_bytes);
     eprintln!(
-        "[{prefix}] metered cold: open {} GET + {} HEAD ({} down), first query {} GET ({} down, one-time warmup), second query {} GET ({} down, steady), repeat query {} GET ({} down), cache fill {} GET ({} down)",
+        "[{prefix}] metered cold: open {} GET + {} HEAD ({} down), first query {} GET ({} down, one-time warmup), second query {} GET ({} down, steady), repeat query {} GET ({} down), cache fill until settled {} GET ({} down; {} GET after the last query)",
         split.open.get_count,
         split.open.head_count,
         rss::fmt_bytes(split.open.get_bytes),
@@ -578,8 +580,9 @@ fn log_cold_split(prefix: &str, split: &storage_meter::ColdStoreSplit) {
         rss::fmt_bytes(split.second_query.get_bytes),
         split.repeat_query.get_count,
         rss::fmt_bytes(split.repeat_query.get_bytes),
-        fill_gets,
-        rss::fmt_bytes(fill_bytes),
+        split.fill.get_count,
+        rss::fmt_bytes(split.fill.get_bytes),
+        split.fill_after_queries.get_count,
     );
     eprintln!(
         "[{prefix}]   open: {} | first query: {} | second query: {} | repeat query: {}",
@@ -640,6 +643,7 @@ fn store_phases_from_measurement(measured: Option<ColdStoreMeasurement>) -> cost
         cold_second_wall_s: measured.as_ref().map(|m| m.second_wall_s),
         cold_second_cpu_s: measured.as_ref().and_then(|m| m.second_cpu_s),
         cold_repeat_query: measured.as_ref().map(|m| m.split.repeat_query),
+        cold_fill: measured.as_ref().map(|m| m.split.fill),
         ..Default::default()
     }
 }
@@ -1275,10 +1279,10 @@ fn measure_routing_state_with(
     }
 }
 
-/// Ceiling for forcing pending background fills to settle before a
-/// routing-state warm window is timed (the settle waiter pushes fills
+/// Ceiling for waiting on background fills to settle: before a routing-state warm window is timed,
+/// and at the end of a metered cold run, whose fill row counts them (the settle waiter pushes fills
 /// through held readers, so the wait is fill bandwidth, not politeness).
-const ROUTING_SETTLE_TIMEOUT: Duration = Duration::from_secs(600);
+const FILL_SETTLE_TIMEOUT: Duration = Duration::from_secs(600);
 /// Repeated warm probes per routing-state transition — sizes the p50
 /// sample and divides the accumulated warm GET count.
 const ROUTING_STATE_WARM_ITERS: usize = 20;
@@ -1490,6 +1494,7 @@ fn query_state_costs(states: &[RoutingStateStat]) -> [cost::QueryStateCost; 4] {
                 cold_query: cold.map(|value| value.split.first_query),
                 cold_second: cold.map(|value| value.split.second_query),
                 cold_repeat: cold.map(|value| value.split.repeat_query),
+                cold_fill: cold.map(|value| value.split.fill),
                 warm: state.warm_io,
                 warm_iters: state
                     .warm_io
@@ -2241,7 +2246,7 @@ pub mod fts {
             },
             &|| {
                 consumer
-                    .wait_until_warm(super::ROUTING_SETTLE_TIMEOUT)
+                    .wait_until_warm(super::FILL_SETTLE_TIMEOUT)
                     .expect("routing-state fill settle");
             },
             &|| measure_cold_store(built).map(super::routing_cold_from_measurement),
@@ -2388,12 +2393,14 @@ pub mod fts {
                     meter.provider(),
                     cache,
                 );
-                SettledColdConsumer {
-                    consumer: tiers::open_consumer(opts),
-                    _cache_dir: tiers::RetryingTempDir::from(cache_dir),
-                }
+                // Consumer first: it must shut down before the cache dir's
+                // removal starts — see `RetryingTempDir`.
+                (
+                    tiers::open_consumer(opts),
+                    tiers::RetryingTempDir::from(cache_dir),
+                )
             },
-            |SettledColdConsumer { consumer, .. }| {
+            |(consumer, _cache)| {
                 let terms = query.terms.join(" ");
                 let mode = exec_fts::to_infino_mode(query.mode);
                 let _ = consumer
@@ -2408,7 +2415,7 @@ pub mod fts {
                     )
                     .expect("metered cold bm25_search");
             },
-            |SettledColdConsumer { consumer, .. }, i| {
+            |(consumer, _cache), i| {
                 let q = steady[i % steady.len()];
                 let terms = q.terms.join(" ");
                 let mode = exec_fts::to_infino_mode(q.mode);
@@ -2425,7 +2432,7 @@ pub mod fts {
                     .expect("metered steady cold bm25_search");
             },
             steady.len().min(STEADY_COLD_SAMPLES),
-            |SettledColdConsumer { consumer, .. }| {
+            |(consumer, _cache)| {
                 let terms = query.terms.join(" ");
                 let mode = exec_fts::to_infino_mode(query.mode);
                 let _ = consumer
@@ -2440,31 +2447,10 @@ pub mod fts {
                     )
                     .expect("metered repeat cold bm25_search");
             },
+            |(consumer, _cache)| settle_cold_fills(consumer),
         );
         log_cold_split("supertable_fts", &measured.split);
         Some(measured)
-    }
-
-    /// The metered cold consumer. Its reads leave background downloads running, and the run
-    /// deletes the table's prefix soon after this measurement ends, so dropping it first waits
-    /// for those downloads: otherwise they find their files deleted under them. The wait runs
-    /// after the measurement's last meter snapshot, so it changes no measured number.
-    struct SettledColdConsumer {
-        // Declared before the cache dir so the consumer (and its disk
-        // cache) shuts down before removal starts — see `RetryingTempDir`.
-        consumer: Supertable,
-        _cache_dir: tiers::RetryingTempDir,
-    }
-
-    impl Drop for SettledColdConsumer {
-        fn drop(&mut self) {
-            if std::thread::panicking() {
-                return;
-            }
-            self.consumer
-                .wait_until_warm(super::ROUTING_SETTLE_TIMEOUT)
-                .expect("metered cold consumer: background downloads settle");
-        }
     }
 
     /// Cold-tier guard: fresh disk cache + consumer only. Same open
@@ -3749,6 +3735,7 @@ pub mod vector {
                     )
                     .unwrap_or_else(|e| panic!("metered repeat vector_search: {e}"));
             },
+            |(consumer, _cache)| settle_cold_fills(consumer),
         );
         log_cold_split(label, &measured.split);
         if let Some(trace) = first_query_trace {
@@ -5608,7 +5595,7 @@ pub mod sql {
             },
             &|| {
                 consumer
-                    .wait_until_warm(super::ROUTING_SETTLE_TIMEOUT)
+                    .wait_until_warm(super::FILL_SETTLE_TIMEOUT)
                     .expect("routing-state fill settle");
             },
             &|| measure_cold_store(built).map(super::routing_cold_from_measurement),
@@ -5682,6 +5669,7 @@ pub mod sql {
                     "metered repeat cold SQL returned no rows: {first}"
                 );
             },
+            |(consumer, _cache)| settle_cold_fills(consumer),
         );
         log_cold_split("supertable_sql", &measured.split);
         Some(measured)

@@ -34,7 +34,7 @@ use crate::{
     markdown::{fmt_count, fmt_time},
     report::{Better, Block, Cell, Report, Section, context, metric, text},
     rss::fmt_bytes,
-    storage_meter::{ObjectStoreMeter, background_fill_meter, merge_background_fill},
+    storage_meter::ObjectStoreMeter,
 };
 
 /// S3 Standard capacity, USD per GB-month (decimal GB).
@@ -292,6 +292,9 @@ pub struct QueryStateIo {
     /// (admit-window centroids, Sq8 meta, stable-id blocks) is resident.
     pub cold_second: Option<ObjectStoreMeter>,
     pub cold_repeat: Option<ObjectStoreMeter>,
+    /// Background-fill GETs of the whole cold run, counted until every fill settled (see
+    /// [`ColdStoreSplit::fill`](crate::storage_meter::ColdStoreSplit::fill)).
+    pub cold_fill: Option<ObjectStoreMeter>,
     pub warm: Option<ObjectStoreMeter>,
     pub warm_iters: u64,
 }
@@ -420,6 +423,8 @@ pub struct StorePhases {
     /// is ~0 GETs; a repeat of the full fan means foreground reads are
     /// not retained (or background fill has not landed yet).
     pub cold_repeat_query: Option<ObjectStoreMeter>,
+    /// Background-fill GETs of the whole cold run, counted until every fill settled.
+    pub cold_fill: Option<ObjectStoreMeter>,
     /// Steady-state warm window: [`Self::warm_query_iters`] queries on
     /// the shared, cache-hot consumer — the same consumer the warm
     /// latency battery timed, so I/O and CPU describe the same path.
@@ -1321,13 +1326,8 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
             "Cold query (second, steady cold)",
             c.store.cold_second_query,
         );
-        let fill = match (c.store.cold_query, c.store.cold_repeat_query) {
-            (Some(q), Some(r)) => Some(merge_background_fill(&q, &r)),
-            (Some(q), None) => Some(background_fill_meter(&q)),
-            (None, Some(r)) => Some(background_fill_meter(&r)),
-            (None, None) => None,
-        };
-        per_query_row(&mut io_rows, "Cache fill (during cold query)", fill);
+        let fill = c.store.cold_fill;
+        per_query_row(&mut io_rows, "Cache fill (until fills settle)", fill);
         per_query_row(
             &mut io_rows,
             "Repeat query on cold consumer",
@@ -1363,15 +1363,14 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
                 &format!("Cold 2nd (steady cold) — {label}"),
                 state.io.cold_second,
             );
-            // Background lazy→mmap fill concurrent with the cold/repeat
-            // windows — counted separately so query GETs stay foreground-only.
-            let fill = match (state.io.cold_query, state.io.cold_repeat) {
-                (Some(q), Some(r)) => Some(merge_background_fill(&q, &r)),
-                (Some(q), None) => Some(background_fill_meter(&q)),
-                (None, Some(r)) => Some(background_fill_meter(&r)),
-                (None, None) => None,
-            };
-            per_query_row(&mut io_rows, &format!("Fill — {label}"), fill);
+            // Background lazy→mmap fill of the whole cold run, until it settles — counted
+            // separately so query GETs stay foreground-only.
+            let fill = state.io.cold_fill;
+            per_query_row(
+                &mut io_rows,
+                &format!("Fill (until fills settle) — {label}"),
+                fill,
+            );
             per_query_row(
                 &mut io_rows,
                 &format!("Repeat — {label}"),
@@ -2366,23 +2365,15 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
                 compute + c.store.cold_open.map(|io| request_usd(&io)).unwrap_or(0.0)
             })
         });
-    // Background lazy->mmap cache fill, concurrent with the cold/repeat
-    // windows (the I/O ledger's "Fill" row prices the identical quantity —
+    // Background lazy->mmap cache fill of the whole cold run, counted until it
+    // settles (the I/O ledger's "Fill" row prices the identical quantity —
     // see per_query_row's Fill construction above, which this mirrors). It
     // is a ONE-TIME cost per cold-open cycle (the fill runs once, warming
     // the cache for whatever queries follow), not a recurring per-query
     // cost — folding it into the recurring cold rate would bill every
     // steady cold query for a fill that happened once. Shown as its own
     // line, like the bulk per-event rates, rather than silently dropped.
-    let fill_meter =
-        query_states
-            .last()
-            .and_then(|state| match (state.io.cold_query, state.io.cold_repeat) {
-                (Some(q), Some(r)) => Some(merge_background_fill(&q, &r)),
-                (Some(q), None) => Some(background_fill_meter(&q)),
-                (None, Some(r)) => Some(background_fill_meter(&r)),
-                (None, None) => None,
-            });
+    let fill_meter = query_states.last().and_then(|state| state.io.cold_fill);
     if let Some(fill) = fill_meter.filter(|f| f.get_count > 0) {
         let fill_usd = request_usd(&fill);
         summary_rows.push(vec![
