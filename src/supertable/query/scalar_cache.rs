@@ -101,35 +101,33 @@ impl<K: Eq + Hash, V: Clone> ByteLru<K, V> {
         if let Some(&at) = state.index.get(&key) {
             state.remove(at);
         }
-        state.push(key, value, bytes, self.max_bytes);
-    }
-
-    /// The value already under `key`, marking it used, or else `value`,
-    /// kept under `key` as [`Self::insert`] keeps it. The first value kept
-    /// wins, so callers racing to fill a key all share one value.
-    pub(crate) fn get_or_insert(&self, key: K, value: V, bytes: usize) -> V {
-        let mut state = self.state.lock().expect("decoded cache poisoned");
-        if let Some(&at) = state.index.get(&key) {
-            state.unlink(at);
-            state.link_newest(at);
-            return state.slots[at]
-                .as_ref()
-                .expect("an indexed key's slot holds its value")
-                .value
-                .clone();
+        while state.bytes.saturating_add(bytes) > self.max_bytes {
+            let Some(oldest) = state.oldest else {
+                break;
+            };
+            state.remove(oldest);
         }
-        if bytes <= self.max_bytes {
-            state.push(key, value.clone(), bytes, self.max_bytes);
-        }
-        value
-    }
-
-    /// Drop the value under `key`, if one is kept.
-    pub(crate) fn remove(&self, key: &K) {
-        let mut state = self.state.lock().expect("decoded cache poisoned");
-        if let Some(&at) = state.index.get(key) {
-            state.remove(at);
-        }
+        let key = Arc::new(key);
+        let slot = LruSlot {
+            key: Arc::clone(&key),
+            value,
+            bytes,
+            newer: None,
+            older: None,
+        };
+        let at = match state.free.pop() {
+            Some(at) => {
+                state.slots[at] = Some(slot);
+                at
+            }
+            None => {
+                state.slots.push(Some(slot));
+                state.slots.len() - 1
+            }
+        };
+        state.link_newest(at);
+        state.index.insert(key, at);
+        state.bytes = state.bytes.saturating_add(bytes);
     }
 
     /// How many values are kept.
@@ -144,39 +142,6 @@ impl<K: Eq + Hash, V: Clone> ByteLru<K, V> {
 }
 
 impl<K: Eq + Hash, V> LruState<K, V> {
-    /// Keeps `value` under `key`, which is not kept yet, as the newest,
-    /// first evicting the least recently used until `bytes` fits in
-    /// `max_bytes`.
-    fn push(&mut self, key: K, value: V, bytes: usize, max_bytes: usize) {
-        while self.bytes.saturating_add(bytes) > max_bytes {
-            let Some(oldest) = self.oldest else {
-                break;
-            };
-            self.remove(oldest);
-        }
-        let key = Arc::new(key);
-        let slot = LruSlot {
-            key: Arc::clone(&key),
-            value,
-            bytes,
-            newer: None,
-            older: None,
-        };
-        let at = match self.free.pop() {
-            Some(at) => {
-                self.slots[at] = Some(slot);
-                at
-            }
-            None => {
-                self.slots.push(Some(slot));
-                self.slots.len() - 1
-            }
-        };
-        self.link_newest(at);
-        self.index.insert(key, at);
-        self.bytes = self.bytes.saturating_add(bytes);
-    }
-
     /// Takes slot `at` out of the recency list, joining its neighbours.
     fn unlink(&mut self, at: usize) {
         let Some((newer, older)) = self.slots[at].as_ref().map(|slot| (slot.newer, slot.older))
@@ -343,13 +308,6 @@ mod tests {
     const VALUE_BYTES: usize = 10;
     /// Values the recency tests' budget holds.
     const KEPT_VALUES: usize = 3;
-    /// Weight of each value in the `get_or_insert` test, so its budget
-    /// bounds a count, as the lazy reader cache's does.
-    const UNIT_WEIGHT: usize = 1;
-    /// Values the `get_or_insert` test's budget holds before evicting.
-    const COUNTED_VALUES: usize = 2;
-    /// A weight one past the `get_or_insert` test's whole budget.
-    const OVERSIZED_WEIGHT: usize = COUNTED_VALUES + 1;
 
     /// A lookup makes a value the newest, so the next eviction takes the
     /// value used longest ago instead; replacing a key frees its old bytes;
@@ -384,31 +342,6 @@ mod tests {
             KEPT_VALUES,
             "freed slots are reused"
         );
-    }
-
-    /// `get_or_insert` keeps the first value under a key, so racing fills
-    /// all share it, marks a hit used, and evicts the least recently used
-    /// past the bound, as the lazy reader cache relies on with unit weights.
-    #[test]
-    fn get_or_insert_keeps_the_first_value_and_drops_the_least_recently_used() {
-        let lru: ByteLru<u32, Arc<u32>> = ByteLru::new(UNIT_WEIGHT * COUNTED_VALUES);
-        assert!(lru.get(&1).is_none());
-        let first = lru.get_or_insert(1, Arc::new(10), UNIT_WEIGHT);
-        // A racing fill's value is not kept: every caller gets the first.
-        let raced = lru.get_or_insert(1, Arc::new(11), UNIT_WEIGHT);
-        assert!(Arc::ptr_eq(&first, &raced));
-        assert!(Arc::ptr_eq(&first, &lru.get(&1).expect("kept")));
-        lru.get_or_insert(2, Arc::new(20), UNIT_WEIGHT);
-        // The racing fill above made 1 the newest, so 2 goes next.
-        lru.get_or_insert(1, Arc::new(12), UNIT_WEIGHT);
-        lru.get_or_insert(3, Arc::new(30), UNIT_WEIGHT);
-        assert!(lru.get(&2).is_none(), "the least recently used goes");
-        assert_eq!(lru.get(&1).as_deref(), Some(&10));
-        assert_eq!(lru.get(&3).as_deref(), Some(&30));
-        // A value larger than the whole budget is handed back but not kept.
-        assert_eq!(*lru.get_or_insert(4, Arc::new(40), OVERSIZED_WEIGHT), 40);
-        assert!(lru.get(&4).is_none());
-        assert_eq!(lru.len(), COUNTED_VALUES);
     }
 
     #[test]

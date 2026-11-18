@@ -211,6 +211,16 @@ struct ProbeCtx<'a> {
 }
 
 impl ColumnReader {
+    /// Heap bytes a read has loaded into this column since open: the parsed
+    /// quantizer and per-doc norms. Its transposed codes are not counted:
+    /// each holds its own reservation against the connection's budget.
+    fn held_bytes(&self) -> usize {
+        self.lazy_sq8_parsed.get().map_or(0, |parsed| {
+            let norms = parsed.per_doc_norms.as_ref().map_or(0, |norms| norms.len());
+            (parsed.scale.len() + parsed.offset.len() + norms) * size_of::<f32>()
+        })
+    }
+
     /// byte range covering one cluster's
     /// `[codes_chunk + doc_ids_chunk]` block as a single
     /// contiguous span. Pulled in **one** range fetch per
@@ -366,6 +376,24 @@ pub struct VectorReader {
 }
 
 impl VectorReader {
+    /// Heap bytes reads have loaded into this reader since open: each
+    /// column's parsed quantizer and norms, and the stable-id region a cold
+    /// probe stashed.
+    pub(crate) fn held_bytes(&self) -> usize {
+        let stashed = self
+            .cold_stable_id_region
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map_or(0, Bytes::len);
+        stashed
+            + self
+                .columns
+                .iter()
+                .map(ColumnReader::held_bytes)
+                .sum::<usize>()
+    }
+
     /// Base flat-cluster id for `cell_id` on a multi-cell (v2) blob: the global
     /// flat cluster the centroid-graph router indexes is
     /// `flat_cluster_base_for_cell(cell) + local_fine_ordinal`. `None` on the v1

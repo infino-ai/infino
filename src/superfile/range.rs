@@ -656,6 +656,11 @@ struct BlockDir {
 }
 
 impl RangeDirectory {
+    /// Heap bytes the parsed directory holds.
+    pub(crate) fn held_bytes(&self) -> usize {
+        self.columns.len() * size_of::<ColumnDir>() + self.blocks.len() * size_of::<BlockDir>()
+    }
+
     /// Parse the directory from `bytes`, which must start at the region's
     /// first byte and hold at least the directory; `region_len` is the
     /// whole region's length, the bound every block must fit in.

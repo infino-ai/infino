@@ -589,6 +589,29 @@ pub(super) fn short_body_malformed() -> FtsError {
 }
 
 impl FtsReader {
+    /// Heap bytes reads have loaded into this reader since it opened: the
+    /// doc-id map, each column's norms and long terms' block tables.
+    pub(crate) fn held_bytes(&self) -> usize {
+        let doc_map = match self.doc_map.get() {
+            Some(DocMap::Permuted(map)) => map.len(),
+            _ => 0,
+        };
+        doc_map
+            + self.block_tables.held_bytes()
+            + self
+                .columns
+                .iter()
+                .map(ColumnMeta::held_bytes)
+                .sum::<usize>()
+    }
+
+    /// What a view from [`Self::with_scoring`] holds beyond the reader it
+    /// was derived from, whose doc-id map, norms and block tables it shares:
+    /// its columns' own decode tables.
+    pub(crate) fn view_held_bytes(&self) -> usize {
+        self.columns.iter().map(ColumnMeta::view_held_bytes).sum()
+    }
+
     /// A view of this reader that scores at `scoring` instead of what its
     /// columns declare, or `None` when that changes no column.
     ///

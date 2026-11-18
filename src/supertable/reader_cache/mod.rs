@@ -38,6 +38,7 @@ pub mod block_source;
 pub mod config;
 pub mod disk;
 pub mod in_memory;
+mod kept_lazy;
 
 use std::sync::Arc;
 
@@ -97,8 +98,9 @@ pub trait SuperfileReaderCache: Send + Sync {
     /// Default no-op — bounded caches (e.g. LRU) don't need this.
     fn remove(&self, _uri: &SuperfileUri) {}
 
-    /// The lazy reader [`Self::keep_lazy`] kept for `uri`, marking it used.
-    /// Default: none is kept.
+    /// The lazy reader [`Self::keep_lazy`] kept for `uri`, marking it used
+    /// and weighing it again, since queries load into it. Default: none is
+    /// kept.
     fn lazy(&self, _uri: &SuperfileUri) -> Option<Arc<SuperfileReader>> {
         None
     }
@@ -112,6 +114,12 @@ pub trait SuperfileReaderCache: Send + Sync {
     fn keep_lazy(&self, _uri: SuperfileUri, reader: Arc<SuperfileReader>) -> Arc<SuperfileReader> {
         reader
     }
+
+    /// Charge what [`Self::keep_lazy`] keeps to `budget`, the memory budget
+    /// of the connection that opened the table, and let it take that back
+    /// when a reservation does not fit. Called when a table opens with its
+    /// options. Default: nothing is kept, so nothing is charged.
+    fn attach_memory_budget(&self, _budget: &Arc<crate::memory::ConnectionMemoryBudget>) {}
 }
 
 /// Error type for [`SuperfileReaderCache`] operations.

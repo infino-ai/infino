@@ -1139,6 +1139,43 @@ impl SuperfileReader {
         })
     }
 
+    /// The memory this reader holds beyond its file's bytes, as far as it is
+    /// counted: the parsed footer (with its page index once a scan loaded
+    /// it), the scan's own copy when it is a separate parse, and what reads
+    /// have loaded since open: the FTS doc-id map, norms and block tables,
+    /// the scored view's decode tables, the vector columns' parsed quantizer
+    /// and norms, and the range directory. Grows as reads load more, so a
+    /// holder that keeps the reader weighs it again when it hands it out.
+    ///
+    /// Not counted: the bytes the open read (a lazy reader holds only the
+    /// tail the open batch names), and the vector columns' transposed
+    /// codes, which hold their own reservations against the connection's
+    /// budget.
+    pub(crate) fn held_bytes(&self) -> usize {
+        let footer = self.footer.load();
+        let parquet = footer.parquet();
+        let scan = self
+            .scan_footer
+            .get()
+            .filter(|scan| !Arc::ptr_eq(*scan, parquet))
+            .map_or(0, |scan| scan.memory_size());
+        let scored = self
+            .scored_fts
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .map_or(0, |(_, view)| view.view_held_bytes());
+        parquet.memory_size()
+            + scan
+            + scored
+            + self.fts.as_ref().map_or(0, FtsReader::held_bytes)
+            + self.vec.as_ref().map_or(0, VectorReader::held_bytes)
+            + self
+                .range_directory
+                .get()
+                .map_or(0, |directory| directory.held_bytes())
+    }
+
     /// The file's footer metadata: the parse made at open, or the
     /// page-indexed one once something has loaded it. The SQL scan path
     /// serves row-group counts and DataFusion's parquet opener from this

@@ -325,6 +325,11 @@ const BLOCK_TABLE_CACHE_MIN_BLOCKS: usize = 256;
 const BLOCK_TABLE_CACHE_MAX_BLOCKS: usize = 1 << 20;
 
 impl BlockTableCache {
+    /// Heap bytes the cached block tables hold.
+    pub(super) fn held_bytes(&self) -> usize {
+        self.blocks.load(AtomicOrdering::Relaxed) * size_of::<BlockMeta>()
+    }
+
     /// Blocks held across all cached tables.
     #[cfg(test)]
     pub(super) fn cached_blocks(&self) -> usize {
