@@ -49,67 +49,13 @@ impl FtsReader {
         debug_assert!(docs.windows(2).all(|w| w[0] < w[1]), "docs ascend");
         let column_id = self.resolve_column_id(column)?;
         let col = &self.columns[column_id as usize];
-        match entry {
-            DictEntry::Inline { doc_id, tf } => Ok(docs
+        if let DictEntry::Inline { doc_id, tf } = entry {
+            return Ok(docs
                 .iter()
                 .map(|&d| if d == doc_id { col.inline_tf(tf) } else { 0 })
-                .collect()),
-            DictEntry::Pfor {
-                metadata_offset,
-                postings_length,
-                short: true,
-            } => {
-                let body = self
-                    .fetch_term_postings(&[(metadata_offset as usize, postings_length as usize)])
-                    .await?
-                    .pop()
-                    .ok_or_else(|| malformed("short body"))?;
-                let (mut ids, mut tfs) = (vec![0u32; BLOCK_LEN], vec![0u32; BLOCK_LEN]);
-                let n = decode_short(&body, col.positions, &mut ids, &mut tfs)
-                    .ok_or_else(|| malformed("short body"))?
-                    .n;
-                Ok(lookup(&ids[..n], &tfs[..n], docs))
-            }
-            DictEntry::Pfor {
-                metadata_offset,
-                postings_length,
-                short: false,
-            } => {
-                self.probe_long(
-                    col.positions,
-                    col.wide_blocks,
-                    metadata_offset as usize,
-                    postings_length as usize,
-                    df,
-                    docs,
-                )
-                .await
-            }
+                .collect());
         }
-    }
-
-    /// [`Self::probe_tfs`] for a long-form term at `metadata_offset` in the
-    /// postings region, `postings_length` bytes long.
-    async fn probe_long(
-        &self,
-        positional: bool,
-        wide: bool,
-        metadata_offset: usize,
-        postings_length: usize,
-        df: u64,
-        docs: &[u32],
-    ) -> Result<Vec<u32>, FtsError> {
-        let blocks = self
-            .covering_blocks(
-                positional,
-                wide,
-                metadata_offset,
-                postings_length,
-                df,
-                docs,
-                false,
-            )
-            .await?;
+        let blocks = self.blocks_for(col, entry, df, docs, false).await?;
         Ok(docs
             .iter()
             .map(|&d| {
@@ -119,6 +65,66 @@ impl FtsReader {
                     .map_or(0, |b| lookup(&b.ids, &b.tfs, &[d])[0])
             })
             .collect())
+    }
+
+    /// The blocks of a term in a `Pfor` dictionary value covering `docs`,
+    /// decoded, each with its position group when `with_positions`: a
+    /// short-form term's one body, or a long-form term's covering blocks.
+    async fn blocks_for(
+        &self,
+        col: &ColumnMeta,
+        entry: DictEntry,
+        df: u64,
+        docs: &[u32],
+        with_positions: bool,
+    ) -> Result<Vec<ProbedBlock>, FtsError> {
+        let DictEntry::Pfor {
+            metadata_offset,
+            postings_length,
+            short,
+        } = entry
+        else {
+            return Err(malformed("an inline term has no blocks"));
+        };
+        let (offset, len) = (metadata_offset as usize, postings_length as usize);
+        if !short {
+            return self
+                .covering_blocks(
+                    col.positions,
+                    col.wide_blocks,
+                    offset,
+                    len,
+                    df,
+                    docs,
+                    with_positions,
+                )
+                .await;
+        }
+        let body = self
+            .fetch_term_postings(&[(offset, len)])
+            .await?
+            .pop()
+            .ok_or_else(|| malformed("short body"))?;
+        let (mut ids, mut tfs) = (vec![0u32; BLOCK_LEN], vec![0u32; BLOCK_LEN]);
+        let decoded = decode_short(&body, col.positions, &mut ids, &mut tfs)
+            .ok_or_else(|| malformed("short body"))?;
+        let group = match with_positions {
+            false => None,
+            true => Some(
+                body.slice(
+                    decoded
+                        .positions_at
+                        .ok_or_else(|| malformed("short positions"))?..,
+                ),
+            ),
+        };
+        Ok(vec![ProbedBlock {
+            lo: 0,
+            hi: u32::MAX,
+            ids: ids[..decoded.n].to_vec(),
+            tfs: tfs[..decoded.n].to_vec(),
+            group,
+        }])
     }
 
     /// The blocks of a long-form term covering `docs`, decoded, each with
@@ -280,73 +286,30 @@ impl FtsReader {
         docs: &[u32],
     ) -> Result<Vec<Vec<u32>>, FtsError> {
         let mut out = vec![Vec::new(); docs.len()];
+        // On a positional column an inline slot is the term's one position.
+        if let DictEntry::Inline { doc_id, tf: slot } = entry {
+            if let Ok(i) = docs.binary_search(&doc_id) {
+                out[i].push(slot);
+            }
+            return Ok(out);
+        }
         let mut group = GroupIndex::default();
-        match entry {
-            // On a positional column the slot is the term's one position.
-            DictEntry::Inline { doc_id, tf: slot } => {
-                if let Ok(i) = docs.binary_search(&doc_id) {
-                    out[i].push(slot);
+        for block in self.blocks_for(col, entry, df, docs, true).await? {
+            let bytes = block
+                .group
+                .as_ref()
+                .ok_or_else(|| malformed("position group"))?;
+            group
+                .locate(bytes, &mut 0, &block.tfs)
+                .ok_or_else(|| malformed("position group"))?;
+            for (slot, &d) in out.iter_mut().zip(docs) {
+                if !block.covers(d) {
+                    continue;
                 }
-            }
-            DictEntry::Pfor {
-                metadata_offset,
-                postings_length,
-                short: true,
-            } => {
-                let body = self
-                    .fetch_term_postings(&[(metadata_offset as usize, postings_length as usize)])
-                    .await?
-                    .pop()
-                    .ok_or_else(|| malformed("short body"))?;
-                let (mut ids, mut tfs) = (vec![0u32; BLOCK_LEN], vec![0u32; BLOCK_LEN]);
-                let decoded = decode_short(&body, true, &mut ids, &mut tfs)
-                    .ok_or_else(|| malformed("short body"))?;
-                let mut at = decoded
-                    .positions_at
-                    .ok_or_else(|| malformed("short positions"))?;
-                group
-                    .locate(&body, &mut at, &tfs[..decoded.n])
-                    .ok_or_else(|| malformed("short position group"))?;
-                for (slot, d) in out.iter_mut().zip(docs) {
-                    if let Ok(p) = ids[..decoded.n].binary_search(d) {
-                        group
-                            .run_positions(&body, p, tfs[p], slot)
-                            .ok_or_else(|| malformed("short position run"))?;
-                    }
-                }
-            }
-            DictEntry::Pfor {
-                metadata_offset,
-                postings_length,
-                short: false,
-            } => {
-                let blocks = self
-                    .covering_blocks(
-                        true,
-                        col.wide_blocks,
-                        metadata_offset as usize,
-                        postings_length as usize,
-                        df,
-                        docs,
-                        true,
-                    )
-                    .await?;
-                for block in &blocks {
-                    let bytes = block.group.as_ref().ok_or_else(|| malformed("group"))?;
-                    let mut at = 0usize;
+                if let Ok(p) = block.ids.binary_search(&d) {
                     group
-                        .locate(bytes, &mut at, &block.tfs)
-                        .ok_or_else(|| malformed("position group"))?;
-                    for (slot, &d) in out.iter_mut().zip(docs) {
-                        if !block.covers(d) {
-                            continue;
-                        }
-                        if let Ok(p) = block.ids.binary_search(&d) {
-                            group
-                                .run_positions(bytes, p, block.tfs[p], slot)
-                                .ok_or_else(|| malformed("position run"))?;
-                        }
-                    }
+                        .run_positions(bytes, p, block.tfs[p], slot)
+                        .ok_or_else(|| malformed("position run"))?;
                 }
             }
         }

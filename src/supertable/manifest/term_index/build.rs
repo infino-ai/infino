@@ -465,19 +465,14 @@ impl HeadBlocks {
                 }
             };
             let block = self.read_block(end)?;
-            let mut keyed: Vec<KeyedEntry> = block
+            let mut block_keyed: Vec<KeyedEntry> = block
                 .entries
                 .iter()
-                .filter_map(|e| {
-                    let superfile = renumber(ordinals, self.ordinal_base + e.superfile)?;
-                    Some(KeyedEntry {
-                        entry: TierEntry { superfile, ..*e },
-                        key: scoring_of(superfile).key(e.tf, e.len),
-                    })
-                })
+                .filter_map(|e| renumbered(e, self.ordinal_base, ordinals))
+                .map(|e| keyed(e, scoring_of))
                 .collect();
-            keyed.sort_unstable_by(head_order);
-            self.pending.extend(keyed);
+            block_keyed.sort_unstable_by(head_order);
+            self.pending.extend(block_keyed);
         }
     }
 
@@ -517,6 +512,23 @@ impl HeadBlocks {
     }
 }
 
+/// `e`, stored relative to `ordinal_base`, renumbered through `ordinals`;
+/// `None` for a superfile that is gone.
+fn renumbered(e: &TierEntry, ordinal_base: u32, ordinals: &[Option<u32>]) -> Option<TierEntry> {
+    Some(TierEntry {
+        superfile: renumber(ordinals, ordinal_base + e.superfile)?,
+        ..*e
+    })
+}
+
+/// `e` with its key at its superfile's scoring.
+fn keyed(e: TierEntry, scoring_of: &dyn Fn(u32) -> ColumnScoring) -> KeyedEntry {
+    KeyedEntry {
+        key: scoring_of(e.superfile).key(e.tf, e.len),
+        entry: e,
+    }
+}
+
 /// One stream of a streamed fold's heap: the entry it offers and which
 /// stream offers it. Ordered so the heap pops the head order's first.
 struct StreamHead(KeyedEntry, usize);
@@ -552,6 +564,29 @@ struct HeadSource {
 }
 
 impl HeadSource {
+    /// Every entry of the source's head, renumbered through `ordinals`;
+    /// entries of superfiles that are gone are dropped.
+    fn entries(
+        &self,
+        ordinals: &[Option<u32>],
+        out: &mut Vec<TierEntry>,
+    ) -> Result<(), TermIndexError> {
+        let mut blocks: Vec<LevelBlock> = Vec::new();
+        for level in &self.levels {
+            decode_segment(
+                span_bytes(&self.bytes, self.base, level.offset, level.len)?,
+                &mut blocks,
+            )?;
+            out.extend(
+                blocks
+                    .iter()
+                    .flat_map(|b| b.entries.iter())
+                    .filter_map(|e| renumbered(e, self.ordinal_base, ordinals)),
+            );
+        }
+        Ok(())
+    }
+
     /// A pinned head read whole after all: its levels' span.
     fn whole(blocks: HeadBlocks) -> Result<Self, TermIndexError> {
         let base = blocks.levels.iter().map(|l| l.offset).min().unwrap_or(0);
@@ -647,20 +682,8 @@ fn encode_head(
     if input.headless {
         entries.extend_from_slice(tier_entries);
     }
-    let mut blocks: Vec<LevelBlock> = Vec::new();
     for source in &input.sources {
-        for level in &source.levels {
-            let bytes = span_bytes(&source.bytes, source.base, level.offset, level.len)?;
-            decode_segment(bytes, &mut blocks)?;
-            for block in &blocks {
-                entries.extend(block.entries.iter().filter_map(|e| {
-                    Some(TierEntry {
-                        superfile: renumber(ordinals, source.ordinal_base + e.superfile)?,
-                        ..*e
-                    })
-                }));
-            }
-        }
+        source.entries(ordinals, &mut entries)?;
     }
     if entries.is_empty() {
         return Ok(None);
@@ -668,14 +691,7 @@ fn encode_head(
     // A document a tier and a head both hold is one candidate.
     entries.sort_unstable_by_key(|e| (e.superfile, e.doc_id));
     entries.dedup_by_key(|e| (e.superfile, e.doc_id));
-    let mut candidates = Vec::with_capacity(entries.len());
-    for g in entries.chunk_by(|a, b| a.superfile == b.superfile) {
-        let scoring = scoring_of(g[0].superfile);
-        candidates.extend(g.iter().map(|e| KeyedEntry {
-            entry: *e,
-            key: scoring.key(e.tf, e.len),
-        }));
-    }
+    let candidates: Vec<KeyedEntry> = entries.into_iter().map(|e| keyed(e, scoring_of)).collect();
     let outside = match input.headless {
         true => input.floor.max(input.tail),
         false => input.floor,
@@ -3705,32 +3721,11 @@ fn fold_streamed_head(
     let scoring_by_ordinal = Arc::clone(&writer.scoring);
     let scoring = move |ordinal: u32| scoring_by_ordinal(ordinal, column);
     // The small heads, decoded whole into one sorted stream.
-    let mut small: Vec<KeyedEntry> = Vec::new();
-    let mut blocks = Vec::new();
+    let mut entries = input.inline.clone();
     for source in &input.sources {
-        for level in &source.levels {
-            decode_segment(
-                span_bytes(&source.bytes, source.base, level.offset, level.len)?,
-                &mut blocks,
-            )?;
-            small.extend(
-                blocks
-                    .iter()
-                    .flat_map(|b| b.entries.iter())
-                    .filter_map(|e| {
-                        let superfile = renumber(ordinals, source.ordinal_base + e.superfile)?;
-                        Some(KeyedEntry {
-                            entry: TierEntry { superfile, ..*e },
-                            key: scoring(superfile).key(e.tf, e.len),
-                        })
-                    }),
-            );
-        }
+        source.entries(ordinals, &mut entries)?;
     }
-    small.extend(input.inline.iter().map(|e| KeyedEntry {
-        entry: *e,
-        key: scoring(e.superfile).key(e.tf, e.len),
-    }));
+    let mut small: Vec<KeyedEntry> = entries.into_iter().map(|e| keyed(e, &scoring)).collect();
     small.sort_unstable_by(head_order);
     let mut small = small.into_iter();
     let small_stream = streams.len();

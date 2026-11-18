@@ -56,6 +56,11 @@
 
 use std::{cmp::Ordering, ops::Range};
 
+/// How deep a term's head is in a layer where it has `df` documents: the
+/// rule a superfile's own head follows, so a layer's cut finds the
+/// documents it keeps in its superfiles' heads.
+pub(crate) use crate::superfile::fts::builder::proportional_head_depth as head_depth;
+
 use super::{
     TermIndexError,
     tier::{BLOCK_ENTRIES, TierEntry, pack_stream},
@@ -64,7 +69,6 @@ use crate::{
     superfile::{
         bits::{for_each_lane, payload_bytes, width_of},
         format::checksum::crc32c,
-        fts::builder::proportional_head_depth,
     },
     utils::{
         bytes::u32_le_at,
@@ -88,13 +92,6 @@ const N_WIDTHS: usize = 4;
 const MAX_U32_BITS: u8 = u32::BITS as u8;
 /// Widest a length-bucket stream may be.
 const MAX_LEN_BITS: u8 = u8::BITS as u8;
-
-/// How deep a term's head is in a layer where it has `df` documents: the
-/// rule a superfile's own head follows, so a layer's cut finds the
-/// documents it keeps in its superfiles' heads.
-pub(crate) fn head_depth(df: u64) -> u64 {
-    proportional_head_depth(df)
-}
 
 /// The entry ranges of a head of `depth` entries' levels, in order.
 pub(crate) fn level_ranges(depth: usize) -> Vec<Range<usize>> {
@@ -297,10 +294,7 @@ impl HeadRef {
 
     /// Read what [`Self::encode`] wrote at `*at`, advancing it.
     pub(crate) fn decode(bytes: &[u8], at: &mut usize) -> Result<Self, TermIndexError> {
-        let floor = bytes
-            .get(*at..*at + KEY_LEN)
-            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-            .ok_or_else(|| malformed("head floor"))?;
+        let floor = key_at(bytes, *at).ok_or_else(|| malformed("head floor"))?;
         *at += KEY_LEN;
         let flag = *bytes
             .get(*at)
@@ -474,13 +468,20 @@ pub(crate) fn decode_segment(
     Ok(())
 }
 
+/// The key stored at `at`, when `bytes` holds it.
+fn key_at(bytes: &[u8], at: usize) -> Option<f32> {
+    u32_le_at(bytes, at).map(f32::from_bits)
+}
+
 fn decode_block(bytes: &[u8], at: &mut usize) -> Result<LevelBlock, TermIndexError> {
-    let header = bytes
-        .get(*at..*at + 2 * KEY_LEN + 1)
-        .ok_or_else(|| malformed("block header"))?;
-    let first_key = f32::from_le_bytes([header[0], header[1], header[2], header[3]]);
-    let last_key = f32::from_le_bytes([header[4], header[5], header[6], header[7]]);
-    let n = header[2 * KEY_LEN] as usize;
+    let (first_key, last_key, n) = match (
+        key_at(bytes, *at),
+        key_at(bytes, *at + KEY_LEN),
+        bytes.get(*at + 2 * KEY_LEN),
+    ) {
+        (Some(first), Some(last), Some(&n)) => (first, last, n as usize),
+        _ => return Err(malformed("block header")),
+    };
     *at += 2 * KEY_LEN + 1;
     if n == 0 || n > BLOCK_ENTRIES || first_key < last_key {
         return Err(malformed("block header"));

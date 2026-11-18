@@ -63,7 +63,7 @@ use crate::{
         bm25::{dequantize_len, quantize_len, score_with_dl_norm_k1, tf_factor},
         reader::{GlobalTermIdf, norm_table},
     },
-    superfile::{SuperfileReader, id_space::FtsDocId},
+    superfile::{SuperfileReader, fts::reader::FtsReader, id_space::FtsDocId},
     supertable::{
         error::QueryError,
         manifest::{
@@ -404,8 +404,7 @@ pub(crate) async fn select(
     };
     let mut rounds = 0usize;
     loop {
-        theta = kth_lower_bound(&candidates, &slots, &weights, k, lb_slack);
-        bounds = slot_bounds(&slots, &heads, &candidates, &weights, lb_slack);
+        (theta, bounds) = settle(&slots, &heads, &candidates, &weights, k, lb_slack);
         if fetched >= HEAD_READ_BUDGET_BYTES {
             break;
         }
@@ -461,11 +460,8 @@ pub(crate) async fn select(
             }
         }
     }
-    // Probes: candidates whose bounds still reach above the threshold for a
-    // term not yet seen for them have that term's frequency read from the
-    // covering posting blocks only; their exact scores raise the threshold,
-    // under which the heads bound the unseen documents, and a superfile so
-    // settled is answered or ruled out without an open.
+    // A row predicate is checked on the best candidates first: only rows it
+    // admits set the threshold.
     if let Some(check) = &query.check {
         check_candidates(
             manifest,
@@ -478,9 +474,13 @@ pub(crate) async fn select(
             theta,
         )
         .await?;
-        theta = kth_lower_bound(&candidates, &slots, &weights, k, lb_slack);
-        bounds = slot_bounds(&slots, &heads, &candidates, &weights, lb_slack);
+        (theta, bounds) = settle(&slots, &heads, &candidates, &weights, k, lb_slack);
     }
+    // Probes: candidates whose bounds still reach above the threshold for a
+    // term or phrase not yet known for them have it read from the covering
+    // posting blocks only; their exact scores raise the threshold, under
+    // which the heads bound the unseen documents, and a superfile so
+    // settled is answered or ruled out without an open.
     if !query.rows_scoped || query.check.is_some() {
         let plan = probe_plan(&slots, &heads, &candidates, &weights, &postings, theta);
         if !plan.is_empty() {
@@ -488,12 +488,8 @@ pub(crate) async fn select(
             let reads = plan.into_iter().map(|(s, probes)| {
                 let entry = &kept[s];
                 async move {
-                    let reader = open_reader_of(manifest, entry).await?;
-                    let fts = reader.fts().ok_or_else(|| {
-                        TermIndexError::Open(QueryError::Internal(
-                            "a superfile the heads name has no full-text index".into(),
-                        ))
-                    })?;
+                    let reader = open_fts(manifest, entry).await?;
+                    let fts = fts_of(&reader);
                     let mut out = Vec::with_capacity(probes.len());
                     for (kind, members, docs) in probes {
                         let read = match kind {
@@ -543,8 +539,7 @@ pub(crate) async fn select(
                     }
                 }
             }
-            theta = kth_lower_bound(&candidates, &slots, weights, k, lb_slack);
-            bounds = slot_bounds(&slots, &heads, &candidates, weights, lb_slack);
+            (theta, bounds) = settle(&slots, &heads, &candidates, weights, k, lb_slack);
         }
     }
     // A scope that admits only some rows: the threshold over every row is
@@ -566,25 +561,8 @@ pub(crate) async fn select(
             if hits.is_empty() {
                 return Ok(Vec::new());
             }
-            let reader = open_reader_of(manifest, entry).await?;
-            let fts = reader.fts().ok_or_else(|| {
-                TermIndexError::Open(QueryError::Internal(
-                    "a superfile the heads name has no full-text index".into(),
-                ))
-            })?;
-            let docs = hits
-                .iter()
-                .map(|&(doc, score)| (FtsDocId::new(doc), score))
-                .collect();
-            let rows = fts
-                .hits_to_rows_async(docs)
-                .await
-                .map_err(|e| TermIndexError::Open(QueryError::from(e)))?;
-            Ok::<_, TermIndexError>(
-                rows.into_iter()
-                    .map(|(row, score)| (row.get(), score))
-                    .collect(),
-            )
+            let reader = open_fts(manifest, entry).await?;
+            to_rows(fts_of(&reader), hits.iter().copied()).await
         }
     });
     let rows = try_join_all(mapped).await?;
@@ -618,12 +596,10 @@ enum ProbeKind {
 /// and document counts there, and the candidates it reads them for.
 type Probe = (ProbeKind, Vec<(DictEntry, u64)>, Vec<u32>);
 
-/// Per superfile to probe, its probes: the candidates whose bounds still
-/// reach above `theta` while a bare term or a phrase is unknown for them,
-/// best bound first — their exact scores raise the threshold, under which
-/// the heads then bound the unseen documents — up to
-/// [`PROBE_MAX_CANDIDATES`] of them, each for the unknowns its superfile
-/// holds postings of.
+/// Per superfile to probe, its probes: the best open candidates (see
+/// [`best_open`]) a bare term or a phrase is still unknown for, each for
+/// the unknowns its superfile holds postings of. Their exact scores raise
+/// the threshold, under which the heads then bound the unseen documents.
 fn probe_plan(
     slots: &[Slot],
     heads: &[Head],
@@ -633,39 +609,25 @@ fn probe_plan(
     theta: f32,
 ) -> BTreeMap<usize, Vec<Probe>> {
     let held = |s: usize, t: usize| postings.contains_key(&(s, t));
-    let mut open: Vec<(f32, usize, u32, Vec<ProbeKind>)> = candidates
-        .iter()
-        .filter_map(|(&(s, doc), c)| {
-            let slot = &slots[s as usize];
-            if slot.deny.is_some() || (weights.filtered && !c.admitted) {
-                return None;
-            }
-            let s = s as usize;
-            let mut kinds: Vec<ProbeKind> = (0..slot.heads.len())
-                .filter(|&t| {
-                    c.known & (1 << t) == 0 && weights.scoring & (1 << t) != 0 && held(s, t)
-                })
-                .map(ProbeKind::Term)
-                .collect();
-            kinds.extend(
-                weights
-                    .phrases
-                    .iter()
-                    .enumerate()
-                    .filter(|(ph, p)| {
-                        c.phrases[*ph].is_none() && p.members.iter().all(|&m| held(s, m))
-                    })
-                    .map(|(ph, _)| ProbeKind::Phrase(ph)),
-            );
-            let ub = candidate_bound(slot, heads, weights, c);
-            (!kinds.is_empty() && ub > theta).then_some((ub, s, doc, kinds))
-        })
-        .collect();
-    open.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
-    open.truncate(PROBE_MAX_CANDIDATES);
+    // What is unknown for a candidate that its superfile holds postings of.
+    let unknowns = |s: usize, c: &Candidate| -> Vec<ProbeKind> {
+        let terms = (0..slots[s].heads.len())
+            .filter(|&t| c.known & (1 << t) == 0 && weights.scoring & (1 << t) != 0 && held(s, t))
+            .map(ProbeKind::Term);
+        let phrases = weights
+            .phrases
+            .iter()
+            .enumerate()
+            .filter(|(ph, p)| c.phrases[*ph].is_none() && p.members.iter().all(|&m| held(s, m)))
+            .map(|(ph, _)| ProbeKind::Phrase(ph));
+        terms.chain(phrases).collect()
+    };
+    let open = best_open(slots, heads, candidates, weights, theta, |s, c| {
+        (!weights.filtered || c.admitted) && !unknowns(s, c).is_empty()
+    });
     let mut docs: BTreeMap<(usize, usize, bool), Vec<u32>> = BTreeMap::new();
-    for (_, s, doc, kinds) in open {
-        for kind in kinds {
+    for (_, s, doc) in open {
+        for kind in unknowns(s, &candidates[&(s as u32, doc)]) {
             let key = match kind {
                 ProbeKind::Term(t) => (s, t, false),
                 ProbeKind::Phrase(ph) => (s, ph, true),
@@ -692,9 +654,8 @@ fn probe_plan(
     plan
 }
 
-/// Check the query's row predicate on its best candidates' rows — those
-/// whose bounds reach above `theta`, best first, up to
-/// [`PROBE_MAX_CANDIDATES`] — reading only the pages that hold them: a
+/// Check the query's row predicate on its best open candidates' rows (see
+/// [`best_open`]), reading only the pages that hold them: a
 /// candidate the predicate admits is marked so, one it rejects is dropped.
 #[allow(clippy::too_many_arguments)]
 async fn check_candidates(
@@ -707,39 +668,17 @@ async fn check_candidates(
     check: &RowCheck,
     theta: f32,
 ) -> Result<(), TermIndexError> {
-    let mut open: Vec<(f32, u32, u32)> = candidates
-        .iter()
-        .filter(|((s, _), c)| slots[*s as usize].deny.is_none() && !c.admitted)
-        .map(|(&(s, doc), c)| {
-            (
-                candidate_bound(&slots[s as usize], heads, weights, c),
-                s,
-                doc,
-            )
-        })
-        .filter(|(ub, _, _)| *ub > theta)
-        .collect();
-    open.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
-    open.truncate(PROBE_MAX_CANDIDATES);
     let mut by_slot: BTreeMap<usize, Vec<u32>> = BTreeMap::new();
-    for (_, s, doc) in open {
-        by_slot.entry(s as usize).or_default().push(doc);
+    for (_, s, doc) in best_open(slots, heads, candidates, weights, theta, |_, c| !c.admitted) {
+        by_slot.entry(s).or_default().push(doc);
     }
     let checks = by_slot.into_iter().map(|(s, mut docs)| {
         docs.sort_unstable();
         let entry = &kept[s];
         async move {
-            let reader = open_reader_of(manifest, entry).await?;
-            let fts = reader.fts().ok_or_else(|| {
-                TermIndexError::Open(QueryError::Internal(
-                    "a superfile the heads name has no full-text index".into(),
-                ))
-            })?;
-            let rows = fts
-                .hits_to_rows_async(docs.iter().map(|&d| (FtsDocId::new(d), 0.0)).collect())
-                .await
-                .map_err(|e| TermIndexError::Open(QueryError::from(e)))?;
-            let asked: RoaringBitmap = rows.iter().map(|(row, _)| row.get()).collect();
+            let reader = open_fts(manifest, entry).await?;
+            let rows = to_rows(fts_of(&reader), docs.iter().map(|&d| (d, 0.0))).await?;
+            let asked: RoaringBitmap = rows.iter().map(|&(row, _)| row).collect();
             let admitted = check
                 .keep(&reader, &asked)
                 .await
@@ -747,7 +686,7 @@ async fn check_candidates(
             let verdicts: Vec<(u32, bool)> = docs
                 .iter()
                 .zip(&rows)
-                .map(|(&doc, (row, _))| (doc, admitted.contains(row.get())))
+                .map(|(&doc, &(row, _))| (doc, admitted.contains(row)))
                 .collect();
             Ok::<_, TermIndexError>((s, verdicts))
         }
@@ -769,13 +708,14 @@ async fn check_candidates(
     Ok(())
 }
 
-/// Open `entry`'s reader through the reader cache.
-async fn open_reader_of(
+/// `entry`'s reader, opened through the reader cache, for its full-text
+/// index.
+async fn open_fts(
     manifest: &ManifestSnapshot,
     entry: &SuperfileEntry,
 ) -> Result<Arc<SuperfileReader>, TermIndexError> {
     let store = Arc::clone(&manifest.options.store);
-    dispatch::open_reader(
+    let reader = dispatch::open_reader(
         &store,
         manifest.options.disk_cache.as_ref(),
         manifest.options.storage.as_ref(),
@@ -783,7 +723,64 @@ async fn open_reader_of(
         ReadIntent::Stream,
     )
     .await
-    .map_err(TermIndexError::Open)
+    .map_err(TermIndexError::Open)?;
+    match reader.fts().is_some() {
+        true => Ok(reader),
+        false => Err(TermIndexError::Open(QueryError::Internal(
+            "a superfile the heads name has no full-text index".into(),
+        ))),
+    }
+}
+
+/// The full-text index of a reader [`open_fts`] opened.
+fn fts_of(reader: &SuperfileReader) -> &FtsReader {
+    reader.fts().expect("open_fts checked the full-text index")
+}
+
+/// Each `(document, score)`'s row, in order: read from the map pages the
+/// documents fall in.
+async fn to_rows(
+    fts: &FtsReader,
+    hits: impl Iterator<Item = (u32, f32)>,
+) -> Result<Vec<(u32, f32)>, TermIndexError> {
+    let docs = hits
+        .map(|(doc, score)| (FtsDocId::new(doc), score))
+        .collect();
+    Ok(fts
+        .hits_to_rows_async(docs)
+        .await
+        .map_err(|e| TermIndexError::Open(QueryError::from(e)))?
+        .into_iter()
+        .map(|(row, score)| (row.get(), score))
+        .collect())
+}
+
+/// The candidates `keep` accepts whose bounds still reach above `theta`,
+/// best bound first, at most [`PROBE_MAX_CANDIDATES`], as
+/// `(bound, slot, document)`; never one of a slot with deletions.
+fn best_open(
+    slots: &[Slot],
+    heads: &[Head],
+    candidates: &HashMap<(u32, u32), Candidate>,
+    weights: &Weights,
+    theta: f32,
+    keep: impl Fn(usize, &Candidate) -> bool,
+) -> Vec<(f32, usize, u32)> {
+    let mut open: Vec<(f32, usize, u32)> = candidates
+        .iter()
+        .filter(|((s, _), c)| slots[*s as usize].deny.is_none() && keep(*s as usize, c))
+        .map(|(&(s, doc), c)| {
+            (
+                candidate_bound(&slots[s as usize], heads, weights, c),
+                s as usize,
+                doc,
+            )
+        })
+        .filter(|(ub, _, _)| *ub > theta)
+        .collect();
+    open.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
+    open.truncate(PROBE_MAX_CANDIDATES);
+    open
 }
 
 /// Add term `t`'s entry for document `doc` of slot `s` to the
@@ -818,6 +815,21 @@ fn absorb(
             c.contrib[t] = weights.contribution(t, tf, len);
         }
     }
+}
+
+/// The threshold and each slot's bounds from what the candidates hold now.
+fn settle(
+    slots: &[Slot],
+    heads: &[Head],
+    candidates: &HashMap<(u32, u32), Candidate>,
+    weights: &Weights,
+    k: usize,
+    lb_slack: f32,
+) -> (f32, Vec<(f32, f32)>) {
+    (
+        kth_lower_bound(candidates, slots, weights, k, lb_slack),
+        slot_bounds(slots, heads, candidates, weights, lb_slack),
+    )
 }
 
 /// The k-th best lower bound among candidates carrying every required
