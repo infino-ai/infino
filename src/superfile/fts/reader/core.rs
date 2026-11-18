@@ -1333,7 +1333,11 @@ impl FtsReader {
             })
             .await;
         match kept {
-            Ok(map) => Ok(Some(map)),
+            Ok(map) => {
+                // Whoever weighs this reader by what it holds weighs it again with the map.
+                self.loads.loaded();
+                Ok(Some(map))
+            }
             Err(None) => Ok(None),
             Err(Some(e)) => Err(e),
         }
@@ -6033,6 +6037,38 @@ mod tests {
         let reported = reports.load(Ordering::SeqCst);
         assert_eq!(filtered_search(&view).await.expect("search"), PROBE_ROWS);
         assert_eq!(reports.load(Ordering::SeqCst), reported);
+    }
+
+    /// A map kept within the heap budget is reported as a load, as one kept without asking is,
+    /// so a holder that weighs the reader counts the map as soon as it lands.
+    #[tokio::test]
+    async fn a_map_kept_within_the_budget_is_reported_as_a_load() {
+        let (_, r) = probed_reader(false).await;
+        let budget = HeapBudget::with_budget(None);
+        budget.set_short_of_memory(false);
+        let r = Arc::new(r.with_heap_budget(budget));
+        let weighed = Arc::new(AtomicUsize::new(0));
+        let listener: LoadListener = {
+            let (reader, weighed) = (Arc::downgrade(&r), Arc::clone(&weighed));
+            Arc::new(move || {
+                let held = reader.upgrade().expect("the test holds it").held_bytes();
+                weighed.store(held, Ordering::SeqCst);
+            })
+        };
+        r.watch_loads(&listener);
+        assert!(
+            r.kept_doc_map_within_budget()
+                .await
+                .expect("keep")
+                .is_some(),
+            "room to keep the map"
+        );
+        assert!(r.doc_map_is_read());
+        assert_eq!(
+            weighed.load(Ordering::SeqCst),
+            r.held_bytes(),
+            "the report weighed the kept map"
+        );
     }
 
     #[tokio::test]
