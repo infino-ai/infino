@@ -53,7 +53,7 @@ pub(crate) enum GraphRole {
 
 /// Graphs kept at once. Each holds adjacency for every fine centroid of one
 /// table column (about 1.2 GB at 8.5M centroids), so the cache stays small.
-const MAX_CACHED_GRAPHS: usize = 4;
+pub(crate) const MAX_CACHED_GRAPHS: usize = 4;
 
 /// Share of a graph's nodes that may be removed or added, counted over every
 /// update since its last full build, before it is rebuilt instead of updated.
@@ -255,6 +255,20 @@ fn take_cached(
         .iter()
         .position(|c| c.covers(role, column, dim, metric, keys.iter().map(|k| &k.0)))?;
     Some(cache.remove(at))
+}
+
+/// Drop the cached `role` graph of the table column that owns any of
+/// `superfiles`, so its next graph is built from scratch.
+pub(crate) fn forget<'a>(
+    role: GraphRole,
+    column: FieldId,
+    mut superfiles: impl Iterator<Item = &'a Uuid>,
+) {
+    let mut cache = lock_cache();
+    let owned: HashSet<&Uuid> = superfiles.by_ref().collect();
+    cache.retain(|c| {
+        c.role != role || c.column != column || !c.superfiles.iter().any(|id| owned.contains(id))
+    });
 }
 
 /// Cache `entry`, replacing any graph of the same table column a concurrent

@@ -525,6 +525,9 @@ const DEFAULT_VECTOR_GLOBAL_FINE_RERANK_MULT: usize = 12;
 /// default. `false` restores the legacy per-cell budget + global 1-bit
 /// shortlist cut (then raise `global_fine_rerank_mult` back toward ~128).
 const DEFAULT_VECTOR_GLOBAL_FINE_PER_CLUSTER_BUDGET: bool = true;
+/// Default for `centroid_graph_as_steps`: off, so the graph is stored whole
+/// until every reader can load the stored steps.
+const DEFAULT_VECTOR_CENTROID_GRAPH_AS_STEPS: bool = false;
 /// Default rerank-pool floor for `ivf_router = centroid_graph` with
 /// `global_fine_per_cluster_budget` on: the per-cluster budget is boosted so
 /// the pooled — and fully reranked — candidate count never drops below this.
@@ -915,6 +918,9 @@ pub struct VectorSettings {
     /// a per-cell budget cut down by a global 1-bit shortlist. On by
     /// default; `false` restores the legacy per-cell + global-cut path.
     pub global_fine_per_cluster_budget: bool,
+    /// For `ivf_router = centroid_graph`: store the graph as a full copy plus
+    /// one small change per drain, instead of whole after every drain.
+    pub centroid_graph_as_steps: bool,
     /// For `ivf_router = centroid_graph` with `global_fine_per_cluster_budget`
     /// on: the minimum pooled (and fully reranked) candidate count. Boosts the
     /// per-cluster budget at small N so recall does not turn depth-limited;
@@ -1146,6 +1152,7 @@ impl Default for VectorSettings {
             global_fine_fanout: DEFAULT_VECTOR_GLOBAL_FINE_FANOUT,
             global_fine_rerank_mult: DEFAULT_VECTOR_GLOBAL_FINE_RERANK_MULT,
             global_fine_per_cluster_budget: DEFAULT_VECTOR_GLOBAL_FINE_PER_CLUSTER_BUDGET,
+            centroid_graph_as_steps: DEFAULT_VECTOR_CENTROID_GRAPH_AS_STEPS,
             global_fine_rerank_pool_floor: DEFAULT_VECTOR_GLOBAL_FINE_RERANK_POOL_FLOOR,
             global_fine_coalesce: false,
             global_fine_graph_ef: 0,

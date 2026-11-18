@@ -28,6 +28,7 @@ pub mod dispatch;
 pub mod exec;
 pub(crate) mod fine_graph_cache;
 pub(crate) mod fine_graph_follow;
+pub(crate) mod fine_graph_publish;
 pub(crate) mod fine_graph_store;
 pub mod fts;
 #[cfg(feature = "graph-index")]
