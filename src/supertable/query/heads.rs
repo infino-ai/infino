@@ -59,11 +59,14 @@ use super::{
 };
 use crate::{
     config,
-    superfile::fts::{
-        bm25::{dequantize_len, quantize_len, score_with_dl_norm_k1, tf_factor},
-        reader::{GlobalTermIdf, norm_table},
+    superfile::{
+        SuperfileReader,
+        fts::{
+            bm25::{dequantize_len, quantize_len, score_with_dl_norm_k1, tf_factor},
+            reader::{FtsReader, GlobalTermIdf, norm_table},
+        },
+        id_space::FtsDocId,
     },
-    superfile::{SuperfileReader, fts::reader::FtsReader, id_space::FtsDocId},
     supertable::{
         error::QueryError,
         manifest::{

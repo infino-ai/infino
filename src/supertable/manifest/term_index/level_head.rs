@@ -56,15 +56,14 @@
 
 use std::{cmp::Ordering, ops::Range};
 
-/// How deep a term's head is in a layer where it has `df` documents: the
-/// rule a superfile's own head follows, so a layer's cut finds the
-/// documents it keeps in its superfiles' heads.
-pub(crate) use crate::superfile::fts::builder::proportional_head_depth as head_depth;
-
 use super::{
     TermIndexError,
     tier::{BLOCK_ENTRIES, TierEntry, pack_stream},
 };
+/// How deep a term's head is in a layer where it has `df` documents: the
+/// rule a superfile's own head follows, so a layer's cut finds the
+/// documents it keeps in its superfiles' heads.
+pub(crate) use crate::superfile::fts::builder::proportional_head_depth as head_depth;
 use crate::{
     superfile::{
         bits::{for_each_lane, payload_bytes, width_of},

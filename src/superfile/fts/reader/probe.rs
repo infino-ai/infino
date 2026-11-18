@@ -14,9 +14,9 @@
 
 use std::slice::from_ref;
 
-use super::{ColumnMeta, core::*, cursor::TermMeta};
 use bytes::Bytes;
 
+use super::{ColumnMeta, core::*, cursor::TermMeta};
 use crate::{
     superfile::{
         ReadError,
