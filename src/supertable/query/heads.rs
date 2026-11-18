@@ -510,6 +510,8 @@ pub(crate) async fn select(
     }
     let probe_started = Instant::now();
     let mut probed_superfiles = 0usize;
+    let mut rulable_seen: Option<usize> = None;
+    let in_play_before_probes = bounds.iter().filter(|(_, ub)| *ub > theta).count();
     // Probes: candidates whose bounds still reach above the threshold for a
     // term or phrase not yet known for them have it read from the covering
     // posting blocks only; their exact scores raise the threshold, under
@@ -517,6 +519,7 @@ pub(crate) async fn select(
     // settled is answered or ruled out without an open.
     if !query.rows_scoped {
         let rulable = rulable_by_probes(&slots, &heads, &candidates, &weights, &bounds, theta, k);
+        rulable_seen = rulable;
         let mut plan = probe_plan(&slots, &heads, &candidates, &weights, &postings, theta);
         // Probing a superfile is a few range reads before any open; it pays
         // only where it can save at least as many opens as it probes
@@ -692,6 +695,9 @@ pub(crate) async fn select(
         rounds,
         probed_superfiles,
         probes,
+        rulable = rulable_seen.map_or(-1, |n| n as i64),
+        in_play_before_probes,
+        in_play_after = above,
         runs_ms = runs_ns / NANOS_PER_MS,
         levels_ms = levels_ns / NANOS_PER_MS,
         probe_ms = probe_ns / NANOS_PER_MS,
