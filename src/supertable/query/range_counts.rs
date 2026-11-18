@@ -80,12 +80,18 @@ impl TableProvider for RangeCounts {
         // found them, so a concurrent delete cannot leave the unfiltered
         // total below a bucket of the same row.
         let table = self.table.reading_tombstones_once();
-        let counts = try_join_all(
-            self.buckets
-                .iter()
-                .map(|bucket| table.counted_rows(state, bucket.range.as_ref(), &bucket.filters)),
-        )
-        .await?;
+        // Buckets that are intervals on one range-indexed column (a
+        // histogram's) are counted together, a pass over the table for all
+        // of them; any other shape, one bucket at a time.
+        let counts = match table.batched_range_counts(&self.buckets).await? {
+            Some(counts) => counts,
+            None => {
+                try_join_all(self.buckets.iter().map(|bucket| {
+                    table.counted_rows(state, bucket.range.as_ref(), &bucket.filters)
+                }))
+                .await?
+            }
+        };
         let columns = counts
             .into_iter()
             .map(|count| {
