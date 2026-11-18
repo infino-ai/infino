@@ -19,7 +19,7 @@ use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, hash_map::Entry},
     hash::{Hash, Hasher},
-    slice,
+    mem, slice,
     sync::Arc,
 };
 
@@ -924,18 +924,102 @@ impl ScalarValueCounts {
         Self::from_distinct_entries(merged.into_iter().collect())
     }
 
-    /// The table of both tables' rows together, as one superfile holding
-    /// them would count it: `None` past [`VALUE_TABLES_BUDGET_BYTES`], which
-    /// no superfile keeps.
-    pub(crate) fn merged_with(&self, other: &Self) -> Option<Self> {
-        Self::from_entries(
-            self.entries
-                .iter()
-                .chain(other.entries.iter())
-                .cloned()
-                .collect(),
-        )
-        .filter(|table| table.value_bytes() <= VALUE_TABLES_BUDGET_BYTES)
+    /// Fold `other`'s rows into this table, as one superfile holding both
+    /// would count them, and say whether it did. The table is left as it was
+    /// when the two would make no table: past [`VALUE_TABLES_BUDGET_BYTES`],
+    /// which no superfile keeps, or where [`Self::from_entries`] would refuse
+    /// their entries together (values of two types, a count past `u64`).
+    ///
+    /// Both tables are sorted and distinct, so they merge in one pass over
+    /// each, with no hashing and no sort. A merge folds a table into its
+    /// output's once per batch, so the first pass only checks the result
+    /// and stops as soon as it passes the budget, and the second moves this
+    /// table's values into the result rather than copying them, unless
+    /// another copy of the table is held.
+    pub(crate) fn merge_from(&mut self, other: &Self) -> bool {
+        let Some(distinct) = self.merged_len(other) else {
+            return false;
+        };
+        let left = Arc::make_mut(&mut self.entries);
+        let right = other.entries();
+        let mut merged = Vec::with_capacity(distinct);
+        let (mut l, mut r) = (0, 0);
+        while l < left.len() || r < right.len() {
+            // `merged_len` has compared every pair compared here, and added
+            // every pair of counts added here, so neither fails.
+            let order = match (left.get(l), right.get(r)) {
+                (Some((lv, _)), Some((rv, _))) => lv.partial_cmp(rv).unwrap_or(Ordering::Less),
+                (Some(_), None) => Ordering::Less,
+                _ => Ordering::Greater,
+            };
+            match order {
+                Ordering::Less => {
+                    merged.push(take_entry(&mut left[l]));
+                    l += 1;
+                }
+                Ordering::Greater => {
+                    merged.push(right[r].clone());
+                    r += 1;
+                }
+                Ordering::Equal => {
+                    let (value, count) = take_entry(&mut left[l]);
+                    merged.push((value, count.saturating_add(right[r].1)));
+                    l += 1;
+                    r += 1;
+                }
+            }
+        }
+        self.entries = merged.into();
+        true
+    }
+
+    /// How many distinct values this table and `other` hold together, when
+    /// they make one table within [`VALUE_TABLES_BUDGET_BYTES`]: the checks
+    /// of [`Self::merge_from`], which [`Self::from_entries`] makes on their
+    /// entries together, in one pass that stops at the budget.
+    fn merged_len(&self, other: &Self) -> Option<usize> {
+        let (left, right) = (self.entries(), other.entries());
+        if let (Some((lv, _)), Some((rv, _))) = (left.first(), right.first())
+            && lv.data_type() != rv.data_type()
+        {
+            return None;
+        }
+        let (mut l, mut r, mut distinct, mut bytes) = (0, 0, 0usize, 0usize);
+        while l < left.len() || r < right.len() {
+            let value = match (left.get(l), right.get(r)) {
+                (Some((lv, lc)), Some((rv, rc))) => match lv.partial_cmp(rv)? {
+                    Ordering::Less => {
+                        l += 1;
+                        lv
+                    }
+                    Ordering::Greater => {
+                        r += 1;
+                        rv
+                    }
+                    Ordering::Equal => {
+                        lc.checked_add(*rc)?;
+                        l += 1;
+                        r += 1;
+                        lv
+                    }
+                },
+                (Some((lv, _)), None) => {
+                    l += 1;
+                    lv
+                }
+                (None, Some((rv, _))) => {
+                    r += 1;
+                    rv
+                }
+                (None, None) => break,
+            };
+            distinct += 1;
+            bytes += stored_value_bytes(value) + size_of::<u64>();
+            if bytes > VALUE_TABLES_BUDGET_BYTES {
+                return None;
+            }
+        }
+        (distinct > 0).then_some(distinct)
     }
 
     /// The counts of a column that holds no value at all: every row null, or
@@ -1030,6 +1114,12 @@ fn stored_value_bytes(value: &ScalarValue) -> usize {
             .primitive_width()
             .unwrap_or(size_of::<u64>()),
     }
+}
+
+/// A table entry moved out of a table being merged away, a null left in
+/// its place.
+fn take_entry(entry: &mut (ScalarValue, u64)) -> (ScalarValue, u64) {
+    (mem::replace(&mut entry.0, ScalarValue::Null), entry.1)
 }
 
 /// `(row, value)` for each non-null value of an Arrow array iterator.
@@ -1414,11 +1504,21 @@ impl ScalarStatsAgg {
         };
         // A side with no non-null values has no counts to give, and adds
         // nothing to the other side's.
-        let merged_table = match (&self.value_counts, &other.value_counts) {
-            (Some(left), Some(right)) => left.merged_with(right),
-            (counts, None) if !other_has_values => counts.clone(),
+        // A table that does not survive is put back, for the sketch below.
+        let merged_table = match (self.value_counts.take(), &other.value_counts) {
+            (Some(mut left), Some(right)) => match left.merge_from(right) {
+                true => Some(left),
+                false => {
+                    self.value_counts = Some(left);
+                    None
+                }
+            },
+            (counts, None) if !other_has_values => counts,
             (None, counts) if !self_has_values => counts.clone(),
-            _ => None,
+            (counts, _) => {
+                self.value_counts = counts;
+                None
+            }
         };
         // Where no table survives, the sketch stands in: each side's own,
         // or its table's values sketched as the column sketch hashes them,
@@ -3142,6 +3242,267 @@ mod tests {
         sketched.merge_with(&upper).expect("same type");
         assert_eq!(sketched.hll.as_deref(), Some(want.as_bytes()));
         assert!(sketched.value_counts.is_none());
+    }
+
+    /// The table of `left`'s and `right`'s entries together, built the slow
+    /// way: every entry hashed into one map, then sorted, and kept while it
+    /// fits the budget. The reference [`ScalarValueCounts::merge_from`] must
+    /// match.
+    fn merged_per_entry(
+        left: &ScalarValueCounts,
+        right: &ScalarValueCounts,
+    ) -> Option<ScalarValueCounts> {
+        ScalarValueCounts::from_entries(
+            left.entries()
+                .iter()
+                .chain(right.entries())
+                .cloned()
+                .collect(),
+        )
+        .filter(|table| table.value_bytes() <= VALUE_TABLES_BUDGET_BYTES)
+    }
+
+    /// Fold `right` into a copy of `left` and check it against
+    /// [`merged_per_entry`]: the same table, counts included, when there is
+    /// one, and the copy as it was when there is none. `left` itself shares
+    /// its entries with the copy, and must be left as it was either way.
+    /// Returns the merged table, if any.
+    fn assert_merges_like_counting_both(
+        left: &ScalarValueCounts,
+        right: &ScalarValueCounts,
+    ) -> Option<ScalarValueCounts> {
+        let before = left.entries().to_vec();
+        let want = merged_per_entry(left, right);
+        let mut merged = left.clone();
+        assert_eq!(merged.merge_from(right), want.is_some());
+        match &want {
+            Some(want) => assert_eq!(&merged, want),
+            None => assert_eq!(&merged, left),
+        }
+        assert_eq!(left.entries(), &before[..]);
+        want
+    }
+
+    /// An `Int64` table of `(value, count)` entries.
+    fn i64_table(entries: impl IntoIterator<Item = (i64, u64)>) -> ScalarValueCounts {
+        ScalarValueCounts::from_entries(
+            entries
+                .into_iter()
+                .map(|(value, count)| (ScalarValue::Int64(Some(value)), count))
+                .collect(),
+        )
+        .expect("a table")
+    }
+
+    /// A `Utf8` table of `(value, count)` entries.
+    fn utf8_table<'a>(entries: impl IntoIterator<Item = (&'a str, u64)>) -> ScalarValueCounts {
+        ScalarValueCounts::from_entries(
+            entries
+                .into_iter()
+                .map(|(value, count)| (ScalarValue::Utf8(Some(value.to_string())), count))
+                .collect(),
+        )
+        .expect("a table")
+    }
+
+    /// Two sorted tables merged in one pass make the table their entries
+    /// make counted together, counts included: overlapping, disjoint,
+    /// interleaved and equal tables of every shape of counted value.
+    #[test]
+    fn merge_from_matches_counting_both_tables_together() {
+        let counted = |range: std::ops::Range<i64>, scale: u64| {
+            i64_table(range.map(move |value| (value, value.unsigned_abs() * scale + 1)))
+        };
+        let pairs = [
+            // Overlapping, each side holding values the other does not.
+            (counted(0..100, 1), counted(50..150, 3)),
+            // Disjoint, either side first.
+            (counted(0..10, 1), counted(10..20, 2)),
+            (counted(10..20, 2), counted(0..10, 1)),
+            // Interleaved, every other value from each side.
+            (
+                i64_table((0..50).map(|v| (2 * v, 1))),
+                i64_table((0..50).map(|v| (2 * v + 1, 2))),
+            ),
+            // The same values on both sides.
+            (counted(-30..30, 1), counted(-30..30, 5)),
+            // One side inside the other.
+            (counted(0..200, 1), counted(90..110, 7)),
+            (counted(90..110, 7), counted(0..200, 1)),
+            // A single value against many.
+            (i64_table([(i64::MIN, 4)]), counted(-5..5, 1)),
+            (counted(-5..5, 1), i64_table([(i64::MAX, 4)])),
+        ];
+        for (left, right) in &pairs {
+            let merged = assert_merges_like_counting_both(left, right).expect("within the budget");
+            let total =
+                |table: &ScalarValueCounts| table.entries().iter().map(|e| e.1).sum::<u64>();
+            assert_eq!(total(&merged), total(left) + total(right));
+        }
+
+        // Strings of several lengths, the empty one among them.
+        let left = utf8_table([("", 1), ("go", 2), ("rust", 3), ("zig", 1)]);
+        let right = utf8_table([("a", 4), ("go", 1), ("python", 2), ("zig", 6)]);
+        assert_merges_like_counting_both(&left, &right).expect("within the budget");
+        let wide = ScalarValueCounts::from_entries(
+            (0..40)
+                .map(|i| (ScalarValue::LargeUtf8(Some("x".repeat(i))), i as u64 + 1))
+                .collect(),
+        )
+        .expect("a table");
+        let narrow = ScalarValueCounts::from_entries(
+            (20..60)
+                .map(|i| (ScalarValue::LargeUtf8(Some("x".repeat(i))), 2))
+                .collect(),
+        )
+        .expect("a table");
+        assert_merges_like_counting_both(&wide, &narrow).expect("within the budget");
+
+        // Booleans, and decimals of one precision and scale.
+        let flags = |entries: &[(bool, u64)]| {
+            ScalarValueCounts::from_entries(
+                entries
+                    .iter()
+                    .map(|&(value, count)| (ScalarValue::Boolean(Some(value)), count))
+                    .collect(),
+            )
+            .expect("a table")
+        };
+        assert_merges_like_counting_both(&flags(&[(true, 3)]), &flags(&[(false, 1), (true, 2)]))
+            .expect("within the budget");
+        let decimals = |values: std::ops::Range<i128>| {
+            ScalarValueCounts::from_entries(
+                values
+                    .map(|v| {
+                        (
+                            ScalarValue::Decimal128(
+                                Some(v * 125),
+                                DECIMAL_PRECISION,
+                                DECIMAL_SCALE,
+                            ),
+                            1,
+                        )
+                    })
+                    .collect(),
+            )
+            .expect("a table")
+        };
+        assert_merges_like_counting_both(&decimals(-10..10), &decimals(0..30))
+            .expect("within the budget");
+
+        // Pairs of every overlap and size, from a fixed seed.
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move |below: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % below
+        };
+        for _ in 0..200 {
+            let side = |next: &mut dyn FnMut(u64) -> u64| {
+                let start = next(400) as i64;
+                let len = next(300) as i64 + 1;
+                let step = next(3) as i64 + 1;
+                i64_table((0..len).map(|i| (start + i * step, next(1_000) + 1)))
+            };
+            let left = side(&mut next);
+            let right = side(&mut next);
+            assert_merges_like_counting_both(&left, &right).expect("within the budget");
+        }
+    }
+
+    /// A merge makes no table where counting both tables' entries together
+    /// makes none, and leaves the table it would fold into as it was: past
+    /// the budget, across two types, or past a `u64` count. Up to the budget
+    /// it makes the table, an empty side adding nothing.
+    #[test]
+    fn merge_from_refuses_what_counting_both_tables_together_refuses() {
+        let below = |end: usize| i64_table((0..end as i64).map(|value| (value, 1)));
+        let above = |start: usize| {
+            i64_table((start as i64..MOST_DISTINCT_I64 as i64).map(|value| (value, 1)))
+        };
+        // Exactly the budget between them, overlapping or not, then one past.
+        let fits = assert_merges_like_counting_both(&below(5_000), &above(3_000)).expect("fits");
+        assert_eq!(fits.value_bytes(), VALUE_TABLES_BUDGET_BYTES);
+        assert_merges_like_counting_both(
+            &below(MOST_DISTINCT_I64 / 2),
+            &above(MOST_DISTINCT_I64 / 2),
+        )
+        .expect("fits");
+        let past = i64_table([(MOST_DISTINCT_I64 as i64, 1)]);
+        assert!(assert_merges_like_counting_both(&below(MOST_DISTINCT_I64), &past).is_none());
+        assert!(assert_merges_like_counting_both(&past, &below(MOST_DISTINCT_I64)).is_none());
+        // Two tables each at the budget pass it together, as does one of
+        // them and a single value more.
+        let half = i64_table((0..MOST_DISTINCT_I64 as i64).map(|value| (2 * value, 1)));
+        let odd = i64_table((0..MOST_DISTINCT_I64 as i64).map(|value| (2 * value + 1, 1)));
+        assert!(assert_merges_like_counting_both(&half, &odd).is_none());
+        assert!(assert_merges_like_counting_both(&half, &i64_table([(-1, 1)])).is_none());
+
+        // Two types: a table of `Int32` values beside one of `Int64` values.
+        let int32 = ScalarValueCounts::from_entries(vec![(ScalarValue::Int32(Some(1)), 1)])
+            .expect("a table");
+        assert!(assert_merges_like_counting_both(&i64_table([(1, 1)]), &int32).is_none());
+        assert!(assert_merges_like_counting_both(&int32, &i64_table([(1, 1)])).is_none());
+
+        // A count past `u64`, and one that just reaches it.
+        let full = i64_table([(1, u64::MAX - 1), (2, 1)]);
+        assert!(assert_merges_like_counting_both(&full, &i64_table([(1, 2)])).is_none());
+        let topped = assert_merges_like_counting_both(&full, &i64_table([(1, 1), (3, 1)]))
+            .expect("a count of u64::MAX fits");
+        assert_eq!(topped.entries()[0].1, u64::MAX);
+
+        // An empty table adds nothing, and two make no table.
+        let some = i64_table([(4, 2), (9, 1)]);
+        let empty = ScalarValueCounts::empty();
+        assert_eq!(
+            assert_merges_like_counting_both(&empty, &some),
+            Some(some.clone())
+        );
+        assert_eq!(
+            assert_merges_like_counting_both(&some, &empty),
+            Some(some.clone())
+        );
+        assert!(assert_merges_like_counting_both(&empty, &empty).is_none());
+    }
+
+    /// A column's stats folded batch by batch keep the table of the whole
+    /// column, counted at once, and drop it at the batch that takes it past
+    /// the budget.
+    #[test]
+    fn scalar_agg_merge_folds_batches_into_the_whole_columns_table() {
+        for (rows, distinct) in [
+            (10_000, 1_200),
+            (20_000, MOST_DISTINCT_I64),
+            (20_000, MOST_DISTINCT_I64 + 1),
+        ] {
+            let whole: ArrayRef = Arc::new(Int64Array::from_iter_values(
+                (0..rows).map(|row| (row * 7_919 % distinct) as i64),
+            ));
+            let mut folded: Option<ScalarStatsAgg> = None;
+            for start in (0..rows).step_by(1_337) {
+                let batch = whole.slice(start, 1_337.min(rows - start));
+                let batch = ScalarStatsAgg::from_column(&batch).expect("batch stats");
+                match folded.as_mut() {
+                    Some(folded) => folded.merge_with(&batch).expect("same type"),
+                    None => folded = Some(batch),
+                }
+            }
+            let folded = folded.expect("rows");
+            assert_eq!(
+                folded.value_counts,
+                counts_per_row(&whole),
+                "{distinct} distinct"
+            );
+            let want_hll = folded
+                .value_counts
+                .is_none()
+                .then(|| column_hll(from_ref(&whole)).expect("sketchable"));
+            assert_eq!(
+                folded.hll.as_deref(),
+                want_hll.as_ref().map(|hll| hll.as_bytes())
+            );
+        }
     }
 
     #[test]
