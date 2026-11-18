@@ -41,7 +41,7 @@ pub(crate) mod tier;
 
 use std::{
     cmp::Reverse,
-    collections::{BTreeSet, BinaryHeap, HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     fmt, fs,
     future::Future,
     io,
@@ -381,11 +381,6 @@ fn object_uri(kind: &str, hash: &ContentHash) -> String {
 pub(crate) fn slice_uri(hash: &ContentHash) -> String {
     object_uri("slice", hash)
 }
-
-/// Candidates each layer nominates per completion a prefix search asks
-/// for, before the table-wide counts rank them: a completion common in the
-/// table is common in some layer.
-const PREFIX_CANDIDATES_PER_COMPLETION: usize = 4;
 
 /// Storage URI of a slice's tier object with this content hash.
 /// One chunk of a tier as a merge reads it: its directory and every
@@ -2751,12 +2746,6 @@ impl<K: Eq + std::hash::Hash + Clone, V: Clone> Resident<K, V> {
         self.map.contains_key(key)
     }
 
-    /// How many values are held.
-    #[cfg(test)]
-    fn len(&self) -> usize {
-        self.map.len()
-    }
-
     fn get(&mut self, key: &K) -> Option<V> {
         let (value, used) = self.map.get_mut(key)?;
         self.tick += 1;
@@ -3119,95 +3108,6 @@ impl TermIndex {
         })
         .await?;
         Ok(out)
-    }
-
-    /// The `n` completions of `prefix` in `column` with the most documents
-    /// over the `live` superfiles, most first (ties in byte order). Each
-    /// layer's counts nominate candidates — a few per completion asked for,
-    /// by the largest count one layer gives them — and the candidates are
-    /// then ranked by their count over every layer. Slices are visited by
-    /// the largest count the root records for them, most first, and the
-    /// walk stops at the first that cannot beat a nomination: a prefix with
-    /// millions of completions reads the few slices its frequent ones are
-    /// in, and the heap stays bounded.
-    pub(crate) async fn top_prefix_completions(
-        &self,
-        column: FieldId,
-        prefix: &str,
-        live: &HashSet<Uuid>,
-        n: usize,
-    ) -> Result<Vec<String>, TermIndexError> {
-        let head = column.term_key("").len();
-        let nominate = n.saturating_mul(PREFIX_CANDIDATES_PER_COMPLETION);
-        let key_prefix = column.term_key(prefix);
-        // Slices by the largest count any term of theirs has, most first:
-        // once the nominations are full and a slice's largest cannot beat
-        // the least of them, neither can any slice after it.
-        let mut refs: Vec<(u32, SliceRef)> = self
-            .root
-            .based_slices_for_prefix(&key_prefix)
-            .map(|(base, r)| (base, r.clone()))
-            .collect();
-        refs.sort_by_key(|(_, r)| Reverse(r.max_df));
-        // Min-heap of (layer count, term) over the best nominations so far.
-        let mut best: BinaryHeap<Reverse<(u64, Vec<u8>)>> = BinaryHeap::new();
-        for (base, r) in refs {
-            if best.len() >= nominate
-                && best
-                    .peek()
-                    .is_some_and(|Reverse((low, _))| r.max_df <= *low)
-            {
-                break;
-            }
-            let bytes = self.slice_bytes(&r.content_hash).await?;
-            let slice = Slice::open(&bytes)?;
-            slice.for_each_prefix(&key_prefix, |key, run| {
-                let df: u64 = run
-                    .iter()
-                    .filter(|p| {
-                        self.superfile_id(p.superfile + base)
-                            .is_some_and(|id| live.contains(&id))
-                    })
-                    .map(|p| p.df)
-                    .sum();
-                if df > 0
-                    && let Some(term) = key.get(head..)
-                    && best
-                        .peek()
-                        .is_none_or(|Reverse((low, _))| best.len() < nominate || df > *low)
-                {
-                    best.push(Reverse((df, term.to_vec())));
-                    if best.len() > nominate {
-                        best.pop();
-                    }
-                }
-                true
-            })?;
-        }
-        let mut candidates: Vec<String> = best
-            .into_iter()
-            .filter_map(|Reverse((_, term))| String::from_utf8(term).ok())
-            .collect();
-        candidates.sort_unstable();
-        candidates.dedup();
-        let refs: Vec<&str> = candidates.iter().map(String::as_str).collect();
-        let runs = self.runs_many(column, &refs).await?;
-        let mut ranked: Vec<(u64, String)> = candidates
-            .iter()
-            .zip(runs.iter())
-            .map(|(term, runs)| {
-                let df = postings_of(runs)
-                    .filter(|p| {
-                        self.superfile_id(p.superfile)
-                            .is_some_and(|id| live.contains(&id))
-                    })
-                    .map(|p| p.df)
-                    .sum();
-                (df, term.clone())
-            })
-            .collect();
-        ranked.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-        Ok(ranked.into_iter().take(n).map(|(_, term)| term).collect())
     }
 
     /// The superfiles holding any term with `prefix` in `column`.
@@ -7722,79 +7622,8 @@ mod tests {
                 .map(|t| alphabet[t].as_bytes().to_vec())
                 .collect();
             prop_assert_eq!(terms, expect);
-            // The most frequent completions over the live superfiles, most
-            // first, ties in byte order.
-            let top = rt.block_on(index.top_prefix_completions(fid("body"), "t0", &live, 3)).expect("top");
-            let mut by_df: Vec<(u64, String)> = (0..10)
-                .map(|t| {
-                    let df = holders(t).iter().filter(|id| live.contains(id)).count() as u64 * (1 + t as u64);
-                    (df, alphabet[t].clone())
-                })
-                .filter(|(df, _)| *df > 0)
-                .collect();
-            by_df.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-            let want: Vec<String> = by_df.into_iter().take(3).map(|(_, t)| t).collect();
-            prop_assert_eq!(top, want);
             prop_assert!(rt.block_on(index.route(fid("body"), &["nope"], BoolMode::Or)).expect("route").is_empty());
         });
-    }
-
-    /// A prefix's most frequent completions are found reading only the
-    /// slices that can hold them: hundreds of rare completions spread over
-    /// many slices, and the frequent ones in a few, are walked by each
-    /// slice's largest count, and the walk stops once no later slice can
-    /// beat what it holds.
-    #[test]
-    fn the_frequent_completions_are_found_without_reading_every_slice() {
-        /// Rare completions, one document each.
-        const RARE: usize = 600;
-        /// Frequent completions, and the document count of each.
-        const FREQUENT: [(&str, u64); 3] = [("pz1", 900), ("pz2", 800), ("pz3", 700)];
-        let dir = TempDir::new().expect("tempdir");
-        let mut w = ContributionWriter::create(dir.path(), Uuid::from_u128(1), 0).expect("create");
-        let mut terms: Vec<(String, u64)> = (0..RARE).map(|i| (format!("pa{i:04}"), 1)).collect();
-        terms.extend(FREQUENT.iter().map(|(t, df)| (t.to_string(), *df)));
-        terms.sort();
-        for (term, df) in &terms {
-            w.push(
-                &fid("body").term_key(term),
-                *df,
-                f32::INFINITY,
-                Location::None,
-                0.0,
-                &[],
-            )
-            .expect("push");
-        }
-        let contribution = w.finish().expect("finish");
-        let policy = BuildPolicy {
-            slice_target_bytes: 512,
-            ..BuildPolicy::default()
-        };
-        let built = build(&[contribution], &policy).expect("build");
-        let n_slices = built.root.layers[0].slices.len();
-        assert!(
-            n_slices > 10,
-            "the completions span many slices: {n_slices}"
-        );
-        let store = TempDir::new().expect("store");
-        let storage: Arc<dyn StorageProvider> =
-            Arc::new(LocalFsStorageProvider::new(store.path()).expect("local fs"));
-        let rt = Runtime::new().expect("runtime");
-        let reference = rt.block_on(write_built(&storage, built)).expect("write");
-        let index = rt
-            .block_on(TermIndex::load(Arc::clone(&storage), None, &reference))
-            .expect("load");
-        let live: HashSet<Uuid> = [Uuid::from_u128(1)].into();
-        let top = rt
-            .block_on(index.top_prefix_completions(fid("body"), "p", &live, 2))
-            .expect("top");
-        assert_eq!(top, vec!["pz1".to_owned(), "pz2".to_owned()]);
-        let read = rt.block_on(index.slices.lock()).len();
-        assert!(
-            read * 4 < n_slices,
-            "read {read} of {n_slices} slices for the two most frequent"
-        );
     }
 
     /// Through the query path: superfile selection for a term is exactly

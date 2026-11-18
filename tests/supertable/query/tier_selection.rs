@@ -19,7 +19,7 @@ use infino::{
     runtime_metrics::op_stats::with_op_stats,
     storage::{LocalFsStorageProvider, StorageProvider},
     superfile::builder::FtsConfig,
-    supertable::{Supertable, SupertableOptions},
+    supertable::{Supertable, SupertableOptions, query::SuperfileHit},
 };
 use tempfile::TempDir;
 
@@ -968,45 +968,33 @@ fn a_table_indexed_by_the_layout_before_tiers_serves_as_before_and_rebuilds() {
     assert!(served, "after the rebuild the tiers serve");
 }
 
-/// A prefix over a table the term index covers scores each document by its
-/// best completion — its highest-scoring term among the prefix's
-/// completions — not their sum: "t" completes to "the" and "tensor", and a
-/// document holding both scores as the better of the two.
+/// A prefix over a table the term index covers scores each document by the
+/// sum over every completion it holds, as a disjunction of the completions
+/// does: "t" completes to "the" and "tensor", and a document holding both
+/// scores as both.
 #[test]
-fn a_prefix_scores_each_document_by_its_best_completion() {
+fn a_prefix_scores_as_the_disjunction_of_its_completions() {
     let dir = TempDir::new().expect("tempdir");
     let st = table(&dir, true);
     let reader = st.reader().expect("reader");
     let all = SUPERFILES * DOCS_PER_SUPERFILE;
-    let mut best: HashMap<(String, u32), f32> = HashMap::new();
-    for term in ["the", "tensor"] {
-        for h in reader
-            .bm25_hits("body", term, all, Bm25SearchOptions::new())
-            .expect("hits")
-        {
-            let score = best
-                .entry((format!("{:?}", h.superfile), h.local_doc_id))
-                .or_insert(h.score);
-            *score = score.max(h.score);
-        }
-    }
-    let mut want: Vec<f32> = best.values().copied().collect();
-    want.sort_by(|a, b| b.total_cmp(a));
+    let key = |h: &SuperfileHit| {
+        (
+            format!("{:?}", h.superfile),
+            h.local_doc_id,
+            h.score.to_bits(),
+        )
+    };
     for k in [1usize, 10, 100, all] {
-        let got = reader.bm25_search_prefix("body", "t", k).expect("prefix");
-        let got_scores: Vec<f32> = got.iter().map(|h| h.score).collect();
+        let prefix = reader.bm25_search_prefix("body", "t", k).expect("prefix");
+        let both = reader
+            .bm25_hits("body", "the tensor", k, Bm25SearchOptions::new())
+            .expect("hits");
         assert_eq!(
-            got_scores,
-            want[..k.min(want.len())],
-            "k={k}: scores by best completion"
+            prefix.iter().map(key).collect::<Vec<_>>(),
+            both.iter().map(key).collect::<Vec<_>>(),
+            "k={k}: the prefix answers as its completions' disjunction"
         );
-        for h in &got {
-            assert_eq!(
-                best[&(format!("{:?}", h.superfile), h.local_doc_id)],
-                h.score,
-                "k={k}: a document scores as its best completion"
-            );
-        }
     }
 }
 
