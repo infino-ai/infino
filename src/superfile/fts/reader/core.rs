@@ -21,7 +21,7 @@ use std::{
     mem,
     num::NonZeroUsize,
     ops::Range,
-    sync::{Arc, Mutex, OnceLock, PoisonError},
+    sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak},
     thread::available_parallelism,
 };
 
@@ -43,6 +43,7 @@ use super::{
     work::{term_cursor_bytes, term_cursor_ranges},
 };
 use crate::{
+    memory::{ConnectionMemoryBudget, Reclaim, Reservation},
     superfile::{
         ReadError,
         error::FtsError,
@@ -64,9 +65,15 @@ use crate::{
         lazy_source::{LazyByteSource, PrefetchedSource, RangeCoalescePlan, Source},
         load_watch::{LoadListener, LoadWatch},
     },
-    supertable::schema::FieldId,
+    supertable::{
+        query::read_ahead::BUDGET_SHARE_PERCENT as READ_AHEAD_SHARE_PERCENT, schema::FieldId,
+    },
     utils::terms::{DictEntry, TermBlocks, make_key},
 };
+
+/// Most of the connection's memory budget, in percent, that kept dictionaries may bring it to: half
+/// of read-ahead's share, so read-ahead always keeps room beside them.
+pub(crate) const QUERY_DICT_SHARE_PERCENT: usize = READ_AHEAD_SHARE_PERCENT / 2;
 
 /// Largest gap worth overfetching when adjacent term postings share a request.
 const TERM_RANGE_COALESCE_MAX_GAP: usize = 64 * 1024;
@@ -535,6 +542,113 @@ pub(super) fn two_term_has_rare_anchor(cursors: &[TermCursor]) -> bool {
     let lo = cursors[0].df.min(cursors[1].df);
     let hi = cursors[0].df.max(cursors[1].df);
     lo > 0 && hi >= lo.saturating_mul(WAND_BMW_2TERM_DF_RATIO)
+}
+
+/// One file's term dictionary, kept across that file's predicate steps so they read it once. Kept
+/// only under a budget with a limit and room ([`QUERY_DICT_SHARE_PERCENT`]), and given back when a
+/// reservation that asks for memory back needs the room; `default()` keeps nothing.
+#[derive(Default)]
+pub(crate) struct QueryDict {
+    /// The slot a kept dictionary lives in and the budget it is reserved from; `None` keeps nothing.
+    keeping: Option<(Arc<KeptDict>, Arc<ConnectionMemoryBudget>)>,
+}
+
+impl QueryDict {
+    /// Keeps the dictionary while `budget` has room for it. A budget with no limit keeps nothing: it
+    /// never asks for memory back, so kept copies would grow with every file and statement.
+    pub(crate) fn with_budget(budget: &Arc<ConnectionMemoryBudget>) -> Self {
+        if budget.remaining().is_none() {
+            return Self::default();
+        }
+        Self {
+            keeping: Some((Arc::default(), Arc::clone(budget))),
+        }
+    }
+
+    /// Whether this can keep a dictionary at all.
+    pub(crate) fn keeps(&self) -> bool {
+        self.keeping.is_some()
+    }
+
+    /// The kept dictionary and the reader that kept it, if one is kept.
+    fn kept(&self) -> Option<(Bytes, usize)> {
+        let (kept, _) = self.keeping.as_ref()?;
+        match &*kept.lock() {
+            Kept::Dict { bytes, reader, .. } => Some((bytes.clone(), *reader)),
+            Kept::Nothing | Kept::GivenBack => None,
+        }
+    }
+
+    /// Gives a kept dictionary back now; nothing more is kept.
+    pub(crate) fn give_back(&self) {
+        if let Some((kept, _)) = &self.keeping {
+            kept.reclaim();
+        }
+    }
+
+    /// Keeps `bytes`, `reader`'s dictionary, if nothing was kept yet and the budget has room; never
+    /// waits or asks others to free memory.
+    fn keep(&self, bytes: &Bytes, reader: usize) {
+        let Some((slot, budget)) = &self.keeping else {
+            return;
+        };
+        // Registered before anything is reserved, so a reservation refused because of this one
+        // always finds it to give back. Once, and only for a file whose dictionary is downloaded.
+        slot.registered.get_or_init(|| {
+            let holder: Weak<KeptDict> = Arc::downgrade(slot);
+            budget.register_reclaim(holder);
+        });
+        let mut kept = slot.lock();
+        if !matches!(*kept, Kept::Nothing) {
+            return;
+        }
+        let Some(reservation) =
+            budget.try_reserve_within_share(bytes.len(), QUERY_DICT_SHARE_PERCENT)
+        else {
+            return;
+        };
+        *kept = Kept::Dict {
+            bytes: bytes.clone(),
+            reader,
+            _reservation: reservation,
+        };
+    }
+}
+
+/// What a [`QueryDict`] holds.
+#[derive(Default)]
+enum Kept {
+    #[default]
+    Nothing,
+    /// The dictionary, the reader it belongs to ([`FtsReader::identity`]) and its reservation.
+    Dict {
+        bytes: Bytes,
+        reader: usize,
+        _reservation: Reservation,
+    },
+    /// Given back to the budget; nothing more is kept.
+    GivenBack,
+}
+
+#[derive(Default)]
+struct KeptDict {
+    kept: Mutex<Kept>,
+    /// Set once this slot is registered with the budget.
+    registered: OnceLock<()>,
+}
+
+impl KeptDict {
+    fn lock(&self) -> MutexGuard<'_, Kept> {
+        self.kept.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl Reclaim for KeptDict {
+    /// Gives the dictionary back; a step already reading it keeps its own handle until it finishes,
+    /// no longer counted against the budget.
+    fn reclaim(&self) {
+        let _given_back = mem::replace(&mut *self.lock(), Kept::GivenBack);
+    }
 }
 
 /// FTS blob reader. Self-contained — owns its `Bytes` (which the storage
@@ -1307,6 +1421,41 @@ impl FtsReader {
     pub fn column_tokenizer(&self, column: &str) -> Result<Arc<dyn Tokenizer>, FtsError> {
         let id = self.resolve_column_id(column)?;
         Ok(Arc::clone(&self.columns[id as usize].tokenizer))
+    }
+
+    /// This file's dictionary, from `dict` if a step kept it, else read and offered to `dict`. Only
+    /// a downloaded dictionary is kept; the flag says whether this call read it.
+    pub(crate) async fn query_dict(&self, dict: &QueryDict) -> Result<(Bytes, bool), FtsError> {
+        if let Some((bytes, reader)) = dict.kept() {
+            debug_assert_eq!(
+                reader,
+                self.identity(),
+                "a `QueryDict` kept another file's dictionary"
+            );
+            // Another file's copy is never used: this reader reads its own.
+            if reader == self.identity() {
+                return Ok((bytes, false));
+            }
+        }
+        let downloads = dict.keeps()
+            && match &self.source {
+                Source::InMemory(_) => false,
+                Source::Lazy(source) => {
+                    !source.is_local(self.dict_range.start as u64, self.dict_range.len() as u64)
+                }
+            };
+        let bytes = self.dict_bytes_async().await?;
+        self.debug_assert_own_dict(&bytes);
+        if downloads {
+            dict.keep(&bytes, self.identity());
+        }
+        Ok((bytes, true))
+    }
+
+    /// The same for every clone of this reader and different for any other: what a kept
+    /// dictionary is checked against, so a `QueryDict` is never shared across files.
+    fn identity(&self) -> usize {
+        Arc::as_ptr(&self.block_tables).addr()
     }
 
     pub(crate) fn dict_bytes(&self) -> Result<Bytes, FtsError> {
@@ -3129,7 +3278,12 @@ mod tests {
     use super::{super::test_util::*, *};
     use crate::superfile::{
         BytesLazyByteSource, LazyByteSourceError,
-        fts::{bm25, builder::FtsBuilder, reader::BoolMode, tokenize::StandardTokenizer},
+        fts::{
+            bm25,
+            builder::FtsBuilder,
+            reader::{BoolMode, ContainsRows},
+            tokenize::StandardTokenizer,
+        },
     };
 
     /// Byte offset of the blob's version field.
@@ -4756,6 +4910,232 @@ mod tests {
         }
     }
 
+    /// A [`RecordingSource`] that serves nothing synchronously, like object storage.
+    struct DownloadSource(RecordingSource);
+
+    #[async_trait]
+    impl LazyByteSource for DownloadSource {
+        fn size(&self) -> u64 {
+            self.0.size()
+        }
+        async fn range(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
+            self.0.range(start, len).await
+        }
+        fn try_get_range_sync(&self, _start: u64, _len: u64) -> Option<Bytes> {
+            None
+        }
+    }
+
+    /// A limit this many times a dictionary: half of its 90% holds the dictionary, the share does not.
+    const NO_ROOM_LIMIT_PER_DICTIONARY: u64 = 3;
+
+    /// A limit this many times a dictionary: the share holds the dictionary, with room past it.
+    const ROOM_LIMIT_PER_DICTIONARY: u64 = 8;
+
+    /// A reader opened lazily over a [`DownloadSource`].
+    async fn recorded_lazy_reader() -> (FtsReader, Arc<DownloadSource>) {
+        let (blob, json) = build_blob();
+        let recording = Arc::new(DownloadSource(RecordingSource {
+            inner: BytesLazyByteSource::new(blob),
+            ranges: Mutex::new(Vec::new()),
+        }));
+        let src: Arc<dyn LazyByteSource> = recording.clone();
+        let r = FtsReader::open_lazy(src, &json, OpenOptions::for_object_store())
+            .await
+            .expect("open_lazy");
+        (r, recording)
+    }
+
+    #[tokio::test]
+    async fn query_dict_keeps_the_dictionary_while_the_budget_has_room() {
+        // A dictionary read through a budgeted `QueryDict`, from a source that only downloads.
+        //  - the first step downloads it and reserves its size;
+        //  - a later step downloads nothing and gets the same buffer;
+        //  - the reservation goes when the `QueryDict` drops.
+        // This test pins one download per query and how long the reservation lasts.
+        let (r, recording) = recorded_lazy_reader().await;
+        let dictionary = r.dict_range.clone();
+        let opened = recording.0.len();
+        let budget = ConnectionMemoryBudget::with_room();
+        let dict = QueryDict::with_budget(&budget);
+
+        let (first, fetched) = r.query_dict(&dict).await.expect("first step");
+        assert!(fetched, "the first step reads the dictionary");
+        assert_eq!(
+            budget.used(),
+            dictionary.len(),
+            "the kept dictionary reserves its size"
+        );
+        let (second, fetched) = r.query_dict(&dict).await.expect("second step");
+        assert!(!fetched, "a later step reads nothing");
+        assert_eq!(
+            second.as_ptr(),
+            first.as_ptr(),
+            "and shares the kept buffer, not a copy"
+        );
+        assert_eq!(
+            recording.0.touches(opened, &dictionary),
+            1,
+            "one read for both steps"
+        );
+
+        drop((first, second));
+        drop(dict);
+        assert_eq!(
+            budget.used(),
+            0,
+            "the reservation goes with the `QueryDict`"
+        );
+    }
+
+    #[tokio::test]
+    async fn query_dict_keeps_nothing_without_room() {
+        // A budget whose share cannot hold the dictionary, a budget with no limit, and a `QueryDict`
+        // with no budget.
+        //  - nothing is kept or reserved;
+        //  - each step downloads the dictionary and gets the same bytes.
+        // This test pins one download per step with no room or no limit.
+        let (r, recording) = recorded_lazy_reader().await;
+        let dictionary = r.dict_range.clone();
+        let no_room = ConnectionMemoryBudget::with_limit(
+            dictionary.len() as u64 * NO_ROOM_LIMIT_PER_DICTIONARY,
+        );
+        let no_limit = ConnectionMemoryBudget::measured();
+        for (budget, dict) in [
+            (&no_room, QueryDict::with_budget(&no_room)),
+            (&no_limit, QueryDict::with_budget(&no_limit)),
+            (&no_room, QueryDict::default()),
+        ] {
+            let opened = recording.0.len();
+            let (first, fetched_first) = r.query_dict(&dict).await.expect("first step");
+            assert_eq!(budget.used(), 0, "nothing is reserved");
+            let (second, fetched_second) = r.query_dict(&dict).await.expect("second step");
+            assert!(
+                fetched_first && fetched_second,
+                "each step reads the dictionary"
+            );
+            assert_eq!(first, second, "the same bytes either way");
+            assert_eq!(
+                recording.0.touches(opened, &dictionary),
+                2,
+                "one read per step"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn query_dict_gives_the_dictionary_back_when_a_reservation_needs_the_room() {
+        // A kept dictionary, then a reservation that fits only once the dictionary is given back.
+        //  - the reservation succeeds and holds all that is used;
+        //  - a later step reads the dictionary again and keeps nothing more.
+        // This test pins that a kept dictionary never makes another reservation fail.
+        let (r, recording) = recorded_lazy_reader().await;
+        let dictionary = r.dict_range.clone();
+        let budget =
+            ConnectionMemoryBudget::with_limit(dictionary.len() as u64 * ROOM_LIMIT_PER_DICTIONARY);
+        let dict = QueryDict::with_budget(&budget);
+        r.query_dict(&dict).await.expect("first step");
+        assert_eq!(budget.used(), dictionary.len(), "the dictionary is kept");
+
+        let room = budget.remaining().expect("a set limit") + 1;
+        let needs_the_room = budget
+            .try_reserve(room)
+            .expect("the dictionary is given back");
+        assert_eq!(budget.used(), room, "only the new reservation is held");
+
+        let opened = recording.0.len();
+        let (_, fetched) = r.query_dict(&dict).await.expect("later step");
+        assert!(fetched, "a later step reads the dictionary again");
+        assert_eq!(recording.0.touches(opened, &dictionary), 1);
+        drop(needs_the_room);
+        let (_, fetched) = r.query_dict(&dict).await.expect("step with room again");
+        assert!(fetched, "nothing more is kept, even with room");
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    #[should_panic(expected = "another file's dictionary")]
+    async fn a_query_dict_refuses_a_dictionary_another_reader_kept() {
+        // Two readers of identical files, so their dictionaries are the same size, and one
+        // `QueryDict` with room.
+        //  - the first reader keeps its dictionary in it;
+        //  - the second asking for it panics in a debug build instead of getting the first's.
+        // This test pins that a kept dictionary never crosses files.
+        let (first, _) = recorded_lazy_reader().await;
+        let (second, _) = recorded_lazy_reader().await;
+        let budget = ConnectionMemoryBudget::with_room();
+        let dict = QueryDict::with_budget(&budget);
+        first.query_dict(&dict).await.expect("kept");
+        let _ = second.query_dict(&dict).await;
+    }
+
+    #[tokio::test]
+    async fn term_rows_share_one_dictionary_read() {
+        // text_match looks its terms up one at a time.
+        //  - through a budgeted `QueryDict`, three terms share one download;
+        //  - through `QueryDict::default()`, each term downloads it;
+        //  - the rows are the same.
+        // This test pins text_match reading the dictionary once.
+        let (r, recording) = recorded_lazy_reader().await;
+        let dictionary = r.dict_range.clone();
+        let terms = ["rust", "runtime", "java"];
+        let budget = ConnectionMemoryBudget::with_room();
+
+        let opened = recording.0.len();
+        let (shared, _) = r
+            .term_rows("body", &terms, None, &QueryDict::with_budget(&budget))
+            .await
+            .expect("terms through a kept dictionary");
+        assert_eq!(
+            recording.0.touches(opened, &dictionary),
+            1,
+            "one read for every term"
+        );
+
+        let opened = recording.0.len();
+        let (each, _) = r
+            .term_rows("body", &terms, None, &QueryDict::default())
+            .await
+            .expect("terms without a kept dictionary");
+        assert_eq!(
+            recording.0.touches(opened, &dictionary),
+            terms.len(),
+            "one read per term"
+        );
+        let rows = |out: &[ContainsRows]| -> Vec<RoaringBitmap> {
+            out.iter().map(|c| c.proven.clone()).collect()
+        };
+        assert_eq!(rows(&shared), rows(&each), "the same rows either way");
+        assert!(
+            rows(&shared).iter().all(|r| !r.is_empty()),
+            "every term matches a row"
+        );
+    }
+
+    #[tokio::test]
+    async fn query_dict_keeps_nothing_for_a_dictionary_already_local() {
+        // A file held whole in memory, and a source that serves the dictionary without a download.
+        //  - nothing is kept or reserved;
+        //  - each step reads it again, for free.
+        // This test pins that only a downloaded dictionary is kept.
+        let (blob, json) = build_blob();
+        let in_memory = FtsReader::open(blob.clone(), &json).expect("open");
+        let local: Arc<dyn LazyByteSource> = Arc::new(BytesLazyByteSource::new(blob));
+        let lazy_local = FtsReader::open_lazy(local, &json, OpenOptions::for_object_store())
+            .await
+            .expect("open_lazy");
+        for r in [in_memory, lazy_local] {
+            let budget = ConnectionMemoryBudget::with_room();
+            let dict = QueryDict::with_budget(&budget);
+            let (_, fetched) = r.query_dict(&dict).await.expect("first step");
+            assert!(fetched);
+            assert_eq!(budget.used(), 0, "nothing reserved");
+            let (_, fetched) = r.query_dict(&dict).await.expect("second step");
+            assert!(fetched, "nothing kept: each step reads it again");
+        }
+    }
+
     /// A lazy open reads the header and the doc-lengths directory and
     /// nothing else. A match-only query served from a memo of already
     /// resolved terms then reads postings alone — neither the dictionary
@@ -4802,7 +5182,13 @@ mod tests {
             .await
             .expect("memo");
         let (docs, _) = r
-            .token_match_prefetched("body", &["rust"], BoolMode::Or, Some(&memo))
+            .token_match_prefetched(
+                "body",
+                &["rust"],
+                BoolMode::Or,
+                Some(&memo),
+                &QueryDict::default(),
+            )
             .await
             .expect("match from the memo");
         assert!(!docs.is_empty());
