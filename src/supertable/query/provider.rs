@@ -149,6 +149,7 @@ use crate::{
             read_ahead::ScanReadAhead,
             schema_adapter::TableExprAdapterFactory,
             skip::{ColumnTypeGuard, ScalarOp, ScalarPredicate},
+            sql::StatementStores,
             superfile_reader::{
                 OpenTierCounts, superfile_reader_in_memory, superfile_reader_tiered,
             },
@@ -1728,7 +1729,7 @@ impl SupertableProvider {
                 &entry.storage_path(),
                 open_intent,
             );
-            if let Some(reader) = &resident
+            if let Some((reader, tier)) = &resident
                 && let Some(parquet_meta) = reader.loaded_parquet_metadata_with_page_index()
             {
                 let prepared = cell
@@ -1738,7 +1739,7 @@ impl SupertableProvider {
                             &scan_footers,
                             &entry,
                             Arc::clone(reader),
-                            OpenTier::Memory,
+                            *tier,
                             parquet_meta,
                             statistics,
                         )
@@ -1753,7 +1754,7 @@ impl SupertableProvider {
                         // A reader already in memory only lacks its page
                         // indexes; reuse it rather than walk the tiers again.
                         let (reader, tier) = match resident {
-                            Some(reader) => (reader, OpenTier::Memory),
+                            Some(resident) => resident,
                             None => superfile_reader_tiered(
                                 &store,
                                 disk_cache.as_ref(),
@@ -3000,30 +3001,53 @@ impl TableProvider for SupertableProvider {
 
         // The files a scan of kept decoded columns would read (built below,
         // once the Parquet scan it stands in for is). Not for a scan the index
-        // narrowed to a few rows (the Parquet scan decodes just their pages),
-        // nor for a scan of no column — except the rows a top-k reads from
-        // the range index: up to the cutoff, ties included, they are spread
-        // over the file, so the Parquet scan decodes a page of every wide
-        // column for each, where kept columns hand them over decoded.
+        // narrowed to a few rows in every superfile (the Parquet scan decodes
+        // just their pages), nor for a scan of no column — except:
+        // - the rows a top-k reads from the range index: up to the cutoff,
+        //   ties included, they are spread over the file, so the Parquet scan
+        //   decodes a page of every wide column for each, where kept columns
+        //   hand them over decoded;
+        // - a scan the index narrowed in some superfiles only: the others are
+        //   read whole, which kept columns serve, and the Parquet scan the
+        //   narrowed ones would keep it on would decode every superfile again
+        //   on every statement. A narrowed row group hands over its rows from
+        //   kept columns when they are kept, and otherwise reads just those
+        //   rows from its pages without keeping them, as the Parquet scan
+        //   would, unless the scan uses most of it or read it before
+        //   (`CachedScanExec`).
         let output = projected_schema(&self.schema, projection)?;
-        let top_k_selected = top_k_rows.is_some();
+        let narrowed = superfiles
+            .iter()
+            .filter(|seg| seg.candidates.is_some())
+            .count();
+        let partly_narrowed = narrowed > 0 && narrowed < superfiles.len();
+        let selects_rows = top_k_rows.is_some() || partly_narrowed;
         let cached_files = (self.manifest.options.decoded_columns.is_some()
             && has_columns(&output)
-            && (top_k_selected || superfiles.iter().all(|seg| seg.candidates.is_none())))
-        .then(|| {
-            superfiles
-                .iter()
-                .zip(&survivor_entries)
-                .map(|(seg, entry)| CachedFile {
-                    uri: entry.uri,
-                    reader: Arc::clone(&seg.prepared.reader),
-                    footer: Arc::clone(&seg.prepared.footer),
-                    row_counts: Arc::clone(&seg.prepared.shape.row_counts),
-                    tombstones: Arc::clone(&seg.tombstones),
-                    selected: top_k_selected.then(|| seg.candidates.clone()).flatten(),
-                })
-                .collect::<Vec<_>>()
-        });
+            && (selects_rows || narrowed == 0))
+            .then(|| {
+                superfiles
+                    .iter()
+                    .zip(&survivor_entries)
+                    .map(|(seg, entry)| CachedFile {
+                        uri: entry.uri,
+                        reader: Arc::clone(&seg.prepared.reader),
+                        footer: Arc::clone(&seg.prepared.footer),
+                        row_counts: Arc::clone(&seg.prepared.shape.row_counts),
+                        tombstones: Arc::clone(&seg.tombstones),
+                        // The live candidates only: a row group holding
+                        // none of them reads nothing, and the scan checks
+                        // them against no tombstone again.
+                        selected: selects_rows
+                            .then(|| {
+                                seg.candidates
+                                    .as_ref()
+                                    .map(|keep| keep - seg.tombstones.as_ref())
+                            })
+                            .flatten(),
+                    })
+                    .collect::<Vec<_>>()
+            });
         let cached_stats = cached_files
             .is_some()
             .then(|| scan_stats.clone().project(projection));
@@ -3032,6 +3056,11 @@ impl TableProvider for SupertableProvider {
         state
             .runtime_env()
             .register_object_store(url.as_ref(), store);
+        // A connection's statements share one runtime: the statement removes
+        // the registration once it is done.
+        if let Some(stores) = state.config().get_extension::<StatementStores>() {
+            stores.record(&url);
+        }
         let mut builder = FileScanConfigBuilder::new(url, Arc::new(source))
             .with_expr_adapter(Some(Arc::new(TableExprAdapterFactory::new(&self.manifest))));
         for file in files {
@@ -3820,6 +3849,8 @@ pub(crate) mod walk_probe {
         fail_with: Option<QueryError>,
         fallbacks: Vec<WalkFallback>,
         walks: usize,
+        windows: usize,
+        walked: usize,
     }
 
     static ARMED: Mutex<Option<HashMap<Uuid, Armed>>> = Mutex::new(None);
@@ -3865,6 +3896,19 @@ pub(crate) mod walk_probe {
     /// Walks started over the watched table.
     pub(crate) fn walks(superfile: Uuid) -> usize {
         watched(superfile, |a| a.walks).unwrap_or(0)
+    }
+
+    /// Windows read, and rows walked in them, by walks over the watched table.
+    pub(crate) fn windows(superfile: Uuid) -> (usize, usize) {
+        watched(superfile, |a| (a.windows, a.walked)).unwrap_or_default()
+    }
+
+    /// A walk over the table of `files` read a window of `rows` rows.
+    pub(crate) fn window_read(files: &[Arc<SuperfileEntry>], rows: usize) {
+        with(files, |a| {
+            a.windows += 1;
+            a.walked += rows;
+        });
     }
 
     /// A walk started over the table of `files`, the table's own list as a walk can read none.

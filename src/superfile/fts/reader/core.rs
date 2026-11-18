@@ -62,6 +62,7 @@ use crate::{
         },
         id_space::{DocMap, FtsDocId, RowId},
         lazy_source::{LazyByteSource, PrefetchedSource, RangeCoalescePlan, Source},
+        load_watch::{LoadListener, LoadWatch},
     },
     supertable::schema::FieldId,
     utils::terms::{DictEntry, TermBlocks, make_key},
@@ -579,6 +580,10 @@ pub struct FtsReader {
     pub(super) doc_map_region: Option<Range<usize>>,
     /// Whether a read after open checks its CRC, as the open's reads did.
     verify_crc: bool,
+    /// Told when a read loads the doc-id map, a column's norms or a block
+    /// table. Shared with `block_tables` and with every view cloned from
+    /// this reader.
+    loads: LoadWatch,
 }
 
 /// The error for a short-form term body the decoder refuses.
@@ -589,6 +594,35 @@ pub(super) fn short_body_malformed() -> FtsError {
 }
 
 impl FtsReader {
+    /// Push the buffers this reader's source keeps: on a lazy open, the
+    /// header and doc-lengths directory it read.
+    pub(crate) fn held_buffers(&self, out: &mut Vec<Bytes>) {
+        self.source.held_buffers(out);
+    }
+
+    /// Heap bytes reads have loaded into this reader since it opened: the
+    /// doc-id map, each column's norms and long terms' block tables.
+    pub(crate) fn held_bytes(&self) -> usize {
+        let doc_map = match self.doc_map.get() {
+            Some(DocMap::Permuted(map)) => map.len(),
+            _ => 0,
+        };
+        doc_map
+            + self.block_tables.held_bytes()
+            + self
+                .columns
+                .iter()
+                .map(ColumnMeta::held_bytes)
+                .sum::<usize>()
+    }
+
+    /// What a view from [`Self::with_scoring`] holds beyond the reader it
+    /// was derived from, whose doc-id map, norms and block tables it shares:
+    /// its columns' own decode tables.
+    pub(crate) fn view_held_bytes(&self) -> usize {
+        self.columns.iter().map(ColumnMeta::view_held_bytes).sum()
+    }
+
     /// A view of this reader that scores at `scoring` instead of what its
     /// columns declare, or `None` when that changes no column.
     ///
@@ -1105,8 +1139,9 @@ impl FtsReader {
             }
         };
 
+        let loads = LoadWatch::default();
         Ok(FtsReader {
-            block_tables: Arc::default(),
+            block_tables: Arc::new(BlockTableCache::new(loads.clone())),
             source,
             n_docs,
             n_terms_total,
@@ -1119,7 +1154,14 @@ impl FtsReader {
             doc_map,
             doc_map_region,
             verify_crc: opts.verify_crc,
+            loads,
         })
+    }
+
+    /// Call `listener` after each read that loads the doc-id map, a
+    /// column's norms or a block table into this reader or a view of it.
+    pub(crate) fn watch_loads(&self, listener: &LoadListener) {
+        self.loads.watch(listener);
     }
 
     /// The doc-id map, read on the caller's runtime if no query has read it
@@ -1129,7 +1171,11 @@ impl FtsReader {
     /// Every query path awaits this before it translates a doc id, so the
     /// read never goes through [`Self::doc_map`]'s blocking one.
     pub(super) async fn ensure_doc_map(&self) -> Result<&DocMap, FtsError> {
-        self.doc_map
+        if let Some(map) = self.doc_map.get() {
+            return Ok(map);
+        }
+        let map = self
+            .doc_map
             .get_or_try_init(|| async {
                 let region = self
                     .doc_map_region
@@ -1145,7 +1191,9 @@ impl FtsReader {
                     })?;
                 read_doc_map(&self.source, region, bytes, self.verify_crc)
             })
-            .await
+            .await?;
+        self.loads.loaded();
+        Ok(map)
     }
 
     /// The length buckets scoring `column` reads besides the postings,
@@ -1333,6 +1381,7 @@ impl FtsReader {
                 source: e,
             })?;
         col.install_fetched_norms(&array)?;
+        self.loads.loaded();
         Ok(())
     }
 
@@ -3062,7 +3111,7 @@ mod tests {
         panic::{AssertUnwindSafe, catch_unwind},
         sync::{
             Barrier, Mutex,
-            atomic::{AtomicBool, AtomicU32, Ordering},
+            atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
         },
         thread::{self, ThreadId},
         time::Duration,
@@ -5413,6 +5462,54 @@ mod tests {
         }
         views[2].ensure_doc_map().await.expect("doc-id map");
         assert_eq!(source.map_reads().len(), 1, "one read serves them all");
+    }
+
+    /// A watched reader reports a load once what it loaded is in place, so
+    /// a listener that weighs the reader then counts it. A search through a
+    /// scored view reads the doc-id map and the column's norms into the
+    /// reader the view shares them with, and the last report weighs the
+    /// reader with both; a second search loads nothing and reports nothing.
+    #[tokio::test]
+    async fn a_watched_reader_reports_its_loads_once_they_are_held() {
+        let (_, r) = probed_reader(false).await;
+        let r = Arc::new(r);
+        let before = r.held_bytes();
+        let reports = Arc::new(AtomicU32::new(0));
+        let weighed = Arc::new(AtomicUsize::new(0));
+        let listener: LoadListener = {
+            let reader = Arc::downgrade(&r);
+            let (reports, weighed) = (Arc::clone(&reports), Arc::clone(&weighed));
+            Arc::new(move || {
+                reports.fetch_add(1, Ordering::SeqCst);
+                let held = reader.upgrade().expect("the test holds it").held_bytes();
+                weighed.store(held, Ordering::SeqCst);
+            })
+        };
+        r.watch_loads(&listener);
+        let view = r
+            .with_scoring(&ScoringView {
+                params: None,
+                avgdl: Some(("body", VIEW_AVERAGE_LENGTHS[0])),
+            })
+            .expect("a view at a new average length");
+
+        assert_eq!(filtered_search(&view).await.expect("search"), PROBE_ROWS);
+        assert!(r.doc_map_is_read(), "the search read the map");
+        assert!(r.columns[0].norms_loaded(), "the search read the norms");
+        assert!(r.held_bytes() > before, "the reader holds what it loaded");
+        assert!(
+            reports.load(Ordering::SeqCst) > 0,
+            "the loads were reported"
+        );
+        assert_eq!(
+            weighed.load(Ordering::SeqCst),
+            r.held_bytes(),
+            "the last report weighed everything the search loaded"
+        );
+
+        let reported = reports.load(Ordering::SeqCst);
+        assert_eq!(filtered_search(&view).await.expect("search"), PROBE_ROWS);
+        assert_eq!(reports.load(Ordering::SeqCst), reported);
     }
 
     #[tokio::test]

@@ -300,11 +300,13 @@ mod tests {
     use roaring::RoaringBitmap;
     use tempfile::TempDir;
     use tokio::runtime::Builder;
+    use uuid::Uuid;
 
     use crate::{
         config::OptimizeOptions,
         memory::ConnectionMemoryBudget,
         storage::{LocalFsStorageProvider, StorageProvider},
+        superfile::builder::FtsConfig,
         supertable::{
             Supertable, SupertableOptions, SupertableReader,
             error::QueryError,
@@ -312,7 +314,6 @@ mod tests {
                 column_cache::DecodedColumnCache,
                 provider::{TopKHint, WalkFallback, tests::planned_files, walk_probe},
                 range_top_k::provider_of,
-                scalar_cache::ByteLru,
             },
         },
     };
@@ -396,7 +397,7 @@ mod tests {
             .expect("options")
             .with_storage(storage)
             .with_range_indexes(&["key".to_string()]);
-        options.decoded_columns = Some(Arc::new(ByteLru::new(KEPT_BYTES)));
+        options.decoded_columns = Some(Arc::new(DecodedColumnCache::new(KEPT_BYTES)));
         options.row_group_size = Some(ROW_GROUP_ROWS);
         let st = Supertable::create(options).expect("create");
         for file in 0..FILES {
@@ -962,7 +963,7 @@ mod tests {
         //  - A walk that keeps no row answers empty and plans no file.
         // This test pins the walk through the kept-columns scan.
         let dir = TempDir::new().expect("tempdir");
-        let kept = Some(Arc::new(ByteLru::new(KEPT_BYTES)));
+        let kept = Some(Arc::new(DecodedColumnCache::new(KEPT_BYTES)));
         let st = tagged_table_with(&dir, kept, TAGGED_FILES, TAGGED_ROWS_PER_FILE);
         let reader = st.reader().expect("reader");
         let sql = |filter: &str, sort: &str| {
@@ -1143,5 +1144,229 @@ mod tests {
             let plan = explained(&reader, sql);
             assert!(plan.contains(note), "{plan}");
         }
+    }
+
+    /// The needle table is 20 files of 500 rows, enough that a rare filter's page is past the
+    /// walk's 4,096-row limit.
+    const NEEDLE_FILES: i64 = 20;
+    const NEEDLE_ROWS: i64 = 500;
+    /// `needle` is in one row of each of the last 9 files: their 4,500 rows are past the limit.
+    const NEEDLE_FROM_FILE: i64 = 11;
+    /// `pair` is in every 10th row of the last 2 files, so it fills a page within them.
+    const PAIR_FROM_FILE: i64 = 18;
+    /// `lone` is in one row of the last file: its page needs more rows than the limit, but the
+    /// file holds only 500.
+    const LONE_FILE: i64 = NEEDLE_FILES - 1;
+    /// `seq` from here keeps the last 7 files, 3,500 rows, with `lone` 3,250 rows in, ascending.
+    const LONE_BOUND: i64 = 6_500;
+
+    /// The needle table: `seq` range indexed, `msg` full-text indexed, `common` every second row.
+    fn needle_table(dir: &TempDir) -> Supertable {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("seq", DataType::Int64, false),
+            Field::new("msg", DataType::LargeUtf8, false),
+        ]));
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let options =
+            SupertableOptions::new(Arc::clone(&schema), vec![FtsConfig::new("msg")], vec![])
+                .expect("options")
+                .with_storage(storage)
+                .with_range_indexes(&["seq".to_string()]);
+        let st = Supertable::create(options).expect("create");
+        for file in 0..NEEDLE_FILES {
+            let seqs: Vec<i64> = (file * NEEDLE_ROWS..(file + 1) * NEEDLE_ROWS).collect();
+            let msgs: Vec<String> = seqs
+                .iter()
+                .map(|s| {
+                    let mut msg = format!("w{s}");
+                    for (word, holds) in [
+                        (
+                            "needle",
+                            file >= NEEDLE_FROM_FILE && s % NEEDLE_ROWS == NEEDLE_ROWS / 2,
+                        ),
+                        ("pair", file >= PAIR_FROM_FILE && s % 10 == 0),
+                        (
+                            "lone",
+                            file == LONE_FILE && s % NEEDLE_ROWS == NEEDLE_ROWS / 2,
+                        ),
+                        ("common", s % 2 == 0),
+                    ] {
+                        if holds {
+                            msg.push(' ');
+                            msg.push_str(word);
+                        }
+                    }
+                    msg
+                })
+                .collect();
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(seqs)),
+                    Arc::new(LargeStringArray::from(msgs)),
+                ],
+            )
+            .expect("batch");
+            let mut writer = st.writer().expect("writer");
+            writer.append(&batch).expect("append");
+            writer.commit().expect("commit");
+        }
+        st
+    }
+
+    /// `seq` of `filter`'s page in `direction`, through the walk and through the sort without it.
+    fn needle_pages(reader: &SupertableReader, filter: &str, direction: &str) -> [Vec<i64>; 2] {
+        ["seq", "(seq + 0)"].map(|sort| {
+            let sql = format!(
+                "SELECT seq FROM supertable WHERE {filter} \
+                 ORDER BY {sort} {direction} NULLS LAST, _id ASC LIMIT 10"
+            );
+            seqs(&reader.query_sql(&sql).expect("sql"))
+        })
+    }
+
+    /// The needle table's reader, with its walks watched.
+    fn watched_needle_table(dir: &TempDir) -> (SupertableReader, Uuid) {
+        let reader = needle_table(dir).reader().expect("reader");
+        let superfile = reader.manifest().superfiles[0].superfile_id;
+        walk_probe::watch(superfile);
+        (reader, superfile)
+    }
+
+    #[test]
+    fn a_rare_text_match_is_declined_before_the_walk_reads_a_window() {
+        // The term index counts `needle` in 9 rows, one in each of 9 files of 500: a page of 10
+        // needs 5,000 rows, and those files hold 4,500, both past the walk's limit.
+        //  - Both directions decline before any window is read, and answer as the sort.
+        //  - So does `needle` and `common`, counted as the rarer of the two in each file.
+        // This test pins that a `text_match` is estimated from the term index.
+        let dir = TempDir::new().expect("tempdir");
+        let (reader, superfile) = watched_needle_table(&dir);
+        for filter in [
+            "text_match(msg, 'needle')",
+            "text_match(msg, 'needle common', 'and')",
+        ] {
+            for direction in ["ASC", "DESC"] {
+                let [walked, sorted] = needle_pages(&reader, filter, direction);
+                assert_eq!(walked, sorted, "{filter} {direction}");
+                assert_eq!(walked.len(), 9, "{filter} {direction}");
+            }
+        }
+        assert_eq!(
+            walk_probe::windows(superfile),
+            (0, 0),
+            "declined before reading"
+        );
+        assert_eq!(
+            walk_probe::fallbacks(superfile),
+            vec![WalkFallback::CannotAnswer; 4]
+        );
+    }
+
+    #[test]
+    fn a_text_match_in_few_files_walks_only_those_files() {
+        // `pair` is in 100 rows, all in the last 2 of 20 files, so first by `seq` descending and
+        // last ascending.
+        //  - Over those 2 files a page of 10 is one row in 10, so one window of 200 rows answers,
+        //    in both directions, as the sort does.
+        //  - Over every file it would be one row in 100, and ascending the first window would
+        //    pass nothing.
+        // This test pins that the walk leaves out files the term index proves hold no match.
+        let dir = TempDir::new().expect("tempdir");
+        let (reader, superfile) = watched_needle_table(&dir);
+        for direction in ["ASC", "DESC"] {
+            let [walked, sorted] = needle_pages(&reader, "text_match(msg, 'pair')", direction);
+            assert_eq!(walked, sorted, "{direction}");
+            assert_eq!(walked.len(), 10, "{direction}");
+        }
+        assert_eq!(walk_probe::windows(superfile), (2, 400));
+        assert_eq!(walk_probe::fallbacks(superfile), vec![]);
+    }
+
+    #[test]
+    fn a_rare_text_match_in_one_small_file_is_walked_under_a_bounded_filter() {
+        // `lone` is in 1 row of the last file of 500: a page of 10 at one row in 500 needs 5,000
+        // rows, past the walk's limit, but that file holds only 500.
+        //  - With no bound on `seq` a walk that reads that file still cannot answer: declined.
+        //  - Under `seq >= 0` both directions read that file in one window and answer as the sort.
+        // This test pins that only under a bounded filter the decline is capped at the rows held.
+        let dir = TempDir::new().expect("tempdir");
+        let (reader, superfile) = watched_needle_table(&dir);
+        let [walked, sorted] = needle_pages(&reader, "text_match(msg, 'lone')", "ASC");
+        assert_eq!(walked, sorted);
+        assert_eq!(walk_probe::windows(superfile), (0, 0), "declined unbounded");
+        assert_eq!(
+            walk_probe::fallbacks(superfile),
+            vec![WalkFallback::CannotAnswer]
+        );
+        for direction in ["ASC", "DESC"] {
+            let filter = "seq >= 0 AND text_match(msg, 'lone')";
+            let [walked, sorted] = needle_pages(&reader, filter, direction);
+            assert_eq!(walked, sorted, "{direction}");
+            assert_eq!(walked.len(), 1, "{direction}");
+        }
+        assert_eq!(walk_probe::windows(superfile), (2, 1000));
+        assert_eq!(
+            walk_probe::fallbacks(superfile),
+            vec![WalkFallback::CannotAnswer]
+        );
+    }
+
+    #[test]
+    fn a_bounded_walk_reads_on_to_the_rows_its_files_hold() {
+        // `seq >= 6500` keeps 7 files of 500, and `LIKE` has no estimate: its one match is 3,250
+        // rows in, ascending.
+        //  - Windows of 20, 80, 320 and 1,280 pass none; the next would pass the limit, but only
+        //    1,800 rows are left, so the walk reads them and answers as the sort.
+        // This test pins that a bounded walk's give-up counts only the rows its files hold.
+        let dir = TempDir::new().expect("tempdir");
+        let (reader, superfile) = watched_needle_table(&dir);
+        let filter = format!("seq >= {LONE_BOUND} AND msg LIKE '%lone%'");
+        let [walked, sorted] = needle_pages(&reader, &filter, "ASC");
+        assert_eq!(walked, sorted);
+        assert_eq!(walked.len(), 1);
+        assert_eq!(walk_probe::windows(superfile), (5, 3500));
+        assert_eq!(walk_probe::fallbacks(superfile), vec![]);
+    }
+
+    #[test]
+    fn a_filter_with_no_estimate_gives_up_once_its_share_puts_the_page_past_the_limit() {
+        // `LIKE` and a function have no estimate, and the `needle` rows are late by `seq`.
+        //  - Windows of 20, 80, 320 and 1,280 rows pass none, and the next would be 5,120: past the
+        //    limit, so the walk stops at 1,700 rows, not at 4,096.
+        //  - The page answers as the sort.
+        // This test pins the walk's give-up when nothing passes.
+        let dir = TempDir::new().expect("tempdir");
+        let (reader, superfile) = watched_needle_table(&dir);
+        for filter in ["msg LIKE '%needle%'", "strpos(msg, 'needle') > 0"] {
+            let (windows, walked) = walk_probe::windows(superfile);
+            let [got, sorted] = needle_pages(&reader, filter, "ASC");
+            assert_eq!(got, sorted, "{filter}");
+            assert_eq!(
+                walk_probe::windows(superfile),
+                (windows + 4, walked + 1700),
+                "{filter}"
+            );
+        }
+        assert_eq!(
+            walk_probe::fallbacks(superfile),
+            vec![WalkFallback::CannotAnswer; 2]
+        );
+    }
+
+    #[test]
+    fn a_common_text_match_is_still_walked() {
+        // `common` is in every second row of every file.
+        // This test pins that the walk still answers it, in both directions, as the sort does.
+        let dir = TempDir::new().expect("tempdir");
+        let (reader, superfile) = watched_needle_table(&dir);
+        for direction in ["ASC", "DESC"] {
+            let [walked, sorted] = needle_pages(&reader, "text_match(msg, 'common')", direction);
+            assert_eq!(walked, sorted, "{direction}");
+            assert_eq!(walked.len(), 10, "{direction}");
+        }
+        assert_eq!(walk_probe::walks(superfile), 2);
+        assert_eq!(walk_probe::fallbacks(superfile), vec![]);
     }
 }

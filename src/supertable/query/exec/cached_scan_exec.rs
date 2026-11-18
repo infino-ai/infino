@@ -11,9 +11,19 @@
 //! files' row groups; for each it takes every projected column from the cache,
 //! decodes the ones the cache lacks from the row group whole
 //! ([`read_file_row_group`], with the schema adaptation the search paths
-//! use), keeps them, and drops the row group's deleted rows. When the range
-//! index chose a file's rows (an `ORDER BY ... LIMIT` over a range), only
-//! those rows come out, and a row group holding none of them is not read.
+//! use), keeps them, and drops the row group's deleted rows. When an index
+//! chose a file's rows (an `ORDER BY ... LIMIT` over a range, or a scan the
+//! full-text index narrowed in some superfiles only), only those rows come
+//! out, and a row group holding none of them is not read.
+//!
+//! A row group whose chosen rows are fewer than half its live rows, and whose
+//! columns the cache lacks, has just those rows read from its pages, as the
+//! Parquet scan reads them, and nothing kept: one selective statement does not
+//! decode a row group whole or push out the columns other statements read
+//! whole. The cache remembers the row group, and the next scan that chooses
+//! rows in it decodes and keeps its columns
+//! ([`DecodedColumnCache::read_in_part_before`]). A row group whose columns
+//! are kept hands over its chosen rows from them.
 //!
 //! It answers what the Parquet scan would: the same columns, typed as the scan
 //! schema types them, each file's rows in file order, without the rows a
@@ -59,6 +69,7 @@ use datafusion::{
         DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
         SendableRecordBatchStream,
         execution_plan::{Boundedness, EmissionType},
+        metrics::{Count, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet},
         stream::RecordBatchStreamAdapter,
     },
 };
@@ -75,8 +86,8 @@ use crate::{
         error::QueryError,
         manifest::{ManifestSnapshot, SuperfileUri, hll::HllSketch},
         query::{
-            column_cache::{ColumnKey, DecodedColumnCache},
-            exec::common::{hit_output_schema, read_file_row_group},
+            column_cache::{ColumnKey, DecodedColumnCache, RowGroupKey},
+            exec::common::{hit_output_schema, read_file_row_group, take_file_columns},
             read_ahead::{file_pruning, statistics_pruned},
         },
         schema::{FieldId, cast::CAST_OPTIONS},
@@ -104,6 +115,15 @@ const DICTIONARY_ROWS_PER_VALUE: usize = 16;
 /// value table needs no margin.
 const SKETCH_KEY_MARGIN: usize = 2;
 
+/// Metric counting the row groups a scan decoded because the cache lacked
+/// one of their projected columns, as `EXPLAIN ANALYZE` lists it. A run over
+/// columns the cache keeps decodes none.
+const ROW_GROUPS_DECODED: &str = "row_groups_decoded";
+
+/// Metric counting the row groups a scan read only the chosen rows of, from
+/// their pages, keeping nothing, as `EXPLAIN ANALYZE` lists it.
+const ROW_GROUPS_READ_IN_PART: &str = "row_groups_read_in_part";
+
 /// One file of the scan: what its row groups are read from.
 #[derive(Debug)]
 pub(crate) struct CachedFile {
@@ -118,9 +138,10 @@ pub(crate) struct CachedFile {
     pub(crate) row_counts: Arc<[u32]>,
     /// The file's deleted rows, by position in the file.
     pub(crate) tombstones: Arc<RoaringBitmap>,
-    /// The only rows to read, by position in the file, when the range
-    /// index chose them (an `ORDER BY ... LIMIT` over a range reads the rows
-    /// up to its cutoff); `None` reads every row.
+    /// The only rows to read, by position in the file, when an index chose
+    /// them (an `ORDER BY ... LIMIT` over a range reads the rows up to its
+    /// cutoff); `None` reads every live row. Live rows only: none of them is
+    /// in [`Self::tombstones`].
     pub(crate) selected: Option<RoaringBitmap>,
 }
 
@@ -159,6 +180,11 @@ struct RowGroupUnit {
     row_group: usize,
     /// The row group's rows, by position in the file.
     rows: Range<u32>,
+    /// Whether a read that lacks a column decodes the row group whole and
+    /// keeps its columns: it is read whole, the scan chose at least half its
+    /// live rows, or a scan read some of its rows before. Otherwise such a
+    /// read takes the chosen rows from the pages and keeps nothing.
+    keep: bool,
 }
 
 /// What every partition reads with.
@@ -196,6 +222,10 @@ pub(crate) struct CachedScanExec {
     /// `ORDER BY ... LIMIT` whose row filter decodes the wide columns only
     /// for the rows that pass, takes it back ([`Self::parquet`]).
     parquet: Arc<dyn ExecutionPlan>,
+    /// The rows each partition hands on, which the per-query counters take
+    /// as the rows the scan materialized, as they take a Parquet scan's; and
+    /// the row groups it decoded ([`ROW_GROUPS_DECODED`]).
+    metrics: ExecutionPlanMetricsSet,
 }
 
 impl CachedScanExec {
@@ -230,6 +260,7 @@ impl CachedScanExec {
         if !convertible {
             return None;
         }
+        let schema_id = manifest.table_schema().schema_id();
         let mut units = Vec::new();
         let mut pruned = 0;
         for file in files.into_iter().map(Arc::new) {
@@ -247,26 +278,39 @@ impl CachedScanExec {
                 }
                 // A row group every row of which is deleted reads nothing, nor
                 // does one holding none of the rows the index chose.
+                let live = u64::from(n) - file.tombstones.range_cardinality(rows.clone());
                 let chosen = file
                     .selected
                     .as_ref()
-                    .is_none_or(|selected| selected.range_cardinality(rows.clone()) > 0);
-                if chosen && n > 0 && file.tombstones.range_cardinality(rows.clone()) < u64::from(n)
-                {
-                    units.push(RowGroupUnit {
-                        file: Arc::clone(&file),
-                        row_group,
-                        rows,
-                    });
+                    .map_or(live, |selected| selected.range_cardinality(rows.clone()));
+                if chosen == 0 {
+                    continue;
                 }
+                let keep = file.selected.is_none()
+                    || chosen.saturating_mul(2) >= live
+                    || cache.read_in_part_before(&RowGroupKey {
+                        uri: file.uri,
+                        schema_id,
+                        row_group,
+                    });
+                units.push(RowGroupUnit {
+                    file: Arc::clone(&file),
+                    row_group,
+                    rows,
+                    keep,
+                });
             }
         }
         let dictionaries = dictionary_columns(&manifest, &schema, &units);
-        if decoded_bytes(&units, &schema, &dictionaries) > cache.max_bytes() {
+        if decoded_bytes(
+            units.iter().filter(|unit| unit.keep),
+            &schema,
+            &dictionaries,
+        ) > cache.max_bytes()
+        {
             return None;
         }
         let partitions = target_partitions.clamp(1, units.len().max(1));
-        let schema_id = manifest.table_schema().schema_id();
         let properties = plan_properties(&schema, partitions);
         Some(Self {
             context: Arc::new(ScanContext {
@@ -285,6 +329,7 @@ impl CachedScanExec {
             statistics: Arc::new(statistics),
             properties,
             parquet,
+            metrics: ExecutionPlanMetricsSet::new(),
         })
     }
 
@@ -296,7 +341,7 @@ impl CachedScanExec {
 }
 
 /// About how many bytes the columns of `schema` take decoded over `units`'
-/// row groups, from the footers:
+/// row groups (those a scan would keep), from the footers:
 /// - a fixed-width column, its width per row;
 /// - any other, [`VIEW_BYTES_PER_ROW`] per row plus its values' bytes, which
 ///   the footer records unencoded (a dictionary-encoded column stores far
@@ -306,13 +351,12 @@ impl CachedScanExec {
 /// A column a file holds under another name, after a rename, isn't found by
 /// this name and counts as nothing; the estimate decides only which scan
 /// serves the statement, never what it returns.
-fn decoded_bytes(
-    units: &[RowGroupUnit],
+fn decoded_bytes<'a>(
+    units: impl Iterator<Item = &'a RowGroupUnit>,
     schema: &Schema,
     dictionaries: &HashMap<SuperfileUri, Arc<[bool]>>,
 ) -> usize {
     units
-        .iter()
         .map(|unit| {
             let dictionary = dictionaries.get(&unit.file.uri);
             let meta = unit.file.reader.parquet_metadata();
@@ -454,6 +498,27 @@ fn plan_properties(schema: &SchemaRef, partitions: usize) -> Arc<PlanProperties>
     ))
 }
 
+/// Which of `rows` (positions in the file) are in `selected`, one entry per
+/// row of the range.
+fn selected_mask(selected: &RoaringBitmap, rows: &Range<u32>) -> BooleanArray {
+    let n = rows.len();
+    let mut mask = BooleanBufferBuilder::new(n);
+    mask.append_n(n, false);
+    for row in selected.range(rows.clone()) {
+        mask.set_bit((row - rows.start) as usize, true);
+    }
+    BooleanArray::new(mask.finish(), None)
+}
+
+/// `array` typed as `target`, the scan schema's type for its column.
+fn as_scan_type(array: &ArrayRef, target: &DataType) -> DfResult<ArrayRef> {
+    Ok(if array.data_type() == target {
+        Arc::clone(array)
+    } else {
+        cast_with_options(array, target, &CAST_OPTIONS)?
+    })
+}
+
 /// `batch` as slices of at most `rows` rows each, sharing its buffers.
 fn sliced(batch: RecordBatch, rows: usize) -> Vec<RecordBatch> {
     let rows = rows.max(1);
@@ -465,6 +530,15 @@ fn sliced(batch: RecordBatch, rows: usize) -> Vec<RecordBatch> {
 }
 
 impl ScanContext {
+    /// The cache's key for `unit`'s row group.
+    fn row_group_key(&self, unit: &RowGroupUnit) -> RowGroupKey {
+        RowGroupKey {
+            uri: unit.file.uri,
+            schema_id: self.schema_id,
+            row_group: unit.row_group,
+        }
+    }
+
     /// The cache's key for `column` of `unit`'s row group.
     fn key(&self, unit: &RowGroupUnit, column: &str) -> ColumnKey {
         ColumnKey {
@@ -503,12 +577,7 @@ impl ScanContext {
         let mut decoded = Vec::with_capacity(missing.len());
         let dictionary = self.dictionaries.get(&unit.file.uri);
         for (&i, array) in missing.iter().zip(read.columns()) {
-            let target = fields[i].data_type();
-            let array = if array.data_type() == target {
-                Arc::clone(array)
-            } else {
-                cast_with_options(array, target, &CAST_OPTIONS)?
-            };
+            let array = as_scan_type(array, fields[i].data_type())?;
             // A column of few values is kept as a dictionary; this statement
             // reads the strings it decoded.
             let kept = match dictionary.is_some_and(|kept| kept[i]) {
@@ -527,7 +596,14 @@ impl ScanContext {
 
     /// `unit`'s row group, every projected column, without its deleted rows
     /// and, when the index chose the file's rows, without the rows it didn't.
-    async fn read(self: &Arc<Self>, unit: &RowGroupUnit) -> DfResult<RecordBatch> {
+    /// A decode of the columns the cache lacks counts in `decoded`; a read of
+    /// just the chosen rows from the pages, keeping nothing, in `read_in_part`.
+    async fn read(
+        self: &Arc<Self>,
+        unit: &RowGroupUnit,
+        decoded: &Count,
+        read_in_part: &Count,
+    ) -> DfResult<RecordBatch> {
         let fields = self.schema.fields();
         // As kept: a column kept as a dictionary stays one until the rows
         // the predicate keeps are known.
@@ -538,7 +614,17 @@ impl ScanContext {
         let missing: Vec<usize> = (0..columns.len())
             .filter(|&i| columns[i].is_none())
             .collect();
+        if !missing.is_empty()
+            && !unit.keep
+            && let Some(selected) = &unit.file.selected
+        {
+            read_in_part.add(1);
+            return self
+                .read_chosen_rows(unit, selected, columns, missing)
+                .await;
+        }
         if !missing.is_empty() {
+            decoded.add(1);
             // The decode runs as its own task: a `LIMIT` above drops this
             // partition's stream once it has its rows, and a decode dropped
             // halfway would have spent its CPU without keeping the columns.
@@ -560,17 +646,10 @@ impl ScanContext {
             .collect::<DfResult<Vec<_>>>()?;
         let n = unit.rows.len();
         let start = unit.rows.start;
+        // The chosen rows are live, so they need no check against the
+        // tombstones.
         let keep = match &unit.file.selected {
-            Some(selected) => {
-                let mut mask = BooleanBufferBuilder::new(n);
-                mask.append_n(n, false);
-                for row in selected.range(unit.rows.clone()) {
-                    if !unit.file.tombstones.contains(row) {
-                        mask.set_bit((row - start) as usize, true);
-                    }
-                }
-                Some(mask)
-            }
+            Some(selected) => Some(selected_mask(selected, &unit.rows)),
             None => {
                 let mut keep: Option<BooleanBufferBuilder> = None;
                 for row in unit.file.tombstones.range(unit.rows.clone()) {
@@ -581,10 +660,10 @@ impl ScanContext {
                     });
                     mask.set_bit((row - start) as usize, false);
                 }
-                keep
+                keep.map(|mut mask| BooleanArray::new(mask.finish(), None))
             }
         };
-        let live = keep.map(|mut mask| BooleanArray::new(mask.finish(), None));
+        let live = keep;
         let keep = match &self.predicate {
             Some(predicate) => passing_rows(predicate, &self.schema, &columns, live, n),
             None => live,
@@ -607,6 +686,65 @@ impl ScanContext {
             columns,
             &RecordBatchOptions::new().with_row_count(Some(rows)),
         )?)
+    }
+
+    /// The `selected` rows of `unit`'s row group: the `missing` columns read
+    /// from the pages for just those rows and not kept, the others taken from
+    /// the kept `columns`. The cache remembers the row group, so the next scan
+    /// that chooses rows in it decodes and keeps its columns.
+    async fn read_chosen_rows(
+        &self,
+        unit: &RowGroupUnit,
+        selected: &RoaringBitmap,
+        columns: Vec<Option<ArrayRef>>,
+        missing: Vec<usize>,
+    ) -> DfResult<RecordBatch> {
+        self.cache.note_read_in_part(self.row_group_key(unit));
+        let fields = self.schema.fields();
+        let rows: Vec<u32> = selected.range(unit.rows.clone()).collect();
+        let chosen = rows.len();
+        let names: Vec<&str> = missing.iter().map(|&i| fields[i].name().as_str()).collect();
+        let stored = hit_output_schema(&self.manifest.stored_schema(), &names)?;
+        let taken = take_file_columns(
+            &self.manifest,
+            &unit.file.reader,
+            rows,
+            &names,
+            &stored,
+            &self.op_stats,
+        )
+        .await?;
+        if taken.num_rows() != chosen {
+            return Err(DataFusionError::Internal(format!(
+                "read {} rows of a row group for {chosen} chosen ones",
+                taken.num_rows()
+            )));
+        }
+        let mask = selected_mask(selected, &unit.rows);
+        // `missing` lists the absent columns in schema order, as the take
+        // returned them.
+        let mut taken = taken.columns().iter();
+        let columns = columns
+            .into_iter()
+            .zip(fields)
+            .map(|(column, field)| match column {
+                // A column kept as a dictionary comes out as the scan's
+                // strings.
+                Some(kept) => as_scanned(filter(kept.as_ref(), &mask)?, field.data_type()),
+                None => {
+                    let array = taken
+                        .next()
+                        .ok_or_else(|| DataFusionError::Internal("a column was not read".into()))?;
+                    as_scan_type(array, field.data_type())
+                }
+            })
+            .collect::<DfResult<Vec<_>>>()?;
+        RecordBatch::try_new_with_options(
+            Arc::clone(&self.schema),
+            columns,
+            &RecordBatchOptions::new().with_row_count(Some(chosen)),
+        )
+        .map_err(DataFusionError::from)
     }
 }
 
@@ -841,6 +979,7 @@ impl CachedScanExec {
             fetch: self.fetch,
             statistics: Arc::clone(&self.statistics),
             properties: Arc::clone(&self.properties),
+            metrics: ExecutionPlanMetricsSet::new(),
         }
     }
 
@@ -918,7 +1057,12 @@ impl ExecutionPlan for CachedScanExec {
             fetch: limit,
             statistics: Arc::clone(&self.statistics),
             properties: Arc::clone(&self.properties),
+            metrics: ExecutionPlanMetricsSet::new(),
         }))
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
     }
 
     fn execute(
@@ -940,6 +1084,10 @@ impl ExecutionPlan for CachedScanExec {
             .cloned()
             .collect();
         let context = Arc::clone(&self.context);
+        let output_rows = MetricBuilder::new(&self.metrics).output_rows(partition);
+        let decoded = MetricBuilder::new(&self.metrics).counter(ROW_GROUPS_DECODED, partition);
+        let read_in_part =
+            MetricBuilder::new(&self.metrics).counter(ROW_GROUPS_READ_IN_PART, partition);
         // A row group goes out in batch-size slices, as the Parquet scan's
         // rows do: the filter above then works a batch at a time, and a
         // `LIMIT` met in the first slice leaves the rest of the row group.
@@ -947,7 +1095,9 @@ impl ExecutionPlan for CachedScanExec {
         let batches = stream::iter(units)
             .then(move |unit| {
                 let context = Arc::clone(&context);
-                async move { context.read(&unit).await }
+                let decoded = decoded.clone();
+                let read_in_part = read_in_part.clone();
+                async move { context.read(&unit, &decoded, &read_in_part).await }
             })
             .map_ok(move |batch| stream::iter(sliced(batch, batch_size).into_iter().map(Ok)))
             .try_flatten()
@@ -964,7 +1114,8 @@ impl ExecutionPlan for CachedScanExec {
                         Some(Ok(batch.slice(0, rows)))
                     }
                 })
-            });
+            })
+            .inspect_ok(move |batch| output_rows.add(batch.num_rows()));
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             Arc::clone(&self.context.schema),
             batches,
@@ -992,7 +1143,7 @@ pub(crate) fn has_columns(schema: &Schema) -> bool {
 #[cfg(test)]
 mod tests {
     use arrow::util::pretty::pretty_format_batches;
-    use arrow_array::{Array, Int64Array, StringArray};
+    use arrow_array::{Array, Int64Array, LargeStringArray, StringArray};
     use arrow_schema::{DataType, Field};
     use datafusion::prelude::{col, lit};
     use tempfile::TempDir;
@@ -1000,7 +1151,8 @@ mod tests {
     use super::*;
     use crate::{
         storage::{LocalFsStorageProvider, StorageProvider},
-        supertable::{Supertable, SupertableOptions, query::scalar_cache::ByteLru},
+        superfile::builder::FtsConfig,
+        supertable::{Supertable, SupertableOptions, SupertableReader},
     };
 
     /// Superfiles the dictionary test's table is written as.
@@ -1152,21 +1304,6 @@ mod tests {
         })
     }
 
-    /// The `EXPLAIN` of `sql` on `st`, every plan line joined.
-    fn explained(st: &Supertable, sql: &str) -> String {
-        st.reader()
-            .expect("reader")
-            .query_sql(&format!("EXPLAIN {sql}"))
-            .expect("explain")
-            .iter()
-            .flat_map(|b| {
-                let plans = b.column(1).as_string::<i32>().clone();
-                (0..plans.len()).map(move |i| plans.value(i).to_owned())
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
     /// The scan checks a `WHERE` on a column it keeps as a dictionary, and a
     /// statement over such columns answers as without a cache: with nulls,
     /// `!=`, `NOT IN`, `IS NULL` and `LIKE`; with a condition that fails on a
@@ -1178,7 +1315,10 @@ mod tests {
         let plain_dir = TempDir::new().expect("tempdir");
         let plain = region_table(&plain_dir, None);
         let kept_dir = TempDir::new().expect("tempdir");
-        let kept = region_table(&kept_dir, Some(Arc::new(ByteLru::new(KEPT_BYTES))));
+        let kept = region_table(
+            &kept_dir,
+            Some(Arc::new(DecodedColumnCache::new(KEPT_BYTES))),
+        );
         let grouped = |condition: &str| {
             format!(
                 "SELECT region, count(*) AS n FROM supertable WHERE {condition} \
@@ -1216,7 +1356,7 @@ mod tests {
         assert!(outcome(&plain, &fails).is_err(), "{fails}");
         // The filter above the scan hands its `WHERE` to the scan.
         let plan = explained(
-            &kept,
+            &kept.reader().expect("reader"),
             "SELECT region, max(msg) AS m FROM supertable WHERE region = 'eu' GROUP BY region",
         );
         assert!(
@@ -1234,7 +1374,7 @@ mod tests {
         let plain_dir = TempDir::new().expect("tempdir");
         let plain = region_table(&plain_dir, None);
         let kept_dir = TempDir::new().expect("tempdir");
-        let cache = Arc::new(ByteLru::new(KEPT_BYTES));
+        let cache = Arc::new(DecodedColumnCache::new(KEPT_BYTES));
         let kept = region_table(&kept_dir, Some(Arc::clone(&cache)));
         for pass in ["decoded", "kept", "kept again"] {
             for sql in STATEMENTS {
@@ -1300,5 +1440,279 @@ mod tests {
             false,
         )])));
         assert!(sliced(empty, SLICE).is_empty());
+    }
+
+    /// Rows in each superfile of the narrowed table, one row group each.
+    const NARROWED_ROWS: i64 = 5_000;
+    /// Rows of the first superfile holding `x`: few enough for the index to
+    /// select them, and far fewer than half the row group.
+    const SPARSE: i64 = 100;
+    /// Rows of the second superfile holding `x`: more than half of it, so
+    /// the index does not select them and the superfile is read whole.
+    const DENSE: i64 = 3_000;
+    /// Rows deleted: those whose `seq` leaves [`DELETED_REMAINDER`] divided
+    /// by this, some of each superfile's `x` rows among them.
+    const DELETED_EVERY: i64 = 10;
+    /// See [`DELETED_EVERY`].
+    const DELETED_REMAINDER: i64 = 3;
+    /// Kept bytes: room for every column of the narrowed table.
+    const NARROWED_KEPT_BYTES: usize = 64 << 20;
+    /// Rows the `ORDER BY ... LIMIT` statements take.
+    const TOP_ROWS: usize = 10;
+
+    /// A scan the index narrows in the first superfile only.
+    const PARTLY_NARROWED: &str = "SELECT seq FROM supertable WHERE k = 'x' ORDER BY seq";
+    /// A scan the index narrows in both superfiles, to one row each.
+    const FULLY_NARROWED: &str =
+        "SELECT seq FROM supertable WHERE k IN ('v200', 'v8200') ORDER BY seq";
+
+    fn narrowed_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("seq", DataType::Int64, false),
+            Field::new("k", DataType::LargeUtf8, false),
+            Field::new("pad", DataType::LargeUtf8, false),
+        ]))
+    }
+
+    /// The `seq` of row `i` of superfile `file`, and its `k`.
+    fn narrowed_row(file: i64, i: i64) -> (i64, String) {
+        let seq = file * NARROWED_ROWS + i;
+        let x = match file {
+            0 => i < SPARSE,
+            _ => i < DENSE,
+        };
+        (seq, if x { "x".to_owned() } else { format!("v{seq}") })
+    }
+
+    /// Every live `x` row's `seq`, ascending.
+    fn live_x() -> Vec<i64> {
+        (0..2)
+            .flat_map(|file| (0..NARROWED_ROWS).map(move |i| narrowed_row(file, i)))
+            .filter(|(seq, k)| k == "x" && seq % DELETED_EVERY != DELETED_REMAINDER)
+            .map(|(seq, _)| seq)
+            .collect()
+    }
+
+    /// Two superfiles of [`NARROWED_ROWS`] rows, `k` indexed, its rows
+    /// deleted as [`DELETED_EVERY`] says, keeping decoded columns in `kept`
+    /// when given.
+    fn narrowed_table(dir: &TempDir, kept: Option<Arc<DecodedColumnCache>>) -> Supertable {
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let mut options =
+            SupertableOptions::new(narrowed_schema(), vec![FtsConfig::new("k")], vec![])
+                .expect("options")
+                .with_storage(storage);
+        options.decoded_columns = kept;
+        options.row_group_size = Some(NARROWED_ROWS as usize);
+        let st = Supertable::create(options).expect("create");
+        for file in 0..2 {
+            let (seqs, ks): (Vec<i64>, Vec<String>) =
+                (0..NARROWED_ROWS).map(|i| narrowed_row(file, i)).unzip();
+            let pads: Vec<String> = seqs.iter().map(|s| format!("{s:0>48}")).collect();
+            let batch = RecordBatch::try_new(
+                narrowed_schema(),
+                vec![
+                    Arc::new(Int64Array::from(seqs)),
+                    Arc::new(LargeStringArray::from(ks)),
+                    Arc::new(LargeStringArray::from(pads)),
+                ],
+            )
+            .expect("batch");
+            let mut writer = st.writer().expect("writer");
+            writer.append(&batch).expect("append");
+            writer.commit().expect("commit");
+        }
+        st.delete((col("seq") % lit(DELETED_EVERY)).eq(lit(DELETED_REMAINDER)))
+            .expect("delete");
+        st
+    }
+
+    /// The `seq` column of `sql`'s rows, in order.
+    fn seqs_of(reader: &SupertableReader, sql: &str) -> Vec<i64> {
+        reader
+            .query_sql(sql)
+            .unwrap_or_else(|error| panic!("{sql}: {error}"))
+            .iter()
+            .flat_map(|b| {
+                let seqs = b
+                    .column_by_name("seq")
+                    .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+                    .expect("seq")
+                    .clone();
+                (0..seqs.len()).map(move |i| seqs.value(i))
+            })
+            .collect()
+    }
+
+    /// The `EXPLAIN` of `sql` on `reader`, every plan line joined.
+    fn explained(reader: &SupertableReader, sql: &str) -> String {
+        reader
+            .query_sql(&format!("EXPLAIN {sql}"))
+            .expect("explain")
+            .iter()
+            .flat_map(|b| {
+                let plans = b
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("plan column")
+                    .clone();
+                (0..plans.len()).map(move |i| plans.value(i).to_owned())
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// How many of `reader`'s superfiles have `column` of their first row
+    /// group, the only one each holds, kept in `kept`.
+    fn superfiles_keeping(
+        reader: &SupertableReader,
+        kept: &DecodedColumnCache,
+        column: &str,
+    ) -> usize {
+        let manifest = reader.manifest();
+        let schema_id = manifest.table_schema().schema_id();
+        manifest
+            .superfiles
+            .iter()
+            .filter(|entry| {
+                kept.get(&ColumnKey {
+                    uri: entry.uri,
+                    schema_id,
+                    column: column.to_owned(),
+                    row_group: 0,
+                })
+                .is_some()
+            })
+            .count()
+    }
+
+    /// A scan the index narrows in some superfiles only reads them through
+    /// kept columns, and answers as the same table keeping no columns does:
+    /// the plain scan and `ORDER BY ... LIMIT` both ways (the path that can
+    /// hand back the Parquet scan), on the first pass and the kept ones. The
+    /// narrowed row group's few rows are read from its pages and kept only
+    /// on its second read, so the first statement keeps the columns of the
+    /// superfile read whole alone.
+    #[test]
+    fn a_partly_narrowed_scan_answers_as_the_table_without_kept_columns() {
+        let kept = Arc::new(DecodedColumnCache::new(NARROWED_KEPT_BYTES));
+        let (with_dir, without_dir) = (
+            TempDir::new().expect("tempdir"),
+            TempDir::new().expect("tempdir"),
+        );
+        let with = narrowed_table(&with_dir, Some(Arc::clone(&kept)));
+        let without = narrowed_table(&without_dir, None);
+        let (with, without) = (
+            with.reader().expect("reader"),
+            without.reader().expect("reader"),
+        );
+        let plan = explained(&with, PARTLY_NARROWED);
+        assert!(plan.contains("CachedScanExec"), "{plan}");
+        let plan = explained(&without, PARTLY_NARROWED);
+        assert!(!plan.contains("CachedScanExec"), "{plan}");
+
+        // First read: `k` is kept for the superfile read whole only. (The
+        // delete that built the table may have kept `seq` already.)
+        assert_eq!(superfiles_keeping(&with, &kept, "k"), 0);
+        assert_eq!(seqs_of(&with, PARTLY_NARROWED), live_x());
+        assert_eq!(
+            superfiles_keeping(&with, &kept, "k"),
+            1,
+            "the narrowed row group's first read keeps nothing"
+        );
+        // Second read of the narrowed row group: its columns are kept too.
+        assert_eq!(seqs_of(&with, PARTLY_NARROWED), live_x());
+        assert_eq!(
+            superfiles_keeping(&with, &kept, "k"),
+            2,
+            "the second read keeps the narrowed row group"
+        );
+
+        let statements = [
+            PARTLY_NARROWED.to_owned(),
+            format!(
+                "SELECT seq, pad FROM supertable WHERE k = 'x' ORDER BY seq DESC LIMIT {TOP_ROWS}"
+            ),
+            format!(
+                "SELECT seq, k, pad FROM supertable WHERE k = 'x' ORDER BY seq LIMIT {TOP_ROWS}"
+            ),
+        ];
+        let mut descending = live_x();
+        descending.reverse();
+        let wanted = [
+            live_x(),
+            descending.into_iter().take(TOP_ROWS).collect::<Vec<_>>(),
+            live_x().into_iter().take(TOP_ROWS).collect::<Vec<_>>(),
+        ];
+        for pass in ["first", "kept", "kept again"] {
+            for (sql, want) in statements.iter().zip(&wanted) {
+                let got = seqs_of(&with, sql);
+                assert_eq!(got, seqs_of(&without, sql), "{pass}: {sql}");
+                assert_eq!(&got, want, "{pass}: {sql}");
+            }
+        }
+    }
+
+    /// A narrowed row group none of whose rows were read in part before
+    /// hands over the columns kept for it and reads the others for its
+    /// selected rows from its pages, keeping them only for the row group read
+    /// whole; and answers as the table keeping no columns does.
+    #[test]
+    fn a_narrowed_row_group_takes_kept_columns_and_reads_the_rest_from_its_pages() {
+        let kept = Arc::new(DecodedColumnCache::new(NARROWED_KEPT_BYTES));
+        let (with_dir, without_dir) = (
+            TempDir::new().expect("tempdir"),
+            TempDir::new().expect("tempdir"),
+        );
+        let with = narrowed_table(&with_dir, Some(Arc::clone(&kept)));
+        let without = narrowed_table(&without_dir, None);
+        let (with, without) = (
+            with.reader().expect("reader"),
+            without.reader().expect("reader"),
+        );
+        // A scan narrowed nowhere keeps `seq` of both row groups.
+        let every = "SELECT seq FROM supertable ORDER BY seq";
+        assert_eq!(seqs_of(&with, every), seqs_of(&without, every));
+        assert_eq!(superfiles_keeping(&with, &kept, "seq"), 2);
+        assert_eq!(superfiles_keeping(&with, &kept, "k"), 0);
+        // `k` is kept for the row group read whole only; the narrowed one's
+        // `seq` comes from the kept column, its `k` from its pages.
+        let got = seqs_of(&with, PARTLY_NARROWED);
+        assert_eq!(got, seqs_of(&without, PARTLY_NARROWED));
+        assert_eq!(got, live_x());
+        assert_eq!(
+            superfiles_keeping(&with, &kept, "k"),
+            1,
+            "k of the row group read whole only"
+        );
+    }
+
+    /// A scan the index narrows in every superfile reads their selected
+    /// pages through the Parquet scan, keeping none of its columns, and answers as
+    /// the table keeping no columns does.
+    #[test]
+    fn a_scan_narrowed_in_every_superfile_reads_the_files() {
+        let kept = Arc::new(DecodedColumnCache::new(NARROWED_KEPT_BYTES));
+        let (with_dir, without_dir) = (
+            TempDir::new().expect("tempdir"),
+            TempDir::new().expect("tempdir"),
+        );
+        let with = narrowed_table(&with_dir, Some(Arc::clone(&kept)));
+        let without = narrowed_table(&without_dir, None);
+        let (with, without) = (
+            with.reader().expect("reader"),
+            without.reader().expect("reader"),
+        );
+        let plan = explained(&with, FULLY_NARROWED);
+        assert!(!plan.contains("CachedScanExec"), "{plan}");
+        assert!(plan.contains("DataSourceExec"), "{plan}");
+        for pass in ["first", "again"] {
+            let got = seqs_of(&with, FULLY_NARROWED);
+            assert_eq!(got, seqs_of(&without, FULLY_NARROWED), "{pass}");
+            assert_eq!(got, vec![200, 8200], "{pass}");
+        }
+        assert_eq!(superfiles_keeping(&with, &kept, "k"), 0, "k is not kept");
     }
 }

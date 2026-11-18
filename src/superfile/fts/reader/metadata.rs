@@ -160,6 +160,12 @@ impl ColumnLengthStats {
 }
 
 impl NormTable {
+    /// Heap bytes the table holds: its per-doc length buckets and its decode
+    /// table.
+    pub(crate) fn held_bytes(&self) -> usize {
+        self.bytes.len() + size_of::<[f32; 256]>()
+    }
+
     /// Build from a column's per-doc lengths, returning the table
     /// alongside the totals the pass produced.
     ///
@@ -537,6 +543,22 @@ impl fmt::Debug for ColumnMeta {
 }
 
 impl ColumnMeta {
+    /// Heap bytes this column's norms hold once a read built them: the
+    /// declared-parameter norms, with their per-doc buckets, and a rescored
+    /// view's decode table, which shares those buckets.
+    pub(super) fn held_bytes(&self) -> usize {
+        self.base_norms
+            .get()
+            .map_or(0, |norms| norms.dl_norm_k1.held_bytes())
+            + self.view_held_bytes()
+    }
+
+    /// What a rescored view of this column holds beyond the norms it shares
+    /// with the column it was derived from: its own decode table.
+    pub(super) fn view_held_bytes(&self) -> usize {
+        self.view_norms.get().map_or(0, |_| size_of::<[f32; 256]>())
+    }
+
     /// The norms at the declared parameters, reading the length array now
     /// if no scoring entry point has done so yet. The entry points prewarm
     /// through `FtsReader::ensure_norms` on the async path, which fails the
