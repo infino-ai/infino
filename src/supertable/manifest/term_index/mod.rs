@@ -7363,7 +7363,7 @@ mod tests {
                 memos.contains_key("title"),
                 "an indexed superfile gets a memo"
             );
-            let budget = ConnectionMemoryBudget::measured();
+            let budget = ConnectionMemoryBudget::with_room();
             let dict = QueryDict::with_budget(&budget);
             let (plain, plain_work) = rt
                 .block_on(plan.evaluate(&sf, None, &TermMemos::new(), &dict))

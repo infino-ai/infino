@@ -17,6 +17,7 @@ use super::{
     core::*,
     cursor::{CursorUse, TermCursor},
     metadata::ColumnMeta,
+    options::BoolMode,
     work::MatchWork,
 };
 use crate::{
@@ -650,7 +651,7 @@ impl FtsReader {
         let mut out = Vec::with_capacity(terms.len());
         for term in terms {
             let (rows, term_work) = self
-                .token_match_prefetched(column, &[term], crate::BoolMode::Or, prefetched, dict)
+                .token_match_prefetched(column, &[term], BoolMode::Or, prefetched, dict)
                 .await?;
             work.merge(term_work);
             out.push(ContainsRows {

@@ -65,13 +65,15 @@ use crate::{
         lazy_source::{LazyByteSource, PrefetchedSource, RangeCoalescePlan, Source},
         load_watch::{LoadListener, LoadWatch},
     },
-    supertable::schema::FieldId,
+    supertable::{
+        query::read_ahead::BUDGET_SHARE_PERCENT as READ_AHEAD_SHARE_PERCENT, schema::FieldId,
+    },
     utils::terms::{DictEntry, TermBlocks, make_key},
 };
 
 /// Most of the connection's memory budget, in percent, that kept dictionaries may bring it to: half
-/// of what read-ahead and cache fills may, so those always keep room beside the dictionaries.
-pub(crate) const QUERY_DICT_SHARE_PERCENT: usize = 25;
+/// of read-ahead's share, so read-ahead always keeps room beside them.
+pub(crate) const QUERY_DICT_SHARE_PERCENT: usize = READ_AHEAD_SHARE_PERCENT / 2;
 
 /// Largest gap worth overfetching when adjacent term postings share a request.
 const TERM_RANGE_COALESCE_MAX_GAP: usize = 64 * 1024;
@@ -542,35 +544,36 @@ pub(super) fn two_term_has_rare_anchor(cursors: &[TermCursor]) -> bool {
     lo > 0 && hi >= lo.saturating_mul(WAND_BMW_2TERM_DF_RATIO)
 }
 
-/// One file's term dictionary, kept across that file's steps so each reads it once. Kept only while
-/// the budget has room ([`QUERY_DICT_SHARE_PERCENT`]) and given back when a reservation needs the
-/// room; `default()` keeps nothing.
+/// One file's term dictionary, kept across that file's predicate steps so they read it once. Kept
+/// only under a budget with a limit and room ([`QUERY_DICT_SHARE_PERCENT`]), and given back when a
+/// reservation that asks for memory back needs the room; `default()` keeps nothing.
 #[derive(Default)]
 pub(crate) struct QueryDict {
-    /// Registered with the budget once something is kept, so the budget can take it back.
-    kept: Arc<KeptDict>,
-    /// The budget a kept dictionary is reserved from; `None` keeps nothing.
-    budget: Option<Arc<ConnectionMemoryBudget>>,
+    /// The slot a kept dictionary lives in and the budget it is reserved from; `None` keeps nothing.
+    keeping: Option<(Arc<KeptDict>, Arc<ConnectionMemoryBudget>)>,
 }
 
 impl QueryDict {
-    /// Keeps the dictionary while `budget` has room for it.
+    /// Keeps the dictionary while `budget` has room for it. A budget with no limit keeps nothing: it
+    /// never asks for memory back, so kept copies would grow with every file and statement.
     pub(crate) fn with_budget(budget: &Arc<ConnectionMemoryBudget>) -> Self {
+        if budget.remaining().is_none() {
+            return Self::default();
+        }
         Self {
-            kept: Arc::default(),
-            budget: Some(Arc::clone(budget)),
+            keeping: Some((Arc::default(), Arc::clone(budget))),
         }
     }
 
     /// Whether this can keep a dictionary at all.
-    #[cfg(test)]
     pub(crate) fn keeps(&self) -> bool {
-        self.budget.is_some()
+        self.keeping.is_some()
     }
 
     /// The kept dictionary and the reader that kept it, if one is kept.
     fn kept(&self) -> Option<(Bytes, usize)> {
-        match &*self.kept.lock() {
+        let (kept, _) = self.keeping.as_ref()?;
+        match &*kept.lock() {
             Kept::Dict { bytes, reader, .. } => Some((bytes.clone(), *reader)),
             Kept::Nothing | Kept::GivenBack => None,
         }
@@ -578,16 +581,24 @@ impl QueryDict {
 
     /// Gives a kept dictionary back now; nothing more is kept.
     pub(crate) fn give_back(&self) {
-        self.kept.reclaim();
+        if let Some((kept, _)) = &self.keeping {
+            kept.reclaim();
+        }
     }
 
     /// Keeps `bytes`, `reader`'s dictionary, if nothing was kept yet and the budget has room; never
     /// waits or asks others to free memory.
     fn keep(&self, bytes: &Bytes, reader: usize) {
-        let Some(budget) = &self.budget else {
+        let Some((slot, budget)) = &self.keeping else {
             return;
         };
-        let mut kept = self.kept.lock();
+        // Registered before anything is reserved, so a reservation refused because of this one
+        // always finds it to give back. Once, and only for a file whose dictionary is downloaded.
+        slot.registered.get_or_init(|| {
+            let holder: Weak<KeptDict> = Arc::downgrade(slot);
+            budget.register_reclaim(holder);
+        });
+        let mut kept = slot.lock();
         if !matches!(*kept, Kept::Nothing) {
             return;
         }
@@ -601,12 +612,6 @@ impl QueryDict {
             reader,
             _reservation: reservation,
         };
-        drop(kept);
-        // A budget with no limit never asks for memory back.
-        if budget.remaining().is_some() {
-            let holder: Weak<KeptDict> = Arc::downgrade(&self.kept);
-            budget.register_reclaim(holder);
-        }
     }
 }
 
@@ -626,16 +631,21 @@ enum Kept {
 }
 
 #[derive(Default)]
-struct KeptDict(Mutex<Kept>);
+struct KeptDict {
+    kept: Mutex<Kept>,
+    /// Set once this slot is registered with the budget.
+    registered: OnceLock<()>,
+}
 
 impl KeptDict {
     fn lock(&self) -> MutexGuard<'_, Kept> {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+        self.kept.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
 impl Reclaim for KeptDict {
-    /// Gives the dictionary back; a step already reading it keeps its own handle.
+    /// Gives the dictionary back; a step already reading it keeps its own handle until it finishes,
+    /// no longer counted against the budget.
     fn reclaim(&self) {
         let _given_back = mem::replace(&mut *self.lock(), Kept::GivenBack);
     }
@@ -1422,14 +1432,18 @@ impl FtsReader {
                 self.identity(),
                 "a `QueryDict` kept another file's dictionary"
             );
-            return Ok((bytes, false));
-        }
-        let downloads = match (&dict.budget, &self.source) {
-            (None, _) | (_, Source::InMemory(_)) => false,
-            (Some(_), Source::Lazy(source)) => {
-                !source.is_local(self.dict_range.start as u64, self.dict_range.len() as u64)
+            // Another file's copy is never used: this reader reads its own.
+            if reader == self.identity() {
+                return Ok((bytes, false));
             }
-        };
+        }
+        let downloads = dict.keeps()
+            && match &self.source {
+                Source::InMemory(_) => false,
+                Source::Lazy(source) => {
+                    !source.is_local(self.dict_range.start as u64, self.dict_range.len() as u64)
+                }
+            };
         let bytes = self.dict_bytes_async().await?;
         self.debug_assert_own_dict(&bytes);
         if downloads {
@@ -4912,6 +4926,12 @@ mod tests {
         }
     }
 
+    /// A limit this many times a dictionary: half of its 90% holds the dictionary, the share does not.
+    const NO_ROOM_LIMIT_PER_DICTIONARY: u64 = 3;
+
+    /// A limit this many times a dictionary: the share holds the dictionary, with room past it.
+    const ROOM_LIMIT_PER_DICTIONARY: u64 = 8;
+
     /// A reader opened lazily over a [`DownloadSource`].
     async fn recorded_lazy_reader() -> (FtsReader, Arc<DownloadSource>) {
         let (blob, json) = build_blob();
@@ -4936,7 +4956,7 @@ mod tests {
         let (r, recording) = recorded_lazy_reader().await;
         let dictionary = r.dict_range.clone();
         let opened = recording.0.len();
-        let budget = ConnectionMemoryBudget::measured();
+        let budget = ConnectionMemoryBudget::with_room();
         let dict = QueryDict::with_budget(&budget);
 
         let (first, fetched) = r.query_dict(&dict).await.expect("first step");
@@ -4970,15 +4990,22 @@ mod tests {
 
     #[tokio::test]
     async fn query_dict_keeps_nothing_without_room() {
-        // A budget whose share cannot hold the dictionary, then a `QueryDict` with no budget.
+        // A budget whose share cannot hold the dictionary, a budget with no limit, and a `QueryDict`
+        // with no budget.
         //  - nothing is kept or reserved;
         //  - each step downloads the dictionary and gets the same bytes.
-        // This test pins one download per step when there is no room.
+        // This test pins one download per step with no room or no limit.
         let (r, recording) = recorded_lazy_reader().await;
         let dictionary = r.dict_range.clone();
-        // The dictionary fits half the limit (90% of this) but not the share, a quarter of it.
-        let budget = ConnectionMemoryBudget::with_limit(dictionary.len() as u64 * 3);
-        for dict in [QueryDict::with_budget(&budget), QueryDict::default()] {
+        let no_room = ConnectionMemoryBudget::with_limit(
+            dictionary.len() as u64 * NO_ROOM_LIMIT_PER_DICTIONARY,
+        );
+        let no_limit = ConnectionMemoryBudget::measured();
+        for (budget, dict) in [
+            (&no_room, QueryDict::with_budget(&no_room)),
+            (&no_limit, QueryDict::with_budget(&no_limit)),
+            (&no_room, QueryDict::default()),
+        ] {
             let opened = recording.0.len();
             let (first, fetched_first) = r.query_dict(&dict).await.expect("first step");
             assert_eq!(budget.used(), 0, "nothing is reserved");
@@ -5004,8 +5031,8 @@ mod tests {
         // This test pins that a kept dictionary never makes another reservation fail.
         let (r, recording) = recorded_lazy_reader().await;
         let dictionary = r.dict_range.clone();
-        // The share (a quarter of 90% of this) holds the dictionary, with room past it.
-        let budget = ConnectionMemoryBudget::with_limit(dictionary.len() as u64 * 8);
+        let budget =
+            ConnectionMemoryBudget::with_limit(dictionary.len() as u64 * ROOM_LIMIT_PER_DICTIONARY);
         let dict = QueryDict::with_budget(&budget);
         r.query_dict(&dict).await.expect("first step");
         assert_eq!(budget.used(), dictionary.len(), "the dictionary is kept");
@@ -5037,7 +5064,7 @@ mod tests {
         // This test pins that a kept dictionary never crosses files.
         let (first, _) = recorded_lazy_reader().await;
         let (second, _) = recorded_lazy_reader().await;
-        let budget = ConnectionMemoryBudget::measured();
+        let budget = ConnectionMemoryBudget::with_room();
         let dict = QueryDict::with_budget(&budget);
         first.query_dict(&dict).await.expect("kept");
         let _ = second.query_dict(&dict).await;
@@ -5053,7 +5080,7 @@ mod tests {
         let (r, recording) = recorded_lazy_reader().await;
         let dictionary = r.dict_range.clone();
         let terms = ["rust", "runtime", "java"];
-        let budget = ConnectionMemoryBudget::measured();
+        let budget = ConnectionMemoryBudget::with_room();
 
         let opened = recording.0.len();
         let (shared, _) = r
@@ -5099,7 +5126,7 @@ mod tests {
             .await
             .expect("open_lazy");
         for r in [in_memory, lazy_local] {
-            let budget = ConnectionMemoryBudget::measured();
+            let budget = ConnectionMemoryBudget::with_room();
             let dict = QueryDict::with_budget(&budget);
             let (_, fetched) = r.query_dict(&dict).await.expect("first step");
             assert!(fetched);

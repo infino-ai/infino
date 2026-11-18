@@ -4613,7 +4613,7 @@ mod tests {
         //  - both walks read the dictionary: it is kept;
         //  - no negated term, a phrase, or a memo answering either walk: nothing is kept.
         // This test pins a kept copy only where it saves a read.
-        let budget = ConnectionMemoryBudget::measured();
+        let budget = ConnectionMemoryBudget::with_room();
         let memo = FetchedTermMemo::from_slots([(Box::from("known"), None)]);
         let keeps =
             |phrase: bool, memo: Option<&FetchedTermMemo>, positive: &[&str], negated: &[&str]| {

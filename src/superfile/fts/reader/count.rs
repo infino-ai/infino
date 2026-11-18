@@ -1035,6 +1035,9 @@ mod tests {
     /// Documents in the reordered blob the dictionary-lifetime test matches.
     const DICT_LIFETIME_DOCS: u32 = 64;
 
+    /// A limit this many times a dictionary: half of its 90% holds the dictionary, the share does not.
+    const NO_ROOM_LIMIT_PER_DICTIONARY: u64 = 3;
+
     /// A dictionary buffer handed out by [`DictWatchSource`]; it counts itself live until the last
     /// slice of it drops.
     struct WatchedDict {
@@ -1170,9 +1173,9 @@ mod tests {
         let (blob, json) = build_standard_blob_with(&refs, Some(&order));
         let probe = FtsReader::open(blob.clone(), &json).expect("open");
         let dict = probe.dict_range.clone();
-        // The dictionary fits half the limit (90% of this) but not the share, a quarter of it.
-        let refused = ConnectionMemoryBudget::with_limit(dict.len() as u64 * 3);
-        let roomy = ConnectionMemoryBudget::measured();
+        let refused =
+            ConnectionMemoryBudget::with_limit(dict.len() as u64 * NO_ROOM_LIMIT_PER_DICTIONARY);
+        let roomy = ConnectionMemoryBudget::with_room();
         let cases = [
             (QueryDict::default(), 0, "no budget"),
             (QueryDict::with_budget(&refused), 0, "no room"),
