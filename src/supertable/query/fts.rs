@@ -117,6 +117,7 @@ pub use crate::superfile::fts::reader::BoolMode;
 use crate::utils::trace::OpOrigin;
 use crate::{
     InfinoError, config,
+    memory::ConnectionMemoryBudget,
     runtime_bridge::run_on_pool_unless_blocking,
     runtime_metrics::op_stats,
     superfile::{
@@ -127,12 +128,12 @@ use crate::{
             bm25::Bm25Params,
             reader::{
                 Bm25SearchOptions, ClauseLists, ColumnLengthStats, FetchedTermMemo, GlobalTermIdf,
-                LiveFloor, MatchWork, OR_WINDOW_MIN_TERMS, OrCursorSet, PreparedClauses, QueryIdf,
-                ScoringView,
+                LiveFloor, MatchWork, OR_WINDOW_MIN_TERMS, OrCursorSet, PreparedClauses, QueryDict,
+                QueryIdf, ScoringView,
             },
             tokenize::Phrase,
         },
-        id_space::RowId,
+        id_space::{FtsDocId, RowId},
     },
     supertable::{
         error::QueryError,
@@ -305,6 +306,24 @@ struct MatchKernel {
     /// The pushed-down `WHERE`'s rows, when its indexes can bound them.
     row_filter: Option<RowFilter>,
     op_stats: Option<Arc<op_stats::OpStatsCollector>>,
+    /// The budget a file's kept dictionary is reserved from.
+    budget: Arc<ConnectionMemoryBudget>,
+}
+
+/// The dictionary copy a file's match walks share: kept only when the positive walk and the negated
+/// walk both read the dictionary, i.e. the memo answers neither; otherwise it keeps nothing.
+fn walk_dict(
+    phrase_involved: bool,
+    memo: Option<&FetchedTermMemo>,
+    positive: &[&str],
+    negated: &[&str],
+    budget: &Arc<ConnectionMemoryBudget>,
+) -> QueryDict {
+    let reads = |tokens: &[&str]| !memo.is_some_and(|m| m.covers(tokens));
+    match !phrase_involved && !negated.is_empty() && reads(positive) && reads(negated) {
+        true => QueryDict::with_budget(budget),
+        false => QueryDict::default(),
+    }
 }
 
 impl MatchKernel {
@@ -355,6 +374,14 @@ impl MatchKernel {
     /// keeps: the positive walk minus any row a negated atom reaches.
     async fn docs(&self, r: &Arc<SuperfileReader>, suid: Uuid) -> Result<Vec<RowId>, QueryError> {
         let (column, memo, refs) = self.file_inputs(r, suid).await;
+        let neg_refs: Vec<&str> = self.negatives.iter().map(String::as_str).collect();
+        let dict = walk_dict(
+            self.phrase_involved,
+            memo.as_deref(),
+            &refs,
+            &neg_refs,
+            &self.budget,
+        );
         // Any phrase atom (match or negated) takes the phrase-aware walk;
         // plain-token queries keep the optimized token_match path.
         let (docs, mut work) = match self.phrase_involved {
@@ -363,7 +390,7 @@ impl MatchKernel {
                     .await?
             }
             false => {
-                r.token_match_prefetched(&column, &refs, self.mode, memo.as_deref())
+                r.token_match_prefetched(&column, &refs, self.mode, memo.as_deref(), &dict)
                     .await?
             }
         };
@@ -371,11 +398,16 @@ impl MatchKernel {
         // of the negatives). The df / count fast paths can't express
         // exclusion, so negation forces a materialized walk over both sets.
         let docs = if self.has_negatives {
-            let neg_refs: Vec<&str> = self.negatives.iter().map(String::as_str).collect();
             let (neg_docs, neg_work) = match self.negative_phrases.is_empty() {
                 true => {
-                    r.token_match_prefetched(&column, &neg_refs, BoolMode::Or, memo.as_deref())
-                        .await?
+                    r.token_match_prefetched(
+                        &column,
+                        &neg_refs,
+                        BoolMode::Or,
+                        memo.as_deref(),
+                        &dict,
+                    )
+                    .await?
                 }
                 false => {
                     r.atoms_match_ids(&column, &neg_refs, &self.negative_phrases, BoolMode::Or)
@@ -390,6 +422,8 @@ impl MatchKernel {
         } else {
             docs
         };
+        // The row filter reads the dictionary on its own; the kept copy is not held through it.
+        drop(dict);
         // One flush per superfile: positive + negation walks.
         self.flush(&work);
         let hits = docs.len() as u64;
@@ -414,24 +448,36 @@ impl MatchKernel {
         Ok(set)
     }
 
-    /// The rows in doc-id slice `[start, end)` of a superfile that `set`,
-    /// its [`Self::cursor_set`], matches. A [`Self::slices`] kernel only.
+    /// What doc-id slice `[start, end)` of a superfile matches against `set`, its
+    /// [`Self::cursor_set`]: its rows when the file holds its doc-id map, else its blob ids for
+    /// the page read. A [`Self::slices`] kernel only.
     fn slice(
         &self,
         r: &SuperfileReader,
         set: &OrCursorSet,
         start: u32,
         end: u32,
-    ) -> Result<Vec<RowId>, QueryError> {
-        let (rows, work) = r.token_match_range_prebuilt(set, start, end)?;
+    ) -> Result<SliceMatch, QueryError> {
+        let (ids, work) = r.token_match_range_in_blob_ids(set, start, end)?;
         self.flush(&work);
-        Ok(rows)
+        Ok(match r.held_ids_to_rows(&ids)? {
+            Some(rows) => SliceMatch::Rows(rows),
+            None => SliceMatch::Unmapped(ids),
+        })
     }
 
     /// Adds a walk's work to the statement's statistics.
     fn flush(&self, work: &MatchWork) {
         add_match_work(&self.op_stats, work);
     }
+}
+
+/// What one slice of a sliced match found.
+enum SliceMatch {
+    /// Its rows, translated through the doc-id map the file holds.
+    Rows(Vec<RowId>),
+    /// Its blob ids, when the file keeps no map, for a read of the map's pages.
+    Unmapped(Vec<FtsDocId>),
 }
 
 /// The row filter walks a superfile's postings only when the match keeps at
@@ -526,7 +572,10 @@ impl RowFilter {
             locations: &self.locations,
             superfile: suid,
         };
-        let estimated = self.plan.estimate(r, Some(&self.pool), Some(located)).await;
+        let estimated = self
+            .plan
+            .estimate(r, Some(&self.pool), Some(located), &QueryDict::default())
+            .await;
         let (estimate, work) = match estimated {
             Ok(estimated) => estimated,
             // A superfile written before a filter column was indexed holds
@@ -541,7 +590,14 @@ impl RowFilter {
         // The walk is CPU work: on the pool, not on a runtime worker.
         let memos = memos_from_plan_locations(r, &self.locations, suid).await;
         let (rows, work) = Arc::clone(&self.plan)
-            .evaluate_on_pool(Arc::clone(r), suid, &self.pool, &self.slots, memos)
+            .evaluate_on_pool(
+                Arc::clone(r),
+                suid,
+                &self.pool,
+                &self.slots,
+                memos,
+                Arc::default(),
+            )
             .await?;
         self.flush(&work);
         Ok(rows.map(Arc::new))
@@ -2731,7 +2787,9 @@ impl SupertableReader {
                         // Residual superfile (contains a scored term, pruned
                         // from scoring): df only, from the dictionary value
                         // + header hint — no postings body.
-                        let (dfs, work) = r.term_dfs(&column_arc, &refs).await?;
+                        let (dfs, work) = r
+                            .term_dfs(&column_arc, &refs, &QueryDict::default())
+                            .await?;
                         add_match_work(&op_stats, &work);
                         Ok((suid, dfs, None))
                     }
@@ -3252,15 +3310,20 @@ impl SupertableReader {
                         // file: a rayon job on the reader pool, so the
                         // slices run side by side and no runtime worker
                         // blocks under one.
-                        let (set, slice_reader, slice_kernel) =
+                        let (slice_set, slice_reader, slice_kernel) =
                             (Arc::clone(set), Arc::clone(&r), Arc::clone(&kernel));
-                        let docs = run_on_pool_unless_blocking(
+                        let found = run_on_pool_unless_blocking(
                             Some(&reader_pool),
                             "match slice",
-                            move || slice_kernel.slice(&slice_reader, &set, start, end),
+                            move || slice_kernel.slice(&slice_reader, &slice_set, start, end),
                         )
                         .await
                         .map_err(|e| QueryError::Internal(e.to_string()))??;
+                        let docs = match found {
+                            SliceMatch::Rows(rows) => rows,
+                            // The file keeps no map: read only this slice's pages of it.
+                            SliceMatch::Unmapped(ids) => r.ids_to_rows_in_pages(ids, set).await?,
+                        };
                         kernel.keep_filtered(&r, suid, hits, true, docs).await?
                     }
                 };
@@ -3433,6 +3496,7 @@ impl SupertableReader {
             locations,
             row_filter,
             op_stats: self.op_stats.clone(),
+            budget: Arc::clone(&self.manifest().options.connection_memory_budget),
         };
         Ok(Some((units, Arc::new(kernel))))
     }
@@ -3565,6 +3629,7 @@ impl SupertableReader {
         // on the first error. The per-superfile body returns this
         // superfile's match count; the totals are summed.
         let op_stats = self.op_stats.clone();
+        let budget = Arc::clone(&self.manifest().options.connection_memory_budget);
         let per_superfile = dispatch::fanout_with(
             self,
             units,
@@ -3572,6 +3637,7 @@ impl SupertableReader {
             self.open_intent(),
             move |r, entry, tombstone_cache, now, _params: ()| {
                 let op_stats = op_stats.clone();
+                let budget = Arc::clone(&budget);
                 let column_arc = Arc::clone(&column_arc);
                 let term_arc = Arc::clone(&term_arc);
                 let phrase_arc = Arc::clone(&phrase_arc);
@@ -3604,6 +3670,9 @@ impl SupertableReader {
                     // negatives) or a tombstone. Negation *without* deletes
                     // takes the skip-based counting path below instead.
                     if tomb.is_some() {
+                        let neg_refs: Vec<&str> = neg_arc.iter().map(|s| s.as_str()).collect();
+                        let dict =
+                            walk_dict(phrase_involved, memo.as_deref(), &refs, &neg_refs, &budget);
                         let (docs, mut work) = match phrase_involved {
                             true => {
                                 r.atoms_match_ids(&column_arc, &refs, &phrase_arc, match_mode)
@@ -3615,12 +3684,12 @@ impl SupertableReader {
                                     &refs,
                                     match_mode,
                                     memo.as_deref(),
+                                    &dict,
                                 )
                                 .await?
                             }
                         };
                         let excluded: RoaringBitmap = if has_negatives {
-                            let neg_refs: Vec<&str> = neg_arc.iter().map(|s| s.as_str()).collect();
                             let (neg_docs, neg_work) = match neg_ph_arc.is_empty() {
                                 true => {
                                     r.token_match_prefetched(
@@ -3628,6 +3697,7 @@ impl SupertableReader {
                                         &neg_refs,
                                         BoolMode::Or,
                                         memo.as_deref(),
+                                        &dict,
                                     )
                                     .await?
                                 }
@@ -3810,7 +3880,13 @@ impl SupertableReader {
                     let memo = memo_from_locations(&r, &locations, entry.superfile_id).await;
                     let refs: Vec<&str> = tokens_arc.iter().map(String::as_str).collect();
                     let (docs, work) = r
-                        .token_match_prefetched(&column_arc, &refs, BoolMode::And, memo.as_deref())
+                        .token_match_prefetched(
+                            &column_arc,
+                            &refs,
+                            BoolMode::And,
+                            memo.as_deref(),
+                            &QueryDict::default(),
+                        )
                         .await?;
                     // The prune pass's posting walk. The verify pass's own
                     // decode is folded into `rows_materialized` below; its
@@ -4718,6 +4794,35 @@ mod tests {
         assert_eq!(approximate_cut(&wide, 1.0, 0).keep, fit);
     }
 
+    #[test]
+    fn match_walks_keep_the_dictionary_only_when_both_read_it() {
+        // A match with a positive and a negated walk, and a memo that answers some terms.
+        //  - both walks read the dictionary: it is kept;
+        //  - no negated term, a phrase, or a memo answering either walk: nothing is kept.
+        // This test pins a kept copy only where it saves a read.
+        let budget = ConnectionMemoryBudget::with_room();
+        let memo = FetchedTermMemo::from_slots([(Box::from("known"), None)]);
+        let keeps =
+            |phrase: bool, memo: Option<&FetchedTermMemo>, positive: &[&str], negated: &[&str]| {
+                walk_dict(phrase, memo, positive, negated, &budget).keeps()
+            };
+        assert!(keeps(false, None, &["rust"], &["java"]));
+        assert!(keeps(false, Some(&memo), &["rust"], &["java"]));
+        assert!(!keeps(false, None, &["rust"], &[]), "no negated walk");
+        assert!(
+            !keeps(true, None, &["rust"], &["java"]),
+            "a phrase walk reads its own"
+        );
+        assert!(
+            !keeps(false, Some(&memo), &["known"], &["java"]),
+            "memo answers positives"
+        );
+        assert!(
+            !keeps(false, Some(&memo), &["rust"], &["known"]),
+            "memo answers negatives"
+        );
+    }
+
     /// A phrase's members are conjunctive, so a quoted phrase on its own
     /// prunes on all of them.
     ///
@@ -5020,10 +5125,11 @@ mod tests {
 
     use super::{
         BoolMode, FanOut, LocatedTerms, SharedTopK, SuperfileHit, SupertableReader,
-        build_work_units, ceilings_at_table_avgdl, fanout_for,
+        build_work_units, ceilings_at_table_avgdl, fanout_for, walk_dict,
     };
     use crate::{
         config::{CompactionSettings, OptimizeOptions},
+        memory::ConnectionMemoryBudget,
         storage::{LocalFsStorageProvider, ObjectMeta, StorageError, StorageProvider},
         superfile::{
             SuperfileReader,
@@ -5031,7 +5137,10 @@ mod tests {
             fts::{
                 bm25,
                 posting::BLOCK_LEN,
-                reader::{Bm25SearchOptions, ColumnLengthStats, top_k_initial_capacity},
+                reader::{
+                    Bm25SearchOptions, ColumnLengthStats, FetchedTermMemo, QueryDict,
+                    top_k_initial_capacity,
+                },
             },
             vector::layout::VectorLayout,
         },
@@ -8294,7 +8403,9 @@ mod tests {
         for e in &entries {
             let bytes = std::fs::read(dir.path().join(e.uri.storage_path())).expect("bytes");
             let sf = SuperfileReader::open(Bytes::from(bytes)).expect("open");
-            let (dfs, _) = rt.block_on(sf.term_dfs("title", &terms)).expect("dfs");
+            let (dfs, _) = rt
+                .block_on(sf.term_dfs("title", &terms, &QueryDict::default()))
+                .expect("dfs");
             for (i, d) in dfs.into_iter().enumerate() {
                 expected_df[i] += d;
             }

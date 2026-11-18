@@ -8,8 +8,7 @@
 
 use std::{cmp::Reverse, collections::BinaryHeap, str::from_utf8};
 
-/// Length buckets: the one-byte codes the length quantizer gives.
-const LEN_BUCKETS: usize = 1 << u8::BITS;
+use bytes::Bytes;
 
 #[cfg(any(test, feature = "test-helpers"))]
 use super::cursor::TermMeta;
@@ -45,6 +44,9 @@ use crate::{
     },
     utils::terms::{DictEntry, make_key},
 };
+
+/// Length buckets: the one-byte codes the length quantizer gives.
+const LEN_BUCKETS: usize = 1 << u8::BITS;
 
 /// Planned dictionary reads for a cursor build over `tokens`: none when a
 /// memo already resolves every token, one otherwise.
@@ -403,7 +405,7 @@ impl FtsReader {
         tokens: &[&str],
         mode: BoolMode,
     ) -> Result<(Vec<RowId>, MatchWork), FtsError> {
-        self.token_match_prefetched(column, tokens, mode, None)
+        self.token_match_prefetched(column, tokens, mode, None, &QueryDict::default())
             .await
     }
 
@@ -418,26 +420,42 @@ impl FtsReader {
         tokens: &[&str],
         mode: BoolMode,
         prefetched: Option<&FetchedTermMemo>,
+        dict: &QueryDict,
     ) -> Result<(Vec<RowId>, MatchWork), FtsError> {
         let column_id = self.resolve_column_id(column)?;
         if tokens.is_empty() {
             return Ok((Vec::new(), MatchWork::default()));
         }
-        let cursors = self
-            .build_term_cursors(
+        // The dictionary only for tokens the memo lacks, read through `dict`.
+        let (dict_bytes, fetched) = match prefetched.is_some_and(|m| m.covers(tokens)) {
+            true => (None, false),
+            false => {
+                let (bytes, fetched) = self.query_dict(dict).await?;
+                (Some(bytes), fetched)
+            }
+        };
+        let cursors: Vec<TermCursor> = self
+            .build_term_cursors_opt(
                 column_id,
                 tokens,
                 QueryIdf::ThisFile,
                 CursorUse::Count,
                 None,
                 prefetched,
+                dict_bytes.as_ref().map(Bytes::as_ref),
             )
-            .await?;
+            .await?
+            .into_iter()
+            .flatten()
+            .collect();
+        // The cursors are built; a dictionary `dict` did not keep is not held through the walk and
+        // the row-map read below.
+        drop(dict_bytes);
         // Tallied before the mode branch: the cursors that DID build cost
         // their bytes even when a missing AND token empties the result.
-        // +1 for the dictionary fetch, when the build had to make one.
+        // +1 for the dictionary fetch, when this call made it.
         let mut work = MatchWork::for_cursors(&cursors);
-        work.planned_ranges += dictionary_fetches(tokens, prefetched);
+        work.planned_ranges += u64::from(fetched);
         let (docs, walk_ns) = timed_section(|| match mode {
             BoolMode::And => {
                 // AND needs every token present; a missing token ⇒ empty
@@ -459,9 +477,10 @@ impl FtsReader {
 
     /// The cursors an `Or` [`Self::token_match_prefetched`] walks over
     /// `tokens`, built once (the postings fetch and skip-table parse) for
-    /// [`Self::token_match_range_prebuilt`] to walk one doc-id slice at a
+    /// [`Self::token_match_range_in_blob_ids`] to walk one doc-id slice at a
     /// time, with what the build read. Slices of one superfile share the
-    /// set; each walks a clone of its cursors.
+    /// set; each walks a clone of its cursors. Decides here, once for the file, whether its
+    /// slices translate through a kept map or read pages ([`Self::kept_doc_map_within_budget`]).
     pub(crate) async fn match_cursor_set(
         &self,
         column: &str,
@@ -477,6 +496,10 @@ impl FtsReader {
                 prefetched,
             )
             .await?;
+        // With no map kept, the slices read only their own pages, so the map's CRC is checked here.
+        if set.df_sum() > 0 && self.kept_doc_map_within_budget().await?.is_none() {
+            self.check_map_crc_for(set.df_sum()).await?;
+        }
         let work = MatchWork {
             postings_bytes: set.postings_bytes(),
             planned_ranges: set.planned_ranges() + dictionary_fetches(tokens, prefetched),
@@ -485,19 +508,16 @@ impl FtsReader {
         Ok((set, work))
     }
 
-    /// The rows whose doc ids in `[start, end)` hold any of `set`'s terms,
-    /// ascending: one slice of an `Or` [`Self::token_match_prefetched`].
-    /// The slices of a superfile's doc-id space together match exactly
-    /// what the whole walk matches; the range is a cut of the blob's ids
-    /// and carries no row meaning, so each slice's rows are put in order
-    /// on their own. The work holds the walk's time alone; the set's build
-    /// counted its bytes.
-    pub(crate) fn token_match_range_prebuilt(
+    /// The doc ids in `[start, end)` that hold any of `set`'s terms, in blob order: one slice of
+    /// an `Or` [`Self::token_match_prefetched`], for [`Self::held_ids_to_rows`] or
+    /// [`Self::ids_to_rows_in_pages`] to turn into rows. The slices together match what the whole
+    /// walk matches. The work holds the walk's time alone; the set's build counted its bytes.
+    pub(crate) fn token_match_range_in_blob_ids(
         &self,
         set: &OrCursorSet,
         start: u32,
         end: u32,
-    ) -> Result<(Vec<RowId>, MatchWork), FtsError> {
+    ) -> Result<(Vec<FtsDocId>, MatchWork), FtsError> {
         let mut work = MatchWork::default();
         if set.cursors.is_empty() || start >= end {
             return Ok((Vec::new(), work));
@@ -509,7 +529,7 @@ impl FtsReader {
                 .collect::<Vec<_>>()
         });
         work.kernel_cpu_ns = walk_ns;
-        Ok((self.ids_to_rows(docs)?, work))
+        Ok((docs, work))
     }
 
     /// Unranked token-match **count** — the cardinality
@@ -790,33 +810,20 @@ impl FtsReader {
     /// a minimal set of parallel GETs). This matters on the global-statistics
     /// path, where a superfile is probed for every scored term of a query at
     /// once.
-    pub async fn term_dfs(
+    ///
+    /// The dictionary is read through `dict`, which may already hold it.
+    pub(crate) async fn term_dfs(
         &self,
         column: &str,
         tokens: &[&str],
+        dict: &QueryDict,
     ) -> Result<(Vec<u64>, MatchWork), FtsError> {
-        self.resolve_column_id(column)?;
-        if tokens.is_empty() {
-            return Ok((Vec::new(), MatchWork::default()));
-        }
-        let dict_bytes = self.dict_bytes_async().await?;
-        self.term_dfs_with(&dict_bytes, column, tokens).await
-    }
-
-    /// [`Self::term_dfs`] over `dict_bytes`, this reader's dictionary already
-    /// fetched by the caller.
-    pub(crate) async fn term_dfs_with(
-        &self,
-        dict_bytes: &[u8],
-        column: &str,
-        tokens: &[&str],
-    ) -> Result<(Vec<u64>, MatchWork), FtsError> {
-        self.debug_assert_own_dict(dict_bytes);
         let column_id = self.resolve_column_id(column)?;
         if tokens.is_empty() {
             return Ok((Vec::new(), MatchWork::default()));
         }
-        let dict = Self::open_dict(dict_bytes)?;
+        let (dict_bytes, fetched) = self.query_dict(dict).await?;
+        let dict = Self::open_dict(&dict_bytes)?;
         let col_meta = &self.columns[column_id as usize];
 
         // First pass — pure in-memory dictionary lookups. Absent and inline
@@ -853,11 +860,11 @@ impl FtsReader {
 
         // One coalesced fetch for every PFOR header; `df` is its first 4
         // bytes. Each header is one planned range (pre-coalesce), and its
-        // bytes count as indexed work — the walk read them.
-        // +1: the dictionary fetch that resolved the slots.
+        // bytes count as indexed work — the walk read them. The dictionary read counts once, when this
+        // call made it.
         let mut work = MatchWork {
             postings_bytes: 0,
-            planned_ranges: 1,
+            planned_ranges: u64::from(fetched),
             kernel_cpu_ns: 0,
         };
         if !header_ranges.is_empty() {
@@ -903,7 +910,9 @@ impl FtsReader {
     /// so a predicate matching a large fraction of the superfile can
     /// fall back to a plain scan instead of a (losing) index pushdown.
     pub async fn term_df(&self, column: &str, token: &str) -> Result<(u64, MatchWork), FtsError> {
-        let (mut dfs, work) = self.term_dfs(column, &[token]).await?;
+        let (mut dfs, work) = self
+            .term_dfs(column, &[token], &QueryDict::default())
+            .await?;
         Ok((dfs.pop().unwrap_or(0), work))
     }
 
@@ -1009,15 +1018,99 @@ pub struct TermLayout {
 #[cfg(test)]
 mod tests {
 
-    use std::ops::Range;
+    use std::{
+        ops::Range,
+        sync::{
+            Arc, Mutex, OnceLock,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
 
+    use async_trait::async_trait;
     use bytes::Bytes;
 
-    use super::{super::test_util::*, *};
-    use crate::superfile::fts::{
-        builder::FtsBuilder,
-        posting::{self, BLOCK_LEN, ENCODING_BITSET, ENCODING_PACKED, ENCODING_PATCHED},
+    use super::{
+        super::{metadata::OpenOptions, test_util::*},
+        *,
     };
+    use crate::{
+        memory::ConnectionMemoryBudget,
+        superfile::{
+            fts::{
+                builder::FtsBuilder,
+                posting::{self, BLOCK_LEN, ENCODING_BITSET, ENCODING_PACKED, ENCODING_PATCHED},
+            },
+            lazy_source::{LazyByteSource, LazyByteSourceError},
+        },
+    };
+
+    /// Documents in the reordered blob the dictionary-lifetime test matches.
+    const DICT_LIFETIME_DOCS: u32 = 64;
+
+    /// A limit this many times a dictionary: half of its 90% holds the dictionary, the share does not.
+    const NO_ROOM_LIMIT_PER_DICTIONARY: u64 = 3;
+
+    /// A dictionary buffer handed out by [`DictWatchSource`]; it counts itself live until the last
+    /// slice of it drops.
+    struct WatchedDict {
+        bytes: Bytes,
+        live: Arc<AtomicUsize>,
+    }
+
+    impl AsRef<[u8]> for WatchedDict {
+        fn as_ref(&self) -> &[u8] {
+            &self.bytes
+        }
+    }
+
+    impl Drop for WatchedDict {
+        fn drop(&mut self) {
+            self.live.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    /// A download-only source that hands out the dictionary as a [`WatchedDict`] and notes how many
+    /// dictionary buffers are live at each read of the doc-id map.
+    struct DictWatchSource {
+        blob: Bytes,
+        /// The dictionary and doc-id map regions, set once the reader is open.
+        regions: OnceLock<(Range<usize>, Range<usize>)>,
+        live: Arc<AtomicUsize>,
+        live_at_map_reads: Mutex<Vec<usize>>,
+    }
+
+    #[async_trait]
+    impl LazyByteSource for DictWatchSource {
+        fn size(&self) -> u64 {
+            self.blob.len() as u64
+        }
+
+        async fn range(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
+            let range = start as usize..(start + len) as usize;
+            let bytes = self.blob.slice(range.clone());
+            let Some((dict, map)) = self.regions.get() else {
+                return Ok(bytes);
+            };
+            if range.start < map.end && range.end > map.start {
+                self.live_at_map_reads
+                    .lock()
+                    .expect("map reads")
+                    .push(self.live.load(Ordering::SeqCst));
+            }
+            if range == *dict {
+                self.live.fetch_add(1, Ordering::SeqCst);
+                return Ok(Bytes::from_owner(WatchedDict {
+                    bytes,
+                    live: Arc::clone(&self.live),
+                }));
+            }
+            Ok(bytes)
+        }
+
+        fn try_get_range_sync(&self, _start: u64, _len: u64) -> Option<Bytes> {
+            None
+        }
+    }
 
     #[tokio::test]
     async fn token_match_or_unions_and_intersects_unranked() {
@@ -1074,6 +1167,64 @@ mod tests {
                 .0
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn token_match_releases_a_dictionary_it_does_not_keep_before_the_row_map_read() {
+        // A reordered blob read from a download-only source, matched through a `QueryDict` that
+        // keeps nothing (no budget, or a budget too small) and one with room.
+        //  - without a kept dictionary, no dictionary buffer is live when the doc-id map is read;
+        //  - with room, the `QueryDict` holds it there;
+        //  - the rows are the same either way.
+        // This test pins the downloaded dictionary going before the row-map read.
+        let docs: Vec<String> = (0..DICT_LIFETIME_DOCS)
+            .map(|row| format!("alpha r{row}"))
+            .collect();
+        let refs: Vec<&str> = docs.iter().map(String::as_str).collect();
+        let order: Vec<u32> = (0..DICT_LIFETIME_DOCS).rev().collect();
+        let (blob, json) = build_standard_blob_with(&refs, Some(&order));
+        let probe = FtsReader::open(blob.clone(), &json).expect("open");
+        let dict = probe.dict_range.clone();
+        let refused =
+            ConnectionMemoryBudget::with_limit(dict.len() as u64 * NO_ROOM_LIMIT_PER_DICTIONARY);
+        let roomy = ConnectionMemoryBudget::with_room();
+        let cases = [
+            (QueryDict::default(), 0, "no budget"),
+            (QueryDict::with_budget(&refused), 0, "no room"),
+            (QueryDict::with_budget(&roomy), 1, "room"),
+        ];
+        for (query_dict, live_at_map_read, label) in cases {
+            let source = Arc::new(DictWatchSource {
+                blob: blob.clone(),
+                regions: OnceLock::new(),
+                live: Arc::new(AtomicUsize::new(0)),
+                live_at_map_reads: Mutex::new(Vec::new()),
+            });
+            let src: Arc<dyn LazyByteSource> = source.clone();
+            let r = FtsReader::open_lazy(src, &json, OpenOptions::for_object_store())
+                .await
+                .expect("open_lazy");
+            let map = r.doc_map_region.clone().expect("the fixture is reordered");
+            source
+                .regions
+                .set((r.dict_range.clone(), map))
+                .expect("regions set once");
+            let (rows, _) = r
+                .token_match_prefetched("body", &["alpha"], BoolMode::Or, None, &query_dict)
+                .await
+                .expect("token_match");
+            assert_eq!(
+                rows,
+                (0..DICT_LIFETIME_DOCS).collect::<Vec<_>>(),
+                "{label}: every row matches"
+            );
+            let seen = source.live_at_map_reads.lock().expect("map reads").clone();
+            assert!(!seen.is_empty(), "{label}: the match reads the doc-id map");
+            assert!(
+                seen.iter().all(|&live| live == live_at_map_read),
+                "{label}: dictionary buffers live at the map read: {seen:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1704,7 +1855,11 @@ mod tests {
         // path (which fetches only the PFOR headers, then scatters the
         // results back) would surface as a mismatch here.
         let tokens = ["rust", "missing", "uniqzero", "common", "absent2"];
-        let batched = r.term_dfs("body", &tokens).await.expect("term_dfs").0;
+        let batched = r
+            .term_dfs("body", &tokens, &QueryDict::default())
+            .await
+            .expect("term_dfs")
+            .0;
         // Element-wise identical to resolving each token on its own.
         let mut per_term = Vec::with_capacity(tokens.len());
         for t in tokens {
@@ -1718,7 +1873,13 @@ mod tests {
         // uniqzero=1 inline, absent tokens=0).
         assert_eq!(batched, vec![2, 0, 1, 3, 0], "planted document frequencies");
         // Empty input short-circuits to empty output (no dict open, no fetch).
-        assert!(r.term_dfs("body", &[]).await.expect("empty").0.is_empty());
+        assert!(
+            r.term_dfs("body", &[], &QueryDict::default())
+                .await
+                .expect("empty")
+                .0
+                .is_empty()
+        );
     }
 
     /// A column no row in this superfile filled is walked without

@@ -627,20 +627,41 @@ mod tests {
 
     use super::*;
     use crate::{
+        memory::ConnectionMemoryBudget,
         storage::{LocalFsStorageProvider, StorageProvider},
         superfile::{
             builder::{FtsConfig, VectorConfig},
+            fts::reader::{BoolMode, QUERY_DICT_SHARE_PERCENT},
             vector::{distance::Metric, rerank_codec::RerankCodec},
         },
         supertable::{
             Supertable, SupertableOptions,
             manifest::ManifestSnapshot,
             query::{candidate::LIKE_MAX_TERMS, exec::common::OVER_FETCH_MIN_CEILING},
+            reader_cache::disk::test_support::RecordingStorage,
         },
+        test_helpers::lazy_disk_cache_without_promotion,
     };
 
     /// Moves manifest id ranges away from every real generated id.
     const INVALID_ID_RANGE_OFFSET: i128 = 1_i128 << 100;
+
+    /// Rows in the filtered vector search test's table; with [`DICT_TEST_WORDS_PER_ROW`] they make
+    /// a dictionary of a few MiB.
+    const DICT_TEST_ROWS: usize = 20_000;
+
+    /// Words per row that no other row has, which set the dictionary's size.
+    const DICT_TEST_WORDS_PER_ROW: usize = 30;
+
+    /// Distinct `rust…` words across those rows: the vocabulary the test's `LIKE 'rust…%'`s expand
+    /// over.
+    const DICT_TEST_RUST_WORDS: usize = 500;
+
+    /// Distinct `tokio…` words across those rows; no `LIKE` in the test matches them.
+    const DICT_TEST_TOKIO_WORDS: usize = 300;
+
+    /// A limit that dictionary fits under but its share does not, leaving the query room.
+    const NO_ROOM_FOR_A_DICTIONARY: u64 = 8 * 1024 * 1024;
 
     // ---- vector-column test harness (mirrors query::vector tests) ----
 
@@ -1209,6 +1230,191 @@ mod tests {
                     .collect::<Vec<_>>()
             })
             .collect()
+    }
+
+    /// Runs `query` over a table whose one file has a dictionary of a few MiB, read lazily from its
+    /// store on a fresh cache: with room to keep the dictionary, then with
+    /// [`NO_ROOM_FOR_A_DICTIONARY`], then with no limit at all. With `term_index` off, a term is
+    /// looked up in the file's dictionary rather than in the index. Returns each run's rows,
+    /// sorted, and how many times it read the dictionary.
+    fn dictionary_runs(
+        dim: usize,
+        term_index: bool,
+        query: impl Fn(&SupertableReader) -> Vec<String>,
+    ) -> [(Vec<String>, usize); 3] {
+        let titles: Vec<String> = (0..DICT_TEST_ROWS)
+            .map(|n| {
+                let words: Vec<String> = (0..DICT_TEST_WORDS_PER_ROW)
+                    .map(|w| format!("u{n}x{w}"))
+                    .collect();
+                format!(
+                    "rust{} tokio{} {}",
+                    n % DICT_TEST_RUST_WORDS,
+                    n % DICT_TEST_TOKIO_WORDS,
+                    words.join(" ")
+                )
+            })
+            .collect();
+        let dir = TempDir::new().expect("dir");
+        let local: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("local"));
+        let written = options_one_superfile_per_commit(dim)
+            .with_term_index(term_index)
+            .with_storage(Arc::clone(&local));
+        drop(supertable_ranked_by_index_with(written, dim, &titles));
+        // Each run's rows and the sizes of its reads from the files' full-text sections.
+        let run = |budget: Arc<ConnectionMemoryBudget>| {
+            let cache_dir = TempDir::new().expect("cache dir");
+            let recording = RecordingStorage::over(Arc::clone(&local));
+            let storage = Arc::clone(&recording) as Arc<dyn StorageProvider>;
+            let cache = lazy_disk_cache_without_promotion(Arc::clone(&storage), cache_dir.path());
+            let mut options = options_one_superfile_per_commit(dim).with_term_index(term_index);
+            options.connection_memory_budget = budget;
+            let st = Supertable::open(options.with_storage(storage).with_disk_cache(cache))
+                .expect("open lazily");
+            let reader = st.reader().expect("reader");
+            let fts: Vec<(u64, u64)> = (reader.manifest().superfiles.iter())
+                .filter_map(|e| e.subsection_offsets.as_ref().and_then(|o| o.fts))
+                .collect();
+            let before = recording.n_ranges();
+            let mut rows = query(&reader);
+            rows.sort_unstable();
+            let reads: Vec<u64> = (recording.ranges_since(before).iter())
+                .filter(|r| {
+                    fts.iter()
+                        .any(|&(at, len)| r.start >= at && r.end <= at + len)
+                })
+                .map(|r| r.end - r.start)
+                .collect();
+            (rows, reads)
+        };
+        let no_room = ConnectionMemoryBudget::with_limit(NO_ROOM_FOR_A_DICTIONARY);
+        let limit = no_room.remaining().expect("a set limit") as u64;
+        let (kept_rows, kept) = run(ConnectionMemoryBudget::with_room());
+        let (plain_rows, plain) = run(no_room);
+        let (unlimited_rows, unlimited) = run(ConnectionMemoryBudget::measured());
+        // The dictionary is the largest full-text read; the test needs it to fit the limit but
+        // not its share, so the share is what keeps it out.
+        let dictionary = kept.iter().copied().max().expect("a full-text read");
+        assert!(
+            limit * QUERY_DICT_SHARE_PERCENT as u64 / 100 < dictionary && dictionary < limit,
+            "the dictionary ({dictionary} bytes) fits the limit ({limit} bytes) but not its share"
+        );
+        let reads = |sizes: &[u64]| sizes.iter().filter(|&&n| n == dictionary).count();
+        [
+            (kept_rows, reads(&kept)),
+            (plain_rows, reads(&plain)),
+            (unlimited_rows, reads(&unlimited)),
+        ]
+    }
+
+    #[test]
+    fn vector_search_where_two_likes_reads_the_dictionary_once_when_it_is_kept() {
+        // A vector search filtered by two `LIKE`s, on a table read lazily from its store.
+        //  - with room, the dictionary is read once for both expansions, the estimate and the match;
+        //  - with no room or no limit, it is read at each of those steps;
+        //  - the rows are the same.
+        // This test pins the filtered vector search reading the dictionary once.
+        let dim = 16;
+        let q = csv_one_hot(dim, 0);
+        let sql = format!(
+            "SELECT title FROM vector_search('emb', '{q}', 50) \
+             WHERE title LIKE 'rust12%' AND title LIKE 'rust1%'"
+        );
+        let [
+            (kept_rows, kept),
+            (plain_rows, plain),
+            (unlimited_rows, unlimited),
+        ] = dictionary_runs(dim, true, |r| titles_of(&r.query_sql(&sql).expect("query")));
+        assert!(!kept_rows.is_empty(), "the filter matches rows");
+        assert_eq!(kept_rows, plain_rows, "the same rows either way");
+        assert_eq!(kept_rows, unlimited_rows, "the same rows with no limit");
+        assert_eq!(
+            (kept, plain, unlimited),
+            (1, 4, 4),
+            "dictionary reads: kept, no room, no limit"
+        );
+    }
+
+    #[test]
+    fn sql_where_two_likes_reads_the_dictionary_once_when_it_is_kept() {
+        // A SQL query filtered by two `LIKE`s, on a table read lazily from its store.
+        //  - with room, the dictionary is read once for both expansions, the estimate and the match;
+        //  - with no room or no limit, it is read at each of those steps;
+        //  - the rows are the same.
+        // This test pins a SQL `LIKE` reading the dictionary once.
+        let dim = 16;
+        let sql = "SELECT title FROM supertable WHERE title LIKE 'rust12%' AND title LIKE 'rust1%'";
+        let [
+            (kept_rows, kept),
+            (plain_rows, plain),
+            (unlimited_rows, unlimited),
+        ] = dictionary_runs(dim, true, |r| titles_of(&r.query_sql(sql).expect("query")));
+        assert!(!kept_rows.is_empty(), "the filter matches rows");
+        assert_eq!(kept_rows, plain_rows, "the same rows either way");
+        assert_eq!(kept_rows, unlimited_rows, "the same rows with no limit");
+        assert_eq!(kept, 1, "read once when kept");
+        assert!(plain > 1, "read at each step without room ({plain} reads)");
+        assert_eq!(unlimited, plain, "with no limit, read at each step too");
+    }
+
+    #[test]
+    fn text_match_terms_share_the_dictionary_before_an_ilike_on_the_same_file() {
+        // A SQL query with a two-term `text_match` and an `ILIKE` on one file, on a table with no
+        // term index, so each term is looked up in the file's dictionary.
+        //  - with room, the two terms share one dictionary read before the `ILIKE` walk reads its
+        //    own;
+        //  - with no room or no limit, each term reads it;
+        //  - the rows are the same.
+        // This test pins the `text_match` columns going first, so they share the dictionary before
+        // the `ILIKE` walk lets it go.
+        let dim = 16;
+        let sql = "SELECT title FROM supertable \
+                   WHERE text_match(title, 'rust12 tokio12') AND title ILIKE '%u1%'";
+        let [
+            (kept_rows, kept),
+            (plain_rows, plain),
+            (unlimited_rows, unlimited),
+        ] = dictionary_runs(dim, false, |r| titles_of(&r.query_sql(sql).expect("query")));
+        assert!(!kept_rows.is_empty(), "the filter matches rows");
+        assert_eq!(kept_rows, plain_rows, "the same rows either way");
+        assert_eq!(kept_rows, unlimited_rows, "the same rows with no limit");
+        assert_eq!(
+            (kept, plain, unlimited),
+            (2, 3, 3),
+            "dictionary reads: kept, no room, no limit"
+        );
+    }
+
+    #[test]
+    fn a_match_with_a_negated_term_shares_one_dictionary_read_for_both_walks() {
+        // `token_match` of a term and a negated term on one file, on a table with no term index, so
+        // both walks look their terms up in the file's dictionary.
+        //  - with room, the positive and the negated walk share one dictionary read;
+        //  - with no room or no limit, each walk reads it;
+        //  - the hits are the same.
+        // This test pins the match kernel sharing the dictionary between its two walks.
+        let dim = 16;
+        let hits = |r: &SupertableReader| -> Vec<String> {
+            (r.token_match("title", "rust12 -tokio12", BoolMode::And)
+                .expect("match"))
+            .iter()
+            .map(|hit| format!("{hit:?}"))
+            .collect()
+        };
+        let [
+            (kept_hits, kept),
+            (plain_hits, plain),
+            (unlimited_hits, unlimited),
+        ] = dictionary_runs(dim, false, hits);
+        assert!(!kept_hits.is_empty(), "the match finds rows");
+        assert_eq!(kept_hits, plain_hits, "the same hits either way");
+        assert_eq!(kept_hits, unlimited_hits, "the same hits with no limit");
+        assert_eq!(
+            (kept, plain, unlimited),
+            (1, 2, 2),
+            "dictionary reads: kept, no room, no limit"
+        );
     }
 
     #[test]

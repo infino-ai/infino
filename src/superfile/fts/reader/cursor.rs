@@ -41,6 +41,7 @@ use crate::superfile::{
         },
         short::decode_short,
     },
+    load_watch::LoadWatch,
 };
 
 /// Parsed per-(column, term) metadata header from the postings
@@ -350,6 +351,8 @@ impl TermMeta {
 pub(crate) struct BlockTableCache {
     tables: Mutex<HashMap<(u64, u32), (Arc<[BlockMeta]>, f32)>>,
     blocks: AtomicUsize,
+    /// Told when a table is cached: the reader's own watch.
+    loads: LoadWatch,
 }
 
 /// Shortest table worth caching: below it the build costs well under a
@@ -360,6 +363,19 @@ const BLOCK_TABLE_CACHE_MIN_BLOCKS: usize = 256;
 const BLOCK_TABLE_CACHE_MAX_BLOCKS: usize = 1 << 20;
 
 impl BlockTableCache {
+    /// An empty cache that reports each table it caches to `loads`.
+    pub(super) fn new(loads: LoadWatch) -> Self {
+        Self {
+            loads,
+            ..Self::default()
+        }
+    }
+
+    /// Heap bytes the cached block tables hold.
+    pub(super) fn held_bytes(&self) -> usize {
+        self.blocks.load(AtomicOrdering::Relaxed) * size_of::<BlockMeta>()
+    }
+
     /// Blocks held across all cached tables.
     #[cfg(test)]
     pub(super) fn cached_blocks(&self) -> usize {
@@ -381,10 +397,14 @@ impl BlockTableCache {
         {
             return;
         }
-        let mut tables = self.tables.lock().unwrap_or_else(PoisonError::into_inner);
-        if tables.insert(key, (Arc::clone(table), term_max)).is_none() {
+        {
+            let mut tables = self.tables.lock().unwrap_or_else(PoisonError::into_inner);
+            if tables.insert(key, (Arc::clone(table), term_max)).is_some() {
+                return;
+            }
             self.blocks.fetch_add(n, AtomicOrdering::Relaxed);
         }
+        self.loads.loaded();
     }
 }
 

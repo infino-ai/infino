@@ -23,7 +23,7 @@ mod sink;
 mod size;
 mod staleness;
 #[cfg(test)]
-mod test_util;
+pub(crate) mod test_util;
 mod work;
 
 pub use core::*;

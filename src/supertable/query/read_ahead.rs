@@ -1099,9 +1099,25 @@ impl ReadAhead {
     }
 }
 
+/// The Arrow schema of the file `meta` describes, coerced to read against
+/// `table` as DataFusion's opener reads it (a column widened since the file
+/// was written reads as the wider type). `None` if the file schema doesn't
+/// parse; nothing can be pruned then.
+///
+/// A file's schema is fixed, so this is read once per file; the pruning of a
+/// filter that tightens as the statement runs ([`pruning_for`]) is rebuilt
+/// against it.
+pub(crate) fn file_schema(table: &SchemaRef, meta: &ParquetMetaData) -> Option<SchemaRef> {
+    let file_meta = meta.file_metadata();
+    let file_schema = Arc::new(
+        parquet_to_arrow_schema(file_meta.schema_descr(), file_meta.key_value_metadata()).ok()?,
+    );
+    Some(apply_file_schema_type_coercions(table, &file_schema).map_or(file_schema, Arc::new))
+}
+
 /// The row-group pruning of a scan filtered by `predicate`, written against
-/// `table`, for the file `meta` describes, built the way DataFusion's opener
-/// builds it:
+/// `table`, for a file whose coerced schema is `schema` ([`file_schema`]),
+/// built the way DataFusion's opener builds it:
 /// - the filter is mapped by `adapter` onto the file's own schema (a column
 ///   the file lacks becomes null, a renamed one its stored name), then
 ///   simplified;
@@ -1109,25 +1125,33 @@ impl ReadAhead {
 ///   filter differently.
 ///
 /// `None` if the filter doesn't convert; nothing can be pruned then.
+pub(crate) fn pruning_for(
+    predicate: &Arc<dyn PhysicalExpr>,
+    adapter: &Arc<dyn PhysicalExprAdapterFactory>,
+    table: &SchemaRef,
+    schema: &SchemaRef,
+) -> Option<PruningPredicate> {
+    let mapped = adapter
+        .create(Arc::clone(table), Arc::clone(schema))
+        .ok()?
+        .rewrite(Arc::clone(predicate))
+        .ok()?;
+    let simplified = PhysicalExprSimplifier::new(schema).simplify(mapped).ok()?;
+    PruningPredicate::try_new(simplified, Arc::clone(schema)).ok()
+}
+
+/// The row-group pruning for the file `meta` describes: its coerced schema
+/// ([`file_schema`]) and the pruning of `predicate` against it
+/// ([`pruning_for`]). `None` if the file schema doesn't parse or the filter
+/// doesn't convert; nothing can be pruned then.
 pub(crate) fn file_pruning(
     predicate: &Arc<dyn PhysicalExpr>,
     adapter: &Arc<dyn PhysicalExprAdapterFactory>,
     table: &SchemaRef,
     meta: &ParquetMetaData,
 ) -> Option<(PruningPredicate, SchemaRef)> {
-    let file_meta = meta.file_metadata();
-    let file_schema = Arc::new(
-        parquet_to_arrow_schema(file_meta.schema_descr(), file_meta.key_value_metadata()).ok()?,
-    );
-    let schema =
-        apply_file_schema_type_coercions(table, &file_schema).map_or(file_schema, Arc::new);
-    let mapped = adapter
-        .create(Arc::clone(table), Arc::clone(&schema))
-        .ok()?
-        .rewrite(Arc::clone(predicate))
-        .ok()?;
-    let simplified = PhysicalExprSimplifier::new(&schema).simplify(mapped).ok()?;
-    let pruning = PruningPredicate::try_new(simplified, Arc::clone(&schema)).ok()?;
+    let schema = file_schema(table, meta)?;
+    let pruning = pruning_for(predicate, adapter, table, &schema)?;
     Some((pruning, schema))
 }
 

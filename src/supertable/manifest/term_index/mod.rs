@@ -3482,10 +3482,15 @@ mod tests {
     };
     use crate::{
         Bm25SearchOptions, CompactionSettings, InfinoError, OptimizeOptions, OptimizeSteps,
+        memory::ConnectionMemoryBudget,
         storage::{LocalFsStorageProvider, ObjectMeta},
         superfile::{
-            SuperfileReader,
-            fts::{bm25, short::SHORT_MAX_DF},
+            LazyByteSource, SuperfileReader,
+            fts::{
+                bm25,
+                reader::{QueryDict, test_util::AsyncOnlySource},
+                short::SHORT_MAX_DF,
+            },
         },
         supertable::{
             Supertable,
@@ -7201,7 +7206,13 @@ mod tests {
                 .block_on(sf.token_match("title", &terms, BoolMode::And))
                 .expect("dictionary path");
             let (memoed, memo_work) = rt
-                .block_on(sf.token_match_prefetched("title", &terms, BoolMode::And, Some(&memo)))
+                .block_on(sf.token_match_prefetched(
+                    "title",
+                    &terms,
+                    BoolMode::And,
+                    Some(&memo),
+                    &QueryDict::default(),
+                ))
                 .expect("memo path");
             assert_eq!(memoed, plain, "same docs either way");
             assert_eq!(
@@ -7365,21 +7376,36 @@ mod tests {
         for e in &entries {
             let bytes =
                 std::fs::read(dir.path().join(e.uri.storage_path())).expect("superfile bytes");
-            let sf = SuperfileReader::open(Bytes::from(bytes)).expect("open");
+            // Opened as from object storage, since only a downloaded dictionary is kept.
+            let source: Arc<dyn LazyByteSource> = Arc::new(AsyncOnlySource(Bytes::from(bytes)));
+            let sf = rt
+                .block_on(SuperfileReader::open_lazy(source))
+                .expect("open");
             let memos = rt.block_on(memos_from_plan_locations(&sf, &locations, e.superfile_id));
             assert!(
                 memos.contains_key("title"),
                 "an indexed superfile gets a memo"
             );
+            let budget = ConnectionMemoryBudget::with_room();
+            let dict = QueryDict::with_budget(&budget);
             let (plain, plain_work) = rt
-                .block_on(plan.evaluate(&sf, None, &TermMemos::new()))
+                .block_on(plan.evaluate(&sf, None, &TermMemos::new(), &dict))
                 .expect("dictionary path");
+            assert!(budget.used() > 0, "the dictionary is kept");
+            drop(dict);
+            assert_eq!(budget.used(), 0, "and given back with its `QueryDict`");
+            let (unkept, unkept_work) = rt
+                .block_on(plan.evaluate(&sf, None, &TermMemos::new(), &QueryDict::default()))
+                .expect("dictionary path, nothing kept");
             let (memoed, memo_work) = rt
-                .block_on(plan.evaluate(&sf, None, &memos))
+                .block_on(plan.evaluate(&sf, None, &memos, &QueryDict::default()))
                 .expect("memo path");
             assert_eq!(memoed, plain, "same rows either way");
-            // Two exact-match nodes, each spared its dictionary read.
-            assert_eq!(memo_work.planned_ranges + 2, plain_work.planned_ranges);
+            assert_eq!(unkept, plain, "same rows with nothing kept");
+            // Without memos the two exact-match nodes share one dictionary read when it is kept,
+            // read it once each when it is not, and with memos read none.
+            assert_eq!(memo_work.planned_ranges + 1, plain_work.planned_ranges);
+            assert_eq!(plain_work.planned_ranges + 1, unkept_work.planned_ranges);
             total_rows += plain.map_or(0, |b| b.len());
         }
         assert!(total_rows > 0, "the fixture matches the plan");
@@ -7464,7 +7490,7 @@ mod tests {
                 superfile: e.superfile_id,
             });
             let estimate = |plan: &CandidatePlan, located| {
-                rt.block_on(plan.estimate(&sf, None, located))
+                rt.block_on(plan.estimate(&sf, None, located, &QueryDict::default()))
                     .expect("estimate")
             };
             let (from_dict, dict_work) = estimate(&plan, None);
@@ -8016,7 +8042,9 @@ mod tests {
                 .block_on(sf.term_memo_from_dict_values(&pairs))
                 .expect("memo");
             let names: Vec<&str> = pairs.iter().map(|(t, _, _)| *t).collect();
-            let (dfs, _) = rt.block_on(sf.term_dfs("title", &names)).expect("dfs");
+            let (dfs, _) = rt
+                .block_on(sf.term_dfs("title", &names, &QueryDict::default()))
+                .expect("dfs");
             let facts = rt
                 .block_on(sf.term_index_facts("title", &names))
                 .expect("facts");

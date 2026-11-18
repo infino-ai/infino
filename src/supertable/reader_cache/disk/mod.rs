@@ -538,9 +538,7 @@ mod store_files;
 
 pub(crate) use budget::{Reservation, ScratchCharge, ScratchRoom};
 pub(crate) use fetch::{open_batch_overlay, skip_background_fill};
-#[cfg(test)]
-pub(crate) use heap::HeapBudget;
-pub(crate) use heap::{CachedSessions, HeapReservation};
+pub(crate) use heap::{CachedSessions, HeapBudget, HeapReservation};
 pub(crate) use scratch::RunScratch;
 pub(crate) use sources::{
     ArcMmapOwner, give_back_temp_file_charge, mmap_charged_temp_file_bytes, mmap_readonly_bytes,
