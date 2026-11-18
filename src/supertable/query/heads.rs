@@ -40,6 +40,7 @@
 //! as the ceilings are.
 
 use std::{
+    cmp::Ordering,
     collections::{BTreeMap, HashMap},
     sync::{Arc, LazyLock},
     time::Instant,
@@ -47,6 +48,7 @@ use std::{
 
 use futures::future::try_join_all;
 use roaring::RoaringBitmap;
+use tracing::debug;
 
 use super::{
     dispatch,
@@ -97,6 +99,8 @@ const LEN_BUCKETS: usize = 1 << u8::BITS;
 /// The largest term frequency a bound searches when a term's per-bucket
 /// maxima are unknown: past any tf a document of a length bucket holds.
 const TF_SEARCH_MAX: u32 = u32::MAX >> 1;
+/// Nanoseconds in a millisecond, for the selection's diagnostic timings.
+const NANOS_PER_MS: u64 = 1_000_000;
 
 /// The longest length each bucket holds: the quantizer keeps a length's
 /// top bits, so a bucket spans up to the next code's first length. A code
@@ -342,6 +346,8 @@ pub(crate) async fn select(
             .and_then(|id| slot_of.get(&id).copied())
     };
     let runs_per_term = index.runs_many(query.column, terms).await?;
+    let runs_ns = started.elapsed().as_nanos() as u64;
+    let mut levels_ns = 0u64;
     let mut heads: Vec<Head> = Vec::new();
     // Where each kept superfile's postings of each term sit, for probes.
     let mut postings: HashMap<(usize, usize), (DictEntry, u64)> = HashMap::new();
@@ -455,7 +461,9 @@ pub(crate) async fn select(
                 index.head_level(&object, &level).await
             }
         });
+        let levels_started = Instant::now();
         let levels = try_join_all(reads).await?;
+        levels_ns += levels_started.elapsed().as_nanos() as u64;
         for (&h, (blocks, bytes)) in wanted.iter().zip(levels) {
             fetched += bytes;
             let (t, base) = (heads[h].term, heads[h].base);
@@ -476,6 +484,7 @@ pub(crate) async fn select(
     }
     // A row predicate is checked on the best candidates first: only rows it
     // admits set the threshold.
+    let check_started = Instant::now();
     if let Some(check) = &query.check {
         check_candidates(
             manifest,
@@ -490,6 +499,9 @@ pub(crate) async fn select(
         .await?;
         (theta, bounds) = settle(&slots, &heads, &candidates, &weights, k, lb_slack);
     }
+    let check_ns = check_started.elapsed().as_nanos() as u64;
+    let probe_started = Instant::now();
+    let mut probed_superfiles = 0usize;
     // Probes: candidates whose bounds still reach above the threshold for a
     // term or phrase not yet known for them have it read from the covering
     // posting blocks only; their exact scores raise the threshold, under
@@ -497,6 +509,7 @@ pub(crate) async fn select(
     // settled is answered or ruled out without an open.
     if !query.rows_scoped || query.check.is_some() {
         let plan = probe_plan(&slots, &heads, &candidates, &weights, &postings, theta);
+        probed_superfiles = plan.len();
         if !plan.is_empty() {
             let weights = &weights;
             let reads = plan.into_iter().map(|(s, probes)| {
@@ -556,6 +569,7 @@ pub(crate) async fn select(
             (theta, bounds) = settle(&slots, &heads, &candidates, weights, k, lb_slack);
         }
     }
+    let probe_ns = probe_started.elapsed().as_nanos() as u64;
     // A scope that admits only some rows: the threshold over every row is
     // no floor for the admitted ones, and an answer would hold rows the
     // scope drops. Only the bounds stand.
@@ -579,10 +593,41 @@ pub(crate) async fn select(
             to_rows(fts_of(&reader), hits.iter().copied()).await
         }
     });
+    let rows_started = Instant::now();
     let rows = try_join_all(mapped).await?;
     for ((_, hits), rows) in resolved.iter_mut().zip(rows) {
         *hits = rows;
     }
+    let (mut below, mut tied, mut above) = (0usize, 0usize, 0usize);
+    for &(_, ub) in &bounds {
+        match ub.total_cmp(&theta) {
+            Ordering::Less => below += 1,
+            Ordering::Equal => tied += 1,
+            Ordering::Greater => above += 1,
+        }
+    }
+    debug!(
+        slots = slots.len(),
+        same_norms = slots.iter().filter(|s| s.same_norms).count(),
+        below,
+        tied,
+        above,
+        theta,
+        resolved = resolved.len(),
+        candidates = candidates.len(),
+        entries_read,
+        head_bytes = fetched,
+        rounds,
+        probed_superfiles,
+        probes,
+        runs_ms = runs_ns / NANOS_PER_MS,
+        levels_ms = levels_ns / NANOS_PER_MS,
+        check_ms = check_ns / NANOS_PER_MS,
+        probe_ms = probe_ns / NANOS_PER_MS,
+        rows_ms = rows_started.elapsed().as_millis() as u64,
+        total_ms = started.elapsed().as_millis() as u64,
+        "level heads selection"
+    );
     Ok(Some(TierSelection {
         bounds: bounds
             .into_iter()
