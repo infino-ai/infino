@@ -498,9 +498,11 @@ pub struct SupertableOptions {
     /// measured to pay on this table: a running cost per tier entry
     /// against the opens the merge could save, and per class of query the
     /// wall of the search with the merge against without it, the cheaper
-    /// taken and the other tried one query in sixteen. Off, the merge
-    /// runs for every query the tiers can serve (what a test of the merge
-    /// wants).
+    /// taken and the other tried one query in sixteen. The level heads
+    /// price each round after their first the same way. Off, the merge
+    /// runs for every query the tiers can serve and the heads read every
+    /// round their bounds call for, up to their entry budget (what a test
+    /// of either wants).
     pub tier_merge_gate: bool,
     /// Whether the table keeps a term index (see `manifest::term_index`):
     /// per `(column, term)`, the superfiles that hold it, its score ceiling

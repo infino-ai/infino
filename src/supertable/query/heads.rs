@@ -471,7 +471,12 @@ pub(crate) async fn select(
             candidates: candidates.len() as u64,
             in_play: in_play as u64,
             first: rounds == 0,
-            open_cost_ns: query.open_cost_ns,
+            // With the table's gate off, the rounds are not priced: every
+            // round the bounds call for is read, up to the budget.
+            open_cost_ns: match query.merge_gate {
+                true => query.open_cost_ns,
+                false => 0,
+            },
             entry_cost_ns: query.entry_cost_ns,
         };
         if !price.worth_reading() {
@@ -537,7 +542,9 @@ pub(crate) async fn select(
     // posting blocks only; their exact scores raise the threshold, under
     // which the heads bound the unseen documents, and a superfile so
     // settled is answered or ruled out without an open.
-    if !query.rows_scoped || query.check.is_some() {
+    if (!query.rows_scoped || query.check.is_some())
+        && probes_can_rule_out(&slots, &heads, &candidates, &weights, &bounds, theta, k)
+    {
         let plan = probe_plan(&slots, &heads, &candidates, &weights, &postings, theta);
         probed_superfiles = plan.len();
         if !plan.is_empty() {
@@ -761,6 +768,39 @@ impl RoundPrice {
         (self.round_entries + self.candidates).saturating_mul(self.entry_cost_ns)
             <= self.in_play.saturating_mul(self.open_cost_ns)
     }
+}
+
+/// Whether probing can rule any superfile still in play out. A probe
+/// learns a candidate's missing terms, which only raises the threshold to
+/// at most the `k`-th best candidate bound; a superfile whose unread
+/// documents bound above that stays in play whatever the probes find. With
+/// no threshold yet, probes are what find one.
+fn probes_can_rule_out(
+    slots: &[Slot],
+    heads: &[Head],
+    candidates: &HashMap<(u32, u32), Candidate>,
+    weights: &Weights,
+    bounds: &[(f32, f32)],
+    theta: f32,
+    k: usize,
+) -> bool {
+    if !theta.is_finite() {
+        return true;
+    }
+    let mut best: Vec<f32> = candidates
+        .iter()
+        .map(|(&(s, _), c)| candidate_bound(&slots[s as usize], heads, weights, c))
+        .filter(|b| b.is_finite())
+        .collect();
+    if best.len() < k {
+        return true;
+    }
+    let (_, kth, _) = best.select_nth_unstable_by(k - 1, |a, b| b.total_cmp(a));
+    let reachable = *kth;
+    slots
+        .iter()
+        .zip(bounds)
+        .any(|(slot, &(_, ub))| ub > theta && unseen_bound(slot, heads, weights) <= reachable)
 }
 
 /// What one probe reads in one superfile.
@@ -1060,14 +1100,15 @@ fn slot_bounds(
     weights: &Weights,
     lb_slack: f32,
 ) -> Vec<(f32, f32)> {
-    // Slots of one layer read the same heads at the same scale: their
-    // unseen bound is computed once.
-    let mut by_shape: HashMap<(&[Option<usize>], u32), f32> = HashMap::new();
+    // Slots of one layer read the same heads at the same scale, and those
+    // built at the table's own average are bounded exactly where the rest
+    // carry slack: their unseen bound is computed once per such shape.
+    let mut by_shape: HashMap<(&[Option<usize>], u32, bool), f32> = HashMap::new();
     let mut out: Vec<(f32, f32)> = slots
         .iter()
         .map(|slot| {
             let unseen = *by_shape
-                .entry((&slot.heads, slot.scale_up.to_bits()))
+                .entry((&slot.heads, slot.scale_up.to_bits(), slot.same_norms))
                 .or_insert_with(|| unseen_bound(slot, heads, weights));
             (f32::NEG_INFINITY, unseen)
         })
@@ -1514,6 +1555,7 @@ mod tests {
     use proptest::prelude::*;
 
     use super::*;
+    use crate::superfile::fts::bm25::Bm25Params;
 
     /// Proptest cases per property.
     const CASES: u32 = 256;
@@ -1534,6 +1576,57 @@ mod tests {
             first: false,
             open_cost_ns: open,
             entry_cost_ns: entry,
+        }
+    }
+
+    /// A slot of one superfile reading `heads[0]` at scale 1.
+    fn slot(same_norms: bool) -> Slot {
+        Slot {
+            heads: vec![Some(0)],
+            scale_up: 1.0,
+            deny: None,
+            id_min: 0,
+            id_max: 0,
+            same_norms,
+        }
+    }
+
+    /// Two superfiles of one layer at the same scale, one built at the
+    /// table's average and one not, bound their unseen documents each by
+    /// its own rule, in either order: the exact one at the kernel's score
+    /// of a tie, so the `_id` order can settle it unopened, the other with
+    /// slack. A shared bound let the padded one stand for both.
+    #[test]
+    fn a_superfile_at_the_tables_average_keeps_its_exact_bound_beside_one_that_is_not() {
+        let weights = Weights {
+            idf: vec![3.0],
+            norm: norm_table(2.5, Bm25Params::default()),
+            scoring: 1,
+            required: 0,
+            phrases: Vec::new(),
+            filtered: false,
+        };
+        let head = Head {
+            term: 0,
+            object: None,
+            base: 0,
+            levels: Vec::new(),
+            next: 0,
+            frontier: tf_factor(1, weights.norm[1]),
+            floor: tf_factor(1, weights.norm[1]),
+            buckets: None,
+        };
+        let heads = [head];
+        let exact = single_term_bound(&heads[0], &weights);
+        for order in [[false, true], [true, false]] {
+            let slots: Vec<Slot> = order.iter().map(|&same| slot(same)).collect();
+            let bounds = slot_bounds(&slots, &heads, &HashMap::new(), &weights, 1.0);
+            for (slot, (_, ub)) in slots.iter().zip(&bounds) {
+                match slot.same_norms {
+                    true => assert_eq!(*ub, exact, "{order:?}: the exact bound"),
+                    false => assert!(*ub > exact, "{order:?}: the padded bound"),
+                }
+            }
         }
     }
 
