@@ -4,11 +4,9 @@
 //! Loads a stored fine-centroid graph (see
 //! [`fine_graph_store`](super::fine_graph_store)).
 //!
-//! The process keeps the last graph it loaded. For a newer version of the
-//! same graph it fetches and applies only the steps it does not have. With
-//! nothing kept it fetches the base and every step.
-
-use std::sync::{LazyLock, Mutex, MutexGuard, PoisonError};
+//! A caller that still has the graph it loaded last passes it in. If the
+//! stored graph is a newer version of it, only the missing steps are fetched
+//! and applied. Otherwise the base and every step are.
 
 use futures::future::try_join_all;
 use tokio::{task::spawn_blocking, try_join};
@@ -23,17 +21,14 @@ use crate::{
     },
 };
 
-/// How many graphs the process keeps.
-const MAX_KEPT_GRAPHS: usize = 4;
-
 /// A loaded graph and the base and steps it was made from.
-struct Kept {
+pub(crate) struct Loaded {
     base: ContentHash,
     steps: Vec<ContentHash>,
-    graph: KeyedGraph,
+    pub(crate) graph: KeyedGraph,
 }
 
-impl Kept {
+impl Loaded {
     /// Whether `head` is this graph or a newer version of it.
     fn leads_to(&self, head: &GraphHead) -> bool {
         self.base == head.base.0
@@ -46,58 +41,26 @@ impl Kept {
     }
 }
 
-static KEPT: LazyLock<Mutex<Vec<Kept>>> = LazyLock::new(|| Mutex::new(Vec::new()));
-
-fn lock_kept() -> MutexGuard<'static, Vec<Kept>> {
-    KEPT.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
-/// Remove and return the kept graph that `head` is a newer version of.
-fn take_older(kept: &mut Vec<Kept>, head: &GraphHead) -> Option<Kept> {
-    let at = kept.iter().position(|k| k.leads_to(head))?;
-    Some(kept.remove(at))
-}
-
-/// Keep `entry` unless a newer version of the same graph is already kept.
-fn keep(kept: &mut Vec<Kept>, entry: Kept) {
-    let newer = |a: &Kept, b: &Kept| a.base == b.base && a.steps.starts_with(&b.steps);
-    if kept.iter().any(|k| newer(k, &entry)) {
-        return;
-    }
-    kept.retain(|k| !newer(&entry, k));
-    kept.push(entry);
-    if kept.len() > MAX_KEPT_GRAPHS {
-        kept.remove(0);
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn forget_all() {
-    lock_kept().clear();
-}
-
-/// The graph `head` describes. `None` if it cannot be fetched, decoded or
-/// matched to the head; the caller then builds the graph itself.
-pub(crate) async fn load(storage: &dyn StorageProvider, head: &GraphHead) -> Option<KeyedGraph> {
-    let older = take_older(&mut lock_kept(), head);
+/// The graph `head` describes, starting from `last` when it can. `None` if
+/// it cannot be fetched, decoded or matched to the head.
+pub(crate) async fn load(
+    storage: &dyn StorageProvider,
+    head: &GraphHead,
+    last: Option<&Loaded>,
+) -> Option<Loaded> {
     let mut graph = None;
-    if let Some(older) = older {
-        let applied = older.steps.len();
-        graph = build(storage, head, Some(older.graph), applied).await;
+    if let Some(last) = last.filter(|last| last.leads_to(head)) {
+        graph = build(storage, head, Some(last.graph.clone()), last.steps.len()).await;
     }
     let graph = match graph {
         Some(graph) => graph,
         None => build(storage, head, None, 0).await?,
     };
-    keep(
-        &mut lock_kept(),
-        Kept {
-            base: head.base.0,
-            steps: head.steps.iter().map(|(step, _)| *step).collect(),
-            graph: graph.clone(),
-        },
-    );
-    Some(graph)
+    Some(Loaded {
+        base: head.base.0,
+        steps: head.steps.iter().map(|(step, _)| *step).collect(),
+        graph,
+    })
 }
 
 /// Apply the steps of `head` after the first `applied` to `graph`, or to the
@@ -148,100 +111,4 @@ async fn build(
     })
     .await
     .ok()?
-}
-
-#[cfg(test)]
-mod tests {
-    use uuid::Uuid;
-
-    use super::*;
-    use crate::{
-        superfile::vector::hnsw::{Hnsw, HnswParams, Sq16Scorer},
-        supertable::{
-            query::fine_graph_cache::{FineNodeKey, GraphRole},
-            schema::FieldId,
-        },
-    };
-
-    const DIM: usize = 8;
-    const NODES: usize = 40;
-
-    fn key(i: usize) -> FineNodeKey {
-        (Uuid::from_u128(1 + i as u128), None, i as u32)
-    }
-
-    fn graph() -> KeyedGraph {
-        let vectors: Vec<Vec<f32>> = (0..NODES)
-            .map(|i| {
-                let mut v = vec![0.0; DIM];
-                v[i % DIM] = 1.0;
-                v[(i / DIM) % DIM] += 0.5;
-                v
-            })
-            .collect();
-        let scorer = Sq16Scorer::from_unit_vectors(&vectors, DIM);
-        KeyedGraph::new(
-            (0..NODES).map(|i| Some(key(i))).collect(),
-            Hnsw::build_serial(&scorer, HnswParams::default()),
-        )
-    }
-
-    fn hash(n: u8) -> ContentHash {
-        ContentHash::of(&[n])
-    }
-
-    fn head(base: u8, steps: u8) -> GraphHead {
-        let graph = graph();
-        let keys = graph.keys.iter().flatten().copied().collect();
-        let full = GraphBase::new(keys, Hnsw::clone(&graph.graph)).expect("base");
-        let mut head = GraphHead::of_base(
-            GraphRole::Router,
-            FieldId(1),
-            DIM as u32,
-            hash(base),
-            1,
-            &full,
-        );
-        head.steps = (0..steps).map(|step| (hash(100 + step), 1)).collect();
-        head
-    }
-
-    fn kept_at(base: u8, steps: u8) -> Kept {
-        let head = head(base, steps);
-        Kept {
-            base: head.base.0,
-            steps: head.steps.iter().map(|(step, _)| *step).collect(),
-            graph: graph(),
-        }
-    }
-
-    #[test]
-    fn a_kept_graph_is_taken_only_for_its_own_or_a_later_generation() {
-        let mut kept = vec![kept_at(1, 2)];
-        assert!(take_older(&mut kept, &head(1, 1)).is_none(), "earlier");
-        assert!(take_older(&mut kept, &head(2, 3)).is_none(), "another base");
-        assert_eq!(kept.len(), 1);
-        let taken = take_older(&mut kept, &head(1, 3)).expect("later");
-        assert_eq!(taken.steps.len(), 2);
-        assert!(kept.is_empty());
-        let mut kept = vec![kept_at(1, 2)];
-        assert!(take_older(&mut kept, &head(1, 2)).is_some(), "its own");
-    }
-
-    #[test]
-    fn the_latest_generation_of_each_graph_is_kept() {
-        let mut kept = Vec::new();
-        keep(&mut kept, kept_at(1, 1));
-        keep(&mut kept, kept_at(1, 3));
-        assert_eq!(kept.len(), 1);
-        assert_eq!(kept[0].steps.len(), 3);
-        keep(&mut kept, kept_at(1, 2));
-        assert_eq!(kept[0].steps.len(), 3, "an earlier generation is dropped");
-
-        for base in 2..=MAX_KEPT_GRAPHS as u8 + 1 {
-            keep(&mut kept, kept_at(base, 0));
-        }
-        assert_eq!(kept.len(), MAX_KEPT_GRAPHS);
-        assert!(kept.iter().all(|k| k.base != hash(1)), "the oldest went");
-    }
 }

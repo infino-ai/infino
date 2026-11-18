@@ -140,7 +140,7 @@ use crate::{
             },
             fine_graph_cache::{self, FineNodeKey, GraphRole},
             fine_graph_follow,
-            fine_graph_store::{GraphHead, KeyedGraph},
+            fine_graph_store::GraphHead,
             fts::{memo_from_locations, memos_from_plan_locations},
             provider::prune_leaves_for_filters,
             prune::{PruneLeaf, select_superfiles},
@@ -1257,6 +1257,9 @@ pub(crate) struct CentroidRouterGraph {
     /// load. The query is transformed into the same space before the walk
     /// ([`gfc_prepare_for_metric`]), so build-time and query-time scoring agree.
     metric: Metric,
+    /// Set when the graph came from its stored base and steps, so the next
+    /// version can start from this one.
+    stored: Option<fine_graph_follow::Loaded>,
 }
 
 /// The [`CentroidRouterGraph::node_map`] entry of a hole.
@@ -1692,6 +1695,7 @@ fn build_centroid_router(
         node_map,
         live_nodes: keys.len(),
         metric,
+        stored: None,
     })
 }
 
@@ -1884,11 +1888,13 @@ fn assemble_centroid_router(
         node_map,
         live_nodes,
         metric,
+        stored: None,
     })
 }
 
 /// Load the router from stored bytes: either the whole router in one section,
-/// or the head of a graph stored as a base plus steps.
+/// or the head of a graph stored as a base plus steps. `last` is the graph
+/// loaded before, if any.
 async fn centroid_router_from_stored(
     bytes: &[u8],
     storage: &dyn StorageProvider,
@@ -1899,6 +1905,7 @@ async fn centroid_router_from_stored(
     section: &crate::supertable::slow_vector_state::CentroidSection,
     dim: usize,
     metric: Metric,
+    last: Option<&fine_graph_follow::Loaded>,
 ) -> Option<CentroidRouterGraph> {
     let Some(head) = GraphHead::from_bytes(bytes) else {
         return decode_centroid_router_section(
@@ -1908,11 +1915,21 @@ async fn centroid_router_from_stored(
     if head.role != GraphRole::Router || head.column != column_id || head.dim as usize != dim {
         return None;
     }
-    let KeyedGraph { keys, graph, .. } = fine_graph_follow::load(storage, &head).await?;
-    let nodes = router_nodes(&keys)?;
-    assemble_centroid_router(
-        graph, &nodes, superfiles, readers, column, column_id, section, dim, metric,
-    )
+    let loaded = fine_graph_follow::load(storage, &head, last).await?;
+    let nodes = router_nodes(&loaded.graph.keys)?;
+    let mut router = assemble_centroid_router(
+        Arc::clone(&loaded.graph.graph),
+        &nodes,
+        superfiles,
+        readers,
+        column,
+        column_id,
+        section,
+        dim,
+        metric,
+    )?;
+    router.stored = Some(loaded);
+    Some(router)
 }
 
 /// Build the centroid-router section bytes for the settled generation: open
@@ -2008,6 +2025,7 @@ pub(crate) fn build_centroid_router_from_cluster_vectors(
         node_map,
         live_nodes,
         metric,
+        stored: None,
     })
 }
 
@@ -5549,6 +5567,7 @@ impl SupertableReader {
                 tracing::warn!(uri = reference.uri, %error, "centroid-router section fetch failed")
             })
             .ok()?;
+        let previous = manifest.options.centroid_router_cache.load_full();
         centroid_router_from_stored(
             bytes.as_ref(),
             storage.as_ref(),
@@ -5559,6 +5578,7 @@ impl SupertableReader {
             section,
             dim,
             metric,
+            previous.as_ref().and_then(|p| p.graph.stored.as_ref()),
         )
         .await
     }
@@ -5731,6 +5751,7 @@ impl SupertableReader {
                 node_map,
                 live_nodes: keys.len(),
                 metric,
+                stored: None,
             },
         });
         Some(FineAssignRouter {
@@ -9172,13 +9193,13 @@ mod tests {
             vector::hnsw::{Fp32Scorer, Hnsw, HnswParams},
         },
         supertable::{
-            manifest::{ScalarStats, part::ContentHash},
+            manifest::ScalarStats,
             query::{
                 fine_graph_cache::{FineNodeKey, GraphRole},
                 fine_graph_store::{GraphBase, GraphHead, GraphStep, KeyedGraph},
             },
             schema::FieldId,
-            slow_vector_state::CentroidSection,
+            slow_vector_state::{CentroidSection, storage_path},
         },
         test_helpers::fid,
     };
@@ -12476,12 +12497,120 @@ mod tests {
     /// Commits before the second drain.
     const STORED_GRAPH_NEXT_COMMITS: u64 = 2;
     const STORED_GRAPH_ROWS_PER_COMMIT: usize = 32;
+    const STORED_GRAPH_DIM: usize = 16;
+    const STORED_GRAPH_FANOUT: usize = 3;
+
+    /// The centroids of one drain of the stored-graph test table.
+    struct StoredGraphFixture {
+        entries: Vec<Arc<SuperfileEntry>>,
+        readers: Vec<Arc<SuperfileReader>>,
+        section: Arc<CentroidSection>,
+        emb: FieldId,
+        centroids: HashMap<FineNodeKey, Vec<f32>>,
+    }
+
+    impl StoredGraphFixture {
+        async fn of(st: &Supertable) -> Self {
+            let outer = st.reader().expect("reader");
+            let hidden = outer.vector_index_table().expect("hidden index").clone();
+            let hr = hidden.reader().expect("hidden reader");
+            let section = hr.centroid_section().await.expect("centroid section");
+            let entries = hr
+                .manifest()
+                .get_all_superfiles_loaded()
+                .await
+                .expect("entries");
+            let readers = hr.open_superfile_readers(&entries).await.expect("readers");
+            let emb = hr.manifest().field_id("emb").expect("emb id");
+            let (vecs, walk) = centroid_router_walk(
+                &entries,
+                &readers,
+                "emb",
+                emb,
+                section.as_ref(),
+                Metric::Cosine,
+                None,
+            )
+            .expect("walk");
+            let centroids = walk
+                .iter()
+                .zip(vecs)
+                .map(|(&(si, flat), vec)| ((entries[si].superfile_id, None, flat), vec))
+                .collect();
+            Self {
+                entries,
+                readers,
+                section,
+                emb,
+                centroids,
+            }
+        }
+
+        fn scorer(&self, nodes: &[Option<FineNodeKey>]) -> Fp32Scorer {
+            let vectors: Vec<Vec<f32>> = nodes
+                .iter()
+                .map(|key| match key {
+                    Some(key) => self.centroids[key].clone(),
+                    None => vec![0.0; STORED_GRAPH_DIM],
+                })
+                .collect();
+            Fp32Scorer::from_vectors(&vectors, STORED_GRAPH_DIM, Metric::Cosine)
+        }
+
+        async fn load(
+            &self,
+            storage: &dyn StorageProvider,
+            bytes: &[u8],
+            last: Option<&fine_graph_follow::Loaded>,
+        ) -> Option<CentroidRouterGraph> {
+            centroid_router_from_stored(
+                bytes,
+                storage,
+                &self.entries,
+                &self.readers,
+                "emb",
+                self.emb,
+                self.section.as_ref(),
+                STORED_GRAPH_DIM,
+                Metric::Cosine,
+                last,
+            )
+            .await
+        }
+
+        /// What each test query selects from `router`, by cluster name.
+        fn picks(&self, router: &CentroidRouterGraph) -> Vec<Vec<(Uuid, u32)>> {
+            stored_graph_picks(&router.graph, &router.scorer, |node| {
+                let (si, flat) = router.node_map[node as usize];
+                (self.entries[si].superfile_id, flat)
+            })
+        }
+    }
+
+    fn stored_graph_picks(
+        graph: &Hnsw,
+        scorer: &Fp32Scorer,
+        name: impl Fn(u32) -> (Uuid, u32),
+    ) -> Vec<Vec<(Uuid, u32)>> {
+        (0..STORED_GRAPH_DIM)
+            .map(|at| {
+                let mut q = vec![0.0f32; STORED_GRAPH_DIM];
+                q[at] = 1.0;
+                let mut picks: Vec<(Uuid, u32)> = graph
+                    .search(scorer, &q, STORED_GRAPH_FANOUT, STORED_GRAPH_FANOUT * 2)
+                    .into_iter()
+                    .map(|(node, _)| name(node))
+                    .collect();
+                picks.sort_unstable();
+                picks
+            })
+            .collect()
+    }
 
     /// A graph stored as a base plus a step loads as the writer's graph.
     #[test]
-    fn a_stored_router_graph_is_followed_across_generations() {
-        let dim = 16usize;
-        let metric = Metric::Cosine;
+    fn a_stored_router_graph_loads_from_its_base_and_steps() {
+        let dim = STORED_GRAPH_DIM;
         let schema = schema_with_vector(dim);
         let dir = tempfile::TempDir::new().expect("tempdir");
         let storage: Arc<dyn StorageProvider> =
@@ -12504,130 +12633,23 @@ mod tests {
             }
             st.drain_vectors_to_cells_sync().expect("drain");
         };
-        let queries: Vec<Vec<f32>> = (0..dim)
-            .map(|at| {
-                let mut q = vec![0.0f32; dim];
-                q[at] = 1.0;
-                gfc_prepare_for_metric(metric, &mut q);
-                q
-            })
-            .collect();
-        let fanout = 3usize;
 
         block_on_mt(async {
-            struct Generation {
-                entries: Vec<Arc<SuperfileEntry>>,
-                readers: Vec<Arc<SuperfileReader>>,
-                section: Arc<CentroidSection>,
-                emb: FieldId,
-                centroids: HashMap<FineNodeKey, Vec<f32>>,
-            }
-            let generation = || async {
-                let outer = st.reader().expect("reader");
-                let hidden = outer.vector_index_table().expect("hidden index").clone();
-                let hr = hidden.reader().expect("hidden reader");
-                let section = hr.centroid_section().await.expect("centroid section");
-                let entries = hr
-                    .manifest()
-                    .get_all_superfiles_loaded()
+            let publish = |bytes: Vec<u8>| async {
+                let len = bytes.len() as u64;
+                let reference = write_resident_index_blob(storage.as_ref(), bytes)
                     .await
-                    .expect("entries");
-                let readers = hr.open_superfile_readers(&entries).await.expect("readers");
-                let emb = hr.manifest().field_id("emb").expect("emb id");
-                let (vecs, walk) = centroid_router_walk(
-                    &entries,
-                    &readers,
-                    "emb",
-                    emb,
-                    section.as_ref(),
-                    metric,
-                    None,
-                )
-                .expect("walk");
-                let centroids = walk
-                    .iter()
-                    .zip(vecs)
-                    .map(|(&(si, flat), vec)| ((entries[si].superfile_id, None, flat), vec))
-                    .collect();
-                Generation {
-                    entries,
-                    readers,
-                    section,
-                    emb,
-                    centroids,
-                }
-            };
-            let scorer_over = |keys: &[Option<FineNodeKey>], generation: &Generation| {
-                let vectors: Vec<Vec<f32>> = keys
-                    .iter()
-                    .map(|key| match key {
-                        Some(key) => generation.centroids[key].clone(),
-                        None => vec![0.0; dim],
-                    })
-                    .collect();
-                Fp32Scorer::from_vectors(&vectors, dim, metric)
-            };
-            let selected =
-                |graph: &Hnsw, scorer: &Fp32Scorer, name: &dyn Fn(u32) -> (Uuid, u32)| {
-                    queries
-                        .iter()
-                        .map(|q| {
-                            let mut picks: Vec<(Uuid, u32)> = graph
-                                .search(scorer, q, fanout, fanout * 2)
-                                .into_iter()
-                                .map(|(node, _)| name(node))
-                                .collect();
-                            picks.sort_unstable();
-                            picks
-                        })
-                        .collect::<Vec<_>>()
-                };
-            let load = |bytes: Vec<u8>, generation: &Generation| {
-                let storage = Arc::clone(&storage);
-                let (entries, readers, section, emb) = (
-                    generation.entries.clone(),
-                    generation.readers.clone(),
-                    Arc::clone(&generation.section),
-                    generation.emb,
-                );
-                async move {
-                    let loaded = centroid_router_from_stored(
-                        &bytes,
-                        storage.as_ref(),
-                        &entries,
-                        &readers,
-                        "emb",
-                        emb,
-                        section.as_ref(),
-                        dim,
-                        metric,
-                    )
-                    .await?;
-                    let name = |node: u32| {
-                        let (si, flat) = loaded.node_map[node as usize];
-                        (entries[si].superfile_id, flat)
-                    };
-                    Some(selected(&loaded.graph, &loaded.scorer, &name))
-                }
-            };
-            let publish = |bytes: Vec<u8>| {
-                let storage = Arc::clone(&storage);
-                async move {
-                    let len = bytes.len() as u64;
-                    let reference = write_resident_index_blob(storage.as_ref(), bytes)
-                        .await
-                        .expect("publish");
-                    (reference.content_hash, len)
-                }
+                    .expect("publish");
+                (reference.content_hash, len)
             };
 
             commit(0, STORED_GRAPH_FIRST_COMMITS);
-            let first = generation().await;
+            let first = StoredGraphFixture::of(&st).await;
             let mut first_keys: Vec<FineNodeKey> = first.centroids.keys().copied().collect();
             first_keys.sort_unstable();
             let first_nodes: Vec<Option<FineNodeKey>> =
                 first_keys.iter().copied().map(Some).collect();
-            let first_scorer = scorer_over(&first_nodes, &first);
+            let first_scorer = first.scorer(&first_nodes);
             let first_graph = Hnsw::build_serial(&first_scorer, HnswParams::default());
             let base = GraphBase::new(first_keys.clone(), first_graph.clone()).expect("base");
             let (base_hash, base_len) = publish(base.to_bytes()).await;
@@ -12639,19 +12661,20 @@ mod tests {
                 base_len,
                 &base,
             );
-            let name_first = |node: u32| {
-                let (superfile, _, flat) = first_keys[node as usize];
-                (superfile, flat)
-            };
+            let first_router = first
+                .load(storage.as_ref(), &first_head.to_bytes(), None)
+                .await
+                .expect("the base loads");
             assert_eq!(
-                load(first_head.to_bytes(), &first)
-                    .await
-                    .expect("the base loads"),
-                selected(&first_graph, &first_scorer, &name_first),
+                first.picks(&first_router),
+                stored_graph_picks(&first_graph, &first_scorer, |node| {
+                    let (superfile, _, flat) = first_keys[node as usize];
+                    (superfile, flat)
+                }),
             );
 
             commit(STORED_GRAPH_FIRST_COMMITS, STORED_GRAPH_NEXT_COMMITS);
-            let second = generation().await;
+            let second = StoredGraphFixture::of(&st).await;
             let gone: Vec<u32> = first_keys
                 .iter()
                 .enumerate()
@@ -12671,7 +12694,7 @@ mod tests {
                 .map(|key| second.centroids.contains_key(key).then_some(*key))
                 .chain(added.iter().copied().map(Some))
                 .collect();
-            let second_scorer = scorer_over(&second_nodes, &second);
+            let second_scorer = second.scorer(&second_nodes);
             let second_graph = first_graph
                 .clone()
                 .unlink_nodes(&gone, &second_scorer)
@@ -12682,32 +12705,28 @@ mod tests {
             )
             .expect("step");
             let (step_hash, step_len) = publish(step.to_bytes()).await;
-            let second_head = first_head.with_step(step_hash, step_len, &step);
-            let name_second = |node: u32| {
+            let head = first_head.with_step(step_hash, step_len, &step).to_bytes();
+            let expected = stored_graph_picks(&second_graph, &second_scorer, |node| {
                 let (superfile, _, flat) = second_nodes[node as usize].expect("a live node");
                 (superfile, flat)
-            };
-            let expected = selected(&second_graph, &second_scorer, &name_second);
-            assert_eq!(
-                load(second_head.to_bytes(), &second)
-                    .await
-                    .expect("the step loads"),
-                expected,
-            );
+            });
+            let from_base = second
+                .load(storage.as_ref(), &head, None)
+                .await
+                .expect("the base and step load");
+            assert_eq!(second.picks(&from_base), expected);
 
-            // With nothing kept, it loads from the base.
-            fine_graph_follow::forget_all();
-            assert_eq!(
-                load(second_head.to_bytes(), &second)
-                    .await
-                    .expect("the base and step load"),
-                expected,
-            );
-
-            // A step that is not stored.
-            let mut missing = second_head.clone();
-            missing.steps.push((ContentHash::of(b"not stored"), 1));
-            assert!(load(missing.to_bytes(), &second).await.is_none());
+            // With the base gone, only a reader that has the first graph loads.
+            storage
+                .delete(&storage_path(&base_hash))
+                .await
+                .expect("delete the base");
+            let from_last = second
+                .load(storage.as_ref(), &head, first_router.stored.as_ref())
+                .await
+                .expect("the step loads");
+            assert_eq!(second.picks(&from_last), expected);
+            assert!(second.load(storage.as_ref(), &head, None).await.is_none());
 
             // The old single-section form.
             let built = build_centroid_router(
@@ -12717,13 +12736,13 @@ mod tests {
                 second.emb,
                 second.section.as_ref(),
                 dim,
-                metric,
+                Metric::Cosine,
                 true,
                 None,
             )
             .expect("build");
             let whole = encode_centroid_router_section(&built, &second.entries, dim);
-            assert!(load(whole, &second).await.is_some());
+            assert!(second.load(storage.as_ref(), &whole, None).await.is_some());
         });
     }
 
