@@ -802,14 +802,15 @@ pub(crate) struct ScalarValueCounts {
 
 impl ScalarValueCounts {
     /// Exact non-null value counts for one column, split into `pieces`. `None`
-    /// when the type has no counts or the table would take more than
-    /// [`VALUE_TABLES_BUDGET_BYTES`] stored, more than a superfile keeps.
-    fn from_pieces(pieces: &[ArrayRef]) -> Option<Self> {
-        counter(pieces.first()?.data_type())?(pieces)
+    /// when the type has no counts or the table would take more than `limit`
+    /// bytes stored, at most [`VALUE_TABLES_BUDGET_BYTES`], more than a
+    /// superfile keeps.
+    fn from_pieces(pieces: &[ArrayRef], limit: usize) -> Option<Self> {
+        counter(pieces.first()?.data_type())?(pieces, limit)
     }
 
     /// [`ScalarValueCounts::count`] for a primitive column of type `T`.
-    fn primitive<T: ArrowPrimitiveType>(pieces: &[ArrayRef]) -> Option<Self>
+    fn primitive<T: ArrowPrimitiveType>(pieces: &[ArrayRef], limit: usize) -> Option<Self>
     where
         T::Native: Hash + Eq,
     {
@@ -817,6 +818,7 @@ impl ScalarValueCounts {
             pieces,
             |piece| Some(non_null(piece.as_primitive_opt::<T>()?.iter())),
             |_| size_of::<T::Native>(),
+            limit,
         )
     }
 
@@ -828,13 +830,16 @@ impl ScalarValueCounts {
     ///
     /// `stored` is the bytes a value takes stored, as [`stored_value_bytes`]
     /// measures its `ScalarValue`. Counting stops once the table's entries
-    /// take more than [`VALUE_TABLES_BUDGET_BYTES`]: no superfile keeps a
-    /// table that large, so a high-cardinality column costs at most the rows
-    /// it takes to fill the budget.
+    /// take more than `limit`, at most [`VALUE_TABLES_BUDGET_BYTES`]: no
+    /// superfile keeps a table that large, so a high-cardinality column
+    /// costs at most the rows it takes to fill the budget. A superfile's
+    /// build passes less, the most its budget can still keep of the column
+    /// ([`ValueTableBudget::keepable_bytes`]).
     fn count<'a, V: Hash + Eq, I: Iterator<Item = (usize, V)>>(
         pieces: &'a [ArrayRef],
         values: impl Fn(&'a ArrayRef) -> Option<I>,
         stored: impl Fn(&V) -> usize,
+        limit: usize,
     ) -> Option<Self> {
         // value -> (count, the piece and row it first showed up in)
         let rows: usize = pieces.iter().map(|piece| piece.len()).sum();
@@ -853,7 +858,7 @@ impl ScalarValueCounts {
                     }
                     Entry::Vacant(new) => {
                         bytes += stored(new.key()) + size_of::<u64>();
-                        if bytes > VALUE_TABLES_BUDGET_BYTES {
+                        if bytes > limit {
                             return None;
                         }
                         new.insert((1, at, row));
@@ -1078,6 +1083,8 @@ struct ValueTableBudget {
     kept: BinaryHeap<(usize, FieldId)>,
     /// What the tables in `kept` take.
     bytes: usize,
+    /// The smallest table dropped so far, as `(bytes, column)`.
+    first_dropped: Option<(usize, FieldId)>,
 }
 
 impl ValueTableBudget {
@@ -1094,8 +1101,60 @@ impl ValueTableBudget {
                 break;
             };
             self.bytes -= largest;
+            let dropped = (largest, column);
+            self.first_dropped = Some(
+                self.first_dropped
+                    .map_or(dropped, |first| first.min(dropped)),
+            );
             drop(column);
         }
+    }
+
+    /// The most bytes `column`'s table, not yet admitted, can take and still
+    /// be kept. A larger table would be dropped as it is admitted, and stay
+    /// dropped, so counting `column` can stop past it. Never less than the
+    /// sketch, as such a table is always kept.
+    ///
+    /// The kept tables are the longest run of the admitted ones, in
+    /// `(bytes, column)` order, that fits the budget, so a table is kept
+    /// while it and every admitted table before it fit together. Admitting
+    /// more tables only adds to what comes before it. A table after one
+    /// already dropped is dropped, as the tables up to that one already
+    /// pass the budget. Before it, the tables before it are the kept ones,
+    /// so the table is kept when it and those fit the budget; the larger the
+    /// table, the more come before it, so the tables that are kept are those
+    /// up to the bytes returned.
+    fn keepable_bytes(&self, column: FieldId) -> usize {
+        let mut kept: Vec<(usize, FieldId)> = self.kept.iter().copied().collect();
+        kept.sort_unstable();
+        // The most bytes that still put `(bytes, column)` before `next`.
+        let below = |(bytes, id): (usize, FieldId)| match column < id {
+            true => bytes,
+            false => bytes - 1,
+        };
+        let ceiling = self.first_dropped.map_or(VALUE_TABLES_BUDGET_BYTES, below);
+        // Try `column` after each prefix of the kept tables, the largest
+        // table that fits there, after the longest prefix it can follow.
+        let mut keepable = HLL_REGISTERS;
+        let mut before = 0usize;
+        for at in 0..=kept.len() {
+            let after = match at {
+                0 => 0,
+                _ => below(kept[at - 1]) + 1,
+            };
+            let most = kept
+                .get(at)
+                .map_or(usize::MAX, |&next| below(next))
+                .min(ceiling)
+                .min(VALUE_TABLES_BUDGET_BYTES.saturating_sub(before));
+            if most >= after {
+                keepable = keepable.max(most);
+            }
+            if let Some(&(bytes, _)) = kept.get(at) {
+                before += bytes;
+            }
+        }
+        keepable
     }
 }
 
@@ -1187,17 +1246,18 @@ impl Hash for CountedStr<'_> {
 }
 
 /// Counts one column's values, for [`ScalarValueCounts::from_pieces`].
-type Counter = fn(&[ArrayRef]) -> Option<ScalarValueCounts>;
+type Counter = fn(&[ArrayRef], usize) -> Option<ScalarValueCounts>;
 
 /// The counter for a column type, or `None` when the type carries no exact
 /// value counts. This is the one list of counted types.
 fn counter(data_type: &DataType) -> Option<Counter> {
     let counter: Counter = match data_type {
-        DataType::Boolean => |pieces| {
+        DataType::Boolean => |pieces, limit| {
             ScalarValueCounts::count(
                 pieces,
                 |piece| Some(non_null(piece.as_boolean_opt()?.iter())),
                 |_| size_of::<u64>(),
+                limit,
             )
         },
         DataType::Int8 => ScalarValueCounts::primitive::<Int8Type>,
@@ -1209,22 +1269,24 @@ fn counter(data_type: &DataType) -> Option<Counter> {
         DataType::UInt32 => ScalarValueCounts::primitive::<UInt32Type>,
         DataType::UInt64 => ScalarValueCounts::primitive::<UInt64Type>,
         DataType::Decimal128(_, _) => ScalarValueCounts::primitive::<Decimal128Type>,
-        DataType::Utf8 => |pieces| {
+        DataType::Utf8 => |pieces, limit| {
             ScalarValueCounts::count(
                 pieces,
                 |piece| {
                     Some(non_null(piece.as_string_opt::<i32>()?.iter()).map(CountedStr::of_row))
                 },
                 |value: &CountedStr<'_>| value.len,
+                limit,
             )
         },
-        DataType::LargeUtf8 => |pieces| {
+        DataType::LargeUtf8 => |pieces, limit| {
             ScalarValueCounts::count(
                 pieces,
                 |piece| {
                     Some(non_null(piece.as_string_opt::<i64>()?.iter()).map(CountedStr::of_row))
                 },
                 |value: &CountedStr<'_>| value.len,
+                limit,
             )
         },
         _ => return None,
@@ -1284,6 +1346,12 @@ impl ScalarStatsAgg {
     /// [`ScalarStatsAgg::from_column`] for one column split into `pieces`, the
     /// same stats as on their concat without copying them into one array.
     fn from_pieces(pieces: &[ArrayRef]) -> Option<ScalarStatsAgg> {
+        Self::from_pieces_within(pieces, VALUE_TABLES_BUDGET_BYTES)
+    }
+
+    /// [`ScalarStatsAgg::from_pieces`] with no value table past `limit`
+    /// bytes, the column's sketch in its place.
+    fn from_pieces_within(pieces: &[ArrayRef], limit: usize) -> Option<ScalarStatsAgg> {
         // The min of the pieces' mins, and the max of their maxes, through the
         // same Arrow min/max, so nulls and NaN are ordered as on the concat.
         let bounds = pieces
@@ -1312,13 +1380,14 @@ impl ScalarStatsAgg {
         // column.
         //
         // A table larger than the whole budget for a superfile's tables is
-        // never kept, and counting stops there; the rest are kept or not by
-        // the superfile's budget (see [`ValueTableBudget`]).
+        // never kept, and counting stops there, or at `limit` when the
+        // superfile's budget can keep less of the column; the rest are kept
+        // or not by the superfile's budget (see [`ValueTableBudget`]).
         let non_null: usize = pieces
             .iter()
             .map(|piece| piece.len() - piece.null_count())
             .sum();
-        let value_counts = ScalarValueCounts::from_pieces(pieces);
+        let value_counts = ScalarValueCounts::from_pieces(pieces, limit);
         let hll = if value_counts.is_some() || non_null == 0 {
             None
         } else {
@@ -1350,11 +1419,19 @@ impl ScalarStatsAgg {
             return HashMap::new();
         }
         // The batches are one superfile's rows, so its tables share one
-        // budget, applied as each column is counted.
+        // budget, applied as each column is counted. A column is counted
+        // only as far as the budget can still keep its table: once the
+        // budget is full, a wide table's later columns stop where their
+        // tables would be dropped, and carry the sketch they would have
+        // been given.
         let mut stats = HashMap::new();
         let mut budget = ValueTableBudget::default();
         for field in scalar_schema.fields() {
-            let Some((id, agg)) = ScalarStatsAgg::for_field(field, batches) else {
+            let Some(id) = field_id_of(field) else {
+                continue;
+            };
+            let limit = budget.keepable_bytes(id);
+            let Some((id, agg)) = ScalarStatsAgg::for_field(field, batches, limit) else {
                 continue;
             };
             let bytes = agg.value_table_bytes();
@@ -1386,7 +1463,9 @@ impl ScalarStatsAgg {
         scalar_schema
             .fields()
             .iter()
-            .filter_map(|field| ScalarStatsAgg::for_field(field, batches))
+            .filter_map(|field| {
+                ScalarStatsAgg::for_field(field, batches, VALUE_TABLES_BUDGET_BYTES)
+            })
             .collect()
     }
 
@@ -1405,7 +1484,9 @@ impl ScalarStatsAgg {
         let mut stats = scalar_schema
             .fields()
             .par_iter()
-            .filter_map(|field| ScalarStatsAgg::for_field(field, batches))
+            .filter_map(|field| {
+                ScalarStatsAgg::for_field(field, batches, VALUE_TABLES_BUDGET_BYTES)
+            })
             .collect();
         Self::fit_value_tables(&mut stats);
         stats
@@ -1446,10 +1527,14 @@ impl ScalarStatsAgg {
         }
     }
 
-    /// One column's stats across `batches`, keyed by its field id. `None` when
-    /// the field has no id, a batch doesn't have the column, or the column's
-    /// type has no stats.
-    fn for_field(field: &Field, batches: &[&RecordBatch]) -> Option<(FieldId, ScalarStatsAgg)> {
+    /// One column's stats across `batches`, keyed by its field id, with no
+    /// value table past `limit` bytes. `None` when the field has no id, a
+    /// batch doesn't have the column, or the column's type has no stats.
+    fn for_field(
+        field: &Field,
+        batches: &[&RecordBatch],
+        limit: usize,
+    ) -> Option<(FieldId, ScalarStatsAgg)> {
         // Stats are keyed by the field id stamped on the stored schema;
         // a field without one is not a column the table tracks.
         let id = field_id_of(field)?;
@@ -1462,7 +1547,7 @@ impl ScalarStatsAgg {
             .iter()
             .map(|b| b.column_by_name(field.name()).cloned())
             .collect::<Option<Vec<ArrayRef>>>()?;
-        Some((id, ScalarStatsAgg::from_pieces(&pieces)?))
+        Some((id, ScalarStatsAgg::from_pieces_within(&pieces, limit)?))
     }
 
     /// Merge `other` into `self` for the same column.
@@ -2862,7 +2947,7 @@ mod tests {
     //! decodes to bit-equal entries; top-level JSON keys are
     //! jq-friendly.
     use std::{
-        collections::{BTreeMap, HashMap},
+        collections::{BTreeMap, HashMap, HashSet},
         slice::from_ref,
         str::from_utf8,
         sync::Arc,
@@ -3078,10 +3163,12 @@ mod tests {
         assert_eq!(counts.entries(), expected.as_slice());
         // Split into pieces, the same table.
         let pieces = [column.slice(0, 7), column.slice(7, values.len() - 7)];
-        let split = ScalarValueCounts::from_pieces(&pieces).expect("under cap");
+        let split =
+            ScalarValueCounts::from_pieces(&pieces, VALUE_TABLES_BUDGET_BYTES).expect("under cap");
         assert_eq!(split.entries(), expected.as_slice());
         let large: ArrayRef = Arc::new(LargeStringArray::from(values.clone()));
-        let large = ScalarValueCounts::from_pieces(&[large]).expect("under cap");
+        let large =
+            ScalarValueCounts::from_pieces(&[large], VALUE_TABLES_BUDGET_BYTES).expect("under cap");
         assert_eq!(large.entries().len(), expected.len());
         for ((value, count), (want, want_count)) in large.entries().iter().zip(&expected) {
             assert_eq!(value.to_string(), want.to_string());
@@ -3709,6 +3796,174 @@ mod tests {
         let alone = ScalarStatsAgg::from_column(&column(0, 0..DISTINCT)).expect("int stats");
         assert!(alone.value_counts.is_some());
         assert!(alone.hll.is_none());
+    }
+
+    /// The tables a budget keeps of `admitted`, admitted in that order, with
+    /// `column`'s table of `bytes` admitted after them.
+    fn keeps_after(admitted: &[(usize, FieldId)], (bytes, column): (usize, FieldId)) -> bool {
+        let mut budget = ValueTableBudget::default();
+        let mut dropped = HashSet::new();
+        for &(bytes, id) in admitted.iter().chain([&(bytes, column)]) {
+            budget.admit(id, bytes, |id| {
+                dropped.insert(id);
+            });
+        }
+        !dropped.contains(&column)
+    }
+
+    /// A column's table is kept exactly when it takes no more than the
+    /// bytes the budget says it can still keep, so a build that stops
+    /// counting a column there drops no table the budget would keep. A
+    /// table past them stays dropped whatever is admitted after it.
+    #[test]
+    fn a_budget_keeps_a_table_exactly_up_to_the_bytes_it_can_still_keep() {
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = move |below: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % below
+        };
+        for _ in 0..500 {
+            // Tables around the sketch's size and up to past the budget,
+            // some of equal size, so ties fall to the column id.
+            let mut tables: Vec<(usize, FieldId)> = (1..=next(30) as u32 + 2)
+                .map(|id| {
+                    let bytes = match next(4) {
+                        0 => HLL_REGISTERS - 64 + next(128) as usize,
+                        1 => 16_000 + 16 * next(3) as usize,
+                        2 => HLL_REGISTERS + next(VALUE_TABLES_BUDGET_BYTES as u64 / 2) as usize,
+                        _ => VALUE_TABLES_BUDGET_BYTES - 64 + next(128) as usize,
+                    };
+                    (bytes, FieldId(id))
+                })
+                .collect();
+            for at in (1..tables.len()).rev() {
+                tables.swap(at, next(at as u64 + 1) as usize);
+            }
+            let column = tables.pop().expect("at least two tables").1;
+            let (admitted, later) = tables.split_at(next(tables.len() as u64 + 1) as usize);
+
+            let mut budget = ValueTableBudget::default();
+            for &(bytes, id) in admitted {
+                budget.admit(id, bytes, |_| {});
+            }
+            let keepable = budget.keepable_bytes(column);
+            assert!(keepable >= HLL_REGISTERS);
+            assert!(keepable <= VALUE_TABLES_BUDGET_BYTES);
+            assert!(keeps_after(admitted, (keepable, column)), "{admitted:?}");
+            assert!(
+                !keeps_after(admitted, (keepable + 1, column)),
+                "{admitted:?}"
+            );
+            for _ in 0..20 {
+                let bytes = next(VALUE_TABLES_BUDGET_BYTES as u64 + 2) as usize;
+                assert_eq!(
+                    keeps_after(admitted, (bytes, column)),
+                    bytes <= keepable,
+                    "{bytes} bytes after {admitted:?}"
+                );
+            }
+
+            // Dropped as it is admitted, the table stays dropped.
+            let mut budget = ValueTableBudget::default();
+            let mut dropped = HashSet::new();
+            for &(bytes, id) in admitted
+                .iter()
+                .chain([&(keepable + 1, column)])
+                .chain(later)
+            {
+                budget.admit(id, bytes, |id| {
+                    dropped.insert(id);
+                });
+            }
+            assert!(dropped.contains(&column), "{admitted:?} then {later:?}");
+        }
+    }
+
+    /// A superfile's build counts each column only as far as its budget can
+    /// still keep the column's table, and keeps the same tables, and the
+    /// same sketches in place of the rest, as counting every column whole
+    /// and fitting the tables after. Wide tables of columns whose tables
+    /// pass the budget together, of integers and of text, some past the
+    /// budget alone, split over batches.
+    #[test]
+    fn a_superfile_build_keeps_the_tables_counting_every_column_whole_keeps() {
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move |below: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % below
+        };
+        const ROWS: i64 = 9_000;
+        // The widths the build was slow on, 1,000 to 1,440 values a column,
+        // then columns of every size.
+        let cycling: Vec<u64> = (0..24).map(|c| 1_000 + (c * 61) % 441).collect();
+        let shapes = [cycling]
+            .into_iter()
+            .chain((0..6).map(|_| {
+                (0..next(24) + 8)
+                    .map(|_| match next(5) {
+                        0 => next(60) + 1,
+                        1 => next(1_000) + 60,
+                        2 => next(3_000) + 1_000,
+                        3 => 8_190 + next(4),
+                        _ => 1_000 + next(441),
+                    })
+                    .collect()
+            }))
+            .collect::<Vec<Vec<u64>>>();
+        for (shape, distinct) in shapes.into_iter().enumerate() {
+            let text: Vec<bool> = distinct.iter().map(|_| next(3) == 0).collect();
+            let user = Schema::new(
+                (0..distinct.len())
+                    .map(|c| {
+                        let data_type = match text[c] {
+                            true => DataType::Utf8,
+                            false => DataType::Int64,
+                        };
+                        Field::new(format!("c{c:03}"), data_type, true)
+                    })
+                    .collect::<Vec<_>>(),
+            );
+            let schema = TableSchema::from_user_schema(&user).stamp_field_ids(&user, "_id");
+            let batch = |rows: std::ops::Range<i64>| {
+                let columns = (0..distinct.len())
+                    .map(|c| -> ArrayRef {
+                        let values = rows
+                            .clone()
+                            .map(|row| (row * 7_919 + c as i64) % distinct[c] as i64);
+                        match text[c] {
+                            true => Arc::new(StringArray::from_iter_values(
+                                values.map(|value| format!("v{value}")),
+                            )),
+                            false => Arc::new(Int64Array::from_iter_values(values)),
+                        }
+                    })
+                    .collect();
+                RecordBatch::try_new(Arc::clone(&schema), columns).expect("batch")
+            };
+            let split = next(ROWS as u64 - 1) as i64 + 1;
+            let (first, second) = (batch(0..split), batch(split..ROWS));
+            let batches = [&first, &second];
+
+            let mut whole = ScalarStatsAgg::from_batches_unbudgeted(&schema, &batches);
+            ScalarStatsAgg::fit_value_tables(&mut whole);
+            let built = ScalarStatsAgg::from_batches(&schema, &batches);
+            assert_eq!(built, whole, "{distinct:?}");
+            assert_eq!(ScalarStatsAgg::from_batches_par(&schema, &batches), whole);
+            if shape == 0 {
+                let kept = whole
+                    .values()
+                    .filter(|agg| agg.value_counts.is_some())
+                    .count();
+                assert!(
+                    kept > 0 && kept < distinct.len(),
+                    "the budget keeps some of these tables and drops the rest"
+                );
+            }
+        }
     }
 
     #[test]
@@ -5847,7 +6102,10 @@ mod tests {
             let sliced = column.slice(1, column.len() - 2);
             for column in [column, &sliced] {
                 assert_eq!(
-                    ScalarValueCounts::from_pieces(slice::from_ref(column)),
+                    ScalarValueCounts::from_pieces(
+                        slice::from_ref(column),
+                        VALUE_TABLES_BUDGET_BYTES
+                    ),
                     counts_per_row(column),
                     "{} rows of {}",
                     column.len(),
@@ -5860,11 +6118,17 @@ mod tests {
         let at_cap: ArrayRef = Arc::new(Int32Array::from_iter_values(0..most));
         let past_cap: ArrayRef = Arc::new(Int32Array::from_iter_values(0..=most));
         assert_eq!(
-            ScalarValueCounts::from_pieces(slice::from_ref(&at_cap)),
+            ScalarValueCounts::from_pieces(slice::from_ref(&at_cap), VALUE_TABLES_BUDGET_BYTES),
             counts_per_row(&at_cap)
         );
-        assert!(ScalarValueCounts::from_pieces(slice::from_ref(&at_cap)).is_some());
-        assert!(ScalarValueCounts::from_pieces(slice::from_ref(&past_cap)).is_none());
+        assert!(
+            ScalarValueCounts::from_pieces(slice::from_ref(&at_cap), VALUE_TABLES_BUDGET_BYTES)
+                .is_some()
+        );
+        assert!(
+            ScalarValueCounts::from_pieces(slice::from_ref(&past_cap), VALUE_TABLES_BUDGET_BYTES)
+                .is_none()
+        );
     }
 
     #[test]
