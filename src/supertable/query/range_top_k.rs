@@ -314,7 +314,6 @@ mod tests {
                 column_cache::DecodedColumnCache,
                 provider::{TopKHint, WalkFallback, tests::planned_files, walk_probe},
                 range_top_k::provider_of,
-                scalar_cache::ByteLru,
             },
         },
     };
@@ -398,7 +397,7 @@ mod tests {
             .expect("options")
             .with_storage(storage)
             .with_range_indexes(&["key".to_string()]);
-        options.decoded_columns = Some(Arc::new(ByteLru::new(KEPT_BYTES)));
+        options.decoded_columns = Some(Arc::new(DecodedColumnCache::new(KEPT_BYTES)));
         options.row_group_size = Some(ROW_GROUP_ROWS);
         let st = Supertable::create(options).expect("create");
         for file in 0..FILES {
@@ -964,7 +963,7 @@ mod tests {
         //  - A walk that keeps no row answers empty and plans no file.
         // This test pins the walk through the kept-columns scan.
         let dir = TempDir::new().expect("tempdir");
-        let kept = Some(Arc::new(ByteLru::new(KEPT_BYTES)));
+        let kept = Some(Arc::new(DecodedColumnCache::new(KEPT_BYTES)));
         let st = tagged_table_with(&dir, kept, TAGGED_FILES, TAGGED_ROWS_PER_FILE);
         let reader = st.reader().expect("reader");
         let sql = |filter: &str, sort: &str| {
