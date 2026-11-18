@@ -3820,6 +3820,8 @@ pub(crate) mod walk_probe {
         fail_with: Option<QueryError>,
         fallbacks: Vec<WalkFallback>,
         walks: usize,
+        windows: usize,
+        walked: usize,
     }
 
     static ARMED: Mutex<Option<HashMap<Uuid, Armed>>> = Mutex::new(None);
@@ -3865,6 +3867,19 @@ pub(crate) mod walk_probe {
     /// Walks started over the watched table.
     pub(crate) fn walks(superfile: Uuid) -> usize {
         watched(superfile, |a| a.walks).unwrap_or(0)
+    }
+
+    /// Windows read, and rows walked in them, by walks over the watched table.
+    pub(crate) fn windows(superfile: Uuid) -> (usize, usize) {
+        watched(superfile, |a| (a.windows, a.walked)).unwrap_or_default()
+    }
+
+    /// A walk over the table of `files` read a window of `rows` rows.
+    pub(crate) fn window_read(files: &[Arc<SuperfileEntry>], rows: usize) {
+        with(files, |a| {
+            a.windows += 1;
+            a.walked += rows;
+        });
     }
 
     /// A walk started over the table of `files`, the table's own list as a walk can read none.

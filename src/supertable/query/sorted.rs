@@ -39,11 +39,13 @@ use datafusion::{
 use roaring::RoaringBitmap;
 use tracing::{Instrument, debug};
 
+#[cfg(test)]
+use crate::supertable::query::provider::walk_probe;
 use crate::{
     InfinoError,
     runtime_bridge::run_on_pool,
     runtime_metrics::op_stats::timed_section,
-    superfile::{SuperfileReader, range::KeyKind},
+    superfile::{SuperfileReader, fts::tokenize::STANDARD_TOKENIZER, range::KeyKind},
     supertable::{
         error::QueryError,
         handle::{Supertable, SupertableReader},
@@ -55,6 +57,7 @@ use crate::{
             exec::common::resolve_hits_named,
             provider::{flatten_or_eq, read_column, scalar_distinct},
             skip::ColumnTypeGuard,
+            text_match::{TextMatchMode, text_match_call},
         },
         reader_cache::disk::ForegroundQueryGuard,
         tombstones::SidecarCache,
@@ -398,13 +401,17 @@ impl SupertableReader {
     ///  - `column = literal`: the rows a file's exact value table counts for it, else one row per
     ///    distinct value, as the scan estimates for the planner.
     ///  - `IN`: one such share per value. `AND`: the product of its sides.
+    ///  - `text_match`: the rows each file's term counts allow ([`Self::text_match_share`]).
     ///  - anything else, or a column with no statistics: every row; the walk learns the share as it
     ///    reads.
-    fn expected_share(&self, condition: &Expr, files: &[Arc<SuperfileEntry>]) -> Share {
+    async fn expected_share(&self, condition: &Expr, files: &[Arc<SuperfileEntry>]) -> Share {
         let mut share = 1.0;
         let mut none = false;
         for conjunct in split_conjunction(condition) {
-            let one = self.conjunct_share(conjunct, files);
+            let one = match self.text_match_share(conjunct, files).await {
+                Some(one) => one,
+                None => self.conjunct_share(conjunct, files),
+            };
             share *= one.share;
             none |= one.none;
         }
@@ -412,6 +419,86 @@ impl SupertableReader {
             share: share.clamp(0.0, 1.0),
             none,
         }
+    }
+
+    /// The rows of each of `files` a `text_match` can keep, from the term index's count of the
+    /// rows a file holds a token in: the rarest token's count for `all`, the sum for `any`.
+    /// A file the index does not list yet, or a token it holds with no count, counts every row.
+    /// `None` when the index cannot answer: no term index, field or token, another tokenizer, or a
+    /// failed read.
+    async fn text_match_counts(
+        &self,
+        conjunct: &Expr,
+        files: &[Arc<SuperfileEntry>],
+    ) -> Option<Vec<u64>> {
+        let (column, tokens, mode) = text_match_call(conjunct)?;
+        let manifest = self.manifest();
+        if tokens.is_empty()
+            || manifest.try_fts_tokenizer_for(&column)?.name() != STANDARD_TOKENIZER
+        {
+            return None;
+        }
+        let field = manifest.field_id(&column)?;
+        // A failed index read leaves no estimate; the statement's own read then reports it.
+        let index = manifest.term_index().await.ok()??;
+        let terms: Vec<&str> = tokens.iter().map(String::as_str).collect();
+        // The same runs the statement's own `text_match` reads, which the index then keeps.
+        let located = index.locations(field, &terms, files).await.ok()?;
+        let mut counts = Vec::with_capacity(files.len());
+        for entry in files {
+            if !index.is_indexed(&entry.superfile_id) {
+                counts.push(entry.n_docs);
+                continue;
+            }
+            let file_terms = located
+                .get(&entry.superfile_id)
+                .map_or(&[][..], Vec::as_slice);
+            // A token the file does not hold counts 0; one held with no count may be in every row.
+            let dfs = terms.iter().map(|term| {
+                match file_terms.iter().find(|(listed, _, _)| listed == term) {
+                    Some((_, 0, _)) => entry.n_docs,
+                    Some((_, df, _)) => *df,
+                    None => 0,
+                }
+            });
+            let count = match mode {
+                TextMatchMode::All => dfs.fold(u64::MAX, u64::min),
+                TextMatchMode::Any => dfs.fold(0, u64::saturating_add),
+            };
+            counts.push(count.min(entry.n_docs));
+        }
+        Some(counts)
+    }
+
+    /// The share of rows a `text_match` can keep over `files` ([`Self::text_match_counts`]).
+    async fn text_match_share(
+        &self,
+        conjunct: &Expr,
+        files: &[Arc<SuperfileEntry>],
+    ) -> Option<Share> {
+        let matched: u64 = self.text_match_counts(conjunct, files).await?.iter().sum();
+        let rows: u64 = files.iter().map(|entry| entry.n_docs).sum();
+        Some(Share {
+            share: matched as f64 / rows.max(1) as f64,
+            none: matched == 0,
+        })
+    }
+
+    /// The `files` that can hold a row `rest` keeps: a file where the term index counts no row for
+    /// one of its `text_match`es holds none, so the walk leaves it out.
+    async fn files_holding(
+        &self,
+        rest: &Expr,
+        files: &[Arc<SuperfileEntry>],
+    ) -> Vec<Arc<SuperfileEntry>> {
+        let mut holding = files.to_vec();
+        for conjunct in split_conjunction(rest) {
+            if let Some(counts) = self.text_match_counts(conjunct, &holding).await {
+                let mut counts = counts.into_iter();
+                holding.retain(|_| counts.next().is_some_and(|count| count > 0));
+            }
+        }
+        holding
     }
 
     /// [`Self::expected_share`] of one conjunct over `files`, the files the walk reads. A value
@@ -625,16 +712,31 @@ impl SupertableReader {
         let window_for = |share: f64, rows: usize| {
             ((needed(share, rows) * WINDOW_MARGIN).ceil() as usize).max(rows)
         };
-        let Share { share, none } = self.expected_share(rest, files);
+        let holding = self.files_holding(rest, files).await;
+        let files = holding.as_slice();
+        let Share { share, none } = self.expected_share(rest, files).await;
         if none {
             // The statistics count every value the filter names, and no row holds one: it keeps
             // none.
             return Ok(Some(Vec::new()));
         }
-        if share <= 0.0 || needed(share, k) > MAX_WALKED_ROWS as f64 {
+        // No window needs more than the rows the files hold, plus one so reading them all ends it.
+        // Under a bounded filter that end answers, so a walk reads no more rows than are left, and
+        // one over a few small files starts.
+        let rows_held = files.iter().map(|entry| entry.n_docs).sum::<u64>();
+        let rows_left = |walked: usize| {
+            (rows_held as usize)
+                .saturating_sub(walked)
+                .saturating_add(1)
+        };
+        let reads = |rows: f64, walked: usize| match filter.bounded {
+            true => rows.min(rows_left(walked) as f64),
+            false => rows,
+        };
+        if share <= 0.0 || reads(needed(share, k), 0) > MAX_WALKED_ROWS as f64 {
             return Ok(None);
         }
-        let mut window = window_for(share, k);
+        let mut window = window_for(share, k).min(rows_left(0));
         let mut page = Vec::with_capacity(k);
         let mut cursor: Option<Cursor> = None;
         let mut walked = 0usize;
@@ -675,6 +777,8 @@ impl SupertableReader {
             else {
                 return Ok(None);
             };
+            #[cfg(test)]
+            walk_probe::window_read(&self.manifest().superfiles, read.len());
             let ended = read.len() < window_now;
             let hits: Vec<SuperfileHit> = read.iter().map(|(_, hit)| *hit).collect();
             let kept = match hits.is_empty() {
@@ -701,13 +805,19 @@ impl SupertableReader {
             }
             cursor = Cursor::past(cursor, &read);
             // Size the next window from the share kept so far; past the limit, the statement is
-            // faster.
+            // faster. With nothing kept yet, grow it, unless walked and grown rows pass the limit.
             let rows = k - page.len();
             window = match passed {
-                0 => window_now.saturating_mul(WINDOW_GROWTH),
+                0 => {
+                    let grown = window_now.saturating_mul(WINDOW_GROWTH);
+                    if walked as f64 + reads(grown as f64, walked) > MAX_WALKED_ROWS as f64 {
+                        return Ok(None);
+                    }
+                    grown
+                }
                 _ => {
                     let seen = passed as f64 / walked as f64;
-                    if walked as f64 + needed(seen, rows) > MAX_WALKED_ROWS as f64 {
+                    if walked as f64 + reads(needed(seen, rows), walked) > MAX_WALKED_ROWS as f64 {
                         return Ok(None);
                     }
                     window_for(seen, rows)
