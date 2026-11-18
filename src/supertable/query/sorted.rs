@@ -17,23 +17,44 @@
 //! value (a missing value sorts last and is in no index). Otherwise the
 //! same sort runs as SQL, which answers alike, only slower.
 
-use std::{sync::Arc, time::Instant};
+use std::{cmp::Ordering, collections::HashMap, slice::from_ref, sync::Arc, time::Instant};
 
-use arrow::record_batch::RecordBatch;
+use arrow::{
+    array::{Array, AsArray},
+    record_batch::RecordBatch,
+};
+use datafusion::{
+    common::{DFSchema, ScalarValue, tree_node::TreeNode},
+    execution::context::ExecutionProps,
+    logical_expr::{
+        Expr,
+        simplify::SimplifyContext,
+        utils::{conjunction, split_conjunction},
+    },
+    optimizer::{
+        analyzer::type_coercion::TypeCoercionRewriter, simplify_expressions::ExprSimplifier,
+    },
+    physical_expr::create_physical_expr,
+};
 use roaring::RoaringBitmap;
 use tracing::{Instrument, debug};
 
 use crate::{
     InfinoError,
+    runtime_bridge::run_on_pool,
+    runtime_metrics::op_stats::timed_section,
     superfile::{SuperfileReader, range::KeyKind},
     supertable::{
         error::QueryError,
         handle::{Supertable, SupertableReader},
-        manifest::SuperfileEntry,
+        manifest::{SuperfileEntry, SuperfileUri},
         query::{
             SuperfileHit,
+            candidate::single_range,
             dispatch::{self, tag_hits, tombstone_deny_set},
             exec::common::resolve_hits_named,
+            provider::{flatten_or_eq, read_column, scalar_distinct},
+            skip::ColumnTypeGuard,
         },
         reader_cache::disk::ForegroundQueryGuard,
         tombstones::SidecarCache,
@@ -50,6 +71,87 @@ const SQL_TABLE: &str = "supertable";
 /// One superfile's candidates: `(key, hit)` for its first rows by the key.
 type Candidates = Vec<(u64, SuperfileHit)>;
 
+/// A top-k walk starts only when it expects to find its rows within 4,096, and reads no window past
+/// that after its first; past it the scan reads every row, faster for a filter that keeps so few.
+pub(crate) const MAX_WALKED_ROWS: usize = 4096;
+
+/// A window reads twice the rows the walk expects to need, so it usually holds the page at once.
+const WINDOW_MARGIN: f64 = 2.0;
+
+/// How much larger a window is than the last when the last kept no row.
+const WINDOW_GROWTH: usize = 4;
+
+/// A walk's window holds at most 1M index entries (about 80 MB) across its files when the
+/// connection has no memory limit; with one, the window is reserved against that limit instead.
+const MAX_WINDOW_ENTRIES: usize = 1 << 20;
+
+/// A filter as a top-k walk reads it: the sort column, the interval of its keys the filter keeps
+/// (every key when nothing bounds it), and the rest, checked on the rows the walk reads.
+struct SortedFilter {
+    column: String,
+    interval: (u64, u64),
+    /// Whether a filter bounds the column, so a row with no value is out of the answer, not unread.
+    bounded: bool,
+    /// Whether a filter keeps no row (`false`, or a `NULL` the simplifier made), so the answer is
+    /// empty.
+    keeps_none: bool,
+    rest: Option<Expr>,
+}
+
+/// The share of rows a filter is expected to keep ([`SupertableReader::expected_share`]), and
+/// whether the statistics prove it keeps none.
+struct Share {
+    share: f64,
+    none: bool,
+}
+
+/// Where a walk stands: the last row read (key and `_id`), and per file how many rows read hold
+/// that key. The next window reads from that key on and skips the rows at or before the cursor.
+struct Cursor {
+    key: u64,
+    id: Option<i128>,
+    at_key: HashMap<SuperfileUri, usize>,
+}
+
+impl Cursor {
+    /// The cursor after a window read `read`, in order, from `before`. `None` when it read none.
+    fn past(before: Option<Cursor>, read: &[(u64, SuperfileHit)]) -> Option<Cursor> {
+        let &(key, last) = read.last()?;
+        // A window that read only rows of the last key adds to that key's count.
+        let mut at_key = match before {
+            Some(before) if before.key == key => before.at_key,
+            _ => HashMap::new(),
+        };
+        for (_, hit) in read.iter().rev().take_while(|(at, _)| *at == key) {
+            *at_key.entry(hit.superfile).or_default() += 1;
+        }
+        Some(Cursor {
+            key,
+            id: last.stable_id,
+            at_key,
+        })
+    }
+
+    /// The rows of `superfile` holding the cursor's key that were read.
+    fn read_at_key(&self, superfile: SuperfileUri) -> usize {
+        self.at_key.get(&superfile).copied().unwrap_or(0)
+    }
+
+    /// The rows holding the cursor's key that were read, in every superfile.
+    fn read(&self) -> usize {
+        self.at_key.values().sum()
+    }
+
+    /// Whether the row of `key` and `id` comes after the cursor: by key, then by `_id` ascending.
+    fn passed_by(&self, key: u64, id: Option<i128>, descending: bool) -> bool {
+        let by_key = match descending {
+            false => key.cmp(&self.key),
+            true => self.key.cmp(&key),
+        };
+        by_key.then(id.cmp(&self.id)) == Ordering::Greater
+    }
+}
+
 impl SupertableReader {
     /// The first `k` rows by `column` (descending with `descending`), ties
     /// by `_id` ascending, as hits in that order, read from the superfiles'
@@ -63,6 +165,41 @@ impl SupertableReader {
         descending: bool,
         k: usize,
     ) -> Result<Option<Vec<SuperfileHit>>, QueryError> {
+        self.sorted_hits_within_async(column, descending, k, None, &self.manifest().superfiles)
+            .await
+    }
+
+    /// [`Self::sorted_hits_async`] over the rows of `files` with a key in `interval` (encoded, both
+    /// ends inclusive). Rows with no value are in no interval, so fewer than `k` rows is the whole
+    /// answer.
+    async fn sorted_hits_within_async(
+        &self,
+        column: &str,
+        descending: bool,
+        k: usize,
+        interval: Option<(u64, u64)>,
+        files: &[Arc<SuperfileEntry>],
+    ) -> Result<Option<Vec<SuperfileHit>>, QueryError> {
+        Ok(self
+            .sorted_keyed_hits_async(column, descending, k, interval, None, files)
+            .await?
+            .map(|page| page.into_iter().map(|(_, hit)| hit).collect()))
+    }
+
+    /// [`Self::sorted_hits_within_async`] as `(key, hit)` pairs, read from `files` only. With
+    /// `after`, it is a walk's next window, which reads no row twice:
+    ///  - each file reads its first `k` rows from the cursor's key on, plus the rows of that key it
+    ///    gave already, so at least `k` are new.
+    ///  - candidates past the merged `k`-th are dropped before their `_id`s are read.
+    async fn sorted_keyed_hits_async(
+        &self,
+        column: &str,
+        descending: bool,
+        k: usize,
+        interval: Option<(u64, u64)>,
+        after: Option<&Cursor>,
+        files: &[Arc<SuperfileEntry>],
+    ) -> Result<Option<Vec<(u64, SuperfileHit)>>, QueryError> {
         let manifest = self.manifest();
         let range_cols = manifest.table_schema().range_column_types();
         let Some((field, data_type)) = range_cols.get(column) else {
@@ -80,22 +217,31 @@ impl SupertableReader {
         }
         // More rows than the table holds cannot all have a value: the rows
         // without one would fill the page, so the indexes cannot answer.
-        if u64::try_from(k).map_or(true, |k| k > self.rows_held()) {
+        if interval.is_none() && u64::try_from(k).map_or(true, |k| k > self.rows_held()) {
             return Ok(None);
         }
+        let mut bounds = interval.unwrap_or((0, u64::MAX));
+        // The rows before the cursor's key were read already.
+        if let Some(after) = after {
+            match descending {
+                false => bounds.0 = after.key,
+                true => bounds.1 = after.key,
+            }
+        }
         let field = *field;
-        let units: Vec<_> = manifest
-            .superfiles
+        let units: Vec<_> = files
             .iter()
-            .cloned()
-            .map(|e| (e, ()))
+            .map(|e| {
+                let read = after.map_or(0, |after| after.read_at_key(e.uri));
+                (Arc::clone(e), k.saturating_add(read))
+            })
             .collect();
         let data_type = data_type.clone();
         let body = move |r: Arc<SuperfileReader>,
                          entry: Arc<SuperfileEntry>,
                          tombstone_cache: Option<Arc<SidecarCache>>,
                          now: Instant,
-                         _: ()| {
+                         take: usize| {
             let data_type = data_type.clone();
             async move {
                 let deleted = match &tombstone_cache {
@@ -107,8 +253,8 @@ impl SupertableReader {
                     .range_ends(
                         field,
                         &data_type,
-                        (0, u64::MAX),
-                        k,
+                        bounds,
+                        take,
                         descending,
                         deleted.as_deref().unwrap_or(&none),
                     )
@@ -134,13 +280,31 @@ impl SupertableReader {
         else {
             return Ok(None);
         };
-        let (keys, mut hits): (Vec<u64>, Vec<SuperfileHit>) =
-            candidates.into_iter().flatten().unzip();
-        if hits.len() < k {
+        let mut candidates: Candidates = candidates.into_iter().flatten().collect();
+        if candidates.len() < k && interval.is_none() {
             return Ok(None);
         }
+        // At most the rows the cursor counts lie at or before it, so the page ends by the merged
+        // `reach`-th key; candidates past it are dropped before their `_id`s are read.
+        let reach = k.saturating_add(after.map_or(0, Cursor::read));
+        if candidates.len() > reach {
+            let mut keys: Vec<u64> = candidates.iter().map(|(key, _)| *key).collect();
+            let cut = match descending {
+                false => *keys.select_nth_unstable(reach - 1).1,
+                true => *keys.select_nth_unstable_by(reach - 1, |a, b| b.cmp(a)).1,
+            };
+            candidates.retain(|(key, _)| match descending {
+                false => *key <= cut,
+                true => *key >= cut,
+            });
+        }
+        let (keys, mut hits): (Vec<u64>, Vec<SuperfileHit>) = candidates.into_iter().unzip();
         dispatch::attach_stable_ids_to_hits(self, &mut hits).await?;
-        let mut order: Vec<usize> = (0..hits.len()).collect();
+        let mut order: Vec<usize> = (0..hits.len())
+            .filter(|&i| {
+                after.is_none_or(|after| after.passed_by(keys[i], hits[i].stable_id, descending))
+            })
+            .collect();
         order.sort_by(|&a, &b| {
             let by_key = match descending {
                 false => keys[a].cmp(&keys[b]),
@@ -148,13 +312,430 @@ impl SupertableReader {
             };
             by_key.then_with(|| hits[a].stable_id.cmp(&hits[b].stable_id))
         });
-        Ok(Some(order.into_iter().take(k).map(|i| hits[i]).collect()))
+        Ok(Some(
+            order
+                .into_iter()
+                .take(k)
+                .map(|i| (keys[i], hits[i]))
+                .collect(),
+        ))
     }
 
     /// The rows this snapshot's superfiles hold, deleted ones included: no
     /// sort can return more.
     fn rows_held(&self) -> u64 {
         self.manifest().superfiles.iter().map(|e| e.n_docs).sum()
+    }
+
+    /// How `filter` reads in `column`'s order: its literal comparisons on the column, `AND`ed, give
+    /// the keys to read, and the rest is checked row by row. `None` with no range index on the
+    /// column.
+    fn sorted_filter(
+        &self,
+        column: &str,
+        filter: &Expr,
+    ) -> Result<Option<SortedFilter>, QueryError> {
+        // Cast each literal as the statement does, then simplify (a literal that cannot cast
+        // errors): on a `Float32` column, `f != 16777217 AND f = 16777216` keeps no row. Casts go
+        // to the stored types of this reader's snapshot, as a statement's `Utf8View` compares as
+        // the stored string does and a later schema change does not move them.
+        let schema = Arc::new(
+            DFSchema::try_from(self.snapshot_sql_schemas().scalar().as_ref().clone())
+                .map_err(QueryError::DataFusion)?,
+        );
+        let simplifier = ExprSimplifier::new(
+            SimplifyContext::builder()
+                .with_schema(Arc::clone(&schema))
+                .build(),
+        );
+        let Ok(coerced) = filter
+            .clone()
+            .rewrite(&mut TypeCoercionRewriter::new(&schema))
+            .map(|t| t.data)
+        else {
+            return Ok(None);
+        };
+        let filter = simplifier
+            .simplify(coerced)
+            .map_err(|e| QueryError::InvalidQuery(format!("top-k walk: {e}")))?;
+        let column = column.to_string();
+        let range_cols = self.manifest().table_schema().range_column_types();
+        if !range_cols.contains_key(&column) {
+            return Ok(None);
+        }
+        let mut bounds = Vec::new();
+        let mut rest = Vec::new();
+        let mut keeps_none = false;
+        for conjunct in split_conjunction(&filter) {
+            match conjunct {
+                Expr::Literal(ScalarValue::Boolean(Some(true)), _) => {}
+                Expr::Literal(value, _)
+                    if value.is_null() || *value == ScalarValue::Boolean(Some(false)) =>
+                {
+                    keeps_none = true;
+                }
+                _ if single_range(from_ref(conjunct), &column, &range_cols).is_some() => {
+                    bounds.push(conjunct.clone());
+                }
+                _ => rest.push(conjunct.clone()),
+            }
+        }
+        let interval = match single_range(&bounds, &column, &range_cols) {
+            Some((_, _, lo, hi)) => (lo, hi),
+            None if keeps_none => (0, u64::MAX),
+            None => return Ok(None),
+        };
+        Ok(Some(SortedFilter {
+            column,
+            interval,
+            bounded: !bounds.is_empty(),
+            keeps_none,
+            rest: conjunction(rest),
+        }))
+    }
+
+    /// The share of rows `condition` is expected to keep, from the files' column statistics:
+    ///  - `column = literal`: the rows a file's exact value table counts for it, else one row per
+    ///    distinct value, as the scan estimates for the planner.
+    ///  - `IN`: one such share per value. `AND`: the product of its sides.
+    ///  - anything else, or a column with no statistics: every row; the walk learns the share as it
+    ///    reads.
+    fn expected_share(&self, condition: &Expr, files: &[Arc<SuperfileEntry>]) -> Share {
+        let mut share = 1.0;
+        let mut none = false;
+        for conjunct in split_conjunction(condition) {
+            let one = self.conjunct_share(conjunct, files);
+            share *= one.share;
+            none |= one.none;
+        }
+        Share {
+            share: share.clamp(0.0, 1.0),
+            none,
+        }
+    }
+
+    /// [`Self::expected_share`] of one conjunct over `files`, the files the walk reads. A value
+    /// table counts every row a file holds, deleted ones too, so a literal missing from it is in no
+    /// live row there.
+    fn conjunct_share(&self, conjunct: &Expr, files: &[Arc<SuperfileEntry>]) -> Share {
+        let unknown = Share {
+            share: 1.0,
+            none: false,
+        };
+        let schemas = self.snapshot_sql_schemas();
+        let (column, literals): (String, Vec<ScalarValue>) = match conjunct {
+            // An equality, or the `OR` of equalities the simplifier makes of a short `IN`.
+            Expr::BinaryExpr(_) => match flatten_or_eq(conjunct, schemas.scalar()) {
+                Some(found) => found,
+                None => return unknown,
+            },
+            Expr::InList(list) if !list.negated => match list.expr.as_ref() {
+                Expr::Column(c) => {
+                    let mut values = Vec::with_capacity(list.list.len());
+                    for v in &list.list {
+                        let Expr::Literal(v, _) = v else {
+                            return unknown;
+                        };
+                        values.push(v.clone());
+                    }
+                    (c.name.clone(), values)
+                }
+                _ => return unknown,
+            },
+            _ => return unknown,
+        };
+        if literals.iter().any(|v| v.is_null()) {
+            return unknown;
+        }
+        // The column in its stored type: the scan's `Utf8View` compares as the stored string does.
+        let Ok(column_type) = schemas
+            .scalar()
+            .field_with_name(&column)
+            .map(|f| f.data_type())
+        else {
+            return unknown;
+        };
+        let manifest = self.manifest();
+        let Some(field) = manifest.table_schema().id_of(&column) else {
+            return unknown;
+        };
+        // Statistics from a type the column has since left no longer compare as the statement does.
+        let guard = ColumnTypeGuard::new(manifest, field);
+        // The walk's files, not the snapshot's list, which a lazily opened table holds in part.
+        let entries = files;
+        if entries.iter().any(|entry| guard.stats_are_stale(entry)) {
+            return unknown;
+        }
+        // Rows the value tables count for the literals, and the rows with a value in files whose
+        // tables do not count them.
+        let mut counted = 0.0;
+        let mut uncounted = 0.0;
+        let mut rows = 0.0;
+        for entry in entries.iter() {
+            rows += entry.n_docs as f64;
+            let Some(stats) = entry.scalar_stats.column(field) else {
+                return unknown;
+            };
+            if stats.all_null() {
+                continue;
+            }
+            match stats.literal_count(&literals, column_type) {
+                Some(held) => counted += held as f64,
+                None => {
+                    uncounted +=
+                        entry.n_docs.saturating_sub(stats.null_count().unwrap_or(0)) as f64;
+                }
+            }
+        }
+        if rows == 0.0 {
+            return unknown;
+        }
+        let mut expected = counted;
+        if uncounted > 0.0 {
+            // One row per distinct value per literal, from the estimate the scan gives the planner.
+            let Some(distinct) = scalar_distinct(&read_column(entries, field)) else {
+                return unknown;
+            };
+            if distinct >= 1 {
+                expected += uncounted * (literals.len() as f64 / distinct as f64).min(1.0);
+            }
+        }
+        Share {
+            share: expected / rows,
+            none: uncounted == 0.0 && expected == 0.0,
+        }
+    }
+
+    /// Which of `hits` `condition` keeps, evaluated over the hits' rows (only the columns it
+    /// names). The rows are reserved against the connection's memory budget; over it, the query is
+    /// refused.
+    ///  - `None` when it cannot run outside a statement (a subquery, a statement-only function).
+    ///  - `None` when it names a column the table does not store.
+    async fn kept_by(
+        &self,
+        hits: &[SuperfileHit],
+        condition: &Expr,
+    ) -> Result<Option<Vec<bool>>, QueryError> {
+        let stored = self.manifest().stored_schema();
+        let mut names: Vec<String> = condition
+            .column_refs()
+            .into_iter()
+            .map(|c| c.name.clone())
+            .collect();
+        names.sort();
+        names.dedup();
+        if names.is_empty() || names.iter().any(|n| stored.field_with_name(n).is_err()) {
+            return Ok(None);
+        }
+        let projection: Vec<&str> = names.iter().map(String::as_str).collect();
+        let rows = resolve_hits_named(self, hits, Some(&projection)).await?;
+        let _held = self
+            .manifest()
+            .options
+            .connection_memory_budget
+            .try_reserve(rows.get_array_memory_size())
+            .map_err(|over| {
+                QueryError::OverBudget(format!(
+                    "while the top-k walk checks a window of rows, {over}"
+                ))
+            })?;
+        let Ok(schema) = DFSchema::try_from(rows.schema().as_ref().clone()) else {
+            return Ok(None);
+        };
+        let Ok(coerced) = condition
+            .clone()
+            .rewrite(&mut TypeCoercionRewriter::new(&schema))
+            .map(|t| t.data)
+        else {
+            return Ok(None);
+        };
+        let Ok(predicate) = create_physical_expr(&coerced, &schema, &ExecutionProps::new()) else {
+            return Ok(None);
+        };
+        // Up to a window of rows: run it on the reader pool, and count its time as the query's.
+        let (kept, ns) = run_on_pool(
+            Some(&self.manifest().options.reader_pool),
+            "sorted search condition",
+            move || {
+                timed_section(|| {
+                    let kept = predicate
+                        .evaluate(&rows)
+                        .and_then(|v| v.into_array(rows.num_rows()))
+                        .ok()?;
+                    let kept = kept.as_boolean_opt()?;
+                    // A row the condition leaves unknown (nulls) is not kept, as in a WHERE.
+                    Some(
+                        (0..kept.len())
+                            .map(|i| kept.is_valid(i) && kept.value(i))
+                            .collect::<Vec<bool>>(),
+                    )
+                })
+            },
+        )
+        .await
+        .map_err(QueryError::internal)?;
+        if let Some(stats) = &self.op_stats {
+            stats.add_kernel_cpu_ns(ns);
+        }
+        Ok(kept)
+    }
+
+    /// The first `k` rows `filter` keeps in its column's order: the interval read from the range
+    /// indexes a window at a time, each from where the last ended, checked against the rest.
+    /// `None`:
+    ///  - when the indexes cannot answer, or the rest cannot run outside a statement.
+    ///  - when [`MAX_WALKED_ROWS`] rows do not find `k`.
+    ///  - when nothing bounds the column and its rows with a value run out (nulls sort after,
+    ///    unread).
+    async fn sorted_hits_where_async(
+        &self,
+        filter: &SortedFilter,
+        descending: bool,
+        k: usize,
+        files: &[Arc<SuperfileEntry>],
+    ) -> Result<Option<Vec<SuperfileHit>>, QueryError> {
+        if filter.keeps_none {
+            return Ok(Some(Vec::new()));
+        }
+        let Some(rest) = &filter.rest else {
+            if !filter.bounded {
+                return self
+                    .sorted_hits_within_async(&filter.column, descending, k, None, files)
+                    .await;
+            }
+            return self
+                .sorted_hits_within_async(
+                    &filter.column,
+                    descending,
+                    k,
+                    Some(filter.interval),
+                    files,
+                )
+                .await;
+        };
+        if k == 0 {
+            return Ok(Some(Vec::new()));
+        }
+        // Rows to read for `rows` more to pass at a share; a walk expected to pass its limit leaves
+        // the rows to the statement before reading them.
+        let needed = |share: f64, rows: usize| rows as f64 / share;
+        let window_for = |share: f64, rows: usize| {
+            ((needed(share, rows) * WINDOW_MARGIN).ceil() as usize).max(rows)
+        };
+        let Share { share, none } = self.expected_share(rest, files);
+        if none {
+            // The statistics count every value the filter names, and no row holds one: it keeps
+            // none.
+            return Ok(Some(Vec::new()));
+        }
+        if share <= 0.0 || needed(share, k) > MAX_WALKED_ROWS as f64 {
+            return Ok(None);
+        }
+        let mut window = window_for(share, k);
+        let mut page = Vec::with_capacity(k);
+        let mut cursor: Option<Cursor> = None;
+        let mut walked = 0usize;
+        let mut passed = 0usize;
+        loop {
+            // The first window reads its full margin; later ones stop at the limit.
+            let window_now = match cursor {
+                None => window,
+                Some(_) => window.min(MAX_WALKED_ROWS - walked),
+            };
+            // Each superfile reads a window from the cursor's key on, plus the rows of that key it
+            // gave already.
+            let entries: usize = files
+                .iter()
+                .map(|e| window_now + cursor.as_ref().map_or(0, |c| c.read_at_key(e.uri)))
+                .sum();
+            let budget = &self.manifest().options.connection_memory_budget;
+            if budget.remaining().is_none() && entries > MAX_WINDOW_ENTRIES {
+                return Ok(None);
+            }
+            let _window = budget
+                .try_reserve(entries.saturating_mul(size_of::<(u64, SuperfileHit)>()))
+                .map_err(|over| {
+                    QueryError::OverBudget(format!(
+                        "while the top-k walk reads a window of the range index, {over}"
+                    ))
+                })?;
+            let Some(read) = self
+                .sorted_keyed_hits_async(
+                    &filter.column,
+                    descending,
+                    window_now,
+                    Some(filter.interval),
+                    cursor.as_ref(),
+                    files,
+                )
+                .await?
+            else {
+                return Ok(None);
+            };
+            let ended = read.len() < window_now;
+            let hits: Vec<SuperfileHit> = read.iter().map(|(_, hit)| *hit).collect();
+            let kept = match hits.is_empty() {
+                true => Vec::new(),
+                false => match self.kept_by(&hits, rest).await? {
+                    Some(kept) => kept,
+                    None => return Ok(None),
+                },
+            };
+            passed += kept.iter().filter(|kept| **kept).count();
+            walked += hits.len();
+            let room = k - page.len();
+            page.extend(
+                hits.iter()
+                    .zip(kept.iter().copied())
+                    .filter_map(|(hit, kept)| kept.then_some(*hit))
+                    .take(room),
+            );
+            if page.len() == k || (ended && filter.bounded) {
+                return Ok(Some(page));
+            }
+            if ended || walked >= MAX_WALKED_ROWS {
+                return Ok(None);
+            }
+            cursor = Cursor::past(cursor, &read);
+            // Size the next window from the share kept so far; past the limit, the statement is
+            // faster.
+            let rows = k - page.len();
+            window = match passed {
+                0 => window_now.saturating_mul(WINDOW_GROWTH),
+                _ => {
+                    let seen = passed as f64 / walked as f64;
+                    if walked as f64 + needed(seen, rows) > MAX_WALKED_ROWS as f64 {
+                        return Ok(None);
+                    }
+                    window_for(seen, rows)
+                }
+            };
+        }
+    }
+
+    /// The first `k` rows `predicates` keep in `column`'s order, ties by `_id` ascending, walked
+    /// over the files a scan kept. `None`, and the scan reads every row, when the walk cannot
+    /// answer, or when rows with no value sort first and no filter on `column` keeps them out.
+    pub(crate) async fn sorted_hits_for_scan(
+        &self,
+        column: &str,
+        predicates: &[Expr],
+        descending: bool,
+        nulls_first: bool,
+        k: usize,
+        files: &[Arc<SuperfileEntry>],
+    ) -> Result<Option<Vec<SuperfileHit>>, QueryError> {
+        // A filter the walk cannot read leaves the rows to the scan.
+        let filter = conjunction(predicates.to_vec())
+            .and_then(|filter| self.sorted_filter(column, &filter).ok().flatten())
+            .filter(|filter| filter.bounded || !nulls_first);
+        match filter {
+            Some(filter) => {
+                self.sorted_hits_where_async(&filter, descending, k, files)
+                    .await
+            }
+            None => Ok(None),
+        }
     }
 
     /// Sync [`Self::sorted_hits_async`] through the sync→async bridge.
@@ -255,11 +836,12 @@ fn quote(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{cmp::Ordering, sync::Arc};
+    use std::{cmp::Ordering, iter::repeat_n, sync::Arc};
 
     use arrow::compute::cast;
     use arrow_array::{
-        Array, Decimal128Array, Float32Array, Float64Array, Int64Array, TimestampMillisecondArray,
+        Array, Decimal128Array, Float32Array, Float64Array, Int64Array, StringArray,
+        TimestampMillisecondArray,
     };
     use arrow_schema::{DataType, Field, Schema, TimeUnit};
     use datafusion::prelude::{col, lit};
@@ -268,9 +850,47 @@ mod tests {
     use super::*;
     use crate::{
         config::OptimizeOptions,
+        runtime_metrics::op_stats::with_op_stats,
         storage::{LocalFsStorageProvider, StorageProvider},
-        supertable::SupertableOptions,
+        supertable::{
+            SupertableOptions,
+            schema::change::{FieldPatch, SchemaPatch},
+        },
     };
+
+    /// [`SupertableReader::sorted_hits_for_scan`] over every file of `st`, as rows. A `None`
+    /// `column` is the one column `filter` names.
+    fn sorted_search_where(
+        st: &Supertable,
+        column: Option<&str>,
+        filter: &Expr,
+        descending: bool,
+        k: usize,
+        projection: Option<&[&str]>,
+    ) -> Result<Option<Vec<RecordBatch>>, InfinoError> {
+        let reader = st.reader()?;
+        let named = filter.column_refs();
+        let column = match column {
+            Some(column) => column.to_owned(),
+            None => {
+                let mut names = named.iter().map(|c| c.name.as_str());
+                match (names.next(), names.next()) {
+                    (Some(name), None) => name.to_owned(),
+                    _ => return Ok(None),
+                }
+            }
+        };
+        let predicates: Vec<Expr> = split_conjunction(filter).into_iter().cloned().collect();
+        let files = &reader.manifest().superfiles;
+        let walked = reader.sorted_hits_for_scan(&column, &predicates, descending, false, k, files);
+        let Some(hits) = reader.block_on(walked).map_err(InfinoError::from)? else {
+            return Ok(None);
+        };
+        let rows = reader
+            .block_on(resolve_hits_named(&reader, &hits, projection))
+            .map_err(InfinoError::from)?;
+        Ok(Some(vec![rows]))
+    }
 
     /// Superfiles the table is written as, one commit each.
     const FILES: i64 = 3;
@@ -370,6 +990,818 @@ mod tests {
                 (0..ids.len()).map(move |i| ids.value(i))
             })
             .collect()
+    }
+
+    #[test]
+    fn sorted_search_where_answers_as_the_filtered_sql_sort() {
+        // One interval of `key`, every ask, before and after optimize.
+        //  - Each page matches the filtered SQL sort, row for row, read from the range indexes.
+        //  - An interval holds no null, so a short page is the whole answer.
+        //  - With no column named, the interval's own column sorts.
+        // This test pins the walk's answer for a plain interval.
+        let dir = TempDir::new().expect("tempdir");
+        let st = table(&dir);
+        let intervals: [(Expr, &str); 5] = [
+            (
+                col("key")
+                    .gt_eq(lit(10_i64))
+                    .and(col("key").lt(lit(20_i64))),
+                "key >= 10 AND key < 20",
+            ),
+            (col("key").gt(lit(45_i64)), "key > 45"),
+            (col("key").lt_eq(lit(3_i64)), "key <= 3"),
+            (
+                col("key").between(lit(7_i64), lit(7_i64)),
+                "key BETWEEN 7 AND 7",
+            ),
+            (col("key").gt(lit(1_000_i64)), "key > 1000"),
+        ];
+        for pass in ["appended", "optimized"] {
+            if pass == "optimized" {
+                st.optimize(&OptimizeOptions::default()).expect("optimize");
+            }
+            let reader = st.reader().expect("reader");
+            for (filter, sql) in &intervals {
+                for &(descending, k) in ASKS {
+                    for column in [Some("key"), None] {
+                        let got = sorted_search_where(
+                            &st,
+                            column,
+                            filter,
+                            descending,
+                            k,
+                            Some(&["_id", "seq", "key"]),
+                        )
+                        .expect("sorted_search_where")
+                        .unwrap_or_else(|| panic!("{pass}: {sql}: the index answers"));
+                        let direction = if descending { "DESC" } else { "ASC" };
+                        let want = reader
+                            .query_sql(&format!(
+                                "SELECT _id, seq, key FROM supertable WHERE {sql} ORDER BY key {direction} NULLS LAST, _id ASC LIMIT {k}"
+                            ))
+                            .expect("sql");
+                        let what = format!("{pass}: {sql}, descending {descending}, k {k}");
+                        assert_eq!(ids(&got), ids(&want), "{what}");
+                        assert_eq!(ints(&got, "seq"), ints(&want, "seq"), "{what}");
+                        assert_eq!(ints(&got, "key"), ints(&want, "key"), "{what}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// The asks the walk answers for a filter keeping a third of any stretch of `key`'s order: all
+    /// but the one past every row with a value.
+    const DENSE_ASKS: &[(bool, usize)] = &[
+        (false, 1),
+        (false, 10),
+        (true, 10),
+        (true, 125),
+        (false, 600),
+    ];
+
+    #[test]
+    fn sorted_search_where_checks_the_other_conditions_on_the_rows_in_order() {
+        // Filters beside the interval, on other columns or the sorted one, before and after
+        // optimize.
+        //  - Every page the walk answers matches the filtered SQL sort, row for row.
+        //  - Each filter's asks within the walk's reach are answered.
+        //  - With nothing bounding the column, a walk past its rows with a value leaves the nulls
+        //    to SQL.
+        // This test pins that the rest of the filter is checked on the rows in order.
+        let dir = TempDir::new().expect("tempdir");
+        let st = table(&dir);
+        // Each filter with the asks the walk must answer:
+        //  - the first three keep a third of any stretch of the order, so pages up to 600 fit the
+        //    walk.
+        //  - keys 3 and 5 lie a few hundred rows into the ascending order, past the limit
+        //    descending.
+        //  - `seq IN (…)` is expected to keep 3 rows, so only a page of one is walked for.
+        //  - `seq < 0` keeps no row, and with no bound on `key` the nulls stay unread: never
+        //    answered.
+        let filters: [(Expr, &str, &[(bool, usize)]); 6] = [
+            (
+                col("key")
+                    .gt_eq(lit(10_i64))
+                    .and((col("seq") % lit(3_i64)).eq(lit(0_i64))),
+                "key >= 10 AND seq % 3 = 0",
+                DENSE_ASKS,
+            ),
+            (
+                (col("seq") % lit(2_i64)).eq(lit(1_i64)),
+                "seq % 2 = 1",
+                DENSE_ASKS,
+            ),
+            (
+                col("key").lt(lit(25_i64)).and(
+                    col("seq")
+                        .gt(lit(4_000_i64))
+                        .or(col("seq").lt(lit(1_000_i64))),
+                ),
+                "key < 25 AND (seq > 4000 OR seq < 1000)",
+                DENSE_ASKS,
+            ),
+            (
+                col("key").eq(lit(3_i64)).or(col("key").eq(lit(5_i64))),
+                "(key = 3 OR key = 5)",
+                &[(false, 1), (false, 10)],
+            ),
+            (
+                col("key").gt(lit(40_i64)).and(
+                    col("seq").in_list(vec![lit(301_i64), lit(302_i64), lit(4_444_i64)], false),
+                ),
+                "key > 40 AND seq IN (301, 302, 4444)",
+                &[(false, 1)],
+            ),
+            (col("seq").lt(lit(0_i64)), "seq < 0", &[]),
+        ];
+        for pass in ["appended", "optimized"] {
+            if pass == "optimized" {
+                st.optimize(&OptimizeOptions::default()).expect("optimize");
+            }
+            let reader = st.reader().expect("reader");
+            for (filter, sql, answered) in &filters {
+                for &(descending, k) in ASKS {
+                    let got = sorted_search_where(
+                        &st,
+                        Some("key"),
+                        filter,
+                        descending,
+                        k,
+                        Some(&["_id", "seq", "key"]),
+                    )
+                    .expect("sorted_search_where");
+                    let what = format!("{pass}: {sql}, descending {descending}, k {k}");
+                    let must = answered.contains(&(descending, k));
+                    if *sql == "seq < 0" {
+                        assert!(got.is_none(), "{what}: left to the statement");
+                    }
+                    let Some(got) = got else {
+                        assert!(!must, "{what}: answered by the walk");
+                        continue;
+                    };
+                    let direction = if descending { "DESC" } else { "ASC" };
+                    let want = reader
+                        .query_sql(&format!(
+                            "SELECT _id, seq, key FROM supertable WHERE {sql} ORDER BY key {direction} NULLS LAST, _id ASC LIMIT {k}"
+                        ))
+                        .expect("sql");
+                    assert_eq!(ids(&got), ids(&want), "{what}");
+                    assert_eq!(ints(&got, "seq"), ints(&want, "seq"), "{what}");
+                    assert_eq!(ints(&got, "key"), ints(&want, "key"), "{what}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_value_no_value_table_holds_keeps_no_row() {
+        // A filter on a column whose files keep exact value tables.
+        //  - A literal no table holds, alone or in an `IN`, keeps no row: empty page, no row read.
+        //  - A literal a table holds is walked and matches the SQL sort.
+        // This test pins that the value tables prove a filter empty.
+        let dir = TempDir::new().expect("tempdir");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("seq", DataType::Int64, false),
+            Field::new("tag", DataType::Utf8, false),
+        ]));
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let options = SupertableOptions::new(Arc::clone(&schema), vec![], vec![])
+            .expect("options")
+            .with_storage(storage)
+            .with_range_indexes(&["seq".to_string()]);
+        let st = Supertable::create(options).expect("create");
+        for file in 0..2_i64 {
+            let seqs: Vec<i64> = (file * 1000..(file + 1) * 1000).collect();
+            let tags: Vec<String> = seqs.iter().map(|s| format!("t{}", s % 7)).collect();
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(seqs)),
+                    Arc::new(arrow_array::StringArray::from(tags)),
+                ],
+            )
+            .expect("batch");
+            let mut writer = st.writer().expect("writer");
+            writer.append(&batch).expect("append");
+            writer.commit().expect("commit");
+        }
+        let page = |filter: &Expr| {
+            sorted_search_where(&st, Some("seq"), filter, true, 10, Some(&["_id", "seq"]))
+                .expect("sorted_search_where")
+        };
+        for filter in [
+            col("tag").eq(lit("absent")),
+            col("tag").in_list(vec![lit("absent"), lit("missing")], false),
+        ] {
+            let got = page(&filter).unwrap_or_else(|| panic!("{filter}: answered"));
+            assert_eq!(
+                got.iter().map(RecordBatch::num_rows).sum::<usize>(),
+                0,
+                "{filter}"
+            );
+        }
+        let held = page(&col("tag").eq(lit("t3"))).expect("a held value is walked");
+        let reader = st.reader().expect("reader");
+        let want = reader
+            .query_sql(
+                "SELECT _id, seq FROM supertable WHERE tag = 't3' ORDER BY seq DESC NULLS LAST, _id ASC LIMIT 10",
+            )
+            .expect("sql");
+        assert_eq!(ints(&held, "seq"), ints(&want, "seq"));
+    }
+
+    /// The numeric-tag table has 7 `tag` values, written with a leading zero (`"00"` to `"06"`).
+    const NUMERIC_TAGS: i64 = 7;
+    /// Every `n` is 2^53 + 1, which reads as 2^53 when cast to `Float64`.
+    const BIG: i64 = (1 << 53) + 1;
+
+    /// Range-indexed `seq`, a numeric `tag` string and `n` = [`BIG`], in two commits, so each file
+    /// keeps exact value tables for `tag` and `n`.
+    fn numeric_tag_table(dir: &TempDir) -> Supertable {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("seq", DataType::Int64, false),
+            Field::new("tag", DataType::Utf8, false),
+            Field::new("n", DataType::Int64, false),
+        ]));
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let options = SupertableOptions::new(Arc::clone(&schema), vec![], vec![])
+            .expect("options")
+            .with_storage(storage)
+            .with_range_indexes(&["seq".to_string()]);
+        let st = Supertable::create(options).expect("create");
+        for file in 0..2_i64 {
+            let seqs: Vec<i64> = (file * 1000..(file + 1) * 1000).collect();
+            let tags: Vec<String> = seqs
+                .iter()
+                .map(|s| format!("{:02}", s % NUMERIC_TAGS))
+                .collect();
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(seqs)),
+                    Arc::new(StringArray::from(tags)),
+                    Arc::new(Int64Array::from(vec![BIG; 1000])),
+                ],
+            )
+            .expect("batch");
+            let mut writer = st.writer().expect("writer");
+            writer.append(&batch).expect("append");
+            writer.commit().expect("commit");
+        }
+        st
+    }
+
+    /// The walk's `seq DESC LIMIT 10` page for `filter` must be answered and match the SQL sort of
+    /// `sql`.
+    fn assert_page_matches_sql(st: &Supertable, filter: &Expr, sql: &str) {
+        let got = sorted_search_where(st, Some("seq"), filter, true, 10, Some(&["_id", "seq"]))
+            .expect("sorted_search_where")
+            .unwrap_or_else(|| panic!("{sql}: answered"));
+        let want = st
+            .reader()
+            .expect("reader")
+            .query_sql(&format!(
+                "SELECT _id, seq FROM supertable WHERE {sql} ORDER BY seq DESC NULLS LAST, _id ASC LIMIT 10"
+            ))
+            .expect("sql");
+        assert!(!ints(&want, "seq").is_empty(), "{sql}: SQL keeps rows");
+        assert_eq!(ints(&got, "seq"), ints(&want, "seq"), "{sql}");
+    }
+
+    #[test]
+    fn a_literal_the_column_is_cast_for_is_not_counted() {
+        // Literals the statement compares by casting the column.
+        //  - `tag = 3` casts `"03"` to 3, and `n = 2^53` casts [`BIG`] to 2^53: both keep rows the
+        //    tables hold under another value, so neither is looked up.
+        //  - A literal of the column's own type is still counted: `tag = '09'` keeps no row.
+        // This test pins that a cast literal is never read as absent.
+        let dir = TempDir::new().expect("tempdir");
+        let st = numeric_tag_table(&dir);
+        assert_page_matches_sql(&st, &col("tag").eq(lit(3_i64)), "tag = 3");
+        assert_page_matches_sql(
+            &st,
+            &col("n").eq(lit((1_i64 << 53) as f64)),
+            "n = 9007199254740992.0",
+        );
+        let absent = sorted_search_where(
+            &st,
+            Some("seq"),
+            &col("tag").eq(lit("09")),
+            true,
+            10,
+            Some(&["_id", "seq"]),
+        )
+        .expect("sorted_search_where")
+        .expect("a value no table holds is answered");
+        assert_eq!(absent.iter().map(RecordBatch::num_rows).sum::<usize>(), 0);
+    }
+
+    #[test]
+    fn value_tables_in_a_type_the_column_left_are_not_counted() {
+        // `tag` converted from strings to `Int64`, its value tables still counting the strings.
+        // This test pins that `tag = 3` keeps the `"03"` rows, not finding no 3 in the old tables.
+        let dir = TempDir::new().expect("tempdir");
+        let st = numeric_tag_table(&dir);
+        st.apply_schema(
+            &SchemaPatch::new(vec![FieldPatch::named("tag").with_type(DataType::Int64)]),
+            None,
+        )
+        .expect("convert tag");
+        assert_page_matches_sql(&st, &col("tag").eq(lit(3_i64)), "tag = 3");
+    }
+
+    /// `seq` of the first row by `seq` that `filter` keeps, walked by `reader` over `files`.
+    fn first_walked_seq(
+        reader: &SupertableReader,
+        filter: Expr,
+        files: &[Arc<SuperfileEntry>],
+    ) -> Vec<Option<i64>> {
+        let predicates = vec![col("seq").gt_eq(lit(0_i64)), filter];
+        let walked = reader.sorted_hits_for_scan("seq", &predicates, false, false, 1, files);
+        let hits = reader
+            .block_on(walked)
+            .expect("walk")
+            .expect("answered by the walk");
+        let rows = reader
+            .block_on(resolve_hits_named(reader, &hits, Some(&["seq"])))
+            .expect("rows");
+        ints(&[rows], "seq")
+    }
+
+    #[test]
+    fn a_walk_casts_its_filter_in_its_snapshot_types() {
+        // `tag` is `Int64` in the snapshot a reader pins, then converted to `Float32`.
+        //  - In `Int64`, `tag != 2^24 + 1` keeps the row whose `tag` is 2^24.
+        //  - In `Float32` the literal would round to 2^24 and drop that row.
+        // This test pins that the pinned reader walks in its own snapshot's types.
+        let dir = TempDir::new().expect("tempdir");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("seq", DataType::Int64, false),
+            Field::new("tag", DataType::Int64, false),
+        ]));
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let options = SupertableOptions::new(Arc::clone(&schema), vec![], vec![])
+            .expect("options")
+            .with_storage(storage)
+            .with_range_indexes(&["seq".to_string()]);
+        let st = Supertable::create(options).expect("create");
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![0, 1])),
+                Arc::new(Int64Array::from(vec![FLOAT32_EXACT, 5])),
+            ],
+        )
+        .expect("batch");
+        let mut writer = st.writer().expect("writer");
+        writer.append(&batch).expect("append");
+        writer.commit().expect("commit");
+        drop(writer);
+        let reader = st.reader().expect("reader");
+        st.apply_schema(
+            &SchemaPatch::new(vec![FieldPatch::named("tag").with_type(DataType::Float32)]),
+            None,
+        )
+        .expect("convert tag");
+        let files = reader.manifest().superfiles.clone();
+        let filter = col("tag").not_eq(lit(FLOAT32_EXACT + 1));
+        assert_eq!(first_walked_seq(&reader, filter, &files), vec![Some(0)]);
+    }
+
+    #[test]
+    fn a_value_is_counted_over_the_files_walked_not_the_snapshot_list() {
+        // A table opened lazily, then appended to: its snapshot's list holds only the new file.
+        //  - The older file holds the one `r` row; the new file holds only `c`.
+        //  - `tag = 'r'` over both files finds that row; the new file's table alone lacks `r`.
+        // This test pins that the value tables of the files walked prove a value absent.
+        let dir = TempDir::new().expect("tempdir");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("seq", DataType::Int64, false),
+            Field::new("tag", DataType::Utf8, false),
+        ]));
+        let options = || {
+            let storage: Arc<dyn StorageProvider> =
+                Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+            SupertableOptions::new(Arc::clone(&schema), vec![], vec![])
+                .expect("options")
+                .with_storage(storage)
+                .with_range_indexes(&["seq".to_string()])
+        };
+        let append = |st: &Supertable, seq: i64, tag: &str| {
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(vec![seq])),
+                    Arc::new(StringArray::from(vec![tag])),
+                ],
+            )
+            .expect("batch");
+            let mut writer = st.writer().expect("writer");
+            writer.append(&batch).expect("append");
+            writer.commit().expect("commit");
+        };
+        let created = Supertable::create(options()).expect("create");
+        append(&created, 0, "r");
+        drop(created);
+        let st = Supertable::open(options().with_eager_load_threshold(0)).expect("open lazily");
+        append(&st, 1, "c");
+        let reader = st.reader().expect("reader");
+        assert_eq!(
+            reader.manifest().superfiles.len(),
+            1,
+            "the lazily opened snapshot lists only the appended file"
+        );
+        let got = reader
+            .query_sql(
+                "SELECT seq FROM supertable WHERE seq >= 0 AND tag = 'r' ORDER BY seq LIMIT 1",
+            )
+            .expect("sql");
+        assert_eq!(ints(&got, "seq"), vec![Some(0)]);
+    }
+
+    /// The CPU test's condition is 200 additions, so evaluating it dwarfs reading its rows.
+    const COSTLY_ADDITIONS: usize = 200;
+    /// It runs 50 times, as the per-thread CPU clock moves at scheduler events and one short run
+    /// can read zero.
+    const CPU_RUNS: usize = 50;
+    /// Rows per run.
+    const CPU_ROWS: usize = 2000;
+    /// The checks must report at least half the condition's own CPU: the clock may lose some, never
+    /// most.
+    const CPU_SHARE_FLOOR: u64 = 2;
+
+    #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "per-thread CPU clock is Linux procfs (schedstat); off Linux kernel_cpu_ns is always 0"
+    )]
+    fn a_condition_checked_on_rows_reports_its_cpu() {
+        // A costly condition checked on a walk's rows, against the same condition evaluated alone.
+        // This test pins that the checks report their CPU to the query, as a WHERE does.
+        let dir = TempDir::new().expect("tempdir");
+        let st = table(&dir);
+        let costly = (0..COSTLY_ADDITIONS)
+            .fold(col("seq"), |sum, _| sum + lit(1_i64))
+            .gt(lit(0_i64));
+        let hits = st
+            .reader()
+            .expect("reader")
+            .sorted_hits("key", false, CPU_ROWS)
+            .expect("hits")
+            .expect("answered");
+        let reader = st.reader().expect("reader");
+        let rows = reader
+            .block_on(resolve_hits_named(&reader, &hits, Some(&["seq"])))
+            .expect("rows");
+        let schema = DFSchema::try_from(rows.schema().as_ref().clone()).expect("schema");
+        let predicate =
+            create_physical_expr(&costly, &schema, &ExecutionProps::new()).expect("predicate");
+        let (((), alone), _) = with_op_stats(|| {
+            timed_section(|| {
+                for _ in 0..CPU_RUNS {
+                    predicate.evaluate(&rows).expect("evaluate");
+                }
+            })
+        });
+        let mut reported = 0;
+        for _ in 0..CPU_RUNS {
+            let (kept, stats) = with_op_stats(|| {
+                let reader = st.reader().expect("reader");
+                reader
+                    .block_on(reader.kept_by(&hits, &costly))
+                    .expect("kept_by")
+            });
+            assert!(kept.expect("evaluated").iter().all(|kept| *kept));
+            reported += stats.kernel_cpu_ns;
+        }
+        assert!(alone > 0, "{CPU_RUNS} evaluations take no CPU");
+        assert!(
+            reported >= alone / CPU_SHARE_FLOOR,
+            "checks report {reported} ns of a condition taking {alone} ns"
+        );
+    }
+
+    /// 2^24 + 1 is the first integer a `Float32` cannot hold: the floats around it are two apart.
+    const FLOAT32_EXACT: i64 = 1 << 24;
+    /// Rows of each value in [`float32_table`].
+    const FLOAT32_ROWS_EACH: usize = 3;
+
+    /// A range-indexed `Float32` column `f` holding the floats from 2^24 - 4 to 2^24 + 4, two
+    /// apart.
+    fn float32_table(dir: &TempDir) -> Supertable {
+        let schema = Arc::new(Schema::new(vec![Field::new("f", DataType::Float32, false)]));
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let options = SupertableOptions::new(Arc::clone(&schema), vec![], vec![])
+            .expect("options")
+            .with_storage(storage)
+            .with_range_indexes(&["f".to_string()]);
+        let st = Supertable::create(options).expect("create");
+        let floats: Vec<f32> = (-2..=2_i64)
+            .flat_map(|step| repeat_n((FLOAT32_EXACT + 2 * step) as f32, FLOAT32_ROWS_EACH))
+            .collect();
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(Float32Array::from(floats))])
+            .expect("batch");
+        let mut writer = st.writer().expect("writer");
+        writer.append(&batch).expect("append");
+        writer.commit().expect("commit");
+        st
+    }
+
+    #[test]
+    fn a_bound_compares_with_its_literal_cast_to_the_column() {
+        // Integer bounds on a `Float32` column, cast as a statement casts them.
+        //  - `f = 2^24 + 1` keeps the rows at 2^24, which it rounds to; `f < 2^24 + 1` keeps none
+        //    of them.
+        //  - Literals a `Float32` holds exactly read as before.
+        // This test pins that each page matches the SQL sort.
+        let dir = TempDir::new().expect("tempdir");
+        let st = float32_table(&dir);
+        let reader = st.reader().expect("reader");
+        let inexact = FLOAT32_EXACT + 1;
+        let cases = [
+            (col("f").eq(lit(inexact)), format!("f = {inexact}")),
+            (col("f").lt(lit(inexact)), format!("f < {inexact}")),
+            (col("f").lt_eq(lit(inexact)), format!("f <= {inexact}")),
+            (col("f").gt(lit(inexact)), format!("f > {inexact}")),
+            (
+                col("f").eq(lit(FLOAT32_EXACT)),
+                format!("f = {FLOAT32_EXACT}"),
+            ),
+            (
+                col("f").lt(lit(FLOAT32_EXACT)),
+                format!("f < {FLOAT32_EXACT}"),
+            ),
+        ];
+        for (filter, sql) in cases {
+            let got = sorted_search_where(&st, Some("f"), &filter, false, 10, Some(&["_id"]))
+                .expect("sorted_search_where")
+                .unwrap_or_else(|| panic!("{sql}: answered"));
+            let want = reader
+                .query_sql(&format!(
+                    "SELECT _id FROM supertable WHERE {sql} ORDER BY f ASC, _id ASC LIMIT 10"
+                ))
+                .expect("sql");
+            assert!(!ids(&want).is_empty(), "{sql}: SQL keeps rows");
+            assert_eq!(ids(&got), ids(&want), "{sql}");
+        }
+    }
+
+    #[test]
+    fn a_compound_filter_is_cast_before_it_is_simplified() {
+        // `f != 2^24 + 1` on a `Float32` column reads as `f != 2^24`.
+        //  - Beside `f = 2^24` it keeps no row.
+        //  - Beside a bound it drops the rows at 2^24.
+        // This test pins that a compound filter is cast before it is simplified.
+        let dir = TempDir::new().expect("tempdir");
+        let st = float32_table(&dir);
+        let reader = st.reader().expect("reader");
+        let inexact = FLOAT32_EXACT + 1;
+        let below = FLOAT32_EXACT - 2;
+        let cases = [
+            (
+                col("f")
+                    .not_eq(lit(inexact))
+                    .and(col("f").eq(lit(FLOAT32_EXACT))),
+                format!("f != {inexact} AND f = {FLOAT32_EXACT}"),
+                false,
+            ),
+            (
+                col("f")
+                    .not_eq(lit(inexact))
+                    .and(col("f").gt_eq(lit(below))),
+                format!("f != {inexact} AND f >= {below}"),
+                true,
+            ),
+        ];
+        for (filter, sql, keeps_rows) in cases {
+            let got = sorted_search_where(&st, Some("f"), &filter, false, 10, Some(&["_id"]))
+                .expect("sorted_search_where")
+                .unwrap_or_else(|| panic!("{sql}: answered"));
+            let want = reader
+                .query_sql(&format!(
+                    "SELECT _id FROM supertable WHERE {sql} ORDER BY f ASC, _id ASC LIMIT 10"
+                ))
+                .expect("sql");
+            assert_eq!(!ids(&want).is_empty(), keeps_rows, "{sql}: SQL's rows");
+            assert_eq!(ids(&got), ids(&want), "{sql}");
+        }
+    }
+
+    #[test]
+    fn a_walk_whose_first_rows_fall_short_reads_its_full_first_window() {
+        // 8,000 rows, 20 of them tagged `r`: 5 among the first 4,096 by `seq`, 15 after.
+        //  - `k = 10` at that share expects 4,000 rows, within the limit, so the walk starts.
+        //  - Its first window reads twice that, finds 20, and answers as the SQL sort.
+        // This test pins that the limit does not cut the first window's margin.
+        let tagged =
+            |s: i64| (s < 4000 && s % 800 == 0) || (4100..7850).step_by(250).any(|t| t == s);
+        assert!((0..4096).filter(|s| tagged(*s)).count() < 10);
+        let dir = TempDir::new().expect("tempdir");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("seq", DataType::Int64, false),
+            Field::new("tag", DataType::Utf8, false),
+        ]));
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let options = SupertableOptions::new(Arc::clone(&schema), vec![], vec![])
+            .expect("options")
+            .with_storage(storage)
+            .with_range_indexes(&["seq".to_string()]);
+        let st = Supertable::create(options).expect("create");
+        for file in 0..2_i64 {
+            let seqs: Vec<i64> = (file * 4000..(file + 1) * 4000).collect();
+            let tags: Vec<&str> = seqs
+                .iter()
+                .map(|s| if tagged(*s) { "r" } else { "c" })
+                .collect();
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(seqs)),
+                    Arc::new(StringArray::from(tags)),
+                ],
+            )
+            .expect("batch");
+            let mut writer = st.writer().expect("writer");
+            writer.append(&batch).expect("append");
+            writer.commit().expect("commit");
+        }
+        let filter = col("tag").eq(lit("r"));
+        let got = sorted_search_where(&st, Some("seq"), &filter, false, 10, Some(&["_id", "seq"]))
+            .expect("sorted_search_where")
+            .expect("answered by the walk");
+        let want = st
+            .reader()
+            .expect("reader")
+            .query_sql(
+                "SELECT _id, seq FROM supertable WHERE tag = 'r' \
+                 ORDER BY seq ASC NULLS LAST, _id ASC LIMIT 10",
+            )
+            .expect("sql");
+        assert_eq!(ints(&want, "seq").len(), 10);
+        assert_eq!(ints(&got, "seq"), ints(&want, "seq"));
+    }
+
+    /// The many-files table: 40 commits of 60 rows, 12 `key` values so each key's rows lie in every
+    /// file and a window ends among them, `key` null every 11th row, and `seq` below 100 deleted.
+    const MANY_FILES: i64 = 40;
+    const MANY_ROWS: i64 = 60;
+    const MANY_KEYS: i64 = 12;
+    const MANY_NULL_EVERY: i64 = 11;
+    const MANY_DELETED_BELOW: i64 = 100;
+    /// The `(descending, k)` asked of each filter.
+    const MANY_ASKS: &[(bool, usize)] = &[
+        (false, 1),
+        (true, 1),
+        (false, 10),
+        (true, 10),
+        (false, 100),
+        (true, 100),
+        (false, 700),
+        (true, 700),
+    ];
+
+    /// The many-files table, `key` range indexed with its values in no order.
+    fn many_table(dir: &TempDir) -> Supertable {
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let options = SupertableOptions::new(schema(), vec![], vec![])
+            .expect("options")
+            .with_storage(storage)
+            .with_range_indexes(&["key".to_string()]);
+        let st = Supertable::create(options).expect("create");
+        for file in 0..MANY_FILES {
+            let seqs: Vec<i64> = (file * MANY_ROWS..(file + 1) * MANY_ROWS).collect();
+            let keys: Vec<Option<i64>> = seqs
+                .iter()
+                .map(|s| (s % MANY_NULL_EVERY != 0).then_some((s * 7) % MANY_KEYS))
+                .collect();
+            let batch = RecordBatch::try_new(
+                schema(),
+                vec![
+                    Arc::new(Int64Array::from(seqs)),
+                    Arc::new(Int64Array::from(keys)),
+                ],
+            )
+            .expect("batch");
+            let mut writer = st.writer().expect("writer");
+            writer.append(&batch).expect("append");
+            writer.commit().expect("commit");
+        }
+        st.delete(col("seq").lt(lit(MANY_DELETED_BELOW)))
+            .expect("delete");
+        st
+    }
+
+    #[test]
+    fn sorted_search_where_walks_many_superfiles_in_order() {
+        // 40 files whose rows of each key interleave, walked over several windows that end among a
+        // key's rows.
+        //  - Each page matches the SQL sort with `NULLS LAST`, both directions.
+        //  - A page reaching past the rows with a value, with no bound on the column, is left to
+        //    SQL.
+        // This test pins the walk's cursor across windows and files.
+        let dir = TempDir::new().expect("tempdir");
+        let st = many_table(&dir);
+        let reader = st.reader().expect("reader");
+        // Asks the walk must leave to SQL: 697 rows with a value keep `seq % 3 = 0` and 105 keep
+        // `seq % 20 = 0`, so their pages of 700 need nulls; the bounded filter's 700 is its 207
+        // rows.
+        let filters: [(Expr, &str, &[usize]); 3] = [
+            (
+                (col("seq") % lit(3_i64)).eq(lit(0_i64)),
+                "seq % 3 = 0",
+                &[700],
+            ),
+            (
+                (col("seq") % lit(20_i64)).eq(lit(0_i64)),
+                "seq % 20 = 0",
+                &[700],
+            ),
+            (
+                col("key")
+                    .lt(lit(6_i64))
+                    .and((col("seq") % lit(5_i64)).eq(lit(2_i64))),
+                "key < 6 AND seq % 5 = 2",
+                &[],
+            ),
+        ];
+        for (filter, sql, declined) in &filters {
+            for &(descending, k) in MANY_ASKS {
+                let what = format!("{sql}, descending {descending}, k {k}");
+                let got = sorted_search_where(
+                    &st,
+                    Some("key"),
+                    filter,
+                    descending,
+                    k,
+                    Some(&["_id", "seq", "key"]),
+                )
+                .expect("sorted_search_where");
+                let direction = if descending { "DESC" } else { "ASC" };
+                let want = reader
+                    .query_sql(&format!(
+                        "SELECT _id, seq, key FROM supertable WHERE {sql} ORDER BY key {direction} NULLS LAST, _id ASC LIMIT {k}"
+                    ))
+                    .expect("sql");
+                if declined.contains(&k) {
+                    assert!(
+                        ints(&want, "key").iter().any(Option::is_none),
+                        "{what}: SQL's page holds nulls"
+                    );
+                    assert!(got.is_none(), "{what}: left to the statement");
+                    continue;
+                }
+                let got = got.unwrap_or_else(|| panic!("{what}: answered by the walk"));
+                assert_eq!(ids(&got), ids(&want), "{what}");
+                assert_eq!(ints(&got, "seq"), ints(&want, "seq"), "{what}");
+                assert_eq!(ints(&got, "key"), ints(&want, "key"), "{what}");
+            }
+        }
+    }
+
+    #[test]
+    fn sorted_search_where_declines_what_the_index_cannot_answer() {
+        // Filters the walk must leave to the statement:
+        //  - a column with no range index, or two columns with none named.
+        //  - a filter keeping no row of the order with nothing bounding the column (nulls unread).
+        //  - a condition only a statement can evaluate.
+        //  - an equality on a column with thousands of distinct values, which needs more rows than
+        //    a walk reads.
+        // This test pins that each one answers `None`.
+        let dir = TempDir::new().expect("tempdir");
+        let st = table(&dir);
+        let declined: [(Option<&str>, Expr); 5] = [
+            (Some("key"), col("seq").eq(lit(5_000_i64))),
+            (Some("seq"), col("seq").gt(lit(10_i64))),
+            (
+                None,
+                col("key").gt(lit(10_i64)).and(col("seq").gt(lit(10_i64))),
+            ),
+            (Some("key"), col("seq").lt(lit(0_i64))),
+            (
+                Some("key"),
+                datafusion::logical_expr::in_subquery(
+                    col("seq"),
+                    Arc::new(
+                        datafusion::logical_expr::LogicalPlanBuilder::empty(true)
+                            .project(vec![lit(1_i64)])
+                            .and_then(|b| b.build())
+                            .expect("plan"),
+                    ),
+                ),
+            ),
+        ];
+        for (column, filter) in &declined {
+            let got = sorted_search_where(&st, *column, filter, false, 10, Some(&["_id", "key"]))
+                .expect("sorted_search_where");
+            assert!(got.is_none(), "{column:?} {filter}: left to a statement");
+        }
     }
 
     /// Every ask answers as the same sort in SQL does, row for row, before

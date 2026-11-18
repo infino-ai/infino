@@ -342,14 +342,18 @@ impl SupertableInner {
     /// The table's cached SQL schemas, built once from the immutable options.
     /// Cheap `Arc` clone on every call after the first.
     pub(super) fn sql_schemas(&self) -> Arc<SqlSchemas> {
-        let manifest = self.manifest.load();
+        self.sql_schemas_of(&self.manifest.load())
+    }
+
+    /// The SQL schemas of `manifest`, a snapshot of this table, cached by its schema id.
+    pub(super) fn sql_schemas_of(&self, manifest: &ManifestSnapshot) -> Arc<SqlSchemas> {
         let schema_id = manifest.table_schema().schema_id();
         if let Some(cached) = self.sql_schemas.load().as_ref()
             && cached.0 == schema_id
         {
             return Arc::clone(&cached.1);
         }
-        let built = Arc::new(build_sql_schemas(&manifest));
+        let built = Arc::new(build_sql_schemas(manifest));
         self.sql_schemas
             .store(Some(Arc::new((schema_id, Arc::clone(&built)))));
         built
@@ -2667,6 +2671,14 @@ impl WeakReader {
             self.op_stats.clone(),
         )))
     }
+
+    /// This handle over `manifest`, another snapshot of the same table.
+    pub(crate) fn over(&self, manifest: Arc<ManifestSnapshot>) -> Self {
+        Self {
+            manifest,
+            ..self.clone()
+        }
+    }
 }
 
 impl SupertableReader {
@@ -2885,6 +2897,12 @@ impl SupertableReader {
     /// Cached per-table SQL schemas (scan view + scalar schema).
     pub(crate) fn sql_schemas(&self) -> Arc<SqlSchemas> {
         self.inner.sql_schemas()
+    }
+
+    /// The SQL schemas of this reader's pinned snapshot, which a later schema change leaves as
+    /// they were.
+    pub(crate) fn snapshot_sql_schemas(&self) -> Arc<SqlSchemas> {
+        self.inner.sql_schemas_of(&self.manifest)
     }
 
     /// The table's value counts carried across snapshots, shared by every

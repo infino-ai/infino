@@ -121,6 +121,7 @@ use crate::{
     supertable::{
         SuperfileEntry, SupertableReader,
         error::QueryError,
+        handle::WeakReader,
         manifest::{
             ColumnStats, ManifestSnapshot, add_sum_arrays, hll::HllSketch, list::ScalarValueCounts,
             load_section_groups, load_section_groups_blocking,
@@ -511,11 +512,12 @@ pub(crate) struct SupertableProvider {
     /// above brings to this snapshot. A provider built without the table's
     /// carries its own, and merges every superfile.
     value_count_carry: Arc<ValueCountCarry>,
-    /// Set by the range top-k rule (`range_top_k`) on a scan that feeds
-    /// `ORDER BY column LIMIT k` and is filtered only on `column`: the scan
-    /// then reads only the rows the range index puts first
-    /// ([`Self::top_k_rows`]).
+    /// Set by the range top-k rule (`range_top_k`) on a scan that feeds `ORDER BY column LIMIT k`
+    /// on a range-indexed `column`: the scan then reads only the rows the index puts first, or the
+    /// rows its walk finds ([`Self::top_k_rows`]).
     top_k: Option<TopKHint>,
+    /// The reader the top-k walk reads through, held weakly as a cached session holds the provider.
+    walk_reader: WeakReader,
     /// Set by the covered-aggregate rewrite (`covered_agg`) on the scan
     /// under a `COUNT(*)` whose `WHERE` is one range on a range-indexed
     /// column: the scan then emits a row with no columns for each row the
@@ -554,6 +556,11 @@ pub(crate) struct TopKHint {
     pub(crate) k: usize,
     pub(crate) ties: bool,
     pub(crate) ties_by_id: bool,
+    /// The filters the walk checks, when they are more than one range on `column` (see
+    /// [`SupertableProvider::walked_rows`]).
+    pub(crate) walk: Option<Vec<Expr>>,
+    /// Whether rows with no value sort first: the walk answers only if a filter keeps them out.
+    pub(crate) nulls_first: bool,
 }
 
 /// Manual `Debug` (required by `TableProvider`): the cache /
@@ -624,6 +631,7 @@ impl SupertableProvider {
             scalar_value_counts: Arc::new(DashMap::new()),
             value_count_carry: Arc::default(),
             top_k: None,
+            walk_reader: WeakReader::from_reader(reader),
             count_range: None,
             read_rows: None,
             deleted_stats: Arc::default(),
@@ -703,6 +711,12 @@ impl SupertableProvider {
     /// idempotency guard.
     pub(crate) fn has_top_k(&self) -> bool {
         self.top_k.is_some()
+    }
+
+    /// The top-k hint this provider carries, for tests of the rule.
+    #[cfg(test)]
+    pub(crate) fn top_k_hint(&self) -> Option<&TopKHint> {
+        self.top_k.as_ref()
     }
 
     /// Clone of this provider for the scan under a `COUNT(*)` of `range`
@@ -798,6 +812,7 @@ impl SupertableProvider {
             scalar_value_counts: Arc::clone(&self.scalar_value_counts),
             value_count_carry: Arc::clone(&self.value_count_carry),
             top_k: self.top_k.clone(),
+            walk_reader: self.walk_reader.clone(),
             count_range: self.count_range.clone(),
             read_rows: self.read_rows.clone(),
             deleted_stats: Arc::clone(&self.deleted_stats),
@@ -812,6 +827,7 @@ impl SupertableProvider {
             .fallback_prepared
             .store(true, atomic::Ordering::Release);
         Self {
+            walk_reader: self.walk_reader.over(Arc::clone(&manifest)),
             manifest,
             prepared_scan_files: Arc::new(PreparedFiles {
                 files: DashMap::new(),
@@ -1408,9 +1424,10 @@ impl SupertableProvider {
     /// own `k`-th key is past the cutoff too). Ties broken by the id ascending
     /// are settled the same way when every survivor's range index keeps its
     /// tied rows in id order: each one's first rows by the key are then its
-    /// first by the key and the id. `None` when there is no hint,
-    /// the filters are not that one range, or a survivor has no range index
-    /// over the column: the scan then reads every row the filters admit.
+    /// first by the key and the id. A hint carrying other filters goes
+    /// to the walk instead ([`Self::walked_rows`]). `None` when there is no
+    /// hint, the filters are not that one range, or a survivor has no range
+    /// index over the column: the scan then reads every row the filters admit.
     async fn top_k_rows(
         &self,
         survivors: &[Arc<SuperfileEntry>],
@@ -1554,6 +1571,69 @@ impl SupertableProvider {
         }
         survivors.truncate(kept);
         Ok(survivors)
+    }
+
+    /// The first rows `predicates` keep in the hint's order, by file, from the range index walk
+    /// ([`SupertableReader::sorted_hits_for_scan`]). The reason it falls back, and the scan reads
+    /// every row, when:
+    ///  - the walk cannot answer, fails, or the table's reader is gone.
+    ///  - a delete the walk did not see removed a row it found (the scan's deletes decide).
+    async fn walked_rows(
+        &self,
+        survivors: &[Arc<SuperfileEntry>],
+        predicates: &[Expr],
+        hint: &TopKHint,
+        now: Instant,
+    ) -> DfResult<Result<HashMap<Uuid, RoaringBitmap>, WalkFallback>> {
+        #[cfg(test)]
+        walk_probe::walk_started(&self.manifest.superfiles);
+        let Some(reader) = self.walk_reader.upgrade() else {
+            return Ok(walk_fell_back(survivors, WalkFallback::CannotAnswer));
+        };
+        let walked = reader
+            .sorted_hits_for_scan(
+                &hint.column,
+                predicates,
+                hint.descending,
+                hint.nulls_first,
+                hint.k,
+                survivors,
+            )
+            .await;
+        #[cfg(test)]
+        let walked = walk_probe::inject(survivors, walked);
+        let hits = match walked {
+            Ok(Some(hits)) => hits,
+            Ok(None) => return Ok(walk_fell_back(survivors, WalkFallback::CannotAnswer)),
+            Err(error) => {
+                let cause = match error {
+                    QueryError::OverBudget(_) => WalkFallback::OverBudget,
+                    _ => WalkFallback::Failed,
+                };
+                debug!(%error, "the top-k walk failed");
+                return Ok(walk_fell_back(survivors, cause));
+            }
+        };
+        let ids: HashMap<_, _> = survivors
+            .iter()
+            .map(|entry| (entry.uri, entry.superfile_id))
+            .collect();
+        #[cfg(test)]
+        walk_probe::after_walk(survivors);
+        let mut rows: HashMap<Uuid, RoaringBitmap> = HashMap::new();
+        for hit in hits {
+            let Some(id) = ids.get(&hit.superfile) else {
+                return Ok(walk_fell_back(survivors, WalkFallback::Failed));
+            };
+            rows.entry(*id).or_default().insert(hit.local_doc_id);
+        }
+        for (id, found) in &rows {
+            let deleted = self.deleted_rows(*id, now)?;
+            if !found.is_disjoint(&deleted) {
+                return Ok(walk_fell_back(survivors, WalkFallback::RowDeleted));
+            }
+        }
+        Ok(Ok(rows))
     }
 
     /// Each survivor's live rows whose key lies in `lo..=hi`, from its range
@@ -1882,7 +1962,10 @@ fn id_min_max(entries: &[Arc<SuperfileEntry>]) -> Option<(ScalarValue, ScalarVal
 /// what the folds below share, so a column costs one read per superfile
 /// however many statistics the planner asks for. `None` where a
 /// superfile carries nothing for the column.
-fn read_column(entries: &[Arc<SuperfileEntry>], column: FieldId) -> Vec<Option<ColumnStats<'_>>> {
+pub(crate) fn read_column(
+    entries: &[Arc<SuperfileEntry>],
+    column: FieldId,
+) -> Vec<Option<ColumnStats<'_>>> {
     entries
         .iter()
         .map(|entry| entry.scalar_stats.column(column))
@@ -1918,7 +2001,7 @@ fn scalar_sum(reads: &[Option<ColumnStats<'_>>]) -> Option<ScalarValue> {
 /// Sketch unions are exact, so the merged estimate has single-sketch
 /// accuracy. A column null throughout every superfile has no distinct
 /// value: zero, not unknown.
-fn scalar_distinct(reads: &[Option<ColumnStats<'_>>]) -> Option<usize> {
+pub(crate) fn scalar_distinct(reads: &[Option<ColumnStats<'_>>]) -> Option<usize> {
     let mut merged: Option<HllSketch> = None;
     let mut null_throughout = false;
     for stats in reads {
@@ -2306,7 +2389,8 @@ impl TableProvider for SupertableProvider {
             && self.top_k.is_none()
             && self.count_range.is_none()
             && self.read_rows.is_none();
-        if bare_limit && self.tombstones_read.is_none() {
+        // A top-k scan reads its deletes once too, so the rows it walked are checked against them.
+        if (bare_limit || self.top_k.is_some()) && self.tombstones_read.is_none() {
             // The same provider with deletes read once, keeping this scan's store registration.
             let once = Self {
                 tombstones_read: Some(Arc::default()),
@@ -2363,6 +2447,40 @@ impl TableProvider for SupertableProvider {
         let survivor_entries = match limit {
             Some(limit) if bare_limit => self.first_holding(survivor_entries, limit, now).await?,
             _ => survivor_entries,
+        };
+
+        // A scan feeding `ORDER BY column LIMIT k` opens only the files holding the rows each range
+        // index puts first, or the rows the walk finds (see `top_k_rows`). No file, no walk.
+        let (top_k_rows, walk_note) = match &self.top_k {
+            Some(hint) if !survivor_entries.is_empty() => {
+                self.prefetch_tombstones(&survivor_entries, now).await;
+                match &hint.walk {
+                    Some(predicates) => {
+                        match self
+                            .walked_rows(&survivor_entries, predicates, hint, now)
+                            .await?
+                        {
+                            Ok(rows) => (Some(rows), Some(Arc::from("top-k walk: answered"))),
+                            Err(cause) => {
+                                let note = format!("top-k walk: fell back, {}", cause.reason());
+                                (None, Some(Arc::<str>::from(note)))
+                            }
+                        }
+                    }
+                    None => (
+                        self.top_k_rows(&survivor_entries, filters, now).await?,
+                        None,
+                    ),
+                }
+            }
+            _ => (None, None),
+        };
+        let survivor_entries = match &top_k_rows {
+            Some(rows) => survivor_entries
+                .into_iter()
+                .filter(|entry| rows.get(&entry.superfile_id).is_some_and(|r| !r.is_empty()))
+                .collect(),
+            None => survivor_entries,
         };
 
         // Nothing survived (empty table, or every superfile pruned):
@@ -2517,9 +2635,6 @@ impl TableProvider for SupertableProvider {
         }
         trace::end(open_span);
 
-        // A scan feeding `ORDER BY column LIMIT k` reads only the rows each
-        // superfile's range index puts first (see `top_k_rows`).
-        let top_k_rows = self.top_k_rows(&survivor_entries, filters, now).await?;
         let top_k_rows = &top_k_rows;
 
         // Per-superfile scan inputs, resolved into PartitionedFiles once the
@@ -2875,7 +2990,8 @@ impl TableProvider for SupertableProvider {
             });
             let wanted = |name: &str| projected.as_ref().is_none_or(|set| set.contains(name));
             let stats = self.statistics_for(&survivor_entries, &wanted);
-            if filters.is_empty() && self.read_rows.is_none() {
+            // A top-k scan emits only the rows it was handed.
+            if filters.is_empty() && self.read_rows.is_none() && self.top_k.is_none() {
                 stats
             } else {
                 stats.to_inexact()
@@ -2945,7 +3061,7 @@ impl TableProvider for SupertableProvider {
             } else {
                 MeteredExec::without_limit_pushdown(scan, op_stats)
             };
-            meter.with_note(self.scan_note.clone())
+            meter.with_note(walk_note.clone().or_else(|| self.scan_note.clone()))
         };
         let parquet: Arc<dyn ExecutionPlan> = Arc::new(
             meter(scan)
@@ -3496,7 +3612,7 @@ fn emit_value_set_leaves(
 /// Returns None unless *every* branch is `column = literal` on one shared
 /// column: a partial match like `a = 1 OR a > 5` isn't a closed value set,
 /// so pruning on the equalities alone would wrongly drop the `> 5` rows.
-fn flatten_or_eq(expr: &Expr, schema: &SchemaRef) -> Option<(String, Vec<ScalarValue>)> {
+pub(crate) fn flatten_or_eq(expr: &Expr, schema: &SchemaRef) -> Option<(String, Vec<ScalarValue>)> {
     let mut column = None;
     let mut values = Vec::new();
     collect_or_eq(expr, schema, &mut column, &mut values).then_some(())?;
@@ -3641,8 +3757,150 @@ fn flip_op(op: ScalarOp) -> ScalarOp {
     }
 }
 
+/// Why a top-k walk left its rows to the scan, shown on the scan in `EXPLAIN`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WalkFallback {
+    /// The index cannot answer exactly, or the walk read its limit of rows.
+    CannotAnswer,
+    /// A window of rows did not fit the connection's memory budget.
+    OverBudget,
+    /// A delete the walk did not see removed a row it found.
+    RowDeleted,
+    /// Any other error.
+    Failed,
+}
+
+impl WalkFallback {
+    fn reason(self) -> &'static str {
+        match self {
+            Self::CannotAnswer => "it cannot answer exactly",
+            Self::OverBudget => "a window over the memory limit",
+            Self::RowDeleted => "a row it found was deleted",
+            Self::Failed => "it failed",
+        }
+    }
+}
+
+/// Logs why the walk left its rows to the scan, which then reads every row.
+fn walk_fell_back(
+    survivors: &[Arc<SuperfileEntry>],
+    cause: WalkFallback,
+) -> Result<HashMap<Uuid, RoaringBitmap>, WalkFallback> {
+    debug!(
+        ?cause,
+        files = survivors.len(),
+        "the top-k walk left its rows to the scan"
+    );
+    #[cfg(test)]
+    walk_probe::count(survivors, cause);
+    Err(cause)
+}
+
+/// Test hooks into the top-k walk over one table, named by one of its files: run an action between
+/// the walk and its deletes check, make the walk fail, and count walks and why they fell back.
 #[cfg(test)]
-mod tests {
+pub(crate) mod walk_probe {
+    use std::{
+        collections::HashMap,
+        sync::{Arc, Mutex},
+    };
+
+    use uuid::Uuid;
+
+    use crate::supertable::{
+        SuperfileEntry,
+        error::QueryError,
+        query::{SuperfileHit, provider::WalkFallback},
+    };
+
+    /// What a test armed for the table holding a superfile.
+    #[derive(Default)]
+    struct Armed {
+        after_walk: Option<Box<dyn FnOnce() + Send>>,
+        fail_with: Option<QueryError>,
+        fallbacks: Vec<WalkFallback>,
+        walks: usize,
+    }
+
+    static ARMED: Mutex<Option<HashMap<Uuid, Armed>>> = Mutex::new(None);
+
+    fn with<T>(survivors: &[Arc<SuperfileEntry>], f: impl FnOnce(&mut Armed) -> T) -> Option<T> {
+        let mut armed = ARMED.lock().expect("probe lock");
+        let armed = armed.as_mut()?;
+        let id = survivors
+            .iter()
+            .map(|e| e.superfile_id)
+            .find(|id| armed.contains_key(id))?;
+        armed.get_mut(&id).map(f)
+    }
+
+    fn watched<T>(superfile: Uuid, f: impl FnOnce(&mut Armed) -> T) -> Option<T> {
+        ARMED
+            .lock()
+            .expect("probe lock")
+            .as_mut()?
+            .get_mut(&superfile)
+            .map(f)
+    }
+
+    /// Watch walks over the table holding `superfile`.
+    pub(crate) fn watch(superfile: Uuid) {
+        ARMED
+            .lock()
+            .expect("probe lock")
+            .get_or_insert_with(HashMap::new)
+            .insert(superfile, Armed::default());
+    }
+
+    /// Run `action` once, after the next walk over the watched table.
+    pub(crate) fn after_next_walk(superfile: Uuid, action: Box<dyn FnOnce() + Send>) {
+        watched(superfile, |a| a.after_walk = Some(action));
+    }
+
+    /// Make the next walk over the watched table fail with `error`.
+    pub(crate) fn fail_next_walk(superfile: Uuid, error: QueryError) {
+        watched(superfile, |a| a.fail_with = Some(error));
+    }
+
+    /// Walks started over the watched table.
+    pub(crate) fn walks(superfile: Uuid) -> usize {
+        watched(superfile, |a| a.walks).unwrap_or(0)
+    }
+
+    /// A walk started over the table of `files`, the table's own list as a walk can read none.
+    pub(super) fn walk_started(files: &[Arc<SuperfileEntry>]) {
+        with(files, |a| a.walks += 1);
+    }
+
+    /// Why walks over the watched table fell back, in order.
+    pub(crate) fn fallbacks(superfile: Uuid) -> Vec<WalkFallback> {
+        watched(superfile, |a| a.fallbacks.clone()).unwrap_or_default()
+    }
+
+    pub(super) fn inject(
+        survivors: &[Arc<SuperfileEntry>],
+        walked: Result<Option<Vec<SuperfileHit>>, QueryError>,
+    ) -> Result<Option<Vec<SuperfileHit>>, QueryError> {
+        match with(survivors, |a| a.fail_with.take()).flatten() {
+            Some(error) => Err(error),
+            None => walked,
+        }
+    }
+
+    pub(super) fn after_walk(survivors: &[Arc<SuperfileEntry>]) {
+        // Run outside the lock: the action may walk again.
+        if let Some(action) = with(survivors, |a| a.after_walk.take()).flatten() {
+            action();
+        }
+    }
+
+    pub(super) fn count(survivors: &[Arc<SuperfileEntry>], cause: WalkFallback) {
+        with(survivors, |a| a.fallbacks.push(cause));
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
     use std::{
         collections::HashMap,
         hash::{DefaultHasher, Hash, Hasher},
@@ -6934,7 +7192,7 @@ mod tests {
         assert_eq!(budget.charged(), 0, "each once");
     }
 
-    fn planned_files(reader: &SupertableReader, sql: &str) -> usize {
+    pub(crate) fn planned_files(reader: &SupertableReader, sql: &str) -> usize {
         // The final physical plan from `EXPLAIN VERBOSE`: the plain display lists at most 5 files a
         // group.
         let plan: String = reader
