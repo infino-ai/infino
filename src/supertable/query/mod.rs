@@ -27,6 +27,7 @@ pub mod df_object_store;
 pub mod dispatch;
 pub mod exec;
 pub(crate) mod fine_graph_cache;
+pub(crate) mod fine_graph_store;
 pub mod fts;
 #[cfg(feature = "graph-index")]
 pub mod graph;
