@@ -322,6 +322,8 @@ proptest! {
             &ordinals,
             &BuildPolicy {
                 head_stream_min_entries: 0,
+                // Objects past the spill size are written to scratch files.
+                spill_to_disk: true,
                 ..policy()
             },
         )
@@ -333,5 +335,52 @@ proptest! {
         prop_assert_eq!(&by_stream.3, &whole.3);
         prop_assert_eq!(by_stream.4, whole.4);
         check_head(whole, &all, candidates);
+    }
+
+    /// A fold that drops a superfile — a compaction's input — leaves its
+    /// documents out of the merged head, which stays sound and exact above
+    /// its floor over the documents that remain.
+    #[test]
+    fn a_fold_dropping_a_superfile_keeps_the_rest_sound(superfiles in arb_superfiles()) {
+        prop_assume!(superfiles.len() >= 2);
+        let dir = TempDir::new().expect("tempdir");
+        let contributions: Vec<Contribution> = superfiles
+            .iter()
+            .enumerate()
+            .map(|(o, (docs, depth))| contribution(dir.path(), o as u32, docs, *depth))
+            .collect();
+        let built = build(&contributions, &policy()).expect("build");
+        let source = vec![place(dir.path(), &built.root.layers[0], &built.slices, &built.tiers)];
+        // Superfile 0 is gone; the rest keep their places, one lower.
+        let ordinals: Vec<Option<u32>> = (0..superfiles.len() as u32)
+            .map(|o| o.checked_sub(1))
+            .collect();
+        for stream in [false, true] {
+            let merged = merge_layers(
+                &source,
+                &ordinals,
+                &BuildPolicy {
+                    head_stream_min_entries: if stream { 0 } else { u64::MAX },
+                    ..policy()
+                },
+            )
+            .expect("merge");
+            let (floor, _, blocks, inline, _) = head_of(&merged.layer, &merged.slices, &merged.tiers);
+            let held: BTreeSet<Doc> = blocks
+                .iter()
+                .flat_map(|b| b.entries.iter())
+                .chain(inline.iter())
+                .map(|e| (e.superfile, e.doc_id, e.tf, e.len))
+                .collect();
+            let rest: Vec<Doc> = superfiles[1..]
+                .iter()
+                .flat_map(|(d, _)| d.iter().map(|&(o, r, tf, len)| (o - 1, r, tf, len)))
+                .collect();
+            let rest_set: BTreeSet<Doc> = rest.iter().copied().collect();
+            prop_assert!(held.is_subset(&rest_set), "the dropped superfile's documents are gone");
+            for d in rest_set.difference(&held) {
+                prop_assert!(key(d) <= floor, "{d:?} left out keys above the floor");
+            }
+        }
     }
 }

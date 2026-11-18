@@ -1686,7 +1686,8 @@ impl Ord for MergeHead {
 /// A slice object past this size moves to a scratch file when the build
 /// spills: a common term's level head is gigabytes on a large table, and
 /// the object holding it is cut only after the term is written.
-const OBJECT_SPILL_BYTES: usize = 64 << 20;
+/// Small under test, so a fixture's objects take the spilled path.
+const OBJECT_SPILL_BYTES: usize = if cfg!(test) { 4 << 10 } else { 64 << 20 };
 
 /// The open slice's object as it grows — its terms' tier chunks and head
 /// levels — hashed as it is written: in memory, or past
