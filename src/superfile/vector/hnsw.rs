@@ -2669,6 +2669,12 @@ impl Hnsw {
     /// and every node's tower and neighbor lists, holes included. Two graphs
     /// with the same checksum search the same way.
     pub(crate) fn checksum(&self) -> u64 {
+        self.checksum_of(self.node_digest())
+    }
+
+    /// [`checksum`](Self::checksum) of this graph given its
+    /// [`node_digest`](Self::node_digest), without reading the nodes.
+    pub(crate) fn checksum_of(&self, node_digest: u64) -> u64 {
         let mut h = Xxh3::new();
         for word in [
             self.len as u64,
@@ -2676,17 +2682,31 @@ impl Hnsw {
             self.m0 as u64,
             self.ef_construction as u64,
             self.entry as u64,
+            node_digest,
         ] {
             h.update(&word.to_le_bytes());
         }
-        for (lists, &level) in self.neighbors.iter().zip(&self.node_level) {
-            h.update(&(lists.len() as u32).to_le_bytes());
-            h.update(&level.to_le_bytes());
-            for list in lists {
-                h.update(&(list.len() as u32).to_le_bytes());
-                for id in list {
-                    h.update(&id.to_le_bytes());
-                }
+        h.digest()
+    }
+
+    /// The sum of every node's hash. A change to some nodes moves it by
+    /// those nodes' hashes alone, so [`apply_change`](Self::apply_change)
+    /// keeps it current without reading the rest of the graph.
+    pub(crate) fn node_digest(&self) -> u64 {
+        (0..self.len).fold(0, |sum, node| sum.wrapping_add(self.node_hash(node)))
+    }
+
+    /// A hash of one node: its id, its height and its neighbor lists.
+    fn node_hash(&self, node: usize) -> u64 {
+        let lists = &self.neighbors[node];
+        let mut h = Xxh3::new();
+        h.update(&(node as u64).to_le_bytes());
+        h.update(&(lists.len() as u32).to_le_bytes());
+        h.update(&self.node_level[node].to_le_bytes());
+        for list in lists {
+            h.update(&(list.len() as u32).to_le_bytes());
+            for id in list {
+                h.update(&id.to_le_bytes());
             }
         }
         h.digest()
@@ -2740,12 +2760,21 @@ impl Hnsw {
     }
 
     /// Apply `change` to this graph, which must be the graph it was made
-    /// from. Every id the change carries is checked before the graph is
-    /// touched, and the result must hash to the change's checksum, so a
-    /// change that does not fit comes back as an error rather than a graph
-    /// that searches differently from the writer's.
-    pub(crate) fn apply_change(mut self, change: &GraphChange) -> Result<Hnsw, GraphChangeError> {
-        if self.len != change.base_len as usize || self.checksum() != change.base_checksum {
+    /// from, and return the result with its node digest. `node_digest` is
+    /// this graph's [`node_digest`](Self::node_digest), which the caller
+    /// keeps from one change to the next, so the checks read only the nodes
+    /// the change touches. Every id the change carries is checked before
+    /// the graph is touched, and the result must hash to the change's
+    /// checksum, so a change that does not fit comes back as an error
+    /// rather than a graph that searches differently from the writer's.
+    pub(crate) fn apply_change(
+        mut self,
+        change: &GraphChange,
+        node_digest: u64,
+    ) -> Result<(Hnsw, u64), GraphChangeError> {
+        if self.len != change.base_len as usize
+            || self.checksum_of(node_digest) != change.base_checksum
+        {
             return Err(GraphChangeError::WrongBase);
         }
         let len = self.len + change.appended.len();
@@ -2798,6 +2827,17 @@ impl Hnsw {
             return Err(GraphChangeError::Invalid);
         }
 
+        let mut touched: Vec<usize> = change
+            .removed
+            .iter()
+            .map(|&node| node as usize)
+            .chain(edited.iter().map(|(node, _, _)| *node))
+            .collect();
+        touched.sort_unstable();
+        touched.dedup();
+        let mut node_digest = touched.iter().fold(node_digest, |sum, &node| {
+            sum.wrapping_sub(self.node_hash(node))
+        });
         for &node in &change.removed {
             self.neighbors[node as usize] = Vec::new();
             self.node_level[node as usize] = 0;
@@ -2809,12 +2849,16 @@ impl Hnsw {
             self.node_level.push(lists.len().saturating_sub(1) as u32);
             self.neighbors.push(lists.clone());
         }
+        touched.extend(self.len..len);
         self.len = len;
         self.entry = change.entry;
-        if self.checksum() != change.checksum {
+        node_digest = touched.iter().fold(node_digest, |sum, &node| {
+            sum.wrapping_add(self.node_hash(node))
+        });
+        if self.checksum_of(node_digest) != change.checksum {
             return Err(GraphChangeError::ChecksumMismatch);
         }
-        Ok(self)
+        Ok((self, node_digest))
     }
 }
 
@@ -5429,6 +5473,12 @@ mod tests {
         assert_holes_unreachable(&compacted);
     }
 
+    /// `graph` after `change`, for a caller that has not kept its digest.
+    fn applied(graph: Hnsw, change: &GraphChange) -> Result<Hnsw, GraphChangeError> {
+        let digest = graph.node_digest();
+        graph.apply_change(change, digest).map(|(graph, _)| graph)
+    }
+
     /// One churn round on a graph with stable ids: unlink every
     /// `stride`-th live node (offset by `round`), then append `added` fresh
     /// vectors to `slots`. Returns the next generation.
@@ -5461,6 +5511,7 @@ mod tests {
         // The reader starts from the writer's base and only ever sees
         // encoded changes.
         let mut reader = writer.clone();
+        let mut digest = reader.node_digest();
         let queries = random_unit_vectors(20, CHURN_DIM, 0xF0111);
         for round in 0..rounds {
             let fresh = &pool[start + round * added..start + (round + 1) * added];
@@ -5470,8 +5521,9 @@ mod tests {
             assert!(removed > 0 && rewritten > 0 && appended == added);
             let decoded = GraphChange::from_bytes(&change.to_bytes()).expect("decode");
             assert_eq!(decoded, change);
-            reader = reader.apply_change(&decoded).expect("apply");
+            (reader, digest) = reader.apply_change(&decoded, digest).expect("apply");
             writer = next;
+            assert_eq!(digest, writer.node_digest(), "round {round}");
             assert_eq!(reader.checksum(), writer.checksum(), "round {round}");
             assert_eq!(reader.to_bytes(), writer.to_bytes(), "round {round}");
             let scorer = Sq16Scorer::from_unit_vectors(&slots, CHURN_DIM);
@@ -5496,9 +5548,15 @@ mod tests {
         let next = churn_round(base.clone(), &mut slots, &pool[n..], 7, 0);
         let change = base.diff(&next).expect("a successor");
         // Applying twice: the second base is `next`, not `base`.
-        let once = base.clone().apply_change(&change).expect("apply");
+        let once = applied(base.clone(), &change).expect("apply");
         assert_eq!(
-            once.apply_change(&change).err(),
+            applied(once, &change).err(),
+            Some(GraphChangeError::WrongBase)
+        );
+        // The right graph with a digest that is not its own.
+        let stale = base.node_digest().wrapping_add(1);
+        assert_eq!(
+            base.clone().apply_change(&change, stale).err(),
             Some(GraphChangeError::WrongBase)
         );
         // A different graph of the same length.
@@ -5507,7 +5565,7 @@ mod tests {
             HnswParams::default(),
         );
         assert_eq!(
-            other.apply_change(&change).err(),
+            applied(other, &change).err(),
             Some(GraphChangeError::WrongBase)
         );
     }
@@ -5545,7 +5603,7 @@ mod tests {
             let mut damaged = bytes.clone();
             damaged[at] ^= 0x10;
             if let Some(change) = GraphChange::from_bytes(&damaged)
-                && let Ok(graph) = base.clone().apply_change(&change)
+                && let Ok(graph) = applied(base.clone(), &change)
             {
                 assert_eq!(graph.checksum(), expected, "flip at {at} applied wrongly");
                 assert_eq!(graph.checksum(), change.checksum());
@@ -5599,9 +5657,11 @@ mod tests {
         // Two of the new nodes go again before the generation is published.
         let next = grown.unlink_nodes(&[n as u32 + 5, n as u32 + 6], &scorer);
         let change = base.diff(&next).expect("a successor");
-        let applied = base
-            .apply_change(&GraphChange::from_bytes(&change.to_bytes()).expect("decode"))
-            .expect("apply");
+        let applied = applied(
+            base,
+            &GraphChange::from_bytes(&change.to_bytes()).expect("decode"),
+        )
+        .expect("apply");
         assert_eq!(applied.checksum(), next.checksum());
         assert!(applied.is_hole(n as u32 + 5) && applied.is_hole(n as u32 + 6));
         assert_eq!(applied.live_len(), n + added - 2);
@@ -5647,10 +5707,11 @@ mod tests {
         );
         let change = graph.diff(&graph).expect("itself");
         assert_eq!(change.counts(), (0, 0, 0));
-        let applied = graph
-            .clone()
-            .apply_change(&GraphChange::from_bytes(&change.to_bytes()).expect("decode"))
-            .expect("apply");
+        let applied = applied(
+            graph.clone(),
+            &GraphChange::from_bytes(&change.to_bytes()).expect("decode"),
+        )
+        .expect("apply");
         assert_eq!(applied.to_bytes(), graph.to_bytes());
     }
 

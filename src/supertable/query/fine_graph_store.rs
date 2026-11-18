@@ -105,6 +105,20 @@ pub(crate) struct KeyedGraph {
     /// hole.
     pub(crate) keys: Vec<Option<FineNodeKey>>,
     pub(crate) graph: Hnsw,
+    /// The graph's [`Hnsw::node_digest`], kept current as steps are applied
+    /// so a step is checked without reading the whole graph.
+    node_digest: u64,
+}
+
+impl KeyedGraph {
+    pub(crate) fn new(keys: Vec<Option<FineNodeKey>>, graph: Hnsw) -> Self {
+        let node_digest = graph.node_digest();
+        Self {
+            keys,
+            graph,
+            node_digest,
+        }
+    }
 }
 
 /// A full copy of a graph: what a reader with nothing starts from. It holds
@@ -175,10 +189,7 @@ impl GraphBase {
 
     /// The graph a reader holds once it has this base and no step.
     pub(crate) fn into_graph(self) -> KeyedGraph {
-        KeyedGraph {
-            keys: self.keys.into_iter().map(Some).collect(),
-            graph: self.graph,
-        }
+        KeyedGraph::new(self.keys.into_iter().map(Some).collect(), self.graph)
     }
 }
 
@@ -219,13 +230,18 @@ impl GraphStep {
         let KeyedGraph {
             mut keys,
             graph: hnsw,
+            node_digest,
         } = graph;
-        let hnsw = hnsw.apply_change(&self.change)?;
+        let (hnsw, node_digest) = hnsw.apply_change(&self.change, node_digest)?;
         for &node in self.change.removed() {
             keys[node as usize] = None;
         }
         keys.extend_from_slice(&self.appended_keys);
-        Ok(KeyedGraph { keys, graph: hnsw })
+        Ok(KeyedGraph {
+            keys,
+            graph: hnsw,
+            node_digest,
+        })
     }
 
     /// The step as bytes: magic, the appended keys, then the graph's change.
@@ -333,7 +349,7 @@ impl GraphHead {
     pub(crate) fn describes(&self, graph: &KeyedGraph) -> bool {
         graph.keys.len() == graph.graph.len()
             && graph.graph.len() as u64 == self.slots
-            && graph.graph.checksum() == self.checksum
+            && graph.graph.checksum_of(graph.node_digest) == self.checksum
     }
 
     /// Put the current generation together from the decoded `base` and
@@ -523,10 +539,10 @@ mod tests {
     /// A writer's graph over the first `nodes` test centroids.
     fn built(vectors: &[Vec<f32>], nodes: usize) -> KeyedGraph {
         let scorer = Sq16Scorer::from_unit_vectors(&vectors[..nodes], DIM);
-        KeyedGraph {
-            keys: (0..nodes).map(|i| Some(key(i))).collect(),
-            graph: Hnsw::build_serial(&scorer, HnswParams::default()),
-        }
+        KeyedGraph::new(
+            (0..nodes).map(|i| Some(key(i))).collect(),
+            Hnsw::build_serial(&scorer, HnswParams::default()),
+        )
     }
 
     /// The writer's next generation: `CHURN` live nodes removed and `CHURN`
@@ -551,7 +567,7 @@ mod tests {
             .clone()
             .unlink_nodes(&removed, &scorer)
             .extend_serial(&scorer_after, HnswParams::default());
-        KeyedGraph { keys, graph: hnsw }
+        KeyedGraph::new(keys, hnsw)
     }
 
     /// A reader that has only the stored bytes (the head, the base and each
