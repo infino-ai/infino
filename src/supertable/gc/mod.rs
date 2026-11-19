@@ -1134,7 +1134,9 @@ mod tests {
             &Sq16Scorer::from_unit_vectors(&vectors, 4),
             HnswParams::default(),
         );
-        let keys = (0..4).map(|i| (Uuid::from_u128(1), None, i)).collect();
+        let keys = (0..4)
+            .map(|i| Some((Uuid::from_u128(1), None, i)))
+            .collect();
         let base = GraphBase::new(keys, graph).expect("base");
         let base_hash = ContentHash::of(b"base");
         let step_hash = ContentHash::of(b"step");

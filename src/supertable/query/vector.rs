@@ -1965,9 +1965,6 @@ pub(crate) async fn publish_centroid_router_section(
     // these fixed bytes). Parallel keeps the one-time publish cheap.
     let column_id = manifest.field_id(column)?;
     let superfile_ids = || entries.iter().map(|entry| &entry.superfile_id);
-    if as_steps && fine_graph_publish::base_due(GraphRole::Router, column_id, superfile_ids()) {
-        fine_graph_cache::forget(GraphRole::Router, column_id, superfile_ids());
-    }
     let router = match build_centroid_router(
         entries,
         &readers,
@@ -12468,8 +12465,7 @@ mod tests {
                     ss,
                 )
                 .expect("router build")
-                .node_map
-                .len()
+                .live_nodes
             };
 
             let full = node_count(None);
@@ -12748,7 +12744,7 @@ mod tests {
                 first_keys.iter().copied().map(Some).collect();
             let first_scorer = first.scorer(&first_nodes);
             let first_graph = Hnsw::build_serial(&first_scorer, HnswParams::default());
-            let base = GraphBase::new(first_keys.clone(), first_graph.clone()).expect("base");
+            let base = GraphBase::new(first_nodes.clone(), first_graph.clone()).expect("base");
             let (base_hash, base_len) = publish(base.to_bytes()).await;
             let first_head = GraphHead::of_base(
                 GraphRole::Router,
