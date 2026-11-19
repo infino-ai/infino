@@ -1044,6 +1044,16 @@ pub(crate) mod test_support {
             .count()
     }
 
+    /// Entries `store` would let go of now: the ones a pass over budget drops (see
+    /// `DiskCacheStore::reclaimable_lazy_entry`).
+    pub(crate) fn reclaimable_lazy_entries(store: &DiskCacheStore) -> usize {
+        store
+            .cached
+            .iter()
+            .filter(|entry| store.reclaimable_lazy_entry(entry.key(), entry.value()))
+            .count()
+    }
+
     /// How long [`wait_until`] waits before it fails.
     pub(crate) const WAIT_UNTIL_DEADLINE: Duration = Duration::from_secs(10);
 
