@@ -91,7 +91,7 @@ use crate::supertable::{
         disk_cache::{CachePin, MetadataDiskCache},
         encoding::stats_ipc_options,
         hll::{HLL_REGISTERS, HllSketch},
-        list::{ScalarStatsAgg, ScalarValueCounts},
+        list::{ScalarStatsAgg, ScalarValueCounts, value_order},
         part::{ContentHash, PartId},
     },
     schema::FieldId,
@@ -217,7 +217,7 @@ const SKETCH_KEPT_ENTRIES: usize = HLL_REGISTERS / size_of::<u64>() + 1;
 /// One column's statistics for one superfile, read in place from the
 /// decoded group: each accessor reads the one array it needs. The value
 /// table alone is built on request, since building it converts every
-/// value, and the pruner and the planner's statistics never need it.
+/// value; an `=` or `IN` reads it to skip a file ([`ColumnStats::literal_count`]).
 #[derive(Clone, Copy)]
 pub struct ColumnRow<'a> {
     group: &'a Group,
@@ -349,6 +349,10 @@ impl ColumnRow<'_> {
 /// `=` and `IN` literals cast once to a column's type, as SQL's own `IN` set test: built per
 /// statement, read per file by [`ColumnStats::literal_count`].
 pub(crate) struct ExactLiterals {
+    /// The literals in [`value_order`], distinct, for a decoded table's search
+    /// ([`ScalarValueCounts::rows_holding`]).
+    values: Vec<ScalarValue>,
+    /// How a section's table is tested.
     find: FindLiterals,
     column_type: DataType,
 }
@@ -373,9 +377,13 @@ enum FindLiterals {
 const FEW_LITERALS: usize = 8;
 
 impl ExactLiterals {
-    /// `None` when SQL would compare a literal by casting the column (a number against a string
-    /// column), or when no literal is left after dropping nulls, which `=` never matches.
+    /// `None` for a float column (`=` on floats is not value identity: `-0.0` and `0.0`, `NaN`),
+    /// when SQL would compare a literal by casting the column (a number against a string column),
+    /// or when no literal is left after dropping nulls, which `=` never matches.
     pub(crate) fn new(literals: &[ScalarValue], column_type: &DataType) -> Option<Self> {
+        if column_type.is_floating() {
+            return None;
+        }
         let mut values = Vec::with_capacity(literals.len());
         for literal in literals {
             if !compares_as_column(column_type, &literal.data_type()) {
@@ -389,6 +397,8 @@ impl ExactLiterals {
         if values.is_empty() {
             return None;
         }
+        values.sort_by(value_order);
+        values.dedup();
         let find = match values.len() <= FEW_LITERALS {
             true => FindLiterals::Each(
                 values
@@ -402,7 +412,7 @@ impl ExactLiterals {
                     column_type.clone(),
                     false,
                 )]));
-                let array = ScalarValue::iter_to_array(values).ok()?;
+                let array = ScalarValue::iter_to_array(values.iter().cloned()).ok()?;
                 let in_set = InListExpr::try_new_from_array(
                     col(VALUE_FIELD, &schema).ok()?,
                     array,
@@ -414,9 +424,15 @@ impl ExactLiterals {
             }
         };
         Some(Self {
+            values,
             find,
             column_type: column_type.clone(),
         })
+    }
+
+    /// How many distinct values are asked for.
+    pub(crate) fn distinct_count(&self) -> usize {
+        self.values.len()
     }
 
     /// Which of a table's `values` are among the literals, `None` when they can't be compared.
@@ -449,16 +465,9 @@ impl ExactLiterals {
 fn compares_as_column(column_type: &DataType, literal_type: &DataType) -> bool {
     match comparison_coercion(column_type, literal_type) {
         Some(common) if &common == column_type => true,
-        Some(common) => is_string(&common) && is_string(column_type),
+        Some(common) => common.is_string() && column_type.is_string(),
         None => false,
     }
-}
-
-fn is_string(data_type: &DataType) -> bool {
-    matches!(
-        data_type,
-        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
-    )
 }
 
 /// One column's statistics for one superfile, wherever they live, read
@@ -466,7 +475,8 @@ fn is_string(data_type: &DataType) -> bool {
 /// are read from the decoded group's arrays. Only [`Self::value_counts`]
 /// builds anything, so the pruner, the planner's statistics and the
 /// rollup fold, which read bounds, counts, sums and sketches, cost one
-/// array read each per superfile and column.
+/// array read each per superfile and column. An `=` or `IN` also builds a
+/// section's value table into a batch ([`Self::literal_count`]).
 #[derive(Clone, Copy)]
 pub enum ColumnStats<'a> {
     Inline(&'a ScalarStatsAgg),
@@ -555,9 +565,9 @@ impl ColumnStats<'_> {
     }
 
     /// The exact value table as a struct array of values and counts, for
-    /// the encoder: a section's row is carried over as it is, a decoded
-    /// table is built into one. `None` when the superfile carries no
-    /// table, or the table's values are not of `data_type`.
+    /// the encoder and a section's [`Self::literal_count`]: a section's row
+    /// is carried over as it is, a decoded table is built into one. `None`
+    /// when the superfile carries no table, or its values are not of `data_type`.
     fn value_table_array(&self, data_type: &DataType) -> Option<ArrayRef> {
         let item = match self {
             Self::Inline(agg) => {
@@ -591,14 +601,15 @@ impl ColumnStats<'_> {
         }
     }
 
-    /// The rows the exact value table counts for `literals`; `None` when the file has no table or
-    /// its table is in another type.
+    /// The rows the exact value table counts for `literals`; `None` when the file has no table, its
+    /// table is in another type, a stored table is malformed (empty, a null or zero count), or the
+    /// counts sum past u64. An in-memory table is checked once, when it is built.
     pub(crate) fn literal_count(&self, literals: &ExactLiterals) -> Option<u64> {
-        // A float table, should one appear, settles nothing: `=` on floats is not value identity.
-        if literals.column_type.is_floating() {
-            return None;
-        }
-        let table = self.value_table_array(&literals.column_type)?;
+        let table = match self {
+            // A decoded table is sorted by value: it is searched in place, nothing built.
+            Self::Inline(agg) => return agg.value_counts.as_ref()?.rows_holding(&literals.values),
+            Self::Section(_) => self.value_table_array(&literals.column_type)?,
+        };
         let table = table.as_struct_opt()?;
         let counts = table.column(1).as_primitive_opt::<UInt64Type>()?;
         // A file's own table is never empty and has no null or zero count; else keep the file.
@@ -1658,7 +1669,7 @@ pub fn rows_from_entries(entries: &[Arc<SuperfileEntry>]) -> Vec<SummaryRow<'_>>
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{fs, iter::repeat_n};
 
     use arrow_array::{Decimal128Array, Float64Array, Int64Array, StringArray};
     use tempfile::TempDir;
@@ -2558,6 +2569,48 @@ mod tests {
             .collect();
         let literals = ExactLiterals::new(&literals, &DataType::Int64).expect("int literals");
         stats.literal_count(&literals)
+    }
+
+    /// [`ColumnStats::literal_count`] of `literals` over an in-memory table of `entries`.
+    fn inline_literal_count(entries: &[(i64, u64)], literals: &[i64]) -> Option<u64> {
+        let rows: Vec<i64> = entries
+            .iter()
+            .flat_map(|(value, count)| repeat_n(*value, *count as usize))
+            .collect();
+        let stats = stats_of(Arc::new(Int64Array::from(rows)));
+        let literals: Vec<ScalarValue> = literals
+            .iter()
+            .map(|value| ScalarValue::Int64(Some(*value)))
+            .collect();
+        let literals = ExactLiterals::new(&literals, &DataType::Int64).expect("int literals");
+        ColumnStats::Inline(&stats).literal_count(&literals)
+    }
+
+    #[test]
+    fn an_in_memory_table_counts_as_its_stored_copy() {
+        // One table with counts 2, 3 and 4, read in memory and as a stored section:
+        //  - fewer literals than values search the table; more literals are searched instead.
+        //  - a literal asked twice counts once, and a value the table lacks counts 0.
+        // This test pins that both shapes count every list of literals alike.
+        let table = [(1, 2), (2, 3), (9, 4)];
+        for (literals, rows) in [
+            (&[1, 2][..], 5),
+            (&[2, 2][..], 3),
+            (&[7][..], 0),
+            (&[9, 1, 3, 5, 0][..], 6),
+            (&[0, 3, 4, 5, 6][..], 0),
+        ] {
+            assert_eq!(
+                inline_literal_count(&table, literals),
+                Some(rows),
+                "in memory {literals:?}"
+            );
+            assert_eq!(
+                persisted_literal_count(&table, literals),
+                Some(rows),
+                "stored {literals:?}"
+            );
+        }
     }
 
     #[test]

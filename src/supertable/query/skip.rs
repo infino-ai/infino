@@ -1495,17 +1495,31 @@ mod tests {
     /// A file whose exact value table counts none of an `=` or `IN` literal is skipped, even
     /// inside its min/max bounds.
     mod exact_values {
-        use arrow_array::Float64Array;
+        use arrow_array::{BooleanArray, Decimal128Array, Float64Array};
 
         use super::*;
         use crate::supertable::manifest::list::ScalarValueCounts;
 
-        /// A table with an integer, a string and a float column.
+        /// The precision and scale of the decimal column `d`.
+        const DECIMAL_PRECISION: u8 = 10;
+        const DECIMAL_SCALE: i8 = 2;
+        /// A scale other than the column's, which SQL compares by casting to a wider decimal.
+        const OTHER_SCALE: i8 = 1;
+        /// 1.7 at [`OTHER_SCALE`]: inside `d`'s bounds and in none of its values.
+        const SEVENTEEN_TENTHS: i128 = 17;
+
+        /// A table with an integer, a string, a float, a decimal and a boolean column.
         fn manifest() -> ManifestSnapshot {
             let schema = Arc::new(Schema::new(vec![
                 Field::new("k", DataType::Int64, false),
                 Field::new("s", DataType::LargeUtf8, false),
                 Field::new("f", DataType::Float64, false),
+                Field::new(
+                    "d",
+                    DataType::Decimal128(DECIMAL_PRECISION, DECIMAL_SCALE),
+                    false,
+                ),
+                Field::new("b", DataType::Boolean, false),
             ]));
             ManifestSnapshot::empty(Arc::new(
                 SupertableOptions::new(schema, vec![], vec![]).expect("opts"),
@@ -1576,6 +1590,8 @@ mod tests {
 
         #[test]
         fn a_file_without_a_table_keeps_its_min_max_answer() {
+            // A file with bounds 0..=10 and no table, as one past its value-table budget has.
+            // This test pins that only its bounds decide.
             let m = manifest();
             let mut e = empty_superfile();
             e.scalar_stats.insert(
@@ -1595,13 +1611,13 @@ mod tests {
 
         #[test]
         fn literals_the_table_cannot_settle_keep_the_file() {
-            let m = manifest();
-            let files = vec![ints(&m, &[0, 5, 10])];
             // A file holding 0, 5 and 10 stays for anything the table cannot settle:
             //  - a null literal alone, and a string the column type cannot take.
             //  - `'5'`, which SQL compares as the number 5, which the file holds.
             //  - `!=` and `<` on 7, inside the bounds and not in the table.
             // This test pins that only an exact `=` can skip a file.
+            let m = manifest();
+            let files = vec![ints(&m, &[0, 5, 10])];
             assert_eq!(
                 scalar_value_set_skip(&m, &files, id(&m, "k"), &[ScalarValue::Int64(None)]),
                 vec![true]
@@ -1676,9 +1692,65 @@ mod tests {
         }
 
         #[test]
+        fn decimal_and_boolean_tables_skip_like_integers() {
+            // A decimal column holding 1.50 and 2.00, and a boolean column holding only `true`:
+            //  - `d = 1.75` at the column's scale is inside the bounds and not in the table.
+            //  - `d = 1.7` at scale 1 coerces to another decimal type, so the file is kept.
+            //  - `b = false` inside a file's bounds is not in its table of `true`; `b = true` is.
+            // This test pins the skip for the other counted types, and the scale refusal.
+            let m = manifest();
+            let dec = |cents: i128| {
+                ScalarValue::Decimal128(Some(cents), DECIMAL_PRECISION, DECIMAL_SCALE)
+            };
+            let bounds = |cents: i128| -> ArrayRef {
+                Arc::new(
+                    Decimal128Array::from(vec![cents])
+                        .with_precision_and_scale(DECIMAL_PRECISION, DECIMAL_SCALE)
+                        .expect("decimal"),
+                )
+            };
+            let decimals = vec![file(
+                &m,
+                "d",
+                vec![dec(150), dec(200)],
+                bounds(150),
+                bounds(200),
+            )];
+            assert_eq!(
+                scalar_value_set_skip(&m, &decimals, id(&m, "d"), &[dec(175)]),
+                vec![false]
+            );
+            assert_eq!(
+                scalar_value_set_skip(&m, &decimals, id(&m, "d"), &[dec(150)]),
+                vec![true]
+            );
+            let one_place =
+                ScalarValue::Decimal128(Some(SEVENTEEN_TENTHS), DECIMAL_PRECISION, OTHER_SCALE);
+            assert_eq!(
+                scalar_value_set_skip(&m, &decimals, id(&m, "d"), &[one_place]),
+                vec![true]
+            );
+            let flag = |v: bool| ScalarValue::Boolean(Some(v));
+            let bound = |v: bool| -> ArrayRef { Arc::new(BooleanArray::from(vec![v])) };
+            let booleans = vec![file(&m, "b", vec![flag(true)], bound(false), bound(true))];
+            assert_eq!(
+                scalar_value_set_skip(&m, &booleans, id(&m, "b"), &[flag(false)]),
+                vec![false]
+            );
+            assert_eq!(
+                scalar_value_set_skip(&m, &booleans, id(&m, "b"), &[flag(true)]),
+                vec![true]
+            );
+        }
+
+        #[test]
         fn a_float_column_carries_no_value_table() {
             // `=` on floats is not value identity (`-0.0` and `0.0`, `NaN`).
-            // This test pins that no float table is built, so it fails first if one ever is.
+            // This test pins that no float table is built and no float literal is looked up.
+            assert!(
+                ExactLiterals::new(&[ScalarValue::Float64(Some(0.5))], &DataType::Float64)
+                    .is_none()
+            );
             assert!(
                 ScalarValueCounts::from_entries(vec![(ScalarValue::Float64(Some(0.0)), 1)])
                     .is_none()
@@ -1706,6 +1778,10 @@ mod tests {
 
         #[test]
         fn strings_match_exactly_and_by_case() {
+            // A string column holding `apple` and `pear`:
+            //  - `banana` and `Apple` are inside its bounds and not in its table.
+            //  - a Utf8 or Utf8View literal compares with the LargeUtf8 column by its bytes.
+            // This test pins exact, case-sensitive matching across the string types.
             let m = manifest();
             let s = |v: &str| ScalarValue::LargeUtf8(Some(v.to_string()));
             let files = vec![file(
@@ -1756,10 +1832,17 @@ mod tests {
 
         use super::*;
         use crate::{
-            IndexSpec,
+            CompactionSettings, IndexSpec, OptimizeOptions,
             catalog::{Connection, connect},
             runtime_metrics::op_stats::with_op_stats,
         };
+
+        /// The merge target for the optimize test, in MiB: far above three small files.
+        const MERGE_TARGET_MB: u64 = 1;
+        /// The least fill a merge accepts: any, so the three small files merge.
+        const MERGE_MIN_FILL_PERCENT: u8 = 1;
+        /// Files a merge needs: fewer than the three written.
+        const MERGE_MIN_FILES: u64 = 2;
 
         /// Three files whose `k` bounds overlap: 1..=9 holding 5, 1..=9 without 5, and 2..=3.
         const FILES: &[&[i64]] = &[&[1, 5, 9], &[1, 4, 9], &[2, 3]];
@@ -1869,9 +1952,11 @@ mod tests {
         }
 
         #[test]
-        fn statements_the_check_does_not_take_keep_what_min_max_keeps() {
-            // NOT IN, a range, a mixed OR and an OR of ranges never reach the table.
-            // This test pins that they keep what min/max keeps.
+        fn a_mixed_or_reads_the_table_and_ranges_keep_what_min_max_keeps() {
+            // NOT IN, a range and an OR of ranges never reach the table; a mixed OR's `=` does:
+            //  - `k = 5 OR k > 8`: `k > 8` keeps both 1..=9 files anyway.
+            //  - `k = 5 OR k > 9`: no file passes `k > 9`, so the table alone narrows `k = 5`.
+            // This test pins the files kept for each, and the table inside an OR branch.
             let (_dir, db) = table();
             assert_eq!(
                 run(&db, "SELECT k FROM t WHERE k NOT IN (5)"),
@@ -1884,7 +1969,12 @@ mod tests {
             assert_eq!(
                 run(&db, "SELECT k FROM t WHERE k = 5 OR k > 8"),
                 (expected(|k| k == 5 || k > 8), 2),
-                "a mixed OR is no value set: both 1..=9 files stay"
+                "`k > 8` keeps both 1..=9 files"
+            );
+            assert_eq!(
+                run(&db, "SELECT k FROM t WHERE k = 5 OR k > 9"),
+                (expected(|k| k == 5 || k > 9), 1),
+                "the `k = 5` branch reads the table"
             );
             assert_eq!(
                 run(
@@ -1900,19 +1990,52 @@ mod tests {
         fn deleted_rows_cannot_make_a_skip_wrong() {
             // Delete every 5, then ask for 5, 1, and 4 or 5:
             //  - a table still counts the deleted rows, so it can only keep a file too many.
-            // This test pins the rows after a delete.
+            // This test pins the rows after a delete, and that the file that held 5 is still read.
             let (_dir, db) = table();
             db.open_table("t")
                 .expect("t")
                 .delete(col("k").eq(lit(5i64)))
                 .expect("delete");
-            assert_eq!(run(&db, "SELECT k FROM t WHERE k = 5").0, Vec::<i64>::new());
+            assert_eq!(
+                run(&db, "SELECT k FROM t WHERE k = 5"),
+                (Vec::<i64>::new(), 1)
+            );
             assert_eq!(
                 run(&db, "SELECT k FROM t WHERE k = 1").0,
                 vec![1, 1],
                 "the other value of both files"
             );
             assert_eq!(run(&db, "SELECT k FROM t WHERE k IN (4, 5)").0, vec![4]);
+        }
+
+        #[test]
+        fn a_merged_file_keeps_an_exact_table() {
+            // The three files merged into one whose bounds are 1..=9 and whose table holds
+            // 1, 2, 3, 4, 5 and 9:
+            //  - `k IN (4, 5)` reads the merged file and returns both values.
+            //  - `k = 6` lies inside the bounds and in no row, so no file is read.
+            // This test pins that a merge keeps the table exact.
+            let (_dir, db) = table();
+            let settings = CompactionSettings {
+                target_superfile_size_mb: MERGE_TARGET_MB,
+                min_fill_percent: MERGE_MIN_FILL_PERCENT,
+                min_superfiles_for_merge: MERGE_MIN_FILES,
+                ..CompactionSettings::default()
+            };
+            db.open_table("t")
+                .expect("t")
+                .optimize(&OptimizeOptions::compact(settings))
+                .expect("optimize");
+            let (_, stats) = with_op_stats(|| db.query_sql("SELECT k FROM t").expect("query"));
+            assert_eq!(stats.superfiles_considered, 1, "the three files merged");
+            assert_eq!(
+                run(&db, "SELECT k FROM t WHERE k IN (4, 5)"),
+                (expected(|k| k == 4 || k == 5), 1)
+            );
+            assert_eq!(
+                run(&db, "SELECT k FROM t WHERE k = 6"),
+                (Vec::<i64>::new(), 0)
+            );
         }
     }
 }
