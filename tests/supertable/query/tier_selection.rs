@@ -568,15 +568,19 @@ fn an_unreadable_tier_leaves_the_query_to_its_ceilings() {
     }
 }
 
-/// With the learned gate on, a table whose terms carry level heads is
-/// served by them on every ask: the gate weighs only the tier merge of
-/// layers built before level heads, so every ask reads the heads and
-/// answers the same.
+/// Asks of one query on one handle: more than the gate's measuring
+/// phase, in which it alternates with and without the index's reads.
+const GATED_ASKS: usize = 20;
+
+/// With the learned gate on, the level heads are weighed as the tier merge
+/// is: within one open window the gate measures asks with the heads and
+/// without them before it settles, so some asks read the heads and some do
+/// not, and every one answers the same.
 ///
-/// The handle opens every superfile in one window, where the gate would
-/// otherwise have had a choice to make.
+/// The handle opens every superfile in one window, where the gate has a
+/// choice to make.
 #[test]
-fn the_learned_gate_leaves_the_level_heads_to_serve_every_ask() {
+fn the_learned_gate_weighs_the_level_heads_and_answers_the_same() {
     let with_dir = TempDir::new().expect("tempdir");
     let without_dir = TempDir::new().expect("tempdir");
     let gated = Build {
@@ -599,17 +603,19 @@ fn the_learned_gate_leaves_the_level_heads_to_serve_every_ask() {
             )
             .expect("open");
             let (expected, _, _) = run(&without, query, mode, k);
-            for _ in 0..20 {
+            let mut served = 0usize;
+            for _ in 0..GATED_ASKS {
                 let (a, stats, _) = run_once(&with, query, mode, k);
                 assert_eq!(
                     a, expected,
                     "{query:?} {mode:?} k={k}: same answer every time"
                 );
-                assert!(
-                    stats.tier_entries > 0,
-                    "{query:?} {mode:?} k={k}: the heads served the ask"
-                );
+                served += usize::from(stats.tier_entries > 0);
             }
+            assert!(
+                served > 0 && served < GATED_ASKS,
+                "{query:?} {mode:?} k={k}: the gate measured both ways ({served} of {GATED_ASKS} read the heads)"
+            );
         }
     }
 }

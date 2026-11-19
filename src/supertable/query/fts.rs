@@ -1664,25 +1664,30 @@ impl SupertableReader {
         // decide how deep it reads. Within a window the table's learned
         // call stands.
         let forced = tiers_serve && kept.len() > manifest.options.ordered_open_window();
+        // Whether the index chooses this query's superfiles before any
+        // open: forced past one window, else the table's learned call for
+        // the class, which times the search with the index's reads against
+        // without them and keeps the cheaper. Level heads take the same
+        // call as tiers: on a table whose opens are cheap — warm, or few
+        // superfiles — reading a level per term and layer can cost more
+        // than the opens it saves, and only the measured walls say which.
+        let merge_now =
+            tiers_serve && (forced || !learned || self.tier_policy().merge(policy_class));
         // A term index with level heads for every term the query scores
-        // chooses the superfiles before any open, whatever the gate learned:
-        // its reads are a level per term and layer, not a block per term
-        // per superfile. A query whose scope admits only some rows keeps
-        // the ceilings' path, as it does without heads: the k-th score over
-        // every row is no floor for the admitted ones. A `WHERE` that only
-        // chooses superfiles is ranked over their rows and its predicate
-        // applied by the widening fill, as the tiers serve it. A negated
-        // query is bounded by its positive terms only, and takes the
-        // ceilings' path too.
+        // serves a merge from them. A query whose scope admits only some
+        // rows keeps the ceilings' path, as it does without heads: the k-th
+        // score over every row is no floor for the admitted ones. A `WHERE`
+        // that only chooses superfiles is ranked over their rows and its
+        // predicate applied by the widening fill, as the tiers serve it. A
+        // negated query is bounded by its positive terms only, and takes
+        // the ceilings' path too.
         let every_row = !rows_scoped && negatives.is_empty() && negative_phrases.is_empty();
-        let heads_serve = match (index_serves && every_row, index_column) {
+        let heads_serve = match (merge_now && every_row, index_column) {
             (true, Some((index, column_id))) => heads::available(index, column_id, &all_terms)
                 .await
                 .unwrap_or(false),
             _ => false,
         };
-        let merge_now = heads_serve
-            || (tiers_serve && (forced || !learned || self.tier_policy().merge(policy_class)));
         // The deny sets, resolved only for a merge: it reads past the
         // deleted rows, and the units then admit rows by the same sets, so
         // a delete committed between the two reads cannot leave the
