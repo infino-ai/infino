@@ -775,7 +775,6 @@ impl Selection<'_> {
                 round_entries,
                 candidates: self.candidates.len() as u64,
                 in_play: in_play as u64,
-                first: self.rounds == 0,
                 open_cost_ns: self.open_cost_ns,
                 entry_cost_ns: self.entry_cost_ns,
             };
@@ -912,8 +911,6 @@ struct RoundPrice {
     candidates: u64,
     /// Superfiles still in play: the opens the round could save.
     in_play: u64,
-    /// Whether no round has been read yet.
-    first: bool,
     /// The table's measured cost of one open; zero when not yet known.
     open_cost_ns: u64,
     /// The table's measured cost of one entry; zero when not yet known.
@@ -922,15 +919,18 @@ struct RoundPrice {
 
 impl RoundPrice {
     /// Whether the round is worth reading: never past
-    /// [`HEAD_READ_BUDGET_ENTRIES`]; the first round, a block per head,
-    /// always, since it finds the threshold and answers a rare term from
-    /// the index; after it, only while the round costs no more than every
-    /// open still in play at this table's measured costs.
+    /// [`HEAD_READ_BUDGET_ENTRIES`], and only while it costs no more than
+    /// every open still in play at this table's measured costs — the first
+    /// round, a block per head, included. On a table whose opens are cheap
+    /// (warm, few superfiles opened together) a many-term query's first
+    /// round costs more than the opens it could save, and the opens then
+    /// settle the query alone. Until both costs are measured every round is
+    /// read.
     fn worth_reading(&self) -> bool {
         if self.entries_read + self.round_entries > HEAD_READ_BUDGET_ENTRIES {
             return false;
         }
-        if self.first || self.open_cost_ns == 0 || self.entry_cost_ns == 0 {
+        if self.open_cost_ns == 0 || self.entry_cost_ns == 0 {
             return true;
         }
         (self.round_entries + self.candidates).saturating_mul(self.entry_cost_ns)
@@ -1640,7 +1640,7 @@ mod tests {
     /// Proptest cases per property.
     const CASES: u32 = 256;
 
-    /// A round priced at the given work and costs, after the first.
+    /// A round priced at the given work and costs.
     fn round(
         round_entries: u64,
         candidates: u64,
@@ -1653,7 +1653,6 @@ mod tests {
             round_entries,
             candidates,
             in_play,
-            first: false,
             open_cost_ns: open,
             entry_cost_ns: entry,
         }
@@ -1717,16 +1716,17 @@ mod tests {
         assert!(!round(1_000, 200_000, 10, 1_000_000, 100).worth_reading());
         // Warm opens of microseconds: a large round is not worth them.
         assert!(!round(100_000, 0, 200, 5_000, 100).worth_reading());
+        // Nor is a first round, nothing read and no candidate held: ten
+        // terms' blocks over twenty layers at a microsecond an entry,
+        // against 48 warm opens of 20 µs that run together.
+        assert!(!round(12_800, 0, 48, 20_000, 1_000).worth_reading());
         // Costs not yet measured: read.
         assert!(round(100_000, 0, 1, 0, 100).worth_reading());
         assert!(round(100_000, 0, 1, 1_000, 0).worth_reading());
     }
 
     #[test]
-    fn the_first_round_is_always_read_and_no_round_past_the_budget() {
-        let mut first = round(4_096, 0, 0, 1_000, 1_000_000);
-        first.first = true;
-        assert!(first.worth_reading(), "the first round finds the threshold");
+    fn no_round_is_read_past_the_budget() {
         let mut past = round(2, 0, 1_000, u64::MAX, 1);
         past.entries_read = HEAD_READ_BUDGET_ENTRIES - 1;
         assert!(!past.worth_reading(), "past the budget nothing is read");

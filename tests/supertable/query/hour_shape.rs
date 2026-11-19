@@ -283,11 +283,13 @@ fn a_table_past_the_open_window_always_merges() {
 }
 
 /// Within one window the learned gate weighs the level heads as it would a
-/// tier merge, trying both ways before it settles. Every run answers the
-/// same, and a run the heads serve opens a handful of the superfiles a
-/// single term ties in, never the table.
+/// tier merge, trying both ways before it settles, and the heads read only
+/// the rounds this table's measured costs say are worth it. Every run
+/// answers the same. How many superfiles a run opens follows the measured
+/// costs, so it is not asserted here; past one window it is (see
+/// `a_table_past_the_open_window_always_merges`).
 #[test]
-fn a_table_within_the_window_weighs_the_heads_and_they_open_a_handful() {
+fn a_table_within_the_window_weighs_the_heads_and_answers_the_same() {
     let p = pair(Shape {
         tiers: true,
         depth: None,
@@ -299,14 +301,7 @@ fn a_table_within_the_window_weighs_the_heads_and_they_open_a_handful() {
         let (a, stats) = ranked(&p.with, "python", 10);
         let (b, _) = ranked(&p.without, "python", 10);
         assert_eq!(a, b, "run {run}: the heads must not change the answer");
-        if stats.tier_entries > 0 {
-            served += 1;
-            let n = opened(&stats);
-            assert!(
-                n <= TIED_TERM_OPENS,
-                "run {run}: opened {n} of {SUPERFILES} superfiles"
-            );
-        }
+        served += usize::from(stats.tier_entries > 0);
     }
     assert!(
         served > 0 && served < GATE_REPEATS,
