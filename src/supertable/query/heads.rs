@@ -709,9 +709,11 @@ impl ProbeStage<'_> {
             plan,
             left,
         } = self;
+        let first_superfiles = plan.len();
         let mut probes = state.probe_wave(plan).await?;
         let (mut theta, mut bounds) = state.settle();
         let mut waves = 1;
+        let mut second_superfiles = 0;
         // The first wave read the best candidates. Where they held too few
         // of the query's documents for a threshold, or one that rules no
         // superfile out, the rest would cost their reads and change no open.
@@ -719,11 +721,16 @@ impl ProbeStage<'_> {
         if theta.is_finite() && state.probes_can_pay(&ubs, theta) {
             let plan = state.probe_plan(theta, left);
             if !plan.is_empty() {
+                second_superfiles = plan.len();
                 probes += state.probe_wave(plan).await?;
                 (theta, bounds) = state.settle();
                 waves += 1;
             }
         }
+        debug!(
+            waves,
+            first_superfiles, second_superfiles, probes, "level heads probe waves"
+        );
         let mut selection = state
             .finish(theta, bounds, 0, probes, started, waves)
             .await?;

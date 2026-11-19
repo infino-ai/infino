@@ -16,6 +16,7 @@ use std::slice::from_ref;
 
 use bytes::Bytes;
 use futures::future::try_join_all;
+use tracing::debug;
 
 use super::{ColumnMeta, core::*, cursor::TermMeta};
 use crate::{
@@ -101,8 +102,15 @@ impl FtsReader {
                 )
                 .await;
         }
+        if len == 0 || offset + len > self.postings_range.len() {
+            return Err(malformed("short body past the postings region"));
+        }
+        let start = self.postings_range.start + offset;
         let body = self
-            .fetch_term_postings(&[(offset, len)])
+            .fetch_coalesced(
+                from_ref(&(start..start + len)),
+                "fts/postings term probe short body",
+            )
             .await?
             .pop()
             .ok_or_else(|| malformed("short body"))?;
@@ -167,9 +175,15 @@ impl FtsReader {
         // The header may name more blocks than the count suggested: read
         // the whole table it names then.
         let named = TermMeta::header_num_blocks(&head).ok_or_else(|| malformed("header"))?;
-        if TermMeta::head_len(named, positional) > head.len() {
+        let reread = TermMeta::head_len(named, positional) > head.len();
+        if reread {
             head = read(TermMeta::head_len(named, positional)).await?;
         }
+        debug!(
+            requests = 1 + u32::from(reread),
+            blocks = named,
+            "term probe head read"
+        );
         let (meta, _) = TermMeta::parse_head(&head, 0, positional)?;
         // Each document's block: the first whose last doc reaches it.
         let last_docs: Vec<u32> = (0..meta.num_blocks)

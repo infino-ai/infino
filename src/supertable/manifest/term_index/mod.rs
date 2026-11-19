@@ -86,7 +86,7 @@ use tokio::{
     task::JoinSet,
     try_join,
 };
-use tracing::{Instrument, warn};
+use tracing::{Instrument, debug, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -3407,6 +3407,11 @@ impl TermIndex {
             return Err(TermIndexError::Malformed("short head level read".into()));
         }
         let fetched = bytes.len() as u64;
+        debug!(
+            bytes = fetched,
+            entries = level.n_entries,
+            "head level read"
+        );
         let blocks = run_on_pool(None, "head level decode", move || {
             let mut blocks = Vec::new();
             decode_segment(&bytes, &mut blocks).map(|()| blocks)

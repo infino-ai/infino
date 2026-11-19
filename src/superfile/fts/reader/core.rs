@@ -32,6 +32,7 @@ use bytes::Bytes;
 use roaring::RoaringBitmap;
 use rustc_hash::FxHashMap;
 use tokio::sync::{OnceCell, Semaphore};
+use tracing::debug;
 
 use super::{
     cursor::{BlockTableCache, CursorUse, TermCursor, TermMeta},
@@ -1704,6 +1705,12 @@ impl FtsReader {
             ranges,
             TERM_RANGE_COALESCE_MAX_GAP,
             TERM_RANGE_COALESCE_MAX_OVERFETCH,
+        );
+        debug!(
+            what,
+            ranges = ranges.len(),
+            requests = plan.fetch_ranges().len(),
+            "coalesced fetch"
         );
         let fetched = self
             .source
