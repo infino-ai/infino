@@ -21,6 +21,11 @@
 //! one it gives; the scan only hands it fewer. The rule fires on a filter
 //! whose input is the scan, through the scan's meter, and leaves alone a scan
 //! that already checks a `WHERE` or stops after a number of rows.
+//!
+//! It also leaves alone a scan spread by a round-robin repartition, as a scan
+//! of fewer row groups than the statement's partitions is (a small table, or
+//! one whose `WHERE` prunes most of them): there the check costs more in the
+//! scan's few partitions than in the filter's many.
 
 use std::sync::Arc;
 

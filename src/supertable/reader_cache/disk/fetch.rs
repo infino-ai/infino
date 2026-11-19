@@ -2318,14 +2318,6 @@ mod tests {
         other
     }
 
-    /// Take `store`'s only download slot, so a download waits for it until the permit drops.
-    async fn hold_fill_slot(store: &Arc<DiskCacheStore>) -> tokio::sync::OwnedSemaphorePermit {
-        Arc::clone(&store.prefetch_semaphore)
-            .acquire_owned()
-            .await
-            .expect("fill permit")
-    }
-
     /// The landing rule a live download installs under (see [`BackgroundFill::may_replace`]).
     fn a_download_may_replace(current: &CachedEntry) -> bool {
         BackgroundFill::default().may_replace(Some(current))
@@ -3179,7 +3171,11 @@ mod tests {
     /// read registered for the same file.
     #[tokio::test]
     async fn a_cancelled_downloads_exit_keeps_the_newer_one() {
-        let (_dir, store, recording) = recording_store(None);
+        // A held reader holds the second download back: any query in the process may wake the
+        // cancelled first one early, and the resume meant for its GET would let the second through.
+        let (_dir, store, recording) = recording_store_with(None, |cfg| {
+            cfg.promotion_defer_timeout = Duration::MAX;
+        });
         let (uri, _) = put_tiny_superfile(&recording).await;
         let permit = hold_fill_slot(&store).await;
         warm_open(&store, &uri).await;
@@ -3190,13 +3186,15 @@ mod tests {
 
         store.evict_at_least(1).await.expect("evict the file");
         assert!(first.is_cancelled());
-        warm_open(&store, &uri).await;
+        let held = store
+            .open_for_query(&uri, &uri.storage_path(), None, None, ReadIntent::Warm)
+            .await
+            .expect("a Warm open");
         let second = fill_of(&store, &uri);
         assert!(!Arc::ptr_eq(&first, &second));
 
-        // The first download wakes, sees its cancel and exits; the second, held at its first GET,
-        // keeps its registration.
-        recording.pause_next_read();
+        // The first download wakes, sees its cancel and exits; the second, waiting for the held
+        // reader, keeps its registration.
         recording.resume();
         timeout(PROMOTE_TIMEOUT, async {
             while store.fills_running.load(Ordering::Acquire) > 1 {
@@ -3216,7 +3214,7 @@ mod tests {
             ),
             "the newer one stays"
         );
-        recording.resume();
+        drop(held);
         store
             .wait_until_fills_settled(PROMOTE_TIMEOUT)
             .await

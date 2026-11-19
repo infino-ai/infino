@@ -839,7 +839,7 @@ pub(crate) mod test_support {
     use roaring::RoaringBitmap;
     use tempfile::TempDir;
     use tokio::{
-        sync::Notify,
+        sync::{Notify, OwnedSemaphorePermit},
         time::{sleep, timeout},
     };
 
@@ -1052,6 +1052,20 @@ pub(crate) mod test_support {
             .iter()
             .filter(|entry| store.reclaimable_lazy_entry(entry.key(), entry.value()))
             .count()
+    }
+
+    /// Take `store`'s only download slot, so a download waits for it until the permit drops.
+    pub(crate) async fn hold_fill_slot(store: &Arc<DiskCacheStore>) -> OwnedSemaphorePermit {
+        let permit = Arc::clone(&store.prefetch_semaphore)
+            .acquire_owned()
+            .await
+            .expect("fill permit");
+        assert_eq!(
+            store.prefetch_semaphore.available_permits(),
+            0,
+            "the store has one download slot"
+        );
+        permit
     }
 
     /// How long [`wait_until`] waits before it fails.
