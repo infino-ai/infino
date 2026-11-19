@@ -1674,12 +1674,12 @@ checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 
 [[package]]
 name = "ferroid"
-version = "2.0.0"
+version = "3.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ee93edf3c501f0035bbeffeccfed0b79e14c311f12195ec0e661e114a0f60da4"
+checksum = "8c63948fb5874d42ea7562d7051437eb22260fccbb502e27a3688cfdae3b9b54"
 dependencies = [
- "portable-atomic",
- "rand 0.10.2",
+ "serde",
+ "tracing",
  "web-time",
 ]
 

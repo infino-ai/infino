@@ -324,13 +324,13 @@ memory-stats = { version = "1.2", features = ["always_use_statm"] }
 # so the version is pinned explicitly.
 fs4 = { version = "0.13", features = ["tokio"] }
 
-# Monotonic millisecond clock for the supertable's 128-bit
+# Cached millisecond clock for the supertable's 128-bit
 # `_id` generator (64 ms + 40 worker + 24 seq). One shared
 # ticker thread publishes the time, so a read is a load, not a
-# syscall, and never steps backwards. The generator itself is
-# ours: it hands out a whole millisecond's run of sequence
+# syscall. The clock can step backwards; ids remain increasing.
+# The generator is ours: it hands out a whole millisecond's run of sequence
 # numbers per clock read, which a per-id generator cannot.
-ferroid = { version = "2", features = ["std", "alloc"] }
+ferroid = { version = "3", features = ["std", "alloc"] }
 
 # Scratch tempdir + spill file management for the streaming
 # `VectorBuilder`. Promoted from dev-dependencies
