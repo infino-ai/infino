@@ -28,7 +28,15 @@
 
 #[cfg(test)]
 use std::collections::HashMap;
-use std::{fmt, ops::Range, sync::Arc};
+use std::{
+    fmt,
+    ops::Range,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -45,7 +53,10 @@ use object_store::{
 use crate::{
     runtime_metrics::op_stats::{self, OpStatsCollector},
     superfile::{CacheBlocks, CacheRoom, LazyByteSource, lazy_source::Source},
-    supertable::error::QueryError,
+    supertable::{
+        error::QueryError,
+        reader_cache::file_use::{ReadKind, with_read_kind_at},
+    },
 };
 
 /// Fixed `last_modified` reported for every registered superfile.
@@ -80,6 +91,11 @@ pub(crate) struct SuperfileObjectStore {
     /// One byte source per surviving superfile, keyed by the same path
     /// used to build the superfile's `PartitionedFile`.
     sources: Arc<DashMap<ObjPath, Arc<dyn LazyByteSource>>>,
+    /// When the store was built.
+    built: Instant,
+    /// When the latest statement's scan began, in microseconds after `built`: the time its reads
+    /// are stamped at, set by each scan so a store a cached context reuses stays current.
+    statement_us: AtomicU64,
 }
 
 impl fmt::Debug for SuperfileObjectStore {
@@ -102,7 +118,20 @@ impl SuperfileObjectStore {
         Self {
             op_stats: op_stats::current(),
             sources: Arc::new(DashMap::new()),
+            built: Instant::now(),
+            statement_us: AtomicU64::new(0),
         }
+    }
+
+    /// Note that a statement's scan begins now: one clock read per statement, not per read.
+    pub(crate) fn begin_statement(&self) {
+        let since_built = self.built.elapsed().as_micros() as u64;
+        self.statement_us.store(since_built, Ordering::Relaxed);
+    }
+
+    /// When the latest statement's scan began, the time this store's reads are stamped at.
+    pub(crate) fn statement_started(&self) -> Instant {
+        self.built + Duration::from_micros(self.statement_us.load(Ordering::Relaxed))
     }
 
     /// The per-query collector this store captured at construction — the
@@ -179,12 +208,12 @@ impl SuperfileObjectStore {
         ranges: &[Range<u64>],
     ) -> OsResult<Vec<Bytes>> {
         let source = self.source(location)?;
-        coalesce_ranges(
+        let read = coalesce_ranges(
             ranges,
             |range| read_range(Arc::clone(&source), range),
             OBJECT_STORE_COALESCE_DEFAULT,
-        )
-        .await
+        );
+        with_read_kind_at(ReadKind::Scan, self.statement_started(), read).await
     }
 
     /// Download `clusters` of spans ahead of the scan, through
@@ -199,7 +228,7 @@ impl SuperfileObjectStore {
         clusters: &[Vec<Range<u64>>],
     ) -> OsResult<Vec<Bytes>> {
         let source = self.source(location)?;
-        let per_cluster: Vec<Vec<Bytes>> = stream::iter(clusters.iter().cloned())
+        let batch = stream::iter(clusters.iter().cloned())
             .map(|cluster| {
                 let source = Arc::clone(&source);
                 async move {
@@ -211,8 +240,10 @@ impl SuperfileObjectStore {
                 }
             })
             .buffered(FETCH_PARALLELISM)
-            .try_collect()
-            .await?;
+            .try_collect::<Vec<Vec<Bytes>>>();
+        // The batch runs on its own task: one scope for all its spans, at the statement's time.
+        let at = self.statement_started();
+        let per_cluster = with_read_kind_at(ReadKind::ReadAhead, at, batch).await?;
         Ok(per_cluster.into_iter().flatten().collect())
     }
 
@@ -379,7 +410,8 @@ impl ObjectStore for SuperfileObjectStore {
 
         let range = resolve_range(options.range, size);
         self.count_page_read(range.end.saturating_sub(range.start));
-        let bytes = read_range(source, range.clone()).await?;
+        let read = read_range(source, range.clone());
+        let bytes = with_read_kind_at(ReadKind::Scan, self.statement_started(), read).await?;
 
         Ok(GetResult {
             payload: GetResultPayload::Stream(stream::once(async move { Ok(bytes) }).boxed()),
@@ -447,6 +479,7 @@ mod tests {
     use std::{slice, sync::Mutex};
 
     use object_store::ObjectStoreExt;
+    use tokio::time::sleep;
 
     use super::*;
     use crate::superfile::{BytesLazyByteSource, LazyByteSourceError};
@@ -479,6 +512,20 @@ mod tests {
 
     /// The size [`ShortSource`] claims.
     const SHORT_SOURCE_SIZE: u64 = 100;
+
+    /// How long a store is kept before a statement, so a stamp at its build time can't pass.
+    const STORE_AGE: Duration = Duration::from_millis(2);
+
+    #[tokio::test]
+    async fn a_reused_store_stamps_each_statements_start() {
+        // A store kept across statements, as the cached context keeps one, aged before a scan.
+        //  - the scan's reads are stamped at that scan's start, not the store's build time.
+        // This test pins that a long-lived store's scan stamps move with each statement.
+        let store = SuperfileObjectStore::new();
+        sleep(STORE_AGE).await;
+        store.begin_statement();
+        assert!(store.statement_started() >= store.built + STORE_AGE);
+    }
 
     #[tokio::test]
     async fn a_short_read_comes_back_short() {

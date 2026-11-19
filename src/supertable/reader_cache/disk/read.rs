@@ -21,7 +21,10 @@ use crate::{
     supertable::{
         StorageRangeSource,
         manifest::{SubsectionOffsets, SuperfileUri},
-        reader_cache::disk::{heap::free_elsewhere, *},
+        reader_cache::{
+            disk::{heap::free_elsewhere, *},
+            file_use::{FileUse, ReadKind},
+        },
     },
 };
 
@@ -183,16 +186,20 @@ impl DiskCacheStore {
         }
 
         // A Load needs the whole file, so a lazy entry is no use to it. Drop it and free its budget
-        // before fetching a whole copy.
-        if intent == ReadIntent::Load {
-            self.drop_lazy_entry(uri);
-        }
+        // before fetching a whole copy, which takes over the dropped entry's record.
+        let dropped = match intent {
+            ReadIntent::Load => self.drop_lazy_entry(uri),
+            _ => None,
+        };
 
         // Tiers 2 to 4, one walk per URI: concurrent callers share it, so N misses cost one stat,
         // one mmap or one download.
         let (entry, tier) = self
             .fetch_local_or_source_coalesced(uri, storage_key, intent, offsets, storage)
             .await?;
+        if let Some(dropped) = &dropped {
+            entry.file_use.absorb(dropped);
+        }
 
         Ok((self.serve(uri, storage_key, &entry, intent, storage), tier))
     }
@@ -242,20 +249,18 @@ impl DiskCacheStore {
             .map(|e| Arc::clone(&e))
     }
 
-    /// Remove a lazy entry and release its budget, for a [`ReadIntent::Load`]. A whole file that
-    /// landed since the memory check is kept.
+    /// Remove a lazy entry and release its budget, for a [`ReadIntent::Load`], returning its record
+    /// of the file's use. A whole file that landed since the memory check is kept.
     ///
     /// Leaves any coordinator alone: it belongs to a fetch in flight, and removing it would send
     /// later callers into a second download. A Load that joins that fetch still ends with a whole
     /// file (see [`Self::fetch_local_or_source_coalesced`]).
-    fn drop_lazy_entry(&self, uri: &SuperfileUri) {
+    fn drop_lazy_entry(&self, uri: &SuperfileUri) -> Option<Arc<FileUse>> {
         // The Load downloads the whole file itself, so the background download is cancelled
         // even when a whole copy keeps the entry.
-        if let Some(removed) =
-            self.remove_entry_cancelling_fill(uri, |entry| !entry.has_whole_file())
-        {
-            self.release_entry_accounting(&removed);
-        }
+        let removed = self.remove_entry_cancelling_fill(uri, |entry| !entry.has_whole_file())?;
+        self.release_entry_accounting(&removed);
+        Some(Arc::clone(&removed.file_use))
     }
 
     /// Every hit is served through here: bump the entry's LRU time and, for [`ReadIntent::Warm`],
@@ -268,7 +273,9 @@ impl DiskCacheStore {
         intent: ReadIntent,
         storage: Option<&Arc<dyn StorageProvider>>,
     ) -> Arc<SuperfileReader> {
-        entry.last_access_us.store(self.now_us(), Ordering::Release);
+        let now = self.now_us();
+        entry.last_access_us.store(now, Ordering::Release);
+        entry.file_use.record_at(ReadKind::Open, now);
         if intent == ReadIntent::Warm {
             self.maybe_spawn_background_fill(uri, storage_key, entry, storage);
         }

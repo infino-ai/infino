@@ -144,7 +144,10 @@ use crate::{
             prune::{PruneLeaf, select_superfiles},
             superfile_reader::OpenTierCounts,
         },
-        reader_cache::ReadIntent,
+        reader_cache::{
+            ReadIntent,
+            file_use::{ReadKind, with_read_kind},
+        },
         schema::FieldId,
         slow_vector_state::{
             CentroidSection, ResidentIndexKind, ResidentVectorIndex, WalkPlaneRequest,
@@ -2039,20 +2042,23 @@ async fn open_readers_from_options(
     options: &SupertableOptions,
     entries: &[Arc<SuperfileEntry>],
 ) -> Result<Vec<Arc<SuperfileReader>>, QueryError> {
-    let mut readers = Vec::with_capacity(entries.len());
-    for entry in entries.iter() {
-        readers.push(
-            dispatch::open_reader(
-                &options.store,
-                options.disk_cache.as_ref(),
-                options.storage.as_ref(),
-                entry,
-                ReadIntent::Stream,
-            )
-            .await?,
-        );
-    }
-    Ok(readers)
+    let open_all = async {
+        let mut readers = Vec::with_capacity(entries.len());
+        for entry in entries.iter() {
+            readers.push(
+                dispatch::open_reader(
+                    &options.store,
+                    options.disk_cache.as_ref(),
+                    options.storage.as_ref(),
+                    entry,
+                    ReadIntent::Stream,
+                )
+                .await?,
+            );
+        }
+        Ok(readers)
+    };
+    with_read_kind(ReadKind::Planning, open_all).await
 }
 
 /// Widen a grid cell cutoff so the probed cells' indexed row counts cover at
@@ -2497,7 +2503,28 @@ pub(crate) async fn stable_ids_by_local_for_routing(
 /// where either source above costs a read per cell or per column chunk.
 /// A file whose vector blob carries rows the Parquet body does not (boundary
 /// stubs) never reads the inline region; its order would not match.
+/// Its reads count as a scan, the open as planning, whichever task runs it.
 async fn read_ids_for_locals(
+    manifest: &ManifestSnapshot,
+    entry: &SuperfileEntry,
+    local_ids: &Arc<Vec<u32>>,
+    id_column: &str,
+    allow_inline_region: bool,
+    op_stats: &Option<Arc<OpStatsCollector>>,
+) -> Result<Vec<i128>, QueryError> {
+    let ids = read_local_ids(
+        manifest,
+        entry,
+        local_ids,
+        id_column,
+        allow_inline_region,
+        op_stats,
+    );
+    with_read_kind(ReadKind::Scan, ids).await
+}
+
+/// [`read_ids_for_locals`] without setting the read kind.
+async fn read_local_ids(
     manifest: &ManifestSnapshot,
     entry: &SuperfileEntry,
     local_ids: &Arc<Vec<u32>>,
@@ -2511,8 +2538,8 @@ async fn read_ids_for_locals(
     let storage = manifest.options.storage.as_ref();
     let store = Arc::clone(&manifest.options.store);
     let disk_cache = manifest.options.disk_cache.as_ref();
-    let reader =
-        dispatch::open_reader(&store, disk_cache, storage, entry, ReadIntent::Stream).await?;
+    let open = dispatch::open_reader(&store, disk_cache, storage, entry, ReadIntent::Stream);
+    let reader = with_read_kind(ReadKind::Planning, open).await?;
     // The inline IVF region is usable as an `_id` source only when its rows
     // map 1:1 to Parquet rows. Boundary-replicated user commits break that:
     // the IVF carries stub rows beyond the Parquet count, so inline order

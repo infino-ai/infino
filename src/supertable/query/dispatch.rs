@@ -77,7 +77,9 @@ use crate::{
             vector::row_id_from_manifest_entry,
         },
         reader_cache::{
-            DiskCacheStore, OpenTier, ReadIntent, SuperfileReaderCache, disk::mmap_readonly_bytes,
+            DiskCacheStore, OpenTier, ReadIntent, SuperfileReaderCache,
+            disk::mmap_readonly_bytes,
+            file_use::{ReadKind, with_read_kind_at},
         },
         tombstones::SidecarCache,
     },
@@ -605,20 +607,21 @@ impl FanoutContext {
         ) -> Fut,
         Fut: Future<Output = Result<R, QueryError>>,
     {
-        let (r, tier) = open_reader_tiered(
+        let open = open_reader_tiered(
             &self.store,
             self.disk_cache.as_ref(),
             self.storage.as_ref(),
             &entry,
             self.intent,
-        )
-        .await?;
+        );
+        let (r, tier) = with_read_kind_at(ReadKind::Planning, self.now, open).await?;
         if let Some(tiers) = &self.tiers {
             tiers.add(tier);
         }
         verify_superfile_vector_codecs(&r, &self.vector_columns)?;
         note_superfile_opened(self.op_stats.as_ref());
-        body(r, entry, self.tombstone_cache.clone(), self.now, params).await
+        let unit = body(r, entry, self.tombstone_cache.clone(), self.now, params);
+        with_read_kind_at(ReadKind::Scan, self.now, unit).await
     }
 
     /// [`Self::run`] on its own task on the shared query runtime, so the

@@ -37,6 +37,7 @@
 pub mod block_source;
 pub mod config;
 pub mod disk;
+pub(crate) mod file_use;
 pub mod in_memory;
 mod kept_lazy;
 

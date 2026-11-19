@@ -156,7 +156,10 @@ use crate::{
             },
             value_count_carry::ValueCountCarry,
         },
-        reader_cache::{DiskCacheStore, OpenTier, ReadIntent, SuperfileReaderCache},
+        reader_cache::{
+            DiskCacheStore, OpenTier, ReadIntent, SuperfileReaderCache,
+            file_use::{ReadKind, with_read_kind},
+        },
         schema::{DECIMAL128_PRECISION, DECIMAL128_SCALE, FieldId},
         tombstones::SidecarCache,
     },
@@ -1920,7 +1923,7 @@ impl SupertableProvider {
                     .await?;
                 Ok(Arc::clone(prepared))
             };
-            SpawnedTask::spawn(open.in_current_span())
+            SpawnedTask::spawn(with_read_kind(ReadKind::Planning, open).in_current_span())
                 .join_unwind()
                 .await
                 .map_err(|e| DataFusionError::ExecutionJoin(Box::new(e)))?
@@ -2512,6 +2515,7 @@ impl TableProvider for SupertableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        self.scan_store.begin_statement();
         // A plain `LIMIT k` (no filter, sort or count) reads only the first files holding `k` live
         // rows, with deletes read once so the rows it counts live are the rows the scan returns.
         let bare_limit = limit.is_some()

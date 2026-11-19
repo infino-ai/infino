@@ -57,6 +57,7 @@ use crate::{
                 sources::mmap_readonly_with_handle,
                 *,
             },
+            file_use::{FileUse, ReadKind},
         },
     },
     utils::trace::{OpOrigin, detached},
@@ -130,10 +131,11 @@ impl DiskCacheStore {
         path: &Path,
         size: u64,
         verify_crc: bool,
+        file_use: Arc<FileUse>,
     ) -> Result<Arc<CachedEntry>, DiskCacheError> {
         let (mmap, bytes) = mmap_readonly_with_handle(path).map_err(DiskCacheError::Io)?;
         let reader = SuperfileReader::open_with(bytes, OpenOptions { verify_crc })?;
-        Ok(self.build_mmap_entry(Arc::new(reader), mmap, size, None))
+        Ok(self.build_mmap_entry(Arc::new(reader), mmap, size, None, file_use))
     }
 
     /// [`Self::open_cached_entry`] for a copy at [`Self::hole_path`]: opened the way its fill left
@@ -204,21 +206,32 @@ impl DiskCacheStore {
         } else {
             size
         };
-        Ok(self.build_mmap_entry(Arc::new(reader), mmap, charge, Some(vector_source)))
+        // A holed copy's vector reads stamp its vector source's record, so the entry shares it.
+        let file_use = Arc::clone(vector_source.file_use());
+        Ok(self.build_mmap_entry(
+            Arc::new(reader),
+            mmap,
+            charge,
+            Some(vector_source),
+            file_use,
+        ))
     }
 
     /// Build a [`Residency::Mapped`] entry, always `Eager`. `charge` is the file size, or less when
     /// the vector blob stays on a block source that charges its own blocks. `vector_source` is
-    /// `Some` only when the vector blob was left out of the mmap.
+    /// `Some` only when the vector blob was left out of the mmap. `file_use` is the file's record,
+    /// the one it already has where the cache kept the file ([`DiskCacheStore::file_use_for`]).
     pub(crate) fn build_mmap_entry(
         &self,
         reader: Arc<SuperfileReader>,
         mmap: Arc<Mmap>,
         charge: u64,
         vector_source: Option<Arc<BlockCachedSource>>,
+        file_use: Arc<FileUse>,
     ) -> Arc<CachedEntry> {
         Arc::new(CachedEntry {
             heap: OnceLock::new(),
+            file_use,
             reader,
             residency: Residency::Mapped {
                 mmap,
@@ -256,6 +269,7 @@ impl DiskCacheStore {
                 let held = own_reservation + occupied.get().whole_file_charge();
                 if held >= charge || self.try_reserve_without_evicting(charge - held) {
                     let replaced = mem::replace(occupied.get_mut(), Arc::clone(&entry));
+                    entry.file_use.absorb(&replaced.file_use);
                     // Leave the lock before the old entry drops: its last reference may fsync a
                     // block index.
                     drop(occupied);
@@ -506,6 +520,7 @@ impl DiskCacheStore {
         //    cache hits serve the mmap reader instead.
         let entry = Arc::new(CachedEntry {
             heap: OnceLock::new(),
+            file_use: self.file_use_for(uri),
             reader: Arc::clone(&foreground_reader),
             // Hybrid foreground: the whole file is in a heap buffer; the finalizer mmaps it later.
             residency: Residency::Buffered,
@@ -867,15 +882,20 @@ impl DiskCacheStore {
 
             let (lazy_reader, size, block_source) = if allow_background_fill && whole_file.is_none()
             {
+                // The second open's source takes over the first's record.
+                let first = Arc::clone(opened.2.file_use());
                 drop(opened);
-                self.open_lazy_unknown_size(
-                    uri,
-                    &storage_uri,
-                    &fetch_storage,
-                    true,
-                    &mut unadmitted,
-                )
-                .await?
+                let reopened = self
+                    .open_lazy_unknown_size(
+                        uri,
+                        &storage_uri,
+                        &fetch_storage,
+                        true,
+                        &mut unadmitted,
+                    )
+                    .await?;
+                reopened.2.file_use().absorb(&first);
+                reopened
             } else {
                 opened
             };
@@ -899,6 +919,7 @@ impl DiskCacheStore {
         };
         let entry = Arc::new(CachedEntry {
             heap: OnceLock::new(),
+            file_use: Arc::clone(block_source.file_use()),
             reader: Arc::clone(&lazy_reader),
             residency: Residency::Paged {
                 block_source: Arc::clone(&block_source),
@@ -1003,7 +1024,8 @@ impl DiskCacheStore {
             }
         };
         tokio::fs::rename(&tmp, &final_path).await?;
-        let entry = self.build_mmap_entry(Arc::new(reader), mmap, size, None);
+        let file_use = self.file_use_for(uri);
+        let entry = self.build_mmap_entry(Arc::new(reader), mmap, size, None, file_use);
 
         let entry = self.admit_entry(*uri, entry);
         self.n_cold_fetches.fetch_add(1, Ordering::AcqRel);
@@ -1136,7 +1158,8 @@ async fn finalize_to_mmap(
         )?;
         // Swap in over the buffered entry, which already carries the whole-size charge. The
         // finalizer reserved nothing of its own.
-        let entry = store.build_mmap_entry(Arc::new(reader), mmap, size, None);
+        let file_use = store.file_use_for(&uri);
+        let entry = store.build_mmap_entry(Arc::new(reader), mmap, size, None, file_use);
         store.install_promoted_entry(
             uri,
             entry,
@@ -1368,6 +1391,8 @@ async fn cold_fetch_to_disk_cancelable(
 ) -> Result<BackgroundFillOutcome, DiskCacheError> {
     let n_streams = store.config.cold_fetch_streams.max(1);
     let chunk_size = store.config.cold_fetch_chunk_bytes.max(1);
+    // The file's record, wherever the cache keeps the file, records the download's chunks.
+    let file_use = store.kept_file_use(uri);
     let n_chunks = if size == 0 {
         0
     } else {
@@ -1477,6 +1502,9 @@ async fn cold_fetch_to_disk_cancelable(
             // re-fetches just the unfinished chunks.
             Some(result) = in_flight.next(), if !in_flight.is_empty() => {
                 filled[result? as usize] = true;
+                if let Some(file_use) = &file_use {
+                    file_use.record_read_by(ReadKind::Fill);
+                }
             }
         }
         if background_store_abandoned(store) {
@@ -1787,7 +1815,13 @@ async fn lazy_background_fill(
                     verify_crc: store.config.crc_verification.verifies_on_landing(),
                 },
             )?;
-            store.build_mmap_entry(Arc::new(reader), mmap_arc, size, None)
+            store.build_mmap_entry(
+                Arc::new(reader),
+                mmap_arc,
+                size,
+                None,
+                store.file_use_for(uri),
+            )
         }
     };
 
@@ -3339,7 +3373,10 @@ mod tests {
         let reader = Arc::new(
             SuperfileReader::open_with(mapped, OpenOptions { verify_crc: false }).expect("open"),
         );
-        (tmp, store.build_mmap_entry(reader, mmap, size, None))
+        (
+            tmp,
+            store.build_mmap_entry(reader, mmap, size, None, store.file_use_for(uri)),
+        )
     }
 
     /// A fill whose file was evicted.
@@ -4081,6 +4118,32 @@ mod tests {
             "promotion re-reads the object once, not per query"
         );
         drop(held);
+    }
+
+    #[tokio::test]
+    async fn a_promoted_copy_shares_the_lazy_entrys_record() {
+        // Setup: a file opened lazily, its background download free to promote it.
+        //  - The whole copy shares the lazy entry's record (the same `Arc`), so a query still on
+        //    the lazy reader stamps the record the cache keeps.
+        // This test pins that promotion shares the record rather than copying it.
+        let (_dir, store) = test_store_with(|cfg| {
+            cfg.cold_fetch_mode = ColdFetchMode::LazyForegroundWithBackgroundFill;
+            cfg.promotion_defer_timeout = Duration::ZERO;
+        });
+        let uri = SuperfileUri::new_v4();
+        put_superfile(&store, &uri, tiny_superfile_bytes()).await;
+        let held = store.reader(&uri).await.expect("lazy cold");
+        let record = Arc::clone(&store.cached.get(&uri).expect("lazy entry").file_use);
+        drop(held);
+        assert!(
+            poll_until_mmap_promoted(&store, &uri, PROMOTE_TIMEOUT).await,
+            "promoted"
+        );
+        let entry = Arc::clone(store.cached.get(&uri).expect("whole copy").value());
+        assert!(
+            Arc::ptr_eq(&entry.file_use, &record),
+            "one record before and after"
+        );
     }
 
     /// With the window left open the fill still yields: a held reader keeps

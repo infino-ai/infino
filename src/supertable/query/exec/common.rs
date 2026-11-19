@@ -105,6 +105,7 @@ use crate::{
             superfile_reader::superfile_reader,
             vector::row_id_from_manifest_entry,
         },
+        reader_cache::file_use::{ReadKind, with_read_kind},
         schema::{DECIMAL128_PRECISION, DECIMAL128_SCALE, PhysicalSchema, map::FileSchemaMap},
         tombstones::SidecarCache,
     },
@@ -1116,8 +1117,20 @@ pub(crate) fn output_schema_with_score(scalar_schema: &SchemaRef) -> SchemaRef {
 /// Selected scalar columns are read per superfile (each
 /// `take_by_local_doc_ids` is a column-projected read), concatenated,
 /// then a single `take` reorders rows back into the global rank order
-/// so row `i` is the `i`-th hit.
+/// so row `i` is the `i`-th hit. Its reads count as a scan, whichever task runs it.
 pub(crate) async fn resolve_hits(
+    reader: &SupertableReader,
+    hits: &[SuperfileHit],
+    scalar_schema: &SchemaRef,
+    output_schema: &SchemaRef,
+    projection: Option<&[usize]>,
+) -> DfResult<RecordBatch> {
+    let rows = read_hit_rows(reader, hits, scalar_schema, output_schema, projection);
+    with_read_kind(ReadKind::Scan, rows).await
+}
+
+/// [`resolve_hits`] without setting the read kind.
+async fn read_hit_rows(
     reader: &SupertableReader,
     hits: &[SuperfileHit],
     scalar_schema: &SchemaRef,
@@ -1684,7 +1697,7 @@ pub(crate) async fn take_file_columns(
 ) -> DfResult<RecordBatch> {
     let adapter = file_adapter(manifest, rd);
     if !rd.can_take_by_local_doc_ids() {
-        return take_lazy_file(
+        let rows = take_lazy_file(
             rd,
             &locals,
             names,
@@ -1692,8 +1705,8 @@ pub(crate) async fn take_file_columns(
             out_schema,
             &manifest.options.reader_pool,
             &manifest.options.connection_memory_budget,
-        )
-        .await;
+        );
+        return with_read_kind(ReadKind::Scan, rows).await;
     }
     let owned_names: Vec<String> = names.iter().map(|s| (*s).to_string()).collect();
     let out_schema = Arc::clone(out_schema);
@@ -1772,7 +1785,8 @@ pub(crate) async fn read_file_row_group(
     } else {
         let refs: Vec<&str> = physical.iter().map(String::as_str).collect();
         let views: Vec<&str> = views.iter().map(String::as_str).collect();
-        read_row_group_byte_source(rd, row_group, &refs, &views).await?
+        let read = read_row_group_byte_source(rd, row_group, &refs, &views);
+        with_read_kind(ReadKind::Scan, read).await?
     };
     match adapter {
         None => Ok(read),
@@ -2606,6 +2620,7 @@ mod tests {
     };
     use rayon::ThreadPoolBuilder;
     use tempfile::TempDir;
+    use tokio::runtime::Builder as RuntimeBuilder;
 
     use super::*;
     use crate::{
@@ -4101,10 +4116,15 @@ mod tests {
         (storage_dir, cache_dir, cache, consumer)
     }
 
-    /// The same take run twice reads its rows from storage once: the bytes
-    /// its exact reads fetched are kept, so the second run finds them local.
-    #[test]
-    fn a_repeated_cold_take_reads_storage_once() {
+    /// A 50,000-row table on a recording local store, with a lazy disk cache half its size: reads
+    /// go past each file's opening tail into the cache's blocks, and whole files never download.
+    fn cold_titles_larger_than_the_cache() -> (
+        TempDir,
+        TempDir,
+        Arc<RecordingStorage>,
+        Arc<dyn StorageProvider>,
+        Arc<DiskCacheStore>,
+    ) {
         let storage_dir = TempDir::new().expect("storage tempdir");
         let cache_dir = TempDir::new().expect("cache tempdir");
         let local: Arc<dyn StorageProvider> =
@@ -4138,6 +4158,15 @@ mod tests {
         };
         let storage = Arc::clone(&recording) as Arc<dyn StorageProvider>;
         let cache = DiskCacheStore::new_unpinned(Arc::clone(&storage), cfg).expect("cache");
+        (storage_dir, cache_dir, recording, storage, cache)
+    }
+
+    /// The same take run twice reads its rows from storage once: the bytes its exact reads
+    /// fetched are kept, so the second run finds them local.
+    #[test]
+    fn a_repeated_cold_take_reads_storage_once() {
+        let (_storage_dir, _cache_dir, recording, storage, cache) =
+            cold_titles_larger_than_the_cache();
         // A fresh handle per take, so the second finds only what the disk
         // cache kept, not what the first handle holds in memory.
         let open = || {
@@ -4298,6 +4327,51 @@ mod tests {
         assert_eq!(batch.schema().field(0).name(), "_id");
         assert_eq!(batch.schema().field(1).name(), "title");
         assert_eq!(batch.schema().field(2).name(), "score");
+    }
+
+    /// A lazily opened file's row group read and row take go through the disk cache's blocks on
+    /// threads that set no read kind of their own, as a decoded-column scan's do; each read still
+    /// counts as a scan.
+    #[test]
+    fn a_lazy_row_group_read_and_take_count_as_a_scan() {
+        let (_storage_dir, _cache_dir, _recording, storage, cache) =
+            cold_titles_larger_than_the_cache();
+        let table = Supertable::open(
+            default_supertable_options()
+                .with_storage(storage)
+                .with_disk_cache(Arc::clone(&cache)),
+        )
+        .expect("open");
+        let manifest = table.manifest_snapshot();
+        let uri = manifest.superfiles[0].uri;
+        let names = ["title"];
+        let schema = hit_output_schema(&manifest.stored_schema(), &names).expect("schema");
+        let runtime = RuntimeBuilder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            // Opened as a query plans, as the fan-out does.
+            let reader = with_read_kind(ReadKind::Planning, cache.reader(&uri))
+                .await
+                .expect("lazy reader");
+            read_file_row_group(&manifest, &reader, 0, &names, &schema, &None)
+                .await
+                .expect("row group");
+            take_file_columns(&manifest, &reader, vec![0, 1], &names, &schema, &None)
+                .await
+                .expect("take");
+        });
+        let uses = cache.file_uses();
+        assert!(!uses.is_empty(), "the file is cached");
+        assert!(
+            uses.iter().all(|u| u.last_read_us(ReadKind::Unknown) == 0),
+            "every read has its kind"
+        );
+        assert!(
+            uses.iter().any(|u| u.last_read_us(ReadKind::Scan) > 0),
+            "the reads count as a scan"
+        );
     }
 
     #[test]

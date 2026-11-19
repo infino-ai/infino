@@ -163,7 +163,7 @@ impl DiskCacheStore {
             // are known-valid (CRC'd at build, already opened as a reader for
             // summary extraction) — re-scanning here is redundant, and the
             // fsync above is what carries that validity to disk.
-            self.open_cached_entry(&final_path, size, false)
+            self.open_cached_entry(&final_path, size, false, self.file_use_for(uri))
         }
         .await;
 
@@ -240,7 +240,9 @@ impl DiskCacheStore {
                 if let Some(uri) = SuperfileUri::from_cache_filename(body) {
                     match self.scan_block_file(&path, &uri) {
                         Some(bytes) => total += bytes,
-                        None => self.drop_block_file(&uri),
+                        None => {
+                            self.drop_block_file(&uri);
+                        }
                     }
                 }
                 continue;
@@ -289,6 +291,7 @@ impl DiskCacheStore {
                 UnindexedFile {
                     size_bytes: size,
                     mtime_us: file_mtime_us(&meta),
+                    file_use: None,
                 },
             );
 
@@ -315,6 +318,7 @@ impl DiskCacheStore {
             UnindexedFile {
                 size_bytes: filled,
                 mtime_us: file_mtime_us(&meta),
+                file_use: None,
             },
         );
         tracing::info!(target: "infino::cache", uri = %uri.0, filled, "cache build: adopted .blocks on scan");
@@ -375,17 +379,18 @@ impl DiskCacheStore {
         // midway (a cancelled query, while a holed copy reads its vector header), leaves the file
         // on disk uncounted until its next open or a restart's scan counts it again. Putting the
         // scan's record back instead could count it twice, were a concurrent open admitting the
-        // same file meanwhile.
-        let reservation = match self.unindexed.remove(uri) {
-            Some(_) => self.adopt_charge(size),
-            None => self.reserve(size).await?,
+        // same file meanwhile. The row's record of the file's use goes to the copy.
+        let (reservation, kept) = match self.unindexed.remove(uri) {
+            Some((_, file)) => (self.adopt_charge(size), file.file_use),
+            None => (self.reserve(size).await?, None),
         };
 
         let opened = if holed {
             self.open_holed_entry(uri, size, storage_key, self.resolve_storage(storage))
                 .await
         } else {
-            self.open_cached_entry(&path, size, adoption_verifies(&self.config, intent))
+            let verify = adoption_verifies(&self.config, intent);
+            self.open_cached_entry(&path, size, verify, self.file_use_for(uri))
         };
 
         match opened {
@@ -393,6 +398,9 @@ impl DiskCacheStore {
                 // Counted or reserved at the file's length; a holed copy is charged less, since
                 // its hole is not on disk.
                 let uncharged = size - entry.size_bytes.load(Ordering::Acquire);
+                if let Some(kept) = &kept {
+                    entry.file_use.absorb(kept);
+                }
 
                 // Two racing reuses of one URI can both admit; admission frees the loser's bytes.
                 let entry = self.admit_entry(*uri, entry);
@@ -413,7 +421,8 @@ impl DiskCacheStore {
 
                 let _ = fs::remove_file(&path);
 
-                self.drop_block_file(uri);
+                let blocks = self.drop_block_file(uri);
+                log_file_use(uri, kept.or(blocks).as_deref());
 
                 Ok(None)
             }
@@ -424,14 +433,16 @@ impl DiskCacheStore {
     /// record's own size, so the accounting balances even when the file on disk no longer matches
     /// what the scan saw (or is gone entirely).
     pub(crate) fn discard_cache_file(&self, uri: &SuperfileUri) {
-        if let Some((_, file)) = self.unindexed.remove(uri) {
+        let whole = self.unindexed.remove(uri).and_then(|(_, file)| {
             self.current_bytes
                 .fetch_sub(file.size_bytes, Ordering::Release);
-        }
+            file.file_use
+        });
 
         tracing::info!(target: "infino::cache", uri = %uri.0, "evict: discard whole .sf.parquet (unusable/size-mismatch)");
         self.remove_local_copy(uri);
-        self.drop_block_file(uri);
+        let blocks = self.drop_block_file(uri);
+        log_file_use(uri, whole.or(blocks).as_deref());
     }
 
     /// Delete the local copy of `uri`, under whichever name it has.
@@ -440,14 +451,18 @@ impl DiskCacheStore {
         let _ = fs::remove_file(self.hole_path(uri));
     }
 
-    pub(crate) fn drop_block_file(&self, uri: &SuperfileUri) {
-        if let Some((_, file)) = self.block_files.remove(uri) {
+    /// Delete `uri`'s `.blocks` file and give back its count. Returns the record its row kept, for
+    /// a caller letting go of the file's last local copy to log.
+    pub(crate) fn drop_block_file(&self, uri: &SuperfileUri) -> Option<Arc<FileUse>> {
+        let file_use = self.block_files.remove(uri).and_then(|(_, file)| {
             self.current_bytes
                 .fetch_sub(file.size_bytes, Ordering::Release);
-        }
+            file.file_use
+        });
         tracing::info!(target: "infino::cache", uri = %uri.0, "evict: dropped .blocks + .blocks.idx (unusable/scan)");
         let _ = fs::remove_file(self.blocks_path(uri));
         let _ = fs::remove_file(self.blocks_idx_path(uri));
+        file_use
     }
 
     /// Keep counting the `.blocks` file of a dropped lazy entry's `source` in the disk budget, so
@@ -456,15 +471,16 @@ impl DiskCacheStore {
     /// replaced it, and a record for the old one would later unlink the newer); the source then
     /// gives its bytes back when it drops. A released source may wait on the freeing thread with
     /// the file open, so if the record is evicted meanwhile, its disk space comes back only then.
+    /// Returns whether the file was kept.
     pub(crate) fn retain_block_file(
         &self,
         uri: &SuperfileUri,
         source: &BlockCachedSource,
         now_us: u64,
-    ) {
+    ) -> bool {
         let filled = source.filled_bytes_handle().load(Ordering::Acquire);
         if filled == 0 || !source.path_names_its_file() {
-            return;
+            return false;
         }
         // From here the record counts the bytes and the source no longer writes the index, so both
         // happen once however long the source outlives its entry on the freeing thread.
@@ -474,11 +490,13 @@ impl DiskCacheStore {
         let file = UnindexedFile {
             size_bytes: filled,
             mtime_us: now_us,
+            file_use: Some(Arc::clone(source.file_use())),
         };
         if let Some(prior) = self.block_files.insert(*uri, file) {
             self.current_bytes
                 .fetch_sub(prior.size_bytes, Ordering::Release);
         }
+        true
     }
 
     /// Leave a finished background download at `final_path`, its cache name
@@ -512,9 +530,11 @@ impl DiskCacheStore {
             self.release_block_bytes(reserved);
             return;
         }
+        // The whole copy keeps the record its block file kept.
         let file = UnindexedFile {
             size_bytes: size,
             mtime_us: fs::metadata(final_path).map_or(0, |meta| file_mtime_us(&meta)),
+            file_use: self.block_files.get(uri).and_then(|f| f.file_use.clone()),
         };
         let prior = self
             .unindexed
@@ -571,23 +591,25 @@ impl DiskCacheStore {
     /// outlives its source. Returns whether an index entry was present, which is what `n_gc_drops`
     /// counts.
     pub(crate) fn erase_superfile_local_copy(&self, uri: &SuperfileUri) -> bool {
-        let present = if let Some(entry) = self.remove_entry_cancelling_fill(uri, |_| true) {
-            self.release_entry_accounting(&entry);
-            true
-        } else {
-            false
-        };
+        let entry = self.remove_entry_cancelling_fill(uri, |_| true);
+        if let Some(entry) = &entry {
+            self.release_entry_accounting(entry);
+        }
+        let present = entry.is_some();
 
         // Give back bytes counted for a never-opened file.
-        if let Some((_, file)) = self.unindexed.remove(uri) {
+        let whole = self.unindexed.remove(uri).and_then(|(_, file)| {
             self.current_bytes
                 .fetch_sub(file.size_bytes, Ordering::Release);
-        }
+            file.file_use
+        });
 
         self.coordinators.remove(uri);
         tracing::info!(target: "infino::cache", uri = %uri.0, present, "evict: erased local copy (object-store GC drop)");
         self.remove_local_copy(uri);
-        self.drop_block_file(uri);
+        let blocks = self.drop_block_file(uri);
+        let file_use = entry.map(|entry| Arc::clone(&entry.file_use));
+        log_file_use(uri, file_use.or(whole).or(blocks).as_deref());
         if present {
             self.n_gc_drops.fetch_add(1, Ordering::AcqRel);
         }

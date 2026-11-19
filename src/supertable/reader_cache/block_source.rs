@@ -126,7 +126,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     task::{Context, Poll},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
@@ -150,7 +150,10 @@ use crate::{
     runtime_bridge::shared_io_runtime,
     storage::{StorageError, stuck_after},
     superfile::{CacheBlocks, CacheRoom, LazyByteSource, LazyByteSourceError},
-    supertable::manifest::SuperfileUri,
+    supertable::{
+        manifest::SuperfileUri,
+        reader_cache::file_use::{FileUse, ReadKind, with_read_kind},
+    },
 };
 
 /// Cache block size: the unit the cache tracks, fills and indexes. Every GET
@@ -285,6 +288,8 @@ pub(crate) struct BlockCachedSource {
     /// past any of them.
     read_ends: [AtomicU64; READ_ENDS],
     next_read_end: AtomicUsize,
+    /// When the file was first seen and last read, shared with its cache entry.
+    file_use: Arc<FileUse>,
     state: OnceLock<Option<BlockFile>>,
     /// Filled-block set. Guarded by a sync mutex; never held across await.
     filled: Mutex<RoaringBitmap>,
@@ -774,6 +779,10 @@ impl BlockCachedSource {
         owns_accounting: bool,
         layout: SourceLayout,
     ) -> Arc<Self> {
+        let file_use = store.upgrade().map_or_else(
+            || FileUse::new(Instant::now()),
+            |store| store.file_use_for(&uri),
+        );
         Arc::new_cyclic(|me| Self {
             inner,
             store,
@@ -790,6 +799,7 @@ impl BlockCachedSource {
             },
             read_ends: array::from_fn(|_| AtomicU64::new(u64::MAX)),
             next_read_end: AtomicUsize::new(0),
+            file_use,
             state: OnceLock::new(),
             filled: Mutex::new(RoaringBitmap::new()),
             filled_bytes: Arc::new(AtomicU64::new(0)),
@@ -851,6 +861,7 @@ impl BlockCachedSource {
         if start >= end {
             return Ok(());
         }
+        self.file_use.record_read_by(ReadKind::Prefetch);
         let (b0, b1) = Self::block_span(start, end - start);
         let (b0, b1) = self.aligned_run(bf.size, b0, b1);
         let per_chunk = (chunk_bytes / CACHE_BLOCK_BYTES).max(1) as u32;
@@ -1227,6 +1238,11 @@ impl BlockCachedSource {
             }
         }
         (start, end)
+    }
+
+    /// The file's record, which this source's reads stamp.
+    pub(crate) fn file_use(&self) -> &Arc<FileUse> {
+        &self.file_use
     }
 
     /// Records where a read ended, over the oldest of the recent ends.
@@ -2281,6 +2297,7 @@ impl LazyByteSource for BlockCachedSource {
     fn try_get_range_sync(&self, start: u64, len: u64) -> Option<Bytes> {
         let bytes = self.read_sync(start, len)?;
         self.note_read(start, len);
+        self.file_use.record_read();
         Some(bytes)
     }
 
@@ -2314,7 +2331,7 @@ impl LazyByteSource for BlockCachedSource {
     }
 
     async fn range_ahead(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
-        self.read(start, len, Window::Grown).await
+        with_read_kind(ReadKind::ReadAhead, self.read(start, len, Window::Grown)).await
     }
 
     /// [`Self::range`] without the window: a miss fetches just the blocks the
@@ -2328,6 +2345,7 @@ impl LazyByteSource for BlockCachedSource {
     }
 
     async fn range_uncached(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
+        self.file_use.record_read();
         let bytes = match self.read_sync(start, len) {
             Some(bytes) => Ok(bytes),
             None => match self.whole_file() {
@@ -2383,6 +2401,7 @@ impl BlockCachedSource {
         if len == 0 {
             return Ok(Bytes::new());
         }
+        self.file_use.record_read();
         let in_hole = self.in_fts_hole(start, len);
         if let Some(bf) = self.blocks_for(start, len, in_hole) {
             let (b0, b1) = Self::block_span(start, len);

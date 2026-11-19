@@ -245,8 +245,11 @@ impl DiskCacheStore {
             .remove_if(uri, |uri, entry| self.reclaimable_lazy_entry(uri, entry))
         {
             self.release_entry_accounting(&removed);
-            if let Some(source) = removed.block_source() {
-                self.retain_block_file(uri, source, now_us);
+            // With no blocks to keep, the file's last local copy goes now.
+            if let Some(source) = removed.block_source()
+                && !self.retain_block_file(uri, source, now_us)
+            {
+                log_file_use(uri, Some(&removed.file_use));
             }
             return Some(Arc::clone(&removed.reader));
         }
@@ -373,10 +376,11 @@ impl DiskCacheStore {
 
             // Only the winner of the remove deletes and subtracts, so two concurrent evictions
             // cannot double-count.
-            if self.unindexed.remove(&uri).is_some() {
+            if let Some((_, file)) = self.unindexed.remove(&uri) {
                 tracing::info!(target: "infino::cache", uri = %uri.0, size, "evict: whole .sf.parquet (budget)");
                 self.remove_local_copy(&uri);
-                self.drop_block_file(&uri);
+                let blocks = self.drop_block_file(&uri);
+                log_file_use(&uri, file.file_use.or(blocks).as_deref());
                 self.current_bytes.fetch_sub(size, Ordering::Release);
                 self.n_evictions.fetch_add(1, Ordering::AcqRel);
                 freed += size;
@@ -406,8 +410,12 @@ impl DiskCacheStore {
                 break;
             }
 
-            if self.block_files.remove(&uri).is_some() {
+            if let Some((_, file)) = self.block_files.remove(&uri) {
                 tracing::info!(target: "infino::cache", uri = %uri.0, size, "evict: .blocks (budget)");
+                // A whole copy built since may share the record; it is the file's copy then.
+                if !self.cached.contains_key(&uri) && !self.unindexed.contains_key(&uri) {
+                    log_file_use(&uri, file.file_use.as_deref());
+                }
                 let _ = fs::remove_file(self.blocks_path(&uri));
                 let _ = fs::remove_file(self.blocks_idx_path(&uri));
                 self.current_bytes.fetch_sub(size, Ordering::Release);
@@ -663,11 +671,13 @@ impl DiskCacheStore {
                 if !entry.has_whole_file() && occupied.get().has_whole_file() {
                     let existing = Arc::clone(occupied.get());
                     drop(occupied);
+                    existing.file_use.absorb(&entry.file_use);
                     self.release_entry_accounting(&entry);
                     return existing;
                 }
 
                 let replaced = mem::replace(occupied.get_mut(), Arc::clone(&entry));
+                entry.file_use.absorb(&replaced.file_use);
                 // Leave the shard lock before `replaced` drops: its last reference may fsync a
                 // block index or munmap, and every URI in the shard would wait on that.
                 drop(occupied);
@@ -778,6 +788,11 @@ impl DiskCacheStore {
             // also cancels the file's download.
             if let Some(entry) = self.remove_entry_cancelling_fill(&uri, |_| true) {
                 tracing::info!(target: "infino::cache", uri = %uri.0, "evict: live cached entry (budget pressure)");
+                log_file_use(&uri, Some(&entry.file_use));
+                // The `.blocks` files go below; a row left for them must not log this record again.
+                if let Some(mut row) = self.block_files.get_mut(&uri) {
+                    row.file_use = None;
+                }
 
                 // A leftover coordinator would keep the evicted entry, and its budget, alive.
                 self.coordinators.remove(&uri);
@@ -1074,6 +1089,7 @@ mod tests {
     use std::{sync::Arc, time::Duration};
 
     use bytes::Bytes;
+    use tokio::time::sleep;
 
     use crate::{
         superfile::LazyByteSource,
@@ -1083,9 +1099,16 @@ mod tests {
                 block_source::CACHE_BLOCK_BYTES,
                 config::ColdFetchMode,
                 disk::{budget::*, test_support::*},
+                file_use::{FileUse, ReadKind, with_read_kind},
             },
         },
     };
+
+    /// A gap between two opens long enough that the store records different open times.
+    const OPEN_GAP: Duration = Duration::from_millis(2);
+
+    /// How many files the full cache in the eviction-order test holds.
+    const FULL_CACHE_FILES: usize = 5;
 
     #[tokio::test]
     async fn downloads_ahead_of_reads_get_half_the_unwritten_runs_cap() {
@@ -1221,6 +1244,65 @@ mod tests {
             .get(uri)
             .and_then(|entry| entry.block_source().map(Arc::clone))
             .expect("a lazy entry")
+    }
+
+    /// A lazy entry whose block read stamped `Scan`, its reader let go, for the record tests below.
+    async fn lazily_scanned(
+        store: &Arc<DiskCacheStore>,
+        uri: &SuperfileUri,
+    ) -> (Arc<FileUse>, u64) {
+        put_superfile(store, uri, tiny_superfile_bytes()).await;
+        let source = open_lazily(store, uri).await;
+        with_read_kind(ReadKind::Scan, source.range(0, 1))
+            .await
+            .expect("block read");
+        store.block_writes_settled().await;
+        let record = Arc::clone(source.file_use());
+        let scanned = record.last_read_us(ReadKind::Scan);
+        assert!(scanned > 0, "the read stamped Scan");
+        (record, scanned)
+    }
+
+    #[tokio::test]
+    async fn a_released_file_keeps_its_record_for_the_next_open() {
+        // Setup: a lazy entry whose block read stamped Scan, released as the open-file cap does,
+        // its blocks kept on disk.
+        //  - The reopen's entry and block reads take the same record back, its Scan stamp included.
+        // This test pins that a file's record lives as long as the cache keeps a local copy of it.
+        let (_dir, store) = test_store_with(|cfg| {
+            cfg.cold_fetch_mode = ColdFetchMode::LazyForegroundWithBackgroundFill;
+            cfg.promotion_defer_timeout = Duration::MAX;
+        });
+        let uri = SuperfileUri::new_v4();
+        let (record, scanned) = lazily_scanned(&store, &uri).await;
+        assert!(
+            store.release_lazy_entry(&uri, store.now_us()).is_some(),
+            "released"
+        );
+        let reopened = open_lazily(&store, &uri).await;
+        assert!(
+            Arc::ptr_eq(reopened.file_use(), &record),
+            "the reopen takes the record back"
+        );
+        assert_eq!(reopened.file_use().last_read_us(ReadKind::Scan), scanned);
+    }
+
+    #[tokio::test]
+    async fn a_load_takes_over_the_lazy_entrys_record() {
+        // Setup: a lazy entry whose block read stamped Scan; then a Load, which drops the lazy
+        // entry and builds a whole copy.
+        //  - The whole copy's record carries the lazy phase's Scan stamp.
+        // This test pins that a compaction or update read keeps the file's history.
+        let (_dir, store) = test_store_with(|cfg| {
+            cfg.cold_fetch_mode = ColdFetchMode::LazyForegroundWithBackgroundFill;
+            cfg.promotion_defer_timeout = Duration::MAX;
+        });
+        let uri = SuperfileUri::new_v4();
+        let (_, scanned) = lazily_scanned(&store, &uri).await;
+        store.reader_synchronous(&uri).await.expect("load");
+        let entry = Arc::clone(store.cached.get(&uri).expect("cached").value());
+        assert!(entry.has_whole_file(), "the Load built a whole copy");
+        assert_eq!(entry.file_use.last_read_us(ReadKind::Scan), scanned);
     }
 
     /// Opens `uri` lazily for streaming and reads its first byte, so one block is filled.
@@ -1874,6 +1956,100 @@ mod tests {
         assert!(matches!(err, DiskCacheError::BudgetExceeded));
         // a stays put; budget unchanged.
         assert!(store.cached.contains_key(&uri_a));
+    }
+
+    #[tokio::test]
+    async fn a_full_cache_evicts_files_in_the_order_they_were_last_opened() {
+        // A cache full with 5 files, reopened in the order 3, 0, 4, 1, 2.
+        //  - each new file evicts one.
+        //  - they go in the reopen order, not the order they were cached.
+        // This test pins eviction by last open.
+        let one = tiny_superfile_bytes().len() as u64;
+        let (_dir, store) =
+            test_store_with(move |cfg| cfg.disk_budget_bytes = FULL_CACHE_FILES as u64 * one);
+        let cached = cache_tiny_superfiles(&store, FULL_CACHE_FILES).await;
+        let opened: Vec<SuperfileUri> = [3, 0, 4, 1, 2].iter().map(|&i| cached[i]).collect();
+        for uri in &opened {
+            sleep(OPEN_GAP).await;
+            store.reader(uri).await.expect("reopen");
+        }
+
+        let mut evicted = Vec::new();
+        for _ in 0..opened.len() {
+            store
+                .insert_warm(&SuperfileUri::new_v4(), tiny_superfile_bytes())
+                .await
+                .expect("insert into a full cache");
+            let gone: Vec<SuperfileUri> = cached
+                .iter()
+                .filter(|uri| !store.is_cached(uri) && !evicted.contains(*uri))
+                .copied()
+                .collect();
+            assert_eq!(gone.len(), 1, "each insert evicts one file");
+            evicted.push(gone[0]);
+        }
+        assert_eq!(evicted, opened);
+        store.assert_budget_consistent();
+    }
+
+    #[tokio::test]
+    async fn reading_cached_blocks_does_not_move_a_file_in_the_eviction_order() {
+        // Two files opened lazily; the first is read again from its cached block after the second.
+        //  - only an open moves a file in the eviction order, a read doesn't.
+        //  - so the first file is still evicted first.
+        // This test pins that reads leave the eviction order alone.
+        let (_dir, store) = test_store_with(|cfg| {
+            cfg.cold_fetch_mode = ColdFetchMode::LazyForegroundWithBackgroundFill;
+            cfg.mmap_cold_threshold_secs = 0;
+            cfg.promotion_defer_timeout = Duration::MAX;
+        });
+        let (first, second) = (SuperfileUri::new_v4(), SuperfileUri::new_v4());
+        put_superfile(&store, &first, tiny_superfile_bytes()).await;
+        put_superfile(&store, &second, tiny_superfile_bytes()).await;
+        let first_source = open_lazily(&store, &first).await;
+        first_source.range(0, 1).await.expect("block read");
+        sleep(OPEN_GAP).await;
+        open_and_fill_a_block(&store, &second).await;
+        store.block_writes_settled().await;
+
+        sleep(OPEN_GAP).await;
+        assert!(first_source.is_local(0, 1), "served from the block");
+        first_source.range(0, 1).await.expect("cached block read");
+
+        store.evict_at_least(1).await.expect("evict");
+        assert!(!store.is_cached(&first), "the file opened first goes first");
+        assert!(store.is_cached(&second), "the file opened last stays");
+        // The evicted file's blocks stay counted until its source drops.
+        drop(first_source);
+        store.assert_budget_consistent();
+    }
+
+    #[tokio::test]
+    async fn an_entry_and_its_block_reads_share_one_record() {
+        // One file opened lazily and read under a scan.
+        //  - the open stamps `Open` and the block read `Scan`.
+        //  - both land on the record the cache entry holds.
+        // This test pins that the record lives on the entry, shared with its block source.
+        let (_dir, store) = test_store_with(|cfg| {
+            cfg.cold_fetch_mode = ColdFetchMode::LazyForegroundWithBackgroundFill;
+            cfg.promotion_defer_timeout = Duration::MAX;
+        });
+        let uri = SuperfileUri::new_v4();
+        put_superfile(&store, &uri, tiny_superfile_bytes()).await;
+        let source = open_lazily(&store, &uri).await;
+        with_read_kind(ReadKind::Scan, source.range(0, 1))
+            .await
+            .expect("read");
+        let entry = Arc::clone(store.cached.get(&uri).expect("cached").value());
+        assert!(Arc::ptr_eq(&entry.file_use, source.file_use()));
+        assert!(
+            entry.file_use.last_read_us(ReadKind::Open) > 0,
+            "the open stamped it"
+        );
+        assert!(
+            entry.file_use.last_read_us(ReadKind::Scan) > 0,
+            "the read stamped it"
+        );
     }
 
     // ----- sweep_once / sweep_for_budget / madvise counters -----

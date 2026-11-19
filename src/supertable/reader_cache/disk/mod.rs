@@ -35,6 +35,7 @@ use crate::{
             block_source::BlockCachedSource,
             config::{ColdFetchMode, DiskCacheConfig},
             disk::{fill_wait::FillWaiters, scratch::scratch_root},
+            file_use::FileUse,
         },
     },
 };
@@ -129,6 +130,13 @@ impl Drop for ForegroundQueryGuard {
     }
 }
 
+/// Debug-logs `file_use`, the record of a file whose last local copy the cache just let go.
+fn log_file_use(uri: &SuperfileUri, file_use: Option<&FileUse>) {
+    if let Some(file_use) = file_use {
+        tracing::debug!(target: "infino::cache", uri = %uri.0, %file_use, "evict: the file's use");
+    }
+}
+
 /// File mtime in microseconds since the unix epoch, 0 if the filesystem has none.
 fn file_mtime_us(meta: &fs::Metadata) -> u64 {
     meta.modified()
@@ -194,6 +202,8 @@ pub(crate) struct CachedEntry {
     /// The footer and page index the reader keeps decoded, counted against the process budget
     /// (see [`heap`]) until the entry goes.
     heap: OnceLock<HeapReservation>,
+    /// When the file was first seen and last read; an entry replacing this one takes it over.
+    file_use: Arc<FileUse>,
 }
 
 /// Which tier of the cache's walk served an open. Returned beside the reader so a scan can say
@@ -410,13 +420,16 @@ pub struct CacheStats {
 }
 
 /// A cache file found on disk at open but not opened yet. Its bytes already count against the budget.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct UnindexedFile {
     size_bytes: u64,
     /// File mtime in microseconds since the unix epoch; eviction drops the oldest first. mtime and
     /// not atime: relatime/noatime mounts make atime undependable, and for a file no read has
     /// opened the two match anyway, so oldest-mtime is oldest-copy, the likeliest dead one.
     mtime_us: u64,
+    /// The file's use, kept while the cache holds the file with no entry, for the next open to
+    /// take back; `None` for a file a restart's scan found.
+    file_use: Option<Arc<FileUse>>,
 }
 
 /// Pulls superfile bytes through a [`StorageProvider`] and caches them locally as mmap-backed
@@ -790,6 +803,31 @@ impl DiskCacheStore {
             .join(uri.cache_tmp_filename(process::id(), seq))
     }
 
+    /// The record of `uri`'s use the cache keeps, on its entry or the row of its kept blocks or
+    /// whole copy. Called with no guard held on these maps.
+    pub(crate) fn kept_file_use(&self, uri: &SuperfileUri) -> Option<Arc<FileUse>> {
+        self.cached
+            .get(uri)
+            .map(|entry| Arc::clone(&entry.file_use))
+            .or_else(|| self.block_files.get(uri).and_then(|f| f.file_use.clone()))
+            .or_else(|| self.unindexed.get(uri).and_then(|f| f.file_use.clone()))
+    }
+
+    /// [`Self::kept_file_use`], else a new record on this store's clock.
+    pub(crate) fn file_use_for(&self, uri: &SuperfileUri) -> Arc<FileUse> {
+        self.kept_file_use(uri)
+            .unwrap_or_else(|| FileUse::new(self.started_at))
+    }
+
+    /// The records of the files cached now, for a test of what stamped them.
+    #[cfg(test)]
+    pub(crate) fn file_uses(&self) -> Vec<Arc<FileUse>> {
+        self.cached
+            .iter()
+            .map(|entry| Arc::clone(&entry.value().file_use))
+            .collect()
+    }
+
     // Test and bench helpers. Compiled only for tests and the `test-helpers` feature, never into
     // the shipped library.
 
@@ -1002,6 +1040,7 @@ pub(crate) mod test_support {
             uri,
             Arc::new(CachedEntry {
                 heap: OnceLock::new(),
+                file_use: store.file_use_for(&uri),
                 reader,
                 residency,
                 size_bytes,

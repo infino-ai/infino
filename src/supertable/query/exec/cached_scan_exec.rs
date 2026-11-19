@@ -143,6 +143,7 @@ use crate::{
             read_ahead::{file_pruning, file_schema, pruning_for, statistics_pruned},
             schema_adapter::TableExprAdapterFactory,
         },
+        reader_cache::file_use::{ReadKind, with_read_kind},
         schema::{FieldId, cast::CAST_OPTIONS},
     },
 };
@@ -396,10 +397,11 @@ impl IdBlockQueue {
                 async move { file.reader.id_blocks().await }
             })
             .collect();
-        let fetched: Vec<_> = stream::iter(reads)
+        let fetched = stream::iter(reads)
             .buffered(in_flight.max(1))
-            .collect()
-            .await;
+            .collect::<Vec<_>>();
+        // The id sidecars are read for the scan, on its own task: one scope stamps them all.
+        let fetched = with_read_kind(ReadKind::Scan, fetched).await;
         let mut files: Vec<FileBlocks> = Vec::with_capacity(order.len());
         for (file, blocks) in order.iter().zip(fetched) {
             let blocks = blocks?;
