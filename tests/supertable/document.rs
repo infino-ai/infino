@@ -26,8 +26,8 @@ use std::sync::Arc;
 use arrow::{compute::cast, util::pretty::pretty_format_batches};
 use arrow_array::{
     Array, ArrayRef, BooleanArray, Float64Array, Int64Array, LargeStringArray, RecordBatch,
-    StringArray, TimestampMillisecondArray, builder::Int64Builder, builder::ListBuilder,
-    builder::StringBuilder,
+    StringArray, TimestampMillisecondArray,
+    builder::{Int64Builder, ListBuilder, StringBuilder},
 };
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use datafusion::prelude::{col, lit};

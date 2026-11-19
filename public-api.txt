@@ -1,4 +1,7 @@
 pub mod infino
+pub use infino::arrow_array
+pub use infino::arrow_schema
+pub use infino::serde_json
 pub mod infino::document
 #[non_exhaustive] pub enum infino::document::DocumentError
 pub infino::document::DocumentError::BadResidual
@@ -12,10 +15,10 @@ pub infino::document::DocumentError::MissingValue
 pub infino::document::DocumentError::MissingValue::slot: infino::document::Slot
 pub infino::document::DocumentError::UnterminatedString
 impl core::clone::Clone for infino::document::DocumentError
-pub fn infino::document::DocumentError::clone(&self) -> infino::document::DocumentError
+pub fn infino::document::DocumentError::clone(&self) -> Self
 impl core::cmp::Eq for infino::document::DocumentError
 impl core::cmp::PartialEq for infino::document::DocumentError
-pub fn infino::document::DocumentError::eq(&self, &infino::document::DocumentError) -> bool
+pub fn infino::document::DocumentError::eq(&self, &Self) -> bool
 impl core::error::Error for infino::document::DocumentError
 impl core::fmt::Debug for infino::document::DocumentError
 pub fn infino::document::DocumentError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
@@ -36,10 +39,10 @@ pub infino::document::Slot::Value(infino::FieldId)
 impl infino::document::Slot
 pub fn infino::document::Slot::field(&self) -> core::option::Option<infino::FieldId>
 impl core::clone::Clone for infino::document::Slot
-pub fn infino::document::Slot::clone(&self) -> infino::document::Slot
+pub fn infino::document::Slot::clone(&self) -> Self
 impl core::cmp::Eq for infino::document::Slot
 impl core::cmp::PartialEq for infino::document::Slot
-pub fn infino::document::Slot::eq(&self, &infino::document::Slot) -> bool
+pub fn infino::document::Slot::eq(&self, &Self) -> bool
 impl core::fmt::Debug for infino::document::Slot
 pub fn infino::document::Slot::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::fmt::Display for infino::document::Slot
@@ -67,9 +70,6 @@ pub fn infino::document::residual_column(&str) -> alloc::string::String
 pub fn infino::document::residual_values(&str) -> core::result::Result<alloc::vec::Vec<&str>, infino::document::DocumentError>
 pub fn infino::document::skeleton_column(&str) -> alloc::string::String
 pub fn infino::document::slots(&str) -> core::result::Result<alloc::vec::Vec<infino::document::Slot>, infino::document::DocumentError>
-pub use infino::arrow_array
-pub use infino::arrow_schema
-pub use infino::serde_json
 pub enum infino::BoolMode
 pub infino::BoolMode::And
 pub infino::BoolMode::Or
