@@ -1,6 +1,6 @@
 # How Infino compares
 
-Infino is a search library built as an alternative to Lucene. It runs full-text (BM25), vector, hybrid, and SQL search over ordinary Parquet on local disk or object storage, embedded in your application with no server to operate. This page starts with Lucene and the engines built on it, then covers the other tools you might be weighing. Head-to-head numbers are in the [README](../README.md#infino-and-lucene) and on the public benchmark boards linked below; this page is about the architectural differences.
+Infino is a search library built as an alternative to Lucene. It runs full-text (BM25), vector, hybrid, and SQL search over ordinary Parquet on local disk or object storage, embedded in your application with no server to operate, or fully managed on [Infino Cloud](https://infino.ai/docs/cloud) with the same API. This page starts with Lucene and the engines built on it, then covers the other tools you might be weighing. Head-to-head numbers are in the [README](../README.md#infino-and-lucene) and on the public benchmark boards linked below; this page is about the architectural differences.
 
 ## vs Lucene
 
@@ -41,7 +41,7 @@ A Postgres vector extension adds vector columns to relational rows inside a runn
 
 ## When Infino is not the right tool
 
-Infino is append-first and commit-oriented, not a transactional row store, so if you need per-row updates with immediate read-your-write semantics, a database is the better fit. If you need a managed, always-on multi-node service that someone else operates for you, a hosted search or vector service fits that shape better. And warm-query latency assumes a filled cache: the first cold query pays file opens and cache fill. The current limitations are listed in the Limitations section of the [README](../README.md#limitations).
+Infino is append-first and commit-oriented, not a transactional row store, so if you need per-row updates with immediate read-your-write semantics, a database is the better fit. If you want a service someone else operates, [Infino Cloud](https://infino.ai/docs/cloud) runs the same engine fully managed, with the same API. And warm-query latency assumes a filled cache: the first cold query pays file opens and cache fill. The current limitations are listed in the Limitations section of the [README](../README.md#limitations).
 
 ## Summary
 
@@ -51,6 +51,7 @@ Infino is append-first and commit-oriented, not a transactional row store, so if
 | Indexes on object storage, compute disposable | yes | local disks per replica; object storage for cold tiers |
 | Full-text, vector, hybrid, and SQL over one table | yes | full-text and vectors; SQL translated to the query DSL |
 | Embedded in your process | yes | Lucene yes; Elasticsearch and OpenSearch run a cluster |
+| Fully managed service | yes, Infino Cloud | Elastic Cloud, Amazon OpenSearch Service |
 | Fuzzy matching, highlighting, geo, many analyzers | not yet | yes |
 | Transactional per-row updates | no | no; a database fits better |
 

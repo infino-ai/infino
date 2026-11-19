@@ -83,7 +83,8 @@ language analyzers. If you need one of them, [open a feature request](https://gi
 shard with an Infino table. Index, bulk, get, search, aggregations, and Dashboards work
 unchanged; the documents live on local disk or object storage, and the same indices answer SQL.
 A node with an empty data directory brings every index back from storage. It installs into
-released OpenSearch versions, with no fork.
+released OpenSearch versions, with no fork. The tables can live on your own storage or on an
+Infino Cloud account.
 
 ## Performance
 
@@ -463,8 +464,9 @@ ORDER BY hits DESC;
   there are no cross-table transactions. This is not an OLTP store.
 - Writes go through a single writer slot, so there is one writer per table at a time. Readers
   are unbounded and are never blocked.
-- This is a library with a SQL and Arrow surface. There is no daemon, no REST endpoint, and no
-  cluster to operate.
+- The open-source engine is a library with a SQL and Arrow surface: no daemon, no REST endpoint,
+  and no cluster to operate. For a hosted service, [Infino Cloud](https://infino.ai/docs/cloud) runs the same engine
+  fully managed, with the same API; a program moves to it by changing its `connect` target.
 
 The crate is 0.x and the API can still move. The public surface is pinned by `public-api.txt`.
 
