@@ -2496,7 +2496,11 @@ impl SupertableReader {
                 settled_before = settled;
                 // Probes run beside the opens, which go in bound order; what
                 // they settle replaces the plan for the units not yet opened.
-                if let Some(stage) = chosen.probes {
+                // Where every unit in play issues at once there are none such:
+                // the probes would add their reads to the opens' and change
+                // nothing.
+                let window = manifest.options.ordered_open_window();
+                if let Some(stage) = chosen.probes.filter(|_| units.len() > window) {
                     replan = Some(Box::pin(async move {
                         match stage.run().await {
                             Ok(selection) => Some(make_plan(selection)),
