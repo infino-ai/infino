@@ -791,10 +791,78 @@ pub struct ScalarStatsAgg {
     pub(crate) value_counts: Option<ScalarValueCounts>,
 }
 
+/// The order a value table's entries and an `=` or `IN`'s literals are sorted in. Values of one
+/// counted type always compare; `Equal` for two that don't keeps a sort from panicking.
+pub(crate) fn value_order(left: &ScalarValue, right: &ScalarValue) -> Ordering {
+    left.partial_cmp(right).unwrap_or(Ordering::Equal)
+}
+
+/// The rows a value table holds for asked values, the table's `entries` and the `asked` values each
+/// distinct and sorted in one order: `order(entry, value)` compares an entry with an asked value by
+/// index, and `rows(entry)` is the entry's count. `None` when the sum passes u64.
+pub(crate) fn held_rows(
+    entries: usize,
+    asked: usize,
+    order: impl Fn(usize, usize) -> Ordering,
+    rows: impl Fn(usize) -> u64,
+) -> Option<u64> {
+    let (short, long) = (asked.min(entries), asked.max(entries));
+    if short == 0 {
+        return Some(0);
+    }
+    let mut held: u64 = 0;
+    // Both sides are sorted. Searching the longer side for each value of the shorter costs about
+    // `short * log2(long)` comparisons, walking the two side by side `short + long`: the cheaper
+    // is taken.
+    if short * long.ilog2() as usize >= short + long {
+        let (mut entry, mut value) = (0, 0);
+        while entry < entries && value < asked {
+            match order(entry, value) {
+                Ordering::Less => entry += 1,
+                Ordering::Greater => value += 1,
+                Ordering::Equal => {
+                    held = held.checked_add(rows(entry))?;
+                    entry += 1;
+                    value += 1;
+                }
+            }
+        }
+    } else if asked <= entries {
+        for value in 0..asked {
+            if let Some(entry) = sorted_position(entries, |entry| order(entry, value)) {
+                held = held.checked_add(rows(entry))?;
+            }
+        }
+    } else {
+        for entry in 0..entries {
+            if sorted_position(asked, |value| order(entry, value).reverse()).is_some() {
+                held = held.checked_add(rows(entry))?;
+            }
+        }
+    }
+    Some(held)
+}
+
+/// The index in `0..len` of the item looked for, the items sorted: `order(at)` compares the item at
+/// `at` with the one looked for.
+fn sorted_position(len: usize, order: impl Fn(usize) -> Ordering) -> Option<usize> {
+    let (mut low, mut high) = (0, len);
+    while low < high {
+        let middle = low + (high - low) / 2;
+        match order(middle) {
+            Ordering::Less => low = middle + 1,
+            Ordering::Greater => high = middle,
+            Ordering::Equal => return Some(middle),
+        }
+    }
+    None
+}
+
 /// A column's exact value table. The entries are shared: a table is never
 /// changed once built, and a superfile's stats are copied whole as an entry
 /// moves into a part and its summaries, so a copy of a table is a count, not
-/// the values it holds.
+/// the values it holds. Its entries are distinct, sorted by value, of one counted type and
+/// comparable pairwise, with no null value or zero count.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ScalarValueCounts {
     entries: Arc<[(ScalarValue, u64)]>,
@@ -898,7 +966,7 @@ impl ScalarValueCounts {
         {
             return None;
         }
-        entries.sort_by(|left, right| left.0.partial_cmp(&right.0).unwrap_or(Ordering::Equal));
+        entries.sort_by(|left, right| value_order(&left.0, &right.0));
         if entries
             .windows(2)
             .any(|pair| pair[0].0.partial_cmp(&pair[1].0).is_none())
@@ -1038,6 +1106,28 @@ impl ScalarValueCounts {
 
     pub(crate) fn entries(&self) -> &[(ScalarValue, u64)] {
         &self.entries
+    }
+
+    /// The rows the table holds for `values`: distinct, in [`value_order`], of one type. `None`
+    /// when that type is not the table's, so the values don't compare, or the sum passes u64.
+    pub(crate) fn rows_holding(&self, values: &[ScalarValue]) -> Option<u64> {
+        let (first, _) = self.entries.first()?;
+        if values.first()?.data_type() != first.data_type() {
+            return None;
+        }
+        debug_assert!(
+            values
+                .windows(2)
+                .all(|pair| value_order(&pair[0], &pair[1]) == Ordering::Less
+                    && pair[1].data_type() == first.data_type()),
+            "asked values are distinct, sorted and of one type"
+        );
+        held_rows(
+            self.entries.len(),
+            values.len(),
+            |entry, value| value_order(&self.entries[entry].0, &values[value]),
+            |entry| self.entries[entry].1,
+        )
     }
 
     /// About the bytes the table's entries take stored: each value's own
@@ -3610,6 +3700,56 @@ mod tests {
         assert!(a.null_count.is_none());
         assert!(a.hll.is_none());
         assert!(a.value_counts.is_none());
+    }
+
+    /// The table of `entries`, which must make one.
+    fn table_of(entries: Vec<(ScalarValue, u64)>) -> ScalarValueCounts {
+        ScalarValueCounts::from_entries(entries).expect("a table")
+    }
+
+    #[test]
+    fn a_table_counts_asked_values() {
+        // Tables of strings, decimals, booleans and integers, asked for fewer values than they hold
+        // (each asked value is searched in the table), for more (each table value is searched),
+        // and for about as many (both are walked side by side).
+        //  - Held values add their rows; absent ones add nothing.
+        //  - Values of another type, or counts whose sum passes u64, give no count.
+        // This test pins all three ways the in-memory table is searched.
+        let s = |v: &str| ScalarValue::Utf8(Some(v.to_string()));
+        let strings = table_of(vec![(s("a"), 2), (s("c"), 3), (s("e"), 4)]);
+        assert_eq!(strings.rows_holding(&[s("c")]), Some(3));
+        assert_eq!(strings.rows_holding(&[s("b"), s("e")]), Some(4));
+        assert_eq!(
+            strings.rows_holding(&[s("a"), s("b"), s("c"), s("d"), s("e")]),
+            Some(9)
+        );
+        assert_eq!(
+            strings.rows_holding(&[s("b"), s("d"), s("f"), s("g")]),
+            Some(0)
+        );
+        let d = |v: i128| ScalarValue::Decimal128(Some(v), 10, 2);
+        let decimals = table_of(vec![(d(150), 5), (d(200), 6)]);
+        assert_eq!(decimals.rows_holding(&[d(150)]), Some(5));
+        assert_eq!(
+            decimals.rows_holding(&[d(100), d(150), d(175), d(200)]),
+            Some(11)
+        );
+        let b = |v: bool| ScalarValue::Boolean(Some(v));
+        let flags = table_of(vec![(b(true), 7)]);
+        assert_eq!(flags.rows_holding(&[b(true)]), Some(7));
+        assert_eq!(flags.rows_holding(&[b(false), b(true)]), Some(7));
+        assert_eq!(flags.rows_holding(&[b(false)]), Some(0));
+        let i = |v: i64| ScalarValue::Int64(Some(v));
+        let one = table_of(vec![(i(1), 1)]);
+        assert_eq!(one.rows_holding(&[ScalarValue::Int32(Some(1))]), None);
+        let full = table_of(vec![(i(1), u64::MAX), (i(2), 1)]);
+        assert_eq!(full.rows_holding(&[i(1), i(2)]), None);
+        assert_eq!(full.rows_holding(&[i(0), i(1), i(2)]), None);
+        let walked = table_of(vec![(i(1), 2), (i(3), 3), (i(5), 4), (i(7), 5)]);
+        assert_eq!(walked.rows_holding(&[i(0), i(3), i(5), i(8)]), Some(7));
+        assert_eq!(walked.rows_holding(&[i(0), i(2), i(4), i(6)]), Some(0));
+        let walked_full = table_of(vec![(i(1), u64::MAX), (i(2), 1), (i(3), 1), (i(4), 1)]);
+        assert_eq!(walked_full.rows_holding(&[i(1), i(2), i(3), i(4)]), None);
     }
 
     /// A side with no non-null values (an all-null batch of the column)
