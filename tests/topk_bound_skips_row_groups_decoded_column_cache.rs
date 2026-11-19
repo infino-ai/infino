@@ -318,17 +318,25 @@ fn a_bound_from_above_skips_work_and_changes_no_answer() {
     let skipped = scan_metric(&conn, &join, ROW_GROUPS_SKIPPED);
     assert!(skipped >= 1.0, "skipped {skipped} row groups: {join}");
 
-    // A `MIN`/`MAX` aggregate hands down its best value so far; the scan
-    // skips the row groups whose statistics can't beat it, so each skip
-    // proves the pushed bound reached the scan, not only that the answer is
-    // right.
+    // A `MIN`/`MAX` aggregate hands down its best value so far, and the scan
+    // skips the row groups whose statistics can't beat it. A filter passes its
+    // rows on in batches of 8,192, so under `spread % 5 = 0`, a fifth of each
+    // row group, the aggregate sets no bound until its partition's scan ends,
+    // and a skip turns on another partition's bound arriving in time: those are
+    // checked for their answers only.
     let kept: Vec<i64> = (0..total).filter(|s| s * SPREAD % total % 5 == 0).collect();
     for (aggregate, want) in [("MIN", kept.iter().min()), ("MAX", kept.iter().max())] {
         let sql = format!("SELECT {aggregate}(seq) FROM t WHERE spread % 5 = 0");
         assert_eq!(answer(&conn, &sql), vec![want.copied()], "{sql}");
-        let skipped = scan_metric(&conn, &sql, ROW_GROUPS_SKIPPED);
-        assert!(skipped >= 1.0, "skipped {skipped} row groups: {sql}");
     }
+    // Under `spread % 5 <> 7`, which keeps every row but which statistics
+    // cannot settle, a row group's first batch goes on whole, and each partition
+    // reads its highest `seq` first, so the `MAX` that batch settles rules out
+    // the partition's other row groups: the bound reached the scan.
+    let max = "SELECT MAX(seq) FROM t WHERE spread % 5 <> 7";
+    assert_eq!(answer(&conn, max), vec![Some(total - 1)], "{max}");
+    let skipped = scan_metric(&conn, max, ROW_GROUPS_SKIPPED);
+    assert!(skipped >= 1.0, "skipped {skipped} row groups: {max}");
     let both = "SELECT MIN(seq), MAX(seq) FROM t WHERE spread % 5 = 0";
     let got = conn.query_sql(both).expect("min and max");
     assert_eq!(
@@ -338,11 +346,6 @@ fn a_bound_from_above_skips_work_and_changes_no_answer() {
             vec![kept.iter().max().copied()]
         ),
         "{both}"
-    );
-    let both_skipped = scan_metric(&conn, both, ROW_GROUPS_SKIPPED);
-    assert!(
-        both_skipped >= 1.0,
-        "skipped {both_skipped} row groups: {both}"
     );
 
     // `w`: `n` written as `Int32`, widened to `Int64`, written again. The

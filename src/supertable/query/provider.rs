@@ -4143,7 +4143,9 @@ pub(crate) mod tests {
             },
             reader_cache::disk::{
                 HeapBudget,
-                test_support::{PROMOTE_TIMEOUT, cache_buffered, lazy_entries},
+                test_support::{
+                    PROMOTE_TIMEOUT, cache_buffered, lazy_entries, reclaimable_lazy_entries,
+                },
             },
             schema::change::{FieldPatch, SchemaPatch},
         },
@@ -7572,14 +7574,21 @@ pub(crate) mod tests {
         assert!(cache.stats().n_entries > 0, "its files are cached");
         assert!(budget.charged() > 0, "and counted");
 
+        // Its block writes done first, so its end's pass keeps only files still downloading:
+        // their reservations cover the downloads, and once they land the files are mapped whole,
+        // which is not counted.
+        cache.block_writes_settled().await;
         drop(ctx);
-        // A download still running at its end keeps its file: its reservation covers the
-        // download. Once it lands, the file is mapped whole, which is not counted.
+        assert_eq!(
+            reclaimable_lazy_entries(&cache),
+            0,
+            "its end lets go of every file it can"
+        );
         cache
             .wait_until_fills_settled(PROMOTE_TIMEOUT)
             .await
             .expect("its downloads settle");
-        assert_eq!(lazy_entries(&cache), 0, "its end lets them go");
+        assert_eq!(lazy_entries(&cache), 0, "and the downloads land the rest");
         assert_eq!(budget.charged(), 0, "each once");
     }
 
