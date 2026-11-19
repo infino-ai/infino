@@ -4121,7 +4121,7 @@ pub(crate) mod tests {
             },
             reader_cache::disk::{
                 HeapBudget,
-                test_support::{cache_buffered, lazy_entries},
+                test_support::{PROMOTE_TIMEOUT, cache_buffered, lazy_entries},
             },
             schema::change::{FieldPatch, SchemaPatch},
         },
@@ -7551,7 +7551,12 @@ pub(crate) mod tests {
         assert!(budget.charged() > 0, "and counted");
 
         drop(ctx);
-        // A background fill that finished first leaves its file mapped whole, which is not counted.
+        // A download still running at its end keeps its file: its reservation covers the
+        // download. Once it lands, the file is mapped whole, which is not counted.
+        cache
+            .wait_until_fills_settled(PROMOTE_TIMEOUT)
+            .await
+            .expect("its downloads settle");
         assert_eq!(lazy_entries(&cache), 0, "its end lets them go");
         assert_eq!(budget.charged(), 0, "each once");
     }
