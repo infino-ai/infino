@@ -8,14 +8,10 @@
 //! written as a step from it. With none kept, or when a fresh base is due, a
 //! base is written.
 
-use std::{
-    collections::HashSet,
-    sync::{LazyLock, Mutex, MutexGuard, PoisonError},
-};
+use std::sync::{LazyLock, Mutex, MutexGuard, PoisonError};
 
 use tokio::task::spawn_blocking;
 use tracing::warn;
-use uuid::Uuid;
 
 use crate::{
     storage::StorageProvider,
@@ -23,7 +19,7 @@ use crate::{
     supertable::{
         manifest::list::RoutingRef,
         query::{
-            fine_graph_cache::{FineNodeKey, GraphRole, MAX_CACHED_GRAPHS},
+            fine_graph_cache::{GraphRole, MAX_CACHED_GRAPHS},
             fine_graph_store::{GraphBase, GraphHead, GraphStep, KeyedGraph},
         },
         schema::FieldId,
@@ -36,7 +32,6 @@ struct Written {
     head: GraphHead,
     reference: RoutingRef,
     graph: KeyedGraph,
-    superfiles: HashSet<Uuid>,
 }
 
 static WRITTEN: LazyLock<Mutex<Vec<Written>>> = LazyLock::new(|| Mutex::new(Vec::new()));
@@ -53,25 +48,6 @@ fn continues(last: &KeyedGraph, next: &KeyedGraph) -> bool {
             .iter()
             .zip(&next.keys)
             .all(|(before, after)| after.is_none() || after == before)
-}
-
-/// Whether the next graph of the table that owns any of `superfiles` must be
-/// written as a base. The caller then builds that graph from scratch, since
-/// a base holds no holes.
-pub(crate) fn base_due<'a>(
-    role: GraphRole,
-    column: FieldId,
-    mut superfiles: impl Iterator<Item = &'a Uuid>,
-) -> bool {
-    let written = lock_written();
-    superfiles.any(|id| {
-        written.iter().any(|w| {
-            w.head.role == role
-                && w.head.column == column
-                && w.superfiles.contains(id)
-                && w.head.fold_due()
-        })
-    })
 }
 
 /// Whether `reference` is the head of a graph this process wrote.
@@ -111,11 +87,9 @@ pub(crate) async fn write(
             Some(last) => GraphStep::between(&last.graph, &graph)
                 .ok()
                 .map(|step| (step.to_bytes(), Object::Step(last.head, step))),
-            None => {
-                let keys: Option<Vec<FineNodeKey>> = graph.keys.iter().copied().collect();
-                keys.and_then(|keys| GraphBase::new(keys, Hnsw::clone(&graph.graph)).ok())
-                    .map(|base| (base.to_bytes(), Object::Base(base)))
-            }
+            None => GraphBase::new(graph.keys.clone(), Hnsw::clone(&graph.graph))
+                .ok()
+                .map(|base| (base.to_bytes(), Object::Base(base))),
         };
         (graph, object)
     })
@@ -131,13 +105,11 @@ pub(crate) async fn write(
         }
     };
     let reference = put(storage, head.to_bytes()).await?;
-    let superfiles = graph.keys.iter().flatten().map(|key| key.0).collect();
     let mut written = lock_written();
     written.push(Written {
         head,
         reference: reference.clone(),
         graph,
-        superfiles,
     });
     if written.len() > MAX_CACHED_GRAPHS {
         written.remove(0);
@@ -160,12 +132,15 @@ async fn put(storage: &dyn StorageProvider, bytes: Vec<u8>) -> Option<RoutingRef
 #[cfg(test)]
 mod tests {
     use tempfile::TempDir;
+    use uuid::Uuid;
 
     use super::*;
     use crate::{
         storage::LocalFsStorageProvider,
         superfile::vector::hnsw::{HnswParams, Sq16Scorer},
-        supertable::slow_vector_state::fetch_resident_index_blob,
+        supertable::{
+            query::fine_graph_cache::FineNodeKey, slow_vector_state::fetch_resident_index_blob,
+        },
     };
 
     const DIM: usize = 8;
@@ -242,10 +217,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_graph_with_holes_and_nothing_kept_is_not_written() {
+    async fn a_graph_with_holes_and_nothing_kept_is_written_as_a_base() {
         let table = 0xA2_0000;
         let dir = TempDir::new().expect("tempdir");
         let storage = LocalFsStorageProvider::new(dir.path()).expect("storage");
-        assert!(head(&storage, next(table, &first(table))).await.is_none());
+        let graph = next(table, &first(table));
+        let base = head(&storage, graph.clone()).await.expect("base");
+        assert!(base.steps.is_empty());
+        assert!(base.describes(&graph));
     }
 }

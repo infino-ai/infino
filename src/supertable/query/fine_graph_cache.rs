@@ -55,13 +55,13 @@ pub(crate) enum GraphRole {
 /// table column (about 1.2 GB at 8.5M centroids), so the cache stays small.
 pub(crate) const MAX_CACHED_GRAPHS: usize = 4;
 
-/// Share of a graph's nodes that may be removed or added, counted over every
-/// update since its last full build, before it is rebuilt instead of updated.
-/// An updated graph keeps the quality of the build it started from, so once
-/// much of it has changed a fresh build costs little more and starts that
-/// quality over. Counting additions keeps a table that only grows from
-/// patching one graph forever.
-const MAX_CHANGED_SHARE: f64 = 0.2;
+/// How many times over a graph's nodes may be removed or added, counted over
+/// every update since its last full build, before it is rebuilt instead of
+/// updated. Compaction re-clusters a table's newest files on every pass, so a
+/// third of a small table's nodes can change at once, and an updated graph
+/// searches as well as a fresh build through many such passes. The bound only
+/// stops one graph from being patched forever.
+const MAX_CHANGED_MULTIPLE: f64 = 4.0;
 
 /// A graph over one table column's fine centroids, with the key of each node.
 struct CachedGraph {
@@ -145,7 +145,7 @@ where
     );
     let params = HnswParams::default();
     let (graph, scorer, order, source, changed_since_build) =
-        match take_cached(role, column, dim, metric, keys) {
+        match take_cached(role, column, dim, metric, keys).map(without_most_holes) {
             Some(cached) => match update_plan(&cached.keys, cached.changed_since_build, keys) {
                 Some((gone, order, added)) => {
                     let scorer = make_scorer(&order);
@@ -234,10 +234,29 @@ fn update_plan(
     let added = order.len() - slots;
     let changed = changed_before + gone.len() + added;
     let live_before = cached.iter().filter(|key| key.is_some()).count();
-    if changed as f64 > MAX_CHANGED_SHARE * live_before.max(keys.len()) as f64 {
+    if changed as f64 > MAX_CHANGED_MULTIPLE * live_before.max(keys.len()) as f64 {
         return None;
     }
     Some((gone, order, added))
+}
+
+/// `cached` with its holes dropped once they outnumber its live nodes. This
+/// renumbers the nodes, so a stored form written next is a fresh base.
+fn without_most_holes(cached: CachedGraph) -> CachedGraph {
+    let live = cached.keys.iter().flatten().count();
+    if cached.keys.len() - live <= live {
+        return cached;
+    }
+    let (graph, kept) = cached.graph.without_holes();
+    let keys = kept
+        .iter()
+        .map(|&node| cached.keys[node as usize])
+        .collect();
+    CachedGraph {
+        graph,
+        keys,
+        ..cached
+    }
 }
 
 /// Remove and return the cached `role` graph of this table column, if any.
@@ -446,20 +465,40 @@ mod tests {
     }
 
     #[test]
-    fn a_graph_that_changed_too_much_since_its_build_is_rebuilt() {
+    fn a_graph_is_rebuilt_only_once_replaced_many_times_over() {
         let cached: Vec<Option<FineNodeKey>> = (0..10).map(|p| Some(key(1, 0, p))).collect();
-        // Seven of ten survive: 30% removed, over the limit.
-        let fewer: Vec<FineNodeKey> = (0..7).map(|p| key(1, 0, p)).collect();
-        assert!(update_plan(&cached, 0, &fewer).is_none());
-        // Ten survive and three are added: 30% added, over the limit too.
-        let more: Vec<FineNodeKey> = (0..13).map(|p| key(1, 0, p)).collect();
-        assert!(update_plan(&cached, 0, &more).is_none());
-        // One removed: an update...
-        let one_gone: Vec<FineNodeKey> = (0..9).map(|p| key(1, 0, p)).collect();
-        let (gone, order, added) = update_plan(&cached, 0, &one_gone).expect("update");
-        assert_eq!((gone, added), (vec![9], 0));
-        assert_eq!(order[9], None, "the removed key's slot stays, as a hole");
-        // ...unless earlier updates already changed two nodes since the build.
-        assert!(update_plan(&cached, 2, &one_gone).is_none());
+        // Seven of ten survive and five are added.
+        let next: Vec<FineNodeKey> = (0..7).chain(10..15).map(|p| key(1, 0, p)).collect();
+        let (gone, order, added) = update_plan(&cached, 0, &next).expect("update");
+        assert_eq!((gone, added), (vec![7, 8, 9], 5));
+        assert_eq!(order[9], None, "a removed key's slot stays, as a hole");
+        // The same change after earlier updates replaced the graph four times.
+        assert!(update_plan(&cached, 45, &next).is_none());
+    }
+
+    #[test]
+    fn holes_are_dropped_once_they_outnumber_live_nodes() {
+        let base = 0xF3_0000_0000u128;
+        let column = FieldId(9);
+        let keys: Vec<FineNodeKey> = (0..20).flat_map(|c| cell_keys(base, c)).collect();
+        graph_over(column, &keys);
+        let fewer: Vec<FineNodeKey> = keys.iter().copied().filter(|k| k.1 < Some(8)).collect();
+        let (graph, _, _, source) = graph_over(column, &fewer);
+        assert!(matches!(source, GraphSource::Updated { .. }));
+        assert!(
+            graph.len() > 2 * graph.live_len(),
+            "holes outnumber live nodes"
+        );
+
+        let (graph, _, order, source) = graph_over(column, &fewer);
+        assert_eq!(
+            source,
+            GraphSource::Updated {
+                removed: 0,
+                added: 0
+            }
+        );
+        assert_eq!(graph.len(), fewer.len(), "the holes are gone");
+        assert!(order.iter().all(Option::is_some));
     }
 }

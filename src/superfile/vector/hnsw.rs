@@ -1397,6 +1397,21 @@ impl Hnsw {
     /// The graph with its holes dropped and the live nodes renumbered from 0
     /// in their old order, and `kept[new] = old` for each of them. No list
     /// names a hole, so nothing needs repair: every list is only renumbered.
+    /// This graph with `nodes` made holes. The bytes keep a hole as a node
+    /// with no neighbors, so a decoder that knows which nodes were holes
+    /// restores them here. `None` if one of them has neighbors.
+    pub(crate) fn with_holes(mut self, nodes: impl IntoIterator<Item = u32>) -> Option<Hnsw> {
+        for node in nodes {
+            let node = node as usize;
+            let lists = self.neighbors.get(node)?;
+            if self.node_level[node] != 0 || lists.iter().any(|list| !list.is_empty()) {
+                return None;
+            }
+            self.neighbors[node] = Vec::new();
+        }
+        Some(self)
+    }
+
     pub(crate) fn without_holes(&self) -> (Hnsw, Vec<u32>) {
         let kept: Vec<u32> = (0..self.len as u32).filter(|&n| !self.is_hole(n)).collect();
         let mut remap = vec![u32::MAX; self.len];
