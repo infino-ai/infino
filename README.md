@@ -6,8 +6,9 @@
 [![CI](https://github.com/infino-ai/infino/actions/workflows/ci.yml/badge.svg)](https://github.com/infino-ai/infino/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-**Infino is a fast embedded retrieval library: full-text, vector, hybrid, and SQL over one table, stored as
-ordinary Parquet on local disk or object storage. Simple, scalable, and optimized for cost.**
+**Infino is a search library built as an alternative to Lucene. Its full-text and vector indexes live
+inside ordinary Parquet files, on local disk or object storage, so one copy of the data answers BM25,
+vector, hybrid, and SQL queries.**
 
 ```sh
 pip install infino              # Python
@@ -47,6 +48,34 @@ docs.append(rows)   # list of dicts, or an Arrow RecordBatch
 # BM25 and vector in one call, fused ranking. `query_vec` is your embedding.
 hits = docs.hybrid_search("body", "disk full", "embedding", query_vec, k=10)
 ```
+
+## Infino and Lucene
+
+Lucene is the standard search library and the engine inside Elasticsearch, OpenSearch, and Solr.
+Infino does the same job, an in-process library you index into and search, with a different
+storage design: the index is Parquet, and it can live on object storage.
+
+| | Lucene | Infino |
+|---|---|---|
+| Index format | Segment files, readable only by Lucene | Parquet files with the BM25 and vector indexes inside; DuckDB, pyarrow, and DataFusion read the same files |
+| Documents | Stored fields and doc values in Lucene's own files | Parquet columns, in the same file as the indexes |
+| Storage | A directory on local disk; Elasticsearch and OpenSearch copy each shard to replicas on other nodes | Local disk or object storage (S3, GCS, Azure); a cache keeps the byte ranges queries touch |
+| Commits | Segments, refresh, background merges | Immutable files and an atomic manifest swap; `optimize()` compacts |
+| Full-text | BM25 with Block-Max WAND | BM25; picks WAND, Block-Max WAND, MaxScore, stored counts, or bitsets per query |
+| Vectors | An HNSW graph per segment, fastest when held in memory | IVF with 1-bit codes paged from object storage by default; HNSW and flat modes optional |
+| SQL | None; Elasticsearch and OpenSearch translate a SQL dialect into their query DSL | Full SQL on Apache DataFusion, with joins and aggregates, and search as table functions |
+| Runtime | Java | Rust, with Python and Node.js bindings |
+
+On [Search Benchmark, the Game](https://tantivy-search.github.io/bench/), Infino answers top-k
+and count queries in about half of Lucene's time:
+
+![Full-text latency relative to Lucene, Search Benchmark the Game](docs/assets/readme/compare-fts.svg)
+
+[Search Benchmark, the Game](https://tantivy-search.github.io/bench/)
+([Repro](https://github.com/infino-ai/search-benchmark-game))
+
+Lucene still covers more ground: fuzzy matching, highlighting, geo queries, and a wider set of
+language analyzers. If you depend on those, stay on Lucene.
 
 ## Performance
 
@@ -172,29 +201,35 @@ Supertable FTS; the SQL shapes are `agg_max_title` (metadata), `WHERE key = ?` (
 
 ### Against other engines
 
+Full-text against Lucene is [above](#infino-and-lucene). Vector search against the Lucene-based
+services and vector databases:
+
 ![Vector search p99 vs vector databases, VectorDBBench Cohere 1M](docs/assets/readme/compare-vdb.svg)
 
 [VectorDBBench](https://vdbbench-viewer-q6unoyyhua-uc.a.run.app/results)
 ([Repro](https://github.com/infino-ai/retrievalbench))
 
-![Quantized vector indexes vs embedded libraries, dbpedia-1536 100K, same queries and ground truth](docs/assets/readme/compare-embedded.svg)
+SQL against search engines, Elasticsearch included:
 
-[RetrievalBench](https://github.com/infino-ai/retrievalbench)([Repro](https://github.com/infino-ai/retrievalbench))
+![SQL vs search engines, ClickBench vCPU-seconds per query](docs/assets/readme/compare-sql-search.svg)
 
-![Full-text latency relative to Lucene, Search Benchmark the Game](docs/assets/readme/compare-fts.svg)
+[ClickBench](https://benchmark.clickhouse.com/#system=-&type=+sac&machine=+c6a.4xlarge&cluster_size=-&opensource=-&hardware=+c&tuned=+n&metric=hot&queries=-)
+([Repro](https://github.com/infino-ai/retrievalbench))
 
-[Search Benchmark, the Game](https://tantivy-search.github.io/bench/)
-([Repro](https://github.com/infino-ai/search-benchmark-game))
+<details>
+<summary>Against analytic engines and embedded vector libraries</summary>
 
 ![SQL vs analytic engines, ClickBench vCPU-seconds per query](docs/assets/readme/compare-sql.svg)
 
 [ClickBench](https://benchmark.clickhouse.com/#system=+ClickHouse%7CDuckDB%7CInfino%7CDataFusion%20%28Parquet%2C%20single%29&machine=+c6a.4xlarge&cluster_size=-&type=-&metric=hot)
 ([Repro](https://github.com/infino-ai/retrievalbench))
 
-![SQL vs search engines, ClickBench vCPU-seconds per query](docs/assets/readme/compare-sql-search.svg)
+![Quantized vector indexes vs embedded libraries, dbpedia-1536 100K, same queries and ground truth](docs/assets/readme/compare-embedded.svg)
 
-[ClickBench](https://benchmark.clickhouse.com/#system=-&type=+sac&machine=+c6a.4xlarge&cluster_size=-&opensource=-&hardware=+c&tuned=+n&metric=hot&queries=-)
+[RetrievalBench](https://github.com/infino-ai/retrievalbench)
 ([Repro](https://github.com/infino-ai/retrievalbench))
+
+</details>
 
 ## How it works
 
@@ -217,7 +252,8 @@ Supertable FTS; the SQL shapes are `agg_max_title` (metadata), `WHERE key = ?` (
 - Any Parquet reader — DuckDB, pyarrow, DataFusion — opens that file and sees a normal
   table. Infino opens the same file and also finds its indexes.
 - There is no separate index artifact to build, ship, or keep in sync, and nothing to load
-  at startup.
+  at startup. A Lucene index is its own copy of the data; teams that also want it in a data
+  lake run a pipeline to keep the two in step.
 
 ### A query reads byte ranges, not files
 
@@ -473,7 +509,7 @@ The same pages are available as Markdown source on GitHub:
 In this repo:
 
 - [FAQ](docs/faq.md) — short answers to common questions
-- [How Infino compares](docs/comparisons.md) — how it relates to vector databases, search engines, and query engines
+- [How Infino compares](docs/comparisons.md) — how it relates to Lucene and search engines, vector databases, and query engines
 
 Design references (in this repo):
 
