@@ -114,7 +114,7 @@ use crate::{
         ReadError, SuperfileReader,
         error::FtsError,
         fts::{
-            reader::{BoolMode, ContainsRows, MatchWork},
+            reader::{BoolMode, ContainsRows, MatchWork, QueryDict},
             tokenize::{Tokenizer, unique_tokens},
         },
         reader::ScanShape,
@@ -1001,6 +1001,9 @@ impl SupertableProvider {
             self.count_rows_checked(checked.len(), verified.len());
             return Ok((verified, work));
         }
+        // text_match looks its terms up one at a time; they share one dictionary read while the
+        // budget has room.
+        let dict = QueryDict::with_budget(&self.manifest.options.connection_memory_budget);
         // Under a LIMIT, any `limit` live rows of the selection answer it
         // (see `exact_limit`). When the selection is one `OR` of whole terms
         // and nothing else narrows it, each term's rows are all rows the
@@ -1024,6 +1027,7 @@ impl SupertableProvider {
                         file_column,
                         &[leaf.needle.as_str()],
                         memos.get(&leaf.column).map(Arc::as_ref),
+                        &dict,
                     )
                     .await;
                 match read {
@@ -1051,13 +1055,13 @@ impl SupertableProvider {
                 return Ok((rows, work));
             }
         }
-        // Each column's distinct needles, in first-seen order: those an
-        // indexed term must contain (`ILIKE`), and those that must be an
-        // indexed term (`text_match`).
-        let mut by_column: BTreeMap<(&str, bool), Vec<&str>> = BTreeMap::new();
+        // Each column's distinct needles, in first-seen order: those that must be an indexed term
+        // (`text_match`, keyed `false` so they come first) and those an indexed term must contain
+        // (`ILIKE`).
+        let mut by_column: BTreeMap<(bool, &str), Vec<&str>> = BTreeMap::new();
         for leaf in check.filter.leaves() {
             let needles = by_column
-                .entry((leaf.column.as_str(), leaf.whole))
+                .entry((!leaf.whole, leaf.column.as_str()))
                 .or_default();
             if !needles.contains(&leaf.needle.as_str()) {
                 needles.push(&leaf.needle);
@@ -1065,7 +1069,8 @@ impl SupertableProvider {
         }
         let budget = &self.manifest.options.connection_memory_budget;
         let mut leaf_rows: HashMap<(&str, &str, bool), ContainsRows> = HashMap::new();
-        for ((column, whole), needles) in by_column {
+        for ((ilike, column), needles) in by_column {
+            let whole = !ilike;
             // A superfile written before a rename keys its dictionary by
             // the column's old name.
             let file_column = prepared
@@ -1074,9 +1079,16 @@ impl SupertableProvider {
             let read = if whole {
                 prepared
                     .reader
-                    .term_rows(file_column, &needles, memos.get(column).map(Arc::as_ref))
+                    .term_rows(
+                        file_column,
+                        &needles,
+                        memos.get(column).map(Arc::as_ref),
+                        &dict,
+                    )
                     .await
             } else {
+                // The `ILIKE` walk reads its own copy; the shared one is not held through it.
+                dict.give_back();
                 prepared
                     .reader
                     .contains_rows(file_column, &needles, Some(pool), Some(budget))
@@ -1123,6 +1135,7 @@ impl SupertableProvider {
                     .zip(rows),
             );
         }
+        drop(dict);
         // Every leaf the tree reads has its rows; checked up front so the
         // lookup below cannot miss.
         if let Some(leaf) = check.filter.leaves().into_iter().find(|leaf| {
@@ -2873,6 +2886,11 @@ impl TableProvider for SupertableProvider {
                         // Resolve candidate rows from the index. `None` => no
                         // usable bound, scan the superfile.
                         let mut predicate_work = MatchWork::default();
+                        // Kept for expansion, the estimate and the match while the budget has
+                        // room; dropped once the candidate rows are known.
+                        let dict = Arc::new(QueryDict::with_budget(
+                            &self.manifest.options.connection_memory_budget,
+                        ));
                         let plan = if needs_expansion {
                             // A whole-dictionary walk pays only when the
                             // column's stored text is large next to its
@@ -2900,6 +2918,7 @@ impl TableProvider for SupertableProvider {
                                     prepared.reader.as_ref(),
                                     &full_walk_pays,
                                     Some(reader_pool),
+                                    &dict,
                                 )
                                 .await
                                 .map_err(QueryError::from)?;
@@ -2923,6 +2942,7 @@ impl TableProvider for SupertableProvider {
                                         plan_locations,
                                         selection_gate(&plan, &prepared),
                                         Some((reader_pool, match_slots)),
+                                        Arc::clone(&dict),
                                     )
                                     .await
                                     .map_err(QueryError::from)?,
@@ -2930,6 +2950,8 @@ impl TableProvider for SupertableProvider {
                             predicate_work.merge(resolved.work);
                             resolved.rows
                         };
+                        // Let go before the exact check, which reserves from the same budget.
+                        drop(dict);
 
                         // This superfile's tombstoned rows (empty when no
                         // overlay); the batch prefetch above already resolved
@@ -4121,7 +4143,7 @@ pub(crate) mod tests {
             },
             reader_cache::disk::{
                 HeapBudget,
-                test_support::{cache_buffered, lazy_entries},
+                test_support::{PROMOTE_TIMEOUT, cache_buffered, lazy_entries},
             },
             schema::change::{FieldPatch, SchemaPatch},
         },
@@ -7551,7 +7573,12 @@ pub(crate) mod tests {
         assert!(budget.charged() > 0, "and counted");
 
         drop(ctx);
-        // A background fill that finished first leaves its file mapped whole, which is not counted.
+        // A download still running at its end keeps its file: its reservation covers the
+        // download. Once it lands, the file is mapped whole, which is not counted.
+        cache
+            .wait_until_fills_settled(PROMOTE_TIMEOUT)
+            .await
+            .expect("its downloads settle");
         assert_eq!(lazy_entries(&cache), 0, "its end lets them go");
         assert_eq!(budget.charged(), 0, "each once");
     }

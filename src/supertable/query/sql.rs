@@ -1300,13 +1300,16 @@ mod tests {
         },
         supertable::{
             Supertable, SupertableOptions,
-            manifest::ManifestSnapshot,
+            manifest::{ManifestSnapshot, list::VALUE_TABLES_BUDGET_BYTES},
             query::{candidate::LIKE_MAX_TERMS, sql::build_sql_schemas},
         },
     };
 
-    /// One more than the manifest's exact-value cardinality cap.
-    const HIGH_CARDINALITY_ROWS: usize = 257;
+    /// One more distinct `i64` than a superfile's value table holds within its
+    /// budget (each entry stores the value and its 8-byte count), so a column
+    /// of this many distinct values carries no table. Strings longer than
+    /// eight bytes pass the budget sooner.
+    const HIGH_CARDINALITY_ROWS: usize = VALUE_TABLES_BUDGET_BYTES / (2 * size_of::<u64>()) + 1;
 
     /// Titles for the `LIKE` oracle, chosen so the index superset and the
     /// exact match differ: `fox` as a whole word, as a head (`foxes`), a

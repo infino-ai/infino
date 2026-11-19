@@ -26,12 +26,14 @@ pub(crate) mod deleted_stats;
 pub mod df_object_store;
 pub mod dispatch;
 pub mod exec;
+pub(crate) mod filter_in_scan;
 pub(crate) mod fine_graph_cache;
 pub(crate) mod fine_graph_store;
 pub mod fts;
 #[cfg(feature = "graph-index")]
 pub mod graph;
 pub mod hierarchical_iter;
+pub(crate) mod id_order;
 pub(crate) mod join_build_size;
 pub(crate) mod limit_stage;
 pub(crate) mod match_order;

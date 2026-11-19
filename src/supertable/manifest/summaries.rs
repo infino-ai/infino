@@ -61,12 +61,15 @@ use std::{
 
 use arrow::{
     buffer::{NullBuffer, OffsetBuffer},
-    compute::concat,
+    compute::{
+        concat,
+        kernels::{boolean::or, cmp::eq},
+    },
     ipc::{reader::StreamReader, writer::StreamWriter},
 };
 use arrow_array::{
-    Array, ArrayRef, BinaryArray, ListArray, RecordBatch, StructArray, UInt32Array, UInt64Array,
-    cast::AsArray, new_null_array, types::UInt64Type,
+    Array, ArrayRef, BinaryArray, BooleanArray, ListArray, RecordBatch, Scalar, StructArray,
+    UInt32Array, UInt64Array, cast::AsArray, new_null_array, types::UInt64Type,
 };
 use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef};
 use bytes::Bytes;
@@ -87,7 +90,7 @@ use crate::supertable::{
         SuperfileEntry, column_hll,
         disk_cache::{CachePin, MetadataDiskCache},
         encoding::stats_ipc_options,
-        hll::HllSketch,
+        hll::{HLL_REGISTERS, HllSketch},
         list::{ScalarStatsAgg, ScalarValueCounts},
         part::{ContentHash, PartId},
     },
@@ -200,7 +203,16 @@ struct Group {
     sum: Option<ArrayRef>,
     hll: Option<BinaryArray>,
     value_counts: Option<ListArray>,
+    /// The sketches of the group's larger value tables, by row, each taken
+    /// the first time it is asked for (see [`ColumnRow::values_sketch`]).
+    values_sketches: Mutex<HashMap<usize, HllSketch>>,
 }
+
+/// The fewest entries a value table holds for its sketch to be kept once
+/// taken: its counts alone then take more than the sketch, so the kept
+/// sketches never take more than the tables they stand for. A smaller
+/// table is sketched each time; it hashes fewer values than this.
+const SKETCH_KEPT_ENTRIES: usize = HLL_REGISTERS / size_of::<u64>() + 1;
 
 /// One column's statistics for one superfile, read in place from the
 /// decoded group: each accessor reads the one array it needs. The value
@@ -267,14 +279,39 @@ impl ColumnRow<'_> {
     /// sketch hashes them, when the superfile carries a table: the
     /// distinct estimate of a column counted exactly, taken from the
     /// table's value array without converting a value.
+    ///
+    /// The planner asks for it on every statement that reads the column's
+    /// statistics, once per superfile, so the sketch of a table of
+    /// [`SKETCH_KEPT_ENTRIES`] or more is taken once and kept with the
+    /// group: hashing a table of hundreds of values on every statement
+    /// costs more than reading a stored sketch.
     pub fn values_sketch(&self) -> Option<HllSketch> {
         let list = self.group.value_counts.as_ref()?;
         if !list.is_valid(self.index) {
             return None;
         }
+        let kept = list.value_length(self.index) as usize >= SKETCH_KEPT_ENTRIES;
+        if kept && let Some(sketch) = self.kept_values_sketches().get(&self.index) {
+            return Some(sketch.clone());
+        }
         let item = list.value(self.index);
         let item = item.as_any().downcast_ref::<StructArray>()?;
-        column_hll(&[Arc::clone(item.column(0))])
+        let sketch = column_hll(&[Arc::clone(item.column(0))])?;
+        if kept {
+            self.kept_values_sketches()
+                .insert(self.index, sketch.clone());
+        }
+        Some(sketch)
+    }
+
+    /// The group's kept table sketches. A sketch is only ever added, the
+    /// same one whoever takes it, so one left by a panicking reader is
+    /// still good.
+    fn kept_values_sketches(&self) -> std::sync::MutexGuard<'_, HashMap<usize, HllSketch>> {
+        self.group
+            .values_sketches
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// The exact value table as it sits in the section: one list item, a
@@ -312,11 +349,28 @@ impl ColumnRow<'_> {
 /// `=` and `IN` literals cast once to a column's type, as SQL's own `IN` set test: built per
 /// statement, read per file by [`ColumnStats::literal_count`].
 pub(crate) struct ExactLiterals {
-    in_set: InListExpr,
-    /// The one column `in_set` reads: a table's values.
-    schema: SchemaRef,
+    find: FindLiterals,
     column_type: DataType,
 }
+
+/// How a table's values are tested against [`ExactLiterals`]. A table's values are distinct and
+/// not null, so a value is one of the literals exactly when it equals one of them.
+enum FindLiterals {
+    /// Up to [`FEW_LITERALS`] literals, each compared with every value: a pass over the values
+    /// per literal, with nothing hashed.
+    Each(Vec<Scalar<ArrayRef>>),
+    /// More literals, as SQL's own `IN` set test, which hashes each value once.
+    InSet {
+        in_set: InListExpr,
+        /// The one column `in_set` reads: a table's values.
+        schema: SchemaRef,
+    },
+}
+
+/// The most literals compared with a table's values one at a time. A planner reads the table of
+/// every file whose bounds hold a literal, on every statement, so an `=` costs a pass over the
+/// values rather than hashing each one.
+const FEW_LITERALS: usize = 8;
 
 impl ExactLiterals {
     /// `None` when SQL would compare a literal by casting the column (a number against a string
@@ -335,20 +389,58 @@ impl ExactLiterals {
         if values.is_empty() {
             return None;
         }
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            VALUE_FIELD,
-            column_type.clone(),
-            false,
-        )]));
-        let array = ScalarValue::iter_to_array(values).ok()?;
-        let in_set =
-            InListExpr::try_new_from_array(col(VALUE_FIELD, &schema).ok()?, array, false, &schema)
+        let find = match values.len() <= FEW_LITERALS {
+            true => FindLiterals::Each(
+                values
+                    .iter()
+                    .map(|value| value.to_scalar().ok())
+                    .collect::<Option<_>>()?,
+            ),
+            false => {
+                let schema = Arc::new(Schema::new(vec![Field::new(
+                    VALUE_FIELD,
+                    column_type.clone(),
+                    false,
+                )]));
+                let array = ScalarValue::iter_to_array(values).ok()?;
+                let in_set = InListExpr::try_new_from_array(
+                    col(VALUE_FIELD, &schema).ok()?,
+                    array,
+                    false,
+                    &schema,
+                )
                 .ok()?;
+                FindLiterals::InSet { in_set, schema }
+            }
+        };
         Some(Self {
-            in_set,
-            schema,
+            find,
             column_type: column_type.clone(),
         })
+    }
+
+    /// Which of a table's `values` are among the literals, `None` when they can't be compared.
+    fn hits(&self, values: &ArrayRef) -> Option<BooleanArray> {
+        match &self.find {
+            FindLiterals::Each(literals) => {
+                let mut hits: Option<BooleanArray> = None;
+                for literal in literals {
+                    let equal = eq(values, literal).ok()?;
+                    hits = Some(match hits {
+                        None => equal,
+                        Some(hits) => or(&hits, &equal).ok()?,
+                    });
+                }
+                hits
+            }
+            FindLiterals::InSet { in_set, schema } => {
+                let batch =
+                    RecordBatch::try_new(Arc::clone(schema), vec![Arc::clone(values)]).ok()?;
+                let hits = in_set.evaluate(&batch).ok()?;
+                let hits = hits.into_array(batch.num_rows()).ok()?;
+                Some(hits.as_boolean_opt()?.clone())
+            }
+        }
     }
 }
 
@@ -517,18 +609,24 @@ impl ColumnStats<'_> {
         {
             return None;
         }
-        let values = Arc::clone(table.column(0));
-        let batch = RecordBatch::try_new(Arc::clone(&literals.schema), vec![values]).ok()?;
-        let hits = literals.in_set.evaluate(&batch).ok()?;
-        let hits = hits.into_array(batch.num_rows()).ok()?;
+        let hits = literals.hits(table.column(0))?;
         let mut held: u64 = 0;
-        for (hit, rows) in hits.as_boolean_opt()?.iter().zip(counts.values()) {
+        for (hit, rows) in hits.iter().zip(counts.values()) {
             if hit == Some(true) {
                 // A sum past u64 is no real file's count, so the table settles nothing.
                 held = held.checked_add(*rows)?;
             }
         }
         Some(held)
+    }
+
+    /// How many values the exact value table holds, read without building
+    /// it; `None` when the superfile carries no table.
+    pub(crate) fn value_table_len(&self) -> Option<usize> {
+        match self {
+            Self::Inline(agg) => agg.value_counts.as_ref().map(|t| t.entries().len()),
+            Self::Section(row) => row.value_table_array().map(|table| table.len()),
+        }
     }
 
     /// Every statistic, in the decoded shape.
@@ -1544,6 +1642,7 @@ fn decode_group(bytes: &[u8]) -> Result<Group, SummariesError> {
         sum: column_by_name(SUM_FIELD),
         hll,
         value_counts,
+        values_sketches: Mutex::default(),
     })
 }
 
@@ -1570,7 +1669,7 @@ pub fn rows_from_entries(entries: &[Arc<SuperfileEntry>]) -> Vec<SummaryRow<'_>>
 mod tests {
     use std::fs;
 
-    use arrow_array::{BooleanArray, Float64Array, Int64Array, StringArray};
+    use arrow_array::{Decimal128Array, Float64Array, Int64Array, StringArray};
     use tempfile::TempDir;
 
     use super::*;
@@ -2257,32 +2356,201 @@ mod tests {
     /// A section row of one `Int64` column whose value table holds `entries` as persisted,
     /// without the checks a table built by the writer passes.
     fn group_with_table(entries: &[(i64, u64)]) -> Group {
-        let values: ArrayRef = Arc::new(Int64Array::from_iter_values(
-            entries.iter().map(|(value, _)| *value),
-        ));
-        let counts: ArrayRef = Arc::new(UInt64Array::from_iter_values(
-            entries.iter().map(|(_, count)| *count),
-        ));
-        let item: ArrayRef = Arc::new(
-            StructArray::try_new(
-                value_table_fields(&DataType::Int64),
-                vec![values, counts],
-                None,
-            )
-            .expect("a value table item"),
-        );
-        let (_, list) =
-            value_table_list(&DataType::Int64, &[item], vec![entries.len()], vec![true])
-                .expect("a value table list");
-        let bound: ArrayRef = Arc::new(Int64Array::from(vec![0]));
+        group_with_tables(&[entries])
+    }
+
+    /// [`group_with_table`] with a row for each of `tables`, in order.
+    fn group_with_tables(tables: &[&[(i64, u64)]]) -> Group {
+        let items: Vec<ArrayRef> = tables
+            .iter()
+            .map(|entries| -> ArrayRef {
+                let values: ArrayRef = Arc::new(Int64Array::from_iter_values(
+                    entries.iter().map(|(value, _)| *value),
+                ));
+                let counts: ArrayRef = Arc::new(UInt64Array::from_iter_values(
+                    entries.iter().map(|(_, count)| *count),
+                ));
+                Arc::new(
+                    StructArray::try_new(
+                        value_table_fields(&DataType::Int64),
+                        vec![values, counts],
+                        None,
+                    )
+                    .expect("a value table item"),
+                )
+            })
+            .collect();
+        let (_, list) = value_table_list(
+            &DataType::Int64,
+            &items,
+            tables.iter().map(|entries| entries.len()).collect(),
+            vec![true; tables.len()],
+        )
+        .expect("a value table list");
+        let rows = tables.len();
+        let bound: ArrayRef = Arc::new(Int64Array::from(vec![0; rows]));
         Group {
-            superfile: UInt32Array::from(vec![0]),
+            superfile: UInt32Array::from_iter_values(0..rows as u32),
             min: Arc::clone(&bound),
             max: bound,
-            null_count: UInt64Array::from(vec![0]),
+            null_count: UInt64Array::from(vec![0; rows]),
             sum: None,
             hll: None,
             value_counts: Some(list.as_list::<i32>().clone()),
+            values_sketches: Mutex::default(),
+        }
+    }
+
+    /// A row's table sketch is the sketch of the table's values whether it
+    /// is taken or kept. A table of [`SKETCH_KEPT_ENTRIES`] entries or more
+    /// keeps its sketch with the group the first time it is taken, each row
+    /// its own; a smaller one is sketched each time.
+    #[test]
+    fn a_tables_sketch_is_the_same_taken_or_kept() {
+        let table = |len: usize, step: i64| -> Vec<(i64, u64)> {
+            (0..len as i64)
+                .map(|at| (at * step, 1 + at as u64 % 3))
+                .collect()
+        };
+        let tables = [
+            table(1, 1),
+            table(SKETCH_KEPT_ENTRIES - 1, 3),
+            table(SKETCH_KEPT_ENTRIES, 5),
+            table(600, 7),
+            table(600, 11),
+        ];
+        let group = group_with_tables(&tables.iter().map(Vec::as_slice).collect::<Vec<_>>());
+        for _ in 0..2 {
+            for (index, entries) in tables.iter().enumerate() {
+                let values: ArrayRef = Arc::new(Int64Array::from_iter_values(
+                    entries.iter().map(|(value, _)| *value),
+                ));
+                let want = column_hll(&[values]).expect("integers sketch");
+                let row = ColumnRow {
+                    group: &group,
+                    index,
+                };
+                assert_eq!(row.values_sketch(), Some(want), "row {index}");
+                let kept = group
+                    .values_sketches
+                    .lock()
+                    .expect("not poisoned")
+                    .contains_key(&index);
+                assert_eq!(kept, entries.len() >= SKETCH_KEPT_ENTRIES, "row {index}");
+            }
+        }
+    }
+
+    /// A table's count for `=` and `IN` literals is the rows its column
+    /// holds equal to one of them, whether the literals are few enough to
+    /// compare one at a time or are tested as SQL's `IN` set: for every
+    /// counted type, with literals repeated and literals the table does not
+    /// hold, in a decoded table and in a section's.
+    #[test]
+    fn a_tables_count_for_literals_is_the_rows_equal_to_one_of_them() {
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move |below: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % below
+        };
+        let decimal = DataType::Decimal128(12, 2);
+        for _ in 0..40 {
+            let distinct = next(400) as i64 + 1;
+            let rows: Vec<i64> = (0..next(2_000) + 1)
+                .map(|_| next(distinct as u64) as i64)
+                .collect();
+            let int64: ArrayRef = Arc::new(Int64Array::from_iter_values(rows.iter().copied()));
+            let text: ArrayRef = Arc::new(StringArray::from_iter_values(
+                rows.iter().map(|row| format!("v{row}")),
+            ));
+            let flags: ArrayRef = Arc::new(BooleanArray::from_iter(
+                rows.iter().map(|row| Some(row % 3 == 0)),
+            ));
+            let amounts: ArrayRef = Arc::new(
+                Decimal128Array::from_iter_values(rows.iter().map(|row| i128::from(*row) * 25))
+                    .with_data_type(decimal.clone()),
+            );
+            for literal_count in [1, 2, 3, FEW_LITERALS, FEW_LITERALS + 1, 30] {
+                // Some held, some repeated, some past the column's values.
+                let wanted: Vec<i64> = (0..literal_count)
+                    .map(|_| next(distinct as u64 + 20) as i64)
+                    .collect();
+                let held = |matches: &dyn Fn(i64) -> bool| -> u64 {
+                    rows.iter().filter(|row| matches(**row)).count() as u64
+                };
+                let count = |column: &ArrayRef, literals: Vec<ScalarValue>| {
+                    let agg = ScalarStatsAgg::from_column(column).expect("counted type");
+                    assert!(agg.value_counts.is_some(), "the column is counted");
+                    let literals = ExactLiterals::new(&literals, column.data_type())
+                        .expect("literals of the column's type");
+                    ColumnStats::Inline(&agg).literal_count(&literals)
+                };
+                assert_eq!(
+                    count(
+                        &int64,
+                        wanted
+                            .iter()
+                            .map(|v| ScalarValue::Int64(Some(*v)))
+                            .collect()
+                    ),
+                    Some(held(&|row| wanted.contains(&row))),
+                    "Int64 {wanted:?}"
+                );
+                assert_eq!(
+                    count(
+                        &text,
+                        wanted
+                            .iter()
+                            .map(|v| ScalarValue::Utf8(Some(format!("v{v}"))))
+                            .collect()
+                    ),
+                    Some(held(&|row| wanted.contains(&row))),
+                    "Utf8 {wanted:?}"
+                );
+                let flags_wanted: Vec<bool> = wanted.iter().map(|v| v % 2 == 0).collect();
+                assert_eq!(
+                    count(
+                        &flags,
+                        flags_wanted
+                            .iter()
+                            .map(|v| ScalarValue::Boolean(Some(*v)))
+                            .collect()
+                    ),
+                    Some(held(&|row| flags_wanted.contains(&(row % 3 == 0)))),
+                    "Boolean {flags_wanted:?}"
+                );
+                assert_eq!(
+                    count(
+                        &amounts,
+                        wanted
+                            .iter()
+                            .map(|v| ScalarValue::Decimal128(Some(i128::from(*v) * 25), 12, 2))
+                            .collect()
+                    ),
+                    Some(held(&|row| wanted.contains(&row))),
+                    "Decimal128 {wanted:?}"
+                );
+
+                // The same table as a section stores it.
+                let agg = ScalarStatsAgg::from_column(&int64).expect("int stats");
+                let entries: Vec<(i64, u64)> = agg
+                    .value_counts
+                    .expect("counted")
+                    .entries()
+                    .iter()
+                    .map(|(value, count)| match value {
+                        ScalarValue::Int64(Some(value)) => (*value, *count),
+                        other => panic!("not an Int64: {other:?}"),
+                    })
+                    .collect();
+                assert_eq!(
+                    persisted_literal_count(&entries, &wanted),
+                    Some(held(&|row| wanted.contains(&row))),
+                    "section {wanted:?}"
+                );
+            }
         }
     }
 

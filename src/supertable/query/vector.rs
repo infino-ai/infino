@@ -103,7 +103,7 @@ use crate::{
     superfile::{
         SuperfileReader,
         error::ReadError,
-        fts::reader::BoolMode,
+        fts::reader::{BoolMode, QueryDict},
         id_space::RowId,
         vector::{
             cell_posting::EncodedCellRow,
@@ -7282,6 +7282,7 @@ impl SupertableReader {
                         &refs,
                         mode,
                         memo.as_deref(),
+                        &QueryDict::default(),
                     )
                     .await
                     .map_err(QueryError::from)?;
@@ -8274,15 +8275,24 @@ impl SupertableReader {
         // The index's locations for the plan's terms let each superfile
         // resolve them from its postings alone.
         let locations = Arc::new(self.plan_locations(plan, superfiles).await?);
+        let budget = Arc::clone(&self.manifest().options.connection_memory_budget);
         self.fanout_candidate_bitmaps(superfiles, move |r, entry| {
             let plan = Arc::clone(&plan_arc);
             let op_stats = op_stats.clone();
             let reader_pool = Arc::clone(&reader_pool);
             let locations = Arc::clone(&locations);
+            let budget = Arc::clone(&budget);
             async move {
                 let memos = memos_from_plan_locations(&r, &locations, entry.superfile_id).await;
+                // A `LIKE` leaf's expansion and the match share one dictionary read while the
+                // budget has room.
                 let (bitmap, work) = plan
-                    .evaluate(r.as_ref(), Some(&reader_pool), &memos)
+                    .evaluate(
+                        r.as_ref(),
+                        Some(&reader_pool),
+                        &memos,
+                        &QueryDict::with_budget(&budget),
+                    )
                     .await
                     .map_err(QueryError::from)?;
                 // The SQL predicate's posting walks, summed across the
