@@ -77,6 +77,14 @@ and count queries in about half of Lucene's time:
 Lucene has some features Infino does not have: fuzzy matching, highlighting, geo queries, and a wider set of
 language analyzers. If you need one of them, [open a feature request](https://github.com/infino-ai/infino/issues/new).
 
+### Inside OpenSearch
+
+[opensearch-infino](https://github.com/infino-ai/opensearch-infino) is an Apache-2.0 plugin that replaces Lucene in each OpenSearch
+shard with an Infino table. Index, bulk, get, search, aggregations, and Dashboards work
+unchanged; the documents live on local disk or object storage, and the same indices answer SQL.
+A node with an empty data directory brings every index back from storage. It installs into
+released OpenSearch versions, with no fork.
+
 ## Performance
 
 Warm p50, tables on object storage:

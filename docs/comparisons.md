@@ -25,6 +25,8 @@ Infino's durable copy is the table in object storage, so compute is disposable a
 
 On the [ClickBench board](https://benchmark.clickhouse.com/#system=-&type=+sac&machine=+c6a.4xlarge&cluster_size=-&opensource=-&hardware=+c&tuned=+n&metric=hot&queries=-), Infino uses more than ten times less CPU per query than Elasticsearch. Vector search against Elastic Cloud and OpenSearch is on the [VectorDBBench board](https://vdbbench-viewer-q6unoyyhua-uc.a.run.app/results).
 
+To keep OpenSearch and change only the engine, [opensearch-infino](https://github.com/infino-ai/opensearch-infino) is an Apache-2.0 plugin that replaces Lucene in each shard with an Infino table. The REST API, aggregations, Dashboards, and the security plugin work unchanged; the indices live on local disk or object storage, answer SQL as well as search, and come back from storage onto a node with an empty data directory.
+
 ## vs a dedicated vector database
 
 Dedicated vector databases store your vectors in their own service that you run and scale separately from your data. Infino keeps one copy of the data as Parquet in your own bucket and adds BM25 and SQL over the same rows, so vector search is one of four ways to query a single table rather than a separate system to operate and sync. Vector-search latency and recall against vector databases are on the [VectorDBBench board](https://vdbbench-viewer-q6unoyyhua-uc.a.run.app/results).
