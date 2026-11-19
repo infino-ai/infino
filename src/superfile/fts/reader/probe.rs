@@ -6,11 +6,12 @@
 //! bounded every other document away probes the few it still needs.
 //!
 //! A long term's bytes are its header, its skip table, its blocks and a
-//! coarse table at the tail. A probe reads the header and skip table in
-//! one range — sized from the term's document count, read again when the
-//! header names more blocks — then only the blocks whose doc-id range
-//! covers the documents asked for, and decodes those. A short term is one
-//! small body read whole; an inline one is in its dictionary value.
+//! coarse table at the tail. A probe of a small one reads them all in one
+//! request; of a larger one, the header and skip table in one range —
+//! sized from the term's document count, read again when the header names
+//! more blocks — then only the blocks whose doc-id range covers the
+//! documents asked for. Either decodes only those blocks. A short term is
+//! one small body read whole; an inline one is in its dictionary value.
 
 use std::slice::from_ref;
 
@@ -32,6 +33,12 @@ use crate::{
     utils::terms::DictEntry,
 };
 
+/// Largest long term a probe reads whole, header to tail, in one request
+/// instead of its header and then its covering blocks: on an object store
+/// this many bytes stream in well under one request's round trip, so the
+/// second request costs more than the bytes the whole read adds.
+const PROBE_WHOLE_TERM_MAX_BYTES: usize = 512 * 1024;
+
 fn malformed(what: &str) -> FtsError {
     FtsError::Read(ReadError::Malformed(format!("term probe: {what}")))
 }
@@ -48,16 +55,32 @@ impl FtsReader {
         df: u64,
         docs: &[u32],
     ) -> Result<Vec<u32>, FtsError> {
-        debug_assert!(docs.windows(2).all(|w| w[0] < w[1]), "docs ascend");
         let column_id = self.resolve_column_id(column)?;
         let col = &self.columns[column_id as usize];
+        self.tfs_in(col, entry, df, docs, PROBE_WHOLE_TERM_MAX_BYTES)
+            .await
+    }
+
+    /// [`Self::probe_tfs`] on `col`, reading a long term whole when its
+    /// postings are at most `whole_max` bytes.
+    async fn tfs_in(
+        &self,
+        col: &ColumnMeta,
+        entry: DictEntry,
+        df: u64,
+        docs: &[u32],
+        whole_max: usize,
+    ) -> Result<Vec<u32>, FtsError> {
+        debug_assert!(docs.windows(2).all(|w| w[0] < w[1]), "docs ascend");
         if let DictEntry::Inline { doc_id, tf } = entry {
             return Ok(docs
                 .iter()
                 .map(|&d| if d == doc_id { col.inline_tf(tf) } else { 0 })
                 .collect());
         }
-        let blocks = self.blocks_for(col, entry, df, docs, false).await?;
+        let blocks = self
+            .blocks_for(col, entry, df, docs, false, whole_max)
+            .await?;
         Ok(docs
             .iter()
             .map(|&d| {
@@ -71,7 +94,8 @@ impl FtsReader {
 
     /// The blocks of a term in a `Pfor` dictionary value covering `docs`,
     /// decoded, each with its position group when `with_positions`: a
-    /// short-form term's one body, or a long-form term's covering blocks.
+    /// short-form term's one body, or a long-form term's covering blocks,
+    /// its postings read whole when at most `whole_max` bytes.
     async fn blocks_for(
         &self,
         col: &ColumnMeta,
@@ -79,6 +103,7 @@ impl FtsReader {
         df: u64,
         docs: &[u32],
         with_positions: bool,
+        whole_max: usize,
     ) -> Result<Vec<ProbedBlock>, FtsError> {
         let DictEntry::Pfor {
             metadata_offset,
@@ -99,6 +124,7 @@ impl FtsReader {
                     df,
                     docs,
                     with_positions,
+                    whole_max,
                 )
                 .await;
         }
@@ -137,9 +163,11 @@ impl FtsReader {
     }
 
     /// The blocks of a long-form term covering `docs`, decoded, each with
-    /// its position group when `with_positions`: the term's header and
-    /// skip table in one read — sized from `df`, read again when the header
-    /// names more blocks — then the covering blocks and groups together.
+    /// its position group when `with_positions`. A term of at most
+    /// `whole_max` bytes is read whole in one request; a larger one, its
+    /// header and skip table in one read — sized from `df`, read again
+    /// when the header names more blocks — then its covering blocks. The
+    /// groups are read together after either.
     #[allow(clippy::too_many_arguments)]
     async fn covering_blocks(
         &self,
@@ -150,6 +178,7 @@ impl FtsReader {
         df: u64,
         docs: &[u32],
         with_positions: bool,
+        whole_max: usize,
     ) -> Result<Vec<ProbedBlock>, FtsError> {
         let base = self.postings_range.start + metadata_offset;
         if metadata_offset + postings_length > self.postings_range.len() {
@@ -170,18 +199,25 @@ impl FtsReader {
                     .ok_or_else(|| malformed("head read"))
             }
         };
-        let guess = (df as usize).div_ceil(block_lanes(wide));
-        let mut head = read(TermMeta::head_len(guess, positional)).await?;
+        // A small term whole: its blocks are then in hand, and the header
+        // read below is that one read.
+        let whole = postings_length <= whole_max;
+        let first = match whole {
+            true => postings_length,
+            false => TermMeta::head_len((df as usize).div_ceil(block_lanes(wide)), positional),
+        };
+        let mut head = read(first).await?;
         // The header may name more blocks than the count suggested: read
         // the whole table it names then.
         let named = TermMeta::header_num_blocks(&head).ok_or_else(|| malformed("header"))?;
-        let reread = TermMeta::head_len(named, positional) > head.len();
+        let reread = !whole && TermMeta::head_len(named, positional) > head.len();
         if reread {
             head = read(TermMeta::head_len(named, positional)).await?;
         }
         debug!(
             requests = 1 + u32::from(reread),
             blocks = named,
+            whole,
             "term probe head read"
         );
         let (meta, _) = TermMeta::parse_head(&head, 0, positional)?;
@@ -209,10 +245,14 @@ impl FtsReader {
         if at > postings_length {
             return Err(malformed("blocks past the term range"));
         }
-        let mut ranges: Vec<_> = wanted
-            .iter()
-            .map(|&i| base + starts[i]..base + starts[i + 1])
-            .collect();
+        // Read whole, the term's blocks are slices of what was read.
+        let mut ranges: Vec<_> = match whole {
+            true => Vec::new(),
+            false => wanted
+                .iter()
+                .map(|&i| base + starts[i]..base + starts[i + 1])
+                .collect(),
+        };
         if with_positions {
             // Each block's group runs from its offset to the next block's,
             // or to the end of the term's positions.
@@ -232,13 +272,24 @@ impl FtsReader {
         }
         // The blocks lie back to back, as do their groups: a few requests
         // serve them all.
-        let mut fetched = self
-            .fetch_coalesced(&ranges, "fts/postings term probe blocks")
-            .await?;
+        let mut fetched = match ranges.is_empty() {
+            true => Vec::new(),
+            false => {
+                self.fetch_coalesced(&ranges, "fts/postings term probe blocks")
+                    .await?
+            }
+        };
         let groups: Vec<Bytes> = match with_positions {
-            true => fetched.split_off(wanted.len()),
+            true => fetched.split_off(fetched.len() - wanted.len()),
             false => Vec::new(),
         };
+        if whole {
+            // `head` is the whole term, and the blocks end within it.
+            fetched = wanted
+                .iter()
+                .map(|&i| head.slice(starts[i]..starts[i + 1]))
+                .collect();
+        }
         let (mut ids, mut tfs) = (vec![0u32; BLOCK_LEN], vec![0u32; BLOCK_LEN]);
         let mut out = Vec::with_capacity(wanted.len());
         for (k, (&i, bytes)) in wanted.iter().zip(&fetched).enumerate() {
@@ -269,7 +320,6 @@ impl FtsReader {
         offsets: &[u32],
         docs: &[u32],
     ) -> Result<Vec<u32>, FtsError> {
-        debug_assert_eq!(members.len(), offsets.len());
         let column_id = self.resolve_column_id(column)?;
         let col = &self.columns[column_id as usize];
         if !col.positions {
@@ -277,10 +327,25 @@ impl FtsReader {
                 column: column.to_owned(),
             });
         }
+        self.phrase_tfs_in(col, members, offsets, docs, PROBE_WHOLE_TERM_MAX_BYTES)
+            .await
+    }
+
+    /// [`Self::probe_phrase_tfs`] on the positional `col`, reading a long
+    /// member whole when its postings are at most `whole_max` bytes.
+    async fn phrase_tfs_in(
+        &self,
+        col: &ColumnMeta,
+        members: &[(DictEntry, u64)],
+        offsets: &[u32],
+        docs: &[u32],
+        whole_max: usize,
+    ) -> Result<Vec<u32>, FtsError> {
+        debug_assert_eq!(members.len(), offsets.len());
         let per_member = try_join_all(
             members
                 .iter()
-                .map(|&(entry, df)| self.member_positions(col, entry, df, docs)),
+                .map(|&(entry, df)| self.member_positions(col, entry, df, docs, whole_max)),
         )
         .await?;
         Ok((0..docs.len())
@@ -298,6 +363,7 @@ impl FtsReader {
         entry: DictEntry,
         df: u64,
         docs: &[u32],
+        whole_max: usize,
     ) -> Result<Vec<Vec<u32>>, FtsError> {
         let mut out = vec![Vec::new(); docs.len()];
         // On a positional column an inline slot is the term's one position.
@@ -308,7 +374,10 @@ impl FtsReader {
             return Ok(out);
         }
         let mut group = GroupIndex::default();
-        for block in self.blocks_for(col, entry, df, docs, true).await? {
+        for block in self
+            .blocks_for(col, entry, df, docs, true, whole_max)
+            .await?
+        {
             let bytes = block
                 .group
                 .as_ref()
@@ -411,6 +480,11 @@ mod tests {
     /// suggested, then its covering blocks and their position groups, which
     /// lie back to back in two regions.
     const PROBE_MAX_REQUESTS: usize = 4;
+    /// Requests a probe of a long term read whole may take: the term, then
+    /// its covering blocks' position groups, back to back.
+    const PROBE_WHOLE_MAX_REQUESTS: usize = 2;
+    /// Whole-read caps that take each long-term path: never whole, always.
+    const WHOLE_CAPS: [usize; 2] = [0, usize::MAX];
 
     /// [`AsyncOnlySource`] counting the requests it serves.
     struct CountingSource {
@@ -464,9 +538,10 @@ mod tests {
     }
 
     /// Probed frequencies equal the documents' own, for every form a term's
-    /// postings take — inline, short and long over many blocks — on a
-    /// column with positions and one without, for documents that hold the
-    /// term and documents that do not.
+    /// postings take — inline, short and long over many blocks, the long
+    /// read whole and by header then blocks — on a column with positions
+    /// and one without, for documents that hold the term and documents
+    /// that do not.
     #[tokio::test]
     async fn a_probe_reads_each_documents_own_frequency() {
         for positions in [false, true] {
@@ -499,12 +574,19 @@ mod tests {
                     vec![N_DOCS - 1],
                 ];
                 for docs in sets {
+                    let want: Vec<u32> = docs.iter().map(|&d| truth(&term, d)).collect();
                     let got = r
                         .probe_tfs("body", fact.entry, fact.df, &docs)
                         .await
                         .expect("probe");
-                    let want: Vec<u32> = docs.iter().map(|&d| truth(&term, d)).collect();
                     assert_eq!(got, want, "{term:?} positions={positions}");
+                    for cap in WHOLE_CAPS {
+                        let got = r
+                            .tfs_in(&r.columns[0], fact.entry, fact.df, &docs, cap)
+                            .await
+                            .expect("probe");
+                        assert_eq!(got, want, "{term:?} positions={positions} cap={cap}");
+                    }
                 }
             }
         }
@@ -531,8 +613,9 @@ mod tests {
     }
 
     /// Probed phrase occurrences equal a brute-force count over the
-    /// documents' tokens, for phrases whose members are long, short and
-    /// inline, adjacent and with a gap.
+    /// documents' tokens, for phrases whose members are long — read whole
+    /// and by header then blocks — short and inline, adjacent and with a
+    /// gap.
     #[tokio::test]
     async fn a_phrase_probe_counts_each_documents_own_occurrences() {
         let mut b = FtsBuilder::new();
@@ -576,6 +659,13 @@ mod tests {
                 .probe_phrase_tfs("body", &members, offsets, &docs)
                 .await
                 .expect("probe");
+            for cap in WHOLE_CAPS {
+                let capped = r
+                    .phrase_tfs_in(&r.columns[0], &members, offsets, &docs, cap)
+                    .await
+                    .expect("probe");
+                assert_eq!(capped, got, "{terms:?} cap={cap}");
+            }
             let want: Vec<u32> = docs
                 .iter()
                 .map(|&d| {
@@ -596,8 +686,9 @@ mod tests {
 
     /// A probe of a long term over many blocks reads its covering blocks,
     /// and their position groups, in a few requests rather than one per
-    /// block: on an object store each request is a round trip and a billed
-    /// operation, and a phrase of common words probes hundreds of
+    /// block, and a term small enough to read whole in one request for its
+    /// blocks: on an object store each request is a round trip and a
+    /// billed operation, and a phrase of common words probes hundreds of
     /// superfiles.
     #[tokio::test]
     async fn a_probe_reads_its_covering_blocks_in_a_few_requests() {
@@ -642,27 +733,39 @@ mod tests {
             blocks > PROBE_MAX_REQUESTS * 2,
             "the term spans many blocks"
         );
+        let col = &lazy.columns[0];
+        let members = [facts["beta"], facts["alpha"]];
+        for (cap, most) in WHOLE_CAPS
+            .into_iter()
+            .zip([PROBE_MAX_REQUESTS, PROBE_WHOLE_MAX_REQUESTS])
+        {
+            let before = source.requests.load(Ordering::Relaxed);
+            let tfs = lazy
+                .tfs_in(col, entry, df, &docs, cap)
+                .await
+                .expect("probe");
+            assert!(tfs.iter().all(|&tf| tf > 0), "every document holds it");
+            let term = source.requests.load(Ordering::Relaxed) - before;
+            assert!(
+                term <= most,
+                "a term probe over {blocks} blocks, cap {cap}, took {term} requests"
+            );
+            let before = source.requests.load(Ordering::Relaxed);
+            lazy.phrase_tfs_in(col, &members, &[0, 1], &docs, cap)
+                .await
+                .expect("phrase probe");
+            let phrase = source.requests.load(Ordering::Relaxed) - before;
+            assert!(
+                phrase <= members.len() * most,
+                "a phrase probe of {} members, cap {cap}, took {phrase} requests",
+                members.len()
+            );
+        }
+        // Read whole, a term without positions is one request.
         let before = source.requests.load(Ordering::Relaxed);
-        let tfs = lazy
-            .probe_tfs("body", entry, df, &docs)
+        lazy.tfs_in(col, entry, df, &docs, usize::MAX)
             .await
             .expect("probe");
-        assert!(tfs.iter().all(|&tf| tf > 0), "every document holds it");
-        let term = source.requests.load(Ordering::Relaxed) - before;
-        assert!(
-            term <= PROBE_MAX_REQUESTS,
-            "a term probe over {blocks} blocks took {term} requests"
-        );
-        let members = [facts["beta"], facts["alpha"]];
-        let before = source.requests.load(Ordering::Relaxed);
-        lazy.probe_phrase_tfs("body", &members, &[0, 1], &docs)
-            .await
-            .expect("phrase probe");
-        let phrase = source.requests.load(Ordering::Relaxed) - before;
-        assert!(
-            phrase <= members.len() * PROBE_MAX_REQUESTS,
-            "a phrase probe of {} members took {phrase} requests",
-            members.len()
-        );
+        assert_eq!(source.requests.load(Ordering::Relaxed) - before, 1);
     }
 }

@@ -48,6 +48,7 @@ use std::{
 use futures::future::try_join_all;
 use roaring::RoaringBitmap;
 use tracing::debug;
+use uuid::Uuid;
 
 use super::{
     dispatch,
@@ -273,7 +274,7 @@ pub(crate) async fn available(
 /// postings in a layer that has no level head, or a superfile the index
 /// does not list or whose average length is unknown.
 pub(crate) async fn select<'a>(
-    index: &TermIndex,
+    index: &Arc<TermIndex>,
     manifest: &'a ManifestSnapshot,
     column: &'a str,
     query: &TierQuery<'_>,
@@ -408,112 +409,7 @@ pub(crate) async fn select<'a>(
         true => 1.0,
         false => 1.0 - nt as f32 * 2.0 * f32::EPSILON,
     };
-    let mut fetched = 0u64;
-    let mut theta;
-    let mut bounds;
-    // What the last round left: its threshold, the slots it left in play,
-    // and the largest of their bounds.
-    let mut last: Option<(f32, usize, f32)> = None;
-    // The host may cap the rounds, for diagnosis; zero is no cap.
-    let max_rounds = match config::global().diagnostics.tier_rounds {
-        0 => usize::MAX,
-        n => n as usize,
-    };
-    let mut rounds = 0usize;
-    loop {
-        (theta, bounds) = settle(&slots, &heads, &candidates, &weights, k, lb_slack);
-        // A round that neither raised the threshold, nor ruled a slot out,
-        // nor lowered the largest bound still in play ends the reading: on
-        // documents that tie across the table the bounds sit at the
-        // threshold however deep the heads are read, and the opens settle
-        // the ties by `_id` instead; a query of required phrases finds no
-        // threshold in the heads, which hold no positions, and its opens,
-        // in bound order, find it. A round that only lowered the bounds is
-        // progress: the next may take them under the threshold, and the
-        // price below decides whether it is worth reading.
-        let in_play = bounds.iter().filter(|(_, ub)| *ub > theta).count();
-        let top = bounds
-            .iter()
-            .map(|&(_, ub)| ub)
-            .filter(|ub| *ub > theta)
-            .fold(f32::NEG_INFINITY, f32::max);
-        let no_threshold_here = weights.phrases.iter().any(|p| p.required);
-        if (theta.is_finite() || no_threshold_here) && last == Some((theta, in_play, top)) {
-            break;
-        }
-        last = Some((theta, in_play, top));
-        // Bounds under the threshold widened by the tolerance are skipped
-        // by the opens anyway: reading further for them buys nothing.
-        let bar = competitive_floor(theta, query.score_tolerance);
-        let wanted = heads_that_matter(&slots, &heads, &candidates, &bounds, bar);
-        if wanted.is_empty() || rounds == max_rounds {
-            break;
-        }
-        // The round's price: its entries, and the candidates every later
-        // round bounds again. Past the budget, or where it costs more than
-        // every open still in play at this table's measured costs, the
-        // opens settle the rest instead.
-        let round_entries: u64 = wanted
-            .iter()
-            .map(|&h| u64::from(heads[h].levels[heads[h].next].n_entries))
-            .sum();
-        let price = RoundPrice {
-            entries_read,
-            round_entries,
-            candidates: candidates.len() as u64,
-            in_play: in_play as u64,
-            first: rounds == 0,
-            // With the table's gate off, the rounds are not priced: every
-            // round the bounds call for is read, up to the budget.
-            open_cost_ns: match query.merge_gate {
-                true => query.open_cost_ns,
-                false => 0,
-            },
-            entry_cost_ns: query.entry_cost_ns,
-        };
-        if !price.worth_reading() {
-            break;
-        }
-        rounds += 1;
-        let reads = wanted.iter().map(|&h| {
-            let head = &heads[h];
-            let level = head.levels[head.next];
-            let object = head.object;
-            async move {
-                let Some(object) = object else {
-                    return Err(TermIndexError::Malformed(
-                        "a head with levels and no object".into(),
-                    ));
-                };
-                index.head_level(&object, &level).await
-            }
-        });
-        let levels = try_join_all(reads).await?;
-        for (&h, (blocks, bytes)) in wanted.iter().zip(levels) {
-            fetched += bytes;
-            let (t, base) = (heads[h].term, heads[h].base);
-            for block in blocks.iter() {
-                for e in &block.entries {
-                    entries_read += 1;
-                    if let Some(s) = slot_for(base + e.superfile) {
-                        absorb(&mut candidates, &weights, nt, t, s, e.doc_id, e.tf, e.len);
-                    }
-                }
-            }
-            let head = &mut heads[h];
-            head.next += 1;
-            if let Some(last) = blocks.last() {
-                head.frontier = last.last_key;
-            }
-        }
-    }
-    // A scope that admits only some rows: the threshold over every row is
-    // no floor for the admitted ones, and an answer would hold rows the
-    // scope drops. Only the bounds stand.
-    if query.rows_scoped {
-        theta = f32::NEG_INFINITY;
-    }
-    let state = Selection {
+    let mut state = Selection {
         manifest,
         kept,
         column,
@@ -525,9 +421,36 @@ pub(crate) async fn select<'a>(
         k,
         lb_slack,
         answers: exact_scores && !query.rows_scoped,
+        index: Arc::clone(index),
+        slot_of,
+        score_tolerance: query.score_tolerance,
+        // With the table's gate off, the rounds are not priced: every
+        // round the bounds call for is read, up to the budget.
+        open_cost_ns: match query.merge_gate {
+            true => query.open_cost_ns,
+            false => 0,
+        },
+        entry_cost_ns: query.entry_cost_ns,
+        rounds: 0,
+        entries_read,
+        fetched: 0,
     };
+    let (mut theta, bounds) = state.read_rounds().await?;
+    // A scope that admits only some rows: the threshold over every row is
+    // no floor for the admitted ones, and an answer would hold rows the
+    // scope drops. Only the bounds stand.
+    if query.rows_scoped {
+        theta = f32::NEG_INFINITY;
+    }
     let now = state
-        .finish(theta, bounds, fetched, entries_read, started, rounds)
+        .finish(
+            theta,
+            bounds,
+            state.fetched,
+            state.entries_read,
+            started,
+            state.rounds,
+        )
         .await?;
     // Probes: candidates whose bounds still reach above the threshold for a
     // term or phrase not yet known for them have it read from the covering
@@ -583,6 +506,24 @@ struct Selection<'a> {
     /// Whether the index may answer for a superfile: scores exact and
     /// every row in scope.
     answers: bool,
+    /// The index the heads' levels are read from.
+    index: Arc<TermIndex>,
+    /// Each kept superfile's slot.
+    slot_of: HashMap<Uuid, usize>,
+    /// The query's score tolerance: bounds under the threshold widened by
+    /// it are skipped by the opens anyway.
+    score_tolerance: f32,
+    /// The table's measured cost of one open, zero when the rounds are
+    /// not priced.
+    open_cost_ns: u64,
+    /// The table's measured cost of one head entry; zero when not known.
+    entry_cost_ns: u64,
+    /// Rounds of head levels read.
+    rounds: usize,
+    /// Head entries read.
+    entries_read: u64,
+    /// Bytes the head levels' reads fetched.
+    fetched: u64,
 }
 
 impl Selection<'_> {
@@ -711,7 +652,14 @@ impl ProbeStage<'_> {
         } = self;
         let first_superfiles = plan.len();
         let mut probes = state.probe_wave(plan).await?;
-        let (mut theta, mut bounds) = state.settle();
+        let (rounds, fetched) = (state.rounds, state.fetched);
+        // With the threshold the first wave found, the rounds a query of
+        // required phrases deferred can now rule superfiles out. Any other
+        // query read its rounds before the opens.
+        let (mut theta, mut bounds) = match state.waits_for_threshold() {
+            true => state.read_rounds().await?,
+            false => state.settle(),
+        };
         let mut waves = 1;
         let mut second_superfiles = 0;
         // The first wave read the best candidates. Where they held too few
@@ -727,15 +675,17 @@ impl ProbeStage<'_> {
                 waves += 1;
             }
         }
+        let (rounds, fetched) = (state.rounds - rounds, state.fetched - fetched);
         debug!(
             waves,
-            first_superfiles, second_superfiles, probes, "level heads probe waves"
+            first_superfiles, second_superfiles, probes, rounds, "level heads probe waves"
         );
         let mut selection = state
-            .finish(theta, bounds, 0, probes, started, waves)
+            .finish(theta, bounds, fetched, probes, started, waves)
             .await?;
-        // Probes are not head entries: their count and time stay out of the
-        // table's measured cost of reading one, which prices the rounds.
+        // The stage's time is mostly its probes, which are not head
+        // entries: its count and time stay out of the table's measured
+        // cost of reading one, which prices the rounds.
         selection.entries_read = 0;
         selection.merge_ns = 0;
         Ok(selection)
@@ -743,6 +693,137 @@ impl ProbeStage<'_> {
 }
 
 impl Selection<'_> {
+    /// Whether the query finds no threshold in the heads: it requires a
+    /// phrase, which they hold no positions of.
+    fn waits_for_threshold(&self) -> bool {
+        self.weights.phrases.iter().any(|p| p.required)
+    }
+
+    /// The slot of the superfile at `ordinal` in the index, when kept.
+    fn slot_for(&self, ordinal: u32) -> Option<usize> {
+        self.index
+            .superfile_id(ordinal)
+            .and_then(|id| self.slot_of.get(&id).copied())
+    }
+
+    /// Read rounds of head levels while they can still change which
+    /// superfiles open, and settle: the threshold and each slot's bounds.
+    ///
+    /// A query of required phrases finds no threshold in the heads, which
+    /// hold no positions, and without one no bound rules a superfile out:
+    /// deeper levels would only reorder the opens, at the cost of bounding
+    /// every candidate they add each round. Past its first round it waits
+    /// for a threshold, which the probes beside the opens find, and then
+    /// reads on.
+    async fn read_rounds(&mut self) -> Result<(f32, Vec<(f32, f32)>), TermIndexError> {
+        let no_threshold_here = self.waits_for_threshold();
+        // What the last round left: its threshold, the slots it left in
+        // play, and the largest of their bounds.
+        let mut last: Option<(f32, usize, f32)> = None;
+        // The host may cap the rounds, for diagnosis; zero is no cap.
+        let max_rounds = match config::global().diagnostics.tier_rounds {
+            0 => usize::MAX,
+            n => n as usize,
+        };
+        loop {
+            let (theta, bounds) = self.settle();
+            if no_threshold_here && !theta.is_finite() && self.rounds > 0 {
+                return Ok((theta, bounds));
+            }
+            // A round that neither raised the threshold, nor ruled a slot
+            // out, nor lowered the largest bound still in play ends the
+            // reading: on documents that tie across the table the bounds
+            // sit at the threshold however deep the heads are read, and the
+            // opens settle the ties by `_id` instead. A round that only
+            // lowered the bounds is progress: the next may take them under
+            // the threshold, and the price below decides whether it is
+            // worth reading.
+            let in_play = bounds.iter().filter(|(_, ub)| *ub > theta).count();
+            let top = bounds
+                .iter()
+                .map(|&(_, ub)| ub)
+                .filter(|ub| *ub > theta)
+                .fold(f32::NEG_INFINITY, f32::max);
+            if (theta.is_finite() || no_threshold_here) && last == Some((theta, in_play, top)) {
+                return Ok((theta, bounds));
+            }
+            last = Some((theta, in_play, top));
+            // Bounds under the threshold widened by the tolerance are
+            // skipped by the opens anyway: reading further for them buys
+            // nothing.
+            let bar = competitive_floor(theta, self.score_tolerance);
+            let wanted =
+                heads_that_matter(&self.slots, &self.heads, &self.candidates, &bounds, bar);
+            if wanted.is_empty() || self.rounds == max_rounds {
+                return Ok((theta, bounds));
+            }
+            // The round's price: its entries, and the candidates every
+            // later round bounds again. Past the budget, or where it costs
+            // more than every open still in play at this table's measured
+            // costs, the opens settle the rest instead.
+            let heads = &self.heads;
+            let round_entries: u64 = wanted
+                .iter()
+                .map(|&h| u64::from(heads[h].levels[heads[h].next].n_entries))
+                .sum();
+            let price = RoundPrice {
+                entries_read: self.entries_read,
+                round_entries,
+                candidates: self.candidates.len() as u64,
+                in_play: in_play as u64,
+                first: self.rounds == 0,
+                open_cost_ns: self.open_cost_ns,
+                entry_cost_ns: self.entry_cost_ns,
+            };
+            if !price.worth_reading() {
+                return Ok((theta, bounds));
+            }
+            self.rounds += 1;
+            let index = &self.index;
+            let reads = wanted.iter().map(|&h| {
+                let head = &heads[h];
+                let level = head.levels[head.next];
+                let object = head.object;
+                async move {
+                    let Some(object) = object else {
+                        return Err(TermIndexError::Malformed(
+                            "a head with levels and no object".into(),
+                        ));
+                    };
+                    index.head_level(&object, &level).await
+                }
+            });
+            let levels = try_join_all(reads).await?;
+            let nt = self.weights.idf.len();
+            for (&h, (blocks, bytes)) in wanted.iter().zip(levels) {
+                self.fetched += bytes;
+                let (t, base) = (self.heads[h].term, self.heads[h].base);
+                for block in blocks.iter() {
+                    for e in &block.entries {
+                        self.entries_read += 1;
+                        if let Some(s) = self.slot_for(base + e.superfile) {
+                            absorb(
+                                &mut self.candidates,
+                                &self.weights,
+                                nt,
+                                t,
+                                s,
+                                e.doc_id,
+                                e.tf,
+                                e.len,
+                            );
+                        }
+                    }
+                }
+                let head = &mut self.heads[h];
+                head.next += 1;
+                if let Some(last) = blocks.last() {
+                    head.frontier = last.last_key;
+                }
+            }
+        }
+    }
+
     /// The threshold and each slot's bounds from the candidates now.
     fn settle(&self) -> (f32, Vec<(f32, f32)>) {
         settle(

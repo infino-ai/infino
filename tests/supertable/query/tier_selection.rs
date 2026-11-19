@@ -10,7 +10,7 @@
 //! documents that carry both terms before any superfile is read.
 #![deny(clippy::unwrap_used)]
 
-use std::sync::Arc;
+use std::{iter::repeat_n, sync::Arc};
 
 use arrow_array::{ArrayRef, LargeStringArray, RecordBatch};
 use datafusion::prelude::{col, lit};
@@ -1220,4 +1220,88 @@ fn a_phrase_its_best_candidates_lack_is_left_to_the_opens() {
         SUPERFILES as u64,
         "the first wave found no threshold, so the opens settle every superfile"
     );
+}
+
+/// A required phrase over heads many levels deep: the heads hold no
+/// positions, so they find no threshold, and without one no bound rules a
+/// superfile out. Its first round names the candidates to probe; deeper
+/// rounds wait for the threshold the probes find, and the answer is the
+/// ceilings'. Reading them before it bounded every candidate they added
+/// each round, and on a warm table cost more than the opens.
+#[test]
+fn a_required_phrase_reads_one_round_before_its_threshold() {
+    /// Superfiles, one commit each.
+    const SUPERFILES: usize = 3;
+    /// Documents per superfile, each holding both members: heads several
+    /// levels deep.
+    const DOCS: usize = 5_000;
+    /// The documents holding the phrase.
+    const HOLDERS: std::ops::Range<usize> = 4_500..4_520;
+    /// Fewest tokens per document.
+    const MIN_LEN: usize = 64;
+    /// Distinct lengths past the fewest.
+    const LEN_SPREAD: usize = 97;
+    /// Distinct frequencies of each member past the first.
+    const TF_SPREAD: usize = 30;
+    /// A head's first level: its entries the first round reads.
+    const FIRST_LEVEL: u64 = 64;
+    /// The first round: a level of each member's head in each layer, one
+    /// layer a commit.
+    const FIRST_ROUND: u64 = 2 * SUPERFILES as u64 * FIRST_LEVEL;
+    let build = |dir: &TempDir, heads: bool| {
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let mut fts = FtsConfig::new("body");
+        fts.positions = true;
+        let mut options = SupertableOptions::new(schema(), vec![fts], vec![])
+            .expect("options")
+            .with_storage(storage)
+            .with_bound_ordered_open_window(OPEN_WINDOW);
+        if !heads {
+            options = options.with_term_tier_entries_per_term(0);
+        }
+        let st = Supertable::create(options).expect("create");
+        for s in 0..SUPERFILES {
+            let docs: Vec<String> = (0..DOCS)
+                .map(|i| {
+                    let mut words = match HOLDERS.contains(&i) {
+                        true => vec!["alpha", "beta"],
+                        false => vec!["beta", "filler", "alpha"],
+                    };
+                    // Members' frequencies and lengths vary, so the heads'
+                    // keys fall level by level and each round lowers the
+                    // bounds.
+                    words.extend(repeat_n("alpha", (i + s) % TF_SPREAD));
+                    words.push("filler");
+                    words.extend(repeat_n("beta", (i * 7 + s) % TF_SPREAD));
+                    words.resize(MIN_LEN + i % LEN_SPREAD, "filler");
+                    words.join(" ")
+                })
+                .collect();
+            let col: ArrayRef = Arc::new(LargeStringArray::from(
+                docs.iter().map(String::as_str).collect::<Vec<_>>(),
+            ));
+            let mut w = st.writer().expect("writer");
+            w.append(&RecordBatch::try_new(schema(), vec![col]).expect("batch"))
+                .expect("append");
+            w.commit().expect("commit");
+        }
+        st
+    };
+    let (with_dir, without_dir) = (
+        TempDir::new().expect("tempdir"),
+        TempDir::new().expect("tempdir"),
+    );
+    let (with, without) = (build(&with_dir, true), build(&without_dir, false));
+    for k in [1usize, 10] {
+        let (a, stats, _) = run(&with, "\"alpha beta\"", BoolMode::And, k);
+        let (b, _, _) = run(&without, "\"alpha beta\"", BoolMode::And, k);
+        assert!(!a.is_empty(), "k={k}: the phrase matches");
+        assert_eq!(a, b, "k={k}: the answer is the ceilings'");
+        assert!(
+            stats.tier_entries > 0 && stats.tier_entries <= FIRST_ROUND,
+            "k={k}: one round of heads before the opens, read {}",
+            stats.tier_entries
+        );
+    }
 }
