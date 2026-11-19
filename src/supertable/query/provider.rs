@@ -1520,8 +1520,11 @@ impl SupertableProvider {
             survivors.iter().cloned().map(|entry| {
                 let prepared = self.prepared_scan_file(Arc::clone(&entry));
                 async move {
+                    let __s = std::time::Instant::now();
                     let prepared = prepared.await?;
+                    let __p = __s.elapsed();
                     let tombstones = self.deleted_rows(entry.superfile_id, now)?;
+                    let __d = __s.elapsed();
                     let ends = prepared
                         .reader
                         .range_ends(
@@ -1534,6 +1537,7 @@ impl SupertableProvider {
                         )
                         .await
                         .map_err(QueryError::from)?;
+                    if std::env::var_os("INFINO_TIMING").is_some() { eprintln!("  topk file prepared {:.2} deleted {:.2} ends {:.2} ms", __p.as_secs_f64()*1e3, __d.as_secs_f64()*1e3, __s.elapsed().as_secs_f64()*1e3); }
                     Ok::<_, DataFusionError>(ends.map(|ends| (entry.superfile_id, ends)))
                 }
             }),
@@ -1575,6 +1579,7 @@ impl SupertableProvider {
                 false => (lo, cut),
                 true => (cut, hi),
             };
+            if std::env::var_os("INFINO_TIMING").is_some() { eprintln!("  topk ties path: range_rows_live"); }
             return self
                 .range_rows_live(survivors, field, data_type, through, now)
                 .await
@@ -2977,6 +2982,8 @@ impl SupertableProvider {
         limit: Option<usize>,
         scanned: Option<&mut Vec<(SuperfileUri, Arc<RoaringBitmap>)>>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        let __t0 = std::time::Instant::now();
+        let __tick = |what: &str| if std::env::var_os("INFINO_TIMING").is_some() { eprintln!("scan {:>8.2} ms {what}", __t0.elapsed().as_secs_f64() * 1000.0); };
         // Superfile selection via the shared two-tier prune (the same
         // path FTS search uses); see `select_survivors`. Survivors go to
         // DataFusion. The span carries both counts, so a trace shows how
@@ -3025,6 +3032,7 @@ impl SupertableProvider {
         // Every surviving superfile's tombstones, before the per-superfile
         // sweep below.
         self.prefetch_tombstones(&survivor_entries, now).await;
+        __tick("tombstones");
 
         // The projected columns' statistics, read and decoded off the
         // runtime, before the scan node's statistics read them in place
@@ -3043,6 +3051,7 @@ impl SupertableProvider {
                 .collect(),
         };
         load_section_groups(&survivor_entries, &statistics_columns).await;
+        __tick("section groups");
 
         // A counting scan reads no row where a range index counts it (see
         // `range_count_exec`).
@@ -3113,6 +3122,7 @@ impl SupertableProvider {
         // superfile then resolves them from its postings, not its dictionary.
         let plan_locations =
             Arc::new(plan_locations_for(&self.manifest, &candidate_plan, &survivor_entries).await?);
+        __tick("plan locations");
         let plan_locations = &plan_locations;
         // The same for the exact conjuncts' whole terms (`text_match`): each
         // superfile then reads a term's postings from where the index says
@@ -3127,6 +3137,7 @@ impl SupertableProvider {
             }
         }
         let exact_locations = &exact_locations;
+        __tick("exact locations");
 
         // Open every survivor, at most `superfiles_in_flight` at once, so a
         // scan over thousands of files does not hold thousands of opens'
@@ -3155,10 +3166,12 @@ impl SupertableProvider {
             tiers.record_on(&open_span);
         }
         trace::end(open_span);
+        __tick("open files");
 
         // A scan feeding `ORDER BY column LIMIT k` reads only the rows each
         // superfile's range index puts first (see `top_k_rows`).
         let top_k_rows = self.top_k_rows(&survivor_entries, filters, now).await?;
+        __tick("top k rows");
         let top_k_rows = &top_k_rows;
 
         // Per-superfile scan inputs, resolved into PartitionedFiles once the
@@ -3576,6 +3589,7 @@ impl SupertableProvider {
             .is_some()
             .then(|| scan_stats.clone().project(projection));
 
+        __tick("resolved rows");
         let url = self.store_url.clone();
         state
             .runtime_env()
@@ -3616,6 +3630,7 @@ impl SupertableProvider {
             };
             meter.with_note(self.scan_note.clone())
         };
+        __tick("files built");
         let parquet: Arc<dyn ExecutionPlan> = Arc::new(
             meter(scan)
                 .with_footers(Arc::clone(&self.scan_footers))
