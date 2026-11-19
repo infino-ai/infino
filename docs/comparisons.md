@@ -15,7 +15,7 @@ Lucene and Infino do the same job: an in-process library you index documents int
 
 Tantivy, a Rust library modeled on Lucene, shares its segment design; it is on the same Search Benchmark chart.
 
-**Where Lucene fits better:** Lucene has features Infino does not have yet: fuzzy matching, highlighting, geo queries, and a wider set of language analyzers. If you depend on those, Lucene is a better fit.
+**Not in Infino yet:** fuzzy matching, highlighting, geo queries, and a wider set of language analyzers, all of which Lucene has. If you need one of them, [open a feature request](https://github.com/infino-ai/infino/issues/new).
 
 ## vs Elasticsearch and OpenSearch
 

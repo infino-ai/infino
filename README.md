@@ -6,7 +6,7 @@
 [![CI](https://github.com/infino-ai/infino/actions/workflows/ci.yml/badge.svg)](https://github.com/infino-ai/infino/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-**Infino is a search library built as an alternative to Lucene. Its full-text and vector indexes live
+**Infino is a search library built as an alternative to Lucene, and more: its full-text and vector indexes live
 inside ordinary Parquet files, on local disk or object storage, so one copy of the data answers BM25,
 vector, hybrid, and SQL queries.**
 
@@ -75,7 +75,7 @@ and count queries in about half of Lucene's time:
 ([Repro](https://github.com/infino-ai/search-benchmark-game))
 
 Lucene has some features Infino does not have: fuzzy matching, highlighting, geo queries, and a wider set of
-language analyzers. If you depend on those, Lucene is a better fit.
+language analyzers. If you need one of them, [open a feature request](https://github.com/infino-ai/infino/issues/new).
 
 ## Performance
 
