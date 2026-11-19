@@ -36,7 +36,7 @@ Yes. An agent's long-term memory is a retrieval problem over text and vectors on
 
 ## Is it embedded, or a service?
 
-Embedded. Infino runs in your process as a library. There is no daemon to run and no control plane between your app and object storage.
+Both. The open-source engine runs in your process as a library, with no daemon to run and no control plane between your app and object storage. [Infino Cloud](https://infino.ai/docs/cloud) serves the same engine as a fully managed service with the same API; a program moves to it by changing only its `connect` target.
 
 ## What languages can I use it from?
 

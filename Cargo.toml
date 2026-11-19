@@ -1,6 +1,6 @@
 [package]
 name = "infino"
-version = "0.11.32"
+version = "0.11.33"
 edition = "2024"
 # Pinned to the toolchain in rust-toolchain.toml. The vector SIMD path
 # uses AVX-512 intrinsics stabilized in 1.89 and std APIs from 1.87, so
@@ -236,6 +236,9 @@ tracing = "0.1"
 # (https://github.com/apache/datafusion/pull/22309), so the guard becomes
 # dead weight that only costs us statistics.
 datafusion = "54"
+# JSON accessors over text columns (`json_get_str`, `->`, `->>`, ...).
+# Its minor tracks DataFusion's major, so bump the two together.
+datafusion-functions-json = "0.54"
 # `macros` enables `#[tokio::test]` for the async DataFusion
 # integration tests; runtime weight on a release build is just the
 # proc-macro, so we keep it in [dependencies] rather than re-listing

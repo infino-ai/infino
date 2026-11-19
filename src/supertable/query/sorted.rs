@@ -17,7 +17,13 @@
 //! value (a missing value sorts last and is in no index). Otherwise the
 //! same sort runs as SQL, which answers alike, only slower.
 
-use std::{cmp::Ordering, collections::HashMap, slice::from_ref, sync::Arc, time::Instant};
+use std::{
+    cmp::Ordering,
+    collections::{HashMap, HashSet},
+    slice::from_ref,
+    sync::Arc,
+    time::Instant,
+};
 
 use arrow::{
     array::{Array, AsArray},
@@ -553,6 +559,12 @@ impl SupertableReader {
         // `None` when a statement would cast the column to compare it with a literal (a string
         // column against a number): then no table counts the literals and each file falls back.
         let exact = ExactLiterals::new(&literals, column_type);
+        // `IN (5, 5)` asks for 5 once: counted after the cast when the literals cast, else as
+        // written.
+        let asked = exact.as_ref().map_or_else(
+            || literals.iter().collect::<HashSet<_>>().len(),
+            ExactLiterals::distinct_count,
+        );
         if entries.iter().any(|entry| guard.stats_are_stale(entry)) {
             return unknown;
         }
@@ -587,7 +599,7 @@ impl SupertableReader {
                 return unknown;
             };
             if distinct >= 1 {
-                expected += uncounted * (literals.len() as f64 / distinct as f64).min(1.0);
+                expected += uncounted * (asked as f64 / distinct as f64).min(1.0);
             }
         }
         Share {
@@ -1323,6 +1335,60 @@ mod tests {
             )
             .expect("sql");
         assert_eq!(ints(&held, "seq"), ints(&want, "seq"));
+    }
+
+    /// Distinct `n` values in the repeated-literal test's file: more than its value tables keep.
+    const UNTABLED_VALUES: i64 = 20_000;
+    /// An `n` value the repeated-literal test asks for; `ASKED + 1` is another one.
+    const ASKED: i64 = 500;
+
+    #[test]
+    fn a_repeated_literal_is_counted_once() {
+        // One file whose `n` holds more distinct values than its value tables keep, so the
+        // estimate is one row per distinct value per literal.
+        //  - `n IN (a, a)` expects the rows `n = a` does, not those of `n IN (a, a + 1)`.
+        // This test pins that the walk's estimate asks for each literal once.
+        let dir = TempDir::new().expect("tempdir");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("seq", DataType::Int64, false),
+            Field::new("n", DataType::Int64, false),
+        ]));
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let options = SupertableOptions::new(Arc::clone(&schema), vec![], vec![])
+            .expect("options")
+            .with_storage(storage)
+            .with_range_indexes(&["seq".to_string()]);
+        let st = Supertable::create(options).expect("create");
+        let values: Vec<i64> = (0..UNTABLED_VALUES).collect();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(values.clone())),
+                Arc::new(Int64Array::from(values)),
+            ],
+        )
+        .expect("batch");
+        let mut writer = st.writer().expect("writer");
+        writer.append(&batch).expect("append");
+        writer.commit().expect("commit");
+        let reader = st.reader().expect("reader");
+        let manifest = reader.manifest();
+        let field = manifest.table_schema().id_of("n").expect("n");
+        let files = &manifest.superfiles;
+        assert!(
+            files.iter().all(|file| file
+                .scalar_stats
+                .column(field)
+                .is_some_and(|stats| stats.value_counts().is_none())),
+            "no file keeps a table for `n`"
+        );
+        let share = |filter: Expr| reader.conjunct_share(&filter, files).share;
+        let one = share(col("n").eq(lit(ASKED)));
+        assert!(one < 1.0, "the estimate counts rows: {one}");
+        let twice = share(col("n").in_list(vec![lit(ASKED), lit(ASKED)], false));
+        assert_eq!(twice, one);
+        assert!(share(col("n").in_list(vec![lit(ASKED), lit(ASKED + 1)], false)) > one);
     }
 
     /// The numeric-tag table has 7 `tag` values, written with a leading zero (`"00"` to `"06"`).

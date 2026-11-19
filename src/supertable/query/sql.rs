@@ -114,6 +114,7 @@ use crate::{
                 match_exec::{MatchTopK, register_match},
                 vector_exec::register_vector_search,
             },
+            json_functions::register_json_functions,
             provider::{SupertableProvider, TABLE_NAME, view_string_schema},
             range_top_k::RangeTopK,
             scalar_cache::ByteLru,
@@ -489,6 +490,10 @@ pub(crate) fn sql_session_context(
     ctx.add_optimizer_rule(Arc::new(CoveredAggregateRewrite::default()));
     ctx.add_optimizer_rule(Arc::new(RangeTopK));
     ctx.add_optimizer_rule(Arc::new(MatchTopK));
+    // JSON accessors for text columns that hold a JSON document. Scalar
+    // functions belong to the session, not to a table, so every copy of a
+    // template carries them.
+    register_json_functions(&ctx);
     Ok(ctx)
 }
 

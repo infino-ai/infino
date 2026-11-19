@@ -3515,7 +3515,7 @@ mod tests {
         },
         test_helpers::{
             copy_dir_recursive,
-            fault_storage::{FaultOp, FaultStorage},
+            fault_storage::{FaultKind, FaultOp, FaultStorage},
             fid, old_format_fts_fixture, open_old_format_fts_fixture,
             slow_storage::SlowStorage,
         },
@@ -11086,7 +11086,15 @@ mod tests {
 
         // A fold uploads each range's objects as the range finishes; one
         // failed put still fails the fold, so no root names what did not land.
-        faults.fail(FaultOp::PutAtomic, "term-index/slice-", 1);
+        // A refused put, not a transient one: the fold can write a slice this
+        // store already holds, and a transient failure on a stored object is
+        // taken as landed.
+        faults.fail_with(
+            FaultKind::PermissionDenied,
+            FaultOp::PutAtomic,
+            "term-index/slice-",
+            1,
+        );
         let ordinals: Vec<Option<u32>> = (0..root.superfiles.len() as u32).map(Some).collect();
         let ranged = BuildPolicy {
             merge_ranges: Some(4),
