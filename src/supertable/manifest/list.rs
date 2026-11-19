@@ -797,15 +797,65 @@ pub(crate) fn value_order(left: &ScalarValue, right: &ScalarValue) -> Ordering {
     left.partial_cmp(right).unwrap_or(Ordering::Equal)
 }
 
-/// Where `value` is in `sorted`, ordered by `key` in [`value_order`]; all of one type.
-fn sorted_position<T>(
-    sorted: &[T],
-    key: impl Fn(&T) -> &ScalarValue,
-    value: &ScalarValue,
-) -> Option<usize> {
-    sorted
-        .binary_search_by(|item| value_order(key(item), value))
-        .ok()
+/// The rows a value table holds for asked values, the table's `entries` and the `asked` values each
+/// distinct and sorted in one order: `order(entry, value)` compares an entry with an asked value by
+/// index, and `rows(entry)` is the entry's count. `None` when the sum passes u64.
+pub(crate) fn held_rows(
+    entries: usize,
+    asked: usize,
+    order: impl Fn(usize, usize) -> Ordering,
+    rows: impl Fn(usize) -> u64,
+) -> Option<u64> {
+    let (short, long) = (asked.min(entries), asked.max(entries));
+    if short == 0 {
+        return Some(0);
+    }
+    let mut held: u64 = 0;
+    // Both sides are sorted. Searching the longer side for each value of the shorter costs about
+    // `short * log2(long)` comparisons, walking the two side by side `short + long`: the cheaper
+    // is taken.
+    if short * long.ilog2() as usize >= short + long {
+        let (mut entry, mut value) = (0, 0);
+        while entry < entries && value < asked {
+            match order(entry, value) {
+                Ordering::Less => entry += 1,
+                Ordering::Greater => value += 1,
+                Ordering::Equal => {
+                    held = held.checked_add(rows(entry))?;
+                    entry += 1;
+                    value += 1;
+                }
+            }
+        }
+    } else if asked <= entries {
+        for value in 0..asked {
+            if let Some(entry) = sorted_position(entries, |entry| order(entry, value)) {
+                held = held.checked_add(rows(entry))?;
+            }
+        }
+    } else {
+        for entry in 0..entries {
+            if sorted_position(asked, |value| order(entry, value).reverse()).is_some() {
+                held = held.checked_add(rows(entry))?;
+            }
+        }
+    }
+    Some(held)
+}
+
+/// The index in `0..len` of the item looked for, the items sorted: `order(at)` compares the item at
+/// `at` with the one looked for.
+fn sorted_position(len: usize, order: impl Fn(usize) -> Ordering) -> Option<usize> {
+    let (mut low, mut high) = (0, len);
+    while low < high {
+        let middle = low + (high - low) / 2;
+        match order(middle) {
+            Ordering::Less => low = middle + 1,
+            Ordering::Greater => high = middle,
+            Ordering::Equal => return Some(middle),
+        }
+    }
+    None
 }
 
 /// A column's exact value table. The entries are shared: a table is never
@@ -1072,43 +1122,12 @@ impl ScalarValueCounts {
                     && pair[1].data_type() == first.data_type()),
             "asked values are distinct, sorted and of one type"
         );
-        let (short, long) = (
-            values.len().min(self.entries.len()),
-            values.len().max(self.entries.len()),
-        );
-        let mut held: u64 = 0;
-        // Both sides are sorted. Searching the longer side for each value of the shorter costs
-        // about `short * log2(long)` comparisons, walking the two side by side `short + long`:
-        // the cheaper is taken.
-        if short * long.ilog2() as usize >= short + long {
-            let (mut at_entry, mut at_value) = (0, 0);
-            while let (Some((entry, rows)), Some(value)) =
-                (self.entries.get(at_entry), values.get(at_value))
-            {
-                match value_order(entry, value) {
-                    Ordering::Less => at_entry += 1,
-                    Ordering::Greater => at_value += 1,
-                    Ordering::Equal => {
-                        held = held.checked_add(*rows)?;
-                        at_entry += 1;
-                        at_value += 1;
-                    }
-                }
-            }
-        } else if values.len() <= self.entries.len() {
-            for value in values {
-                if let Some(at) = sorted_position(&self.entries, |(entry, _)| entry, value) {
-                    held = held.checked_add(self.entries[at].1)?;
-                }
-            }
-        } else {
-            for (entry, rows) in self.entries.iter() {
-                if sorted_position(values, |value| value, entry).is_some() {
-                    held = held.checked_add(*rows)?;
-                }
-            }
-        }
-        Some(held)
+        held_rows(
+            self.entries.len(),
+            values.len(),
+            |entry, value| value_order(&self.entries[entry].0, &values[value]),
+            |entry| self.entries[entry].1,
+        )
     }
 
     /// About the bytes the table's entries take stored: each value's own
