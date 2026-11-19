@@ -282,28 +282,40 @@ fn a_table_past_the_open_window_always_merges() {
     }
 }
 
-/// Within one window the level heads choose on every run, whatever the
-/// learned gate would have decided for a tier merge: a single term tied in
-/// every superfile opens a handful each time, never the table.
+/// Within one window the learned gate weighs the level heads as it would a
+/// tier merge, trying both ways before it settles. Every run answers the
+/// same, and a run the heads serve opens a handful of the superfiles a
+/// single term ties in, never the table.
 #[test]
-fn a_table_within_the_window_is_served_by_the_heads_every_run() {
+fn a_table_within_the_window_weighs_the_heads_and_they_open_a_handful() {
     let p = pair(Shape {
         tiers: true,
         depth: None,
         window: SUPERFILES,
         index: true,
     });
+    let mut served = 0usize;
     for run in 0..GATE_REPEATS {
-        let n = opens_and_equal(&p, "python", 10);
-        assert!(
-            n <= TIED_TERM_OPENS,
-            "run {run}: opened {n} of {SUPERFILES} superfiles"
-        );
+        let (a, stats) = ranked(&p.with, "python", 10);
+        let (b, _) = ranked(&p.without, "python", 10);
+        assert_eq!(a, b, "run {run}: the heads must not change the answer");
+        if stats.tier_entries > 0 {
+            served += 1;
+            let n = opened(&stats);
+            assert!(
+                n <= TIED_TERM_OPENS,
+                "run {run}: opened {n} of {SUPERFILES} superfiles"
+            );
+        }
     }
+    assert!(
+        served > 0 && served < GATE_REPEATS,
+        "the gate tried both ways: {served} of {GATE_REPEATS} runs read the heads"
+    );
 }
 
-/// Runs a test of a table within one window repeats: enough for a learned
-/// gate to have tried both its ways after the first, were it deciding.
+/// Runs a test of a table within one window repeats: enough for the learned
+/// gate to have tried both its ways.
 const GATE_REPEATS: usize = 12;
 
 /// Superfiles of the lone-phrase test that hold the whole phrase.
