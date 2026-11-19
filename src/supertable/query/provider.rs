@@ -2637,7 +2637,8 @@ impl SupertableProvider {
                 store_url: self.store_url.clone(),
                 ..self.sibling()
             };
-            return Box::pin(once.scan_stored_into(state, projection, filters, limit, scanned)).await;
+            return Box::pin(once.scan_stored_into(state, projection, filters, limit, scanned))
+                .await;
         }
         // The catalog opens a table without statistics only for a statement it finds uses none
         // (`uses_statistics`). A filter it missed reads them here first: slower, never wrong.
@@ -2653,9 +2654,10 @@ impl SupertableProvider {
                     "reading a table's statistics left it without them".to_owned(),
                 ));
             }
-            return Box::pin(self.with_manifest(manifest).scan_stored_into(
-                state, projection, filters, limit, scanned,
-            ))
+            return Box::pin(
+                self.with_manifest(manifest)
+                    .scan_stored_into(state, projection, filters, limit, scanned),
+            )
             .await;
         }
         // Superfile selection via the shared two-tier prune (the same
