@@ -6,7 +6,7 @@ Infino is a search library built as an alternative to Lucene. It runs full-text 
 
 Lucene and Infino do the same job: an in-process library you index documents into and search. They differ in where the index lives and what can read it.
 
-- **Format.** A Lucene index is a set of segment files that only Lucene can read, and it is its own copy of the data. An Infino table is Parquet files with the BM25 and vector indexes embedded in them, so DuckDB, pyarrow, and DataFusion read the same files as ordinary tables. Teams that want their search data in a lake too run no export pipeline.
+- **Format.** A Lucene index is a set of segment files that only Lucene can read, and it is its own copy of the data. An Infino table is Parquet files with the BM25 and vector indexes embedded in them, so DuckDB, pyarrow, and DataFusion read the same files as ordinary tables. Teams that want their search data in a lake do not need to run an ETL pipeline.
 - **Storage.** Lucene reads a directory on local disk. Infino reads local disk or object storage (S3, GCS, Azure) through a cache that holds only the byte ranges queries touch, so tables much larger than RAM or disk stay searchable.
 - **Commits.** Lucene writes segments, refreshes readers, and merges in the background. Infino writes immutable files and swaps a manifest atomically; a reader keeps the version it opened, and `optimize()` compacts.
 - **Full-text.** Both score with BM25. Lucene uses Block-Max WAND; Infino chooses per query among WAND, Block-Max WAND, MaxScore, stored counts, and bitsets. On [Search Benchmark, the Game](https://tantivy-search.github.io/bench/), Infino answers top-k and count queries in about half of Lucene's time.
