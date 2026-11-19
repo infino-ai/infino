@@ -51,9 +51,9 @@ hits = docs.hybrid_search("body", "disk full", "embedding", query_vec, k=10)
 
 ## Infino and Lucene
 
-Lucene is the standard search library and the engine inside Elasticsearch, OpenSearch, and Solr.
-Infino does the same job, an in-process library you index into and search, with a different
-storage design: the index is Parquet, and it can live on object storage.
+Lucene is the engine inside Elasticsearch, OpenSearch, and Solr. Infino does the same job, 
+an in-process library you index into and search, but with a different storage design: the index is Parquet, 
+it can live on object storage, and you can query it in SQL.
 
 | | Lucene | Infino |
 |---|---|---|
@@ -74,8 +74,8 @@ and count queries in about half of Lucene's time:
 [Search Benchmark, the Game](https://tantivy-search.github.io/bench/)
 ([Repro](https://github.com/infino-ai/search-benchmark-game))
 
-Lucene still covers more ground: fuzzy matching, highlighting, geo queries, and a wider set of
-language analyzers. If you depend on those, stay on Lucene.
+Lucene has some features Infino does not have: fuzzy matching, highlighting, geo queries, and a wider set of
+language analyzers. If you depend on those, Lucene is a better fit.
 
 ## Performance
 
@@ -463,9 +463,8 @@ The crate is 0.x and the API can still move. The public surface is pinned by `pu
 ## Building an agent?
 
 Infino is a powerful agent data layer. Hybrid search and SQL allow more expressive
-queries in more compact form, with less token spend on LLMs — for example in
-[code-context](https://github.com/infino-ai/code-context), our Claude Code plugin.
-Use for agent data exhaust, storing corpora for searching, or agent memory. 
+queries in more compact form, with less token spend on LLMs.
+Use for agent memory, storing corpora for searching, or agent exhaust in general. 
 Transcripts, embeddings, and metadata can be stored in one table, recalled by meaning, 
 keyword, or SQL — in memory or over object storage, with no service to run:
 
