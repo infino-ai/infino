@@ -1360,6 +1360,55 @@ fn stable_id_sidecar_bytes(batches: &[RecordBatch], id_column: &str) -> Vec<u8> 
     out
 }
 
+/// `bytes` re-spliced with its stable-id sidecar in the raw layout — one
+/// little-endian `i128` per row, no layout key — the form a writer that
+/// predates the packed layout left, the one input the reader answers `_id`
+/// from the Parquet column and a scan reads whole, with no id blocks to stop
+/// early on. The ids come from the file's own `_id` column, so this
+/// round-trips a superfile whose ids the writer minted and no caller holds.
+#[cfg(test)]
+pub(crate) fn with_raw_id_sidecar_from_self(bytes: &bytes::Bytes) -> bytes::Bytes {
+    use std::io::empty;
+
+    let source = SuperfileReader::open(bytes.clone()).expect("open packed superfile");
+    let id_column = source.id_column().to_owned();
+    let locals: Vec<u32> = (0..source.n_docs() as u32).collect();
+    let ids = source
+        .take_by_local_doc_ids_from_parquet(&locals, &[id_column.as_str()])
+        .expect("read the ids from the Parquet column");
+    let raw_ids = stable_id_sidecar_bytes(std::slice::from_ref(&ids), &id_column);
+    assert_eq!(
+        raw_ids.len(),
+        source.n_docs() as usize * format::ID_SIDECAR_ENTRY_BYTES,
+        "the id column must be a non-empty Decimal128 for a raw sidecar",
+    );
+    let src_kv = extract_kv_map(&source.parquet_metadata()).expect("footer kvs");
+    let at = |key: &str| -> usize { src_kv[key].parse().expect("numeric region key") };
+    let fts = at(kv::FTS_OFFSET)..at(kv::FTS_OFFSET) + at(kv::FTS_LENGTH);
+    let kvs: Vec<(String, String)> = src_kv
+        .iter()
+        .filter(|(k, _)| k.as_str() != kv::IDS_LAYOUT)
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let mut out = Vec::new();
+    splice_carried_body_to(
+        &bytes[..fts.start],
+        fts.start as u64,
+        &source.parquet_metadata(),
+        &bytes[fts.clone()],
+        fts.len() as u64,
+        empty(),
+        0,
+        raw_ids.as_slice(),
+        raw_ids.len() as u64,
+        RangeStream::none(),
+        &kvs,
+        &mut out,
+    )
+    .expect("splice the raw sidecar");
+    bytes::Bytes::from(out)
+}
+
 impl BuilderOptions {
     /// Default `row_group_size` [`DEFAULT_ROW_GROUP_ROWS`], `compression = ZSTD(3)`.
     ///

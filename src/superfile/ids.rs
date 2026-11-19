@@ -342,7 +342,11 @@ pub(crate) fn ids_in_block(
 /// in `bytes`, or `None` if the header is bad or the block runs past the
 /// bytes. `expected` is how many docs the block must hold.
 fn parse_block(bytes: &[u8], off: usize, expected: usize) -> Option<IdBlock> {
-    let header = bytes.get(off..off + BLOCK_HEADER_BYTES)?;
+    // A corrupt directory entry can name any offset up to `u64::MAX`, so the
+    // header's end is checked before it is used; past it, every sum is
+    // bounded by the bytes the header check just proved are there.
+    let hi_start = off.checked_add(BLOCK_HEADER_BYTES)?;
+    let header = bytes.get(off..hi_start)?;
     let hi_width = header[HI_WIDTH_AT];
     let lo_width = header[LO_WIDTH_AT];
     let n_in_block =
@@ -350,7 +354,6 @@ fn parse_block(bytes: &[u8], off: usize, expected: usize) -> Option<IdBlock> {
     if hi_width > MAX_WIDTH || lo_width > MAX_WIDTH || n_in_block != expected {
         return None;
     }
-    let hi_start = off + BLOCK_HEADER_BYTES;
     let lo_start = hi_start + payload_bytes(n_in_block, hi_width);
     let lo_end = lo_start + payload_bytes(n_in_block, lo_width);
     bytes.get(hi_start..lo_end)?;
@@ -480,6 +483,15 @@ impl<'a> PackedIds<'a> {
         resolved
     }
 
+    /// Each block's lowest and highest possible `_id` ([`IdBlock::bounds`]),
+    /// in block order, read from the block headers alone; `None` when a
+    /// header is bad.
+    pub(crate) fn block_bounds(&self) -> Option<Vec<(i128, i128)>> {
+        (0..self.n_blocks)
+            .map(|b| self.block(b).map(|blk| blk.bounds()))
+            .collect()
+    }
+
     /// Resolve ascending `docs`, calling `sink(index_in_docs, id)` for each.
     /// A block's docs are served from one parsed header: unpacked wholesale
     /// once the run asks for at least `1 / BULK_DENSITY` of the block, lane
@@ -523,6 +535,32 @@ struct IdBlock {
 }
 
 impl IdBlock {
+    /// The lowest and highest id the block can hold, from its header: each
+    /// half lies between its base and its base plus the largest offset its
+    /// width packs. Every id of the block lies between the two. The whole
+    /// `i128` range when a half could pass `u64::MAX`, or the high halves
+    /// could straddle the sign bit, where [`Self::id`]'s cast orders the ids
+    /// differently from their halves.
+    fn bounds(&self) -> (i128, i128) {
+        let widest = |width: u8| match width {
+            0 => 0,
+            w if u32::from(w) >= u64::BITS => u64::MAX,
+            w => (1u64 << w) - 1,
+        };
+        let (Some(hi_max), Some(lo_max)) = (
+            self.hi_base.checked_add(widest(self.hi_width)),
+            self.lo_base.checked_add(widest(self.lo_width)),
+        ) else {
+            return (i128::MIN, i128::MAX);
+        };
+        let sign = 1u64 << (u64::BITS - 1);
+        if self.hi_base & sign != hi_max & sign {
+            return (i128::MIN, i128::MAX);
+        }
+        let id = |hi: u64, lo: u64| (((hi as u128) << 64) | lo as u128) as i128;
+        (id(self.hi_base, self.lo_base), id(hi_max, lo_max))
+    }
+
     /// The id whose halves are `hi` and `lo` above the block's bases.
     #[inline]
     fn id(&self, hi: u64, lo: u64) -> i128 {
@@ -653,6 +691,51 @@ mod tests {
         }
         assert_eq!(p.get(ids.len() as u32), None);
         packed
+    }
+
+    /// Each block's bounds hold every id of the block, and a block of one
+    /// writer's sequential ids is bounded tightly.
+    #[test]
+    fn block_bounds_hold_every_id_of_their_block() {
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let arbitrary: Vec<i128> = (0..3_000)
+            .map(|_| (((next() as u128) << 64) | (next() as u128)) as i128)
+            .collect();
+        let positive: Vec<i128> = arbitrary.iter().map(|id| id & i128::MAX).collect();
+        for ids in [arbitrary, positive, two_writer_ids(5_000)] {
+            let packed = encode_packed(&raw(&ids));
+            let bounds = PackedIds::open(&packed, ids.len())
+                .expect("valid")
+                .block_bounds()
+                .expect("headers");
+            assert_eq!(bounds.len(), ids.len().div_ceil(BLOCK_DOCS));
+            for (block, &(lo, hi)) in ids.chunks(BLOCK_DOCS).zip(&bounds) {
+                assert!(lo <= hi);
+                for &id in block {
+                    assert!(lo <= id && id <= hi, "{id} outside {lo}..={hi}");
+                }
+            }
+        }
+        let worker: u64 = 0x1234 << 24;
+        let sequential: Vec<i128> = (0..2 * BLOCK_DOCS as u64)
+            .map(|i| (((1_700_000_000_000u128) << 64) | (worker | i) as u128) as i128)
+            .collect();
+        let packed = encode_packed(&raw(&sequential));
+        let bounds = PackedIds::open(&packed, sequential.len())
+            .expect("valid")
+            .block_bounds()
+            .expect("headers");
+        for (block, &(lo, hi)) in sequential.chunks(BLOCK_DOCS).zip(&bounds) {
+            assert_eq!(lo, block[0]);
+            // A width packs offsets up to the next power of two.
+            assert!(hi >= block[BLOCK_DOCS - 1] && hi - lo < 2 * BLOCK_DOCS as i128);
+        }
     }
 
     #[test]
@@ -869,16 +952,19 @@ mod tests {
             edit(&mut bytes);
             bytes
         };
-        let cases: [(&str, Vec<u8>); 4] = [
+        let dir_entry = |off: u64| {
+            damage(&move |b| {
+                let dir = HEADER_BYTES + last_block * DIR_ENTRY_BYTES;
+                b[dir..dir + DIR_ENTRY_BYTES].copy_from_slice(&off.to_le_bytes());
+            })
+        };
+        let cases: [(&str, Vec<u8>); 5] = [
             ("block cut short", packed[..packed.len() - 1].to_vec()),
             (
                 "directory entry past the sidecar",
-                damage(&|b| {
-                    let dir = HEADER_BYTES + last_block * DIR_ENTRY_BYTES;
-                    let past_end = b.len() as u64;
-                    b[dir..dir + 8].copy_from_slice(&past_end.to_le_bytes());
-                }),
+                dir_entry(packed.len() as u64),
             ),
+            ("directory entry at the top of u64", dir_entry(u64::MAX)),
             ("width past 64", damage(&|b| damage_block(b, last_block))),
             (
                 "doc count",
@@ -892,6 +978,7 @@ mod tests {
         for (what, bytes) in &cases {
             let p = PackedIds::open(bytes, n).expect("header intact");
             assert_eq!(p.get(bad_doc), None, "{what}");
+            assert_eq!(p.block_bounds(), None, "{what}: no bounds from a bad block");
             assert_eq!(
                 p.check_blocks(),
                 Err(format!("packed id sidecar block {last_block} is malformed")),

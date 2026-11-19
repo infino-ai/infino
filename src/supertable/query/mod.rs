@@ -33,6 +33,7 @@ pub mod fts;
 #[cfg(feature = "graph-index")]
 pub mod graph;
 pub mod hierarchical_iter;
+pub(crate) mod id_order;
 pub(crate) mod join_build_size;
 pub(crate) mod limit_stage;
 pub(crate) mod match_order;
