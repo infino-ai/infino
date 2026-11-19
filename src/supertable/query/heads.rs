@@ -654,7 +654,7 @@ impl ProbeStage<'_> {
         let mut probes = state.probe_wave(plan).await?;
         let (rounds, fetched) = (state.rounds, state.fetched);
         // With the threshold the first wave found, the rounds a query of
-        // required phrases deferred can now rule superfiles out. Any other
+        // phrases deferred can now rule superfiles out. Any other
         // query read its rounds before the opens.
         let (mut theta, mut bounds) = match state.waits_for_threshold() {
             true => state.read_rounds().await?,
@@ -693,10 +693,13 @@ impl ProbeStage<'_> {
 }
 
 impl Selection<'_> {
-    /// Whether the query finds no threshold in the heads: it requires a
-    /// phrase, which they hold no positions of.
+    /// Whether the query finds no threshold in the heads, which hold no
+    /// positions: no candidate is known to match until a probe finds a
+    /// phrase in it, when the query requires a phrase or scores no bare
+    /// term (see [`Weights::counts`]).
     fn waits_for_threshold(&self) -> bool {
-        self.weights.phrases.iter().any(|p| p.required)
+        let w = &self.weights;
+        w.phrases.iter().any(|p| p.required) || (w.scoring == 0 && !w.phrases.is_empty())
     }
 
     /// The slot of the superfile at `ordinal` in the index, when kept.
@@ -709,8 +712,9 @@ impl Selection<'_> {
     /// Read rounds of head levels while they can still change which
     /// superfiles open, and settle: the threshold and each slot's bounds.
     ///
-    /// A query of required phrases finds no threshold in the heads, which
-    /// hold no positions, and without one no bound rules a superfile out:
+    /// A query of phrases alone, or one requiring a phrase, finds no
+    /// threshold in the heads, which hold no positions, and without one no
+    /// bound rules a superfile out:
     /// deeper levels would only reorder the opens, at the cost of bounding
     /// every candidate they add each round. Past its first round it waits
     /// for a threshold, which the probes beside the opens find, and then

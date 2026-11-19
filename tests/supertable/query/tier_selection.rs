@@ -1222,14 +1222,14 @@ fn a_phrase_its_best_candidates_lack_is_left_to_the_opens() {
     );
 }
 
-/// A required phrase over heads many levels deep: the heads hold no
-/// positions, so they find no threshold, and without one no bound rules a
-/// superfile out. Its first round names the candidates to probe; deeper
+/// A phrase, alone or required, over heads many levels deep: the heads
+/// hold no positions, so they find no threshold, and without one no bound
+/// rules a superfile out. Its first round names the candidates to probe; deeper
 /// rounds wait for the threshold the probes find, and the answer is the
 /// ceilings'. Reading them before it bounded every candidate they added
 /// each round, and on a warm table cost more than the opens.
 #[test]
-fn a_required_phrase_reads_one_round_before_its_threshold() {
+fn a_phrase_reads_one_round_before_its_threshold() {
     /// Superfiles, one commit each.
     const SUPERFILES: usize = 3;
     /// Documents per superfile, each holding both members: heads several
@@ -1293,14 +1293,17 @@ fn a_required_phrase_reads_one_round_before_its_threshold() {
         TempDir::new().expect("tempdir"),
     );
     let (with, without) = (build(&with_dir, true), build(&without_dir, false));
-    for k in [1usize, 10] {
-        let (a, stats, _) = run(&with, "\"alpha beta\"", BoolMode::And, k);
-        let (b, _, _) = run(&without, "\"alpha beta\"", BoolMode::And, k);
-        assert!(!a.is_empty(), "k={k}: the phrase matches");
-        assert_eq!(a, b, "k={k}: the answer is the ceilings'");
+    for (mode, k) in [BoolMode::And, BoolMode::Or]
+        .into_iter()
+        .flat_map(|m| [(m, 1usize), (m, 10)])
+    {
+        let (a, stats, _) = run(&with, "\"alpha beta\"", mode, k);
+        let (b, _, _) = run(&without, "\"alpha beta\"", mode, k);
+        assert!(!a.is_empty(), "{mode:?} k={k}: the phrase matches");
+        assert_eq!(a, b, "{mode:?} k={k}: the answer is the ceilings'");
         assert!(
             stats.tier_entries > 0 && stats.tier_entries <= FIRST_ROUND,
-            "k={k}: one round of heads before the opens, read {}",
+            "{mode:?} k={k}: one round of heads before the opens, read {}",
             stats.tier_entries
         );
     }
