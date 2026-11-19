@@ -1079,23 +1079,11 @@ pub(crate) fn ceiling_can_compete(ceiling: f32, floor: f32) -> bool {
     ceiling.partial_cmp(&floor) != Some(std::cmp::Ordering::Less)
 }
 
-/// The score a superfile's ceiling is actually tested against: the running
-/// k-th score, raised by the caller's tolerance.
-///
-/// At the default tolerance of zero this returns `floor` bit for bit, because
-/// multiplying by `1.0` is exact, so exact scoring keeps precisely the
-/// comparison it had before tolerance existed. A negative or non-finite
-/// tolerance is treated as zero rather than rejected: the worst such a value
-/// could do is lower the bar and open superfiles that need not be opened,
-/// which is slow and still correct, but defining it away is cheaper than
-/// reasoning about it at every call site.
-/// Wall a ranked query's opens may take before it answers approximately:
-/// past it, a query whose bounds leave too many superfiles in play keeps
-/// only those that can matter most.
+/// Wall a ranked query's opens may take before a query that accepts an
+/// approximate answer (a score tolerance above zero) takes one: past it,
+/// such a query whose bounds leave too many superfiles in play keeps only
+/// those that can matter most.
 const APPROXIMATE_BUDGET_NS: u64 = 60_000_000_000;
-/// The score tolerance an over-budget query first takes: superfiles
-/// bounded within it of the threshold are left unopened.
-const APPROXIMATE_TOLERANCE: f32 = 0.05;
 /// What one open is taken to cost before the table has measured it: a
 /// cold read of a superfile's dictionary and postings from object storage.
 const UNMEASURED_OPEN_COST_NS: u64 = 50_000_000;
@@ -1111,14 +1099,30 @@ struct ApproximateCut {
 }
 
 /// Where to cut a ranked query's superfiles, `ceilings` in descending
-/// order, given its threshold `theta` and what an open costs. All of them
-/// while their opens fit [`APPROXIMATE_BUDGET_NS`] — the answer is exact.
-/// Past it, first those bounded more than [`APPROXIMATE_TOLERANCE`] above
-/// the threshold; still past it, as many of those as fit, best first. The
-/// gap is the largest bound left unopened over the threshold, less one: no
-/// missed document scores further above the returned k-th score, which is
-/// at least the threshold. Without a threshold no gap is known.
-fn approximate_cut(ceilings: &[f32], theta: f32, open_cost_ns: u64) -> ApproximateCut {
+/// order, given its threshold `theta`, what an open costs and the caller's
+/// score `tolerance`. Every one is kept — the answer is exact — unless the
+/// caller accepts an approximate answer (`tolerance` above zero), a
+/// threshold is known, and opening those in play would run past
+/// [`APPROXIMATE_BUDGET_NS`]. Then first those bounded more than the
+/// tolerance above the threshold are kept; still past it, as many of those
+/// as fit, best first. The gap is the largest bound left unopened over the
+/// threshold, less one: no missed document scores further above the
+/// returned k-th score, which is at least the threshold.
+fn approximate_cut(
+    ceilings: &[f32],
+    theta: f32,
+    open_cost_ns: u64,
+    tolerance: f32,
+) -> ApproximateCut {
+    let exact = ApproximateCut {
+        keep: ceilings.len(),
+        gap_ppm: 0,
+    };
+    let accepts = tolerance.is_finite() && tolerance > 0.0;
+    let bounded = theta.is_finite() && theta > 0.0;
+    if !(accepts && bounded) {
+        return exact;
+    }
     let per_open = match open_cost_ns {
         0 => UNMEASURED_OPEN_COST_NS,
         ns => ns,
@@ -1126,27 +1130,30 @@ fn approximate_cut(ceilings: &[f32], theta: f32, open_cost_ns: u64) -> Approxima
     let fit = (APPROXIMATE_BUDGET_NS / per_open).max(1) as usize;
     let in_play = ceilings.iter().filter(|c| **c > theta).count();
     if in_play <= fit {
-        return ApproximateCut {
-            keep: ceilings.len(),
-            gap_ppm: 0,
-        };
+        return exact;
     }
-    let past_tolerance = match theta.is_finite() && theta > 0.0 {
-        true => ceilings
-            .iter()
-            .filter(|c| **c > theta * (1.0 + APPROXIMATE_TOLERANCE))
-            .count(),
-        false => ceilings.len(),
-    };
+    let past_tolerance = ceilings
+        .iter()
+        .filter(|c| **c > theta * (1.0 + tolerance))
+        .count();
     let keep = past_tolerance.min(fit);
     let gap_ppm = match ceilings.get(keep) {
         None => 0,
-        Some(_) if !(theta.is_finite() && theta > 0.0) => u64::MAX,
         Some(&next) => (((next / theta) - 1.0).max(0.0) * PPM).ceil() as u64,
     };
     ApproximateCut { keep, gap_ppm }
 }
 
+/// The score a superfile's ceiling is actually tested against: the running
+/// k-th score, raised by the caller's tolerance.
+///
+/// At the default tolerance of zero this returns `floor` bit for bit, because
+/// multiplying by `1.0` is exact, so exact scoring keeps precisely the
+/// comparison it had before tolerance existed. A negative or non-finite
+/// tolerance is treated as zero rather than rejected: the worst such a value
+/// could do is lower the bar and open superfiles that need not be opened,
+/// which is slow and still correct, but defining it away is cheaper than
+/// reasoning about it at every call site.
 pub(crate) fn competitive_floor(floor: f32, tolerance: f32) -> f32 {
     match tolerance.is_finite() && tolerance > 0.0 {
         true => floor * (1.0 + tolerance),
@@ -2438,11 +2445,14 @@ impl SupertableReader {
                             .then(yl.total_cmp(xl))
                             .then(a.id_min.cmp(&b.id_min))
                     });
-                    // Exact unless opening what is still in play would run
-                    // past the budget; then approximate, with the gap noted.
+                    // Exact unless the caller accepts an approximate answer
+                    // and opening what is still in play would run past the
+                    // budget; then approximate, with the gap noted.
                     let ceilings: Vec<f32> = keep.iter().map(|(_, p, _)| p.ceiling).collect();
-                    let cut = approximate_cut(&ceilings, selection.theta_lb, open_cost_ns);
-                    if cut.keep < keep.len() {
+                    let cut =
+                        approximate_cut(&ceilings, selection.theta_lb, open_cost_ns, score_tolerance);
+                    let cut_any = cut.keep < keep.len();
+                    if cut_any {
                         let skipped = (keep.len() - cut.keep) as u64;
                         keep.truncate(cut.keep);
                         if let Some(stats) = &reader.op_stats {
@@ -2455,8 +2465,11 @@ impl SupertableReader {
                     // replace these placeholders only raise it. They stand
                     // for k real documents at `_id`s no higher than the
                     // threshold's, so a superfile that can only tie them and
-                    // holds only higher `_id`s is skipped on the tie.
-                    if selection.theta_lb.is_finite() {
+                    // holds only higher `_id`s is skipped on the tie. Not
+                    // after a cut: the documents they stand for may sit in a
+                    // superfile left unopened, and the answer would come back
+                    // short of k.
+                    if selection.theta_lb.is_finite() && !cut_any {
                         merger.merge(selection.theta_id_max, repeat_n(selection.theta_lb, k));
                     }
                     let resolved = answered.len() as u64;
@@ -4761,6 +4774,9 @@ mod tests {
     use super::{APPROXIMATE_BUDGET_NS, ApproximateCut, UNMEASURED_OPEN_COST_NS, approximate_cut};
     use crate::supertable::manifest::ScalarStats;
 
+    /// The tolerance an over-budget query takes in the cuts below.
+    const TOLERANCE: f32 = 0.05;
+
     /// Within the budget every superfile opens; past it, first those over
     /// the tolerance, then as many as fit, and the gap bounds what is left.
     #[test]
@@ -4769,7 +4785,7 @@ mod tests {
         // Four fit: every one opens, exactly.
         let few = [3.0, 2.5, 2.0, 1.5];
         assert_eq!(
-            approximate_cut(&few, 1.0, per_open),
+            approximate_cut(&few, 1.0, per_open, TOLERANCE),
             ApproximateCut {
                 keep: 4,
                 gap_ppm: 0
@@ -4777,25 +4793,42 @@ mod tests {
         );
         // Bounds at or under the threshold never count against the budget.
         let tied = [3.0, 2.0, 1.5, 1.2, 1.0, 1.0, 0.5];
-        assert_eq!(approximate_cut(&tied, 1.0, per_open).keep, 7);
+        assert_eq!(approximate_cut(&tied, 1.0, per_open, TOLERANCE).keep, 7);
         // Six in play: the tolerance leaves those within 5% of the
         // threshold, and the gap is the largest of them.
         let near = [3.0, 2.0, 1.5, 1.2, 1.04, 1.02];
-        let cut = approximate_cut(&near, 1.0, per_open);
+        let cut = approximate_cut(&near, 1.0, per_open, TOLERANCE);
         assert_eq!(cut.keep, 4);
         assert!((cut.gap_ppm as f32 - 40_000.0).abs() < 2.0, "{cut:?}");
         // Still past it: the four best open, the gap is the fifth's bound.
         let many = [5.0, 4.0, 3.0, 2.5, 2.0, 1.5];
-        let cut = approximate_cut(&many, 1.0, per_open);
+        let cut = approximate_cut(&many, 1.0, per_open, TOLERANCE);
         assert_eq!(cut.keep, 4);
         assert_eq!(cut.gap_ppm, 1_000_000);
-        // Without a threshold the gap is unknown.
-        let cut = approximate_cut(&many, f32::NEG_INFINITY, per_open);
-        assert_eq!((cut.keep, cut.gap_ppm), (4, u64::MAX));
         // Unmeasured opens are priced as cold reads.
         let wide: Vec<f32> = (0..2000).map(|i| 3.0 - i as f32 * 1e-3).collect();
         let fit = (APPROXIMATE_BUDGET_NS / UNMEASURED_OPEN_COST_NS) as usize;
-        assert_eq!(approximate_cut(&wide, 1.0, 0).keep, fit);
+        assert_eq!(approximate_cut(&wide, 1.0, 0, TOLERANCE).keep, fit);
+    }
+
+    /// A query that did not accept an approximate answer, or one with no
+    /// threshold to bound the gap by, opens every superfile however far
+    /// past the budget its opens run.
+    #[test]
+    fn an_exact_or_unbounded_query_is_never_cut() {
+        let per_open = APPROXIMATE_BUDGET_NS / 4;
+        let many = [5.0, 4.0, 3.0, 2.5, 2.0, 1.5];
+        let exact = ApproximateCut {
+            keep: many.len(),
+            gap_ppm: 0,
+        };
+        for tolerance in [0.0, -1.0, f32::NAN] {
+            assert_eq!(approximate_cut(&many, 1.0, per_open, tolerance), exact);
+        }
+        assert_eq!(
+            approximate_cut(&many, f32::NEG_INFINITY, per_open, TOLERANCE),
+            exact
+        );
     }
 
     #[test]

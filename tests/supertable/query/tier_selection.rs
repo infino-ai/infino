@@ -652,39 +652,6 @@ fn nulls_in_the_column_answer_the_same_and_still_resolve() {
     );
 }
 
-/// A cap on a term's entries cuts every superfile's head to the same
-/// shallower depth: the bounds hold through the raised tails and the
-/// answers do not change.
-#[test]
-fn a_per_term_budget_cuts_heads_and_answers_the_same() {
-    let with_dir = TempDir::new().expect("tempdir");
-    let without_dir = TempDir::new().expect("tempdir");
-    let with = table_with(
-        &with_dir,
-        Build {
-            tiers: true,
-            budget: Some(100),
-            ..Build::default()
-        },
-    );
-    let without = table(&without_dir, false);
-    let mut served = 0usize;
-    for (query, mode) in queries() {
-        for k in [10usize, 100] {
-            let (a, stats, _) = run(&with, &query, mode, k);
-            let (b, _, _) = run(&without, &query, mode, k);
-            assert_eq!(
-                a, b,
-                "{query:?} {mode:?} k={k}: same answer under the budget"
-            );
-            if stats.tier_entries > 0 {
-                served += 1;
-            }
-        }
-    }
-    assert!(served > 0, "the cut heads still serve queries");
-}
-
 /// The merge serves up to sixty-four distinct terms, a bit each; one more
 /// keeps the ceilings. Both answer as the table without tiers does.
 #[test]

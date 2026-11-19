@@ -270,7 +270,7 @@ pub(crate) async fn available(
 }
 
 /// Choose the superfiles `query` opens from the level heads, or `None`
-/// when the heads cannot serve it: a phrase or a negation, a term with
+/// when the heads cannot serve it: a negation, a term with
 /// postings in a layer that has no level head, or a superfile the index
 /// does not list or whose average length is unknown.
 pub(crate) async fn select<'a>(
