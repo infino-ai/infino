@@ -55,6 +55,7 @@ use crate::{
     memory::ConnectionMemoryBudget,
     supertable::{
         query::{
+            filter_in_scan::FilterIntoCachedScan,
             join_build_size::RightSizeJoinBuild,
             limit_stage::StageLimitGathers,
             read_ahead_rule::ReadAheadOff,
@@ -291,6 +292,9 @@ pub(crate) fn budgeted_session_context(
     //    earlier onto the probe side. It copies build columns whose buffers
     //    are much larger than their rows, so the join is charged for the rows
     //    it keeps.
+    //  - `FilterIntoCachedScan` after DataFusion's rules, once filters sit
+    //    over the scans they read, to check a `WHERE` in a scan of kept
+    //    columns on the columns as kept.
     //  - `KeepSortedRoot` after DataFusion's rules, to remove the round-robin
     //    repartition that `EnforceDistribution` adds above a sorted result,
     //    which would return an `ORDER BY` out of order.
@@ -303,6 +307,7 @@ pub(crate) fn budgeted_session_context(
     rules.insert(0, Arc::new(RowFilterUnderTopK));
     rules.insert(1, Arc::new(OrderUnderScalarSubquery));
     rules.push(Arc::new(RightSizeJoinBuild));
+    rules.push(Arc::new(FilterIntoCachedScan));
     rules.push(Arc::new(KeepSortedRoot));
     rules.push(Arc::new(StageLimitGathers));
     rules.push(Arc::new(ReadAheadOff));

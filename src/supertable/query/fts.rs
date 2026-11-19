@@ -88,8 +88,9 @@ use arrow::record_batch::RecordBatch;
 use arrow_array::{Array, LargeStringArray};
 use datafusion::logical_expr::Expr;
 use futures::future::join;
+use rayon::ThreadPool;
 use roaring::RoaringBitmap;
-use tokio::sync::OnceCell;
+use tokio::sync::{OnceCell, Semaphore};
 use tracing::{Instrument, debug, warn};
 use uuid::Uuid;
 
@@ -116,6 +117,7 @@ pub use crate::superfile::fts::reader::BoolMode;
 use crate::utils::trace::OpOrigin;
 use crate::{
     InfinoError, config,
+    memory::ConnectionMemoryBudget,
     runtime_bridge::run_on_pool_unless_blocking,
     runtime_metrics::op_stats,
     superfile::{
@@ -126,12 +128,12 @@ use crate::{
             bm25::Bm25Params,
             reader::{
                 Bm25SearchOptions, ClauseLists, ColumnLengthStats, FetchedTermMemo, GlobalTermIdf,
-                LiveFloor, MatchWork, OR_WINDOW_MIN_TERMS, OrCursorSet, PreparedClauses, QueryIdf,
-                ScoringView,
+                LiveFloor, MatchWork, OR_WINDOW_MIN_TERMS, OrCursorSet, PreparedClauses, QueryDict,
+                QueryIdf, ScoringView,
             },
             tokenize::Phrase,
         },
-        id_space::RowId,
+        id_space::{FtsDocId, RowId},
     },
     supertable::{
         error::QueryError,
@@ -145,10 +147,11 @@ use crate::{
             candidate::{CandidatePlan, CandidateScope, TermMemos},
             dispatch,
             exec::common::{
-                hit_output_schema, resolve_hits_named, take_file_columns, take_rows_byte_source,
+                candidate_plan_for_filters, hit_output_schema, resolve_hits_named,
+                take_file_columns, take_rows_byte_source,
             },
             match_order::MatchOrder,
-            provider::prune_leaves_for_filters,
+            provider::{holds_no_postings, prune_leaves_for_filters},
             prune::{PruneLeaf, select_superfiles},
             tier,
         },
@@ -299,10 +302,54 @@ struct MatchKernel {
     negatives: Vec<String>,
     negative_phrases: Vec<Phrase<String>>,
     locations: IndexLocations,
+    /// The pushed-down `WHERE`'s rows, when its indexes can bound them.
+    row_filter: Option<RowFilter>,
     op_stats: Option<Arc<op_stats::OpStatsCollector>>,
+    /// The budget a file's kept dictionary is reserved from.
+    budget: Arc<ConnectionMemoryBudget>,
+}
+
+/// The dictionary copy a file's match walks share: kept only when the positive walk and the negated
+/// walk both read the dictionary, i.e. the memo answers neither; otherwise it keeps nothing.
+fn walk_dict(
+    phrase_involved: bool,
+    memo: Option<&FetchedTermMemo>,
+    positive: &[&str],
+    negated: &[&str],
+    budget: &Arc<ConnectionMemoryBudget>,
+) -> QueryDict {
+    let reads = |tokens: &[&str]| !memo.is_some_and(|m| m.covers(tokens));
+    match !phrase_involved && !negated.is_empty() && reads(positive) && reads(negated) {
+        true => QueryDict::with_budget(budget),
+        false => QueryDict::default(),
+    }
 }
 
 impl MatchKernel {
+    /// `docs` of superfile `suid` without the rows the `WHERE` rules out,
+    /// when [`RowFilter::rows`] finds them; `hits` bounds how many rows the
+    /// match keeps there, and `shared` keeps the rows for the file's other
+    /// slices.
+    async fn keep_filtered(
+        &self,
+        r: &Arc<SuperfileReader>,
+        suid: Uuid,
+        hits: u64,
+        shared: bool,
+        mut docs: Vec<RowId>,
+    ) -> Result<Vec<RowId>, QueryError> {
+        let Some(filter) = &self.row_filter else {
+            return Ok(docs);
+        };
+        if docs.is_empty() {
+            return Ok(docs);
+        }
+        if let Some(rows) = filter.rows(r, suid, hits, shared).await? {
+            docs.retain(|d| rows.contains(d.get()));
+        }
+        Ok(docs)
+    }
+
     /// What every walk of superfile `suid` starts from: the matched column
     /// under the name `r` knows it by, the index's memo of the terms'
     /// postings there, and the terms.
@@ -324,8 +371,16 @@ impl MatchKernel {
 
     /// The rows of superfile `suid`, read through `r`, that the match
     /// keeps: the positive walk minus any row a negated atom reaches.
-    async fn docs(&self, r: &SuperfileReader, suid: Uuid) -> Result<Vec<RowId>, QueryError> {
+    async fn docs(&self, r: &Arc<SuperfileReader>, suid: Uuid) -> Result<Vec<RowId>, QueryError> {
         let (column, memo, refs) = self.file_inputs(r, suid).await;
+        let neg_refs: Vec<&str> = self.negatives.iter().map(String::as_str).collect();
+        let dict = walk_dict(
+            self.phrase_involved,
+            memo.as_deref(),
+            &refs,
+            &neg_refs,
+            &self.budget,
+        );
         // Any phrase atom (match or negated) takes the phrase-aware walk;
         // plain-token queries keep the optimized token_match path.
         let (docs, mut work) = match self.phrase_involved {
@@ -334,7 +389,7 @@ impl MatchKernel {
                     .await?
             }
             false => {
-                r.token_match_prefetched(&column, &refs, self.mode, memo.as_deref())
+                r.token_match_prefetched(&column, &refs, self.mode, memo.as_deref(), &dict)
                     .await?
             }
         };
@@ -342,11 +397,16 @@ impl MatchKernel {
         // of the negatives). The df / count fast paths can't express
         // exclusion, so negation forces a materialized walk over both sets.
         let docs = if self.has_negatives {
-            let neg_refs: Vec<&str> = self.negatives.iter().map(String::as_str).collect();
             let (neg_docs, neg_work) = match self.negative_phrases.is_empty() {
                 true => {
-                    r.token_match_prefetched(&column, &neg_refs, BoolMode::Or, memo.as_deref())
-                        .await?
+                    r.token_match_prefetched(
+                        &column,
+                        &neg_refs,
+                        BoolMode::Or,
+                        memo.as_deref(),
+                        &dict,
+                    )
+                    .await?
                 }
                 false => {
                     r.atoms_match_ids(&column, &neg_refs, &self.negative_phrases, BoolMode::Or)
@@ -361,9 +421,12 @@ impl MatchKernel {
         } else {
             docs
         };
+        // The row filter reads the dictionary on its own; the kept copy is not held through it.
+        drop(dict);
         // One flush per superfile: positive + negation walks.
         self.flush(&work);
-        Ok(docs)
+        let hits = docs.len() as u64;
+        self.keep_filtered(r, suid, hits, false, docs).await
     }
 
     /// Whether one superfile's walk may be cut into doc-id slices: a plain
@@ -384,27 +447,173 @@ impl MatchKernel {
         Ok(set)
     }
 
-    /// The rows in doc-id slice `[start, end)` of a superfile that `set`,
-    /// its [`Self::cursor_set`], matches. A [`Self::slices`] kernel only.
+    /// What doc-id slice `[start, end)` of a superfile matches against `set`, its
+    /// [`Self::cursor_set`]: its rows when the file holds its doc-id map, else its blob ids for
+    /// the page read. A [`Self::slices`] kernel only.
     fn slice(
         &self,
         r: &SuperfileReader,
         set: &OrCursorSet,
         start: u32,
         end: u32,
-    ) -> Result<Vec<RowId>, QueryError> {
-        let (rows, work) = r.token_match_range_prebuilt(set, start, end)?;
+    ) -> Result<SliceMatch, QueryError> {
+        let (ids, work) = r.token_match_range_in_blob_ids(set, start, end)?;
         self.flush(&work);
-        Ok(rows)
+        Ok(match r.held_ids_to_rows(&ids)? {
+            Some(rows) => SliceMatch::Rows(rows),
+            None => SliceMatch::Unmapped(ids),
+        })
     }
 
     /// Adds a walk's work to the statement's statistics.
     fn flush(&self, work: &MatchWork) {
-        if let Some(stats) = &self.op_stats {
-            stats.add_fts_postings_bytes(work.postings_bytes);
-            stats.add_planned_read_ranges(work.planned_ranges);
-            stats.add_kernel_cpu_ns(work.kernel_cpu_ns);
+        add_match_work(&self.op_stats, work);
+    }
+}
+
+/// What one slice of a sliced match found.
+enum SliceMatch {
+    /// Its rows, translated through the doc-id map the file holds.
+    Rows(Vec<RowId>),
+    /// Its blob ids, when the file keeps no map, for a read of the map's pages.
+    Unmapped(Vec<FtsDocId>),
+}
+
+/// The row filter walks a superfile's postings only when the match keeps at
+/// least this many times the rows the filter's estimate keeps. Below it the
+/// walk drops too few rows to pay for itself, and the narrowed rows miss the
+/// decoded-column cache an unnarrowed repeat would hit.
+const ROW_FILTER_MIN_HITS_RATIO: u64 = 2;
+
+/// Fewest rows a match must keep in a superfile before the row filter is
+/// tried there. Below it, taking the extra rows costs less than the
+/// filter's estimate, which may read the superfile's dictionary.
+pub(crate) const ROW_FILTER_MIN_HITS: u64 = 1024;
+
+/// The rows a pushed-down `WHERE` keeps in each superfile, read from its
+/// indexes on the reader the match already opened, so a match takes no
+/// column for a row the filter rules out. A row set is a superset of the
+/// rows that pass: the `FilterExec` above the scan still decides the rows.
+struct RowFilter {
+    /// The `WHERE` as a bounded candidate plan with no `LIKE` leaf.
+    plan: Arc<CandidatePlan>,
+    /// The index's locations for the plan's terms in the kept superfiles.
+    locations: PlanLocations,
+    pool: Arc<ThreadPool>,
+    /// Bounds how many filter walks this query puts on `pool` at once.
+    slots: Semaphore,
+    op_stats: Option<Arc<op_stats::OpStatsCollector>>,
+    /// A sliced superfile's rows, found once and shared by its slices.
+    found: SuperfileCells<Option<Arc<RoaringBitmap>>>,
+}
+
+impl RowFilter {
+    /// The filter for `filters` over `kept`, or `None` when the indexes
+    /// bound no row. A `LIKE` is left to the `FilterExec`: binding it walks
+    /// each superfile's dictionary.
+    async fn new(
+        manifest: &ManifestSnapshot,
+        filters: &[Expr],
+        kept: &[Arc<SuperfileEntry>],
+        op_stats: Option<Arc<op_stats::OpStatsCollector>>,
+    ) -> Result<Option<Self>, QueryError> {
+        if filters.is_empty() {
+            return Ok(None);
         }
+        let plan = candidate_plan_for_filters(manifest, filters);
+        if matches!(plan, CandidatePlan::Unbounded) || plan.has_like() {
+            return Ok(None);
+        }
+        let locations = plan_locations_for(manifest, &plan, kept).await?;
+        let pool = Arc::clone(&manifest.options.reader_pool);
+        Ok(Some(Self {
+            plan: Arc::new(plan),
+            locations,
+            slots: Semaphore::new(pool.current_num_threads()),
+            pool,
+            op_stats,
+            found: SuperfileCells::default(),
+        }))
+    }
+
+    /// The rows of superfile `suid` the filter can keep, or `None` when it
+    /// does not narrow them. `hits` bounds the rows the match keeps there:
+    /// the filter is tried only from [`ROW_FILTER_MIN_HITS`], and its
+    /// postings are walked only when its estimate is well below `hits`
+    /// (see [`ROW_FILTER_MIN_HITS_RATIO`]). With `shared`, the rows are
+    /// found once and kept for the file's other slices.
+    async fn rows(
+        &self,
+        r: &Arc<SuperfileReader>,
+        suid: Uuid,
+        hits: u64,
+        shared: bool,
+    ) -> Result<Option<Arc<RoaringBitmap>>, QueryError> {
+        if hits < ROW_FILTER_MIN_HITS {
+            return Ok(None);
+        }
+        if !shared {
+            return self.find(r, suid, hits).await;
+        }
+        let cell = cell_for(&self.found, suid);
+        let rows = cell.get_or_try_init(|| self.find(r, suid, hits)).await?;
+        Ok(rows.clone())
+    }
+
+    /// [`Self::rows`] without the cache.
+    async fn find(
+        &self,
+        r: &Arc<SuperfileReader>,
+        suid: Uuid,
+        hits: u64,
+    ) -> Result<Option<Arc<RoaringBitmap>>, QueryError> {
+        let located = IndexedSuperfile {
+            locations: &self.locations,
+            superfile: suid,
+        };
+        let estimated = self
+            .plan
+            .estimate(r, Some(&self.pool), Some(located), &QueryDict::default())
+            .await;
+        let (estimate, work) = match estimated {
+            Ok(estimated) => estimated,
+            // A superfile written before a filter column was indexed holds
+            // no postings for it: its rows are left to the `FilterExec`.
+            Err(e) if holds_no_postings(&e) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        self.flush(&work);
+        if estimate.saturating_mul(ROW_FILTER_MIN_HITS_RATIO) > hits {
+            return Ok(None);
+        }
+        // The walk is CPU work: on the pool, not on a runtime worker.
+        let memos = memos_from_plan_locations(r, &self.locations, suid).await;
+        let (rows, work) = Arc::clone(&self.plan)
+            .evaluate_on_pool(
+                Arc::clone(r),
+                suid,
+                &self.pool,
+                &self.slots,
+                memos,
+                Arc::default(),
+            )
+            .await?;
+        self.flush(&work);
+        Ok(rows.map(Arc::new))
+    }
+
+    /// Adds the filter's index work to the statement's statistics.
+    fn flush(&self, work: &MatchWork) {
+        add_match_work(&self.op_stats, work);
+    }
+}
+
+/// Adds an index walk's work to the statement's statistics, if collected.
+fn add_match_work(op_stats: &Option<Arc<op_stats::OpStatsCollector>>, work: &MatchWork) {
+    if let Some(stats) = op_stats {
+        stats.add_fts_postings_bytes(work.postings_bytes);
+        stats.add_planned_read_ranges(work.planned_ranges);
+        stats.add_kernel_cpu_ns(work.kernel_cpu_ns);
     }
 }
 
@@ -1822,7 +2031,7 @@ impl SupertableReader {
                     // queries (`fanout_for` never slices when a must
                     // or negated clause exists).
                     Some((start, end)) => {
-                        let cell = cursor_cell(&cursor_sets, suid);
+                        let cell = cell_for(&cursor_sets, suid);
                         // The global idf is one map for the whole query, so
                         // every slice of a superfile wants cursors built
                         // with the same override — sharing the cursor set
@@ -2446,12 +2655,10 @@ impl SupertableReader {
                         // Residual superfile (contains a scored term, pruned
                         // from scoring): df only, from the dictionary value
                         // + header hint — no postings body.
-                        let (dfs, work) = r.term_dfs(&column_arc, &refs).await?;
-                        if let Some(stats) = &op_stats {
-                            stats.add_fts_postings_bytes(work.postings_bytes);
-                            stats.add_planned_read_ranges(work.planned_ranges);
-                            stats.add_kernel_cpu_ns(work.kernel_cpu_ns);
-                        }
+                        let (dfs, work) = r
+                            .term_dfs(&column_arc, &refs, &QueryDict::default())
+                            .await?;
+                        add_match_work(&op_stats, &work);
                         Ok((suid, dfs, None))
                     }
                 }
@@ -2846,7 +3053,8 @@ impl SupertableReader {
     /// stable id only where the fan-out tagged one, and must not be asked
     /// for `_id`.
     ///
-    /// Superfiles whose statistics cannot pass `filters` are not walked.
+    /// Superfiles whose statistics cannot pass `filters` are not walked, and
+    /// where the filters' indexes bound their rows, only those rows come out.
     pub(crate) async fn token_match_hits_async(
         &self,
         column: &str,
@@ -2957,23 +3165,34 @@ impl SupertableReader {
                 let docs = match range {
                     None => kernel.docs(&r, suid).await?,
                     Some((start, end)) => {
-                        let cell = cursor_cell(&cursor_sets, suid);
+                        let cell = cell_for(&cursor_sets, suid);
                         let set = cell
                             .get_or_try_init(|| async {
                                 Ok::<_, QueryError>(Arc::new(kernel.cursor_set(&r, suid).await?))
                             })
                             .await?;
+                        // The whole file's match keeps at most its terms'
+                        // summed counts, whichever slice asks.
+                        let hits = set.df_sum().min(r.n_docs());
                         // A slice's walk is a sync scan of a share of the
                         // file: a rayon job on the reader pool, so the
                         // slices run side by side and no runtime worker
                         // blocks under one.
-                        let (set, slice_reader, slice_kernel) =
+                        let (slice_set, slice_reader, slice_kernel) =
                             (Arc::clone(set), Arc::clone(&r), Arc::clone(&kernel));
-                        run_on_pool_unless_blocking(Some(&reader_pool), "match slice", move || {
-                            slice_kernel.slice(&slice_reader, &set, start, end)
-                        })
+                        let found = run_on_pool_unless_blocking(
+                            Some(&reader_pool),
+                            "match slice",
+                            move || slice_kernel.slice(&slice_reader, &slice_set, start, end),
+                        )
                         .await
-                        .map_err(|e| QueryError::Internal(e.to_string()))??
+                        .map_err(|e| QueryError::Internal(e.to_string()))??;
+                        let docs = match found {
+                            SliceMatch::Rows(rows) => rows,
+                            // The file keeps no map: read only this slice's pages of it.
+                            SliceMatch::Unmapped(ids) => r.ids_to_rows_in_pages(ids, set).await?,
+                        };
+                        kernel.keep_filtered(&r, suid, hits, true, docs).await?
                     }
                 };
                 let mut locals: Vec<u32> = docs.into_iter().map(RowId::get).collect();
@@ -3115,12 +3334,16 @@ impl SupertableReader {
             .chain(negatives.terms.iter())
             .map(String::as_str)
             .collect();
-        let locations = self
-            .index_locations(column, &all_terms, &kept)
-            .instrument(trace::phase(phases, || {
-                detail_span!("fts.term_index", terms = all_terms.len())
-            }))
-            .await?;
+        // The match's and the filter's index lookups run side by side.
+        let (locations, row_filter) = join(
+            self.index_locations(column, &all_terms, &kept)
+                .instrument(trace::phase(phases, || {
+                    detail_span!("fts.term_index", terms = all_terms.len())
+                })),
+            RowFilter::new(self.manifest(), filters, &kept, self.op_stats.clone()),
+        )
+        .await;
+        let (locations, row_filter) = (locations?, row_filter?);
         let units: Vec<(Arc<SuperfileEntry>, Uuid)> = kept
             .into_iter()
             .map(|e| {
@@ -3139,7 +3362,9 @@ impl SupertableReader {
             negatives: negatives.terms,
             negative_phrases: negatives.phrases,
             locations,
+            row_filter,
             op_stats: self.op_stats.clone(),
+            budget: Arc::clone(&self.manifest().options.connection_memory_budget),
         };
         Ok(Some((units, Arc::new(kernel))))
     }
@@ -3272,6 +3497,7 @@ impl SupertableReader {
         // on the first error. The per-superfile body returns this
         // superfile's match count; the totals are summed.
         let op_stats = self.op_stats.clone();
+        let budget = Arc::clone(&self.manifest().options.connection_memory_budget);
         let per_superfile = dispatch::fanout_with(
             self,
             units,
@@ -3279,6 +3505,7 @@ impl SupertableReader {
             self.open_intent(),
             move |r, entry, tombstone_cache, now, _params: ()| {
                 let op_stats = op_stats.clone();
+                let budget = Arc::clone(&budget);
                 let column_arc = Arc::clone(&column_arc);
                 let term_arc = Arc::clone(&term_arc);
                 let phrase_arc = Arc::clone(&phrase_arc);
@@ -3311,6 +3538,9 @@ impl SupertableReader {
                     // negatives) or a tombstone. Negation *without* deletes
                     // takes the skip-based counting path below instead.
                     if tomb.is_some() {
+                        let neg_refs: Vec<&str> = neg_arc.iter().map(|s| s.as_str()).collect();
+                        let dict =
+                            walk_dict(phrase_involved, memo.as_deref(), &refs, &neg_refs, &budget);
                         let (docs, mut work) = match phrase_involved {
                             true => {
                                 r.atoms_match_ids(&column_arc, &refs, &phrase_arc, match_mode)
@@ -3322,12 +3552,12 @@ impl SupertableReader {
                                     &refs,
                                     match_mode,
                                     memo.as_deref(),
+                                    &dict,
                                 )
                                 .await?
                             }
                         };
                         let excluded: RoaringBitmap = if has_negatives {
-                            let neg_refs: Vec<&str> = neg_arc.iter().map(|s| s.as_str()).collect();
                             let (neg_docs, neg_work) = match neg_ph_arc.is_empty() {
                                 true => {
                                     r.token_match_prefetched(
@@ -3335,6 +3565,7 @@ impl SupertableReader {
                                         &neg_refs,
                                         BoolMode::Or,
                                         memo.as_deref(),
+                                        &dict,
                                     )
                                     .await?
                                 }
@@ -3419,7 +3650,8 @@ impl SupertableReader {
     /// **no scoring**. See [`crate::superfile::SuperfileReader::exact_match`]
     /// for the per-superfile two-pass (token-AND prune + raw verify).
     ///
-    /// Superfiles whose statistics cannot pass `filters` are not read.
+    /// Superfiles whose statistics cannot pass `filters` are not read, and
+    /// where the filters' indexes bound their rows, only those are verified.
     ///
     /// `pub(crate)` async kernel; the public surface is the sync
     /// [`SupertableReader::exact_match`].
@@ -3473,12 +3705,16 @@ impl SupertableReader {
             return Ok(Vec::new());
         }
         let token_refs: Vec<&str> = term_strings.iter().map(String::as_str).collect();
-        let locations = self
-            .index_locations(column, &token_refs, &kept)
-            .instrument(trace::phase(phases, || {
-                detail_span!("fts.term_index", terms = token_refs.len())
-            }))
-            .await?;
+        // The match's and the filter's index lookups run side by side.
+        let (locations, row_filter) = join(
+            self.index_locations(column, &token_refs, &kept)
+                .instrument(trace::phase(phases, || {
+                    detail_span!("fts.term_index", terms = token_refs.len())
+                })),
+            RowFilter::new(manifest, filters, &kept, self.op_stats.clone()),
+        )
+        .await;
+        let (locations, row_filter) = (locations?, row_filter?.map(Arc::new));
         let units: Vec<(Arc<SuperfileEntry>, ())> = kept.into_iter().map(|e| (e, ())).collect();
         let column_field_id = self.manifest().field_id(column);
         let column_arc = Arc::new(column.to_owned());
@@ -3496,6 +3732,7 @@ impl SupertableReader {
             let value_arc = Arc::clone(&value_arc);
             let tokens_arc = Arc::clone(&tokens_arc);
             let locations = Arc::clone(&locations);
+            let row_filter = row_filter.clone();
             let op_stats = op_stats.clone();
             let reader_pool = Arc::clone(&reader_pool);
             let budget = Arc::clone(&budget);
@@ -3505,13 +3742,19 @@ impl SupertableReader {
                 // what finds the column in either file.
                 let column_arc = r.column_alias(column_field_id, &column_arc).to_owned();
 
-                let candidates: Vec<u32> = if tokens_arc.is_empty() {
+                let mut candidates: Vec<u32> = if tokens_arc.is_empty() {
                     (0..r.n_docs() as u32).collect()
                 } else {
                     let memo = memo_from_locations(&r, &locations, entry.superfile_id).await;
                     let refs: Vec<&str> = tokens_arc.iter().map(String::as_str).collect();
                     let (docs, work) = r
-                        .token_match_prefetched(&column_arc, &refs, BoolMode::And, memo.as_deref())
+                        .token_match_prefetched(
+                            &column_arc,
+                            &refs,
+                            BoolMode::And,
+                            memo.as_deref(),
+                            &QueryDict::default(),
+                        )
                         .await?;
                     // The prune pass's posting walk. The verify pass's own
                     // decode is folded into `rows_materialized` below; its
@@ -3525,6 +3768,14 @@ impl SupertableReader {
                     }
                     docs.into_iter().map(RowId::get).collect()
                 };
+                if let Some(filter) = &row_filter
+                    && !candidates.is_empty()
+                {
+                    let hits = candidates.len() as u64;
+                    if let Some(rows) = filter.rows(&r, entry.superfile_id, hits, false).await? {
+                        candidates.retain(|d| rows.contains(*d));
+                    }
+                }
                 if candidates.is_empty() {
                     return Ok(Vec::new());
                 }
@@ -3775,19 +4026,18 @@ impl SupertableReader {
     }
 }
 
-/// The cursors one superfile's doc-id slices share, keyed by superfile id
-/// and built by the first slice to need them; the `OnceCell` coalesces
-/// concurrent slices of a file.
-type SharedCursorSets = Arc<Mutex<HashMap<Uuid, SharedCursorCell>>>;
+/// One value per superfile, built by the first task to need it; the
+/// `OnceCell` coalesces concurrent tasks on the same file.
+type SuperfileCells<T> = Mutex<HashMap<Uuid, Arc<OnceCell<T>>>>;
 
-/// One superfile's slot in [`SharedCursorSets`].
-type SharedCursorCell = Arc<OnceCell<Arc<OrCursorSet>>>;
+/// The cursors one superfile's doc-id slices share.
+type SharedCursorSets = Arc<SuperfileCells<Arc<OrCursorSet>>>;
 
-/// Superfile `suid`'s slot in `sets`, made empty by the first slice to
-/// ask; the slice then builds or awaits the set through it.
-fn cursor_cell(sets: &SharedCursorSets, suid: Uuid) -> SharedCursorCell {
-    let mut sets = sets.lock().expect("cursor-set map lock poisoned");
-    Arc::clone(sets.entry(suid).or_default())
+/// Superfile `suid`'s slot in `cells`, made empty by the first task to
+/// ask; the task then builds or awaits the value through it.
+fn cell_for<T>(cells: &SuperfileCells<T>, suid: Uuid) -> Arc<OnceCell<T>> {
+    let mut cells = cells.lock().expect("superfile cell map lock poisoned");
+    Arc::clone(cells.entry(suid).or_default())
 }
 
 /// One unit of per-superfile search work scheduled into the reader
@@ -4374,6 +4624,35 @@ mod tests {
 
     use crate::supertable::manifest::ScalarStats;
 
+    #[test]
+    fn match_walks_keep_the_dictionary_only_when_both_read_it() {
+        // A match with a positive and a negated walk, and a memo that answers some terms.
+        //  - both walks read the dictionary: it is kept;
+        //  - no negated term, a phrase, or a memo answering either walk: nothing is kept.
+        // This test pins a kept copy only where it saves a read.
+        let budget = ConnectionMemoryBudget::with_room();
+        let memo = FetchedTermMemo::from_slots([(Box::from("known"), None)]);
+        let keeps =
+            |phrase: bool, memo: Option<&FetchedTermMemo>, positive: &[&str], negated: &[&str]| {
+                walk_dict(phrase, memo, positive, negated, &budget).keeps()
+            };
+        assert!(keeps(false, None, &["rust"], &["java"]));
+        assert!(keeps(false, Some(&memo), &["rust"], &["java"]));
+        assert!(!keeps(false, None, &["rust"], &[]), "no negated walk");
+        assert!(
+            !keeps(true, None, &["rust"], &["java"]),
+            "a phrase walk reads its own"
+        );
+        assert!(
+            !keeps(false, Some(&memo), &["known"], &["java"]),
+            "memo answers positives"
+        );
+        assert!(
+            !keeps(false, Some(&memo), &["rust"], &["known"]),
+            "memo answers negatives"
+        );
+    }
+
     /// A phrase's members are conjunctive, so a quoted phrase on its own
     /// prunes on all of them.
     ///
@@ -4676,10 +4955,11 @@ mod tests {
 
     use super::{
         BoolMode, FanOut, LocatedTerms, SharedTopK, SuperfileHit, SupertableReader,
-        build_work_units, ceilings_at_table_avgdl, fanout_for,
+        build_work_units, ceilings_at_table_avgdl, fanout_for, walk_dict,
     };
     use crate::{
         config::{CompactionSettings, OptimizeOptions},
+        memory::ConnectionMemoryBudget,
         storage::{LocalFsStorageProvider, ObjectMeta, StorageError, StorageProvider},
         superfile::{
             SuperfileReader,
@@ -4687,7 +4967,10 @@ mod tests {
             fts::{
                 bm25,
                 posting::BLOCK_LEN,
-                reader::{Bm25SearchOptions, ColumnLengthStats, top_k_initial_capacity},
+                reader::{
+                    Bm25SearchOptions, ColumnLengthStats, FetchedTermMemo, QueryDict,
+                    top_k_initial_capacity,
+                },
             },
             vector::layout::VectorLayout,
         },
@@ -7950,7 +8233,9 @@ mod tests {
         for e in &entries {
             let bytes = std::fs::read(dir.path().join(e.uri.storage_path())).expect("bytes");
             let sf = SuperfileReader::open(Bytes::from(bytes)).expect("open");
-            let (dfs, _) = rt.block_on(sf.term_dfs("title", &terms)).expect("dfs");
+            let (dfs, _) = rt
+                .block_on(sf.term_dfs("title", &terms, &QueryDict::default()))
+                .expect("dfs");
             for (i, d) in dfs.into_iter().enumerate() {
                 expected_df[i] += d;
             }

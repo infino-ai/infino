@@ -104,8 +104,10 @@ pub async fn superfile_reader(
 
 /// [`superfile_reader`], also saying which tier served the file: the
 /// in-memory tier is [`OpenTier::Memory`], the disk cache reports its own
-/// walk, and the storage-only fallback is a lazy reader over range reads,
-/// so [`OpenTier::Lazy`]. For a scan that counts where its files came from.
+/// walk, and the storage-only fallback opens a lazy reader over range reads
+/// of the object, [`OpenTier::Source`], or reuses one it opened before on
+/// this table, [`OpenTier::Lazy`]. For a scan that counts where its files
+/// came from.
 pub async fn superfile_reader_tiered(
     store: &Arc<dyn SuperfileReaderCache>,
     disk_cache: Option<&Arc<DiskCacheStore>>,
@@ -134,12 +136,21 @@ pub async fn superfile_reader_tiered(
     }
 
     // 3. Storage-only fallback, for handles configured with durable storage
-    // but no disk cache. A lazy reader over range reads of the object: a
-    // query then fetches the footer and the row groups it touches, and the
-    // scan's read-ahead batches the rest. Fetching the whole object here
-    // cost a one-hour query over a 1 GiB superfile the whole gigabyte, and a
-    // scan over many files that many gigabytes resident at once.
+    // but no disk cache: every connection without a `cache_dir`, which is
+    // the default. A lazy reader over range reads of the object: a query
+    // then fetches the footer and the row groups it touches, and the scan's
+    // read-ahead batches the rest. Fetching the whole object here cost a
+    // one-hour query over a 1 GiB superfile the whole gigabyte, and a scan
+    // over many files that many gigabytes resident at once.
     if let Some(storage) = storage {
+        // A reader this table opened before is reused, with the footer and
+        // page indexes it parsed. `store` keeps it (see
+        // `SuperfileReaderCache::keep_lazy`): it belongs to the table handle
+        // `storage` does, so the reader reads through the caller's own
+        // storage handle.
+        if let Some(reader) = store.lazy(uri) {
+            return Ok((reader, OpenTier::Lazy));
+        }
         let source: Arc<dyn LazyByteSource> = match offsets {
             // The manifest entry says how big the object is and carries its
             // open batch, or what to fetch for one: the same overlay the disk
@@ -194,7 +205,8 @@ pub async fn superfile_reader_tiered(
         let reader = SuperfileReader::open_lazy_with(source, OpenOptions { verify_crc: false })
             .await
             .map_err(|source| ReaderCacheError::OpenFailed { source })?;
-        return Ok((Arc::new(reader), OpenTier::Lazy));
+        let reader = store.keep_lazy(*uri, Arc::new(reader));
+        return Ok((reader, OpenTier::Source));
     }
 
     Err(ReaderCacheError::NotFound { uri: *uri })
@@ -202,9 +214,11 @@ pub async fn superfile_reader_tiered(
 
 /// The in-memory tiers of [`superfile_reader_tiered`] alone, with nothing to
 /// await: `uri`'s reader when this process already holds it, from the reader
-/// cache or as a whole file in the disk cache, served as the full walk serves
-/// it. `None` when an open would have to read or map the file, or when the
-/// reader cache fails, which the full walk then reports.
+/// cache or as a whole file in the disk cache ([`OpenTier::Memory`]), or as
+/// the lazy reader the storage-only tier kept for it ([`OpenTier::Lazy`]),
+/// served as the full walk serves it. `None` when an open would have to read
+/// or map the file, or when the reader cache fails, which the full walk then
+/// reports.
 pub(crate) fn superfile_reader_in_memory(
     store: &Arc<dyn SuperfileReaderCache>,
     disk_cache: Option<&Arc<DiskCacheStore>>,
@@ -212,13 +226,21 @@ pub(crate) fn superfile_reader_in_memory(
     uri: &SuperfileUri,
     storage_key: &str,
     intent: ReadIntent,
-) -> Option<Arc<SuperfileReader>> {
+) -> Option<(Arc<SuperfileReader>, OpenTier)> {
     match store.reader(uri) {
-        Ok(reader) => return Some(reader),
+        Ok(reader) => return Some((reader, OpenTier::Memory)),
         Err(ReaderCacheError::NotFound { .. }) => {}
         Err(_) => return None,
     }
-    disk_cache?.reader_in_memory(uri, storage_key, intent, storage)
+    match disk_cache {
+        Some(cache) => cache
+            .reader_in_memory(uri, storage_key, intent, storage)
+            .map(|reader| (reader, OpenTier::Memory)),
+        // The storage-only tier's reader, when it opened this one before.
+        None => storage
+            .and_then(|_| store.lazy(uri))
+            .map(|reader| (reader, OpenTier::Lazy)),
+    }
 }
 
 /// How many of a read's opens each cache tier served. One line of counts on the
@@ -433,8 +455,8 @@ mod tests {
     }
 
     /// The tiered accessor names where the reader came from: the in-memory
-    /// tier is `Memory`, and the storage-only fallback, a whole-object GET
-    /// with no cache attached, is `Source`.
+    /// tier is `Memory`, and the storage-only fallback, a lazy open against
+    /// the object with no cache attached, is `Source`.
     #[tokio::test]
     async fn tiered_accessor_reports_memory_and_source() {
         let store = empty_store();
@@ -471,7 +493,7 @@ mod tests {
         .await
         .expect("storage-only fallback");
         assert_eq!(reader.n_docs(), N_DOCS);
-        assert_eq!(tier, OpenTier::Lazy, "a cacheless open reads by range");
+        assert_eq!(tier, OpenTier::Source, "a cacheless open reads the object");
     }
 
     /// A cacheless open of a superfile whose manifest entry carries its open
@@ -513,13 +535,139 @@ mod tests {
         )
         .await
         .expect("storage-only fallback");
-        assert_eq!(tier, OpenTier::Lazy);
+        assert_eq!(tier, OpenTier::Source);
         assert_eq!(reader.n_docs(), N_DOCS);
         let data = meter.snapshot().since(&before).class_io(UriClass::UserData);
         assert_eq!(
             data.get_count, 0,
             "the open batch came from the manifest, not the object"
         );
+    }
+
+    /// A storage provider over `dir` that records its reads into its own
+    /// meter, as each connection's provider does.
+    fn metered_storage(dir: &TempDir) -> (Arc<UsageMeter>, Arc<dyn StorageProvider>) {
+        let meter = UsageMeter::new();
+        let storage: Arc<dyn StorageProvider> = Arc::new(
+            LocalFsStorageProvider::new_with_meter(dir.path(), Arc::clone(&meter))
+                .expect("localfs"),
+        );
+        (meter, storage)
+    }
+
+    /// A second cacheless open of a superfile on the same table is served
+    /// the reader the first opened, footer parsed and all, without touching
+    /// the object, and reported as `Lazy`; the in-memory lookup the scan
+    /// tries first finds it too. The table's store keeps it, so the test's
+    /// own store holds it and no other test can evict it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_cacheless_open_reuses_the_reader_the_first_one_opened() {
+        let dir = TempDir::new().expect("tempdir");
+        let (meter, storage) = metered_storage(&dir);
+        let uri = SuperfileUri::new_v4();
+        put_at_storage(&storage, &uri, minimal_superfile_bytes()).await;
+        let store = empty_store();
+        let key = uri.storage_path();
+        let open = || {
+            superfile_reader_tiered(
+                &store,
+                None,
+                Some(&storage),
+                &uri,
+                &key,
+                None,
+                ReadIntent::Warm,
+            )
+        };
+        let (first, tier) = open().await.expect("first open");
+        assert_eq!(tier, OpenTier::Source);
+        let before = meter.snapshot();
+        let (second, tier) = open().await.expect("second open");
+        assert_eq!(tier, OpenTier::Lazy);
+        assert!(Arc::ptr_eq(&first, &second), "one reader for the superfile");
+        let data = meter.snapshot().since(&before).class_io(UriClass::UserData);
+        assert_eq!(data.get_count, 0, "the second open read nothing");
+        let (resident, tier) =
+            superfile_reader_in_memory(&store, None, Some(&storage), &uri, &key, ReadIntent::Warm)
+                .expect("the in-memory lookup finds it");
+        assert!(Arc::ptr_eq(&first, &resident));
+        assert_eq!(tier, OpenTier::Lazy);
+        // Without storage the tier does not apply, and neither does what it
+        // kept.
+        assert!(
+            superfile_reader_in_memory(&store, None, None, &uri, &key, ReadIntent::Warm).is_none()
+        );
+        let err = superfile_reader_tiered(&store, None, None, &uri, &key, None, ReadIntent::Warm)
+            .await
+            .expect_err("without storage the kept reader is not served");
+        assert!(
+            matches!(err, ReaderCacheError::NotFound { .. }),
+            "expected NotFound, got {err:?}"
+        );
+        // A superfile the table drops (merged away, say) is not kept either.
+        store.remove(&uri);
+        let (_, tier) = open().await.expect("open after remove");
+        assert_eq!(tier, OpenTier::Source);
+    }
+
+    /// Two handles on one table, each with its own store and its own storage
+    /// provider over the same objects, as two connections to one table have:
+    /// neither is served a reader the other opened, so each reads through
+    /// its own provider and charges its own meter.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_connections_on_one_table_each_read_through_their_own_storage() {
+        let dir = TempDir::new().expect("tempdir");
+        let (meter_a, storage_a) = metered_storage(&dir);
+        let (meter_b, storage_b) = metered_storage(&dir);
+        let uri = SuperfileUri::new_v4();
+        put_at_storage(&storage_a, &uri, minimal_superfile_bytes()).await;
+        let key = uri.storage_path();
+        let (store_a, store_b) = (empty_store(), empty_store());
+        let open = |store: Arc<dyn SuperfileReaderCache>, storage: Arc<dyn StorageProvider>| {
+            let key = key.clone();
+            async move {
+                superfile_reader_tiered(
+                    &store,
+                    None,
+                    Some(&storage),
+                    &uri,
+                    &key,
+                    None,
+                    ReadIntent::Warm,
+                )
+                .await
+                .expect("open")
+            }
+        };
+        let (a, tier) = open(Arc::clone(&store_a), Arc::clone(&storage_a)).await;
+        assert_eq!(tier, OpenTier::Source);
+
+        let (before_a, before_b) = (meter_a.snapshot(), meter_b.snapshot());
+        let (b, tier) = open(Arc::clone(&store_b), Arc::clone(&storage_b)).await;
+        assert_eq!(tier, OpenTier::Source, "b does not reuse a's reader");
+        assert!(!Arc::ptr_eq(&a, &b));
+        let read_a = meter_a
+            .snapshot()
+            .since(&before_a)
+            .class_io(UriClass::UserData);
+        let read_b = meter_b
+            .snapshot()
+            .since(&before_b)
+            .class_io(UriClass::UserData);
+        assert_eq!(read_a.get_count, 0, "b's open is not charged to a");
+        assert!(read_b.get_count > 0, "b's open is charged to b");
+
+        // Each handle reuses only its own reader.
+        let (again_a, tier) = open(Arc::clone(&store_a), Arc::clone(&storage_a)).await;
+        assert_eq!(tier, OpenTier::Lazy);
+        assert!(Arc::ptr_eq(&a, &again_a));
+        let (again_b, tier) = open(Arc::clone(&store_b), Arc::clone(&storage_b)).await;
+        assert_eq!(tier, OpenTier::Lazy);
+        assert!(Arc::ptr_eq(&b, &again_b));
+
+        // Dropping a's handle drops what it kept; b still reads.
+        drop((a, again_a, store_a, storage_a));
+        assert_eq!(b.n_docs(), N_DOCS);
     }
 
     // ---- tier 1: non-NotFound error short-circuits ---------------------

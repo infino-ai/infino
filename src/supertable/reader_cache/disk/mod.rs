@@ -399,6 +399,10 @@ pub struct CacheStats {
     pub n_madvise_calls: u64,
     /// Total count of entries dropped because GC deleted from objectstore.
     pub n_gc_drops: u64,
+    /// Background downloads that failed because their file was gone from storage. A dropped
+    /// table or a removed prefix does this, and logs no warning, so this count is where a file
+    /// missing while its table still lists it shows up.
+    pub n_fills_gone_from_storage: u64,
     /// Bytes of `current_bytes` charged for the table's temp files beside the cache.
     pub scratch_bytes: u64,
     /// Bytes charged for the table's metadata caches beside the cache.
@@ -470,6 +474,8 @@ pub struct DiskCacheStore {
     n_disk_reuses: AtomicU64,
     n_evictions: AtomicU64,
     n_gc_drops: AtomicU64,
+    /// See [`CacheStats::n_fills_gone_from_storage`].
+    n_fills_gone_from_storage: AtomicU64,
     n_madvise_calls: AtomicU64,
     /// Number of callers explicitly waiting for lazy background
     /// promotion. A waiter means promotion is now latency-critical,
@@ -532,9 +538,7 @@ mod store_files;
 
 pub(crate) use budget::{Reservation, ScratchCharge, ScratchRoom};
 pub(crate) use fetch::{open_batch_overlay, skip_background_fill};
-#[cfg(test)]
-pub(crate) use heap::HeapBudget;
-pub(crate) use heap::{CachedSessions, HeapReservation};
+pub(crate) use heap::{CachedSessions, HeapBudget, HeapReservation};
 pub(crate) use scratch::RunScratch;
 pub(crate) use sources::{
     ArcMmapOwner, give_back_temp_file_charge, mmap_charged_temp_file_bytes, mmap_readonly_bytes,
@@ -617,6 +621,7 @@ impl DiskCacheStore {
             n_disk_reuses: AtomicU64::new(0),
             n_evictions: AtomicU64::new(0),
             n_gc_drops: AtomicU64::new(0),
+            n_fills_gone_from_storage: AtomicU64::new(0),
             n_madvise_calls: AtomicU64::new(0),
             n_promotion_waiters: AtomicU64::new(0),
             pinned_fn: std::sync::Mutex::new(pinned_fn),
@@ -699,6 +704,7 @@ impl DiskCacheStore {
             n_evictions: self.n_evictions.load(Ordering::Acquire),
             n_madvise_calls: self.n_madvise_calls.load(Ordering::Acquire),
             n_gc_drops: self.n_gc_drops.load(Ordering::Acquire),
+            n_fills_gone_from_storage: self.n_fills_gone_from_storage.load(Ordering::Acquire),
             scratch_bytes: self.scratch_bytes.load(Ordering::Acquire),
             metadata_bytes: self.metadata_bytes.load(Ordering::Acquire),
         }

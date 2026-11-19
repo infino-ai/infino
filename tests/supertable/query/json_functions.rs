@@ -5,10 +5,10 @@
 //!
 //! The fixture is shaped like a log table: a body, and a `resource` column
 //! whose JSON keys vary by row and themselves contain dots. The same document
-//! is stored under each string type a table can declare, so every accessor is
-//! checked against all of them.
-
-#![deny(clippy::unwrap_used)]
+//! is stored under each string type a table can declare, and once more in a
+//! full-text indexed column, so every accessor is checked against all of
+//! them. The indexed copy pins that a predicate on a JSON key is evaluated
+//! against each row's document and never answered from the column's index.
 
 use std::sync::Arc;
 
@@ -52,8 +52,17 @@ const BEEPER_ROWS: i64 = 2;
 /// Sum of `limits.cpu` across the rows that carry it.
 const TOTAL_CPU: i64 = 7;
 
-/// The string columns holding the same documents, one per string type.
-const JSON_COLUMNS: [&str; 3] = ["resource_large", "resource_utf8", "resource_view"];
+/// The string columns holding the same documents: one per string type, and
+/// one that is full-text indexed.
+const JSON_COLUMNS: [&str; 4] = [
+    "resource_large",
+    "resource_utf8",
+    "resource_view",
+    "resource_indexed",
+];
+
+/// Functions of the extension that a session does not offer.
+const UNREGISTERED: [&str; 2] = ["json_get", "json_as_text"];
 
 /// Create the table and append the fixture rows.
 fn seeded_table(dir: &TempDir) -> Connection {
@@ -63,6 +72,7 @@ fn seeded_table(dir: &TempDir) -> Connection {
         Field::new("resource_large", DataType::LargeUtf8, true),
         Field::new("resource_utf8", DataType::Utf8, true),
         Field::new("resource_view", DataType::Utf8View, true),
+        Field::new("resource_indexed", DataType::LargeUtf8, true),
     ]));
     let bodies: Vec<String> = (0..RESOURCES.len()).map(|i| format!("line {i}")).collect();
     let columns: Vec<ArrayRef> = vec![
@@ -70,10 +80,15 @@ fn seeded_table(dir: &TempDir) -> Connection {
         Arc::new(LargeStringArray::from_iter(RESOURCES)),
         Arc::new(StringArray::from_iter(RESOURCES)),
         Arc::new(StringViewArray::from_iter(RESOURCES)),
+        Arc::new(LargeStringArray::from_iter(RESOURCES)),
     ];
     let batch = RecordBatch::try_new(schema.clone(), columns).expect("batch");
     let logs = db
-        .create_table(TABLE, schema, IndexSpec::new().fts("body"))
+        .create_table(
+            TABLE,
+            schema,
+            IndexSpec::new().fts("body").fts("resource_indexed"),
+        )
         .expect("create_table");
     logs.append(&batch).expect("append");
     db
@@ -181,21 +196,39 @@ fn a_nested_path_reads_a_typed_value() {
 }
 
 #[test]
-fn the_arrow_operators_read_a_key() {
+fn a_key_equality_counts_rows_and_a_nested_object_reads_as_json() {
     let dir = TempDir::new().expect("tempdir");
     let db = seeded_table(&dir);
     for column in JSON_COLUMNS {
         let rows = only_i64(
             &db,
-            &format!("SELECT count(*) FROM {TABLE} WHERE ({column}->>'app') = 'beeper'"),
+            &format!("SELECT count(*) FROM {TABLE} WHERE json_get_str({column}, 'app') = 'beeper'"),
         );
-        assert_eq!(rows, BEEPER_ROWS, "{column} ->>");
+        assert_eq!(rows, BEEPER_ROWS, "{column}");
         let total = only_i64(
             &db,
-            &format!("SELECT sum(json_get_int({column}->'limits', 'cpu')) FROM {TABLE}"),
+            &format!(
+                "SELECT sum(json_get_int(json_get_json({column}, 'limits'), 'cpu')) FROM {TABLE}"
+            ),
         );
-        assert_eq!(total, TOTAL_CPU, "{column} ->");
+        assert_eq!(total, TOTAL_CPU, "{column}");
     }
+}
+
+#[test]
+fn only_the_listed_functions_and_no_operators_are_offered() {
+    let dir = TempDir::new().expect("tempdir");
+    let db = seeded_table(&dir);
+    for function in UNREGISTERED {
+        let refused = db.query_sql(&format!(
+            "SELECT {function}(resource_large, 'app') FROM {TABLE}"
+        ));
+        assert!(refused.is_err(), "{function} is not part of the surface");
+    }
+    let refused = db.query_sql(&format!(
+        "SELECT count(*) FROM {TABLE} WHERE (resource_large->>'app') = 'beeper'"
+    ));
+    assert!(refused.is_err(), "the ->> operator is not offered");
 }
 
 #[test]

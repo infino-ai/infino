@@ -11,6 +11,7 @@ pub mod hour_shape;
 mod hybrid_hidden_index;
 pub mod hybrid_search;
 mod id_resolve;
+mod json_functions;
 pub mod match_search;
 mod op_stats;
 mod phrase_prune;

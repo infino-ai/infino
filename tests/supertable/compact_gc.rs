@@ -167,6 +167,26 @@ fn optimize_leaves_superfile_id_ranges_disjoint_and_in_order() {
 }
 
 #[test]
+fn optimize_merges_superfiles_another_handle_committed() {
+    const COMMITS: usize = 10;
+    let dir = TempDir::new().expect("tempdir");
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+    let options = || default_supertable_options().with_storage(Arc::clone(&storage));
+    let held = Supertable::create(options()).expect("create");
+    let other = Supertable::open(options()).expect("open");
+    for commit in 0..COMMITS {
+        let marker = format!("marker{commit}");
+        commit_titles(&other, &[&marker, "filler one", "filler two"]);
+    }
+
+    held.optimize(&small_optimize_opts()).expect("optimize");
+
+    let fresh = Supertable::open(options()).expect("open");
+    assert!(fresh.reader().expect("reader").n_superfiles() < COMMITS);
+}
+
+#[test]
 fn compact_then_gc_removes_stale_files_and_preserves_queries() {
     let dir = TempDir::new().expect("tempdir");
     let storage: Arc<dyn StorageProvider> =
