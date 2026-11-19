@@ -33,6 +33,9 @@ const COMPACT_TARGET_MB: u64 = 1;
 const COMPACT_MIN_FILL_PERCENT: u8 = 1;
 /// Writes in the manifest-growth comparison.
 const GROWTH_WRITES: usize = 4;
+/// Bytes one write's records may differ by between two tables of the same rows: the clock and
+/// the random writer id in each `_id` move its id page by a few, tens at most over four writes.
+const ID_DRIFT_PER_WRITE: u64 = 64;
 /// Dimension of the vector table's embedding column.
 const DIM: usize = 16;
 /// The vector table's embedding column.
@@ -250,7 +253,8 @@ fn files_of_disjoint_columns_answer_and_merge_into_their_union() {
 
 /// What a write costs per superfile follows the columns it sets, not how
 /// wide the table is: the same rows written to a table forty times wider
-/// make superfiles, manifest parts and summaries of the same size.
+/// make superfiles, manifest parts and summaries of the same size, but for
+/// the few bytes the clock and writer id in each `_id` move.
 #[test]
 fn what_a_write_records_follows_its_columns_not_the_width() {
     let filled: Vec<usize> = (0..FILLED).collect();
@@ -274,10 +278,18 @@ fn what_a_write_records_follows_its_columns_not_the_width() {
         narrow.0 > 0 && narrow.1 > 0,
         "the writes recorded something"
     );
-    assert_eq!(
-        wide, narrow,
-        "(manifest records, superfile bytes) over {GROWTH_WRITES} writes"
-    );
+    // Far below what a record sized by the table's width adds: a bit for each of its columns
+    // is 250 bytes a write.
+    let leeway = ID_DRIFT_PER_WRITE * GROWTH_WRITES as u64;
+    for (what, wide, narrow) in [
+        ("manifest records", wide.0, narrow.0),
+        ("superfile bytes", wide.1, narrow.1),
+    ] {
+        assert!(
+            wide.abs_diff(narrow) < leeway,
+            "{what} over {GROWTH_WRITES} writes: wide {wide}, narrow {narrow}"
+        );
+    }
 }
 
 /// Row `row`'s embedding in [`vector_rows_setting`].

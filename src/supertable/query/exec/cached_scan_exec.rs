@@ -2370,6 +2370,10 @@ mod tests {
     const ROWS_PER_FILE: i64 = 2000;
     /// Rows per row group, so each file has several.
     const ROW_GROUP_ROWS: usize = 500;
+    /// Partitions the table's statements run on: no more than its row groups, or a repartition
+    /// spreads the scan and leaves the `WHERE` to the filter above it.
+    const PARTITIONS: usize = 4;
+    const _: () = assert!(PARTITIONS as i64 <= FILES * ROWS_PER_FILE / ROW_GROUP_ROWS as i64);
     /// The few values `region` takes.
     const REGIONS: [&str; 5] = ["af", "ap", "eu", "sa", "us"];
     /// Rows the delete removes: those with `seq` below this.
@@ -2434,7 +2438,7 @@ mod tests {
     }
 
     /// The table, keeping decoded columns in `kept` (none with `None`), its
-    /// rows below [`DELETED_BELOW`] deleted.
+    /// rows below [`DELETED_BELOW`] deleted, its statements on [`PARTITIONS`].
     fn region_table(dir: &TempDir, kept: Option<Arc<DecodedColumnCache>>) -> Supertable {
         let storage: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
@@ -2484,6 +2488,18 @@ mod tests {
         }
         st.delete(col("seq").lt(lit(DELETED_BELOW)))
             .expect("delete");
+        // Set on the session the table's readers share, which lasts until its next commit.
+        let ctx = st
+            .reader()
+            .expect("reader")
+            .sql_session_context()
+            .expect("context");
+        ctx.state_ref()
+            .write()
+            .config_mut()
+            .options_mut()
+            .execution
+            .target_partitions = PARTITIONS;
         st
     }
 
