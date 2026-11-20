@@ -2142,7 +2142,7 @@ dependencies = [
 
 [[package]]
 name = "infino"
-version = "0.11.33"
+version = "0.11.34"
 dependencies = [
  "apache-avro",
  "arc-swap",
@@ -2196,7 +2196,7 @@ dependencies = [
 
 [[package]]
 name = "infino-python"
-version = "0.11.29"
+version = "0.11.30"
 dependencies = [
  "arrow",
  "arrow-array",
