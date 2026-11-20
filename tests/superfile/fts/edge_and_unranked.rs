@@ -284,7 +284,7 @@ async fn token_match_count_equals_ids_len() {
     }
 }
 
-/// Documents in the `term_dfs` corpus: more than a short posting holds (128), so one term is long.
+/// Documents in the `term_dfs` corpus: more than a short posting holds, so one term is long.
 const TERM_DFS_DOCS: u64 = 200;
 
 #[tokio::test]

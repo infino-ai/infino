@@ -2809,9 +2809,7 @@ impl SupertableReader {
                         // Residual superfile (contains a scored term, pruned
                         // from scoring): df only, from the dictionary value
                         // + header hint — no postings body.
-                        let (dfs, work) = r
-                            .term_dfs_with_dict(&column_arc, &refs, &QueryDict::default())
-                            .await?;
+                        let (dfs, work) = r.term_dfs(&column_arc, &refs).await?;
                         add_match_work(&op_stats, &work);
                         Ok((suid, dfs, None))
                     }
