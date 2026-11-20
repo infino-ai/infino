@@ -28,7 +28,7 @@ use datafusion::{
 };
 use serde_json::{Value, json};
 
-use super::{RemoteCatalog, Response, finish, read_arrow, read_json, wire};
+use super::{RemoteCatalog, read_arrow, read_json, wire};
 use crate::{
     Bm25SearchOptions, BoolMode, GcError, GcReport, InfinoError, MutationStats, OptimizeError,
     OptimizeOptions, ReindexError, ReindexOptions, StagedAppend, Supertable, VectorFilter,
@@ -211,7 +211,7 @@ fn reject_remote_overrides(opts: &VectorSearchOptions) -> Result<(), InfinoError
 
 /// Parse an update/delete response (`{matched, n_tombstoned, n_not_found}`)
 /// into [`MutationStats`].
-fn parse_mutation_stats(op: &str, response: Response) -> Result<MutationStats, InfinoError> {
+fn parse_mutation_stats(op: &str, response: ureq::Response) -> Result<MutationStats, InfinoError> {
     let value = read_json(op, response)?;
     let field = |name: &str| -> Result<usize, InfinoError> {
         value
@@ -234,10 +234,9 @@ impl Table for RemoteTable {
 
     fn append(&self, batch: &RecordBatch) -> Result<(), InfinoError> {
         let body = wire::batches_to_ipc(std::slice::from_ref(batch))?;
-        let response =
-            self.catalog
-                .post_arrow("append", &[("table", self.table_name.as_str())], body)?;
-        finish("append", response)
+        self.catalog
+            .post_arrow("append", &[("table", self.table_name.as_str())], body)?;
+        Ok(())
     }
 
     /// Staging writes superfiles to the table's storage, which the hosted
