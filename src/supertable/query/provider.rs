@@ -777,11 +777,18 @@ impl SupertableProvider {
 
     /// `predicate` as one interval on one range-indexed column, when it is
     /// a conjunction of comparisons and `BETWEEN`s on that column against
-    /// literals (`a <= x AND x < b`): the shape a range index counts
-    /// without reading a row. `None` for anything else.
+    /// literals (`a <= x AND x < b`), and of `IS NOT NULL` on it: the shape
+    /// a range index counts without reading a row. `None` for anything else.
     pub(crate) fn counted_range(&self, predicate: &Expr) -> Option<CountedRange> {
-        let conjuncts: Vec<Expr> = split_conjunction(predicate).into_iter().cloned().collect();
         let column = predicate.column_refs().into_iter().next()?.name.clone();
+        // The range index keys every non-null value of its column and no
+        // null, so a count of its keys counts the rows `column IS NOT NULL`
+        // holds: that conjunct narrows nothing the count reads.
+        let conjuncts: Vec<Expr> = split_conjunction(predicate)
+            .into_iter()
+            .filter(|conjunct| !is_not_null_of(conjunct, &column))
+            .cloned()
+            .collect();
         let range_cols = self.manifest.table_schema().range_column_types();
         let (field, data_type, lo, hi) = single_range(&conjuncts, &column, &range_cols)?;
         Some(CountedRange {
@@ -3961,6 +3968,11 @@ fn walk_fell_back(
     #[cfg(test)]
     walk_probe::count(survivors, cause);
     Err(cause)
+}
+
+/// Whether `expr` is `column IS NOT NULL`.
+fn is_not_null_of(expr: &Expr, column: &str) -> bool {
+    matches!(expr, Expr::IsNotNull(inner) if matches!(inner.as_ref(), Expr::Column(c) if c.name == column))
 }
 
 /// Test hooks into the top-k walk over one table, named by one of its files: run an action between

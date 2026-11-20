@@ -98,6 +98,10 @@ const QUERIES: &[&str] = &[
     "SELECT seq, qty FROM {t} WHERE qty < -200 ORDER BY qty DESC, seq DESC LIMIT 7",
     "SELECT seq, price AS price FROM {t} WHERE price > 900 ORDER BY price ASC NULLS LAST, seq ASC NULLS LAST LIMIT 10",
     "SELECT seq, qty FROM {t} WHERE qty BETWEEN 240 AND 249 ORDER BY qty DESC, seq LIMIT 30",
+    "SELECT count(*) AS n FROM {t} WHERE qty IS NOT NULL",
+    "SELECT count(*) AS n FROM {t} WHERE qty IS NOT NULL AND qty > 100",
+    "SELECT seq, qty FROM {t} WHERE qty IS NOT NULL ORDER BY qty DESC NULLS LAST, seq LIMIT 7",
+    "SELECT seq, qty FROM {t} WHERE qty IS NOT NULL ORDER BY qty ASC NULLS FIRST, seq LIMIT 7",
 ];
 
 /// A top-k whose sort column ties on many rows (`qty` repeats every 500
@@ -342,6 +346,50 @@ fn assert_same_counts(db: &Connection, when: &str) {
             .count_where(&exprs)
             .unwrap_or_else(|e| panic!("{when}: count_where on {table}: {e}"));
         assert_eq!(counts, expected, "{when}: count_where on {table}");
+    }
+
+    // Only shapes the range index counts, so the counts come from it: a
+    // column's present rows (`qty` is null every few rows, `price` never),
+    // alone and beside a range on the same column.
+    let indexed = [
+        (col("qty").is_not_null(), "qty IS NOT NULL"),
+        (
+            col("qty").is_not_null().and(col("qty").gt(lit(100))),
+            "qty IS NOT NULL AND qty > 100",
+        ),
+        (col("price").is_not_null(), "price IS NOT NULL"),
+        (col("seq").lt(lit(1000i64)), "seq < 1000"),
+    ];
+    let exprs: Vec<_> = indexed.iter().map(|(expr, _)| expr.clone()).collect();
+    let sql = format!(
+        "SELECT {} FROM plain",
+        indexed
+            .iter()
+            .map(|(_, sql)| format!("count(*) FILTER (WHERE {sql})"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let batches = db.query_sql(&sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    let expected: Vec<u64> = (0..indexed.len())
+        .map(|i| {
+            let counts = batches[0]
+                .column(i)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("an Int64 count");
+            u64::try_from(counts.value(0)).expect("a count")
+        })
+        .collect();
+    for table in ["ranged", "plain"] {
+        let counts = db
+            .open_table(table)
+            .expect("open")
+            .count_where(&exprs)
+            .unwrap_or_else(|e| panic!("{when}: count_where of present rows on {table}: {e}"));
+        assert_eq!(
+            counts, expected,
+            "{when}: count_where of present rows on {table}"
+        );
     }
 
     // A predicate that reads another relation, which no FILTER clause can
