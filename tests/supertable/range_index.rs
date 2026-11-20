@@ -29,6 +29,7 @@ use datafusion::{
 };
 use infino::{
     ColumnIndex, Connection, FieldPatch, IndexSpec, OptimizeOptions, SchemaPatch, connect,
+    runtime_metrics::op_stats::with_op_stats,
 };
 use tempfile::TempDir;
 
@@ -302,6 +303,18 @@ fn scan_rows(plan: &str) -> f64 {
     number.parse::<f64>().expect("a row count") * scale
 }
 
+/// Rows `count_where` reads counting `qty`'s and `price`'s present rows on
+/// `table`: none when the statistics or the range index count them.
+fn present_count_rows_read(db: &Connection, table: &str) -> u64 {
+    let (counts, stats) = with_op_stats(|| {
+        db.open_table(table)
+            .expect("open")
+            .count_where(&[col("qty").is_not_null(), col("price").is_not_null()])
+    });
+    counts.unwrap_or_else(|e| panic!("count_where on {table}: {e}"));
+    stats.rows_materialized
+}
+
 /// Every one of `queries`' answers from both tables, the same.
 fn assert_same_answers(db: &Connection, queries: &[&str], when: &str) {
     for query in queries {
@@ -498,6 +511,11 @@ fn a_range_indexed_table_answers_as_a_scan_does_through_deletes_compaction_and_r
                 "{table}: {plan}"
             );
         }
+        assert_eq!(
+            present_count_rows_read(&db, table),
+            0,
+            "after load: {table}"
+        );
     }
     let plan = answer(&db, &format!("EXPLAIN {QTY_PRESENT_IN_RANGE}"), "ranged");
     assert!(!plan.contains(FILTER_OPERATOR), "{plan}");
@@ -562,6 +580,11 @@ fn a_range_indexed_table_answers_as_a_scan_does_through_deletes_compaction_and_r
     for table in ["plain", "ranged"] {
         let plan = answer(&db, &format!("EXPLAIN {QTY_PRESENT}"), table);
         assert!(!plan.contains(LOGICAL_SCAN), "{table}: {plan}");
+        assert_eq!(
+            present_count_rows_read(&db, table),
+            0,
+            "after a delete: {table}"
+        );
     }
 
     // Past half a superfile, its deleted rows' statistics are not read: the
@@ -589,6 +612,10 @@ fn a_range_indexed_table_answers_as_a_scan_does_through_deletes_compaction_and_r
         plan.contains(INDEX_COUNT) && !plan.contains(FILTER_OPERATOR),
         "{plan}"
     );
+    assert_eq!(present_count_rows_read(&db, "ranged"), 0, "ranged");
+    // The plain table has no index to count from: the count scans, and the
+    // op stats see it.
+    assert!(present_count_rows_read(&db, "plain") > 0, "plain");
 
     for table in ["plain", "ranged"] {
         db.open_table(table)
