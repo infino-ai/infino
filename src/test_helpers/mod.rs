@@ -443,13 +443,18 @@ pub fn open_old_format_fts_fixture(
 }
 
 pub fn default_supertable_options() -> SupertableOptions {
+    title_supertable_options(FtsConfig::new("title"))
+}
+
+/// [`default_supertable_options`] with `title` indexed by `fts`.
+pub fn title_supertable_options(fts: FtsConfig) -> SupertableOptions {
     let pool = Arc::new(
         ThreadPoolBuilder::new()
             .num_threads(1)
             .build()
             .expect("rayon ThreadPoolBuilder with num_threads(1) builds"),
     );
-    SupertableOptions::new(schema_id_title(), vec![FtsConfig::new("title")], vec![])
+    SupertableOptions::new(schema_id_title(), vec![fts], vec![])
         .expect("SupertableOptions::new with default test fixture args")
         .with_writer_pool(pool)
 }

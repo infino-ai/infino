@@ -3670,7 +3670,8 @@ pub(crate) fn exprs_to_scalar_predicates(
 /// `a = x OR a = y` filters in `filters`. Each yields:
 ///  i)  a `ScalarValueSet` (min/max) leaf — on every column;
 ///  ii) plus, on an FTS-indexed column, a `TermPresence{Or}` leaf over the
-///      values' tokens, which prunes on which superfiles hold the term.
+///      values' tokens, which prunes on which superfiles hold the term,
+///      unless a value has no token (see [`emit_value_set_leaves`]).
 ///
 /// A `NOT IN`, a non-literal item, a function-wrapped or unknown column,
 /// or a mixed/cross-column `OR` yields no leaf — that filter just isn't
@@ -3749,6 +3750,8 @@ fn collect_value_set_leaves(
 ///
 /// The bloom flattens all tokens into one `Or`, so a superfile holding
 /// only `orange` is kept though no value matches; FilterExec verifies.
+/// A value with no token (`'!!'`, or a stopword the column drops) matches
+/// rows the bloom cannot see, so then there is no bloom leaf at all.
 fn emit_value_set_leaves(
     column: String,
     values: Vec<ScalarValue>,
@@ -3760,15 +3763,21 @@ fn emit_value_set_leaves(
     // tokenizer so the bloom probe matches how it was indexed. A column
     // `resolve` cannot answer for gets no bloom leaf — probing it with
     // some other analyzer's tokens could drop a matching superfile.
-    if let Some(tok) = resolve(&column).filter(|_| fts_cols.contains(column.as_str())) {
-        let terms = unique_tokens(tok.as_ref(), values.iter().filter_map(scalar_as_str));
-        if !terms.is_empty() {
-            out.push(PruneLeaf::TermPresence {
-                column: column.clone(),
-                terms,
-                mode: BoolMode::Or,
-            });
-        }
+    // A NULL matches no row, so it needs no term; any other value must be text with a token.
+    if let Some(tok) = resolve(&column).filter(|_| fts_cols.contains(column.as_str()))
+        && let Some(texts) = values
+            .iter()
+            .filter(|value| !value.is_null())
+            .map(scalar_as_str)
+            .collect::<Option<Vec<_>>>()
+        && let Some(terms) = unique_tokens(tok.as_ref(), texts)
+        && !terms.is_empty()
+    {
+        out.push(PruneLeaf::TermPresence {
+            column: column.clone(),
+            terms,
+            mode: BoolMode::Or,
+        });
     }
     // `column` moves into the last leaf — cloned above only for the bloom.
     out.push(PruneLeaf::ScalarValueSet { column, values });
@@ -4527,6 +4536,44 @@ pub(crate) mod tests {
                 .or(cast(col("x"), DataType::Int32).eq(lit(2_i32)));
         assert!(
             exprs_to_value_set_leaves(&[expr], &s, &HashSet::new(), &standard_resolver).is_empty()
+        );
+    }
+
+    #[test]
+    fn a_value_set_with_a_tokenless_value_has_no_term_bloom() {
+        // '!!' and '' analyze to no token, so a superfile of only them is invisible to a term
+        // bloom: the list keeps its min/max leaf and gets no term leaf. A NULL needs no term.
+        let s = Arc::new(Schema::new(vec![Field::new("title", DataType::Utf8, true)]));
+        let fts = HashSet::from(["title"]);
+        let has_bloom = |list: Vec<Expr>| {
+            let leaves = exprs_to_value_set_leaves(
+                &[col("title").in_list(list, false)],
+                &s,
+                &fts,
+                &standard_resolver,
+            );
+            assert!(
+                leaves
+                    .iter()
+                    .any(|l| matches!(l, PruneLeaf::ScalarValueSet { .. })),
+                "the min/max leaf stays"
+            );
+            leaves
+                .iter()
+                .any(|l| matches!(l, PruneLeaf::TermPresence { .. }))
+        };
+        assert!(
+            !has_bloom(vec![lit("!!"), lit("Foo Bar")]),
+            "'!!' has no token"
+        );
+        assert!(!has_bloom(vec![lit(""), lit("Foo Bar")]), "'' has no token");
+        assert!(
+            has_bloom(vec![lit(ScalarValue::Utf8(None)), lit("Foo Bar")]),
+            "a NULL keeps it"
+        );
+        assert!(
+            has_bloom(vec![lit("Foo Bar"), lit("Bar Baz")]),
+            "every value has a token"
         );
     }
 
