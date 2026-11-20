@@ -39,13 +39,18 @@ use arrow_schema::{DataType, Field, Schema};
 use datafusion::prelude::{col, lit};
 use infino::{
     Bm25SearchOptions,
-    superfile::{builder::FtsConfig, fts::reader::BoolMode},
+    superfile::{
+        builder::FtsConfig,
+        fts::{analysis::Stopwords, reader::BoolMode},
+    },
     supertable::{
         Supertable, SupertableOptions,
         schema::change::{FieldPatch, SchemaPatch},
         storage::{LocalFsStorageProvider, StorageProvider},
     },
-    test_helpers::{build_title_batch, default_disk_cache, default_supertable_options},
+    test_helpers::{
+        build_title_batch, default_disk_cache, default_supertable_options, title_supertable_options,
+    },
 };
 use rayon::ThreadPoolBuilder;
 
@@ -59,6 +64,8 @@ const HIERARCHICAL_PART_COUNT: usize = 5;
 const ROWS_PER_PART: i64 = 2;
 /// BM25 / prefix top-k for the hierarchical queries.
 const BM25_TOP_K: usize = 10;
+/// Rows of the value-set fixture's part 0, all holding the value with no token.
+const TOKENLESS_ROWS: usize = 4;
 use tempfile::TempDir;
 
 /// Build a producer that creates one part per commit (via
@@ -581,10 +588,19 @@ fn sql_filtered_aggregates_on_a_lazy_handle_load_only_matching_parts() {
 /// is one superfile, two superfiles pack into a part, then a new part
 /// rolls over. 6 commits → 3 parts. `titles[i]` is commit i's batch.
 fn build_3_parts_two_superfiles_each(storage_dir: &std::path::Path, commits: &[[&str; 2]]) {
+    build_3_parts_with(default_supertable_options(), storage_dir, commits);
+}
+
+/// [`build_3_parts_two_superfiles_each`] for a table made with `options`.
+fn build_3_parts_with(
+    options: SupertableOptions,
+    storage_dir: &std::path::Path,
+    commits: &[[&str; 2]],
+) {
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(storage_dir).expect("provider"));
     let producer = Supertable::create(
-        default_supertable_options()
+        options
             .with_storage(Arc::clone(&storage))
             .with_target_superfiles_per_part(2),
     )
@@ -597,11 +613,20 @@ fn build_3_parts_two_superfiles_each(storage_dir: &std::path::Path, commits: &[[
 }
 
 fn open_lazy_consumer(storage_dir: &std::path::Path, cache_dir: &std::path::Path) -> Supertable {
+    open_lazy_consumer_with(default_supertable_options(), storage_dir, cache_dir)
+}
+
+/// [`open_lazy_consumer`] for a table made with `options`.
+fn open_lazy_consumer_with(
+    options: SupertableOptions,
+    storage_dir: &std::path::Path,
+    cache_dir: &std::path::Path,
+) -> Supertable {
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(storage_dir).expect("provider"));
     let cache = default_disk_cache(Arc::clone(&storage), cache_dir);
     Supertable::open(
-        default_supertable_options()
+        options
             .with_storage(Arc::clone(&storage))
             .with_eager_load_threshold(EAGER_LOAD_THRESHOLD_FORCE_LAZY)
             .with_disk_cache(Arc::clone(&cache)),
@@ -708,6 +733,52 @@ fn sql_multi_value_in_returns_exact_rows_across_parts() {
         0,
         "no row's full title equals either literal"
     );
+}
+
+#[test]
+fn sql_value_set_keeps_parts_whose_value_has_no_tokens() {
+    // Part 0 holds only a value that analyzes to no token: '!!', and 'the' on a column that drops
+    // English stopwords. An `IN` or `OR` of equalities naming it with 'Fig Roll' must return every
+    // part 0 row plus the one 'Fig Roll' row.
+    for (stopwords, value) in [(Stopwords::None, "!!"), (Stopwords::English, "the")] {
+        let dir = TempDir::new().expect("tempdir");
+        build_3_parts_with(
+            title_supertable_options(FtsConfig::new("title").stopwords(stopwords)),
+            dir.path(),
+            &[
+                [value, value], // part 0: only `value`
+                [value, value],
+                ["Cherry Cake", "Date Loaf"], // part 1: holds 'Fig Roll'
+                ["Fig Roll", "Grape Jam"],
+                ["Kiwi Smoothie", "Lemon Tart"], // part 2: neither
+                ["Mango Lassi", "Orange Juice"],
+            ],
+        );
+        let cache_dir = TempDir::new().expect("cache");
+        let consumer = open_lazy_consumer_with(
+            title_supertable_options(FtsConfig::new("title").stopwords(stopwords)),
+            dir.path(),
+            cache_dir.path(),
+        );
+        for filter in [
+            format!("title IN ('{value}', 'Fig Roll')"),
+            format!("title = '{value}' OR title = 'Fig Roll'"),
+            // Four values: DataFusion turns three or fewer into an `OR`, so this one stays an `IN`.
+            format!("title IN ('{value}', 'Fig Roll', 'Plum Cake', 'Pear Tart')"),
+        ] {
+            let batches = consumer
+                .reader()
+                .expect("reader")
+                .query_sql(&format!("SELECT _id FROM supertable WHERE {filter}"))
+                .expect("query");
+            let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(
+                rows,
+                TOKENLESS_ROWS + 1,
+                "{filter}: every '{value}' row and one 'Fig Roll'"
+            );
+        }
+    }
 }
 
 #[test]
