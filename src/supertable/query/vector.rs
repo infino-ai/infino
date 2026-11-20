@@ -1801,6 +1801,7 @@ fn decode_centroid_router_section(
         section,
         dim,
         metric,
+        None,
     )
 }
 
@@ -1817,8 +1818,10 @@ fn router_nodes(keys: &[Option<FineNodeKey>]) -> Option<Vec<Option<(Uuid, u32)>>
 }
 
 /// Build the router from a stored graph and the cluster behind each node
-/// (`None` for a hole). `None` if the graph and `nodes` disagree or a cluster is
-/// not in the current superfiles.
+/// (`None` for a hole). A node with the same cluster as in `previous` takes its
+/// centroid from there, so only superfiles with new clusters are read. `None`
+/// if the graph and `nodes` disagree or a cluster is not in the current
+/// superfiles.
 fn assemble_centroid_router(
     graph: Arc<Hnsw>,
     nodes: &[Option<(Uuid, u32)>],
@@ -1829,29 +1832,39 @@ fn assemble_centroid_router(
     section: &crate::supertable::slow_vector_state::CentroidSection,
     dim: usize,
     metric: Metric,
+    previous: Option<&CentroidRouterGraph>,
 ) -> Option<CentroidRouterGraph> {
     if graph.len() != nodes.len() {
         return None;
     }
-    // Resolve each stable id to its CURRENT array index, and gather every
-    // resident `(superfile_id, flat) -> normalized centroid` so the scorer can
-    // be assembled in node order.
-    let mut id_to_si: HashMap<Uuid, usize> = HashMap::with_capacity(superfiles.len());
-    for (si, sf) in superfiles.iter().enumerate() {
-        id_to_si.insert(sf.superfile_id, si);
-    }
+    let previous = previous
+        .filter(|previous| previous.metric == metric)
+        .and_then(|previous| Some((previous, &previous.stored.as_ref()?.graph.keys)));
+    let kept = |node: usize, (superfile, flat): (Uuid, u32)| -> Option<&[f32]> {
+        let (previous, keys) = previous?;
+        (*keys.get(node)? == Some((superfile, None, flat)))
+            .then(|| previous.scorer.row(node as u32))
+    };
+    let id_to_si: HashMap<Uuid, usize> = superfiles
+        .iter()
+        .enumerate()
+        .map(|(si, sf)| (sf.superfile_id, si))
+        .collect();
+    let to_read: HashSet<Uuid> = nodes
+        .iter()
+        .enumerate()
+        .filter_map(|(node, key)| key.filter(|&key| kept(node, key).is_none()))
+        .map(|(superfile, _)| superfile)
+        .collect();
+    // No superseded filter here: only the stored nodes are looked up, and the
+    // settle composed those with superseded cells already excluded.
     let mut cluster_vecs: HashMap<(Uuid, u32), Vec<f32>> = HashMap::new();
-    for (si, reader) in readers.iter().enumerate() {
+    for (reader, sf) in readers.iter().zip(superfiles) {
         let Some(vr) = reader.vec() else { continue };
-        let Some(sf) = superfiles.get(si) else {
-            continue;
-        };
         let sfid = sf.superfile_id;
-        // No superseded filter here: this fills a `(sfid, flat) -> vec` lookup
-        // and then assembles ONLY the stored nodes, which the settle composed
-        // with superseded cells already excluded. Any extra superseded vec
-        // fetched into the map is simply never referenced; a split clears the
-        // section ref, so the stored nodes are never stale.
+        if !to_read.contains(&sfid) {
+            continue;
+        }
         for (flat, mut vec) in vr
             .global_fine_cluster_vectors(column, column_id, section, sfid, None)
             .ok()?
@@ -1860,28 +1873,29 @@ fn assemble_centroid_router(
             cluster_vecs.insert((sfid, flat), vec);
         }
     }
-    // Assemble the scorer + in-memory node map in graph-node order. A missing
-    // id or cluster (membership drifted) rejects.
-    let mut vecs: Vec<Vec<f32>> = Vec::with_capacity(nodes.len());
+    let mut rows: Vec<f32> = Vec::with_capacity(nodes.len() * dim);
     let mut node_map: Vec<(usize, u32)> = Vec::with_capacity(nodes.len());
     for (node, key) in nodes.iter().enumerate() {
         if graph.is_hole(node as u32) != key.is_none() {
             return None;
         }
-        let Some((sfid, flat)) = key else {
-            vecs.push(vec![0.0; dim]);
+        let Some(key) = *key else {
+            rows.resize(rows.len() + dim, 0.0);
             node_map.push(HOLE_NODE);
             continue;
         };
-        let si = *id_to_si.get(sfid)?;
-        let vec = cluster_vecs.get(&(*sfid, *flat))?;
-        if vec.len() != dim {
+        let si = *id_to_si.get(&key.0)?;
+        let row = match kept(node, key) {
+            Some(row) => row,
+            None => cluster_vecs.get(&key)?.as_slice(),
+        };
+        if row.len() != dim {
             return None;
         }
-        vecs.push(vec.clone());
-        node_map.push((si, *flat));
+        rows.extend_from_slice(row);
+        node_map.push((si, key.1));
     }
-    let scorer = Fp32Scorer::from_vectors(&vecs, dim, metric);
+    let scorer = Fp32Scorer::from_rows(rows, dim, metric);
     let live_nodes = graph.live_len();
     Some(CentroidRouterGraph {
         scorer,
@@ -1906,7 +1920,7 @@ async fn centroid_router_from_stored(
     section: &crate::supertable::slow_vector_state::CentroidSection,
     dim: usize,
     metric: Metric,
-    last: Option<&fine_graph_follow::Loaded>,
+    previous: Option<&CentroidRouterGraph>,
 ) -> Option<CentroidRouterGraph> {
     let Some(head) = GraphHead::from_bytes(bytes) else {
         return decode_centroid_router_section(
@@ -1916,6 +1930,7 @@ async fn centroid_router_from_stored(
     if head.role != GraphRole::Router || head.column != column_id || head.dim as usize != dim {
         return None;
     }
+    let last = previous.and_then(|previous| previous.stored.as_ref());
     let loaded = fine_graph_follow::load(storage, &head, last).await?;
     let nodes = router_nodes(&loaded.graph.keys)?;
     let mut router = assemble_centroid_router(
@@ -1928,6 +1943,7 @@ async fn centroid_router_from_stored(
         section,
         dim,
         metric,
+        previous,
     )?;
     router.stored = Some(loaded);
     Some(router)
@@ -5599,7 +5615,10 @@ impl SupertableReader {
             section,
             dim,
             metric,
-            previous.as_ref().and_then(|p| p.graph.stored.as_ref()),
+            previous
+                .as_ref()
+                .filter(|previous| previous.column == column)
+                .map(|previous| &previous.graph),
         )
         .await
     }
@@ -9207,7 +9226,7 @@ mod tests {
     use rand::{RngExt, SeedableRng, rngs::StdRng};
     use roaring::RoaringBitmap;
 
-    use super::{IndexOutcome, fine_graph_follow, publish_centroid_router_section};
+    use super::{IndexOutcome, publish_centroid_router_section};
     use crate::{
         superfile::{
             fts::reader::Bm25SearchOptions,
@@ -12603,7 +12622,7 @@ mod tests {
             &self,
             storage: &dyn StorageProvider,
             bytes: &[u8],
-            last: Option<&fine_graph_follow::Loaded>,
+            previous: Option<&CentroidRouterGraph>,
         ) -> Option<CentroidRouterGraph> {
             centroid_router_from_stored(
                 bytes,
@@ -12615,7 +12634,7 @@ mod tests {
                 self.section.as_ref(),
                 STORED_GRAPH_DIM,
                 Metric::Cosine,
-                last,
+                previous,
             )
             .await
         }
@@ -12714,11 +12733,7 @@ mod tests {
             // table's graph out of the build cache: then a new base.
             assert!(second_head.steps.len() <= 1);
             let second_router = second
-                .load(
-                    storage.as_ref(),
-                    &second_bytes,
-                    first_router.stored.as_ref(),
-                )
+                .load(storage.as_ref(), &second_bytes, Some(&first_router))
                 .await
                 .expect("the second loads");
             assert_eq!(second.picks(&second_router), built(&second));
@@ -12831,10 +12846,13 @@ mod tests {
                 .await
                 .expect("delete the base");
             let from_last = second
-                .load(storage.as_ref(), &head, first_router.stored.as_ref())
+                .load(storage.as_ref(), &head, Some(&first_router))
                 .await
                 .expect("the step loads");
             assert_eq!(second.picks(&from_last), expected);
+            for node in 0..second_nodes.len() as u32 {
+                assert_eq!(from_last.scorer.row(node), from_base.scorer.row(node));
+            }
             assert!(second.load(storage.as_ref(), &head, None).await.is_none());
 
             // The old single-section form.
