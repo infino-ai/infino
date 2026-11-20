@@ -289,7 +289,8 @@ mod tests {
             Arc,
             atomic::{AtomicBool, Ordering},
         },
-        thread::spawn,
+        thread::{sleep, spawn},
+        time::Duration,
     };
 
     use arrow::util::display::array_value_to_string;
@@ -317,6 +318,7 @@ mod tests {
                 column_cache::DecodedColumnCache,
                 provider::{TopKHint, WalkFallback, tests::planned_files, walk_probe},
                 range_top_k::provider_of,
+                vector::row_id_from_manifest_entry,
             },
         },
     };
@@ -598,6 +600,9 @@ mod tests {
     const MANY_FILES: i64 = 12;
     /// Rows in each of them, three row groups' worth.
     const MANY_ROWS_PER_FILE: i64 = 1500;
+    /// A pause between two appends of one commit: their ids fall on two sides of a
+    /// millisecond, so the superfile's ids are no longer one span.
+    const ID_GAP_WAIT: Duration = Duration::from_millis(20);
     /// The pages the paged statements ask for.
     const PAGE_LIMITS: &[usize] = &[1, 10, 45, 250];
     /// Filters a paged statement carries, `{col}` the sorted column: none (`1=1`, as a search
@@ -613,11 +618,41 @@ mod tests {
     /// as the same sort with no index in reach does, over many superfiles with deleted rows; on
     /// `key`, whose every key is held by many rows of every superfile, and on `opt`, which has
     /// nulls; both ways. The scan reads the page alone: the ids settle which tied rows it holds.
+    /// Then one more superfile whose ids are not one span, so its candidates' ids come from its
+    /// id pages.
     #[test]
     fn a_paged_top_k_tie_broken_by_the_id_reads_the_page_alone() {
         let dir = TempDir::new().expect("tempdir");
         let st = tagged_table_with(&dir, None, MANY_FILES, MANY_ROWS_PER_FILE);
+        assert_pages_read_alone(&st.reader().expect("reader"), "appended");
+        let first = MANY_FILES * MANY_ROWS_PER_FILE;
+        let half = first + MANY_ROWS_PER_FILE / 2;
+        let mut writer = st.writer().expect("writer");
+        writer
+            .append(&tagged_batch(&(first..half).collect::<Vec<_>>()))
+            .expect("append");
+        sleep(ID_GAP_WAIT);
+        writer
+            .append(&tagged_batch(
+                &(half..first + MANY_ROWS_PER_FILE).collect::<Vec<_>>(),
+            ))
+            .expect("append");
+        writer.commit().expect("commit");
         let reader = st.reader().expect("reader");
+        assert!(
+            reader
+                .manifest()
+                .superfiles
+                .iter()
+                .any(|entry| row_id_from_manifest_entry(entry, 0).is_none()),
+            "a superfile has gaps in its ids"
+        );
+        assert_pages_read_alone(&reader, "gapped");
+    }
+
+    /// Every paged statement on `reader` answers as the sort with no index in reach, and its scan
+    /// reads the page alone.
+    fn assert_pages_read_alone(reader: &SupertableReader, pass: &str) {
         for col in ["key", "opt"] {
             for filter in PAGE_FILTERS {
                 let filter = filter.replace("{col}", &format!("\"{col}\""));
@@ -634,13 +669,39 @@ mod tests {
                         assert_eq!(
                             seqs(&reader.query_sql(&sql).expect("sql")),
                             seqs(&reader.query_sql(&unindexed).expect("unindexed")),
-                            "{sql}"
+                            "{pass}: {sql}"
                         );
-                        assert_eq!(scanned_rows(&reader, &sql), *limit as u64, "{sql}");
+                        assert_eq!(scanned_rows(reader, &sql), *limit as u64, "{pass}: {sql}");
                     }
                 }
             }
         }
+    }
+
+    /// A top-k whose candidates' ids cannot be read hands the scan every candidate, and the scan's
+    /// sort answers alike: the failure costs rows read, never the answer.
+    #[test]
+    fn a_top_k_whose_ids_cannot_be_read_scans_every_candidate() {
+        let dir = TempDir::new().expect("tempdir");
+        let st = tagged_table_with(&dir, None, MANY_FILES, MANY_ROWS_PER_FILE);
+        let reader = st.reader().expect("reader");
+        let superfile = reader.manifest().superfiles[0].superfile_id;
+        walk_probe::watch(superfile);
+        let limit = PAGE_LIMITS[1];
+        let sql = |sort: &str| {
+            format!(
+                "SELECT seq FROM supertable ORDER BY {sort} ASC NULLS LAST, _id ASC LIMIT {limit}"
+            )
+        };
+        let want = seqs(&reader.query_sql(&sql("key + 0")).expect("unindexed"));
+        assert_eq!(scanned_rows(&reader, &sql("key")), limit as u64, "ids read");
+        walk_probe::fail_next_id_read(superfile, QueryError::internal("injected"));
+        assert_eq!(seqs(&reader.query_sql(&sql("key")).expect("sql")), want);
+        walk_probe::fail_next_id_read(superfile, QueryError::internal("injected"));
+        assert!(
+            scanned_rows(&reader, &sql("key")) > limit as u64,
+            "with no ids, the scan reads every candidate"
+        );
     }
 
     // The walk: a sort whose filter is more than one range on its column.
@@ -714,24 +775,8 @@ mod tests {
         let st = Supertable::create(options).expect("create");
         for file in 0..files {
             let seqs: Vec<i64> = (file * rows..(file + 1) * rows).collect();
-            let batch = RecordBatch::try_new(
-                tagged_schema(),
-                vec![
-                    Arc::new(Int64Array::from(seqs.clone())),
-                    Arc::new(Int64Array::from_iter_values(seqs.iter().map(|s| key(*s)))),
-                    Arc::new(Int64Array::from_iter(seqs.iter().map(|s| opt(*s)))),
-                    Arc::new(LargeStringArray::from_iter_values(
-                        seqs.iter().map(|s| tag(*s)),
-                    )),
-                    Arc::new(LargeStringArray::from_iter_values(
-                        seqs.iter()
-                            .map(|s| format!("{s:0>width$}", width = PAD_LEN)),
-                    )),
-                ],
-            )
-            .expect("batch");
             let mut writer = st.writer().expect("writer");
-            writer.append(&batch).expect("append");
+            writer.append(&tagged_batch(&seqs)).expect("append");
             writer.commit().expect("commit");
         }
         st.delete(
@@ -741,6 +786,26 @@ mod tests {
         )
         .expect("delete");
         st
+    }
+
+    /// The tagged table's rows `seqs`.
+    fn tagged_batch(seqs: &[i64]) -> RecordBatch {
+        RecordBatch::try_new(
+            tagged_schema(),
+            vec![
+                Arc::new(Int64Array::from(seqs.to_vec())),
+                Arc::new(Int64Array::from_iter_values(seqs.iter().map(|s| key(*s)))),
+                Arc::new(Int64Array::from_iter(seqs.iter().map(|s| opt(*s)))),
+                Arc::new(LargeStringArray::from_iter_values(
+                    seqs.iter().map(|s| tag(*s)),
+                )),
+                Arc::new(LargeStringArray::from_iter_values(
+                    seqs.iter()
+                        .map(|s| format!("{s:0>width$}", width = PAD_LEN)),
+                )),
+            ],
+        )
+        .expect("batch")
     }
 
     /// The rows the scan under `sql` emitted, from its `EXPLAIN ANALYZE`.

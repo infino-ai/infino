@@ -80,27 +80,49 @@ const SQL_TABLE: &str = "supertable";
 /// One superfile's candidates: `(key, hit)` for its first rows by the key.
 type Candidates = Vec<(u64, SuperfileHit)>;
 
-/// The `candidates` that `keep` accepts, in a sort's order by the key, `descending` or not, and
-/// then by `_id` ascending, each hit given its `_id` first. The `_id`s come from the superfiles'
-/// id spans or id pages, so no other column is read.
+/// The first `k` of the `candidates` that `keep` accepts, in a sort's order by the key,
+/// `descending` or not, and then by `_id` ascending, each hit given its `_id` first. The `_id`s
+/// come from the superfiles' id spans or id pages, so no other column is read. The candidates are
+/// reserved against the connection's memory budget while they are ordered; over it, an error.
 pub(crate) async fn by_key_then_id(
     reader: &SupertableReader,
     candidates: Candidates,
     descending: bool,
+    k: usize,
     keep: impl Fn(u64, &SuperfileHit) -> bool,
 ) -> Result<Candidates, QueryError> {
+    let _held = reader
+        .manifest()
+        .options
+        .connection_memory_budget
+        .try_reserve(
+            candidates
+                .len()
+                .saturating_mul(size_of::<(u64, SuperfileHit)>()),
+        )
+        .map_err(|over| {
+            QueryError::OverBudget(format!(
+                "while a top-k orders its candidates by key and `_id`, {over}"
+            ))
+        })?;
     let (keys, mut hits): (Vec<u64>, Vec<SuperfileHit>) = candidates.into_iter().unzip();
     dispatch::attach_stable_ids_to_hits(reader, &mut hits).await?;
     let mut order: Vec<usize> = (0..hits.len())
         .filter(|&i| keep(keys[i], &hits[i]))
         .collect();
-    order.sort_by(|&a, &b| {
+    let compare = |&a: &usize, &b: &usize| {
         let by_key = match descending {
             false => keys[a].cmp(&keys[b]),
             true => keys[b].cmp(&keys[a]),
         };
         by_key.then_with(|| hits[a].stable_id.cmp(&hits[b].stable_id))
-    });
+    };
+    // Only the first `k` are kept: pick them, then sort just those.
+    if order.len() > k {
+        order.select_nth_unstable_by(k, compare);
+        order.truncate(k);
+    }
+    order.sort_by(compare);
     Ok(order.into_iter().map(|i| (keys[i], hits[i])).collect())
 }
 
@@ -332,13 +354,10 @@ impl SupertableReader {
             });
         }
         Ok(Some(
-            by_key_then_id(self, candidates, descending, |key, hit| {
+            by_key_then_id(self, candidates, descending, k, |key, hit| {
                 after.is_none_or(|after| after.passed_by(key, hit.stable_id, descending))
             })
-            .await?
-            .into_iter()
-            .take(k)
-            .collect(),
+            .await?,
         ))
     }
 
@@ -987,6 +1006,7 @@ mod tests {
     use super::*;
     use crate::{
         config::OptimizeOptions,
+        memory::ConnectionMemoryBudget,
         runtime_metrics::op_stats::with_op_stats,
         storage::{LocalFsStorageProvider, StorageProvider},
         supertable::{
@@ -2272,6 +2292,72 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Keys the candidates of [`by_key_then_id_keeps_the_first_k_within_the_budget`] take, so
+    /// many share each key and the `_id` decides among them.
+    const CANDIDATE_KEYS: u32 = 7;
+    /// The candidates it keeps.
+    const KEPT: usize = 40;
+
+    /// `by_key_then_id` returns only the first `k` candidates by the key and then `_id`, either
+    /// way, and refuses candidates the connection's memory budget cannot hold.
+    #[test]
+    fn by_key_then_id_keeps_the_first_k_within_the_budget() {
+        let dir = TempDir::new().expect("tempdir");
+        drop(table(&dir));
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let mut options = SupertableOptions::new(schema(), vec![], vec![])
+            .expect("options")
+            .with_storage(storage)
+            .with_range_indexes(&["key".to_string()]);
+        options.connection_memory_budget = ConnectionMemoryBudget::with_room();
+        let st = Supertable::open(options).expect("open");
+        let reader = st.reader().expect("reader");
+        let candidates: Candidates = reader
+            .manifest()
+            .superfiles
+            .iter()
+            .flat_map(|entry| {
+                let locals: Vec<u32> = (0..entry.n_docs as u32).collect();
+                let keys = locals.iter().map(|local| u64::from(local % CANDIDATE_KEYS));
+                let hits = tag_hits(entry, locals.iter().map(|local| (*local, 0.0)).collect());
+                keys.zip(hits).collect::<Vec<_>>()
+            })
+            .collect();
+        for descending in [false, true] {
+            let mut want: Vec<(u64, Option<i128>)> = candidates
+                .iter()
+                .map(|(key, hit)| (*key, hit.stable_id))
+                .collect();
+            want.sort_by(|a, b| match descending {
+                false => a.cmp(b),
+                true => b.0.cmp(&a.0).then(a.1.cmp(&b.1)),
+            });
+            want.truncate(KEPT);
+            let got: Vec<(u64, Option<i128>)> = reader
+                .block_on(by_key_then_id(
+                    &reader,
+                    candidates.clone(),
+                    descending,
+                    KEPT,
+                    |_, _| true,
+                ))
+                .expect("ordered")
+                .into_iter()
+                .map(|(key, hit)| (key, hit.stable_id))
+                .collect();
+            assert_eq!(got, want, "descending: {descending}");
+        }
+        let budget = &reader.manifest().options.connection_memory_budget;
+        let _full = budget
+            .try_reserve(budget.remaining().expect("a bounded budget"))
+            .expect("fill the budget");
+        let over = reader.block_on(by_key_then_id(&reader, candidates, false, KEPT, |_, _| {
+            true
+        }));
+        assert!(matches!(over, Err(QueryError::OverBudget(_))), "{over:?}");
     }
 
     /// A column without a range index is refused by name, and a `k` of

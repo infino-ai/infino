@@ -106,7 +106,7 @@ use parquet::{
 use rayon::ThreadPool;
 use roaring::RoaringBitmap;
 use tokio::sync::{OnceCell, Semaphore};
-use tracing::{Instrument, debug};
+use tracing::{Instrument, debug, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -1674,8 +1674,9 @@ impl SupertableProvider {
     /// The `hint.k` rows of `kept` (each superfile's candidate `(key, row)`s) first by the key in
     /// the hint's direction and then by `_id` ascending, by superfile. Only the candidates' ids
     /// are read, from the superfiles' id spans or id pages, so the scan then decodes `k` rows
-    /// rather than every candidate. `None` when the table's reader is gone or an id cannot be
-    /// read: the caller then hands the scan every candidate and the sort above picks the `k`.
+    /// rather than every candidate. `None` when the table's reader is gone, an id cannot be read,
+    /// or the candidates do not fit the memory budget: the caller then hands the scan every
+    /// candidate and the sort above picks the `k`.
     async fn best_by_key_then_id(
         &self,
         survivors: &[Arc<SuperfileEntry>],
@@ -1695,16 +1696,19 @@ impl SupertableProvider {
             let hits = tag_hits(entry, pairs.iter().map(|(_, row)| (*row, 0.0)).collect());
             candidates.extend(pairs.iter().map(|(key, _)| *key).zip(hits));
         }
-        let ordered = match by_key_then_id(&reader, candidates, hint.descending, |_, _| true).await
-        {
+        let ordered =
+            by_key_then_id(&reader, candidates, hint.descending, hint.k, |_, _| true).await;
+        #[cfg(test)]
+        let ordered = walk_probe::inject_id_read(survivors, ordered);
+        let ordered = match ordered {
             Ok(ordered) => ordered,
             Err(error) => {
-                debug!(%error, "the top-k could not read its candidates' ids");
+                warn!(%error, "the top-k could not read its candidates' ids, so it scans them all");
                 return None;
             }
         };
         let mut rows: HashMap<Uuid, RoaringBitmap> = HashMap::new();
-        for (_, hit) in ordered.into_iter().take(hint.k) {
+        for (_, hit) in ordered {
             rows.entry(*by_uri.get(&hit.superfile)?)
                 .or_default()
                 .insert(hit.local_doc_id);
@@ -4038,6 +4042,7 @@ pub(crate) mod walk_probe {
     struct Armed {
         after_walk: Option<Box<dyn FnOnce() + Send>>,
         fail_with: Option<QueryError>,
+        fail_id_read: Option<QueryError>,
         fallbacks: Vec<WalkFallback>,
         walks: usize,
         windows: usize,
@@ -4084,6 +4089,11 @@ pub(crate) mod walk_probe {
         watched(superfile, |a| a.fail_with = Some(error));
     }
 
+    /// Make the next id read of a top-k over the watched table fail with `error`.
+    pub(crate) fn fail_next_id_read(superfile: Uuid, error: QueryError) {
+        watched(superfile, |a| a.fail_id_read = Some(error));
+    }
+
     /// Walks started over the watched table.
     pub(crate) fn walks(superfile: Uuid) -> usize {
         watched(superfile, |a| a.walks).unwrap_or(0)
@@ -4120,6 +4130,16 @@ pub(crate) mod walk_probe {
             Some(error) => Err(error),
             None => walked,
         }
+    }
+
+    /// `read`, or the error armed for the next id read of a top-k over the table of `survivors`.
+    pub(super) fn inject_id_read<T>(
+        survivors: &[Arc<SuperfileEntry>],
+        read: Result<T, QueryError>,
+    ) -> Result<T, QueryError> {
+        with(survivors, |a| a.fail_id_read.take())
+            .flatten()
+            .map_or(read, Err)
     }
 
     pub(super) fn after_walk(survivors: &[Arc<SuperfileEntry>]) {
