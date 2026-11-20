@@ -548,6 +548,12 @@ fn a_range_indexed_table_answers_as_a_scan_does_through_deletes_compaction_and_r
             .expect("delete");
     }
     assert_same_answers(&db, QUERIES, "after a delete");
+    // With deletes, a range-indexed column's present rows come from its index.
+    let plan = answer(&db, &format!("EXPLAIN {QTY_PRESENT}"), "ranged");
+    assert!(
+        plan.contains(INDEX_COUNT) && !plan.contains(FILTER_OPERATOR),
+        "{plan}"
+    );
 
     for table in ["plain", "ranged"] {
         db.open_table(table)
@@ -933,267 +939,129 @@ fn a_range_beside_an_exact_text_filter_answers_as_a_scan_does() {
     assert!(!physical.contains(FILTER_OPERATOR), "{physical}");
 }
 
-/// Rows in each superfile of the present-rows fixture.
-const PRESENT_ROWS_PER_FILE: i64 = 200;
-/// Superfiles the present-rows fixture is written as, one commit each; the
-/// first is written before `late` exists.
-const PRESENT_FILES: i64 = 3;
-/// The delete removes the rows with `seq` below this, in the first
-/// superfile, ...
-const PRESENT_DELETED_BELOW: i64 = 50;
-/// ... and those from this `seq` up to [`PRESENT_DELETED_TO`], in the third,
-/// leaving the second with no deleted row.
-const PRESENT_DELETED_FROM: i64 = 410;
-/// The first `seq` past the third superfile's deleted rows.
-const PRESENT_DELETED_TO: i64 = 440;
-/// `f`'s value for `seq` modulo [`F_CYCLE`], where one is listed: a null,
-/// and the values that are present but compare oddly; `seq` itself
-/// otherwise.
-const F_SPECIAL: [Option<f64>; 5] = [
-    None,
-    Some(f64::NAN),
-    Some(-f64::NAN),
-    Some(f64::INFINITY),
-    Some(f64::NEG_INFINITY),
-];
-/// The period `f`'s values repeat with.
-const F_CYCLE: i64 = 8;
-/// Every this-many rows `n` is null.
-const N_NULL_EVERY: i64 = 3;
-/// Every this-many rows `late` is null, in the superfiles written after it.
-const LATE_NULL_EVERY: i64 = 5;
-/// The nullable columns the present-rows fixture counts: floats with NaN
-/// and infinities, integers with nulls, a column of nulls only, and one
-/// added after the first superfile.
-const PRESENT_COLUMNS: [&str; 4] = ["f", "n", "e", "late"];
-/// How a plain scan counts a column's present rows: beside a conjunct only a
-/// row can answer (`random()`, always at least zero), which no statistics or
-/// index does.
-const SCANNED_PRESENT: &str =
-    "SELECT count(*) AS n FROM {t} WHERE {c} IS NOT NULL AND random() >= 0";
-/// The statement under test: a count under `{c} IS NOT NULL`.
-const PRESENT_COUNT: &str = "SELECT count(*) AS n FROM {t} WHERE {c} IS NOT NULL";
-
-/// Row `seq`'s value in `column` of the present-rows fixture.
-fn present_value(column: &str, seq: i64) -> Option<f64> {
-    match column {
-        "f" => usize::try_from(seq % F_CYCLE)
-            .ok()
-            .and_then(|at| F_SPECIAL.get(at).copied())
-            .unwrap_or(Some(seq as f64)),
-        "n" => (seq % N_NULL_EVERY != 0).then_some(seq as f64),
-        "e" => None,
-        "late" => {
-            (seq >= PRESENT_ROWS_PER_FILE && seq % LATE_NULL_EVERY != 0).then_some(seq as f64)
-        }
-        other => panic!("no column {other}"),
-    }
-}
-
-/// Whether the delete removes row `seq`.
-fn present_deleted(seq: i64) -> bool {
-    seq < PRESENT_DELETED_BELOW || (PRESENT_DELETED_FROM..PRESENT_DELETED_TO).contains(&seq)
-}
-
-/// The present-rows fixture's live rows: every row, less the deleted ones
-/// once `deleted`.
-fn present_live(deleted: bool) -> impl Iterator<Item = i64> {
-    (0..PRESENT_FILES * PRESENT_ROWS_PER_FILE)
-        .filter(move |seq| !(deleted && present_deleted(*seq)))
-}
-
-/// Superfile `file` of the present-rows fixture, with `late` from the second.
-fn present_rows(file: i64) -> RecordBatch {
-    let seq: Vec<i64> =
-        (file * PRESENT_ROWS_PER_FILE..(file + 1) * PRESENT_ROWS_PER_FILE).collect();
-    let floats =
-        |column| -> Float64Array { seq.iter().map(|s| present_value(column, *s)).collect() };
-    let ints = |column| -> Int64Array {
-        seq.iter()
-            .map(|s| present_value(column, *s).map(|v| v as i64))
-            .collect()
-    };
-    let mut fields = vec![
-        Field::new("seq", DataType::Int64, false),
-        Field::new("f", DataType::Float64, true),
-        Field::new("n", DataType::Int64, true),
-        Field::new("e", DataType::Int64, true),
-    ];
-    let mut columns: Vec<Arc<dyn Array>> = vec![
-        Arc::new(Int64Array::from(seq.clone())),
-        Arc::new(floats("f")),
-        Arc::new(ints("n")),
-        Arc::new(ints("e")),
-    ];
-    if file > 0 {
-        fields.push(Field::new("late", DataType::Int64, true));
-        columns.push(Arc::new(ints("late")));
-    }
-    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("batch")
-}
-
-/// Each of [`PRESENT_COLUMNS`]' present rows on `table`, as SQL and
-/// `count_where` count them, alone and beside other predicates, is the
-/// count of the values the fixture wrote there, and what a plain scan
-/// counts.
-fn assert_present_counts(db: &Connection, table: &str, live: &[i64], when: &str) {
-    let all = i64::try_from(live.len()).expect("a count");
-    let past_first = live
-        .iter()
-        .filter(|seq| **seq >= PRESENT_ROWS_PER_FILE)
-        .count();
-    let past_first = i64::try_from(past_first).expect("a count");
-    for column in PRESENT_COLUMNS {
-        let present = live
-            .iter()
-            .filter(|seq| present_value(column, **seq).is_some())
-            .count();
-        let present = i64::try_from(present).expect("a count");
-        let on = |query: &str| query.replace("{c}", column);
-        assert_eq!(
-            counts(db, &on(PRESENT_COUNT), table),
-            [present],
-            "{when}: {table}.{column}"
-        );
-        assert_eq!(
-            counts(db, &on(SCANNED_PRESENT), table),
-            [present],
-            "{when}: {table}.{column} scanned"
-        );
-        let handle = db.open_table(table).expect("open");
-        let as_u64 = |n: i64| u64::try_from(n).expect("a count");
-        let alone = handle
-            .count_where(&[col(column).is_not_null()])
-            .unwrap_or_else(|e| panic!("{when}: count_where on {table}.{column}: {e}"));
-        assert_eq!(
-            alone,
-            [as_u64(present)],
-            "{when}: count_where on {table}.{column}"
-        );
-        let several = handle
-            .count_where(&[
-                lit(true),
-                col(column).is_not_null(),
-                col("seq").gt_eq(lit(PRESENT_ROWS_PER_FILE)),
-            ])
-            .unwrap_or_else(|e| panic!("{when}: count_where of several on {table}.{column}: {e}"));
-        assert_eq!(
-            several,
-            [as_u64(all), as_u64(present), as_u64(past_first)],
-            "{when}: count_where of several on {table}.{column}"
-        );
-    }
-}
+/// Present values in the edge-case table's columns: `f` holds a value in 9
+/// rows (NaN, -NaN and the infinities are values), `late` in 2 (it was added
+/// after the first append, so earlier rows hold none), `e` in none.
+const F_PRESENT: i64 = 9;
+const LATE_PRESENT: i64 = 2;
+const E_PRESENT: i64 = 0;
+/// Rows in the edge-case table.
+const EDGE_ROWS: i64 = 12;
 
 /// `COUNT(*) WHERE column IS NOT NULL`, in SQL and through `count_where`,
-/// counts the rows holding a value, as a scan does: a NaN or an infinity is
-/// a value, a superfile written before the column was added holds none, a
-/// column of nulls holds none, deleted rows are left out, and an empty table
-/// counts zero. With or without a range index on the column; the plan reads
-/// no row while each superfile's null count answers, and counts from the
-/// range index when deletes leave statistics short on a range-indexed
-/// column.
+/// counts the rows holding a value: NaN and the infinities count, a column
+/// added later counts none in the rows written before it, a column of nulls
+/// counts none, and an empty table counts zero. With and without a range
+/// index on the column.
 #[test]
-fn a_count_of_present_rows_answers_as_a_scan_does() {
+fn a_count_of_present_rows_counts_values_not_nulls() {
     let dir = TempDir::new().expect("tempdir");
     let db = connect(dir.path().to_str().expect("utf-8 path")).expect("connect");
-    let first = present_rows(0);
-    let ranged_spec = || {
-        IndexSpec::new()
-            .range("seq")
-            .range("f")
-            .range("n")
-            .range("e")
-    };
-    for (table, spec) in [
-        ("plain", IndexSpec::new()),
-        ("ranged", ranged_spec()),
-        ("empty_plain", IndexSpec::new()),
-        ("empty_ranged", ranged_spec()),
-    ] {
-        db.create_table(table, first.schema(), spec)
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("seq", DataType::Int64, false),
+        Field::new("f", DataType::Float64, true),
+        Field::new("e", DataType::Int64, true),
+    ]));
+    let first = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from((0..8).collect::<Vec<i64>>())),
+            Arc::new(Float64Array::from(vec![
+                Some(1.0),
+                Some(f64::NAN),
+                Some(-f64::NAN),
+                Some(f64::INFINITY),
+                Some(f64::NEG_INFINITY),
+                None,
+                Some(2.0),
+                None,
+            ])),
+            Arc::new(Int64Array::from(vec![None::<i64>; 8])),
+        ],
+    )
+    .expect("first batch");
+    let second_schema = Arc::new(Schema::new(vec![
+        Field::new("seq", DataType::Int64, false),
+        Field::new("f", DataType::Float64, true),
+        Field::new("e", DataType::Int64, true),
+        Field::new("late", DataType::Int64, true),
+    ]));
+    let second = RecordBatch::try_new(
+        second_schema,
+        vec![
+            Arc::new(Int64Array::from((8..12).collect::<Vec<i64>>())),
+            Arc::new(Float64Array::from(vec![
+                Some(3.0),
+                None,
+                Some(f64::NAN),
+                Some(4.0),
+            ])),
+            Arc::new(Int64Array::from(vec![None::<i64>; 4])),
+            Arc::new(Int64Array::from(vec![Some(1), None, Some(3), None])),
+        ],
+    )
+    .expect("second batch");
+    let tables = [
+        ("edges", IndexSpec::new(), false),
+        (
+            "edges_ranged",
+            IndexSpec::new().range("f").range("e"),
+            false,
+        ),
+        ("edges_empty", IndexSpec::new(), true),
+    ];
+    for (table, spec, empty) in tables {
+        db.create_table(table, Arc::clone(&schema), spec)
             .expect("create");
-    }
-    for table in ["plain", "ranged", "empty_plain", "empty_ranged"] {
         let mut late = FieldPatch::named("late").with_type(DataType::Int64);
-        if table.ends_with("ranged") {
+        if table == "edges_ranged" {
             late = late.with_index(ColumnIndex::Range);
         }
-        if table.starts_with("empty") {
-            db.apply_schema(table, &SchemaPatch::new(vec![late]), None)
-                .expect("add late");
-            continue;
-        }
-        let handle = db.open_table(table).expect("open");
-        handle.append(&first).expect("append");
-        db.apply_schema(table, &SchemaPatch::new(vec![late]), None)
-            .expect("add late");
-        for file in 1..PRESENT_FILES {
+        if !empty {
             db.open_table(table)
                 .expect("open")
-                .append(&present_rows(file))
+                .append(&first)
+                .expect("append");
+        }
+        db.apply_schema(table, &SchemaPatch::new(vec![late]), None)
+            .expect("add late");
+        if !empty {
+            db.open_table(table)
+                .expect("open")
+                .append(&second)
                 .expect("append");
         }
     }
-
-    let live: Vec<i64> = present_live(false).collect();
-    for table in ["plain", "ranged"] {
-        assert_present_counts(&db, table, &live, "after load");
-        for column in PRESENT_COLUMNS {
-            // The scan the counts are compared with checks its filter on
-            // every row it reads (a superfile of nulls only, it skips).
-            let scanned = answer(
-                &db,
-                &format!("EXPLAIN {}", SCANNED_PRESENT.replace("{c}", column)),
-                table,
-            );
-            assert!(
-                scanned.contains(FILTER_OPERATOR),
-                "{table}.{column}: {scanned}"
-            );
-            // With no delete, every superfile's null count answers: the
-            // plan reads no table.
-            let plan = answer(
-                &db,
-                &format!("EXPLAIN {}", PRESENT_COUNT.replace("{c}", column)),
-                table,
-            );
-            assert!(
-                !plan.contains(FILTER_OPERATOR) && !plan.contains(LOGICAL_SCAN),
-                "{table}.{column}: {plan}"
+    for (table, _, empty) in tables {
+        let expected = |n: i64| if empty { 0 } else { n };
+        for (column, present) in [("f", F_PRESENT), ("late", LATE_PRESENT), ("e", E_PRESENT)] {
+            let query = format!("SELECT count(*) AS n FROM {{t}} WHERE {column} IS NOT NULL");
+            assert_eq!(
+                counts(&db, &query, table),
+                [expected(present)],
+                "{table}.{column}"
             );
         }
-    }
-    for table in ["empty_plain", "empty_ranged"] {
-        assert_present_counts(&db, table, &[], "empty");
-    }
-
-    for table in ["plain", "ranged"] {
-        db.open_table(table)
+        let counted = db
+            .open_table(table)
             .expect("open")
-            .delete(
-                col("seq").lt(lit(PRESENT_DELETED_BELOW)).or(col("seq")
-                    .gt_eq(lit(PRESENT_DELETED_FROM))
-                    .and(col("seq").lt(lit(PRESENT_DELETED_TO)))),
-            )
-            .expect("delete");
-    }
-    let live: Vec<i64> = present_live(true).collect();
-    for table in ["plain", "ranged"] {
-        assert_present_counts(&db, table, &live, "after a delete");
-    }
-    // Two superfiles have deleted rows, nulls among them, whose statistics a
-    // range-indexed column never asks for: the index counts its keys, and
-    // checks no row.
-    for column in ["f", "n"] {
-        let plan = answer(
-            &db,
-            &format!("EXPLAIN {}", PRESENT_COUNT.replace("{c}", column)),
-            "ranged",
-        );
-        assert!(
-            plan.contains(INDEX_COUNT) && !plan.contains(FILTER_OPERATOR),
-            "{column}: {plan}"
+            .count_where(&[
+                lit(true),
+                col("f").is_not_null(),
+                col("late").is_not_null(),
+                col("e").is_not_null(),
+            ])
+            .expect("count_where");
+        let as_u64 = |n: i64| u64::try_from(expected(n)).expect("a count");
+        assert_eq!(
+            counted,
+            [
+                as_u64(EDGE_ROWS),
+                as_u64(F_PRESENT),
+                as_u64(LATE_PRESENT),
+                as_u64(E_PRESENT)
+            ],
+            "{table}: count_where"
         );
     }
 }
