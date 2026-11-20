@@ -105,7 +105,8 @@ use crate::{
         manifest::ManifestSnapshot,
         query::{
             covered_agg::{
-                CoveredAggregateRewrite, prepare_aggregate_inputs, value_counts_from_statistics,
+                CoveredAggregateRewrite, lone_not_null_column, non_null_count,
+                prepare_aggregate_inputs, value_counts_from_statistics,
             },
             exec::{
                 common::{collect_plan_metered, run_within_process_limit},
@@ -817,7 +818,9 @@ impl SupertableReader {
     /// `SELECT COUNT(*) FILTER (WHERE p) ...` counts them.
     ///
     /// Counted with no statement planned when every predicate, simplified, is
-    /// one interval on one range-indexed column, or the literal `true` (every
+    /// `column IS NOT NULL` alone, which the manifest's null counts answer
+    /// for every superfile, or one interval on one range-indexed column
+    /// (perhaps beside `IS NOT NULL` on it), or the literal `true` (every
     /// live row), and every superfile it keeps carries that column's range
     /// index ([`Self::count_where_from_index`]). Otherwise the counts run as
     /// one aggregate, built as a plan; a predicate holding a subquery, which
@@ -891,16 +894,44 @@ impl SupertableReader {
         self.block_on_statement(collector, drive)
     }
 
-    /// [`Self::count_where`] from the range index, the manifest and the
-    /// tombstones alone. `None` when a predicate is not one interval on one
-    /// range-indexed column nor the literal `true`, or a superfile it keeps
-    /// has no range index over the column.
+    /// [`Self::count_where`] from the manifest's statistics, the range index
+    /// and the tombstones alone. A lone `column IS NOT NULL` is the column's
+    /// non-null rows, from each superfile's null count when those answer
+    /// for every superfile ([`non_null_count`]), else from the range index
+    /// as any other predicate. `None` when a predicate is neither answered
+    /// so nor one interval on one range-indexed column nor the literal
+    /// `true`, or a superfile it keeps has no range index over the column.
     fn count_where_from_index(&self, predicates: &[Expr]) -> Result<Option<Vec<u64>>, QueryError> {
         // One read of each superfile's deleted rows for every predicate, so
         // the counts agree with each other as one aggregate's would.
         let provider = op_stats::suppressed(|| self.sql_provider()).reading_tombstones_once();
+        if predicates
+            .iter()
+            .any(|predicate| lone_not_null_column(predicate).is_some())
+        {
+            // The statistics answer from the whole manifest in memory and
+            // each superfile's deleted rows; the count reads both anyway.
+            // Only fetching them waits on the runtime.
+            self.block_on(async {
+                provider.load_every_part().await?;
+                if provider.may_have_deletes() {
+                    provider.prefetch_listed_tombstones().await;
+                }
+                Ok::<_, QueryError>(())
+            })?;
+        }
+        // Each predicate's count when the statistics give it, else what the
+        // index counts it from.
+        let mut known = Vec::with_capacity(predicates.len());
         let mut counted = Vec::with_capacity(predicates.len());
         for predicate in predicates {
+            if let Some(count) =
+                lone_not_null_column(predicate).and_then(|column| non_null_count(&provider, column))
+            {
+                known.push(Some(count));
+                continue;
+            }
+            known.push(None);
             if matches!(
                 predicate,
                 Expr::Literal(ScalarValue::Boolean(Some(true)), _)
@@ -915,12 +946,16 @@ impl SupertableReader {
             counted.push((Some(range), filters));
         }
         let provider = &provider;
-        let counts = self
+        let mut indexed = self
             .block_on(try_join_all(counted.iter().map(|(range, filters)| {
                 provider.indexed_rows(range.as_ref(), filters)
             })))
-            .map_err(QueryError::DataFusion)?;
-        Ok(counts.into_iter().collect())
+            .map_err(QueryError::DataFusion)?
+            .into_iter();
+        Ok(known
+            .into_iter()
+            .map(|count| count.or_else(|| indexed.next().flatten()))
+            .collect())
     }
 
     /// The pushdown-aware provider over this reader's pinned snapshot,

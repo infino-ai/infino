@@ -12,6 +12,10 @@
 //! columns (`SupertableProvider::counting`); so is each bucket of a
 //! bucketed range aggregation written as `COUNT(*) FILTER (WHERE range)`
 //! outputs, every bucket's count in one row of one scan (`RangeCounts`).
+//! `COUNT(*) WHERE column IS NOT NULL` counts the rows `COUNT(column)` does,
+//! and is answered as it, from each superfile's null count (the range index
+//! counts it when those leave superfiles to scan); a `column IS NOT NULL`
+//! beside a comparison of the same column narrows nothing and is dropped.
 //! Other ungrouped aggregates whose `WHERE` clause is a single-column range
 //! use the manifest's segment bounds. Segments fall into three classes:
 //!
@@ -42,8 +46,9 @@
 //! scan path is always correct):
 //!
 //!   * the filter must be EXACTLY a conjunction of range comparisons
-//!     over one column (an unrecognized conjunct disables the rewrite
-//!     — partial predicate coverage would answer the wrong query);
+//!     over one column, perhaps beside `IS NOT NULL` on it, or `COUNT(*)`'s
+//!     `column IS NOT NULL` alone (an unrecognized conjunct disables the
+//!     rewrite — partial predicate coverage would answer the wrong query);
 //!   * a segment with deletes whose statistics are not corrected for
 //!     them exactly, or whose deletes are unknown, demotes to boundary —
 //!     one superfile's deletes send that superfile to the scan, not the
@@ -90,7 +95,8 @@ use datafusion::{
     functions_aggregate::expr_fn::{count, max, min, sum},
     logical_expr::{
         Aggregate, EmptyRelation, Expr, Filter, LogicalPlan, LogicalPlanBuilder, Operator,
-        TableScan, TableSource, lit, utils::split_conjunction,
+        TableScan, TableSource, lit,
+        utils::{conjunction, split_conjunction},
     },
     optimizer::{OptimizerConfig, OptimizerRule, optimizer::ApplyOrder},
     prelude::{cast, col, ident},
@@ -117,6 +123,17 @@ use crate::supertable::{
     },
     schema::{DECIMAL128_PRECISION, DECIMAL128_SCALE, FieldId},
 };
+
+/// The comparisons that are never true when their column is null (a null
+/// compared is null), so a `column IS NOT NULL` beside one narrows nothing.
+const NULL_REJECTING_COMPARISONS: [Operator; 6] = [
+    Operator::Eq,
+    Operator::NotEq,
+    Operator::Lt,
+    Operator::LtEq,
+    Operator::Gt,
+    Operator::GtEq,
+];
 
 /// What a dry run's rewrite collects: the deleted rows each rewritten
 /// aggregate wants, by the provider to read them through.
@@ -220,8 +237,9 @@ enum Class {
 /// optimized:
 ///
 ///   * load every manifest part of each table an unfiltered, ungrouped
-///     aggregate reads, subqueries included, so the rewrite finds the whole
-///     table in memory (that aggregate's scan would load every part anyway);
+///     aggregate reads, or a `COUNT(*)` of one column's non-null rows,
+///     subqueries included, so the rewrite finds the whole table in memory
+///     (that aggregate's scan would load every part anyway);
 ///   * for a table with deletes under an aggregate of a shape the rewrite
 ///     answers, read its superfiles' deleted rows, so the rewrite's lookups
 ///     of them are cache reads;
@@ -244,7 +262,9 @@ pub(crate) async fn prepare_aggregate_inputs(
         if let LogicalPlan::Aggregate(agg) = node
             && let Some(scan) = aggregated_scan(agg)
         {
-            if agg.group_expr.is_empty() && peel_unfiltered_scan(agg.input.as_ref()).is_some() {
+            if agg.group_expr.is_empty()
+                && (peel_unfiltered_scan(agg.input.as_ref()).is_some() || counts_non_null(agg))
+            {
                 sources.push(Arc::clone(&scan.source));
             }
             if answerable_shape(agg) {
@@ -324,6 +344,17 @@ fn answerable_shape(agg: &Aggregate) -> bool {
             }
             _ => false,
         })
+}
+
+/// Whether `agg` is a lone `COUNT(*)` of the rows one column holds a value
+/// in (`WHERE column IS NOT NULL`), which the rewrite answers as that
+/// column's `COUNT`, from every superfile's statistics.
+fn counts_non_null(agg: &Aggregate) -> bool {
+    matches!(
+        parse_aggregates(&agg.aggr_expr).as_deref(),
+        Some([AggKind::CountStar])
+    ) && peel_input(agg.input.as_ref())
+        .is_some_and(|(predicate, _)| lone_not_null_column(&predicate).is_some())
 }
 
 /// `state` with the rewrite collecting into `collector` what it wants.
@@ -429,25 +460,12 @@ fn try_rewrite_wanting(
         // One read of each superfile's deleted rows for the statement: the
         // statistics and the residual scan see the same ones.
         let provider = &provider.reading_tombstones_once();
-        let manifest = provider.manifest();
-        let Some(superfiles) = manifest.resident_superfiles() else {
+        let Some((partials, split)) =
+            table_statistics(provider, &kinds, "unfiltered aggregate", requests)
+        else {
             return Ok(None);
         };
-        let Some((partials, split)) = answer_from_statistics(
-            provider,
-            &kinds,
-            &superfiles,
-            None,
-            "unfiltered aggregate",
-            requests,
-        ) else {
-            return Ok(None);
-        };
-        if split.scans_any() {
-            return rewrite_with_residual(agg, scan, provider, &kinds, partials, split, None);
-        }
-        split.log();
-        return literal_answer(agg, &partials).map(Some);
+        return answer_or_scan_rest(agg, scan, provider, &kinds, partials, split, None);
     }
 
     // Input shape: Filter over TableScan (a pure-column Projection in
@@ -459,6 +477,12 @@ fn try_rewrite_wanting(
     let Some(provider) = provider_of(scan) else {
         return Ok(None);
     };
+    let predicate = without_implied_not_null(&predicate);
+    if matches!(kinds.as_slice(), [AggKind::CountStar])
+        && let Some(column) = lone_not_null_column(&predicate)
+    {
+        return rewrite_non_null_count(agg, scan, provider, column, &predicate, requests);
+    }
     let Some(range) = extract_range(&predicate) else {
         return Ok(None);
     };
@@ -524,15 +548,7 @@ fn try_rewrite_wanting(
     if matches!(kinds.as_slice(), [AggKind::CountStar])
         && let Some(counted) = counted
     {
-        let input = counting_scan(provider, scan, counted, &predicate)?;
-        return Ok(Some(LogicalPlan::Aggregate(
-            Aggregate::try_new_with_schema(
-                Arc::new(input),
-                Vec::new(),
-                agg.aggr_expr.clone(),
-                Arc::clone(&agg.schema),
-            )?,
-        )));
+        return range_count(agg, scan, provider, counted, &predicate).map(Some);
     }
 
     let Some(superfiles) = superfiles else {
@@ -548,11 +564,7 @@ fn try_rewrite_wanting(
     ) else {
         return Ok(None);
     };
-    if !split.scans_any() {
-        split.log();
-        return literal_answer(agg, &partials).map(Some);
-    }
-    rewrite_with_residual(
+    answer_or_scan_rest(
         agg,
         scan,
         provider,
@@ -561,6 +573,180 @@ fn try_rewrite_wanting(
         split,
         Some(&predicate),
     )
+}
+
+/// `kinds` over every row of the table, answered from the statistics of each
+/// superfile, corrected for its deleted rows (see [`answer_from_statistics`]),
+/// and the superfiles they do not answer for. `None` while a part of the
+/// manifest is not in memory, or when nothing is answered.
+fn table_statistics(
+    provider: &SupertableProvider,
+    kinds: &[AggKind],
+    shape: &'static str,
+    requests: &mut StatsRequests,
+) -> Option<(Vec<Partial>, Split)> {
+    let superfiles = provider.manifest().resident_superfiles()?;
+    answer_from_statistics(provider, kinds, &superfiles, None, shape, requests)
+}
+
+/// `agg` from `partials`: one literal row when `split` scans no superfile,
+/// otherwise `partials` plus a scan of the superfiles it does, filtered by
+/// `predicate` when the query has one.
+fn answer_or_scan_rest(
+    agg: &Aggregate,
+    scan: &TableScan,
+    provider: &SupertableProvider,
+    kinds: &[AggKind],
+    partials: Vec<Partial>,
+    split: Split,
+    predicate: Option<&Expr>,
+) -> DfResult<Option<LogicalPlan>> {
+    if split.scans_any() {
+        return rewrite_with_residual(agg, scan, provider, kinds, partials, split, predicate);
+    }
+    split.log();
+    literal_answer(agg, &partials).map(Some)
+}
+
+/// `COUNT(*) WHERE column IS NOT NULL` (`predicate`, every conjunct of it
+/// that) as `COUNT(column)`: the two count the same rows, the rows holding a
+/// value. In order:
+///
+///   * every superfile answered from its statistics (its null count, less
+///     its deleted rows): one literal row;
+///   * else, on a range-indexed column, a count of the index's keys, which
+///     are every value and no null: a block or two per superfile, cheaper
+///     than scanning the superfiles the statistics leave, so no deleted
+///     row's statistics are asked for;
+///   * else the statistics for what they answer and a scan of the rest,
+///     whose `COUNT(column)` counts the rows the predicate keeps there;
+///   * else nothing: the plain scan answers.
+fn rewrite_non_null_count(
+    agg: &Aggregate,
+    scan: &TableScan,
+    provider: &SupertableProvider,
+    column: &str,
+    predicate: &Expr,
+    requests: &mut StatsRequests,
+) -> DfResult<Option<LogicalPlan>> {
+    // One read of each superfile's deleted rows for the statement: the
+    // statistics, the index count and the residual scan see the same ones.
+    let provider = &provider.reading_tombstones_once();
+    let kinds = [AggKind::Count(column.to_string())];
+    let counted = provider.counted_range(predicate);
+    let mut unread = StatsRequests {
+        list: Vec::new(),
+        quiet: requests.quiet,
+    };
+    let wanted = match counted.is_some() {
+        true => &mut unread,
+        false => &mut *requests,
+    };
+    let answered = table_statistics(provider, &kinds, "non-null count", wanted);
+    if let Some((partials, split)) = answered
+        && (!split.scans_any() || counted.is_none())
+    {
+        return answer_or_scan_rest(agg, scan, provider, &kinds, partials, split, None);
+    }
+    match counted {
+        Some(counted) => range_count(agg, scan, provider, counted, predicate).map(Some),
+        None => Ok(None),
+    }
+}
+
+/// `agg`, a lone `COUNT(*)`, over the counting scan of `counted`
+/// (`predicate`'s rows), counted from each superfile's range index.
+fn range_count(
+    agg: &Aggregate,
+    scan: &TableScan,
+    provider: &SupertableProvider,
+    counted: CountedRange,
+    predicate: &Expr,
+) -> DfResult<LogicalPlan> {
+    let input = counting_scan(provider, scan, counted, predicate)?;
+    Ok(LogicalPlan::Aggregate(Aggregate::try_new_with_schema(
+        Arc::new(input),
+        Vec::new(),
+        agg.aggr_expr.clone(),
+        Arc::clone(&agg.schema),
+    )?))
+}
+
+/// `COUNT(column)` over the table's live rows — the rows `column IS NOT
+/// NULL` keeps — from the manifest's statistics alone, corrected for the
+/// deleted rows `provider` reads. `None` when they leave a superfile to scan
+/// (deleted rows whose statistics are unread, a column mid-retype, a part of
+/// the manifest not in memory).
+pub(crate) fn non_null_count(provider: &SupertableProvider, column: &str) -> Option<u64> {
+    let kinds = [AggKind::Count(column.to_string())];
+    let mut requests = StatsRequests {
+        list: Vec::new(),
+        quiet: true,
+    };
+    let (partials, split) = table_statistics(provider, &kinds, "non-null count", &mut requests)?;
+    if split.scans_any() {
+        return None;
+    }
+    match partials.as_slice() {
+        [Partial::Count(count)] => u64::try_from(*count).ok(),
+        _ => None,
+    }
+}
+
+/// The column every conjunct of `predicate` asks to be non-null
+/// (`column IS NOT NULL`, perhaps repeated); `None` for any other predicate.
+pub(crate) fn lone_not_null_column(predicate: &Expr) -> Option<&str> {
+    let mut columns = split_conjunction(predicate)
+        .into_iter()
+        .map(not_null_column);
+    let first = columns.next()??;
+    columns.all(|column| column == Some(first)).then_some(first)
+}
+
+/// `predicate` without each `column IS NOT NULL` conjunct that sits beside a
+/// comparison (or `BETWEEN`) of the same column to a non-null literal: a
+/// comparison is never true on a null, so the `IS NOT NULL` narrows nothing.
+/// `predicate` unchanged otherwise.
+fn without_implied_not_null(predicate: &Expr) -> Expr {
+    let conjuncts = split_conjunction(predicate);
+    let implied = |conjunct: &Expr| {
+        not_null_column(conjunct).is_some_and(|column| {
+            conjuncts
+                .iter()
+                .any(|other| compares_to_literal(other, column))
+        })
+    };
+    let kept: Vec<Expr> = conjuncts
+        .iter()
+        .filter(|conjunct| !implied(conjunct))
+        .map(|conjunct| (*conjunct).clone())
+        .collect();
+    if kept.len() == conjuncts.len() {
+        return predicate.clone();
+    }
+    conjunction(kept).unwrap_or_else(|| predicate.clone())
+}
+
+/// `column` when `expr` is `column IS NOT NULL`.
+fn not_null_column(expr: &Expr) -> Option<&str> {
+    match expr {
+        Expr::IsNotNull(inner) => match inner.as_ref() {
+            Expr::Column(c) => Some(c.name.as_str()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Whether `expr` compares `column` to a non-null literal, or is a `BETWEEN`
+/// of it and two: true on no row where `column` is null. Only the plain
+/// comparisons: `IS DISTINCT FROM` and the like are true on a null.
+fn compares_to_literal(expr: &Expr, column: &str) -> bool {
+    let mut leaves = Vec::new();
+    collect_range_leaves(expr, &mut leaves).is_some()
+        && leaves
+            .iter()
+            .all(|(name, op, _)| name == column && NULL_REJECTING_COMPARISONS.contains(op))
 }
 
 /// `agg` answered by `partials` alone, one literal row: every superfile it
