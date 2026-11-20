@@ -393,11 +393,21 @@ impl ExecutionPlan for VectorSearchExec {
             // longer use up the search. What the filtered search then misses
             // is what its cluster probes don't reach.
             let plan = candidate_plan_for_filters(reader.manifest(), &filters);
+            // The superfiles a bounded plan may match in, chosen once for every widening round.
+            let superfiles = match &plan {
+                CandidatePlan::Unbounded => Vec::new(),
+                bounded => {
+                    reader
+                        .superfiles_a_where_may_match(&filters, bounded)
+                        .await?
+                }
+            };
             let search = |want: usize| {
                 let reader = &reader;
                 let column = &column;
                 let query = &query;
                 let plan = &plan;
+                let superfiles = &superfiles;
                 async move {
                     let hits = match plan {
                         CandidatePlan::Unbounded => {
@@ -407,7 +417,9 @@ impl ExecutionPlan for VectorSearchExec {
                         }
                         bounded => {
                             reader
-                                .vector_hits_filtered_by_plan(column, query, want, options, bounded)
+                                .vector_hits_filtered_by_plan(
+                                    column, query, want, options, superfiles, bounded,
+                                )
                                 .await?
                         }
                     };
