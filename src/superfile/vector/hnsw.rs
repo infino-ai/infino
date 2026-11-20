@@ -465,8 +465,18 @@ impl Fp32Scorer {
         }
     }
 
+    /// A scorer over `data`, `dim` values per node in node order.
+    pub(crate) fn from_rows(data: Vec<f32>, dim: usize, metric: Metric) -> Self {
+        Self {
+            len: data.len() / dim,
+            data,
+            dim,
+            metric,
+        }
+    }
+
     #[inline]
-    fn row(&self, node: u32) -> &[f32] {
+    pub(crate) fn row(&self, node: u32) -> &[f32] {
         let start = node as usize * self.dim;
         &self.data[start..start + self.dim]
     }
@@ -1397,6 +1407,21 @@ impl Hnsw {
     /// The graph with its holes dropped and the live nodes renumbered from 0
     /// in their old order, and `kept[new] = old` for each of them. No list
     /// names a hole, so nothing needs repair: every list is only renumbered.
+    /// This graph with `nodes` made holes. The bytes keep a hole as a node
+    /// with no neighbors, so a decoder that knows which nodes were holes
+    /// restores them here. `None` if one of them has neighbors.
+    pub(crate) fn with_holes(mut self, nodes: impl IntoIterator<Item = u32>) -> Option<Hnsw> {
+        for node in nodes {
+            let node = node as usize;
+            let lists = self.neighbors.get(node)?;
+            if self.node_level[node] != 0 || lists.iter().any(|list| !list.is_empty()) {
+                return None;
+            }
+            self.neighbors[node] = Vec::new();
+        }
+        Some(self)
+    }
+
     pub(crate) fn without_holes(&self) -> (Hnsw, Vec<u32>) {
         let kept: Vec<u32> = (0..self.len as u32).filter(|&n| !self.is_hole(n)).collect();
         let mut remap = vec![u32::MAX; self.len];

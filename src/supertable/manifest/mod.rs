@@ -644,6 +644,7 @@ impl ManifestSnapshot {
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
+            slow_vector_state_centroid_graph_last: None,
             term_index: None,
             term_index_complete: false,
             parts,
@@ -2069,6 +2070,23 @@ impl ManifestSnapshot {
             .as_ref()
     }
 
+    /// The last centroid graph ref stamped, which a membership change keeps.
+    pub(crate) fn slow_vector_state_centroid_graph_last_blob(&self) -> Option<&RoutingRef> {
+        self.list
+            .as_ref()?
+            .slow_vector_state_centroid_graph_last
+            .as_ref()
+    }
+
+    /// This manifest with `last` as the centroid graph ref a membership
+    /// change keeps.
+    pub(crate) fn with_centroid_graph_last(mut self, last: Option<RoutingRef>) -> Self {
+        if let Some(list) = self.list.as_mut() {
+            list.slow_vector_state_centroid_graph_last = last;
+        }
+        self
+    }
+
     test_visible! {
         /// Bench/test introspection for the published resident vector-index
         /// blob (the flat plane or graph bundle the drain persisted): its
@@ -3142,6 +3160,10 @@ impl ManifestSnapshot {
             // set), so it is cleared here like the centroid section and the
             // settle restamps it for the new generation — never carried forward.
             slow_vector_state_centroid_graph: None,
+            slow_vector_state_centroid_graph_last: self
+                .list
+                .as_ref()
+                .and_then(|l| l.slow_vector_state_centroid_graph_last.clone()),
             parts: out_list_entries_after_removal
                 .into_iter()
                 .map(|mut entry| {
@@ -7470,6 +7492,7 @@ mod tests {
                 slow_vector_state_centroids: None,
                 slow_vector_state_graphs: None,
                 slow_vector_state_centroid_graph: None,
+                slow_vector_state_centroid_graph_last: None,
                 term_index: None,
                 term_index_complete: false,
                 parts: entries,
@@ -8424,6 +8447,7 @@ mod tests {
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
+            slow_vector_state_centroid_graph_last: None,
             term_index: None,
             term_index_complete: false,
             parts: vec![list::ManifestPartEntry {
@@ -8614,6 +8638,7 @@ mod tests {
                 slow_vector_state_centroids: None,
                 slow_vector_state_graphs: None,
                 slow_vector_state_centroid_graph: None,
+                slow_vector_state_centroid_graph_last: None,
                 term_index: None,
                 term_index_complete: false,
                 parts: vec![],
@@ -8627,6 +8652,39 @@ mod tests {
             derived_length_totals: Default::default(),
             inline_rollups_fit: Default::default(),
         })
+    }
+
+    /// A membership change clears the centroid graph ref and keeps the last
+    /// one stamped, so gc still knows the objects it names.
+    #[tokio::test]
+    async fn a_membership_change_keeps_the_last_centroid_graph_ref() {
+        let opts = make_opts();
+        let graph = RoutingRef {
+            uri: "slow-vector-state/state-head.bin".into(),
+            content_hash: ContentHash([7u8; 32]),
+        };
+        let stamped = empty_manifest(&opts)
+            .with_slow_vector_state(
+                "slow-vector-state/state-x.bin".into(),
+                ContentHash([3u8; 32]),
+                RoutingRef {
+                    uri: "slow-vector-state/state-c.bin".into(),
+                    content_hash: ContentHash([5u8; 32]),
+                },
+                None,
+                Some(graph.clone()),
+            )
+            .with_centroid_graph_last(Some(graph.clone()));
+        let new_entry = make_new_entry(100);
+        let (updated, _parts) = stamped
+            .update(from_ref(&new_entry), &[])
+            .await
+            .expect("update");
+        assert!(updated.slow_vector_state_centroid_graph_blob().is_none());
+        assert_eq!(
+            updated.slow_vector_state_centroid_graph_last_blob(),
+            Some(&graph)
+        );
     }
 
     /// Slow-CAS section semantics: `with_slow_vector_state` stamps the ref
@@ -8761,6 +8819,7 @@ mod tests {
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
+            slow_vector_state_centroid_graph_last: None,
             term_index: None,
             term_index_complete: false,
             parts: vec![part_entry(pa_id), part_entry(pb_id)],
@@ -8843,6 +8902,7 @@ mod tests {
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
+            slow_vector_state_centroid_graph_last: None,
             term_index: None,
             term_index_complete: false,
             parts: Vec::new(),
@@ -9451,6 +9511,7 @@ mod tests {
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
+            slow_vector_state_centroid_graph_last: None,
             term_index: None,
             term_index_complete: false,
             parts: vec![ManifestPartEntry {
@@ -9668,6 +9729,7 @@ mod tests {
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
+            slow_vector_state_centroid_graph_last: None,
             term_index: None,
             term_index_complete: false,
             parts: vec![ManifestPartEntry {
@@ -10550,6 +10612,7 @@ mod tests {
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
+            slow_vector_state_centroid_graph_last: None,
             term_index: None,
             term_index_complete: false,
             parts: vec![ManifestPartEntry {
@@ -10731,6 +10794,7 @@ mod tests {
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
+            slow_vector_state_centroid_graph_last: None,
             term_index: None,
             term_index_complete: false,
             parts: vec![ManifestPartEntry {
@@ -10897,6 +10961,7 @@ mod tests {
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
+            slow_vector_state_centroid_graph_last: None,
             term_index: None,
             term_index_complete: false,
             parts: vec![
@@ -11115,6 +11180,7 @@ mod tests {
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
+            slow_vector_state_centroid_graph_last: None,
             term_index: None,
             term_index_complete: false,
             parts: vec![ManifestPartEntry {
@@ -11228,6 +11294,7 @@ mod tests {
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
+            slow_vector_state_centroid_graph_last: None,
             term_index: None,
             term_index_complete: false,
             parts: vec![ManifestPartEntry {
@@ -11368,6 +11435,7 @@ mod tests {
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
+            slow_vector_state_centroid_graph_last: None,
             term_index: None,
             term_index_complete: false,
             parts: vec![ManifestPartEntry {
@@ -11498,6 +11566,7 @@ mod tests {
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
+            slow_vector_state_centroid_graph_last: None,
             term_index: None,
             term_index_complete: false,
             parts: vec![
@@ -11647,6 +11716,7 @@ mod tests {
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
+            slow_vector_state_centroid_graph_last: None,
             term_index: None,
             term_index_complete: false,
             parts: vec![
@@ -11806,6 +11876,7 @@ mod tests {
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
+            slow_vector_state_centroid_graph_last: None,
             term_index: None,
             term_index_complete: false,
             parts: vec![
@@ -11979,6 +12050,7 @@ mod tests {
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
+            slow_vector_state_centroid_graph_last: None,
             term_index: None,
             term_index_complete: false,
             parts: vec![
@@ -12220,6 +12292,7 @@ mod tests {
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
+            slow_vector_state_centroid_graph_last: None,
             term_index: None,
             term_index_complete: false,
             parts: vec![ManifestPartEntry {
@@ -12330,6 +12403,7 @@ mod tests {
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
+            slow_vector_state_centroid_graph_last: None,
             term_index: None,
             term_index_complete: false,
             parts: vec![ManifestPartEntry {
@@ -12456,6 +12530,7 @@ mod tests {
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
+            slow_vector_state_centroid_graph_last: None,
             term_index: None,
             term_index_complete: false,
             parts: vec![
@@ -12608,6 +12683,7 @@ mod tests {
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
+            slow_vector_state_centroid_graph_last: None,
             term_index: None,
             term_index_complete: false,
             parts: vec![
@@ -12757,6 +12833,7 @@ mod tests {
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
+            slow_vector_state_centroid_graph_last: None,
             term_index: None,
             term_index_complete: false,
             parts: vec![ManifestPartEntry {
@@ -12857,6 +12934,7 @@ mod tests {
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
+            slow_vector_state_centroid_graph_last: None,
             term_index: None,
             term_index_complete: false,
             parts: vec![ManifestPartEntry {
@@ -12976,6 +13054,7 @@ mod tests {
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
+            slow_vector_state_centroid_graph_last: None,
             term_index: None,
             term_index_complete: false,
             parts: vec![
@@ -13124,6 +13203,7 @@ mod tests {
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
+            slow_vector_state_centroid_graph_last: None,
             term_index: None,
             term_index_complete: false,
             parts,

@@ -99,7 +99,7 @@ use crate::{
     config,
     runtime_bridge::run_on_pool,
     runtime_metrics::op_stats::{self, OpStatsCollector},
-    storage::io_counters,
+    storage::{StorageProvider, io_counters},
     superfile::{
         SuperfileReader,
         error::ReadError,
@@ -111,7 +111,7 @@ use crate::{
                 Metric, dequantize_sq16_adaptive_into, distance, normalize, relative_score_window,
             },
             flat::Sq4FlatIndex,
-            hnsw::{self, Fp32Scorer, HnswParams, Plane, Sq4Scorer, Sq16Scorer, encode_hnsw},
+            hnsw::{self, Fp32Scorer, Hnsw, HnswParams, Plane, Sq4Scorer, Sq16Scorer, encode_hnsw},
             layout::VectorLayout,
             reader::{
                 EMPTY_FILTER_SELECTIVITY_MULT, ProbeTally, ScanCandidate, ScanOutcome,
@@ -127,7 +127,7 @@ use crate::{
             CellVectorSummary, ManifestSnapshot, RABITQ_ADMIT_CELL_SHORTLIST_FRACTION,
             RABITQ_ADMIT_CELL_SHORTLIST_MIN, RabitqAdmitQuery, SuperfileEntry, SuperfileUri,
             VectorSummary,
-            list::{CellRoutingParams, PartitionStrategy},
+            list::{CellRoutingParams, PartitionStrategy, RoutingRef},
         },
         opann::REPLICA_CLOSURE_DISTANCE_RATIO,
         options::{GappedPlacementCell, GappedPlacementIndex},
@@ -139,6 +139,8 @@ use crate::{
                 SCORE_COLUMN, id_score_batch, resolve_hits_named, take_rows_byte_source,
             },
             fine_graph_cache::{self, FineNodeKey, GraphRole},
+            fine_graph_follow, fine_graph_publish,
+            fine_graph_store::{GraphHead, KeyedGraph},
             fts::{memo_from_locations, memos_from_plan_locations},
             provider::prune_leaves_for_filters,
             prune::{PruneLeaf, select_superfiles},
@@ -149,6 +151,7 @@ use crate::{
         slow_vector_state::{
             CentroidSection, ResidentIndexKind, ResidentVectorIndex, WalkPlaneRequest,
             fetch_centroid_section, fetch_resident_index_blob, hydrate_resident_index,
+            write_resident_index_blob,
         },
         tombstones::SidecarCache,
     },
@@ -1243,7 +1246,7 @@ fn union_cell_selection(grid: &[u32], fine: &[u32]) -> Vec<u32> {
 /// downstream read is byte-identical.
 pub(crate) struct CentroidRouterGraph {
     scorer: crate::superfile::vector::hnsw::Fp32Scorer,
-    graph: crate::superfile::vector::hnsw::Hnsw,
+    graph: Arc<crate::superfile::vector::hnsw::Hnsw>,
     /// `node_map[i] = (superfile index, per-superfile flat cluster)` for graph
     /// node `i`, or [`HOLE_NODE`] for a hole (a node no search returns).
     /// Resolves each selected node to its superfile + flat cluster.
@@ -1255,6 +1258,9 @@ pub(crate) struct CentroidRouterGraph {
     /// load. The query is transformed into the same space before the walk
     /// ([`gfc_prepare_for_metric`]), so build-time and query-time scoring agree.
     metric: Metric,
+    /// Set when the graph came from its stored base and steps, so the next
+    /// version can start from this one.
+    stored: Option<fine_graph_follow::Loaded>,
 }
 
 /// The [`CentroidRouterGraph::node_map`] entry of a hole.
@@ -1686,10 +1692,11 @@ fn build_centroid_router(
         .collect();
     Ok(CentroidRouterGraph {
         scorer,
-        graph,
+        graph: Arc::new(graph),
         node_map,
         live_nodes: keys.len(),
         metric,
+        stored: None,
     })
 }
 
@@ -1755,7 +1762,6 @@ fn decode_centroid_router_section(
     dim: usize,
     metric: Metric,
 ) -> Option<CentroidRouterGraph> {
-    use crate::superfile::vector::hnsw::{Fp32Scorer, Hnsw};
     if bytes.get(..CENTROID_ROUTER_SECTION_MAGIC.len())? != CENTROID_ROUTER_SECTION_MAGIC {
         return None;
     }
@@ -1784,28 +1790,81 @@ fn decode_centroid_router_section(
     pos += 8;
     let topology = bytes.get(pos..pos.checked_add(topo_len)?)?;
     let graph = Hnsw::from_bytes(topology)?;
-    if graph.len() != n {
+    let nodes: Vec<Option<(Uuid, u32)>> = persisted.into_iter().map(Some).collect();
+    assemble_centroid_router(
+        Arc::new(graph),
+        &nodes,
+        superfiles,
+        readers,
+        column,
+        column_id,
+        section,
+        dim,
+        metric,
+        None,
+    )
+}
+
+/// The `(superfile_id, flat cluster)` of each node, `None` for a hole. Fails on
+/// a key with a cell, which a router graph never has.
+fn router_nodes(keys: &[Option<FineNodeKey>]) -> Option<Vec<Option<(Uuid, u32)>>> {
+    keys.iter()
+        .map(|key| match key {
+            Some((superfile, None, flat)) => Some(Some((*superfile, *flat))),
+            Some((_, Some(_), _)) => None,
+            None => Some(None),
+        })
+        .collect()
+}
+
+/// Build the router from a stored graph and the cluster behind each node
+/// (`None` for a hole). A node with the same cluster as in `previous` takes its
+/// centroid from there, so only superfiles with new clusters are read. `None`
+/// if the graph and `nodes` disagree or a cluster is not in the current
+/// superfiles.
+fn assemble_centroid_router(
+    graph: Arc<Hnsw>,
+    nodes: &[Option<(Uuid, u32)>],
+    superfiles: &[Arc<SuperfileEntry>],
+    readers: &[Arc<SuperfileReader>],
+    column: &str,
+    column_id: FieldId,
+    section: &crate::supertable::slow_vector_state::CentroidSection,
+    dim: usize,
+    metric: Metric,
+    previous: Option<&CentroidRouterGraph>,
+) -> Option<CentroidRouterGraph> {
+    if graph.len() != nodes.len() {
         return None;
     }
-    // Resolve each stable id to its CURRENT array index, and gather every
-    // resident `(superfile_id, flat) -> normalized centroid` so the scorer can
-    // be assembled in persisted node order.
-    let mut id_to_si: HashMap<Uuid, usize> = HashMap::with_capacity(superfiles.len());
-    for (si, sf) in superfiles.iter().enumerate() {
-        id_to_si.insert(sf.superfile_id, si);
-    }
+    let previous = previous
+        .filter(|previous| previous.metric == metric)
+        .and_then(|previous| Some((previous, &previous.stored.as_ref()?.graph.keys)));
+    let kept = |node: usize, (superfile, flat): (Uuid, u32)| -> Option<&[f32]> {
+        let (previous, keys) = previous?;
+        (*keys.get(node)? == Some((superfile, None, flat)))
+            .then(|| previous.scorer.row(node as u32))
+    };
+    let id_to_si: HashMap<Uuid, usize> = superfiles
+        .iter()
+        .enumerate()
+        .map(|(si, sf)| (sf.superfile_id, si))
+        .collect();
+    let to_read: HashSet<Uuid> = nodes
+        .iter()
+        .enumerate()
+        .filter_map(|(node, key)| key.filter(|&key| kept(node, key).is_none()))
+        .map(|(superfile, _)| superfile)
+        .collect();
+    // No superseded filter here: only the stored nodes are looked up, and the
+    // settle composed those with superseded cells already excluded.
     let mut cluster_vecs: HashMap<(Uuid, u32), Vec<f32>> = HashMap::new();
-    for (si, reader) in readers.iter().enumerate() {
+    for (reader, sf) in readers.iter().zip(superfiles) {
         let Some(vr) = reader.vec() else { continue };
-        let Some(sf) = superfiles.get(si) else {
-            continue;
-        };
         let sfid = sf.superfile_id;
-        // No superseded filter here: this fills a `(sfid, flat) -> vec` lookup
-        // and then assembles ONLY the persisted node-map entries, which the
-        // settle composed with superseded cells already excluded. Any extra
-        // superseded vec fetched into the map is simply never referenced; a
-        // split clears the section ref, so the persisted map is never stale.
+        if !to_read.contains(&sfid) {
+            continue;
+        }
         for (flat, mut vec) in vr
             .global_fine_cluster_vectors(column, column_id, section, sfid, None)
             .ok()?
@@ -1814,20 +1873,29 @@ fn decode_centroid_router_section(
             cluster_vecs.insert((sfid, flat), vec);
         }
     }
-    // Assemble the scorer + in-memory node map in topology-node order, driven by
-    // the persisted map. A missing id or cluster (membership drifted) rejects.
-    let mut vecs: Vec<Vec<f32>> = Vec::with_capacity(n);
-    let mut node_map: Vec<(usize, u32)> = Vec::with_capacity(n);
-    for (sfid, flat) in &persisted {
-        let si = *id_to_si.get(sfid)?;
-        let vec = cluster_vecs.get(&(*sfid, *flat))?;
-        if vec.len() != dim {
+    let mut rows: Vec<f32> = Vec::with_capacity(nodes.len() * dim);
+    let mut node_map: Vec<(usize, u32)> = Vec::with_capacity(nodes.len());
+    for (node, key) in nodes.iter().enumerate() {
+        if graph.is_hole(node as u32) != key.is_none() {
             return None;
         }
-        vecs.push(vec.clone());
-        node_map.push((si, *flat));
+        let Some(key) = *key else {
+            rows.resize(rows.len() + dim, 0.0);
+            node_map.push(HOLE_NODE);
+            continue;
+        };
+        let si = *id_to_si.get(&key.0)?;
+        let row = match kept(node, key) {
+            Some(row) => row,
+            None => cluster_vecs.get(&key)?.as_slice(),
+        };
+        if row.len() != dim {
+            return None;
+        }
+        rows.extend_from_slice(row);
+        node_map.push((si, key.1));
     }
-    let scorer = Fp32Scorer::from_vectors(&vecs, dim, metric);
+    let scorer = Fp32Scorer::from_rows(rows, dim, metric);
     let live_nodes = graph.live_len();
     Some(CentroidRouterGraph {
         scorer,
@@ -1835,26 +1903,67 @@ fn decode_centroid_router_section(
         node_map,
         live_nodes,
         metric,
+        stored: None,
     })
 }
 
-/// Build the centroid-router section bytes for the settled generation: open
-/// readers over `entries`, build the router for `column`/`dim` from the freshly
-/// published centroid `section`, and serialize it. `None` when membership is
-/// empty or a step fails (the settle then stamps no ref). The per-`k` fanout is
-/// derived and stamped by the compaction recalibration on its single
-/// ground-truth scan and carried forward by the settle, so it is not measured
-/// here. The caller has already resolved `column`/`dim` via
-/// [`select_eager_router_column`], so this does not re-gate. Called from the
-/// drain/compaction settle so the graph is published once per generation,
-/// `mmap`-loaded identically on every node and after a restart.
-pub(crate) async fn compose_centroid_router_section(
+/// Load the router from stored bytes: either the whole router in one section,
+/// or the head of a graph stored as a base plus steps. `last` is the graph
+/// loaded before, if any.
+async fn centroid_router_from_stored(
+    bytes: &[u8],
+    storage: &dyn StorageProvider,
+    superfiles: &[Arc<SuperfileEntry>],
+    readers: &[Arc<SuperfileReader>],
+    column: &str,
+    column_id: FieldId,
+    section: &crate::supertable::slow_vector_state::CentroidSection,
+    dim: usize,
+    metric: Metric,
+    previous: Option<&CentroidRouterGraph>,
+) -> Option<CentroidRouterGraph> {
+    let Some(head) = GraphHead::from_bytes(bytes) else {
+        return decode_centroid_router_section(
+            bytes, superfiles, readers, column, column_id, section, dim, metric,
+        );
+    };
+    if head.role != GraphRole::Router || head.column != column_id || head.dim as usize != dim {
+        return None;
+    }
+    let last = previous.and_then(|previous| previous.stored.as_ref());
+    let loaded = fine_graph_follow::load(storage, &head, last).await?;
+    let nodes = router_nodes(&loaded.graph.keys)?;
+    let mut router = assemble_centroid_router(
+        Arc::clone(&loaded.graph.graph),
+        &nodes,
+        superfiles,
+        readers,
+        column,
+        column_id,
+        section,
+        dim,
+        metric,
+        previous,
+    )?;
+    router.stored = Some(loaded);
+    Some(router)
+}
+
+/// Build the centroid router for the settled generation and store it,
+/// returning the ref the manifest stamps. With `centroid_graph_as_steps` the
+/// graph is stored as a base plus steps; otherwise, or when that cannot be
+/// written, as one section. `None` when membership is empty or a step fails
+/// (the settle then stamps no ref). The caller has already resolved
+/// `column`/`dim` via [`select_eager_router_column`].
+pub(crate) async fn publish_centroid_router_section(
+    storage: &dyn StorageProvider,
     manifest: &ManifestSnapshot,
     entries: &[Arc<SuperfileEntry>],
     section: &crate::supertable::slow_vector_state::CentroidSection,
     column: &str,
     dim: usize,
-) -> Option<Vec<u8>> {
+    as_steps: bool,
+) -> Option<RoutingRef> {
     if entries.is_empty() {
         return None;
     }
@@ -1871,6 +1980,7 @@ pub(crate) async fn compose_centroid_router_section(
     // the parallel build's non-determinism does not reach placement (which loads
     // these fixed bytes). Parallel keeps the one-time publish cheap.
     let column_id = manifest.field_id(column)?;
+    let superfile_ids = || entries.iter().map(|entry| &entry.superfile_id);
     let router = match build_centroid_router(
         entries,
         &readers,
@@ -1888,7 +1998,28 @@ pub(crate) async fn compose_centroid_router_section(
             return None;
         }
     };
-    Some(encode_centroid_router_section(&router, entries, dim))
+    if as_steps {
+        let keys = router
+            .node_map
+            .iter()
+            .map(|&node| (node != HOLE_NODE).then(|| (entries[node.0].superfile_id, None, node.1)))
+            .collect();
+        let graph = KeyedGraph::shared(keys, Arc::clone(&router.graph));
+        let written =
+            fine_graph_publish::write(storage, GraphRole::Router, column_id, dim as u32, graph)
+                .await;
+        if written.is_some() {
+            return written;
+        }
+        fine_graph_cache::forget(GraphRole::Router, column_id, superfile_ids());
+    }
+    write_resident_index_blob(
+        storage,
+        encode_centroid_router_section(&router, entries, dim),
+    )
+    .await
+    .map_err(|error| warn!(%error, "centroid-router publish: section write failed"))
+    .ok()
 }
 
 /// Build the in-memory centroid router from superfiles' OWN resident fine
@@ -1927,10 +2058,11 @@ pub(crate) fn build_centroid_router_from_cluster_vectors(
     let live_nodes = node_map.len();
     Ok(CentroidRouterGraph {
         scorer,
-        graph,
+        graph: Arc::new(graph),
         node_map,
         live_nodes,
         metric,
+        stored: None,
     })
 }
 
@@ -5472,8 +5604,10 @@ impl SupertableReader {
                 tracing::warn!(uri = reference.uri, %error, "centroid-router section fetch failed")
             })
             .ok()?;
-        decode_centroid_router_section(
+        let previous = manifest.options.centroid_router_cache.load_full();
+        centroid_router_from_stored(
             bytes.as_ref(),
+            storage.as_ref(),
             superfiles,
             readers,
             column,
@@ -5481,7 +5615,12 @@ impl SupertableReader {
             section,
             dim,
             metric,
+            previous
+                .as_ref()
+                .filter(|previous| previous.column == column)
+                .map(|previous| &previous.graph),
         )
+        .await
     }
 
     /// Build the centroid-router graph for `column` from THIS reader's pinned
@@ -5648,10 +5787,11 @@ impl SupertableReader {
             column: column.to_string(),
             graph: CentroidRouterGraph {
                 scorer,
-                graph,
+                graph: Arc::new(graph),
                 node_map,
                 live_nodes: keys.len(),
                 metric,
+                stored: None,
             },
         });
         Some(FineAssignRouter {
@@ -9096,9 +9236,21 @@ mod tests {
     use rand::{RngExt, SeedableRng, rngs::StdRng};
     use roaring::RoaringBitmap;
 
-    use super::IndexOutcome;
+    use super::{IndexOutcome, publish_centroid_router_section};
     use crate::{
-        superfile::fts::reader::Bm25SearchOptions, supertable::manifest::ScalarStats,
+        superfile::{
+            fts::reader::Bm25SearchOptions,
+            vector::hnsw::{Fp32Scorer, Hnsw, HnswParams},
+        },
+        supertable::{
+            manifest::ScalarStats,
+            query::{
+                fine_graph_cache::{FineNodeKey, GraphRole},
+                fine_graph_store::{GraphBase, GraphHead, GraphStep, KeyedGraph},
+            },
+            schema::FieldId,
+            slow_vector_state::{CentroidSection, fetch_resident_index_blob, storage_path},
+        },
         test_helpers::fid,
     };
 
@@ -9125,10 +9277,11 @@ mod tests {
         admit_extension_round, admit_shortlist_window, allowed_cells, apply_width_pin,
         assemble_flat_sections, assemble_hnsw_sections, build_centroid_router,
         calibrated_query_for, cell_layout, cell_passes, cell_row_ranges,
-        cells_ranked_by_fine_score, decode_centroid_router_section, dispatch,
-        encode_centroid_router_section, filtered_k, filtered_route_k, free_column_slot,
-        free_columns_unambiguous, gate_fine_candidates_by_fragment, gfc_prepare_for_metric,
-        gfc_unit_normalize, hidden_hits_user_ids, hits_for_pass_rate, id_score_projection_indices,
+        cells_ranked_by_fine_score, centroid_router_from_stored, centroid_router_walk,
+        decode_centroid_router_section, dispatch, encode_centroid_router_section, filtered_k,
+        filtered_route_k, free_column_slot, free_columns_unambiguous,
+        gate_fine_candidates_by_fragment, gfc_prepare_for_metric, gfc_unit_normalize,
+        hidden_hits_user_ids, hits_for_pass_rate, id_score_projection_indices,
         id_values_from_batch, indexed_rows_outside, is_hidden_vector_manifest,
         law_floor_serve_selection, law_read_rows, lookup_user_placements_by_id,
         lookup_user_placements_in, matching_cell_clusters, matching_rows_by_cell, next_check_want,
@@ -12357,8 +12510,7 @@ mod tests {
                     ss,
                 )
                 .expect("router build")
-                .node_map
-                .len()
+                .live_nodes
             };
 
             let full = node_count(None);
@@ -12386,6 +12538,348 @@ mod tests {
                 "the superseded filter partitions the fine centroids exactly — a \
                  split's dead parent cells must not leak into the router graph"
             );
+        });
+    }
+
+    /// Commits before the first drain.
+    const STORED_GRAPH_FIRST_COMMITS: u64 = 20;
+    /// Commits before the second drain.
+    const STORED_GRAPH_NEXT_COMMITS: u64 = 2;
+    const STORED_GRAPH_ROWS_PER_COMMIT: usize = 32;
+    const STORED_GRAPH_DIM: usize = 16;
+    const STORED_GRAPH_FANOUT: usize = 3;
+
+    /// The centroids of one drain of the stored-graph test table.
+    struct StoredGraphFixture {
+        entries: Vec<Arc<SuperfileEntry>>,
+        readers: Vec<Arc<SuperfileReader>>,
+        section: Arc<CentroidSection>,
+        emb: FieldId,
+        centroids: HashMap<FineNodeKey, Vec<f32>>,
+        manifest: Arc<ManifestSnapshot>,
+    }
+
+    impl StoredGraphFixture {
+        async fn of(st: &Supertable) -> Self {
+            let outer = st.reader().expect("reader");
+            let hidden = outer.vector_index_table().expect("hidden index").clone();
+            let hr = hidden.reader().expect("hidden reader");
+            let section = hr.centroid_section().await.expect("centroid section");
+            let entries = hr
+                .manifest()
+                .get_all_superfiles_loaded()
+                .await
+                .expect("entries");
+            let readers = hr.open_superfile_readers(&entries).await.expect("readers");
+            let emb = hr.manifest().field_id("emb").expect("emb id");
+            let (vecs, walk) = centroid_router_walk(
+                &entries,
+                &readers,
+                "emb",
+                emb,
+                section.as_ref(),
+                Metric::Cosine,
+                None,
+            )
+            .expect("walk");
+            let centroids = walk
+                .iter()
+                .zip(vecs)
+                .map(|(&(si, flat), vec)| ((entries[si].superfile_id, None, flat), vec))
+                .collect();
+            Self {
+                entries,
+                readers,
+                section,
+                emb,
+                centroids,
+                manifest: Arc::clone(hr.manifest()),
+            }
+        }
+
+        /// Store this drain's router as the settle does and return what was
+        /// stored.
+        async fn publish(&self, storage: &dyn StorageProvider, as_steps: bool) -> Bytes {
+            let reference = publish_centroid_router_section(
+                storage,
+                &self.manifest,
+                &self.entries,
+                self.section.as_ref(),
+                "emb",
+                STORED_GRAPH_DIM,
+                as_steps,
+            )
+            .await
+            .expect("publish");
+            fetch_resident_index_blob(storage, &reference)
+                .await
+                .expect("fetch")
+                .0
+        }
+
+        fn scorer(&self, nodes: &[Option<FineNodeKey>]) -> Fp32Scorer {
+            let vectors: Vec<Vec<f32>> = nodes
+                .iter()
+                .map(|key| match key {
+                    Some(key) => self.centroids[key].clone(),
+                    None => vec![0.0; STORED_GRAPH_DIM],
+                })
+                .collect();
+            Fp32Scorer::from_vectors(&vectors, STORED_GRAPH_DIM, Metric::Cosine)
+        }
+
+        async fn load(
+            &self,
+            storage: &dyn StorageProvider,
+            bytes: &[u8],
+            previous: Option<&CentroidRouterGraph>,
+        ) -> Option<CentroidRouterGraph> {
+            centroid_router_from_stored(
+                bytes,
+                storage,
+                &self.entries,
+                &self.readers,
+                "emb",
+                self.emb,
+                self.section.as_ref(),
+                STORED_GRAPH_DIM,
+                Metric::Cosine,
+                previous,
+            )
+            .await
+        }
+
+        /// What each test query selects from `router`, by cluster name.
+        fn picks(&self, router: &CentroidRouterGraph) -> Vec<Vec<(Uuid, u32)>> {
+            stored_graph_picks(&router.graph, &router.scorer, |node| {
+                let (si, flat) = router.node_map[node as usize];
+                (self.entries[si].superfile_id, flat)
+            })
+        }
+    }
+
+    fn stored_graph_picks(
+        graph: &Hnsw,
+        scorer: &Fp32Scorer,
+        name: impl Fn(u32) -> (Uuid, u32),
+    ) -> Vec<Vec<(Uuid, u32)>> {
+        (0..STORED_GRAPH_DIM)
+            .map(|at| {
+                let mut q = vec![0.0f32; STORED_GRAPH_DIM];
+                q[at] = 1.0;
+                let mut picks: Vec<(Uuid, u32)> = graph
+                    .search(scorer, &q, STORED_GRAPH_FANOUT, STORED_GRAPH_FANOUT * 2)
+                    .into_iter()
+                    .map(|(node, _)| name(node))
+                    .collect();
+                picks.sort_unstable();
+                picks
+            })
+            .collect()
+    }
+
+    /// Commit `commits` batches to the stored-graph test table, then drain.
+    fn stored_graph_commits(st: &Supertable, from: u64, commits: u64) {
+        let schema = schema_with_vector(STORED_GRAPH_DIM);
+        for c in from..from + commits {
+            let mut w = st.writer().expect("writer");
+            w.append(&build_vector_batch(
+                c * STORED_GRAPH_ROWS_PER_COMMIT as u64,
+                STORED_GRAPH_ROWS_PER_COMMIT,
+                STORED_GRAPH_DIM,
+                schema.clone(),
+            ))
+            .expect("append");
+            w.commit().expect("commit");
+        }
+        st.drain_vectors_to_cells_sync().expect("drain");
+    }
+
+    /// With the switch on, each drain's router is stored as a base or a step
+    /// and a reader loads it as the writer's router.
+    #[test]
+    fn a_router_graph_written_as_steps_loads_as_built() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(crate::storage::LocalFsStorageProvider::new(dir.path()).expect("storage"));
+        let st = Supertable::create(
+            options_one_superfile_per_commit(STORED_GRAPH_DIM).with_storage(Arc::clone(&storage)),
+        )
+        .expect("create");
+
+        block_on_mt(async {
+            let built = |fixture: &StoredGraphFixture| {
+                let router = build_centroid_router(
+                    &fixture.entries,
+                    &fixture.readers,
+                    "emb",
+                    fixture.emb,
+                    fixture.section.as_ref(),
+                    STORED_GRAPH_DIM,
+                    Metric::Cosine,
+                    true,
+                    None,
+                )
+                .expect("build");
+                fixture.picks(&router)
+            };
+
+            stored_graph_commits(&st, 0, STORED_GRAPH_FIRST_COMMITS);
+            let first = StoredGraphFixture::of(&st).await;
+            let first_bytes = first.publish(storage.as_ref(), true).await;
+            let first_head = GraphHead::from_bytes(&first_bytes).expect("a head");
+            assert!(first_head.steps.is_empty());
+            let first_router = first
+                .load(storage.as_ref(), &first_bytes, None)
+                .await
+                .expect("the base loads");
+            assert_eq!(first.picks(&first_router), built(&first));
+
+            stored_graph_commits(&st, STORED_GRAPH_FIRST_COMMITS, STORED_GRAPH_NEXT_COMMITS);
+            let second = StoredGraphFixture::of(&st).await;
+            let second_bytes = second.publish(storage.as_ref(), true).await;
+            let second_head = GraphHead::from_bytes(&second_bytes).expect("a head");
+            // A step on the first base, unless another test pushed this
+            // table's graph out of the build cache: then a new base.
+            assert!(second_head.steps.len() <= 1);
+            let second_router = second
+                .load(storage.as_ref(), &second_bytes, Some(&first_router))
+                .await
+                .expect("the second loads");
+            assert_eq!(second.picks(&second_router), built(&second));
+
+            // With the switch off the router is stored whole.
+            let whole = second.publish(storage.as_ref(), false).await;
+            assert!(GraphHead::from_bytes(&whole).is_none());
+            assert!(second.load(storage.as_ref(), &whole, None).await.is_some());
+        });
+    }
+
+    /// A graph stored as a base plus a step loads as the writer's graph.
+    #[test]
+    fn a_stored_router_graph_loads_from_its_base_and_steps() {
+        let dim = STORED_GRAPH_DIM;
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(crate::storage::LocalFsStorageProvider::new(dir.path()).expect("storage"));
+        let st = Supertable::create(
+            options_one_superfile_per_commit(dim).with_storage(Arc::clone(&storage)),
+        )
+        .expect("create");
+        let commit = |from: u64, commits: u64| stored_graph_commits(&st, from, commits);
+
+        block_on_mt(async {
+            let publish = |bytes: Vec<u8>| async {
+                let len = bytes.len() as u64;
+                let reference = write_resident_index_blob(storage.as_ref(), bytes)
+                    .await
+                    .expect("publish");
+                (reference.content_hash, len)
+            };
+
+            commit(0, STORED_GRAPH_FIRST_COMMITS);
+            let first = StoredGraphFixture::of(&st).await;
+            let mut first_keys: Vec<FineNodeKey> = first.centroids.keys().copied().collect();
+            first_keys.sort_unstable();
+            let first_nodes: Vec<Option<FineNodeKey>> =
+                first_keys.iter().copied().map(Some).collect();
+            let first_scorer = first.scorer(&first_nodes);
+            let first_graph = Hnsw::build_serial(&first_scorer, HnswParams::default());
+            let base = GraphBase::new(first_nodes.clone(), first_graph.clone()).expect("base");
+            let (base_hash, base_len) = publish(base.to_bytes()).await;
+            let first_head = GraphHead::of_base(
+                GraphRole::Router,
+                first.emb,
+                dim as u32,
+                base_hash,
+                base_len,
+                &base,
+            );
+            let first_router = first
+                .load(storage.as_ref(), &first_head.to_bytes(), None)
+                .await
+                .expect("the base loads");
+            assert_eq!(
+                first.picks(&first_router),
+                stored_graph_picks(&first_graph, &first_scorer, |node| {
+                    let (superfile, _, flat) = first_keys[node as usize];
+                    (superfile, flat)
+                }),
+            );
+
+            commit(STORED_GRAPH_FIRST_COMMITS, STORED_GRAPH_NEXT_COMMITS);
+            let second = StoredGraphFixture::of(&st).await;
+            let gone: Vec<u32> = first_keys
+                .iter()
+                .enumerate()
+                .filter(|(_, key)| !second.centroids.contains_key(key))
+                .map(|(node, _)| node as u32)
+                .collect();
+            let mut added: Vec<FineNodeKey> = second
+                .centroids
+                .keys()
+                .filter(|key| !first.centroids.contains_key(key))
+                .copied()
+                .collect();
+            added.sort_unstable();
+            assert!(!added.is_empty(), "the second drain adds centroids");
+            let second_nodes: Vec<Option<FineNodeKey>> = first_keys
+                .iter()
+                .map(|key| second.centroids.contains_key(key).then_some(*key))
+                .chain(added.iter().copied().map(Some))
+                .collect();
+            let second_scorer = second.scorer(&second_nodes);
+            let second_graph = first_graph
+                .clone()
+                .unlink_nodes(&gone, &second_scorer)
+                .extend_serial(&second_scorer, HnswParams::default());
+            let step = GraphStep::between(
+                &KeyedGraph::new(first_nodes, first_graph),
+                &KeyedGraph::new(second_nodes.clone(), second_graph.clone()),
+            )
+            .expect("step");
+            let (step_hash, step_len) = publish(step.to_bytes()).await;
+            let head = first_head.with_step(step_hash, step_len, &step).to_bytes();
+            let expected = stored_graph_picks(&second_graph, &second_scorer, |node| {
+                let (superfile, _, flat) = second_nodes[node as usize].expect("a live node");
+                (superfile, flat)
+            });
+            let from_base = second
+                .load(storage.as_ref(), &head, None)
+                .await
+                .expect("the base and step load");
+            assert_eq!(second.picks(&from_base), expected);
+
+            // With the base gone, only a reader that has the first graph loads.
+            storage
+                .delete(&storage_path(&base_hash))
+                .await
+                .expect("delete the base");
+            let from_last = second
+                .load(storage.as_ref(), &head, Some(&first_router))
+                .await
+                .expect("the step loads");
+            assert_eq!(second.picks(&from_last), expected);
+            for node in 0..second_nodes.len() as u32 {
+                assert_eq!(from_last.scorer.row(node), from_base.scorer.row(node));
+            }
+            assert!(second.load(storage.as_ref(), &head, None).await.is_none());
+
+            // The old single-section form.
+            let built = build_centroid_router(
+                &second.entries,
+                &second.readers,
+                "emb",
+                second.emb,
+                second.section.as_ref(),
+                dim,
+                Metric::Cosine,
+                true,
+                None,
+            )
+            .expect("build");
+            let whole = encode_centroid_router_section(&built, &second.entries, dim);
+            assert!(second.load(storage.as_ref(), &whole, None).await.is_some());
         });
     }
 

@@ -234,6 +234,9 @@ pub struct Manifest {
     /// manifests, when the router is off at drain, or on a build failure
     /// (consumers reconstruct it in memory).
     pub slow_vector_state_centroid_graph: Option<RoutingRef>,
+    /// The last centroid graph ref stamped, kept across membership changes
+    /// so gc keeps the objects it names while the ref above is cleared.
+    pub slow_vector_state_centroid_graph_last: Option<RoutingRef>,
     /// The table-level term index root (`manifest::term_index`), when
     /// one has been built. Carried across every commit: its postings are
     /// per superfile, so a removal leaves it valid (a reader ignores
@@ -2091,6 +2094,10 @@ struct ManifestDto {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     slow_vector_state_centroid_graph_content_hash: Option<String>, // "blake3:<64hex>"
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    slow_vector_state_centroid_graph_last_uri: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    slow_vector_state_centroid_graph_last_content_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     term_index_uri: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     term_index_content_hash: Option<String>, // "blake3:<64hex>"
@@ -2796,6 +2803,14 @@ fn list_to_dto(l: &Manifest) -> Result<ManifestDto, ListEncodeError> {
             .slow_vector_state_centroid_graph
             .as_ref()
             .map(|r| encode_hash(&r.content_hash)),
+        slow_vector_state_centroid_graph_last_uri: l
+            .slow_vector_state_centroid_graph_last
+            .as_ref()
+            .map(|r| r.uri.clone()),
+        slow_vector_state_centroid_graph_last_content_hash: l
+            .slow_vector_state_centroid_graph_last
+            .as_ref()
+            .map(|r| encode_hash(&r.content_hash)),
         term_index_uri: l.term_index.as_ref().map(|r| r.uri.clone()),
         term_index_content_hash: l.term_index.as_ref().map(|r| encode_hash(&r.content_hash)),
         term_index_complete: l.term_index_complete,
@@ -2923,6 +2938,17 @@ fn list_from_dto(d: ManifestDto, legacy: &LegacyNames) -> Result<Manifest, ListP
         slow_vector_state_centroid_graph: match (
             d.slow_vector_state_centroid_graph_uri,
             d.slow_vector_state_centroid_graph_content_hash.as_deref(),
+        ) {
+            (Some(uri), Some(hash)) => Some(RoutingRef {
+                uri,
+                content_hash: decode_hash(hash)?,
+            }),
+            _ => None,
+        },
+        slow_vector_state_centroid_graph_last: match (
+            d.slow_vector_state_centroid_graph_last_uri,
+            d.slow_vector_state_centroid_graph_last_content_hash
+                .as_deref(),
         ) {
             (Some(uri), Some(hash)) => Some(RoutingRef {
                 uri,
@@ -4402,6 +4428,7 @@ mod tests {
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
+            slow_vector_state_centroid_graph_last: None,
             term_index: None,
             term_index_complete: false,
             parts: vec![],
@@ -4572,6 +4599,21 @@ mod tests {
         let bytes = encode(&list).expect("encode");
         let decoded = decode(&bytes, &LegacyNames::none()).expect("decode");
         assert_lists_equal(&decoded, &list);
+    }
+
+    #[test]
+    fn centroid_graph_last_roundtrip() {
+        let mut list = empty_list();
+        list.slow_vector_state_centroid_graph_last = Some(RoutingRef {
+            uri: "slow-vector-state/state-head.bin".into(),
+            content_hash: ContentHash([7; 32]),
+        });
+        let bytes = encode(&list).expect("encode");
+        let decoded = decode(&bytes, &LegacyNames::none()).expect("decode");
+        assert_eq!(
+            decoded.slow_vector_state_centroid_graph_last,
+            list.slow_vector_state_centroid_graph_last
+        );
     }
 
     #[test]
