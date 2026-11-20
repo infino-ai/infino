@@ -237,9 +237,9 @@ VDB_META = {
 
 # (name, version, search ratio, count ratio, is_infino)
 SBG_ROWS: list[tuple[str, str, float, float, bool]] = [
-    ("Infino", "0.11.26", 0.54, 0.59, True),
+    ("Infino", "0.11.26", 0.53, 0.53, True),
     ("Lucene", "10.5.0", 1.00, 1.00, False),
-    ("Tantivy", "0.27", 1.04, 0.91, False),
+    ("Tantivy", "0.27", 1.03, 0.90, False),
 ]
 
 SBG_META = {
