@@ -88,9 +88,12 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef, SortOptions};
 use datafusion::{
-    arrow::compute::{
-        can_cast_types, cast_with_options, concat, filter, filter_record_batch, sort_to_indices,
-        take,
+    arrow::{
+        buffer::BooleanBuffer,
+        compute::{
+            can_cast_types, cast_with_options, concat, filter, filter_record_batch,
+            sort_to_indices, take,
+        },
     },
     common::{
         Column as StatsColumn, ScalarValue, Statistics, config::ConfigOptions,
@@ -1770,7 +1773,7 @@ fn passing_rows(
         return live;
     }
     let last = conjuncts.len() - 1;
-    let mut passing = live.unwrap_or_else(|| BooleanArray::from(vec![true; rows]));
+    let mut passing = live.unwrap_or_else(|| BooleanArray::new(BooleanBuffer::new_set(rows), None));
     for (at, (conjunct, used, on_dictionary)) in conjuncts.iter().enumerate() {
         if at == last && !on_dictionary {
             break;
@@ -1855,21 +1858,24 @@ fn dictionary_conjunct(
         }
         false => false,
     };
-    let mut next = BooleanBufferBuilder::new(passing.len());
-    next.append_n(passing.len(), false);
-    for row in passing.values().set_indices() {
-        let passes = match keys.is_null(row) {
-            true => on_null,
-            false => {
-                let at = slot[keys.value(row) as usize].expect("a passing row's value is checked");
-                on_values.is_valid(at) && on_values.value(at)
-            }
-        };
-        if passes {
-            next.set_bit(row, true);
+    // Each dictionary value's answer (false for a value no passing row
+    // uses), taken for every row by its key: a passing row's answer is its
+    // value's, a row with no key gets the null's, and every other row is
+    // left out by the passing rows themselves.
+    let answers: BooleanArray = slot
+        .iter()
+        .map(|at| Some(at.is_some_and(|at| on_values.is_valid(at) && on_values.value(at))))
+        .collect();
+    let by_row = take(&answers, keys, None)?;
+    let by_row = boolean(by_row)?;
+    let mut next = by_row.values() & passing.values();
+    if let Some(present) = keys.nulls() {
+        next = &next & present.inner();
+        if on_null {
+            next = &next | &(passing.values() & &!present.inner());
         }
     }
-    Ok(BooleanArray::new(next.finish(), None))
+    Ok(BooleanArray::new(next, None))
 }
 
 /// The rows of `passing` that pass `conjunct`, which reads the columns
@@ -1887,10 +1893,16 @@ fn conjunct_on_rows(
             .map(|&i| schema.field(i).clone())
             .collect::<Vec<_>>(),
     ));
+    // Every row passing: the conjunct is checked on the columns as they are,
+    // and its answer is the next passing rows, a null counting as false.
+    let every_row = passing.null_count() == 0 && passing.true_count() == passing.len();
     let arrays = used
         .iter()
         .map(|&i| {
-            let rows = filter(columns[i].as_ref(), passing)?;
+            let rows = match every_row {
+                true => Arc::clone(&columns[i]),
+                false => filter(columns[i].as_ref(), passing)?,
+            };
             as_scanned(rows, schema.field(i).data_type())
         })
         .collect::<DfResult<Vec<_>>>()?;
@@ -1902,6 +1914,14 @@ fn conjunct_on_rows(
     )?;
     let expr = reassign_expr_columns(Arc::clone(conjunct), &projected)?;
     let checked = boolean(expr.evaluate(&batch)?.into_array(n)?)?;
+    if every_row {
+        // A null answer does not pass.
+        let passes = match checked.nulls() {
+            Some(valid) => checked.values() & valid.inner(),
+            None => checked.values().clone(),
+        };
+        return Ok(BooleanArray::new(passes, None));
+    }
     let mut next = BooleanBufferBuilder::new(passing.len());
     next.append_n(passing.len(), false);
     for (at, row) in passing.values().set_indices().enumerate() {
