@@ -477,30 +477,31 @@ pub struct SupertableOptions {
     /// A search opens no more than [`Self::superfiles_in_flight`] at once,
     /// whatever this is set to.
     pub bound_ordered_open_window: usize,
-    /// Documents the term index keeps per term in its *tier* — a term's
-    /// best documents per superfile, read ahead of any superfile open so a
-    /// ranked multi-term query opens the superfiles that hold its top k
-    /// rather than every one its terms appear in. The cap on a term's
-    /// entries across all superfiles: when the superfiles' heads together
-    /// exceed it, every head is cut to the same shallower depth. `None`
-    /// leaves the heads at [`Self::term_head_depth`]; `Some(0)` keeps no
-    /// tiers, and the ranked path opens by score ceiling alone, as it did
-    /// before tiers existed.
+    /// Whether the term index keeps the documents a ranked query chooses
+    /// its superfiles by, read ahead of any superfile open so a multi-term
+    /// query opens the superfiles that hold its top k rather than every one
+    /// its terms appear in. These were once per-term *tiers*, capped at this
+    /// many entries; the index now keeps level heads, one per term and
+    /// layer, and only zero is read: `Some(0)` keeps no heads, and the
+    /// ranked path opens by score ceiling alone. Any other value, or
+    /// `None`, keeps them.
     pub term_tier_entries_per_term: Option<u64>,
     /// Documents each superfile keeps per term in its head (see
     /// `term_tier_entries_per_term`), clamped to `1..=4096`. `None` is the
     /// engine's depth, chosen so that a superfile's tail — the first
     /// document its head leaves out — sits well below its best, which is
     /// what lets a query rule the superfile out without opening it. To
-    /// keep no tiers, set `term_tier_entries_per_term` to zero.
+    /// keep no heads, set `term_tier_entries_per_term` to zero.
     pub term_head_depth: Option<usize>,
     /// Whether a ranked query merges its terms' tiers only when that is
     /// measured to pay on this table: a running cost per tier entry
     /// against the opens the merge could save, and per class of query the
     /// wall of the search with the merge against without it, the cheaper
-    /// taken and the other tried one query in sixteen. Off, the merge
-    /// runs for every query the tiers can serve (what a test of the merge
-    /// wants).
+    /// taken and the other tried one query in sixteen. The level heads
+    /// price each round after their first the same way. Off, the merge
+    /// runs for every query the tiers can serve and the heads read every
+    /// round their bounds call for, up to their entry budget (what a test
+    /// of either wants).
     pub tier_merge_gate: bool,
     /// Whether the table keeps a term index (see `manifest::term_index`):
     /// per `(column, term)`, the superfiles that hold it, its score ceiling
@@ -1127,8 +1128,9 @@ impl SupertableOptions {
         self
     }
 
-    /// Documents the term index keeps per term in its tier (see
-    /// [`Self::term_tier_entries_per_term`]); `0` keeps no tiers.
+    /// Whether the term index keeps level heads (see
+    /// [`Self::term_tier_entries_per_term`]): `0` keeps none, any other
+    /// value keeps them.
     pub fn with_term_tier_entries_per_term(mut self, entries: u64) -> Self {
         self.term_tier_entries_per_term = Some(entries);
         self
@@ -1184,10 +1186,13 @@ impl SupertableOptions {
     /// What the term-index build takes from these options.
     pub(crate) fn term_index_build_policy(&self) -> BuildPolicy {
         // Every superfile keeps its head to the same depth, at least one
-        // document and at most what the index holds; the cap on a term's
-        // entries binds only when the caller sets one.
+        // document and at most what the index holds. Level heads replace
+        // tiers: a table keeps none, and keeps no heads either when the
+        // caller sets a term's tier entries to zero, so the ranked path
+        // opens by its ceilings alone.
         BuildPolicy {
-            tier_entries_per_term: self.term_tier_entries_per_term.unwrap_or(u64::MAX),
+            tier_entries_per_term: 0,
+            level_heads: self.term_tier_entries_per_term != Some(0),
             head_depth_per_superfile: self
                 .term_head_depth
                 .unwrap_or(HEAD_DEPTH)

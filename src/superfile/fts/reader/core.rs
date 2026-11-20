@@ -32,6 +32,7 @@ use bytes::Bytes;
 use roaring::RoaringBitmap;
 use rustc_hash::FxHashMap;
 use tokio::sync::{OnceCell, Semaphore};
+use tracing::debug;
 
 use super::{
     cursor::{BlockTableCache, CursorUse, TermCursor, TermMeta},
@@ -1687,19 +1688,35 @@ impl FtsReader {
             }
             ranges.push(base + m..base + m + postings_length);
         }
+        self.fetch_coalesced(&ranges, "fts/postings term body")
+            .await
+    }
+
+    /// Fetch `ranges` of the blob in input order, nearby ones sharing a
+    /// request under the same gap and overfetch limits as a term's
+    /// postings: a probe's covering blocks and position groups are many
+    /// small ranges of one term, which one request serves at little extra.
+    pub(super) async fn fetch_coalesced(
+        &self,
+        ranges: &[Range<usize>],
+        what: &'static str,
+    ) -> Result<Vec<Bytes>, FtsError> {
         let plan = RangeCoalescePlan::new(
-            &ranges,
+            ranges,
             TERM_RANGE_COALESCE_MAX_GAP,
             TERM_RANGE_COALESCE_MAX_OVERFETCH,
+        );
+        debug!(
+            what,
+            ranges = ranges.len(),
+            requests = plan.fetch_ranges().len(),
+            "coalesced fetch"
         );
         let fetched = self
             .source
             .get_ranges_parallel_async(plan.fetch_ranges())
             .await
-            .map_err(|e| FtsError::RangeFetch {
-                what: "fts/postings term body",
-                source: e,
-            })?;
+            .map_err(|e| FtsError::RangeFetch { what, source: e })?;
         Ok(plan.restore(&fetched))
     }
 
@@ -5864,7 +5881,16 @@ mod tests {
                         .await
                         .expect("term facts");
                     let fact = facts[0].as_ref().expect("the term is in the file");
-                    sorted(fact.head.docs.iter().map(|&(row, _, _)| row))
+                    // The head names documents by blob id; its rows are
+                    // read from the map as a query's answer is.
+                    let docs = fact
+                        .head
+                        .docs
+                        .iter()
+                        .map(|&(doc, _, _)| (FtsDocId::new(doc), 0.0))
+                        .collect();
+                    let rows = r.hits_to_rows_async(docs).await.expect("translate");
+                    sorted(rows.into_iter().map(|(row, _)| row.get()))
                 }
                 other => unreachable!("no case {other}"),
             };

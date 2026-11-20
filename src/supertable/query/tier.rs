@@ -94,11 +94,11 @@ use crate::{
 /// Terms up to which a candidate's summed contributions equal the kernel's
 /// score bit for bit: one term is one product, two commute, three or more
 /// depend on the order the kernel adds them in.
-const EXACT_SUM_TERMS: usize = 2;
+pub(crate) const EXACT_SUM_TERMS: usize = 2;
 /// Widening applied to a bound taken from a stored key — a tail or a
 /// ceiling — which is rounded once more than the kernel rounds a score.
 /// Mirrors the term index's ceiling slack.
-const BOUND_SLACK: f32 = 1.0 + 8.0 * f32::EPSILON;
+pub(crate) const BOUND_SLACK: f32 = 1.0 + 8.0 * f32::EPSILON;
 /// A term's tier up to this size is read whole in the merge's first wave: it
 /// costs what its first block costs, one ranged read, and the rounds after
 /// the first then need no storage round trip. A larger tier — a common
@@ -344,6 +344,9 @@ pub(crate) struct TierQuery<'a> {
     /// counted, as the kernel weights it — times the smallest member key
     /// of the document, the bound the ceiling path uses.
     pub(crate) phrases: Vec<(Vec<usize>, bool)>,
+    /// Each phrase's members' offsets from its first member, parallel to
+    /// `phrases`: a stopword dropped from the phrase leaves a gap.
+    pub(crate) phrase_offsets: Vec<Vec<u32>>,
     /// Whether the query negates terms or phrases: a document the heads
     /// show cannot then be taken as a match, so the merge bounds and
     /// orders but seeds no threshold and answers for nothing.
@@ -379,6 +382,15 @@ pub(crate) struct TierQuery<'a> {
     /// The connection's memory budget, which every round's reads are
     /// reserved against.
     pub(crate) budget: Arc<ConnectionMemoryBudget>,
+    /// Whether the query's scope admits only some rows of a superfile: the
+    /// k-th score over every row is then no floor for the admitted ones,
+    /// so a selection bounds superfiles but seeds no threshold and answers
+    /// for none. The tier merge does not serve such a query.
+    pub(crate) rows_scoped: bool,
+    /// The query's score tolerance: a document may be missed when it
+    /// scores at most this share above the returned k-th, so a superfile
+    /// bounded under the threshold widened by it need not be read for.
+    pub(crate) score_tolerance: f32,
 }
 
 /// The merge's outcome for one query.
@@ -698,7 +710,7 @@ pub(crate) async fn prepare_merge<'a>(
     let terms = query.terms;
     let nt = terms.len();
     let k = query.k;
-    if nt == 0 || nt > MAX_TIER_TERMS || k == 0 || kept.is_empty() {
+    if nt == 0 || nt > MAX_TIER_TERMS || k == 0 || kept.is_empty() || query.rows_scoped {
         return Ok(None);
     }
     // The gate: the merge's first round decodes a block per term per

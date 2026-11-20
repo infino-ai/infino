@@ -76,6 +76,9 @@ pub fn document(global: usize) -> String {
     text
 }
 
+/// Superfiles a test table opens at once, in bound order.
+pub const OPEN_WINDOW: usize = 1;
+
 pub fn table(dir: &TempDir, tiers: bool) -> Supertable {
     table_with(
         dir,
@@ -93,15 +96,13 @@ pub struct Build {
     pub tiers: bool,
     /// Each superfile's head per term cut to this depth, when given.
     pub depth: Option<usize>,
-    /// A cap on a term's entries across superfiles, when given.
-    pub budget: Option<u64>,
     /// Whether the merge is the table's learned call (on) or runs for every
     /// query the tiers can serve (off, what a test of the merge wants).
     pub gate: bool,
     /// Whether every third document's body is null.
     pub nulls: bool,
-    /// Whether the table keeps no term index at all (`tiers`, `depth` and
-    /// `budget` then have nothing to shape).
+    /// Whether the table keeps no term index at all (`tiers` and `depth`
+    /// then have nothing to shape).
     pub without_index: bool,
 }
 
@@ -118,12 +119,10 @@ pub fn options_for(dir: &TempDir, build: Build) -> SupertableOptions {
     let mut options = SupertableOptions::new(schema(), vec![fts], vec![])
         .expect("options")
         .with_storage(storage)
-        .with_bound_ordered_open_window(1)
+        .with_bound_ordered_open_window(OPEN_WINDOW)
         .with_tier_merge_gate(build.gate);
     if !build.tiers {
         options = options.with_term_tier_entries_per_term(0);
-    } else if let Some(budget) = build.budget {
-        options = options.with_term_tier_entries_per_term(budget);
     }
     if let Some(depth) = build.depth {
         options = options.with_term_head_depth(depth);

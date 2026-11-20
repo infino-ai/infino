@@ -282,36 +282,35 @@ fn a_table_past_the_open_window_always_merges() {
     }
 }
 
-/// Within one window the learned gate still decides: it takes both its
-/// ways, one opening every tied superfile, the other merging and opening a
-/// handful. The table holds exactly one window of superfiles, so a merge
-/// forced at the window itself would leave only the second.
+/// Within one window the learned gate weighs the level heads as it would a
+/// tier merge, trying both ways before it settles, and the heads read only
+/// the rounds this table's measured costs say are worth it. Every run
+/// answers the same. How many superfiles a run opens follows the measured
+/// costs, so it is not asserted here; past one window it is (see
+/// `a_table_past_the_open_window_always_merges`).
 #[test]
-fn a_table_within_the_window_keeps_the_learned_gate() {
+fn a_table_within_the_window_weighs_the_heads_and_answers_the_same() {
     let p = pair(Shape {
         tiers: true,
         depth: None,
         window: SUPERFILES,
         index: true,
     });
-    // The first run opens every superfile whatever the gate says: its
-    // merge runs beside opens a whole table wide.
-    opens_and_equal(&p, "python", 10);
-    let opens: Vec<u64> = (1..GATE_REPEATS)
-        .map(|_| opens_and_equal(&p, "python", 10))
-        .collect();
+    let mut served = 0usize;
+    for run in 0..GATE_REPEATS {
+        let (a, stats) = ranked(&p.with, "python", 10);
+        let (b, _) = ranked(&p.without, "python", 10);
+        assert_eq!(a, b, "run {run}: the heads must not change the answer");
+        served += usize::from(stats.tier_entries > 0);
+    }
     assert!(
-        opens.iter().any(|&n| n > TIED_TERM_OPENS),
-        "{opens:?}: the gate never took its way without the merge"
-    );
-    assert!(
-        opens.iter().any(|&n| n <= TIED_TERM_OPENS),
-        "{opens:?}: the gate never merged"
+        served > 0 && served < GATE_REPEATS,
+        "the gate tried both ways: {served} of {GATE_REPEATS} runs read the heads"
     );
 }
 
-/// Runs a test of the learned gate repeats: enough for it to have tried
-/// both its ways after the first.
+/// Runs a test of a table within one window repeats: enough for the learned
+/// gate to have tried both its ways.
 const GATE_REPEATS: usize = 12;
 
 /// Superfiles of the lone-phrase test that hold the whole phrase.
@@ -374,8 +373,10 @@ fn a_lone_phrase_rules_out_superfiles_holding_one_of_its_words() {
     opens_and_equal(&p, "\"barack obama\"", 10);
     for run in 1..REPEATS {
         let n = opens_and_equal(&p, "\"barack obama\"", 10);
-        assert_eq!(
-            n, PHRASE_HOLDERS as u64,
+        // The holders open, or are answered from the index once their
+        // phrase is probed; nothing else opens.
+        assert!(
+            n <= PHRASE_HOLDERS as u64,
             "run {run}: opened {n}, but only {PHRASE_HOLDERS} superfiles hold the phrase"
         );
     }

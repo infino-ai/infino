@@ -32,6 +32,7 @@ pub(crate) mod fine_graph_store;
 pub mod fts;
 #[cfg(feature = "graph-index")]
 pub mod graph;
+pub(crate) mod heads;
 pub mod hierarchical_iter;
 pub(crate) mod id_order;
 pub(crate) mod join_build_size;

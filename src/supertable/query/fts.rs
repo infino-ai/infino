@@ -150,6 +150,7 @@ use crate::{
                 candidate_plan_for_filters, hit_output_schema, resolve_hits_named,
                 take_file_columns, take_rows_byte_source,
             },
+            heads,
             match_order::MatchOrder,
             provider::{holds_no_postings, prune_leaves_for_filters},
             prune::{PruneLeaf, select_superfiles},
@@ -1078,6 +1079,71 @@ pub(crate) fn ceiling_can_compete(ceiling: f32, floor: f32) -> bool {
     ceiling.partial_cmp(&floor) != Some(std::cmp::Ordering::Less)
 }
 
+/// Wall a ranked query's opens may take before a query that accepts an
+/// approximate answer (a score tolerance above zero) takes one: past it,
+/// such a query whose bounds leave too many superfiles in play keeps only
+/// those that can matter most.
+const APPROXIMATE_BUDGET_NS: u64 = 60_000_000_000;
+/// What one open is taken to cost before the table has measured it: a
+/// cold read of a superfile's dictionary and postings from object storage.
+const UNMEASURED_OPEN_COST_NS: u64 = 50_000_000;
+/// Parts per million, the unit an approximate answer's gap is noted in.
+const PPM: f32 = 1_000_000.0;
+
+/// How many of a ranked query's superfiles to open, in descending bound
+/// order, and the gap that leaves.
+#[derive(Debug, PartialEq)]
+struct ApproximateCut {
+    keep: usize,
+    gap_ppm: u64,
+}
+
+/// Where to cut a ranked query's superfiles, `ceilings` in descending
+/// order, given its threshold `theta`, what an open costs and the caller's
+/// score `tolerance`. Every one is kept — the answer is exact — unless the
+/// caller accepts an approximate answer (`tolerance` above zero), a
+/// threshold is known, and opening those in play would run past
+/// [`APPROXIMATE_BUDGET_NS`]. Then first those bounded more than the
+/// tolerance above the threshold are kept; still past it, as many of those
+/// as fit, best first. The gap is the largest bound left unopened over the
+/// threshold, less one: no missed document scores further above the
+/// returned k-th score, which is at least the threshold.
+fn approximate_cut(
+    ceilings: &[f32],
+    theta: f32,
+    open_cost_ns: u64,
+    tolerance: f32,
+) -> ApproximateCut {
+    let exact = ApproximateCut {
+        keep: ceilings.len(),
+        gap_ppm: 0,
+    };
+    let accepts = tolerance.is_finite() && tolerance > 0.0;
+    let bounded = theta.is_finite() && theta > 0.0;
+    if !(accepts && bounded) {
+        return exact;
+    }
+    let per_open = match open_cost_ns {
+        0 => UNMEASURED_OPEN_COST_NS,
+        ns => ns,
+    };
+    let fit = (APPROXIMATE_BUDGET_NS / per_open).max(1) as usize;
+    let in_play = ceilings.iter().filter(|c| **c > theta).count();
+    if in_play <= fit {
+        return exact;
+    }
+    let past_tolerance = ceilings
+        .iter()
+        .filter(|c| **c > theta * (1.0 + tolerance))
+        .count();
+    let keep = past_tolerance.min(fit);
+    let gap_ppm = match ceilings.get(keep) {
+        None => 0,
+        Some(&next) => (((next / theta) - 1.0).max(0.0) * PPM).ceil() as u64,
+    };
+    ApproximateCut { keep, gap_ppm }
+}
+
 /// The score a superfile's ceiling is actually tested against: the running
 /// k-th score, raised by the caller's tolerance.
 ///
@@ -1567,12 +1633,13 @@ impl SupertableReader {
         // order, and its kernel seeds its own floor from its own blocks; the
         // merge would only cost its reads and rounds on every query, and the
         // gate its samples learning so.
-        let tiers_serve = index_column.is_some()
+        let rows_scoped = scope.is_some_and(|s| s.bounds_rows(&kept));
+        let index_serves = index_column.is_some()
             && kept.len() > 1
-            && scope.is_none_or(|s| !s.bounds_rows(&kept))
             && all_terms.len() <= tier::MAX_TIER_TERMS
             && manifest.term_index_complete()
             && !config::global().diagnostics.disable_tier_selection;
+        let tiers_serve = index_serves && !rows_scoped;
         // Whether to merge at all is the table's learned call per class of
         // query; the search is timed from here so the call can be judged.
         let rarest_idf = all_terms
@@ -1597,8 +1664,30 @@ impl SupertableReader {
         // decide how deep it reads. Within a window the table's learned
         // call stands.
         let forced = tiers_serve && kept.len() > manifest.options.ordered_open_window();
+        // Whether the index chooses this query's superfiles before any
+        // open: forced past one window, else the table's learned call for
+        // the class, which times the search with the index's reads against
+        // without them and keeps the cheaper. Level heads take the same
+        // call as tiers: on a table whose opens are cheap — warm, or few
+        // superfiles — reading a level per term and layer can cost more
+        // than the opens it saves, and only the measured walls say which.
         let merge_now =
             tiers_serve && (forced || !learned || self.tier_policy().merge(policy_class));
+        // A term index with level heads for every term the query scores
+        // serves a merge from them. A query whose scope admits only some
+        // rows keeps the ceilings' path, as it does without heads: the k-th
+        // score over every row is no floor for the admitted ones. A `WHERE`
+        // that only chooses superfiles is ranked over their rows and its
+        // predicate applied by the widening fill, as the tiers serve it. A
+        // negated query is bounded by its positive terms only, and takes
+        // the ceilings' path too.
+        let every_row = !rows_scoped && negatives.is_empty() && negative_phrases.is_empty();
+        let heads_serve = match (merge_now && every_row, index_column) {
+            (true, Some((index, column_id))) => heads::available(index, column_id, &all_terms)
+                .await
+                .unwrap_or(false),
+            _ => false,
+        };
         // The deny sets, resolved only for a merge: it reads past the
         // deleted rows, and the units then admit rows by the same sets, so
         // a delete committed between the two reads cannot leave the
@@ -1701,6 +1790,11 @@ impl SupertableReader {
                     required,
                     scoring,
                     phrases: tier_phrases,
+                    phrase_offsets: must_phrases
+                        .iter()
+                        .chain(should_phrases.iter())
+                        .map(|p| p.offsets.clone())
+                        .collect(),
                     // A negated phrase excludes as a negated term does: the
                     // heads cannot see the adjacency that unmakes a match.
                     negated: !negatives.is_empty() || !negative_phrases.is_empty(),
@@ -1713,6 +1807,8 @@ impl SupertableReader {
                     merge_gate: manifest.options.tier_merge_gate,
                     forced,
                     budget: Arc::clone(&manifest.options.connection_memory_budget),
+                    rows_scoped,
+                    score_tolerance,
                 });
             }
         }
@@ -2242,6 +2338,7 @@ impl SupertableReader {
                 units = units.len(),
                 resolved = tracing::field::Empty,
                 ruled_out = tracing::field::Empty,
+                approximate_skipped = tracing::field::Empty,
             )
         });
         let fanout_records = fanout_span.clone();
@@ -2280,6 +2377,7 @@ impl SupertableReader {
                     m
                 });
             let reader = self;
+            let open_cost_ns = self.open_cost_ns();
             let selected = &selected;
             let pruned = &pruned;
             // What a selection does to the units it is handed: the
@@ -2293,6 +2391,10 @@ impl SupertableReader {
                 if let Some(per_entry) = selection.merge_ns.checked_div(selection.entries_read) {
                     reader.note_tier_entry_cost(per_entry);
                 }
+                // A plan may be made twice, from the heads' reads and then
+                // from their probes, each from its own copies.
+                let (merged_ids, units_of, merger, span) =
+                    (merged_ids.clone(), units_of.clone(), Arc::clone(&merger), span.clone());
                 Box::new(move |remaining: dispatch::Units<UnitParams>| {
                     let bounds_of: HashMap<Uuid, tier::SuperfileBounds> =
                         merged_ids.iter().copied().zip(selection.bounds).collect();
@@ -2348,13 +2450,31 @@ impl SupertableReader {
                             .then(yl.total_cmp(xl))
                             .then(a.id_min.cmp(&b.id_min))
                     });
+                    // Exact unless the caller accepts an approximate answer
+                    // and opening what is still in play would run past the
+                    // budget; then approximate, with the gap noted.
+                    let ceilings: Vec<f32> = keep.iter().map(|(_, p, _)| p.ceiling).collect();
+                    let cut =
+                        approximate_cut(&ceilings, selection.theta_lb, open_cost_ns, score_tolerance);
+                    let cut_any = cut.keep < keep.len();
+                    if cut_any {
+                        let skipped = (keep.len() - cut.keep) as u64;
+                        keep.truncate(cut.keep);
+                        if let Some(stats) = &reader.op_stats {
+                            stats.add_approximate(skipped, cut.gap_ppm);
+                        }
+                        span.record("approximate_skipped", skipped);
+                    }
                     // The tiers' lower bound on the k-th score is a floor
                     // every kernel may prune against; the real scores that
                     // replace these placeholders only raise it. They stand
                     // for k real documents at `_id`s no higher than the
                     // threshold's, so a superfile that can only tie them and
-                    // holds only higher `_id`s is skipped on the tie.
-                    if selection.theta_lb.is_finite() {
+                    // holds only higher `_id`s is skipped on the tie. Not
+                    // after a cut: the documents they stand for may sit in a
+                    // superfile left unopened, and the answer would come back
+                    // short of k.
+                    if selection.theta_lb.is_finite() && !cut_any {
                         merger.merge(selection.theta_id_max, repeat_n(selection.theta_lb, k));
                     }
                     let resolved = answered.len() as u64;
@@ -2377,42 +2497,31 @@ impl SupertableReader {
             let unreadable = |e: term_index::TermIndexError| {
                 warn!(error = %e, "term-index tier unreadable; the query keeps its ceilings");
             };
-            let prepared = tier::prepare_merge(index, &query, &merge_kept, &global_idf, pool)
-                .await
-                .unwrap_or_else(|e| {
-                    unreadable(e);
-                    None
-                });
-            if prepared.is_none() {
-                declined.store(true, AtomicOrdering::Relaxed);
-            }
-            let window = manifest.options.ordered_open_window();
-            match prepared {
-                Some(prepared) if prepared.resident => {
-                    let selection = prepared.run(live_floor).await.unwrap_or_else(|e| {
+            // The level heads choose first, before any open; a query they
+            // cannot serve takes the tier merge.
+            let by_heads = match heads_serve {
+                true => heads::select(index, manifest, column, &query, &merge_kept, &global_idf)
+                    .await
+                    .unwrap_or_else(|e| {
                         unreadable(e);
                         None
-                    });
-                    if let Some(selection) = selection {
-                        let (keep, settled) = make_plan(selection)(units);
-                        units = keep;
-                        settled_before = settled;
-                    }
-                }
-                // On a table whose kept units all issue at once, a merge that
-                // must read its tiers would report after every open is under
-                // way and change none; its reads would only compete with the
-                // opens, and the gate would spend samples on a plan that
-                // cannot act. Its first wave is read without waiting, for the
-                // next query of these terms, and nothing is reported.
-                Some(prepared) if units.len() <= window => {
-                    prepared.prefetch(Arc::clone(index));
-                }
-                Some(prepared) => {
+                    }),
+                false => None,
+            };
+            if let Some(chosen) = by_heads {
+                let (keep, settled) = make_plan(chosen.now)(units);
+                units = keep;
+                settled_before = settled;
+                // Probes run beside the opens, which go in bound order; what
+                // they settle replaces the plan for the units not yet opened.
+                // Where every unit in play issues at once there are none such:
+                // the probes would add their reads to the opens' and change
+                // nothing.
+                let window = manifest.options.ordered_open_window();
+                if let Some(stage) = chosen.probes.filter(|_| units.len() > window) {
                     replan = Some(Box::pin(async move {
-                        match prepared.run(live_floor).await {
-                            Ok(Some(selection)) => Some(make_plan(selection)),
-                            Ok(None) => None,
+                        match stage.run().await {
+                            Ok(selection) => Some(make_plan(selection)),
                             Err(e) => {
                                 unreadable(e);
                                 None
@@ -2420,7 +2529,52 @@ impl SupertableReader {
                         }
                     }));
                 }
-                None => {}
+            } else {
+                let prepared = tier::prepare_merge(index, &query, &merge_kept, &global_idf, pool)
+                    .await
+                    .unwrap_or_else(|e| {
+                        unreadable(e);
+                        None
+                    });
+                if prepared.is_none() {
+                    declined.store(true, AtomicOrdering::Relaxed);
+                }
+                let window = manifest.options.ordered_open_window();
+                match prepared {
+                    Some(prepared) if prepared.resident => {
+                        let selection = prepared.run(live_floor).await.unwrap_or_else(|e| {
+                            unreadable(e);
+                            None
+                        });
+                        if let Some(selection) = selection {
+                            let (keep, settled) = make_plan(selection)(units);
+                            units = keep;
+                            settled_before = settled;
+                        }
+                    }
+                    // On a table whose kept units all issue at once, a merge that
+                    // must read its tiers would report after every open is under
+                    // way and change none; its reads would only compete with the
+                    // opens, and the gate would spend samples on a plan that
+                    // cannot act. Its first wave is read without waiting, for the
+                    // next query of these terms, and nothing is reported.
+                    Some(prepared) if units.len() <= window => {
+                        prepared.prefetch(Arc::clone(index));
+                    }
+                    Some(prepared) => {
+                        replan = Some(Box::pin(async move {
+                            match prepared.run(live_floor).await {
+                                Ok(Some(selection)) => Some(make_plan(selection)),
+                                Ok(None) => None,
+                                Err(e) => {
+                                    unreadable(e);
+                                    None
+                                }
+                            }
+                        }));
+                    }
+                    None => {}
+                }
             }
         }
         let per_unit = match !exact_count && ceilings.is_some() {
@@ -4622,7 +4776,65 @@ mod tests {
         time::Instant,
     };
 
+    use super::{APPROXIMATE_BUDGET_NS, ApproximateCut, UNMEASURED_OPEN_COST_NS, approximate_cut};
     use crate::supertable::manifest::ScalarStats;
+
+    /// The tolerance an over-budget query takes in the cuts below.
+    const TOLERANCE: f32 = 0.05;
+
+    /// Within the budget every superfile opens; past it, first those over
+    /// the tolerance, then as many as fit, and the gap bounds what is left.
+    #[test]
+    fn an_over_budget_query_keeps_what_can_matter_most() {
+        let per_open = APPROXIMATE_BUDGET_NS / 4;
+        // Four fit: every one opens, exactly.
+        let few = [3.0, 2.5, 2.0, 1.5];
+        assert_eq!(
+            approximate_cut(&few, 1.0, per_open, TOLERANCE),
+            ApproximateCut {
+                keep: 4,
+                gap_ppm: 0
+            }
+        );
+        // Bounds at or under the threshold never count against the budget.
+        let tied = [3.0, 2.0, 1.5, 1.2, 1.0, 1.0, 0.5];
+        assert_eq!(approximate_cut(&tied, 1.0, per_open, TOLERANCE).keep, 7);
+        // Six in play: the tolerance leaves those within 5% of the
+        // threshold, and the gap is the largest of them.
+        let near = [3.0, 2.0, 1.5, 1.2, 1.04, 1.02];
+        let cut = approximate_cut(&near, 1.0, per_open, TOLERANCE);
+        assert_eq!(cut.keep, 4);
+        assert!((cut.gap_ppm as f32 - 40_000.0).abs() < 2.0, "{cut:?}");
+        // Still past it: the four best open, the gap is the fifth's bound.
+        let many = [5.0, 4.0, 3.0, 2.5, 2.0, 1.5];
+        let cut = approximate_cut(&many, 1.0, per_open, TOLERANCE);
+        assert_eq!(cut.keep, 4);
+        assert_eq!(cut.gap_ppm, 1_000_000);
+        // Unmeasured opens are priced as cold reads.
+        let wide: Vec<f32> = (0..2000).map(|i| 3.0 - i as f32 * 1e-3).collect();
+        let fit = (APPROXIMATE_BUDGET_NS / UNMEASURED_OPEN_COST_NS) as usize;
+        assert_eq!(approximate_cut(&wide, 1.0, 0, TOLERANCE).keep, fit);
+    }
+
+    /// A query that did not accept an approximate answer, or one with no
+    /// threshold to bound the gap by, opens every superfile however far
+    /// past the budget its opens run.
+    #[test]
+    fn an_exact_or_unbounded_query_is_never_cut() {
+        let per_open = APPROXIMATE_BUDGET_NS / 4;
+        let many = [5.0, 4.0, 3.0, 2.5, 2.0, 1.5];
+        let exact = ApproximateCut {
+            keep: many.len(),
+            gap_ppm: 0,
+        };
+        for tolerance in [0.0, -1.0, f32::NAN] {
+            assert_eq!(approximate_cut(&many, 1.0, per_open, tolerance), exact);
+        }
+        assert_eq!(
+            approximate_cut(&many, f32::NEG_INFINITY, per_open, TOLERANCE),
+            exact
+        );
+    }
 
     #[test]
     fn match_walks_keep_the_dictionary_only_when_both_read_it() {

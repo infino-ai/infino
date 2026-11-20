@@ -127,7 +127,7 @@ use crate::{
             bm25,
             positions::{TermRuns, encode_group_runs, encode_run, skip_run},
             posting::{BLOCK_LEN, Block, EncodedBlock, block_lanes, encode_block_with},
-            reader::{ColumnLengthStats, TopKEntry, finish_head},
+            reader::{ColumnLengthStats, TopKEntry, finish_head, select_head},
             short::{SHORT_MAX_DF, encode_short},
             sorted_merge::{SortedInput, merge_column},
             tokenize::{StandardTokenizer, Tokenizer},
@@ -1903,9 +1903,9 @@ pub(crate) struct TermHeadFacts<'a> {
     pub(crate) bound: f32,
     /// The dictionary entry written for the term.
     pub(crate) entry: DictEntry,
-    /// The best documents by impact as `(row, term frequency, length
-    /// bucket)`, in descending impact then ascending blob document id, at
-    /// most the sink's depth, encoded by [`push_head`].
+    /// The best documents by impact as `(blob document id, term frequency,
+    /// length bucket)`, in descending impact then ascending id, at most the
+    /// sink's depth, encoded by [`push_head`].
     pub(crate) head: &'a [u8],
     /// The length-normalized term frequency — `tf / (tf + norm)` at this
     /// blob's average length and parameters, the factor a score multiplies
@@ -1917,13 +1917,17 @@ pub(crate) struct TermHeadFacts<'a> {
     pub(crate) avgdl: f32,
     /// The column's parameters, likewise.
     pub(crate) params: bm25::Bm25Params,
+    /// The largest term frequency per length bucket over every document of
+    /// the term in this blob, ascending by bucket.
+    pub(crate) buckets: &'a [(u8, u32)],
 }
 
 /// A term's head as the encoder gathers it.
 #[derive(Default, Clone)]
 struct HeadOut {
     df: u64,
-    /// The head's documents as `(row, term frequency, length bucket)`,
+    /// The head's documents as `(blob document id, term frequency, length
+    /// bucket)`,
     /// encoded by [`push_head`] where the term is encoded, so the thread
     /// that writes terms in order only copies them.
     facts: Vec<u8>,
@@ -1932,6 +1936,40 @@ struct HeadOut {
     /// The average length and parameters `tail` is keyed at.
     avgdl: f32,
     params: bm25::Bm25Params,
+    /// The largest term frequency per length bucket over every document of
+    /// the term, ascending by bucket, one pair per bucket it occurs in.
+    buckets: Vec<(u8, u32)>,
+    /// Per bucket, the largest term frequency seen so far for the term
+    /// being gathered; zero where none. Reset through `buckets` after each
+    /// term, so a rare term does not clear the whole table.
+    bucket_scratch: Vec<u32>,
+}
+
+/// A term with at most this many documents in a blob keeps every one in
+/// its head: a rare term is then listed whole by the table's index, and a
+/// query bounds it by its own list.
+pub(crate) const WHOLE_HEAD_MAX_DF: u64 = 2048;
+/// A term with more keeps the best `1 / HEAD_DEPTH_DIVISOR` of them, never
+/// fewer than [`WHOLE_HEAD_MAX_DF`]: deep enough that the table's index,
+/// which cuts each layer's head at the same share, finds every document of
+/// its cut in some superfile's head.
+pub(crate) const HEAD_DEPTH_DIVISOR: u64 = 8;
+/// A head at least `1 / HEAD_SELECT_SHARE` of its term's documents is cut
+/// by one partition of all of them rather than a heap of the kept ones: a
+/// heap of millions costs a logarithm per document, a partition a pass.
+const HEAD_SELECT_SHARE: usize = 16;
+/// Length buckets: the one-byte codes [`bm25::quantize_len`] gives.
+const LEN_BUCKETS: usize = 1 << u8::BITS;
+
+/// How deep a term with `df` documents keeps its head: all of them up to
+/// [`WHOLE_HEAD_MAX_DF`], else the top `1 / HEAD_DEPTH_DIVISOR`, never
+/// fewer than [`WHOLE_HEAD_MAX_DF`].
+pub(crate) fn proportional_head_depth(df: u64) -> u64 {
+    if df <= WHOLE_HEAD_MAX_DF {
+        df
+    } else {
+        df.div_ceil(HEAD_DEPTH_DIVISOR).max(WHOLE_HEAD_MAX_DF)
+    }
 }
 
 /// Keep a term's best `depth` documents by `scores` (one per posting, as
@@ -1947,18 +1985,12 @@ fn term_head(
     kept: &mut Vec<((u32, u32), f32)>,
     out: &mut HeadOut,
 ) {
-    let depth = enc.head_depth;
-    heap.clear();
+    // The configured depth is a floor: a common term keeps its share.
+    let depth = enc
+        .head_depth
+        .max(proportional_head_depth(pairs.len() as u64) as usize);
     out.df = pairs.len() as u64;
-    for (&(doc, tf), &score) in pairs.iter().zip(scores) {
-        if heap.len() <= depth {
-            heap.push(TopKEntry(score, (doc, tf)));
-        } else if let Some(mut worst) = heap.peek_mut()
-            && score > worst.0
-        {
-            *worst = TopKEntry(score, (doc, tf));
-        }
-    }
+    term_bucket_maxima(pairs, enc.doc_lengths, out);
     // The key of a document: what the term index orders its tiers by.
     let key = |(doc, tf): (u32, u32)| {
         bm25::tf_factor(
@@ -1967,17 +1999,61 @@ fn term_head(
                 .dl_norm_k1(bm25::stored_len(enc.doc_lengths[doc as usize]), enc.avgdl),
         )
     };
-    (out.bound, out.tail) = finish_head(heap, depth, kept, key);
+    (out.bound, out.tail) = match depth.saturating_mul(HEAD_SELECT_SHARE) >= pairs.len() {
+        true => select_head(
+            pairs.iter().copied().zip(scores.iter().copied()),
+            depth,
+            kept,
+            key,
+        ),
+        false => {
+            heap.clear();
+            for (&(doc, tf), &score) in pairs.iter().zip(scores) {
+                if heap.len() <= depth {
+                    heap.push(TopKEntry(score, (doc, tf)));
+                } else if let Some(mut worst) = heap.peek_mut()
+                    && score > worst.0
+                {
+                    *worst = TopKEntry(score, (doc, tf));
+                }
+            }
+            finish_head(heap, depth, kept, key)
+        }
+    };
     out.facts.clear();
     push_head(
         &mut out.facts,
-        kept.iter().map(|&((doc, tf), _)| {
-            let row = enc.rows.map_or(doc, |rows| rows[doc as usize]);
-            (row, tf, bm25::quantize_len(enc.doc_lengths[doc as usize]))
-        }),
+        // Documents by the blob's own id, which its postings use: a probe
+        // finds one in them without the row map.
+        kept.iter()
+            .map(|&((doc, tf), _)| (doc, tf, bm25::quantize_len(enc.doc_lengths[doc as usize]))),
     );
     out.avgdl = enc.avgdl;
     out.params = enc.params;
+}
+
+/// Gather `out.buckets`: the largest term frequency per length bucket over
+/// every document of the term.
+fn term_bucket_maxima(pairs: &[(u32, u32)], doc_lengths: &[u32], out: &mut HeadOut) {
+    if out.bucket_scratch.len() != LEN_BUCKETS {
+        out.bucket_scratch = vec![0; LEN_BUCKETS];
+    }
+    let table = &mut out.bucket_scratch;
+    out.buckets.clear();
+    for &(doc, tf) in pairs {
+        let bucket = bm25::quantize_len(doc_lengths[doc as usize]);
+        let slot = &mut table[usize::from(bucket)];
+        if *slot == 0 {
+            out.buckets.push((bucket, tf));
+        }
+        *slot = (*slot).max(tf);
+    }
+    out.buckets.sort_unstable_by_key(|&(bucket, _)| bucket);
+    for (bucket, tf) in &mut out.buckets {
+        let slot = &mut table[usize::from(*bucket)];
+        *tf = *slot;
+        *slot = 0;
+    }
 }
 
 impl Default for FtsBuilder {
@@ -3148,7 +3224,6 @@ impl FtsBuilder {
                 n_scored_docs: n_scored,
                 heads: head_sink.is_some(),
                 head_depth,
-                rows: doc_map.as_deref(),
             };
 
             // In-RAM path invariant: the dispatcher checked that no column
@@ -3349,7 +3424,6 @@ impl FtsBuilder {
                 n_scored_docs: n_scored,
                 heads: head_sink.is_some(),
                 head_depth,
-                rows: doc_map.as_deref(),
             };
 
             let mut sink = TermSink {
@@ -4718,8 +4792,6 @@ struct TermEncoding<'a> {
     /// Whether a head is gathered for each term, and how deep.
     heads: bool,
     head_depth: usize,
-    /// The row each blob document id stands for, when they differ.
-    rows: Option<&'a [u32]>,
 }
 
 /// A term encoded on a worker thread, its bytes taken out of that
@@ -5125,6 +5197,7 @@ fn write_term<W: Write>(
                 tail: head.tail,
                 avgdl: head.avgdl,
                 params: head.params,
+                buckets: &head.buckets,
             },
         )?;
     }
@@ -6748,26 +6821,35 @@ mod tests {
         assert_eq!(shared_body, BLOCK_LEN as u64 + 9);
     }
 
-    /// A term's head names each document it keeps by the row it stands
-    /// for, with the document's own term frequency and its own length,
-    /// quantized: in a blob whose documents are renumbered, the length is
-    /// looked up by document, not by row. It keeps the best-scoring
-    /// documents, as many as the depth.
+    /// A term's head names each document it keeps by the blob's own id —
+    /// what its postings use, so a probe finds it there — with the
+    /// document's own term frequency and its own length, quantized. It
+    /// keeps the best-scoring
+    /// documents, as many as the depth: the configured one, or the term's
+    /// proportional share when that is deeper.
     #[test]
-    fn a_head_names_its_documents_by_row_with_their_own_lengths() {
-        /// Documents holding the term.
-        const DOCS: u32 = 12;
+    fn a_head_names_its_documents_by_blob_id_with_their_own_lengths() {
+        /// Documents holding the term: past the whole-list size, so the
+        /// head is cut.
+        const DOCS: u32 = 3 * WHOLE_HEAD_MAX_DF as u32;
+        /// The configured depth, shallower than the term's share.
+        const MIN_DEPTH: usize = 4;
         /// Documents the head keeps.
-        const DEPTH: usize = 4;
-        /// Length step between documents, so no two share a length.
-        const LEN_STEP: u32 = 37;
-        /// Term frequencies cycle through this many values.
-        const TF_CYCLE: u32 = 5;
-        let doc_lengths: Vec<u32> = (0..DOCS).map(|d| 1 + d * LEN_STEP).collect();
+        const DEPTH: usize = WHOLE_HEAD_MAX_DF as usize;
+        /// Length step between documents' lengths.
+        const LEN_STEP: u32 = 3;
+        /// Lengths cycle through this many values.
+        const LEN_CYCLE: u32 = 7;
+        /// The term frequency of the documents the head must keep.
+        const HIGH_TF: u32 = 20;
+        // Lengths repeat over a few short values the norm table holds
+        // exactly; the first DEPTH documents carry the term far more often,
+        // so they outscore every other document whatever its length.
+        let doc_lengths: Vec<u32> = (0..DOCS).map(|d| 1 + (d % LEN_CYCLE) * LEN_STEP).collect();
         let avgdl = doc_lengths.iter().sum::<u32>() as f32 / DOCS as f32;
-        // Blob document d stands for row DOCS - 1 - d.
-        let rows: Vec<u32> = (0..DOCS).rev().collect();
-        let pairs: Vec<(u32, u32)> = (0..DOCS).map(|d| (d, 1 + d % TF_CYCLE)).collect();
+        let pairs: Vec<(u32, u32)> = (0..DOCS)
+            .map(|d| (d, if (d as usize) < DEPTH { HIGH_TF } else { 1 }))
+            .collect();
         let params = bm25::Bm25Params::default();
         let enc = TermEncoding {
             doc_lengths: &doc_lengths,
@@ -6775,9 +6857,9 @@ mod tests {
             params,
             n_scored_docs: DOCS,
             heads: true,
-            head_depth: DEPTH,
-            rows: Some(&rows),
+            head_depth: MIN_DEPTH,
         };
+        assert_eq!(proportional_head_depth(u64::from(DOCS)) as usize, DEPTH);
         let idf = bm25::idf(u64::from(DOCS), pairs.len() as u64);
         let scores: Vec<f32> = pairs
             .iter()
@@ -6810,13 +6892,12 @@ mod tests {
         assert_eq!(head.len(), DEPTH);
         let mut kept: Vec<u32> = head
             .iter()
-            .map(|&(row, tf, len)| {
-                let doc = DOCS - 1 - row;
-                assert_eq!(tf, pairs[doc as usize].1, "row {row}'s own tf");
+            .map(|&(doc, tf, len)| {
+                assert_eq!(tf, pairs[doc as usize].1, "document {doc}'s own tf");
                 assert_eq!(
                     len,
                     bm25::quantize_len(doc_lengths[doc as usize]),
-                    "row {row}'s own length"
+                    "document {doc}'s own length"
                 );
                 doc
             })

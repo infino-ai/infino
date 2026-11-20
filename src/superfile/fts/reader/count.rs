@@ -34,11 +34,19 @@ use crate::{
         ReadError,
         error::FtsError,
         format::fts::U32_BYTES,
-        fts::{bm25, builder::TERM_META_SIZE, short::short_df, tokenize::Phrase},
-        id_space::{DocMap, FtsDocId, RowId},
+        fts::{
+            bm25,
+            builder::{TERM_META_SIZE, proportional_head_depth},
+            short::short_df,
+            tokenize::Phrase,
+        },
+        id_space::{FtsDocId, RowId},
     },
     utils::terms::{DictEntry, make_key},
 };
+
+/// Length buckets: the one-byte codes the length quantizer gives.
+const LEN_BUCKETS: usize = 1 << u8::BITS;
 
 /// Planned dictionary reads for a cursor build over `tokens`: none when a
 /// memo already resolves every token, one otherwise.
@@ -76,6 +84,9 @@ pub(crate) struct TermHead {
     /// file's average length and parameters — of the best document not in
     /// `docs`; `0.0` when `docs` is the term's whole posting list here.
     pub(crate) tail: f32,
+    /// The largest term frequency per length bucket over every document of
+    /// the term here, ascending by bucket.
+    pub(crate) buckets: Vec<(u8, u32)>,
 }
 
 impl FtsReader {
@@ -633,12 +644,6 @@ impl FtsReader {
                 Some(dict_bytes),
             )
             .await?;
-        // A head names its documents by row, so a term with postings here
-        // needs the doc-id map; terms this file lacks read none of it.
-        let doc_map = match cursors.iter().any(Option::is_some) {
-            true => Some(self.ensure_doc_map().await?),
-            false => None,
-        };
         let norms = col_meta.dl_norm_k1();
         Ok(entries
             .into_iter()
@@ -647,7 +652,7 @@ impl FtsReader {
                 let mut cursor = cursor?;
                 // A depth of zero is read as one: an empty head would read
                 // as a term no document carries.
-                let (head, bound) = self.head_of(&mut cursor, norms, doc_map?, head_depth.max(1));
+                let (head, bound) = self.head_of(&mut cursor, norms, head_depth.max(1));
                 Some(TermIndexFact {
                     df: cursor.df,
                     bound,
@@ -663,27 +668,24 @@ impl FtsReader {
     /// the term's bound here. Blocks whose maximum cannot beat the running
     /// `depth`-th impact are skipped undecoded, as the single-term search
     /// skips them; the cursor is consumed.
-    fn head_of(
-        &self,
-        cursor: &mut TermCursor,
-        norms: &NormTable,
-        doc_map: &DocMap,
-        depth: usize,
-    ) -> (TermHead, f32) {
+    fn head_of(&self, cursor: &mut TermCursor, norms: &NormTable, depth: usize) -> (TermHead, f32) {
+        // A common term keeps its proportional share, as a build's head
+        // does, so a table rebuilt from its superfiles gets the heads a
+        // fresh build would.
+        let depth = depth.max(proportional_head_depth(cursor.df) as usize);
         // Most terms have a document or two: the heap is sized by what the
         // term has, up to the depth and the tail.
         let mut heap: BinaryHeap<TopKEntry<(FtsDocId, u32)>> =
             BinaryHeap::with_capacity((depth + 1).min(cursor.df as usize + 1));
+        let buckets = norms.buckets();
+        // The largest tf per length bucket over every document: no block
+        // is skipped, since a skipped one could hold a bucket's largest.
+        let mut bucket_max = [0u32; LEN_BUCKETS];
         while !cursor.is_exhausted() {
-            if heap.len() > depth
-                && let Some(TopKEntry(min, _)) = heap.peek()
-                && cursor.current_block_max_bm25() <= *min
-            {
-                cursor.skip_blocks_under(0.0, *min, u32::MAX);
-                continue;
-            }
             let doc = cursor.current_doc_id();
             let tf = cursor.current_tf();
+            let slot = &mut bucket_max[usize::from(buckets[doc as usize])];
+            *slot = (*slot).max(tf);
             let score = bm25::score_with_dl_norm_k1(cursor.idf_weight, tf, norms.get(doc));
             if heap.len() <= depth {
                 heap.push(TopKEntry(score, (FtsDocId::new(doc), tf)));
@@ -699,12 +701,24 @@ impl FtsReader {
         let key = |(id, tf): (FtsDocId, u32)| bm25::tf_factor(tf, norms.get(id.get()));
         let mut hits = Vec::new();
         let (bound, tail) = finish_head(&mut heap, depth, &mut hits, key);
-        let buckets = norms.buckets();
         let docs = hits
             .into_iter()
-            .map(|((id, tf), _)| (doc_map.row_of(id).get(), tf, buckets[id.get() as usize]))
+            .map(|((id, tf), _)| (id.get(), tf, buckets[id.get() as usize]))
             .collect();
-        (TermHead { docs, tail }, bound)
+        let buckets = bucket_max
+            .iter()
+            .enumerate()
+            .filter(|(_, tf)| **tf > 0)
+            .map(|(b, tf)| (b as u8, *tf))
+            .collect();
+        (
+            TermHead {
+                docs,
+                tail,
+                buckets,
+            },
+            bound,
+        )
     }
 
     /// Up to `limit` of `column`'s terms after `after` (from the first when
@@ -735,8 +749,6 @@ impl FtsReader {
         }
         entries.truncate(limit);
         self.ensure_norms(column_id).await?;
-        // Every term walked here has a document, and a head names it by row.
-        let doc_map = self.ensure_doc_map().await?;
         let col_meta = &self.columns[column_id as usize];
         let mut out = Vec::with_capacity(entries.len());
         let mut with_postings: Vec<usize> = Vec::new();
@@ -748,13 +760,11 @@ impl FtsReader {
                     // out.
                     let tf = col_meta.inline_tf(tf);
                     let bound = bm25::tf_factor(tf, col_meta.dl_norm_k1().get(doc_id));
+                    let bucket = col_meta.dl_norm_k1().buckets()[doc_id as usize];
                     let head = TermHead {
-                        docs: vec![(
-                            doc_map.row_of(FtsDocId::new(doc_id)).get(),
-                            tf,
-                            col_meta.dl_norm_k1().buckets()[doc_id as usize],
-                        )],
+                        docs: vec![(doc_id, tf, bucket)],
                         tail: 0.0,
+                        buckets: vec![(bucket, tf)],
                     };
                     Some(TermIndexFact {
                         df: 1,
@@ -1915,8 +1925,10 @@ mod tests {
         for (term, fact) in facts {
             let term = std::str::from_utf8(&term).expect("utf8").to_owned();
             let fact = fact.expect("every term has a fact");
+            // A common term keeps its proportional share past the depth asked.
+            let depth = DEPTH.max(proportional_head_depth(fact.df) as usize);
             let ranked = r
-                .search_with_floor("body", &[&term], DEPTH + 1, BoolMode::Or, f32::NEG_INFINITY)
+                .search_with_floor("body", &[&term], depth + 1, BoolMode::Or, f32::NEG_INFINITY)
                 .await
                 .expect("ranked");
             // The head carries facts; scored with the file's own norms and
@@ -1934,19 +1946,19 @@ mod tests {
                 .collect();
             let want: Vec<(u32, f32)> = ranked
                 .iter()
-                .take(DEPTH)
+                .take(depth)
                 .map(|(row, s)| (row.get(), *s))
                 .collect();
-            assert_eq!(got, want, "head of {term:?} is the top-{DEPTH}");
+            assert_eq!(got, want, "head of {term:?} is the top-{depth}");
             let df = fact.df as usize;
             assert_eq!(
                 fact.head.tail == 0.0,
-                df <= DEPTH,
+                df <= depth,
                 "{term:?}: df {df} leaves a tail only past the depth"
             );
             // The tail is the key of the first document left out: its score
             // over the idf, which the ranking only knows as a product.
-            let want_tail = match ranked.get(DEPTH) {
+            let want_tail = match ranked.get(depth) {
                 Some((_, s)) => *s,
                 None => 0.0,
             };
