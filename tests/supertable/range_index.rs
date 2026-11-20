@@ -1010,7 +1010,7 @@ fn a_count_of_present_rows_counts_values_not_nulls() {
         ),
         ("edges_empty", IndexSpec::new(), true),
     ];
-    for (table, spec, empty) in tables {
+    for (table, spec, empty) in tables.clone() {
         db.create_table(table, Arc::clone(&schema), spec)
             .expect("create");
         let mut late = FieldPatch::named("late").with_type(DataType::Int64);
