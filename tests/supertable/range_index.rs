@@ -51,6 +51,9 @@ const FIRST_DAY: i32 = 19_000;
 const DAYS: i64 = 365;
 /// Rows the delete removes: those with `seq` below this.
 const DELETED_BELOW: i64 = 500;
+/// Rows of the second superfile a later delete removes: more than half, so
+/// their statistics are not read and that superfile is left to the scan.
+const MOST_OF_A_FILE: i64 = 2000;
 /// The physical operator a scan's rows pass through when a filter is
 /// checked on them; a count the range index answers has none.
 const FILTER_OPERATOR: &str = "FilterExec";
@@ -104,6 +107,7 @@ const QUERIES: &[&str] = &[
     "SELECT count(*) AS n FROM {t} WHERE price IS NOT NULL",
     "SELECT count(*) AS n FROM {t} WHERE qty IS NOT NULL AND qty > 100",
     "SELECT count(*) AS n FROM {t} WHERE qty IS NOT NULL AND qty >= -100 AND qty < 100",
+    QTY_PRESENT_AGGREGATES,
     "SELECT seq, qty FROM {t} WHERE qty IS NOT NULL ORDER BY qty DESC NULLS LAST, seq LIMIT 7",
     "SELECT seq, qty FROM {t} WHERE qty IS NOT NULL ORDER BY qty ASC NULLS FIRST, seq LIMIT 7",
 ];
@@ -157,6 +161,10 @@ const INDEX_COUNT: &str = "projection=[], full_filters=";
 const QTY_PRESENT: &str = "SELECT count(*) FROM {t} WHERE qty IS NOT NULL";
 /// The same beside a range on the column, which already leaves out nulls.
 const QTY_PRESENT_IN_RANGE: &str = "SELECT count(*) FROM {t} WHERE qty IS NOT NULL AND qty > 100";
+/// Aggregates the `IS NOT NULL` changes none of: each skips nulls. (A `SUM`
+/// of the `Int32` column reads as a sum of its cast, which no statistic
+/// answers, filtered or not.)
+const QTY_PRESENT_AGGREGATES: &str = "SELECT count(*) AS n, min(qty) AS lo, max(qty) AS hi, avg(qty) AS a FROM {t} WHERE qty IS NOT NULL";
 
 /// The shapes both tables answer once `qty` is renamed `amount` and a new
 /// `qty` is added: the range index follows `amount`, and the new `qty`
@@ -483,11 +491,13 @@ fn a_range_indexed_table_answers_as_a_scan_does_through_deletes_compaction_and_r
     // no row is read at all. Beside a range on the column, the `IS NOT NULL`
     // narrows nothing, and the range is counted without checking a row.
     for table in ["plain", "ranged"] {
-        let plan = answer(&db, &format!("EXPLAIN {QTY_PRESENT}"), table);
-        assert!(
-            !plan.contains(FILTER_OPERATOR) && !plan.contains(LOGICAL_SCAN),
-            "{table}: {plan}"
-        );
+        for query in [QTY_PRESENT, QTY_PRESENT_AGGREGATES] {
+            let plan = answer(&db, &format!("EXPLAIN {query}"), table);
+            assert!(
+                !plan.contains(FILTER_OPERATOR) && !plan.contains(LOGICAL_SCAN),
+                "{table}: {plan}"
+            );
+        }
     }
     let plan = answer(&db, &format!("EXPLAIN {QTY_PRESENT_IN_RANGE}"), "ranged");
     assert!(!plan.contains(FILTER_OPERATOR), "{plan}");
@@ -548,7 +558,32 @@ fn a_range_indexed_table_answers_as_a_scan_does_through_deletes_compaction_and_r
             .expect("delete");
     }
     assert_same_answers(&db, QUERIES, "after a delete");
-    // With deletes, a range-indexed column's present rows come from its index.
+    // The deleted rows' statistics correct the null counts: still no scan.
+    for table in ["plain", "ranged"] {
+        let plan = answer(&db, &format!("EXPLAIN {QTY_PRESENT}"), table);
+        assert!(!plan.contains(LOGICAL_SCAN), "{table}: {plan}");
+    }
+
+    // Past half a superfile, its deleted rows' statistics are not read: the
+    // range index counts that superfile's present rows, the statistics the
+    // rest, and the plain table scans it.
+    for table in ["plain", "ranged"] {
+        db.open_table(table)
+            .expect("open")
+            .delete(
+                col("seq")
+                    .gt_eq(lit(ROWS_PER_FILE))
+                    .and(col("seq").lt(lit(ROWS_PER_FILE + MOST_OF_A_FILE))),
+            )
+            .expect("delete");
+    }
+    for query in [QTY_PRESENT, QTY_PRESENT_AGGREGATES] {
+        assert_eq!(
+            answer(&db, query, "ranged"),
+            answer(&db, query, "plain"),
+            "{query}"
+        );
+    }
     let plan = answer(&db, &format!("EXPLAIN {QTY_PRESENT}"), "ranged");
     assert!(
         plan.contains(INDEX_COUNT) && !plan.contains(FILTER_OPERATOR),

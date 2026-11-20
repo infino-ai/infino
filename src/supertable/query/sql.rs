@@ -905,33 +905,35 @@ impl SupertableReader {
         // One read of each superfile's deleted rows for every predicate, so
         // the counts agree with each other as one aggregate's would.
         let provider = op_stats::suppressed(|| self.sql_provider()).reading_tombstones_once();
+        // Each predicate's count when the statistics give it, else what the
+        // index counts it from.
+        let mut known = vec![None; predicates.len()];
         if predicates
             .iter()
             .any(|predicate| lone_not_null_column(predicate).is_some())
         {
-            // The statistics answer from the whole manifest in memory and
-            // each superfile's deleted rows; the count reads both anyway.
-            // Only fetching them waits on the runtime.
+            // The statistics answer from the whole manifest in memory, each
+            // superfile's deleted rows and those rows' statistics; the count
+            // reads them anyway. Only fetching them waits on the runtime.
+            let state = self.sql_session_context()?.state();
             self.block_on(async {
                 provider.load_every_part().await?;
                 if provider.may_have_deletes() {
                     provider.prefetch_listed_tombstones().await;
                 }
+                for (predicate, count) in predicates.iter().zip(&mut known) {
+                    if let Some(column) = lone_not_null_column(predicate) {
+                        *count = non_null_count(&provider, &state, column).await;
+                    }
+                }
                 Ok::<_, QueryError>(())
             })?;
         }
-        // Each predicate's count when the statistics give it, else what the
-        // index counts it from.
-        let mut known = Vec::with_capacity(predicates.len());
         let mut counted = Vec::with_capacity(predicates.len());
-        for predicate in predicates {
-            if let Some(count) =
-                lone_not_null_column(predicate).and_then(|column| non_null_count(&provider, column))
-            {
-                known.push(Some(count));
+        for (predicate, count) in predicates.iter().zip(&known) {
+            if count.is_some() {
                 continue;
             }
-            known.push(None);
             if matches!(
                 predicate,
                 Expr::Literal(ScalarValue::Boolean(Some(true)), _)
