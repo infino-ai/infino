@@ -47,9 +47,10 @@ use datafusion::common::DFSchema;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::Expr;
 use infino::{
-    Bm25SearchOptions, BoolMode, ColdFetchMode, CompactionSettings, GcError, InfinoError, Metric,
-    OptimizeError, OptimizeOptions as InfinoOptimizeOptions, RecalibratePolicy, ReindexError,
-    ReindexMode, ReindexOptions as InfinoReindexOptions, SchemaPatch, Stemmer, Stopwords,
+    Bm25FieldsOptions, Bm25SearchOptions, BoolMode, ColdFetchMode, CompactionSettings, GcError,
+    InfinoError, Metric, OptimizeError, OptimizeOptions as InfinoOptimizeOptions,
+    RecalibratePolicy, ReindexError, ReindexMode, ReindexOptions as InfinoReindexOptions,
+    SchemaPatch, Stemmer, Stopwords,
 };
 
 // ---------------------------------------------------------------------------
@@ -581,6 +582,16 @@ pub struct OptimizeOptions {
     /// rerank pool lags), `"force"` (always), or `"skip"` (never; storage
     /// compaction still runs). Omit for `"auto"`.
     pub recalibrate: Option<String>,
+}
+
+/// One clause of `bm25SearchFields`: a query text and the full-text columns
+/// it searches.
+#[napi(object)]
+pub struct FieldClause {
+    /// The clause's query text, read as `bm25Search` reads a query.
+    pub query: String,
+    /// The full-text columns the clause searches.
+    pub fields: Vec<String>,
 }
 
 /// Row counts from an `update` / `delete`.
@@ -1208,6 +1219,44 @@ impl Table {
         let batches = self
             .inner
             .bm25_search(&column, &query, k as usize, opts, proj.as_deref())
+            .map_err(map_err)?;
+        batches_to_ipc(&batches)
+    }
+
+    /// BM25 over several full-text columns at once, scored *best fields*.
+    /// Each clause scores a row by its best column (the largest
+    /// `weight × BM25` among the clause's `fields`), and the row's score is
+    /// the sum over the clauses it matches: one `dis_max` (tie breaker 0)
+    /// per clause, summed, as a multi-field `query_string` or `multi_match`
+    /// of type `best_fields` ranks. `mode` is `"or"` (default: a row
+    /// matching any clause is a hit) or `"and"` (it must match every
+    /// clause), and is also the mode of each clause's bare terms.
+    /// `weights` multiplies each named column's scores (1 for a column it
+    /// does not name). Returns rows like `bm25Search`, best first, ties by
+    /// ascending `_id`.
+    #[napi]
+    pub fn bm25_search_fields(
+        &self,
+        clauses: Vec<FieldClause>,
+        k: u32,
+        mode: Option<String>,
+        weights: Option<HashMap<String, f64>>,
+        projection: Option<Vec<String>>,
+    ) -> Result<Buffer> {
+        let mut opts = Bm25FieldsOptions::new().with_mode(parse_mode(mode.as_deref())?);
+        for (column, weight) in weights.unwrap_or_default() {
+            opts = opts.with_weight(column, weight as f32);
+        }
+        let clauses: Vec<infino::FieldClause> = clauses
+            .into_iter()
+            .map(|c| infino::FieldClause::new(c.query, c.fields))
+            .collect();
+        let proj: Option<Vec<&str>> = projection
+            .as_ref()
+            .map(|v| v.iter().map(String::as_str).collect());
+        let batches = self
+            .inner
+            .bm25_search_fields(&clauses, k as usize, &opts, proj.as_deref())
             .map_err(map_err)?;
         batches_to_ipc(&batches)
     }

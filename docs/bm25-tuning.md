@@ -147,6 +147,41 @@ Two limits are worth planning around:
 Both are reasons to bake a pair you have settled on: it is the only way
 every query path gets it.
 
+## Ranking one query over several columns
+
+`bm25_search_fields` ranks a query over several full-text columns the
+way a *best fields* search does: each clause scores a row by its best
+column (a `dis_max` with no tie breaker), and a row scores the sum of
+the clauses it matches. Each column keeps its own analyzer and its own
+`k1`/`b`, and the statistics are the table's, so a row scores the same
+however the table is split into superfiles.
+
+```rust
+use infino::{Bm25FieldsOptions, FieldClause};
+
+let clauses = [
+    FieldClause::new("error", ["title", "body"]),
+    FieldClause::new("timeout", ["body"]),
+];
+let opts = Bm25FieldsOptions::new().with_weight("title", 2.0);
+let hits = docs.bm25_search_fields(&clauses, 10, &opts, Some(&["_id", "score"]))?;
+```
+
+```sql
+SELECT _id, score
+FROM bm25_search_fields('docs',
+       '[{"query": "error", "fields": ["title", "body"]},
+         {"query": "timeout", "fields": ["body"]}]',
+       10, 'or', '{"title": 2.0}');
+```
+
+The top `k` is exact: it is the same as searching every (clause, column)
+pair for all of its matches and merging them, but the search stops once
+no row it has not scored can reach the `k`th score. A weight multiplies
+a column's scores; a weight on a column no clause searches has no effect.
+Under `'and'` a row must match every clause, and a
+column matches a clause only when it holds every bare term of it.
+
 ## Baking the pair into the index
 
 Declare the pair on the column when you create the table
@@ -566,6 +601,7 @@ Two debugging helpers repay the time they take:
 | Per-superfile derived-view memo | [`src/superfile/reader.rs`](../src/superfile/reader.rs) |
 | Query fan-out, table-wide statistics, query syntax | [`src/supertable/query/fts.rs`](../src/supertable/query/fts.rs) |
 | SQL search table functions | [`src/supertable/query/exec/fts_exec.rs`](../src/supertable/query/exec/fts_exec.rs), [`src/catalog/search_tvf.rs`](../src/catalog/search_tvf.rs) |
+| Multi-field (best fields) BM25 and its table function | [`src/supertable/query/multi_field.rs`](../src/supertable/query/multi_field.rs), [`src/supertable/query/exec/fields_exec.rs`](../src/supertable/query/exec/fields_exec.rs) |
 | Public search surface | [`src/catalog/table.rs`](../src/catalog/table.rs) |
 
 See also [`docs/architecture/superfile.md`](./architecture/superfile.md) for the
