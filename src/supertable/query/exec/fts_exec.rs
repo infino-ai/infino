@@ -577,9 +577,11 @@ pub(crate) fn arg_to_bool_mode(expr: &Expr) -> DfResult<BoolMode> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use arrow_array::{Array, Float32Array, Int64Array, LargeStringArray, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
-    use datafusion::prelude::{col, lit};
+    use datafusion::prelude::{col, lit, lower};
 
     use super::*;
     use crate::{
@@ -1443,6 +1445,171 @@ mod tests {
         let allow = scope.allow.expect("a bounded plan resolves rows");
         let rows: u64 = allow.values().map(|bm| bm.len()).sum();
         assert_eq!(rows, 4, "every row of the survivor holds the term-AND");
+    }
+
+    /// Distinct tags in the last superfile of [`tag_u_supertable`]: past what the manifest's exact
+    /// value table for a superfile keeps (128 KiB of values).
+    const MANY_DISTINCT_TAGS: usize = 20_000;
+
+    /// Five superfiles with text-indexed `tag` and `u` and range-indexed `n`, in commit order:
+    ///
+    /// | superfile | tag                              | u     | n      |
+    /// |-----------|----------------------------------|-------|--------|
+    /// | 0         | a a a a                          | y ... | 0-3    |
+    /// | 1         | b rare b rare                    | x x y y | 10-13 |
+    /// | 2         | c c c c                          | x ... | 20-23  |
+    /// | 3         | b c z z, then `w0` to `w19999`   | y ... | from 30 |
+    /// | 4         | !! !! d d                        | v ... | from 20,034 |
+    ///
+    /// Only superfile 1 holds `rare`, and one row of it holds `rare` beside `x`. Superfile 3 holds
+    /// words of several values without holding any one value's words together, and so many
+    /// distinct values that the manifest keeps no exact table of them: a value set checks it by
+    /// its min/max range alone. Superfile 4 holds `!!`, a value with no words.
+    /// On local storage, so commits build the table's term index and a word routes to exactly the
+    /// superfiles holding it; the directory lives as long as the table is used.
+    fn tag_u_supertable() -> (Supertable, tempfile::TempDir) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("tag", DataType::LargeUtf8, false),
+            Field::new("u", DataType::LargeUtf8, false),
+            Field::new("n", DataType::Int64, false),
+        ]));
+        let options = SupertableOptions::new(
+            Arc::clone(&schema),
+            vec![FtsConfig::new("tag"), FtsConfig::new("u")],
+            vec![],
+        )
+        .expect("valid options")
+        .with_range_indexes(&["n".to_owned()]);
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let st = Supertable::create(options.with_storage(storage)).expect("create");
+        let words = |w: &[&str]| w.iter().map(|w| (*w).to_owned()).collect::<Vec<_>>();
+        // Too many distinct values for the manifest to keep the superfile's exact table of them.
+        let many: Vec<String> = ["b", "c", "z", "z"]
+            .into_iter()
+            .map(str::to_owned)
+            .chain((0..MANY_DISTINCT_TAGS).map(|i| format!("w{i}")))
+            .collect();
+        for (base, tags, u) in [
+            (
+                0,
+                words(&["a", "a", "a", "a"]),
+                words(&["y", "y", "y", "y"]),
+            ),
+            (
+                10,
+                words(&["b", "rare", "b", "rare"]),
+                words(&["x", "x", "y", "y"]),
+            ),
+            (
+                20,
+                words(&["c", "c", "c", "c"]),
+                words(&["x", "x", "x", "x"]),
+            ),
+            (30, many.clone(), vec!["y".to_owned(); many.len()]),
+            (
+                30 + many.len() as i64,
+                words(&["!!", "!!", "d", "d"]),
+                words(&["v", "v", "v", "v"]),
+            ),
+        ] {
+            let rows = tags.len() as i64;
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(LargeStringArray::from(tags)),
+                    Arc::new(LargeStringArray::from(u)),
+                    Arc::new(Int64Array::from_iter_values(base..base + rows)),
+                ],
+            )
+            .expect("batch");
+            let mut w = st.writer().expect("writer");
+            w.append(&batch).expect("append");
+            w.commit().expect("commit");
+        }
+        (st, dir)
+    }
+
+    /// The superfiles a `WHERE` on text-indexed columns may match in, as a pushed-down search's
+    /// scope and a filtered vector search both choose them, for each shape the `WHERE` can take.
+    /// An `OR` under an `AND` prunes, a value of several words prunes a superfile holding its words
+    /// but not the value, and an `OR` with a side that bounds nothing prunes by the rest of the
+    /// conjunction alone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_where_keeps_exactly_the_superfiles_its_words_allow() {
+        let (st, _dir) = tag_u_supertable();
+        let reader = st.reader().expect("reader");
+        let manifest = reader.manifest();
+        // The manifest lists superfiles in commit order, the fixture's numbering.
+        let in_commit_order = &manifest.superfiles;
+        assert_eq!(in_commit_order.len(), 5, "premise: five superfiles");
+        let ids = |kept: &[usize]| -> HashSet<u128> {
+            kept.iter()
+                .map(|&i| in_commit_order[i].superfile_id.as_u128())
+                .collect()
+        };
+        let in_list =
+            |values: &[&str]| col("tag").in_list(values.iter().map(|v| lit(*v)).collect(), false);
+        let shapes: [(&str, Expr, &[usize]); 7] = [
+            ("=", col("tag").eq(lit("rare")), &[1]),
+            ("IN", in_list(&["rare", "c"]), &[1, 2, 3]),
+            (
+                "IN AND word",
+                in_list(&["rare", "absent"]).and(col("u").eq(lit("x"))),
+                &[1],
+            ),
+            // Superfile 3's value range spans both values and it holds `b` and `c`, so only the
+            // plan's check that a value's words are together rules it out. Superfile 1's exact
+            // table of values rules it out.
+            ("IN of two-word values", in_list(&["b x", "c y"]), &[]),
+            (
+                "OR of ANDs under AND",
+                col("tag")
+                    .eq(lit("rare"))
+                    .and(col("u").eq(lit("y")))
+                    .or(col("tag").eq(lit("c")).and(col("u").eq(lit("x"))))
+                    .and(col("n").gt_eq(lit(0_i64))),
+                &[1, 2],
+            ),
+            (
+                "OR with a side that bounds nothing, AND word",
+                col("tag")
+                    .eq(lit("rare"))
+                    .or(lower(col("tag")).eq(lit("y")))
+                    .and(col("u").eq(lit("x"))),
+                &[1, 2],
+            ),
+            // `!!` has no words, so no word check can stand for it: superfile 4 stays for its
+            // exact table of values, which holds `!!`.
+            (
+                "IN with a value of no words, AND word",
+                in_list(&["!!", "rare"]).and(col("u").eq(lit("v"))),
+                &[4],
+            ),
+        ];
+        for (what, filter, want) in shapes {
+            let filters = [filter];
+            let plan = candidate_plan_for_filters(manifest, &filters);
+            let kept: HashSet<u128> = reader
+                .superfiles_a_where_may_match(&filters, &plan)
+                .await
+                .expect("prune")
+                .iter()
+                .map(|e| e.superfile_id.as_u128())
+                .collect();
+            assert_eq!(kept, ids(want), "{what}");
+        }
+        // The scope for `IN AND word` admits the one row holding `rare` beside `x`.
+        let filters = [in_list(&["rare", "absent"]).and(col("u").eq(lit("x")))];
+        let plan = candidate_plan_for_filters(manifest, &filters);
+        let scope = reader
+            .candidate_scope(&filters, &plan)
+            .await
+            .expect("scope");
+        let allow = scope.allow.expect("a bounded plan resolves rows");
+        let rows: Vec<Vec<u32>> = allow.values().map(|bm| bm.iter().collect()).collect();
+        assert_eq!(rows, vec![vec![1]]);
     }
 
     // ---- unit ----
