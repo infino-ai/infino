@@ -198,7 +198,7 @@ serde_json = "1"
 # only under the `remote` feature. Sync fits the engine's blocking public
 # API and needs no tokio runtime, so it can't nest a runtime inside a host
 # process (e.g. a language binding). rustls for a pure-Rust TLS stack.
-ureq = { version = "2", default-features = false, features = ["json", "tls"], optional = true }
+ureq = { version = "3.5", default-features = false, features = ["json", "rustls"], optional = true }
 
 # Supertable: lock-free manifest swap + superfile ids + FTS bloom hash.
 # Manifest is held in ArcSwap<Manifest> for reader-writer isolation;
