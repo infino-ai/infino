@@ -134,6 +134,7 @@ use crate::{
             },
             deleted_stats::DeletedStatsCache,
             df_object_store::SuperfileObjectStore,
+            dispatch::tag_hits,
             exec::{
                 cached_scan_exec::{
                     CachedFile, CachedScanExec, RowGroupFilter, has_columns, projected_schema,
@@ -150,6 +151,7 @@ use crate::{
             read_ahead::ScanReadAhead,
             schema_adapter::TableExprAdapterFactory,
             skip::{ColumnTypeGuard, ScalarOp, ScalarPredicate},
+            sorted::by_key_then_id,
             sql::StatementStores,
             superfile_reader::{
                 OpenTierCounts, superfile_reader_in_memory, superfile_reader_tiered,
@@ -1554,7 +1556,8 @@ impl SupertableProvider {
     /// own `k`-th key is past the cutoff too). Ties broken by the id ascending
     /// are settled the same way when every survivor's range index keeps its
     /// tied rows in id order: each one's first rows by the key are then its
-    /// first by the key and the id. A hint carrying other filters goes
+    /// first by the key and the id, and the `k` best of them by the key and
+    /// the id are kept ([`Self::best_by_key_then_id`]). A hint carrying other filters goes
     /// to the walk instead ([`Self::walked_rows`]). `None` when there is no
     /// hint, the filters are not that one range, or a survivor has no range
     /// index over the column: the scan then reads every row the filters admit.
@@ -1644,19 +1647,69 @@ impl SupertableProvider {
             (Some(cut), false) => key <= cut,
             (Some(cut), true) => key >= cut,
         };
+        let kept: Vec<(Uuid, Vec<(u64, u32)>)> = ends
+            .into_iter()
+            .map(|(id, ends)| {
+                let pairs = ends.pairs.into_iter().filter(|(key, _)| within(*key));
+                (id, pairs.collect())
+            })
+            .collect();
+        // Ties the id breaks, each superfile's kept rows its first by the key and the id: the
+        // answer is the `k` best of them by the key and then the id, which their ids settle.
+        let kept_rows: usize = kept.iter().map(|(_, pairs)| pairs.len()).sum();
+        if !ties
+            && hint.ties_by_id
+            && kept_rows > hint.k
+            && let Some(best) = self.best_by_key_then_id(survivors, &kept, hint).await
+        {
+            return Ok(Some(best));
+        }
         Ok(Some(
-            ends.into_iter()
-                .map(|(id, ends)| {
-                    let rows: RoaringBitmap = ends
-                        .pairs
-                        .into_iter()
-                        .filter(|(key, _)| within(*key))
-                        .map(|(_, row)| row)
-                        .collect();
-                    (id, rows)
-                })
+            kept.into_iter()
+                .map(|(id, pairs)| (id, pairs.into_iter().map(|(_, row)| row).collect()))
                 .collect(),
         ))
+    }
+
+    /// The `hint.k` rows of `kept` (each superfile's candidate `(key, row)`s) first by the key in
+    /// the hint's direction and then by `_id` ascending, by superfile. Only the candidates' ids
+    /// are read, from the superfiles' id spans or id pages, so the scan then decodes `k` rows
+    /// rather than every candidate. `None` when the table's reader is gone or an id cannot be
+    /// read: the caller then hands the scan every candidate and the sort above picks the `k`.
+    async fn best_by_key_then_id(
+        &self,
+        survivors: &[Arc<SuperfileEntry>],
+        kept: &[(Uuid, Vec<(u64, u32)>)],
+        hint: &TopKHint,
+    ) -> Option<HashMap<Uuid, RoaringBitmap>> {
+        let reader = self.walk_reader.upgrade()?;
+        let entries: HashMap<Uuid, &Arc<SuperfileEntry>> = survivors
+            .iter()
+            .map(|entry| (entry.superfile_id, entry))
+            .collect();
+        let mut by_uri = HashMap::new();
+        let mut candidates = Vec::new();
+        for (id, pairs) in kept {
+            let entry = entries.get(id)?;
+            by_uri.insert(entry.uri, *id);
+            let hits = tag_hits(entry, pairs.iter().map(|(_, row)| (*row, 0.0)).collect());
+            candidates.extend(pairs.iter().map(|(key, _)| *key).zip(hits));
+        }
+        let ordered = match by_key_then_id(&reader, candidates, hint.descending, |_, _| true).await
+        {
+            Ok(ordered) => ordered,
+            Err(error) => {
+                debug!(%error, "the top-k could not read its candidates' ids");
+                return None;
+            }
+        };
+        let mut rows: HashMap<Uuid, RoaringBitmap> = HashMap::new();
+        for (_, hit) in ordered.into_iter().take(hint.k) {
+            rows.entry(*by_uri.get(&hit.superfile)?)
+                .or_default()
+                .insert(hit.local_doc_id);
+        }
+        Some(rows)
     }
 
     /// The rows of `entry` not deleted as of `now`.

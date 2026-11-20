@@ -80,6 +80,30 @@ const SQL_TABLE: &str = "supertable";
 /// One superfile's candidates: `(key, hit)` for its first rows by the key.
 type Candidates = Vec<(u64, SuperfileHit)>;
 
+/// The `candidates` that `keep` accepts, in a sort's order by the key, `descending` or not, and
+/// then by `_id` ascending, each hit given its `_id` first. The `_id`s come from the superfiles'
+/// id spans or id pages, so no other column is read.
+pub(crate) async fn by_key_then_id(
+    reader: &SupertableReader,
+    candidates: Candidates,
+    descending: bool,
+    keep: impl Fn(u64, &SuperfileHit) -> bool,
+) -> Result<Candidates, QueryError> {
+    let (keys, mut hits): (Vec<u64>, Vec<SuperfileHit>) = candidates.into_iter().unzip();
+    dispatch::attach_stable_ids_to_hits(reader, &mut hits).await?;
+    let mut order: Vec<usize> = (0..hits.len())
+        .filter(|&i| keep(keys[i], &hits[i]))
+        .collect();
+    order.sort_by(|&a, &b| {
+        let by_key = match descending {
+            false => keys[a].cmp(&keys[b]),
+            true => keys[b].cmp(&keys[a]),
+        };
+        by_key.then_with(|| hits[a].stable_id.cmp(&hits[b].stable_id))
+    });
+    Ok(order.into_iter().map(|i| (keys[i], hits[i])).collect())
+}
+
 /// A top-k walk starts only when it expects to find its rows within 4,096, and reads no window past
 /// that after its first; past it the scan reads every row, faster for a filter that keeps so few.
 pub(crate) const MAX_WALKED_ROWS: usize = 4096;
@@ -307,26 +331,14 @@ impl SupertableReader {
                 true => *key >= cut,
             });
         }
-        let (keys, mut hits): (Vec<u64>, Vec<SuperfileHit>) = candidates.into_iter().unzip();
-        dispatch::attach_stable_ids_to_hits(self, &mut hits).await?;
-        let mut order: Vec<usize> = (0..hits.len())
-            .filter(|&i| {
-                after.is_none_or(|after| after.passed_by(keys[i], hits[i].stable_id, descending))
-            })
-            .collect();
-        order.sort_by(|&a, &b| {
-            let by_key = match descending {
-                false => keys[a].cmp(&keys[b]),
-                true => keys[b].cmp(&keys[a]),
-            };
-            by_key.then_with(|| hits[a].stable_id.cmp(&hits[b].stable_id))
-        });
         Ok(Some(
-            order
-                .into_iter()
-                .take(k)
-                .map(|i| (keys[i], hits[i]))
-                .collect(),
+            by_key_then_id(self, candidates, descending, |key, hit| {
+                after.is_none_or(|after| after.passed_by(key, hit.stable_id, descending))
+            })
+            .await?
+            .into_iter()
+            .take(k)
+            .collect(),
         ))
     }
 

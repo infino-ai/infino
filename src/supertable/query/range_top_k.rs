@@ -35,7 +35,10 @@
 //! cutoff too. The one exception is a sort whose only later key is the table's
 //! `_id`, ascending: a range index that keeps the rows of a tied key in `_id`
 //! order makes a superfile's first rows by the column its first by the column
-//! and `_id`, and the scan reads those alone. The sort and the filters stay
+//! and `_id`, and of those the scan reads only the `k` best by the column and
+//! `_id`, which their ids (read without any other column) settle: on a column
+//! whose best key many rows share, every superfile would otherwise hand the
+//! scan its own `k` rows of it. The sort and the filters stay
 //! where they are, so the answer is the one they give over the rows the scan
 //! returns.
 
@@ -566,6 +569,9 @@ mod tests {
                     expected_then_seq(above.unwrap_or(BELOW_EVERY_KEY), *descending, *limit),
                     "{pass}: {sql}"
                 );
+                // Every cutoff ties on many rows of every superfile: the ids settle which of
+                // them are the page, so the scan reads the page alone.
+                assert_eq!(scanned_rows(&reader, &sql), *limit as u64, "{pass}: {sql}");
             }
         }
     }
@@ -586,6 +592,55 @@ mod tests {
             expected(above, descending, limit),
             "{sql}"
         );
+    }
+
+    /// Superfiles of the many-file table: each holds rows of every cutoff's key.
+    const MANY_FILES: i64 = 12;
+    /// Rows in each of them, three row groups' worth.
+    const MANY_ROWS_PER_FILE: i64 = 1500;
+    /// The pages the paged statements ask for.
+    const PAGE_LIMITS: &[usize] = &[1, 10, 45, 250];
+    /// Filters a paged statement carries, `{col}` the sorted column: none (`1=1`, as a search
+    /// with no query sends it), a range, and two ranges.
+    const PAGE_FILTERS: &[&str] = &[
+        "1=1",
+        "(1=1) AND ({col} > 40)",
+        "{col} >= 10 AND {col} < 90",
+    ];
+
+    /// A page of a sort tie-broken by the table's `_id`, in the shape a search engine sends it
+    /// (every column aliased to itself, an always-true filter, `NULLS LAST` on both keys), answers
+    /// as the same sort with no index in reach does, over many superfiles with deleted rows; on
+    /// `key`, whose every key is held by many rows of every superfile, and on `opt`, which has
+    /// nulls; both ways. The scan reads the page alone: the ids settle which tied rows it holds.
+    #[test]
+    fn a_paged_top_k_tie_broken_by_the_id_reads_the_page_alone() {
+        let dir = TempDir::new().expect("tempdir");
+        let st = tagged_table_with(&dir, None, MANY_FILES, MANY_ROWS_PER_FILE);
+        let reader = st.reader().expect("reader");
+        for col in ["key", "opt"] {
+            for filter in PAGE_FILTERS {
+                let filter = filter.replace("{col}", &format!("\"{col}\""));
+                for order in ["ASC", "DESC"] {
+                    for limit in PAGE_LIMITS {
+                        let sql = format!(
+                            "SELECT seq, \"{col}\" AS \"{col}\", \"_id\" AS \"_id\" FROM \"supertable\" \
+                             WHERE {filter} ORDER BY \"{col}\" {order} NULLS LAST, \"_id\" ASC NULLS LAST LIMIT {limit}"
+                        );
+                        let unindexed = format!(
+                            "SELECT seq FROM supertable WHERE {filter} \
+                             ORDER BY \"{col}\" + 0 {order} NULLS LAST, _id ASC LIMIT {limit}"
+                        );
+                        assert_eq!(
+                            seqs(&reader.query_sql(&sql).expect("sql")),
+                            seqs(&reader.query_sql(&unindexed).expect("unindexed")),
+                            "{sql}"
+                        );
+                        assert_eq!(scanned_rows(&reader, &sql), *limit as u64, "{sql}");
+                    }
+                }
+            }
+        }
     }
 
     // The walk: a sort whose filter is more than one range on its column.
