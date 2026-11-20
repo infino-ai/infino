@@ -728,7 +728,7 @@ fn without_implied_not_null(predicate: &Expr) -> Expr {
 }
 
 /// `column` when `expr` is `column IS NOT NULL`.
-fn not_null_column(expr: &Expr) -> Option<&str> {
+pub(crate) fn not_null_column(expr: &Expr) -> Option<&str> {
     match expr {
         Expr::IsNotNull(inner) => match inner.as_ref() {
             Expr::Column(c) => Some(c.name.as_str()),
@@ -2160,13 +2160,7 @@ fn peel_unfiltered_scan(input: &LogicalPlan) -> Option<&TableScan> {
 /// pure-column projection [`peel_input`] admits. `None` for any other filter.
 fn peel_not_null_filter<'a>(input: &'a LogicalPlan, column: &str) -> Option<&'a TableScan> {
     let (predicate, scan) = peel_input(input)?;
-    match predicate {
-        Expr::IsNotNull(inner) => match inner.as_ref() {
-            Expr::Column(c) if c.name == column => Some(scan),
-            _ => None,
-        },
-        _ => None,
-    }
+    (not_null_column(&predicate) == Some(column)).then_some(scan)
 }
 
 /// The provider behind a scan, when it is ours, not this rule's own

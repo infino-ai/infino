@@ -132,6 +132,7 @@ use crate::{
                 CandidatePlan, ExactFilter, PoolFile, Resolved, SelectionGate, TermMemos,
                 exact_filter, exact_range, like_prune_leaves, single_range,
             },
+            covered_agg::not_null_column,
             deleted_stats::DeletedStatsCache,
             df_object_store::SuperfileObjectStore,
             exec::{
@@ -786,7 +787,7 @@ impl SupertableProvider {
         // holds: that conjunct narrows nothing the count reads.
         let conjuncts: Vec<Expr> = split_conjunction(predicate)
             .into_iter()
-            .filter(|conjunct| !is_not_null_of(conjunct, &column))
+            .filter(|conjunct| not_null_column(conjunct) != Some(column.as_str()))
             .cloned()
             .collect();
         let range_cols = self.manifest.table_schema().range_column_types();
@@ -3968,11 +3969,6 @@ fn walk_fell_back(
     #[cfg(test)]
     walk_probe::count(survivors, cause);
     Err(cause)
-}
-
-/// Whether `expr` is `column IS NOT NULL`.
-fn is_not_null_of(expr: &Expr, column: &str) -> bool {
-    matches!(expr, Expr::IsNotNull(inner) if matches!(inner.as_ref(), Expr::Column(c) if c.name == column))
 }
 
 /// Test hooks into the top-k walk over one table, named by one of its files: run an action between
