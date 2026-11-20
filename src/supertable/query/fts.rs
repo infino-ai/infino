@@ -2810,7 +2810,7 @@ impl SupertableReader {
                         // from scoring): df only, from the dictionary value
                         // + header hint — no postings body.
                         let (dfs, work) = r
-                            .term_dfs(&column_arc, &refs, &QueryDict::default())
+                            .term_dfs_with_dict(&column_arc, &refs, &QueryDict::default())
                             .await?;
                         add_match_work(&op_stats, &work);
                         Ok((suid, dfs, None))
@@ -5180,8 +5180,7 @@ mod tests {
                 bm25,
                 posting::BLOCK_LEN,
                 reader::{
-                    Bm25SearchOptions, ColumnLengthStats, FetchedTermMemo, QueryDict,
-                    top_k_initial_capacity,
+                    Bm25SearchOptions, ColumnLengthStats, FetchedTermMemo, top_k_initial_capacity,
                 },
             },
             vector::layout::VectorLayout,
@@ -8445,9 +8444,7 @@ mod tests {
         for e in &entries {
             let bytes = std::fs::read(dir.path().join(e.uri.storage_path())).expect("bytes");
             let sf = SuperfileReader::open(Bytes::from(bytes)).expect("open");
-            let (dfs, _) = rt
-                .block_on(sf.term_dfs("title", &terms, &QueryDict::default()))
-                .expect("dfs");
+            let (dfs, _) = rt.block_on(sf.term_dfs("title", &terms)).expect("dfs");
             for (i, d) in dfs.into_iter().enumerate() {
                 expected_df[i] += d;
             }

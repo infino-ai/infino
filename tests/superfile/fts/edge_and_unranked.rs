@@ -14,6 +14,8 @@
 //!   `count == ids.len()` invariants, plus the cross-spine invariant
 //!   that a ranked search returning every match (`k ≥ n`) has exactly
 //!   `token_match_count` hits.
+//! * **`term_dfs`**: each token's document count, called from outside the
+//!   crate on both readers.
 
 use std::collections::HashSet;
 
@@ -278,6 +280,59 @@ async fn token_match_count_equals_ids_len() {
             count as usize,
             ids.len(),
             "count must equal ids len for {tokens:?} {mode:?}"
+        );
+    }
+}
+
+/// Documents in the `term_dfs` corpus: more than a short posting holds (128), so one term is long.
+const TERM_DFS_DOCS: u64 = 200;
+
+#[tokio::test]
+async fn term_dfs_counts_documents_per_term_from_outside_the_crate() {
+    // Both readers' `term_dfs(column, tokens)`, called from outside the crate, count each token's
+    // documents in input order: a long term, a short one, a one-document term, an absent token and
+    // a repeat.
+    let texts: Vec<String> = (0..TERM_DFS_DOCS)
+        .map(|doc| match doc {
+            0 => "common solo pair".to_string(),
+            1 => "common pair".to_string(),
+            _ => "common filler".to_string(),
+        })
+        .collect();
+    let corp: Vec<(u64, &str)> = (0..TERM_DFS_DOCS)
+        .zip(texts.iter().map(String::as_str))
+        .collect();
+    let r = build_infino_superfile(&corp);
+    let tokens = ["pair", "common", "definitely-absent", "solo", "common"];
+    let want: Vec<u64> = tokens
+        .iter()
+        .map(|t| docs_with(&corp, t).len() as u64)
+        .collect();
+    assert_eq!(
+        want,
+        [2, TERM_DFS_DOCS, 0, 1, TERM_DFS_DOCS],
+        "corpus truth"
+    );
+    let (dfs, _) = r.term_dfs("title", &tokens).await.expect("term_dfs");
+    assert_eq!(dfs, want, "superfile reader");
+    let fts = r.fts().expect("an fts index");
+    let (dfs, _) = fts.term_dfs("title", &tokens).await.expect("fts term_dfs");
+    assert_eq!(dfs, want, "fts reader");
+    // Each term is stored the way it is meant to cover: long, short and inline.
+    for (term, short, inline) in [
+        ("common", false, false),
+        ("pair", true, false),
+        ("solo", false, true),
+    ] {
+        let layout = fts
+            .term_layout("title", term)
+            .await
+            .expect("term_layout")
+            .expect("the term is present");
+        assert_eq!(
+            (layout.short, layout.inline),
+            (short, inline),
+            "{term}: stored form"
         );
     }
 }

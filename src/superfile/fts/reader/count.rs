@@ -810,9 +810,17 @@ impl FtsReader {
     /// a minimal set of parallel GETs). This matters on the global-statistics
     /// path, where a superfile is probed for every scored term of a query at
     /// once.
-    ///
-    /// The dictionary is read through `dict`, which may already hold it.
-    pub(crate) async fn term_dfs(
+    pub async fn term_dfs(
+        &self,
+        column: &str,
+        tokens: &[&str],
+    ) -> Result<(Vec<u64>, MatchWork), FtsError> {
+        self.term_dfs_with_dict(column, tokens, &QueryDict::default())
+            .await
+    }
+
+    /// [`Self::term_dfs`] with the dictionary read through `dict`, which may already hold it.
+    pub(crate) async fn term_dfs_with_dict(
         &self,
         column: &str,
         tokens: &[&str],
@@ -910,9 +918,7 @@ impl FtsReader {
     /// so a predicate matching a large fraction of the superfile can
     /// fall back to a plain scan instead of a (losing) index pushdown.
     pub async fn term_df(&self, column: &str, token: &str) -> Result<(u64, MatchWork), FtsError> {
-        let (mut dfs, work) = self
-            .term_dfs(column, &[token], &QueryDict::default())
-            .await?;
+        let (mut dfs, work) = self.term_dfs(column, &[token]).await?;
         Ok((dfs.pop().unwrap_or(0), work))
     }
 
@@ -1855,11 +1861,7 @@ mod tests {
         // path (which fetches only the PFOR headers, then scatters the
         // results back) would surface as a mismatch here.
         let tokens = ["rust", "missing", "uniqzero", "common", "absent2"];
-        let batched = r
-            .term_dfs("body", &tokens, &QueryDict::default())
-            .await
-            .expect("term_dfs")
-            .0;
+        let batched = r.term_dfs("body", &tokens).await.expect("term_dfs").0;
         // Element-wise identical to resolving each token on its own.
         let mut per_term = Vec::with_capacity(tokens.len());
         for t in tokens {
@@ -1873,13 +1875,7 @@ mod tests {
         // uniqzero=1 inline, absent tokens=0).
         assert_eq!(batched, vec![2, 0, 1, 3, 0], "planted document frequencies");
         // Empty input short-circuits to empty output (no dict open, no fetch).
-        assert!(
-            r.term_dfs("body", &[], &QueryDict::default())
-                .await
-                .expect("empty")
-                .0
-                .is_empty()
-        );
+        assert!(r.term_dfs("body", &[]).await.expect("empty").0.is_empty());
     }
 
     /// A column no row in this superfile filled is walked without
