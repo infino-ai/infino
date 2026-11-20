@@ -315,9 +315,11 @@ mod tests {
             Supertable, SupertableOptions, SupertableReader,
             error::QueryError,
             query::{
+                SuperfileHit,
                 column_cache::DecodedColumnCache,
                 provider::{TopKHint, WalkFallback, tests::planned_files, walk_probe},
                 range_top_k::provider_of,
+                sorted::WINDOW_MARGIN,
                 vector::row_id_from_manifest_entry,
             },
         },
@@ -1173,6 +1175,75 @@ mod tests {
         assert!(matches!(small, Ok(Some(_))), "{small:?}");
         let large = walk(4000, col("seq").gt_eq(lit(0_i64)));
         assert!(matches!(large, Err(QueryError::OverBudget(_))), "{large:?}");
+    }
+
+    /// A connection memory limit no walk here comes near.
+    const ROOMY_BUDGET: u64 = 1 << 30;
+    /// The page the walk of [`a_walk_reserves_its_window_once`] asks for.
+    const WALK_PAGE: usize = 10;
+
+    #[test]
+    fn a_walk_reserves_its_window_once() {
+        // The tagged table, and a walk for 10 rows under a filter every row passes: its first
+        // window reads twice the page from each file and holds the page.
+        //  - With room for that window, and for fewer entries than the window's candidates once
+        //    more, the walk answers as with room to spare.
+        // This test pins that the walk reserves its candidates once, with its window: ordering
+        // them by the key and `_id` reserves nothing more.
+        let dir = TempDir::new().expect("tempdir");
+        tagged_table(&dir);
+        let st = reopened_with_budget(&dir, ROOMY_BUDGET);
+        let reader = st.reader().expect("reader");
+        let files = reader.manifest().superfiles.clone();
+        let every_row = [col("seq").gt_eq(lit(0_i64))];
+        let walk = || {
+            reader.block_on(
+                reader.sorted_hits_for_scan("opt", &every_row, false, false, WALK_PAGE, &files),
+            )
+        };
+        let want = walk().expect("walk").expect("the walk answers");
+        // The window's entries; after the cut to its merged first rows, at least `window_rows`
+        // of them are candidates.
+        let window_rows = (WALK_PAGE as f64 * WINDOW_MARGIN) as usize;
+        let entry = size_of::<(u64, SuperfileHit)>();
+        let window = files.len() * window_rows * entry;
+        let left = window + window_rows * entry - 1;
+        let mut held = reader
+            .manifest()
+            .options
+            .connection_memory_budget
+            .hold_all();
+        held.shrink(left);
+        let got = walk().expect("the window fits").expect("the walk answers");
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn a_top_k_whose_candidates_do_not_fit_the_budget_scans_them_all() {
+        // Many superfiles that each hold the lowest `key`, and the first row by `key` and `_id`.
+        //  - With room, the top-k keeps that one row: the scan reads one file.
+        //  - With the connection's memory budget full, the candidates (each file's first row) do
+        //    not fit, so the scan reads every file's candidate and the sort above picks the row.
+        // This test pins that the top-k reserves its candidates before it orders them.
+        let dir = TempDir::new().expect("tempdir");
+        tagged_table_with(&dir, None, MANY_FILES, MANY_ROWS_PER_FILE);
+        let st = reopened_with_budget(&dir, ROOMY_BUDGET);
+        let reader = st.reader().expect("reader");
+        let limit = PAGE_LIMITS[0];
+        let sql = format!(
+            "SELECT seq FROM supertable ORDER BY key ASC NULLS LAST, _id ASC LIMIT {limit}"
+        );
+        assert_eq!(planned_files(&reader, &sql), 1, "with room, the row's file");
+        let _full = reader
+            .manifest()
+            .options
+            .connection_memory_budget
+            .hold_all();
+        assert_eq!(
+            planned_files(&reader, &sql),
+            MANY_FILES as usize,
+            "over the budget"
+        );
     }
 
     #[test]

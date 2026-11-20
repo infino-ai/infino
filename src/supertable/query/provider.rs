@@ -128,6 +128,7 @@ use crate::{
             load_section_groups, load_section_groups_blocking,
         },
         query::{
+            SuperfileHit,
             candidate::{
                 CandidatePlan, ExactFilter, PoolFile, Resolved, SelectionGate, TermMemos,
                 exact_filter, exact_range, like_prune_leaves, single_range,
@@ -1674,8 +1675,9 @@ impl SupertableProvider {
     /// The `hint.k` rows of `kept` (each superfile's candidate `(key, row)`s) first by the key in
     /// the hint's direction and then by `_id` ascending, by superfile. Only the candidates' ids
     /// are read, from the superfiles' id spans or id pages, so the scan then decodes `k` rows
-    /// rather than every candidate. `None` when the table's reader is gone, an id cannot be read,
-    /// or the candidates do not fit the memory budget: the caller then hands the scan every
+    /// rather than every candidate. The candidates are reserved against the connection's memory
+    /// budget while they are ordered. `None` when the table's reader is gone, an id cannot be
+    /// read, or the candidates do not fit the memory budget: the caller then hands the scan every
     /// candidate and the sort above picks the `k`.
     async fn best_by_key_then_id(
         &self,
@@ -1684,6 +1686,19 @@ impl SupertableProvider {
         hint: &TopKHint,
     ) -> Option<HashMap<Uuid, RoaringBitmap>> {
         let reader = self.walk_reader.upgrade()?;
+        let candidate_rows: usize = kept.iter().map(|(_, pairs)| pairs.len()).sum();
+        let _held = match self
+            .manifest
+            .options
+            .connection_memory_budget
+            .try_reserve(candidate_rows.saturating_mul(size_of::<(u64, SuperfileHit)>()))
+        {
+            Ok(held) => held,
+            Err(over) => {
+                debug!(%over, "the top-k scans every candidate: they are over the memory budget");
+                return None;
+            }
+        };
         let entries: HashMap<Uuid, &Arc<SuperfileEntry>> = survivors
             .iter()
             .map(|entry| (entry.superfile_id, entry))

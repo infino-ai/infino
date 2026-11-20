@@ -82,8 +82,8 @@ type Candidates = Vec<(u64, SuperfileHit)>;
 
 /// The first `k` of the `candidates` that `keep` accepts, in a sort's order by the key,
 /// `descending` or not, and then by `_id` ascending, each hit given its `_id` first. The `_id`s
-/// come from the superfiles' id spans or id pages, so no other column is read. The candidates are
-/// reserved against the connection's memory budget while they are ordered; over it, an error.
+/// come from the superfiles' id spans or id pages, so no other column is read. It reserves no
+/// memory: the walk and the range top-k reserve their candidates before they call it.
 pub(crate) async fn by_key_then_id(
     reader: &SupertableReader,
     candidates: Candidates,
@@ -91,20 +91,6 @@ pub(crate) async fn by_key_then_id(
     k: usize,
     keep: impl Fn(u64, &SuperfileHit) -> bool,
 ) -> Result<Candidates, QueryError> {
-    let _held = reader
-        .manifest()
-        .options
-        .connection_memory_budget
-        .try_reserve(
-            candidates
-                .len()
-                .saturating_mul(size_of::<(u64, SuperfileHit)>()),
-        )
-        .map_err(|over| {
-            QueryError::OverBudget(format!(
-                "while a top-k orders its candidates by key and `_id`, {over}"
-            ))
-        })?;
     let (keys, mut hits): (Vec<u64>, Vec<SuperfileHit>) = candidates.into_iter().unzip();
     dispatch::attach_stable_ids_to_hits(reader, &mut hits).await?;
     let mut order: Vec<usize> = (0..hits.len())
@@ -131,7 +117,7 @@ pub(crate) async fn by_key_then_id(
 pub(crate) const MAX_WALKED_ROWS: usize = 4096;
 
 /// A window reads twice the rows the walk expects to need, so it usually holds the page at once.
-const WINDOW_MARGIN: f64 = 2.0;
+pub(crate) const WINDOW_MARGIN: f64 = 2.0;
 
 /// How much larger a window is than the last when the last kept no row.
 const WINDOW_GROWTH: usize = 4;
@@ -2294,16 +2280,17 @@ mod tests {
         }
     }
 
-    /// Keys the candidates of [`by_key_then_id_keeps_the_first_k_within_the_budget`] take, so
+    /// Keys the candidates of [`by_key_then_id_keeps_the_first_k_and_reserves_nothing`] take, so
     /// many share each key and the `_id` decides among them.
     const CANDIDATE_KEYS: u32 = 7;
     /// The candidates it keeps.
     const KEPT: usize = 40;
 
     /// `by_key_then_id` returns only the first `k` candidates by the key and then `_id`, either
-    /// way, and refuses candidates the connection's memory budget cannot hold.
+    /// way. It reserves no memory, so it answers with the connection's budget full: its callers
+    /// reserve the candidates, and a second reservation would count them twice.
     #[test]
-    fn by_key_then_id_keeps_the_first_k_within_the_budget() {
+    fn by_key_then_id_keeps_the_first_k_and_reserves_nothing() {
         let dir = TempDir::new().expect("tempdir");
         drop(table(&dir));
         let storage: Arc<dyn StorageProvider> =
@@ -2315,6 +2302,11 @@ mod tests {
         options.connection_memory_budget = ConnectionMemoryBudget::with_room();
         let st = Supertable::open(options).expect("open");
         let reader = st.reader().expect("reader");
+        let _full = reader
+            .manifest()
+            .options
+            .connection_memory_budget
+            .hold_all();
         let candidates: Candidates = reader
             .manifest()
             .superfiles
@@ -2350,14 +2342,6 @@ mod tests {
                 .collect();
             assert_eq!(got, want, "descending: {descending}");
         }
-        let budget = &reader.manifest().options.connection_memory_budget;
-        let _full = budget
-            .try_reserve(budget.remaining().expect("a bounded budget"))
-            .expect("fill the budget");
-        let over = reader.block_on(by_key_then_id(&reader, candidates, false, KEPT, |_, _| {
-            true
-        }));
-        assert!(matches!(over, Err(QueryError::OverBudget(_))), "{over:?}");
     }
 
     /// A column without a range index is refused by name, and a `k` of
