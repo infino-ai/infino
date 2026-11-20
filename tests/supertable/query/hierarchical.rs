@@ -64,6 +64,8 @@ const HIERARCHICAL_PART_COUNT: usize = 5;
 const ROWS_PER_PART: i64 = 2;
 /// BM25 / prefix top-k for the hierarchical queries.
 const BM25_TOP_K: usize = 10;
+/// Rows of the value-set fixture's part 0, all holding the value with no token.
+const TOKENLESS_ROWS: usize = 4;
 use tempfile::TempDir;
 
 /// Build a producer that creates one part per commit (via
@@ -770,7 +772,11 @@ fn sql_value_set_keeps_parts_whose_value_has_no_tokens() {
                 .query_sql(&format!("SELECT _id FROM supertable WHERE {filter}"))
                 .expect("query");
             let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-            assert_eq!(rows, 5, "{filter}: four '{value}' rows and one 'Fig Roll'");
+            assert_eq!(
+                rows,
+                TOKENLESS_ROWS + 1,
+                "{filter}: every '{value}' row and one 'Fig Roll'"
+            );
         }
     }
 }
