@@ -668,6 +668,9 @@ impl Connection {
                 opts = opts
                     .with_read_consistency(self.inner.options.read_consistency)
                     .with_companions(indexes.companion_specs());
+                if self.inner.options.lazy_manifest {
+                    opts = opts.with_eager_load_threshold(0);
+                }
 
                 // Create the physical table at its unique location, then
                 // register the name. A losing racer that also created a
@@ -786,6 +789,9 @@ impl Connection {
                 // BoundedStaleness(1s): the per-query pointer re-check is
                 // amortized across the window rather than paid on every query.
                 options = options.with_read_consistency(self.inner.options.read_consistency);
+                if self.inner.options.lazy_manifest {
+                    options = options.with_eager_load_threshold(0);
+                }
                 if !statistics {
                     options = options.without_statistics();
                 }
@@ -7744,6 +7750,74 @@ mod tests {
 
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_dir_all(&dir2);
+    }
+
+    #[test]
+    fn a_lazy_manifest_connection_opens_tables_lazily_and_reads_them_whole() {
+        // A lazy connection loads no manifest part at open, and its reads
+        // still see every row: the parts load when a read needs them.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let uri = dir.path().to_str().expect("utf8 path").to_string();
+        let writer = connect(&uri).expect("connect writer");
+        let table = writer
+            .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create");
+        for titles in [&["fox", "hen"][..], &["fox"], &["owl"]] {
+            table.append(&build_title_batch(titles)).expect("append");
+        }
+        assert_eq!(
+            table.local_handle().options().eager_load_threshold_parts,
+            u32::MAX,
+            "a default connection loads every part at open"
+        );
+
+        let lazy = connect_with(&uri, ConnectOptions::new().with_lazy_manifest(true))
+            .expect("connect lazy");
+        let opened = lazy.open_table("docs").expect("open");
+        let handle = opened.local_handle();
+        assert_eq!(handle.options().eager_load_threshold_parts, 0);
+        assert!(
+            handle
+                .reader()
+                .expect("reader")
+                .manifest()
+                .resident_superfiles()
+                .is_none(),
+            "no part is loaded at open"
+        );
+        assert_eq!(
+            n_rows(
+                &opened
+                    .bm25_search("title", "fox", TOP_K, Bm25SearchOptions::new(), None)
+                    .expect("search")
+            ),
+            2,
+            "search sees every matching row"
+        );
+        assert_eq!(
+            n_rows(&lazy.query_sql("SELECT * FROM docs").expect("scan")),
+            4,
+            "a scan sees every row"
+        );
+        let counted = lazy
+            .query_sql("SELECT COUNT(*) AS n FROM docs")
+            .expect("count");
+        let n = counted[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .expect("an Int64 count")
+            .value(0);
+        assert_eq!(n, 4, "count(*) sees every row");
+
+        let created = lazy
+            .create_table("more", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create on the lazy connection");
+        assert_eq!(
+            created.local_handle().options().eager_load_threshold_parts,
+            0,
+            "create_table applies the same loading as open_table"
+        );
     }
 
     #[test]
