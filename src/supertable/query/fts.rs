@@ -73,7 +73,7 @@
 use std::{
     borrow::Cow,
     cmp::{Ordering, Reverse},
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     future::Future,
     iter::repeat_n,
     slice,
@@ -2987,9 +2987,9 @@ impl SupertableReader {
         &self,
         column: &str,
         files: Vec<Arc<SuperfileEntry>>,
-    ) -> Result<BTreeMap<Vec<u8>, u64>, QueryError> {
+    ) -> Result<HashMap<Vec<u8>, u64>, QueryError> {
         let field = self.manifest().field_id(column);
-        let mut counts: BTreeMap<Vec<u8>, u64> = BTreeMap::new();
+        let mut counts: HashMap<Vec<u8>, u64> = HashMap::new();
         let index = self
             .manifest()
             .term_index()
@@ -3003,15 +3003,16 @@ impl SupertableReader {
                 let live: HashSet<Uuid> = covered.iter().map(|e| e.superfile_id).collect();
                 if !live.is_empty() {
                     let head = field.term_key("").len();
+                    // Whether each superfile ordinal of the index is live, so a
+                    // posting is checked without a lookup by id.
+                    let live_ordinals: Vec<bool> = (0..index.root().superfiles.len() as u32)
+                        .map(|o| index.superfile_id(o).is_some_and(|id| live.contains(&id)))
+                        .collect();
                     index
                         .for_each_prefix(field, "", |key, run| {
                             let held: u64 = run
                                 .iter()
-                                .filter(|p| {
-                                    index
-                                        .superfile_id(p.superfile)
-                                        .is_some_and(|id| live.contains(&id))
-                                })
+                                .filter(|p| live_ordinals.get(p.superfile as usize) == Some(&true))
                                 .map(|p| p.df)
                                 .sum();
                             if held > 0 {
