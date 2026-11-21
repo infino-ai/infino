@@ -2533,55 +2533,6 @@ mod tests {
     /// A `k` above the fixture's match count.
     const TABLE_IDF_K: usize = 10;
 
-    /// The map path, which a prefix expansion's long term list takes, must
-    /// give the scan path's output: distinct terms in first-seen order, each
-    /// with its repeat count. Lists either side of the cut, with and without
-    /// repeats, are checked against a plain scan.
-    #[test]
-    fn long_and_short_term_lists_dedup_alike() {
-        let scan = |terms: &[&str]| {
-            let mut distinct: Vec<String> = Vec::new();
-            let mut qtf: Vec<u32> = Vec::new();
-            for &t in terms {
-                match distinct.iter().position(|d| d == t) {
-                    Some(i) => qtf[i] += 1,
-                    None => {
-                        distinct.push(t.to_owned());
-                        qtf.push(1);
-                    }
-                }
-            }
-            (distinct, qtf)
-        };
-        let mut seed = 11u64;
-        let mut rng = move || {
-            seed = seed
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            seed >> 33
-        };
-        for len in [
-            0,
-            1,
-            2,
-            DEDUP_SCAN_MAX_TERMS,
-            DEDUP_SCAN_MAX_TERMS + 1,
-            500,
-            5_000,
-        ] {
-            for vocab in [len.max(1), (len / 3).max(1), 2] {
-                let owned: Vec<String> = (0..len)
-                    .map(|_| format!("t{}", rng() % vocab as u64))
-                    .collect();
-                let terms: Vec<&str> = owned.iter().map(String::as_str).collect();
-                let (distinct, qtf) = FtsReader::dedup_terms_with_qtf(&terms);
-                let (want_distinct, want_qtf) = scan(&terms);
-                assert_eq!(distinct, want_distinct, "len {len}, vocab {vocab}");
-                assert_eq!(qtf, want_qtf, "len {len}, vocab {vocab}");
-                assert_eq!(qtf.iter().sum::<u32>() as usize, len);
-            }
-        }
-    }
     /// An arbitrary table-wide idf to score with.
     const TABLE_IDF: f32 = 1.5;
     /// Score slack between the ranked and the exact-count walks: they add
@@ -2612,6 +2563,56 @@ mod tests {
     const BETA_EVERY: u32 = 3;
     /// Every this many rows carry `rare`: a match sparse enough to be sorted.
     const RARE_EVERY: u32 = 128;
+    /// Seed of the term lists the dedup test draws.
+    const DEDUP_SEED: u64 = 11;
+    /// A term list well past the scan's cut.
+    const DEDUP_LONG_TERMS: usize = 500;
+    /// A term list as long as a short prefix's expansion.
+    const DEDUP_PREFIX_TERMS: usize = 5_000;
+
+    /// The map path, which a prefix expansion's long term list takes, must
+    /// give the scan path's output: distinct terms in first-seen order, each
+    /// with its repeat count. Lists either side of the cut, with and without
+    /// repeats, are checked against a plain scan.
+    #[test]
+    fn long_and_short_term_lists_dedup_alike() {
+        let scan = |terms: &[&str]| {
+            let mut distinct: Vec<String> = Vec::new();
+            let mut qtf: Vec<u32> = Vec::new();
+            for &t in terms {
+                match distinct.iter().position(|d| d == t) {
+                    Some(i) => qtf[i] += 1,
+                    None => {
+                        distinct.push(t.to_owned());
+                        qtf.push(1);
+                    }
+                }
+            }
+            (distinct, qtf)
+        };
+        let mut rng = xorshift(DEDUP_SEED);
+        for len in [
+            0,
+            1,
+            2,
+            DEDUP_SCAN_MAX_TERMS,
+            DEDUP_SCAN_MAX_TERMS + 1,
+            DEDUP_LONG_TERMS,
+            DEDUP_PREFIX_TERMS,
+        ] {
+            for vocab in [len.max(1), (len / 3).max(1), 2] {
+                let owned: Vec<String> = (0..len)
+                    .map(|_| format!("t{}", rng() % vocab as u64))
+                    .collect();
+                let terms: Vec<&str> = owned.iter().map(String::as_str).collect();
+                let (distinct, qtf) = FtsReader::dedup_terms_with_qtf(&terms);
+                let (want_distinct, want_qtf) = scan(&terms);
+                assert_eq!(distinct, want_distinct, "len {len}, vocab {vocab}");
+                assert_eq!(qtf, want_qtf, "len {len}, vocab {vocab}");
+                assert_eq!(qtf.iter().sum::<u32>() as usize, len);
+            }
+        }
+    }
 
     /// An unranked match on a reordered blob comes back as its rows,
     /// ascending, whether it is dense enough to be put in order through a
