@@ -55,9 +55,10 @@
 //!     Bytes are uncompressed, as that's what decoding costs. A cold read pays
 //!     compressed bytes, so if the skipped columns compress well, the ratio
 //!     overstates what we save.
-//!   - under a plain `LIMIT`, only fires on a scan with a `WHERE` (one without
-//!     takes the limit already) whose files read every row of the row groups
-//!     they read. The Parquet reader's limit pruning swaps a file's row
+//!   - under a plain `LIMIT`, only fires on a Parquet scan (a scan of kept
+//!     decoded columns hands over its first batch with nothing to decode)
+//!     with a `WHERE` (one without takes the limit already) whose files read
+//!     every row of the row groups they read. The Parquet reader's limit pruning swaps a file's row
 //!     selections for whole row groups the statistics prove match, which would
 //!     return the rows a tombstone deletes or an index ruled out.
 
@@ -173,6 +174,11 @@ fn row_filtered(
         // only for the rows that pass. Where the row filter applies, the
         // Parquet scan the kept columns stand in for serves the statement.
         if let Some(cached) = meter.input().downcast_ref::<CachedScanExec>() {
+            // Under a plain `LIMIT` the gather stops after the scan's first
+            // batch, which kept columns hand over with nothing to decode.
+            if matches!(bound, Bound::Limit) {
+                return Ok(None);
+            }
             return row_filtered(cached.parquet(), bound, filters);
         }
         let (Some(scan), Some(footers)) = (
