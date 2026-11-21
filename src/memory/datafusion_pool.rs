@@ -269,7 +269,7 @@ pub(crate) fn budgeted_session_context(
         .skip_partial_aggregation_probe_ratio_threshold = PARTIAL_AGG_SKIP_PROBE_RATIO;
 
     // Predicates run in a `FilterExec` above the scan, not as Parquet row
-    // filters, except under `ORDER BY ... LIMIT` (see `RowFilterUnderTopK`).
+    // filters, except under a `LIMIT` (see `RowFilterUnderTopK`).
     // Pinned off here because the scan's own flag is ORed with this option.
     config.options_mut().execution.parquet.pushdown_filters = false;
 

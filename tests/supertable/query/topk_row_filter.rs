@@ -2,9 +2,10 @@
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
 //! Where a `WHERE` runs: as a Parquet row filter in a scan under
-//! `ORDER BY ... LIMIT`, in a `FilterExec` above the scan everywhere else. A
-//! filtered scan under a plain `LIMIT` is gathered in stages: its first
-//! partition alone, then the rest side by side if that falls short.
+//! `ORDER BY ... LIMIT`, or under a plain `LIMIT` when the scan reads wide
+//! columns the `WHERE` doesn't, in a `FilterExec` above the scan everywhere
+//! else. Any other filtered scan under a plain `LIMIT` is gathered in stages:
+//! its first partition alone, then the rest side by side if that falls short.
 //!
 //! `EXPLAIN ANALYZE` tells which. A row filter counts the rows it checks in
 //! `pushdown_rows_matched` and `pushdown_rows_pruned`; without one both are 0.
@@ -44,6 +45,10 @@ const GATE: &str = "ScanGateExec";
 const MAX_FETCH: usize = 8_192;
 /// How `EXPLAIN ANALYZE` shows how many files a scan opened.
 const FILES_OPENED: &str = "files_opened=";
+/// The value of `m` the plain-`LIMIT` filter keeps: a tenth of the rows.
+const M: i64 = 3;
+/// How `EXPLAIN` shows a scan that stops after the `LIMIT`'s rows.
+const SCAN_LIMIT: &str = "], limit=";
 
 fn schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
@@ -532,4 +537,69 @@ fn a_large_limit_gets_no_row_filter() {
         assert_eq!(got, (0..limit).collect::<Vec<i64>>(), "{sql}");
         assert_eq!(row_filter_ran(&db, &sql), want, "{sql}");
     }
+}
+
+/// Every `n` whose `m` is `M`, skipping `deleted`.
+fn matching_m(deleted: &[i64]) -> Vec<i64> {
+    (0..2 * ROWS_PER_APPEND)
+        .filter(|v| v % 10 == M && !deleted.contains(v))
+        .collect()
+}
+
+#[test]
+fn a_plain_limit_runs_its_filter_inside_the_scan_when_it_reads_narrow_columns() {
+    // `SELECT n, s WHERE m = 3 LIMIT 5`, and the same with an offset.
+    //  - the `WHERE` reads `m` alone; `s` is many times wider.
+    //  - the rule marks the scan, DataFusion moves the `WHERE` into it, and
+    //    the scan takes the limit, so it decodes `s` only for rows that pass.
+    //  - the gather still runs partition 0 alone first; its first file has
+    //    the rows, so the other superfile is never opened.
+    // This test pins the plan shape, the files opened and that every row
+    // returned matches.
+    let (_dir, db, _table) = fixture();
+    let all = matching_m(&[]);
+    for (offset, fetch) in [("", FETCH), (" OFFSET 3", FETCH + 3)] {
+        let sql = format!("SELECT n, s FROM t WHERE m = {M} LIMIT {FETCH}{offset}");
+        assert_fetch_of(&db, &sql, &all);
+        assert!(row_filter_ran(&db, &sql), "no row filter for: {sql}");
+        let plan = explain(&db, "", &sql);
+        assert!(!plan.contains("FilterExec"), "{plan}");
+        assert!(plan.contains(&format!("{SCAN_LIMIT}{fetch}")), "{plan}");
+        assert!(plan.contains(&format!("{STAGED}{fetch}")), "{plan}");
+        assert!(plan.contains(GATE), "{plan}");
+        assert_eq!(files_opened(&db, &sql), 1, "{sql}");
+    }
+}
+
+#[test]
+fn deleted_rows_stay_out_of_a_plain_limit_whose_where_every_row_meets() {
+    // Delete every odd `n`, then `WHERE n >= 0 LIMIT <every live row>`.
+    //  - the statistics prove every row group matches `n >= 0`. Given the
+    //    limit, the Parquet reader would read such row groups whole, past the
+    //    deletes, so the rule leaves a scan with deleted rows alone.
+    // This test pins that no deleted row comes back.
+    let (_dir, db, table) = fixture();
+    table
+        .delete((col("n") % lit(2_i64)).eq(lit(1_i64)))
+        .expect("delete");
+    let want: Vec<i64> = (0..2 * ROWS_PER_APPEND).filter(|n| n % 2 == 0).collect();
+    for limit in [FETCH, want.len()] {
+        let sql = format!("SELECT n, s FROM t WHERE n >= 0 LIMIT {limit}");
+        let got = n_values(&db.query_sql(&sql).expect("sql"));
+        assert_eq!(got.len(), limit, "{sql}");
+        assert!(got.iter().all(|n| n % 2 == 0), "{sql}: {got:?}");
+        assert!(!row_filter_ran(&db, &sql), "row filter ran for: {sql}");
+    }
+}
+
+#[test]
+fn a_plain_limit_whose_where_reads_the_wide_column_keeps_its_filter_above() {
+    // `SELECT n, m WHERE s LIKE '%7%' LIMIT 5`: the `WHERE` reads the wide
+    // column, and nothing wide is left to skip.
+    // This test pins the rows and that the `WHERE` stays in a `FilterExec`.
+    let (_dir, db, _table) = fixture();
+    let sql = format!("SELECT n, m FROM t WHERE s LIKE '%{DIGIT}%' LIMIT {FETCH}");
+    assert_fetch_of(&db, &sql, &matching(&[]));
+    assert!(!row_filter_ran(&db, &sql), "row filter ran for: {sql}");
+    assert!(explain(&db, "", &sql).contains("FilterExec"), "{sql}");
 }
