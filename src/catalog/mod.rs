@@ -688,10 +688,7 @@ impl Connection {
             } => {
                 // Warm path: lock-free sharded lookup, no serialization. A
                 // handle purged elsewhere is dropped here, so the cold path
-                // re-resolves it against the catalog. No pointer read: a
-                // query or a commit on the handle reads the pointer anyway and
-                // reports a drop it finds there, so checking here too would
-                // add a storage request to every query and write.
+                // re-resolves it against the catalog.
                 if let Some(handle) = live_handle(handles, name) {
                     return Ok(handle);
                 }
@@ -906,10 +903,15 @@ impl Connection {
                 Ok((*handle.table_schema()).clone())
             }
             CatalogStore::Storage { root, handles, .. } => {
-                // A handle already open answers, unless its table was dropped
-                // elsewhere.
-                if let Some(handle) = fresh_live_handle(handles, name) {
-                    return Ok((*handle.table_schema()).clone());
+                // A handle already open answers with the document it holds,
+                // after the freshness check a read makes: unlike a read, a
+                // describe touches no storage, so without it a table dropped
+                // elsewhere would be described from cache indefinitely.
+                if let Some(handle) = live_handle(handles, name) {
+                    let _ = handle.ensure_fresh();
+                    if !handle.pointer_vanished() {
+                        return Ok((*handle.table_schema()).clone());
+                    }
                 }
                 // Otherwise the pointer and the list, and nothing of the
                 // parts: an open loads every part and keeps its entries and
@@ -2131,29 +2133,6 @@ fn live_handle(
     }
     drop(entry);
     handles.remove(name);
-    None
-}
-
-/// [`live_handle`], after the handle's freshness check, so a table another
-/// process dropped is not served from cache. The check follows the handle's
-/// read consistency: no read under `Snapshot` or in memory, and at most one
-/// pointer read per window under `BoundedStaleness`.
-///
-/// Only for paths that would otherwise answer from memory alone, such as a
-/// describe. The open behind queries and writes uses [`live_handle`]: those
-/// read the pointer or commit anyway, and see the drop there.
-fn fresh_live_handle(
-    handles: &DashMap<String, SupertableHandle>,
-    name: &str,
-) -> Option<SupertableHandle> {
-    let handle = live_handle(handles, name)?;
-    let _ = handle.ensure_fresh();
-    if !handle.pointer_vanished() {
-        return Some(handle);
-    }
-    // Remove it only if it is still the dropped one: another process may have
-    // re-created the table since.
-    handles.remove_if(name, |_, cached| cached.pointer_vanished());
     None
 }
 
