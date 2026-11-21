@@ -552,7 +552,10 @@ fn a_plain_limit_runs_its_filter_inside_the_scan_when_it_reads_narrow_columns() 
     //  - the `WHERE` reads `m` alone; `s` is many times wider.
     //  - the rule marks the scan, DataFusion moves the `WHERE` into it, and
     //    the scan takes the limit, so it decodes `s` only for rows that pass.
-    // This test pins the plan shape and that every row returned matches.
+    //  - the gather still runs partition 0 alone first; its first file has
+    //    the rows, so the other superfile is never opened.
+    // This test pins the plan shape, the files opened and that every row
+    // returned matches.
     let (_dir, db, _table) = fixture();
     let all = matching_m(&[]);
     for (offset, fetch) in [("", FETCH), (" OFFSET 3", FETCH + 3)] {
@@ -562,6 +565,9 @@ fn a_plain_limit_runs_its_filter_inside_the_scan_when_it_reads_narrow_columns() 
         let plan = explain(&db, "", &sql);
         assert!(!plan.contains("FilterExec"), "{plan}");
         assert!(plan.contains(&format!("{SCAN_LIMIT}{fetch}")), "{plan}");
+        assert!(plan.contains(&format!("{STAGED}{fetch}")), "{plan}");
+        assert!(plan.contains(GATE), "{plan}");
+        assert_eq!(files_opened(&db, &sql), 1, "{sql}");
     }
 }
 

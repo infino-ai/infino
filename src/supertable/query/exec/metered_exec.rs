@@ -198,6 +198,12 @@ impl MeteredExec {
         })
     }
 
+    /// Whether this meter passes a `LIMIT` to a scan that runs its whole
+    /// `WHERE` as a row filter ([`Self::passing_limits`]).
+    pub(crate) fn passes_limits_to_row_filter(&self) -> bool {
+        self.limits == Limits::PassToRowFilter
+    }
+
     /// A meter over `input` with this node's collector and limit policy.
     fn rewrap(&self, input: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
         Arc::new(self.rewrapped(input))
