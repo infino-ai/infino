@@ -93,8 +93,8 @@ fn fixture_with(index: IndexSpec) -> (TempDir, Connection, Supertable) {
     )
     .expect("connect");
     let table = db.create_table("t", schema(), index).expect("create_table");
-    table.append(&batch(0)).expect("append");
-    table.append(&batch(ROWS_PER_APPEND)).expect("append");
+    table.append(&batch(0), None).expect("append");
+    table.append(&batch(ROWS_PER_APPEND), None).expect("append");
     (dir, db, table)
 }
 

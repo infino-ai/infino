@@ -51,7 +51,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // One `append` == one commit == one sealed, immutable superfile.
     let titles = ["the quick brown fox", "a lazy sleeping dog"];
-    docs.append(&build_batch(schema, &titles)?)?;
+    docs.append(&build_batch(schema, &titles)?, None)?;
 
     // A — BM25 keyword search. Arrow rows carry the auto-injected `_id`,
     // the projected columns, and a trailing `score`.

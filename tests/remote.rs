@@ -152,7 +152,9 @@ async fn append_streams_arrow_body_with_table_query() {
 
     with_connection(server.uri(), |db| {
         let table = db.open_table("posts").expect("open_table");
-        table.append(&id_batch(vec![1, 2, 3])).expect("append");
+        table
+            .append(&id_batch(vec![1, 2, 3]), None)
+            .expect("append");
     })
     .await;
 }
@@ -965,7 +967,7 @@ async fn remote_client_matches_the_published_api_spec() {
         let _ = db.schema("posts");
         let _ = db.apply_schema("posts", &body_patch(), Some(1));
         if let Ok(table) = db.open_table("posts") {
-            let _ = table.append(&id_batch(vec![1]));
+            let _ = table.append(&id_batch(vec![1]), None);
             let _ = table.update(col("id").gt(lit(0_i32)), &id_batch(vec![1]));
             let _ = table.delete(col("id").lt(lit(0_i32)));
             let _ = table.bm25_search("id", "x", 1, Bm25SearchOptions::new(), Some(&["_id"]));

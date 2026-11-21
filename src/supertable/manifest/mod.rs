@@ -113,6 +113,7 @@ use crate::{
     supertable::{
         CommitError,
         error::ManifestError,
+        idempotency::{self, IdempotencyToken, TokenStatus},
         manifest::{
             commit::{
                 EncodedPart, PointerFile, frame_content_size, part_uri, read_pointer,
@@ -650,6 +651,7 @@ impl ManifestSnapshot {
             tombstone_seqs,
             superseded_cells,
             split_checks: BTreeMap::new(),
+            idempotency: Default::default(),
         }
     }
 
@@ -1630,15 +1632,20 @@ impl ManifestSnapshot {
         // Step 4: conditional pointer write — the visibility
         // barrier. Until this succeeds, no reader sees the new
         // manifest version.
-        write_pointer(storage, &pointer, expected_prev_etag)
+        match write_pointer(storage, &pointer, expected_prev_etag)
             .instrument(detail_span!("manifest.write_pointer"))
             .await
-            .inspect_err(|e| {
-                if matches!(e, CommitError::WriteContentionExhausted) {
-                    record("lost", "pointer");
-                }
-            })?;
-        Ok(())
+        {
+            Ok(()) => Ok(()),
+            Err(CommitError::WriteContentionExhausted) => {
+                record("lost", "pointer");
+                Err(CommitError::WriteContentionExhausted)
+            }
+            Err(error) => {
+                let tokened = list_to_write.idempotency.recorded_in(pointer.manifest_id);
+                settle_pointer_write(storage, &pointer, expected_prev_etag, tokened, error).await
+            }
+        }
     }
 
     pub fn get_all_superfiles(&self) -> &[Arc<SuperfileEntry>] {
@@ -1978,6 +1985,41 @@ impl ManifestSnapshot {
             derived_length_totals: Arc::clone(&self.derived_length_totals),
             inline_rollups_fit: Arc::clone(&self.inline_rollups_fit),
         }
+    }
+
+    /// Whether this snapshot's list records `token` as committed.
+    pub(crate) fn holds_idempotency_token(&self, token: IdempotencyToken<'_>) -> bool {
+        self.list
+            .as_ref()
+            .is_some_and(|list| list.idempotency.committed(token))
+    }
+
+    /// What this snapshot's list records about `token`; see
+    /// [`idempotency::Idempotency::status`]. A snapshot with no list holds
+    /// no tokens.
+    pub(crate) fn idempotency_token_status(
+        &self,
+        token: IdempotencyToken<'_>,
+        since_ms: u64,
+    ) -> TokenStatus {
+        self.list.as_ref().map_or(TokenStatus::Absent, |list| {
+            list.idempotency.status(token, since_ms)
+        })
+    }
+
+    /// This snapshot with `token` recorded as committed by `manifest_id`,
+    /// id unchanged, for the commit that publishes it. `None` for a
+    /// snapshot with no list, which has nowhere to record it.
+    pub(crate) fn with_idempotency_token_recorded(
+        &self,
+        token: IdempotencyToken<'_>,
+        manifest_id: u64,
+        now_ms: u64,
+    ) -> Option<Self> {
+        self.list.as_ref()?;
+        Some(self.with_list_edited(false, |list| {
+            list.idempotency.record(token, manifest_id, now_ms);
+        }))
     }
 
     /// The manifest's term-index root reference, when one has been built.
@@ -3075,6 +3117,22 @@ impl ManifestSnapshot {
             .as_ref()
             .map(|list| list.split_checks.clone())
             .unwrap_or_default();
+        // Tokens carry forward on every commit, rewrites included: a list
+        // that dropped one would let a retry of its write commit the rows
+        // again. Retention runs here, as each list is written.
+        let mut idempotency = self
+            .list
+            .as_ref()
+            .map(|list| list.idempotency.clone())
+            .unwrap_or_default();
+        if !idempotency.is_empty() {
+            idempotency.expire(
+                idempotency::now_ms(),
+                opts.idempotency_token_ttl,
+                idempotency::MAX_KEY_ENTRIES,
+                self.get_next_manifest_id(),
+            );
+        }
 
         let opts_hash = options_hash::compute_options_hash(opts.as_ref(), &strategy);
         let new_list = Manifest {
@@ -3085,6 +3143,7 @@ impl ManifestSnapshot {
             tombstone_seqs,
             superseded_cells,
             split_checks,
+            idempotency,
             format_version: LIST_FORMAT_VERSION.into(),
             manifest_id: self.get_next_manifest_id(),
             options_hash: opts_hash,
@@ -6331,6 +6390,64 @@ impl ClusterCentroids {
     }
 }
 
+/// Settle a pointer write that failed with something other than lost
+/// contention: the request may have landed before the error reached us (a
+/// timeout, a dropped connection), so the pointer is read back to decide.
+///
+/// - The pointer names this commit's list: the commit landed, and it is
+///   reported as landed. An append that landed never returns an error,
+///   so a caller that retries on error cannot write the rows twice.
+/// - The pointer is where the commit found it (same etag, or still
+///   absent for a create): the write did not land, and `error` stands.
+/// - The pointer moved to another commit: this one lost the slot, or
+///   landed and was built on since. For a `tokened` commit, one whose list
+///   records an idempotency token, that is reported as contention: the
+///   commit loop refreshes and the token in the list it reads settles
+///   which. For any other commit `error` stands, since a retry could not
+///   tell that it landed and might apply it twice.
+/// - The read-back fails too: nothing is known, and `error` stands.
+async fn settle_pointer_write(
+    storage: &dyn StorageProvider,
+    pointer: &PointerFile,
+    expected_prev_etag: Option<&str>,
+    tokened: bool,
+    error: CommitError,
+) -> Result<(), CommitError> {
+    let current = match read_pointer(storage).await {
+        Ok(current) => current,
+        Err(read_error) => {
+            warn!(
+                manifest_id = pointer.manifest_id,
+                %error,
+                %read_error,
+                "pointer write failed and the read-back failed too; the commit is uncertain"
+            );
+            return Err(error);
+        }
+    };
+    match current {
+        Some((found, _)) if found == *pointer => {
+            warn!(
+                manifest_id = pointer.manifest_id,
+                %error,
+                "pointer write reported an error but landed; the commit stands"
+            );
+            Ok(())
+        }
+        None if expected_prev_etag.is_none() => Err(error),
+        Some((_, meta))
+            if expected_prev_etag.is_some() && meta.etag.as_deref() == expected_prev_etag =>
+        {
+            Err(error)
+        }
+        _ if tokened => {
+            record("lost", "pointer");
+            Err(CommitError::WriteContentionExhausted)
+        }
+        _ => Err(error),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -7452,6 +7569,7 @@ mod tests {
                 tombstone_seqs: Default::default(),
                 superseded_cells: Default::default(),
                 split_checks: Default::default(),
+                idempotency: Default::default(),
                 format_version: LIST_FORMAT_VERSION.into(),
                 manifest_id: 1,
                 options_hash: ContentHash([0u8; 32]),
@@ -8406,6 +8524,7 @@ mod tests {
             tombstone_seqs: Default::default(),
             superseded_cells: Default::default(),
             split_checks: Default::default(),
+            idempotency: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 1,
             options_hash: part::ContentHash([0u8; 32]),
@@ -8596,6 +8715,7 @@ mod tests {
                 tombstone_seqs: Default::default(),
                 superseded_cells: Default::default(),
                 split_checks: Default::default(),
+                idempotency: Default::default(),
                 format_version: list::FORMAT_VERSION.into(),
                 manifest_id: 0,
                 options_hash: ContentHash([0u8; 32]),
@@ -8743,6 +8863,7 @@ mod tests {
             tombstone_seqs: Default::default(),
             superseded_cells: Default::default(),
             split_checks: Default::default(),
+            idempotency: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -8825,6 +8946,7 @@ mod tests {
             tombstone_seqs: Default::default(),
             superseded_cells: Default::default(),
             split_checks: Default::default(),
+            idempotency: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 1,
             options_hash: ContentHash([0u8; 32]),
@@ -8955,6 +9077,63 @@ mod tests {
         let store: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("local"));
         (dir, store)
+    }
+
+    #[tokio::test]
+    async fn a_failed_pointer_write_finding_the_pointer_moved_retries_only_a_tokened_commit() {
+        // The pointer names another commit's list and its etag is not the
+        // one this commit expected: it lost the slot, or landed and was
+        // built on. A tokened commit's retry tells which from the token, so
+        // it is contention; any other commit keeps its error, since a retry
+        // could apply it twice.
+        let (_dir, storage) = local_storage();
+        let pointer = |manifest_id: u64| PointerFile {
+            manifest_id,
+            manifest_uri: format!("manifest-{manifest_id}"),
+            content_hash: ContentHash::of(&manifest_id.to_le_bytes()),
+        };
+        write_pointer(storage.as_ref(), &pointer(3), None)
+            .await
+            .expect("another commit's pointer");
+        let failure = || {
+            CommitError::Storage(StorageError::NotFound {
+                uri: "the pointer write's own error".into(),
+            })
+        };
+        let tokened =
+            settle_pointer_write(storage.as_ref(), &pointer(2), Some("seen"), true, failure())
+                .await;
+        assert!(
+            matches!(tokened, Err(CommitError::WriteContentionExhausted)),
+            "{tokened:?}"
+        );
+        let plain = settle_pointer_write(
+            storage.as_ref(),
+            &pointer(2),
+            Some("seen"),
+            false,
+            failure(),
+        )
+        .await;
+        assert!(
+            matches!(
+                plain,
+                Err(CommitError::Storage(StorageError::NotFound { .. }))
+            ),
+            "{plain:?}"
+        );
+        let ours = settle_pointer_write(
+            storage.as_ref(),
+            &pointer(3),
+            Some("seen"),
+            false,
+            failure(),
+        )
+        .await;
+        assert!(
+            ours.is_ok(),
+            "the pointer names this commit: it landed: {ours:?}"
+        );
     }
 
     /// The variables of the handle measurement: a `file://` catalog root and
@@ -9372,7 +9551,7 @@ mod tests {
             let batch = wide_batch(&schema, commit);
             let built = resident_mib();
             let started = Instant::now();
-            table.append(&batch).expect("append");
+            table.append(&batch, None).expect("append");
             drop(batch);
             let seconds = started.elapsed().as_secs_f64();
             eprintln!(
@@ -9433,6 +9612,7 @@ mod tests {
             tombstone_seqs: Default::default(),
             superseded_cells: Default::default(),
             split_checks: Default::default(),
+            idempotency: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 1,
             options_hash: ContentHash([0u8; 32]),
@@ -9650,6 +9830,7 @@ mod tests {
             tombstone_seqs: Default::default(),
             superseded_cells: Default::default(),
             split_checks: Default::default(),
+            idempotency: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 1,
             options_hash: ContentHash([0u8; 32]),
@@ -10532,6 +10713,7 @@ mod tests {
             tombstone_seqs: Default::default(),
             superseded_cells: Default::default(),
             split_checks: Default::default(),
+            idempotency: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -10713,6 +10895,7 @@ mod tests {
             tombstone_seqs: Default::default(),
             superseded_cells: Default::default(),
             split_checks: Default::default(),
+            idempotency: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -10879,6 +11062,7 @@ mod tests {
             tombstone_seqs: Default::default(),
             superseded_cells: Default::default(),
             split_checks: Default::default(),
+            idempotency: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -11097,6 +11281,7 @@ mod tests {
             tombstone_seqs: Default::default(),
             superseded_cells: Default::default(),
             split_checks: Default::default(),
+            idempotency: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -11210,6 +11395,7 @@ mod tests {
             tombstone_seqs: Default::default(),
             superseded_cells: Default::default(),
             split_checks: Default::default(),
+            idempotency: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -11350,6 +11536,7 @@ mod tests {
             tombstone_seqs: Default::default(),
             superseded_cells: Default::default(),
             split_checks: Default::default(),
+            idempotency: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -11480,6 +11667,7 @@ mod tests {
             tombstone_seqs: Default::default(),
             superseded_cells: Default::default(),
             split_checks: Default::default(),
+            idempotency: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -11629,6 +11817,7 @@ mod tests {
             tombstone_seqs: Default::default(),
             superseded_cells: Default::default(),
             split_checks: Default::default(),
+            idempotency: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -11788,6 +11977,7 @@ mod tests {
             tombstone_seqs: Default::default(),
             superseded_cells: Default::default(),
             split_checks: Default::default(),
+            idempotency: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -11961,6 +12151,7 @@ mod tests {
             tombstone_seqs: Default::default(),
             superseded_cells: Default::default(),
             split_checks: Default::default(),
+            idempotency: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -12202,6 +12393,7 @@ mod tests {
             tombstone_seqs: Default::default(),
             superseded_cells: Default::default(),
             split_checks: Default::default(),
+            idempotency: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -12312,6 +12504,7 @@ mod tests {
             tombstone_seqs: Default::default(),
             superseded_cells: Default::default(),
             split_checks: Default::default(),
+            idempotency: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -12438,6 +12631,7 @@ mod tests {
             tombstone_seqs: Default::default(),
             superseded_cells: Default::default(),
             split_checks: Default::default(),
+            idempotency: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -12590,6 +12784,7 @@ mod tests {
             tombstone_seqs: Default::default(),
             superseded_cells: Default::default(),
             split_checks: Default::default(),
+            idempotency: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -12739,6 +12934,7 @@ mod tests {
             tombstone_seqs: Default::default(),
             superseded_cells: Default::default(),
             split_checks: Default::default(),
+            idempotency: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -12839,6 +13035,7 @@ mod tests {
             tombstone_seqs: Default::default(),
             superseded_cells: Default::default(),
             split_checks: Default::default(),
+            idempotency: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -12958,6 +13155,7 @@ mod tests {
             tombstone_seqs: Default::default(),
             superseded_cells: Default::default(),
             split_checks: Default::default(),
+            idempotency: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -13106,6 +13304,7 @@ mod tests {
             tombstone_seqs: Default::default(),
             superseded_cells: Default::default(),
             split_checks: Default::default(),
+            idempotency: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 1,
             options_hash: part::ContentHash([0u8; 32]),

@@ -964,7 +964,7 @@ fn sql_fixture(dir: &TempDir) -> Connection {
     ));
     let ratings: ArrayRef = Arc::new(Int64Array::from((0..SQL_ROWS as i64).collect::<Vec<_>>()));
     let batch = RecordBatch::try_new(schema, vec![title_arr, ratings]).expect("batch");
-    docs.append(&batch).expect("append");
+    docs.append(&batch, None).expect("append");
     db
 }
 
@@ -1022,7 +1022,7 @@ fn sql_like_fixture(dir: &TempDir, padded: bool, extra: &[String]) -> Connection
         (0..titles.len() as i64).collect::<Vec<_>>(),
     ));
     let batch = RecordBatch::try_new(schema, vec![title_arr, ratings]).expect("batch");
-    docs.append(&batch).expect("append");
+    docs.append(&batch, None).expect("append");
     db
 }
 
@@ -1427,7 +1427,7 @@ fn sql_vector_fixture(dir: &TempDir) -> Connection {
                 .vector("emb", DIM, Metric::L2Sq),
         )
         .expect("create_table");
-    docs.append(&vector_batch(schema)).expect("append");
+    docs.append(&vector_batch(schema), None).expect("append");
     docs.local_handle()
         .drain_vectors_to_cells_sync()
         .expect("drain");

@@ -117,6 +117,17 @@ impl RemoteCatalog {
         query: &[(&str, &str)],
         body: Vec<u8>,
     ) -> Result<ureq::Response, InfinoError> {
+        self.post_arrow_with_headers(op, query, &[], body)
+    }
+
+    /// [`Self::post_arrow`] with extra request headers.
+    pub(crate) fn post_arrow_with_headers(
+        &self,
+        op: &str,
+        query: &[(&str, &str)],
+        headers: &[(&str, &str)],
+        body: Vec<u8>,
+    ) -> Result<ureq::Response, InfinoError> {
         let mut request = self
             .agent
             .post(&self.url(op))
@@ -124,6 +135,9 @@ impl RemoteCatalog {
             .set("Content-Type", wire::ARROW_STREAM_CONTENT_TYPE);
         for (key, value) in query {
             request = request.query(key, value);
+        }
+        for (name, value) in headers {
+            request = request.set(name, value);
         }
         map_send(op, request.send_bytes(&body))
     }

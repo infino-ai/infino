@@ -209,7 +209,7 @@ fn create(db: &Connection, name: &str, commits: usize, vectors: bool) -> Superta
         .create_table(name, schema(vectors), index)
         .expect("create_table");
     for commit in 0..commits {
-        table.append(&batch(commit, vectors)).expect("append");
+        table.append(&batch(commit, vectors), None).expect("append");
     }
     table
 }

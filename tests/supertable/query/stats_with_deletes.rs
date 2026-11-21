@@ -215,7 +215,7 @@ impl Fixture {
         for _ in 0..n_files {
             let rows = random_file(&mut rng, next_key);
             next_key += rows.len() as i64;
-            table.append(&batch(&rows)).expect("append");
+            table.append(&batch(&rows), None).expect("append");
             files.push(rows);
         }
         Self {
@@ -568,7 +568,7 @@ fn table_of(files: &[Vec<Row>]) -> (TempDir, Connection, Supertable) {
         .create_table(TABLE, schema(), IndexSpec::new())
         .expect("create");
     for rows in files {
-        table.append(&batch(rows)).expect("append");
+        table.append(&batch(rows), None).expect("append");
     }
     (dir, conn, table)
 }
@@ -765,18 +765,16 @@ fn grouped_count_corrects_the_superfile_with_deletes() {
         f: None,
     };
     table
-        .append(&batch(&[
-            row(0, Some("a")),
-            row(1, Some("b")),
-            row(2, None),
-        ]))
+        .append(
+            &batch(&[row(0, Some("a")), row(1, Some("b")), row(2, None)]),
+            None,
+        )
         .expect("append clean");
     table
-        .append(&batch(&[
-            row(3, Some("a")),
-            row(4, Some("c")),
-            row(5, None),
-        ]))
+        .append(
+            &batch(&[row(3, Some("a")), row(4, Some("c")), row(5, None)]),
+            None,
+        )
         .expect("append the one with deletes");
     table.delete(col("k").eq(lit(4i64))).expect("delete");
 

@@ -6933,6 +6933,7 @@ mod tests {
             graph_ref: None,
             schema: None,
             expected_schema_id: None,
+            idempotency_token: None,
         };
         let no_removals = Vec::new();
         // The hidden table's own scoped provider — its pointer file, not the
@@ -7136,6 +7137,7 @@ mod tests {
             graph_ref: None,
             schema: None,
             expected_schema_id: None,
+            idempotency_token: None,
         };
         let no_removals = Vec::new();
         let hidden_storage = hidden
@@ -7216,6 +7218,7 @@ mod tests {
             graph_ref: None,
             schema: None,
             expected_schema_id: None,
+            idempotency_token: None,
         };
         let zero_manifest = hidden
             .block_on_query(persist_commit_async(
@@ -7421,6 +7424,7 @@ mod tests {
             graph_ref: None,
             schema: None,
             expected_schema_id: None,
+            idempotency_token: None,
         };
         let no_removals = Vec::new();
         let hidden_storage = hidden
@@ -7605,6 +7609,7 @@ mod tests {
             graph_ref: None,
             schema: None,
             expected_schema_id: None,
+            idempotency_token: None,
         };
         let hidden_storage = hidden
             .inner()

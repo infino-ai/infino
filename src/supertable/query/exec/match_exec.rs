@@ -1102,7 +1102,7 @@ mod tests {
             .create_table(METERED_TABLE, Arc::clone(schema), spec)
             .expect("create");
         for batch in commits {
-            table.append(batch).expect("append");
+            table.append(batch, None).expect("append");
         }
         conn
     }
@@ -1519,7 +1519,7 @@ mod tests {
             IndexSpec::new().fts("title").fts("tag"),
         )
         .expect("create")
-        .append(&batch)
+        .append(&batch, None)
         .expect("append");
         conn.open_table(METERED_TABLE)
             .expect("open")
@@ -1677,7 +1677,7 @@ mod tests {
         )
         .expect("batch");
         let table = conn.open_table(METERED_TABLE).expect("open");
-        table.append(&later).expect("append with the column");
+        table.append(&later, None).expect("append with the column");
         for sql in match_path_sqls("rust") {
             let filtered = format!("{sql} WHERE body = 'v' OR tag = 'y'");
             assert_eq!(metered_rows(&conn, &filtered).0, 2, "{filtered}");
@@ -2378,7 +2378,10 @@ mod tests {
         for day in DAYS_AFTER_RETYPE {
             let at = TimestampNanosecondArray::from(vec![day * NANOS_PER_DAY; 2]);
             table
-                .append(&titled_batch(&retyped, &["Zyzzyva", "page"], Arc::new(at)))
+                .append(
+                    &titled_batch(&retyped, &["Zyzzyva", "page"], Arc::new(at)),
+                    None,
+                )
                 .expect("append");
         }
         let got = walked(&conn, "zyzzyva", "", "day DESC", "LIMIT 1", "day");

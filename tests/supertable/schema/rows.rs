@@ -82,7 +82,7 @@ fn documents_grow_the_schema_and_read_back() {
     let docs = db
         .create_table(TABLE, title_schema(), IndexSpec::new().fts("title"))
         .expect("create");
-    docs.append_rows(&corpus()).expect("append rows");
+    docs.append_rows(&corpus(), None).expect("append rows");
 
     let doc = db.schema(TABLE).expect("schema");
     let names: Vec<&str> = doc.fields().iter().map(|f| f.name.as_str()).collect();
@@ -148,14 +148,17 @@ fn an_array_of_objects_lines_its_leaves_up_by_element() {
     let docs = db
         .create_table(TABLE, title_schema(), IndexSpec::new())
         .expect("create");
-    docs.append_rows(&[json!({
-        "title": "a",
-        "comments": [
-            {"user": "ann", "stars": 5},
-            {"user": "bob"},
-            {"user": "cy", "stars": 3}
-        ]
-    })])
+    docs.append_rows(
+        &[json!({
+            "title": "a",
+            "comments": [
+                {"user": "ann", "stars": 5},
+                {"user": "bob"},
+                {"user": "cy", "stars": 3}
+            ]
+        })],
+        None,
+    )
     .expect("append rows");
 
     let batches = db
@@ -194,7 +197,7 @@ fn the_frozen_document_matches_the_shared_fixture() {
     let docs = db
         .create_table(TABLE, title_schema(), IndexSpec::new().fts("title"))
         .expect("create");
-    docs.append_rows(&corpus()).expect("append rows");
+    docs.append_rows(&corpus(), None).expect("append rows");
     let canonical = db.schema(TABLE).expect("schema").to_json().to_string();
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join(FIXTURES)
@@ -216,21 +219,21 @@ fn every_refusal_names_the_schema_write_that_admits_the_rows() {
     let docs = db
         .create_table(TABLE, title_schema(), IndexSpec::new())
         .expect("create");
-    docs.append_rows(&[json!({"title": "a", "n": 1})])
+    docs.append_rows(&[json!({"title": "a", "n": 1})], None)
         .expect("n is Int64 from here");
 
     // A fraction, `5.0` and a string are all refused on an Int64 path, and
     // a retype to Float64 admits the numbers.
     schema_error(
-        docs.append_rows(&[json!({"title": "b", "n": 1.5})]),
+        docs.append_rows(&[json!({"title": "b", "n": 1.5})], None),
         "Int64",
     );
     schema_error(
-        docs.append_rows(&[json!({"title": "b", "n": 5.0})]),
+        docs.append_rows(&[json!({"title": "b", "n": 5.0})], None),
         "Int64",
     );
     schema_error(
-        docs.append_rows(&[json!({"title": "b", "n": "42"})]),
+        docs.append_rows(&[json!({"title": "b", "n": "42"})], None),
         "Int64",
     );
     db.apply_schema(
@@ -239,16 +242,19 @@ fn every_refusal_names_the_schema_write_that_admits_the_rows() {
         None,
     )
     .expect("retype");
-    docs.append_rows(&[
-        json!({"title": "b", "n": 1.5}),
-        json!({"title": "c", "n": 5}),
-    ])
+    docs.append_rows(
+        &[
+            json!({"title": "b", "n": 1.5}),
+            json!({"title": "c", "n": 5}),
+        ],
+        None,
+    )
     .expect("floats and integral literals fit a Float64 column");
     assert_eq!(column(&db, "n"), vec!["1", "1.5", "5"]);
 
     // A mixed array is refused outright.
     schema_error(
-        docs.append_rows(&[json!({"title": "d", "x": [1, "a"]})]),
+        docs.append_rows(&[json!({"title": "d", "x": [1, "a"]})], None),
         "more than one type",
     );
 
@@ -262,7 +268,7 @@ fn every_refusal_names_the_schema_write_that_admits_the_rows() {
     db.apply_schema(TABLE, &caps(Some(3), None), None)
         .expect("cap");
     schema_error(
-        docs.append_rows(&[json!({"title": "e", "p": 1, "q": 2})]),
+        docs.append_rows(&[json!({"title": "e", "p": 1, "q": 2})], None),
         "over its cap",
     );
     assert_eq!(
@@ -272,18 +278,18 @@ fn every_refusal_names_the_schema_write_that_admits_the_rows() {
     );
     db.apply_schema(TABLE, &caps(Some(10), None), None)
         .expect("raise");
-    docs.append_rows(&[json!({"title": "e", "p": 1, "q": 2})])
+    docs.append_rows(&[json!({"title": "e", "p": 1, "q": 2})], None)
         .expect("within the cap");
 
     db.apply_schema(TABLE, &caps(None, Some(2)), None)
         .expect("depth");
     schema_error(
-        docs.append_rows(&[json!({"title": "f", "a": {"b": {"c": 1}}})]),
+        docs.append_rows(&[json!({"title": "f", "a": {"b": {"c": 1}}})], None),
         "nests deeper",
     );
     db.apply_schema(TABLE, &caps(None, Some(3)), None)
         .expect("deeper");
-    docs.append_rows(&[json!({"title": "f", "a": {"b": {"c": 1}}})])
+    docs.append_rows(&[json!({"title": "f", "a": {"b": {"c": 1}}})], None)
         .expect("within the depth");
     assert!(db.schema(TABLE).expect("schema").id_of("a.b.c").is_some());
 }
@@ -295,8 +301,11 @@ fn update_rows_obey_the_same_rules() {
     let docs = db
         .create_table(TABLE, title_schema(), IndexSpec::new().fts("title"))
         .expect("create");
-    docs.append_rows(&[json!({"title": "a", "n": 1}), json!({"title": "b", "n": 2})])
-        .expect("append");
+    docs.append_rows(
+        &[json!({"title": "a", "n": 1}), json!({"title": "b", "n": 2})],
+        None,
+    )
+    .expect("append");
     let stats = docs
         .update_rows(
             col("title").eq(lit("a")),
@@ -339,7 +348,7 @@ fn a_body_of_distinct_keys_costs_its_values_not_rows_times_columns() {
     let rows: Vec<Value> = (0..ROWS)
         .map(|i| json!({ "title": "t", format!("k{i}"): i as i64 }))
         .collect();
-    docs.append_rows(&rows).expect("append a sparse body");
+    docs.append_rows(&rows, None).expect("append a sparse body");
 
     let doc = db.schema(TABLE).expect("schema");
     assert_eq!(
@@ -379,10 +388,13 @@ fn an_array_inside_an_array_of_objects_is_refused() {
         .expect("create");
 
     let err = docs
-        .append_rows(&[json!({
-            "title": "a",
-            "xs": [{"a": 1, "t": ["p", "q"]}, {"a": 2, "t": ["r"]}]
-        })])
+        .append_rows(
+            &[json!({
+                "title": "a",
+                "xs": [{"a": 1, "t": ["p", "q"]}, {"a": 2, "t": ["r"]}]
+            })],
+            None,
+        )
         .expect_err("a nested array has no single position per element");
     assert!(
         matches!(&err, InfinoError::Schema(SchemaError::NestedArray { path }) if path == "xs.t"),
@@ -390,10 +402,13 @@ fn an_array_inside_an_array_of_objects_is_refused() {
     );
 
     // The scalar leaves of an array of objects still line up.
-    docs.append_rows(&[json!({
-        "title": "b",
-        "xs": [{"a": 1}, {"a": 2, "b": 3}]
-    })])
+    docs.append_rows(
+        &[json!({
+            "title": "b",
+            "xs": [{"a": 1}, {"a": 2, "b": 3}]
+        })],
+        None,
+    )
     .expect("scalar leaves are positional");
 }
 
@@ -420,7 +435,7 @@ fn a_document_fills_a_struct_column_it_names() {
         )
         .expect("create");
 
-    docs.append_rows(&[json!({"title": "x", "a": {"b": 1}})])
+    docs.append_rows(&[json!({"title": "x", "a": {"b": 1}})], None)
         .expect("the document fills the struct it names");
 
     // No shadow column was created, and the value reads back where the
@@ -444,7 +459,7 @@ fn a_document_fills_a_struct_column_it_names() {
     // A key the struct does not declare is still refused: its fields are the
     // table's, and storing the row without the key would lose the value.
     let err = docs
-        .append_rows(&[json!({"title": "z", "a": {"c": 2}})])
+        .append_rows(&[json!({"title": "z", "a": {"c": 2}})], None)
         .expect_err("`c` is not a field of the struct");
     assert!(
         matches!(
@@ -465,7 +480,7 @@ fn a_document_fills_a_struct_column_it_names() {
         )
         .expect("create");
     let err = flat
-        .append_rows(&[json!({"a": {"b": 1}})])
+        .append_rows(&[json!({"a": {"b": 1}})], None)
         .expect_err("an object does not fill a scalar column");
     assert!(
         matches!(
@@ -477,6 +492,6 @@ fn a_document_fills_a_struct_column_it_names() {
     );
 
     // A path that nests under nothing is still free to join.
-    docs.append_rows(&[json!({"title": "y", "meta": {"source": "s"}})])
+    docs.append_rows(&[json!({"title": "y", "meta": {"source": "s"}})], None)
         .expect("a fresh nested path flattens as before");
 }

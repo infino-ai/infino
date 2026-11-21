@@ -240,7 +240,7 @@ fn update(
         .collect();
     *next_key += keys.len() as i64;
     table
-        .append(&rows(schema, columns, &keys, rng))
+        .append(&rows(schema, columns, &keys, rng), None)
         .expect("append the new versions");
 }
 
@@ -328,7 +328,7 @@ pub fn run() {
             .map(|r| (commit * ROWS_PER_COMMIT + r) as i64)
             .collect();
         table
-            .append(&rows(&schema, columns, &keys, &mut rng))
+            .append(&rows(&schema, columns, &keys, &mut rng), None)
             .expect("append");
     }
     let mut next_key = (commits * ROWS_PER_COMMIT) as i64;

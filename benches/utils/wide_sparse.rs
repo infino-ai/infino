@@ -380,7 +380,7 @@ fn build(root: &Path, rows: usize, columns: usize) {
         let n = ROWS_PER_COMMIT.min(rows - first_row);
         let width = width_at(commit, commits, columns);
         let batch = sparse_batch(&mut rng, commit, n, width, first_row);
-        table.append(&batch).expect("append");
+        table.append(&batch, None).expect("append");
     }
 }
 

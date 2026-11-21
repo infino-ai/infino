@@ -1266,7 +1266,7 @@ impl Connection {
     /// # let db = connect("memory://")?;
     /// # let schema = Arc::new(Schema::new(vec![Field::new("body", DataType::LargeUtf8, false)]));
     /// # let posts = db.create_table("posts", schema.clone(), IndexSpec::new().fts("body"))?;
-    /// # posts.append(&RecordBatch::try_new(schema, vec![Arc::new(LargeStringArray::from(vec!["hello"]))])?)?;
+    /// # posts.append(&RecordBatch::try_new(schema, vec![Arc::new(LargeStringArray::from(vec!["hello"]))])?, None)?;
     /// let rows = db.query_sql("SELECT _id, body FROM posts")?;
     /// assert_eq!(rows.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
@@ -2684,7 +2684,7 @@ mod tests {
 
         conn.create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
             .expect("create_table after create_database")
-            .append(&build_title_batch(&["fox"]))
+            .append(&build_title_batch(&["fox"]), None)
             .expect("append");
         assert_eq!(count_rows(&conn, "docs"), 1);
     }
@@ -2803,7 +2803,7 @@ mod tests {
                 ],
             )
             .expect("batch");
-            table.append(&batch).expect("append");
+            table.append(&batch, None).expect("append");
         }
         let on_disk = walkdir_parquet_bytes(dir.path());
         assert!(on_disk > 0, "the table wrote superfiles");
@@ -2873,7 +2873,7 @@ mod tests {
         let (conn, _dir) = storage_conn();
         conn.create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
             .expect("create_table")
-            .append(&build_title_batch(&["fox"]))
+            .append(&build_title_batch(&["fox"]), None)
             .expect("append");
 
         let (building, handles) = storage_maps(&conn);
@@ -2929,7 +2929,7 @@ mod tests {
         .expect("create_table must not panic on a poisoned gate")
         .expect("create_table should succeed after recovering the poisoned gate");
         table
-            .append(&build_title_batch(&["fox"]))
+            .append(&build_title_batch(&["fox"]), None)
             .expect("append to the created table");
         assert_eq!(count_rows(&conn, "fresh"), 1, "the created table is usable");
     }
@@ -2941,7 +2941,7 @@ mod tests {
             .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
             .expect("create_table");
         table
-            .append(&build_title_batch(&["the quick brown fox"]))
+            .append(&build_title_batch(&["the quick brown fox"]), None)
             .expect("append");
 
         assert_eq!(conn.list_tables().expect("list"), vec!["docs".to_string()]);
@@ -3008,11 +3008,10 @@ mod tests {
             )
             .expect("create stemmed table");
         stemmed
-            .append(&build_title_batch(&[
-                "running late",
-                "she runs fast",
-                "a walk",
-            ]))
+            .append(
+                &build_title_batch(&["running late", "she runs fast", "a walk"]),
+                None,
+            )
             .expect("append");
 
         // Every inflection reaches both documents holding one, whichever
@@ -3034,11 +3033,10 @@ mod tests {
             .create_table("plain", schema_id_title(), IndexSpec::new().fts("title"))
             .expect("create plain table");
         plain
-            .append(&build_title_batch(&[
-                "running late",
-                "she runs fast",
-                "a walk",
-            ]))
+            .append(
+                &build_title_batch(&["running late", "she runs fast", "a walk"]),
+                None,
+            )
             .expect("append");
         let hits = plain
             .bm25_search("title", "run", TOP_K, Bm25SearchOptions::new(), None)
@@ -3064,7 +3062,10 @@ mod tests {
             )
             .expect("create stopped table");
         stopped
-            .append(&build_title_batch(&["the fox and the hound", "a cat"]))
+            .append(
+                &build_title_batch(&["the fox and the hound", "a cat"]),
+                None,
+            )
             .expect("append");
 
         // The content words still search normally.
@@ -3106,12 +3107,15 @@ mod tests {
             )
             .expect("create table");
         table
-            .append(&build_title_batch(&[
-                "new york city",                // 0: the words are adjacent
-                "new the york city",            // 1: a removed word sits between them
-                "the end of the world is nigh", // 2
-                "end world",                    // 3: no gap where the phrase wants one
-            ]))
+            .append(
+                &build_title_batch(&[
+                    "new york city",                // 0: the words are adjacent
+                    "new the york city",            // 1: a removed word sits between them
+                    "the end of the world is nigh", // 2
+                    "end world",                    // 3: no gap where the phrase wants one
+                ]),
+                None,
+            )
             .expect("append");
 
         let phrase = |q: &str| -> usize {
@@ -3165,7 +3169,7 @@ mod tests {
                 )
                 .expect("create_table");
             table
-                .append(&build_title_batch(&["the running studies"]))
+                .append(&build_title_batch(&["the running studies"]), None)
                 .expect("append");
         }
         // A fresh connection over the same root, so the spec is rebuilt
@@ -3206,7 +3210,10 @@ mod tests {
                 )
                 .expect("create_table");
             table
-                .append(&build_title_batch(&["new york city", "york new city"]))
+                .append(
+                    &build_title_batch(&["new york city", "york new city"]),
+                    None,
+                )
                 .expect("append");
             // The phrase works before the reopen, so a failure after it
             // is the round-trip and not the declaration.
@@ -3258,7 +3265,7 @@ mod tests {
             .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
             .expect("create_table");
         table
-            .append(&build_title_batch(&["york new city"]))
+            .append(&build_title_batch(&["york new city"]), None)
             .expect("append");
         let err = table
             .bm25_search(
@@ -3334,7 +3341,7 @@ mod tests {
             .create_table("dflt", schema_id_title(), IndexSpec::new().fts("title"))
             .expect("create default table");
         table
-            .append(&build_title_batch(&["café latte"]))
+            .append(&build_title_batch(&["café latte"]), None)
             .expect("append");
         let hits = table
             .bm25_search("title", "café", TOP_K, Bm25SearchOptions::new(), None)
@@ -3382,7 +3389,10 @@ mod tests {
             )
             .expect("create_table");
         table
-            .append(&title_body_batch(schema, "running late", "running late"))
+            .append(
+                &title_body_batch(schema, "running late", "running late"),
+                None,
+            )
             .expect("append");
 
         let search = |column: &str, query: &str| {
@@ -3506,11 +3516,10 @@ mod tests {
                 )
                 .expect("create_table");
             table
-                .append(&title_body_batch(
-                    schema.clone(),
-                    "stored title",
-                    "hidden signal text",
-                ))
+                .append(
+                    &title_body_batch(schema.clone(), "stored title", "hidden signal text"),
+                    None,
+                )
                 .expect("append");
         }
         let conn2 = connect(&uri).expect("reconnect");
@@ -3557,7 +3566,7 @@ mod tests {
         )
         .expect("batch");
         assert!(
-            table.append(&short).is_err(),
+            table.append(&short, None).is_err(),
             "append without the index-only column must be rejected"
         );
         let _ = fs::remove_dir_all(&dir);
@@ -3629,7 +3638,7 @@ mod tests {
         // Fully usable: the first commit lands through the reopened handle,
         // then the query round-trips.
         opened
-            .append(&build_title_batch(&["the quick brown fox"]))
+            .append(&build_title_batch(&["the quick brown fox"]), None)
             .expect("append via reopened handle");
         let hits = opened
             .bm25_search("title", "fox", TOP_K, Bm25SearchOptions::new(), None)
@@ -3654,9 +3663,9 @@ mod tests {
                 .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
                 .expect("create_table");
             // Two commits, so the manifest has parts to not read.
-            docs.append(&build_title_batch(&["the quick brown fox"]))
+            docs.append(&build_title_batch(&["the quick brown fox"]), None)
                 .expect("append");
-            docs.append(&build_title_batch(&["jumps over the lazy dog"]))
+            docs.append(&build_title_batch(&["jumps over the lazy dog"]), None)
                 .expect("append");
             let patch =
                 SchemaPatch::new(vec![FieldPatch::named("views").with_type(DataType::Int64)]);
@@ -3734,7 +3743,7 @@ mod tests {
         writer
             .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
             .expect("create_table")
-            .append(&build_title_batch(&["the quick brown fox"]))
+            .append(&build_title_batch(&["the quick brown fox"]), None)
             .expect("append");
 
         // Fresh reader connection with a disk cache: empty in-memory tier, so
@@ -3823,7 +3832,7 @@ mod tests {
             .expect("connect writer")
             .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
             .expect("create_table")
-            .append(&build_title_batch(&["the quick brown fox"]))
+            .append(&build_title_batch(&["the quick brown fox"]), None)
             .expect("append");
         let reader = cached_reader(&uri, cache.path());
         reader.query_sql("SELECT title FROM docs").expect("scan");
@@ -3853,7 +3862,7 @@ mod tests {
         writer
             .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
             .expect("create_table")
-            .append(&build_title_batch(&["the quick brown fox"]))
+            .append(&build_title_batch(&["the quick brown fox"]), None)
             .expect("append");
         let reader = cached_reader(&uri, cache.path());
         reader.query_sql("SELECT title FROM docs").expect("scan");
@@ -3865,7 +3874,7 @@ mod tests {
         writer
             .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
             .expect("re-create")
-            .append(&build_title_batch(&["a slow green turtle"]))
+            .append(&build_title_batch(&["a slow green turtle"]), None)
             .expect("append");
         // Trip the reader's freshness probe, as a peer's drop is first seen
         // (`storage_recreated_table_after_a_peer_drop_reads_the_new_generation`).
@@ -3894,7 +3903,7 @@ mod tests {
             .expect("connect writer")
             .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
             .expect("create_table")
-            .append(&build_title_batch(&["the quick brown fox"]))
+            .append(&build_title_batch(&["the quick brown fox"]), None)
             .expect("append");
         let table_root = cache.path().join("docs");
         fs::create_dir_all(&table_root).expect("mkdir");
@@ -3952,7 +3961,7 @@ mod tests {
         writer
             .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
             .expect("create_table")
-            .append(&build_title_batch(&["the quick brown fox"]))
+            .append(&build_title_batch(&["the quick brown fox"]), None)
             .expect("append");
 
         // Warm the peer's handle cache, and confirm it really is serving.
@@ -4022,7 +4031,7 @@ mod tests {
         writer
             .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
             .expect("create_table")
-            .append(&build_title_batch(&["the quick brown fox"]))
+            .append(&build_title_batch(&["the quick brown fox"]), None)
             .expect("append");
 
         // Read once through the held handle so the superfile bytes are resident
@@ -4097,13 +4106,13 @@ mod tests {
         writer
             .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
             .expect("create_table")
-            .append(&build_title_batch(&["the quick brown fox"]))
+            .append(&build_title_batch(&["the quick brown fox"]), None)
             .expect("append");
 
         // Write once through the peer, so its handle carries real manifest state.
         let peer_table = peer.open_table("docs").expect("peer opens the table");
         peer_table
-            .append(&build_title_batch(&["peer row"]))
+            .append(&build_title_batch(&["peer row"]), None)
             .expect("peer append before the drop");
 
         writer.drop_table("docs", true).expect("drop_table");
@@ -4113,7 +4122,7 @@ mod tests {
         );
 
         let err = peer_table
-            .append(&build_title_batch(&["after the drop"]))
+            .append(&build_title_batch(&["after the drop"]), None)
             .expect_err("appending to a purged table must fail");
         // The same answer the read path gives. It has to survive the commit →
         // build → mutation-commit error hops the append path takes, or a caller
@@ -4152,19 +4161,19 @@ mod tests {
         writer
             .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
             .expect("create_table")
-            .append(&build_title_batch(&["seeded"]))
+            .append(&build_title_batch(&["seeded"]), None)
             .expect("append");
 
         // The peer only ever writes — no query, so no freshness probe.
         let peer_table = peer.open_table("docs").expect("peer opens the table");
         peer_table
-            .append(&build_title_batch(&["peer row"]))
+            .append(&build_title_batch(&["peer row"]), None)
             .expect("peer append before the drop");
 
         writer.drop_table("docs", true).expect("drop_table");
 
         let err = peer_table
-            .append(&build_title_batch(&["after the drop"]))
+            .append(&build_title_batch(&["after the drop"]), None)
             .expect_err("appending to a purged table must refuse");
         assert!(
             matches!(err, InfinoError::NotFound(_)),
@@ -4176,12 +4185,12 @@ mod tests {
         writer
             .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
             .expect("re-create")
-            .append(&build_title_batch(&["new one"]))
+            .append(&build_title_batch(&["new one"]), None)
             .expect("append to the new generation");
 
         peer.open_table("docs")
             .expect("peer re-opens the re-created table")
-            .append(&build_title_batch(&["peer writes again"]))
+            .append(&build_title_batch(&["peer writes again"]), None)
             .expect("a write-only peer must recover after the re-create");
         assert_eq!(
             count_rows(&writer, "docs"),
@@ -4211,7 +4220,10 @@ mod tests {
         writer
             .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
             .expect("create_table")
-            .append(&build_title_batch(&["old one", "old two", "old three"]))
+            .append(
+                &build_title_batch(&["old one", "old two", "old three"]),
+                None,
+            )
             .expect("append");
         assert_eq!(count_rows(&peer, "docs"), 3, "peer warms on the old table");
 
@@ -4219,7 +4231,7 @@ mod tests {
         writer
             .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
             .expect("re-create")
-            .append(&build_title_batch(&["new one"]))
+            .append(&build_title_batch(&["new one"]), None)
             .expect("append to the new generation");
 
         // Trip the peer's freshness probe (see the read-path test above).
@@ -4254,7 +4266,10 @@ mod tests {
         writer
             .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
             .expect("create_table")
-            .append(&build_title_batch(&["old one", "old two", "old three"]))
+            .append(
+                &build_title_batch(&["old one", "old two", "old three"]),
+                None,
+            )
             .expect("append");
 
         // Warm the peer's handle cache *without* querying through it, so no
@@ -4281,7 +4296,7 @@ mod tests {
         writer
             .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
             .expect("re-create")
-            .append(&build_title_batch(&["new one"]))
+            .append(&build_title_batch(&["new one"]), None)
             .expect("append to the new generation");
         assert_eq!(
             count_rows(&peer, "docs"),
@@ -4332,7 +4347,7 @@ mod tests {
         writer
             .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
             .expect("create_table")
-            .append(&build_title_batch(&["the quick brown fox"]))
+            .append(&build_title_batch(&["the quick brown fox"]), None)
             .expect("append");
 
         let reader = connect_with(
@@ -4375,7 +4390,7 @@ mod tests {
         let conn = connect(&uri).expect("connect");
         conn.create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
             .expect("create_table")
-            .append(&build_title_batch(&["fox"]))
+            .append(&build_title_batch(&["fox"]), None)
             .expect("append");
         // Warm the memo so the drop must actively evict it.
         conn.open_table("docs").expect("open before drop");
@@ -4402,7 +4417,7 @@ mod tests {
         let conn = connect(&uri).expect("connect");
         conn.create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
             .expect("create_table")
-            .append(&build_title_batch(&["fox"]))
+            .append(&build_title_batch(&["fox"]), None)
             .expect("append");
 
         // First drop removes the table from the catalog and purges its bytes.
@@ -4436,7 +4451,7 @@ mod tests {
             let name = format!("t{round}");
             conn.create_table(&name, schema_id_title(), IndexSpec::new().fts("title"))
                 .expect("create_table")
-                .append(&build_title_batch(&["fox"]))
+                .append(&build_title_batch(&["fox"]), None)
                 .expect("append");
             // Warm the memo, so a racing open can observe (and must not restore)
             // an entry the drop is removing.
@@ -4482,7 +4497,7 @@ mod tests {
                 s.spawn(|| {
                     conn.create_table(&name, schema_id_title(), IndexSpec::new().fts("title"))
                         .expect("create_table")
-                        .append(&build_title_batch(&["fox"]))
+                        .append(&build_title_batch(&["fox"]), None)
                         .expect("append");
                 });
                 for _ in 0..OPENERS {
@@ -4520,7 +4535,7 @@ mod tests {
             .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
             .expect("create_table");
         table
-            .append(&build_title_batch(&["one"]))
+            .append(&build_title_batch(&["one"]), None)
             .expect("append 1");
 
         // First query memoizes + warms the handle.
@@ -4530,7 +4545,7 @@ mod tests {
         // (the memoized one), then re-query: the memoized handle must see it.
         conn.open_table("docs")
             .expect("open")
-            .append(&build_title_batch(&["two"]))
+            .append(&build_title_batch(&["two"]), None)
             .expect("append 2");
         assert_eq!(
             count_rows(&conn, "docs"),
@@ -4558,7 +4573,7 @@ mod tests {
         writer
             .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
             .expect("create_table")
-            .append(&build_title_batch(&["one"]))
+            .append(&build_title_batch(&["one"]), None)
             .expect("append 1");
 
         // A separate connection memoizes + warms its own handle for `docs`.
@@ -4573,7 +4588,7 @@ mod tests {
         writer
             .open_table("docs")
             .expect("reopen for append")
-            .append(&build_title_batch(&["two"]))
+            .append(&build_title_batch(&["two"]), None)
             .expect("append 2");
 
         assert_eq!(
@@ -4801,7 +4816,7 @@ mod tests {
             .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
             .expect("create");
         first
-            .append(&build_title_batch(&["a lazy sleeping fox"]))
+            .append(&build_title_batch(&["a lazy sleeping fox"]), None)
             .expect("append");
         assert_eq!(
             n_rows(
@@ -4902,7 +4917,7 @@ mod tests {
             .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
             .expect("create");
         table
-            .append(&build_title_batch(&["a lazy sleeping fox"]))
+            .append(&build_title_batch(&["a lazy sleeping fox"]), None)
             .expect("append");
         assert!(
             files_under_location(dir.path(), "docs-") > 0,
@@ -4937,7 +4952,7 @@ mod tests {
         let conn = connect_with(dir.path().to_str().expect("utf8 path"), options).expect("connect");
         conn.create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
             .expect("create")
-            .append(&build_title_batch(&["a lazy sleeping fox"]))
+            .append(&build_title_batch(&["a lazy sleeping fox"]), None)
             .expect("append");
 
         // More objects under the table's location than one round of
@@ -5025,12 +5040,15 @@ mod tests {
         let docs = conn
             .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
             .expect("create docs");
-        docs.append(&build_title_batch(&["the quick brown fox", "a lazy dog"]))
-            .expect("append docs");
+        docs.append(
+            &build_title_batch(&["the quick brown fox", "a lazy dog"]),
+            None,
+        )
+        .expect("append docs");
         let more = conn
             .create_table("more", schema_id_title(), IndexSpec::new().fts("title"))
             .expect("create more");
-        more.append(&build_title_batch(&["hello world"]))
+        more.append(&build_title_batch(&["hello world"]), None)
             .expect("append more");
 
         // Resolved by catalog name (not the old hardcoded `supertable`).
@@ -5062,10 +5080,10 @@ mod tests {
             .create_table(name, schema_id_title(), IndexSpec::new())
             .expect("create");
         table
-            .append(&build_title_batch(&["yellow", "green", "yellow"]))
+            .append(&build_title_batch(&["yellow", "green", "yellow"]), None)
             .expect("append 1");
         table
-            .append(&build_title_batch(&["fhv", "yellow"]))
+            .append(&build_title_batch(&["fhv", "yellow"]), None)
             .expect("append 2");
     }
 
@@ -5157,10 +5175,10 @@ mod tests {
             .expect("batch")
         };
         table
-            .append(&rows(&["a", "b", "c"], vec![Some(1), None, Some(3)]))
+            .append(&rows(&["a", "b", "c"], vec![Some(1), None, Some(3)]), None)
             .expect("append with notes");
         table
-            .append(&rows(&["d", "e"], vec![None, None]))
+            .append(&rows(&["d", "e"], vec![None, None]), None)
             .expect("append without notes");
         let entries = table
             .local_handle()
@@ -5433,7 +5451,7 @@ mod tests {
             .expect("peer")
             .open_table("cabs")
             .expect("open for writing")
-            .append(&build_title_batch(&["yellow"]))
+            .append(&build_title_batch(&["yellow"]), None)
             .expect("append");
         let cold = connect_strong(&uri);
         cold.usage_meter().start_trace();
@@ -5454,7 +5472,7 @@ mod tests {
         let table = conn.open_table("cabs").expect("open for writing");
         assert!(table.local_handle().statistics_loaded());
         table
-            .append(&build_title_batch(&["yellow"]))
+            .append(&build_title_batch(&["yellow"]), None)
             .expect("append");
         assert!(table.local_handle().statistics_loaded());
         assert_eq!(count_on(&conn, YELLOW_COUNT), YELLOW_CABS + 1);
@@ -5539,7 +5557,10 @@ mod tests {
             .create_table(name, Arc::clone(&schema), IndexSpec::new())
             .expect("create");
         table
-            .append(&RecordBatch::try_new(schema, vec![values]).expect("batch"))
+            .append(
+                &RecordBatch::try_new(schema, vec![values]).expect("batch"),
+                None,
+            )
             .expect("append");
         table
     }
@@ -6009,7 +6030,7 @@ mod tests {
                 ],
             )
             .expect("batch");
-            table.append(&batch).expect("append");
+            table.append(&batch, None).expect("append");
         }
         let reader = table.local_handle().reader().expect("reader");
         let superfiles = reader.manifest().get_all_superfiles();
@@ -6075,6 +6096,7 @@ mod tests {
                     vec![Arc::new(LargeStringArray::from(vec!["x", "y"]))],
                 )
                 .expect("batch"),
+                None,
             )
             .expect("append");
         assert_value_counts(&conn, "tags", "tag", Answered::FromStats);
@@ -6144,6 +6166,7 @@ mod tests {
                     vec![distinct_strings("b", UNDER_THE_TABLE_LIMIT)],
                 )
                 .expect("batch"),
+                None,
             )
             .expect("append");
         assert_value_counts(&conn, "split", "tag", Answered::ByGroupBy);
@@ -6179,7 +6202,7 @@ mod tests {
         assert_value_counts(&conn, "cabs", "title", Answered::FromStats);
         let table = conn.open_table("cabs").expect("open");
         table
-            .append(&build_title_batch(&["green", "taxi"]))
+            .append(&build_title_batch(&["green", "taxi"]), None)
             .expect("append");
         assert_value_counts(&conn, "cabs", "title", Answered::FromStats);
 
@@ -6390,16 +6413,22 @@ mod tests {
             .expect("batch")
         };
         table
-            .append(&batch(
-                vec![Some("yellow"), None, Some("green")],
-                vec![Some(10.0), Some(2.5), None],
-            ))
+            .append(
+                &batch(
+                    vec![Some("yellow"), None, Some("green")],
+                    vec![Some(10.0), Some(2.5), None],
+                ),
+                None,
+            )
             .expect("append 1");
         table
-            .append(&batch(
-                vec![Some("yellow"), Some("fhv"), None],
-                vec![None, Some(7.0), Some(0.5)],
-            ))
+            .append(
+                &batch(
+                    vec![Some("yellow"), Some("fhv"), None],
+                    vec![None, Some(7.0), Some(0.5)],
+                ),
+                None,
+            )
             .expect("append 2");
     }
 
@@ -6571,7 +6600,8 @@ mod tests {
             .expect("create");
         let titles = many_distinct_titles();
         let refs: Vec<&str> = titles.iter().map(String::as_str).collect();
-        docs.append(&build_title_batch(&refs)).expect("append");
+        docs.append(&build_title_batch(&refs), None)
+            .expect("append");
         titles.len()
     }
 
@@ -6694,7 +6724,7 @@ mod tests {
         let docs = conn
             .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
             .expect("create docs");
-        docs.append(&build_title_batch(&["alpha", "beta"]))
+        docs.append(&build_title_batch(&["alpha", "beta"]), None)
             .expect("append");
 
         // Same projection with rows gives the ground-truth schema to compare against.
@@ -6727,7 +6757,7 @@ mod tests {
         let docs = conn
             .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
             .expect("create docs");
-        docs.append(&build_title_batch(&["alpha", "beta"]))
+        docs.append(&build_title_batch(&["alpha", "beta"]), None)
             .expect("append");
 
         // The same aggregate over matching rows gives the ground-truth schema:
@@ -6772,7 +6802,7 @@ mod tests {
         let docs = conn
             .create_table("docs", schema_id_title(), IndexSpec::new())
             .expect("create docs");
-        docs.append(&build_title_batch(&["alpha", "beta"]))
+        docs.append(&build_title_batch(&["alpha", "beta"]), None)
             .expect("append");
         conn.create_table("blank", schema_id_title(), IndexSpec::new())
             .expect("create blank");
@@ -6832,7 +6862,7 @@ mod tests {
         let docs = conn
             .create_table("docs", schema_id_title(), IndexSpec::new())
             .expect("create docs");
-        docs.append(&build_title_batch(&["alpha", "beta", "alpha"]))
+        docs.append(&build_title_batch(&["alpha", "beta", "alpha"]), None)
             .expect("append");
 
         let batches = conn
@@ -6865,7 +6895,7 @@ mod tests {
         let docs = conn
             .create_table("docs", schema_id_title(), IndexSpec::new())
             .expect("create docs");
-        docs.append(&build_title_batch(&["beta", "alpha", "gamma"]))
+        docs.append(&build_title_batch(&["beta", "alpha", "gamma"]), None)
             .expect("append");
 
         let batches = conn
@@ -6902,9 +6932,9 @@ mod tests {
         let b = conn
             .create_table("b", schema_id_title(), IndexSpec::new())
             .expect("create b");
-        a.append(&build_title_batch(&["rust", "go"]))
+        a.append(&build_title_batch(&["rust", "go"]), None)
             .expect("append a");
-        b.append(&build_title_batch(&["rust", "go"]))
+        b.append(&build_title_batch(&["rust", "go"]), None)
             .expect("append b");
 
         let batches = conn
@@ -6954,6 +6984,7 @@ mod tests {
                 ],
             )
             .expect("a batch"),
+            None,
         )
         .expect("append a");
         b.append(
@@ -6966,6 +6997,7 @@ mod tests {
                 ],
             )
             .expect("b batch"),
+            None,
         )
         .expect("append b");
 
@@ -7140,7 +7172,7 @@ mod tests {
         let b = conn
             .create_table("b", Arc::clone(&b_schema), IndexSpec::new().fts("title"))
             .expect("create b");
-        a.append(&build_title_batch(&["red fox", "lazy dog"]))
+        a.append(&build_title_batch(&["red fox", "lazy dog"]), None)
             .expect("append a");
         b.append(
             &RecordBatch::try_new(
@@ -7151,6 +7183,7 @@ mod tests {
                 ],
             )
             .expect("b batch"),
+            None,
         )
         .expect("append b");
         let title_id = |table: &str| {
@@ -7181,8 +7214,11 @@ mod tests {
         let docs = conn
             .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
             .expect("create docs");
-        docs.append(&build_title_batch(&["the quick brown fox", "a lazy dog"]))
-            .expect("append");
+        docs.append(
+            &build_title_batch(&["the quick brown fox", "a lazy dog"]),
+            None,
+        )
+        .expect("append");
 
         // Leading table-name argument selects the catalog table.
         let rows: usize = conn
@@ -7213,8 +7249,11 @@ mod tests {
         let docs = conn
             .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
             .expect("create docs");
-        docs.append(&build_title_batch(&["the quick brown fox", "a lazy dog"]))
-            .expect("append");
+        docs.append(
+            &build_title_batch(&["the quick brown fox", "a lazy dog"]),
+            None,
+        )
+        .expect("append");
 
         let rows: usize = conn
             .query_sql("SELECT _id, score FROM bm25_search('docs', 'title', 'fox', 10)")
@@ -7237,7 +7276,7 @@ mod tests {
         let docs = conn
             .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
             .expect("create docs");
-        docs.append(&build_title_batch(&["the quick brown fox"]))
+        docs.append(&build_title_batch(&["the quick brown fox"]), None)
             .expect("append");
         // Table-free TVF → builds the connection runtime on this thread.
         conn.query_sql("SELECT _id FROM bm25_search('docs', 'title', 'fox', 10)")
@@ -7253,11 +7292,10 @@ mod tests {
         let docs = conn
             .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
             .expect("create docs");
-        docs.append(&build_title_batch(&[
-            "the quick brown fox",
-            "a lazy dog",
-            "quick thinking",
-        ]))
+        docs.append(
+            &build_title_batch(&["the quick brown fox", "a lazy dog", "quick thinking"]),
+            None,
+        )
         .expect("append");
 
         // Unranked token match: rows containing the token, any order.
@@ -7341,7 +7379,7 @@ mod tests {
                 .vector("emb", VEC_DIM, Metric::L2Sq),
         )
         .expect("create table")
-        .append(&batch)
+        .append(&batch, None)
         .expect("append");
         conn
     }
@@ -7367,7 +7405,7 @@ mod tests {
         let conn = conn_with_vector_table();
         conn.create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
             .expect("create docs")
-            .append(&build_title_batch(&["rust", "zig"]))
+            .append(&build_title_batch(&["rust", "zig"]), None)
             .expect("append");
         let v = one_hot_csv(0);
         // (what, first call, second call, first count, second count)
@@ -7517,7 +7555,7 @@ mod tests {
         let conn = connect("memory://").expect("connect");
         conn.create_table("notes", schema_id_title(), IndexSpec::new().fts("title"))
             .expect("create notes")
-            .append(&build_title_batch(&["rust async"]))
+            .append(&build_title_batch(&["rust async"]), None)
             .expect("append notes");
         let cases = [
             (
@@ -7678,7 +7716,7 @@ mod tests {
             .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
             .expect("create");
         table
-            .append(&build_title_batch(&["the quick brown fox"]))
+            .append(&build_title_batch(&["the quick brown fox"]), None)
             .expect("append");
         let hits = table
             .bm25_search("title", "fox", TOP_K, Bm25SearchOptions::new(), None)
@@ -7760,7 +7798,7 @@ mod tests {
         writer
             .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
             .expect("create")
-            .append(&build_title_batch(&["fox"]))
+            .append(&build_title_batch(&["fox"]), None)
             .expect("append v1");
 
         // A separate default (BoundedStaleness) connection. Its first read sees
@@ -7780,7 +7818,7 @@ mod tests {
         writer
             .open_table("docs")
             .expect("open")
-            .append(&build_title_batch(&["fox"]))
+            .append(&build_title_batch(&["fox"]), None)
             .expect("append v2");
 
         // Within the 1s window the reader still serves its pinned snapshot.
@@ -7851,7 +7889,7 @@ mod tests {
         let docs = conn
             .create_table("docs", schema_id_title(), IndexSpec::new())
             .expect("create docs");
-        docs.append(&build_title_batch(&["one row"]))
+        docs.append(&build_title_batch(&["one row"]), None)
             .expect("append docs");
         conn
     }
@@ -8167,7 +8205,7 @@ mod tests {
         for rows in [ORDER_FIRST_APPEND_ROWS, ORDER_SECOND_APPEND_ROWS] {
             let titles: Vec<String> = (0..rows).map(|i| format!("row {i}")).collect();
             let refs: Vec<&str> = titles.iter().map(String::as_str).collect();
-            t.append(&build_title_batch(&refs)).expect("append");
+            t.append(&build_title_batch(&refs), None).expect("append");
         }
         let sql = "SELECT CAST(_id AS VARCHAR) AS v FROM t ORDER BY _id";
 
@@ -8349,7 +8387,7 @@ mod tests {
         let docs = conn
             .create_table("docs", schema_id_title(), IndexSpec::new())
             .expect("create docs");
-        docs.append(&build_title_batch(&["one row"]))
+        docs.append(&build_title_batch(&["one row"]), None)
             .expect("append docs");
         let predicate = (0..MAX_PREDICATE_CONNECTIVES + 1)
             .map(|i| col("title").eq(lit(format!("t{i}"))))
@@ -8489,7 +8527,9 @@ mod tests {
                         .vector("embedding", 16, Metric::L2Sq),
                 )
                 .expect("create vector table");
-            table.append(&one_vector()).expect("append vector row");
+            table
+                .append(&one_vector(), None)
+                .expect("append vector row");
         }
 
         // Reopen: open_table rebuilds the spec via metric_from_str and
@@ -8541,7 +8581,7 @@ mod tests {
         let docs = conn
             .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
             .expect("create docs");
-        docs.append(&build_title_batch(&["alpha", "beta"]))
+        docs.append(&build_title_batch(&["alpha", "beta"]), None)
             .expect("append");
         let rows: usize = conn
             .query_sql("SELECT a.title FROM docs a JOIN docs b ON a._id = b._id")
@@ -8563,7 +8603,7 @@ mod tests {
                 .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
                 .expect("create_table");
             table
-                .append(&build_title_batch(&["a lazy sleeping fox"]))
+                .append(&build_title_batch(&["a lazy sleeping fox"]), None)
                 .expect("append");
         }
 
@@ -8612,7 +8652,7 @@ mod tests {
             .expect("create posts");
         let posts = conn.open_table("posts").expect("open");
         posts
-            .append(&build_title_batch(&["hello world"]))
+            .append(&build_title_batch(&["hello world"]), None)
             .expect("append one row");
 
         let err = posts
@@ -8645,7 +8685,7 @@ mod tests {
         let before_b = b.usage_snapshot();
         a.create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
             .expect("create a")
-            .append(&build_title_batch(&["alpha"]))
+            .append(&build_title_batch(&["alpha"]), None)
             .expect("append a");
         let delta_a = a.usage_snapshot().since(&before_a);
         let delta_b = b.usage_snapshot().since(&before_b);
@@ -8800,7 +8840,9 @@ mod tests {
                 .collect();
             titles.push(format!("gone {i}"));
             let titles: Vec<&str> = titles.iter().map(String::as_str).collect();
-            table.append(&build_title_batch(&titles)).expect("append");
+            table
+                .append(&build_title_batch(&titles), None)
+                .expect("append");
         }
         let deleted = table
             .delete(col("title").like(lit("gone%")))
@@ -9337,7 +9379,7 @@ mod tests {
                 vec![Arc::new(Int64Array::from(n)), Arc::new(body)],
             )
             .expect("batch");
-            table.append(&batch).expect("append");
+            table.append(&batch, None).expect("append");
         }
         table.local_handle().storage_bytes().expect("table size")
     }

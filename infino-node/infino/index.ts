@@ -134,6 +134,42 @@ export interface ConnectOptions {
   apiKey?: string;
 }
 
+/**
+ * Makes a retried write commit once: a string key, or `{ scope, seq }` for
+ * the `seq`th commit of the writer `scope` (a non-negative integer).
+ */
+export type IdempotencyToken = string | { scope: string; seq: number };
+
+/** Options for `append` / `appendNamed`. */
+export interface AppendOptions {
+  /**
+   * When the table already holds this token, the call returns without
+   * appending again. Empty input records nothing. Refused for a table with
+   * no storage (`memory://`).
+   */
+  idempotencyToken?: IdempotencyToken;
+}
+
+/** Whether the write that carried a token committed. */
+export type IdempotencyTokenStatus =
+  | {
+      status: "committed";
+      /** The manifest the token was recorded in. */
+      manifestId: number;
+      /** When it committed, in milliseconds since the Unix epoch. */
+      committedMs: number;
+      /** For a `{ scope, seq }` token, the scope's latest committed number. */
+      seq?: number;
+    }
+  /** The table never held the token, or held it before `sinceMs`. */
+  | { status: "absent" }
+  /** Retention may have dropped it after `sinceMs`: whether it committed is unknown. */
+  | { status: "expired" };
+
+function nativeToken(token: IdempotencyToken): { key?: string; scope?: string; seq?: number } {
+  return typeof token === "string" ? { key: token } : { scope: token.scope, seq: token.seq };
+}
+
 /** Row counts returned by `update` / `delete`. */
 export interface MutationStats {
   /** Rows the predicate matched. */
@@ -547,11 +583,15 @@ export class Table {
   /**
    * Append rows. Accepts an array of objects, an apache-arrow
    * Table/RecordBatch, or raw Arrow IPC bytes. Durable on return; one
-   * append == one commit.
+   * append == one commit. With `opts.idempotencyToken`, an append the table
+   * already holds returns without appending again.
    */
-  append(data: AppendData): void {
+  append(data: AppendData, opts: AppendOptions = {}): void {
     const input = writeInput(data);
-    guard(this.remote, () => ("rows" in input ? this.inner.appendRows(input.rows) : this.inner.append(input.ipc)));
+    const token = opts.idempotencyToken === undefined ? undefined : nativeToken(opts.idempotencyToken);
+    guard(this.remote, () =>
+      "rows" in input ? this.inner.appendRows(input.rows, token) : this.inner.append(input.ipc, token),
+    );
   }
 
   /**
@@ -559,14 +599,39 @@ export class Table {
    * this commit writes are keyed `data/<stem>-<uuid>.sf.parquet`, with the
    * stem the key-safe form of `sourceName` (lowercase `[a-z0-9_]`), so a
    * bucket listing shows where each came from. The table behaves exactly as
-   * after `append`; the name is a label on the object key. Not available on
-   * a hosted table.
+   * after `append`, `opts` included; the name is a label on the object key.
+   * Not available on a hosted table.
    */
-  appendNamed(data: AppendData, sourceName: string): void {
+  appendNamed(data: AppendData, sourceName: string, opts: AppendOptions = {}): void {
     const input = writeInput(data);
+    const token = opts.idempotencyToken === undefined ? undefined : nativeToken(opts.idempotencyToken);
     guard(this.remote, () =>
-      "rows" in input ? this.inner.appendRowsNamed(input.rows, sourceName) : this.inner.appendNamed(input.ipc, sourceName),
+      "rows" in input
+        ? this.inner.appendRowsNamed(input.rows, sourceName, token)
+        : this.inner.appendNamed(input.ipc, sourceName, token),
     );
+  }
+
+  /**
+   * Whether the write that carried `token` committed, as the table holds it
+   * now. Pass as `sinceMs` a time, in milliseconds since the Unix epoch,
+   * before the write was first tried (default 0).
+   */
+  idempotencyTokenStatus(token: IdempotencyToken, sinceMs = 0): IdempotencyTokenStatus {
+    const out = guard(this.remote, () => this.inner.idempotencyTokenStatus(nativeToken(token), sinceMs));
+    switch (out.status) {
+      case "committed":
+        return {
+          status: "committed",
+          manifestId: out.manifestId as number,
+          committedMs: out.committedMs as number,
+          ...(out.seq == null ? {} : { seq: out.seq }),
+        };
+      case "absent":
+        return { status: "absent" };
+      default:
+        return { status: "expired" };
+    }
   }
 
   /** Ranked BM25 search; rows as records (or an Arrow `Table`). `score` is a

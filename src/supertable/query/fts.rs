@@ -4524,7 +4524,7 @@ impl Supertable {
     /// # let schema = Arc::new(Schema::new(vec![Field::new("body", DataType::LargeUtf8, false)]));
     /// # let posts = db.create_table("posts", schema.clone(), IndexSpec::new().fts("body"))?;
     /// # posts.append(&RecordBatch::try_new(
-    /// #     schema, vec![Arc::new(LargeStringArray::from(vec!["the quick brown fox"]))])?)?;
+    /// #     schema, vec![Arc::new(LargeStringArray::from(vec!["the quick brown fox"]))])?, None)?;
     /// // Bare call → `_id` + `score`, no scalar decode:
     /// let hits = posts.bm25_search("body", "fox", 10, Bm25SearchOptions::new(), None)?;
     /// assert_eq!(hits[0].num_columns(), 2);
@@ -4719,7 +4719,7 @@ impl Supertable {
     /// # posts.append(&RecordBatch::try_new(
     /// #     schema,
     /// #     vec![Arc::new(LargeStringArray::from(vec!["the quick brown fox", "a lazy dog"]))],
-    /// # )?)?;
+    /// # )?, None)?;
     /// let n = posts.count("body", "fox", BoolMode::Or)?;
     /// assert_eq!(n, 1);
     /// // `+must` defines the count; bare terms are scoring-only:

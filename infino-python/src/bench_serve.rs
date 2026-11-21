@@ -369,7 +369,7 @@ fn do_append(stream: &mut TcpStream, srv: &ServeState) -> std::io::Result<()> {
         #[allow(clippy::readonly_write_lock)]
         let g = srv.state.write().unwrap();
         let table = g.table.as_ref().ok_or("append before create")?;
-        table.append(&batch).map_err(|e| e.to_string())
+        table.append(&batch, None).map_err(|e| e.to_string())
     })();
     match &res {
         Ok(()) => {

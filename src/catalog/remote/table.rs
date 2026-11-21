@@ -30,8 +30,9 @@ use serde_json::{Value, json};
 
 use super::{RemoteCatalog, read_arrow, read_json, wire};
 use crate::{
-    Bm25SearchOptions, BoolMode, GcError, GcReport, InfinoError, MutationStats, OptimizeError,
-    OptimizeOptions, ReindexError, ReindexOptions, StagedAppend, Supertable, VectorFilter,
+    Bm25SearchOptions, BoolMode, GcError, GcReport, IdempotencyToken, InfinoError, MutationStats,
+    OptimizeError, OptimizeOptions, ReindexError, ReindexOptions, StagedAppend, Supertable,
+    TokenStatus, VectorFilter,
     catalog::table::Table,
     dynamic::rows_to_batch,
     superfile::VectorSearchOptions,
@@ -209,6 +210,20 @@ fn reject_remote_overrides(opts: &VectorSearchOptions) -> Result<(), InfinoError
     Ok(())
 }
 
+/// The request header a hosted append carries its idempotency token in.
+pub(crate) const IDEMPOTENCY_TOKEN_HEADER: &str = "Idempotency-Token";
+
+/// `token` as an [`IDEMPOTENCY_TOKEN_HEADER`] value, or refused when it
+/// cannot travel as one.
+fn token_header(token: IdempotencyToken<'_>) -> Result<String, InfinoError> {
+    token.to_header_value().ok_or_else(|| {
+        InfinoError::Unsupported(format!(
+            "idempotency token {token:?} cannot travel to a hosted table: it must be non-empty \
+             visible ASCII, with no leading or trailing space"
+        ))
+    })
+}
+
 /// Parse an update/delete response (`{matched, n_tombstoned, n_not_found}`)
 /// into [`MutationStats`].
 fn parse_mutation_stats(op: &str, response: ureq::Response) -> Result<MutationStats, InfinoError> {
@@ -232,11 +247,44 @@ impl Table for RemoteTable {
         self.schema.clone()
     }
 
-    fn append(&self, batch: &RecordBatch) -> Result<(), InfinoError> {
+    /// A token travels as the `Idempotency-Token` header, so a hosted
+    /// table records it with the rows as a local table does.
+    fn append(
+        &self,
+        batch: &RecordBatch,
+        idempotency_token: Option<IdempotencyToken<'_>>,
+    ) -> Result<(), InfinoError> {
+        let header = idempotency_token.map(token_header).transpose()?;
+        let headers: Vec<(&str, &str)> = header
+            .iter()
+            .map(|value| (IDEMPOTENCY_TOKEN_HEADER, value.as_str()))
+            .collect();
         let body = wire::batches_to_ipc(std::slice::from_ref(batch))?;
-        self.catalog
-            .post_arrow("append", &[("table", self.table_name.as_str())], body)?;
+        self.catalog.post_arrow_with_headers(
+            "append",
+            &[("table", self.table_name.as_str())],
+            &headers,
+            body,
+        )?;
         Ok(())
+    }
+
+    fn idempotency_token_status(
+        &self,
+        token: IdempotencyToken<'_>,
+        since_ms: u64,
+    ) -> Result<TokenStatus, InfinoError> {
+        let op = "idempotency_token_status";
+        let token = match token {
+            IdempotencyToken::Key(key) => json!({ "key": key }),
+            IdempotencyToken::Sequence { scope, seq } => json!({ "scope": scope, "seq": seq }),
+        };
+        let response = self.catalog.post_json(
+            op,
+            json!({ "table_name": self.table_name, "token": token, "since_ms": since_ms }),
+        )?;
+        serde_json::from_value(read_json(op, response)?)
+            .map_err(|e| InfinoError::Backend(format!("{op} response: {e}")))
     }
 
     /// Staging writes superfiles to the table's storage, which the hosted
@@ -247,7 +295,11 @@ impl Table for RemoteTable {
         ))
     }
 
-    fn commit_staged(&self, _staged: &[StagedAppend]) -> Result<(), InfinoError> {
+    fn commit_staged(
+        &self,
+        _staged: &[StagedAppend],
+        _idempotency_token: Option<IdempotencyToken<'_>>,
+    ) -> Result<(), InfinoError> {
         Err(InfinoError::Unsupported(
             "commit_staged is not available on a hosted table; use append".into(),
         ))
@@ -257,7 +309,12 @@ impl Table for RemoteTable {
     /// name has nowhere to travel. Refused rather than silently dropped: a
     /// caller asking for named superfiles and getting unnamed ones would have
     /// no way to tell.
-    fn append_named(&self, _batch: &RecordBatch, source_name: &str) -> Result<(), InfinoError> {
+    fn append_named(
+        &self,
+        _batch: &RecordBatch,
+        source_name: &str,
+        _idempotency_token: Option<IdempotencyToken<'_>>,
+    ) -> Result<(), InfinoError> {
         Err(InfinoError::Backend(format!(
             "append_named({source_name:?}) is not available on a hosted table: the append wire \
              carries no source name; use append"
@@ -267,16 +324,25 @@ impl Table for RemoteTable {
     /// Rows are mapped here against the Arrow schema the table was opened
     /// with, and travel as a batch; the hosted side applies its own rules
     /// to the batch.
-    fn append_rows(&self, rows: &[Value]) -> Result<(), InfinoError> {
+    fn append_rows(
+        &self,
+        rows: &[Value],
+        idempotency_token: Option<IdempotencyToken<'_>>,
+    ) -> Result<(), InfinoError> {
         let batch = rows_to_batch(rows, &TableSchema::from_user_schema(&self.schema))
             .map_err(|e| InfinoError::Schema(e).with_context("append_rows", None))?;
-        self.append(&batch)
+        self.append(&batch, idempotency_token)
     }
 
-    fn append_rows_named(&self, rows: &[Value], source_name: &str) -> Result<(), InfinoError> {
+    fn append_rows_named(
+        &self,
+        rows: &[Value],
+        source_name: &str,
+        idempotency_token: Option<IdempotencyToken<'_>>,
+    ) -> Result<(), InfinoError> {
         let batch = rows_to_batch(rows, &TableSchema::from_user_schema(&self.schema))
             .map_err(|e| InfinoError::Schema(e).with_context("append_rows_named", None))?;
-        self.append_named(&batch, source_name)
+        self.append_named(&batch, source_name, idempotency_token)
     }
 
     fn update_rows(&self, predicate: Expr, rows: &[Value]) -> Result<MutationStats, InfinoError> {
