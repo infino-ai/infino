@@ -16,7 +16,7 @@ use crate::{
     superfile::{
         builder::FtsConfig,
         fts::{
-            analysis::{Stemmer, Stopwords},
+            analysis::{Analyzer, Stemmer, Stopwords, check_chain},
             bm25::Bm25Params,
             tokenize::STANDARD_TOKENIZER,
         },
@@ -86,8 +86,15 @@ impl FtsField {
         }
     }
 
-    /// Name the column's base tokenizer. `"standard"`, the default, is the
-    /// only one; any other name is refused at `create_table`.
+    /// Name the column's base tokenizer: `"standard"` (the default) or
+    /// `"keyword"`. Any other name is refused at `create_table`.
+    ///
+    /// `keyword` indexes each value as one term, exactly as written: no
+    /// splitting, lowercasing or trimming, so `Foo`, `foo` and `foo.` are
+    /// three different terms. It suits exact values such as host names,
+    /// paths or status codes. A query on such a column is one whole value
+    /// too. It takes no [`stopwords`](FtsField::stopwords) or
+    /// [`stemmer`](FtsField::stemmer).
     pub fn analyzer(mut self, name: impl Into<String>) -> Self {
         self.analyzer = name.into();
         self
@@ -496,15 +503,34 @@ impl IndexSpec {
         self
     }
 
-    /// Refuses an FTS column that names an analyzer other than `standard`.
+    /// Refuses an FTS column that names an analyzer this engine does not
+    /// ship, or a `keyword` column with stopwords or a stemmer.
     pub(crate) fn check_analyzers(&self) -> Result<(), InfinoError> {
-        match self.fts.iter().find(|f| f.analyzer != STANDARD_TOKENIZER) {
-            Some(f) => Err(InfinoError::Config(format!(
-                "FTS column {:?}: unsupported analyzer {:?}; the only analyzer is {STANDARD_TOKENIZER:?}",
-                f.column, f.analyzer
-            ))),
-            None => Ok(()),
+        for f in &self.fts {
+            let Some(analyzer) = Analyzer::from_name(&f.analyzer) else {
+                return Err(InfinoError::Config(format!(
+                    "FTS column {:?}: unsupported analyzer {:?}; the analyzers are \
+                     {STANDARD_TOKENIZER:?} and {:?}",
+                    f.column,
+                    f.analyzer,
+                    Analyzer::Keyword.as_str()
+                )));
+            };
+            check_chain(analyzer, f.stopwords, f.stemmer).map_err(|reason| {
+                InfinoError::Config(format!("FTS column {:?}: {reason}", f.column))
+            })?;
         }
+        Ok(())
+    }
+
+    /// FTS base tokenizers, in declaration order (parallel to
+    /// [`fts_columns`](Self::fts_columns)). The names were checked by
+    /// [`check_analyzers`](Self::check_analyzers) at `create_table`.
+    pub(crate) fn fts_analyzers(&self) -> Vec<Analyzer> {
+        self.fts
+            .iter()
+            .map(|f| Analyzer::from_name(&f.analyzer).unwrap_or_default())
+            .collect()
     }
 
     /// FTS column names, in declaration order.
@@ -560,8 +586,10 @@ impl IndexSpec {
         let fts = self
             .fts
             .iter()
-            .map(|f| {
+            .zip(self.fts_analyzers())
+            .map(|(f, analyzer)| {
                 FtsConfig::new(f.column.clone())
+                    .analyzer(analyzer)
                     .stopwords(f.stopwords)
                     .stemmer(f.stemmer)
                     .positions(f.positions)

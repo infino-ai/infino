@@ -369,7 +369,8 @@ impl IndexSpec {
 
     /// Mark `column` (a UTF-8 string column) as full-text indexed,
     /// tokenized by the Unicode-aware UAX #29 `standard` tokenizer.
-    /// `analyzer` names it; `"standard"`, the default, is the only one.
+    /// `analyzer` names it: `"standard"` (the default) or `"keyword"`,
+    /// which keeps each value as one whole term.
     /// `stored=False` makes the column index-only: searchable, but the
     /// raw text is never kept in the table, so it cannot be selected,
     /// projected, or filtered on (append/update batches still carry it).

@@ -131,7 +131,7 @@ use crate::{
                 LiveFloor, MatchWork, OR_WINDOW_MIN_TERMS, OrCursorSet, PreparedClauses, QueryDict,
                 QueryIdf, ScoringView,
             },
-            tokenize::Phrase,
+            tokenize::{KEYWORD_TOKENIZER, Phrase},
         },
         id_space::{FtsDocId, RowId},
     },
@@ -2866,17 +2866,22 @@ impl SupertableReader {
         // As in `bm25_search_async`: a prefix query over a column with no
         // full-text index would otherwise fail deep in the scan with an opaque
         // missing-metadata error. Reject up front, naming the searchable set.
-        if manifest.try_fts_tokenizer_for(column).is_none() {
+        let Some(tokenizer) = manifest.try_fts_tokenizer_for(column) else {
             return Err(QueryError::InvalidQuery(no_fts_index_message(
                 column,
                 &manifest.fts_configs(),
             )));
-        }
-        // Expansion matches the dictionary's lowercased bytes, and the
-        // term-range prune compares the same bytes, so both see one prefix.
+        };
+        // Expansion matches the dictionary's bytes, and the term-range
+        // prune compares the same bytes, so both see one prefix: lowercased,
+        // except on a keyword column, whose terms keep their case.
+        let prefix = match tokenizer.name() {
+            KEYWORD_TOKENIZER => prefix.as_bytes().to_vec(),
+            _ => prefix.to_ascii_lowercase().into_bytes(),
+        };
         let prune_leaf = PruneLeaf::Prefix {
             column: column.to_owned(),
-            prefix: prefix.to_ascii_lowercase().into_bytes(),
+            prefix,
         };
         let kept = self.select_scored(column, &prune_leaf, None).await?;
         let shoulds = self

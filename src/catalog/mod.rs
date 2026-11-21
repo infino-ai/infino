@@ -148,7 +148,6 @@ use crate::{
         fts::{
             analysis::{Stemmer, Stopwords, check_recorded_tokenizer},
             bm25,
-            tokenize::STANDARD_TOKENIZER,
         },
         vector::{builder::VectorConfig, distance::Metric},
     },
@@ -598,10 +597,11 @@ impl Connection {
                     schema_ipc: schema_to_ipc(&schema)
                         .map_err(|e| e.with_context("create_table", Some(name)))?,
                     fts: indexes.fts_columns(),
-                    fts_analyzers: vec![
-                        STANDARD_TOKENIZER.to_string();
-                        indexes.fts_columns().len()
-                    ],
+                    fts_analyzers: indexes
+                        .fts_analyzers()
+                        .iter()
+                        .map(|a| a.as_str().to_string())
+                        .collect(),
                     fts_stopwords: indexes
                         .fts_stopwords()
                         .iter()
@@ -832,10 +832,11 @@ impl Connection {
         // identical and the table's options-hash check passes.
         let mut spec = IndexSpec::new();
         for (i, column) in entry.fts.iter().enumerate() {
-            check_recorded_tokenizer(column, entry.fts_analyzers.get(i).map(String::as_str))
-                .map_err(|e| {
-                    InfinoError::Config(e.to_string()).with_context("open_table", Some(name))
-                })?;
+            let analyzer =
+                check_recorded_tokenizer(column, entry.fts_analyzers.get(i).map(String::as_str))
+                    .map_err(|e| {
+                        InfinoError::Config(e.to_string()).with_context("open_table", Some(name))
+                    })?;
             // A missing or short list reads as the default.
             let stored = entry.fts_stored.get(i).copied().unwrap_or(true);
             let positions = entry.fts_positions.get(i).copied().unwrap_or(false);
@@ -869,6 +870,7 @@ impl Connection {
             let b = entry.fts_b.get(i).copied().unwrap_or(bm25::B);
             spec = spec.fts(
                 FtsField::new(column.clone())
+                    .analyzer(analyzer.as_str())
                     .stopwords(stopwords)
                     .stemmer(stemmer)
                     .positions(positions)
@@ -2477,6 +2479,7 @@ fn seed_from_patch(patch: &SchemaPatch) -> Result<(SchemaRef, IndexSpec), Infino
         })?;
         match &field.index {
             Some(ColumnIndex::Fts {
+                analyzer,
                 stopwords,
                 stemmer,
                 positions,
@@ -2485,6 +2488,7 @@ fn seed_from_patch(patch: &SchemaPatch) -> Result<(SchemaRef, IndexSpec), Infino
             }) => {
                 indexes = indexes.fts(
                     FtsField::new(field.name.clone())
+                        .analyzer(analyzer.as_str())
                         .stopwords(*stopwords)
                         .stemmer(*stemmer)
                         .positions(*positions)
@@ -2625,7 +2629,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        Bm25SearchOptions, BoolMode, CompactionSettings, Consistency, FieldPatch, Metric,
+        Analyzer, Bm25SearchOptions, BoolMode, CompactionSettings, Consistency, FieldPatch, Metric,
         OptimizeOptions, SchemaPatch, Stemmer, Stopwords,
         catalog::manifest::CATALOG_PATH,
         runtime_metrics::{io::UriClass, op_stats::with_op_stats},
@@ -3187,6 +3191,197 @@ mod tests {
             1,
             "the reopened table still stems and still drops stopwords"
         );
+    }
+
+    /// Values a keyword column must keep apart: case, a trailing dot, a
+    /// space and slashes, the empty string, and non-ASCII.
+    const KEYWORD_VALUES: [&str; 6] = ["Foo", "foo", "foo.", "/a/b c", "", "Café ☕"];
+
+    /// A table with the same text in a `keyword` column and a `standard`
+    /// one, written as two files, each holding every value and a null.
+    fn keyword_table(conn: &Connection, name: &str) -> Supertable {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("kw", DataType::LargeUtf8, true),
+            Field::new("body", DataType::LargeUtf8, true),
+        ]));
+        let table = conn
+            .create_table(
+                name,
+                Arc::clone(&schema),
+                IndexSpec::new()
+                    .fts(FtsField::new("kw").analyzer("keyword"))
+                    .fts("body"),
+            )
+            .expect("create keyword table");
+        let values: Vec<Option<&str>> = KEYWORD_VALUES
+            .iter()
+            .copied()
+            .map(Some)
+            .chain([None])
+            .collect();
+        for _ in 0..2 {
+            let column: ArrayRef = Arc::new(LargeStringArray::from(values.clone()));
+            table
+                .append(
+                    &RecordBatch::try_new(Arc::clone(&schema), vec![Arc::clone(&column), column])
+                        .expect("batch"),
+                )
+                .expect("append");
+        }
+        table
+    }
+
+    /// The `kw` values of `batches`, sorted; a null reads as `None`.
+    fn kw_values(batches: &[RecordBatch]) -> Vec<Option<String>> {
+        let mut out: Vec<Option<String>> = batches
+            .iter()
+            .flat_map(|b| {
+                let kw = b
+                    .column_by_name("kw")
+                    .expect("kw projected")
+                    .as_string::<i64>();
+                (0..b.num_rows())
+                    .map(|i| kw.is_valid(i).then(|| kw.value(i).to_string()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Every search path on a keyword column matches whole values only,
+    /// while a `standard` column over the same text still matches words.
+    fn assert_keyword_answers(conn: &Connection, name: &str) {
+        let table = conn.open_table(name).expect("open");
+        let kw = Some(&["kw"][..]);
+        let both_files = |v: &str| vec![Some(v.to_string()); 2];
+        for value in KEYWORD_VALUES {
+            let hits = table
+                .token_match("kw", value, BoolMode::Or, kw)
+                .expect("token_match");
+            assert_eq!(kw_values(&hits), both_files(value), "token_match {value:?}");
+            let hits = table.exact_match("kw", value, kw).expect("exact_match");
+            assert_eq!(kw_values(&hits), both_files(value), "exact_match {value:?}");
+            let hits = table
+                .bm25_search("kw", value, TOP_K, Bm25SearchOptions::new(), kw)
+                .expect("bm25_search");
+            assert_eq!(kw_values(&hits), both_files(value), "bm25_search {value:?}");
+            let sql = format!("SELECT kw FROM {name} WHERE kw = '{value}'");
+            let rows = conn.query_sql(&sql).expect("sql");
+            assert_eq!(kw_values(&rows), both_files(value), "{sql}");
+        }
+        // Case and punctuation are part of the value.
+        let hits = table
+            .token_match("kw", "FOO", BoolMode::Or, kw)
+            .expect("token_match");
+        assert!(kw_values(&hits).is_empty(), "no value is FOO");
+        let prefix = |p: &str| {
+            let sql = format!("SELECT kw FROM bm25_search_prefix('{name}', 'kw', '{p}', 10)");
+            kw_values(&conn.query_sql(&sql).expect("prefix"))
+        };
+        assert_eq!(prefix("Fo"), both_files("Foo"), "a prefix keeps its case");
+        assert_eq!(prefix("foo").len(), 4, "foo and foo., in both files");
+
+        // `standard` over the same text is unchanged: `foo` is a word of
+        // three values.
+        let hits = table
+            .token_match("body", "foo", BoolMode::Or, Some(&["body"][..]))
+            .expect("token_match body");
+        assert_eq!(n_rows(&hits), 6, "Foo, foo and foo., in both files");
+        // `text_match` is defined by `standard` tokens whatever the index,
+        // so on a keyword column it still matches words.
+        let rows = conn
+            .query_sql(&format!(
+                "SELECT kw FROM {name} WHERE text_match(kw, 'foo')"
+            ))
+            .expect("text_match");
+        assert_eq!(n_rows(&rows), 6);
+    }
+
+    /// A keyword column indexes each value as one term, through reopen and
+    /// compaction, and records its analyzer in the schema document.
+    #[test]
+    fn a_keyword_column_matches_whole_values_through_reopen_and_compaction() {
+        let (conn, dir) = storage_conn();
+        keyword_table(&conn, "kws");
+        assert_keyword_answers(&conn, "kws");
+
+        let reopened = connect(dir.path().to_str().expect("utf8 path")).expect("reconnect");
+        assert_keyword_answers(&reopened, "kws");
+        let schema = reopened.schema("kws").expect("schema");
+        let analyzer_of = |column: &str| {
+            schema
+                .fields()
+                .iter()
+                .find(|f| f.name == column)
+                .and_then(|f| match &f.index {
+                    Some(ColumnIndex::Fts { analyzer, .. }) => Some(*analyzer),
+                    _ => None,
+                })
+        };
+        assert_eq!(analyzer_of("kw"), Some(Analyzer::Keyword));
+        assert_eq!(analyzer_of("body"), Some(Analyzer::Standard));
+
+        let table = reopened.open_table("kws").expect("open");
+        table
+            .optimize(&OptimizeOptions::compact(CompactionSettings {
+                min_superfiles_for_merge: MERGE_AT_SUPERFILES,
+                ..CompactionSettings::default()
+            }))
+            .expect("optimize");
+        let files = reopened
+            .open_table("kws")
+            .expect("open")
+            .local_handle()
+            .reader()
+            .expect("reader")
+            .n_superfiles();
+        assert_eq!(files, 1, "the compaction merged both files");
+        assert_keyword_answers(&reopened, "kws");
+    }
+
+    /// An analyzer this engine does not ship is refused, and so is a
+    /// keyword column with a filter, at create and in a schema patch.
+    #[test]
+    fn a_keyword_column_takes_no_filter_and_unknown_analyzers_stay_refused() {
+        let conn = connect("memory://").expect("connect");
+        for field in [
+            FtsField::new("title").analyzer("whitespace"),
+            FtsField::new("title")
+                .analyzer("keyword")
+                .stemmer(Stemmer::English),
+            FtsField::new("title")
+                .analyzer("keyword")
+                .stopwords(Stopwords::English),
+        ] {
+            let err = conn
+                .create_table("t", schema_id_title(), IndexSpec::new().fts(field.clone()))
+                .expect_err("refused");
+            assert!(matches!(err, InfinoError::Config(_)), "{field:?}: {err:?}");
+            assert!(err.to_string().contains("title"), "{err}");
+        }
+        let (conn, _dir) = storage_conn();
+        conn.create_table("t", schema_id_title(), IndexSpec::new())
+            .expect("create");
+        let err = conn
+            .apply_schema(
+                "t",
+                &SchemaPatch::new(vec![
+                    FieldPatch::named("tag")
+                        .with_type(DataType::LargeUtf8)
+                        .with_index(ColumnIndex::Fts {
+                            analyzer: Analyzer::Keyword,
+                            stopwords: Stopwords::English,
+                            stemmer: Stemmer::None,
+                            positions: false,
+                            stored: true,
+                            bm25: bm25::Bm25Params::STANDARD,
+                        }),
+                ]),
+                None,
+            )
+            .expect_err("a filtered keyword index is refused");
+        assert!(err.to_string().contains("keyword"), "{err}");
     }
 
     /// The `positions` flag has to round-trip the catalog record, and

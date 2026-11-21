@@ -45,9 +45,9 @@ use crate::{
         builder::FtsConfig,
         format::fts::REPAIR_RELEASE,
         fts::{
-            analysis::{Stemmer, Stopwords, chain_tokenizer},
+            analysis::{Analyzer, Stemmer, Stopwords, chain_tokenizer, check_chain},
             bm25::Bm25Params,
-            tokenize::{STANDARD_TOKENIZER, Tokenizer},
+            tokenize::Tokenizer,
         },
         vector::{builder::VectorConfig, distance::Metric, rerank_codec::RerankCodec},
     },
@@ -152,6 +152,8 @@ impl fmt::Display for FieldId {
 pub enum ColumnIndex {
     /// A full-text index over a string column.
     Fts {
+        /// The base tokenizer.
+        analyzer: Analyzer,
         /// The stopword filter applied after tokenizing.
         stopwords: Stopwords,
         /// The stemmer applied after tokenizing.
@@ -395,6 +397,7 @@ impl TableSchema {
             .iter()
             .filter_map(|f| match &f.index {
                 Some(ColumnIndex::Fts {
+                    analyzer,
                     stopwords,
                     stemmer,
                     positions,
@@ -402,6 +405,7 @@ impl TableSchema {
                     bm25,
                 }) => Some(FtsConfig {
                     column: f.name.clone(),
+                    analyzer: *analyzer,
                     stopwords: *stopwords,
                     stemmer: *stemmer,
                     positions: *positions,
@@ -466,8 +470,11 @@ impl TableSchema {
         let field = self.fields.iter().find(|f| f.name == column)?;
         match &field.index {
             Some(ColumnIndex::Fts {
-                stopwords, stemmer, ..
-            }) => Some(chain_tokenizer(*stopwords, *stemmer)),
+                analyzer,
+                stopwords,
+                stemmer,
+                ..
+            }) => Some(chain_tokenizer(*analyzer, *stopwords, *stemmer)),
             _ => None,
         }
     }
@@ -646,6 +653,7 @@ impl TableSchema {
 fn column_index(name: &str, fts: &[FtsConfig], vectors: &[VectorConfig]) -> Option<ColumnIndex> {
     if let Some(fc) = fts.iter().find(|fc| fc.column == name) {
         return Some(ColumnIndex::Fts {
+            analyzer: fc.analyzer,
             stopwords: fc.stopwords,
             stemmer: fc.stemmer,
             positions: fc.positions,
@@ -667,6 +675,7 @@ pub(crate) fn index_to_json(index: &ColumnIndex) -> Value {
     let mut out = Map::new();
     match index {
         ColumnIndex::Fts {
+            analyzer,
             stopwords,
             stemmer,
             positions,
@@ -674,8 +683,7 @@ pub(crate) fn index_to_json(index: &ColumnIndex) -> Value {
             bm25,
         } => {
             out.insert("kind".into(), Value::from("fts"));
-            // Recorded so a future tokenizer needs no format change.
-            out.insert("analyzer".into(), Value::from(STANDARD_TOKENIZER));
+            out.insert("analyzer".into(), Value::from(analyzer.as_str()));
             if let Some(name) = stopwords.as_str() {
                 out.insert("stopwords".into(), Value::from(name));
             }
@@ -746,21 +754,26 @@ pub(crate) fn index_from_json(json: &Value) -> Result<ColumnIndex, String> {
     match str_of("kind")? {
         "fts" => {
             let defaults = FtsConfig::new("");
-            // Only `standard` is reproducible; a list naming another base
+            // Only a shipped base is reproducible; a list naming another
             // refuses rather than query an index split another way.
-            if let Some(name) = obj.get("analyzer").and_then(Value::as_str)
-                && name != STANDARD_TOKENIZER
-            {
-                return Err(format!(
-                    "index uses the removed analyzer '{name}'; copy the table's rows out \
-                     with infino {REPAIR_RELEASE} before upgrading, then re-create it \
-                     under \"standard\""
-                ));
-            }
+            let analyzer = match obj.get("analyzer").and_then(Value::as_str) {
+                None => defaults.analyzer,
+                Some(name) => Analyzer::from_name(name).ok_or_else(|| {
+                    format!(
+                        "index uses the removed analyzer '{name}'; copy the table's rows out \
+                         with infino {REPAIR_RELEASE} before upgrading, then re-create it \
+                         under \"standard\""
+                    )
+                })?,
+            };
+            let stopwords =
+                named(obj, "stopwords", Stopwords::from_name)?.unwrap_or(defaults.stopwords);
+            let stemmer = named(obj, "stemmer", Stemmer::from_name)?.unwrap_or(defaults.stemmer);
+            check_chain(analyzer, stopwords, stemmer)?;
             Ok(ColumnIndex::Fts {
-                stopwords: named(obj, "stopwords", Stopwords::from_name)?
-                    .unwrap_or(defaults.stopwords),
-                stemmer: named(obj, "stemmer", Stemmer::from_name)?.unwrap_or(defaults.stemmer),
+                analyzer,
+                stopwords,
+                stemmer,
                 positions: bool_or("positions", defaults.positions)?,
                 stored: bool_or("stored", defaults.stored)?,
                 bm25: Bm25Params::new(
