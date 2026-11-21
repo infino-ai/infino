@@ -393,9 +393,10 @@ impl ExecutionPlan for VectorSearchExec {
             // longer use up the search. What the filtered search then misses
             // is what its cluster probes don't reach.
             let plan = candidate_plan_for_filters(reader.manifest(), &filters);
-            // The superfiles a bounded plan may match in, chosen once for every widening round.
+            // The superfiles a bounded plan may match in, chosen once for every widening round. A
+            // search for no rows finds none, so it reads nothing to choose them.
             let superfiles = match &plan {
-                CandidatePlan::Unbounded => Vec::new(),
+                plan if k == 0 || matches!(plan, CandidatePlan::Unbounded) => Vec::new(),
                 bounded => {
                     reader
                         .superfiles_a_where_may_match(&filters, bounded)
@@ -652,8 +653,14 @@ mod tests {
             query::{candidate::LIKE_MAX_TERMS, exec::common::OVER_FETCH_MIN_CEILING},
             reader_cache::disk::test_support::RecordingStorage,
         },
-        test_helpers::lazy_disk_cache_without_promotion,
+        test_helpers::{
+            fault_storage::{FaultOp, FaultStorage},
+            lazy_disk_cache_without_promotion,
+        },
     };
+
+    /// Part of the URI of every object of a table's term index: its root and its slices.
+    const TERM_INDEX_URI_FRAGMENT: &str = "term-index/";
 
     /// Moves manifest id ranges away from every real generated id.
     const INVALID_ID_RANGE_OFFSET: i128 = 1_i128 << 100;
@@ -1318,6 +1325,46 @@ mod tests {
             (plain_rows, reads(&plain)),
             (unlimited_rows, reads(&unlimited)),
         ]
+    }
+
+    /// A vector search for no rows finds none without reading anything for its `WHERE`: with every
+    /// read of the term index failing, `k = 0` still answers empty, while `k = 1` reaches the
+    /// failing read.
+    #[test]
+    fn vector_search_for_no_rows_reads_nothing_for_its_where() {
+        let dim = 16;
+        let titles: Vec<String> = ["rust a", "tokio b", "rust c"].map(str::to_owned).into();
+        let dir = TempDir::new().expect("dir");
+        let local: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("local"));
+        let written = options_one_superfile_per_commit(dim)
+            .with_term_index(true)
+            .with_storage(Arc::clone(&local));
+        drop(supertable_ranked_by_index_with(written, dim, &titles));
+        let faults = FaultStorage::wrap(local);
+        let storage = Arc::clone(&faults) as Arc<dyn StorageProvider>;
+        let options = options_one_superfile_per_commit(dim).with_term_index(true);
+        let st = Supertable::open(options.with_storage(storage)).expect("open");
+        faults.fail(FaultOp::Get, TERM_INDEX_URI_FRAGMENT, usize::MAX);
+        faults.fail(FaultOp::GetRange, TERM_INDEX_URI_FRAGMENT, usize::MAX);
+        let reader = st.reader().expect("reader");
+        let q = csv_one_hot(dim, 0);
+        let sql = |k: usize| {
+            format!("SELECT title FROM vector_search('emb', '{q}', {k}) WHERE title = 'rust'")
+        };
+        let none = reader
+            .query_sql(&sql(0))
+            .expect("k = 0 reads nothing, so nothing fails");
+        assert_eq!(none.iter().map(RecordBatch::num_rows).sum::<usize>(), 0);
+        assert_eq!(faults.fired(), 0, "k = 0 read no part of the term index");
+        assert!(
+            reader.query_sql(&sql(1)).is_err(),
+            "premise: k = 1 reads the term index, and the read fails"
+        );
+        assert!(
+            faults.fired() > 0,
+            "premise: the failed read was the term index's"
+        );
     }
 
     #[test]
