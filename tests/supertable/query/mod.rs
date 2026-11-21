@@ -29,4 +29,5 @@ pub mod tier_harness;
 mod tier_selection;
 pub mod tombstone_filter;
 mod topk_row_filter;
+mod unordered_limit_order;
 mod values_scalar_subquery;

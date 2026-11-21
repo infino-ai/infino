@@ -318,6 +318,11 @@ pub(crate) struct CachedScanExec {
     /// Set when a sort on `_id` was pushed down: the rows are read by id
     /// block ([`IdOrder`]).
     id_order: Option<IdOrder>,
+    /// Set under a `LIMIT` with no `ORDER BY`: each partition reads one run
+    /// of consecutive row groups instead of every `partitions`-th, so the
+    /// partitions handed on one after another give the rows in file order
+    /// ([`Self::in_file_order`]).
+    in_file_order: bool,
     /// The rows of the units read ([`ROWS_READ`]), the row groups decoded
     /// ([`ROW_GROUPS_DECODED`]), the row groups skipped
     /// ([`ROW_GROUPS_SKIPPED`]) and the rows dropped ([`ROWS_DROPPED`]), for
@@ -1094,6 +1099,7 @@ impl CachedScanExec {
             live: None,
             reads_best_first: false,
             id_order: None,
+            in_file_order: false,
             metrics: ExecutionPlanMetricsSet::new(),
         })
     }
@@ -1102,6 +1108,23 @@ impl CachedScanExec {
     /// builds it.
     pub(crate) fn parquet(&self) -> &Arc<dyn ExecutionPlan> {
         &self.parquet
+    }
+
+    /// This scan with each partition reading one run of consecutive row
+    /// groups, in the order the files and their row groups were listed:
+    /// partition 0 the first run, partition 1 the next. A gather that hands
+    /// the partitions on one after another then gives the rows in file
+    /// order, the same on every run. `None` when the scan reads for a sort,
+    /// best row groups first or by id block, which is not file order.
+    pub(crate) fn in_file_order(&self) -> Option<Arc<dyn ExecutionPlan>> {
+        if self.reads_best_first || self.id_order.is_some() {
+            return None;
+        }
+        Some(Arc::new(Self {
+            in_file_order: true,
+            metrics: ExecutionPlanMetricsSet::new(),
+            ..self.clone()
+        }))
     }
 
     /// This scan reading by id block ([`IdOrder`]) for a sort on its output
@@ -1982,6 +2005,9 @@ impl DisplayAs for CachedScanExec {
             let direction = if order.descending { "desc" } else { "asc" };
             write!(f, ", id_blocks={direction}")?;
         }
+        if self.in_file_order {
+            write!(f, ", file_order")?;
+        }
         Ok(())
     }
 }
@@ -2137,6 +2163,7 @@ impl ExecutionPlan for CachedScanExec {
             )));
         }
         let partitions = self.partitions;
+        let in_file_order = self.in_file_order;
         let all = Arc::clone(&self.units);
         // By id block only under a filter that tightens: without one, no
         // block is skipped, and the row groups read in fewer, larger batches.
@@ -2175,6 +2202,11 @@ impl ExecutionPlan for CachedScanExec {
                     future::ready(next.map(|unit| (unit, id_read)))
                 })
                 .boxed(),
+                None if in_file_order => {
+                    let run = |p: usize| p * all.len() / partitions;
+                    let mine = all[run(partition)..run(partition + 1)].to_vec();
+                    stream::iter(mine).boxed()
+                }
                 None => {
                     let mine: Vec<RowGroupUnit> = all
                         .iter()
