@@ -3990,20 +3990,23 @@ mod tests {
         assert!(reopened.schema().field_with_name("body").is_ok());
     }
 
-    /// An open makes no storage read of its own, so a handle opened after a
-    /// peer drop may be the dropped one. Its first read reports the drop, and
-    /// the next open resolves the re-created table.
+    /// A handle cached before a peer drop is never served: the first open or
+    /// read after the drop reports it, and the next open resolves the
+    /// re-created table. Which of the two reports it depends on whether the
+    /// open has to read storage (for statistics the handle lacks), so either
+    /// is accepted.
     #[test]
-    fn a_read_on_a_peer_dropped_handle_reports_the_drop() {
+    fn a_peer_dropped_handle_is_reported_on_first_use() {
         let (_dir, writer, reader) = peer_with_cached_docs();
 
         writer.drop_table("docs", true).expect("drop elsewhere");
         recreate_docs_wider(&writer);
-        let stale = reader.open_table("docs").expect("open");
-        let read = stale.bm25_search("title", "fox", TOP_K, Bm25SearchOptions::new(), None);
+        let first = reader.open_table("docs").and_then(|stale| {
+            stale.bm25_search("title", "fox", TOP_K, Bm25SearchOptions::new(), None)
+        });
         assert!(
-            matches!(read, Err(InfinoError::NotFound(_))),
-            "a read on the dropped generation must report it gone: {read:?}"
+            matches!(first, Err(InfinoError::NotFound(_))),
+            "the dropped generation must be reported gone: {first:?}"
         );
 
         let reopened = reader.open_table("docs").expect("open the new table");
