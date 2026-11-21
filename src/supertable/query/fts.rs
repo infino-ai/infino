@@ -73,7 +73,7 @@
 use std::{
     borrow::Cow,
     cmp::{Ordering, Reverse},
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     future::Future,
     iter::repeat_n,
     slice,
@@ -2978,6 +2978,86 @@ impl SupertableReader {
             .into_iter()
             .filter_map(|t| String::from_utf8(t).ok())
             .collect())
+    }
+
+    /// Every term of `column` with the documents holding it, summed over
+    /// `files`, deleted rows included: from the term index for the
+    /// superfiles it covers, from the dictionaries of the rest.
+    pub(crate) async fn term_doc_counts(
+        &self,
+        column: &str,
+        files: Vec<Arc<SuperfileEntry>>,
+    ) -> Result<BTreeMap<Vec<u8>, u64>, QueryError> {
+        let field = self.manifest().field_id(column);
+        let mut counts: BTreeMap<Vec<u8>, u64> = BTreeMap::new();
+        let index = self
+            .manifest()
+            .term_index()
+            .await
+            .map_err(QueryError::from)?;
+        let rest: Vec<Arc<SuperfileEntry>> = match (&index, field) {
+            (Some(index), Some(field)) => {
+                let (covered, rest): (Vec<_>, Vec<_>) = files
+                    .into_iter()
+                    .partition(|entry| index.is_indexed(&entry.superfile_id));
+                let live: HashSet<Uuid> = covered.iter().map(|e| e.superfile_id).collect();
+                if !live.is_empty() {
+                    let head = field.term_key("").len();
+                    index
+                        .for_each_prefix(field, "", |key, run| {
+                            let held: u64 = run
+                                .iter()
+                                .filter(|p| {
+                                    index
+                                        .superfile_id(p.superfile)
+                                        .is_some_and(|id| live.contains(&id))
+                                })
+                                .map(|p| p.df)
+                                .sum();
+                            if held > 0 {
+                                *counts.entry(key[head..].to_vec()).or_default() += held;
+                            }
+                            true
+                        })
+                        .await
+                        .map_err(QueryError::from)?;
+                }
+                rest
+            }
+            _ => files,
+        };
+        let column_arc: Arc<str> = Arc::from(column);
+        let pool = Arc::clone(&self.manifest().options.reader_pool);
+        let units = rest.into_iter().map(|entry| (entry, ())).collect();
+        let per_superfile: Vec<Vec<(Vec<u8>, u64)>> = dispatch::fanout_with(
+            self,
+            units,
+            false,
+            self.open_intent(),
+            move |r, _entry, _sidecars, _now, ()| {
+                let column_arc = Arc::clone(&column_arc);
+                let pool = Arc::clone(&pool);
+                async move {
+                    let fts = r
+                        .fts()
+                        .ok_or_else(|| QueryError::Internal("superfile has no FTS index".into()))?;
+                    let column = r.column_alias(field, &column_arc);
+                    let terms = fts.terms_with_prefix(column, b"", Some(&pool)).await?;
+                    let texts = terms
+                        .iter()
+                        .map(|t| str::from_utf8(t))
+                        .collect::<Result<Vec<&str>, _>>()
+                        .map_err(|_| QueryError::Internal("a term is not UTF-8".into()))?;
+                    let (dfs, _) = fts.term_dfs(column, &texts).await?;
+                    Ok(terms.into_iter().zip(dfs).collect())
+                }
+            },
+        )
+        .await?;
+        for (term, df) in per_superfile.into_iter().flatten() {
+            *counts.entry(term).or_default() += df;
+        }
+        Ok(counts)
     }
 
     /// Parse `query` into positive and negated tokens, then select the
