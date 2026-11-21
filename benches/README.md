@@ -959,3 +959,26 @@ One append of N rows (a 12-word BM25 column and a cosine vector column clustered
 | 6K | 64 | 1.95 s |
 | 6K | 384 | 2.27 s |
 <!-- END: bench/diagnostic/hybrid-optimize -->
+
+<!-- BEGIN: bench/diagnostic/fts-fields -->
+### Multi-field BM25 against single-column searches merged in the client
+
+_Host: unknown CPU · 11C/11T · macos/aarch64_
+
+500000 rows in 10 commits; full-text columns title (8 terms), body (60) and tags (3) over a 20000-term Zipfian vocabulary, and labels (one of 8 words, so a label's every match ties); every clause searches the three Zipfian columns, a label clause labels alone. Warm median and p95 of 20 runs. `client, every match` fetches each (clause, column) pair's every match and is exact; `client, top k` fetches each pair's top k, and `overlap` is the share of the exact top k it returns.
+
+| Query | k | fields p50 | fields p95 | client, every match p50 | client, every match p95 | client, top k p50 | client, top k p95 | overlap |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| one rare term | 10 | 159.58 µs | 199.21 µs | 221.25 µs | 249.96 µs | 158.08 µs | 173.88 µs | 1.000 |
+| one rare term | 100 | 183.96 µs | 197.21 µs | 225.33 µs | 235.46 µs | 151.46 µs | 165.00 µs | 1.000 |
+| two mid terms | 10 | 215.50 µs | 237.75 µs | 3.13 ms | 3.32 ms | 221.08 µs | 263.62 µs | 1.000 |
+| two mid terms | 100 | 417.83 µs | 476.88 µs | 3.08 ms | 3.19 ms | 348.12 µs | 404.04 µs | 1.000 |
+| one common term | 10 | 620.04 µs | 717.46 µs | 86.39 ms | 90.12 ms | 409.42 µs | 448.67 µs | 1.000 |
+| one common term | 100 | 1.04 ms | 1.21 ms | 86.54 ms | 89.71 ms | 630.88 µs | 706.08 µs | 1.000 |
+| two clauses, mid + rare | 10 | 5.01 ms | 5.27 ms | 1.95 ms | 2.06 ms | 305.83 µs | 345.46 µs | 0.000 |
+| two clauses, mid + rare | 100 | 3.25 ms | 3.47 ms | 1.99 ms | 2.12 ms | 501.21 µs | 618.42 µs | 0.780 |
+| one label (tied) | 10 | 101.75 µs | 113.58 µs | 10.15 ms | 10.40 ms | 99.46 µs | 122.58 µs | 1.000 |
+| one label (tied) | 100 | 165.46 µs | 176.62 µs | 10.05 ms | 10.21 ms | 161.50 µs | 174.88 µs | 1.000 |
+| two clauses, label + mid | 10 | 4.70 ms | 5.17 ms | 11.92 ms | 12.33 ms | 264.62 µs | 310.42 µs | 0.100 |
+| two clauses, label + mid | 100 | 4.48 ms | 4.76 ms | 11.94 ms | 12.14 ms | 426.46 µs | 509.12 µs | 0.190 |
+<!-- END: bench/diagnostic/fts-fields -->

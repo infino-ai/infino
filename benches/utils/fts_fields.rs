@@ -15,8 +15,10 @@
 //!   gives its overlap with the exact top k.
 //!
 //! The table has three full-text columns of different lengths (title,
-//! body, tags) over one Zipfian vocabulary, written in several commits so
-//! the searches span superfiles. Each query is timed warm: the median and
+//! body, tags) over one Zipfian vocabulary, and a fourth, labels, holding
+//! one word from a handful: every row a label matches scores the same, the
+//! worst case for a search that must place ties. It is written in several
+//! commits so the searches span superfiles. Each query is timed warm: the median and
 //! p95 of repeated runs on one connection. Every `bm25_search_fields`
 //! answer is checked against the exact client merge.
 //!
@@ -36,7 +38,7 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use infino::{
     Bm25FieldsOptions, Bm25SearchOptions, BoolMode, FieldClause, IndexSpec, Supertable, connect,
 };
-use rand::{SeedableRng, rngs::StdRng};
+use rand::{RngExt, SeedableRng, rngs::StdRng};
 use tempfile::TempDir;
 
 use crate::{
@@ -56,7 +58,13 @@ const VOCAB: usize = 20_000;
 const TITLE_TERMS: usize = 8;
 const BODY_TERMS: usize = 60;
 const TAGS_TERMS: usize = 3;
+/// The columns over the Zipfian vocabulary, which every clause but a label
+/// clause searches.
 const COLUMNS: [&str; 3] = ["title", "body", "tags"];
+/// The one-word column, each row's word drawn uniformly from `LABELS`
+/// words.
+const LABELS_COLUMN: &str = "labels";
+const LABELS: usize = 8;
 const KS: [usize; 2] = [10, 100];
 const SEED: u64 = 0x5eed_f1e1d5;
 const TABLE: &str = "docs";
@@ -65,6 +73,11 @@ const P50: usize = 50;
 const P95: usize = 95;
 /// Scores that differ by less than this share are the same score.
 const SCORE_TOLERANCE: f32 = 1e-4;
+
+/// The label word `index`.
+fn label(index: usize) -> String {
+    format!("label{index}")
+}
 
 /// The term of Zipf rank `rank`.
 fn term(rank: usize) -> String {
@@ -75,12 +88,13 @@ fn schema() -> SchemaRef {
     Arc::new(Schema::new(
         COLUMNS
             .iter()
+            .chain([&LABELS_COLUMN])
             .map(|c| Field::new(*c, DataType::LargeUtf8, false))
             .collect::<Vec<_>>(),
     ))
 }
 
-/// `rows` rows of the three columns.
+/// `rows` rows of the four columns.
 fn batch(
     schema: &SchemaRef,
     rows: usize,
@@ -95,11 +109,15 @@ fn batch(
                 .join(" ")
         })))
     };
-    let arrays = vec![column(TITLE_TERMS), column(BODY_TERMS), column(TAGS_TERMS)];
+    let mut arrays = vec![column(TITLE_TERMS), column(BODY_TERMS), column(TAGS_TERMS)];
+    arrays.push(Arc::new(LargeStringArray::from_iter_values(
+        (0..rows).map(|_| label(rng.random_range(0..LABELS))),
+    )));
     RecordBatch::try_new(Arc::clone(schema), arrays).expect("batch")
 }
 
-/// The queries timed, by label: clauses over every column.
+/// The queries timed, by name: clauses over the three Zipfian columns, and
+/// label clauses over the labels column alone.
 fn queries() -> Vec<(String, Vec<FieldClause>)> {
     let clause = |ranks: &[usize]| {
         FieldClause::new(
@@ -107,6 +125,7 @@ fn queries() -> Vec<(String, Vec<FieldClause>)> {
             COLUMNS,
         )
     };
+    let label_clause = |index: usize| FieldClause::new(label(index), [LABELS_COLUMN]);
     vec![
         ("one rare term".into(), vec![clause(&[5_000])]),
         ("two mid terms".into(), vec![clause(&[200, 900])]),
@@ -114,6 +133,11 @@ fn queries() -> Vec<(String, Vec<FieldClause>)> {
         (
             "two clauses, mid + rare".into(),
             vec![clause(&[300]), clause(&[4_000])],
+        ),
+        ("one label (tied)".into(), vec![label_clause(0)]),
+        (
+            "two clauses, label + mid".into(),
+            vec![label_clause(1), clause(&[300])],
         ),
     ]
 }
@@ -236,6 +260,7 @@ pub fn run() {
     let conn = connect(&uri).expect("connect");
     let spec = COLUMNS
         .iter()
+        .chain([&LABELS_COLUMN])
         .fold(IndexSpec::new(), |spec, c| spec.fts(*c));
     let table = conn
         .create_table(TABLE, Arc::clone(&schema), spec)
@@ -300,7 +325,8 @@ pub fn run() {
         note: format!(
             "{rows} rows in {commits} commits; full-text columns title ({TITLE_TERMS} terms), \
              body ({BODY_TERMS}) and tags ({TAGS_TERMS}) over a {VOCAB}-term Zipfian \
-             vocabulary; every clause searches all three. Warm median and p95 of {iters} runs. \
+             vocabulary, and labels (one of {LABELS} words, so a label's every match ties); \
+             every clause searches the three Zipfian columns, a label clause labels alone. Warm median and p95 of {iters} runs. \
              `client, every match` fetches each (clause, column) pair's every match and is \
              exact; `client, top k` fetches each pair's top k, and `overlap` is the share of \
              the exact top k it returns."

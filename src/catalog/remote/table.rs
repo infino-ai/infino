@@ -336,8 +336,8 @@ impl Table for RemoteTable {
 
     /// The wire has no multi-field call, so the search travels as SQL
     /// ([`fields_statement`]) and the hosted side answers it with the
-    /// `bm25_search_fields` table function. The clauses and weights are
-    /// checked here first, so a malformed query fails as it does locally.
+    /// `bm25_search_fields` table function. The statement is built from the
+    /// checked query, so a malformed query fails as it does locally.
     fn bm25_search_fields(
         &self,
         clauses: &[FieldClause],
@@ -345,12 +345,11 @@ impl Table for RemoteTable {
         opts: &Bm25FieldsOptions,
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, InfinoError> {
-        FieldsQuery::new(clauses, opts)?;
+        let query = FieldsQuery::new(clauses, opts)?;
         self.catalog.query_sql(&fields_statement(
             &self.table_name,
-            clauses,
+            &query,
             k,
-            opts,
             projection,
             &default_id_column(),
         ))

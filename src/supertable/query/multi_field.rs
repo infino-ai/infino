@@ -31,22 +31,30 @@
 //! 3. A row no pair returned scores at most the pair's last score on each
 //!    pair (0 on a pair that returned every row it matches), so its
 //!    combined score is at most the sum, over clauses, of the clause's
-//!    largest such bound. Once the k-th best candidate scores strictly
-//!    above that bound, no unseen row can enter the top k or tie into it.
-//! 4. Otherwise `w` grows and the rounds repeat. They also stop once the
+//!    largest such bound. Each pair's list is its top `w` in the order
+//!    `bm25_search` ranks by, score then ascending `_id`, so a row that ties
+//!    a pair's last score ranks after that last hit. The round settles once the k-th best
+//!    candidate, in that same order, scores at least the bound, and
+//!    strictly more than any unseen row could score without ranking after
+//!    it on a tie: no unseen row can then enter the top k.
+//! 4. Otherwise `w` grows and the rounds repeat, each scoring only the
+//!    candidates earlier rounds left unscored. They also stop once the
 //!    pairs have returned every row they match (every pair under `Or`, every
 //!    pair of some clause under `And`), or `w` reaches the table's size.
 //!
-//! The answer is the exact top k, in score order with ties broken by
-//! ascending `_id`, as `bm25_search` breaks them.
+//! The answer is the exact top k, in score order with ties at the k-th
+//! score settled as each pair's `bm25_search` settles them: by ascending
+//! `_id` across superfiles, and within one superfile in the order its
+//! full-text index holds the rows.
 
 use std::{
+    cmp::Ordering,
     collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
 };
 
 use arrow::record_batch::RecordBatch;
-use futures::future::try_join_all;
+use futures::{StreamExt, TryStreamExt, stream};
 use roaring::RoaringBitmap;
 use serde::Deserialize;
 use tracing::{Instrument, debug};
@@ -174,28 +182,39 @@ pub(crate) fn weights_from_json(json: &str) -> Result<BTreeMap<String, f32>, Que
     })
 }
 
-/// The catalog SQL statement that runs a multi-field search on `table`:
-/// how a hosted table carries the call, as the `bm25_search_fields` TVF.
-/// `projection` defaults to `_id` (`id_column`) + `score`; rows come back
-/// best first, ties by ascending `_id`.
+/// The catalog SQL statement that runs a validated multi-field search on
+/// `table`: how a hosted table carries the call, as the
+/// `bm25_search_fields` TVF. Each clause lists its distinct columns, and
+/// the weights name only the columns the query searches at a weight other
+/// than 1. `projection` defaults to `_id` (`id_column`) + `score`; rows
+/// come back best first, ties by ascending `_id`.
 #[cfg(feature = "remote")]
 pub(crate) fn fields_statement(
     table: &str,
-    clauses: &[FieldClause],
+    query: &FieldsQuery,
     k: usize,
-    opts: &Bm25FieldsOptions,
     projection: Option<&[&str]>,
     id_column: &str,
 ) -> String {
     let literal = |text: &str| format!("'{}'", text.replace('\'', "''"));
     let clauses_json = serde_json::Value::Array(
-        clauses
+        query
+            .texts
             .iter()
-            .map(|c| serde_json::json!({ "query": c.query, "fields": c.fields }))
+            .enumerate()
+            .map(|(c, text)| {
+                let fields: Vec<&str> = query
+                    .pairs
+                    .iter()
+                    .filter(|pair| pair.clause == c)
+                    .map(|pair| pair.column.as_str())
+                    .collect();
+                serde_json::json!({ "query": text, "fields": fields })
+            })
             .collect(),
     )
     .to_string();
-    let mode = match opts.mode {
+    let mode = match query.mode {
         BoolMode::And => "and",
         BoolMode::Or => "or",
     };
@@ -205,8 +224,15 @@ pub(crate) fn fields_statement(
         k.to_string(),
         literal(mode),
     ];
-    if !opts.weights.is_empty() {
-        let weights = serde_json::to_string(&opts.weights).expect("a map of finite numbers");
+    // Every weight is finite: `FieldsQuery::new` checked it.
+    let weights: BTreeMap<&str, f32> = query
+        .pairs
+        .iter()
+        .filter(|pair| pair.weight != 1.0)
+        .map(|pair| (pair.column.as_str(), pair.weight))
+        .collect();
+    if !weights.is_empty() {
+        let weights = serde_json::to_string(&weights).expect("a map of finite numbers");
         args.push(literal(&weights));
     }
     let default = [id_column, SCORE_COLUMN];
@@ -389,15 +415,49 @@ impl Supertable {
     }
 }
 
-/// A row some pair returned, with its weighted score on each pair (`None`
-/// where the pair does not match it).
+/// A candidate's score on one pair.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum PairScore {
+    /// Not known: the pair has not returned the row and no search confined
+    /// to the candidates has scored it on the pair. Once a round's scoring
+    /// is done, only a pair that returned every row it matches leaves a
+    /// candidate here, so it means the pair does not match the row.
+    Unknown,
+    /// The pair does not match the row.
+    Miss,
+    /// The pair's weighted score for the row.
+    Hit(f32),
+}
+
+/// A row some pair returned, with what is known of its weighted score on
+/// each pair.
 struct Candidate {
     hit: SuperfileHit,
-    scores: Vec<Option<f32>>,
+    scores: Vec<PairScore>,
 }
 
 /// A candidate's key: the superfile it lives in and its row there.
 type RowKey = (SuperfileUri, u32);
+
+/// The work one multi-field search did: what the tests that bound it read.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FieldsWork {
+    /// Rounds of the threshold algorithm.
+    pub(crate) rounds: usize,
+    /// Rows the pair searches returned, summed over pairs and rounds.
+    pub(crate) pair_hits: usize,
+    /// Candidates the confined searches were asked to score, summed over
+    /// pairs and rounds.
+    pub(crate) scored: usize,
+}
+
+/// The rank order of the answer: score descending, then stable `_id`
+/// ascending.
+fn by_rank(a: &SuperfileHit, b: &SuperfileHit) -> Ordering {
+    b.score
+        .total_cmp(&a.score)
+        .then(a.stable_id.cmp(&b.stable_id))
+}
 
 impl SupertableReader {
     /// The `k` best rows for `query` within `scope` (`None` searches the
@@ -412,27 +472,46 @@ impl SupertableReader {
         k: usize,
         scope: Option<&CandidateScope>,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
+        let (hits, _) = self.bm25_search_fields_counted(query, k, scope).await?;
+        Ok(hits)
+    }
+
+    /// [`Self::bm25_search_fields_scoped_async`], with the work it did.
+    pub(crate) async fn bm25_search_fields_counted(
+        &self,
+        query: &FieldsQuery,
+        k: usize,
+        scope: Option<&CandidateScope>,
+    ) -> Result<(Vec<SuperfileHit>, FieldsWork), QueryError> {
+        let mut work = FieldsWork::default();
         if k == 0 || query.pairs.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), work));
         }
         let total = usize::try_from(self.manifest().n_docs_total()).unwrap_or(usize::MAX);
         let opts = query.opts();
+        let n_pairs = query.pairs.len();
+        let clauses = query.texts.len();
         // The superfiles a candidate can live in, by URI: what a search
         // confined to the candidates is scoped to, and each superfile's
-        // smallest `_id` for the final tie order. Read once, on first need.
-        let mut entries: Option<HashMap<SuperfileUri, Arc<SuperfileEntry>>> = None;
-        // Each pair's every match, once a round has returned them: later
-        // rounds reuse them rather than search the pair again.
-        let mut complete_lists: Vec<Option<Vec<SuperfileHit>>> = vec![None; query.pairs.len()];
+        // smallest `_id` for the final tie order.
+        let entries = self.scope_entries(scope).await?;
+        let at_once = self.searches_at_once(entries.len());
+        // Every row any pair has returned, kept across rounds: a later round
+        // scores only what earlier rounds left unknown.
+        let mut candidates: HashMap<RowKey, Candidate> = HashMap::new();
+        // Each pair's last hit in its latest search, and whether that search
+        // returned every row the pair matches. A pair that has is not
+        // searched again.
+        let mut last: Vec<Option<SuperfileHit>> = vec![None; n_pairs];
+        let mut exhausted = vec![false; n_pairs];
         let mut want = k;
         loop {
-            let fetched = try_join_all(
-                query
-                    .pairs
-                    .iter()
-                    .enumerate()
-                    .filter(|(p, _)| complete_lists[*p].is_none())
-                    .map(|(p, pair)| async move {
+            work.rounds += 1;
+            let searches: Vec<_> = (0..n_pairs)
+                .filter(|&p| !exhausted[p])
+                .map(|p| {
+                    let pair = &query.pairs[p];
+                    async move {
                         let hits = self
                             .bm25_search_scoped_async(
                                 &pair.column,
@@ -443,63 +522,43 @@ impl SupertableReader {
                             )
                             .await?;
                         Ok::<_, QueryError>((p, hits))
-                    }),
-            )
-            .await?;
-            // A pair that returned fewer rows than asked returned every row
-            // it matches: the kernels admit only live rows within the scope
-            // into their heaps. One asked for the whole table has too.
-            let mut exhausted: Vec<bool> = complete_lists.iter().map(Option::is_some).collect();
-            let mut lists: Vec<Vec<SuperfileHit>> = complete_lists
-                .iter_mut()
-                .map(|list| list.take().unwrap_or_default())
+                    }
+                })
                 .collect();
+            let fetched: Vec<(usize, Vec<SuperfileHit>)> = stream::iter(searches)
+                .buffer_unordered(at_once)
+                .try_collect()
+                .await?;
             for (p, hits) in fetched {
+                work.pair_hits += hits.len();
+                // A pair that returned fewer rows than asked returned every
+                // row it matches: the kernels admit only live rows within the
+                // scope into their heaps. One asked for the whole table has
+                // too.
                 exhausted[p] = hits.len() < want || want >= total;
-                lists[p] = hits;
-            }
-            let mut candidates: HashMap<RowKey, Candidate> = HashMap::new();
-            for (p, hits) in lists.iter().enumerate() {
+                last[p] = hits.last().copied();
                 let weight = query.pairs[p].weight;
                 for hit in hits {
                     let candidate = candidates
                         .entry((hit.superfile, hit.local_doc_id))
                         .or_insert_with(|| Candidate {
-                            hit: *hit,
-                            scores: vec![None; query.pairs.len()],
+                            hit,
+                            scores: vec![PairScore::Unknown; n_pairs],
                         });
-                    candidate.scores[p] = Some(weight * hit.score);
+                    candidate.scores[p] = PairScore::Hit(weight * hit.score);
                     if candidate.hit.stable_id.is_none() {
                         candidate.hit.stable_id = hit.stable_id;
                     }
                 }
             }
-            if entries.is_none() {
-                entries = Some(self.scope_entries(scope).await?);
-            }
-            let entries = entries.as_ref().expect("entries read above");
-            self.score_missing(query, &lists, &exhausted, &mut candidates, entries)
+            work.scored += self
+                .score_unknown(query, &exhausted, &mut candidates, &entries, at_once)
                 .await?;
 
-            let clauses = query.texts.len();
             let mut scored: Vec<SuperfileHit> = candidates
-                .into_values()
+                .values()
                 .filter_map(|candidate| combined(query, clauses, candidate))
                 .collect();
-
-            // The most a row no pair returned can score.
-            let mut bound_per_clause = vec![0.0f32; clauses];
-            for (p, hits) in lists.iter().enumerate() {
-                let pair = &query.pairs[p];
-                let theta = match (exhausted[p], hits.last()) {
-                    (false, Some(last)) => pair.weight * last.score,
-                    _ => 0.0,
-                };
-                let bound = &mut bound_per_clause[pair.clause];
-                *bound = bound.max(theta);
-            }
-            let bound: f32 = bound_per_clause.iter().sum();
-
             let complete = match query.mode {
                 BoolMode::Or => exhausted.iter().all(|&e| e),
                 BoolMode::And => (0..clauses).any(|c| {
@@ -512,20 +571,19 @@ impl SupertableReader {
                 }),
             };
             let settled = scored.len() >= k && {
-                scored.select_nth_unstable_by(k - 1, |a, b| b.score.total_cmp(&a.score));
-                scored[k - 1].score > bound
+                scored.select_nth_unstable_by(k - 1, by_rank);
+                let kth = scored[k - 1];
+                let (bound, bound_after_kth) =
+                    unseen_bounds(query, &last, &exhausted, kth.stable_id);
+                kth.score >= bound && kth.score > bound_after_kth
             };
             if complete || settled || want >= total {
                 let id_mins: HashMap<SuperfileUri, i128> = entries
                     .iter()
                     .map(|(uri, entry)| (*uri, entry.id_min))
                     .collect();
-                return select_top_k_stable(self, vec![scored], k, &id_mins).await;
-            }
-            for (p, list) in lists.into_iter().enumerate() {
-                if exhausted[p] {
-                    complete_lists[p] = Some(list);
-                }
+                let hits = select_top_k_stable(self, vec![scored], k, &id_mins).await?;
+                return Ok((hits, work));
             }
             want = want.saturating_mul(OVER_FETCH_GROWTH).min(total.max(k));
         }
@@ -551,39 +609,52 @@ impl SupertableReader {
             .collect())
     }
 
-    /// Score every candidate on each pair that did not return it, by a
-    /// search of the pair confined to those candidates. A pair that returned
-    /// every row it matches needs none: a candidate it left out does not
-    /// match it.
-    async fn score_missing(
+    /// How many single-column searches over `superfiles` superfiles run at
+    /// once, so that together they stay within the table's
+    /// [`superfiles_in_flight`](crate::SupertableOptions::superfiles_in_flight):
+    /// one search works on at most one unit per superfile plus one per
+    /// reader-pool thread (the ranged parts of a split superfile), never
+    /// past the cap itself.
+    fn searches_at_once(&self, superfiles: usize) -> usize {
+        let options = &self.manifest().options;
+        let in_flight = options.superfiles_in_flight.max(1);
+        let per_search = superfiles
+            .saturating_add(options.reader_pool.current_num_threads())
+            .clamp(1, in_flight);
+        (in_flight / per_search).max(1)
+    }
+
+    /// Score every candidate whose score on a pair is unknown, by a search
+    /// of the pair confined to those candidates, and return how many
+    /// candidates were asked about. A pair that returned every row it
+    /// matches needs none: a candidate it left out does not match it.
+    async fn score_unknown(
         &self,
         query: &FieldsQuery,
-        lists: &[Vec<SuperfileHit>],
         exhausted: &[bool],
         candidates: &mut HashMap<RowKey, Candidate>,
         entries: &HashMap<SuperfileUri, Arc<SuperfileEntry>>,
-    ) -> Result<(), QueryError> {
+        at_once: usize,
+    ) -> Result<usize, QueryError> {
         let opts = query.opts();
         let mut searches = Vec::new();
+        let mut asked = 0usize;
         for (p, pair) in query.pairs.iter().enumerate() {
             if exhausted[p] {
                 continue;
             }
-            let returned: HashSet<RowKey> = lists[p]
-                .iter()
-                .map(|hit| (hit.superfile, hit.local_doc_id))
-                .collect();
             let mut allow: HashMap<SuperfileUri, RoaringBitmap> = HashMap::new();
-            let mut missing = 0usize;
-            for key in candidates.keys() {
-                if !returned.contains(key) {
+            let mut unknown = 0usize;
+            for (key, candidate) in candidates.iter() {
+                if candidate.scores[p] == PairScore::Unknown {
                     allow.entry(key.0).or_default().insert(key.1);
-                    missing += 1;
+                    unknown += 1;
                 }
             }
-            if missing == 0 {
+            if unknown == 0 {
                 continue;
             }
+            asked += unknown;
             let superfiles: Vec<Arc<SuperfileEntry>> = allow
                 .keys()
                 .map(|uri| {
@@ -604,40 +675,96 @@ impl SupertableReader {
                         .collect(),
                 ),
             };
-            searches.push(async move {
+            searches.push((p, pair, unknown, scope));
+        }
+        let searches: Vec<_> = searches
+            .into_iter()
+            .map(|(p, pair, unknown, scope)| async move {
                 let hits = self
                     .bm25_search_scoped_async(
                         &pair.column,
                         &query.texts[pair.clause],
-                        missing,
+                        unknown,
                         opts,
                         Some(&scope),
                     )
                     .await?;
                 Ok::<_, QueryError>((p, hits))
-            });
-        }
-        for (p, hits) in try_join_all(searches).await? {
+            })
+            .collect();
+        let scored: Vec<(usize, Vec<SuperfileHit>)> = stream::iter(searches)
+            .buffer_unordered(at_once)
+            .try_collect()
+            .await?;
+        for (p, hits) in scored {
             let weight = query.pairs[p].weight;
             for hit in hits {
                 if let Some(candidate) = candidates.get_mut(&(hit.superfile, hit.local_doc_id)) {
-                    candidate.scores[p] = Some(weight * hit.score);
+                    candidate.scores[p] = PairScore::Hit(weight * hit.score);
+                }
+            }
+            // The confined search returns every candidate the pair matches:
+            // it is asked for as many rows as it may admit.
+            for candidate in candidates.values_mut() {
+                if candidate.scores[p] == PairScore::Unknown {
+                    candidate.scores[p] = PairScore::Miss;
                 }
             }
         }
-        Ok(())
+        Ok(asked)
     }
+}
+
+/// The most a row no pair returned can score, and the most it can score
+/// while still ranking ahead of a hit at that score with stable `_id`
+/// `kth_id`.
+///
+/// Each pair's list is its top in `bm25_search`'s order, score then
+/// ascending `_id`, so a row it did not return scores at most its last hit's
+/// score on it, and scores exactly that only ranking after the last hit. Where that
+/// `_id` is at or above `kth_id`, a row tying the pair ranks after the k-th
+/// candidate on a combined tie, so for the second bound the pair counts only
+/// what a score strictly below its last allows: the weight times the next
+/// `f32` down. A pair that returned every row it matches counts 0 in both.
+/// Each bound sums, in clause order, its clause's largest pair bound;
+/// rounding is monotone, so no unseen row's combined score exceeds it.
+fn unseen_bounds(
+    query: &FieldsQuery,
+    last: &[Option<SuperfileHit>],
+    exhausted: &[bool],
+    kth_id: Option<i128>,
+) -> (f32, f32) {
+    let clauses = query.texts.len();
+    let mut bound = vec![0.0f32; clauses];
+    let mut after_kth = vec![0.0f32; clauses];
+    for (p, pair) in query.pairs.iter().enumerate() {
+        let Some(last) = last[p].filter(|_| !exhausted[p]) else {
+            continue;
+        };
+        let theta = pair.weight * last.score;
+        let tie_ranks_after = matches!(
+            (last.stable_id, kth_id),
+            (Some(last_id), Some(kth_id)) if last_id >= kth_id
+        );
+        let ahead = match tie_ranks_after {
+            true => pair.weight * last.score.next_down(),
+            false => theta,
+        };
+        bound[pair.clause] = bound[pair.clause].max(theta);
+        after_kth[pair.clause] = after_kth[pair.clause].max(ahead);
+    }
+    (bound.iter().sum(), after_kth.iter().sum())
 }
 
 /// `candidate` with its combined score: the sum, in clause order, of each
 /// matched clause's best weighted column score. `None` when it is no hit:
 /// under `And`, a clause it does not match.
-fn combined(query: &FieldsQuery, clauses: usize, candidate: Candidate) -> Option<SuperfileHit> {
+fn combined(query: &FieldsQuery, clauses: usize, candidate: &Candidate) -> Option<SuperfileHit> {
     let mut best: Vec<Option<f32>> = vec![None; clauses];
     for (pair, score) in query.pairs.iter().zip(&candidate.scores) {
-        if let Some(score) = score {
+        if let PairScore::Hit(score) = *score {
             let slot = &mut best[pair.clause];
-            *slot = Some(slot.map_or(*score, |b| b.max(*score)));
+            *slot = Some(slot.map_or(score, |b| b.max(score)));
         }
     }
     if query.mode == BoolMode::And && best.iter().any(Option::is_none) {
@@ -659,6 +786,7 @@ fn combined(query: &FieldsQuery, clauses: usize, candidate: Candidate) -> Option
 pub(crate) mod tests {
     use std::{
         collections::{BTreeSet, HashMap},
+        iter,
         ops::Deref,
     };
 
@@ -1021,6 +1149,127 @@ pub(crate) mod tests {
         assert_matches_oracle(&st, &clauses, 3, &opts);
     }
 
+    /// The ranked hits and the work of one search, through the reader.
+    fn fields_counted(
+        st: &Supertable,
+        clauses: &[FieldClause],
+        k: usize,
+        opts: &Bm25FieldsOptions,
+    ) -> (Vec<(Id, f32)>, FieldsWork) {
+        let reader = st.reader().expect("reader");
+        let query = FieldsQuery::new(clauses, opts).expect("valid");
+        let (hits, work) = reader
+            .block_on(reader.bm25_search_fields_counted(&query, k, None))
+            .expect("bm25_search_fields");
+        let ranked = hits
+            .iter()
+            .map(|hit| (hit.stable_id.expect("stable _id"), hit.score))
+            .collect();
+        (ranked, work)
+    }
+
+    /// A one-word column where half the rows hold the same word: every
+    /// match scores the same. The first round's `k` hits are the answer
+    /// (the tie order says no unseen row can rank ahead of them), so the
+    /// search stops there, without reading the rest of the tied run.
+    #[test]
+    fn a_tied_column_settles_in_one_round() {
+        /// Rows of the table.
+        const ROWS: usize = 1_200;
+        /// Rows per superfile: fewer than `ROWS`, so the tied run spans
+        /// several superfiles.
+        const ROWS_PER_SUPERFILE: usize = 200;
+        /// Every this-many rows holds the tied word: half the table.
+        const TIED_EVERY: usize = 2;
+        /// One `k`, a few, and one that cuts a superfile's run unevenly.
+        const KS: [usize; 3] = [1, 10, 37];
+        let rows: Vec<Row> = (0..ROWS)
+            .map(|i| {
+                let tag = if i % TIED_EVERY == 0 { "db" } else { "web" };
+                (
+                    "plain".to_string(),
+                    "filler".to_string(),
+                    tag.to_string(),
+                    0,
+                )
+            })
+            .collect();
+        let st = corpus_table(&rows, ROWS_PER_SUPERFILE);
+        assert!(st.reader().expect("reader").n_superfiles() > 1);
+        let opts = Bm25FieldsOptions::new();
+        for clauses in [
+            vec![FieldClause::new("db", ["tags"])],
+            vec![FieldClause::new("db", ["tags", "title"])],
+        ] {
+            for k in KS {
+                let (got, work) = fields_counted(&st, &clauses, k, &opts);
+                assert_eq!(
+                    got,
+                    oracle(&st, &clauses, k, &opts, None),
+                    "{clauses:?} k {k}"
+                );
+                assert_eq!(work.rounds, 1, "{clauses:?} k {k}: {work:?}");
+                assert_eq!(work.pair_hits, k, "{clauses:?} k {k}: {work:?}");
+                assert_eq!(work.scored, 0, "{clauses:?} k {k}: {work:?}");
+            }
+        }
+    }
+
+    /// A clause with fewer than `k` matches beside one every row matches,
+    /// over bodies of many lengths (scores spread out, with ties among
+    /// equal lengths): one round settles it, reading `k` rows of the common
+    /// clause and scoring only the rare rows it did not return, not the
+    /// common clause's every match.
+    #[test]
+    fn a_rare_clause_beside_a_common_one_settles_in_one_round() {
+        const FILLER: &[&str] = &["alpha", "beta", "gamma", "delta", "epsilon", "zeta"];
+        /// Rows of the table, every one holding the common word.
+        const ROWS: usize = 900;
+        /// Rows per superfile: fewer than `ROWS`, so several superfiles.
+        const ROWS_PER_SUPERFILE: usize = 150;
+        /// Every this-many rows, from [`RARE_AT`], holds the rare word: fewer
+        /// rows than `K`.
+        const RARE_EVERY: usize = 400;
+        /// The first rare row.
+        const RARE_AT: usize = 7;
+        /// Distinct body lengths, so the common word's scores spread out,
+        /// with ties among rows of one length.
+        const LENGTHS: usize = 17;
+        /// A prime stride over the lengths, so neighbouring rows differ.
+        const LENGTH_STRIDE: usize = 7_919;
+        /// Rows asked for.
+        const K: usize = 10;
+        let rows: Vec<Row> = (0..ROWS)
+            .map(|i| {
+                let title = if i % RARE_EVERY == RARE_AT {
+                    "rare"
+                } else {
+                    "plain"
+                };
+                let len = 1 + (i * LENGTH_STRIDE) % LENGTHS;
+                let body = iter::once("common")
+                    .chain((0..len).map(|j| FILLER[(i + j) % FILLER.len()]))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                (title.to_string(), body, "x".to_string(), 0)
+            })
+            .collect();
+        let st = corpus_table(&rows, ROWS_PER_SUPERFILE);
+        let clauses = [
+            FieldClause::new("rare", ["title"]),
+            FieldClause::new("common", ["body"]),
+        ];
+        let opts = Bm25FieldsOptions::new();
+        let k = K;
+        let rare = oracle(&st, &clauses[..1], usize::MAX, &opts, None).len();
+        assert!(rare > 0 && rare < k, "{rare} rare rows");
+        let (got, work) = fields_counted(&st, &clauses, k, &opts);
+        assert_eq!(got, oracle(&st, &clauses, k, &opts, None));
+        assert_eq!(work.rounds, 1, "{work:?}");
+        assert_eq!(work.pair_hits, rare + k, "{work:?}");
+        assert!(work.scored <= rare, "{work:?}");
+    }
+
     /// `k` past the match count returns every match, no more.
     #[test]
     fn k_past_the_match_count_returns_every_match() {
@@ -1171,17 +1420,18 @@ pub(crate) mod tests {
         assert!(weights_from_json(r#"{"x": "2"}"#).is_err());
     }
 
-    /// The hosted statement: quotes doubled, weights only when set, the
-    /// default projection `_id` + `score`, best first then ascending `_id`.
+    /// The hosted statement: quotes doubled, each clause's columns once,
+    /// weights only for searched columns weighted other than 1, the default
+    /// projection `_id` + `score`, best first then ascending `_id`.
     #[cfg(feature = "remote")]
     #[test]
     fn fields_statement_carries_the_call() {
-        let clauses = [FieldClause::new("o'brien", ["title", "body"])];
+        let clauses = [FieldClause::new("o'brien", ["title", "body", "title"])];
+        let query = |opts: &Bm25FieldsOptions| FieldsQuery::new(&clauses, opts).expect("valid");
         let plain = fields_statement(
             "my'table",
-            &clauses,
+            &query(&Bm25FieldsOptions::new()),
             7,
-            &Bm25FieldsOptions::new(),
             None,
             "_id",
         );
@@ -1191,11 +1441,14 @@ pub(crate) mod tests {
         );
         let weighted = fields_statement(
             "t",
-            &clauses,
+            &query(
+                &Bm25FieldsOptions::new()
+                    .with_mode(BoolMode::And)
+                    .with_weight("title", 2.0)
+                    .with_weight("body", 1.0)
+                    .with_weight("tags", 3.0),
+            ),
             3,
-            &Bm25FieldsOptions::new()
-                .with_mode(BoolMode::And)
-                .with_weight("title", 2.0),
             Some(&["_id", "title", "score"]),
             "_id",
         );
@@ -1214,6 +1467,9 @@ pub(crate) mod tests {
             .and_then(|rest| rest.split("', 7").next())
             .expect("clauses literal")
             .replace("''", "'");
-        assert_eq!(clauses_from_json(&json).expect("round trip"), clauses);
+        assert_eq!(
+            clauses_from_json(&json).expect("round trip"),
+            [FieldClause::new("o'brien", ["title", "body"])]
+        );
     }
 }
