@@ -218,6 +218,9 @@ pub struct UsageMeter {
     put_bytes: AtomicU64,
     list_count: AtomicU64,
     delete_count: AtomicU64,
+    /// Second requests sent beside a read whose headers were late. Not part of the snapshot: a
+    /// hedge is not a read and is never billed as one.
+    hedge_count: AtomicU64,
     class_get_count: [AtomicU64; N_URI_CLASSES],
     class_get_bytes: [AtomicU64; N_URI_CLASSES],
     trace: Mutex<Option<Vec<TraceEntry>>>,
@@ -235,6 +238,7 @@ impl Default for UsageMeter {
             put_bytes: AtomicU64::new(0),
             list_count: AtomicU64::new(0),
             delete_count: AtomicU64::new(0),
+            hedge_count: AtomicU64::new(0),
             class_get_count: array::from_fn(|_| AtomicU64::new(0)),
             class_get_bytes: array::from_fn(|_| AtomicU64::new(0)),
             trace: Mutex::new(None),
@@ -306,6 +310,18 @@ impl UsageMeter {
                 bytes,
             });
         }
+    }
+
+    /// Record a second request sent beside a read whose headers were late. The read itself is
+    /// recorded once, by [`Self::record_get`], with the bytes of the response that answered.
+    pub(crate) fn record_hedge(&self) {
+        self.hedge_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Second requests recorded by [`Self::record_hedge`].
+    #[cfg(test)]
+    pub(crate) fn hedge_count(&self) -> u64 {
+        self.hedge_count.load(Ordering::Relaxed)
     }
 
     pub fn record_put(&self, bytes: u64) {
@@ -400,6 +416,17 @@ mod tests {
         labels.sort_unstable();
         labels.dedup();
         assert_eq!(labels.len(), all.len(), "labels must stay distinct");
+    }
+
+    /// A hedge is counted as a hedge, never as a read or anything else the snapshot bills.
+    #[test]
+    fn a_hedge_leaves_the_snapshot_as_it_was() {
+        let m = UsageMeter::new();
+        m.record_get("u", None, 1);
+        let before = m.snapshot();
+        m.record_hedge();
+        assert_eq!(m.snapshot(), before);
+        assert_eq!(m.hedge_count(), 1);
     }
 
     /// `read_requests` is the billing-side read count: HEAD probes plus
