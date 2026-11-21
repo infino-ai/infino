@@ -5,7 +5,8 @@
 //! The parser lives here because the `+` / `-` clause sigils must be
 //! handled before tokenizing — the tokenizer splits on both.
 //!
-//! Ships one base tokenizer, [`StandardTokenizer`]. The [`Tokenizer`]
+//! Ships two base tokenizers, [`StandardTokenizer`] and
+//! [`KeywordTokenizer`] (the whole value is one term). The [`Tokenizer`]
 //! trait is the extension point for ICU / language-aware stemmers /
 //! custom char filters under the same trait without touching FTS code.
 //!
@@ -25,7 +26,7 @@
 //!     a normalizing analyzer plugs in through the [`Tokenizer`] trait
 //!     rather than altering `standard`'s semantics.
 
-use std::{any::Any, borrow::Cow, collections::BTreeSet, ops::Deref};
+use std::{any::Any, borrow::Cow, collections::BTreeSet, iter::once, ops::Deref};
 
 use unicode_properties::{EmojiStatus, UnicodeEmoji};
 use unicode_segmentation::UnicodeSegmentation;
@@ -1172,6 +1173,45 @@ impl Tokenizer for StandardTokenizer {
     }
 }
 
+/// Name of the keyword tokenizer.
+pub const KEYWORD_TOKENIZER: &str = "keyword";
+
+/// The whole value is one term, byte for byte: no splitting, case
+/// folding, trimming or length cap. The empty string is a term too.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct KeywordTokenizer;
+
+impl Tokenizer for KeywordTokenizer {
+    fn name(&self) -> &'static str {
+        KEYWORD_TOKENIZER
+    }
+
+    fn tokenize<'a>(&'a self, text: &'a str) -> Box<dyn Iterator<Item = String> + 'a> {
+        Box::new(once(text.to_owned()))
+    }
+
+    fn tokenize_each(&self, text: &str, f: &mut dyn FnMut(&str)) {
+        f(text);
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn tokenize_each_query<'q>(&self, text: &'q str, f: &mut dyn FnMut(Cow<'q, str>)) {
+        f(Cow::Borrowed(text));
+    }
+
+    /// A query on a keyword column is one value: spaces, quotes and
+    /// `+` / `-` are part of it, not query syntax.
+    fn parse<'q>(&self, query: &'q str) -> ParsedQuery<'q> {
+        ParsedQuery {
+            positives: vec![Cow::Borrowed(query)],
+            ..ParsedQuery::default()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use arrow::{
@@ -1181,7 +1221,7 @@ mod tests {
     use proptest::prelude::*;
 
     use super::*;
-    use crate::superfile::fts::analysis::{Stemmer, Stopwords, chain_tokenizer};
+    use crate::superfile::fts::analysis::{Analyzer, Stemmer, Stopwords, chain_tokenizer};
 
     /// A parsed query's phrases as plain term lists. `Phrase`'s own
     /// equality includes the offsets; these assertions are about which
@@ -2027,7 +2067,7 @@ mod tests {
     /// turns them into offsets normalized to the first surviving term.
     #[test]
     fn a_phrase_carries_the_holes_its_tokenizer_left() {
-        let tok = chain_tokenizer(Stopwords::English, Stemmer::None);
+        let tok = chain_tokenizer(Analyzer::Standard, Stopwords::English, Stemmer::None);
         // `the` is removed and consumes one ordinal, so `york` sits two
         // positions after `new`.
         let p = tok.parse("\"new the york\"");

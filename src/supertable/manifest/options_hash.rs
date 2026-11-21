@@ -221,7 +221,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        Stemmer, Stopwords,
+        Analyzer, Stemmer, Stopwords,
         superfile::{
             builder::{FtsConfig, VectorConfig},
             vector::{distance::Metric, rerank_codec::RerankCodec},
@@ -742,10 +742,12 @@ mod tests {
                 .stopwords(Stopwords::English)
                 .stemmer(Stemmer::English),
         );
+        let keyword = hash_of(FtsConfig::new("title").analyzer(Analyzer::Keyword));
         for (label, h) in [
             ("stopwords", &stopped),
             ("stemmer", &stemmed),
             ("both", &both),
+            ("keyword", &keyword),
         ] {
             assert_ne!(
                 &plain, h,
@@ -763,6 +765,7 @@ mod tests {
             plain,
             hash_of(
                 FtsConfig::new("title")
+                    .analyzer(Analyzer::Standard)
                     .stopwords(Stopwords::None)
                     .stemmer(Stemmer::None)
             ),

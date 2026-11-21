@@ -2,6 +2,27 @@ pub mod infino
 pub use infino::arrow_array
 pub use infino::arrow_schema
 pub use infino::serde_json
+#[non_exhaustive] pub enum infino::Analyzer
+pub infino::Analyzer::Keyword
+pub infino::Analyzer::Standard
+impl core::clone::Clone for infino::Analyzer
+pub fn infino::Analyzer::clone(&self) -> Self
+impl core::cmp::Eq for infino::Analyzer
+impl core::cmp::PartialEq for infino::Analyzer
+pub fn infino::Analyzer::eq(&self, &Self) -> bool
+impl core::default::Default for infino::Analyzer
+pub fn infino::Analyzer::default() -> Self
+impl core::fmt::Debug for infino::Analyzer
+pub fn infino::Analyzer::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for infino::Analyzer
+impl core::marker::StructuralPartialEq for infino::Analyzer
+impl core::marker::Freeze for infino::Analyzer
+impl core::marker::Send for infino::Analyzer
+impl core::marker::Sync for infino::Analyzer
+impl core::marker::Unpin for infino::Analyzer
+impl core::marker::UnsafeUnpin for infino::Analyzer
+impl core::panic::unwind_safe::RefUnwindSafe for infino::Analyzer
+impl core::panic::unwind_safe::UnwindSafe for infino::Analyzer
 pub enum infino::BoolMode
 pub infino::BoolMode::And
 pub infino::BoolMode::Or
@@ -49,6 +70,7 @@ impl core::panic::unwind_safe::RefUnwindSafe for infino::ColdFetchMode
 impl core::panic::unwind_safe::UnwindSafe for infino::ColdFetchMode
 #[non_exhaustive] pub enum infino::ColumnIndex
 pub infino::ColumnIndex::Fts
+pub infino::ColumnIndex::Fts::analyzer: infino::Analyzer
 pub infino::ColumnIndex::Fts::bm25: infino::Bm25Params
 pub infino::ColumnIndex::Fts::positions: bool
 pub infino::ColumnIndex::Fts::stemmer: infino::Stemmer

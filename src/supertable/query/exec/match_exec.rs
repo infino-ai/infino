@@ -1649,6 +1649,7 @@ mod tests {
                 FieldPatch::named("body")
                     .with_type(DataType::LargeUtf8)
                     .with_index(ColumnIndex::Fts {
+                        analyzer: Default::default(),
                         stopwords: Stopwords::None,
                         stemmer: Stemmer::None,
                         positions: false,

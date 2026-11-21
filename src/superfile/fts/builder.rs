@@ -2378,6 +2378,22 @@ impl FtsBuilder {
         local_doc_id: u32,
         text: &str,
     ) -> Result<(), BuildError> {
+        self.add_row(column_id, local_doc_id, Some(text))
+    }
+
+    /// Record a null value for `(column_id, local_doc_id)`: a document
+    /// with no tokens. Not the same as `add_doc` with `""`, which a
+    /// keyword column indexes as the empty-string term.
+    pub fn add_null_doc(&mut self, column_id: u32, local_doc_id: u32) -> Result<(), BuildError> {
+        self.add_row(column_id, local_doc_id, None)
+    }
+
+    fn add_row(
+        &mut self,
+        column_id: u32,
+        local_doc_id: u32,
+        text: Option<&str>,
+    ) -> Result<(), BuildError> {
         let col_idx = column_id as usize;
         if col_idx >= self.columns.len() {
             return Err(BuildError::FtsColumnTypeInvalid {
@@ -2460,12 +2476,14 @@ impl FtsBuilder {
                 }
                 *slot += 1;
             };
-            if let Some(standard) = standard_tok {
-                standard.tokenize_each_inline(text, &mut on_token);
-            } else if let Some(chain) = chain_tok {
-                chain.tokenize_each_inline(text, &mut on_token);
-            } else {
-                tokenizer.tokenize_each(text, &mut on_token);
+            if let Some(text) = text {
+                if let Some(standard) = standard_tok {
+                    standard.tokenize_each_inline(text, &mut on_token);
+                } else if let Some(chain) = chain_tok {
+                    chain.tokenize_each_inline(text, &mut on_token);
+                } else {
+                    tokenizer.tokenize_each(text, &mut on_token);
+                }
             }
         } else {
             self.doc_pos_chain.clear();
@@ -2528,33 +2546,35 @@ impl FtsBuilder {
                     }
                 }
             };
-            if let Some(standard) = standard_tok {
-                // `standard` drops nothing — every segment carrying an
-                // alphanumeric is emitted — so an emission ordinal *is*
-                // the gap-inclusive position and no gap bookkeeping is
-                // needed. Monomorphized for the same reason as above.
-                standard.tokenize_each_inline(text, |tok| {
-                    record(tok, tokens_in_doc);
-                    tokens_in_doc += 1;
-                });
-            } else if let Some(chain) = chain_tok {
-                // Gap-aware: a token the chain's stopword filter removes
-                // advances the position ordinal but emits nothing, and
-                // the doc length counts only what is emitted — the token
-                // count Lucene's norms are built from too.
-                chain.tokenize_each_inline_positioned(text, |tok, position| {
-                    record(tok, position);
-                    tokens_in_doc += 1;
-                });
-            } else {
-                // A custom tokenizer reports its own gap-inclusive
-                // positions through the trait; the default numbering is
-                // consecutive, which is correct for one that drops
-                // nothing (see the `Tokenizer` trait docs).
-                tokenizer.tokenize_each_positioned(text, &mut |tok, position| {
-                    record(tok, position);
-                    tokens_in_doc += 1;
-                });
+            if let Some(text) = text {
+                if let Some(standard) = standard_tok {
+                    // `standard` drops nothing — every segment carrying an
+                    // alphanumeric is emitted — so an emission ordinal *is*
+                    // the gap-inclusive position and no gap bookkeeping is
+                    // needed. Monomorphized for the same reason as above.
+                    standard.tokenize_each_inline(text, |tok| {
+                        record(tok, tokens_in_doc);
+                        tokens_in_doc += 1;
+                    });
+                } else if let Some(chain) = chain_tok {
+                    // Gap-aware: a token the chain's stopword filter removes
+                    // advances the position ordinal but emits nothing, and
+                    // the doc length counts only what is emitted — the token
+                    // count Lucene's norms are built from too.
+                    chain.tokenize_each_inline_positioned(text, |tok, position| {
+                        record(tok, position);
+                        tokens_in_doc += 1;
+                    });
+                } else {
+                    // A custom tokenizer reports its own gap-inclusive
+                    // positions through the trait; the default numbering is
+                    // consecutive, which is correct for one that drops
+                    // nothing (see the `Tokenizer` trait docs).
+                    tokenizer.tokenize_each_positioned(text, &mut |tok, position| {
+                        record(tok, position);
+                        tokens_in_doc += 1;
+                    });
+                }
             }
             run_bytes = match sink {
                 PositionSink::Runs { bytes, .. } => bytes,

@@ -114,15 +114,14 @@ use crate::{
         },
         fts::{
             analysis::{
-                Stemmer, Stopwords, UNKNOWN_ANALYSIS_REVISION, chain_name, chain_revision,
-                chain_tokenizer,
+                Analyzer, Stemmer, Stopwords, UNKNOWN_ANALYSIS_REVISION, chain_name,
+                chain_revision, chain_tokenizer,
             },
             bm25,
             builder::{FrozenLanes, FtsBuilder, LaneView, TermHeadSink},
             reader::{ColumnLengthStats, ColumnMeta, FtsReader},
             reorder::{BisectParams, ForwardIndex, bisect_order_reported},
             sorted_merge::SortedInput,
-            tokenize::STANDARD_TOKENIZER,
         },
         id_space::{FtsDocId, RowId},
         ids::{self, PackedIdEncoder, PackedIdOutput},
@@ -1005,6 +1004,9 @@ pub(crate) enum FtsCarry {
 #[derive(Debug, Clone)]
 pub struct FtsConfig {
     pub column: String,
+    /// Base tokenizer. Persisted as `"tokenizer"`; readers treat absence
+    /// as `standard`.
+    pub analyzer: Analyzer,
     /// Stopword set removed after the `standard` tokenizer and before the
     /// stemmer. Persisted in the column's `inf.fts.columns` entry as
     /// `"stopwords"`, emitted only when set; readers treat absence as
@@ -1064,6 +1066,7 @@ impl FtsConfig {
     pub fn new(column: impl Into<String>) -> Self {
         Self {
             column: column.into(),
+            analyzer: Analyzer::Standard,
             stopwords: Stopwords::None,
             stemmer: Stemmer::None,
             positions: false,
@@ -1071,6 +1074,12 @@ impl FtsConfig {
             bm25: bm25::Bm25Params::STANDARD,
             carried_analysis_revision: None,
         }
+    }
+
+    /// Set the base tokenizer (see the field docs).
+    pub fn analyzer(mut self, analyzer: Analyzer) -> Self {
+        self.analyzer = analyzer;
+        self
     }
 
     /// Set the stopword set (see the field docs).
@@ -1089,7 +1098,7 @@ impl FtsConfig {
     /// value [`Tokenizer::name`] reports for its tokenizer. Never
     /// persisted; see [`crate::superfile::fts::analysis`].
     pub(crate) fn chain_name(&self) -> &'static str {
-        chain_name(self.stopwords, self.stemmer)
+        chain_name(self.analyzer, self.stopwords, self.stemmer)
     }
 
     /// Carry an existing file's analysis revision (see the field docs).
@@ -1102,7 +1111,7 @@ impl FtsConfig {
     /// in, else the revision this engine's chain emits.
     pub(crate) fn analysis_revision(&self) -> u32 {
         self.carried_analysis_revision
-            .unwrap_or_else(|| chain_revision(self.stopwords, self.stemmer))
+            .unwrap_or_else(|| chain_revision(self.analyzer, self.stopwords, self.stemmer))
     }
 
     /// Record token positions (see the field docs).
@@ -1669,6 +1678,7 @@ impl BuilderOptions {
             fts.fts_columns_config()
                 .map(|c| {
                     FtsConfig::new(c.name.clone())
+                        .analyzer(c.analyzer)
                         .stopwords(c.stopwords)
                         .stemmer(c.stemmer)
                         .positions(c.positions)
@@ -5120,7 +5130,7 @@ fn fts_builder_for(opts: &BuilderOptions) -> Result<Option<FtsBuilder>, BuildErr
         // The whole chain, not just the base: a column that declares a
         // stopword set or a stemmer must be indexed through them, or the
         // postings would hold unfiltered terms while every query filtered.
-        let tok = chain_tokenizer(fc.stopwords, fc.stemmer);
+        let tok = chain_tokenizer(fc.analyzer, fc.stopwords, fc.stemmer);
         let id =
             fb.register_column_with_tokenizer(fc.column.clone(), fc.positions, tok, fc.bm25)?;
         if let Some(corpus) = opts.fts_corpus_stats.get(&fc.column) {
@@ -5152,12 +5162,11 @@ pub(crate) fn index_fts_rows(
             .expect("schema validated as LargeUtf8");
         for row in 0..batch.num_rows() {
             let local_doc_id = first_doc + row as u32;
-            let text = if strs.is_null(row) {
-                ""
+            if strs.is_null(row) {
+                fb.add_null_doc(col_id as u32, local_doc_id)?;
             } else {
-                strs.value(row)
-            };
-            fb.add_doc(col_id as u32, local_doc_id, text)?;
+                fb.add_doc(col_id as u32, local_doc_id, strs.value(row))?;
+            }
         }
     }
     Ok(())
@@ -6009,7 +6018,7 @@ fn fts_columns_json(cols: &[FtsConfig], field_id_of: impl Fn(&str) -> Option<Fie
             s.push_str(&id.to_string());
         }
         s.push_str(r#","tokenizer":""#);
-        s.push_str(STANDARD_TOKENIZER);
+        s.push_str(c.analyzer.as_str());
         s.push('"');
         // Always emitted — see the function docs.
         s.push_str(r#","k1":"#);
@@ -11995,7 +12004,7 @@ mod tests {
             vec![],
         );
         // The derived identity the reader will report for that column.
-        let chain = chain_name(Stopwords::English, Stemmer::English);
+        let chain = chain_name(Analyzer::Standard, Stopwords::English, Stemmer::English);
         let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
         let schema = b.opts.schema.clone();
         b.add_batch(&batch_two_rows(&schema), &[])

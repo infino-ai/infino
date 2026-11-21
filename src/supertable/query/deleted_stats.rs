@@ -390,6 +390,19 @@ impl<'a> LiveColumn<'a> {
         })
     }
 
+    /// The values the deleted rows held, each with how many held it.
+    pub(crate) fn deleted_counts(&self) -> Result<Vec<(ScalarValue, u64)>, Unknown> {
+        if self.deleted == 0 || self.no_values() {
+            return Ok(Vec::new());
+        }
+        let delta = self.delta()?;
+        if delta.all_null() {
+            return Ok(Vec::new());
+        }
+        let counts = delta.value_counts.as_ref().ok_or(Unknown::Scan)?;
+        Ok(counts.entries().to_vec())
+    }
+
     /// How the live rows change the stored value counts. A superfile that
     /// holds values it recorded no counts of is scanned.
     pub(crate) fn counts_change(&self) -> Result<CountsChange, Unknown> {
@@ -662,7 +675,7 @@ pub(crate) fn better_bound<'a>(
 mod tests {
     use std::{collections::HashSet, ops::Range, slice::from_ref, sync::Arc};
 
-    use arrow_array::{Int64Array, RecordBatch};
+    use arrow_array::{ArrayRef, Int64Array, LargeStringArray, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::prelude::{col, lit};
     use roaring::RoaringBitmap;
@@ -670,11 +683,15 @@ mod tests {
 
     use super::*;
     use crate::{
+        Analyzer,
+        runtime_metrics::op_stats::with_op_stats,
         storage::{LocalFsStorageProvider, StorageProvider},
+        superfile::builder::FtsConfig,
         supertable::{
-            Supertable, SupertableOptions, SupertableReader, query::sql::value_count_schema,
+            Supertable, SupertableOptions, SupertableReader,
+            query::{sql::value_count_schema, value_count_carry::MAX_TABLE_VALUE_COUNTS},
         },
-        test_helpers::default_disk_cache,
+        test_helpers::{default_disk_cache, xorshift},
     };
 
     /// Rows of the superfile whose deletes cover most of it.
@@ -695,6 +712,17 @@ mod tests {
     /// Rows of the superfile with deletes in the bounds test: more distinct
     /// values of `w` than a superfile counts exactly.
     const WIDE_ROWS: i64 = 300;
+
+    /// Files in the keyword value-count fixture, and rows in each.
+    const KEYWORD_FILES: usize = 5;
+    const KEYWORD_ROWS: usize = 2_000;
+    /// Distinct numbers the fixture's values are made from: well past the
+    /// table-wide limit, so the statistics decline.
+    const KEYWORD_POOL: u64 = 1_500;
+    /// `n` is drawn from `0..KEYWORD_N_RANGE`; rows below
+    /// `KEYWORD_DELETED_BELOW` are deleted, about one in ten.
+    const KEYWORD_N_RANGE: u64 = 1_000;
+    const KEYWORD_DELETED_BELOW: i64 = 100;
 
     struct Table {
         table: Supertable,
@@ -1021,5 +1049,105 @@ mod tests {
             sorted_rows(from_ref(&counted))
         );
         assert_eq!(reader.deleted_stats().len(), 1);
+    }
+
+    /// `value_counts` on a keyword column equals the grouped count, with
+    /// nulls, deletes, a file with every row deleted and many files, and
+    /// reads no row: from the term index, and from each file's dictionary on
+    /// a table that keeps no index. The same values in a `standard` column
+    /// are grouped as before.
+    #[test]
+    fn keyword_value_counts_sum_the_terms_less_the_deleted_rows() {
+        assert!(MAX_TABLE_VALUE_COUNTS < KEYWORD_POOL as usize);
+        for term_index in [true, false] {
+            let dir = TempDir::new().expect("tempdir");
+            let cache_dir = TempDir::new().expect("cache dir");
+            let storage: Arc<dyn StorageProvider> =
+                Arc::new(LocalFsStorageProvider::new(dir.path()).expect("storage"));
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("n", DataType::Int64, false),
+                Field::new("tag", DataType::LargeUtf8, true),
+                Field::new("plain", DataType::LargeUtf8, true),
+            ]));
+            let fts = vec![
+                FtsConfig::new("tag").analyzer(Analyzer::Keyword),
+                FtsConfig::new("plain"),
+            ];
+            let options = SupertableOptions::new(Arc::clone(&schema), fts, vec![])
+                .expect("options")
+                .with_storage(Arc::clone(&storage))
+                .with_disk_cache(default_disk_cache(storage, cache_dir.path()))
+                .with_term_index(term_index);
+            let table = Supertable::create(options).expect("create");
+            let mut next = xorshift(0x5EED);
+            // The last file's rows are all deleted: it holds no live value,
+            // and its deleted rows are not read.
+            for file in 0..=KEYWORD_FILES {
+                let n: Vec<i64> = (0..KEYWORD_ROWS)
+                    .map(|_| match file {
+                        KEYWORD_FILES => KEYWORD_N_RANGE as i64,
+                        _ => (next() % KEYWORD_N_RANGE) as i64,
+                    })
+                    .collect();
+                // Spellings `standard` would fold together, the empty
+                // string, non-ASCII, and a null in about one row in ten.
+                let tags: Vec<Option<String>> = (0..KEYWORD_ROWS)
+                    .map(|_| {
+                        let r = next();
+                        let v = r % KEYWORD_POOL;
+                        match r % 10 {
+                            0 => None,
+                            1 => Some(String::new()),
+                            2 => Some(format!("Tag {v}")),
+                            3 => Some(format!("tag {v}.")),
+                            4 => Some(format!("ünï/{v}")),
+                            _ => Some(format!("tag {v}")),
+                        }
+                    })
+                    .collect();
+                let tags: ArrayRef = Arc::new(LargeStringArray::from(tags));
+                let batch = RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![Arc::new(Int64Array::from(n)), Arc::clone(&tags), tags],
+                )
+                .expect("batch");
+                let mut writer = table.writer().expect("writer");
+                writer.append(&batch).expect("append");
+                writer.commit().expect("commit");
+            }
+            table
+                .delete(
+                    col("n")
+                        .lt(lit(KEYWORD_DELETED_BELOW))
+                        .or(col("n").eq(lit(KEYWORD_N_RANGE as i64))),
+                )
+                .expect("delete");
+
+            let reader = table.reader().expect("reader");
+            for (column, reads_rows) in [("tag", false), ("plain", true)] {
+                let label = format!("{column}, term index {term_index}");
+                let (counted, stats) =
+                    with_op_stats(|| reader.value_counts(column).expect("value counts"));
+                let grouped = rows(
+                    &reader,
+                    &format!("SELECT {column}, COUNT(*) FROM supertable GROUP BY {column}"),
+                );
+                assert_eq!(sorted_rows(from_ref(&counted)), grouped, "{label}");
+                assert_eq!(
+                    stats.rows_materialized > 0,
+                    reads_rows,
+                    "{label}: {stats:?}"
+                );
+                let field = schema.field_with_name(column).expect("field");
+                let value_schema = value_count_schema(field).expect("schema");
+                assert!(
+                    reader
+                        .value_counts_from_stats(column, &value_schema)
+                        .expect("from stats")
+                        .is_none(),
+                    "{label}: the statistics decline"
+                );
+            }
+        }
     }
 }
