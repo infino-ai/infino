@@ -630,4 +630,6 @@ memory:
   # These bytes are not reserved against connection_budget_bytes. They are
   # resident memory, so they count toward what process_limit_bytes measures:
   # a large cache leaves statements that much less room under that limit.
+  # A program embedding the engine may size the cache itself instead
+  # (set_decoded_column_cache_bytes), which takes the place of this value.
   decoded_column_cache_bytes: 0
