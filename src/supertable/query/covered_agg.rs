@@ -1930,6 +1930,10 @@ fn term_count_pass(
         let deleted = provider
             .deleted_rows(entry.superfile_id, Instant::now())
             .ok()?;
+        // No live row: no value and no null, and no deleted rows to read.
+        if deleted.len() >= entry.n_docs {
+            continue;
+        }
         let live = live_column(provider, entry, column.id, data_type, &deleted);
         let answer = live
             .live_nulls()
@@ -1947,7 +1951,7 @@ fn term_count_pass(
             Err(Unknown::Scan) => return None,
         };
         inputs.nulls = inputs.nulls.checked_add(nulls)?;
-        if file_lacks_column(entry, column.id) || deleted.len() >= entry.n_docs {
+        if file_lacks_column(entry, column.id) {
             continue;
         }
         // Every document with a token has exactly one: the file's index

@@ -1052,9 +1052,10 @@ mod tests {
     }
 
     /// `value_counts` on a keyword column equals the grouped count, with
-    /// nulls, deletes and many files, and reads no row: from the term index,
-    /// and from each file's dictionary on a table that keeps no index. The
-    /// same values in a `standard` column are grouped as before.
+    /// nulls, deletes, a file with every row deleted and many files, and
+    /// reads no row: from the term index, and from each file's dictionary on
+    /// a table that keeps no index. The same values in a `standard` column
+    /// are grouped as before.
     #[test]
     fn keyword_value_counts_sum_the_terms_less_the_deleted_rows() {
         assert!(MAX_TABLE_VALUE_COUNTS < KEYWORD_POOL as usize);
@@ -1079,9 +1080,14 @@ mod tests {
                 .with_term_index(term_index);
             let table = Supertable::create(options).expect("create");
             let mut next = xorshift(0x5EED);
-            for _ in 0..KEYWORD_FILES {
+            // The last file's rows are all deleted: it holds no live value,
+            // and its deleted rows are not read.
+            for file in 0..=KEYWORD_FILES {
                 let n: Vec<i64> = (0..KEYWORD_ROWS)
-                    .map(|_| (next() % KEYWORD_N_RANGE) as i64)
+                    .map(|_| match file {
+                        KEYWORD_FILES => KEYWORD_N_RANGE as i64,
+                        _ => (next() % KEYWORD_N_RANGE) as i64,
+                    })
                     .collect();
                 // Spellings `standard` would fold together, the empty
                 // string, non-ASCII, and a null in about one row in ten.
@@ -1110,7 +1116,11 @@ mod tests {
                 writer.commit().expect("commit");
             }
             table
-                .delete(col("n").lt(lit(KEYWORD_DELETED_BELOW)))
+                .delete(
+                    col("n")
+                        .lt(lit(KEYWORD_DELETED_BELOW))
+                        .or(col("n").eq(lit(KEYWORD_N_RANGE as i64))),
+                )
                 .expect("delete");
 
             let reader = table.reader().expect("reader");
