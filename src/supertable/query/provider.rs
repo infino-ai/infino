@@ -26,7 +26,7 @@
 //!      source, where `PruningPredicate` prunes row groups and pages.
 //!      A predicate the index could not bound runs in DataFusion's
 //!      `FilterExec` above the scan, or as a Parquet row filter under
-//!      `ORDER BY ... LIMIT` (`RowFilterUnderTopK`).
+//!      `ORDER BY ... LIMIT` or a plain `LIMIT` (`RowFilterUnderTopK`).
 //!      We deliberately do **not** reimplement this commodity layer.
 //!
 //! Correctness is independent of either tier: every pushed filter
@@ -3170,7 +3170,7 @@ impl TableProvider for SupertableProvider {
         //
         // No predicate is attached to the source. DataFusion hands it the
         // `FilterExec` predicate for statistics pruning, and as a row filter
-        // only under `ORDER BY ... LIMIT` (see `RowFilterUnderTopK`).
+        // only under a `LIMIT` (see `RowFilterUnderTopK`).
         let mut source = ParquetSource::new(Arc::clone(&self.schema));
         // Serve DataFusion's opener the index-complete footers the
         // readers already parsed — without this the opener re-reads +

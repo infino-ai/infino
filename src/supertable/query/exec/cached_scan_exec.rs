@@ -68,10 +68,10 @@
 //! The Parquet scan serves the statement instead when it reads less:
 //! - the columns this scan would decode don't fit the cache. Kept, they
 //!   would push each other out, and every run would decode them all again;
-//! - a filtered `ORDER BY ... LIMIT` whose other columns are wide. The top-k
-//!   rule (`RowFilterUnderTopK`) takes back the Parquet scan this one stands
-//!   in for, whose row filter decodes those columns only for the rows that
-//!   pass.
+//! - a filtered `ORDER BY ... LIMIT` or plain `LIMIT` whose other columns
+//!   are wide. `RowFilterUnderTopK` takes back the Parquet scan this one
+//!   stands in for, whose row filter decodes those columns only for the rows
+//!   that pass.
 
 use std::{
     cmp::Reverse,
@@ -303,9 +303,9 @@ pub(crate) struct CachedScanExec {
     statistics: Arc<Statistics>,
     properties: Arc<PlanProperties>,
     /// The Parquet scan this one stands in for, metered as the provider
-    /// builds it. A plan that reads better through the Parquet scan, an
-    /// `ORDER BY ... LIMIT` whose row filter decodes the wide columns only
-    /// for the rows that pass, takes it back ([`Self::parquet`]).
+    /// builds it. A plan that reads better through the Parquet scan, a
+    /// `LIMIT` whose row filter decodes the wide columns only for the rows
+    /// that pass, takes it back ([`Self::parquet`]).
     parquet: Arc<dyn ExecutionPlan>,
     /// Filters a parent pushed down that tighten while the statement runs
     /// ([`LiveFilters`]); `None` without any.

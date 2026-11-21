@@ -49,7 +49,10 @@
 //! The `WHERE` stays in its `FilterExec`. A Parquet row filter would decode
 //! only the `WHERE`'s columns for rows that fail, but a filter keeping rows at
 //! random leaves a selection of thousands of fragments per row group, which
-//! measured slower than decoding the batch whole.
+//! measured slower than decoding the batch whole. Where the scan's other
+//! columns are wide, `RowFilterUnderTopK` instead runs the `WHERE` in the scan
+//! and hands it the `LIMIT`, which stops the selection at the limit's rows;
+//! such a scan takes the fetch and is not staged.
 
 use std::{mem, sync::Arc};
 
