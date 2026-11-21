@@ -28,6 +28,12 @@ pub struct ColdStoreSplit {
     pub first_query: ObjectStoreMeter,
     pub second_query: ObjectStoreMeter,
     pub repeat_query: ObjectStoreMeter,
+    /// Background-fill GETs and bytes of the whole cold run, from the open until every fill it
+    /// started settled, whichever query started them, shaped as a foreground meter. Fills run past
+    /// the queries, so the query windows alone miss most of them.
+    pub fill: ObjectStoreMeter,
+    /// The part of [`Self::fill`] that ran after the last query returned.
+    pub fill_after_queries: ObjectStoreMeter,
 }
 
 /// Handle to a storage provider and its engine usage meter.
@@ -72,15 +78,6 @@ pub fn background_fill_meter(snap: &ObjectStoreMeter) -> ObjectStoreMeter {
     ObjectStoreMeter {
         get_count: snap.bg_get_count,
         get_bytes: snap.bg_get_bytes,
-        ..Default::default()
-    }
-}
-
-/// Merge background-fill GETs from two windows.
-pub fn merge_background_fill(a: &ObjectStoreMeter, b: &ObjectStoreMeter) -> ObjectStoreMeter {
-    ObjectStoreMeter {
-        get_count: a.bg_get_count.saturating_add(b.bg_get_count),
-        get_bytes: a.bg_get_bytes.saturating_add(b.bg_get_bytes),
         ..Default::default()
     }
 }

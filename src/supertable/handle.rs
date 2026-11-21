@@ -1555,6 +1555,15 @@ impl Supertable {
         self.block_on_query(async move { cache.wait_until_fills_settled(timeout).await })
     }
 
+    /// Drop this table's cached SQL sessions and plans, as the memory pass does when held files
+    /// fill the budget, so the files they prepared are no longer held. A background download waits
+    /// while its file is held, so a caller that waits for downloads to finish
+    /// ([`Self::wait_until_warm`]) after its SQL statements calls this first.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn drop_cached_sessions_for_test(&self) {
+        self.inner.drop_cached_sessions();
+    }
+
     /// This handle's lease-owner id. Stamped on every WAL the
     /// handle's recovery sweep / commit pipeline acquires.
     /// Minted once at handle construction via `IdGenerator`;
@@ -3042,6 +3051,7 @@ mod tests {
             opann::MODALITY_MIN_CELL_DOCS,
             options::Consistency,
             query::dispatch::open_reader,
+            reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore},
             schema::LegacyNames,
             slow_vector_state::{self, PendingDrainState},
             writer::{
@@ -3049,8 +3059,17 @@ mod tests {
                 stamp_slow_vector_state,
             },
         },
-        test_helpers::default_tokenizer,
+        test_helpers::{build_title_batch, default_supertable_options, default_tokenizer},
     };
+
+    /// Files in the cached-session download test's table.
+    const HELD_FILES: usize = 3;
+    /// How long that test lets downloads run while the cached session holds their files.
+    const HELD_WAIT: Duration = Duration::from_millis(300);
+    /// How long it gives them once the cached session is gone.
+    const RELEASED_WAIT: Duration = Duration::from_secs(30);
+    /// A defer window longer than the test, as the benches set it, so a held file stays held.
+    const LONG_DEFER: Duration = Duration::from_secs(3600);
 
     fn rerank_payloads_by_stable_id(table: &Supertable) -> HashMap<i128, Vec<u8>> {
         let table_reader = table.reader().expect("reader");
@@ -3352,6 +3371,67 @@ mod tests {
         // No disk cache attached → returns Ok immediately.
         st.wait_until_warm(Duration::from_millis(1))
             .expect("warm no-op");
+    }
+
+    /// A cached SQL session holds the files its statements prepared, so their background downloads
+    /// wait while it lives. Dropping the cached sessions lets them finish.
+    #[test]
+    fn dropping_cached_sessions_lets_held_files_download() {
+        let storage_dir = TempDir::new().expect("storage tempdir");
+        let cache_dir = TempDir::new().expect("cache tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(storage_dir.path()).expect("provider"));
+        {
+            let producer =
+                Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+                    .expect("create");
+            for file in 0..HELD_FILES {
+                let mut writer = producer.writer().expect("writer");
+                writer
+                    .append(&build_title_batch(&[&format!("alpha {file}"), "beta"]))
+                    .expect("append");
+                writer.commit().expect("commit");
+            }
+        }
+        let cache = DiskCacheStore::new_unpinned(
+            Arc::clone(&storage),
+            DiskCacheConfig {
+                cache_root: cache_dir.path().to_path_buf(),
+                cold_fetch_mode: ColdFetchMode::LazyForegroundWithBackgroundFill,
+                promotion_defer_timeout: LONG_DEFER,
+                ..Default::default()
+            },
+        )
+        .expect("cache");
+        let st = Supertable::open(
+            default_supertable_options()
+                .with_storage(storage)
+                .with_disk_cache(cache),
+        )
+        .expect("open");
+        st.reader()
+            .expect("reader")
+            .query_sql("SELECT count(*) FROM supertable WHERE title LIKE '%alpha%'")
+            .expect("query");
+
+        assert!(
+            st.wait_until_warm(HELD_WAIT).is_err(),
+            "the cached session holds the files, so their downloads wait"
+        );
+        assert_eq!(
+            st.stats().mmap_resident_bytes,
+            Some(0),
+            "no download has landed while the files are held"
+        );
+        st.drop_cached_sessions_for_test();
+        st.wait_until_warm(RELEASED_WAIT)
+            .expect("with the session gone, the downloads finish");
+        assert!(
+            st.stats()
+                .mmap_resident_bytes
+                .is_some_and(|bytes| bytes > 0),
+            "and land: the files are now whole on local disk, not cancelled"
+        );
     }
 
     #[test]
