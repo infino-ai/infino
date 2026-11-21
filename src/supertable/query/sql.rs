@@ -110,6 +110,7 @@ use crate::{
             },
             exec::{
                 common::{collect_plan_metered, run_within_process_limit},
+                fields_exec::register_bm25_fields,
                 fts_exec::register_bm25,
                 hybrid_exec::register_hybrid_search,
                 match_exec::{MatchTopK, register_match},
@@ -1068,6 +1069,7 @@ impl SupertableReader {
         // nodes that call the async kernels inside `execute()`.
         register_vector_search(&ctx, Arc::clone(&reader), schemas.scalar().clone());
         register_bm25(&ctx, Arc::clone(&reader), schemas.scalar().clone());
+        register_bm25_fields(&ctx, Arc::clone(&reader), schemas.scalar().clone());
         // Unranked token / exact match TVFs (siblings of bm25_search).
         register_match(&ctx, Arc::clone(&reader), schemas.scalar().clone());
         // `text_match`, the token match as a WHERE predicate.
