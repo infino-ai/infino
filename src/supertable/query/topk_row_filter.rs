@@ -175,8 +175,10 @@ fn row_filtered(
         // Parquet scan the kept columns stand in for serves the statement.
         if let Some(cached) = meter.input().downcast_ref::<CachedScanExec>() {
             // Under a plain `LIMIT` the gather stops after the scan's first
-            // batch, which kept columns hand over with nothing to decode.
-            if matches!(bound, Bound::Limit) {
+            // batch, which kept columns hand over with nothing to decode. A
+            // scan of only the rows an index chose (a top-k it answered)
+            // reads the other columns for just those rows already.
+            if matches!(bound, Bound::Limit) || cached.reads_chosen_rows() {
                 return Ok(None);
             }
             return row_filtered(cached.parquet(), bound, filters);
