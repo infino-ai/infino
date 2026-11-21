@@ -31,7 +31,7 @@ use crate::{
             posting::BLOCK_LEN,
             tokenize::{MAX_TOKEN_CHARS, STANDARD_TOKENIZER},
         },
-        id_space::{FtsDocId, RowId},
+        id_space::{FtsDocId, row_bitmap},
     },
     utils::terms::{make_key, value::DictEntry},
 };
@@ -655,7 +655,7 @@ impl FtsReader {
                 .await?;
             work.merge(term_work);
             out.push(ContainsRows {
-                proven: rows.into_iter().map(RowId::get).collect(),
+                proven: row_bitmap(&rows),
                 doubtful: RoaringBitmap::new(),
             });
         }

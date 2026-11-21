@@ -133,7 +133,7 @@ use crate::{
             },
             tokenize::Phrase,
         },
-        id_space::{FtsDocId, RowId},
+        id_space::{FtsDocId, RowId, row_bitmap},
     },
     supertable::{
         error::QueryError,
@@ -415,7 +415,7 @@ impl MatchKernel {
                 }
             };
             work.merge(neg_work);
-            let excluded: RoaringBitmap = neg_docs.into_iter().map(RowId::get).collect();
+            let excluded = row_bitmap(&neg_docs);
             docs.into_iter()
                 .filter(|d| !excluded.contains(d.get()))
                 .collect::<Vec<_>>()
@@ -3414,12 +3414,7 @@ impl SupertableReader {
                          (suid, within): (Uuid, Option<Arc<RoaringBitmap>>)| {
             let kernel = Arc::clone(&kernel);
             async move {
-                let mut rows: RoaringBitmap = kernel
-                    .docs(&r, suid)
-                    .await?
-                    .into_iter()
-                    .map(RowId::get)
-                    .collect();
+                let mut rows = row_bitmap(&kernel.docs(&r, suid).await?);
                 match within {
                     Some(within) => rows &= within.as_ref(),
                     None => {
@@ -3732,7 +3727,7 @@ impl SupertableReader {
                                 }
                             };
                             work.merge(neg_work);
-                            neg_docs.into_iter().map(RowId::get).collect()
+                            row_bitmap(&neg_docs)
                         } else {
                             RoaringBitmap::new()
                         };
