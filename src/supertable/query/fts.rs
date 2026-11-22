@@ -5239,7 +5239,7 @@ mod tests {
         );
     }
 
-    use arrow_array::{Decimal128Array, LargeStringArray, RecordBatch};
+    use arrow_array::{ArrayRef, Decimal128Array, LargeStringArray, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
     use async_trait::async_trait;
     use bytes::Bytes;
@@ -5254,6 +5254,7 @@ mod tests {
         build_work_units, ceilings_at_table_avgdl, fanout_for, walk_dict,
     };
     use crate::{
+        Analyzer,
         config::{CompactionSettings, OptimizeOptions},
         memory::ConnectionMemoryBudget,
         storage::{LocalFsStorageProvider, ObjectMeta, StorageError, StorageProvider},
@@ -7193,6 +7194,59 @@ mod tests {
         let r = st.reader().expect("reader");
         let hits = r.bm25_search_prefix("title", "RUST", 5).expect("query");
         assert_eq!(hits.len(), 1);
+    }
+
+    /// An empty prefix finds the `''` values of a keyword column in a part
+    /// that holds no other value. The empty string is a real term there,
+    /// but the part's term range reads as empty, and the part-level prune
+    /// used to drop the part on that alone: with and without a term index.
+    #[test]
+    fn empty_prefix_keeps_a_part_whose_keyword_values_are_all_empty() {
+        for term_index in [true, false] {
+            let dir = TempDir::new().expect("tempdir");
+            let storage: Arc<dyn StorageProvider> =
+                Arc::new(LocalFsStorageProvider::new(dir.path()).expect("storage"));
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "tag",
+                DataType::LargeUtf8,
+                true,
+            )]));
+            // A one-byte part threshold puts each commit in a part of its
+            // own, and opening with no eager load leaves the parts unloaded,
+            // so a query chooses parts by their summaries.
+            let options = || {
+                SupertableOptions::new(
+                    Arc::clone(&schema),
+                    vec![FtsConfig::new("tag").analyzer(Analyzer::Keyword)],
+                    vec![],
+                )
+                .expect("options")
+                .with_storage(Arc::clone(&storage))
+                .with_part_size_threshold_bytes(1)
+                .with_eager_load_threshold(0)
+                .with_term_index(term_index)
+            };
+            let table = Supertable::create(options()).expect("create");
+            for values in [vec![Some("a"), None], vec![Some(""), Some(""), None]] {
+                let column: ArrayRef = Arc::new(LargeStringArray::from(values));
+                let batch = RecordBatch::try_new(Arc::clone(&schema), vec![column]).expect("batch");
+                let mut w = table.writer().expect("writer");
+                w.append(&batch).expect("append");
+                w.commit().expect("commit");
+            }
+            drop(table);
+            let table = Supertable::open(options()).expect("open");
+            let hits = table
+                .reader()
+                .expect("reader")
+                .bm25_search_prefix("tag", "", 10)
+                .expect("prefix");
+            assert_eq!(
+                hits.len(),
+                3,
+                "`a` and both `''` rows, term index {term_index}"
+            );
+        }
     }
 
     #[test]
