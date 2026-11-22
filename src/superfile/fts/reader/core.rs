@@ -1712,6 +1712,63 @@ impl FtsReader {
             .map(|pairs| col.few_norms(pairs)))
     }
 
+    /// The length bucket of each of `docs` in `column_id`, in `docs`' order:
+    /// from the norms when they are in memory, else from the stored buckets,
+    /// as a few page reads or, for documents spread wide, the whole array in
+    /// one read; a column without stored buckets loads its norms.
+    pub(super) async fn doc_buckets(
+        &self,
+        column_id: u32,
+        docs: &[u32],
+    ) -> Result<Vec<u8>, FtsError> {
+        let col = &self.columns[column_id as usize];
+        if !col.norms_loaded()
+            && let Some(buckets) = col.bucket_bytes()
+        {
+            let mut sorted = docs.to_vec();
+            sorted.sort_unstable();
+            sorted.dedup();
+            let pairs = match self
+                .read_buckets(col, buckets.clone(), &sorted, CANDIDATE_MAX_RANGES)
+                .await?
+            {
+                Some(pairs) => pairs,
+                None => {
+                    let all = self.source.range_async(buckets).await.map_err(|e| {
+                        FtsError::RangeFetch {
+                            what: LENGTH_ARRAY,
+                            source: e,
+                        }
+                    })?;
+                    let mut pairs = Vec::with_capacity(sorted.len());
+                    for &doc in &sorted {
+                        let Some(&bucket) = all.get(doc as usize) else {
+                            return Err(FtsError::Read(ReadError::Malformed(format!(
+                                "doc {doc} past the bucket array of column '{}'",
+                                col.name
+                            ))));
+                        };
+                        pairs.push((doc, bucket));
+                    }
+                    pairs
+                }
+            };
+            return Ok(docs
+                .iter()
+                .map(|d| {
+                    let at = pairs
+                        .binary_search_by_key(d, |&(doc, _)| doc)
+                        .expect("every document was read");
+                    pairs[at].1
+                })
+                .collect());
+        }
+        self.ensure_norms(column_id).await?;
+        let base = col.base_norms.get().expect("the norms were just loaded");
+        let (bytes, _) = base.dl_norm_k1.parts();
+        Ok(docs.iter().map(|&d| bytes[d as usize]).collect())
+    }
+
     /// The stored buckets of `docs` (sorted, distinct), documents a page or
     /// less apart read together; `None` when that takes more than
     /// `max_ranges` reads.

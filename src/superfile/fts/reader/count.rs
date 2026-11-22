@@ -35,6 +35,7 @@ use crate::{
         error::FtsError,
         format::fts::U32_BYTES,
         fts::{
+            analysis::chain_revision,
             bm25,
             builder::{TERM_META_SIZE, proportional_head_depth},
             short::short_df,
@@ -472,6 +473,69 @@ impl FtsReader {
                 .collect(),
         });
         work.kernel_cpu_ns = walk_ns;
+        Ok((self.ids_to_rows_async(docs).await?, work))
+    }
+
+    /// The documents of `column` holding every one of `tokens` whose length is
+    /// the tokens' count, as rows: all an exact match of the string the tokens
+    /// came from can be, since an equal string analyzes to the same tokens. A
+    /// column analyzed by an older chain keeps every document that holds the
+    /// tokens, as its terms may split the string differently.
+    pub(crate) async fn exact_match_candidates(
+        &self,
+        column: &str,
+        tokens: &[&str],
+        prefetched: Option<&FetchedTermMemo>,
+        dict: &QueryDict,
+    ) -> Result<(Vec<RowId>, MatchWork), FtsError> {
+        let column_id = self.resolve_column_id(column)?;
+        if tokens.is_empty() {
+            return Ok((Vec::new(), MatchWork::default()));
+        }
+        let (dict_bytes, fetched) = match prefetched.is_some_and(|m| m.covers(tokens)) {
+            true => (None, false),
+            false => {
+                let (bytes, fetched) = self.query_dict(dict).await?;
+                (Some(bytes), fetched)
+            }
+        };
+        let cursors: Vec<TermCursor> = self
+            .build_term_cursors_opt(
+                column_id,
+                tokens,
+                QueryIdf::ThisFile,
+                CursorUse::Count,
+                None,
+                prefetched,
+                dict_bytes.as_ref().map(Bytes::as_ref),
+            )
+            .await?
+            .into_iter()
+            .flatten()
+            .collect();
+        drop(dict_bytes);
+        let mut work = MatchWork::for_cursors(&cursors);
+        work.planned_ranges += u64::from(fetched);
+        if cursors.len() != tokens.len() {
+            return Ok((Vec::new(), work));
+        }
+        let (docs, walk_ns) = timed_section(|| self.collect_and_intersect(cursors));
+        work.kernel_cpu_ns = walk_ns;
+        let col = &self.columns[column_id as usize];
+        let current = chain_revision(col.stopwords, col.stemmer);
+        let docs = match col.analysis_revision.is_some_and(|r| r >= current) && !docs.is_empty() {
+            true => {
+                let want = bm25::quantize_len(u32::try_from(tokens.len()).unwrap_or(u32::MAX));
+                let ids: Vec<u32> = docs.iter().map(|d| d.get()).collect();
+                let buckets = self.doc_buckets(column_id, &ids).await?;
+                docs.into_iter()
+                    .zip(buckets)
+                    .filter(|&(_, bucket)| bucket == want)
+                    .map(|(d, _)| d)
+                    .collect()
+            }
+            false => docs,
+        };
         Ok((self.ids_to_rows_async(docs).await?, work))
     }
 

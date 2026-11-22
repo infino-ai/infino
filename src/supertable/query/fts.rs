@@ -4030,10 +4030,9 @@ impl SupertableReader {
                     let memo = memo_from_locations(&r, &locations, entry.superfile_id).await;
                     let refs: Vec<&str> = tokens_arc.iter().map(String::as_str).collect();
                     let (docs, work) = r
-                        .token_match_prefetched(
+                        .exact_match_candidates(
                             &column_arc,
                             &refs,
-                            BoolMode::And,
                             memo.as_deref(),
                             &QueryDict::default(),
                         )

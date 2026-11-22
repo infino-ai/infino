@@ -2926,6 +2926,22 @@ impl SuperfileReader {
             .await?)
     }
 
+    /// [`FtsReader::exact_match_candidates`] on this superfile's index.
+    pub(crate) async fn exact_match_candidates(
+        &self,
+        column: &str,
+        tokens: &[&str],
+        prefetched: Option<&FetchedTermMemo>,
+        dict: &QueryDict,
+    ) -> Result<(Vec<RowId>, MatchWork), ReadError> {
+        let fts = self
+            .fts()
+            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
+        Ok(fts
+            .exact_match_candidates(column, tokens, prefetched, dict)
+            .await?)
+    }
+
     /// The cursors of an `Or` match over `tokens`, built once for this
     /// superfile's doc-id slices. Delegates to
     /// [`FtsReader::match_cursor_set`].
