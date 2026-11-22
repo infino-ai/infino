@@ -5,13 +5,13 @@
 //! table ([`NormTable`]), per-column metadata ([`ColumnMeta`]) and its
 //! JSON config ([`FtsColumnConfig`]), and the reader [`OpenOptions`].
 
-use bytes::Bytes;
 use std::{
     fmt,
     ops::Range,
     sync::{Arc, OnceLock},
 };
 
+use bytes::Bytes;
 use serde::Deserialize;
 
 use crate::{

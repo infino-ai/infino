@@ -113,7 +113,6 @@ const RANGED_KERNEL_POOL_MIN_TERMS: usize = OR_WINDOW_MIN_TERMS;
 const UNRANGED_KERNEL_POOL_MIN_MASS: u64 = 20_000;
 
 pub use crate::superfile::fts::reader::BoolMode;
-use crate::superfile::fts::reader::{CANDIDATE_MAX_POSTINGS, FEW_NORMS_MAX_DOCS};
 #[cfg(feature = "detailed-tracing")]
 use crate::utils::trace::OpOrigin;
 use crate::{
@@ -128,9 +127,10 @@ use crate::{
             bm25,
             bm25::Bm25Params,
             reader::{
-                Bm25SearchOptions, CandidateNorms, ClauseLists, ColumnLengthStats, FetchedTermMemo,
-                GlobalTermIdf, LiveFloor, MatchWork, OR_WINDOW_MIN_TERMS, OrCursorSet,
-                PreparedClauses, QueryDict, QueryIdf, ScoringView,
+                Bm25SearchOptions, CANDIDATE_MAX_POSTINGS, CandidateNorms, ClauseLists,
+                ColumnLengthStats, FEW_NORMS_MAX_DOCS, FetchedTermMemo, GlobalTermIdf, LiveFloor,
+                MatchWork, OR_WINDOW_MIN_TERMS, OrCursorSet, PreparedClauses, QueryDict, QueryIdf,
+                ScoringView,
             },
             tokenize::Phrase,
         },
