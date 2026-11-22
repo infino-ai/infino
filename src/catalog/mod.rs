@@ -2630,8 +2630,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        Bm25SearchOptions, BoolMode, CompactionSettings, Consistency, FieldPatch, Metric,
-        OptimizeOptions, SchemaPatch, Stemmer, Stopwords,
+        Bm25FieldsOptions, Bm25SearchOptions, BoolMode, CompactionSettings, Consistency,
+        FieldClause, FieldPatch, Metric, OptimizeOptions, SchemaPatch, Stemmer, Stopwords,
         catalog::manifest::CATALOG_PATH,
         runtime_metrics::{io::UriClass, op_stats::with_op_stats},
         supertable::{
@@ -7276,6 +7276,74 @@ mod tests {
         );
     }
 
+    /// The catalog form names its table first, and returns what the
+    /// table's own `bm25_search_fields` returns.
+    #[test]
+    fn query_sql_bm25_search_fields_tvf_resolves_table() {
+        let conn = connect("memory://").expect("connect");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new("body", DataType::LargeUtf8, false),
+        ]));
+        let docs = conn
+            .create_table(
+                "docs",
+                schema.clone(),
+                IndexSpec::new().fts("title").fts("body"),
+            )
+            .expect("create docs");
+        let batch = |titles: &[&str], bodies: &[&str]| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(LargeStringArray::from(titles.to_vec())),
+                    Arc::new(LargeStringArray::from(bodies.to_vec())),
+                ],
+            )
+            .expect("batch")
+        };
+        docs.append(&batch(
+            &["the quick brown fox", "a lazy dog", "fox news"],
+            &[
+                "jumps over the dog",
+                "sleeps all day",
+                "the fox and the hound",
+            ],
+        ))
+        .expect("append");
+        docs.append(&batch(&["dog days"], &["a fox at dusk"]))
+            .expect("append");
+
+        let clauses = [
+            FieldClause::new("fox", ["title", "body"]),
+            FieldClause::new("dog", ["title", "body"]),
+        ];
+        let opts = Bm25FieldsOptions::new().with_weight("title", 2.0);
+        let want = rows_of(
+            &docs
+                .bm25_search_fields(&clauses, 10, &opts, None)
+                .expect("table api"),
+        );
+        let got = rows_of(
+            &conn
+                .query_sql(
+                    r#"SELECT _id, score FROM bm25_search_fields('docs', '[{"query": "fox", "fields": ["title", "body"]}, {"query": "dog", "fields": ["title", "body"]}]', 10, 'or', '{"title": 2.0}') ORDER BY score DESC, _id ASC"#,
+                )
+                .expect("bm25_search_fields tvf"),
+        );
+        assert_eq!(got, want);
+        assert_eq!(got.len(), 4, "every row matches fox or dog somewhere");
+
+        // A table with no full-text column named, or none at all, is a
+        // clean planning error.
+        assert!(
+            conn.query_sql(
+                r#"SELECT _id FROM bm25_search_fields('nope', '[{"query": "fox", "fields": ["title"]}]', 10)"#
+            )
+            .is_err()
+        );
+    }
+
     #[test]
     fn query_sql_search_tvf_over_storage_does_not_panic() {
         // Regression: a search TVF takes the table-free runtime fallback (it
@@ -7553,6 +7621,11 @@ mod tests {
             (
                 "SELECT * FROM bm25_search('vecs', 'title')".to_string(),
                 "bm25_search expects 4 or 5 arguments (table, column, query, k[, mode]), got 2",
+                "table \"vecs\" has full-text columns: title",
+            ),
+            (
+                "SELECT * FROM bm25_search_fields('vecs')".to_string(),
+                "bm25_search_fields expects 3 to 5 arguments (table, clauses, k[, mode[, weights]]), got 1",
                 "table \"vecs\" has full-text columns: title",
             ),
             (
