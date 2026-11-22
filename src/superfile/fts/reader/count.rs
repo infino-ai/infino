@@ -527,7 +527,9 @@ impl FtsReader {
             true => {
                 let want = bm25::quantize_len(u32::try_from(tokens.len()).unwrap_or(u32::MAX));
                 let ids: Vec<u32> = docs.iter().map(|d| d.get()).collect();
-                let buckets = self.doc_buckets(column_id, &ids).await?;
+                let buckets = self
+                    .doc_buckets(column_id, &ids, CANDIDATE_MAX_RANGES)
+                    .await?;
                 docs.into_iter()
                     .zip(buckets)
                     .filter(|&(_, bucket)| bucket == want)
@@ -1106,7 +1108,9 @@ mod tests {
     use crate::{
         memory::ConnectionMemoryBudget,
         superfile::{
+            BytesLazyByteSource,
             fts::{
+                analysis::{Stemmer, Stopwords},
                 builder::FtsBuilder,
                 posting::{self, BLOCK_LEN, ENCODING_BITSET, ENCODING_PACKED, ENCODING_PATCHED},
             },
@@ -2146,5 +2150,65 @@ mod tests {
                 assert_eq!(walk.entry, lookup.entry, "{column}/{name}: entry");
             }
         }
+    }
+
+    /// An exact match's candidates are the documents holding every token
+    /// at exactly the tokens' length, in any order; the verify pass that
+    /// compares the value settles the order. Read with single buckets or
+    /// from the norms in memory, they are the same. A column analyzed by
+    /// an older chain, or one that records none, keeps every document
+    /// holding the tokens.
+    #[tokio::test]
+    async fn exact_match_candidates_keep_only_documents_of_the_value_length() {
+        let (blob, unrecorded) = build_standard_blob(&[
+            "taylor swift",
+            "taylor swift live",
+            "swift taylor",
+            "taylor",
+            "Taylor Swift",
+            "taylor swift taylor swift",
+            "red blue",
+        ]);
+        let current = format!(
+            r#"[{{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75,"analysis_revision":{}}}]"#,
+            chain_revision(Stopwords::None, Stemmer::None)
+        );
+        let open_lazy = |json: String| {
+            let src: Arc<dyn LazyByteSource> = Arc::new(BytesLazyByteSource::new(blob.clone()));
+            async move {
+                FtsReader::open_lazy(src, &json, OpenOptions { verify_crc: false })
+                    .await
+                    .expect("open_lazy")
+            }
+        };
+        let readers = [
+            (
+                "eager",
+                FtsReader::open(blob.clone(), &current).expect("open"),
+                vec![0, 2, 4],
+            ),
+            ("lazy", open_lazy(current.clone()).await, vec![0, 2, 4]),
+            (
+                "unrecorded",
+                open_lazy(unrecorded).await,
+                vec![0, 1, 2, 4, 5],
+            ),
+        ];
+        for (name, r, expected) in &readers {
+            let (rows, _) = r
+                .exact_match_candidates("body", &["taylor", "swift"], None, &QueryDict::default())
+                .await
+                .expect("candidates");
+            assert_eq!(rows, *expected, "{name}");
+            let (rows, _) = r
+                .exact_match_candidates("body", &["taylor", "absent"], None, &QueryDict::default())
+                .await
+                .expect("candidates");
+            assert!(rows.is_empty(), "{name}: a token no document holds");
+        }
+        assert!(
+            !readers[1].1.columns[0].norms_loaded(),
+            "single buckets were read"
+        );
     }
 }

@@ -755,7 +755,7 @@ const CANDIDATE_MAX_DOCS: usize = 8192;
 
 /// Most bucket reads one superfile's candidates may take: past this, the
 /// whole array costs less than the requests.
-const CANDIDATE_MAX_RANGES: usize = 64;
+pub(super) const CANDIDATE_MAX_RANGES: usize = 64;
 
 /// A candidate's bound is a sum of a few terms added in another order than
 /// the kernel adds them: widened so a rounding never drops a tie.
@@ -1714,12 +1714,13 @@ impl FtsReader {
 
     /// The length bucket of each of `docs` in `column_id`, in `docs`' order:
     /// from the norms when they are in memory, else from the stored buckets,
-    /// as a few page reads or, for documents spread wide, the whole array in
-    /// one read; a column without stored buckets loads its norms.
+    /// as at most `max_ranges` page reads or else the whole array in one
+    /// read; a column without stored buckets loads its norms.
     pub(super) async fn doc_buckets(
         &self,
         column_id: u32,
         docs: &[u32],
+        max_ranges: usize,
     ) -> Result<Vec<u8>, FtsError> {
         let col = &self.columns[column_id as usize];
         if !col.norms_loaded()
@@ -1729,7 +1730,7 @@ impl FtsReader {
             sorted.sort_unstable();
             sorted.dedup();
             let pairs = match self
-                .read_buckets(col, buckets.clone(), &sorted, CANDIDATE_MAX_RANGES)
+                .read_buckets(col, buckets.clone(), &sorted, max_ranges)
                 .await?
             {
                 Some(pairs) => pairs,
@@ -6961,6 +6962,234 @@ mod tests {
                 }
                 assert_eq!(dest, expect, "window at {base}");
             }
+        }
+    }
+
+    /// Documents in [`candidate_corpus`].
+    const CANDIDATE_CORPUS_DOCS: u32 = 3000;
+
+    /// Hits the candidate-norms tests rank.
+    const CANDIDATE_K: usize = 10;
+
+    /// A positional `body` corpus of spread lengths: `alpha` and `beta` are
+    /// common, `the` very common, `zyzzyva` in every 97th document and
+    /// `quux` in one.
+    fn candidate_corpus() -> (Bytes, &'static str) {
+        const FILLER: [&str; 6] = ["red", "green", "blue", "cyan", "pink", "gray"];
+        let mut next = xorshift(0x5eed_cafe);
+        let mut b = FtsBuilder::new();
+        b.register_column("body".into(), true).expect("register");
+        for doc in 0..CANDIDATE_CORPUS_DOCS {
+            let len = 1 + next() % 40;
+            let mut words: Vec<&str> = (0..len)
+                .map(|_| match next() % 100 {
+                    0..=3 => "alpha",
+                    4..=11 => "beta",
+                    12..=27 => "the",
+                    n => FILLER[(n % 6) as usize],
+                })
+                .collect();
+            if doc % 97 == 0 {
+                words.push("zyzzyva");
+            }
+            if doc == 1234 {
+                words.push("quux");
+            }
+            b.add_doc(0, doc, &words.join(" ")).expect("add doc");
+        }
+        (
+            Bytes::from(b.finish().expect("finish")),
+            r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75,"positions":true}]"#,
+        )
+    }
+
+    /// A lazy reader over `blob` that reads single buckets: no CRC check
+    /// needs the whole array.
+    async fn bucket_reader(blob: &Bytes, json: &str) -> FtsReader {
+        let src: Arc<dyn LazyByteSource> = Arc::new(BytesLazyByteSource::new(blob.clone()));
+        FtsReader::open_lazy(src, json, OpenOptions { verify_crc: false })
+            .await
+            .expect("open_lazy")
+    }
+
+    /// The top `k` of `lists` on `r` at `floor`, as rows.
+    async fn ranked(r: &FtsReader, lists: ClauseLists<'_>, floor: f32) -> Vec<(RowId, f32)> {
+        let prep = r
+            .prepare_clauses("body", lists, CANDIDATE_K, floor)
+            .await
+            .expect("prepare");
+        r.hits_to_rows_async(r.run_prepared_in_blob_ids(prep).expect("run"))
+            .await
+            .expect("rows")
+    }
+
+    /// Scoring through candidate norms at the kth-best score returns
+    /// exactly the hits, and scores, of scoring with the whole length
+    /// array, for bare terms under either mode and for a lone phrase, and
+    /// never reads that array.
+    #[tokio::test]
+    async fn candidate_norms_rank_as_the_whole_length_array_does() {
+        let (blob, json) = candidate_corpus();
+        let eager = FtsReader::open(blob.clone(), json).expect("open");
+        let idf: GlobalTermIdf = [("alpha", 2.5), ("beta", 1.5), ("the", 0.4)]
+            .into_iter()
+            .map(|(t, w)| (t.to_string(), w))
+            .collect();
+        let pair: &[&str] = &["alpha", "beta"];
+        let with_the: &[&str] = &["alpha", "the"];
+        let phrase = [Phrase {
+            terms: vec!["the".to_string(), "alpha".to_string()],
+            offsets: vec![0, 1],
+        }];
+        let lists = |name: &str| match name {
+            "or" => ClauseLists {
+                shoulds: pair,
+                idf: QueryIdf::Table(&idf),
+                ..ClauseLists::default()
+            },
+            "and" => ClauseLists {
+                musts: with_the,
+                idf: QueryIdf::Table(&idf),
+                ..ClauseLists::default()
+            },
+            _ => ClauseLists {
+                should_phrases: &phrase,
+                idf: QueryIdf::Table(&idf),
+                ..ClauseLists::default()
+            },
+        };
+        for name in ["or", "and", "phrase"] {
+            let whole = ranked(&eager, lists(name), f32::NEG_INFINITY).await;
+            assert_eq!(
+                whole.len(),
+                CANDIDATE_K,
+                "{name}: the corpus fills the top k"
+            );
+            let floor = whole[CANDIDATE_K - 1].1;
+
+            let lazy = bucket_reader(&blob, json).await;
+            let query = lists(name);
+            let bare: Vec<(&str, u32)> = query
+                .musts
+                .iter()
+                .chain(query.shoulds)
+                .map(|&t| (t, 1))
+                .collect();
+            let phrases: Vec<&[String]> = query
+                .should_phrases
+                .iter()
+                .map(|p| p.terms.as_slice())
+                .collect();
+            let no_view = ScoringView {
+                norms: None,
+                params: None,
+                avgdl: None,
+            };
+            let norms = lazy
+                .candidate_norms("body", &bare, &phrases, &idf, &no_view, floor, None)
+                .await
+                .expect("candidate norms")
+                .unwrap_or_else(|| panic!("{name}: the candidates are read alone"));
+            let view = lazy
+                .with_scoring(&ScoringView {
+                    norms: Some(CandidateNorms {
+                        column: "body",
+                        norms: &norms,
+                    }),
+                    ..no_view
+                })
+                .expect("a view over the candidate norms");
+            assert_eq!(ranked(&view, query, floor).await, whole, "{name}");
+            assert!(
+                !lazy.columns[0].norms_loaded(),
+                "{name}: the length array was never read"
+            );
+        }
+    }
+
+    /// Candidate norms are not built where they cannot help: no floor, a
+    /// term without a table idf, or norms already in memory.
+    #[tokio::test]
+    async fn candidate_norms_step_aside_when_they_cannot_help() {
+        let (blob, json) = candidate_corpus();
+        let idf: GlobalTermIdf = [("alpha".to_string(), 2.5)].into_iter().collect();
+        let no_view = ScoringView {
+            norms: None,
+            params: None,
+            avgdl: None,
+        };
+        let lazy = bucket_reader(&blob, json).await;
+        let alpha_beta = [("alpha", 1), ("beta", 1)];
+        for (name, bare, floor) in [
+            ("no floor", &alpha_beta[..1], f32::NEG_INFINITY),
+            ("no idf", &alpha_beta[..], 1.0),
+        ] {
+            let built = lazy
+                .candidate_norms("body", bare, &[], &idf, &no_view, floor, None)
+                .await
+                .expect("candidate norms");
+            assert!(built.is_none(), "{name}");
+        }
+        let eager = FtsReader::open(blob, json).expect("open");
+        eager.ensure_norms(0).await.expect("norms");
+        let built = eager
+            .candidate_norms("body", &alpha_beta[..1], &[], &idf, &no_view, 1.0, None)
+            .await
+            .expect("candidate norms");
+        assert!(built.is_none(), "norms in memory");
+    }
+
+    /// A term of one posting, or of one short block, weighted by the
+    /// table, scores from its own documents' buckets as it does from the
+    /// whole array.
+    #[tokio::test]
+    async fn a_rare_term_scores_from_its_own_buckets() {
+        let (blob, json) = candidate_corpus();
+        let eager = FtsReader::open(blob.clone(), json).expect("open");
+        let idf: GlobalTermIdf = [("quux", 6.0), ("zyzzyva", 3.5)]
+            .into_iter()
+            .map(|(t, w)| (t.to_string(), w))
+            .collect();
+        for term in ["quux", "zyzzyva"] {
+            let terms = [term];
+            let lists = || ClauseLists {
+                shoulds: &terms,
+                idf: QueryIdf::Table(&idf),
+                ..ClauseLists::default()
+            };
+            let lazy = bucket_reader(&blob, json).await;
+            let whole = ranked(&eager, lists(), f32::NEG_INFINITY).await;
+            assert!(!whole.is_empty(), "{term}: the corpus holds it");
+            assert_eq!(
+                ranked(&lazy, lists(), f32::NEG_INFINITY).await,
+                whole,
+                "{term}"
+            );
+            assert!(!lazy.columns[0].norms_loaded(), "{term}: no array read");
+        }
+    }
+
+    /// A document's bucket is the same whether read alone, with the whole
+    /// array, or from the norms in memory.
+    #[tokio::test]
+    async fn doc_buckets_agree_however_they_are_read() {
+        let (blob, json) = candidate_corpus();
+        let docs: Vec<u32> = (0..CANDIDATE_CORPUS_DOCS).rev().step_by(7).collect();
+        let eager = FtsReader::open(blob.clone(), json).expect("open");
+        let expected = eager
+            .doc_buckets(0, &docs, CANDIDATE_MAX_RANGES)
+            .await
+            .expect("from the norms");
+        for max_ranges in [CANDIDATE_MAX_RANGES, 0] {
+            let lazy = bucket_reader(&blob, json).await;
+            assert_eq!(
+                lazy.doc_buckets(0, &docs, max_ranges)
+                    .await
+                    .expect("from the stored buckets"),
+                expected,
+                "at most {max_ranges} ranges"
+            );
+            assert!(!lazy.columns[0].norms_loaded());
         }
     }
 }
