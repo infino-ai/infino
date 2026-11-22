@@ -207,13 +207,12 @@ mod tests {
     use tempfile::TempDir;
     use tokio::runtime::{Builder, Runtime};
 
+    use super::ORDERED_FETCH_BATCHES;
     use crate::{
         memory::{ConnectionMemoryBudget, budgeted_session_context},
         storage::{LocalFsStorageProvider, StorageProvider},
         supertable::{Supertable, SupertableOptions, query::column_cache::DecodedColumnCache},
     };
-
-    use super::ORDERED_FETCH_BATCHES;
 
     /// Superfiles of `t`, fewer than the scan's partitions, so the scan
     /// splits them.
