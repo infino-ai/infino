@@ -128,9 +128,9 @@ use crate::{
             bm25::Bm25Params,
             reader::{
                 Bm25SearchOptions, CANDIDATE_MAX_POSTINGS, CANDIDATE_MAX_TERMS, CandidateNorms,
-                ClauseLists, ColumnLengthStats, FEW_NORMS_MAX_DOCS, FetchedTermMemo, GlobalTermIdf,
-                LiveFloor, MatchWork, OR_WINDOW_MIN_TERMS, OrCursorSet, PreparedClauses, QueryDict,
-                QueryIdf, ScoringView,
+                ClauseLists, ColumnLengthStats, ColumnNorms, FEW_NORMS_MAX_DOCS, FetchedTermMemo,
+                GlobalTermIdf, LiveFloor, MatchWork, OR_WINDOW_MIN_TERMS, OrCursorSet,
+                PreparedClauses, QueryDict, QueryIdf, ScoringView,
             },
             tokenize::Phrase,
         },
@@ -1964,6 +1964,10 @@ impl SupertableReader {
         // 2.5x cold bytes when slicing widened. The OnceCell coalesces
         // concurrent slices of a file; un-ranged units never touch this.
         let cursor_sets = SharedCursorSets::default();
+        // Slices of one superfile share its candidate norms too: built once,
+        // at the floor the first slice reads. The floor only rises, so every
+        // later slice's candidates are among them.
+        let candidate_cells = SharedCandidateNorms::default();
         // Ranged kernels are multi-millisecond SYNC scans; run them as a
         // rayon wave on the reader pool, bridged with a oneshot, per the
         // concurrency contract. Inline on tokio workers they block the
@@ -2013,6 +2017,7 @@ impl SupertableReader {
             let bare_counts = Arc::clone(&bare_counts);
             let shared = Arc::clone(&shared);
             let cursor_sets = Arc::clone(&cursor_sets);
+            let candidate_cells = Arc::clone(&candidate_cells);
             let reader_pool = Arc::clone(&reader_pool);
             let tombstones = tombstones.clone();
             let deny_by_superfile = Arc::clone(&deny_by_superfile);
@@ -2160,20 +2165,30 @@ impl SupertableReader {
                 // the column's own norms.
                 let candidates = match (r.fts(), &candidate_terms) {
                     (Some(fts), Some((bare, phrases))) if r.parquet_bytes().is_none() => {
-                        fts.candidate_norms(
-                            &column_arc,
-                            bare,
-                            phrases,
-                            &global_idf,
-                            &scoring,
-                            floor,
-                            memo.as_deref(),
-                        )
-                        .await
-                        .unwrap_or_else(|error| {
-                            debug!(%error, "candidate norms unreadable; scoring reads the column's");
-                            None
-                        })
+                        cell_for(&candidate_cells, suid)
+                            .get_or_init(|| async {
+                                fts.candidate_norms(
+                                    &column_arc,
+                                    bare,
+                                    phrases,
+                                    &global_idf,
+                                    &scoring,
+                                    floor,
+                                    memo.as_deref(),
+                                    Some(&reader_pool),
+                                )
+                                .await
+                                .unwrap_or_else(|error| {
+                                    debug!(
+                                        %error,
+                                        "candidate norms unreadable; scoring reads the column's"
+                                    );
+                                    None
+                                })
+                                .map(Arc::new)
+                            })
+                            .await
+                            .clone()
                     }
                     _ => None,
                 };
@@ -4329,6 +4344,10 @@ type SuperfileCells<T> = Mutex<HashMap<Uuid, Arc<OnceCell<T>>>>;
 
 /// The cursors one superfile's doc-id slices share.
 type SharedCursorSets = Arc<SuperfileCells<Arc<OrCursorSet>>>;
+
+/// The candidate norms one superfile's doc-id slices share; `None` where
+/// the superfile scores with its own.
+type SharedCandidateNorms = Arc<SuperfileCells<Option<Arc<ColumnNorms>>>>;
 
 /// Superfile `suid`'s slot in `cells`, made empty by the first task to
 /// ask; the task then builds or awaits the value through it.

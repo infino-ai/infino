@@ -29,6 +29,7 @@ use std::{
 };
 
 use bytes::Bytes;
+use rayon::ThreadPool;
 use roaring::RoaringBitmap;
 use rustc_hash::FxHashMap;
 use tokio::sync::{OnceCell, Semaphore};
@@ -49,13 +50,17 @@ use super::{
 };
 use crate::{
     memory::{ConnectionMemoryBudget, Reclaim, Reservation},
+    runtime_bridge::run_on_pool_unless_blocking,
     superfile::{
         ReadError,
         error::FtsError,
         format::{
             self, KEY_SEPARATOR,
             checksum::crc32c,
-            fts::{HEADER_SIZE, MAGIC_BYTES, U32_BYTES, U64_BYTES, VERSION_MIN, hdr, term_meta},
+            fts::{
+                DOC_LENGTH_STORED_MAX, HEADER_SIZE, MAGIC_BYTES, U32_BYTES, U64_BYTES, VERSION_MIN,
+                hdr, term_meta,
+            },
         },
         fts::{
             analysis::{chain_tokenizer, check_recorded_tokenizer},
@@ -734,8 +739,9 @@ pub(super) fn short_body_malformed() -> FtsError {
 }
 
 /// Most postings a term may have for its documents' buckets to be read
-/// one by one instead of with the whole array: one block's worth.
-pub(crate) const FEW_NORMS_MAX_DOCS: usize = crate::superfile::fts::posting::BLOCK_LEN;
+/// one by one instead of with the whole array: the most a short body
+/// holds, the longest list the single-term scorer decodes for them.
+pub(crate) const FEW_NORMS_MAX_DOCS: usize = SHORT_MAX_DF;
 
 /// Documents whose buckets lie at most this many bytes apart are read
 /// together: one storage page.
@@ -760,6 +766,93 @@ pub(super) const CANDIDATE_MAX_RANGES: usize = 64;
 /// A candidate's bound is a sum of a few terms added in another order than
 /// the kernel adds them: widened so a rounding never drops a tie.
 const CANDIDATE_BOUND_SLACK: f32 = 1.0 + 1e-4;
+
+/// The documents of `cursors` (a query's held terms) whose score, bounded
+/// at the shortest length each can have, reaches `floor`, sorted; `None`
+/// when there are too many postings to walk or too many candidates. CPU
+/// over up to [`CANDIDATE_MAX_POSTINGS`] postings, run on the reader pool by
+/// [`FtsReader::candidate_norms`].
+fn candidate_docs(
+    mut cursors: Vec<TermCursor>,
+    weights: &[f32],
+    phrase_parts: &[(Vec<usize>, f32)],
+    lut: &[f32; 256],
+    floor: f32,
+) -> Option<Vec<u32>> {
+    let nt = cursors.len();
+    let df: Vec<u64> = cursors.iter().map(|c| c.df).collect();
+    let mut tfs: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+    let lone_phrase = weights.iter().all(|w| *w == 0.0) && phrase_parts.len() == 1;
+    if lone_phrase {
+        // A match holds every word of the phrase: its documents are the
+        // rarest word's, each looked up in the others, so a stopword's
+        // millions of postings are skipped over rather than decoded.
+        let members = &phrase_parts[0].0;
+        let &lead = members.iter().min_by_key(|&&t| df[t])?;
+        if df[lead] > CANDIDATE_MAX_POSTINGS {
+            return None;
+        }
+        let mut lead_docs: Vec<(u32, u32)> = Vec::with_capacity(df[lead] as usize);
+        let cursor = &mut cursors[lead];
+        while !cursor.is_exhausted() {
+            lead_docs.push((cursor.current_doc_id(), cursor.current_tf()));
+            cursor.next();
+        }
+        for (doc, tf) in lead_docs {
+            let mut row = vec![0; nt];
+            row[lead] = tf;
+            for &m in members.iter().filter(|&&m| m != lead) {
+                let cursor = &mut cursors[m];
+                cursor.skip_to(doc);
+                if !cursor.is_exhausted() && cursor.current_doc_id() == doc {
+                    row[m] = cursor.current_tf();
+                }
+            }
+            tfs.insert(doc, row);
+        }
+    } else {
+        if df.iter().sum::<u64>() > CANDIDATE_MAX_POSTINGS {
+            return None;
+        }
+        for (t, cursor) in cursors.iter_mut().enumerate() {
+            while !cursor.is_exhausted() {
+                tfs.entry(cursor.current_doc_id())
+                    .or_insert_with(|| vec![0; nt])[t] = cursor.current_tf();
+                cursor.next();
+            }
+        }
+    }
+    let mut docs: Vec<u32> = tfs
+        .iter()
+        .filter_map(|(&doc, tf)| {
+            // A document holds at least the query's occurrences, and its
+            // length is scored capped as the writer stores it.
+            let tokens = tf
+                .iter()
+                .fold(0u32, |sum, &t| sum.saturating_add(t))
+                .clamp(1, DOC_LENGTH_STORED_MAX);
+            let norm = lut[usize::from(bm25::quantize_len(tokens))];
+            let mut bound = 0.0f32;
+            for (t, &w) in weights.iter().enumerate() {
+                if w > 0.0 && tf[t] > 0 {
+                    bound += bm25::score_with_dl_norm_k1(w, tf[t], norm);
+                }
+            }
+            for (members, w) in phrase_parts {
+                let occurrences = members.iter().map(|&m| tf[m]).min().unwrap_or(0);
+                if occurrences > 0 {
+                    bound += bm25::score_with_dl_norm_k1(*w, occurrences, norm);
+                }
+            }
+            (bound * CANDIDATE_BOUND_SLACK >= floor).then_some(doc)
+        })
+        .collect();
+    if docs.len() > CANDIDATE_MAX_DOCS {
+        return None;
+    }
+    docs.sort_unstable();
+    Some(docs)
+}
 
 impl FtsReader {
     /// Push the buffers this reader's source keeps: on a lazy open, the
@@ -1722,6 +1815,9 @@ impl FtsReader {
         docs: &[u32],
         max_ranges: usize,
     ) -> Result<Vec<u8>, FtsError> {
+        // Ids come from postings: a corrupt one past the documents is an
+        // error, not an index past the norms.
+        self.check_ids_in_map(docs.iter().map(|&d| FtsDocId::new(d)))?;
         let col = &self.columns[column_id as usize];
         if !col.norms_loaded()
             && let Some(buckets) = col.bucket_bytes()
@@ -1824,7 +1920,9 @@ impl FtsReader {
     /// so stays under `floor` either way. `bare` pairs each bare term with
     /// its count in the query. `None` when the norms are already in memory,
     /// the column cannot be read that way, a term has no table idf, or the
-    /// candidates take too many reads.
+    /// candidates take too many reads. The postings fetch and bucket reads
+    /// stay on the calling runtime; the walk over the postings runs on
+    /// `pool` (rayon's global pool when `None`) behind a oneshot.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn candidate_norms(
         &self,
@@ -1835,6 +1933,7 @@ impl FtsReader {
         scoring: &ScoringView<'_>,
         floor: f32,
         prefetched: Option<&FetchedTermMemo>,
+        pool: Option<&ThreadPool>,
     ) -> Result<Option<ColumnNorms>, FtsError> {
         if !floor.is_finite() {
             return Ok(None);
@@ -1919,7 +2018,7 @@ impl FtsReader {
         for (i, &t) in held.iter().enumerate() {
             at[t] = i;
         }
-        let mut cursors: Vec<TermCursor> = held
+        let cursors: Vec<TermCursor> = held
             .iter()
             .map(|&t| built[t].take().expect("a held term has a cursor"))
             .collect();
@@ -1937,76 +2036,14 @@ impl FtsReader {
         if weights.iter().all(|w| *w == 0.0) && phrase_parts.is_empty() {
             return Ok(None);
         }
-        let nt = held.len();
-        let df: Vec<u64> = cursors.iter().map(|c| c.df).collect();
-        let mut tfs: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
-        let lone_phrase = weights.iter().all(|w| *w == 0.0) && phrase_parts.len() == 1;
-        if lone_phrase {
-            // A match holds every word of the phrase: its documents are the
-            // rarest word's, each looked up in the others, so a stopword's
-            // millions of postings are skipped over rather than decoded.
-            let members = &phrase_parts[0].0;
-            let Some(&lead) = members.iter().min_by_key(|&&t| df[t]) else {
-                return Ok(None);
-            };
-            if df[lead] > CANDIDATE_MAX_POSTINGS {
-                return Ok(None);
-            }
-            let mut lead_docs: Vec<(u32, u32)> = Vec::with_capacity(df[lead] as usize);
-            let cursor = &mut cursors[lead];
-            while !cursor.is_exhausted() {
-                lead_docs.push((cursor.current_doc_id(), cursor.current_tf()));
-                cursor.next();
-            }
-            for (doc, tf) in lead_docs {
-                let mut row = vec![0; nt];
-                row[lead] = tf;
-                for &m in members.iter().filter(|&&m| m != lead) {
-                    let cursor = &mut cursors[m];
-                    cursor.skip_to(doc);
-                    if !cursor.is_exhausted() && cursor.current_doc_id() == doc {
-                        row[m] = cursor.current_tf();
-                    }
-                }
-                tfs.insert(doc, row);
-            }
-        } else {
-            if df.iter().sum::<u64>() > CANDIDATE_MAX_POSTINGS {
-                return Ok(None);
-            }
-            for (t, cursor) in cursors.iter_mut().enumerate() {
-                while !cursor.is_exhausted() {
-                    tfs.entry(cursor.current_doc_id())
-                        .or_insert_with(|| vec![0; nt])[t] = cursor.current_tf();
-                    cursor.next();
-                }
-            }
-        }
-        let mut docs: Vec<u32> = tfs
-            .iter()
-            .filter_map(|(&doc, tf)| {
-                // A document holds at least the query's occurrences.
-                let tokens: u32 = tf.iter().sum();
-                let norm = lut[usize::from(bm25::quantize_len(tokens.max(1)))];
-                let mut bound = 0.0f32;
-                for (t, &w) in weights.iter().enumerate() {
-                    if w > 0.0 && tf[t] > 0 {
-                        bound += bm25::score_with_dl_norm_k1(w, tf[t], norm);
-                    }
-                }
-                for (members, w) in &phrase_parts {
-                    let occurrences = members.iter().map(|&m| tf[m]).min().unwrap_or(0);
-                    if occurrences > 0 {
-                        bound += bm25::score_with_dl_norm_k1(*w, occurrences, norm);
-                    }
-                }
-                (bound * CANDIDATE_BOUND_SLACK >= floor).then_some(doc)
-            })
-            .collect();
-        if docs.len() > CANDIDATE_MAX_DOCS {
+        let docs = run_on_pool_unless_blocking(pool, "candidate norms", move || {
+            candidate_docs(cursors, &weights, &phrase_parts, &lut, floor)
+        })
+        .await
+        .map_err(|_| FtsError::TaskDropped("candidate norms"))?;
+        let Some(docs) = docs else {
             return Ok(None);
-        }
-        docs.sort_unstable();
+        };
         let Some(pairs) = self
             .read_buckets(col, buckets, &docs, CANDIDATE_MAX_RANGES)
             .await?
@@ -7089,7 +7126,7 @@ mod tests {
                 avgdl: None,
             };
             let norms = lazy
-                .candidate_norms("body", &bare, &phrases, &idf, &no_view, floor, None)
+                .candidate_norms("body", &bare, &phrases, &idf, &no_view, floor, None, None)
                 .await
                 .expect("candidate norms")
                 .unwrap_or_else(|| panic!("{name}: the candidates are read alone"));
@@ -7128,7 +7165,7 @@ mod tests {
             ("no idf", &alpha_beta[..], 1.0),
         ] {
             let built = lazy
-                .candidate_norms("body", bare, &[], &idf, &no_view, floor, None)
+                .candidate_norms("body", bare, &[], &idf, &no_view, floor, None, None)
                 .await
                 .expect("candidate norms");
             assert!(built.is_none(), "{name}");
@@ -7136,7 +7173,16 @@ mod tests {
         let eager = FtsReader::open(blob, json).expect("open");
         eager.ensure_norms(0).await.expect("norms");
         let built = eager
-            .candidate_norms("body", &alpha_beta[..1], &[], &idf, &no_view, 1.0, None)
+            .candidate_norms(
+                "body",
+                &alpha_beta[..1],
+                &[],
+                &idf,
+                &no_view,
+                1.0,
+                None,
+                None,
+            )
             .await
             .expect("candidate norms");
         assert!(built.is_none(), "norms in memory");
@@ -7193,6 +7239,147 @@ mod tests {
                 "at most {max_ranges} ranges"
             );
             assert!(!lazy.columns[0].norms_loaded());
+        }
+    }
+
+    /// A posting's id past the documents is malformed, not an index past
+    /// the norms, whether the norms are in memory, read as single buckets,
+    /// or loaded on demand.
+    #[tokio::test]
+    async fn doc_buckets_refuse_a_document_past_the_column() {
+        let (blob, json) = candidate_corpus();
+        let docs = [0, CANDIDATE_CORPUS_DOCS];
+        let eager = FtsReader::open(blob.clone(), json).expect("open");
+        eager.ensure_norms(0).await.expect("norms");
+        let src: Arc<dyn LazyByteSource> = Arc::new(BytesLazyByteSource::new(blob.clone()));
+        let checked = FtsReader::open_lazy(src, json, OpenOptions { verify_crc: true })
+            .await
+            .expect("open_lazy");
+        let readers = [
+            ("loaded", eager),
+            ("single buckets", bucket_reader(&blob, json).await),
+            ("loaded on demand", checked),
+        ];
+        for (name, r) in &readers {
+            let result = r.doc_buckets(0, &docs, CANDIDATE_MAX_RANGES).await;
+            assert!(
+                matches!(result, Err(FtsError::Read(ReadError::Malformed(_)))),
+                "{name}: {result:?}"
+            );
+        }
+    }
+
+    /// Occurrences of each of `alpha` and `beta` in the one long document
+    /// of [`a_length_past_the_stored_cap_stays_a_candidate`]: together one
+    /// past the longest stored length.
+    const LONG_DOC_EACH: usize = 1 << 15;
+
+    /// A document longer than the stored cap is scored at the capped
+    /// length; its candidate bound is too, so at its own score as the
+    /// floor it stays a candidate and ranks as with the whole array. Bound
+    /// at its uncapped length, a bucket longer, it would fall under.
+    #[tokio::test]
+    async fn a_length_past_the_stored_cap_stays_a_candidate() {
+        const TABLE_AVGDL: f32 = 2.0;
+        let mut b = FtsBuilder::new();
+        b.register_column("body".into(), false).expect("register");
+        let long = [vec!["alpha"; LONG_DOC_EACH], vec!["beta"; LONG_DOC_EACH]].concat();
+        b.add_doc(0, 0, &long.join(" ")).expect("add doc");
+        b.add_doc(0, 1, "alpha beta").expect("add doc");
+        b.add_doc(0, 2, "gray").expect("add doc");
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
+        let idf: GlobalTermIdf = [("alpha", 2.5), ("beta", 1.5)]
+            .into_iter()
+            .map(|(t, w)| (t.to_string(), w))
+            .collect();
+        let terms: &[&str] = &["alpha", "beta"];
+        let lists = || ClauseLists {
+            shoulds: terms,
+            idf: QueryIdf::Table(&idf),
+            ..ClauseLists::default()
+        };
+        let table = ScoringView {
+            norms: None,
+            params: None,
+            avgdl: Some(("body", TABLE_AVGDL)),
+        };
+        let eager = FtsReader::open(blob.clone(), json).expect("open");
+        let whole = ranked(
+            &eager
+                .with_scoring(&table)
+                .expect("a view at the table average"),
+            lists(),
+            f32::NEG_INFINITY,
+        )
+        .await;
+        assert_eq!(whole[0].0, RowId::new(0), "the long document ranks first");
+        let floor = whole[0].1;
+        let lazy = bucket_reader(&blob, json).await;
+        let norms = lazy
+            .candidate_norms(
+                "body",
+                &[("alpha", 1), ("beta", 1)],
+                &[],
+                &idf,
+                &table,
+                floor,
+                None,
+                None,
+            )
+            .await
+            .expect("candidate norms")
+            .expect("the candidates are read alone");
+        let view = lazy
+            .with_scoring(&ScoringView {
+                norms: Some(CandidateNorms {
+                    column: "body",
+                    norms: &norms,
+                }),
+                ..table
+            })
+            .expect("a view over the candidate norms");
+        assert_eq!(ranked(&view, lists(), floor).await, whole[..1]);
+    }
+
+    /// A lone term scores from its own documents' buckets exactly when it
+    /// has at most [`FEW_NORMS_MAX_DOCS`] postings, the count up to which
+    /// the table's fan-out skips the length-array prewarm.
+    #[tokio::test]
+    async fn few_norms_cover_a_term_of_up_to_the_short_limit() {
+        let mut b = FtsBuilder::new();
+        b.register_column("body".into(), false).expect("register");
+        let at_most = FEW_NORMS_MAX_DOCS as u32;
+        for doc in 0..=at_most {
+            let text = match doc < at_most {
+                true => "within past",
+                false => "past",
+            };
+            b.add_doc(0, doc, text).expect("add doc");
+        }
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
+        let idf: GlobalTermIdf = [("within", 1.0), ("past", 1.0)]
+            .into_iter()
+            .map(|(t, w)| (t.to_string(), w))
+            .collect();
+        for (term, df) in [("within", at_most), ("past", at_most + 1)] {
+            let terms = [term];
+            let lists = ClauseLists {
+                shoulds: &terms,
+                idf: QueryIdf::Table(&idf),
+                ..ClauseLists::default()
+            };
+            let lazy = bucket_reader(&blob, json).await;
+            assert_eq!(
+                ranked(&lazy, lists, f32::NEG_INFINITY).await.len(),
+                CANDIDATE_K
+            );
+            assert_eq!(
+                lazy.columns[0].norms_loaded(),
+                df as usize > FEW_NORMS_MAX_DOCS,
+                "{term}: {df} postings"
+            );
         }
     }
 }

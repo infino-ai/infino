@@ -1283,7 +1283,10 @@ impl FtsReader {
 
     /// An error naming the first of `ids` past this blob's documents, which the map has no entry
     /// for.
-    fn check_ids_in_map(&self, mut ids: impl Iterator<Item = FtsDocId>) -> Result<(), FtsError> {
+    pub(super) fn check_ids_in_map(
+        &self,
+        mut ids: impl Iterator<Item = FtsDocId>,
+    ) -> Result<(), FtsError> {
         match ids.find(|id| id.get() >= self.n_docs()) {
             Some(id) => Err(FtsError::Read(ReadError::Malformed(format!(
                 "fts doc-map has no entry for blob doc id {}",
