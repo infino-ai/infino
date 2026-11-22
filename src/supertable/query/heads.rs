@@ -1692,7 +1692,14 @@ mod tests {
     /// settles it unopened.
     #[test]
     fn a_superfile_bounds_its_unseen_documents_exactly_at_its_own_average() {
+        /// The largest tf of the term in any length, so the brute force
+        /// below searches all the bound may use.
+        const MAX_TF: u32 = 4096;
         let table = 2.5;
+        let mut buckets = BucketMaxTf::default();
+        for len in 0..=u8::MAX {
+            buckets.observe(len, MAX_TF);
+        }
         let weights = Weights {
             idf: vec![3.0],
             norm: norm_table(table, Bm25Params::default()),
@@ -1712,7 +1719,7 @@ mod tests {
                 next: 0,
                 frontier: key,
                 floor: key,
-                buckets: None,
+                buckets: Some(buckets.clone()),
             };
             let heads = [head];
             let bounds = slot_bounds(
@@ -1726,8 +1733,8 @@ mod tests {
                 true => key,
                 false => key * KEY_TOLERANCE,
             };
-            let oracle = (0..LEN_BUCKETS as u8)
-                .flat_map(|len| (1..=TF_SEARCH_MAX.min(4096)).map(move |tf| (len, tf)))
+            let oracle = (0..=u8::MAX)
+                .flat_map(|len| (1..=MAX_TF).map(move |tf| (len, tf)))
                 .filter(|&(len, tf)| tf_factor(tf, slot.key_norm[usize::from(len)]) <= cap)
                 .map(|(len, tf)| weights.contribution(0, tf, len))
                 .fold(f32::NEG_INFINITY, f32::max);
