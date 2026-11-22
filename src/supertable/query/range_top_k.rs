@@ -681,7 +681,10 @@ mod tests {
     }
 
     /// A top-k whose candidates' ids cannot be read hands the scan every candidate, and the scan's
-    /// sort answers alike: the failure costs rows read, never the answer.
+    /// sort answers alike: the failure costs rows read, never the answer. Every superfile holds more
+    /// than a page of the smallest key, so its candidates are its first page. The rows are counted
+    /// as handed, not as the scan's output: the sort's running bound drops some of them in the
+    /// scan, how many depending on thread timing.
     #[test]
     fn a_top_k_whose_ids_cannot_be_read_scans_every_candidate() {
         let dir = TempDir::new().expect("tempdir");
@@ -696,13 +699,23 @@ mod tests {
             )
         };
         let want = seqs(&reader.query_sql(&sql("key + 0")).expect("unindexed"));
-        assert_eq!(scanned_rows(&reader, &sql("key")), limit as u64, "ids read");
+        assert_eq!(
+            scanned_rows(&reader, &sql("key")),
+            limit as u64,
+            "ids read: rows scanned"
+        );
+        assert_eq!(
+            walk_probe::rows_handed(superfile),
+            Some(limit as u64),
+            "ids read: rows handed"
+        );
         walk_probe::fail_next_id_read(superfile, QueryError::internal("injected"));
         assert_eq!(seqs(&reader.query_sql(&sql("key")).expect("sql")), want);
-        walk_probe::fail_next_id_read(superfile, QueryError::internal("injected"));
-        assert!(
-            scanned_rows(&reader, &sql("key")) > limit as u64,
-            "with no ids, the scan reads every candidate"
+        assert!(!walk_probe::id_read_armed(superfile), "the id read failed");
+        assert_eq!(
+            walk_probe::rows_handed(superfile),
+            Some(MANY_FILES as u64 * limit as u64),
+            "with no ids, the scan is handed every candidate"
         );
     }
 
