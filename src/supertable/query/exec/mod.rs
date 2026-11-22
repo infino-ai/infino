@@ -14,6 +14,7 @@
 
 pub(crate) mod cached_scan_exec;
 pub mod common;
+pub mod fields_exec;
 pub mod fts_exec;
 #[cfg(feature = "graph-index")]
 pub mod graph_exec;

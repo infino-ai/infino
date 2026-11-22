@@ -36,6 +36,7 @@ pub mod diag_common;
 pub mod disk_warm;
 pub mod filtered_vector;
 pub mod fts_diag;
+pub mod fts_fields;
 pub mod fts_merge;
 pub mod fts_quality;
 pub mod hybrid_optimize;

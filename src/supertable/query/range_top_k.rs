@@ -35,7 +35,10 @@
 //! cutoff too. The one exception is a sort whose only later key is the table's
 //! `_id`, ascending: a range index that keeps the rows of a tied key in `_id`
 //! order makes a superfile's first rows by the column its first by the column
-//! and `_id`, and the scan reads those alone. The sort and the filters stay
+//! and `_id`, and of those the scan reads only the `k` best by the column and
+//! `_id`, which their ids (read without any other column) settle: on a column
+//! whose best key many rows share, every superfile would otherwise hand the
+//! scan its own `k` rows of it. The sort and the filters stay
 //! where they are, so the answer is the one they give over the rows the scan
 //! returns.
 
@@ -286,7 +289,8 @@ mod tests {
             Arc,
             atomic::{AtomicBool, Ordering},
         },
-        thread::spawn,
+        thread::{sleep, spawn},
+        time::Duration,
     };
 
     use arrow::util::display::array_value_to_string;
@@ -311,9 +315,12 @@ mod tests {
             Supertable, SupertableOptions, SupertableReader,
             error::QueryError,
             query::{
+                SuperfileHit,
                 column_cache::DecodedColumnCache,
                 provider::{TopKHint, WalkFallback, tests::planned_files, walk_probe},
                 range_top_k::provider_of,
+                sorted::WINDOW_MARGIN,
+                vector::row_id_from_manifest_entry,
             },
         },
     };
@@ -566,6 +573,9 @@ mod tests {
                     expected_then_seq(above.unwrap_or(BELOW_EVERY_KEY), *descending, *limit),
                     "{pass}: {sql}"
                 );
+                // Every cutoff ties on many rows of every superfile: the ids settle which of
+                // them are the page, so the scan reads the page alone.
+                assert_eq!(scanned_rows(&reader, &sql), *limit as u64, "{pass}: {sql}");
             }
         }
     }
@@ -585,6 +595,127 @@ mod tests {
             seqs(&reader.query_sql(&sql).expect("sql")),
             expected(above, descending, limit),
             "{sql}"
+        );
+    }
+
+    /// Superfiles of the many-file table: each holds rows of every cutoff's key.
+    const MANY_FILES: i64 = 12;
+    /// Rows in each of them, three row groups' worth.
+    const MANY_ROWS_PER_FILE: i64 = 1500;
+    /// A pause between two appends of one commit: their ids fall on two sides of a
+    /// millisecond, so the superfile's ids are no longer one span.
+    const ID_GAP_WAIT: Duration = Duration::from_millis(20);
+    /// The pages the paged statements ask for.
+    const PAGE_LIMITS: &[usize] = &[1, 10, 45, 250];
+    /// Filters a paged statement carries, `{col}` the sorted column: none (`1=1`, as a search
+    /// with no query sends it), a range, and two ranges.
+    const PAGE_FILTERS: &[&str] = &[
+        "1=1",
+        "(1=1) AND ({col} > 40)",
+        "{col} >= 10 AND {col} < 90",
+    ];
+
+    /// A page of a sort tie-broken by the table's `_id`, in the shape a search engine sends it
+    /// (every column aliased to itself, an always-true filter, `NULLS LAST` on both keys), answers
+    /// as the same sort with no index in reach does, over many superfiles with deleted rows; on
+    /// `key`, whose every key is held by many rows of every superfile, and on `opt`, which has
+    /// nulls; both ways. The scan reads the page alone: the ids settle which tied rows it holds.
+    /// Then one more superfile whose ids are not one span, so its candidates' ids come from its
+    /// id pages.
+    #[test]
+    fn a_paged_top_k_tie_broken_by_the_id_reads_the_page_alone() {
+        let dir = TempDir::new().expect("tempdir");
+        let st = tagged_table_with(&dir, None, MANY_FILES, MANY_ROWS_PER_FILE);
+        assert_pages_read_alone(&st.reader().expect("reader"), "appended");
+        let first = MANY_FILES * MANY_ROWS_PER_FILE;
+        let half = first + MANY_ROWS_PER_FILE / 2;
+        let mut writer = st.writer().expect("writer");
+        writer
+            .append(&tagged_batch(&(first..half).collect::<Vec<_>>()))
+            .expect("append");
+        sleep(ID_GAP_WAIT);
+        writer
+            .append(&tagged_batch(
+                &(half..first + MANY_ROWS_PER_FILE).collect::<Vec<_>>(),
+            ))
+            .expect("append");
+        writer.commit().expect("commit");
+        let reader = st.reader().expect("reader");
+        assert!(
+            reader
+                .manifest()
+                .superfiles
+                .iter()
+                .any(|entry| row_id_from_manifest_entry(entry, 0).is_none()),
+            "a superfile has gaps in its ids"
+        );
+        assert_pages_read_alone(&reader, "gapped");
+    }
+
+    /// Every paged statement on `reader` answers as the sort with no index in reach, and its scan
+    /// reads the page alone.
+    fn assert_pages_read_alone(reader: &SupertableReader, pass: &str) {
+        for col in ["key", "opt"] {
+            for filter in PAGE_FILTERS {
+                let filter = filter.replace("{col}", &format!("\"{col}\""));
+                for order in ["ASC", "DESC"] {
+                    for limit in PAGE_LIMITS {
+                        let sql = format!(
+                            "SELECT seq, \"{col}\" AS \"{col}\", \"_id\" AS \"_id\" FROM \"supertable\" \
+                             WHERE {filter} ORDER BY \"{col}\" {order} NULLS LAST, \"_id\" ASC NULLS LAST LIMIT {limit}"
+                        );
+                        let unindexed = format!(
+                            "SELECT seq FROM supertable WHERE {filter} \
+                             ORDER BY \"{col}\" + 0 {order} NULLS LAST, _id ASC LIMIT {limit}"
+                        );
+                        assert_eq!(
+                            seqs(&reader.query_sql(&sql).expect("sql")),
+                            seqs(&reader.query_sql(&unindexed).expect("unindexed")),
+                            "{pass}: {sql}"
+                        );
+                        assert_eq!(scanned_rows(reader, &sql), *limit as u64, "{pass}: {sql}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// A top-k whose candidates' ids cannot be read hands the scan every candidate, and the scan's
+    /// sort answers alike: the failure costs rows read, never the answer. Every superfile holds more
+    /// than a page of the smallest key, so its candidates are its first page. The rows are counted
+    /// as handed, not as the scan's output: the sort's running bound drops some of them in the
+    /// scan, how many depending on thread timing.
+    #[test]
+    fn a_top_k_whose_ids_cannot_be_read_scans_every_candidate() {
+        let dir = TempDir::new().expect("tempdir");
+        let st = tagged_table_with(&dir, None, MANY_FILES, MANY_ROWS_PER_FILE);
+        let reader = st.reader().expect("reader");
+        let superfile = reader.manifest().superfiles[0].superfile_id;
+        walk_probe::watch(superfile);
+        let limit = PAGE_LIMITS[1];
+        let sql = |sort: &str| {
+            format!(
+                "SELECT seq FROM supertable ORDER BY {sort} ASC NULLS LAST, _id ASC LIMIT {limit}"
+            )
+        };
+        let want = seqs(&reader.query_sql(&sql("key + 0")).expect("unindexed"));
+        assert_eq!(
+            scanned_rows(&reader, &sql("key")),
+            limit as u64,
+            "ids read: rows scanned"
+        );
+        assert_eq!(
+            walk_probe::rows_handed(superfile),
+            Some(limit as u64),
+            "ids read: rows handed"
+        );
+        walk_probe::fail_next_id_read(superfile, QueryError::internal("injected"));
+        assert_eq!(seqs(&reader.query_sql(&sql("key")).expect("sql")), want);
+        assert!(!walk_probe::id_read_armed(superfile), "the id read failed");
+        assert_eq!(
+            walk_probe::rows_handed(superfile),
+            Some(MANY_FILES as u64 * limit as u64),
+            "with no ids, the scan is handed every candidate"
         );
     }
 
@@ -659,24 +790,8 @@ mod tests {
         let st = Supertable::create(options).expect("create");
         for file in 0..files {
             let seqs: Vec<i64> = (file * rows..(file + 1) * rows).collect();
-            let batch = RecordBatch::try_new(
-                tagged_schema(),
-                vec![
-                    Arc::new(Int64Array::from(seqs.clone())),
-                    Arc::new(Int64Array::from_iter_values(seqs.iter().map(|s| key(*s)))),
-                    Arc::new(Int64Array::from_iter(seqs.iter().map(|s| opt(*s)))),
-                    Arc::new(LargeStringArray::from_iter_values(
-                        seqs.iter().map(|s| tag(*s)),
-                    )),
-                    Arc::new(LargeStringArray::from_iter_values(
-                        seqs.iter()
-                            .map(|s| format!("{s:0>width$}", width = PAD_LEN)),
-                    )),
-                ],
-            )
-            .expect("batch");
             let mut writer = st.writer().expect("writer");
-            writer.append(&batch).expect("append");
+            writer.append(&tagged_batch(&seqs)).expect("append");
             writer.commit().expect("commit");
         }
         st.delete(
@@ -686,6 +801,26 @@ mod tests {
         )
         .expect("delete");
         st
+    }
+
+    /// The tagged table's rows `seqs`.
+    fn tagged_batch(seqs: &[i64]) -> RecordBatch {
+        RecordBatch::try_new(
+            tagged_schema(),
+            vec![
+                Arc::new(Int64Array::from(seqs.to_vec())),
+                Arc::new(Int64Array::from_iter_values(seqs.iter().map(|s| key(*s)))),
+                Arc::new(Int64Array::from_iter(seqs.iter().map(|s| opt(*s)))),
+                Arc::new(LargeStringArray::from_iter_values(
+                    seqs.iter().map(|s| tag(*s)),
+                )),
+                Arc::new(LargeStringArray::from_iter_values(
+                    seqs.iter()
+                        .map(|s| format!("{s:0>width$}", width = PAD_LEN)),
+                )),
+            ],
+        )
+        .expect("batch")
     }
 
     /// The rows the scan under `sql` emitted, from its `EXPLAIN ANALYZE`.
@@ -1053,6 +1188,75 @@ mod tests {
         assert!(matches!(small, Ok(Some(_))), "{small:?}");
         let large = walk(4000, col("seq").gt_eq(lit(0_i64)));
         assert!(matches!(large, Err(QueryError::OverBudget(_))), "{large:?}");
+    }
+
+    /// A connection memory limit no walk here comes near.
+    const ROOMY_BUDGET: u64 = 1 << 30;
+    /// The page the walk of [`a_walk_reserves_its_window_once`] asks for.
+    const WALK_PAGE: usize = 10;
+
+    #[test]
+    fn a_walk_reserves_its_window_once() {
+        // The tagged table, and a walk for 10 rows under a filter every row passes: its first
+        // window reads twice the page from each file and holds the page.
+        //  - With room for that window, and for fewer entries than the window's candidates once
+        //    more, the walk answers as with room to spare.
+        // This test pins that the walk reserves its candidates once, with its window: ordering
+        // them by the key and `_id` reserves nothing more.
+        let dir = TempDir::new().expect("tempdir");
+        tagged_table(&dir);
+        let st = reopened_with_budget(&dir, ROOMY_BUDGET);
+        let reader = st.reader().expect("reader");
+        let files = reader.manifest().superfiles.clone();
+        let every_row = [col("seq").gt_eq(lit(0_i64))];
+        let walk = || {
+            reader.block_on(
+                reader.sorted_hits_for_scan("opt", &every_row, false, false, WALK_PAGE, &files),
+            )
+        };
+        let want = walk().expect("walk").expect("the walk answers");
+        // The window's entries; after the cut to its merged first rows, at least `window_rows`
+        // of them are candidates.
+        let window_rows = (WALK_PAGE as f64 * WINDOW_MARGIN) as usize;
+        let entry = size_of::<(u64, SuperfileHit)>();
+        let window = files.len() * window_rows * entry;
+        let left = window + window_rows * entry - 1;
+        let mut held = reader
+            .manifest()
+            .options
+            .connection_memory_budget
+            .hold_all();
+        held.shrink(left);
+        let got = walk().expect("the window fits").expect("the walk answers");
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn a_top_k_whose_candidates_do_not_fit_the_budget_scans_them_all() {
+        // Many superfiles that each hold the lowest `key`, and the first row by `key` and `_id`.
+        //  - With room, the top-k keeps that one row: the scan reads one file.
+        //  - With the connection's memory budget full, the candidates (each file's first row) do
+        //    not fit, so the scan reads every file's candidate and the sort above picks the row.
+        // This test pins that the top-k reserves its candidates before it orders them.
+        let dir = TempDir::new().expect("tempdir");
+        tagged_table_with(&dir, None, MANY_FILES, MANY_ROWS_PER_FILE);
+        let st = reopened_with_budget(&dir, ROOMY_BUDGET);
+        let reader = st.reader().expect("reader");
+        let limit = PAGE_LIMITS[0];
+        let sql = format!(
+            "SELECT seq FROM supertable ORDER BY key ASC NULLS LAST, _id ASC LIMIT {limit}"
+        );
+        assert_eq!(planned_files(&reader, &sql), 1, "with room, the row's file");
+        let _full = reader
+            .manifest()
+            .options
+            .connection_memory_budget
+            .hold_all();
+        assert_eq!(
+            planned_files(&reader, &sql),
+            MANY_FILES as usize,
+            "over the budget"
+        );
     }
 
     #[test]

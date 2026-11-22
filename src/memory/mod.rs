@@ -213,6 +213,22 @@ impl ConnectionMemoryBudget {
         Self::with_limit(ROOM_FOR_TESTS)
     }
 
+    /// Hold every byte the budget has room for, once the holders that can give memory back have
+    /// given it, so a test's next reservation fits only in what the test frees.
+    #[cfg(test)]
+    pub(crate) fn hold_all(self: &Arc<Self>) -> Reservation {
+        let mut held = Reservation {
+            budget: Arc::clone(self),
+            size: 0,
+        };
+        // A request past the room asks those holders first.
+        while held
+            .try_grow(self.remaining().expect("a bounded budget").max(1))
+            .is_ok()
+        {}
+        held
+    }
+
     /// A measure-only budget: counts usage but never refuses. The default when
     /// no limit is configured.
     pub fn measured() -> Arc<Self> {
