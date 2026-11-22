@@ -187,3 +187,306 @@ fn over_ordered_gather(plan: &Arc<dyn ExecutionPlan>) -> bool {
         _ => false,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! Files of several row groups, which a Parquet scan splits into byte
+    //! ranges across partitions and a scan of kept columns reads as runs of
+    //! row groups, with and without deleted rows. Unit tests, as setting a
+    //! table's row group size is internal.
+
+    use std::{ops::Range, sync::Arc};
+
+    use arrow_array::{Array, Int64Array, LargeStringArray, RecordBatch};
+    use arrow_schema::{DataType, Field, Schema};
+    use datafusion::{
+        logical_expr::Expr,
+        physical_plan::{collect, displayable},
+        prelude::{SessionContext, col, lit},
+    };
+    use tempfile::TempDir;
+    use tokio::runtime::{Builder, Runtime};
+
+    use crate::{
+        memory::{ConnectionMemoryBudget, budgeted_session_context},
+        storage::{LocalFsStorageProvider, StorageProvider},
+        supertable::{Supertable, SupertableOptions, query::column_cache::DecodedColumnCache},
+    };
+
+    use super::ORDERED_FETCH_BATCHES;
+
+    /// Superfiles of `t`, fewer than the scan's partitions, so the scan
+    /// splits them.
+    const FILES: i64 = 3;
+    /// Rows in each superfile: file `f` holds `seq` `f * ROWS .. (f + 1) * ROWS`.
+    const ROWS: i64 = 4_000;
+    /// Rows per row group: eight row groups to a superfile.
+    const ROW_GROUP_ROWS: usize = 500;
+    /// Partitions of the scan.
+    const PARTITIONS: usize = 4;
+    /// Rows per page.
+    const PAGE: usize = 700;
+    /// Times each statement runs, to catch a run that reads in another order.
+    const RUNS: usize = 10;
+    /// Bytes of decoded columns a table keeping them holds: all of `t`'s.
+    const KEPT_BYTES: usize = 64 * 1024 * 1024;
+    /// Width of each row's `pad`, which spreads a superfile over enough bytes
+    /// to split.
+    const PAD_WIDTH: usize = 64;
+    /// The filtered pages keep the rows whose `seq` isn't a multiple of this.
+    const FILTER_MODULUS: i64 = 3;
+    /// [`delete_some`] deletes every row whose `seq` is a multiple of this.
+    const DELETE_MODULUS: i64 = 7;
+    /// [`delete_some`] deletes this whole row group, the second of the second
+    /// superfile.
+    const DELETED_ROW_GROUP: Range<i64> = 4_500..5_000;
+    /// [`delete_some`] deletes this run across the second and third superfiles.
+    const DELETED_ACROSS_FILES: Range<i64> = 7_900..8_100;
+
+    /// How `t` is read.
+    #[derive(Clone, Copy, Debug)]
+    enum Scan {
+        /// A Parquet scan of the superfiles, split into byte ranges.
+        Parquet,
+        /// A scan of kept decoded columns, in runs of row groups.
+        Kept,
+    }
+
+    fn schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("seq", DataType::Int64, false),
+            Field::new("pad", DataType::LargeUtf8, false),
+        ]))
+    }
+
+    /// `t`, [`FILES`] superfiles of [`ROWS`] rows in row groups of
+    /// [`ROW_GROUP_ROWS`], read by `scan`.
+    fn table(dir: &TempDir, scan: Scan) -> Supertable {
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let mut options = SupertableOptions::new(schema(), vec![], vec![])
+            .expect("options")
+            .with_storage(storage);
+        options.row_group_size = Some(ROW_GROUP_ROWS);
+        // Set either way, so a host's process-wide cache doesn't decide the scan.
+        options.decoded_columns = match scan {
+            Scan::Parquet => None,
+            Scan::Kept => Some(Arc::new(DecodedColumnCache::new(KEPT_BYTES))),
+        };
+        let st = Supertable::create(options).expect("create");
+        for f in 0..FILES {
+            let seqs: Vec<i64> = (f * ROWS..(f + 1) * ROWS).collect();
+            let pads: Vec<String> = seqs.iter().map(|s| format!("{s:0>PAD_WIDTH$}")).collect();
+            let batch = RecordBatch::try_new(
+                schema(),
+                vec![
+                    Arc::new(Int64Array::from(seqs)),
+                    Arc::new(LargeStringArray::from(pads)),
+                ],
+            )
+            .expect("batch");
+            let mut writer = st.writer().expect("writer");
+            writer.append(&batch).expect("append");
+            writer.commit().expect("commit");
+        }
+        st
+    }
+
+    /// A session over `st` as `t` in [`PARTITIONS`] partitions, splitting a
+    /// Parquet scan of any size into byte ranges.
+    fn session(runtime: &Runtime, st: &Supertable) -> SessionContext {
+        let ctx =
+            budgeted_session_context(&ConnectionMemoryBudget::measured(), None).expect("session");
+        runtime.block_on(async {
+            for set in [
+                format!("SET datafusion.execution.target_partitions = {PARTITIONS}"),
+                "SET datafusion.optimizer.repartition_file_min_size = 0".to_owned(),
+            ] {
+                ctx.sql(&set).await.expect("set");
+            }
+        });
+        st.register_into(&ctx, "t").expect("register");
+        ctx
+    }
+
+    /// The plan of `sql` and the `seq`s it returns, in order.
+    fn run(runtime: &Runtime, ctx: &SessionContext, sql: &str) -> (String, Vec<i64>) {
+        runtime.block_on(async {
+            let plan = ctx
+                .sql(sql)
+                .await
+                .expect("plan")
+                .create_physical_plan()
+                .await
+                .expect("physical plan");
+            let shape = displayable(plan.as_ref()).indent(true).to_string();
+            let batches = collect(plan, ctx.task_ctx()).await.expect("collect");
+            let seqs = batches
+                .iter()
+                .flat_map(|b| {
+                    let seq = b
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .expect("Int64")
+                        .clone();
+                    (0..seq.len()).map(move |i| seq.value(i))
+                })
+                .collect();
+            (shape, seqs)
+        })
+    }
+
+    /// `shape` gathers its partitions one after another: through an
+    /// `OrderedCoalesceExec`, alone or under the staged gather.
+    fn gathers_in_order(shape: &str) -> bool {
+        shape.contains("OrderedCoalesceExec")
+            || shape
+                .lines()
+                .any(|line| line.contains("StagedCoalesceExec:") && line.ends_with(", ordered"))
+    }
+
+    /// `shape` reads `t` by `scan` in file order across partitions: some
+    /// superfile split into byte ranges, listed as `path:start..end` with a
+    /// `start` past zero, or kept columns read in file order by
+    /// [`PARTITIONS`] partitions sharing more row groups than that.
+    fn reads_in_file_order(shape: &str, scan: Scan) -> bool {
+        gathers_in_order(shape)
+            && match scan {
+                Scan::Parquet => shape
+                    .split(".parquet:")
+                    .skip(1)
+                    .any(|range| !range.starts_with("0..")),
+                Scan::Kept => shape.lines().any(|line| {
+                    let row_groups = line
+                        .split("CachedScanExec: row_groups=")
+                        .nth(1)
+                        .and_then(|rest| rest.split(',').next())
+                        .and_then(|n| n.parse::<usize>().ok());
+                    row_groups.is_some_and(|n| n > PARTITIONS)
+                        && line.contains(&format!(", partitions={PARTITIONS},"))
+                        && line.contains(", file_order")
+                }),
+            }
+    }
+
+    /// The whole of `select` is `want`, read by `scan` in file order, and
+    /// every page of it, [`PAGE`] rows at growing offsets, is the slice of
+    /// `want` it starts at, on every run.
+    fn pages_cover_each_row_once(
+        runtime: &Runtime,
+        ctx: &SessionContext,
+        scan: Scan,
+        select: &str,
+        want: &[i64],
+    ) {
+        // The whole read takes the file-order path only within the fetch the
+        // rule orders.
+        let batch_size = ctx.state().config().batch_size();
+        let whole = usize::try_from(FILES * ROWS).expect("rows");
+        assert!(
+            whole <= ORDERED_FETCH_BATCHES * batch_size,
+            "{whole} rows is past the {ORDERED_FETCH_BATCHES} batches of {batch_size} the rule orders"
+        );
+        let whole_sql = format!("{select} LIMIT {whole}");
+        // The first read fills the kept columns a scan of them reads from.
+        run(runtime, ctx, &whole_sql);
+        let (shape, whole) = run(runtime, ctx, &whole_sql);
+        assert!(
+            reads_in_file_order(&shape, scan),
+            "{scan:?}: {whole_sql} not read in file order:\n{shape}"
+        );
+        assert_eq!(
+            whole, want,
+            "{scan:?}: {whole_sql}: each row once, in file order"
+        );
+        for (p, page) in want.chunks(PAGE).enumerate() {
+            let sql = format!("{select} LIMIT {PAGE} OFFSET {}", p * PAGE);
+            for r in 0..RUNS {
+                let (shape, seqs) = run(runtime, ctx, &sql);
+                // A page's fetch is small enough that DataFusion may read the
+                // superfiles whole, in groups of files, or in one group, which
+                // is in order as is.
+                let in_order = match scan {
+                    Scan::Parquet => {
+                        gathers_in_order(&shape) || shape.contains("file_groups={1 group:")
+                    }
+                    Scan::Kept => reads_in_file_order(&shape, scan),
+                };
+                assert!(in_order, "{scan:?}: {sql} not read in file order:\n{shape}");
+                assert_eq!(seqs, page, "{scan:?} run {r}: {sql}");
+            }
+        }
+    }
+
+    /// Pages of `t` read by `scan` after deleting the rows `deleted` names
+    /// (`predicate`), unfiltered and filtered, return each live row once.
+    fn pages_return_each_live_row_once(
+        scan: Scan,
+        predicate: Option<Expr>,
+        deleted: fn(i64) -> bool,
+    ) {
+        let runtime = Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let dir = TempDir::new().expect("tempdir");
+        let st = table(&dir, scan);
+        if let Some(predicate) = predicate {
+            st.delete(predicate).expect("delete");
+        }
+        let ctx = session(&runtime, &st);
+        let live: Vec<i64> = (0..FILES * ROWS).filter(|&s| !deleted(s)).collect();
+        pages_cover_each_row_once(&runtime, &ctx, scan, "SELECT seq FROM t", &live);
+        let kept: Vec<i64> = live
+            .iter()
+            .copied()
+            .filter(|s| s % FILTER_MODULUS != 0)
+            .collect();
+        let filtered = format!("SELECT seq FROM t WHERE seq % {FILTER_MODULUS} <> 0");
+        pages_cover_each_row_once(&runtime, &ctx, scan, &filtered, &kept);
+    }
+
+    /// `seq` in `range`.
+    fn seq_in(range: Range<i64>) -> Expr {
+        col("seq")
+            .gt_eq(lit(range.start))
+            .and(col("seq").lt(lit(range.end)))
+    }
+
+    /// Rows deleted by [`delete_some`]: every [`DELETE_MODULUS`]th,
+    /// [`DELETED_ROW_GROUP`], and [`DELETED_ACROSS_FILES`].
+    fn deleted_some(seq: i64) -> bool {
+        seq % DELETE_MODULUS == 0
+            || DELETED_ROW_GROUP.contains(&seq)
+            || DELETED_ACROSS_FILES.contains(&seq)
+    }
+
+    /// The predicate deleting [`deleted_some`]'s rows.
+    fn delete_some() -> Expr {
+        (col("seq") % lit(DELETE_MODULUS))
+            .eq(lit(0i64))
+            .or(seq_in(DELETED_ROW_GROUP))
+            .or(seq_in(DELETED_ACROSS_FILES))
+    }
+
+    #[test]
+    fn pages_over_files_split_into_byte_ranges_return_each_row_once() {
+        pages_return_each_live_row_once(Scan::Parquet, None, |_| false);
+    }
+
+    #[test]
+    fn pages_over_runs_of_kept_row_groups_return_each_row_once() {
+        pages_return_each_live_row_once(Scan::Kept, None, |_| false);
+    }
+
+    #[test]
+    fn pages_over_byte_ranges_after_a_delete_return_each_live_row_once() {
+        pages_return_each_live_row_once(Scan::Parquet, Some(delete_some()), deleted_some);
+    }
+
+    #[test]
+    fn pages_over_kept_row_groups_after_a_delete_return_each_live_row_once() {
+        pages_return_each_live_row_once(Scan::Kept, Some(delete_some()), deleted_some);
+    }
+}
