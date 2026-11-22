@@ -370,10 +370,12 @@ impl NormTable {
         out
     }
 
-    /// The stored length bucket of `doc`.
-    pub(super) fn bucket(&self, doc: u32) -> u8 {
-        let byte = self.bytes[doc as usize];
-        if self.reversed { u8::MAX - byte } else { byte }
+    /// The stored length bucket of `doc`; `None` past the table, which an
+    /// empty table (a column the directory says scores no document) is for
+    /// every document.
+    pub(super) fn bucket(&self, doc: u32) -> Option<u8> {
+        let byte = *self.bytes.get(doc as usize)?;
+        Some(if self.reversed { u8::MAX - byte } else { byte })
     }
 
     /// The buckets this table scores by.

@@ -1966,7 +1966,8 @@ impl SupertableReader {
         let cursor_sets = SharedCursorSets::default();
         // Slices of one superfile share its candidate norms too: built once,
         // at the floor the first slice reads. The floor only rises, so every
-        // later slice's candidates are among them.
+        // later slice's candidates are among them. An un-ranged unit builds
+        // its own and drops them once scored.
         let candidate_cells = SharedCandidateNorms::default();
         // Ranged kernels are multi-millisecond SYNC scans; run them as a
         // rayon wave on the reader pool, bridged with a oneshot, per the
@@ -2165,30 +2166,36 @@ impl SupertableReader {
                 // the column's own norms.
                 let candidates = match (r.fts(), &candidate_terms) {
                     (Some(fts), Some((bare, phrases))) if r.parquet_bytes().is_none() => {
-                        cell_for(&candidate_cells, suid)
-                            .get_or_init(|| async {
-                                fts.candidate_norms(
-                                    &column_arc,
-                                    bare,
-                                    phrases,
-                                    &global_idf,
-                                    &scoring,
-                                    floor,
-                                    memo.as_deref(),
-                                    Some(&reader_pool),
-                                )
-                                .await
-                                .unwrap_or_else(|error| {
-                                    debug!(
-                                        %error,
-                                        "candidate norms unreadable; scoring reads the column's"
-                                    );
-                                    None
-                                })
-                                .map(Arc::new)
-                            })
+                        let build = || async {
+                            fts.candidate_norms(
+                                &column_arc,
+                                bare,
+                                phrases,
+                                &global_idf,
+                                &scoring,
+                                floor,
+                                memo.as_deref(),
+                                Some(&reader_pool),
+                            )
                             .await
-                            .clone()
+                            .unwrap_or_else(|error| {
+                                debug!(
+                                    %error,
+                                    "candidate norms unreadable; scoring reads the column's"
+                                );
+                                None
+                            })
+                            .map(Arc::new)
+                        };
+                        match range.is_some() {
+                            true => cell_for(&candidate_cells, suid)
+                                .get_or_init(build)
+                                .await
+                                .clone(),
+                            // The file's only unit: a shared cell would hold
+                            // its norms until the whole fan-out returns.
+                            false => build().await,
+                        }
                     }
                     _ => None,
                 };

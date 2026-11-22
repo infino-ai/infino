@@ -1862,7 +1862,16 @@ impl FtsReader {
         }
         self.ensure_norms(column_id).await?;
         let base = col.base_norms.get().expect("the norms were just loaded");
-        Ok(docs.iter().map(|&d| base.dl_norm_k1.bucket(d)).collect())
+        docs.iter()
+            .map(|&doc| {
+                base.dl_norm_k1.bucket(doc).ok_or_else(|| {
+                    FtsError::Read(ReadError::Malformed(format!(
+                        "doc {doc} past the loaded norms of column '{}'",
+                        col.name
+                    )))
+                })
+            })
+            .collect()
     }
 
     /// The stored buckets of `docs` (sorted, distinct), documents a page or
@@ -7266,6 +7275,37 @@ mod tests {
                 matches!(result, Err(FtsError::Read(ReadError::Malformed(_)))),
                 "{name}: {result:?}"
             );
+        }
+    }
+
+    /// Where a stored-bucket directory entry keeps the column's count of
+    /// scored documents.
+    const N_SCORED_DOCS_IN_ENTRY: Range<usize> = 24..32;
+
+    /// A directory that says the column scores no document loads an empty
+    /// norm table; a document the column does hold is then malformed, not
+    /// an index past that table. The same blob uncorrupted reads it.
+    #[tokio::test]
+    async fn doc_buckets_refuse_a_document_past_empty_loaded_norms() {
+        let (blob, json) = candidate_corpus();
+        let dir_off =
+            read_u64_le(&blob[hdr::DOC_LENGTHS_DIR_OFF..hdr::DOC_LENGTHS_DIR_OFF + U64_BYTES])
+                as usize;
+        let mut corrupt = blob.to_vec();
+        corrupt[dir_off + N_SCORED_DOCS_IN_ENTRY.start..dir_off + N_SCORED_DOCS_IN_ENTRY.end]
+            .copy_from_slice(&0u64.to_le_bytes());
+        let corrupt = Bytes::from(corrupt);
+        for (name, blob, ok) in [("intact", &blob, true), ("no scored docs", &corrupt, false)] {
+            let r = bucket_reader(blob, json).await;
+            r.ensure_norms(0).await.expect("norms");
+            let result = r.doc_buckets(0, &[0], CANDIDATE_MAX_RANGES).await;
+            match ok {
+                true => assert!(result.is_ok(), "{name}: {result:?}"),
+                false => assert!(
+                    matches!(result, Err(FtsError::Read(ReadError::Malformed(_)))),
+                    "{name}: {result:?}"
+                ),
+            }
         }
     }
 
