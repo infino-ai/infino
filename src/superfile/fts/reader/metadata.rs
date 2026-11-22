@@ -370,6 +370,12 @@ impl NormTable {
         out
     }
 
+    /// The stored length bucket of `doc`.
+    pub(super) fn bucket(&self, doc: u32) -> u8 {
+        let byte = self.bytes[doc as usize];
+        if self.reversed { u8::MAX - byte } else { byte }
+    }
+
     /// The buckets this table scores by.
     pub(super) fn buckets(&self) -> &[u8] {
         &self.bytes

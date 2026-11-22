@@ -1765,8 +1765,7 @@ impl FtsReader {
         }
         self.ensure_norms(column_id).await?;
         let base = col.base_norms.get().expect("the norms were just loaded");
-        let (bytes, _) = base.dl_norm_k1.parts();
-        Ok(docs.iter().map(|&d| bytes[d as usize]).collect())
+        Ok(docs.iter().map(|&d| base.dl_norm_k1.bucket(d)).collect())
     }
 
     /// The stored buckets of `docs` (sorted, distinct), documents a page or
