@@ -3340,6 +3340,66 @@ mod tests {
         assert_keyword_answers(&reopened, "kws");
     }
 
+    /// A keyword value longer than the 255-character cap `standard` chops
+    /// its tokens at is still one whole term: two values that share their
+    /// first 300 bytes stay apart, and a value of 200 two-byte characters
+    /// matches whole, through every search path and after a reopen.
+    #[test]
+    fn a_keyword_value_over_255_bytes_stays_one_term() {
+        let (conn, dir) = storage_conn();
+        let head = "x".repeat(300);
+        let longer = format!("{head}y");
+        let wide = "é".repeat(200);
+        assert!(head.len() > 255 && wide.len() > 255 && wide.chars().count() < 255);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "kw",
+            DataType::LargeUtf8,
+            true,
+        )]));
+        let table = conn
+            .create_table(
+                "long_kws",
+                Arc::clone(&schema),
+                IndexSpec::new().fts(FtsField::new("kw").analyzer("keyword")),
+            )
+            .expect("create");
+        let column: ArrayRef = Arc::new(LargeStringArray::from(vec![
+            head.as_str(),
+            longer.as_str(),
+            wide.as_str(),
+        ]));
+        table
+            .append(&RecordBatch::try_new(Arc::clone(&schema), vec![column]).expect("batch"))
+            .expect("append");
+        drop(table);
+
+        let reopened = connect(dir.path().to_str().expect("utf8 path")).expect("reconnect");
+        for conn in [&conn, &reopened] {
+            let table = conn.open_table("long_kws").expect("open");
+            let kw = Some(&["kw"][..]);
+            for value in [&head, &longer, &wide] {
+                let only = vec![Some(value.clone())];
+                let hits = table
+                    .token_match("kw", value, BoolMode::Or, kw)
+                    .expect("token_match");
+                assert_eq!(kw_values(&hits), only, "token_match {}", value.len());
+                let hits = table.exact_match("kw", value, kw).expect("exact_match");
+                assert_eq!(kw_values(&hits), only, "exact_match {}", value.len());
+                let hits = table
+                    .bm25_search("kw", value, TOP_K, Bm25SearchOptions::new(), kw)
+                    .expect("bm25_search");
+                assert_eq!(kw_values(&hits), only, "bm25_search {}", value.len());
+            }
+            let sql = format!("SELECT kw FROM bm25_search_prefix('long_kws', 'kw', '{head}', 10)");
+            let rows = conn.query_sql(&sql).expect("prefix");
+            assert_eq!(
+                kw_values(&rows),
+                vec![Some(head.clone()), Some(longer.clone())],
+                "the shared head is a prefix of both values"
+            );
+        }
+    }
+
     /// An analyzer this engine does not ship is refused, and so is a
     /// keyword column with a filter, at create and in a schema patch.
     #[test]

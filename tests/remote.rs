@@ -19,9 +19,9 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use datafusion::prelude::{col, lit};
 use infino::{
-    Bm25SearchOptions, BoolMode, ConnectOptions, FieldPatch, FtsField, IndexSpec, InfinoError,
-    Metric, OptimizeError, OptimizeOptions, SchemaPatch, Stemmer, Stopwords, VectorFilter,
-    VectorSearchOptions,
+    Analyzer, Bm25SearchOptions, BoolMode, ColumnIndex, ConnectOptions, FieldPatch, FtsField,
+    IndexSpec, InfinoError, Metric, OptimizeError, OptimizeOptions, SchemaPatch, Stemmer,
+    Stopwords, VectorFilter, VectorSearchOptions,
 };
 use serde_json::json;
 use wiremock::{
@@ -128,6 +128,52 @@ async fn create_table_posts_expected_shape() {
         body.get("schema").is_none(),
         "the JSON descriptor form is no longer sent"
     );
+}
+
+/// The hosted service builds `standard` indexes only, so a `keyword`
+/// column is refused on the client, at create and in a schema patch,
+/// before any request is sent: a service that did not know the analyzer
+/// could build the column as `standard`.
+#[tokio::test]
+async fn a_keyword_column_is_refused_before_any_request() {
+    let server = MockServer::start().await;
+    let errors = with_connection(server.uri(), |db| {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "tag",
+            DataType::LargeUtf8,
+            true,
+        )]));
+        let created = db
+            .create_table(
+                "posts",
+                schema,
+                IndexSpec::new().fts(FtsField::new("tag").analyzer("keyword")),
+            )
+            .err();
+        let patched = db
+            .apply_schema(
+                "posts",
+                &SchemaPatch::new(vec![
+                    FieldPatch::named("tag")
+                        .with_type(DataType::LargeUtf8)
+                        .with_index(ColumnIndex::fts(Analyzer::Keyword)),
+                ]),
+                None,
+            )
+            .err();
+        [created, patched]
+    })
+    .await;
+    for err in errors {
+        let err = err.expect("a keyword column is refused");
+        assert!(matches!(err, InfinoError::Config(_)), "{err:?}");
+        assert!(err.to_string().contains("\"keyword\""), "{err}");
+    }
+    let requests = server
+        .received_requests()
+        .await
+        .expect("request recording is enabled");
+    assert!(requests.is_empty(), "nothing reached the service");
 }
 
 #[tokio::test]

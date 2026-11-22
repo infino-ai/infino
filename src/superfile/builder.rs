@@ -5987,8 +5987,9 @@ fn adapt_batch(
 /// `{"name":"<escaped>","field_id":<n>,"tokenizer":"standard","k1":<f>,"b":<f>}`.
 /// `field_id` is the column's stable id, omitted when the builder's
 /// schema was never stamped; readers then resolve the column by name.
-/// `tokenizer` is always `standard` today; recording it lets a future
-/// tokenizer be added without a format change. A stopword set and a
+/// `tokenizer` names the column's base analyzer, `standard` or
+/// `keyword`; a reader that does not know the name refuses the file
+/// rather than query it split another way. A stopword set and a
 /// stemmer ride as
 /// `"stopwords"` / `"stemmer"`, each emitted only when set; the reader
 /// reconstructs the column's tokenizer from them for query-time

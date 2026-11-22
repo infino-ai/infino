@@ -1978,7 +1978,8 @@ fn admits(token: LikeToken, fold: bool) -> Option<LikeToken> {
 
 /// Build a `TermsAll` leaf for `column = value`, or `Unbounded` if the
 /// column isn't FTS-indexed, the value isn't a string, or it tokenizes
-/// to nothing (e.g. the empty string — no tokens to bound with).
+/// to nothing (e.g. the empty string under `standard` — no tokens to
+/// bound with; under `keyword` the empty string is itself one term).
 fn terms_all(
     column: &str,
     value: &ScalarValue,

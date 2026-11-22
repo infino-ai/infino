@@ -277,6 +277,10 @@ pub(crate) fn check_recorded_tokenizer(
     }
 }
 
+/// The one analyzer a past release shipped and this engine no longer
+/// reads. Any other unknown name was written by a newer engine.
+pub(crate) const REMOVED_ANALYZER: &str = "ascii_lower";
+
 /// Refuse a chain that cannot be built: `keyword` keeps the whole value,
 /// so it takes no stopwords or stemmer.
 pub(crate) fn check_chain(

@@ -69,7 +69,7 @@ impl core::marker::UnsafeUnpin for infino::ColdFetchMode
 impl core::panic::unwind_safe::RefUnwindSafe for infino::ColdFetchMode
 impl core::panic::unwind_safe::UnwindSafe for infino::ColdFetchMode
 #[non_exhaustive] pub enum infino::ColumnIndex
-pub infino::ColumnIndex::Fts
+#[non_exhaustive] pub infino::ColumnIndex::Fts
 pub infino::ColumnIndex::Fts::analyzer: infino::Analyzer
 pub infino::ColumnIndex::Fts::bm25: infino::Bm25Params
 pub infino::ColumnIndex::Fts::positions: bool
@@ -81,6 +81,8 @@ pub infino::ColumnIndex::Vector
 pub infino::ColumnIndex::Vector::metric: infino::Metric
 pub infino::ColumnIndex::Vector::rerank_codec: infino::RerankCodec
 pub infino::ColumnIndex::Vector::rot_seed: u64
+impl infino::ColumnIndex
+pub fn infino::ColumnIndex::fts(infino::Analyzer) -> Self
 impl core::clone::Clone for infino::ColumnIndex
 pub fn infino::ColumnIndex::clone(&self) -> Self
 impl core::cmp::PartialEq for infino::ColumnIndex

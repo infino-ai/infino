@@ -524,12 +524,27 @@ impl IndexSpec {
     }
 
     /// FTS base tokenizers, in declaration order (parallel to
-    /// [`fts_columns`](Self::fts_columns)). The names were checked by
-    /// [`check_analyzers`](Self::check_analyzers) at `create_table`.
+    /// [`fts_columns`](Self::fts_columns)).
+    ///
+    /// # Panics
+    ///
+    /// On a name this engine does not ship. Every caller runs
+    /// [`check_analyzers`](Self::check_analyzers) first (`create_table`
+    /// does, and a spec rebuilt from a catalog record names only shipped
+    /// analyzers); a caller that skipped it must fail loudly rather than
+    /// build the column under `standard`.
     pub(crate) fn fts_analyzers(&self) -> Vec<Analyzer> {
         self.fts
             .iter()
-            .map(|f| Analyzer::from_name(&f.analyzer).unwrap_or_default())
+            .map(|f| {
+                Analyzer::from_name(&f.analyzer).unwrap_or_else(|| {
+                    panic!(
+                        "FTS column {:?}: analyzer {:?} reached the index without \
+                         check_analyzers",
+                        f.column, f.analyzer
+                    )
+                })
+            })
             .collect()
     }
 
