@@ -431,17 +431,19 @@ pub trait Tokenizer: Send + Sync + std::fmt::Debug + 'static {
 
 /// Tokenize several `texts` into one sorted, de-duplicated term list.
 /// For building a single term set from many values (e.g. an `IN` list)
-/// where a word shared across values must be probed only once.
+/// where a word shared across values must be probed only once. `None`
+/// when a text yields no token: no term set stands for that text.
 pub(crate) fn unique_tokens<'a>(
     tok: &dyn Tokenizer,
     texts: impl IntoIterator<Item = &'a str>,
-) -> Vec<String> {
-    texts
-        .into_iter()
-        .flat_map(|t| tok.tokenize(t))
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect()
+) -> Option<Vec<String>> {
+    let mut terms = BTreeSet::new();
+    for text in texts {
+        let mut tokens = tok.tokenize(text).peekable();
+        tokens.peek()?;
+        terms.extend(tokens);
+    }
+    Some(terms.into_iter().collect())
 }
 
 /// One quoted phrase: its terms in query order, plus each term's
@@ -2074,7 +2076,18 @@ mod tests {
         let tok = StandardTokenizer;
         // values share 'juice'; result is one sorted set, no repeat
         let got = unique_tokens(&tok, ["Orange Juice", "Apple Juice"]);
-        assert_eq!(got, vec!["apple", "juice", "orange"]);
+        assert_eq!(
+            got,
+            Some(vec!["apple".into(), "juice".into(), "orange".into()])
+        );
+    }
+
+    #[test]
+    fn unique_tokens_is_none_when_a_value_has_no_token() {
+        // '!!' yields no token, so no term set stands for the list.
+        let tok = StandardTokenizer;
+        assert_eq!(unique_tokens(&tok, ["Orange Juice", "!!"]), None);
+        assert_eq!(unique_tokens(&tok, ["", "Orange"]), None);
     }
 
     #[test]

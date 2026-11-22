@@ -3162,7 +3162,19 @@ impl SuperfileReader {
     /// for any absent token). Batched sibling of [`Self::term_df`]: resolves
     /// the whole set with one dictionary parse and one coalesced header fetch.
     /// Delegates to [`FtsReader::term_dfs`].
-    pub(crate) async fn term_dfs(
+    pub async fn term_dfs(
+        &self,
+        column: &str,
+        tokens: &[&str],
+    ) -> Result<(Vec<u64>, MatchWork), ReadError> {
+        let fts = self
+            .fts()
+            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
+        Ok(fts.term_dfs(column, tokens).await?)
+    }
+
+    /// [`Self::term_dfs`] with the dictionary read through `dict`, which may already hold it.
+    pub(crate) async fn term_dfs_with_dict(
         &self,
         column: &str,
         tokens: &[&str],
@@ -3171,7 +3183,7 @@ impl SuperfileReader {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
-        Ok(fts.term_dfs(column, tokens, dict).await?)
+        Ok(fts.term_dfs_with_dict(column, tokens, dict).await?)
     }
 
     /// Open-wave fetch of `terms`' dictionary slots + postings ranges

@@ -25,7 +25,7 @@
 // step with each generation is its first caller.
 #![allow(dead_code)]
 
-use std::fmt;
+use std::{fmt, sync::Arc};
 
 use uuid::Uuid;
 
@@ -104,7 +104,8 @@ pub(crate) struct KeyedGraph {
     /// `keys[node]` is the centroid behind graph node `node`; `None` for a
     /// hole.
     pub(crate) keys: Vec<Option<FineNodeKey>>,
-    pub(crate) graph: Hnsw,
+    /// Shared with the query router, so a loaded graph is held once.
+    pub(crate) graph: Arc<Hnsw>,
     /// The graph's [`Hnsw::node_digest`], kept current as steps are applied
     /// so a step is checked without reading the whole graph.
     node_digest: u64,
@@ -115,7 +116,7 @@ impl KeyedGraph {
         let node_digest = graph.node_digest();
         Self {
             keys,
-            graph,
+            graph: Arc::new(graph),
             node_digest,
         }
     }
@@ -232,14 +233,15 @@ impl GraphStep {
             graph: hnsw,
             node_digest,
         } = graph;
-        let (hnsw, node_digest) = hnsw.apply_change(&self.change, node_digest)?;
+        let (hnsw, node_digest) =
+            Arc::unwrap_or_clone(hnsw).apply_change(&self.change, node_digest)?;
         for &node in self.change.removed() {
             keys[node as usize] = None;
         }
         keys.extend_from_slice(&self.appended_keys);
         Ok(KeyedGraph {
             keys,
-            graph: hnsw,
+            graph: Arc::new(hnsw),
             node_digest,
         })
     }
@@ -562,9 +564,7 @@ mod tests {
         }
         keys.extend((slots..slots + CHURN).map(|i| Some(key(i))));
         let scorer_after = Sq16Scorer::from_unit_vectors(&vectors[..slots + CHURN], DIM);
-        let hnsw = graph
-            .graph
-            .clone()
+        let hnsw = Hnsw::clone(&graph.graph)
             .unlink_nodes(&removed, &scorer)
             .extend_serial(&scorer_after, HnswParams::default());
         KeyedGraph::new(keys, hnsw)
@@ -579,7 +579,7 @@ mod tests {
         let mut writer = built(&vectors, START_NODES);
         let base = GraphBase::new(
             writer.keys.iter().flatten().copied().collect(),
-            writer.graph.clone(),
+            Hnsw::clone(&writer.graph),
         )
         .expect("a fresh build has no holes");
         let base_bytes = base.to_bytes();
@@ -628,7 +628,7 @@ mod tests {
         let writer = built(&vectors, START_NODES);
         let base = GraphBase::new(
             writer.keys.iter().flatten().copied().collect(),
-            writer.graph.clone(),
+            Hnsw::clone(&writer.graph),
         )
         .expect("base");
         let after = next_generation(&writer, &vectors, 0);
@@ -648,7 +648,7 @@ mod tests {
         let to_third = GraphStep::between(&second, &third).expect("step");
         let base = GraphBase::new(
             first.keys.iter().flatten().copied().collect(),
-            first.graph.clone(),
+            Hnsw::clone(&first.graph),
         )
         .expect("base");
         let hash = ContentHash::of(b"x");
@@ -677,11 +677,11 @@ mod tests {
         let holed = next_generation(&fresh, &vectors, 0);
         let keys: Vec<FineNodeKey> = (0..holed.graph.len()).map(key).collect();
         assert_eq!(
-            GraphBase::new(keys, holed.graph).expect_err("holes"),
+            GraphBase::new(keys, Hnsw::clone(&holed.graph)).expect_err("holes"),
             GraphStoreError::HoleInBase
         );
         assert_eq!(
-            GraphBase::new(vec![key(0)], fresh.graph).expect_err("one key"),
+            GraphBase::new(vec![key(0)], Hnsw::clone(&fresh.graph)).expect_err("one key"),
             GraphStoreError::KeyCount
         );
     }
@@ -695,7 +695,7 @@ mod tests {
         let first = built(&vectors, START_NODES);
         let base = GraphBase::new(
             first.keys.iter().flatten().copied().collect(),
-            first.graph.clone(),
+            Hnsw::clone(&first.graph),
         )
         .expect("base");
         let hash = ContentHash::of(b"x");
@@ -737,7 +737,7 @@ mod tests {
         let second = next_generation(&first, &vectors, 0);
         let base = GraphBase::new(
             first.keys.iter().flatten().copied().collect(),
-            first.graph.clone(),
+            Hnsw::clone(&first.graph),
         )
         .expect("base");
         let step = GraphStep::between(&first, &second).expect("step");

@@ -1056,7 +1056,7 @@ async fn fold_dfs(
     }
     let refs: Vec<&str> = terms.iter().map(String::as_str).collect();
     let (dfs, work) = reader
-        .term_dfs(reader.column_alias(field, column), &refs, dict)
+        .term_dfs_with_dict(reader.column_alias(field, column), &refs, dict)
         .await?;
     Ok((dfs.into_iter().fold(init, fold), work))
 }

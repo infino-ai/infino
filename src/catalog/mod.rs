@@ -964,9 +964,14 @@ impl Connection {
             }
             CatalogStore::Storage { root, handles, .. } => {
                 // A handle already open answers with the document it holds,
-                // as every other read through this connection does.
+                // after the freshness check a read makes: unlike a read, a
+                // describe touches no storage, so without it a table dropped
+                // elsewhere would be described from cache indefinitely.
                 if let Some(handle) = live_handle(handles, name) {
-                    return Ok((*handle.table_schema()).clone());
+                    let _ = handle.ensure_fresh();
+                    if !handle.pointer_vanished() {
+                        return Ok((*handle.table_schema()).clone());
+                    }
                 }
                 // Otherwise the pointer and the list, and nothing of the
                 // parts: an open loads every part and keeps its entries and
@@ -4230,6 +4235,77 @@ mod tests {
             "peer must rebuild against the re-created table, not serve the \
              dropped generation's rows"
         );
+    }
+
+    /// Two strong connections over one directory, with `docs` created by the
+    /// first and its handle cached by the second through a query.
+    fn peer_with_cached_docs() -> (tempfile::TempDir, Connection, Connection) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let uri = dir.path().to_str().expect("utf8 path").to_string();
+        let strong = || ConnectOptions::new().with_read_consistency(Consistency::Strong);
+        let writer = connect_with(&uri, strong()).expect("connect writer");
+        let reader = connect_with(&uri, strong()).expect("connect reader");
+        writer
+            .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create_table")
+            .append(&build_title_batch(&["the quick brown fox"]))
+            .expect("append");
+        assert_eq!(count_rows(&reader, "docs"), 1, "reader caches the handle");
+        (dir, writer, reader)
+    }
+
+    /// `docs` again, with a `body` column the dropped generation lacked.
+    fn recreate_docs_wider(writer: &Connection) {
+        let wider = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new("body", DataType::LargeUtf8, true),
+        ]));
+        writer
+            .create_table("docs", wider, IndexSpec::new().fts("title"))
+            .expect("re-create with another schema");
+    }
+
+    /// A describe answers from a cached handle without reading storage, so it
+    /// checks the handle first: a table dropped and re-created by another
+    /// process is seen with no query in between.
+    #[test]
+    fn schema_sees_a_peer_drop_and_recreate() {
+        let (_dir, writer, reader) = peer_with_cached_docs();
+
+        writer.drop_table("docs", true).expect("drop elsewhere");
+        assert!(matches!(
+            reader.schema("docs"),
+            Err(InfinoError::NotFound(_))
+        ));
+
+        recreate_docs_wider(&writer);
+        let described = reader.schema("docs").expect("schema");
+        assert!(described.fields().iter().any(|f| f.name == "body"));
+        let reopened = reader.open_table("docs").expect("open the new table");
+        assert!(reopened.schema().field_with_name("body").is_ok());
+    }
+
+    /// A handle cached before a peer drop is never served: the first open or
+    /// read after the drop reports it, and the next open resolves the
+    /// re-created table. Which of the two reports it depends on whether the
+    /// open has to read storage (for statistics the handle lacks), so either
+    /// is accepted.
+    #[test]
+    fn a_peer_dropped_handle_is_reported_on_first_use() {
+        let (_dir, writer, reader) = peer_with_cached_docs();
+
+        writer.drop_table("docs", true).expect("drop elsewhere");
+        recreate_docs_wider(&writer);
+        let first = reader.open_table("docs").and_then(|stale| {
+            stale.bm25_search("title", "fox", TOP_K, Bm25SearchOptions::new(), None)
+        });
+        assert!(
+            matches!(first, Err(InfinoError::NotFound(_))),
+            "the dropped generation must be reported gone: {first:?}"
+        );
+
+        let reopened = reader.open_table("docs").expect("open the new table");
+        assert!(reopened.schema().field_with_name("body").is_ok());
     }
 
     /// The same purge, against a peer handle that has never served a read.

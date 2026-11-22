@@ -1069,6 +1069,13 @@
           "query": {
             "type": "string"
           },
+          "rerank": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "Rows reranked for a question before they come back: `{\"question\":\n\"...\", \"k\": 10}`. The rows a query finds are each put to the\ndeployment's grader with the question - the pass the agent APIs'\n`ask` ranks its results by - and the top `k` come back, best first,\nas JSON: `{\"rows\": [...], \"rerank\": {...}}` with the pass's coverage.\nThe grader reads at most the deployment's triage pool\n(`ask.triage.pool`): a search fetches the pool rather than its `k`,\nand a match's or a statement's rows past the pool are neither graded\nnor returned, the coverage counting them (`over_pool`). `k` is the\nsearch's own when absent, or every row graded; a `k` over the pool is\nrefused (400). Off when absent or `null`. Needs a deployment with the\nagent APIs and their triage pass; refused otherwise (501). Its shape\nis the agent APIs' (`api::rerank::Rerank`), carried here as it came."
+          },
           "table_name": {
             "type": "string"
           }
@@ -1641,6 +1648,13 @@
               "type": "string"
             }
           },
+          "rerank": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "Rows reranked for a question before they come back: `{\"question\":\n\"...\", \"k\": 10}`. The rows a query finds are each put to the\ndeployment's grader with the question - the pass the agent APIs'\n`ask` ranks its results by - and the top `k` come back, best first,\nas JSON: `{\"rows\": [...], \"rerank\": {...}}` with the pass's coverage.\nThe grader reads at most the deployment's triage pool\n(`ask.triage.pool`): a search fetches the pool rather than its `k`,\nand a match's or a statement's rows past the pool are neither graded\nnor returned, the coverage counting them (`over_pool`). `k` is the\nsearch's own when absent, or every row graded; a `k` over the pool is\nrefused (400). Off when absent or `null`. Needs a deployment with the\nagent APIs and their triage pass; refused otherwise (501). Its shape\nis the agent APIs' (`api::rerank::Rerank`), carried here as it came."
+          },
           "table_name": {
             "type": "string"
           },
@@ -1755,6 +1769,13 @@
             "items": {
               "type": "string"
             }
+          },
+          "rerank": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "Rows reranked for a question before they come back: `{\"question\":\n\"...\", \"k\": 10}`. The rows a query finds are each put to the\ndeployment's grader with the question - the pass the agent APIs'\n`ask` ranks its results by - and the top `k` come back, best first,\nas JSON: `{\"rows\": [...], \"rerank\": {...}}` with the pass's coverage.\nThe grader reads at most the deployment's triage pool\n(`ask.triage.pool`): a search fetches the pool rather than its `k`,\nand a match's or a statement's rows past the pool are neither graded\nnor returned, the coverage counting them (`over_pool`). `k` is the\nsearch's own when absent, or every row graded; a `k` over the pool is\nrefused (400). Off when absent or `null`. Needs a deployment with the\nagent APIs and their triage pass; refused otherwise (501). Its shape\nis the agent APIs' (`api::rerank::Rerank`), carried here as it came."
           },
           "table_name": {
             "type": "string"
@@ -2283,6 +2304,13 @@
           "query": {
             "type": "string"
           },
+          "rerank": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "Rows reranked for a question before they come back: `{\"question\":\n\"...\", \"k\": 10}`. The rows a query finds are each put to the\ndeployment's grader with the question - the pass the agent APIs'\n`ask` ranks its results by - and the top `k` come back, best first,\nas JSON: `{\"rows\": [...], \"rerank\": {...}}` with the pass's coverage.\nThe grader reads at most the deployment's triage pool\n(`ask.triage.pool`): a search fetches the pool rather than its `k`,\nand a match's or a statement's rows past the pool are neither graded\nnor returned, the coverage counting them (`over_pool`). `k` is the\nsearch's own when absent, or every row graded; a `k` over the pool is\nrefused (400). Off when absent or `null`. Needs a deployment with the\nagent APIs and their triage pass; refused otherwise (501). Its shape\nis the agent APIs' (`api::rerank::Rerank`), carried here as it came."
+          },
           "validate": {
             "oneOf": [
               {
@@ -2368,6 +2396,13 @@
           },
           "query": {
             "type": "string"
+          },
+          "rerank": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "Rows reranked for a question before they come back: `{\"question\":\n\"...\", \"k\": 10}`. The rows a query finds are each put to the\ndeployment's grader with the question - the pass the agent APIs'\n`ask` ranks its results by - and the top `k` come back, best first,\nas JSON: `{\"rows\": [...], \"rerank\": {...}}` with the pass's coverage.\nThe grader reads at most the deployment's triage pool\n(`ask.triage.pool`): a search fetches the pool rather than its `k`,\nand a match's or a statement's rows past the pool are neither graded\nnor returned, the coverage counting them (`over_pool`). `k` is the\nsearch's own when absent, or every row graded; a `k` over the pool is\nrefused (400). Off when absent or `null`. Needs a deployment with the\nagent APIs and their triage pass; refused otherwise (501). Its shape\nis the agent APIs' (`api::rerank::Rerank`), carried here as it came."
           },
           "table_name": {
             "type": "string"
@@ -2463,6 +2498,13 @@
               "type": "number",
               "format": "float"
             }
+          },
+          "rerank": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "Rows reranked for a question before they come back: `{\"question\":\n\"...\", \"k\": 10}`. The rows a query finds are each put to the\ndeployment's grader with the question - the pass the agent APIs'\n`ask` ranks its results by - and the top `k` come back, best first,\nas JSON: `{\"rows\": [...], \"rerank\": {...}}` with the pass's coverage.\nThe grader reads at most the deployment's triage pool\n(`ask.triage.pool`): a search fetches the pool rather than its `k`,\nand a match's or a statement's rows past the pool are neither graded\nnor returned, the coverage counting them (`over_pool`). `k` is the\nsearch's own when absent, or every row graded; a `k` over the pool is\nrefused (400). Off when absent or `null`. Needs a deployment with the\nagent APIs and their triage pass; refused otherwise (501). Its shape\nis the agent APIs' (`api::rerank::Rerank`), carried here as it came."
           },
           "table_name": {
             "type": "string"
