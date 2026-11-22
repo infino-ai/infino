@@ -748,7 +748,7 @@ pub(crate) const CANDIDATE_MAX_POSTINGS: u64 = 1 << 16;
 
 /// Most of a query's terms one superfile may hold for its candidates to be
 /// bounded term by term.
-const CANDIDATE_MAX_TERMS: usize = 64;
+pub(crate) const CANDIDATE_MAX_TERMS: usize = 64;
 
 /// Most candidates one superfile may have for its buckets to be read alone.
 const CANDIDATE_MAX_DOCS: usize = 8192;
@@ -1852,21 +1852,24 @@ impl FtsReader {
         // weights it (its idf times its count), phrase members at zero.
         let mut terms: Vec<&str> = Vec::new();
         let mut weights: Vec<f32> = Vec::new();
-        fn slot<'t>(t: &'t str, terms: &mut Vec<&'t str>, weights: &mut Vec<f32>) -> usize {
-            match terms.iter().position(|x| *x == t) {
-                Some(at) => at,
-                None => {
-                    terms.push(t);
-                    weights.push(0.0);
-                    terms.len() - 1
-                }
-            }
+        let mut slots: FxHashMap<&str, usize> = FxHashMap::default();
+        fn slot<'t>(
+            t: &'t str,
+            slots: &mut FxHashMap<&'t str, usize>,
+            terms: &mut Vec<&'t str>,
+            weights: &mut Vec<f32>,
+        ) -> usize {
+            *slots.entry(t).or_insert_with(|| {
+                terms.push(t);
+                weights.push(0.0);
+                terms.len() - 1
+            })
         }
         for &(term, count) in bare {
             let Some(&w) = idf.get(term) else {
                 return Ok(None);
             };
-            let at = slot(term, &mut terms, &mut weights);
+            let at = slot(term, &mut slots, &mut terms, &mut weights);
             weights[at] += w * count as f32;
         }
         let mut phrase_parts: Vec<(Vec<usize>, f32)> = Vec::with_capacity(phrases.len());
@@ -1878,7 +1881,7 @@ impl FtsReader {
                     return Ok(None);
                 };
                 weight += w;
-                let at = slot(term, &mut terms, &mut weights);
+                let at = slot(term, &mut slots, &mut terms, &mut weights);
                 if !members.contains(&at) {
                     members.push(at);
                 }

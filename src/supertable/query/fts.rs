@@ -127,10 +127,10 @@ use crate::{
             bm25,
             bm25::Bm25Params,
             reader::{
-                Bm25SearchOptions, CANDIDATE_MAX_POSTINGS, CandidateNorms, ClauseLists,
-                ColumnLengthStats, FEW_NORMS_MAX_DOCS, FetchedTermMemo, GlobalTermIdf, LiveFloor,
-                MatchWork, OR_WINDOW_MIN_TERMS, OrCursorSet, PreparedClauses, QueryDict, QueryIdf,
-                ScoringView,
+                Bm25SearchOptions, CANDIDATE_MAX_POSTINGS, CANDIDATE_MAX_TERMS, CandidateNorms,
+                ClauseLists, ColumnLengthStats, FEW_NORMS_MAX_DOCS, FetchedTermMemo, GlobalTermIdf,
+                LiveFloor, MatchWork, OR_WINDOW_MIN_TERMS, OrCursorSet, PreparedClauses, QueryDict,
+                QueryIdf, ScoringView,
             },
             tokenize::Phrase,
         },
@@ -1921,10 +1921,14 @@ impl SupertableReader {
                 || !should_ph_arc.is_empty());
         let bare_counts: Arc<Vec<(String, u32)>> = Arc::new({
             let mut counts: Vec<(String, u32)> = Vec::new();
+            let mut at: HashMap<&str, usize> = HashMap::new();
             for term in must_arc.iter().chain(should_arc.iter()) {
-                match counts.iter_mut().find(|(t, _)| t == term) {
-                    Some((_, n)) => *n += 1,
-                    None => counts.push((term.clone(), 1)),
+                match at.get(term.as_str()) {
+                    Some(&i) => counts[i].1 += 1,
+                    None => {
+                        at.insert(term, counts.len());
+                        counts.push((term.clone(), 1));
+                    }
                 }
             }
             counts
@@ -2069,34 +2073,53 @@ impl SupertableReader {
                         .and_then(|term| index_locations.held(suid)?.df(term))
                         .is_some_and(|df| df as usize <= FEW_NORMS_MAX_DOCS);
                 // Candidate norms are worth trying only where the term index
-                // says the postings to decode are few: all the query's terms,
-                // or a lone phrase's rarest word. Elsewhere the length array
-                // is prewarmed and read as before.
-                let candidate_cheap = candidate_shape
-                    && index_locations.held(suid).is_some_and(|held| {
-                        let df = |t: &str| held.df(t);
-                        let phrases: Vec<&Phrase<String>> =
-                            must_ph_arc.iter().chain(should_ph_arc.iter()).collect();
-                        let work = match (bare_counts.is_empty(), phrases.as_slice()) {
-                            (true, [phrase]) => phrase
+                // says the postings to decode are few: all the query's terms
+                // this superfile holds, or a lone phrase's rarest word, over
+                // few terms. Only those terms go on: a prefix's other
+                // expansions, thousands of them, are absent here. Elsewhere
+                // the length array is prewarmed and read as before.
+                let candidate_terms = candidate_shape
+                    .then(|| index_locations.held(suid))
+                    .flatten()
+                    .and_then(|held| {
+                        let mut bare: Vec<(&str, u32)> = Vec::new();
+                        let mut work = 0u64;
+                        let mut distinct: HashSet<&str> = HashSet::new();
+                        for (term, count) in bare_counts.iter() {
+                            let df = held.df(term)?;
+                            if df > 0 {
+                                bare.push((term.as_str(), *count));
+                                work += df;
+                                distinct.insert(term.as_str());
+                            }
+                        }
+                        let mut phrases: Vec<(&[String], Vec<u64>)> = Vec::new();
+                        for phrase in must_ph_arc.iter().chain(should_ph_arc.iter()) {
+                            let dfs = phrase
                                 .terms
                                 .iter()
-                                .map(|t| df(t))
-                                .collect::<Option<Vec<u64>>>()
-                                .and_then(|dfs| dfs.into_iter().min()),
-                            _ => bare_counts
-                                .iter()
-                                .map(|(t, _)| t.as_str())
-                                .chain(
-                                    phrases
-                                        .iter()
-                                        .flat_map(|p| p.terms.iter().map(String::as_str)),
-                                )
-                                .map(df)
-                                .sum::<Option<u64>>(),
+                                .map(|t| held.df(t))
+                                .collect::<Option<Vec<u64>>>()?;
+                            // A phrase missing a word here cannot match here.
+                            if dfs.iter().all(|&df| df > 0) {
+                                distinct.extend(phrase.terms.iter().map(String::as_str));
+                                phrases.push((phrase.terms.as_slice(), dfs));
+                            }
+                        }
+                        work = match (bare.is_empty(), phrases.as_slice()) {
+                            (true, [(_, dfs)]) => dfs.iter().copied().min().unwrap_or(0),
+                            _ => work + phrases.iter().flat_map(|(_, dfs)| dfs).sum::<u64>(),
                         };
-                        work.is_some_and(|w| w <= CANDIDATE_MAX_POSTINGS)
+                        let cheap = !distinct.is_empty()
+                            && distinct.len() <= CANDIDATE_MAX_TERMS
+                            && work <= CANDIDATE_MAX_POSTINGS;
+                        cheap.then(|| {
+                            let phrases: Vec<&[String]> =
+                                phrases.into_iter().map(|(terms, _)| terms).collect();
+                            (bare, phrases)
+                        })
                     });
+                let candidate_cheap = candidate_terms.is_some();
                 let prewarm = async {
                     if r.parquet_bytes().is_some() {
                         return;
@@ -2135,19 +2158,12 @@ impl SupertableReader {
                 // floor: scoring reads only their length buckets (see
                 // `candidate_norms`). Anything it cannot read that way keeps
                 // the column's own norms.
-                let candidates = match r.fts() {
-                    Some(fts) if candidate_cheap && r.parquet_bytes().is_none() => {
-                        let bare: Vec<(&str, u32)> =
-                            bare_counts.iter().map(|(t, n)| (t.as_str(), *n)).collect();
-                        let phrases: Vec<&[String]> = must_ph_arc
-                            .iter()
-                            .chain(should_ph_arc.iter())
-                            .map(|p| p.terms.as_slice())
-                            .collect();
+                let candidates = match (r.fts(), &candidate_terms) {
+                    (Some(fts), Some((bare, phrases))) if r.parquet_bytes().is_none() => {
                         fts.candidate_norms(
                             &column_arc,
-                            &bare,
-                            &phrases,
+                            bare,
+                            phrases,
                             &global_idf,
                             &scoring,
                             floor,
