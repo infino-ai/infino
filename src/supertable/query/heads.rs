@@ -88,6 +88,9 @@ use crate::{
 /// threshold however deep they are read, stops here instead of reading
 /// hundreds of millions of entries to save no open.
 const HEAD_READ_BUDGET_ENTRIES: u64 = 256 << 10;
+/// How far a stored key may sit under one recomputed from its superfile's
+/// recorded average: a few roundings.
+const KEY_TOLERANCE: f32 = 1.0 + 4.0 * f32::EPSILON;
 /// Most candidates a query probes: each costs, per missing term, a share of
 /// its superfile's reads of that term — the header and skip table once,
 /// then the blocks covering the candidates — so this bounds a query's
@@ -204,6 +207,8 @@ struct Slot {
     /// Whether the superfile was built at exactly the table's average, so
     /// its stored keys are the kernel's own `tf / (tf + norm)`.
     same_norms: bool,
+    /// The length norms its stored keys were computed at: its own average's.
+    key_norm: Arc<[f32; LEN_BUCKETS]>,
 }
 
 /// One phrase of the query: its members (term indices in order, a
@@ -318,6 +323,8 @@ pub(crate) async fn select<'a>(
         .map(|(i, e)| (e.superfile_id, i))
         .collect();
     let mut slots = Vec::with_capacity(kept.len());
+    let mut key_norms: HashMap<u32, Arc<[f32; LEN_BUCKETS]>> = HashMap::new();
+    key_norms.insert(query.table_avgdl.to_bits(), Arc::clone(&weights.norm));
     for (i, e) in kept.iter().enumerate() {
         let Some(baked) = baked_avgdl(e, query.column).filter(|b| *b > 0.0) else {
             return Ok(None);
@@ -338,6 +345,11 @@ pub(crate) async fn select<'a>(
             id_min: e.id_min,
             id_max: e.id_max,
             same_norms: baked == query.table_avgdl,
+            key_norm: Arc::clone(
+                key_norms
+                    .entry(baked.to_bits())
+                    .or_insert_with(|| norm_table(baked, query.params)),
+            ),
         });
     }
     let slot_for = |ordinal: u32| {
@@ -1156,20 +1168,35 @@ fn kth_lower_bound(
     *kth
 }
 
+/// The most occurrences of `head`'s term an unread document of bucket `len`
+/// in `slot` can hold: the largest tf whose key, at the norms the superfile
+/// was built at, stays under the head's unread bound, and at most `max_tf`.
+fn unread_tf(head: &Head, slot: &Slot, len: u8, max_tf: u32) -> u32 {
+    // A key recomputed from an average read back from the manifest may
+    // differ from the stored one by a rounding.
+    let cap = match slot.same_norms {
+        true => head.unread(),
+        false => head.unread() * KEY_TOLERANCE,
+    };
+    max_tf_under(cap, slot.key_norm[usize::from(len)], max_tf)
+}
+
 /// Per term of a slot, what an unread entry of the term can still
 /// contribute in bucket `len`: its head's unread key at the slot's scale,
 /// held under the term's largest tf in the bucket. Zero for a term the slot
 /// has no documents of, or none of that length.
-fn term_cap(head: &Head, scale_up: f32, weights: &Weights, len: u8) -> f32 {
+fn term_cap(head: &Head, slot: &Slot, weights: &Weights, len: u8) -> f32 {
     let idf = weights.idf[head.term];
-    let by_key = idf * head.unread() * scale_up * BOUND_SLACK;
-    match &head.buckets {
-        None => by_key,
+    let by_key = idf * head.unread() * slot.scale_up * BOUND_SLACK;
+    let max_tf = match &head.buckets {
+        None => TF_SEARCH_MAX,
         Some(buckets) => match buckets.get(len) {
-            None => 0.0,
-            Some(max_tf) => by_key.min(weights.contribution(head.term, max_tf, len) * BOUND_SLACK),
+            None => return 0.0,
+            Some(max_tf) => max_tf,
         },
-    }
+    };
+    let tf = unread_tf(head, slot, len, max_tf);
+    by_key.min(weights.contribution(head.term, tf, len) * BOUND_SLACK)
 }
 
 /// Per slot, `(lb, ub)`: the best lower bound among its candidates
@@ -1182,15 +1209,14 @@ fn slot_bounds(
     weights: &Weights,
     lb_slack: f32,
 ) -> Vec<(f32, f32)> {
-    // Slots of one layer read the same heads at the same scale, and those
-    // built at the table's own average are bounded exactly where the rest
-    // carry slack: their unseen bound is computed once per such shape.
-    let mut by_shape: HashMap<(&[Option<usize>], u32, bool), f32> = HashMap::new();
+    // Slots of one layer built at one average read the same heads at the
+    // same norms: their unseen bound is computed once per such shape.
+    let mut by_shape: HashMap<(&[Option<usize>], *const [f32; LEN_BUCKETS]), f32> = HashMap::new();
     let mut out: Vec<(f32, f32)> = slots
         .iter()
         .map(|slot| {
             let unseen = *by_shape
-                .entry((&slot.heads, slot.scale_up.to_bits(), slot.same_norms))
+                .entry((&slot.heads, Arc::as_ptr(&slot.key_norm)))
                 .or_insert_with(|| unseen_bound(slot, heads, weights));
             (f32::NEG_INFINITY, unseen)
         })
@@ -1231,7 +1257,6 @@ fn phrase_cap(
     seen: Option<&Candidate>,
 ) -> f32 {
     let norm = weights.norm[usize::from(len)];
-    let mut key = f32::INFINITY;
     let mut tf = BUCKET_MAX_LEN[usize::from(len)] / phrase.members.len().max(1) as u32;
     for &m in &phrase.members {
         if let Some(c) = seen
@@ -1251,27 +1276,17 @@ fn phrase_cap(
                 Some(max_tf) => max_tf,
             },
         };
-        match slot.same_norms {
-            // Stored keys are the kernel's: the member's unread documents
-            // hold at most the largest tf keying under its bound.
-            true => tf = tf.min(max_tf_under(head.unread(), norm, max_tf)),
-            false => {
-                key = key.min(head.unread() * slot.scale_up * BOUND_SLACK);
-                tf = tf.min(max_tf);
-            }
-        }
+        // The member's unread documents hold at most the largest tf keying
+        // under its bound at the norms the superfile was built at.
+        tf = tf.min(unread_tf(head, slot, len, max_tf));
     }
-    if tf == 0 || key <= 0.0 {
+    if tf == 0 {
         return 0.0;
     }
     // At most that many occurrences, scored as the kernel scores them, bit
     // for bit: a superfile whose phrase only ties the floor is settled by
     // `_id` order unopened.
-    let by_tf = score_with_dl_norm_k1(phrase.idf, tf, norm);
-    match key.is_finite() {
-        false => by_tf,
-        true => (by_tf * BOUND_SLACK).min(phrase.idf * key),
-    }
+    score_with_dl_norm_k1(phrase.idf, tf, norm)
 }
 
 /// Whether term `t` can still be found for a document of bucket `len` in
@@ -1308,7 +1323,7 @@ fn candidate_bound(slot: &Slot, heads: &[Head], weights: &Weights, c: &Candidate
             return f32::NEG_INFINITY;
         }
         if weights.scoring & (1 << t) != 0 {
-            ub += h.map_or(0.0, |h| term_cap(&heads[h], slot.scale_up, weights, c.len));
+            ub += h.map_or(0.0, |h| term_cap(&heads[h], slot, weights, c.len));
         }
     }
     for (phrase, known) in weights.phrases.iter().zip(&c.phrases) {
@@ -1348,9 +1363,8 @@ fn unseen_bound(slot: &Slot, heads: &[Head], weights: &Weights) -> f32 {
     }
     if let [h] = bare[..]
         && weights.phrases.is_empty()
-        && slot.same_norms
     {
-        return single_term_bound(&heads[h], weights);
+        return single_term_bound(&heads[h], slot, weights);
     }
     let mut best = f32::NEG_INFINITY;
     let mut caps = Vec::with_capacity(bare.len());
@@ -1368,7 +1382,7 @@ fn unseen_bound(slot: &Slot, heads: &[Head], weights: &Weights) -> f32 {
         caps.clear();
         idfs.clear();
         for &h in &bare {
-            let cap = term_cap(&heads[h], slot.scale_up, weights, len);
+            let cap = term_cap(&heads[h], slot, weights, len);
             if cap > 0.0 {
                 caps.push(cap);
                 idfs.push(weights.idf[heads[h].term]);
@@ -1391,13 +1405,12 @@ fn unseen_bound(slot: &Slot, heads: &[Head], weights: &Weights) -> f32 {
     best
 }
 
-/// The exact bound on an unread document of one term in a superfile whose
-/// stored keys are the kernel's own: per length bucket, the largest tf
-/// whose key stays under the head's unread bound, scored as the kernel
-/// scores it. A document that only ties the threshold then bounds at it
-/// bit for bit, and is settled by `_id` order unopened.
-fn single_term_bound(head: &Head, weights: &Weights) -> f32 {
-    let cap = head.unread();
+/// The exact bound on an unread document of one term: per length bucket,
+/// the largest tf whose key, at the norms its superfile was built at, stays
+/// under the head's unread bound, scored as the kernel scores it at the
+/// table's. A document that only ties the threshold then bounds at it bit
+/// for bit, and is settled by `_id` order unopened.
+fn single_term_bound(head: &Head, slot: &Slot, weights: &Weights) -> f32 {
     let mut best = f32::NEG_INFINITY;
     for len in 0..LEN_BUCKETS {
         let len = len as u8;
@@ -1408,7 +1421,7 @@ fn single_term_bound(head: &Head, weights: &Weights) -> f32 {
                 Some(tf) => tf,
             },
         };
-        let tf = max_tf_under(cap, weights.norm[usize::from(len)], max_tf);
+        let tf = unread_tf(head, slot, len, max_tf);
         if tf > 0 {
             best = best.max(weights.contribution(head.term, tf, len));
         }
@@ -1658,53 +1671,67 @@ mod tests {
         }
     }
 
-    /// A slot of one superfile reading `heads[0]` at scale 1.
-    fn slot(same_norms: bool) -> Slot {
+    /// A slot of one superfile reading `heads[0]`, built at `baked` under a
+    /// table whose average is `table`.
+    fn slot(baked: f32, table: f32) -> Slot {
         Slot {
             heads: vec![Some(0)],
-            scale_up: 1.0,
+            scale_up: (table / baked).max(1.0),
             deny: None,
             id_min: 0,
             id_max: 0,
-            same_norms,
+            same_norms: baked == table,
+            key_norm: norm_table(baked, Bm25Params::default()),
         }
     }
 
-    /// Two superfiles of one layer at the same scale, one built at the
-    /// table's average and one not, bound their unseen documents each by
-    /// its own rule, in either order: the exact one at the kernel's score
-    /// of a tie, so the `_id` order can settle it unopened, the other with
-    /// slack. A shared bound let the padded one stand for both.
+    /// Superfiles built at averages above, at and below the table's bound
+    /// an unread document of one term at the best score any document can
+    /// reach whose key, at its own build norms, stays under the head's
+    /// bound: a tie with the threshold bounds at it, and the `_id` order
+    /// settles it unopened.
     #[test]
-    fn a_superfile_at_the_tables_average_keeps_its_exact_bound_beside_one_that_is_not() {
+    fn a_superfile_bounds_its_unseen_documents_exactly_at_its_own_average() {
+        let table = 2.5;
         let weights = Weights {
             idf: vec![3.0],
-            norm: norm_table(2.5, Bm25Params::default()),
+            norm: norm_table(table, Bm25Params::default()),
             scoring: 1,
             required: 0,
             phrases: Vec::new(),
         };
-        let head = Head {
-            term: 0,
-            object: None,
-            base: 0,
-            levels: Vec::new(),
-            next: 0,
-            frontier: tf_factor(1, weights.norm[1]),
-            floor: tf_factor(1, weights.norm[1]),
-            buckets: None,
-        };
-        let heads = [head];
-        let exact = single_term_bound(&heads[0], &weights);
-        for order in [[false, true], [true, false]] {
-            let slots: Vec<Slot> = order.iter().map(|&same| slot(same)).collect();
-            let bounds = slot_bounds(&slots, &heads, &HashMap::new(), &weights, 1.0);
-            for (slot, (_, ub)) in slots.iter().zip(&bounds) {
-                match slot.same_norms {
-                    true => assert_eq!(*ub, exact, "{order:?}: the exact bound"),
-                    false => assert!(*ub > exact, "{order:?}: the padded bound"),
-                }
-            }
+        for baked in [2.0f32, 2.5, 3.1] {
+            let slot = slot(baked, table);
+            // The head's next entry: one occurrence in a one-token title.
+            let key = tf_factor(1, slot.key_norm[1]);
+            let head = Head {
+                term: 0,
+                object: None,
+                base: 0,
+                levels: Vec::new(),
+                next: 0,
+                frontier: key,
+                floor: key,
+                buckets: None,
+            };
+            let heads = [head];
+            let bounds = slot_bounds(
+                std::slice::from_ref(&slot),
+                &heads,
+                &HashMap::new(),
+                &weights,
+                1.0,
+            );
+            let cap = match baked == table {
+                true => key,
+                false => key * KEY_TOLERANCE,
+            };
+            let oracle = (0..LEN_BUCKETS as u8)
+                .flat_map(|len| (1..=TF_SEARCH_MAX.min(4096)).map(move |tf| (len, tf)))
+                .filter(|&(len, tf)| tf_factor(tf, slot.key_norm[usize::from(len)]) <= cap)
+                .map(|(len, tf)| weights.contribution(0, tf, len))
+                .fold(f32::NEG_INFINITY, f32::max);
+            assert_eq!(bounds[0].1, oracle, "built at {baked}");
         }
     }
 
