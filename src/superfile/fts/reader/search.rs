@@ -1849,8 +1849,10 @@ impl FtsReader {
         // that would release them. A term of one block or less scores from
         // its own documents' buckets when those can be read alone: on a
         // large superfile the whole array is megabytes for a handful of
-        // postings.
+        // postings. A weight from this file's own counts reads the array
+        // anyway.
         let few = match &source {
+            _ if !matches!(idf, TermIdf::Table(_)) => None,
             SingleSource::Inline { doc_id, .. } => self.few_norms(column_id, &[*doc_id]).await?,
             SingleSource::Bytes { bytes, short: true } => {
                 let mut buf_d = [0u32; BLOCK_LEN];
