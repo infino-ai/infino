@@ -228,6 +228,7 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(SWEEP_SEED);
         for factor in RESCORE_AVGDL_FACTORS {
             let scoring = ScoringView {
+                norms: None,
                 params: None,
                 avgdl: Some(("body", baked * factor)),
             };

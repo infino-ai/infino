@@ -113,6 +113,7 @@ const RANGED_KERNEL_POOL_MIN_TERMS: usize = OR_WINDOW_MIN_TERMS;
 const UNRANGED_KERNEL_POOL_MIN_MASS: u64 = 20_000;
 
 pub use crate::superfile::fts::reader::BoolMode;
+use crate::superfile::fts::reader::{CANDIDATE_MAX_POSTINGS, FEW_NORMS_MAX_DOCS};
 #[cfg(feature = "detailed-tracing")]
 use crate::utils::trace::OpOrigin;
 use crate::{
@@ -127,9 +128,9 @@ use crate::{
             bm25,
             bm25::Bm25Params,
             reader::{
-                Bm25SearchOptions, ClauseLists, ColumnLengthStats, FetchedTermMemo, GlobalTermIdf,
-                LiveFloor, MatchWork, OR_WINDOW_MIN_TERMS, OrCursorSet, PreparedClauses, QueryDict,
-                QueryIdf, ScoringView,
+                Bm25SearchOptions, CandidateNorms, ClauseLists, ColumnLengthStats, FetchedTermMemo,
+                GlobalTermIdf, LiveFloor, MatchWork, OR_WINDOW_MIN_TERMS, OrCursorSet,
+                PreparedClauses, QueryDict, QueryIdf, ScoringView,
             },
             tokenize::Phrase,
         },
@@ -1166,6 +1167,7 @@ pub(crate) fn competitive_floor(floor: f32, tolerance: f32) -> f32 {
 /// is scored at the table's.
 fn table_scoring(column: &str, params: Option<Bm25Params>, avgdl: Option<f32>) -> ScoringView<'_> {
     ScoringView {
+        norms: None,
         params,
         avgdl: avgdl.map(|avgdl| (column, avgdl)),
     }
@@ -1909,6 +1911,24 @@ impl SupertableReader {
         let must_ph_arc: Arc<Vec<Phrase<String>>> = Arc::new(must_phrases);
         let should_ph_arc: Arc<Vec<Phrase<String>>> = Arc::new(should_phrases);
         let neg_ph_arc: Arc<Vec<Phrase<String>>> = Arc::new(negative_phrases);
+        // A multi-term or phrase query with nothing negated and no exact
+        // count scores only what can reach the floor.
+        let candidate_shape = !exact_count
+            && neg_arc.is_empty()
+            && neg_ph_arc.is_empty()
+            && (must_arc.len() + should_arc.len() >= 2
+                || !must_ph_arc.is_empty()
+                || !should_ph_arc.is_empty());
+        let bare_counts: Arc<Vec<(String, u32)>> = Arc::new({
+            let mut counts: Vec<(String, u32)> = Vec::new();
+            for term in must_arc.iter().chain(should_arc.iter()) {
+                match counts.iter_mut().find(|(t, _)| t == term) {
+                    Some((_, n)) => *n += 1,
+                    None => counts.push((term.clone(), 1)),
+                }
+            }
+            counts
+        });
         let column_field_id = self.manifest().field_id(column);
         let column_arc = Arc::new(column_owned);
         // Exact count only: each superfile's row count, to turn its
@@ -1986,6 +2006,7 @@ impl SupertableReader {
             let must_ph_arc = Arc::clone(&must_ph_arc);
             let should_ph_arc = Arc::clone(&should_ph_arc);
             let neg_ph_arc = Arc::clone(&neg_ph_arc);
+            let bare_counts = Arc::clone(&bare_counts);
             let shared = Arc::clone(&shared);
             let cursor_sets = Arc::clone(&cursor_sets);
             let reader_pool = Arc::clone(&reader_pool);
@@ -2033,12 +2054,57 @@ impl SupertableReader {
                 // A resident superfile has every byte in memory: nothing to
                 // prewarm, and on a warm table a future per superfile is
                 // measurable against a query of a millisecond.
+                // One bare term with a block or less of postings here scores
+                // from those documents' buckets alone (see `few_norms`), so
+                // prewarming the whole length array would only add its bytes.
+                let few_postings = must_arc.len() + should_arc.len() == 1
+                    && neg_arc.is_empty()
+                    && must_ph_arc.is_empty()
+                    && should_ph_arc.is_empty()
+                    && neg_ph_arc.is_empty()
+                    && must_arc
+                        .iter()
+                        .chain(should_arc.iter())
+                        .next()
+                        .and_then(|term| index_locations.held(suid)?.df(term))
+                        .is_some_and(|df| df as usize <= FEW_NORMS_MAX_DOCS);
+                // Candidate norms are worth trying only where the term index
+                // says the postings to decode are few: all the query's terms,
+                // or a lone phrase's rarest word. Elsewhere the length array
+                // is prewarmed and read as before.
+                let candidate_cheap = candidate_shape
+                    && index_locations.held(suid).is_some_and(|held| {
+                        let df = |t: &str| held.df(t);
+                        let phrases: Vec<&Phrase<String>> =
+                            must_ph_arc.iter().chain(should_ph_arc.iter()).collect();
+                        let work = match (bare_counts.is_empty(), phrases.as_slice()) {
+                            (true, [phrase]) => phrase
+                                .terms
+                                .iter()
+                                .map(|t| df(t))
+                                .collect::<Option<Vec<u64>>>()
+                                .and_then(|dfs| dfs.into_iter().min()),
+                            _ => bare_counts
+                                .iter()
+                                .map(|(t, _)| t.as_str())
+                                .chain(
+                                    phrases
+                                        .iter()
+                                        .flat_map(|p| p.terms.iter().map(String::as_str)),
+                                )
+                                .map(df)
+                                .sum::<Option<u64>>(),
+                        };
+                        work.is_some_and(|w| w <= CANDIDATE_MAX_POSTINGS)
+                    });
                 let prewarm = async {
                     if r.parquet_bytes().is_some() {
                         return;
                     }
                     let scoring = async {
-                        if let Some(fts) = r.fts()
+                        if !few_postings
+                            && !candidate_cheap
+                            && let Some(fts) = r.fts()
                             && let Err(error) = fts.prewarm_scoring(&column_arc).await
                         {
                             debug!(%error, "prewarm of the scoring reads failed; the kernel reads them");
@@ -2064,6 +2130,43 @@ impl SupertableReader {
                 let floor = match exact_count {
                     true => f32::NEG_INFINITY,
                     false => shared.floor(),
+                };
+                // Few documents of a multi-term or phrase query can reach the
+                // floor: scoring reads only their length buckets (see
+                // `candidate_norms`). Anything it cannot read that way keeps
+                // the column's own norms.
+                let candidates = match r.fts() {
+                    Some(fts) if candidate_cheap && r.parquet_bytes().is_none() => {
+                        let bare: Vec<(&str, u32)> =
+                            bare_counts.iter().map(|(t, n)| (t.as_str(), *n)).collect();
+                        let phrases: Vec<&[String]> = must_ph_arc
+                            .iter()
+                            .chain(should_ph_arc.iter())
+                            .map(|p| p.terms.as_slice())
+                            .collect();
+                        fts.candidate_norms(
+                            &column_arc,
+                            &bare,
+                            &phrases,
+                            &global_idf,
+                            &scoring,
+                            floor,
+                            memo.as_deref(),
+                        )
+                        .await
+                        .unwrap_or_else(|error| {
+                            debug!(%error, "candidate norms unreadable; scoring reads the column's");
+                            None
+                        })
+                    }
+                    _ => None,
+                };
+                let scoring = ScoringView {
+                    norms: candidates.as_ref().map(|norms| CandidateNorms {
+                        column: &column_arc,
+                        norms,
+                    }),
+                    ..scoring
                 };
                 let (live_floor, allow) = {
                     // The set the merge read for this superfile, when every
@@ -2165,6 +2268,7 @@ impl SupertableReader {
                             let kernel_set = Arc::clone(set);
                             let kernel_stats = op_stats.clone();
                             let kernel_column = column_arc.clone();
+                            let kernel_candidates = candidates.clone();
                             run_on_pool_unless_blocking(
                                 Some(&reader_pool),
                                 "ranged fts kernel",
@@ -2176,7 +2280,15 @@ impl SupertableReader {
                                             start,
                                             end,
                                             floor,
-                                            &table_scoring(&kernel_column, bm25_params, avgdl),
+                                            &ScoringView {
+                                                norms: kernel_candidates.as_ref().map(|norms| {
+                                                    CandidateNorms {
+                                                        column: &kernel_column,
+                                                        norms,
+                                                    }
+                                                }),
+                                                ..table_scoring(&kernel_column, bm25_params, avgdl)
+                                            },
                                         )
                                     })
                                 },
@@ -2238,6 +2350,7 @@ impl SupertableReader {
                                     let kernel_reader = Arc::clone(&r);
                                     let kernel_stats = op_stats.clone();
                                     let kernel_column = column_arc.clone();
+                                    let kernel_candidates = candidates.clone();
                                     run_on_pool_unless_blocking(
                                         Some(&reader_pool),
                                         "exact-count fts kernel",
@@ -2245,11 +2358,19 @@ impl SupertableReader {
                                             op_stats::timed_kernel(&kernel_stats, || {
                                                 kernel_reader.run_prepared_with_count_in_blob_ids(
                                                     prep,
-                                                    &table_scoring(
-                                                        &kernel_column,
-                                                        bm25_params,
-                                                        avgdl,
-                                                    ),
+                                                    &ScoringView {
+                                                        norms: kernel_candidates.as_ref().map(
+                                                            |norms| CandidateNorms {
+                                                                column: &kernel_column,
+                                                                norms,
+                                                            },
+                                                        ),
+                                                        ..table_scoring(
+                                                            &kernel_column,
+                                                            bm25_params,
+                                                            avgdl,
+                                                        )
+                                                    },
                                                 )
                                             })
                                         },
@@ -2281,6 +2402,7 @@ impl SupertableReader {
                                     let kernel_reader = Arc::clone(&r);
                                     let kernel_stats = op_stats.clone();
                                     let kernel_column = column_arc.clone();
+                                    let kernel_candidates = candidates.clone();
                                     run_on_pool_unless_blocking(
                                         Some(&reader_pool),
                                         "un-ranged fts kernel",
@@ -2288,11 +2410,19 @@ impl SupertableReader {
                                             op_stats::timed_kernel(&kernel_stats, || {
                                                 kernel_reader.run_prepared_in_blob_ids(
                                                     prep,
-                                                    &table_scoring(
-                                                        &kernel_column,
-                                                        bm25_params,
-                                                        avgdl,
-                                                    ),
+                                                    &ScoringView {
+                                                        norms: kernel_candidates.as_ref().map(
+                                                            |norms| CandidateNorms {
+                                                                column: &kernel_column,
+                                                                norms,
+                                                            },
+                                                        ),
+                                                        ..table_scoring(
+                                                            &kernel_column,
+                                                            bm25_params,
+                                                            avgdl,
+                                                        )
+                                                    },
                                                 )
                                             })
                                         },

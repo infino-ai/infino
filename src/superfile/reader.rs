@@ -3376,6 +3376,7 @@ impl SuperfileReader {
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .as_ref()
+            && scoring.norms.is_none()
             && cached.matches(scoring)
         {
             return Ok(ScoredFts::Derived(Arc::clone(view)));
@@ -3384,6 +3385,9 @@ impl SuperfileReader {
             return Ok(ScoredFts::Baked(fts));
         };
         let view = Arc::new(view);
+        if scoring.norms.is_some() {
+            return Ok(ScoredFts::Derived(view));
+        }
         // Last writer wins. Two queries racing here derive the same view
         // from the same inputs — `with_scoring` is deterministic — so which
         // one lands is immaterial.
@@ -5150,6 +5154,7 @@ mod tests {
         });
         assert!(poisoner.is_err() && r.scored_fts.is_poisoned());
         let at = ScoringView {
+            norms: None,
             params: Some(Bm25Params::new(1.4, 0.6)),
             avgdl: None,
         };
@@ -5176,6 +5181,7 @@ mod tests {
         let a = Bm25Params::new(1.4, 0.6);
         let b = Bm25Params::new(0.9, 0.4);
         let at = |params| ScoringView {
+            norms: None,
             params: Some(params),
             avgdl: None,
         };
@@ -5216,6 +5222,7 @@ mod tests {
         let column = fts.fts_columns_config().next().expect("column");
         let (name, baked) = (column.name.clone(), column.avgdl());
         let at = |avgdl| ScoringView {
+            norms: None,
             params: None,
             avgdl: Some((name.as_str(), avgdl)),
         };

@@ -38,7 +38,8 @@ use super::{
     cursor::{BlockTableCache, CursorUse, TermCursor, TermMeta},
     filter::ExcludeFilter,
     metadata::{
-        ColumnLengthStats, ColumnMeta, FtsColumnConfig, LENGTH_ARRAY, OpenOptions, StoredNorms,
+        ColumnLengthStats, ColumnMeta, ColumnNorms, FewNorms, FtsColumnConfig, LENGTH_ARRAY,
+        OpenOptions, StoredNorms, build_lut,
     },
     phrase::{AnyCursor, PhraseCursor, distinct_members},
     scorers::{count_and_planned, cursors_max_doc, df_total},
@@ -95,6 +96,23 @@ pub(crate) struct ScoringView<'a> {
     /// The average document length for the one column named, as this file
     /// labels it.
     pub avgdl: Option<(&'a str, f32)>,
+    /// Norms that stand in for one column's own for this query alone, never
+    /// cached (see [`FtsReader::candidate_norms`]).
+    pub norms: Option<CandidateNorms<'a>>,
+}
+
+/// One query's candidate norms for one column, as this file labels it.
+/// Equal only to themselves.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CandidateNorms<'a> {
+    pub column: &'a str,
+    pub norms: &'a ColumnNorms,
+}
+
+impl PartialEq for CandidateNorms<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.column == other.column && std::ptr::eq(self.norms, other.norms)
+    }
 }
 
 /// Per-term table-wide BM25 idf, keyed by term.
@@ -715,6 +733,34 @@ pub(super) fn short_body_malformed() -> FtsError {
     ))
 }
 
+/// Most postings a term may have for its documents' buckets to be read
+/// one by one instead of with the whole array: one block's worth.
+pub(crate) const FEW_NORMS_MAX_DOCS: usize = crate::superfile::fts::posting::BLOCK_LEN;
+
+/// Documents whose buckets lie at most this many bytes apart are read
+/// together: one storage page.
+const FEW_NORMS_GAP_BYTES: usize = 4096;
+
+/// Most postings [`FtsReader::candidate_norms`] decodes in one superfile:
+/// all of a query's terms, or a lone phrase's rarest word. Past this the
+/// superfile reads its whole array, as it would have anyway.
+pub(crate) const CANDIDATE_MAX_POSTINGS: u64 = 1 << 16;
+
+/// Most of a query's terms one superfile may hold for its candidates to be
+/// bounded term by term.
+const CANDIDATE_MAX_TERMS: usize = 64;
+
+/// Most candidates one superfile may have for its buckets to be read alone.
+const CANDIDATE_MAX_DOCS: usize = 8192;
+
+/// Most bucket reads one superfile's candidates may take: past this, the
+/// whole array costs less than the requests.
+const CANDIDATE_MAX_RANGES: usize = 64;
+
+/// A candidate's bound is a sum of a few terms added in another order than
+/// the kernel adds them: widened so a rounding never drops a tie.
+const CANDIDATE_BOUND_SLACK: f32 = 1.0 + 1e-4;
+
 impl FtsReader {
     /// Push the buffers this reader's source keeps: on a lazy open, the
     /// header and doc-lengths directory it read.
@@ -764,15 +810,22 @@ impl FtsReader {
             };
             (params, avgdl)
         };
-        if self
-            .columns
-            .iter()
-            .all(|col| target(col) == (col.params, col.score_avgdl))
+        if scoring.norms.is_none()
+            && self
+                .columns
+                .iter()
+                .all(|col| target(col) == (col.params, col.score_avgdl))
         {
             return None;
         }
         let mut view = self.clone();
         for col in &mut view.columns {
+            if let Some(candidates) = scoring.norms
+                && candidates.column == col.name
+            {
+                col.base_norms = Arc::new(OnceLock::from(candidates.norms.clone()));
+                col.view_norms = Arc::new(OnceLock::new());
+            }
             let (params, avgdl) = target(col);
             if (params, avgdl) == (col.params, col.score_avgdl) {
                 continue;
@@ -792,6 +845,7 @@ impl FtsReader {
     #[cfg(test)]
     pub(crate) fn with_bm25_override(&self, params: bm25::Bm25Params) -> Self {
         let scoring = ScoringView {
+            norms: None,
             params: Some(params),
             avgdl: None,
         };
@@ -1634,6 +1688,290 @@ impl FtsReader {
         col.install_fetched_norms(&array)?;
         self.loads.loaded();
         Ok(())
+    }
+
+    /// The length buckets of `docs` (sorted, distinct) alone, read as a few
+    /// small ranges instead of the column's whole array. `None` when the
+    /// norms are already in memory, there are too many documents, or the
+    /// column cannot be read that way; the caller then loads the norms.
+    pub(super) async fn few_norms(
+        &self,
+        column_id: u32,
+        docs: &[u32],
+    ) -> Result<Option<FewNorms>, FtsError> {
+        let col = &self.columns[column_id as usize];
+        if col.norms_loaded() || docs.is_empty() || docs.len() > FEW_NORMS_MAX_DOCS {
+            return Ok(None);
+        }
+        let Some(buckets) = col.bucket_bytes() else {
+            return Ok(None);
+        };
+        Ok(self
+            .read_buckets(col, buckets, docs, usize::MAX)
+            .await?
+            .map(|pairs| col.few_norms(pairs)))
+    }
+
+    /// The stored buckets of `docs` (sorted, distinct), documents a page or
+    /// less apart read together; `None` when that takes more than
+    /// `max_ranges` reads.
+    async fn read_buckets(
+        &self,
+        col: &ColumnMeta,
+        buckets: Range<usize>,
+        docs: &[u32],
+        max_ranges: usize,
+    ) -> Result<Option<Vec<(u32, u8)>>, FtsError> {
+        let mut ranges: Vec<Range<usize>> = Vec::new();
+        for &doc in docs {
+            let at = buckets.start + doc as usize;
+            if at >= buckets.end {
+                return Err(FtsError::Read(ReadError::Malformed(format!(
+                    "doc {doc} past the bucket array of column '{}'",
+                    col.name
+                ))));
+            }
+            match ranges.last_mut() {
+                Some(r) if at < r.end + FEW_NORMS_GAP_BYTES => r.end = at + 1,
+                _ => ranges.push(at..at + 1),
+            }
+            if ranges.len() > max_ranges {
+                return Ok(None);
+            }
+        }
+        let fetched = futures::future::try_join_all(
+            ranges.iter().map(|r| self.source.range_async(r.clone())),
+        )
+        .await
+        .map_err(|e| FtsError::RangeFetch {
+            what: LENGTH_ARRAY,
+            source: e,
+        })?;
+        let mut pairs = Vec::with_capacity(docs.len());
+        let mut r = 0;
+        for &doc in docs {
+            let at = buckets.start + doc as usize;
+            while at >= ranges[r].end {
+                r += 1;
+            }
+            pairs.push((doc, fetched[r][at - ranges[r].start]));
+        }
+        Ok(Some(pairs))
+    }
+
+    /// Norms for one query in this superfile built from its candidates'
+    /// length buckets alone. A candidate is a document whose score, bounded
+    /// from its postings at the shortest length it can have, reaches
+    /// `floor`; it keeps its stored bucket. Every other document reads the
+    /// longest bucket, where it scores no higher than at its own length and
+    /// so stays under `floor` either way. `bare` pairs each bare term with
+    /// its count in the query. `None` when the norms are already in memory,
+    /// the column cannot be read that way, a term has no table idf, or the
+    /// candidates take too many reads.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn candidate_norms(
+        &self,
+        column: &str,
+        bare: &[(&str, u32)],
+        phrases: &[&[String]],
+        idf: &GlobalTermIdf,
+        scoring: &ScoringView<'_>,
+        floor: f32,
+        prefetched: Option<&FetchedTermMemo>,
+    ) -> Result<Option<ColumnNorms>, FtsError> {
+        if !floor.is_finite() {
+            return Ok(None);
+        }
+        let column_id = self.resolve_column_id(column)?;
+        let col = &self.columns[column_id as usize];
+        if col.norms_loaded() {
+            return Ok(None);
+        }
+        let (Some(buckets), Some(stored)) = (col.bucket_bytes(), col.stored_norms.as_deref())
+        else {
+            return Ok(None);
+        };
+        // The query's distinct terms, each bare one weighted as the kernel
+        // weights it (its idf times its count), phrase members at zero.
+        let mut terms: Vec<&str> = Vec::new();
+        let mut weights: Vec<f32> = Vec::new();
+        fn slot<'t>(t: &'t str, terms: &mut Vec<&'t str>, weights: &mut Vec<f32>) -> usize {
+            match terms.iter().position(|x| *x == t) {
+                Some(at) => at,
+                None => {
+                    terms.push(t);
+                    weights.push(0.0);
+                    terms.len() - 1
+                }
+            }
+        }
+        for &(term, count) in bare {
+            let Some(&w) = idf.get(term) else {
+                return Ok(None);
+            };
+            let at = slot(term, &mut terms, &mut weights);
+            weights[at] += w * count as f32;
+        }
+        let mut phrase_parts: Vec<(Vec<usize>, f32)> = Vec::with_capacity(phrases.len());
+        for phrase in phrases {
+            let mut members = Vec::new();
+            let mut weight = 0.0f32;
+            for term in phrase.iter() {
+                let Some(&w) = idf.get(term.as_str()) else {
+                    return Ok(None);
+                };
+                weight += w;
+                let at = slot(term, &mut terms, &mut weights);
+                if !members.contains(&at) {
+                    members.push(at);
+                }
+            }
+            phrase_parts.push((members, weight));
+        }
+        if terms.is_empty() {
+            return Ok(None);
+        }
+        let params = scoring.params.unwrap_or(col.params);
+        let avgdl = match scoring.avgdl {
+            Some((name, avgdl)) if name == col.name => avgdl,
+            _ => col.score_avgdl,
+        };
+        let lut = build_lut(avgdl, params);
+        let mut built = self
+            .build_term_cursors_opt(
+                column_id,
+                &terms,
+                QueryIdf::ThisFile,
+                CursorUse::Match,
+                None,
+                prefetched,
+                None,
+            )
+            .await?;
+        // Only the terms this superfile holds take part: a prefix query asks
+        // about hundreds of expansions, of which one superfile holds a few. A
+        // phrase missing a word here cannot match here.
+        let held: Vec<usize> = (0..terms.len()).filter(|&t| built[t].is_some()).collect();
+        if held.is_empty() || held.len() > CANDIDATE_MAX_TERMS {
+            return Ok(None);
+        }
+        let mut at = vec![usize::MAX; terms.len()];
+        for (i, &t) in held.iter().enumerate() {
+            at[t] = i;
+        }
+        let mut cursors: Vec<TermCursor> = held
+            .iter()
+            .map(|&t| built[t].take().expect("a held term has a cursor"))
+            .collect();
+        let weights: Vec<f32> = held.iter().map(|&t| weights[t]).collect();
+        let phrase_parts: Vec<(Vec<usize>, f32)> = phrase_parts
+            .into_iter()
+            .filter_map(|(members, w)| {
+                let members = members
+                    .iter()
+                    .map(|&t| (at[t] != usize::MAX).then_some(at[t]))
+                    .collect::<Option<Vec<usize>>>()?;
+                Some((members, w))
+            })
+            .collect();
+        if weights.iter().all(|w| *w == 0.0) && phrase_parts.is_empty() {
+            return Ok(None);
+        }
+        let nt = held.len();
+        let df: Vec<u64> = cursors.iter().map(|c| c.df).collect();
+        let mut tfs: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+        let lone_phrase = weights.iter().all(|w| *w == 0.0) && phrase_parts.len() == 1;
+        if lone_phrase {
+            // A match holds every word of the phrase: its documents are the
+            // rarest word's, each looked up in the others, so a stopword's
+            // millions of postings are skipped over rather than decoded.
+            let members = &phrase_parts[0].0;
+            let Some(&lead) = members.iter().min_by_key(|&&t| df[t]) else {
+                return Ok(None);
+            };
+            if df[lead] > CANDIDATE_MAX_POSTINGS {
+                return Ok(None);
+            }
+            let mut lead_docs: Vec<(u32, u32)> = Vec::with_capacity(df[lead] as usize);
+            let cursor = &mut cursors[lead];
+            while !cursor.is_exhausted() {
+                lead_docs.push((cursor.current_doc_id(), cursor.current_tf()));
+                cursor.next();
+            }
+            for (doc, tf) in lead_docs {
+                let mut row = vec![0; nt];
+                row[lead] = tf;
+                for &m in members.iter().filter(|&&m| m != lead) {
+                    let cursor = &mut cursors[m];
+                    cursor.skip_to(doc);
+                    if !cursor.is_exhausted() && cursor.current_doc_id() == doc {
+                        row[m] = cursor.current_tf();
+                    }
+                }
+                tfs.insert(doc, row);
+            }
+        } else {
+            if df.iter().sum::<u64>() > CANDIDATE_MAX_POSTINGS {
+                return Ok(None);
+            }
+            for (t, cursor) in cursors.iter_mut().enumerate() {
+                while !cursor.is_exhausted() {
+                    tfs.entry(cursor.current_doc_id())
+                        .or_insert_with(|| vec![0; nt])[t] = cursor.current_tf();
+                    cursor.next();
+                }
+            }
+        }
+        let mut docs: Vec<u32> = tfs
+            .iter()
+            .filter_map(|(&doc, tf)| {
+                // A document holds at least the query's occurrences.
+                let tokens: u32 = tf.iter().sum();
+                let norm = lut[usize::from(bm25::quantize_len(tokens.max(1)))];
+                let mut bound = 0.0f32;
+                for (t, &w) in weights.iter().enumerate() {
+                    if w > 0.0 && tf[t] > 0 {
+                        bound += bm25::score_with_dl_norm_k1(w, tf[t], norm);
+                    }
+                }
+                for (members, w) in &phrase_parts {
+                    let occurrences = members.iter().map(|&m| tf[m]).min().unwrap_or(0);
+                    if occurrences > 0 {
+                        bound += bm25::score_with_dl_norm_k1(*w, occurrences, norm);
+                    }
+                }
+                (bound * CANDIDATE_BOUND_SLACK >= floor).then_some(doc)
+            })
+            .collect();
+        if docs.len() > CANDIDATE_MAX_DOCS {
+            return Ok(None);
+        }
+        docs.sort_unstable();
+        let Some(pairs) = self
+            .read_buckets(col, buckets, &docs, CANDIDATE_MAX_RANGES)
+            .await?
+        else {
+            return Ok(None);
+        };
+        // One byte per document, megabytes on a large superfile, stored
+        // reversed in fresh anonymous memory: its zero pages already read the
+        // longest length, and only the pages holding a candidate are written.
+        // An allocator's zeroed block would be filled first.
+        let Ok(mut table) = memmap2::MmapMut::map_anon(self.n_docs as usize) else {
+            return Ok(None);
+        };
+        for (doc, bucket) in pairs {
+            table[doc as usize] = u8::MAX - bucket;
+        }
+        let Ok(table) = table.make_read_only() else {
+            return Ok(None);
+        };
+        Ok(Some(ColumnNorms::from_reversed(
+            Bytes::from_owner(table),
+            stored,
+            col.declared_params,
+            col.baked_avgdl,
+        )))
     }
 
     /// Async term-dictionary fetch for the query path. Resolves
@@ -5999,6 +6337,7 @@ mod tests {
             .into_iter()
             .map(|avgdl| {
                 r.with_scoring(&ScoringView {
+                    norms: None,
                     params: None,
                     avgdl: Some(("body", avgdl)),
                 })
@@ -6041,6 +6380,7 @@ mod tests {
         r.watch_loads(&listener);
         let view = r
             .with_scoring(&ScoringView {
+                norms: None,
                 params: None,
                 avgdl: Some(("body", VIEW_AVERAGE_LENGTHS[0])),
             })

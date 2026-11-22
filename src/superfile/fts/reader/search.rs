@@ -1846,8 +1846,29 @@ impl FtsReader {
         // that parks the runtime's own core on a storage read. This path had
         // no prewarm of its own, and two cold scored queries racing on one
         // column could park every core with nothing left to drive the read
-        // that would release them.
-        self.ensure_norms(column_id).await?;
+        // that would release them. A term of one block or less scores from
+        // its own documents' buckets when those can be read alone: on a
+        // large superfile the whole array is megabytes for a handful of
+        // postings.
+        let few = match &source {
+            SingleSource::Inline { doc_id, .. } => self.few_norms(column_id, &[*doc_id]).await?,
+            SingleSource::Bytes { bytes, short: true } => {
+                let mut buf_d = [0u32; BLOCK_LEN];
+                let mut buf_t = [0u32; BLOCK_LEN];
+                match decode_short(bytes.as_ref(), col_meta.positions, &mut buf_d, &mut buf_t) {
+                    Some(decoded) => self.few_norms(column_id, &buf_d[..decoded.n]).await?,
+                    None => None,
+                }
+            }
+            _ => None,
+        };
+        if few.is_none() {
+            self.ensure_norms(column_id).await?;
+        }
+        let dl_norm_of = |doc: u32| match &few {
+            Some(few) => few.get(doc),
+            None => col_meta.dl_norm_k1().get(doc),
+        };
         let term_bytes = match source {
             SingleSource::Absent => return Ok((Vec::new(), MatchWork::default(), 0)),
             SingleSource::Inline { doc_id, tf } => {
@@ -1873,7 +1894,7 @@ impl FtsReader {
                 {
                     return Ok((Vec::new(), MatchWork::default(), 0));
                 }
-                let dl_norm_k1 = col_meta.dl_norm_k1().get(doc_id);
+                let dl_norm_k1 = dl_norm_of(doc_id);
                 let score = bm25::score_with_dl_norm_k1(idf_weight, tf, dl_norm_k1);
                 if score <= floor_eff {
                     return Ok((Vec::new(), MatchWork::default(), 0));
@@ -1894,7 +1915,6 @@ impl FtsReader {
                     decode_short(bytes.as_ref(), col_meta.positions, &mut buf_d, &mut buf_t)
                         .ok_or_else(short_body_malformed)?;
                 let idf_weight = idf.resolve(col_meta, decoded.n as u64)?;
-                let dl_norm_k1 = col_meta.dl_norm_k1();
                 let mut heap: BinaryHeap<TopKEntry> =
                     BinaryHeap::with_capacity(k.min(decoded.n).max(1));
                 for j in 0..decoded.n {
@@ -1905,7 +1925,7 @@ impl FtsReader {
                         continue;
                     }
                     let score =
-                        bm25::score_with_dl_norm_k1(idf_weight, buf_t[j], dl_norm_k1.get(doc_id));
+                        bm25::score_with_dl_norm_k1(idf_weight, buf_t[j], dl_norm_of(doc_id));
                     if score <= floor_eff {
                         continue;
                     }
