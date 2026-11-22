@@ -61,6 +61,7 @@ use datafusion::{
         filter_pushdown::{
             ChildPushdownResult, FilterDescription, FilterPushdownPhase, FilterPushdownPropagation,
         },
+        limit::{GlobalLimitExec, LocalLimitExec},
         projection::ProjectionExec,
     },
 };
@@ -192,10 +193,7 @@ impl MeteredExec {
     /// from more partitions, and an exchange below this node would keep the
     /// fetch from reaching it.
     pub(crate) fn passing_limits(&self, input: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
-        Arc::new(MeteredExec {
-            limits: Limits::PassToRowFilter,
-            ..self.rewrapped(input)
-        })
+        Arc::new(self.rewrapped_with(input, Limits::PassToRowFilter))
     }
 
     /// Whether this meter passes a `LIMIT` to a scan that runs its whole
@@ -211,15 +209,48 @@ impl MeteredExec {
 
     /// [`Self::rewrap`], unboxed.
     fn rewrapped(&self, input: Arc<dyn ExecutionPlan>) -> MeteredExec {
+        self.rewrapped_with(input, self.limits)
+    }
+
+    /// As [`Self::rewrapped`], with `limits`. A scan given a plain `LIMIT`
+    /// ([`Limits::PassToRowFilter`]) keeps file order ([`in_file_order`]),
+    /// whatever a rewrite below this meter set: given the limit, the Parquet
+    /// reader would otherwise read only the row groups its statistics prove
+    /// match, skipping earlier ones, and which it skips depends on the limit,
+    /// so pages of one statement would skip or repeat rows.
+    fn rewrapped_with(&self, input: Arc<dyn ExecutionPlan>, limits: Limits) -> MeteredExec {
+        let input = match limits {
+            Limits::PassToRowFilter => in_file_order(input),
+            Limits::Pass | Limits::Refuse => input,
+        };
         MeteredExec {
             input,
             op_stats: self.op_stats.clone(),
             footers: self.footers.clone(),
             read_ahead: self.read_ahead.clone(),
-            limits: self.limits,
+            limits,
             note: self.note.clone(),
         }
     }
+}
+
+/// `plan` with the scan it is, or the scan under its limits, reading its
+/// files in order. DataFusion's `LimitPushdown` hands a fetch to the scan and
+/// resets its order, and under an `OFFSET` it leaves a `GlobalLimitExec` with
+/// the skip between this meter and the scan, so the order is set through it.
+fn in_file_order(plan: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+    let is_limit = plan.downcast_ref::<GlobalLimitExec>().is_some()
+        || plan.downcast_ref::<LocalLimitExec>().is_some();
+    if !is_limit {
+        return plan.with_preserve_order(true).unwrap_or(plan);
+    }
+    let [child] = plan.children()[..] else {
+        return plan;
+    };
+    let child = in_file_order(Arc::clone(child));
+    Arc::clone(&plan)
+        .with_new_children(vec![child])
+        .unwrap_or(plan)
 }
 
 impl DisplayAs for MeteredExec {
