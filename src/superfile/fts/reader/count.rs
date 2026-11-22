@@ -33,7 +33,7 @@ use crate::{
     superfile::{
         ReadError,
         error::FtsError,
-        format::fts::U32_BYTES,
+        format::fts::{DOC_LENGTH_STORED_MAX, U32_BYTES},
         fts::{
             analysis::chain_revision,
             bm25,
@@ -525,7 +525,9 @@ impl FtsReader {
         let current = chain_revision(col.stopwords, col.stemmer);
         let docs = match col.analysis_revision.is_some_and(|r| r >= current) && !docs.is_empty() {
             true => {
-                let want = bm25::quantize_len(u32::try_from(tokens.len()).unwrap_or(u32::MAX));
+                // The writer caps a stored length before bucketing it.
+                let len = u32::try_from(tokens.len()).unwrap_or(u32::MAX);
+                let want = bm25::quantize_len(len.min(DOC_LENGTH_STORED_MAX));
                 let ids: Vec<u32> = docs.iter().map(|d| d.get()).collect();
                 let buckets = self
                     .doc_buckets(column_id, &ids, CANDIDATE_MAX_RANGES)
@@ -2210,5 +2212,25 @@ mod tests {
             !readers[1].1.columns[0].norms_loaded(),
             "single buckets were read"
         );
+    }
+
+    /// A value longer than the longest stored length still finds the row
+    /// equal to it: both lengths are capped before bucketing.
+    #[tokio::test]
+    async fn exact_match_candidates_find_a_value_past_the_stored_length_cap() {
+        let len = DOC_LENGTH_STORED_MAX as usize + 1;
+        let value = vec!["x"; len].join(" ");
+        let (blob, _) = build_standard_blob(&[&value, "x"]);
+        let json = format!(
+            r#"[{{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75,"analysis_revision":{}}}]"#,
+            chain_revision(Stopwords::None, Stemmer::None)
+        );
+        let r = FtsReader::open(blob, &json).expect("open");
+        let tokens = vec!["x"; len];
+        let (rows, _) = r
+            .exact_match_candidates("body", &tokens, None, &QueryDict::default())
+            .await
+            .expect("candidates");
+        assert_eq!(rows, vec![0], "the one row equal to the value");
     }
 }
