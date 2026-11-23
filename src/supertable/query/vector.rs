@@ -99,19 +99,19 @@ use crate::{
     config,
     runtime_bridge::run_on_pool,
     runtime_metrics::op_stats::{self, OpStatsCollector},
-    storage::io_counters,
+    storage::{StorageProvider, io_counters},
     superfile::{
         SuperfileReader,
         error::ReadError,
         fts::reader::{BoolMode, QueryDict},
-        id_space::RowId,
+        id_space::row_bitmap,
         vector::{
             cell_posting::EncodedCellRow,
             distance::{
                 Metric, dequantize_sq16_adaptive_into, distance, normalize, relative_score_window,
             },
             flat::Sq4FlatIndex,
-            hnsw::{self, Fp32Scorer, HnswParams, Plane, Sq4Scorer, Sq16Scorer, encode_hnsw},
+            hnsw::{self, Fp32Scorer, Hnsw, HnswParams, Plane, Sq4Scorer, Sq16Scorer, encode_hnsw},
             layout::VectorLayout,
             reader::{
                 EMPTY_FILTER_SELECTIVITY_MULT, ProbeTally, ScanCandidate, ScanOutcome,
@@ -139,6 +139,8 @@ use crate::{
                 SCORE_COLUMN, id_score_batch, resolve_hits_named, take_rows_byte_source,
             },
             fine_graph_cache::{self, FineNodeKey, GraphRole},
+            fine_graph_follow,
+            fine_graph_store::GraphHead,
             fts::{memo_from_locations, memos_from_plan_locations},
             provider::prune_leaves_for_filters,
             prune::{PruneLeaf, select_superfiles},
@@ -1243,7 +1245,7 @@ fn union_cell_selection(grid: &[u32], fine: &[u32]) -> Vec<u32> {
 /// downstream read is byte-identical.
 pub(crate) struct CentroidRouterGraph {
     scorer: crate::superfile::vector::hnsw::Fp32Scorer,
-    graph: crate::superfile::vector::hnsw::Hnsw,
+    graph: Arc<crate::superfile::vector::hnsw::Hnsw>,
     /// `node_map[i] = (superfile index, per-superfile flat cluster)` for graph
     /// node `i`, or [`HOLE_NODE`] for a hole (a node no search returns).
     /// Resolves each selected node to its superfile + flat cluster.
@@ -1255,6 +1257,9 @@ pub(crate) struct CentroidRouterGraph {
     /// load. The query is transformed into the same space before the walk
     /// ([`gfc_prepare_for_metric`]), so build-time and query-time scoring agree.
     metric: Metric,
+    /// Set when the graph came from its stored base and steps, so the next
+    /// version can start from this one.
+    stored: Option<fine_graph_follow::Loaded>,
 }
 
 /// The [`CentroidRouterGraph::node_map`] entry of a hole.
@@ -1686,10 +1691,11 @@ fn build_centroid_router(
         .collect();
     Ok(CentroidRouterGraph {
         scorer,
-        graph,
+        graph: Arc::new(graph),
         node_map,
         live_nodes: keys.len(),
         metric,
+        stored: None,
     })
 }
 
@@ -1755,7 +1761,6 @@ fn decode_centroid_router_section(
     dim: usize,
     metric: Metric,
 ) -> Option<CentroidRouterGraph> {
-    use crate::superfile::vector::hnsw::{Fp32Scorer, Hnsw};
     if bytes.get(..CENTROID_ROUTER_SECTION_MAGIC.len())? != CENTROID_ROUTER_SECTION_MAGIC {
         return None;
     }
@@ -1784,12 +1789,52 @@ fn decode_centroid_router_section(
     pos += 8;
     let topology = bytes.get(pos..pos.checked_add(topo_len)?)?;
     let graph = Hnsw::from_bytes(topology)?;
-    if graph.len() != n {
+    let nodes: Vec<Option<(Uuid, u32)>> = persisted.into_iter().map(Some).collect();
+    assemble_centroid_router(
+        Arc::new(graph),
+        &nodes,
+        superfiles,
+        readers,
+        column,
+        column_id,
+        section,
+        dim,
+        metric,
+    )
+}
+
+/// The `(superfile_id, flat cluster)` of each node, `None` for a hole. Fails on
+/// a key with a cell, which a router graph never has.
+fn router_nodes(keys: &[Option<FineNodeKey>]) -> Option<Vec<Option<(Uuid, u32)>>> {
+    keys.iter()
+        .map(|key| match key {
+            Some((superfile, None, flat)) => Some(Some((*superfile, *flat))),
+            Some((_, Some(_), _)) => None,
+            None => Some(None),
+        })
+        .collect()
+}
+
+/// Build the router from a stored graph and the cluster behind each node
+/// (`None` for a hole). `None` if the graph and `nodes` disagree or a cluster is
+/// not in the current superfiles.
+fn assemble_centroid_router(
+    graph: Arc<Hnsw>,
+    nodes: &[Option<(Uuid, u32)>],
+    superfiles: &[Arc<SuperfileEntry>],
+    readers: &[Arc<SuperfileReader>],
+    column: &str,
+    column_id: FieldId,
+    section: &crate::supertable::slow_vector_state::CentroidSection,
+    dim: usize,
+    metric: Metric,
+) -> Option<CentroidRouterGraph> {
+    if graph.len() != nodes.len() {
         return None;
     }
     // Resolve each stable id to its CURRENT array index, and gather every
     // resident `(superfile_id, flat) -> normalized centroid` so the scorer can
-    // be assembled in persisted node order.
+    // be assembled in node order.
     let mut id_to_si: HashMap<Uuid, usize> = HashMap::with_capacity(superfiles.len());
     for (si, sf) in superfiles.iter().enumerate() {
         id_to_si.insert(sf.superfile_id, si);
@@ -1802,10 +1847,10 @@ fn decode_centroid_router_section(
         };
         let sfid = sf.superfile_id;
         // No superseded filter here: this fills a `(sfid, flat) -> vec` lookup
-        // and then assembles ONLY the persisted node-map entries, which the
-        // settle composed with superseded cells already excluded. Any extra
-        // superseded vec fetched into the map is simply never referenced; a
-        // split clears the section ref, so the persisted map is never stale.
+        // and then assembles ONLY the stored nodes, which the settle composed
+        // with superseded cells already excluded. Any extra superseded vec
+        // fetched into the map is simply never referenced; a split clears the
+        // section ref, so the stored nodes are never stale.
         for (flat, mut vec) in vr
             .global_fine_cluster_vectors(column, column_id, section, sfid, None)
             .ok()?
@@ -1814,11 +1859,19 @@ fn decode_centroid_router_section(
             cluster_vecs.insert((sfid, flat), vec);
         }
     }
-    // Assemble the scorer + in-memory node map in topology-node order, driven by
-    // the persisted map. A missing id or cluster (membership drifted) rejects.
-    let mut vecs: Vec<Vec<f32>> = Vec::with_capacity(n);
-    let mut node_map: Vec<(usize, u32)> = Vec::with_capacity(n);
-    for (sfid, flat) in &persisted {
+    // Assemble the scorer + in-memory node map in graph-node order. A missing
+    // id or cluster (membership drifted) rejects.
+    let mut vecs: Vec<Vec<f32>> = Vec::with_capacity(nodes.len());
+    let mut node_map: Vec<(usize, u32)> = Vec::with_capacity(nodes.len());
+    for (node, key) in nodes.iter().enumerate() {
+        if graph.is_hole(node as u32) != key.is_none() {
+            return None;
+        }
+        let Some((sfid, flat)) = key else {
+            vecs.push(vec![0.0; dim]);
+            node_map.push(HOLE_NODE);
+            continue;
+        };
         let si = *id_to_si.get(sfid)?;
         let vec = cluster_vecs.get(&(*sfid, *flat))?;
         if vec.len() != dim {
@@ -1835,7 +1888,48 @@ fn decode_centroid_router_section(
         node_map,
         live_nodes,
         metric,
+        stored: None,
     })
+}
+
+/// Load the router from stored bytes: either the whole router in one section,
+/// or the head of a graph stored as a base plus steps. `last` is the graph
+/// loaded before, if any.
+async fn centroid_router_from_stored(
+    bytes: &[u8],
+    storage: &dyn StorageProvider,
+    superfiles: &[Arc<SuperfileEntry>],
+    readers: &[Arc<SuperfileReader>],
+    column: &str,
+    column_id: FieldId,
+    section: &crate::supertable::slow_vector_state::CentroidSection,
+    dim: usize,
+    metric: Metric,
+    last: Option<&fine_graph_follow::Loaded>,
+) -> Option<CentroidRouterGraph> {
+    let Some(head) = GraphHead::from_bytes(bytes) else {
+        return decode_centroid_router_section(
+            bytes, superfiles, readers, column, column_id, section, dim, metric,
+        );
+    };
+    if head.role != GraphRole::Router || head.column != column_id || head.dim as usize != dim {
+        return None;
+    }
+    let loaded = fine_graph_follow::load(storage, &head, last).await?;
+    let nodes = router_nodes(&loaded.graph.keys)?;
+    let mut router = assemble_centroid_router(
+        Arc::clone(&loaded.graph.graph),
+        &nodes,
+        superfiles,
+        readers,
+        column,
+        column_id,
+        section,
+        dim,
+        metric,
+    )?;
+    router.stored = Some(loaded);
+    Some(router)
 }
 
 /// Build the centroid-router section bytes for the settled generation: open
@@ -1927,10 +2021,11 @@ pub(crate) fn build_centroid_router_from_cluster_vectors(
     let live_nodes = node_map.len();
     Ok(CentroidRouterGraph {
         scorer,
-        graph,
+        graph: Arc::new(graph),
         node_map,
         live_nodes,
         metric,
+        stored: None,
     })
 }
 
@@ -5472,8 +5567,10 @@ impl SupertableReader {
                 tracing::warn!(uri = reference.uri, %error, "centroid-router section fetch failed")
             })
             .ok()?;
-        decode_centroid_router_section(
+        let previous = manifest.options.centroid_router_cache.load_full();
+        centroid_router_from_stored(
             bytes.as_ref(),
+            storage.as_ref(),
             superfiles,
             readers,
             column,
@@ -5481,7 +5578,9 @@ impl SupertableReader {
             section,
             dim,
             metric,
+            previous.as_ref().and_then(|p| p.graph.stored.as_ref()),
         )
+        .await
     }
 
     /// Build the centroid-router graph for `column` from THIS reader's pinned
@@ -5648,10 +5747,11 @@ impl SupertableReader {
             column: column.to_string(),
             graph: CentroidRouterGraph {
                 scorer,
-                graph,
+                graph: Arc::new(graph),
                 node_map,
                 live_nodes: keys.len(),
                 metric,
+                stored: None,
             },
         });
         Some(FineAssignRouter {
@@ -7176,9 +7276,8 @@ impl SupertableReader {
         }
 
         // Manifest-only leaf survival: part-tier term bloom / range, then
-        // per-superfile summaries — no superfile reads. Intersect with the
-        // vector centroid prune so `token_match` opens only superfiles that
-        // could match the predicate *and* might hold vector-near rows.
+        // per-superfile summaries — no superfile reads — so `token_match`
+        // opens only superfiles that could match the predicate.
         let prune_leaves = [PruneLeaf::TermPresence {
             column: filter.column.to_owned(),
             terms: tokens.clone(),
@@ -7191,19 +7290,7 @@ impl SupertableReader {
                 survivors = tracing::field::Empty,
             )
         });
-        let surviving: HashSet<u128> = select_superfiles(manifest, &prune_leaves)
-            .instrument(select_span.clone())
-            .await?
-            .iter()
-            .map(|e| e.superfile_id.as_u128())
-            .collect();
-        if surviving.is_empty() {
-            select_span.record("survivors", 0);
-            trace::end(select_span);
-            return Ok(Vec::new());
-        }
-        let superfiles = self
-            .vector_pruned_superfiles_intersect(manifest, &surviving)
+        let superfiles = select_superfiles(manifest, &prune_leaves)
             .instrument(select_span.clone())
             .await?;
         select_span.record("survivors", superfiles.len());
@@ -7224,22 +7311,6 @@ impl SupertableReader {
 
         self.route_filtered_vector_hits_async(superfiles, allow, column, query, k, options)
             .await
-    }
-
-    /// All loaded superfile entries intersected with a manifest-only
-    /// survival set.
-    async fn vector_pruned_superfiles_intersect(
-        &self,
-        manifest: &ManifestSnapshot,
-        surviving: &HashSet<u128>,
-    ) -> Result<Vec<Arc<SuperfileEntry>>, QueryError> {
-        Ok(manifest
-            .get_all_superfiles_loaded()
-            .await
-            .map_err(QueryError::ManifestLoad)?
-            .into_iter()
-            .filter(|e| surviving.contains(&e.superfile_id.as_u128()))
-            .collect())
     }
 
     /// Resolve the text predicate (`filter_col` contains `tokens` under
@@ -7293,7 +7364,7 @@ impl SupertableReader {
                     stats.add_planned_read_ranges(work.planned_ranges);
                     stats.add_kernel_cpu_ns(work.kernel_cpu_ns);
                 }
-                Ok(docs.into_iter().map(RowId::get).collect::<RoaringBitmap>())
+                Ok(row_bitmap(&docs))
             }
         })
         .await
@@ -7311,16 +7382,18 @@ impl SupertableReader {
     /// resolved on the user table and kNN runs on the hidden index when
     /// drained (same routing as [`Self::vector_hits_filtered_async`]).
     ///
-    /// Manifest-only leaf survival runs before any superfile opens: bounded
-    /// FTS leaves are lowered to term-bloom prunes and intersected with the
-    /// vector centroid prune. The per-superfile allow-set (`plan.evaluate`)
-    /// then runs only over that intersection.
+    /// `superfiles` are those the `WHERE` `plan` is lowered from may hold a
+    /// match in ([`Self::superfiles_a_where_may_match`]), chosen once by the
+    /// caller before any superfile opens, however many times it widens the
+    /// search. The per-superfile allow-set (`plan.evaluate`) runs only over
+    /// those.
     pub(crate) async fn vector_hits_filtered_by_plan(
         &self,
         column: &str,
         query: &[f32],
         k: usize,
         options: VectorSearchOptions,
+        superfiles: &[Arc<SuperfileEntry>],
         plan: &CandidatePlan,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
         if k == 0 {
@@ -7330,26 +7403,14 @@ impl SupertableReader {
         // apply the cosine query calibration (#512) at this seam.
         let query = calibrated_query(self, column, query);
         let query: &[f32] = &query;
-        let manifest = self.manifest();
-        let superfiles = match plan.surviving_superfile_ids(manifest).await? {
-            None => manifest
-                .get_all_superfiles_loaded()
-                .await
-                .map_err(QueryError::ManifestLoad)?,
-            Some(surviving) if surviving.is_empty() => return Ok(Vec::new()),
-            Some(surviving) => {
-                self.vector_pruned_superfiles_intersect(manifest, &surviving)
-                    .await?
-            }
-        };
         if superfiles.is_empty() {
             return Ok(Vec::new());
         }
-        let allow = self.candidate_bitmaps_from_plan(&superfiles, plan).await?;
+        let allow = self.candidate_bitmaps_from_plan(superfiles, plan).await?;
         if allow.is_empty() {
             return Ok(Vec::new());
         }
-        self.route_filtered_vector_hits_async(superfiles, allow, column, query, k, options)
+        self.route_filtered_vector_hits_async(superfiles.to_vec(), allow, column, query, k, options)
             .await
     }
 
@@ -7389,30 +7450,42 @@ impl SupertableReader {
             .await
     }
 
+    /// The superfiles that may hold a row a SQL `WHERE` keeps, from statistics
+    /// of the pinned manifest alone, in one pass over two sets of leaves that
+    /// must all hold:
+    /// - those the SQL scan itself lowers `filters` to: scalar min/max, value
+    ///   sets, null counts, and the term blooms of equalities, `IN`s, `LIKE`s
+    ///   and any `OR` of those, so a `path = 'x'` on a column with no
+    ///   full-text index still skips every superfile whose `path` range
+    ///   excludes `x`;
+    /// - the term blooms of `plan`, lowered from the same `filters`, which ask
+    ///   for a value's words together: an `IN` of `'a b'` needs `a` and `b`
+    ///   in one superfile, where the leaves above ask for any of its words.
+    pub(crate) async fn superfiles_a_where_may_match(
+        &self,
+        filters: &[Expr],
+        plan: &CandidatePlan,
+    ) -> Result<Vec<Arc<SuperfileEntry>>, QueryError> {
+        let manifest = self.manifest();
+        let mut leaves = prune_leaves_for_filters(manifest, &manifest.scalar_schema(), filters);
+        leaves.extend(plan.survival_leaves());
+        select_superfiles(manifest, &leaves).await
+    }
+
     /// Resolve what a SQL `WHERE` pushed into a search table function
     /// admits — the superfiles that may hold a match and, under a bounded
     /// `plan`, the candidate rows in each. See [`CandidateScope`].
     ///
-    /// Superfile survival is the intersection of two gates on the pinned
-    /// manifest, both pure statistics reads: the prune leaves the SQL scan
-    /// itself lowers `filters` to (scalar min/max, value sets, `LIKE`
-    /// blooms and ranges, null counts — so a `path = 'x'` on a column with
-    /// no full-text index still skips every superfile whose `path` range
-    /// excludes `x`), and the plan's term-bloom survival. The candidate
-    /// rows are the plan's per-superfile evaluation, tombstones removed;
-    /// an [`Unbounded`](CandidatePlan::Unbounded) plan bounds no row and
-    /// leaves `allow` as `None`.
+    /// The superfiles are those [`Self::superfiles_a_where_may_match`]
+    /// keeps. The candidate rows are the plan's per-superfile evaluation,
+    /// tombstones removed; an [`Unbounded`](CandidatePlan::Unbounded) plan
+    /// bounds no row and leaves `allow` as `None`.
     pub(crate) async fn candidate_scope(
         &self,
         filters: &[Expr],
         plan: &CandidatePlan,
     ) -> Result<CandidateScope, QueryError> {
-        let manifest = self.manifest();
-        let leaves = prune_leaves_for_filters(manifest, &self.manifest().scalar_schema(), filters);
-        let mut superfiles = select_superfiles(manifest, &leaves).await?;
-        if let Some(surviving) = plan.surviving_superfile_ids(manifest).await? {
-            superfiles.retain(|e| surviving.contains(&e.superfile_id.as_u128()));
-        }
+        let superfiles = self.superfiles_a_where_may_match(filters, plan).await?;
         if superfiles.is_empty() {
             return Ok(CandidateScope::empty());
         }
@@ -9096,9 +9169,21 @@ mod tests {
     use rand::{RngExt, SeedableRng, rngs::StdRng};
     use roaring::RoaringBitmap;
 
-    use super::IndexOutcome;
+    use super::{IndexOutcome, fine_graph_follow};
     use crate::{
-        superfile::fts::reader::Bm25SearchOptions, supertable::manifest::ScalarStats,
+        superfile::{
+            fts::reader::Bm25SearchOptions,
+            vector::hnsw::{Fp32Scorer, Hnsw, HnswParams},
+        },
+        supertable::{
+            manifest::ScalarStats,
+            query::{
+                fine_graph_cache::{FineNodeKey, GraphRole},
+                fine_graph_store::{GraphBase, GraphHead, GraphStep, KeyedGraph},
+            },
+            schema::FieldId,
+            slow_vector_state::{CentroidSection, storage_path},
+        },
         test_helpers::fid,
     };
 
@@ -9125,10 +9210,11 @@ mod tests {
         admit_extension_round, admit_shortlist_window, allowed_cells, apply_width_pin,
         assemble_flat_sections, assemble_hnsw_sections, build_centroid_router,
         calibrated_query_for, cell_layout, cell_passes, cell_row_ranges,
-        cells_ranked_by_fine_score, decode_centroid_router_section, dispatch,
-        encode_centroid_router_section, filtered_k, filtered_route_k, free_column_slot,
-        free_columns_unambiguous, gate_fine_candidates_by_fragment, gfc_prepare_for_metric,
-        gfc_unit_normalize, hidden_hits_user_ids, hits_for_pass_rate, id_score_projection_indices,
+        cells_ranked_by_fine_score, centroid_router_from_stored, centroid_router_walk,
+        decode_centroid_router_section, dispatch, encode_centroid_router_section, filtered_k,
+        filtered_route_k, free_column_slot, free_columns_unambiguous,
+        gate_fine_candidates_by_fragment, gfc_prepare_for_metric, gfc_unit_normalize,
+        hidden_hits_user_ids, hits_for_pass_rate, id_score_projection_indices,
         id_values_from_batch, indexed_rows_outside, is_hidden_vector_manifest,
         law_floor_serve_selection, law_read_rows, lookup_user_placements_by_id,
         lookup_user_placements_in, matching_cell_clusters, matching_rows_by_cell, next_check_want,
@@ -11291,11 +11377,12 @@ mod tests {
     // the per-superfile bitmap); this direct test pins the
     // contract for the vector side.
 
+    use datafusion::logical_expr::Expr;
     use tempfile::TempDir;
     use uuid::Uuid;
 
     use crate::{
-        runtime_metrics::UsageMeter,
+        runtime_metrics::{UsageMeter, op_stats::with_op_stats},
         storage::{LocalFsStorageProvider, StorageProvider},
         supertable::{
             manifest::{SuperfileEntry, SuperfileUri},
@@ -12386,6 +12473,260 @@ mod tests {
                 "the superseded filter partitions the fine centroids exactly — a \
                  split's dead parent cells must not leak into the router graph"
             );
+        });
+    }
+
+    /// Commits before the first drain.
+    const STORED_GRAPH_FIRST_COMMITS: u64 = 20;
+    /// Commits before the second drain.
+    const STORED_GRAPH_NEXT_COMMITS: u64 = 2;
+    const STORED_GRAPH_ROWS_PER_COMMIT: usize = 32;
+    const STORED_GRAPH_DIM: usize = 16;
+    const STORED_GRAPH_FANOUT: usize = 3;
+
+    /// The centroids of one drain of the stored-graph test table.
+    struct StoredGraphFixture {
+        entries: Vec<Arc<SuperfileEntry>>,
+        readers: Vec<Arc<SuperfileReader>>,
+        section: Arc<CentroidSection>,
+        emb: FieldId,
+        centroids: HashMap<FineNodeKey, Vec<f32>>,
+    }
+
+    impl StoredGraphFixture {
+        async fn of(st: &Supertable) -> Self {
+            let outer = st.reader().expect("reader");
+            let hidden = outer.vector_index_table().expect("hidden index").clone();
+            let hr = hidden.reader().expect("hidden reader");
+            let section = hr.centroid_section().await.expect("centroid section");
+            let entries = hr
+                .manifest()
+                .get_all_superfiles_loaded()
+                .await
+                .expect("entries");
+            let readers = hr.open_superfile_readers(&entries).await.expect("readers");
+            let emb = hr.manifest().field_id("emb").expect("emb id");
+            let (vecs, walk) = centroid_router_walk(
+                &entries,
+                &readers,
+                "emb",
+                emb,
+                section.as_ref(),
+                Metric::Cosine,
+                None,
+            )
+            .expect("walk");
+            let centroids = walk
+                .iter()
+                .zip(vecs)
+                .map(|(&(si, flat), vec)| ((entries[si].superfile_id, None, flat), vec))
+                .collect();
+            Self {
+                entries,
+                readers,
+                section,
+                emb,
+                centroids,
+            }
+        }
+
+        fn scorer(&self, nodes: &[Option<FineNodeKey>]) -> Fp32Scorer {
+            let vectors: Vec<Vec<f32>> = nodes
+                .iter()
+                .map(|key| match key {
+                    Some(key) => self.centroids[key].clone(),
+                    None => vec![0.0; STORED_GRAPH_DIM],
+                })
+                .collect();
+            Fp32Scorer::from_vectors(&vectors, STORED_GRAPH_DIM, Metric::Cosine)
+        }
+
+        async fn load(
+            &self,
+            storage: &dyn StorageProvider,
+            bytes: &[u8],
+            last: Option<&fine_graph_follow::Loaded>,
+        ) -> Option<CentroidRouterGraph> {
+            centroid_router_from_stored(
+                bytes,
+                storage,
+                &self.entries,
+                &self.readers,
+                "emb",
+                self.emb,
+                self.section.as_ref(),
+                STORED_GRAPH_DIM,
+                Metric::Cosine,
+                last,
+            )
+            .await
+        }
+
+        /// What each test query selects from `router`, by cluster name.
+        fn picks(&self, router: &CentroidRouterGraph) -> Vec<Vec<(Uuid, u32)>> {
+            stored_graph_picks(&router.graph, &router.scorer, |node| {
+                let (si, flat) = router.node_map[node as usize];
+                (self.entries[si].superfile_id, flat)
+            })
+        }
+    }
+
+    fn stored_graph_picks(
+        graph: &Hnsw,
+        scorer: &Fp32Scorer,
+        name: impl Fn(u32) -> (Uuid, u32),
+    ) -> Vec<Vec<(Uuid, u32)>> {
+        (0..STORED_GRAPH_DIM)
+            .map(|at| {
+                let mut q = vec![0.0f32; STORED_GRAPH_DIM];
+                q[at] = 1.0;
+                let mut picks: Vec<(Uuid, u32)> = graph
+                    .search(scorer, &q, STORED_GRAPH_FANOUT, STORED_GRAPH_FANOUT * 2)
+                    .into_iter()
+                    .map(|(node, _)| name(node))
+                    .collect();
+                picks.sort_unstable();
+                picks
+            })
+            .collect()
+    }
+
+    /// A graph stored as a base plus a step loads as the writer's graph.
+    #[test]
+    fn a_stored_router_graph_loads_from_its_base_and_steps() {
+        let dim = STORED_GRAPH_DIM;
+        let schema = schema_with_vector(dim);
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(crate::storage::LocalFsStorageProvider::new(dir.path()).expect("storage"));
+        let st = Supertable::create(
+            options_one_superfile_per_commit(dim).with_storage(Arc::clone(&storage)),
+        )
+        .expect("create");
+        let commit = |from: u64, commits: u64| {
+            for c in from..from + commits {
+                let mut w = st.writer().expect("writer");
+                w.append(&build_vector_batch(
+                    c * STORED_GRAPH_ROWS_PER_COMMIT as u64,
+                    STORED_GRAPH_ROWS_PER_COMMIT,
+                    dim,
+                    schema.clone(),
+                ))
+                .expect("append");
+                w.commit().expect("commit");
+            }
+            st.drain_vectors_to_cells_sync().expect("drain");
+        };
+
+        block_on_mt(async {
+            let publish = |bytes: Vec<u8>| async {
+                let len = bytes.len() as u64;
+                let reference = write_resident_index_blob(storage.as_ref(), bytes)
+                    .await
+                    .expect("publish");
+                (reference.content_hash, len)
+            };
+
+            commit(0, STORED_GRAPH_FIRST_COMMITS);
+            let first = StoredGraphFixture::of(&st).await;
+            let mut first_keys: Vec<FineNodeKey> = first.centroids.keys().copied().collect();
+            first_keys.sort_unstable();
+            let first_nodes: Vec<Option<FineNodeKey>> =
+                first_keys.iter().copied().map(Some).collect();
+            let first_scorer = first.scorer(&first_nodes);
+            let first_graph = Hnsw::build_serial(&first_scorer, HnswParams::default());
+            let base = GraphBase::new(first_keys.clone(), first_graph.clone()).expect("base");
+            let (base_hash, base_len) = publish(base.to_bytes()).await;
+            let first_head = GraphHead::of_base(
+                GraphRole::Router,
+                first.emb,
+                dim as u32,
+                base_hash,
+                base_len,
+                &base,
+            );
+            let first_router = first
+                .load(storage.as_ref(), &first_head.to_bytes(), None)
+                .await
+                .expect("the base loads");
+            assert_eq!(
+                first.picks(&first_router),
+                stored_graph_picks(&first_graph, &first_scorer, |node| {
+                    let (superfile, _, flat) = first_keys[node as usize];
+                    (superfile, flat)
+                }),
+            );
+
+            commit(STORED_GRAPH_FIRST_COMMITS, STORED_GRAPH_NEXT_COMMITS);
+            let second = StoredGraphFixture::of(&st).await;
+            let gone: Vec<u32> = first_keys
+                .iter()
+                .enumerate()
+                .filter(|(_, key)| !second.centroids.contains_key(key))
+                .map(|(node, _)| node as u32)
+                .collect();
+            let mut added: Vec<FineNodeKey> = second
+                .centroids
+                .keys()
+                .filter(|key| !first.centroids.contains_key(key))
+                .copied()
+                .collect();
+            added.sort_unstable();
+            assert!(!added.is_empty(), "the second drain adds centroids");
+            let second_nodes: Vec<Option<FineNodeKey>> = first_keys
+                .iter()
+                .map(|key| second.centroids.contains_key(key).then_some(*key))
+                .chain(added.iter().copied().map(Some))
+                .collect();
+            let second_scorer = second.scorer(&second_nodes);
+            let second_graph = first_graph
+                .clone()
+                .unlink_nodes(&gone, &second_scorer)
+                .extend_serial(&second_scorer, HnswParams::default());
+            let step = GraphStep::between(
+                &KeyedGraph::new(first_nodes, first_graph),
+                &KeyedGraph::new(second_nodes.clone(), second_graph.clone()),
+            )
+            .expect("step");
+            let (step_hash, step_len) = publish(step.to_bytes()).await;
+            let head = first_head.with_step(step_hash, step_len, &step).to_bytes();
+            let expected = stored_graph_picks(&second_graph, &second_scorer, |node| {
+                let (superfile, _, flat) = second_nodes[node as usize].expect("a live node");
+                (superfile, flat)
+            });
+            let from_base = second
+                .load(storage.as_ref(), &head, None)
+                .await
+                .expect("the base and step load");
+            assert_eq!(second.picks(&from_base), expected);
+
+            // With the base gone, only a reader that has the first graph loads.
+            storage
+                .delete(&storage_path(&base_hash))
+                .await
+                .expect("delete the base");
+            let from_last = second
+                .load(storage.as_ref(), &head, first_router.stored.as_ref())
+                .await
+                .expect("the step loads");
+            assert_eq!(second.picks(&from_last), expected);
+            assert!(second.load(storage.as_ref(), &head, None).await.is_none());
+
+            // The old single-section form.
+            let built = build_centroid_router(
+                &second.entries,
+                &second.readers,
+                "emb",
+                second.emb,
+                second.section.as_ref(),
+                dim,
+                Metric::Cosine,
+                true,
+                None,
+            )
+            .expect("build");
+            let whole = encode_centroid_router_section(&built, &second.entries, dim);
+            assert!(second.load(storage.as_ref(), &whole, None).await.is_some());
         });
     }
 
@@ -15162,7 +15503,9 @@ mod tests {
     /// Filtered vector search driven by a lowered [`CandidatePlan`] — the
     /// boolean-plan fan-out (`candidate_bitmaps_from_plan`). The plan resolves
     /// the title predicate to per-superfile candidate bitmaps, then vector
-    /// ranking runs over the survivors.
+    /// ranking runs over the survivors. The superfiles searched are those the
+    /// `WHERE` may match in: an `IN` under an `AND` keeps only the superfile
+    /// holding one of its values.
     #[test]
     fn vector_hits_filtered_by_plan_returns_matching_docs() {
         use std::collections::HashSet;
@@ -15200,17 +15543,20 @@ mod tests {
         let storage: Arc<dyn StorageProvider> =
             Arc::new(crate::storage::LocalFsStorageProvider::new(dir.path()).expect("storage"));
         let st = Supertable::create(opts.with_storage(storage)).expect("create");
-        let mut w = st.writer().expect("writer");
-        w.append(&build_vector_batch(0, 32, dim, schema.clone()))
-            .expect("append");
-        w.commit().expect("commit");
-        drop(w);
+        // Two superfiles: titles `doc 0` to `doc 15`, then `doc 0` to `doc 2` again.
+        for (start, n) in [(0, 16), (16, 3)] {
+            let mut w = st.writer().expect("writer");
+            w.append(&build_vector_batch(start, n, dim, schema.clone()))
+                .expect("append");
+            w.commit().expect("commit");
+        }
         st.drain_vectors_to_cells_sync().expect("drain");
 
         let reader = st.reader().expect("reader");
         let manifest = reader.manifest();
         let fts_cols: HashSet<&str> = HashSet::from(["title"]);
-        let filters = [col("title").eq(lit("doc"))];
+        // A title one row holds whole: the superfile's statistics keep it, and its words admit it.
+        let filters = [col("title").eq(lit("doc 7"))];
         let plan = CandidatePlan::from_filters(
             &filters,
             &fts_cols,
@@ -15221,17 +15567,53 @@ mod tests {
 
         let mut q = vec![0.0f32; dim];
         q[0] = 1.0;
-        let hits = block_on(reader.vector_hits_filtered_by_plan(
-            "emb",
-            &q,
-            10,
-            VectorSearchOptions::new(),
-            &plan,
-        ))
-        .expect("plan-filtered vector search");
+        // The superfiles the `WHERE` may match in, chosen in one pass over the scan's leaves and
+        // the plan's term blooms together, then the search over them.
+        let search = |filters: &[Expr], plan: &CandidatePlan| {
+            with_op_stats(|| {
+                block_on(async {
+                    let superfiles = reader.superfiles_a_where_may_match(filters, plan).await?;
+                    reader
+                        .vector_hits_filtered_by_plan(
+                            "emb",
+                            &q,
+                            10,
+                            VectorSearchOptions::new(),
+                            &superfiles,
+                            plan,
+                        )
+                        .await
+                })
+            })
+        };
+        let (hits, stats) = search(&filters, &plan);
         assert!(
-            !hits.is_empty(),
+            !hits.expect("plan-filtered vector search").is_empty(),
             "the title-token plan must admit docs for vector ranking"
+        );
+        assert_eq!(
+            (stats.superfiles_considered, stats.presence_pruning_survived),
+            (2, 1),
+            "one pass, keeping the one superfile holding `doc 7`"
+        );
+
+        // An `IN` under an `AND`: the plan alone, with an `OR` inside, ruled out no superfile.
+        let filters = [col("title")
+            .in_list(vec![lit("doc 3"), lit("doc 5")], false)
+            .and(col("title").like(lit("doc%")))];
+        let plan = CandidatePlan::from_filters(
+            &filters,
+            &fts_cols,
+            &RangeColumns::new(),
+            &|col| manifest.try_fts_tokenizer_for(col),
+            &|col| manifest.field_id(col),
+        );
+        let (hits, stats) = search(&filters, &plan);
+        assert!(!hits.expect("IN-filtered vector search").is_empty());
+        assert_eq!(
+            (stats.superfiles_considered, stats.presence_pruning_survived),
+            (2, 1),
+            "only the first superfile holds `doc 3` or `doc 5`"
         );
     }
 

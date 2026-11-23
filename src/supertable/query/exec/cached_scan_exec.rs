@@ -88,9 +88,12 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef, SortOptions};
 use datafusion::{
-    arrow::compute::{
-        can_cast_types, cast_with_options, concat, filter, filter_record_batch, sort_to_indices,
-        take,
+    arrow::{
+        buffer::BooleanBuffer,
+        compute::{
+            can_cast_types, cast_with_options, concat, filter, filter_record_batch,
+            prep_null_mask_filter, sort_to_indices, take,
+        },
     },
     common::{
         Column as StatsColumn, ScalarValue, Statistics, config::ConfigOptions,
@@ -105,7 +108,10 @@ use datafusion::{
         utils::{collect_columns, reassign_expr_columns, split_conjunction},
     },
     physical_expr_adapter::PhysicalExprAdapterFactory,
-    physical_expr_common::physical_expr::{snapshot_generation, snapshot_physical_expr},
+    physical_expr_common::{
+        physical_expr::{snapshot_generation, snapshot_physical_expr},
+        utils::scatter,
+    },
     physical_optimizer::pruning::PruningPredicate,
     physical_plan::{
         DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
@@ -318,6 +324,11 @@ pub(crate) struct CachedScanExec {
     /// Set when a sort on `_id` was pushed down: the rows are read by id
     /// block ([`IdOrder`]).
     id_order: Option<IdOrder>,
+    /// Set under a `LIMIT` with no `ORDER BY`: each partition reads one run
+    /// of consecutive row groups instead of every `partitions`-th, so the
+    /// partitions handed on one after another give the rows in file order
+    /// ([`Self::in_file_order`]).
+    in_file_order: bool,
     /// The rows of the units read ([`ROWS_READ`]), the row groups decoded
     /// ([`ROW_GROUPS_DECODED`]), the row groups skipped
     /// ([`ROW_GROUPS_SKIPPED`]) and the rows dropped ([`ROWS_DROPPED`]), for
@@ -997,6 +1008,8 @@ impl CachedScanExec {
     /// - the columns it would decode don't fit the cache ([`decoded_bytes`]):
     ///   kept, they would push each other out, and every run would decode
     ///   them all again where the Parquet scan decodes only what it reads.
+    ///   Row groups kept only because a scan read some of their rows before
+    ///   are read in part again first, and don't count.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn try_new(
         schema: SchemaRef,
@@ -1022,6 +1035,8 @@ impl CachedScanExec {
         let schema_id = manifest.table_schema().schema_id();
         let mut units = Vec::new();
         let mut pruned = 0;
+        // Units kept only because a scan read some of their rows before.
+        let mut promoted = Vec::new();
         for file in files.into_iter().map(Arc::new) {
             let plan = filter.as_ref().and_then(|filter| filter.plan(&file));
             let mut first = 0u32;
@@ -1045,13 +1060,16 @@ impl CachedScanExec {
                 if chosen == 0 {
                     continue;
                 }
-                let keep = file.selected.is_none()
-                    || chosen.saturating_mul(2) >= live
+                let whole = file.selected.is_none() || chosen.saturating_mul(2) >= live;
+                let keep = whole
                     || cache.read_in_part_before(&RowGroupKey {
                         uri: file.uri,
                         schema_id,
                         row_group,
                     });
+                if !whole && keep {
+                    promoted.push(units.len());
+                }
                 units.push(RowGroupUnit {
                     file: Arc::clone(&file),
                     row_group,
@@ -1063,13 +1081,22 @@ impl CachedScanExec {
             }
         }
         let dictionaries = dictionary_columns(&manifest, &schema, &units);
-        if decoded_bytes(
-            units.iter().filter(|unit| unit.keep),
-            &schema,
-            &dictionaries,
-        ) > cache.max_bytes()
-        {
-            return None;
+        let fits = |units: &[RowGroupUnit]| {
+            decoded_bytes(
+                units.iter().filter(|unit| unit.keep),
+                &schema,
+                &dictionaries,
+            ) <= cache.max_bytes()
+        };
+        // Row groups a scan read some rows of before don't need keeping:
+        // their chosen rows are read from the pages again, as the first time.
+        if !fits(&units) {
+            for &i in &promoted {
+                units[i].keep = false;
+            }
+            if !fits(&units) {
+                return None;
+            }
         }
         let partitions = target_partitions.clamp(1, units.len().max(1));
         let properties = plan_properties(&schema, partitions);
@@ -1094,14 +1121,38 @@ impl CachedScanExec {
             live: None,
             reads_best_first: false,
             id_order: None,
+            in_file_order: false,
             metrics: ExecutionPlanMetricsSet::new(),
         })
+    }
+
+    /// Whether every file this scan reads gives only the rows an index chose
+    /// in it, as for a top-k the range index or its walk answered.
+    pub(crate) fn reads_chosen_rows(&self) -> bool {
+        !self.units.is_empty() && self.units.iter().all(|unit| unit.file.selected.is_some())
     }
 
     /// The Parquet scan this one stands in for, metered as the provider
     /// builds it.
     pub(crate) fn parquet(&self) -> &Arc<dyn ExecutionPlan> {
         &self.parquet
+    }
+
+    /// This scan with each partition reading one run of consecutive row
+    /// groups, in the order the files and their row groups were listed:
+    /// partition 0 the first run, partition 1 the next. A gather that hands
+    /// the partitions on one after another then gives the rows in file
+    /// order, the same on every run. `None` when the scan reads for a sort,
+    /// best row groups first or by id block, which is not file order.
+    pub(crate) fn in_file_order(&self) -> Option<Arc<dyn ExecutionPlan>> {
+        if self.reads_best_first || self.id_order.is_some() {
+            return None;
+        }
+        Some(Arc::new(Self {
+            in_file_order: true,
+            metrics: ExecutionPlanMetricsSet::new(),
+            ..self.clone()
+        }))
     }
 
     /// This scan reading by id block ([`IdOrder`]) for a sort on its output
@@ -1770,7 +1821,7 @@ fn passing_rows(
         return live;
     }
     let last = conjuncts.len() - 1;
-    let mut passing = live.unwrap_or_else(|| BooleanArray::from(vec![true; rows]));
+    let mut passing = live.unwrap_or_else(|| BooleanArray::new(BooleanBuffer::new_set(rows), None));
     for (at, (conjunct, used, on_dictionary)) in conjuncts.iter().enumerate() {
         if at == last && !on_dictionary {
             break;
@@ -1819,22 +1870,20 @@ fn dictionary_conjunct(
             kept.data_type()
         )));
     };
-    let keys = dictionary.keys();
+    // The passing rows' keys, in order.
+    let keys = filter(dictionary.keys(), passing)?;
+    let keys = keys.as_primitive::<Int16Type>();
     // Each value a passing row uses, once, and where it sits among them.
     let mut slot: Vec<Option<usize>> = vec![None; dictionary.values().len()];
     let mut used: Vec<u32> = Vec::new();
-    let mut null_row = false;
-    for row in passing.values().set_indices() {
-        if keys.is_null(row) {
-            null_row = true;
-            continue;
-        }
-        let value = keys.value(row) as usize;
+    for value in keys.iter().flatten() {
+        let value = value as usize;
         if slot[value].is_none() {
             slot[value] = Some(used.len());
             used.push(value as u32);
         }
     }
+    let null_row = keys.null_count() > 0;
     let one = Arc::new(Schema::new(vec![field.clone().with_nullable(true)]));
     let expr = reassign_expr_columns(Arc::clone(conjunct), &one)?;
     let check = |values: ArrayRef| -> DfResult<BooleanArray> {
@@ -1855,21 +1904,19 @@ fn dictionary_conjunct(
         }
         false => false,
     };
-    let mut next = BooleanBufferBuilder::new(passing.len());
-    next.append_n(passing.len(), false);
-    for row in passing.values().set_indices() {
-        let passes = match keys.is_null(row) {
-            true => on_null,
-            false => {
-                let at = slot[keys.value(row) as usize].expect("a passing row's value is checked");
-                on_values.is_valid(at) && on_values.value(at)
-            }
-        };
-        if passes {
-            next.set_bit(row, true);
-        }
-    }
-    Ok(BooleanArray::new(next.finish(), None))
+    // Each dictionary value's answer (false for a value no passing row
+    // uses), taken for each passing row by its key. A row with no key gets
+    // the null's answer.
+    let answers: BooleanArray = slot
+        .iter()
+        .map(|at| Some(at.is_some_and(|at| on_values.is_valid(at) && on_values.value(at))))
+        .collect();
+    let on_rows = boolean(take(&answers, keys, None)?)?;
+    let on_rows = match (on_null, on_rows.nulls()) {
+        (true, Some(present)) => BooleanArray::new(on_rows.values() | &!present.inner(), None),
+        _ => on_rows,
+    };
+    in_place(passing, &on_rows)
 }
 
 /// The rows of `passing` that pass `conjunct`, which reads the columns
@@ -1890,8 +1937,10 @@ fn conjunct_on_rows(
     let arrays = used
         .iter()
         .map(|&i| {
-            let rows = filter(columns[i].as_ref(), passing)?;
-            as_scanned(rows, schema.field(i).data_type())
+            as_scanned(
+                filter(columns[i].as_ref(), passing)?,
+                schema.field(i).data_type(),
+            )
         })
         .collect::<DfResult<Vec<_>>>()?;
     let n = passing.true_count();
@@ -1902,14 +1951,18 @@ fn conjunct_on_rows(
     )?;
     let expr = reassign_expr_columns(Arc::clone(conjunct), &projected)?;
     let checked = boolean(expr.evaluate(&batch)?.into_array(n)?)?;
-    let mut next = BooleanBufferBuilder::new(passing.len());
-    next.append_n(passing.len(), false);
-    for (at, row) in passing.values().set_indices().enumerate() {
-        if checked.is_valid(at) && checked.value(at) {
-            next.set_bit(row, true);
-        }
-    }
-    Ok(BooleanArray::new(next.finish(), None))
+    in_place(passing, &checked)
+}
+
+/// The rows of `passing` whose answer in `checked`, which holds one per
+/// passing row in order, is true. A null answer does not pass. Never null.
+fn in_place(passing: &BooleanArray, checked: &BooleanArray) -> DfResult<BooleanArray> {
+    // Rows that don't pass come back null, as do null answers.
+    let placed = boolean(scatter(passing, checked)?)?;
+    Ok(match placed.null_count() {
+        0 => placed,
+        _ => prep_null_mask_filter(&placed),
+    })
 }
 
 /// `array` as the booleans a predicate gives.
@@ -1981,6 +2034,9 @@ impl DisplayAs for CachedScanExec {
         if let Some(order) = &self.id_order {
             let direction = if order.descending { "desc" } else { "asc" };
             write!(f, ", id_blocks={direction}")?;
+        }
+        if self.in_file_order {
+            write!(f, ", file_order")?;
         }
         Ok(())
     }
@@ -2137,6 +2193,7 @@ impl ExecutionPlan for CachedScanExec {
             )));
         }
         let partitions = self.partitions;
+        let in_file_order = self.in_file_order;
         let all = Arc::clone(&self.units);
         // By id block only under a filter that tightens: without one, no
         // block is skipped, and the row groups read in fewer, larger batches.
@@ -2175,6 +2232,11 @@ impl ExecutionPlan for CachedScanExec {
                     future::ready(next.map(|unit| (unit, id_read)))
                 })
                 .boxed(),
+                None if in_file_order => {
+                    let run = |p: usize| p * all.len() / partitions;
+                    let mine = all[run(partition)..run(partition + 1)].to_vec();
+                    stream::iter(mine).boxed()
+                }
                 None => {
                     let mine: Vec<RowGroupUnit> = all
                         .iter()
@@ -2350,11 +2412,20 @@ pub(crate) fn has_columns(schema: &Schema) -> bool {
 mod tests {
     use std::collections::BTreeMap;
 
-    use arrow::util::pretty::pretty_format_batches;
-    use arrow_array::{Array, Decimal128Array, Int64Array, LargeStringArray, StringArray};
+    use arrow::{compute::cast, util::pretty::pretty_format_batches};
+    use arrow_array::{
+        Array, Decimal128Array, DictionaryArray, Int16Array, Int64Array, LargeStringArray,
+        StringArray,
+    };
     use arrow_schema::{DataType, Field};
     use bytes::Bytes;
-    use datafusion::prelude::{col, lit};
+    use datafusion::{
+        common::DFSchema,
+        execution::context::ExecutionProps,
+        logical_expr::{Expr, cast as cast_to},
+        physical_expr::create_physical_expr,
+        prelude::{col, lit},
+    };
     use tempfile::TempDir;
 
     use super::*;
@@ -2589,6 +2660,158 @@ mod tests {
                 .any(|line| line.contains("CachedScanExec") && line.contains("predicate=")),
             "the scan checks the WHERE:\n{plan}"
         );
+    }
+
+    /// The values the kernel test's dictionary holds: [`NOT_A_NUMBER`] fails
+    /// a cast to a number.
+    const KERNEL_VALUES: [&str; 4] = ["1", "2", "3", NOT_A_NUMBER];
+    /// The kernel test's keys, before the slice; `None` is a row with no key.
+    const KERNEL_KEYS: [Option<i16>; 12] = [
+        Some(3),
+        Some(0),
+        Some(1),
+        None,
+        Some(0),
+        Some(2),
+        None,
+        Some(3),
+        Some(1),
+        Some(2),
+        Some(0),
+        Some(1),
+    ];
+    /// The kernel test's other column, before the slice: a number or null.
+    const KERNEL_NUMBERS: [Option<i64>; 12] = [
+        Some(9),
+        None,
+        Some(5),
+        Some(1),
+        None,
+        Some(7),
+        Some(3),
+        Some(8),
+        None,
+        Some(6),
+        Some(2),
+        Some(4),
+    ];
+    /// Where the kernel test's slice starts, so its keys and nulls start
+    /// mid-buffer.
+    const KERNEL_OFFSET: usize = 2;
+    /// Rows in the kernel test's slice.
+    const KERNEL_ROWS: usize = 10;
+    /// The rows still passing in the kernel test's partial case. The one row
+    /// holding [`NOT_A_NUMBER`] (5) does not pass, nor does one with no key (4).
+    const KERNEL_PASSING: [bool; KERNEL_ROWS] = [
+        true, true, false, true, false, false, true, true, true, false,
+    ];
+    /// The number `n > ` compares with in the kernel test.
+    const KERNEL_NUMBER_BOUND: i64 = 4;
+    /// The number a cast `name` is compared with in the kernel test.
+    const KERNEL_CAST_BOUND: i32 = 1;
+
+    /// `name` as a sliced dictionary with null keys, and `n` as numbers with
+    /// nulls, with the schema the scan reads them as.
+    fn kernel_columns() -> (SchemaRef, Vec<ArrayRef>) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("n", DataType::Int64, true),
+        ]));
+        let dictionary = DictionaryArray::<Int16Type>::try_new(
+            Int16Array::from(KERNEL_KEYS.to_vec()),
+            Arc::new(StringArray::from(KERNEL_VALUES.to_vec())),
+        )
+        .expect("dictionary");
+        let names: ArrayRef = Arc::new(dictionary.slice(KERNEL_OFFSET, KERNEL_ROWS));
+        let numbers: ArrayRef =
+            Arc::new(Int64Array::from(KERNEL_NUMBERS.to_vec()).slice(KERNEL_OFFSET, KERNEL_ROWS));
+        (schema, vec![names, numbers])
+    }
+
+    /// The rows of `passing` that pass `conjunct`, checked one row at a time
+    /// on the columns as the scan reads them: a null answer does not pass,
+    /// and a row that does not pass is never checked.
+    fn passing_row_by_row(
+        conjunct: &Arc<dyn PhysicalExpr>,
+        schema: &SchemaRef,
+        columns: &[ArrayRef],
+        passing: &BooleanArray,
+    ) -> DfResult<Vec<bool>> {
+        let scanned = columns
+            .iter()
+            .zip(schema.fields())
+            .map(|(column, field)| cast(column, field.data_type()))
+            .collect::<Result<Vec<_>, _>>()?;
+        (0..passing.len())
+            .map(|row| {
+                if !passing.value(row) {
+                    return Ok(false);
+                }
+                let one = scanned.iter().map(|column| column.slice(row, 1)).collect();
+                let batch = RecordBatch::try_new(Arc::clone(schema), one)?;
+                let answer = boolean(conjunct.evaluate(&batch)?.into_array(1)?)?;
+                Ok(answer.is_valid(0) && answer.value(0))
+            })
+            .collect()
+    }
+
+    /// `dictionary_conjunct` and `conjunct_on_rows` give the rows a check of
+    /// each passing row on its own gives, on a sliced dictionary with null
+    /// keys: with every row passing (where a null answer must not pass) and
+    /// with some, where a value only the other rows use, which fails a cast,
+    /// is never checked. A conjunct that fails on a passing row fails both.
+    #[test]
+    fn conjunct_kernels_answer_as_a_check_of_each_passing_row() {
+        let (schema, columns) = kernel_columns();
+        let df_schema = DFSchema::try_from(Arc::clone(&schema)).expect("schema");
+        let conjuncts: Vec<Expr> = vec![
+            col("name").eq(lit(KERNEL_VALUES[1])),
+            col("name").not_eq(lit(KERNEL_VALUES[1])),
+            col("name").is_null(),
+            col("name").is_not_null(),
+            cast_to(col("name"), DataType::Int32).gt(lit(KERNEL_CAST_BOUND)),
+            col("n").gt(lit(KERNEL_NUMBER_BOUND)),
+        ];
+        let every_row = BooleanArray::new(BooleanBuffer::new_set(KERNEL_ROWS), None);
+        let some_rows = BooleanArray::from(KERNEL_PASSING.to_vec());
+        for conjunct in &conjuncts {
+            let expr =
+                create_physical_expr(conjunct, &df_schema, &ExecutionProps::new()).expect("expr");
+            let used: Vec<usize> = collect_columns(&expr)
+                .iter()
+                .map(|column| column.index())
+                .collect();
+            for passing in [&every_row, &some_rows] {
+                let expected = passing_row_by_row(&expr, &schema, &columns, passing);
+                let case = format!("{conjunct} on {passing:?}");
+                let on_rows = conjunct_on_rows(&expr, &schema, &columns, &used, passing);
+                let mut answers = vec![on_rows];
+                if let [only] = used.as_slice()
+                    && kept_as_dictionary(&columns[*only], schema.field(*only))
+                {
+                    answers.push(dictionary_conjunct(
+                        &expr,
+                        schema.field(*only),
+                        &columns[*only],
+                        passing,
+                    ));
+                }
+                for answer in answers {
+                    match &expected {
+                        Ok(expected) => {
+                            let answer = answer.expect(&case);
+                            assert_eq!(answer.null_count(), 0, "{case}");
+                            assert_eq!(
+                                &answer.iter().flatten().collect::<Vec<_>>(),
+                                expected,
+                                "{case}"
+                            );
+                        }
+                        Err(_) => assert!(answer.is_err(), "{case}"),
+                    }
+                }
+            }
+        }
     }
 
     /// A string column of few values is kept as a dictionary of `Int16`

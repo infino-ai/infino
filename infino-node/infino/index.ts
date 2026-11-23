@@ -93,10 +93,11 @@ export interface SchemaPatch {
 /**
  * Storage and cache config the `connect` URI can't carry. All optional.
  *
- * Which options apply depends on the backend: `apiKey` is for a hosted
- * (Infino Cloud) connection, while the storage/cache options — `storageOptions`,
- * `cacheDir`, `cacheBudgetBytes`, `coldFetchMode`, `validate` — apply to **local
- * connections only**; Infino Cloud manages storage, so it ignores them.
+ * Which options apply depends on the backend: `apiKey` and `requestTimeoutMs`
+ * are for a hosted (Infino Cloud) connection, while the storage/cache options —
+ * `storageOptions`, `cacheDir`, `cacheBudgetBytes`, `coldFetchMode`, `validate`
+ * — apply to **local connections only**; Infino Cloud manages storage, so it
+ * ignores them.
  * `connectionMemoryBudgetBytes` applies to both.
  */
 export interface ConnectOptions {
@@ -132,6 +133,14 @@ export interface ConnectOptions {
    * `INFINO_API_KEY` environment variable when omitted.
    */
   apiKey?: string;
+  /**
+   * Deadline for each request on a hosted connection, in milliseconds, from
+   * connecting to the last byte of the answer. Past it the call throws an
+   * Error whose message starts with `Unavailable:`. Default 620000, a little
+   * past the longest a hosted request can run (600 s). A write that times out
+   * may still commit, so check before reissuing it. Ignored by local backends.
+   */
+  requestTimeoutMs?: number;
 }
 
 /** Row counts returned by `update` / `delete`. */
@@ -254,6 +263,26 @@ export interface Bm25SearchOptions {
   k1?: number;
   /** BM25 `b` for this search only; see {@link Bm25SearchOptions.k1}. */
   b?: number;
+  arrow?: boolean;
+}
+/** One clause of `bm25SearchFields`: a query text and the full-text columns
+ * it searches. The text is read as `bm25Search` reads a query, tokenized by
+ * each column's own analyzer. */
+export interface FieldClause {
+  query: string;
+  fields: string[];
+}
+/** Options for `bm25SearchFields`. */
+export interface Bm25FieldsOptions {
+  /** `"or"` (default): a row matching any clause is a hit; `"and"`: it must
+   * match every clause. Also the mode of each clause's bare terms. */
+  mode?: BoolMode;
+  /** What each named column's scores are multiplied by before a clause takes
+   * its best column; 1 for a column not named. Each must be finite and > 0;
+   * a weight on a column no clause searches has no effect. */
+  weights?: Record<string, number>;
+  /** Columns to return, e.g. `["_id", "body"]`; omit for `_id` + `score` only. */
+  projection?: string[];
   arrow?: boolean;
 }
 /** Text-predicate filter for `vectorSearch` (a pushdown pre-filter, not a
@@ -578,6 +607,20 @@ export class Table {
     rejectRemovedOptions("bm25Search", opts, REMOVED_SEARCH_OPTIONS);
     const buf = guard(this.remote, () =>
       this.inner.bm25Search(column, query, k, opts.mode, opts.projection, opts.k1, opts.b),
+    );
+    return decode(buf, opts.arrow);
+  }
+
+  /** Ranked BM25 over several full-text columns, scored *best fields*: each
+   * clause scores a row by its best column (the largest `weight × BM25` among
+   * its `fields`), and a row's score is the sum over the clauses it matches,
+   * as a multi-field `query_string` or `multi_match` of type `best_fields`
+   * ranks. Rows best first, ties by ascending `_id`. */
+  bm25SearchFields(clauses: FieldClause[], k: number, opts: Bm25FieldsOptions & { arrow: true }): arrow.Table;
+  bm25SearchFields(clauses: FieldClause[], k: number, opts?: Bm25FieldsOptions): RowRecord[];
+  bm25SearchFields(clauses: FieldClause[], k: number, opts: Bm25FieldsOptions = {}): RowRecord[] | arrow.Table {
+    const buf = guard(this.remote, () =>
+      this.inner.bm25SearchFields(clauses, k, opts.mode, opts.weights, opts.projection),
     );
     return decode(buf, opts.arrow);
   }

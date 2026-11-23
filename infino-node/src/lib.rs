@@ -47,9 +47,10 @@ use datafusion::common::DFSchema;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::Expr;
 use infino::{
-    Bm25SearchOptions, BoolMode, ColdFetchMode, CompactionSettings, GcError, InfinoError, Metric,
-    OptimizeError, OptimizeOptions as InfinoOptimizeOptions, RecalibratePolicy, ReindexError,
-    ReindexMode, ReindexOptions as InfinoReindexOptions, SchemaPatch, Stemmer, Stopwords,
+    Bm25FieldsOptions, Bm25SearchOptions, BoolMode, ColdFetchMode, CompactionSettings, GcError,
+    InfinoError, Metric, OptimizeError, OptimizeOptions as InfinoOptimizeOptions,
+    RecalibratePolicy, ReindexError, ReindexMode, ReindexOptions as InfinoReindexOptions,
+    SchemaPatch, Stemmer, Stopwords,
 };
 
 // ---------------------------------------------------------------------------
@@ -98,6 +99,13 @@ fn map_err(e: InfinoError) -> Error {
         // tell it apart and reissue the operation.
         InfinoError::Conflict(m) => {
             Error::new(Status::GenericFailure, format!("ConflictError: {m}"))
+        }
+        // The hosted service could not be reached or did not answer in time
+        // (a broken connection, a request past `requestTimeoutMs`, or a 502,
+        // 503 or 504). Transient, and prefixed so a caller can tell it apart
+        // and retry.
+        InfinoError::Unavailable(m) => {
+            Error::new(Status::GenericFailure, format!("Unavailable: {m}"))
         }
         // A valid query using something the engine does not support yet.
         // Prefixed with the variant name, as `NotFound:` is, so a caller can
@@ -559,6 +567,9 @@ pub struct ConnectOptions {
     /// bearer credential. Ignored by local backends; falls back to the
     /// `INFINO_API_KEY` environment variable when omitted.
     pub api_key: Option<String>,
+    /// Deadline for each request on a hosted connection, in milliseconds,
+    /// from connecting to the last byte of the answer. Default 620000.
+    pub request_timeout_ms: Option<f64>,
 }
 
 /// Tuning for `optimize`; all fields optional (omitted ⇒ engine default).
@@ -581,6 +592,16 @@ pub struct OptimizeOptions {
     /// rerank pool lags), `"force"` (always), or `"skip"` (never; storage
     /// compaction still runs). Omit for `"auto"`.
     pub recalibrate: Option<String>,
+}
+
+/// One clause of `bm25SearchFields`: a query text and the full-text columns
+/// it searches.
+#[napi(object)]
+pub struct FieldClause {
+    /// The clause's query text, read as `bm25Search` reads a query.
+    pub query: String,
+    /// The full-text columns the clause searches.
+    pub fields: Vec<String>,
 }
 
 /// Row counts from an `update` / `delete`.
@@ -942,6 +963,18 @@ pub fn connect(env: Env, uri: String, options: Option<ConnectOptions>) -> Result
             if let Some(key) = o.api_key {
                 opts = opts.with_api_key(key);
             }
+            if let Some(ms) = o.request_timeout_ms {
+                let timeout = Duration::try_from_secs_f64(ms / 1000.0)
+                    .ok()
+                    .filter(|d| !d.is_zero())
+                    .ok_or_else(|| {
+                        Error::new(
+                            Status::InvalidArg,
+                            format!("requestTimeoutMs must be a positive number, got {ms}"),
+                        )
+                    })?;
+                opts = opts.with_request_timeout(timeout);
+            }
             infino::connect_with(&uri, opts)
         }
     }
@@ -1208,6 +1241,44 @@ impl Table {
         let batches = self
             .inner
             .bm25_search(&column, &query, k as usize, opts, proj.as_deref())
+            .map_err(map_err)?;
+        batches_to_ipc(&batches)
+    }
+
+    /// BM25 over several full-text columns at once, scored *best fields*.
+    /// Each clause scores a row by its best column (the largest
+    /// `weight × BM25` among the clause's `fields`), and the row's score is
+    /// the sum over the clauses it matches: one `dis_max` (tie breaker 0)
+    /// per clause, summed, as a multi-field `query_string` or `multi_match`
+    /// of type `best_fields` ranks. `mode` is `"or"` (default: a row
+    /// matching any clause is a hit) or `"and"` (it must match every
+    /// clause), and is also the mode of each clause's bare terms.
+    /// `weights` multiplies each named column's scores (1 for a column it
+    /// does not name). Returns rows like `bm25Search`, best first, ties by
+    /// ascending `_id`.
+    #[napi]
+    pub fn bm25_search_fields(
+        &self,
+        clauses: Vec<FieldClause>,
+        k: u32,
+        mode: Option<String>,
+        weights: Option<HashMap<String, f64>>,
+        projection: Option<Vec<String>>,
+    ) -> Result<Buffer> {
+        let mut opts = Bm25FieldsOptions::new().with_mode(parse_mode(mode.as_deref())?);
+        for (column, weight) in weights.unwrap_or_default() {
+            opts = opts.with_weight(column, weight as f32);
+        }
+        let clauses: Vec<infino::FieldClause> = clauses
+            .into_iter()
+            .map(|c| infino::FieldClause::new(c.query, c.fields))
+            .collect();
+        let proj: Option<Vec<&str>> = projection
+            .as_ref()
+            .map(|v| v.iter().map(String::as_str).collect());
+        let batches = self
+            .inner
+            .bm25_search_fields(&clauses, k as usize, &opts, proj.as_deref())
             .map_err(map_err)?;
         batches_to_ipc(&batches)
     }

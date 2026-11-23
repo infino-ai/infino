@@ -20,8 +20,8 @@ use datafusion::prelude::Expr;
 use serde_json::Value;
 
 use crate::{
-    Bm25SearchOptions, BoolMode, GcError, GcReport, InfinoError, MutationStats, OptimizeError,
-    OptimizeOptions, ReindexError, ReindexOptions, VectorFilter,
+    Bm25FieldsOptions, Bm25SearchOptions, BoolMode, FieldClause, GcError, GcReport, InfinoError,
+    MutationStats, OptimizeError, OptimizeOptions, ReindexError, ReindexOptions, VectorFilter,
     catalog::ensure_expr_within_connective_cap,
     superfile::VectorSearchOptions,
     supertable::{
@@ -55,6 +55,13 @@ pub(crate) trait Table: Send + Sync {
         query: &str,
         k: usize,
         opts: Bm25SearchOptions,
+        projection: Option<&[&str]>,
+    ) -> Result<Vec<RecordBatch>, InfinoError>;
+    fn bm25_search_fields(
+        &self,
+        clauses: &[FieldClause],
+        k: usize,
+        opts: &Bm25FieldsOptions,
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, InfinoError>;
     fn token_match(
@@ -170,6 +177,15 @@ impl Table for SupertableHandle {
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, InfinoError> {
         SupertableHandle::bm25_search(self, column, query, k, opts, projection)
+    }
+    fn bm25_search_fields(
+        &self,
+        clauses: &[FieldClause],
+        k: usize,
+        opts: &Bm25FieldsOptions,
+        projection: Option<&[&str]>,
+    ) -> Result<Vec<RecordBatch>, InfinoError> {
+        SupertableHandle::bm25_search_fields(self, clauses, k, opts, projection)
     }
     fn token_match(
         &self,
@@ -452,6 +468,30 @@ impl Supertable {
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, InfinoError> {
         self.inner.bm25_search(column, query, k, opts, projection)
+    }
+
+    /// Ranked BM25 over several full-text columns at once, scored *best
+    /// fields*: each [`FieldClause`] scores a row by its best column (the
+    /// largest `weight × BM25` among the clause's columns, weights from
+    /// `opts`, 1 for a column it does not name), and the row's score is the
+    /// sum over the clauses it matches. `opts.mode` decides whether a row
+    /// must match any clause (`Or`) or every clause (`And`), and is also the
+    /// mode of each clause's bare terms, as in [`Self::bm25_search`].
+    ///
+    /// This is the ranking of one `dis_max` (tie breaker 0) per clause,
+    /// summed: a multi-field `query_string` or `multi_match` of type
+    /// `best_fields`. Each column keeps its own analyzer and the same
+    /// statistics [`Self::bm25_search`] scores it with, and the result is
+    /// the exact top `k`, ties by ascending `_id`. The SQL form is
+    /// `bm25_search_fields(clauses_json, k[, mode[, weights_json]])`.
+    pub fn bm25_search_fields(
+        &self,
+        clauses: &[FieldClause],
+        k: usize,
+        opts: &Bm25FieldsOptions,
+        projection: Option<&[&str]>,
+    ) -> Result<Vec<RecordBatch>, InfinoError> {
+        self.inner.bm25_search_fields(clauses, k, opts, projection)
     }
 
     /// Unranked token match over one FTS column.

@@ -71,8 +71,22 @@ use crate::{
         cpu,
         op_stats::{OpStatsCollector, OuterBracketGuard, metering_active, outer_bracket_active},
     },
-    supertable::query::{provider::ScanFooters, read_ahead::ScanReadAhead},
+    supertable::query::{
+        provider::ScanFooters, read_ahead::ScanReadAhead, scan_order::can_read_in_file_order,
+    },
 };
+
+/// What a meter does with a `LIMIT` fetch from above.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Limits {
+    /// Passes it on to the scan.
+    Pass,
+    /// Keeps it above; see [`MeteredExec::without_limit_pushdown`].
+    Refuse,
+    /// Passes it on to a scan that runs its whole `WHERE` as a row filter;
+    /// see [`MeteredExec::passing_limits`].
+    PassToRowFilter,
+}
 
 /// Wraps `input`, metering every partition's poll time into `op_stats`.
 #[derive(Debug)]
@@ -86,10 +100,9 @@ pub(crate) struct MeteredExec {
     /// turns it off under a `LIMIT`.
     read_ahead: Option<Arc<ScanReadAhead>>,
     /// Whether the planner may carry a `LIMIT` fetch past this node into
-    /// the child. The one place this is `false` is the meter the table
-    /// provider wraps around a scan that carries filters — see
-    /// [`Self::without_limit_pushdown`].
-    limit_pushdown: bool,
+    /// the child. The provider's meter around a scan that carries filters
+    /// refuses it — see [`Self::without_limit_pushdown`].
+    limits: Limits,
     /// What the wrapped scan stands for, shown after the node's name in
     /// `EXPLAIN`.
     note: Option<Arc<str>>,
@@ -109,7 +122,7 @@ impl MeteredExec {
             op_stats,
             footers: None,
             read_ahead: None,
-            limit_pushdown: true,
+            limits: Limits::Pass,
             note: None,
         }
     }
@@ -124,7 +137,8 @@ impl MeteredExec {
     /// exact filter leaves no `FilterExec`, so this node refuses the fetch
     /// and the limit node above keeps it. The provider pushes its own
     /// scan-level limit only for filter-less scans, where no predicate can
-    /// mark a row group fully matching.
+    /// mark a row group fully matching. `RowFilterUnderTopK` lifts the
+    /// refusal for a scan with no selections ([`Self::passing_limits`]).
     pub(crate) fn without_limit_pushdown(
         input: Arc<dyn ExecutionPlan>,
         op_stats: Option<Arc<OpStatsCollector>>,
@@ -134,7 +148,7 @@ impl MeteredExec {
             op_stats,
             footers: None,
             read_ahead: None,
-            limit_pushdown: false,
+            limits: Limits::Refuse,
             note: None,
         }
     }
@@ -172,16 +186,60 @@ impl MeteredExec {
         self.footers.as_deref()
     }
 
+    /// A meter over `input` with this node's collector, which lets a `LIMIT`
+    /// fetch through to it. For a filtered scan that runs its whole `WHERE`
+    /// as a row filter and reads every row of the row groups it reads, so the
+    /// fetch counts rows that pass and no selection can be lost. Each
+    /// partition of such a scan stops after the fetch, so it gains nothing
+    /// from more partitions, and an exchange below this node would keep the
+    /// fetch from reaching it.
+    ///
+    /// Given the limit, the Parquet reader reads only the row groups its
+    /// statistics prove match, skipping earlier ones, and which it skips
+    /// depends on the limit, so pages of one statement would skip or repeat
+    /// rows. `ScanOrderUnderLimit` reads such a scan in file order once the
+    /// limits are placed; a scan that can't read in file order is refused the
+    /// limit, which stays above this meter.
+    pub(crate) fn passing_limits(&self, input: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+        Arc::new(MeteredExec {
+            limits: Limits::PassToRowFilter,
+            ..self.rewrapped(input)
+        })
+    }
+
+    /// Whether this meter passes a `LIMIT` to a scan that runs its whole
+    /// `WHERE` as a row filter ([`Self::passing_limits`]).
+    pub(crate) fn passes_limits_to_row_filter(&self) -> bool {
+        self.limits == Limits::PassToRowFilter
+    }
+
+    /// Whether a `LIMIT` fetch may pass this meter into its scan: not for a
+    /// scan with filters ([`Self::without_limit_pushdown`]), and for one that
+    /// runs its `WHERE` as a row filter only when it can read in file order
+    /// ([`Self::passing_limits`]).
+    fn passes_limits(&self) -> bool {
+        match self.limits {
+            Limits::Pass => true,
+            Limits::Refuse => false,
+            Limits::PassToRowFilter => can_read_in_file_order(&self.input),
+        }
+    }
+
     /// A meter over `input` with this node's collector and limit policy.
     fn rewrap(&self, input: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
-        Arc::new(MeteredExec {
+        Arc::new(self.rewrapped(input))
+    }
+
+    /// [`Self::rewrap`], unboxed.
+    fn rewrapped(&self, input: Arc<dyn ExecutionPlan>) -> MeteredExec {
+        MeteredExec {
             input,
             op_stats: self.op_stats.clone(),
             footers: self.footers.clone(),
             read_ahead: self.read_ahead.clone(),
-            limit_pushdown: self.limit_pushdown,
+            limits: self.limits,
             note: self.note.clone(),
-        })
+        }
     }
 }
 
@@ -258,8 +316,13 @@ impl ExecutionPlan for MeteredExec {
     fn supports_limit_pushdown(&self) -> bool {
         // `false` makes `LimitPushdown` keep its limit node above this
         // meter instead of walking into the scan; see
-        // [`Self::without_limit_pushdown`].
-        self.limit_pushdown
+        // [`Self::passes_limits`].
+        self.passes_limits()
+    }
+
+    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+        // See [`Self::passing_limits`].
+        vec![self.limits != Limits::PassToRowFilter]
     }
 
     fn cardinality_effect(&self) -> CardinalityEffect {
@@ -331,8 +394,8 @@ impl ExecutionPlan for MeteredExec {
         // the walk may not pass, this is exactly the question that must
         // be refused: with no fetch-capable node here, `LimitPushdown`
         // keeps a limit node above the meter (see
-        // [`Self::without_limit_pushdown`]).
-        if !self.limit_pushdown {
+        // [`Self::passes_limits`]).
+        if !self.passes_limits() {
             return None;
         }
         self.input.with_fetch(limit).map(|input| self.rewrap(input))

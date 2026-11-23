@@ -2926,6 +2926,22 @@ impl SuperfileReader {
             .await?)
     }
 
+    /// [`FtsReader::exact_match_candidates`] on this superfile's index.
+    pub(crate) async fn exact_match_candidates(
+        &self,
+        column: &str,
+        tokens: &[&str],
+        prefetched: Option<&FetchedTermMemo>,
+        dict: &QueryDict,
+    ) -> Result<(Vec<RowId>, MatchWork), ReadError> {
+        let fts = self
+            .fts()
+            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
+        Ok(fts
+            .exact_match_candidates(column, tokens, prefetched, dict)
+            .await?)
+    }
+
     /// The cursors of an `Or` match over `tokens`, built once for this
     /// superfile's doc-id slices. Delegates to
     /// [`FtsReader::match_cursor_set`].
@@ -3162,7 +3178,19 @@ impl SuperfileReader {
     /// for any absent token). Batched sibling of [`Self::term_df`]: resolves
     /// the whole set with one dictionary parse and one coalesced header fetch.
     /// Delegates to [`FtsReader::term_dfs`].
-    pub(crate) async fn term_dfs(
+    pub async fn term_dfs(
+        &self,
+        column: &str,
+        tokens: &[&str],
+    ) -> Result<(Vec<u64>, MatchWork), ReadError> {
+        let fts = self
+            .fts()
+            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
+        Ok(fts.term_dfs(column, tokens).await?)
+    }
+
+    /// [`Self::term_dfs`] with the dictionary read through `dict`, which may already hold it.
+    pub(crate) async fn term_dfs_with_dict(
         &self,
         column: &str,
         tokens: &[&str],
@@ -3171,7 +3199,7 @@ impl SuperfileReader {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
-        Ok(fts.term_dfs(column, tokens, dict).await?)
+        Ok(fts.term_dfs_with_dict(column, tokens, dict).await?)
     }
 
     /// Open-wave fetch of `terms`' dictionary slots + postings ranges
@@ -3364,6 +3392,7 @@ impl SuperfileReader {
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .as_ref()
+            && scoring.norms.is_none()
             && cached.matches(scoring)
         {
             return Ok(ScoredFts::Derived(Arc::clone(view)));
@@ -3372,6 +3401,9 @@ impl SuperfileReader {
             return Ok(ScoredFts::Baked(fts));
         };
         let view = Arc::new(view);
+        if scoring.norms.is_some() {
+            return Ok(ScoredFts::Derived(view));
+        }
         // Last writer wins. Two queries racing here derive the same view
         // from the same inputs — `with_scoring` is deterministic — so which
         // one lands is immaterial.
@@ -5138,6 +5170,7 @@ mod tests {
         });
         assert!(poisoner.is_err() && r.scored_fts.is_poisoned());
         let at = ScoringView {
+            norms: None,
             params: Some(Bm25Params::new(1.4, 0.6)),
             avgdl: None,
         };
@@ -5164,6 +5197,7 @@ mod tests {
         let a = Bm25Params::new(1.4, 0.6);
         let b = Bm25Params::new(0.9, 0.4);
         let at = |params| ScoringView {
+            norms: None,
             params: Some(params),
             avgdl: None,
         };
@@ -5204,6 +5238,7 @@ mod tests {
         let column = fts.fts_columns_config().next().expect("column");
         let (name, baked) = (column.name.clone(), column.avgdl());
         let at = |avgdl| ScoringView {
+            norms: None,
             params: None,
             avgdl: Some((name.as_str(), avgdl)),
         };

@@ -80,12 +80,44 @@ const SQL_TABLE: &str = "supertable";
 /// One superfile's candidates: `(key, hit)` for its first rows by the key.
 type Candidates = Vec<(u64, SuperfileHit)>;
 
+/// The first `k` of the `candidates` that `keep` accepts, in a sort's order by the key,
+/// `descending` or not, and then by `_id` ascending, each hit given its `_id` first. The `_id`s
+/// come from the superfiles' id spans or id pages, so no other column is read. It reserves no
+/// memory: the walk and the range top-k reserve their candidates before they call it.
+pub(crate) async fn by_key_then_id(
+    reader: &SupertableReader,
+    candidates: Candidates,
+    descending: bool,
+    k: usize,
+    keep: impl Fn(u64, &SuperfileHit) -> bool,
+) -> Result<Candidates, QueryError> {
+    let (keys, mut hits): (Vec<u64>, Vec<SuperfileHit>) = candidates.into_iter().unzip();
+    dispatch::attach_stable_ids_to_hits(reader, &mut hits).await?;
+    let mut order: Vec<usize> = (0..hits.len())
+        .filter(|&i| keep(keys[i], &hits[i]))
+        .collect();
+    let compare = |&a: &usize, &b: &usize| {
+        let by_key = match descending {
+            false => keys[a].cmp(&keys[b]),
+            true => keys[b].cmp(&keys[a]),
+        };
+        by_key.then_with(|| hits[a].stable_id.cmp(&hits[b].stable_id))
+    };
+    // Only the first `k` are kept: pick them, then sort just those.
+    if order.len() > k {
+        order.select_nth_unstable_by(k, compare);
+        order.truncate(k);
+    }
+    order.sort_by(compare);
+    Ok(order.into_iter().map(|i| (keys[i], hits[i])).collect())
+}
+
 /// A top-k walk starts only when it expects to find its rows within 4,096, and reads no window past
 /// that after its first; past it the scan reads every row, faster for a filter that keeps so few.
 pub(crate) const MAX_WALKED_ROWS: usize = 4096;
 
 /// A window reads twice the rows the walk expects to need, so it usually holds the page at once.
-const WINDOW_MARGIN: f64 = 2.0;
+pub(crate) const WINDOW_MARGIN: f64 = 2.0;
 
 /// How much larger a window is than the last when the last kept no row.
 const WINDOW_GROWTH: usize = 4;
@@ -307,26 +339,11 @@ impl SupertableReader {
                 true => *key >= cut,
             });
         }
-        let (keys, mut hits): (Vec<u64>, Vec<SuperfileHit>) = candidates.into_iter().unzip();
-        dispatch::attach_stable_ids_to_hits(self, &mut hits).await?;
-        let mut order: Vec<usize> = (0..hits.len())
-            .filter(|&i| {
-                after.is_none_or(|after| after.passed_by(keys[i], hits[i].stable_id, descending))
-            })
-            .collect();
-        order.sort_by(|&a, &b| {
-            let by_key = match descending {
-                false => keys[a].cmp(&keys[b]),
-                true => keys[b].cmp(&keys[a]),
-            };
-            by_key.then_with(|| hits[a].stable_id.cmp(&hits[b].stable_id))
-        });
         Ok(Some(
-            order
-                .into_iter()
-                .take(k)
-                .map(|i| (keys[i], hits[i]))
-                .collect(),
+            by_key_then_id(self, candidates, descending, k, |key, hit| {
+                after.is_none_or(|after| after.passed_by(key, hit.stable_id, descending))
+            })
+            .await?,
         ))
     }
 
@@ -955,7 +972,7 @@ pub(crate) fn sorted_statement(
 }
 
 /// `name` as a quoted SQL identifier.
-fn quote(name: &str) -> String {
+pub(crate) fn quote(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
@@ -975,6 +992,7 @@ mod tests {
     use super::*;
     use crate::{
         config::OptimizeOptions,
+        memory::ConnectionMemoryBudget,
         runtime_metrics::op_stats::with_op_stats,
         storage::{LocalFsStorageProvider, StorageProvider},
         supertable::{
@@ -2259,6 +2277,70 @@ mod tests {
                     "{column}: descending {descending}, k {k}"
                 );
             }
+        }
+    }
+
+    /// Keys the candidates of [`by_key_then_id_keeps_the_first_k_and_reserves_nothing`] take, so
+    /// many share each key and the `_id` decides among them.
+    const CANDIDATE_KEYS: u32 = 7;
+    /// The candidates it keeps.
+    const KEPT: usize = 40;
+
+    /// `by_key_then_id` returns only the first `k` candidates by the key and then `_id`, either
+    /// way. It reserves no memory, so it answers with the connection's budget full: its callers
+    /// reserve the candidates, and a second reservation would count them twice.
+    #[test]
+    fn by_key_then_id_keeps_the_first_k_and_reserves_nothing() {
+        let dir = TempDir::new().expect("tempdir");
+        drop(table(&dir));
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let mut options = SupertableOptions::new(schema(), vec![], vec![])
+            .expect("options")
+            .with_storage(storage)
+            .with_range_indexes(&["key".to_string()]);
+        options.connection_memory_budget = ConnectionMemoryBudget::with_room();
+        let st = Supertable::open(options).expect("open");
+        let reader = st.reader().expect("reader");
+        let _full = reader
+            .manifest()
+            .options
+            .connection_memory_budget
+            .hold_all();
+        let candidates: Candidates = reader
+            .manifest()
+            .superfiles
+            .iter()
+            .flat_map(|entry| {
+                let locals: Vec<u32> = (0..entry.n_docs as u32).collect();
+                let keys = locals.iter().map(|local| u64::from(local % CANDIDATE_KEYS));
+                let hits = tag_hits(entry, locals.iter().map(|local| (*local, 0.0)).collect());
+                keys.zip(hits).collect::<Vec<_>>()
+            })
+            .collect();
+        for descending in [false, true] {
+            let mut want: Vec<(u64, Option<i128>)> = candidates
+                .iter()
+                .map(|(key, hit)| (*key, hit.stable_id))
+                .collect();
+            want.sort_by(|a, b| match descending {
+                false => a.cmp(b),
+                true => b.0.cmp(&a.0).then(a.1.cmp(&b.1)),
+            });
+            want.truncate(KEPT);
+            let got: Vec<(u64, Option<i128>)> = reader
+                .block_on(by_key_then_id(
+                    &reader,
+                    candidates.clone(),
+                    descending,
+                    KEPT,
+                    |_, _| true,
+                ))
+                .expect("ordered")
+                .into_iter()
+                .map(|(key, hit)| (key, hit.stable_id))
+                .collect();
+            assert_eq!(got, want, "descending: {descending}");
         }
     }
 

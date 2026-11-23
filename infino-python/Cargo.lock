@@ -1550,12 +1550,12 @@ checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
 
 [[package]]
 name = "ferroid"
-version = "2.0.0"
+version = "3.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ee93edf3c501f0035bbeffeccfed0b79e14c311f12195ec0e661e114a0f60da4"
+checksum = "b597ae9512a7f3f2090ee1093de133ae1e4fd3c91911d6d18572a89eb4e8034b"
 dependencies = [
- "portable-atomic",
- "rand 0.10.1",
+ "serde",
+ "tracing",
  "web-time",
 ]
 
@@ -2142,7 +2142,7 @@ dependencies = [
 
 [[package]]
 name = "infino"
-version = "0.11.33"
+version = "0.11.36"
 dependencies = [
  "apache-avro",
  "arc-swap",
@@ -2196,7 +2196,7 @@ dependencies = [
 
 [[package]]
 name = "infino-python"
-version = "0.11.29"
+version = "0.11.32"
 dependencies = [
  "arrow",
  "arrow-array",

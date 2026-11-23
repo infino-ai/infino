@@ -20,6 +20,7 @@ def test_package_metadata():
     assert set(infino.__all__) == {
         "connect",
         "ConflictError",
+        "UnavailableError",
         "SchemaError",
         "AlreadyRunningError",
         "Connection",

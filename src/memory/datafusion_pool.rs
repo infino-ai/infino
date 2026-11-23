@@ -60,6 +60,7 @@ use crate::{
             join_build_size::RightSizeJoinBuild,
             limit_stage::StageLimitGathers,
             read_ahead_rule::ReadAheadOff,
+            scan_order::ScanOrderUnderLimit,
             sorted_root::{KeepSortedRoot, OrderUnderScalarSubquery},
             topk_row_filter::RowFilterUnderTopK,
             values_subquery::ValuesSubqueryRewrite,
@@ -269,7 +270,7 @@ pub(crate) fn budgeted_session_context(
         .skip_partial_aggregation_probe_ratio_threshold = PARTIAL_AGG_SKIP_PROBE_RATIO;
 
     // Predicates run in a `FilterExec` above the scan, not as Parquet row
-    // filters, except under `ORDER BY ... LIMIT` (see `RowFilterUnderTopK`).
+    // filters, except under a `LIMIT` (see `RowFilterUnderTopK`).
     // Pinned off here because the scan's own flag is ORed with this option.
     config.options_mut().execution.parquet.pushdown_filters = false;
 
@@ -302,6 +303,10 @@ pub(crate) fn budgeted_session_context(
     //  - `KeepSortedRoot` after DataFusion's rules, to remove the round-robin
     //    repartition that `EnforceDistribution` adds above a sorted result,
     //    which would return an `ORDER BY` out of order.
+    //  - `ScanOrderUnderLimit` after DataFusion's rules, once `LimitPushdown`
+    //    has set the gather's fetch, to read a scan under a `LIMIT` with no
+    //    `ORDER BY` in file order, the same rows on every run. Before
+    //    `StageLimitGathers`, which keeps that order.
     //  - `StageLimitGathers` after DataFusion's rules, once `EnforceDistribution`
     //    has split a filtered scan and `LimitPushdown` has set the gather's
     //    fetch, to start its partitions in two stages under a small `LIMIT`.
@@ -314,6 +319,7 @@ pub(crate) fn budgeted_session_context(
     rules.push(Arc::new(RightSizeJoinBuild));
     rules.push(Arc::new(FilterIntoCachedScan));
     rules.push(Arc::new(KeepSortedRoot));
+    rules.push(Arc::new(ScanOrderUnderLimit));
     rules.push(Arc::new(StageLimitGathers));
     rules.push(Arc::new(ReadAheadOff));
     let mut builder = SessionStateBuilder::new()

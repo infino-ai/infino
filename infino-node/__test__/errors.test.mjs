@@ -69,6 +69,8 @@ test("hosted 503 carries status 503 (transient — caller can retry)", async () 
   await withStubApi(503, '{"error":"no capacity to activate database"}', (db) => {
     const e = throws(() => db.listTables());
     assert.equal(e.status, 503);
+    // Typed by prefix, so a caller can tell it apart and retry.
+    assert.match(e.message, /^Unavailable: /);
     assert.match(e.message, /no capacity/);
   });
 });
@@ -95,6 +97,40 @@ test("hosted 403 carries status 403 and the API's own reason", async () => {
     assert.equal(e.status, 403);
     assert.match(e.message, /row limit reached/);
   });
+});
+
+// A stub that accepts the connection and never answers.
+const SILENT_SRC = `
+  const { parentPort } = require("node:worker_threads");
+  const net = require("node:net");
+  const server = net.createServer(() => {});
+  server.listen(0, "127.0.0.1", () => parentPort.postMessage(server.address().port));
+`;
+
+test("hosted request past requestTimeoutMs throws Unavailable", async () => {
+  const worker = new Worker(SILENT_SRC, { eval: true });
+  const port = await new Promise((resolve) => worker.once("message", resolve));
+  try {
+    const db = connect(`http://127.0.0.1:${port}/yelp`, {
+      apiKey: "test-key",
+      requestTimeoutMs: 300,
+    });
+    const start = Date.now();
+    const e = throws(() => db.listTables());
+    assert.ok(Date.now() - start < 4000, `waited ${Date.now() - start} ms`);
+    assert.match(e.message, /^Unavailable: /);
+  } finally {
+    await worker.terminate();
+  }
+});
+
+test("a zero or negative requestTimeoutMs is refused at connect", () => {
+  for (const requestTimeoutMs of [0, -1]) {
+    const e = throws(() =>
+      connect("http://127.0.0.1:1/yelp", { apiKey: "test-key", requestTimeoutMs }),
+    );
+    assert.equal(e.code, "InvalidArg");
+  }
 });
 
 // --- local path: untouched — no status, addon error rethrown as-is ---

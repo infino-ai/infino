@@ -49,7 +49,11 @@
 //! The `WHERE` stays in its `FilterExec`. A Parquet row filter would decode
 //! only the `WHERE`'s columns for rows that fail, but a filter keeping rows at
 //! random leaves a selection of thousands of fragments per row group, which
-//! measured slower than decoding the batch whole.
+//! measured slower than decoding the batch whole. Where the scan's other
+//! columns are wide, `RowFilterUnderTopK` instead runs the `WHERE` in the scan
+//! and hands it the `LIMIT`, which stops the selection at the limit's rows.
+//! Such a scan is gated the same way, under a `LocalLimitExec` that drops
+//! partition 0 once it has the rows.
 
 use std::{mem, sync::Arc};
 
@@ -71,6 +75,7 @@ use datafusion::{
 
 use crate::supertable::query::exec::{
     metered_exec::MeteredExec,
+    ordered_coalesce_exec::OrderedCoalesceExec,
     staged_coalesce_exec::{ScanGateExec, StagedCoalesceExec},
 };
 
@@ -93,9 +98,13 @@ impl PhysicalOptimizerRule for StageLimitGathers {
         // gate would always open and the query would only pay the wait.
         let max_fetch = config.execution.batch_size;
         plan.transform_down(|node| {
+            // `ScanOrderUnderLimit` has put an ordered gather on a scan read
+            // in file order; the staged gather keeps that order.
+            let ordered = node.downcast_ref::<OrderedCoalesceExec>().is_some();
             let Some(fetch) = node
                 .downcast_ref::<CoalescePartitionsExec>()
                 .and_then(|coalesce| coalesce.fetch())
+                .or_else(|| ordered.then(|| node.fetch()).flatten())
                 .filter(|&fetch| fetch <= max_fetch)
             else {
                 return Ok(Transformed::no(node));
@@ -109,7 +118,8 @@ impl PhysicalOptimizerRule for StageLimitGathers {
             if input.output_partitioning().partition_count() <= 1 {
                 return Ok(Transformed::no(node));
             }
-            let staged: Arc<dyn ExecutionPlan> = Arc::new(StagedCoalesceExec::new(input, fetch));
+            let staged: Arc<dyn ExecutionPlan> =
+                Arc::new(StagedCoalesceExec::new(input, fetch, ordered));
             Ok(Transformed::yes(staged))
         })
         .map(|t| t.data)
@@ -130,7 +140,8 @@ impl PhysicalOptimizerRule for StageLimitGathers {
 /// scan's meter taking no fetch is what marks it filtered: a scan with no
 /// filter takes the `LIMIT` itself and stops on its own. A `WHERE` an index
 /// answers leaves no `FilterExec`, so the meter's refused fetch lands in a
-/// `LocalLimitExec` right above it.
+/// `LocalLimitExec` right above it. A scan that runs its `WHERE` as a row
+/// filter takes the fetch, and is gated all the same.
 fn gated_scan(
     plan: &Arc<dyn ExecutionPlan>,
     fetch: usize,
@@ -139,7 +150,8 @@ fn gated_scan(
         return gated_scan(input, fetch);
     }
     if let Some(meter) = plan.downcast_ref::<MeteredExec>() {
-        if meter.supports_limit_pushdown() {
+        let row_filtered = meter.passes_limits_to_row_filter();
+        if meter.supports_limit_pushdown() && !row_filtered {
             return Ok(None);
         }
         // `EnforceDistribution` puts the exchange below the meter when the
@@ -147,7 +159,15 @@ fn gated_scan(
         let scan = round_robin_input(meter.input()).unwrap_or(meter.input());
         let (rest, first) = split_first_file(scan);
         let meter = Arc::clone(plan).with_new_children(vec![rest])?;
-        return Ok(Some(Arc::new(ScanGateExec::new(meter, first))));
+        let gate: Arc<dyn ExecutionPlan> = Arc::new(ScanGateExec::new(meter, first));
+        // A scan that stops at the fetch ends once it has the rows, and a
+        // partition 0 that ends opens the gate. The limit above drops it
+        // before it is asked again.
+        return Ok(Some(if row_filtered {
+            Arc::new(LocalLimitExec::new(gate, fetch))
+        } else {
+            gate
+        }));
     }
     let passes_rows_on = plan.downcast_ref::<FilterExec>().is_some()
         || plan.downcast_ref::<ProjectionExec>().is_some()
@@ -193,7 +213,7 @@ fn split_first_file(
 }
 
 /// The input of `node` when it is a round-robin exchange, else `None`.
-fn round_robin_input(node: &Arc<dyn ExecutionPlan>) -> Option<&Arc<dyn ExecutionPlan>> {
+pub(super) fn round_robin_input(node: &Arc<dyn ExecutionPlan>) -> Option<&Arc<dyn ExecutionPlan>> {
     node.downcast_ref::<RepartitionExec>()
         .filter(|exchange| matches!(exchange.partitioning(), Partitioning::RoundRobinBatch(_)))
         .map(RepartitionExec::input)

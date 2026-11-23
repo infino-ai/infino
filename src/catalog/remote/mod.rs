@@ -34,32 +34,39 @@ const DOCUMENT_ENCODING: &str = "document";
 /// Longest wait to open the TCP and TLS connection to the endpoint.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Longest wait for the endpoint to send the next bytes of a response. The
-/// response to a write comes after the endpoint commits it, so this also
-/// bounds the commit; it is set well above the endpoint's own request limit,
-/// so it fires only on a connection that has stopped.
-const READ_TIMEOUT: Duration = Duration::from_secs(300);
-
-/// Longest wait for the connection to take more of a request body. It counts
-/// from the last progress, not from the start, so a slow upload that keeps
-/// moving finishes whatever its size.
-const WRITE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Default deadline for a request, from connecting to the last byte of the
+/// answer; `ConnectOptions::with_request_timeout` overrides it.
+/// A hosted request can run up to 600 s, and an append, update or delete
+/// commits inside its request and answers after the commit. The client waits
+/// a little longer than that, so it never gives up on a write that still
+/// commits: a retry of that write would apply it twice.
+/// ureq 2 uses what is left of it as the timeout of each read and write, in
+/// place of `timeout_read` and `timeout_write`. It does not cover the DNS
+/// lookup.
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(620);
 
 /// The HTTP client for a hosted connection. Without these bounds, a request on
 /// a connection that stops making progress waits forever, and so does every
-/// caller behind it.
-fn agent(connect: Duration, read: Duration, write: Duration) -> ureq::Agent {
-    ureq::AgentBuilder::new()
+/// caller behind it. ureq 2 applies the deadline to a request body only on a
+/// new connection, so an agent built with `pooled` false opens one for each
+/// request.
+fn agent(connect: Duration, total: Duration, pooled: bool) -> ureq::Agent {
+    let builder = ureq::AgentBuilder::new()
         .timeout_connect(connect)
-        .timeout_read(read)
-        .timeout_write(write)
-        .build()
+        .timeout(total);
+    if pooled {
+        builder.build()
+    } else {
+        builder.max_idle_connections(0).build()
+    }
 }
 
 /// A connection to a hosted endpoint. Holds the sync HTTP client, the base URL
 /// (scheme + host), the target database, and the bearer credential.
 pub(crate) struct RemoteCatalog {
     agent: ureq::Agent,
+    /// For Arrow bodies, which can be large: a new connection per request.
+    arrow_agent: ureq::Agent,
     base_url: String,
     database: String,
     api_key: String,
@@ -68,12 +75,21 @@ pub(crate) struct RemoteCatalog {
 impl RemoteCatalog {
     /// Build a hosted connection. The key comes from `api_key` or, when unset,
     /// the `INFINO_API_KEY` environment variable; a hosted connection without a
-    /// key is a configuration error.
+    /// key is a configuration error. `request_timeout` is the deadline of each
+    /// request ([`DEFAULT_REQUEST_TIMEOUT`] when unset); zero is a
+    /// configuration error.
     pub(crate) fn new(
         base_url: String,
         database: String,
         api_key: Option<String>,
+        request_timeout: Option<Duration>,
     ) -> Result<Self, InfinoError> {
+        let request_timeout = request_timeout.unwrap_or(DEFAULT_REQUEST_TIMEOUT);
+        if request_timeout.is_zero() {
+            return Err(InfinoError::Config(
+                "the request timeout of a hosted connection must be greater than zero".to_string(),
+            ));
+        }
         let api_key = api_key
             .or_else(|| std::env::var(API_KEY_ENV).ok())
             .filter(|k| !k.is_empty())
@@ -83,7 +99,8 @@ impl RemoteCatalog {
                 ))
             })?;
         Ok(Self {
-            agent: agent(CONNECT_TIMEOUT, READ_TIMEOUT, WRITE_TIMEOUT),
+            agent: agent(CONNECT_TIMEOUT, request_timeout, true),
+            arrow_agent: agent(CONNECT_TIMEOUT, request_timeout, false),
             base_url,
             database,
             api_key,
@@ -118,7 +135,7 @@ impl RemoteCatalog {
         body: Vec<u8>,
     ) -> Result<ureq::Response, InfinoError> {
         let mut request = self
-            .agent
+            .arrow_agent
             .post(&self.url(op))
             .set("Authorization", &self.bearer())
             .set("Content-Type", wire::ARROW_STREAM_CONTENT_TYPE);
@@ -254,7 +271,8 @@ fn read_schema_document(op: &str, response: ureq::Response) -> Result<TableSchem
 }
 
 /// Turn a `ureq` send result into an [`InfinoError`]: an HTTP error status maps
-/// through [`wire::status_to_error`]; a transport failure is a `Backend` error.
+/// through [`wire::status_to_error`]; a transport failure (a timeout, a
+/// connection that failed or broke) is `Unavailable`.
 fn map_send(
     op: &str,
     result: Result<ureq::Response, ureq::Error>,
@@ -265,7 +283,7 @@ fn map_send(
             let body = response.into_string().unwrap_or_default();
             Err(wire::status_to_error(op, code, &body))
         }
-        Err(ureq::Error::Transport(transport)) => Err(InfinoError::Backend(format!(
+        Err(ureq::Error::Transport(transport)) => Err(InfinoError::Unavailable(format!(
             "{op}: transport error: {transport}"
         ))),
     }
@@ -306,67 +324,186 @@ pub(crate) fn read_arrow_schema(op: &str, response: ureq::Response) -> Result<Sc
 #[cfg(test)]
 mod tests {
     use std::{
-        net::TcpListener,
-        thread,
+        fmt::Debug,
+        io::{Read, Write, copy, sink},
+        iter::repeat,
+        net::{TcpListener, TcpStream},
+        thread::{self, JoinHandle},
         time::{Duration, Instant},
     };
 
     use serde_json::json;
 
-    use super::{RemoteCatalog, agent};
+    use super::{RemoteCatalog, read_json};
     use crate::InfinoError;
 
-    /// The read timeout the test client waits for a silent endpoint.
-    const TEST_READ_TIMEOUT: Duration = Duration::from_millis(300);
-    /// Connect and write bounds for the test client, longer than the test needs.
-    const TEST_OTHER_TIMEOUT: Duration = Duration::from_secs(2);
-    /// How long the silent endpoint holds the connection before closing it.
-    /// A client with no read timeout waits this long, past [`LATEST_RETURN`].
-    const SILENT_HOLD: Duration = Duration::from_secs(5);
-    /// The latest a request may return for the read timeout to be what ended it.
+    /// The request deadline of the test client.
+    const TEST_TIMEOUT: Duration = Duration::from_millis(300);
+    /// How long a stalled endpoint holds the connection before closing it.
+    /// A client with no bound waits this long, past [`LATEST_RETURN`].
+    const HOLD: Duration = Duration::from_secs(5);
+    /// The latest a request may return for its deadline to be what ended it.
+    /// A stalled body write can take twice the deadline: one write that
+    /// sends part of its bytes, then one that sends none.
     const LATEST_RETURN: Duration = Duration::from_secs(4);
+    /// A complete answer to any request.
+    const OK: &[u8] =
+        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n[]";
+    /// The head of an answer whose body is far longer than the test lasts.
+    const ENDLESS_HEAD: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\n\r\n";
+    /// The pause between the bytes of the answer that never ends.
+    const TRICKLE_GAP: Duration = Duration::from_millis(100);
+    /// An append body larger than the socket buffers can hold, so the write
+    /// blocks once the endpoint stops reading.
+    const LARGE_BODY: usize = 64 << 20;
 
-    /// A request to an endpoint that accepts the connection and then sends
-    /// nothing fails with a transport error once the read timeout passes,
-    /// instead of waiting forever.
-    #[test]
-    fn a_request_to_a_silent_endpoint_times_out() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-        let addr = listener.local_addr().expect("addr");
-        // Accept and hold the connection open without reading or answering.
-        let server = thread::spawn(move || {
-            let (stream, _) = listener.accept().expect("accept");
-            thread::sleep(SILENT_HOLD);
-            drop(stream);
-        });
-
-        let mut catalog = RemoteCatalog::new(
+    fn catalog(addr: &str) -> RemoteCatalog {
+        RemoteCatalog::new(
             format!("http://{addr}"),
             "db".to_string(),
             Some("ik_test".to_string()),
+            Some(TEST_TIMEOUT),
         )
-        .expect("catalog");
-        catalog.agent = agent(TEST_OTHER_TIMEOUT, TEST_READ_TIMEOUT, TEST_OTHER_TIMEOUT);
+        .expect("catalog")
+    }
 
-        let start = Instant::now();
-        let result = catalog.post_json("append", json!({}));
-        let waited = start.elapsed();
+    /// A zero deadline would fail every request at once; it is refused when
+    /// the connection is built.
+    #[test]
+    fn a_zero_request_timeout_is_refused() {
+        let result = RemoteCatalog::new(
+            "http://127.0.0.1:1".to_string(),
+            "db".to_string(),
+            Some("ik_test".to_string()),
+            Some(Duration::ZERO),
+        );
+        assert!(matches!(result, Err(InfinoError::Config(_))));
+    }
 
-        match result {
-            Err(InfinoError::Backend(message)) => {
-                assert!(message.starts_with("append: transport error"), "{message}");
-            }
-            Err(other) => panic!("expected a transport error, got {other:?}"),
-            Ok(_) => panic!("a silent endpoint answered"),
+    /// Read one request: the head, then the body its Content-Length names.
+    fn read_request(stream: &mut TcpStream) {
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut byte).expect("request head");
+            head.push(byte[0]);
         }
+        let head = String::from_utf8_lossy(&head).to_lowercase();
+        let length: u64 = head
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length:"))
+            .map_or(0, |n| n.trim().parse().expect("content-length"));
+        copy(&mut stream.take(length), &mut sink()).expect("request body");
+    }
+
+    /// Answer the first request on the first connection, then hand that
+    /// connection to `then`. The listener stays open while `then` runs, so a
+    /// new connection is taken by the system but nobody reads it.
+    fn serve_one_then(then: impl FnOnce(TcpStream) + Send + 'static) -> (String, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr").to_string();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            read_request(&mut stream);
+            stream.write_all(OK).expect("answer");
+            then(stream);
+            drop(listener);
+        });
+        (addr, server)
+    }
+
+    /// `call` fails as `Unavailable`, after the deadline and well before the
+    /// endpoint lets go.
+    fn assert_unavailable_in_time<T: Debug>(call: impl FnOnce() -> Result<T, InfinoError>) {
+        let start = Instant::now();
+        let result = call();
+        let waited = start.elapsed();
+        assert!(waited < LATEST_RETURN, "waited {waited:?}: {result:?}");
         assert!(
-            waited >= TEST_READ_TIMEOUT,
-            "returned before the read timeout: {waited:?}"
+            waited >= TEST_TIMEOUT,
+            "returned after {waited:?}: {result:?}"
         );
         assert!(
-            waited < LATEST_RETURN,
-            "waited {waited:?}, past the read timeout"
+            matches!(result, Err(InfinoError::Unavailable(_))),
+            "{result:?}"
         );
+    }
+
+    /// A request to an endpoint that accepts the connection and then sends
+    /// nothing ends at the deadline.
+    #[test]
+    fn a_request_to_a_silent_endpoint_times_out() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr").to_string();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            thread::sleep(HOLD);
+            drop(stream);
+        });
+        let catalog = catalog(&addr);
+        assert_unavailable_in_time(|| catalog.post_json("append", json!({})));
+        server.join().expect("server thread");
+    }
+
+    /// ureq 2 clears the timeouts of a connection it puts back in the pool;
+    /// the deadline still ends a request that reuses it and gets no answer.
+    #[test]
+    fn a_silent_answer_on_a_reused_connection_times_out() {
+        let (addr, server) = serve_one_then(|mut stream| {
+            read_request(&mut stream);
+            thread::sleep(HOLD);
+        });
+        let catalog = catalog(&addr);
+        read_json(
+            "list_tables",
+            catalog.post_json("list_tables", json!({})).expect("first"),
+        )
+        .expect("first answer");
+        assert_unavailable_in_time(|| catalog.post_json("append", json!({})));
+        server.join().expect("server thread");
+    }
+
+    /// A body write is bounded only on a new connection. An append after an
+    /// append opens one, so a large body to an endpoint that stopped reading
+    /// ends in time.
+    #[test]
+    fn a_large_append_to_an_endpoint_that_stopped_reading_times_out() {
+        let (addr, server) = serve_one_then(|stream| {
+            thread::sleep(HOLD);
+            drop(stream);
+        });
+        let catalog = catalog(&addr);
+        catalog
+            .post_arrow("append", &[("table", "t")], Vec::new())
+            .expect("first append");
+        assert_unavailable_in_time(|| {
+            catalog.post_arrow("append", &[("table", "t")], vec![0u8; LARGE_BODY])
+        });
+        server.join().expect("server thread");
+    }
+
+    /// An answer that keeps sending a byte at a time never trips a read
+    /// timeout; the deadline ends it.
+    #[test]
+    fn an_answer_that_never_ends_times_out() {
+        let (addr, server) = serve_one_then(|mut stream| {
+            read_request(&mut stream);
+            let start = Instant::now();
+            let mut bytes = ENDLESS_HEAD.iter().copied().chain(repeat(b' '));
+            while start.elapsed() < HOLD {
+                thread::sleep(TRICKLE_GAP);
+                if stream.write_all(&[bytes.next().expect("byte")]).is_err() {
+                    return;
+                }
+            }
+        });
+        let catalog = catalog(&addr);
+        read_json(
+            "list_tables",
+            catalog.post_json("list_tables", json!({})).expect("first"),
+        )
+        .expect("first answer");
+        assert_unavailable_in_time(|| catalog.post_json("query_sql", json!({})));
         server.join().expect("server thread");
     }
 }

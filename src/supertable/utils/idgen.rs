@@ -35,7 +35,7 @@
 
 use std::{cell::Cell, fmt, hint};
 
-use ferroid::time::{MonotonicClock, TimeSource, UNIX_EPOCH};
+use ferroid::time::{CachedClock, TimeSource};
 use rand::random;
 
 const WORKER_BITS: u32 = 40;
@@ -57,8 +57,8 @@ pub struct IdGenerator {
     worker_bits: u128,
     /// Milliseconds since the Unix epoch, published by a shared
     /// ticker thread, so reading it is a load rather than a syscall
-    /// and it never steps backwards.
-    clock: MonotonicClock<1>,
+    /// and may follow wall-clock corrections backwards.
+    clock: CachedClock<1>,
     /// The last id handed out, or 0 before the first. Its timestamp
     /// and sequence fields are where the next claim continues from.
     last: Cell<u128>,
@@ -86,7 +86,7 @@ impl IdGenerator {
         Self {
             worker_id: worker40,
             worker_bits: u128::from(worker40) << SEQUENCE_BITS,
-            clock: MonotonicClock::<1>::with_epoch(UNIX_EPOCH),
+            clock: CachedClock::<1>::default(),
             last: Cell::new(0),
         }
     }
@@ -170,10 +170,10 @@ impl IdGenerator {
 
     /// Where the next id goes, and how many ids its millisecond has left
     /// from there (at least 1): the rest of the current millisecond's
-    /// sequence if the clock has not moved, else a fresh millisecond
-    /// starting at sequence 0. Waits for the next tick while the current
-    /// millisecond is used up. Does not advance the generator; the caller
-    /// records the last id it takes.
+    /// sequence if the clock has not advanced, else a fresh millisecond
+    /// starting at sequence 0. Waits for a later timestamp when the
+    /// sequence is used up, including after backwards clock corrections.
+    /// Does not advance the generator; the caller records the last id it takes.
     ///
     /// The returned id fits `i128` losslessly: its high bit is 0 for
     /// current-era Unix-ms timestamps (today ≈ 1.7×10¹² ms = 41 bits;
@@ -191,8 +191,8 @@ impl IdGenerator {
             }
             let sequence = last & SEQUENCE_MASK;
             if sequence < SEQUENCE_MASK {
-                // Same millisecond (the clock never reads behind the
-                // last id): continue its sequence.
+                // Same millisecond or a backwards clock correction:
+                // continue the last id's timestamp and sequence.
                 return (last + 1, SEQUENCE_MASK - sequence);
             }
             // This millisecond's sequence is used up; wait for the
@@ -486,7 +486,7 @@ mod tests {
         // and confirm the id landing in the new ms is NOT `prev + 1`.
         //
         // We poll until the clock advances rather than sleeping a fixed
-        // amount: the monotonic clock's ms counter is published by a
+        // amount: the cached clock's ms counter is published by a
         // background ticker thread that can lag a short fixed sleep under
         // load (e.g. coverage instrumentation on a busy runner). A fixed
         // sleep would then read the same stale ms for both ids and see

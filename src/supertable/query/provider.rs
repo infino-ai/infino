@@ -26,7 +26,7 @@
 //!      source, where `PruningPredicate` prunes row groups and pages.
 //!      A predicate the index could not bound runs in DataFusion's
 //!      `FilterExec` above the scan, or as a Parquet row filter under
-//!      `ORDER BY ... LIMIT` (`RowFilterUnderTopK`).
+//!      `ORDER BY ... LIMIT` or a plain `LIMIT` (`RowFilterUnderTopK`).
 //!      We deliberately do **not** reimplement this commodity layer.
 //!
 //! Correctness is independent of either tier: every pushed filter
@@ -106,7 +106,7 @@ use parquet::{
 use rayon::ThreadPool;
 use roaring::RoaringBitmap;
 use tokio::sync::{OnceCell, Semaphore};
-use tracing::{Instrument, debug};
+use tracing::{Instrument, debug, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -128,12 +128,15 @@ use crate::{
             load_section_groups, load_section_groups_blocking,
         },
         query::{
+            SuperfileHit,
             candidate::{
                 CandidatePlan, ExactFilter, PoolFile, Resolved, SelectionGate, TermMemos,
                 exact_filter, exact_range, like_prune_leaves, single_range,
             },
+            covered_agg::not_null_column,
             deleted_stats::DeletedStatsCache,
             df_object_store::SuperfileObjectStore,
+            dispatch::tag_hits,
             exec::{
                 cached_scan_exec::{
                     CachedFile, CachedScanExec, RowGroupFilter, has_columns, projected_schema,
@@ -150,6 +153,7 @@ use crate::{
             read_ahead::ScanReadAhead,
             schema_adapter::TableExprAdapterFactory,
             skip::{ColumnTypeGuard, ScalarOp, ScalarPredicate},
+            sorted::by_key_then_id,
             sql::StatementStores,
             superfile_reader::{
                 OpenTierCounts, superfile_reader_in_memory, superfile_reader_tiered,
@@ -777,11 +781,18 @@ impl SupertableProvider {
 
     /// `predicate` as one interval on one range-indexed column, when it is
     /// a conjunction of comparisons and `BETWEEN`s on that column against
-    /// literals (`a <= x AND x < b`): the shape a range index counts
-    /// without reading a row. `None` for anything else.
+    /// literals (`a <= x AND x < b`), and of `IS NOT NULL` on it: the shape
+    /// a range index counts without reading a row. `None` for anything else.
     pub(crate) fn counted_range(&self, predicate: &Expr) -> Option<CountedRange> {
-        let conjuncts: Vec<Expr> = split_conjunction(predicate).into_iter().cloned().collect();
         let column = predicate.column_refs().into_iter().next()?.name.clone();
+        // The range index keys every non-null value of its column and no
+        // null, so a count of its keys counts the rows `column IS NOT NULL`
+        // holds: that conjunct narrows nothing the count reads.
+        let conjuncts: Vec<Expr> = split_conjunction(predicate)
+            .into_iter()
+            .filter(|conjunct| not_null_column(conjunct) != Some(column.as_str()))
+            .cloned()
+            .collect();
         let range_cols = self.manifest.table_schema().range_column_types();
         let (field, data_type, lo, hi) = single_range(&conjuncts, &column, &range_cols)?;
         Some(CountedRange {
@@ -1554,7 +1565,8 @@ impl SupertableProvider {
     /// own `k`-th key is past the cutoff too). Ties broken by the id ascending
     /// are settled the same way when every survivor's range index keeps its
     /// tied rows in id order: each one's first rows by the key are then its
-    /// first by the key and the id. A hint carrying other filters goes
+    /// first by the key and the id, and the `k` best of them by the key and
+    /// the id are kept ([`Self::best_by_key_then_id`]). A hint carrying other filters goes
     /// to the walk instead ([`Self::walked_rows`]). `None` when there is no
     /// hint, the filters are not that one range, or a survivor has no range
     /// index over the column: the scan then reads every row the filters admit.
@@ -1644,19 +1656,87 @@ impl SupertableProvider {
             (Some(cut), false) => key <= cut,
             (Some(cut), true) => key >= cut,
         };
+        let kept: Vec<(Uuid, Vec<(u64, u32)>)> = ends
+            .into_iter()
+            .map(|(id, ends)| {
+                let pairs = ends.pairs.into_iter().filter(|(key, _)| within(*key));
+                (id, pairs.collect())
+            })
+            .collect();
+        // Ties the id breaks, each superfile's kept rows its first by the key and the id: the
+        // answer is the `k` best of them by the key and then the id, which their ids settle.
+        let kept_rows: usize = kept.iter().map(|(_, pairs)| pairs.len()).sum();
+        if !ties
+            && hint.ties_by_id
+            && kept_rows > hint.k
+            && let Some(best) = self.best_by_key_then_id(survivors, &kept, hint).await
+        {
+            return Ok(Some(best));
+        }
         Ok(Some(
-            ends.into_iter()
-                .map(|(id, ends)| {
-                    let rows: RoaringBitmap = ends
-                        .pairs
-                        .into_iter()
-                        .filter(|(key, _)| within(*key))
-                        .map(|(_, row)| row)
-                        .collect();
-                    (id, rows)
-                })
+            kept.into_iter()
+                .map(|(id, pairs)| (id, pairs.into_iter().map(|(_, row)| row).collect()))
                 .collect(),
         ))
+    }
+
+    /// The `hint.k` rows of `kept` (each superfile's candidate `(key, row)`s) first by the key in
+    /// the hint's direction and then by `_id` ascending, by superfile. Only the candidates' ids
+    /// are read, from the superfiles' id spans or id pages, so the scan then decodes `k` rows
+    /// rather than every candidate. The candidates are reserved against the connection's memory
+    /// budget while they are ordered. `None` when the table's reader is gone, an id cannot be
+    /// read, or the candidates do not fit the memory budget: the caller then hands the scan every
+    /// candidate and the sort above picks the `k`.
+    async fn best_by_key_then_id(
+        &self,
+        survivors: &[Arc<SuperfileEntry>],
+        kept: &[(Uuid, Vec<(u64, u32)>)],
+        hint: &TopKHint,
+    ) -> Option<HashMap<Uuid, RoaringBitmap>> {
+        let reader = self.walk_reader.upgrade()?;
+        let candidate_rows: usize = kept.iter().map(|(_, pairs)| pairs.len()).sum();
+        let _held = match self
+            .manifest
+            .options
+            .connection_memory_budget
+            .try_reserve(candidate_rows.saturating_mul(size_of::<(u64, SuperfileHit)>()))
+        {
+            Ok(held) => held,
+            Err(over) => {
+                debug!(%over, "the top-k scans every candidate: they are over the memory budget");
+                return None;
+            }
+        };
+        let entries: HashMap<Uuid, &Arc<SuperfileEntry>> = survivors
+            .iter()
+            .map(|entry| (entry.superfile_id, entry))
+            .collect();
+        let mut by_uri = HashMap::new();
+        let mut candidates = Vec::new();
+        for (id, pairs) in kept {
+            let entry = entries.get(id)?;
+            by_uri.insert(entry.uri, *id);
+            let hits = tag_hits(entry, pairs.iter().map(|(_, row)| (*row, 0.0)).collect());
+            candidates.extend(pairs.iter().map(|(key, _)| *key).zip(hits));
+        }
+        let ordered =
+            by_key_then_id(&reader, candidates, hint.descending, hint.k, |_, _| true).await;
+        #[cfg(test)]
+        let ordered = walk_probe::inject_id_read(survivors, ordered);
+        let ordered = match ordered {
+            Ok(ordered) => ordered,
+            Err(error) => {
+                warn!(%error, "the top-k could not read its candidates' ids, so it scans them all");
+                return None;
+            }
+        };
+        let mut rows: HashMap<Uuid, RoaringBitmap> = HashMap::new();
+        for (_, hit) in ordered {
+            rows.entry(*by_uri.get(&hit.superfile)?)
+                .or_default()
+                .insert(hit.local_doc_id);
+        }
+        Some(rows)
     }
 
     /// The rows of `entry` not deleted as of `now`.
@@ -2605,6 +2685,8 @@ impl TableProvider for SupertableProvider {
             }
             _ => (None, None),
         };
+        #[cfg(test)]
+        walk_probe::scan_handed(&self.manifest.superfiles, top_k_rows.as_ref());
         let survivor_entries = match &top_k_rows {
             Some(rows) => survivor_entries
                 .into_iter()
@@ -3090,7 +3172,7 @@ impl TableProvider for SupertableProvider {
         //
         // No predicate is attached to the source. DataFusion hands it the
         // `FilterExec` predicate for statistics pruning, and as a row filter
-        // only under `ORDER BY ... LIMIT` (see `RowFilterUnderTopK`).
+        // only under a `LIMIT` (see `RowFilterUnderTopK`).
         let mut source = ParquetSource::new(Arc::clone(&self.schema));
         // Serve DataFusion's opener the index-complete footers the
         // readers already parsed — without this the opener re-reads +
@@ -3670,7 +3752,8 @@ pub(crate) fn exprs_to_scalar_predicates(
 /// `a = x OR a = y` filters in `filters`. Each yields:
 ///  i)  a `ScalarValueSet` (min/max) leaf — on every column;
 ///  ii) plus, on an FTS-indexed column, a `TermPresence{Or}` leaf over the
-///      values' tokens, which prunes on which superfiles hold the term.
+///      values' tokens, which prunes on which superfiles hold the term,
+///      unless a value has no token (see [`emit_value_set_leaves`]).
 ///
 /// A `NOT IN`, a non-literal item, a function-wrapped or unknown column,
 /// or a mixed/cross-column `OR` yields no leaf — that filter just isn't
@@ -3749,6 +3832,8 @@ fn collect_value_set_leaves(
 ///
 /// The bloom flattens all tokens into one `Or`, so a superfile holding
 /// only `orange` is kept though no value matches; FilterExec verifies.
+/// A value with no token (`'!!'`, or a stopword the column drops) matches
+/// rows the bloom cannot see, so then there is no bloom leaf at all.
 fn emit_value_set_leaves(
     column: String,
     values: Vec<ScalarValue>,
@@ -3760,15 +3845,21 @@ fn emit_value_set_leaves(
     // tokenizer so the bloom probe matches how it was indexed. A column
     // `resolve` cannot answer for gets no bloom leaf — probing it with
     // some other analyzer's tokens could drop a matching superfile.
-    if let Some(tok) = resolve(&column).filter(|_| fts_cols.contains(column.as_str())) {
-        let terms = unique_tokens(tok.as_ref(), values.iter().filter_map(scalar_as_str));
-        if !terms.is_empty() {
-            out.push(PruneLeaf::TermPresence {
-                column: column.clone(),
-                terms,
-                mode: BoolMode::Or,
-            });
-        }
+    // A NULL matches no row, so it needs no term; any other value must be text with a token.
+    if let Some(tok) = resolve(&column).filter(|_| fts_cols.contains(column.as_str()))
+        && let Some(texts) = values
+            .iter()
+            .filter(|value| !value.is_null())
+            .map(scalar_as_str)
+            .collect::<Option<Vec<_>>>()
+        && let Some(terms) = unique_tokens(tok.as_ref(), texts)
+        && !terms.is_empty()
+    {
+        out.push(PruneLeaf::TermPresence {
+            column: column.clone(),
+            terms,
+            mode: BoolMode::Or,
+        });
     }
     // `column` moves into the last leaf — cloned above only for the bloom.
     out.push(PruneLeaf::ScalarValueSet { column, values });
@@ -3963,8 +4054,9 @@ fn walk_fell_back(
     Err(cause)
 }
 
-/// Test hooks into the top-k walk over one table, named by one of its files: run an action between
-/// the walk and its deletes check, make the walk fail, and count walks and why they fell back.
+/// Test hooks into the top-k over one table, named by one of its files: run an action between the
+/// walk and its deletes check, make the walk or the id read fail, count walks and why they fell
+/// back, and record the rows the top-k handed its scan.
 #[cfg(test)]
 pub(crate) mod walk_probe {
     use std::{
@@ -3972,6 +4064,7 @@ pub(crate) mod walk_probe {
         sync::{Arc, Mutex},
     };
 
+    use roaring::RoaringBitmap;
     use uuid::Uuid;
 
     use crate::supertable::{
@@ -3985,7 +4078,9 @@ pub(crate) mod walk_probe {
     struct Armed {
         after_walk: Option<Box<dyn FnOnce() + Send>>,
         fail_with: Option<QueryError>,
+        fail_id_read: Option<QueryError>,
         fallbacks: Vec<WalkFallback>,
+        handed: Option<u64>,
         walks: usize,
         windows: usize,
         walked: usize,
@@ -4031,6 +4126,31 @@ pub(crate) mod walk_probe {
         watched(superfile, |a| a.fail_with = Some(error));
     }
 
+    /// Make the next id read of a top-k over the watched table fail with `error`.
+    pub(crate) fn fail_next_id_read(superfile: Uuid, error: QueryError) {
+        watched(superfile, |a| a.fail_id_read = Some(error));
+    }
+
+    /// Whether an id-read failure armed for the watched table is still waiting to fire.
+    pub(crate) fn id_read_armed(superfile: Uuid) -> bool {
+        watched(superfile, |a| a.fail_id_read.is_some()).unwrap_or(false)
+    }
+
+    /// Rows the top-k of the last scan over the watched table handed it, `None` when it handed no
+    /// rows (no top-k, or one that scans every file).
+    pub(crate) fn rows_handed(superfile: Uuid) -> Option<u64> {
+        watched(superfile, |a| a.handed).flatten()
+    }
+
+    /// A scan over the table of `files` was handed `rows` by its top-k.
+    pub(super) fn scan_handed(
+        files: &[Arc<SuperfileEntry>],
+        rows: Option<&HashMap<Uuid, RoaringBitmap>>,
+    ) {
+        let handed = rows.map(|rows| rows.values().map(RoaringBitmap::len).sum());
+        with(files, |a| a.handed = handed);
+    }
+
     /// Walks started over the watched table.
     pub(crate) fn walks(superfile: Uuid) -> usize {
         watched(superfile, |a| a.walks).unwrap_or(0)
@@ -4067,6 +4187,16 @@ pub(crate) mod walk_probe {
             Some(error) => Err(error),
             None => walked,
         }
+    }
+
+    /// `read`, or the error armed for the next id read of a top-k over the table of `survivors`.
+    pub(super) fn inject_id_read<T>(
+        survivors: &[Arc<SuperfileEntry>],
+        read: Result<T, QueryError>,
+    ) -> Result<T, QueryError> {
+        with(survivors, |a| a.fail_id_read.take())
+            .flatten()
+            .map_or(read, Err)
     }
 
     pub(super) fn after_walk(survivors: &[Arc<SuperfileEntry>]) {
@@ -4527,6 +4657,44 @@ pub(crate) mod tests {
                 .or(cast(col("x"), DataType::Int32).eq(lit(2_i32)));
         assert!(
             exprs_to_value_set_leaves(&[expr], &s, &HashSet::new(), &standard_resolver).is_empty()
+        );
+    }
+
+    #[test]
+    fn a_value_set_with_a_tokenless_value_has_no_term_bloom() {
+        // '!!' and '' analyze to no token, so a superfile of only them is invisible to a term
+        // bloom: the list keeps its min/max leaf and gets no term leaf. A NULL needs no term.
+        let s = Arc::new(Schema::new(vec![Field::new("title", DataType::Utf8, true)]));
+        let fts = HashSet::from(["title"]);
+        let has_bloom = |list: Vec<Expr>| {
+            let leaves = exprs_to_value_set_leaves(
+                &[col("title").in_list(list, false)],
+                &s,
+                &fts,
+                &standard_resolver,
+            );
+            assert!(
+                leaves
+                    .iter()
+                    .any(|l| matches!(l, PruneLeaf::ScalarValueSet { .. })),
+                "the min/max leaf stays"
+            );
+            leaves
+                .iter()
+                .any(|l| matches!(l, PruneLeaf::TermPresence { .. }))
+        };
+        assert!(
+            !has_bloom(vec![lit("!!"), lit("Foo Bar")]),
+            "'!!' has no token"
+        );
+        assert!(!has_bloom(vec![lit(""), lit("Foo Bar")]), "'' has no token");
+        assert!(
+            has_bloom(vec![lit(ScalarValue::Utf8(None)), lit("Foo Bar")]),
+            "a NULL keeps it"
+        );
+        assert!(
+            has_bloom(vec![lit("Foo Bar"), lit("Bar Baz")]),
+            "every value has a token"
         );
     }
 

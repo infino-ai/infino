@@ -1,10 +1,16 @@
 from collections.abc import Mapping, Sequence
-from typing import Any, Literal, TypeAlias
+from typing import Any, Literal, TypeAlias, TypedDict
 
 from pyarrow import RecordBatch, Schema, Table as ArrowTable
 
 Metric: TypeAlias = Literal["cosine", "l2sq", "l2", "negdot", "dot"]
 BoolMode: TypeAlias = Literal["or", "and"]
+
+class FieldClause(TypedDict):
+    query: str
+    fields: Sequence[str]
+
+FieldClauseSpec: TypeAlias = FieldClause | tuple[str, Sequence[str]]
 # How much a reindex repairs: "auto" gives each superfile the cheapest repair
 # that makes it current; "rewrite" brings layouts current and leaves superfiles
 # whose terms are stale (reported); "reanalyze" re-tokenizes every stale
@@ -33,6 +39,7 @@ def connect(
     cold_fetch_mode: ColdFetchMode | None = ...,
     validate: bool | None = ...,
     api_key: str | None = ...,
+    request_timeout: float | None = ...,
 ) -> Connection: ...
 
 def bench_serve_tcp(
@@ -76,6 +83,13 @@ class ConflictError(InfinoError):
     """Raised when a concurrent writer won the commit race and the engine's own
     retries were exhausted. Recoverable: nothing partial is visible, so catch it,
     back off, and reissue the append / update / delete."""
+
+class UnavailableError(InfinoError):
+    """Raised when the hosted service could not be reached or did not answer in
+    time: a connection that failed or broke, a request past its
+    ``request_timeout``, or a 502, 503 or 504. Recoverable: the same request may
+    succeed later. A write that timed out may still have been committed, so
+    check before reissuing it."""
 
 class SchemaError(ValueError):
     """Raised when the schema refuses a write: a batch whose types disagree with
@@ -165,6 +179,20 @@ class Table:
         *,
         k1: float | None = ...,
         b: float | None = ...,
+    ) -> ArrowTable: ...
+    # BM25 over several FTS columns, scored best fields: each clause scores a
+    # row by its best column (largest weight * BM25 among its fields), and the
+    # row's score is the sum over the clauses it matches. `clauses` holds
+    # {"query": str, "fields": [str]} dicts or (query, fields) pairs; `mode`
+    # decides whether a row must match any clause ("or") or every clause
+    # ("and"); `weights` multiplies each named column's scores.
+    def bm25_search_fields(
+        self,
+        clauses: Sequence[FieldClauseSpec],
+        k: int,
+        mode: BoolMode | None = ...,
+        weights: Mapping[str, float] | None = ...,
+        projection: Sequence[str] | None = ...,
     ) -> ArrowTable: ...
     def vector_search(
         self,

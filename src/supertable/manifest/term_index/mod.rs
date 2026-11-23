@@ -8047,9 +8047,7 @@ mod tests {
                 .block_on(sf.term_memo_from_dict_values(&pairs))
                 .expect("memo");
             let names: Vec<&str> = pairs.iter().map(|(t, _, _)| *t).collect();
-            let (dfs, _) = rt
-                .block_on(sf.term_dfs("title", &names, &QueryDict::default()))
-                .expect("dfs");
+            let (dfs, _) = rt.block_on(sf.term_dfs("title", &names)).expect("dfs");
             let facts = rt
                 .block_on(sf.term_index_facts("title", &names))
                 .expect("facts");
