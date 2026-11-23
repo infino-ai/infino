@@ -115,7 +115,7 @@ use crate::{
         error::FtsError,
         fts::{
             reader::{BoolMode, ContainsRows, MatchWork, QueryDict},
-            tokenize::{Tokenizer, unique_tokens},
+            tokenize::{STANDARD_TOKENIZER, Tokenizer, unique_tokens},
         },
         reader::ScanShape,
     },
@@ -942,6 +942,16 @@ impl SupertableProvider {
         exact_filter(filter, fts_cols, &|col| manifest.try_fts_tokenizer_for(col))
     }
 
+    /// The analyzer whose terms a whole-term leaf on `column` names: the
+    /// column's own, `standard` for a `text_match` and `keyword` for an
+    /// equality (see [`ExactFilter`]). A leaf is built only on a column the
+    /// table indexes; `standard`, the function's analyzer, otherwise.
+    fn whole_term_analyzer(&self, column: &str) -> &'static str {
+        self.manifest
+            .try_fts_tokenizer_for(column)
+            .map_or(STANDARD_TOKENIZER, |tokenizer| tokenizer.name())
+    }
+
     /// Whether this provider answers any of `filters` exactly
     /// ([`Self::exact_filter`]): DataFusion then keeps no `Filter` node for
     /// it, and a scan carrying it returns fewer rows than the manifest's
@@ -1036,6 +1046,7 @@ impl SupertableProvider {
                     .reader
                     .term_rows(
                         file_column,
+                        self.whole_term_analyzer(&leaf.column),
                         &[leaf.needle.as_str()],
                         memos.get(&leaf.column).map(Arc::as_ref),
                         &dict,
@@ -1092,6 +1103,7 @@ impl SupertableProvider {
                     .reader
                     .term_rows(
                         file_column,
+                        self.whole_term_analyzer(column),
                         &needles,
                         memos.get(column).map(Arc::as_ref),
                         &dict,
@@ -1107,10 +1119,11 @@ impl SupertableProvider {
             };
             let (rows, column_work) = match read {
                 Ok(read) => read,
-                // A `text_match` column this superfile holds no `standard`
-                // postings for (it was written before the column's index,
-                // or under another analyzer): every live row is doubtful,
-                // so each is checked against its text below.
+                // A whole-term column this superfile holds no postings of
+                // the column's analyzer for (it was written before the
+                // column's index, or under another analyzer): every live
+                // row is doubtful, so each is checked against its text
+                // below.
                 Err(e) if whole && holds_no_postings(&e) => {
                     let total: u64 = prepared
                         .shape
@@ -2307,7 +2320,7 @@ pub(crate) fn holds_no_postings(e: &ReadError) -> bool {
         ReadError::MissingKv(_) => true,
         ReadError::Fts(f) => matches!(
             f.as_ref(),
-            FtsError::UnknownColumn(_) | FtsError::ExactNeedsStandard { .. }
+            FtsError::UnknownColumn(_) | FtsError::ExactNeedsAnalyzer { .. }
         ),
         _ => false,
     }

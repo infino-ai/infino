@@ -549,7 +549,7 @@ impl FtsReader {
     /// `FtsError::OverBudget`.
     ///
     /// Errors with `FtsError::UnknownColumn` when `column` is not
-    /// FTS-indexed here, and with `FtsError::ExactNeedsStandard` when this
+    /// FTS-indexed here, and with `FtsError::ExactNeedsAnalyzer` when this
     /// superfile indexed it with another analyzer — the rule the answer
     /// rests on is the standard analyzer's, and a plan that promised an
     /// exact answer has no fallback.
@@ -564,9 +564,10 @@ impl FtsReader {
         let col = &self.columns[column_id as usize];
         let analyzer = col.tokenizer.name();
         if analyzer != STANDARD_TOKENIZER {
-            return Err(FtsError::ExactNeedsStandard {
+            return Err(FtsError::ExactNeedsAnalyzer {
                 column: column.to_owned(),
                 analyzer: analyzer.to_owned(),
+                expected: STANDARD_TOKENIZER,
             });
         }
         let mut work = MatchWork::default();
@@ -623,28 +624,31 @@ impl FtsReader {
     /// cursors [`Self::token_match`] walks, served from `prefetched` (the
     /// table's term index) where it holds the term. Every row is proven
     /// ([`ContainsRows::doubtful`] is empty): the rows a term's postings hold
-    /// are by definition the rows that have it as a token, and the caller
-    /// (the table layer's `text_match`) asks for the tokens `standard` gives
-    /// a value, so each term is looked up as `standard` wrote it. One result
-    /// per term, in order; a term the column never indexed has no rows. The
+    /// are by definition the rows that have it as a token. The caller asks
+    /// for the terms `analyzer` gives a value (the tokens `standard` gives
+    /// for a `text_match`, the whole value under `keyword` for an equality),
+    /// so each term is looked up as that analyzer wrote it. One result per
+    /// term, in order; a term the column never indexed has no rows. The
     /// dictionary, for terms the memo lacks, is read through `dict`.
     ///
     /// Errors as [`Self::contains_rows`] does: `FtsError::UnknownColumn`
-    /// when `column` is not FTS-indexed here, `FtsError::ExactNeedsStandard`
-    /// when this superfile indexed it with another analyzer.
+    /// when `column` is not FTS-indexed here, `FtsError::ExactNeedsAnalyzer`
+    /// when this superfile indexed it with another analyzer than `analyzer`.
     pub(crate) async fn term_rows(
         &self,
         column: &str,
+        analyzer: &'static str,
         terms: &[&str],
         prefetched: Option<&crate::superfile::fts::reader::FetchedTermMemo>,
         dict: &QueryDict,
     ) -> Result<(Vec<ContainsRows>, MatchWork), FtsError> {
         let column_id = self.resolve_column_id(column)?;
-        let analyzer = self.columns[column_id as usize].tokenizer.name();
-        if analyzer != STANDARD_TOKENIZER {
-            return Err(FtsError::ExactNeedsStandard {
+        let indexed = self.columns[column_id as usize].tokenizer.name();
+        if indexed != analyzer {
+            return Err(FtsError::ExactNeedsAnalyzer {
                 column: column.to_owned(),
-                analyzer: analyzer.to_owned(),
+                analyzer: indexed.to_owned(),
+                expected: analyzer,
             });
         }
         let mut work = MatchWork::default();
@@ -1426,7 +1430,7 @@ mod tests {
         let err = rt
             .block_on(r.contains_rows("body", &["rust"], None, None))
             .expect_err("stemmed column");
-        assert!(matches!(err, FtsError::ExactNeedsStandard { .. }), "{err}");
+        assert!(matches!(err, FtsError::ExactNeedsAnalyzer { .. }), "{err}");
         let err = rt
             .block_on(r.contains_rows("nope", &["rust"], None, None))
             .expect_err("unknown column");

@@ -1297,4 +1297,42 @@ mod tests {
             assert_eq!(budget.used(), before, "{label}: nothing held afterwards");
         }
     }
+
+    /// Filters on a keyword column, `{c}` standing for it: the postings
+    /// answer them exactly on `tag`, and no index answers them on
+    /// `tag || ''`, so each row is checked.
+    const KEYWORD_EQUALITIES: [&str; 7] = [
+        "{c} = 'tag 7'",
+        "{c} = 'Tag 7'",
+        "{c} = ''",
+        "'ünï/7' = {c}",
+        "{c} = 'no such value'",
+        "{c} IN ('tag 7', 'Tag 7', 'tag 7.', '', 'no such value')",
+        "{c} IN ('tag 9') OR {c} = 'tag 11'",
+    ];
+
+    /// `=` and `IN` on a keyword column select their rows from the postings,
+    /// with no filter left to check each row, and return what a per-row
+    /// check returns, deletes, case and the empty string included: from the
+    /// term index and from each file's dictionary.
+    #[test]
+    fn keyword_equalities_select_rows_from_the_postings() {
+        for term_index in [true, false] {
+            let (_dir, _cache_dir, table, _schema) = keyword_value_table(term_index);
+            let reader = table.reader().expect("reader");
+            for filter in KEYWORD_EQUALITIES {
+                let checked = filter.replace("{c}", "(tag || '')");
+                let filter = filter.replace("{c}", "tag");
+                let label = format!("{filter}, term index {term_index}");
+                for select in ["n, tag", "COUNT(*)"] {
+                    let sql = format!("SELECT {select} FROM supertable WHERE {filter}");
+                    let forced = format!("SELECT {select} FROM supertable WHERE {checked}");
+                    assert_eq!(rows(&reader, &sql), rows(&reader, &forced), "{label}");
+                }
+                let sql = format!("SELECT n FROM supertable WHERE {filter}");
+                let plan = explain(&reader, &sql);
+                assert!(!plan.contains("FilterExec"), "{label}: {plan}");
+            }
+        }
+    }
 }

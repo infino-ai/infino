@@ -3047,11 +3047,12 @@ impl SuperfileReader {
     }
 
     /// For each of `terms`, the rows of `column` that hold the term as one
-    /// of their tokens, from the postings alone: every row proven, none
-    /// doubtful. Delegates to [`FtsReader::term_rows`].
+    /// of their tokens under `analyzer`, from the postings alone: every row
+    /// proven, none doubtful. Delegates to [`FtsReader::term_rows`].
     pub(crate) async fn term_rows(
         &self,
         column: &str,
+        analyzer: &'static str,
         terms: &[&str],
         prefetched: Option<&FetchedTermMemo>,
         dict: &QueryDict,
@@ -3059,7 +3060,9 @@ impl SuperfileReader {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
-        Ok(fts.term_rows(column, terms, prefetched, dict).await?)
+        Ok(fts
+            .term_rows(column, analyzer, terms, prefetched, dict)
+            .await?)
     }
 
     /// Unranked token-match **count**: the number of `local_doc_id`s
