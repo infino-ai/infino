@@ -135,6 +135,12 @@ const TIER_READ_MAX_BYTES: u64 = 16 * 1024 * 1024;
 /// practice.
 const CEILING_SLACK: f32 = 1.0 + BOUND_ROUNDING_SLACK;
 
+/// Relative error, in units of `f32::EPSILON` per summed term, by which two
+/// sums of the same non-negative terms in different orders can differ. A
+/// ceiling adds its terms in index order while a kernel adds the scores in
+/// cursor order, so the ceiling widens by this much per term it sums.
+const REASSOCIATION_ULPS_PER_TERM: f32 = 2.0;
+
 /// Decoded posting runs kept per loaded index, keyed by `column \x1F term`.
 /// A ranked query asks for the same term's postings several times — to
 /// choose parts, to select superfiles, for ceilings, for locations — and
@@ -3046,6 +3052,8 @@ impl TermIndex {
                 per_term.insert(term, by_sf);
             }
         }
+        let summed = terms.len() + phrases.len();
+        let reassociation = 1.0 + REASSOCIATION_ULPS_PER_TERM * summed as f32 * f32::EPSILON;
         let mut out: HashMap<Uuid, f32> = HashMap::with_capacity(entries.len());
         for e in entries {
             let id = e.superfile_id;
@@ -3079,7 +3087,7 @@ impl TermIndex {
                     };
                 }
             }
-            out.insert(id, ceiling * CEILING_SLACK);
+            out.insert(id, ceiling * CEILING_SLACK * reassociation);
         }
         Ok(out)
     }
@@ -6483,6 +6491,37 @@ mod tests {
     /// document actually receives — for single terms, multi-term unions
     /// and phrases under table-wide statistics, where the stored bound is
     /// rescaled from the superfile's own idf to the query's.
+    /// A ceiling sums its terms in index order and a kernel sums the same
+    /// scores in cursor order: the reassociation slack keeps the ceiling at
+    /// or above the score for any order, up to a hundred terms and more.
+    #[test]
+    fn ceiling_slack_covers_summing_in_another_order() {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..20_000 {
+            let n = 2 + (next() % 100) as usize;
+            let terms: Vec<f32> = (0..n)
+                .map(|_| (next() % 1_000_000) as f32 / 37_000.0 * (1 + next() % 3) as f32)
+                .collect();
+            let mut shuffled = terms.clone();
+            for i in (1..n).rev() {
+                shuffled.swap(i, (next() % (i as u64 + 1)) as usize);
+            }
+            let ceiling = terms.iter().sum::<f32>()
+                * (1.0 + REASSOCIATION_ULPS_PER_TERM * n as f32 * f32::EPSILON);
+            let score: f32 = shuffled.iter().sum();
+            assert!(
+                ceiling >= score,
+                "{n} terms: ceiling {ceiling} under score {score}"
+            );
+        }
+    }
+
     #[test]
     fn query_ceilings_bound_real_scores_for_terms_and_phrases() {
         use crate::Bm25SearchOptions;
