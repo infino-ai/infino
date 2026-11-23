@@ -1194,7 +1194,7 @@ mod tests {
             let tags: Vec<Option<String>> = (0..LONG_ROWS)
                 .map(|row| {
                     let n = file * LONG_ROWS + row;
-                    (n % 10 != 0).then(|| format!("{n:0>LONG_VALUE_LEN$}"))
+                    (!n.is_multiple_of(10)).then(|| format!("{n:0>LONG_VALUE_LEN$}"))
                 })
                 .collect();
             let tags: ArrayRef = Arc::new(LargeStringArray::from(tags));
