@@ -239,14 +239,16 @@ impl MatchOrder {
     }
 
     /// Superfiles to keep open at once once `answered` have answered: as
-    /// many as have answered, from [`ORDERED_WINDOW`] up to `widest`. A walk
-    /// that stops early stops while its window is small, opening at most
-    /// about twice the superfiles it needs; one that cannot stop — a `WHERE`
+    /// many as have answered, from [`ORDERED_WINDOW`] up to `widest`, and
+    /// never past `widest`, the fan-out's cap, even when it is below
+    /// [`ORDERED_WINDOW`]. A walk that stops early stops while its window
+    /// is small, opening at most about twice the superfiles it needs; one
+    /// that cannot stop — a `WHERE`
     /// few rows pass, or a column whose ranges overlap in every superfile —
     /// reaches the fan-out's width in a few steps instead of opening every
     /// superfile a fixed few at a time.
     pub(crate) fn window(answered: usize, widest: usize) -> usize {
-        answered.clamp(ORDERED_WINDOW, widest.max(ORDERED_WINDOW))
+        answered.max(ORDERED_WINDOW).min(widest)
     }
 
     /// [`Self::window`] for this walk: the fan-out's width from the start
@@ -254,7 +256,7 @@ impl MatchOrder {
     pub(crate) fn walk_window(&self, answered: usize, widest: usize) -> usize {
         match self.stops_early {
             true => Self::window(answered, widest),
-            false => widest.max(ORDERED_WINDOW),
+            false => widest,
         }
     }
 
@@ -439,7 +441,7 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::scalar::ScalarValue;
 
-    use super::{MatchOrder, keep_best};
+    use super::{MatchOrder, ORDERED_WINDOW, keep_best};
     use crate::{
         IndexSpec, connect,
         superfile::SuperfileReader,
@@ -462,6 +464,12 @@ mod tests {
     const SEEDED: [i64; FETCH] = [THRESHOLD_HOUR, 50];
     /// The worst of [`SEEDED`].
     const THRESHOLD_HOUR: i64 = 40;
+    /// A fan-out cap of one superfile at a time.
+    const ONE_IN_FLIGHT: usize = 1;
+    /// A fan-out cap above [`ORDERED_WINDOW`].
+    const WIDE_IN_FLIGHT: usize = 16;
+    /// Superfiles answered, past either cap.
+    const MANY_ANSWERED: usize = 100;
 
     /// A walk ordering one superfile of [`HOURS`] by `hour DESC LIMIT FETCH`,
     /// the table's reader, and that superfile's entry and reader.
@@ -606,5 +614,28 @@ mod tests {
             rank(&order, *SEEDED.last().expect("seeded")),
             "a verified match raises it"
         );
+    }
+
+    /// The walk never keeps more superfiles open than the fan-out's cap,
+    /// whether it can stop early or not, even a cap below
+    /// [`ORDERED_WINDOW`]; a wider cap still starts a walk that can stop
+    /// early at [`ORDERED_WINDOW`] and one that cannot at the cap.
+    #[test]
+    fn the_walk_window_never_passes_the_fan_out_cap() {
+        let (mut order, _, _, _) = fixture();
+        for stops_early in [true, false] {
+            order.stops_early = stops_early;
+            for answered in [0, MANY_ANSWERED] {
+                assert_eq!(order.walk_window(answered, ONE_IN_FLIGHT), ONE_IN_FLIGHT);
+            }
+        }
+        order.stops_early = true;
+        assert_eq!(order.walk_window(0, WIDE_IN_FLIGHT), ORDERED_WINDOW);
+        assert_eq!(
+            order.walk_window(MANY_ANSWERED, WIDE_IN_FLIGHT),
+            WIDE_IN_FLIGHT
+        );
+        order.stops_early = false;
+        assert_eq!(order.walk_window(0, WIDE_IN_FLIGHT), WIDE_IN_FLIGHT);
     }
 }
