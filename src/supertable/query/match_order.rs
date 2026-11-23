@@ -277,11 +277,8 @@ impl MatchOrder {
         for chunk in candidates.chunks(EXACT_SCOPE_TAKE_ROWS) {
             let (ranks, _) = self.chunk_ranks(r, chunk, 0).await?;
             placing.extend(
-                chunk
-                    .iter()
-                    .zip(&ranks)
-                    .filter(|(_, rank)| **rank >= worst)
-                    .map(|(row, _)| *row),
+                self.ranked_at_least(chunk.to_vec(), ranks, Some(worst))
+                    .await?,
             );
         }
         Ok(placing)
@@ -350,12 +347,8 @@ impl MatchOrder {
             Some(check) => check.keep(r, &rows).await?,
             None => rows,
         };
-        let hits: Vec<SuperfileHit> = hits
-            .into_iter()
-            .filter(|h| kept.contains(h.local_doc_id))
-            .collect();
-        if hits.is_empty() {
-            return Ok(hits);
+        if kept.is_empty() {
+            return Ok(Vec::new());
         }
         // The keys are read in chunks: a chunk's best `fetch` ranks are all
         // the walk's best can take from it, so only those reach the lock.
@@ -378,18 +371,43 @@ impl MatchOrder {
                 }
             };
             // A tie with the `fetch`-th best is kept: the sort above breaks it.
-            placing.extend(
-                chunk
-                    .iter()
-                    .zip(&ranks)
-                    .filter(|(_, rank)| worst.is_none_or(|worst| **rank >= worst))
-                    .map(|(row, _)| *row),
-            );
+            placing.extend(self.ranked_at_least(chunk, ranks, worst).await?);
         }
-        Ok(hits
-            .into_iter()
-            .filter(|h| placing.contains(h.local_doc_id))
-            .collect())
+        run_on_pool(
+            Some(&self.manifest.options.reader_pool),
+            "ordered match pruning",
+            move || {
+                hits.into_iter()
+                    .filter(|h| placing.contains(h.local_doc_id))
+                    .collect()
+            },
+        )
+        .await
+        .map_err(QueryError::internal)
+    }
+
+    /// Of `rows`, those whose rank in `ranks` is at least `worst`, all of
+    /// them while there is no worst yet. Picked on the reader pool, since a
+    /// chunk holds up to [`EXACT_SCOPE_TAKE_ROWS`] rows.
+    async fn ranked_at_least(
+        &self,
+        rows: Vec<u32>,
+        ranks: Vec<u64>,
+        worst: Option<u64>,
+    ) -> Result<Vec<u32>, QueryError> {
+        run_on_pool(
+            Some(&self.manifest.options.reader_pool),
+            "ordered match pruning",
+            move || {
+                rows.into_iter()
+                    .zip(ranks)
+                    .filter(|(_, rank)| worst.is_none_or(|worst| *rank >= worst))
+                    .map(|(row, _)| row)
+                    .collect()
+            },
+        )
+        .await
+        .map_err(QueryError::internal)
     }
 }
 
