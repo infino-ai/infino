@@ -73,9 +73,12 @@ use super::fts::baked_avgdl;
 use crate::{
     memory::{ConnectionMemoryBudget, Reservation},
     runtime_bridge::run_on_pool,
-    superfile::fts::{
-        bm25::{Bm25Params, score_with_dl_norm_k1},
-        reader::{GlobalTermIdf, norm_table},
+    superfile::{
+        format::fts::DOC_LENGTH_STORED_MAX,
+        fts::{
+            bm25::{Bm25Params, dequantize_len, score_with_dl_norm_k1, tf_factor},
+            reader::{GlobalTermIdf, norm_table},
+        },
     },
     supertable::{
         error::QueryError,
@@ -460,6 +463,10 @@ struct HeadState {
     /// any document of the superfile: its stored ceiling. Zero when the
     /// superfile holds no document of the term.
     ceiling: f32,
+    /// The largest key, at the superfile's own average length, of any
+    /// document of the superfile not in `docs`: the stored key `tail`
+    /// was scaled from. Zero once every document is in `docs`.
+    tail_key: f32,
     /// Nothing more of the head can be read: it was read to its end, or
     /// the superfile holds no block beyond.
     done: bool,
@@ -478,6 +485,7 @@ impl HeadState {
             blocks: 0,
             tail: 0.0,
             ceiling: 0.0,
+            tail_key: 0.0,
             done: true,
             source: None,
         }
@@ -562,6 +570,8 @@ struct Slot {
     /// The ratio the superfile's stored keys and tails are scaled by to
     /// hold at the table's average length.
     scale_up: f32,
+    /// The average length the superfile's stored keys are computed at.
+    key_avgdl: f32,
     /// Rows deleted from the superfile: read past, never candidates.
     deny: Option<Arc<RoaringBitmap>>,
     /// The highest `_id` the superfile holds; `i128::MAX` until known,
@@ -581,6 +591,7 @@ impl Slot {
             live: true,
             ordinal: u32::MAX,
             scale_up,
+            key_avgdl: 0.0,
             deny,
             id_max: i128::MAX,
         }
@@ -777,6 +788,7 @@ pub(crate) async fn prepare_merge<'a>(
         };
         let mut slot = Slot::new(nt, scale_up, query.deny.get(slots.len()).cloned().flatten());
         slot.id_max = e.id_max;
+        slot.key_avgdl = baked;
         slots.push(slot);
     }
     // The slot of a superfile the index files under `ordinal`; `None` for
@@ -849,6 +861,12 @@ pub(crate) async fn prepare_merge<'a>(
                     blocks: p.df.div_ceil(BLOCK_ENTRIES as u64) as u32,
                     tail,
                     ceiling,
+                    // The best document's key bounds every key until a
+                    // block's tail lowers it.
+                    tail_key: match p.tail.is_finite() && !chunked {
+                        true => p.tail.min(p.bound),
+                        false => p.bound,
+                    },
                     done: !chunked,
                     source,
                 };
@@ -1335,6 +1353,7 @@ impl Merge {
                         state.tail =
                             (tail_key * scoring.idf[read.ti] * slot.scale_up * BOUND_SLACK)
                                 .min(state.ceiling);
+                        state.tail_key = state.tail_key.min(tail_key.max(0.0));
                         if tail_key <= 0.0 || decoded.len() < BLOCK_ENTRIES {
                             state.done = true;
                         }
@@ -1535,6 +1554,35 @@ impl Slot {
             }
         }
         let heads = &self.heads;
+        // Zero where the superfile's key average is unknown: its tails then
+        // bound by their scaled keys alone.
+        let avgdl = self.key_avgdl;
+        // A read document's length bucket, and the occurrences its length
+        // leaves for the terms it was not read under: every query term's
+        // occurrences are tokens of the document, so together they are at
+        // most its length.
+        let room = |mask: TermMask, tf_len: &[u32]| -> Option<(u8, u32)> {
+            if mask == 0 || avgdl <= 0.0 {
+                return None;
+            }
+            let mut len = 0u8;
+            let mut used = 0u32;
+            for (t, packed) in tf_len.iter().enumerate() {
+                if mask & (1 << t) != 0 {
+                    let (tf, l) = unpack_tf_len(*packed);
+                    len = l;
+                    used = match tf {
+                        TF_UNKNOWN => u32::MAX,
+                        tf => used.saturating_add(tf),
+                    };
+                }
+            }
+            let left = match bucket_max_len(len) {
+                Some(max) if used != u32::MAX => max.saturating_sub(used),
+                _ => u32::MAX,
+            };
+            Some((len, left))
+        };
         // The bound for a document read under `mask` with contributions
         // `c` and packed frequencies and lengths `tf_len` (every tail for
         // one read under no term). Widened by the slack only where its sum
@@ -1544,12 +1592,30 @@ impl Slot {
         let doc_ub = |mask: TermMask, c: &[f32], tf_len: &[u32]| -> f32 {
             let mut ub = 0.0f32;
             let mut exact = shape.exact_sums;
+            let fit = room(mask, tf_len);
             for (t, h) in heads.iter().enumerate() {
                 if shape.scoring & (1 << t) != 0 {
-                    ub += if mask & (1 << t) != 0 { c[t] } else { h.tail };
+                    ub += if mask & (1 << t) != 0 {
+                        c[t]
+                    } else if let Some((len, left)) = fit {
+                        // At most the occurrences the tail's key and the
+                        // document's length allow, scored as the kernel
+                        // scores them.
+                        let tf = max_tf(h.tail_key, scoring.params, avgdl, len, left);
+                        h.tail
+                            .min(score_at_most(idf[t], tf, norm[usize::from(len)]))
+                    } else {
+                        h.tail
+                    };
                 }
             }
             for (members, _) in &shape.phrases {
+                // A document shorter than the phrase cannot hold it.
+                if let Some((len, _)) = fit
+                    && bucket_max_len(len).is_some_and(|max| max < members.len() as u32)
+                {
+                    continue;
+                }
                 // By keys: the members' idf sum times the smallest member
                 // key, a read member's own or an unread one's tail — needs
                 // the slack, through its divisions.
@@ -1589,7 +1655,20 @@ impl Slot {
         scratch.tf_len.clear();
         scratch.tf_len.resize(nt, 0);
         let mut ub = if settled == 0 {
-            doc_ub(0, &scratch.zero, &scratch.tf_len)
+            let by_tails = doc_ub(0, &scratch.zero, &scratch.tf_len);
+            match avgdl > 0.0 {
+                // A document read under no term has some length bucket; at
+                // each, its terms are held to what their tails' keys and
+                // its length allow.
+                true => {
+                    let mut tfs = Vec::with_capacity(nt);
+                    let by_length = (0..=u8::MAX)
+                        .map(|len| unseen_bound_at(heads, shape, scoring, avgdl, len, &mut tfs))
+                        .fold(f32::NEG_INFINITY, f32::max);
+                    by_tails.min(by_length)
+                }
+                false => by_tails,
+            }
         } else {
             f32::NEG_INFINITY
         };
@@ -1677,6 +1756,146 @@ fn phrase_atom_bound(
     ))
 }
 
+/// The longest a document whose length is quantized to bucket `len` can
+/// be; `None` when the bucket does not bound it (the top bucket, or one
+/// reaching the length a blob saturates at).
+fn bucket_max_len(len: u8) -> Option<u32> {
+    let next = dequantize_len(len.checked_add(1)?);
+    // Codes past the saturated length decode out of order.
+    if next <= dequantize_len(len) {
+        return None;
+    }
+    let max = next - 1;
+    (max < DOC_LENGTH_STORED_MAX).then_some(max)
+}
+
+/// Widening of a key compared against a stored tail: the two are computed
+/// the same way at the same average, so this only absorbs a difference of
+/// a rounding or two where an average was recovered from its fixed point.
+const KEY_TOLERANCE: f32 = 1.0 + 4.0 * f32::EPSILON;
+
+/// The most occurrences, up to `cap`, a term can have in a document of
+/// length bucket `len` whose key at `avgdl` is at most `key`: the key
+/// rises with the frequency at a fixed length.
+fn max_tf(key: f32, params: Bm25Params, avgdl: f32, len: u8, cap: u32) -> u32 {
+    if cap == 0 || key <= 0.0 {
+        return 0;
+    }
+    let norm = params.dl_norm_k1(dequantize_len(len), avgdl);
+    let limit = key * KEY_TOLERANCE;
+    let fits = |tf: u32| tf_factor(tf, norm) <= limit;
+    // `tf / (tf + norm) <= key` solves to `tf <= norm · key / (1 − key)`;
+    // past the frequencies a bound is exact at, the cap is as tight.
+    let guess = norm * key / (1.0 - key);
+    // A NaN guess (an average of zero) takes the cap too.
+    if guess.is_nan() || guess >= PHRASE_TF_EXACT_MAX as f32 {
+        return cap;
+    }
+    let mut tf = (guess as u32).min(cap);
+    while tf < cap && fits(tf + 1) {
+        tf += 1;
+    }
+    while tf > 0 && !fits(tf) {
+        tf -= 1;
+    }
+    tf
+}
+
+/// An upper bound on what a term of weight `idf` contributes to a document
+/// of length norm `norm` at `tf` occurrences or fewer: the kernel's score
+/// at `tf`, where the score rises with the frequency in f32 (see
+/// [`PHRASE_TF_EXACT_MAX`]), and that score widened by [`BOUND_SLACK`]
+/// elsewhere.
+fn score_at_most(idf: f32, tf: u32, norm: f32) -> f32 {
+    if tf == 0 {
+        return 0.0;
+    }
+    let score = score_with_dl_norm_k1(idf, tf, norm);
+    match tf <= PHRASE_TF_EXACT_MAX && norm >= PHRASE_EXACT_MIN_NORM {
+        true => score,
+        false => score * BOUND_SLACK,
+    }
+}
+
+/// Above what the greedy split of a length budget may search, the budget
+/// is left unsplit: a document that long bounds its terms independently.
+const MAX_SPLIT_BUDGET: u32 = 64;
+
+/// The most a document of length bucket `len` scores that was read under
+/// no query term, through the heads' keys: each bare term at most the
+/// occurrences its tail allows there, every term's occurrences together at
+/// most the document's length, and a phrase at most as often as its
+/// members allow and its length fits. The kernel's arithmetic throughout;
+/// widened where a frequency is past the exact range, or where the budget
+/// is split greedily.
+fn unseen_bound_at(
+    heads: &[HeadState],
+    shape: &Shape,
+    scoring: &Scoring,
+    avgdl: f32,
+    len: u8,
+    tfs: &mut Vec<u32>,
+) -> f32 {
+    let norm = scoring.norm[usize::from(len)];
+    let max_len = bucket_max_len(len);
+    let cap = max_len.unwrap_or(u32::MAX);
+    tfs.clear();
+    tfs.extend(
+        heads
+            .iter()
+            .map(|h| max_tf(h.tail_key, scoring.params, avgdl, len, cap)),
+    );
+    let scoring_terms = || (0..heads.len()).filter(|t| shape.scoring & (1 << t) != 0);
+    let budget_used: u64 = scoring_terms().map(|t| u64::from(tfs[t])).sum();
+    let mut ub = match max_len {
+        Some(m) if budget_used > u64::from(m) && m <= MAX_SPLIT_BUDGET => {
+            // Spend the length one occurrence at a time where it adds the
+            // most: optimal for scores concave in the frequency, up to the
+            // roundings the widening covers.
+            let mut given = vec![0u32; heads.len()];
+            for _ in 0..m {
+                let best = scoring_terms()
+                    .filter(|&t| given[t] < tfs[t])
+                    .map(|t| {
+                        let idf = scoring.idf[t];
+                        let gain = score_with_dl_norm_k1(idf, given[t] + 1, norm)
+                            - score_with_dl_norm_k1(idf, given[t], norm);
+                        (t, gain)
+                    })
+                    .max_by(|a, b| a.1.total_cmp(&b.1));
+                let Some((t, _)) = best else { break };
+                given[t] += 1;
+            }
+            let sum: f32 = scoring_terms()
+                .map(|t| score_at_most(scoring.idf[t], given[t], norm))
+                .sum();
+            sum * (1.0 + (8 + heads.len()) as f32 * f32::EPSILON)
+        }
+        _ => scoring_terms()
+            .map(|t| score_at_most(scoring.idf[t], tfs[t], norm))
+            .sum(),
+    };
+    for (members, _) in &shape.phrases {
+        let m = members.len() as u32;
+        if max_len.is_some_and(|l| l < m) {
+            continue;
+        }
+        let mut tf = members.iter().map(|&t| tfs[t]).min().unwrap_or(0);
+        if let Some(l) = max_len {
+            tf = tf.min(l + 1 - m);
+        }
+        let idf_sum: f32 = members.iter().map(|&t| scoring.idf[t]).sum();
+        ub += score_at_most(idf_sum, tf, norm);
+    }
+    // Past two atoms the kernel adds them in its own order, which can round
+    // above the sum taken here.
+    let atoms = shape.scoring.count_ones() as usize + shape.phrases.len();
+    match atoms > EXACT_SUM_TERMS {
+        true => ub * (1.0 + (8 + atoms) as f32 * f32::EPSILON),
+        false => ub,
+    }
+}
+
 /// The sum of a document's bare-term contributions.
 fn bare_sum(contrib: &[f32], scoring: TermMask) -> f32 {
     contrib
@@ -1696,6 +1915,8 @@ struct Scoring {
     /// kernel's own table, at the column's parameters and the average
     /// every kept superfile scores at.
     norm: Arc<[f32; 256]>,
+    /// The column's parameters, which stored keys are computed at.
+    params: Bm25Params,
 }
 
 impl Scoring {
@@ -1703,6 +1924,7 @@ impl Scoring {
         Self {
             idf,
             norm: norm_table(avgdl, params),
+            params,
         }
     }
 
@@ -1731,6 +1953,9 @@ impl Ord for OrdF32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        superfile::fts::bm25::quantize_len, supertable::manifest::term_index::ColumnScoring,
+    };
 
     /// A frequency and length the bound oracles do not model: a phrase over
     /// such documents is bounded by its members' contributions.
@@ -1743,6 +1968,7 @@ mod tests {
         Scoring {
             idf: idf.to_vec(),
             norm: Arc::new(FLAT_NORM),
+            params: Bm25Params::default(),
         }
     }
 
@@ -1873,6 +2099,186 @@ mod tests {
                 "case {case}: the lower bound {lb} exceeds the best candidate {best}"
             );
         }
+    }
+
+    /// Longest document the length-aware oracle draws; past
+    /// sixteen tokens lengths fall in quantized buckets.
+    const ORACLE_MAX_LEN: u32 = 40;
+    /// Most entries a head keeps in the length-aware oracle.
+    const ORACLE_MAX_DEPTH: u64 = 8;
+    /// Average length the length-aware oracle's table scores at.
+    const ORACLE_TABLE_AVGDL: f32 = 6.0;
+
+    /// One superfile of real documents for the length-aware oracle: per
+    /// document its length and per term its frequency, with the
+    /// frequencies summing to at most the length.
+    struct OracleCorpus {
+        lens: Vec<u32>,
+        tfs: Vec<Vec<u32>>,
+    }
+
+    /// Fill `slot` with heads cut from `corpus` the way a build cuts them:
+    /// per term, its documents in descending key at `baked`, the first
+    /// `depth` read and the next one's key the tail.
+    fn cut_heads(
+        slot: &mut Slot,
+        corpus: &OracleCorpus,
+        scoring: &Scoring,
+        baked: f32,
+        next: &mut impl FnMut() -> u64,
+    ) {
+        let keys = ColumnScoring {
+            avgdl: baked,
+            params: scoring.params,
+            scored_docs: 0,
+        };
+        slot.key_avgdl = baked;
+        for (ti, tfs) in corpus.tfs.iter().enumerate() {
+            let mut docs: Vec<(f32, u32)> = tfs
+                .iter()
+                .enumerate()
+                .filter(|(_, tf)| **tf > 0)
+                .map(|(d, tf)| (keys.key(*tf, quantize_len(corpus.lens[d])), d as u32))
+                .collect();
+            docs.sort_by(|a, b| b.0.total_cmp(&a.0));
+            let depth = (next() % (ORACLE_MAX_DEPTH + 1)) as usize;
+            let tail_key = docs.get(depth).map_or(0.0, |d| d.0);
+            let ceiling_key = docs.first().map_or(0.0, |d| d.0);
+            let idf = scoring.idf[ti];
+            let h = &mut slot.heads[ti];
+            h.tail_key = tail_key;
+            h.tail = tail_key * idf * slot.scale_up * BOUND_SLACK;
+            h.ceiling = ceiling_key * idf * slot.scale_up * BOUND_SLACK;
+            h.done = true;
+            h.whole = tail_key <= 0.0;
+            for &(_, d) in docs.iter().take(depth) {
+                let (tf, len) = (tfs[d as usize], quantize_len(corpus.lens[d as usize]));
+                let c = score_with_dl_norm_k1(idf, tf, scoring.norm[usize::from(len)]);
+                slot.absorb(ti, d, c, pack_tf_len(tf, len));
+            }
+        }
+    }
+
+    /// Bounds taken from real documents' lengths and the heads' keys,
+    /// rescaled from the average each superfile was built at, hold over
+    /// every document of the superfile, read or not: for one or two bare
+    /// terms bit for bit against the kernel's sum, past that within the
+    /// slack a longer sum needs.
+    #[test]
+    fn length_aware_bounds_hold_over_real_documents() {
+        let mut next = crate::test_helpers::xorshift(0xD1B5_4A32_D192_ED03);
+        let params = Bm25Params::default();
+        for case in 0..BOUND_CASES {
+            let nt = 1 + (next() % 3) as usize;
+            let idf: Vec<f32> = (0..nt)
+                .map(|_| 0.5 + (next() % 1000) as f32 / 300.0)
+                .collect();
+            let scoring = Scoring::new(idf.clone(), params, ORACLE_TABLE_AVGDL);
+            // A phrase over every term, sometimes, in place of bare terms.
+            let phrase = nt >= 2 && next().is_multiple_of(3);
+            let all: TermMask = (1u64 << nt) - 1;
+            let shape = Shape {
+                required: 0,
+                scoring: if phrase { 0 } else { all },
+                phrases: if phrase {
+                    vec![((0..nt).collect(), false)]
+                } else {
+                    Vec::new()
+                },
+                trusted: false,
+                exact_sums: !phrase && nt <= EXACT_SUM_TERMS,
+            };
+            let baked = 2.0 + (next() % 1000) as f32 / 125.0;
+            let scale_up = match baked < ORACLE_TABLE_AVGDL {
+                true => (ORACLE_TABLE_AVGDL / baked).next_up(),
+                false => 1.0,
+            };
+            let mut corpus = OracleCorpus {
+                lens: Vec::new(),
+                tfs: vec![Vec::new(); nt],
+            };
+            for _ in 0..UNIVERSE {
+                let len = 1 + (next() % u64::from(ORACLE_MAX_LEN)) as u32;
+                let mut left = len;
+                corpus.lens.push(len);
+                for tfs in corpus.tfs.iter_mut() {
+                    let tf = match next().is_multiple_of(2) {
+                        true => (next() % (u64::from(left) + 1)) as u32,
+                        false => 0,
+                    };
+                    left -= tf;
+                    tfs.push(tf);
+                }
+            }
+            let mut slot = Slot::new(nt, scale_up, None);
+            cut_heads(&mut slot, &corpus, &scoring, baked, &mut next);
+            let slack = if shape.exact_sums {
+                1.0
+            } else {
+                1.0 + (8 + nt) as f32 * f32::EPSILON
+            };
+            slot.refresh(&shape, &scoring, 10, 1.0, slack, &mut Scratch::default());
+            for d in 0..UNIVERSE as usize {
+                let len = quantize_len(corpus.lens[d]);
+                let norm = scoring.norm[usize::from(len)];
+                let tf = |t: usize| corpus.tfs[t][d];
+                let score = match phrase {
+                    // The phrase at its most: as often as its rarest
+                    // member, where it fits.
+                    true => {
+                        let most = (0..nt).map(tf).min().unwrap_or(0);
+                        let fits = corpus.lens[d] + 1 - (nt as u32).min(corpus.lens[d]);
+                        let idf_sum: f32 = idf.iter().sum();
+                        match corpus.lens[d] >= nt as u32 && most > 0 {
+                            true => score_with_dl_norm_k1(idf_sum, most.min(fits), norm),
+                            false => 0.0,
+                        }
+                    }
+                    false => (0..nt)
+                        .map(|t| score_with_dl_norm_k1(idf[t], tf(t), norm))
+                        .sum(),
+                };
+                assert!(
+                    score <= slot.ub,
+                    "case {case}: document {d} scores {score} above the bound {}",
+                    slot.ub
+                );
+            }
+        }
+    }
+
+    /// Two terms whose best document is read under one of them, of a
+    /// length that leaves room for one occurrence of the other: the bound
+    /// is that document's score bit for bit, so a superfile that can only
+    /// tie the threshold is skipped on the tie.
+    #[test]
+    fn a_two_term_tie_bounds_at_the_kernel_score() {
+        let params = Bm25Params::default();
+        let idf = vec![3.0f32, 2.0];
+        let scoring = Scoring::new(idf.clone(), params, ORACLE_TABLE_AVGDL);
+        let shape = Shape {
+            required: 0,
+            scoring: 0b11,
+            phrases: Vec::new(),
+            trusted: true,
+            exact_sums: true,
+        };
+        // Document 0 holds both terms in two tokens; the second term's
+        // head shows only document 1, a one-token document.
+        let corpus = OracleCorpus {
+            lens: vec![2, 1],
+            tfs: vec![vec![1, 0], vec![1, 1]],
+        };
+        let baked = ORACLE_TABLE_AVGDL;
+        let mut slot = Slot::new(2, 1.0, None);
+        let mut depths = [2u64, 1].into_iter();
+        cut_heads(&mut slot, &corpus, &scoring, baked, &mut || {
+            depths.next().unwrap_or(0)
+        });
+        slot.refresh(&shape, &scoring, 10, 1.0, 1.0, &mut Scratch::default());
+        let norm = scoring.norm[2];
+        let best = score_with_dl_norm_k1(idf[0], 1, norm) + score_with_dl_norm_k1(idf[1], 1, norm);
+        assert_eq!(slot.ub.to_bits(), best.to_bits());
     }
 
     /// The policy alternates until each way has its samples, then takes
