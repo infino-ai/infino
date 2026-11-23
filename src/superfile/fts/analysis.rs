@@ -217,7 +217,9 @@ const STANDARD_REVISION: u32 = 1;
 /// reads as older than it.
 const KEYWORD_REVISION: u32 = 1;
 
-/// The base tokenizer a column's analysis starts from.
+/// The base tokenizer a column's analysis starts from. A column names it
+/// with [`FtsField::analyzer`](crate::FtsField::analyzer); see there for
+/// what each one indexes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 /// `#[non_exhaustive]` for the same reason as [`Stopwords`].
 #[non_exhaustive]

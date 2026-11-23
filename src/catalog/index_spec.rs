@@ -262,13 +262,16 @@ impl IndexSpec {
     }
 
     /// Mark a column as full-text (BM25) indexed. Takes a plain column
-    /// name for the defaults, or an [`FtsField`] to set the analysis
-    /// filters and whether the raw text is stored:
+    /// name for the defaults, or an [`FtsField`] to set the analyzer, the
+    /// analysis filters and whether the raw text is stored. Below, `host`
+    /// is indexed by the `keyword` analyzer, one exact term per value (see
+    /// [`FtsField::analyzer`]):
     ///
     /// ```
     /// use infino::{FtsField, IndexSpec, Stopwords};
     /// let spec = IndexSpec::new()
     ///     .fts("title")
+    ///     .fts(FtsField::new("host").analyzer("keyword"))
     ///     .fts(FtsField::new("body").stopwords(Stopwords::English).stored(false));
     /// # let _ = spec;
     /// ```
