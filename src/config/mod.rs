@@ -183,7 +183,8 @@ pub struct MemorySettings {
     /// the whole process: a scan of a column it has kept reads the arrays
     /// instead of decoding the file's pages again. Least recently used
     /// columns leave first. `0` (the default) keeps none. Read once per
-    /// process.
+    /// process, and not at all when the embedder sized the cache first
+    /// ([`crate::set_decoded_column_cache_bytes`]).
     pub decoded_column_cache_bytes: u64,
 }
 
@@ -206,7 +207,9 @@ impl Default for MemorySettings {
 /// where threading a per-table [`crate::supertable::SupertableOptions`]
 /// down to the read site isn't practical. Such knobs were previously
 /// bespoke `std::env::var("INFINO_…")` reads; they now live in
-/// [`Config`] and are read from here, so YAML alone controls them.
+/// [`Config`] and are read from here, so YAML alone controls them. The
+/// one exception is the decoded-column cache's size, which an embedder may
+/// set in code first ([`crate::set_decoded_column_cache_bytes`]).
 ///
 /// Load failure falls back to the embedded defaults so a read site
 /// never panics on a malformed host config.
