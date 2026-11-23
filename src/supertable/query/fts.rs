@@ -148,8 +148,8 @@ use crate::{
             candidate::{CandidatePlan, CandidateScope, TermMemos},
             dispatch,
             exec::common::{
-                RowCheck, candidate_plan_for_filters, hit_output_schema, resolve_hits_named,
-                take_file_columns, take_rows_byte_source,
+                EXACT_SCOPE_TAKE_ROWS, RowCheck, candidate_plan_for_filters, hit_output_schema,
+                resolve_hits_named, take_file_columns, take_rows_byte_source,
             },
             heads,
             match_order::MatchOrder,
@@ -2346,6 +2346,106 @@ impl SupertableReader {
                     };
                     (live_floor, allow)
                 };
+                let must_refs: Vec<&str> = must_arc.iter().map(|s| s.as_str()).collect();
+                let should_refs: Vec<&str> = should_arc.iter().map(|s| s.as_str()).collect();
+                let neg_refs: Vec<&str> = neg_arc.iter().map(|s| s.as_str()).collect();
+                // The un-ranged walk over this unit's best `want` rows among
+                // `allow`, prepared, its read volume counted.
+                let prepare = async |want: usize,
+                                     live_floor: Option<&LiveFloor>,
+                                     allow: Option<Arc<RoaringBitmap>>,
+                                     exact_count: bool| {
+                    let prep = r
+                        .prepare_clauses(
+                            &column_arc,
+                            ClauseLists {
+                                musts: &must_refs,
+                                shoulds: &should_refs,
+                                negatives: &neg_refs,
+                                must_phrases: &must_ph_arc,
+                                should_phrases: &should_ph_arc,
+                                negative_phrases: &neg_ph_arc,
+                                idf: QueryIdf::Table(&global_idf),
+                                prefetched: memo.as_deref(),
+                                live_floor,
+                                allow,
+                                exact_count,
+                            },
+                            want,
+                            floor,
+                            &scoring,
+                        )
+                        .instrument(trace::phase(phases, || detail_span!("fts.prepare")))
+                        .await?;
+                    if let Some(stats) = &op_stats {
+                        stats.add_fts_postings_bytes(prep.postings_bytes());
+                        stats.add_planned_read_ranges(prep.planned_ranges());
+                        // Single-term / phrase shapes finish inside
+                        // `prepare_clauses`; their walk's on-CPU time
+                        // rides the `Done` (0 for cursor shapes, whose
+                        // kernels are bracketed where they run).
+                        stats.add_kernel_cpu_ns(prep.inline_kernel_cpu_ns());
+                    }
+                    Ok::<_, QueryError>(prep)
+                };
+                // The un-ranged walk run to its top `want` hits, in rows.
+                let prepare_and_run =
+                    async |want: usize,
+                           live_floor: Option<&LiveFloor>,
+                           allow: Option<Arc<RoaringBitmap>>| {
+                        let prep = prepare(want, live_floor, allow, false).await?;
+                        // The kernels score in blob ids; the top hits are
+                        // translated to rows here, on this runtime, reading
+                        // only the doc-id map pages they fall in.
+                        let hits = match prep {
+                            // Already-final shapes: the walk (and its kernel
+                            // time) happened inside `prepare_clauses`. Its hits
+                            // are blob ids like every other shape's, and are
+                            // turned into rows below with the rest.
+                            prep @ PreparedClauses::Done { .. } => {
+                                r.run_prepared_in_blob_ids(prep, &scoring)?
+                            }
+                            // Gate on posting mass, not term count: this scan
+                            // isn't sliced, so a rare-term query with many
+                            // terms can be cheaper than a common-term pair.
+                            prep if prep.posting_mass() >= UNRANGED_KERNEL_POOL_MIN_MASS => {
+                                let kernel_reader = Arc::clone(&r);
+                                let kernel_stats = op_stats.clone();
+                                let kernel_column = column_arc.clone();
+                                let kernel_candidates = candidates.clone();
+                                run_on_pool_unless_blocking(
+                                    Some(&reader_pool),
+                                    "un-ranged fts kernel",
+                                    move || {
+                                        op_stats::timed_kernel(&kernel_stats, || {
+                                            kernel_reader.run_prepared_in_blob_ids(
+                                                prep,
+                                                &ScoringView {
+                                                    norms: kernel_candidates.as_ref().map(
+                                                        |norms| CandidateNorms {
+                                                            column: &kernel_column,
+                                                            norms,
+                                                        },
+                                                    ),
+                                                    ..table_scoring(
+                                                        &kernel_column,
+                                                        bm25_params,
+                                                        avgdl,
+                                                    )
+                                                },
+                                            )
+                                        })
+                                    },
+                                )
+                                .await
+                                .map_err(|e| QueryError::Internal(e.to_string()))??
+                            }
+                            prep => op_stats::timed_kernel(&op_stats, || {
+                                r.run_prepared_in_blob_ids(prep, &scoring)
+                            })?,
+                        };
+                        Ok::<_, QueryError>(r.hits_to_rows_async(hits).await?)
+                    };
                 let hits = match (range, check.as_deref()) {
                     // Ranged units exist only for pure multi-should
                     // queries (`fanout_for` never slices when a must
@@ -2424,10 +2524,6 @@ impl SupertableReader {
                         r.hits_to_rows_async(hits).await?
                     }
                     (None, Some(check)) => {
-                        let must_refs: Vec<&str> = must_arc.iter().map(|s| s.as_str()).collect();
-                        let should_refs: Vec<&str> =
-                            should_arc.iter().map(|s| s.as_str()).collect();
-                        let neg_refs: Vec<&str> = neg_arc.iter().map(|s| s.as_str()).collect();
                         let Some(mut admitted) = allow else {
                             return Err(QueryError::Internal(
                                 "a checked search needs a scope that bounds rows".to_owned(),
@@ -2439,71 +2535,8 @@ impl SupertableReader {
                         let mut passing = RoaringBitmap::new();
                         let mut want = k;
                         loop {
-                            let prep = r
-                                .prepare_clauses(
-                                    &column_arc,
-                                    ClauseLists {
-                                        musts: &must_refs,
-                                        shoulds: &should_refs,
-                                        negatives: &neg_refs,
-                                        must_phrases: &must_ph_arc,
-                                        should_phrases: &should_ph_arc,
-                                        negative_phrases: &neg_ph_arc,
-                                        idf: QueryIdf::Table(&global_idf),
-                                        prefetched: memo.as_deref(),
-                                        live_floor: None,
-                                        allow: Some(Arc::clone(&admitted)),
-                                        exact_count: false,
-                                    },
-                                    want,
-                                    floor,
-                                    &scoring,
-                                )
-                                .instrument(trace::phase(phases, || detail_span!("fts.prepare")))
-                                .await?;
-                            if let Some(stats) = &op_stats {
-                                stats.add_fts_postings_bytes(prep.postings_bytes());
-                                stats.add_planned_read_ranges(prep.planned_ranges());
-                                stats.add_kernel_cpu_ns(prep.inline_kernel_cpu_ns());
-                            }
-                            let hits = match prep {
-                                prep @ PreparedClauses::Done { .. } => {
-                                    r.run_prepared_in_blob_ids(prep, &scoring)?
-                                }
-                                prep => {
-                                    let kernel_reader = Arc::clone(&r);
-                                    let kernel_stats = op_stats.clone();
-                                    let kernel_column = column_arc.clone();
-                                    let kernel_candidates = candidates.clone();
-                                    run_on_pool_unless_blocking(
-                                        Some(&reader_pool),
-                                        "checked fts kernel",
-                                        move || {
-                                            op_stats::timed_kernel(&kernel_stats, || {
-                                                kernel_reader.run_prepared_in_blob_ids(
-                                                    prep,
-                                                    &ScoringView {
-                                                        norms: kernel_candidates.as_ref().map(
-                                                            |norms| CandidateNorms {
-                                                                column: &kernel_column,
-                                                                norms,
-                                                            },
-                                                        ),
-                                                        ..table_scoring(
-                                                            &kernel_column,
-                                                            bm25_params,
-                                                            avgdl,
-                                                        )
-                                                    },
-                                                )
-                                            })
-                                        },
-                                    )
-                                    .await
-                                    .map_err(|e| QueryError::Internal(e.to_string()))??
-                                }
-                            };
-                            let hits = r.hits_to_rows_async(hits).await?;
+                            let hits =
+                                prepare_and_run(want, None, Some(Arc::clone(&admitted))).await?;
                             let fresh: RoaringBitmap = hits
                                 .iter()
                                 .map(|(row, _)| row.get())
@@ -2524,144 +2557,55 @@ impl SupertableReader {
                             let mut rest = admitted.as_ref().clone();
                             rest -= &fresh - &kept;
                             admitted = Arc::new(rest);
-                            want = want.saturating_mul(CHECKED_UNIT_GROWTH);
+                            want = next_checked_want(want, k);
                         }
                     }
-                    (None, None) => {
-                        let must_refs: Vec<&str> = must_arc.iter().map(|s| s.as_str()).collect();
-                        let should_refs: Vec<&str> =
-                            should_arc.iter().map(|s| s.as_str()).collect();
-                        let neg_refs: Vec<&str> = neg_arc.iter().map(|s| s.as_str()).collect();
-                        let prep = r
-                            .prepare_clauses(
-                                &column_arc,
-                                ClauseLists {
-                                    musts: &must_refs,
-                                    shoulds: &should_refs,
-                                    negatives: &neg_refs,
-                                    must_phrases: &must_ph_arc,
-                                    should_phrases: &should_ph_arc,
-                                    negative_phrases: &neg_ph_arc,
-                                    idf: QueryIdf::Table(&global_idf),
-                                    prefetched: memo.as_deref(),
-                                    live_floor,
-                                    allow,
-                                    exact_count,
-                                },
-                                k,
-                                floor,
-                                &scoring,
-                            )
-                            .instrument(trace::phase(phases, || detail_span!("fts.prepare")))
-                            .await?;
-                        if let Some(stats) = &op_stats {
-                            stats.add_fts_postings_bytes(prep.postings_bytes());
-                            stats.add_planned_read_ranges(prep.planned_ranges());
-                            // Single-term / phrase shapes finish inside
-                            // `prepare_clauses`; their walk's on-CPU time
-                            // rides the `Done` (0 for cursor shapes, whose
-                            // kernels are bracketed below).
-                            stats.add_kernel_cpu_ns(prep.inline_kernel_cpu_ns());
-                        }
-                        if exact_count {
-                            // Every match is scored, so the scan is the heavy
-                            // case by definition: a pool job unless the walk
-                            // already finished inside `prepare_clauses`.
-                            let (hits, count) = match prep {
-                                prep @ PreparedClauses::Done { .. } => {
-                                    r.run_prepared_with_count_in_blob_ids(prep, &scoring)?
-                                }
-                                prep => {
-                                    let kernel_reader = Arc::clone(&r);
-                                    let kernel_stats = op_stats.clone();
-                                    let kernel_column = column_arc.clone();
-                                    let kernel_candidates = candidates.clone();
-                                    run_on_pool_unless_blocking(
-                                        Some(&reader_pool),
-                                        "exact-count fts kernel",
-                                        move || {
-                                            op_stats::timed_kernel(&kernel_stats, || {
-                                                kernel_reader.run_prepared_with_count_in_blob_ids(
-                                                    prep,
-                                                    &ScoringView {
-                                                        norms: kernel_candidates.as_ref().map(
-                                                            |norms| CandidateNorms {
-                                                                column: &kernel_column,
-                                                                norms,
-                                                            },
-                                                        ),
-                                                        ..table_scoring(
-                                                            &kernel_column,
-                                                            bm25_params,
-                                                            avgdl,
-                                                        )
-                                                    },
-                                                )
-                                            })
-                                        },
-                                    )
-                                    .await
-                                    .map_err(|e| QueryError::Internal(e.to_string()))??
-                                }
-                            };
-                            total.fetch_add(count, AtomicOrdering::Relaxed);
-                            r.hits_to_rows_async(hits).await?
-                        } else {
-                            // The kernels score in blob ids; the top hits are
-                            // translated to rows here, on this runtime, reading
-                            // only the doc-id map pages they fall in.
-                            let hits = match prep {
-                                // Already-final shapes: the walk (and its
-                                // kernel time) happened inside
-                                // `prepare_clauses`. Its hits are blob ids
-                                // like every other shape's, and are turned
-                                // into rows below with the rest.
-                                prep @ PreparedClauses::Done { .. } => {
-                                    r.run_prepared_in_blob_ids(prep, &scoring)?
-                                }
-                                // Gate on posting mass, not term count: this
-                                // scan isn't sliced, so a rare-term query
-                                // with many terms can be cheaper than a
-                                // common-term pair.
-                                prep if prep.posting_mass() >= UNRANGED_KERNEL_POOL_MIN_MASS => {
-                                    let kernel_reader = Arc::clone(&r);
-                                    let kernel_stats = op_stats.clone();
-                                    let kernel_column = column_arc.clone();
-                                    let kernel_candidates = candidates.clone();
-                                    run_on_pool_unless_blocking(
-                                        Some(&reader_pool),
-                                        "un-ranged fts kernel",
-                                        move || {
-                                            op_stats::timed_kernel(&kernel_stats, || {
-                                                kernel_reader.run_prepared_in_blob_ids(
-                                                    prep,
-                                                    &ScoringView {
-                                                        norms: kernel_candidates.as_ref().map(
-                                                            |norms| CandidateNorms {
-                                                                column: &kernel_column,
-                                                                norms,
-                                                            },
-                                                        ),
-                                                        ..table_scoring(
-                                                            &kernel_column,
-                                                            bm25_params,
-                                                            avgdl,
-                                                        )
-                                                    },
-                                                )
-                                            })
-                                        },
-                                    )
-                                    .await
-                                    .map_err(|e| QueryError::Internal(e.to_string()))??
-                                }
-                                prep => op_stats::timed_kernel(&op_stats, || {
-                                    r.run_prepared_in_blob_ids(prep, &scoring)
-                                })?,
-                            };
-                            r.hits_to_rows_async(hits).await?
-                        }
+                    (None, None) if exact_count => {
+                        let prep = prepare(k, live_floor, allow, exact_count).await?;
+                        // Every match is scored, so the scan is the heavy
+                        // case by definition: a pool job unless the walk
+                        // already finished inside `prepare_clauses`.
+                        let (hits, count) = match prep {
+                            prep @ PreparedClauses::Done { .. } => {
+                                r.run_prepared_with_count_in_blob_ids(prep, &scoring)?
+                            }
+                            prep => {
+                                let kernel_reader = Arc::clone(&r);
+                                let kernel_stats = op_stats.clone();
+                                let kernel_column = column_arc.clone();
+                                let kernel_candidates = candidates.clone();
+                                run_on_pool_unless_blocking(
+                                    Some(&reader_pool),
+                                    "exact-count fts kernel",
+                                    move || {
+                                        op_stats::timed_kernel(&kernel_stats, || {
+                                            kernel_reader.run_prepared_with_count_in_blob_ids(
+                                                prep,
+                                                &ScoringView {
+                                                    norms: kernel_candidates.as_ref().map(
+                                                        |norms| CandidateNorms {
+                                                            column: &kernel_column,
+                                                            norms,
+                                                        },
+                                                    ),
+                                                    ..table_scoring(
+                                                        &kernel_column,
+                                                        bm25_params,
+                                                        avgdl,
+                                                    )
+                                                },
+                                            )
+                                        })
+                                    },
+                                )
+                                .await
+                                .map_err(|e| QueryError::Internal(e.to_string()))??
+                            }
+                        };
+                        total.fetch_add(count, AtomicOrdering::Relaxed);
+                        r.hits_to_rows_async(hits).await?
                     }
+                    (None, None) => prepare_and_run(k, live_floor, allow).await?,
                 };
                 // Raise the global floor with this unit's surviving
                 // scores. Sidecars were prefetched by the dispatcher,
@@ -4712,6 +4656,24 @@ struct WorkUnit {
 /// row-shard) are well above this floor.
 const SUBRANGE_MIN_DOCS: u32 = 50_000;
 
+/// How many times a checked unit grows the rows it scores after a round in
+/// which fewer than `k` of them passed the check.
+const CHECKED_UNIT_GROWTH: usize = 4;
+
+/// The most rows a checked unit scores in one round, unless `k` is more:
+/// the growth stops here, so a predicate rejecting nearly every match
+/// costs more rounds of this many rather than a collector sized to every
+/// match. The same bound as one chunk of the check itself.
+const CHECKED_UNIT_MAX_ROWS: usize = EXACT_SCOPE_TAKE_ROWS;
+
+/// The rows a checked unit scores in the round after one that scored
+/// `want` and found fewer than `k` passing: [`CHECKED_UNIT_GROWTH`] times
+/// more, up to [`CHECKED_UNIT_MAX_ROWS`] or `k` if that is more.
+fn next_checked_want(want: usize, k: usize) -> usize {
+    want.saturating_mul(CHECKED_UNIT_GROWTH)
+        .min(CHECKED_UNIT_MAX_ROWS.max(k))
+}
+
 /// Unwrap FTS hits out of row space for the shared per-superfile hit
 /// shape.
 ///
@@ -4720,10 +4682,6 @@ const SUBRANGE_MIN_DOCS: u32 = 50_000;
 /// superfile's Parquet rows. FTS hits *are* rows by the time they leave
 /// the reader, so the type comes off here, at the one place they enter
 /// that shape.
-/// How many times a checked unit grows the rows it scores after a round in
-/// which fewer than `k` of them passed the check.
-const CHECKED_UNIT_GROWTH: usize = 4;
-
 fn rows_as_local_ids(hits: Vec<(RowId, f32)>) -> Vec<(u32, f32)> {
     hits.into_iter().map(|(row, s)| (row.get(), s)).collect()
 }
@@ -5691,6 +5649,23 @@ mod tests {
     }
 
     #[test]
+    fn a_checked_unit_grows_its_rounds_up_to_a_bounded_batch() {
+        let k = 10;
+        assert_eq!(next_checked_want(k, k), k * CHECKED_UNIT_GROWTH);
+        let mut want = k;
+        for _ in 0..64 {
+            want = next_checked_want(want, k);
+        }
+        assert_eq!(want, CHECKED_UNIT_MAX_ROWS, "the growth stops at the batch");
+        let large = CHECKED_UNIT_MAX_ROWS * 2;
+        assert_eq!(
+            next_checked_want(large, large),
+            large,
+            "a k past the batch is still asked for whole"
+        );
+    }
+
+    #[test]
     fn a_tolerance_raises_the_bar() {
         let floor = 100.0f32;
         assert!(
@@ -5759,8 +5734,9 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        BoolMode, FEW_NORMS_MAX_DOCS, FanOut, LocatedTerms, SharedTopK, SuperfileHit,
-        SupertableReader, build_work_units, ceilings_at_table_avgdl, fanout_for, walk_dict,
+        BoolMode, CHECKED_UNIT_GROWTH, CHECKED_UNIT_MAX_ROWS, FEW_NORMS_MAX_DOCS, FanOut,
+        LocatedTerms, SharedTopK, SuperfileHit, SupertableReader, build_work_units,
+        ceilings_at_table_avgdl, fanout_for, next_checked_want, walk_dict,
     };
     use crate::{
         Analyzer,
