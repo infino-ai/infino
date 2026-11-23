@@ -104,7 +104,7 @@ use crate::{
         SuperfileReader,
         error::ReadError,
         fts::reader::{BoolMode, QueryDict},
-        id_space::RowId,
+        id_space::row_bitmap,
         vector::{
             cell_posting::EncodedCellRow,
             distance::{
@@ -7276,9 +7276,8 @@ impl SupertableReader {
         }
 
         // Manifest-only leaf survival: part-tier term bloom / range, then
-        // per-superfile summaries — no superfile reads. Intersect with the
-        // vector centroid prune so `token_match` opens only superfiles that
-        // could match the predicate *and* might hold vector-near rows.
+        // per-superfile summaries — no superfile reads — so `token_match`
+        // opens only superfiles that could match the predicate.
         let prune_leaves = [PruneLeaf::TermPresence {
             column: filter.column.to_owned(),
             terms: tokens.clone(),
@@ -7291,19 +7290,7 @@ impl SupertableReader {
                 survivors = tracing::field::Empty,
             )
         });
-        let surviving: HashSet<u128> = select_superfiles(manifest, &prune_leaves)
-            .instrument(select_span.clone())
-            .await?
-            .iter()
-            .map(|e| e.superfile_id.as_u128())
-            .collect();
-        if surviving.is_empty() {
-            select_span.record("survivors", 0);
-            trace::end(select_span);
-            return Ok(Vec::new());
-        }
-        let superfiles = self
-            .vector_pruned_superfiles_intersect(manifest, &surviving)
+        let superfiles = select_superfiles(manifest, &prune_leaves)
             .instrument(select_span.clone())
             .await?;
         select_span.record("survivors", superfiles.len());
@@ -7324,22 +7311,6 @@ impl SupertableReader {
 
         self.route_filtered_vector_hits_async(superfiles, allow, column, query, k, options)
             .await
-    }
-
-    /// All loaded superfile entries intersected with a manifest-only
-    /// survival set.
-    async fn vector_pruned_superfiles_intersect(
-        &self,
-        manifest: &ManifestSnapshot,
-        surviving: &HashSet<u128>,
-    ) -> Result<Vec<Arc<SuperfileEntry>>, QueryError> {
-        Ok(manifest
-            .get_all_superfiles_loaded()
-            .await
-            .map_err(QueryError::ManifestLoad)?
-            .into_iter()
-            .filter(|e| surviving.contains(&e.superfile_id.as_u128()))
-            .collect())
     }
 
     /// Resolve the text predicate (`filter_col` contains `tokens` under
@@ -7393,7 +7364,7 @@ impl SupertableReader {
                     stats.add_planned_read_ranges(work.planned_ranges);
                     stats.add_kernel_cpu_ns(work.kernel_cpu_ns);
                 }
-                Ok(docs.into_iter().map(RowId::get).collect::<RoaringBitmap>())
+                Ok(row_bitmap(&docs))
             }
         })
         .await
@@ -7411,16 +7382,18 @@ impl SupertableReader {
     /// resolved on the user table and kNN runs on the hidden index when
     /// drained (same routing as [`Self::vector_hits_filtered_async`]).
     ///
-    /// Manifest-only leaf survival runs before any superfile opens: bounded
-    /// FTS leaves are lowered to term-bloom prunes and intersected with the
-    /// vector centroid prune. The per-superfile allow-set (`plan.evaluate`)
-    /// then runs only over that intersection.
+    /// `superfiles` are those the `WHERE` `plan` is lowered from may hold a
+    /// match in ([`Self::superfiles_a_where_may_match`]), chosen once by the
+    /// caller before any superfile opens, however many times it widens the
+    /// search. The per-superfile allow-set (`plan.evaluate`) runs only over
+    /// those.
     pub(crate) async fn vector_hits_filtered_by_plan(
         &self,
         column: &str,
         query: &[f32],
         k: usize,
         options: VectorSearchOptions,
+        superfiles: &[Arc<SuperfileEntry>],
         plan: &CandidatePlan,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
         if k == 0 {
@@ -7430,26 +7403,14 @@ impl SupertableReader {
         // apply the cosine query calibration (#512) at this seam.
         let query = calibrated_query(self, column, query);
         let query: &[f32] = &query;
-        let manifest = self.manifest();
-        let superfiles = match plan.surviving_superfile_ids(manifest).await? {
-            None => manifest
-                .get_all_superfiles_loaded()
-                .await
-                .map_err(QueryError::ManifestLoad)?,
-            Some(surviving) if surviving.is_empty() => return Ok(Vec::new()),
-            Some(surviving) => {
-                self.vector_pruned_superfiles_intersect(manifest, &surviving)
-                    .await?
-            }
-        };
         if superfiles.is_empty() {
             return Ok(Vec::new());
         }
-        let allow = self.candidate_bitmaps_from_plan(&superfiles, plan).await?;
+        let allow = self.candidate_bitmaps_from_plan(superfiles, plan).await?;
         if allow.is_empty() {
             return Ok(Vec::new());
         }
-        self.route_filtered_vector_hits_async(superfiles, allow, column, query, k, options)
+        self.route_filtered_vector_hits_async(superfiles.to_vec(), allow, column, query, k, options)
             .await
     }
 
@@ -7489,30 +7450,42 @@ impl SupertableReader {
             .await
     }
 
+    /// The superfiles that may hold a row a SQL `WHERE` keeps, from statistics
+    /// of the pinned manifest alone, in one pass over two sets of leaves that
+    /// must all hold:
+    /// - those the SQL scan itself lowers `filters` to: scalar min/max, value
+    ///   sets, null counts, and the term blooms of equalities, `IN`s, `LIKE`s
+    ///   and any `OR` of those, so a `path = 'x'` on a column with no
+    ///   full-text index still skips every superfile whose `path` range
+    ///   excludes `x`;
+    /// - the term blooms of `plan`, lowered from the same `filters`, which ask
+    ///   for a value's words together: an `IN` of `'a b'` needs `a` and `b`
+    ///   in one superfile, where the leaves above ask for any of its words.
+    pub(crate) async fn superfiles_a_where_may_match(
+        &self,
+        filters: &[Expr],
+        plan: &CandidatePlan,
+    ) -> Result<Vec<Arc<SuperfileEntry>>, QueryError> {
+        let manifest = self.manifest();
+        let mut leaves = prune_leaves_for_filters(manifest, &manifest.scalar_schema(), filters);
+        leaves.extend(plan.survival_leaves());
+        select_superfiles(manifest, &leaves).await
+    }
+
     /// Resolve what a SQL `WHERE` pushed into a search table function
     /// admits — the superfiles that may hold a match and, under a bounded
     /// `plan`, the candidate rows in each. See [`CandidateScope`].
     ///
-    /// Superfile survival is the intersection of two gates on the pinned
-    /// manifest, both pure statistics reads: the prune leaves the SQL scan
-    /// itself lowers `filters` to (scalar min/max, value sets, `LIKE`
-    /// blooms and ranges, null counts — so a `path = 'x'` on a column with
-    /// no full-text index still skips every superfile whose `path` range
-    /// excludes `x`), and the plan's term-bloom survival. The candidate
-    /// rows are the plan's per-superfile evaluation, tombstones removed;
-    /// an [`Unbounded`](CandidatePlan::Unbounded) plan bounds no row and
-    /// leaves `allow` as `None`.
+    /// The superfiles are those [`Self::superfiles_a_where_may_match`]
+    /// keeps. The candidate rows are the plan's per-superfile evaluation,
+    /// tombstones removed; an [`Unbounded`](CandidatePlan::Unbounded) plan
+    /// bounds no row and leaves `allow` as `None`.
     pub(crate) async fn candidate_scope(
         &self,
         filters: &[Expr],
         plan: &CandidatePlan,
     ) -> Result<CandidateScope, QueryError> {
-        let manifest = self.manifest();
-        let leaves = prune_leaves_for_filters(manifest, &self.manifest().scalar_schema(), filters);
-        let mut superfiles = select_superfiles(manifest, &leaves).await?;
-        if let Some(surviving) = plan.surviving_superfile_ids(manifest).await? {
-            superfiles.retain(|e| surviving.contains(&e.superfile_id.as_u128()));
-        }
+        let superfiles = self.superfiles_a_where_may_match(filters, plan).await?;
         if superfiles.is_empty() {
             return Ok(CandidateScope::empty());
         }
@@ -11404,11 +11377,12 @@ mod tests {
     // the per-superfile bitmap); this direct test pins the
     // contract for the vector side.
 
+    use datafusion::logical_expr::Expr;
     use tempfile::TempDir;
     use uuid::Uuid;
 
     use crate::{
-        runtime_metrics::UsageMeter,
+        runtime_metrics::{UsageMeter, op_stats::with_op_stats},
         storage::{LocalFsStorageProvider, StorageProvider},
         supertable::{
             manifest::{SuperfileEntry, SuperfileUri},
@@ -15529,7 +15503,9 @@ mod tests {
     /// Filtered vector search driven by a lowered [`CandidatePlan`] — the
     /// boolean-plan fan-out (`candidate_bitmaps_from_plan`). The plan resolves
     /// the title predicate to per-superfile candidate bitmaps, then vector
-    /// ranking runs over the survivors.
+    /// ranking runs over the survivors. The superfiles searched are those the
+    /// `WHERE` may match in: an `IN` under an `AND` keeps only the superfile
+    /// holding one of its values.
     #[test]
     fn vector_hits_filtered_by_plan_returns_matching_docs() {
         use std::collections::HashSet;
@@ -15567,17 +15543,20 @@ mod tests {
         let storage: Arc<dyn StorageProvider> =
             Arc::new(crate::storage::LocalFsStorageProvider::new(dir.path()).expect("storage"));
         let st = Supertable::create(opts.with_storage(storage)).expect("create");
-        let mut w = st.writer().expect("writer");
-        w.append(&build_vector_batch(0, 32, dim, schema.clone()))
-            .expect("append");
-        w.commit().expect("commit");
-        drop(w);
+        // Two superfiles: titles `doc 0` to `doc 15`, then `doc 0` to `doc 2` again.
+        for (start, n) in [(0, 16), (16, 3)] {
+            let mut w = st.writer().expect("writer");
+            w.append(&build_vector_batch(start, n, dim, schema.clone()))
+                .expect("append");
+            w.commit().expect("commit");
+        }
         st.drain_vectors_to_cells_sync().expect("drain");
 
         let reader = st.reader().expect("reader");
         let manifest = reader.manifest();
         let fts_cols: HashSet<&str> = HashSet::from(["title"]);
-        let filters = [col("title").eq(lit("doc"))];
+        // A title one row holds whole: the superfile's statistics keep it, and its words admit it.
+        let filters = [col("title").eq(lit("doc 7"))];
         let plan = CandidatePlan::from_filters(
             &filters,
             &fts_cols,
@@ -15588,17 +15567,53 @@ mod tests {
 
         let mut q = vec![0.0f32; dim];
         q[0] = 1.0;
-        let hits = block_on(reader.vector_hits_filtered_by_plan(
-            "emb",
-            &q,
-            10,
-            VectorSearchOptions::new(),
-            &plan,
-        ))
-        .expect("plan-filtered vector search");
+        // The superfiles the `WHERE` may match in, chosen in one pass over the scan's leaves and
+        // the plan's term blooms together, then the search over them.
+        let search = |filters: &[Expr], plan: &CandidatePlan| {
+            with_op_stats(|| {
+                block_on(async {
+                    let superfiles = reader.superfiles_a_where_may_match(filters, plan).await?;
+                    reader
+                        .vector_hits_filtered_by_plan(
+                            "emb",
+                            &q,
+                            10,
+                            VectorSearchOptions::new(),
+                            &superfiles,
+                            plan,
+                        )
+                        .await
+                })
+            })
+        };
+        let (hits, stats) = search(&filters, &plan);
         assert!(
-            !hits.is_empty(),
+            !hits.expect("plan-filtered vector search").is_empty(),
             "the title-token plan must admit docs for vector ranking"
+        );
+        assert_eq!(
+            (stats.superfiles_considered, stats.presence_pruning_survived),
+            (2, 1),
+            "one pass, keeping the one superfile holding `doc 7`"
+        );
+
+        // An `IN` under an `AND`: the plan alone, with an `OR` inside, ruled out no superfile.
+        let filters = [col("title")
+            .in_list(vec![lit("doc 3"), lit("doc 5")], false)
+            .and(col("title").like(lit("doc%")))];
+        let plan = CandidatePlan::from_filters(
+            &filters,
+            &fts_cols,
+            &RangeColumns::new(),
+            &|col| manifest.try_fts_tokenizer_for(col),
+            &|col| manifest.field_id(col),
+        );
+        let (hits, stats) = search(&filters, &plan);
+        assert!(!hits.expect("IN-filtered vector search").is_empty());
+        assert_eq!(
+            (stats.superfiles_considered, stats.presence_pruning_survived),
+            (2, 1),
+            "only the first superfile holds `doc 3` or `doc 5`"
         );
     }
 
