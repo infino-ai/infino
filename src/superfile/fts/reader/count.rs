@@ -237,12 +237,27 @@ impl FtsReader {
     /// terms + phrases under `mode`, ascending — the atoms sibling of
     /// [`Self::token_match`], used whenever the match set contains a
     /// phrase. Under `And`, a missing atom empties the set.
+    #[cfg(test)]
     pub(crate) async fn atoms_match_ids(
         &self,
         column: &str,
         terms: &[&str],
         phrases: &[Phrase<String>],
         mode: BoolMode,
+    ) -> Result<(Vec<RowId>, MatchWork), FtsError> {
+        self.atoms_match_ids_prefetched(column, terms, phrases, mode, None)
+            .await
+    }
+
+    /// [`Self::atoms_match_ids`] with a memo of located postings: a term or
+    /// phrase member the memo holds is not looked up in the dictionary.
+    pub(crate) async fn atoms_match_ids_prefetched(
+        &self,
+        column: &str,
+        terms: &[&str],
+        phrases: &[Phrase<String>],
+        mode: BoolMode,
+        prefetched: Option<&FetchedTermMemo>,
     ) -> Result<(Vec<RowId>, MatchWork), FtsError> {
         let column_id = self.resolve_column_id(column)?;
         // Unranked: built to match, so no global idf and no norms; the
@@ -253,7 +268,7 @@ impl FtsReader {
                 terms,
                 phrases,
                 QueryIdf::ThisFile,
-                None,
+                prefetched,
                 CursorUse::Match,
             )
             .await?;
@@ -278,6 +293,7 @@ impl FtsReader {
 
     /// Phrase-aware unranked match **count** — the atoms sibling of
     /// [`Self::token_match_count`].
+    #[cfg(test)]
     pub(crate) async fn atoms_match_count(
         &self,
         column: &str,
@@ -286,6 +302,31 @@ impl FtsReader {
         mode: BoolMode,
         neg_terms: &[&str],
         neg_phrases: &[Phrase<String>],
+    ) -> Result<(u64, MatchWork), FtsError> {
+        self.atoms_match_count_prefetched(
+            column,
+            terms,
+            phrases,
+            mode,
+            neg_terms,
+            neg_phrases,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::atoms_match_count`] with a memo of located postings: a term or
+    /// phrase member the memo holds is not looked up in the dictionary.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn atoms_match_count_prefetched(
+        &self,
+        column: &str,
+        terms: &[&str],
+        phrases: &[Phrase<String>],
+        mode: BoolMode,
+        neg_terms: &[&str],
+        neg_phrases: &[Phrase<String>],
+        prefetched: Option<&FetchedTermMemo>,
     ) -> Result<(u64, MatchWork), FtsError> {
         let column_id = self.resolve_column_id(column)?;
         // Plain terms on both sides: count by probing or folding, whichever
@@ -298,7 +339,7 @@ impl FtsReader {
                     QueryIdf::ThisFile,
                     CursorUse::Count,
                     None,
-                    None,
+                    prefetched,
                 )
                 .await?;
             let mut work = MatchWork::for_cursors(&pos);
@@ -312,7 +353,7 @@ impl FtsReader {
                     QueryIdf::ThisFile,
                     CursorUse::Count,
                     None,
-                    None,
+                    prefetched,
                 )
                 .await?;
             work.postings_bytes += MatchWork::for_cursors(&neg).postings_bytes;
@@ -328,7 +369,7 @@ impl FtsReader {
                 terms,
                 phrases,
                 QueryIdf::ThisFile,
-                None,
+                prefetched,
                 CursorUse::Match,
             )
             .await?;
@@ -352,7 +393,7 @@ impl FtsReader {
                     neg_terms,
                     neg_phrases,
                     QueryIdf::ThisFile,
-                    None,
+                    prefetched,
                     CursorUse::Match,
                 )
                 .await?;

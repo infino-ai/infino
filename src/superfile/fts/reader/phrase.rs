@@ -1861,6 +1861,31 @@ mod tests {
                 .expect("count");
             assert_eq!(count, expected.len() as u64, "count, {label}");
 
+            // Members served from a memo match what the dictionary finds.
+            let memo = r
+                .fetch_scored_terms("title", &distinct)
+                .await
+                .expect("memo");
+            let (ids, _) = r
+                .atoms_match_ids_prefetched("title", &[], one, BoolMode::And, Some(&memo))
+                .await
+                .expect("memo match ids");
+            let ids: Vec<u32> = ids.iter().map(|d| d.get()).collect();
+            assert_eq!(ids, expected_ids, "memo match ids, {label}");
+            let (count, _) = r
+                .atoms_match_count_prefetched(
+                    "title",
+                    &[],
+                    one,
+                    BoolMode::And,
+                    &[],
+                    &[],
+                    Some(&memo),
+                )
+                .await
+                .expect("memo count");
+            assert_eq!(count, expected.len() as u64, "memo count, {label}");
+
             // The phrase idf, from each query position's own term cursor.
             let mut idf = 0.0f32;
             for t in p.iter() {

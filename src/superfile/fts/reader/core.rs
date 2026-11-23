@@ -2309,13 +2309,14 @@ impl FtsReader {
                         let dict_bytes = self.dict_bytes_async().await?;
                         let dict = Self::open_dict(&dict_bytes)?;
                         let key = make_key(&col_meta.name, term);
-                        let packed = dict
-                            .lookup(&key)
-                            .expect("inline member cursor was built from this dict");
-                        let position = match packed {
-                            DictEntry::Inline { tf: slot, .. } => slot,
-                            DictEntry::Pfor { .. } => {
-                                unreachable!("inline cursor from a PFOR dictionary entry")
+                        // The cursor may come from the term index, so the
+                        // dictionary disagreeing with it is a read error.
+                        let position = match dict.lookup(&key) {
+                            Some(DictEntry::Inline { tf: slot, .. }) => slot,
+                            _ => {
+                                return Err(FtsError::Read(ReadError::Malformed(format!(
+                                    "phrase member {term:?} is not inline in the dictionary"
+                                ))));
                             }
                         };
                         positional.push((None, Some(position)));
