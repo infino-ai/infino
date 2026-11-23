@@ -345,10 +345,14 @@ matched whole: host names, paths, status codes, user ids, tags. On a
 - **Prefix search keeps case.** `Fo` finds `Foo` and not `foo`.
 - **`value_counts` reads the term index.** Each term is one whole value,
   so `Table::value_counts` adds up the term counts, minus deleted rows,
-  instead of grouping the rows.
+  instead of grouping the rows. When the terms do not fit the connection
+  memory budget, it groups the rows instead.
 - **`text_match` still means words.** The SQL function always uses
   `standard` tokens, whatever the column's index. So a `keyword` index
   does not answer it, and does not narrow a `LIKE` scan either.
+- **Older engines cannot open the table.** An engine older than the
+  release that adds `keyword` refuses a table with a `keyword` column,
+  with an error that names the column and the analyzer.
 
 ```rust
 use infino::{FtsField, IndexSpec};
