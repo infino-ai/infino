@@ -1008,6 +1008,8 @@ impl CachedScanExec {
     /// - the columns it would decode don't fit the cache ([`decoded_bytes`]):
     ///   kept, they would push each other out, and every run would decode
     ///   them all again where the Parquet scan decodes only what it reads.
+    ///   Row groups kept only because a scan read some of their rows before
+    ///   are read in part again first, and don't count.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn try_new(
         schema: SchemaRef,
@@ -1033,6 +1035,8 @@ impl CachedScanExec {
         let schema_id = manifest.table_schema().schema_id();
         let mut units = Vec::new();
         let mut pruned = 0;
+        // Units kept only because a scan read some of their rows before.
+        let mut promoted = Vec::new();
         for file in files.into_iter().map(Arc::new) {
             let plan = filter.as_ref().and_then(|filter| filter.plan(&file));
             let mut first = 0u32;
@@ -1056,13 +1060,16 @@ impl CachedScanExec {
                 if chosen == 0 {
                     continue;
                 }
-                let keep = file.selected.is_none()
-                    || chosen.saturating_mul(2) >= live
+                let whole = file.selected.is_none() || chosen.saturating_mul(2) >= live;
+                let keep = whole
                     || cache.read_in_part_before(&RowGroupKey {
                         uri: file.uri,
                         schema_id,
                         row_group,
                     });
+                if !whole && keep {
+                    promoted.push(units.len());
+                }
                 units.push(RowGroupUnit {
                     file: Arc::clone(&file),
                     row_group,
@@ -1074,13 +1081,22 @@ impl CachedScanExec {
             }
         }
         let dictionaries = dictionary_columns(&manifest, &schema, &units);
-        if decoded_bytes(
-            units.iter().filter(|unit| unit.keep),
-            &schema,
-            &dictionaries,
-        ) > cache.max_bytes()
-        {
-            return None;
+        let fits = |units: &[RowGroupUnit]| {
+            decoded_bytes(
+                units.iter().filter(|unit| unit.keep),
+                &schema,
+                &dictionaries,
+            ) <= cache.max_bytes()
+        };
+        // Row groups a scan read some rows of before don't need keeping:
+        // their chosen rows are read from the pages again, as the first time.
+        if !fits(&units) {
+            for &i in &promoted {
+                units[i].keep = false;
+            }
+            if !fits(&units) {
+                return None;
+            }
         }
         let partitions = target_partitions.clamp(1, units.len().max(1));
         let properties = plan_properties(&schema, partitions);
@@ -1108,6 +1124,12 @@ impl CachedScanExec {
             in_file_order: false,
             metrics: ExecutionPlanMetricsSet::new(),
         })
+    }
+
+    /// Whether every file this scan reads gives only the rows an index chose
+    /// in it, as for a top-k the range index or its walk answered.
+    pub(crate) fn reads_chosen_rows(&self) -> bool {
+        !self.units.is_empty() && self.units.iter().all(|unit| unit.file.selected.is_some())
     }
 
     /// The Parquet scan this one stands in for, metered as the provider

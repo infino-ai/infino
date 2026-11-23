@@ -49,7 +49,11 @@
 //! The `WHERE` stays in its `FilterExec`. A Parquet row filter would decode
 //! only the `WHERE`'s columns for rows that fail, but a filter keeping rows at
 //! random leaves a selection of thousands of fragments per row group, which
-//! measured slower than decoding the batch whole.
+//! measured slower than decoding the batch whole. Where the scan's other
+//! columns are wide, `RowFilterUnderTopK` instead runs the `WHERE` in the scan
+//! and hands it the `LIMIT`, which stops the selection at the limit's rows.
+//! Such a scan is gated the same way, under a `LocalLimitExec` that drops
+//! partition 0 once it has the rows.
 
 use std::{mem, sync::Arc};
 
@@ -136,7 +140,8 @@ impl PhysicalOptimizerRule for StageLimitGathers {
 /// scan's meter taking no fetch is what marks it filtered: a scan with no
 /// filter takes the `LIMIT` itself and stops on its own. A `WHERE` an index
 /// answers leaves no `FilterExec`, so the meter's refused fetch lands in a
-/// `LocalLimitExec` right above it.
+/// `LocalLimitExec` right above it. A scan that runs its `WHERE` as a row
+/// filter takes the fetch, and is gated all the same.
 fn gated_scan(
     plan: &Arc<dyn ExecutionPlan>,
     fetch: usize,
@@ -145,7 +150,8 @@ fn gated_scan(
         return gated_scan(input, fetch);
     }
     if let Some(meter) = plan.downcast_ref::<MeteredExec>() {
-        if meter.supports_limit_pushdown() {
+        let row_filtered = meter.passes_limits_to_row_filter();
+        if meter.supports_limit_pushdown() && !row_filtered {
             return Ok(None);
         }
         // `EnforceDistribution` puts the exchange below the meter when the
@@ -153,7 +159,15 @@ fn gated_scan(
         let scan = round_robin_input(meter.input()).unwrap_or(meter.input());
         let (rest, first) = split_first_file(scan);
         let meter = Arc::clone(plan).with_new_children(vec![rest])?;
-        return Ok(Some(Arc::new(ScanGateExec::new(meter, first))));
+        let gate: Arc<dyn ExecutionPlan> = Arc::new(ScanGateExec::new(meter, first));
+        // A scan that stops at the fetch ends once it has the rows, and a
+        // partition 0 that ends opens the gate. The limit above drops it
+        // before it is asked again.
+        return Ok(Some(if row_filtered {
+            Arc::new(LocalLimitExec::new(gate, fetch))
+        } else {
+            gate
+        }));
     }
     let passes_rows_on = plan.downcast_ref::<FilterExec>().is_some()
         || plan.downcast_ref::<ProjectionExec>().is_some()

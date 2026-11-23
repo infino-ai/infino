@@ -53,6 +53,24 @@
 //! file in row order, for as long as the table's files stay the same: a
 //! commit or a merge that changes them can change the order, as a
 //! `LIMIT` with no `ORDER BY` promises nothing across them.
+//!
+//! A scan that runs its `WHERE` as a Parquet row filter under a plain `LIMIT`
+//! (`RowFilterUnderTopK`) takes the limit itself. Given the limit, the Parquet
+//! reader reads only the row groups its statistics prove match, skipping
+//! earlier ones, and which it skips depends on the limit. So the rule reads
+//! every such scan in file order, gathered or not, through the limit
+//! `LimitPushdown` leaves between it and its meter under an `OFFSET`, and
+//! drops a round-robin exchange above one of a single partition. Its meter
+//! hands the scan the limit only when the scan can read in file order
+//! ([`can_read_in_file_order`]); the limit stays above it otherwise.
+//!
+//! ```text
+//!   ProjectionExec                            ProjectionExec
+//!     RepartitionExec RoundRobinBatch           MeteredExec
+//!       MeteredExec                               GlobalLimitExec skip=m fetch=n
+//!         GlobalLimitExec skip=m fetch=n            DataSourceExec limit=m+n, preserve_order
+//!           DataSourceExec limit=m+n
+//! ```
 
 use std::sync::Arc;
 
@@ -63,8 +81,11 @@ use datafusion::{
     error::Result as DfResult,
     physical_optimizer::PhysicalOptimizerRule,
     physical_plan::{
-        ExecutionPlan, coalesce_partitions::CoalescePartitionsExec, filter::FilterExec,
-        limit::LocalLimitExec, projection::ProjectionExec,
+        ExecutionPlan, ExecutionPlanProperties,
+        coalesce_partitions::CoalescePartitionsExec,
+        filter::FilterExec,
+        limit::{GlobalLimitExec, LocalLimitExec},
+        projection::ProjectionExec,
     },
 };
 
@@ -116,10 +137,18 @@ impl PhysicalOptimizerRule for ScanOrderUnderLimit {
         })?;
         plan.data
             .transform_up(|node| {
+                if let Some(meter) = node.downcast_ref::<MeteredExec>()
+                    && meter.passes_limits_to_row_filter()
+                {
+                    // A scan that runs its `WHERE` as a row filter and took a
+                    // plain `LIMIT`, gathered or not.
+                    return Ok(match in_file_order(&node)? {
+                        Some(ordered) => Transformed::yes(ordered),
+                        None => Transformed::no(node),
+                    });
+                }
                 Ok(match round_robin_input(&node) {
-                    Some(input) if over_ordered_gather(input) => {
-                        Transformed::yes(Arc::clone(input))
-                    }
+                    Some(input) if over_file_order(input) => Transformed::yes(Arc::clone(input)),
                     _ => Transformed::no(node),
                 })
             })
@@ -136,8 +165,9 @@ impl PhysicalOptimizerRule for ScanOrderUnderLimit {
 }
 
 /// `plan` reading in file order, with its round-robin exchanges dropped,
-/// when it is a table scan below its meter, filters, projections and
-/// per-partition limits, in any order; else `None`.
+/// when it is a table scan below its meter, filters, projections and limits,
+/// in any order; else `None`. Under an `OFFSET`, `LimitPushdown` leaves a
+/// `GlobalLimitExec` with the skip between a row-filtered scan and its meter.
 fn in_file_order(plan: &Arc<dyn ExecutionPlan>) -> DfResult<Option<Arc<dyn ExecutionPlan>>> {
     if let Some(input) = round_robin_input(plan) {
         return in_file_order(input);
@@ -148,7 +178,8 @@ fn in_file_order(plan: &Arc<dyn ExecutionPlan>) -> DfResult<Option<Arc<dyn Execu
     let passes_rows_on = plan.downcast_ref::<MeteredExec>().is_some()
         || plan.downcast_ref::<FilterExec>().is_some()
         || plan.downcast_ref::<ProjectionExec>().is_some()
-        || plan.downcast_ref::<LocalLimitExec>().is_some();
+        || plan.downcast_ref::<LocalLimitExec>().is_some()
+        || plan.downcast_ref::<GlobalLimitExec>().is_some();
     if !passes_rows_on {
         return Ok(None);
     }
@@ -176,14 +207,30 @@ fn scan_in_file_order(scan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn Execution
         .and_then(|source| source.with_preserve_order(true))
 }
 
-/// `plan` is an [`OrderedCoalesceExec`], or a node that keeps its one input's
-/// order over one.
-fn over_ordered_gather(plan: &Arc<dyn ExecutionPlan>) -> bool {
+/// Whether `plan`, a table scan below its meter, filters, projections and
+/// limits, can read in file order. A meter hands a plain `LIMIT` to a scan
+/// that runs its `WHERE` as a row filter only then
+/// ([`MeteredExec::passing_limits`]).
+pub(crate) fn can_read_in_file_order(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    in_file_order(plan).is_ok_and(|ordered| ordered.is_some())
+}
+
+/// `plan` gives its rows in file order on one partition: it is an
+/// [`OrderedCoalesceExec`], or a scan that runs its `WHERE` as a row filter
+/// under a plain `LIMIT` in one partition, which this rule reads in file
+/// order, or a node that keeps its one input's order over either.
+fn over_file_order(plan: &Arc<dyn ExecutionPlan>) -> bool {
     if plan.downcast_ref::<OrderedCoalesceExec>().is_some() {
         return true;
     }
+    if let Some(meter) = plan.downcast_ref::<MeteredExec>()
+        && meter.passes_limits_to_row_filter()
+    {
+        return meter.supports_limit_pushdown()
+            && plan.output_partitioning().partition_count() == 1;
+    }
     match plan.children()[..] {
-        [child] if plan.maintains_input_order() == [true] => over_ordered_gather(child),
+        [child] if plan.maintains_input_order() == [true] => over_file_order(child),
         _ => false,
     }
 }
@@ -487,5 +534,69 @@ mod tests {
     #[test]
     fn pages_over_kept_row_groups_after_a_delete_return_each_live_row_once() {
         pages_return_each_live_row_once(Scan::Kept, Some(delete_some()), deleted_some);
+    }
+
+    #[test]
+    fn a_scan_that_cannot_read_in_file_order_is_not_handed_a_plain_limit() {
+        // `LIMIT 10 OFFSET 5` over the meter a row-filtered scan gets, but
+        // over a scan that can't read in file order (an in-memory one).
+        //  - given the limit, such a scan could skip rows by the limit, and
+        //    no rule could put them back in order, so pages could skip or
+        //    repeat rows. The meter refuses the limit; it stays above.
+        // This test pins where the limit lands and the rows of the page.
+        use datafusion::{
+            datasource::memory::MemorySourceConfig,
+            physical_optimizer::{PhysicalOptimizerRule, limit_pushdown::LimitPushdown},
+            physical_plan::{ExecutionPlan, limit::GlobalLimitExec},
+        };
+
+        use super::{ScanOrderUnderLimit, can_read_in_file_order};
+        use crate::supertable::query::exec::metered_exec::MeteredExec;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("seq", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from_iter_values(0..100))],
+        )
+        .expect("batch");
+        let scan: Arc<dyn ExecutionPlan> =
+            MemorySourceConfig::try_new_exec(&[vec![batch]], schema, None).expect("scan");
+        assert!(!can_read_in_file_order(&scan));
+        let meter =
+            MeteredExec::without_limit_pushdown(Arc::clone(&scan), None).passing_limits(scan);
+        let limit: Arc<dyn ExecutionPlan> = Arc::new(GlobalLimitExec::new(meter, 5, Some(10)));
+        let config = datafusion::config::ConfigOptions::default();
+        let plan = LimitPushdown::new()
+            .optimize(limit, &config)
+            .and_then(|plan| ScanOrderUnderLimit.optimize(plan, &config))
+            .expect("optimize");
+        let shape = displayable(plan.as_ref()).indent(true).to_string();
+        let [meter] = plan.children()[..] else {
+            panic!("{shape}");
+        };
+        assert!(plan.downcast_ref::<GlobalLimitExec>().is_some(), "{shape}");
+        assert!(meter.downcast_ref::<MeteredExec>().is_some(), "{shape}");
+        let [scan] = meter.children()[..] else {
+            panic!("{shape}");
+        };
+        assert_eq!(scan.fetch(), None, "{shape}");
+
+        let runtime = Builder::new_current_thread().build().expect("runtime");
+        let batches = runtime
+            .block_on(collect(plan, SessionContext::new().task_ctx()))
+            .expect("collect");
+        let seqs: Vec<i64> = batches
+            .iter()
+            .flat_map(|b| {
+                let seq = b
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("Int64")
+                    .clone();
+                (0..seq.len()).map(move |i| seq.value(i))
+            })
+            .collect();
+        assert_eq!(seqs, (5..15).collect::<Vec<i64>>());
     }
 }
