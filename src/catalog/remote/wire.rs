@@ -210,6 +210,9 @@ pub(crate) fn status_to_error(op: &str, code: u16, body: &str) -> InfinoError {
         401 | 403 => InfinoError::Backend(format!(
             "{op}: server returned {code}: the key was refused for this call: {body}"
         )),
+        // The service, or the gateway in front of it, could not serve the
+        // call now; a later try may pass.
+        502..=504 => InfinoError::Unavailable(format!("{op}: server returned {code}: {body}")),
         _ => InfinoError::Backend(format!("{op}: server returned {code}: {body}")),
     }
 }
@@ -398,6 +401,14 @@ mod tests {
             status_to_error("query_sql", 500, "boom"),
             InfinoError::Backend(_)
         ));
+        for code in [502, 503, 504] {
+            let e = status_to_error("append", code, "try later");
+            assert!(matches!(e, InfinoError::Unavailable(_)), "{e:?}");
+            assert!(
+                e.to_string().contains(&format!("server returned {code}")),
+                "{e}"
+            );
+        }
     }
 
     /// A refused key and a refused call differ only by status, and the

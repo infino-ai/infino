@@ -39,6 +39,7 @@ def connect(
     cold_fetch_mode: ColdFetchMode | None = ...,
     validate: bool | None = ...,
     api_key: str | None = ...,
+    request_timeout: float | None = ...,
 ) -> Connection: ...
 
 def bench_serve_tcp(
@@ -82,6 +83,13 @@ class ConflictError(InfinoError):
     """Raised when a concurrent writer won the commit race and the engine's own
     retries were exhausted. Recoverable: nothing partial is visible, so catch it,
     back off, and reissue the append / update / delete."""
+
+class UnavailableError(InfinoError):
+    """Raised when the hosted service could not be reached or did not answer in
+    time: a connection that failed or broke, a request past its
+    ``request_timeout``, or a 502, 503 or 504. Recoverable: the same request may
+    succeed later. A write that timed out may still have been committed, so
+    check before reissuing it."""
 
 class SchemaError(ValueError):
     """Raised when the schema refuses a write: a batch whose types disagree with

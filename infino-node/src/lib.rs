@@ -100,6 +100,13 @@ fn map_err(e: InfinoError) -> Error {
         InfinoError::Conflict(m) => {
             Error::new(Status::GenericFailure, format!("ConflictError: {m}"))
         }
+        // The hosted service could not be reached or did not answer in time
+        // (a broken connection, a request past `requestTimeoutMs`, or a 502,
+        // 503 or 504). Transient, and prefixed so a caller can tell it apart
+        // and retry.
+        InfinoError::Unavailable(m) => {
+            Error::new(Status::GenericFailure, format!("Unavailable: {m}"))
+        }
         // A valid query using something the engine does not support yet.
         // Prefixed with the variant name, as `NotFound:` is, so a caller can
         // tell it apart from a malformed query.
@@ -560,6 +567,9 @@ pub struct ConnectOptions {
     /// bearer credential. Ignored by local backends; falls back to the
     /// `INFINO_API_KEY` environment variable when omitted.
     pub api_key: Option<String>,
+    /// Deadline for each request on a hosted connection, in milliseconds,
+    /// from connecting to the last byte of the answer. Default 620000.
+    pub request_timeout_ms: Option<f64>,
 }
 
 /// Tuning for `optimize`; all fields optional (omitted ⇒ engine default).
@@ -952,6 +962,18 @@ pub fn connect(env: Env, uri: String, options: Option<ConnectOptions>) -> Result
             }
             if let Some(key) = o.api_key {
                 opts = opts.with_api_key(key);
+            }
+            if let Some(ms) = o.request_timeout_ms {
+                let timeout = Duration::try_from_secs_f64(ms / 1000.0)
+                    .ok()
+                    .filter(|d| !d.is_zero())
+                    .ok_or_else(|| {
+                        Error::new(
+                            Status::InvalidArg,
+                            format!("requestTimeoutMs must be a positive number, got {ms}"),
+                        )
+                    })?;
+                opts = opts.with_request_timeout(timeout);
             }
             infino::connect_with(&uri, opts)
         }

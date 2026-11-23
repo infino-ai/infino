@@ -126,6 +126,7 @@ pub infino::InfinoError::OverBudget(alloc::string::String)
 pub infino::InfinoError::PermissionDenied(alloc::string::String)
 pub infino::InfinoError::Query(alloc::string::String)
 pub infino::InfinoError::Schema(infino::SchemaError)
+pub infino::InfinoError::Unavailable(alloc::string::String)
 pub infino::InfinoError::Unsupported(alloc::string::String)
 impl core::error::Error for infino::InfinoError
 impl core::fmt::Debug for infino::InfinoError
@@ -608,6 +609,7 @@ pub fn infino::ConnectOptions::with_cache_dir(self, impl core::convert::Into<std
 pub fn infino::ConnectOptions::with_cold_fetch_mode(self, infino::ColdFetchMode) -> Self
 pub fn infino::ConnectOptions::with_connection_memory_budget_bytes(self, u64) -> Self
 pub fn infino::ConnectOptions::with_read_consistency(self, infino::Consistency) -> Self
+pub fn infino::ConnectOptions::with_request_timeout(self, core::time::Duration) -> Self
 pub fn infino::ConnectOptions::with_storage_option(self, impl core::convert::Into<alloc::string::String>, impl core::convert::Into<alloc::string::String>) -> Self
 pub fn infino::ConnectOptions::with_validate(self, bool) -> Self
 impl core::clone::Clone for infino::ConnectOptions

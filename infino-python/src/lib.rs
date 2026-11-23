@@ -83,6 +83,17 @@ create_exception!(
 
 create_exception!(
     infino,
+    UnavailableError,
+    InfinoError,
+    "Raised when the hosted service could not be reached or did not answer \
+     in time: a connection that failed or broke, a request past its \
+     `request_timeout`, or a 502, 503 or 504. It says nothing about the \
+     request itself, so the same request may succeed later. A write that \
+     timed out may still have been committed, so check before reissuing it."
+);
+
+create_exception!(
+    infino,
     AlreadyRunningError,
     InfinoError,
     "Raised by `reindex` when an `optimize` or another reindex already holds \
@@ -125,6 +136,8 @@ fn py_err(e: CoreError) -> PyErr {
         CoreError::OverBudget(m) => ConnectionMemoryBudgetError::new_err(m),
         // A lost CAS race: retryable
         CoreError::Conflict(m) => ConflictError::new_err(m),
+        // The hosted service did not answer: transient, so typed for retry.
+        CoreError::Unavailable(m) => UnavailableError::new_err(m),
         // A valid query using something the engine does not support yet.
         CoreError::Unsupported(m) => PyNotImplementedError::new_err(m),
         // The core error is `#[non_exhaustive]`: future variants fall back
@@ -244,6 +257,12 @@ fn cold_fetch_from_str(s: &str) -> PyResult<ColdFetchMode> {
 /// credentials fail there. Omit all for local / `memory://` /
 /// ambient-credential object storage.
 ///
+/// `request_timeout` (seconds, a hosted connection only) is the deadline of
+/// each request, from connecting to the last byte of the answer; past it the
+/// call raises `UnavailableError`. The default, 620 s, is a little past the
+/// longest a hosted request can run (600 s). A write that times out may still
+/// commit, so check before reissuing it.
+///
 /// `connection_memory_budget_bytes` caps this connection's heap: the memory
 /// used to ingest data and run queries over it (keyword, vector, hybrid, or
 /// SQL). Crossing it raises `ConnectionMemoryBudgetError` rather than risking an
@@ -256,7 +275,7 @@ fn cold_fetch_from_str(s: &str) -> PyResult<ColdFetchMode> {
 #[allow(clippy::too_many_arguments)]
 #[pyo3(signature = (uri, *, storage_options=None, cache_dir=None, cache_budget_bytes=None,
                     connection_memory_budget_bytes=None, cold_fetch_mode=None, validate=None,
-                    api_key=None))]
+                    api_key=None, request_timeout=None))]
 fn connect(
     py: Python<'_>,
     uri: &str,
@@ -267,6 +286,7 @@ fn connect(
     cold_fetch_mode: Option<String>,
     validate: Option<bool>,
     api_key: Option<String>,
+    request_timeout: Option<f64>,
 ) -> PyResult<Connection> {
     // Opening a connection can touch object storage; release the GIL so
     // other Python threads run during the (blocking) I/O.
@@ -301,6 +321,18 @@ fn connect(
         }
         if let Some(key) = api_key {
             opts = opts.with_api_key(key);
+            has_options = true;
+        }
+        if let Some(secs) = request_timeout {
+            let timeout = Duration::try_from_secs_f64(secs)
+                .ok()
+                .filter(|d| !d.is_zero())
+                .ok_or_else(|| {
+                    PyValueError::new_err(format!(
+                        "request_timeout must be a positive number of seconds, got {secs}"
+                    ))
+                })?;
+            opts = opts.with_request_timeout(timeout);
             has_options = true;
         }
         // Preserve the plain `connect(uri)` path when no options are set.
@@ -1891,6 +1923,7 @@ fn infino_ext(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.py().get_type::<ConnectionMemoryBudgetError>(),
     )?;
     m.add("ConflictError", m.py().get_type::<ConflictError>())?;
+    m.add("UnavailableError", m.py().get_type::<UnavailableError>())?;
     m.add("SchemaError", m.py().get_type::<SchemaError>())?;
     m.add(
         "AlreadyRunningError",
