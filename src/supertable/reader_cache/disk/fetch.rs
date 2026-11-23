@@ -819,13 +819,8 @@ impl DiskCacheStore {
             );
             unadmitted.sources.push(Arc::clone(&block_source));
             let block_source_arc = Arc::clone(&block_source);
-            let overlay = open_batch_overlay(
-                Arc::clone(&fetch_storage),
-                storage_uri.clone(),
-                offsets,
-                block_source,
-            )
-            .await?;
+            block_source.start_opening();
+            let overlay = open_batch_overlay(storage_uri.clone(), offsets, block_source).await?;
             let source: Arc<dyn LazyByteSource> = Arc::new(overlay);
 
             // Every internal read inside `open_lazy_with` (parquet tail,
@@ -919,6 +914,8 @@ impl DiskCacheStore {
         if Arc::ptr_eq(&admitted, &entry) {
             unadmitted.admitted();
         }
+        // The entry is live now, so the blocks the open read can be kept.
+        block_source.opened();
 
         Ok(admitted)
     }
@@ -1188,9 +1185,9 @@ fn uncovered_ranges(blob: &[(u64, Vec<u8>)], wanted: &[(u64, u64)]) -> Vec<(u64,
 /// means zero open-time GETs against the object. Older or incomplete hints
 /// fall back to fixed headers; the readers then discover the rest. Shared by
 /// the disk cache's lazy open and the cacheless fallback, so both open a
-/// superfile with the same round trips.
+/// superfile with the same round trips. The wave reads through `inner`, so
+/// with a disk cache its bytes are kept and the next open reads them locally.
 pub(crate) async fn open_batch_overlay(
-    storage: Arc<dyn StorageProvider>,
     storage_uri: String,
     offsets: &SubsectionOffsets,
     inner: Arc<dyn LazyByteSource>,
@@ -1225,7 +1222,7 @@ pub(crate) async fn open_batch_overlay(
             _ => Vec::new(),
         }
     };
-    let mut overlay = PrefetchedSource::new(inner);
+    let mut overlay = PrefetchedSource::new(Arc::clone(&inner));
     for (off, bytes) in &offsets.open_blob {
         overlay.install(*off, Bytes::copy_from_slice(bytes));
     }
@@ -1235,32 +1232,24 @@ pub(crate) async fn open_batch_overlay(
     let vec_missing = uncovered_ranges(&offsets.open_blob, &vec_ranges);
     let fts_missing = uncovered_ranges(&offsets.open_blob, &fts_ranges);
     if tail_missing || !vec_missing.is_empty() || !fts_missing.is_empty() {
-        let storage_for_parquet = Arc::clone(&storage);
-        let storage_for_vec = Arc::clone(&storage);
-        let storage_for_fts = Arc::clone(&storage);
-        let parquet_uri = storage_uri.clone();
-        let vec_uri = storage_uri.clone();
-        let fts_uri = storage_uri.clone();
-
-        let parquet_fut = async move {
+        let parquet_fut = async {
             if !tail_missing {
-                return Ok::<_, StorageError>(Bytes::new());
+                return Ok(Bytes::new());
             }
-            storage_for_parquet
-                .get_range(&parquet_uri, parquet_tail_start..total_size)
+            inner
+                .range_exact(parquet_tail_start, parquet_tail_len)
                 .await
         };
-        let vec_fut = async move { fetch_hint_ranges(storage_for_vec, vec_uri, vec_missing).await };
-        let fts_fut = async move { fetch_hint_ranges(storage_for_fts, fts_uri, fts_missing).await };
-
-        let (parquet_bytes, vec_pre, fts_pre) = futures::try_join!(parquet_fut, vec_fut, fts_fut)?;
+        let (parquet_bytes, vec_pre, fts_pre) = futures::try_join!(
+            parquet_fut,
+            fetch_hint_ranges(&inner, vec_missing),
+            fetch_hint_ranges(&inner, fts_missing),
+        )
+        .map_err(|error| open_batch_error(&storage_uri, error))?;
         if !parquet_bytes.is_empty() {
             overlay.install(parquet_tail_start, parquet_bytes);
         }
-        for (off, bytes) in vec_pre {
-            overlay.install(off, bytes);
-        }
-        for (off, bytes) in fts_pre {
+        for (off, bytes) in vec_pre.into_iter().chain(fts_pre) {
             overlay.install(off, bytes);
         }
     }
@@ -1268,24 +1257,28 @@ pub(crate) async fn open_batch_overlay(
 }
 
 async fn fetch_hint_ranges(
-    storage: Arc<dyn StorageProvider>,
-    storage_uri: String,
+    inner: &Arc<dyn LazyByteSource>,
     ranges: Vec<(u64, u64)>,
-) -> Result<Vec<(u64, Bytes)>, StorageError> {
+) -> Result<Vec<(u64, Bytes)>, LazyByteSourceError> {
     try_join_all(
         ranges
             .into_iter()
             .filter(|&(_, len)| len > 0)
-            .map(|(off, len)| {
-                let storage = Arc::clone(&storage);
-                let storage_uri = storage_uri.clone();
-                async move {
-                    let bytes = storage.get_range(&storage_uri, off..off + len).await?;
-                    Ok::<_, StorageError>((off, bytes))
-                }
-            }),
+            .map(|(off, len)| async move { Ok((off, inner.range_exact(off, len).await?)) }),
     )
     .await
+}
+
+/// A failed open-batch read as the storage error it carries, or as a
+/// permanent one when it failed for another reason.
+fn open_batch_error(storage_uri: &str, error: LazyByteSourceError) -> StorageError {
+    match error {
+        LazyByteSourceError::Storage(error) => error,
+        other => StorageError::Permanent {
+            uri: storage_uri.to_owned(),
+            source: Box::new(other),
+        },
+    }
 }
 
 fn background_store_abandoned(store: &Arc<DiskCacheStore>) -> bool {
@@ -5589,6 +5582,35 @@ mod tests {
             "eviction reaches the file"
         );
         assert_eq!(restarted.stats().current_bytes, 0);
+    }
+
+    /// A lazy open keeps what it reads, so once its entry leaves the cache a reopen of the file
+    /// reads the open batch and the page index from disk and sends no GET.
+    #[tokio::test]
+    async fn a_reopen_reads_its_open_batch_from_disk() {
+        let (_dir, store, recording) = store_over_recording();
+        let uri = SuperfileUri::new_v4();
+        let bytes = tiny_superfile_bytes();
+        let offsets = offsets_without_open_blob(bytes.len() as u64);
+        put_superfile(&store, &uri, bytes).await;
+        let storage = Arc::clone(&recording) as Arc<dyn StorageProvider>;
+        let key = uri.storage_path();
+        let intent = ReadIntent::Stream;
+
+        let first = store.open_for_query(&uri, &key, Some(&offsets), Some(&storage), intent);
+        drop(first.await.expect("first open"));
+        assert!(recording.n_ranges() > 0, "the first open reads the object");
+        store.block_writes_settled().await;
+        assert!(
+            store.release_lazy_entry(&uri, store.now_us()).is_some(),
+            "the entry leaves the cache"
+        );
+
+        let before = recording.n_ranges();
+        let reopen = store.open_for_query(&uri, &key, Some(&offsets), Some(&storage), intent);
+        drop(reopen.await.expect("reopen"));
+        let gets = recording.ranges_since(before);
+        assert!(gets.is_empty(), "the reopen sends no GET: {gets:?}");
     }
 
     /// The same reservation comes back when a read of the open batch fails, not only when the open

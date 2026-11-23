@@ -598,6 +598,12 @@ impl DiskCacheStore {
         })
     }
 
+    /// Whether the unwritten runs already fill [`WRITE_BEHIND_CAP_BYTES`], so a read's run would
+    /// not be cached now.
+    pub(crate) fn write_behind_is_full(&self) -> bool {
+        self.write_behind_bytes.load(Ordering::Acquire) >= WRITE_BEHIND_CAP_BYTES
+    }
+
     /// Takes `bytes` of the cap on unwritten runs, or `false` if that would go over
     /// [`WRITE_BEHIND_CAP_BYTES`]. A run bigger than the whole cap is still let in when nothing else
     /// is waiting, so a big read can be cached at all.
