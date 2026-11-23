@@ -1919,8 +1919,7 @@ fn take_prefetch_budget() -> &'static Semaphore {
 }
 
 /// The process's [`TAKE_PREFETCH_READS_IN_FLIGHT`] permits. A take holds one
-/// for each read it can have in flight, from its fetch until its decode is
-/// done.
+/// for each read it can have in flight, while it fetches.
 fn take_prefetch_reads() -> &'static Semaphore {
     static READS: OnceLock<Semaphore> = OnceLock::new();
     READS.get_or_init(|| Semaphore::new(TAKE_PREFETCH_READS_IN_FLIGHT))
@@ -2216,7 +2215,7 @@ async fn take_prefetched(
         let cached = cache_room.is_some();
         // Once per take, not once per read: a take has hundreds of reads, and
         // a per-read acquire made this shared semaphore's lock a hot spot.
-        let _reads = take_prefetch_reads()
+        let reads = take_prefetch_reads()
             .acquire_many(spans.len().min(TAKE_PREFETCH_CONCURRENCY) as u32)
             .await
             .map_err(QueryError::internal)?;
@@ -2234,8 +2233,10 @@ async fn take_prefetched(
         .buffered(TAKE_PREFETCH_CONCURRENCY)
         .try_collect()
         .await?;
-        // The cache holds room only until the download ends.
+        // The cache holds room only until the download ends, and the read
+        // permits are not needed for the decode.
         drop(cache_room);
+        drop(reads);
         prefetched = spans.into_iter().zip(fetched).collect();
         // The fetch was the I/O; the decode is CPU, and goes to the reader
         // pool, reading only the prefetched bytes.
